@@ -2,7 +2,7 @@
 # https://github.com/mlc-ai/mlc-llm/blob/main/CMakeLists.txt
 
 cmake_minimum_required(VERSION 3.26)
-project(TILE_LANG C CXX)
+project(TILE_LANG-MESH C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
