@@ -26,10 +26,33 @@ enum class CopyInst : uint8_t {
   kBulkStore1D = 6, // utilize tma store 1d
   kTMemLoad = 7,    // tcgen05.ld (tensor memory -> register)
   kTMemStore = 8,   // tcgen05.st (register -> tensor memory)
+
+  // dma
+  kDMALoad = 9,
+  kDMAStore = 10,
 };
 
 /// Descriptor for Tensor Memory Access (TMA) copy operations
 struct TMADesc {
+  size_t rank;                   ///< Tensor rank (number of dimensions)
+  int data_type;                 ///< Data type identifier
+  Array<PrimExpr> global_shape;  ///< Shape in global memory
+  Array<PrimExpr> global_stride; ///< Strides in global memory
+  Array<PrimExpr> smem_box;      ///< Block shape in shared memory
+  Array<PrimExpr> smem_stride;   ///< Strides in shared memory
+  PrimExpr global_addr;          ///< Base address in global memory
+  int swizzle;                   ///< Memory layout swizzle parameter
+  int interleave;                ///< Memory interleave parameter
+  int oob_fill;                  ///< Out-of-bound fill policy
+  int l2_promotion;              ///< L2 cache promotion flag
+
+  /// Encode descriptor fields into runtime call arguments
+  Array<PrimExpr> EncodeCallArgs() const;
+};
+
+/// Descriptor for DMA copy operations
+/// the same as TMADesc
+struct DMADesc {
   size_t rank;                   ///< Tensor rank (number of dimensions)
   int data_type;                 ///< Data type identifier
   Array<PrimExpr> global_shape;  ///< Shape in global memory
@@ -129,6 +152,18 @@ public:
                         InferLevel level) const override;
 
   /*!
+   * \brief Check if dma load is supported.
+   */
+  bool CheckDMALoad(Target target, arith::Analyzer *analyzer,
+                     bool check_last_dim = true) const;
+
+  /*!
+   * \brief Check if dma store is supported.
+   */
+  bool CheckDMAStore(Target target, arith::Analyzer *analyzer,
+                     bool check_last_dim = true) const;
+
+  /*!
    * \brief Check if bulk copy is supported.
    */
   bool CheckBulkLoad(Target target, arith::Analyzer *analyzer,
@@ -189,6 +224,12 @@ public:
                        bool buffer_oob) const;
 
 protected:
+  /*!
+   * \brief Generate lowering for dma copy.
+   */
+  Stmt LowerDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
+                     CopyInst copy_inst) const;
+
   /*!
    * \brief Generate lowering for bulk/global-to-shared copy.
    */
