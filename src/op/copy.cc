@@ -564,6 +564,26 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
     }
     return {};
   }
+
+  if (copy_inst == CopyInst::kDMALoad || copy_inst == CopyInst::kDMAStore) {
+    // if can apply swizzling, we skip layout inference
+    // for dma load/store, we can directly apply the layout of normal copy
+    // This must be a global/shared layout, so we can skip the parallel op
+    // layout inference (parallel layout inference only annotate the loop layout
+    // and the register layout).
+    // the same implementation as TMA
+    bool is_load = copy_inst == CopyInst::kDMALoad;
+    Buffer global_tensor = is_load ? src : dst;
+    Buffer shared_tensor = is_load ? dst : src;
+    // check shared layout is non-swizzle
+    // skip layout inference if shared layout is already annotated
+    if (level == InferLevel::kFree && !T.layout_map.count(shared_tensor)) {
+      // create a new layout map for tma linear layout
+      Layout linear_layout = ComputeLinearLayout(shared_tensor);
+      return Map<Buffer, Layout>({{shared_tensor, linear_layout}});
+    }
+    return {};
+  }
   // for LDSM/STSM, the layout was deduced from register layout
   // so we can directly apply the layout of normal copy
   // Use parallel op to infer the layout
@@ -573,6 +593,107 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
   }
   return par_op_->InferLayout(T, level);
 }
+
+/**
+ * @brief Determine whether this CopyNode can be lowered to a DMA Load 
+ * instruction.
+ *
+ * The function returns true when all of the following hold:
+ * - the target architecture advertises DMA support;
+ * - the source buffer resides in global memory;
+ * - the destination buffer resides in shared memory (either "shared" or
+ * "shared.dyn");
+ * - the source and destination have the same element data type.
+ *
+ * If the source and destination dtypes differ, a warning is logged and the
+ * function returns false (the caller is expected to fall back to a normal
+ * copy).
+ * 
+ *
+ * @param target The compilation target to query for dma load support.
+ * @return true if the copy can be implemented as a DMA Load; false
+ * otherwise.
+ */
+bool CopyNode::CheckDMALoad(Target target, arith::Analyzer *analyzer, 
+  bool check_last_dim) const {
+  // 1. arch must support zpu
+  if (!TargetIsZpu(target))
+    return false;
+  // 2. src and dst must be global and shared
+  if (src.scope() != "global" ||
+      (dst.scope() != "shared.dyn" && dst.scope() != "shared"))
+    return false;
+  // 3. check shape.
+  // last dim of src * dtype.bits() must be a multiple of 16
+  // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
+  // now we check src (gmem) as tma box dim is deduced from src
+  if (check_last_dim &&
+      analyzer->CanProve(
+          FloorMod(src_range[src_range.size() - 1]->extent * src->dtype.bytes(),
+                   16) != 0,
+          arith::ProofStrength::kSymbolicBound)) {
+    LOG(WARNING)
+        << "src range must have last dim multiple of 16 for tma bulk load "
+        << src->name << " range " << src_range[src_range.size() - 1]->extent
+        << " * " << src->dtype.bytes() << " % 16 != 0";
+    return false;
+  }
+
+  // 4. src and dst must have the same dtype
+  if (src->dtype != dst->dtype) {
+    LOG(WARNING) << "src and dst must have the same dtype for tma load "
+                 << src->name << " vs. " << dst->name << " dtype " << src->dtype
+                 << " vs. " << dst->dtype << " will be fallback to normal copy";
+    return false;
+  }
+  return true;
+}
+
+/**
+ * @brief Determine if this CopyNode can be lowered to a CUDA DMA store.
+ *
+ * Checks whether the target supports DMA store, the source buffer is in shared
+ * memory (shared or shared.dyn), the destination buffer is in global memory,
+ * and both buffers have the same element data type. If the data types differ,
+ * a warning is logged and false is returned.
+ *
+ * @param target Target device/architecture to check for dma store support.
+ * @return true if all conditions are met; false otherwise.
+ */
+bool CopyNode::CheckDMAStore(Target target, arith::Analyzer *analyzer,
+                              bool check_last_dim) const {
+  // 1. arch must support zpu
+  if (!TargetIsZpu(target))
+    return false;
+  // 2. src and dst must be shared.dyn and local.fragment
+  if ((src.scope() != "shared.dyn" && src.scope() != "shared") ||
+      dst.scope() != "global")
+    return false;
+  // 3. check shape.
+  // last dim of dst * dtype.bits() must be a multiple of 16
+  // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
+  // now we check dst (gmem) as tma box dim is deduced from dst
+  if (check_last_dim &&
+      analyzer->CanProve(
+          FloorMod(dst_range[dst_range.size() - 1]->extent * dst->dtype.bytes(),
+                   16) != 0,
+          arith::ProofStrength::kSymbolicBound)) {
+    LOG(WARNING)
+        << "dst range must have last dim multiple of 16 for tma bulk store "
+        << dst->name << " range " << dst_range[dst_range.size() - 1]->extent
+        << " * " << dst->dtype.bytes() << " % 16 != 0";
+    return false;
+  }
+  // 4. src and dst must have the same dtype
+  if (src->dtype != dst->dtype) {
+    LOG(WARNING) << "src and dst must have the same dtype for tma store "
+                 << src->name << " vs. " << dst->name << " dtype " << src->dtype
+                 << " vs. " << dst->dtype << " will be fallback to normal copy";
+    return false;
+  }
+  return true;
+}
+
 /**
  * @brief Determine whether this CopyNode can be lowered to a Bulk Load (TMA)
  * instruction.
@@ -830,7 +951,11 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
 
   // Check tensor memory operations first (highest priority for SM100/Blackwell)
   // 1d tma access can not support out of bound access
-  if (!disable_tma_lower && !buffer_oob &&
+  if (CheckDMALoad(target, analyzer)) {
+    return CopyInst::kDMALoad;
+  } else if (CheckDMAStore(target, analyzer)) {
+    return CopyInst::kDMAStore;
+  } else if (!disable_tma_lower && !buffer_oob &&
       CheckBulkLoad1D(target, layout_map, analyzer)) {
     return CopyInst::kBulkLoad1D;
   } else if (!disable_tma_lower && !buffer_oob &&
@@ -874,7 +999,12 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       pass_ctx->GetConfig<Bool>(kDisableTMALower, Bool(false)).value();
   auto copy_inst = GetCopyInst(target, disable_tma_lower || disable_tma,
                                T.layout_map, analyzer);
-  if (copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore) {
+
+  if (copy_inst == CopyInst::kDMALoad || copy_inst == CopyInst::kDMAStore) {
+    auto bulk_copy = LowerDMACopy(T, analyzer, copy_inst);
+    ICHECK(bulk_copy.defined()) << "Failed to lower dma load/store";
+    return bulk_copy;
+  } else if(copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore) {
     auto tmem_copy = LowerTmemCopy(T, analyzer);
     ICHECK(tmem_copy.defined()) << "Failed to lower tensor memory copy";
     return tmem_copy;
@@ -897,6 +1027,317 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   } else {
     LOG(FATAL) << "Unsupported copy inst " << static_cast<int>(copy_inst);
   }
+}
+
+/**
+ * @brief Lower a Copy operator to a DMA transfer.
+ *
+ * Haoze TODO: the same as tma now
+ * Lowers the copy to an optimized DMA load or store when the target and buffer
+ * layouts permit. 
+ *
+ * If preconditions are not satisfied (unsupported swizzle, stride/size limits,
+ * mismatched element counts, OOB risks, or other hardware constraints), this
+ * function falls back to LowerNormalCopy.
+ *
+ * @param T LowerArgs containing target information, thread/bounds variables,
+ *          and layout/ buffer remap information used for descriptor
+ * construction.
+ * @param analyzer Analyzer used to prove shapes/contiguity/equality
+ * constraints.
+ * @param copy_inst Indicates whether to emit a BulkLoad (TMA load) or BulkStore
+ *                  (TMA store). Must be CopyInst::kDMALoad or kDMAStore.
+ * @return Stmt A TIR statement performing the bulk TMA copy (or the result of
+ *         LowerNormalCopy when falling back).
+ */
+Stmt CopyNode::LowerDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
+                             CopyInst copy_inst) const {
+  ICHECK(copy_inst == CopyInst::kDMALoad || copy_inst == CopyInst::kDMAStore)
+      << "Invalid copy inst " << static_cast<int>(copy_inst);
+  bool is_load = copy_inst == CopyInst::kDMALoad;
+  Buffer global_tensor = is_load ? src : dst;
+  Buffer shared_tensor = is_load ? dst : src;
+  Array<Range> global_range = is_load ? src_range : dst_range;
+  Array<Range> shared_range = is_load ? dst_range : src_range;
+  // Cannot support a non-swizzled global layout, will be fallback to normal copy
+  if (T.layout_map.count(global_tensor)) {
+    LOG(WARNING) << "DMA copy cannot support a non-swizzled global "
+                    "layout, fallback to normal copy.";
+    return LowerNormalCopy(T, analyzer);
+  }
+
+  // linear layout must be computed before remapping
+  auto linear_layout = ComputeLinearLayout(shared_tensor);
+
+  Array<PrimExpr> shared_indices;
+  for (auto r : shared_range)
+    shared_indices.push_back(r->min);
+  std::vector<PrimExpr> shared_strides;
+  PrimExpr shared_stride = 1;
+  for (size_t i = 0; i < shared_tensor->shape.size(); i++) {
+    auto s = shared_tensor->shape[shared_tensor->shape.size() - i - 1];
+    shared_strides.insert(shared_strides.begin(), shared_stride);
+    shared_stride *= s;
+  }
+
+  Array<PrimExpr> global_indices;
+  for (auto r : global_range) {
+    global_indices.push_back(r->min);
+  }
+  std::vector<PrimExpr> global_strides;
+  PrimExpr global_stride = 1;
+  for (size_t i = 0; i < global_tensor->shape.size(); i++) {
+    auto s = global_tensor->shape[global_tensor->shape.size() - i - 1];
+    global_strides.insert(global_strides.begin(), global_stride);
+    global_stride *= s;
+  }
+
+  ICHECK(shared_strides.size() == shared_indices.size())
+      << "shared_strides.size() != shared_indices.size()"
+      << shared_strides.size() << " " << shared_indices.size();
+  PrimExpr shared_offset = 0;
+  for (size_t i = 0; i < shared_indices.size(); i++) {
+    shared_offset += shared_indices[i] * shared_strides[i];
+  }
+  PrimExpr global_offset = 0;
+  for (size_t i = 0; i < global_indices.size(); i++) {
+    global_offset += global_indices[i] * global_strides[i];
+  }
+
+  TMADesc desc;
+  // Verify copy rank
+  desc.rank = global_tensor->shape.size();
+  ICHECK(desc.rank >= 1 && desc.rank <= 5) << desc.rank;
+
+  // Verify datatype
+  ICHECK(global_tensor->dtype == shared_tensor->dtype)
+      << "Copy between buffer " << global_tensor->name << " and "
+      << shared_tensor->name << " with different data type "
+      << global_tensor->dtype << " and " << shared_tensor->dtype;
+
+  desc.data_type = to_CUtensorMapDataType(global_tensor->dtype);
+
+  // Global Tensor Shape and Stride
+  desc.global_addr = global_tensor->data;
+  desc.global_shape = ReverseArray(global_tensor->shape);
+  Array<PrimExpr> global_coords =
+      ReverseArray(global_range.Map([](Range r) { return r->min; }));
+  if (!global_tensor->strides.empty()) {
+    desc.global_stride = ReverseArray(global_tensor->strides);
+  } else {
+    // Create stride from shape
+    PrimExpr stride = 1;
+    desc.global_stride.reserve(desc.rank);
+    for (size_t i = 0; i < desc.rank; i++) {
+      desc.global_stride.push_back(stride);
+      stride *= desc.global_shape[i];
+    }
+  }
+  // The first stride element should be 1
+  ICHECK(is_one(desc.global_stride[0])) << desc.global_stride;
+  // Make global stride in bytes
+  desc.global_stride = desc.global_stride.Map([&](PrimExpr e) {
+    return cast(DataType::Int(64), e) * global_tensor->dtype.bytes();
+  });
+  for (size_t i{1}; i < desc.global_stride.size(); i++) {
+    auto stride = desc.global_stride[i].as<IntImmNode>();
+    if (stride != nullptr) {
+      // otherwise, the stride is symbolic, we need to check in future with
+      // assumptions
+      if (stride->value % 16 != 0 || stride->value >= (1ULL << 40)) {
+        LOG(WARNING) << "TMA bulk copy cannot support a global stride of "
+                     << desc.global_stride[i] << ", fallback to normal copy.";
+        return LowerNormalCopy(T, analyzer);
+      }
+    }
+  }
+
+  // Smem Box
+  // check smem range and global range is legal
+  auto s_range_idx = 0;
+  for (size_t i = 0; i < global_range.size(); i++) {
+    auto g_range = global_range[i];
+    if (is_one(g_range->extent)) {
+      continue;
+    }
+    // skip one range if it is 1
+    // in case of global range is [128, 64], while shared range is [1, 128, 64]
+    // A_shared[0, :, :].
+    while (is_one(shared_range[s_range_idx]->extent) &&
+           s_range_idx < shared_range.size()) {
+      s_range_idx++;
+    }
+    if (s_range_idx >= shared_range.size()) {
+      LOG(FATAL) << "TMA bulk copy cannot support a global range of "
+                 << global_range << ", shared_range " << shared_range;
+    }
+    auto s_range = shared_range[s_range_idx];
+    s_range_idx++;
+
+    ICHECK(StructuralEqual()(g_range->extent, s_range->extent))
+        << global_tensor->name << "[" << i << "] is illegal, "
+        << global_tensor->name << "[" << i << "] = " << g_range->extent << ", "
+        << shared_tensor->name << "[" << s_range_idx
+        << "] = " << s_range->extent;
+  }
+  // TODO(lei): find a much smarter way to deduce smem box dim
+  // instead of using global_range
+  desc.smem_box =
+      ReverseArray(global_range.Map([](Range r) { return r->extent; }));
+
+  desc.smem_stride = Array<PrimExpr>(desc.rank, PrimExpr(1));
+  // L2 & OOB
+  desc.l2_promotion = static_cast<int>(CU_TENSOR_MAP_L2_PROMOTION_L2_128B);
+  desc.oob_fill = static_cast<int>(CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+  // Detect smem layout
+  // Shared memory swizzling is crucial for TMA performance
+  // It determines how data is arranged in shared memory banks to minimize bank
+  // conflicts Different swizzle patterns (32B, 64B, 128B) offer different
+  // trade-offs between access efficiency and memory usage
+  desc.interleave = static_cast<int>(CU_TENSOR_MAP_INTERLEAVE_NONE);
+  Layout shared_layout;
+  if (T.layout_map.count(shared_tensor)) {
+    shared_layout = T.layout_map.at(shared_tensor);
+    ICHECK(T.buffer_remap.count(shared_tensor))
+        << "shared_tensor: " << shared_tensor->name
+        << " not found in buffer_remap";
+    shared_tensor = T.buffer_remap.at(shared_tensor);
+  }
+  if (!shared_layout.defined()) {
+    desc.swizzle = static_cast<int>(CU_TENSOR_MAP_SWIZZLE_NONE);
+  } else if (StructuralEqual()(shared_layout, linear_layout)) {
+    desc.swizzle = static_cast<int>(CU_TENSOR_MAP_SWIZZLE_NONE);
+  } else {
+    ICHECK(shared_layout->InputDim() == 2) << "Cannot detect TMA layout.";
+    auto stride = as_const_int(shared_layout->InputShape()[0]);
+    auto continuous = as_const_int(shared_layout->InputShape()[1]);
+    ICHECK(stride != nullptr && continuous != nullptr);
+    // We also need to check if the shape satisfies the following doc:
+    // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
+    if (StructuralEqual()(shared_layout, makeQuarterBankSwizzleLayout(
+                                             *stride, *continuous,
+                                             shared_tensor->dtype.bits()))) {
+      desc.swizzle = static_cast<int>(CU_TENSOR_MAP_SWIZZLE_32B);
+    } else if (StructuralEqual()(
+                   shared_layout,
+                   makeHalfBankSwizzleLayout(*stride, *continuous,
+                                             shared_tensor->dtype.bits()))) {
+      desc.swizzle = static_cast<int>(CU_TENSOR_MAP_SWIZZLE_64B);
+    } else if (StructuralEqual()(
+                   shared_layout,
+                   makeFullBankSwizzleLayout(*stride, *continuous,
+                                             shared_tensor->dtype.bits()))) {
+      desc.swizzle = static_cast<int>(CU_TENSOR_MAP_SWIZZLE_128B);
+    } else if (StructuralEqual()(
+                   shared_layout,
+                   makeGemmABLayoutPadded(*stride, *continuous,
+                                          shared_tensor->dtype.bits()))) {
+      LOG(WARNING) << "Bulk copy cannot support a padded layout for src: "
+                   << src->name << ", dst: " << dst->name
+                   << ", fallback to normal copy";
+      return LowerNormalCopy(T, analyzer);
+    } else {
+      LOG(WARNING) << "Came across unsupported swizzle layout for src: "
+                   << src->name << ", dst: " << dst->name
+                   << ", fallback to normal copy";
+      return LowerNormalCopy(T, analyzer);
+    }
+  }
+
+  auto inner_box_dim = as_const_int(desc.smem_box[0]);
+  if (inner_box_dim == nullptr) {
+    LOG(WARNING) << "inner_box_dim " << desc.smem_box[0]
+                 << " can only be a constant integer for TMA bulk copy, "
+                    "fallback to normal copy";
+    return LowerNormalCopy(T, analyzer);
+  }
+  int instruction_dim = *inner_box_dim;
+  if (desc.swizzle == static_cast<int>(CU_TENSOR_MAP_SWIZZLE_64B)) {
+    instruction_dim = 64 / src->dtype.bytes();
+  } else if (desc.swizzle == static_cast<int>(CU_TENSOR_MAP_SWIZZLE_128B)) {
+    instruction_dim = 128 / src->dtype.bytes();
+  }
+  if (instruction_dim > 256) {
+    // smem_box dim must be in [0, 256]
+    // if is 512, we need to split the copy into two parts
+    ICHECK((*inner_box_dim) % 256 == 0)
+        << "inner_box_dim: " << *inner_box_dim << " is not divisible by 256";
+    instruction_dim = 256;
+  }
+  ICHECK((*inner_box_dim) % instruction_dim == 0)
+      << "inner_box_dim: " << *inner_box_dim
+      << " is not divisible by instruction_dim: " << instruction_dim;
+  desc.smem_box.Set(0, PrimExpr(instruction_dim));
+
+  int inner_box_dim_ = instruction_dim * shared_tensor->dtype.bytes();
+
+  // Check inner_box_dim_ for each swizzle type in a cleaner way
+  struct SwizzleCheck {
+    int swizzle;
+    int max_dim;
+  };
+  static const std::vector<SwizzleCheck> swizzle_checks = {
+      {static_cast<int>(CU_TENSOR_MAP_SWIZZLE_32B), 32},
+      {static_cast<int>(CU_TENSOR_MAP_SWIZZLE_64B), 64},
+      {static_cast<int>(CU_TENSOR_MAP_SWIZZLE_128B), 128},
+  };
+  for (const auto &check : swizzle_checks) {
+    if (desc.swizzle == check.swizzle && inner_box_dim_ > check.max_dim) {
+      LOG(WARNING) << "TMA bulk copy cannot support a swizzled global layout "
+                      "with inner_box_dim_ > "
+                   << check.max_dim << ", will be fallback to normal copy";
+      return LowerNormalCopy(T, analyzer);
+    }
+  }
+
+  Call create_descriptor =
+      Call(DataType::Handle(), create_tma_descriptor(), desc.EncodeCallArgs());
+
+  Array<PrimExpr> args;
+  args.reserve(desc.rank + 4);
+  args.push_back(create_descriptor);
+  if (is_load)
+    args.push_back(0); // mbarrier id placeholder
+  auto op = is_load ? tma_load() : tma_store();
+
+  Stmt tma_copy;
+  PrimExpr total_elements = 1;
+  for (auto e : desc.smem_box)
+    total_elements *= e;
+
+  if ((*inner_box_dim) != instruction_dim) {
+    Var loop_var("i");
+    int loop_extent = (*inner_box_dim) / instruction_dim;
+
+    PrimExpr shared_addr = shared_tensor.access_ptr(
+        is_load ? 2 : 1, DataType::Handle(), 1,
+        shared_offset + total_elements * loop_var, total_elements);
+    args.push_back(shared_addr);
+    global_coords.Set(0, global_coords[0] + instruction_dim * loop_var);
+    for (auto coord : global_coords)
+      args.push_back(coord);
+    int need_reduce = 0;
+    if (!is_load)
+      args.push_back(need_reduce);
+    args.push_back(this->eviction_policy);
+    tma_copy = For(loop_var, 0, loop_extent, ForKind::kUnrolled,
+                   Evaluate(Call(DataType::Handle(), op, args)));
+  } else {
+    PrimExpr shared_addr = shared_tensor.access_ptr(
+        is_load ? 2 : 1, DataType::Handle(), 1, shared_offset, total_elements);
+    args.push_back(shared_addr);
+    for (auto coord : global_coords)
+      args.push_back(coord);
+    int need_reduce = 0;
+    if (!is_load)
+      args.push_back(need_reduce);
+    args.push_back(this->eviction_policy);
+    tma_copy = Evaluate(Call(DataType::Handle(), op, args));
+  }
+  tma_copy = IfThenElse(EQ(T.thread_var, T.thread_bounds->min), tma_copy);
+
+  return tma_copy;
 }
 
 /**
@@ -1762,6 +2203,38 @@ Stmt CopyNode::LowerBulkCopy1D(const LowerArgs &T, arith::Analyzer *analyzer,
   tma_copy = IfThenElse(EQ(T.thread_var, T.thread_bounds->min), tma_copy);
   return tma_copy;
 }
+
+/*!
+ * \brief Encode the DMA descriptor into an array of PrimExpr.
+ * This function serializes the DMA descriptor fields into a format suitable for
+ * passing to the create_dma_descriptor() builtin function. The encoding follows
+ * the expected argument order for the DMA descriptor creation.
+ * \return Array of PrimExpr representing the encoded DMA descriptor.
+ * the same implementation as TMA
+ */
+Array<PrimExpr> DMADesc::EncodeCallArgs() const {
+  Array<PrimExpr> args;
+  args.reserve(rank * 4 + 7);
+
+  args.push_back(data_type);
+  args.push_back(static_cast<int>(rank));
+  args.push_back(global_addr);
+  for (auto e : global_shape)
+    args.push_back(e);
+  for (auto e : global_stride)
+    args.push_back(e);
+  for (auto e : smem_box)
+    args.push_back(e);
+  for (auto e : smem_stride)
+    args.push_back(e);
+  args.push_back(interleave);
+  args.push_back(swizzle);
+  args.push_back(l2_promotion);
+  args.push_back(oob_fill);
+
+  return args;
+}
+
 /*!
  * \brief Encode the TMA descriptor into an array of PrimExpr.
  * This function serializes the TMA descriptor fields into a format suitable for

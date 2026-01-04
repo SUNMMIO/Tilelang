@@ -17,6 +17,11 @@ bool TargetIsCuda(Target target) {
 bool TargetIsRocm(Target target) {
   return target->GetTargetDeviceType() == kDLROCM;
 }
+bool TargetIsZpu(Target target) {
+  // return true;
+  bool check = (target->kind->name == "zpu");
+  return check;
+}
 
 int GetArchInt(Target target) {
   auto s = target->GetAttr<tvm::ffi::String>("arch");
