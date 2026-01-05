@@ -676,6 +676,9 @@ class PrimFuncCreater(Generic[_P, _T]):
         with builder.prim_func(self.orig_func.__name__):
             self.ir_gen.gen(builder)(*args, **kwargs)
         res: PrimFunc = builder.get()
+        metadata = self.func_annot.get_metadata()
+        if metadata:
+            res = res.with_attr("tensor_meta", metadata)
         res.ir_gen = self.ir_gen
         res.orig_func = self.orig_func
         res.func_annot = self.func_annot

@@ -18,6 +18,9 @@ from .v2.annot import (
     Buffer,  # noqa: F401
     Tensor,  # noqa: F401
     StridedTensor,  # noqa: F401
+    MeshShardingPolicy,  # noqa: F401
+    MeshReplicationType,  # noqa: F401
+    MeshTensor,  # noqa: F401
     FragmentBuffer,  # noqa: F401
     SharedBuffer,  # noqa: F401
     LocalBuffer,  # noqa: F401
@@ -105,6 +108,7 @@ from .annotations import (  # noqa: F401
 )
 
 from .annotate_mesh_tensor import mesh_tensor_functions  # noqa: F401
+
 
 def import_source(source: str | None = None):
     # source is the source code to be imported
