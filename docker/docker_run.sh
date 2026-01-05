@@ -46,6 +46,7 @@ DOCKER_CMD="docker run -d ${DOCKER_RT} \
     --name ${CONTAINER_NAME} \
     -p ${SSH_PORT}:22 \
     -v \"${WORKSPACE_DIR}:/workspace\" \
+    --cap-add=SYS_PTRACE \
     -w /workspace"
 
 # Complete the command
