@@ -6,6 +6,15 @@ from tvm.tir import IterVar, Var, PrimExpr, IndexMap
 from tilelang import _ffi_api
 
 
+# Register the TileLayout class as a TVM object under the name "tl.Layout"
+@tvm_ffi.register_object("tl.Layout")
+class TileLayout(Node):
+    def __init__(self, tile_shape, dim_map, tile_size):
+        self.tile_shape = tile_shape
+        self.dim_map = dim_map
+        self.tile_size = tile_size
+
+
 # Register the Layout class as a TVM object under the name "tl.Layout"
 @tvm_ffi.register_object("tl.Layout")
 class Layout(Node):

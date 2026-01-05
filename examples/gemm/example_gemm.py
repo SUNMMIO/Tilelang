@@ -12,8 +12,10 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
             C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
-            A_shared = T.alloc_shared((block_M, block_K), dtype)
-            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            # A_shared = T.alloc_shared((block_M, block_K), dtype)
+            # B_shared = T.alloc_shared((block_K, block_N), dtype)
+            A_shared = T.alloc_shared_with_tileview((block_M, block_K), dtype)
+            B_shared = T.alloc_shared_with_tileview((block_K, block_N), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
             T.clear(C_local)

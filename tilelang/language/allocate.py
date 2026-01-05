@@ -34,6 +34,75 @@ _Shapes = TypeVarTuple('_Shapes')
 _DType = TypeVar('_DType')
 
 
+def handle_shape_tuple_when_alloc_shared_with_tileview(shape: tuple[Unpack[_Shapes]], tile_size=None, dim_map=None) -> tuple[Unpack[_Shapes]]:
+    # check shape
+    if shape is None:
+        raise ValueError("shape map ValueError")
+    if len(shape) == 0:
+        raise ValueError("shape map ValueError")
+    # check tile_size None
+    if tile_size is None:
+        tile_size = ()
+    if len(tile_size) == 0:
+        if len(shape) == 1:
+            tile_size = (32, 1)
+        if len(shape) > 1:
+            tile_size = (32, 32)
+    # check tile_size
+    if len(tile_size) > len(shape) and len(shape) != 1:
+        raise ValueError("tile map ValueError")
+    if len(shape) == 1:
+        if len(tile_size) > 2:
+            raise ValueError("tile map ValueError")
+        if len(tile_size) == 2:
+            if tile_size [0] != 1 and tile_size[1] != 1:
+                raise ValueError("tile map ValueError")
+    for a_tile in tile_size:
+        if a_tile == 0:
+            raise ValueError("tile map ValueError")
+    # check dim_map None
+    if dim_map is None:
+        dim_map = ()
+    if len(dim_map) == 0:
+        if len(shape) == 1:
+            dim_map=(0,)
+        if len(shape) > 1:
+            dim_map = tuple(range(len(shape) - len(tile_size), len(shape)))
+    # check dim_map
+    if len(dim_map) != len(set(dim_map)):
+        raise ValueError("dim map ValueError")
+    for a_dim in dim_map:
+        if a_dim >= len(shape) or a_dim < 0:
+            raise ValueError("dim map ValueError")
+    if len(dim_map) != len(tile_size) and len(shape) != 1:
+        raise ValueError("dim map ValueError")
+    # len(shape) = 1
+    if len(shape) == 1:
+        if len(tile_size) == 1:
+            return (T.ceildiv(shape[0], tile_size[0]), tile_size[0])
+        if tile_size[0] == 1:
+            return (T.ceildiv(shape[0], tile_size[0]), 1, tile_size[0])
+        if tile_size[1] == 1:
+            return (T.ceildiv(shape[0], tile_size[0]), tile_size[0], 1)
+    # normal
+    shapeList=list(shape)
+    for a_tile, a_dim in zip(tile_size, dim_map):
+        shapeList[a_dim] = T.ceildiv(shape[a_dim], a_tile)
+        shapeList += [a_tile]
+    return tuple(shapeList)
+
+from tilelang.layout import TileLayout
+def alloc_shared_with_tileview(shape: tuple[Unpack[_Shapes]], dtype: _DType, tile_size=None, dim_map=None, scope="shared.dyn") -> SharedBuffer[Callable[[Unpack[_Shapes]]], _DType]:
+    newShape = handle_shape_tuple_when_alloc_shared_with_tileview(shape=shape, tile_size=tile_size, dim_map=dim_map)
+    if dtype == "bool":
+        scope = "shared"
+    buffer = T.alloc_buffer(shape, dtype, scope=scope)
+    tileLayout = TileLayout(newShape, dim_map, tile_size)
+    # block_attr({"tile_view": {buffer.data: {"tile_size": tile_size, "dim_map": dim_map, "tiled_shape": newShape}}})
+    block_attr({"tile_view": {buffer.data: tileLayout}})
+    return buffer
+
+
 def alloc_shared(shape: tuple[Unpack[_Shapes]],
                  dtype: _DType,
                  scope="shared.dyn") -> SharedBuffer[Callable[[Unpack[_Shapes]]], _DType]:
