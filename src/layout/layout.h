@@ -39,7 +39,16 @@ private:
 };
 
 class Layout;
+class TileLayout;
 class Fragment;
+
+class TileLayoutNode : public Object {
+  TileLayoutNode() = default;
+  TileLayoutNode(Array<PrimExpr> input_shape, Array<PrimExpr> tile_size, Array<PrimExpr> dim_map);
+  static void RegisterReflection();
+  TVM_FFI_DECLARE_OBJECT_INFO("tl.Layout", TileLayoutNode, Object);
+  static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+};
 
 class LayoutNode : public Object {
 public:
@@ -91,6 +100,13 @@ protected:
   void UpdateAnalyzer(arith::Analyzer *analyzer) const;
   Array<PrimExpr> forward_index_;
   Array<PrimExpr> input_size_;
+};
+
+class TileLayout : public ObjectRef {
+public:
+  TVM_DLL TileLayout(Array<IterVar> input_shape_Iter, Array<IterVar> tile_size_Iter, Array<IterVar> dim_map_Iter);
+  TVM_DLL TileLayout(Array<PrimExpr> input_shape, Array<PrimExpr> tile_size, Array<PrimExpr> dim_map);
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(TileLayout, ObjectRef, TileLayoutNode);
 };
 
 /*!

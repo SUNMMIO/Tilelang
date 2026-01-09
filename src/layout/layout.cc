@@ -55,6 +55,34 @@ LayoutNode::LayoutNode(Array<PrimExpr> input_size,
       [&](const PrimExpr &e) { return analyzer.Simplify(e); });
 }
 
+TileLayoutNode::TileLayoutNode(Array<PrimExpr> input_shape, Array<PrimExpr> tile_size, Array<PrimExpr> dim_map) {
+  input_shape_ = input_shape;
+  tile_size_ = tile_size;
+  dim_map_ = dim_map;
+}
+
+TileLayout::TileLayout(Array<IterVar> input_shape_Iter, Array<IterVar> tile_size_Iter, Array<IterVar> dim_map_Iter){
+  Map<Var, PrimExpr> vmap;
+  Array<PrimExpr> input_shape, tile_size, dim_map;
+  for (size_t i = 0; i < input_shape_Iter.size(); i++) {
+    vmap.Set(input_shape_Iter[i]->var, InputPlaceholder(i));
+    CHECK(is_zero(input_shape_Iter[i]->dom->min));
+    input_shape.push_back(input_shape_Iter[i]->dom->extent);
+  }
+  for (size_t i = 0; i < tile_size_Iter.size(); i++) {
+    vmap.Set(tile_size_Iter[i]->var, InputPlaceholder(i));
+    CHECK(is_zero(tile_size_Iter[i]->dom->min));
+    tile_size.push_back(tile_size_Iter[i]->dom->extent);
+  }
+  for (size_t i = 0; i < dim_map_Iter.size(); i++) {
+    vmap.Set(dim_map_Iter[i]->var, InputPlaceholder(i));
+    CHECK(is_zero(dim_map_Iter[i]->dom->min));
+    dim_map.push_back(dim_map_Iter[i]->dom->extent);
+  }
+  auto n = tvm::ffi::make_object<LayoutNode>(input_size, tile_size, dim_map);
+  data_ = std::move(n);
+}
+
 Layout::Layout(Array<IterVar> forward_var, Array<PrimExpr> forward_index) {
   Map<Var, PrimExpr> vmap;
   Array<PrimExpr> input_size;
@@ -69,9 +97,23 @@ Layout::Layout(Array<IterVar> forward_var, Array<PrimExpr> forward_index) {
   data_ = std::move(n);
 }
 
+TileLayout::TileLayout(Array<PrimExpr> input_shape, Array<PrimExpr> tile_size, Array<PrimExpr> dim_map) {
+  auto n = tvm::ffi::make_object<TileLayoutNode>(input_shape, tile_size, dim_map);
+  data_ = std::move(n);
+}
+
 Layout::Layout(Array<PrimExpr> input_size, Array<PrimExpr> forward_index) {
   auto n = tvm::ffi::make_object<LayoutNode>(input_size, forward_index);
   data_ = std::move(n);
+}
+
+void TileLayoutNode::RegisterReflection() {
+  namespace refl = tvm::ffi::reflection;
+  refl::ObjectDef<TileLayoutNode>()
+      .def_ro("input_shape", &TileLayoutNode::input_shape_)
+      .def_ro("tile_size", &TileLayoutNode::tile_size_)
+      .def_ro("dim_map", &TileLayoutNode::dim_map_)
+      .def("_DebugOutput", &TileLayoutNode::DebugOutput);
 }
 
 void LayoutNode::RegisterReflection() {
@@ -668,6 +710,10 @@ std::string LayoutNode::DebugOutput() const {
   return ss.str();
 }
 
+std::string TileLayoutNode::DebugOutput() const {
+  return "";
+}
+
 std::string FragmentNode::DebugOutput() const {
   std::stringstream ss;
   ss << "Fragment(" << InputShape() << " -> " << OutputShape()
@@ -722,6 +768,12 @@ void FragmentNode::RegisterReflection() {
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
+      .def_packed("tl.TileLayout",
+                  [](PackedArgs args, Any *rv) {
+                    *rv = TileLayout(args[0].cast<Array<IterVar>>(),
+                                     args[1].cast<Array<IterVar>>(),
+                                     args[2].cast<Array<IterVar>>());
+                  })
       .def_packed("tl.Layout",
                   [](PackedArgs args, Any *rv) {
                     *rv = Layout(args[0].cast<Array<IterVar>>(),
@@ -819,6 +871,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   LayoutNode::RegisterReflection();
+  TileLayoutNode::RegisterReflection();
   FragmentNode::RegisterReflection();
 }
 
