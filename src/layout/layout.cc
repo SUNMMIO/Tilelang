@@ -79,7 +79,7 @@ TileLayout::TileLayout(Array<IterVar> input_shape_Iter, Array<IterVar> tile_size
     CHECK(is_zero(dim_map_Iter[i]->dom->min));
     dim_map.push_back(dim_map_Iter[i]->dom->extent);
   }
-  auto n = tvm::ffi::make_object<LayoutNode>(input_size, tile_size, dim_map);
+  auto n = tvm::ffi::make_object<TileLayoutNode>(input_shape, tile_size, dim_map);
   data_ = std::move(n);
 }
 

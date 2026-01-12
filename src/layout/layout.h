@@ -43,11 +43,19 @@ class TileLayout;
 class Fragment;
 
 class TileLayoutNode : public Object {
+ public:
   TileLayoutNode() = default;
   TileLayoutNode(Array<PrimExpr> input_shape, Array<PrimExpr> tile_size, Array<PrimExpr> dim_map);
+  
+  virtual std::string DebugOutput() const;
+  
   static void RegisterReflection();
-  TVM_FFI_DECLARE_OBJECT_INFO("tl.Layout", TileLayoutNode, Object);
+  TVM_FFI_DECLARE_OBJECT_INFO("tl.TileLayout", TileLayoutNode, Object);
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind = kTVMFFISEqHashKindTreeNode;
+  
+  Array<PrimExpr> input_shape_;
+  Array<PrimExpr> tile_size_;
+  Array<PrimExpr> dim_map_;
 };
 
 class LayoutNode : public Object {
