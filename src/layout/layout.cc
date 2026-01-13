@@ -61,28 +61,6 @@ TileLayoutNode::TileLayoutNode(Array<PrimExpr> input_shape, Array<PrimExpr> tile
   dim_map_ = dim_map;
 }
 
-TileLayout::TileLayout(Array<IterVar> input_shape_Iter, Array<IterVar> tile_size_Iter, Array<IterVar> dim_map_Iter){
-  Map<Var, PrimExpr> vmap;
-  Array<PrimExpr> input_shape, tile_size, dim_map;
-  for (size_t i = 0; i < input_shape_Iter.size(); i++) {
-    vmap.Set(input_shape_Iter[i]->var, InputPlaceholder(i));
-    CHECK(is_zero(input_shape_Iter[i]->dom->min));
-    input_shape.push_back(input_shape_Iter[i]->dom->extent);
-  }
-  for (size_t i = 0; i < tile_size_Iter.size(); i++) {
-    vmap.Set(tile_size_Iter[i]->var, InputPlaceholder(i));
-    CHECK(is_zero(tile_size_Iter[i]->dom->min));
-    tile_size.push_back(tile_size_Iter[i]->dom->extent);
-  }
-  for (size_t i = 0; i < dim_map_Iter.size(); i++) {
-    vmap.Set(dim_map_Iter[i]->var, InputPlaceholder(i));
-    CHECK(is_zero(dim_map_Iter[i]->dom->min));
-    dim_map.push_back(dim_map_Iter[i]->dom->extent);
-  }
-  auto n = tvm::ffi::make_object<TileLayoutNode>(input_shape, tile_size, dim_map);
-  data_ = std::move(n);
-}
-
 Layout::Layout(Array<IterVar> forward_var, Array<PrimExpr> forward_index) {
   Map<Var, PrimExpr> vmap;
   Array<PrimExpr> input_size;
@@ -770,9 +748,9 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef()
       .def_packed("tl.TileLayout",
                   [](PackedArgs args, Any *rv) {
-                    *rv = TileLayout(args[0].cast<Array<IterVar>>(),
-                                     args[1].cast<Array<IterVar>>(),
-                                     args[2].cast<Array<IterVar>>());
+                    *rv = TileLayout(args[0].cast<Array<PrimExpr>>(),
+                                     args[1].cast<Array<PrimExpr>>(),
+                                     args[2].cast<Array<PrimExpr>>());
                   })
       .def_packed("tl.Layout",
                   [](PackedArgs args, Any *rv) {

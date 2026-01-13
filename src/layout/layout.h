@@ -112,7 +112,7 @@ protected:
 
 class TileLayout : public ObjectRef {
 public:
-  TVM_DLL TileLayout(Array<IterVar> input_shape_Iter, Array<IterVar> tile_size_Iter, Array<IterVar> dim_map_Iter);
+  // Only keep the PrimExpr version to avoid FFI overload resolution issues
   TVM_DLL TileLayout(Array<PrimExpr> input_shape, Array<PrimExpr> tile_size, Array<PrimExpr> dim_map);
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(TileLayout, ObjectRef, TileLayoutNode);
 };
