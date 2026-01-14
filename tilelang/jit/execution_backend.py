@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from tvm.target import Target
+from tilelang.jit.adapter.utils import is_cutedsl_target
 
 # Canonical names for execution backends used internally
 _CANONICAL_MAP = {
@@ -30,22 +31,25 @@ def allowed_backends_for_target(target: Target, *, include_unavailable: bool = T
     """
     kind = _target_kind(target)
 
-    if kind == "cuda":
-        allowed = ["tvm_ffi", "nvrtc", "cython", "ctypes"]
+    if is_cutedsl_target(target):
+        return ["cutedsl"]
+    elif kind == "cuda":
+        allowed = ["tvm_ffi", "nvrtc", "cython"]
     elif kind == "hip":
-        allowed = ["tvm_ffi", "cython", "ctypes"]
+        allowed = ["tvm_ffi", "cython"]
     elif kind == "metal":
         allowed = ["torch"]
     elif kind == "c":  # CPU C backend
-        allowed = ["cython", "ctypes", "tvm_ffi"]
+        allowed = ["cython", "tvm_ffi"]
     else:
         # Fallback: prefer portable hosts
-        allowed = ["cython", "ctypes", "tvm_ffi"]
+        allowed = ["cython", "tvm_ffi"]
 
     if not include_unavailable:
         # Drop NVRTC if not importable
         try:
             from tilelang.jit.adapter.nvrtc import is_nvrtc_available  # lazy
+
             if not is_nvrtc_available and "nvrtc" in allowed:
                 allowed = [b for b in allowed if b != "nvrtc"]
         except Exception:
@@ -73,6 +77,8 @@ def resolve_execution_backend(requested: str | None, target: Target) -> str:
 
     # Default selection for auto/None
     if req in (None, "auto"):
+        if is_cutedsl_target(target):
+            return "cutedsl"
         kind = _target_kind(target)
         if kind == "cuda":
             choice = "tvm_ffi"
@@ -89,12 +95,14 @@ def resolve_execution_backend(requested: str | None, target: Target) -> str:
     if req not in allowed_all:
         raise ValueError(
             f"Invalid execution backend '{requested}' for target '{_target_kind(target)}'. "
-            f"Allowed: {_format_options(allowed_all)}. Tip: use execution_backend='auto'.")
+            f"Allowed: {_format_options(allowed_all)}. Tip: use execution_backend='auto'."
+        )
 
     # Promote to availability-aware set for nicer errors (e.g., nvrtc not installed)
     if req not in allowed_avail:
         raise ValueError(
             f"Execution backend '{requested}' requires extra dependencies and is not available now. "
-            f"Try one of: {_format_options(allowed_avail)}.")
+            f"Try one of: {_format_options(allowed_avail)}."
+        )
 
     return req

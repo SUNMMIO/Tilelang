@@ -6,14 +6,15 @@ from tvm.ir.base import Node
 from tvm.ir import Range
 from tvm.runtime import Scriptable
 import tvm_ffi
-from tilelang.ir import GemmWarpPolicy as GemmWarpPolicy
 from .gemm_mma import GemmMMA
 from .gemm_mma_sm70 import GemmMMASm70
 from .gemm_wgmma import GemmWGMMA
 from .gemm_tcgen05 import GemmTCGEN5
 from .gemm_mfma import GemmMFMA
+from .gemm_cutedsl import GemmCuTeDSL
 from tilelang import _ffi_api
 from tilelang.utils.target import target_is_volta
+from tilelang.jit.adapter.utils import is_cutedsl_target
 
 
 @tvm_ffi.register_global_func("tl.gemm_py.infer_layout")
@@ -23,8 +24,7 @@ def gemm_py_infer_layout(gemm_py: GemmMMA, target: Target, thread_bounds: Range)
 
 
 @tvm_ffi.register_global_func("tl.gemm_py.lower")
-def gemm_py_lower(gemm_py: GemmMMA, layout_map, target: Target, thread_bounds: Range,
-                  thread_var: tir.Var):
+def gemm_py_lower(gemm_py: GemmMMA, layout_map, target: Target, thread_bounds: Range, thread_var: tir.Var):
     thread_nums = thread_bounds.extent
     stmt = gemm_py.lower(layout_map, target, thread_nums, thread_var)
     return stmt
@@ -170,6 +170,7 @@ class GemmPy(Node, Scriptable):
 
         Args:
             gemm_inst: The selected GEMM instruction type
+            target: Target architecture
 
         Returns:
             The implementation class for the instruction type
@@ -178,6 +179,10 @@ class GemmPy(Node, Scriptable):
             NotImplementedError: If the instruction type is not supported
             ValueError: If the instruction type is unknown
         """
+        # CuTeDSL backend uses direct intrinsic call, bypass complex lowering
+        if is_cutedsl_target(target):
+            return GemmCuTeDSL
+
         if gemm_inst.is_mma():
             if target_is_volta(target):
                 return GemmMMASm70

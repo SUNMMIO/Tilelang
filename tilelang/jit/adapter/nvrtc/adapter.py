@@ -27,18 +27,19 @@ class NVRTCKernelAdapter(BaseKernelAdapter):
     pymodule = None
     kernels = {}
 
-    def __init__(self,
-                 params: list[KernelParam],
-                 result_idx: list[int],
-                 target: str | Target,
-                 func_or_mod: tir.PrimFunc | tvm.IRModule,
-                 host_mod: tvm.IRModule | None = None,
-                 device_mod: tvm.IRModule | None = None,
-                 device_kernel_source: str | None = None,
-                 verbose: bool = False,
-                 pass_configs: dict[str, Any] | None = None,
-                 compile_flags: list[str] | None = None):
-
+    def __init__(
+        self,
+        params: list[KernelParam],
+        result_idx: list[int],
+        target: str | Target,
+        func_or_mod: tir.PrimFunc | tvm.IRModule,
+        host_mod: tvm.IRModule | None = None,
+        device_mod: tvm.IRModule | None = None,
+        device_kernel_source: str | None = None,
+        verbose: bool = False,
+        pass_configs: dict[str, Any] | None = None,
+        compile_flags: list[str] | None = None,
+    ):
         check_nvrtc_available()
 
         self.params = params
@@ -51,7 +52,8 @@ class NVRTCKernelAdapter(BaseKernelAdapter):
             self.ir_module = func_or_mod
 
         # Cache parameter information during initialization
-        self.param_dtypes = [param.dtype for param in params]
+        # Convert tvm.DataType to torch.dtype for tensor creation
+        self.param_dtypes = [param.torch_dtype() for param in params]
         self.param_shapes = []
         for param in params:
             native_shape = []
@@ -74,7 +76,9 @@ class NVRTCKernelAdapter(BaseKernelAdapter):
         self.wrapper.assign_pass_configs(pass_configs)
         self.wrapper.assign_host_module(host_mod)
         self.wrapper.assign_device_module(device_mod)
-        self.host_func, self.function_names = self.wrapper.wrap(device_kernel_source)
+        wrapper_result = self.wrapper.wrap(device_kernel_source)
+        self.host_func = wrapper_result["host_func"]
+        self.function_names = wrapper_result["function_names"]
 
         self.lib_generator = NVRTCLibraryGenerator(self.target, self.verbose)
         self.lib_generator.update_lib_code(self.device_kernel_source)
@@ -92,17 +96,19 @@ class NVRTCKernelAdapter(BaseKernelAdapter):
         self._post_init()
 
     @classmethod
-    def from_database(cls,
-                      params: list[KernelParam],
-                      result_idx: list[int],
-                      target: str,
-                      func_or_mod: tir.PrimFunc | tvm.IRModule,
-                      host_kernel_source: str,
-                      device_kernel_source: str,
-                      kernel_lib_path: str,
-                      verbose: bool = False,
-                      pass_configs: dict[str, Any] | None = None,
-                      compile_flags: list[str] | None = None):
+    def from_database(
+        cls,
+        params: list[KernelParam],
+        result_idx: list[int],
+        target: str,
+        func_or_mod: tir.PrimFunc | tvm.IRModule,
+        host_kernel_source: str,
+        device_kernel_source: str,
+        kernel_lib_path: str,
+        verbose: bool = False,
+        pass_configs: dict[str, Any] | None = None,
+        compile_flags: list[str] | None = None,
+    ):
         adapter = cls.__new__(cls)
         adapter.params = params
         adapter.result_idx = adapter._legalize_result_idx(result_idx)
@@ -115,7 +121,8 @@ class NVRTCKernelAdapter(BaseKernelAdapter):
             adapter.ir_module = func_or_mod
 
         # Cache parameter information during initialization
-        adapter.param_dtypes = [param.dtype for param in params]
+        # Convert tvm.DataType to torch.dtype for tensor creation
+        adapter.param_dtypes = [param.torch_dtype() for param in params]
         adapter.param_shapes = []
         for param in params:
             native_shape = []
@@ -183,8 +190,7 @@ class NVRTCKernelAdapter(BaseKernelAdapter):
             return self.host_func
 
     def _forward_from_prebuild_lib(self, *args, stream: int | None = None):
-        """Low-level function to call the compiled CUDA kernel.
-        """
+        """Low-level function to call the compiled CUDA kernel."""
         return self.pymodule.call(self.kernels, *args, stream=stream)
 
     def _wrap_forward_from_prebuild_lib(self, *ins: list[torch.Tensor], stream: int | None = None):

@@ -1,4 +1,8 @@
 from __future__ import annotations
+
+
+import torch
+
 from platform import mac_ver
 from typing import Literal
 from tilelang import tvm as tvm
@@ -15,6 +19,7 @@ SUPPORTED_TARGETS: dict[str, str] = {
     "llvm": "LLVM CPU target (accepts standard TVM LLVM options).",
     "webgpu": "WebGPU target for browser/WebGPU runtimes.",
     "c": "C source backend.",
+    "cutedsl": "CuTe DSL GPU target.",
 }
 
 
@@ -56,11 +61,32 @@ def check_metal_availability() -> bool:
     if not mac_release:
         return False
     # todo: check torch version?
-    return arch == 'arm64'
+    return arch == "arm64"
 
 
-def determine_target(target: str | Target | Literal["auto"] = "auto",
-                     return_object: bool = False) -> str | Target:
+def normalize_cutedsl_target(target: str | Target) -> Target | None:
+    if isinstance(target, Target):
+        if target.kind.name == "cuda" and "cutedsl" in target.keys:
+            return target
+        return None
+
+    if target.startswith("cutedsl"):
+        cuda_target_str = target.replace("cutedsl", "cuda", 1)
+
+        try:
+            temp_target = Target(cuda_target_str)
+
+            target_dict = dict(temp_target.export())
+            target_dict["keys"] = list(set(target_dict["keys"]) | {"cutedsl"})
+
+            return Target(target_dict)
+        except Exception:
+            return None
+
+    return None
+
+
+def determine_target(target: str | Target | Literal["auto"] = "auto", return_object: bool = False) -> str | Target:
     """
     Determine the appropriate target for compilation (CUDA, HIP, or manual selection).
 
@@ -89,33 +115,50 @@ def determine_target(target: str | Target | Literal["auto"] = "auto",
 
         # Determine the target based on availability
         if is_cuda_available:
-            return_var = "cuda"
+            if torch.cuda.is_available() and (cap := torch.cuda.get_device_capability(0)):
+                return_var = Target({"kind": "cuda", "arch": f"sm_{nvcc.get_target_arch(cap)}"})
+            else:
+                return_var = "cuda"
         elif is_hip_available:
             return_var = "hip"
         elif check_metal_availability():
             return_var = "metal"
         else:
             raise ValueError("No CUDA or HIP or MPS available on this system.")
-    else:
-        # Validate the target if it's not "auto"
-        if isinstance(target, Target):
-            return_var = target
-        elif isinstance(target, str):
-            normalized_target = target.strip()
-            if not normalized_target:
-                raise AssertionError(f"Target {target} is not supported")
-            try:
-                Target(normalized_target)
-            except Exception as err:
-                examples = ", ".join(f"`{name}`" for name in SUPPORTED_TARGETS)
-                raise AssertionError(
-                    f"Target {target} is not supported. Supported targets include: {examples}. "
-                    "Pass additional options after the base name, e.g. `cuda -arch=sm_80`."
-                ) from err
-            return_var = normalized_target
-        else:
-            raise AssertionError(f"Target {target} is not supported")
 
+    else:
+        possible_cutedsl_target = normalize_cutedsl_target(target)
+        if possible_cutedsl_target is not None:
+            try:
+                from tilelang.jit.adapter.cutedsl.checks import check_cutedsl_available  # lazy
+
+                check_cutedsl_available()
+            except ImportError as e:
+                raise AssertionError(f"CuTeDSL backend is not available. Please install tilelang-cutedsl package. {str(e)}") from e
+
+            return_var = possible_cutedsl_target
+        else:
+            # Validate the target if it's not "auto"
+            if isinstance(target, Target):
+                return_var = target
+            elif isinstance(target, str):
+                normalized_target = target.strip()
+                if not normalized_target:
+                    raise AssertionError(f"Target {target} is not supported")
+                try:
+                    Target(normalized_target)
+                except Exception as err:
+                    examples = ", ".join(f"`{name}`" for name in SUPPORTED_TARGETS)
+                    raise AssertionError(
+                        f"Target {target} is not supported. Supported targets include: {examples}. "
+                        "Pass additional options after the base name, e.g. `cuda -arch=sm_80`."
+                    ) from err
+                return_var = normalized_target
+            else:
+                raise AssertionError(f"Target {target} is not supported")
+
+    if isinstance(return_var, Target):
+        return return_var
     if return_object:
         if isinstance(return_var, Target):
             return return_var

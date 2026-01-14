@@ -22,8 +22,6 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kDisableSafeMemoryLegalize, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableWarpSpecialized, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableThreadStorageSync, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kConfigIndexBitwidth, Integer);
-TVM_REGISTER_PASS_CONFIG_OPTION(kDisableDynamicTailSplit, Bool);
-TVM_REGISTER_PASS_CONFIG_OPTION(kDynamicAlignment, Integer);
 TVM_REGISTER_PASS_CONFIG_OPTION(kEnableAggressiveSharedMemoryMerge, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kForceLetInline, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableFastMath, Bool);
@@ -34,8 +32,10 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kDisableVectorize256, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableWGMMA, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableShuffleElect, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kStorageRewriteDetectInplace, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kASTPrintEnable, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kLayoutVisualizationEnable, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kLayoutVisualizationFormats, String);
+TVM_REGISTER_PASS_CONFIG_OPTION(kDeviceCompileFlags, ffi::Array<ffi::String>);
 
 DataType cuTensorMapType() { return DataType::UInt(8, 128); }
 
@@ -100,6 +100,17 @@ TIR_DEFINE_TL_BUILTIN(ieee_frsqrt)
 
 TIR_DEFINE_TL_BUILTIN(ieee_fdiv).set_num_inputs(3).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kPure));
+
+TIR_DEFINE_TL_BUILTIN(rng_init).set_num_inputs(4).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(rng_rand).set_num_inputs(0).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(rng_rand_float)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 
 TIR_DEFINE_TL_BUILTIN(create_list_of_mbarrier)
     .set_num_inputs(-1)
@@ -194,6 +205,11 @@ TIR_DEFINE_TL_BUILTIN(ptx_stmatrix)
 
 TIR_DEFINE_TL_BUILTIN(ptx_cp_async_barrier_noinc)
     .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(ptx_cp_async)
+    .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -367,6 +383,11 @@ TIR_DEFINE_TL_BUILTIN(warp_reduce_bitor)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
+
+// __ldg(BufferLoad | Buffer, idx?) -> value
+// Treat as a pure call that returns the loaded value.
+TIR_DEFINE_TL_BUILTIN(__ldg).set_num_inputs(-1).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kPure));
 
 } // namespace tl
 } // namespace tvm

@@ -32,6 +32,8 @@ int TargetGetWarpSize(Target target);
 
 bool TargetIsZpu(Target target);
 
+bool IsCudaVectorizableFP8(DataType dtype);
+bool IsCudaVectorizableCast(DataType from_ty, DataType target_ty);
 
 } // namespace tl
 } // namespace tvm

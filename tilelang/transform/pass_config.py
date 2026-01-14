@@ -5,23 +5,13 @@ from enum import Enum
 
 class PassConfigKey(str, Enum):
     """Pass configuration keys for TileLang compiler."""
+
     # TileLang specific configs
     TL_SIMPLIFY = "tl.Simplify"
     """Enable/disable TileLang simplification passes. Default: True"""
 
-    TL_DYNAMIC_ALIGNMENT = "tl.dynamic_alignment"
-    """Memory alignment requirement for dynamic shapes. Default: 16"""
-
-    TL_DISABLE_DYNAMIC_TAIL_SPLIT = "tl.disable_dynamic_tail_split"
-    """Disable dynamic tail splitting optimization. Default: False"""
-
     TL_DISABLE_WARP_SPECIALIZED = "tl.disable_warp_specialized"
     """Disable warp specialization optimization. Default: False"""
-
-    TL_DISABLE_FAST_MATH = "tl.disable_fast_math"
-    """Disable fast math optimization. Default: True
-    will be deprecated in the 0.1.7 release
-    """
 
     TL_ENABLE_FAST_MATH = "tl.enable_fast_math"
     """
@@ -35,6 +25,20 @@ class PassConfigKey(str, Enum):
 
     TL_ENABLE_PTXAS_VERBOSE_OUTPUT = "tl.enable_ptxas_verbose_output"
     """Enable ptxas verbose output. Default: False"""
+
+    TL_DEVICE_COMPILE_FLAGS = "tl.device_compile_flags"
+    """Additional device compiler flags passed to nvcc/NVRTC.
+
+    Accepts either a string (parsed with shell-like splitting) or a list of
+    strings. Typical usage is to provide extra include paths, defines or
+    ptxas options, e.g.:
+
+    - "-I/opt/include -DMY_SWITCH=1 --ptxas-options=--verbose"
+    - ["-I/opt/include", "-DMY_SWITCH=1", "--ptxas-options=--verbose"]
+
+    These flags are appended to the compiler options used in the tvm_ffi
+    CUDA compile callback. Default: None
+    """
 
     TL_CONFIG_INDEX_BITWIDTH = "tl.config_index_bitwidth"
     """Bitwidth for configuration indices. Default: 32"""
@@ -69,6 +73,9 @@ class PassConfigKey(str, Enum):
     TL_FORCE_LET_INLINE = "tl.force_let_inline"
     """Force TileLang to inline let bindings during simplification. Default: False"""
 
+    TL_AST_PRINT_ENABLE = "tl.ast_print_enable"
+    """Enable TIR AST printing for debugging purposes. Default: False"""
+
     TL_LAYOUT_VISUALIZATION_ENABLE = "tl.layout_visualization_enable"
     """Enable layout inference visualization. Default: False"""
 
@@ -85,10 +92,10 @@ class PassConfigKey(str, Enum):
     such as `dst[i] = f(src[i])`, avoiding implicit aliasing:
 
     ```
-    read = T.allocate([1], "int32", "local.var")
-    write = T.allocate([1], "int32", "local.var")
-    read_buf = T.Buffer((1,), "int32", data=read, scope="local.var")
-    write_buf = T.Buffer((1,), "int32", data=write, scope="local.var")
+    read = T.allocate([1], T.int32, "local.var")
+    write = T.allocate([1], T.int32, "local.var")
+    read_buf = T.Buffer((1,), T.int32, data=read, scope="local.var")
+    write_buf = T.Buffer((1,), T.int32, data=write, scope="local.var")
     write_buf[0] = read_buf[0] * 2
     f(write_buf[0])
     ```
@@ -98,8 +105,8 @@ class PassConfigKey(str, Enum):
     like:
 
     ```
-    read = T.allocate([1], "int32", "local.var")
-    read_buf = T.Buffer((1,), "int32", data=read, scope="local.var")
+    read = T.allocate([1], T.int32, "local.var")
+    read_buf = T.Buffer((1,), T.int32, data=read, scope="local.var")
     read_buf[0] = read_buf[0] * 2
     f(read_buf[0])
     ```

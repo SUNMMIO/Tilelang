@@ -1,3 +1,4 @@
+import pytest
 from tilelang import tvm as tvm
 from tilelang.utils.sparse import compress, randn_semi_sparse, randint_semi_sparse
 from tilelang.utils.tensor import torch_assert_close, map_torch_type
@@ -6,6 +7,7 @@ from tilelang.intrinsics.mma_sp_macro_generator import SparseTensorCoreIntrinEmi
 
 import tilelang.testing
 import torch
+import tilelang.language as T
 
 
 def matmul(
@@ -30,24 +32,24 @@ def matmul(
     A_shared_shape = (block_M, block_K // 2) if not trans_A else (block_K // 2, block_M)
     B_shared_shape = (block_N, block_K) if trans_B else (block_K, block_N)
 
-    import tilelang.language as T
-
     @T.prim_func
     def main(
-            A_sparse: T.Tensor(A_sparse_shape, in_dtype),
-            E: T.Tensor((M, K // E_factor), metadata_dtype),
-            B: T.Tensor(B_shape, in_dtype),
-            C: T.Tensor((M, N), out_dtype),
+        A_sparse: T.Tensor(A_sparse_shape, in_dtype),
+        E: T.Tensor((M, K // E_factor), metadata_dtype),
+        B: T.Tensor(B_shape, in_dtype),
+        C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             A_shared = T.alloc_shared(A_shared_shape, in_dtype)
             B_shared = T.alloc_shared(B_shared_shape, in_dtype)
             E_shared = T.alloc_shared((block_M, block_K // E_factor), metadata_dtype)
             C_frag = T.alloc_fragment((block_M, block_N), accum_dtype)
-            T.annotate_layout({
-                E: make_cutlass_metadata_layout(E, mma_dtype=in_dtype, arch="8.0"),
-                E_shared: make_cutlass_metadata_layout(E_shared, mma_dtype=in_dtype, arch="8.0"),
-            })
+            T.annotate_layout(
+                {
+                    E: make_cutlass_metadata_layout(E, mma_dtype=in_dtype, arch="8.0"),
+                    E_shared: make_cutlass_metadata_layout(E_shared, mma_dtype=in_dtype, arch="8.0"),
+                }
+            )
             T.clear(C_frag)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
                 T.copy(E[by * block_M, k * block_K // E_factor], E_shared)
@@ -80,7 +82,7 @@ def run_gemm_ss(
     num_stages=3,
     num_threads=128,
 ):
-    metadata_dtype = 'int32' if ('8' in in_dtype) else 'int16'
+    metadata_dtype = T.int32 if ("8" in in_dtype) else T.int16
     program = matmul(
         M,
         N,
@@ -105,7 +107,8 @@ def run_gemm_ss(
         pass_configs={
             tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        })
+        },
+    )
     A, B = generate_dense_input(M, N, K, trans_A, trans_B, in_dtype)
 
     A_sparse, E = compress(A, transposed=trans_A, block_k=block_K, arch="8.0")
@@ -142,57 +145,33 @@ def generate_dense_input(M, N, K, trans_A, trans_B, in_dtype):
             low, high = (0, 4) if is_unsigned else (-2, 2)
         else:
             low, high = (0, 128) if is_unsigned else (-64, 64)
-        A = randint_semi_sparse(
-            M,
-            K,
-            low=low,
-            high=high,
-            dtype=map_torch_type(in_dtype),
-            device='cuda',
-            transposed=trans_A)
-        B = torch.randint(
-            size=(N, K) if trans_B else (K, N),
-            low=low,
-            high=high,
-            dtype=map_torch_type(in_dtype),
-            device='cuda')
+        A = randint_semi_sparse(M, K, low=low, high=high, dtype=map_torch_type(in_dtype), device="cuda", transposed=trans_A)
+        B = torch.randint(size=(N, K) if trans_B else (K, N), low=low, high=high, dtype=map_torch_type(in_dtype), device="cuda")
     else:
-        A = randn_semi_sparse(
-            M, K, dtype=map_torch_type(in_dtype), device='cuda', transposed=trans_A)
-        B = torch.randn(
-            (N, K) if trans_B else (K, N), device='cuda',
-            dtype=torch.float32).to(map_torch_type(in_dtype))
+        A = randn_semi_sparse(M, K, dtype=map_torch_type(in_dtype), device="cuda", transposed=trans_A)
+        B = torch.randn((N, K) if trans_B else (K, N), device="cuda", dtype=torch.float32).to(map_torch_type(in_dtype))
     return A, B
 
 
-def test_gemm_ss():
-    # More test case can be found in kernel/test_tilelang_kernel_gemm.py
-    # GEMM tests for float16
-    # TODO: support transposed A compressor
-    run_gemm_ss(512, 1024, 768, False, True, "float16", "float16", "float", 128, 128, 32, 2)
-    run_gemm_ss(512, 1024, 768, False, False, "float16", "float16", "float", 128, 128, 32, 2)
-    run_gemm_ss(512, 1024, 768, True, False, "float16", "float16", "float", 128, 128, 32, 2)
-    run_gemm_ss(512, 1024, 768, True, True, "float16", "float16", "float", 128, 128, 32, 2)
-
-    # n8 test
-    run_gemm_ss(128, 8, 64, False, True, "float16", "float16", "float", 128, 8, 32, 0, 128)
-
-    # int8 test
-    run_gemm_ss(128, 128, 128, False, True, "int8", "int32", "int32", 128, 128, 64, 2)
-    run_gemm_ss(128, 128, 128, False, False, "int8", "int8", "int32", 128, 128, 64, 2)
-    run_gemm_ss(128, 128, 128, True, False, "int8", "int8", "int32", 128, 128, 64, 2)
-    run_gemm_ss(128, 128, 128, True, True, "int8", "int8", "int32", 128, 128, 64, 2)
-
-    # float8 tests
-    run_gemm_ss(128, 128, 128, False, True, "float8_e5m2", "float8_e5m2", "float32", 128, 128, 64,
-                2)
-    run_gemm_ss(128, 128, 128, True, True, "float8_e5m2", "float8_e5m2", "float32", 128, 128, 64, 2)
-
-    # tfloat32 test
-    # run_gemm_ss(128, 128, 128, False, False, "float", "float", "float32", 128, 128, 32, 2)
-    # run_gemm_ss(128, 128, 128, False, True, "float", "float", "float32", 128, 128, 32, 2)
-    # run_gemm_ss(128, 128, 128, True, False, "float", "float", "float32", 128, 128, 32, 2)
-    # run_gemm_ss(128, 128, 128, True, True, "float", "float", "float32", 128, 128, 32, 2)
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads",
+    [
+        (512, 1024, 768, False, True, T.float16, T.float16, T.float, 128, 128, 32, 2, 128),
+        (512, 1024, 768, False, False, T.float16, T.float16, T.float, 128, 128, 32, 2, 128),
+        (512, 1024, 768, True, False, T.float16, T.float16, T.float, 128, 128, 32, 2, 128),
+        (512, 1024, 768, True, True, T.float16, T.float16, T.float, 128, 128, 32, 2, 128),
+        (128, 8, 64, False, True, T.float16, T.float16, T.float, 128, 8, 32, 0, 128),
+        (128, 128, 128, False, True, T.int8, T.int32, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, False, False, T.int8, T.int8, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, True, False, T.int8, T.int8, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, True, True, T.int8, T.int8, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, False, True, T.float8_e5m2, T.float8_e5m2, T.float32, 128, 128, 64, 2, 128),
+        (128, 128, 128, True, True, T.float8_e5m2, T.float8_e5m2, T.float32, 128, 128, 64, 2, 128),
+    ],
+)
+def test_gemm_ss(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads):
+    run_gemm_ss(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads)
 
 
 def matmul_rs(
@@ -222,10 +201,10 @@ def matmul_rs(
 
     @T.prim_func
     def main(
-            A_sparse: T.Tensor(A_sparse_shape, in_dtype),
-            E: T.Tensor((M, K // E_factor), metadata_dtype),
-            B: T.Tensor(B_shape, in_dtype),
-            C: T.Tensor((M, N), out_dtype),
+        A_sparse: T.Tensor(A_sparse_shape, in_dtype),
+        E: T.Tensor((M, K // E_factor), metadata_dtype),
+        B: T.Tensor(B_shape, in_dtype),
+        C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             A_shared = T.alloc_shared(A_shared_shape, in_dtype)
@@ -233,11 +212,13 @@ def matmul_rs(
             E_shared = T.alloc_shared((block_M, block_K // E_factor), metadata_dtype)
             A_frag = T.alloc_fragment(A_frag_shape, in_dtype)
             C_frag = T.alloc_fragment((block_M, block_N), accum_dtype)
-            T.annotate_layout({
-                A_shared: tilelang.layout.make_swizzled_layout(A_shared),
-                E: make_cutlass_metadata_layout(E, mma_dtype=in_dtype, arch="8.0"),
-                E_shared: make_cutlass_metadata_layout(E_shared, mma_dtype=in_dtype, arch="8.0"),
-            })
+            T.annotate_layout(
+                {
+                    A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                    E: make_cutlass_metadata_layout(E, mma_dtype=in_dtype, arch="8.0"),
+                    E_shared: make_cutlass_metadata_layout(E_shared, mma_dtype=in_dtype, arch="8.0"),
+                }
+            )
             T.clear(C_frag)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
                 T.copy(E[by * block_M, k * block_K // E_factor], E_shared)
@@ -271,7 +252,7 @@ def run_gemm_rs(
     num_stages=3,
     num_threads=128,
 ):
-    metadata_dtype = 'int32' if ('8' in in_dtype) else 'int16'
+    metadata_dtype = T.int32 if ("8" in in_dtype) else T.int16
     program = matmul_rs(
         M,
         N,
@@ -289,14 +270,14 @@ def run_gemm_rs(
         num_stages,
         num_threads,
     )
-
     kernel = tilelang.compile(
         program,
         out_idx=[3],
         pass_configs={
             tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        })
+        },
+    )
     A, B = generate_dense_input(M, N, K, trans_A, trans_B, in_dtype)
     A_sparse, E = compress(A, transposed=trans_A, block_k=block_K, arch="8.0")
     C_sp = kernel(A_sparse, E, B)
@@ -323,30 +304,24 @@ def run_gemm_rs(
     print("pass")
 
 
-def test_gemm_rs():
-    # GEMM tests for float16
-    run_gemm_rs(512, 1024, 768, False, False, "float16", "float16", "float", 128, 256, 32, 2)
-    run_gemm_rs(512, 1024, 768, False, True, "float16", "float16", "float", 128, 256, 32, 2)
-    run_gemm_rs(512, 1024, 768, True, False, "float16", "float16", "float", 128, 256, 32, 2)
-    run_gemm_rs(512, 1024, 768, True, True, "float16", "float16", "float", 128, 256, 32, 2)
-
-    # n8 tests
-    run_gemm_rs(128, 8, 64, False, True, "float16", "float16", "float", 128, 8, 32, 0, 128)
-
-    # int8 tests
-    run_gemm_rs(128, 128, 128, False, True, "int8", "int8", "int32", 128, 128, 64, 2)
-    run_gemm_rs(128, 128, 128, False, False, "int8", "int8", "int32", 128, 128, 64, 2)
-    run_gemm_rs(128, 128, 128, True, False, "int8", "int8", "int32", 128, 128, 64, 2)
-    run_gemm_rs(128, 128, 128, True, True, "int8", "int8", "int32", 128, 128, 64, 2)
-
-    # float8 tests
-    run_gemm_rs(128, 128, 128, True, True, "float8_e5m2", "float8_e5m2", "float32", 128, 128, 64, 2)
-
-    # float32 tests
-    # run_gemm_rs(128, 128, 128, False, False, "float", "float", "float32", 128, 128, 32, 2)
-    # run_gemm_rs(128, 128, 128, False, True, "float", "float", "float32", 128, 128, 32, 2)
-    # run_gemm_rs(128, 128, 128, True, False, "float", "float", "float32", 128, 128, 32, 2)
-    # run_gemm_rs(128, 128, 128, True, True, "float", "float", "float32", 128, 128, 32, 2)
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads",
+    [
+        (512, 1024, 768, False, False, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (512, 1024, 768, False, True, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (512, 1024, 768, True, False, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (512, 1024, 768, True, True, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (128, 8, 64, False, True, T.float16, T.float16, T.float32, 128, 8, 32, 0, 128),
+        (128, 128, 128, False, True, T.int8, T.int8, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, False, False, T.int8, T.int8, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, True, False, T.int8, T.int8, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, True, True, T.int8, T.int8, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, True, True, T.float8_e5m2, T.float8_e5m2, T.float32, 128, 128, 64, 2, 128),
+    ],
+)
+def test_gemm_rs(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads):
+    run_gemm_rs(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads)
 
 
 def matmul_sr(
@@ -376,10 +351,10 @@ def matmul_sr(
 
     @T.prim_func
     def main(
-            A_sparse: T.Tensor(A_sparse_shape, in_dtype),
-            E: T.Tensor((M, K // E_factor), metadata_dtype),
-            B: T.Tensor(B_shape, in_dtype),
-            C: T.Tensor((M, N), out_dtype),
+        A_sparse: T.Tensor(A_sparse_shape, in_dtype),
+        E: T.Tensor((M, K // E_factor), metadata_dtype),
+        B: T.Tensor(B_shape, in_dtype),
+        C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             A_shared = T.alloc_shared(A_shared_shape, in_dtype)
@@ -387,11 +362,13 @@ def matmul_sr(
             E_shared = T.alloc_shared((block_M, block_K // E_factor), metadata_dtype)
             B_frag = T.alloc_fragment(B_frag_shape, in_dtype)
             C_frag = T.alloc_fragment((block_M, block_N), accum_dtype)
-            T.annotate_layout({
-                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
-                E: make_cutlass_metadata_layout(E, mma_dtype=in_dtype, arch="8.0"),
-                E_shared: make_cutlass_metadata_layout(E_shared, mma_dtype=in_dtype, arch="8.0"),
-            })
+            T.annotate_layout(
+                {
+                    B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+                    E: make_cutlass_metadata_layout(E, mma_dtype=in_dtype, arch="8.0"),
+                    E_shared: make_cutlass_metadata_layout(E_shared, mma_dtype=in_dtype, arch="8.0"),
+                }
+            )
             T.clear(C_frag)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
                 T.copy(E[by * block_M, k * block_K // E_factor], E_shared)
@@ -425,7 +402,7 @@ def run_gemm_sr(
     num_stages=3,
     num_threads=128,
 ):
-    metadata_dtype = 'int32' if ('8' in in_dtype) else 'int16'
+    metadata_dtype = T.int32 if ("8" in in_dtype) else T.int16
     program = matmul_sr(
         M,
         N,
@@ -450,7 +427,8 @@ def run_gemm_sr(
         pass_configs={
             tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        })
+        },
+    )
     A, B = generate_dense_input(M, N, K, trans_A, trans_B, in_dtype)
     A_sparse, E = compress(A, transposed=trans_A, block_k=block_K, arch="8.0")
     C_sp = kernel(A_sparse, E, B)
@@ -477,30 +455,24 @@ def run_gemm_sr(
     print("pass")
 
 
-def test_gemm_sr():
-    # GEMM tests for float16
-    run_gemm_sr(512, 1024, 768, False, False, "float16", "float16", "float", 128, 256, 32, 2)
-    run_gemm_sr(512, 1024, 768, False, True, "float16", "float16", "float", 128, 256, 32, 2)
-    run_gemm_sr(512, 1024, 768, True, False, "float16", "float16", "float", 128, 256, 32, 2)
-    run_gemm_sr(512, 1024, 768, True, True, "float16", "float16", "float", 128, 256, 32, 2)
-
-    # n8 tests
-    run_gemm_sr(128, 8, 64, False, True, "float16", "float16", "float", 128, 8, 32, 0, 128)
-
-    # int8 tests
-    run_gemm_sr(128, 128, 128, False, True, "int8", "int8", "int32", 128, 128, 128, 2)
-    run_gemm_sr(128, 128, 128, False, False, "int8", "int8", "int32", 128, 128, 128, 2)
-    run_gemm_sr(128, 128, 128, True, False, "int8", "int8", "int32", 128, 128, 64, 2)
-    run_gemm_sr(128, 128, 128, True, True, "int8", "int8", "int32", 128, 128, 64, 2)
-
-    # float8 tests
-    run_gemm_sr(128, 128, 128, True, True, "float8_e5m2", "float8_e5m2", "float32", 128, 128, 64, 2)
-
-    # float32 tests
-    # run_gemm_sr(128, 128, 128, False, False, "float", "float", "float32", 128, 128, 32, 2)
-    # run_gemm_sr(128, 128, 128, False, True, "float", "float", "float32", 128, 128, 32, 2)
-    # run_gemm_sr(128, 128, 128, True, False, "float", "float", "float32", 128, 128, 32, 2)
-    # run_gemm_sr(128, 128, 128, True, True, "float", "float", "float32", 128, 128, 32, 2)
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads",
+    [
+        (512, 1024, 768, False, False, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (512, 1024, 768, False, True, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (512, 1024, 768, True, False, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (512, 1024, 768, True, True, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (128, 8, 64, False, True, T.float16, T.float16, T.float32, 128, 8, 32, 0, 128),
+        (128, 128, 128, False, True, T.int8, T.int8, T.int32, 128, 128, 128, 2, 128),
+        (128, 128, 128, False, False, T.int8, T.int8, T.int32, 128, 128, 128, 2, 128),
+        (128, 128, 128, True, False, T.int8, T.int8, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, True, True, T.int8, T.int8, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, True, True, T.float8_e5m2, T.float8_e5m2, T.float32, 128, 128, 64, 2, 128),
+    ],
+)
+def test_gemm_sr(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads):
+    run_gemm_sr(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads)
 
 
 def matmul_rr(
@@ -531,10 +503,10 @@ def matmul_rr(
 
     @T.prim_func
     def main(
-            A_sparse: T.Tensor(A_sparse_shape, in_dtype),
-            E: T.Tensor((M, K // E_factor), metadata_dtype),
-            B: T.Tensor(B_shape, in_dtype),
-            C: T.Tensor((M, N), out_dtype),
+        A_sparse: T.Tensor(A_sparse_shape, in_dtype),
+        E: T.Tensor((M, K // E_factor), metadata_dtype),
+        B: T.Tensor(B_shape, in_dtype),
+        C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             A_shared = T.alloc_shared(A_shared_shape, in_dtype)
@@ -543,12 +515,14 @@ def matmul_rr(
             A_frag = T.alloc_fragment(A_frag_shape, in_dtype)
             B_frag = T.alloc_fragment(B_frag_shape, in_dtype)
             C_frag = T.alloc_fragment((block_M, block_N), accum_dtype)
-            T.annotate_layout({
-                A_shared: tilelang.layout.make_swizzled_layout(A_shared),
-                B_shared: tilelang.layout.make_swizzled_layout(B_shared),
-                E: make_cutlass_metadata_layout(E, mma_dtype=in_dtype, arch="8.0"),
-                E_shared: make_cutlass_metadata_layout(E_shared, mma_dtype=in_dtype, arch="8.0"),
-            })
+            T.annotate_layout(
+                {
+                    A_shared: tilelang.layout.make_swizzled_layout(A_shared),
+                    B_shared: tilelang.layout.make_swizzled_layout(B_shared),
+                    E: make_cutlass_metadata_layout(E, mma_dtype=in_dtype, arch="8.0"),
+                    E_shared: make_cutlass_metadata_layout(E_shared, mma_dtype=in_dtype, arch="8.0"),
+                }
+            )
             T.clear(C_frag)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
                 T.copy(E[by * block_M, k * block_K // E_factor], E_shared)
@@ -583,7 +557,7 @@ def run_gemm_rr(
     num_stages=3,
     num_threads=128,
 ):
-    metadata_dtype = 'int32' if ('8' in in_dtype) else 'int16'
+    metadata_dtype = T.int32 if ("8" in in_dtype) else T.int16
     program = matmul_rr(
         M,
         N,
@@ -608,7 +582,8 @@ def run_gemm_rr(
         pass_configs={
             tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
             tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-        })
+        },
+    )
     A, B = generate_dense_input(M, N, K, trans_A, trans_B, in_dtype)
     A_sparse, E = compress(A, transposed=trans_A, block_k=block_K, arch="8.0")
     C_sp = kernel(A_sparse, E, B)
@@ -635,31 +610,26 @@ def run_gemm_rr(
     print("pass")
 
 
-def test_gemm_rr():
-    # GEMM tests for float16
-    run_gemm_rr(512, 1024, 768, False, False, "float16", "float16", "float", 128, 256, 32, 2)
-    run_gemm_rr(512, 1024, 768, False, True, "float16", "float16", "float", 128, 256, 32, 2)
-    run_gemm_rr(512, 1024, 768, True, False, "float16", "float16", "float", 128, 256, 32, 2)
-    run_gemm_rr(512, 1024, 768, True, True, "float16", "float16", "float", 128, 256, 32, 2)
-    run_gemm_rr(512, 1024, 768, False, True, "bfloat16", "bfloat16", "float", 128, 256, 32, 2)
-    # n8 tests
-    run_gemm_rr(128, 8, 128, False, True, "float16", "float16", "float", 128, 8, 32, 2)
-    run_gemm_rr(128, 8, 128, False, True, "int8", "int8", "int32", 128, 8, 64, 2)
-
-    # int8 tests
-    run_gemm_rr(128, 128, 128, False, True, "int8", "int8", "int32", 128, 128, 64, 2)
-    run_gemm_rr(128, 128, 128, False, False, "int8", "int8", "int32", 128, 128, 64, 2)
-    run_gemm_rr(128, 128, 128, True, False, "int8", "int8", "int32", 128, 128, 64, 2)
-    run_gemm_rr(128, 128, 128, True, True, "int8", "int8", "int32", 128, 128, 64, 2)
-
-    # float8 tests
-    run_gemm_rr(128, 128, 128, True, True, "float8_e5m2", "float8_e5m2", "float32", 128, 128, 64, 2)
-
-    # float32 tests
-    # run_gemm_rr(128, 128, 128, False, False, "float", "float", "float32", 128, 128, 32, 2)
-    # run_gemm_rr(128, 128, 128, False, True, "float", "float", "float32", 128, 128, 32, 2)
-    # run_gemm_rr(128, 128, 128, True, False, "float", "float", "float32", 128, 128, 32, 2)
-    # run_gemm_rr(128, 128, 128, True, True, "float", "float", "float32", 128, 128, 32, 2)
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize(
+    "M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads",
+    [
+        (512, 1024, 768, False, False, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (512, 1024, 768, False, True, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (512, 1024, 768, True, False, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (512, 1024, 768, True, True, T.float16, T.float16, T.float32, 128, 256, 32, 2, 128),
+        (512, 1024, 768, False, True, T.bfloat16, T.bfloat16, T.float32, 128, 256, 32, 2, 128),
+        (128, 8, 128, False, True, T.float16, T.float16, T.float32, 128, 8, 32, 2, 128),
+        (128, 8, 128, False, True, T.int8, T.int8, T.int32, 128, 8, 64, 2, 128),
+        (128, 128, 128, False, True, T.int8, T.int8, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, False, False, T.int8, T.int8, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, True, False, T.int8, T.int8, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, True, True, T.int8, T.int8, T.int32, 128, 128, 64, 2, 128),
+        (128, 128, 128, True, True, T.float8_e5m2, T.float8_e5m2, T.float32, 128, 128, 64, 2, 128),
+    ],
+)
+def test_gemm_rr(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads):
+    run_gemm_rr(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads)
 
 
 if __name__ == "__main__":

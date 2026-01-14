@@ -136,6 +136,7 @@ file(GLOB TILE_LANG_SRCS
   src/*.cc
   src/layout/*.cc
   src/transform/*.cc
+  src/transform/common/*.cc
   src/op/*.cc
   src/target/utils.cc
   src/target/codegen_c_host.cc
@@ -214,11 +215,23 @@ elseif(USE_CUDA)
     src/runtime/runtime.cc
     src/target/ptx.cc
     src/target/codegen_cuda.cc
+    src/target/codegen_py.cc
+    src/target/codegen_utils.cc
+    src/target/codegen_cutedsl.cc
     src/target/rt_mod_cuda.cc
+    src/target/rt_mod_cutedsl.cc
   )
   list(APPEND TILE_LANG_SRCS ${TILE_LANG_CUDA_SRCS})
 
   list(APPEND TILE_LANG_INCLUDES ${CUDAToolkit_INCLUDE_DIRS})
+endif()
+
+set(USE_Z3      ON CACHE STRING "Use Z3 SMT solver for TileLang optimizations")
+set(USE_PYPI_Z3 ON CACHE BOOL   "Use Z3 provided by PyPI z3-solver package")
+
+if(USE_Z3 AND USE_PYPI_Z3)
+  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/pypi-z3")
+  find_package(Z3 REQUIRED)
 endif()
 
 # Include tvm after configs have been populated
@@ -228,7 +241,11 @@ add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)
 add_compile_definitions(DMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>)
 
 add_library(tilelang_objs OBJECT ${TILE_LANG_SRCS})
+
+# Set debug mode compile definitions
+# We open the deubg option of TVM, i.e. TVM_LOG_DEBUG
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  message(STATUS "Building TileLang with DEBUG mode")
   target_compile_definitions(tilelang_objs PRIVATE "TVM_LOG_DEBUG")
 endif()
 
@@ -283,18 +300,34 @@ install(TARGETS tilelang_cython_wrapper
         RUNTIME DESTINATION tilelang/lib
         ARCHIVE DESTINATION tilelang/lib)
 
-# let libtilelang to search tvm/tvm_runtime in same dir
-if(APPLE)
-  set_target_properties(tilelang PROPERTIES INSTALL_RPATH "@loader_path;@loader_path/../../tvm_ffi/lib")
-  set_target_properties(tilelang_module PROPERTIES INSTALL_RPATH "@loader_path;@loader_path/../../tvm_ffi/lib")
-  set_target_properties(tvm PROPERTIES INSTALL_RPATH "@loader_path;@loader_path/../../tvm_ffi/lib")
-  set_target_properties(tvm_runtime PROPERTIES INSTALL_RPATH "@loader_path;@loader_path/../../tvm_ffi/lib")
-elseif(UNIX)
-  set_target_properties(tilelang PROPERTIES INSTALL_RPATH "\$ORIGIN:\$ORIGIN/../../tvm_ffi/lib")
-  set_target_properties(tilelang_module PROPERTIES INSTALL_RPATH "\$ORIGIN:\$ORIGIN/../../tvm_ffi/lib")
-  set_target_properties(tvm PROPERTIES INSTALL_RPATH "\$ORIGIN:\$ORIGIN/../../tvm_ffi/lib")
-  set_target_properties(tvm_runtime PROPERTIES INSTALL_RPATH "\$ORIGIN:\$ORIGIN/../../tvm_ffi/lib")
+# Copy libz3.so to build folder to workaround isolated build env issue
+if(USE_Z3 AND USE_PYPI_Z3)
+  get_target_property(Z3_LIBRARY_PATH z3::libz3 IMPORTED_LOCATION)
+  install(FILES "${Z3_LIBRARY_PATH}" DESTINATION "${CMAKE_BINARY_DIR}/tvm")
+  if(APPLE)
+    set_target_properties(tvm PROPERTIES BUILD_RPATH "@loader_path")
+  else()
+    set_target_properties(tvm PROPERTIES BUILD_RPATH "\$ORIGIN")
+  endif()
 endif()
+
+if(APPLE)
+  set(TILELANG_INSTALL_RPATH "@loader_path;@loader_path/../../tvm_ffi/lib")
+  if(USE_Z3 AND USE_PYPI_Z3)
+    # some z3 is placed in lib/ and some in bin/, we add both in rpath
+    list(APPEND TILELANG_INSTALL_RPATH "@loader_path/../../z3/lib" "@loader_path/../../z3/bin")
+  endif()
+elseif(UNIX)
+  set(TILELANG_INSTALL_RPATH "\$ORIGIN:\$ORIGIN/../../tvm_ffi/lib")
+  if(USE_Z3 AND USE_PYPI_Z3)
+    # cmake uses ; by default, we explicitly use : for linux
+    string(APPEND TILELANG_INSTALL_RPATH ":\$ORIGIN/../../z3/lib")
+  endif()
+endif()
+
+set_target_properties(
+  tilelang tilelang_module tvm tvm_runtime
+  PROPERTIES INSTALL_RPATH "${TILELANG_INSTALL_RPATH}")
 
 install(
   TARGETS tvm tvm_runtime tilelang_module tilelang

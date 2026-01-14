@@ -1,6 +1,9 @@
 import tilelang
 import tilelang.testing
 from tilelang import language as T
+from tilelang.utils.target import check_hip_availability
+
+_IS_HIP_AVAILABLE = check_hip_availability()
 
 
 @tilelang.jit
@@ -8,12 +11,12 @@ def _compile_kernel_without_inplace():
     num_tokens = T.symbolic("num_tokens")
 
     @T.prim_func
-    def buggy_kernel(x: T.Tensor[(num_tokens,), "float"]):
+    def buggy_kernel(x: T.Tensor[(num_tokens,), T.float]):
         with T.Kernel(num_tokens, threads=32) as pid:
-            read = T.alloc_var("int")
+            read = T.alloc_var(T.int)
             read = x[pid]
 
-            write = T.alloc_var("int")
+            write = T.alloc_var(T.int)
             write = read * 2
             x[pid] = write
 
@@ -23,17 +26,18 @@ def _compile_kernel_without_inplace():
 @tilelang.jit(
     pass_configs={
         tilelang.PassConfigKey.TL_STORAGE_REWRITE_DETECT_INPLACE: True,
-    },)
+    },
+)
 def _compile_kernel_with_inplace():
     num_tokens = T.symbolic("num_tokens")
 
     @T.prim_func
-    def buggy_kernel(x: T.Tensor[(num_tokens,), "float"]):
+    def buggy_kernel(x: T.Tensor[(num_tokens,), T.float]):
         with T.Kernel(num_tokens, threads=32) as pid:
-            read = T.alloc_var("int")
+            read = T.alloc_var(T.int)
             read = x[pid]
 
-            write = T.alloc_var("int")
+            write = T.alloc_var(T.int)
             write = read * 2
             x[pid] = write
 
@@ -53,8 +57,9 @@ def test_storage_rewrite_detect_inplace_toggle():
     script_off = _get_device_kernel_script(detect_inplace=False)
     script_on = _get_device_kernel_script(detect_inplace=True)
 
-    assert script_off.count("read = (read * 2);") == 0
-    assert script_on.count("read = (read * 2);") > 0
+    pattern = "read[0] = (read[0] * 2);" if _IS_HIP_AVAILABLE else "read = (read * 2);"
+    assert script_off.count(pattern) == 0
+    assert script_on.count(pattern) > 0
 
 
 if __name__ == "__main__":

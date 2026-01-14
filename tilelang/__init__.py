@@ -23,6 +23,7 @@ def _compute_version() -> str:
         if version_file.is_file():
             try:
                 from version_provider import dynamic_metadata  # type: ignore
+
                 return dynamic_metadata("version")
             except Exception:
                 # Fall back to the raw VERSION file if provider isn't available.
@@ -33,6 +34,7 @@ def _compute_version() -> str:
 
     try:
         from importlib.metadata import version as _dist_version  # py3.8+
+
         return _dist_version("tilelang")
     except Exception as exc:
         warnings.warn(
@@ -139,10 +141,11 @@ from . import (
     engine,  # noqa: F401
     tools,  # noqa: F401
 )
+from .language.v2 import dtypes  # noqa: F401
 from .autotuner import autotune  # noqa: F401
 from .transform import PassConfigKey  # noqa: F401
 
-from .engine import lower, register_cuda_postproc, register_hip_postproc  # noqa: F401
+from .engine import lower, register_cuda_postproc, register_hip_postproc, register_c_postproc  # noqa: F401
 
 from .math import *  # noqa: F403
 

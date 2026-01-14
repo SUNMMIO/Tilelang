@@ -92,7 +92,7 @@ jobs:
       - name: Upload SDist
         # Not PR to save artifact storage, as SDist is only needed for releases.
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.title, '[Release]')
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -106,8 +106,10 @@ jobs:
     strategy:
       matrix:
         target:
-          - { runner: ubuntu-latest, toolkit: "CUDA-12.1" }
+          - { runner: ubuntu-latest, toolkit: "CUDA-12.8" }
           - { runner: ubuntu-24.04-arm, toolkit: "CUDA-12.8" }
+          - { runner: ubuntu-latest, toolkit: "Nightly-CUDA-13.1" }
+          - { runner: ubuntu-24.04-arm, toolkit: "Nightly-CUDA-13.1" }
           - { runner: macos-latest, toolkit: "Metal" }
         python-version:
           # Wheels are built with Python 3.8 Limited API, they should work with all Python >= 3.8.
@@ -132,13 +134,10 @@ jobs:
           create-symlink: true
           evict-old-files: "7d"
           append-timestamp: false
-          key: wheel-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target.toolkit }}-${{ hashFiles('**/*.cc') }}
+          key: wheel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/*.cc') }}
           restore-keys: |
-            wheel-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target.toolkit }}-${{ hashFiles('**/*.cc') }}
-            wheel-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target.toolkit }}
+            wheel-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/*.cc') }}
             wheel-${{ runner.os }}-${{ runner.arch }}
-            ${{ runner.os }}-${{ runner.arch }}-${{ matrix.target.toolkit }}
-            ${{ runner.os }}-${{ runner.arch }}
 
       - name: Set CIBW_BUILD
         run: |
@@ -149,8 +148,14 @@ jobs:
 
           if [[ "${{ matrix.target.toolkit }}" == *"CUDA"* ]]; then
             CUDA_VERSION="${{ matrix.target.toolkit }}"
-            CUDA_VERSION="${CUDA_VERSION#CUDA-}"
+            CUDA_VERSION="${CUDA_VERSION##*-}"
             echo "CUDA_VERSION=${CUDA_VERSION}" | tee -a "${GITHUB_ENV}"
+          fi
+
+          if [[ "${{ matrix.target.toolkit }}" == "Nightly-"* ]] && [[ "${{ github.event_name }}" == "release" ]]; then
+            # Avoid using same file name for different toolkit.
+            echo "NO_VERSION_LABEL=OFF" | tee -a "${GITHUB_ENV}"
+            echo "NO_GIT_VERSION=ON" | tee -a "${GITHUB_ENV}"
           fi
 
           if [[ "${{ runner.os }}" == "Linux" ]]; then
@@ -168,7 +173,7 @@ jobs:
       - name: Upload wheels
         # Not PR to save artifact storage, as wheels are only needed for releases.
         if: github.event_name != 'pull_request' || contains(github.event.pull_request.title, '[Release]')
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: wheels-${{ matrix.python-version }}-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target.toolkit }}
           path: wheelhouse/*.whl
@@ -183,7 +188,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Download built SDist
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           # unpacks default artifact into dist/
           # if `name: artifact` is omitted, the action will create extra parent dir
@@ -191,7 +196,7 @@ jobs:
           path: dist
 
       - name: Download built wheels
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           pattern: wheels-*
           path: dist
@@ -201,7 +206,7 @@ jobs:
         run: ls -lh dist/*
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: artifacts
           path: dist/*

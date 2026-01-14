@@ -3,11 +3,10 @@ from tvm import tir, IRModule
 from tvm.target import Target
 import tilelang
 from tilelang.transform import PassContext
-from tilelang.contrib.nvcc import have_tma, is_hopper
+from tilelang.contrib.nvcc import have_tma, is_hopper, have_pdl
 
 
-def allow_warp_specialized(pass_ctx: PassContext | None = None,
-                           target: Target | None = None) -> bool:
+def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
     # avoid circular import
     from tilelang.jit.adapter.utils import is_cuda_target
 
@@ -19,8 +18,7 @@ def allow_warp_specialized(pass_ctx: PassContext | None = None,
     return not disable_warp_specialized
 
 
-def allow_tma_and_warp_specialized(pass_ctx: PassContext | None = None,
-                                   target: Target | None = None) -> bool:
+def allow_tma_and_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()
     if not have_tma(target):
@@ -47,12 +45,10 @@ def allow_global_thread_synchronization(pass_ctx: PassContext | None = None) -> 
     return enable_global_thread_sync
 
 
-def should_enable_aggressive_merge(pass_ctx: PassContext | None = None,
-                                   target: Target | None = None) -> bool:
+def should_enable_aggressive_merge(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()
-    enable_aggressive_merge = bool(
-        pass_ctx.config.get(tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE, False))
+    enable_aggressive_merge = bool(pass_ctx.config.get(tilelang.PassConfigKey.TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE, False))
     if allow_warp_specialized(pass_ctx=pass_ctx, target=target):
         # This is a workaround to avoid the bug in the MergeSharedMemoryAllocations pass
         # when warp specialization is enabled, as different warp threads may access different
@@ -65,6 +61,12 @@ def should_force_let_inline(pass_ctx: PassContext | None = None) -> bool:
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()
     return bool(pass_ctx and pass_ctx.config.get(tilelang.PassConfigKey.TL_FORCE_LET_INLINE, False))
+
+
+def should_enable_ast_print(pass_ctx: PassContext | None = None) -> bool:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    return bool(pass_ctx and pass_ctx.config.get(tilelang.PassConfigKey.TL_AST_PRINT_ENABLE, False))
 
 
 def should_enable_layout_visual(pass_ctx: PassContext | None = None) -> bool:
@@ -88,7 +90,7 @@ def get_layout_visual_formats(pass_ctx: PassContext | None = None) -> list[str]:
         return ["txt", "png", "pdf", "svg"]
 
     if "," in formats_str:
-        formats_list = [f.strip() for f in formats_str.split(',')]
+        formats_list = [f.strip() for f in formats_str.split(",")]
     else:
         formats_list = [formats_str]
 
@@ -116,8 +118,9 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
     Note: This is a validation-only pipeline of passes and does not modify or return the module.
     """
 
-    # Debug
-    # tilelang.analysis.ASTPrinter()(mod)
+    # Print AST for debugging purpose
+    if should_enable_ast_print():
+        tilelang.analysis.ASTPrinter()(mod)
     # Check if there are any invalid nested loops.
     tilelang.analysis.NestedLoopChecker()(mod)
     # Check if there are any invalid symbolic T.Parallel + fragment access.
@@ -179,6 +182,8 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # TODO(lei): return to tir pass when kSymbolicBound simplification
     # is merged into tvm.
     mod = tilelang.transform.Simplify()(mod)
+    # Hoist any root-block annotations to PrimFunc attrs if pass is available
+    mod = tilelang.transform.HoistNonRestrictParams()(mod)
     return mod
 
 
@@ -217,6 +222,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
             mod = tilelang.transform.InjectFenceProxy()(mod)
 
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
+    mod = tilelang.transform.Simplify()(mod)
     mod = tir.transform.NarrowDataType(32)(mod)
     mod = tilelang.transform.FlattenBuffer()(mod)
     # ConfigIndexBitwidth must be applied after FlattenBuffer
@@ -253,12 +259,15 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.ThreadSync("global")(mod)
     mod = tilelang.transform.AnnotateDeviceRegions()(mod)
     mod = tilelang.transform.SplitHostDevice()(mod)
+
+    # Mark the function contains pdl_sync or pdl_trigger
+    mod = tilelang.transform.MarkCudaSyncCalls(have_pdl(target))(mod)
+
+    mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
     # MergeSharedMemoryAllocations must be applied after SplitHostDevice
     # because the merged allocation site is at the beginning of each device function
     enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
-    mod = tilelang.transform.MergeSharedMemoryAllocations(
-        enable_aggressive_merge=enable_aggressive_merge)(
-            mod)
+    mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
     mod = tilelang.transform.ThreadSync("shared")(mod)
     mod = tilelang.transform.ThreadSync("shared.dyn")(mod)
     # Inject PTX async copy must behind the thread sync pass

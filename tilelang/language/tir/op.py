@@ -117,7 +117,7 @@ def call_cpacked_lowered(*args, span=None):
     return _tvm_op.call_cpacked_lowered(*args, span=span)
 
 
-def call_intrin(dtype, func_name, *args, span=None):
+def call_intrin(dtype, func_name, *args, annotations=None, span=None):
     """Build expression by calling an intrinsic function.
 
     Intrinsics can be overloaded with multiple data types via
@@ -142,7 +142,7 @@ def call_intrin(dtype, func_name, *args, span=None):
     call : PrimExpr
         The call expression.
     """
-    return _tvm_op.call_intrin(dtype, func_name, *args, span=span)
+    return _tvm_op.call_intrin(dtype, func_name, *args, annotations=annotations, span=span)
 
 
 def call_pure_extern(dtype, func_name, *args, span=None):
@@ -724,8 +724,7 @@ def tvm_load_matrix_sync(fragment, m, n, k, index, buffer_ptr, stride, layout):
     return _tvm_op.tvm_load_matrix_sync(fragment, m, n, k, index, buffer_ptr, stride, layout)
 
 
-def tvm_mma_sync(fragment_d, index_d, fragment_a, index_a, fragment_b, index_b, fragment_c,
-                 index_c):
+def tvm_mma_sync(fragment_d, index_d, fragment_a, index_a, fragment_b, index_b, fragment_c, index_c):
     """TVM intrinsic for tensor core mma_sync operators
 
     Parameters
@@ -759,12 +758,10 @@ def tvm_mma_sync(fragment_d, index_d, fragment_a, index_a, fragment_b, index_b, 
     call : PrimExpr
         The call expression.
     """
-    return _tvm_op.tvm_mma_sync(fragment_d, index_d, fragment_a, index_a, fragment_b, index_b,
-                                fragment_c, index_c)
+    return _tvm_op.tvm_mma_sync(fragment_d, index_d, fragment_a, index_a, fragment_b, index_b, fragment_c, index_c)
 
 
-def tvm_bmma_sync(fragment_d, index_d, fragment_a, index_a, fragment_b, index_b, fragment_c,
-                  index_c):
+def tvm_bmma_sync(fragment_d, index_d, fragment_a, index_a, fragment_b, index_b, fragment_c, index_c):
     """TVM intrinsic for tensor core bmma_sync operators
 
     Parameters
@@ -798,8 +795,7 @@ def tvm_bmma_sync(fragment_d, index_d, fragment_a, index_a, fragment_b, index_b,
     call : PrimExpr
         The call expression.
     """
-    return _tvm_op.tvm_bmma_sync(fragment_d, index_d, fragment_a, index_a, fragment_b, index_b,
-                                 fragment_c, index_c)
+    return _tvm_op.tvm_bmma_sync(fragment_d, index_d, fragment_a, index_a, fragment_b, index_b, fragment_c, index_c)
 
 
 def tvm_fill_fragment(fragment, m, n, k, index, value):
@@ -1121,7 +1117,6 @@ def ptx_wgmma_rs(
     scale_in_a,
     scale_in_b,
 ):
-
     return call_intrin(
         dtype,
         _tvm_op.Op.get("tl.ptx_wgmma_rs"),
@@ -1168,7 +1163,7 @@ def ptx_tcgen05_mma_ss(
      desc_val, scale_out, mask0, mask1, mask2, mask3[, enable_ws]).
     Aliases: you can also pass `ws` or `warp_specialized` (booleans) instead of `enable_ws`.
     Alternatively, use `variant="ws"` (or "default").
-    - kind_dtype: instruction kind selector (e.g., "float16" for kind::f16,
+    - kind_dtype: instruction kind selector (e.g., T.float16 for kind::f16,
       "tf32" for kind::tf32, "int8" for kind::i8, "float8_e4m3" for kind::f8f6f4).
     """
     # Aliases precedence: if either `ws` or `warp_specialized` is provided, they override enable_ws
@@ -1229,7 +1224,7 @@ def ptx_tcgen05_mma_ts(
     Expects 13 positional arguments:
     (kind_dtype, A_ptr, A_offset, desc_b, B_offset, C_ptr, C_offset,
      desc_val, scale_out, mask0, mask1, mask2, mask3).
-    - kind_dtype: instruction kind selector (e.g., "float16" for kind::f16,
+    - kind_dtype: instruction kind selector (e.g., T.float16 for kind::f16,
       "tf32" for kind::tf32, "int8" for kind::i8, "float8_e4m3" for kind::f8f6f4).
     """
     return call_intrin(
@@ -1345,44 +1340,62 @@ def ptx_ldmatrix(dtype, trans, num, type, local_ptr, local_offset, smem_ptr, sme
     call : PrimExpr
         The call expression.
     """
-    return _tvm_op.ptx_ldmatrix(dtype, trans, num, type, local_ptr, local_offset, smem_ptr,
-                                smem_offset)
+    return _tvm_op.ptx_ldmatrix(dtype, trans, num, type, local_ptr, local_offset, smem_ptr, smem_offset)
 
 
-def ptx_cp_async(dtype, shared_ptr, shared_offset, global_ptr, global_offset, bytes):
+def ptx_cp_async(dst_access_ptr, src_access_ptr, bytes, predicate=None):
     """TVM intrinsic for ptx async copy from global to shared memory using cp.async
     https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async
 
     Parameters
     ----------
-    dtype : str
-       The data type of the result.
+    dst_access_ptr : PrimExpr
+        The destination (shared memory) access pointer created by tvm_access_ptr.
+        Should include pointer, offset, extent, and write access flag (rw_mask=2).
 
-    shared_ptr : Var
-        The shared memory pointer variable.
+    src_access_ptr : PrimExpr
+        The source (global memory) access pointer created by tvm_access_ptr.
+        Should include pointer, offset, extent, and read access flag (rw_mask=1).
 
-    shared_offset : Expr
-        The offset of shared memory pointer.
+    bytes : int or PrimExpr
+        The number of bytes to copy (must be 4, 8, or 16).
 
-    global_ptr : Var
-        The global memory pointer variable.
-
-    global_offset : Expr
-        The offset of global memory pointer.
-
-    bytes : int
-        The data size to copy.
+    predicate : PrimExpr, optional
+        Optional predicate condition for conditional cp.async. When provided, the copy
+        will only be performed if the predicate evaluates to true. Otherwise, the
+        destination will be filled with zeros (default behavior of cp.async).
 
     Returns
     -------
     call : PrimExpr
         The call expression.
+
+    Examples
+    --------
+    >>> # Copy 16 bytes from global to shared memory
+    >>> T.ptx_cp_async(
+    ...     T.tvm_access_ptr(T.type_annotation(T.uint8), A_shared.data, 0, 16, 2),  # dst
+    ...     T.tvm_access_ptr(T.type_annotation(T.uint8), B_global.data, 0, 16, 1),  # src
+    ...     16  # bytes
+    ... )
+    >>>
+    >>> # Predicated cp.async (only copy if condition is true)
+    >>> T.ptx_cp_async(
+    ...     T.tvm_access_ptr(T.type_annotation(T.uint8), A_shared.data, 0, 16, 2),
+    ...     T.tvm_access_ptr(T.type_annotation(T.uint8), B_global.data, 0, 16, 1),
+    ...     16,
+    ...     predicate=guard  # only copy if guard is true
+    ... )
     """
-    return _tvm_op.ptx_cp_async(dtype, shared_ptr, shared_offset, global_ptr, global_offset, bytes)
+    from tvm import tir
+
+    if predicate is None:
+        return tir.call_intrin("", tir.op.Op.get("tl.ptx_cp_async"), dst_access_ptr, src_access_ptr, bytes)
+    else:
+        return tir.call_intrin("", tir.op.Op.get("tl.ptx_cp_async"), dst_access_ptr, src_access_ptr, bytes, predicate)
 
 
-def ptx_cp_async_bulk(dtype, shared_ptr, shared_offset, global_ptr, global_offset, bytes,
-                      barrier_id):
+def ptx_cp_async_bulk(dtype, shared_ptr, shared_offset, global_ptr, global_offset, bytes, barrier_id):
     """TVM intrinsic for ptx async copy from global to shared memory using cp.async.bulk
     https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk
 
@@ -1414,8 +1427,7 @@ def ptx_cp_async_bulk(dtype, shared_ptr, shared_offset, global_ptr, global_offse
     call : PrimExpr
         The call expression.
     """
-    return _tvm_op.ptx_cp_async_bulk(dtype, shared_ptr, shared_offset, global_ptr, global_offset,
-                                     bytes, barrier_id)
+    return _tvm_op.ptx_cp_async_bulk(dtype, shared_ptr, shared_offset, global_ptr, global_offset, bytes, barrier_id)
 
 
 def ptx_commit_group():
@@ -2951,8 +2963,7 @@ def q_multiply_shift_per_axis(
     z : PrimExpr
         The result.
     """
-    return _tvm_op.q_multiply_shift_per_axis(x, y, ls, rs, q, is_lshift_required,
-                                             is_rshift_required)
+    return _tvm_op.q_multiply_shift_per_axis(x, y, ls, rs, q, is_lshift_required, is_rshift_required)
 
 
 def shift_left(x, y, span=None):
@@ -3302,8 +3313,7 @@ def TVMBackendAllocWorkspace(device_type, device_id, nbytes, dtype_code_hint, dt
     call : PrimExpr
         The call expression.
     """
-    return _tvm_op.TVMBackendAllocWorkspace(device_type, device_id, nbytes, dtype_code_hint,
-                                            dtype_bits_hint)
+    return _tvm_op.TVMBackendAllocWorkspace(device_type, device_id, nbytes, dtype_code_hint, dtype_bits_hint)
 
 
 def TVMBackendFreeWorkspace(device_type, device_id, ptr):

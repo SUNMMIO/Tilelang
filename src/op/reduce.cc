@@ -10,6 +10,7 @@
 #include <tvm/tir/op_attr_types.h>
 #include <tvm/tir/stmt_functor.h>
 
+#include "../layout/layout.h"
 #include "../layout/utils.h"
 #include "../op/parallel.h"
 #include "../target/utils.h"
@@ -27,7 +28,7 @@ using namespace tir;
 
 // MakeAccessPtrFromRegion moved to src/op/utils.{h,cc}
 
-ReduceOp::ReduceOp(Array<PrimExpr> args) {
+ReduceOp::ReduceOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   ObjectPtr<ReduceOpNode> node = tvm::ffi::make_object<ReduceOpNode>();
   // Accept BufferRegion/BufferLoad for src/dst
   node->srcRegion_ = NormalizeToBufferRegion(args[0]);
@@ -308,7 +309,8 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         std::stringstream ss;
 
         auto thread_offset = T.thread_bounds->min;
-        if (TargetIsHopper(T.target) || TargetIsSm100(T.target)) {
+        if (TargetIsHopper(T.target) || TargetIsSm100(T.target) ||
+            TargetIsSM120(T.target)) {
           auto all_threads = T.thread_bounds->extent;
           ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
              << reducing_threads << ", " << (*scale) << ", " << thread_offset
@@ -380,7 +382,7 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &T,
   if (level >= InferLevel::kStrict)
     return {};
 
-  if (src.scope() == "local.fragment" && dst.scope() == "local.fragment" &&
+  if (IsFragmentBuffer(src) && IsFragmentBuffer(dst) &&
       T.layout_map.count(src)) {
     auto src_layout = T.layout_map[src].as<Fragment>().value();
 
@@ -493,7 +495,7 @@ static BufferRegion ConvertBufferToBufferRegion(const Buffer &buf) {
   return BufferRegion(buf, ranges);
 }
 
-CumSumOp::CumSumOp(Array<PrimExpr> args) {
+CumSumOp::CumSumOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   /// CumSum constructor arguments:
   /// - src: input buffer
   /// - dst: output buffer
@@ -518,8 +520,7 @@ CumSumOp::CumSumOp(Array<PrimExpr> args) {
 }
 
 Stmt CumSumOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
-  if (this->src.scope() == "local.fragment" &&
-      this->dst.scope() == "local.fragment") {
+  if (IsFragmentBuffer(this->src) && IsFragmentBuffer(this->dst)) {
     LOG(FATAL) << "CumSum for fragment not implemented, please raise an issue "
                   "if you need this feature.";
   } else if (this->src.scope() == "shared.dyn" ||
@@ -528,23 +529,29 @@ Stmt CumSumOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     std::stringstream ss;
     auto threads = T.thread_bounds->extent;
     Array<PrimExpr> args;
-    int ndim = static_cast<int>(src->shape.size());
 
     // Build access pointers from regions locally
     PrimExpr srcPtr = MakeAccessPtrFromRegion(srcRegion_, 1);
     PrimExpr dstPtr = MakeAccessPtrFromRegion(dstRegion_, 2);
+
+    // Use region extents instead of buffer shape for correct slice handling
+    Array<PrimExpr> src_extents;
+    for (const auto &range : srcRegion_->region) {
+      src_extents.push_back(range->extent);
+    }
+    int ndim = static_cast<int>(src_extents.size());
 
     if (ndim == 1) {
       ICHECK_EQ(dim, 0) << "Cumulative sum over a 1D buffer only supports dim "
                            "= 0.";
       ss << "tl::CumSum1D<" << threads << ", " << (reverse ? "true" : "false")
          << ">::run";
-      args = {StringImm(ss.str()), srcPtr, dstPtr, src->shape[0]};
+      args = {StringImm(ss.str()), srcPtr, dstPtr, src_extents[0]};
     } else if (ndim == 2) {
       ss << "tl::CumSum2D<" << threads << ", " << dim << ", "
          << (reverse ? "true" : "false") << ">::run";
-      args = {StringImm(ss.str()), srcPtr, dstPtr, src->shape[0],
-              src->shape[1]};
+      args = {StringImm(ss.str()), srcPtr, dstPtr, src_extents[0],
+              src_extents[1]};
     } else {
       LOG(FATAL) << "CumSum currently supports only 1D or 2D buffers, got "
                  << ndim << "D.";
@@ -560,7 +567,37 @@ Stmt CumSumOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
 LayoutMap CumSumOpNode::InferLayout(const LayoutInferArgs &T,
                                     InferLevel level) const {
-  return {};
+  // Only infer layout in strict mode
+  if (level != InferLevel::kStrict) {
+    return {};
+  }
+
+  LayoutMap result_map;
+
+  auto make_linear_layout = [](const Buffer &buf) -> Layout {
+    return makeLinearLayout(buf->shape);
+  };
+
+  auto check_or_set_linear_layout = [&](const Buffer &buf) {
+    if (!IsSharedBuffer(buf))
+      return;
+
+    Layout linear_layout = make_linear_layout(buf);
+    if (T.layout_map.count(buf)) {
+      // Check if existing layout is linear
+      Layout existing = T.layout_map.Get(buf).value().as<Layout>().value();
+      ICHECK(StructuralEqual()(existing, linear_layout))
+          << "CumSum requires linear layout for shared buffer " << buf->name
+          << ", but got non-linear layout.";
+    } else {
+      result_map.Set(buf, linear_layout);
+    }
+  };
+
+  check_or_set_linear_layout(src);
+  check_or_set_linear_layout(dst);
+
+  return result_map;
 }
 
 TIR_REGISTER_TL_TILE_OP(CumSumOp, cumsum)
