@@ -15,6 +15,12 @@ from .eager import *  # noqa: F401
 from .tir.ir import *  # noqa: F401
 from tilelang.layout import Layout, Fragment  # noqa: F401
 from .proxy import ptr, make_tensor, Buffer, Tensor, StridedTensor, FragmentBuffer, SharedBuffer, LocalBuffer  # noqa: F401
+from .mesh_tensor import (  # noqa: F401
+    MeshShardingPolicy,
+    MeshReplicationType,
+    MeshTensor,
+    TensorWithMeta,
+)
 from .loop import (
     Parallel,  # noqa: F401
     Persistent,  # noqa: F401
@@ -123,7 +129,6 @@ from .pdl import (
     pdl_sync,  # noqa: F401
 )
 
-from .annotate_mesh_tensor import mesh_tensor_functions  # noqa: F401
 
 def import_source(source: str | None = None):
     # source is the source code to be imported
