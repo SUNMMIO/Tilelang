@@ -205,7 +205,9 @@ def make_hierarchical_layout(arg):
         # This will involve reading attributes from the Buffer object.
         # Once extracted, a HierarchicalLayout instance should be constructed:
         # hlayout_instance = HierarchicalLayout(hdims=..., hstrides=..., groups=...)
-        raise NotImplementedError("Extracting HierarchicalLayout from Buffer/BufferLoad/BufferRegion is not yet implemented.")
+        raise NotImplementedError(
+            "Extracting HierarchicalLayout from Buffer/BufferLoad/BufferRegion is not yet implemented."
+        )
     elif isinstance(arg, HierarchicalLayout):
         hlayout_instance = arg
     else:
@@ -215,7 +217,8 @@ def make_hierarchical_layout(arg):
     # Convert Python lists/tuples from the hlayout_instance to TVM runtime Arrays for the C++ FFI call
     hdims_arr = tvm.runtime.convert(hlayout_instance.hdims)
     hstrides_arr = tvm.runtime.convert(hlayout_instance.hstrides)
-    groups_arr = tvm.runtime.convert([list(g) for g in hlayout_instance.groups]) # Convert inner tuples to lists
+    groups_arr = tvm.runtime.convert([list(g) for g in hlayout_instance.groups
+                                     ])  # Convert inner tuples to lists
     logical_shape_arr = tvm.runtime.convert(list(hlayout_instance.logical_shape))
 
     return _ffi_api.make_hierarchical_layout(hdims_arr, hstrides_arr, groups_arr, logical_shape_arr)
