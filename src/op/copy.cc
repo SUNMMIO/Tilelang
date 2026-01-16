@@ -595,7 +595,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
 }
 
 /**
- * @brief Determine whether this CopyNode can be lowered to a DMA Load 
+ * @brief Determine whether this CopyNode can be lowered to a DMA Load
  * instruction.
  *
  * The function returns true when all of the following hold:
@@ -608,14 +608,14 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
  * If the source and destination dtypes differ, a warning is logged and the
  * function returns false (the caller is expected to fall back to a normal
  * copy).
- * 
+ *
  *
  * @param target The compilation target to query for dma load support.
  * @return true if the copy can be implemented as a DMA Load; false
  * otherwise.
  */
-bool CopyNode::CheckDMALoad(Target target, arith::Analyzer *analyzer, 
-  bool check_last_dim) const {
+bool CopyNode::CheckDMALoad(Target target, arith::Analyzer *analyzer,
+                            bool check_last_dim) const {
   // 1. arch must support zpu
   if (!TargetIsZpu(target))
     return false;
@@ -661,7 +661,7 @@ bool CopyNode::CheckDMALoad(Target target, arith::Analyzer *analyzer,
  * @return true if all conditions are met; false otherwise.
  */
 bool CopyNode::CheckDMAStore(Target target, arith::Analyzer *analyzer,
-                              bool check_last_dim) const {
+                             bool check_last_dim) const {
   // 1. arch must support zpu
   if (!TargetIsZpu(target))
     return false;
@@ -956,7 +956,7 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
   } else if (CheckDMAStore(target, analyzer)) {
     return CopyInst::kDMAStore;
   } else if (!disable_tma_lower && !buffer_oob &&
-      CheckBulkLoad1D(target, layout_map, analyzer)) {
+             CheckBulkLoad1D(target, layout_map, analyzer)) {
     return CopyInst::kBulkLoad1D;
   } else if (!disable_tma_lower && !buffer_oob &&
              CheckBulkStore1D(target, layout_map, analyzer)) {
@@ -1004,7 +1004,8 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     auto bulk_copy = LowerDMACopy(T, analyzer, copy_inst);
     ICHECK(bulk_copy.defined()) << "Failed to lower dma load/store";
     return bulk_copy;
-  } else if(copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore) {
+  } else if (copy_inst == CopyInst::kTMemLoad ||
+             copy_inst == CopyInst::kTMemStore) {
     auto tmem_copy = LowerTmemCopy(T, analyzer);
     ICHECK(tmem_copy.defined()) << "Failed to lower tensor memory copy";
     return tmem_copy;
@@ -1034,7 +1035,7 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
  *
  * Haoze TODO: the same as tma now
  * Lowers the copy to an optimized DMA load or store when the target and buffer
- * layouts permit. 
+ * layouts permit.
  *
  * If preconditions are not satisfied (unsupported swizzle, stride/size limits,
  * mismatched element counts, OOB risks, or other hardware constraints), this
@@ -1051,7 +1052,7 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
  *         LowerNormalCopy when falling back).
  */
 Stmt CopyNode::LowerDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
-                             CopyInst copy_inst) const {
+                            CopyInst copy_inst) const {
   ICHECK(copy_inst == CopyInst::kDMALoad || copy_inst == CopyInst::kDMAStore)
       << "Invalid copy inst " << static_cast<int>(copy_inst);
   bool is_load = copy_inst == CopyInst::kDMALoad;
@@ -1059,7 +1060,8 @@ Stmt CopyNode::LowerDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
   Buffer shared_tensor = is_load ? dst : src;
   Array<Range> global_range = is_load ? src_range : dst_range;
   Array<Range> shared_range = is_load ? dst_range : src_range;
-  // Cannot support a non-swizzled global layout, will be fallback to normal copy
+  // Cannot support a non-swizzled global layout, will be fallback to normal
+  // copy
   if (T.layout_map.count(global_tensor)) {
     LOG(WARNING) << "DMA copy cannot support a non-swizzled global "
                     "layout, fallback to normal copy.";

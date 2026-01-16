@@ -155,7 +155,7 @@ public:
    * \brief Check if dma load is supported.
    */
   bool CheckDMALoad(Target target, arith::Analyzer *analyzer,
-                     bool check_last_dim = true) const;
+                    bool check_last_dim = true) const;
 
   /*!
    * \brief Check if dma store is supported.
@@ -228,7 +228,7 @@ protected:
    * \brief Generate lowering for dma copy.
    */
   Stmt LowerDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
-                     CopyInst copy_inst) const;
+                    CopyInst copy_inst) const;
 
   /*!
    * \brief Generate lowering for bulk/global-to-shared copy.

@@ -32,7 +32,6 @@ int TargetGetWarpSize(Target target);
 
 bool TargetIsZpu(Target target);
 
-
 } // namespace tl
 } // namespace tvm
 
