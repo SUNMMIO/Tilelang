@@ -1,7 +1,14 @@
+/*!
+ * \file swizzle.h
+ * \brief Define swizzled layout
+ *
+ */
+
+#ifndef TVM_TL_LAYOUT_HIERARCHICAL_H_
+#define TVM_TL_LAYOUT_HIERARCHICAL_H_
+
 #include "layout.h"
 #include <tvm/arith/analyzer.h>
-#include <tvm/ffi/reflection/registry.h>
-#include <tvm/runtime/registry.h>
 #include <tvm/tir/op.h>
 
 namespace tvm {
@@ -38,14 +45,16 @@ Layout makeHierarchicalLayout(Array<Integer> hdims_arr,
 
   Array<IterVar> input_vars;
   for (size_t i = 0; i < logical_shape_arr.size(); ++i) {
-    input_vars.push_back(make_itervar(
-        std::string{'_', char('i' + i)}, logical_shape_arr[i]));
+    input_vars.push_back(
+        make_itervar(std::string{'_', char('i' + i)}, logical_shape_arr[i]));
   }
 
   // The final physical offset expression
-  PrimExpr total_offset = make_zero(DataType::Int(32)); // Assuming int32 for offset
+  PrimExpr total_offset =
+      make_zero(DataType::Int(32)); // Assuming int32 for offset
 
-  int h_idx_offset_global = 0; // Tracks position in the flat hdims/hstrides arrays
+  int h_idx_offset_global =
+      0; // Tracks position in the flat hdims/hstrides arrays
 
   for (size_t logical_dim_idx = 0; logical_dim_idx < groups_arr.size();
        ++logical_dim_idx) {
@@ -66,14 +75,16 @@ Layout makeHierarchicalLayout(Array<Integer> hdims_arr,
     // Get the logical input variable for this dimension
     PrimExpr logical_input_var = input_vars[logical_dim_idx]->var;
 
-    // Decompose the logical input variable into hierarchical indices for this dim
+    // Decompose the logical input variable into hierarchical indices for this
+    // dim
     Array<PrimExpr> h_indices_for_dim =
         decompose_index_expr(logical_input_var, factors_for_dim);
 
     // Calculate the offset contribution from this logical dimension
     PrimExpr dim_offset_contribution = make_zero(DataType::Int(32));
     ICHECK_EQ(h_indices_for_dim.size(), strides_for_dim.size())
-        << "Hierarchical indices and strides size mismatch for logical dimension "
+        << "Hierarchical indices and strides size mismatch for logical "
+           "dimension "
         << logical_dim_idx;
 
     for (size_t i = 0; i < h_indices_for_dim.size(); ++i) {
@@ -88,3 +99,5 @@ Layout makeHierarchicalLayout(Array<Integer> hdims_arr,
 
 } // namespace tl
 } // namespace tvm
+
+#endif // TVM_TL_LAYOUT_HIERARCHICAL_H_
