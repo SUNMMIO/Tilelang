@@ -1,6 +1,6 @@
 /*!
- * \file swizzle.h
- * \brief Define swizzled layout
+ * \file layout/hierarchical_layout.cc
+ * \brief Define Hierarchical Layout and related functions
  *
  */
 
