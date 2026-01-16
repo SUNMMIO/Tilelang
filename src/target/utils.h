@@ -30,9 +30,6 @@ bool TargetHasTmem(Target target);
 bool TargetHasBulkCopy(Target target);
 int TargetGetWarpSize(Target target);
 
-bool TargetIsZpu(Target target);
-
-
 } // namespace tl
 } // namespace tvm
 

@@ -1,4 +1,6 @@
 from __future__ import annotations
+import math
+from enum import Enum
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 from tvm import tir
@@ -486,6 +488,162 @@ class LocalBufferAnnot(BufferAnnot):
         return 'local'
 
 
+@dataclass
+class TensorWithMeta:
+    buffer: tir.Buffer
+    meta_data: dict
+
+
+@dataclass
+class TensorWithMetaAnnot(Annot):
+    data: TensorWithMeta
+
+    def is_kernel_arg(self) -> bool:
+        return True
+
+    def with_name(self, name: str) -> Self:
+        IRBuilder.name(name, self.data.buffer)
+        return self
+
+    def get_key_parser(self) -> Callable[[str, Any], tuple[Any, ...]]:
+        return lambda name, value: (None,)
+
+    def create_prim_func_arg(self, name: str, value: Any, vt: ArgVarTable) -> tir.Buffer:
+        return tb_tir.arg(name, self.data.buffer)
+
+    def promote(self) -> TIRAnnot | None:
+        return None
+
+
+class MeshReplicationType(Enum):
+    NONE = 0  # no replication (each core has unique data)
+    ROW = 1  # replicate across X (same row)
+    COLUMN = 2  # replicate across Y (same column)
+    ALL = 3  # replicate on all cores
+
+
+class MeshShardingPolicy:
+    """
+    Sharding Policy for MeshTensor
+    """
+
+    def __init__(
+            self,
+            x: int | None = None,
+            y: int | None = None,
+            replicate: MeshReplicationType = MeshReplicationType.NONE,
+            cross_mesh_dim: int | None = None,  # special: split dim across full X×Y
+    ):
+        # validation
+        if cross_mesh_dim is not None and (x is not None or y is not None):
+            raise ValueError("cross_mesh_dim is mutually exclusive with x/y splits")
+        if sum(v is not None for v in [x, y, cross_mesh_dim]) > 2:
+            raise ValueError("Invalid layout: too many splits")
+
+        self.x = x
+        self.y = y
+        self.replicate = replicate
+        self.cross_mesh_dim = cross_mesh_dim
+
+    def __repr__(self):
+        if self.cross_mesh_dim is not None:
+            return f"MeshLayout(split_dim={self.cross_mesh_dim} across XxY)"
+        parts = []
+        if self.x is not None:
+            parts.append(f"x→dim{self.x}")
+        if self.y is not None:
+            parts.append(f"y→dim{self.y}")
+        if self.replicate != MeshReplicationType.NONE:
+            parts.append(f"replicate={self.replicate.name}")
+        return "MeshLayout(" + ", ".join(parts) + ")" if parts else "MeshLayout(replicated)"
+
+
+class MeshTensorAnnot(BufferAnnot):
+    """Annotations for distributed tensor (distributed memory buffer)
+    This class implements the distributed tensor proxy for global memory scope.
+    """
+
+    @staticmethod
+    def _get_sharded_shape(shape: tuple[Any], policy: MeshShardingPolicy, nrows: int,
+                           ncols: int) -> tuple[Any]:
+        sharded_shape = list(shape)
+        # Sanity check
+        if policy.replicate == MeshReplicationType.ALL:
+            return tuple(sharded_shape)
+
+        if policy.cross_mesh_dim is not None:
+            if not 0 <= policy.cross_mesh_dim < len(sharded_shape):
+                raise ValueError(f"Invalid cross_mesh_dim: {policy.cross_mesh_dim}, "
+                                 f"tensor rank is {len(sharded_shape)}")
+            sharded_shape[policy.cross_mesh_dim] = int(
+                math.ceil(sharded_shape[policy.cross_mesh_dim] / (nrows * ncols)))
+            return tuple(sharded_shape)
+
+        if policy.replicate == MeshReplicationType.ROW:
+            if policy.x is not None:
+                raise ValueError("Cannot shard on x-axis when replicating on rows")
+            if policy.y is not None:
+                if not 0 <= policy.y < len(sharded_shape):
+                    raise ValueError(f"Invalid y-split dimension: {policy.y}, "
+                                     f"tensor rank is {len(sharded_shape)}")
+                sharded_shape[policy.y] = int(math.ceil(sharded_shape[policy.y] / nrows))
+        elif policy.replicate == MeshReplicationType.COLUMN:
+            if policy.y is not None:
+                raise ValueError("Cannot shard on y-axis when replicating on columns")
+            if policy.x is not None:
+                if not 0 <= policy.x < len(sharded_shape):
+                    raise ValueError(f"Invalid x-split dimension: {policy.x}, "
+                                     f"tensor rank is {len(sharded_shape)}")
+                sharded_shape[policy.x] = int(math.ceil(sharded_shape[policy.x] / ncols))
+        elif policy.replicate == MeshReplicationType.NONE:
+            if policy.x is not None:
+                if not 0 <= policy.x < len(sharded_shape):
+                    raise ValueError(f"Invalid x-split dimension: {policy.x}, "
+                                     f"tensor rank is {len(sharded_shape)}")
+                sharded_shape[policy.x] = int(math.ceil(sharded_shape[policy.x] / ncols))
+            if policy.y is not None:
+                if not 0 <= policy.y < len(sharded_shape):
+                    raise ValueError(f"Invalid y-split dimension: {policy.y}, "
+                                     f"tensor rank is {len(sharded_shape)}")
+                sharded_shape[policy.y] = int(math.ceil(sharded_shape[policy.y] / nrows))
+        return tuple(sharded_shape)
+
+    def __call__(self,
+                 shape: tuple[Unpack[_Shapes]],
+                 sharding_policy: MeshShardingPolicy,
+                 device_mesh_config: tuple[int],
+                 dtype: _DType = "float32",
+                 data=None,
+                 strides=None,
+                 elem_offset=None,
+                 scope=None,
+                 align=0,
+                 offset_factor=0,
+                 buffer_type="",
+                 axis_separators=None) -> TensorWithMeta:
+        if isinstance(shape, (int, PrimExpr)):
+            shape = (shape,)
+        nrows, ncols = device_mesh_config
+        sharded_shape = self._get_sharded_shape(shape, sharding_policy, nrows, ncols)
+        # TODO: Implement hierarchical strides and dimensions
+        sharded_strides = TensorAnnot._construct_strides(sharded_shape)
+        buffer = super().__call__(
+            shape=sharded_shape,
+            dtype=dtype,
+            data=data,
+            strides=sharded_strides,
+            elem_offset=elem_offset,
+            scope=scope,
+            align=align,
+            offset_factor=offset_factor,
+            buffer_type=buffer_type,
+            axis_separators=axis_separators)
+        global_shape = shape
+        global_strides = TensorAnnot._construct_strides(global_shape)
+        return TensorWithMeta(buffer,
+                              dict(global_shape=global_shape, global_strides=global_strides))
+
+
 class DynAnnot(Value):
     '''
     Dynamic variable annotation represents a tvm tir.Var argument
@@ -626,6 +784,24 @@ if TYPE_CHECKING:
         ) -> Tensor[Callable[[Unpack[_Shapes]]], _DType]:
             ...
 
+    class MeshTensor(Generic[_Shape, _DType], Buffer[_Shape, _DType]):
+
+        def __new__(
+            shape: tuple[Unpack[_Shapes]],
+            sharding_policy: MeshShardingPolicy,
+            device_mesh_config: tuple[int],
+            dtype: _DType = "float32",
+            data=None,
+            strides=None,
+            elem_offset=None,
+            scope=None,
+            align=0,
+            offset_factor=0,
+            buffer_type="",
+            axis_separators=None,
+        ) -> Tensor[Callable[[Unpack[_Shapes]]], _DType]:
+            ...
+
     class FragmentBuffer(Generic[_Shape, _DType], Buffer[_Shape, _DType]):
         pass
 
@@ -653,6 +829,7 @@ else:
     SharedBuffer = SharedBufferAnnot()
     LocalBuffer = LocalBufferAnnot()
     dyn = DynAnnot()
+    MeshTensor = MeshTensorAnnot()
 
 
 @dataclass
@@ -678,6 +855,8 @@ class FuncAnnot:
                     annot = DTypeAnnot(name=name)
                 elif isinstance(annot, (tir.Buffer, tir.Var)):
                     annot = TIRAnnot(data=annot)
+                elif isinstance(annot, TensorWithMeta):
+                    annot = TensorWithMetaAnnot(data=annot)
                 else:
                     annot = Value(kind='static', name=name)
             annot = annot.promote() or annot
@@ -687,6 +866,13 @@ class FuncAnnot:
             arg_parser[name] = annot.get_key_parser()
         arg_names = list(sig.parameters.keys())
         return FuncAnnot(sig, arg_names, annots, arg_parser, ker_arg_names)
+
+    def get_metadata(self):
+        meta = {}
+        for name, annot in self.annots.items():
+            if isinstance(annot, TensorWithMetaAnnot):
+                meta[name] = annot.data.meta_data
+        return meta
 
     def parse_key(self, *args, **kws):
         '''
@@ -715,18 +901,19 @@ class FuncAnnot:
         '''
         Check if all arguments are static (i.e., can be fully determined at compile time)
         '''
-        return all(isinstance(annot, TIRAnnot) for annot in self.annots.values())
+        return all(
+            isinstance(annot, (TIRAnnot, TensorWithMetaAnnot)) for annot in self.annots.values())
 
     def get_all_static_args(self):
         res = {}
         for name, annot in self.annots.items():
-            if isinstance(annot, TIRAnnot):
+            if isinstance(annot, (TIRAnnot, TensorWithMetaAnnot)):
                 res[name] = annot.data
         return res
 
     def get_compile_time_unknown_args(self):
         res = []
         for name, annot in self.annots.items():
-            if not isinstance(annot, TIRAnnot):
+            if not isinstance(annot, (TIRAnnot, TensorWithMetaAnnot)):
                 res.append(name)
         return res
