@@ -883,7 +883,17 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       .def("tl.make_fully_replicated_layout_fragment",
            [](Array<PrimExpr> shape, PrimExpr thread_extent) {
              return Fragment::FullyReplicated(shape, thread_extent);
-           });
+           })
+      .def("tl.make_hierarchical_layout",
+           [](Array<Integer> hdims_arr, Array<Integer> hstrides_arr,
+              Array<Array<Integer>> groups_arr,
+              Array<Integer> logical_shape_arr) {
+             return makeHierarchicalLayout(hdims_arr, hstrides_arr, groups_arr,
+                                           logical_shape_arr);
+           })
+      .def("tl.make_linear_layout_gemm", [](int stride, int continuous) {
+        return makeGemmLayoutLinear(stride, continuous);
+      });
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
