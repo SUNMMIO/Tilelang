@@ -146,6 +146,37 @@ def test_call_method(shape, device_mesh_config, policy):
     assert tuple(buffer.buffer.shape) == expected_shape
 
 
+@pytest.mark.parametrize("shape, device_mesh_config, policy", [
+    ((128, 256), (2, 4), MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)),
+    ((100, 200, 300), (2, 2), MeshShardingPolicy(cross_mesh_dim=1)),
+    ((128, 256, 512), (2, 4), MeshShardingPolicy(replicate=MeshReplicationType.ALL)),
+])
+def test_default_row_major_layout(shape, device_mesh_config, policy):
+    proxy = MeshTensorAnnot()
+    nrows, ncols = device_mesh_config
+
+    tensor_with_meta = proxy(shape, policy, device_mesh_config)
+    sharded_shape = MeshTensorAnnot._get_sharded_shape(shape, policy, nrows, ncols)
+    expected_sharded_strides = TensorAnnot._construct_strides(sharded_shape)
+    expected_global_strides = TensorAnnot._construct_strides(shape)
+
+    # Verify the sharded buffer
+    assert tuple(tensor_with_meta.buffer.shape) == sharded_shape
+    assert tuple(tensor_with_meta.buffer.strides) == expected_sharded_strides
+
+    # Verify the metadata
+    meta = tensor_with_meta.meta_data
+    assert meta["global_shape"] == shape
+    assert meta["global_strides"] == expected_global_strides
+    assert meta["global_hdims"] == shape
+    assert meta["global_hstrides"] == expected_global_strides
+    assert meta["global_hgroups"] == tuple((i, i + 1) for i in range(len(shape)))
+
+    assert meta["sharded_hdims"] == sharded_shape
+    assert meta["sharded_hstrides"] == expected_sharded_strides
+    assert meta["sharded_hgroups"] == tuple((i, i + 1) for i in range(len(sharded_shape)))
+
+
 @pytest.mark.parametrize("M_val, N_val, K_val, device_mesh_config, policyA, policyB, policyC", [
     (100, 200, 300, (4, 4), MeshShardingPolicy(x=1, y=0), MeshShardingPolicy(
         x=1, y=0), MeshShardingPolicy(x=1, y=0)),
