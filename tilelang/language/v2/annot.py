@@ -691,6 +691,14 @@ class MeshTensorAnnot(BufferAnnot):
             meta_data["sharded_hdims"] = sharded_hdims
             meta_data["sharded_hstrides"] = sharded_hstrides
             meta_data["sharded_hgroups"] = hierarchical_groups
+        else:
+            # no hierarchical layout info provided. Row-major by default
+            meta_data["global_hdims"] = shape
+            meta_data["global_hstrides"] = TensorAnnot._construct_strides(shape)
+            meta_data["global_hgroups"] = tuple((i, i + 1) for i in range(len(shape)))
+            meta_data["sharded_hdims"] = sharded_shape
+            meta_data["sharded_hstrides"] = sharded_strides
+            meta_data["sharded_hgroups"] = tuple((i, i + 1) for i in range(len(shape)))
 
         buffer = super().__call__(
             shape=sharded_shape,

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import tvm.runtime
 from tvm.tir import Buffer, BufferLoad, BufferRegion
 from tilelang import _ffi_api
+from .swizzle import _get_stride_continuous
 
 
 @dataclass
@@ -179,16 +180,18 @@ class HierarchicalLayout:
         return f"HierarchicalLayout(hdims=({hdims_str}), hstrides=({hstrides_str}))"
 
 
-def make_hierarchical_layout(arg):
+def make_hierarchical_layout(hdims: list[int], hstrides: list[int], groups: list[tuple[int, int]]):
     """
-    Creates a C++ Layout object from a Python HierarchicalLayout instance or extracts
-    it from a Buffer/BufferLoad/BufferRegion object.
+    Creates a C++ Layout object
 
     Parameters
     ----------
-    arg : Union[Buffer, BufferLoad, BufferRegion, HierarchicalLayout]
-        The input object from which to create or extract the hierarchical layout.
-
+    hdims : list[int]
+        The hierarchical dimensions of the layout.
+    hstrides : list[int]
+        The hierarchical strides corresponding to the hdims.
+    groups : list[tuple[int]]
+        The grouping of hdims and hstrides to form logical dimensions.
     Returns
     -------
     tvm.tl.Layout
@@ -199,26 +202,46 @@ def make_hierarchical_layout(arg):
     ValueError
         If an invalid argument type is provided.
     """
-    hlayout_instance: HierarchicalLayout
-    if isinstance(arg, (Buffer, BufferLoad, BufferRegion)):
-        # TODO: Implement extraction of hdims, hstrides, and groups from buffer attributes.
-        # This will involve reading attributes from the Buffer object.
-        # Once extracted, a HierarchicalLayout instance should be constructed:
-        # hlayout_instance = HierarchicalLayout(hdims=..., hstrides=..., groups=...)
-        raise NotImplementedError(
-            "Extracting HierarchicalLayout from Buffer/BufferLoad/BufferRegion is not yet implemented."
-        )
-    elif isinstance(arg, HierarchicalLayout):
-        hlayout_instance = arg
-    else:
-        raise ValueError("Invalid argument type for make_hierarchical_layout. "
-                         "Expected Buffer, BufferLoad, BufferRegion, or HierarchicalLayout.")
-
     # Convert Python lists/tuples from the hlayout_instance to TVM runtime Arrays for the C++ FFI call
-    hdims_arr = tvm.runtime.convert(hlayout_instance.hdims)
-    hstrides_arr = tvm.runtime.convert(hlayout_instance.hstrides)
-    groups_arr = tvm.runtime.convert([list(g) for g in hlayout_instance.groups
-                                     ])  # Convert inner tuples to lists
-    logical_shape_arr = tvm.runtime.convert(list(hlayout_instance.logical_shape))
+    logical_shape = []
+    for group in groups:
+        group_dims = hdims[group[0]:group[1]]
+        logical_shape.append(math.prod(group_dims))
+    hdims_arr = tvm.runtime.convert(hdims)
+    hstrides_arr = tvm.runtime.convert(hstrides)
+    groups_arr = tvm.runtime.convert([list(g) for g in groups])  # Convert inner tuples to lists
+    logical_shape_arr = tvm.runtime.convert(logical_shape)
 
     return _ffi_api.make_hierarchical_layout(hdims_arr, hstrides_arr, groups_arr, logical_shape_arr)
+
+
+def make_blockwise_zz_layout(buffer: Buffer | BufferLoad | BufferRegion | tuple[int, int],
+                             block_size: tuple[int, int] = (32, 32)):
+    """
+    Args:
+        args: buffer/BufferLoad/BufferRegion or (stride, continuous)
+    Examples:
+        make_blockwise_zz_layout(buffer)
+        make_blockwise_zz_layout(stride, continuous)
+    Note:
+        Blockwise ZZ Layout is designed for 2D tensors only.
+        A 2d tensor is layout in a zig-zag manner in block units.
+        Each block unit is of size 32 x 32 by-default.
+    """
+    if isinstance(buffer, (Buffer, BufferLoad, BufferRegion)):
+        row, column = _get_stride_continuous(buffer)
+    elif isinstance(buffer, tuple) and len(buffer) == 2:
+        row, column = buffer
+    else:
+        raise ValueError(f"Invalid arguments: {buffer}")
+    row_bs, col_bs = block_size
+    nelements_per_block = row_bs * col_bs
+    # Derive hdims, hstrides, and groups for blockwise ZZ layout
+    # from stride and continuous
+    assert row % row_bs == 0 and column % col_bs == 0, \
+        "Row and column must be multiples of block sizes for blockwise ZZ layout."
+    hdims = [row // row_bs, row_bs, column // col_bs, col_bs]
+    hstrides = [row_bs * col_bs * (column // col_bs), row_bs, nelements_per_block, 1]
+    groups = [(0, 2), (2, 4)]
+
+    return make_hierarchical_layout(hdims, hstrides, groups)

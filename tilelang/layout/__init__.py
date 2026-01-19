@@ -17,4 +17,5 @@ from .gemm_sp import make_cutlass_metadata_layout  # noqa: F401
 from .hierarchical_layout import (
     HierarchicalLayout,  # noqa: F401
     make_hierarchical_layout,  # noqa: F401
+    make_blockwise_zz_layout,  # noqa: F401
 )

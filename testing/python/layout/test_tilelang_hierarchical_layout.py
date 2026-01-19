@@ -1,7 +1,9 @@
 import pytest
+import random
 
 from tilelang import tvm as tvm
-from tilelang.layout import HierarchicalLayout, make_hierarchical_layout
+from tilelang.layout import HierarchicalLayout, make_hierarchical_layout, \
+    make_blockwise_zz_layout
 
 
 @pytest.mark.parametrize(
@@ -49,11 +51,6 @@ def test_hierarchical_layout_properties(hdims, hstrides, groups, expected_logica
 def test_hierarchical_layout_invalid_init():
     with pytest.raises(AssertionError, match="hdims and hstrides must have the same length"):
         HierarchicalLayout(hdims=[1, 2], hstrides=[1], groups=[(0, 2)])
-
-
-def test_make_hierarchical_layout_invalid_arg():
-    with pytest.raises(ValueError, match="Invalid argument type for make_hierarchical_layout"):
-        make_hierarchical_layout(123)
 
 
 @pytest.mark.parametrize(
@@ -207,7 +204,7 @@ def test_hierarchical_layout_inverse_index_conversion(hdims, hstrides, groups, h
 )
 def test_hierarchical_layout_cpp_apply(hdims, hstrides, groups, logical_indices):
     py_layout = HierarchicalLayout(hdims, hstrides, groups)
-    cpp_layout = make_hierarchical_layout(py_layout)
+    cpp_layout = make_hierarchical_layout(hdims, hstrides, groups)
 
     h_indices = py_layout.get_hierarchical_indices(logical_indices)
     expected_offset = sum(h * s for h, s in zip(h_indices, py_layout.hstrides))
@@ -222,3 +219,122 @@ def test_hierarchical_layout_cpp_apply(hdims, hstrides, groups, logical_indices)
     analyzer = tvm.arith.Analyzer()
     simplified_offset = analyzer.simplify(offset_expr)
     assert simplified_offset.value == expected_offset
+
+
+@pytest.mark.parametrize(
+    "buffer, block_size, hdims, hstrides, groups",
+    [((128, 128), (32, 32), (4, 32, 4, 32), (4096, 32, 1024, 1), ((
+        0,
+        2,
+    ), (
+        2,
+        4,
+    ))), ((128, 256), (32, 32), (4, 32, 8, 32), (8192, 32, 1024, 1), ((
+        0,
+        2,
+    ), (
+        2,
+        4,
+    ))), ((128, 256), (16, 32), (8, 16, 8, 32), (4096, 16, 512, 1), ((
+        0,
+        2,
+    ), (
+        2,
+        4,
+    ))), ((32, 32), (32, 32), (1, 32, 1, 32), (1024, 32, 1024, 1), ((
+        0,
+        2,
+    ), (
+        2,
+        4,
+    ))), ((32, 64), (32, 32), (1, 32, 2, 32), (2048, 32, 1024, 1), ((
+        0,
+        2,
+    ), (
+        2,
+        4,
+    ))), ((64, 64), (1, 32), (64, 1, 2, 32), (64, 1, 32, 1), ((
+        0,
+        2,
+    ), (
+        2,
+        4,
+    ))), ((60, 90), (10, 15), (6, 10, 6, 15), (900, 10, 150, 1), ((
+        0,
+        2,
+    ), (
+        2,
+        4,
+    ))), ((48, 48), (6, 8), (8, 6, 6, 8), (288, 6, 48, 1), ((
+        0,
+        2,
+    ), (
+        2,
+        4,
+    )))],
+)
+def test_make_blockwise_zz_layout(buffer: tuple[int, int], block_size: tuple[int, int],
+                                  hdims: list[int], hstrides: list[int], groups: list[tuple[int,
+                                                                                            int]]):
+    layout = make_blockwise_zz_layout(buffer, block_size)
+    py_layout = HierarchicalLayout(hdims, hstrides, groups)
+    analyzer = tvm.arith.Analyzer()
+
+    # randomly generate indices within logical shape
+    for i in range(100):
+        logical_indices = [random.randint(0, dim - 1) for dim in buffer]
+        logical_indices_expr = [tvm.tir.IntImm("int32", i) for i in logical_indices]
+
+        offset_expr = layout.map_forward_index(logical_indices_expr)[0]
+        simplified_offset = analyzer.simplify(offset_expr)
+
+        h_indices = py_layout.get_hierarchical_indices(logical_indices)
+        expected_offset = sum(h * s for h, s in zip(h_indices, py_layout.hstrides))
+
+        # The result of map_forward_index is a PrimExpr, we need to simplify and get the value
+        assert simplified_offset.value == expected_offset
+
+
+def test_make_blockwise_zz_layout_invalid_arg():
+    with pytest.raises(ValueError, match="Invalid arguments: 123"):
+        make_blockwise_zz_layout(123)
+
+
+def test_make_blockwise_zz_layout_assertion_error():
+    with pytest.raises(
+            AssertionError,
+            match="Row and column must be multiples of block sizes for blockwise ZZ layout."):
+        make_blockwise_zz_layout((128, 128), (30, 30))
+
+
+def test_make_blockwise_zz_layout_with_buffer():
+    shape = (128, 128)
+    block_size = (32, 32)
+    hdims = [4, 32, 4, 32]
+    hstrides = [4096, 32, 1024, 1]
+    groups = [(
+        0,
+        2,
+    ), (
+        2,
+        4,
+    )]
+
+    buffer = tvm.tir.decl_buffer(shape, "float16")
+    layout = make_blockwise_zz_layout(buffer, block_size)
+    py_layout = HierarchicalLayout(hdims, hstrides, groups)
+    analyzer = tvm.arith.Analyzer()
+
+    # randomly generate indices within logical shape
+    for _ in range(100):
+        logical_indices = [random.randint(0, dim - 1) for dim in shape]
+        logical_indices_expr = [tvm.tir.IntImm("int32", i) for i in logical_indices]
+
+        offset_expr = layout.map_forward_index(logical_indices_expr)[0]
+        simplified_offset = analyzer.simplify(offset_expr)
+
+        h_indices = py_layout.get_hierarchical_indices(logical_indices)
+        expected_offset = sum(h * s for h, s in zip(h_indices, py_layout.hstrides))
+
+        # The result of map_forward_index is a PrimExpr, we need to simplify and get the value
+        assert simplified_offset.value == expected_offset
