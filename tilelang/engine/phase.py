@@ -147,7 +147,6 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
     mod = tir.transform.BindTarget(target)(mod)
-    print(mod)
 
     if should_force_let_inline():
         # Force-let inline whenever the pass config requests it.
