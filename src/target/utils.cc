@@ -17,6 +17,19 @@ bool TargetIsCuda(Target target) {
 bool TargetIsRocm(Target target) {
   return target->GetTargetDeviceType() == kDLROCM;
 }
+bool TargetIsSunmmio(Target target) {
+  // TODO: Before we get supported in TVM, we use llvm
+  // as the target kind for sunmmio. We check additionally
+  // on the mcpu attribute to confirm.
+  if (target->GetTargetDeviceType() != kDLCPU)
+    return false;
+  if (target->attrs.count("mcpu")) {
+    std::string mcpu = Downcast<tvm::ffi::String>(target->attrs.at("mcpu"));
+    // if mcpu start with "sunmmio-", it is CDNA
+    return mcpu.find("sunmmio-") == 0;
+  }
+  return false;
+}
 
 int GetArchInt(Target target) {
   auto s = target->GetAttr<tvm::ffi::String>("arch");
@@ -141,6 +154,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            [](Target target) { return TargetIsCuda(target); })
       .def("tl.TargetIsRocm",
            [](Target target) { return TargetIsRocm(target); })
+      .def("tl.TargetIsSunmmio",
+           [](Target target) { return TargetIsSunmmio(target); })
       .def("tl.TargetIsVolta",
            [](Target target) { return TargetIsVolta(target); })
       .def("tl.TargetIsTuring",

@@ -15,7 +15,10 @@ SUPPORTED_TARGETS: dict[str, str] = {
     "llvm": "LLVM CPU target (accepts standard TVM LLVM options).",
     "webgpu": "WebGPU target for browser/WebGPU runtimes.",
     "c": "C source backend.",
+    "Sunmmio": "Sunmmio target (A4E device)"
 }
+
+SUNMMIO_TARGET_DESC = "llvm -mcpu=sunmmio-a4e -mattr=device_mesh_nrow_4,device_mesh_ncol_4"
 
 
 def describe_supported_targets() -> dict[str, str]:
@@ -59,6 +62,17 @@ def check_metal_availability() -> bool:
     return arch == 'arm64'
 
 
+def check_sunmmio_availability() -> bool:
+    """
+    Placeholder function to check for Sunmmio availability.
+    Currently always returns False.
+    TODO: Integrate with SuBase
+    Returns:
+        bool: True if Sunmmio is available, False otherwise.
+    """
+    return False
+
+
 def determine_target(target: str | Target | Literal["auto"] = "auto",
                      return_object: bool = False) -> str | Target:
     """
@@ -94,6 +108,8 @@ def determine_target(target: str | Target | Literal["auto"] = "auto",
             return_var = "hip"
         elif check_metal_availability():
             return_var = "metal"
+        elif check_sunmmio_availability():
+            return_var = SUNMMIO_TARGET_DESC
         else:
             raise ValueError("No CUDA or HIP or MPS available on this system.")
     else:
@@ -104,6 +120,8 @@ def determine_target(target: str | Target | Literal["auto"] = "auto",
             normalized_target = target.strip()
             if not normalized_target:
                 raise AssertionError(f"Target {target} is not supported")
+            if normalized_target in SUPPORTED_TARGETS and normalized_target == "Sunmmio":
+                normalized_target = SUNMMIO_TARGET_DESC
             try:
                 Target(normalized_target)
             except Exception as err:
@@ -129,6 +147,10 @@ def target_is_cuda(target: Target) -> bool:
 
 def target_is_hip(target: Target) -> bool:
     return _ffi_api.TargetIsRocm(target)
+
+
+def target_is_sunmmio(target: Target) -> bool:
+    return _ffi_api.TargetIsSunmmio(target)
 
 
 def target_is_volta(target: Target) -> bool:

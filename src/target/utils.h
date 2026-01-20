@@ -14,6 +14,7 @@ namespace tl {
 
 bool TargetIsCuda(Target target);
 bool TargetIsRocm(Target target);
+bool TargetIsSunmmio(Target target);
 
 bool TargetIsVolta(Target target);
 bool TargetIsTuring(Target target);
