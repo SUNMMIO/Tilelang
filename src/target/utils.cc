@@ -21,6 +21,18 @@ bool TargetIsRocm(Target target) {
 bool TargetIsMetal(Target target) {
   return target->GetTargetDeviceType() == kDLMetal;
 }
+bool TargetIsSunmmio(Target target) {
+  // TODO: Before we get supported in TVM, we use llvm
+  // as the target kind for sunmmio. We check additionally
+  // on the mcpu attribute to confirm.
+  if (target->GetTargetDeviceType() != kDLCPU)
+    return false;
+  if (target->attrs.count("mcpu")) {
+    std::string mcpu = Downcast<tvm::ffi::String>(target->attrs.at("mcpu"));
+    return mcpu.find("sunmmio-") == 0;
+  }
+  return false;
+}
 
 int GetArchInt(Target target) {
   auto s = target->GetAttr<tvm::ffi::String>("arch");
@@ -265,6 +277,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            [](Target target) { return TargetIsRocm(target); })
       .def("tl.TargetIsMetal",
            [](Target target) { return TargetIsMetal(target); })
+      .def("tl.TargetIsSunmmio",
+           [](Target target) { return TargetIsSunmmio(target); })
       .def("tl.TargetIsVolta",
            [](Target target) { return TargetIsVolta(target); })
       .def("tl.TargetIsTuring",
