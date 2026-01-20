@@ -1,5 +1,6 @@
 import tilelang.language as T
 from tilelang import tvm as tvm
+from tilelang.carver.arch import driver
 from tilelang.engine.lower import canon_target_host
 from tilelang.utils.target import determine_target, \
     target_is_sunmmio
@@ -21,10 +22,8 @@ def test_sunmmio_target():
 
 
 def test_sunmmio_target_binding():
-    device_mesh_config = (
-        2,
-        2,
-    )
+    device_mesh_config = driver.get_sunmmio_device_mesh_config()
+    print("Device mesh config:", device_mesh_config)
 
     def example_tensor_annot(shape):
         MyTensor = T.MeshTensor(
