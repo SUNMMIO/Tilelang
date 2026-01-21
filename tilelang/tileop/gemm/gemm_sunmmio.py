@@ -2,7 +2,7 @@ from .gemm_base import GemmBase
 from tilelang.layout import make_blockwise_zz_layout
 from tilelang.intrinsics.mma_macro_generator import (
     TensorCoreIntrinEmitter,)
-from tilelang.utils.language import is_shared, is_fragment, is_full_region
+from tilelang.utils.language import is_shared, is_full_region
 from tilelang import tvm as tvm
 from tvm.target import Target
 from tvm import tir
@@ -21,7 +21,8 @@ class GemmSunmmio(GemmBase):
             }
         else:
             raise ValueError(
-                f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}")
+                f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}"
+            )
 
     def lower(self, layout_map: dict, target: Target, thread_nums: int, thread_var: tir.Var):
         # TODO: lower not implemented
@@ -120,7 +121,8 @@ class GemmSunmmio(GemmBase):
             return _Simplify(_gemm_rrr, inline_let=True)
         else:
             raise ValueError(
-                f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}")
+                f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}"
+            )
 
     def is_gemm_sss(self) -> bool:
         return is_shared(self.A) and is_shared(self.B) and is_shared(self.C)

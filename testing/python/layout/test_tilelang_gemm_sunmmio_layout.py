@@ -1,4 +1,3 @@
-import os
 import tilelang
 import pytest
 from tilelang import tvm as tvm
@@ -8,17 +7,18 @@ import tilelang.language as T
 from tvm import tir
 from tvm.tir import PyStmtExprVisitor
 from tvm.tir.transform import prim_func_pass
-import tilelang.env as env
-
 
 tilelang.env.disable_cache()
 
 collected_result = {}
 
+
 def layout_func(i, j, continous):
     return (i // 32 * (continous // 32) + j // 32) * 32 * 32 + i % 32 * 32 + j % 32
 
+
 def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
+
     @T.prim_func
     def main(
             A: T.Tensor((M, K), dtype),
@@ -40,8 +40,10 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
 
     return tvm.IRModule({'main': main})
 
+
 @tir.functor.visitor
 class _LayoutVisualVisitor(PyStmtExprVisitor):
+
     def __init__(self):
         super().__init__()
 
@@ -61,24 +63,24 @@ def LayoutVisual():
 
     return prim_func_pass(pass_fn, opt_level=0)
 
+
 TEST_CASES = [
     # (M, N, K, block_M, block_N, block_K, version)
-    (128, 128, 128, 32, 32, 32), 
-    (128, 128, 128, 64, 64, 64), 
-    (128, 128, 128, 64, 32, 64), 
-    (128, 128, 128, 32, 64, 64), 
-    (128, 128, 128, 64, 64, 32), 
-    (128, 128, 128, 64, 32, 32), 
-    (128, 128, 128, 32, 64, 32), 
-    (128, 128, 128, 32, 32, 64), 
+    (128, 128, 128, 32, 32, 32),
+    (128, 128, 128, 64, 64, 64),
+    (128, 128, 128, 64, 32, 64),
+    (128, 128, 128, 32, 64, 64),
+    (128, 128, 128, 64, 64, 32),
+    (128, 128, 128, 64, 32, 32),
+    (128, 128, 128, 32, 64, 32),
+    (128, 128, 128, 32, 32, 64),
 ]
+
 
 @pytest.mark.parametrize(
     "M, N, K, block_M, block_N, block_K",
     TEST_CASES,
 )
-
-
 def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K):
     with tvm.transform.PassContext():
         mod = matmul(M, N, K, block_M, block_N, block_K)
@@ -92,7 +94,7 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K):
             for j in range(block_K):
                 index = layout_func(i, j, block_K)
                 assert index == collected_result['A_shared'].map_forward_index([i, j])[0]
-        
+
         for i in range(block_K):
             for j in range(block_N):
                 index = layout_func(i, j, block_N)
