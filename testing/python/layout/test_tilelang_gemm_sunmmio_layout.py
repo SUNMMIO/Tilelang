@@ -13,8 +13,8 @@ tilelang.env.disable_cache()
 collected_result = {}
 
 
-def layout_func(i, j, continous):
-    return (i // 32 * (continous // 32) + j // 32) * 32 * 32 + i % 32 * 32 + j % 32
+def layout_func(i, j, continuous):
+    return (i // 32 * (continuous // 32) + j // 32) * 32 * 32 + i % 32 * 32 + j % 32
 
 
 def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
