@@ -81,8 +81,18 @@ public:
         ctxt->GetConfig(kDisableVectorize256, Optional<Bool>());
     bool disable_vectorize_256 =
         opt_disable_vectorize_256.value_or(Bool(false));
-    if (tvm::tl::TargetIsSm100(Target::Current(false)) &&
-        !disable_vectorize_256 &&
+    // original code:
+    // if (tvm::tl::TargetIsSm100(Target::Current(false)) &&
+    //
+    // vector_size_ should be independent of target, but target info has been
+    // accessed here
+    //
+    // our target doesn't have runtime now, we use the following code to avoid
+    // the compile error
+    auto target = Target::Current(true);
+    if (!target.defined())
+      return 1;
+    if (tvm::tl::TargetIsSm100(target) && !disable_vectorize_256 &&
         VectorizeFindGlobalAccess().HasGlobalAccess(node)) {
       vector_load_bits_max_ = vector_size_ = 256;
     } else {

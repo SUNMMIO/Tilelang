@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-
+import tvm_ffi
 import tvm.runtime
 from tvm.tir import Buffer, BufferLoad, BufferRegion
 from tilelang import _ffi_api
@@ -215,6 +215,7 @@ def make_hierarchical_layout(hdims: list[int], hstrides: list[int], groups: list
     return _ffi_api.make_hierarchical_layout(hdims_arr, hstrides_arr, groups_arr, logical_shape_arr)
 
 
+@tvm_ffi.register_global_func("tl.layout.make_blockwise_zz_layout")
 def make_blockwise_zz_layout(buffer: Buffer | BufferLoad | BufferRegion | tuple[int, int],
                              block_size: tuple[int, int] = (32, 32)):
     """
