@@ -241,6 +241,11 @@ Layout makeHalfBankSwizzleLayout(int stride, int continuous, int element_size);
 Layout makeQuarterBankSwizzleLayout(int stride, int continuous,
                                     int element_size);
 
+Layout makeHierarchicalLayout(Array<Integer> hdims_arr,
+                              Array<Integer> hstrides_arr,
+                              Array<Array<Integer>> groups_arr,
+                              Array<Integer> logical_shape_arr);
+
 namespace attr {
 // BlockAttr, Containing the layout for all the buffers in the block
 constexpr const char *kLayoutMap = "layout_map";

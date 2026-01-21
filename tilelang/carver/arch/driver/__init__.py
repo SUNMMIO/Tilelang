@@ -8,3 +8,7 @@ from .cuda_driver import (
     get_num_sms,  # noqa: F401
     get_registers_per_block,  # noqa: F401
 )
+from .sunmmio_driver import (
+    get_sunmmio_device_properties,  # noqa: F401
+    get_device_mesh_config as get_sunmmio_device_mesh_config,  # noqa: F401
+)
