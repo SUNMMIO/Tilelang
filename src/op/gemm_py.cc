@@ -127,9 +127,7 @@ bool GemmPyNode::allowWgmma(int block_size, Target target) const {
 GemmInst GemmPyNode::getGemmInst(int block_size, Target target) const {
   bool allow_tcgen5mma = allowTcgen5Mma(target);
   bool allow_wgmma = allowWgmma(block_size, target);
-  if (TargetIsSunmmio(target)) {
-    return GemmInst::kSunmmio;
-  } else if (allow_tcgen5mma) {
+  if (allow_tcgen5mma) {
     return GemmInst::kTCGEN5MMA;
   } else if (allow_wgmma) {
     return GemmInst::kWGMMA;
@@ -139,6 +137,8 @@ GemmInst GemmPyNode::getGemmInst(int block_size, Target target) const {
              TargetIsTuring(target) || TargetIsHopper(target) ||
              TargetIsSm100(target)) {
     return GemmInst::kMMA;
+  } else if (TargetIsSunmmio(target)) {
+    return GemmInst::kSunmmioMMA;
   } else {
     ICHECK(0) << "Unsupported target for gemm: " << target->str();
     return GemmInst::kMMA; // This line will never be reached due to ICHECK, but

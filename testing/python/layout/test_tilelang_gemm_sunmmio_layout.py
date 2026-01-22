@@ -104,6 +104,3 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K):
             for j in range(block_N):
                 index = layout_func(i, j, block_N)
                 assert index == collected_result['C_shared'].map_forward_index([i, j])[0]
-
-
-test_tilelang_gemm_sunmmio_layout(128, 128, 128, 32, 32, 64)

@@ -38,7 +38,7 @@ class GemmInst(IntEnum):
     WGMMA = 1
     TCGEN5MMA = 2
     MFMA = 3
-    Sunmmio = 4
+    SunmmioMMA = 4
 
     def is_mma(self) -> bool:
         return self == GemmInst.MMA
@@ -53,7 +53,7 @@ class GemmInst(IntEnum):
         return self == GemmInst.MFMA
 
     def is_sunmmio(self) -> bool:
-        return self == GemmInst.Sunmmio
+        return self == GemmInst.SunmmioMMA
 
     def __repr__(self) -> str:
         return self.name

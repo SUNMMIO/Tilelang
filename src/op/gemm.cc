@@ -127,9 +127,7 @@ bool GemmNode::allowWgmma(int block_size, Target target) const {
 }
 
 GemmInst GemmNode::getGemmInst(int block_size, Target target) const {
-  if (TargetIsSunmmio(target)) {
-    return GemmInst::kSunmmio;
-  } else if (allowTcgen5Mma(target)) {
+  if (allowTcgen5Mma(target)) {
     return GemmInst::kTCGEN5MMA;
   } else if (allowWgmma(block_size, target)) {
     return GemmInst::kWGMMA;
@@ -137,6 +135,8 @@ GemmInst GemmNode::getGemmInst(int block_size, Target target) const {
     return GemmInst::kMFMA;
   } else if (TargetIsCuda(target)) {
     return GemmInst::kMMA;
+  } else if (TargetIsSunmmio(target)) {
+    return GemmInst::kSunmmioMMA;
   } else {
     ICHECK(0) << "Unsupported target for gemm: " << target;
     return GemmInst::kMMA;
@@ -603,23 +603,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
   GemmInst gemm_inst = getGemmInst(block_size, T.target);
   auto [warp_m, warp_n] =
       policy_->computeWarpPartition(m_, n_, block_size, T.target, gemm_inst);
-  if (gemm_inst == GemmInst::kSunmmio) {
-    ICHECK((((std::string)a_.scope()).compare(0, 6, "shared") == 0))
-        << "Sunmmio Gemm only supports A in shared scope, got " << a_.scope();
-    ICHECK((((std::string)b_.scope()).compare(0, 6, "shared") == 0))
-        << "Sunmmio Gemm only supports B in shared scope, got " << b_.scope();
-    ICHECK((((std::string)c_.scope()).compare(0, 6, "shared") == 0))
-        << "Sunmmio Gemm only supports C in shared scope, got " << c_.scope();
-
-    const auto f =
-        ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
-    auto l = Downcast<Layout>((*f)(a_));
-    results.Set(a_, l);
-    l = Downcast<Layout>((*f)(b_));
-    results.Set(b_, l);
-    l = Downcast<Layout>((*f)(c_));
-    results.Set(c_, l);
-  } else if (TargetIsVolta(T.target)) {
+  if (TargetIsVolta(T.target)) {
     ICHECK(c_.scope() == "local.fragment")
         << "Volta gemm only supports C in local.fragment scope, got "
         << c_.scope();
@@ -825,6 +809,22 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
     } else {
       ICHECK(0);
     }
+  } else if (gemm_inst == GemmInst::kSunmmioMMA) {
+    ICHECK((((std::string)a_.scope()).compare(0, 6, "shared") == 0))
+        << "Sunmmio Gemm only supports A in shared scope, got " << a_.scope();
+    ICHECK((((std::string)b_.scope()).compare(0, 6, "shared") == 0))
+        << "Sunmmio Gemm only supports B in shared scope, got " << b_.scope();
+    ICHECK((((std::string)c_.scope()).compare(0, 6, "shared") == 0))
+        << "Sunmmio Gemm only supports C in shared scope, got " << c_.scope();
+
+    const auto f =
+        ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
+    auto l = Downcast<Layout>((*f)(a_));
+    results.Set(a_, l);
+    l = Downcast<Layout>((*f)(b_));
+    results.Set(b_, l);
+    l = Downcast<Layout>((*f)(c_));
+    results.Set(c_, l);
   } else {
     ICHECK(0) << "Not supported " << T.target->str();
   }
