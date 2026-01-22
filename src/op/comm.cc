@@ -85,7 +85,7 @@ LayoutMap BroadcastNode::InferLayout(const LayoutInferArgs &T,
   args.push_back(dst_expr);
   Copy copy_op = Copy(args);
   LayoutMap out_layout = copy_op->InferLayout(T, level);
-  return out_layout;                                    
+  return out_layout;
 }
 
 // int get_target_mesh_nrows(Target target) {
@@ -123,12 +123,13 @@ int get_target_mesh(Target target, int axis) {
   for (size_t i = 0; i < mattr.size(); i++) {
     std::string m = mattr[i];
     if (m.find(axis_str) != std::string::npos) {
-      std::string s = m.substr(m.find_last_of('_') + 1);;
+      std::string s = m.substr(m.find_last_of('_') + 1);
+      ;
       try {
         x = std::stoi(s);
-      } catch (const std::invalid_argument& e) {
+      } catch (const std::invalid_argument &e) {
         x = -1;
-      } catch (const std::out_of_range& e) {
+      } catch (const std::out_of_range &e) {
         x = -1;
       }
     }
@@ -137,7 +138,6 @@ int get_target_mesh(Target target, int axis) {
   ICHECK(x > 0) << "Invalid " << axis_str;
   return x;
 }
-
 
 Stmt BroadcastNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   Target target = T.target;
@@ -444,7 +444,7 @@ Layout AllgatherNode::ComputeLinearLayout(const Buffer &shared_tensor) const {
 
 LayoutMap AllgatherNode::InferLayout(const LayoutInferArgs &T,
                                      InferLevel level) const {
-  Buffer recv_buffer = NormalizeToBufferRegion(recv)->buffer;                    
+  Buffer recv_buffer = NormalizeToBufferRegion(recv)->buffer;
   Layout linear_layout = ComputeLinearLayout(recv_buffer);
   return Map<Buffer, Layout>({{recv_buffer, linear_layout}});
 }

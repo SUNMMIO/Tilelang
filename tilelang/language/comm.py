@@ -13,7 +13,6 @@ from tvm import tir
 import tilelang.language as T
 from tilelang.utils.language import to_buffer_region
 
-
 DIRECTION_MAP = {"horizontal": 0, "h": 0, "vertical": 1, "v": 1, "all": 2, "a": 2}
 
 
@@ -38,7 +37,7 @@ def get_target_mesh_shape(target: str = "auto") -> dict[str, int]:
         return {"x": 2, "y": 4}
     else:
         raise ValueError(f"Unknown target: {target}")
-    
+
 
 def core_tuple_to_id(core_id: tuple[int, int]) -> int:
     """Convert 2D (row, col) coordinates on the mesh into a linear core id.
@@ -60,12 +59,8 @@ def core_tuple_to_id(core_id: tuple[int, int]) -> int:
     """
     mesh_shape = get_target_mesh_shape("auto")
     row, col = core_id
-    assert (
-        0 <= row < mesh_shape["x"]
-    ), f"Row {row} out of bounds for mesh shape {mesh_shape}."
-    assert (
-        0 <= col < mesh_shape["y"]
-    ), f"Col {col} out of bounds for mesh shape {mesh_shape}."
+    assert (0 <= row < mesh_shape["x"]), f"Row {row} out of bounds for mesh shape {mesh_shape}."
+    assert (0 <= col < mesh_shape["y"]), f"Col {col} out of bounds for mesh shape {mesh_shape}."
     core_id_value = row * mesh_shape["y"] + col
     return core_id_value
 
@@ -117,19 +112,14 @@ def CoreId(core_id: int | tuple[int, int]):
     mesh_shape = get_target_mesh_shape("auto")
     if isinstance(core_id, tuple):
         row, col = core_id
-        assert (
-            0 <= row < mesh_shape["x"]
-        ), f"Row {row} out of bounds for mesh shape {mesh_shape}"
-        assert (
-            0 <= col < mesh_shape["y"]
-        ), f"Col {col} out of bounds for mesh shape {mesh_shape}"
+        assert (0 <= row < mesh_shape["x"]), f"Row {row} out of bounds for mesh shape {mesh_shape}"
+        assert (0 <= col < mesh_shape["y"]), f"Col {col} out of bounds for mesh shape {mesh_shape}"
         # Convert 2D coordinates into a linear core id.
         core_id_value = row * mesh_shape["x"] + col
     elif isinstance(core_id, int):
         core_id_value = core_id
-        assert (
-            0 <= core_id_value < mesh_shape["x"] * mesh_shape["y"]
-        ), f"Core ID {core_id_value} out of bounds for mesh shape {mesh_shape}"
+        assert (0 <= core_id_value < mesh_shape["x"] * mesh_shape["y"]
+               ), f"Core ID {core_id_value} out of bounds for mesh shape {mesh_shape}"
     else:
         raise ValueError("core_id must be either a tuple[int, int] or an int.")
     return tir.call_intrin("handle", tir.op.Op.get("tl.CoreId"), core_id_value)
@@ -185,22 +175,19 @@ def broadcast(
     ), f"Source and destination buffer dtypes must match for broadcast. Got {src.dtype} vs {dst.dtype}."
     if len(src.shape) != len(dst.shape):
         raise ValueError(
-            "Source and destination buffer must have the same number of dimensions for broadcast."
-        )
+            "Source and destination buffer must have the same number of dimensions for broadcast.")
     for i in range(len(src.shape)):
-        assert (src.shape[i] == dst.shape[i] or src.shape[i] == 1 or dst.shape[i] == 1
+        assert (
+            src.shape[i] == dst.shape[i] or src.shape[i] == 1 or dst.shape[i] == 1
         ), f"Source buffer shape  and destination buffer shape must match for broadcast. Got {src.shape} vs {dst.shape}."
 
     mesh_shape = get_target_mesh_shape("auto")
-    assert (
-        isinstance(src_core, tuple) and len(src_core) == 2
-    ), "src_core must be a tuple of (row, col)."
-    assert (
-        0 <= src_core[0] < mesh_shape["x"]
-    ), f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
-    assert (
-        0 <= src_core[1] < mesh_shape["y"]
-    ), f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
+    assert (isinstance(src_core, tuple) and
+            len(src_core) == 2), "src_core must be a tuple of (row, col)."
+    assert (0 <= src_core[0] < mesh_shape["x"]
+           ), f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
+    assert (0 <= src_core[1] < mesh_shape["y"]
+           ), f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
 
     src_elements = 1
     for dim in src.shape:
@@ -260,39 +247,30 @@ def put(
     ), f"Source and destination buffer dtypes must match for broadcast. Got {src.dtype} vs {dst.dtype}."
     if len(src.shape) != len(dst.shape):
         raise ValueError(
-            "Source and destination buffer must have the same number of dimensions for broadcast."
-        )
+            "Source and destination buffer must have the same number of dimensions for broadcast.")
     for i in range(len(src.shape)):
         assert (
             src.shape[i] == dst.shape[i] or src.shape[i] == 1 or dst.shape[i] == 1
         ), f"Source buffer shape  and destination buffer shape must match for broadcast. Got {src.shape} vs {dst.shape}."
 
     mesh_shape = get_target_mesh_shape("auto")
-    assert (
-        isinstance(src_core, tuple) and len(src_core) == 2
-    ), "src_core must be a tuple of (row, col)."
-    assert (
-        0 <= src_core[0] < mesh_shape["x"]
-    ), f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
-    assert (
-        0 <= src_core[1] < mesh_shape["y"]
-    ), f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
-    assert (
-        isinstance(dst_core, tuple) and len(dst_core) == 2
-    ), "dst_core must be a tuple of (row, col)."
-    assert (
-        0 <= dst_core[0] < mesh_shape["x"]
-    ), f"dst_core row {dst_core[0]} out of bounds for mesh shape {mesh_shape}."
-    assert (
-        0 <= dst_core[1] < mesh_shape["y"]
-    ), f"dst_core col {dst_core[1]} out of bounds for mesh shape {mesh_shape}."
+    assert (isinstance(src_core, tuple) and
+            len(src_core) == 2), "src_core must be a tuple of (row, col)."
+    assert (0 <= src_core[0] < mesh_shape["x"]
+           ), f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
+    assert (0 <= src_core[1] < mesh_shape["y"]
+           ), f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
+    assert (isinstance(dst_core, tuple) and
+            len(dst_core) == 2), "dst_core must be a tuple of (row, col)."
+    assert (0 <= dst_core[0] < mesh_shape["x"]
+           ), f"dst_core row {dst_core[0]} out of bounds for mesh shape {mesh_shape}."
+    assert (0 <= dst_core[1] < mesh_shape["y"]
+           ), f"dst_core col {dst_core[1]} out of bounds for mesh shape {mesh_shape}."
     src_elements = 1
     for dim in src.shape:
         src_elements *= dim
     assert isinstance(size, int) and size >= -1, "size must be an integer >= -1."
-    assert (
-        size <= src_elements
-    ), f"size {size} exceeds source buffer size {src_elements}."
+    assert (size <= src_elements), f"size {size} exceeds source buffer size {src_elements}."
 
     src_region = to_buffer_region(src)
     dst_region = to_buffer_region(dst)
@@ -330,8 +308,9 @@ def all_gather(
     >>> all_gather(A_local, C_local, direction="horizontal")
     """
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
-    
-    assert (send_buffer.dtype == recv_buffer.dtype
+
+    assert (
+        send_buffer.dtype == recv_buffer.dtype
     ), f"Source and destination buffer dtypes must match for broadcast. Got {send_buffer.dtype} vs {recv_buffer.dtype}."
     mesh_shape = get_target_mesh_shape("auto")
 
@@ -352,9 +331,7 @@ def all_gather(
     send_elements = 1
     for dim in send_buffer.shape:
         send_elements *= dim
-    assert (
-        size <= send_elements
-    ), f"size {size} exceeds send buffer size {send_elements}."
+    assert (size <= send_elements), f"size {size} exceeds send buffer size {send_elements}."
 
     send_buffer_region = to_buffer_region(send_buffer)
     recv_buffer_region = to_buffer_region(recv_buffer)

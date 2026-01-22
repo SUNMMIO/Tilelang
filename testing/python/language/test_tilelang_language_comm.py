@@ -34,13 +34,11 @@ def main(A_handle: T.handle):
         T.comm_allgather(A_local[0:128, 0:128], C_local[0:16, 0:128, 0:128], 2, -1)"""
 
     @T.prim_func
-    def main(
-        A: T.Tensor((M, N), dtype),
-    ):
+    def main(A: T.Tensor((M, N), dtype),):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
-            A_local  = T.alloc_fragment([block_M, block_N], accum_dtype)
-            B_local  = T.alloc_fragment([block_M, block_N], accum_dtype)
-            C_local  = T.alloc_fragment([16, block_M, block_N], accum_dtype)
+            A_local = T.alloc_fragment([block_M, block_N], accum_dtype)
+            B_local = T.alloc_fragment([block_M, block_N], accum_dtype)
+            C_local = T.alloc_fragment([16, block_M, block_N], accum_dtype)
             T.copy(A[by * block_M, bx * block_N], A_local)
 
             T.comm.broadcast(A_local, B_local, (1, 2), direction="all")
@@ -48,7 +46,7 @@ def main(A_handle: T.handle):
             T.comm.all_gather(A_local, C_local, direction="all")
 
     assert main.script() == func_str, "The generated script does not match the expected output."
-            
+
 
 @pytest.mark.parametrize("M, N, block_M, block_N, dtype, accum_dtype", [
     (1024, 1024, 128, 128, "float16", "float"),
@@ -85,23 +83,21 @@ class Module:
             T.broadcast_(T.tvm_access_ptr(T.type_annotation("float32"), B_local.data, 0, 16384, 1), T.tvm_access_ptr(T.type_annotation("float32"), B_local.data, 0, 16384, 2), 16384, 14, 0, 2)"""
 
     @T.prim_func
-    def main(
-        A: T.Tensor((M, N), dtype),
-    ):
+    def main(A: T.Tensor((M, N), dtype),):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
-            A_local  = T.alloc_fragment([block_M, block_N], accum_dtype)
-            B_local  = T.alloc_fragment([block_M, block_N], accum_dtype)
+            A_local = T.alloc_fragment([block_M, block_N], accum_dtype)
+            B_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             T.copy(A[by * block_M, bx * block_N], A_local)
 
             T.comm.broadcast(A_local, B_local, (1, 2), direction="all")
-            
+
     mod = tvm.IRModule({'main': main})
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
         assert mod.script() == func_str, "The generated script does not match the expected output."
-    
+
 
 @pytest.mark.parametrize("M, N, block_M, block_N, dtype, accum_dtype", [
     (1024, 1024, 128, 128, "float16", "float"),
@@ -133,25 +129,24 @@ class Module:
                         A_local[i, j * 4 + vec] = T.Cast("float32", A[by * 128 + i, bx * 128 + (j * 4 + vec)])
             T.broadcast_(T.tvm_access_ptr(T.type_annotation("float32"), A_local.data, 0, 16384, 1), T.tvm_access_ptr(T.type_annotation("float32"), B_local.data, 0, 16384, 2), 16384, 6, 1, 0, 1, 3)
             T.broadcast_(T.tvm_access_ptr(T.type_annotation("float32"), B_local.data, 0, 16384, 1), T.tvm_access_ptr(T.type_annotation("float32"), B_local.data, 0, 16384, 2), 16384, 7, 0, 0, 1, 2)"""
+
     @T.prim_func
-    def main(
-        A: T.Tensor((M, N), dtype),
-    ):
+    def main(A: T.Tensor((M, N), dtype),):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
-            A_local  = T.alloc_fragment([block_M, block_N], accum_dtype)
-            B_local  = T.alloc_fragment([block_M, block_N], accum_dtype)
+            A_local = T.alloc_fragment([block_M, block_N], accum_dtype)
+            B_local = T.alloc_fragment([block_M, block_N], accum_dtype)
             T.copy(A[by * block_M, bx * block_N], A_local)
 
             T.comm.put(A_local, B_local, (1, 2), (2, 3))
-            
+
     mod = tvm.IRModule({'main': main})
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
         assert mod.script() == func_str, "The generated script does not match the expected output."
-        
-        
+
+
 @pytest.mark.parametrize("M, N, block_M, block_N, dtype, accum_dtype", [
     (1024, 1024, 128, 128, "float16", "float"),
 ])
@@ -212,16 +207,16 @@ class Module:
             T.broadcast_(T.tvm_access_ptr(T.type_annotation("float32"), C_local.data, 65536, 65536, 1), T.tvm_access_ptr(T.type_annotation("float32"), C_local.data, 65536, 65536, 2), 65536, 7, 1, 1)
             T.broadcast_(T.tvm_access_ptr(T.type_annotation("float32"), C_local.data, 131072, 65536, 1), T.tvm_access_ptr(T.type_annotation("float32"), C_local.data, 131072, 65536, 2), 65536, 11, 1, 2)
             T.broadcast_(T.tvm_access_ptr(T.type_annotation("float32"), C_local.data, 196608, 65536, 1), T.tvm_access_ptr(T.type_annotation("float32"), C_local.data, 196608, 65536, 2), 65536, 15, 1, 3)"""
+
     @T.prim_func
-    def main(
-        A: T.Tensor((M, N), dtype),
-    ):
+    def main(A: T.Tensor((M, N), dtype),):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
-            A_local  = T.alloc_fragment([block_M, block_N], accum_dtype)
-            C_local  = T.alloc_fragment([16, block_M, block_N], accum_dtype)
+            A_local = T.alloc_fragment([block_M, block_N], accum_dtype)
+            C_local = T.alloc_fragment([16, block_M, block_N], accum_dtype)
             T.copy(A[by * block_M, bx * block_N], A_local)
 
-            T.comm.all_gather(A_local, C_local, direction="all") 
+            T.comm.all_gather(A_local, C_local, direction="all")
+
     mod = tvm.IRModule({'main': main})
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
