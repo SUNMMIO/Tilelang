@@ -32,6 +32,30 @@ def Parallel(*extents: tir.PrimExpr, coalesced_width: int | None = None):
     return _ffi_api.Parallel(extents, annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
+def Tiles(shared_buf: tir.Buffer, parallel: bool = False):
+    """Tools to construct tiled for loop over a shared memory buffer.
+
+    Parameters
+    ----------
+    shared_buf : tir.Buffer
+        The shared memory buffer to be tiled.
+
+    parallel : bool
+        Whether to generate a parallel tiled loop.
+
+    Returns
+    -------
+    res : frame.ForFrame
+        The ForFrame.
+    """
+    annotations = {
+        "tile_level_loop": tir.IntImm("int32", 1),
+        "tile.parallel": tir.IntImm("int32", 1 if parallel else 0),
+    }
+
+    return _ffi_api.Parallel(tuple(shared_buf.shape), annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
+
+
 def Persistent(
     domain: list[tir.PrimExpr],
     wave_size: tir.PrimExpr,
