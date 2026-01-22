@@ -82,10 +82,10 @@ TEST_CASES = [
     TEST_CASES,
 )
 def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K):
-    with tvm.transform.PassContext():
+    target_name = "Sunmmio"
+    target = determine_target(target_name, return_object=True)
+    with tvm.target.Target(target):
         mod = matmul(M, N, K, block_M, block_N, block_K)
-        target_name = "Sunmmio"
-        target = determine_target(target_name, return_object=True)
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl.transform.LayoutInference()(mod)
         LayoutVisual()(mod)
