@@ -65,7 +65,7 @@ def LayoutVisual():
 
 
 TEST_CASES = [
-    # (M, N, K, block_M, block_N, block_K, version)
+    # (M, N, K, block_M, block_N, block_K)
     (128, 128, 128, 32, 32, 32),
     (128, 128, 128, 64, 64, 64),
     (128, 128, 128, 64, 32, 64),
