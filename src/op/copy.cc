@@ -616,8 +616,8 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
  */
 bool CopyNode::CheckDMALoad(Target target, arith::Analyzer *analyzer, 
   bool check_last_dim) const {
-  // 1. arch must support zpu
-  if (!TargetIsZpu(target))
+  // 1. arch must support Sunmmio
+  if (!TargetIsSunmmio(target))
     return false;
   // 2. src and dst must be global and shared
   if (src.scope() != "global" ||
@@ -662,8 +662,8 @@ bool CopyNode::CheckDMALoad(Target target, arith::Analyzer *analyzer,
  */
 bool CopyNode::CheckDMAStore(Target target, arith::Analyzer *analyzer,
                               bool check_last_dim) const {
-  // 1. arch must support zpu
-  if (!TargetIsZpu(target))
+  // 1. arch must support Sunmmio
+  if (!TargetIsSunmmio(target))
     return false;
   // 2. src and dst must be shared.dyn and local.fragment
   if ((src.scope() != "shared.dyn" && src.scope() != "shared") ||
@@ -951,11 +951,7 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
 
   // Check tensor memory operations first (highest priority for SM100/Blackwell)
   // 1d tma access can not support out of bound access
-  if (CheckDMALoad(target, analyzer)) {
-    return CopyInst::kDMALoad;
-  } else if (CheckDMAStore(target, analyzer)) {
-    return CopyInst::kDMAStore;
-  } else if (!disable_tma_lower && !buffer_oob &&
+  if (!disable_tma_lower && !buffer_oob &&
       CheckBulkLoad1D(target, layout_map, analyzer)) {
     return CopyInst::kBulkLoad1D;
   } else if (!disable_tma_lower && !buffer_oob &&
@@ -973,6 +969,10 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
     return CopyInst::kTMemLoad;
   } else if (CheckTMemStore(target)) {
     return CopyInst::kTMemStore;
+  } else if (CheckDMALoad(target, analyzer)) {
+    return CopyInst::kDMALoad;
+  } else if (CheckDMAStore(target, analyzer)) {
+    return CopyInst::kDMAStore;
   } else {
     return CopyInst::kNormal;
   }
@@ -1000,11 +1000,7 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   auto copy_inst = GetCopyInst(target, disable_tma_lower || disable_tma,
                                T.layout_map, analyzer);
 
-  if (copy_inst == CopyInst::kDMALoad || copy_inst == CopyInst::kDMAStore) {
-    auto bulk_copy = LowerDMACopy(T, analyzer, copy_inst);
-    ICHECK(bulk_copy.defined()) << "Failed to lower dma load/store";
-    return bulk_copy;
-  } else if(copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore) {
+  if(copy_inst == CopyInst::kTMemLoad || copy_inst == CopyInst::kTMemStore) {
     auto tmem_copy = LowerTmemCopy(T, analyzer);
     ICHECK(tmem_copy.defined()) << "Failed to lower tensor memory copy";
     return tmem_copy;
@@ -1024,6 +1020,10 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     return ldsm_copy;
   } else if (copy_inst == CopyInst::kNormal) {
     return LowerNormalCopy(T, analyzer);
+  } else if (copy_inst == CopyInst::kDMALoad || copy_inst == CopyInst::kDMAStore) {
+    auto bulk_copy = LowerDMACopy(T, analyzer, copy_inst);
+    ICHECK(bulk_copy.defined()) << "Failed to lower dma load/store";
+    return bulk_copy;
   } else {
     LOG(FATAL) << "Unsupported copy inst " << static_cast<int>(copy_inst);
   }
