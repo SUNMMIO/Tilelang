@@ -7,6 +7,7 @@ import tilelang.language as T
 from tvm import tir
 from tvm.tir import PyStmtExprVisitor
 from tvm.tir.transform import prim_func_pass
+import tilelang.env as env
 
 tilelang.env.disable_cache()
 
@@ -17,7 +18,7 @@ def layout_func(i, j, continuous):
     return (i // 32 * (continuous // 32) + j // 32) * 32 * 32 + i % 32 * 32 + j % 32
 
 
-def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
+def matmul(M, N, K, block_M, block_N, block_K, version, dtype=T.float16, accum_dtype=T.float32):
 
     @T.prim_func
     def main(
@@ -34,7 +35,12 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.fl
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
                 T.copy(A[by * block_M, k * block_K], A_shared)
                 T.copy(B[k * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, C_shared)
+                if version == 1:
+                    T.gemm_v1(A_shared, B_shared, C_shared)
+                elif version == 2:
+                    T.gemm_v2(A_shared, B_shared, C_shared)
+                else:
+                    raise ValueError(f'unsupported gemm version: {version}')
 
             T.copy(C_shared, C[by * block_M, bx * block_N])
 
@@ -65,27 +71,40 @@ def LayoutVisual():
 
 
 TEST_CASES = [
-    # (M, N, K, block_M, block_N, block_K)
-    (128, 128, 128, 32, 32, 32),
-    (128, 128, 128, 64, 64, 64),
-    (128, 128, 128, 64, 32, 64),
-    (128, 128, 128, 32, 64, 64),
-    (128, 128, 128, 64, 64, 32),
-    (128, 128, 128, 64, 32, 32),
-    (128, 128, 128, 32, 64, 32),
-    (128, 128, 128, 32, 32, 64),
+    # (M, N, K, block_M, block_N, block_K, version)
+    # gemm v1
+    (128, 128, 128, 32, 32, 32, 1),
+    (128, 128, 128, 64, 64, 64, 1),
+    (128, 128, 128, 64, 32, 64, 1),
+    (128, 128, 128, 32, 64, 64, 1),
+    (128, 128, 128, 64, 64, 32, 1),
+    (128, 128, 128, 64, 32, 32, 1),
+    (128, 128, 128, 32, 64, 32, 1),
+    (128, 128, 128, 32, 32, 64, 1),
+    # gemm v2
+    (128, 128, 128, 32, 32, 32, 2),
+    (128, 128, 128, 64, 64, 64, 2),
+    (128, 128, 128, 64, 32, 64, 2),
+    (128, 128, 128, 32, 64, 64, 2),
+    (128, 128, 128, 64, 64, 32, 2),
+    (128, 128, 128, 64, 32, 32, 2),
+    (128, 128, 128, 32, 64, 32, 2),
+    (128, 128, 128, 32, 32, 64, 2),
 ]
 
 
 @pytest.mark.parametrize(
-    "M, N, K, block_M, block_N, block_K",
+    "M, N, K, block_M, block_N, block_K, version",
     TEST_CASES,
 )
-def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K):
+def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, version):
+    # Enable v2
+    env.TILELANG_USE_GEMM_V1 = 0
+    assert not env.use_gemm_v1()
     target_name = "Sunmmio"
     target = determine_target(target_name, return_object=True)
     with tvm.target.Target(target):
-        mod = matmul(M, N, K, block_M, block_N, block_K)
+        mod = matmul(M, N, K, block_M, block_N, block_K, version)
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl.transform.LayoutInference()(mod)
         LayoutVisual()(mod)
