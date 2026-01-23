@@ -12,6 +12,7 @@ from .gemm_wgmma import GemmWGMMA
 from .gemm_tcgen05 import GemmTCGEN5
 from .gemm_mfma import GemmMFMA
 from .gemm_cutedsl import GemmCuTeDSL
+from .gemm_sunmmio import GemmSunmmio
 from tilelang import _ffi_api
 from tilelang.utils.target import target_is_volta
 from tilelang.jit.adapter.utils import is_cutedsl_target
@@ -160,7 +161,9 @@ class GemmPy(Node, Scriptable):
         if is_cutedsl_target(target):
             return GemmCuTeDSL
 
-        if gemm_inst.is_mma():
+        if gemm_inst.is_sunmmio():
+            return GemmSunmmio
+        elif gemm_inst.is_mma():
             if target_is_volta(target):
                 return GemmMMASm70
             return GemmMMA

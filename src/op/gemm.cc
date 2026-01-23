@@ -131,6 +131,8 @@ GemmInst GemmNode::getGemmInst(int block_size, Target target) const {
     return GemmInst::kMFMA;
   } else if (TargetIsCuda(target)) {
     return GemmInst::kMMA;
+  } else if (TargetIsSunmmio(target)) {
+    return GemmInst::kSunmmioMMA;
   } else {
     ICHECK(0) << "Unsupported target for gemm: " << target;
     return GemmInst::kMMA;
@@ -806,6 +808,22 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
     } else {
       ICHECK(0);
     }
+  } else if (gemm_inst == GemmInst::kSunmmioMMA) {
+    ICHECK((((std::string)a_.scope()).compare(0, 6, "shared") == 0))
+        << "Sunmmio Gemm only supports A in shared scope, got " << a_.scope();
+    ICHECK((((std::string)b_.scope()).compare(0, 6, "shared") == 0))
+        << "Sunmmio Gemm only supports B in shared scope, got " << b_.scope();
+    ICHECK((((std::string)c_.scope()).compare(0, 6, "shared") == 0))
+        << "Sunmmio Gemm only supports C in shared scope, got " << c_.scope();
+
+    const auto f =
+        ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
+    auto l = Downcast<Layout>((*f)(a_));
+    results.Set(a_, l);
+    l = Downcast<Layout>((*f)(b_));
+    results.Set(b_, l);
+    l = Downcast<Layout>((*f)(c_));
+    results.Set(c_, l);
   } else {
     ICHECK(0) << "Not supported " << T.target->str();
   }
