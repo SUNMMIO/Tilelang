@@ -71,7 +71,6 @@ struct TMADesc {
   /// Encode descriptor fields into runtime call arguments
   Array<PrimExpr> EncodeCallArgs() const;
 };
-
 /*!
  * \brief Descriptor for TMA-based im2col transformation used in Conv2D.
  *
