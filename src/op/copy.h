@@ -49,26 +49,6 @@ struct TMADesc {
   /// Encode descriptor fields into runtime call arguments
   Array<PrimExpr> EncodeCallArgs() const;
 };
-
-/// Descriptor for DMA copy operations
-/// the same as TMADesc
-struct DMADesc {
-  size_t rank;                   ///< Tensor rank (number of dimensions)
-  int data_type;                 ///< Data type identifier
-  Array<PrimExpr> global_shape;  ///< Shape in global memory
-  Array<PrimExpr> global_stride; ///< Strides in global memory
-  Array<PrimExpr> smem_box;      ///< Block shape in shared memory
-  Array<PrimExpr> smem_stride;   ///< Strides in shared memory
-  PrimExpr global_addr;          ///< Base address in global memory
-  int swizzle;                   ///< Memory layout swizzle parameter
-  int interleave;                ///< Memory interleave parameter
-  int oob_fill;                  ///< Out-of-bound fill policy
-  int l2_promotion;              ///< L2 cache promotion flag
-
-  /// Encode descriptor fields into runtime call arguments
-  Array<PrimExpr> EncodeCallArgs() const;
-};
-
 /*!
  * \brief Descriptor for TMA-based im2col transformation used in Conv2D.
  *
