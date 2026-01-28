@@ -92,11 +92,10 @@ private:
       for (auto buffer : alloc_buffers) {
         if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
           buffers_to_infer.insert(buffer);
-        } else if ((buffer.scope() == "shared.asram") ||
-                   (buffer.scope() == "shared.wsram") ||
-                   (buffer.scope() == "shared.rsram")) {
-          // has validated in GEMM node
-        } else {
+        } else if ((buffer.scope() != "shared.asram") &&
+                   (buffer.scope() != "shared.wsram") &&
+                   (buffer.scope() != "shared.rsram")) {
+          // sram type has validated in GEMM node
           ICHECK(0) << "Invalid scope " << buffer.scope() << " of " << buffer
                     << " in Sunmmio.";
         }
@@ -158,9 +157,8 @@ private:
               buffer_remap_.Set(buffer, remap_buffer);
               var_remap_.Set(buffer->data, new_var);
             }
-          } else if (buffer.scope() == "shared.asram") {
-            // correct specification
-          } else {
+          } else if (buffer.scope() != "shared.asram") {
+            // incorrect specification
             ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
                       << buffer << " in GEMM Sunmmio.";
           }
@@ -185,9 +183,8 @@ private:
               buffer_remap_.Set(buffer, remap_buffer);
               var_remap_.Set(buffer->data, new_var);
             }
-          } else if (buffer.scope() == "shared.wsram") {
-            // correct specification
-          } else {
+          } else if (buffer.scope() != "shared.wsram") {
+            // incorrect specification
             ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
                       << buffer << " in GEMM Sunmmio.";
           }
@@ -212,9 +209,8 @@ private:
               buffer_remap_.Set(buffer, remap_buffer);
               var_remap_.Set(buffer->data, new_var);
             }
-          } else if (buffer.scope() == "shared.rsram") {
-            // correct specification
-          } else {
+          } else if (buffer.scope() != "shared.rsram") {
+            // incorrect specification
             ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
                       << buffer << " in GEMM Sunmmio.";
           }
