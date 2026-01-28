@@ -28,6 +28,7 @@
 #include "arith/ir_visitor_with_analyzer.h"
 #include "common/loop_fusion_utils.h"
 #include "common/loop_parallel_transform_utils.h"
+#include "common/remap_buffer_rewriter.h"
 #include "common/union_find.h"
 #include "layout_reducer.h"
 #include "loop_partition.h"
@@ -50,95 +51,6 @@ static Buffer makeBufferWithScope(const Buffer &buffer, std::string scope) {
                 buffer->buffer_type);
 }
 
-/*!
- * \brief A class that rewrites buffer references in a statement based on a
- * given buffer remapping.
- *
- * This class is used to update buffer references in a statement after buffer
- * transformations have been applied. It specifically handles the remapping of
- * padding annotations.
- */
-class RemapBufferRewriter : public arith::IRMutatorWithAnalyzer {
-public:
-  /*!
-   * \brief Substitute buffer references in a statement based on a given buffer
-   * remapping. \param stmt The statement to rewrite. \param buffer_remap A map
-   * from old buffers to new buffers. \return The rewritten statement.
-   */
-  static Stmt Substitute(const Stmt &stmt, Map<Buffer, Buffer> buffer_remap) {
-    arith::Analyzer analyzer;
-    RemapBufferRewriter substituter(&analyzer);
-    substituter.buffer_remap_ = std::move(buffer_remap);
-    return substituter.VisitStmt(stmt);
-  }
-
-private:
-  using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
-
-  Stmt VisitStmt_(const BlockNode *op) final {
-    if (op->annotations.count(attr::kSafeValueMap)) {
-      return RewritePaddingMap(op);
-    }
-    return IRMutatorWithAnalyzer::VisitStmt_(op);
-  }
-
-  /*!
-   * \brief Rewrite the padding map annotation of a block.
-   * \param op The block node to rewrite.
-   * \return The rewritten block.
-   */
-  Stmt RewritePaddingMap(const BlockNode *op) {
-    auto safe_value_map = op->annotations.Get(attr::kSafeValueMap);
-    if (!safe_value_map) {
-      LOG(FATAL) << "Padding map annotation is missing";
-    }
-
-    Map<Var, Var> var_remap = CreateVarRemap();
-    Map<Var, PrimExpr> new_safe_value_map = RemapPaddingMap(
-        Downcast<Map<Var, PrimExpr>>(safe_value_map.value()), var_remap);
-
-    LOG(INFO) << var_remap;
-    LOG(INFO) << new_safe_value_map;
-    auto block = Downcast<Block>(IRMutatorWithAnalyzer::VisitStmt_(op));
-    auto block_ptr = block.CopyOnWrite();
-    block_ptr->annotations.Set(attr::kSafeValueMap, new_safe_value_map);
-    return block;
-  }
-
-  /*!
-   * \brief Create a mapping from old variables to new variables based on buffer
-   * remapping. \return A map from old variables to new variables.
-   */
-  Map<Var, Var> CreateVarRemap() const {
-    Map<Var, Var> var_remap;
-    for (const auto &[buffer, buffer_remap] : buffer_remap_) {
-      var_remap.Set(buffer->data, buffer_remap->data);
-    }
-    return var_remap;
-  }
-
-  /*!
-   * \brief Remap the padding map using the variable remapping.
-   * \param safe_value_map The original padding map.
-   * \param var_remap The variable remapping.
-   * \return The remapped padding map.
-   */
-  Map<Var, PrimExpr> RemapPaddingMap(const Map<Var, PrimExpr> &safe_value_map,
-                                     const Map<Var, Var> &var_remap) const {
-    Map<Var, PrimExpr> new_safe_value_map;
-    for (const auto &[var, padding] : safe_value_map) {
-      if (var_remap.count(var)) {
-        new_safe_value_map.Set(var_remap.at(var), padding);
-      } else {
-        new_safe_value_map.Set(var, padding);
-      }
-    }
-    return new_safe_value_map;
-  }
-
-  Map<Buffer, Buffer> buffer_remap_;
-};
-
 class InferSramScopePass : public arith::IRMutatorWithAnalyzer {
 public:
   static PrimFunc Substitute(PrimFunc f) {
@@ -148,15 +60,18 @@ public:
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
     ICHECK(target.defined())
         << "InferSramScopePass: Require the target attribute";
+
+    // Sunmmio specified pass
     if (!TargetIsSunmmio(target.value()))
       return f;
-    // Sunmmio specified pass
 
     auto *fptr = f.CopyOnWrite();
 
     // collect remap info when replace_flag = false
     substituter.replace_flag = false;
     fptr->body = substituter.VisitStmt(f->body);
+
+    substituter.InferUnspecifiedBuffer();
 
     fptr->body =
         RemapBufferRewriter::Substitute(fptr->body, substituter.buffer_remap_);
@@ -175,12 +90,16 @@ private:
       Block block = tvm::ffi::GetRef<Block>(op);
       Array<Buffer> alloc_buffers = op->alloc_buffers;
       for (auto buffer : alloc_buffers) {
-        buffer_remap_.Set(buffer, makeBufferWithScope(buffer, "shared.rsram"));
-        const auto *ptr_type =
-            TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-        Type new_type = PointerType(ptr_type->element_type, "shared.rsram");
-        Var new_var = Var(buffer->data->name_hint, new_type);
-        var_remap_.Set(buffer->data, new_var);
+        if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
+          buffers_to_infer.insert(buffer);
+        } else if ((buffer.scope() == "shared.asram") ||
+                   (buffer.scope() == "shared.wsram") ||
+                   (buffer.scope() == "shared.rsram")) {
+          // has validated in GEMM node
+        } else {
+          ICHECK(0) << "Invalid scope " << buffer.scope() << " of " << buffer
+                    << " in Sunmmio.";
+        }
       }
       return StmtExprMutator::VisitStmt_(op);
     }
@@ -220,39 +139,84 @@ private:
           auto cRegion_ = NormalizeToBufferRegion(call->args[2]);
 
           auto buffer = aRegion_->buffer;
-          {
-            auto remap_buffer =
-                makeBufferWithScope(aRegion_->buffer, "shared.asram");
-            const auto *ptr_type =
-                TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-            Type new_type = PointerType(ptr_type->element_type, "shared.asram");
-            Var new_var = Var(buffer->data->name_hint, new_type);
-            buffer_remap_.Set(buffer, remap_buffer);
-            var_remap_.Set(buffer->data, new_var);
+          if ((buffer.scope() == "shared") ||
+              (buffer.scope() == "shared.dyn")) {
+            if (buffer_remap_.count(buffer)) {
+              ICHECK(buffer_remap_[buffer].scope() == "shared.asram")
+                  << "Infer scope shared.asram of " << buffer
+                  << " in GEMM Sunmmio, but scope "
+                  << buffer_remap_[buffer].scope() << " has been inferred for "
+                  << buffer << ".";
+            } else {
+              auto remap_buffer =
+                  makeBufferWithScope(aRegion_->buffer, "shared.asram");
+              const auto *ptr_type =
+                  TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
+              Type new_type =
+                  PointerType(ptr_type->element_type, "shared.asram");
+              Var new_var = Var(buffer->data->name_hint, new_type);
+              buffer_remap_.Set(buffer, remap_buffer);
+              var_remap_.Set(buffer->data, new_var);
+            }
+          } else if (buffer.scope() == "shared.asram") {
+            // correct specification
+          } else {
+            ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
+                      << buffer << " in GEMM Sunmmio.";
           }
 
           buffer = bRegion_->buffer;
-          {
-            auto remap_buffer =
-                makeBufferWithScope(bRegion_->buffer, "shared.wsram");
-            const auto *ptr_type =
-                TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-            Type new_type = PointerType(ptr_type->element_type, "shared.wsram");
-            Var new_var = Var(buffer->data->name_hint, new_type);
-            buffer_remap_.Set(buffer, remap_buffer);
-            var_remap_.Set(buffer->data, new_var);
+          if ((buffer.scope() == "shared") ||
+              (buffer.scope() == "shared.dyn")) {
+            if (buffer_remap_.count(buffer)) {
+              ICHECK(buffer_remap_[buffer].scope() == "shared.wsram")
+                  << "Infer scope shared.wsram of " << buffer
+                  << " in GEMM Sunmmio, but scope "
+                  << buffer_remap_[buffer].scope() << " has been inferred for "
+                  << buffer << ".";
+            } else {
+              auto remap_buffer =
+                  makeBufferWithScope(bRegion_->buffer, "shared.wsram");
+              const auto *ptr_type =
+                  TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
+              Type new_type =
+                  PointerType(ptr_type->element_type, "shared.wsram");
+              Var new_var = Var(buffer->data->name_hint, new_type);
+              buffer_remap_.Set(buffer, remap_buffer);
+              var_remap_.Set(buffer->data, new_var);
+            }
+          } else if (buffer.scope() == "shared.wsram") {
+            // correct specification
+          } else {
+            ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
+                      << buffer << " in GEMM Sunmmio.";
           }
 
           buffer = cRegion_->buffer;
-          {
-            auto remap_buffer =
-                makeBufferWithScope(cRegion_->buffer, "shared.rsram");
-            const auto *ptr_type =
-                TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-            Type new_type = PointerType(ptr_type->element_type, "shared.rsram");
-            Var new_var = Var(buffer->data->name_hint, new_type);
-            buffer_remap_.Set(buffer, remap_buffer);
-            var_remap_.Set(buffer->data, new_var);
+          if ((buffer.scope() == "shared") ||
+              (buffer.scope() == "shared.dyn")) {
+            if (buffer_remap_.count(buffer)) {
+              ICHECK(buffer_remap_[buffer].scope() == "shared.rsram")
+                  << "Infer scope shared.rsram of " << buffer
+                  << " in GEMM Sunmmio, but scope "
+                  << buffer_remap_[buffer].scope() << " has been inferred for "
+                  << buffer << ".";
+            } else {
+              auto remap_buffer =
+                  makeBufferWithScope(cRegion_->buffer, "shared.rsram");
+              const auto *ptr_type =
+                  TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
+              Type new_type =
+                  PointerType(ptr_type->element_type, "shared.rsram");
+              Var new_var = Var(buffer->data->name_hint, new_type);
+              buffer_remap_.Set(buffer, remap_buffer);
+              var_remap_.Set(buffer->data, new_var);
+            }
+          } else if (buffer.scope() == "shared.rsram") {
+            // correct specification
+          } else {
+            ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
+                      << buffer << " in GEMM Sunmmio.";
           }
         }
       }
@@ -329,10 +293,25 @@ private:
     return var;
   }
 
+  void InferUnspecifiedBuffer() {
+    for (const auto buffer : buffers_to_infer) {
+      if (!buffer_remap_.count(buffer)) {
+        auto remap_buffer = makeBufferWithScope(buffer, "shared.rsram");
+        const auto *ptr_type =
+            TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
+        Type new_type = PointerType(ptr_type->element_type, "shared.rsram");
+        Var new_var = Var(buffer->data->name_hint, new_type);
+        buffer_remap_.Set(buffer, remap_buffer);
+        var_remap_.Set(buffer->data, new_var);
+      }
+    }
+  }
+
   Map<Buffer, Buffer> buffer_remap_;
   Map<Var, Var> var_remap_;
-  std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> buffer_map_;
-  Map<Var, Buffer> buffer_data_to_buffer_;
+
+  std::set<Buffer> buffers_to_infer;
+
   bool replace_flag = false;
 };
 

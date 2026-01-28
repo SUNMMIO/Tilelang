@@ -54,6 +54,248 @@ def gemm_matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype
     return tvm.IRModule({'main': main})
 
 
+def gemm_matmul_specify_all_correct_scope(M,
+                                          N,
+                                          K,
+                                          block_M,
+                                          block_N,
+                                          block_K,
+                                          dtype=T.float16,
+                                          accum_dtype=T.float32):
+
+    @T.prim_func
+    def main(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((K, N), dtype),
+            C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype, scope='shared.asram')
+            B_shared = T.alloc_shared((block_K, block_N), dtype, scope='shared.wsram')
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope='shared.rsram')
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return tvm.IRModule({'main': main})
+
+
+def gemm_matmul_specify_A_scope(M,
+                                N,
+                                K,
+                                block_M,
+                                block_N,
+                                block_K,
+                                dtype=T.float16,
+                                accum_dtype=T.float32):
+
+    @T.prim_func
+    def main(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((K, N), dtype),
+            C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype, scope='shared.asram')
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return tvm.IRModule({'main': main})
+
+
+def gemm_matmul_specify_B_scope(M,
+                                N,
+                                K,
+                                block_M,
+                                block_N,
+                                block_K,
+                                dtype=T.float16,
+                                accum_dtype=T.float32):
+
+    @T.prim_func
+    def main(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((K, N), dtype),
+            C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype, scope='shared.wsram')
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return tvm.IRModule({'main': main})
+
+
+def gemm_matmul_specify_C_scope(M,
+                                N,
+                                K,
+                                block_M,
+                                block_N,
+                                block_K,
+                                dtype=T.float16,
+                                accum_dtype=T.float32):
+
+    @T.prim_func
+    def main(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((K, N), dtype),
+            C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope='shared.rsram')
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return tvm.IRModule({'main': main})
+
+
+def example_kernel(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
+
+    @T.prim_func
+    def main(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((K, N), dtype),
+            C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return tvm.IRModule({'main': main})
+
+
+CORRECT_TEST_CASES = [
+    (
+        gemm_matmul(128, 128, 128, 32, 32, 32),
+        {
+            'A': 'global',
+            'B': 'global',
+            'C': 'global',
+
+            # T.gemm(A_shared, B_shared, C_shared)
+            'A_shared': 'shared.asram',
+            'B_shared': 'shared.wsram',
+            'C_shared': 'shared.rsram',
+        }),
+    (
+        gemm_matmul_specify_all_correct_scope(128, 128, 128, 32, 32, 32),
+        {
+            'A': 'global',
+            'B': 'global',
+            'C': 'global',
+
+            # T.gemm(A_shared, B_shared, C_shared)
+            'A_shared': 'shared.asram',
+            'B_shared': 'shared.wsram',
+            'C_shared': 'shared.rsram',
+        }),
+    (
+        gemm_matmul_specify_A_scope(128, 128, 128, 32, 32, 32),
+        {
+            'A': 'global',
+            'B': 'global',
+            'C': 'global',
+
+            # T.gemm(A_shared, B_shared, C_shared)
+            'A_shared': 'shared.asram',
+            'B_shared': 'shared.wsram',
+            'C_shared': 'shared.rsram',
+        }),
+    (
+        gemm_matmul_specify_B_scope(128, 128, 128, 32, 32, 32),
+        {
+            'A': 'global',
+            'B': 'global',
+            'C': 'global',
+
+            # T.gemm(A_shared, B_shared, C_shared)
+            'A_shared': 'shared.asram',
+            'B_shared': 'shared.wsram',
+            'C_shared': 'shared.rsram',
+        }),
+    (
+        gemm_matmul_specify_C_scope(128, 128, 128, 32, 32, 32),
+        {
+            'A': 'global',
+            'B': 'global',
+            'C': 'global',
+
+            # T.gemm(A_shared, B_shared, C_shared)
+            'A_shared': 'shared.asram',
+            'B_shared': 'shared.wsram',
+            'C_shared': 'shared.rsram',
+        }),
+    (
+        example_kernel(128, 128, 128, 32, 32, 32),
+        {
+            'A': 'global',
+            'B': 'global',
+            'C': 'global',
+
+            # T.gemm(A_shared, B_shared, C_shared)
+            'A_shared': 'shared.rsram',
+            'B_shared': 'shared.rsram',
+            'C_shared': 'shared.rsram',
+        }),
+]
+
+
+@pytest.mark.parametrize(
+    "kernel, buffer_scope_dict",
+    CORRECT_TEST_CASES,
+)
+def test_tilelang_correct_infer_sram_scope(kernel, buffer_scope_dict):
+    target_name = "Sunmmio"
+    # target_name = "cuda"
+    target = determine_target(target_name, return_object=True)
+    with tvm.target.Target(target):
+        mod = kernel
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl.transform.InferSramScope()(mod)
+
+        func = list(mod.functions.values())[0]
+        buffers = extract_buffers_from_kernel(func)
+        for buf in buffers:
+            assert buf.scope() == buffer_scope_dict[buf.name]
+
+
 # from examples/flash_attention/example_gqa_fwd_bshd.py
 def flashattn(batch,
               heads,
@@ -77,7 +319,7 @@ def flashattn(batch,
         K: T.Tensor(kv_shape, dtype),
         Q_shared: T.SharedBuffer([block_M, dim], dtype),
         K_shared: T.SharedBuffer([block_N, dim], dtype),
-        acc_s: T.FragmentBuffer([block_M, block_N], accum_dtype),
+        acc_s: T.SharedBuffer([block_M, block_N], accum_dtype),
         k: T.int32,
         bx: T.int32,
         by: T.int32,
@@ -96,26 +338,26 @@ def flashattn(batch,
 
     @T.macro
     def MMA1(
-        V: T.Tensor(kv_shape, dtype),
-        V_shared: T.SharedBuffer([block_N, dim], dtype),
-        acc_s_cast: T.FragmentBuffer([block_M, block_N], dtype),
-        acc_o: T.FragmentBuffer([block_M, dim], accum_dtype),
-        k: T.int32,
-        by: T.int32,
-        bz: T.int32,
+            V: T.Tensor(kv_shape, dtype),
+            V_shared: T.SharedBuffer([block_N, dim], dtype),
+            acc_s_cast: T.SharedBuffer([block_M, block_N], dtype),
+            acc_o: T.SharedBuffer([block_M, dim], accum_dtype),
+            k: T.int32,
+            by: T.int32,
+            bz: T.int32,
     ):
         T.copy(V[bz, k * block_N:(k + 1) * block_N, by // groups, :], V_shared)
         T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
     @T.macro
     def Softmax(
-            acc_s: T.FragmentBuffer([block_M, block_N], accum_dtype),
-            acc_s_cast: T.FragmentBuffer([block_M, block_N], dtype),
-            scores_max: T.FragmentBuffer([block_M], accum_dtype),
-            scores_max_prev: T.FragmentBuffer([block_M], accum_dtype),
-            scores_scale: T.FragmentBuffer([block_M], accum_dtype),
-            scores_sum: T.FragmentBuffer([block_M], accum_dtype),
-            logsum: T.FragmentBuffer([block_M], accum_dtype),
+            acc_s: T.SharedBuffer([block_M, block_N], accum_dtype),
+            acc_s_cast: T.SharedBuffer([block_M, block_N], dtype),
+            scores_max: T.SharedBuffer([block_M], accum_dtype),
+            scores_max_prev: T.SharedBuffer([block_M], accum_dtype),
+            scores_scale: T.SharedBuffer([block_M], accum_dtype),
+            scores_sum: T.SharedBuffer([block_M], accum_dtype),
+            logsum: T.SharedBuffer([block_M], accum_dtype),
     ):
         T.copy(scores_max, scores_max_prev)
         T.fill(scores_max, -T.infinity(accum_dtype))
@@ -141,8 +383,8 @@ def flashattn(batch,
 
     @T.macro
     def Rescale(
-            acc_o: T.FragmentBuffer([block_M, dim], accum_dtype),
-            scores_scale: T.FragmentBuffer([block_M], accum_dtype),
+            acc_o: T.SharedBuffer([block_M, dim], accum_dtype),
+            scores_scale: T.SharedBuffer([block_M], accum_dtype),
     ):
         for i, j in T.Parallel(block_M, dim):
             acc_o[i, j] *= scores_scale[i]
@@ -159,14 +401,14 @@ def flashattn(batch,
             K_shared = T.alloc_shared([block_N, dim], dtype)
             V_shared = T.alloc_shared([block_N, dim], dtype)
             O_shared = T.alloc_shared([block_M, dim], dtype)
-            acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)
-            acc_s_cast = T.alloc_fragment([block_M, block_N], dtype)
-            acc_o = T.alloc_fragment([block_M, dim], accum_dtype)
-            scores_max = T.alloc_fragment([block_M], accum_dtype)
-            scores_max_prev = T.alloc_fragment([block_M], accum_dtype)
-            scores_scale = T.alloc_fragment([block_M], accum_dtype)
-            scores_sum = T.alloc_fragment([block_M], accum_dtype)
-            logsum = T.alloc_fragment([block_M], accum_dtype)
+            acc_s = T.alloc_shared([block_M, block_N], accum_dtype)
+            acc_s_cast = T.alloc_shared([block_M, block_N], dtype)
+            acc_o = T.alloc_shared([block_M, dim], accum_dtype)
+            scores_max = T.alloc_shared([block_M], accum_dtype)
+            scores_max_prev = T.alloc_shared([block_M], accum_dtype)
+            scores_scale = T.alloc_shared([block_M], accum_dtype)
+            scores_sum = T.alloc_shared([block_M], accum_dtype)
+            logsum = T.alloc_shared([block_M], accum_dtype)
 
             T.copy(Q[bz, bx * block_M:(bx + 1) * block_M, by, :], Q_shared)
             T.fill(acc_o, 0)
@@ -191,69 +433,215 @@ def flashattn(batch,
     return tvm.IRModule({'main': main})
 
 
-TEST_CASES = [
-    (
-        gemm_matmul(128, 128, 128, 32, 32, 32),
-        {
-            'A': 'global',
-            'B': 'global',
-            'C': 'global',
+# flashattn fail for the following reason:
+#
+# @macro
+# def reduce_macro(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clear: bool):
+#     if is_shared(buffer) and is_shared(out):
+#         red_frag_in = alloc_fragment(buffer.shape, buffer.dtype)
+#         red_frag_out = alloc_fragment(out.shape, out.dtype)
 
-            # T.gemm(A_shared, B_shared, C_shared)
-            'A_shared': 'shared.asram',
-            'B_shared': 'shared.wsram',
-            'C_shared': 'shared.rsram',
-        }),
-    (
-        flashattn(
-            1,
-            64,
-            4096,
-            128,
-            False,
-            groups=16,
-        ),
-        {
-            'Q': 'global',
-            'K': 'global',
-            'V': 'global',
-            'Output': 'global',
+#         # rename buffers
+#         IRBuilder.name(buffer.name + "_frag", red_frag_in)
+#         IRBuilder.name(out.name + "_frag", red_frag_out)
 
-            # T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-            'Q_shared': 'shared.asram',
-            'K_shared': 'shared.wsram',
+#         copy(buffer, red_frag_in)
+#
+# so T.reduce will create a local.fragment buffer, causing error
 
-            # T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
-            'acc_s_cast': 'shared.asram',
-            'V_shared': 'shared.wsram',
 
-            # by default rsram
-            'O_shared': 'shared.rsram',
-            'acc_s': 'shared.rsram',
-            'scores_max_prev': 'shared.rsram',
-            'scores_scale': 'shared.rsram',
-            'scores_max': 'shared.rsram',
-            'logsum': 'shared.rsram',
-            'acc_o': 'shared.rsram',
-            'scores_sum': 'shared.rsram',
-        })
+def gemm_matmul_incorrect_A_scope(M,
+                                  N,
+                                  K,
+                                  block_M,
+                                  block_N,
+                                  block_K,
+                                  dtype=T.float16,
+                                  accum_dtype=T.float32):
+
+    @T.prim_func
+    def main(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((K, N), dtype),
+            C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype, scope='shared.wsram')
+            B_shared = T.alloc_shared((block_K, block_N), dtype, scope='shared.wsram')
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope='shared.rsram')
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return tvm.IRModule({'main': main})
+
+
+def gemm_matmul_incorrect_B_scope(M,
+                                  N,
+                                  K,
+                                  block_M,
+                                  block_N,
+                                  block_K,
+                                  dtype=T.float16,
+                                  accum_dtype=T.float32):
+
+    @T.prim_func
+    def main(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((K, N), dtype),
+            C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype, scope='shared.asram')
+            B_shared = T.alloc_shared((block_K, block_N), dtype, scope='shared.asram')
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope='shared.rsram')
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return tvm.IRModule({'main': main})
+
+
+def gemm_matmul_A_scope_infer_conflict(M,
+                                       N,
+                                       K,
+                                       block_M,
+                                       block_N,
+                                       block_K,
+                                       dtype=T.float16,
+                                       accum_dtype=T.float32):
+
+    @T.prim_func
+    def main(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((K, N), dtype),
+            C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(B_shared, C_shared, A_shared)
+                T.gemm(A_shared, B_shared, C_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return tvm.IRModule({'main': main})
+
+
+def gemm_matmul_B_scope_infer_conflict(M,
+                                       N,
+                                       K,
+                                       block_M,
+                                       block_N,
+                                       block_K,
+                                       dtype=T.float16,
+                                       accum_dtype=T.float32):
+
+    @T.prim_func
+    def main(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((K, N), dtype),
+            C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_shared)
+                T.gemm(B_shared, C_shared, A_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return tvm.IRModule({'main': main})
+
+
+def gemm_matmul_C_scope_infer_conflict(M,
+                                       N,
+                                       K,
+                                       block_M,
+                                       block_N,
+                                       block_K,
+                                       dtype=T.float16,
+                                       accum_dtype=T.float32):
+
+    @T.prim_func
+    def main(
+            A: T.Tensor((M, K), dtype),
+            B: T.Tensor((K, N), dtype),
+            C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_shared)
+                T.gemm(C_shared, B_shared, A_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return tvm.IRModule({'main': main})
+
+
+INCORRECT_TEST_CASES = [
+    (gemm_matmul_incorrect_A_scope(128, 128, 128, 32, 32, 32),
+     "Specify invalid scope shared.wsram of A_shared in GEMM Sunmmio."),
+    (gemm_matmul_incorrect_B_scope(128, 128, 128, 32, 32, 32),
+     "Specify invalid scope shared.asram of B_shared in GEMM Sunmmio."),
+    (gemm_matmul_A_scope_infer_conflict(128, 128, 128, 32, 32, 32),
+     "Infer scope shared.asram of A_shared in GEMM Sunmmio, but scope shared.rsram has been inferred for A_shared."
+    ),
+    (gemm_matmul_B_scope_infer_conflict(128, 128, 128, 32, 32, 32),
+     "Infer scope shared.asram of B_shared in GEMM Sunmmio, but scope shared.wsram has been inferred for B_shared."
+    ),
+    (gemm_matmul_C_scope_infer_conflict(128, 128, 128, 32, 32, 32),
+     "Infer scope shared.asram of C_shared in GEMM Sunmmio, but scope shared.rsram has been inferred for C_shared."
+    ),
+    (flashattn(
+        1,
+        64,
+        4096,
+        128,
+        False,
+        groups=16,
+    ), "Invalid scope local.fragment of acc_s_frag in Sunmmio.")
 ]
 
 
 @pytest.mark.parametrize(
-    "kernel, buffer_scope_dict",
-    TEST_CASES,
+    "kernel, error_info",
+    INCORRECT_TEST_CASES,
 )
-def test_tilelang_infer_sram_scope(kernel, buffer_scope_dict):
+def test_tilelang_incorrect_infer_sram_scope(kernel, error_info):
     target_name = "Sunmmio"
     # target_name = "cuda"
     target = determine_target(target_name, return_object=True)
-    with tvm.target.Target(target):
+    with pytest.raises(tvm.error.InternalError, match=error_info), tvm.target.Target(target):
         mod = kernel
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl.transform.InferSramScope()(mod)
-
-        func = list(mod.functions.values())[0]
-        buffers = extract_buffers_from_kernel(func)
-        for buf in buffers:
-            assert buf.scope() == buffer_scope_dict[buf.name]
