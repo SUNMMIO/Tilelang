@@ -52,8 +52,8 @@ TIR_DEFINE_TL_BUILTIN(broadcast_)
 
 using namespace tir;
 
-Broadcast::Broadcast(Array<PrimExpr> args) {
-  ObjectPtr<BroadcastNode> node = tvm::ffi::make_object<BroadcastNode>();
+BroadcastOp::BroadcastOp(Array<PrimExpr> args) {
+  ObjectPtr<BroadcastOpNode> node = tvm::ffi::make_object<BroadcastOpNode>();
   node->src_expr = args[0];
   node->dst_expr = args[1];
   Array<Range> rgs[2];
@@ -73,13 +73,13 @@ Broadcast::Broadcast(Array<PrimExpr> args) {
   data_ = std::move(node);
 }
 
-TileOperator BroadcastNode::Clone() const {
-  auto op = tvm::ffi::make_object<BroadcastNode>(*this);
-  return Broadcast(op);
+TileOperator BroadcastOpNode::Clone() const {
+  auto op = tvm::ffi::make_object<BroadcastOpNode>(*this);
+  return BroadcastOp(op);
 }
 
-LayoutMap BroadcastNode::InferLayout(const LayoutInferArgs &T,
-                                     InferLevel level) const {
+LayoutMap BroadcastOpNode::InferLayout(const LayoutInferArgs &T,
+                                       InferLevel level) const {
   Array<PrimExpr> args;
   args.push_back(src_expr);
   args.push_back(dst_expr);
@@ -87,27 +87,6 @@ LayoutMap BroadcastNode::InferLayout(const LayoutInferArgs &T,
   LayoutMap out_layout = copy_op->InferLayout(T, level);
   return out_layout;
 }
-
-// int get_target_mesh_nrows(Target target) {
-//   auto mattr = target->GetAttr<Array<String>>("mattr").value();
-//   int x = 0;
-//   for (size_t i = 0; i < mattr.size(); i++) {
-//     std::string m = mattr[i];
-//     if (m.find("device_mesh_nrow_") != std::string::npos) {
-//       std::string s = m.substr(m.find_last_of('_') + 1);;
-//       try {
-//         x = std::stoi(s);
-//       } catch (const std::invalid_argument& e) {
-//         x = -1;
-//       } catch (const std::out_of_range& e) {
-//         x = -1;
-//       }
-//     }
-//   }
-//   ICHECK(x != 0) << "Device mesh row number not found.";
-//   ICHECK(x > 0) << "Invalid device mesh row number: ";
-//   return x;
-// }
 
 int get_target_mesh(Target target, int axis) {
   auto mattr = target->GetAttr<Array<String>>("mattr").value();
@@ -139,7 +118,8 @@ int get_target_mesh(Target target, int axis) {
   return x;
 }
 
-Stmt BroadcastNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
+Stmt BroadcastOpNode::Lower(const LowerArgs &T,
+                            arith::Analyzer *analyzer) const {
   Target target = T.target;
   ICHECK(TargetIsSunmmio(target)) << "Broadcast only supports SUNMMIO targets.";
   int mesh_x = get_target_mesh(target, 0);
@@ -222,16 +202,14 @@ Stmt BroadcastNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     args.push_back(1); // direction: vertical
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     seq.push_back(broadcast);
-    // herizontal broadcast
+    // horizontal broadcast
     for (int i = 0; i < mesh_x; i++) {
       Array<PrimExpr> args;
       args.push_back(dst.access_ptr(1, DataType::Handle(), 1, 0, dst_elements));
       args.push_back(dst.access_ptr(2, DataType::Handle(), 1, 0, dst_elements));
       args.push_back(Downcast<IntImm>(broadcast_elements));
       args.push_back(int(i * mesh_y) + src_core_y);
-      args.push_back(0); // direction: horeizontal
-      args.push_back(
-          IntImm(DataType::Int(32), src_core_y)); // mask: current core only
+      args.push_back(0); // direction: horizontal
       Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
       seq.push_back(broadcast);
     }
@@ -239,13 +217,13 @@ Stmt BroadcastNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   }
 }
 
-TIR_REGISTER_TL_TILE_OP(Broadcast, comm_broadcast)
+TIR_REGISTER_TL_TILE_OP(BroadcastOp, comm_broadcast)
     .set_num_inputs(6)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-Put::Put(Array<PrimExpr> args) {
-  ObjectPtr<PutNode> node = tvm::ffi::make_object<PutNode>();
+PutOp::PutOp(Array<PrimExpr> args) {
+  ObjectPtr<PutOpNode> node = tvm::ffi::make_object<PutOpNode>();
   node->src_expr = args[0];
   node->dst_expr = args[1];
   Array<Range> rgs[2];
@@ -263,13 +241,13 @@ Put::Put(Array<PrimExpr> args) {
   data_ = std::move(node);
 }
 
-TileOperator PutNode::Clone() const {
-  auto op = tvm::ffi::make_object<PutNode>(*this);
-  return Put(op);
+TileOperator PutOpNode::Clone() const {
+  auto op = tvm::ffi::make_object<PutOpNode>(*this);
+  return PutOp(op);
 }
 
-LayoutMap PutNode::InferLayout(const LayoutInferArgs &T,
-                               InferLevel level) const {
+LayoutMap PutOpNode::InferLayout(const LayoutInferArgs &T,
+                                 InferLevel level) const {
   Array<PrimExpr> args;
   args.push_back(src_expr);
   args.push_back(dst_expr);
@@ -278,7 +256,7 @@ LayoutMap PutNode::InferLayout(const LayoutInferArgs &T,
   return out_layout;
 }
 
-Stmt PutNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
+Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   Target target = T.target;
   ICHECK(TargetIsSunmmio(target)) << "Put only supports SUNMMIO targets.";
   int mesh_x = get_target_mesh(target, 0);
@@ -308,7 +286,7 @@ Stmt PutNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       << "Source buffer size larger than destination buffer size: "
       << src_elements << " vs " << dst_elements;
   ICHECK(size->value <= Downcast<IntImm>(src_elements)->value)
-      << "Broadcast size larger than data size: " << size->value << " vs "
+      << "Put size larger than data size: " << size->value << " vs "
       << Downcast<IntImm>(src_elements)->value;
 
   // check for size
@@ -320,12 +298,12 @@ Stmt PutNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   }
   ICHECK((Downcast<IntImm>(broadcast_elements)->value) <=
          Downcast<IntImm>(src_elements)->value)
-      << "Broadcast size Larger than source buffer size: "
+      << "Put size Larger than source buffer size: "
       << (Downcast<IntImm>(broadcast_elements)->value) << " vs "
       << Downcast<IntImm>(src_elements)->value;
   ICHECK((Downcast<IntImm>(broadcast_elements)->value) <=
          Downcast<IntImm>(dst_elements)->value)
-      << "Broadcast size larger than destination buffer size: "
+      << "Put size larger than destination buffer size: "
       << (Downcast<IntImm>(broadcast_elements)->value) << " vs "
       << Downcast<IntImm>(dst_elements)->value;
 
@@ -406,13 +384,13 @@ Stmt PutNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   }
 }
 
-TIR_REGISTER_TL_TILE_OP(Put, comm_put)
+TIR_REGISTER_TL_TILE_OP(PutOp, comm_put)
     .set_num_inputs(5)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-Allgather::Allgather(Array<PrimExpr> args) {
-  ObjectPtr<AllgatherNode> node = tvm::ffi::make_object<AllgatherNode>();
+AllgatherOp::AllgatherOp(Array<PrimExpr> args) {
+  ObjectPtr<AllgatherOpNode> node = tvm::ffi::make_object<AllgatherOpNode>();
   node->send = args[0];
   node->recv = args[1];
   node->direction = Downcast<IntImm>(args[2])->value;
@@ -420,36 +398,86 @@ Allgather::Allgather(Array<PrimExpr> args) {
   data_ = std::move(node);
 }
 
-TileOperator AllgatherNode::Clone() const {
-  auto op = tvm::ffi::make_object<AllgatherNode>(*this);
-  return Allgather(op);
+TileOperator AllgatherOpNode::Clone() const {
+  auto op = tvm::ffi::make_object<AllgatherOpNode>(*this);
+  return AllgatherOp(op);
 }
 
-Layout AllgatherNode::ComputeLinearLayout(const Buffer &shared_tensor) const {
-  Array<PrimExpr> input_size = shared_tensor->shape;
-  Array<PrimExpr> forward_vars;
-  for (size_t i = 0; i < input_size.size(); i++) {
-    forward_vars.push_back(InputPlaceholder(i));
+// Not yet complete; it will be further refined later
+LayoutMap AllgatherOpNode::ComputeLayout(const LayoutInferArgs &T,
+                                         InferLevel level, Buffer src,
+                                         Buffer dst) const {
+  if (src.scope() == "local.fragment" && dst.scope() == "local.fragment" &&
+      T.layout_map.count(src)) {
+    auto src_layout = T.layout_map[src].as<Fragment>().value();
+
+    PrimExpr src_rep_extent = src_layout->ReplicateExtent();
+
+    Array<PrimExpr> fwd;
+    fwd.push_back(InputPlaceholder(0));
+    for (int i = 0; i < static_cast<int>(src->shape.size()); i++) {
+      fwd.push_back(InputPlaceholder(i + 1));
+    }
+    auto thd = src_layout->ForwardThread(fwd, std::nullopt);
+
+    Fragment dst_layout =
+        Fragment(dst->shape, {}, thd, src_rep_extent, std::nullopt)
+            ->CondenseReplicateVar()
+            ->BindThreadRange(T.thread_bounds);
+
+    if (!T.layout_map.count(dst))
+      return {{dst, dst_layout}};
+    else {
+      // Check if computed layout is compatible with existing: the existing one
+      // must strictly contains the computed layout
+      auto orig_dst_layout =
+          T.layout_map.Get(dst).value().as<Fragment>().value();
+      ICHECK(dst_layout->InputDim() == orig_dst_layout->InputDim());
+      Array<PrimExpr> indices;
+      indices.reserve(dst_layout->InputDim());
+      arith::Analyzer inner_analyzer;
+      for (int i = 0; i < dst_layout->InputDim(); ++i) {
+        auto x = InputPlaceholder(i);
+        indices.push_back(x);
+        // should be literal - literal = 0, any analyzer will work
+        ICHECK(is_zero(inner_analyzer.Simplify(
+            dst_layout->InputShape()[i] - orig_dst_layout->InputShape()[i])));
+        inner_analyzer.Bind(x, Range(0, dst_layout->InputShape()[i]));
+      }
+
+      ICHECK(as_const_int(dst_layout->ReplicateExtent()));
+      ICHECK(as_const_int(src_layout->ReplicateExtent()));
+      auto dst_rep = *as_const_int(dst_layout->ReplicateExtent());
+      auto src_rep = *as_const_int(src_layout->ReplicateExtent());
+      if (dst_rep < src_rep ||
+          !ProveFragmentContains(orig_dst_layout, dst_layout, indices, indices,
+                                 inner_analyzer)) {
+        std::ostringstream oss;
+        oss << "Layout may conflict with ReduceOp for buffer " << dst << " vs. "
+            << src << "\nLHS = " << src_layout->DebugOutput()
+            << "\nRHS = " << orig_dst_layout->DebugOutput()
+            << "\nYou may need to use a shared memory to transform the "
+               "layout";
+        throw LayoutConflictException(oss.str());
+      }
+
+      if (dst_rep > src_rep) {
+        return {{dst, dst_layout}};
+      }
+    }
   }
-  // [i, j] -> [i // 256, j // 256, i % 256, j % 256]
-  Array<PrimExpr> forward_index;
-  for (size_t i = 0; i < input_size.size(); i++) {
-    forward_index.push_back(FloorDiv(forward_vars[i], 256));
-  }
-  for (size_t i = 0; i < input_size.size(); i++) {
-    forward_index.push_back(FloorMod(forward_vars[i], 256));
-  }
-  return Layout(input_size, forward_index);
+  return {};
 }
 
-LayoutMap AllgatherNode::InferLayout(const LayoutInferArgs &T,
-                                     InferLevel level) const {
+LayoutMap AllgatherOpNode::InferLayout(const LayoutInferArgs &T,
+                                       InferLevel level) const {
+  Buffer src_buffer = NormalizeToBufferRegion(send)->buffer;
   Buffer recv_buffer = NormalizeToBufferRegion(recv)->buffer;
-  Layout linear_layout = ComputeLinearLayout(recv_buffer);
-  return Map<Buffer, Layout>({{recv_buffer, linear_layout}});
+  return ComputeLayout(T, level, src_buffer, recv_buffer);
 }
 
-Stmt AllgatherNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
+Stmt AllgatherOpNode::Lower(const LowerArgs &T,
+                            arith::Analyzer *analyzer) const {
   Target target = T.target;
   ICHECK(TargetIsSunmmio(target)) << "Allgather only supports SUNMMIO targets.";
   int mesh_x = get_target_mesh(target, 0);
@@ -503,7 +531,7 @@ Stmt AllgatherNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         args.push_back(IntImm(DataType::Int(32), j) * send_elements); // offset
         args.push_back(IntImm(DataType::Int(32), i * mesh_y + j)); // src_core
         args.push_back(0); // direction: horizontal
-        Broadcast bcast = Broadcast(args);
+        BroadcastOp bcast = BroadcastOp(args);
         Stmt bcast_stmt = bcast->Lower(T, analyzer);
         bcast_stmts.push_back(bcast_stmt);
       }
@@ -518,7 +546,7 @@ Stmt AllgatherNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         args.push_back(IntImm(DataType::Int(32), i) * send_elements); // offset
         args.push_back(IntImm(DataType::Int(32), i * mesh_y + j)); // src_core
         args.push_back(1); // direction: vertical
-        Broadcast bcast = Broadcast(args);
+        BroadcastOp bcast = BroadcastOp(args);
         Stmt bcast_stmt = bcast->Lower(T, analyzer);
         bcast_stmts.push_back(bcast_stmt);
       }
@@ -535,7 +563,7 @@ Stmt AllgatherNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
                        send_elements);                             // offset
         args.push_back(IntImm(DataType::Int(32), i * mesh_y + j)); // src_core
         args.push_back(0); // direction: horizontal
-        Broadcast bcast = Broadcast(args);
+        BroadcastOp bcast = BroadcastOp(args);
         Stmt bcast_stmt = bcast->Lower(T, analyzer);
         bcast_stmts.push_back(bcast_stmt);
       }
@@ -559,8 +587,7 @@ Stmt AllgatherNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
             IntImm(DataType::Int(32), mesh_y) * send_elements));
         args.push_back(IntImm(DataType::Int(32), allgather_size)); // size
         args.push_back(IntImm(DataType::Int(32), i * mesh_y + j)); // src_core
-        args.push_back(1);                            // direction: vertical
-        args.push_back(IntImm(DataType::Int(32), i)); // mask: current row only
+        args.push_back(1); // direction: vertical
         Stmt bcast_stmt =
             Evaluate(Call(DataType::Handle(), broadcast_(), args));
         bcast_stmts.push_back(bcast_stmt);
@@ -570,15 +597,333 @@ Stmt AllgatherNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   return SeqStmt::Flatten(bcast_stmts);
 }
 
-TIR_REGISTER_TL_TILE_OP(Allgather, comm_allgather)
+TIR_REGISTER_TL_TILE_OP(AllgatherOp, comm_allgather)
     .set_num_inputs(4)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+AllreduceOp::AllreduceOp(Array<PrimExpr> args) {
+  ObjectPtr<AllreduceOpNode> node = tvm::ffi::make_object<AllreduceOpNode>();
+  node->src = args[0];
+  node->dst = args[1];
+  node->row_allgather = args[2];
+  node->col_allgather = args[3];
+
+  node->type = Downcast<StringImm>(args[4]);
+  node->direction = Downcast<IntImm>(args[5])->value;
+  node->dim = Downcast<IntImm>(args[6]);
+  node->clear = Downcast<IntImm>(args[7]);
+  if (args.size() > 8) {
+    node->dst_copy = args[8];
+  }
+  data_ = std::move(node);
+}
+
+TileOperator AllreduceOpNode::Clone() const {
+  auto op = tvm::ffi::make_object<AllreduceOpNode>(*this);
+  return AllreduceOp(op);
+}
+
+// Not yet complete; it will be further refined later
+LayoutMap AllreduceOpNode::ComputeLayout(const LayoutInferArgs &T,
+                                         InferLevel level, Buffer src,
+                                         Buffer dst, int dim) const {
+  if (level >= InferLevel::kStrict)
+    return {};
+
+  if (src.scope() == "local.fragment" && dst.scope() == "local.fragment" &&
+      T.layout_map.count(src)) {
+    auto src_layout = T.layout_map[src].as<Fragment>().value();
+
+    PrimExpr indice_rep_extent = src->shape[dim];
+    PrimExpr src_rep_extent = src_layout->ReplicateExtent();
+    PrimExpr dest_buffer_rep_extent = indice_rep_extent * src_rep_extent;
+
+    Array<PrimExpr> fwd;
+    fwd.push_back(InputPlaceholder(0));
+    for (int i = 0; i < static_cast<int>(src->shape.size()); i++) {
+      if (i == dim) {
+        ;
+      } else if (i < dim) {
+        fwd.push_back(InputPlaceholder(i + 1));
+      } else if (i > dim) {
+        fwd.push_back(InputPlaceholder(i - 1 + 1));
+      }
+    }
+    auto thd = src_layout->ForwardThread(
+        fwd, FloorDiv(ReplicationPlaceholder(), indice_rep_extent));
+
+    // Ensure the thread count is divisible by the replicate extent.
+    // Otherwise, we cannot infer a valid fragment<->fragment layout.
+    {
+      arith::Analyzer analyzer;
+      PrimExpr num_threads = T.thread_bounds->extent;
+      // Though the dest_buffer_rep_extent will be compressed at
+      // CondenseReplicateVar, we need to check the divisibility here to avoid
+      // the issue that the thread count is not divisible by the replicate
+      // extent.
+      if (!analyzer.CanProve(FloorMod(num_threads, dest_buffer_rep_extent) ==
+                             0) &&
+          !analyzer.CanProve(FloorMod(dest_buffer_rep_extent, num_threads) ==
+                             0)) {
+        ICHECK(false) << "ReduceOp fragment layout inference failed: "
+                         "num_threads % replicate_extent != 0. "
+                      << "This mapping requires the block's thread count to be "
+                         "divisible by the "
+                      << "replicate extent. "
+                      << "Try one of: (1) choose a thread block size divisible "
+                         "by replicate_extent; "
+                      << "(2) pick a different reduce dimension or adjust the "
+                         "source fragment layout; "
+                      << "Details: num_threads=" << num_threads
+                      << ", replicate_extent=" << indice_rep_extent
+                      << ", src=" << src << ", dst=" << dst;
+      }
+    }
+
+    Fragment dst_layout =
+        Fragment(dst->shape, {}, thd, dest_buffer_rep_extent, std::nullopt)
+            ->CondenseReplicateVar()
+            ->BindThreadRange(T.thread_bounds);
+
+    if (!T.layout_map.count(dst))
+      return {{dst, dst_layout}};
+    else {
+      // Check if computed layout is compatible with existing: the existing one
+      // must strictly contains the computed layout
+      auto orig_dst_layout =
+          T.layout_map.Get(dst).value().as<Fragment>().value();
+      ICHECK(dst_layout->InputDim() == orig_dst_layout->InputDim());
+      Array<PrimExpr> indices;
+      indices.reserve(dst_layout->InputDim());
+      arith::Analyzer inner_analyzer;
+      for (int i = 0; i < dst_layout->InputDim(); ++i) {
+        auto x = InputPlaceholder(i);
+        indices.push_back(x);
+        // should be literal - literal = 0, any analyzer will work
+        ICHECK(is_zero(inner_analyzer.Simplify(
+            dst_layout->InputShape()[i] - orig_dst_layout->InputShape()[i])));
+        inner_analyzer.Bind(x, Range(0, dst_layout->InputShape()[i]));
+      }
+
+      ICHECK(as_const_int(dst_layout->ReplicateExtent()));
+      ICHECK(as_const_int(src_layout->ReplicateExtent()));
+      auto dst_rep = *as_const_int(dst_layout->ReplicateExtent());
+      auto src_rep = *as_const_int(src_layout->ReplicateExtent());
+      if (dst_rep < src_rep ||
+          !ProveFragmentContains(orig_dst_layout, dst_layout, indices, indices,
+                                 inner_analyzer)) {
+        std::ostringstream oss;
+        oss << "Layout may conflict with ReduceOp for buffer " << dst << " vs. "
+            << src << "\nLHS = " << src_layout->DebugOutput()
+            << "\nRHS = " << orig_dst_layout->DebugOutput()
+            << "\nYou may need to use a shared memory to transform the "
+               "layout";
+        throw LayoutConflictException(oss.str());
+      }
+
+      if (dst_rep > src_rep) {
+        return {{dst, dst_layout}};
+      }
+    }
+  }
+  return {};
+}
+
+LayoutMap AllreduceOpNode::InferLayout(const LayoutInferArgs &T,
+                                       InferLevel level) const {
+  LayoutMap lm;
+
+  Array<PrimExpr> dst_layout_args;
+  dst_layout_args.push_back(src);
+  dst_layout_args.push_back(dst);
+  dst_layout_args.push_back(type);
+  dst_layout_args.push_back(dim);
+  dst_layout_args.push_back(clear);
+  ReduceOp dst_layout_op = ReduceOp(dst_layout_args);
+  LayoutMap dst_layout_map = dst_layout_op->InferLayout(T, InferLevel::kFree);
+  for (const auto &kv : dst_layout_map) {
+    lm.Set(kv.first, kv.second);
+  }
+
+  if (dst_copy.defined()) {
+    Array<PrimExpr> dst_copy_layout_args;
+    dst_copy_layout_args.push_back(src);
+    dst_copy_layout_args.push_back(dst_copy);
+    dst_copy_layout_args.push_back(type);
+    dst_copy_layout_args.push_back(dim);
+    dst_copy_layout_args.push_back(clear);
+    ReduceOp dst_copy_layout_op = ReduceOp(dst_copy_layout_args);
+    LayoutMap dst_copy_layout_map =
+        dst_copy_layout_op->InferLayout(T, InferLevel::kFree);
+    for (const auto &kv : dst_copy_layout_map) {
+      lm.Set(kv.first, kv.second);
+    }
+  }
+
+  Buffer row_allgather_buffer = NormalizeToBufferRegion(row_allgather)->buffer;
+  LayoutMap row_allgather_layout =
+      ComputeLayout(T, InferLevel::kFree, NormalizeToBufferRegion(src)->buffer,
+                    row_allgather_buffer, dim->value);
+  for (const auto &kv : row_allgather_layout) {
+    lm.Set(kv.first, kv.second);
+  }
+
+  Buffer col_allgather_buffer = NormalizeToBufferRegion(col_allgather)->buffer;
+  LayoutMap col_allgather_layout =
+      ComputeLayout(T, InferLevel::kFree, NormalizeToBufferRegion(src)->buffer,
+                    col_allgather_buffer, dim->value);
+  for (const auto &kv : col_allgather_layout) {
+    lm.Set(kv.first, kv.second);
+  }
+
+  return lm;
+}
+
+Stmt AllreduceOpNode::Lower(const LowerArgs &T,
+                            arith::Analyzer *analyzer) const {
+  Target target = T.target;
+  ICHECK(TargetIsSunmmio(target)) << "Allreduce only supports SUNMMIO targets.";
+  int mesh_x = get_target_mesh(target, 0);
+  int mesh_y = get_target_mesh(target, 1);
+
+  Array<Stmt> stmts;
+
+  if (clear.as<Bool>().value() == true) {
+    // Local reduce to dst
+    Array<PrimExpr> local_reduce_args;
+    local_reduce_args.push_back(src);
+    local_reduce_args.push_back(dst);
+    local_reduce_args.push_back(type);
+    local_reduce_args.push_back(dim);
+    local_reduce_args.push_back(IntImm(DataType::Int(32), 1)); // clear = true
+    ReduceOp local_reduce_op = ReduceOp(local_reduce_args);
+    Stmt local_reduce_stmt = local_reduce_op->Lower(T, analyzer);
+    stmts.push_back(local_reduce_stmt);
+
+    if (direction == 0 or direction == 2) { // row-wise
+      // Allgather dst in rows to row_allgather
+      Array<PrimExpr> row_allgather_args;
+      row_allgather_args.push_back(dst);
+      row_allgather_args.push_back(row_allgather);
+      row_allgather_args.push_back(
+          IntImm(DataType::Int(32), 0)); // direction = horizontal
+      row_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
+      AllgatherOp row_allgather_op = AllgatherOp(row_allgather_args);
+      Stmt row_allgather_stmt = row_allgather_op->Lower(T, analyzer);
+      stmts.push_back(row_allgather_stmt);
+
+      // Local reduce from row_allgather to dst
+      Array<PrimExpr> row_reduce_args;
+      row_reduce_args.push_back(row_allgather);
+      row_reduce_args.push_back(dst);
+      row_reduce_args.push_back(type);
+      row_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // dim
+      row_reduce_args.push_back(IntImm(DataType::Int(32), 1)); // clear = true
+      ReduceOp row_reduce_op = ReduceOp(row_reduce_args);
+      Stmt row_reduce_stmt = row_reduce_op->Lower(T, analyzer);
+      stmts.push_back(row_reduce_stmt);
+    }
+
+    if (direction == 1 or direction == 2) { // column-wise
+      // Allgather dst in columns to col_allgather
+      Array<PrimExpr> col_allgather_args;
+      col_allgather_args.push_back(dst);
+      col_allgather_args.push_back(col_allgather);
+      col_allgather_args.push_back(
+          IntImm(DataType::Int(32), 1)); // direction = vertical
+      col_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
+      AllgatherOp col_allgather_op = AllgatherOp(col_allgather_args);
+      Stmt col_allgather_stmt = col_allgather_op->Lower(T, analyzer);
+      stmts.push_back(col_allgather_stmt);
+
+      // Local reduce from col_allgather to dst
+      Array<PrimExpr> col_reduce_args;
+      col_reduce_args.push_back(col_allgather);
+      col_reduce_args.push_back(dst);
+      col_reduce_args.push_back(type);
+      col_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // dim
+      col_reduce_args.push_back(IntImm(DataType::Int(32), 1)); // clear = true
+      ReduceOp col_reduce_op = ReduceOp(col_reduce_args);
+      Stmt col_reduce_stmt = col_reduce_op->Lower(T, analyzer);
+      stmts.push_back(col_reduce_stmt);
+    }
+  } else {
+    // Local reduce to dst_copy
+    Array<PrimExpr> local_reduce_args;
+    local_reduce_args.push_back(src);
+    local_reduce_args.push_back(dst_copy);
+    local_reduce_args.push_back(type);
+    local_reduce_args.push_back(dim);
+    local_reduce_args.push_back(IntImm(DataType::Int(32), 1)); // clear = true
+    ReduceOp local_reduce_op = ReduceOp(local_reduce_args);
+    Stmt local_reduce_stmt = local_reduce_op->Lower(T, analyzer);
+    stmts.push_back(local_reduce_stmt);
+
+    if (direction == 0 or direction == 2) { // row-wise
+      // Allgather dst in rows to row_allgather
+      Array<PrimExpr> row_allgather_args;
+      row_allgather_args.push_back(dst_copy);
+      row_allgather_args.push_back(row_allgather);
+      row_allgather_args.push_back(
+          IntImm(DataType::Int(32), 0)); // direction = horizontal
+      row_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
+      AllgatherOp row_allgather_op = AllgatherOp(row_allgather_args);
+      Stmt row_allgather_stmt = row_allgather_op->Lower(T, analyzer);
+      stmts.push_back(row_allgather_stmt);
+
+      // Local reduce from row_allgather to dst
+      Array<PrimExpr> row_reduce_args;
+      row_reduce_args.push_back(row_allgather);
+      row_reduce_args.push_back(direction == 0 ? dst : dst_copy);
+      row_reduce_args.push_back(type);
+      row_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // dim
+      row_reduce_args.push_back(IntImm(
+          DataType::Int(32),
+          direction == 0 ? 0 : 1)); // clear = direction == 0 ? false : true
+      ReduceOp row_reduce_op = ReduceOp(row_reduce_args);
+      Stmt row_reduce_stmt = row_reduce_op->Lower(T, analyzer);
+      stmts.push_back(row_reduce_stmt);
+    }
+
+    if (direction == 1 or direction == 2) { // column-wise
+      // Allgather dst in columns to col_allgather
+      Array<PrimExpr> col_allgather_args;
+      col_allgather_args.push_back(dst_copy);
+      col_allgather_args.push_back(col_allgather);
+      col_allgather_args.push_back(
+          IntImm(DataType::Int(32), 1)); // direction = vertical
+      col_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
+      AllgatherOp col_allgather_op = AllgatherOp(col_allgather_args);
+      Stmt col_allgather_stmt = col_allgather_op->Lower(T, analyzer);
+      stmts.push_back(col_allgather_stmt);
+
+      // Local reduce from col_allgather to dst
+      Array<PrimExpr> col_reduce_args;
+      col_reduce_args.push_back(col_allgather);
+      col_reduce_args.push_back(dst);
+      col_reduce_args.push_back(type);
+      col_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // dim
+      col_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // clear = false
+      ReduceOp col_reduce_op = ReduceOp(col_reduce_args);
+      Stmt col_reduce_stmt = col_reduce_op->Lower(T, analyzer);
+      stmts.push_back(col_reduce_stmt);
+    }
+  }
+
+  return SeqStmt::Flatten(stmts);
+}
+
+TIR_REGISTER_TL_TILE_OP(AllreduceOp, comm_allreduce)
+    .set_num_inputs(-1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TVM_FFI_STATIC_INIT_BLOCK() {
-  PutNode::RegisterReflection();
-  BroadcastNode::RegisterReflection();
-  AllgatherNode::RegisterReflection();
+  PutOpNode::RegisterReflection();
+  BroadcastOpNode::RegisterReflection();
+  AllgatherOpNode::RegisterReflection();
+  AllreduceOpNode::RegisterReflection();
 }
 
 } // namespace tl

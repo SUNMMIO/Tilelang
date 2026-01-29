@@ -11,32 +11,28 @@ from collections.abc import Iterable
 
 from tvm import tir
 import tilelang.language as T
-from tilelang.utils.language import to_buffer_region
+from tilelang.utils.language import (
+    to_buffer_region,)
+
+from tilelang.carver.arch.driver import get_sunmmio_device_mesh_config
 
 DIRECTION_MAP = {"horizontal": 0, "h": 0, "vertical": 1, "v": 1, "all": 2, "a": 2}
+REDUCE_TYPE_LIST = (
+    "sum",
+    "abssum",
+    "max",
+    "min",
+    "absmax",
+    "bitand",
+    "bitor",
+    "bitxor",
+)
 
 
-def get_target_mesh_shape(target: str = "auto") -> dict[str, int]:
-    """Get the shape of the target mesh as a dictionary with 'x' and 'y' keys.
-    Args:
-        target: The target mesh type. Supported values are
-            'sunmmio-a4e', 'sunmmio-a4e-lite', and 'auto'. If 'auto' is specified,
-            the function defaults to 'sunmmio-a4e'.
-    Returns:
-        A dictionary with integer keys 'x' and 'y' representing
-        the 2D mesh size in each dimension.
-    Raises:
-        ValueError: If an unknown target is specified.
-    """
-    if target == "auto":
-        target = "sunmmio-a4e"
-
-    if target == "sunmmio-a4e":
-        return {"x": 4, "y": 4}
-    elif target == "sunmmio-a4e-lite":
-        return {"x": 2, "y": 4}
-    else:
-        raise ValueError(f"Unknown target: {target}")
+def get_target_mesh_shape() -> dict[str, int]:
+    """Get the target mesh shape as a dictionary with 'x' and 'y' keys."""
+    nrow, ncol = get_sunmmio_device_mesh_config()
+    return {"x": nrow, "y": ncol}
 
 
 def core_tuple_to_id(core_id: tuple[int, int]) -> int:
@@ -55,9 +51,9 @@ def core_tuple_to_id(core_id: tuple[int, int]) -> int:
     Notes
     -----
     The conversion uses the current target mesh shape obtained via
-    get_target_mesh_shape("auto").
+    get_target_mesh_shape().
     """
-    mesh_shape = get_target_mesh_shape("auto")
+    mesh_shape = get_target_mesh_shape()
     row, col = core_id
     assert (0 <= row < mesh_shape["x"]), f"Row {row} out of bounds for mesh shape {mesh_shape}."
     assert (0 <= col < mesh_shape["y"]), f"Col {col} out of bounds for mesh shape {mesh_shape}."
@@ -81,9 +77,9 @@ def core_id_to_tuple(core_id: tir.Call) -> tuple[int, int]:
     Notes
     -----
     The conversion uses the current target mesh shape obtained via
-    get_target_mesh_shape("auto").
+    get_target_mesh_shape().
     """
-    mesh_shape = get_target_mesh_shape("auto")
+    mesh_shape = get_target_mesh_shape()
     core_id_value = core_id
     row = core_id_value // mesh_shape["y"]
     col = core_id_value % mesh_shape["y"]
@@ -109,13 +105,9 @@ def CoreId(core_id: int | tuple[int, int]):
     AssertionError, ValueError
         If the provided coordinates are out of bounds or the type is invalid.
     """
-    mesh_shape = get_target_mesh_shape("auto")
+    mesh_shape = get_target_mesh_shape()
     if isinstance(core_id, tuple):
-        row, col = core_id
-        assert (0 <= row < mesh_shape["x"]), f"Row {row} out of bounds for mesh shape {mesh_shape}"
-        assert (0 <= col < mesh_shape["y"]), f"Col {col} out of bounds for mesh shape {mesh_shape}"
-        # Convert 2D coordinates into a linear core id.
-        core_id_value = row * mesh_shape["x"] + col
+        core_id_value = core_tuple_to_id(core_id)
     elif isinstance(core_id, int):
         core_id_value = core_id
         assert (0 <= core_id_value < mesh_shape["x"] * mesh_shape["y"]
@@ -181,7 +173,7 @@ def broadcast(
             src.shape[i] == dst.shape[i] or src.shape[i] == 1 or dst.shape[i] == 1
         ), f"Source buffer shape  and destination buffer shape must match for broadcast. Got {src.shape} vs {dst.shape}."
 
-    mesh_shape = get_target_mesh_shape("auto")
+    mesh_shape = get_target_mesh_shape()
     assert (isinstance(src_core, tuple) and
             len(src_core) == 2), "src_core must be a tuple of (row, col)."
     assert (0 <= src_core[0] < mesh_shape["x"]
@@ -193,7 +185,7 @@ def broadcast(
     for dim in src.shape:
         src_elements *= dim
     assert isinstance(size, int) and size >= -1, "size must be an integer >= -1."
-    assert size <= src_elements, f"size {size} exceeds source buffer size {src_elements}."
+    assert (size <= src_elements), f"size {size} exceeds source buffer size {src_elements}."
 
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
 
@@ -244,16 +236,16 @@ def put(
     """
     assert (
         src.dtype == dst.dtype
-    ), f"Source and destination buffer dtypes must match for broadcast. Got {src.dtype} vs {dst.dtype}."
+    ), f"Source and destination buffer dtypes must match for put. Got {src.dtype} vs {dst.dtype}."
     if len(src.shape) != len(dst.shape):
         raise ValueError(
-            "Source and destination buffer must have the same number of dimensions for broadcast.")
+            "Source and destination buffer must have the same number of dimensions for put.")
     for i in range(len(src.shape)):
         assert (
             src.shape[i] == dst.shape[i] or src.shape[i] == 1 or dst.shape[i] == 1
-        ), f"Source buffer shape  and destination buffer shape must match for broadcast. Got {src.shape} vs {dst.shape}."
+        ), f"Source buffer shape and destination buffer shape must be compatible for put. Got {src.shape} vs {dst.shape}."
 
-    mesh_shape = get_target_mesh_shape("auto")
+    mesh_shape = get_target_mesh_shape()
     assert (isinstance(src_core, tuple) and
             len(src_core) == 2), "src_core must be a tuple of (row, col)."
     assert (0 <= src_core[0] < mesh_shape["x"]
@@ -311,8 +303,8 @@ def all_gather(
 
     assert (
         send_buffer.dtype == recv_buffer.dtype
-    ), f"Source and destination buffer dtypes must match for broadcast. Got {send_buffer.dtype} vs {recv_buffer.dtype}."
-    mesh_shape = get_target_mesh_shape("auto")
+    ), f"Source and destination buffer dtypes must match for all_gather. Got {send_buffer.dtype} vs {recv_buffer.dtype}."
+    mesh_shape = get_target_mesh_shape()
 
     recv_num = 1
     if direction.lower() in ["horizontal", "h"]:
@@ -336,14 +328,109 @@ def all_gather(
     send_buffer_region = to_buffer_region(send_buffer)
     recv_buffer_region = to_buffer_region(recv_buffer)
 
-    direction_map = {"horizontal": 0, "h": 0, "vertical": 1, "v": 1, "all": 2, "a": 2}
     args = (
         send_buffer_region,
         recv_buffer_region,
-        direction_map[direction.lower()],
+        DIRECTION_MAP[direction.lower()],
         size,
     )
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_allgather"), *args)
+
+
+def all_reduce(
+    buffer: T.Buffer,
+    out: T.Buffer,
+    reduce_type: str,
+    direction: Literal["horizontal", "h", "vertical", "v", "all", "a"],
+    dim: int = -1,
+    clear: bool = True,
+):
+    """Perform an all-reduce operation on a buffer and store the result in an output buffer
+    by emitting the TIR intrinsic tl.tileop.comm_allreduce.
+    Parameters
+    ----------
+    buffer : T.Buffer
+        Input buffer containing data to reduce.
+    out : T.Buffer
+        Output buffer to store the reduced result.
+    reduce_type : str
+        Type of reduction operation (e.g., "sum", "max", etc.).
+    direction : Literal["horizontal", "h", "vertical", "v", "all", "a"]
+        Direction of all-reduce: "horizontal" (or "h") for row-wise, "vertical" (or "v") for column-wise,
+        and "all" (or "a") for all cores.
+    dim : int
+        Dimension along which to perform the reduction. Default is -1 (last dimension).
+    clear : bool
+        Whether to clear the output buffer before reduction. Default is True.
+    Returns
+    -------
+    tir.Call
+        The TIR intrinsic call handle for `tl.tileop.comm_allreduce`.
+    Examples
+    --------
+    >>> all_reduce(A_local, E_local, "sum", "all", dim=-1, clear=False)
+    """
+    assert (isinstance(dim, int) and dim >= -1 and dim < len(
+        buffer.shape)), f"dim {dim} out of bounds for buffer with {len(buffer.shape)} dimensions."
+    if dim == -1:
+        dim = len(buffer.shape) - 1
+
+    expected_shapes = [
+        buffer.shape[:dim] + buffer.shape[dim + 1:],
+        buffer.shape[:dim] + [1] + buffer.shape[dim + 1:],
+    ]
+    if list(out.shape) not in expected_shapes:
+        expected_shapes_str = " or ".join(map(str, expected_shapes))
+        raise ValueError(
+            f"Invalid reduce output shape, buffer shape is {buffer.shape}, dim is {dim}, "
+            f"output shape is {out.shape}, expected shapes are {expected_shapes_str}")
+
+    reduce_type = reduce_type.lower()
+    assert (reduce_type in REDUCE_TYPE_LIST
+           ), f"Reduction op must be one of {REDUCE_TYPE_LIST}, but got {reduce_type}."
+
+    assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
+    assert clear in [True, False], "clear must be a boolean value."
+
+    mesh_shape = get_target_mesh_shape()
+
+    # Create temporary buffers for row and column allgather results
+    row_allgather = T.alloc_fragment(list([mesh_shape["x"]] + out.shape), out.dtype)
+    col_allgather = T.alloc_fragment(list([mesh_shape["y"]] + out.shape), out.dtype)
+
+    buffer_region = to_buffer_region(buffer)
+    out_region = to_buffer_region(out)
+    row_allgather_region = to_buffer_region(row_allgather)
+    col_allgather_region = to_buffer_region(col_allgather)
+
+    args = (
+        buffer_region,
+        out_region,
+        row_allgather_region,
+        col_allgather_region,
+        reduce_type,
+        DIRECTION_MAP[direction.lower()],
+        dim,
+        clear,
+    )
+
+    # If not clearing, allocate an output copy buffer to hold intermediate results
+    if not clear:
+        out_copy = T.alloc_fragment(list(out.shape), out.dtype)
+        out_copy_region = to_buffer_region(out_copy)
+        args = (
+            buffer_region,
+            out_region,
+            row_allgather_region,
+            col_allgather_region,
+            reduce_type,
+            DIRECTION_MAP[direction.lower()],
+            dim,
+            clear,
+            out_copy_region,
+        )
+
+    return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_allreduce"), *args)
 
 
 def barrier(group: Iterable[tuple[int, int]] | None = None):
@@ -352,8 +439,6 @@ def barrier(group: Iterable[tuple[int, int]] | None = None):
     Parameters
     ----------
     group : iterable of tuple[int, int] | None
-        Optional set of core coordinates to synchronize. If omitted, the
-        runtime's default participant set is used.
         Optional set of core coordinates to synchronize. If omitted, the
         runtime's default participant set is used.
 
