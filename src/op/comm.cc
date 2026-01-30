@@ -787,6 +787,10 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
   int mesh_x = get_target_mesh(target, 0);
   int mesh_y = get_target_mesh(target, 1);
 
+  ICHECK(direction == 0 || direction == 1 || direction == 2)
+      << "Invalid allreduce direction " << direction
+      << ", must be 0 (row-wise) or 1 (column-wise) or 2 (all).";
+
   Array<Stmt> stmts;
 
   if (clear.as<Bool>().value() == true) {

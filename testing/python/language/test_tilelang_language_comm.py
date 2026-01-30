@@ -10,7 +10,7 @@ from tilelang.utils.target import determine_target
 @pytest.mark.parametrize("M, N, block_M, block_N, dtype, accum_dtype", [
     (1024, 1024, 128, 128, "float16", "float"),
 ])
-def test_comm_python_api(M, N, block_M, block_N, dtype="float16", accum_dtype="float"):
+def test_comm_python_api(M, N, block_M, block_N, dtype, accum_dtype):
     func_str = """# from tvm.script import tir as T
 
 @T.prim_func
@@ -51,7 +51,7 @@ def main(A_handle: T.handle):
 @pytest.mark.parametrize("M, N, block_M, block_N, dtype, accum_dtype", [
     (1024, 1024, 128, 128, "float16", "float"),
 ])
-def test_comm_broadcast_lower(M, N, block_M, block_N, dtype="float16", accum_dtype="float"):
+def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
     func_str = """# from tvm.script import ir as I
 # from tvm.script import tir as T
 
@@ -102,7 +102,7 @@ class Module:
 @pytest.mark.parametrize("M, N, block_M, block_N, dtype, accum_dtype", [
     (1024, 1024, 128, 128, "float16", "float"),
 ])
-def test_comm_put_lower(M, N, block_M, block_N, dtype="float16", accum_dtype="float"):
+def test_comm_put_lower(M, N, block_M, block_N, dtype, accum_dtype):
     func_str = """# from tvm.script import ir as I
 # from tvm.script import tir as T
 
@@ -150,7 +150,7 @@ class Module:
 @pytest.mark.parametrize("M, N, block_M, block_N, dtype, accum_dtype", [
     (1024, 1024, 128, 128, "float16", "float"),
 ])
-def test_comm_all_gather_lower(M, N, block_M, block_N, dtype="float16", accum_dtype="float"):
+def test_comm_all_gather_lower(M, N, block_M, block_N, dtype, accum_dtype):
     func_str = """# from tvm.script import ir as I
 # from tvm.script import tir as T
 
@@ -228,7 +228,7 @@ class Module:
 @pytest.mark.parametrize("M, N, block_M, block_N, dtype, accum_dtype", [
     (1024 * 128, 1024 * 128, 1024, 1024, "float16", "float"),
 ])
-def test_comm_all_reduce_lower(M, N, block_M, block_N, dtype="float16", accum_dtype="float"):
+def test_comm_all_reduce_lower(M, N, block_M, block_N, dtype, accum_dtype):
     func_str = """# from tvm.script import ir as I
 # from tvm.script import tir as T
 
