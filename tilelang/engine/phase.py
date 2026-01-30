@@ -159,6 +159,8 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.InjectAssumes()(mod)
     # Simplify the IR expressions
     mod = tilelang.transform.Simplify()(mod)
+    # Infer shared memory SRAM scope
+    mod = tilelang.transform.InferSramScope()(mod)
     # Set layouts for reducers
     mod = tilelang.transform.LayoutReducer()(mod)
     # Infer memory layouts for fragments and shared memory
