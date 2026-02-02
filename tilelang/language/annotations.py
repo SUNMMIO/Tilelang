@@ -69,10 +69,8 @@ def annotate_tileview(tileview_map: dict):
             tile_shape, index_map = tileview
             _tileview_map[buffer.data] = make_tileview(buffer, tile_shape, index_map)
         else:
-            raise ValueError(
-                f"Invalid tileview: {tileview}. "
-                "Expected TileView or tuple of (tile_shape, index_map)"
-            )
+            raise ValueError(f"Invalid tileview: {tileview}. "
+                             "Expected TileView or tuple of (tile_shape, index_map)")
 
     return block_attr({"tileview_map": _tileview_map})
 

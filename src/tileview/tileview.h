@@ -36,7 +36,7 @@ class TileView;
  * constraints: width must be 32, height can be 8/16/32.
  */
 class TileViewNode : public Object {
- public:
+public:
   TileViewNode() = default;
 
   /*!
@@ -71,14 +71,14 @@ class TileViewNode : public Object {
   PrimExpr VectorLanes() const;
 
   /*! \brief Check equality with another TileViewNode. */
-  bool IsEqual(const TileViewNode* other) const;
+  bool IsEqual(const TileViewNode *other) const;
 
   static void RegisterReflection();
   TVM_FFI_DECLARE_OBJECT_INFO("tl.TileView", TileViewNode, Object);
   static constexpr TVMFFISEqHashKind _type_s_eq_hash_kind =
       kTVMFFISEqHashKindTreeNode;
 
- protected:
+protected:
   /*! \brief The shape of each tile. */
   Array<PrimExpr> tile_shape_;
 
@@ -97,7 +97,7 @@ class TileViewNode : public Object {
  * \brief TileView reference class.
  */
 class TileView : public ObjectRef {
- public:
+public:
   /*!
    * \brief Construct a TileView with tile shape and index map.
    * \param buffer_shape The shape of buffer being tiled
@@ -123,10 +123,10 @@ TileView makeTileView(Array<PrimExpr> buffer_shape, Array<PrimExpr> tile_shape,
 
 namespace attr {
 /*! \brief Block attribute containing the TileView map for buffers. */
-constexpr const char* kTileViewMap = "tileview_map";
-}  // namespace attr
+constexpr const char *kTileViewMap = "tileview_map";
+} // namespace attr
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm
 
-#endif  // TVM_TL_TILEVIEW_TILEVIEW_H_
+#endif // TVM_TL_TILEVIEW_TILEVIEW_H_

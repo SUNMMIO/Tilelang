@@ -14,7 +14,8 @@ namespace tl {
 
 using namespace tir;
 
-TileViewNode::TileViewNode(Array<PrimExpr> buffer_shape, Array<PrimExpr> tile_shape,
+TileViewNode::TileViewNode(Array<PrimExpr> buffer_shape,
+                           Array<PrimExpr> tile_shape,
                            Array<PrimExpr> index_map) {
   ICHECK_EQ(tile_shape.size(), index_map.size())
       << "tile_shape and index_map must have the same size";
@@ -29,7 +30,7 @@ TileViewNode::TileViewNode(Array<PrimExpr> buffer_shape, Array<PrimExpr> tile_sh
   // Build a map from original dim index to tile_dim_index
   std::vector<int> dim_to_tile_idx(ndim, -1);
   for (size_t i = 0; i < tile_shape_.size(); ++i) {
-    const auto* idx_int = index_map_[i].as<IntImmNode>();
+    const auto *idx_int = index_map_[i].as<IntImmNode>();
     ICHECK(idx_int) << "index_map must contain integer constants";
     int idx = static_cast<int>(idx_int->value);
     if (idx < 0) {
@@ -70,7 +71,7 @@ TileViewNode::TileViewNode(Array<PrimExpr> buffer_shape, Array<PrimExpr> tile_sh
   }
 
   // Append tile shape dimensions at the end
-  for (const auto& ts : tile_shape_) {
+  for (const auto &ts : tile_shape_) {
     tiled_shape.push_back(ts);
   }
 
@@ -79,14 +80,15 @@ TileViewNode::TileViewNode(Array<PrimExpr> buffer_shape, Array<PrimExpr> tile_sh
 
 PrimExpr TileViewNode::VectorLanes() const {
   PrimExpr lanes = Integer(1);
-  for (const auto& dim : tile_shape_) {
+  for (const auto &dim : tile_shape_) {
     lanes = lanes * dim;
   }
   return lanes;
 }
 
-bool TileViewNode::IsEqual(const TileViewNode* other) const {
-  if (other == nullptr) return false;
+bool TileViewNode::IsEqual(const TileViewNode *other) const {
+  if (other == nullptr)
+    return false;
   bool ret = StructuralEqual()(tile_shape_, other->tile_shape_);
   ret &= StructuralEqual()(index_map_, other->index_map_);
   ret &= StructuralEqual()(buffer_shape_, other->buffer_shape_);
@@ -119,15 +121,14 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
       .def_packed("tl.TileView",
-                  [](PackedArgs args, Any* rv) {
+                  [](PackedArgs args, Any *rv) {
                     *rv = TileView(args[0].cast<Array<PrimExpr>>(),
                                    args[1].cast<Array<PrimExpr>>(),
                                    args[2].cast<Array<PrimExpr>>());
                   })
       .def("tl.TileView_tile_shape",
            [](TileView tv) { return tv->TileShape(); })
-      .def("tl.TileView_index_map",
-           [](TileView tv) { return tv->IndexMap(); })
+      .def("tl.TileView_index_map", [](TileView tv) { return tv->IndexMap(); })
       .def("tl.TileView_buffer_shape",
            [](TileView tv) { return tv->BufferShape(); })
       .def("tl.TileView_tiled_buffer_shape",
@@ -145,9 +146,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            });
 }
 
-TVM_FFI_STATIC_INIT_BLOCK() {
-  TileViewNode::RegisterReflection();
-}
+TVM_FFI_STATIC_INIT_BLOCK() { TileViewNode::RegisterReflection(); }
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm
