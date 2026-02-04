@@ -23,6 +23,7 @@
 
 #include "arith/ir_mutator_with_analyzer.h"
 #include "arith/ir_visitor_with_analyzer.h"
+#include "common/global_layout_utils.h"
 #include "common/loop_fusion_utils.h"
 #include "common/loop_parallel_transform_utils.h"
 #include "common/union_find.h"
@@ -416,6 +417,10 @@ public:
     ICHECK(target.defined())
         << "Layout_Inference: Require the target attribute";
     target_ = target.value();
+
+    // Populate global buffer layouts from tensor_meta (Sunmmio only)
+    PopulateGlobalBufferLayouts(f, target_, &annotated_layout_map_);
+
     this->operator()(f->body);
   }
 
