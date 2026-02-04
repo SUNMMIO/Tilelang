@@ -211,7 +211,7 @@ TVM_DLL const Op &tma_load();
  *   A[32:64, 128:192, 0:256]
  * then:
  *   src_rank = 3
- *   src_shape = [128, 256, 512]
+ *   src_region_shape = [32, 64, 256]
  *   coord = [32, 128, 0]
  *
  * \param data_type
@@ -220,17 +220,17 @@ TVM_DLL const Op &tma_load();
  * \param src_rank
  *   Rank (number of dimensions) of the source tensor.
  *
- * \param src_shape
- *   Logical shape of the source tensor.
- *   For example, Tensor(128, 256, 512) -> [128, 256, 512].
+ * \param src_region_shape
+ *   Logical shape of the source buffer region.
+ *   For example, A[32:64, 128:192, 0:256] -> [32, 64, 256].
  *
  * \param src_input_size
- *   Input shape of the source layout, retrievable via Layout::getInputShape().
+ *   Input shape of the source layout, retrievable via LayoutNode::InputShape().
  *   For a row-major 3D tensor, this is identical to src_shape.
  *
  * \param src_forward
  *   Forward index mapping of the source layout, retrievable via
- *   Layout::GetForwardIndex().
+ *   LayoutNode::GetForwardIndex().
  *   For a row-major layout of Tensor(128, 256, 512),
  *   this is [256 * 512, 512, 1].
  *
@@ -241,8 +241,8 @@ TVM_DLL const Op &tma_load();
  * \param dst_rank
  *   Rank (number of dimensions) of the destination tensor.
  *
- * \param dst_shape
- *   Logical shape of the destination tensor.
+ * \param dst_region_shape
+ *   Logical shape of the destination buffer region.
  *
  * \param dst_input_size
  *   Input shape of the destination layout, retrievable via
@@ -259,12 +259,16 @@ TVM_DLL const Op &tma_load();
  * \param src_addr
  *   Base address of the source tensor in memory .
  *
- * \param coord
+ * \param src_coord
  *   Coordinate offset specifying the starting point of the copy in the source
  * tensor. Its length must equal src_rank.
  *
  * \param dst_addr
  *   Base address of the destination tensor in memory .
+ *
+ * \param dst_coord
+ *   Coordinate offset specifying the starting point of the copy in the
+ * destination tensor. Its length must equal dst_rank.
  *
  * \note
  *   Out-of-bound fill policies are currently not supported.
