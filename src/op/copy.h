@@ -28,8 +28,7 @@ enum class CopyInst : uint8_t {
   kTMemStore = 8,   // tcgen05.st (register -> tensor memory)
 
   // dma
-  kDMALoad = 9,
-  kDMAStore = 10,
+  kDMACopy = 9,
 };
 
 /// Descriptor for Tensor Memory Access (TMA) copy operations
@@ -132,16 +131,10 @@ public:
                         InferLevel level) const override;
 
   /*!
-   * \brief Check if dma load is supported.
+   * \brief Check if dma copy is supported.
    */
-  bool CheckDMALoad(Target target, arith::Analyzer *analyzer,
+  bool CheckDMACopy(Target target, arith::Analyzer *analyzer,
                     bool check_last_dim = true) const;
-
-  /*!
-   * \brief Check if dma store is supported.
-   */
-  bool CheckDMAStore(Target target, arith::Analyzer *analyzer,
-                     bool check_last_dim = true) const;
 
   /*!
    * \brief Check if bulk copy is supported.

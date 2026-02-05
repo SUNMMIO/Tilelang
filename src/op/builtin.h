@@ -189,7 +189,7 @@ TVM_DLL const Op &get_mbarrier();
 TVM_DLL const Op &tma_load();
 
 /*!
- * \brief Perform a DMA load operation from source memory to destination memory.
+ * \brief Perform a DMA copy operation from source memory to destination memory.
  *
  * This function describes a DMA-based tensor copy with explicit shape, layout,
  * memory scope. It is typically used to lower a high-level
@@ -273,15 +273,7 @@ TVM_DLL const Op &tma_load();
  * \note
  *   Out-of-bound fill policies are currently not supported.
  */
-TVM_DLL const Op &dma_load();
-
-/*!
- * \brief Perform a DMA store operation from source memory to destination
- * memory. see dma_load for details.
- *
- *
- */
-TVM_DLL const Op &dma_store();
+TVM_DLL const Op &dma_copy();
 
 /*!
  * \brief tvm intrinsics for loading image from global tensor to columns in

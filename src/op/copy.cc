@@ -565,33 +565,26 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
     return {};
   }
 
-  if (copy_inst == CopyInst::kDMALoad || copy_inst == CopyInst::kDMAStore) {
-    // for dma load/store, we can directly apply the blockwise_zz_layout
-    bool is_load = copy_inst == CopyInst::kDMALoad;
+  if (copy_inst == CopyInst::kDMACopy) {
+    // for dma copy, we can directly apply the blockwise_zz_layout
     const auto f =
         ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
-    if (!is_load) {
-      // DMA Store, only src in shared
-      if (level == InferLevel::kFree && !T.layout_map.count(src)) {
-        auto layout = Downcast<Layout>((*f)(src));
-        return Map<Buffer, Layout>({{src, layout}});
-      }
-      return {};
-    } else {
-      // DMA Load, src may in shared, dst in shared
-      auto result = Map<Buffer, Layout>();
-      if (level == InferLevel::kFree && src.scope() != "global" &&
-          !T.layout_map.count(src)) {
+    auto result = Map<Buffer, Layout>();
+
+    if (level == InferLevel::kFree && !T.layout_map.count(src)) {
+      if (src.scope() != "global") {
         auto layout = Downcast<Layout>((*f)(src));
         result.Set(src, layout);
       }
-      if (level == InferLevel::kFree && !T.layout_map.count(dst)) {
+    }
+
+    if (level == InferLevel::kFree && !T.layout_map.count(dst)) {
+      if (dst.scope() != "global") {
         auto layout = Downcast<Layout>((*f)(dst));
         result.Set(dst, layout);
       }
-      return result;
     }
-    return {};
+    return result;
   }
   // for LDSM/STSM, the layout was deduced from register layout
   // so we can directly apply the layout of normal copy
@@ -621,7 +614,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
  * @return true if the copy can be implemented as a DMA Load; false
  * otherwise.
  */
-bool CopyNode::CheckDMALoad(Target target, arith::Analyzer *analyzer,
+bool CopyNode::CheckDMACopy(Target target, arith::Analyzer *analyzer,
                             bool check_last_dim) const {
   // 1. arch must support Sunmmio
   if (!TargetIsSunmmio(target))
@@ -632,53 +625,30 @@ bool CopyNode::CheckDMALoad(Target target, arith::Analyzer *analyzer,
   // 2.1 DRAM -> RSRAM
   if (src.scope() == "global" && dst.scope() == "shared.rsram")
     scope_check = true;
-  // 2.2 RSRAM -> WSRAM
+  // 2.2 DRAM -> WSRAM
+  if (src.scope() == "global" && dst.scope() == "shared.wsram")
+    scope_check = true;
+  // 2.3 DRAM -> ASRAM
+  if (src.scope() == "global" && dst.scope() == "shared.asram")
+    scope_check = true;
+  // 2.4 RSRAM -> WSRAM
   if (src.scope() == "shared.rsram" && dst.scope() == "shared.wsram")
     scope_check = true;
-  // 2.3 RSRAM -> ASRAM
+  // 2.5 RSRAM -> ASRAM
   if (src.scope() == "shared.rsram" && dst.scope() == "shared.asram")
     scope_check = true;
-  // 2.4 RSRAM <-> RSRAM
+  // 2.6 RSRAM <-> RSRAM
   if (src.scope() == "shared.rsram" && dst.scope() == "shared.rsram")
     scope_check = true;
-  // 2.5 DRAM -> WSRAM
-  if (src.scope() == "global" && dst.scope() == "shared.wsram")
+  // 2.7 RSRAM -> DRAM
+  if (src.scope() == "shared.rsram" && dst.scope() == "global")
     scope_check = true;
   if (!scope_check)
     return false;
 
   // 3. src and dst must have the same dtype
   if (src->dtype != dst->dtype) {
-    LOG(WARNING) << "src and dst must have the same dtype for tma load "
-                 << src->name << " vs. " << dst->name << " dtype " << src->dtype
-                 << " vs. " << dst->dtype << " will be fallback to normal copy";
-    return false;
-  }
-  return true;
-}
-
-/**
- * @brief Determine if this CopyNode can be lowered to a CUDA DMA store.
- *
- * Checks whether the target supports DMA store, the source buffer is in shared
- * memory (shared.rsram), the destination buffer is in global memory,
- * and both buffers have the same element data type. If the data types differ,
- * a warning is logged and false is returned.
- *
- * @param target Target device/architecture to check for dma store support.
- * @return true if all conditions are met; false otherwise.
- */
-bool CopyNode::CheckDMAStore(Target target, arith::Analyzer *analyzer,
-                             bool check_last_dim) const {
-  // 1. arch must support Sunmmio
-  if (!TargetIsSunmmio(target))
-    return false;
-  // 2. src and dst must be shared.dyn and local.fragment
-  if (src.scope() != "shared.rsram" || dst.scope() != "global")
-    return false;
-  // 3. src and dst must have the same dtype
-  if (src->dtype != dst->dtype) {
-    LOG(WARNING) << "src and dst must have the same dtype for dma store "
+    LOG(WARNING) << "src and dst must have the same dtype for dma copy "
                  << src->name << " vs. " << dst->name << " dtype " << src->dtype
                  << " vs. " << dst->dtype << " will be fallback to normal copy";
     return false;
@@ -962,12 +932,9 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
   } else if (CheckTMemStore(target)) {
     return CopyInst::kTMemStore;
   } else if (TargetIsSunmmio(target)) {
-    auto is_load = CheckDMALoad(target, analyzer);
-    auto is_store = CheckDMAStore(target, analyzer);
-    if (is_load)
-      return CopyInst::kDMALoad;
-    if (is_store)
-      return CopyInst::kDMAStore;
+    auto is_copy = CheckDMACopy(target, analyzer);
+    if (is_copy)
+      return CopyInst::kDMACopy;
     ICHECK(0) << "Unsupported copy from " << src.scope() << " to "
               << dst.scope() << " of Sunmmio target.";
   } else {
@@ -1018,11 +985,10 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     return ldsm_copy;
   } else if (copy_inst == CopyInst::kNormal) {
     return LowerNormalCopy(T, analyzer);
-  } else if (copy_inst == CopyInst::kDMALoad ||
-             copy_inst == CopyInst::kDMAStore) {
-    auto bulk_copy = LowerDMACopy(T, analyzer, copy_inst);
-    ICHECK(bulk_copy.defined()) << "Failed to lower dma load/store";
-    return bulk_copy;
+  } else if (copy_inst == CopyInst::kDMACopy) {
+    auto dma_copy = LowerDMACopy(T, analyzer, copy_inst);
+    ICHECK(dma_copy.defined()) << "Failed to lower dma load/store";
+    return dma_copy;
   } else {
     LOG(FATAL) << "Unsupported copy inst " << static_cast<int>(copy_inst);
   }
@@ -1045,10 +1011,9 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
  */
 Stmt CopyNode::LowerDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
                             CopyInst copy_inst) const {
-  ICHECK(copy_inst == CopyInst::kDMALoad || copy_inst == CopyInst::kDMAStore)
+  ICHECK(copy_inst == CopyInst::kDMACopy)
       << "Invalid copy inst " << static_cast<int>(copy_inst);
 
-  bool is_load = copy_inst == CopyInst::kDMALoad;
   Array<PrimExpr> args;
   // \param data_type
   args.push_back(to_CUtensorMapDataType(src->dtype));
@@ -1129,7 +1094,7 @@ Stmt CopyNode::LowerDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
     args.push_back(r->min);
   }
 
-  auto op = is_load ? dma_load() : dma_store();
+  auto op = dma_copy();
   Stmt dma_copy;
   dma_copy = Evaluate(Call(DataType::Handle(), op, args));
 
