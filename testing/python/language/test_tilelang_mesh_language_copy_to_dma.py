@@ -25,9 +25,11 @@ def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
 
             for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
                 # DRAM -> RSRAM
-                T.copy(C[by * block_M, ko * block_K], C_shared)
-                # DRAM <- RSRAM
-                T.copy(C_shared, C[by * block_M, ko * block_K])
+                # T.copy(C[by * block_M, ko * block_K], C_shared)
+                # # DRAM -> WSRAM
+                # T.copy(C[by * block_M, ko * block_K], B_shared)
+                # # DRAM <- RSRAM
+                # T.copy(C_shared, C[by * block_M, ko * block_K])
                 # RSRAM -> ASRAM
                 T.copy(C_shared[8:24, 16:48], A_shared[24:40, 8:40])
                 # RSRAM -> WSRAM
@@ -39,15 +41,39 @@ def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
 
 
 TEST_CASES = [
-    (128, 64, 64, 32),
+    (
+        128,
+        64,
+        64,
+        32,
+        [
+            # DRAM -> RSRAM
+            # T.copy(C[by * block_M, ko * block_K], C_shared)
+            # "1",
+            # DRAM -> WSRAM
+            # T.copy(C[by * block_M, ko * block_K], B_shared)
+            # "1",
+            # DRAM <- RSRAM
+            # T.copy(C_shared, C[by * block_M, ko * block_K])
+            # "1",
+            # RSRAM -> ASRAM
+            # T.copy(C_shared[8:24, 16:48], A_shared[24:40, 8:40])
+            "T.dma_load(7, 2, 16, 32, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, \"shared.rsram\", 2, 16, 32, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, \"shared.asram\", T.tvm_access_ptr(T.type_annotation(\"float32\"), C_shared.data, 0, 512, 1), 8, 16, T.tvm_access_ptr(T.type_annotation(\"float32\"), A_shared.data, 0, 512, 2), 24, 8)",
+            # RSRAM -> WSRAM
+            # T.copy(C_shared[8:32, 48:56], B_shared[40:64, 0:8])
+            "T.dma_load(7, 2, 24, 8, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, \"shared.rsram\", 2, 24, 8, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, \"shared.wsram\", T.tvm_access_ptr(T.type_annotation(\"float32\"), C_shared.data, 0, 192, 1), 8, 48, T.tvm_access_ptr(T.type_annotation(\"float32\"), B_shared.data, 0, 192, 2), 40, 0)",
+            # RSRAM <-> RSRAM
+            # T.copy(C_shared, D_shared)
+            "T.dma_load(7, 2, 64, 64, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, \"shared.rsram\", 2, 64, 64, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, \"shared.rsram\", T.tvm_access_ptr(T.type_annotation(\"float32\"), C_shared.data, 0, 4096, 1), 0, 0, T.tvm_access_ptr(T.type_annotation(\"float32\"), D_shared.data, 0, 4096, 2), 0, 0)",
+        ]),
 ]
 
 
 @pytest.mark.parametrize(
-    "K, block_M, block_N, block_K",
+    "K, block_M, block_N, block_K, lower_stmt",
     TEST_CASES,
 )
-def test_tilelang_mesh_copy_to_dma(K, block_M, block_N, block_K):
+def test_tilelang_mesh_copy_to_dma(K, block_M, block_N, block_K, lower_stmt):
     target_name = "Sunmmio"
     target = determine_target(target_name, return_object=True)
     with tvm.target.Target(target):
@@ -69,7 +95,11 @@ def test_tilelang_mesh_copy_to_dma(K, block_M, block_N, block_K):
         mod = tilelang.transform.LayoutInference()(mod)
         # Lower high-level tile operations to low-level operations
         mod = tilelang.transform.LowerTileOp()(mod)
-        print(mod)
+        texts = mod.script().split('\n')
+        texts = texts[29:]
+        texts = [it[20:] for it in texts]
+        for i in range(len(texts)):
+            assert texts[i] == lower_stmt[i]
 
 
 def wrong_copy_1(M,
@@ -101,8 +131,6 @@ def wrong_copy_1(M,
                     T.copy(C[by * block_M, ko * block_K], A_shared)
                 elif error_type == 'A->D':
                     T.copy(A_shared, C[by * block_M, ko * block_K])
-                elif error_type == 'D->W':
-                    T.copy(C[by * block_M, ko * block_K], B_shared)
                 elif error_type == 'W->D':
                     T.copy(B_shared, C[by * block_M, ko * block_K])
                 elif error_type == 'A->R':
@@ -124,8 +152,6 @@ WRONG_TEST_CASES = [
      "Unsupported copy from global to shared.asram of Sunmmio target."),
     (128, 128, 128, 32, 32, 32, "A->D",
      "Unsupported copy from shared.asram to global of Sunmmio target."),
-    (128, 128, 128, 32, 32, 32, "D->W",
-     "Unsupported copy from global to shared.wsram of Sunmmio target."),
     (128, 128, 128, 32, 32, 32, "W->D",
      "Unsupported copy from shared.wsram to global of Sunmmio target."),
     (128, 128, 128, 32, 32, 32, "A->R",

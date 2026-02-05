@@ -641,6 +641,9 @@ bool CopyNode::CheckDMALoad(Target target, arith::Analyzer *analyzer,
   // 2.4 RSRAM <-> RSRAM
   if (src.scope() == "shared.rsram" && dst.scope() == "shared.rsram")
     scope_check = true;
+  // 2.5 DRAM -> WSRAM
+  if (src.scope() == "global" && dst.scope() == "shared.wsram")
+    scope_check = true;
   if (!scope_check)
     return false;
 
