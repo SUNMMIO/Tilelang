@@ -4,12 +4,14 @@ from typing import Callable
 
 from tilelang.layout import Fragment, Layout
 from tilelang.utils.language import is_fragment
+from tilelang.tileview import TileView, make_tileview
 from tvm.script.parser.tir import attr, block_attr
 from tvm.tir import FloatImm
 
 __all__ = [
     "use_swizzle",
     "annotate_layout",
+    "annotate_tileview",
     "annotate_safe_value",
     "annotate_l2_hit_ratio",
     "annotate_restrict_buffers",
@@ -38,6 +40,44 @@ def annotate_layout(layout_map: dict):
             raise ValueError(f"Invalid layout: {layout}")
 
     return block_attr({"layout_map": _layout_map})
+
+
+def annotate_tileview(tileview_map: dict):
+    """Annotate the tileview of the buffer.
+
+    Parameters
+    ----------
+    tileview_map : dict
+        A dictionary mapping buffers to their TileView specifications.
+        Values can be:
+        - A TileView object directly
+        - A tuple of (tile_shape, index_map) to create a TileView from the buffer
+
+    Returns
+    -------
+    block_attr
+        A block attribute containing the tileview map.
+
+    Examples
+    --------
+    >>> # Using TileView directly
+    >>> annotate_tileview({A: make_tileview(A, [16, 32], [-2, -1])})
+
+    >>> # Using tuple shorthand (tile_shape, index_map)
+    >>> annotate_tileview({A: ([16, 32], [-2, -1])})
+    """
+    _tileview_map = {}
+    for buffer, tileview in tileview_map.items():
+        if isinstance(tileview, TileView):
+            _tileview_map[buffer.data] = tileview
+        elif isinstance(tileview, tuple) and len(tileview) == 2:
+            tile_shape, index_map = tileview
+            _tileview_map[buffer.data] = make_tileview(buffer, tile_shape, index_map)
+        else:
+            raise ValueError(f"Invalid tileview: {tileview}. "
+                             "Expected TileView or tuple of (tile_shape, index_map)")
+
+    return block_attr({"tileview_map": _tileview_map})
 
 
 def annotate_safe_value(safe_value_map: dict):
