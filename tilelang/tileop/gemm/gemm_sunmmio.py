@@ -28,6 +28,7 @@ class GemmSunmmio(GemmBase):
             args = []
 
             def add_info(args, region):
+                args.append(len(region.buffer.shape))
                 for it in region.region:
                     args.append(it.extent)
                 args.append(region.buffer.dtype)

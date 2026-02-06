@@ -530,6 +530,7 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     Array<PrimExpr> args;
 
     {
+      args.push_back(static_cast<int>(a_->shape.size()));
       for (auto it : aRegion_->region) {
         args.push_back(it->extent);
       }
@@ -557,6 +558,7 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     }
 
     {
+      args.push_back(static_cast<int>(b_->shape.size()));
       for (auto it : bRegion_->region) {
         args.push_back(it->extent);
       }
@@ -584,6 +586,7 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     }
 
     {
+      args.push_back(static_cast<int>(c_->shape.size()));
       for (auto it : cRegion_->region) {
         args.push_back(it->extent);
       }

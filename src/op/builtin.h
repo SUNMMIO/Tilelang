@@ -282,6 +282,9 @@ TVM_DLL const Op &dma_store();
 /*!
  * \brief tvm intrinsic for mma operation of Sunmmio target.
  *
+ *  \param A_rank
+ *    Rank (number of dimensions) of A operand
+ *
  *  \param A_region_shape
  *    Region shape of A operand
  *
@@ -303,6 +306,9 @@ TVM_DLL const Op &dma_store();
  *  \param A_addr
  *    Addr of A operand.
  *
+ *  \param B_rank
+ *    Rank (number of dimensions) of B operand
+ *
  *  \param B_region_shape
  *    Region shape of B operand
  *
@@ -323,6 +329,9 @@ TVM_DLL const Op &dma_store();
  *
  *  \param B_addr
  *    Addr of B operand.
+ *
+ *  \param C_rank
+ *    Rank (number of dimensions) of C operand
  *
  *  \param C_region_shape
  *    Region shape of C operand
