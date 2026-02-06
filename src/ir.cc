@@ -130,6 +130,32 @@ ForFrame TilesFor(const Array<PrimExpr> &extents,
   };
   return ForFrame(n);
 }
+ForFrame TilesFor(const Array<PrimExpr> &extents,
+                  const Map<String, ObjectRef> &annotations) {
+  using namespace tvm::tir;
+  ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
+  n->vars.reserve(extents.size());
+  n->doms.reserve(extents.size());
+  for (const auto &extent : extents) {
+    DataType dtype = extent.dtype();
+    n->vars.push_back(Var("v", extent.dtype()));
+    n->doms.push_back(Range(make_const(dtype, 0), extent));
+  }
+  n->f_make_for_loop = [annotations](const Array<Var> &vars,
+                                     const Array<Range> &doms,
+                                     Stmt body) -> Stmt {
+    ICHECK_EQ(vars.size(), doms.size());
+    int n = vars.size();
+    for (int i = n - 1; i >= 0; --i) {
+      Range dom = doms[i];
+      Var var = vars[i];
+      body = For(var, dom->min, dom->extent, ForKind::kSerial, body,
+                 /*thread_binding=*/std::nullopt, /*annotations=*/annotations);
+    }
+    return body;
+  };
+  return ForFrame(n);
+}
 
 ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
                       const Array<PrimExpr> &order,
