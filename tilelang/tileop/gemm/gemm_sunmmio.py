@@ -1,13 +1,12 @@
 from .gemm_base import GemmBase
 from tilelang.layout import make_blockwise_zz_layout
-from tilelang.intrinsics.mma_macro_generator import (
-    TensorCoreIntrinEmitter,)
-from tilelang.utils.language import is_shared, is_full_region
+from tilelang.utils.language import is_shared
 from tilelang import tvm as tvm
 from tvm.target import Target
 from tvm import tir
-from tilelang import language as T
 from tilelang.transform.simplify import _Simplify
+from tilelang import language as T
+from tilelang.utils.language import retrieve_ptr
 
 
 class GemmSunmmio(GemmBase):
@@ -25,100 +24,44 @@ class GemmSunmmio(GemmBase):
             )
 
     def lower(self, layout_map: dict, target: Target, thread_nums: int, thread_var: tir.Var):
-        # TODO: lower not implemented
-        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target,
-                                                            False)
-        warp_row_tiles = int(self.M // m_warp)
-        warp_col_tiles = int(self.N // n_warp)
-        mma_emitter = TensorCoreIntrinEmitter(
-            a_dtype=self.in_dtype,
-            b_dtype=self.in_dtype,
-            accum_dtype=self.accum_dtype,
-            a_transposed=self.trans_A,
-            b_transposed=self.trans_B,
-            block_row_warps=m_warp,
-            block_col_warps=n_warp,
-            warp_row_tiles=warp_row_tiles,
-            warp_col_tiles=warp_col_tiles,
-            chunk=self.chunk,
-            thread_var=thread_var,
-        )
-
-        in_dtype = self.in_dtype
-        warp_rows = mma_emitter.warp_rows
-        warp_cols = mma_emitter.warp_cols
-        local_size_a = mma_emitter.local_size_a
-        local_size_b = mma_emitter.local_size_b
-        block_K = mma_emitter.chunk
-        micro_size_k = mma_emitter.micro_size_k
-        # We use region for memory input to support strided gemm
-        # T.gemm(A_shared[0:128, :], B_shared, C_local)
-        A_region = self.ARegion
-        B_region = self.BRegion
-        C_region = self.CRegion
-
-        A_buf = A_region.buffer
-        B_buf = B_region.buffer
-        C_buf = C_region.buffer
-
-        clear_accum = self.clear_accum
-
-        assert block_K >= micro_size_k, f"block_K ({block_K}) must be >= micro_size_k ({micro_size_k})"
-
-        assert is_full_region(C_region), "Fragment output C must be a full region"
-
         if self.is_gemm_sss():
+            args = []
+
+            def add_info(args, region):
+                for it in region.region:
+                    args.append(it.extent)
+                args.append(region.buffer.dtype)
+                layout = layout_map[region.buffer]
+                for it in layout.input_size:
+                    args.append(it)
+                for it in layout.forward_index:
+                    args.append(it)
+                args.append(region.buffer.scope())
+                for it in region.region:
+                    args.append(it.min)
+                if region != self.CRegion:
+                    args.append(retrieve_ptr(region.buffer, access_type="r"))
+                else:
+                    args.append(retrieve_ptr(region.buffer, access_type="w"))
+
+            add_info(args, self.ARegion)
+            add_info(args, self.BRegion)
+            add_info(args, self.CRegion)
+
+            args.append(self.trans_A)
+            args.append(self.trans_B)
+            args.append(self.clear_accum)
 
             @T.prim_func
-            def _gemm_ssr() -> None:
-                """
-                The inner macro that loads data from shared buffers A_shared and
-                B_shared into local fragments, then issues Tensor Core mma ops,
-                accumulating into C_local.
-                """
-                A_local = T.alloc_local((warp_rows * local_size_a), in_dtype)
-                B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
-                if clear_accum:
-                    T.clear(C_buf)
-                for ki in T.serial(0, (block_K // micro_size_k)):
-                    # Load A into fragment
-                    mma_emitter.ldmatrix_a(
-                        A_local,
-                        A_region,
-                        ki,
-                    )
+            def _gemm_sss() -> None:
+                tir.call_intrin(
+                    "handle",
+                    tir.op.Op.get("tl.mma_sunmmio"),
+                    *args,
+                )
 
-                    # Load B into fragment
-                    mma_emitter.ldmatrix_b(
-                        B_local,
-                        B_region,
-                        ki,
-                    )
+            return _Simplify(_gemm_sss, inline_let=True)
 
-                    # Perform Matrix Multiplication
-                    mma_emitter.mma(A_local, B_local, C_buf, ki)
-
-            # Simplify to optimize the index computing
-            # Must inline let statements to simplify the analysis
-            return _Simplify(_gemm_ssr, inline_let=True)
-            assert is_full_region(A_region), "Fragment input A must be a full region"
-            assert is_full_region(B_region), "Fragment input B must be a full region"
-
-            @T.prim_func
-            def _gemm_rrr() -> None:
-                """
-                The inner macro that loads data from shared buffers A_shared and
-                B_shared into local fragments, then issues Tensor Core mma ops,
-                accumulating into C_local.
-                """
-
-                for ki in T.serial(0, (block_K // micro_size_k)):
-                    # Perform Matrix Multiplication
-                    mma_emitter.mma(A_buf, B_buf, C_buf, ki)
-
-            # Simplify to optimize the index computing
-            # Must inline let statements to simplify the analysis
-            return _Simplify(_gemm_rrr, inline_let=True)
         else:
             raise ValueError(
                 f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}"

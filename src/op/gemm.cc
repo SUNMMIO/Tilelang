@@ -150,6 +150,10 @@ std::pair<int, int> GemmWarpPolicyNode::computeWarpPartition(
     return {1, num_warps}; // TCGEN5MMA doesn't care about warp partitioning
   }
 
+  if (gemm_inst == GemmInst::kSunmmioMMA) {
+    return {1, num_warps}; // kSunmmioMMA doesn't care about warp partitioning
+  }
+
   int m_warp = 1, n_warp = 1;
   constexpr int kMPerWarp = 16; // Rows processed by a single warp
   int kNPerWarp = 8;            // Columns processed by a single warp
@@ -520,6 +524,101 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
                      Evaluate(new_call));
       return tcgen5mma_call;
     }
+  }
+
+  if (gemm_inst == GemmInst::kSunmmioMMA) {
+    Array<PrimExpr> args;
+
+    {
+      for (auto it : aRegion_->region) {
+        args.push_back(it->extent);
+      }
+      args.push_back(StringImm(tvm::runtime::DLDataTypeToString(a_->dtype)));
+
+      ICHECK(T.layout_map.count(a_))
+          << "Layout of buffer " << a_ << " not found.";
+      auto layout = T.layout_map.at(a_);
+      for (auto s : layout->InputShape()) {
+        args.push_back(s);
+      }
+      for (auto s : layout->GetForwardIndex()) {
+        args.push_back(s);
+      }
+      args.push_back(StringImm(a_.scope()));
+      for (auto it : aRegion_->region) {
+        args.push_back(it->min);
+      }
+      PrimExpr total_elements = 1;
+      for (auto e : a_->shape) {
+        total_elements *= e;
+      }
+      auto addr = a_.access_ptr(1, DataType::Handle(), 1, 0, total_elements);
+      args.push_back(addr);
+    }
+
+    {
+      for (auto it : bRegion_->region) {
+        args.push_back(it->extent);
+      }
+      args.push_back(StringImm(tvm::runtime::DLDataTypeToString(b_->dtype)));
+
+      ICHECK(T.layout_map.count(b_))
+          << "Layout of buffer " << b_ << " not found.";
+      auto layout = T.layout_map.at(b_);
+      for (auto s : layout->InputShape()) {
+        args.push_back(s);
+      }
+      for (auto s : layout->GetForwardIndex()) {
+        args.push_back(s);
+      }
+      args.push_back(StringImm(b_.scope()));
+      for (auto it : bRegion_->region) {
+        args.push_back(it->min);
+      }
+      PrimExpr total_elements = 1;
+      for (auto e : b_->shape) {
+        total_elements *= e;
+      }
+      auto addr = b_.access_ptr(1, DataType::Handle(), 1, 0, total_elements);
+      args.push_back(addr);
+    }
+
+    {
+      for (auto it : cRegion_->region) {
+        args.push_back(it->extent);
+      }
+      args.push_back(StringImm(tvm::runtime::DLDataTypeToString(c_->dtype)));
+
+      ICHECK(T.layout_map.count(c_))
+          << "Layout of buffer " << c_ << " not found.";
+      auto layout = T.layout_map.at(c_);
+      for (auto s : layout->InputShape()) {
+        args.push_back(s);
+      }
+      for (auto s : layout->GetForwardIndex()) {
+        args.push_back(s);
+      }
+      args.push_back(StringImm(c_.scope()));
+      for (auto it : cRegion_->region) {
+        args.push_back(it->min);
+      }
+      PrimExpr total_elements = 1;
+      for (auto e : c_->shape) {
+        total_elements *= e;
+      }
+      auto addr = c_.access_ptr(2, DataType::Handle(), 1, 0, total_elements);
+      args.push_back(addr);
+    }
+
+    args.push_back(Bool(transA_));
+    args.push_back(Bool(transB_));
+    args.push_back(clearAccum_);
+
+    auto op = mma_sunmmio();
+    Stmt mma_sunmmio;
+    mma_sunmmio = Evaluate(Call(DataType::Handle(), op, args));
+
+    return mma_sunmmio;
   }
 
   if (a_.scope() == "local.fragment") {
