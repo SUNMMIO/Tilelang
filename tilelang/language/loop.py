@@ -48,12 +48,10 @@ def Tiles(shared_buf: tir.Buffer, parallel: bool = False):
     res : frame.ForFrame
         The ForFrame.
     """
-    annotations = {
-        "tile_level_loop": tir.IntImm("int32", 1),
-        "tile.parallel": tir.IntImm("int32", 1 if parallel else 0),
-    }
-
-    return _ffi_api.Parallel(tuple(shared_buf.shape), annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
+    annotations = {"tile_level_loop": tir.IntImm("int32", 0), "tiled_buffer": shared_buf.data}
+    if parallel:
+        annotations.update({"tile_level_loop": tir.IntImm("int32", 1)})
+        return _ffi_api.Tiles(tuple(shared_buf.shape), annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
 def Persistent(
