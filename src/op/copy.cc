@@ -1024,17 +1024,14 @@ Stmt CopyNode::LowerDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
     args.push_back(r->extent);
   }
   // \param src_input_size & \param src_forward
-  if (src.scope() == "global") {
-  } else {
-    ICHECK(T.layout_map.count(src))
-        << "Layout of buffer " << src << " not found.";
-    auto layout = T.layout_map.at(src);
-    for (auto s : layout->InputShape()) {
-      args.push_back(s);
-    }
-    for (auto s : layout->GetForwardIndex()) {
-      args.push_back(s);
-    }
+  ICHECK(T.layout_map.count(src))
+      << "Layout of buffer " << src << " not found.";
+  auto layout = T.layout_map.at(src);
+  for (auto s : layout->InputShape()) {
+    args.push_back(s);
+  }
+  for (auto s : layout->GetForwardIndex()) {
+    args.push_back(s);
   }
   // \param src_scope
   auto src_scope = StringImm(src.scope());
@@ -1047,17 +1044,14 @@ Stmt CopyNode::LowerDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
     args.push_back(r->extent);
   }
   // \param dst_input_size & \param dst_forward
-  if (dst.scope() == "global") {
-  } else {
-    ICHECK(T.layout_map.count(dst))
-        << "Layout of buffer " << dst << " not found.";
-    auto layout = T.layout_map.at(dst);
-    for (auto s : layout->InputShape()) {
-      args.push_back(s);
-    }
-    for (auto s : layout->GetForwardIndex()) {
-      args.push_back(s);
-    }
+  ICHECK(T.layout_map.count(dst))
+      << "Layout of buffer " << dst << " not found.";
+  layout = T.layout_map.at(dst);
+  for (auto s : layout->InputShape()) {
+    args.push_back(s);
+  }
+  for (auto s : layout->GetForwardIndex()) {
+    args.push_back(s);
   }
   // \param dst_scope
   auto dst_scope = StringImm(dst.scope());

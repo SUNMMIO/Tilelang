@@ -107,15 +107,15 @@ def test_tilelang_mesh_copy_to_dma(K, block_M, block_N, block_K, lower_stmt):
             assert texts[i] == lower_stmt[i]
 
 
-def wrong_copy_1(M,
-                 N,
-                 K,
-                 block_M,
-                 block_N,
-                 block_K,
-                 error_type,
-                 dtype="float16",
-                 accum_dtype="float16"):
+def wrong_copy(M,
+               N,
+               K,
+               block_M,
+               block_N,
+               block_K,
+               error_type,
+               dtype="float16",
+               accum_dtype="float16"):
 
     @T.prim_func
     def main(
@@ -185,7 +185,7 @@ def test_tilelang_mesh_wrong_copy_to_dma(M, N, K, block_M, block_N, block_K, err
     target_name = "Sunmmio"
     target = determine_target(target_name, return_object=True)
     with pytest.raises(tvm.error.InternalError, match=error_msg), tvm.target.Target(target):
-        mod = wrong_copy_1(M, N, K, block_M, block_N, block_K, error_type)
+        mod = wrong_copy(M, N, K, block_M, block_N, block_K, error_type)
         mod = tvm.tir.transform.BindTarget(target)(mod)
         # Add wrapper for single buf store
         mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
