@@ -1062,8 +1062,8 @@ Stmt CopyNode::LowerDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
     args.push_back(src->data);
   } else {
     PrimExpr total_elements = 1;
-    for (auto e : src_range) {
-      total_elements *= e->extent;
+    for (auto e : src->shape) {
+      total_elements *= e;
     }
     auto addr = src.access_ptr(1, DataType::Handle(), 1, 0, total_elements);
     args.push_back(addr);
@@ -1077,8 +1077,8 @@ Stmt CopyNode::LowerDMACopy(const LowerArgs &T, arith::Analyzer *analyzer,
     args.push_back(dst->data);
   } else {
     PrimExpr total_elements = 1;
-    for (auto e : dst_range) {
-      total_elements *= e->extent;
+    for (auto e : dst->shape) {
+      total_elements *= e;
     }
     auto addr = dst.access_ptr(2, DataType::Handle(), 1, 0, total_elements);
     args.push_back(addr);
