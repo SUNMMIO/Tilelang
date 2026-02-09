@@ -64,6 +64,10 @@ def is_metal_target(target: Target) -> bool:
     return target.kind.name == "metal"
 
 
+def is_sunmmio_target(target: Target) -> bool:
+    return target.kind.name == "Sunmmio"
+
+
 def get_annotated_mod(
     func_or_mod: tir.PrimFunc | tvm.IRModule,
     target: str | Target = "auto",

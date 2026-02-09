@@ -47,6 +47,12 @@ def allow_global_thread_synchronization(pass_ctx: PassContext | None = None) -> 
     return enable_global_thread_sync
 
 
+def allow_odma(target: Target | None = None) -> bool:
+    # avoid circular import
+    from tilelang.jit.adapter.utils import is_sunmmio_target
+    return is_sunmmio_target(target)
+
+
 def should_enable_aggressive_merge(pass_ctx: PassContext | None = None,
                                    target: Target | None = None) -> bool:
     if pass_ctx is None:
@@ -207,6 +213,18 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         if is_hopper(target):
             mod = tilelang.transform.RewriteWgmmaSync()(mod)
         mod = tilelang.transform.InjectFenceProxy()(mod)
+    elif allow_odma(target=target):
+        print('allow_odma')
+        # 先按之前的流程走，保持可测试性，后续根据情况替换实际的逻辑
+        mod = tilelang.transform.IfStmtBinding()(mod)
+        mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
+        mod = tilelang.transform.PipelinePlanning()(mod)
+        mod = tilelang.transform.InjectSoftwarePipeline()(mod)
+        mod = tilelang.transform.MergeIfStmt()(mod)
+        if allow_fence_proxy(target=target):
+            # in hopper device, wgmma is an async proxy
+            # so we need to inject a fence proxy before it
+            mod = tilelang.transform.InjectFenceProxy()(mod)
     else:
         mod = tilelang.transform.IfStmtBinding()(mod)
         mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
