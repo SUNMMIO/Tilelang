@@ -16,11 +16,11 @@ using namespace tir;
  * \brief Annotation keys used by Tiles lowering pipeline.
  *
  * NOTE:
- * - tile_execution : marks loops originating from T.Tiles()
- * - tile.tile_size : 2D tile size, attached by LegalizeTilesLoop
+ * - tile.execution : loops corresponding to the index map(index_map=(-2, -1))
+ * - tile.tile_size : 2D tile size, e.g. (32, 32)
  */
 namespace attr {
-constexpr const char *tile_execution = "tile_execution";
+constexpr const char *tile_execution = "tile.execution";
 constexpr const char *tile_tile_size = "tile.tile_size";
 } // namespace attr
 
@@ -43,15 +43,12 @@ constexpr const char *tile_tile_size = "tile.tile_size";
  * 3. Structural matching (not annotation-driven semantics):
  *    - Actual lowering only happens when we see:
  *
- *        for i (serial, tile_execution):
- *          for j (serial, tile_execution):
+ *        for i (serial, annotation="tile.execution..."):
+ *          for j (serial, annotation="tile.execution..."):
  *            BODY
  *
  *    - i, j are assumed to be the 2D tile-execution axes.
- *
- * 4. Exactly-once lowering:
- *    - The inner `for j` is consumed during lowering.
- *    - Lowering happens exactly once per T.Tiles().
+ * 4. construct and insert two new ForNodes.
  */
 class TilesLoopRewriter : public StmtExprMutator {
 public:
@@ -104,7 +101,7 @@ private:
    *   1. Recursively visit body.
    *   2. Gate by tile_execution.
    *   3. Try to match 2D tile pattern.
-   *   4. Perform lowering if matched.
+   *   4. construct two new ForNodes if matched.
    */
   Stmt VisitStmt_(const ForNode *loop) final {
     // ------------------------------------------------------------
@@ -154,7 +151,6 @@ private:
     // ------------------------------------------------------------
     auto tile_size_opt = GetTileSize(loop);
     if (!tile_size_opt.defined()) {
-      LOG(INFO) << "[TilesLoop]  Missing tile_tile_size, skip lowering";
       return UpdateBody(loop, new_body);
     }
 
@@ -164,7 +160,7 @@ private:
     LOG(INFO) << "[TilesLoop]  Performing 2D tile lowering";
 
     // ------------------------------------------------------------
-    // (5) Perform tile lowering
+    // (5) Perform tile lowering, construct and insert new ForNodes
     // ------------------------------------------------------------
     Var ti = loop->loop_var;
     Var tj = inner->loop_var;
@@ -190,10 +186,10 @@ private:
 
     tiled_body = For(ki, 0, tile_size[0], ForKind::kSerial, tiled_body);
 
-    // Replace the original inner loop body,j loop is consumed
+    // Replace the original inner loop body
     For new_inner = ffi::GetRef<For>(inner);
     new_inner.CopyOnWrite()->body = tiled_body;
-    // Replace the original outer loop body, i loop remains
+    // Replace the original outer loop body
     For new_outer = ffi::GetRef<For>(loop);
     new_outer.CopyOnWrite()->body = new_inner;
 
