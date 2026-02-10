@@ -56,6 +56,7 @@ struct LowerArgs {
   // Map from LetStmt variable to its bound expression, for resolving
   // fragment buffer accesses through let bindings
   Map<Var, PrimExpr> let_var_to_expr;
+  LayoutMap global_layout_map;
 };
 
 struct LayoutInferArgs {
@@ -68,6 +69,7 @@ struct LayoutInferArgs {
   // Map from LetStmt variable to its bound expression, for resolving
   // fragment buffer accesses through let bindings
   Map<Var, PrimExpr> let_var_to_expr;
+  LayoutMap global_layout_map;
 };
 
 class TileOperator;

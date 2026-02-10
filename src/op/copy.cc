@@ -1143,7 +1143,8 @@ Stmt CopyNode::LowerBulkCopy(const LowerArgs &T, arith::Analyzer *analyzer,
   Array<Range> shared_range = is_load ? dst_range : src_range;
   // TMA bulk copy cannot support a non-swizzled global layout, will be fallback
   // to normal copy
-  if (T.layout_map.count(global_tensor)) {
+  if (T.layout_map.count(global_tensor) ||
+      T.global_layout_map.count(global_tensor)) {
     LOG(WARNING) << "TMA bulk copy cannot support a non-swizzled global "
                     "layout, fallback to normal copy.";
     return LowerNormalCopy(T, analyzer);

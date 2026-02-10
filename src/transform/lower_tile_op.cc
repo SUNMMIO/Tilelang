@@ -172,6 +172,13 @@ private:
         layout_map_.Set(buffer, layout);
       }
     }
+    // Read global layout map separately — these are read-only metadata
+    // and must NOT be processed through makeBufferWithLayout/Forward.
+    if (op->annotations.count(attr::kGlobalLayoutMap)) {
+      global_layout_map_ = op->annotations.at(attr::kGlobalLayoutMap)
+                               .as<Map<Buffer, Layout>>()
+                               .value();
+    }
     // Begin a new workspace collection frame for this block scope
     workspace_stack_.emplace_back();
 
@@ -917,7 +924,7 @@ private:
 
     auto lowered = tile_op->Lower(
         LowerArgs{target_, thread_bounds, thread_var_->var, callback,
-                  layout_map_, buffer_remap_, let_var_to_expr},
+                  layout_map_, buffer_remap_, let_var_to_expr, global_layout_map_},
         analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
@@ -1113,6 +1120,7 @@ private:
   Map<Buffer, Layout> layout_map_;
   Map<Buffer, Layout> layout_remap_;
   Map<Buffer, Buffer> buffer_remap_;
+  Map<Buffer, Layout> global_layout_map_;
   // This is a workaround for cpu backend,
   // we need to define a thread_var for the serial loop.
   IterVar thread_var_ = IterVar(Range::FromMinExtent(0, 1), Var("v_thread"),

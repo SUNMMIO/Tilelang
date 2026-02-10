@@ -288,6 +288,8 @@ constexpr const char *kParallelLoopLayout = "parallel_loop_layout";
 constexpr const char *kParallelLoopPredicate = "parallel_loop_predicate";
 // ForAttr, Width (in elements) for coalesced memory access
 constexpr const char *kCoalescedWidth = "coalesced_width";
+// BlockAttr, Containing the layout for global (DRAM) buffers.
+constexpr const char *kGlobalLayoutMap = "global_layout_map";
 } // namespace attr
 
 } // namespace tl

@@ -26,6 +26,7 @@
 
 #include "arith/ir_mutator_with_analyzer.h"
 #include "arith/ir_visitor_with_analyzer.h"
+#include "common/global_layout_utils.h"
 #include "common/loop_fusion_utils.h"
 #include "common/union_find.h"
 #include "layout_reducer.h"
@@ -62,6 +63,7 @@ struct LayoutInferenceResult {
   Map<Buffer, Layout> layout_map;
   Map<For, Fragment> for_map;
   Map<For, PrimExpr> predicate_map;
+  Map<Buffer, Layout> global_layout_map;
 };
 
 class BufferUseDefCollector : public IRVisitorWithAnalyzer {
@@ -115,7 +117,8 @@ public:
                                                      cur_analyzer,
                                                      buffer_oob,
                                                      {},
-                                                     let_var_to_expr_},
+                                                     let_var_to_expr_,
+                                                     global_layout_map_},
                                      level);
 
     // Process the returned updates
@@ -440,7 +443,7 @@ public:
       }
     }
 
-    return {layout_map, for_map, predicate_map};
+    return {layout_map, for_map, predicate_map, global_layout_map_};
   }
 
   void Collect(const PrimFunc &f) {
@@ -457,6 +460,11 @@ public:
     ICHECK(target.defined())
         << "Layout_Inference: Require the target attribute";
     target_ = target.value();
+
+    // Populate global buffer layouts from tensor_meta (Sunmmio only).
+    // Stored separately so that inference does not overwrite them.
+    PopulateGlobalBufferLayouts(f, target_, &global_layout_map_);
+
     this->operator()(f->body);
     // Compute floating fragment buffers after collection
     ComputeFloatingFragmentBuffers(f->body);
@@ -1009,6 +1017,7 @@ private:
   std::vector<bool> buffer_oob_vec_;
   Target target_;
   LayoutMap annotated_layout_map_;
+  LayoutMap global_layout_map_;
   bool skip_thread_partition_{false};
 
   std::vector<TileOperator> BackupInferList() {
@@ -1223,6 +1232,10 @@ private:
     }
     auto block_ptr = block.CopyOnWrite();
     block_ptr->annotations.Set(attr::kLayoutMap, result_.layout_map);
+    if (!result_.global_layout_map.empty()) {
+      block_ptr->annotations.Set(attr::kGlobalLayoutMap,
+                                 result_.global_layout_map);
+    }
     return block;
   }
 
