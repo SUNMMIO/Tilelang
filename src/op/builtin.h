@@ -214,6 +214,14 @@ TVM_DLL const Op &tma_load();
  *   src_region_shape = [32, 64, 256]
  *   coord = [32, 128, 0]
  *
+ * \param src_scope
+ *   Memory scope of the source tensor.
+ *   Examples: "global", "shared.asram", "shared.wsram", "shared.rsram".
+ *
+ * \param dst_scope
+ *   Memory scope of the destination tensor.
+ *   Examples: "global", "shared.asram", "shared.wsram", "shared.rsram".
+ *
  * \param data_type
  *   Element data type of the tensor (e.g. float32, float16).
  *
@@ -234,10 +242,6 @@ TVM_DLL const Op &tma_load();
  *   For a row-major layout of Tensor(128, 256, 512),
  *   this is [256 * 512, 512, 1].
  *
- * \param src_scope
- *   Memory scope of the source tensor.
- *   Examples: "global", "shared.asram", "shared.wsram", "shared.rsram".
- *
  * \param dst_rank
  *   Rank (number of dimensions) of the destination tensor.
  *
@@ -251,10 +255,6 @@ TVM_DLL const Op &tma_load();
  * \param dst_forward
  *   Forward index mapping of the destination layout, retrievable via
  *   Layout::GetForwardIndex().
- *
- * \param dst_scope
- *   Memory scope of the destination tensor.
- *   Examples: "global", "shared.asram", "shared.wsram", "shared.rsram".
  *
  * \param src_addr
  *   Base address of the source tensor in memory .

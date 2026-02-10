@@ -24,15 +24,15 @@ def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
             D_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
 
             for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-                # # DRAM -> RSRAM
-                # T.copy(C[by * block_M, ko * block_K], C_shared)
-                # # DRAM -> WSRAM
-                # T.copy(C[by * block_M, ko * block_K], B_shared)
-                # # DRAM <- RSRAM
-                # T.copy(C_shared, C[by * block_M, ko * block_K])
-                # # DRAM -> ASRAM
-                # T.copy(C[by * block_M, ko * block_K], A_shared)
-                # # RSRAM -> ASRAM
+                # DRAM -> RSRAM
+                T.copy(C[by * block_M, ko * block_K], C_shared)
+                # DRAM -> WSRAM
+                T.copy(C[by * block_M, ko * block_K], B_shared)
+                # DRAM <- RSRAM
+                T.copy(C_shared, C[by * block_M, ko * block_K])
+                # DRAM -> ASRAM
+                T.copy(C[by * block_M, ko * block_K], A_shared)
+                # RSRAM -> ASRAM
                 T.copy(C_shared[8:24, 16:48], A_shared[24:40, 8:40])
                 # RSRAM -> WSRAM
                 T.copy(C_shared[8:32, 48:56], B_shared[40:64, 0:8])
@@ -51,25 +51,25 @@ TEST_CASES = [
         [
             # DRAM -> RSRAM
             # T.copy(C[by * block_M, ko * block_K], C_shared)
-            # "1",
+            "T.dma_copy(\"global\", \"shared.rsram\", 7, 2, 64, 64, 32, 128, _j * 32 + _i, 2, 64, 64, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, C.data, by * 64, ko * 32, T.tvm_access_ptr(T.type_annotation(\"float32\"), C_shared.data, 0, 4096, 2), 0, 0)",
             # DRAM -> WSRAM
             # T.copy(C[by * block_M, ko * block_K], B_shared)
-            # "1",
+            "T.dma_copy(\"global\", \"shared.wsram\", 7, 2, 64, 64, 32, 128, _j * 32 + _i, 2, 64, 64, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, C.data, by * 64, ko * 32, T.tvm_access_ptr(T.type_annotation(\"float32\"), B_shared.data, 0, 4096, 2), 0, 0)",
             # DRAM <- RSRAM
             # T.copy(C_shared, C[by * block_M, ko * block_K])
-            # "1",
+            "T.dma_copy(\"shared.rsram\", \"global\", 7, 2, 64, 64, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, 2, 64, 64, 32, 128, _j * 32 + _i, T.tvm_access_ptr(T.type_annotation(\"float32\"), C_shared.data, 0, 4096, 1), 0, 0, C.data, by * 64, ko * 32)",
             # DRAM -> ASRAM
             # T.copy(C[by * block_M, ko * block_K], A_shared)
-            # "1",
+            "T.dma_copy(\"global\", \"shared.asram\", 7, 2, 64, 64, 32, 128, _j * 32 + _i, 2, 64, 64, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, C.data, by * 64, ko * 32, T.tvm_access_ptr(T.type_annotation(\"float32\"), A_shared.data, 0, 4096, 2), 0, 0)",
             # RSRAM -> ASRAM
             # T.copy(C_shared[8:24, 16:48], A_shared[24:40, 8:40])
-            "T.dma_copy(7, 2, 16, 32, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, \"shared.rsram\", 2, 16, 32, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, \"shared.asram\", T.tvm_access_ptr(T.type_annotation(\"float32\"), C_shared.data, 0, 4096, 1), 8, 16, T.tvm_access_ptr(T.type_annotation(\"float32\"), A_shared.data, 0, 4096, 2), 24, 8)",
+            "T.dma_copy(\"shared.rsram\", \"shared.asram\", 7, 2, 16, 32, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, 2, 16, 32, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, T.tvm_access_ptr(T.type_annotation(\"float32\"), C_shared.data, 0, 4096, 1), 8, 16, T.tvm_access_ptr(T.type_annotation(\"float32\"), A_shared.data, 0, 4096, 2), 24, 8)",
             # RSRAM -> WSRAM
             # T.copy(C_shared[8:32, 48:56], B_shared[40:64, 0:8])
-            "T.dma_copy(7, 2, 24, 8, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, \"shared.rsram\", 2, 24, 8, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, \"shared.wsram\", T.tvm_access_ptr(T.type_annotation(\"float32\"), C_shared.data, 0, 4096, 1), 8, 48, T.tvm_access_ptr(T.type_annotation(\"float32\"), B_shared.data, 0, 4096, 2), 40, 0)",
+            "T.dma_copy(\"shared.rsram\", \"shared.wsram\", 7, 2, 24, 8, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, 2, 24, 8, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, T.tvm_access_ptr(T.type_annotation(\"float32\"), C_shared.data, 0, 4096, 1), 8, 48, T.tvm_access_ptr(T.type_annotation(\"float32\"), B_shared.data, 0, 4096, 2), 40, 0)",
             # RSRAM <-> RSRAM
             # T.copy(C_shared, D_shared)
-            "T.dma_copy(7, 2, 64, 64, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, \"shared.rsram\", 2, 64, 64, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, \"shared.rsram\", T.tvm_access_ptr(T.type_annotation(\"float32\"), C_shared.data, 0, 4096, 1), 0, 0, T.tvm_access_ptr(T.type_annotation(\"float32\"), D_shared.data, 0, 4096, 2), 0, 0)",
+            "T.dma_copy(\"shared.rsram\", \"shared.rsram\", 7, 2, 64, 64, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, 2, 64, 64, 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, T.tvm_access_ptr(T.type_annotation(\"float32\"), C_shared.data, 0, 4096, 1), 0, 0, T.tvm_access_ptr(T.type_annotation(\"float32\"), D_shared.data, 0, 4096, 2), 0, 0)",
         ]),
 ]
 
@@ -101,7 +101,7 @@ def test_tilelang_mesh_copy_to_dma(K, block_M, block_N, block_K, lower_stmt):
         # Lower high-level tile operations to low-level operations
         mod = tilelang.transform.LowerTileOp()(mod)
         texts = mod.script().split('\n')
-        texts = texts[29:]
+        texts = texts[29:-2]
         texts = [it.lstrip() for it in texts]
         for i in range(len(texts)):
             assert texts[i] == lower_stmt[i]
