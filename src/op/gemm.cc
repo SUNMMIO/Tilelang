@@ -527,6 +527,12 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   }
 
   if (gemm_inst == GemmInst::kSunmmioMMA) {
+    ICHECK(a_.scope() == "shared.asram")
+        << "Invalid scope of buffer " << a_ << " in SunmmioMMA.";
+    ICHECK(b_.scope() == "shared.wsram")
+        << "Invalid scope of buffer " << b_ << " in SunmmioMMA.";
+    ICHECK(c_.scope() == "shared.rsram")
+        << "Invalid scope of buffer " << c_ << " in SunmmioMMA.";
     Array<PrimExpr> args;
 
     {
@@ -912,12 +918,12 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
       ICHECK(0);
     }
   } else if (gemm_inst == GemmInst::kSunmmioMMA) {
-    ICHECK((((std::string)a_.scope()).compare(0, 6, "shared") == 0))
-        << "Sunmmio Gemm only supports A in shared scope, got " << a_.scope();
-    ICHECK((((std::string)b_.scope()).compare(0, 6, "shared") == 0))
-        << "Sunmmio Gemm only supports B in shared scope, got " << b_.scope();
-    ICHECK((((std::string)c_.scope()).compare(0, 6, "shared") == 0))
-        << "Sunmmio Gemm only supports C in shared scope, got " << c_.scope();
+    ICHECK(a_.scope() == "shared.asram")
+        << "Invalid scope of buffer " << a_ << " in SunmmioMMA.";
+    ICHECK(b_.scope() == "shared.wsram")
+        << "Invalid scope of buffer " << b_ << " in SunmmioMMA.";
+    ICHECK(c_.scope() == "shared.rsram")
+        << "Invalid scope of buffer " << c_ << " in SunmmioMMA.";
 
     const auto f =
         ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");

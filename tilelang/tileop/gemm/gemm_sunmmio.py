@@ -12,6 +12,9 @@ from tilelang.utils.language import retrieve_ptr
 class GemmSunmmio(GemmBase):
 
     def infer_layout(self, target: Target, thread_nums: int):
+        assert self.A.scope() == 'shared.asram'
+        assert self.B.scope() == 'shared.wsram'
+        assert self.C.scope() == 'shared.rsram'
         if self.is_gemm_sss():
             return {
                 self.A: make_blockwise_zz_layout(self.A),
@@ -24,6 +27,9 @@ class GemmSunmmio(GemmBase):
             )
 
     def lower(self, layout_map: dict, target: Target, thread_nums: int, thread_var: tir.Var):
+        assert self.A.scope() == 'shared.asram'
+        assert self.B.scope() == 'shared.wsram'
+        assert self.C.scope() == 'shared.rsram'
         if self.is_gemm_sss():
             args = []
 
