@@ -160,6 +160,10 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     if should_force_let_inline():
         # Force-let inline whenever the pass config requests it.
         mod = tilelang.transform.LetInline()(mod)
+    # read TileView metadata and attach them to Tiles loops.
+    mod = tilelang.transform.LegalizeTilesLoop()(mod)
+    # add two for loops for tile loops
+    mod = tilelang.transform.TilesLoop()(mod)
     # Add wrapper for single buf store
     mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
     # Normalize negative indices to canonical non-negative form
