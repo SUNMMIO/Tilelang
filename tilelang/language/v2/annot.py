@@ -938,10 +938,26 @@ class FuncAnnot:
         return FuncAnnot(sig, arg_names, annots, arg_parser, ker_arg_names)
 
     def get_metadata(self):
+        """Get metadata dict with values converted to TIR types for C++ FFI compatibility."""
+
+        def convert_to_tir(value):
+            """Convert Python values to TIR types recursively."""
+            if isinstance(value, int):
+                # Use int32 to match buffer shape dtype used in makeHierarchicalLayout
+                return tir.IntImm("int32", value)
+            elif isinstance(value, tuple):
+                return tuple(convert_to_tir(v) for v in value)
+            elif isinstance(value, list):
+                return [convert_to_tir(v) for v in value]
+            elif isinstance(value, dict):
+                return {k: convert_to_tir(v) for k, v in value.items()}
+            return value
+
         meta = {}
         for name, annot in self.annots.items():
             if isinstance(annot, TensorWithMetaAnnot):
-                meta[name] = annot.data.meta_data
+                # Convert the metadata to TIR types
+                meta[name] = convert_to_tir(annot.data.meta_data)
         return meta
 
     def parse_key(self, *args, **kws):

@@ -249,6 +249,10 @@ Layout makeHierarchicalLayout(Array<Integer> hdims_arr,
 namespace attr {
 // BlockAttr, Containing the layout for all the buffers in the block
 constexpr const char *kLayoutMap = "layout_map";
+// BlockAttr, Containing the layout for global (DRAM) buffers.
+// Separated from kLayoutMap so that inference/lowering passes do not
+// accidentally overwrite or transform these read-only metadata layouts.
+constexpr const char *kGlobalLayoutMap = "global_layout_map";
 } // namespace attr
 
 } // namespace tl
