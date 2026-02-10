@@ -34,6 +34,10 @@ class _LayoutMapCollector(PyStmtExprVisitor):
             for key, layout in layout_map.items():
                 # key is a Buffer, use its name as dict key
                 collected_layout_map[key.name] = layout
+        if "global_layout_map" in op.annotations:
+            global_layout_map = op.annotations["global_layout_map"]
+            for key, layout in global_layout_map.items():
+                collected_layout_map[key.name] = layout
 
 
 def CollectLayoutMap():

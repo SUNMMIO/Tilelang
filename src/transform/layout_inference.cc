@@ -63,6 +63,7 @@ struct LayoutInferenceResult {
   Map<Buffer, Layout> layout_map;
   Map<For, Fragment> for_map;
   Map<For, PrimExpr> predicate_map;
+  Map<Buffer, Layout> global_layout_map;
 };
 
 class BufferUseDefCollector : public IRVisitorWithAnalyzer {
@@ -110,10 +111,14 @@ public:
            "required for layout inference.";
 
     // Run InferLayout
-    auto updates =
-        next->InferLayout(LayoutInferArgs{target_, thread_bounds, layout_map,
-                                          cur_analyzer, buffer_oob},
-                          level);
+    auto updates = next->InferLayout(LayoutInferArgs{target_,
+                                                     thread_bounds,
+                                                     layout_map,
+                                                     cur_analyzer,
+                                                     buffer_oob,
+                                                     {},
+                                                     global_layout_map_},
+                                     level);
 
     // Process the returned updates
     for (const auto &[buffer, layout] : updates) {
@@ -400,7 +405,7 @@ public:
       }
     }
 
-    return {layout_map, for_map, predicate_map};
+    return {layout_map, for_map, predicate_map, global_layout_map_};
   }
 
   void Collect(const PrimFunc &f) {
@@ -418,8 +423,9 @@ public:
         << "Layout_Inference: Require the target attribute";
     target_ = target.value();
 
-    // Populate global buffer layouts from tensor_meta (Sunmmio only)
-    PopulateGlobalBufferLayouts(f, target_, &annotated_layout_map_);
+    // Populate global buffer layouts from tensor_meta (Sunmmio only).
+    // Stored separately so that inference does not overwrite them.
+    PopulateGlobalBufferLayouts(f, target_, &global_layout_map_);
 
     this->operator()(f->body);
   }
@@ -835,6 +841,7 @@ private:
   std::vector<bool> buffer_oob_vec_;
   Target target_;
   LayoutMap annotated_layout_map_;
+  LayoutMap global_layout_map_;
   bool skip_thread_partition_{false};
 
   std::vector<TileOperator> BackupInferList() {
@@ -1050,6 +1057,10 @@ private:
     }
     auto block_ptr = block.CopyOnWrite();
     block_ptr->annotations.Set(attr::kLayoutMap, result_.layout_map);
+    if (!result_.global_layout_map.empty()) {
+      block_ptr->annotations.Set(attr::kGlobalLayoutMap,
+                                 result_.global_layout_map);
+    }
     return block;
   }
 

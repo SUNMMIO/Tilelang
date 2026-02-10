@@ -39,6 +39,7 @@ struct LowerArgs {
   AddWorkspaceCallback AddWorkspace;
   LayoutMap layout_map;
   Map<Buffer, Buffer> buffer_remap;
+  LayoutMap global_layout_map;
 };
 
 struct LayoutInferArgs {
@@ -48,6 +49,7 @@ struct LayoutInferArgs {
   arith::Analyzer *analyzer;
   bool buffer_oob = false;
   Map<Buffer, Buffer> buffer_remap;
+  LayoutMap global_layout_map;
 };
 
 class TileOperator;
