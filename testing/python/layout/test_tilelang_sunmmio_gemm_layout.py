@@ -24,7 +24,7 @@ def matmul(M, N, K, block_M, block_N, block_K, version, dtype=T.float16, accum_d
     def main(
             A: T.Tensor((M, K), dtype),
             B: T.Tensor((K, N), dtype),
-            C: T.Tensor((M, N), dtype),
+            C: T.Tensor((M, N), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
@@ -106,6 +106,7 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, versio
     with tvm.target.Target(target):
         mod = matmul(M, N, K, block_M, block_N, block_K, version)
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl.transform.InferSramScope()(mod)
         mod = tl.transform.LayoutInference()(mod)
         LayoutVisual()(mod)
 
