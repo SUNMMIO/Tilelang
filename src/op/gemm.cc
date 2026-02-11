@@ -533,95 +533,15 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         << "Invalid scope of buffer " << b_ << " in SunmmioMMA.";
     ICHECK(c_.scope() == "shared.rsram")
         << "Invalid scope of buffer " << c_ << " in SunmmioMMA.";
-    Array<PrimExpr> args;
 
-    {
-      args.push_back(static_cast<int>(a_->shape.size()));
-      for (auto it : aRegion_->region) {
-        args.push_back(it->extent);
-      }
-      args.push_back(StringImm(tvm::runtime::DLDataTypeToString(a_->dtype)));
-
-      ICHECK(T.layout_map.count(a_))
-          << "Layout of buffer " << a_ << " not found.";
-      auto layout = T.layout_map.at(a_);
-      for (auto s : layout->InputShape()) {
-        args.push_back(s);
-      }
-      for (auto s : layout->GetForwardIndex()) {
-        args.push_back(s);
-      }
-      args.push_back(StringImm(a_.scope()));
-      for (auto it : aRegion_->region) {
-        args.push_back(it->min);
-      }
-      PrimExpr total_elements = 1;
-      for (auto e : a_->shape) {
-        total_elements *= e;
-      }
-      auto addr = a_.access_ptr(1, DataType::Handle(), 1, 0, total_elements);
-      args.push_back(addr);
-    }
-
-    {
-      args.push_back(static_cast<int>(b_->shape.size()));
-      for (auto it : bRegion_->region) {
-        args.push_back(it->extent);
-      }
-      args.push_back(StringImm(tvm::runtime::DLDataTypeToString(b_->dtype)));
-
-      ICHECK(T.layout_map.count(b_))
-          << "Layout of buffer " << b_ << " not found.";
-      auto layout = T.layout_map.at(b_);
-      for (auto s : layout->InputShape()) {
-        args.push_back(s);
-      }
-      for (auto s : layout->GetForwardIndex()) {
-        args.push_back(s);
-      }
-      args.push_back(StringImm(b_.scope()));
-      for (auto it : bRegion_->region) {
-        args.push_back(it->min);
-      }
-      PrimExpr total_elements = 1;
-      for (auto e : b_->shape) {
-        total_elements *= e;
-      }
-      auto addr = b_.access_ptr(1, DataType::Handle(), 1, 0, total_elements);
-      args.push_back(addr);
-    }
-
-    {
-      args.push_back(static_cast<int>(c_->shape.size()));
-      for (auto it : cRegion_->region) {
-        args.push_back(it->extent);
-      }
-      args.push_back(StringImm(tvm::runtime::DLDataTypeToString(c_->dtype)));
-
-      ICHECK(T.layout_map.count(c_))
-          << "Layout of buffer " << c_ << " not found.";
-      auto layout = T.layout_map.at(c_);
-      for (auto s : layout->InputShape()) {
-        args.push_back(s);
-      }
-      for (auto s : layout->GetForwardIndex()) {
-        args.push_back(s);
-      }
-      args.push_back(StringImm(c_.scope()));
-      for (auto it : cRegion_->region) {
-        args.push_back(it->min);
-      }
-      PrimExpr total_elements = 1;
-      for (auto e : c_->shape) {
-        total_elements *= e;
-      }
-      auto addr = c_.access_ptr(2, DataType::Handle(), 1, 0, total_elements);
-      args.push_back(addr);
-    }
-
-    args.push_back(Bool(transA_));
-    args.push_back(Bool(transB_));
-    args.push_back(clearAccum_);
+    PrimExpr A_region =
+        MakeRegionExpr(aRegion_->buffer, aRegion_->region, /*access_mask=*/1);
+    PrimExpr B_region =
+        MakeRegionExpr(bRegion_->buffer, bRegion_->region, /*access_mask=*/1);
+    PrimExpr C_region =
+        MakeRegionExpr(cRegion_->buffer, cRegion_->region, /*access_mask=*/3);
+    Array<PrimExpr> args = {A_region,      B_region,      C_region,
+                            Bool(transA_), Bool(transB_), clearAccum_};
 
     auto op = mma_sunmmio();
     Stmt mma_sunmmio;

@@ -205,77 +205,14 @@ TVM_DLL const Op &dma_copy();
 /*!
  * \brief tvm intrinsic for mma operation of Sunmmio target.
  *
- *  \param A_rank
- *    Rank (number of dimensions) of A operand
+ *  \param A_region
+ *    A tl.tileop.region PrimExpr describing A.
  *
- *  \param A_region_shape
- *    Region shape of A operand
+ *  \param B_region
+ *    A tl.tileop.region PrimExpr describing B.
  *
- *  \param A_dtype
- *    Dtype of A operand
- *
- *  \param A_input_size
- *    Input_shape and of A operand. Input_size + forward = layout.
- *
- *  \param A_forward
- *    Forward of A operand. Input_size + forward = layout.
- *
- *  \param A_scope
- *    Scope of A operand.
- *
- *  \param A_coord
- *    Coord of A operand.
- *
- *  \param A_addr
- *    Addr of A operand.
- *
- *  \param B_rank
- *    Rank (number of dimensions) of B operand
- *
- *  \param B_region_shape
- *    Region shape of B operand
- *
- *  \param B_dtype
- *    Dtype of B operand
- *
- *  \param B_input_size
- *    Input_shape and of B operand. Input_size + forward = layout.
- *
- *  \param B_forward
- *    Forward of B operand. Input_size + forward = layout.
- *
- *  \param B_scope
- *    Scope of B operand.
- *
- *  \param B_coord
- *    Coord of B operand.
- *
- *  \param B_addr
- *    Addr of B operand.
- *
- *  \param C_rank
- *    Rank (number of dimensions) of C operand
- *
- *  \param C_region_shape
- *    Region shape of C operand
- *
- *  \param C_dtype
- *    Dtype of C operand
- *
- *  \param C_input_size
- *    Input_shape and of C operand. Input_size + forward = layout.
- *
- *  \param C_forward
- *    Forward of C operand. Input_size + forward = layout.
- *
- *  \param C_scope
- *    Scope of C operand.
- *
- *  \param C_coord
- *    Coord of C operand.
- *
- *  \param C_addr
- *    Addr of C operand.
+ *  \param C_region
+ *    A tl.tileop.region PrimExpr describing C.
  *
  *  \param trans_A
  *    Whether to transpose A operand.

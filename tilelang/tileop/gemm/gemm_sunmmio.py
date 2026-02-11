@@ -6,7 +6,10 @@ from tvm.target import Target
 from tvm import tir
 from tilelang.transform.simplify import _Simplify
 from tilelang import language as T
-from tilelang.utils.language import retrieve_ptr
+from tilelang.utils.language import (
+    retrieve_shape,)
+from tilelang.language.utils import (
+    buffer_region_to_tile_region,)
 
 
 class GemmSunmmio(GemmBase):
@@ -31,33 +34,14 @@ class GemmSunmmio(GemmBase):
         assert self.B.scope() == 'shared.wsram'
         assert self.C.scope() == 'shared.rsram'
         if self.is_gemm_sss():
-            args = []
+            A_shape = retrieve_shape(self.ARegion)
+            B_shape = retrieve_shape(self.BRegion)
+            C_shape = retrieve_shape(self.CRegion)
+            A_arg = buffer_region_to_tile_region(self.ARegion, "r", [r for r in A_shape])
+            B_arg = buffer_region_to_tile_region(self.BRegion, "r", [r for r in B_shape])
+            C_arg = buffer_region_to_tile_region(self.CRegion, "rw", [r for r in C_shape])
 
-            def add_info(args, region):
-                args.append(len(region.buffer.shape))
-                for it in region.region:
-                    args.append(it.extent)
-                args.append(region.buffer.dtype)
-                layout = layout_map[region.buffer]
-                for it in layout.input_size:
-                    args.append(it)
-                for it in layout.forward_index:
-                    args.append(it)
-                args.append(region.buffer.scope())
-                for it in region.region:
-                    args.append(it.min)
-                if region != self.CRegion:
-                    args.append(retrieve_ptr(region.buffer, access_type="r"))
-                else:
-                    args.append(retrieve_ptr(region.buffer, access_type="w"))
-
-            add_info(args, self.ARegion)
-            add_info(args, self.BRegion)
-            add_info(args, self.CRegion)
-
-            args.append(self.trans_A)
-            args.append(self.trans_B)
-            args.append(self.clear_accum)
+            args = [A_arg, B_arg, C_arg, self.trans_A, self.trans_B, self.clear_accum]
 
             @T.prim_func
             def _gemm_sss() -> None:

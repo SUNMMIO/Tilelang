@@ -12,7 +12,7 @@ def layout_func(i, j, continuous):
     return (i // 32 * (continuous // 32) + j // 32) * 32 * 32 + i % 32 * 32 + j % 32
 
 
-def matmul(M, N, K, block_M, block_N, block_K, version, dtype=T.float16, accum_dtype=T.float32):
+def matmul(M, N, K, block_M, block_N, block_K, version, dtype=T.float16, accum_dtype=T.float16):
 
     @T.prim_func
     def main(
@@ -52,8 +52,8 @@ def matmul(M, N, K, block_M, block_N, block_K, version, dtype=T.float16, accum_d
 
 
 stmts = [
-    "T.mma_sunmmio(2, 8, 16, \"float16\", 32, 32, _i * 32 + _j, \"shared.asram\", 0, 16, T.tvm_access_ptr(T.type_annotation(\"float16\"), A_shared.data, 0, 1024, 1), 2, 16, 8, \"float16\", 32, 32, _i * 32 + _j, \"shared.wsram\", 0, 8, T.tvm_access_ptr(T.type_annotation(\"float16\"), B_shared.data, 0, 1024, 1), 2, 16, 16, \"float32\", 32, 32, _i * 32 + _j, \"shared.rsram\", 8, 16, T.tvm_access_ptr(T.type_annotation(\"float32\"), C_shared.data, 0, 1024, 2), T.bool(True), T.bool(True), T.bool(False))",
-    "T.mma_sunmmio(2, 8, 16, \"float16\", 64, 64, _i // 32 * 2048 + _j // 32 * 1024 + _i % 32 * 32 + _j % 32, \"shared.asram\", 0, 16, T.tvm_access_ptr(T.type_annotation(\"float16\"), A_shared.data, 0, 4096, 1), 2, 16, 8, \"float16\", 64, 32, _i * 32 + _j, \"shared.wsram\", 0, 8, T.tvm_access_ptr(T.type_annotation(\"float16\"), B_shared.data, 0, 2048, 1), 2, 16, 16, \"float32\", 64, 32, _i * 32 + _j, \"shared.rsram\", 8, 16, T.tvm_access_ptr(T.type_annotation(\"float32\"), C_shared.data, 0, 2048, 2), T.bool(True), T.bool(True), T.bool(False))"
+    "T.mma_sunmmio(T.region(A_shared[0, 16], 1, 8, 16), T.region(B_shared[0, 8], 1, 16, 8), T.region(C_shared[8, 16], 3, 16, 16), T.bool(True), T.bool(True), T.bool(False))",
+    "T.mma_sunmmio(T.region(A_shared[0, 16], 1, 8, 16), T.region(B_shared[0, 8], 1, 16, 8), T.region(C_shared[8, 16], 3, 16, 16), T.bool(True), T.bool(True), T.bool(False))"
 ]
 TEST_CASES = [
     # gemm v1
@@ -79,5 +79,5 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, versio
         mod = tl.transform.LayoutInference()(mod)
         mod = tl.transform.LowerTileOp()(mod)
         texts = mod.script().split('\n')
-        text = texts[-6].lstrip()
+        text = texts[-2].lstrip()
         assert text == lower_stmt
