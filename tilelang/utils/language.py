@@ -54,10 +54,7 @@ def is_shared(buffer: Buffer | BufferLoad | BufferRegion, allow_dynamic: bool = 
     """
     buffer = _get_buffer(buffer)
     conditions = [False]
-    conditions.append(buffer.scope() == "shared")
-    conditions.append(buffer.scope() == "shared.asram")
-    conditions.append(buffer.scope() == "shared.wsram")
-    conditions.append(buffer.scope() == "shared.rsram")
+    conditions.append(buffer.scope().startswith("shared"))
     if allow_dynamic:
         conditions.append(is_shared_dynamic(buffer))
     return any(conditions)
@@ -74,7 +71,7 @@ def is_shared_dynamic(buffer: Buffer | BufferLoad | BufferRegion) -> bool:
         bool: True if the buffer is in dynamic shared memory, False otherwise.
     """
     buffer = _get_buffer(buffer)
-    return buffer.scope() == "shared.dyn"
+    return buffer.scope().startswith("shared") and buffer.scope().endswith(".dyn")
 
 
 def is_tensor_memory(buffer: Buffer | BufferLoad | BufferRegion) -> bool:

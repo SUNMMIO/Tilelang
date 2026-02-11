@@ -189,95 +189,18 @@ TVM_DLL const Op &get_mbarrier();
 TVM_DLL const Op &tma_load();
 
 /*!
- * \brief Perform a DMA load operation from source memory to destination memory.
+ * \brief Perform a DMA copy operation preserving full buffer region semantics.
  *
- * This function describes a DMA-based tensor copy with explicit shape, layout,
- * memory scope. It is typically used to lower a high-level
- * tensor copy into a hardware-specific DMA instruction.
+ * This intrinsic encodes a high-level copy between two buffer regions as
+ * tl.dma_copy(src_region, dst_region), where each argument is a
+ * tl.tileop.region Call carrying the buffer, access mask, and per-axis
+ * extents. It is emitted by the SUNMMIO lowering path of CopyNode and
+ * consumed by later target-specific codegen passes.
  *
- * The source and destination tensors are described in terms of:
- * - data type
- * - rank and logical shape
- * - layout (input shape + forward index), The T.Layout type is ObjectRef,
- * which is not suitable for backend parsing, so it's two members are extracted:
- * input shape and forward index, which are both Array<PrimExpr>
- * - memory scope
- *
- * A sub-region of the source tensor can be copied by specifying the coordinate
- * offset (`coord`) relative to the source base address.
- *
- * Example:
- * For a 3D tensor A: Tensor(128, 256, 512), copying
- *   A[32:64, 128:192, 0:256]
- * then:
- *   src_rank = 3
- *   src_shape = [128, 256, 512]
- *   coord = [32, 128, 0]
- *
- * \param data_type
- *   Element data type of the tensor (e.g. float32, float16).
- *
- * \param src_rank
- *   Rank (number of dimensions) of the source tensor.
- *
- * \param src_shape
- *   Logical shape of the source tensor.
- *   For example, Tensor(128, 256, 512) -> [128, 256, 512].
- *
- * \param src_input_size
- *   Input shape of the source layout, retrievable via Layout::getInputShape().
- *   For a row-major 3D tensor, this is identical to src_shape.
- *
- * \param src_forward
- *   Forward index mapping of the source layout, retrievable via
- *   Layout::GetForwardIndex().
- *   For a row-major layout of Tensor(128, 256, 512),
- *   this is [256 * 512, 512, 1].
- *
- * \param src_scope
- *   Memory scope of the source tensor.
- *   Examples: "global", "shared.asram", "shared.wsram", "shared.rsram".
- *
- * \param dst_rank
- *   Rank (number of dimensions) of the destination tensor.
- *
- * \param dst_shape
- *   Logical shape of the destination tensor.
- *
- * \param dst_input_size
- *   Input shape of the destination layout, retrievable via
- * Layout::getInputShape().
- *
- * \param dst_forward
- *   Forward index mapping of the destination layout, retrievable via
- *   Layout::GetForwardIndex().
- *
- * \param dst_scope
- *   Memory scope of the destination tensor.
- *   Examples: "global", "shared.asram", "shared.wsram", "shared.rsram".
- *
- * \param src_addr
- *   Base address of the source tensor in memory .
- *
- * \param coord
- *   Coordinate offset specifying the starting point of the copy in the source
- * tensor. Its length must equal src_rank.
- *
- * \param dst_addr
- *   Base address of the destination tensor in memory .
- *
- * \note
- *   Out-of-bound fill policies are currently not supported.
+ * \param src_region  A tl.tileop.region PrimExpr describing the source.
+ * \param dst_region  A tl.tileop.region PrimExpr describing the destination.
  */
-TVM_DLL const Op &dma_load();
-
-/*!
- * \brief Perform a DMA store operation from source memory to destination
- * memory. see dma_load for details.
- *
- *
- */
-TVM_DLL const Op &dma_store();
+TVM_DLL const Op &dma_copy();
 
 /*!
  * \brief tvm intrinsic for mma operation of Sunmmio target.
