@@ -18,7 +18,6 @@
 #include "../op/gemm.h"
 #include "../op/gemm_sp.h"
 #include "../op/operator.h"
-#include "../op/utils.h"
 #include "../target/utils.h"
 #include "common/remap_buffer_rewriter.h"
 
@@ -167,8 +166,10 @@ private:
                             .as<Map<Buffer, Layout>>()
                             .value();
       for (auto [buffer, layout] : layout_map) {
-        buffer_remap_.Set(buffer,
-                          makeBufferWithLayout(buffer, layout, var_remap_));
+        if (!TargetIsSunmmio(target_)) {
+          buffer_remap_.Set(buffer,
+                            makeBufferWithLayout(buffer, layout, var_remap_));
+        }
         layout_map_.Set(buffer, layout);
       }
     }

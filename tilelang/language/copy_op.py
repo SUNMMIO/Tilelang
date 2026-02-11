@@ -65,6 +65,7 @@ def copy(
     dst_extent = get_extent(dst)
     # Combine the nested if statements into a single if statement as suggested by SIM102
     if src_extent is None and dst_extent is None and isinstance(src, tir.BufferLoad) and isinstance(dst, tir.BufferLoad):
+        # FIXME(sunmmio): For Sunmmio an invalid D<->D copy operation will enter here
         # check if the case is like this:
         # copy(buffer_a[i], buffer_b[i]) where both are BufferLoad nodes
         # In this case, lower it to a simple BufferStore: buffer_b[i] = buffer_a[i]

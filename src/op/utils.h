@@ -35,6 +35,13 @@ TVM_DLL bool IsBufferLikeExpr(const PrimExpr &expr);
 // Note: tvm_access_ptr is no longer supported here.
 TVM_DLL BufferRegion NormalizeToBufferRegion(const PrimExpr &arg);
 
+// Build a tl.tileop.region Call from a Buffer + Array<Range>.
+// This is the inverse of NormalizeToBufferRegion: it packages buffer, access
+// mask, and per-axis extents into a Call(RegionOp::Get(), ...) that can be
+// passed as an argument to builtins like dma_copy.
+TVM_DLL PrimExpr MakeRegionExpr(const Buffer &buffer,
+                                const Array<Range> &ranges, int access_mask);
+
 // Build a tvm_access_ptr(handle) from a BufferRegion.
 // - If `require_2d` is true, checks buffer ndim >= 2.
 // - For 1D regions (when allowed), offset=min, extent=extent.

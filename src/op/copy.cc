@@ -449,6 +449,28 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
     return result_map;
   }
 
+  // Sunmmio DMA Layout Inference
+  if (copy_inst == CopyInst::kSunmmioDMACopy) {
+    const auto f =
+        ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
+    auto result = Map<Buffer, Layout>();
+
+    if (level == InferLevel::kFree && !T.layout_map.count(src)) {
+      if (src.scope() != "global") {
+        auto layout = Downcast<Layout>((*f)(src));
+        result.Set(src, layout);
+      }
+    }
+
+    if (level == InferLevel::kFree && !T.layout_map.count(dst)) {
+      if (dst.scope() != "global") {
+        auto layout = Downcast<Layout>((*f)(dst));
+        result.Set(dst, layout);
+      }
+    }
+    return result;
+  }
+
   // for LDSM/STSM, the layout was deduced from register layout
   // so we can directly apply the layout of normal copy
   // Use parallel op to infer the layout
@@ -636,9 +658,38 @@ bool CopyNode::CheckTMemStore(Target target) const {
          dst.scope() == "shared.tmem";
 }
 
+bool CopyNode::CheckSunmmioDMACopy(Target target) const {
+  if (!TargetIsSunmmio(target))
+    return false;
+
+  bool scope_check = false;
+  if (src.scope() == "global" && dst.scope() == "shared.rsram")
+    scope_check = true;
+  if (src.scope() == "global" && dst.scope() == "shared.wsram")
+    scope_check = true;
+  if (src.scope() == "global" && dst.scope() == "shared.asram")
+    scope_check = true;
+  if (src.scope() == "shared.rsram" && dst.scope() == "shared.wsram")
+    scope_check = true;
+  if (src.scope() == "shared.rsram" && dst.scope() == "shared.asram")
+    scope_check = true;
+  if (src.scope() == "shared.rsram" && dst.scope() == "shared.rsram")
+    scope_check = true;
+  if (src.scope() == "shared.rsram" && dst.scope() == "global")
+    scope_check = true;
+  if (!scope_check)
+    return false;
+
+  if (src->dtype != dst->dtype) {
+    LOG(WARNING) << "src and dst must have the same dtype for dma copy "
+                 << src->name << " vs. " << dst->name << " dtype " << src->dtype
+                 << " vs. " << dst->dtype << " will be fallback to normal copy";
+    return false;
+  }
+  return true;
+}
+
 // Selects the most specific copy instruction for the given target and buffers.
-// Priority: BulkLoad1D, BulkStore1D, BulkLoad, BulkStore, LDSM, STSM, TMemLoad,
-// TMemStore, Normal.
 CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
                                const LayoutMap &layout_map,
                                arith::Analyzer *analyzer,
@@ -667,13 +718,18 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
     return CopyInst::kTMemLoad;
   } else if (CheckTMemStore(target)) {
     return CopyInst::kTMemStore;
+  } else if (TargetIsSunmmio(target)) {
+    auto is_copy = CheckSunmmioDMACopy(target);
+    if (is_copy)
+      return CopyInst::kSunmmioDMACopy;
+    ICHECK(0) << "Unsupported copy from " << src.scope() << " to "
+              << dst.scope() << " of Sunmmio target.";
   } else {
     return CopyInst::kNormal;
   }
 }
 
-// Lowers the copy operation to PTX code by dispatching to specialized lowering
-// functions.
+// Lowers the copy operation by dispatching to specialized lowering functions.
 Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   Target target = T.target;
 
@@ -703,9 +759,21 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     return ldsm_copy;
   } else if (copy_inst == CopyInst::kNormal) {
     return LowerNormalCopy(T, analyzer);
+  } else if (copy_inst == CopyInst::kSunmmioDMACopy) {
+    auto dma_copy = LowerSunmmioDmaCopy(T, analyzer);
+    ICHECK(dma_copy.defined()) << "Failed to lower dma copy";
+    return dma_copy;
   } else {
     LOG(FATAL) << "Unsupported copy inst " << static_cast<int>(copy_inst);
   }
+}
+
+Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
+                                   arith::Analyzer *analyzer) const {
+  PrimExpr src_region = MakeRegionExpr(src, src_range, /*access_mask=*/1);
+  PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
+  return Evaluate(
+      Call(DataType::Handle(), dma_copy(), {src_region, dst_region}));
 }
 
 // Lowers the copy using standard load/store with loop transformations.

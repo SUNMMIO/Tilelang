@@ -63,6 +63,47 @@ BufferRegion NormalizeToBufferRegion(const PrimExpr &arg) {
   throw; // Unreachable
 }
 
+/*!
+ * \brief Encode a Buffer + Array<Range> into a tl.tileop.region Call
+ * expression.
+ *
+ * This is the inverse of NormalizeToBufferRegion: it packs buffer region
+ * metadata into a PrimExpr so it can travel through Call arguments (where
+ * BufferRegion cannot appear directly).
+ *
+ * Use this when emitting intrinsic calls (e.g. tl.dma_copy) that need to
+ * carry full region semantics — buffer identity, per-axis min/extent, and
+ * access mode — as opaque PrimExpr arguments for later codegen consumption.
+ *
+ * Encoding layout:
+ *   args[0] = BufferLoad(buffer, {range[0].min, range[1].min, ...})
+ *   args[1] = access_mask  (1=read, 2=write, 3=read-write)
+ *   args[2+i] = range[i].extent
+ *
+ * \param buffer      The buffer this region refers to.
+ * \param ranges      Per-axis [min, extent) ranges describing the tile.
+ * \param access_mask 1=read, 2=write, 3=read-write.
+ * \return A Call(tl.tileop.region, ...) expression.
+ */
+PrimExpr MakeRegionExpr(const Buffer &buffer, const Array<Range> &ranges,
+                        int access_mask) {
+  // Build BufferLoad with indices = per-axis minima
+  Array<PrimExpr> indices;
+  for (const auto &r : ranges) {
+    indices.push_back(r->min);
+  }
+  BufferLoad load(buffer, indices);
+
+  // Pack args: [load, access_mask, extent_0, extent_1, ...]
+  Array<PrimExpr> args;
+  args.push_back(load);
+  args.push_back(IntImm(DataType::Int(32), access_mask));
+  for (const auto &r : ranges) {
+    args.push_back(r->extent);
+  }
+  return Call(DataType::Handle(), RegionOp::Get(), args);
+}
+
 PrimExpr MakeAccessPtrFromRegion(const BufferRegion &region, int rw_mask,
                                  bool require_2d) {
   Buffer buf = region->buffer;
