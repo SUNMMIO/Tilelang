@@ -12,13 +12,13 @@ def layout_func(i, j, continuous):
     return (i // 32 * (continuous // 32) + j // 32) * 32 * 32 + i % 32 * 32 + j % 32
 
 
-def matmul(M, N, K, block_M, block_N, block_K, version, dtype=T.float16, accum_dtype=T.float16):
+def matmul(M, N, K, block_M, block_N, block_K, version, dtype=T.float16, accum_dtype=T.float32):
 
     @T.prim_func
     def main(
             A: T.Tensor((M, K), dtype),
             B: T.Tensor((K, N), dtype),
-            C: T.Tensor((M, N), dtype),
+            C: T.Tensor((M, N), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
