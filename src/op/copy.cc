@@ -949,7 +949,7 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
  * determined copy instruction type:
  * - Bulk Load/Store: Uses Tensor Memory Accelerator (TMA) instructions
  * - LDSM/STSM: Uses matrix load/store instructions for tensor cores
- * - DMA Load/Store: Sunmmio specified instructions for copy
+ * - DMA copy: Sunmmio specified instructions for copy
  * - Normal: Uses standard load/store operations with loop transformations
  * \param T LowerArgs containing target and layout map.
  * \param analyzer Arithmetic analyzer for simplification.
