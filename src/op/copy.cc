@@ -958,11 +958,6 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
 Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   Target target = T.target;
 
-  // SUNMMIO: emit a dma_copy intrinsic instead of GPU-style lowering
-  if (TargetIsSunmmio(target)) {
-    return LowerSunmmioDmaCopy(T, analyzer);
-  }
-
   using namespace tvm::transform;
   PassContext pass_ctx = PassContext::Current();
   bool disable_tma_lower =
