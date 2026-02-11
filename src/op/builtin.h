@@ -280,6 +280,20 @@ TVM_DLL const Op &dma_load();
 TVM_DLL const Op &dma_store();
 
 /*!
+ * \brief Perform a DMA copy operation preserving full buffer region semantics.
+ *
+ * This intrinsic encodes a high-level copy between two buffer regions as
+ * tl.dma_copy(src_region, dst_region), where each argument is a
+ * tl.tileop.region Call carrying the buffer, access mask, and per-axis
+ * extents. It is emitted by the SUNMMIO lowering path of CopyNode and
+ * consumed by later target-specific codegen passes.
+ *
+ * \param src_region  A tl.tileop.region PrimExpr describing the source.
+ * \param dst_region  A tl.tileop.region PrimExpr describing the destination.
+ */
+TVM_DLL const Op &dma_copy();
+
+/*!
  * \brief tvm intrinsics for loading image from global tensor to columns in
  * shared memory
  *

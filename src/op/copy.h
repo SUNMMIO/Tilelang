@@ -218,6 +218,14 @@ protected:
   Stmt LowerNormalCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
 
   /*!
+   * \brief Generate lowering for SUNMMIO DMA copy.
+   *
+   * Emits a tl.dma_copy(src_region, dst_region) intrinsic that preserves full
+   * buffer region semantics for later SUNMMIO codegen consumption.
+   */
+  Stmt LowerDmaCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
+
+  /*!
    * \brief Generate SIMT (thread-level) loop for copying.
    */
   For MakeSIMTLoop(arith::Analyzer *analyzer) const;

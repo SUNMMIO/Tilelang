@@ -868,6 +868,11 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
 Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   Target target = T.target;
 
+  // SUNMMIO: emit a dma_copy intrinsic instead of GPU-style lowering
+  if (TargetIsSunmmio(target)) {
+    return LowerDmaCopy(T, analyzer);
+  }
+
   using namespace tvm::transform;
   PassContext pass_ctx = PassContext::Current();
   bool disable_tma_lower =
@@ -897,6 +902,28 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   } else {
     LOG(FATAL) << "Unsupported copy inst " << static_cast<int>(copy_inst);
   }
+}
+
+/**
+ * @brief Lower the copy operator for the SUNMMIO target.
+ *
+ * Emits a `tl.dma_copy(src_region, dst_region)` intrinsic call that preserves
+ * full buffer region semantics (buffer identity, per-axis min/extent, and
+ * memory scope). This intrinsic is consumed by later SUNMMIO-specific codegen
+ * passes to generate actual DMA instructions.
+ *
+ * @param T Lowering context (target, layout map, etc.).
+ * @param analyzer Arithmetic analyzer (unused here but kept for interface
+ *                 consistency).
+ * @return Stmt An Evaluate wrapping the tl.dma_copy Call.
+ */
+Stmt CopyNode::LowerDmaCopy(const LowerArgs &T,
+                            arith::Analyzer *analyzer) const {
+  // access_mask: 1=read for src, 2=write for dst
+  PrimExpr src_region = MakeRegionExpr(src, src_range, /*access_mask=*/1);
+  PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
+  return Evaluate(
+      Call(DataType::Handle(), dma_copy(), {src_region, dst_region}));
 }
 
 /**

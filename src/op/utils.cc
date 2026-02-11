@@ -52,6 +52,25 @@ BufferRegion NormalizeToBufferRegion(const PrimExpr &arg) {
   throw; // Unreachable
 }
 
+PrimExpr MakeRegionExpr(const Buffer &buffer, const Array<Range> &ranges,
+                        int access_mask) {
+  // Build BufferLoad with indices = per-axis minima
+  Array<PrimExpr> indices;
+  for (const auto &r : ranges) {
+    indices.push_back(r->min);
+  }
+  BufferLoad load(buffer, indices);
+
+  // Pack args: [load, access_mask, extent_0, extent_1, ...]
+  Array<PrimExpr> args;
+  args.push_back(load);
+  args.push_back(IntImm(DataType::Int(32), access_mask));
+  for (const auto &r : ranges) {
+    args.push_back(r->extent);
+  }
+  return Call(DataType::Handle(), RegionOp::Get(), args);
+}
+
 PrimExpr MakeAccessPtrFromRegion(const BufferRegion &region, int rw_mask,
                                  bool require_2d) {
   Buffer buf = region->buffer;
