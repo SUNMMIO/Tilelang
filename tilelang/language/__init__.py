@@ -50,6 +50,7 @@ from .allocate import (
     alloc_var,  # noqa: F401
     alloc_local,  # noqa: F401
     alloc_shared,  # noqa: F401
+    alloc_shared_with_tileview,  # noqa: F401
     alloc_fragment,  # noqa: F401
     alloc_barrier,  # noqa: F401
     alloc_tmem,  # noqa: F401
