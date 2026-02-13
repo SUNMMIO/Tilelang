@@ -1,6 +1,5 @@
 from .gemm_base import GemmBase
 from tilelang.layout import make_blockwise_zz_layout
-from tilelang.utils.language import is_shared
 from tilelang import tvm as tvm
 from tvm.target import Target
 from tvm import tir
@@ -15,10 +14,7 @@ from tilelang.language.utils import (
 class GemmSunmmio(GemmBase):
 
     def infer_layout(self, target: Target, thread_nums: int):
-        assert self.A.scope() == 'shared.asram'
-        assert self.B.scope() == 'shared.wsram'
-        assert self.C.scope() == 'shared.rsram'
-        if self.is_gemm_sss():
+        if self.is_gemm_sunmmio_scope():
             return {
                 self.A: make_blockwise_zz_layout(self.A),
                 self.B: make_blockwise_zz_layout(self.B),
@@ -26,14 +22,12 @@ class GemmSunmmio(GemmBase):
             }
         else:
             raise ValueError(
-                f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}"
+                f"Unsupported gemm combination of Sunmmio, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}"
             )
 
     def lower(self, layout_map: dict, target: Target, thread_nums: int, thread_var: tir.Var):
-        assert self.A.scope() == 'shared.asram'
-        assert self.B.scope() == 'shared.wsram'
-        assert self.C.scope() == 'shared.rsram'
-        if self.is_gemm_sss():
+
+        if self.is_gemm_sunmmio_scope():
             A_shape = retrieve_shape(self.ARegion)
             B_shape = retrieve_shape(self.BRegion)
             C_shape = retrieve_shape(self.CRegion)
@@ -55,8 +49,11 @@ class GemmSunmmio(GemmBase):
 
         else:
             raise ValueError(
-                f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}"
+                f"Unsupported gemm combination of Sunmmio, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}"
             )
 
-    def is_gemm_sss(self) -> bool:
-        return is_shared(self.A) and is_shared(self.B) and is_shared(self.C)
+    def is_gemm_sunmmio_scope(self) -> bool:
+        a_check = self.A.scope() == 'shared.asram'
+        b_check = self.B.scope() == 'shared.wsram'
+        c_check = self.C.scope() == 'shared.rsram'
+        return a_check and b_check and c_check

@@ -443,6 +443,31 @@ static int GetArchInt(Target target) {
 Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   auto block_size = *as_const_int(T.thread_bounds->extent);
   GemmInst gemm_inst = getGemmInst(block_size, T.target);
+
+  if (gemm_inst == GemmInst::kSunmmioMMA) {
+    ICHECK(a_.scope() == "shared.asram")
+        << "Invalid scope of buffer " << a_ << " in SunmmioMMA.";
+    ICHECK(b_.scope() == "shared.wsram")
+        << "Invalid scope of buffer " << b_ << " in SunmmioMMA.";
+    ICHECK(c_.scope() == "shared.rsram")
+        << "Invalid scope of buffer " << c_ << " in SunmmioMMA.";
+
+    PrimExpr A_region =
+        MakeRegionExpr(aRegion_->buffer, aRegion_->region, /*access_mask=*/1);
+    PrimExpr B_region =
+        MakeRegionExpr(bRegion_->buffer, bRegion_->region, /*access_mask=*/1);
+    PrimExpr C_region =
+        MakeRegionExpr(cRegion_->buffer, cRegion_->region, /*access_mask=*/3);
+    Array<PrimExpr> args = {A_region,      B_region,      C_region,
+                            Bool(transA_), Bool(transB_), clearAccum_};
+
+    auto op = mma_sunmmio();
+    Stmt mma_sunmmio;
+    mma_sunmmio = Evaluate(Call(DataType::Handle(), op, args));
+
+    return mma_sunmmio;
+  }
+
   auto [warp_m, warp_n] =
       policy_->computeWarpPartition(m_, n_, block_size, T.target, gemm_inst);
 
@@ -524,30 +549,6 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
                      Evaluate(new_call));
       return tcgen5mma_call;
     }
-  }
-
-  if (gemm_inst == GemmInst::kSunmmioMMA) {
-    ICHECK(a_.scope() == "shared.asram")
-        << "Invalid scope of buffer " << a_ << " in SunmmioMMA.";
-    ICHECK(b_.scope() == "shared.wsram")
-        << "Invalid scope of buffer " << b_ << " in SunmmioMMA.";
-    ICHECK(c_.scope() == "shared.rsram")
-        << "Invalid scope of buffer " << c_ << " in SunmmioMMA.";
-
-    PrimExpr A_region =
-        MakeRegionExpr(aRegion_->buffer, aRegion_->region, /*access_mask=*/1);
-    PrimExpr B_region =
-        MakeRegionExpr(bRegion_->buffer, bRegion_->region, /*access_mask=*/1);
-    PrimExpr C_region =
-        MakeRegionExpr(cRegion_->buffer, cRegion_->region, /*access_mask=*/3);
-    Array<PrimExpr> args = {A_region,      B_region,      C_region,
-                            Bool(transA_), Bool(transB_), clearAccum_};
-
-    auto op = mma_sunmmio();
-    Stmt mma_sunmmio;
-    mma_sunmmio = Evaluate(Call(DataType::Handle(), op, args));
-
-    return mma_sunmmio;
   }
 
   if (a_.scope() == "local.fragment") {
