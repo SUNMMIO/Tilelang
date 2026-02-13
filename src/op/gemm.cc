@@ -148,6 +148,10 @@ std::pair<int, int> GemmWarpPolicyNode::computeWarpPartition(
     return {1, num_warps}; // TCGEN5MMA doesn't care about warp partitioning
   }
 
+  if (gemm_inst == GemmInst::kSunmmioMMA) {
+    return {1, num_warps}; // kSunmmioMMA doesn't care about warp partitioning
+  }
+
   int m_warp = 1, n_warp = 1;
   constexpr int kMPerWarp = 16; // Rows processed by a single warp
   int kNPerWarp = 8;            // Columns processed by a single warp
@@ -439,6 +443,31 @@ static int GetArchInt(Target target) {
 Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   auto block_size = *as_const_int(T.thread_bounds->extent);
   GemmInst gemm_inst = getGemmInst(block_size, T.target);
+
+  if (gemm_inst == GemmInst::kSunmmioMMA) {
+    ICHECK(a_.scope() == "shared.asram")
+        << "Invalid scope of buffer " << a_ << " in SunmmioMMA.";
+    ICHECK(b_.scope() == "shared.wsram")
+        << "Invalid scope of buffer " << b_ << " in SunmmioMMA.";
+    ICHECK(c_.scope() == "shared.rsram")
+        << "Invalid scope of buffer " << c_ << " in SunmmioMMA.";
+
+    PrimExpr A_region =
+        MakeRegionExpr(aRegion_->buffer, aRegion_->region, /*access_mask=*/1);
+    PrimExpr B_region =
+        MakeRegionExpr(bRegion_->buffer, bRegion_->region, /*access_mask=*/1);
+    PrimExpr C_region =
+        MakeRegionExpr(cRegion_->buffer, cRegion_->region, /*access_mask=*/3);
+    Array<PrimExpr> args = {A_region,      B_region,      C_region,
+                            Bool(transA_), Bool(transB_), clearAccum_};
+
+    auto op = mma_sunmmio();
+    Stmt mma_sunmmio;
+    mma_sunmmio = Evaluate(Call(DataType::Handle(), op, args));
+
+    return mma_sunmmio;
+  }
+
   auto [warp_m, warp_n] =
       policy_->computeWarpPartition(m_, n_, block_size, T.target, gemm_inst);
 
@@ -809,12 +838,12 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
       ICHECK(0);
     }
   } else if (gemm_inst == GemmInst::kSunmmioMMA) {
-    ICHECK((((std::string)a_.scope()).compare(0, 6, "shared") == 0))
-        << "Sunmmio Gemm only supports A in shared scope, got " << a_.scope();
-    ICHECK((((std::string)b_.scope()).compare(0, 6, "shared") == 0))
-        << "Sunmmio Gemm only supports B in shared scope, got " << b_.scope();
-    ICHECK((((std::string)c_.scope()).compare(0, 6, "shared") == 0))
-        << "Sunmmio Gemm only supports C in shared scope, got " << c_.scope();
+    ICHECK(a_.scope() == "shared.asram")
+        << "Invalid scope of buffer " << a_ << " in SunmmioMMA.";
+    ICHECK(b_.scope() == "shared.wsram")
+        << "Invalid scope of buffer " << b_ << " in SunmmioMMA.";
+    ICHECK(c_.scope() == "shared.rsram")
+        << "Invalid scope of buffer " << c_ << " in SunmmioMMA.";
 
     const auto f =
         ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");

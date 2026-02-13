@@ -258,6 +258,29 @@ TVM_DLL const Op &tma_load();
 TVM_DLL const Op &dma_copy();
 
 /*!
+ * \brief tvm intrinsic for mma operation of Sunmmio target.
+ *
+ *  \param A_region
+ *    A tl.tileop.region PrimExpr describing A.
+ *
+ *  \param B_region
+ *    A tl.tileop.region PrimExpr describing B.
+ *
+ *  \param C_region
+ *    A tl.tileop.region PrimExpr describing C.
+ *
+ *  \param trans_A
+ *    Whether to transpose A operand.
+ *
+ *  \param trans_B
+ *    Whether to transpose B operand.
+ *
+ *  \param clear_accum
+ *    Whether to clear accmulation buffer.
+ */
+TVM_DLL const Op &mma_sunmmio();
+
+/*!
  * \brief tvm intrinsics for loading image from global tensor to columns in
  * shared memory
  *
