@@ -33,25 +33,22 @@ def Parallel(*extents: tir.PrimExpr, coalesced_width: int | None = None):
 
 
 def Tiles(shared_buf: tir.Buffer, parallel: bool = False):
-    """Tools to construct tiled for loop over a shared memory buffer.
+    """Construct tiled loop over shared memory buffer.
 
-    Parameters
-    ----------
-    shared_buf : tir.Buffer
-        The shared memory buffer to be tiled.
-
-    parallel : bool
-        Whether to generate a parallel tiled loop.
-
-    Returns
-    -------
-    res : frame.ForFrame
-        The ForFrame.
+    parallel:
+        True  -> no loop-carried dependency
+        False -> loop carries dependency (e.g. reduction)
     """
-    annotations = {"tile_level_loop": tir.IntImm("int32", 0), "tiled_buffer": shared_buf.data}
-    if parallel:
-        annotations.update({"tile_level_loop": tir.IntImm("int32", 1)})
-        return _ffi_api.Tiles(tuple(shared_buf.shape), annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
+
+    annotations = {
+        "tile.loop_parallel": tir.IntImm("int32", 1 if parallel else 0),
+        "tile.tiled_buffer": shared_buf.data,
+        #This indicates how many passes the tile loop has gone through. init value 0
+        # after passing through the `Legalizetilesloop` pass, the value will be set to 1,
+        # and after passing through the `Tilesloop` pass, it set to 2.
+        "tile.loop_stage": tir.IntImm("int32", 0)
+    }
+    return _ffi_api.Tiles(tuple(shared_buf.shape), annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
 def Persistent(
