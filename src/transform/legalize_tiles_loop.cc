@@ -1,33 +1,19 @@
 #include <unordered_map>
+#include <unordered_set>
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/runtime/logging.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
 #include "../support/ffi_aliases.h"
 #include "../tileview/tileview.h"
+#include "tiles_loop_attr.h"
 
 namespace tvm {
 namespace tl {
 
 using namespace tir;
-
-/* ============================================================
- * Attributes
- * ============================================================ */
-namespace attr {
-// ---- loop-level (existing) ----
-constexpr const char *tile_level_loop = "tile_level_loop";
-constexpr const char *tiled_buffer = "tiled_buffer";
-
-// ---- added / normalized by this pass ----
-// Mark the loops corresponding to the index map(index_map=(-2, -1)) for
-// subsequent passes
-constexpr const char *tile_execution_loop = "tile.execution";
-constexpr const char *tile_new_shape = "tile.buffer_new_shape";
-constexpr const char *tile_tile_size = "tile.tile_size";
-constexpr const char *tile_dim_map = "tile.dim_map";
-} // namespace attr
 
 /* ============================================================
  * TileView Collector
@@ -62,6 +48,36 @@ private:
 
 private:
   TileViewMap tileviews_;
+};
+
+/* ============================================================
+ * SharedBufferCollector
+ *
+ * Collect all buffer->data Vars used inside a loop body
+ * ============================================================ */
+class SharedBufferCollector : public StmtExprVisitor {
+public:
+  using BufferSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
+
+  static BufferSet Collect(const Stmt &stmt) {
+    SharedBufferCollector collector;
+    collector(stmt);
+    return std::move(collector.buffers_);
+  }
+
+private:
+  void VisitExpr_(const BufferLoadNode *op) final {
+    buffers_.insert(op->buffer->data);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    buffers_.insert(op->buffer->data);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+private:
+  BufferSet buffers_;
 };
 
 /* ============================================================
@@ -100,6 +116,21 @@ private:
       return StmtExprMutator::VisitStmt_(loop);
     }
 
+    // ---- Stage Check (Idempotency) ----
+    int stage = static_cast<int>(TileLoopStage::kInitial);
+
+    auto stage_it = loop->annotations.find(attr::kTileLoopStage);
+    if (stage_it != loop->annotations.end()) {
+      stage = Downcast<Integer>((*stage_it).second)->value;
+    }
+
+    if (stage >= static_cast<int>(TileLoopStage::kLegalized)) {
+      // Already legalized → skip
+      LOG(INFO) << "[Legalize tiles loop] tile loop stage is: " << stage
+                << ", so skip. ";
+      return StmtExprMutator::VisitStmt_(loop);
+    }
+
     // Must be associated with a tiled buffer
     auto buf_it = loop->annotations.find(attr::tiled_buffer);
     if (buf_it == loop->annotations.end()) {
@@ -113,7 +144,35 @@ private:
       return StmtExprMutator::VisitStmt_(loop);
     }
 
-    const TileView &tv = tv_it->second;
+    // ---- Collect all used buffers inside loop body ----
+    auto used_buffers = SharedBufferCollector::Collect(loop->body);
+
+    if (used_buffers.empty()) {
+      return StmtExprMutator::VisitStmt_(loop);
+    }
+
+    // ---- Validate TileViews ----
+    const TileView *ref_tv = nullptr;
+
+    for (const Var &buf : used_buffers) {
+      auto it = tileviews_.find(buf);
+
+      if (it == tileviews_.end()) {
+        LOG(FATAL) << "Buffer " << buf
+                   << " used inside tile loop but has no TileView.";
+      }
+
+      if (!ref_tv) {
+        ref_tv = &(it->second);
+      } else {
+        ICHECK(ref_tv->get()->IsEqual(it->second.get()))
+            << "Inconsistent TileView inside tile loop.";
+      }
+    }
+
+    ICHECK(ref_tv) << "Internal error: ref_tv should not be null.";
+
+    const TileView &tv = *ref_tv;
 
     // Enter tile loop (depth == tile dimension)
     int dim = tile_loop_depth_++;
@@ -135,7 +194,8 @@ private:
     n->annotations.Set(attr::tile_new_shape, tiled_shape);
     n->annotations.Set(attr::tile_tile_size, tv->TileShape());
     n->annotations.Set(attr::tile_dim_map, tv->IndexMap());
-
+    n->annotations.Set(attr::kTileLoopStage,
+                       Integer(static_cast<int>(TileLoopStage::kLegalized)));
     // ---- Determine whether this loop is a tile execution dimension ----
     int buf_ndim = static_cast<int>(tv->BufferShape().size());
     bool is_tile_execution = false;
