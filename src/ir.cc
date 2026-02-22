@@ -100,6 +100,7 @@ ForFrame ParallelFor(const Array<PrimExpr> &extents,
   };
   return ForFrame(n);
 }
+
 ForFrame TilesFor(const Array<PrimExpr> &extents,
                   const Map<String, ObjectRef> &annotations) {
   using namespace tvm::tir;
@@ -108,7 +109,7 @@ ForFrame TilesFor(const Array<PrimExpr> &extents,
   n->doms.reserve(extents.size());
   for (const auto &extent : extents) {
     DataType dtype = extent.dtype();
-    n->vars.push_back(Var("v", extent.dtype()));
+    n->vars.push_back(Var("v", dtype));
     n->doms.push_back(Range(make_const(dtype, 0), extent));
   }
   n->f_make_for_loop = [annotations](const Array<Var> &vars,
