@@ -847,31 +847,27 @@ bool CopyNode::CheckTMemStore(Target target) const {
  * otherwise.
  */
 bool CopyNode::CheckSunmmioDMACopy(Target target) const {
-  // 1. arch must support Sunmmio
-  if (!TargetIsSunmmio(target))
-    return false;
-
-  // 2. src and dst must be legal
+  // 1. src and dst must be legal
   bool scope_check = false;
-  // 2.1 DRAM -> RSRAM
+  // 1.1 DRAM -> RSRAM
   if (src.scope() == "global" && dst.scope() == "shared.rsram")
     scope_check = true;
-  // 2.2 DRAM -> WSRAM
+  // 1.2 DRAM -> WSRAM
   if (src.scope() == "global" && dst.scope() == "shared.wsram")
     scope_check = true;
-  // 2.3 DRAM -> ASRAM
+  // 1.3 DRAM -> ASRAM
   if (src.scope() == "global" && dst.scope() == "shared.asram")
     scope_check = true;
-  // 2.4 RSRAM -> WSRAM
+  // 1.4 RSRAM -> WSRAM
   if (src.scope() == "shared.rsram" && dst.scope() == "shared.wsram")
     scope_check = true;
-  // 2.5 RSRAM -> ASRAM
+  // 1.5 RSRAM -> ASRAM
   if (src.scope() == "shared.rsram" && dst.scope() == "shared.asram")
     scope_check = true;
-  // 2.6 RSRAM <-> RSRAM
+  // 1.6 RSRAM <-> RSRAM
   if (src.scope() == "shared.rsram" && dst.scope() == "shared.rsram")
     scope_check = true;
-  // 2.7 RSRAM -> DRAM
+  // 1.7 RSRAM -> DRAM
   if (src.scope() == "shared.rsram" && dst.scope() == "global")
     scope_check = true;
   if (!scope_check) {
@@ -880,7 +876,7 @@ bool CopyNode::CheckSunmmioDMACopy(Target target) const {
     return false;
   }
 
-  // 3. src and dst must have the same dtype
+  // 2. src and dst must have the same dtype
   if (src->dtype != dst->dtype) {
     ICHECK(0) << "src and dst must have the same dtype for copy.";
     return false;
@@ -933,9 +929,8 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
   } else if (CheckTMemStore(target)) {
     return CopyInst::kTMemStore;
   } else if (TargetIsSunmmio(target)) {
-    auto is_copy = CheckSunmmioDMACopy(target);
-    if (is_copy)
-      return CopyInst::kSunmmioDMACopy;
+    CheckSunmmioDMACopy(target);
+    return CopyInst::kSunmmioDMACopy;
   } else {
     return CopyInst::kNormal;
   }
