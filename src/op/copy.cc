@@ -874,14 +874,15 @@ bool CopyNode::CheckSunmmioDMACopy(Target target) const {
   // 2.7 RSRAM -> DRAM
   if (src.scope() == "shared.rsram" && dst.scope() == "global")
     scope_check = true;
-  if (!scope_check)
+  if (!scope_check) {
+    ICHECK(0) << "Unsupported copy from " << src.scope() << " to "
+              << dst.scope() << " of Sunmmio target.";
     return false;
+  }
 
   // 3. src and dst must have the same dtype
   if (src->dtype != dst->dtype) {
-    LOG(WARNING) << "src and dst must have the same dtype for dma copy "
-                 << src->name << " vs. " << dst->name << " dtype " << src->dtype
-                 << " vs. " << dst->dtype << " will be fallback to normal copy";
+    ICHECK(0) << "src and dst must have the same dtype for copy.";
     return false;
   }
   return true;
@@ -935,8 +936,6 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
     auto is_copy = CheckSunmmioDMACopy(target);
     if (is_copy)
       return CopyInst::kSunmmioDMACopy;
-    ICHECK(0) << "Unsupported copy from " << src.scope() << " to "
-              << dst.scope() << " of Sunmmio target.";
   } else {
     return CopyInst::kNormal;
   }
