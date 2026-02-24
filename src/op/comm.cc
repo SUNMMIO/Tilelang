@@ -93,9 +93,9 @@ int get_target_mesh(Target target, int axis) {
   int x = 0;
   std::string axis_str;
   if (axis == 0) {
-    axis_str = "device_mesh_ncol_";
-  } else if (axis == 1) {
     axis_str = "device_mesh_nrow_";
+  } else if (axis == 1) {
+    axis_str = "device_mesh_ncol_";
   } else {
     LOG(FATAL) << "Invalid axis " << axis << " for getting mesh dimension.";
   }
@@ -122,13 +122,13 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
                             arith::Analyzer *analyzer) const {
   Target target = T.target;
   ICHECK(TargetIsSunmmio(target)) << "Broadcast only supports SUNMMIO targets.";
-  int mesh_x = get_target_mesh(target, 0);
-  int mesh_y = get_target_mesh(target, 1);
+  int mesh_nrow = get_target_mesh(target, 0);
+  int mesh_ncol = get_target_mesh(target, 1);
 
   // check for valid core id
-  ICHECK(src_core->value >= 0 and src_core->value < mesh_x * mesh_y)
+  ICHECK(src_core->value >= 0 and src_core->value < mesh_nrow * mesh_ncol)
       << "Source core id " << src_core->value << " out of range [0, "
-      << mesh_x * mesh_y << ")";
+      << mesh_nrow * mesh_ncol << ")";
 
   // check for src and dst buffer sizes
   PrimExpr src_elements = 1;
@@ -178,7 +178,7 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
   PrimExpr dst_addr =
       dst.access_ptr(2, DataType::Handle(), 1,
                      Downcast<IntImm>(dst_offset->value), src_elements);
-  int src_core_y = src_core->value % mesh_y;
+  int src_core_y = src_core->value % mesh_ncol;
 
   if (direction == 0 or direction == 1) {
     // 1D broadcast
@@ -203,12 +203,12 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     seq.push_back(broadcast);
     // horizontal broadcast
-    for (int i = 0; i < mesh_x; i++) {
+    for (int i = 0; i < mesh_nrow; i++) {
       Array<PrimExpr> args;
       args.push_back(dst.access_ptr(1, DataType::Handle(), 1, 0, dst_elements));
       args.push_back(dst.access_ptr(2, DataType::Handle(), 1, 0, dst_elements));
       args.push_back(Downcast<IntImm>(broadcast_elements));
-      args.push_back(int(i * mesh_y) + src_core_y);
+      args.push_back(int(i * mesh_ncol) + src_core_y);
       args.push_back(0); // direction: horizontal
       Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
       seq.push_back(broadcast);
@@ -259,16 +259,16 @@ LayoutMap PutOpNode::InferLayout(const LayoutInferArgs &T,
 Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   Target target = T.target;
   ICHECK(TargetIsSunmmio(target)) << "Put only supports SUNMMIO targets.";
-  int mesh_x = get_target_mesh(target, 0);
-  int mesh_y = get_target_mesh(target, 1);
+  int mesh_nrow = get_target_mesh(target, 0);
+  int mesh_ncol = get_target_mesh(target, 1);
 
   // check for valid core id
-  ICHECK(src_core->value >= 0 and src_core->value < mesh_x * mesh_y)
+  ICHECK(src_core->value >= 0 and src_core->value < mesh_nrow * mesh_ncol)
       << "Source core id " << src_core->value << " out of range [0, "
-      << mesh_x * mesh_y << ")";
-  ICHECK(dst_core->value >= 0 and dst_core->value < mesh_x * mesh_y)
+      << mesh_nrow * mesh_ncol << ")";
+  ICHECK(dst_core->value >= 0 and dst_core->value < mesh_nrow * mesh_ncol)
       << "Destination core id " << dst_core->value << " out of range [0, "
-      << mesh_x * mesh_y << ")";
+      << mesh_nrow * mesh_ncol << ")";
 
   // check for src and dst buffer sizes
   PrimExpr src_elements = 1;
@@ -310,10 +310,10 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   // all checks passed, generate the call
   PrimExpr src_addr = src.access_ptr(1, DataType::Handle(), 1, 0, src_elements);
   PrimExpr dst_addr = dst.access_ptr(2, DataType::Handle(), 1, 0, dst_elements);
-  int src_core_x = src_core->value / mesh_y;
-  int src_core_y = src_core->value % mesh_y;
-  int dst_core_x = dst_core->value / mesh_y;
-  int dst_core_y = dst_core->value % mesh_y;
+  int src_core_x = src_core->value / mesh_ncol;
+  int src_core_y = src_core->value % mesh_ncol;
+  int dst_core_x = dst_core->value / mesh_ncol;
+  int dst_core_y = dst_core->value % mesh_ncol;
 
   if (src_core_x == dst_core_x) {
     // 1D put via horizontal communication
@@ -323,7 +323,7 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     args.push_back(Downcast<IntImm>(broadcast_elements));
     args.push_back(src_core);
     args.push_back(0); // direction: horizontal
-    for (int j = 0; j < mesh_y; j++) {
+    for (int j = 0; j < mesh_ncol; j++) {
       if (j != dst_core_y) {
         args.push_back(
             IntImm(DataType::Int(32), j)); // mask: all cores except dst_core_y
@@ -339,7 +339,7 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     args.push_back(Downcast<IntImm>(broadcast_elements));
     args.push_back(src_core);
     args.push_back(1); // direction: vertical
-    for (int i = 0; i < mesh_x; i++) {
+    for (int i = 0; i < mesh_nrow; i++) {
       if (i != dst_core_x) {
         args.push_back(
             IntImm(DataType::Int(32), i)); // mask: all cores except dst_core_x
@@ -350,14 +350,14 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   } else {
     Array<Stmt> seq;
     // vertical transfer from src core to intermediate core
-    int intermediate_core_id = src_core_x * mesh_y + dst_core_y;
+    int intermediate_core_id = src_core_x * mesh_ncol + dst_core_y;
     Array<PrimExpr> args1;
     args1.push_back(src_addr);
     args1.push_back(dst_addr);
     args1.push_back(Downcast<IntImm>(broadcast_elements));
     args1.push_back(src_core);
     args1.push_back(1); // direction: vertical
-    for (int i = 0; i < mesh_x; i++) {
+    for (int i = 0; i < mesh_nrow; i++) {
       if (i != dst_core_x) {
         args1.push_back(
             IntImm(DataType::Int(32), i)); // mask: all cores except dst_core_x
@@ -372,7 +372,7 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     args2.push_back(Downcast<IntImm>(broadcast_elements));
     args2.push_back(IntImm(DataType::Int(32), intermediate_core_id));
     args2.push_back(0); // direction: horizontal
-    for (int j = 0; j < mesh_y; j++) {
+    for (int j = 0; j < mesh_ncol; j++) {
       if (j != dst_core_y) {
         args2.push_back(
             IntImm(DataType::Int(32), j)); // mask: all cores except dst_core_y
@@ -480,8 +480,8 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
                             arith::Analyzer *analyzer) const {
   Target target = T.target;
   ICHECK(TargetIsSunmmio(target)) << "Allgather only supports SUNMMIO targets.";
-  int mesh_x = get_target_mesh(target, 0);
-  int mesh_y = get_target_mesh(target, 1);
+  int mesh_nrow = get_target_mesh(target, 0);
+  int mesh_ncol = get_target_mesh(target, 1);
 
   Array<Range> send_range, recv_range;
   auto send_region = NormalizeToBufferRegion(send);
@@ -491,11 +491,11 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
 
   int recv_num = 1;
   if (direction == 0) { // horizontal
-    recv_num = mesh_y;
+    recv_num = mesh_ncol;
   } else if (direction == 1) { // vertical
-    recv_num = mesh_x;
+    recv_num = mesh_nrow;
   } else if (direction == 2) { // all
-    recv_num = mesh_x * mesh_y;
+    recv_num = mesh_nrow * mesh_ncol;
   } else {
     // invalid direction
     ICHECK(false) << "Invalid direction value for allgather: " << direction;
@@ -522,14 +522,15 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
   Array<Stmt> bcast_stmts;
 
   if (direction == 0) { // horizontal
-    for (int i = 0; i < mesh_x; i++) {
-      for (size_t j = 0; j < mesh_y; j++) {
+    for (int i = 0; i < mesh_nrow; i++) {
+      for (size_t j = 0; j < mesh_ncol; j++) {
         Array<PrimExpr> args;
         args.push_back(send);
         args.push_back(recv);
         args.push_back(size);
         args.push_back(IntImm(DataType::Int(32), j) * send_elements); // offset
-        args.push_back(IntImm(DataType::Int(32), i * mesh_y + j)); // src_core
+        args.push_back(
+            IntImm(DataType::Int(32), i * mesh_ncol + j)); // src_core
         args.push_back(0); // direction: horizontal
         BroadcastOp bcast = BroadcastOp(args);
         Stmt bcast_stmt = bcast->Lower(T, analyzer);
@@ -537,14 +538,15 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
       }
     }
   } else if (direction == 1) { // vertical
-    for (int j = 0; j < mesh_y; j++) {
-      for (size_t i = 0; i < mesh_x; i++) {
+    for (int j = 0; j < mesh_ncol; j++) {
+      for (size_t i = 0; i < mesh_nrow; i++) {
         Array<PrimExpr> args;
         args.push_back(send);
         args.push_back(recv);
         args.push_back(size);
         args.push_back(IntImm(DataType::Int(32), i) * send_elements); // offset
-        args.push_back(IntImm(DataType::Int(32), i * mesh_y + j)); // src_core
+        args.push_back(
+            IntImm(DataType::Int(32), i * mesh_ncol + j)); // src_core
         args.push_back(1); // direction: vertical
         BroadcastOp bcast = BroadcastOp(args);
         Stmt bcast_stmt = bcast->Lower(T, analyzer);
@@ -553,15 +555,16 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
     }
   } else if (direction == 2) { // all
     // first do horizontal allgather
-    for (int i = 0; i < mesh_x; i++) {
-      for (size_t j = 0; j < mesh_y; j++) {
+    for (int i = 0; i < mesh_nrow; i++) {
+      for (size_t j = 0; j < mesh_ncol; j++) {
         Array<PrimExpr> args;
         args.push_back(send);
         args.push_back(recv);
         args.push_back(size);
-        args.push_back(IntImm(DataType::Int(32), i * mesh_y + j) *
-                       send_elements);                             // offset
-        args.push_back(IntImm(DataType::Int(32), i * mesh_y + j)); // src_core
+        args.push_back(IntImm(DataType::Int(32), i * mesh_ncol + j) *
+                       send_elements); // offset
+        args.push_back(
+            IntImm(DataType::Int(32), i * mesh_ncol + j)); // src_core
         args.push_back(0); // direction: horizontal
         BroadcastOp bcast = BroadcastOp(args);
         Stmt bcast_stmt = bcast->Lower(T, analyzer);
@@ -570,23 +573,24 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
     }
     // then do vertical allgather
     Buffer recv_buffer = recv_region->buffer;
-    int allgather_size = (size->value < 0)
-                             ? Downcast<IntImm>(send_elements)->value * mesh_y
-                             : size->value * mesh_y;
+    int allgather_size =
+        (size->value < 0) ? Downcast<IntImm>(send_elements)->value * mesh_ncol
+                          : size->value * mesh_ncol;
 
-    for (int j = 0; j < mesh_y; j++) {
-      for (size_t i = 0; i < mesh_x; i++) {
+    for (int j = 0; j < mesh_ncol; j++) {
+      for (size_t i = 0; i < mesh_nrow; i++) {
         Array<PrimExpr> args;
         args.push_back(recv_buffer.access_ptr(
             1, DataType::Handle(), 1,
-            IntImm(DataType::Int(32), i * mesh_y) * send_elements,
-            IntImm(DataType::Int(32), mesh_y) * send_elements));
+            IntImm(DataType::Int(32), i * mesh_ncol) * send_elements,
+            IntImm(DataType::Int(32), mesh_ncol) * send_elements));
         args.push_back(recv_buffer.access_ptr(
             2, DataType::Handle(), 1,
-            IntImm(DataType::Int(32), i * mesh_y) * send_elements,
-            IntImm(DataType::Int(32), mesh_y) * send_elements));
+            IntImm(DataType::Int(32), i * mesh_ncol) * send_elements,
+            IntImm(DataType::Int(32), mesh_ncol) * send_elements));
         args.push_back(IntImm(DataType::Int(32), allgather_size)); // size
-        args.push_back(IntImm(DataType::Int(32), i * mesh_y + j)); // src_core
+        args.push_back(
+            IntImm(DataType::Int(32), i * mesh_ncol + j)); // src_core
         args.push_back(1); // direction: vertical
         Stmt bcast_stmt =
             Evaluate(Call(DataType::Handle(), broadcast_(), args));
@@ -784,8 +788,8 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
                             arith::Analyzer *analyzer) const {
   Target target = T.target;
   ICHECK(TargetIsSunmmio(target)) << "Allreduce only supports SUNMMIO targets.";
-  int mesh_x = get_target_mesh(target, 0);
-  int mesh_y = get_target_mesh(target, 1);
+  int mesh_nrow = get_target_mesh(target, 0);
+  int mesh_ncol = get_target_mesh(target, 1);
 
   ICHECK(direction == 0 || direction == 1 || direction == 2)
       << "Invalid allreduce direction " << direction
