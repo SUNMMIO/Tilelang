@@ -8,7 +8,7 @@
 
 #include "../support/ffi_aliases.h"
 #include "../tileview/tileview.h"
-#include "tiles_loop_attr.h"
+#include "common/attr.h"
 
 namespace tvm {
 namespace tl {
