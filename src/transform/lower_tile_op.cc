@@ -442,10 +442,10 @@ private:
           buffer->strides, buffer->elem_offset, buffer->name,
           buffer->data_alignment, buffer->offset_factor, buffer->buffer_type);
       return BufferLoad(new_buffer, load->indices);
-    } else if (!TargetIsSunmmio(target_)) {
+    } else if (TargetIsSunmmio(target_) && layout_map_.count(buffer)) {
       // Sunmmio doesn't remap buffer, so we need to keep the buffer's layout in
       // layout remap. Otherwise, the layout is lost in the follow-up transform.
-      layout_remap_.Set(buffer, layout_map_[load->buffer]);
+      layout_remap_.Set(buffer, layout_map_[buffer]);
     }
     return load;
   }
@@ -464,10 +464,10 @@ private:
           buffer->strides, buffer->elem_offset, buffer->name,
           buffer->data_alignment, buffer->offset_factor, buffer->buffer_type);
       return BufferStore(new_buffer, store->value, store->indices);
-    } else if (!TargetIsSunmmio(target_)) {
+    } else if (TargetIsSunmmio(target_) && layout_map_.count(buffer)) {
       // Sunmmio doesn't remap buffer, so we need to keep the buffer's layout in
       // layout remap. Otherwise, the layout is lost in the follow-up transform.
-      layout_remap_.Set(buffer, layout_map_[store->buffer]);
+      layout_remap_.Set(buffer, layout_map_[buffer]);
     }
     return store;
   }
