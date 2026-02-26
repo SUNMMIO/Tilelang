@@ -928,8 +928,7 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
     return CopyInst::kTMemLoad;
   } else if (CheckTMemStore(target)) {
     return CopyInst::kTMemStore;
-  } else if (TargetIsSunmmio(target)) {
-    CheckSunmmioDMACopy(target);
+  } else if (TargetIsSunmmio(target) && CheckSunmmioDMACopy(target)) {
     return CopyInst::kSunmmioDMACopy;
   } else {
     return CopyInst::kNormal;
