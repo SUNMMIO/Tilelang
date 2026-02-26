@@ -4,6 +4,7 @@ and that each region can be normalized back to a BufferRegion with full metadata
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
+from tilelang.layout import make_blockwise_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC, determine_target
 from tilelang.language.v2.annot import MeshShardingPolicy
 from tvm import tir
@@ -109,6 +110,11 @@ class _DmaCopyVisitor(PyStmtExprVisitor):
 def extract_dma_copy_lines(mod):
     """Extract T.dma_copy lines from TIR script, robust to formatting changes."""
     return [line.lstrip() for line in mod.script().split('\n') if 'T.dma_copy' in line]
+
+
+def extract_block_attr_lines(mod):
+    """Extract block attributes from TIR script"""
+    return [line.lstrip() for line in mod.script().split('\n') if 'T.block_attr' in line]
 
 
 SIMPLE_COPY_CASES = [
@@ -290,6 +296,8 @@ def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
             D_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
 
+            T.annotate_layout({C_shared: make_blockwise_zz_layout(C_shared)})
+
             for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
                 # DRAM -> RSRAM
                 T.copy(C[by * block_M, ko * block_K], C_shared)
@@ -369,3 +377,7 @@ def test_tilelang_mesh_copy_to_dma(K, block_M, block_N, block_K, lower_stmt):
         for i in range(len(texts)):
             assert texts[i] == lower_stmt[i], (
                 f"Line {i} mismatch:\n  actual:   {texts[i]}\n  expected: {lower_stmt[i]}")
+        # Check layout map
+        texts = extract_block_attr_lines(mod)
+        for text in texts:
+            assert '"layout_map"' in text and 'C_shared: metadata["tl.Layout"]' in text
