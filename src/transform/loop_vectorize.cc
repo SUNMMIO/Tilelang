@@ -85,6 +85,8 @@ public:
         !disable_vectorize_256 &&
         VectorizeFindGlobalAccess().HasGlobalAccess(node)) {
       vector_load_bits_max_ = vector_size_ = 256;
+    } else if (tvm::tl::TargetIsSunmmio(Target::Current(false))) {
+      vector_load_bits_max_ = vector_size_ = 1024;
     } else {
       vector_load_bits_max_ = vector_size_ = 128;
     }
