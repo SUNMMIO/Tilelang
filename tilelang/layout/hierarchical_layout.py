@@ -231,8 +231,14 @@ def make_blockwise_zz_layout(buffer: Buffer | BufferLoad | BufferRegion | tuple[
     """
     if isinstance(buffer, (Buffer, BufferLoad, BufferRegion)):
         row, column = _get_stride_continuous(buffer)
-    elif isinstance(buffer, tuple) and len(buffer) == 2:
+    elif isinstance(buffer, (tuple, list)) and len(buffer) == 2:
         row, column = buffer
+    elif isinstance(buffer, tvm_ffi.container.Array):
+        py_list = list(buffer)
+        if len(py_list) != 2:
+            raise ValueError(f"Invalid arguments: {buffer}")
+        else:
+            row, column = py_list
     else:
         raise ValueError(f"Invalid arguments: {buffer}")
     row_bs, col_bs = block_size
