@@ -564,6 +564,30 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
     }
     return {};
   }
+
+  // Sunmmio DMA Layout Inference
+  if (copy_inst == CopyInst::kSunmmioDMACopy) {
+    // for dma copy, we can directly apply the blockwise_zz_layout
+    const auto f =
+        ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
+    auto result = Map<Buffer, Layout>();
+
+    if (level == InferLevel::kFree && !T.layout_map.count(src)) {
+      if (src.scope() != "global") {
+        auto layout = Downcast<Layout>((*f)(src));
+        result.Set(src, layout);
+      }
+    }
+
+    if (level == InferLevel::kFree && !T.layout_map.count(dst)) {
+      if (dst.scope() != "global") {
+        auto layout = Downcast<Layout>((*f)(dst));
+        result.Set(dst, layout);
+      }
+    }
+    return result;
+  }
+
   // for LDSM/STSM, the layout was deduced from register layout
   // so we can directly apply the layout of normal copy
   // Use parallel op to infer the layout
@@ -805,6 +829,62 @@ bool CopyNode::CheckTMemStore(Target target) const {
 }
 
 /**
+ * @brief Determine whether this CopyNode can be lowered to a DMA Copy
+ * Intrinsic for Sunmmio target.
+ *
+ * The function returns true when all of the following hold:
+ * - the target architecture advertises DMA support;
+ * - the source buffer and the destination buffer are legal;
+ * - the source and destination have the same element data type.
+ *
+ * If the source and destination dtypes differ, a warning is logged and the
+ * function returns false (the caller is expected to fall back to a normal
+ * copy).
+ *
+ *
+ * @param target The compilation target to query for dma copy support.
+ * @return true if the copy can be implemented as a DMA Copy; false
+ * otherwise.
+ */
+bool CopyNode::CheckSunmmioDMACopy(Target target) const {
+  // 1. src and dst must be legal
+  bool scope_check = false;
+  // 1.1 DRAM -> RSRAM
+  if (src.scope() == "global" && dst.scope() == "shared.rsram")
+    scope_check = true;
+  // 1.2 DRAM -> WSRAM
+  if (src.scope() == "global" && dst.scope() == "shared.wsram")
+    scope_check = true;
+  // 1.3 DRAM -> ASRAM
+  if (src.scope() == "global" && dst.scope() == "shared.asram")
+    scope_check = true;
+  // 1.4 RSRAM -> WSRAM
+  if (src.scope() == "shared.rsram" && dst.scope() == "shared.wsram")
+    scope_check = true;
+  // 1.5 RSRAM -> ASRAM
+  if (src.scope() == "shared.rsram" && dst.scope() == "shared.asram")
+    scope_check = true;
+  // 1.6 RSRAM <-> RSRAM
+  if (src.scope() == "shared.rsram" && dst.scope() == "shared.rsram")
+    scope_check = true;
+  // 1.7 RSRAM -> DRAM
+  if (src.scope() == "shared.rsram" && dst.scope() == "global")
+    scope_check = true;
+  if (!scope_check) {
+    ICHECK(0) << "Unsupported copy from " << src.scope() << " to "
+              << dst.scope() << " of Sunmmio target.";
+    return false;
+  }
+
+  // 2. src and dst must have the same dtype
+  if (src->dtype != dst->dtype) {
+    ICHECK(0) << "src and dst must have the same dtype for copy.";
+    return false;
+  }
+  return true;
+}
+
+/**
  * @brief Selects the most specific copy instruction supported for the given
  * target and buffers.
  *
@@ -848,6 +928,8 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
     return CopyInst::kTMemLoad;
   } else if (CheckTMemStore(target)) {
     return CopyInst::kTMemStore;
+  } else if (TargetIsSunmmio(target) && CheckSunmmioDMACopy(target)) {
+    return CopyInst::kSunmmioDMACopy;
   } else {
     return CopyInst::kNormal;
   }
@@ -860,6 +942,7 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
  * determined copy instruction type:
  * - Bulk Load/Store: Uses Tensor Memory Accelerator (TMA) instructions
  * - LDSM/STSM: Uses matrix load/store instructions for tensor cores
+ * - DMA copy: Sunmmio specified instructions for copy
  * - Normal: Uses standard load/store operations with loop transformations
  * \param T LowerArgs containing target and layout map.
  * \param analyzer Arithmetic analyzer for simplification.
@@ -894,9 +977,35 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     return ldsm_copy;
   } else if (copy_inst == CopyInst::kNormal) {
     return LowerNormalCopy(T, analyzer);
+  } else if (copy_inst == CopyInst::kSunmmioDMACopy) {
+    auto dma_copy = LowerSunmmioDmaCopy(T, analyzer);
+    ICHECK(dma_copy.defined()) << "Failed to lower dma copy";
+    return dma_copy;
   } else {
     LOG(FATAL) << "Unsupported copy inst " << static_cast<int>(copy_inst);
   }
+}
+
+/**
+ * @brief Lower the copy operator for the SUNMMIO target.
+ *
+ * Emits a `tl.dma_copy(src_region, dst_region)` intrinsic call that preserves
+ * full buffer region semantics (buffer identity, per-axis min/extent, and
+ * memory scope). This intrinsic is consumed by later SUNMMIO-specific codegen
+ * passes to generate actual DMA instructions.
+ *
+ * @param T Lowering context (target, layout map, etc.).
+ * @param analyzer Arithmetic analyzer (unused here but kept for interface
+ *                 consistency).
+ * @return Stmt An Evaluate wrapping the tl.dma_copy Call.
+ */
+Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
+                                   arith::Analyzer *analyzer) const {
+  // access_mask: 1=read for src, 2=write for dst
+  PrimExpr src_region = MakeRegionExpr(src, src_range, /*access_mask=*/1);
+  PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
+  return Evaluate(
+      Call(DataType::Handle(), dma_copy(), {src_region, dst_region}));
 }
 
 /**
@@ -1407,7 +1516,8 @@ Stmt CopyNode::LowerBulkCopy(const LowerArgs &T, arith::Analyzer *analyzer,
   Array<Range> shared_range = is_load ? dst_range : src_range;
   // TMA bulk copy cannot support a non-swizzled global layout, will be fallback
   // to normal copy
-  if (T.layout_map.count(global_tensor)) {
+  if (T.layout_map.count(global_tensor) ||
+      T.global_layout_map.count(global_tensor)) {
     LOG(WARNING) << "TMA bulk copy cannot support a non-swizzled global "
                     "layout, fallback to normal copy.";
     return LowerNormalCopy(T, analyzer);

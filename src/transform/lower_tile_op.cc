@@ -18,6 +18,7 @@
 #include "../op/gemm.h"
 #include "../op/gemm_sp.h"
 #include "../op/operator.h"
+#include "../target/utils.h"
 #include "common/remap_buffer_rewriter.h"
 
 #include "arith/ir_mutator_with_analyzer.h"
@@ -157,10 +158,19 @@ private:
                             .as<Map<Buffer, Layout>>()
                             .value();
       for (auto [buffer, layout] : layout_map) {
-        buffer_remap_.Set(buffer,
-                          makeBufferWithLayout(buffer, layout, var_remap_));
+        if (!TargetIsSunmmio(target_)) {
+          buffer_remap_.Set(buffer,
+                            makeBufferWithLayout(buffer, layout, var_remap_));
+        }
         layout_map_.Set(buffer, layout);
       }
+    }
+    // Read global layout map separately — these are read-only metadata
+    // and must NOT be processed through makeBufferWithLayout/Forward.
+    if (op->annotations.count(attr::kGlobalLayoutMap)) {
+      global_layout_map_ = op->annotations.at(attr::kGlobalLayoutMap)
+                               .as<Map<Buffer, Layout>>()
+                               .value();
     }
     // Begin a new workspace collection frame for this block scope
     workspace_stack_.emplace_back();
@@ -432,6 +442,10 @@ private:
           buffer->strides, buffer->elem_offset, buffer->name,
           buffer->data_alignment, buffer->offset_factor, buffer->buffer_type);
       return BufferLoad(new_buffer, load->indices);
+    } else if (TargetIsSunmmio(target_) && layout_map_.count(buffer)) {
+      // Sunmmio doesn't remap buffer, so we need to keep the buffer's layout in
+      // layout remap. Otherwise, the layout is lost in the follow-up transform.
+      layout_remap_.Set(buffer, layout_map_[buffer]);
     }
     return load;
   }
@@ -450,6 +464,10 @@ private:
           buffer->strides, buffer->elem_offset, buffer->name,
           buffer->data_alignment, buffer->offset_factor, buffer->buffer_type);
       return BufferStore(new_buffer, store->value, store->indices);
+    } else if (TargetIsSunmmio(target_) && layout_map_.count(buffer)) {
+      // Sunmmio doesn't remap buffer, so we need to keep the buffer's layout in
+      // layout remap. Otherwise, the layout is lost in the follow-up transform.
+      layout_remap_.Set(buffer, layout_map_[buffer]);
     }
     return store;
   }
@@ -552,10 +570,10 @@ private:
       thread_bounds = Range::FromMinExtent(0, 1);
     }
 
-    auto lowered =
-        tile_op->Lower(LowerArgs{target_, thread_bounds, thread_var_->var,
-                                 callback, layout_map_, buffer_remap_},
-                       analyzer_);
+    auto lowered = tile_op->Lower(
+        LowerArgs{target_, thread_bounds, thread_var_->var, callback,
+                  layout_map_, buffer_remap_, global_layout_map_},
+        analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
 
@@ -577,6 +595,7 @@ private:
   Map<Buffer, Layout> layout_map_;
   Map<Buffer, Layout> layout_remap_;
   Map<Buffer, Buffer> buffer_remap_;
+  Map<Buffer, Layout> global_layout_map_;
   // This is a workaround for cpu backend,
   // we need to define a thread_var for the serial loop.
   IterVar thread_var_ = IterVar(Range::FromMinExtent(0, 1), Var("v_thread"),

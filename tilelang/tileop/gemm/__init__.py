@@ -183,9 +183,7 @@ class GemmPy(Node, Scriptable):
             NotImplementedError: If the instruction type is not supported
             ValueError: If the instruction type is unknown
         """
-        if gemm_inst.is_sunmmio():
-            return GemmSunmmio
-        elif gemm_inst.is_mma():
+        if gemm_inst.is_mma():
             if target_is_volta(target):
                 return GemmMMASm70
             return GemmMMA
@@ -197,5 +195,7 @@ class GemmPy(Node, Scriptable):
             return GemmMFMA
         elif gemm_inst.is_tcgen5mma():
             raise NotImplementedError("TCGEN5MMA is not implemented")
+        elif gemm_inst.is_sunmmio():
+            return GemmSunmmio
         else:
             raise ValueError(f"Unsupported GEMM instruction: {gemm_inst}")

@@ -22,10 +22,11 @@ enum class CopyInst : uint8_t {
   kBulkStore = 4, // utilize tma store
   // we should separate the bulk load and store for 1d and multi-dim
   // as they have different memory access patterns
-  kBulkLoad1D = 5,  // utilize tma load 1d
-  kBulkStore1D = 6, // utilize tma store 1d
-  kTMemLoad = 7,    // tcgen05.ld (tensor memory -> register)
-  kTMemStore = 8,   // tcgen05.st (register -> tensor memory)
+  kBulkLoad1D = 5,     // utilize tma load 1d
+  kBulkStore1D = 6,    // utilize tma store 1d
+  kTMemLoad = 7,       // tcgen05.ld (tensor memory -> register)
+  kTMemStore = 8,      // tcgen05.st (register -> tensor memory)
+  kSunmmioDMACopy = 9, // Sunmmio DMA
 };
 
 /// Descriptor for Tensor Memory Access (TMA) copy operations
@@ -181,6 +182,11 @@ public:
   bool CheckTMemStore(Target target) const;
 
   /*!
+   * \brief Check if Sunmmio dma copy is supported.
+   */
+  bool CheckSunmmioDMACopy(Target target) const;
+
+  /*!
    * \brief Get the copy instruction type.
    */
   CopyInst GetCopyInst(Target target, bool disable_tma_lower,
@@ -216,6 +222,14 @@ protected:
    * \brief Generate lowering for normal copy.
    */
   Stmt LowerNormalCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
+
+  /*!
+   * \brief Generate lowering for SUNMMIO DMA copy.
+   *
+   * Emits a tl.dma_copy(src_region, dst_region) intrinsic that preserves full
+   * buffer region semantics for later SUNMMIO codegen consumption.
+   */
+  Stmt LowerSunmmioDmaCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
 
   /*!
    * \brief Generate SIMT (thread-level) loop for copying.
