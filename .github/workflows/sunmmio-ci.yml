@@ -77,6 +77,7 @@ jobs:
       image: nvidia/cuda:12.8.0-devel-ubuntu24.04
       options: --gpus all --ipc=host
     env:
+      USE_CUDA: 1
       PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu128
       UV_INDEX: https://download.pytorch.org/whl/cu128
       CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON"
@@ -89,9 +90,10 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            python3.12 python3.12-venv python3-pip \
+            python3.12 python3.12-venv python3.12-dev python3-pip wget \
             clang-tidy cmake ninja-build git curl ca-certificates \
-            build-essential pkg-config
+            build-essential pkg-config libgtest-dev libprotobuf-dev \
+            protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
           mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}"
 
