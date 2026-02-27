@@ -1,4 +1,5 @@
 import tilelang
+import tilelang.testing
 import tilelang.language as T
 
 
@@ -27,6 +28,8 @@ def run_fill_symbolic(n: int):
     assert x.min() == 1.0 and x.max() == 1.0
 
 
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0)
 def test_fill_symbolic():
     # Requires 8GB VRAM
     run_fill_symbolic(2**32)

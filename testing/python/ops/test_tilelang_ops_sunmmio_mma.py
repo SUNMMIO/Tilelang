@@ -1,15 +1,17 @@
-import tilelang
 import pytest
-from tilelang import tvm as tvm
-from tilelang.utils.target import determine_target
+
+import tilelang
 import tilelang as tl
 import tilelang.language as T
+from tilelang import tvm as tvm
+from tilelang.utils.target import determine_target
 
 tilelang.env.disable_cache()
 
 
-def layout_func(i, j, continuous):
-    return (i // 32 * (continuous // 32) + j // 32) * 32 * 32 + i % 32 * 32 + j % 32
+def extract_sunmmio_mma_lines(mod):
+    """Extract block attributes from TIR script"""
+    return [line.lstrip() for line in mod.script().split('\n') if 'T.mma_sunmmio(' in line]
 
 
 def matmul(M, N, K, block_M, block_N, block_K, version, dtype=T.float16, accum_dtype=T.float32):
@@ -57,11 +59,11 @@ stmts = [
 ]
 TEST_CASES = [
     # gemm v1
-    (128, 128, 128, 32, 32, 32, 1, stmts[0]),
-    (128, 128, 128, 64, 32, 64, 1, stmts[1]),
+    (128, 128, 128, 32, 32, 32, 1, [stmts[0]]),
+    (128, 128, 128, 64, 32, 64, 1, [stmts[1]]),
     # # gemm v2
-    (128, 128, 128, 32, 32, 32, 2, stmts[0]),
-    (128, 128, 128, 64, 32, 64, 2, stmts[1]),
+    (128, 128, 128, 32, 32, 32, 2, [stmts[0]]),
+    (128, 128, 128, 64, 32, 64, 2, [stmts[1]]),
 ]
 
 
@@ -78,6 +80,9 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, versio
         mod = tilelang.transform.InferSramScope()(mod)
         mod = tl.transform.LayoutInference()(mod)
         mod = tl.transform.LowerTileOp()(mod)
-        texts = mod.script().split('\n')
-        text = texts[-2].lstrip()
-        assert text == lower_stmt
+        texts = extract_sunmmio_mma_lines(mod)
+        assert len(texts) == len(lower_stmt), (
+            f"Expected {len(lower_stmt)} sunmmio_mma statements, got {len(texts)}")
+        for i in range(len(texts)):
+            assert texts[i] == lower_stmt[i], (
+                f"Line {i} mismatch:\n  actual:   {texts[i]}\n  expected: {lower_stmt[i]}")
