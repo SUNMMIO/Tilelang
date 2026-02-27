@@ -81,12 +81,6 @@ jobs:
       UV_INDEX: https://download.pytorch.org/whl/cu130
       CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON"
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          submodules: recursive
-
       - name: Install system dependencies
         run: |
           apt-get update
@@ -96,6 +90,12 @@ jobs:
             build-essential pkg-config
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
           python -m pip install --upgrade pip setuptools wheel
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
 
       - name: Install uv
         run: |
