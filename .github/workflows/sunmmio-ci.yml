@@ -80,6 +80,10 @@ jobs:
       PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu130
       UV_INDEX: https://download.pytorch.org/whl/cu130
       CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON"
+      XDG_CACHE_HOME: "${{ github.workspace }}/.cache" # to be updated
+      PIP_CACHE_DIR: "${{ github.workspace }}/.cache/pip" # to be updated
+      UV_CACHE_DIR: "${{ github.workspace }}/.cache/uv" # to be updated
+      PRE_COMMIT_HOME: "${{ github.workspace }}/.cache/pip/.pre-commit" # to be updated
     steps:
       - name: Install system dependencies
         run: |
@@ -89,7 +93,7 @@ jobs:
             clang-tidy cmake ninja-build git curl ca-certificates \
             build-essential pkg-config
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
-          python -m pip install --upgrade pip setuptools wheel
+          mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}"
 
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -106,6 +110,7 @@ jobs:
         run: |
           uv venv .venv --python /usr/bin/python3.12
           . .venv/bin/activate
+          python -m pip install --upgrade pip setuptools wheel
           uv pip install -v -r requirements-test.txt
           uv pip install --no-build-isolation-package=flash-attn -v -r requirements-test-cuda.txt
           python -c "import torch; print(f'torch: {torch.__version__}'); print(f'cuda available: {torch.cuda.is_available()}'); print(f'device: {torch.cuda.get_device_name(0)}')"
