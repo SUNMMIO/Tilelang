@@ -74,11 +74,11 @@ jobs:
     runs-on: [self-hosted, Linux, CUDA-rtx3080]
     timeout-minutes: 120
     container:
-      image: nvidia/cuda:13.0.2-devel-ubuntu24.04
+      image: nvidia/cuda:12.8.0-devel-ubuntu24.04
       options: --gpus all --ipc=host
     env:
-      PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu130
-      UV_INDEX: https://download.pytorch.org/whl/cu130
+      PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu128
+      UV_INDEX: https://download.pytorch.org/whl/cu128
       CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON"
       XDG_CACHE_HOME: "${{ github.workspace }}/.cache" # to be updated
       PIP_CACHE_DIR: "${{ github.workspace }}/.cache/pip" # to be updated
@@ -111,6 +111,7 @@ jobs:
           uv venv .venv --python /usr/bin/python3.12
           uv pip install --python .venv/bin/python -v --upgrade pip setuptools wheel
           uv pip install --python .venv/bin/python -v -r requirements-test.txt
+          echo "import torch; print(f'torch: {torch.__version__}')" | uv run --no-project --script -
           uv pip install --python .venv/bin/python --no-build-isolation-package=flash-attn -v -r requirements-test-cuda.txt
           . .venv/bin/activate
           python -c "import torch; print(f'torch: {torch.__version__}'); print(f'cuda available: {torch.cuda.is_available()}'); print(f'device: {torch.cuda.get_device_name(0)}')"
