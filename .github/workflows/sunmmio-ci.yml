@@ -123,6 +123,7 @@ jobs:
 
       - name: Run clang-tidy
         id: clang-tidy
+        shell: bash
         run: |
           echo "\$ $(command -v clang-tidy) --version" && clang-tidy --version
 
