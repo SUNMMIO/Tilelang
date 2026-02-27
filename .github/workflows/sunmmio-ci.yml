@@ -71,7 +71,7 @@ jobs:
     name: CUDA Tests in Container (NVIDIA 3090)
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     needs: [lint]
-    runs-on: gpu-runners
+    runs-on: [self-hosted, Linux, CUDA-rtx3080]
     timeout-minutes: 120
     container:
       image: nvidia/cuda:13.0.2-devel-ubuntu24.04
