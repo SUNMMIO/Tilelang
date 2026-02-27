@@ -109,10 +109,10 @@ jobs:
       - name: Setup Python environment
         run: |
           uv venv .venv --python /usr/bin/python3.12
+          uv pip install --python .venv/bin/python -v --upgrade pip setuptools wheel
+          uv pip install --python .venv/bin/python -v -r requirements-test.txt
+          uv pip install --python .venv/bin/python --no-build-isolation-package=flash-attn -v -r requirements-test-cuda.txt
           . .venv/bin/activate
-          python -m pip install --upgrade pip setuptools wheel
-          uv pip install -v -r requirements-test.txt
-          uv pip install --no-build-isolation-package=flash-attn -v -r requirements-test-cuda.txt
           python -c "import torch; print(f'torch: {torch.__version__}'); print(f'cuda available: {torch.cuda.is_available()}'); print(f'device: {torch.cuda.get_device_name(0)}')"
           echo "::group::torch.utils.collect_env"
           uv run --no-project -m -- torch.utils.collect_env
