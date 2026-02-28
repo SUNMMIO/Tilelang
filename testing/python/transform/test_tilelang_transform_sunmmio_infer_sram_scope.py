@@ -7,6 +7,7 @@ import tilelang.language as T
 from tvm.tir.stmt_functor import post_order_visit
 from tvm.tir import BufferLoad, BufferStore, Buffer
 from typing import Set
+from tilelang.tileview import make_tileview
 
 tilelang.env.disable_cache()
 
@@ -645,3 +646,71 @@ def test_tilelang_incorrect_infer_sram_scope(kernel, error_info):
         mod = kernel
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl.transform.InferSramScope()(mod)
+
+
+def dot_mul_tiled_parallel(M,
+                           N,
+                           block_M,
+                           block_N,
+                           tile_size,
+                           index_map,
+                           dtype="float16",
+                           accum_dtype="float"):
+
+    @T.prim_func
+    def main(
+            A: T.Tensor((M, N), dtype),
+            B: T.Tensor((M, N), dtype),
+            C: T.Tensor((M, N), dtype),
+    ):
+        # Initialize Kernel Context
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_N), dtype)
+            T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, index_map)})
+            B_shared = T.alloc_shared((block_M, block_N), dtype)
+            T.annotate_tileview({B_shared: make_tileview(B_shared, tile_size, index_map)})
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+            T.annotate_tileview({C_shared: make_tileview(C_shared, tile_size, index_map)})
+            # T.block_attr({"tile_view":{
+            #     A_shared.data:{"tile_size": (T.int32(32), T.int32(32)), "dim_map": (T.int32(0), T.int32(1)), "new_shape": (T.int32(6), T.int32(6))},
+            #     B_shared.data:{"tile_size": (T.int32(32), T.int32(32)), "dim_map": (T.int32(0), T.int32(1)), "new_shape": (T.int32(6), T.int32(6))},
+            #     C_shared.data:{"tile_size": (T.int32(32), T.int32(32)), "dim_map": (T.int32(0), T.int32(1)), "new_shape": (T.int32(6), T.int32(6))}
+            # }
+            # })
+
+            T.clear(C_shared)
+
+            T.copy(A[by * block_M, bx * block_N], A_shared)
+            T.copy(B[by * block_M, bx * block_N], B_shared)
+
+            # for i, j in T.Tiles(A_shared, parallel=True):
+            #     C_shared[i, j] = A_shared[i, j] * B_shared[i, j]
+
+            # for i, j in T.Tiles((T.ceildiv(block_M, 32), T.ceildiv(block_N, 32)), parallel=True):
+            #     C_shared[i, j] = A_shared[i, j] * B_shared[i, j]
+
+            # for i, j in T.Tiles((T.ceildiv(block_M, 32), T.ceildiv(block_N, 32)), tile_size=(32, 32), dim_map=(0, 1), parallel=True):
+            #     C_shared[i, j] = A_shared[i, j] * B_shared[i, j]
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return main
+
+
+BUG_CASES = [
+    (dot_mul_tiled_parallel(128, 128, 128, 128, (32, 32), (-2, -1)), '1'),
+]
+
+
+@pytest.mark.parametrize(
+    "kernel, error_info",
+    BUG_CASES,
+)
+def test_tilelang_bug_case_infer_sram_scope(kernel, error_info):
+    target_name = "Sunmmio"
+    # target_name = "cuda"
+    target = determine_target(target_name, return_object=True)
+    with pytest.raises(tvm.error.InternalError, match=error_info), tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(kernel.with_attr("global_symbol", "main"))
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl.transform.InferSramScope()(mod)
+        print(mod)
