@@ -37,16 +37,7 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
-
-      - name: Mark workspace as safe
-        shell: bash
-        run: |
-          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
-
-      - name: Ensure submodules are initialized
-        shell: bash
-        run: |
-          git submodule update --init --recursive
+          set-safe-directory: true
 
       - name: Setup Python 3.8
         id: setup-pylowest
@@ -90,11 +81,15 @@ jobs:
       USE_CUDA: 1
       PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu128
       UV_INDEX: https://download.pytorch.org/whl/cu128
-      CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON"
+      CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON -DTILELANG_UPDATE_SUBMODULES=OFF"
+      CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF"
       XDG_CACHE_HOME: "${{ github.workspace }}/.cache" # to be updated
       PIP_CACHE_DIR: "${{ github.workspace }}/.cache/pip" # to be updated
       UV_CACHE_DIR: "${{ github.workspace }}/.cache/uv" # to be updated
       PRE_COMMIT_HOME: "${{ github.workspace }}/.cache/pip/.pre-commit" # to be updated
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install system dependencies
         run: |
@@ -112,6 +107,7 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+          set-safe-directory: true
 
       - name: Install uv
         run: |
@@ -133,7 +129,6 @@ jobs:
 
       - name: Run clang-tidy
         id: clang-tidy
-        shell: bash
         run: |
           echo "\$ $(command -v clang-tidy) --version" && clang-tidy --version
 

@@ -15,7 +15,17 @@ endif()
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.gitmodules" AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+option(
+  TILELANG_UPDATE_SUBMODULES
+  "Run `git submodule update --init --recursive` during CMake configure."
+  ON
+)
+
+if(
+  TILELANG_UPDATE_SUBMODULES
+  AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.gitmodules"
+  AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git"
+)
   find_package(Git QUIET)
   if(Git_FOUND)
     execute_process(
@@ -37,6 +47,14 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.gitmodules" AND EXISTS "${CMAKE_CURRENT_
         "Please install git or fetch the submodules manually."
     )
   endif()
+endif()
+
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/tvm/CMakeLists.txt")
+  message(
+    FATAL_ERROR
+      "Missing required submodules under 3rdparty. Please run "
+      "`git submodule update --init --recursive` and re-run CMake."
+  )
 endif()
 
 find_program(CCACHE_PROGRAM ccache)
