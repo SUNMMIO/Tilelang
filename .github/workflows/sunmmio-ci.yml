@@ -38,6 +38,16 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      - name: Mark workspace as safe
+        shell: bash
+        run: |
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Ensure submodules are initialized
+        shell: bash
+        run: |
+          git submodule update --init --recursive
+
       - name: Setup Python 3.8
         id: setup-pylowest
         uses: actions/setup-python@v6
