@@ -97,7 +97,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             python3.12 python3.12-venv python3.12-dev python3-pip wget \
             clang-tidy cmake ninja-build git curl ca-certificates \
-            build-essential pkg-config libgtest-dev libprotobuf-dev \
+            build-essential pkg-config libgtest-dev googletest libprotobuf-dev \
             protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
           mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}"
