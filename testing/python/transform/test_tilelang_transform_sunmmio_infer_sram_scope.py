@@ -1,6 +1,7 @@
 import tilelang
 import pytest
 from tilelang import tvm as tvm
+from tilelang.layout.hierarchical_layout import make_blockwise_zz_layout
 from tilelang.utils.target import determine_target
 import tilelang as tl
 import tilelang.language as T
@@ -664,9 +665,11 @@ def dot_mul_tiled_parallel(M,
             C: T.Tensor((M, N), dtype),
     ):
         # Initialize Kernel Context
+        # A_shared = T.alloc_shared((block_M, block_N), dtype)
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_N), dtype)
             T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, index_map)})
+            T.annotate_layout({A_shared: make_blockwise_zz_layout(A_shared)})
             B_shared = T.alloc_shared((block_M, block_N), dtype)
             T.annotate_tileview({B_shared: make_tileview(B_shared, tile_size, index_map)})
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -697,20 +700,35 @@ def dot_mul_tiled_parallel(M,
 
 
 BUG_CASES = [
-    (dot_mul_tiled_parallel(128, 128, 128, 128, (32, 32), (-2, -1)), '1'),
+    (dot_mul_tiled_parallel(128, 128, 128, 128, (32, 32), (-2, -1)), {
+        'A': 'global',
+        'B': 'global',
+        'C': 'global',
+        'A_shared': 'shared.rsram',
+        'B_shared': 'shared.rsram',
+        'C_shared': 'shared.rsram',
+    }),
 ]
 
 
 @pytest.mark.parametrize(
-    "kernel, error_info",
+    "kernel, buffer_scope_dict",
     BUG_CASES,
 )
-def test_tilelang_bug_case_infer_sram_scope(kernel, error_info):
+def test_tilelang_bug_case_infer_sram_scope(kernel, buffer_scope_dict):
     target_name = "Sunmmio"
     # target_name = "cuda"
     target = determine_target(target_name, return_object=True)
-    with pytest.raises(tvm.error.InternalError, match=error_info), tvm.target.Target(target):
+    with tvm.target.Target(target):
         mod = tvm.IRModule.from_expr(kernel.with_attr("global_symbol", "main"))
         mod = tvm.tir.transform.BindTarget(target)(mod)
+
+        mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
+        mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+        mod = tilelang.transform.InjectAssumes()(mod)
+        mod = tilelang.transform.Simplify()(mod)
         mod = tl.transform.InferSramScope()(mod)
-        print(mod)
+        func = list(mod.functions.values())[0]
+        buffers = extract_buffers_from_kernel(func)
+        for buf in buffers:
+            assert buf.scope() == buffer_scope_dict[buf.name]

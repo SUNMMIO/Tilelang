@@ -23,7 +23,7 @@
 #include "../op/region.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
-
+#include "../tileview/tileview.h"
 #include "arith/ir_mutator_with_analyzer.h"
 #include "arith/ir_visitor_with_analyzer.h"
 #include "common/loop_fusion_utils.h"
@@ -35,21 +35,15 @@
 #include "loop_vectorize.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
+#include "tvm/node/cast.h"
+#include "tvm/tir/buffer.h"
+#include "tvm/tir/stmt.h"
+#include "tvm/tir/var.h"
 
 namespace tvm {
 namespace tl {
 
 using namespace tir;
-
-static Buffer makeBufferWithScope(const Buffer &buffer, std::string scope) {
-  const auto *ptr_type =
-      TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-  Type new_type = PointerType(ptr_type->element_type, scope);
-  Var new_var = Var(buffer->data->name_hint, new_type);
-  return Buffer(new_var, buffer->dtype, buffer->shape, {}, buffer->elem_offset,
-                buffer->name, buffer->data_alignment, buffer->offset_factor,
-                buffer->buffer_type);
-}
 
 class InferSramScopePass : public arith::IRMutatorWithAnalyzer {
 public:
@@ -84,11 +78,13 @@ public:
 
 private:
   using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
-  Stmt VisitStmt_(const BlockNode *op) final {
+  Stmt VisitStmt_(const BlockRealizeNode *op) final {
+    BlockRealize block_realize =
+        Downcast<BlockRealize>(StmtExprMutator::VisitStmt_(op));
+    Block block = block_realize->block;
     // remap shared buffers to rsram buffers by default
     if (!replace_flag) {
-      Block block = tvm::ffi::GetRef<Block>(op);
-      Array<Buffer> alloc_buffers = op->alloc_buffers;
+      Array<Buffer> alloc_buffers = block->alloc_buffers;
       for (auto buffer : alloc_buffers) {
         if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
           buffers_to_infer.insert(buffer);
@@ -100,16 +96,43 @@ private:
                     << " in Sunmmio.";
         }
       }
-      return StmtExprMutator::VisitStmt_(op);
+      return block_realize;
     }
-
-    // do op->alloc_buffers remap
-    Block block = tvm::ffi::GetRef<Block>(op);
-    Array<Buffer> alloc_buffers = op->alloc_buffers;
 
     if (buffer_remap_.empty()) {
-      return StmtExprMutator::VisitStmt_(op);
+      return block_realize;
     }
+
+    // do block attributes remap
+    Map<String, Any> new_annotations;
+    if (block->annotations.count(attr::kLayoutMap)) {
+      auto map = block->annotations.Get(attr::kLayoutMap)
+                     ->as<Map<Var, Layout>>()
+                     .value();
+      Map<Var, Layout> new_map;
+      for (const auto &[var, layout] : map) {
+        if (var_remap_.count(var)) {
+          new_map.Set(var_remap_[var], layout);
+        }
+      }
+      new_annotations.Set(attr::kLayoutMap, new_map);
+    }
+
+    if (block->annotations.count(attr::kTileViewMap)) {
+      auto map = block->annotations.Get(attr::kTileViewMap)
+                     ->as<Map<Var, TileView>>()
+                     .value();
+      Map<Var, TileView> new_map;
+      for (const auto &[var, tileView] : map) {
+        if (var_remap_.count(var)) {
+          new_map.Set(var_remap_[var], tileView);
+        }
+      }
+      new_annotations.Set(attr::kTileViewMap, new_map);
+    }
+
+    // do block->alloc_buffers remap
+    Array<Buffer> alloc_buffers = block->alloc_buffers;
 
     // remove the buffers
     alloc_buffers.MutateByApply([this](Buffer buf) {
@@ -119,12 +142,15 @@ private:
       return buf;
     });
 
-    if (!alloc_buffers.same_as(op->alloc_buffers)) {
-      block.CopyOnWrite()->alloc_buffers = alloc_buffers;
-      return StmtExprMutator::VisitStmt_(block.get());
-    } else {
-      return StmtExprMutator::VisitStmt_(op);
+    if (!alloc_buffers.same_as(block->alloc_buffers)) {
+      Block new_block =
+          Block(block->iter_vars, block->reads, block->writes, block->name_hint,
+                block->body, block->init, alloc_buffers, block->match_buffers,
+                new_annotations, block->span);
+      block_realize.CopyOnWrite()->block = new_block;
     }
+
+    return block_realize;
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
@@ -224,8 +250,9 @@ private:
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
     auto load = Downcast<BufferLoad>(IRMutatorWithAnalyzer::VisitExpr_(op));
-    if (!replace_flag)
+    if (!replace_flag) {
       return load;
+    }
     auto buffer = load->buffer;
     if (buffer_remap_.count(buffer)) {
       auto new_buffer = buffer_remap_[load->buffer];
@@ -236,7 +263,6 @@ private:
           var_remap_[buffer->data], buffer->dtype, buffer->shape,
           buffer->strides, buffer->elem_offset, buffer->name,
           buffer->data_alignment, buffer->offset_factor, buffer->buffer_type);
-      LOG(INFO) << load;
       return BufferLoad(new_buffer, load->indices);
     }
     auto expr = StmtExprMutator::VisitExpr_(op);
@@ -245,8 +271,9 @@ private:
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     auto store = Downcast<BufferStore>(IRMutatorWithAnalyzer::VisitStmt_(op));
-    if (!replace_flag)
+    if (!replace_flag) {
       return store;
+    }
     auto buffer = store->buffer;
     if (buffer_remap_.count(buffer)) {
       auto new_buffer = buffer_remap_[store->buffer];
@@ -281,24 +308,37 @@ private:
 
   PrimExpr VisitExpr_(const VarNode *op) final {
     Var var = tvm::ffi::GetRef<Var>(op);
-    if (!replace_flag)
-      return var;
-    if (var_remap_.count(var)) {
-      return var_remap_[var];
+    if (!replace_flag) {
+      return std::move(var);
     }
-    return var;
+    if (var_remap_.count(var)) {
+      auto new_var = var_remap_[var];
+      return std::move(new_var);
+    }
+    return std::move(var);
+  }
+
+  Buffer makeBufferWithScope(const Buffer &buffer, std::string scope) {
+    const auto *ptr_type =
+        TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
+    Var new_var;
+    if (var_remap_.count(buffer->data)) {
+      new_var = var_remap_[buffer->data];
+    } else {
+      Type new_type = PointerType(ptr_type->element_type, scope);
+      new_var = Var(buffer->data->name_hint, new_type);
+      var_remap_.Set(buffer->data, new_var);
+    }
+    return Buffer(new_var, buffer->dtype, buffer->shape, {},
+                  buffer->elem_offset, buffer->name, buffer->data_alignment,
+                  buffer->offset_factor, buffer->buffer_type);
   }
 
   void InferUnspecifiedBuffer() {
     for (const auto buffer : buffers_to_infer) {
       if (!buffer_remap_.count(buffer)) {
         auto remap_buffer = makeBufferWithScope(buffer, "shared.rsram");
-        const auto *ptr_type =
-            TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-        Type new_type = PointerType(ptr_type->element_type, "shared.rsram");
-        Var new_var = Var(buffer->data->name_hint, new_type);
         buffer_remap_.Set(buffer, remap_buffer);
-        var_remap_.Set(buffer->data, new_var);
       }
     }
   }
