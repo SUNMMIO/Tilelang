@@ -170,6 +170,7 @@ jobs:
           rm -rf cmake-build run-clang-tidy.py
           if (( rc != 0 )); then
             echo "::error::clang-tidy found issues (exit code: ${rc}). Please run 'clang-tidy --fix' locally to fix them."
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
             git diff --color=always || true
             exit "${rc}"
           fi

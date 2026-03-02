@@ -89,7 +89,7 @@ private:
     if (!replace_flag) {
       Block block = tvm::ffi::GetRef<Block>(op);
       Array<Buffer> alloc_buffers = op->alloc_buffers;
-      for (auto buffer : alloc_buffers) {
+      for (auto &buffer : alloc_buffers) {
         if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
           buffers_to_infer.insert(buffer);
         } else if ((buffer.scope() != "shared.asram") &&
@@ -290,7 +290,7 @@ private:
   }
 
   void InferUnspecifiedBuffer() {
-    for (const auto buffer : buffers_to_infer) {
+    for (const auto &buffer : buffers_to_infer) {
       if (!buffer_remap_.count(buffer)) {
         auto remap_buffer = makeBufferWithScope(buffer, "shared.rsram");
         const auto *ptr_type =
