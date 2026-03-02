@@ -104,7 +104,6 @@ private:
     }
 
     // do block attributes remap
-    Map<String, Any> new_annotations;
     if (block->annotations.count(attr::kLayoutMap)) {
       auto map = block->annotations.Get(attr::kLayoutMap)
                      ->as<Map<Var, Layout>>()
@@ -113,9 +112,11 @@ private:
       for (const auto &[var, layout] : map) {
         if (var_remap_.count(var)) {
           new_map.Set(var_remap_[var], layout);
+        } else {
+          new_map.Set(var, layout);
         }
       }
-      new_annotations.Set(attr::kLayoutMap, new_map);
+      block.CopyOnWrite()->annotations.Set(attr::kLayoutMap, new_map);
     }
 
     if (block->annotations.count(attr::kTileViewMap)) {
@@ -126,9 +127,11 @@ private:
       for (const auto &[var, tileView] : map) {
         if (var_remap_.count(var)) {
           new_map.Set(var_remap_[var], tileView);
+        } else {
+          new_map.Set(var, tileView);
         }
       }
-      new_annotations.Set(attr::kTileViewMap, new_map);
+      block.CopyOnWrite()->annotations.Set(attr::kTileViewMap, new_map);
     }
 
     // do block->alloc_buffers remap
@@ -143,11 +146,8 @@ private:
     });
 
     if (!alloc_buffers.same_as(block->alloc_buffers)) {
-      Block new_block =
-          Block(block->iter_vars, block->reads, block->writes, block->name_hint,
-                block->body, block->init, alloc_buffers, block->match_buffers,
-                new_annotations, block->span);
-      block_realize.CopyOnWrite()->block = new_block;
+      block.CopyOnWrite()->alloc_buffers = alloc_buffers;
+      block_realize.CopyOnWrite()->block = block;
     }
 
     return block_realize;
