@@ -119,7 +119,7 @@ def test_global_buffer_layout_populated_for_sunmmio():
             B_shared = T.alloc_shared((block_K, block_N), "float16")
             C_shared = T.alloc_shared((block_M, block_N), "float32")
 
-            T.clear(C_shared)
+            # T.clear(C_shared)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
                 T.copy(A[by * block_M, k * block_K], A_shared)
                 T.copy(B[k * block_K, bx * block_N], B_shared)
@@ -138,7 +138,9 @@ def test_global_buffer_layout_populated_for_sunmmio():
 
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl.transform.InferSramScope()(mod)
         mod = tl.transform.LayoutInference()(mod)
+        mod = tl.transform.LowerTileOp()(mod)
         CollectLayoutMap()(mod)
 
     # Verify that global buffer 'A' has a layout in the layout_map
@@ -181,6 +183,7 @@ def test_global_buffer_layout_not_populated_for_cuda():
 
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl.transform.InferSramScope()(mod)
         mod = tl.transform.LayoutInference()(mod)
         CollectLayoutMap()(mod)
 
@@ -250,7 +253,7 @@ def test_hierarchical_layout_values():
             B_shared = T.alloc_shared((block_K, block_N), "float16")
             C_shared = T.alloc_shared((block_M, block_N), "float32")
 
-            T.clear(C_shared)
+            # T.clear(C_shared)
             for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
                 T.copy(A[by * block_M, k * block_K], A_shared)
                 T.copy(B[k * block_K, bx * block_N], B_shared)
@@ -263,7 +266,9 @@ def test_hierarchical_layout_values():
 
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl.transform.InferSramScope()(mod)
         mod = tl.transform.LayoutInference()(mod)
+        mod = tl.transform.LowerTileOp()(mod)
         CollectLayoutMap()(mod)
 
     assert "A" in collected_layout_map, "Global buffer 'A' should be in layout_map"
@@ -285,19 +290,3 @@ def test_hierarchical_layout_values():
     assert offset_0_0[0] == 0, f"Expected offset(0,0)=0, got {offset_0_0[0]}"
     assert offset_0_1[0] == 1, f"Expected offset(0,1)=1, got {offset_0_1[0]}"
     assert offset_1_0[0] == 32, f"Expected offset(1,0)=32, got {offset_1_0[0]}"
-
-
-if __name__ == "__main__":
-    test_sunmmio_target_detection()
-    print("PASSED: test_sunmmio_target_detection")
-
-    test_global_buffer_layout_populated_for_sunmmio()
-    print("PASSED: test_global_buffer_layout_populated_for_sunmmio")
-
-    test_global_buffer_layout_not_populated_for_cuda()
-    print("PASSED: test_global_buffer_layout_not_populated_for_cuda")
-
-    test_hierarchical_layout_values()
-    print("PASSED: test_hierarchical_layout_values")
-
-    print("\nAll tests passed!")

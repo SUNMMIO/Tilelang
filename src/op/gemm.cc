@@ -461,7 +461,7 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     Array<PrimExpr> args = {A_region,      B_region,      C_region,
                             Bool(transA_), Bool(transB_), clearAccum_};
 
-    auto op = mma_sunmmio();
+    const auto &op = mma_sunmmio();
     Stmt mma_sunmmio;
     mma_sunmmio = Evaluate(Call(DataType::Handle(), op, args));
 
