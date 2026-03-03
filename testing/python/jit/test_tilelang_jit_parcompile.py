@@ -58,7 +58,7 @@ def matmul_kernel_jit(
 def test_par_compile():
     configs = [
         (1024, 1024, 1024, 128, 128, 32),
-        (2048, 2048, 2048, 256, 256, 64),
+        (2048, 2048, 2048, 128, 256, 64),
         (4096, 4096, 4096, 64, 64, 128),
     ]
     kernels = matmul_kernel_jit.par_compile(configs)

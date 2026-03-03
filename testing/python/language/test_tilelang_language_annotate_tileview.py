@@ -112,7 +112,7 @@ TILEVIEW_ERROR_CASES = [
 @pytest.mark.parametrize("buffer_shape, tile_shape, index_map", TILEVIEW_ERROR_CASES)
 def test_tileview_non_divisible_error(buffer_shape, tile_shape, index_map):
     """Test that TileView raises error for non-divisible dimensions."""
-    with pytest.raises(ValueError):
+    with pytest.raises(tvm.error.InternalError):
         TileView(buffer_shape, tile_shape, index_map)
 
 

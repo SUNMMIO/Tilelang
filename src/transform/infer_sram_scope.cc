@@ -335,7 +335,7 @@ private:
   }
 
   void InferUnspecifiedBuffer() {
-    for (const auto buffer : buffers_to_infer) {
+    for (const auto &buffer : buffers_to_infer) {
       if (!buffer_remap_.count(buffer)) {
         auto remap_buffer = makeBufferWithScope(buffer, "shared.rsram");
         buffer_remap_.Set(buffer, remap_buffer);
