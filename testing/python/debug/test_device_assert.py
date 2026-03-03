@@ -1,4 +1,5 @@
 # type: ignore
+import torch
 import tilelang
 import tilelang.testing
 import tilelang.language as T
@@ -18,6 +19,7 @@ def _manual_device_assert_triggered():
     profiler.run_once()
 
 
+@tilelang.testing.requires_cuda
 def test_device_assert_no_trigger():
     @T.prim_func
     def program():
