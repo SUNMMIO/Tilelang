@@ -77,20 +77,28 @@ jobs:
     container:
       image: nvidia/cuda:12.8.0-devel-ubuntu24.04
       options: --gpus all --ipc=host
+      volumes:
+        - ${{ runner.tool_cache }}/.ci-cache-sunmmio:/ci-cache
     env:
       USE_CUDA: 1
       PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu128
       UV_INDEX: https://download.pytorch.org/whl/cu128
       CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON -DTILELANG_UPDATE_SUBMODULES=OFF"
       CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF"
-      XDG_CACHE_HOME: "${{ github.workspace }}/.cache" # to be updated
-      PIP_CACHE_DIR: "${{ github.workspace }}/.cache/pip" # to be updated
-      UV_CACHE_DIR: "${{ github.workspace }}/.cache/uv" # to be updated
-      PRE_COMMIT_HOME: "${{ github.workspace }}/.cache/pip/.pre-commit" # to be updated
+      XDG_CACHE_HOME: /ci-cache
+      PIP_CACHE_DIR: /ci-cache/pip
+      UV_CACHE_DIR: /ci-cache/uv
+      PRE_COMMIT_HOME: /ci-cache/pre-commit
     defaults:
       run:
         shell: bash
     steps:
+      - name: Prepare persistent cache
+        run: |
+          mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}" "${PRE_COMMIT_HOME}"
+          echo "Cache mount: /ci-cache"
+          du -sh /ci-cache/* 2>/dev/null || echo "Cache is empty (first run)"
+
       - name: Install system dependencies
         run: |
           apt-get update
@@ -100,7 +108,6 @@ jobs:
             build-essential pkg-config libprotobuf-dev \
             protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
-          mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}"
 
       - name: Install GoogleTest from source
         run: |
@@ -188,3 +195,13 @@ jobs:
             pytest --verbose --color=yes --durations=0 --showlocals --cache-clear
           )
           "${PYTEST[@]}" --maxfail=3 --numprocesses=4 -c pytest.ini ./python
+
+      - name: Prune caches (disk space management)
+        if: always()
+        run: |
+          echo "=== Cache usage before pruning ==="
+          du -sh /ci-cache/* 2>/dev/null || true
+          # Remove uv cache entries not used in the last 7 days
+          uv cache prune --ci 2>/dev/null || true
+          echo "=== Cache usage after pruning ==="
+          du -sh /ci-cache/* 2>/dev/null || true
