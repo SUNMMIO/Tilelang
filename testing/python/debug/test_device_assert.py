@@ -1,4 +1,5 @@
 # type: ignore
+import torch
 import tilelang
 import tilelang.testing
 import tilelang.language as T
@@ -19,7 +20,14 @@ def _manual_device_assert_triggered():
     profiler.run_once()
 
 
+@tilelang.testing.requires_cuda
 def test_device_assert_no_trigger():
+    # Ensure a valid CUDA runtime context is current on this thread before
+    # using driver API calls. Without this, cuModuleLoadData can fail with
+    # CUDA_ERROR_INVALID_CONTEXT for kernels that don't touch any device
+    # memory (i.e., no tensor parameters to implicitly create a context).
+    # See upstream: testing/python/issue/test_tilelang_issue_830.py
+    torch.cuda.set_device(0)
 
     @T.prim_func
     def program():

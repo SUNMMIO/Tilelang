@@ -59,6 +59,8 @@ def run_fill_static(n: int):
     assert x.min() == 1.0 and x.max() == 1.0
 
 
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0)
 def test_fill_static():
     # Requires 8GB VRAM
     run_fill_static(2**32)
