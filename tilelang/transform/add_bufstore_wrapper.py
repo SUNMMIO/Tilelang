@@ -97,7 +97,7 @@ def AddWrapperForSingleBufStore():
             Returns:
                 True if the loop is a tile operation (parallel or has num_stages annotation)
             """
-            return loop.kind == ForKind.PARALLEL or "num_stages" in loop.annotations
+            return loop.kind == ForKind.PARALLEL or 'num_stages' in loop.annotations
 
         def pre_visit(statement):
             """

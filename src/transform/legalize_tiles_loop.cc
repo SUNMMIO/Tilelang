@@ -141,6 +141,20 @@ private:
 
     auto tv_it = tileviews_.find(buffer_data);
     if (tv_it == tileviews_.end()) {
+      // for debugging, it is helpful to print the buffer_data and the keys in
+      // tileviews_ to see why the lookup fails. It is possible that the
+      // buffer_data is not exactly the same as the key in tileviews_ even they
+      // represent the same buffer, due to some transformation before this pass.
+      // We can check their names and shapes to see if they match.
+      LOG(INFO) << "Looking for buffer: " << buffer_data;
+      for (auto &kv : tileviews_) {
+        LOG(INFO) << "Have tileview for: " << kv.first;
+      }
+
+      LOG(INFO) << "Looking for buffer: " << buffer_data.get();
+      for (auto &kv : tileviews_) {
+        LOG(INFO) << "Have tileview for: " << kv.first.get();
+      }
       return StmtExprMutator::VisitStmt_(loop);
     }
 
