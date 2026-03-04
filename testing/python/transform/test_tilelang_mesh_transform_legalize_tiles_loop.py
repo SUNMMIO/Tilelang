@@ -167,22 +167,23 @@ def test_legalize_tiles_loop_attach_tileview_metadata():
             "tile.tile_size": False,
             "tile.dim_map": False,
             "tile.buffer_new_shape": False,
-            "tile_level_loop": False,
+            "tile.loop_parallel": False,  # Was tile_level_loop
+            "tile.loop_stage": False,  # New
+            "tile.tiled_buffer": False,  # New
         }
 
-        def visit(
-            stmt,
-            found_tile_metadata=found_tile_metadata,
-        ):
+        def visit(stmt, found_tile_metadata=found_tile_metadata):
             nonlocal tile_execution_count
             if isinstance(stmt, tir.For):
                 ann = stmt.annotations
                 if ann is not None:
+                    # Check for keys
                     for k in found_tile_metadata:
                         if k in ann:
                             found_tile_metadata[k] = True
+
+                    # Check tile.execution
                     if "tile.execution" in ann:
-                        nonlocal tile_execution_count
                         tile_execution_count += 1
 
         tvm.tir.stmt_functor.post_order_visit(main_func.body, visit)
