@@ -164,6 +164,8 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LayoutReducer()(mod)
     # Infer memory layouts for fragments and shared memory
     mod = tilelang.transform.LayoutInference()(mod)
+    # print("after layout inference pass")
+    # mod.show()
     # Visualize the layout
     LayoutVisual(mod)
     # Lower high-level tile operations to low-level operations
@@ -184,8 +186,6 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # TODO(lei): return to tir pass when kSymbolicBound simplification
     # is merged into tvm.
     mod = tilelang.transform.Simplify()(mod)
-    print("After legalization and lowering:")
-    mod.show()
     return mod
 
 
