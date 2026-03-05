@@ -20,6 +20,7 @@
 #include "../op/operator.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
+#include "../tileview/tileview.h"
 #include "common/remap_buffer_rewriter.h"
 
 #include "arith/ir_mutator_with_analyzer.h"
@@ -173,6 +174,11 @@ private:
         }
         layout_map_.Set(buffer, layout);
       }
+    }
+    if (op->annotations.count(attr::kTileViewMap)) {
+      tileview_map_ = op->annotations.at(attr::kTileViewMap)
+                          .as<Map<Var, TileView>>()
+                          .value();
     }
     // Read global layout map separately — these are read-only metadata
     // and must NOT be processed through makeBufferWithLayout/Forward.
@@ -932,11 +938,11 @@ private:
       let_var_to_expr.Set(var, expr);
     }
 
-    auto lowered =
-        tile_op->Lower(LowerArgs{target_, thread_bounds, thread_var_->var,
-                                 callback, layout_map_, buffer_remap_,
-                                 let_var_to_expr, global_layout_map_},
-                       analyzer_);
+    auto lowered = tile_op->Lower(
+        LowerArgs{target_, thread_bounds, thread_var_->var, callback,
+                  layout_map_, buffer_remap_, let_var_to_expr,
+                  global_layout_map_, tileview_map_},
+        analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
 
@@ -1132,6 +1138,7 @@ private:
   Map<Buffer, Layout> layout_remap_;
   Map<Buffer, Buffer> buffer_remap_;
   Map<Buffer, Layout> global_layout_map_;
+  Map<Var, TileView> tileview_map_;
   // This is a workaround for cpu backend,
   // we need to define a thread_var for the serial loop.
   IterVar thread_var_ = IterVar(Range::FromMinExtent(0, 1), Var("v_thread"),
