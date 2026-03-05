@@ -106,6 +106,45 @@ def _parse_device_list(raw: str) -> list[str]:
     return [token.strip() for token in raw.split(",") if token.strip()]
 
 
+def _filter_devices_by_free_memory(devices: list[str], min_free_mib: int = 2048) -> list[str]:
+    """Filter out GPUs that have less than *min_free_mib* MiB of free memory.
+
+    Uses ``nvidia-smi`` so we avoid initialising CUDA in the controller process.
+    If ``nvidia-smi`` is unavailable or fails, all devices are returned unchanged.
+    """
+    import shutil
+    import subprocess
+
+    if not shutil.which("nvidia-smi"):
+        return devices
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return devices
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return devices
+
+    # Parse "index, free_mib" lines.
+    free_map: dict[str, int] = {}
+    for line in result.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2:
+            try:
+                free_map[parts[0]] = int(parts[1])
+            except ValueError:
+                pass
+
+    filtered = [d for d in devices if free_map.get(d, min_free_mib) >= min_free_mib]
+    # Fall back to the full list if every device would be excluded.
+    return filtered if filtered else devices
+
+
 def _discover_cuda_devices() -> list[str]:
     """
     Discover available CUDA devices, then select only ceil(n/2) devices.
@@ -115,7 +154,9 @@ def _discover_cuda_devices() -> list[str]:
       2) ENV: CUDA_VISIBLE_DEVICES
       3) torch.cuda device count (if available)
 
-    After discovery, if there are n devices, we keep ceil(n/2) devices.
+    After discovery, devices with insufficient free memory are filtered out
+    (via ``nvidia-smi``).  Then, if there are n remaining devices, we keep
+    ceil(n/2) of them.
     """
     devices: list[str] = []
 
@@ -135,6 +176,8 @@ def _discover_cuda_devices() -> list[str]:
                 devices = [str(idx) for idx in range(torch.cuda.device_count())]
 
     if devices:
+        # Drop GPUs that are already heavily loaded by other processes.
+        devices = _filter_devices_by_free_memory(devices)
         # Keep only ceil(n/2) devices
         n = len(devices)
         limit = (n + 1) // 2
