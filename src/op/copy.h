@@ -50,6 +50,8 @@ inline const char *CopyInstToString(CopyInst inst) {
     return "TMemLoad";
   case CopyInst::kTMemStore:
     return "TMemStore";
+  case CopyInst::kSunmmioDMACopy:
+    return "SunmmioDMACopy";
   default:
     return "Unknown";
   }

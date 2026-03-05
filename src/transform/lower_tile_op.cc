@@ -18,6 +18,7 @@
 #include "../op/gemm.h"
 #include "../op/gemm_sp.h"
 #include "../op/operator.h"
+#include "../op/utils.h"
 #include "../target/utils.h"
 #include "common/remap_buffer_rewriter.h"
 
@@ -931,10 +932,11 @@ private:
       let_var_to_expr.Set(var, expr);
     }
 
-    auto lowered = tile_op->Lower(
-        LowerArgs{target_, thread_bounds, thread_var_->var, callback,
-                  layout_map_, buffer_remap_, let_var_to_expr, global_layout_map_},
-        analyzer_);
+    auto lowered =
+        tile_op->Lower(LowerArgs{target_, thread_bounds, thread_var_->var,
+                                 callback, layout_map_, buffer_remap_,
+                                 let_var_to_expr, global_layout_map_},
+                       analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
 

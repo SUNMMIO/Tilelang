@@ -6,7 +6,7 @@ import tilelang.language as T
 from tilelang import tvm as tvm
 from tilelang.layout import make_blockwise_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC, determine_target
-from tilelang.language.v2.annot import MeshShardingPolicy
+from tilelang.language.mesh_tensor import MeshShardingPolicy
 from tvm import tir
 from tvm.tir import PyStmtExprVisitor
 import pytest
@@ -18,7 +18,9 @@ def simple_copy_kernel(M, N, block_M, block_N, dtype="float16"):
     """A minimal kernel with T.copy from global to shared memory."""
 
     @T.prim_func
-    def main(A: T.Tensor((M, N), dtype),):
+    def main(
+        A: T.Tensor((M, N), dtype),
+    ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_N), dtype)
             T.copy(A[by * block_M, bx * block_N], A_shared)
@@ -71,8 +73,7 @@ def normalize_region(region_call):
     access_mask = int(region_call.args[1])
     num_extents = len(region_call.args) - 2
 
-    assert len(
-        load.indices) == num_extents, (f"Expected {num_extents} indices, got {len(load.indices)}")
+    assert len(load.indices) == num_extents, f"Expected {num_extents} indices, got {len(load.indices)}"
 
     ranges = []
     for i in range(num_extents):
@@ -109,12 +110,12 @@ class _DmaCopyVisitor(PyStmtExprVisitor):
 
 def extract_dma_copy_lines(mod):
     """Extract T.dma_copy lines from TIR script, robust to formatting changes."""
-    return [line.lstrip() for line in mod.script().split('\n') if 'T.dma_copy' in line]
+    return [line.lstrip() for line in mod.script().split("\n") if "T.dma_copy" in line]
 
 
 def extract_block_attr_lines(mod):
     """Extract block attributes from TIR script"""
-    return [line.lstrip() for line in mod.script().split('\n') if 'T.block_attr' in line]
+    return [line.lstrip() for line in mod.script().split("\n") if "T.block_attr" in line]
 
 
 SIMPLE_COPY_CASES = [
@@ -139,19 +140,19 @@ def test_tilelang_dma_copy(M, N, block_M, block_N):
     visitor.visit_stmt(func.body)
 
     # Verify that exactly one tl.dma_copy call was emitted
-    assert len(visitor.dma_copy_calls) == 1, (
-        f"Expected exactly 1 tl.dma_copy call, got {len(visitor.dma_copy_calls)}")
+    assert len(visitor.dma_copy_calls) == 1, f"Expected exactly 1 tl.dma_copy call, got {len(visitor.dma_copy_calls)}"
 
     call = visitor.dma_copy_calls[0]
 
     # dma_copy should have exactly 2 arguments (src_region, dst_region)
-    assert len(call.args) == 2, (f"Expected 2 args for dma_copy, got {len(call.args)}")
+    assert len(call.args) == 2, f"Expected 2 args for dma_copy, got {len(call.args)}"
 
     # Each argument should be a tl.tileop.region Call
     for i, arg in enumerate(call.args):
-        assert isinstance(arg, tir.Call), (f"dma_copy arg[{i}] should be a Call, got {type(arg)}")
+        assert isinstance(arg, tir.Call), f"dma_copy arg[{i}] should be a Call, got {type(arg)}"
         assert hasattr(arg.op, "name") and arg.op.name == "tl.tileop.region", (
-            f"dma_copy arg[{i}] should be tl.tileop.region, got {arg.op.name}")
+            f"dma_copy arg[{i}] should be tl.tileop.region, got {arg.op.name}"
+        )
 
     # --- Normalize regions back to buffer metadata ---
     src_buf, src_ranges, src_mask = normalize_region(call.args[0])
@@ -171,48 +172,35 @@ def test_tilelang_dma_copy(M, N, block_M, block_N):
     assert int(src_buf.shape[1]) == N, f"Source shape[1] should be {N}, got {src_buf.shape[1]}"
 
     assert len(dst_buf.shape) == 2, f"Dest buffer should be 2D, got {len(dst_buf.shape)}D"
-    assert int(
-        dst_buf.shape[0]) == block_M, (f"Dest shape[0] should be {block_M}, got {dst_buf.shape[0]}")
-    assert int(
-        dst_buf.shape[1]) == block_N, (f"Dest shape[1] should be {block_N}, got {dst_buf.shape[1]}")
+    assert int(dst_buf.shape[0]) == block_M, f"Dest shape[0] should be {block_M}, got {dst_buf.shape[0]}"
+    assert int(dst_buf.shape[1]) == block_N, f"Dest shape[1] should be {block_N}, got {dst_buf.shape[1]}"
 
     # Buffer scope: InferSramScope assigns shared.rsram for a plain alloc_shared
     src_scope = src_buf.scope()
-    assert src_scope == "" or src_scope == "global", (
-        f"Source buffer should be in global scope, got '{src_scope}'")
+    assert src_scope == "" or src_scope == "global", f"Source buffer should be in global scope, got '{src_scope}'"
     dst_scope = dst_buf.scope()
-    assert dst_scope == "shared.rsram", (
-        f"Destination buffer should be shared.rsram after InferSramScope, got '{dst_scope}'")
+    assert dst_scope == "shared.rsram", f"Destination buffer should be shared.rsram after InferSramScope, got '{dst_scope}'"
 
     # Region extents match block dimensions
     assert len(src_ranges) == 2
     src_extent_0 = int(src_ranges[0].extent)
     src_extent_1 = int(src_ranges[1].extent)
-    assert src_extent_0 == block_M, (f"Source extent[0] should be {block_M}, got {src_extent_0}")
-    assert src_extent_1 == block_N, (f"Source extent[1] should be {block_N}, got {src_extent_1}")
+    assert src_extent_0 == block_M, f"Source extent[0] should be {block_M}, got {src_extent_0}"
+    assert src_extent_1 == block_N, f"Source extent[1] should be {block_N}, got {src_extent_1}"
 
     assert len(dst_ranges) == 2
     dst_extent_0 = int(dst_ranges[0].extent)
     dst_extent_1 = int(dst_ranges[1].extent)
-    assert dst_extent_0 == block_M, (f"Dest extent[0] should be {block_M}, got {dst_extent_0}")
-    assert dst_extent_1 == block_N, (f"Dest extent[1] should be {block_N}, got {dst_extent_1}")
+    assert dst_extent_0 == block_M, f"Dest extent[0] should be {block_M}, got {dst_extent_0}"
+    assert dst_extent_1 == block_N, f"Dest extent[1] should be {block_N}, got {dst_extent_1}"
 
 
-def wrong_copy(M,
-               N,
-               K,
-               block_M,
-               block_N,
-               block_K,
-               error_type,
-               dtype="float16",
-               accum_dtype="float16"):
-
+def wrong_copy(M, N, K, block_M, block_N, block_K, error_type, dtype="float16", accum_dtype="float16"):
     @T.prim_func
     def main(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((K, N), dtype),
-            C: T.Tensor((M, N), accum_dtype),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        C: T.Tensor((M, N), accum_dtype),
     ):
         # Initialize Kernel Context
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
@@ -223,48 +211,40 @@ def wrong_copy(M,
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
 
             for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-                if error_type == 'A->D':
+                if error_type == "A->D":
                     T.copy(A_shared, C[by * block_M, ko * block_K])
-                elif error_type == 'W->D':
+                elif error_type == "W->D":
                     T.copy(B_shared, C[by * block_M, ko * block_K])
-                elif error_type == 'A->R':
+                elif error_type == "A->R":
                     T.copy(A_shared, C_shared)
-                elif error_type == 'W->R':
+                elif error_type == "W->R":
                     T.copy(B_shared, C_shared)
-                elif error_type == 'D<->D':
+                elif error_type == "D<->D":
                     T.copy(C[by * block_M, ko * block_K], B[by * block_M, ko * block_K])
-                elif error_type == 'A<->A':
+                elif error_type == "A<->A":
                     T.copy(A_shared, A_shared_2)
-                elif error_type == 'W<->W':
+                elif error_type == "W<->W":
                     T.copy(B_shared, B_shared_2)
-                elif error_type == 'A->W':
+                elif error_type == "A->W":
                     T.copy(A_shared, B_shared)
-                elif error_type == 'W->A':
+                elif error_type == "W->A":
                     T.copy(B_shared, A_shared)
 
-    return tvm.IRModule({'main': main})
+    return tvm.IRModule({"main": main})
 
 
 WRONG_TEST_CASES = [
-    (128, 128, 128, 32, 32, 32, "A->D",
-     "Unsupported copy from shared.asram to global of Sunmmio target."),
-    (128, 128, 128, 32, 32, 32, "W->D",
-     "Unsupported copy from shared.wsram to global of Sunmmio target."),
-    (128, 128, 128, 32, 32, 32, "A->R",
-     "Unsupported copy from shared.asram to shared.rsram of Sunmmio target."),
-    (128, 128, 128, 32, 32, 32, "W->R",
-     "Unsupported copy from shared.wsram to shared.rsram of Sunmmio target."),
+    (128, 128, 128, 32, 32, 32, "A->D", "Unsupported copy from shared.asram to global of Sunmmio target."),
+    (128, 128, 128, 32, 32, 32, "W->D", "Unsupported copy from shared.wsram to global of Sunmmio target."),
+    (128, 128, 128, 32, 32, 32, "A->R", "Unsupported copy from shared.asram to shared.rsram of Sunmmio target."),
+    (128, 128, 128, 32, 32, 32, "W->R", "Unsupported copy from shared.wsram to shared.rsram of Sunmmio target."),
     # (128, 128, 128, 32, 32, 32, "D<->D",
     #  "Unsupported copy from global to global of Sunmmio target."),
     # D<->D not work now
-    (128, 128, 128, 32, 32, 32, "A<->A",
-     "Unsupported copy from shared.asram to shared.asram of Sunmmio target."),
-    (128, 128, 128, 32, 32, 32, "W<->W",
-     "Unsupported copy from shared.wsram to shared.wsram of Sunmmio target."),
-    (128, 128, 128, 32, 32, 32, "A->W",
-     "Unsupported copy from shared.asram to shared.wsram of Sunmmio target."),
-    (128, 128, 128, 32, 32, 32, "W->A",
-     "Unsupported copy from shared.wsram to shared.asram of Sunmmio target."),
+    (128, 128, 128, 32, 32, 32, "A<->A", "Unsupported copy from shared.asram to shared.asram of Sunmmio target."),
+    (128, 128, 128, 32, 32, 32, "W<->W", "Unsupported copy from shared.wsram to shared.wsram of Sunmmio target."),
+    (128, 128, 128, 32, 32, 32, "A->W", "Unsupported copy from shared.asram to shared.wsram of Sunmmio target."),
+    (128, 128, 128, 32, 32, 32, "W->A", "Unsupported copy from shared.wsram to shared.asram of Sunmmio target."),
 ]
 
 
@@ -280,12 +260,14 @@ def test_tilelang_mesh_wrong_copy_to_dma(M, N, K, block_M, block_N, block_K, err
 
 
 def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
-    MyTensor = T.MeshTensor((128, 128),
-                            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-                            device_mesh_config=(2, 2),
-                            hierarchical_dims=(4, 32, 128),
-                            hierarchical_groups=((0, 2), (2, 3)),
-                            hierarchical_strides=(32, 1, 4096))
+    MyTensor = T.MeshTensor(
+        (128, 128),
+        sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+        device_mesh_config=(2, 2),
+        hierarchical_dims=(4, 32, 128),
+        hierarchical_groups=((0, 2), (2, 3)),
+        hierarchical_strides=(32, 1, 4096),
+    )
 
     @T.prim_func
     def main(C: MyTensor):
@@ -314,7 +296,7 @@ def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
                 # RSRAM <-> RSRAM
                 T.copy(C_shared, D_shared)
 
-    return tvm.IRModule({'main': main})
+    return tvm.IRModule({"main": main})
 
 
 # fmt: off
@@ -372,11 +354,9 @@ def test_tilelang_mesh_copy_to_dma(K, block_M, block_N, block_K, lower_stmt):
         mod = copy(K, block_M, block_N, block_K)
         mod = apply_sunmmio_passes(mod, target)
         texts = extract_dma_copy_lines(mod)
-        assert len(texts) == len(lower_stmt), (
-            f"Expected {len(lower_stmt)} dma_copy lines, got {len(texts)}")
+        assert len(texts) == len(lower_stmt), f"Expected {len(lower_stmt)} dma_copy lines, got {len(texts)}"
         for i in range(len(texts)):
-            assert texts[i] == lower_stmt[i], (
-                f"Line {i} mismatch:\n  actual:   {texts[i]}\n  expected: {lower_stmt[i]}")
+            assert texts[i] == lower_stmt[i], f"Line {i} mismatch:\n  actual:   {texts[i]}\n  expected: {lower_stmt[i]}"
         # Check layout map
         texts = extract_block_attr_lines(mod)
         for text in texts:

@@ -28,6 +28,7 @@ try:
 except ImportError:  # Python < 3.11 for Self, < 3.10 for ParamSpec
     from typing_extensions import ParamSpec, Self
 from .. import dtypes as dt
+from ..mesh_tensor import TensorWithMeta
 from . import utils
 from tilelang.jit.exceptions import JITNoBuilderError, EagerJITBuildError
 import threading
@@ -186,6 +187,29 @@ class Builder(BaseBuilder):
         self.current_macro_name = "<unknown-macro>"
         # stack to record caller fileline, not callee fileline
         self.macro_fileline_stack: list[tuple[str, int, str]] = []
+        # Metadata collected during prim_func_arg processing
+        self._metadata: dict[str, dict] = {}
+
+    def attach_metadata(self, prim_func):
+        """Attach collected Metadata to a PrimFunc as 'tensor_meta' attribute.
+
+        Converts Python values (int, tuple, dict) to TIR types for C++ FFI compatibility.
+        """
+        if not self._metadata:
+            return prim_func
+
+        def _convert_to_tir(value):
+            if isinstance(value, int):
+                return tvm.tir.IntImm("int32", value)
+            elif isinstance(value, tuple):
+                return tuple(_convert_to_tir(v) for v in value)
+            elif isinstance(value, list):
+                return [_convert_to_tir(v) for v in value]
+            elif isinstance(value, dict):
+                return {k: _convert_to_tir(v) for k, v in value.items()}
+            return value
+
+        return prim_func.with_attr("tensor_meta", _convert_to_tir(self._metadata))
 
     @classmethod
     def current(cls) -> Self:
@@ -693,7 +717,10 @@ class Builder(BaseBuilder):
             return value
 
     def prim_func_arg(self, name, value):
-        if isinstance(value, (Buffer, Var)):
+        if isinstance(value, TensorWithMeta):
+            self._metadata[name] = value.meta_data
+            return tir.arg(name, value.buffer)
+        elif isinstance(value, (Buffer, Var)):
             return tir.arg(name, value)
         elif value is self.empty:
             raise ValueError(f"Argument `{name}` is not annotated")
@@ -1014,6 +1041,7 @@ class TirTemplate(Generic[_P, _T]):
         with builder.prim_func(self.name):
             self.ir_gen.gen(builder)(**tensor_args, **kwargs)
         pf = builder.get()
+        pf = builder.attach_metadata(pf)
         if builder.out_idx:
             pf.out_idx_override = builder.out_idx
         return pf
@@ -1111,6 +1139,7 @@ class JITFunc(Generic[_P, _T]):
             with builder.prim_func(self.orig_func.__name__):
                 self.ir_gen.gen(builder)(**self.tensor_args, **kwargs)
             pf = builder.get()
+            pf = builder.attach_metadata(pf)
             pf.orig_func = self.orig_func
             if builder.out_idx:
                 pf.out_idx_override = builder.out_idx
@@ -1213,6 +1242,7 @@ def prim_func(func: Callable[_P, _T] = None, *, eager_jit: bool = False) -> Prim
                 with builder.prim_func(func.__name__):
                     ir_gen.gen(builder)(**annot)
                 prim_func = builder.get()
+                prim_func = builder.attach_metadata(prim_func)
                 prim_func.orig_func = func
                 if builder.out_idx:
                     prim_func.out_idx_override = builder.out_idx

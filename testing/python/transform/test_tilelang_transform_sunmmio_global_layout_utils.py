@@ -10,7 +10,7 @@ from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target, SUNMMIO_TARGET_DESC, target_is_sunmmio
 import tilelang as tl
 import tilelang.language as T
-from tilelang.language.v2.annot import MeshShardingPolicy, MeshReplicationType
+from tilelang.language.mesh_tensor import MeshShardingPolicy, MeshReplicationType
 from tvm import tir
 from tvm.tir import PyStmtExprVisitor
 from tvm.tir.transform import prim_func_pass
@@ -134,7 +134,7 @@ def test_global_buffer_layout_populated_for_sunmmio():
     target = determine_target("Sunmmio", return_object=True)
 
     # Create IR module and run passes
-    mod = tvm.IRModule({'main': kernel})
+    mod = tvm.IRModule({"main": kernel})
 
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
@@ -144,8 +144,9 @@ def test_global_buffer_layout_populated_for_sunmmio():
         CollectLayoutMap()(mod)
 
     # Verify that global buffer 'A' has a layout in the layout_map
-    assert "A" in collected_layout_map, \
+    assert "A" in collected_layout_map, (
         f"Global buffer 'A' should be in layout_map after LayoutInference. Got: {list(collected_layout_map.keys())}"
+    )
 
     # Verify the layout is a Layout object (hierarchical layout)
     a_layout = collected_layout_map["A"]
@@ -167,8 +168,8 @@ def test_global_buffer_layout_not_populated_for_cuda():
 
     @T.prim_func
     def kernel(
-            A: T.Tensor((M, N), "float16"),
-            B: T.Tensor((M, N), "float16"),
+        A: T.Tensor((M, N), "float16"),
+        B: T.Tensor((M, N), "float16"),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_N), "float16")
@@ -179,7 +180,7 @@ def test_global_buffer_layout_not_populated_for_cuda():
     # Use CUDA target
     target = Target("cuda")
 
-    mod = tvm.IRModule({'main': kernel})
+    mod = tvm.IRModule({"main": kernel})
 
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
@@ -190,8 +191,7 @@ def test_global_buffer_layout_not_populated_for_cuda():
     # For CUDA without MeshTensor, global buffer 'A' should NOT be in layout_map
     # (only fragment/shared buffers get layouts inferred)
     # This verifies that our code path for Sunmmio is not triggered for CUDA
-    assert "A" not in collected_layout_map, \
-        "Global buffer 'A' should NOT be in layout_map for CUDA target"
+    assert "A" not in collected_layout_map, "Global buffer 'A' should NOT be in layout_map for CUDA target"
 
 
 def test_hierarchical_layout_values():
@@ -262,7 +262,7 @@ def test_hierarchical_layout_values():
             T.copy(C_shared, C[by * block_M, bx * block_N])
 
     target = determine_target("Sunmmio", return_object=True)
-    mod = tvm.IRModule({'main': kernel})
+    mod = tvm.IRModule({"main": kernel})
 
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
