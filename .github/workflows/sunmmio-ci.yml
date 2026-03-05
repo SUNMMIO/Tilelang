@@ -77,7 +77,7 @@ jobs:
       USE_CUDA: 1
       PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu128
       UV_INDEX: https://download.pytorch.org/whl/cu128
-      CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON -DTILELANG_UPDATE_SUBMODULES=OFF"
+      CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON -DTILELANG_UPDATE_SUBMODULES=OFF -DPython3_EXECUTABLE=.venv/bin/python -DPython_EXECUTABLE=.venv/bin/python"
       CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF"
       XDG_CACHE_HOME: /ci-cache
       PIP_CACHE_DIR: /ci-cache/pip
@@ -160,6 +160,9 @@ jobs:
           else
             echo "::warning::clang-apply-replacements not found in PATH, automatic fixing disabled."
           fi
+
+          # Activate venv so CMake finds z3 and other Python packages
+          . .venv/bin/activate
 
           # Run cmake to create the build directory with compile_commands.json
           cmake -S . -B cmake-build --fresh ${CLANG_TIDY_CMAKE_OPTIONS}  # no quotes here
