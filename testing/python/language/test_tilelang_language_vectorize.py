@@ -138,13 +138,27 @@ def vectorize_test_all_dtypes(dtype, vec_num):
         torch.int16,
         torch.int32,
         torch.int64,
+    ],
+)
+@pytest.mark.parametrize("vec_num", [1, 2, 4, 8])
+def test_vectorize_all_dtypes(dtype, vec_num):
+    x = torch.empty((64,), dtype=dtype, device="cuda")
+    kernel = vectorize_test_all_dtypes(dtype, vec_num)
+    kernel(x)
+
+
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0)
+@pytest.mark.parametrize(
+    "dtype",
+    [
         torch.float8_e4m3fn,
         torch.float8_e5m2,
         torch.float8_e8m0fnu,
     ],
 )
 @pytest.mark.parametrize("vec_num", [1, 2, 4, 8])
-def test_vectorize_all_dtypes(dtype, vec_num):
+def test_vectorize_fp8(dtype, vec_num):
     x = torch.empty((64,), dtype=dtype, device="cuda")
     kernel = vectorize_test_all_dtypes(dtype, vec_num)
     kernel(x)

@@ -994,9 +994,9 @@ struct TileLangThreadSyncPlanner : public ConstrVisitor {
             Array<PrimExpr> indices;
             PrimExpr remaining = std::move(offset);
             for (size_t i = 0; i < shape.size(); ++i) {
-              PrimExpr stride = make_const(DataType::Int(32), 1);
+              PrimExpr stride = make_const(remaining.dtype(), 1);
               for (size_t j = i + 1; j < shape.size(); ++j) {
-                stride = stride * shape[j];
+                stride = stride * cast(remaining.dtype(), shape[j]);
               }
               PrimExpr idx = FloorDiv(remaining, stride);
               remaining = FloorMod(remaining, stride);

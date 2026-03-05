@@ -445,6 +445,7 @@ def test_gemm_sr(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, blo
 
 
 @tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(8, 9)
 @pytest.mark.parametrize(
     "M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads",
     [
@@ -609,6 +610,7 @@ def test_gemm_rr(M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, blo
 
 
 @tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(8, 9)
 @pytest.mark.parametrize(
     "M, N, K, trans_A, trans_B, in_dtype, out_dtype, dtypeAccum, block_M, block_N, block_K, num_stages, num_threads",
     [

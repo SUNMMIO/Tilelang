@@ -325,27 +325,31 @@ TL_DEVICE T warp_reduce(T value, ReduceOp op) {
   }
 #endif
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-  auto run_reduce_sync = [&]<typename T_cast>(T_cast val) {
-    if constexpr (std::is_same_v<ReduceOp, SumOp>) {
-      return __reduce_add_sync(mask, val);
-    } else if constexpr (std::is_same_v<ReduceOp, MaxOp>) {
-      return __reduce_max_sync(mask, val);
-    } else if constexpr (std::is_same_v<ReduceOp, MinOp>) {
-      return __reduce_min_sync(mask, val);
-    } else if constexpr (std::is_same_v<ReduceOp, BitAndOp>) {
-      return __reduce_and_sync(mask, val);
-    } else if constexpr (std::is_same_v<ReduceOp, BitOrOp>) {
-      return __reduce_or_sync(mask, val);
-    } else if constexpr (std::is_same_v<ReduceOp, BitXorOp>) {
-      return __reduce_xor_sync(mask, val);
-    }
-  };
+// Helper to dispatch reduce_sync by ReduceOp type (C++17 compatible,
+// avoids C++20 template lambda syntax unsupported by older nvcc).
+#define TL_DISPATCH_REDUCE_SYNC(val)                                           \
+  ([&]() {                                                                     \
+    if constexpr (std::is_same_v<ReduceOp, SumOp>) {                           \
+      return __reduce_add_sync(mask, val);                                     \
+    } else if constexpr (std::is_same_v<ReduceOp, MaxOp>) {                    \
+      return __reduce_max_sync(mask, val);                                     \
+    } else if constexpr (std::is_same_v<ReduceOp, MinOp>) {                    \
+      return __reduce_min_sync(mask, val);                                     \
+    } else if constexpr (std::is_same_v<ReduceOp, BitAndOp>) {                 \
+      return __reduce_and_sync(mask, val);                                     \
+    } else if constexpr (std::is_same_v<ReduceOp, BitOrOp>) {                  \
+      return __reduce_or_sync(mask, val);                                      \
+    } else if constexpr (std::is_same_v<ReduceOp, BitXorOp>) {                 \
+      return __reduce_xor_sync(mask, val);                                     \
+    }                                                                          \
+  }())
 
   if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, uint32_t>) {
-    return run_reduce_sync(value);
+    return TL_DISPATCH_REDUCE_SYNC(value);
   } else if constexpr (std::is_integral_v<T>) {
-    return static_cast<T>(run_reduce_sync(static_cast<int32_t>(value)));
+    return static_cast<T>(TL_DISPATCH_REDUCE_SYNC(static_cast<int32_t>(value)));
   }
+#undef TL_DISPATCH_REDUCE_SYNC
 #endif
   value = op(value, tl::shfl_xor_sync(mask, value, 16));
   value = op(value, tl::shfl_xor_sync(mask, value, 8));

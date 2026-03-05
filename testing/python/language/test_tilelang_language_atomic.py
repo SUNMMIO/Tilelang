@@ -215,6 +215,7 @@ def tma_atomic_add_program(out, explicit_swizzle=False):
 
 
 @tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(9, 0)
 def test_tma_atomic_add():
     out = torch.zeros((16, 16), dtype=torch.float32, device="cuda")
     tma_atomic_add_program(out)

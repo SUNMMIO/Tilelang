@@ -21,6 +21,7 @@
 
 import pytest
 import tilelang
+import tilelang.testing
 import tilelang.language as T
 import tvm_ffi
 import torch
@@ -28,12 +29,27 @@ import uuid
 from pathlib import Path
 from tilelang.env import env
 from tilelang.cache import _dispatch_map
+from tilelang.contrib import nvcc
+
+# Check CUDA toolkit version for CuTeDSL (requires >= 12.3)
+try:
+    _cuda_ver = nvcc.get_cuda_version()[:2]
+except Exception:
+    _cuda_ver = (0, 0)
+
+_cutedsl_param = pytest.param(
+    "cutedsl",
+    marks=pytest.mark.skipif(
+        _cuda_ver < (12, 3),
+        reason=f"CuTeDSL requires CUDA toolkit >= 12.3, have {'.'.join(map(str, _cuda_ver))}",
+    ),
+)
 
 BACKENDS = [
     "tvm_ffi",
     "cython",
     "nvrtc",
-    "cutedsl",
+    _cutedsl_param,
 ]
 
 

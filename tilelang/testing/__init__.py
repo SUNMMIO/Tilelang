@@ -122,3 +122,34 @@ def requires_cuda_compute_version_lt(major_version, minor_version=0):
 
 def requires_cuda_compute_version_le(major_version, minor_version=0):
     return requires_cuda_compute_version(major_version, minor_version, mode="le")
+
+
+def requires_cuda_toolkit_version(major, minor=0):
+    """Skip test if CUDA toolkit version is below (major, minor).
+
+    Checks the nvcc / toolkit version (e.g. 12.3), NOT the GPU compute
+    capability.  Useful for guarding tests that rely on Driver API
+    symbols introduced in a specific CUDA release.
+    """
+    min_ver = (major, minor)
+    try:
+        full = nvcc.get_cuda_version()  # e.g. (12, 0, 140)
+        toolkit_ver = full[:2]
+    except Exception:
+        toolkit_ver = (0, 0)
+
+    min_str = ".".join(str(v) for v in min_ver)
+    cur_str = ".".join(str(v) for v in toolkit_ver)
+
+    requires = [
+        pytest.mark.skipif(
+            toolkit_ver < min_ver,
+            reason=f"Requires CUDA toolkit >= {min_str}, but have {cur_str}",
+        ),
+        *requires_cuda.marks(),
+    ]
+
+    def inner(func):
+        return _compose([func], requires)
+
+    return inner

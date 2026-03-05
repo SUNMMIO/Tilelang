@@ -126,6 +126,7 @@ def test_no_transform_if_then_else_condition():
 
 
 @tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0, mode="gt")
 def test_codegen_local_to_memory():
     """Test CUDA codegen for local → memory with vectorized copy."""
 
@@ -148,6 +149,7 @@ def test_codegen_local_to_memory():
 
 
 @tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0, mode="gt")
 def test_codegen_memory_to_local():
     """Test CUDA codegen for memory → local with vectorized copy."""
 
