@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 from tvm import tir
-from tilelang.utils.language import (get_buffer_region_from_load, legalize_pairwise_extents,
-                                     to_buffer_region)
+from tilelang.utils.language import get_buffer_region_from_load, legalize_pairwise_extents, to_buffer_region
 
 
 def _get_extent(data):

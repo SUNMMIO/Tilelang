@@ -19,12 +19,11 @@ def layout_func(i, j, continuous):
 
 
 def matmul(M, N, K, block_M, block_N, block_K, version, dtype=T.float16, accum_dtype=T.float32):
-
     @T.prim_func
     def main(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((K, N), dtype),
-            C: T.Tensor((M, N), accum_dtype),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        C: T.Tensor((M, N), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
@@ -40,16 +39,15 @@ def matmul(M, N, K, block_M, block_N, block_K, version, dtype=T.float16, accum_d
                 elif version == 2:
                     T.gemm_v2(A_shared, B_shared, C_shared)
                 else:
-                    raise ValueError(f'unsupported gemm version: {version}')
+                    raise ValueError(f"unsupported gemm version: {version}")
 
             T.copy(C_shared, C[by * block_M, bx * block_N])
 
-    return tvm.IRModule({'main': main})
+    return tvm.IRModule({"main": main})
 
 
 @tir.functor.visitor
 class _LayoutVisualVisitor(PyStmtExprVisitor):
-
     def __init__(self):
         super().__init__()
 
@@ -62,7 +60,6 @@ class _LayoutVisualVisitor(PyStmtExprVisitor):
 
 
 def LayoutVisual():
-
     def pass_fn(func: tir.PrimFunc, mod, ctx):
         _LayoutVisualVisitor().visit_stmt(func.body)
         return func
@@ -113,14 +110,14 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, versio
         for i in range(block_M):
             for j in range(block_K):
                 index = layout_func(i, j, block_K)
-                assert index == collected_result['A_shared'].map_forward_index([i, j])[0]
+                assert index == collected_result["A_shared"].map_forward_index([i, j])[0]
 
         for i in range(block_K):
             for j in range(block_N):
                 index = layout_func(i, j, block_N)
-                assert index == collected_result['B_shared'].map_forward_index([i, j])[0]
+                assert index == collected_result["B_shared"].map_forward_index([i, j])[0]
 
         for i in range(block_M):
             for j in range(block_N):
                 index = layout_func(i, j, block_N)
-                assert index == collected_result['C_shared'].map_forward_index([i, j])[0]
+                assert index == collected_result["C_shared"].map_forward_index([i, j])[0]
