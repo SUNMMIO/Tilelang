@@ -183,12 +183,14 @@ jobs:
       - name: Run Python test suite
         run: |
           . .venv/bin/activate
+          # Add the CUDA-aware pytest-xdist scheduler plugin to PYTHONPATH
+          export PYTHONPATH="${GITHUB_WORKSPACE}/maint/scripts:${PYTHONPATH}"
           cd testing
           PYTEST=(
             uv run --no-project -m --
             pytest --verbose --color=yes --durations=0 --showlocals --cache-clear
           )
-          "${PYTEST[@]}" --maxfail=3 --numprocesses=4 -c pytest.ini ./python
+          "${PYTEST[@]}" --maxfail=3 --numprocesses=4 -p pytest_cuda_scheduler -c pytest.ini ./python
 
       - name: List generated files
         if: ${{ !cancelled() }}
