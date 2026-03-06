@@ -21,27 +21,28 @@ def dot_mul_tiled_parallel_2d(
     dtype="float16",
     accum_dtype="float16",
 ):
-
     @T.prim_func
     def main(
-            A: T.Tensor((M, N), dtype),
-            B: T.Tensor((M, N), dtype),
-            C: T.Tensor((M, N), dtype),
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M, N), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(
-                T.ceildiv(N, block_N),
-                T.ceildiv(M, block_M),
-                threads=128,
+            T.ceildiv(N, block_N),
+            T.ceildiv(M, block_M),
+            threads=128,
         ) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_N), dtype)
             B_shared = T.alloc_shared((block_M, block_N), dtype)
             C_shared = T.alloc_fragment((block_M, block_N), accum_dtype)
 
-            T.annotate_tileview({
-                A_shared: make_tileview(A_shared, tile_size, index_map),
-                B_shared: make_tileview(B_shared, tile_size, index_map),
-                C_shared: make_tileview(C_shared, tile_size, index_map),
-            })
+            T.annotate_tileview(
+                {
+                    A_shared: make_tileview(A_shared, tile_size, index_map),
+                    B_shared: make_tileview(B_shared, tile_size, index_map),
+                    C_shared: make_tileview(C_shared, tile_size, index_map),
+                }
+            )
 
             T.clear(C_shared)
             T.copy(A[by * block_M, bx * block_N], A_shared)
@@ -67,38 +68,37 @@ def dot_mul_tiled_parallel_3d(
     dtype="float16",
     accum_dtype="float16",
 ):
-
     @T.prim_func
     def main(
-            A: T.Tensor((Batch, M, N), dtype),
-            B: T.Tensor((Batch, M, N), dtype),
-            C: T.Tensor((Batch, M, N), dtype),
+        A: T.Tensor((Batch, M, N), dtype),
+        B: T.Tensor((Batch, M, N), dtype),
+        C: T.Tensor((Batch, M, N), dtype),
     ):
         with T.Kernel(
-                T.ceildiv(N, block_N),
-                T.ceildiv(M, block_M),
-                T.ceildiv(Batch, block_B),
-                threads=128,
+            T.ceildiv(N, block_N),
+            T.ceildiv(M, block_M),
+            T.ceildiv(Batch, block_B),
+            threads=128,
         ) as (bx, by, bz):
             A_shared = T.alloc_shared((block_B, block_M, block_N), dtype)
             B_shared = T.alloc_shared((block_B, block_M, block_N), dtype)
             C_shared = T.alloc_fragment((block_B, block_M, block_N), accum_dtype)
 
-            T.annotate_tileview({
-                A_shared: make_tileview(A_shared, tile_size, index_map),
-                B_shared: make_tileview(B_shared, tile_size, index_map),
-                C_shared: make_tileview(C_shared, tile_size, index_map),
-            })
+            T.annotate_tileview(
+                {
+                    A_shared: make_tileview(A_shared, tile_size, index_map),
+                    B_shared: make_tileview(B_shared, tile_size, index_map),
+                    C_shared: make_tileview(C_shared, tile_size, index_map),
+                }
+            )
 
             T.clear(C_shared)
             T.copy(
-                A[bz * block_B:(bz + 1) * block_B, by * block_M:(by + 1) * block_M,
-                  bx * block_N:(bx + 1) * block_N],
+                A[bz * block_B : (bz + 1) * block_B, by * block_M : (by + 1) * block_M, bx * block_N : (bx + 1) * block_N],
                 A_shared,
             )
             T.copy(
-                B[bz * block_B:(bz + 1) * block_B, by * block_M:(by + 1) * block_M,
-                  bx * block_N:(bx + 1) * block_N],
+                B[bz * block_B : (bz + 1) * block_B, by * block_M : (by + 1) * block_M, bx * block_N : (bx + 1) * block_N],
                 B_shared,
             )
 
@@ -107,8 +107,7 @@ def dot_mul_tiled_parallel_3d(
 
             T.copy(
                 C_shared,
-                C[bz * block_B:(bz + 1) * block_B, by * block_M:(by + 1) * block_M,
-                  bx * block_N:(bx + 1) * block_N],
+                C[bz * block_B : (bz + 1) * block_B, by * block_M : (by + 1) * block_M, bx * block_N : (bx + 1) * block_N],
             )
 
     return main
@@ -196,19 +195,16 @@ def test_tiles_loop_insert_and_index_rewrite(prim_func_builder):
             found_vectorized=found_vectorized,
         ):
             if isinstance(stmt, tir.For):
-                if (stmt.kind == tir.ForKind.SERIAL and isinstance(stmt.extent, tir.IntImm) and
-                        stmt.extent.value == tile_size[0]):
+                if stmt.kind == tir.ForKind.SERIAL and isinstance(stmt.extent, tir.IntImm) and stmt.extent.value == tile_size[0]:
                     found_serial.append(stmt)
 
-                if (stmt.kind == tir.ForKind.VECTORIZED and isinstance(stmt.extent, tir.IntImm) and
-                        stmt.extent.value == tile_size[1]):
+                if stmt.kind == tir.ForKind.VECTORIZED and isinstance(stmt.extent, tir.IntImm) and stmt.extent.value == tile_size[1]:
                     found_vectorized.append(stmt)
 
         tvm.tir.stmt_functor.post_order_visit(exec_loop.body, visit_subtree)
 
-        assert found_serial, ("Expected serial(tile_size[0]) loop inside tile.execution subtree")
-        assert found_vectorized, (
-            "Expected vectorized(tile_size[1]) loop inside tile.execution subtree")
+        assert found_serial, "Expected serial(tile_size[0]) loop inside tile.execution subtree"
+        assert found_vectorized, "Expected vectorized(tile_size[1]) loop inside tile.execution subtree"
 
     # -----------------------------------------------------
     # 3. Pattern check: index rewrite
@@ -225,8 +221,6 @@ def test_tiles_loop_insert_and_index_rewrite(prim_func_builder):
         s = str(expr)
         return f"* {factor}" in s or f"*{factor}" in s
 
-    assert any(contains_mul(e, tile_size[0])
-               for e in index_exprs), "Expected i * tile_size[0] in rewritten indices"
+    assert any(contains_mul(e, tile_size[0]) for e in index_exprs), "Expected i * tile_size[0] in rewritten indices"
 
-    assert any(contains_mul(e, tile_size[1])
-               for e in index_exprs), "Expected j * tile_size[1] in rewritten indices"
+    assert any(contains_mul(e, tile_size[1]) for e in index_exprs), "Expected j * tile_size[1] in rewritten indices"

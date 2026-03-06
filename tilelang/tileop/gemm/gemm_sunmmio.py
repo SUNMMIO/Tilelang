@@ -6,13 +6,14 @@ from tvm import tir
 from tilelang.transform.simplify import _Simplify
 from tilelang import language as T
 from tilelang.utils.language import (
-    retrieve_shape,)
+    retrieve_shape,
+)
 from tilelang.language.utils import (
-    buffer_region_to_tile_region,)
+    buffer_region_to_tile_region,
+)
 
 
 class GemmSunmmio(GemmBase):
-
     def infer_layout(self, target: Target, thread_nums: int):
         if self.is_gemm_sunmmio_scope():
             return {
@@ -21,12 +22,9 @@ class GemmSunmmio(GemmBase):
                 self.C: make_blockwise_zz_layout(self.C),
             }
         else:
-            raise ValueError(
-                f"Unsupported gemm combination of Sunmmio, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}"
-            )
+            raise ValueError(f"Unsupported gemm combination of Sunmmio, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}")
 
     def lower(self, layout_map: dict, target: Target, thread_nums: int, thread_var: tir.Var):
-
         if self.is_gemm_sunmmio_scope():
             A_shape = retrieve_shape(self.ARegion)
             B_shape = retrieve_shape(self.BRegion)
@@ -48,12 +46,10 @@ class GemmSunmmio(GemmBase):
             return _Simplify(_gemm_sss, inline_let=True)
 
         else:
-            raise ValueError(
-                f"Unsupported gemm combination of Sunmmio, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}"
-            )
+            raise ValueError(f"Unsupported gemm combination of Sunmmio, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}")
 
     def is_gemm_sunmmio_scope(self) -> bool:
-        a_check = self.A.scope() == 'shared.asram'
-        b_check = self.B.scope() == 'shared.wsram'
-        c_check = self.C.scope() == 'shared.rsram'
+        a_check = self.A.scope() == "shared.asram"
+        b_check = self.B.scope() == "shared.wsram"
+        c_check = self.C.scope() == "shared.rsram"
         return a_check and b_check and c_check

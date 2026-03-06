@@ -90,13 +90,8 @@ class MeshTensorProxy:
 
         if policy.cross_mesh_dim is not None:
             if not 0 <= policy.cross_mesh_dim < len(sharded_shape):
-                raise ValueError(
-                    f"Invalid cross_mesh_dim: {policy.cross_mesh_dim}, "
-                    f"tensor rank is {len(sharded_shape)}"
-                )
-            sharded_shape[policy.cross_mesh_dim] = int(
-                math.ceil(sharded_shape[policy.cross_mesh_dim] / (nrows * ncols))
-            )
+                raise ValueError(f"Invalid cross_mesh_dim: {policy.cross_mesh_dim}, tensor rank is {len(sharded_shape)}")
+            sharded_shape[policy.cross_mesh_dim] = int(math.ceil(sharded_shape[policy.cross_mesh_dim] / (nrows * ncols)))
             return tuple(sharded_shape)
 
         if policy.replicate == MeshReplicationType.ROW:
@@ -104,35 +99,23 @@ class MeshTensorProxy:
                 raise ValueError("Cannot shard on x-axis when replicating on rows")
             if policy.y is not None:
                 if not 0 <= policy.y < len(sharded_shape):
-                    raise ValueError(
-                        f"Invalid y-split dimension: {policy.y}, "
-                        f"tensor rank is {len(sharded_shape)}"
-                    )
+                    raise ValueError(f"Invalid y-split dimension: {policy.y}, tensor rank is {len(sharded_shape)}")
                 sharded_shape[policy.y] = int(math.ceil(sharded_shape[policy.y] / nrows))
         elif policy.replicate == MeshReplicationType.COLUMN:
             if policy.y is not None:
                 raise ValueError("Cannot shard on y-axis when replicating on columns")
             if policy.x is not None:
                 if not 0 <= policy.x < len(sharded_shape):
-                    raise ValueError(
-                        f"Invalid x-split dimension: {policy.x}, "
-                        f"tensor rank is {len(sharded_shape)}"
-                    )
+                    raise ValueError(f"Invalid x-split dimension: {policy.x}, tensor rank is {len(sharded_shape)}")
                 sharded_shape[policy.x] = int(math.ceil(sharded_shape[policy.x] / ncols))
         elif policy.replicate == MeshReplicationType.NONE:
             if policy.x is not None:
                 if not 0 <= policy.x < len(sharded_shape):
-                    raise ValueError(
-                        f"Invalid x-split dimension: {policy.x}, "
-                        f"tensor rank is {len(sharded_shape)}"
-                    )
+                    raise ValueError(f"Invalid x-split dimension: {policy.x}, tensor rank is {len(sharded_shape)}")
                 sharded_shape[policy.x] = int(math.ceil(sharded_shape[policy.x] / ncols))
             if policy.y is not None:
                 if not 0 <= policy.y < len(sharded_shape):
-                    raise ValueError(
-                        f"Invalid y-split dimension: {policy.y}, "
-                        f"tensor rank is {len(sharded_shape)}"
-                    )
+                    raise ValueError(f"Invalid y-split dimension: {policy.y}, tensor rank is {len(sharded_shape)}")
                 sharded_shape[policy.y] = int(math.ceil(sharded_shape[policy.y] / nrows))
 
         return tuple(sharded_shape)
@@ -211,9 +194,7 @@ class MeshTensorProxy:
         )
 
         if hierarchical_dims is not None:
-            sharded_hdims = self._get_sharded_hierarchical_layout(
-                hierarchical_dims, hierarchical_groups, sharding_policy, nrows, ncols
-            )
+            sharded_hdims = self._get_sharded_hierarchical_layout(hierarchical_dims, hierarchical_groups, sharding_policy, nrows, ncols)
             sharded_hstrides = self._derive_sharded_hstrides(sharded_hdims, hierarchical_strides)
             meta_data["global_hdims"] = hierarchical_dims
             meta_data["global_hstrides"] = hierarchical_strides
@@ -241,7 +222,6 @@ class MeshTensorProxy:
 if TYPE_CHECKING:
 
     class MeshTensor:
-
         def __new__(
             cls,
             shape: ShapeType,

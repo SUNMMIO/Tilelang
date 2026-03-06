@@ -18,28 +18,29 @@ def dot_mul_tiled_parallel_2d(
     dtype="float16",
     accum_dtype="float16",
 ):
-
     @T.prim_func
     def main(
-            A: T.Tensor((M, N), dtype),
-            B: T.Tensor((M, N), dtype),
-            C: T.Tensor((M, N), dtype),
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M, N), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(
-                T.ceildiv(N, block_N),
-                T.ceildiv(M, block_M),
-                threads=128,
+            T.ceildiv(N, block_N),
+            T.ceildiv(M, block_M),
+            threads=128,
         ) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_N), dtype)
             B_shared = T.alloc_shared((block_M, block_N), dtype)
             C_shared = T.alloc_fragment((block_M, block_N), accum_dtype)
 
             # Attach tileview metadata to buffers
-            T.annotate_tileview({
-                A_shared: make_tileview(A_shared, (32, 32), (-2, -1)),
-                B_shared: make_tileview(B_shared, (32, 32), (-2, -1)),
-                C_shared: make_tileview(C_shared, (32, 32), (-2, -1)),
-            })
+            T.annotate_tileview(
+                {
+                    A_shared: make_tileview(A_shared, (32, 32), (-2, -1)),
+                    B_shared: make_tileview(B_shared, (32, 32), (-2, -1)),
+                    C_shared: make_tileview(C_shared, (32, 32), (-2, -1)),
+                }
+            )
 
             T.clear(C_shared)
 
@@ -68,39 +69,38 @@ def dot_mul_tiled_parallel_3d(
     dtype="float16",
     accum_dtype="float16",
 ):
-
     @T.prim_func
     def main(
-            A: T.Tensor((B, M, N), dtype),
-            B_: T.Tensor((B, M, N), dtype),
-            C: T.Tensor((B, M, N), dtype),
+        A: T.Tensor((B, M, N), dtype),
+        B_: T.Tensor((B, M, N), dtype),
+        C: T.Tensor((B, M, N), dtype),
     ):
         with T.Kernel(
-                T.ceildiv(N, block_N),
-                T.ceildiv(M, block_M),
-                T.ceildiv(B, block_B),
-                threads=128,
+            T.ceildiv(N, block_N),
+            T.ceildiv(M, block_M),
+            T.ceildiv(B, block_B),
+            threads=128,
         ) as (bx, by, bz):
             A_shared = T.alloc_shared((block_B, block_M, block_N), dtype)
             B_shared = T.alloc_shared((block_B, block_M, block_N), dtype)
             C_shared = T.alloc_fragment((block_B, block_M, block_N), accum_dtype)
 
-            T.annotate_tileview({
-                A_shared: make_tileview(A_shared, (32, 32), (-2, -1)),
-                B_shared: make_tileview(B_shared, (32, 32), (-2, -1)),
-                C_shared: make_tileview(C_shared, (32, 32), (-2, -1)),
-            })
+            T.annotate_tileview(
+                {
+                    A_shared: make_tileview(A_shared, (32, 32), (-2, -1)),
+                    B_shared: make_tileview(B_shared, (32, 32), (-2, -1)),
+                    C_shared: make_tileview(C_shared, (32, 32), (-2, -1)),
+                }
+            )
 
             T.clear(C_shared)
 
             T.copy(
-                A[bz * block_B:(bz + 1) * block_B, by * block_M:(by + 1) * block_M,
-                  bx * block_N:(bx + 1) * block_N],
+                A[bz * block_B : (bz + 1) * block_B, by * block_M : (by + 1) * block_M, bx * block_N : (bx + 1) * block_N],
                 A_shared,
             )
             T.copy(
-                B_[bz * block_B:(bz + 1) * block_B, by * block_M:(by + 1) * block_M,
-                   bx * block_N:(bx + 1) * block_N],
+                B_[bz * block_B : (bz + 1) * block_B, by * block_M : (by + 1) * block_M, bx * block_N : (bx + 1) * block_N],
                 B_shared,
             )
 
@@ -109,8 +109,7 @@ def dot_mul_tiled_parallel_3d(
 
             T.copy(
                 C_shared,
-                C[bz * block_B:(bz + 1) * block_B, by * block_M:(by + 1) * block_M,
-                  bx * block_N:(bx + 1) * block_N],
+                C[bz * block_B : (bz + 1) * block_B, by * block_M : (by + 1) * block_M, bx * block_N : (bx + 1) * block_N],
             )
 
     return main
@@ -194,9 +193,9 @@ def test_legalize_tiles_loop_attach_tileview_metadata():
         for k, v in found_tile_metadata.items():
             assert v, f"Expected annotation '{k}' not found in tile loops"
 
-        assert (
-            tile_execution_count == expected_exec_count
-        ), f"Expected {expected_exec_count} tile.execution annotations, got {tile_execution_count}"
+        assert tile_execution_count == expected_exec_count, (
+            f"Expected {expected_exec_count} tile.execution annotations, got {tile_execution_count}"
+        )
 
 
 if __name__ == "__main__":

@@ -2,8 +2,7 @@ import tilelang.language as T
 from tilelang import tvm as tvm
 from tilelang.carver.arch import driver
 from tilelang.engine.lower import canon_target_host
-from tilelang.utils.target import determine_target, \
-    target_is_sunmmio
+from tilelang.utils.target import determine_target, target_is_sunmmio
 
 
 def test_sunmmio_target():
@@ -26,8 +25,7 @@ def test_sunmmio_target_binding():
     print("Device mesh config:", device_mesh_config)
 
     def example_tensor_annot(shape):
-        MyTensor = T.MeshTensor(
-            shape, T.MeshShardingPolicy(y=0, x=1), device_mesh_config, dtype="float32")
+        MyTensor = T.MeshTensor(shape, T.MeshShardingPolicy(y=0, x=1), device_mesh_config, dtype="float32")
 
         @T.prim_func
         def kernel(A: MyTensor):
@@ -35,10 +33,12 @@ def test_sunmmio_target_binding():
 
         return kernel
 
-    func = example_tensor_annot((
-        1024,
-        1024,
-    ))
+    func = example_tensor_annot(
+        (
+            1024,
+            1024,
+        )
+    )
     print(func)
     target_name = "Sunmmio"
     target = determine_target(target_name, return_object=True)
@@ -53,4 +53,4 @@ def test_sunmmio_target_binding():
     target_attr = prim_func_attr["target"]
     assert target_attr.attrs["mcpu"] == "sunmmio-a4e"
     for key in ["device_mesh_nrow", "device_mesh_nrow"]:
-        assert any(key in mattr for mattr in target_attr.attrs['mattr'])
+        assert any(key in mattr for mattr in target_attr.attrs["mattr"])
