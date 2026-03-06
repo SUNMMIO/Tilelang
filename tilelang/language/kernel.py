@@ -3,11 +3,13 @@
 from __future__ import annotations
 from collections import deque
 from tvm import tir
+from tvm.target import Target
 from tvm.tir import Var
 from tvm.script.ir_builder.tir.frame import TIRFrame, BlockFrame
 from tvm.ffi import register_object
 from tilelang import _ffi_api
 from tilelang.jit.exceptions import JITNoBuilderError
+from tilelang.utils.target import target_is_sunmmio
 import threading
 
 # Ensure single-dimension kernel bindings can be unpacked like iterables.
@@ -292,8 +294,8 @@ def Kernel(
 
     if not is_cpu:
         cur_target = Target.current(allow_none=True)
-        if cur_target is not None and target_is_sunmmio(cur_target):
-            #Overriding requested threads to 1 for Sunmmio target.
+        if cur_target is not None and (cur_target.kind.name == "npu" or
+                                       target_is_sunmmio(cur_target)):
             threads = 1
 
     if not is_cpu and threads is None:
