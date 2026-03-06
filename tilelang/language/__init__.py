@@ -23,6 +23,7 @@ from .mesh_tensor import (  # noqa: F401
 )
 from .loop import (
     Parallel,  # noqa: F401
+    Tiles,  # noqa: F401
     Persistent,  # noqa: F401
     Pipelined,  # noqa: F401
     serial,  # noqa: F401
