@@ -13,7 +13,6 @@ import threading
 # Ensure single-dimension kernel bindings can be unpacked like iterables.
 # especially for issue https://github.com/tile-ai/tilelang/issues/830
 if not hasattr(Var, "__iter__"):
-
     def _var_iter(self):
         yield self
 
@@ -290,6 +289,12 @@ def Kernel(
         raise JITNoBuilderError("T.Kernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")
 
     attrs: dict = {}
+
+    if not is_cpu:
+        cur_target = Target.current(allow_none=True)
+        if cur_target is not None and target_is_sunmmio(cur_target):
+            #Overriding requested threads to 1 for Sunmmio target.
+            threads = 1
 
     if not is_cpu and threads is None:
         threads = 128  # default thread number
