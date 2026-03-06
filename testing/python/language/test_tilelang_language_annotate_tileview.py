@@ -1,4 +1,5 @@
 """Tests for TileView and annotate_tileview functionality."""
+
 import pytest
 import tilelang
 import tilelang.language as T
@@ -13,21 +14,15 @@ from tvm import tir
 # =============================================================================
 TILEVIEW_TEST_CASES = [
     # Basic 2D cases
-    pytest.param([64, 128], [16, 32], [-2, -1], [4, 4, 16, 32],
-                 512,
-                 id="2d_basic_64x128_tile_16x32"),
+    pytest.param([64, 128], [16, 32], [-2, -1], [4, 4, 16, 32], 512, id="2d_basic_64x128_tile_16x32"),
     pytest.param([128, 256], [32, 64], [-2, -1], [4, 4, 32, 64], 2048, id="2d_128x256_tile_32x64"),
     pytest.param([32, 32], [8, 8], [-2, -1], [4, 4, 8, 8], 64, id="2d_square_32x32_tile_8x8"),
     pytest.param([64, 128], [16, 32], [0, 1], [4, 4, 16, 32], 512, id="2d_positive_index_map"),
     # 3D cases - tiling last 2 dims
-    pytest.param([8, 64, 128], [16, 32], [-2, -1], [8, 4, 4, 16, 32],
-                 512,
-                 id="3d_8x64x128_tile_last2"),
+    pytest.param([8, 64, 128], [16, 32], [-2, -1], [8, 4, 4, 16, 32], 512, id="3d_8x64x128_tile_last2"),
     pytest.param([4, 32, 64], [8, 16], [-2, -1], [4, 4, 4, 8, 16], 128, id="3d_4x32x64_tile_last2"),
     # 4D cases - tiling last 2 dims
-    pytest.param([2, 4, 64, 128], [16, 32], [-2, -1], [2, 4, 4, 4, 16, 32],
-                 512,
-                 id="4d_2x4x64x128_tile_last2"),
+    pytest.param([2, 4, 64, 128], [16, 32], [-2, -1], [2, 4, 4, 4, 16, 32], 512, id="4d_2x4x64x128_tile_last2"),
     # Single tile (buffer_shape == tile_shape for tiled dims)
     pytest.param([16, 32], [16, 32], [-2, -1], [1, 1, 16, 32], 512, id="2d_single_tile"),
     # Asymmetric tiling
@@ -35,11 +30,8 @@ TILEVIEW_TEST_CASES = [
 ]
 
 
-@pytest.mark.parametrize(
-    "buffer_shape, tile_shape, index_map, expected_tiled_shape, expected_vector_lanes",
-    TILEVIEW_TEST_CASES)
-def test_tileview_creation(buffer_shape, tile_shape, index_map, expected_tiled_shape,
-                           expected_vector_lanes):
+@pytest.mark.parametrize("buffer_shape, tile_shape, index_map, expected_tiled_shape, expected_vector_lanes", TILEVIEW_TEST_CASES)
+def test_tileview_creation(buffer_shape, tile_shape, index_map, expected_tiled_shape, expected_vector_lanes):
     """Test TileView creation with various shapes and configurations."""
     tv = TileView(buffer_shape, tile_shape, index_map)
 
@@ -72,18 +64,10 @@ def test_tileview_creation(buffer_shape, tile_shape, index_map, expected_tiled_s
 # Format: (tv1_args, tv2_args, should_be_equal)
 # =============================================================================
 TILEVIEW_EQUALITY_CASES = [
-    pytest.param(([64, 128], [16, 32], [-2, -1]), ([64, 128], [16, 32], [-2, -1]),
-                 True,
-                 id="equal_same_params"),
-    pytest.param(([64, 128], [16, 32], [-2, -1]), ([64, 128], [8, 32], [-2, -1]),
-                 False,
-                 id="different_tile_shape"),
-    pytest.param(([64, 128], [16, 32], [-2, -1]), ([128, 128], [16, 32], [-2, -1]),
-                 False,
-                 id="different_buffer_shape"),
-    pytest.param(([64, 128], [16, 32], [0, 1]), ([64, 128], [16, 32], [-2, -1]),
-                 False,
-                 id="different_index_map"),
+    pytest.param(([64, 128], [16, 32], [-2, -1]), ([64, 128], [16, 32], [-2, -1]), True, id="equal_same_params"),
+    pytest.param(([64, 128], [16, 32], [-2, -1]), ([64, 128], [8, 32], [-2, -1]), False, id="different_tile_shape"),
+    pytest.param(([64, 128], [16, 32], [-2, -1]), ([128, 128], [16, 32], [-2, -1]), False, id="different_buffer_shape"),
+    pytest.param(([64, 128], [16, 32], [0, 1]), ([64, 128], [16, 32], [-2, -1]), False, id="different_index_map"),
 ]
 
 
@@ -177,14 +161,15 @@ ANNOTATE_TILEVIEW_CASES = [
 ]
 
 
-@pytest.mark.parametrize("buffer_shape, tile_shape, index_map, expected_tiled_shape",
-                         ANNOTATE_TILEVIEW_CASES)
+@pytest.mark.parametrize("buffer_shape, tile_shape, index_map, expected_tiled_shape", ANNOTATE_TILEVIEW_CASES)
 def test_annotate_tileview_with_tuple(buffer_shape, tile_shape, index_map, expected_tiled_shape):
     """Test annotate_tileview with tuple shorthand in kernel context."""
     M, N = buffer_shape
 
     @T.prim_func
-    def kernel(A: T.Tensor((M, N), "float16"),):
+    def kernel(
+        A: T.Tensor((M, N), "float16"),
+    ):
         with T.Kernel(1, 1) as (bx, by):
             A_shared = T.alloc_shared((M, N), "float16")
             T.annotate_tileview({A_shared: (tile_shape, index_map)})
@@ -215,15 +200,15 @@ def test_annotate_tileview_with_tuple(buffer_shape, tile_shape, index_map, expec
         assert int(tv.tiled_buffer_shape[i]) == expected
 
 
-@pytest.mark.parametrize("buffer_shape, tile_shape, index_map, expected_tiled_shape",
-                         ANNOTATE_TILEVIEW_CASES)
-def test_annotate_tileview_with_make_tileview(buffer_shape, tile_shape, index_map,
-                                              expected_tiled_shape):
+@pytest.mark.parametrize("buffer_shape, tile_shape, index_map, expected_tiled_shape", ANNOTATE_TILEVIEW_CASES)
+def test_annotate_tileview_with_make_tileview(buffer_shape, tile_shape, index_map, expected_tiled_shape):
     """Test annotate_tileview with make_tileview in kernel context."""
     M, N = buffer_shape
 
     @T.prim_func
-    def kernel(A: T.Tensor((M, N), "float16"),):
+    def kernel(
+        A: T.Tensor((M, N), "float16"),
+    ):
         with T.Kernel(1, 1) as (bx, by):
             A_shared = T.alloc_shared((M, N), "float16")
             T.annotate_tileview({A_shared: make_tileview(A_shared, tile_shape, index_map)})
@@ -247,22 +232,28 @@ def test_annotate_tileview_with_make_tileview(buffer_shape, tile_shape, index_ma
 # Format: (buffers_config) where each entry is (name, buffer_shape, tile_shape, index_map, expected_tiled_shape)
 # =============================================================================
 MULTI_BUFFER_CASES = [
-    pytest.param([
-        ("A_shared", (64, 128), [16, 32], [-2, -1], [4, 4, 16, 32]),
-        ("B_shared", (128, 64), [32, 16], [-2, -1], [4, 4, 32, 16]),
-    ],
-                 id="two_buffers_different_shapes"),
-    pytest.param([
-        ("A_shared", (64, 64), [8, 8], [-2, -1], [8, 8, 8, 8]),
-        ("B_shared", (64, 64), [16, 16], [-2, -1], [4, 4, 16, 16]),
-    ],
-                 id="two_buffers_same_shape_different_tiles"),
-    pytest.param([
-        ("A_shared", (32, 32), [8, 8], [-2, -1], [4, 4, 8, 8]),
-        ("B_shared", (32, 64), [8, 16], [-2, -1], [4, 4, 8, 16]),
-        ("C_shared", (64, 32), [16, 8], [-2, -1], [4, 4, 16, 8]),
-    ],
-                 id="three_buffers"),
+    pytest.param(
+        [
+            ("A_shared", (64, 128), [16, 32], [-2, -1], [4, 4, 16, 32]),
+            ("B_shared", (128, 64), [32, 16], [-2, -1], [4, 4, 32, 16]),
+        ],
+        id="two_buffers_different_shapes",
+    ),
+    pytest.param(
+        [
+            ("A_shared", (64, 64), [8, 8], [-2, -1], [8, 8, 8, 8]),
+            ("B_shared", (64, 64), [16, 16], [-2, -1], [4, 4, 16, 16]),
+        ],
+        id="two_buffers_same_shape_different_tiles",
+    ),
+    pytest.param(
+        [
+            ("A_shared", (32, 32), [8, 8], [-2, -1], [4, 4, 8, 8]),
+            ("B_shared", (32, 64), [8, 16], [-2, -1], [4, 4, 8, 16]),
+            ("C_shared", (64, 32), [16, 8], [-2, -1], [4, 4, 16, 8]),
+        ],
+        id="three_buffers",
+    ),
 ]
 
 
@@ -278,17 +269,19 @@ def test_annotate_tileview_multiple_buffers(buffers_config):
 
     @T.prim_func
     def kernel(
-            A: T.Tensor((M_a, N_a), "float16"),
-            B: T.Tensor((M_b, N_b), "float16"),
+        A: T.Tensor((M_a, N_a), "float16"),
+        B: T.Tensor((M_b, N_b), "float16"),
     ):
         with T.Kernel(1, 1) as (bx, by):
             A_shared = T.alloc_shared((M_a, N_a), "float16")
             B_shared = T.alloc_shared((M_b, N_b), "float16")
 
-            T.annotate_tileview({
-                A_shared: (buf_a[2], buf_a[3]),
-                B_shared: (buf_b[2], buf_b[3]),
-            })
+            T.annotate_tileview(
+                {
+                    A_shared: (buf_a[2], buf_a[3]),
+                    B_shared: (buf_b[2], buf_b[3]),
+                }
+            )
 
             for i, j in T.Parallel(M_a, N_a):
                 A_shared[i, j] = A[i, j]
@@ -316,7 +309,9 @@ def test_annotate_tileview_invalid_input():
     with pytest.raises(ValueError):
 
         @T.prim_func
-        def kernel(A: T.Tensor((64, 128), "float16"),):
+        def kernel(
+            A: T.Tensor((64, 128), "float16"),
+        ):
             with T.Kernel(1, 1) as (bx, by):
                 A_shared = T.alloc_shared((64, 128), "float16")
                 # Invalid: passing a single list instead of tuple

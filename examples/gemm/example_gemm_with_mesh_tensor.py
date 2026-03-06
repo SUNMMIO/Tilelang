@@ -4,14 +4,13 @@ import tilelang.language as T
 
 @tilelang.jit(out_idx=[-1])
 def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
-
     mesh_device_config = (1, 1)
 
     @T.prim_func
     def gemm(
-            A: T.MeshTensor((M, K), T.MeshShardingPolicy(x=1, y=0), mesh_device_config, dtype),
-            B: T.MeshTensor((K, N), T.MeshShardingPolicy(x=1, y=0), mesh_device_config, dtype),
-            C: T.MeshTensor((M, N), T.MeshShardingPolicy(x=1, y=0), mesh_device_config, dtype),
+        A: T.MeshTensor((M, K), T.MeshShardingPolicy(x=1, y=0), mesh_device_config, dtype),
+        B: T.MeshTensor((K, N), T.MeshShardingPolicy(x=1, y=0), mesh_device_config, dtype),
+        C: T.MeshTensor((M, N), T.MeshShardingPolicy(x=1, y=0), mesh_device_config, dtype),
     ):
         sharded_M, sharded_K = A.shape
         _, sharded_N = B.shape

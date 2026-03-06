@@ -204,6 +204,7 @@ def run_gemm_jit_kernel(
 
 
 @tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0)
 @tilelang.testing.requires_cuda_toolkit_version(12, 3)
 def test_gemm_jit_kernel():
     run_gemm_jit_kernel(
@@ -257,6 +258,7 @@ def run_cutedsl_kernel_do_bench(
 
 
 @tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0)
 @tilelang.testing.requires_cuda_toolkit_version(12, 3)
 def test_cutedsl_kernel_do_bench():
     run_cutedsl_kernel_do_bench(512, 1024, 768, False, False, "float16", "float16", "float16", 128, 256, 32, 2)
@@ -301,6 +303,7 @@ def run_cutedsl_kernel_multi_stream(
 
 
 @tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0)
 @tilelang.testing.requires_cuda_toolkit_version(12, 3)
 def test_cutedsl_kernel_multi_stream():
     run_cutedsl_kernel_multi_stream(512, 1024, 768, False, False, "float16", "float16", "float16", 128, 256, 32, 2)
@@ -352,6 +355,7 @@ def run_cutedsl_dynamic_shape(
 
 
 @tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0)
 @tilelang.testing.requires_cuda_toolkit_version(12, 3)
 def test_cutedsl_dynamic_shape():
     run_cutedsl_dynamic_shape(T.dynamic("m"), 1024, 768, False, False, "float16", "float16", "float16", 128, 256, 32, 2)
@@ -403,18 +407,11 @@ def run_cutedsl_barrier(
 
 
 @tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0)
 @tilelang.testing.requires_cuda_toolkit_version(12, 3)
 def test_cutedsl_barrier():
     mbars = (1, 1, 128, 128)
     run_cutedsl_barrier(512, 1024, 768, 128, 256, 32, mbars, False, False, "float16", "float16", "float16", 2, 128)
-
-
-def check_hopper():
-    if not torch.cuda.is_available():
-        return False
-    props = torch.cuda.get_device_properties(0)
-    compute_capability = props.major, props.minor
-    return compute_capability == (9, 0)
 
 
 if __name__ == "__main__":

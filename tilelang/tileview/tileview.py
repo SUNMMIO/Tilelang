@@ -125,10 +125,12 @@ class TileView(Node):
         return _ffi_api.TileView_is_equal(self, other)
 
     def __repr__(self):
-        return (f"TileView(buffer_shape={list(self.buffer_shape)}, "
-                f"tile_shape={list(self.tile_shape)}, "
-                f"index_map={list(self.index_map)}) -> "
-                f"tiled_shape={list(self.tiled_buffer_shape)}")
+        return (
+            f"TileView(buffer_shape={list(self.buffer_shape)}, "
+            f"tile_shape={list(self.tile_shape)}, "
+            f"index_map={list(self.index_map)}) -> "
+            f"tiled_shape={list(self.tiled_buffer_shape)}"
+        )
 
 
 def make_tileview(buffer: Buffer | BufferLoad | BufferRegion, tile_shape, index_map):

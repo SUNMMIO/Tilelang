@@ -77,7 +77,7 @@ jobs:
       USE_CUDA: 1
       PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu128
       UV_INDEX: https://download.pytorch.org/whl/cu128
-      CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON -DTILELANG_UPDATE_SUBMODULES=OFF"
+      CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON -DTILELANG_UPDATE_SUBMODULES=OFF -DPython3_EXECUTABLE=.venv/bin/python -DPython_EXECUTABLE=.venv/bin/python"
       CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF"
       XDG_CACHE_HOME: /ci-cache
       PIP_CACHE_DIR: /ci-cache/pip
@@ -145,21 +145,20 @@ jobs:
         run: |
           echo "\$ $(command -v clang-tidy) --version" && clang-tidy --version
 
-          if [[ -x "$(command -v run-clang-tidy)" ]]; then
-            echo "Using run-clang-tidy from $(command -v run-clang-tidy)"
-            CLANG_TIDY=(run-clang-tidy)
-          else
-            RCT_URL=https://raw.githubusercontent.com/llvm/llvm-project/refs/heads/release/21.x/clang-tools-extra/clang-tidy/tool/run-clang-tidy.py
-            echo "Downloading run-clang-tidy script from ${RCT_URL}"
-            echo "import urllib.request; url = '${RCT_URL}'.rstrip('/'); urllib.request.urlretrieve(url, url.split('/')[-1])" | uv run --no-project --script -
-            CLANG_TIDY=(uv run --no-project --script -- run-clang-tidy.py)
-          fi
+          # Download run-clang-tidy script
+          RCT_URL=https://raw.githubusercontent.com/llvm/llvm-project/refs/heads/release/21.x/clang-tools-extra/clang-tidy/tool/run-clang-tidy.py
+          echo "Downloading run-clang-tidy script from ${RCT_URL}"
+          echo "import urllib.request; url = '${RCT_URL}'.rstrip('/'); urllib.request.urlretrieve(url, url.split('/')[-1])" | uv run --no-project --script -
+          CLANG_TIDY=(uv run --no-project --script -- run-clang-tidy.py)
           if [[ -x "$(command -v clang-apply-replacements)" ]]; then
             echo "Using clang-apply-replacements from $(command -v clang-apply-replacements)"
             CLANG_TIDY+=(-fix -clang-apply-replacements-binary="$(command -v clang-apply-replacements)")
           else
             echo "::warning::clang-apply-replacements not found in PATH, automatic fixing disabled."
           fi
+
+          # Activate venv so CMake finds z3 and other Python packages
+          . .venv/bin/activate
 
           # Run cmake to create the build directory with compile_commands.json
           cmake -S . -B cmake-build --fresh ${CLANG_TIDY_CMAKE_OPTIONS}  # no quotes here
@@ -184,12 +183,14 @@ jobs:
       - name: Run Python test suite
         run: |
           . .venv/bin/activate
+          # Add the CUDA-aware pytest-xdist scheduler plugin to PYTHONPATH
+          export PYTHONPATH="${GITHUB_WORKSPACE}/maint/scripts:${PYTHONPATH}"
           cd testing
           PYTEST=(
             uv run --no-project -m --
             pytest --verbose --color=yes --durations=0 --showlocals --cache-clear
           )
-          "${PYTEST[@]}" --maxfail=3 --numprocesses=4 -c pytest.ini ./python
+          "${PYTEST[@]}" -c pytest.ini ./python
 
       - name: List generated files
         if: ${{ !cancelled() }}
