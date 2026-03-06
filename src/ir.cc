@@ -112,16 +112,19 @@ ForFrame TilesFor(const Array<PrimExpr> &extents,
     n->vars.push_back(Var("v", dtype));
     n->doms.push_back(Range(make_const(dtype, 0), extent));
   }
-  n->f_make_for_loop = [annotations](const Array<Var> &vars,
-                                     const Array<Range> &doms,
-                                     Stmt body) -> Stmt {
+  n->f_make_for_loop =
+      [annotations](const Array<Var> &vars, const Array<Range> &doms,
+                    const Array<Optional<PrimExpr>> &steps, Stmt body) -> Stmt {
     ICHECK_EQ(vars.size(), doms.size());
     int n = vars.size();
     for (int i = n - 1; i >= 0; --i) {
       Range dom = doms[i];
       Var var = vars[i];
+      Optional<PrimExpr> step =
+          i < steps.size() ? steps[i] : Optional<PrimExpr>(std::nullopt);
       body = For(var, dom->min, dom->extent, ForKind::kSerial, body,
-                 /*thread_binding=*/std::nullopt, /*annotations=*/annotations);
+                 /*thread_binding=*/std::nullopt, /*annotations=*/annotations,
+                 /*step=*/step);
     }
     return body;
   };
