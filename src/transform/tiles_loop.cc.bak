@@ -1,0 +1,245 @@
+#include <tvm/ffi/reflection/registry.h>
+#include <tvm/tir/op.h>
+#include <tvm/tir/stmt_functor.h>
+#include <tvm/tir/transform.h>
+#include <tvm/runtime/logging.h>
+
+#include "../support/ffi_aliases.h"
+#include "../tileview/tileview.h"
+#include "tile_attr.h"
+
+namespace tvm {
+namespace tl {
+
+using namespace tir;
+
+
+/*!
+ * \brief TilesLoopRewriter
+ *
+ * This pass performs the lowering of T.Tiles() into
+ *   serial + vectorized inner loops.
+ *
+ * Design principles:
+ * ------------------
+ * 1. Post-order traversal:
+ *    - Always visit loop body first.
+ *    - Structural decisions are made only after the body is stable.
+ *
+ * 2. Scope gating via annotation:
+ *    - Only loops marked with `tile_execution` are considered.
+ *    - Other loops (e.g. T.parallel, normal serial loops) are ignored.
+ *
+ * 3. Structural matching (not annotation-driven semantics):
+ *    - Actual lowering only happens when we see:
+ *
+ *        for i (serial, annotation="tile.execution..."):
+ *          for j (serial, annotation="tile.execution..."):
+ *            BODY
+ *
+ *    - i, j are assumed to be the 2D tile-execution axes.
+ * 4. construct and insert two new ForNodes.
+ */
+class TilesLoopRewriter : public StmtExprMutator {
+public:
+  static PrimFunc Rewrite(PrimFunc f) {
+    TilesLoopRewriter rewriter;
+    f.CopyOnWrite()->body = rewriter(f->body);
+    return f;
+  }
+
+private:
+  // ------------------------------------------------------------
+  // Loop stack (用于向上查找 tile_level_loop)
+  // ------------------------------------------------------------
+  std::vector<For> loop_stack_;
+
+  // ------------------------------------------------------------
+  // Helpers
+  // ------------------------------------------------------------
+
+  bool IsExecutionLoop(const ForNode* loop) const {
+    return loop->annotations.count(attr::tile_execution_loop);
+  }
+
+  bool IsTileRoot(const ForNode* loop) const {
+    return loop->annotations.count(attr::tile_level_loop);
+  }
+
+  bool IsSerialFor(const ForNode* loop) const {
+    return loop->kind == ForKind::kSerial;
+  }
+
+  int GetStage(const ForNode* loop) const {
+    auto it = loop->annotations.find(attr::kTileLoopStage);
+    if (it == loop->annotations.end()) {
+      return static_cast<int>(TileLoopStage::kInitial);
+    }
+    return Downcast<Integer>((*it).second)->value;
+  }
+
+  Optional<Array<PrimExpr>> GetTileSize(const ForNode* loop) const {
+    auto it = loop->annotations.find(attr::tile_tile_size);
+    if (it == loop->annotations.end()) {
+      return std::nullopt;
+    }
+    return Downcast<Array<PrimExpr>>((*it).second);
+  }
+
+  Stmt UpdateBody(const ForNode* loop, Stmt new_body) {
+    if (new_body.same_as(loop->body)) {
+      return ffi::GetRef<For>(loop);
+    }
+    For f = ffi::GetRef<For>(loop);
+    f.CopyOnWrite()->body = new_body;
+    return f;
+  }
+
+  // ------------------------------------------------------------
+  // 更新 execution subtree 的 stage
+  // ------------------------------------------------------------
+  Stmt UpdateStageRecursively(Stmt stmt) {
+    class StageUpdater : public StmtExprMutator {
+     public:
+      Stmt VisitStmt_(const ForNode* loop) final {
+        For f = Downcast<For>(StmtExprMutator::VisitStmt_(loop));
+        if (f->annotations.count(attr::kTileLoopStage)) {
+          f.CopyOnWrite()->annotations.Set(
+              attr::kTileLoopStage,
+              Integer(static_cast<int>(TileLoopStage::kTiled)));
+        }
+        return f;
+      }
+    };
+
+    StageUpdater updater;
+    return updater(stmt);
+  }
+
+  // ------------------------------------------------------------
+  // 更新最近的 tile_level_loop 的 stage
+  // ------------------------------------------------------------
+  void UpdateNearestTileRootStage() {
+    for (auto it = loop_stack_.rbegin(); it != loop_stack_.rend(); ++it) {
+      For parent = *it;
+      if (IsTileRoot(parent.get())) {
+        parent.CopyOnWrite()->annotations.Set(
+            attr::kTileLoopStage,
+            Integer(static_cast<int>(TileLoopStage::kTiled)));
+        return;
+      }
+    }
+  }
+
+  // ------------------------------------------------------------
+  // Core visit
+  // ------------------------------------------------------------
+  Stmt VisitStmt_(const ForNode* loop) final {
+
+    For current = ffi::GetRef<For>(loop);
+    loop_stack_.push_back(current);
+
+    // Post-order
+    Stmt new_body = VisitStmt(loop->body);
+
+    // Only execution loops trigger rewrite
+    if (!IsExecutionLoop(loop)) {
+      loop_stack_.pop_back();
+      return UpdateBody(loop, new_body);
+    }
+
+    // Stage gate
+    int stage = GetStage(loop);
+    if (stage != static_cast<int>(TileLoopStage::kLegalized)) {
+      loop_stack_.pop_back();
+      return UpdateBody(loop, new_body);
+    }
+
+    // Structural match: execution-execution
+    const ForNode* inner = new_body.as<ForNode>();
+    if (!inner || !IsExecutionLoop(inner) ||
+        !IsSerialFor(loop) || !IsSerialFor(inner)) {
+      loop_stack_.pop_back();
+      return UpdateBody(loop, new_body);
+    }
+
+    auto tile_size_opt = GetTileSize(loop);
+    if (!tile_size_opt.defined()) {
+      loop_stack_.pop_back();
+      return UpdateBody(loop, new_body);
+    }
+
+    Array<PrimExpr> tile_size = tile_size_opt.value();
+    ICHECK_EQ(tile_size.size(), 2);
+
+    // ------------------------------------------------------------
+    // Perform tile lowering
+    // ------------------------------------------------------------
+
+    Var ti = loop->loop_var;
+    Var tj = inner->loop_var;
+
+    Var ki("ki");
+    Var kj("kj");
+
+    Map<Var, PrimExpr> vmap;
+    vmap.Set(ti, ti * tile_size[0] + ki);
+    vmap.Set(tj, tj * tile_size[1] + kj);
+
+    Stmt tiled_body = Substitute(inner->body, vmap);
+
+    tiled_body = For(kj, 0, tile_size[1],
+                     ForKind::kVectorized,
+                     tiled_body);
+
+    tiled_body = For(ki, 0, tile_size[0],
+                     ForKind::kSerial,
+                     tiled_body);
+
+    For new_inner = ffi::GetRef<For>(inner);
+    new_inner.CopyOnWrite()->body = tiled_body;
+
+    For new_outer = ffi::GetRef<For>(loop);
+    new_outer.CopyOnWrite()->body = new_inner;
+
+    // ------------------------------------------------------------
+    // Stage transitions
+    // ------------------------------------------------------------
+
+    Stmt result = new_outer;
+
+    // 1️⃣ 更新 execution subtree
+    result = UpdateStageRecursively(result);
+
+    // 2️⃣ 更新最近的 tile_level_loop
+    UpdateNearestTileRootStage();
+
+    loop_stack_.pop_back();
+    return result;
+  }
+};
+
+using namespace tir::transform;
+
+/*!
+ * \brief Create TilesLoop pass.
+ */
+Pass TilesLoop() {
+  auto pass_func = [](PrimFunc f, const IRModule &,
+                      const PassContext &) -> PrimFunc {
+    return TilesLoopRewriter::Rewrite(std::move(f));
+  };
+
+  return CreatePrimFuncPass(pass_func,
+                            /*opt_level=*/0, "tl.TilesLoop", {});
+}
+
+/*!
+ * \brief FFI registration.
+ */
+TVM_FFI_STATIC_INIT_BLOCK() {
+  tvm::ffi::reflection::GlobalDef().def("tl.transform.TilesLoop", TilesLoop);
+}
+
+} // namespace tl
+} // namespace tvm
