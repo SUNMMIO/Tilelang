@@ -46,12 +46,16 @@ public:
   void VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == tir::attr::thread_extent) {
       IterVar iv = Downcast<IterVar>(op->node);
-      thread_binding_[iv->var.get()] = iv;
+      // Only collect threadIdx bindings; blockIdx are grid-level and must not
+      // be mistaken for intra-block thread parallelism.
+      if (std::string(iv->thread_tag).rfind("threadIdx", 0) == 0) {
+        thread_binding_[iv->var.get()] = iv;
+      }
     }
     StmtExprVisitor::VisitStmt_(op);
   }
 
-  // The thread binding map
+  // The thread binding map (threadIdx.* only)
   std::unordered_map<const VarNode *, IterVar> thread_binding_;
 };
 
