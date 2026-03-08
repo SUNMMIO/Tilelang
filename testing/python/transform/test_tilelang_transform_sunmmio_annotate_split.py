@@ -129,8 +129,8 @@ def test_split_host_device_device_func_has_sunmmio_target():
         f"Expected device function target to be Sunmmio, got: {device_funcs[0].attrs['target']}")
 
 
-def test_split_host_device_device_func_is_threadless():
-    """The device function body must contain threadIdx.x with extent 1 (Sunmmio is threadless)."""
+def test_split_host_device_device_func_has_no_thread_bindings():
+    """The device function body must contain no threadIdx bindings (Sunmmio is fully threadless)."""
     target = make_sunmmio_target_with_host()
 
     with tvm.target.Target(target):
@@ -154,18 +154,15 @@ def test_split_host_device_device_func_is_threadless():
 
     post_order_visit(device_func.body, fvisit)
 
-    assert "threadIdx.x" in thread_extents, (
-        f"Expected a 'thread_extent' AttrStmt for threadIdx.x in the device function body. "
+    assert "threadIdx.x" not in thread_extents, (
+        f"Sunmmio device function must have no threadIdx bindings (threadless). "
         f"Found thread extents: {thread_extents}\n"
         f"Device function:\n{device_func.script()}")
-    assert thread_extents["threadIdx.x"] == 1, (
-        f"Expected threadIdx.x extent to be 1 (Sunmmio is threadless), "
-        f"got {thread_extents['threadIdx.x']}")
 
 
 if __name__ == "__main__":
     test_annotate_device_regions_wraps_thread_extent_with_target()
     test_split_host_device_produces_two_functions()
     test_split_host_device_device_func_has_sunmmio_target()
-    test_split_host_device_device_func_is_threadless()
+    test_split_host_device_device_func_has_no_thread_bindings()
     print("All tests passed.")
