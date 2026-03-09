@@ -741,24 +741,33 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
 
     @T.prim_func
     def gemm(
-            A: T.MeshTensor((M, K),
-                        sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-                        device_mesh_config=(2, 2),
-                        hierarchical_dims=(4, 32, 128),
-                        hierarchical_groups=((0, 2), (2, 3)),
-                        hierarchical_strides=(32, 1, 4096), dtype=dtype),
-            B: T.MeshTensor((K, N),
-                        sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-                        device_mesh_config=(2, 2),
-                        hierarchical_dims=(4, 32, 128),
-                        hierarchical_groups=((0, 2), (2, 3)),
-                        hierarchical_strides=(32, 1, 4096), dtype=dtype),
-            C: T.MeshTensor((M, N),
-                        sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-                        device_mesh_config=(2, 2),
-                        hierarchical_dims=(4, 32, 128),
-                        hierarchical_groups=((0, 2), (2, 3)),
-                        hierarchical_strides=(32, 1, 4096), dtype=accum_dtype),
+        A: T.MeshTensor(
+            (M, K),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=dtype,
+        ),
+        B: T.MeshTensor(
+            (K, N),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=dtype,
+        ),
+        C: T.MeshTensor(
+            (M, N),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=accum_dtype,
+        ),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
@@ -779,6 +788,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
 
     return gemm
 
+
 DEBUG_CASE = [
     matmul(128, 128, 128, 32, 32, 32),
 ]
@@ -788,7 +798,7 @@ DEBUG_CASE = [
     "kernel",
     DEBUG_CASE,
 )
-def test_tilelang_consistency_case_infer_sram_scope(kernel):
+def test_tilelang_data_pointer_bug_infer_sram_scope(kernel):
     target_name = "Sunmmio"
     target = determine_target(target_name, return_object=True)
 
@@ -816,14 +826,14 @@ def test_tilelang_consistency_case_infer_sram_scope(kernel):
                 after_values = list(after_attr[key].values())
                 for i in range(len(before_keys)):
                     assert before_keys[i].name == after_keys[i].name
-                    
+
                 for i in range(len(before_values)):
                     assert tvm.ir.structural_equal(before_values[i], after_values[i])
-        
+
         for i in range(len(after_attrs)):
             after_attr = after_attrs[i]
-            if 'tileview_map' in after_attr.keys():
-                map = dict(after_attr['tileview_map'])
+            if "tileview_map" in after_attr.keys():
+                map = dict(after_attr["tileview_map"])
                 for it in after_buffers:
-                    if it.scope() != 'global':
+                    if it.scope() != "global":
                         assert it.data in list(map.keys())
