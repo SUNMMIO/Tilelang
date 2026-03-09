@@ -9,6 +9,7 @@ from tvm.tir.stmt_functor import post_order_visit
 from tvm.tir import BufferLoad, BufferStore, Buffer, Block
 from typing import Set
 from tilelang.tileview import make_tileview
+from tilelang.language.mesh_tensor import MeshShardingPolicy
 
 tilelang.env.disable_cache()
 
@@ -732,3 +733,97 @@ def test_tilelang_consistency_case_infer_sram_scope(kernel):
                         assert tvm.tir.analysis.expr_deep_equal(before_values[i], after_values[i])
                     else:
                         assert tvm.ir.structural_equal(before_values[i], after_values[i])
+
+
+def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
+    tile_size = (8, 8)
+    index_map = (-2, -1)
+
+    @T.prim_func
+    def gemm(
+            A: T.MeshTensor((M, K),
+                        sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+                        device_mesh_config=(2, 2),
+                        hierarchical_dims=(4, 32, 128),
+                        hierarchical_groups=((0, 2), (2, 3)),
+                        hierarchical_strides=(32, 1, 4096), dtype=dtype),
+            B: T.MeshTensor((K, N),
+                        sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+                        device_mesh_config=(2, 2),
+                        hierarchical_dims=(4, 32, 128),
+                        hierarchical_groups=((0, 2), (2, 3)),
+                        hierarchical_strides=(32, 1, 4096), dtype=dtype),
+            C: T.MeshTensor((M, N),
+                        sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+                        device_mesh_config=(2, 2),
+                        hierarchical_dims=(4, 32, 128),
+                        hierarchical_groups=((0, 2), (2, 3)),
+                        hierarchical_strides=(32, 1, 4096), dtype=accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+
+            T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, index_map)})
+            T.annotate_tileview({B_shared: make_tileview(B_shared, tile_size, index_map)})
+            T.annotate_tileview({C_shared: make_tileview(C_shared, tile_size, index_map)})
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=4):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return gemm
+
+DEBUG_CASE = [
+    matmul(128, 128, 128, 32, 32, 32),
+]
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    DEBUG_CASE,
+)
+def test_tilelang_consistency_case_infer_sram_scope(kernel):
+    target_name = "Sunmmio"
+    target = determine_target(target_name, return_object=True)
+
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(kernel.with_attr("global_symbol", "main"))
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+
+        mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
+        mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+        mod = tilelang.transform.InjectAssumes()(mod)
+        mod = tilelang.transform.Simplify()(mod)
+        mod = tilelang.transform.InferSramScope()(mod)
+
+        before_attrs = extract_block_attrs_from_kernel(list(mod.functions.values())[0])
+        mod = tl.transform.InferSramScope()(mod)
+        after_attrs = extract_block_attrs_from_kernel(list(mod.functions.values())[0])
+        after_buffers = list(extract_buffers_from_kernel(list(mod.functions.values())[0]))
+        for i in range(len(before_attrs)):
+            before_attr = before_attrs[i]
+            after_attr = after_attrs[i]
+            for key in before_attr.keys():
+                before_keys = list(before_attr[key])
+                after_keys = list(after_attr[key])
+                before_values = list(before_attr[key].values())
+                after_values = list(after_attr[key].values())
+                for i in range(len(before_keys)):
+                    assert before_keys[i].name == after_keys[i].name
+                    
+                for i in range(len(before_values)):
+                    assert tvm.ir.structural_equal(before_values[i], after_values[i])
+        
+        for i in range(len(after_attrs)):
+            after_attr = after_attrs[i]
+            if 'tileview_map' in after_attr.keys():
+                map = dict(after_attr['tileview_map'])
+                for it in after_buffers:
+                    if it.scope() != 'global':
+                        assert it.data in list(map.keys())

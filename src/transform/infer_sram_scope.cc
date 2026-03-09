@@ -146,8 +146,8 @@ private:
 
     if (!alloc_buffers.same_as(block->alloc_buffers)) {
       block.CopyOnWrite()->alloc_buffers = alloc_buffers;
-      block_realize.CopyOnWrite()->block = block;
     }
+    block_realize.CopyOnWrite()->block = block;
 
     return block_realize;
   }
@@ -174,13 +174,7 @@ private:
             } else {
               auto remap_buffer =
                   makeBufferWithScope(aRegion_->buffer, "shared.asram");
-              const auto *ptr_type =
-                  TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-              Type new_type =
-                  PointerType(ptr_type->element_type, "shared.asram");
-              Var new_var = Var(buffer->data->name_hint, new_type);
               buffer_remap_.Set(buffer, remap_buffer);
-              var_remap_.Set(buffer->data, new_var);
             }
           } else if (buffer.scope() != "shared.asram") {
             // incorrect specification
@@ -200,13 +194,7 @@ private:
             } else {
               auto remap_buffer =
                   makeBufferWithScope(bRegion_->buffer, "shared.wsram");
-              const auto *ptr_type =
-                  TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-              Type new_type =
-                  PointerType(ptr_type->element_type, "shared.wsram");
-              Var new_var = Var(buffer->data->name_hint, new_type);
               buffer_remap_.Set(buffer, remap_buffer);
-              var_remap_.Set(buffer->data, new_var);
             }
           } else if (buffer.scope() != "shared.wsram") {
             // incorrect specification
@@ -226,13 +214,7 @@ private:
             } else {
               auto remap_buffer =
                   makeBufferWithScope(cRegion_->buffer, "shared.rsram");
-              const auto *ptr_type =
-                  TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-              Type new_type =
-                  PointerType(ptr_type->element_type, "shared.rsram");
-              Var new_var = Var(buffer->data->name_hint, new_type);
               buffer_remap_.Set(buffer, remap_buffer);
-              var_remap_.Set(buffer->data, new_var);
             }
           } else if (buffer.scope() != "shared.rsram") {
             // incorrect specification
