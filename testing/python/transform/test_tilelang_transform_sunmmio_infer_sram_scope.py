@@ -810,7 +810,6 @@ def test_tilelang_data_pointer_bug_infer_sram_scope(kernel):
         mod = tilelang.transform.LegalizeNegativeIndex()(mod)
         mod = tilelang.transform.InjectAssumes()(mod)
         mod = tilelang.transform.Simplify()(mod)
-        mod = tilelang.transform.InferSramScope()(mod)
 
         before_attrs = extract_block_attrs_from_kernel(list(mod.functions.values())[0])
         mod = tl.transform.InferSramScope()(mod)
