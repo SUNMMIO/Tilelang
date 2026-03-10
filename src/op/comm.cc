@@ -178,13 +178,13 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
   PrimExpr dst_addr =
       dst.access_ptr(2, DataType::Handle(), 1,
                      Downcast<IntImm>(dst_offset->value), src_elements);
-  int src_core_y = src_core->value % mesh_ncol;
+  int src_core_col = src_core->value % mesh_ncol;
 
   if (direction == 0 or direction == 1) {
     // 1D broadcast
     Array<PrimExpr> args;
-    args.push_back(src_addr);
-    args.push_back(dst_addr);
+    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
+    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
     args.push_back(Downcast<IntImm>(broadcast_elements));
     args.push_back(src_core);
     args.push_back(direction);
@@ -195,8 +195,8 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
     Array<Stmt> seq;
     // vertical broadcast
     Array<PrimExpr> args;
-    args.push_back(src_addr);
-    args.push_back(dst_addr);
+    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
+    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
     args.push_back(Downcast<IntImm>(broadcast_elements));
     args.push_back(src_core);
     args.push_back(1); // direction: vertical
@@ -205,10 +205,10 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
     // horizontal broadcast
     for (int i = 0; i < mesh_nrow; i++) {
       Array<PrimExpr> args;
-      args.push_back(dst.access_ptr(1, DataType::Handle(), 1, 0, dst_elements));
-      args.push_back(dst.access_ptr(2, DataType::Handle(), 1, 0, dst_elements));
+      args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/1));
+      args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
       args.push_back(Downcast<IntImm>(broadcast_elements));
-      args.push_back(int(i * mesh_ncol) + src_core_y);
+      args.push_back(int(i * mesh_ncol) + src_core_col);
       args.push_back(0); // direction: horizontal
       Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
       seq.push_back(broadcast);
@@ -310,39 +310,39 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   // all checks passed, generate the call
   PrimExpr src_addr = src.access_ptr(1, DataType::Handle(), 1, 0, src_elements);
   PrimExpr dst_addr = dst.access_ptr(2, DataType::Handle(), 1, 0, dst_elements);
-  int src_core_x = src_core->value / mesh_ncol;
-  int src_core_y = src_core->value % mesh_ncol;
-  int dst_core_x = dst_core->value / mesh_ncol;
-  int dst_core_y = dst_core->value % mesh_ncol;
+  int src_core_row = src_core->value / mesh_ncol;
+  int src_core_col = src_core->value % mesh_ncol;
+  int dst_core_row = dst_core->value / mesh_ncol;
+  int dst_core_col = dst_core->value % mesh_ncol;
 
-  if (src_core_x == dst_core_x) {
+  if (src_core_row == dst_core_row) {
     // 1D put via horizontal communication
     Array<PrimExpr> args;
-    args.push_back(src_addr);
-    args.push_back(dst_addr);
+    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
+    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
     args.push_back(Downcast<IntImm>(broadcast_elements));
     args.push_back(src_core);
     args.push_back(0); // direction: horizontal
     for (int j = 0; j < mesh_ncol; j++) {
-      if (j != dst_core_y) {
-        args.push_back(
-            IntImm(DataType::Int(32), j)); // mask: all cores except dst_core_y
+      if (j != dst_core_col) {
+        args.push_back(IntImm(DataType::Int(32),
+                              j)); // mask: all cores except dst_core_col
       }
     }
     Stmt put = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return put;
-  } else if (src_core_y == dst_core_y) {
+  } else if (src_core_col == dst_core_col) {
     // 1D put via vertical communication
     Array<PrimExpr> args;
-    args.push_back(src_addr);
-    args.push_back(dst_addr);
+    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
+    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
     args.push_back(Downcast<IntImm>(broadcast_elements));
     args.push_back(src_core);
     args.push_back(1); // direction: vertical
     for (int i = 0; i < mesh_nrow; i++) {
-      if (i != dst_core_x) {
-        args.push_back(
-            IntImm(DataType::Int(32), i)); // mask: all cores except dst_core_x
+      if (i != dst_core_row) {
+        args.push_back(IntImm(DataType::Int(32),
+                              i)); // mask: all cores except dst_core_row
       }
     }
     Stmt put = Evaluate(Call(DataType::Handle(), broadcast_(), args));
@@ -350,32 +350,32 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   } else {
     Array<Stmt> seq;
     // vertical transfer from src core to intermediate core
-    int intermediate_core_id = src_core_x * mesh_ncol + dst_core_y;
+    int intermediate_core_id = dst_core_row * mesh_ncol + src_core_col;
     Array<PrimExpr> args1;
-    args1.push_back(src_addr);
-    args1.push_back(dst_addr);
+    args1.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
+    args1.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
     args1.push_back(Downcast<IntImm>(broadcast_elements));
     args1.push_back(src_core);
     args1.push_back(1); // direction: vertical
     for (int i = 0; i < mesh_nrow; i++) {
-      if (i != dst_core_x) {
-        args1.push_back(
-            IntImm(DataType::Int(32), i)); // mask: all cores except dst_core_x
+      if (i != dst_core_row) {
+        args1.push_back(IntImm(DataType::Int(32),
+                               i)); // mask: all cores except dst_core_row
       }
     }
     Stmt put1 = Evaluate(Call(DataType::Handle(), broadcast_(), args1));
     seq.push_back(put1);
     // horizontal transfer from intermediate core to dst core
     Array<PrimExpr> args2;
-    args2.push_back(dst.access_ptr(1, DataType::Handle(), 1, 0, src_elements));
-    args2.push_back(dst.access_ptr(2, DataType::Handle(), 1, 0, dst_elements));
+    args2.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/1));
+    args2.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
     args2.push_back(Downcast<IntImm>(broadcast_elements));
     args2.push_back(IntImm(DataType::Int(32), intermediate_core_id));
     args2.push_back(0); // direction: horizontal
     for (int j = 0; j < mesh_ncol; j++) {
-      if (j != dst_core_y) {
-        args2.push_back(
-            IntImm(DataType::Int(32), j)); // mask: all cores except dst_core_y
+      if (j != dst_core_col) {
+        args2.push_back(IntImm(DataType::Int(32),
+                               j)); // mask: all cores except dst_core_col
       }
     }
     Stmt put2 = Evaluate(Call(DataType::Handle(), broadcast_(), args2));
@@ -577,17 +577,56 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
         (size->value < 0) ? Downcast<IntImm>(send_elements)->value * mesh_ncol
                           : size->value * mesh_ncol;
 
+    // Try to slice along the first dimension to avoid flattening
+    // This produces cleaner TIR when the buffer shape is aligned with the mesh
+    bool use_flatten = true;
+    PrimExpr dim0_extent = 0;
+    PrimExpr stride0 = 1;
+
+    if (recv_buffer->shape.size() > 0) {
+      for (size_t k = 1; k < recv_buffer->shape.size(); k++) {
+        stride0 *= recv_buffer->shape[k];
+      }
+      stride0 = analyzer->Simplify(stride0);
+
+      PrimExpr row_size = IntImm(DataType::Int(32), mesh_ncol) * send_elements;
+      if (analyzer->CanProve(FloorMod(row_size, stride0) == 0)) {
+        dim0_extent = analyzer->Simplify(FloorDiv(row_size, stride0));
+        use_flatten = false;
+      }
+    }
+
+    Buffer target_buffer = recv_buffer;
+    if (use_flatten && recv_buffer->shape.size() > 1) {
+      target_buffer =
+          Buffer(recv_buffer->data, recv_buffer->dtype, {recv_elements}, {1},
+                 recv_buffer->elem_offset, recv_buffer->name + "_flat",
+                 recv_buffer->data_alignment, recv_buffer->offset_factor,
+                 recv_buffer->buffer_type);
+    }
+
     for (int j = 0; j < mesh_ncol; j++) {
       for (size_t i = 0; i < mesh_nrow; i++) {
         Array<PrimExpr> args;
-        args.push_back(recv_buffer.access_ptr(
-            1, DataType::Handle(), 1,
-            IntImm(DataType::Int(32), i * mesh_ncol) * send_elements,
-            IntImm(DataType::Int(32), mesh_ncol) * send_elements));
-        args.push_back(recv_buffer.access_ptr(
-            2, DataType::Handle(), 1,
-            IntImm(DataType::Int(32), i * mesh_ncol) * send_elements,
-            IntImm(DataType::Int(32), mesh_ncol) * send_elements));
+        Array<Range> ranges;
+
+        if (use_flatten) {
+          PrimExpr offset =
+              IntImm(DataType::Int(32), i * mesh_ncol) * send_elements;
+          PrimExpr extent =
+              IntImm(DataType::Int(32), mesh_ncol) * send_elements;
+          ranges.push_back(Range::FromMinExtent(offset, extent));
+        } else {
+          // Slice along the first dimension
+          ranges.push_back(Range::FromMinExtent(
+              IntImm(DataType::Int(32), i) * dim0_extent, dim0_extent));
+          for (size_t k = 1; k < recv_buffer->shape.size(); k++) {
+            ranges.push_back(Range::FromMinExtent(0, recv_buffer->shape[k]));
+          }
+        }
+
+        args.push_back(MakeRegionExpr(target_buffer, ranges, 1));
+        args.push_back(MakeRegionExpr(target_buffer, ranges, 2));
         args.push_back(IntImm(DataType::Int(32), allgather_size)); // size
         args.push_back(
             IntImm(DataType::Int(32), i * mesh_ncol + j)); // src_core
