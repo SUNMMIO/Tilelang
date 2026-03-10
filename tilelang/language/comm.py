@@ -30,9 +30,9 @@ REDUCE_TYPE_LIST = (
 
 
 def get_target_mesh_shape() -> dict[str, int]:
-    """Get the target mesh shape as a dictionary with 'x' and 'y' keys."""
+    """Get the target mesh shape as a dictionary with 'nrow' and 'ncol' keys."""
     nrow, ncol = get_sunmmio_device_mesh_config()
-    return {"x": nrow, "y": ncol}
+    return {"nrow": nrow, "ncol": ncol}
 
 
 def core_tuple_to_id(core_id: tuple[int, int]) -> int:
@@ -55,9 +55,9 @@ def core_tuple_to_id(core_id: tuple[int, int]) -> int:
     """
     mesh_shape = get_target_mesh_shape()
     row, col = core_id
-    assert (0 <= row < mesh_shape["x"]), f"Row {row} out of bounds for mesh shape {mesh_shape}."
-    assert (0 <= col < mesh_shape["y"]), f"Col {col} out of bounds for mesh shape {mesh_shape}."
-    core_id_value = row * mesh_shape["y"] + col
+    assert (0 <= row < mesh_shape["nrow"]), f"Row {row} out of bounds for mesh shape {mesh_shape}."
+    assert (0 <= col < mesh_shape["ncol"]), f"Col {col} out of bounds for mesh shape {mesh_shape}."
+    core_id_value = row * mesh_shape["ncol"] + col
     return core_id_value
 
 
@@ -81,8 +81,8 @@ def core_id_to_tuple(core_id: tir.Call) -> tuple[int, int]:
     """
     mesh_shape = get_target_mesh_shape()
     core_id_value = core_id
-    row = core_id_value // mesh_shape["y"]
-    col = core_id_value % mesh_shape["y"]
+    row = core_id_value // mesh_shape["ncol"]
+    col = core_id_value % mesh_shape["ncol"]
     return (row, col)
 
 
@@ -98,7 +98,7 @@ def CoreId(core_id: int | tuple[int, int]):
     Returns
     -------
     int
-        The linear core id mapped into [0, mesh_x * mesh_y).
+        The linear core id mapped into [0, mesh_nrow * mesh_ncol).
 
     Raises
     ------
@@ -110,7 +110,7 @@ def CoreId(core_id: int | tuple[int, int]):
         core_id_value = core_tuple_to_id(core_id)
     elif isinstance(core_id, int):
         core_id_value = core_id
-        assert (0 <= core_id_value < mesh_shape["x"] * mesh_shape["y"]
+        assert (0 <= core_id_value < mesh_shape["nrow"] * mesh_shape["ncol"]
                ), f"Core ID {core_id_value} out of bounds for mesh shape {mesh_shape}"
     else:
         raise ValueError("core_id must be either a tuple[int, int] or an int.")
@@ -130,6 +130,12 @@ def current_core():
     >>> current_core()
     """
     return tir.call_intrin("handle", tir.op.Op.get("tl.comm_current_core"))
+
+
+def _get_buffer_info(buf):
+    if isinstance(buf, tir.BufferRegion):
+        return buf.buffer.dtype, [r.extent for r in buf.region]
+    return buf.dtype, buf.shape
 
 
 def broadcast(
@@ -162,27 +168,30 @@ def broadcast(
     --------
     >>> broadcast(A, B, (1, 2), direction="horizontal")
     """
+    src_dtype, src_shape = _get_buffer_info(src)
+    dst_dtype, dst_shape = _get_buffer_info(dst)
+
     assert (
-        src.dtype == dst.dtype
-    ), f"Source and destination buffer dtypes must match for broadcast. Got {src.dtype} vs {dst.dtype}."
-    if len(src.shape) != len(dst.shape):
+        src_dtype == dst_dtype
+    ), f"Source and destination buffer dtypes must match for broadcast. Got {src_dtype} vs {dst_dtype}."
+    if len(src_shape) != len(dst_shape):
         raise ValueError(
             "Source and destination buffer must have the same number of dimensions for broadcast.")
-    for i in range(len(src.shape)):
+    for i in range(len(src_shape)):
         assert (
-            src.shape[i] == dst.shape[i] or src.shape[i] == 1 or dst.shape[i] == 1
-        ), f"Source buffer shape  and destination buffer shape must match for broadcast. Got {src.shape} vs {dst.shape}."
+            src_shape[i] == dst_shape[i] or src_shape[i] == 1 or dst_shape[i] == 1
+        ), f"Source buffer shape  and destination buffer shape must match for broadcast. Got {src_shape} vs {dst_shape}."
 
     mesh_shape = get_target_mesh_shape()
     assert (isinstance(src_core, tuple) and
             len(src_core) == 2), "src_core must be a tuple of (row, col)."
-    assert (0 <= src_core[0] < mesh_shape["x"]
+    assert (0 <= src_core[0] < mesh_shape["nrow"]
            ), f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
-    assert (0 <= src_core[1] < mesh_shape["y"]
+    assert (0 <= src_core[1] < mesh_shape["ncol"]
            ), f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
 
     src_elements = 1
-    for dim in src.shape:
+    for dim in src_shape:
         src_elements *= dim
     assert isinstance(size, int) and size >= -1, "size must be an integer >= -1."
     assert (size <= src_elements), f"size {size} exceeds source buffer size {src_elements}."
@@ -248,15 +257,15 @@ def put(
     mesh_shape = get_target_mesh_shape()
     assert (isinstance(src_core, tuple) and
             len(src_core) == 2), "src_core must be a tuple of (row, col)."
-    assert (0 <= src_core[0] < mesh_shape["x"]
+    assert (0 <= src_core[0] < mesh_shape["nrow"]
            ), f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
-    assert (0 <= src_core[1] < mesh_shape["y"]
+    assert (0 <= src_core[1] < mesh_shape["ncol"]
            ), f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
     assert (isinstance(dst_core, tuple) and
             len(dst_core) == 2), "dst_core must be a tuple of (row, col)."
-    assert (0 <= dst_core[0] < mesh_shape["x"]
+    assert (0 <= dst_core[0] < mesh_shape["nrow"]
            ), f"dst_core row {dst_core[0]} out of bounds for mesh shape {mesh_shape}."
-    assert (0 <= dst_core[1] < mesh_shape["y"]
+    assert (0 <= dst_core[1] < mesh_shape["ncol"]
            ), f"dst_core col {dst_core[1]} out of bounds for mesh shape {mesh_shape}."
     src_elements = 1
     for dim in src.shape:
@@ -308,11 +317,11 @@ def all_gather(
 
     recv_num = 1
     if direction.lower() in ["horizontal", "h"]:
-        recv_num = mesh_shape["y"]
+        recv_num = mesh_shape["ncol"]
     elif direction.lower() in ["vertical", "v"]:
-        recv_num = mesh_shape["x"]
+        recv_num = mesh_shape["nrow"]
     elif direction.lower() in ["all", "a"]:
-        recv_num = mesh_shape["x"] * mesh_shape["y"]
+        recv_num = mesh_shape["nrow"] * mesh_shape["ncol"]
 
     expected_recv_shape = [recv_num] + list(send_buffer.shape)
     assert (
@@ -395,8 +404,8 @@ def all_reduce(
     mesh_shape = get_target_mesh_shape()
 
     # Create temporary buffers for row and column allgather results
-    row_allgather = T.alloc_fragment(list([mesh_shape["x"]] + out.shape), out.dtype)
-    col_allgather = T.alloc_fragment(list([mesh_shape["y"]] + out.shape), out.dtype)
+    row_allgather = T.alloc_fragment(list([mesh_shape["nrow"]] + out.shape), out.dtype)
+    col_allgather = T.alloc_fragment(list([mesh_shape["ncol"]] + out.shape), out.dtype)
 
     buffer_region = to_buffer_region(buffer)
     out_region = to_buffer_region(out)
