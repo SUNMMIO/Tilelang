@@ -100,7 +100,8 @@ jobs:
             python3.12 python3.12-venv python3.12-dev python3-pip wget \
             clang-tidy cmake ninja-build git curl ca-certificates \
             build-essential pkg-config libprotobuf-dev \
-            protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev
+            protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev \
+            iproute2 curl dnsutils
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
 
       - name: Network debug
