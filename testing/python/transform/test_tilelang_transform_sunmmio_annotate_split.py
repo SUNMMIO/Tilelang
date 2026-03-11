@@ -52,7 +52,6 @@ def get_device_func(mod):
 
 
 def simple_kernel(M, N, dtype=T.float32):
-
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
         with T.Kernel(M, N) as (bx, by):

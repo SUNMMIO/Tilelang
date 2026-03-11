@@ -58,7 +58,6 @@ tilelang.env.disable_cache()
 
 
 def make_elementwise_copy_kernel(M, N, dtype=T.float32):
-
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
         with T.Kernel(M, N) as (bx, by):
@@ -68,7 +67,6 @@ def make_elementwise_copy_kernel(M, N, dtype=T.float32):
 
 
 def make_parallel_shared_kernel(M, N, dtype=T.float32):
-
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
         with T.Kernel(T.ceildiv(M, 32), T.ceildiv(N, 32)) as (bx, by):
@@ -82,7 +80,6 @@ def make_parallel_shared_kernel(M, N, dtype=T.float32):
 
 
 def make_3d_grid_kernel(M, N, K, dtype=T.float32):
-
     @T.prim_func
     def main(A: T.Tensor((M, N, K), dtype), B: T.Tensor((M, N, K), dtype)):
         with T.Kernel(M, N, K) as (bx, by, bz):

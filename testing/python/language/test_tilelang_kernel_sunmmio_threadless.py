@@ -5,7 +5,6 @@ import tilelang.language as T
 
 
 def make_kernel(threads):
-
     @T.prim_func
     def kernel(A: T.Tensor((128,), T.float32)):
         with T.Kernel(128, threads=threads):
@@ -15,18 +14,22 @@ def make_kernel(threads):
 
 
 @pytest.mark.parametrize("requested_threads", [1, 32, 128, 256])
-def test_sunmmio_kernel_threads_always_one(requested_threads):
-    """T.Kernel threads= is overridden to 1 for Sunmmio target, regardless of the requested value."""
+def test_sunmmio_kernel_has_no_threadidx(requested_threads):
+    """T.Kernel on Sunmmio emits no threadIdx bindings regardless of the threads= argument.
+
+    Sunmmio is unconditionally threadless: threads=None is forced at the compiler
+    level. No threadIdx AttrStmt should appear in the IR.
+    """
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = make_kernel(requested_threads)
 
     script = mod.script()
-    assert "threadIdx_x, 1)" in script, f"Expected threadIdx_x extent to be 1, but got:\n{script}"
+    assert "threadIdx" not in script, f"Sunmmio kernel must have no threadIdx bindings (threadless). Got:\n{script}"
 
 
-def test_sunmmio_kernel_default_threads_is_one():
-    """When threads= is not specified, Sunmmio target still defaults to 1 (not 128)."""
+def test_sunmmio_kernel_default_has_no_threadidx():
+    """When threads= is not specified, Sunmmio kernel still emits no threadIdx bindings."""
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
 
@@ -38,7 +41,7 @@ def test_sunmmio_kernel_default_threads_is_one():
         mod = tvm.IRModule({"main": kernel})
 
     script = mod.script()
-    assert "threadIdx_x, 1)" in script, f"Expected threadIdx_x extent to be 1, but got:\n{script}"
+    assert "threadIdx" not in script, f"Sunmmio kernel must have no threadIdx bindings (threadless). Got:\n{script}"
 
 
 def test_non_sunmmio_kernel_respects_threads():
@@ -47,4 +50,4 @@ def test_non_sunmmio_kernel_respects_threads():
         mod = make_kernel(128)
 
     script = mod.script()
-    assert "threadIdx_x, 128)" in script, f"Expected threadIdx_x extent to be 128, but got:\n{script}"
+    assert 'threadIdx.x", 128)' in script, f"Expected threadIdx.x extent to be 128, but got:\n{script}"
