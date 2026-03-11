@@ -33,7 +33,7 @@ def test_comm_python_api(M, N, block_M, block_N, dtype, accum_dtype):
             T.comm.put(A_shared, B_shared, (1, 2), (2, 3))
             T.comm.all_gather(A_shared, C_shared, direction="all")
 
-    assert main.script()[-len(func_str):] == func_str, "The generated script does not match the expected output."
+    assert main.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
 
 
 @pytest.mark.parametrize(
@@ -66,7 +66,7 @@ def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
-        assert mod.script()[-len(func_str):] == func_str, "The generated script does not match the expected output."
+        assert mod.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
 
 
 @pytest.mark.parametrize(
@@ -96,7 +96,7 @@ def test_comm_put_lower(M, N, block_M, block_N, dtype, accum_dtype):
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
-        assert mod.script()[-len(func_str):] == func_str, "The generated script does not match the expected output."
+        assert mod.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
 
 
 @pytest.mark.parametrize(
@@ -156,7 +156,8 @@ def test_comm_all_gather_lower(M, N, block_M, block_N, dtype, accum_dtype):
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
-        assert mod.script()[-len(func_str):] == func_str, "The generated script does not match the expected output."
+        assert mod.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
+
 
 '''
 @pytest.mark.parametrize(

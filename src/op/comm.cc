@@ -391,7 +391,7 @@ TIR_REGISTER_TL_TILE_OP(PutOp, comm_put)
                                Integer(CallEffectKind::kOpaque));
 
 AllgatherOp::AllgatherOp(Array<PrimExpr> args,
-                           Map<String, ObjectRef> annotations) {
+                         Map<String, ObjectRef> annotations) {
   ObjectPtr<AllgatherOpNode> node = tvm::ffi::make_object<AllgatherOpNode>();
   node->send = args[0];
   node->recv = args[1];
@@ -648,7 +648,7 @@ TIR_REGISTER_TL_TILE_OP(AllgatherOp, comm_allgather)
                                Integer(CallEffectKind::kOpaque));
 
 AllreduceOp::AllreduceOp(Array<PrimExpr> args,
-                           Map<String, ObjectRef> annotations) {
+                         Map<String, ObjectRef> annotations) {
   ObjectPtr<AllreduceOpNode> node = tvm::ffi::make_object<AllreduceOpNode>();
   node->src = args[0];
   node->dst = args[1];
