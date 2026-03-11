@@ -44,8 +44,9 @@ def get_device_func(mod):
     is GPU-only). We identify it by kIsGlobalFunc + Sunmmio target.
     """
     candidates = [
-        f for f in mod.functions.values() if f.attrs.get("tir.is_global_func", False)
-        and "target" in f.attrs and target_is_sunmmio(f.attrs["target"])
+        f
+        for f in mod.functions.values()
+        if f.attrs.get("tir.is_global_func", False) and "target" in f.attrs and target_is_sunmmio(f.attrs["target"])
     ]
     return candidates
 
@@ -75,18 +76,18 @@ def test_annotate_device_regions_wraps_thread_extent_with_target():
     target_attrs = collect_attr_stmts(func.body, "target")
 
     assert len(target_attrs) >= 1, (
-        f"Expected at least one 'target' AttrStmt after AnnotateDeviceRegions, found none.\n"
-        f"Function body:\n{func.script()}")
+        f"Expected at least one 'target' AttrStmt after AnnotateDeviceRegions, found none.\nFunction body:\n{func.script()}"
+    )
 
     device_target_node = target_attrs[0].node
     assert target_is_sunmmio(device_target_node), (
-        f"Expected 'target' AttrStmt to annotate with the Sunmmio device target, "
-        f"got: {device_target_node}")
+        f"Expected 'target' AttrStmt to annotate with the Sunmmio device target, got: {device_target_node}"
+    )
 
     inner_stmt = target_attrs[0].body
     assert isinstance(inner_stmt, tir.AttrStmt) and inner_stmt.attr_key == "thread_extent", (
-        f"Expected the body of the 'target' AttrStmt to be a 'thread_extent' AttrStmt "
-        f"(the thread launch region), got: {type(inner_stmt)}")
+        f"Expected the body of the 'target' AttrStmt to be a 'thread_extent' AttrStmt (the thread launch region), got: {type(inner_stmt)}"
+    )
 
 
 def test_split_host_device_produces_two_functions():
@@ -101,8 +102,7 @@ def test_split_host_device_produces_two_functions():
     mod = tilelang.transform.SplitHostDevice()(mod)
 
     funcs = dict(mod.functions)
-    assert len(funcs) == 2, (
-        f"Expected 2 functions after SplitHostDevice, got {len(funcs)}: {list(funcs.keys())}")
+    assert len(funcs) == 2, f"Expected 2 functions after SplitHostDevice, got {len(funcs)}: {list(funcs.keys())}"
 
 
 def test_split_host_device_device_func_has_sunmmio_target():
@@ -123,9 +123,11 @@ def test_split_host_device_device_func_has_sunmmio_target():
     device_funcs = get_device_func(mod)
     assert len(device_funcs) == 1, (
         f"Expected exactly 1 Sunmmio device function, got {len(device_funcs)}.\n"
-        f"Functions: { {gv.name_hint: dict(f.attrs) for gv, f in mod.functions.items()} }")
+        f"Functions: { {gv.name_hint: dict(f.attrs) for gv, f in mod.functions.items()} }"
+    )
     assert target_is_sunmmio(device_funcs[0].attrs["target"]), (
-        f"Expected device function target to be Sunmmio, got: {device_funcs[0].attrs['target']}")
+        f"Expected device function target to be Sunmmio, got: {device_funcs[0].attrs['target']}"
+    )
 
 
 def test_split_host_device_device_func_has_no_thread_bindings():
@@ -142,7 +144,8 @@ def test_split_host_device_device_func_has_no_thread_bindings():
     device_funcs = get_device_func(mod)
     assert len(device_funcs) == 1, (
         "Expected a device function (Sunmmio target + kIsGlobalFunc) after SplitHostDevice, "
-        f"found none.\nFunctions in module: {[str(gv) for gv in mod.functions]}")
+        f"found none.\nFunctions in module: {[str(gv) for gv in mod.functions]}"
+    )
     device_func = device_funcs[0]
 
     thread_extents = {}
@@ -156,7 +159,8 @@ def test_split_host_device_device_func_has_no_thread_bindings():
     assert "threadIdx.x" not in thread_extents, (
         f"Sunmmio device function must have no threadIdx bindings (threadless). "
         f"Found thread extents: {thread_extents}\n"
-        f"Device function:\n{device_func.script()}")
+        f"Device function:\n{device_func.script()}"
+    )
 
 
 if __name__ == "__main__":

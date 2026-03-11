@@ -39,6 +39,7 @@ Note on target context: VectorizePlanner::Plan inside LayoutInference calls
 Target::Current() at runtime. All test functions run entirely inside a
 `with tvm.target.Target(target):` block to keep the context active.
 """
+
 import tilelang
 import tilelang.language as T
 import tilelang.transform as tl_transform
@@ -126,8 +127,7 @@ def collect_var_names(func):
 def get_device_func(mod):
     """Return the device PrimFunc: the one whose target attribute has no host."""
     for func in mod.functions.values():
-        if (isinstance(func, tir.PrimFunc) and func.attrs is not None and "target" in func.attrs
-                and not func.attrs["target"].host):
+        if isinstance(func, tir.PrimFunc) and func.attrs is not None and "target" in func.attrs and not func.attrs["target"].host:
             return func
     return None
 
@@ -148,16 +148,19 @@ def assert_threadless_invariants(func, after_pass):
     assert not threadidx_tags, (
         f"After {after_pass}: threadIdx bindings must not exist in a threadless "
         f"Sunmmio kernel. Found: {threadidx_tags}\nAll extents: {extents}\n"
-        f"IR:\n{func.script()}")
+        f"IR:\n{func.script()}"
+    )
 
     assert "v_thread" not in var_names, (
         f"After {after_pass}: free v_thread variable found. A pass incorrectly "
         f"treated blockIdx as a thread binding and called PartitionLoop.\n"
-        f"All vars: {sorted(var_names)}\nIR:\n{func.script()}")
+        f"All vars: {sorted(var_names)}\nIR:\n{func.script()}"
+    )
 
     assert blockidx_tags, (
         f"After {after_pass}: blockIdx bindings must be preserved in a threadless "
-        f"Sunmmio kernel. Found extents: {extents}\nIR:\n{func.script()}")
+        f"Sunmmio kernel. Found extents: {extents}\nIR:\n{func.script()}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +228,8 @@ def run_optimize_for_sunmmio_cascade(mod, target):
     device_func = get_device_func(mod)
     assert device_func is not None, (
         "After SplitHostDevice: expected a device function (target attr with no host), "
-        f"found none. Functions: {[str(gv) for gv in mod.functions]}")
+        f"found none. Functions: {[str(gv) for gv in mod.functions]}"
+    )
     assert_threadless_invariants(device_func, "SplitHostDevice")
 
     # MergeSRAMAllocations  -- SKIPPED (under implementation)
@@ -234,15 +238,13 @@ def run_optimize_for_sunmmio_cascade(mod, target):
 
     mod = tl_transform.MakePackedAPI()(mod)
     device_func = get_device_func(mod)
-    assert device_func is not None, ("After MakePackedAPI: device function lost. "
-                                     f"Functions: {[str(gv) for gv in mod.functions]}")
+    assert device_func is not None, f"After MakePackedAPI: device function lost. Functions: {[str(gv) for gv in mod.functions]}"
     assert_threadless_invariants(device_func, "MakePackedAPI")
 
     mod = tl_transform.LowerDeviceKernelLaunch()(mod)
     # LowerDeviceKernelLaunch rewrites the host launcher; device body is unchanged.
     device_func = get_device_func(mod)
-    assert device_func is not None, ("After LowerDeviceKernelLaunch: device function lost. "
-                                     f"Functions: {[str(gv) for gv in mod.functions]}")
+    assert device_func is not None, f"After LowerDeviceKernelLaunch: device function lost. Functions: {[str(gv) for gv in mod.functions]}"
     assert_threadless_invariants(device_func, "LowerDeviceKernelLaunch")
 
     return mod

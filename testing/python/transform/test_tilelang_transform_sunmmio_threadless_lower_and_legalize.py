@@ -30,6 +30,7 @@ inside LayoutInference) calls Target::Current() at runtime. For kernels that use
 T.Parallel, the target context must remain active for the duration of the pass
 cascade. All test functions therefore run entirely inside a with tvm.target.Target block.
 """
+
 import tilelang
 import tilelang.language as T
 import tilelang.transform as tl_transform
@@ -130,17 +131,20 @@ def assert_threadless_invariants(mod, after_pass):
     assert not threadidx_tags, (
         f"After {after_pass}: threadIdx bindings must not exist in a threadless "
         f"Sunmmio kernel. Found: {threadidx_tags}\nAll extents: {extents}\n"
-        f"IR:\n{func.script()}")
+        f"IR:\n{func.script()}"
+    )
 
     assert "v_thread" not in var_names, (
         f"After {after_pass}: free v_thread variable found. A pass incorrectly "
         f"treated blockIdx as a thread binding and called PartitionLoop with the "
         f"unbound dummy thread variable.\nAll vars: {sorted(var_names)}\n"
-        f"IR:\n{func.script()}")
+        f"IR:\n{func.script()}"
+    )
 
     assert blockidx_tags, (
         f"After {after_pass}: blockIdx bindings must be preserved in a threadless "
-        f"Sunmmio kernel. Found extents: {extents}\nIR:\n{func.script()}")
+        f"Sunmmio kernel. Found extents: {extents}\nIR:\n{func.script()}"
+    )
 
 
 # ---------------------------------------------------------------------------

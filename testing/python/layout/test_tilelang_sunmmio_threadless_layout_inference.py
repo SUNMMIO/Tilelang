@@ -26,6 +26,7 @@ Regression coverage:
   2. Threadless kernel WITH T.Parallel + shared memory — the exact bug trigger,
      verifying that PartitionLoop is not called with the dummy v_thread variable.
 """
+
 import tilelang
 import tilelang.language as T
 import tilelang.transform as tl_transform
@@ -165,7 +166,8 @@ def test_layout_inference_threadless_kernel_has_no_threadidx_bindings():
     assert not threadidx_tags, (
         f"Threadless Sunmmio kernel must have no threadIdx bindings after LayoutInference. "
         f"Found: {thread_extents}\n"
-        f"IR:\n{mod['main'].script()}")
+        f"IR:\n{mod['main'].script()}"
+    )
 
 
 def test_layout_inference_threadless_kernel_preserves_blockidx_bindings():
@@ -188,7 +190,8 @@ def test_layout_inference_threadless_kernel_preserves_blockidx_bindings():
     assert blockidx_tags, (
         f"Threadless Sunmmio kernel must still have blockIdx bindings after LayoutInference. "
         f"Found extents: {thread_extents}\n"
-        f"IR:\n{mod['main'].script()}")
+        f"IR:\n{mod['main'].script()}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +242,8 @@ def test_layout_inference_parallel_shared_kernel_has_no_threadidx_bindings():
     assert not threadidx_tags, (
         f"Sunmmio kernel with T.Parallel must have no threadIdx bindings after "
         f"LayoutInference (Sunmmio is fully threadless). Found: {thread_extents}\n"
-        f"IR:\n{mod['main'].script()}")
+        f"IR:\n{mod['main'].script()}"
+    )
 
 
 def test_layout_inference_parallel_shared_kernel_has_no_v_thread_variable():
@@ -269,7 +273,8 @@ def test_layout_inference_parallel_shared_kernel_has_no_v_thread_variable():
         "blockIdx.* as a thread binding, causing PartitionLoop to run with an "
         "unbound dummy thread variable.\n"
         f"All vars found: {sorted(var_names)}\n"
-        f"IR:\n{mod['main'].script()}")
+        f"IR:\n{mod['main'].script()}"
+    )
 
 
 if __name__ == "__main__":
