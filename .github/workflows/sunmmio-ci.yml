@@ -83,6 +83,7 @@ jobs:
       PIP_CACHE_DIR: /ci-cache/pip
       UV_CACHE_DIR: /ci-cache/uv
       PRE_COMMIT_HOME: /ci-cache/pre-commit
+      GTEST_CACHE_DIR: /ci-cache/googletest
     defaults:
       run:
         shell: bash
@@ -104,28 +105,15 @@ jobs:
             iproute2 curl dnsutils
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
 
-      - name: Network debug
-        run: |
-          echo "===== DNS ====="
-          cat /etc/resolv.conf
-
-          echo "===== ROUTE ====="
-          ip route
-
-          echo "===== TEST CURL ====="
-          curl -v https://github.com
-
       - name: Install GoogleTest from source
         run: |
-          git clone https://github.com/google/googletest.git
-          cd googletest
+          cd "${GTEST_CACHE_DIR}"
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local
           cmake --build build -j$(nproc)
           cmake --install build
           cd ..
-          rm -rf googletest
 
       - name: Checkout repository
         uses: actions/checkout@v6
