@@ -103,26 +103,9 @@ jobs:
             protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
 
-      - name: Install GoogleTest from source
+      - name: Install GoogleTest
         run: |
-          GTEST_CACHE=/ci-cache/googletest-install
-          if [ -f "${GTEST_CACHE}/lib/libgtest.a" ]; then
-            echo "GoogleTest already cached at ${GTEST_CACHE}, skipping build."
-          else
-            echo "Building GoogleTest and caching to ${GTEST_CACHE}."
-            rm -rf googletest
-            git clone https://github.com/google/googletest.git
-            cd googletest
-            cmake -S . -B build \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_INSTALL_PREFIX="${GTEST_CACHE}"
-            cmake --build build -j$(nproc)
-            cmake --install build
-            cd ..
-            rm -rf googletest
-          fi
-          cp -r "${GTEST_CACHE}/include/"* /usr/local/include/
-          cp -r "${GTEST_CACHE}/lib/"*      /usr/local/lib/
+          apt-get install -y --no-install-recommends libgtest-dev libgmock-dev
 
       - name: Checkout repository
         uses: actions/checkout@v6
