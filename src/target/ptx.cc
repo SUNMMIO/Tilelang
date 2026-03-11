@@ -74,9 +74,11 @@ DataType DTypeFromString(const std::string str) {
     return DataType::kInt64;
   } else if (str == "uint64" || str == ".u64") {
     return DataType::kUInt64;
-  } else if (str == "float8_e4m3" || str == "e4m3" || str == ".e4m3") {
+  } else if (str == "float8_e4m3" || str == "float8_e4m3fn" || str == "e4m3" ||
+             str == ".e4m3") {
     return DataType::kFloat8_e4m3;
-  } else if (str == "float8_e5m2" || str == "e5m2" || str == ".e5m2") {
+  } else if (str == "float8_e5m2" || str == "float8_e5m2fn" || str == "e5m2" ||
+             str == ".e5m2") {
     return DataType::kFloat8_e5m2;
   } else if (str == "float16" || str == "fp16" || str == ".f16") {
     return DataType::kFloat16;
@@ -1341,9 +1343,13 @@ std::string PrintCpAsyncAssembly(const std::string &shared_ptr,
 )";
   Replacer replacer;
   replacer.register_rule("{smem_addr}",
-                         shared_ptr + " + " + shared_elem_offset);
+                         shared_elem_offset.empty()
+                             ? shared_ptr
+                             : shared_ptr + " + " + shared_elem_offset);
   replacer.register_rule("{global_ptr}",
-                         global_ptr + " + " + global_elem_offset);
+                         global_elem_offset.empty()
+                             ? global_ptr
+                             : global_ptr + " + " + global_elem_offset);
   replacer.register_rule("{bytes}", bytes);
   replacer.register_rule("{cg_or_ca}", bytes == "16" ? "cg" : "ca");
   asm_code = replacer.rewrite(asm_code);
@@ -1396,9 +1402,13 @@ std::string PrintPredicatedCpAsyncAssembly(
 
   Replacer replacer;
   replacer.register_rule("{smem_addr}",
-                         shared_ptr + " + " + shared_elem_offset);
+                         shared_elem_offset.empty()
+                             ? shared_ptr
+                             : shared_ptr + " + " + shared_elem_offset);
   replacer.register_rule("{global_ptr}",
-                         global_ptr + " + " + global_elem_offset);
+                         global_elem_offset.empty()
+                             ? global_ptr
+                             : global_ptr + " + " + global_elem_offset);
   replacer.register_rule("{bytes}", bytes);
   replacer.register_rule("{cg_or_ca}", bytes == "16" ? "cg" : "ca");
   replacer.register_rule("{store_shared}", store_shared);

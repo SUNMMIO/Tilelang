@@ -5,23 +5,50 @@ from enum import Enum
 
 class PassConfigKey(str, Enum):
     """Pass configuration keys for TileLang compiler."""
+
     # TileLang specific configs
     TL_SIMPLIFY = "tl.Simplify"
-    """Enable/disable TileLang simplification passes. Default: True"""
+    """Configuration for TileLang simplification passes.
 
-    TL_DYNAMIC_ALIGNMENT = "tl.dynamic_alignment"
-    """Memory alignment requirement for dynamic shapes. Default: 16"""
+    This is a dict-based config with the following options:
+    - transitively_prove_inequalities: bool, default False
+    - convert_boolean_to_and_of_ors: bool, default False
+    - apply_constraints_to_boolean_branches: bool, default False
+    - propagate_knowns_to_prove_conditional: bool, default False
+    - propagate_knowns_to_simplify_expressions: bool, default False
+    - enable_simplify_let_inline: bool, default True
 
-    TL_DISABLE_DYNAMIC_TAIL_SPLIT = "tl.disable_dynamic_tail_split"
-    """Disable dynamic tail splitting optimization. Default: False"""
+    Usage:
+        with tvm.transform.PassContext(config={
+            "tl.Simplify": {"enable_simplify_let_inline": False}
+        }):
+            mod = tl.transform.Simplify()(mod)
+    """
+
+    # TL_SIMPLIFY sub-config keys
+    TL_SIMPLIFY_TRANSITIVELY_PROVE_INEQUALITIES = "transitively_prove_inequalities"
+    """Enable transitive inequality proving in simplification. Default: False"""
+
+    TL_SIMPLIFY_CONVERT_BOOLEAN_TO_AND_OF_ORS = "convert_boolean_to_and_of_ors"
+    """Convert boolean expressions to AND of ORs form. Default: False"""
+
+    TL_SIMPLIFY_APPLY_CONSTRAINTS_TO_BOOLEAN_BRANCHES = "apply_constraints_to_boolean_branches"
+    """Apply constraints to simplify boolean branches. Default: False"""
+
+    TL_SIMPLIFY_PROPAGATE_KNOWNS_TO_PROVE_CONDITIONAL = "propagate_knowns_to_prove_conditional"
+    """Propagate known values to prove conditionals. Default: False"""
+
+    TL_SIMPLIFY_PROPAGATE_KNOWNS_TO_SIMPLIFY_EXPRESSIONS = "propagate_knowns_to_simplify_expressions"
+    """Propagate known values to simplify expressions. Default: False"""
+
+    TL_SIMPLIFY_ENABLE_LET_INLINE = "enable_simplify_let_inline"
+    """Enable inlining of let statements during simplification. Default: True"""
+
+    TL_DISABLE_DATA_RACE_CHECK = "tl.disable_data_race_check"
+    """Disable data race check in TileLang. Default: False"""
 
     TL_DISABLE_WARP_SPECIALIZED = "tl.disable_warp_specialized"
     """Disable warp specialization optimization. Default: False"""
-
-    TL_DISABLE_FAST_MATH = "tl.disable_fast_math"
-    """Disable fast math optimization. Default: True
-    will be deprecated in the 0.1.7 release
-    """
 
     TL_ENABLE_FAST_MATH = "tl.enable_fast_math"
     """
@@ -36,6 +63,20 @@ class PassConfigKey(str, Enum):
     TL_ENABLE_PTXAS_VERBOSE_OUTPUT = "tl.enable_ptxas_verbose_output"
     """Enable ptxas verbose output. Default: False"""
 
+    TL_DEVICE_COMPILE_FLAGS = "tl.device_compile_flags"
+    """Additional device compiler flags passed to nvcc/NVRTC.
+
+    Accepts either a string (parsed with shell-like splitting) or a list of
+    strings. Typical usage is to provide extra include paths, defines or
+    ptxas options, e.g.:
+
+    - "-I/opt/include -DMY_SWITCH=1 --ptxas-options=--verbose"
+    - ["-I/opt/include", "-DMY_SWITCH=1", "--ptxas-options=--verbose"]
+
+    These flags are appended to the compiler options used in the tvm_ffi
+    CUDA compile callback. Default: None
+    """
+
     TL_CONFIG_INDEX_BITWIDTH = "tl.config_index_bitwidth"
     """Bitwidth for configuration indices. Default: 32"""
 
@@ -47,6 +88,24 @@ class PassConfigKey(str, Enum):
 
     TL_DISABLE_VECTORIZE_256 = "tl.disable_vectorize_256"
     """Disable usage of LDG/STG 256. Default: False"""
+
+    TL_ENABLE_LOWER_LDGSTG = "tl.enable_lower_ldgstg"
+    """Enable non-predicated LDG/STG lowering for global memory access.
+    When enabled, converts Ramp-based global buffer load/store to ldg/stg intrinsics.
+    Default: False"""
+
+    TL_ENABLE_LOWER_LDGSTG_PREDICATED = "tl.enable_lower_ldgstg_predicated"
+    """Enable predicated LDG/STG lowering.
+    When True, predicated loads (if_then_else with else=0) and
+    predicated stores (IfThenElse with empty then case) are lowered to
+    ldg/stg intrinsics. Default: False"""
+
+    TL_ENABLE_VECTORIZE_PLANNER_VERBOSE = "tl.enable_vectorize_planner_verbose"
+    """Enable verbose output for vectorize planner. When enabled, prints detailed
+    information about each buffer's inferred vector size and which buffer determines
+    the final vectorization factor. Useful for debugging vectorization issues.
+    Default: False"""
+
     TL_DISABLE_WGMMA = "tl.disable_wgmma"
     """Disable usage of Hopper WGMMA. Default: False"""
 
@@ -59,6 +118,15 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_SHUFFLE_ELECT = "tl.disable_shuffle_elect"
     """Disable shuffle election optimization. Default: False"""
 
+    TL_DISABLE_LOOP_UNSWITCHING = "tl.disable_loop_unswitching"
+    """Disable loop unswitching optimization. Default: False"""
+
+    TL_LOOP_UNSWITCHING_ALLOW_NON_TRIVIAL_ELSE = "tl.loop_unswitching_allow_non_trivial_else"
+    """Allow loop unswitching even when the else-version of the loop body has side effects.
+
+    This is more aggressive and may increase code size. Default: False.
+    """
+
     TL_DISABLE_THREAD_STORAGE_SYNC = "tl.disable_thread_storage_sync"
     """Disable thread storage synchronization pass. When enabled, disables the
     automatic insertion of thread synchronization barriers (e.g., __syncthreads())
@@ -68,6 +136,9 @@ class PassConfigKey(str, Enum):
 
     TL_FORCE_LET_INLINE = "tl.force_let_inline"
     """Force TileLang to inline let bindings during simplification. Default: False"""
+
+    TL_AST_PRINT_ENABLE = "tl.ast_print_enable"
+    """Enable TIR AST printing for debugging purposes. Default: False"""
 
     TL_LAYOUT_VISUALIZATION_ENABLE = "tl.layout_visualization_enable"
     """Enable layout inference visualization. Default: False"""
@@ -85,10 +156,10 @@ class PassConfigKey(str, Enum):
     such as `dst[i] = f(src[i])`, avoiding implicit aliasing:
 
     ```
-    read = T.allocate([1], "int32", "local.var")
-    write = T.allocate([1], "int32", "local.var")
-    read_buf = T.Buffer((1,), "int32", data=read, scope="local.var")
-    write_buf = T.Buffer((1,), "int32", data=write, scope="local.var")
+    read = T.allocate([1], T.int32, "local.var")
+    write = T.allocate([1], T.int32, "local.var")
+    read_buf = T.Buffer((1,), T.int32, data=read, scope="local.var")
+    write_buf = T.Buffer((1,), T.int32, data=write, scope="local.var")
     write_buf[0] = read_buf[0] * 2
     f(write_buf[0])
     ```
@@ -98,8 +169,8 @@ class PassConfigKey(str, Enum):
     like:
 
     ```
-    read = T.allocate([1], "int32", "local.var")
-    read_buf = T.Buffer((1,), "int32", data=read, scope="local.var")
+    read = T.allocate([1], T.int32, "local.var")
+    read_buf = T.Buffer((1,), T.int32, data=read, scope="local.var")
     read_buf[0] = read_buf[0] * 2
     f(read_buf[0])
     ```
@@ -151,3 +222,6 @@ class PassConfigKey(str, Enum):
 
     CUDA_KERNELS_OUTPUT_DIR = "cuda.kernels_output_dir"
     """Output directory for generated CUDA kernels. Default: empty string"""
+
+    TL_DISABLE_OUT_OF_BOUND_WARNING = "tl.disable_out_of_bound_warning"
+    """Disable out-of-bound access warnings in safe memory access legalization. Default: False"""

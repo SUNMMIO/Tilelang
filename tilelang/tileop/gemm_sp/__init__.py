@@ -1,13 +1,14 @@
 from tilelang import tvm as tvm
 from tvm import tir
 from tilelang.utils.target import (
-    target_is_cuda,)
+    target_is_cuda,
+)
 from tvm.target import Target
 from tvm.ir.base import Node
 from tvm.ir import Range
 from tvm.runtime import Scriptable
 import tvm_ffi
-from tilelang.ir import GemmWarpPolicy
+from tilelang.tileop.base import GemmWarpPolicy
 from .gemm_sp_mma import GemmSPMMA
 
 
@@ -18,8 +19,7 @@ def gemm_sp_py_infer_layout(gemm_sp_py: GemmSPMMA, target: Target, thread_bounds
 
 
 @tvm_ffi.register_global_func("tl.gemm_sp_py.lower")
-def gemm_sp_py_lower(gemm_sp_py: GemmSPMMA, target: Target, thread_bounds: Range,
-                     thread_var: tir.Var):
+def gemm_sp_py_lower(gemm_sp_py: GemmSPMMA, target: Target, thread_bounds: Range, thread_var: tir.Var):
     thread_nums = thread_bounds.extent
     stmt = gemm_sp_py.lower(target, thread_nums, thread_var)
     return stmt

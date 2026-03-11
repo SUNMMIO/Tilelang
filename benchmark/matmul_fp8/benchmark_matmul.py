@@ -2,7 +2,6 @@ import argparse
 import itertools
 import torch
 import logging
-import tilelang
 import tilelang.language as T
 from tilelang.autotuner import autotune
 from tilelang import jit
@@ -63,9 +62,9 @@ def get_configs(args, kwargs):
             M=M,
             N=N,
             K=K,
-            in_dtype="float16",
-            out_dtype="float16",
-            accum_dtype="float",
+            in_dtype=T.float16,
+            out_dtype=T.float16,
+            accum_dtype=T.float32,
         ).with_arch(arch)
 
         func = carve_template.equivalent_function()
@@ -104,9 +103,7 @@ def get_configs(args, kwargs):
             policy=[T.GemmWarpPolicy.Square],
             enable_rasteration=[True, False],
         )
-        return [{
-            k: v for k, v in zip(iter_params, values)
-        } for values in itertools.product(*iter_params.values())]
+        return [{k: v for k, v in zip(iter_params, values)} for values in itertools.product(*iter_params.values())]
 
     return configs
 
@@ -116,7 +113,9 @@ def get_configs(args, kwargs):
     warmup=3,
     rep=20,
 )
-@jit(out_idx=[2],)
+@jit(
+    out_idx=[2],
+)
 def matmul(
     M,
     N,
@@ -159,14 +158,14 @@ def matmul(
 
     # Use half-precision for input data to reduce memory bandwidth,
     # accumulate in float for better numerical accuracy
-    dtype = "float8_e4m3fnuz" if torch.version.hip is not None else "float8_e4m3"
-    accum_dtype = "float"
+    dtype = T.float8_e4m3fnuz if torch.version.hip is not None else T.float8_e4m3fn
+    accum_dtype = T.float32
 
     @T.prim_func
     def main(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((N, K), dtype),
-            C: T.Tensor((M, N), dtype),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((N, K), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         """
         The compiled TVM function for block-level matrix multiplication.
@@ -181,7 +180,6 @@ def matmul(
         # Bind x-dimension to block index in N,
         #     y-dimension to block index in M.
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=thread_num) as (bx, by):
-
             # Allocate shared memory for A sub-block of shape (block_M, block_K)
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             # Allocate shared memory for B sub-block of shape (block_N, block_K)
@@ -193,8 +191,6 @@ def matmul(
 
             # Enable (or disable) swizzling optimization
             T.use_swizzle(panel_size=10, enable=enable_rasteration)
-            # to utilize swizzle tma layout
-            T.annotate_layout({C_shared: tilelang.layout.make_swizzled_layout(C_shared)})
 
             # Clear out the accumulation buffer
             T.clear(C_local)

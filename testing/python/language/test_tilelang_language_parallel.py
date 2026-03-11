@@ -8,12 +8,11 @@ tilelang.testing.set_random_seed()
 
 
 @tilelang.jit(out_idx=[1])
-def parallel_elementwise_static(length=256, dtype="float32"):
-
+def parallel_elementwise_static(length=256, dtype=T.float32):
     @T.prim_func
     def main(
-            A: T.Tensor((length,), dtype),
-            B: T.Tensor((length,), dtype),
+        A: T.Tensor((length,), dtype),
+        B: T.Tensor((length,), dtype),
     ):
         with T.Kernel(1, threads=length) as _:
             for i in T.Parallel(length):
@@ -23,13 +22,12 @@ def parallel_elementwise_static(length=256, dtype="float32"):
 
 
 @tilelang.jit(out_idx=[1])
-def parallel_elementwise_dynamic(max_len=512, threads=256, dtype="float32"):
-
+def parallel_elementwise_dynamic(max_len=512, threads=256, dtype=T.float32):
     @T.prim_func
     def main(
-            A: T.Tensor((max_len,), dtype),
-            B: T.Tensor((max_len,), dtype),
-            valid_len: T.int32,
+        A: T.Tensor((max_len,), dtype),
+        B: T.Tensor((max_len,), dtype),
+        valid_len: T.int32,
     ):
         with T.Kernel(1, threads=threads) as _:
             for i in T.Parallel(max_len):
@@ -66,6 +64,22 @@ def test_parallel_dynamic_extent():
         clip = min(valid_len, data.shape[0])
         reference[:clip] = data[:clip] - 1.0
         torch.testing.assert_close(out, reference, atol=1e-5, rtol=1e-5)
+
+
+@tilelang.jit
+def _parallel_vectorize_local_and_var():
+    with T.Kernel(1) as _:
+        x = T.alloc_fragment([256], T.float32)
+        y = T.alloc_fragment([256], T.float32)
+        z = T.alloc_var(T.float32)
+        for i in T.parallel(256):
+            y[i] = x[i] * z
+
+
+def test_parallel_vectorize_var():
+    source = _parallel_vectorize_local_and_var.get_kernel_source()
+    # do not vectorize if the loop only contains local/fragment and var buffer access
+    assert "float2" not in source
 
 
 if __name__ == "__main__":

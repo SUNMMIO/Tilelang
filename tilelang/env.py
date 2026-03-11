@@ -1,4 +1,5 @@
 from __future__ import annotations
+import importlib.metadata
 import sys
 import os
 import pathlib
@@ -10,40 +11,60 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 # SETUP ENVIRONMENT VARIABLES
-CUTLASS_NOT_FOUND_MESSAGE = ("CUTLASS is not installed or found in the expected path")
+CUTLASS_NOT_FOUND_MESSAGE = "CUTLASS is not installed or found in the expected path"
 ", which may lead to compilation bugs when utilize tilelang backend."
-COMPOSABLE_KERNEL_NOT_FOUND_MESSAGE = (
-    "Composable Kernel is not installed or found in the expected path")
+COMPOSABLE_KERNEL_NOT_FOUND_MESSAGE = "Composable Kernel is not installed or found in the expected path"
 ", which may lead to compilation bugs when utilize tilelang backend."
-TL_TEMPLATE_NOT_FOUND_MESSAGE = ("TileLang is not installed or found in the expected path")
+TL_TEMPLATE_NOT_FOUND_MESSAGE = "TileLang is not installed or found in the expected path"
 ", which may lead to compilation bugs when utilize tilelang backend."
-TVM_LIBRARY_NOT_FOUND_MESSAGE = ("TVM is not installed or found in the expected path")
+TVM_LIBRARY_NOT_FOUND_MESSAGE = "TVM is not installed or found in the expected path"
 
 TL_ROOT = os.path.dirname(os.path.abspath(__file__))
 # Only expose the internal lib directory to sys.path to avoid shadowing
 # common top-level module names (e.g., utils, analysis) from user projects.
-TL_LIBS = [os.path.join(TL_ROOT, 'lib')]
+TL_LIBS = [os.path.join(TL_ROOT, "lib")]
 TL_LIBS = [i for i in TL_LIBS if os.path.exists(i)]
 
 DEV = False
-THIRD_PARTY_ROOT = os.path.join(TL_ROOT, '3rdparty')
+THIRD_PARTY_ROOT = os.path.join(TL_ROOT, "3rdparty")
 if not os.path.exists(THIRD_PARTY_ROOT):
     DEV = True
     tl_dev_root = os.path.dirname(TL_ROOT)
 
-    dev_lib_root = os.path.join(tl_dev_root, 'build')
+    dev_lib_root = os.path.join(tl_dev_root, "build")
     # In dev builds, place artifacts under build/lib and point search path there
     # to avoid adding the entire build root to sys.path.
-    TL_LIBS = [os.path.join(dev_lib_root, 'lib'), os.path.join(dev_lib_root, 'tvm')]
-    THIRD_PARTY_ROOT = os.path.join(tl_dev_root, '3rdparty')
-    logger.warning(f'Loading tilelang libs from dev root: {dev_lib_root}')
+    TL_LIBS = [os.path.join(dev_lib_root, "lib"), os.path.join(dev_lib_root, "tvm")]
+    THIRD_PARTY_ROOT = os.path.join(tl_dev_root, "3rdparty")
+    logger.warning(f"Loading tilelang libs from dev root: {dev_lib_root}")
 
-assert TL_LIBS and all(
-    os.path.exists(i) for i in TL_LIBS), f'tilelang lib root do not exists: {TL_LIBS}'
+assert TL_LIBS and all(os.path.exists(i) for i in TL_LIBS), f"tilelang lib root do not exists: {TL_LIBS}"
 
 for lib in TL_LIBS:
     if lib not in sys.path:
         sys.path.insert(0, lib)
+
+
+def _get_package_version(pkg: str) -> str | None:
+    try:
+        return importlib.metadata.version(pkg)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _is_running_autodd() -> bool:
+    """Detect if we are running under `python -m tilelang.autodd`."""
+    orig_argv = getattr(sys, "orig_argv", None)
+    if orig_argv is None:
+        return False
+    if "-mtilelang.autodd" in orig_argv:
+        return True
+    pos = orig_argv.index("-m") if "-m" in orig_argv else -1
+    if pos != -1 and pos + 1 < len(orig_argv):
+        module_name = orig_argv[pos + 1]
+        if module_name == "tilelang.autodd" or module_name.startswith("tilelang.autodd."):
+            return True
+    return False
 
 
 def _find_cuda_home() -> str:
@@ -52,7 +73,7 @@ def _find_cuda_home() -> str:
     Adapted from https://github.com/pytorch/pytorch/blob/main/torch/utils/cpp_extension.py
     """
     # Guess #1
-    cuda_home = os.environ.get('CUDA_HOME') or os.environ.get('CUDA_PATH')
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
     if cuda_home is None:
         # Guess #2
         nvcc_path = shutil.which("nvcc")
@@ -68,34 +89,45 @@ def _find_cuda_home() -> str:
             else:
                 cuda_home = os.path.dirname(os.path.dirname(nvcc_path))
 
-        else:
+        elif _get_package_version("nvidia-cuda-nvcc") is not None:
             # Guess #3
-            if sys.platform == 'win32':
-                cuda_homes = glob.glob('C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v*.*')
-                cuda_home = '' if len(cuda_homes) == 0 else cuda_homes[0]
+            # from pypi package nvidia-cuda-nvcc, only nvidia-cuda-nvcc>=13.0 works.
+            # nvidia-cuda-nvcc-cu12, etc. only installs `ptxas`, not `nvcc`
+            for file in importlib.metadata.files("nvidia-cuda-nvcc") or []:
+                if file.name == "nvcc" or file.name == "nvcc.exe":
+                    cuda_home = str(pathlib.Path(file.locate()).parent.parent)
+                    break
+            else:
+                raise AssertionError("`nvidia-cuda-nvcc` installed but no `nvcc` found")
+
+        else:
+            # Guess #4
+            if sys.platform == "win32":
+                cuda_homes = glob.glob("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v*.*")
+                cuda_home = "" if len(cuda_homes) == 0 else cuda_homes[0]
             else:
                 # Linux/macOS
-                if os.path.exists('/usr/local/cuda'):
-                    cuda_home = '/usr/local/cuda'
-                elif os.path.exists('/opt/nvidia/hpc_sdk/Linux_x86_64'):
-                    cuda_home = '/opt/nvidia/hpc_sdk/Linux_x86_64'
+                if os.path.exists("/usr/local/cuda"):
+                    cuda_home = "/usr/local/cuda"
+                elif os.path.exists("/opt/nvidia/hpc_sdk/Linux_x86_64"):
+                    cuda_home = "/opt/nvidia/hpc_sdk/Linux_x86_64"
 
-            # Validate found path
-            if cuda_home is None or not os.path.exists(cuda_home):
-                cuda_home = None
+        # Validate found path
+        if cuda_home is None or not os.path.exists(cuda_home):
+            cuda_home = None
 
     return cuda_home if cuda_home is not None else ""
 
 
 def _find_rocm_home() -> str:
     """Find the ROCM install path."""
-    rocm_home = os.environ.get('ROCM_PATH') or os.environ.get('ROCM_HOME')
+    rocm_home = os.environ.get("ROCM_PATH") or os.environ.get("ROCM_HOME")
     if rocm_home is None:
         rocmcc_path = shutil.which("hipcc")
         if rocmcc_path is not None:
             rocm_home = os.path.dirname(os.path.dirname(rocmcc_path))
         else:
-            rocm_home = '/opt/rocm'
+            rocm_home = "/opt/rocm"
             if not os.path.exists(rocm_home):
                 rocm_home = None
     return rocm_home if rocm_home is not None else ""
@@ -104,6 +136,7 @@ def _find_rocm_home() -> str:
 # Cache control
 class CacheState:
     """Class to manage global kernel caching state."""
+
     _enabled = True
 
     @classmethod
@@ -230,13 +263,11 @@ class Environment:
     TILELANG_TMP_DIR = EnvVar("TILELANG_TMP_DIR", os.path.join(TILELANG_CACHE_DIR.get(), "tmp"))
 
     # Kernel Build options
-    TILELANG_PRINT_ON_COMPILATION = EnvVar("TILELANG_PRINT_ON_COMPILATION",
-                                           "1")  # print kernel name on compile
+    TILELANG_PRINT_ON_COMPILATION = EnvVar("TILELANG_PRINT_ON_COMPILATION", "1")  # print kernel name on compile
     TILELANG_DISABLE_CACHE = EnvVar(
-        "TILELANG_DISABLE_CACHE",
-        "0")  # disable kernel cache, usually for unit testing / debugging, high priority
-    TILELANG_CLEAR_CACHE = EnvVar("TILELANG_CLEAR_CACHE",
-                                  "0")  # DEPRECATED! clear cache automatically if set
+        "TILELANG_DISABLE_CACHE", "0"
+    )  # disable kernel cache, usually for unit testing / debugging, high priority
+    TILELANG_CLEAR_CACHE = EnvVar("TILELANG_CLEAR_CACHE", "0")  # DEPRECATED! clear cache automatically if set
 
     # Kernel selection options
     # Default to GEMM v2; set to "1"/"true"/"yes"/"on" to force v1
@@ -244,12 +275,15 @@ class Environment:
 
     # Auto-tuning settings
     TILELANG_AUTO_TUNING_DISABLE_CACHE = EnvVar("TILELANG_AUTO_TUNING_DISABLE_CACHE", "0")
-    TILELANG_AUTO_TUNING_CPU_UTILITIES = EnvVar("TILELANG_AUTO_TUNING_CPU_UTILITIES",
-                                                "0.9")  # percent of CPUs used
-    TILELANG_AUTO_TUNING_CPU_COUNTS = EnvVar("TILELANG_AUTO_TUNING_CPU_COUNTS",
-                                             "-1")  # -1 means auto
-    TILELANG_AUTO_TUNING_MAX_CPU_COUNT = EnvVar("TILELANG_AUTO_TUNING_MAX_CPU_COUNT",
-                                                "-1")  # -1 means no limit
+    TILELANG_AUTO_TUNING_CPU_UTILITIES = EnvVar("TILELANG_AUTO_TUNING_CPU_UTILITIES", "0.9")  # percent of CPUs used
+    TILELANG_AUTO_TUNING_CPU_COUNTS = EnvVar("TILELANG_AUTO_TUNING_CPU_COUNTS", "-1")  # -1 means auto
+    TILELANG_AUTO_TUNING_MAX_CPU_COUNT = EnvVar("TILELANG_AUTO_TUNING_MAX_CPU_COUNT", "-1")  # -1 means no limit
+
+    # Compilation defaults (for jit, autotune, compile)
+    # These allow overriding default compilation parameters via environment variables
+    TILELANG_DEFAULT_TARGET = EnvVar("TILELANG_TARGET", "auto")
+    TILELANG_DEFAULT_EXECUTION_BACKEND = EnvVar("TILELANG_EXECUTION_BACKEND", "auto")
+    TILELANG_DEFAULT_VERBOSE = EnvVar("TILELANG_VERBOSE", "0")
 
     # TVM integration
     SKIP_LOADING_TILELANG_SO = EnvVar("SKIP_LOADING_TILELANG_SO", "0")
@@ -295,6 +329,29 @@ class Environment:
         """
         return str(self.TILELANG_USE_GEMM_V1).lower() in ("1", "true", "yes", "on")
 
+    def get_default_target(self) -> str:
+        """Get default compilation target from environment."""
+        return self.TILELANG_DEFAULT_TARGET
+
+    def get_default_execution_backend(self) -> str:
+        """Get default execution backend from environment."""
+        return self.TILELANG_DEFAULT_EXECUTION_BACKEND
+
+    def get_default_verbose(self) -> bool:
+        """Get default verbose flag from environment."""
+        return self.TILELANG_DEFAULT_VERBOSE.lower() in ("1", "true", "yes", "on")
+
+    def is_running_autodd(self) -> bool:
+        """Return True if we are running under `python -m tilelang.autodd`."""
+        # means we are running under `python -m tilelang.autodd`
+        return _is_running_autodd()
+
+    def is_light_import(self) -> bool:
+        """Return True if we are running in light import mode."""
+        # means we are running under `python -m tilelang.autodd` or some
+        # other scripts that only require the minimal environment variables.
+        return self.is_running_autodd()
+
 
 # Instantiate as a global configuration object
 env = Environment()
@@ -323,18 +380,18 @@ def prepend_pythonpath(path):
 if env.TVM_IMPORT_PYTHON_PATH is not None:
     prepend_pythonpath(env.TVM_IMPORT_PYTHON_PATH)
 else:
-    tvm_path = os.path.join(THIRD_PARTY_ROOT, 'tvm', 'python')
+    tvm_path = os.path.join(THIRD_PARTY_ROOT, "tvm", "python")
     assert os.path.exists(tvm_path), tvm_path
     if tvm_path not in sys.path:
         prepend_pythonpath(tvm_path)
         env.TVM_IMPORT_PYTHON_PATH = tvm_path
 # By default, the built TVM-related libraries are stored in TL_LIBS.
 if os.environ.get("TVM_LIBRARY_PATH") is None:
-    os.environ['TVM_LIBRARY_PATH'] = env.TVM_LIBRARY_PATH = os.pathsep.join(TL_LIBS)
+    os.environ["TVM_LIBRARY_PATH"] = env.TVM_LIBRARY_PATH = os.pathsep.join(TL_LIBS)
 
 # Initialize CUTLASS paths
 if os.environ.get("TL_CUTLASS_PATH", None) is None:
-    cutlass_inc_path = os.path.join(THIRD_PARTY_ROOT, 'cutlass', 'include')
+    cutlass_inc_path = os.path.join(THIRD_PARTY_ROOT, "cutlass", "include")
     if os.path.exists(cutlass_inc_path):
         os.environ["TL_CUTLASS_PATH"] = env.CUTLASS_INCLUDE_DIR = cutlass_inc_path
     else:
@@ -342,7 +399,7 @@ if os.environ.get("TL_CUTLASS_PATH", None) is None:
 
 # Initialize COMPOSABLE_KERNEL paths
 if os.environ.get("TL_COMPOSABLE_KERNEL_PATH", None) is None:
-    ck_inc_path = os.path.join(THIRD_PARTY_ROOT, 'composable_kernel', 'include')
+    ck_inc_path = os.path.join(THIRD_PARTY_ROOT, "composable_kernel", "include")
     if os.path.exists(ck_inc_path):
         os.environ["TL_COMPOSABLE_KERNEL_PATH"] = env.COMPOSABLE_KERNEL_INCLUDE_DIR = ck_inc_path
     else:

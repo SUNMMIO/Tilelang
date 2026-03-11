@@ -6,6 +6,8 @@
 
 #include "operator.h"
 
+#include "builtin.h"
+
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op_attr_types.h>
 
@@ -31,7 +33,7 @@ TileOperator ParseOperator(Call call) {
   auto op_map = Op::GetAttrMap<OpBuilderFunc>("TLOpBuilder");
   Op op = call->op.as<Op>().value();
   if (op_map.count(op)) {
-    auto tile_op = op_map[op](call->args);
+    auto tile_op = op_map[op](call->args, call->annotations);
     ICHECK(tile_op.defined());
     return tile_op;
   }
@@ -71,10 +73,22 @@ TileOperator ParseOperator(Stmt stmt) {
 Var GetVarFromAccessPtr(const PrimExpr &expr) {
   auto call = expr.as<CallNode>();
   ICHECK(call);
-  ICHECK(call->op.same_as(builtin::tvm_access_ptr()));
-  auto var = call->args[1].as<VarNode>();
-  ICHECK(var);
-  return tvm::ffi::GetRef<Var>(var);
+  if (call->op.same_as(builtin::tvm_access_ptr())) {
+    auto var = call->args[1].as<VarNode>();
+    ICHECK(var);
+    return tvm::ffi::GetRef<Var>(var);
+  }
+  if (call->op.same_as(tl::access_ptr())) {
+    ICHECK_EQ(call->args.size(), 3U);
+    auto load = call->args[0].as<BufferLoadNode>();
+    ICHECK(load);
+    auto var = load->buffer->data.as<VarNode>();
+    ICHECK(var);
+    return tvm::ffi::GetRef<Var>(var);
+  }
+  LOG(FATAL) << "GetVarFromAccessPtr expects a tvm_access_ptr or tl.access_ptr "
+                "call, but got: "
+             << tvm::ffi::GetRef<Call>(call);
 }
 
 } // namespace tl

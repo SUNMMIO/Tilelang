@@ -1,13 +1,15 @@
-"""The language interface for tl programs."""
+"""Logical operations exposed on the TileLang language surface."""
+
 from __future__ import annotations
 
 from tilelang import language as T
 from tvm.tir import Buffer, BufferRegion, BufferLoad
 from tvm import tir
 from tilelang.utils.language import get_buffer_elems
+from tilelang._typing import BufferLikeType
 
 
-def any_of(buffer: T.Tensor | BufferRegion):
+def any_of(buffer: BufferLikeType) -> tir.PrimExpr:
     """Check if any element in the buffer is true.
 
     Args:
@@ -19,7 +21,7 @@ def any_of(buffer: T.Tensor | BufferRegion):
     return_type: str = "bool"
     if isinstance(buffer, Buffer):
         elems = get_buffer_elems(buffer)
-        return T.call_intrin(return_type, tir.op.Op.get("tl.any_of"), T.address_of(buffer), elems)
+        return T.call_intrin(return_type, tir.op.Op.get("tl.any_of"), T.access_ptr(buffer, "r"), elems)
     elif isinstance(buffer, BufferRegion):
         buffer, region = buffer.buffer, buffer.region
         new_region = []
@@ -36,13 +38,17 @@ def any_of(buffer: T.Tensor | BufferRegion):
                     )
                 new_region.append(r.min)
         buffer_load = BufferLoad(buffer, new_region)
-        return T.call_intrin(return_type, tir.op.Op.get("tl.any_of"), T.address_of(buffer_load),
-                             extent)
+        return T.call_intrin(
+            return_type,
+            tir.op.Op.get("tl.any_of"),
+            T.access_ptr(buffer_load, "r", extent=extent),
+            extent,
+        )
     else:
         raise ValueError(f"Invalid buffer type: {type(buffer)}")
 
 
-def all_of(buffer: T.Tensor | BufferRegion):
+def all_of(buffer: BufferLikeType) -> tir.PrimExpr:
     """Check if all elements in the buffer are true.
 
     Args:
@@ -54,7 +60,7 @@ def all_of(buffer: T.Tensor | BufferRegion):
     return_type: str = "bool"
     if isinstance(buffer, Buffer):
         elems = get_buffer_elems(buffer)
-        return T.call_intrin(return_type, tir.op.Op.get("tl.all_of"), T.address_of(buffer), elems)
+        return T.call_intrin(return_type, tir.op.Op.get("tl.all_of"), T.access_ptr(buffer, "r"), elems)
     elif isinstance(buffer, BufferRegion):
         buffer, region = buffer.buffer, buffer.region
         new_region = []
@@ -71,7 +77,11 @@ def all_of(buffer: T.Tensor | BufferRegion):
                     )
                 new_region.append(r.min)
         buffer_load = BufferLoad(buffer, new_region)
-        return T.call_intrin(return_type, tir.op.Op.get("tl.all_of"), T.address_of(buffer_load),
-                             extent)
+        return T.call_intrin(
+            return_type,
+            tir.op.Op.get("tl.all_of"),
+            T.access_ptr(buffer_load, "r", extent=extent),
+            extent,
+        )
     else:
         raise ValueError(f"Invalid buffer type: {type(buffer)}")

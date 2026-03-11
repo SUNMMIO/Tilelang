@@ -1,4 +1,5 @@
-"""The language interface for tl programs."""
+"""Kernel launching language interface in TileLang."""
+
 from __future__ import annotations
 from collections import deque
 from tvm import tir
@@ -6,6 +7,7 @@ from tvm.tir import Var
 from tvm.script.ir_builder.tir.frame import TIRFrame, BlockFrame
 from tvm.ffi import register_object
 from tilelang import _ffi_api
+from tilelang.jit.exceptions import JITNoBuilderError
 import threading
 
 # Ensure single-dimension kernel bindings can be unpacked like iterables.
@@ -107,8 +109,7 @@ class KernelLaunchFrame(TIRFrame):
         _get_current_stack().push(self)
 
         last_block_frame = self.frames[-1]
-        assert isinstance(last_block_frame,
-                          BlockFrame), f"Last frame must be a block frame, got {last_block_frame}"
+        assert isinstance(last_block_frame, BlockFrame), f"Last frame must be a block frame, got {last_block_frame}"
 
         maybe_cpu = last_block_frame.annotations.get("tilelang.is_cpu_kernel_frame", False)
 
@@ -226,7 +227,7 @@ class KernelLaunchFrame(TIRFrame):
 
 
 def Kernel(
-    *blocks: list[tir.PrimExpr],
+    *blocks: int | tir.PrimExpr,
     threads: int | list[int] | tuple | None = None,
     is_cpu: bool = False,
     prelude: str | None = None,
@@ -235,7 +236,7 @@ def Kernel(
 
     Parameters
     ----------
-    blocks : List[int]
+    blocks : int
         A list of extent, can be 1-3 dimension, representing gridDim.(x|y|z)
     threads : int
         A integer representing blockDim.x
@@ -279,6 +280,15 @@ def Kernel(
         with T.Kernel(loop_extent, is_cpu=True) as (i,):
             ...
     """
+    # In eager mode, we construct AST directly without prim_func,
+    # so there must be a Builder available. If not, this function
+    # is being called outside of a JIT/prim_func context.
+    # lazy import to avoid circular import
+    from tilelang.language.eager.builder import Builder
+
+    if Builder.current() is None:
+        raise JITNoBuilderError("T.Kernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")
+
     attrs: dict = {}
 
     if not is_cpu and threads is None:
@@ -303,56 +313,48 @@ def Kernel(
 
 
 def get_thread_binding(dim: int = 0) -> Var:
-    """Returns the thread binding for the given dimension.
-    """
+    """Returns the thread binding for the given dimension."""
     assert KernelLaunchFrame.Current() is not None, "KernelLaunchFrame is not initialized"
     return KernelLaunchFrame.Current().get_thread_binding(dim)
 
 
 def get_thread_bindings() -> list[Var]:
-    """Returns all three thread bindings.
-    """
+    """Returns all three thread bindings."""
     assert KernelLaunchFrame.Current() is not None, "KernelLaunchFrame is not initialized"
     return KernelLaunchFrame.Current().get_thread_bindings()
 
 
 def get_block_binding(dim: int = 0) -> Var:
-    """Returns the block binding for the given dimension.
-    """
+    """Returns the block binding for the given dimension."""
     assert KernelLaunchFrame.Current() is not None, "KernelLaunchFrame is not initialized"
     return KernelLaunchFrame.Current().get_block_binding(dim)
 
 
 def get_block_bindings() -> list[Var]:
-    """Returns all three block bindings.
-    """
+    """Returns all three block bindings."""
     assert KernelLaunchFrame.Current() is not None, "KernelLaunchFrame is not initialized"
     return KernelLaunchFrame.Current().get_block_bindings()
 
 
 def get_thread_extent(dim: int = 0) -> int:
-    """Returns the thread extent for the given dimension.
-    """
+    """Returns the thread extent for the given dimension."""
     assert KernelLaunchFrame.Current() is not None, "KernelLaunchFrame is not initialized"
     return KernelLaunchFrame.Current().get_thread_extent(dim)
 
 
 def get_thread_extents() -> list[int]:
-    """Returns all three thread extents.
-    """
+    """Returns all three thread extents."""
     assert KernelLaunchFrame.Current() is not None, "KernelLaunchFrame is not initialized"
     return KernelLaunchFrame.Current().get_thread_extents()
 
 
 def get_block_extent(dim: int = 0) -> int:
-    """Returns the block extent for the given dimension.
-    """
+    """Returns the block extent for the given dimension."""
     assert KernelLaunchFrame.Current() is not None, "KernelLaunchFrame is not initialized"
     return KernelLaunchFrame.Current().get_block_extent(dim)
 
 
 def get_block_extents() -> list[int]:
-    """Returns all three block extents.
-    """
+    """Returns all three block extents."""
     assert KernelLaunchFrame.Current() is not None, "KernelLaunchFrame is not initialized"
     return KernelLaunchFrame.Current().get_block_extents()

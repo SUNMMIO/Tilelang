@@ -1,4 +1,5 @@
 """The language interface for tl programs."""
+
 from __future__ import annotations
 
 # from .parser import *
@@ -10,21 +11,15 @@ from tvm.script.parser.tir import *
 from . import overrides as _overrides  # noqa: F401
 
 # from .tir import prim_func, macro,  # noqa: F401
-from .v2 import *  # noqa: F401
+from .eager import *  # noqa: F401
 from .tir.ir import *  # noqa: F401
 from tilelang.layout import Layout, Fragment  # noqa: F401
-from .proxy import ptr, make_tensor  # noqa: F401
-from .v2.annot import (
-    Buffer,  # noqa: F401
-    Tensor,  # noqa: F401
-    StridedTensor,  # noqa: F401
-    MeshShardingPolicy,  # noqa: F401
-    MeshReplicationType,  # noqa: F401
-    MeshTensor,  # noqa: F401
-    FragmentBuffer,  # noqa: F401
-    SharedBuffer,  # noqa: F401
-    LocalBuffer,  # noqa: F401
-    dyn,  # noqa: F401
+from .proxy import ptr, make_tensor, Buffer, Tensor, StridedTensor, FragmentBuffer, SharedBuffer, LocalBuffer  # noqa: F401
+from .mesh_tensor import (  # noqa: F401
+    MeshShardingPolicy,
+    MeshReplicationType,
+    MeshTensor,
+    TensorWithMeta,
 )
 from .loop import (
     Parallel,  # noqa: F401
@@ -32,8 +27,10 @@ from .loop import (
     Pipelined,  # noqa: F401
     serial,  # noqa: F401
     unroll,  # noqa: F401
+    vectorized,  # noqa: F401
     Serial,  # noqa: F401
     Unroll,  # noqa: F401
+    Vectorized,  # noqa: F401
 )
 from .frame import has_let_value, get_let_value  # noqa: F401
 from .math_intrinsics import *  # noqa: F401
@@ -60,12 +57,13 @@ from .allocate import (
     alloc_tcgen05_instr_desc,  # noqa: F401
     empty,  # noqa: F401
 )
-from .copy import copy, c2d_im2col  # noqa: F401
+from .copy_op import copy, c2d_im2col  # noqa: F401
 from .dma import dma_load, dma_store  # noqa: F401
-from .gemm import GemmWarpPolicy, gemm, gemm_v1, gemm_v2  # noqa: F401
+from tilelang.tileop.base import GemmWarpPolicy  # noqa: F401
+from .gemm_op import gemm, gemm_v1, gemm_v2  # noqa: F401
 from .experimental.gemm_sp import gemm_sp, gemm_sp_v2  # noqa: F401
-from .fill import fill, clear  # noqa: F401
-from .reduce import (
+from .fill_op import fill, clear  # noqa: F401
+from .reduce_op import (
     reduce,  # noqa: F401
     reduce_max,  # noqa: F401
     reduce_min,  # noqa: F401
@@ -83,7 +81,7 @@ from .reduce import (
     warp_reduce_bitand,  # noqa: F401
     warp_reduce_bitor,  # noqa: F401
 )
-from .print import print, device_assert  # noqa: F401
+from .print_op import print, device_assert  # noqa: F401
 from .customize import (
     atomic_max,  # noqa: F401
     atomic_min,  # noqa: F401
@@ -100,12 +98,37 @@ from .customize import (
 )
 from .logical import any_of, all_of  # noqa: F401
 from .builtin import *  # noqa: F401
+from .builtin import __ldg as __ldg  # noqa: F401
+from .builtin import ldg32 as ldg32  # noqa: F401
+from .builtin import ldg64 as ldg64  # noqa: F401
+from .builtin import ldg128 as ldg128  # noqa: F401
+from .builtin import ldg256 as ldg256  # noqa: F401
+from .builtin import stg32 as stg32  # noqa: F401
+from .builtin import stg64 as stg64  # noqa: F401
+from .builtin import stg128 as stg128  # noqa: F401
+from .builtin import stg256 as stg256  # noqa: F401
 
 from .utils import index_to_coordinates  # noqa: F401
 
 from .symbolics import dynamic, symbolic  # noqa: F401
 from .annotations import (  # noqa: F401
-    use_swizzle, annotate_layout, annotate_tileview, annotate_safe_value, annotate_l2_hit_ratio,
+    use_swizzle,
+    annotate_layout,
+    annotate_tileview,
+    annotate_safe_value,
+    annotate_l2_hit_ratio,
+    annotate_restrict_buffers,
+)
+
+from .random import (
+    rng_init,  # noqa: F401
+    rng_rand,  # noqa: F401
+    rng_rand_float,  # noqa: F401
+)
+
+from .pdl import (
+    pdl_trigger,  # noqa: F401
+    pdl_sync,  # noqa: F401
 )
 from . import comm  # noqa: F401
 

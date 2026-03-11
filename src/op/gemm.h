@@ -22,8 +22,43 @@ enum class GemmWarpPolicyType : uint8_t {
   kFree = 3,
 };
 
+/// Convert GemmWarpPolicyType enum to string for debugging
+inline const char *GemmWarpPolicyTypeToString(GemmWarpPolicyType type) {
+  switch (type) {
+  case GemmWarpPolicyType::kSquare:
+    return "Square";
+  case GemmWarpPolicyType::kFullRow:
+    return "FullRow";
+  case GemmWarpPolicyType::kFullCol:
+    return "FullCol";
+  case GemmWarpPolicyType::kFree:
+    return "Free";
+  default:
+    return "Unknown";
+  }
+}
+
 // Target GEMM instruction
 enum class GemmInst : uint8_t { kMMA, kWGMMA, kTCGEN5MMA, kMFMA, kSunmmioMMA };
+
+/// Convert GemmInst enum to string for debugging
+inline const char *GemmInstToString(GemmInst inst) {
+  switch (inst) {
+  case GemmInst::kMMA:
+    return "MMA";
+  case GemmInst::kWGMMA:
+    return "WGMMA";
+  case GemmInst::kTCGEN5MMA:
+    return "TCGEN5MMA";
+  case GemmInst::kMFMA:
+    return "MFMA";
+  case GemmInst::kSunmmioMMA:
+    return "SunmmioMMA";
+  default:
+    return "Unknown";
+  }
+}
+
 class GemmWarpPolicyNode : public Object {
 public:
   mutable int m_warp{0};
@@ -97,8 +132,7 @@ public:
   // only will be enabled under cdna mfma instructions
   int kPack_ = 1;
   int wgWait_ = 0;
-  BufferRegion mbarRegion_;
-  std::optional<tir::Buffer> mbar_; // mbar is optional, only used for TCGEN5MMA
+  tir::BufferLoad mbar_; // mbar is optional, only used for TCGEN5MMA
   Array<PrimExpr> cCoords_;
   mutable GemmWarpPolicy policy_;
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Gemm", GemmNode, TileOperatorNode);
@@ -124,6 +158,8 @@ public:
         .def_ro("clearAccum", &GemmNode::clearAccum_)
         .def_ro("kPack", &GemmNode::kPack_)
         .def_ro("wgWait", &GemmNode::wgWait_)
+        .def_ro("mbar", &GemmNode::mbar_)
+        .def_ro("cCoords", &GemmNode::cCoords_)
         .def_ro("policy", &GemmNode::policy_);
   }
 
@@ -144,7 +180,8 @@ private:
 class Gemm : public TileOperator {
 public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Gemm, TileOperator, GemmNode);
-  TVM_DLL Gemm(Array<PrimExpr> args);
+  TVM_DLL Gemm(Array<PrimExpr> args,
+               Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
   static const Op &Get();
 };
 

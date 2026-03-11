@@ -175,6 +175,20 @@ public:
                    PrimExpr forward_thread, PrimExpr replicate_size,
                    Optional<Var> replicate_var);
 
+  /*!
+   * \brief Create a fully replicated fragment layout.
+   *
+   * A fully replicated fragment means all threads hold identical copies of the
+   * entire buffer. This is useful for index buffers or masks that need to be
+   * accessed uniformly across all threads.
+   *
+   * \param shape The shape of the buffer.
+   * \param thread_extent The number of threads.
+   * \return A Fragment where each thread has a complete copy of all elements.
+   */
+  TVM_DLL static Fragment FullyReplicated(Array<PrimExpr> shape,
+                                          PrimExpr thread_extent);
+
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(Fragment, Layout, FragmentNode);
 };
 
@@ -209,8 +223,8 @@ Fragment makeGemmFragmentACDNA(const int block_m, const int block_n,
                                const int warp_n, const int element_size,
                                const int k_pack, bool transposed = false);
 
-// Default Memory Layout
-Layout makeGemmLayoutLinear(int stride, int continuous);
+// Default Memory Layout (row-major linear layout for any dimension)
+Layout makeLinearLayout(Array<PrimExpr> shape);
 Layout makeGemmABLayoutPadded(int stride, int continuous, int element_size);
 Layout makeGemmABLayout(int mat_stride, int mat_continuous, int continuity,
                         int element_size, bool k_inner = true);
@@ -241,6 +255,25 @@ Layout makeHalfBankSwizzleLayout(int stride, int continuous, int element_size);
 Layout makeQuarterBankSwizzleLayout(int stride, int continuous,
                                     int element_size);
 
+// Swizzle mode for shared memory layouts (nvidia only)
+// Smaller enum value = smaller swizzle granularity
+enum class SwizzleMode {
+  kNone = 0,    // Not a swizzle layout (linear or padded)
+  kQuarter = 1, // 32B swizzle (CU_TENSOR_MAP_SWIZZLE_32B)
+  kHalf = 2,    // 64B swizzle (CU_TENSOR_MAP_SWIZZLE_64B)
+  kFull = 3     // 128B swizzle (CU_TENSOR_MAP_SWIZZLE_128B)
+};
+
+// Detect which swizzle mode a layout uses
+SwizzleMode DetectSwizzleMode(const Layout &layout, int stride, int continuous,
+                              int element_size);
+
+// Merge two swizzle layouts by taking the smaller granularity
+// Returns NullOpt if either layout is not a swizzle layout
+Optional<Layout> MergeSwizzleLayouts(const Layout &layout1,
+                                     const Layout &layout2, int stride,
+                                     int continuous, int element_size);
+
 Layout makeHierarchicalLayout(Array<Integer> hdims_arr,
                               Array<Integer> hstrides_arr,
                               Array<Array<Integer>> groups_arr,
@@ -249,9 +282,13 @@ Layout makeHierarchicalLayout(Array<Integer> hdims_arr,
 namespace attr {
 // BlockAttr, Containing the layout for all the buffers in the block
 constexpr const char *kLayoutMap = "layout_map";
+// ForAttr, Containing the parallel loop layout for a parallel for loop
+constexpr const char *kParallelLoopLayout = "parallel_loop_layout";
+// ForAttr, Containing the predicate for a parallel for loop
+constexpr const char *kParallelLoopPredicate = "parallel_loop_predicate";
+// ForAttr, Width (in elements) for coalesced memory access
+constexpr const char *kCoalescedWidth = "coalesced_width";
 // BlockAttr, Containing the layout for global (DRAM) buffers.
-// Separated from kLayoutMap so that inference/lowering passes do not
-// accidentally overwrite or transform these read-only metadata layouts.
 constexpr const char *kGlobalLayoutMap = "global_layout_map";
 } // namespace attr
 

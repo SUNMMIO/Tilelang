@@ -6,7 +6,7 @@
 </div>
 
 :::{warning}
-   This document is still **experimental** and may be incomplete.  
+   This document is still **experimental** and may be incomplete.
    Suggestions and improvements are highly encouraged—please submit a PR!
 :::
 
@@ -206,7 +206,6 @@ def splitk_gemv(
     return main
 ```
 
-
 ## Vectorized Reads
 
 GEMV is less computation intensive than GEMM as the computation intensity and memory throughput will be the optimization bottleneck. One effective strategy is to use vectorized load/store operations (e.g., `float2`, `float4`). In `TileLang`, you can specify vectorized operations via `T.vectorized`:
@@ -254,7 +253,6 @@ def splitk_gemv_vectorized(
 
 With vectorized read, now the kernel finishes in **~0.0084 ms**, which is getting close to cuBLAS performance.
 
-
 ## `tvm_thread_allreduce` Instead of `atomicAdd`
 
 [`tvm_thread_allreduce`](https://tvm.apache.org/docs/reference/api/python/tir/tir.html#tvm.tir.tvm_thread_allreduce) has implemented optimization when making an all-reduce across a number of threads, which should outperfrom out plain smem + `atomidAdd`:
@@ -294,7 +292,7 @@ def splitk_gemv_vectorized_tvm(
                     C_accum[0] += A_local[k].astype(accum_dtype) * B_local[k].astype(accum_dtype)
             C_reduced = T.alloc_local((1,), accum_dtype)
             with T.attr(
-                    T.comm_reducer(lambda x, y: x + y, [T.Cast(accum_dtype, 0)]),
+                    T.comm_reducer(lambda x, y: x + y, [T.cast(0, accum_dtype)]),
                     "reduce_scope",
                     T.reinterpret(T.uint64(0), dtype="handle"),
             ):
@@ -379,7 +377,7 @@ def get_best_config(N, K):
                         C_accum[0] += A_local[k].astype(accum_dtype) * B_local[k].astype(accum_dtype)
                 C_reduced = T.alloc_local((1,), accum_dtype)
                 with T.attr(
-                        T.comm_reducer(lambda x, y: x + y, [T.Cast(accum_dtype, 0)]),
+                        T.comm_reducer(lambda x, y: x + y, [T.cast(0, accum_dtype)]),
                         "reduce_scope",
                         T.reinterpret(T.uint64(0), dtype="handle"),
                 ):
@@ -458,7 +456,6 @@ This corresponds closely to our `TileLang` program, with necessary synchronizati
 | splitk_gemv | 0.02419 ms |
 | splitk_gemv_vectorized | 0.00809 ms |
 | splitk_gemv_vectorized_tvm | 0.00675 ms |
-
 
 Triton Time: 0.0077344514429569244
 In this tutorial, we implemented a simple GEMV kernel and learn that `TileLang` exposes low level control to user such as thread-level programming and CUDA primitives.

@@ -2,10 +2,12 @@ from __future__ import annotations
 import tilelang.language as T
 from typing import Literal, Callable
 from tvm import DataType
-from tvm.tir import PrimExpr, IndexMap, Buffer, Var, BufferRegion
+from tvm import tir
+from tvm.ir import Range
+from tvm.tir import PrimExpr, IndexMap, Buffer, Var, BufferRegion, BufferLoad
 from tilelang import tvm as tvm
 from tvm.runtime import convert
-from tilelang.utils import is_fragment
+from tilelang.utils import is_fragment, get_buffer_region_from_load
 from tilelang.intrinsics.mma_sm70_layout import (
     shared_16x4_to_mma_a_32x4_layout,
     shared_4x16_to_mma_b_32x4_layout,
@@ -46,9 +48,9 @@ class TensorCoreIntrinEmitter:
 
     def __init__(
         self,
-        a_dtype: str = "float16",
-        b_dtype: str = "float16",
-        accum_dtype: str = "float16",
+        a_dtype: str = T.float16,
+        b_dtype: str = T.float16,
+        accum_dtype: str = T.float16,
         a_transposed: bool = False,
         b_transposed: bool = False,
         block_row_warps: int = 2,
@@ -89,7 +91,7 @@ class TensorCoreIntrinEmitter:
                 f"Invalid threads configuration for this tile shape, {self.warp_rows} x {self.warp_cols} with threads {self.threads}"
             )
 
-    def _initialize_k_dim(self, a_dtype="float16"):
+    def _initialize_k_dim(self, a_dtype=T.float16):
         self.k_dim = 4
 
     def _initialize_local_size(self, m_dim=16, n_dim=16, k_dim=16):
@@ -147,18 +149,15 @@ class TensorCoreIntrinEmitter:
     def get_store_index_map(self, inverse: bool = False) -> IndexMap:
         warp_size, local_size_c = self.WARP_SIZE, self.local_size_out
         index_map = IndexMap.from_func(
-            mma_32x8_to_shared_16x16_layout_fp32
-            if self.accum_dtype == "float32" else mma_32x8_to_shared_16x16_layout_fp16,
-            index_dtype="int32")
+            mma_32x8_to_shared_16x16_layout_fp32 if self.accum_dtype == T.float32 else mma_32x8_to_shared_16x16_layout_fp16,
+            index_dtype=T.int32,
+        )
         if not inverse:
             return index_map
         inverse_index_map = index_map.inverse([warp_size, local_size_c])
         return inverse_index_map
 
-    def extract_thread_binding(
-            self,
-            thread_id: PrimExpr,
-            is_m_first: bool | None = None) -> tuple[PrimExpr, PrimExpr, PrimExpr]:
+    def extract_thread_binding(self, thread_id: PrimExpr, is_m_first: bool | None = None) -> tuple[PrimExpr, PrimExpr, PrimExpr]:
         """
         is_m_first: True if the thread binding is in the form of (tx, warp_n, warp_m)
         which represents [warp_size, block_row_warps (split n), block_col_warps (split m)]
@@ -187,11 +186,7 @@ class TensorCoreIntrinEmitter:
             )
             return lane_id, warp_n, warp_m
 
-    def ldmatrix_a(self,
-                   A_local_buf: Buffer,
-                   A_shared_buf: Buffer | BufferRegion,
-                   ki: PrimExpr,
-                   rk: PrimExpr | None = 0):
+    def ldmatrix_a(self, A_local_buf: Buffer, A_shared_buf: Buffer | BufferRegion, ki: PrimExpr, rk: PrimExpr | None = 0):
         warp_row_tiles = self.warp_row_tiles
         warp_rows = self.warp_rows
         chunk = self.chunk
@@ -231,11 +226,7 @@ class TensorCoreIntrinEmitter:
 
         return _warp_ldmatrix_a(A_local_buf, A_region, ki, thread_binding, rk)
 
-    def ldmatrix_b(self,
-                   B_local_buf: Buffer,
-                   B_shared_buf: Buffer | BufferRegion,
-                   ki: PrimExpr,
-                   rk: PrimExpr | None = 0):
+    def ldmatrix_b(self, B_local_buf: Buffer, B_shared_buf: Buffer | BufferRegion, ki: PrimExpr, rk: PrimExpr | None = 0):
         warp_col_tiles = self.warp_col_tiles
         warp_cols = self.warp_cols
         chunk = self.chunk
@@ -274,20 +265,14 @@ class TensorCoreIntrinEmitter:
                 for j in T.vectorized(local_size_b):
                     if b_transposed:
                         mi, mk = mma_load_layout(tx, j)
-                        B_local_buf[i * local_size_b + j] = B_buf[B_base0 + wi + mi,
-                                                                  B_base1 + wk + mk]
+                        B_local_buf[i * local_size_b + j] = B_buf[B_base0 + wi + mi, B_base1 + wk + mk]
                     else:
                         mk, mi = mma_load_layout(tx, j)
-                        B_local_buf[i * local_size_b + j] = B_buf[B_base0 + wk + mk,
-                                                                  B_base1 + wi + mi]
+                        B_local_buf[i * local_size_b + j] = B_buf[B_base0 + wk + mk, B_base1 + wi + mi]
 
         return _warp_ldmatrix_b(B_local_buf, B_region, ki, thread_binding, rk)
 
-    def mma(self,
-            A_local_buf: Buffer,
-            B_local_buf: Buffer,
-            C_local_buf: Buffer,
-            k_inner: PrimExpr | None = 0):
+    def mma(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer, k_inner: PrimExpr | None = 0):
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
         local_size_a = self.local_size_a
@@ -326,9 +311,7 @@ class TensorCoreIntrinEmitter:
 
         return _warp_mma(A_local_buf, B_local_buf, C_local_buf)
 
-    def make_mma_load_layout(self,
-                             local_buf: Buffer,
-                             matrix: Literal["A", "B"] = "A") -> T.Fragment:
+    def make_mma_load_layout(self, local_buf: Buffer, matrix: Literal["A", "B"] = "A") -> T.Fragment:
         """
         Create a layout function for storing MMA results into a fragment buffer.
         This layout is used in conjunction with `inverse_mma_store_layout` to
@@ -351,6 +334,7 @@ class TensorCoreIntrinEmitter:
             If `local_buf` is not detected to be a fragment buffer.
         """
         from tilelang.utils import is_fragment
+
         assert matrix in ["A", "B"], "matrix should be either A or B"
         matrix_is_a: bool = matrix == "A"
         matrix_is_b: bool = matrix == "B"
@@ -383,11 +367,9 @@ class TensorCoreIntrinEmitter:
         # so the b matrix expected a transposed basic layout
         transform_func: Callable = None
         if matrix_is_a:
-            transform_func = transform_func_sr_a if is_sr_axis_order else lambda i, j: transform_func_sr_a(
-                j, i)
+            transform_func = transform_func_sr_a if is_sr_axis_order else lambda i, j: transform_func_sr_a(j, i)
         elif matrix_is_b:
-            transform_func = transform_func_sr_b if is_sr_axis_order else lambda i, j: transform_func_rs_b(
-                i, j)
+            transform_func = transform_func_sr_b if is_sr_axis_order else lambda i, j: transform_func_rs_b(i, j)
         else:
             raise ValueError(f"Unsupported matrix {matrix}")
 
@@ -403,7 +385,7 @@ class TensorCoreIntrinEmitter:
             self.block_col_warps,
         )
 
-        inverse_mma_load_layout = IndexMap.from_func(transform_func, index_dtype="int32")
+        inverse_mma_load_layout = IndexMap.from_func(transform_func, index_dtype=T.int32)
 
         def forward(i: int, j: int, rep: int) -> int:
             """
@@ -413,9 +395,8 @@ class TensorCoreIntrinEmitter:
             return lane_id, local_id
 
         base_fragment = T.Fragment(
-            [micro_size_s, micro_size_r] if is_sr_axis_order else [micro_size_r, micro_size_s],
-            forward_fn=forward,
-            replicate=2)
+            [micro_size_s, micro_size_r] if is_sr_axis_order else [micro_size_r, micro_size_s], forward_fn=forward, replicate=2
+        )
 
         warp_rows, warp_cols = self.warp_rows, self.warp_cols
         chunk = self.chunk
@@ -426,31 +407,19 @@ class TensorCoreIntrinEmitter:
         replicate = block_col_warps if matrix_is_a else block_row_warps
 
         if is_sr_axis_order:
-            warp_fragment = base_fragment.repeat([warp_s, warp_r],
-                                                 repeat_on_thread=False,
-                                                 lower_dim_first=False)
+            warp_fragment = base_fragment.repeat([warp_s, warp_r], repeat_on_thread=False, lower_dim_first=False)
             if matrix_is_a:
-                block_fragment = warp_fragment.repeat([block_s, 1],
-                                                      repeat_on_thread=True,
-                                                      lower_dim_first=True).replicate(replicate)
+                block_fragment = warp_fragment.repeat([block_s, 1], repeat_on_thread=True, lower_dim_first=True).replicate(replicate)
             elif matrix_is_b:
-                block_fragment = warp_fragment.replicate(replicate).repeat([block_s, 1],
-                                                                           repeat_on_thread=True,
-                                                                           lower_dim_first=True)
+                block_fragment = warp_fragment.replicate(replicate).repeat([block_s, 1], repeat_on_thread=True, lower_dim_first=True)
             else:
                 raise ValueError(f"Unsupported matrix type {matrix}")
         else:
-            warp_fragment = base_fragment.repeat([warp_r, warp_s],
-                                                 repeat_on_thread=False,
-                                                 lower_dim_first=True)
+            warp_fragment = base_fragment.repeat([warp_r, warp_s], repeat_on_thread=False, lower_dim_first=True)
             if matrix_is_a:
-                block_fragment = warp_fragment.repeat([1, block_s],
-                                                      repeat_on_thread=True,
-                                                      lower_dim_first=True).replicate(replicate)
+                block_fragment = warp_fragment.repeat([1, block_s], repeat_on_thread=True, lower_dim_first=True).replicate(replicate)
             elif matrix_is_b:
-                block_fragment = warp_fragment.replicate(replicate).repeat([1, block_s],
-                                                                           repeat_on_thread=True,
-                                                                           lower_dim_first=True)
+                block_fragment = warp_fragment.replicate(replicate).repeat([1, block_s], repeat_on_thread=True, lower_dim_first=True)
             else:
                 raise ValueError(f"Unsupported matrix type {matrix}")
 
@@ -526,3 +495,30 @@ class TensorCoreIntrinEmitter:
             forward_thread_fn=forward_thread,
             forward_index_fn=forward_index,
         )
+
+    @staticmethod
+    def _legalize_to_buffer_region(obj: Buffer | BufferLoad | BufferRegion) -> BufferRegion:
+        """
+        Convert Buffer/BufferRegion/BufferLoad to a BufferRegion.
+
+        - Buffer -> full-region BufferRegion covering entire shape
+        - BufferRegion -> returned as-is
+        - BufferLoad -> best-effort convert via get_buffer_region_from_load;
+        if scalar, fall back to 1-sized ranges at given indices
+        """
+        if isinstance(obj, BufferRegion):
+            return obj
+        if isinstance(obj, Buffer):
+            mins = [tir.IntImm("int32", 0) for _ in obj.shape]
+            ranges = [Range.from_min_extent(m, e) for m, e in zip(mins, obj.shape)]
+            return BufferRegion(obj, ranges)
+        if isinstance(obj, BufferLoad):
+            region = get_buffer_region_from_load(obj)
+            if region is not None:
+                return region
+            # Fallback: scalar load -> 1-sized ranges at indices
+            mins = [idx for idx in obj.indices]
+            ones = [tir.IntImm("int32", 1) for _ in obj.indices]
+            ranges = [Range.from_min_extent(m, e) for m, e in zip(mins, ones)]
+            return BufferRegion(obj.buffer, ranges)
+        raise ValueError(f"Unsupported argument type for BufferRegion: {type(obj)}")

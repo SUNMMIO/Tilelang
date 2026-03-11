@@ -19,7 +19,7 @@ using namespace tir;
 class GemmSPWarpPolicyNode : public GemmWarpPolicyNode {
 public:
   std::pair<int, int> computeWarpPartition(int M, int N, int block_size,
-                                           Target target, bool use_wgmma,
+                                           Target target, GemmInst gemm_inst,
                                            int bits) const;
   TVM_FFI_DECLARE_OBJECT_INFO("tl.GemmSPWarpPolicy", GemmSPWarpPolicyNode,
                               GemmWarpPolicyNode);
@@ -109,7 +109,8 @@ private:
 class GemmSP : public TileOperator {
 public:
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(GemmSP, TileOperator, GemmSPNode);
-  TVM_DLL GemmSP(Array<PrimExpr> args);
+  TVM_DLL GemmSP(Array<PrimExpr> args,
+                 Map<String, ObjectRef> annotations = Map<String, ObjectRef>());
   static const Op &Get();
 };
 

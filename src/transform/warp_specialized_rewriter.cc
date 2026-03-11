@@ -50,6 +50,7 @@ class ProducerUsedBufferFinder : public StmtExprVisitor {
 public:
   auto FindProducerusedBuffer(const Stmt &stmt) {
     producer_buffers_.clear();
+    let_var_to_expr_.clear();
     std::unordered_set<const BufferNode *> last_producer_buffers_;
     for (;;) {
       VisitStmt(stmt);
@@ -68,6 +69,28 @@ public:
     for (const auto &buffer : usage.buffer_use_count_) {
       producer_buffers_.insert(buffer.first);
     }
+    // Also collect buffers through let bindings
+    CollectBuffersFromExpr(expr);
+  }
+
+  // Collect buffers from expression, following let bindings
+  void CollectBuffersFromExpr(const PrimExpr &expr) {
+    PostOrderVisit(expr, [this](const ObjectRef &node) {
+      if (auto bl = node.as<BufferLoadNode>()) {
+        producer_buffers_.insert(bl->buffer.get());
+      } else if (auto var_node = node.as<VarNode>()) {
+        auto var = tvm::ffi::GetRef<Var>(var_node);
+        auto it = let_var_to_expr_.find(var.get());
+        if (it != let_var_to_expr_.end()) {
+          CollectBuffersFromExpr(it->second);
+        }
+      }
+    });
+  }
+
+  void VisitStmt_(const LetStmtNode *op) final {
+    let_var_to_expr_[op->var.get()] = op->value;
+    StmtExprVisitor::VisitStmt_(op);
   }
 
   void VisitStmt_(const IfThenElseNode *op) final {
@@ -102,15 +125,15 @@ public:
   void VisitExpr_(const CallNode *op) final {
     if (op->op.same_as(tma_load()) || op->op.same_as(tma_load_im2col())) {
       for (auto arg : op->args) {
-        if (auto buffer_load = arg.as<BufferLoadNode>()) {
-          producer_buffers_.insert(buffer_load->buffer.get());
-        }
+        // Collect buffers from args, including through let bindings
+        CollectBuffersFromExpr(arg);
       }
     }
   }
 
 private:
   std::unordered_set<const BufferNode *> producer_buffers_;
+  std::unordered_map<const VarNode *, PrimExpr> let_var_to_expr_;
 };
 
 class WarpSpecializedRoleMarker : public StmtVisitor {
@@ -139,6 +162,9 @@ public:
         has_bulk_copy_ = true;
       }
       if (call->op.same_as(loop_break())) {
+        role = Role::kBoth;
+      }
+      if (call->op.same_as(pdl_sync()) || call->op.same_as(pdl_trigger())) {
         role = Role::kBoth;
       }
     }
@@ -716,7 +742,23 @@ private:
                                 : parity_;
           block_stmt.push_back(makeParityWait(acquire_barrier_id, parity));
         }
-        ICHECK(!map.release[i].empty());
+        // It is possible that a producer does not participate in any
+        // producer-consumer dependency that requires synchronization.
+        // In that case, there will be no associated release pattern.
+        // We should still emit the (optionally guarded) statement without
+        // inserting any mbarrier for it instead of failing.
+        if (map.release[i].empty()) {
+          LOG(WARNING) << "Producer doesn't have corresponding consumer: "
+                       << seq_transformed[i];
+          block_stmt.push_back(seq_transformed[i]);
+          new_body.push_back(
+              MakeGroupBlock(block_stmt.size() == 1
+                                 ? block_stmt[0]
+                                 // NOLINTNEXTLINE(performance-move-const-arg)
+                                 : SeqStmt(std::move(block_stmt)),
+                             annotations));
+          continue;
+        }
         for (size_t j = 0; j < map.release[i].size(); j++) {
           int pattern_idx = map.release[i][j];
           PrimExpr release_barrier_id =

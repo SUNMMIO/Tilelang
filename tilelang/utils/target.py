@@ -1,4 +1,8 @@
 from __future__ import annotations
+
+
+import torch
+
 from platform import mac_ver
 from typing import Literal
 from tilelang import tvm as tvm
@@ -15,7 +19,8 @@ SUPPORTED_TARGETS: dict[str, str] = {
     "llvm": "LLVM CPU target (accepts standard TVM LLVM options).",
     "webgpu": "WebGPU target for browser/WebGPU runtimes.",
     "c": "C source backend.",
-    "Sunmmio": "Sunmmio target (A4E device)"
+    "cutedsl": "CuTe DSL GPU target.",
+    "Sunmmio": "Sunmmio target (A4E device)",
 }
 
 SUNMMIO_TARGET_DESC = "llvm -mcpu=sunmmio-a4e -mattr=device_mesh_nrow_4,device_mesh_ncol_4"
@@ -59,7 +64,60 @@ def check_metal_availability() -> bool:
     if not mac_release:
         return False
     # todo: check torch version?
-    return arch == 'arm64'
+    return arch == "arm64"
+
+
+def determine_fp8_type(fp8_format: Literal["e4m3", "e5m2"] = "e4m3") -> str:
+    """
+    Select the correct FP8 dtype string for the current platform.
+    - CUDA defaults to FP8 E4M3FN / E5M2.
+    - ROCm uses FNUZ except gfx950 (OCP), which prefers non-FNUZ when available.
+    """
+    if fp8_format not in {"e4m3", "e5m2"}:
+        raise ValueError(f"Unsupported FP8 format: {fp8_format}")
+    if torch.version.hip is None:
+        return "float8_e4m3fn" if fp8_format == "e4m3" else "float8_e5m2"
+    if not torch.cuda.is_available():
+        return "float8_e4m3fnuz" if fp8_format == "e4m3" else "float8_e5m2fnuz"
+    props = torch.cuda.get_device_properties(0)
+    gcn_arch = getattr(props, "gcnArchName", "")
+    if fp8_format == "e4m3":
+        if gcn_arch.startswith("gfx950"):
+            return "float8_e4m3fn"
+        return "float8_e4m3fnuz"
+    if gcn_arch.startswith("gfx950") and hasattr(torch, "float8_e5m2"):
+        return "float8_e5m2"
+    return "float8_e5m2fnuz"
+
+
+def determine_torch_fp8_type(fp8_format: Literal["e4m3", "e5m2"] = "e4m3") -> torch.dtype:
+    dtype_name = determine_fp8_type(fp8_format)
+    torch_dtype = getattr(torch, dtype_name, None)
+    if torch_dtype is None:
+        raise RuntimeError(f"PyTorch does not expose dtype {dtype_name}")
+    return torch_dtype
+
+
+def normalize_cutedsl_target(target: str | Target) -> Target | None:
+    if isinstance(target, Target):
+        if target.kind.name == "cuda" and "cutedsl" in target.keys:
+            return target
+        return None
+
+    if target.startswith("cutedsl"):
+        cuda_target_str = target.replace("cutedsl", "cuda", 1)
+
+        try:
+            temp_target = Target(cuda_target_str)
+
+            target_dict = dict(temp_target.export())
+            target_dict["keys"] = list(set(target_dict["keys"]) | {"cutedsl"})
+
+            return Target(target_dict)
+        except Exception:
+            return None
+
+    return None
 
 
 def check_sunmmio_availability() -> bool:
@@ -73,8 +131,7 @@ def check_sunmmio_availability() -> bool:
     return False
 
 
-def determine_target(target: str | Target | Literal["auto"] = "auto",
-                     return_object: bool = False) -> str | Target:
+def determine_target(target: str | Target | Literal["auto"] = "auto", return_object: bool = False) -> str | Target:
     """
     Determine the appropriate target for compilation (CUDA, HIP, or manual selection).
 
@@ -103,7 +160,10 @@ def determine_target(target: str | Target | Literal["auto"] = "auto",
 
         # Determine the target based on availability
         if is_cuda_available:
-            return_var = "cuda"
+            if torch.cuda.is_available() and (cap := torch.cuda.get_device_capability(0)):
+                return_var = Target({"kind": "cuda", "arch": f"sm_{nvcc.get_target_arch(cap)}"})
+            else:
+                return_var = "cuda"
         elif is_hip_available:
             return_var = "hip"
         elif check_metal_availability():
@@ -112,28 +172,42 @@ def determine_target(target: str | Target | Literal["auto"] = "auto",
             return_var = SUNMMIO_TARGET_DESC
         else:
             raise ValueError("No CUDA or HIP or MPS available on this system.")
-    else:
-        # Validate the target if it's not "auto"
-        if isinstance(target, Target):
-            return_var = target
-        elif isinstance(target, str):
-            normalized_target = target.strip()
-            if not normalized_target:
-                raise AssertionError(f"Target {target} is not supported")
-            if normalized_target in SUPPORTED_TARGETS and normalized_target == "Sunmmio":
-                normalized_target = SUNMMIO_TARGET_DESC
-            try:
-                Target(normalized_target)
-            except Exception as err:
-                examples = ", ".join(f"`{name}`" for name in SUPPORTED_TARGETS)
-                raise AssertionError(
-                    f"Target {target} is not supported. Supported targets include: {examples}. "
-                    "Pass additional options after the base name, e.g. `cuda -arch=sm_80`."
-                ) from err
-            return_var = normalized_target
-        else:
-            raise AssertionError(f"Target {target} is not supported")
 
+    else:
+        possible_cutedsl_target = normalize_cutedsl_target(target)
+        if possible_cutedsl_target is not None:
+            try:
+                from tilelang.jit.adapter.cutedsl.checks import check_cutedsl_available  # lazy
+
+                check_cutedsl_available()
+            except ImportError as e:
+                raise AssertionError(f"CuTeDSL backend is not available. Please install tilelang-cutedsl package. {str(e)}") from e
+
+            return_var = possible_cutedsl_target
+        else:
+            # Validate the target if it's not "auto"
+            if isinstance(target, Target):
+                return_var = target
+            elif isinstance(target, str):
+                normalized_target = target.strip()
+                if not normalized_target:
+                    raise AssertionError(f"Target {target} is not supported")
+                if normalized_target == "Sunmmio":
+                    normalized_target = SUNMMIO_TARGET_DESC
+                try:
+                    Target(normalized_target)
+                except Exception as err:
+                    examples = ", ".join(f"`{name}`" for name in SUPPORTED_TARGETS)
+                    raise AssertionError(
+                        f"Target {target} is not supported. Supported targets include: {examples}. "
+                        "Pass additional options after the base name, e.g. `cuda -arch=sm_80`."
+                    ) from err
+                return_var = normalized_target
+            else:
+                raise AssertionError(f"Target {target} is not supported")
+
+    if isinstance(return_var, Target):
+        return return_var
     if return_object:
         if isinstance(return_var, Target):
             return return_var
@@ -147,6 +221,10 @@ def target_is_cuda(target: Target) -> bool:
 
 def target_is_hip(target: Target) -> bool:
     return _ffi_api.TargetIsRocm(target)
+
+
+def target_is_metal(target: Target) -> bool:
+    return _ffi_api.TargetIsMetal(target)
 
 
 def target_is_sunmmio(target: Target) -> bool:

@@ -1,6 +1,10 @@
 """The profiler and convert to torch utils"""
 
-from .target import determine_target  # noqa: F401
+from .target import (  # noqa: F401
+    determine_target,
+    determine_fp8_type,
+    determine_torch_fp8_type,
+)
 from .tensor import TensorSupplyType, torch_assert_close, map_torch_type  # noqa: F401
 from .language import (
     is_global,  # noqa: F401
@@ -16,5 +20,8 @@ from .language import (
     is_full_region,  # noqa: F401
     to_buffer_region,  # noqa: F401
     get_buffer_region_from_load,  # noqa: F401
+    get_prim_func_name,  # noqa: F401
+    side_effect,  # noqa: F401
 )
 from .deprecated import deprecated  # noqa: F401
+from .version import build_date  # noqa: F401

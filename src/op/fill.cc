@@ -13,7 +13,6 @@
 #include "../layout/tcgen05_layout.h"
 #include "../target/utils.h"
 #include "../transform/common/loop_fusion_utils.h"
-#include "../transform/common/loop_parallel_transform_utils.h"
 #include "../transform/loop_partition.h"
 #include "../transform/loop_vectorize.h"
 #include "builtin.h"
@@ -58,7 +57,7 @@ using namespace tir;
  * lanes) and will terminate (via CHECK/ICHECK) if inputs are unsupported or out
  * of bounds.
  */
-Fill::Fill(Array<PrimExpr> args) {
+Fill::Fill(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   ObjectPtr<FillNode> node = tvm::ffi::make_object<FillNode>();
 
   BufferRegion region = NormalizeToBufferRegion(args[0]);
@@ -156,37 +155,50 @@ For FillNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
  * @return Stmt The lowered TIR statement implementing the fill.
  */
 Stmt FillNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
-  if (dst.scope() == "local.fragment") {
+  if (IsFragmentBuffer(dst)) {
     auto par_op = ParallelOp(MakeSIMTLoop(analyzer));
-    par_op->InferLayout({T.target, T.thread_bounds, T.layout_map, analyzer,
-                         false, T.buffer_remap},
+    par_op->InferLayout({T.target,
+                         T.thread_bounds,
+                         T.layout_map,
+                         analyzer,
+                         false,
+                         T.buffer_remap,
+                         {}},
                         InferLevel::kFree);
     auto thread_loop = PartitionLoop(par_op->GetRoot(), T.thread_var, analyzer,
                                      par_op->GetLoopLayout());
-    auto vectorized_thread_loop = VectorizeLoop(thread_loop, analyzer);
+    auto vectorized_loop = VectorizeLoop(thread_loop, analyzer, T.layout_map);
+    auto unrolled_loop = PragmaUnrollLoop(vectorized_loop);
+
     if (par_op->GetPredicate(T.thread_var).defined()) {
       return IfThenElse(par_op->GetPredicate(T.thread_var).value(),
-                        vectorized_thread_loop);
+                        unrolled_loop);
     }
-    return vectorized_thread_loop;
-  } else if (dst.scope() == "local") {
+    return unrolled_loop;
+  } else if (IsLocalBuffer(dst) || IsLocalVarBuffer(dst)) {
     auto init_loop = MakeSIMTLoop(analyzer);
-    auto vectorized_thread_loop = VectorizeLoop(init_loop, analyzer);
-    return vectorized_thread_loop;
-  } else if (dst.scope() == "shared.dyn" || dst.scope() == "shared" ||
-             dst.scope() == "global") {
+    auto vectorized_loop = VectorizeLoop(init_loop, analyzer, T.layout_map);
+    auto unrolled_loop = PragmaUnrollLoop(vectorized_loop);
+    return unrolled_loop;
+  } else if (IsSharedBuffer(dst) || IsGlobalBuffer(dst)) {
     auto par_op = ParallelOp(MakeSIMTLoop(analyzer));
-    par_op->InferLayout({T.target, T.thread_bounds, T.layout_map, analyzer,
-                         false, T.buffer_remap},
+    par_op->InferLayout({T.target,
+                         T.thread_bounds,
+                         T.layout_map,
+                         analyzer,
+                         false,
+                         T.buffer_remap,
+                         {}},
                         InferLevel::kFree);
     auto thread_loop = PartitionLoop(par_op->GetRoot(), T.thread_var, analyzer,
                                      par_op->GetLoopLayout());
-    auto vectorized_thread_loop = VectorizeLoop(thread_loop, analyzer);
+    auto vectorized_loop = VectorizeLoop(thread_loop, analyzer, T.layout_map);
+    auto unrolled_loop = PragmaUnrollLoop(vectorized_loop);
     if (par_op->GetPredicate(T.thread_var).defined()) {
       return IfThenElse(par_op->GetPredicate(T.thread_var).value(),
-                        vectorized_thread_loop);
+                        unrolled_loop);
     }
-    return vectorized_thread_loop;
+    return unrolled_loop;
   } else {
     LOG(FATAL) << "Unsupported scope " << dst.scope();
     return Stmt();

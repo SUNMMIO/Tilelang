@@ -1,6 +1,8 @@
 #pragma once
 
+#include "atomic.h"
 #include <ck_tile/core.hpp>
+#include <hip/amd_detail/amd_warp_functions.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -105,17 +107,121 @@ TL_DEVICE unsigned __pack_bfloat162(const bfloat16_t x, const bfloat16_t y) {
   return (v1 << 16) | v0;
 }
 
-template <typename T1, typename T2>
-TL_DEVICE void AtomicAdd(T1 *address, T2 val) {
-  atomicAdd(reinterpret_cast<T1 *>(address), static_cast<T1>(val));
+namespace tl {
+
+// Packed FP32x2 math helpers (HIP fallback)
+//
+// CUDA has PTX `.f32x2` instructions that may lower to SASS FADD2/FMUL2/FFMA2
+// on supported architectures. HIP does not expose an equivalent packed-FP32x2
+// instruction, so we provide per-lane scalar fallbacks to keep the TileLang
+// language surface portable.
+TL_DEVICE float2 fadd2(float2 a, float2 b) {
+  float2 out;
+  out.x = a.x + b.x;
+  out.y = a.y + b.y;
+  return out;
 }
 
-// Overload for when the first argument is a value instead of a pointer
-template <typename T1, typename T2>
-TL_DEVICE void AtomicAdd(T1 address, T2 val) {
-  atomicAdd(reinterpret_cast<T1 *>(&address), static_cast<T1>(val));
+TL_DEVICE float2 fmul2(float2 a, float2 b) {
+  float2 out;
+  out.x = a.x * b.x;
+  out.y = a.y * b.y;
+  return out;
 }
 
-template <typename T1, typename T2> TL_DEVICE T1 AtomicAddRet(T1 &ref, T2 val) {
-  return atomicAdd(&ref, static_cast<T1>(val));
+TL_DEVICE float2 fma2(float2 a, float2 b, float2 c) {
+  float2 out;
+  out.x = a.x * b.x + c.x;
+  out.y = a.y * b.y + c.y;
+  return out;
 }
+
+// Any
+template <typename T> TL_DEVICE bool Any(T *a, int size) {
+  for (int i = 0; i < size; i++) {
+    if (a[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// All
+template <typename T> TL_DEVICE bool All(T *a, int size) {
+  for (int i = 0; i < size; i++) {
+    if (!a[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// TODO(gong): support shfl_sync(rocm 7.1.1 provide shfl_sync)
+// shfl_sync func
+template <typename T> TL_DEVICE T shfl_xor(T val, int delta) {
+  return __shfl_xor(val, delta);
+}
+
+template <typename T> TL_DEVICE T shfl_down(T val, int delta) {
+  return __shfl_down(val, delta);
+}
+
+template <typename T> TL_DEVICE T shfl_up(T val, int delta) {
+  return __shfl_up(val, delta);
+}
+
+template <typename T> TL_DEVICE T shfl(T val, int srcLane) {
+  return __shfl(val, srcLane);
+}
+
+// specialize half_t
+template <> TL_DEVICE half_t shfl_xor(half_t val, int delta) {
+  float f = static_cast<float>(val);
+  float r = __shfl_xor(f, delta);
+  return half_t(r);
+}
+
+template <> TL_DEVICE half_t shfl_down(half_t val, int delta) {
+  float f = static_cast<float>(val);
+  float r = __shfl_down(f, delta);
+  return half_t(r);
+}
+
+template <> TL_DEVICE half_t shfl_up(half_t val, int delta) {
+  float f = static_cast<float>(val);
+  float r = __shfl_up(f, delta);
+  return half_t(r);
+}
+
+template <> TL_DEVICE half_t shfl(half_t val, int srcLane) {
+  float f = static_cast<float>(val);
+  float r = __shfl(f, srcLane);
+  return half_t(r);
+}
+
+// specialize bfloat16_t
+template <> TL_DEVICE bfloat16_t shfl_xor(bfloat16_t val, int laneMask) {
+  float f = static_cast<float>(val);
+  float r = __shfl_xor(f, laneMask);
+  return bfloat16_t(r);
+}
+
+template <> TL_DEVICE bfloat16_t shfl_down(bfloat16_t val, int delta) {
+  float f = static_cast<float>(val);
+  float r = __shfl_down(f, delta);
+  return bfloat16_t(r);
+}
+
+template <> TL_DEVICE bfloat16_t shfl_up(bfloat16_t val, int delta) {
+  float f = static_cast<float>(val);
+  float r = __shfl_up(f, delta);
+  return bfloat16_t(r);
+}
+
+template <> TL_DEVICE bfloat16_t shfl(bfloat16_t val, int srcLane) {
+  float f = static_cast<float>(val);
+  float r = __shfl(f, srcLane);
+  return bfloat16_t(r);
+}
+
+} // namespace tl

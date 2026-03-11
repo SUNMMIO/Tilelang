@@ -14,6 +14,7 @@ namespace tl {
 
 bool TargetIsCuda(Target target);
 bool TargetIsRocm(Target target);
+bool TargetIsMetal(Target target);
 bool TargetIsSunmmio(Target target);
 
 bool TargetIsVolta(Target target);
@@ -29,7 +30,12 @@ bool TargetHasLdmatrix(Target target);
 bool TargetHasStmatrix(Target target);
 bool TargetHasTmem(Target target);
 bool TargetHasBulkCopy(Target target);
+bool TargetSupportVectorize256(Target target);
 int TargetGetWarpSize(Target target);
+bool TargetHasSMVersionGE(Target target, int version);
+
+bool IsCudaVectorizableFP8(DataType dtype);
+bool IsCudaVectorizableCast(DataType from_ty, DataType target_ty);
 
 } // namespace tl
 } // namespace tvm

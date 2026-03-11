@@ -1,4 +1,5 @@
 from .gemm_sp_base import GemmSPBase
+from tilelang.tileop.gemm.inst import GemmInst
 from tilelang.layout import make_swizzled_layout
 from tilelang.intrinsics.mma_sp_macro_generator import SparseTensorCoreIntrinEmitter
 from tilelang.utils.language import is_shared, is_fragment
@@ -10,10 +11,9 @@ from tilelang.transform.simplify import _Simplify
 
 
 class GemmSPMMA(GemmSPBase):
-
     def infer_layout(self, target: Target, thread_nums: int):
-        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target,
-                                                            False)
+        # NOTE(wt): Actually gemm_sp v2 currently use GemmWarpPolicy
+        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GemmInst.MMA)
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
         mma_emitter = SparseTensorCoreIntrinEmitter(
@@ -55,12 +55,11 @@ class GemmSPMMA(GemmSPBase):
                 self.C: mma_emitter.make_mma_store_layout(self.C),
             }
         else:
-            raise ValueError(
-                f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}")
+            raise ValueError(f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}")
 
     def lower(self, target: Target, thread_nums: int, thread_var: tir.Var):
-        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target,
-                                                            False)
+        # NOTE(wt): Actually gemm_sp v2 currently use GemmWarpPolicy
+        m_warp, n_warp = self.policy.compute_warp_partition(self.M, self.N, thread_nums, target, GemmInst.MMA)
         warp_row_tiles = int(self.M // m_warp)
         warp_col_tiles = int(self.N // n_warp)
         mma_emitter = SparseTensorCoreIntrinEmitter(
@@ -90,6 +89,7 @@ class GemmSPMMA(GemmSPBase):
         E_shared = self.E
         B_shared = self.B
         C_local = self.C
+        clear_accum = self.clear_accum
         assert micro_size_k <= self.K, f"K dimension {self.K} should be >= micro size k {micro_size_k}"
         if self.is_gemm_ss():
 
@@ -103,6 +103,9 @@ class GemmSPMMA(GemmSPBase):
                 A_local = T.alloc_local((warp_rows * local_size_a), in_dtype)
                 E_local = T.alloc_local((warp_rows * local_size_e), self.e_dtype)
                 B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
+
+                if clear_accum:
+                    T.clear(C_local)
 
                 for ki in T.serial(0, (self.K // micro_size_k)):
                     # Load A into fragment
@@ -145,8 +148,10 @@ class GemmSPMMA(GemmSPBase):
                 A_local = T.alloc_local((warp_rows * local_size_a), in_dtype)
                 E_local = T.alloc_local((warp_rows * local_size_e), self.e_dtype)
 
-                for ki in T.serial(0, (self.K // micro_size_k)):
+                if clear_accum:
+                    T.clear(C_local)
 
+                for ki in T.serial(0, (self.K // micro_size_k)):
                     # Load A into fragment
                     mma_emitter.ldmatrix_a(
                         A_local,
@@ -182,6 +187,9 @@ class GemmSPMMA(GemmSPBase):
                 E_local = T.alloc_local((warp_rows * local_size_e), self.e_dtype)
                 B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
 
+                if clear_accum:
+                    T.clear(C_local)
+
                 for ki in T.serial(0, (self.K // micro_size_k)):
                     # Load E into fragment
                     mma_emitter.ldmatrix_e(
@@ -216,6 +224,9 @@ class GemmSPMMA(GemmSPBase):
                 """
                 E_local = T.alloc_local((warp_rows * local_size_e), self.e_dtype)
 
+                if clear_accum:
+                    T.clear(C_local)
+
                 for ki in T.serial(0, (self.K // micro_size_k)):
                     # Load E into fragment
                     mma_emitter.ldmatrix_e(
@@ -231,8 +242,7 @@ class GemmSPMMA(GemmSPBase):
             # Must inline let statements to simplify the analysis
             return _Simplify(_gemm_rrr, inline_let=True)
         else:
-            raise ValueError(
-                f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}")
+            raise ValueError(f"Unsupported gemm combination, A: {self.A.scope()}, B: {self.B.scope()}")
 
     def is_gemm_ss(self) -> bool:
         return is_shared(self.A) and is_shared(self.B)

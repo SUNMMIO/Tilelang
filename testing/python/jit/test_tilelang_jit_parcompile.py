@@ -1,6 +1,7 @@
 import tilelang.testing
 import tilelang
 import torch
+from tilelang import language as T
 
 
 @tilelang.jit(
@@ -16,9 +17,9 @@ def matmul_kernel_jit(
     block_K,
     trans_A=False,
     trans_B=True,
-    in_dtype='float16',
-    out_dtype='float32',
-    accum_dtype='float32',
+    in_dtype=T.float16,
+    out_dtype=T.float32,
+    accum_dtype=T.float32,
     num_stages=2,
     threads=128,
 ):
@@ -31,9 +32,9 @@ def matmul_kernel_jit(
 
     @T.prim_func
     def main(
-            A: T.Tensor(A_shape, in_dtype),
-            B: T.Tensor(B_shape, in_dtype),
-            C: T.Tensor((M, N), out_dtype),
+        A: T.Tensor(A_shape, in_dtype),
+        B: T.Tensor(B_shape, in_dtype),
+        C: T.Tensor((M, N), out_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             A_shared = T.alloc_shared(A_shared_shape, in_dtype)
@@ -57,8 +58,8 @@ def matmul_kernel_jit(
 
 def test_par_compile():
     configs = [
-        (1024, 1024, 1024, 128, 128, 32),
-        (2048, 2048, 2048, 256, 256, 64),
+        (1024, 1024, 1024, 128, 128, 64),
+        (2048, 2048, 2048, 256, 256, 32),
         (4096, 4096, 4096, 64, 64, 128),
     ]
     kernels = matmul_kernel_jit.par_compile(configs)

@@ -13,30 +13,24 @@ Available allocation functions:
 Each function takes shape and dtype parameters and returns a TVM buffer object
 with the appropriate memory scope.
 """
+
 from __future__ import annotations
-from typing import TypeVar, overload, Literal, Callable
-# Python 3.9 compatibility for advanced typing features (PEP 646)
-try:
-    from typing import TypeVarTuple, Unpack  # type: ignore[attr-defined]
-except Exception:
-    from typing_extensions import TypeVarTuple, Unpack  # type: ignore
+from typing import overload, Literal
+from tilelang._typing import DType, ShapeType
 from tilelang import tvm as tvm
 from tvm.script import tir as T
 from tvm.tir import PrimExpr
 from tvm.script.parser.tir import block_attr
 from tvm.tir.buffer import Buffer
 from tvm.tir.expr import FloatImm, IntImm
-from .v2.dtypes import dtype as tl_dtype
-from .v2.builder import OutTensor
-from .v2.annot import Tensor, SharedBuffer, LocalBuffer, FragmentBuffer
 
-_Shapes = TypeVarTuple('_Shapes')
-_DType = TypeVar('_DType')
+from . import dtypes as _dtypes
+from .dtypes import dtype as tl_dtype
+from .eager.builder import OutTensor
+from .proxy import Tensor
 
 
-def alloc_shared(shape: tuple[Unpack[_Shapes]],
-                 dtype: _DType,
-                 scope="shared.dyn") -> SharedBuffer[Callable[[Unpack[_Shapes]]], _DType]:
+def alloc_shared(shape: ShapeType, dtype: DType, scope="shared.dyn") -> Buffer:
     """Allocate a shared memory buffer for inter-thread communication.
 
     Args:
@@ -54,9 +48,7 @@ def alloc_shared(shape: tuple[Unpack[_Shapes]],
     return T.alloc_buffer(shape, dtype, scope=scope)
 
 
-def alloc_local(shape: tuple[Unpack[_Shapes]],
-                dtype: _DType,
-                scope="local") -> LocalBuffer[Callable[[Unpack[_Shapes]]], _DType]:
+def alloc_local(shape: ShapeType, dtype: DType, scope="local") -> Buffer:
     """Allocate a local memory buffer for thread-private storage.
 
     Args:
@@ -70,9 +62,7 @@ def alloc_local(shape: tuple[Unpack[_Shapes]],
     return T.alloc_buffer(shape, dtype, scope=scope)
 
 
-def alloc_fragment(shape: tuple[Unpack[_Shapes]],
-                   dtype: _DType,
-                   scope="local.fragment") -> FragmentBuffer[Callable[[Unpack[_Shapes]]], _DType]:
+def alloc_fragment(shape: ShapeType, dtype: DType, scope="local.fragment") -> Buffer:
     """Allocate a fragment memory buffer for specialized operations.
 
     Args:
@@ -87,19 +77,14 @@ def alloc_fragment(shape: tuple[Unpack[_Shapes]],
 
 
 @overload
-def alloc_var(dtype: str, init: PrimExpr | int | float, scope: str = 'local.var') -> Buffer:
-    ...
+def alloc_var(dtype: DType, init: PrimExpr | int | float, scope: str = "local.var") -> Buffer: ...
 
 
 @overload
-def alloc_var(dtype: str,
-              scope: str = 'local.var',
-              *,
-              init: PrimExpr | int | float | None = None) -> Buffer:
-    ...
+def alloc_var(dtype: DType, scope: str = "local.var", *, init: PrimExpr | int | float | None = None) -> Buffer: ...
 
 
-def alloc_var(dtype, *args, scope="local.var", init: PrimExpr | None = None):
+def alloc_var(dtype: DType, *args, scope: str = "local.var", init: PrimExpr | int | float | None = None) -> Buffer:
     """Allocate a single-element variable buffer.
 
     Args:
@@ -142,8 +127,7 @@ def alloc_var(dtype, *args, scope="local.var", init: PrimExpr | None = None):
             raise TypeError("Scope must be provided as a string in alloc_var.")
         parsed_scope = parsed_scope_arg
     elif len(args) > 2:
-        raise TypeError(
-            f"alloc_var expected at most 3 positional arguments but got {len(args) + 1}.")
+        raise TypeError(f"alloc_var expected at most 3 positional arguments but got {len(args) + 1}.")
 
     if not isinstance(parsed_scope, str):
         raise TypeError("Scope must be a string in alloc_var.")
@@ -157,19 +141,35 @@ def alloc_var(dtype, *args, scope="local.var", init: PrimExpr | None = None):
     return buffer
 
 
-def alloc_barrier(arrive_count: int):
+def alloc_barrier(arrive_count: int | list[int]) -> Buffer:
     """Allocate a barrier buffer.
 
     Args:
-        arrive_count (int): The number of threads that need to arrive at the barrier
+        arrive_count (int | list[int]): The number of threads that need to arrive at each barrier
 
     Returns:
         T.Buffer: A TVM buffer object allocated as a barrier
+
+    Examples
+    --------
+    >>> mbar = alloc_barrier(128)  # allocate a barrier with arrive count 128
+    >>> mbars = alloc_barrier([128] * n)  # allocate n barriers with the same arrive count 128
     """
-    return T.alloc_buffer([arrive_count], "uint64", scope="shared.barrier")
+    # Normalize to list
+    if isinstance(arrive_count, int):
+        arrive_count = [arrive_count]
+    else:
+        arrive_count = list(arrive_count)
+    buffer = T.alloc_buffer((len(arrive_count),), _dtypes.uint64, scope="shared.barrier")
+    # Convert to TIR IntImm expressions for C++ pass to consume as Map<Var, Array<PrimExpr>>
+    # Use buffer.data as key to support multiple barrier buffer allocations
+    arrive_count_exprs = [IntImm("int32", c) for c in arrive_count]
+    block_attr({"barrier_init": {buffer.data: arrive_count_exprs}})
+
+    return buffer
 
 
-def alloc_tmem(shape, dtype):
+def alloc_tmem(shape: ShapeType, dtype: DType) -> Buffer:
     """
     Allocate a Tensor Memory (TMEM) buffer for use with 5th generation Tensor Core operations (e.g., TCGEN5.MMA).
 
@@ -198,7 +198,10 @@ def alloc_tmem(shape, dtype):
     return T.alloc_buffer(shape, dtype, scope="shared.tmem")
 
 
-def alloc_reducer(shape, dtype, op="sum", replication=None):
+ReducerOp = Literal["sum", "max", "min"]
+
+
+def alloc_reducer(shape: ShapeType, dtype: DType, op: ReducerOp = "sum", replication=None) -> Buffer:
     """
     Allocate a reducer buffer.
 
@@ -239,8 +242,8 @@ DescKind = Literal["wgmma", "tcgen05_smem", "tcgen05_instr"]
 
 def alloc_descriptor(
     kind: DescKind = "wgmma",
-    dtype: str = "uint64",
-):
+    dtype: DType = _dtypes.uint64,
+) -> Buffer:
     """Allocate a descriptor buffer for WGMMA and TCGEN5.MMA.
 
     Args:
@@ -256,31 +259,28 @@ def alloc_descriptor(
     return T.alloc_buffer([1], dtype, scope=scope)
 
 
-def alloc_wgmma_desc(dtype: str = "uint64"):
+def alloc_wgmma_desc(dtype: DType = _dtypes.uint64) -> Buffer:
     return alloc_descriptor("wgmma", dtype=dtype)
 
 
-def alloc_tcgen05_smem_desc(dtype: str = "uint64"):
+def alloc_tcgen05_smem_desc(dtype: DType = _dtypes.uint64) -> Buffer:
     return alloc_descriptor("tcgen05_smem", dtype=dtype)
 
 
-def alloc_tcgen05_instruction_desc(dtype: str = "uint32"):
+def alloc_tcgen05_instruction_desc(dtype: DType = _dtypes.uint32) -> Buffer:
     return alloc_descriptor("tcgen05_instr", dtype=dtype)
 
 
 # Alias: short name consistent with imports
-def alloc_tcgen05_instr_desc(dtype: str = "uint32"):
+def alloc_tcgen05_instr_desc(dtype: DType = _dtypes.uint32) -> Buffer:
     return alloc_tcgen05_instruction_desc(dtype)
 
 
 @overload
-def empty(shape: tuple[Unpack[_Shapes]],
-          dtype: str = 'float32') -> Tensor[Callable[[Unpack[_Shapes]]], _DType]:
-    ...
+def empty(shape, dtype: DType = _dtypes.float32) -> Tensor: ...
 
 
-def empty(*shape: Unpack[_Shapes],
-          dtype: str = 'float32') -> Tensor[Callable[[Unpack[_Shapes]]], _DType]:
+def empty(*shape, dtype: DType = _dtypes.float32) -> Tensor:
     if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
         return OutTensor(shape[0], dtype)
     elif len(shape) == 2 and isinstance(shape[0], (tuple, list)) and isinstance(shape[1], str):
@@ -288,4 +288,4 @@ def empty(*shape: Unpack[_Shapes],
     elif all([isinstance(x, (int, PrimExpr)) for x in shape]):
         return OutTensor(shape, dtype)
     else:
-        raise RuntimeError(f'Invalid shape {shape}')
+        raise TypeError(f"Invalid shape {shape}")
