@@ -70,7 +70,7 @@ jobs:
     timeout-minutes: 120
     container:
       image: nvidia/cuda:12.8.0-devel-ubuntu24.04
-      options: --gpus all --ipc=host --network host
+      options: --gpus all --ipc=host --network host --sysctl net.ipv4.tcp_mtu_probing=1
       volumes:
         - /opt/ci-cache/sunmmio:/ci-cache
     env:
