@@ -36,7 +36,6 @@ from tvm.tir.stmt_functor import post_order_visit
 
 tilelang.env.disable_cache()
 
-
 # ---------------------------------------------------------------------------
 # Kernel helpers
 # ---------------------------------------------------------------------------

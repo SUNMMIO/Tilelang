@@ -126,8 +126,8 @@ def collect_var_names(func):
 def get_device_func(mod):
     """Return the device PrimFunc: the one whose target attribute has no host."""
     for func in mod.functions.values():
-        if (isinstance(func, tir.PrimFunc) and func.attrs is not None and
-                "target" in func.attrs and not func.attrs["target"].host):
+        if (isinstance(func, tir.PrimFunc) and func.attrs is not None and "target" in func.attrs
+                and not func.attrs["target"].host):
             return func
     return None
 
@@ -234,17 +234,15 @@ def run_optimize_for_sunmmio_cascade(mod, target):
 
     mod = tl_transform.MakePackedAPI()(mod)
     device_func = get_device_func(mod)
-    assert device_func is not None, (
-        "After MakePackedAPI: device function lost. "
-        f"Functions: {[str(gv) for gv in mod.functions]}")
+    assert device_func is not None, ("After MakePackedAPI: device function lost. "
+                                     f"Functions: {[str(gv) for gv in mod.functions]}")
     assert_threadless_invariants(device_func, "MakePackedAPI")
 
     mod = tl_transform.LowerDeviceKernelLaunch()(mod)
     # LowerDeviceKernelLaunch rewrites the host launcher; device body is unchanged.
     device_func = get_device_func(mod)
-    assert device_func is not None, (
-        "After LowerDeviceKernelLaunch: device function lost. "
-        f"Functions: {[str(gv) for gv in mod.functions]}")
+    assert device_func is not None, ("After LowerDeviceKernelLaunch: device function lost. "
+                                     f"Functions: {[str(gv) for gv in mod.functions]}")
     assert_threadless_invariants(device_func, "LowerDeviceKernelLaunch")
 
     return mod

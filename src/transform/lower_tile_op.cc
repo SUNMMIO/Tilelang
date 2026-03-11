@@ -1060,10 +1060,10 @@ private:
     // Determine if this is a true parallel loop requiring thread partitioning.
     // Skip partitioning for loops that only operate on local/register buffers.
     // Also skip when no real threadIdx.x binding was seen in the IR: calling
-    // PartitionLoop with the dummy v_thread variable embeds a free variable into
-    // the output IR.  has_thread_binding_ is set by VisitStmt_(AttrStmtNode)
-    // only when a genuine threadIdx.x AttrStmt is encountered, so this check is
-    // IR-driven rather than target-driven.
+    // PartitionLoop with the dummy v_thread variable embeds a free variable
+    // into the output IR.  has_thread_binding_ is set by
+    // VisitStmt_(AttrStmtNode) only when a genuine threadIdx.x AttrStmt is
+    // encountered, so this check is IR-driven rather than target-driven.
     bool parallel_loop =
         !local_register_only && !store_into_local && has_thread_binding_;
 

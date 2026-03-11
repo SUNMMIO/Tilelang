@@ -15,6 +15,7 @@ import threading
 # Ensure single-dimension kernel bindings can be unpacked like iterables.
 # especially for issue https://github.com/tile-ai/tilelang/issues/830
 if not hasattr(Var, "__iter__"):
+
     def _var_iter(self):
         yield self
 
@@ -110,7 +111,8 @@ class KernelLaunchFrame(TIRFrame):
         _get_current_stack().push(self)
 
         last_block_frame = self.frames[-1]
-        assert isinstance(last_block_frame, BlockFrame), f"Last frame must be a block frame, got {last_block_frame}"
+        assert isinstance(last_block_frame,
+                          BlockFrame), f"Last frame must be a block frame, got {last_block_frame}"
 
         maybe_cpu = last_block_frame.annotations.get("tilelang.is_cpu_kernel_frame", False)
         maybe_sunmmio = last_block_frame.annotations.get("tilelang.is_sunmmio_kernel_frame", False)
@@ -292,7 +294,9 @@ def Kernel(
     from tilelang.language.eager.builder import Builder
 
     if Builder.current() is None:
-        raise JITNoBuilderError("T.Kernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available.")
+        raise JITNoBuilderError(
+            "T.Kernel() can only be used inside @tilelang.jit or @T.prim_func context. No Builder is available."
+        )
 
     attrs: dict = {}
 

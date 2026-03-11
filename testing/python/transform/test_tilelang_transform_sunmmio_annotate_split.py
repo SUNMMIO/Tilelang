@@ -44,9 +44,8 @@ def get_device_func(mod):
     is GPU-only). We identify it by kIsGlobalFunc + Sunmmio target.
     """
     candidates = [
-        f for f in mod.functions.values()
-        if f.attrs.get("tir.is_global_func", False) and
-           "target" in f.attrs and target_is_sunmmio(f.attrs["target"])
+        f for f in mod.functions.values() if f.attrs.get("tir.is_global_func", False)
+        and "target" in f.attrs and target_is_sunmmio(f.attrs["target"])
     ]
     return candidates
 
