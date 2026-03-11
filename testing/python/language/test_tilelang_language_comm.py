@@ -7,9 +7,12 @@ from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 
 
-@pytest.mark.parametrize("M, N, block_M, block_N, dtype, accum_dtype", [
-    (1024, 1024, 128, 128, "float16", "float"),
-])
+@pytest.mark.parametrize(
+    "M, N, block_M, block_N, dtype, accum_dtype",
+    [
+        (1024, 1024, 128, 128, "float16", "float"),
+    ],
+)
 def test_comm_python_api(M, N, block_M, block_N, dtype, accum_dtype):
     func_str = """# from tvm.script import tir as T
 
@@ -34,7 +37,9 @@ def main(A_handle: T.handle):
         T.comm_allgather(A_shared[0:128, 0:128], C_shared[0:16, 0:128, 0:128], 2, -1)"""
 
     @T.prim_func
-    def main(A: T.Tensor((M, N), dtype),):
+    def main(
+        A: T.Tensor((M, N), dtype),
+    ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared([block_M, block_N], dtype, scope="shared.rsram")
             B_shared = T.alloc_shared([block_M, block_N], dtype, scope="shared.rsram")
@@ -48,9 +53,12 @@ def main(A_handle: T.handle):
     assert main.script() == func_str, "The generated script does not match the expected output."
 
 
-@pytest.mark.parametrize("M, N, block_M, block_N, dtype, accum_dtype", [
-    (1024, 1024, 128, 128, "float16", "float"),
-])
+@pytest.mark.parametrize(
+    "M, N, block_M, block_N, dtype, accum_dtype",
+    [
+        (1024, 1024, 128, 128, "float16", "float"),
+    ],
+)
 def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
     func_str = """# from tvm.script import ir as I
 # from tvm.script import tir as T
@@ -80,7 +88,9 @@ class Module:
             T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 14, 0)"""
 
     @T.prim_func
-    def main(A: T.Tensor((M, N), dtype),):
+    def main(
+        A: T.Tensor((M, N), dtype),
+    ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared([block_M, block_N], dtype, scope="shared.rsram")
             B_shared = T.alloc_shared([block_M, block_N], dtype, scope="shared.rsram")
@@ -88,7 +98,7 @@ class Module:
 
             T.comm.broadcast(A_shared, B_shared, (1, 2), direction="all")
 
-    mod = tvm.IRModule({'main': main})
+    mod = tvm.IRModule({"main": main})
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
@@ -96,9 +106,12 @@ class Module:
         assert mod.script() == func_str, "The generated script does not match the expected output."
 
 
-@pytest.mark.parametrize("M, N, block_M, block_N, dtype, accum_dtype", [
-    (1024, 1024, 128, 128, "float16", "float"),
-])
+@pytest.mark.parametrize(
+    "M, N, block_M, block_N, dtype, accum_dtype",
+    [
+        (1024, 1024, 128, 128, "float16", "float"),
+    ],
+)
 def test_comm_put_lower(M, N, block_M, block_N, dtype, accum_dtype):
     func_str = """# from tvm.script import ir as I
 # from tvm.script import tir as T
@@ -125,7 +138,9 @@ class Module:
             T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 10, 0, 0, 1, 2)"""
 
     @T.prim_func
-    def main(A: T.Tensor((M, N), dtype),):
+    def main(
+        A: T.Tensor((M, N), dtype),
+    ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared([block_M, block_N], dtype, scope="shared.rsram")
             B_shared = T.alloc_shared([block_M, block_N], dtype, scope="shared.rsram")
@@ -133,7 +148,7 @@ class Module:
 
             T.comm.put(A_shared, B_shared, (1, 2), (2, 3))
 
-    mod = tvm.IRModule({'main': main})
+    mod = tvm.IRModule({"main": main})
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
@@ -141,9 +156,12 @@ class Module:
         assert mod.script() == func_str, "The generated script does not match the expected output."
 
 
-@pytest.mark.parametrize("M, N, block_M, block_N, dtype, accum_dtype", [
-    (1024, 1024, 128, 128, "float16", "float"),
-])
+@pytest.mark.parametrize(
+    "M, N, block_M, block_N, dtype, accum_dtype",
+    [
+        (1024, 1024, 128, 128, "float16", "float"),
+    ],
+)
 def test_comm_all_gather_lower(M, N, block_M, block_N, dtype, accum_dtype):
     func_str = """# from tvm.script import ir as I
 # from tvm.script import tir as T
@@ -200,7 +218,9 @@ class Module:
             T.broadcast_(T.region(C_shared[12, 0, 0], 1, 4, 128, 128), T.region(C_shared[12, 0, 0], 2, 4, 128, 128), 65536, 15, 1)"""
 
     @T.prim_func
-    def main(A: T.Tensor((M, N), dtype),):
+    def main(
+        A: T.Tensor((M, N), dtype),
+    ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared([block_M, block_N], dtype, scope="shared.rsram")
             C_shared = T.alloc_shared([16, block_M, block_N], dtype, scope="shared.rsram")
@@ -208,7 +228,7 @@ class Module:
 
             T.comm.all_gather(A_shared, C_shared, direction="all")
 
-    mod = tvm.IRModule({'main': main})
+    mod = tvm.IRModule({"main": main})
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
@@ -216,9 +236,12 @@ class Module:
         assert mod.script() == func_str, "The generated script does not match the expected output."
 
 
-@pytest.mark.parametrize("M, N, block_M, block_N, dtype, accum_dtype", [
-    (1024 * 128, 1024 * 128, 1024, 1024, "float16", "float"),
-])
+@pytest.mark.parametrize(
+    "M, N, block_M, block_N, dtype, accum_dtype",
+    [
+        (1024 * 128, 1024 * 128, 1024, 1024, "float16", "float"),
+    ],
+)
 def test_comm_all_reduce_lower(M, N, block_M, block_N, dtype, accum_dtype):
     func_str = """# from tvm.script import ir as I
 # from tvm.script import tir as T
@@ -305,7 +328,9 @@ class Module:
 # Metadata omitted. Use show_meta=True in script() method to show it."""
 
     @T.prim_func
-    def main(A: T.Tensor((M, N), dtype),):
+    def main(
+        A: T.Tensor((M, N), dtype),
+    ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared([block_M, block_N], dtype, scope="shared.rsram")
             E_shared = T.alloc_shared([block_M], dtype, scope="shared.rsram")
@@ -313,7 +338,7 @@ class Module:
 
             T.comm.all_reduce(A_shared, E_shared, "sum", "all", dim=-1, clear=False)
 
-    mod = tvm.IRModule({'main': main})
+    mod = tvm.IRModule({"main": main})
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)

@@ -12,7 +12,8 @@ from collections.abc import Iterable
 from tvm import tir
 import tilelang.language as T
 from tilelang.utils.language import (
-    to_buffer_region,)
+    to_buffer_region,
+)
 
 from tilelang.carver.arch.driver import get_sunmmio_device_mesh_config
 
@@ -55,8 +56,8 @@ def core_tuple_to_id(core_id: tuple[int, int]) -> int:
     """
     mesh_shape = get_target_mesh_shape()
     row, col = core_id
-    assert (0 <= row < mesh_shape["nrow"]), f"Row {row} out of bounds for mesh shape {mesh_shape}."
-    assert (0 <= col < mesh_shape["ncol"]), f"Col {col} out of bounds for mesh shape {mesh_shape}."
+    assert 0 <= row < mesh_shape["nrow"], f"Row {row} out of bounds for mesh shape {mesh_shape}."
+    assert 0 <= col < mesh_shape["ncol"], f"Col {col} out of bounds for mesh shape {mesh_shape}."
     core_id_value = row * mesh_shape["ncol"] + col
     return core_id_value
 
@@ -110,8 +111,9 @@ def CoreId(core_id: int | tuple[int, int]):
         core_id_value = core_tuple_to_id(core_id)
     elif isinstance(core_id, int):
         core_id_value = core_id
-        assert (0 <= core_id_value < mesh_shape["nrow"] * mesh_shape["ncol"]
-               ), f"Core ID {core_id_value} out of bounds for mesh shape {mesh_shape}"
+        assert 0 <= core_id_value < mesh_shape["nrow"] * mesh_shape["ncol"], (
+            f"Core ID {core_id_value} out of bounds for mesh shape {mesh_shape}"
+        )
     else:
         raise ValueError("core_id must be either a tuple[int, int] or an int.")
     return tir.call_intrin("handle", tir.op.Op.get("tl.CoreId"), core_id_value)
@@ -171,30 +173,24 @@ def broadcast(
     src_dtype, src_shape = _get_buffer_info(src)
     dst_dtype, dst_shape = _get_buffer_info(dst)
 
-    assert (
-        src_dtype == dst_dtype
-    ), f"Source and destination buffer dtypes must match for broadcast. Got {src_dtype} vs {dst_dtype}."
+    assert src_dtype == dst_dtype, f"Source and destination buffer dtypes must match for broadcast. Got {src_dtype} vs {dst_dtype}."
     if len(src_shape) != len(dst_shape):
-        raise ValueError(
-            "Source and destination buffer must have the same number of dimensions for broadcast.")
+        raise ValueError("Source and destination buffer must have the same number of dimensions for broadcast.")
     for i in range(len(src_shape)):
-        assert (
-            src_shape[i] == dst_shape[i] or src_shape[i] == 1 or dst_shape[i] == 1
-        ), f"Source buffer shape  and destination buffer shape must match for broadcast. Got {src_shape} vs {dst_shape}."
+        assert src_shape[i] == dst_shape[i] or src_shape[i] == 1 or dst_shape[i] == 1, (
+            f"Source buffer shape  and destination buffer shape must match for broadcast. Got {src_shape} vs {dst_shape}."
+        )
 
     mesh_shape = get_target_mesh_shape()
-    assert (isinstance(src_core, tuple) and
-            len(src_core) == 2), "src_core must be a tuple of (row, col)."
-    assert (0 <= src_core[0] < mesh_shape["nrow"]
-           ), f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
-    assert (0 <= src_core[1] < mesh_shape["ncol"]
-           ), f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
+    assert isinstance(src_core, tuple) and len(src_core) == 2, "src_core must be a tuple of (row, col)."
+    assert 0 <= src_core[0] < mesh_shape["nrow"], f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
+    assert 0 <= src_core[1] < mesh_shape["ncol"], f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
 
     src_elements = 1
     for dim in src_shape:
         src_elements *= dim
     assert isinstance(size, int) and size >= -1, "size must be an integer >= -1."
-    assert (size <= src_elements), f"size {size} exceeds source buffer size {src_elements}."
+    assert size <= src_elements, f"size {size} exceeds source buffer size {src_elements}."
 
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
 
@@ -243,35 +239,26 @@ def put(
     --------
     >>> put(A, B, (1, 2), (2, 3))
     """
-    assert (
-        src.dtype == dst.dtype
-    ), f"Source and destination buffer dtypes must match for put. Got {src.dtype} vs {dst.dtype}."
+    assert src.dtype == dst.dtype, f"Source and destination buffer dtypes must match for put. Got {src.dtype} vs {dst.dtype}."
     if len(src.shape) != len(dst.shape):
-        raise ValueError(
-            "Source and destination buffer must have the same number of dimensions for put.")
+        raise ValueError("Source and destination buffer must have the same number of dimensions for put.")
     for i in range(len(src.shape)):
-        assert (
-            src.shape[i] == dst.shape[i] or src.shape[i] == 1 or dst.shape[i] == 1
-        ), f"Source buffer shape and destination buffer shape must be compatible for put. Got {src.shape} vs {dst.shape}."
+        assert src.shape[i] == dst.shape[i] or src.shape[i] == 1 or dst.shape[i] == 1, (
+            f"Source buffer shape and destination buffer shape must be compatible for put. Got {src.shape} vs {dst.shape}."
+        )
 
     mesh_shape = get_target_mesh_shape()
-    assert (isinstance(src_core, tuple) and
-            len(src_core) == 2), "src_core must be a tuple of (row, col)."
-    assert (0 <= src_core[0] < mesh_shape["nrow"]
-           ), f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
-    assert (0 <= src_core[1] < mesh_shape["ncol"]
-           ), f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
-    assert (isinstance(dst_core, tuple) and
-            len(dst_core) == 2), "dst_core must be a tuple of (row, col)."
-    assert (0 <= dst_core[0] < mesh_shape["nrow"]
-           ), f"dst_core row {dst_core[0]} out of bounds for mesh shape {mesh_shape}."
-    assert (0 <= dst_core[1] < mesh_shape["ncol"]
-           ), f"dst_core col {dst_core[1]} out of bounds for mesh shape {mesh_shape}."
+    assert isinstance(src_core, tuple) and len(src_core) == 2, "src_core must be a tuple of (row, col)."
+    assert 0 <= src_core[0] < mesh_shape["nrow"], f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
+    assert 0 <= src_core[1] < mesh_shape["ncol"], f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
+    assert isinstance(dst_core, tuple) and len(dst_core) == 2, "dst_core must be a tuple of (row, col)."
+    assert 0 <= dst_core[0] < mesh_shape["nrow"], f"dst_core row {dst_core[0]} out of bounds for mesh shape {mesh_shape}."
+    assert 0 <= dst_core[1] < mesh_shape["ncol"], f"dst_core col {dst_core[1]} out of bounds for mesh shape {mesh_shape}."
     src_elements = 1
     for dim in src.shape:
         src_elements *= dim
     assert isinstance(size, int) and size >= -1, "size must be an integer >= -1."
-    assert (size <= src_elements), f"size {size} exceeds source buffer size {src_elements}."
+    assert size <= src_elements, f"size {size} exceeds source buffer size {src_elements}."
 
     src_region = to_buffer_region(src)
     dst_region = to_buffer_region(dst)
@@ -310,9 +297,9 @@ def all_gather(
     """
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
 
-    assert (
-        send_buffer.dtype == recv_buffer.dtype
-    ), f"Source and destination buffer dtypes must match for all_gather. Got {send_buffer.dtype} vs {recv_buffer.dtype}."
+    assert send_buffer.dtype == recv_buffer.dtype, (
+        f"Source and destination buffer dtypes must match for all_gather. Got {send_buffer.dtype} vs {recv_buffer.dtype}."
+    )
     mesh_shape = get_target_mesh_shape()
 
     recv_num = 1
@@ -324,15 +311,15 @@ def all_gather(
         recv_num = mesh_shape["nrow"] * mesh_shape["ncol"]
 
     expected_recv_shape = [recv_num] + list(send_buffer.shape)
-    assert (
-        list(recv_buffer.shape) == expected_recv_shape
-    ), f"Receive buffer shape must be {expected_recv_shape} to hold gathered data from {recv_num} cores, but got {recv_buffer.shape}."
+    assert list(recv_buffer.shape) == expected_recv_shape, (
+        f"Receive buffer shape must be {expected_recv_shape} to hold gathered data from {recv_num} cores, but got {recv_buffer.shape}."
+    )
 
     assert isinstance(size, int) and size >= -1, "size must be an integer >= -1."
     send_elements = 1
     for dim in send_buffer.shape:
         send_elements *= dim
-    assert (size <= send_elements), f"size {size} exceeds send buffer size {send_elements}."
+    assert size <= send_elements, f"size {size} exceeds send buffer size {send_elements}."
 
     send_buffer_region = to_buffer_region(send_buffer)
     recv_buffer_region = to_buffer_region(recv_buffer)
@@ -379,24 +366,25 @@ def all_reduce(
     --------
     >>> all_reduce(A_local, E_local, "sum", "all", dim=-1, clear=False)
     """
-    assert (isinstance(dim, int) and dim >= -1 and dim < len(
-        buffer.shape)), f"dim {dim} out of bounds for buffer with {len(buffer.shape)} dimensions."
+    assert isinstance(dim, int) and dim >= -1 and dim < len(buffer.shape), (
+        f"dim {dim} out of bounds for buffer with {len(buffer.shape)} dimensions."
+    )
     if dim == -1:
         dim = len(buffer.shape) - 1
 
     expected_shapes = [
-        buffer.shape[:dim] + buffer.shape[dim + 1:],
-        buffer.shape[:dim] + [1] + buffer.shape[dim + 1:],
+        buffer.shape[:dim] + buffer.shape[dim + 1 :],
+        buffer.shape[:dim] + [1] + buffer.shape[dim + 1 :],
     ]
     if list(out.shape) not in expected_shapes:
         expected_shapes_str = " or ".join(map(str, expected_shapes))
         raise ValueError(
             f"Invalid reduce output shape, buffer shape is {buffer.shape}, dim is {dim}, "
-            f"output shape is {out.shape}, expected shapes are {expected_shapes_str}")
+            f"output shape is {out.shape}, expected shapes are {expected_shapes_str}"
+        )
 
     reduce_type = reduce_type.lower()
-    assert (reduce_type in REDUCE_TYPE_LIST
-           ), f"Reduction op must be one of {REDUCE_TYPE_LIST}, but got {reduce_type}."
+    assert reduce_type in REDUCE_TYPE_LIST, f"Reduction op must be one of {REDUCE_TYPE_LIST}, but got {reduce_type}."
 
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
     assert clear in [True, False], "clear must be a boolean value."

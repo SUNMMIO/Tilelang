@@ -1,14 +1,14 @@
 """test of using DMA operations in Tilelang Mesh Language to perform matrix multiplication with ReLU activation."""
+
 import tilelang.language as T
 
 
 def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
-
     @T.prim_func
     def matmul_relu_kernel(
-            A: T.Tensor((M, K), dtype),
-            B: T.Tensor((K, N), dtype),
-            C: T.Tensor((M, N), dtype),
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         # Initialize Kernel Context
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
@@ -79,5 +79,4 @@ def matmul_relu_kernel(A_handle: T.handle, B_handle: T.handle, C_handle: T.handl
         T.dma_store(T.region(C_local[0, 0], 1, 128, 128), T.region(C[by * 128, bx * 128], 2, 128, 128), 0)"""
 
 # mul_primfunc.show() # Uncomment to see the generated primfunc
-assert mul_primfunc.script(
-) == expected_result, "The output is not as expected. Use mul_primfunc.show() to view the results."
+assert mul_primfunc.script() == expected_result, "The output is not as expected. Use mul_primfunc.show() to view the results."

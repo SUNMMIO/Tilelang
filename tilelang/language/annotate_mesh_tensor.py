@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from copy import deepcopy
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable
 
 from tvm import tir
 import tilelang.language as T
@@ -12,7 +14,7 @@ per-tile shapes and performing copy operations between mesh tiles.
 """
 
 
-def mesh_tensor_functions(mesh_shape: dict[str, int]) -> Dict[str, Callable]:
+def mesh_tensor_functions(mesh_shape: dict[str, int]) -> dict[str, Callable]:
     """Create mesh-tensor helper functions for a given mesh shape.
 
     This factory returns a dictionary with three helpers:
@@ -32,7 +34,7 @@ def mesh_tensor_functions(mesh_shape: dict[str, int]) -> Dict[str, Callable]:
     """
 
     # Internal storage for mesh-tensor metadata; keyed by buffer.data
-    _mesh_tensor_info: Dict = {}
+    _mesh_tensor_info: dict = {}
     if isinstance(mesh_shape, dict) and "x" in mesh_shape and "y" in mesh_shape:
         _mesh_shape = deepcopy(mesh_shape)
     else:
@@ -44,7 +46,7 @@ def mesh_tensor_functions(mesh_shape: dict[str, int]) -> Dict[str, Callable]:
         Args:
             mesh_tensor_info: Mapping from `tir.Buffer` -> metadata dict.
 
-            The expected input maps buffer objects to info dicts containing 
+            The expected input maps buffer objects to info dicts containing
             at least 'block_shape', 'program_id', and 'sharding'.
 
         Example:
@@ -74,12 +76,7 @@ def mesh_tensor_functions(mesh_shape: dict[str, int]) -> Dict[str, Callable]:
         _mesh_tensor_info = {}
         for buffer, info in mesh_tensor_info.items():
             # Validate metadata structure for each buffer
-            if (
-                not isinstance(info, dict)
-                or "block_shape" not in info
-                or "program_id" not in info
-                or "sharding" not in info
-            ):
+            if not isinstance(info, dict) or "block_shape" not in info or "program_id" not in info or "sharding" not in info:
                 raise ValueError(f"Invalid mesh tensor info: {info}")
             else:
                 # store metadata keyed by `buffer.data` so helpers can lookup
@@ -87,7 +84,7 @@ def mesh_tensor_functions(mesh_shape: dict[str, int]) -> Dict[str, Callable]:
 
         return T.func_attr({"mesh_tensor_info": _mesh_tensor_info})
 
-    def get_tile_shape(buffer: tir.Buffer) -> Tuple[int, ...]:
+    def get_tile_shape(buffer: tir.Buffer) -> tuple[int, ...]:
         """Compute the per-tile shape for a given buffer.
 
         This uses stored mesh tensor metadata (sharding) to determine which
@@ -124,8 +121,8 @@ def mesh_tensor_functions(mesh_shape: dict[str, int]) -> Dict[str, Callable]:
         src: tir.Buffer,
         dst: tir.Buffer,
         *,
-        src_coord: Optional[Tuple[int, ...]] = None,
-        dst_coord: Optional[Tuple[int, ...]] = None,
+        src_coord: tuple[int, ...] | None = None,
+        dst_coord: tuple[int, ...] | None = None,
     ):
         """Copy data between mesh tensor tiles.
 
@@ -155,9 +152,7 @@ def mesh_tensor_functions(mesh_shape: dict[str, int]) -> Dict[str, Callable]:
                 block_shape = info["block_shape"]
                 src = src[tuple(i * b for i, b in zip(src_coord, block_shape))]
             except KeyError as e:
-                raise ValueError(
-                    f"MeshTensor information for buffer {src} not found."
-                ) from e
+                raise ValueError(f"MeshTensor information for buffer {src} not found.") from e
 
         # If a destination coordinate is specified, compute its tile slice
         if dst_coord is not None:
@@ -166,9 +161,7 @@ def mesh_tensor_functions(mesh_shape: dict[str, int]) -> Dict[str, Callable]:
                 block_shape = info["block_shape"]
                 dst = dst[tuple(i * b for i, b in zip(dst_coord, block_shape))]
             except KeyError as e:
-                raise ValueError(
-                    f"MeshTensor information for buffer {dst} not found."
-                ) from e
+                raise ValueError(f"MeshTensor information for buffer {dst} not found.") from e
 
         # Delegate to TileLang's copy primitive
         return T.copy(src, dst)
