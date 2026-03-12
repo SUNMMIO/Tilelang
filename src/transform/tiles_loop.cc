@@ -138,7 +138,45 @@ private:
       return UpdateBody(loop, new_body);
     }
 
-    // ---- Structural match ----
+    auto tile_size_opt = GetTileSize(loop);
+    if (!tile_size_opt.defined()) {
+      return UpdateBody(loop, new_body);
+    }
+
+    Array<PrimExpr> tile_size = tile_size_opt.value();
+    ICHECK(tile_size.size() == 1 || tile_size.size() == 2)
+        << "TilesLoop expects 1D or 2D tile_size, got " << tile_size.size();
+
+    // ---- Record modified tile buffer (semantic grouping anchor) ----
+    auto buf_it = loop->annotations.find(attr::tiled_buffer);
+    ICHECK(buf_it != loop->annotations.end());
+    Var tiled_buf = Downcast<Var>((*buf_it).second);
+    modified_tile_buffers_.insert(tiled_buf);
+
+    if (tile_size.size() == 1) {
+      // ---- 1D lowering ----
+      // for ti  →  for ti { for ki (vectorized) { body[ti → ti*ts+ki] } }
+      if (!IsSerialFor(loop)) {
+        return UpdateBody(loop, new_body);
+      }
+
+      Var ti = loop->loop_var;
+      Var ki("ki");
+
+      Map<Var, PrimExpr> vmap;
+      vmap.Set(ti, ti * tile_size[0] + ki);
+
+      Stmt tiled_body = Substitute(new_body, vmap);
+      tiled_body = For(ki, 0, tile_size[0], ForKind::kVectorized, tiled_body);
+
+      For new_outer = ffi::GetRef<For>(loop);
+      new_outer.CopyOnWrite()->body = tiled_body;
+      return new_outer;
+    }
+
+    // ---- 2D lowering ----
+    // for ti { for tj }  →  for ti { for tj { for ki { for kj (vec) { ... } } }
+    // }
     const ForNode *inner = new_body.as<ForNode>();
     if (!inner) {
       return UpdateBody(loop, new_body);
@@ -152,15 +190,6 @@ private:
       return UpdateBody(loop, new_body);
     }
 
-    auto tile_size_opt = GetTileSize(loop);
-    if (!tile_size_opt.defined()) {
-      return UpdateBody(loop, new_body);
-    }
-
-    Array<PrimExpr> tile_size = tile_size_opt.value();
-    ICHECK_EQ(tile_size.size(), 2) << "TilesLoop expects exactly 2D tile_size";
-
-    // ---- Perform lowering ----
     Var ti = loop->loop_var;
     Var tj = inner->loop_var;
 
@@ -181,13 +210,6 @@ private:
 
     For new_outer = ffi::GetRef<For>(loop);
     new_outer.CopyOnWrite()->body = new_inner;
-
-    // ---- Record modified tile buffer (semantic grouping anchor) ----
-    auto buf_it = loop->annotations.find(attr::tiled_buffer);
-    ICHECK(buf_it != loop->annotations.end());
-    Var tiled_buf = Downcast<Var>((*buf_it).second);
-
-    modified_tile_buffers_.insert(tiled_buf);
 
     return new_outer;
   }

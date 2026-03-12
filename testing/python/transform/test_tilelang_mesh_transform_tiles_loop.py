@@ -224,3 +224,110 @@ def test_tiles_loop_insert_and_index_rewrite(prim_func_builder):
     assert any(contains_mul(e, tile_size[0]) for e in index_exprs), "Expected i * tile_size[0] in rewritten indices"
 
     assert any(contains_mul(e, tile_size[1]) for e in index_exprs), "Expected j * tile_size[1] in rewritten indices"
+
+
+# =========================================================
+# 1D test
+# =========================================================
+
+
+def dot_mul_tiled_parallel_1d(M, block_M, tile_size, index_map, dtype="float16"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((M,), dtype),
+        B: T.Tensor((M,), dtype),
+        C: T.Tensor((M,), dtype),
+    ):
+        with T.Kernel(T.ceildiv(M, block_M), threads=128) as (bx,):
+            A_shared = T.alloc_shared((block_M,), dtype)
+            B_shared = T.alloc_shared((block_M,), dtype)
+            C_shared = T.alloc_fragment((block_M,), dtype)
+
+            T.annotate_tileview(
+                {
+                    A_shared: make_tileview(A_shared, tile_size, index_map),
+                    B_shared: make_tileview(B_shared, tile_size, index_map),
+                    C_shared: make_tileview(C_shared, tile_size, index_map),
+                }
+            )
+
+            T.clear(C_shared)
+            T.copy(A[bx * block_M], A_shared)
+            T.copy(B[bx * block_M], B_shared)
+
+            for i in T.Tiles(A_shared, parallel=True):
+                C_shared[i] = A_shared[i] * B_shared[i]
+
+            T.copy(C_shared, C[bx * block_M])
+
+    return main
+
+
+def test_tiles_loop_1d():
+    """
+    TilesLoop pass contract test for 1D tile_size.
+
+    Verifies:
+    1) A single tile.execution loop is present
+    2) A vectorized(tile_size) loop is inserted inside it
+    3) Index is rewritten as: i * tile_size + ki
+    """
+    tile_size = (32,)
+
+    mod = IRModule.from_expr(
+        dot_mul_tiled_parallel_1d(
+            M=1024,
+            block_M=256,
+            tile_size=tile_size,
+            index_map=(-1,),
+        ).with_attr("global_symbol", "main")
+    )
+
+    mod = tl.transform.LegalizeTilesLoop()(mod)
+    mod = tl.transform.TilesLoop()(mod)
+
+    main_func = mod["main"]
+
+    # 1. Collect tile.execution loops
+    tile_exec_loops = []
+
+    def collect_tile_exec(stmt, tile_exec_loops=tile_exec_loops):
+        if isinstance(stmt, tir.For):
+            ann = stmt.annotations
+            if ann and ann.get("tile.execution", 0) == 1:
+                tile_exec_loops.append(stmt)
+
+    tvm.tir.stmt_functor.post_order_visit(main_func.body, collect_tile_exec)
+
+    assert len(tile_exec_loops) == 1, f"Expected 1 tile.execution loop, got {len(tile_exec_loops)}"
+
+    # 2. Vectorized(tile_size) loop is inside the execution loop
+    exec_loop = tile_exec_loops[0]
+    found_vectorized = []
+
+    def visit_subtree(stmt, found_vectorized=found_vectorized):
+        if (
+            isinstance(stmt, tir.For)
+            and stmt.kind == tir.ForKind.VECTORIZED
+            and isinstance(stmt.extent, tir.IntImm)
+            and stmt.extent.value == tile_size[0]
+        ):
+            found_vectorized.append(stmt)
+
+    tvm.tir.stmt_functor.post_order_visit(exec_loop.body, visit_subtree)
+    assert found_vectorized, "Expected vectorized(tile_size) loop inside tile.execution subtree"
+
+    # 3. Index rewrite: i * tile_size + ki
+    index_exprs = []
+
+    def collect_indices(stmt, index_exprs=index_exprs):
+        if isinstance(stmt, tir.BufferStore):
+            index_exprs.extend(stmt.indices)
+
+    tvm.tir.stmt_functor.post_order_visit(main_func.body, collect_indices)
+
+    def contains_mul(expr, factor):
+        s = str(expr)
+        return f"* {factor}" in s or f"*{factor}" in s
+
+    assert any(contains_mul(e, tile_size[0]) for e in index_exprs), "Expected i * tile_size in rewritten indices"
