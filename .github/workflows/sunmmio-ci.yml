@@ -128,8 +128,8 @@ jobs:
           ip link set "${IFACE}" mtu "${MTU}" || \
             echo "::warning::Failed to set MTU (may need --cap-add NET_ADMIN)"
 
-          # Ensure aggressive TCP MTU probing is active (2 = always probe)
-          echo 2 > /proc/sys/net/ipv4/tcp_mtu_probing
+          # tcp_mtu_probing=2 is already set via --sysctl in container options
+          # (/proc/sys is read-only inside the container)
 
           # Clamp TCP MSS to path MTU for all outgoing SYN packets
           iptables -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
