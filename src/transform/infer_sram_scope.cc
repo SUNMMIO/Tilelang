@@ -26,6 +26,7 @@
 #include "../tileview/tileview.h"
 #include "arith/ir_mutator_with_analyzer.h"
 #include "arith/ir_visitor_with_analyzer.h"
+#include "common/attr.h"
 #include "common/loop_fusion_utils.h"
 #include "common/remap_buffer_rewriter.h"
 #include "common/union_find.h"
@@ -150,6 +151,29 @@ private:
     }
 
     return block_realize;
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    auto loop = Downcast<For>(IRMutatorWithAnalyzer::VisitStmt_(op));
+    if (!replace_flag) {
+      return loop;
+    }
+
+    // Update tile.tiled_buffer annotation if the buffer var has been remapped
+    if (loop->annotations.count(attr::tiled_buffer)) {
+      Var old_buffer_var =
+          Downcast<Var>(loop->annotations.at(attr::tiled_buffer));
+      Var new_buffer_var = old_buffer_var;
+
+      if (var_remap_.count(old_buffer_var)) {
+        new_buffer_var = var_remap_[old_buffer_var];
+      }
+
+      if (!new_buffer_var.same_as(old_buffer_var)) {
+        loop.CopyOnWrite()->annotations.Set(attr::tiled_buffer, new_buffer_var);
+      }
+    }
+    return loop;
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
