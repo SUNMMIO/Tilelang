@@ -45,30 +45,6 @@
 namespace tvm {
 namespace tl {
 
-#define TIR_DEFINE_TL_BUILTIN(OpName)                                          \
-  const Op &OpName() {                                                         \
-    static const Op &op = Op::Get("tl." #OpName);                              \
-    return op;                                                                 \
-  }                                                                            \
-  TVM_REGISTER_OP("tl." #OpName)                                               \
-      .set_attr<TScriptPrinterName>("TScriptPrinterName", #OpName)
-TIR_DEFINE_TL_BUILTIN(barrier_init)
-    .set_num_inputs(-1)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(barrier_arrive_and_wait)
-    .set_num_inputs(1)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(sync_token_id)
-    .set_num_inputs(1)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(wait_token)
-    .set_num_inputs(1)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-
 using namespace tir;
 using namespace tir::transform;
 using arith::IRMutatorWithAnalyzer;

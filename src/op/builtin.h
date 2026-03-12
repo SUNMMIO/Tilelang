@@ -905,6 +905,56 @@ TVM_DLL const Op &stg128();
  */
 TVM_DLL const Op &stg256();
 
+/*!
+ * \brief Initialize a synchronization barrier.
+ *
+ * This intrinsic initializes a barrier used for cross-core synchronization.
+ * It is primarily used in the InjectSunmmioSync pass to manage data
+ * dependencies across different cores (e.g. read/write cores).
+ *
+ * Args:
+ *   barrier_id: The identifier of the barrier.
+ *   read_core: The core ID that reads data.
+ *   write_cores...: The core IDs that write data.
+ */
+TVM_DLL const Op &barrier_init();
+
+/*!
+ * \brief Arrive at a barrier and wait.
+ *
+ * This intrinsic blocks execution until the barrier is reached by all
+ * participants. It is used in conjunction with barrier_init to synchronize
+ * execution.
+ *
+ * Args:
+ *   barrier_id: The identifier of the barrier to wait on.
+ */
+TVM_DLL const Op &barrier_arrive_and_wait();
+
+/*!
+ * \brief Associate a token ID with a synchronization point.
+ *
+ * This intrinsic is used to tag an asynchronous operation (like DMA copy, MMA,
+ * or Broadcast) with a specific token ID. This token is later used by
+ * wait_token to ensure completion.
+ *
+ * Args:
+ *   token_id: The unique token identifier.
+ */
+TVM_DLL const Op &sync_token_id();
+
+/*!
+ * \brief Wait for a token to be signaled.
+ *
+ * This intrinsic blocks execution until the operation associated with the given
+ * token ID has completed. This is used to enforce Read-After-Write (RAW),
+ * Write-After-Read (WAR), and Write-After-Write (WAW) dependencies.
+ *
+ * Args:
+ *   token_id: The token identifier to wait for.
+ */
+TVM_DLL const Op &wait_token();
+
 } // namespace tl
 } // namespace tvm
 
