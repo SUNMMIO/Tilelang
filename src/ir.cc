@@ -101,6 +101,36 @@ ForFrame ParallelFor(const Array<PrimExpr> &extents,
   return ForFrame(n);
 }
 
+ForFrame TilesFor(const Array<PrimExpr> &extents,
+                  const Map<String, ObjectRef> &annotations) {
+  using namespace tvm::tir;
+  ObjectPtr<ForFrameNode> n = tvm::ffi::make_object<ForFrameNode>();
+  n->vars.reserve(extents.size());
+  n->doms.reserve(extents.size());
+  for (const auto &extent : extents) {
+    DataType dtype = extent.dtype();
+    n->vars.push_back(Var("v", dtype));
+    n->doms.push_back(Range(make_const(dtype, 0), extent));
+  }
+  n->f_make_for_loop =
+      [annotations](const Array<Var> &vars, const Array<Range> &doms,
+                    const Array<Optional<PrimExpr>> &steps, Stmt body) -> Stmt {
+    ICHECK_EQ(vars.size(), doms.size());
+    int n = vars.size();
+    for (int i = n - 1; i >= 0; --i) {
+      Range dom = doms[i];
+      Var var = vars[i];
+      Optional<PrimExpr> step =
+          i < steps.size() ? steps[i] : Optional<PrimExpr>(std::nullopt);
+      body = For(var, dom->min, dom->extent, ForKind::kSerial, body,
+                 /*thread_binding=*/std::nullopt, /*annotations=*/annotations,
+                 /*step=*/step);
+    }
+    return body;
+  };
+  return ForFrame(n);
+}
+
 ForFrame PipelinedFor(PrimExpr start, const PrimExpr &stop, int num_stages,
                       const Array<PrimExpr> &order,
                       const Array<PrimExpr> &stages,
@@ -330,6 +360,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
       .def("tl.Parallel", ParallelFor)
+      .def("tl.Tiles", TilesFor)
       .def("tl.Pipelined", PipelinedFor)
       .def("tl.Persistent", PersistentFor)
       .def("tl.KernelLaunch", KernelLaunch);
