@@ -48,7 +48,8 @@ public:
       IterVar iv = Downcast<IterVar>(op->node);
       // Only collect threadIdx bindings; blockIdx are grid-level and must not
       // be mistaken for intra-block thread parallelism.
-      if (std::string(iv->thread_tag).rfind("threadIdx", 0) == 0) {
+      if (std::string_view(iv->thread_tag.data(), iv->thread_tag.size())
+              .substr(0, 9) == "threadIdx") {
         thread_binding_[iv->var.get()] = iv;
       }
     }
