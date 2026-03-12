@@ -23,6 +23,7 @@ from .mesh_tensor import (  # noqa: F401
 )
 from .loop import (
     Parallel,  # noqa: F401
+    Tiles,  # noqa: F401
     Persistent,  # noqa: F401
     Pipelined,  # noqa: F401
     serial,  # noqa: F401
@@ -107,6 +108,8 @@ from .builtin import stg32 as stg32  # noqa: F401
 from .builtin import stg64 as stg64  # noqa: F401
 from .builtin import stg128 as stg128  # noqa: F401
 from .builtin import stg256 as stg256  # noqa: F401
+
+from . import comm  # noqa: F401
 
 from .utils import index_to_coordinates  # noqa: F401
 
