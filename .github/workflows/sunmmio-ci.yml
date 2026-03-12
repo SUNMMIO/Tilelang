@@ -70,7 +70,7 @@ jobs:
     timeout-minutes: 120
     container:
       image: nvidia/cuda:12.8.0-devel-ubuntu24.04
-      options: --gpus all --ipc=host --sysctl net.ipv4.tcp_mtu_probing=2
+      options: --gpus all --ipc=host --cap-add NET_ADMIN --sysctl net.ipv4.tcp_mtu_probing=2
       volumes:
         - /opt/ci-cache/sunmmio:/ci-cache
     env:
@@ -125,7 +125,8 @@ jobs:
           # router proxy/VPN/PPPoE encapsulation overhead
           MTU=1400
           echo "Setting ${IFACE} MTU to ${MTU}"
-          ip link set "${IFACE}" mtu "${MTU}"
+          ip link set "${IFACE}" mtu "${MTU}" || \
+            echo "::warning::Failed to set MTU (may need --cap-add NET_ADMIN)"
 
           # Ensure aggressive TCP MTU probing is active (2 = always probe)
           echo 2 > /proc/sys/net/ipv4/tcp_mtu_probing
