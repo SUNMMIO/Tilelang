@@ -109,6 +109,8 @@ from .builtin import stg64 as stg64  # noqa: F401
 from .builtin import stg128 as stg128  # noqa: F401
 from .builtin import stg256 as stg256  # noqa: F401
 
+from . import comm  # noqa: F401
+
 from .utils import index_to_coordinates  # noqa: F401
 
 from .symbolics import dynamic, symbolic  # noqa: F401
