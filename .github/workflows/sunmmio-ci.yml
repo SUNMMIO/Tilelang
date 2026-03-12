@@ -103,9 +103,17 @@ jobs:
             protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
 
-      - name: Install GoogleTest
+      - name: Install GoogleTest from source
         run: |
-          apt-get install -y --no-install-recommends libgtest-dev libgmock-dev
+          git clone https://github.com/google/googletest.git
+          cd googletest
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
+          cmake --build build -j$(nproc)
+          cmake --install build
+          cd ..
+          rm -rf googletest
 
       - name: Checkout repository
         uses: actions/checkout@v6
