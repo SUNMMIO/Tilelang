@@ -228,6 +228,19 @@ private:
 
     Var buffer_data = Downcast<Var>((*buf_it).second);
 
+    // ---- Reject nested T.Tiles from different buffers ----
+    // Nesting separate T.Tiles calls (e.g., T.Tiles(A) inside T.Tiles(B))
+    // is not supported.  Loops from a single T.Tiles call share the same
+    // tiled_buffer and nest naturally; only cross-buffer nesting is banned.
+    if (tile_loop_depth_ > 0 && active_tiled_buffer_.defined() &&
+        !buffer_data.same_as(active_tiled_buffer_)) {
+      LOG(FATAL) << "Nested T.Tiles from different buffers is not supported. "
+                 << "Outer T.Tiles uses buffer " << active_tiled_buffer_
+                 << ", but inner T.Tiles uses buffer " << buffer_data << ". "
+                 << "Access multiple buffers within a single T.Tiles scope "
+                 << "instead.";
+    }
+
     // ---- Local tileview map for this tile loop scope ----
     TileViewMap local_tileviews;
 
@@ -309,7 +322,10 @@ private:
 
     // Enter tile loop (depth == tile dimension)
     int dim = tile_loop_depth_++;
+    Var prev_active_buffer = active_tiled_buffer_;
+    active_tiled_buffer_ = buffer_data;
     Stmt new_body = VisitStmt(loop->body);
+    active_tiled_buffer_ = prev_active_buffer;
     tile_loop_depth_--;
 
     Array<PrimExpr> tiled_shape = tv->TiledBufferShape();
@@ -359,6 +375,8 @@ private:
   BufferDataMap buffer_data_to_buffer_;
   Map<Buffer, Layout> layout_map_;
   int tile_loop_depth_{0};
+  Var active_tiled_buffer_; // tracks the tiled_buffer of the innermost T.Tiles
+                            // scope
 };
 
 /* ============================================================

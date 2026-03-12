@@ -33,6 +33,15 @@ constexpr const char *tile_new_shape = "tile.buffer_new_shape";
 constexpr const char *tile_tile_size = "tile.tile_size";
 constexpr const char *tile_dim_map = "tile.dim_map";
 
+// ---- these attrs are added by the tiles_loop pass ----
+// Marks the outermost tile.execution loop — codegen entry point for a tile
+// scope
+constexpr const char *tile_scope_entry = "tile.scope_entry";
+// Marks generated inner loops (ki, kj) that iterate within a single tile
+constexpr const char *tile_interior = "tile.interior";
+// Which axis of the tile shape this interior loop corresponds to (0, 1, ...)
+constexpr const char *tile_interior_axis = "tile.interior_axis";
+
 } // namespace attr
 
 enum class TileLoopStage : int {
