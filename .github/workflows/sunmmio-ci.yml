@@ -70,7 +70,7 @@ jobs:
     timeout-minutes: 120
     container:
       image: nvidia/cuda:12.8.0-devel-ubuntu24.04
-      options: --gpus all --ipc=host
+      options: --gpus all --ipc=host --cap-add NET_ADMIN --sysctl net.ipv4.tcp_mtu_probing=2
       volumes:
         - /opt/ci-cache/sunmmio:/ci-cache
     env:
@@ -83,6 +83,7 @@ jobs:
       PIP_CACHE_DIR: /ci-cache/pip
       UV_CACHE_DIR: /ci-cache/uv
       PRE_COMMIT_HOME: /ci-cache/pre-commit
+      GTEST_CACHE_DIR: /ci-cache/googletest
     defaults:
       run:
         shell: bash
@@ -100,20 +101,57 @@ jobs:
             python3.12 python3.12-venv python3.12-dev python3-pip wget \
             clang-tidy cmake ninja-build git curl ca-certificates \
             build-essential pkg-config libprotobuf-dev \
-            protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev
+            protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev \
+            iproute2 iptables curl dnsutils
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
+
+      - name: Fix container networking
+        run: |
+          set -euo pipefail
+          echo "=== Pre-fix diagnostics ==="
+          echo "DNS:"
+          cat /etc/resolv.conf
+          echo "Routes:"
+          ip route
+          echo "Interfaces:"
+          ip -d link show
+
+          # Detect default interface
+          IFACE=$(ip route | awk '/default/{print $5; exit}')
+          CURRENT_MTU=$(cat /sys/class/net/${IFACE}/mtu)
+          echo "Default interface: ${IFACE}, current MTU: ${CURRENT_MTU}"
+
+          # Clamp MTU to 1400 to avoid PMTUD black holes caused by
+          # router proxy/VPN/PPPoE encapsulation overhead
+          MTU=1400
+          echo "Setting ${IFACE} MTU to ${MTU}"
+          ip link set "${IFACE}" mtu "${MTU}" || \
+            echo "::warning::Failed to set MTU (may need --cap-add NET_ADMIN)"
+
+          # tcp_mtu_probing=2 is already set via --sysctl in container options
+          # (/proc/sys is read-only inside the container)
+
+          # Clamp TCP MSS to path MTU for all outgoing SYN packets
+          iptables -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+            echo "::warning::iptables MSS clamping failed (may need NET_ADMIN capability)"
+
+          # Verify connectivity to critical hosts
+          echo "=== Post-fix connectivity test ==="
+          for host in github.com pypi.org download.pytorch.org; do
+            curl -sS --connect-timeout 15 --max-time 30 "https://${host}" > /dev/null \
+              && echo "${host}: OK" \
+              || echo "::warning::${host}: FAILED"
+          done
 
       - name: Install GoogleTest from source
         run: |
-          git clone https://github.com/google/googletest.git
-          cd googletest
+          cd "${GTEST_CACHE_DIR}"
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local
           cmake --build build -j$(nproc)
           cmake --install build
           cd ..
-          rm -rf googletest
 
       - name: Checkout repository
         uses: actions/checkout@v6
