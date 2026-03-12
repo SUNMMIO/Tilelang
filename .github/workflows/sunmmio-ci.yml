@@ -70,7 +70,7 @@ jobs:
     timeout-minutes: 120
     container:
       image: nvidia/cuda:12.8.0-devel-ubuntu24.04
-      options: --gpus all --ipc=host --sysctl net.ipv4.tcp_mtu_probing=1
+      options: --gpus all --ipc=host --sysctl net.ipv4.tcp_mtu_probing=2
       volumes:
         - /opt/ci-cache/sunmmio:/ci-cache
     env:
@@ -102,8 +102,45 @@ jobs:
             clang-tidy cmake ninja-build git curl ca-certificates \
             build-essential pkg-config libprotobuf-dev \
             protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev \
-            iproute2 curl dnsutils
+            iproute2 iptables curl dnsutils
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
+
+      - name: Fix container networking
+        run: |
+          set -euo pipefail
+          echo "=== Pre-fix diagnostics ==="
+          echo "DNS:"
+          cat /etc/resolv.conf
+          echo "Routes:"
+          ip route
+          echo "Interfaces:"
+          ip -d link show
+
+          # Detect default interface
+          IFACE=$(ip route | awk '/default/{print $5; exit}')
+          CURRENT_MTU=$(cat /sys/class/net/${IFACE}/mtu)
+          echo "Default interface: ${IFACE}, current MTU: ${CURRENT_MTU}"
+
+          # Clamp MTU to 1400 to avoid PMTUD black holes caused by
+          # router proxy/VPN/PPPoE encapsulation overhead
+          MTU=1400
+          echo "Setting ${IFACE} MTU to ${MTU}"
+          ip link set "${IFACE}" mtu "${MTU}"
+
+          # Ensure aggressive TCP MTU probing is active (2 = always probe)
+          echo 2 > /proc/sys/net/ipv4/tcp_mtu_probing
+
+          # Clamp TCP MSS to path MTU for all outgoing SYN packets
+          iptables -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+            echo "::warning::iptables MSS clamping failed (may need NET_ADMIN capability)"
+
+          # Verify connectivity to critical hosts
+          echo "=== Post-fix connectivity test ==="
+          for host in github.com pypi.org download.pytorch.org; do
+            curl -sS --connect-timeout 15 --max-time 30 "https://${host}" > /dev/null \
+              && echo "${host}: OK" \
+              || echo "::warning::${host}: FAILED"
+          done
 
       - name: Install GoogleTest from source
         run: |
