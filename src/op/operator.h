@@ -16,6 +16,7 @@
 #include <tvm/tir/stmt.h>
 
 #include "../layout/layout.h"
+#include "../tileview/tileview.h"
 
 namespace tvm {
 namespace tl {
@@ -24,6 +25,7 @@ using namespace tir;
 
 using AddWorkspaceCallback = std::function<PrimExpr(int, DataType)>;
 using LayoutMap = Map<Buffer, Layout>;
+using TileViewMap = Map<Var, TileView>;
 using BufferMap = Map<Var, Buffer>;
 
 enum class InferLevel : uint8_t {
@@ -57,6 +59,7 @@ struct LowerArgs {
   // fragment buffer accesses through let bindings
   Map<Var, PrimExpr> let_var_to_expr;
   LayoutMap global_layout_map;
+  TileViewMap tileview_map;
 };
 
 struct LayoutInferArgs {
