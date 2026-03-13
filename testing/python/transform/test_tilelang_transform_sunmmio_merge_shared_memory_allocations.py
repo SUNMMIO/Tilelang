@@ -15,9 +15,11 @@ from tilelang.utils.target import determine_target
 
 target = determine_target("Sunmmio", return_object=True)
 
-def show_module(mod,desc='module:'):
+
+def show_module(mod, desc="module:"):
     print(desc)
     print(mod.script())
+
 
 def _count_alloc_by_scope(body, scope):
     cnt = 0
@@ -164,6 +166,7 @@ def test_aggressive_reuse_diff():
 
 if __name__ == "__main__":
     import tilelang.testing
+
     tilelang.testing.main()
     # test_aggressive_reuse_diff()
     # test_merge_multi_scope_mixed_sizes()
