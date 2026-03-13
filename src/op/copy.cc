@@ -456,14 +456,14 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
     auto result = Map<Buffer, Layout>();
 
     if (level == InferLevel::kFree && !T.layout_map.count(src)) {
-      if (src.scope() != "global") {
+      if (src.scope() != "global" && src->shape.size() > 1) {
         auto layout = Downcast<Layout>((*f)(src));
         result.Set(src, layout);
       }
     }
 
     if (level == InferLevel::kFree && !T.layout_map.count(dst)) {
-      if (dst.scope() != "global") {
+      if (dst.scope() != "global" && dst->shape.size() > 1) {
         auto layout = Downcast<Layout>((*f)(dst));
         result.Set(dst, layout);
       }
