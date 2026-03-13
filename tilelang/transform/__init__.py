@@ -621,6 +621,4 @@ def MergeSharedMemoryAllocationsSunmmio(
     fpass : tvm.transform.Pass
         The result pass
     """
-    return _ffi_api.MergeSharedMemoryAllocationsSunmmio(
-        enable_aggressive_merge, asram_align_bytes, wsram_align_bytes, rsram_align_bytes
-    )  # type: ignore
+    return _ffi_api.MergeSharedMemoryAllocationsSunmmio(enable_aggressive_merge, asram_align_bytes, wsram_align_bytes, rsram_align_bytes)  # type: ignore
