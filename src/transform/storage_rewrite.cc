@@ -678,6 +678,8 @@ private:
   bool IsSpecialTaggedMemory(const StorageScope &scope) {
     return !scope.tag.empty() && scope.tag != ".dyn" &&
            scope.tag != ".barrier" && scope.tag != ".workspace" &&
+          //  new add scope
+           scope.tag != ".asram" && scope.tag != ".wsram" && scope.tag != ".rsram" &&
            scope.tag != ".vtcm" && scope.tag != ".var" &&
            scope.tag.find(".descriptor") != 0;
   }

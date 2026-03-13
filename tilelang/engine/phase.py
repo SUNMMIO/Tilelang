@@ -1,4 +1,5 @@
 from __future__ import annotations
+from tilelang.utils.target import target_is_sunmmio
 from tvm import tir, IRModule
 from tvm.target import Target
 import tilelang
@@ -276,7 +277,10 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # MergeSharedMemoryAllocations must be applied after SplitHostDevice
     # because the merged allocation site is at the beginning of each device function
     enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
-    mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
+    if target_is_sunmmio(target):
+        mod = tilelang.transform.MergeSharedMemoryAllocationsSunmmio(enable_aggressive_merge=enable_aggressive_merge)(mod)
+    else:
+        mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.InjectFenceProxy()(mod)
     else:
