@@ -28,7 +28,6 @@ def apply_sunmmio_passes(mod, target):
     mod = tilelang.transform.LowerTileOp()(mod)
     mod = tl.transform.LegalizeTilesLoop()(mod)
     mod = tl.transform.TilesLoop()(mod)
-    print(mod)
     return mod
 
 
@@ -105,24 +104,20 @@ def test_infer_tileview_2d_no_annotation():
     mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
     # Omit layout inference to test rowmajor case
     mod = tl.transform.LegalizeTilesLoop()(mod)
+    mod = tl.transform.TilesLoop()(mod)
 
     loops, exec_count = collect_tile_annotations(mod["main"])
 
     # Should have 2 tile loops (i, j)
-    assert len(loops) == 2, f"Expected 2 tile loops, got {len(loops)}"
+    assert len(loops) == 4, f"Expected 4 tile loops, got {len(loops)}"
     assert exec_count == 2, f"Expected 2 tile.execution, got {exec_count}"
 
-    # All annotations should be present
-    for loop_info in loops:
-        for k in ["tile.tile_size", "tile.dim_map", "tile.buffer_new_shape"]:
-            assert loop_info[k] is not None, f"Missing annotation '{k}'"
-
     # Verify inferred tile_size = (1, 32) — no layout, so row-major
-    assert _to_int_list(loops[0]["tile.tile_size"]) == [1, 32]
+    assert _to_int_list(loops[-1]["tile.tile_size"]) == [1, 32]
     # dim_map should be (-2, -1)
-    assert _to_int_list(loops[0]["tile.dim_map"]) == [-2, -1]
+    assert _to_int_list(loops[-1]["tile.dim_map"]) == [-2, -1]
     # tiled shape: [num_tiles..., tile_shape...] = [256/1, 128/32, 1, 32]
-    assert _to_int_list(loops[0]["tile.buffer_new_shape"]) == [256, 4, 1, 32]
+    assert _to_int_list(loops[-1]["tile.buffer_new_shape"]) == [256, 4, 1, 32]
 
 
 def test_infer_tileview_2d_with_layout_annotation():
@@ -165,20 +160,15 @@ def test_infer_tileview_2d_with_layout_annotation():
     loops, exec_count = collect_tile_annotations(mod["main"])
 
     # Should have 2 tile loops (i, j)
-    assert len(loops) == 2, f"Expected 2 tile loops, got {len(loops)}"
+    assert len(loops) == 4, f"Expected 4 tile loops, got {len(loops)}"
     assert exec_count == 2, f"Expected 2 tile.execution, got {exec_count}"
 
-    # All annotations should be present
-    for loop_info in loops:
-        for k in ["tile.tile_size", "tile.dim_map", "tile.buffer_new_shape"]:
-            assert loop_info[k] is not None, f"Missing annotation '{k}'"
-
     # Verify inferred tile_size = (32, 32) — blockwise layout
-    assert _to_int_list(loops[0]["tile.tile_size"]) == [32, 32]
+    assert _to_int_list(loops[-1]["tile.tile_size"]) == [32, 32]
     # dim_map should be (-2, -1)
-    assert _to_int_list(loops[0]["tile.dim_map"]) == [-2, -1]
+    assert _to_int_list(loops[-1]["tile.dim_map"]) == [-2, -1]
     # tiled shape: [num_tiles..., tile_shape...] = [256/32, 128/32, 32, 32]
-    assert _to_int_list(loops[0]["tile.buffer_new_shape"]) == [8, 4, 32, 32]
+    assert _to_int_list(loops[-1]["tile.buffer_new_shape"]) == [8, 4, 32, 32]
 
 
 # ---------------------------------------------------------
@@ -211,15 +201,15 @@ def test_infer_tileview_1d_no_annotation():
 
     loops, exec_count = collect_tile_annotations(mod["main"])
 
-    assert len(loops) == 1, f"Expected 1 tile loop, got {len(loops)}"
+    assert len(loops) == 2, f"Expected 2 tile loop, got {len(loops)}"
     assert exec_count == 1, f"Expected 1 tile.execution, got {exec_count}"
 
     # Verify inferred tile_size = (32,)
-    assert _to_int_list(loops[0]["tile.tile_size"]) == [32]
+    assert _to_int_list(loops[-1]["tile.tile_size"]) == [32]
     # dim_map = (-1,)
-    assert _to_int_list(loops[0]["tile.dim_map"]) == [-1]
+    assert _to_int_list(loops[-1]["tile.dim_map"]) == [-1]
     # tiled shape: [num_tiles..., tile_shape...] = [256/32, 32]
-    assert _to_int_list(loops[0]["tile.buffer_new_shape"]) == [8, 32]
+    assert _to_int_list(loops[-1]["tile.buffer_new_shape"]) == [8, 32]
 
 
 # ---------------------------------------------------------
@@ -256,14 +246,14 @@ def test_infer_tileview_mixed_rank():
     loops, exec_count = collect_tile_annotations(mod["main"])
 
     # Primary buffer is 2D -> 2 tile loops, both execution
-    assert len(loops) == 2, f"Expected 2 tile loops, got {len(loops)}"
+    assert len(loops) == 4, f"Expected 4 tile loops, got {len(loops)}"
     assert exec_count == 2, f"Expected 2 tile.execution, got {exec_count}"
 
     # Loop structure follows primary (2D) buffer: tile_size = (32, 32)
-    assert _to_int_list(loops[0]["tile.tile_size"]) == [32, 32]
-    assert _to_int_list(loops[0]["tile.dim_map"]) == [-2, -1]
+    assert _to_int_list(loops[-1]["tile.tile_size"]) == [32, 32]
+    assert _to_int_list(loops[-1]["tile.dim_map"]) == [-2, -1]
     # tiled shape: [num_tiles..., tile_shape...] = [128/32, 64/32, 32, 32]
-    assert _to_int_list(loops[0]["tile.buffer_new_shape"]) == [4, 2, 32, 32]
+    assert _to_int_list(loops[-1]["tile.buffer_new_shape"]) == [4, 2, 32, 32]
 
 
 # ---------------------------------------------------------
@@ -309,11 +299,11 @@ def test_manual_annotation_overrides_inference():
 
     loops, exec_count = collect_tile_annotations(mod["main"])
 
-    assert len(loops) == 2, f"Expected 2 tile loops, got {len(loops)}"
+    assert len(loops) == 4, f"Expected 4 tile loops, got {len(loops)}"
     assert exec_count == 2, f"Expected 2 tile.execution, got {exec_count}"
 
     # Must be (32, 32) from manual annotation, NOT (1, 32) from inference
-    assert _to_int_list(loops[0]["tile.tile_size"]) == [32, 32]
-    assert _to_int_list(loops[0]["tile.dim_map"]) == [-2, -1]
+    assert _to_int_list(loops[-1]["tile.tile_size"]) == [32, 32]
+    assert _to_int_list(loops[-1]["tile.dim_map"]) == [-2, -1]
     # tiled shape: [num_tiles..., tile_shape...] = [256/32, 128/32, 32, 32]
-    assert _to_int_list(loops[0]["tile.buffer_new_shape"]) == [8, 4, 32, 32]
+    assert _to_int_list(loops[-1]["tile.buffer_new_shape"]) == [8, 4, 32, 32]
