@@ -1,4 +1,5 @@
 """Wrapping Layouts."""
+
 # pylint: disable=invalid-name, unsupported-binary-operation
 from __future__ import annotations
 
@@ -75,6 +76,7 @@ class HierarchicalLayout:
     beneficial for data locality and performance on certain hardware
     architectures.
     """
+
     hdims: list[int]
     hstrides: list[int]
     groups: list[tuple[int]]
@@ -90,7 +92,7 @@ class HierarchicalLayout:
     def logical_shape(self) -> tuple[int]:
         shape = []
         for group in self.groups:
-            group_dims = self.hdims[group[0]:group[1]]
+            group_dims = self.hdims[group[0] : group[1]]
             shape.append(math.prod(group_dims))
         return tuple(shape)
 
@@ -153,12 +155,12 @@ class HierarchicalLayout:
             group_start, group_end = group
             group_len = group_end - group_start
 
-            h_indices_group = hierarchical_indices[h_idx_offset:h_idx_offset + group_len]
+            h_indices_group = hierarchical_indices[h_idx_offset : h_idx_offset + group_len]
             factors = self.hdims[group_start:group_end]
 
             logical_idx = 0
             if h_indices_group:
-                strides = [math.prod(factors[i + 1:]) for i in range(len(factors))]
+                strides = [math.prod(factors[i + 1 :]) for i in range(len(factors))]
                 for i, h_idx in enumerate(h_indices_group):
                     logical_idx += h_idx * strides[i]
 
@@ -168,7 +170,6 @@ class HierarchicalLayout:
         return logical_indices
 
     def __str__(self) -> str:
-
         def format_grouped_list(lst):
             parts = []
             for start, end in self.groups:
@@ -205,7 +206,7 @@ def make_hierarchical_layout(hdims: list[int], hstrides: list[int], groups: list
     # Convert Python lists/tuples from the hlayout_instance to TVM runtime Arrays for the C++ FFI call
     logical_shape = []
     for group in groups:
-        group_dims = hdims[group[0]:group[1]]
+        group_dims = hdims[group[0] : group[1]]
         logical_shape.append(math.prod(group_dims))
     hdims_arr = tvm.runtime.convert(hdims)
     hstrides_arr = tvm.runtime.convert(hstrides)
@@ -216,8 +217,7 @@ def make_hierarchical_layout(hdims: list[int], hstrides: list[int], groups: list
 
 
 @tvm_ffi.register_global_func("tl.layout.make_blockwise_zz_layout")
-def make_blockwise_zz_layout(buffer: Buffer | BufferLoad | BufferRegion | tuple[int, int],
-                             block_size: tuple[int, int] = (32, 32)):
+def make_blockwise_zz_layout(buffer: Buffer | BufferLoad | BufferRegion | tuple[int, int], block_size: tuple[int, int] = (32, 32)):
     """
     Args:
         args: buffer/BufferLoad/BufferRegion or (stride, continuous)
@@ -245,8 +245,7 @@ def make_blockwise_zz_layout(buffer: Buffer | BufferLoad | BufferRegion | tuple[
     nelements_per_block = row_bs * col_bs
     # Derive hdims, hstrides, and groups for blockwise ZZ layout
     # from stride and continuous
-    assert row % row_bs == 0 and column % col_bs == 0, \
-        "Row and column must be multiples of block sizes for blockwise ZZ layout."
+    assert row % row_bs == 0 and column % col_bs == 0, "Row and column must be multiples of block sizes for blockwise ZZ layout."
     hdims = [row // row_bs, row_bs, column // col_bs, col_bs]
     hstrides = [row_bs * col_bs * (column // col_bs), row_bs, nelements_per_block, 1]
     groups = [(0, 2), (2, 4)]

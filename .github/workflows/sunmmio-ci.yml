@@ -70,19 +70,20 @@ jobs:
     timeout-minutes: 120
     container:
       image: nvidia/cuda:12.8.0-devel-ubuntu24.04
-      options: --gpus all --ipc=host
+      options: --gpus all --ipc=host --cap-add NET_ADMIN --sysctl net.ipv4.tcp_mtu_probing=2
       volumes:
         - /opt/ci-cache/sunmmio:/ci-cache
     env:
       USE_CUDA: 1
       PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu128
       UV_INDEX: https://download.pytorch.org/whl/cu128
-      CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON -DTILELANG_UPDATE_SUBMODULES=OFF"
+      CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON -DTILELANG_UPDATE_SUBMODULES=OFF -DPython3_EXECUTABLE=.venv/bin/python -DPython_EXECUTABLE=.venv/bin/python"
       CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF"
       XDG_CACHE_HOME: /ci-cache
       PIP_CACHE_DIR: /ci-cache/pip
       UV_CACHE_DIR: /ci-cache/uv
       PRE_COMMIT_HOME: /ci-cache/pre-commit
+      GTEST_CACHE_DIR: /ci-cache/googletest
     defaults:
       run:
         shell: bash
@@ -100,20 +101,57 @@ jobs:
             python3.12 python3.12-venv python3.12-dev python3-pip wget \
             clang-tidy cmake ninja-build git curl ca-certificates \
             build-essential pkg-config libprotobuf-dev \
-            protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev
+            protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev \
+            iproute2 iptables curl dnsutils
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
+
+      - name: Fix container networking
+        run: |
+          set -euo pipefail
+          echo "=== Pre-fix diagnostics ==="
+          echo "DNS:"
+          cat /etc/resolv.conf
+          echo "Routes:"
+          ip route
+          echo "Interfaces:"
+          ip -d link show
+
+          # Detect default interface
+          IFACE=$(ip route | awk '/default/{print $5; exit}')
+          CURRENT_MTU=$(cat /sys/class/net/${IFACE}/mtu)
+          echo "Default interface: ${IFACE}, current MTU: ${CURRENT_MTU}"
+
+          # Clamp MTU to 1400 to avoid PMTUD black holes caused by
+          # router proxy/VPN/PPPoE encapsulation overhead
+          MTU=1400
+          echo "Setting ${IFACE} MTU to ${MTU}"
+          ip link set "${IFACE}" mtu "${MTU}" || \
+            echo "::warning::Failed to set MTU (may need --cap-add NET_ADMIN)"
+
+          # tcp_mtu_probing=2 is already set via --sysctl in container options
+          # (/proc/sys is read-only inside the container)
+
+          # Clamp TCP MSS to path MTU for all outgoing SYN packets
+          iptables -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+            echo "::warning::iptables MSS clamping failed (may need NET_ADMIN capability)"
+
+          # Verify connectivity to critical hosts
+          echo "=== Post-fix connectivity test ==="
+          for host in github.com pypi.org download.pytorch.org; do
+            curl -sS --connect-timeout 15 --max-time 30 "https://${host}" > /dev/null \
+              && echo "${host}: OK" \
+              || echo "::warning::${host}: FAILED"
+          done
 
       - name: Install GoogleTest from source
         run: |
-          git clone https://github.com/google/googletest.git
-          cd googletest
+          cd "${GTEST_CACHE_DIR}"
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=/usr/local
           cmake --build build -j$(nproc)
           cmake --install build
           cd ..
-          rm -rf googletest
 
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -145,21 +183,20 @@ jobs:
         run: |
           echo "\$ $(command -v clang-tidy) --version" && clang-tidy --version
 
-          if [[ -x "$(command -v run-clang-tidy)" ]]; then
-            echo "Using run-clang-tidy from $(command -v run-clang-tidy)"
-            CLANG_TIDY=(run-clang-tidy)
-          else
-            RCT_URL=https://raw.githubusercontent.com/llvm/llvm-project/refs/heads/release/21.x/clang-tools-extra/clang-tidy/tool/run-clang-tidy.py
-            echo "Downloading run-clang-tidy script from ${RCT_URL}"
-            echo "import urllib.request; url = '${RCT_URL}'.rstrip('/'); urllib.request.urlretrieve(url, url.split('/')[-1])" | uv run --no-project --script -
-            CLANG_TIDY=(uv run --no-project --script -- run-clang-tidy.py)
-          fi
+          # Download run-clang-tidy script
+          RCT_URL=https://raw.githubusercontent.com/llvm/llvm-project/refs/heads/release/21.x/clang-tools-extra/clang-tidy/tool/run-clang-tidy.py
+          echo "Downloading run-clang-tidy script from ${RCT_URL}"
+          echo "import urllib.request; url = '${RCT_URL}'.rstrip('/'); urllib.request.urlretrieve(url, url.split('/')[-1])" | uv run --no-project --script -
+          CLANG_TIDY=(uv run --no-project --script -- run-clang-tidy.py)
           if [[ -x "$(command -v clang-apply-replacements)" ]]; then
             echo "Using clang-apply-replacements from $(command -v clang-apply-replacements)"
             CLANG_TIDY+=(-fix -clang-apply-replacements-binary="$(command -v clang-apply-replacements)")
           else
             echo "::warning::clang-apply-replacements not found in PATH, automatic fixing disabled."
           fi
+
+          # Activate venv so CMake finds z3 and other Python packages
+          . .venv/bin/activate
 
           # Run cmake to create the build directory with compile_commands.json
           cmake -S . -B cmake-build --fresh ${CLANG_TIDY_CMAKE_OPTIONS}  # no quotes here
@@ -184,12 +221,14 @@ jobs:
       - name: Run Python test suite
         run: |
           . .venv/bin/activate
+          # Add the CUDA-aware pytest-xdist scheduler plugin to PYTHONPATH
+          export PYTHONPATH="${GITHUB_WORKSPACE}/maint/scripts:${PYTHONPATH}"
           cd testing
           PYTEST=(
             uv run --no-project -m --
             pytest --verbose --color=yes --durations=0 --showlocals --cache-clear
           )
-          "${PYTEST[@]}" --maxfail=3 --numprocesses=4 -c pytest.ini ./python
+          "${PYTEST[@]}" -c pytest.ini ./python
 
       - name: List generated files
         if: ${{ !cancelled() }}

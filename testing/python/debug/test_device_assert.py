@@ -1,5 +1,4 @@
 # type: ignore
-import torch
 import tilelang
 import tilelang.testing
 import tilelang.language as T

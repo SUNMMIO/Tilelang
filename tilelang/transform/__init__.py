@@ -295,6 +295,28 @@ def LegalizeVectorizedLoop():
     return _ffi_api.LegalizeVectorizedLoop()  # type: ignore
 
 
+def LegalizeTilesLoop():
+    """LegalizeTilesLoop
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LegalizeTilesLoop()  # type: ignore
+
+
+def TilesLoop():
+    """TilesLoop
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.TilesLoop()  # type: ignore
+
+
 def LegalizeSafeMemoryAccess():
     """LegalizeLoopVectorize
 

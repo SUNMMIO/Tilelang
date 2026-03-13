@@ -5,7 +5,7 @@
 #   -p SSH_PORT        SSH port (default: 2222)
 #   -ws WORKSPACE_DIR  Workspace directory (default: ~/workspace)
 #   -n CONTAINER_NAME  Container name (default: ccl-dev)
-# Example: ./docker_run.sh -p 2222 -ws /path/to/workspace -n jiaqi_tilelang_dev 
+# Example: ./docker_run.sh -p 2222 -ws /path/to/workspace -n jiaqi_tilelang_dev
 
 # Default values
 while [[ $# -gt 0 ]]; do

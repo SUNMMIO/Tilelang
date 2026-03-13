@@ -26,6 +26,7 @@
 #include "../tileview/tileview.h"
 #include "arith/ir_mutator_with_analyzer.h"
 #include "arith/ir_visitor_with_analyzer.h"
+#include "common/attr.h"
 #include "common/loop_fusion_utils.h"
 #include "common/remap_buffer_rewriter.h"
 #include "common/union_find.h"
@@ -146,10 +147,33 @@ private:
 
     if (!alloc_buffers.same_as(block->alloc_buffers)) {
       block.CopyOnWrite()->alloc_buffers = alloc_buffers;
-      block_realize.CopyOnWrite()->block = block;
     }
+    block_realize.CopyOnWrite()->block = block;
 
     return block_realize;
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    auto loop = Downcast<For>(IRMutatorWithAnalyzer::VisitStmt_(op));
+    if (!replace_flag) {
+      return loop;
+    }
+
+    // Update tile.tiled_buffer annotation if the buffer var has been remapped
+    if (loop->annotations.count(attr::tiled_buffer)) {
+      Var old_buffer_var =
+          Downcast<Var>(loop->annotations.at(attr::tiled_buffer));
+      Var new_buffer_var = old_buffer_var;
+
+      if (var_remap_.count(old_buffer_var)) {
+        new_buffer_var = var_remap_[old_buffer_var];
+      }
+
+      if (!new_buffer_var.same_as(old_buffer_var)) {
+        loop.CopyOnWrite()->annotations.Set(attr::tiled_buffer, new_buffer_var);
+      }
+    }
+    return loop;
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
@@ -174,13 +198,7 @@ private:
             } else {
               auto remap_buffer =
                   makeBufferWithScope(aRegion_->buffer, "shared.asram");
-              const auto *ptr_type =
-                  TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-              Type new_type =
-                  PointerType(ptr_type->element_type, "shared.asram");
-              Var new_var = Var(buffer->data->name_hint, new_type);
               buffer_remap_.Set(buffer, remap_buffer);
-              var_remap_.Set(buffer->data, new_var);
             }
           } else if (buffer.scope() != "shared.asram") {
             // incorrect specification
@@ -200,13 +218,7 @@ private:
             } else {
               auto remap_buffer =
                   makeBufferWithScope(bRegion_->buffer, "shared.wsram");
-              const auto *ptr_type =
-                  TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-              Type new_type =
-                  PointerType(ptr_type->element_type, "shared.wsram");
-              Var new_var = Var(buffer->data->name_hint, new_type);
               buffer_remap_.Set(buffer, remap_buffer);
-              var_remap_.Set(buffer->data, new_var);
             }
           } else if (buffer.scope() != "shared.wsram") {
             // incorrect specification
@@ -226,13 +238,7 @@ private:
             } else {
               auto remap_buffer =
                   makeBufferWithScope(cRegion_->buffer, "shared.rsram");
-              const auto *ptr_type =
-                  TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-              Type new_type =
-                  PointerType(ptr_type->element_type, "shared.rsram");
-              Var new_var = Var(buffer->data->name_hint, new_type);
               buffer_remap_.Set(buffer, remap_buffer);
-              var_remap_.Set(buffer->data, new_var);
             }
           } else if (buffer.scope() != "shared.rsram") {
             // incorrect specification

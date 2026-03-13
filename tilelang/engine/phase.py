@@ -158,7 +158,6 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
     mod = tir.transform.BindTarget(target)(mod)
-
     if should_force_let_inline():
         # Force-let inline whenever the pass config requests it.
         mod = tilelang.transform.LetInline()(mod)
@@ -183,6 +182,10 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     LayoutVisual(mod)
     # Lower high-level tile operations to low-level operations
     mod = tilelang.transform.LowerTileOp()(mod)
+    # read TileView metadata and attach them to Tiles loops.
+    mod = tilelang.transform.LegalizeTilesLoop()(mod)
+    # trans the tiles loop into two layers of loops, the inner one is a vectorized loop and the outer one is a Serial loop
+    mod = tilelang.transform.TilesLoop()(mod)
     # Lower l2 persistent map
     mod = tilelang.transform.LowerL2Persistent()(mod)
     # Decouple type cast vectorization constraints before vectorization
