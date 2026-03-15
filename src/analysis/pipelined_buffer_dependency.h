@@ -39,11 +39,11 @@ public:
 
 class BufferDependencyEdge : public ObjectRef {
 public:
-  TVM_DLL BufferDependencyEdge(String dep_kind, Integer distance, Buffer buffer,
-                               BufferRegion src_region,
-                               BufferRegion dst_region,
-                               Optional<Integer> src_effect_id = Optional<Integer>(),
-                               Optional<Integer> dst_effect_id = Optional<Integer>());
+  TVM_DLL
+  BufferDependencyEdge(String dep_kind, Integer distance, Buffer buffer,
+                       BufferRegion src_region, BufferRegion dst_region,
+                       Optional<Integer> src_effect_id = Optional<Integer>(),
+                       Optional<Integer> dst_effect_id = Optional<Integer>());
 
   TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(BufferDependencyEdge, ObjectRef,
                                              BufferDependencyEdgeNode);
@@ -110,12 +110,14 @@ public:
                                    Array<BufferDependencyEdge> edges,
                                    Array<BufferDependencyPattern> patterns);
 
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(BufferDependencyAnalysis, ObjectRef,
+  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(BufferDependencyAnalysis,
+                                             ObjectRef,
                                              BufferDependencyAnalysisNode);
 };
 
 namespace attr {
-constexpr const char *kBufferDependencyAnalysis = "tl_buffer_dependency_analysis";
+constexpr const char *kBufferDependencyAnalysis =
+    "tl_buffer_dependency_analysis";
 } // namespace attr
 
 namespace buffer_dependency {

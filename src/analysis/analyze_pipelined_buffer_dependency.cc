@@ -21,9 +21,9 @@
 #include <utility>
 #include <vector>
 
-#include "pipelined_buffer_dependency.h"
 #include "../op/builtin.h"
 #include "../op/utils.h"
+#include "pipelined_buffer_dependency.h"
 
 namespace tvm {
 namespace tl {
@@ -85,7 +85,8 @@ std::string CallOpName(const CallNode *op) {
 }
 
 CallEffectKind GetCallEffectKind(const CallNode *op) {
-  static auto op_call_effect = Op::GetAttrMap<TCallEffectKind>("TCallEffectKind");
+  static auto op_call_effect =
+      Op::GetAttrMap<TCallEffectKind>("TCallEffectKind");
   if (auto opt = op->op.as<Op>()) {
     return static_cast<CallEffectKind>(op_call_effect[opt.value()]->value);
   }
@@ -126,8 +127,7 @@ public:
       const Map<Var, PrimExpr> &let_bindings,
       bool record_unknown_stmt_calls = false)
       : buffer_data_to_buffer_(buffer_data_to_buffer),
-        loop_var_domains_(loop_var_domains),
-        let_bindings_(let_bindings),
+        loop_var_domains_(loop_var_domains), let_bindings_(let_bindings),
         record_unknown_stmt_calls_(record_unknown_stmt_calls) {}
 
   Array<BufferRegion> GetReads() const { return reads_; }
@@ -147,8 +147,8 @@ private:
   Range RelaxRange(const Range &range, const PrimExpr &shape) const {
     Range substituted = Range::FromMinExtent(SubstituteBindings(range->min),
                                              SubstituteBindings(range->extent));
-    arith::IntSet relaxed = arith::EvalSet(Array<Range>{substituted},
-                                           loop_var_domains_)[0];
+    arith::IntSet relaxed =
+        arith::EvalSet(Array<Range>{substituted}, loop_var_domains_)[0];
     return relaxed.CoverRange(Range::FromMinExtent(0, shape));
   }
 
@@ -216,11 +216,13 @@ private:
       VisitExpr(op->predicate.value());
     }
     VisitExpr(op->value);
-    AddWrite(BufferRegion(op->buffer, RelaxIndicesToRegion(op->buffer, op->indices)));
+    AddWrite(BufferRegion(op->buffer,
+                          RelaxIndicesToRegion(op->buffer, op->indices)));
   }
 
   void VisitExpr_(const BufferLoadNode *op) final {
-    AddRead(BufferRegion(op->buffer, RelaxIndicesToRegion(op->buffer, op->indices)));
+    AddRead(BufferRegion(op->buffer,
+                         RelaxIndicesToRegion(op->buffer, op->indices)));
   }
 
   void VisitExpr_(const CallNode *op) final {
@@ -234,7 +236,8 @@ private:
       ICHECK_GE(op->args.size(), 6U);
       AddRead(RelaxBufferRegion(NormalizeToBufferRegion(op->args[0])));
       AddRead(RelaxBufferRegion(NormalizeToBufferRegion(op->args[1])));
-      BufferRegion accum = RelaxBufferRegion(NormalizeToBufferRegion(op->args[2]));
+      BufferRegion accum =
+          RelaxBufferRegion(NormalizeToBufferRegion(op->args[2]));
       AddWrite(accum);
       arith::Analyzer analyzer;
       if (!analyzer.CanProveEqual(op->args[5], Bool(true))) {
@@ -251,7 +254,8 @@ private:
         auto it =
             buffer_data_to_buffer_.find(tvm::ffi::GetRef<Var>(buffer_var));
         if (it != buffer_data_to_buffer_.end()) {
-          BufferRegion full = RelaxBufferRegion(BufferRegion::FullRegion((*it).second));
+          BufferRegion full =
+              RelaxBufferRegion(BufferRegion::FullRegion((*it).second));
           int rw_mask = 1;
           if (const auto *mask_imm = op->args[4].as<IntImmNode>()) {
             rw_mask = static_cast<int>(mask_imm->value);
@@ -272,8 +276,8 @@ private:
     if (record_unknown_stmt_calls_) {
       CallEffectKind effect_kind = GetCallEffectKind(op);
       if (effect_kind > CallEffectKind::kReadState) {
-        AddUnknownEffect(String(CallOpName(op) + " effect=" +
-                                EffectKindToString(effect_kind)));
+        AddUnknownEffect(String(CallOpName(op) +
+                                " effect=" + EffectKindToString(effect_kind)));
       }
     }
     StmtExprVisitor::VisitExpr_(op);
@@ -373,11 +377,11 @@ private:
     return MayConflict(lhs->region, rhs->region);
   }
 
-  std::optional<StatementAccessInfo> CollectStatementAccess(const Stmt &stmt,
-                                                            int index,
-                                                            const AnalysisContext &ctx) const {
-    BufferAccessCollector collector(buffer_data_to_buffer_, ctx.loop_var_domains,
-                                    ctx.let_bindings,
+  std::optional<StatementAccessInfo>
+  CollectStatementAccess(const Stmt &stmt, int index,
+                         const AnalysisContext &ctx) const {
+    BufferAccessCollector collector(buffer_data_to_buffer_,
+                                    ctx.loop_var_domains, ctx.let_bindings,
                                     stmt.as<EvaluateNode>() != nullptr);
     collector(stmt);
     if (collector.GetReads().empty() && collector.GetWrites().empty() &&
@@ -402,9 +406,8 @@ private:
 
   bool SameRegionEquivalent(const BufferRegion &lhs,
                             const BufferRegion &rhs) const {
-    return SameRegion(lhs, rhs) ||
-           (lhs->buffer.same_as(rhs->buffer) &&
-            RegionToString(lhs) == RegionToString(rhs));
+    return SameRegion(lhs, rhs) || (lhs->buffer.same_as(rhs->buffer) &&
+                                    RegionToString(lhs) == RegionToString(rhs));
   }
 
   bool RangeContains(const Range &cover, const Range &target,
@@ -431,7 +434,8 @@ private:
     return true;
   }
 
-  void AddUniqueDef(std::vector<ReachingDef> *defs, const ReachingDef &def) const {
+  void AddUniqueDef(std::vector<ReachingDef> *defs,
+                    const ReachingDef &def) const {
     for (const ReachingDef &existing : *defs) {
       if (existing.stmt_index == def.stmt_index &&
           existing.distance == def.distance &&
@@ -557,7 +561,8 @@ private:
       os << " relation=covered";
       return os.str();
     }
-    if (pattern->kind == buffer_dependency::kPatternPartialOverwriteRemainderRead) {
+    if (pattern->kind ==
+        buffer_dependency::kPatternPartialOverwriteRemainderRead) {
       os << pattern->buffer->name << ": carried_d=1";
       if (pattern->effect_ids.size() >= 1) {
         os << " writer_op=" << pattern->effect_ids[0]->value;
@@ -633,13 +638,11 @@ private:
     }
   }
 
-  void KillOverlappingDefs(std::vector<ReachingDef> *defs,
-                           const BufferRegion &write_region,
-                           arith::Analyzer *analyzer,
-                           AnalysisSummary *summary = nullptr,
-                           int overwrite_op = -1,
-                           std::vector<PendingPartialOverwrite> *pending_hazards =
-                               nullptr) const {
+  void KillOverlappingDefs(
+      std::vector<ReachingDef> *defs, const BufferRegion &write_region,
+      arith::Analyzer *analyzer, AnalysisSummary *summary = nullptr,
+      int overwrite_op = -1,
+      std::vector<PendingPartialOverwrite> *pending_hazards = nullptr) const {
     std::vector<ReachingDef> kept;
     kept.reserve(defs->size());
     for (const ReachingDef &def : *defs) {
@@ -647,7 +650,8 @@ private:
         kept.push_back(def);
         continue;
       }
-      if (summary != nullptr && pending_hazards != nullptr && def.distance > 0) {
+      if (summary != nullptr && pending_hazards != nullptr &&
+          def.distance > 0) {
         // `covered_rewrite` means the current write fully contains the
         // loop-carried reaching definition from the previous iteration.
         //
@@ -666,8 +670,7 @@ private:
           AddUniquePattern(
               summary,
               MakePattern(String(buffer_dependency::kPatternCoveredRewrite),
-                          write_region->buffer,
-                          {def.region, write_region},
+                          write_region->buffer, {def.region, write_region},
                           {Integer(def.stmt_index), Integer(overwrite_op)}));
         } else if (!SameRegionEquivalent(def.region, write_region)) {
           pending_hazards->push_back(
@@ -678,12 +681,10 @@ private:
     *defs = std::move(kept);
   }
 
-  void ApplyStatementWrites(std::vector<ReachingDef> *defs,
-                            const StatementAccessInfo &info,
-                            arith::Analyzer *analyzer,
-                            AnalysisSummary *summary = nullptr,
-                            std::vector<PendingPartialOverwrite> *pending_hazards =
-                                nullptr) const {
+  void ApplyStatementWrites(
+      std::vector<ReachingDef> *defs, const StatementAccessInfo &info,
+      arith::Analyzer *analyzer, AnalysisSummary *summary = nullptr,
+      std::vector<PendingPartialOverwrite> *pending_hazards = nullptr) const {
     for (const BufferRegion &write_region : info.writes) {
       KillOverlappingDefs(defs, write_region, analyzer, summary, info.index,
                           pending_hazards);
@@ -726,10 +727,11 @@ private:
     ProcessAccessInfo(info, defs, summary, analyzer, pending_hazards);
   }
 
-  std::optional<StatementAccessInfo> CollectExpressionAccess(
-      const PrimExpr &expr, int index, const AnalysisContext &ctx) const {
-    BufferAccessCollector collector(buffer_data_to_buffer_, ctx.loop_var_domains,
-                                    ctx.let_bindings);
+  std::optional<StatementAccessInfo>
+  CollectExpressionAccess(const PrimExpr &expr, int index,
+                          const AnalysisContext &ctx) const {
+    BufferAccessCollector collector(buffer_data_to_buffer_,
+                                    ctx.loop_var_domains, ctx.let_bindings);
     collector(expr);
     if (collector.GetReads().empty() && collector.GetWrites().empty() &&
         collector.GetUnknownEffects().empty()) {
@@ -774,11 +776,11 @@ private:
     }
   }
 
-  void ProcessAccessInfo(const StatementAccessInfo &info,
-                         std::vector<ReachingDef> *defs,
-                         AnalysisSummary *summary,
-                         arith::Analyzer *analyzer,
-                         std::vector<PendingPartialOverwrite> *pending_hazards) {
+  void
+  ProcessAccessInfo(const StatementAccessInfo &info,
+                    std::vector<ReachingDef> *defs, AnalysisSummary *summary,
+                    arith::Analyzer *analyzer,
+                    std::vector<PendingPartialOverwrite> *pending_hazards) {
     if (summary != nullptr) {
       for (const UnknownEffectInfo &unknown_effect : info.unknown_effects) {
         AddUniquePattern(
@@ -853,8 +855,8 @@ private:
     if (const auto *block = stmt.as<BlockNode>()) {
       WithScopedBuffers(CollectScopedBuffers(block), [&]() {
         if (block->init) {
-          AnalyzeStmt(block->init.value(), defs, effect_index, summary, analyzer,
-                      pending_hazards, ctx);
+          AnalyzeStmt(block->init.value(), defs, effect_index, summary,
+                      analyzer, pending_hazards, ctx);
         }
         AnalyzeStmt(block->body, defs, effect_index, summary, analyzer,
                     pending_hazards, ctx);
@@ -927,10 +929,9 @@ private:
         ProcessLeafExpr(for_node->step.value(), defs, effect_index, summary,
                         analyzer, pending_hazards, *ctx);
       }
-      ctx->loop_var_domains.Set(
-          for_node->loop_var,
-          arith::IntSet::FromRange(
-              Range::FromMinExtent(for_node->min, for_node->extent)));
+      ctx->loop_var_domains.Set(for_node->loop_var,
+                                arith::IntSet::FromRange(Range::FromMinExtent(
+                                    for_node->min, for_node->extent)));
       AnalyzeStmt(for_node->body, defs, effect_index, summary, analyzer,
                   pending_hazards, ctx);
       ctx->loop_var_domains.erase(for_node->loop_var);
@@ -975,8 +976,7 @@ private:
                     pending_hazards, *ctx);
   }
 
-  std::vector<ReachingDef>
-  ComputeLoopExitDefs(const Stmt &pipeline_body_root) {
+  std::vector<ReachingDef> ComputeLoopExitDefs(const Stmt &pipeline_body_root) {
     std::vector<ReachingDef> defs;
     arith::Analyzer analyzer;
     int effect_index = 0;
@@ -1029,10 +1029,9 @@ private:
     header_defs.reserve(exit_defs.size());
     arith::Analyzer analyzer;
     for (const ReachingDef &def : exit_defs) {
-      AddUniqueDef(&header_defs,
-                   ReachingDef{def.stmt_index,
-                               1,
-                               ShiftRegion(def.region, loop_var, -1, &analyzer)});
+      AddUniqueDef(&header_defs, ReachingDef{def.stmt_index, 1,
+                                             ShiftRegion(def.region, loop_var,
+                                                         -1, &analyzer)});
     }
     return header_defs;
   }
@@ -1051,10 +1050,10 @@ private:
     return edges;
   }
 
-  Array<BufferRegion> BuildChannelRegions(
-      const std::vector<BufferRegion> &write_regions,
-      const std::vector<BufferRegion> &state_regions,
-      arith::Analyzer *analyzer) const {
+  Array<BufferRegion>
+  BuildChannelRegions(const std::vector<BufferRegion> &write_regions,
+                      const std::vector<BufferRegion> &state_regions,
+                      arith::Analyzer *analyzer) const {
     Array<BufferRegion> channel_regions;
     for (const BufferRegion &write_region : write_regions) {
       bool is_state = false;
@@ -1072,8 +1071,9 @@ private:
     return channel_regions;
   }
 
-  BufferDependencyAnalysis BuildAnalysisResult(
-      const AnalysisSummary &summary, arith::Analyzer *analyzer) const {
+  BufferDependencyAnalysis
+  BuildAnalysisResult(const AnalysisSummary &summary,
+                      arith::Analyzer *analyzer) const {
     Array<BufferDependencyInfo> infos;
     for (const auto &[buffer_node, buffer] : summary.written_internal_buffers) {
       Array<BufferRegion> state_regions;
@@ -1094,9 +1094,8 @@ private:
         channel_regions =
             BuildChannelRegions(it->second, buffer_state_regions, analyzer);
       }
-      infos.push_back(
-          BufferDependencyInfo(buffer, std::move(state_regions),
-                               std::move(channel_regions)));
+      infos.push_back(BufferDependencyInfo(buffer, std::move(state_regions),
+                                           std::move(channel_regions)));
     }
 
     Array<BufferDependencyEdge> edges;
@@ -1111,7 +1110,8 @@ private:
                                     std::move(patterns));
   }
 
-  Array<PrimExpr> DebugStateBuffers(const BufferDependencyAnalysis &analysis) const {
+  Array<PrimExpr>
+  DebugStateBuffers(const BufferDependencyAnalysis &analysis) const {
     std::set<std::string> buffers;
     for (const BufferDependencyInfo &info : analysis->buffers) {
       if (!info->state_regions.empty()) {
@@ -1121,7 +1121,8 @@ private:
     return ToStringImmArray(buffers);
   }
 
-  Array<PrimExpr> DebugChannelBuffers(const BufferDependencyAnalysis &analysis) const {
+  Array<PrimExpr>
+  DebugChannelBuffers(const BufferDependencyAnalysis &analysis) const {
     std::set<std::string> buffers;
     for (const BufferDependencyInfo &info : analysis->buffers) {
       if (info->state_regions.empty() && !info->channel_regions.empty()) {
@@ -1181,9 +1182,8 @@ private:
       }
     }
 
-    std::vector<ReachingDef> current_defs =
-        BuildLoopHeaderDefs(ComputeLoopExitDefs(pipeline_body_root),
-                            op->loop_var);
+    std::vector<ReachingDef> current_defs = BuildLoopHeaderDefs(
+        ComputeLoopExitDefs(pipeline_body_root), op->loop_var);
     arith::Analyzer analyzer;
     int effect_index = 0;
     std::vector<PendingPartialOverwrite> pending_hazards;
@@ -1191,8 +1191,7 @@ private:
     AnalyzeStmt(pipeline_body_root, &current_defs, &effect_index, &summary,
                 &analyzer, &pending_hazards, &ctx);
     FinalizePatterns(&summary, &analyzer);
-    BufferDependencyAnalysis analysis =
-        BuildAnalysisResult(summary, &analyzer);
+    BufferDependencyAnalysis analysis = BuildAnalysisResult(summary, &analyzer);
 
     Map<String, Any> annotations;
     for (const auto &[key, value] : op->annotations) {
@@ -1205,8 +1204,8 @@ private:
     annotations.Set(kInterRawEdgesAttr, DebugEdges(analysis, 1));
     annotations.Set(
         kMixedRoleBuffersAttr,
-        DebugPatternBuffers(analysis,
-                            String(buffer_dependency::kPatternMixedRoleRegions)));
+        DebugPatternBuffers(
+            analysis, String(buffer_dependency::kPatternMixedRoleRegions)));
     annotations.Set(
         kMixedRoleDetailsAttr,
         DebugPatternDetails(
@@ -1278,7 +1277,8 @@ tvm::transform::Pass AnalyzePipelinedBufferDependency() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     return AnalyzePipelinedBufferDependencyRewriter::Run(std::move(f));
   };
-  return CreatePrimFuncPass(pass_func, 0, "tl.AnalyzePipelinedBufferDependency", {});
+  return CreatePrimFuncPass(pass_func, 0, "tl.AnalyzePipelinedBufferDependency",
+                            {});
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

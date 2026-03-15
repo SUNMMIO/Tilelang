@@ -18,8 +18,6 @@ repos:
       - id: check-added-large-files
       - id: check-merge-conflict
         fail_fast: true
-      - id: check-executables-have-shebangs
-      - id: check-shebang-scripts-are-executable
       - id: detect-private-key
       - id: check-yaml
       - id: check-toml

@@ -40,9 +40,9 @@ BufferDependencyPattern::BufferDependencyPattern(String kind, Buffer buffer,
   data_ = std::move(node);
 }
 
-BufferDependencyInfo::BufferDependencyInfo(Buffer buffer,
-                                           Array<BufferRegion> state_regions,
-                                           Array<BufferRegion> channel_regions) {
+BufferDependencyInfo::BufferDependencyInfo(
+    Buffer buffer, Array<BufferRegion> state_regions,
+    Array<BufferRegion> channel_regions) {
   auto node = tvm::ffi::make_object<BufferDependencyInfoNode>();
   node->buffer = std::move(buffer);
   node->state_regions = std::move(state_regions);

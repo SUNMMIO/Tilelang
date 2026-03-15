@@ -84,9 +84,7 @@ def flashattn(batch, heads, seq_len, dim, groups, block_M, block_N, num_stages):
             for i in T.Tiles(scores_max):
                 scores_max[i] = -T.infinity(accum_dtype)
 
-            loop_range = (
-                T.min(T.ceildiv(seq_len, block_N), T.ceildiv((bx + 1) * block_M, block_N))
-            )
+            loop_range = T.min(T.ceildiv(seq_len, block_N), T.ceildiv((bx + 1) * block_M, block_N))
             for k in T.Pipelined(loop_range, num_stages=num_stages):
                 T.copy(K[bz, k * block_N : (k + 1) * block_N, by // groups, :], K_shared)
                 for i, j in T.Tiles(acc_s):
@@ -439,6 +437,7 @@ def test_conditional_branch_sequence_analysis():
     assert any("state" in edge for edge in inter_raw_edges)
     assert not any("tmp" in edge for edge in inter_raw_edges)
 
+
 def test_partial_overwrite_full_region_detection():
     target = SUNMMIO_TARGET_DESC
     mod = IRModule.from_expr(partial_overwrite_full_region())
@@ -456,6 +455,7 @@ def test_partial_overwrite_full_region_detection():
         assert "carry" in channel_buffers
         assert not any("carry" in detail for detail in covered_rewrites)
         assert any("carry" in detail for detail in partial_overwrite_hazards)
+
 
 def test_mixed_region_roles_detection():
     mod = IRModule.from_expr(mixed_region_roles)
@@ -503,22 +503,12 @@ def test_downstream_structured_analysis_example():
         }
         for info in analysis.buffers
     }
-    loop_carried_buffers = {
-        edge.buffer.name
-        for edge in analysis.edges
-        if edge.dep_kind == "RAW" and int(edge.distance) > 0
-    }
+    loop_carried_buffers = {edge.buffer.name for edge in analysis.edges if edge.dep_kind == "RAW" and int(edge.distance) > 0}
     special_handling_buffers = {
-        pattern.buffer.name
-        for pattern in analysis.patterns
-        if pattern.kind in {"mixed_role_regions", "partial_overwrite_remainder_read"}
+        pattern.buffer.name for pattern in analysis.patterns if pattern.kind in {"mixed_role_regions", "partial_overwrite_remainder_read"}
     }
     plain_state_buffers = loop_carried_buffers - special_handling_buffers
-    plain_channel_buffers = {
-        name
-        for name, roles in buffer_roles.items()
-        if roles["channel"] and name not in special_handling_buffers
-    }
+    plain_channel_buffers = {name for name, roles in buffer_roles.items() if roles["channel"] and name not in special_handling_buffers}
 
     assert buffer_roles["mix"]["state"] == ["mix[1]"]
     assert buffer_roles["mix"]["channel"] == ["mix[0]"]
@@ -554,7 +544,4 @@ def test_unknown_opaque_effect_detection():
 
     assert any("tir.call_extern:mystery_runtime" in detail for detail in unknown_effects)
     assert any(pattern.kind == "unknown_effect" for pattern in analysis.patterns)
-    assert any(
-        pattern.kind == "unknown_effect" and "tir.call_extern:mystery_runtime" in pattern.detail
-        for pattern in analysis.patterns
-    )
+    assert any(pattern.kind == "unknown_effect" and "tir.call_extern:mystery_runtime" in pattern.detail for pattern in analysis.patterns)
