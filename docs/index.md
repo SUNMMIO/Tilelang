@@ -57,6 +57,7 @@ deeplearning_operators/deepseek_mla
 compiler_internals/letstmt_inline
 compiler_internals/inject_fence_proxy
 compiler_internals/tensor_checks
+compiler_internals/pipelined_buffer_dependency
 :::
 
 :::{toctree}

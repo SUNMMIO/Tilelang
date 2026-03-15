@@ -167,6 +167,7 @@ set(TILE_LANG_INCLUDES ${TVM_INCLUDES})
 # Collect source files
 file(GLOB TILE_LANG_SRCS
   src/*.cc
+  src/analysis/*.cc
   src/layout/*.cc
   src/tileview/*.cc
   src/transform/*.cc
