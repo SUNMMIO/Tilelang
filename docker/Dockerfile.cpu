@@ -1,0 +1,103 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+
+# RUN sed -i 's/archive.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list
+# RUN sed -i 's/security.ubuntu.com/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list
+
+# RUN apt-get update \
+#   && apt-get install -y --no-install-recommends \
+#   python3.12 python3.12-venv python3.12-dev python3-pip wget \
+#   clang-tidy cmake ninja-build git curl ca-certificates \
+#   build-essential pkg-config libprotobuf-dev \
+#   protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev \
+#   iproute2 iptables curl dnsutils \
+#   && \
+#   ln -sf /usr/bin/python3.12 /usr/local/bin/python && \
+#   apt-get clean autoclean && \
+#   rm -rf /var/lib/apt/lists/*
+
+RUN set -eux; \
+    . /etc/os-release; \
+    printf '%s\n' \
+      "Types: deb" \
+      "URIs: http://mirrors.tuna.tsinghua.edu.cn/ubuntu" \
+      "Suites: ${VERSION_CODENAME} ${VERSION_CODENAME}-updates ${VERSION_CODENAME}-backports" \
+      "Components: main restricted universe multiverse" \
+      "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg" \
+      "" \
+      "Types: deb" \
+      "URIs: http://mirrors.tuna.tsinghua.edu.cn/ubuntu" \
+      "Suites: ${VERSION_CODENAME}-security" \
+      "Components: main restricted universe multiverse" \
+      "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg" \
+      > /etc/apt/sources.list.d/ubuntu.sources; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates; \
+    update-ca-certificates
+
+RUN set -eux; \
+    sed -i 's|http://mirrors.tuna.tsinghua.edu.cn|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/ubuntu.sources; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      python3.12 python3.12-venv python3.12-dev python3-pip wget \
+      clang-tidy cmake ninja-build git curl \
+      build-essential pkg-config libprotobuf-dev \
+      protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev \
+      iproute2 iptables dnsutils openssh-server; \
+    ln -sf /usr/bin/python3.12 /usr/local/bin/python; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Google Test
+RUN git clone https://github.com/google/googletest.git /usr/local/src/googletest && \
+  cd /usr/local/src/googletest && \
+  cmake -S . -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local && \
+  cmake --build build -j$(nproc) && \
+  cmake --install build && \
+  cd .. && \
+  rm -rf /usr/local/src/googletest
+
+# uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+COPY requirements*.txt /workspace/
+
+# Python environment
+RUN uv venv .venv --python /usr/bin/python3.12 \
+  && uv pip install --python .venv/bin/python -v --upgrade pip setuptools wheel \
+  && uv pip install --python .venv/bin/python -v -r /workspace/requirements-test.txt \
+  && uv pip install --python .venv/bin/python -v -r /workspace/requirements-lint.txt \
+  && uv pip install --python .venv/bin/python -v -r /workspace/requirements-dev.txt \
+  && echo "import torch; print(f'torch: {torch.__version__}')" | uv run --no-project --script - \
+  && uv run --no-project -m -- torch.utils.collect_env
+
+RUN echo "LC_ALL=en_US.UTF-8" >> /etc/environment
+
+# Configure SSH
+RUN apt install -y openssh-server
+RUN mkdir -p /var/run/sshd && \
+  echo 'root:sunlune' | chpasswd && \
+  sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+  sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+  sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config && \
+  mkdir -p /root/.ssh && chmod 700 /root/.ssh
+
+# Expose SSH port
+EXPOSE 22
+
+# install claude code
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash && \
+  . "$HOME/.nvm/nvm.sh" && \
+  nvm install 22 && \
+  node -v && nvm current && npm -v && \
+  npm install -g @openai/codex && \
+  curl -fsSL https://claude.ai/install.sh | bash
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]

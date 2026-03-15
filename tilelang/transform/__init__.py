@@ -38,6 +38,17 @@ def PipelinePlanning():
     return _ffi_api.PipelinePlanning()  # type: ignore
 
 
+def AnalyzePipelinedBufferDependency():
+    """Analyze intra-iteration and inter-iteration RAW dependencies in pipelined loops.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.AnalyzePipelinedBufferDependency()  # type: ignore
+
+
 def LayoutInference():
     """LayoutInference
 
