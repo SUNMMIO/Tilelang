@@ -497,7 +497,7 @@ private:
     for (const Integer &effect_id : pattern->effect_ids) {
       os << "|" << effect_id->value;
     }
-    if (pattern->detail.size() != 0) {
+    if (!pattern->detail.empty()) {
       os << "|" << pattern->detail;
     }
     if (summary->pattern_keys.insert(os.str()).second) {
@@ -538,7 +538,7 @@ private:
   std::string FormatPattern(const BufferDependencyPattern &pattern) const {
     std::ostringstream os;
     if (pattern->kind == buffer_dependency::kPatternUnknownEffect) {
-      if (pattern->effect_ids.size() >= 1) {
+      if (!pattern->effect_ids.empty()) {
         os << "op_id=" << pattern->effect_ids[0]->value << " ";
       }
       os << pattern->detail;
@@ -546,13 +546,13 @@ private:
     }
     if (pattern->kind == buffer_dependency::kPatternCoveredRewrite) {
       os << pattern->buffer->name << ": carried_d=1";
-      if (pattern->effect_ids.size() >= 1) {
+      if (!pattern->effect_ids.empty()) {
         os << " writer_op=" << pattern->effect_ids[0]->value;
       }
       if (pattern->effect_ids.size() >= 2) {
         os << " overwrite_op=" << pattern->effect_ids[1]->value;
       }
-      if (pattern->regions.size() >= 1) {
+      if (!pattern->regions.empty()) {
         os << " carried=" << RegionToString(pattern->regions[0]);
       }
       if (pattern->regions.size() >= 2) {
@@ -564,7 +564,7 @@ private:
     if (pattern->kind ==
         buffer_dependency::kPatternPartialOverwriteRemainderRead) {
       os << pattern->buffer->name << ": carried_d=1";
-      if (pattern->effect_ids.size() >= 1) {
+      if (!pattern->effect_ids.empty()) {
         os << " writer_op=" << pattern->effect_ids[0]->value;
       }
       if (pattern->effect_ids.size() >= 2) {
@@ -573,7 +573,7 @@ private:
       if (pattern->effect_ids.size() >= 3) {
         os << " read_op=" << pattern->effect_ids[2]->value;
       }
-      if (pattern->regions.size() >= 1) {
+      if (!pattern->regions.empty()) {
         os << " carried=" << RegionToString(pattern->regions[0]);
       }
       if (pattern->regions.size() >= 2) {
@@ -586,7 +586,7 @@ private:
     }
     if (pattern->kind == buffer_dependency::kPatternMixedRoleRegions) {
       os << pattern->buffer->name;
-      if (pattern->regions.size() >= 1) {
+      if (!pattern->regions.empty()) {
         os << ": state_region=" << RegionToString(pattern->regions[0]);
       }
       if (pattern->regions.size() >= 2) {
