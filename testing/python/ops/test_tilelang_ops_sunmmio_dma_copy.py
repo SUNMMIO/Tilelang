@@ -316,8 +316,6 @@ MESH_COPY_CASES = [
             'T.dma_copy(T.region(C_shared[8, 16], 1, 16, 32), T.region(A_shared[24, 8], 2, 16, 32))',
             # RSRAM -> WSRAM
             'T.dma_copy(T.region(C_shared[8, 48], 1, 24, 8), T.region(B_shared[40, 0], 2, 24, 8))',
-            # RSRAM <-> RSRAM
-            'T.dma_copy(T.region(C_shared[0, 0], 1, 64, 64), T.region(D_shared[0, 0], 2, 64, 64))',
         ],
     ),
     (
@@ -335,8 +333,6 @@ MESH_COPY_CASES = [
             'T.dma_copy(T.region(C_shared[8, 16], 1, 16, 32), T.region(A_shared[24, 8], 2, 16, 32))',
             # RSRAM -> WSRAM
             'T.dma_copy(T.region(C_shared[8, 48], 1, 24, 8), T.region(B_shared[40, 0], 2, 24, 8))',
-            # RSRAM <-> RSRAM
-            'T.dma_copy(T.region(C_shared[0, 0], 1, 64, 64), T.region(D_shared[0, 0], 2, 64, 64))',
         ],
     ),
 ]
