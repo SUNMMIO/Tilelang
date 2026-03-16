@@ -585,7 +585,7 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
     PrimExpr dim0_extent = 0;
     PrimExpr stride0 = 1;
 
-    if (recv_buffer->shape.size() > 0) {
+    if (!recv_buffer->shape.empty()) {
       for (size_t k = 1; k < recv_buffer->shape.size(); k++) {
         stride0 *= recv_buffer->shape[k];
       }
