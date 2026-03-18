@@ -25,8 +25,6 @@ TVM_DLL const Op &wait_token();
 
 using namespace tir;
 
-int get_target_mesh(Target target, int axis);
-
 class BroadcastOpNode : public TileOperatorNode {
 public:
   Buffer src, dst;

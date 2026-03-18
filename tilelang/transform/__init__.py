@@ -317,6 +317,17 @@ def TilesLoop():
     return _ffi_api.TilesLoop()  # type: ignore
 
 
+def LowerTilesLoop():
+    """LowerTilesLoop
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LowerTilesLoop()  # type: ignore
+
+
 def LegalizeSafeMemoryAccess():
     """LegalizeLoopVectorize
 
