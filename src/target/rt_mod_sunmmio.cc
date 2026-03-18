@@ -1,7 +1,8 @@
 #include "codegen_sunmmio.h"
-#include "runtime/cuda/cuda_module.h"
-#include "runtime/pack_args.h"
+#include "target/source/codegen_source_base.h"
 #include <tvm/ffi/reflection/registry.h>
+#include <string>
+#include <unordered_map>
 
 namespace tvm {
 namespace codegen {
@@ -36,6 +37,13 @@ ExtractFuncInfo(const IRModule &mod) {
 }
 
 ffi::Module BuildTileLangSunMMIO(IRModule mod, Target target) {
+  LOG(FATAL) << "target.build.tilelang_sunmmio is not implemented yet. "
+             << "Use target.build.tilelang_sunmmio_without_compile "
+             << "or set enable_device_compile=False.";
+  TVM_FFI_UNREACHABLE();
+}
+
+ffi::Module BuildTileLangSunMMIOWithoutCompile(IRModule mod, Target target) {
   CodeGenTileLangSunMMIO cg;
   cg.Init();
 
@@ -54,11 +62,8 @@ ffi::Module BuildTileLangSunMMIO(IRModule mod, Target target) {
           ffi::Function::GetGlobal("tilelang_callback_sunmmio_postproc")) {
     code = (*f)(code, target).cast<std::string>();
   }
-  return runtime::CUDAModuleCreate("ptx", "ptx", ExtractFuncInfo(mod), code);
-}
-
-ffi::Module BuildTileLangSunMMIOWithoutCompile(IRModule mod, Target target) {
-  return BuildTileLangSunMMIO(mod, target);
+  return codegen::DeviceSourceModuleCreate(code, "sunmmio", ExtractFuncInfo(mod),
+                                           "sunmmio");
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
