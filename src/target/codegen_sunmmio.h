@@ -1,7 +1,7 @@
 #ifndef TVM_TL_TARGET_CODEGEN_SUNMMIO_H_
 #define TVM_TL_TARGET_CODEGEN_SUNMMIO_H_
 
-#include <tvm/ir/global_var.h>
+#include <tvm/ir/expr.h>
 #include <tvm/ir/module.h>
 #include <tvm/runtime/data_type.h>
 #include <tvm/tir/function.h>
