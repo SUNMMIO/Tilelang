@@ -28,6 +28,10 @@ void CodeGenTileLangSunMMIO::Clear() {
   initialized_ = false;
 }
 
+std::string CodeGenTileLangSunMMIO::EvalExpr(const tvm::PrimExpr& expr) {
+  return tir::ExprFunctor<std::string(const tvm::PrimExpr&)>::VisitExpr(expr);
+}
+
 void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar& gvar, const tir::PrimFunc& f) {
   if (!initialized_) {
     Init();
@@ -66,8 +70,8 @@ std::string CodeGenTileLangSunMMIO::Finish() {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::ForNode* op) {
-  std::string min = VisitExpr(op->min);
-  std::string extent = VisitExpr(op->extent);
+  std::string min = EvalExpr(op->min);
+  std::string extent = EvalExpr(op->extent);
   std::string iv = NewValue();
   var_ids_[op->loop_var.get()] = iv;
   EmitLine("sunmmio.for " + iv + " = " + min + " to " + extent + " {");
@@ -78,8 +82,8 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::ForNode* op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferStoreNode* op) {
-  std::string value = VisitExpr(op->value);
-  std::string index = op->indices.empty() ? "0" : VisitExpr(op->indices[0]);
+  std::string value = EvalExpr(op->value);
+  std::string index = op->indices.empty() ? "0" : EvalExpr(op->indices[0]);
   auto it = var_ids_.find(op->buffer->data.get());
   std::string buffer = it == var_ids_.end() ? static_cast<std::string>(op->buffer->name) : it->second;
   EmitLine("sunmmio.store " + value + ", " + buffer + "[" + index + "]");
@@ -88,7 +92,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferStoreNode* op) {
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode* op) {
   std::string alloc_name = NewValue();
   var_ids_[op->buffer_var.get()] = alloc_name;
-  std::string extent = op->extents.empty() ? "1" : VisitExpr(op->extents[0]);
+  std::string extent = op->extents.empty() ? "1" : EvalExpr(op->extents[0]);
   EmitLine(alloc_name + " = sunmmio.alloc " + extent + " : " + PrintType(op->dtype));
   VisitStmt(op->body);
 }
@@ -98,7 +102,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AttrStmtNode* op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::IfThenElseNode* op) {
-  std::string cond = VisitExpr(op->condition);
+  std::string cond = EvalExpr(op->condition);
   EmitLine("sunmmio.if " + cond + " {");
   EnterScope();
   VisitStmt(op->then_case);
@@ -113,7 +117,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::IfThenElseNode* op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::EvaluateNode* op) {
-  std::string value = VisitExpr(op->value);
+  std::string value = EvalExpr(op->value);
   EmitLine("sunmmio.eval " + value);
 }
 
@@ -130,7 +134,7 @@ std::string CodeGenTileLangSunMMIO::VisitExpr_(const tir::VarNode* op) {
 std::string CodeGenTileLangSunMMIO::VisitExpr_(const tir::BufferLoadNode* op) {
   auto it = var_ids_.find(op->buffer->data.get());
   std::string buffer = it == var_ids_.end() ? static_cast<std::string>(op->buffer->name) : it->second;
-  std::string index = op->indices.empty() ? "0" : VisitExpr(op->indices[0]);
+  std::string index = op->indices.empty() ? "0" : EvalExpr(op->indices[0]);
   std::string dst = NewValue();
   EmitLine(dst + " = sunmmio.load " + buffer + "[" + index + "] : " + PrintType(op->dtype));
   return dst;
@@ -163,7 +167,7 @@ std::string CodeGenTileLangSunMMIO::VisitExpr_(const tir::DivNode* op) {
 }
 
 std::string CodeGenTileLangSunMMIO::VisitExpr_(const tir::CastNode* op) {
-  std::string src = VisitExpr(op->value);
+  std::string src = EvalExpr(op->value);
   std::string dst = NewValue();
   EmitLine(dst + " = sunmmio.cast " + src + " : " + PrintType(op->dtype));
   return dst;
@@ -181,7 +185,7 @@ std::string CodeGenTileLangSunMMIO::VisitExpr_(const tir::CallNode* op) {
     if (i != 0) {
       call << ", ";
     }
-    call << VisitExpr(op->args[i]);
+    call << EvalExpr(op->args[i]);
   }
   call << ") : " << PrintType(op->dtype);
   EmitLine(call.str());
@@ -200,8 +204,8 @@ std::string CodeGenTileLangSunMMIO::NewValue() {
 
 std::string CodeGenTileLangSunMMIO::EmitBinary(const char* op_name, const tvm::PrimExpr& lhs,
                                                const tvm::PrimExpr& rhs, tvm::DataType dtype) {
-  std::string lhs_value = VisitExpr(lhs);
-  std::string rhs_value = VisitExpr(rhs);
+  std::string lhs_value = EvalExpr(lhs);
+  std::string rhs_value = EvalExpr(rhs);
   std::string dst = NewValue();
   EmitLine(dst + " = " + op_name + " " + lhs_value + ", " + rhs_value + " : " + PrintType(dtype));
   return dst;
