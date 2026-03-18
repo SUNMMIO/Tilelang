@@ -40,10 +40,10 @@ ffi::Module BuildTileLangSunMMIO(IRModule mod, Target target) {
   cg.Init();
 
   for (auto kv : mod->functions) {
-    ICHECK(kv.second->IsInstance<PrimFuncNode>())
+    ICHECK(kv.second->IsInstance<tir::PrimFuncNode>())
         << "CodeGenTileLangSunMMIO: Can only take PrimFunc";
     auto gvar = Downcast<GlobalVar>(kv.first);
-    auto f = Downcast<PrimFunc>(kv.second);
+    auto f = Downcast<tir::PrimFunc>(kv.second);
     auto calling_conv = f->GetAttr<Integer>(tvm::attr::kCallingConv);
     ICHECK(calling_conv == CallingConv::kDeviceKernelLaunch);
     cg.AddFunction(gvar, f);

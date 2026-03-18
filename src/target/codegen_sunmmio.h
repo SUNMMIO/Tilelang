@@ -48,6 +48,7 @@ protected:
   std::string VisitExprDefault_(const Object* op) override;
 
 private:
+  std::string EvalExpr(const tvm::PrimExpr& expr);
   std::string NewValue();
   std::string EmitBinary(const char* op_name, const tvm::PrimExpr& lhs,
                          const tvm::PrimExpr& rhs, tvm::DataType dtype);
