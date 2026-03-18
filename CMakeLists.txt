@@ -339,10 +339,12 @@ elseif(USE_CUDA)
     src/runtime/runtime.cc
     src/target/ptx.cc
     src/target/codegen_cuda.cc
+    src/target/codegen_sunmmio.cc
     src/target/codegen_py.cc
     src/target/codegen_utils.cc
     src/target/codegen_cutedsl.cc
     src/target/rt_mod_cuda.cc
+    src/target/rt_mod_sunmmio.cc
     src/target/rt_mod_cutedsl.cc
   )
   list(APPEND TILE_LANG_SRCS ${TILE_LANG_CUDA_SRCS})
