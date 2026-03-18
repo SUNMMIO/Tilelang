@@ -172,7 +172,10 @@ def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
     device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
 
     if target.kind.name == "cuda":
-        global_func = "target.build.tilelang_" + ("cutedsl" if "cutedsl" in target.keys else "cuda")
+        if "sunmmio" in target.keys:
+            global_func = "target.build.tilelang_sunmmio"
+        else:
+            global_func = "target.build.tilelang_" + ("cutedsl" if "cutedsl" in target.keys else "cuda")
         device_mod = tvm.ffi.get_global_func(global_func)(device_mod, target)
     elif target.kind.name == "hip":
         device_mod = tvm.ffi.get_global_func("target.build.tilelang_hip")(device_mod, target)
@@ -191,7 +194,10 @@ def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> 
     device_mod = tilelang.transform.HoistBroadcastValues()(device_mod)
 
     if target.kind.name == "cuda":
-        global_func = "target.build.tilelang_" + ("cutedsl" if "cutedsl" in target.keys else "cuda") + "_without_compile"
+        if "sunmmio" in target.keys:
+            global_func = "target.build.tilelang_sunmmio_without_compile"
+        else:
+            global_func = "target.build.tilelang_" + ("cutedsl" if "cutedsl" in target.keys else "cuda") + "_without_compile"
         device_mod = tvm.ffi.get_global_func(global_func)(device_mod, target)
     elif target.kind.name == "hip":
         device_mod = tvm.ffi.get_global_func("target.build.tilelang_hip_without_compile")(device_mod, target)
