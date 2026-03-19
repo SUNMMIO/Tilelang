@@ -3,6 +3,7 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm as tvm
+from tilelang.utils.target import determine_target
 
 
 def simple_add_kernel(n: int = 16):
@@ -19,8 +20,9 @@ def simple_add_kernel(n: int = 16):
 
 
 def lower_to_sunmmio_source(func) -> str:
-    with tvm.transform.PassContext(), tvm.target.Target("Sunmmio"):
-        artifact = tilelang.lower(func, target="Sunmmio", enable_device_compile=False)
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.transform.PassContext(), tvm.target.Target(target):
+        artifact = tilelang.lower(func, target=target, enable_device_compile=False)
     assert artifact.kernel_source is not None
     return artifact.kernel_source
 
@@ -37,9 +39,10 @@ def test_sunmmio_codegen_without_compile_emits_skeleton_source():
 
 
 def test_sunmmio_codegen_compile_path_not_implemented():
-    with tvm.transform.PassContext(), tvm.target.Target("Sunmmio"):
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.transform.PassContext(), tvm.target.Target(target):
         with pytest.raises(Exception, match="not implemented yet"):
-            tilelang.lower(simple_add_kernel(), target="Sunmmio", enable_device_compile=True)
+            tilelang.lower(simple_add_kernel(), target=target, enable_device_compile=True)
 
 
 if __name__ == "__main__":
