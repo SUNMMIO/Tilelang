@@ -33,7 +33,7 @@ def test_sunmmio_codegen_without_compile_emits_skeleton_source():
     assert "sunmmio.func" in src
     assert "sunmmio.for" in src
     assert "sunmmio.load" in src
-    assert "sunmmio.addf" in src
+    assert "sunmmio.add" in src
     assert "sunmmio.store" in src
     assert "sunmmio.return" in src
 
