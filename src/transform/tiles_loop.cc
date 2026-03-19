@@ -417,7 +417,7 @@ private:
     if (!scope_info_opt.has_value()) {
       return scope_root;
     }
-    ScopeExecInfo scope_info = scope_info_opt.value();
+    ScopeExecInfo &scope_info = scope_info_opt.value();
     const ForNode *exec_loop = scope_info.axis_to_loop[0];
     if (exec_loop == nullptr || !IsSerialFor(exec_loop)) {
       return scope_root;
@@ -466,7 +466,7 @@ private:
     if (!scope_info_opt.has_value()) {
       return scope_root;
     }
-    ScopeExecInfo scope_info = scope_info_opt.value();
+    ScopeExecInfo &scope_info = scope_info_opt.value();
 
     const ForNode *outermost_exec = scope_info.outermost_exec;
     const ForNode *innermost_exec = scope_info.innermost_exec;
