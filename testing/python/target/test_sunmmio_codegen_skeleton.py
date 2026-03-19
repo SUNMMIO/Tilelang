@@ -1,5 +1,4 @@
 import pytest
-import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm as tvm
@@ -19,16 +18,17 @@ def simple_add_kernel(n: int = 16):
     return main
 
 
-def lower_to_sunmmio_source(func) -> str:
+def build_sunmmio_module_without_compile(func):
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.transform.PassContext(), tvm.target.Target(target):
-        artifact = tilelang.lower(func, target=target, enable_device_compile=False)
-    assert artifact.kernel_source is not None
-    return artifact.kernel_source
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("calling_conv", int(tvm.ir.CallingConv.DEVICE_KERNEL_LAUNCH))
+    mod = tvm.IRModule({"main": func})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    return builder(mod, target)
 
 
 def test_sunmmio_codegen_without_compile_emits_skeleton_source():
-    src = lower_to_sunmmio_source(simple_add_kernel())
+    src = build_sunmmio_module_without_compile(simple_add_kernel()).inspect_source()
     assert "sunmmio.module {" in src
     assert "sunmmio.func" in src
     assert "sunmmio.for" in src
@@ -40,9 +40,12 @@ def test_sunmmio_codegen_without_compile_emits_skeleton_source():
 
 def test_sunmmio_codegen_compile_path_not_implemented():
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.transform.PassContext(), tvm.target.Target(target):
-        with pytest.raises(Exception, match="not implemented yet"):
-            tilelang.lower(simple_add_kernel(), target=target, enable_device_compile=True)
+    func = simple_add_kernel().with_attr("global_symbol", "main")
+    func = func.with_attr("calling_conv", int(tvm.ir.CallingConv.DEVICE_KERNEL_LAUNCH))
+    mod = tvm.IRModule({"main": func})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio")
+    with pytest.raises(Exception, match="not implemented yet"):
+        builder(mod, target)
 
 
 if __name__ == "__main__":
