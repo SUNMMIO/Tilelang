@@ -20,6 +20,12 @@
 
 - `src/target/rt_mod_sunmmio.cc`
 - `testing/python/target/test_sunmmio_codegen_skeleton.py`
+- `docs/SUNMMIO_ARCH_INFO.md`
+
+## Architecture Brief
+
+- SunMMIO NPU architecture and codegen assumptions are documented in:
+  - `docs/SUNMMIO_ARCH_INFO.md`
 
 ## Current Expected Behavior
 
