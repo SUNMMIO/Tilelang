@@ -29,6 +29,7 @@ def build_sunmmio_module_without_compile(func):
 
 def test_sunmmio_codegen_without_compile_emits_skeleton_source():
     src = build_sunmmio_module_without_compile(simple_add_kernel()).inspect_source()
+    print(src)
     assert "sunmmio.module {" in src
     assert "sunmmio.func" in src
     assert "sunmmio.for" in src
