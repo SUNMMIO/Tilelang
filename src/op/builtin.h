@@ -944,6 +944,16 @@ TVM_DLL const Op &barrier_arrive_and_wait();
 TVM_DLL const Op &sync_token_id();
 
 /*!
+ * \brief Declare a null token that is treated as already completed.
+ *
+ * Waiting on this token is a no-op and will be skipped.
+ *
+ * Args:
+ *   token_id: The unique token identifier.
+ */
+TVM_DLL const Op &sync_null_token();
+
+/*!
  * \brief Wait for a token to be signaled.
  *
  * This intrinsic blocks execution until the operation associated with the given

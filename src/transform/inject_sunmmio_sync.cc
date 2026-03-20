@@ -32,6 +32,7 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <set>
 #include <utility>
 
 #include "../op/builtin.h"
@@ -174,6 +175,7 @@ struct LoopScope {
   Map<Array<ObjectRef>, int> token_map;
   Var loop_var;
   PrimExpr min;
+  std::set<int> waited_tokens;
 };
 
 // Main rewriter class to inject synchronization primitives.
@@ -247,6 +249,9 @@ private:
     for (int i = loop_scopes_.size() - 1; i >= 0; i--) {
       auto &scope = loop_scopes_[i];
       for (const auto &buf : scope.writes) {
+        if (is_log_async && scope.token_map[buf] == curr_token_id) {
+          continue;
+        }
         Buffer buf_buffer = Downcast<Buffer>(buf[0]);
         Region buf_region = Downcast<Region>(buf[1]);
         if (src_buffer.same_as(buf_buffer) &&
@@ -255,6 +260,7 @@ private:
           if (waited_tokens.count(token) == 0) {
             process_wait_token_and_barrier_wait(stmts, token);
             waited_tokens.insert(token);
+            scope.waited_tokens.insert(token);
           }
         }
       }
@@ -277,6 +283,7 @@ private:
     Buffer dst_buffer = buffer_region->buffer;
     Region dst_region = buffer_region->region;
     auto dst = Array<ObjectRef>{dst_buffer, dst_region};
+    std::unordered_set<int> waited_tokens;
 
     // Check if the current write buffer has dependencies with existing read
     // buffers. If yes, we need to wait for the read to finish before writing.
@@ -288,7 +295,11 @@ private:
       Region buf_region = Downcast<Region>(buf[1]);
       if (dst_buffer.same_as(buf_buffer) &&
           RegionIntersect(dst_region, buf_region)) {
-        process_wait_token_and_barrier_wait(stmts, read_buffer_token_map[buf]);
+        int token = read_buffer_token_map[buf];
+        if (waited_tokens.count(token) == 0) {
+          process_wait_token_and_barrier_wait(stmts, token);
+          waited_tokens.insert(token);
+        }
       }
     }
     // We also need to check the dependencies with existing write buffers. If
@@ -301,7 +312,32 @@ private:
       Region buf_region = Downcast<Region>(buf[1]);
       if (dst_buffer.same_as(buf_buffer) &&
           RegionIntersect(dst_region, buf_region)) {
-        process_wait_token_and_barrier_wait(stmts, write_buffer_token_map[buf]);
+        int token = write_buffer_token_map[buf];
+        if (waited_tokens.count(token) == 0) {
+          process_wait_token_and_barrier_wait(stmts, token);
+          waited_tokens.insert(token);
+        }
+      }
+    }
+
+    // Check loop carried dependencies
+    for (int i = loop_scopes_.size() - 1; i >= 0; i--) {
+      auto &scope = loop_scopes_[i];
+      for (const auto &buf : scope.writes) {
+        if (is_log_async && scope.token_map[buf] == curr_token_id) {
+          continue;
+        }
+        Buffer buf_buffer = Downcast<Buffer>(buf[0]);
+        Region buf_region = Downcast<Region>(buf[1]);
+        if (dst_buffer.same_as(buf_buffer) &&
+            RegionIntersect(dst_region, buf_region)) {
+          int token = scope.token_map[buf];
+          if (waited_tokens.count(token) == 0) {
+            process_wait_token_and_barrier_wait(stmts, token);
+            waited_tokens.insert(token);
+            scope.waited_tokens.insert(token);
+          }
+        }
       }
     }
 
@@ -399,9 +435,15 @@ private:
 
     Stmt loop_stmt = StmtMutator::VisitStmt_(op);
 
+    scope = loop_scopes_.back();
     loop_scopes_.pop_back();
     for (const auto &p : collector.writes) {
       pre_assigned_tokens_.erase(p.first);
+    }
+
+    for (int token : scope.waited_tokens) {
+      stmts.push_back(Evaluate(Call(DataType::Handle(), sync_null_token(),
+                                    {IntImm(DataType::Int(32), token)})));
     }
 
     stmts.push_back(loop_stmt);
@@ -692,9 +734,15 @@ private:
 
     Stmt loop_stmt = StmtMutator::VisitStmt_(loop);
 
+    scope = loop_scopes_.back();
     loop_scopes_.pop_back();
     for (const auto &p : collector.writes) {
       pre_assigned_tokens_.erase(p.first);
+    }
+
+    for (int token : scope.waited_tokens) {
+      stmts.push_back(Evaluate(Call(DataType::Handle(), sync_null_token(),
+                                    {IntImm(DataType::Int(32), token)})));
     }
 
     stmts.push_back(loop_stmt);
@@ -986,6 +1034,60 @@ private:
   Map<int, int> barrier_to_token_map_;
 };
 
+class FunctionWaitRewriter : public StmtMutator {
+public:
+  FunctionWaitRewriter() {}
+
+  Stmt operator()(Stmt stmt) {
+    TokenCollector collector;
+    collector(stmt);
+    tokens_ = collector.tokens;
+    is_root_ = true;
+    return VisitStmt(stmt);
+  }
+
+private:
+  class TokenCollector : public StmtExprVisitor {
+  public:
+    std::set<int> tokens;
+    void VisitExpr_(const CallNode *op) override {
+      if (op->op.same_as(sync_token_id())) {
+        if (const IntImmNode *imm = op->args[0].as<IntImmNode>()) {
+          tokens.insert(imm->value);
+        }
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+  };
+
+  std::set<int> tokens_;
+  bool is_root_;
+
+  Stmt VisitStmt_(const BlockNode *op) override {
+    bool root = is_root_;
+    if (root) {
+      is_root_ = false;
+    }
+    Block block = Downcast<Block>(StmtMutator::VisitStmt_(op));
+    if (root) {
+      Array<Stmt> stmts;
+      if (const SeqStmtNode *seq = block->body.as<SeqStmtNode>()) {
+        stmts = seq->seq;
+      } else {
+        stmts.push_back(block->body);
+      }
+      for (int token_id : tokens_) {
+        stmts.push_back(Evaluate(Call(DataType::Handle(), wait_token(),
+                                      {IntImm(DataType::Int(32), token_id)})));
+      }
+      auto n = CopyOnWrite(block.get());
+      n->body = SeqStmt::Flatten(stmts);
+      return Stmt(n);
+    }
+    return std::move(block);
+  }
+};
+
 class SunmmioSyncRewriter : public IRMutatorWithAnalyzer {
 public:
   SunmmioSyncRewriter(arith::Analyzer *analyzer)
@@ -1003,6 +1105,9 @@ public:
     auto barrier_extract_rewriter =
         BarrierExtractRewriter(inject_sync_rewriter.get_barrier_to_token_map());
     f.CopyOnWrite()->body = barrier_extract_rewriter(f->body);
+
+    auto function_wait_rewriter = FunctionWaitRewriter();
+    f.CopyOnWrite()->body = function_wait_rewriter(f->body);
 
     auto eliminate_redundancy_rewriter = EliminateRedundancyRewriter(
         std::vector<int>({}), std::vector<int>({}),

@@ -111,18 +111,20 @@ def test_inject_sunmmio_sync_dma():
     wait_lines = [l for l in lines if "wait_token" in l]
 
     assert len(dma_lines) == 2
-    assert len(wait_lines) == 1
+    assert len(wait_lines) == 2
 
     assert "sync_token_id(0)" in dma_lines[0]
     assert "wait_token(0)" in wait_lines[0]
     assert "sync_token_id(1)" in dma_lines[1]
+    assert "wait_token(1)" in wait_lines[1]
 
     # Check that wait(0) is between dma(0) and dma(1) in the full script
     idx_dma0 = script.find("sync_token_id(0)")
     idx_wait0 = script.find("wait_token(0)")
     idx_dma1 = script.find("sync_token_id(1)")
+    idx_wait1 = script.find("wait_token(1)")
 
-    assert idx_dma0 < idx_wait0 < idx_dma1
+    assert idx_dma0 < idx_wait0 < idx_dma1 < idx_wait1
 
 
 def test_inject_sunmmio_sync_mma():
@@ -162,8 +164,8 @@ def test_inject_sunmmio_sync_mma():
 
     assert len(dma_lines) == 3  # 2 loads + 1 store
     assert len(mma_lines) == 1
-    # We expect at least 3 wait tokens (0, 1, 2)
-    assert len(wait_lines) >= 3
+    # We expect at least 4 wait tokens (0, 1, 2, 3)
+    assert len(wait_lines) >= 4
 
     # Check instruction order:
     # 1. dma_copy (load A) -> token 0
@@ -173,6 +175,7 @@ def test_inject_sunmmio_sync_mma():
     # 5. mma_sunmmio -> token 2
     # 6. wait_token(2)
     # 7. dma_copy (store C) -> token 3
+    # 8. wait_token(3)
 
     idx_dma0 = script.find("sync_token_id(0)")
     idx_dma1 = script.find("sync_token_id(1)")
@@ -182,6 +185,7 @@ def test_inject_sunmmio_sync_mma():
     idx_token2 = script.find("sync_token_id(2)")  # token 2 is inside mma
     idx_wait2 = script.find("wait_token(2)")
     idx_dma2 = script.find("sync_token_id(3)")
+    idx_wait3 = script.find("wait_token(3)")
 
     assert idx_dma0 < idx_wait0
     assert idx_dma1 < idx_wait1
@@ -196,6 +200,7 @@ def test_inject_sunmmio_sync_mma():
     # Wait(2) must be after Token 2 generation and before DMA store (Token 3)
     assert idx_token2 < idx_wait2
     assert idx_wait2 < idx_dma2
+    assert idx_dma2 < idx_wait3
 
 
 def test_inject_sunmmio_sync_broadcast():
@@ -227,7 +232,7 @@ def test_inject_sunmmio_sync_broadcast():
     assert len(dma_lines) == 2
     assert len(bcast_lines) == 1
     assert len(barrier_lines) >= 1
-    assert len(wait_lines) >= 2
+    assert len(wait_lines) >= 3
 
     # Check instruction order:
     # 1. dma_copy (load A) -> token 0
@@ -237,6 +242,7 @@ def test_inject_sunmmio_sync_broadcast():
     # 5. wait_token(1)
     # 6. barrier_arrive_and_wait
     # 7. dma_copy (store B) -> token 2
+    # 8. wait_token(2)
 
     idx_dma0 = script.find("sync_token_id(0)")
     idx_wait0 = script.find("wait_token(0)")
@@ -246,6 +252,7 @@ def test_inject_sunmmio_sync_broadcast():
     idx_wait1 = script.find("wait_token(1)")
     idx_barrier_wait = script.find("barrier_arrive_and_wait")
     idx_dma1 = script.find("sync_token_id(2)")
+    idx_wait2 = script.find("wait_token(2)")
 
     # Verify order
     assert idx_dma0 < idx_wait0
@@ -255,6 +262,7 @@ def test_inject_sunmmio_sync_broadcast():
     assert idx_barrier_init < idx_wait1
     assert idx_wait1 < idx_barrier_wait
     assert idx_barrier_wait < idx_dma1
+    assert idx_dma1 < idx_wait2
 
 
 def test_inject_sunmmio_sync_if():
@@ -342,24 +350,31 @@ def test_inject_sunmmio_sync_loop():
 
     func_str = """
                 T.dma_copy(T.region(C[by * 32, bx * 32], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), T.sync_token_id(0))
-                for _i in range(10):
-                    T.wait_token(0)
-                    T.wait_token(2)
-                    T.dma_copy(T.region(D_shared[0, 0], 1, 32, 32), T.region(C_shared[0, 0], 2, 32, 32), T.sync_token_id(1))
-                    T.wait_token(1)
-                    T.dma_copy(T.region(C_shared[0, 0], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), T.sync_token_id(2))
-                for _i in range(10):
-                    T.wait_token(1)
-                    T.wait_token(4)
-                    T.barrier_arrive_and_wait(1)
-                    T.wait_token(0)
-                    T.wait_token(2)
-                    T.broadcast_(T.region(C_shared[0, 0], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), 1024, 0, 0, T.sync_token_id(3))
-                    T.barrier_init(0, 0, 1, 2, 3)
-                    T.wait_token(3)
-                    T.barrier_arrive_and_wait(0)
-                    T.broadcast_(T.region(D_shared[0, 0], 1, 32, 32), T.region(C_shared[0, 0], 2, 32, 32), 1024, 0, 0, T.sync_token_id(4))
-                    T.barrier_init(1, 0, 1, 2, 3)
+                    T.sync_null_token(2)
+                    for _i in range(10):
+                        T.wait_token(0)
+                        T.wait_token(2)
+                        T.dma_copy(T.region(D_shared[0, 0], 1, 32, 32), T.region(C_shared[0, 0], 2, 32, 32), T.sync_token_id(1))
+                        T.wait_token(1)
+                        T.dma_copy(T.region(C_shared[0, 0], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), T.sync_token_id(2))
+                    T.sync_null_token(4)
+                    for _i in range(10):
+                        T.wait_token(1)
+                        T.wait_token(4)
+                        T.barrier_arrive_and_wait(1)
+                        T.wait_token(0)
+                        T.wait_token(2)
+                        T.broadcast_(T.region(C_shared[0, 0], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), 1024, 0, 0, T.sync_token_id(3))
+                        T.barrier_init(0, 0, 1, 2, 3)
+                        T.wait_token(3)
+                        T.barrier_arrive_and_wait(0)
+                        T.broadcast_(T.region(D_shared[0, 0], 1, 32, 32), T.region(C_shared[0, 0], 2, 32, 32), 1024, 0, 0, T.sync_token_id(4))
+                        T.barrier_init(1, 0, 1, 2, 3)
+            T.wait_token(0)
+            T.wait_token(1)
+            T.wait_token(2)
+            T.wait_token(3)
+            T.wait_token(4)
     """.strip()
 
     M, N = 128, 128
@@ -377,8 +392,8 @@ def test_inject_sunmmio_sync_loop():
 
 
 if __name__ == "__main__":
-    test_inject_sunmmio_sync_dma()
-    test_inject_sunmmio_sync_mma()
-    test_inject_sunmmio_sync_broadcast()
-    test_inject_sunmmio_sync_if()
+    # test_inject_sunmmio_sync_dma()
+    # test_inject_sunmmio_sync_mma()
+    # test_inject_sunmmio_sync_broadcast()
+    # test_inject_sunmmio_sync_if()
     test_inject_sunmmio_sync_loop()
