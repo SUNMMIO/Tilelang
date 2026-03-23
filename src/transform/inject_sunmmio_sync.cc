@@ -912,6 +912,74 @@ private:
 // Optimization pass to remove redundant synchronization calls.
 // If a token or barrier has already been waited on in the current execution
 // path, subsequent waits are unnecessary.
+class BlockWaitRewriter : public StmtMutator {
+public:
+  BlockWaitRewriter(Map<int, int> token_to_barrier_map)
+      : token_to_barrier_map_(std::move(token_to_barrier_map)) {}
+
+  Stmt VisitStmt_(const BlockNode *op) final {
+    Stmt new_body = StmtMutator::VisitStmt(op->body);
+
+    BlockTokenCollector collector;
+    collector(op->body);
+
+    if (collector.tokens.empty()) {
+      if (new_body.same_as(op->body)) {
+        return ffi::GetRef<Stmt>(op);
+      }
+      auto n = CopyOnWrite(op);
+      n->body = new_body;
+      return Stmt(n);
+    }
+
+    Array<Stmt> stmts;
+    if (const auto *seq = new_body.as<SeqStmtNode>()) {
+      stmts = seq->seq;
+    } else {
+      stmts.push_back(new_body);
+    }
+
+    std::vector<int> tokens(collector.tokens.begin(), collector.tokens.end());
+    std::sort(tokens.begin(), tokens.end());
+
+    for (int token_id : tokens) {
+      stmts.push_back(Evaluate(Call(DataType::Handle(), wait_token(),
+                                    {IntImm(DataType::Int(32), token_id)})));
+      if (token_to_barrier_map_.count(token_id)) {
+        int barrier_id = token_to_barrier_map_[token_id];
+        stmts.push_back(
+            Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
+                          {IntImm(DataType::Int(32), barrier_id)})));
+      }
+    }
+
+    auto n = CopyOnWrite(op);
+    n->body = SeqStmt::Flatten(stmts);
+    return Stmt(n);
+  }
+
+private:
+  Map<int, int> token_to_barrier_map_;
+
+  class BlockTokenCollector : public StmtExprVisitor {
+  public:
+    void VisitStmt_(const BlockRealizeNode *op) final {
+      // Do not visit inner blocks
+    }
+    void VisitStmt_(const BlockNode *op) final {
+      // Do not visit inner blocks
+    }
+    void VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(sync_token_id())) {
+        int token_id = op->args[0].as<IntImm>().value()->value;
+        tokens.insert(token_id);
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+    std::set<int> tokens;
+  };
+};
+
 class EliminateRedundancyRewriter : public StmtMutator {
 public:
   EliminateRedundancyRewriter(std::vector<int> parent_token_ids = {},
@@ -1034,60 +1102,6 @@ private:
   Map<int, int> barrier_to_token_map_;
 };
 
-class FunctionWaitRewriter : public StmtMutator {
-public:
-  FunctionWaitRewriter() {}
-
-  Stmt operator()(Stmt stmt) {
-    TokenCollector collector;
-    collector(stmt);
-    tokens_ = collector.tokens;
-    is_root_ = true;
-    return VisitStmt(stmt);
-  }
-
-private:
-  class TokenCollector : public StmtExprVisitor {
-  public:
-    std::set<int> tokens;
-    void VisitExpr_(const CallNode *op) override {
-      if (op->op.same_as(sync_token_id())) {
-        if (const IntImmNode *imm = op->args[0].as<IntImmNode>()) {
-          tokens.insert(imm->value);
-        }
-      }
-      StmtExprVisitor::VisitExpr_(op);
-    }
-  };
-
-  std::set<int> tokens_;
-  bool is_root_;
-
-  Stmt VisitStmt_(const BlockNode *op) override {
-    bool root = is_root_;
-    if (root) {
-      is_root_ = false;
-    }
-    Block block = Downcast<Block>(StmtMutator::VisitStmt_(op));
-    if (root) {
-      Array<Stmt> stmts;
-      if (const SeqStmtNode *seq = block->body.as<SeqStmtNode>()) {
-        stmts = seq->seq;
-      } else {
-        stmts.push_back(block->body);
-      }
-      for (int token_id : tokens_) {
-        stmts.push_back(Evaluate(Call(DataType::Handle(), wait_token(),
-                                      {IntImm(DataType::Int(32), token_id)})));
-      }
-      auto n = CopyOnWrite(block.get());
-      n->body = SeqStmt::Flatten(stmts);
-      return Stmt(n);
-    }
-    return std::move(block);
-  }
-};
-
 class SunmmioSyncRewriter : public IRMutatorWithAnalyzer {
 public:
   SunmmioSyncRewriter(arith::Analyzer *analyzer)
@@ -1106,8 +1120,9 @@ public:
         BarrierExtractRewriter(inject_sync_rewriter.get_barrier_to_token_map());
     f.CopyOnWrite()->body = barrier_extract_rewriter(f->body);
 
-    auto function_wait_rewriter = FunctionWaitRewriter();
-    f.CopyOnWrite()->body = function_wait_rewriter(f->body);
+    auto block_wait_rewriter =
+        BlockWaitRewriter(inject_sync_rewriter.get_barrier_to_token_map());
+    f.CopyOnWrite()->body = block_wait_rewriter(f->body);
 
     auto eliminate_redundancy_rewriter = EliminateRedundancyRewriter(
         std::vector<int>({}), std::vector<int>({}),
