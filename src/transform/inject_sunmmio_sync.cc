@@ -1003,7 +1003,7 @@ public:
 
   void VisitExpr_(const CallNode *op) final {
     if (op->op.same_as(sync_token_id()) || op->op.same_as(sync_null_token())) {
-      if (op->args.size() > 0 && op->args[0].as<IntImmNode>()) {
+      if (!op->args.empty() && op->args[0].as<IntImmNode>()) {
         int token_id = op->args[0].as<IntImmNode>()->value;
         generated_tokens.insert(token_id);
       }
@@ -1014,7 +1014,7 @@ public:
   void VisitStmt_(const EvaluateNode *op) final {
     if (const CallNode *call = op->value.as<CallNode>()) {
       if (call->op.same_as(barrier_init())) {
-        if (call->args.size() > 0 && call->args[0].as<IntImmNode>()) {
+        if (!call->args.empty() && call->args[0].as<IntImmNode>()) {
           int barrier_id = call->args[0].as<IntImmNode>()->value;
           generated_barriers.insert(barrier_id);
         }
@@ -1038,7 +1038,7 @@ public:
 
   void VisitExpr_(const CallNode *op) final {
     if (op->op.same_as(sync_token_id()) || op->op.same_as(sync_null_token())) {
-      if (op->args.size() > 0 && op->args[0].as<IntImmNode>()) {
+      if (!op->args.empty() && op->args[0].as<IntImmNode>()) {
         pending_tokens.insert(op->args[0].as<IntImmNode>()->value);
       }
     }
@@ -1048,15 +1048,15 @@ public:
   void VisitStmt_(const EvaluateNode *op) final {
     if (const CallNode *call = op->value.as<CallNode>()) {
       if (call->op.same_as(wait_token())) {
-        if (call->args.size() > 0 && call->args[0].as<IntImmNode>()) {
+        if (!call->args.empty() && call->args[0].as<IntImmNode>()) {
           pending_tokens.erase(call->args[0].as<IntImmNode>()->value);
         }
       } else if (call->op.same_as(barrier_init())) {
-        if (call->args.size() > 0 && call->args[0].as<IntImmNode>()) {
+        if (!call->args.empty() && call->args[0].as<IntImmNode>()) {
           pending_barriers.insert(call->args[0].as<IntImmNode>()->value);
         }
       } else if (call->op.same_as(barrier_arrive_and_wait())) {
-        if (call->args.size() > 0 && call->args[0].as<IntImmNode>()) {
+        if (!call->args.empty() && call->args[0].as<IntImmNode>()) {
           int barrier_id = call->args[0].as<IntImmNode>()->value;
           pending_barriers.erase(barrier_id);
           if (barrier_to_token_map_.count(barrier_id)) {
