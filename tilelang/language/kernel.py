@@ -3,11 +3,13 @@
 from __future__ import annotations
 from collections import deque
 from tvm import tir
+from tvm.target import Target
 from tvm.tir import Var
 from tvm.script.ir_builder.tir.frame import TIRFrame, BlockFrame
 from tvm.ffi import register_object
 from tilelang import _ffi_api
 from tilelang.jit.exceptions import JITNoBuilderError
+from tilelang.utils.target import target_is_sunmmio
 import threading
 
 # Ensure single-dimension kernel bindings can be unpacked like iterables.
@@ -112,10 +114,14 @@ class KernelLaunchFrame(TIRFrame):
         assert isinstance(last_block_frame, BlockFrame), f"Last frame must be a block frame, got {last_block_frame}"
 
         maybe_cpu = last_block_frame.annotations.get("tilelang.is_cpu_kernel_frame", False)
+        maybe_sunmmio = last_block_frame.annotations.get("tilelang.is_sunmmio_kernel_frame", False)
 
         if maybe_cpu:
             # CPU kernel frame, return a list of for frame items.
             return _normalize_bindings([frame.vars[0] for frame in self.frames[0:-1]])
+        elif maybe_sunmmio:
+            # Only blockIdx frames; last frame is the Block frame (no threadIdx frames)
+            return _normalize_bindings([frame.iter_var.var for frame in self.frames[0:-1]])
         else:
             # Otherwise, return a list of iter_var.var objects (excluding the last 4 frames).
             # As 4 frames for threadIdx.x, threadIdx.y, threadIdx.z and block frame with attributes
@@ -291,7 +297,14 @@ def Kernel(
 
     attrs: dict = {}
 
-    if not is_cpu and threads is None:
+    if not is_cpu:
+        cur_target = Target.current(allow_none=True)
+        if cur_target is not None and target_is_sunmmio(cur_target):
+            attrs["tilelang.is_sunmmio_kernel_frame"] = True
+            threads = None
+
+    is_sunmmio = attrs.get("tilelang.is_sunmmio_kernel_frame", False)
+    if not is_cpu and not is_sunmmio and threads is None:
         threads = 128  # default thread number
 
     if isinstance(threads, int):
@@ -301,7 +314,7 @@ def Kernel(
     elif isinstance(threads, tuple):
         threads = list(threads) + [1] * (3 - len(threads))
     else:
-        assert is_cpu, "threads must be an integer or a list of integers"
+        assert is_cpu or is_sunmmio, "threads must be an integer or a list of integers"
 
     if is_cpu:
         attrs["tilelang.is_cpu_kernel_frame"] = True
