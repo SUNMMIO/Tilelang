@@ -293,6 +293,7 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     // It has the same rank as 'src', but non-tiled dimensions are collapsed
     // to 1.
     Array<PrimExpr> single_tile_acc_shape;
+    single_tile_acc_shape.reserve(src_ndim);
     for (int i = 0; i < src_ndim; ++i) {
       if (src_dim_to_tile_size.count(i)) {
         single_tile_acc_shape.push_back(src_dim_to_tile_size[i]);
@@ -307,6 +308,7 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     int dst_ndim = this->dst->shape.size();
     std::unordered_map<int, PrimExpr> dst_dim_to_tile_size;
     if (is_dim_tiled) {
+      single_tile_res_shape.reserve(dst_ndim);
       for (size_t i = 0; i < tv_dst->IndexMap().size(); i++) {
         const auto *idx_ptr = tv_dst->IndexMap()[i].as<IntImmNode>();
         ICHECK(idx_ptr);
@@ -336,6 +338,7 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     // Create outer loop variables for each dimension of the source tensor.
     // Tiled dimensions will have extents = buffer_extent / tile_size.
     Array<IterVar> loop_vars;
+    loop_vars.reserve(src_ndim);
     for (int i = 0; i < src_ndim; i++) {
       PrimExpr extent = this->src->shape[i];
       if (src_dim_to_tile_size.count(i)) {
@@ -367,6 +370,7 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     // inside a Tile.
     Array<Var> interior_vars;
     Array<PrimExpr> src_tile_shape = tv_src->TileShape();
+    interior_vars.reserve(src_tile_shape.size());
     for (size_t i = 0; i < src_tile_shape.size(); i++) {
       interior_vars.push_back(Var("k" + std::string{char('i' + i)}));
     }
@@ -375,6 +379,7 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     // ensure coordinate consistency.
     Array<Var> dst_interior_vars_mapped;
     Array<PrimExpr> dst_tile_shape = tv_dst->TileShape();
+    dst_interior_vars_mapped.reserve(tv_dst->IndexMap().size());
     for (size_t i = 0; i < tv_dst->IndexMap().size(); i++) {
       int dst_dim_val = tv_dst->IndexMap()[i].as<IntImmNode>()->value;
       if (dst_dim_val < 0)
@@ -492,9 +497,11 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     };
 
     std::vector<int> all_src_axes;
+    all_src_axes.reserve(src_tile_shape.size());
     for (size_t i = 0; i < src_tile_shape.size(); i++)
       all_src_axes.push_back(i);
     std::vector<int> all_dst_axes;
+    all_dst_axes.reserve(dst_tile_shape.size());
     for (size_t i = 0; i < dst_tile_shape.size(); i++)
       all_dst_axes.push_back(i);
 
