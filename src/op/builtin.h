@@ -281,6 +281,23 @@ TVM_DLL const Op &dma_copy();
 TVM_DLL const Op &mma_sunmmio();
 
 /*!
+ * \brief tvm intrinsic for in-tile reduction of Sunmmio target.
+ *
+ *  \param reduce_type
+ *    The type of reduction (e.g. "sum", "max", etc.).
+ *
+ *  \param out
+ *    The output tile buffer.
+ *
+ *  \param in
+ *    The input tile buffer.
+ *
+ *  \param axis
+ *    The axis of reduction within the tile.
+ */
+TVM_DLL const Op &vector_core_in_tile_reduce();
+
+/*!
  * \brief tvm intrinsics for loading image from global tensor to columns in
  * shared memory
  *
