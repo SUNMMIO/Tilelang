@@ -946,6 +946,7 @@ private:
       ICHECK_NE(iv->thread_tag.length(), 0U);
       if (iv->thread_tag == "threadIdx.x") {
         thread_var_ = iv;
+        has_thread_binding_ = true;
         ICHECK(iv->dom->extent.as<IntImmNode>());
         thread_block_size_ = iv->dom->extent.as<IntImmNode>()->value;
       }
@@ -1058,7 +1059,13 @@ private:
 
     // Determine if this is a true parallel loop requiring thread partitioning.
     // Skip partitioning for loops that only operate on local/register buffers.
-    bool parallel_loop = !local_register_only && !store_into_local;
+    // Also skip when no real threadIdx.x binding was seen in the IR: calling
+    // PartitionLoop with the dummy v_thread variable embeds a free variable
+    // into the output IR.  has_thread_binding_ is set by
+    // VisitStmt_(AttrStmtNode) only when a genuine threadIdx.x AttrStmt is
+    // encountered, so this check is IR-driven rather than target-driven.
+    bool parallel_loop =
+        !local_register_only && !store_into_local && has_thread_binding_;
 
     // Check if there are non-local buffer accesses (for vectorization decision)
     bool has_non_local = false;
@@ -1136,6 +1143,10 @@ private:
   // we need to define a thread_var for the serial loop.
   IterVar thread_var_ = IterVar(Range::FromMinExtent(0, 1), Var("v_thread"),
                                 IterVarType::kDataPar);
+  // True only when a real threadIdx.x AttrStmt has been visited. Used to guard
+  // thread partitioning: if no threadIdx.x exists (e.g. threadless kernels),
+  // calling PartitionLoop with the dummy v_thread would embed a free variable.
+  bool has_thread_binding_ = false;
   size_t thread_block_size_ = 0;
   // Stack of per-Block workspace buffers gathered while visiting children
   std::vector<Array<Buffer>> workspace_stack_;

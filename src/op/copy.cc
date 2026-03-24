@@ -11,6 +11,7 @@
 #include "copy.h"
 #include "../layout/tcgen05_layout.h"
 #include "../target/utils.h"
+#include "../transform/common/attr.h"
 #include "../transform/common/loop_fusion_utils.h"
 #include "../transform/loop_partition.h"
 #include "../transform/loop_vectorize.h"
@@ -247,14 +248,15 @@ For CopyNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
     // Only attach the parallel related annotations on the outermost loop (i ==
     // 0)
     if (i == 0) {
-      if (annotations.count(attr::kCoalescedWidth)) {
-        loop_annotations.Set(attr::kCoalescedWidth,
-                             annotations.Get(attr::kCoalescedWidth).value());
-      }
-      if (annotations.count(attr::kParallelLoopLayout)) {
+      if (annotations.count(tl::attr::kCoalescedWidth)) {
         loop_annotations.Set(
-            attr::kParallelLoopLayout,
-            annotations.Get(attr::kParallelLoopLayout).value());
+            tl::attr::kCoalescedWidth,
+            annotations.Get(tl::attr::kCoalescedWidth).value());
+      }
+      if (annotations.count(tl::attr::kParallelLoopLayout)) {
+        loop_annotations.Set(
+            tl::attr::kParallelLoopLayout,
+            annotations.Get(tl::attr::kParallelLoopLayout).value());
       }
     }
 
@@ -298,7 +300,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
   // If user annotated a loop layout on T.copy, enforce SIMT (normal) copy.
   // Parallel-loop layout only applies to SIMT-style loops we generate here;
   // other copy instructions (TMA/LDSM/STSM/TMem) are incompatible.
-  if (annotations.count(attr::kParallelLoopLayout)) {
+  if (annotations.count(tl::attr::kParallelLoopLayout)) {
     if (copy_inst != CopyInst::kNormal) {
       std::ostringstream oss;
       oss << "T.copy loop layout annotation requires SIMT copy; got "
@@ -450,7 +452,8 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
   }
 
   // Sunmmio DMA Layout Inference
-  if (copy_inst == CopyInst::kSunmmioDMACopy) {
+  if (copy_inst == CopyInst::kSunmmioDMACopy ||
+      copy_inst == CopyInst::kSunmmioTileCopy) {
     const auto f =
         ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
     auto result = Map<Buffer, Layout>();
@@ -671,19 +674,46 @@ bool CopyNode::CheckSunmmioDMACopy(Target target) const {
     scope_check = true;
   if (src.scope() == "shared.rsram" && dst.scope() == "shared.asram")
     scope_check = true;
-  if (src.scope() == "shared.rsram" && dst.scope() == "shared.rsram")
-    scope_check = true;
   if (src.scope() == "shared.rsram" && dst.scope() == "global")
     scope_check = true;
   if (!scope_check) {
-    ICHECK(0) << "Unsupported copy from " << src.scope() << " to "
-              << dst.scope() << " of Sunmmio target.";
     return false;
   }
-
-  // 2. src and dst must have the same dtype
+  // 2. src and dst must have the same dtype for DMA-based lowering
   if (src->dtype != dst->dtype) {
-    ICHECK(0) << "src and dst must have the same dtype for copy.";
+    ICHECK(0) << "src and dst must have the same dtype for Sunmmio DMA copy.";
+    return false;
+  }
+  return true;
+}
+
+bool CopyNode::CheckSunmmioTileCopy(Target target) const {
+  auto is_full_buffer_region = [](const Buffer &buffer,
+                                  const Array<Range> &ranges) {
+    if (ranges.size() != buffer->shape.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      if (!is_zero(ranges[i]->min) ||
+          !StructuralEqual()(ranges[i]->extent, buffer->shape[i])) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  // shared.rsram -> shared.rsram is lowered via tile loops instead of DMA, so
+  // dtype mismatch is allowed and handled by an inserted Cast during lowering.
+  // For now, only support full-buffer copies. Region copies require the
+  // T.Tiles legalization path to preserve copy-region semantics.
+  if (src.scope() != "shared.rsram" || dst.scope() != "shared.rsram") {
+    return false;
+  }
+  if (!StructuralEqual()(src->shape, dst->shape)) {
+    return false;
+  }
+  if (!is_full_buffer_region(src, src_range) ||
+      !is_full_buffer_region(dst, dst_range)) {
     return false;
   }
   return true;
@@ -718,8 +748,14 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
     return CopyInst::kTMemLoad;
   } else if (CheckTMemStore(target)) {
     return CopyInst::kTMemStore;
-  } else if (TargetIsSunmmio(target) && CheckSunmmioDMACopy(target)) {
-    return CopyInst::kSunmmioDMACopy;
+  } else if (TargetIsSunmmio(target)) {
+    if (CheckSunmmioDMACopy(target)) {
+      return CopyInst::kSunmmioDMACopy;
+    } else if (CheckSunmmioTileCopy(target)) {
+      return CopyInst::kSunmmioTileCopy;
+    }
+    ICHECK(0) << "Unsupported copy from " << src.scope() << " to "
+              << dst.scope() << " of Sunmmio target.";
   } else {
     return CopyInst::kNormal;
   }
@@ -757,8 +793,12 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     return LowerNormalCopy(T, analyzer);
   } else if (copy_inst == CopyInst::kSunmmioDMACopy) {
     auto dma_copy = LowerSunmmioDmaCopy(T, analyzer);
-    ICHECK(dma_copy.defined()) << "Failed to lower dma copy";
+    ICHECK(dma_copy.defined()) << "Failed to lower sunmmio dma copy";
     return dma_copy;
+  } else if (copy_inst == CopyInst::kSunmmioTileCopy) {
+    auto tile_copy = LowerSunmmioTileCopy(T, analyzer);
+    ICHECK(tile_copy.defined()) << "Failed to lower sunmmio tile copy";
+    return tile_copy;
   } else {
     LOG(FATAL) << "Unsupported copy inst " << static_cast<int>(copy_inst);
   }
@@ -770,6 +810,95 @@ Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
   PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
   return Evaluate(
       Call(DataType::Handle(), dma_copy(), {src_region, dst_region}));
+}
+
+Stmt CopyNode::LowerSunmmioTileCopy(const LowerArgs &T,
+                                    arith::Analyzer *analyzer) const {
+  // Lower rsram-to-rsram copies through tile-loop-shaped serial loops so
+  // LegalizeTilesLoop/TilesLoop can route them through the tile unit.
+  Array<Var> loop_vars;
+  loop_vars.reserve(src_range.size());
+  for (size_t i = 0; i < src_range.size(); ++i) {
+    loop_vars.push_back(
+        Var("v" + std::to_string(i), src_range[i]->extent.dtype()));
+    analyzer->Bind(loop_vars[i], Range::FromMinExtent(0, src_range[i]->extent));
+  }
+
+  auto make_indices = [&](const Array<Range> &ranges) {
+    ICHECK_EQ(loop_vars.size(), ranges.size());
+    Array<PrimExpr> indices;
+    indices.reserve(ranges.size());
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      if (is_one(ranges[i]->extent)) {
+        indices.push_back(ranges[i]->min);
+      } else {
+        indices.push_back(ranges[i]->min + loop_vars[i]);
+      }
+    }
+    return indices;
+  };
+
+  auto make_predicate = [&](const Array<Range> &ranges,
+                            const Array<PrimExpr> &buffer_shape) {
+    ICHECK_EQ(loop_vars.size(), ranges.size());
+    ICHECK_EQ(buffer_shape.size(), ranges.size());
+
+    Array<PrimExpr> cond_list;
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      PrimExpr idx = is_one(ranges[i]->extent) ? ranges[i]->min
+                                               : ranges[i]->min + loop_vars[i];
+
+      PrimExpr upper = idx < buffer_shape[i];
+      if (!analyzer->CanProve(upper, arith::ProofStrength::kSymbolicBound)) {
+        cond_list.push_back(upper);
+      }
+
+      PrimExpr lower = idx >= 0;
+      if (!analyzer->CanProve(lower, arith::ProofStrength::kSymbolicBound)) {
+        cond_list.push_back(lower);
+      }
+    }
+
+    if (cond_list.empty()) {
+      return PrimExpr();
+    }
+
+    PrimExpr predicate = cond_list[0];
+    for (size_t i = 1; i < cond_list.size(); ++i) {
+      predicate = And(predicate, cond_list[i]);
+    }
+    return predicate;
+  };
+
+  Array<PrimExpr> src_indices = make_indices(src_range);
+  Array<PrimExpr> dst_indices = make_indices(dst_range);
+  PrimExpr src_predicate = make_predicate(src_range, src->shape);
+  PrimExpr dst_predicate = make_predicate(dst_range, dst->shape);
+
+  PrimExpr value = BufferLoad(src, src_indices);
+  if (src->dtype != dst->dtype) {
+    value = Cast(dst->dtype, value);
+  }
+  if (src_predicate.defined()) {
+    value = if_then_else(src_predicate, value, make_zero(dst->dtype));
+  }
+
+  Stmt body = BufferStore(dst, value, dst_indices);
+  if (dst_predicate.defined()) {
+    body = IfThenElse(dst_predicate, body);
+  }
+
+  Map<String, ObjectRef> tile_annotations;
+  tile_annotations.Set(tl::attr::tile_level_loop, Integer(1));
+  tile_annotations.Set(tl::attr::tiled_buffer, src->data);
+  tile_annotations.Set(tl::attr::kTileLoopStage,
+                       Integer(static_cast<int>(TileLoopStage::kInitial)));
+
+  for (int i = static_cast<int>(loop_vars.size()) - 1; i >= 0; --i) {
+    body = For(loop_vars[i], 0, src_range[i]->extent, ForKind::kSerial, body,
+               std::nullopt, tile_annotations);
+  }
+  return body;
 }
 
 // Lowers the copy using standard load/store with loop transformations.

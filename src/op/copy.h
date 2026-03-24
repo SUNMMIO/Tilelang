@@ -22,11 +22,12 @@ enum class CopyInst : uint8_t {
   kBulkStore = 4, // utilize tma store
   // we should separate the bulk load and store for 1d and multi-dim
   // as they have different memory access patterns
-  kBulkLoad1D = 5,     // utilize tma load 1d
-  kBulkStore1D = 6,    // utilize tma store 1d
-  kTMemLoad = 7,       // tcgen05.ld (tensor memory -> register)
-  kTMemStore = 8,      // tcgen05.st (register -> tensor memory)
-  kSunmmioDMACopy = 9, // Sunmmio DMA
+  kBulkLoad1D = 5,       // utilize tma load 1d
+  kBulkStore1D = 6,      // utilize tma store 1d
+  kTMemLoad = 7,         // tcgen05.ld (tensor memory -> register)
+  kTMemStore = 8,        // tcgen05.st (register -> tensor memory)
+  kSunmmioDMACopy = 9,   // Sunmmio DMA Copy
+  kSunmmioTileCopy = 10, // Sunmmio Tile-based Copy
 };
 
 /// Convert CopyInst enum to string for debugging
@@ -52,6 +53,8 @@ inline const char *CopyInstToString(CopyInst inst) {
     return "TMemStore";
   case CopyInst::kSunmmioDMACopy:
     return "SunmmioDMACopy";
+  case CopyInst::kSunmmioTileCopy:
+    return "SunmmioTileCopy";
   default:
     return "Unknown";
   }
@@ -234,6 +237,11 @@ public:
   bool CheckSunmmioDMACopy(Target target) const;
 
   /*!
+   * \brief Check if Sunmmio tile-based copy is supported.
+   */
+  bool CheckSunmmioTileCopy(Target target) const;
+
+  /*!
    * \brief Get the copy instruction type.
    */
   CopyInst GetCopyInst(Target target, bool disable_tma_lower,
@@ -277,6 +285,14 @@ protected:
    * buffer region semantics for later SUNMMIO codegen consumption.
    */
   Stmt LowerSunmmioDmaCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
+
+  /*!
+   * \brief Generate lowering for SUNMMIO Tile-based copy.
+   *
+   * Emits a T.Tiles for-loop to copy data between shared.rsram buffers
+   */
+  Stmt LowerSunmmioTileCopy(const LowerArgs &T,
+                            arith::Analyzer *analyzer) const;
 
   /*!
    * \brief Generate SIMT (thread-level) loop for copying.
