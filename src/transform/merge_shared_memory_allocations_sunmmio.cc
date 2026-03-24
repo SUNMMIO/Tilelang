@@ -42,6 +42,9 @@
 #include <utility>
 
 #include "../op/builtin.h"
+#include "../op/comm.h"
+#include "../op/region.h"
+#include "../op/utils.h"
 #include "../target/utils.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
@@ -63,7 +66,8 @@ static bool IsScope(const Var &v, const std::string &scope) {
 }
 
 /*!
- * \brief collect the mapping from the buffer var to its allocate
+ * \brief collect the mapping from the buffer var to its allocate group by the
+ * type(asram,wsram,rsram)
  */
 class AllocateCollectorSunmmio : public StmtExprVisitor {
 public:
@@ -75,15 +79,16 @@ public:
     } else if (IsScope(op->buffer_var, ScopeR)) {
       rsram_allocs_[op->buffer_var.get()] = op;
     } else {
-      LOG(DEBUG) << "tmp_debug allocNode type error: "
-                 << GetPtrStorageScope(op->buffer_var);
+      LOG(INFO) << "unsupported buffer scope:"
+                << GetPtrStorageScope(op->buffer_var);
     }
     StmtExprVisitor::VisitStmt_(op);
   }
-  // The dynamic mapping from the original buffer var to its allocate
+  // The asram mapping from the original buffer var to its allocate
   std::unordered_map<const VarNode *, const AllocateNode *> asram_allocs_;
-  // The static mapping from the original buffer var to its allocate
+  // The wsram mapping from the original buffer var to its allocate
   std::unordered_map<const VarNode *, const AllocateNode *> wsram_allocs_;
+  // The rsram mapping from the original buffer var to its allocate
   std::unordered_map<const VarNode *, const AllocateNode *> rsram_allocs_;
 };
 
@@ -128,19 +133,6 @@ public:
     const AllocateNode *alloc{nullptr};
   };
 
-  struct StmtAttr {
-    // the level in the scope stack
-    size_t level{0};
-  };
-
-  void UpdateStmtAttr(const Object *stmt, size_t level) {
-    if (stmt_attrs_.find(stmt) == stmt_attrs_.end()) {
-      stmt_attrs_[stmt] = StmtAttr{level};
-    } else {
-      stmt_attrs_[stmt].level = level;
-    }
-  }
-
   void VisitStmt_(const AllocateNode *op) final {
     size_t level = scope_.size();
     const VarNode *buf = op->buffer_var.get();
@@ -163,7 +155,8 @@ public:
       if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
         // set into scope_.size() - 1 for aggressive memory reuse
         auto enable_aggressive_merge = enable_aggressive_merge_;
-        if (enable_aggressive_merge) {
+        // 在循环外才可以使用aggressive策略
+        if (enable_aggressive_merge && loop_level_ == 0) {
           scope_[scope_.size() - 1].touched.push_back(buf);
         } else {
           // the scope :first under allocate
@@ -176,7 +169,6 @@ public:
     scope_.pop_back();
     if (!e.touched.empty()) {
       e.stmt = op;
-      UpdateStmtAttr(op, scope_level_);
       linear_seq_.push_back(e);
     }
   }
@@ -189,7 +181,6 @@ public:
     scope_.pop_back();
     if (!e.touched.empty()) {
       e.stmt = op;
-      UpdateStmtAttr(op, scope_level_);
       linear_seq_.push_back(e);
     }
   }
@@ -210,7 +201,7 @@ public:
           << "Load memory in places other than store.";
       if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
         auto enable_aggressive_merge = enable_aggressive_merge_;
-        if (enable_aggressive_merge) {
+        if (enable_aggressive_merge && loop_level_ == 0) {
           scope_[scope_.size() - 1].touched.push_back(buf);
         } else {
           // When the access happens in the same scope frame as the allocation
@@ -234,7 +225,7 @@ public:
       ICHECK_LE(it->second.level, scope_.size());
       if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
         auto enable_aggressive_merge = enable_aggressive_merge_;
-        if (enable_aggressive_merge) {
+        if (enable_aggressive_merge && loop_level_ == 0) {
           scope_[scope_.size() - 1].touched.push_back(buf);
         } else {
           // Attribute same-level uses to the allocation frame, mirroring the
@@ -246,11 +237,80 @@ public:
     }
   }
 
+  // 处理异步操作（dma_copy/mma_sunmmio/broadcast）和其对应的等待操作（wait_token）
+  void VisitExpr_(const CallNode *op) final {
+    StmtExprVisitor::VisitExpr_(op);
+    // 识别异步操作：dma_copy/mma_sunmmio/broadcast，提取sync_token_id和关联buffer
+    if (op->op.same_as(tl::dma_copy()) || op->op.same_as(tl::broadcast_()) ||
+        op->op.same_as(tl::mma_sunmmio())) {
+
+      // 提取sync_token_id（最后一个参数为T.sync_token_id(id)）
+      ICHECK_GE(op->args.size(), 1) << "异步操作必须包含sync_token_id参数";
+      bool t_flag = false;
+      int token_id = -1;
+      if (auto sync_call = op->args.back().as<CallNode>()) {
+        if (sync_call->op.same_as(tl::sync_token_id())) {
+          const IntImmNode *token_id_node = sync_call->args[0].as<IntImmNode>();
+          if (token_id_node) {
+            token_id = token_id_node->value;
+            t_flag = true;
+          }
+        }
+      }
+      // 确保获取到sync_token_id
+      ICHECK(t_flag) << "sync op get sync_token_id error";
+
+      // 提取关联的buffer（遍历参数，除了最后一个）
+      // 采用获取bufferRegion的方式获取参数中的buffer
+      for (size_t i = 0; i < op->args.size() - 1; ++i) {
+        if (auto arg_c = op->args[i].as<CallNode>()) {
+          if (arg_c->op.same_as(RegionOp::Get())) {
+            // 也可以直接解参数里的bufferLoad来获取varNode
+            BufferRegion br = NormalizeToBufferRegion(op->args[i]);
+            const VarNode *buf_var = br->buffer->data.get();
+            if (buf_var &&
+                IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf_var))) {
+              alive_wait_token_set.insert(token_id);
+              token_id_to_buffers_[token_id].push_back(buf_var);
+            }
+          }
+        }
+      }
+    }
+
+    // 2. 识别同步操作：wait_token，补充对应buffer的触及标记
+    if (op->op.same_as(tl::wait_token())) {
+      ICHECK_EQ(op->args.size(), 1) << "wait_token必须传入唯一的int类型id参数";
+      const IntImmNode *token_id_node = op->args[0].as<IntImmNode>();
+      ICHECK(token_id_node) << "wait_token args error:" << op->args[0]->dtype;
+      int token_id = token_id_node->value;
+      auto it = token_id_to_buffers_.find(token_id);
+      // 可能有token_id的先使用再定义，仅在循环中出现
+      // 循环中禁aggressive,颠倒的buffer后面肯定会出现，还会触及计入for,所以可以不用管
+      if (it == token_id_to_buffers_.end()) {
+        return;
+      }
+      alive_wait_token_set.erase(token_id);
+      // 为异步操作中的buffer补充触及标记
+      for (const VarNode *buf_var : it->second) {
+        auto alloc_it = alloc_info_.find(buf_var);
+        if (alloc_it == alloc_info_.end())
+          continue;
+        // wait_token在EvalateNode里，所以直接操作即可
+        if (enable_aggressive_merge_ && loop_level_ == 0) {
+          scope_[scope_.size() - 1].touched.push_back(buf_var);
+        } else {
+          // wait在evaluateNode中,必然在allocateNode层级内，所以直接去alloc层级即可
+          scope_[alloc_it->second.level].touched.push_back(buf_var);
+        }
+      }
+    }
+  }
+
   template <typename T> void VisitNewScope(const T *op) {
     scope_.push_back(StmtEntry());
     StmtEntry e;
     e.stmt = op;
-    UpdateStmtAttr(op, scope_level_);
     int64_t begin_index = static_cast<int64_t>(linear_seq_.size());
     // before scope.
     linear_seq_.push_back(e);
@@ -274,6 +334,21 @@ public:
     if (op->attr_key == tir::attr::thread_extent && !in_thread_env_) {
       in_thread_env_ = true;
       VisitNewScope(op);
+
+      // 最后，将未释放的token对应的buffer加到最后
+      for (int token_id : alive_wait_token_set) {
+        auto it = token_id_to_buffers_.find(token_id);
+        if (it == token_id_to_buffers_.end()) {
+          continue;
+        }
+        const std::vector<const VarNode *> &buffers = it->second;
+        for (const VarNode *buf : buffers) {
+          if (buf == nullptr) {
+            continue;
+          }
+          linear_seq_.back().touched.push_back(buf);
+        }
+      }
       in_thread_env_ = false;
     } else if (op->attr_key == tir::attr::extern_scope) {
       VisitNewScope(op);
@@ -292,29 +367,17 @@ public:
 
   void VisitStmt_(const IfThenElseNode *op) final { VisitNewScope(op); }
 
-  bool ContainsSeqStmt(const Stmt &stmt) {
-    if (stmt->IsInstance<SeqStmtNode>()) {
-      return true;
-    }
-    if (const auto *if_node = stmt.as<IfThenElseNode>()) {
-      return ContainsSeqStmt(if_node->then_case) ||
-             (if_node->else_case.defined() &&
-              ContainsSeqStmt(if_node->else_case.value()));
-    }
-    return false;
-  }
-
   void VisitStmt_(const ForNode *op) final {
-    if (ContainsSeqStmt(op->body)) {
-      scope_level_++;
-      VisitNewScope(op);
-      scope_level_--;
-    } else {
-      VisitNewScope(op);
-    }
+    loop_level_++;
+    VisitNewScope(op);
+    loop_level_--;
   }
 
-  void VisitStmt_(const WhileNode *op) final { VisitNewScope(op); }
+  void VisitStmt_(const WhileNode *op) final {
+    loop_level_++;
+    VisitNewScope(op);
+    loop_level_--;
+  }
 
   void VisitStmt_(const AssertStmtNode *op) final { VisitNewScope(op); }
 
@@ -322,8 +385,6 @@ public:
   std::vector<StmtEntry> linear_seq_;
   // The storage scope of each buffer
   std::unordered_map<const VarNode *, AllocEntry> alloc_info_;
-  // The attribute of each statement
-  std::unordered_map<const Object *, StmtAttr> stmt_attrs_;
 
 private:
   // Wrapper function to determine if the shared memory allocation for a
@@ -341,8 +402,12 @@ private:
   bool in_thread_env_{false};
   // The scope stack.
   std::vector<StmtEntry> scope_;
-  // The size of the scope.
-  size_t scope_level_{0};
+  // The size of the loop. 循环嵌套层级
+  size_t loop_level_{0};
+  // 异步操作，wait_token id 对应的buffers
+  std::unordered_map<int, std::vector<const VarNode *>> token_id_to_buffers_;
+  // 异步操作，还每执行wait的tokens
+  std::unordered_set<int> alive_wait_token_set;
 };
 
 class SharedMemoryAlignmentPlannerSunmmio : public StmtExprVisitor {
@@ -433,8 +498,8 @@ public:
     shmem_alignment_map_ = SharedMemoryAlignmentPlannerSunmmio::Plan(stmt);
     // First compute liveness over the flattened schedule, then feed it into the
     // arena packer.
-    this->LivenessAnalysis(finder.linear_seq_, finder.stmt_attrs_);
-    this->PlanMemory(finder.linear_seq_, finder.stmt_attrs_);
+    this->LivenessAnalysis(finder.linear_seq_);
+    this->PlanMemory(finder.linear_seq_);
   }
 
 private:
@@ -563,46 +628,6 @@ private:
       return Call(op->dtype, op->op,
                   {op->args[0], merged_buf_var_, extra_offset + offset, extent,
                    op->args[4]});
-    } else if (op->op.same_as(builtin::ptx_cp_async())) {
-      ICHECK_EQ(op->args.size(), 3U)
-          << "ptx_cp_async expects 3 arguments (dst_access_ptr, "
-             "src_access_ptr, bytes)";
-
-      // Extract dst_access_ptr and check if it needs merging
-      Call dst_access_ptr = Downcast<Call>(op->args[0]);
-      ICHECK(dst_access_ptr->op.same_as(builtin::tvm_access_ptr()))
-          << "First argument must be tvm_access_ptr";
-
-      // tvm_access_ptr(ptype, data, offset, extent, rw_mask)
-      Var buffer = Downcast<Var>(dst_access_ptr->args[1]);
-      if (!IsAppropriateSharedMemory(buffer)) {
-        return StmtExprMutator::VisitExpr_(op);
-      }
-
-      DataType dtype = op->dtype;
-      PrimExpr extra_offset = GetBufferOffset(buffer, dtype);
-      PrimExpr offset = this->VisitExpr(dst_access_ptr->args[2]);
-      // the dst shared memory is a byte buffer generated by merging shared
-      // memory. we need to multiply the offset index by the byte size of the
-      // original value dtype, to get the correct offset of merged shared
-      // buffer.
-      int index_factor = dtype.bytes();
-
-      // Create new dst_access_ptr with merged buffer and adjusted offset
-      auto new_dst_access_ptr =
-          Call(DataType::Handle(), builtin::tvm_access_ptr(),
-               {
-                   dst_access_ptr->args[0], // ptype
-                   merged_buf_var_,         // merged buffer
-                   mul(extra_offset + offset,
-                       PrimExpr(index_factor)), // adjusted offset
-                   dst_access_ptr->args[3],     // extent
-                   dst_access_ptr->args[4]      // rw_mask
-               });
-
-      // Keep src_access_ptr and bytes unchanged
-      return Call(dtype, op->op,
-                  {new_dst_access_ptr, op->args[1], op->args[2]});
     } else {
       return StmtExprMutator::VisitExpr_(op);
     }
@@ -622,7 +647,6 @@ private:
   }
 
   using StmtEntry = SharedMemLinearAccessPatternFinderSunmmio::StmtEntry;
-  using StmtAttr = SharedMemLinearAccessPatternFinderSunmmio::StmtAttr;
 
   // Metadata about a single shared-memory allocation prior to merging.  This
   // is used to build lifetimes, alignment requirements, and final offsets.
@@ -826,25 +850,11 @@ private:
     std::vector<const VarNode *> kill;
   };
 
-  void PlanAlignment(const Stmt &stmt) {
-    DLOG(INFO) << "PlanAlignment";
-    PostOrderVisit(stmt, [&](const ObjectRef &node) {
-      if (const auto *call = node.as<CallNode>()) {
-        if (call->op.same_as(tl::tl_gemm()) ||
-            call->op.same_as(tl::tl_gemm_sp())) {
-          DLOG(INFO) << "PostOrderVisit CallNode tl_gemm and tl_gemm_sp: "
-                     << call->op;
-        }
-      }
-    });
-  }
   /*!
    * \brief Liveness analysis to find gen and kill point of each variable.
    * \param seq the linear pattern of storage access
    */
-  void LivenessAnalysis(
-      const std::vector<StmtEntry> &seq,
-      const std::unordered_map<const Object *, StmtAttr> &stmt_attrs) {
+  void LivenessAnalysis(const std::vector<StmtEntry> &seq) {
     // find kill point, do a reverse linear scan.
     std::unordered_set<const VarNode *> touched;
     for (size_t i = seq.size(); i != 0; --i) {
@@ -890,11 +900,6 @@ private:
         const EventEntry &entry = it->second;
         if (entry.gen.empty() && entry.kill.empty())
           continue;
-        ICHECK(stmt_attrs.count(stmt_key))
-            << "stmt_key = " << stmt_key->GetTypeKey();
-        auto level = stmt_attrs.at(stmt_key).level;
-        LOG(DEBUG) << "  Statement: " << stmt_key->GetTypeKey()
-                   << " (scope_level: " << level << ")";
 
         std::stringstream gen_vars_ss;
         bool x_generated = false;
@@ -945,76 +950,6 @@ private:
       }
     }
 
-    for (auto &event_pair : event_map_) {
-      const Object *stmt = event_pair.first;
-      EventEntry &event = event_pair.second;
-
-      // Skip if no kill points to process
-      if (event.kill.empty())
-        continue;
-
-      // Get scope level of current statement
-      ICHECK(stmt_attrs.count(stmt));
-      int kill_level = stmt_attrs.at(stmt).level;
-
-      std::unordered_set<const VarNode *> visited_buffers;
-
-      // For each killed buffer, find its gen statement and check scope levels
-      for (auto it = event.kill.begin(); it != event.kill.end();) {
-        const VarNode *buffer = *it;
-        bool found_gen = false;
-        int gen_level = 0;
-
-        // Find the gen statement for this buffer
-        for (const auto &gen_pair : event_map_) {
-          const auto &gen_event = gen_pair.second;
-          if (std::find(gen_event.gen.begin(), gen_event.gen.end(), buffer) !=
-              gen_event.gen.end()) {
-            found_gen = true;
-            gen_level = stmt_attrs.at(gen_pair.first).level;
-            break;
-          }
-        }
-
-        if (found_gen && kill_level > gen_level) {
-          if (visited_buffers.count(buffer)) {
-            ++it;
-            continue;
-          }
-          // Need to move kill point - remove from current event
-          it = event.kill.erase(it);
-
-          // Find the last statement at gen_level and add kill point there
-          // Find the last statement at gen_level in the sequence
-          const Object *last_stmt_at_level = nullptr;
-          auto stmt_it = gen_kill_seq.begin();
-          for (; stmt_it != gen_kill_seq.end(); ++stmt_it) {
-            if (stmt_it->stmt == stmt) {
-              break;
-            }
-          }
-          // start from current statement and find the last statement at
-          // gen_level
-
-          for (; stmt_it != gen_kill_seq.end(); ++stmt_it) {
-            // Check if next statement has different level
-            auto next_it = stmt_it + 1;
-            if (next_it == gen_kill_seq.end() ||
-                stmt_attrs.at(next_it->stmt).level == gen_level) {
-              last_stmt_at_level = stmt_it->stmt;
-              break;
-            }
-          }
-          if (last_stmt_at_level) {
-            event_map_[last_stmt_at_level].kill.push_back(buffer);
-            visited_buffers.insert(buffer);
-          }
-        } else {
-          ++it;
-        }
-      }
-    }
-
     std::vector<const Object *> stmt_keys;
     for (const auto &stmt_entry : seq) {
       auto stmt = stmt_entry.stmt;
@@ -1035,11 +970,6 @@ private:
         const EventEntry &entry = it->second;
         if (entry.gen.empty() && entry.kill.empty())
           continue;
-        ICHECK(stmt_attrs.count(stmt_key))
-            << "stmt_key = " << stmt_key->GetTypeKey();
-        auto level = stmt_attrs.at(stmt_key).level;
-        LOG(DEBUG) << "  Statement: " << stmt_key->GetTypeKey()
-                   << " (scope_level: " << level << ")";
 
         std::stringstream gen_vars_ss;
         bool x_generated = false;
@@ -1082,11 +1012,8 @@ private:
    * \param seq the linear pattern of storage access
    * \param alloc_info
    */
-  void
-  PlanMemory(const std::vector<StmtEntry> &seq,
-             const std::unordered_map<const Object *, StmtAttr> &stmt_attrs) {
+  void PlanMemory(const std::vector<StmtEntry> &seq) {
     buffer_byte_offsets_.clear();
-    (void)stmt_attrs;
 
     if (shmem_allocs_.empty()) {
       merged_alloc_size_ = make_const(DataType::Int(64), 0);
@@ -1400,6 +1327,8 @@ Pass MergeSharedMemoryAllocationsSunmmio(bool enable_aggressive_merge = false,
     bool debug_merge_shared_memory_allocations =
         ctx->GetConfig<Bool>(kDebugMergeSharedMemoryAllocations, Bool(false))
             .value();
+    LOG(INFO) << "merge_static_smem:" << merge_static_smem
+              << " verbose: " << debug_merge_shared_memory_allocations;
     auto *n = f.CopyOnWrite();
     n->body = tl::MergeSharedMemoryAllocationsSunmmio(
         std::move(n->body), merge_static_smem, enable_aggressive_merge,

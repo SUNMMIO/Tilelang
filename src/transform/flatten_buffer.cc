@@ -34,6 +34,7 @@
 #include <utility>
 
 #include "../op/builtin.h"
+#include "../op/utils.h"
 
 namespace tvm {
 namespace tl {
@@ -288,8 +289,55 @@ private:
       auto result = StmtExprMutator::VisitExpr_(op);
       under_address_of = false;
       return result;
+    } else if (op->op.same_as((RegionOp::Get()))) {
+      // flatten bufferRegion(T.region)
+      return VisitTLRegionCall(op);
     }
     return StmtExprMutator::VisitExpr_(op);
+  }
+
+  // let T.region(A[x,y,...],1,a,b,...) => T.region(A[m],1,n)
+  PrimExpr VisitTLRegionCall(const CallNode *op) {
+    ICHECK_GE(op->args.size(), 3U)
+        << "flatter region error,T.region args.size=" << op->args.size();
+    BufferLoad base_load = Downcast<BufferLoad>(op->args[0]);
+    size_t ndim = base_load->indices.size();
+    ICHECK_EQ(op->args.size(), 2U + ndim)
+        << "flatter region error,T.region args.size=" << op->args.size()
+        << ";buffer ndim=" << ndim;
+
+    Array<Range> ranges;
+    ranges.reserve(ndim);
+    for (size_t i = 0; i < ndim; ++i) {
+      PrimExpr min = this->VisitExpr(base_load->indices[i]);
+      PrimExpr extent = this->VisitExpr(op->args[2 + i]);
+      ranges.push_back(Range::FromMinExtent(min, extent));
+    }
+
+    BufferRegion region =
+        NormalizeToBufferRegion(tvm::ffi::GetRef<PrimExpr>(op));
+    BufferRegion flattened = MutateBufferRegion(std::move(region));
+    BufferLoad new_base_load = base_load;
+    {
+      auto writer = new_base_load.CopyOnWrite();
+      writer->buffer = flattened->buffer;
+      Array<PrimExpr> mins;
+      mins.reserve(flattened->region.size());
+      for (const Range &r : flattened->region) {
+        mins.push_back(r->min);
+      }
+      writer->indices = mins;
+    }
+
+    Array<PrimExpr> new_args;
+    new_args.reserve(2 + flattened->region.size());
+    new_args.push_back(new_base_load);
+    new_args.push_back(this->VisitExpr(op->args[1]));
+    for (const Range &r : flattened->region) {
+      new_args.push_back(r->extent);
+    }
+
+    return Call(op->dtype, op->op, new_args);
   }
 
   Array<PrimExpr> GetSimplifiedElemOffset(const Buffer &buffer,
