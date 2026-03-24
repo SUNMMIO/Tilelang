@@ -323,8 +323,8 @@ def test_inject_sunmmio_sync_if():
         mod = tilelang.transform.InjectSunmmioSync()(mod)
 
     script = mod.script(show_meta=True)
-    assert script[-len(func_str) :] == func_str, "The generated script does not match the expected output."
     print(script)
+    assert script[-len(func_str) :] == func_str, "The generated script does not match the expected output."
 
 
 def test_inject_sunmmio_sync_loop():
@@ -350,31 +350,30 @@ def test_inject_sunmmio_sync_loop():
 
     func_str = """
                 T.dma_copy(T.region(C[by * 32, bx * 32], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), T.sync_token_id(0))
-                    T.sync_null_token(2)
-                    for _i in range(10):
-                        T.wait_token(0)
-                        T.wait_token(2)
-                        T.dma_copy(T.region(D_shared[0, 0], 1, 32, 32), T.region(C_shared[0, 0], 2, 32, 32), T.sync_token_id(1))
-                        T.wait_token(1)
-                        T.dma_copy(T.region(C_shared[0, 0], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), T.sync_token_id(2))
-                    T.sync_null_token(4)
-                    for _i in range(10):
-                        T.wait_token(1)
-                        T.wait_token(4)
-                        T.barrier_arrive_and_wait(1)
-                        T.wait_token(0)
-                        T.wait_token(2)
-                        T.broadcast_(T.region(C_shared[0, 0], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), 1024, 0, 0, T.sync_token_id(3))
-                        T.barrier_init(0, 0, 1, 2, 3)
-                        T.wait_token(3)
-                        T.barrier_arrive_and_wait(0)
-                        T.broadcast_(T.region(D_shared[0, 0], 1, 32, 32), T.region(C_shared[0, 0], 2, 32, 32), 1024, 0, 0, T.sync_token_id(4))
-                        T.barrier_init(1, 0, 1, 2, 3)
-            T.wait_token(0)
-            T.wait_token(1)
-            T.wait_token(2)
-            T.wait_token(3)
-            T.wait_token(4)
+                T.sync_null_token(2)
+                for _i in range(10):
+                    T.wait_token(0)
+                    T.wait_token(2)
+                    T.dma_copy(T.region(D_shared[0, 0], 1, 32, 32), T.region(C_shared[0, 0], 2, 32, 32), T.sync_token_id(1))
+                    T.wait_token(1)
+                    T.dma_copy(T.region(C_shared[0, 0], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), T.sync_token_id(2))
+                T.sync_null_token(4)
+                T.barrier_init(1, 0, 1, 2, 3)
+                for _i in range(10):
+                    T.wait_token(4)
+                    T.barrier_arrive_and_wait(1)
+                    T.wait_token(0)
+                    T.wait_token(2)
+                    T.broadcast_(T.region(C_shared[0, 0], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), 1024, 0, 0, T.sync_token_id(3))
+                    T.barrier_init(0, 0, 1, 2, 3)
+                    T.wait_token(3)
+                    T.barrier_arrive_and_wait(0)
+                    T.broadcast_(T.region(D_shared[0, 0], 1, 32, 32), T.region(C_shared[0, 0], 2, 32, 32), 1024, 0, 0, T.sync_token_id(4))
+                    T.barrier_init(1, 0, 1, 2, 3)
+                T.wait_token(0)
+                T.wait_token(2)
+                T.wait_token(4)
+                T.barrier_arrive_and_wait(1)
     """.strip()
 
     M, N = 128, 128
@@ -392,8 +391,8 @@ def test_inject_sunmmio_sync_loop():
 
 
 if __name__ == "__main__":
-    # test_inject_sunmmio_sync_dma()
-    # test_inject_sunmmio_sync_mma()
-    # test_inject_sunmmio_sync_broadcast()
-    # test_inject_sunmmio_sync_if()
+    test_inject_sunmmio_sync_dma()
+    test_inject_sunmmio_sync_mma()
+    test_inject_sunmmio_sync_broadcast()
+    test_inject_sunmmio_sync_if()
     test_inject_sunmmio_sync_loop()

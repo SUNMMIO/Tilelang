@@ -115,27 +115,7 @@ private:
         const BufferRegion buffer_region = BufferRegion::FullRegion(buffer);
         reads_.push_back(buffer_region);
       }
-    }
-    // else if (op->op.same_as(tl::mbarrier_wait_parity())) {
-    //   ICHECK(args[0].as<BufferLoadNode>());
-    //   Buffer mbar_buf = args[0].as<BufferLoadNode>()->buffer;
-    //   auto buffer_reads =
-    //       chain_builder_.mbar_to_buffer_reads_.find(mbar_buf.get());
-    //   auto buffer_writes =
-    //       chain_builder_.mbar_to_buffer_writes_.find(mbar_buf.get());
-    //   if (buffer_reads != chain_builder_.mbar_to_buffer_reads_.end()) {
-    //     reads_.insert(reads_.end(), buffer_reads->second.begin(),
-    //                   buffer_reads->second.end());
-    //   }
-    //   if (buffer_writes != chain_builder_.mbar_to_buffer_writes_.end()) {
-    //     writes_.insert(
-    //         writes_.end(),
-    //         chain_builder_.mbar_to_buffer_writes_.at(mbar_buf.get()).begin(),
-    //         chain_builder_.mbar_to_buffer_writes_.at(mbar_buf.get()).end());
-    //   }
-    // }
-
-    else {
+    } else {
       ExprVisitor::VisitExpr_(op);
     }
   }
@@ -173,6 +153,7 @@ public:
 struct LoopScope {
   Array<Array<ObjectRef>> writes;
   Map<Array<ObjectRef>, int> token_map;
+  std::map<int, const CallNode *> token_to_call;
   Var loop_var;
   PrimExpr min;
   std::set<int> waited_tokens;
@@ -359,6 +340,8 @@ private:
     stmts.push_back(Evaluate(Call(call->dtype, call->op, new_args)));
   }
 
+  // Helper to construct and inject a barrier_init call.
+  // Also establishes the mappings between the generated token and barrier IDs.
   void init_barrier_(Array<Stmt> &stmts, int barrier_id, int token_id,
                      Integer read_core, Array<Integer> write_cores = {}) {
     Array<PrimExpr> args;
@@ -378,6 +361,60 @@ private:
     barrier_to_token_map.Set(barrier_id, token_id);
   }
 
+  // Analyzes a broadcast operation and initializes a barrier for it.
+  // Calculates the read core and write cores based on the mesh topology
+  // (rows/cols) and the broadcast direction (horizontal or vertical),
+  // considering given masks.
+  void process_broadcast_barrier(const CallNode *call, int curr_token_id,
+                                 int curr_barrier_id, Array<Stmt> &stmts) {
+    auto src_core = call->args[3].as<Integer>().value();
+    int direction = call->args[4].as<IntImm>().value()->value;
+    Array<int> masks;
+    for (size_t i = 5; i < call->args.size(); i++) {
+      masks.push_back(call->args[i].as<IntImm>().value()->value);
+    }
+
+    int src_core_row = src_core->value / mesh_ncol_;
+    int src_core_col = src_core->value % mesh_ncol_;
+    auto read_cores = Array<Integer>{src_core};
+    Array<Integer> write_cores;
+    bool mask_flag = false;
+    if (direction == 0) { // horizontal
+      for (int j = 0; j < mesh_ncol_; j++) {
+        for (const auto &mask : masks) {
+          if (mask == j) {
+            mask_flag = true;
+            break;
+          }
+        }
+        if (mask_flag) {
+          mask_flag = false;
+          continue;
+        }
+        write_cores.push_back(Integer(src_core_row * mesh_ncol_ + j));
+      }
+    } else if (direction == 1) { // vertical
+      for (int i = 0; i < mesh_nrow_; i++) {
+        for (const auto &mask : masks) {
+          if (mask == i) {
+            mask_flag = true;
+            break;
+          }
+        }
+        if (mask_flag) {
+          mask_flag = false;
+          continue;
+        }
+        write_cores.push_back(Integer(i * mesh_ncol_ + src_core_col));
+      }
+    }
+
+    init_barrier_(stmts, curr_barrier_id, curr_token_id, src_core, write_cores);
+  }
+
+  // Extracts all buffer read and write accesses from a primitive expression
+  // and processes their dependencies to inject necessary synchronization
+  // tokens.
   void token_process_prim_expr(const PrimExpr &expr, Array<Stmt> &stmts) {
     auto buf_load_collector = BufferAccessCollector(buffer_data_to_buffer_);
     buf_load_collector(expr);
@@ -418,8 +455,10 @@ private:
       int token = GetNextTokenId();
       pre_assigned_tokens_[p.first] = token;
 
-      // check if it is a broadcast
       const CallNode *call = p.first->value.as<CallNode>();
+      scope.token_to_call[token] = call;
+
+      // check if it is a broadcast
       if (call && call->op.same_as(broadcast_())) {
         int barrier = GetNextBarrierId();
         token_to_barrier_map.Set(token, barrier);
@@ -444,6 +483,13 @@ private:
     for (int token : scope.waited_tokens) {
       stmts.push_back(Evaluate(Call(DataType::Handle(), sync_null_token(),
                                     {IntImm(DataType::Int(32), token)})));
+      if (scope.token_to_call.count(token)) {
+        const CallNode *call = scope.token_to_call[token];
+        if (call && call->op.same_as(broadcast_())) {
+          int barrier_id = token_to_barrier_map[token];
+          process_broadcast_barrier(call, token, barrier_id, stmts);
+        }
+      }
     }
 
     stmts.push_back(loop_stmt);
@@ -562,48 +608,6 @@ private:
           curr_barrier_id = GetNextBarrierId();
         }
 
-        auto src_core = call->args[3].as<Integer>().value();
-        int direction = call->args[4].as<IntImm>().value()->value;
-        Array<int> masks;
-        for (size_t i = 5; i < call->args.size(); i++) {
-          masks.push_back(call->args[i].as<IntImm>().value()->value);
-        }
-
-        int src_core_row = src_core->value / mesh_ncol_;
-        int src_core_col = src_core->value % mesh_ncol_;
-        auto read_cores = Array<Integer>{src_core};
-        Array<Integer> write_cores;
-        bool mask_flag = false;
-        if (direction == 0) { // horizontal
-          for (int j = 0; j < mesh_ncol_; j++) {
-            for (const auto &mask : masks) {
-              if (mask == j) {
-                mask_flag = true;
-                break;
-              }
-            }
-            if (mask_flag) {
-              mask_flag = false;
-              continue;
-            }
-            write_cores.push_back(Integer(src_core_row * mesh_ncol_ + j));
-          }
-        } else if (direction == 1) { // vertical
-          for (int i = 0; i < mesh_nrow_; i++) {
-            for (const auto &mask : masks) {
-              if (mask == i) {
-                mask_flag = true;
-                break;
-              }
-            }
-            if (mask_flag) {
-              mask_flag = false;
-              continue;
-            }
-            write_cores.push_back(Integer(i * mesh_ncol_ + src_core_col));
-          }
-        }
-
         token_process_read_buffer(NormalizeToBufferRegion(call->args[0]), stmts,
                                   curr_token_id);
         token_process_write_buffer(NormalizeToBufferRegion(call->args[1]),
@@ -611,16 +615,7 @@ private:
 
         curr_stmt_with_token_id(call, stmts, curr_token_id);
 
-        init_barrier_(stmts, curr_barrier_id, curr_token_id, src_core,
-                      write_cores);
-
-        // stmts.push_back(
-        //     Evaluate(Call(DataType::Handle(), wait_token(),
-        //                   {IntImm(DataType::Int(32), curr_token_id)})));
-
-        // stmts.push_back(
-        //     Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
-        //                   {IntImm(DataType::Int(32), curr_barrier_id)})));
+        process_broadcast_barrier(call, curr_token_id, curr_barrier_id, stmts);
 
         return SeqStmt::Flatten(stmts);
       }
@@ -717,8 +712,10 @@ private:
       int token = GetNextTokenId();
       pre_assigned_tokens_[p.first] = token;
 
-      // check if it is a broadcast
       const CallNode *call = p.first->value.as<CallNode>();
+      scope.token_to_call[token] = call;
+
+      // check if it is a broadcast
       if (call && call->op.same_as(broadcast_())) {
         int barrier = GetNextBarrierId();
         token_to_barrier_map.Set(token, barrier);
@@ -743,6 +740,13 @@ private:
     for (int token : scope.waited_tokens) {
       stmts.push_back(Evaluate(Call(DataType::Handle(), sync_null_token(),
                                     {IntImm(DataType::Int(32), token)})));
+      if (scope.token_to_call.count(token)) {
+        const CallNode *call = scope.token_to_call[token];
+        if (call && call->op.same_as(broadcast_())) {
+          int barrier_id = token_to_barrier_map[token];
+          process_broadcast_barrier(call, token, barrier_id, stmts);
+        }
+      }
     }
 
     stmts.push_back(loop_stmt);
@@ -805,6 +809,9 @@ public:
   std::vector<int> get_barrier_wait_ids() const { return barrier_wait_ids_; }
 
 private:
+  // Extracts barrier_init and barrier_arrive_and_wait calls, keeping track of
+  // their presence within the current control flow block to inform dependency
+  // analysis.
   Stmt VisitStmt_(const EvaluateNode *op) {
     const CallNode *call = op->value.as<CallNode>();
     if (call) {
@@ -831,6 +838,10 @@ private:
     return StmtMutator::VisitStmt_(op);
   }
 
+  // Handles control flow branching for barrier synchronization.
+  // Analyzes then/else cases separately to ensure any barriers initialized
+  // inside the branches are appropriately waited on or hoisted to the parent
+  // scope.
   Stmt VisitStmt_(const IfThenElseNode *op) {
     Array<Stmt> stmts;
     auto barrier_init_then_rewriter =
@@ -909,66 +920,68 @@ private:
   Map<int, int> barrier_to_token_map_;
 };
 
-// Optimization pass to remove redundant synchronization calls.
-// If a token or barrier has already been waited on in the current execution
-// path, subsequent waits are unnecessary.
-class BlockWaitRewriter : public StmtMutator {
+// Rewriter to inject final synchronization waits at the end of the device
+// execution scope. This ensures all pending asynchronous operations are
+// completed before the device kernel finishes.
+class DeviceScopeWaitRewriter : public StmtMutator {
 public:
-  BlockWaitRewriter(Map<int, int> token_to_barrier_map)
+  DeviceScopeWaitRewriter(Map<int, int> token_to_barrier_map)
       : token_to_barrier_map_(std::move(token_to_barrier_map)) {}
 
   Stmt VisitStmt_(const BlockNode *op) final {
-    Stmt new_body = StmtMutator::VisitStmt(op->body);
+    // If the block is the device root block (e.g., "tilelang_root" or "root" in
+    // lowered IR without SplitHostDevice) we should apply the exit wait logic.
+    // For typical tilelang lowering, "tilelang_root" represents the device
+    // scope.
+    if (op->name_hint == "tilelang_root" || op->name_hint == "root") {
+      Stmt new_body = StmtMutator::VisitStmt(op->body);
 
-    BlockTokenCollector collector;
-    collector(op->body);
+      DeviceTokenCollector collector;
+      collector(op->body);
 
-    if (collector.tokens.empty()) {
-      if (new_body.same_as(op->body)) {
-        return ffi::GetRef<Stmt>(op);
+      if (collector.tokens.empty()) {
+        if (new_body.same_as(op->body)) {
+          return ffi::GetRef<Stmt>(op);
+        }
+        auto n = CopyOnWrite(op);
+        n->body = new_body;
+        return Stmt(n);
       }
+
+      Array<Stmt> stmts;
+      if (const auto *seq = new_body.as<SeqStmtNode>()) {
+        stmts = seq->seq;
+      } else {
+        stmts.push_back(new_body);
+      }
+
+      std::vector<int> tokens(collector.tokens.begin(), collector.tokens.end());
+      std::sort(tokens.begin(), tokens.end());
+
+      for (int token_id : tokens) {
+        stmts.push_back(Evaluate(Call(DataType::Handle(), wait_token(),
+                                      {IntImm(DataType::Int(32), token_id)})));
+        if (token_to_barrier_map_.count(token_id)) {
+          int barrier_id = token_to_barrier_map_[token_id];
+          stmts.push_back(
+              Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
+                            {IntImm(DataType::Int(32), barrier_id)})));
+        }
+      }
+
       auto n = CopyOnWrite(op);
-      n->body = new_body;
+      n->body = SeqStmt::Flatten(stmts);
       return Stmt(n);
     }
-
-    Array<Stmt> stmts;
-    if (const auto *seq = new_body.as<SeqStmtNode>()) {
-      stmts = seq->seq;
-    } else {
-      stmts.push_back(new_body);
-    }
-
-    std::vector<int> tokens(collector.tokens.begin(), collector.tokens.end());
-    std::sort(tokens.begin(), tokens.end());
-
-    for (int token_id : tokens) {
-      stmts.push_back(Evaluate(Call(DataType::Handle(), wait_token(),
-                                    {IntImm(DataType::Int(32), token_id)})));
-      if (token_to_barrier_map_.count(token_id)) {
-        int barrier_id = token_to_barrier_map_[token_id];
-        stmts.push_back(
-            Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
-                          {IntImm(DataType::Int(32), barrier_id)})));
-      }
-    }
-
-    auto n = CopyOnWrite(op);
-    n->body = SeqStmt::Flatten(stmts);
-    return Stmt(n);
+    return StmtMutator::VisitStmt_(op);
   }
 
 private:
   Map<int, int> token_to_barrier_map_;
 
-  class BlockTokenCollector : public StmtExprVisitor {
+  // Helper to collect all token IDs referenced within the device block.
+  class DeviceTokenCollector : public StmtExprVisitor {
   public:
-    void VisitStmt_(const BlockRealizeNode *op) final {
-      // Do not visit inner blocks
-    }
-    void VisitStmt_(const BlockNode *op) final {
-      // Do not visit inner blocks
-    }
     void VisitExpr_(const CallNode *op) final {
       if (op->op.same_as(sync_token_id())) {
         int token_id = op->args[0].as<IntImm>().value()->value;
@@ -980,6 +993,116 @@ private:
   };
 };
 
+// Collector to identify all sync tokens and barriers generated within a given
+// statement or expression. This is primarily used for tracking resources that
+// may need subsequent synchronizations.
+class AsyncResourceCollector : public StmtExprVisitor {
+public:
+  std::set<int> generated_tokens;
+  std::set<int> generated_barriers;
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(sync_token_id()) || op->op.same_as(sync_null_token())) {
+      if (op->args.size() > 0 && op->args[0].as<IntImmNode>()) {
+        int token_id = op->args[0].as<IntImmNode>()->value;
+        generated_tokens.insert(token_id);
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const EvaluateNode *op) final {
+    if (const CallNode *call = op->value.as<CallNode>()) {
+      if (call->op.same_as(barrier_init())) {
+        if (call->args.size() > 0 && call->args[0].as<IntImmNode>()) {
+          int barrier_id = call->args[0].as<IntImmNode>()->value;
+          generated_barriers.insert(barrier_id);
+        }
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+};
+
+// Analyzer to track which tokens and barriers are currently pending (i.e.,
+// generated but not yet waited on) within a specific execution scope. Used to
+// determine if additional waits are required.
+class PendingAnalyzer : public StmtExprVisitor {
+public:
+  PendingAnalyzer(Map<int, int> barrier_to_token_map)
+      : barrier_to_token_map_(barrier_to_token_map) {}
+
+  std::set<int> pending_tokens;
+  std::set<int> pending_barriers;
+  Map<int, int> barrier_to_token_map_;
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(sync_token_id()) || op->op.same_as(sync_null_token())) {
+      if (op->args.size() > 0 && op->args[0].as<IntImmNode>()) {
+        pending_tokens.insert(op->args[0].as<IntImmNode>()->value);
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const EvaluateNode *op) final {
+    if (const CallNode *call = op->value.as<CallNode>()) {
+      if (call->op.same_as(wait_token())) {
+        if (call->args.size() > 0 && call->args[0].as<IntImmNode>()) {
+          pending_tokens.erase(call->args[0].as<IntImmNode>()->value);
+        }
+      } else if (call->op.same_as(barrier_init())) {
+        if (call->args.size() > 0 && call->args[0].as<IntImmNode>()) {
+          pending_barriers.insert(call->args[0].as<IntImmNode>()->value);
+        }
+      } else if (call->op.same_as(barrier_arrive_and_wait())) {
+        if (call->args.size() > 0 && call->args[0].as<IntImmNode>()) {
+          int barrier_id = call->args[0].as<IntImmNode>()->value;
+          pending_barriers.erase(barrier_id);
+          if (barrier_to_token_map_.count(barrier_id)) {
+            pending_tokens.erase(barrier_to_token_map_[barrier_id]);
+          }
+        }
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) final {
+    auto pending_tokens_before = pending_tokens;
+    auto pending_barriers_before = pending_barriers;
+
+    VisitStmt(op->then_case);
+    auto then_pending_tokens = pending_tokens;
+    auto then_pending_barriers = pending_barriers;
+
+    pending_tokens = pending_tokens_before;
+    pending_barriers = pending_barriers_before;
+
+    if (op->else_case.defined()) {
+      VisitStmt(op->else_case.value());
+    }
+
+    pending_tokens.insert(then_pending_tokens.begin(),
+                          then_pending_tokens.end());
+    pending_barriers.insert(then_pending_barriers.begin(),
+                            then_pending_barriers.end());
+  }
+
+  void VisitStmt_(const ForNode *op) final { VisitStmt(op->body); }
+
+  void VisitStmt_(const WhileNode *op) final { VisitStmt(op->body); }
+
+  void VisitStmt_(const SeqStmtNode *op) final {
+    for (auto stmt : op->seq) {
+      VisitStmt(stmt);
+    }
+  }
+};
+
+// Optimization pass to remove redundant synchronization calls.
+// If a token or barrier has already been waited on in the current execution
+// path, subsequent waits are unnecessary.
 class EliminateRedundancyRewriter : public StmtMutator {
 public:
   EliminateRedundancyRewriter(std::vector<int> parent_token_ids = {},
@@ -996,6 +1119,8 @@ public:
     return current_barrier_ids_;
   }
 
+  std::vector<int> get_current_token_ids() const { return current_token_ids_; }
+
 private:
   std::vector<int> get_all_token_ids() const {
     std::vector<int> all_token_ids = parent_token_ids_;
@@ -1011,6 +1136,37 @@ private:
     return all_barrier_ids;
   }
 
+  // Propagates the resolved token and barrier states from a block (e.g., loop
+  // body or if branch) to the current scope, marking them as handled to avoid
+  // redundant waits.
+  void PropagateResolvedStates(const Stmt &block) {
+    AsyncResourceCollector collector;
+    collector(block);
+
+    PendingAnalyzer pending_analyzer(barrier_to_token_map_);
+    pending_analyzer(block);
+
+    for (int barrier_id : collector.generated_barriers) {
+      if (pending_analyzer.pending_barriers.count(barrier_id) == 0) {
+        if (std::find(current_barrier_ids_.begin(), current_barrier_ids_.end(),
+                      barrier_id) == current_barrier_ids_.end()) {
+          current_barrier_ids_.push_back(barrier_id);
+        }
+      }
+    }
+    for (int token_id : collector.generated_tokens) {
+      if (pending_analyzer.pending_tokens.count(token_id) == 0) {
+        if (std::find(current_token_ids_.begin(), current_token_ids_.end(),
+                      token_id) == current_token_ids_.end()) {
+          current_token_ids_.push_back(token_id);
+        }
+      }
+    }
+  }
+
+  // Intercepts wait_token and barrier_arrive_and_wait calls.
+  // Drops the statement if the synchronization has already been performed in
+  // the current execution path.
   Stmt VisitStmt_(const EvaluateNode *op) {
     const CallNode *call = op->value.as<CallNode>();
     if (call) {
@@ -1040,6 +1196,9 @@ private:
           return Stmt();
         } else {
           current_barrier_ids_.push_back(barrier_id);
+          if (barrier_to_token_map_.count(barrier_id)) {
+            current_token_ids_.push_back(barrier_to_token_map_[barrier_id]);
+          }
           return StmtMutator::VisitStmt_(op);
         }
       }
@@ -1051,46 +1210,37 @@ private:
     auto eliminate_sync_then_rewriter = EliminateRedundancyRewriter(
         get_all_token_ids(), get_all_barrier_ids(), barrier_to_token_map_);
     auto then_case = eliminate_sync_then_rewriter(op->then_case);
-    auto then_barrier_ids =
-        eliminate_sync_then_rewriter.get_current_barrier_ids();
-    for (int barrier_id : then_barrier_ids) {
-      if (std::find(current_barrier_ids_.begin(), current_barrier_ids_.end(),
-                    barrier_id) == current_barrier_ids_.end()) {
-        current_barrier_ids_.push_back(barrier_id);
-        current_token_ids_.push_back(barrier_to_token_map_[barrier_id]);
-      }
-    }
 
     Stmt else_case;
     if (op->else_case.defined()) {
       auto eliminate_sync_else_rewriter = EliminateRedundancyRewriter(
           get_all_token_ids(), get_all_barrier_ids(), barrier_to_token_map_);
       else_case = eliminate_sync_else_rewriter(op->else_case.value());
-      auto else_barrier_ids =
-          eliminate_sync_else_rewriter.get_current_barrier_ids();
-      for (int barrier_id : else_barrier_ids) {
-        if (std::find(current_barrier_ids_.begin(), current_barrier_ids_.end(),
-                      barrier_id) == current_barrier_ids_.end()) {
-          current_barrier_ids_.push_back(barrier_id);
-          current_token_ids_.push_back(barrier_to_token_map_[barrier_id]);
-        }
-      }
     }
+
+    PropagateResolvedStates(ffi::GetRef<Stmt>(op));
+
     return IfThenElse(op->condition, then_case, else_case);
   }
 
   Stmt VisitStmt_(const ForNode *op) {
-    auto eliminate_sync_then_rewriter = EliminateRedundancyRewriter(
+    auto eliminate_sync_loop_rewriter = EliminateRedundancyRewriter(
         get_all_token_ids(), get_all_barrier_ids(), barrier_to_token_map_);
-    auto body = eliminate_sync_then_rewriter(op->body);
+    auto body = eliminate_sync_loop_rewriter(op->body);
+
+    PropagateResolvedStates(ffi::GetRef<Stmt>(op));
+
     return For(op->loop_var, op->min, op->extent, op->kind, body,
                op->thread_binding, op->annotations);
   }
 
   Stmt VisitStmt_(const WhileNode *op) {
-    auto eliminate_sync_then_rewriter = EliminateRedundancyRewriter(
+    auto eliminate_sync_loop_rewriter = EliminateRedundancyRewriter(
         get_all_token_ids(), get_all_barrier_ids(), barrier_to_token_map_);
-    auto body = eliminate_sync_then_rewriter(op->body);
+    auto body = eliminate_sync_loop_rewriter(op->body);
+
+    PropagateResolvedStates(ffi::GetRef<Stmt>(op));
+
     return While(op->condition, body);
   }
 
@@ -1102,6 +1252,9 @@ private:
   Map<int, int> barrier_to_token_map_;
 };
 
+// Main rewriter orchestrating the synchronization injection passes.
+// It applies a sequence of passes: inject syncs, extract barriers, add device
+// scope waits, and finally eliminate redundant synchronizations.
 class SunmmioSyncRewriter : public IRMutatorWithAnalyzer {
 public:
   SunmmioSyncRewriter(arith::Analyzer *analyzer)
@@ -1120,9 +1273,9 @@ public:
         BarrierExtractRewriter(inject_sync_rewriter.get_barrier_to_token_map());
     f.CopyOnWrite()->body = barrier_extract_rewriter(f->body);
 
-    auto block_wait_rewriter =
-        BlockWaitRewriter(inject_sync_rewriter.get_barrier_to_token_map());
-    f.CopyOnWrite()->body = block_wait_rewriter(f->body);
+    auto device_scope_wait_rewriter = DeviceScopeWaitRewriter(
+        inject_sync_rewriter.get_token_to_barrier_map());
+    f.CopyOnWrite()->body = device_scope_wait_rewriter(f->body);
 
     auto eliminate_redundancy_rewriter = EliminateRedundancyRewriter(
         std::vector<int>({}), std::vector<int>({}),
@@ -1133,6 +1286,9 @@ public:
   }
 };
 
+// TVM transform pass entry point.
+// Applies the SunmmioSyncRewriter to inject required synchronization
+// primitives.
 tvm::transform::Pass InjectSunmmioSync() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
     arith::Analyzer analyzer;
