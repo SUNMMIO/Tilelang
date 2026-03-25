@@ -1322,13 +1322,17 @@ Pass MergeSharedMemoryAllocationsSunmmio(bool enable_aggressive_merge = false,
     if (!target.defined() || !TargetIsSunmmio(target.value())) {
       return f;
     }
+    // default enable merge static smem, user can disable it by setting
+    // "tir.merge_static_smem" to false
     bool merge_static_smem =
-        ctx->GetConfig<Bool>("tir.merge_static_smem", Bool(false)).value();
+        ctx->GetConfig<Bool>("tir.merge_static_smem", Bool(true)).value();
+    if (!merge_static_smem) {
+      return f;
+    }
     bool debug_merge_shared_memory_allocations =
         ctx->GetConfig<Bool>(kDebugMergeSharedMemoryAllocations, Bool(false))
             .value();
-    LOG(INFO) << "merge_static_smem:" << merge_static_smem
-              << " verbose: " << debug_merge_shared_memory_allocations;
+
     auto *n = f.CopyOnWrite();
     n->body = tl::MergeSharedMemoryAllocationsSunmmio(
         std::move(n->body), merge_static_smem, enable_aggressive_merge,
