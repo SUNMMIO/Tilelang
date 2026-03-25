@@ -126,25 +126,34 @@ private:
   Map<Var, Buffer> buffer_data_to_buffer_;
 };
 
-// Collector for asynchronous write operations within a loop body.
+// Collector for asynchronous operations within a loop body.
 // Identifies DMA copies, MMA operations, and Broadcasts that happen
 // asynchronously.
-class LoopAsyncWriteCollector : public StmtVisitor {
+class LoopAsyncCollector : public StmtVisitor {
 public:
   void VisitStmt_(const EvaluateNode *op) final {
     const CallNode *call = op->value.as<CallNode>();
     if (call) {
       if (call->op.same_as(dma_copy())) {
+        reads.push_back({op, NormalizeToBufferRegion(call->args[0])});
         writes.push_back({op, NormalizeToBufferRegion(call->args[1])});
+        ops.push_back(op);
       } else if (call->op.same_as(mma_sunmmio())) {
+        reads.push_back({op, NormalizeToBufferRegion(call->args[0])});
+        reads.push_back({op, NormalizeToBufferRegion(call->args[1])});
         writes.push_back({op, NormalizeToBufferRegion(call->args[2])});
+        ops.push_back(op);
       } else if (call->op.same_as(broadcast_())) {
+        reads.push_back({op, NormalizeToBufferRegion(call->args[0])});
         writes.push_back({op, NormalizeToBufferRegion(call->args[1])});
+        ops.push_back(op);
       }
     }
     StmtVisitor::VisitStmt_(op);
   }
+  std::vector<std::pair<const EvaluateNode *, BufferRegion>> reads;
   std::vector<std::pair<const EvaluateNode *, BufferRegion>> writes;
+  std::vector<const EvaluateNode *> ops;
 };
 
 // Represents the scope of a loop for dependency tracking.
@@ -152,10 +161,9 @@ public:
 // dependencies.
 struct LoopScope {
   Array<Array<ObjectRef>> writes;
-  Map<Array<ObjectRef>, int> token_map;
+  Array<Array<ObjectRef>> reads;
+  Map<Array<ObjectRef>, int> buffer_ref_to_token;
   std::map<int, const CallNode *> token_to_call;
-  Var loop_var;
-  PrimExpr min;
   std::set<int> waited_tokens;
 };
 
@@ -230,14 +238,14 @@ private:
     for (int i = loop_scopes_.size() - 1; i >= 0; i--) {
       auto &scope = loop_scopes_[i];
       for (const auto &buf : scope.writes) {
-        if (is_log_async && scope.token_map[buf] == curr_token_id) {
+        if (is_log_async && scope.buffer_ref_to_token[buf] == curr_token_id) {
           continue;
         }
         Buffer buf_buffer = Downcast<Buffer>(buf[0]);
         Region buf_region = Downcast<Region>(buf[1]);
         if (src_buffer.same_as(buf_buffer) &&
             RegionIntersect(src_region, buf_region)) {
-          int token = scope.token_map[buf];
+          int token = scope.buffer_ref_to_token[buf];
           if (waited_tokens.count(token) == 0) {
             process_wait_token_and_barrier_wait(stmts, token);
             waited_tokens.insert(token);
@@ -305,14 +313,30 @@ private:
     for (int i = loop_scopes_.size() - 1; i >= 0; i--) {
       auto &scope = loop_scopes_[i];
       for (const auto &buf : scope.writes) {
-        if (is_log_async && scope.token_map[buf] == curr_token_id) {
+        if (is_log_async && scope.buffer_ref_to_token[buf] == curr_token_id) {
           continue;
         }
         Buffer buf_buffer = Downcast<Buffer>(buf[0]);
         Region buf_region = Downcast<Region>(buf[1]);
         if (dst_buffer.same_as(buf_buffer) &&
             RegionIntersect(dst_region, buf_region)) {
-          int token = scope.token_map[buf];
+          int token = scope.buffer_ref_to_token[buf];
+          if (waited_tokens.count(token) == 0) {
+            process_wait_token_and_barrier_wait(stmts, token);
+            waited_tokens.insert(token);
+            scope.waited_tokens.insert(token);
+          }
+        }
+      }
+      for (const auto &buf : scope.reads) {
+        if (is_log_async && scope.buffer_ref_to_token[buf] == curr_token_id) {
+          continue;
+        }
+        Buffer buf_buffer = Downcast<Buffer>(buf[0]);
+        Region buf_region = Downcast<Region>(buf[1]);
+        if (dst_buffer.same_as(buf_buffer) &&
+            RegionIntersect(dst_region, buf_region)) {
+          int token = scope.buffer_ref_to_token[buf];
           if (waited_tokens.count(token) == 0) {
             process_wait_token_and_barrier_wait(stmts, token);
             waited_tokens.insert(token);
@@ -446,38 +470,54 @@ private:
     Array<Stmt> stmts;
     token_process_prim_expr(op->condition, stmts);
 
-    LoopAsyncWriteCollector collector;
+    LoopAsyncCollector collector;
     collector(op->body);
 
     LoopScope scope;
 
-    for (const auto &p : collector.writes) {
+    for (const auto &op_node : collector.ops) {
+      // Pre-assign a stable token id for each async site in this loop.
+      // This lets the body rewriter attach the same token id every iteration,
+      // enabling consistent loop-carried dependency reasoning.
       int token = GetNextTokenId();
-      pre_assigned_tokens_[p.first] = token;
+      pre_assigned_tokens_[op_node] = token;
 
-      const CallNode *call = p.first->value.as<CallNode>();
+      // Keep a back-reference from token -> call for special handling after we
+      // finish rewriting the loop (e.g. broadcast barrier initialization).
+      const CallNode *call = op_node->value.as<CallNode>();
       scope.token_to_call[token] = call;
 
-      // check if it is a broadcast
+      // For broadcast, we also need a barrier id to synchronize the data
+      // movement across cores. The barrier init may be emitted later (after we
+      // know whether the broadcast token is actually waited on).
       if (call && call->op.same_as(broadcast_())) {
         int barrier = GetNextBarrierId();
         token_to_barrier_map.Set(token, barrier);
         barrier_to_token_map.Set(barrier, token);
       }
-
-      Array<ObjectRef> buffer_ref = {p.second->buffer, p.second->region};
-      scope.writes.push_back(buffer_ref);
-      scope.token_map.Set(buffer_ref, token);
     }
 
+    for (const auto &p : collector.writes) {
+      Array<ObjectRef> buffer_ref = {p.second->buffer, p.second->region};
+      scope.writes.push_back(buffer_ref);
+      scope.buffer_ref_to_token.Set(buffer_ref, pre_assigned_tokens_[p.first]);
+    }
+    for (const auto &p : collector.reads) {
+      Array<ObjectRef> buffer_ref = {p.second->buffer, p.second->region};
+      scope.reads.push_back(buffer_ref);
+      scope.buffer_ref_to_token.Set(buffer_ref, pre_assigned_tokens_[p.first]);
+    }
+
+    // Push this loop scope so nested visitors can consult it when analyzing
+    // read/write accesses inside the loop body.
     loop_scopes_.push_back(scope);
 
     Stmt loop_stmt = StmtMutator::VisitStmt_(op);
 
     scope = loop_scopes_.back();
     loop_scopes_.pop_back();
-    for (const auto &p : collector.writes) {
-      pre_assigned_tokens_.erase(p.first);
+    for (const auto &op_node : collector.ops) {
+      pre_assigned_tokens_.erase(op_node);
     }
 
     for (int token : scope.waited_tokens) {
@@ -701,18 +741,16 @@ private:
     token_process_prim_expr(loop->min, stmts);
     token_process_prim_expr(loop->extent, stmts);
 
-    LoopAsyncWriteCollector collector;
+    LoopAsyncCollector collector;
     collector(loop->body);
 
     LoopScope scope;
-    scope.loop_var = loop->loop_var;
-    scope.min = loop->min;
 
-    for (const auto &p : collector.writes) {
+    for (const auto &op_node : collector.ops) {
       int token = GetNextTokenId();
-      pre_assigned_tokens_[p.first] = token;
+      pre_assigned_tokens_[op_node] = token;
 
-      const CallNode *call = p.first->value.as<CallNode>();
+      const CallNode *call = op_node->value.as<CallNode>();
       scope.token_to_call[token] = call;
 
       // check if it is a broadcast
@@ -721,10 +759,18 @@ private:
         token_to_barrier_map.Set(token, barrier);
         barrier_to_token_map.Set(barrier, token);
       }
+    }
 
+    for (const auto &p : collector.writes) {
       Array<ObjectRef> buffer_ref = {p.second->buffer, p.second->region};
       scope.writes.push_back(buffer_ref);
-      scope.token_map.Set(buffer_ref, token);
+      scope.buffer_ref_to_token.Set(buffer_ref, pre_assigned_tokens_[p.first]);
+    }
+
+    for (const auto &p : collector.reads) {
+      Array<ObjectRef> buffer_ref = {p.second->buffer, p.second->region};
+      scope.reads.push_back(buffer_ref);
+      scope.buffer_ref_to_token.Set(buffer_ref, pre_assigned_tokens_[p.first]);
     }
 
     loop_scopes_.push_back(scope);
@@ -733,8 +779,8 @@ private:
 
     scope = loop_scopes_.back();
     loop_scopes_.pop_back();
-    for (const auto &p : collector.writes) {
-      pre_assigned_tokens_.erase(p.first);
+    for (const auto &op_node : collector.ops) {
+      pre_assigned_tokens_.erase(op_node);
     }
 
     for (int token : scope.waited_tokens) {
@@ -827,7 +873,8 @@ private:
           if (std::find(barrier_wait_ids_.begin(), barrier_wait_ids_.end(),
                         barrier_id) == barrier_wait_ids_.end()) {
             // if the barrier wait does not have a corresponding barrier init in
-            // current scope, we need to keep it and add its id to the
+            // current scope and  the barrier wait id is not in the
+            // barrier_wait_ids_ list, we need to keep it and add its id to the
             // barrier_wait_ids_ list
             barrier_wait_ids_.push_back(barrier_id);
             return StmtMutator::VisitStmt_(op);
@@ -854,14 +901,15 @@ private:
         barrier_init_then_rewriter.get_barrier_wait_ids();
 
     for (int barrier_id : then_barrier_wait_ids) {
-      LOG(INFO) << "barrier wait id in then case: " << barrier_id;
-      for (int init_id : barrier_init_ids_) {
-        LOG(INFO) << "barrier init id in current scope: " << init_id;
-      }
       if (std::find(barrier_init_ids_.begin(), barrier_init_ids_.end(),
                     barrier_id) == barrier_init_ids_.end()) {
+        // If the barrier wait does not have a corresponding barrier init in the
+        // current scope, we need to keep it and add its ID to the
+        // barrier_wait_ids_ list for further processing.
         barrier_wait_ids_.push_back(barrier_id);
       } else {
+        // if the barrier wait has a corresponding barrier init in current
+        // scope, we need to wait on the token associated with the barrier init
         stmts.push_back(Evaluate(Call(
             DataType::Handle(), wait_token(),
             {IntImm(DataType::Int(32), barrier_to_token_map_[barrier_id])})));
@@ -1140,12 +1188,22 @@ private:
   // body or if branch) to the current scope, marking them as handled to avoid
   // redundant waits.
   void PropagateResolvedStates(const Stmt &block) {
+    // Collect async resources that are created inside this block. These IDs
+    // represent potential synchronization points introduced by the rewriter
+    // (e.g., new tokens and barriers).
     AsyncResourceCollector collector;
     collector(block);
 
+    // Analyze which of the collected resources are still pending after the
+    // block finishes. A resource is considered "pending" if there exists a
+    // path in the block that may still require a corresponding wait later.
     PendingAnalyzer pending_analyzer(barrier_to_token_map_);
     pending_analyzer(block);
 
+    // If a barrier is generated in this block but is not pending at the block
+    // exit, it means the block has fully synchronized that barrier internally
+    // (or it has no remaining uses). We can mark it as resolved in the current
+    // scope so parent scopes won't emit redundant waits for it.
     for (int barrier_id : collector.generated_barriers) {
       if (pending_analyzer.pending_barriers.count(barrier_id) == 0) {
         if (std::find(current_barrier_ids_.begin(), current_barrier_ids_.end(),
@@ -1154,6 +1212,11 @@ private:
         }
       }
     }
+
+    // Same propagation for tokens: if a token is generated in the block and is
+    // not pending at the block exit, then any necessary waits for that token
+    // have been handled within the block. Record it as resolved for the
+    // current scope to avoid re-waiting in enclosing control-flow.
     for (int token_id : collector.generated_tokens) {
       if (pending_analyzer.pending_tokens.count(token_id) == 0) {
         if (std::find(current_token_ids_.begin(), current_token_ids_.end(),
@@ -1245,9 +1308,15 @@ private:
   }
 
 private:
+  // Token IDs that are already known to be waited/synchronized in outer scopes
   std::vector<int> parent_token_ids_;
+  // Token IDs that have been waited/synchronized along the current execution
+  // path
   std::vector<int> current_token_ids_;
+  // Barrier IDs that are already known to be arrived-and-waited in outer scopes
   std::vector<int> parent_barrier_ids_;
+  // Barrier IDs that have been arrived-and-waited along the current execution
+  // path
   std::vector<int> current_barrier_ids_;
   Map<int, int> barrier_to_token_map_;
 };
