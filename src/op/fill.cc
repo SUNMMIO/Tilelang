@@ -166,9 +166,33 @@ Stmt FillNode::MakeSunmmioTileFill(const LowerArgs &T,
          "shared.rsram scope, but got "
       << dst.scope();
 
-  auto it = T.tileview_map.find(dst->data);
-  if (it != T.tileview_map.end()) {
-    TileView tv = (*it).second;
+  // Helper to find TileView metadata for a buffer, supporting name-hint
+  // fallback. This is necessary because TVM may rename buffers (e.g.,
+  // adding suffixes like _1, _2) during lowering, which causes direct
+  // pointer-based lookup in tileview_map to fail.
+  auto find_tileview = [&](const Buffer &buf) -> Optional<TileView> {
+    if (T.tileview_map.count(buf->data)) {
+      return T.tileview_map.at(buf->data);
+    }
+    // Fallback: match by name hint, ignoring common suffixes like _1, _2.
+    auto simplify_name = [](std::string name) {
+      if (name.size() > 2 && name[name.size() - 2] == '_') {
+        return name.substr(0, name.size() - 2);
+      }
+      return name;
+    };
+    std::string target_name = simplify_name(buf->data->name_hint);
+    for (const auto &kv : T.tileview_map) {
+      if (simplify_name(kv.first->name_hint) == target_name) {
+        return kv.second;
+      }
+    }
+    return std::nullopt;
+  };
+
+  Optional<TileView> opt_tv = find_tileview(dst);
+  if (opt_tv.defined()) {
+    TileView tv = opt_tv.value();
     // Build map from buffer dim index to tile size
     // This map is essential for handling tiled loops, as we need to know
     // which dimensions are tiled and what their tile sizes are.

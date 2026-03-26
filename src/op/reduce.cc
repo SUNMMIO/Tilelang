@@ -240,13 +240,23 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
       << src_scope << " and " << dst_scope;
 
   // Helper to find TileView metadata for a buffer, supporting name-hint
-  // fallback.
+  // fallback. This is necessary because TVM may rename buffers (e.g.,
+  // adding suffixes like _1, _2) during lowering, which causes direct
+  // pointer-based lookup in tileview_map to fail.
   auto find_tileview = [&](const Buffer &buf) -> Optional<TileView> {
     if (T.tileview_map.count(buf->data)) {
       return T.tileview_map.at(buf->data);
     }
+    // Fallback: match by name hint, ignoring common suffixes like _1, _2.
+    auto simplify_name = [](std::string name) {
+      if (name.size() > 2 && name[name.size() - 2] == '_') {
+        return name.substr(0, name.size() - 2);
+      }
+      return name;
+    };
+    std::string target_name = simplify_name(buf->data->name_hint);
     for (const auto &kv : T.tileview_map) {
-      if (kv.first->name_hint == buf->data->name_hint) {
+      if (simplify_name(kv.first->name_hint) == target_name) {
         return kv.second;
       }
     }
@@ -547,7 +557,11 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   } else {
     // For non-tiled axis reduction, 'acc' shape matches 'dst' shape within the
     // tile, so we can safely load the initial value.
-    init_stmt = BufferStore(acc, BufferLoad(this->dst, dst_idx), acc_idx);
+    PrimExpr init_val = BufferLoad(this->dst, dst_idx);
+    if (this->type->isAbsSum() || this->type->isAbsMax()) {
+      init_val = tvm::abs(init_val);
+    }
+    init_stmt = BufferStore(acc, init_val, acc_idx);
   }
   init_stmt =
       wrap_interior(init_stmt, interior_vars, src_tile_shape, all_src_axes);
@@ -618,11 +632,23 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
                         {StringImm(in_tile_reduce_type), res_region, acc_region,
                          IntImm(DataType::Int(32), reduce_tile_axis)}));
 
-      // 4. Add dst_res to dst
-      Stmt add_res_stmt = BufferStore(this->dst,
-                                      BufferLoad(this->dst, dst_idx) +
-                                          BufferLoad(dst_res_buf, res_idx),
-                                      dst_idx);
+      // 4. Final accumulation from dst_res to dst
+      PrimExpr dst_val = BufferLoad(this->dst, dst_idx);
+      PrimExpr res_val = BufferLoad(dst_res_buf, res_idx);
+      if (this->type->isAbsSum() || this->type->isAbsMax()) {
+        dst_val = tvm::abs(dst_val);
+      }
+      PrimExpr update;
+      if (this->type->isSum() || this->type->isAbsSum()) {
+        update = dst_val + res_val;
+      } else if (this->type->isMax() || this->type->isAbsMax()) {
+        update = Max(dst_val, res_val);
+      } else if (this->type->isMin()) {
+        update = Min(dst_val, res_val);
+      } else {
+        LOG(FATAL) << "Unsupported reduce type for Sunmmio accumulation";
+      }
+      Stmt add_res_stmt = BufferStore(this->dst, update, dst_idx);
       add_res_stmt = wrap_interior(add_res_stmt, dst_interior_vars_mapped,
                                    dst_tile_shape, all_dst_axes);
 
@@ -939,8 +965,11 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     if (need_duplicate) {
       PrimExpr update;
       if (need_update) {
-        auto src_val = BufferLoad(clear_buffer, red_indices);
-        auto dst_val = BufferLoad(dst_buffer, dst_indices);
+        PrimExpr src_val = BufferLoad(clear_buffer, red_indices);
+        PrimExpr dst_val = BufferLoad(dst_buffer, dst_indices);
+        if (this->type->isAbsSum() || this->type->isAbsMax()) {
+          dst_val = tvm::abs(dst_val);
+        }
         if (this->type->isSum() || this->type->isAbsSum()) {
           update = dst_val + src_val;
         } else if (this->type->isBitAnd()) {

@@ -192,7 +192,7 @@ def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
     reduce(buffer, out, "sum", dim, clear)
 
 
-def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1) -> None:
+def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
     """Perform reduce absolute sum on input buffer, store the result to output buffer.
 
     Args:
@@ -204,7 +204,7 @@ def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1) -> None:
         tir.Call: Handle to the reduction operation
     """
     dim = _legalize_dim(buffer, dim)
-    reduce(buffer, out, "abssum", dim, True)
+    reduce(buffer, out, "abssum", dim, clear)
 
 
 def reduce_absmax(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:

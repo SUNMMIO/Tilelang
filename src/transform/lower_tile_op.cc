@@ -176,9 +176,12 @@ private:
       }
     }
     if (op->annotations.count(attr::kTileViewMap)) {
-      tileview_map_ = op->annotations.at(attr::kTileViewMap)
-                          .as<Map<Var, TileView>>()
-                          .value();
+      auto new_map = op->annotations.at(attr::kTileViewMap)
+                         .as<Map<Var, TileView>>()
+                         .value();
+      for (auto [k, v] : new_map) {
+        tileview_map_.Set(k, v);
+      }
     }
     // Read global layout map separately — these are read-only metadata
     // and must NOT be processed through makeBufferWithLayout/Forward.
