@@ -164,9 +164,9 @@ struct LoopScope {
   std::map<int, const CallNode *> token_to_call;
   // When memory accesses within the loop body depend on asynchronous operations
   // from previous iterations (which are identified by pre-assigned tokens), a
-  // corresponding sync_null_token must be inserted before the loop because those
-  // asynchronous operations have not yet occurred during the first iteration.
-  // The waited_tokens set is used to record these tokens.
+  // corresponding sync_null_token must be inserted before the loop because
+  // those asynchronous operations have not yet occurred during the first
+  // iteration. The waited_tokens set is used to record these tokens.
   std::set<int> waited_tokens;
 };
 
