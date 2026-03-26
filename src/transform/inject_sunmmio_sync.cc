@@ -18,8 +18,8 @@
  */
 
 /*!
- * \file tma_barrier_rewriter.cc
- * \brief Rewrite TMA barriers for cuda GPU (sm90+)
+ * \file inject_sunmmio_sync.cc
+ * \brief Inject synchronization primitives for SUNMMIO.
  */
 
 #include <tvm/arith/analyzer.h>
@@ -75,7 +75,6 @@ public:
       : buffer_data_to_buffer_(buffer_data_to_buffer) {}
 
   Array<BufferRegion> GetReads() const { return reads_; }
-  Array<BufferRegion> GetWrites() const { return writes_; }
 
 private:
   void VisitExpr_(const BufferLoadNode *op) final {
@@ -122,7 +121,6 @@ private:
 
 private:
   Array<BufferRegion> reads_;
-  Array<BufferRegion> writes_;
   Map<Var, Buffer> buffer_data_to_buffer_;
 };
 
@@ -164,6 +162,11 @@ struct LoopScope {
   Array<Array<ObjectRef>> reads;
   Map<Array<ObjectRef>, int> buffer_ref_to_token;
   std::map<int, const CallNode *> token_to_call;
+  // When memory accesses within the loop body depend on asynchronous operations
+  // from previous iterations (which are identified by pre-assigned tokens), a
+  // corresponding sync_null_token must be inserted before the loop because those
+  // asynchronous operations have not yet occurred during the first iteration.
+  // The waited_tokens set is used to record these tokens.
   std::set<int> waited_tokens;
 };
 
@@ -214,6 +217,8 @@ private:
     Buffer src_buffer = buffer_region->buffer;
     Region src_region = buffer_region->region;
     auto src = Array<ObjectRef>{src_buffer, src_region};
+    // Tracks whether a token has already been waited on within the current loop
+    // level or in any of the scopes recorded in loop_scopes .
     std::unordered_set<int> waited_tokens;
 
     // Check if the current read buffer has dependencies with existing write
@@ -445,10 +450,6 @@ private:
     Array<BufferRegion> read_regions = buf_load_collector.GetReads();
     for (const auto &read_region : read_regions) {
       token_process_read_buffer(read_region, stmts, -1, false);
-    }
-    Array<BufferRegion> write_regions = buf_load_collector.GetWrites();
-    for (const auto &write_region : write_regions) {
-      token_process_write_buffer(write_region, stmts, -1, false);
     }
   }
 
