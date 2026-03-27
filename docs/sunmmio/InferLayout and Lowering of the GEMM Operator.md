@@ -1,4 +1,4 @@
-#  InferLayout and Lowering of the GEMM Operator
+# InferLayout and Lowering of the GEMM Operator
 
 ## 1 Motivation
 
@@ -10,7 +10,7 @@ If the native compiler directly generates scalar multiply-accumulate loops, it n
 Within the existing operator system of TileLang, we specifically designed a GEMM extension oriented towards the A4E NPU: `kSunmmioMMA`, implemented through `gemm_sunmmio.py` and `src/op/gemm.cc`.
 TileLang's GEMM is divided into v1 and v2; v2 is implemented in Python, and v1 is implemented in C++. We provide supports for both.
 
-- **Strict Verification of Storage Scopes:** 
+- **Strict Verification of Storage Scopes:**
   - The NPU's Tensor Engine requires that operands must be stored in specific physical SRAMs. The design enforces that matrix A must be in `shared.asram`, matrix B must be in `shared.wsram`, and matrix C must be in `shared.rsram`.
 - **Layout Inference:**
   - Tailored to the access characteristics of the NPU Tensor Engine, the hardware-specific `make_blockwise_zz_layout` (Blockwise ZZ Layout) is forcibly inferred and bound to the three matrices participating in GEMM. This ensures that the computation units achieve optimal bandwidth and alignment efficiency when fetching data.

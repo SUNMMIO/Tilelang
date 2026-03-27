@@ -12,7 +12,7 @@ We designed a Pipeline Pass tailored specifically for the multi-engine architect
 - **Pipeline Planning:**
   - **Step 1: Label statements as Producer, Consumer, or Both.**
     - Utilizing TileLang's native recognition patterns. For non-composite statements, if a write to a shared buffer within the statement is completed by the global memory, the statement is a Producer; otherwise, it is a Consumer. Producer patterns only appear in `dma_copy` and `BufferStore`. For composite statements like `IfStmt` or `SeqStmt`, if the labels on their subtrees differ, the statement's label is marked as Both.
-  
+
   - **Step 2: Identify Buffers requiring Multi-versioning based on the labels generated in Step 1.**
     - **Step 2.1: Utilize TileLang's native recognition patterns.**
       1. If a Buffer is written by a producer and read by a consumer, it can be multi-versioned.

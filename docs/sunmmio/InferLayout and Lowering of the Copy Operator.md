@@ -9,7 +9,7 @@ Our A4E NPU is equipped with a dedicated DMA engine. To unleash hardware perform
 
 Building upon the original `copy.cc`, two core copy modes specifically tailored for the A4E NPU have been extended: `kSunmmioDMACopy` and `kSunmmioTileCopy`.
 
-- **Mode Recognition and Dispatch:** 
+- **Mode Recognition and Dispatch:**
   - When the movement crosses storage scopes (e.g., `global <-> shared.*`) and the data types match, it branches into `kSunmmioDMACopy`.
   - When the movement is `shared.rsram -> shared.rsram` and it is a full buffer copy, it branches into `kSunmmioTileCopy`.
 

@@ -27,11 +27,11 @@ The lowering of fill/clear is mainly implemented in the `fill.cc` file. The key 
     with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), T.ceildiv(B, block_B), threads=128) as (bx, by, bz):
         A_shared = T.alloc_shared((block_B, block_M, block_N), dtype)
         T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, index_map)})
-        
+
         # 1. Fill the entire buffer
         T.fill(A_shared, T.float16(1.0))
-        
-        # 2. Fill a region of the buffer 
+
+        # 2. Fill a region of the buffer
         T.fill(A_shared[0:block_B, 0:block_M//2, 0:block_N], T.float16(2.0))
 
         # 3. Fill a region with offset
@@ -88,11 +88,11 @@ The lowering of reduce is mainly implemented in `reduce.cc`. The key points of t
 Taking a tensor with shape `(b, m, n)` as an example, there are two cases for the reduction axis: tile axis (`m` or `n`), and non-tile axis (`b`). Below is the user's syntax:
 
 ```python
-    with T.Kernel(T.ceildiv(N, block_N) if reduce_axis != 2 else T.ceildiv(M, block_M), 
+    with T.Kernel(T.ceildiv(N, block_N) if reduce_axis != 2 else T.ceildiv(M, block_M),
                     T.ceildiv(B, block_B) if reduce_axis != 0 else T.ceildiv(M, block_M), threads=128) as (bx, bz):
         A_shared = T.alloc_shared((block_B, block_M, block_N), dtype, scope="shared.rsram")
         Out_shared = T.alloc_shared(out_shape_block, dtype, scope="shared.rsram")
-        
+
         T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, index_map)})
         # Different reduction axes
         if reduce_axis == 2: # Reduce N
@@ -134,7 +134,7 @@ After the `LowerTileOp` pass (below is the IR generated when reducing along the 
                         for ki in T.serial(32, annotations={"tile.interior": 1, "tile.interior_axis": 0, "tile.loop_stage": 2, "tile.tiled_buffer": A_shared.data}):
                             for kj in T.vectorized(32, annotations={"tile.interior": 1, "tile.interior_axis": 1, "tile.loop_stage": 2, "tile.tiled_buffer": A_shared.data}):
                                 Out_shared_acc_1[0, ki, kj] = T.float16(0.0)
-                    # Accumulation operation between tiles                    
+                    # Accumulation operation between tiles
                     for ki in T.serial(32, annotations={"tile.interior": 1, "tile.interior_axis": 0, "tile.loop_stage": 2, "tile.tiled_buffer": A_shared.data}):
                         for kj in T.vectorized(32, annotations={"tile.interior": 1, "tile.interior_axis": 1, "tile.loop_stage": 2, "tile.tiled_buffer": A_shared.data}):
                             Out_shared_acc_1[0, ki, kj] = Out_shared_acc_1[0, ki, kj] + T.fabs(A_shared[i, j * 32 + ki, k * 32 + kj])

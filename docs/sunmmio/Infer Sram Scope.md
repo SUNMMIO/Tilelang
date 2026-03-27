@@ -47,19 +47,19 @@ This Pass inherits from `arith::IRMutatorWithAnalyzer`, and its implementation m
 **Before InferSRAMScope：**
 
 ```python
-A = T.alloc_shared((128, 128), dtype="float16") 
-B = T.alloc_shared((128, 128), dtype="float16") 
-C = T.alloc_shared((128, 128), dtype="float16") 
-D = T.alloc_shared((128, 128), dtype="float16") 
+A = T.alloc_shared((128, 128), dtype="float16")
+B = T.alloc_shared((128, 128), dtype="float16")
+C = T.alloc_shared((128, 128), dtype="float16")
+D = T.alloc_shared((128, 128), dtype="float16")
 T.gemm(A, B, C)
 ```
 
 **After InferSRAMScope：**
 
 ```python
-A = T.alloc_shared((128, 128), dtype="float16", scope="shared.asram") 
-B = T.alloc_shared((128, 128), dtype="float16", scope="shared.wsram") 
-C = T.alloc_shared((128, 128), dtype="float16", scope="shared.rsram") 
-D = T.alloc_shared((128, 128), dtype="float16", scope="shared.rsram") 
+A = T.alloc_shared((128, 128), dtype="float16", scope="shared.asram")
+B = T.alloc_shared((128, 128), dtype="float16", scope="shared.wsram")
+C = T.alloc_shared((128, 128), dtype="float16", scope="shared.rsram")
+D = T.alloc_shared((128, 128), dtype="float16", scope="shared.rsram")
 T.gemm(A, B, C)
 ```

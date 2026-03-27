@@ -34,10 +34,10 @@ The combination of both covers both single-core asynchronous pipelining and mult
 
 `InjectSunmmioSync` is not a simple linear instrumenter but is composed of multiple collaborating Rewriters:
 
-1.  **InjectSyncRewriter**: Responsible for identifying asynchronous operations, allocating tokens, performing RAW/WAR/WAW dependency analysis, and initially inserting waits.
-2.  **BarrierExtractRewriter**: Responsible for organizing broadcast-related barriers so they can be correctly extracted and reused within the control flow.
-3.  **DeviceScopeWaitRewriter**: Responsible for adding final waits for uncompleted tokens and barriers at the end of the device execution scope.
-4.  **EliminateRedundancyRewriter**: Responsible for deleting redundant synchronizations after ensuring correctness, reducing unnecessary waiting overhead.
+1. **InjectSyncRewriter**: Responsible for identifying asynchronous operations, allocating tokens, performing RAW/WAR/WAW dependency analysis, and initially inserting waits.
+2. **BarrierExtractRewriter**: Responsible for organizing broadcast-related barriers so they can be correctly extracted and reused within the control flow.
+3. **DeviceScopeWaitRewriter**: Responsible for adding final waits for uncompleted tokens and barriers at the end of the device execution scope.
+4. **EliminateRedundancyRewriter**: Responsible for deleting redundant synchronizations after ensuring correctness, reducing unnecessary waiting overhead.
 
 This multi-stage design ensures that the pass possesses both "correctness priority" and "performance optimization" capabilities.
 
