@@ -121,6 +121,9 @@ private:
   /// Sunmmio Tile-based reduction logic
   Stmt MakeSunmmioTileReduce(const LowerArgs &T,
                              arith::Analyzer *analyzer) const;
+  /// Sunmmio layout inference logic
+  LayoutMap InferLayoutSunmmioTileReduce(const LayoutInferArgs &T,
+                                         InferLevel level) const;
 };
 
 /// Wrapper class for reduction operations

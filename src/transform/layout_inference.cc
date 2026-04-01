@@ -123,7 +123,8 @@ public:
                                                      buffer_oob,
                                                      {},
                                                      let_var_to_expr_,
-                                                     global_layout_map_},
+                                                     global_layout_map_,
+                                                     tileview_map_},
                                      level);
 
     // Process the returned updates
@@ -755,6 +756,15 @@ private:
     // BufferLoad/BufferStore
     IRVisitorWithAnalyzer::VisitStmt_(op);
 
+    if (op->annotations.count(attr::kTileViewMap)) {
+      auto new_map = op->annotations.at(attr::kTileViewMap)
+                         .as<Map<Var, TileView>>()
+                         .value();
+      for (auto [k, v] : new_map) {
+        tileview_map_.Set(k, v);
+      }
+    }
+
     // After visiting, apply layouts to all collected buffers
     if (op->annotations.count(attr::kLayoutMap)) {
       // Check if the layout map is Map<Var, Layout>
@@ -1023,6 +1033,7 @@ private:
   Target target_;
   LayoutMap annotated_layout_map_;
   LayoutMap global_layout_map_;
+  TileViewMap tileview_map_;
   bool skip_thread_partition_{false};
 
   std::vector<TileOperator> BackupInferList() {

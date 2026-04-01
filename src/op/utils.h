@@ -85,6 +85,31 @@ inline bool IsLocalVarBuffer(const Buffer &buffer) {
   return buffer.defined() && buffer.scope() == "local.var";
 }
 
+// Helper to find TileView metadata for a buffer, supporting name-hint
+// fallback. This is necessary because TVM may rename buffers (e.g.,
+// adding suffixes like _1, _2) during lowering, which causes direct
+// pointer-based lookup in tileview_map to fail.
+inline Optional<TileView> FindTileView(const TileViewMap &tileview_map,
+                                       const Buffer &buf) {
+  if (tileview_map.count(buf->data)) {
+    return tileview_map.at(buf->data);
+  }
+  // Fallback: match by name hint, ignoring common suffixes like _1, _2.
+  auto simplify_name = [](std::string name) {
+    if (name.size() > 2 && name[name.size() - 2] == '_') {
+      return name.substr(0, name.size() - 2);
+    }
+    return name;
+  };
+  std::string target_name = simplify_name(buf->data->name_hint);
+  for (const auto &kv : tileview_map) {
+    if (simplify_name(kv.first->name_hint) == target_name) {
+      return kv.second;
+    }
+  }
+  return std::nullopt;
+}
+
 } // namespace tl
 } // namespace tvm
 

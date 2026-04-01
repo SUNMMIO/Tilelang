@@ -73,6 +73,7 @@ struct LayoutInferArgs {
   // fragment buffer accesses through let bindings
   Map<Var, PrimExpr> let_var_to_expr;
   LayoutMap global_layout_map;
+  TileViewMap tileview_map;
 };
 
 class TileOperator;

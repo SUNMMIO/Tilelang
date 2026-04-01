@@ -277,19 +277,47 @@ Stmt FillNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   }
 }
 
+LayoutMap FillNode::InferLayoutSunmmioTileFill(const LayoutInferArgs &T,
+                                               InferLevel level) const {
+  if (level == InferLevel::kStrict) {
+    auto dst_scope = dst.scope();
+    ICHECK(dst_scope == "shared.rsram")
+        << "For Sunmmio target, Fill operator dst must be in "
+           "shared.rsram scope, but got "
+        << dst_scope;
+
+    if (dst->shape.size() == 1) {
+      const auto make_linear =
+          ffi::Function::GetGlobal("tl.make_linear_layout");
+      auto layout = Downcast<Layout>((*make_linear)(dst->shape));
+      return {{dst, layout}};
+    } else {
+      const auto f =
+          ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
+      auto layout = Downcast<Layout>((*f)(dst));
+      return {{dst, layout}};
+    }
+  }
+  return {};
+}
+
 /**
  * @brief Infer memory/layout mapping for the Fill operator.
  *
  * Returns the layout mapping produced by layout inference for this FillNode.
- * Currently no layout inference is performed for Fill and the function returns
- * an empty LayoutMap.
+ * For Sunmmio targets, if the destination buffer is in the shared.rsram scope,
+ * it strictly infers a blockwise zz layout. Otherwise, it returns an empty
+ * LayoutMap.
  *
- * @param T Context required for layout inference (unused).
- * @param level The inference level requested (unused).
- * @return LayoutMap Empty map indicating no inferred layouts for this operator.
+ * @param T Context required for layout inference (target, layout map, etc.).
+ * @param level The inference level requested.
+ * @return LayoutMap Inferred layout mappings.
  */
 LayoutMap FillNode::InferLayout(const LayoutInferArgs &T,
                                 InferLevel level) const {
+  if (TargetIsSunmmio(T.target)) {
+    return InferLayoutSunmmioTileFill(T, level);
+  }
   return {};
 }
 

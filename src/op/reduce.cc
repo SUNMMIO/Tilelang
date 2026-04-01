@@ -711,8 +711,22 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
     alloc_buffers.push_back(dst_res.value());
   }
 
-  body = Block({}, {}, {}, "reduce_tile_op", body, std::nullopt, alloc_buffers,
-               {}, {});
+  Map<Buffer, Layout> local_layout_map;
+  const auto make_zz =
+      ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
+  auto acc_layout = Downcast<Layout>((*make_zz)(acc));
+  local_layout_map.Set(acc, acc_layout);
+
+  if (dst_res.defined()) {
+    const auto make_linear = ffi::Function::GetGlobal("tl.make_linear_layout");
+    auto res_layout = Downcast<Layout>((*make_linear)(dst_res.value()->shape));
+    local_layout_map.Set(dst_res.value(), res_layout);
+  }
+
+  body =
+      Block({}, {}, {}, "reduce_tile_op", body, std::nullopt, alloc_buffers, {},
+            {{attr::kTileViewMap, new_tileview_map},
+             {attr::kLayoutMap, local_layout_map}});
 
   return body;
 }
@@ -1032,8 +1046,66 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   return Stmt();
 }
 
+LayoutMap ReduceOpNode::InferLayoutSunmmioTileReduce(const LayoutInferArgs &T,
+                                                     InferLevel level) const {
+  if (level == InferLevel::kStrict) {
+    auto src_scope = src.scope();
+    auto dst_scope = dst.scope();
+    ICHECK(src_scope == "shared.rsram" && dst_scope == "shared.rsram")
+        << "For Sunmmio target, Reduce operator src and dst must be in "
+           "shared.rsram scope, but got "
+        << src_scope << " and " << dst_scope;
+
+    LayoutMap result;
+    const auto make_zz =
+        ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
+    const auto make_linear = ffi::Function::GetGlobal("tl.make_linear_layout");
+
+    if (src->shape.size() == 1) {
+      auto src_layout = Downcast<Layout>((*make_linear)(src->shape));
+      result.Set(src, src_layout);
+    } else {
+      auto src_layout = Downcast<Layout>((*make_zz)(src));
+      result.Set(src, src_layout);
+    }
+
+    Optional<TileView> opt_tv = FindTileView(T.tileview_map, src);
+    if (opt_tv.defined()) {
+      TileView tv = opt_tv.value();
+      bool is_tiled = false;
+      int src_ndim = src->shape.size();
+      for (size_t i = 0; i < tv->IndexMap().size(); i++) {
+        const auto *idx_ptr = tv->IndexMap()[i].as<IntImmNode>();
+        if (idx_ptr) {
+          int dim = idx_ptr->value;
+          if (dim < 0)
+            dim += src_ndim;
+          if (dim == this->dim) {
+            is_tiled = true;
+            break;
+          }
+        }
+      }
+
+      if (is_tiled || dst->shape.size() == 1) {
+        auto dst_layout = Downcast<Layout>((*make_linear)(dst->shape));
+        result.Set(dst, dst_layout);
+      } else {
+        auto dst_layout = Downcast<Layout>((*make_zz)(dst));
+        result.Set(dst, dst_layout);
+      }
+    }
+    return result;
+  }
+  return {};
+}
+
 LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &T,
                                     InferLevel level) const {
+  if (TargetIsSunmmio(T.target)) {
+    return InferLayoutSunmmioTileReduce(T, level);
+  }
+
   if (level >= InferLevel::kStrict)
     return {};
 
