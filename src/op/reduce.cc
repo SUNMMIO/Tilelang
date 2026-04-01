@@ -14,7 +14,10 @@
 #include "../layout/utils.h"
 #include "../op/parallel.h"
 #include "../target/utils.h"
+#include "../tileview/tileview.h"
+#include "../transform/common/attr.h"
 #include "../transform/loop_partition.h"
+#include "builtin.h"
 #include "tir/transforms/ir_utils.h"
 #include "tvm/ir/expr.h"
 #include "tvm/tir/expr.h"
@@ -110,7 +113,7 @@ PrimExpr ReduceOpNode::MakeReduce(const PrimExpr &acc,
   if (type->isSum()) {
     return acc + rhs;
   } else if (type->isAbsSum()) {
-    return acc + Max(rhs, -rhs);
+    return acc + tvm::abs(rhs);
   } else if (type->isMax()) {
     return Max(acc, rhs);
   } else if (type->isMin()) {
@@ -125,6 +128,7 @@ PrimExpr ReduceOpNode::MakeReduce(const PrimExpr &acc,
     return acc ^ rhs;
   } else {
     LOG(FATAL) << "Unsupported reduce type: " << type->type;
+    return PrimExpr();
   }
 }
 
@@ -185,6 +189,525 @@ static Fragment ComputeReducerLayout(const Fragment &src_layout, int dim) {
   return reducer_layout;
 }
 
+Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
+                                         arith::Analyzer *analyzer) const {
+  auto src_scope = this->src.scope();
+  auto dst_scope = this->dst.scope();
+
+  // Sunmmio target requires buffers to be in shared.rsram scope.
+  // The lowering logic here implements tile-level reduction using a
+  // combination of element-wise accumulation and specialized hardware
+  // primitives.
+  ICHECK(src_scope == "shared.rsram" && dst_scope == "shared.rsram")
+      << "For Sunmmio target, Reduce operator src and dst must be in "
+         "shared.rsram scope, but got "
+      << src_scope << " and " << dst_scope;
+
+  // Helper to find TileView metadata for a buffer, supporting name-hint
+  // fallback. This is necessary because TVM may rename buffers (e.g.,
+  // adding suffixes like _1, _2) during lowering, which causes direct
+  // pointer-based lookup in tileview_map to fail.
+  auto find_tileview = [&](const Buffer &buf) -> Optional<TileView> {
+    if (T.tileview_map.count(buf->data)) {
+      return T.tileview_map.at(buf->data);
+    }
+    // Fallback: match by name hint, ignoring common suffixes like _1, _2.
+    auto simplify_name = [](std::string name) {
+      if (name.size() > 2 && name[name.size() - 2] == '_') {
+        return name.substr(0, name.size() - 2);
+      }
+      return name;
+    };
+    std::string target_name = simplify_name(buf->data->name_hint);
+    for (const auto &kv : T.tileview_map) {
+      if (simplify_name(kv.first->name_hint) == target_name) {
+        return kv.second;
+      }
+    }
+    return std::nullopt;
+  };
+
+  Optional<TileView> opt_tv_src = find_tileview(this->src);
+  Optional<TileView> opt_tv_dst = find_tileview(this->dst);
+
+  ICHECK(opt_tv_src.defined())
+      << "TileView not found for src buffer " << this->src->name;
+  ICHECK(opt_tv_dst.defined())
+      << "TileView not found for dst buffer " << this->dst->name;
+
+  TileView tv_src = opt_tv_src.value();
+  TileView tv_dst = opt_tv_dst.value();
+
+  // Map physical buffer dimensions to their logical tile sizes based on
+  // IndexMap. E.g., if IndexMap is [-2, -1] and TileShape is [32, 32], the
+  // last two dims are tiled.
+  std::unordered_map<int, PrimExpr> src_dim_to_tile_size;
+  int src_ndim = this->src->shape.size();
+  for (size_t i = 0; i < tv_src->IndexMap().size(); i++) {
+    PrimExpr idx_expr = analyzer->Simplify(tv_src->IndexMap()[i]);
+    const auto *idx_ptr = idx_expr.as<IntImmNode>();
+    ICHECK(idx_ptr) << "TileView IndexMap must be constant integers, but got "
+                    << tv_src->IndexMap()[i];
+    int dim = idx_ptr->value;
+    if (dim < 0)
+      dim += src_ndim;
+    src_dim_to_tile_size[dim] = tv_src->TileShape()[i];
+  }
+
+  // Check if the dimension we are reducing along is a tiled dimension.
+  bool is_dim_tiled = src_dim_to_tile_size.count(this->dim);
+
+  // Derive the shape of the single-tile accumulation buffer 'acc'.
+  // It has the same rank as 'src', but non-tiled dimensions are collapsed
+  // to 1.
+  Array<PrimExpr> single_tile_acc_shape;
+  single_tile_acc_shape.reserve(src_ndim);
+  for (int i = 0; i < src_ndim; ++i) {
+    if (src_dim_to_tile_size.count(i)) {
+      single_tile_acc_shape.push_back(src_dim_to_tile_size[i]);
+    } else {
+      single_tile_acc_shape.push_back(1);
+    }
+  }
+
+  // single_tile_shape for potential intermediate result.
+  // Only needed if the reduction dimension is tiled and we are not clearing
+  // (i.e. accumulating into existing dst values), since in that case we need to
+  // store the per-tile reduction results before accumulating back to dst.
+  Array<PrimExpr> single_tile_res_shape;
+  int dst_ndim = this->dst->shape.size();
+  std::unordered_map<int, PrimExpr> dst_dim_to_tile_size;
+  if (is_dim_tiled) {
+    single_tile_res_shape.reserve(dst_ndim);
+    for (size_t i = 0; i < tv_dst->IndexMap().size(); i++) {
+      const auto *idx_ptr = tv_dst->IndexMap()[i].as<IntImmNode>();
+      ICHECK(idx_ptr);
+      int dim = idx_ptr->value;
+      if (dim < 0)
+        dim += dst_ndim;
+      dst_dim_to_tile_size[dim] = tv_dst->TileShape()[i];
+    }
+    for (int i = 0; i < dst_ndim; ++i) {
+      if (dst_dim_to_tile_size.count(i)) {
+        single_tile_res_shape.push_back(dst_dim_to_tile_size[i]);
+      } else {
+        single_tile_res_shape.push_back(1);
+      }
+    }
+  }
+
+  // Create the 'acc' buffer in shared.rsram to hold intermediate reduction
+  // values for a single tile.
+  auto create_tile_buffer = [&](std::string name, Array<PrimExpr> shape) {
+    return decl_buffer(shape, this->dst->dtype, name, "shared.rsram");
+  };
+
+  Buffer acc =
+      create_tile_buffer(this->dst->name + "_acc", single_tile_acc_shape);
+
+  Optional<Buffer> dst_res;
+  if (is_dim_tiled && !this->clear) {
+    dst_res =
+        create_tile_buffer(this->dst->name + "_res", single_tile_res_shape);
+  }
+
+  // Create outer loop variables for each dimension of the source tensor.
+  // Tiled dimensions will have extents = buffer_extent / tile_size.
+  Array<IterVar> loop_vars;
+  loop_vars.reserve(src_ndim);
+  for (int i = 0; i < src_ndim; i++) {
+    PrimExpr extent = this->src->shape[i];
+    if (src_dim_to_tile_size.count(i)) {
+      extent = truncdiv(extent, src_dim_to_tile_size[i]);
+    }
+    Var var = Var(std::string{char('i' + i)}, extent->dtype);
+    loop_vars.push_back({Range(0, extent), var, IterVarType::kDataPar});
+  }
+
+  // Identify which buffer dimensions are tiled and map them to tile axes (0,
+  // 1, ...).
+  std::unordered_map<int, int> src_buf_dim_to_tile_axis;
+  for (size_t i = 0; i < tv_src->IndexMap().size(); i++) {
+    int dim = tv_src->IndexMap()[i].as<IntImmNode>()->value;
+    if (dim < 0)
+      dim += src_ndim;
+    src_buf_dim_to_tile_axis[dim] = i;
+  }
+
+  std::unordered_map<int, int> dst_buf_dim_to_tile_axis;
+  for (size_t i = 0; i < tv_dst->IndexMap().size(); i++) {
+    int dim = tv_dst->IndexMap()[i].as<IntImmNode>()->value;
+    if (dim < 0)
+      dim += dst_ndim;
+    dst_buf_dim_to_tile_axis[dim] = i;
+  }
+
+  // Create interior loop variables (ki, kj, ...) for element-wise operations
+  // inside a Tile.
+  Array<Var> interior_vars;
+  Array<PrimExpr> src_tile_shape = tv_src->TileShape();
+  interior_vars.reserve(src_tile_shape.size());
+  for (size_t i = 0; i < src_tile_shape.size(); i++) {
+    interior_vars.push_back(Var("k" + std::string{char('i' + i)}));
+  }
+
+  // Map output tiled axes to the same interior variables used by source to
+  // ensure coordinate consistency.
+  Array<Var> dst_interior_vars_mapped;
+  Array<PrimExpr> dst_tile_shape = tv_dst->TileShape();
+  dst_interior_vars_mapped.reserve(tv_dst->IndexMap().size());
+  for (size_t i = 0; i < tv_dst->IndexMap().size(); i++) {
+    int dst_dim_val = tv_dst->IndexMap()[i].as<IntImmNode>()->value;
+    if (dst_dim_val < 0)
+      dst_dim_val += dst_ndim;
+
+    // Match output dimension to corresponding input dimension to find the
+    // correct 'k' variable.
+    int target_src_dim =
+        (this->dst->shape.size() == src_ndim)
+            ? dst_dim_val
+            : ((dst_dim_val < this->dim) ? dst_dim_val : dst_dim_val + 1);
+
+    bool found = false;
+    for (size_t j = 0; j < tv_src->IndexMap().size(); j++) {
+      int src_dim_val = tv_src->IndexMap()[j].as<IntImmNode>()->value;
+      if (src_dim_val < 0)
+        src_dim_val += src_ndim;
+      if (src_dim_val == target_src_dim) {
+        dst_interior_vars_mapped.push_back(interior_vars[j]);
+        found = true;
+        break;
+      }
+    }
+    ICHECK(found) << "Could not map dst tiled axis to src tiled axis";
+  }
+
+  // Helper functions to generate indices for element-wise TIR access.
+  // Large buffers use (loop_var * tile_size + interior_var), while 'acc' uses
+  // (interior_var).
+  auto get_src_indices = [&]() {
+    Array<PrimExpr> indices;
+    for (int i = 0; i < src_ndim; i++) {
+      if (src_buf_dim_to_tile_axis.count(i)) {
+        int axis = src_buf_dim_to_tile_axis.at(i);
+        indices.push_back(loop_vars[i]->var * src_tile_shape[axis] +
+                          interior_vars[axis]);
+      } else {
+        indices.push_back(loop_vars[i]->var);
+      }
+    }
+    return indices;
+  };
+
+  auto get_acc_indices = [&]() {
+    Array<PrimExpr> indices;
+    for (int i = 0; i < src_ndim; i++) {
+      if (src_buf_dim_to_tile_axis.count(i)) {
+        indices.push_back(interior_vars[src_buf_dim_to_tile_axis.at(i)]);
+      } else {
+        indices.push_back(make_zero(DataType::Int(32)));
+      }
+    }
+    return indices;
+  };
+
+  auto get_dst_indices = [&]() {
+    Array<PrimExpr> indices;
+    for (int i = 0; i < dst_ndim; i++) {
+      int src_dim = (this->dst->shape.size() == src_ndim)
+                        ? i
+                        : ((i < this->dim) ? i : i + 1);
+      if (dst_buf_dim_to_tile_axis.count(i)) {
+        int axis = dst_buf_dim_to_tile_axis.at(i);
+        indices.push_back(loop_vars[src_dim]->var * dst_tile_shape[axis] +
+                          dst_interior_vars_mapped[axis]);
+      } else {
+        if (this->dst->shape.size() == src_ndim && i == this->dim) {
+          indices.push_back(make_zero(this->dst->shape[i]->dtype));
+        } else {
+          indices.push_back(loop_vars[src_dim]->var);
+        }
+      }
+    }
+    return indices;
+  };
+
+  auto get_res_indices = [&]() {
+    Array<PrimExpr> indices;
+    for (int i = 0; i < dst_ndim; i++) {
+      if (dst_buf_dim_to_tile_axis.count(i)) {
+        indices.push_back(
+            dst_interior_vars_mapped[dst_buf_dim_to_tile_axis.at(i)]);
+      } else {
+        indices.push_back(make_zero(DataType::Int(32)));
+      }
+    }
+    return indices;
+  };
+
+  Array<PrimExpr> src_idx = get_src_indices();
+  Array<PrimExpr> acc_idx = get_acc_indices();
+  Array<PrimExpr> dst_idx = get_dst_indices();
+  Array<PrimExpr> res_idx = get_res_indices();
+
+  // Wraps a Stmt with interior loops (ki, kj, ...) representing element-wise
+  // execution of a Tile. The innermost loop is marked as vectorized.
+  auto wrap_interior = [&](Stmt b, const Array<Var> &i_vars,
+                           const Array<PrimExpr> &t_shape,
+                           const std::vector<int> &axes) {
+    for (int i = static_cast<int>(axes.size()) - 1; i >= 0; i--) {
+      int axis = axes[i];
+      ForKind kind = (i == static_cast<int>(axes.size()) - 1)
+                         ? ForKind::kVectorized
+                         : ForKind::kSerial;
+      For loop(i_vars[axis], 0, t_shape[axis], kind, b);
+      auto *n = loop.CopyOnWrite();
+      n->annotations.Set(attr::tile_interior, Integer(1));
+      n->annotations.Set(attr::tile_interior_axis, Integer(axis));
+      n->annotations.Set(attr::kTileLoopStage,
+                         Integer(static_cast<int>(TileLoopStage::kTiled)));
+      n->annotations.Set(attr::tiled_buffer, this->src->data);
+      b = loop;
+    }
+    return b;
+  };
+
+  std::vector<int> all_src_axes;
+  all_src_axes.reserve(src_tile_shape.size());
+  for (size_t i = 0; i < src_tile_shape.size(); i++)
+    all_src_axes.push_back(i);
+  std::vector<int> all_dst_axes;
+  all_dst_axes.reserve(dst_tile_shape.size());
+  for (size_t i = 0; i < dst_tile_shape.size(); i++)
+    all_dst_axes.push_back(i);
+
+  // Identify which interior axis corresponds to the reduction dimension.
+  int reduce_tile_axis = -1;
+  for (size_t i = 0; i < src_tile_shape.size(); i++) {
+    int dim_val = tv_src->IndexMap()[i].as<IntImmNode>()->value;
+    if (dim_val < 0)
+      dim_val += src_ndim;
+    if (dim_val == this->dim) {
+      reduce_tile_axis = i;
+    }
+  }
+
+  // Construct the reduction logic using a guarded multi-step process.
+  // This allows unifying spatial and reduction loops while maintaining
+  // correct Tile semantics.
+
+  // Step 1: Accumulate (Tile-to-Tile accumulation using element-wise
+  // operations)
+  Stmt accumulate_stmt =
+      BufferStore(acc,
+                  this->MakeReduce(BufferLoad(acc, acc_idx),
+                                   BufferLoad(this->src, src_idx)),
+                  acc_idx);
+  accumulate_stmt = wrap_interior(accumulate_stmt, interior_vars,
+                                  src_tile_shape, all_src_axes);
+
+  // Step 2: Init (Guarded: only run on the first step of the reduction loop)
+  Stmt init_stmt;
+  if (this->clear || is_dim_tiled) {
+    // If we are reducing along a tiled axis, we MUST initialize 'acc' with the
+    // neutral value (e.g. 0 for sum) even if clear=False. This is because 'acc'
+    // is a full tile (e.g., [32, 32]), but 'dst' is already reduced (e.g.,
+    // [32]). If we load 'dst' into every element of 'acc' along the reduction
+    // axis, the in-tile hardware reduction will accumulate the initial value 32
+    // times (resulting in "multiple additions"). The correct approach for
+    // clear=False + is_dim_tiled is to accumulate the pure reduced result into
+    // 'dst' during the finalize step.
+    init_stmt = BufferStore(acc, this->MakeInitValue(), acc_idx);
+  } else {
+    // For non-tiled axis reduction, 'acc' shape matches 'dst' shape within the
+    // tile, so we can safely load the initial value.
+    PrimExpr init_val = BufferLoad(this->dst, dst_idx);
+    if (this->type->isAbsSum() || this->type->isAbsMax()) {
+      init_val = tvm::abs(init_val);
+    }
+    init_stmt = BufferStore(acc, init_val, acc_idx);
+  }
+  init_stmt =
+      wrap_interior(init_stmt, interior_vars, src_tile_shape, all_src_axes);
+
+  // Step 3: Finalize (Guarded: run on the last step of the reduction loop)
+  Stmt finalize_stmt;
+  if (is_dim_tiled) {
+    // If reducing along a tiled axis, we need a specialized in-tile
+    // reduction.
+    std::string in_tile_reduce_type;
+    if (this->type->isSum() || this->type->isAbsSum())
+      in_tile_reduce_type = "sum";
+    else if (this->type->isMax() || this->type->isAbsMax())
+      in_tile_reduce_type = "max";
+    else if (this->type->isMin())
+      in_tile_reduce_type = "min";
+    else
+      LOG(FATAL) << "Unsupported reduce type for Sunmmio";
+
+    // Direct write-back to Out_shared using BufferRegion to save memory and
+    // IR depth.
+    Array<Range> dst_ranges;
+    for (int i = 0; i < dst_ndim; i++) {
+      int src_dim = (this->dst->shape.size() == src_ndim)
+                        ? i
+                        : ((i < this->dim) ? i : i + 1);
+      if (dst_dim_to_tile_size.count(i)) {
+        PrimExpr min = loop_vars[src_dim]->var * dst_dim_to_tile_size[i];
+        dst_ranges.push_back(
+            Range::FromMinExtent(min, dst_dim_to_tile_size[i]));
+      } else {
+        dst_ranges.push_back(Range::FromMinExtent(loop_vars[src_dim]->var, 1));
+      }
+    }
+    PrimExpr dst_region = MakeRegionExpr(this->dst, dst_ranges, 2);
+
+    Array<Range> acc_ranges;
+    for (int i = 0; i < src_ndim; i++) {
+      acc_ranges.push_back(
+          Range::FromMinExtent(make_zero(acc->shape[i]->dtype), acc->shape[i]));
+    }
+    PrimExpr acc_region = MakeRegionExpr(acc, acc_ranges, 1);
+
+    if (this->clear) {
+      finalize_stmt =
+          Evaluate(Call(DataType::Handle(), vector_core_in_tile_reduce(),
+                        {StringImm(in_tile_reduce_type), dst_region, acc_region,
+                         IntImm(DataType::Int(32), reduce_tile_axis)}));
+    } else {
+      ICHECK(dst_res.defined());
+      Buffer dst_res_buf = dst_res.value();
+
+      // 1. Create a region for dst_res
+      Array<Range> res_ranges;
+      for (int i = 0; i < dst_ndim; i++) {
+        res_ranges.push_back(Range::FromMinExtent(
+            make_zero(dst_res_buf->shape[i]->dtype), dst_res_buf->shape[i]));
+      }
+      PrimExpr res_region = MakeRegionExpr(dst_res_buf, res_ranges, 1);
+
+      // 2. Init dst_res with 0 (not strictly necessary if vector_core
+      // overwrites, but safe) Wait, vector_core_in_tile_reduce overwrites the
+      // dst region. We do not need to init dst_res manually.
+
+      // 3. vector_core_in_tile_reduce from acc to dst_res
+      Stmt in_tile_reduce_stmt =
+          Evaluate(Call(DataType::Handle(), vector_core_in_tile_reduce(),
+                        {StringImm(in_tile_reduce_type), res_region, acc_region,
+                         IntImm(DataType::Int(32), reduce_tile_axis)}));
+
+      // 4. Final accumulation from dst_res to dst
+      PrimExpr dst_val = BufferLoad(this->dst, dst_idx);
+      PrimExpr res_val = BufferLoad(dst_res_buf, res_idx);
+      if (this->type->isAbsSum() || this->type->isAbsMax()) {
+        dst_val = tvm::abs(dst_val);
+      }
+      PrimExpr update;
+      if (this->type->isSum() || this->type->isAbsSum()) {
+        update = dst_val + res_val;
+      } else if (this->type->isMax() || this->type->isAbsMax()) {
+        update = Max(dst_val, res_val);
+      } else if (this->type->isMin()) {
+        update = Min(dst_val, res_val);
+      } else {
+        LOG(FATAL) << "Unsupported reduce type for Sunmmio accumulation";
+      }
+      Stmt add_res_stmt = BufferStore(this->dst, update, dst_idx);
+      add_res_stmt = wrap_interior(add_res_stmt, dst_interior_vars_mapped,
+                                   dst_tile_shape, all_dst_axes);
+
+      finalize_stmt = SeqStmt({in_tile_reduce_stmt, add_res_stmt});
+    }
+  } else {
+    // If reduction is NOT along a tiled axis (e.g. Batch axis), 'acc' already
+    // holds the result.
+    Stmt store_stmt = BufferStore(this->dst, BufferLoad(acc, acc_idx), dst_idx);
+    store_stmt =
+        wrap_interior(store_stmt, interior_vars, src_tile_shape, all_src_axes);
+    finalize_stmt = store_stmt;
+  }
+
+  Var rv = loop_vars[this->dim]->var;
+  PrimExpr r_extent = loop_vars[this->dim]->dom->extent;
+
+  // Combine steps into a single body with guards.
+  Stmt body = SeqStmt({IfThenElse(rv == 0, init_stmt), accumulate_stmt,
+                       IfThenElse(rv == r_extent - 1, finalize_stmt)});
+
+  // 6. Wrap with outer Tile Loops (Spatial and Reduction).
+  // IMPORTANT: For memory reuse of 'acc', the reduction loop MUST be the
+  // innermost.
+  Map<String, ObjectRef> base_annotations;
+  base_annotations.Set(attr::kTileLoopStage,
+                       Integer(static_cast<int>(TileLoopStage::kTiled)));
+  base_annotations.Set(attr::tiled_buffer, this->src->data);
+  base_annotations.Set(attr::tile_new_shape, tv_src->TiledBufferShape());
+  base_annotations.Set(attr::tile_tile_size, tv_src->TileShape());
+  base_annotations.Set(attr::tile_dim_map, tv_src->IndexMap());
+
+  // Identify the outermost tiled loop index to set 'tile.scope_entry'.
+  int outermost_tiled_idx = -1;
+  for (int i = 0; i < src_ndim; i++) {
+    if (i != this->dim && src_buf_dim_to_tile_axis.count(i)) {
+      outermost_tiled_idx = i;
+      break;
+    }
+  }
+  if (outermost_tiled_idx == -1 && src_buf_dim_to_tile_axis.count(this->dim)) {
+    outermost_tiled_idx = this->dim;
+  }
+
+  // Wrap the reduction loop first (innermost).
+  {
+    int i = this->dim;
+    Map<String, ObjectRef> loop_anno = base_annotations;
+    loop_anno.Set(attr::tile_level_loop,
+                  Integer(0)); // Reduction axis is serial.
+    if (src_buf_dim_to_tile_axis.count(i)) {
+      loop_anno.Set(attr::tile_execution_loop, Integer(1));
+    }
+    if (i == outermost_tiled_idx) {
+      loop_anno.Set(attr::tile_scope_entry, Integer(1));
+    }
+    body = For(loop_vars[i]->var, 0, loop_vars[i]->dom->extent,
+               ForKind::kSerial, body, std::nullopt, loop_anno);
+  }
+
+  // Wrap spatial loops (outer loops).
+  for (int i = src_ndim - 1; i >= 0; i--) {
+    if (i == this->dim)
+      continue;
+    Map<String, ObjectRef> loop_anno = base_annotations;
+    loop_anno.Set(attr::tile_level_loop,
+                  Integer(1)); // Spatial axes are parallel.
+    if (src_buf_dim_to_tile_axis.count(i)) {
+      loop_anno.Set(attr::tile_execution_loop, Integer(1));
+    }
+    if (i == outermost_tiled_idx) {
+      loop_anno.Set(attr::tile_scope_entry, Integer(1));
+    }
+    body = For(loop_vars[i]->var, 0, loop_vars[i]->dom->extent,
+               ForKind::kSerial, body, std::nullopt, loop_anno);
+  }
+
+  // Finally, wrap the body in a Block with TileView metadata.
+  TileView tv_acc = makeTileView(single_tile_acc_shape, tv_src->TileShape(),
+                                 tv_src->IndexMap());
+  Map<Var, TileView> new_tileview_map;
+  new_tileview_map.Set(acc->data, tv_acc);
+
+  Array<Buffer> alloc_buffers;
+  alloc_buffers.push_back(acc);
+  if (dst_res.defined()) {
+    alloc_buffers.push_back(dst_res.value());
+  }
+
+  body = Block({}, {}, {}, "reduce_tile_op", body, std::nullopt, alloc_buffers,
+               {}, {{attr::kTileViewMap, new_tileview_map}});
+
+  return body;
+}
+
 /**
  * @brief Lower the Reduce operator to a TIR statement.
  *
@@ -230,6 +753,10 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
   auto src_scope = this->src.scope();
   auto dst_scope = this->dst.scope();
+
+  if (TargetIsSunmmio(T.target)) {
+    return MakeSunmmioTileReduce(T, analyzer);
+  }
 
   if (src_scope == "local.fragment" && dst_scope == "local.fragment") {
 
@@ -438,8 +965,11 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     if (need_duplicate) {
       PrimExpr update;
       if (need_update) {
-        auto src_val = BufferLoad(clear_buffer, red_indices);
-        auto dst_val = BufferLoad(dst_buffer, dst_indices);
+        PrimExpr src_val = BufferLoad(clear_buffer, red_indices);
+        PrimExpr dst_val = BufferLoad(dst_buffer, dst_indices);
+        if (this->type->isAbsSum() || this->type->isAbsMax()) {
+          dst_val = tvm::abs(dst_val);
+        }
         if (this->type->isSum() || this->type->isAbsSum()) {
           update = dst_val + src_val;
         } else if (this->type->isBitAnd()) {

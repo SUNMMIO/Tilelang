@@ -7,7 +7,6 @@ emit TIR intrinsics for inter-core communication on a target mesh.
 from __future__ import annotations
 
 from typing import Literal
-from collections.abc import Iterable
 
 from tvm import tir
 import tilelang.language as T
@@ -428,44 +427,3 @@ def all_reduce(
         )
 
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_allreduce"), *args)
-
-
-def barrier(group: Iterable[tuple[int, int]] | None = None):
-    """Insert a synchronization barrier among a group of cores.
-
-    Parameters
-    ----------
-    group : iterable of tuple[int, int] | None
-        Optional set of core coordinates to synchronize. If omitted, the
-        runtime's default participant set is used.
-
-    Returns
-    -------
-    tir.Call
-        The TIR intrinsic call handle for `tl.comm_barrier`.
-
-    Examples
-    --------
-    >>> barrier()
-    >>> barrier(group=[(0,0),(0,1)])
-    """
-    if group is None:
-        return tir.call_intrin("handle", tir.op.Op.get("tl.comm_barrier"))
-    else:
-        group = [core_tuple_to_id(core_id) for core_id in group]
-        return tir.call_intrin("handle", tir.op.Op.get("tl.comm_barrier"), *group)
-
-
-def fence():
-    """Emit a memory/communication fence intrinsic.
-
-    Returns
-    -------
-    tir.Call
-        The TIR intrinsic call handle for `tl.comm_fence`.
-
-    Examples
-    --------
-    >>> fence()
-    """
-    return tir.call_intrin("handle", tir.op.Op.get("tl.comm_fence"))

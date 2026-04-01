@@ -247,7 +247,7 @@ def make_blockwise_zz_layout(buffer: Buffer | BufferLoad | BufferRegion | tuple[
     # from stride and continuous
     assert row % row_bs == 0 and column % col_bs == 0, "Row and column must be multiples of block sizes for blockwise ZZ layout."
     hdims = [row // row_bs, row_bs, column // col_bs, col_bs]
-    hstrides = [row_bs * col_bs * (column // col_bs), row_bs, nelements_per_block, 1]
+    hstrides = [row_bs * col_bs * (column // col_bs), col_bs, nelements_per_block, 1]
     groups = [(0, 2), (2, 4)]
 
     return make_hierarchical_layout(hdims, hstrides, groups)
