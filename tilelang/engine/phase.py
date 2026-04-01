@@ -5,7 +5,6 @@ from tvm.target import Target
 import tilelang
 from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma, is_hopper, have_pdl
-from tilelang.utils.target import target_is_sunmmio
 
 
 def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
