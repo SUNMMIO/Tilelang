@@ -14,14 +14,7 @@ namespace tl {
 TVM_DLL const Op &CoreId();
 TVM_DLL const Op &comm_current_core();
 TVM_DLL const Op &comm_is_current_core();
-TVM_DLL const Op &comm_barrier();
 TVM_DLL const Op &broadcast_();
-
-TVM_DLL const Op &barrier_id();
-TVM_DLL const Op &barrier_init();
-TVM_DLL const Op &barrier_arrive_and_wait();
-TVM_DLL const Op &sync_token_id();
-TVM_DLL const Op &wait_token();
 
 using namespace tir;
 

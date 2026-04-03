@@ -4,9 +4,11 @@ from __future__ import annotations
 from typing import Literal
 from tilelang._typing import BufferLikeType
 from tvm import tir
+from tvm.target import Target
 from tilelang.language import copy, macro, alloc_shared, alloc_fragment
 from tilelang.utils.language import to_buffer_region, retrieve_shape, _get_buffer
 from tilelang.utils.language import is_shared, is_fragment
+from tilelang.utils.target import target_is_sunmmio
 from tvm.script.ir_builder import IRBuilder
 
 
@@ -43,6 +45,22 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: in
 
     @macro
     def reduce_macro(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clear: bool) -> None:
+        target = Target.current()
+        # Sunmmio uses direct builtins for ReduceOp in LowerTileOp
+        # Check for Sunmmio target or specific Sunmmio shared memory scopes
+        is_sunmmio_scope = any(scope in (buffer.scope(), out.scope()) for scope in ("shared.rsram", "shared.asram", "shared.wsram"))
+        if (target and target_is_sunmmio(target)) or is_sunmmio_scope:
+            tir.call_intrin(
+                "handle",
+                tir.op.Op.get(_REDUCE_OP_KEY),
+                to_buffer_region(buffer, access_type="r"),
+                to_buffer_region(out, access_type="w"),
+                reduce_type,
+                dim,
+                clear,
+            )
+            return
+
         if is_shared(buffer) and is_shared(out):
             red_frag_in = alloc_fragment(buffer.shape, buffer.dtype)
             red_frag_out = alloc_fragment(out.shape, out.dtype)
@@ -174,7 +192,7 @@ def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
     reduce(buffer, out, "sum", dim, clear)
 
 
-def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1) -> None:
+def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
     """Perform reduce absolute sum on input buffer, store the result to output buffer.
 
     Args:
@@ -186,7 +204,7 @@ def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1) -> None:
         tir.Call: Handle to the reduction operation
     """
     dim = _legalize_dim(buffer, dim)
-    reduce(buffer, out, "abssum", dim, True)
+    reduce(buffer, out, "abssum", dim, clear)
 
 
 def reduce_absmax(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:

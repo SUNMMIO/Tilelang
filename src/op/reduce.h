@@ -118,6 +118,9 @@ private:
   PrimExpr MakeReduce(const PrimExpr &acc, const PrimExpr &b) const;
   /// Generate codegen reducer string
   std::string MakeCodegenReducer() const;
+  /// Sunmmio Tile-based reduction logic
+  Stmt MakeSunmmioTileReduce(const LowerArgs &T,
+                             arith::Analyzer *analyzer) const;
 };
 
 /// Wrapper class for reduction operations

@@ -4,6 +4,7 @@ from tvm.target import Target
 import tilelang
 from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma, is_hopper, have_pdl
+from tilelang.utils.target import target_is_sunmmio
 
 
 def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
@@ -227,6 +228,17 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.LowerOpaqueBlock()(mod)
         if is_hopper(target):
             mod = tilelang.transform.RewriteWgmmaSync()(mod)
+    elif target_is_sunmmio(target):
+        # sunmmio target support dma
+        mod = tilelang.transform.IfStmtBinding()(mod)
+        mod = tilelang.transform.MultiVersionBuffer()(mod)
+        print("Before InjectSunmmioSynchronization...\n", mod)
+        mod = tilelang.transform.InjectSunmmioSync()(mod)
+        print("After InjectSunmmioSynchronization...\n", mod)
+
+        mod = tilelang.transform.PipelinePlanning()(mod)
+        mod = tilelang.transform.InjectSoftwarePipeline()(mod)
+        mod = tilelang.transform.MergeIfStmt()(mod)
     else:
         mod = tilelang.transform.IfStmtBinding()(mod)
         mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
