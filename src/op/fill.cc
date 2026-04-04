@@ -288,7 +288,7 @@ LayoutMap FillNode::InferLayoutSunmmioTileFill(const LayoutInferArgs &T,
 
     if (dst->shape.size() == 1) {
       const auto make_linear =
-          ffi::Function::GetGlobal("tl.make_linear_layout");
+          ffi::Function::GetGlobal("tl.layout.make_linear_layout");
       auto layout = Downcast<Layout>((*make_linear)(dst->shape));
       return {{dst, layout}};
     } else {

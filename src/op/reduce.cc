@@ -718,7 +718,8 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   local_layout_map.Set(acc, acc_layout);
 
   if (dst_res.defined()) {
-    const auto make_linear = ffi::Function::GetGlobal("tl.make_linear_layout");
+    const auto make_linear =
+        ffi::Function::GetGlobal("tl.layout.make_linear_layout");
     auto res_layout = Downcast<Layout>((*make_linear)(dst_res.value()->shape));
     local_layout_map.Set(dst_res.value(), res_layout);
   }
@@ -1059,7 +1060,8 @@ LayoutMap ReduceOpNode::InferLayoutSunmmioTileReduce(const LayoutInferArgs &T,
     LayoutMap result;
     const auto make_zz =
         ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
-    const auto make_linear = ffi::Function::GetGlobal("tl.make_linear_layout");
+    const auto make_linear =
+        ffi::Function::GetGlobal("tl.layout.make_linear_layout");
 
     if (src->shape.size() == 1) {
       auto src_layout = Downcast<Layout>((*make_linear)(src->shape));
