@@ -19,45 +19,22 @@
 namespace tvm {
 namespace codegen {
 
-struct ExprInfo {
+struct SunMMIOValue {
   DataType dtype;
-  std::string kind;
-  std::string text;
-  bool is_constant{false};
+  std::string value;
+  std::string mlir_type;
 };
 
-struct BufferInfo {
-  std::string name;
+struct BufferBinding {
   tir::Buffer buffer;
-  DataType dtype;
-  ffi::Array<PrimExpr> shape;
+  std::string handle;
+  std::string memref_type;
   std::string scope;
   bool is_external{false};
 };
 
-struct LoopInfo {
-  tir::Var loop_var;
-  ExprInfo min;
-  ExprInfo extent;
-  tir::ForKind kind;
-};
-
-struct AttrInfo {
-  ffi::Any node;
-  ffi::String key;
-  ExprInfo value;
-};
-
-struct FunctionInfo {
-  GlobalVar gvar;
-  tir::PrimFunc prim_func;
-  std::string name;
-  std::vector<std::string> param_names;
-  std::vector<std::string> param_kinds;
-};
-
 class CodeGenTileLangSunMMIO final : public tir::StmtVisitor,
-                                      public tir::ExprFunctor<ExprInfo(const tvm::PrimExpr&)> {
+                                      public tir::ExprFunctor<SunMMIOValue(const tvm::PrimExpr&)> {
 public:
   CodeGenTileLangSunMMIO();
   ~CodeGenTileLangSunMMIO() noexcept override = default;
@@ -73,6 +50,7 @@ protected:
   void VisitStmt_(const tir::LetStmtNode* op) override;
   void VisitStmt_(const tir::AttrStmtNode* op) override;
   void VisitStmt_(const tir::IfThenElseNode* op) override;
+  void VisitStmt_(const tir::WhileNode* op) override;
   void VisitStmt_(const tir::AllocateNode* op) override;
   void VisitStmt_(const tir::AllocateConstNode* op) override;
   void VisitStmt_(const tir::DeclBufferNode* op) override;
@@ -84,39 +62,39 @@ protected:
   void VisitStmt_(const tir::BlockRealizeNode* op) override;
   void VisitStmtDefault_(const Object* op) override;
 
-  ExprInfo VisitExpr_(const tir::VarNode* op) override;
-  ExprInfo VisitExpr_(const tir::SizeVarNode* op) override;
-  ExprInfo VisitExpr_(const tir::IntImmNode* op) override;
-  ExprInfo VisitExpr_(const tir::FloatImmNode* op) override;
-  ExprInfo VisitExpr_(const tir::StringImmNode* op) override;
-  ExprInfo VisitExpr_(const tir::CastNode* op) override;
-  ExprInfo VisitExpr_(const tir::CallNode* op) override;
-  ExprInfo VisitExpr_(const tir::AddNode* op) override;
-  ExprInfo VisitExpr_(const tir::SubNode* op) override;
-  ExprInfo VisitExpr_(const tir::MulNode* op) override;
-  ExprInfo VisitExpr_(const tir::DivNode* op) override;
-  ExprInfo VisitExpr_(const tir::ModNode* op) override;
-  ExprInfo VisitExpr_(const tir::FloorDivNode* op) override;
-  ExprInfo VisitExpr_(const tir::FloorModNode* op) override;
-  ExprInfo VisitExpr_(const tir::MinNode* op) override;
-  ExprInfo VisitExpr_(const tir::MaxNode* op) override;
-  ExprInfo VisitExpr_(const tir::EQNode* op) override;
-  ExprInfo VisitExpr_(const tir::NENode* op) override;
-  ExprInfo VisitExpr_(const tir::LTNode* op) override;
-  ExprInfo VisitExpr_(const tir::LENode* op) override;
-  ExprInfo VisitExpr_(const tir::GTNode* op) override;
-  ExprInfo VisitExpr_(const tir::GENode* op) override;
-  ExprInfo VisitExpr_(const tir::AndNode* op) override;
-  ExprInfo VisitExpr_(const tir::OrNode* op) override;
-  ExprInfo VisitExpr_(const tir::NotNode* op) override;
-  ExprInfo VisitExpr_(const tir::SelectNode* op) override;
-  ExprInfo VisitExpr_(const tir::BufferLoadNode* op) override;
-  ExprInfo VisitExpr_(const tir::ProducerLoadNode* op) override;
-  ExprInfo VisitExpr_(const tir::RampNode* op) override;
-  ExprInfo VisitExpr_(const tir::BroadcastNode* op) override;
-  ExprInfo VisitExpr_(const tir::ShuffleNode* op) override;
-  ExprInfo VisitExpr_(const tir::LetNode* op) override;
-  ExprInfo VisitExprDefault_(const Object* op) override;
+  SunMMIOValue VisitExpr_(const tir::VarNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::SizeVarNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::IntImmNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::FloatImmNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::StringImmNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::CastNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::CallNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::AddNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::SubNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::MulNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::DivNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::ModNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::FloorDivNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::FloorModNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::MinNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::MaxNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::EQNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::NENode* op) override;
+  SunMMIOValue VisitExpr_(const tir::LTNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::LENode* op) override;
+  SunMMIOValue VisitExpr_(const tir::GTNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::GENode* op) override;
+  SunMMIOValue VisitExpr_(const tir::AndNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::OrNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::NotNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::SelectNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::BufferLoadNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::ProducerLoadNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::RampNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::BroadcastNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::ShuffleNode* op) override;
+  SunMMIOValue VisitExpr_(const tir::LetNode* op) override;
+  SunMMIOValue VisitExprDefault_(const Object* op) override;
 
 private:
   enum class CallBucket {
@@ -132,41 +110,66 @@ private:
     kUnsupported
   };
 
-  ExprInfo EvalExpr(const tvm::PrimExpr& expr);
-  ExprInfo MakeExprInfo(DataType dtype, const char* kind, std::string text,
-                        bool is_constant = false) const;
-  ExprInfo EmitBinaryExprInfo(const char* kind, const tvm::PrimExpr& lhs,
-                              const tvm::PrimExpr& rhs, tvm::DataType dtype);
-  std::string PrintType(tvm::DataType dtype) const;
-  void EnterScope();
-  void ExitScope();
-  void BindVar(const tir::Var& var, const ExprInfo& info);
-  void RegisterBuffer(const tir::Buffer& buffer, bool is_external);
-  void RecordAttr(const AttrInfo& attr);
-  void RecordLoop(const LoopInfo& loop);
-  void RecordFunctionMetadata(const GlobalVar& gvar, const tir::PrimFunc& f);
+  struct ScopedAttr {
+    ffi::Any node;
+    ffi::String key;
+    SunMMIOValue value;
+  };
+
+  SunMMIOValue EvalExpr(const tvm::PrimExpr& expr);
+  SunMMIOValue EmitBinary(const char* op_name, const tvm::PrimExpr& lhs,
+                          const tvm::PrimExpr& rhs, tvm::DataType dtype);
+  SunMMIOValue EmitCmp(const char* pred, const tvm::PrimExpr& lhs,
+                       const tvm::PrimExpr& rhs);
+  SunMMIOValue EmitCast(const SunMMIOValue& v, tvm::DataType target_dtype);
+  SunMMIOValue EmitCall(const tir::CallNode* op);
+  SunMMIOValue EmitLoad(const tir::Buffer& buffer,
+                        const ffi::Array<PrimExpr>& indices);
+  void EmitStore(const tir::Buffer& buffer, const ffi::Array<PrimExpr>& indices,
+                 const SunMMIOValue& value);
+  void EmitAlloc(const tir::Var& buffer_var, DataType dtype,
+                 const ffi::Array<PrimExpr>& extents,
+                 const std::string& scope_hint);
+  void EmitFor(const tir::ForNode* op);
+  void EmitIf(const tir::IfThenElseNode* op);
+
+  std::string MapType(tvm::DataType dtype) const;
+  std::string MapBufferType(const tir::Buffer& buffer) const;
+  std::string MapStorageScope(const std::string& scope) const;
   std::string ClassifyParamKind(const tir::Var& param,
                                 const tir::PrimFunc& f) const;
+  std::string NewValueName();
+  std::string NewLabel(const std::string& prefix);
+  void EmitLine(const std::string& line);
+  SunMMIOValue EmitConstIndex(int64_t v);
+  SunMMIOValue EnsureIndex(const SunMMIOValue& v);
+  SunMMIOValue EnsureType(const SunMMIOValue& v, const std::string& mlir_type,
+                          DataType dtype);
+  SunMMIOValue BindVar(const tir::Var& var, const SunMMIOValue& value);
+  void RegisterBuffer(const tir::Buffer& buffer, bool is_external,
+                      const std::string& handle_hint = "");
+  const BufferBinding& LookupBuffer(const tir::Buffer& buffer) const;
+  void EnterScope();
+  void ExitScope();
+
   CallBucket ClassifyCall(const tir::CallNode* op) const;
-  std::string ToString(CallBucket bucket) const;
+  const char* CallBucketName(CallBucket bucket) const;
   [[noreturn]] void UnsupportedStmt(const Object* op,
                                     const std::string& detail = "") const;
   [[noreturn]] void UnsupportedExpr(const Object* op,
                                     const std::string& detail = "") const;
 
-  std::ostringstream summary_;
+  std::ostringstream mlir_;
   bool initialized_{false};
-  int expr_counter_{0};
+  int ssa_counter_{0};
+  int label_counter_{0};
+  int indent_{0};
+  bool module_open_{false};
+  bool function_open_{false};
 
-  std::vector<FunctionInfo> functions_;
-  FunctionInfo* current_function_{nullptr};
-
-  std::unordered_map<const tir::VarNode*, ExprInfo> var_table_;
-  std::unordered_map<const tir::BufferNode*, BufferInfo> buffer_registry_;
-  std::vector<LoopInfo> loop_stack_;
-  std::vector<AttrInfo> attr_stack_;
-  std::vector<std::string> diagnostics_;
-  std::vector<std::string> unsupported_reports_;
+  std::unordered_map<const tir::VarNode*, SunMMIOValue> var_table_;
+  std::unordered_map<const tir::BufferNode*, BufferBinding> buffer_registry_;
+  std::vector<ScopedAttr> attr_stack_;
 
   std::vector<const tir::VarNode*> scoped_vars_;
   std::vector<const tir::BufferNode*> scoped_buffers_;
