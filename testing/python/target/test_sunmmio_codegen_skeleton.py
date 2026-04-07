@@ -1,4 +1,5 @@
 import pytest
+import re
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm as tvm
@@ -27,16 +28,80 @@ def build_sunmmio_module_without_compile(func):
     return builder(mod, target)
 
 
-def test_sunmmio_codegen_without_compile_emits_skeleton_source():
-    src = build_sunmmio_module_without_compile(simple_add_kernel()).inspect_source()
+def build_sunmmio_source_without_compile(func):
+    return build_sunmmio_module_without_compile(func).inspect_source()
+
+
+def build_sunmmio_source_from_stmt(stmt):
+    target = determine_target("Sunmmio", return_object=True)
+    func = tvm.tir.PrimFunc([], stmt)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("calling_conv", int(tvm.ir.CallingConv.DEVICE_KERNEL_LAUNCH))
+    mod = tvm.IRModule({"main": func})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    return builder(mod, target).inspect_source()
+
+
+def test_sunmmio_codegen_without_compile_emits_mlir_source():
+    src = build_sunmmio_source_without_compile(simple_add_kernel())
     print(src)
-    assert "sunmmio.module {" in src
-    assert "sunmmio.func" in src
-    assert "sunmmio.for" in src
-    assert "sunmmio.load" in src
-    assert "sunmmio.add" in src
-    assert "sunmmio.store" in src
-    assert "sunmmio.return" in src
+    assert "module {" in src
+    assert "func.func @main" in src
+    assert "scf.for" in src
+    assert "memref.load" in src
+    assert "arith.addf" in src
+    assert "memref.store" in src
+    assert "return" in src
+
+
+def test_sunmmio_codegen_no_placeholder_summary_text():
+    src = build_sunmmio_source_without_compile(simple_add_kernel())
+    print(src)
+    assert "sunmmio.traversal_summary" not in src
+    assert "status: traversal_only_no_emission" not in src
+
+
+def test_sunmmio_codegen_emits_multidim_store_indices():
+    @T.prim_func
+    def main(A: T.Tensor((4, 4), dtype=T.float32), B: T.Tensor((4, 4), dtype=T.float32)):
+        with T.attr(0, "sunmmio.test_attr", 7):
+            for i, j in T.grid(2, 3):
+                with T.block("B0"):
+                    vi, vj = T.axis.remap("SS", [i, j])
+                    T.reads(A[vi, vj])
+                    T.writes(B[vi, vj])
+                    B[vi, vj] = A[vi, vj] + T.float32(1.0)
+
+    src = build_sunmmio_source_without_compile(main)
+    print(src)
+    assert "scf.for" in src
+    assert "memref.store" in src
+    assert re.search(r"memref\.store .*?\[[^,\]]+,\s*[^,\]]+\]", src), src
+
+
+def test_sunmmio_codegen_classifies_sunmmio_intrinsic_calls():
+    dma_call = tvm.tir.Call("handle", tvm.ir.Op.get("tl.dma_copy"), [])
+    mma_call = tvm.tir.Call("handle", tvm.ir.Op.get("tl.mma_sunmmio"), [])
+    body = tvm.tir.SeqStmt([tvm.tir.Evaluate(dma_call), tvm.tir.Evaluate(mma_call)])
+    src = build_sunmmio_source_from_stmt(body)
+    print(src)
+    assert 'sunmmio.call @"tl.dma_copy"(' in src
+    assert 'sunmmio.call @"tl.mma_sunmmio"(' in src
+    assert 'category = "sunmmio_intrinsic"' in src
+
+
+def test_sunmmio_codegen_unsupported_stmt_fails_loudly():
+    cond = tvm.tir.LT(tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 1))
+    body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
+    stmt = tvm.tir.While(cond, body)
+    target = determine_target("Sunmmio", return_object=True)
+    func = tvm.tir.PrimFunc([], stmt)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("calling_conv", int(tvm.ir.CallingConv.DEVICE_KERNEL_LAUNCH))
+    mod = tvm.IRModule({"main": func})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(Exception, match="CodeGenTileLangSunMMIO unsupported stmt: tir.While"):
+        builder(mod, target)
 
 
 def test_sunmmio_codegen_compile_path_not_implemented():
