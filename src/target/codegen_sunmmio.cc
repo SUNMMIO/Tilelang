@@ -389,9 +389,60 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::EvaluateNode* op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockNode* op) {
+  auto traverse_range = [this](const Range& range) {
+    (void)EvalExpr(range->min);
+    (void)EvalExpr(range->extent);
+  };
+  auto traverse_buffer_region = [&traverse_range](const BufferRegion& region) {
+    for (const Range& r : region->region) {
+      traverse_range(r);
+    }
+  };
+  auto traverse_annotation_obj =
+      [this](const ffi::Any& value,
+             const auto& self_ref) -> void {
+    if (auto maybe_expr = value.as<PrimExpr>()) {
+      (void)EvalExpr(maybe_expr.value());
+      return;
+    }
+    if (auto maybe_arr_expr = value.as<ffi::Array<PrimExpr>>()) {
+      for (const PrimExpr& item : maybe_arr_expr.value()) {
+        (void)EvalExpr(item);
+      }
+      return;
+    }
+    if (auto maybe_arr_any = value.as<ffi::Array<ffi::Any>>()) {
+      for (const ffi::Any& item : maybe_arr_any.value()) {
+        self_ref(item, self_ref);
+      }
+      return;
+    }
+    if (auto maybe_map_expr = value.as<ffi::Map<ffi::String, PrimExpr>>()) {
+      for (const auto& kv : maybe_map_expr.value()) {
+        (void)EvalExpr(kv.second);
+      }
+      return;
+    }
+    if (auto maybe_map_any = value.as<ffi::Map<ffi::String, ffi::Any>>()) {
+      for (const auto& kv : maybe_map_any.value()) {
+        self_ref(kv.second, self_ref);
+      }
+      return;
+    }
+    if (auto maybe_map_any_any = value.as<ffi::Map<ffi::Any, ffi::Any>>()) {
+      for (const auto& kv : maybe_map_any_any.value()) {
+        self_ref(kv.first, self_ref);
+        self_ref(kv.second, self_ref);
+      }
+      return;
+    }
+  };
+
   EnterScope();
   for (const IterVar& iv : op->iter_vars) {
-    BindVar(iv->var, EvalExpr(iv->var));
+    if (!var_table_.count(iv->var.get())) {
+      BindVar(iv->var, EvalExpr(iv->var));
+    }
   }
   for (const Buffer& alloc : op->alloc_buffers) {
     RegisterBuffer(alloc, false, NewValueName());
@@ -399,18 +450,31 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockNode* op) {
     EmitLine(binding.handle + " = memref.alloc() {sunmmio.scope = \"" +
              MapStorageScope(alloc.scope()) + "\"} : " + binding.memref_type);
   }
-  for (const BufferRegion& r : op->reads) {
-    for (const Range& range : r->region) {
-      EvalExpr(range->min);
-      EvalExpr(range->extent);
+  for (const MatchBufferRegion& match : op->match_buffers) {
+    if (match->source.defined()) {
+      RegisterBuffer(match->source->buffer, false);
+      traverse_buffer_region(match->source);
     }
+    if (!buffer_registry_.count(match->buffer.get())) {
+      if (match->source.defined() &&
+          buffer_registry_.count(match->source->buffer.get())) {
+        const BufferBinding& src = LookupBuffer(match->source->buffer);
+        RegisterBuffer(match->buffer, false, src.handle);
+      } else {
+        RegisterBuffer(match->buffer, false, NewValueName());
+      }
+    }
+  }
+  for (const BufferRegion& r : op->reads) {
+    RegisterBuffer(r->buffer, false);
+    traverse_buffer_region(r);
   }
   for (const BufferRegion& r : op->writes) {
     RegisterBuffer(r->buffer, false);
-    for (const Range& range : r->region) {
-      EvalExpr(range->min);
-      EvalExpr(range->extent);
-    }
+    traverse_buffer_region(r);
+  }
+  for (const auto& kv : op->annotations) {
+    traverse_annotation_obj(kv.second, traverse_annotation_obj);
   }
   if (op->init.defined()) {
     VisitStmt(op->init.value());
@@ -420,12 +484,30 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockNode* op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockRealizeNode* op) {
+  auto is_trivially_true = [](const PrimExpr& expr) {
+    if (is_one(expr)) {
+      return true;
+    }
+    if (const auto* imm = expr.as<IntImmNode>()) {
+      return imm->value != 0;
+    }
+    return false;
+  };
+
   EnterScope();
   for (size_t i = 0; i < op->iter_values.size() && i < op->block->iter_vars.size(); ++i) {
     BindVar(op->block->iter_vars[i]->var, EvalExpr(op->iter_values[i]));
   }
-  (void)EnsureType(EvalExpr(op->predicate), "i1", DataType::Bool());
-  VisitStmt(op->block);
+  if (is_trivially_true(op->predicate)) {
+    VisitStmt(op->block);
+  } else {
+    SunMMIOValue pred = EnsureType(EvalExpr(op->predicate), "i1", DataType::Bool());
+    EmitLine("scf.if " + pred.value + " {");
+    indent_++;
+    VisitStmt(op->block);
+    indent_--;
+    EmitLine("}");
+  }
   ExitScope();
 }
 
@@ -904,6 +986,13 @@ std::string CodeGenTileLangSunMMIO::ClassifyParamKind(const tir::Var& param,
 
 [[noreturn]] void CodeGenTileLangSunMMIO::UnsupportedStmt(
     const Object* op, const std::string& detail) const {
+  // Intentional unsupported contract for this backend:
+  // - tir::WhileNode
+  // - legacy tir::LoadNode
+  // - tir::AnyNode
+  // - tir::ShuffleNode
+  // These forms must be eliminated before SunMMIO codegen; reaching here is
+  // a pipeline bug and should fail loudly.
   std::ostringstream os;
   os << "CodeGenTileLangSunMMIO unsupported stmt: " << op->GetTypeKey();
   if (!detail.empty()) {
@@ -915,6 +1004,13 @@ std::string CodeGenTileLangSunMMIO::ClassifyParamKind(const tir::Var& param,
 
 [[noreturn]] void CodeGenTileLangSunMMIO::UnsupportedExpr(
     const Object* op, const std::string& detail) const {
+  // Intentional unsupported contract for this backend:
+  // - tir::WhileNode
+  // - legacy tir::LoadNode
+  // - tir::AnyNode
+  // - tir::ShuffleNode
+  // These forms must be eliminated before SunMMIO codegen; reaching here is
+  // a pipeline bug and should fail loudly.
   std::ostringstream os;
   os << "CodeGenTileLangSunMMIO unsupported expr: " << op->GetTypeKey();
   if (!detail.empty()) {
