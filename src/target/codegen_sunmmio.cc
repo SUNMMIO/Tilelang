@@ -112,6 +112,10 @@ std::string CodeGenTileLangSunMMIO::NewLabel(const std::string& prefix) {
 }
 
 std::string CodeGenTileLangSunMMIO::MapType(tvm::DataType dtype) const {
+  if (dtype.lanes() > 1) {
+    DataType scalar = dtype.with_lanes(1);
+    return "vector<" + std::to_string(dtype.lanes()) + "x" + MapType(scalar) + ">";
+  }
   if (dtype.is_void()) {
     return "none";
   }
@@ -707,11 +711,33 @@ SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::ProducerLoadNode* op)
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::RampNode* op) {
-  UnsupportedExpr(op, "RampNode lowering is not implemented yet.");
+  DataType elem_dtype = op->dtype.with_lanes(1);
+  std::string elem_ty = MapType(elem_dtype);
+  std::string vec_ty = MapType(op->dtype);
+
+  SunMMIOValue base = EvalExpr(op->base);
+  SunMMIOValue stride = EvalExpr(op->stride);
+  base = EnsureType(base, elem_ty, elem_dtype);
+  stride = EnsureType(stride, elem_ty, elem_dtype);
+
+  std::string out = NewValueName();
+  EmitLine(out + " = sunmmio.ramp " + base.value + ", " + stride.value +
+           " {lanes = " + std::to_string(op->dtype.lanes()) + "} : " + elem_ty +
+           " -> " + vec_ty);
+  return SunMMIOValue{op->dtype, out, vec_ty};
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::BroadcastNode* op) {
-  UnsupportedExpr(op, "BroadcastNode lowering is not implemented yet.");
+  SunMMIOValue scalar = EvalExpr(op->value);
+  DataType scalar_dtype = op->dtype.with_lanes(1);
+  std::string scalar_ty = MapType(scalar_dtype);
+  std::string vec_ty = MapType(op->dtype);
+  scalar = EnsureType(scalar, scalar_ty, scalar_dtype);
+
+  std::string out = NewValueName();
+  EmitLine(out + " = vector.broadcast " + scalar.value + " : " + scalar_ty +
+           " to " + vec_ty);
+  return SunMMIOValue{op->dtype, out, vec_ty};
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::ShuffleNode* op) {

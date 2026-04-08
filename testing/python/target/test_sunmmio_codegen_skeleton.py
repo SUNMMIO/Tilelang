@@ -13,6 +13,7 @@ from tilelang.utils.target import determine_target
 # - Allocate, AllocateConst
 # - DeclBuffer, BufferRealize, BufferLoad, BufferStore
 # - Block, BlockRealize
+# - Ramp, Broadcast
 # - TileLang/SunMMIO intrinsic Call
 #
 # Intentionally unsupported:
@@ -200,6 +201,24 @@ def test_sunmmio_codegen_shuffle_fails_loudly():
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
     with pytest.raises(Exception, match="CodeGenTileLangSunMMIO unsupported expr: tir.Shuffle"):
         builder(mod, target)
+
+
+def test_sunmmio_codegen_ramp_is_supported():
+    ramp = tvm.tir.Ramp(tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 1), 4)
+    stmt = tvm.tir.Evaluate(ramp)
+    src = build_sunmmio_source_from_stmt(stmt)
+    print(src)
+    assert "sunmmio.ramp" in src
+    assert "vector<4xi32>" in src
+
+
+def test_sunmmio_codegen_broadcast_is_supported():
+    bcast = tvm.tir.Broadcast(tvm.tir.FloatImm("float32", 1.5), 4)
+    stmt = tvm.tir.Evaluate(bcast)
+    src = build_sunmmio_source_from_stmt(stmt)
+    print(src)
+    assert "vector.broadcast" in src
+    assert "vector<4xf32>" in src
 
 
 def test_sunmmio_codegen_legacy_loadnode_fails_loudly():
