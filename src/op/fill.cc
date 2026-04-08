@@ -10,6 +10,8 @@
 #include <tvm/tir/op.h>
 #include <tvm/tir/op_attr_types.h>
 
+#include "../layout/layout.h"
+#include "../layout/tcgen05_layout.h"
 #include "../target/utils.h"
 #include "../transform/common/attr.h"
 #include "../transform/common/loop_fusion_utils.h"
@@ -20,6 +22,21 @@
 
 namespace tvm {
 namespace tl {
+
+namespace {
+bool CanUseBlockwiseZZ(const Buffer &buf) {
+  if (buf->shape.size() < 2)
+    return false;
+  auto row = buf->shape[buf->shape.size() - 2];
+  auto col = buf->shape[buf->shape.size() - 1];
+  if (const auto *imm_row = row.as<IntImmNode>()) {
+    if (const auto *imm_col = col.as<IntImmNode>()) {
+      return imm_row->value % 32 == 0 && imm_col->value % 32 == 0;
+    }
+  }
+  return false;
+}
+} // namespace
 
 using namespace tir;
 
@@ -286,15 +303,15 @@ LayoutMap FillNode::InferLayoutSunmmioTileFill(const LayoutInferArgs &T,
            "shared.rsram scope, but got "
         << dst_scope;
 
-    if (dst->shape.size() == 1) {
-      const auto make_linear =
-          ffi::Function::GetGlobal("tl.layout.make_linear_layout");
-      auto layout = Downcast<Layout>((*make_linear)(dst->shape));
-      return {{dst, layout}};
-    } else {
+    if (CanUseBlockwiseZZ(dst)) {
       const auto f =
           ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
+      ICHECK(f != nullptr)
+          << "Cannot find global function tl.layout.make_blockwise_zz_layout";
       auto layout = Downcast<Layout>((*f)(dst));
+      return {{dst, layout}};
+    } else {
+      auto layout = makeLinearLayout(dst->shape);
       return {{dst, layout}};
     }
   }

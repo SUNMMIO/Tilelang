@@ -28,6 +28,21 @@
 namespace tvm {
 namespace tl {
 
+namespace {
+bool CanUseBlockwiseZZ(const Buffer &buf) {
+  if (buf->shape.size() < 2)
+    return false;
+  auto row = buf->shape[buf->shape.size() - 2];
+  auto col = buf->shape[buf->shape.size() - 1];
+  if (const auto *imm_row = row.as<IntImmNode>()) {
+    if (const auto *imm_col = col.as<IntImmNode>()) {
+      return imm_row->value % 32 == 0 && imm_col->value % 32 == 0;
+    }
+  }
+  return false;
+}
+} // namespace
+
 using namespace tir;
 
 // NormalizeToBufferRegion moved to src/op/utils.{h,cc}
@@ -714,20 +729,24 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   Map<Buffer, Layout> local_layout_map;
   const auto make_zz =
       ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
-  auto acc_layout = Downcast<Layout>((*make_zz)(acc));
-  local_layout_map.Set(acc, acc_layout);
+  ICHECK(make_zz != nullptr)
+      << "Cannot find global function tl.layout.make_blockwise_zz_layout";
+
+  if (CanUseBlockwiseZZ(acc)) {
+    auto acc_layout = Downcast<Layout>((*make_zz)(acc));
+    local_layout_map.Set(acc, acc_layout);
+  } else {
+    auto acc_layout = makeLinearLayout(acc->shape);
+    local_layout_map.Set(acc, acc_layout);
+  }
 
   if (dst_res.defined()) {
-    const auto make_linear =
-        ffi::Function::GetGlobal("tl.layout.make_linear_layout");
-    auto res_layout = Downcast<Layout>((*make_linear)(dst_res.value()->shape));
+    auto res_layout = makeLinearLayout(dst_res.value()->shape);
     local_layout_map.Set(dst_res.value(), res_layout);
   }
 
-  body =
-      Block({}, {}, {}, "reduce_tile_op", body, std::nullopt, alloc_buffers, {},
-            {{attr::kTileViewMap, new_tileview_map},
-             {attr::kLayoutMap, local_layout_map}});
+  body = Block({}, {}, {}, "reduce_tile_op", body, std::nullopt, alloc_buffers,
+               {}, {{attr::kLayoutMap, local_layout_map}});
 
   return body;
 }
@@ -1060,14 +1079,14 @@ LayoutMap ReduceOpNode::InferLayoutSunmmioTileReduce(const LayoutInferArgs &T,
     LayoutMap result;
     const auto make_zz =
         ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
-    const auto make_linear =
-        ffi::Function::GetGlobal("tl.layout.make_linear_layout");
+    ICHECK(make_zz != nullptr)
+        << "Cannot find global function tl.layout.make_blockwise_zz_layout";
 
-    if (src->shape.size() == 1) {
-      auto src_layout = Downcast<Layout>((*make_linear)(src->shape));
+    if (CanUseBlockwiseZZ(src)) {
+      auto src_layout = Downcast<Layout>((*make_zz)(src));
       result.Set(src, src_layout);
     } else {
-      auto src_layout = Downcast<Layout>((*make_zz)(src));
+      auto src_layout = makeLinearLayout(src->shape);
       result.Set(src, src_layout);
     }
 
@@ -1089,8 +1108,8 @@ LayoutMap ReduceOpNode::InferLayoutSunmmioTileReduce(const LayoutInferArgs &T,
         }
       }
 
-      if (is_tiled || dst->shape.size() == 1) {
-        auto dst_layout = Downcast<Layout>((*make_linear)(dst->shape));
+      if (is_tiled || !CanUseBlockwiseZZ(dst)) {
+        auto dst_layout = makeLinearLayout(dst->shape);
         result.Set(dst, dst_layout);
       } else {
         auto dst_layout = Downcast<Layout>((*make_zz)(dst));
