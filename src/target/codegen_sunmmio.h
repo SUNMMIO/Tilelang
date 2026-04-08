@@ -26,6 +26,11 @@ struct SunMMIOValue {
   std::string mlir_type;
 };
 
+struct BuilderArg {
+  std::string name;
+  std::string type;
+};
+
 struct BufferBinding {
   tir::Buffer buffer;
   std::string handle;
@@ -36,6 +41,8 @@ struct BufferBinding {
 
 class SunMMIOBuilder {
 public:
+  enum class CompareKind { kInt, kFloat };
+
   virtual ~SunMMIOBuilder() = default;
 
   virtual void Init() = 0;
@@ -46,7 +53,7 @@ public:
   virtual void EndModule() = 0;
 
   virtual void BeginFunction(const std::string& name,
-                             const std::vector<std::string>& arg_defs) = 0;
+                             const std::vector<BuilderArg>& args) = 0;
   virtual void EndFunction() = 0;
   virtual void EmitReturn() = 0;
 
@@ -70,7 +77,8 @@ public:
                               DataType dtype) = 0;
 
   virtual SunMMIOValue Compare(const std::string& result_name,
-                               const std::string& opcode,
+                               CompareKind kind,
+                               const std::string& predicate,
                                const SunMMIOValue& a,
                                const SunMMIOValue& b,
                                const std::string& ty) = 0;
@@ -85,7 +93,7 @@ public:
   virtual SunMMIOValue Alloc(const std::string& result_name,
                              const std::string& memref_type,
                              const std::vector<SunMMIOValue>& dyn_extents,
-                             const std::string& scope_attr,
+                             const std::string& scope_name,
                              DataType dtype) = 0;
 
   virtual SunMMIOValue Load(const std::string& result_name,
@@ -108,6 +116,21 @@ public:
                             DataType ret_dtype,
                             const std::string& ret_ty) = 0;
 
+  virtual SunMMIOValue Ramp(const std::string& result_name,
+                            const SunMMIOValue& base,
+                            const SunMMIOValue& stride,
+                            int lanes,
+                            const std::string& elem_ty,
+                            const std::string& vec_ty,
+                            DataType dtype) = 0;
+
+  virtual SunMMIOValue Broadcast(const std::string& result_name,
+                                 const SunMMIOValue& scalar,
+                                 int lanes,
+                                 const std::string& scalar_ty,
+                                 const std::string& vec_ty,
+                                 DataType dtype) = 0;
+
   virtual void BeginFor(const std::string& iv,
                         const SunMMIOValue& lb,
                         const SunMMIOValue& ub,
@@ -120,8 +143,6 @@ public:
 
   virtual void EmitAssert(const SunMMIOValue& cond,
                           const std::string& msg_text) = 0;
-
-  virtual void EmitRawLine(const std::string& line) = 0;
 };
 
 class CodeGenTileLangSunMMIO final : public tir::StmtVisitor,
