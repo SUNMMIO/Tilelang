@@ -40,12 +40,12 @@ public:
   }
 
   void BeginFunction(const std::string& name,
-                     const std::vector<std::string>& arg_defs) final {
+                     const std::vector<BuilderArg>& args) final {
     std::ostringstream sig;
-    for (size_t i = 0; i < arg_defs.size(); ++i) {
+    for (size_t i = 0; i < args.size(); ++i) {
       if (i != 0)
         sig << ", ";
-      sig << arg_defs[i];
+      sig << args[i].name << ": " << args[i].type;
     }
     EmitLine("func.func @" + name + "(" + sig.str() + ") {");
     indent_++;
@@ -92,11 +92,17 @@ public:
     return SunMMIOValue{dtype, result_name, ty};
   }
 
-  SunMMIOValue Compare(const std::string& result_name, const std::string& opcode,
+  SunMMIOValue Compare(const std::string& result_name, CompareKind kind,
+                       const std::string& predicate,
                        const SunMMIOValue& a, const SunMMIOValue& b,
                        const std::string& ty) final {
-    EmitLine(result_name + " = " + opcode + " " + a.value + ", " + b.value +
-             " : " + ty);
+    if (kind == CompareKind::kFloat) {
+      EmitLine(result_name + " = arith.cmpf o" + predicate + ", " + a.value + ", " +
+               b.value + " : " + ty);
+    } else {
+      EmitLine(result_name + " = arith.cmpi " + predicate + ", " + a.value + ", " +
+               b.value + " : " + ty);
+    }
     return SunMMIOValue{DataType::Bool(), result_name, "i1"};
   }
 
@@ -110,13 +116,14 @@ public:
 
   SunMMIOValue Alloc(const std::string& result_name, const std::string& memref_type,
                      const std::vector<SunMMIOValue>& dyn_extents,
-                     const std::string& scope_attr, DataType dtype) final {
+                     const std::string& scope_name, DataType dtype) final {
     std::ostringstream dyn_sig;
     for (size_t i = 0; i < dyn_extents.size(); ++i) {
       if (i != 0)
         dyn_sig << ", ";
       dyn_sig << dyn_extents[i].value;
     }
+    std::string scope_attr = " {sunmmio.scope = \"" + scope_name + "\"}";
     if (dyn_extents.empty()) {
       EmitLine(result_name + " = memref.alloc()" + scope_attr + " : " + memref_type);
     } else {
@@ -191,6 +198,24 @@ public:
     return SunMMIOValue{ret_dtype, result_name, ret_ty};
   }
 
+  SunMMIOValue Ramp(const std::string& result_name, const SunMMIOValue& base,
+                    const SunMMIOValue& stride, int lanes,
+                    const std::string& elem_ty, const std::string& vec_ty,
+                    DataType dtype) final {
+    EmitLine(result_name + " = sunmmio.ramp " + base.value + ", " + stride.value +
+             " {lanes = " + std::to_string(lanes) + "} : " + elem_ty + " -> " + vec_ty);
+    return SunMMIOValue{dtype, result_name, vec_ty};
+  }
+
+  SunMMIOValue Broadcast(const std::string& result_name, const SunMMIOValue& scalar,
+                         int lanes, const std::string& scalar_ty,
+                         const std::string& vec_ty, DataType dtype) final {
+    (void)lanes;
+    EmitLine(result_name + " = vector.broadcast " + scalar.value + " : " + scalar_ty +
+             " to " + vec_ty);
+    return SunMMIOValue{dtype, result_name, vec_ty};
+  }
+
   void BeginFor(const std::string& iv, const SunMMIOValue& lb,
                 const SunMMIOValue& ub, const SunMMIOValue& step) final {
     EmitLine("scf.for " + iv + " = " + lb.value + " to " + ub.value + " step " +
@@ -222,8 +247,6 @@ public:
   void EmitAssert(const SunMMIOValue& cond, const std::string& msg_text) final {
     EmitLine("cf.assert " + cond.value + ", " + msg_text);
   }
-
-  void EmitRawLine(const std::string& line) final { EmitLine(line); }
 
 private:
   void EmitLine(const std::string& line) {
@@ -274,22 +297,22 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar& gvar, const tir::PrimF
   }
   ICHECK(builder_) << "CodeGenTileLangSunMMIO builder is not initialized";
   EnterScope();
-  std::vector<std::string> arg_defs;
+  std::vector<BuilderArg> args;
   int arg_index = 0;
   for (const tir::Var& p : f->params) {
     std::string arg_name = "%arg" + std::to_string(arg_index++);
     if (f->buffer_map.count(p)) {
       const tir::Buffer& buffer = f->buffer_map.at(p);
-      arg_defs.push_back(arg_name + ": " + MapBufferType(buffer));
+      args.push_back({arg_name, MapBufferType(buffer)});
       BindVar(p, SunMMIOValue{p.dtype(), arg_name, MapBufferType(buffer)});
       RegisterBuffer(buffer, true, arg_name);
     } else {
-      arg_defs.push_back(arg_name + ": " + MapType(p.dtype()));
+      args.push_back({arg_name, MapType(p.dtype())});
       BindVar(p, SunMMIOValue{p.dtype(), arg_name, MapType(p.dtype())});
     }
   }
 
-  builder_->BeginFunction(gvar->name_hint, arg_defs);
+  builder_->BeginFunction(gvar->name_hint, args);
   VisitStmt(f->body);
   builder_->EmitReturn();
   builder_->EndFunction();
@@ -440,9 +463,9 @@ void CodeGenTileLangSunMMIO::EmitAlloc(const tir::Var& buffer_var, DataType dtyp
     memref << "x";
   }
   memref << MapType(dtype) << ">";
-  std::string scope_attr = " {sunmmio.scope = \"" + MapStorageScope(scope_hint) + "\"}";
   SunMMIOValue alloc =
-      builder_->Alloc(NewValueName(), memref.str(), dyn_extents, scope_attr, dtype);
+      builder_->Alloc(NewValueName(), memref.str(), dyn_extents,
+                      MapStorageScope(scope_hint), dtype);
   BindVar(buffer_var, alloc);
 }
 
@@ -514,7 +537,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::DeclBufferNode* op) {
   RegisterBuffer(op->buffer, false, NewValueName());
   const BufferBinding& binding = LookupBuffer(op->buffer);
   builder_->Alloc(binding.handle, binding.memref_type, {},
-                  " {sunmmio.scope = \"" + MapStorageScope(op->buffer.scope()) + "\"}",
+                  MapStorageScope(op->buffer.scope()),
                   op->buffer->dtype);
   VisitStmt(op->body);
 }
@@ -524,7 +547,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferStoreNode* op) {
     RegisterBuffer(op->buffer, false, NewValueName());
     const BufferBinding& binding = LookupBuffer(op->buffer);
     builder_->Alloc(binding.handle, binding.memref_type, {},
-                    " {sunmmio.scope = \"" + MapStorageScope(op->buffer.scope()) + "\"}",
+                    MapStorageScope(op->buffer.scope()),
                     op->buffer->dtype);
   }
   EmitStore(op->buffer, op->indices, EvalExpr(op->value));
@@ -542,7 +565,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferRealizeNode* op) {
     }
   }
   builder_->Alloc(binding.handle, binding.memref_type, dyn_bounds,
-                  " {sunmmio.scope = \"" + MapStorageScope(op->buffer.scope()) + "\"}",
+                  MapStorageScope(op->buffer.scope()),
                   op->buffer->dtype);
   VisitStmt(op->body);
   ExitScope();
@@ -620,7 +643,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockNode* op) {
     RegisterBuffer(alloc, false, NewValueName());
     const BufferBinding& binding = LookupBuffer(alloc);
     builder_->Alloc(binding.handle, binding.memref_type, {},
-                    " {sunmmio.scope = \"" + MapStorageScope(alloc.scope()) + "\"}",
+                    MapStorageScope(alloc.scope()),
                     alloc->dtype);
   }
   for (const MatchBufferRegion& match : op->match_buffers) {
@@ -842,7 +865,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::BufferLoadNode* op) {
     RegisterBuffer(op->buffer, false, NewValueName());
     const BufferBinding& b = LookupBuffer(op->buffer);
     builder_->Alloc(b.handle, b.memref_type, {},
-                    " {sunmmio.scope = \"" + MapStorageScope(op->buffer.scope()) + "\"}",
+                    MapStorageScope(op->buffer.scope()),
                     op->buffer->dtype);
   }
   return EmitLoad(op->buffer, op->indices);
@@ -862,11 +885,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::RampNode* op) {
   base = EnsureType(base, elem_ty, elem_dtype);
   stride = EnsureType(stride, elem_ty, elem_dtype);
 
-  std::string out = NewValueName();
-  builder_->EmitRawLine(out + " = sunmmio.ramp " + base.value + ", " + stride.value +
-                        " {lanes = " + std::to_string(op->dtype.lanes()) + "} : " +
-                        elem_ty + " -> " + vec_ty);
-  return SunMMIOValue{op->dtype, out, vec_ty};
+  return builder_->Ramp(NewValueName(), base, stride, op->dtype.lanes(), elem_ty,
+                        vec_ty, op->dtype);
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::BroadcastNode* op) {
@@ -876,10 +896,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::BroadcastNode* op) {
   std::string vec_ty = MapType(op->dtype);
   scalar = EnsureType(scalar, scalar_ty, scalar_dtype);
 
-  std::string out = NewValueName();
-  builder_->EmitRawLine(out + " = vector.broadcast " + scalar.value + " : " +
-                        scalar_ty + " to " + vec_ty);
-  return SunMMIOValue{op->dtype, out, vec_ty};
+  return builder_->Broadcast(NewValueName(), scalar, op->dtype.lanes(), scalar_ty,
+                             vec_ty, op->dtype);
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::ShuffleNode* op) {
@@ -987,10 +1005,9 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCmp(const char* pred,
   b = EnsureType(b, ty, a.dtype);
   std::string out = NewValueName();
   if (a.dtype.is_float() || a.dtype.is_bfloat16()) {
-    std::string p = std::string("o") + pred;
-    return builder_->Compare(out, "arith.cmpf " + p + ",", a, b, ty);
+    return builder_->Compare(out, SunMMIOBuilder::CompareKind::kFloat, pred, a, b, ty);
   } else {
-    return builder_->Compare(out, "arith.cmpi " + std::string(pred) + ",", a, b, ty);
+    return builder_->Compare(out, SunMMIOBuilder::CompareKind::kInt, pred, a, b, ty);
   }
 }
 
