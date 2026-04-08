@@ -20,29 +20,68 @@
 namespace tvm {
 namespace codegen {
 
+enum class BinaryOp {
+  kAdd,
+  kSub,
+  kMul,
+  kDiv,
+  kMod,
+  kMin,
+  kMax,
+  kAnd,
+  kOr,
+  kXor
+};
+
+enum class ArithmeticFlavor {
+  kFloat,
+  kSignedInt,
+  kUnsignedInt,
+  kBool,
+  kIndex
+};
+
+enum class CompareOp { kEQ, kNE, kLT, kLE, kGT, kGE };
+
+enum class CompareDomain { kFloat, kSignedInt, kUnsignedInt, kBool };
+
+struct SunMMIOType {
+  enum class Kind {
+    kScalar,
+    kIndex,
+    kHandle,
+    kVector,
+    kMemRef,
+    kUnknown
+  };
+
+  Kind kind{Kind::kUnknown};
+  DataType dtype{DataType::Void()};
+  int lanes{1};
+  std::vector<PrimExpr> shape;
+};
+
 struct SunMMIOValue {
   DataType dtype;
   std::string value;
-  std::string mlir_type;
+  SunMMIOType type;
 };
 
 struct BuilderArg {
   std::string name;
-  std::string type;
+  SunMMIOType type;
 };
 
 struct BufferBinding {
   tir::Buffer buffer;
   std::string handle;
-  std::string memref_type;
+  SunMMIOType buffer_type;
   std::string scope;
   bool is_external{false};
 };
 
 class SunMMIOBuilder {
 public:
-  enum class CompareKind { kInt, kFloat };
-
   virtual ~SunMMIOBuilder() = default;
 
   virtual void Init() = 0;
@@ -58,40 +97,42 @@ public:
   virtual void EmitReturn() = 0;
 
   virtual SunMMIOValue ConstantInt(const std::string& result_name, int64_t v,
-                                   const std::string& ty, DataType dtype) = 0;
+                                   const SunMMIOType& type,
+                                   DataType dtype) = 0;
   virtual SunMMIOValue ConstantFloat(const std::string& result_name,
                                      const std::string& literal,
-                                     const std::string& ty,
+                                     const SunMMIOType& type,
                                      DataType dtype) = 0;
 
   virtual SunMMIOValue Cast(const std::string& result_name,
                             const SunMMIOValue& v,
-                            const std::string& dst_ty,
+                            const SunMMIOType& dst_type,
                             DataType dst_dtype) = 0;
 
   virtual SunMMIOValue Binary(const std::string& result_name,
-                              const std::string& opcode,
+                              BinaryOp op,
+                              ArithmeticFlavor flavor,
                               const SunMMIOValue& a,
                               const SunMMIOValue& b,
-                              const std::string& ty,
+                              const SunMMIOType& result_type,
                               DataType dtype) = 0;
 
   virtual SunMMIOValue Compare(const std::string& result_name,
-                               CompareKind kind,
-                               const std::string& predicate,
+                               CompareOp op,
+                               CompareDomain domain,
                                const SunMMIOValue& a,
                                const SunMMIOValue& b,
-                               const std::string& ty) = 0;
+                               const SunMMIOType& operand_type) = 0;
 
   virtual SunMMIOValue Select(const std::string& result_name,
                               const SunMMIOValue& cond,
                               const SunMMIOValue& tv,
                               const SunMMIOValue& fv,
-                              const std::string& ty,
+                              const SunMMIOType& result_type,
                               DataType dtype) = 0;
 
   virtual SunMMIOValue Alloc(const std::string& result_name,
-                             const std::string& memref_type,
+                             const SunMMIOType& memref_type,
                              const std::vector<SunMMIOValue>& dyn_extents,
                              const std::string& scope_name,
                              DataType dtype) = 0;
@@ -99,14 +140,14 @@ public:
   virtual SunMMIOValue Load(const std::string& result_name,
                             const std::string& buffer_handle,
                             const std::vector<SunMMIOValue>& indices,
-                            const std::string& memref_type,
+                            const SunMMIOType& memref_type,
                             DataType dtype,
-                            const std::string& result_ty) = 0;
+                            const SunMMIOType& result_type) = 0;
 
   virtual void Store(const SunMMIOValue& value,
                      const std::string& buffer_handle,
                      const std::vector<SunMMIOValue>& indices,
-                     const std::string& memref_type) = 0;
+                     const SunMMIOType& memref_type) = 0;
 
   virtual SunMMIOValue Call(const std::string& result_name,
                             const std::string& callee,
@@ -114,21 +155,21 @@ public:
                             const std::vector<std::string>& string_args,
                             const std::string& category,
                             DataType ret_dtype,
-                            const std::string& ret_ty) = 0;
+                            const SunMMIOType& ret_type) = 0;
 
   virtual SunMMIOValue Ramp(const std::string& result_name,
                             const SunMMIOValue& base,
                             const SunMMIOValue& stride,
                             int lanes,
-                            const std::string& elem_ty,
-                            const std::string& vec_ty,
+                            const SunMMIOType& elem_type,
+                            const SunMMIOType& vec_type,
                             DataType dtype) = 0;
 
   virtual SunMMIOValue Broadcast(const std::string& result_name,
                                  const SunMMIOValue& scalar,
                                  int lanes,
-                                 const std::string& scalar_ty,
-                                 const std::string& vec_ty,
+                                 const SunMMIOType& scalar_type,
+                                 const SunMMIOType& vec_type,
                                  DataType dtype) = 0;
 
   virtual void BeginFor(const std::string& iv,
@@ -245,14 +286,16 @@ private:
   void EmitFor(const tir::ForNode* op);
   void EmitIf(const tir::IfThenElseNode* op);
 
-  std::string MapType(tvm::DataType dtype) const;
-  std::string MapBufferType(const tir::Buffer& buffer) const;
+  SunMMIOType MapType(tvm::DataType dtype) const;
+  SunMMIOType MapBufferType(const tir::Buffer& buffer) const;
   std::string MapStorageScope(const std::string& scope) const;
   std::string NewValueName();
   SunMMIOValue EmitConstIndex(int64_t v);
   SunMMIOValue EnsureIndex(const SunMMIOValue& v);
-  SunMMIOValue EnsureType(const SunMMIOValue& v, const std::string& mlir_type,
+  SunMMIOValue EnsureType(const SunMMIOValue& v, const SunMMIOType& target_type,
                           DataType dtype);
+  ArithmeticFlavor GetArithmeticFlavor(DataType dtype) const;
+  CompareDomain GetCompareDomain(DataType dtype) const;
   SunMMIOValue BindVar(const tir::Var& var, const SunMMIOValue& value);
   void RegisterBuffer(const tir::Buffer& buffer, bool is_external,
                       const std::string& handle_hint = "");
