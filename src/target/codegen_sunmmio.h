@@ -12,6 +12,7 @@
 #include <tvm/tir/stmt_functor.h>
 
 #include <sstream>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -31,6 +32,96 @@ struct BufferBinding {
   std::string memref_type;
   std::string scope;
   bool is_external{false};
+};
+
+class SunMMIOBuilder {
+public:
+  virtual ~SunMMIOBuilder() = default;
+
+  virtual void Init() = 0;
+  virtual void Clear() = 0;
+  virtual std::string Finish() = 0;
+
+  virtual void BeginModule() = 0;
+  virtual void EndModule() = 0;
+
+  virtual void BeginFunction(const std::string& name,
+                             const std::vector<std::string>& arg_defs) = 0;
+  virtual void EndFunction() = 0;
+  virtual void EmitReturn() = 0;
+
+  virtual SunMMIOValue ConstantInt(const std::string& result_name, int64_t v,
+                                   const std::string& ty, DataType dtype) = 0;
+  virtual SunMMIOValue ConstantFloat(const std::string& result_name,
+                                     const std::string& literal,
+                                     const std::string& ty,
+                                     DataType dtype) = 0;
+
+  virtual SunMMIOValue Cast(const std::string& result_name,
+                            const SunMMIOValue& v,
+                            const std::string& dst_ty,
+                            DataType dst_dtype) = 0;
+
+  virtual SunMMIOValue Binary(const std::string& result_name,
+                              const std::string& opcode,
+                              const SunMMIOValue& a,
+                              const SunMMIOValue& b,
+                              const std::string& ty,
+                              DataType dtype) = 0;
+
+  virtual SunMMIOValue Compare(const std::string& result_name,
+                               const std::string& opcode,
+                               const SunMMIOValue& a,
+                               const SunMMIOValue& b,
+                               const std::string& ty) = 0;
+
+  virtual SunMMIOValue Select(const std::string& result_name,
+                              const SunMMIOValue& cond,
+                              const SunMMIOValue& tv,
+                              const SunMMIOValue& fv,
+                              const std::string& ty,
+                              DataType dtype) = 0;
+
+  virtual SunMMIOValue Alloc(const std::string& result_name,
+                             const std::string& memref_type,
+                             const std::vector<SunMMIOValue>& dyn_extents,
+                             const std::string& scope_attr,
+                             DataType dtype) = 0;
+
+  virtual SunMMIOValue Load(const std::string& result_name,
+                            const std::string& buffer_handle,
+                            const std::vector<SunMMIOValue>& indices,
+                            const std::string& memref_type,
+                            DataType dtype,
+                            const std::string& result_ty) = 0;
+
+  virtual void Store(const SunMMIOValue& value,
+                     const std::string& buffer_handle,
+                     const std::vector<SunMMIOValue>& indices,
+                     const std::string& memref_type) = 0;
+
+  virtual SunMMIOValue Call(const std::string& result_name,
+                            const std::string& callee,
+                            const std::vector<SunMMIOValue>& operands,
+                            const std::vector<std::string>& string_args,
+                            const std::string& category,
+                            DataType ret_dtype,
+                            const std::string& ret_ty) = 0;
+
+  virtual void BeginFor(const std::string& iv,
+                        const SunMMIOValue& lb,
+                        const SunMMIOValue& ub,
+                        const SunMMIOValue& step) = 0;
+  virtual void EndFor() = 0;
+
+  virtual void BeginIf(const SunMMIOValue& cond) = 0;
+  virtual void BeginElse() = 0;
+  virtual void EndIf() = 0;
+
+  virtual void EmitAssert(const SunMMIOValue& cond,
+                          const std::string& msg_text) = 0;
+
+  virtual void EmitRawLine(const std::string& line) = 0;
 };
 
 class CodeGenTileLangSunMMIO final : public tir::StmtVisitor,
@@ -136,11 +227,7 @@ private:
   std::string MapType(tvm::DataType dtype) const;
   std::string MapBufferType(const tir::Buffer& buffer) const;
   std::string MapStorageScope(const std::string& scope) const;
-  std::string ClassifyParamKind(const tir::Var& param,
-                                const tir::PrimFunc& f) const;
   std::string NewValueName();
-  std::string NewLabel(const std::string& prefix);
-  void EmitLine(const std::string& line);
   SunMMIOValue EmitConstIndex(int64_t v);
   SunMMIOValue EnsureIndex(const SunMMIOValue& v);
   SunMMIOValue EnsureType(const SunMMIOValue& v, const std::string& mlir_type,
@@ -159,13 +246,9 @@ private:
   [[noreturn]] void UnsupportedExpr(const Object* op,
                                     const std::string& detail = "") const;
 
-  std::ostringstream mlir_;
+  std::unique_ptr<SunMMIOBuilder> builder_;
   bool initialized_{false};
   int ssa_counter_{0};
-  int label_counter_{0};
-  int indent_{0};
-  bool module_open_{false};
-  bool function_open_{false};
 
   std::unordered_map<const tir::VarNode*, SunMMIOValue> var_table_;
   std::unordered_map<const tir::BufferNode*, BufferBinding> buffer_registry_;
