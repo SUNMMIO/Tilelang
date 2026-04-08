@@ -27,6 +27,16 @@ def ClusterPlanning():
     return _ffi_api.ClusterPlanning()  # type: ignore
 
 
+def InjectSunmmioSync():
+    """InjectSunmmioSync
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.InjectSunmmioSync()  # type: ignore
+
+
 def PipelinePlanning():
     """infer the fragment/shared memory layout
 
