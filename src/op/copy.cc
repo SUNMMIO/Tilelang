@@ -688,14 +688,15 @@ bool CopyNode::CheckSunmmioDMACopy(Target target) const {
 }
 
 bool CopyNode::CheckSunmmioTileCopy(Target target) const {
-  auto is_full_buffer_region = [](const Buffer &buffer,
-                                  const Array<Range> &ranges) {
-    if (ranges.size() != buffer->shape.size()) {
+  auto have_same_region_shape = [&](const Array<Range> &lhs,
+                                    const Array<Range> &rhs) {
+    if (lhs.size() != rhs.size()) {
       return false;
     }
-    for (size_t i = 0; i < ranges.size(); ++i) {
-      if (!is_zero(ranges[i]->min) ||
-          !StructuralEqual()(ranges[i]->extent, buffer->shape[i])) {
+
+    arith::Analyzer analyzer;
+    for (size_t i = 0; i < lhs.size(); ++i) {
+      if (!analyzer.CanProveEqual(lhs[i]->extent, rhs[i]->extent)) {
         return false;
       }
     }
@@ -704,16 +705,13 @@ bool CopyNode::CheckSunmmioTileCopy(Target target) const {
 
   // shared.rsram -> shared.rsram is lowered via tile loops instead of DMA, so
   // dtype mismatch is allowed and handled by an inserted Cast during lowering.
-  // For now, only support full-buffer copies. Region copies require the
-  // T.Tiles legalization path to preserve copy-region semantics.
+  // Region views are legal as long as src/dst describe the same logical copy
+  // shape. Lowering will materialize a tile.domain scope over that region so
+  // LegalizeTilesLoop/TilesLoop can preserve the offsets.
   if (src.scope() != "shared.rsram" || dst.scope() != "shared.rsram") {
     return false;
   }
-  if (!StructuralEqual()(src->shape, dst->shape)) {
-    return false;
-  }
-  if (!is_full_buffer_region(src, src_range) ||
-      !is_full_buffer_region(dst, dst_range)) {
+  if (!have_same_region_shape(src_range, dst_range)) {
     return false;
   }
   return true;
@@ -816,64 +814,24 @@ Stmt CopyNode::LowerSunmmioTileCopy(const LowerArgs &T,
                                     arith::Analyzer *analyzer) const {
   // Lower rsram-to-rsram copies through tile-loop-shaped serial loops so
   // LegalizeTilesLoop/TilesLoop can route them through the tile unit.
-  Array<Var> loop_vars;
-  loop_vars.reserve(src_range.size());
+  ICHECK_EQ(src_range.size(), dst_range.size())
+      << "Sunmmio tile copy requires src and dst to have the same rank.";
   for (size_t i = 0; i < src_range.size(); ++i) {
-    loop_vars.push_back(
-        Var("v" + std::to_string(i), src_range[i]->extent.dtype()));
-    analyzer->Bind(loop_vars[i], Range::FromMinExtent(0, src_range[i]->extent));
+    ICHECK(analyzer->CanProveEqual(src_range[i]->extent, dst_range[i]->extent))
+        << "Sunmmio tile copy requires src and dst region extents to match at "
+           "dim "
+        << i << ", but got " << src_range[i]->extent << " vs. "
+        << dst_range[i]->extent << ".";
   }
 
-  auto make_indices = [&](const Array<Range> &ranges) {
-    ICHECK_EQ(loop_vars.size(), ranges.size());
-    Array<PrimExpr> indices;
-    indices.reserve(ranges.size());
-    for (size_t i = 0; i < ranges.size(); ++i) {
-      if (is_one(ranges[i]->extent)) {
-        indices.push_back(ranges[i]->min);
-      } else {
-        indices.push_back(ranges[i]->min + loop_vars[i]);
-      }
-    }
-    return indices;
-  };
-
-  auto make_predicate = [&](const Array<Range> &ranges,
-                            const Array<PrimExpr> &buffer_shape) {
-    ICHECK_EQ(loop_vars.size(), ranges.size());
-    ICHECK_EQ(buffer_shape.size(), ranges.size());
-
-    Array<PrimExpr> cond_list;
-    for (size_t i = 0; i < ranges.size(); ++i) {
-      PrimExpr idx = is_one(ranges[i]->extent) ? ranges[i]->min
-                                               : ranges[i]->min + loop_vars[i];
-
-      PrimExpr upper = idx < buffer_shape[i];
-      if (!analyzer->CanProve(upper, arith::ProofStrength::kSymbolicBound)) {
-        cond_list.push_back(upper);
-      }
-
-      PrimExpr lower = idx >= 0;
-      if (!analyzer->CanProve(lower, arith::ProofStrength::kSymbolicBound)) {
-        cond_list.push_back(lower);
-      }
-    }
-
-    if (cond_list.empty()) {
-      return PrimExpr();
-    }
-
-    PrimExpr predicate = cond_list[0];
-    for (size_t i = 1; i < cond_list.size(); ++i) {
-      predicate = And(predicate, cond_list[i]);
-    }
-    return predicate;
-  };
-
-  Array<PrimExpr> src_indices = make_indices(src_range);
-  Array<PrimExpr> dst_indices = make_indices(dst_range);
-  PrimExpr src_predicate = make_predicate(src_range, src->shape);
-  PrimExpr dst_predicate = make_predicate(dst_range, dst->shape);
+  Array<IterVar> loop_vars = MakeIterVars();
+  for (const IterVar &iv : loop_vars) {
+    analyzer->Bind(iv->var, iv->dom);
+  }
+  Array<PrimExpr> src_indices = MakeIndices(loop_vars, 0);
+  Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
+  PrimExpr src_predicate = MakePredicate(analyzer, loop_vars, src->shape, 0);
+  PrimExpr dst_predicate = MakePredicate(analyzer, loop_vars, dst->shape, 1);
 
   PrimExpr value = BufferLoad(src, src_indices);
   if (src->dtype != dst->dtype) {
@@ -889,14 +847,25 @@ Stmt CopyNode::LowerSunmmioTileCopy(const LowerArgs &T,
   }
 
   Map<String, ObjectRef> tile_annotations;
+  Array<PrimExpr> tile_domain;
+  tile_domain.reserve(loop_vars.size());
+  for (const IterVar &iv : loop_vars) {
+    tile_domain.push_back(iv->dom->extent);
+  }
   tile_annotations.Set(tl::attr::tile_level_loop, Integer(1));
-  tile_annotations.Set(tl::attr::tiled_buffer, src->data);
   tile_annotations.Set(tl::attr::kTileLoopStage,
                        Integer(static_cast<int>(TileLoopStage::kInitial)));
+  if (!tile_domain.empty()) {
+    tile_annotations.Set(tl::attr::kTileDomain, tile_domain);
+  }
 
   for (int i = static_cast<int>(loop_vars.size()) - 1; i >= 0; --i) {
-    body = For(loop_vars[i], 0, src_range[i]->extent, ForKind::kSerial, body,
-               std::nullopt, tile_annotations);
+    Map<String, ObjectRef> loop_annotations = tile_annotations;
+    if (i != 0) {
+      loop_annotations.erase(tl::attr::kTileDomain);
+    }
+    body = For(loop_vars[i]->var, 0, loop_vars[i]->dom->extent,
+               ForKind::kSerial, body, std::nullopt, loop_annotations);
   }
   return body;
 }

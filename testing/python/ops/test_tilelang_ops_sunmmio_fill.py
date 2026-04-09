@@ -1,7 +1,6 @@
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.tileview import make_tileview
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 import pytest
 
@@ -24,13 +23,12 @@ def apply_sunmmio_passes(mod, target):
     return mod
 
 
-def fill_kernel(B, M, N, block_B, block_M, block_N, tile_size, index_map, dtype="float16"):
+def fill_kernel(B, M, N, block_B, block_M, block_N, dtype="float16"):
     @T.prim_func
     def main(A: T.Tensor((B, M, N), dtype)):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), T.ceildiv(B, block_B), threads=128) as (bx, by, bz):
             A_shared = T.alloc_shared((block_B, block_M, block_N), dtype)
-            # Annotate tileview for the shared buffer
-            T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, index_map)})
+            # No T.annotate_tileview(): fill should infer the execution TileView.
 
             # 1. Fill the entire buffer -> value 1.0
             T.fill(A_shared, T.float16(1.0))
@@ -78,13 +76,12 @@ class LoopNestChecker(tvm.tir.PyStmtExprVisitor):
             self.max_loop_depth = max(self.max_loop_depth, self.current_loop_depth)
 
 
-def fill_kernel_config(B, M, N, block_B, block_M, block_N, tile_size, index_map, fill_type="full", dtype="float16"):
+def fill_kernel_config(B, M, N, block_B, block_M, block_N, fill_type="full", dtype="float16"):
     @T.prim_func
     def main(A: T.Tensor((B, M, N), dtype)):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), T.ceildiv(B, block_B), threads=128) as (bx, by, bz):
             A_shared = T.alloc_shared((block_B, block_M, block_N), dtype)
-            # Annotate tileview for the shared buffer
-            T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, index_map)})
+            # No T.annotate_tileview(): fill should infer the execution TileView.
 
             if fill_type == "full":
                 T.fill(A_shared, T.float16(1.0))
@@ -117,11 +114,9 @@ def test_tilelang_fill_sunmmio(fill_type, expected_val, dtype):
     # Parameters
     B, M, N = 64, 512, 1024
     block_B, block_M, block_N = 16, 256, 128
-    tile_size = (32, 32)
-    index_map = (-2, -1)
 
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    mod = fill_kernel_config(B, M, N, block_B, block_M, block_N, tile_size, index_map, fill_type=fill_type, dtype=dtype)
+    mod = fill_kernel_config(B, M, N, block_B, block_M, block_N, fill_type=fill_type, dtype=dtype)
 
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
