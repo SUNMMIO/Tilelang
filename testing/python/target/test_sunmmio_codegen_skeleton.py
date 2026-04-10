@@ -1,10 +1,27 @@
 import pytest
 import re
 import numpy as np
+import os
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
+
+# PRINT = os.getenv("SUNMMIO_TEST_PRINT", "false").lower() in ("1", "true", "yes", "on")
+PRINT = True
+
+
+def _maybe_print_kernel_and_mlir(func, src: str):
+    if not PRINT:
+        return
+    print("=== TVM Kernel ===")
+    if hasattr(func, "script"):
+        print(func.script())
+    else:
+        print(func)
+    print("=== SunMMIO Text MLIR ===")
+    print(src)
+
 
 # SunMMIO codegen traversal contract:
 # Supported now:
@@ -46,7 +63,9 @@ def build_sunmmio_module_without_compile(func):
 
 
 def build_sunmmio_source_without_compile(func):
-    return build_sunmmio_module_without_compile(func).inspect_source()
+    src = build_sunmmio_module_without_compile(func).inspect_source()
+    _maybe_print_kernel_and_mlir(func, src)
+    return src
 
 
 def build_sunmmio_source_from_stmt(stmt):
@@ -56,12 +75,13 @@ def build_sunmmio_source_from_stmt(stmt):
     func = func.with_attr("calling_conv", int(tvm.ir.CallingConv.DEVICE_KERNEL_LAUNCH))
     mod = tvm.IRModule({"main": func})
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
-    return builder(mod, target).inspect_source()
+    src = builder(mod, target).inspect_source()
+    _maybe_print_kernel_and_mlir(func, src)
+    return src
 
 
 def test_sunmmio_codegen_without_compile_emits_mlir_source():
     src = build_sunmmio_source_without_compile(simple_add_kernel())
-    print(src)
     assert "module {" in src
     assert "func.func @main" in src
     assert "scf.for" in src
@@ -73,7 +93,6 @@ def test_sunmmio_codegen_without_compile_emits_mlir_source():
 
 def test_sunmmio_codegen_no_placeholder_summary_text():
     src = build_sunmmio_source_without_compile(simple_add_kernel())
-    print(src)
     assert "sunmmio.traversal_summary" not in src
     assert "status: traversal_only_no_emission" not in src
 
@@ -90,7 +109,6 @@ def test_sunmmio_codegen_emits_multidim_store_indices():
                     B[vi, vj] = A[vi, vj] + T.float32(1.0)
 
     src = build_sunmmio_source_without_compile(main)
-    print(src)
     assert "scf.for" in src
     assert "memref.store" in src
     assert re.search(r"memref\.store .*?\[[^,\]]+,\s*[^,\]]+\]", src), src
@@ -101,7 +119,6 @@ def test_sunmmio_codegen_classifies_sunmmio_intrinsic_calls():
     mma_call = tvm.tir.Call("handle", tvm.ir.Op.get("tl.mma_sunmmio"), [])
     body = tvm.tir.SeqStmt([tvm.tir.Evaluate(dma_call), tvm.tir.Evaluate(mma_call)])
     src = build_sunmmio_source_from_stmt(body)
-    print(src)
     assert 'sunmmio.call @"tl.dma_copy"(' in src
     assert 'sunmmio.call @"tl.mma_sunmmio"(' in src
     assert 'category = "sunmmio_intrinsic"' in src
@@ -119,7 +136,6 @@ def test_sunmmio_codegen_block_predicate_emits_control_flow():
                 B[vi] = A[vi] + T.float32(1.0)
 
     src = build_sunmmio_source_without_compile(main)
-    print(src)
     assert "scf.if" in src
     assert "memref.store" in src
 
@@ -136,7 +152,6 @@ def test_sunmmio_codegen_block_annotations_are_traversed():
                 B[vi] = A[vi] + T.float32(1.0)
 
     src = build_sunmmio_source_without_compile(main)
-    print(src)
     assert "func.func @main" in src
     assert "arith.addi" in src
     assert "memref.store" in src
@@ -151,7 +166,6 @@ def test_sunmmio_codegen_allocate_const_is_handled():
     body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
     stmt = tvm.tir.AllocateConst(cbuf.data, dtype, shape, data, body)
     src = build_sunmmio_source_from_stmt(stmt)
-    print(src)
     assert "memref.alloc" in src
 
 
@@ -168,7 +182,6 @@ def test_sunmmio_codegen_block_alloc_buffers_are_handled():
                 B[vi] = tmp[vi] + T.float32(1.0)
 
     src = build_sunmmio_source_without_compile(main)
-    print(src)
     assert "memref.alloc" in src
     assert "memref.store" in src
 
@@ -207,7 +220,6 @@ def test_sunmmio_codegen_ramp_is_supported():
     ramp = tvm.tir.Ramp(tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 1), 4)
     stmt = tvm.tir.Evaluate(ramp)
     src = build_sunmmio_source_from_stmt(stmt)
-    print(src)
     assert "sunmmio.ramp" in src
     assert "vector<4xi32>" in src
 
@@ -216,7 +228,6 @@ def test_sunmmio_codegen_broadcast_is_supported():
     bcast = tvm.tir.Broadcast(tvm.tir.FloatImm("float32", 1.5), 4)
     stmt = tvm.tir.Evaluate(bcast)
     src = build_sunmmio_source_from_stmt(stmt)
-    print(src)
     assert "vector.broadcast" in src
     assert "vector<4xf32>" in src
 
