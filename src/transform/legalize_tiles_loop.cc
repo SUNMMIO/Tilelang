@@ -1,5 +1,5 @@
+#include <algorithm>
 #include <unordered_map>
-#include <unordered_set>
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
@@ -9,6 +9,7 @@
 #include "../layout/layout.h"
 #include "../support/ffi_aliases.h"
 #include "../tileview/tileview.h"
+#include "../tileview/tileview_planner.h"
 #include "common/attr.h"
 
 namespace tvm {
@@ -51,152 +52,114 @@ private:
   TileViewMap tileviews_;
 };
 
-/* ============================================================
- * SharedBufferCollector
- *
- * Collect all buffer->data Vars used inside a loop body
- * ============================================================ */
-class SharedBufferCollector : public StmtExprVisitor {
+class NestedTilesScopeDetector : public StmtExprVisitor {
 public:
-  using BufferSet = std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual>;
-
-  static BufferSet Collect(const Stmt &stmt) {
-    SharedBufferCollector collector;
-    collector(stmt);
-    return std::move(collector.buffers_);
+  static bool Exists(const Stmt &stmt) {
+    NestedTilesScopeDetector detector;
+    detector(stmt);
+    return detector.found_;
   }
 
 private:
-  void VisitExpr_(const BufferLoadNode *op) final {
-    buffers_.insert(op->buffer->data);
-    StmtExprVisitor::VisitExpr_(op);
+  void VisitStmt_(const ForNode *loop) final {
+    if (loop->annotations.count(attr::kTileDomain)) {
+      found_ = true;
+      return;
+    }
+    StmtExprVisitor::VisitStmt_(loop);
   }
 
-  void VisitStmt_(const BufferStoreNode *op) final {
-    buffers_.insert(op->buffer->data);
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-private:
-  BufferSet buffers_;
+  bool found_{false};
 };
 
 /* ============================================================
  * LegalizeTilesLoopRewriter
  *
- * Rewrite tile-level For loops:
- *   for ... in T.Tiles(...)
- * into:
- *   extent := TileView::TiledBufferShape()[tile_dim]
- *
- * Assumptions:
- * - Tile loop nesting order == TileView dimension order
- * - TileView already validated semantic correctness
+ * Rewrite tile-level For loops using a TileView plan solved by
+ * the shared tileview planner.
  * ============================================================ */
 class LegalizeTilesLoopRewriter : public StmtExprMutator {
 public:
-  using TileViewMap =
-      std::unordered_map<Var, TileView, ObjectPtrHash, ObjectPtrEqual>;
-  using BufferDataMap =
-      std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual>;
-
   static PrimFunc Rewrite(PrimFunc f) {
     LegalizeTilesLoopRewriter rewriter;
     rewriter.tileviews_ = TileViewCollector::Collect(f);
-
-    // Collect buffer info from PrimFunc params
-    for (const auto &[_, buffer] : f->buffer_map) {
-      rewriter.buffer_data_to_buffer_[buffer->data] = buffer;
-    }
+    rewriter.tile_processor_config_ =
+        GetSunmmioTileProcessorConfig(f->GetAttr<Target>("target"));
 
     f.CopyOnWrite()->body = rewriter(f->body);
     return f;
   }
 
 private:
+  static void AddBufferIfMissing(std::vector<Buffer> *buffers,
+                                 const Buffer &buffer) {
+    auto it = std::find_if(
+        buffers->begin(), buffers->end(),
+        [&](const Buffer &candidate) { return candidate.same_as(buffer); });
+    if (it == buffers->end()) {
+      buffers->push_back(buffer);
+    }
+  }
+
+  static std::vector<const ForNode *>
+  CollectTileLoopChain(const ForNode *root) {
+    std::vector<const ForNode *> loops;
+    const ForNode *current = root;
+    while (current != nullptr &&
+           current->annotations.count(attr::tile_level_loop)) {
+      loops.push_back(current);
+      const auto *next = current->body.as<ForNode>();
+      if (next == nullptr || !next->annotations.count(attr::tile_level_loop)) {
+        break;
+      }
+      current = next;
+    }
+    return loops;
+  }
+
   /* ---- Collect buffer and layout info from Block nodes ---- */
   Stmt VisitStmt_(const BlockNode *block) final {
-    // Collect buffer data -> Buffer mapping from alloc_buffers and
-    // match_buffers
-    for (const auto &buffer : block->alloc_buffers) {
-      buffer_data_to_buffer_[buffer->data] = buffer;
-    }
-    for (const auto &match_buffer : block->match_buffers) {
-      buffer_data_to_buffer_[match_buffer->buffer->data] = match_buffer->buffer;
-    }
-
     // Collect layout_map from block annotation
     if (block->annotations.count(attr::kLayoutMap)) {
-      auto layout_map = Downcast<Map<Buffer, Layout>>(
-          block->annotations.at(attr::kLayoutMap));
-      for (const auto &[buffer, layout] : layout_map) {
-        layout_map_.Set(buffer, layout);
+      auto layout_map_obj = block->annotations.Get(attr::kLayoutMap).value();
+      if (auto layout_map = layout_map_obj.as<Map<Buffer, Layout>>()) {
+        for (const auto &[buffer, layout] : layout_map.value()) {
+          layout_map_.Set(buffer, layout);
+        }
+      } else if (auto layout_map = layout_map_obj.as<Map<Var, Layout>>()) {
+        std::vector<Buffer> block_buffers;
+        for (const Buffer &buffer : block->alloc_buffers) {
+          AddBufferIfMissing(&block_buffers, buffer);
+        }
+        for (const BufferRegion &region : block->reads) {
+          AddBufferIfMissing(&block_buffers, region->buffer);
+        }
+        for (const BufferRegion &region : block->writes) {
+          AddBufferIfMissing(&block_buffers, region->buffer);
+        }
+        for (const MatchBufferRegion &match_buffer : block->match_buffers) {
+          AddBufferIfMissing(&block_buffers, match_buffer->buffer);
+        }
+
+        for (const auto &[buffer_var, layout] : layout_map.value()) {
+          bool found = false;
+          for (const Buffer &buffer : block_buffers) {
+            if (buffer->data.same_as(buffer_var)) {
+              layout_map_.Set(buffer, layout);
+              found = true;
+            }
+          }
+          ICHECK(found)
+              << "layout_map annotation references unknown buffer var "
+              << buffer_var << ".";
+        }
+      } else {
+        LOG(FATAL)
+            << "Unsupported layout_map annotation type in LegalizeTilesLoop.";
       }
     }
 
     return StmtExprMutator::VisitStmt_(block);
-  }
-
-  /* ---- Check if buffer has a layout in layout_map_ ---- */
-  bool HasLayout(const Buffer &buffer) const {
-    return layout_map_.count(buffer) > 0;
-  }
-
-  /* ---- Infer TileView for a buffer when no manual annotation exists ----
-   *
-   * All buffers inside T.Tiles are on-chip SRAM, so scope is not a
-   * distinguishing factor.  The only question is whether the buffer has
-   * a layout in layout_map_ (set by LayoutInference), which indicates
-   * that the tile unit processes it in 2-D blocks rather than row-by-row.
-   *
-   * Rules:
-   *   1D buffer                → tile_shape=(32,),    index_map=(-1,)
-   *   2D+ buffer WITH layout   → tile_shape=(H, 32),  index_map=(-2,-1)
-   *       where H = largest of {32,16,8,1} dividing dim[-2]
-   *   2D+ buffer WITHOUT layout→ tile_shape=(1, 32),   index_map=(-2,-1)
-   * ------------------------------------------------------------------ */
-  TileView InferTileView(const Var &buffer_data) {
-    auto buf_it = buffer_data_to_buffer_.find(buffer_data);
-    ICHECK(buf_it != buffer_data_to_buffer_.end())
-        << "Cannot find buffer for data var " << buffer_data
-        << " during TileView inference.";
-
-    const Buffer &buffer = buf_it->second;
-    int ndim = static_cast<int>(buffer->shape.size());
-
-    if (ndim == 1) {
-      // 1D buffer: tile_shape={32}, index_map={-1}
-      Array<PrimExpr> buffer_shape = buffer->shape;
-      Array<PrimExpr> tile_shape = {Integer(32)};
-      Array<PrimExpr> index_map = {Integer(-1)};
-      return makeTileView(buffer_shape, tile_shape, index_map);
-    }
-
-    // 2D+ buffer
-    Array<PrimExpr> buffer_shape = buffer->shape;
-
-    int tile_h = 1;
-    if (HasLayout(buffer)) {
-      // TODO: Further verify the layout (blockwise)
-      // Buffer has a layout from LayoutInference — tile unit processes
-      // it in 2-D blocks.  Pick the largest tile height that evenly
-      // divides the second-to-last dimension.
-      const auto *dim_val = buffer->shape[ndim - 2].as<IntImmNode>();
-      if (dim_val) {
-        int64_t dim_size = dim_val->value;
-        for (int candidate : {32, 16, 8, 1}) {
-          if (dim_size % candidate == 0) {
-            tile_h = candidate;
-            break;
-          }
-        }
-      }
-      // Dynamic dim: tile_h stays 1
-    }
-
-    Array<PrimExpr> tile_shape = {Integer(tile_h), Integer(32)};
-    Array<PrimExpr> index_map = {Integer(-2), Integer(-1)};
-    return makeTileView(buffer_shape, tile_shape, index_map);
   }
 
   Stmt VisitStmt_(const ForNode *loop) final {
@@ -220,114 +183,36 @@ private:
       return StmtExprMutator::VisitStmt_(loop);
     }
 
-    // Must be associated with a tiled buffer
-    auto buf_it = loop->annotations.find(attr::tiled_buffer);
-    if (buf_it == loop->annotations.end()) {
-      return StmtExprMutator::VisitStmt_(loop);
+    bool starts_scope = loop->annotations.count(attr::kTileDomain);
+    if (starts_scope) {
+      ICHECK(!in_active_scope_) << "Nested T.Tiles scopes are not supported.";
+
+      Array<PrimExpr> domain =
+          Downcast<Array<PrimExpr>>(loop->annotations.at(attr::kTileDomain));
+      ICHECK(!NestedTilesScopeDetector::Exists(loop->body))
+          << "Nested T.Tiles scopes are not supported.";
+      auto scope_loops = CollectTileLoopChain(loop);
+      ICHECK_GE(scope_loops.size(), domain.size())
+          << "T.Tiles scope loop rank does not cover the declared domain rank.";
+      scope_loops.resize(domain.size());
+      auto accesses = CollectBufferAccesses(loop->body);
+      active_tileview_plan_ =
+          PlanTileViewsForTilesScope(domain, scope_loops, accesses, tileviews_,
+                                     layout_map_, tile_processor_config_);
+      active_scope_depth_ = 0;
+      in_active_scope_ = true;
     }
 
-    Var buffer_data = Downcast<Var>((*buf_it).second);
-
-    // ---- Reject nested T.Tiles from different buffers ----
-    // Nesting separate T.Tiles calls (e.g., T.Tiles(A) inside T.Tiles(B))
-    // is not supported.  Loops from a single T.Tiles call share the same
-    // tiled_buffer and nest naturally; only cross-buffer nesting is banned.
-    if (tile_loop_depth_ > 0 && active_tiled_buffer_.defined() &&
-        !buffer_data.same_as(active_tiled_buffer_)) {
-      LOG(FATAL) << "Nested T.Tiles from different buffers is not supported. "
-                 << "Outer T.Tiles uses buffer " << active_tiled_buffer_
-                 << ", but inner T.Tiles uses buffer " << buffer_data << ". "
-                 << "Access multiple buffers within a single T.Tiles scope "
-                 << "instead.";
-    }
-
-    // ---- Local tileview map for this tile loop scope ----
-    TileViewMap local_tileviews;
-
-    // Look up primary buffer's TileView: manual annotation first, then infer
-    auto tv_it = tileviews_.find(buffer_data);
-    TileView primary_tv;
-    if (tv_it != tileviews_.end()) {
-      primary_tv = tv_it->second;
-    } else {
-      // Auto-infer TileView for the primary buffer
-      primary_tv = InferTileView(buffer_data);
-      LOG(INFO) << "[Legalize tiles loop] Auto-inferred TileView for primary "
-                   "buffer: "
-                << buffer_data;
-    }
-    local_tileviews[buffer_data] = primary_tv;
-
-    // ---- Collect all used buffers inside loop body ----
-    auto used_buffers = SharedBufferCollector::Collect(loop->body);
-
-    if (used_buffers.empty()) {
-      return StmtExprMutator::VisitStmt_(loop);
-    }
-
-    // ---- Resolve TileViews for all used buffers ----
-    for (const Var &buf : used_buffers) {
-      if (local_tileviews.count(buf))
-        continue;
-
-      auto it = tileviews_.find(buf);
-      if (it != tileviews_.end()) {
-        // Manual annotation exists
-        local_tileviews[buf] = it->second;
-      } else {
-        // Auto-infer
-        local_tileviews[buf] = InferTileView(buf);
-        LOG(INFO) << "[Legalize tiles loop] Auto-inferred TileView for "
-                     "buffer: "
-                  << buf;
-      }
-    }
-
-    // ---- Validate TileView compatibility across buffers ----
-    // 1) Same-rank buffers must have equal TileViews.
-    // 2) Cross-rank buffers must share the same tile width (last dim of
-    //    tile_shape) so that broadcast is straightforward.
-    {
-      size_t primary_rank = primary_tv->TileDim();
-      Array<PrimExpr> primary_tile = primary_tv->TileShape();
-      PrimExpr primary_width = primary_tile[primary_tile.size() - 1];
-
-      for (const auto &[buf, tv] : local_tileviews) {
-        size_t rank = tv->TileDim();
-        Array<PrimExpr> tile = tv->TileShape();
-        PrimExpr width = tile[tile.size() - 1];
-
-        if (rank == primary_rank) {
-          // Same rank: full equality check
-          ICHECK(primary_tv->IsEqual(tv.get()))
-              << "Inconsistent TileView inside tile loop: buffer " << buf
-              << " has same tile rank (" << rank
-              << ") as primary buffer but different TileView.";
-        } else {
-          // Cross rank: tile width must match for broadcast
-          const auto *pw = primary_width.as<IntImmNode>();
-          const auto *w = width.as<IntImmNode>();
-          ICHECK(pw && w && pw->value == w->value)
-              << "Tile width mismatch inside tile loop: primary buffer has "
-                 "tile width "
-              << primary_width << " but buffer " << buf << " has tile width "
-              << width << ". Cross-rank buffers must share tile width for "
-              << "broadcast.";
-        }
-      }
-    }
-
-    // Use the primary buffer's TileView for loop structure
-    const TileView &tv = primary_tv;
+    ICHECK(in_active_scope_)
+        << "Tile loop encountered without an active T.Tiles domain root.";
 
     // Enter tile loop (depth == tile dimension)
-    int dim = tile_loop_depth_++;
-    Var prev_active_buffer = active_tiled_buffer_;
-    active_tiled_buffer_ = buffer_data;
+    int dim = active_scope_depth_++;
     Stmt new_body = VisitStmt(loop->body);
-    active_tiled_buffer_ = prev_active_buffer;
-    tile_loop_depth_--;
+    active_scope_depth_--;
 
+    const TileViewPlan &plan = active_tileview_plan_;
+    const TileView &tv = plan.execution_tileview;
     Array<PrimExpr> tiled_shape = tv->TiledBufferShape();
 
     ICHECK(dim < static_cast<int>(tiled_shape.size()))
@@ -340,43 +225,51 @@ private:
     n->body = new_body;
 
     // Attach normalized loop annotations
-    n->annotations.Set(attr::tile_new_shape, tiled_shape);
     n->annotations.Set(attr::tile_tile_size, tv->TileShape());
-    n->annotations.Set(attr::tile_dim_map, tv->IndexMap());
     n->annotations.Set(attr::kTileLoopStage,
                        Integer(static_cast<int>(TileLoopStage::kLegalized)));
-    // ---- Determine whether this loop is a tile execution dimension ----
-    int buf_ndim = static_cast<int>(tv->BufferShape().size());
-    bool is_tile_execution = false;
-
-    for (const PrimExpr &pe : tv->IndexMap()) {
-      const auto *imm = pe.as<IntImmNode>();
-      ICHECK(imm) << "index_map must contain IntImm";
-
-      int mapped_dim = static_cast<int>(imm->value);
-      if (mapped_dim < 0) {
-        mapped_dim += buf_ndim;
-      }
-
-      if (mapped_dim == dim) {
-        is_tile_execution = true;
-        break;
-      }
-    }
+    // ---- Determine whether this logical domain loop carries an execution axis
+    // If plan.execution_domain_axes[k] == dim, then:
+    //   - this loop carries execution axis k
+    //   - tile.tile_size[k] applies to this logical domain axis
+    // Example: execution_domain_axes=[1,0] means tile_size[0] belongs to the
+    // second logical loop axis, and tile_size[1] belongs to the first.
+    auto axis_it = std::find(plan.execution_domain_axes.begin(),
+                             plan.execution_domain_axes.end(), dim);
+    bool is_tile_execution = axis_it != plan.execution_domain_axes.end();
 
     if (is_tile_execution) {
-      n->annotations.Set(attr::tile_execution_loop, Integer(1));
+      n->annotations.Set(attr::tile_execution_axis,
+                         Integer(static_cast<int>(std::distance(
+                             plan.execution_domain_axes.begin(), axis_it))));
+    }
+
+    if (starts_scope) {
+      // Scope-level execution axis -> logical domain axis mapping.
+      Array<PrimExpr> execution_domain_axes;
+      for (int axis : plan.execution_domain_axes) {
+        execution_domain_axes.push_back(Integer(axis));
+      }
+      n->annotations.Set(attr::tile_execution_domain_axes,
+                         execution_domain_axes);
+    }
+
+    if (starts_scope) {
+      in_active_scope_ = false;
+      active_tileview_plan_ = TileViewPlan();
+      active_scope_depth_ = 0;
     }
     return new_for;
   }
 
 private:
   TileViewMap tileviews_;
-  BufferDataMap buffer_data_to_buffer_;
   Map<Buffer, Layout> layout_map_;
-  int tile_loop_depth_{0};
-  Var active_tiled_buffer_; // tracks the tiled_buffer of the innermost T.Tiles
-                            // scope
+  SunmmioTileProcessorConfig tile_processor_config_{
+      GetSunmmioTileProcessorConfig(ffi::Optional<Target>())};
+  bool in_active_scope_{false};
+  TileViewPlan active_tileview_plan_;
+  int active_scope_depth_{0};
 };
 
 /* ============================================================

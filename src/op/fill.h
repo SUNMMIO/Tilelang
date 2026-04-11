@@ -40,7 +40,7 @@ private:
   /// Create SIMT-style parallel loop for filling
   For MakeSIMTLoop(arith::Analyzer *analyzer) const;
   /// Sunmmio Tile-based fill logic
-  Stmt MakeSunmmioTileFill(const LowerArgs &T, arith::Analyzer *analyzer) const;
+  Stmt MakeSunmmioTileFill(const LowerArgs &, arith::Analyzer *analyzer) const;
 };
 
 /// Wrapper class for fill operations

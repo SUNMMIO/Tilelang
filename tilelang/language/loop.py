@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from typing import Any
+from collections.abc import Iterable
 from tvm import tir
 from tvm.tir import IntImm
 import tvm.script.ir_builder.tir as tb_tir
@@ -72,23 +73,31 @@ def Parallel(
     return _ffi_api.Parallel(extents, annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
-def Tiles(shared_buf: tir.Buffer, parallel: bool = False):
-    """Construct tiled loop over shared memory buffer.
+def Tiles(domain: tir.Buffer | Iterable[int | tir.PrimExpr], parallel: bool = False):
+    """Construct a tiled loop over an explicit logical domain.
+
+    The preferred form is ``T.Tiles([m, n], parallel=True)`` where the
+    extents describe the logical computation domain. Passing a buffer remains
+    supported as a compatibility path and uses ``buffer.shape`` as the domain.
 
     parallel:
         True  -> no loop-carried dependency
         False -> loop carries dependency (e.g. reduction)
     """
+    if isinstance(domain, tir.Buffer):
+        extents = tuple(domain.shape)
+    else:
+        extents = tuple(domain)
 
     annotations = {
         "tile.loop_parallel": tir.IntImm("int32", 1 if parallel else 0),
-        "tile.tiled_buffer": shared_buf.data,
+        "tile.domain": extents,
         # This indicates how many passes the tile loop has gone through. init value 0
         # after passing through the `Legalizetilesloop` pass, the value will be set to 1,
         # and after passing through the `Tilesloop` pass, it set to 2.
         "tile.loop_stage": tir.IntImm("int32", 0),
     }
-    return _ffi_api.Tiles(tuple(shared_buf.shape), annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
+    return _ffi_api.Tiles(extents, annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
 def Persistent(

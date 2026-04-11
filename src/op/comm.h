@@ -18,8 +18,6 @@ TVM_DLL const Op &broadcast_();
 
 using namespace tir;
 
-int get_target_mesh(Target target, int axis);
-
 class BroadcastOpNode : public TileOperatorNode {
 public:
   Buffer src, dst;

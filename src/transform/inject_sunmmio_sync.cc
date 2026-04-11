@@ -38,6 +38,7 @@
 #include "../op/builtin.h"
 #include "../op/comm.h"
 #include "../op/utils.h"
+#include "../target/sunmmio_utils.h"
 #include "./common/attr.h"
 #include "./common/collector.h"
 #include "arith/ir_mutator_with_analyzer.h"
@@ -1332,8 +1333,9 @@ public:
 
   static PrimFunc Rewrite(PrimFunc f, arith::Analyzer *analyzer) {
     auto target = f->GetAttr<Target>(tvm::attr::kTarget).value();
-    int mesh_nrow = get_target_mesh(target, 0);
-    int mesh_ncol = get_target_mesh(target, 1);
+    SunmmioMeshConfig mesh = GetSunmmioMeshConfig(target);
+    int mesh_nrow = mesh.nrow;
+    int mesh_ncol = mesh.ncol;
 
     auto inject_sync_rewriter =
         InjectSyncRewriter(f->buffer_map, mesh_nrow, mesh_ncol);

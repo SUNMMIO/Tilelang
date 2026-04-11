@@ -1,6 +1,5 @@
 """Regression tests for Sunmmio shared.rsram -> shared.rsram copy lowering."""
 
-import pytest
 import tilelang
 import tilelang as tl
 import tilelang.language as T
@@ -23,10 +22,8 @@ def apply_sunmmio_passes(mod, target):
     mod = tilelang.transform.LayoutReducer()(mod)
     mod = tilelang.transform.LayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
-    print(mod)
     mod = tl.transform.LegalizeTilesLoop()(mod)
     mod = tl.transform.TilesLoop()(mod)
-    print(mod)
     return mod
 
 
@@ -54,7 +51,7 @@ def rsram_copy_region(block_M=64, block_N=64, dtype="float16"):
         with T.Kernel(1, 1, threads=128) as (_bx, _by):
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
-            T.copy(A_shared[8:24, 16:48], B_shared[0:16, 0:32])
+            T.copy(A_shared[8:24, 32:64], B_shared[0:16, 0:32])
 
     return tvm.IRModule({"main": main})
 
@@ -85,6 +82,17 @@ def collect_buffer_stores(func, buffer_name):
 
     tvm.tir.stmt_functor.post_order_visit(func.body, visit)
     return stores
+
+
+def collect_buffer_loads(func, buffer_name):
+    loads = []
+
+    def visit(stmt):
+        if isinstance(stmt, tir.BufferLoad) and stmt.buffer.name == buffer_name:
+            loads.append(stmt)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return loads
 
 
 def expr_has_cast(expr, dst_dtype, src_dtype):
@@ -150,18 +158,29 @@ def test_tilelang_rsram_copy_inserts_cast_for_dtype_mismatch():
     )
 
 
-def test_tilelang_rsram_region_copy_is_rejected_for_now():
+def test_tilelang_rsram_region_copy_lowers_to_tile_loop():
     target = determine_target("Sunmmio", return_object=True)
 
-    with (
-        pytest.raises(
-            tvm.error.InternalError,
-            match="Unsupported copy from shared.rsram to shared.rsram of Sunmmio target.",
-        ),
-        tvm.target.Target(target),
-    ):
-        mod = rsram_copy_region()
-        apply_sunmmio_passes(mod, target)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(rsram_copy_region(), target)
+
+    func = mod["main"]
+    stores = collect_buffer_stores(func, "B_shared")
+    loads = collect_buffer_loads(func, "A_shared")
+    load_indices = [str(idx) for load in loads for idx in load.indices]
+
+    assert extract_dma_copy_lines(mod) == []
+    assert collect_loops_with_attr(func, "tile.scope_entry")
+    assert collect_loops_with_attr(func, "tile.interior")
+    assert stores
+    assert loads
+    assert not any(expr_has_if_then_else(store.value) for store in stores)
+    assert any(("i + 1" in index or "i+1" in index) and ("* 8" in index or "*8" in index) for index in load_indices), (
+        "Expected the height offset to survive tile-loop rewriting"
+    )
+    assert any(("j + 1" in index or "j+1" in index) and ("* 32" in index or "*32" in index) for index in load_indices), (
+        "Expected the width offset to survive tile-loop rewriting"
+    )
 
 
 def extract_block_attr_lines(mod):
