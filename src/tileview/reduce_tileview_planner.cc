@@ -316,7 +316,10 @@ PlanReduceTileViews(const BufferRegion &src_region,
           return lhs.useful_spatial_tiled_dims > rhs.useful_spatial_tiled_dims;
         }
         if (lhs.dst_tile_elems != rhs.dst_tile_elems) {
-          return lhs.dst_tile_elems < rhs.dst_tile_elems;
+          // Prefer keeping more data live on the surviving non-reduced axes.
+          // This preserves compatible source/destination tileviews like [4, 32]
+          // over collapsed projections like [1, 32] when both are legal.
+          return lhs.dst_tile_elems > rhs.dst_tile_elems;
         }
         if (lhs.src_tile_elems != rhs.src_tile_elems) {
           return lhs.src_tile_elems > rhs.src_tile_elems;

@@ -338,6 +338,17 @@ def LowerTilesLoop():
     return _ffi_api.LowerTilesLoop()  # type: ignore
 
 
+def SunmmioTileLoopFusion():
+    """SunmmioTileLoopFusion
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.SunmmioTileLoopFusion()  # type: ignore
+
+
 def LegalizeSafeMemoryAccess():
     """LegalizeLoopVectorize
 
