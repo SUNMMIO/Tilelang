@@ -10,9 +10,7 @@
 #include <tvm/tir/op.h>
 #include <tvm/tir/op_attr_types.h>
 
-#include "../layout/tcgen05_layout.h"
 #include "../target/utils.h"
-#include "../tileview/tileview.h"
 #include "../transform/common/attr.h"
 #include "../transform/common/loop_fusion_utils.h"
 #include "../transform/loop_partition.h"
@@ -138,6 +136,69 @@ For FillNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
   return Downcast<For>(body);
 }
 
+Stmt FillNode::MakeSunmmioTileFill(const LowerArgs &,
+                                   arith::Analyzer *analyzer) const {
+  // For Sunmmio target, we strictly require the destination buffer to be in
+  // "shared.rsram" scope. This is because the vector core on Sunmmio only
+  // operates on data residing in RSRAM.
+  ICHECK(dst.scope() == "shared.rsram")
+      << "For Sunmmio target, Fill operator destination must be in "
+         "shared.rsram scope, but got "
+      << dst.scope();
+
+  Array<IterVar> loop_vars;
+  Array<PrimExpr> dst_indices;
+  loop_vars.reserve(region.size());
+  dst_indices.reserve(region.size());
+  int loop_idx = 0;
+  for (const Range &range : region) {
+    // Singleton dimensions do not need a loop. Keep the constant region min so
+    // the resulting BufferStore still points at the correct slice.
+    if (is_one(range->extent)) {
+      dst_indices.push_back(range->min);
+      continue;
+    }
+
+    // Non-singleton dimensions become the logical tile-domain loops. The final
+    // store index keeps the original region offset as `min + loop_var`.
+    Var var("i" + std::to_string(loop_idx++), range->extent.dtype());
+    IterVar iv(Range(0, range->extent), var, IterVarType::kDataPar);
+    loop_vars.push_back(iv);
+    analyzer->Bind(var, iv->dom);
+    dst_indices.push_back(range->min + var);
+  }
+
+  Stmt body = BufferStore(dst, value, dst_indices);
+  if (loop_vars.empty()) {
+    return body;
+  }
+
+  Map<String, ObjectRef> tile_annotations;
+  Array<PrimExpr> tile_domain;
+  tile_domain.reserve(loop_vars.size());
+  for (const IterVar &iv : loop_vars) {
+    tile_domain.push_back(iv->dom->extent);
+  }
+  // LegalizeTilesLoop/TilesLoop pipeline will infer a legal execution tile
+  // shape from this region-aware BufferStore.
+  tile_annotations.Set(attr::tile_level_loop, Integer(1));
+  tile_annotations.Set(attr::kTileLoopStage,
+                       Integer(static_cast<int>(TileLoopStage::kInitial)));
+  tile_annotations.Set(attr::kTileDomain, tile_domain);
+
+  for (int i = static_cast<int>(loop_vars.size()) - 1; i >= 0; --i) {
+    Map<String, ObjectRef> loop_annotations = tile_annotations;
+    // Only the outermost loop carries tile.domain; inner loops remain part of
+    // the same raw tile scope.
+    if (i != 0) {
+      loop_annotations.erase(attr::kTileDomain);
+    }
+    body = For(loop_vars[i]->var, 0, loop_vars[i]->dom->extent,
+               ForKind::kSerial, body, std::nullopt, loop_annotations);
+  }
+  return body;
+}
+
 /**
  * @brief Lower this Fill operator to a TIR statement for the target.
  *
@@ -156,119 +217,6 @@ For FillNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
  * @param T Lowering arguments (target, thread bounds, thread var, layout map).
  * @return Stmt The lowered TIR statement implementing the fill.
  */
-Stmt FillNode::MakeSunmmioTileFill(const LowerArgs &T,
-                                   arith::Analyzer *analyzer) const {
-  // For Sunmmio target, we strictly require the destination buffer to be in
-  // "shared.rsram" scope. This is because the vector core on Sunmmio only
-  // operates on data residing in RSRAM.
-  ICHECK(dst.scope() == "shared.rsram")
-      << "For Sunmmio target, Fill operator destination must be in "
-         "shared.rsram scope, but got "
-      << dst.scope();
-
-  // Helper to find TileView metadata for a buffer, supporting name-hint
-  // fallback. This is necessary because TVM may rename buffers (e.g.,
-  // adding suffixes like _1, _2) during lowering, which causes direct
-  // pointer-based lookup in tileview_map to fail.
-  auto find_tileview = [&](const Buffer &buf) -> Optional<TileView> {
-    if (T.tileview_map.count(buf->data)) {
-      return T.tileview_map.at(buf->data);
-    }
-    // Fallback: match by name hint, ignoring common suffixes like _1, _2.
-    auto simplify_name = [](std::string name) {
-      if (name.size() > 2 && name[name.size() - 2] == '_') {
-        return name.substr(0, name.size() - 2);
-      }
-      return name;
-    };
-    std::string target_name = simplify_name(buf->data->name_hint);
-    for (const auto &kv : T.tileview_map) {
-      if (simplify_name(kv.first->name_hint) == target_name) {
-        return kv.second;
-      }
-    }
-    return std::nullopt;
-  };
-
-  Optional<TileView> opt_tv = find_tileview(dst);
-  if (opt_tv.defined()) {
-    TileView tv = opt_tv.value();
-    // Build map from buffer dim index to tile size
-    // This map is essential for handling tiled loops, as we need to know
-    // which dimensions are tiled and what their tile sizes are.
-    std::unordered_map<int, PrimExpr> dim_to_tile_size;
-    int ndim = dst->shape.size();
-    for (size_t i = 0; i < tv->IndexMap().size(); i++) {
-      const auto *idx_ptr = tv->IndexMap()[i].as<IntImmNode>();
-      ICHECK(idx_ptr);
-      int dim = idx_ptr->value;
-      if (dim < 0)
-        dim += ndim;
-      dim_to_tile_size[dim] = tv->TileShape()[i];
-    }
-
-    Array<IterVar> loop_vars;
-    Array<PrimExpr> dst_indices;
-    Map<String, ObjectRef> annotations;
-
-    // Add common annotations required for subsequent passes (e.g. TilesLoop)
-    // to correctly process and expand the loops.
-    // - tile_new_shape: The shape of the buffer after tiling.
-    // - tile_dim_map: Mapping between original and tiled dimensions.
-    // - tile_tile_size: The size of each tile.
-    // - kTileLoopStage: Set to kLegalized to indicate that we have handled
-    // the tiling logic.
-    // - tiled_buffer: The underlying buffer being tiled.
-    // - tile_level_loop: Indicates that this loop iterates over tiles.
-    annotations.Set(attr::tile_new_shape, tv->TiledBufferShape());
-    annotations.Set(attr::tile_dim_map, tv->IndexMap());
-    annotations.Set(attr::tile_tile_size, tv->TileShape());
-    annotations.Set(attr::kTileLoopStage,
-                    Integer(static_cast<int>(TileLoopStage::kLegalized)));
-    annotations.Set(attr::tiled_buffer, dst->data);
-    annotations.Set(attr::tile_level_loop, Integer(1));
-
-    for (int i = 0; i < ndim; i++) {
-      PrimExpr extent = region[i]->extent;
-      bool is_tiled = dim_to_tile_size.count(i);
-      if (is_tiled) {
-        PrimExpr tile_size = dim_to_tile_size[i];
-        // Ensure that the region start and extent are aligned with the tile
-        // size. This is a hardware constraint for vector core operations on
-        // tiles.
-        ICHECK(analyzer->CanProve(truncmod(region[i]->min, tile_size) == 0))
-            << "Fill region min " << region[i]->min
-            << " not divisible by tile size " << tile_size;
-        ICHECK(analyzer->CanProve(truncmod(extent, tile_size) == 0))
-            << "Fill region extent " << extent << " not divisible by tile size "
-            << tile_size;
-        extent = truncdiv(extent, tile_size);
-      }
-      Var var = Var(std::string{char('i' + i)}, extent->dtype);
-      loop_vars.push_back({Range(0, extent), var, IterVarType::kDataPar});
-      // We use the original region min + var as the index.
-      // The TilesLoop pass will later handle the substitution of var to
-      // (var * tile_size + inner_var) for tiled dimensions.
-      dst_indices.push_back(region[i]->min + var);
-    }
-
-    Stmt body = BufferStore(dst, value, dst_indices);
-
-    for (int i = ndim - 1; i >= 0; i--) {
-      Map<String, ObjectRef> loop_anno = annotations;
-      // Mark the innermost loop of a tiled dimension as the execution loop
-      // for that tile.
-      if (dim_to_tile_size.count(i)) {
-        loop_anno.Set(attr::tile_execution_loop, Integer(1));
-      }
-      body = For(loop_vars[i]->var, 0, loop_vars[i]->dom->extent,
-                 ForKind::kSerial, body, std::nullopt, loop_anno);
-    }
-    return body;
-  }
-  return Stmt();
-}
-
 Stmt FillNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   if (TargetIsSunmmio(T.target)) {
     Stmt body = MakeSunmmioTileFill(T, analyzer);

@@ -14,6 +14,7 @@
 #include "../layout/utils.h"
 #include "../op/parallel.h"
 #include "../target/utils.h"
+#include "../tileview/reduce_tileview_planner.h"
 #include "../tileview/tileview.h"
 #include "../transform/common/attr.h"
 #include "../transform/loop_partition.h"
@@ -230,19 +231,20 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   Optional<TileView> opt_tv_src = find_tileview(this->src);
   Optional<TileView> opt_tv_dst = find_tileview(this->dst);
 
-  ICHECK(opt_tv_src.defined())
-      << "TileView not found for src buffer " << this->src->name;
-  ICHECK(opt_tv_dst.defined())
-      << "TileView not found for dst buffer " << this->dst->name;
+  ReduceTileViewPlan plan = PlanReduceTileViews(
+      this->srcRegion_, this->dstRegion_, this->dim, {opt_tv_src, opt_tv_dst},
+      T.layout_map, GetSunmmioTileProcessorConfig(T.target), analyzer);
 
-  TileView tv_src = opt_tv_src.value();
-  TileView tv_dst = opt_tv_dst.value();
+  TileView tv_src = plan.src_tileview;
+  TileView tv_dst = plan.dst_tileview;
+  Array<PrimExpr> source_domain = plan.source_domain;
+  int src_ndim = static_cast<int>(source_domain.size());
+  int dst_ndim = static_cast<int>(this->dstRegion_->region.size());
 
   // Map physical buffer dimensions to their logical tile sizes based on
   // IndexMap. E.g., if IndexMap is [-2, -1] and TileShape is [32, 32], the
   // last two dims are tiled.
   std::unordered_map<int, PrimExpr> src_dim_to_tile_size;
-  int src_ndim = this->src->shape.size();
   for (size_t i = 0; i < tv_src->IndexMap().size(); i++) {
     PrimExpr idx_expr = analyzer->Simplify(tv_src->IndexMap()[i]);
     const auto *idx_ptr = idx_expr.as<IntImmNode>();
@@ -255,7 +257,7 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   }
 
   // Check if the dimension we are reducing along is a tiled dimension.
-  bool is_dim_tiled = src_dim_to_tile_size.count(this->dim);
+  bool is_dim_tiled = plan.reduce_tile_axis >= 0;
 
   // Derive the shape of the single-tile accumulation buffer 'acc'.
   // It has the same rank as 'src', but non-tiled dimensions are collapsed
@@ -275,7 +277,6 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   // (i.e. accumulating into existing dst values), since in that case we need to
   // store the per-tile reduction results before accumulating back to dst.
   Array<PrimExpr> single_tile_res_shape;
-  int dst_ndim = this->dst->shape.size();
   std::unordered_map<int, PrimExpr> dst_dim_to_tile_size;
   if (is_dim_tiled) {
     single_tile_res_shape.reserve(dst_ndim);
@@ -312,15 +313,15 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   }
 
   // Create outer loop variables for each dimension of the source tensor.
-  // Tiled dimensions will have extents = buffer_extent / tile_size.
+  // Tiled dimensions will have extents = region_extent / tile_size.
   Array<IterVar> loop_vars;
   loop_vars.reserve(src_ndim);
   for (int i = 0; i < src_ndim; i++) {
-    PrimExpr extent = this->src->shape[i];
+    PrimExpr extent = source_domain[i];
     if (src_dim_to_tile_size.count(i)) {
       extent = truncdiv(extent, src_dim_to_tile_size[i]);
     }
-    Var var = Var(std::string{char('i' + i)}, extent->dtype);
+    Var var("i" + std::to_string(i), extent->dtype);
     loop_vars.push_back({Range(0, extent), var, IterVarType::kDataPar});
   }
 
@@ -356,17 +357,24 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   Array<Var> dst_interior_vars_mapped;
   Array<PrimExpr> dst_tile_shape = tv_dst->TileShape();
   dst_interior_vars_mapped.reserve(tv_dst->IndexMap().size());
+  auto dst_dim_to_src_dim = [&](int dst_dim) {
+    for (int src_dim = 0; src_dim < src_ndim; ++src_dim) {
+      if (plan.src_dim_to_dst_dim[src_dim] == dst_dim) {
+        return src_dim;
+      }
+    }
+    LOG(FATAL) << "Could not map dst dim " << dst_dim
+               << " back to a source dim for Sunmmio reduction.";
+    return -1;
+  };
   for (size_t i = 0; i < tv_dst->IndexMap().size(); i++) {
     int dst_dim_val = tv_dst->IndexMap()[i].as<IntImmNode>()->value;
     if (dst_dim_val < 0)
       dst_dim_val += dst_ndim;
 
-    // Match output dimension to corresponding input dimension to find the
-    // correct 'k' variable.
-    int target_src_dim =
-        (this->dst->shape.size() == src_ndim)
-            ? dst_dim_val
-            : ((dst_dim_val < this->dim) ? dst_dim_val : dst_dim_val + 1);
+    // Match output dimension to the corresponding source dimension to find the
+    // correct interior variable.
+    int target_src_dim = dst_dim_to_src_dim(dst_dim_val);
 
     bool found = false;
     for (size_t j = 0; j < tv_src->IndexMap().size(); j++) {
@@ -388,12 +396,13 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   auto get_src_indices = [&]() {
     Array<PrimExpr> indices;
     for (int i = 0; i < src_ndim; i++) {
+      PrimExpr base = this->srcRegion_->region[i]->min;
       if (src_buf_dim_to_tile_axis.count(i)) {
         int axis = src_buf_dim_to_tile_axis.at(i);
-        indices.push_back(loop_vars[i]->var * src_tile_shape[axis] +
+        indices.push_back(base + loop_vars[i]->var * src_tile_shape[axis] +
                           interior_vars[axis]);
       } else {
-        indices.push_back(loop_vars[i]->var);
+        indices.push_back(base + loop_vars[i]->var);
       }
     }
     return indices;
@@ -414,18 +423,19 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   auto get_dst_indices = [&]() {
     Array<PrimExpr> indices;
     for (int i = 0; i < dst_ndim; i++) {
-      int src_dim = (this->dst->shape.size() == src_ndim)
-                        ? i
-                        : ((i < this->dim) ? i : i + 1);
+      PrimExpr base = this->dstRegion_->region[i]->min;
       if (dst_buf_dim_to_tile_axis.count(i)) {
         int axis = dst_buf_dim_to_tile_axis.at(i);
-        indices.push_back(loop_vars[src_dim]->var * dst_tile_shape[axis] +
+        int src_dim = dst_dim_to_src_dim(i);
+        indices.push_back(base +
+                          loop_vars[src_dim]->var * dst_tile_shape[axis] +
                           dst_interior_vars_mapped[axis]);
       } else {
-        if (this->dst->shape.size() == src_ndim && i == this->dim) {
-          indices.push_back(make_zero(this->dst->shape[i]->dtype));
+        if (dst_ndim == src_ndim && i == this->dim) {
+          indices.push_back(base);
         } else {
-          indices.push_back(loop_vars[src_dim]->var);
+          int src_dim = dst_dim_to_src_dim(i);
+          indices.push_back(base + loop_vars[src_dim]->var);
         }
       }
     }
@@ -464,9 +474,6 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
       auto *n = loop.CopyOnWrite();
       n->annotations.Set(attr::tile_interior, Integer(1));
       n->annotations.Set(attr::tile_interior_axis, Integer(axis));
-      n->annotations.Set(attr::kTileLoopStage,
-                         Integer(static_cast<int>(TileLoopStage::kTiled)));
-      n->annotations.Set(attr::tiled_buffer, this->src->data);
       b = loop;
     }
     return b;
@@ -482,15 +489,7 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
     all_dst_axes.push_back(i);
 
   // Identify which interior axis corresponds to the reduction dimension.
-  int reduce_tile_axis = -1;
-  for (size_t i = 0; i < src_tile_shape.size(); i++) {
-    int dim_val = tv_src->IndexMap()[i].as<IntImmNode>()->value;
-    if (dim_val < 0)
-      dim_val += src_ndim;
-    if (dim_val == this->dim) {
-      reduce_tile_axis = i;
-    }
-  }
+  int reduce_tile_axis = plan.reduce_tile_axis;
 
   // Construct the reduction logic using a guarded multi-step process.
   // This allows unifying spatial and reduction loops while maintaining
@@ -549,15 +548,19 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
     // IR depth.
     Array<Range> dst_ranges;
     for (int i = 0; i < dst_ndim; i++) {
-      int src_dim = (this->dst->shape.size() == src_ndim)
-                        ? i
-                        : ((i < this->dim) ? i : i + 1);
       if (dst_dim_to_tile_size.count(i)) {
-        PrimExpr min = loop_vars[src_dim]->var * dst_dim_to_tile_size[i];
+        int src_dim = dst_dim_to_src_dim(i);
+        PrimExpr min = this->dstRegion_->region[i]->min +
+                       loop_vars[src_dim]->var * dst_dim_to_tile_size[i];
         dst_ranges.push_back(
             Range::FromMinExtent(min, dst_dim_to_tile_size[i]));
+      } else if (dst_ndim == src_ndim && i == this->dim) {
+        dst_ranges.push_back(
+            Range::FromMinExtent(this->dstRegion_->region[i]->min, 1));
       } else {
-        dst_ranges.push_back(Range::FromMinExtent(loop_vars[src_dim]->var, 1));
+        int src_dim = dst_dim_to_src_dim(i);
+        dst_ranges.push_back(Range::FromMinExtent(
+            this->dstRegion_->region[i]->min + loop_vars[src_dim]->var, 1));
       }
     }
     PrimExpr dst_region = MakeRegionExpr(this->dst, dst_ranges, 2);
@@ -634,37 +637,41 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   Stmt body = SeqStmt({IfThenElse(rv == 0, init_stmt), accumulate_stmt,
                        IfThenElse(rv == r_extent - 1, finalize_stmt)});
 
-  // 6. Wrap with outer Tile Loops (Spatial and Reduction).
+  // 6. Wrap with the final legal tile-loop contract directly.
   // IMPORTANT: For memory reuse of 'acc', the reduction loop MUST be the
   // innermost.
-  Map<String, ObjectRef> base_annotations;
-  base_annotations.Set(attr::kTileLoopStage,
-                       Integer(static_cast<int>(TileLoopStage::kTiled)));
-  base_annotations.Set(attr::tiled_buffer, this->src->data);
-  base_annotations.Set(attr::tile_new_shape, tv_src->TiledBufferShape());
-  base_annotations.Set(attr::tile_tile_size, tv_src->TileShape());
-  base_annotations.Set(attr::tile_dim_map, tv_src->IndexMap());
+  Map<String, ObjectRef> root_annotations;
+  root_annotations.Set(attr::kTileDomain, source_domain);
+  root_annotations.Set(attr::tile_tile_size, tv_src->TileShape());
+  Array<PrimExpr> execution_domain_axes;
+  execution_domain_axes.reserve(plan.execution_domain_axes.size());
+  std::unordered_map<int, int> src_dim_to_execution_axis;
+  for (size_t axis = 0; axis < plan.execution_domain_axes.size(); ++axis) {
+    int src_dim = plan.execution_domain_axes[axis];
+    execution_domain_axes.push_back(Integer(src_dim));
+    src_dim_to_execution_axis[src_dim] = static_cast<int>(axis);
+  }
+  root_annotations.Set(attr::tile_execution_domain_axes, execution_domain_axes);
 
   // Identify the outermost tiled loop index to set 'tile.scope_entry'.
   int outermost_tiled_idx = -1;
   for (int i = 0; i < src_ndim; i++) {
-    if (i != this->dim && src_buf_dim_to_tile_axis.count(i)) {
+    if (i != this->dim && src_dim_to_execution_axis.count(i)) {
       outermost_tiled_idx = i;
       break;
     }
   }
-  if (outermost_tiled_idx == -1 && src_buf_dim_to_tile_axis.count(this->dim)) {
+  if (outermost_tiled_idx == -1 && src_dim_to_execution_axis.count(this->dim)) {
     outermost_tiled_idx = this->dim;
   }
 
   // Wrap the reduction loop first (innermost).
   {
     int i = this->dim;
-    Map<String, ObjectRef> loop_anno = base_annotations;
-    loop_anno.Set(attr::tile_level_loop,
-                  Integer(0)); // Reduction axis is serial.
-    if (src_buf_dim_to_tile_axis.count(i)) {
-      loop_anno.Set(attr::tile_execution_loop, Integer(1));
+    Map<String, ObjectRef> loop_anno;
+    if (src_dim_to_execution_axis.count(i)) {
+      loop_anno.Set(attr::tile_execution_axis,
+                    Integer(src_dim_to_execution_axis.at(i)));
     }
     if (i == outermost_tiled_idx) {
       loop_anno.Set(attr::tile_scope_entry, Integer(1));
@@ -677,11 +684,10 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   for (int i = src_ndim - 1; i >= 0; i--) {
     if (i == this->dim)
       continue;
-    Map<String, ObjectRef> loop_anno = base_annotations;
-    loop_anno.Set(attr::tile_level_loop,
-                  Integer(1)); // Spatial axes are parallel.
-    if (src_buf_dim_to_tile_axis.count(i)) {
-      loop_anno.Set(attr::tile_execution_loop, Integer(1));
+    Map<String, ObjectRef> loop_anno;
+    if (src_dim_to_execution_axis.count(i)) {
+      loop_anno.Set(attr::tile_execution_axis,
+                    Integer(src_dim_to_execution_axis.at(i)));
     }
     if (i == outermost_tiled_idx) {
       loop_anno.Set(attr::tile_scope_entry, Integer(1));
@@ -690,12 +696,15 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
                ForKind::kSerial, body, std::nullopt, loop_anno);
   }
 
-  // Finally, wrap the body in a Block with TileView metadata.
-  TileView tv_acc = makeTileView(single_tile_acc_shape, tv_src->TileShape(),
-                                 tv_src->IndexMap());
-  Map<Var, TileView> new_tileview_map;
-  new_tileview_map.Set(acc->data, tv_acc);
+  For root = Downcast<For>(body);
+  auto *root_ptr = root.CopyOnWrite();
+  for (const auto &kv : root_annotations) {
+    root_ptr->annotations.Set(kv.first, kv.second);
+  }
+  body = root;
 
+  // Finally, wrap the body in a Block so the accumulator temporaries are
+  // allocated with the reduction scope.
   Array<Buffer> alloc_buffers;
   alloc_buffers.push_back(acc);
   if (dst_res.defined()) {
@@ -703,7 +712,7 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   }
 
   body = Block({}, {}, {}, "reduce_tile_op", body, std::nullopt, alloc_buffers,
-               {}, {{attr::kTileViewMap, new_tileview_map}});
+               {}, {});
 
   return body;
 }

@@ -70,6 +70,48 @@ def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
 
 
 @pytest.mark.parametrize(
+    "M, N, block_M, block_N, dtype",
+    [
+        (1024, 1024, 128, 128, "float16"),
+    ],
+)
+def test_comm_broadcast_lower_custom_mesh(M, N, block_M, block_N, dtype):
+    func_str = """
+            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 5, 1)
+            T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 2, 0)
+            T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 5, 0)""".strip()
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared([block_M, block_N], dtype, scope="shared.rsram")
+            B_shared = T.alloc_shared([block_M, block_N], dtype, scope="shared.rsram")
+            T.copy(A[by * block_M, bx * block_N], A_shared)
+
+            T.evaluate(
+                tvm.tir.call_intrin(
+                    "handle",
+                    tvm.tir.op.Op.get("tl.tileop.comm_broadcast"),
+                    A_shared[0:128, 0:128],
+                    B_shared[0:128, 0:128],
+                    -1,
+                    0,
+                    5,
+                    2,
+                )
+            )
+
+    mod = tvm.IRModule({"main": main})
+    target = determine_target("llvm -mcpu=sunmmio-a4e -mattr=device_mesh_nrow_2,device_mesh_ncol_3", return_object=True)
+    with tvm.target.Target(target):
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.LowerTileOp()(mod)
+        assert mod.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
+
+
+@pytest.mark.parametrize(
     "M, N, block_M, block_N, dtype, accum_dtype",
     [
         (1024, 1024, 128, 128, "float16", "float"),

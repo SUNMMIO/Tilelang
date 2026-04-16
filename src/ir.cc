@@ -117,13 +117,22 @@ ForFrame TilesFor(const Array<PrimExpr> &extents,
                     const Array<Optional<PrimExpr>> &steps, Stmt body) -> Stmt {
     ICHECK_EQ(vars.size(), doms.size());
     int n = vars.size();
+    String tile_domain_key(attr::kTileDomain);
     for (int i = n - 1; i >= 0; --i) {
       Range dom = doms[i];
       Var var = vars[i];
       Optional<PrimExpr> step =
           i < steps.size() ? steps[i] : Optional<PrimExpr>(std::nullopt);
+      Map<String, ObjectRef> loop_annotations;
+      for (const auto &kv : annotations) {
+        if (i != 0 && kv.first == tile_domain_key) {
+          continue;
+        }
+        loop_annotations.Set(kv.first, kv.second);
+      }
       body = For(var, dom->min, dom->extent, ForKind::kSerial, body,
-                 /*thread_binding=*/std::nullopt, /*annotations=*/annotations,
+                 /*thread_binding=*/std::nullopt,
+                 /*annotations=*/loop_annotations,
                  /*step=*/step);
     }
     return body;

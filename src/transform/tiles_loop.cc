@@ -1,7 +1,12 @@
+#include <optional>
+#include <unordered_map>
 #include <unordered_set>
 
+#include <tvm/arith/analyzer.h>
+#include <tvm/arith/pattern.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/tir/analysis.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
@@ -15,44 +20,156 @@ namespace tl {
 
 using namespace tir;
 
-/*!
- * ------------------------------------------------------------
- * StageUpdateRewriter
- *
- * After structural rewrite succeeds, we update all loops
- * belonging to the same tiled_buffer scope.
- *
- * This guarantees:
- *  - Multi-level loops are handled
- *  - Outer ancestors are updated
- *  - Multiple Tiles do not interfere
- *  - Idempotency preserved
- * ------------------------------------------------------------
- */
-class StageUpdateRewriter : public StmtExprMutator {
+class FinalTileAttrCleanupRewriter : public StmtExprMutator {
 public:
-  explicit StageUpdateRewriter(
-      const std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> &buffers)
-      : buffers_(buffers) {}
+  static PrimFunc Rewrite(PrimFunc f) {
+    FinalTileAttrCleanupRewriter rewriter;
+    f.CopyOnWrite()->body = rewriter(f->body);
+    return f;
+  }
 
 private:
   Stmt VisitStmt_(const ForNode *loop) final {
     For f = Downcast<For>(StmtExprMutator::VisitStmt_(loop));
+    auto *n = f.CopyOnWrite();
+    bool is_scope_root = n->annotations.count(attr::kTileDomain);
 
-    auto it = f->annotations.find(attr::tiled_buffer);
-    if (it != f->annotations.end()) {
-      Var buf = Downcast<Var>((*it).second);
-      if (buffers_.count(buf)) {
-        f.CopyOnWrite()->annotations.Set(
-            attr::kTileLoopStage,
-            Integer(static_cast<int>(TileLoopStage::kTiled)));
-      }
+    n->annotations.erase(attr::kTileLoopStage);
+    n->annotations.erase(attr::tile_level_loop);
+
+    if (!is_scope_root) {
+      n->annotations.erase(attr::tile_tile_size);
+      n->annotations.erase(attr::tile_execution_domain_axes);
     }
-
     return f;
   }
+};
 
-  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> buffers_;
+class TileAccessRewriter : public StmtExprMutator {
+public:
+  TileAccessRewriter(const std::vector<Var> &exec_vars,
+                     const std::vector<Var> &interior_vars,
+                     const Array<PrimExpr> &tile_size)
+      : exec_vars_(exec_vars), interior_vars_(interior_vars),
+        tile_size_(tile_size) {
+    ICHECK_EQ(exec_vars_.size(), interior_vars_.size());
+    ICHECK_EQ(exec_vars_.size(), tile_size_.size());
+
+    for (size_t i = 0; i < exec_vars_.size(); ++i) {
+      exec_var_nodes_.insert(exec_vars_[i].get());
+      subst_map_.emplace(exec_vars_[i],
+                         exec_vars_[i] * tile_size_[i] + interior_vars_[i]);
+    }
+  }
+
+  Stmt Rewrite(const Stmt &stmt) { return VisitStmt(stmt); }
+
+private:
+  bool UsesExecVar(const PrimExpr &expr) const {
+    return UsesVar(expr, [this](const VarNode *node) {
+      return exec_var_nodes_.count(node) != 0;
+    });
+  }
+
+  PrimExpr NormalizeAccessIndex(const PrimExpr &index) {
+    if (!UsesExecVar(index)) {
+      return analyzer_.Simplify(index);
+    }
+
+    // LegalizeTilesLoop already proved that every execution-bound access is
+    // affine, unit-coefficient, and tile-aligned. Lowering only needs to
+    // recover the matched execution axis and fold the offset into tile space.
+    Array<Var> exec_vars;
+    for (const Var &var : exec_vars_) {
+      exec_vars.push_back(var);
+    }
+
+    Array<PrimExpr> coeffs = arith::DetectLinearEquation(index, exec_vars);
+    ICHECK(!coeffs.empty()) << "Internal error: TilesLoop expected "
+                               "LegalizeTilesLoop to pre-validate "
+                               "an affine tile access index, but got "
+                            << index << ".";
+
+    int matched_axis = -1;
+    PrimExpr base = analyzer_.Simplify(coeffs[coeffs.size() - 1]);
+
+    for (size_t i = 0; i < exec_vars_.size(); ++i) {
+      PrimExpr coeff = analyzer_.Simplify(coeffs[i]);
+      PrimExpr zero = make_zero(coeff.dtype());
+      PrimExpr one = make_const(coeff.dtype(), 1);
+
+      if (analyzer_.CanProve(coeff == zero)) {
+        continue;
+      }
+      ICHECK(analyzer_.CanProve(coeff == one))
+          << "Internal error: TilesLoop expected a legalized tile access index "
+             "to use tile execution vars with unit coefficient, but got "
+             "coefficient "
+          << coeff << " in " << index << ".";
+      ICHECK_EQ(matched_axis, -1)
+          << "Internal error: TilesLoop expected a legalized tile access index "
+             "to depend on at most one tile execution var, but got "
+          << index << ".";
+      matched_axis = static_cast<int>(i);
+    }
+
+    ICHECK_GE(matched_axis, 0)
+        << "Internal error: TilesLoop expected a legalized tile access index "
+           "to bind one tile execution axis, but no matching axis was found "
+           "for "
+        << index << ".";
+
+    PrimExpr tile_extent = tile_size_[matched_axis];
+    PrimExpr remainder = analyzer_.Simplify(floormod(base, tile_extent));
+    ICHECK(analyzer_.CanProve(remainder == make_zero(remainder.dtype())))
+        << "Internal error: TilesLoop expected LegalizeTilesLoop to "
+           "pre-normalize "
+           "tile access offsets, but got offset "
+        << base << " with non-zero intra-tile remainder for index " << index
+        << ".";
+
+    PrimExpr tile_offset = analyzer_.Simplify(floordiv(base, tile_extent));
+    PrimExpr tile_coord =
+        analyzer_.Simplify(exec_vars_[matched_axis] + tile_offset);
+    return tile_coord * tile_extent + interior_vars_[matched_axis];
+  }
+
+  PrimExpr VisitExpr_(const VarNode *op) final {
+    Var var = ffi::GetRef<Var>(op);
+    auto it = subst_map_.find(var);
+    if (it != subst_map_.end()) {
+      return it->second;
+    }
+    return var;
+  }
+
+  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    Array<PrimExpr> indices;
+    for (const PrimExpr &index : op->indices) {
+      indices.push_back(NormalizeAccessIndex(index));
+    }
+    return BufferLoad(op->buffer, indices, op->predicate, op->span);
+  }
+
+  Stmt VisitStmt_(const BufferStoreNode *op) final {
+    Array<PrimExpr> indices;
+    for (const PrimExpr &index : op->indices) {
+      indices.push_back(NormalizeAccessIndex(index));
+    }
+    PrimExpr value = VisitExpr(op->value);
+    Optional<PrimExpr> predicate = op->predicate;
+    if (predicate.defined()) {
+      predicate = VisitExpr(predicate.value());
+    }
+    return BufferStore(op->buffer, value, indices, predicate, op->span);
+  }
+
+  arith::Analyzer analyzer_;
+  std::vector<Var> exec_vars_;
+  std::vector<Var> interior_vars_;
+  Array<PrimExpr> tile_size_;
+  std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual> subst_map_;
+  std::unordered_set<const VarNode *> exec_var_nodes_;
 };
 
 /*!
@@ -72,10 +189,9 @@ private:
  *           body
  *
  * Only for stage == kLegalized.
- * After rewrite, stage → kTiled (by buffer-group update).
  *
  * The 2D path is tolerant of non-trivial nesting between the
- * outer and inner tile.execution loops (LetStmt, AttrStmt, etc.
+ * outer and inner tile.execution_axis loops (LetStmt, AttrStmt, etc.
  * may appear in between).
  * ------------------------------------------------------------
  */
@@ -84,23 +200,19 @@ public:
   static PrimFunc Rewrite(PrimFunc f) {
     TilesLoopRewriter rewriter;
     f.CopyOnWrite()->body = rewriter(f->body);
-
-    // If any tiles loop was modified, update stage by semantic grouping
-    // When visiting tiles for node, we collect all tiled_buffers and
-    // update stage based on these buffers.
-    if (!rewriter.modified_tile_buffers_.empty()) {
-      StageUpdateRewriter updater(rewriter.modified_tile_buffers_);
-      f.CopyOnWrite()->body = updater(f->body);
-    }
-
+    f = FinalTileAttrCleanupRewriter::Rewrite(std::move(f));
     return f;
   }
 
 private:
   // ---- Predicates ----
 
-  static bool IsTilesScope(const ForNode *loop) {
-    return loop->annotations.count(attr::tile_execution_loop);
+  static bool IsTileExecutionLoop(const ForNode *loop) {
+    return loop->annotations.count(attr::tile_execution_axis);
+  }
+
+  static bool IsTilesRoot(const ForNode *loop) {
+    return loop->annotations.count(attr::kTileDomain);
   }
 
   static bool IsSerialFor(const ForNode *loop) {
@@ -109,6 +221,14 @@ private:
 
   static Optional<Array<PrimExpr>> GetTileSize(const ForNode *loop) {
     auto it = loop->annotations.find(attr::tile_tile_size);
+    if (it == loop->annotations.end()) {
+      return std::nullopt;
+    }
+    return Downcast<Array<PrimExpr>>((*it).second);
+  }
+
+  static Optional<Array<PrimExpr>> GetExecutionDomainAxes(const ForNode *loop) {
+    auto it = loop->annotations.find(attr::tile_execution_domain_axes);
     if (it == loop->annotations.end()) {
       return std::nullopt;
     }
@@ -124,45 +244,89 @@ private:
     return f;
   }
 
-  // ---- Helpers for tolerant nesting ----
+  struct ScopeExecInfo {
+    std::vector<const ForNode *> chain;
+    std::vector<const ForNode *> axis_to_loop;
+    const ForNode *outermost_exec{nullptr};
+    const ForNode *innermost_exec{nullptr};
+  };
 
-  /*!
-   * \brief Search for the inner tile.execution ForNode by peeling through
-   *        transparent wrapper statements (LetStmt, AttrStmt, AssertStmt).
-   *
-   * This makes the 2D lowering path tolerant of intermediate IR that
-   * earlier passes may have inserted between the outer and inner tile
-   * execution loops.
-   *
-   * \param body The statement to search within.
-   * \param tiled_buf Only match loops tied to this buffer.
-   * \return The inner ForNode if found, nullptr otherwise.
-   */
-  static const ForNode *PeelToInnerTileExecLoop(const Stmt &body,
-                                                const Var &tiled_buf) {
-    if (const auto *f = body.as<ForNode>()) {
-      if (f->annotations.count(attr::tile_execution_loop)) {
-        auto buf_it = f->annotations.find(attr::tiled_buffer);
-        if (buf_it != f->annotations.end() &&
-            Downcast<Var>((*buf_it).second).same_as(tiled_buf)) {
-          return f;
-        }
+  static int NormalizeDomainAxis(const PrimExpr &expr, int rank) {
+    const auto *imm = expr.as<IntImmNode>();
+    ICHECK(imm) << "tile.execution_domain_axes entries must be IntImm, but got "
+                << expr;
+    int mapped_dim = static_cast<int>(imm->value);
+    if (mapped_dim < 0) {
+      mapped_dim += rank;
+    }
+    ICHECK(mapped_dim >= 0 && mapped_dim < rank)
+        << "tile.execution_domain_axes entry " << expr
+        << " is out of bounds for rank " << rank << ".";
+    return mapped_dim;
+  }
+
+  static std::vector<const ForNode *>
+  CollectTileLoopChain(const ForNode *root) {
+    std::vector<const ForNode *> loops;
+    const ForNode *current = root;
+    while (current != nullptr &&
+           current->annotations.count(attr::tile_level_loop)) {
+      loops.push_back(current);
+      const auto *next = current->body.as<ForNode>();
+      if (next == nullptr || !next->annotations.count(attr::tile_level_loop)) {
+        break;
       }
-      // A ForNode that isn't the right tile.execution — stop peeling
-      return nullptr;
+      current = next;
     }
-    // Peel through transparent single-child wrappers
-    if (const auto *let = body.as<LetStmtNode>()) {
-      return PeelToInnerTileExecLoop(let->body, tiled_buf);
+    return loops;
+  }
+
+  static std::optional<ScopeExecInfo>
+  AnalyzeScopeExecution(const ForNode *root) {
+    ScopeExecInfo info;
+    info.chain = CollectTileLoopChain(root);
+    int domain_rank = static_cast<int>(info.chain.size());
+
+    // Decode the explicit execution-axis mapping emitted by
+    // LegalizeTilesLoop. TilesLoop should not be inferring this again.
+    auto execution_domain_axes_opt = GetExecutionDomainAxes(root);
+    ICHECK(execution_domain_axes_opt.defined())
+        << "TilesLoop requires tile.execution_domain_axes on the T.Tiles scope "
+           "root.";
+
+    Array<PrimExpr> execution_domain_axes = execution_domain_axes_opt.value();
+    info.axis_to_loop.resize(execution_domain_axes.size(), nullptr);
+
+    for (int axis = 0; axis < static_cast<int>(execution_domain_axes.size());
+         ++axis) {
+      int mapped_dim =
+          NormalizeDomainAxis(execution_domain_axes[axis], domain_rank);
+      const ForNode *mapped_loop = info.chain[mapped_dim];
+      ICHECK(IsTileExecutionLoop(mapped_loop))
+          << "tile.execution_domain_axes references loop dim " << mapped_dim
+          << " that is not marked as an execution loop.";
+      auto axis_it = mapped_loop->annotations.find(attr::tile_execution_axis);
+      ICHECK(axis_it != mapped_loop->annotations.end())
+          << "TilesLoop requires tile.execution_axis on every execution loop.";
+      int loop_axis = Downcast<Integer>((*axis_it).second)->value;
+      ICHECK_EQ(loop_axis, axis)
+          << "Execution loop for domain axis " << mapped_dim
+          << " carries tile.execution_axis=" << loop_axis
+          << " but was planned as axis " << axis << ".";
+      info.axis_to_loop[axis] = mapped_loop;
     }
-    if (const auto *attr_stmt = body.as<AttrStmtNode>()) {
-      return PeelToInnerTileExecLoop(attr_stmt->body, tiled_buf);
+
+    for (const ForNode *loop : info.chain) {
+      if (!IsTileExecutionLoop(loop)) {
+        continue;
+      }
+      if (info.outermost_exec == nullptr) {
+        info.outermost_exec = loop;
+      }
+      info.innermost_exec = loop;
     }
-    if (const auto *assert_stmt = body.as<AssertStmtNode>()) {
-      return PeelToInnerTileExecLoop(assert_stmt->body, tiled_buf);
-    }
-    // SeqStmt, IfThenElse, etc. — don't descend
-    return nullptr;
+
+    return info;
   }
 
   /*!
@@ -171,9 +335,9 @@ private:
    * Used to swap the inner tile.execution loop with its rewritten
    * version, preserving any wrapper statements in between.
    */
-  class InnerLoopReplacer : public StmtExprMutator {
+  class LoopReplacer : public StmtExprMutator {
   public:
-    InnerLoopReplacer(const ForNode *target, Stmt replacement)
+    LoopReplacer(const ForNode *target, Stmt replacement)
         : target_(target), replacement_(std::move(replacement)) {}
 
     Stmt VisitStmt_(const ForNode *loop) final {
@@ -194,15 +358,13 @@ private:
    * \param kind      kSerial for non-last axes, kVectorized for last axis.
    * \param body      The loop body.
    * \param axis      Which axis of the tile shape (0, 1, ...).
-   * \param tiled_buf The tiled buffer this loop belongs to.
    */
   static For MakeTileInteriorLoop(Var loop_var, PrimExpr extent, ForKind kind,
-                                  Stmt body, int axis, const Var &tiled_buf) {
+                                  Stmt body, int axis) {
     For loop(loop_var, Integer(0), extent, kind, body);
     auto *n = loop.CopyOnWrite();
     n->annotations.Set(attr::tile_interior, Integer(1));
     n->annotations.Set(attr::tile_interior_axis, Integer(axis));
-    n->annotations.Set(attr::tiled_buffer, tiled_buf);
     return loop;
   }
 
@@ -212,8 +374,7 @@ private:
     // Post-order traversal
     Stmt new_body = VisitStmt(loop->body);
 
-    // Only care about tile execution loops
-    if (!IsTilesScope(loop)) {
+    if (!IsTilesRoot(loop)) {
       return UpdateBody(loop, new_body);
     }
 
@@ -237,16 +398,10 @@ private:
     ICHECK(tile_size.size() == 1 || tile_size.size() == 2)
         << "TilesLoop expects 1D or 2D tile_size, got " << tile_size.size();
 
-    // ---- Record modified tile buffer (semantic grouping anchor) ----
-    auto buf_it = loop->annotations.find(attr::tiled_buffer);
-    ICHECK(buf_it != loop->annotations.end());
-    Var tiled_buf = Downcast<Var>((*buf_it).second);
-    modified_tile_buffers_.insert(tiled_buf);
-
     if (tile_size.size() == 1) {
-      return Rewrite1D(loop, new_body, tile_size, tiled_buf);
+      return Rewrite1D(loop, new_body, tile_size);
     }
-    return Rewrite2D(loop, new_body, tile_size, tiled_buf);
+    return Rewrite2D(loop, new_body, tile_size);
   }
 
   /*!
@@ -254,30 +409,42 @@ private:
    *   for ti → for ti (scope_entry) { for ki (interior, vec) { body } }
    */
   Stmt Rewrite1D(const ForNode *loop, Stmt new_body,
-                 const Array<PrimExpr> &tile_size, const Var &tiled_buf) {
-    if (!IsSerialFor(loop)) {
-      return UpdateBody(loop, new_body);
+                 const Array<PrimExpr> &tile_size) {
+    For scope_root = ffi::GetRef<For>(loop);
+    scope_root.CopyOnWrite()->body = new_body;
+
+    auto scope_info_opt = AnalyzeScopeExecution(scope_root.get());
+    if (!scope_info_opt.has_value()) {
+      return scope_root;
+    }
+    ScopeExecInfo &scope_info = scope_info_opt.value();
+    const ForNode *exec_loop = scope_info.axis_to_loop[0];
+    if (exec_loop == nullptr || !IsSerialFor(exec_loop)) {
+      return scope_root;
     }
 
-    Var ti = loop->loop_var;
+    Var ti = exec_loop->loop_var;
     Var ki("ki");
-
-    Map<Var, PrimExpr> vmap;
-    vmap.Set(ti, ti * tile_size[0] + ki);
-
-    Stmt tiled_body = Substitute(new_body, vmap);
+    TileAccessRewriter access_rewriter({ti}, {ki}, tile_size);
+    Stmt tiled_body = access_rewriter.Rewrite(exec_loop->body);
 
     // Create annotated interior loop
     For ki_loop =
         MakeTileInteriorLoop(ki, tile_size[0], ForKind::kVectorized, tiled_body,
-                             /*axis=*/0, tiled_buf);
+                             /*axis=*/0);
 
-    // Update outer loop: set scope_entry
-    For new_outer = ffi::GetRef<For>(loop);
-    auto *n = new_outer.CopyOnWrite();
+    For new_exec = ffi::GetRef<For>(exec_loop);
+    auto *n = new_exec.CopyOnWrite();
     n->body = ki_loop;
     n->annotations.Set(attr::tile_scope_entry, Integer(1));
-    return new_outer;
+
+    if (exec_loop == scope_root.get()) {
+      return new_exec;
+    }
+
+    scope_root.CopyOnWrite()->body =
+        LoopReplacer(exec_loop, new_exec)(scope_root->body);
+    return scope_root;
   }
 
   /*!
@@ -291,61 +458,63 @@ private:
    * Tolerant of LetStmt/AttrStmt/AssertStmt between ti and tj.
    */
   Stmt Rewrite2D(const ForNode *loop, Stmt new_body,
-                 const Array<PrimExpr> &tile_size, const Var &tiled_buf) {
-    // Find inner tile.execution loop, peeling through wrappers
-    const ForNode *inner = PeelToInnerTileExecLoop(new_body, tiled_buf);
-    if (!inner) {
-      return UpdateBody(loop, new_body);
+                 const Array<PrimExpr> &tile_size) {
+    For scope_root = ffi::GetRef<For>(loop);
+    scope_root.CopyOnWrite()->body = new_body;
+
+    auto scope_info_opt = AnalyzeScopeExecution(scope_root.get());
+    if (!scope_info_opt.has_value()) {
+      return scope_root;
+    }
+    ScopeExecInfo &scope_info = scope_info_opt.value();
+
+    const ForNode *outermost_exec = scope_info.outermost_exec;
+    const ForNode *innermost_exec = scope_info.innermost_exec;
+    const ForNode *axis0_loop = scope_info.axis_to_loop[0];
+    const ForNode *axis1_loop = scope_info.axis_to_loop[1];
+
+    if (outermost_exec == nullptr || innermost_exec == nullptr ||
+        axis0_loop == nullptr || axis1_loop == nullptr ||
+        !IsSerialFor(axis0_loop) || !IsSerialFor(axis1_loop)) {
+      return scope_root;
     }
 
-    if (!IsSerialFor(loop) || !IsSerialFor(inner)) {
-      return UpdateBody(loop, new_body);
-    }
-
-    Var ti = loop->loop_var;
-    Var tj = inner->loop_var;
+    Var ti = axis0_loop->loop_var;
+    Var tj = axis1_loop->loop_var;
 
     Var ki("ki");
     Var kj("kj");
-
-    Map<Var, PrimExpr> vmap;
-    vmap.Set(ti, ti * tile_size[0] + ki);
-    vmap.Set(tj, tj * tile_size[1] + kj);
-
-    Stmt tiled_body = Substitute(inner->body, vmap);
+    TileAccessRewriter access_rewriter({ti, tj}, {ki, kj}, tile_size);
+    Stmt tiled_body = access_rewriter.Rewrite(innermost_exec->body);
 
     // Create annotated interior loops
     For kj_loop =
         MakeTileInteriorLoop(kj, tile_size[1], ForKind::kVectorized, tiled_body,
-                             /*axis=*/1, tiled_buf);
+                             /*axis=*/1);
     For ki_loop =
         MakeTileInteriorLoop(ki, tile_size[0], ForKind::kSerial, kj_loop,
-                             /*axis=*/0, tiled_buf);
+                             /*axis=*/0);
 
-    // Replace inner loop's body with the tiled loops
-    For new_inner = ffi::GetRef<For>(inner);
-    new_inner.CopyOnWrite()->body = ki_loop;
+    // Replace the innermost execution loop body with the tiled loops.
+    For new_inner_exec = ffi::GetRef<For>(innermost_exec);
+    new_inner_exec.CopyOnWrite()->body = ki_loop;
 
-    // Replace inner loop in the body tree (tolerant of wrapper stmts)
-    Stmt replaced_body;
-    if (new_body.as<ForNode>() == inner) {
-      // Fast path: inner loop is the direct body
-      replaced_body = new_inner;
-    } else {
-      // General path: inner loop is behind wrapper stmts
-      replaced_body = InnerLoopReplacer(inner, new_inner)(new_body);
+    Stmt replaced_exec_body = LoopReplacer(innermost_exec, new_inner_exec)(
+        ffi::GetRef<For>(outermost_exec)->body);
+
+    For new_outer_exec = ffi::GetRef<For>(outermost_exec);
+    auto *n = new_outer_exec.CopyOnWrite();
+    n->body = replaced_exec_body;
+    n->annotations.Set(attr::tile_scope_entry, Integer(1));
+
+    if (outermost_exec == scope_root.get()) {
+      return new_outer_exec;
     }
 
-    // Update outer loop: set scope_entry
-    For new_outer = ffi::GetRef<For>(loop);
-    auto *n = new_outer.CopyOnWrite();
-    n->body = replaced_body;
-    n->annotations.Set(attr::tile_scope_entry, Integer(1));
-    return new_outer;
+    scope_root.CopyOnWrite()->body =
+        LoopReplacer(outermost_exec, new_outer_exec)(scope_root->body);
+    return scope_root;
   }
-
-private:
-  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> modified_tile_buffers_;
 };
 
 /*!
