@@ -78,10 +78,8 @@ struct WindowPlannerInput {
   std::unordered_map<std::string, DynamicBitset> raw_consumer_masks_by_key;
 };
 
-WindowPlannerInput BuildWindowPlannerInput(
-    const std::vector<TileScopeRegionSummary> &regions,
-    const std::vector<NormalizedTileScopeRegionSummary> &normalized_regions,
-    const TileScopeWindowGraphSummary &graph);
+WindowPlannerInput
+BuildWindowPlannerInput(const SunmmioTileLoopFusionWindowProblem &problem);
 
 enum class ResidentValueKind : int {
   kDefinition = 0,
@@ -147,7 +145,7 @@ TransitionResult ApplyAction(const WindowPlannerInput &input,
 
 struct MemoResult {
   SunmmioTileLoopFusionPlannerScore score;
-  std::vector<SunmmioTileLoopFusionPlannerActionSummary> actions;
+  std::vector<SunmmioTileLoopFusionPlannerAction> actions;
 };
 
 struct PlannerSearchContext {
@@ -159,8 +157,8 @@ MemoResult BuildSourceOrderFallbackPlan(const WindowPlannerInput &input);
 MemoResult SolveWindowPlan(const WindowPlannerInput &input,
                            const PlannerState &state,
                            PlannerSearchContext *context);
-std::vector<SunmmioTileLoopFusionPlannerTreeNode> BuildPlanTree(
-    const std::vector<SunmmioTileLoopFusionPlannerActionSummary> &actions);
+std::vector<SunmmioTileLoopFusionPlannerTreeNode>
+BuildPlanTree(const std::vector<SunmmioTileLoopFusionPlannerAction> &actions);
 
 } // namespace detail
 } // namespace tl

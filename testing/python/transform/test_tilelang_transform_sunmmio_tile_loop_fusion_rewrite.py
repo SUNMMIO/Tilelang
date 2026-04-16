@@ -149,7 +149,7 @@ def test_sunmmio_tile_loop_fusion_rewrites_consecutive_tile_scopes():
     mod = IRModule.from_expr(two_consecutive_tile_scopes_kernel().with_attr("global_symbol", "main"))
     mod = apply_sunmmio_tile_loop_fusion(mod)
 
-    summary = get_debug_summary(mod)
+    discovery = get_discovery_summary(mod)
     stmts = _tilelang_root_seq(mod)
     fused_loop = _expect_single_match(
         _find_scope_entry_loops(stmts, tile_size=[8, 32], extent=4),
@@ -157,9 +157,9 @@ def test_sunmmio_tile_loop_fusion_rewrites_consecutive_tile_scopes():
         "fused [8, 32] tile shell with Tmp_shared then B_shared semantics",
     )
 
-    assert summary["region_count"] == 1
-    assert summary["window_count"] == 1
-    assert summary["window_lengths"] == [1]
+    assert discovery["region_count"] == 1
+    assert discovery["region_run_count"] == 1
+    assert discovery["region_run_lengths"] == [1]
     assert _semantic_tags(_expect_loop_body_seq(fused_loop)) == ["Tmp_shared", "B_shared"]
 
 
@@ -167,7 +167,7 @@ def test_sunmmio_tile_loop_fusion_rewrites_flash_attention_window():
     mod = IRModule.from_expr(flash_attention_online_softmax_tiled_kernel().with_attr("global_symbol", "main"))
     mod = apply_sunmmio_tile_loop_fusion(mod)
 
-    summary = get_debug_summary(mod)
+    discovery = get_discovery_summary(mod)
     stmts = _tilelang_root_seq(mod)
     fused_row = _expect_single_match(
         _find_scope_entry_loops(stmts, tile_size=[32], extent=1),
@@ -180,9 +180,9 @@ def test_sunmmio_tile_loop_fusion_rewrites_flash_attention_window():
         "fused flash tile shell realizing acc_s, acc_s_cast, then reduce_scores_sum",
     )
 
-    assert summary["region_count"] == 7
-    assert summary["window_count"] == 1
-    assert summary["window_lengths"] == [7]
+    assert discovery["region_count"] == 7
+    assert discovery["region_run_count"] == 1
+    assert discovery["region_run_lengths"] == [7]
     assert _semantic_tags(_expect_loop_body_seq(fused_row)) == ["scores_max", "scores_scale"]
     assert _semantic_tags(_expect_loop_body_seq(fused_tile)) == ["acc_s", "acc_s_cast", "reduce_scores_sum"]
 
@@ -223,12 +223,12 @@ def test_sunmmio_tile_loop_fusion_rewrite_hoists_common_attr_wrapper():
     mod = IRModule.from_expr(attr_wrapped_two_region_lowered_kernel().with_attr("global_symbol", "main"))
     mod = tl.transform.SunmmioTileLoopFusion()(mod)
 
-    summary = get_debug_summary(mod)
+    discovery = get_discovery_summary(mod)
     root_stmts = _root_seq(mod)
 
-    assert summary["region_count"] == 1
-    assert summary["window_count"] == 1
-    assert summary["window_lengths"] == [1]
+    assert discovery["region_count"] == 1
+    assert discovery["region_run_count"] == 1
+    assert discovery["region_run_lengths"] == [1]
 
     attr_stmt = _expect_single_match(
         root_stmts,
@@ -248,12 +248,12 @@ def test_sunmmio_tile_loop_fusion_rewrite_preserves_local_let_wrappers():
     mod = IRModule.from_expr(let_wrapped_two_region_lowered_kernel().with_attr("global_symbol", "main"))
     mod = tl.transform.SunmmioTileLoopFusion()(mod)
 
-    summary = get_debug_summary(mod)
+    discovery = get_discovery_summary(mod)
     root_stmts = _root_seq(mod)
 
-    assert summary["region_count"] == 1
-    assert summary["window_count"] == 1
-    assert summary["window_lengths"] == [1]
+    assert discovery["region_count"] == 1
+    assert discovery["region_run_count"] == 1
+    assert discovery["region_run_lengths"] == [1]
 
     let_stmt = _expect_single_match(
         root_stmts,
@@ -276,12 +276,12 @@ def test_sunmmio_tile_loop_fusion_rewrite_preserves_local_let_in_mixed_cluster()
     mod = IRModule.from_expr(mixed_plain_and_let_wrapped_two_region_lowered_kernel().with_attr("global_symbol", "main"))
     mod = tl.transform.SunmmioTileLoopFusion()(mod)
 
-    summary = get_debug_summary(mod)
+    discovery = get_discovery_summary(mod)
     root_stmts = _root_seq(mod)
 
-    assert summary["region_count"] == 1
-    assert summary["window_count"] == 1
-    assert summary["window_lengths"] == [1]
+    assert discovery["region_count"] == 1
+    assert discovery["region_run_count"] == 1
+    assert discovery["region_run_lengths"] == [1]
 
     fused_loop = _expect_single_match(
         root_stmts,
@@ -300,12 +300,12 @@ def test_sunmmio_tile_loop_fusion_rewrites_rmsnorm_window_structurally():
     mod = IRModule.from_expr(rms_norm_tiled_kernel().with_attr("global_symbol", "main"))
     mod = apply_sunmmio_tile_loop_fusion(mod)
 
-    summary = get_debug_summary(mod)
+    discovery = get_discovery_summary(mod)
     stmts = _tilelang_root_seq(mod)
 
-    assert summary["region_count"] == 4
-    assert summary["window_count"] == 1
-    assert summary["window_lengths"] == [4]
+    assert discovery["region_count"] == 4
+    assert discovery["region_run_count"] == 1
+    assert discovery["region_run_lengths"] == [4]
 
     fused_tile = _expect_single_match(
         _find_scope_entry_loops(stmts, tile_size=[4, 32], extent=8),

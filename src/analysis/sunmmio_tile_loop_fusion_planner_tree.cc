@@ -31,14 +31,14 @@ FreezeTree(const std::shared_ptr<MutablePlannerTreeNode> &node) {
 
 } // namespace
 
-std::vector<SunmmioTileLoopFusionPlannerTreeNode> BuildPlanTree(
-    const std::vector<SunmmioTileLoopFusionPlannerActionSummary> &actions) {
+std::vector<SunmmioTileLoopFusionPlannerTreeNode>
+BuildPlanTree(const std::vector<SunmmioTileLoopFusionPlannerAction> &actions) {
   auto root = std::make_shared<MutablePlannerTreeNode>();
   root->is_scope = true;
 
   std::vector<std::shared_ptr<MutablePlannerTreeNode>> open_path;
   open_path.push_back(root);
-  for (const SunmmioTileLoopFusionPlannerActionSummary &action : actions) {
+  for (const SunmmioTileLoopFusionPlannerAction &action : actions) {
     while (static_cast<int>(open_path.size()) - 1 > action.close_to_depth) {
       open_path.pop_back();
     }

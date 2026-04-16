@@ -1,3 +1,9 @@
+// Rewrite stage for Sunmmio tile loop fusion.
+//
+// This file consumes the original planner-visible program plus the chosen plan
+// for each window and emits the rewritten TIR. It deliberately does not know
+// how regions are discovered or how schedules are chosen.
+
 #include "../analysis/sunmmio_tile_loop_fusion_analysis.h"
 #include "../analysis/sunmmio_tile_loop_fusion_planner.h"
 #include "../analysis/sunmmio_tile_loop_fusion_utils.h"
@@ -38,7 +44,7 @@ private:
 };
 
 Map<Var, PrimExpr>
-BuildSharedLoopVarSubst(const TileScopeRegionSummary &region,
+BuildSharedLoopVarSubst(const TileScopeRegion &region,
                         const std::vector<Var> &shared_loop_vars) {
   Map<Var, PrimExpr> subst;
   int limit = std::min(static_cast<int>(region.execution_loops.size()),
@@ -50,7 +56,7 @@ BuildSharedLoopVarSubst(const TileScopeRegionSummary &region,
 }
 
 bool AttrReferencesExecutionLoops(const AttrStmt &attr,
-                                  const TileScopeRegionSummary &region) {
+                                  const TileScopeRegion &region) {
   std::unordered_set<const VarNode *> execution_vars;
   for (const For &loop : region.execution_loops) {
     execution_vars.insert(loop->loop_var.get());
@@ -70,7 +76,7 @@ bool AttrReferencesExecutionLoops(const AttrStmt &attr,
 }
 
 std::vector<AttrStmt>
-ExtractLeadingHoistableAttrPrefix(const TileScopeRegionSummary &region) {
+ExtractLeadingHoistableAttrPrefix(const TileScopeRegion &region) {
   std::vector<AttrStmt> attrs;
   Stmt current = region.root_stmt;
   while (!current.same_as(region.scope_entry_for)) {
@@ -88,7 +94,7 @@ ExtractLeadingHoistableAttrPrefix(const TileScopeRegionSummary &region) {
   return attrs;
 }
 
-Stmt StripLeadingHoistableAttrPrefix(const TileScopeRegionSummary &region,
+Stmt StripLeadingHoistableAttrPrefix(const TileScopeRegion &region,
                                      int strip_count) {
   Stmt current = region.root_stmt;
   for (int i = 0; i < strip_count; ++i) {
@@ -122,8 +128,7 @@ CollectLeafRegionIndices(const SunmmioTileLoopFusionPlannerTreeNode &node) {
 
 std::vector<AttrStmt> CollectCommonHoistableAttrPrefix(
     const SunmmioTileLoopFusionPlannerTreeNode &node,
-    const std::vector<TileScopeRegionSummary> &regions,
-    int already_hoisted_attrs) {
+    const std::vector<TileScopeRegion> &regions, int already_hoisted_attrs) {
   std::vector<int> leaf_region_indices = CollectLeafRegionIndices(node);
   if (leaf_region_indices.empty()) {
     return {};
@@ -164,7 +169,7 @@ Stmt ReapplyAttrPrefix(const std::vector<AttrStmt> &attrs, Stmt body) {
   return body;
 }
 
-Stmt BuildPrivateExecutionSuffix(const TileScopeRegionSummary &region,
+Stmt BuildPrivateExecutionSuffix(const TileScopeRegion &region,
                                  int shared_depth,
                                  const std::vector<Var> &shared_loop_vars) {
   Map<Var, PrimExpr> subst = BuildSharedLoopVarSubst(region, shared_loop_vars);
@@ -183,7 +188,7 @@ Stmt BuildPrivateExecutionSuffix(const TileScopeRegionSummary &region,
   return body;
 }
 
-Stmt BuildRegionLeaf(const TileScopeRegionSummary &region, int shared_depth,
+Stmt BuildRegionLeaf(const TileScopeRegion &region, int shared_depth,
                      const std::vector<Var> &shared_loop_vars,
                      int hoisted_attr_prefix_count) {
   Stmt stripped_root =
@@ -213,19 +218,17 @@ int FindFirstLeafRegionIndex(const SunmmioTileLoopFusionPlannerTreeNode &node) {
 Stmt BuildPlannedStmtList(
     const std::vector<SunmmioTileLoopFusionPlannerTreeNode> &nodes,
     int parent_depth, const std::vector<Var> &shared_loop_vars,
-    const std::vector<TileScopeRegionSummary> &regions,
-    int hoisted_attr_prefix_count);
+    const std::vector<TileScopeRegion> &regions, int hoisted_attr_prefix_count);
 
 Stmt BuildScopeNode(const SunmmioTileLoopFusionPlannerTreeNode &node,
                     int parent_depth, const std::vector<Var> &shared_loop_vars,
-                    const std::vector<TileScopeRegionSummary> &regions,
+                    const std::vector<TileScopeRegion> &regions,
                     int hoisted_attr_prefix_count) {
   int scope_depth = static_cast<int>(node.shell_axes.size());
   ICHECK_GT(scope_depth, parent_depth);
   int representative_region_index = FindFirstLeafRegionIndex(node);
   ICHECK_GE(representative_region_index, 0);
-  const TileScopeRegionSummary &representative =
-      regions[representative_region_index];
+  const TileScopeRegion &representative = regions[representative_region_index];
 
   std::vector<AttrStmt> common_attrs = CollectCommonHoistableAttrPrefix(
       node, regions, hoisted_attr_prefix_count);
@@ -256,7 +259,7 @@ Stmt BuildScopeNode(const SunmmioTileLoopFusionPlannerTreeNode &node,
 Stmt BuildPlannedStmtList(
     const std::vector<SunmmioTileLoopFusionPlannerTreeNode> &nodes,
     int parent_depth, const std::vector<Var> &shared_loop_vars,
-    const std::vector<TileScopeRegionSummary> &regions,
+    const std::vector<TileScopeRegion> &regions,
     int hoisted_attr_prefix_count) {
   Array<Stmt> stmts;
   stmts.reserve(nodes.size());
@@ -275,15 +278,14 @@ Stmt BuildPlannedStmtList(
 }
 
 struct WindowRewriteSpec {
-  std::vector<int> region_indices;
+  TileScopeRegionRun source_region_run;
   std::vector<SunmmioTileLoopFusionPlannerTreeNode> tree;
 };
 
 class SunmmioTileLoopFusionRewriter : public StmtExprMutator {
 public:
-  SunmmioTileLoopFusionRewriter(
-      const std::vector<TileScopeRegionSummary> &regions,
-      const std::vector<WindowRewriteSpec> &windows)
+  SunmmioTileLoopFusionRewriter(const std::vector<TileScopeRegion> &regions,
+                                const std::vector<WindowRewriteSpec> &windows)
       : regions_(regions), windows_(windows) {}
 
   Stmt Rewrite(const Stmt &stmt) { return VisitStmt(stmt); }
@@ -291,13 +293,17 @@ public:
 private:
   bool MatchWindowAt(const Array<Stmt> &seq, int start,
                      const WindowRewriteSpec &window) const {
-    if (start + static_cast<int>(window.region_indices.size()) >
+    if (start + window.source_region_run.num_regions >
         static_cast<int>(seq.size())) {
       return false;
     }
-    for (size_t i = 0; i < window.region_indices.size(); ++i) {
-      if (!seq[start + static_cast<int>(i)].same_as(
-              regions_[window.region_indices[i]].root_stmt)) {
+    for (int region_offset = 0;
+         region_offset < window.source_region_run.num_regions;
+         ++region_offset) {
+      int region_index =
+          window.source_region_run.begin_region_index + region_offset;
+      if (!seq[start + region_offset].same_as(
+              regions_[region_index].root_stmt)) {
         return false;
       }
     }
@@ -315,7 +321,7 @@ private:
         }
         rewritten.push_back(
             BuildPlannedStmtList(window.tree, 0, {}, regions_, 0));
-        i += static_cast<int>(window.region_indices.size());
+        i += window.source_region_run.num_regions;
         matched = true;
         break;
       }
@@ -327,32 +333,32 @@ private:
     return SeqStmt::Flatten(rewritten);
   }
 
-  const std::vector<TileScopeRegionSummary> &regions_;
+  const std::vector<TileScopeRegion> &regions_;
   const std::vector<WindowRewriteSpec> &windows_;
 };
 
 PrimFunc RewriteSunmmioTileLoopFusion(
-    PrimFunc func, const std::vector<TileScopeRegionSummary> &regions,
-    const std::vector<TileScopeWindowSummary> &windows,
-    const std::vector<SunmmioTileLoopFusionWindowPlanSummary> &plans) {
-  ICHECK_EQ(windows.size(), plans.size())
+    PrimFunc func, const SunmmioTileLoopFusionProgram &program,
+    const std::vector<SunmmioTileLoopFusionWindowPlan> &plans) {
+  ICHECK_EQ(program.region_runs.size(), plans.size())
       << "Expected one rewrite plan per fusion window, but got "
-      << windows.size() << " windows and " << plans.size() << " plans.";
+      << program.region_runs.size() << " windows and " << plans.size()
+      << " plans.";
 
   std::vector<WindowRewriteSpec> rewrite_windows;
-  rewrite_windows.reserve(windows.size());
-  for (size_t i = 0; i < windows.size(); ++i) {
+  rewrite_windows.reserve(program.region_runs.size());
+  for (size_t i = 0; i < program.region_runs.size(); ++i) {
     if (plans[i].tree.empty()) {
       continue;
     }
-    rewrite_windows.push_back({windows[i].region_indices, plans[i].tree});
+    rewrite_windows.push_back({program.region_runs[i], plans[i].tree});
   }
   if (rewrite_windows.empty()) {
     return func;
   }
 
   PrimFuncNode *node = func.CopyOnWrite();
-  node->body = SunmmioTileLoopFusionRewriter(regions, rewrite_windows)
+  node->body = SunmmioTileLoopFusionRewriter(program.regions, rewrite_windows)
                    .Rewrite(node->body);
   return func;
 }
@@ -364,15 +370,13 @@ tvm::transform::Pass SunmmioTileLoopFusion() {
     for (const auto &kv : mod->functions) {
       if (const auto *prim = kv.second.as<tir::PrimFuncNode>()) {
         tir::PrimFunc func = ffi::GetRef<tir::PrimFunc>(prim);
-        std::vector<TileScopeRegionSummary> regions =
-            AnalyzeSunmmioTileLoopFusionRegions(func);
-        std::vector<TileScopeWindowSummary> windows =
-            BuildSunmmioTileLoopFusionWindows(func);
-        std::vector<TileScopeWindowGraphSummary> graphs =
-            BuildSunmmioTileLoopFusionLegalityGraphs(regions, windows);
-        std::vector<SunmmioTileLoopFusionWindowPlanSummary> plans =
-            PlanSunmmioTileLoopFusionWindows(regions, windows, graphs);
-        func = RewriteSunmmioTileLoopFusion(func, regions, windows, plans);
+        SunmmioTileLoopFusionProgram program =
+            BuildSunmmioTileLoopFusionProgram(func);
+        std::vector<SunmmioTileLoopFusionWindowProblem> problems =
+            BuildSunmmioTileLoopFusionWindowProblems(program);
+        std::vector<SunmmioTileLoopFusionWindowPlan> plans =
+            PlanSunmmioTileLoopFusionWindowProblems(problems);
+        func = RewriteSunmmioTileLoopFusion(func, program, plans);
         mod->Add(kv.first, func, true);
       }
     }

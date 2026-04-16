@@ -1,6 +1,12 @@
 #pragma once
 
-#include "sunmmio_tile_loop_fusion_analysis.h"
+// Utility helpers shared by discovery and planning.
+//
+// These helpers do not define stage boundaries themselves. They exist to keep
+// recurring logical-axis normalization and variable-collection code out of the
+// higher-level analysis and planner entrypoints.
+
+#include "sunmmio_tile_loop_fusion_protocol.h"
 
 #include <tvm/tir/stmt_functor.h>
 
@@ -12,12 +18,9 @@
 namespace tvm {
 namespace tl {
 
-struct NormalizedTileScopeRegionSummary {
-  Array<tir::BufferRegion> use_in;
-  Array<tir::BufferRegion> def_out;
-};
-
 String PrimExprToString(const PrimExpr &expr);
+
+const char *DependenceKindToCString(TileScopeDependenceKind kind);
 
 class VarUseCollector : public tir::ExprVisitor {
 public:
@@ -28,14 +31,14 @@ private:
 };
 
 Map<tir::Var, PrimExpr> BuildLogicalExecutionAxisSubstitution(
-    const TileScopeRegionSummary &region,
+    const TileScopeRegion &region,
     std::unordered_map<std::string, tir::Var> *canonical_execution_vars);
 
 tir::BufferRegion NormalizeBufferRegionByLogicalExecutionAxes(
     const tir::BufferRegion &region, const Map<tir::Var, PrimExpr> &subst);
 
-std::vector<NormalizedTileScopeRegionSummary>
-NormalizeRegionBoundaries(const std::vector<TileScopeRegionSummary> &regions);
+std::vector<NormalizedTileScopeRegion>
+NormalizeRegionBoundaries(const std::vector<TileScopeRegion> &regions);
 
 } // namespace tl
 } // namespace tvm

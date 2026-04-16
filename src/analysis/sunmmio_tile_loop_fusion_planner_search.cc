@@ -151,7 +151,7 @@ MemoResult BuildSourceOrderFallbackPlan(const WindowPlannerInput &input) {
       fallback.score = AddSunmmioTileLoopFusionPlannerScores(fallback.score,
                                                              transition.delta);
 
-      SunmmioTileLoopFusionPlannerActionSummary action;
+      SunmmioTileLoopFusionPlannerAction action;
       action.region_index =
           input.regions[region_local_index].global_region_index;
       action.close_to_depth = 0;
@@ -244,7 +244,7 @@ MemoResult SolveWindowPlan(const WindowPlannerInput &input,
           continue;
         }
 
-        SunmmioTileLoopFusionPlannerActionSummary action;
+        SunmmioTileLoopFusionPlannerAction action;
         action.region_index = region.global_region_index;
         action.close_to_depth = close_to_depth;
         action.open_to_depth = open_to_depth;

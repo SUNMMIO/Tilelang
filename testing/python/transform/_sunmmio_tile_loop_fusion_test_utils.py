@@ -34,103 +34,130 @@ def apply_sunmmio_tile_loop_fusion(mod):
     return tl.transform.SunmmioTileLoopFusion()(mod)
 
 
-def get_debug_summary(mod):
-    debug_func = tvm.get_global_func("tl.analysis.DebugSunmmioTileLoopFusionAnalysisSummary")
-    summary = debug_func(mod)
+def _to_buffer_region_dict(region):
+    return {
+        "buffer": str(region["buffer"]),
+        "mins": [str(x) for x in region["mins"]],
+        "extents": [str(x) for x in region["extents"]],
+    }
 
-    def to_buffer_region_dict(region):
-        return {
-            "buffer": str(region["buffer"]),
-            "mins": [str(x) for x in region["mins"]],
-            "extents": [str(x) for x in region["extents"]],
-        }
 
-    def to_region_dict(region):
-        return {
-            "root_loop_var": str(region["root_loop_var"]),
-            "execution_loop_vars": [str(x) for x in region["execution_loop_vars"]],
-            "logical_execution_axes": [str(x) for x in region["logical_execution_axes"]],
-            "execution_loop_extents": [str(x) for x in region["execution_loop_extents"]],
-            "sig_rank": int(region["sig_rank"]),
-            "sig_tile_shape": [int(x) for x in region["sig_tile_shape"]],
-            "sig_execution_axis_to_loop_index": [int(x) for x in region["sig_execution_axis_to_loop_index"]],
-            "use_in": [to_buffer_region_dict(x) for x in region["use_in"]],
-            "def_out": [to_buffer_region_dict(x) for x in region["def_out"]],
-            "available_at_execution_depths": [int(x) for x in region["available_at_execution_depths"]],
-        }
+def _to_region_run_dict(region_run):
+    return {
+        "begin_region_index": int(region_run["begin_region_index"]),
+        "num_regions": int(region_run["num_regions"]),
+    }
 
-    def to_weight(value):
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return str(value)
 
-    def to_edge_dict(edge):
-        return {
-            "src": int(edge["src"]),
-            "dst": int(edge["dst"]),
-            "kind": str(edge["kind"]),
-            "buffer_region": to_buffer_region_dict(edge["buffer_region"]),
-            "rho": int(edge["rho"]),
-            "w": to_weight(edge["w"]),
-        }
+def _to_region_dict(region):
+    return {
+        "root_loop_var": str(region["root_loop_var"]),
+        "execution_loop_vars": [str(x) for x in region["execution_loop_vars"]],
+        "logical_execution_axes": [str(x) for x in region["logical_execution_axes"]],
+        "execution_loop_extents": [str(x) for x in region["execution_loop_extents"]],
+        "use_in": [_to_buffer_region_dict(x) for x in region["use_in"]],
+        "def_out": [_to_buffer_region_dict(x) for x in region["def_out"]],
+        "available_at_execution_depths": [int(x) for x in region["available_at_execution_depths"]],
+    }
 
-    def to_graph_dict(graph):
-        return {
-            "region_indices": [int(x) for x in graph["region_indices"]],
-            "edges": [to_edge_dict(x) for x in graph["edges"]],
-        }
 
-    def to_bool(value):
-        text = str(value)
-        if text in ("True", "T.bool(True)"):
-            return True
-        if text in ("False", "T.bool(False)"):
-            return False
-        raise ValueError(f"Unsupported boolean value: {value}")
+def _to_edge_dict(edge):
+    return {
+        "src": int(edge["src"]),
+        "dst": int(edge["dst"]),
+        "kind": str(edge["kind"]),
+        "src_access_index": int(edge["src_access_index"]),
+        "dst_access_index": int(edge["dst_access_index"]),
+        "buffer": str(edge["buffer"]),
+        "debug_overlap_region": _to_buffer_region_dict(edge["debug_overlap_region"]),
+        "rho": int(edge["rho"]),
+        "weight_bytes": int(edge["weight_bytes"]),
+    }
 
-    def to_score_dict(score):
-        return {
-            "write_cut_cost": int(score["write_cut_cost"]),
-            "shared_read_cost": int(score["shared_read_cost"]),
-            "live_range_penalty": int(score["live_range_penalty"]),
-            "reorder_penalty": int(score["reorder_penalty"]),
-        }
 
-    def to_action_dict(action):
-        return {
-            "region_index": int(action["region_index"]),
-            "close_to_depth": int(action["close_to_depth"]),
-            "open_to_depth": int(action["open_to_depth"]),
-            "opened_shells": [[str(axis) for axis in shell] for shell in action["opened_shells"]],
-            "opened_shell_extents": [[str(extent) for extent in shell] for shell in action["opened_shell_extents"]],
-        }
+def _to_graph_dict(graph):
+    return {
+        "region_indices": [int(x) for x in graph["region_indices"]],
+        "edges": [_to_edge_dict(x) for x in graph["edges"]],
+    }
 
-    def to_tree_node_dict(node):
-        return {
-            "is_scope": to_bool(node["is_scope"]),
-            "region_index": int(node["region_index"]),
-            "shell_axes": [str(axis) for axis in node["shell_axes"]],
-            "shell_extents": [str(extent) for extent in node["shell_extents"]],
-            "children": [to_tree_node_dict(child) for child in node["children"]],
-        }
 
-    def to_plan_dict(plan):
-        return {
-            "region_indices": [int(x) for x in plan["region_indices"]],
-            "order": [int(x) for x in plan["order"]],
-            "score": to_score_dict(plan["score"]),
-            "actions": [to_action_dict(x) for x in plan["actions"]],
-            "tree": [to_tree_node_dict(x) for x in plan["tree"]],
-        }
+def _to_bool(value):
+    text = str(value)
+    if text in ("True", "T.bool(True)"):
+        return True
+    if text in ("False", "T.bool(False)"):
+        return False
+    raise ValueError(f"Unsupported boolean value: {value}")
 
+
+def _to_score_dict(score):
+    return {
+        "write_cut_cost": int(score["write_cut_cost"]),
+        "shared_read_cost": int(score["shared_read_cost"]),
+        "live_range_penalty": int(score["live_range_penalty"]),
+        "reorder_penalty": int(score["reorder_penalty"]),
+    }
+
+
+def _to_action_dict(action):
+    return {
+        "region_index": int(action["region_index"]),
+        "close_to_depth": int(action["close_to_depth"]),
+        "open_to_depth": int(action["open_to_depth"]),
+        "opened_shells": [[str(axis) for axis in shell] for shell in action["opened_shells"]],
+        "opened_shell_extents": [[str(extent) for extent in shell] for shell in action["opened_shell_extents"]],
+    }
+
+
+def _to_tree_node_dict(node):
+    return {
+        "is_scope": _to_bool(node["is_scope"]),
+        "region_index": int(node["region_index"]),
+        "shell_axes": [str(axis) for axis in node["shell_axes"]],
+        "shell_extents": [str(extent) for extent in node["shell_extents"]],
+        "children": [_to_tree_node_dict(child) for child in node["children"]],
+    }
+
+
+def _to_plan_dict(plan):
+    return {
+        "region_indices": [int(x) for x in plan["region_indices"]],
+        "order": [int(x) for x in plan["order"]],
+        "score": _to_score_dict(plan["score"]),
+        "actions": [_to_action_dict(x) for x in plan["actions"]],
+        "tree": [_to_tree_node_dict(x) for x in plan["tree"]],
+    }
+
+
+def get_discovery_summary(mod):
+    explain_func = tvm.get_global_func("tl.analysis.ExplainSunmmioTileLoopFusionDiscovery")
+    summary = explain_func(mod)
     return {
         "region_count": int(summary["region_count"]),
-        "window_count": int(summary["window_count"]),
-        "window_lengths": [int(x) for x in summary["window_lengths"]],
-        "regions": [to_region_dict(x) for x in summary["regions"]],
-        "graphs": [to_graph_dict(x) for x in summary["graphs"]],
-        "plans": [to_plan_dict(x) for x in summary["plans"]],
+        "region_run_count": int(summary["region_run_count"]),
+        "region_run_lengths": [int(x) for x in summary["region_run_lengths"]],
+        "region_runs": [_to_region_run_dict(x) for x in summary["region_runs"]],
+        "regions": [_to_region_dict(x) for x in summary["regions"]],
+    }
+
+
+def get_dependence_summary(mod):
+    explain_func = tvm.get_global_func("tl.analysis.ExplainSunmmioTileLoopFusionDependence")
+    summary = explain_func(mod)
+    return {
+        "region_run_count": int(summary["region_run_count"]),
+        "region_run_lengths": [int(x) for x in summary["region_run_lengths"]],
+        "graphs": [_to_graph_dict(x) for x in summary["graphs"]],
+    }
+
+
+def get_plan_summary(mod):
+    explain_func = tvm.get_global_func("tl.analysis.ExplainSunmmioTileLoopFusionPlan")
+    summary = explain_func(mod)
+    return {
+        "plan_count": int(summary["plan_count"]),
+        "plans": [_to_plan_dict(x) for x in summary["plans"]],
     }
 
 
@@ -195,9 +222,9 @@ def graph_edge_keys(graph):
             edge["src"],
             edge["dst"],
             edge["kind"],
-            edge["buffer_region"]["buffer"],
+            edge["buffer"],
             edge["rho"],
-            edge["w"],
+            edge["weight_bytes"],
         )
         for edge in graph["edges"]
     }

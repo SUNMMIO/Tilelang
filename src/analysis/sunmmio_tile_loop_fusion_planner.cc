@@ -1,3 +1,10 @@
+// Exact planning entrypoints for Sunmmio tile loop fusion.
+//
+// This file owns the transition from a window-local semantic problem to a
+// chosen schedule. The DP/search machinery below is intentionally opaque to
+// callers; the public contract is a vector of window problems in, a vector of
+// window plans out.
+
 #include "sunmmio_tile_loop_fusion_planner_internal.h"
 
 #include <tvm/ffi/reflection/registry.h>
@@ -129,23 +136,14 @@ Map<String, ffi::Any> DebugSunmmioTileLoopFusionRawCoverageAccounting() {
   return summary;
 }
 
-std::vector<SunmmioTileLoopFusionWindowPlanSummary>
-PlanSunmmioTileLoopFusionWindows(
-    const std::vector<TileScopeRegionSummary> &regions,
-    const std::vector<TileScopeWindowSummary> &windows,
-    const std::vector<TileScopeWindowGraphSummary> &graphs) {
-  ICHECK_EQ(windows.size(), graphs.size())
-      << "Expected one legality graph per tile-scope window";
+std::vector<SunmmioTileLoopFusionWindowPlan>
+PlanSunmmioTileLoopFusionWindowProblems(
+    const std::vector<SunmmioTileLoopFusionWindowProblem> &problems) {
+  std::vector<SunmmioTileLoopFusionWindowPlan> plans;
+  plans.reserve(problems.size());
 
-  std::vector<NormalizedTileScopeRegionSummary> normalized_regions =
-      NormalizeRegionBoundaries(regions);
-
-  std::vector<SunmmioTileLoopFusionWindowPlanSummary> plans;
-  plans.reserve(windows.size());
-
-  for (size_t window_index = 0; window_index < windows.size(); ++window_index) {
-    WindowPlannerInput input = BuildWindowPlannerInput(
-        regions, normalized_regions, graphs[window_index]);
+  for (const SunmmioTileLoopFusionWindowProblem &problem : problems) {
+    WindowPlannerInput input = BuildWindowPlannerInput(problem);
 
     MemoResult best;
     if (static_cast<int>(input.regions.size()) > kMaxExactPlannerRegions) {
@@ -160,12 +158,11 @@ PlanSunmmioTileLoopFusionWindows(
       }
     }
 
-    SunmmioTileLoopFusionWindowPlanSummary summary;
+    SunmmioTileLoopFusionWindowPlan summary;
     summary.region_indices = input.region_indices;
     summary.score = best.score;
     summary.actions = best.actions;
-    for (const SunmmioTileLoopFusionPlannerActionSummary &action :
-         best.actions) {
+    for (const SunmmioTileLoopFusionPlannerAction &action : best.actions) {
       summary.order.push_back(action.region_index);
     }
     summary.tree = BuildPlanTree(best.actions);
