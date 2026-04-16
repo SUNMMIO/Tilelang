@@ -9,6 +9,7 @@
 #include <tvm/tir/op.h>
 #include <vector>
 
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "copy.h"
 #include "reduce.h"
@@ -89,42 +90,13 @@ LayoutMap BroadcastOpNode::InferLayout(const LayoutInferArgs &T,
   return out_layout;
 }
 
-int get_target_mesh(Target target, int axis) {
-  auto mattr = target->GetAttr<Array<String>>("mattr").value();
-  int x = 0;
-  std::string axis_str;
-  if (axis == 0) {
-    axis_str = "device_mesh_nrow_";
-  } else if (axis == 1) {
-    axis_str = "device_mesh_ncol_";
-  } else {
-    LOG(FATAL) << "Invalid axis " << axis << " for getting mesh dimension.";
-  }
-  for (size_t i = 0; i < mattr.size(); i++) {
-    std::string m = mattr[i];
-    if (m.find(axis_str) != std::string::npos) {
-      std::string s = m.substr(m.find_last_of('_') + 1);
-      ;
-      try {
-        x = std::stoi(s);
-      } catch (const std::invalid_argument &e) {
-        x = -1;
-      } catch (const std::out_of_range &e) {
-        x = -1;
-      }
-    }
-  }
-  ICHECK(x != 0) << axis_str << " not found.";
-  ICHECK(x > 0) << "Invalid " << axis_str;
-  return x;
-}
-
 Stmt BroadcastOpNode::Lower(const LowerArgs &T,
                             arith::Analyzer *analyzer) const {
   Target target = T.target;
   ICHECK(TargetIsSunmmio(target)) << "Broadcast only supports SUNMMIO targets.";
-  int mesh_nrow = get_target_mesh(target, 0);
-  int mesh_ncol = get_target_mesh(target, 1);
+  auto mesh = GetSunmmioMeshConfig(target);
+  int mesh_nrow = mesh.nrow;
+  int mesh_ncol = mesh.ncol;
 
   // check for valid core id
   ICHECK(src_core->value >= 0 and src_core->value < mesh_nrow * mesh_ncol)
@@ -260,8 +232,9 @@ LayoutMap PutOpNode::InferLayout(const LayoutInferArgs &T,
 Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   Target target = T.target;
   ICHECK(TargetIsSunmmio(target)) << "Put only supports SUNMMIO targets.";
-  int mesh_nrow = get_target_mesh(target, 0);
-  int mesh_ncol = get_target_mesh(target, 1);
+  auto mesh = GetSunmmioMeshConfig(target);
+  int mesh_nrow = mesh.nrow;
+  int mesh_ncol = mesh.ncol;
 
   // check for valid core id
   ICHECK(src_core->value >= 0 and src_core->value < mesh_nrow * mesh_ncol)
@@ -482,8 +455,9 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
                             arith::Analyzer *analyzer) const {
   Target target = T.target;
   ICHECK(TargetIsSunmmio(target)) << "Allgather only supports SUNMMIO targets.";
-  int mesh_nrow = get_target_mesh(target, 0);
-  int mesh_ncol = get_target_mesh(target, 1);
+  auto mesh = GetSunmmioMeshConfig(target);
+  int mesh_nrow = mesh.nrow;
+  int mesh_ncol = mesh.ncol;
 
   Array<Range> send_range, recv_range;
   auto send_region = NormalizeToBufferRegion(send);
@@ -830,8 +804,9 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
                             arith::Analyzer *analyzer) const {
   Target target = T.target;
   ICHECK(TargetIsSunmmio(target)) << "Allreduce only supports SUNMMIO targets.";
-  int mesh_nrow = get_target_mesh(target, 0);
-  int mesh_ncol = get_target_mesh(target, 1);
+  auto mesh = GetSunmmioMeshConfig(target);
+  int mesh_nrow = mesh.nrow;
+  int mesh_ncol = mesh.ncol;
 
   ICHECK(direction == 0 || direction == 1 || direction == 2)
       << "Invalid allreduce direction " << direction

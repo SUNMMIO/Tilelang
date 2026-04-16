@@ -52,5 +52,5 @@ def test_sunmmio_target_binding():
     prim_func_attr = prim_func.attrs
     target_attr = prim_func_attr["target"]
     assert target_attr.attrs["mcpu"] == "sunmmio-a4e"
-    for key in ["device_mesh_nrow", "device_mesh_nrow"]:
+    for key in ["device_mesh_nrow", "device_mesh_ncol"]:
         assert any(key in mattr for mattr in target_attr.attrs["mattr"])

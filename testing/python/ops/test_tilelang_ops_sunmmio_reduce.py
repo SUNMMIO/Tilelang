@@ -1,7 +1,6 @@
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.tileview import make_tileview
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 import pytest
 
@@ -27,29 +26,31 @@ class ReduceIRChecker(tvm.tir.PyStmtExprVisitor):
     def __init__(self, target_buffer_name="Out_shared"):
         super().__init__()
         self.target_buffer_name = target_buffer_name
-        self.max_loop_depth = 0
-        self.current_loop_depth = 0
-        self.found_ktiled_stage = True
         self.has_in_tile_reduce = False
+        self.scope_root = None
         self.scope_entry_count = 0
-        self.execution_loop_count = 0
+        self.execution_axes = []
+        self.interior_axes = []
+        self.saw_legacy_stage = False
+        self.saw_legacy_execution = False
 
     def visit_for_(self, op):
-        self.current_loop_depth += 1
-        self.max_loop_depth = max(self.max_loop_depth, self.current_loop_depth)
-
         ann = op.annotations
         if ann:
-            if "tile.loop_stage" in ann and ann["tile.loop_stage"] != 2:
-                self.found_ktiled_stage = False
-
+            if "tile.domain" in ann:
+                self.scope_root = op
             if ann.get("tile.scope_entry", 0) == 1:
                 self.scope_entry_count += 1
-            if ann.get("tile.execution", 0) == 1:
-                self.execution_loop_count += 1
+            if "tile.execution_axis" in ann:
+                self.execution_axes.append(int(ann["tile.execution_axis"]))
+            if ann.get("tile.interior", 0) == 1:
+                self.interior_axes.append(int(ann["tile.interior_axis"]))
+            if "tile.loop_stage" in ann:
+                self.saw_legacy_stage = True
+            if "tile.execution" in ann:
+                self.saw_legacy_execution = True
 
-        self.visit_stmt(op.body)
-        self.current_loop_depth -= 1
+        super().visit_for_(op)
 
     def visit_call_(self, op):
         if op.op.name == "tl.vector_core_in_tile_reduce":
@@ -57,22 +58,10 @@ class ReduceIRChecker(tvm.tir.PyStmtExprVisitor):
         super().visit_call_(op)
 
 
-def reduce_kernel_builder(rank, shape, tile_size, index_map, reduce_axis, dtype="float16"):
+def reduce_kernel_builder(shape, reduce_axis, dtype="float16"):
     out_shape = list(shape[:reduce_axis]) + list(shape[reduce_axis + 1 :])
     if not out_shape:  # Handle scalar reduction case
         out_shape = [1]
-
-    # Pre-calculate output tileview info outside T.prim_func
-    out_tile_size = []
-    out_index_map = []
-    for i, axis in enumerate(index_map):
-        if axis == reduce_axis:
-            continue
-        out_tile_size.append(tile_size[i])
-        if axis > reduce_axis:
-            out_index_map.append(axis - 1)
-        else:
-            out_index_map.append(axis)
 
     @T.prim_func
     def main(A: T.Tensor(shape, dtype), Out: T.Tensor(out_shape, dtype)):
@@ -81,9 +70,6 @@ def reduce_kernel_builder(rank, shape, tile_size, index_map, reduce_axis, dtype=
             A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
             Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
 
-            T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, index_map)})
-            T.annotate_tileview({Out_shared: make_tileview(Out_shared, out_tile_size, out_index_map)})
-
             T.copy(A, A_shared)
             T.reduce_sum(A_shared, Out_shared, dim=reduce_axis)
             T.copy(Out_shared, Out)
@@ -91,33 +77,31 @@ def reduce_kernel_builder(rank, shape, tile_size, index_map, reduce_axis, dtype=
     return tvm.IRModule({"main": main})
 
 
-# (Rank, Shape, TileSize, IndexMap, ReduceAxis, ExpectedDepth, ExpectedInTileReduce)
+# (Shape, ReduceAxis, ExpectedInTileReduce)
 # For Sunmmio, all dimensions should be multiples of 32 for simplicity in these tests.
 REDUCE_TEST_CASES = [
-    # 1D (Using asram)
-    (1, (1024,), (32,), (0,), 0, 2, True),
-    # 2D (Used as 1D equivalent: reducing last dim of a 2D tensor)
-    (2, (32, 1024), (32,), (1,), 1, 3, True),
+    ((1024,), 0, True),
+    ((32, 1024), 1, True),
     # 2D
-    (2, (128, 128), (32, 32), (0, 1), 1, 4, True),
-    (2, (128, 128), (32, 32), (0, 1), 0, 4, True),
+    ((128, 128), 1, True),
+    ((128, 128), 0, True),
     # 3D
-    (3, (32, 128, 128), (32, 32), (1, 2), 2, 5, True),
-    (3, (32, 128, 128), (32, 32), (1, 2), 1, 5, True),
-    (3, (32, 128, 128), (32, 32), (1, 2), 0, 5, False),
+    ((32, 128, 128), 2, True),
+    ((32, 128, 128), 1, True),
+    ((32, 128, 128), 0, False),
     # 4D
-    (4, (32, 32, 128, 128), (32, 32), (2, 3), 3, 6, True),
-    (4, (32, 32, 128, 128), (32, 32), (2, 3), 1, 6, False),
+    ((32, 32, 128, 128), 3, True),
+    ((32, 32, 128, 128), 1, False),
     # 5D
-    (5, (32, 32, 32, 128, 128), (32, 32), (3, 4), 4, 7, True),
-    (5, (32, 32, 32, 128, 128), (32, 32), (3, 4), 0, 7, False),
+    ((32, 32, 32, 128, 128), 4, True),
+    ((32, 32, 32, 128, 128), 0, False),
 ]
 
 
-@pytest.mark.parametrize("rank, shape, tile_size, index_map, reduce_axis, expected_depth, expected_in_tile", REDUCE_TEST_CASES)
-def test_tilelang_reduce_sunmmio(rank, shape, tile_size, index_map, reduce_axis, expected_depth, expected_in_tile):
+@pytest.mark.parametrize("shape, reduce_axis, expected_in_tile", REDUCE_TEST_CASES)
+def test_tilelang_reduce_sunmmio(shape, reduce_axis, expected_in_tile):
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    mod = reduce_kernel_builder(rank, shape, tile_size, index_map, reduce_axis)
+    mod = reduce_kernel_builder(shape, reduce_axis)
 
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
@@ -125,16 +109,24 @@ def test_tilelang_reduce_sunmmio(rank, shape, tile_size, index_map, reduce_axis,
     checker = ReduceIRChecker()
     checker.visit_stmt(mod["main"].body)
 
-    assert checker.found_ktiled_stage, "All loops in the reduction block should have tile.loop_stage == 2"
-    assert checker.max_loop_depth == expected_depth, f"Expected depth {expected_depth}, but found {checker.max_loop_depth} for rank {rank}"
+    assert checker.scope_root is not None, "Missing tile.domain root on lowered reduction"
+    root_ann = checker.scope_root.annotations
+    tile_size = [int(x) for x in root_ann["tile.tile_size"]]
+    execution_domain_axes = [int(x) for x in root_ann["tile.execution_domain_axes"]]
 
     if expected_in_tile:
         assert checker.has_in_tile_reduce, "Expected vector_core_in_tile_reduce intrinsic but not found"
     else:
         assert not checker.has_in_tile_reduce, "Did not expect vector_core_in_tile_reduce intrinsic but found it"
 
-    assert checker.scope_entry_count >= 1, "Missing tile.scope_entry annotation"
-    assert checker.execution_loop_count >= len(tile_size), "Missing tile.execution annotation"
+    assert checker.scope_entry_count == 1, "Expected exactly one tile.scope_entry annotation"
+    assert not checker.saw_legacy_stage, "Reduction should not emit legacy tile.loop_stage annotations"
+    assert not checker.saw_legacy_execution, "Reduction should not emit legacy tile.execution annotations"
+    assert sorted(checker.execution_axes) == list(range(len(tile_size))), (
+        "tile.execution_axis annotations should cover every execution axis"
+    )
+    assert len(execution_domain_axes) == len(tile_size), "tile.execution_domain_axes rank must match tile.tile_size"
+    assert set(checker.interior_axes).issuperset(set(range(len(tile_size)))), "Missing tile.interior annotations for one or more tile axes"
 
 
 if __name__ == "__main__":
