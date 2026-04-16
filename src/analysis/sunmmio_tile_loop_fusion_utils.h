@@ -37,6 +37,11 @@ Map<tir::Var, PrimExpr> BuildLogicalExecutionAxisSubstitution(
 tir::BufferRegion NormalizeBufferRegionByLogicalExecutionAxes(
     const tir::BufferRegion &region, const Map<tir::Var, PrimExpr> &subst);
 
+/*!
+ * \brief Normalize each region's external use/def boundaries into a shared
+ * logical-axis coordinate system and attach the planner-facing metadata used
+ * by later dependence and planning stages.
+ */
 std::vector<NormalizedTileScopeRegion>
 NormalizeRegionBoundaries(const std::vector<TileScopeRegion> &regions);
 

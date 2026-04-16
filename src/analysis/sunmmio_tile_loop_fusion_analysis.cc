@@ -1,12 +1,7 @@
-// Discovery and problem-building for Sunmmio tile loop fusion.
-//
-// This file owns the transition from lowered TIR to the shared protocol used
-// by later stages. It should answer three questions only:
-// - which lowered regions are planner-visible?
-// - how are those regions partitioned into source-order region runs?
-// - what legality/profitability information does each planner window expose?
-//
-// It intentionally does not choose schedules or emit rewritten TIR.
+/*!
+ * \file sunmmio_tile_loop_fusion_analysis.cc
+ * \brief Discovery and problem-building for Sunmmio tile loop fusion.
+ */
 
 #include "sunmmio_tile_loop_fusion_analysis.h"
 #include "sunmmio_tile_loop_fusion_utils.h"
@@ -86,11 +81,6 @@ struct PlannerVisibleRegionMatch {
 struct PlannerVisibleMatchResult {
   PlannerVisibleRegionMatch match;
   int end_index{-1};
-};
-
-struct PlannerVisibleProgramDiscovery {
-  std::vector<PlannerVisibleRegionMatch> region_matches;
-  std::vector<TileScopeRegionRun> region_runs;
 };
 
 class VisibleBufferCollector : public StmtExprVisitor {
@@ -207,15 +197,13 @@ std::optional<BufferRegion> NormalizeRegionArgument(const PrimExpr &arg) {
   }
 }
 
-struct OpaqueBuiltinAccesses {
+class OpaqueBuiltinAccessCollector : public StmtExprVisitor {
+public:
+  void Collect(const Stmt &stmt) { VisitStmt(stmt); }
+
   Array<BufferRegion> reads;
   Array<BufferRegion> writes;
   Array<BufferRegion> write_only_writes;
-};
-
-class OpaqueBuiltinAccessCollector : public StmtExprVisitor {
-public:
-  OpaqueBuiltinAccesses summary;
 
 private:
   void VisitStmt_(const EvaluateNode *op) final {
@@ -224,23 +212,17 @@ private:
         call->args.size() >= 3) {
       if (std::optional<BufferRegion> dst =
               NormalizeRegionArgument(call->args[1])) {
-        summary.writes.push_back(*dst);
-        summary.write_only_writes.push_back(*dst);
+        writes.push_back(*dst);
+        write_only_writes.push_back(*dst);
       }
       if (std::optional<BufferRegion> src =
               NormalizeRegionArgument(call->args[2])) {
-        summary.reads.push_back(*src);
+        reads.push_back(*src);
       }
     }
     StmtExprVisitor::VisitStmt_(op);
   }
 };
-
-OpaqueBuiltinAccesses CollectOpaqueBuiltinAccesses(const Stmt &stmt) {
-  OpaqueBuiltinAccessCollector collector;
-  collector(stmt);
-  return collector.summary;
-}
 
 std::optional<For> FindWrappedTileScopeEntryLoop(const Stmt &stmt) {
   if (const auto *loop = stmt.as<ForNode>()) {
@@ -292,14 +274,16 @@ MatchPlannerVisibleRegion(const Array<Stmt> &seq, int start_index) {
 
 class PlannerVisibleProgramCollector : public StmtVisitor {
 public:
-  PlannerVisibleProgramDiscovery summary;
+  void Collect(const PrimFunc &func) { VisitStmt(func->body); }
+
+  std::vector<PlannerVisibleRegionMatch> region_matches;
+  std::vector<TileScopeRegionRun> region_runs;
 
 private:
   void Flush(std::vector<int> *run) {
     if (!run->empty()) {
       ICHECK_EQ(run->back() - run->front() + 1, static_cast<int>(run->size()));
-      summary.region_runs.push_back(
-          {run->front(), static_cast<int>(run->size())});
+      region_runs.push_back({run->front(), static_cast<int>(run->size())});
       run->clear();
     }
   }
@@ -311,8 +295,8 @@ private:
       std::optional<PlannerVisibleMatchResult> match =
           MatchPlannerVisibleRegion(op->seq, index);
       if (match) {
-        int region_index = static_cast<int>(summary.region_matches.size());
-        summary.region_matches.push_back(match->match);
+        int region_index = static_cast<int>(region_matches.size());
+        region_matches.push_back(match->match);
         current_run.push_back(region_index);
         index = match->end_index + 1;
         continue;
@@ -326,24 +310,17 @@ private:
 
   void VisitStmt_(const ForNode *op) final {
     if (IsTileScopeEntry(op)) {
-      int region_index = static_cast<int>(summary.region_matches.size());
+      int region_index = static_cast<int>(region_matches.size());
       PlannerVisibleRegionMatch match;
       match.root_stmt = ffi::GetRef<For>(op);
       match.scope_entry_for = ffi::GetRef<For>(op);
-      summary.region_matches.push_back(match);
-      summary.region_runs.push_back({region_index, 1});
+      region_matches.push_back(match);
+      region_runs.push_back({region_index, 1});
       return;
     }
     StmtVisitor::VisitStmt_(op);
   }
 };
-
-PlannerVisibleProgramDiscovery
-CollectPlannerVisibleProgram(const PrimFunc &func) {
-  PlannerVisibleProgramCollector collector;
-  collector(func->body);
-  return collector.summary;
-}
 
 Array<BufferRegion> DedupeExternalRegions(
     const Array<BufferRegion> &regions,
@@ -505,6 +482,9 @@ struct OverlapFacts {
 std::optional<BufferRegion> IntersectBufferRegions(const BufferRegion &lhs,
                                                    const BufferRegion &rhs,
                                                    arith::Analyzer *analyzer) {
+  // Only compare accesses to the same normalized buffer with the same rank.
+  // Then intersect each dimension independently and reject the pair only when
+  // some per-dimension overlap extent is provably empty.
   if (!lhs->buffer.same_as(rhs->buffer) ||
       lhs->region.size() != rhs->region.size()) {
     return std::nullopt;
@@ -533,6 +513,10 @@ std::optional<BufferRegion> IntersectBufferRegions(const BufferRegion &lhs,
 
 int ComputeRequiredSharedPrefixDepth(const NormalizedBufferAccess &src_access,
                                      const NormalizedBufferAccess &dst_access) {
+  // `rho` is the minimum shared execution depth needed to keep this overlap
+  // internal. If either access boundary depends on depth d, the value instance
+  // can vary across iterations at d, so any shallower shared shell is too weak.
+  // Prefix axis/extent compatibility is enforced later by the planner.
   ICHECK_EQ(src_access.dims.size(), dst_access.dims.size());
   int rho = 0;
   for (size_t i = 0; i < src_access.dims.size(); ++i) {
@@ -551,6 +535,9 @@ int64_t ComputeEdgeWeightBytes(const NormalizedBufferAccess &src_access,
                                const BufferRegion &exact_overlap_region,
                                TileScopeDependenceKind kind,
                                arith::Analyzer *analyzer) {
+  // Only RAW edges carry a direct cut cost today. Use the exact overlap
+  // fragment as the payload unit, and fall back to the minimum static
+  // per-dimension extents when the symbolic overlap extent is not constant.
   if (kind != TileScopeDependenceKind::kRAW) {
     return 0;
   }
@@ -628,15 +615,15 @@ AnalyzeOneTileScopeRegion(const PlannerVisibleRegionMatch &match,
               /*body=*/boundary_stmt);
   Array<Array<BufferRegion>> access =
       GetBlockReadWriteRegion(block, visible_buffers);
-  OpaqueBuiltinAccesses opaque_access =
-      CollectOpaqueBuiltinAccesses(boundary_stmt);
+  OpaqueBuiltinAccessCollector opaque_access_collector;
+  opaque_access_collector.Collect(boundary_stmt);
 
   Array<BufferRegion> raw_use_in = access[0];
-  for (const BufferRegion &region : opaque_access.reads) {
+  for (const BufferRegion &region : opaque_access_collector.reads) {
     raw_use_in.push_back(region);
   }
   Array<BufferRegion> raw_def_out = access[1];
-  for (const BufferRegion &region : opaque_access.writes) {
+  for (const BufferRegion &region : opaque_access_collector.writes) {
     raw_def_out.push_back(region);
   }
 
@@ -645,7 +632,8 @@ AnalyzeOneTileScopeRegion(const PlannerVisibleRegionMatch &match,
 
   Array<BufferRegion> use_in =
       DedupeExternalRegions(raw_use_in, local_buffer_vars);
-  use_in = RemoveMatchingRegions(use_in, opaque_access.write_only_writes);
+  use_in =
+      RemoveMatchingRegions(use_in, opaque_access_collector.write_only_writes);
   Array<BufferRegion> def_out =
       DedupeExternalRegions(raw_def_out, local_buffer_vars);
 
@@ -685,6 +673,10 @@ static std::vector<TileScopeWindowGraph> BuildWindowGraphs(
   for (const TileScopeRegionRun &run : region_runs) {
     TileScopeWindowGraph graph;
 
+    /* ---- Sweep one run in source order and keep the last relevant uses/defs
+     * per buffer. Reads produce RAW edges from currently active defs. Writes
+     * produce WAR/WAW edges against currently active reads/defs and then kill
+     * the overlapping older accesses they supersede. ---- */
     std::unordered_map<const BufferNode *, std::vector<ActiveUseInfo>>
         active_uses;
     std::unordered_map<const BufferNode *, std::vector<ActiveDefInfo>>
@@ -786,17 +778,17 @@ static std::vector<TileScopeWindowGraph> BuildWindowGraphs(
 
 SunmmioTileLoopFusionProgram
 BuildSunmmioTileLoopFusionProgram(const PrimFunc &func) {
-  PlannerVisibleProgramDiscovery visible_program =
-      CollectPlannerVisibleProgram(func);
+  PlannerVisibleProgramCollector collector;
+  collector.Collect(func);
   Map<Var, Buffer> visible_buffers = CollectVisibleBuffers(func);
 
   SunmmioTileLoopFusionProgram program;
-  program.region_runs = visible_program.region_runs;
-  program.regions.reserve(visible_program.region_matches.size());
-  for (size_t region_index = 0;
-       region_index < visible_program.region_matches.size(); ++region_index) {
+  program.region_runs = collector.region_runs;
+  program.regions.reserve(collector.region_matches.size());
+  for (size_t region_index = 0; region_index < collector.region_matches.size();
+       ++region_index) {
     TileScopeRegion region = AnalyzeOneTileScopeRegion(
-        visible_program.region_matches[region_index], visible_buffers);
+        collector.region_matches[region_index], visible_buffers);
     region.global_region_index = static_cast<int>(region_index);
     program.regions.push_back(std::move(region));
   }

@@ -8,6 +8,8 @@ from tilelang.layout import make_blockwise_zz_layout
 from tilelang.tileview import make_tileview
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 
+IRModule = tvm.IRModule
+
 
 def apply_tiles_lowering(mod):
     return tl.transform.LowerTilesLoop()(mod)
