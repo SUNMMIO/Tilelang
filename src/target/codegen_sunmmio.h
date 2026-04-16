@@ -14,6 +14,7 @@
 #include <sstream>
 #include <memory>
 #include <string>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -270,6 +271,12 @@ private:
   };
 
   SunMMIOValue EvalExpr(const tvm::PrimExpr& expr);
+  void VisitStmtTracked(const tir::Stmt& stmt);
+  void CollectExpectedCoverage(const tir::PrimFunc& f);
+  void MarkVisitedNodeType(const std::string& type_key);
+  void MarkVisitedCallOpFromExpr(const tvm::PrimExpr& expr);
+  void WriteCoverageReport() const;
+  void CheckCoverageOrFail() const;
   SunMMIOValue EmitBinary(const char* op_name, const tvm::PrimExpr& lhs,
                           const tvm::PrimExpr& rhs, tvm::DataType dtype);
   SunMMIOValue EmitCmp(const char* pred, const tvm::PrimExpr& lhs,
@@ -322,6 +329,12 @@ private:
   std::vector<const tir::BufferNode*> scoped_buffers_;
   std::vector<size_t> var_scope_markers_;
   std::vector<size_t> buffer_scope_markers_;
+
+  // Traversal coverage sets for codegen completeness checking.
+  std::set<std::string> expected_node_types_;
+  std::set<std::string> visited_node_types_;
+  std::set<std::string> expected_call_ops_;
+  std::set<std::string> visited_call_ops_;
 };
 
 } // namespace codegen
