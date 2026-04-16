@@ -4,8 +4,12 @@
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
+#include <tvm/tir/stmt_functor.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <utility>
 
 namespace tvm {
@@ -435,11 +439,140 @@ void CodeGenTileLangSunMMIO::Clear() {
   scoped_buffers_.clear();
   var_scope_markers_.clear();
   buffer_scope_markers_.clear();
+  expected_node_types_.clear();
+  visited_node_types_.clear();
+  expected_call_ops_.clear();
+  visited_call_ops_.clear();
   initialized_ = false;
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::EvalExpr(const tvm::PrimExpr& expr) {
+  if (expr.defined()) {
+    MarkVisitedNodeType(expr->GetTypeKey());
+    MarkVisitedCallOpFromExpr(expr);
+  }
   return tir::ExprFunctor<SunMMIOValue(const tvm::PrimExpr&)>::VisitExpr(expr);
+}
+
+void CodeGenTileLangSunMMIO::VisitStmtTracked(const tir::Stmt& stmt) {
+  if (stmt.defined()) {
+    MarkVisitedNodeType(stmt->GetTypeKey());
+  }
+  tir::StmtVisitor::VisitStmt(stmt);
+}
+
+void CodeGenTileLangSunMMIO::MarkVisitedNodeType(const std::string& type_key) {
+  visited_node_types_.insert(type_key);
+}
+
+void CodeGenTileLangSunMMIO::MarkVisitedCallOpFromExpr(const tvm::PrimExpr& expr) {
+  const auto* call = expr.as<tir::CallNode>();
+  if (!call) {
+    return;
+  }
+  if (const auto* op_node = call->op.as<OpNode>()) {
+    visited_call_ops_.insert(op_node->name);
+  } else if (const auto* gv = call->op.as<GlobalVarNode>()) {
+    visited_call_ops_.insert(std::string("global::") + gv->name_hint);
+  } else {
+    visited_call_ops_.insert("unknown_call_target");
+  }
+}
+
+void CodeGenTileLangSunMMIO::CollectExpectedCoverage(const tir::PrimFunc& f) {
+  tir::PostOrderVisit(f->body, [&](const ObjectRef& obj) {
+    if (!obj.defined()) {
+      return;
+    }
+    expected_node_types_.insert(obj->GetTypeKey());
+    if (const auto* call = obj.as<tir::CallNode>()) {
+      if (const auto* op_node = call->op.as<OpNode>()) {
+        expected_call_ops_.insert(op_node->name);
+      } else if (const auto* gv = call->op.as<GlobalVarNode>()) {
+        expected_call_ops_.insert(std::string("global::") + gv->name_hint);
+      } else {
+        expected_call_ops_.insert("unknown_call_target");
+      }
+    }
+  });
+}
+
+void CodeGenTileLangSunMMIO::WriteCoverageReport() const {
+  const char* path = std::getenv("TL_SUNMMIO_CODEGEN_COVERAGE_PATH");
+  if (path == nullptr || std::string(path).empty()) {
+    return;
+  }
+  std::ofstream os(path, std::ios::out | std::ios::trunc);
+  if (!os.is_open()) {
+    LOG(WARNING) << "CodeGenTileLangSunMMIO: failed to open coverage path: " << path;
+    return;
+  }
+  auto write_list = [&os](const char* key, const std::set<std::string>& values) {
+    os << "  \"" << key << "\": [";
+    bool first = true;
+    for (const auto& item : values) {
+      if (!first) {
+        os << ", ";
+      }
+      first = false;
+      os << "\"" << item << "\"";
+    }
+    os << "]";
+  };
+  auto diff = [](const std::set<std::string>& a, const std::set<std::string>& b) {
+    std::set<std::string> out;
+    std::set_difference(a.begin(), a.end(), b.begin(), b.end(),
+                        std::inserter(out, out.begin()));
+    return out;
+  };
+  std::set<std::string> missing_nodes = diff(expected_node_types_, visited_node_types_);
+  std::set<std::string> missing_calls = diff(expected_call_ops_, visited_call_ops_);
+
+  os << "{\n";
+  write_list("expected_node_types", expected_node_types_);
+  os << ",\n";
+  write_list("visited_node_types", visited_node_types_);
+  os << ",\n";
+  write_list("missing_node_types", missing_nodes);
+  os << ",\n";
+  write_list("expected_call_ops", expected_call_ops_);
+  os << ",\n";
+  write_list("visited_call_ops", visited_call_ops_);
+  os << ",\n";
+  write_list("missing_call_ops", missing_calls);
+  os << "\n}\n";
+}
+
+void CodeGenTileLangSunMMIO::CheckCoverageOrFail() const {
+  auto diff = [](const std::set<std::string>& a, const std::set<std::string>& b) {
+    std::set<std::string> out;
+    std::set_difference(a.begin(), a.end(), b.begin(), b.end(),
+                        std::inserter(out, out.begin()));
+    return out;
+  };
+  std::set<std::string> missing_nodes = diff(expected_node_types_, visited_node_types_);
+  std::set<std::string> missing_calls = diff(expected_call_ops_, visited_call_ops_);
+
+  const char* strict_env = std::getenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT");
+  bool strict = strict_env != nullptr && std::string(strict_env) == "1";
+
+  if (!missing_nodes.empty() || !missing_calls.empty()) {
+    LOG(WARNING) << "CodeGenTileLangSunMMIO coverage gaps: missing_nodes="
+                 << missing_nodes.size() << ", missing_call_ops="
+                 << missing_calls.size();
+    if (strict) {
+      std::ostringstream err;
+      err << "SunMMIO codegen traversal incomplete. Missing node types: ";
+      for (const auto& s : missing_nodes) {
+        err << s << "; ";
+      }
+      err << "Missing call ops: ";
+      for (const auto& s : missing_calls) {
+        err << s << "; ";
+      }
+      LOG(FATAL) << err.str();
+    }
+  }
 }
 
 void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar& gvar, const tir::PrimFunc& f) {
@@ -447,6 +580,7 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar& gvar, const tir::PrimF
     Init();
   }
   ICHECK(builder_) << "CodeGenTileLangSunMMIO builder is not initialized";
+  CollectExpectedCoverage(f);
   EnterScope();
   std::vector<BuilderArg> args;
   int arg_index = 0;
@@ -466,7 +600,7 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar& gvar, const tir::PrimF
   }
 
   builder_->BeginFunction(gvar->name_hint, args);
-  VisitStmt(f->body);
+  VisitStmtTracked(f->body);
   builder_->EmitReturn();
   builder_->EndFunction();
   ExitScope();
@@ -477,6 +611,8 @@ std::string CodeGenTileLangSunMMIO::Finish() {
     Init();
   }
   ICHECK(builder_) << "CodeGenTileLangSunMMIO builder is not initialized";
+  WriteCoverageReport();
+  CheckCoverageOrFail();
   builder_->EndModule();
   std::string out = builder_->Finish();
   initialized_ = false;
@@ -520,7 +656,7 @@ SunMMIOType CodeGenTileLangSunMMIO::MapBufferType(const tir::Buffer& buffer) con
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::SeqStmtNode* op) {
   for (const Stmt& stmt : op->seq) {
-    VisitStmt(stmt);
+    VisitStmtTracked(stmt);
   }
 }
 
@@ -653,7 +789,7 @@ void CodeGenTileLangSunMMIO::EmitFor(const tir::ForNode* op) {
   BindVar(op->loop_var,
           SunMMIOValue{op->loop_var.dtype(), iv,
                        SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}}});
-  VisitStmt(op->body);
+  VisitStmtTracked(op->body);
   ExitScope();
   builder_->EndFor();
 }
@@ -664,10 +800,10 @@ void CodeGenTileLangSunMMIO::EmitIf(const tir::IfThenElseNode* op) {
       SunMMIOType{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}},
       DataType::Bool());
   builder_->BeginIf(cond);
-  VisitStmt(op->then_case);
+  VisitStmtTracked(op->then_case);
   if (op->else_case.defined()) {
     builder_->BeginElse();
-    VisitStmt(op->else_case.value());
+    VisitStmtTracked(op->else_case.value());
   }
   builder_->EndIf();
 }
@@ -678,14 +814,14 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::LetStmtNode* op) {
   SunMMIOValue value = EvalExpr(op->value);
   EnterScope();
   BindVar(op->var, value);
-  VisitStmt(op->body);
+  VisitStmtTracked(op->body);
   ExitScope();
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AttrStmtNode* op) {
   ScopedAttr attr{op->node, op->attr_key, EvalExpr(op->value)};
   attr_stack_.push_back(attr);
-  VisitStmt(op->body);
+  VisitStmtTracked(op->body);
   attr_stack_.pop_back();
 }
 
@@ -699,14 +835,14 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::WhileNode* op) {
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode* op) {
   EnterScope();
   EmitAlloc(op->buffer_var, op->dtype, op->extents, "local");
-  VisitStmt(op->body);
+  VisitStmtTracked(op->body);
   ExitScope();
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateConstNode* op) {
   EnterScope();
   EmitAlloc(op->buffer_var, op->dtype, op->extents, "const");
-  VisitStmt(op->body);
+  VisitStmtTracked(op->body);
   ExitScope();
 }
 
@@ -716,7 +852,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::DeclBufferNode* op) {
   builder_->Alloc(binding.handle, binding.buffer_type, {},
                   MapStorageScope(op->buffer.scope()),
                   op->buffer->dtype);
-  VisitStmt(op->body);
+  VisitStmtTracked(op->body);
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferStoreNode* op) {
@@ -744,7 +880,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferRealizeNode* op) {
   builder_->Alloc(binding.handle, binding.buffer_type, dyn_bounds,
                   MapStorageScope(op->buffer.scope()),
                   op->buffer->dtype);
-  VisitStmt(op->body);
+  VisitStmtTracked(op->body);
   ExitScope();
 }
 
@@ -756,7 +892,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AssertStmtNode* op) {
   SunMMIOValue msg = EvalExpr(op->message);
   std::string text = msg.value.empty() ? "\"assertion failed\"" : msg.value;
   builder_->EmitAssert(cond, text);
-  VisitStmt(op->body);
+  VisitStmtTracked(op->body);
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::EvaluateNode* op) {
@@ -853,9 +989,9 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockNode* op) {
     traverse_annotation_obj(kv.second, traverse_annotation_obj);
   }
   if (op->init.defined()) {
-    VisitStmt(op->init.value());
+    VisitStmtTracked(op->init.value());
   }
-  VisitStmt(op->body);
+  VisitStmtTracked(op->body);
   ExitScope();
 }
 
@@ -875,14 +1011,14 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockRealizeNode* op) {
     BindVar(op->block->iter_vars[i]->var, EvalExpr(op->iter_values[i]));
   }
   if (is_trivially_true(op->predicate)) {
-    VisitStmt(op->block);
+    VisitStmtTracked(op->block);
   } else {
     SunMMIOValue pred = EnsureType(
         EvalExpr(op->predicate),
         SunMMIOType{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}},
         DataType::Bool());
     builder_->BeginIf(pred);
-    VisitStmt(op->block);
+    VisitStmtTracked(op->block);
     builder_->EndIf();
   }
   ExitScope();
@@ -1288,6 +1424,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode* op) {
   std::vector<std::string> string_args;
   for (const PrimExpr& arg : op->args) {
     if (const auto* s = arg.as<StringImmNode>()) {
+      MarkVisitedNodeType("tir.StringImm");
       string_args.push_back(static_cast<std::string>(s->value));
       continue;
     }
