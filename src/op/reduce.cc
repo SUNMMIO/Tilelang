@@ -29,17 +29,42 @@ namespace tvm {
 namespace tl {
 
 namespace {
+/**
+ * @brief Check if a buffer can use the Sunmmio blockwise ZZ layout.
+ *
+ * This function enforces a relaxed constraint:
+ * 1. 1D buffers are strictly excluded.
+ * 2. "Degenerated 1D" buffers (e.g., (1, 64), (1, 1, 128)) are excluded
+ *    and should fallback to linear layouts.
+ * 3. All other multi-dimensional shapes (e.g., (2, 64), (1, 4, 64), (32, 32))
+ *    are allowed to use the blockwise ZZ layout. The python-side generator
+ *    will automatically pad these shapes to the nearest 32x32 block boundary.
+ */
 bool CanUseBlockwiseZZ(const Buffer &buf) {
   if (buf->shape.size() < 2)
     return false;
-  auto row = buf->shape[buf->shape.size() - 2];
-  auto col = buf->shape[buf->shape.size() - 1];
-  if (const auto *imm_row = row.as<IntImmNode>()) {
-    if (const auto *imm_col = col.as<IntImmNode>()) {
-      return imm_row->value % 32 == 0 && imm_col->value % 32 == 0;
+
+  // Check if it's (1, 1, ..., 1, N) shape
+  bool all_ones_except_last = true;
+  for (size_t i = 0; i < buf->shape.size() - 1; ++i) {
+    if (const auto *imm = buf->shape[i].as<IntImmNode>()) {
+      if (imm->value != 1) {
+        all_ones_except_last = false;
+        break;
+      }
+    } else {
+      // If any dimension before the last is not a constant,
+      // we conservatively assume it's not a (1,1,...,1,N) shape.
+      all_ones_except_last = false;
+      break;
     }
   }
-  return false;
+
+  if (all_ones_except_last) {
+    return false;
+  }
+
+  return true;
 }
 } // namespace
 
