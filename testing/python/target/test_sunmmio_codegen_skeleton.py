@@ -89,9 +89,7 @@ def flashattn_kernel(
             V_shared = T.alloc_shared([block_N, dim], dtype)
             O_shared = T.alloc_shared([block_M, dim], dtype)
             acc_s = T.alloc_shared([block_M, block_N], accum_dtype)
-            acc_s_cast = T.alloc_shared(
-                [block_M, block_N], accum_dtype, scope="shared.asram"
-            )
+            acc_s_cast = T.alloc_shared([block_M, block_N], accum_dtype, scope="shared.asram")
             acc_o = T.alloc_shared([block_M, dim], accum_dtype, scope="shared.rsram")
             scores_max = T.alloc_shared([block_M], accum_dtype)
             scores_max_prev = T.alloc_shared([block_M], accum_dtype)
@@ -105,11 +103,7 @@ def flashattn_kernel(
             T.fill(scores_max, -T.infinity(accum_dtype))
 
             loop_range = (
-                T.min(
-                    T.ceildiv(seq_len, block_N), T.ceildiv((bx + 1) * block_M, block_N)
-                )
-                if is_causal
-                else T.ceildiv(seq_len, block_N)
+                T.min(T.ceildiv(seq_len, block_N), T.ceildiv((bx + 1) * block_M, block_N)) if is_causal else T.ceildiv(seq_len, block_N)
             )
 
             for k in T.Pipelined(loop_range, num_stages=num_stages):
@@ -123,9 +117,7 @@ def flashattn_kernel(
                         )
                 else:
                     for i, j in T.Parallel(block_M, block_N):
-                        acc_s[i, j] = T.if_then_else(
-                            k * block_N + j >= seq_len, -T.infinity(acc_s.dtype), 0
-                        )
+                        acc_s[i, j] = T.if_then_else(k * block_N + j >= seq_len, -T.infinity(acc_s.dtype), 0)
                 T.gemm(Q_shared, K_shared, acc_s, transpose_B=True)
 
                 for i in T.serial(0, block_M):
@@ -136,16 +128,12 @@ def flashattn_kernel(
                     scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
 
                 for i in T.Parallel(block_M):
-                    scores_scale[i] = T.exp2(
-                        scores_max_prev[i] * scale - scores_max[i] * scale
-                    )
+                    scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
 
                 for i in T.serial(0, block_M):
                     scores_sum[i] = T.cast(0, accum_dtype)
                     for j in T.serial(0, block_N):
-                        acc_s[i, j] = T.exp2(
-                            acc_s[i, j] * scale - scores_max[i] * scale
-                        )
+                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
                         scores_sum[i] = scores_sum[i] + acc_s[i, j]
 
                 for i in T.Parallel(block_M):
@@ -166,22 +154,14 @@ def flashattn_kernel(
     return main
 
 
-def func_comm_kernel(
-    M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float32"
-):
+def func_comm_kernel(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float32"):
     mesh_device_config = (4, 4)
 
     @T.prim_func
     def main(
-        A: T.MeshTensor(
-            (M, K), T.MeshShardingPolicy(x=1, y=0), mesh_device_config, dtype
-        ),
-        B: T.MeshTensor(
-            (K, N), T.MeshShardingPolicy(x=1, y=0), mesh_device_config, dtype
-        ),
-        C: T.MeshTensor(
-            (M, N), T.MeshShardingPolicy(x=1, y=0), mesh_device_config, accum_dtype
-        ),
+        A: T.MeshTensor((M, K), T.MeshShardingPolicy(x=1, y=0), mesh_device_config, dtype),
+        B: T.MeshTensor((K, N), T.MeshShardingPolicy(x=1, y=0), mesh_device_config, dtype),
+        C: T.MeshTensor((M, N), T.MeshShardingPolicy(x=1, y=0), mesh_device_config, accum_dtype),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (
             bx,
@@ -216,9 +196,7 @@ def func_comm_kernel(
     return main
 
 
-def func_sync_kernel(
-    M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"
-):
+def func_sync_kernel(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
     @T.prim_func
     def kernel(
         A: T.Tensor((M, K), dtype),
@@ -448,16 +426,12 @@ def test_sunmmio_codegen_compile_path_not_implemented():
         ("simple_add", lambda: simple_add_kernel()),
         (
             "flashattn",
-            lambda: flashattn_kernel(
-                1, 1, 128, 32, False, block_M=32, block_N=32, num_stages=1, threads=1
-            ),
+            lambda: flashattn_kernel(1, 1, 128, 32, False, block_M=32, block_N=32, num_stages=1, threads=1),
         ),
         ("func_sync", lambda: func_sync_kernel(256, 256, 256, 64, 64, 64)),
     ],
 )
-def test_sunmmio_codegen_coverage_report_has_no_missing_entries(
-    tmp_path, kernel_name, kernel_factory
-):
+def test_sunmmio_codegen_coverage_report_has_no_missing_entries(tmp_path, kernel_name, kernel_factory):
     report_path = tmp_path / f"codegen_coverage_{kernel_name}.json"
     old_path = os.environ.get("TL_SUNMMIO_CODEGEN_COVERAGE_PATH")
     old_strict = os.environ.get("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT")

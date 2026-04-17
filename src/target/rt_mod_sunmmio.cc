@@ -1,7 +1,7 @@
 #include "codegen_sunmmio.h"
 #include "target/source/codegen_source_base.h"
-#include <tvm/ffi/reflection/registry.h>
 #include <string>
+#include <tvm/ffi/reflection/registry.h>
 #include <unordered_map>
 
 namespace tvm {
@@ -62,8 +62,8 @@ ffi::Module BuildTileLangSunMMIOWithoutCompile(IRModule mod, Target target) {
           ffi::Function::GetGlobal("tilelang_callback_sunmmio_postproc")) {
     code = (*f)(code, target).cast<std::string>();
   }
-  return codegen::DeviceSourceModuleCreate(code, "sunmmio", ExtractFuncInfo(mod),
-                                           "sunmmio");
+  return codegen::DeviceSourceModuleCreate(code, "sunmmio",
+                                           ExtractFuncInfo(mod), "sunmmio");
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
