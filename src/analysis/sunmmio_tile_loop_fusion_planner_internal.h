@@ -3,6 +3,7 @@
 #include "sunmmio_tile_loop_fusion_planner.h"
 #include "sunmmio_tile_loop_fusion_utils.h"
 
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -10,7 +11,7 @@
 
 namespace tvm {
 namespace tl {
-namespace detail {
+namespace planner_internal {
 
 inline constexpr int kMaxExactPlannerRegions = 15;
 inline constexpr size_t kMaxPlannerMemoEntries = 200000;
@@ -37,7 +38,6 @@ std::string SerializeDynamicBitset(const DynamicBitset &bitset);
 struct PlannerBufferValueInfo {
   int buffer_region_id{-1};
   std::string buffer_name;
-  tir::BufferRegion buffer_region;
   int home_depth{0};
   int64_t payload_bytes{0};
   int64_t instance_count{1};
@@ -45,9 +45,6 @@ struct PlannerBufferValueInfo {
 
 struct WindowPlannerRegionInfo {
   int global_region_index{-1};
-  int source_order_index{-1};
-  std::vector<std::string> logical_execution_axes;
-  Array<PrimExpr> execution_loop_extents;
   std::vector<PlannerBufferValueInfo> use_in;
   std::vector<PlannerBufferValueInfo> def_out;
 };
@@ -61,13 +58,30 @@ struct WindowPlannerEdgeInfo {
   int rho{0};
   int64_t weight{0};
   int64_t instance_count{1};
-  std::vector<int> covered_use_indices;
+  int covered_use_index{-1};
 };
 
-std::string RawConsumerKey(int origin_region_local_index, int buffer_region_id);
+struct RawConsumerKey {
+  int origin_region_local_index{-1};
+  int buffer_region_id{-1};
+
+  bool operator==(const RawConsumerKey &other) const {
+    return origin_region_local_index == other.origin_region_local_index &&
+           buffer_region_id == other.buffer_region_id;
+  }
+};
+
+struct RawConsumerKeyHash {
+  std::size_t operator()(const RawConsumerKey &key) const {
+    std::size_t seed = std::hash<int>{}(key.origin_region_local_index);
+    seed ^= std::hash<int>{}(key.buffer_region_id) + 0x9e3779b9 + (seed << 6) +
+            (seed >> 2);
+    return seed;
+  }
+};
 
 struct WindowPlannerInput {
-  std::vector<int> region_indices;
+  const SunmmioTileLoopFusionWindowProblem *problem{nullptr};
   std::vector<WindowPlannerRegionInfo> regions;
   std::vector<WindowPlannerEdgeInfo> edges;
   std::vector<std::vector<int>> incoming_edges_by_dst;
@@ -75,11 +89,9 @@ struct WindowPlannerInput {
   std::vector<DynamicBitset> predecessor_masks;
   std::vector<DynamicBitset> earlier_source_masks;
   std::unordered_map<int, DynamicBitset> read_consumer_masks_by_region_id;
-  std::unordered_map<std::string, DynamicBitset> raw_consumer_masks_by_key;
+  std::unordered_map<RawConsumerKey, DynamicBitset, RawConsumerKeyHash>
+      raw_consumer_masks_by_key;
 };
-
-WindowPlannerInput
-BuildWindowPlannerInput(const SunmmioTileLoopFusionWindowProblem &problem);
 
 enum class ResidentValueKind : int {
   kDefinition = 0,
@@ -109,7 +121,6 @@ struct PlannerState {
 
 bool SameResidentValue(const ResidentValueState &lhs,
                        const ResidentValueState &rhs);
-void SortAndDedupeResidents(OpenScopeFrame *frame);
 std::string SerializeResident(const ResidentValueState &resident);
 std::string SerializePlannerState(const PlannerState &state);
 std::vector<std::string>
@@ -160,6 +171,6 @@ MemoResult SolveWindowPlan(const WindowPlannerInput &input,
 std::vector<SunmmioTileLoopFusionPlannerTreeNode>
 BuildPlanTree(const std::vector<SunmmioTileLoopFusionPlannerAction> &actions);
 
-} // namespace detail
+} // namespace planner_internal
 } // namespace tl
 } // namespace tvm
