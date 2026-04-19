@@ -2,10 +2,10 @@ find_package(GTest REQUIRED)
 include(GoogleTest)
 
 add_executable(tilelang_cpp_tests
-  sunmmio_tile_loop_fusion_discovery_test.cc
-  sunmmio_tile_loop_fusion_cost_model_test.cc
-  sunmmio_tile_loop_fusion_planner_internal_test.cc
-  sunmmio_tile_loop_fusion_planner_test.cc
+  transform/sunmmio_tile_loop_fusion/discovery_test.cc
+  transform/sunmmio_tile_loop_fusion/cost_model_test.cc
+  transform/sunmmio_tile_loop_fusion/planner_internal_test.cc
+  transform/sunmmio_tile_loop_fusion/planner_test.cc
 )
 
 set_target_properties(tilelang_cpp_tests PROPERTIES
