@@ -100,22 +100,22 @@ If you apply the pass before the IR contains `tile.scope_entry` regions, it usua
 ## Core Terms
 
 - **Planner-visible region**
-  One lowered tile region rooted at a `tile.scope_entry` loop, together with any wrapper structure that still belongs to that region.
+  One lowered tile region rooted at a `tile.scope_entry` loop, together with any wrapper structure that still belongs to that region. Discovery also recognizes thin `AttrStmt`, `LetStmt`, `Block`, and `BlockRealize` wrappers around the scope-entry loop, so regions with surrounding local bindings or annotations are still discovered as single units.
 
 - **Execution loops**
   The loops directly under the `tile.scope_entry` that carry `tile.execution_axis` metadata. These are the loops the pass may choose to share.
 
 - **Logical execution axis key**
-  A canonical axis label such as `i`, `j`, or `k`. Discovery maps lowered loop variables into this logical space so two regions can still be compared even if their concrete loop var names differ.
+  A canonical axis label such as `i`, `j`, or `k`. Discovery maps lowered loop variables into this logical space so two regions can still be compared even if their concrete loop var names differ. The mapping is derived from `tile.execution_domain_axes` annotations on the scope-entry loop: each execution loop's `tile.execution_axis` index is resolved through this domain-axis array to produce a stable logical label.
 
 - **Planning group**
   A contiguous group of adjacent planner-visible regions that the pass analyzes, plans, and rewrites together. If any unrelated statement appears between two regions, they belong to different groups. In the implementation, this group is later packaged into planner-facing `WindowProblem` and `WindowPlan` objects, but you can read the pass as operating on one group at a time.
 
 - **`use_in`**
-  External buffer regions the region reads when it begins execution. Local scratch buffers are filtered out before they reach the planner.
+  External buffer regions the region reads when it begins execution. Local scratch buffers and planner-private scopes (any scope other than `global` or `shared*`) are filtered out before they reach the planner.
 
 - **`def_out`**
-  External buffer regions the region produces.
+  External buffer regions the region produces. The same filtering rules apply.
 
 - **Availability depth / `home_depth`**
   These are two stage-specific names for the same idea: the shallowest shared execution-loop depth at which a value or access no longer depends on any deeper loop indices. For example, if a produced value still changes with both `i` and `j`, it needs depth 2. If it changes with `i` but not with `j`, depth 1 is enough.
@@ -126,7 +126,7 @@ If you apply the pass before the IR contains `tile.scope_entry` regions, it usua
   `WAW` means two regions write overlapping output.
 
 - **`rho`**
-  The minimum shared execution depth required to keep a dependence internal. If `rho = 1`, sharing only the outer execution loop is enough. If `rho = 2`, the producer and consumer must also share the next inner loop.
+  The minimum shared execution depth required to keep a dependence internal. If `rho = 1`, sharing only the outer execution loop is enough. If `rho = 2`, the producer and consumer must also share the next inner loop. `rho` is computed from the deepest execution-loop depth referenced by either the source or destination normalized access dimensions.
 
 - **Shared loop prefix**
   The outer execution loops that multiple regions execute inside after fusion. In implementation comments and helper names, this is sometimes called a "shared shell."
@@ -222,11 +222,11 @@ Discovery walks the lowered `PrimFunc` and looks for planner-visible regions. At
 
 ### What counts as one region
 
-The pass does not only remember the bare `tile.scope_entry` loop. It keeps the full wrapped statement that owns that region. This is why rewrite can later preserve local wrappers such as `LetStmt` nodes and can hoist compatible `AttrStmt` wrappers.
+The pass does not only remember the bare `tile.scope_entry` loop. It keeps the full wrapped statement that owns that region. This is why rewrite can later preserve local wrappers such as `LetStmt` nodes and can hoist compatible `AttrStmt` wrappers. Discovery also recognizes `BlockRealize` and `Block` wrappers (provided the block has no `init`), so regions that lowering wraps in a block boundary are still matched as single planner-visible units.
 
 ### How planning groups are formed
 
-Discovery partitions the program into contiguous groups of adjacent planner-visible regions. Each group is one exact interval that the pass may plan and rewrite together. The pass does not pretend unrelated statements are part of the same planning problem.
+Discovery partitions the program into contiguous groups of adjacent planner-visible regions. Each group is one exact interval that the pass may plan and rewrite together. The pass does not pretend unrelated statements are part of the same planning problem. Discovery walks enclosing `SeqStmt` nodes: for each child, it attempts to match a planner-visible region. Consecutive matches form a run; any unrecognized child flushes the current run and starts a new one.
 
 ### How a region is summarized for planning
 
@@ -258,9 +258,11 @@ That is the information later stages use to answer questions such as the followi
 
 Discovery builds this summary from the body below the exposed execution loops, with a few simplifying rules:
 
-- Local scratch buffers are ignored, because other regions cannot observe them.
+- Local scratch buffers (allocated inside the region via `alloc_buffer` or `BufferRealize`) are ignored, because other regions cannot observe them.
+- Planner-private buffers (scopes other than `global` or `shared*`) are filtered out.
 - Duplicate external accesses are deduplicated.
 - Write-only opaque accesses are removed from the external-read set.
+- Opaque intrinsic calls (such as `vector_core_in_tile_reduce`) are handled specially: discovery extracts their read/write buffer regions and merges them into the standard `use_in`/`def_out` sets.
 - For each external write, discovery also records how much of the surrounding loop nest must be fixed before that result is determined.
 
 That last point matters because a region can have two execution loops and still produce a value that depends only on the outer loop variable. In that case the result becomes reusable after the outer loop is fixed, rather than only after both loops are fixed.
@@ -296,7 +298,7 @@ Tmp_shared[i1 * 8 + ki, j1 * 32 + kj]
 
 If the pass compared those accesses literally, it would treat them as different just because one region uses `i0, j0` and the other uses `i1, j1`.
 
-Normalization fixes that by rewriting each external read and write into one shared logical coordinate system with canonical axis names such as `i`, `j`, and `k`.
+Normalization fixes that by rewriting each external read and write into one shared logical coordinate system with canonical axis names such as `i`, `j`, and `k`. A single set of canonical `Var` objects is shared across all regions in the program, so that structurally equal expressions in different regions truly compare as equal.
 
 After normalization, both examples above become:
 
@@ -323,13 +325,13 @@ You can think of this record as combining three kinds of information in one plac
 - loop dependence: which execution loops that access still depends on
 - reuse: after what shared-loop depth the value can be treated as available
 
-For reads, `home_depth` is inferred from the deepest execution loop referenced by the access. For writes, discovery can sometimes set a shallower `home_depth` when the produced result no longer depends on the deepest loop, which means later regions may be able to reuse it earlier.
+For reads, `home_depth` is inferred from the deepest execution loop referenced by the access. When no execution loop is referenced but the region has execution loops, `home_depth` falls back to the minimum of the region's execution rank and the access's buffer-region rank. For writes, discovery can set a shallower `home_depth` when the produced result no longer depends on the deepest loop, which means later regions may be able to reuse it earlier.
 
 ### 3) Compare normalized accesses to build dependence edges
 
 Now that every region's external reads and writes are expressed in the same logical coordinate system, the pass can compare them across regions in the same planning group.
 
-If two normalized accesses do not overlap, no dependence edge is created.
+Comparison uses per-dimension range intersection. Two normalized accesses to the same buffer are intersected dimension by dimension: each dimension computes `max(lhs_min, rhs_min)` as the intersection start and `min(lhs_end, rhs_end)` as the intersection end. If any per-dimension intersection extent is provably non-positive (using TVM's arithmetic analyzer), the accesses do not overlap and no dependence edge is created. If all dimensions have a non-empty intersection, an edge is created.
 
 If they do overlap, the pass creates one of three edge kinds:
 
@@ -359,9 +361,21 @@ So `rho` is not just "there is a dependence." It is "how deeply do these regions
 
 #### What edge weight means
 
-Today only `RAW` edges carry a direct cut cost. The pass estimates that cost in bytes of overlap payload that would have to leave the fused loop prefix if the dependence were cut. The current model treats that as a spill/reload pair, so the byte cost is effectively doubled.
+Today only `RAW` edges carry a direct cut cost. The pass estimates that cost in bytes of overlap payload that would have to leave the fused loop prefix if the dependence were cut. The current model treats that as a spill/reload pair, so the byte cost is effectively doubled (the implementation computes `2 * element_count * dtype_bytes`). When the exact overlap extent is not a constant, the pass falls back to the minimum of the source and destination per-dimension static extents.
 
-`WAR` and `WAW` edges still matter for legality, but they do not currently contribute a direct cut-byte term.
+`WAR` and `WAW` edges still matter for legality, but they do not currently contribute a direct cut-byte term (their weight is always 0).
+
+### 5) Active-set sweep for graph construction
+
+Edges are not built by comparing every pair of accesses across every pair of regions. Instead, the implementation sweeps through the planning group in source order, maintaining active sets of the most recent definitions and uses per buffer.
+
+For each new region:
+1. Its reads are compared against active definitions to find `RAW` edges.
+2. Its writes are compared against active reads to find `WAR` edges. Overlapping earlier reads are killed from the active set.
+3. Its writes are compared against active definitions to find `WAW` edges. Overlapping earlier definitions are killed from the active set.
+4. The new region's reads and writes are added to the active sets.
+
+This sweep-based approach means that a later overwrite of a buffer kills the earlier definition from the active set, so only the latest relevant producer/consumer relationships are tracked. For example, if regions A, B, and C all write the same buffer in sequence, only B→C edges are created (not A→C), because B's write kills A's definition.
 
 After Stage 2, the planner no longer reasons about raw TIR accesses. It reasons about regions connected by a data-flow/dependence graph whose edges already encode overlap kind, required shared-loop depth, and estimated cut cost.
 
@@ -428,11 +442,11 @@ It is not enough to know which regions have already been scheduled. Future decis
 
 For that reason, the planner state tracks three things:
 
-- which regions have already been scheduled
-- which shared loop prefixes are currently open
+- which regions have already been scheduled (as a dynamic bitset)
+- which shared loop prefixes are currently open (as a stack of scope frames)
 - which values are still resident and visible inside those open prefixes
 
-Those resident values are what let the planner reason about reuse. A later region may be able to consume a producer's result directly if that result is still resident under a sufficiently deep shared loop prefix.
+Those resident values are what let the planner reason about reuse. A later region may be able to consume a producer's result directly if that result is still resident under a sufficiently deep shared loop prefix. Resident values come in two kinds: `kDefinition` (a producer's output that a later RAW consumer may reuse) and `kRead` (a materialized read that a later region sharing the same buffer access may reuse).
 
 ### 4) What one planner action means
 
@@ -443,9 +457,9 @@ One planner action chooses one next region and two depths:
 
 This lets the planner express choices like:
 
-- attach the next region at the root with no shared loop prefix
-- keep sharing only the outer execution loop
-- extend the current prefix to share both outer and inner loops
+- attach the next region at the root with no shared loop prefix (`close_to_depth=0, open_to_depth=0`)
+- keep sharing only the outer execution loop (`close_to_depth=1, open_to_depth=1`)
+- extend the current prefix to share both outer and inner loops (`close_to_depth=1, open_to_depth=2`)
 
 In other words, one action says both "run this region next" and "run it under this amount of shared loop structure."
 
@@ -456,10 +470,10 @@ When the planner considers one action, it computes the immediate cost of that ch
 That evaluation does five important things:
 
 1. Rebuild the open shared loop-prefix stack implied by `close_to_depth` and `open_to_depth`.
-2. Check incoming `RAW` edges. If the required producer value is no longer visible at this attach depth, that dependence is cut and contributes `write_cut_cost`.
-3. Charge `shared_read_cost` for reads that are not already satisfied by a visible resident value.
-4. Update resident values by removing overwritten ones and installing newly available ones.
-5. Compute the remaining live resident footprint and the amount of source-order reordering introduced by this step.
+2. Check incoming `RAW` edges. If the required producer definition is not visible at this attach depth, that dependence is cut and contributes `write_cut_cost`. If the producer definition is visible, the covered use is marked so it does not also contribute shared-read cost.
+3. Charge `shared_read_cost` for uncovered reads that are not already satisfied by a visible resident value (either a definition or a read resident).
+4. Update resident values: kill all residents for any buffer that the current region overwrites (by buffer name), then install newly available definitions. Outgoing RAW edges are also walked to pre-install producer definitions at their dependence `rho` depth.
+5. Mark the region as scheduled, prune residents that have no remaining future consumers, compute the remaining live resident footprint (`live_range_penalty`), and count source-order inversions (`reorder_penalty`).
 
 This is why the planner needs the full state described above. The immediate cost of a choice depends on what values are still visible, not just on which regions remain unscheduled.
 
@@ -474,23 +488,30 @@ The score terms are, in priority order:
 2. `shared_read_cost`
    Estimated bytes materialized for uses that are not already covered by visible residents.
 3. `live_range_penalty`
-   Estimated bytes kept live across the currently open shared loop prefixes.
+   Estimated bytes kept live across the currently open shared loop prefixes, weighted by each resident's execution-prefix instance count.
 4. `reorder_penalty`
    Count of earlier source-order regions skipped over by the chosen action.
 
-This priority order is strict. A one-byte improvement in `write_cut_cost` dominates any change in the lower-priority terms.
+This priority order is strict. A one-byte improvement in `write_cut_cost` dominates any change in the lower-priority terms. All score arithmetic uses saturating add/multiply (clamped to `int64_t::max / 4`) to prevent overflow.
 
 ### 7) How the planner searches
 
-For small planning groups, the planner uses a memoized exact search:
+For small planning groups (up to 15 regions), the planner uses a memoized exact search:
 
 ```text
 best(state) = min_a delta(state, a) + best(next_state(state, a))
 ```
 
-The memo key is the full planner state, not just the scheduled-region mask, because future costs depend on both the open shared loop prefixes and the resident values attached to them.
+The memo key is the full planner state serialized as a string, not just the scheduled-region mask, because future costs depend on both the open shared loop prefixes and the resident values attached to them.
 
-To keep compile time bounded, large planning groups fall back to a conservative source-order plan instead of exploring the exact state space. The current hard cap is 15 regions per exact group, and the exact search also stops if the memo table grows too large.
+The search also applies a pruning bound: because all score terms are nonnegative, any branch whose immediate transition delta already exceeds the best complete plan found so far can be skipped without recursion.
+
+To keep compile time bounded, two hard limits are enforced:
+
+- **Region count limit**: groups with more than 15 regions skip exact search entirely and use source-order fallback.
+- **Memo table limit**: if the memo table reaches 200,000 entries, the exact search is abandoned and the caller falls back to source-order planning.
+
+The source-order fallback schedules each region at the root depth (no shared loop prefix) in the first legal source-order position, which is conservative but guaranteed to terminate quickly.
 
 After Stage 3, the pass has chosen one concrete fused loop-prefix tree for the planning group. Stage 4 is then responsible for materializing that tree back into TIR.
 
@@ -537,9 +558,13 @@ becomes TIR shaped like:
 
 So the essential question in this stage is simple: how do we rebuild concrete loops and region bodies so that they match the tree the planner chose?
 
-### 2) Replace one exact statement interval at a time
+### 2) Converting the action trace to a tree
 
-Rewrite does not search the whole function again. Each planned group remembers the exact contiguous statement interval it came from, and rewrite only substitutes when the current `SeqStmt` still contains that same interval unchanged.
+The planner produces a linear action trace (a sequence of `close_to_depth` / `open_to_depth` / `region_index` triples). Before rewrite can use this, the trace is replayed against a mutable stack of scope nodes to reconstruct the nested tree structure. Each `close_to_depth` pops the stack back, each `open_to_depth` pushes new scope nodes, and the region is attached as a leaf under the current top of stack. The result is then frozen into an immutable `SunmmioTileLoopFusionPlannerTreeNode` tree.
+
+### 3) Replace one exact statement interval at a time
+
+Rewrite does not search the whole function again. Each planned group remembers the exact contiguous statement interval it came from, and rewrite only substitutes when the current `SeqStmt` still contains that same interval unchanged. Matching uses pointer identity (`same_as`), so it is precise and fast.
 
 This keeps the transformation local and precise:
 
@@ -547,7 +572,7 @@ This keeps the transformation local and precise:
 - unrelated surrounding statements are left untouched
 - the emitted subtree drops back into the original function at the same place
 
-### 3) Rebuild each shared loop prefix from a representative region
+### 4) Rebuild each shared loop prefix from a representative region
 
 Each internal scope node in the planner tree says that several children should execute under one shared loop prefix. Rewrite materializes that scope by choosing one representative region under the scope and reusing that region's original loop structure for the shared prefix.
 
@@ -555,11 +580,12 @@ Concretely, rewrite:
 
 - picks the first leaf region under the scope as the representative
 - takes that region's original execution loops up to the shared depth
-- rebuilds those loops around the rewritten children of the scope node
+- creates fresh `Var` objects for the shared loop variables (preserving the original name hints)
+- rebuilds those loops around the rewritten children of the scope node, substituting the representative region's original loop variables with the outer shared vars where needed
 
 This is legal because the planner only groups regions under the same shared loop prefix when their shared axes and extents already match.
 
-### 4) Turn each planned region into a leaf under that prefix
+### 5) Turn each planned region into a leaf under that prefix
 
 A planned region usually contains both:
 
@@ -570,16 +596,17 @@ When rewrite places that region under a shared loop prefix, it removes the alrea
 
 So if the planner says that two regions share `for i in ...:` but not any deeper loop, rewrite does not duplicate that `i` loop inside each leaf. Instead, it emits one outer `i` loop and puts each region's private remainder inside it.
 
-To make the rebuilt prefix line up with the original body, rewrite also substitutes the shared loop variables from the rebuilt loops into the leaf body.
+To make the rebuilt prefix line up with the original body, rewrite substitutes the shared loop variables from the rebuilt loops into the leaf body. This substitution uses a `ScopeEntryReplacer` mutator that finds the original `tile.scope_entry` loop in the (potentially wrapped) region root and replaces it with the rebuilt private suffix.
 
-### 5) Preserve wrappers and local structure
+### 6) Preserve wrappers and local structure
 
 The rebuilt tree should preserve the important structure that originally surrounded each region.
 
 Rewrite therefore treats wrappers carefully:
 
-- Common leading `AttrStmt` wrappers that are compatible with the shared loop prefix can be hoisted once around the fused subtree.
-- Local `LetStmt` wrappers stay attached to the leaf that originally owned them.
+- Common leading `AttrStmt` wrappers that are compatible with the shared loop prefix can be hoisted once around the fused subtree. Two `AttrStmt` frames are considered "the same" when they agree on `attr_key`, `node`, and `value` (checked by structural equality). Only the longest common prefix across all leaf regions is hoisted. `AttrStmt` wrappers that reference execution-loop variables are never hoisted.
+- Local `LetStmt` wrappers stay attached to the leaf that originally owned them, because they may bind values specific to that region.
+- `AttrStmt` hoisting is cumulative through scope nesting: each scope node additionally hoists any common `AttrStmt` prefix shared by its children, beyond what the parent scope already hoisted.
 
 This is why rewrite can both simplify the outer structure and still preserve region-local bindings and annotations.
 
@@ -671,14 +698,14 @@ scope(i):
   region_1
 ```
 
-This kind of plan appears in the planner tests. It keeps the deeper `i,j` consumer close to the producer while still preserving a shallower shared loop prefix that shares only the outer loop for the other consumer.
+This kind of plan appears in the planner tests. It keeps the deeper `i,j` consumer close to the producer while still preserving a shallower shared loop prefix that shares only the outer loop for the other consumer. In this case, `region_2` (originally third in source order) is reordered ahead of `region_1` because the tile-level RAW dependence (with higher byte weight) takes priority over the row-level dependence.
 
 ### Real-kernel cases
 
 The Python rewrite tests also cover larger structural examples:
 
-- Flash-attention online softmax groups, where some operations fuse at depth 1 and others at depth 2.
-- RMSNorm groups, where elementwise work and row reductions are fused while reduction-local scratch allocations remain correct.
+- Flash-attention online softmax groups, where some operations fuse at depth 1 (row-level: `scores_max` + `scores_scale`) and others at depth 2 (tile-level: `acc_s` + `acc_s_cast` + reduction).
+- RMSNorm groups, where elementwise work (`a_square`) and row reductions (`reduce_row_sum`) are fused at depth 2 while reduction-local scratch allocations remain correctly scoped inside their `Block` wrappers.
 
 Those tests are useful references because they show the pass operating on realistic lowered kernels rather than only hand-built unit cases.
 
@@ -699,6 +726,7 @@ Those tests are useful references because they show the pass operating on realis
 - It does not ignore `RAW`, `WAR`, or `WAW` hazards.
 - It does not promise global optimality once the planner falls back to source order for large planning groups.
 - It does not remove local wrappers such as region-specific `LetStmt` bindings.
+- It does not hoist `AttrStmt` wrappers that reference execution-loop variables.
 
 ---
 
@@ -708,7 +736,7 @@ Those tests are useful references because they show the pass operating on realis
   A single planner-visible region is already maximal for that interval, so the pass is effectively a no-op.
 
 - **Incompatible shared prefix**
-  Two regions may touch related buffers but still disagree on execution axes or extents, so they cannot be placed under the same shared loop prefix.
+  Two regions may touch related buffers but still disagree on execution axes or extents, so they cannot be placed under the same shared loop prefix. The planner checks both axis labels and extents (using structural equality) at each depth.
 
 - **Insufficient legal sharing depth**
   An edge may require a deeper shared prefix than the candidate regions can legally share.
@@ -717,10 +745,25 @@ Those tests are useful references because they show the pass operating on realis
   The planner may decide a more fused shared loop prefix would increase higher-priority score terms instead of reducing them.
 
 - **Large planning group**
-  Large groups fall back to a conservative source-order plan to keep compile time bounded.
+  Groups with more than 15 regions fall back to a conservative source-order plan to keep compile time bounded. Even smaller groups may fall back if the memoized state space exceeds 200,000 entries.
 
 - **No overlapping external reads/writes**
   If the normalized read/write regions do not overlap, no dependence edge is created, so there may be nothing useful to internalize.
+
+---
+
+## Implementation Files
+
+| File | Stage | Purpose |
+|------|-------|---------|
+| `src/transform/sunmmio_tile_loop_fusion/types.h` | All | Shared stage-boundary data structures |
+| `src/transform/sunmmio_tile_loop_fusion/cost_model.h/cc` | 3 | Lexicographic score representation and saturating arithmetic |
+| `src/transform/sunmmio_tile_loop_fusion/utils.h/cc` | 1–2 | Logical-axis normalization, `VarUseCollector`, expression helpers |
+| `src/transform/sunmmio_tile_loop_fusion/discovery.h/cc` | 1–2 | Region discovery, buffer access analysis, normalization, and dependence graph construction |
+| `src/transform/sunmmio_tile_loop_fusion/planner.h/cc` | 3 | Public planning entrypoint and input preprocessing |
+| `src/transform/sunmmio_tile_loop_fusion/planner_internal.h` | 3 | Private solver types: bitsets, resident state, memo/search records |
+| `src/transform/sunmmio_tile_loop_fusion/planner_solver.cc` | 3 | Exact DP search, source-order fallback, and plan tree reconstruction |
+| `src/transform/sunmmio_tile_loop_fusion/pass.cc` | 4 + entry | Rewrite mutator and module-pass entry point |
 
 ---
 
@@ -740,20 +783,13 @@ print(mod.script())
 
 For Sunmmio kernels, a more realistic sequence is to run the full lowering pipeline through `LowerTileOp` and `LowerTilesLoop`, then inspect the rewritten module after fusion.
 
-The main implementation files are:
-
-- `src/transform/sunmmio_tile_loop_fusion/discovery.cc`
-- `src/transform/sunmmio_tile_loop_fusion/utils.cc`
-- `src/transform/sunmmio_tile_loop_fusion/planner.cc`
-- `src/transform/sunmmio_tile_loop_fusion/planner_solver.cc`
-- `src/transform/sunmmio_tile_loop_fusion/pass.cc`
-
 Useful regression tests include:
 
 - `testing/python/transform/test_tilelang_transform_sunmmio_tile_loop_fusion_rewrite.py`
 - `testing/cpp/transform/sunmmio_tile_loop_fusion/discovery_test.cc`
 - `testing/cpp/transform/sunmmio_tile_loop_fusion/planner_test.cc`
 - `testing/cpp/transform/sunmmio_tile_loop_fusion/planner_internal_test.cc`
+- `testing/cpp/transform/sunmmio_tile_loop_fusion/cost_model_test.cc`
 
 ---
 
@@ -769,7 +805,10 @@ Useful regression tests include:
   Because `rho` depends on which execution depths the overlapping reads and writes actually vary with.
 
 - **Why are some wrappers hoisted while others stay local?**
-  Common leading `AttrStmt` wrappers that do not depend on execution-loop vars can be hoisted. Local `LetStmt` wrappers remain attached to the leaf that owns them.
+  Common leading `AttrStmt` wrappers that do not depend on execution-loop vars can be hoisted. Local `LetStmt` wrappers remain attached to the leaf that owns them because they may bind region-specific values.
 
 - **Why is a large example still close to source order after fusion?**
   The planner intentionally falls back to a conservative source-order plan once the exact search group becomes too large or the memoized state space is exhausted.
+
+- **What happens if two different buffers share the same name?**
+  The planner kills resident values by buffer name string, not by buffer identity. In practice this is safe because lowered buffer names are unique, but it is an implementation assumption worth knowing about.
