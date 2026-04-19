@@ -1,4 +1,13 @@
-#include "sunmmio_tile_loop_fusion_cost_model.h"
+/*!
+ * \file cost_model.cc
+ * \brief Lexicographic score math for Sunmmio tile loop fusion planning.
+ *
+ * This file intentionally does only tuple arithmetic and ordering. The actual
+ * byte/count deltas are produced by discovery and planner transitions; here we
+ * preserve the rule that earlier score fields dominate later ones absolutely.
+ */
+
+#include "cost_model.h"
 
 #include <limits>
 
@@ -7,6 +16,8 @@ namespace tl {
 
 namespace {
 
+// Reserve headroom below int64_t max so repeated saturating operations can use
+// a stable finite sentinel for "effectively infinite" planner cost.
 int64_t PlannerScoreSaturationLimit() {
   return std::numeric_limits<int64_t>::max() / 4;
 }
@@ -85,6 +96,9 @@ SunmmioTileLoopFusionPlannerScore AddSunmmioTileLoopFusionPlannerScores(
 int CompareSunmmioTileLoopFusionPlannerScores(
     const SunmmioTileLoopFusionPlannerScore &lhs,
     const SunmmioTileLoopFusionPlannerScore &rhs) {
+  // Earlier fields dominate later ones exactly. There is no scalar weighting
+  // between terms: for example, any reduction in write-cut bytes beats any
+  // increase in shared-read bytes or live-range penalty.
   if (lhs.write_cut_cost != rhs.write_cut_cost) {
     return lhs.write_cut_cost < rhs.write_cut_cost ? -1 : 1;
   }

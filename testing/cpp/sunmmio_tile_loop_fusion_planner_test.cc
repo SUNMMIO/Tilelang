@@ -5,9 +5,9 @@
 #include <tvm/tir/function.h>
 #include <tvm/tir/stmt.h>
 
-#include "analysis/sunmmio_tile_loop_fusion_analysis.h"
-#include "analysis/sunmmio_tile_loop_fusion_planner.h"
 #include "transform/common/attr.h"
+#include "transform/sunmmio_tile_loop_fusion/discovery.h"
+#include "transform/sunmmio_tile_loop_fusion/planner.h"
 
 #include <string>
 #include <utility>

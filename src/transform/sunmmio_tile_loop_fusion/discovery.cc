@@ -1,16 +1,16 @@
 /*!
- * \file sunmmio_tile_loop_fusion_analysis.cc
+ * \file discovery.cc
  * \brief Discovery and problem-building for Sunmmio tile loop fusion.
  */
 
-#include "sunmmio_tile_loop_fusion_analysis.h"
-#include "sunmmio_tile_loop_fusion_utils.h"
+#include "discovery.h"
+#include "utils.h"
 
-#include "../op/builtin.h"
-#include "../op/copy.h"
-#include "../op/reduce.h"
-#include "../op/utils.h"
-#include "../transform/common/attr.h"
+#include "../../op/builtin.h"
+#include "../../op/copy.h"
+#include "../../op/reduce.h"
+#include "../../op/utils.h"
+#include "../common/attr.h"
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/arith/pattern.h>
@@ -225,6 +225,8 @@ private:
 };
 
 std::optional<For> FindWrappedTileScopeEntryLoop(const Stmt &stmt) {
+  // Discovery accepts thin AttrStmt/LetStmt/Block wrappers around a
+  // `tile.scope_entry` loop so rewrite can later preserve that wrapper shape.
   if (const auto *loop = stmt.as<ForNode>()) {
     if (IsTileScopeEntry(loop)) {
       return ffi::GetRef<For>(loop);
@@ -289,6 +291,8 @@ private:
   }
 
   void VisitStmt_(const SeqStmtNode *op) final {
+    // A planner-visible run is a maximal consecutive source-order interval of
+    // matched regions inside the same enclosing SeqStmt.
     std::vector<int> current_run;
     int index = 0;
     while (index < static_cast<int>(op->seq.size())) {
@@ -325,6 +329,8 @@ private:
 Array<BufferRegion> DedupeExternalRegions(
     const Array<BufferRegion> &regions,
     const std::unordered_set<const VarNode *> &local_buffer_vars = {}) {
+  // Discovery only keeps externally visible regions. Local scratch buffers and
+  // planner-private scopes never cross stage boundaries.
   Array<BufferRegion> result;
   for (const BufferRegion &region : regions) {
     if (IsPlannerPrivateBuffer(region->buffer) ||
@@ -534,9 +540,11 @@ int64_t ComputeEdgeWeightBytes(const NormalizedBufferAccess &src_access,
                                const BufferRegion &exact_overlap_region,
                                TileScopeDependenceKind kind,
                                arith::Analyzer *analyzer) {
-  // Only RAW edges carry a direct cut cost today. Use the exact overlap
-  // fragment as the payload unit, and fall back to the minimum static
-  // per-dimension extents when the symbolic overlap extent is not constant.
+  // Only RAW edges carry a direct cut cost today. Measure that cost in bytes
+  // of overlap payload that would need to escape the fused shell if the edge is
+  // cut. The factor of 2 models a spill/reload pair: once out of the producer
+  // and once back into the consumer. When the symbolic overlap extent is not
+  // constant, fall back to the minimum static per-dimension extents.
   if (kind != TileScopeDependenceKind::kRAW) {
     return 0;
   }
@@ -776,6 +784,8 @@ static std::vector<TileScopeWindowGraph> BuildWindowGraphs(
 
 SunmmioTileLoopFusionProgram
 BuildSunmmioTileLoopFusionProgram(const PrimFunc &func) {
+  // First discover every planner-visible region and every maximal source-order
+  // run where loop fusion may later occur.
   PlannerVisibleProgramCollector collector;
   collector.Collect(func);
   Map<Var, Buffer> visible_buffers = CollectVisibleBuffers(func);
@@ -796,6 +806,8 @@ BuildSunmmioTileLoopFusionProgram(const PrimFunc &func) {
 std::vector<SunmmioTileLoopFusionWindowProblem>
 BuildSunmmioTileLoopFusionWindowProblems(
     const SunmmioTileLoopFusionProgram &program) {
+  // Then normalize access boundaries into logical-axis space and attach the
+  // per-run dependence graph consumed by the planner.
   std::vector<NormalizedTileScopeRegion> normalized_regions =
       NormalizeRegionBoundaries(program.regions);
   std::vector<TileScopeWindowGraph> graphs =

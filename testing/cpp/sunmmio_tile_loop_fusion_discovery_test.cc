@@ -6,9 +6,9 @@
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt.h>
 
-#include "analysis/sunmmio_tile_loop_fusion_analysis.h"
-#include "analysis/sunmmio_tile_loop_fusion_utils.h"
 #include "transform/common/attr.h"
+#include "transform/sunmmio_tile_loop_fusion/discovery.h"
+#include "transform/sunmmio_tile_loop_fusion/utils.h"
 
 #include <string>
 #include <vector>
@@ -141,7 +141,7 @@ const TileScopeDependenceEdge *FindEdge(const TileScopeWindowGraph &graph,
   return nullptr;
 }
 
-TEST(SunmmioTileLoopFusionAnalysisTest,
+TEST(SunmmioTileLoopFusionDiscoveryTest,
      SingleRegionBuildsOneWindowWithExpectedExternalBoundaries) {
   Buffer a_shared = MakeSharedBuffer("A_shared", {I(32), I(32)});
   Buffer b_shared = MakeSharedBuffer("B_shared", {I(32), I(32)});
@@ -177,7 +177,7 @@ TEST(SunmmioTileLoopFusionAnalysisTest,
   EXPECT_EQ(RegionExtents(def_out), std::vector<std::string>({"8", "32"}));
 }
 
-TEST(SunmmioTileLoopFusionAnalysisTest,
+TEST(SunmmioTileLoopFusionDiscoveryTest,
      TwoConsecutiveRegionsProduceOneRawDependenceEdge) {
   Buffer a_shared = MakeSharedBuffer("A_shared", {I(32), I(32)});
   Buffer tmp_shared = MakeSharedBuffer("Tmp_shared", {I(32), I(32)});
@@ -206,7 +206,7 @@ TEST(SunmmioTileLoopFusionAnalysisTest,
   EXPECT_EQ(edge.weight_bytes, 1024);
 }
 
-TEST(SunmmioTileLoopFusionAnalysisTest,
+TEST(SunmmioTileLoopFusionDiscoveryTest,
      OverwrittenDefsKillEarlierRawAndPreserveOnlyLatestProducer) {
   Buffer a_shared = MakeSharedBuffer("A_shared", {I(32), I(32)});
   Buffer b_shared = MakeSharedBuffer("B_shared", {I(32), I(32)});
@@ -241,7 +241,7 @@ TEST(SunmmioTileLoopFusionAnalysisTest,
   EXPECT_EQ(FindEdge(graph, 0, 2, TileScopeDependenceKind::kRAW), nullptr);
 }
 
-TEST(SunmmioTileLoopFusionAnalysisTest, RecordsWarEdgesForReadThenOverwrite) {
+TEST(SunmmioTileLoopFusionDiscoveryTest, RecordsWarEdgesForReadThenOverwrite) {
   Buffer a_shared = MakeSharedBuffer("A_shared", {I(32), I(32)});
   Buffer tmp_shared = MakeSharedBuffer("Tmp_shared", {I(32), I(32)});
   Buffer b_shared = MakeSharedBuffer("B_shared", {I(32), I(32)});
@@ -267,7 +267,7 @@ TEST(SunmmioTileLoopFusionAnalysisTest, RecordsWarEdgesForReadThenOverwrite) {
   EXPECT_EQ(edge.weight_bytes, 0);
 }
 
-TEST(SunmmioTileLoopFusionAnalysisTest,
+TEST(SunmmioTileLoopFusionDiscoveryTest,
      Restricts3DExternalRegionsToExposedPrefix) {
   Buffer a_shared = MakeSharedBuffer("A_shared", {I(1), I(2), I(128)});
   Buffer b_shared = MakeSharedBuffer("B_shared", {I(1), I(2), I(128)});
@@ -291,7 +291,8 @@ TEST(SunmmioTileLoopFusionAnalysisTest,
   EXPECT_EQ(RegionExtents(lhs), std::vector<std::string>({"1", "2", "128"}));
 }
 
-TEST(SunmmioTileLoopFusionAnalysisTest, SwappedExecutionDomainMapsLogicalAxes) {
+TEST(SunmmioTileLoopFusionDiscoveryTest,
+     SwappedExecutionDomainMapsLogicalAxes) {
   Buffer a_shared = MakeSharedBuffer("A_shared", {I(32), I(32)});
   Buffer b_shared = MakeSharedBuffer("B_shared", {I(32), I(32)});
 

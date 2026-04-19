@@ -1,10 +1,10 @@
 /*!
- * \file sunmmio_tile_loop_fusion_analysis.h
+ * \file discovery.h
  * \brief Discovery-side entrypoints for Sunmmio tile loop fusion.
  */
 #pragma once
 
-#include "sunmmio_tile_loop_fusion_protocol.h"
+#include "types.h"
 
 #include <tvm/tir/function.h>
 

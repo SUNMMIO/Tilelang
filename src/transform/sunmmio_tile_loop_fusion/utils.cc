@@ -1,4 +1,9 @@
-#include "sunmmio_tile_loop_fusion_utils.h"
+/*!
+ * \file utils.cc
+ * \brief Shared normalization helpers for Sunmmio tile loop fusion.
+ */
+
+#include "utils.h"
 
 #include <tvm/arith/analyzer.h>
 
@@ -15,6 +20,9 @@ using namespace tir;
 
 namespace {
 
+// Record which logical execution depths a normalized buffer dimension depends
+// on so later dependence construction can recover rho directly from the
+// normalized access description.
 std::vector<int> CollectExecutionAxisDepths(
     const PrimExpr &min, const PrimExpr &extent,
     const std::unordered_map<const VarNode *, int> &depth_by_var) {
@@ -33,6 +41,9 @@ std::vector<int> CollectExecutionAxisDepths(
   return depths;
 }
 
+// A value's "home depth" is the shallowest shared shell where it becomes
+// available or must remain visible. When explicit metadata is missing, infer it
+// from the deepest execution axis referenced by the access.
 int ComputeAccessHomeDepth(const std::vector<NormalizedBufferAccessDim> &dims,
                            int max_execution_rank, int fallback_rank) {
   int home_depth = 0;
@@ -61,6 +72,8 @@ int64_t ComputeAccessPayloadBytes(const BufferRegion &region,
   return payload;
 }
 
+// Build the fully planner-facing normalized access record used by both
+// dependence construction and planner preprocessing.
 NormalizedBufferAccess BuildNormalizedBufferAccess(
     const BufferRegion &region, const Map<Var, PrimExpr> &subst,
     const std::unordered_map<std::string, Var> &canonical_execution_vars,
@@ -154,6 +167,9 @@ NormalizeBufferRegionByLogicalExecutionAxes(const BufferRegion &region,
 
 std::vector<NormalizedTileScopeRegion>
 NormalizeRegionBoundaries(const std::vector<TileScopeRegion> &regions) {
+  // Canonical logical-axis vars are shared across every region in the window so
+  // equal accesses normalize to the same symbolic coordinate system even when
+  // their lowered loop vars differ.
   std::unordered_map<std::string, Var> canonical_execution_vars;
   std::vector<NormalizedTileScopeRegion> normalized_regions;
   normalized_regions.reserve(regions.size());

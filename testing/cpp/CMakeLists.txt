@@ -2,7 +2,7 @@ find_package(GTest REQUIRED)
 include(GoogleTest)
 
 add_executable(tilelang_cpp_tests
-  sunmmio_tile_loop_fusion_analysis_test.cc
+  sunmmio_tile_loop_fusion_discovery_test.cc
   sunmmio_tile_loop_fusion_cost_model_test.cc
   sunmmio_tile_loop_fusion_planner_internal_test.cc
   sunmmio_tile_loop_fusion_planner_test.cc
@@ -20,8 +20,7 @@ set_target_properties(tilelang_cpp_tests PROPERTIES
 target_include_directories(tilelang_cpp_tests PRIVATE
   ${TILE_LANG_INCLUDES}
   ${PROJECT_SOURCE_DIR}/src
-  ${PROJECT_SOURCE_DIR}/src/analysis
-  ${PROJECT_SOURCE_DIR}/src/layout
+    ${PROJECT_SOURCE_DIR}/src/layout
   ${PROJECT_SOURCE_DIR}/src/op
   ${PROJECT_SOURCE_DIR}/src/target
   ${PROJECT_SOURCE_DIR}/src/tileview

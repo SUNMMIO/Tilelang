@@ -1,7 +1,5 @@
-#pragma once
-
 /*!
- * \file sunmmio_tile_loop_fusion_protocol.h
+ * \file types.h
  * \brief Shared stage-boundary data for Sunmmio tile loop fusion.
  *
  * The pass is intentionally staged as:
@@ -20,9 +18,11 @@
  * search state and rewrite-local helper state stay in stage-local sources.
  */
 
-#include "sunmmio_tile_loop_fusion_cost_model.h"
+#pragma once
 
-#include "../support/ffi_aliases.h"
+#include "cost_model.h"
+
+#include "../../support/ffi_aliases.h"
 
 #include <tvm/ir/expr.h>
 #include <tvm/tir/function.h>

@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "sunmmio_tile_loop_fusion_cost_model.h"
+#include "transform/sunmmio_tile_loop_fusion/cost_model.h"
 
 namespace tvm {
 namespace tl {

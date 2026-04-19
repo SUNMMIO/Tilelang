@@ -1,7 +1,5 @@
-#pragma once
-
 /*!
- * \file sunmmio_tile_loop_fusion_planner.h
+ * \file planner.h
  * \brief Public planning entrypoints for Sunmmio tile loop fusion.
  *
  * This stage consumes window-local planning problems and produces the chosen
@@ -10,7 +8,9 @@
  * surface is the window problem and final plan.
  */
 
-#include "sunmmio_tile_loop_fusion_protocol.h"
+#pragma once
+
+#include "types.h"
 
 namespace tvm {
 namespace tl {

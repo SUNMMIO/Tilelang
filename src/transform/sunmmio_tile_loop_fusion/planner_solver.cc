@@ -1,4 +1,9 @@
-#include "sunmmio_tile_loop_fusion_planner_internal.h"
+/*!
+ * \file planner_solver.cc
+ * \brief Exact-search planner implementation for Sunmmio tile loop fusion.
+ */
+
+#include "planner_internal.h"
 
 #include <tvm/node/structural_equal.h>
 
@@ -14,6 +19,8 @@ namespace planner_internal {
 
 namespace {
 
+// Serialization helpers keep memo keys deterministic and human-readable in the
+// same ordering used by the resident sorting logic below.
 std::string JoinExtents(const Array<PrimExpr> &extents) {
   std::ostringstream os;
   for (size_t i = 0; i < extents.size(); ++i) {
@@ -304,6 +311,9 @@ void AccumulatePlannerScoreTerm(int64_t *field, int64_t delta) {
 }
 
 int64_t ComputeLiveRangeDelta(const PlannerState &state) {
+  // Live-range penalty is measured in resident bytes kept alive across the
+  // currently open scopes, scaled by the number of execution instances each
+  // resident represents.
   int64_t live_range_delta = 0;
   for (const OpenScopeFrame &frame : state.open_scopes) {
     for (const ResidentValueState &resident : frame.residents) {
@@ -476,6 +486,8 @@ TransitionResult ApplyAction(const WindowPlannerInput &input,
 }
 
 MemoResult BuildSourceOrderFallbackPlan(const WindowPlannerInput &input) {
+  // Fallback scheduling simply emits the next legal region in source order and
+  // attaches it at the root. This is intentionally conservative but bounded.
   MemoResult fallback;
   fallback.score = {0, 0, 0, 0};
   PlannerState state{DynamicBitset(static_cast<int>(input.regions.size())), {}};
@@ -678,6 +690,8 @@ MemoResult SolveWindowPlan(const WindowPlannerInput &input,
 
 std::vector<SunmmioTileLoopFusionPlannerTreeNode>
 BuildPlanTree(const std::vector<SunmmioTileLoopFusionPlannerAction> &actions) {
+  // Reconstruct the nested rewrite-facing tree by replaying the linear action
+  // trace's close/open shell operations against a mutable stack of scope nodes.
   auto root = std::make_shared<MutablePlannerTreeNode>();
   root->is_scope = true;
 

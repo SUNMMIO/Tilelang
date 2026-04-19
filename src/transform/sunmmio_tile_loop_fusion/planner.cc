@@ -1,5 +1,5 @@
 /*!
- * \file sunmmio_tile_loop_fusion_planner.cc
+ * \file planner.cc
  * \brief Public planning entrypoints for Sunmmio tile loop fusion.
  *
  * This file owns the transition from a window-local semantic problem to a
@@ -8,7 +8,7 @@
  * of window plans out.
  */
 
-#include "sunmmio_tile_loop_fusion_planner_internal.h"
+#include "planner_internal.h"
 
 #include <algorithm>
 #include <sstream>
@@ -19,6 +19,8 @@ namespace tl {
 
 namespace {
 
+// Use a normalized BufferRegion string key so planner preprocessing can assign
+// stable region-local ids to equal logical accesses.
 std::string BufferRegionKey(const tir::BufferRegion &region) {
   std::ostringstream os;
   os << region->buffer->name << '|';
@@ -31,6 +33,8 @@ std::string BufferRegionKey(const tir::BufferRegion &region) {
 
 int64_t ComputeExecutionPrefixInstanceCount(const Array<PrimExpr> &extents,
                                             int depth) {
+  // Scale a per-instance byte cost up to the number of dynamic executions of
+  // the shared prefix where that value/edge exists.
   if (depth <= 0) {
     return 1;
   }
@@ -50,6 +54,8 @@ int64_t
 ComputeRawEdgeInstanceCount(const Array<PrimExpr> &src_execution_loop_extents,
                             const Array<PrimExpr> &dst_execution_loop_extents,
                             int rho) {
+  // Charge a RAW edge at the multiplicity of the shared execution prefix that
+  // must carry the value between producer and consumer.
   return std::max(
       ComputeExecutionPrefixInstanceCount(src_execution_loop_extents, rho),
       ComputeExecutionPrefixInstanceCount(dst_execution_loop_extents, rho));
@@ -57,6 +63,9 @@ ComputeRawEdgeInstanceCount(const Array<PrimExpr> &src_execution_loop_extents,
 
 planner_internal::WindowPlannerInput
 BuildWindowPlannerInput(const SunmmioTileLoopFusionWindowProblem &problem) {
+  // Convert the discovery-facing window problem into the solver's compact
+  // internal working IR: localize region ids, precompute multiplicities, and
+  // build the predecessor/consumer masks needed by the exact search.
   planner_internal::WindowPlannerInput input;
   input.problem = &problem;
   int num_regions = static_cast<int>(problem.regions.size());
@@ -218,6 +227,8 @@ PlanSunmmioTileLoopFusionWindowProblems(
         BuildWindowPlannerInput(problem);
 
     planner_internal::MemoResult best;
+    // Small windows use the exact memoized search. Larger or exhausted cases
+    // fall back to a simpler source-order plan to keep compile-time bounded.
     if (static_cast<int>(input.regions.size()) >
         planner_internal::kMaxExactPlannerRegions) {
       best = planner_internal::BuildSourceOrderFallbackPlan(input);

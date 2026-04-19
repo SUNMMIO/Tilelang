@@ -1,12 +1,48 @@
-// Rewrite stage for Sunmmio tile loop fusion.
-//
-// This file consumes the original planner-visible program plus the chosen plan
-// for each window and emits the rewritten TIR. It deliberately does not know
-// how regions are discovered or how schedules are chosen.
+/*!
+ * \file pass.cc
+ * \brief Entry point and rewrite stage for the Sunmmio tile loop fusion pass.
+ *
+ * \details
+ * This pass solves one specific problem in lowered Sunmmio TIR: after tile
+ * lowering, many adjacent `tile.scope_entry` regions still execute as separate
+ * loop nests even when they touch the same logical execution prefix and could
+ * profitably share outer loops. Leaving them separate cuts producer/consumer
+ * reuse across region boundaries, forces extra materialization of intermediate
+ * values, and misses opportunities to keep data alive inside shared shells.
+ *
+ * Intuitively, the pass tries to turn a source-order run of compatible tile
+ * regions into a fused tree of shared execution shells. Instead of replaying
+ * each region as a standalone loop nest, it discovers which outer execution
+ * loops can be shared, chooses an order and shell structure that preserves the
+ * most useful reuse, and then rewrites the original statement interval into
+ * that fused tree.
+ *
+ * The planning problem is formulated window-by-window. Discovery first builds a
+ * dependence graph over each maximal source-order run of planner-visible tile
+ * regions. The planner then solves a dynamic-programming search over partial
+ * schedules: each action chooses the next region plus how much of the current
+ * shared-shell stack to keep or reopen. The objective is a lexicographic cost
+ * model rather than a single weighted scalar, so the solver first minimizes cut
+ * RAW reuse, then uncovered shared reads, then live resident footprint, and
+ * finally source-order inversions.
+ *
+ * Structurally, the pass is split into four stages:
+ * 1. Discovery: find planner-visible tile regions and partition them into
+ *    source-order windows.
+ * 2. Problem building: normalize external accesses and construct the per-window
+ *    dependence graph.
+ * 3. Planning: solve each window as a shared-shell scheduling problem and emit
+ *    a rewrite-ready tree.
+ * 4. Rewrite: replace each original window in the TIR with the chosen fused
+ *    shell tree.
+ *
+ * This file contains stage 4 plus the top-level pass entry that orchestrates
+ * the full pipeline.
+ */
 
-#include "../analysis/sunmmio_tile_loop_fusion_analysis.h"
-#include "../analysis/sunmmio_tile_loop_fusion_planner.h"
-#include "../analysis/sunmmio_tile_loop_fusion_utils.h"
+#include "discovery.h"
+#include "planner.h"
+#include "utils.h"
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/transform.h>
@@ -24,6 +60,14 @@ namespace {
 
 using namespace tir;
 
+/*!
+ * \brief Replace one specific scope-entry loop with a prebuilt leaf body.
+ *
+ * Region leaves keep their original wrapper structure, but when a planner tree
+ * places a region under shared outer loops we must cut away the shared prefix
+ * from the original scope-entry loop nest and splice in only the private
+ * execution suffix.
+ */
 class ScopeEntryReplacer : public StmtExprMutator {
 public:
   ScopeEntryReplacer(const For &target, const Stmt &replacement)
@@ -75,6 +119,8 @@ bool AttrReferencesExecutionLoops(const AttrStmt &attr,
   return false;
 }
 
+// AttrStmt wrappers that do not depend on execution-loop vars can be hoisted
+// once around a fused shell instead of being duplicated on every child leaf.
 std::vector<AttrStmt>
 ExtractLeadingHoistableAttrPrefix(const TileScopeRegion &region) {
   std::vector<AttrStmt> attrs;
@@ -169,6 +215,9 @@ Stmt ReapplyAttrPrefix(const std::vector<AttrStmt> &attrs, Stmt body) {
   return body;
 }
 
+// A leaf keeps only the execution suffix below the shared shell depth. The
+// outer shared loops are rebuilt by the enclosing scope node and substituted
+// into the region body here.
 Stmt BuildPrivateExecutionSuffix(const TileScopeRegion &region,
                                  int shared_depth,
                                  const std::vector<Var> &shared_loop_vars) {
@@ -215,11 +264,16 @@ int FindFirstLeafRegionIndex(const SunmmioTileLoopFusionPlannerTreeNode &node) {
   return -1;
 }
 
+// Materialize one planner-tree sibling list into a flat SeqStmt while
+// preserving the planner-chosen execution order among scope nodes and leaves.
 Stmt BuildPlannedStmtList(
     const std::vector<SunmmioTileLoopFusionPlannerTreeNode> &nodes,
     int parent_depth, const std::vector<Var> &shared_loop_vars,
     const std::vector<TileScopeRegion> &regions, int hoisted_attr_prefix_count);
 
+// Emit one shared-shell node from the planner tree. The representative region
+// contributes the concrete loop objects for the shared prefix; planner legality
+// guarantees every child under this node agrees on that shared prefix shape.
 Stmt BuildScopeNode(const SunmmioTileLoopFusionPlannerTreeNode &node,
                     int parent_depth, const std::vector<Var> &shared_loop_vars,
                     const std::vector<TileScopeRegion> &regions,
@@ -277,6 +331,8 @@ Stmt BuildPlannedStmtList(
   return SeqStmt::Flatten(stmts);
 }
 
+// Rewrite works window-by-window: match one discovered source-order run, then
+// replace that exact statement interval with the planner-produced tree.
 struct WindowRewriteSpec {
   TileScopeRegionRun source_region_run;
   std::vector<SunmmioTileLoopFusionPlannerTreeNode> tree;
@@ -291,6 +347,9 @@ public:
   Stmt Rewrite(const Stmt &stmt) { return VisitStmt(stmt); }
 
 private:
+  // Discovery records the original source-order statement run for each window.
+  // Rewrite only substitutes when the current SeqStmt still contains that
+  // exact region interval unchanged.
   bool MatchWindowAt(const Array<Stmt> &seq, int start,
                      const WindowRewriteSpec &window) const {
     if (start + window.source_region_run.num_regions >
@@ -337,6 +396,13 @@ private:
   const std::vector<WindowRewriteSpec> &windows_;
 };
 
+/*!
+ * \brief Apply the chosen planner trees back onto one PrimFunc.
+ *
+ * Windows whose plan tree is empty are true no-ops and are skipped. Every
+ * non-empty window is rewritten by matching its original source-order run and
+ * replacing that interval with the rebuilt fused shell tree.
+ */
 PrimFunc RewriteSunmmioTileLoopFusion(
     PrimFunc func, const SunmmioTileLoopFusionProgram &program,
     const std::vector<SunmmioTileLoopFusionWindowPlan> &plans) {
@@ -365,17 +431,24 @@ PrimFunc RewriteSunmmioTileLoopFusion(
 
 } // namespace
 
+/*!
+ * \brief Module pass entrypoint for Sunmmio tile loop fusion.
+ */
 tvm::transform::Pass SunmmioTileLoopFusion() {
   auto pass_func = [](IRModule mod, const tvm::transform::PassContext &) {
     for (const auto &kv : mod->functions) {
       if (const auto *prim = kv.second.as<tir::PrimFuncNode>()) {
         tir::PrimFunc func = ffi::GetRef<tir::PrimFunc>(prim);
+        // Stage 1: discover planner-visible regions and source-order windows.
         SunmmioTileLoopFusionProgram program =
             BuildSunmmioTileLoopFusionProgram(func);
+        // Stage 2: build one window-local planning problem per discovered run.
         std::vector<SunmmioTileLoopFusionWindowProblem> problems =
             BuildSunmmioTileLoopFusionWindowProblems(program);
+        // Stage 3: choose a fused shared-shell tree for each window.
         std::vector<SunmmioTileLoopFusionWindowPlan> plans =
             PlanSunmmioTileLoopFusionWindowProblems(problems);
+        // Stage 4: splice the chosen trees back into the original TIR.
         func = RewriteSunmmioTileLoopFusion(func, program, plans);
         mod->Add(kv.first, func, true);
       }

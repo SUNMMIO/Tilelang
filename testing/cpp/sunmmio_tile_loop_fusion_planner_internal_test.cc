@@ -2,7 +2,7 @@
 
 #include <tvm/runtime/logging.h>
 
-#include "sunmmio_tile_loop_fusion_planner_internal.h"
+#include "transform/sunmmio_tile_loop_fusion/planner_internal.h"
 
 namespace tvm {
 namespace tl {
