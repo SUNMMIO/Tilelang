@@ -316,6 +316,38 @@ int64_t ComputeLiveRangeDelta(const PlannerState &state) {
   return live_range_delta;
 }
 
+/*!
+ * \brief Apply one candidate scheduling action to the current planner state.
+ *
+ * \details
+ * This function is the one-step state transition used by
+ * \ref SolveWindowPlan. It does not choose the best action; it evaluates
+ * one concrete choice `(region_local_index, close_to_depth, open_to_depth)`
+ * and returns both the immediate planner-cost delta and the resulting
+ * planner state.
+ *
+ * The transition has five jobs:
+ * 1. Close the existing shell stack to the requested depth and reopen the
+ *    candidate region's shell prefix until the attach depth.
+ * 2. Inspect incoming RAW edges to determine which dependences remain
+ *    internal and which ones are cut, charging write-cut cost for the
+ *    latter.
+ * 3. Materialize uncovered reads that are not already resident, charging
+ *    shared-read cost when they must be fetched.
+ * 4. Kill overwritten residents and install the current region's new
+ *    definitions so later actions can reuse them.
+ * 5. Mark the region scheduled, prune dead residents, and recompute the
+ *    live-range and reorder score terms for the next state.
+ *
+ * \param input Immutable window-local planning problem.
+ * \param state Planner state before applying the action.
+ * \param region_local_index Window-local region to schedule.
+ * \param close_to_depth Number of currently open shells to keep.
+ * \param open_to_depth Depth where the candidate region attaches after
+ * reopening any needed shells.
+ * \return The next planner state plus the immediate cost delta charged
+ * by this action.
+ */
 TransitionResult ApplyAction(const WindowPlannerInput &input,
                              const PlannerState &state, int region_local_index,
                              int close_to_depth, int open_to_depth) {
@@ -335,6 +367,10 @@ TransitionResult ApplyAction(const WindowPlannerInput &input,
             static_cast<int>(region.execution_loop_extents.size()));
 
   TransitionResult result{state, {0, 0, 0, 0}};
+
+  // Rebuild the shell stack seen by the candidate region: keep the first
+  // `close_to_depth` shells from the current state, then open any deeper
+  // prefixes needed to attach this region at `open_to_depth`.
   result.next_state.open_scopes.resize(close_to_depth);
   for (int depth = close_to_depth + 1; depth <= open_to_depth; ++depth) {
     result.next_state.open_scopes.push_back(
@@ -343,6 +379,10 @@ TransitionResult ApplyAction(const WindowPlannerInput &input,
          {}});
   }
 
+  // RAW dependences both constrain legality/profitability and tell us which
+  // destination uses are already covered by a producer definition. If the
+  // required producer definition is not visible at this attach depth, the edge
+  // is cut and contributes write-cut cost.
   std::unordered_set<int> raw_covered_use_indices;
   for (int edge_index : input.incoming_edges_by_dst[region_local_index]) {
     const WindowPlannerEdgeInfo &edge = input.edges[edge_index];
@@ -368,6 +408,9 @@ TransitionResult ApplyAction(const WindowPlannerInput &input,
     }
   }
 
+  // Any input use not already satisfied by a covered RAW edge must either find
+  // a resident value in the visible shell prefix or pay shared-read cost to be
+  // materialized for this action.
   for (size_t use_index = 0; use_index < region_view.use_in.size();
        ++use_index) {
     const PlannerBufferValueInfo &use_info = region_view.use_in[use_index];
@@ -391,6 +434,10 @@ TransitionResult ApplyAction(const WindowPlannerInput &input,
     }
   }
 
+  // Definitions produced by the current region overwrite older residents for
+  // the same buffer, then seed the new visible definition residents that later
+  // actions may reuse. The outgoing RAW walk ensures we also install any
+  // producer definitions that become reusable exactly at their dependence rho.
   for (const PlannerBufferValueInfo &def_info : region_view.def_out) {
     KillResidentsForBuffer(&result.next_state.open_scopes,
                            def_info.buffer_name);
@@ -417,6 +464,8 @@ TransitionResult ApplyAction(const WindowPlannerInput &input,
                               edge.instance_count});
   }
 
+  // Finalize the new planner state and score terms after scheduling this
+  // region.
   result.next_state.scheduled_mask = state.scheduled_mask;
   SetBit(&result.next_state.scheduled_mask, region_local_index);
   PruneDeadResidents(input, &result.next_state);
@@ -469,6 +518,39 @@ MemoResult BuildSourceOrderFallbackPlan(const WindowPlannerInput &input) {
   return fallback;
 }
 
+/*!
+ * \brief Solve the optimal remaining schedule suffix from the current planner
+ * state.
+ *
+ * \details
+ * This is the exact memoized search for one planning window. The memo key is
+ * the full \c PlannerState rather than just the scheduled-region mask because
+ * future costs depend on both the currently open shared shells and the
+ * resident values attached to them.
+ *
+ * The recurrence is:
+ * \code
+ *   best(state) = min_a delta(state, a) + best(next_state(state, a))
+ * \endcode
+ * over all legal actions \c a = (region_local_index, close_to_depth,
+ * open_to_depth).
+ *
+ * A legal action chooses an unscheduled region whose predecessors are already
+ * scheduled, closes the current shell stack to \p close_to_depth, and then
+ * reopens shells for the candidate region until \p open_to_depth. Prefix reuse
+ * is only legal when the kept shells match the candidate region's execution
+ * prefix axes and extents.
+ *
+ * Because every planner score term is nonnegative, the search can prune any
+ * branch whose immediate transition delta is already no better than the best
+ * complete plan found so far.
+ *
+ * \param input Immutable window-local planning problem.
+ * \param state Current scheduled mask, open-shell stack, and resident values.
+ * \param context Memo table and exhaustion flag shared across recursive calls.
+ * \return The minimum remaining planner score and the action trace that
+ * achieves it.
+ */
 MemoResult SolveWindowPlan(const WindowPlannerInput &input,
                            const PlannerState &state,
                            PlannerSearchContext *context) {
@@ -476,16 +558,21 @@ MemoResult SolveWindowPlan(const WindowPlannerInput &input,
     return {MakeInfiniteSunmmioTileLoopFusionPlannerScore(), {}};
   }
 
+  // Memoize by the full planner state so repeated subproblems are solved once.
   std::string key = SerializePlannerState(state);
   auto it = context->memo.find(key);
   if (it != context->memo.end()) {
     return it->second;
   }
+  // Cap exact search once the memo grows too large; the caller will fall back
+  // to the simpler source-order plan if this happens.
   if (context->memo.size() >= kMaxPlannerMemoEntries) {
     context->exhausted = true;
     return {MakeInfiniteSunmmioTileLoopFusionPlannerScore(), {}};
   }
 
+  // Base case: once every region in the window has been scheduled, the
+  // remaining suffix contributes zero cost and no further actions.
   bool all_scheduled = true;
   ICHECK(input.problem != nullptr);
   for (int region_local_index = 0;
@@ -506,6 +593,8 @@ MemoResult SolveWindowPlan(const WindowPlannerInput &input,
   MemoResult best;
   best.score = MakeInfiniteSunmmioTileLoopFusionPlannerScore();
 
+  // Enumerate every dependence-legal next region and every legal way to attach
+  // it under the current shell stack.
   for (int region_local_index = 0;
        region_local_index < static_cast<int>(input.regions.size());
        ++region_local_index) {
@@ -523,6 +612,9 @@ MemoResult SolveWindowPlan(const WindowPlannerInput &input,
     for (int close_to_depth = 0;
          close_to_depth <= static_cast<int>(state.open_scopes.size());
          ++close_to_depth) {
+      // `close_to_depth` keeps the first N currently open shells and closes
+      // anything deeper. Only prefixes that match the region's execution
+      // prefix are legal to keep.
       if (!PathMatchesExecutionPrefix(state.open_scopes, close_to_depth,
                                       region.logical_execution_axis_keys,
                                       region.execution_loop_extents)) {
@@ -532,6 +624,9 @@ MemoResult SolveWindowPlan(const WindowPlannerInput &input,
            open_to_depth <=
            static_cast<int>(region.logical_execution_axis_keys.size());
            ++open_to_depth) {
+        // `open_to_depth` extends the kept prefix to the depth where this
+        // region attaches. ApplyAction computes the one-step cost and the next
+        // planner state induced by that decision.
         TransitionResult transition = ApplyAction(
             input, state, region_local_index, close_to_depth, open_to_depth);
         // Planner score terms are nonnegative, so any suffix can only increase
@@ -557,6 +652,8 @@ MemoResult SolveWindowPlan(const WindowPlannerInput &input,
         action.region_index = region_view.global_region_index;
         action.close_to_depth = close_to_depth;
         action.open_to_depth = open_to_depth;
+        // Record the shells opened by this step so the final action trace can
+        // be turned back into the rewrite-facing tree later.
         for (int depth = close_to_depth + 1; depth <= open_to_depth; ++depth) {
           action.opened_shells.push_back(TakeExecutionAxisPrefix(
               region.logical_execution_axis_keys, depth));
@@ -564,6 +661,8 @@ MemoResult SolveWindowPlan(const WindowPlannerInput &input,
               TakeExecutionExtentPrefix(region.execution_loop_extents, depth));
         }
 
+        // This action plus its optimal suffix is the best complete plan seen
+        // from the current state so far.
         best.score = total;
         best.actions.clear();
         best.actions.push_back(std::move(action));

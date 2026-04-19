@@ -1,19 +1,26 @@
 #pragma once
 
-// Planner entrypoints for Sunmmio tile loop fusion.
-//
-// This stage consumes window-local planning problems and produces the chosen
-// region order plus fused shared-shell tree for each window.
-//
-// The exact search implementation and its memo/state machinery are
-// intentionally hidden from callers; the protocol surface is the window problem
-// and plan.
+/*!
+ * \file sunmmio_tile_loop_fusion_planner.h
+ * \brief Public planning entrypoints for Sunmmio tile loop fusion.
+ *
+ * This stage consumes window-local planning problems and produces the chosen
+ * fused shared-shell tree for each window. The exact search implementation and
+ * its memo/state machinery are intentionally hidden from callers; the protocol
+ * surface is the window problem and final plan.
+ */
 
 #include "sunmmio_tile_loop_fusion_protocol.h"
 
 namespace tvm {
 namespace tl {
 
+/*!
+ * \brief Solve each window-local planning problem.
+ *
+ * \param problems Window-local semantic planning problems from discovery.
+ * \return One production-ready fusion plan per input window.
+ */
 std::vector<SunmmioTileLoopFusionWindowPlan>
 PlanSunmmioTileLoopFusionWindowProblems(
     const std::vector<SunmmioTileLoopFusionWindowProblem> &problems);

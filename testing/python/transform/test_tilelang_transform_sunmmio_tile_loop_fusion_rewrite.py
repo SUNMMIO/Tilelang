@@ -1,4 +1,287 @@
-from testing.python.transform._sunmmio_tile_loop_fusion_test_utils import *
+import tilelang as tl
+import tilelang.language as T
+from tilelang import tvm as tvm
+from tilelang.layout import make_blockwise_zz_layout
+from tilelang.tileview import make_tileview
+from tilelang.utils.target import SUNMMIO_TARGET_DESC
+
+IRModule = tvm.IRModule
+
+
+def apply_tiles_lowering(mod):
+    return tl.transform.LowerTilesLoop()(mod)
+
+
+def apply_sunmmio_tiles_lowering(mod):
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl.transform.AddWrapperForSingleBufStore()(mod)
+        mod = tl.transform.LegalizeNegativeIndex()(mod)
+        mod = tl.transform.InjectAssumes()(mod)
+        mod = tl.transform.Simplify()(mod)
+        mod = tl.transform.InferSramScope()(mod)
+        mod = tl.transform.LayoutReducer()(mod)
+        mod = tl.transform.LayoutInference()(mod)
+        mod = tl.transform.LowerTileOp()(mod)
+        mod = tl.transform.LowerTilesLoop()(mod)
+    return mod
+
+
+def apply_sunmmio_tile_loop_fusion(mod):
+    mod = apply_sunmmio_tiles_lowering(mod)
+    return tl.transform.SunmmioTileLoopFusion()(mod)
+
+
+def single_tile_scope_kernel(block_m=32, block_n=32, tile_size=(8, 32), dtype="float16"):
+    @T.prim_func
+    def main(A: T.Tensor((block_m, block_n), dtype), B: T.Tensor((block_m, block_n), dtype)):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((block_m, block_n), dtype)
+            B_shared = T.alloc_shared((block_m, block_n), dtype)
+
+            T.annotate_layout(
+                {
+                    A_shared: make_blockwise_zz_layout(A_shared),
+                    B_shared: make_blockwise_zz_layout(B_shared),
+                }
+            )
+            T.annotate_tileview(
+                {
+                    A_shared: make_tileview(A_shared, tile_size, (-2, -1)),
+                    B_shared: make_tileview(B_shared, tile_size, (-2, -1)),
+                }
+            )
+
+            T.copy(A[0:block_m, 0:block_n], A_shared)
+            for i, j in T.Tiles([block_m, block_n], parallel=True):
+                B_shared[i, j] = A_shared[i, j]
+            T.copy(B_shared, B[0:block_m, 0:block_n])
+
+    return main
+
+
+def two_consecutive_tile_scopes_kernel(block_m=32, block_n=32, tile_size=(8, 32), dtype="float16"):
+    @T.prim_func
+    def main(A: T.Tensor((block_m, block_n), dtype), B: T.Tensor((block_m, block_n), dtype)):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((block_m, block_n), dtype)
+            Tmp_shared = T.alloc_shared((block_m, block_n), dtype)
+            B_shared = T.alloc_shared((block_m, block_n), dtype)
+
+            T.annotate_layout(
+                {
+                    A_shared: make_blockwise_zz_layout(A_shared),
+                    Tmp_shared: make_blockwise_zz_layout(Tmp_shared),
+                    B_shared: make_blockwise_zz_layout(B_shared),
+                }
+            )
+            T.annotate_tileview(
+                {
+                    A_shared: make_tileview(A_shared, tile_size, (-2, -1)),
+                    Tmp_shared: make_tileview(Tmp_shared, tile_size, (-2, -1)),
+                    B_shared: make_tileview(B_shared, tile_size, (-2, -1)),
+                }
+            )
+
+            T.copy(A[0:block_m, 0:block_n], A_shared)
+            for i, j in T.Tiles([block_m, block_n], parallel=True):
+                Tmp_shared[i, j] = A_shared[i, j]
+            for i, j in T.Tiles([block_m, block_n], parallel=True):
+                B_shared[i, j] = Tmp_shared[i, j]
+            T.copy(B_shared, B[0:block_m, 0:block_n])
+
+    return main
+
+
+def flash_attention_online_softmax_tiled_kernel(block_m=32, block_n=32, dim=32, dtype="float32", accum_dtype="float32"):
+    scale = 1.0
+
+    @T.prim_func
+    def main(
+        AccSIn: T.Tensor((block_m, block_n), accum_dtype),
+        AccOIn: T.Tensor((block_m, dim), accum_dtype),
+        ScoresMaxIn: T.Tensor((block_m,), accum_dtype),
+        LogsumIn: T.Tensor((block_m,), accum_dtype),
+        AccSCastOut: T.Tensor((block_m, block_n), accum_dtype),
+        AccOOut: T.Tensor((block_m, dim), accum_dtype),
+        ScoresMaxOut: T.Tensor((block_m,), accum_dtype),
+        LogsumOut: T.Tensor((block_m,), accum_dtype),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            acc_s = T.alloc_shared((block_m, block_n), accum_dtype, scope="shared.rsram")
+            acc_s_cast = T.alloc_shared((block_m, block_n), accum_dtype, scope="shared.rsram")
+            acc_o = T.alloc_shared((block_m, dim), accum_dtype, scope="shared.rsram")
+            scores_max = T.alloc_shared((block_m,), accum_dtype, scope="shared.rsram")
+            scores_max_prev = T.alloc_shared((block_m,), accum_dtype, scope="shared.rsram")
+            scores_scale = T.alloc_shared((block_m,), accum_dtype, scope="shared.rsram")
+            scores_sum = T.alloc_shared((block_m,), accum_dtype, scope="shared.rsram")
+            logsum = T.alloc_shared((block_m,), accum_dtype, scope="shared.rsram")
+
+            T.copy(AccSIn[0:block_m, 0:block_n], acc_s)
+            T.copy(AccOIn[0:block_m, 0:dim], acc_o)
+            T.copy(ScoresMaxIn[0:block_m], scores_max)
+            T.copy(LogsumIn[0:block_m], logsum)
+
+            for i in T.Tiles([block_m], parallel=True):
+                scores_max_prev[i] = scores_max[i]
+
+            for i in T.Tiles([block_m], parallel=True):
+                scores_max[i] = -T.infinity(accum_dtype)
+
+            T.reduce(acc_s, scores_max, "max", dim=1, clear=False)
+
+            for i in T.Tiles([block_m], parallel=True):
+                scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+
+            for i in T.Tiles([block_m], parallel=True):
+                scores_scale[i] = T.exp2(scores_max_prev[i] * T.float32(scale) - scores_max[i] * T.float32(scale))
+
+            for i, j in T.Tiles([block_m, block_n], parallel=True):
+                acc_s[i, j] = T.exp2(acc_s[i, j] * T.float32(scale) - scores_max[i] * T.float32(scale))
+
+            T.reduce(acc_s, scores_sum, "sum", dim=1, clear=True)
+
+            for i in T.Tiles([block_m], parallel=True):
+                logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+
+            for i, j in T.Tiles([block_m, block_n], parallel=True):
+                acc_s_cast[i, j] = acc_s[i, j]
+
+            for i, j in T.Tiles([block_m, dim], parallel=True):
+                acc_o[i, j] *= scores_scale[i]
+
+            T.copy(acc_s_cast, AccSCastOut[0:block_m, 0:block_n])
+            T.copy(acc_o, AccOOut[0:block_m, 0:dim])
+            T.copy(scores_max, ScoresMaxOut[0:block_m])
+            T.copy(logsum, LogsumOut[0:block_m])
+
+    return main
+
+
+def rms_norm_tiled_kernel(block_m=32, block_n=32, dtype="float32", accum_dtype="float32"):
+    eps = 1e-6
+
+    @T.prim_func
+    def main(AIn: T.Tensor((block_m, block_n), dtype), AOut: T.Tensor((block_m, block_n), dtype)):
+        with T.Kernel(1, threads=128) as (bx,):
+            a_shared = T.alloc_shared((block_m, block_n), dtype, scope="shared.rsram")
+            a_square = T.alloc_shared((block_m, block_n), accum_dtype, scope="shared.rsram")
+            a_out = T.alloc_shared((block_m, block_n), dtype, scope="shared.rsram")
+            row_sum = T.alloc_shared((block_m,), accum_dtype, scope="shared.rsram")
+            row_scale = T.alloc_shared((block_m,), accum_dtype, scope="shared.rsram")
+
+            T.copy(AIn[0:block_m, 0:block_n], a_shared)
+
+            for i in T.Tiles([block_m], parallel=True):
+                row_sum[i] = T.float32(0)
+
+            for i, j in T.Tiles([block_m, block_n], parallel=True):
+                a_square[i, j] = a_shared[i, j] * a_shared[i, j]
+
+            T.reduce(a_square, row_sum, "sum", dim=1, clear=False)
+
+            for i in T.Tiles([block_m], parallel=True):
+                row_scale[i] = T.rsqrt(row_sum[i] / T.float32(block_n) + T.float32(eps))
+
+            for i, j in T.Tiles([block_m, block_n], parallel=True):
+                a_out[i, j] = a_shared[i, j] * row_scale[i]
+
+            T.copy(a_out, AOut[0:block_m, 0:block_n])
+
+    return main
+
+
+def attr_wrapped_two_region_lowered_kernel(dtype="float16"):
+    @T.prim_func
+    def main():
+        with T.block("root"):
+            T.reads()
+            T.writes()
+            A_shared = T.alloc_buffer((32, 32), dtype, scope="shared.rsram")
+            Tmp_shared = T.alloc_buffer((32, 32), dtype, scope="shared.rsram")
+            B_shared = T.alloc_buffer((32, 32), dtype, scope="shared.rsram")
+
+            with T.attr("wrapper_scope", "unit_test", 1):
+                for i in T.serial(
+                    4,
+                    annotations={
+                        "tile.domain": [T.int32(32), T.int32(32)],
+                        "tile.execution_axis": T.int32(0),
+                        "tile.execution_domain_axes": [T.int32(0), T.int32(1)],
+                        "tile.scope_entry": T.int32(1),
+                        "tile.tile_size": [T.int32(8), T.int32(32)],
+                    },
+                ):
+                    for j in T.serial(1, annotations={"tile.execution_axis": T.int32(1)}):
+                        for ki in T.serial(8, annotations={"tile.interior": T.int32(1), "tile.interior_axis": T.int32(0)}):
+                            for kj in T.vectorized(32, annotations={"tile.interior": T.int32(1), "tile.interior_axis": T.int32(1)}):
+                                Tmp_shared[i * 8 + ki, j * 32 + kj] = A_shared[i * 8 + ki, j * 32 + kj]
+
+            with T.attr("wrapper_scope", "unit_test", 1):
+                for i in T.serial(
+                    4,
+                    annotations={
+                        "tile.domain": [T.int32(32), T.int32(32)],
+                        "tile.execution_axis": T.int32(0),
+                        "tile.execution_domain_axes": [T.int32(0), T.int32(1)],
+                        "tile.scope_entry": T.int32(1),
+                        "tile.tile_size": [T.int32(8), T.int32(32)],
+                    },
+                ):
+                    for j in T.serial(1, annotations={"tile.execution_axis": T.int32(1)}):
+                        for ki in T.serial(8, annotations={"tile.interior": T.int32(1), "tile.interior_axis": T.int32(0)}):
+                            for kj in T.vectorized(32, annotations={"tile.interior": T.int32(1), "tile.interior_axis": T.int32(1)}):
+                                B_shared[i * 8 + ki, j * 32 + kj] = Tmp_shared[i * 8 + ki, j * 32 + kj]
+
+    return main
+
+
+def let_wrapped_two_region_lowered_kernel(dtype="float16"):
+    source = f"""
+# from tvm.script import tir as T
+@T.prim_func
+def main():
+    A_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")
+    Tmp_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")
+    B_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")
+    x0: T.int32 = 7
+    for i in T.serial(4, annotations={{"tile.domain": [T.int32(32), T.int32(32)], "tile.execution_axis": T.int32(0), "tile.execution_domain_axes": [T.int32(0), T.int32(1)], "tile.scope_entry": T.int32(1), "tile.tile_size": [T.int32(8), T.int32(32)]}}):
+        for j in T.serial(1, annotations={{"tile.execution_axis": T.int32(1)}}):
+            for ki in T.serial(8, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(0)}}):
+                for kj in T.vectorized(32, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(1)}}):
+                    Tmp_shared[i * 8 + ki, j * 32 + kj] = A_shared[i * 8 + ki, j * 32 + kj] + T.Cast("{dtype}", x0)
+    x1: T.int32 = 11
+    for i in T.serial(4, annotations={{"tile.domain": [T.int32(32), T.int32(32)], "tile.execution_axis": T.int32(0), "tile.execution_domain_axes": [T.int32(0), T.int32(1)], "tile.scope_entry": T.int32(1), "tile.tile_size": [T.int32(8), T.int32(32)]}}):
+        for j in T.serial(1, annotations={{"tile.execution_axis": T.int32(1)}}):
+            for ki in T.serial(8, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(0)}}):
+                for kj in T.vectorized(32, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(1)}}):
+                    B_shared[i * 8 + ki, j * 32 + kj] = Tmp_shared[i * 8 + ki, j * 32 + kj] + T.Cast("{dtype}", x1)
+"""
+    return tvm.script.from_source(source)
+
+
+def mixed_plain_and_let_wrapped_two_region_lowered_kernel(dtype="float16"):
+    source = f"""
+# from tvm.script import tir as T
+@T.prim_func
+def main():
+    A_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")
+    Tmp_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")
+    B_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")
+    for i in T.serial(4, annotations={{"tile.domain": [T.int32(32), T.int32(32)], "tile.execution_axis": T.int32(0), "tile.execution_domain_axes": [T.int32(0), T.int32(1)], "tile.scope_entry": T.int32(1), "tile.tile_size": [T.int32(8), T.int32(32)]}}):
+        for j in T.serial(1, annotations={{"tile.execution_axis": T.int32(1)}}):
+            for ki in T.serial(8, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(0)}}):
+                for kj in T.vectorized(32, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(1)}}):
+                    Tmp_shared[i * 8 + ki, j * 32 + kj] = A_shared[i * 8 + ki, j * 32 + kj]
+    x1: T.int32 = 7
+    for i in T.serial(4, annotations={{"tile.domain": [T.int32(32), T.int32(32)], "tile.execution_axis": T.int32(0), "tile.execution_domain_axes": [T.int32(0), T.int32(1)], "tile.scope_entry": T.int32(1), "tile.tile_size": [T.int32(8), T.int32(32)]}}):
+        for j in T.serial(1, annotations={{"tile.execution_axis": T.int32(1)}}):
+            for ki in T.serial(8, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(0)}}):
+                for kj in T.vectorized(32, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(1)}}):
+                    B_shared[i * 8 + ki, j * 32 + kj] = Tmp_shared[i * 8 + ki, j * 32 + kj] + T.Cast("{dtype}", x1)
+"""
+    return tvm.script.from_source(source)
 
 
 def _get_block_by_name(stmt, name):
@@ -135,7 +418,7 @@ def _semantic_tags(stmts):
     return [_semantic_leaf_tag(stmt) for stmt in stmts]
 
 
-def test_sunmmio_tile_loop_fusion_pass_is_noop_for_stage1():
+def test_sunmmio_tile_loop_fusion_is_noop_on_single_lowered_tile_scope():
     mod = IRModule.from_expr(single_tile_scope_kernel().with_attr("global_symbol", "main"))
     mod = apply_tiles_lowering(mod)
 
@@ -149,7 +432,6 @@ def test_sunmmio_tile_loop_fusion_rewrites_consecutive_tile_scopes():
     mod = IRModule.from_expr(two_consecutive_tile_scopes_kernel().with_attr("global_symbol", "main"))
     mod = apply_sunmmio_tile_loop_fusion(mod)
 
-    discovery = get_discovery_summary(mod)
     stmts = _tilelang_root_seq(mod)
     fused_loop = _expect_single_match(
         _find_scope_entry_loops(stmts, tile_size=[8, 32], extent=4),
@@ -157,9 +439,6 @@ def test_sunmmio_tile_loop_fusion_rewrites_consecutive_tile_scopes():
         "fused [8, 32] tile shell with Tmp_shared then B_shared semantics",
     )
 
-    assert discovery["region_count"] == 1
-    assert discovery["region_run_count"] == 1
-    assert discovery["region_run_lengths"] == [1]
     assert _semantic_tags(_expect_loop_body_seq(fused_loop)) == ["Tmp_shared", "B_shared"]
 
 
@@ -167,7 +446,6 @@ def test_sunmmio_tile_loop_fusion_rewrites_flash_attention_window():
     mod = IRModule.from_expr(flash_attention_online_softmax_tiled_kernel().with_attr("global_symbol", "main"))
     mod = apply_sunmmio_tile_loop_fusion(mod)
 
-    discovery = get_discovery_summary(mod)
     stmts = _tilelang_root_seq(mod)
     fused_row = _expect_single_match(
         _find_scope_entry_loops(stmts, tile_size=[32], extent=1),
@@ -180,9 +458,6 @@ def test_sunmmio_tile_loop_fusion_rewrites_flash_attention_window():
         "fused flash tile shell realizing acc_s, acc_s_cast, then reduce_scores_sum",
     )
 
-    assert discovery["region_count"] == 7
-    assert discovery["region_run_count"] == 1
-    assert discovery["region_run_lengths"] == [7]
     assert _semantic_tags(_expect_loop_body_seq(fused_row)) == ["scores_max", "scores_scale"]
     assert _semantic_tags(_expect_loop_body_seq(fused_tile)) == ["acc_s", "acc_s_cast", "reduce_scores_sum"]
 
@@ -223,12 +498,7 @@ def test_sunmmio_tile_loop_fusion_rewrite_hoists_common_attr_wrapper():
     mod = IRModule.from_expr(attr_wrapped_two_region_lowered_kernel().with_attr("global_symbol", "main"))
     mod = tl.transform.SunmmioTileLoopFusion()(mod)
 
-    discovery = get_discovery_summary(mod)
     root_stmts = _root_seq(mod)
-
-    assert discovery["region_count"] == 1
-    assert discovery["region_run_count"] == 1
-    assert discovery["region_run_lengths"] == [1]
 
     attr_stmt = _expect_single_match(
         root_stmts,
@@ -248,12 +518,7 @@ def test_sunmmio_tile_loop_fusion_rewrite_preserves_local_let_wrappers():
     mod = IRModule.from_expr(let_wrapped_two_region_lowered_kernel().with_attr("global_symbol", "main"))
     mod = tl.transform.SunmmioTileLoopFusion()(mod)
 
-    discovery = get_discovery_summary(mod)
     root_stmts = _root_seq(mod)
-
-    assert discovery["region_count"] == 1
-    assert discovery["region_run_count"] == 1
-    assert discovery["region_run_lengths"] == [1]
 
     let_stmt = _expect_single_match(
         root_stmts,
@@ -276,12 +541,7 @@ def test_sunmmio_tile_loop_fusion_rewrite_preserves_local_let_in_mixed_cluster()
     mod = IRModule.from_expr(mixed_plain_and_let_wrapped_two_region_lowered_kernel().with_attr("global_symbol", "main"))
     mod = tl.transform.SunmmioTileLoopFusion()(mod)
 
-    discovery = get_discovery_summary(mod)
     root_stmts = _root_seq(mod)
-
-    assert discovery["region_count"] == 1
-    assert discovery["region_run_count"] == 1
-    assert discovery["region_run_lengths"] == [1]
 
     fused_loop = _expect_single_match(
         root_stmts,
@@ -300,12 +560,7 @@ def test_sunmmio_tile_loop_fusion_rewrites_rmsnorm_window_structurally():
     mod = IRModule.from_expr(rms_norm_tiled_kernel().with_attr("global_symbol", "main"))
     mod = apply_sunmmio_tile_loop_fusion(mod)
 
-    discovery = get_discovery_summary(mod)
     stmts = _tilelang_root_seq(mod)
-
-    assert discovery["region_count"] == 4
-    assert discovery["region_run_count"] == 1
-    assert discovery["region_run_lengths"] == [4]
 
     fused_tile = _expect_single_match(
         _find_scope_entry_loops(stmts, tile_size=[4, 32], extent=8),

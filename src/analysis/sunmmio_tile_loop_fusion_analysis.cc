@@ -476,7 +476,6 @@ struct ActiveDefInfo {
 struct OverlapFacts {
   int rho{0};
   int64_t weight_bytes{0};
-  std::optional<BufferRegion> debug_overlap_region;
 };
 
 std::optional<BufferRegion> IntersectBufferRegions(const BufferRegion &lhs,
@@ -580,7 +579,6 @@ ComputeOverlapFacts(const NormalizedBufferAccess &src_access,
   facts.rho = ComputeRequiredSharedPrefixDepth(src_access, dst_access);
   facts.weight_bytes = ComputeEdgeWeightBytes(
       src_access, dst_access, exact_overlap.value(), kind, analyzer);
-  facts.debug_overlap_region = exact_overlap;
   return facts;
 }
 
@@ -588,9 +586,9 @@ TileScopeDependenceEdge
 MakeDependenceEdge(int src_region_index, int dst_region_index,
                    TileScopeDependenceKind kind, int src_access_index,
                    int dst_access_index, const OverlapFacts &facts) {
-  return {src_region_index,   dst_region_index,          kind,
-          src_access_index,   dst_access_index,          facts.rho,
-          facts.weight_bytes, facts.debug_overlap_region};
+  return {src_region_index,  dst_region_index, kind,
+          src_access_index,  dst_access_index, facts.rho,
+          facts.weight_bytes};
 }
 
 TileScopeRegion

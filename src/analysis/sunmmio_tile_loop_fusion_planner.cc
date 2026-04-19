@@ -1,9 +1,12 @@
-// Exact planning entrypoints for Sunmmio tile loop fusion.
-//
-// This file owns the transition from a window-local semantic problem to a
-// chosen schedule. The DP/search machinery below is intentionally opaque to
-// callers; the public contract is a vector of window problems in, a vector of
-// window plans out.
+/*!
+ * \file sunmmio_tile_loop_fusion_planner.cc
+ * \brief Public planning entrypoints for Sunmmio tile loop fusion.
+ *
+ * This file owns the transition from a window-local semantic problem to a
+ * chosen schedule. The DP/search machinery below is intentionally opaque to
+ * callers; the public contract is a vector of window problems in and a vector
+ * of window plans out.
+ */
 
 #include "sunmmio_tile_loop_fusion_planner_internal.h"
 
@@ -237,10 +240,6 @@ PlanSunmmioTileLoopFusionWindowProblems(
       summary.region_indices.push_back(region.global_region_index);
     }
     summary.score = best.score;
-    summary.actions = best.actions;
-    for (const SunmmioTileLoopFusionPlannerAction &action : best.actions) {
-      summary.order.push_back(action.region_index);
-    }
     summary.tree = planner_internal::BuildPlanTree(best.actions);
     plans.push_back(std::move(summary));
   }
