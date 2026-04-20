@@ -9,4 +9,4 @@
 	url = https://github.com/ROCm/composable_kernel
 [submodule "3rdparty/NPU-IR"]
 	path = 3rdparty/NPU-IR
-	url = https://github.com/SUNMMIO/NPU-IR.git
+	url = git@github.com:SUNMMIO/NPU-IR.git

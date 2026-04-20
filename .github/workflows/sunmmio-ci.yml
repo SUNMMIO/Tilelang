@@ -38,6 +38,12 @@ jobs:
           fetch-depth: 0
           submodules: recursive
           set-safe-directory: true
+          ssh-key: ${{ secrets.SUNMMIONPUIR }}
+
+      - name: Verify submodule
+        run: |
+          git submodule sync --recursive
+          git submodule status --recursive
 
       - name: Setup Python 3.9
         id: setup-pylowest
@@ -159,6 +165,12 @@ jobs:
           fetch-depth: 0
           submodules: recursive
           set-safe-directory: true
+          ssh-key: ${{ secrets.SUNMMIONPUIR }}
+
+      - name: Verify submodule
+        run: |
+          git submodule sync --recursive
+          git submodule status --recursive
 
       - name: Install uv
         run: |
