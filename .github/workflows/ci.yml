@@ -44,6 +44,7 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+          ssh-key: ${{ secrets.SUNMMIONPUIR }}
 
       - name: Setup Python 3.9
         id: setup-pylowest
