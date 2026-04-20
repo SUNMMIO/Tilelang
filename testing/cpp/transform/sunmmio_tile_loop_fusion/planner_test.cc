@@ -165,6 +165,62 @@ TEST(SunmmioTileLoopFusionPlannerTest, LargeWindowFallsBackToSourceOrder) {
   }
 }
 
+TEST(SunmmioTileLoopFusionPlannerTest,
+     BoundaryWindowOf15UsesExactPlannerAndKeepsRawReuse) {
+  SunmmioTileLoopFusionProgram program =
+      BuildSunmmioTileLoopFusionProgram(MakeLongRowChainPrimFunc(15));
+  std::vector<SunmmioTileLoopFusionWindowProblem> problems =
+      BuildSunmmioTileLoopFusionWindowProblems(program);
+  std::vector<SunmmioTileLoopFusionWindowPlan> plans =
+      PlanSunmmioTileLoopFusionWindowProblems(problems);
+
+  ASSERT_EQ(program.region_runs.size(), 1U);
+  EXPECT_EQ(program.region_runs[0].num_regions, 15);
+  ASSERT_EQ(plans.size(), 1U);
+  const SunmmioTileLoopFusionWindowPlan &plan = plans[0];
+
+  EXPECT_EQ(
+      LeafRegionOrder(plan.tree),
+      std::vector<int>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}));
+  EXPECT_EQ(plan.score.write_cut_cost, 0);
+  EXPECT_EQ(plan.score.shared_read_cost, 0);
+  EXPECT_EQ(plan.score.reorder_penalty, 0);
+
+  ASSERT_EQ(plan.tree.size(), 1U);
+  EXPECT_TRUE(plan.tree[0].is_scope);
+  EXPECT_EQ(plan.tree[0].shell_axes, std::vector<std::string>({"i"}));
+  ASSERT_EQ(plan.tree[0].children.size(), 15U);
+  for (int i = 0; i < 15; ++i) {
+    EXPECT_FALSE(plan.tree[0].children[i].is_scope);
+    EXPECT_EQ(plan.tree[0].children[i].region_index, i);
+  }
+}
+
+TEST(SunmmioTileLoopFusionPlannerTest,
+     WindowOf16RegionsFallsBackAtExactPlannerBoundary) {
+  SunmmioTileLoopFusionProgram program =
+      BuildSunmmioTileLoopFusionProgram(MakeLongRowChainPrimFunc(16));
+  std::vector<SunmmioTileLoopFusionWindowProblem> problems =
+      BuildSunmmioTileLoopFusionWindowProblems(program);
+  std::vector<SunmmioTileLoopFusionWindowPlan> plans =
+      PlanSunmmioTileLoopFusionWindowProblems(problems);
+
+  ASSERT_EQ(program.region_runs.size(), 1U);
+  EXPECT_EQ(program.region_runs[0].num_regions, 16);
+  ASSERT_EQ(plans.size(), 1U);
+  const SunmmioTileLoopFusionWindowPlan &plan = plans[0];
+
+  EXPECT_EQ(
+      LeafRegionOrder(plan.tree),
+      std::vector<int>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}));
+  EXPECT_GT(plan.score.write_cut_cost, 0);
+  ASSERT_EQ(plan.tree.size(), 16U);
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_FALSE(plan.tree[i].is_scope);
+    EXPECT_EQ(plan.tree[i].region_index, i);
+  }
+}
+
 TEST(SunmmioTileLoopFusionPlannerTest, SharedRowRawEdgeBuildsSingleOuterShell) {
   Buffer row_buffer = MakeSharedBuffer("row_buffer", {I(8)});
 

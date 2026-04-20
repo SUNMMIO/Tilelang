@@ -4,6 +4,7 @@ from tilelang import tvm as tvm
 from tilelang.layout import make_blockwise_zz_layout
 from tilelang.tileview import make_tileview
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
+import textwrap
 
 IRModule = tvm.IRModule
 
@@ -284,6 +285,199 @@ def main():
     return tvm.script.from_source(source)
 
 
+def _make_manual_lowered_primfunc(buffer_decls, stmt_snippets):
+    body = "\n".join([*buffer_decls, *stmt_snippets])
+    source = "# from tvm.script import tir as T\n@T.prim_func\ndef main():\n"
+    source += textwrap.indent(body, "    ")
+    return tvm.script.from_source(source)
+
+
+def _lowered_2d_tile_region(dst, expr, *, block_m=32, block_n=32, tile_size=(8, 32)):
+    tile_m, tile_n = tile_size
+    outer_m = block_m // tile_m
+    outer_n = block_n // tile_n
+    return textwrap.dedent(
+        f"""
+        for i in T.serial(
+            {outer_m},
+            annotations={{
+                "tile.domain": [T.int32({block_m}), T.int32({block_n})],
+                "tile.execution_axis": T.int32(0),
+                "tile.execution_domain_axes": [T.int32(0), T.int32(1)],
+                "tile.scope_entry": T.int32(1),
+                "tile.tile_size": [T.int32({tile_m}), T.int32({tile_n})],
+            }},
+        ):
+            for j in T.serial({outer_n}, annotations={{"tile.execution_axis": T.int32(1)}}):
+                for ki in T.serial({tile_m}, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(0)}}):
+                    for kj in T.vectorized({tile_n}, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(1)}}):
+                        {dst}[i * {tile_m} + ki, j * {tile_n} + kj] = {expr}
+        """
+    ).strip()
+
+
+def _lowered_row_summary_region(dst, expr, *, block_m=32, block_n=32, tile_size=(8, 32)):
+    tile_m, tile_n = tile_size
+    outer_m = block_m // tile_m
+    outer_n = block_n // tile_n
+    return textwrap.dedent(
+        f"""
+        for i in T.serial(
+            {outer_m},
+            annotations={{
+                "tile.domain": [T.int32({block_m}), T.int32({block_n})],
+                "tile.execution_axis": T.int32(0),
+                "tile.execution_domain_axes": [T.int32(0), T.int32(1)],
+                "tile.scope_entry": T.int32(1),
+                "tile.tile_size": [T.int32({tile_m}), T.int32({tile_n})],
+            }},
+        ):
+            for j in T.serial({outer_n}, annotations={{"tile.execution_axis": T.int32(1)}}):
+                {dst}[i] = {expr}
+        """
+    ).strip()
+
+
+def independent_two_region_lowered_kernel(dtype="float16"):
+    return _make_manual_lowered_primfunc(
+        [
+            f'A_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'Tmp_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'C_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+        ],
+        [
+            _lowered_2d_tile_region("Tmp_shared", "A_shared[i * 8 + ki, j * 32 + kj]"),
+            _lowered_2d_tile_region("C_shared", "A_shared[i * 8 + ki, j * 32 + kj]"),
+        ],
+    )
+
+
+def incompatible_prefix_two_region_lowered_kernel(dtype="float16"):
+    return _make_manual_lowered_primfunc(
+        [
+            f'A_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'Tmp_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'B_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+        ],
+        [
+            _lowered_2d_tile_region("Tmp_shared", "A_shared[i * 8 + ki, j * 32 + kj]", tile_size=(8, 32)),
+            _lowered_2d_tile_region("B_shared", "Tmp_shared[i * 4 + ki, j * 32 + kj]", tile_size=(4, 32)),
+        ],
+    )
+
+
+def interrupted_two_region_lowered_kernel(dtype="float16"):
+    return _make_manual_lowered_primfunc(
+        [
+            f'A_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'Tmp_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'B_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'fence = T.alloc_buffer((1,), "{dtype}", scope="shared.rsram")',
+        ],
+        [
+            _lowered_2d_tile_region("Tmp_shared", "A_shared[i * 8 + ki, j * 32 + kj]"),
+            f'fence[0] = T.Cast("{dtype}", 0)',
+            _lowered_2d_tile_region("B_shared", "Tmp_shared[i * 8 + ki, j * 32 + kj]"),
+        ],
+    )
+
+
+def three_region_chain_lowered_kernel(dtype="float16"):
+    return _make_manual_lowered_primfunc(
+        [
+            f'A_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'Tmp0_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'Tmp1_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'B_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+        ],
+        [
+            _lowered_2d_tile_region("Tmp0_shared", "A_shared[i * 8 + ki, j * 32 + kj]"),
+            _lowered_2d_tile_region("Tmp1_shared", "Tmp0_shared[i * 8 + ki, j * 32 + kj]"),
+            _lowered_2d_tile_region("B_shared", "Tmp1_shared[i * 8 + ki, j * 32 + kj]"),
+        ],
+    )
+
+
+def war_two_region_lowered_kernel(dtype="float16"):
+    return _make_manual_lowered_primfunc(
+        [
+            f'A_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'Tmp_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'B_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+        ],
+        [
+            _lowered_2d_tile_region("B_shared", "Tmp_shared[i * 8 + ki, j * 32 + kj]"),
+            _lowered_2d_tile_region("Tmp_shared", "A_shared[i * 8 + ki, j * 32 + kj]"),
+        ],
+    )
+
+
+def partial_depth_two_region_lowered_kernel(dtype="float16"):
+    return _make_manual_lowered_primfunc(
+        [
+            f'A_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'row_sum = T.alloc_buffer((4,), "{dtype}", scope="shared.rsram")',
+            f'B_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+        ],
+        [
+            _lowered_row_summary_region("row_sum", "A_shared[i * 8, 0]"),
+            _lowered_2d_tile_region("B_shared", "A_shared[i * 8 + ki, j * 32 + kj] + row_sum[i]"),
+        ],
+    )
+
+
+def two_disjoint_groups_lowered_kernel(dtype="float16"):
+    return _make_manual_lowered_primfunc(
+        [
+            f'A_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'Tmp0_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'B_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'Tmp1_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'C_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'fence = T.alloc_buffer((1,), "{dtype}", scope="shared.rsram")',
+        ],
+        [
+            _lowered_2d_tile_region("Tmp0_shared", "A_shared[i * 8 + ki, j * 32 + kj]"),
+            _lowered_2d_tile_region("B_shared", "Tmp0_shared[i * 8 + ki, j * 32 + kj]"),
+            f'fence[0] = T.Cast("{dtype}", 0)',
+            _lowered_2d_tile_region("Tmp1_shared", "A_shared[i * 8 + ki, j * 32 + kj]"),
+            _lowered_2d_tile_region("C_shared", "Tmp1_shared[i * 8 + ki, j * 32 + kj]"),
+        ],
+    )
+
+
+def loop_var_let_wrapped_two_region_lowered_kernel(dtype="float16"):
+    return _make_manual_lowered_primfunc(
+        [
+            f'A_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'Tmp_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+            f'B_shared = T.alloc_buffer((32, 32), "{dtype}", scope="shared.rsram")',
+        ],
+        [
+            _lowered_2d_tile_region("Tmp_shared", "A_shared[i * 8 + ki, j * 32 + kj]"),
+            textwrap.dedent(
+                f"""
+                for i in T.serial(
+                    4,
+                    annotations={{
+                        "tile.domain": [T.int32(32), T.int32(32)],
+                        "tile.execution_axis": T.int32(0),
+                        "tile.execution_domain_axes": [T.int32(0), T.int32(1)],
+                        "tile.scope_entry": T.int32(1),
+                        "tile.tile_size": [T.int32(8), T.int32(32)],
+                    }},
+                ):
+                    for j in T.serial(1, annotations={{"tile.execution_axis": T.int32(1)}}):
+                        x1: T.int32 = i * 8 + j * 32
+                        for ki in T.serial(8, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(0)}}):
+                            for kj in T.vectorized(32, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(1)}}):
+                                B_shared[i * 8 + ki, j * 32 + kj] = Tmp_shared[i * 8 + ki, j * 32 + kj] + T.Cast("{dtype}", x1)
+                """
+            ).strip(),
+        ],
+    )
+
+
 def _get_block_by_name(stmt, name):
     found = None
 
@@ -367,6 +561,28 @@ def _collect_buffer_accesses(stmt):
     return reads, writes
 
 
+def _single_write_name(stmt):
+    _, writes = _collect_buffer_accesses(stmt)
+    write_names = sorted(set(writes))
+    assert len(write_names) == 1, f"Expected a single written buffer, but found {write_names}"
+    return write_names[0]
+
+
+def _leaf_write_names(stmts):
+    return [_single_write_name(stmt) for stmt in stmts]
+
+
+def _collect_var_names(node):
+    names = set()
+
+    def visit(obj):
+        if isinstance(obj, tvm.tir.Var):
+            names.add(obj.name)
+
+    tvm.tir.stmt_functor.post_order_visit(node, visit)
+    return names
+
+
 def _semantic_leaf_tag(stmt):
     if isinstance(stmt, tvm.tir.LetStmt):
         return _semantic_leaf_tag(stmt.body)
@@ -440,6 +656,127 @@ def test_sunmmio_tile_loop_fusion_rewrites_consecutive_tile_scopes():
     )
 
     assert _semantic_tags(_expect_loop_body_seq(fused_loop)) == ["Tmp_shared", "B_shared"]
+
+
+def test_sunmmio_tile_loop_fusion_keeps_independent_readers_in_source_order():
+    mod = IRModule.from_expr(independent_two_region_lowered_kernel().with_attr("global_symbol", "main"))
+    mod = tl.transform.SunmmioTileLoopFusion()(mod)
+
+    root_stmts = _root_seq(mod)
+    scope_loops = _find_scope_entry_loops(root_stmts)
+
+    if len(scope_loops) == 1:
+        assert _leaf_write_names(_expect_loop_body_seq(scope_loops[0])) == ["Tmp_shared", "C_shared"]
+    else:
+        assert len(scope_loops) == 2
+        assert [_single_write_name(loop) for loop in scope_loops] == ["Tmp_shared", "C_shared"]
+
+
+def test_sunmmio_tile_loop_fusion_does_not_merge_incompatible_execution_prefixes():
+    mod = IRModule.from_expr(incompatible_prefix_two_region_lowered_kernel().with_attr("global_symbol", "main"))
+    mod = tl.transform.SunmmioTileLoopFusion()(mod)
+
+    root_stmts = _root_seq(mod)
+    scope_loops = _find_scope_entry_loops(root_stmts)
+
+    assert len(scope_loops) == 2
+    assert [_single_write_name(loop) for loop in scope_loops] == ["Tmp_shared", "B_shared"]
+    assert [[int(x) for x in _for_annotations(loop)["tile.tile_size"]] for loop in scope_loops] == [[8, 32], [4, 32]]
+    assert [int(loop.extent) for loop in scope_loops] == [4, 8]
+
+
+def test_sunmmio_tile_loop_fusion_does_not_cross_non_tile_statement():
+    mod = IRModule.from_expr(interrupted_two_region_lowered_kernel().with_attr("global_symbol", "main"))
+    mod = tl.transform.SunmmioTileLoopFusion()(mod)
+
+    root_stmts = _root_seq(mod)
+
+    assert len(root_stmts) == 3
+    assert _is_scope_entry_loop(root_stmts[0], tile_size=[8, 32], extent=4)
+    assert _single_write_name(root_stmts[0]) == "Tmp_shared"
+    assert isinstance(root_stmts[1], tvm.tir.BufferStore)
+    assert root_stmts[1].buffer.name == "fence"
+    assert _is_scope_entry_loop(root_stmts[2], tile_size=[8, 32], extent=4)
+    assert _single_write_name(root_stmts[2]) == "B_shared"
+
+
+def test_sunmmio_tile_loop_fusion_rewrites_three_region_chain():
+    mod = IRModule.from_expr(three_region_chain_lowered_kernel().with_attr("global_symbol", "main"))
+    mod = tl.transform.SunmmioTileLoopFusion()(mod)
+
+    root_stmts = _root_seq(mod)
+    fused_loop = _expect_single_match(
+        _find_scope_entry_loops(root_stmts, tile_size=[8, 32], extent=4),
+        lambda loop: _leaf_write_names(_expect_loop_body_seq(loop)) == ["Tmp0_shared", "Tmp1_shared", "B_shared"],
+        "three-region fused tile shell",
+    )
+
+    assert _leaf_write_names(_expect_loop_body_seq(fused_loop)) == ["Tmp0_shared", "Tmp1_shared", "B_shared"]
+
+
+def test_sunmmio_tile_loop_fusion_preserves_war_order():
+    mod = IRModule.from_expr(war_two_region_lowered_kernel().with_attr("global_symbol", "main"))
+    mod = tl.transform.SunmmioTileLoopFusion()(mod)
+
+    root_stmts = _root_seq(mod)
+    scope_loops = _find_scope_entry_loops(root_stmts)
+
+    if len(scope_loops) == 1:
+        assert _leaf_write_names(_expect_loop_body_seq(scope_loops[0])) == ["B_shared", "Tmp_shared"]
+    else:
+        assert len(scope_loops) == 2
+        assert [_single_write_name(loop) for loop in scope_loops] == ["B_shared", "Tmp_shared"]
+
+
+def test_sunmmio_tile_loop_fusion_can_share_only_the_outer_loop_prefix():
+    mod = IRModule.from_expr(partial_depth_two_region_lowered_kernel().with_attr("global_symbol", "main"))
+    mod = tl.transform.SunmmioTileLoopFusion()(mod)
+
+    root_stmts = _root_seq(mod)
+    fused_loop = _expect_single_match(
+        _find_scope_entry_loops(root_stmts, tile_size=[8, 32], extent=4),
+        lambda loop: _leaf_write_names(_expect_loop_body_seq(loop)) == ["row_sum", "B_shared"],
+        "depth-1 fused outer loop prefix",
+    )
+
+    fused_body = _expect_loop_body_seq(fused_loop)
+    assert _leaf_write_names(fused_body) == ["row_sum", "B_shared"]
+    assert all(isinstance(stmt, tvm.tir.For) for stmt in fused_body)
+    assert all(_for_annotations(stmt).get("tile.execution_axis") == 1 for stmt in fused_body)
+
+
+def test_sunmmio_tile_loop_fusion_rewrites_multiple_planning_groups_independently():
+    mod = IRModule.from_expr(two_disjoint_groups_lowered_kernel().with_attr("global_symbol", "main"))
+    mod = tl.transform.SunmmioTileLoopFusion()(mod)
+
+    root_stmts = _root_seq(mod)
+
+    assert len(root_stmts) == 3
+    assert _is_scope_entry_loop(root_stmts[0], tile_size=[8, 32], extent=4)
+    assert _leaf_write_names(_expect_loop_body_seq(root_stmts[0])) == ["Tmp0_shared", "B_shared"]
+    assert isinstance(root_stmts[1], tvm.tir.BufferStore)
+    assert root_stmts[1].buffer.name == "fence"
+    assert _is_scope_entry_loop(root_stmts[2], tile_size=[8, 32], extent=4)
+    assert _leaf_write_names(_expect_loop_body_seq(root_stmts[2])) == ["Tmp1_shared", "C_shared"]
+
+
+def test_sunmmio_tile_loop_fusion_rewrite_preserves_loop_var_dependent_local_let():
+    mod = IRModule.from_expr(loop_var_let_wrapped_two_region_lowered_kernel().with_attr("global_symbol", "main"))
+    mod = tl.transform.SunmmioTileLoopFusion()(mod)
+
+    root_stmts = _root_seq(mod)
+    fused_loop = _expect_single_match(
+        _find_scope_entry_loops(root_stmts, tile_size=[8, 32], extent=4),
+        lambda loop: _semantic_tags(_expect_loop_body_seq(loop)) == ["Tmp_shared", "B_shared"],
+        "fused shell with loop-var-dependent local LetStmt leaf",
+    )
+
+    fused_body = _expect_loop_body_seq(fused_loop)
+    assert _semantic_leaf_tag(fused_body[0]) == "Tmp_shared"
+    assert isinstance(fused_body[1], tvm.tir.LetStmt)
+    assert fused_body[1].var.name == "x1"
+    assert _semantic_leaf_tag(fused_body[1]) == "B_shared"
+    assert {"i", "j"}.issubset(_collect_var_names(fused_body[1].value))
 
 
 def test_sunmmio_tile_loop_fusion_rewrites_flash_attention_window():
