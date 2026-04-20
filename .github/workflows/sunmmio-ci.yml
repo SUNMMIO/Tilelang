@@ -108,7 +108,7 @@ jobs:
             clang-tidy cmake ninja-build git curl ca-certificates \
             build-essential pkg-config libprotobuf-dev \
             protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev \
-            iproute2 iptables curl dnsutils
+            iproute2 iptables curl dnsutils openssh-client
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
 
       - name: Fix container networking
