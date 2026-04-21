@@ -83,20 +83,21 @@ jobs:
       USE_CUDA: 1
       PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu128
       UV_INDEX: https://download.pytorch.org/whl/cu128
-      CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON -DTILELANG_UPDATE_SUBMODULES=OFF -DPython3_EXECUTABLE=.venv/bin/python -DPython_EXECUTABLE=.venv/bin/python"
+      CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON -DUSE_Z3=OFF -DTILELANG_UPDATE_SUBMODULES=OFF -DPython3_EXECUTABLE=/usr/bin/python3.12 -DPython_EXECUTABLE=/usr/bin/python3.12"
       CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF"
       XDG_CACHE_HOME: /ci-cache
       PIP_CACHE_DIR: /ci-cache/pip
       UV_CACHE_DIR: /ci-cache/uv
       PRE_COMMIT_HOME: /ci-cache/pre-commit
       GTEST_CACHE_DIR: /ci-cache/googletest
+      NPUIR_CACHE_ROOT: /ci-cache/npuir
     defaults:
       run:
         shell: bash
     steps:
       - name: Prepare persistent cache
         run: |
-          mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}" "${PRE_COMMIT_HOME}"
+          mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}" "${PRE_COMMIT_HOME}" "${GTEST_CACHE_DIR}" "${NPUIR_CACHE_ROOT}"
           echo "Cache mount: /ci-cache"
           du -sh /ci-cache/* 2>/dev/null || echo "Cache is empty (first run)"
 
@@ -172,6 +173,139 @@ jobs:
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
 
+      - name: Install clang-tidy toolchain
+        run: |
+          # Keep clang-tidy aligned with requirements-lint.txt instead of the base image.
+          uv venv .clang-tidy-venv --python /usr/bin/python3.12
+          uv pip install --python .clang-tidy-venv/bin/python -v -r requirements-lint.txt
+
+      - name: Read LLVM pin from NPU-IR
+        run: |
+          set -euo pipefail
+
+          llvm_config="3rdparty/NPU-IR/cmake/IncludeLLVM.cmake"
+          if [[ ! -f "${llvm_config}" ]]; then
+            echo "::error::Missing ${llvm_config}"
+            exit 1
+          fi
+
+          NPUIR_LLVM_COMMIT="$(
+            grep -E '^[[:space:]]*set\(LLVM_BUILD_COMMIT_HASH[[:space:]]+' "${llvm_config}" \
+              | grep -Eo '[0-9a-f]{40}' \
+              | head -n1
+          )"
+
+          if [[ -z "${NPUIR_LLVM_COMMIT}" ]]; then
+            echo "::error::Could not determine the pinned LLVM commit from ${llvm_config}"
+            exit 1
+          fi
+
+          echo "NPUIR_LLVM_COMMIT=${NPUIR_LLVM_COMMIT}" >> "${GITHUB_ENV}"
+          echo "Using NPU-IR LLVM pin ${NPUIR_LLVM_COMMIT}"
+
+      - name: Prepare cached LLVM checkout for NPU-IR
+        run: |
+          set -euo pipefail
+
+          NPUIR_CACHE_DIR="${NPUIR_CACHE_ROOT}/${NPUIR_LLVM_COMMIT}"
+          NPUIR_LLVM_SOURCE_DIR="${NPUIR_CACHE_DIR}/llvm-project"
+          NPUIR_LLVM_BUILD_DIR="${NPUIR_CACHE_DIR}/llvm-project-build"
+          NPUIR_LLVM_MARKER_FILE="${NPUIR_CACHE_DIR}/llvm-project.commit"
+
+          echo "NPUIR_CACHE_DIR=${NPUIR_CACHE_DIR}" >> "${GITHUB_ENV}"
+          echo "NPUIR_LLVM_SOURCE_DIR=${NPUIR_LLVM_SOURCE_DIR}" >> "${GITHUB_ENV}"
+          echo "NPUIR_LLVM_BUILD_DIR=${NPUIR_LLVM_BUILD_DIR}" >> "${GITHUB_ENV}"
+
+          lock_file="${NPUIR_CACHE_ROOT}/llvm-project.lock"
+          exec 9>"${lock_file}"
+          flock 9
+
+          if [[ -f "${NPUIR_LLVM_MARKER_FILE}" ]] && [[ -f "${NPUIR_LLVM_SOURCE_DIR}/llvm/CMakeLists.txt" ]]; then
+            current_rev="$(<"${NPUIR_LLVM_MARKER_FILE}")"
+          else
+            current_rev=""
+          fi
+
+          if [[ "${current_rev}" == "${NPUIR_LLVM_COMMIT}" ]]; then
+            echo "Reusing cached llvm-project checkout at ${current_rev}"
+          else
+            archive_url="https://codeload.github.com/llvm/llvm-project/tar.gz/${NPUIR_LLVM_COMMIT}"
+            archive_file="${NPUIR_CACHE_DIR}/llvm-project-${NPUIR_LLVM_COMMIT}.tar.gz"
+            extract_root="${NPUIR_CACHE_DIR}/llvm-project-extract.tmp"
+            source_tmp="${NPUIR_CACHE_DIR}/llvm-project.tmp"
+
+            rm -rf "${extract_root}" "${source_tmp}"
+            mkdir -p "${NPUIR_CACHE_DIR}" "${extract_root}"
+
+            wget \
+              --tries=5 \
+              --waitretry=10 \
+              --retry-connrefused \
+              --timeout=60 \
+              --output-document="${archive_file}" \
+              "${archive_url}"
+
+            tar -xzf "${archive_file}" -C "${extract_root}"
+            extracted_dir="$(find "${extract_root}" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+            if [[ -z "${extracted_dir}" ]] || [[ ! -f "${extracted_dir}/llvm/CMakeLists.txt" ]]; then
+              echo "::error::Extracted llvm-project archive is missing llvm/CMakeLists.txt"
+              exit 1
+            fi
+
+            mv "${extracted_dir}" "${source_tmp}"
+            rm -rf "${NPUIR_LLVM_SOURCE_DIR}" "${NPUIR_LLVM_BUILD_DIR}"
+            mv "${source_tmp}" "${NPUIR_LLVM_SOURCE_DIR}"
+            printf '%s\n' "${NPUIR_LLVM_COMMIT}" > "${NPUIR_LLVM_SOURCE_DIR}/.tilelang-source-commit"
+            printf '%s\n' "${NPUIR_LLVM_COMMIT}" > "${NPUIR_LLVM_MARKER_FILE}"
+            rm -f "${archive_file}"
+            rm -rf "${extract_root}"
+          fi
+
+          du -sh "${NPUIR_CACHE_DIR}" 2>/dev/null || true
+
+      - name: Run clang-tidy
+        id: clang-tidy
+        run: |
+          CLANG_TIDY_PYTHON=".clang-tidy-venv/bin/python"
+          CLANG_TIDY_BIN=".clang-tidy-venv/bin/clang-tidy"
+          CLANG_APPLY_REPLACEMENTS_BIN=".clang-tidy-venv/bin/clang-apply-replacements"
+          echo "\$ ${CLANG_TIDY_BIN} --version" && "${CLANG_TIDY_BIN}" --version
+
+          # Run clang-tidy before provisioning the heavyweight Python/CUDA test env.
+          # The clang-tidy configure only needs system Python and CUDA headers.
+          RCT_URL=https://raw.githubusercontent.com/llvm/llvm-project/refs/heads/release/21.x/clang-tools-extra/clang-tidy/tool/run-clang-tidy.py
+          echo "Downloading run-clang-tidy script from ${RCT_URL}"
+          curl -LsSf "${RCT_URL}" -o run-clang-tidy.py
+          CLANG_TIDY=("${CLANG_TIDY_PYTHON}" run-clang-tidy.py -j "$(nproc)")
+          if [[ -x "${CLANG_APPLY_REPLACEMENTS_BIN}" ]]; then
+            echo "Using clang-apply-replacements from ${CLANG_APPLY_REPLACEMENTS_BIN}"
+            CLANG_TIDY+=(-fix -clang-apply-replacements-binary="${CLANG_APPLY_REPLACEMENTS_BIN}")
+          else
+            echo "::warning::clang-apply-replacements not found in PATH, automatic fixing disabled."
+          fi
+
+          # Reuse a persistent NPU-IR/LLVM cache so clang-tidy does not need to
+          # clone llvm-project or reconfigure its build tree on every run.
+          lock_file="${NPUIR_CACHE_ROOT}/llvm-project.lock"
+          exec 9>"${lock_file}"
+          flock 9
+          cmake -S . -B cmake-build --fresh ${CLANG_TIDY_CMAKE_OPTIONS} \
+            -DTILELANG_NPUIR_BINARY_DIR="${NPUIR_CACHE_DIR}"
+          flock -u 9
+
+          CXX_FILES=$(find src -type f \( -iname "*.[ch]pp" -o -iname "*.cc" -o -iname "*.c" -o -iname "*.h" \))
+          rc=0
+          "${CLANG_TIDY[@]}" -clang-tidy-binary="${CLANG_TIDY_BIN}" \
+            -exclude-header-filter='^(3rdparty|tvm)/.*$' \
+            -p="cmake-build" ${CXX_FILES} || rc="$?"
+          rm -rf cmake-build run-clang-tidy.py
+          if (( rc != 0 )); then
+            echo "::error::clang-tidy found issues (exit code: ${rc}). Please run 'clang-tidy --fix' locally to fix them."
+            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            git diff --color=always || true
+            exit "${rc}"
+          fi
+
       - name: Setup Python environment
         run: |
           uv venv .venv --python /usr/bin/python3.12
@@ -185,44 +319,10 @@ jobs:
           uv run --no-project -m -- torch.utils.collect_env
           echo "::endgroup::"
 
-      - name: Run clang-tidy
-        id: clang-tidy
-        run: |
-          echo "\$ $(command -v clang-tidy) --version" && clang-tidy --version
-
-          # Download run-clang-tidy script
-          RCT_URL=https://raw.githubusercontent.com/llvm/llvm-project/refs/heads/release/21.x/clang-tools-extra/clang-tidy/tool/run-clang-tidy.py
-          echo "Downloading run-clang-tidy script from ${RCT_URL}"
-          echo "import urllib.request; url = '${RCT_URL}'.rstrip('/'); urllib.request.urlretrieve(url, url.split('/')[-1])" | uv run --no-project --script -
-          CLANG_TIDY=(uv run --no-project --script -- run-clang-tidy.py)
-          if [[ -x "$(command -v clang-apply-replacements)" ]]; then
-            echo "Using clang-apply-replacements from $(command -v clang-apply-replacements)"
-            CLANG_TIDY+=(-fix -clang-apply-replacements-binary="$(command -v clang-apply-replacements)")
-          else
-            echo "::warning::clang-apply-replacements not found in PATH, automatic fixing disabled."
-          fi
-
-          # Activate venv so CMake finds z3 and other Python packages
-          . .venv/bin/activate
-
-          # Run cmake to create the build directory with compile_commands.json
-          cmake -S . -B cmake-build --fresh ${CLANG_TIDY_CMAKE_OPTIONS}  # no quotes here
-
-          CXX_FILES=$(find src -type f -iname "*.[ch]pp" -o -iname "*.cc" -o -iname "*.c" -o -iname "*.h")
-          rc=0
-          "${CLANG_TIDY[@]}" -clang-tidy-binary="$(command -v clang-tidy)" \
-            -exclude-header-filter='^(3rdparty|tvm)/.*$' \
-            -p="cmake-build" ${CXX_FILES} || rc="$?"
-          rm -rf cmake-build run-clang-tidy.py
-          if (( rc != 0 )); then
-            echo "::error::clang-tidy found issues (exit code: ${rc}). Please run 'clang-tidy --fix' locally to fix them."
-            git config --global --add safe.directory "$GITHUB_WORKSPACE"
-            git diff --color=always || true
-            exit "${rc}"
-          fi
-
       - name: Install project (wheel form)
         run: |
+          # Reuse the same cached NPU-IR/LLVM tree during the wheel build.
+          export CMAKE_ARGS="${CMAKE_ARGS} -DTILELANG_NPUIR_BINARY_DIR=${NPUIR_CACHE_DIR}"
           uv pip install -v .
 
       - name: Run Python test suite
@@ -251,7 +351,7 @@ jobs:
         run: |
           echo "=== Cache usage before pruning ==="
           du -sh /ci-cache/* 2>/dev/null || true
-          # Remove uv cache entries not used in the last 7 days
-          uv cache prune --ci 2>/dev/null || true
+          # Keep warm prebuilt wheels on this persistent self-hosted runner.
+          uv cache prune 2>/dev/null || true
           echo "=== Cache usage after pruning ==="
           du -sh /ci-cache/* 2>/dev/null || true
