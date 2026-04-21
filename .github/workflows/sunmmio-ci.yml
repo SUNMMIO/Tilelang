@@ -168,6 +168,17 @@ jobs:
           set-safe-directory: true
           ssh-key: ${{ secrets.SUNMMIONPUIR }}
 
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Install clang-tidy toolchain
+        run: |
+          # Keep clang-tidy aligned with requirements-lint.txt instead of the base image.
+          uv venv .clang-tidy-venv --python /usr/bin/python3.12
+          uv pip install --python .clang-tidy-venv/bin/python -v -r requirements-lint.txt
+
       - name: Read LLVM pin from NPU-IR
         run: |
           set -euo pipefail
@@ -255,17 +266,20 @@ jobs:
       - name: Run clang-tidy
         id: clang-tidy
         run: |
-          echo "\$ $(command -v clang-tidy) --version" && clang-tidy --version
+          CLANG_TIDY_PYTHON=".clang-tidy-venv/bin/python"
+          CLANG_TIDY_BIN=".clang-tidy-venv/bin/clang-tidy"
+          CLANG_APPLY_REPLACEMENTS_BIN=".clang-tidy-venv/bin/clang-apply-replacements"
+          echo "\$ ${CLANG_TIDY_BIN} --version" && "${CLANG_TIDY_BIN}" --version
 
           # Run clang-tidy before provisioning the heavyweight Python/CUDA test env.
           # The clang-tidy configure only needs system Python and CUDA headers.
           RCT_URL=https://raw.githubusercontent.com/llvm/llvm-project/refs/heads/release/21.x/clang-tools-extra/clang-tidy/tool/run-clang-tidy.py
           echo "Downloading run-clang-tidy script from ${RCT_URL}"
           curl -LsSf "${RCT_URL}" -o run-clang-tidy.py
-          CLANG_TIDY=(python3.12 run-clang-tidy.py -j "$(nproc)")
-          if [[ -x "$(command -v clang-apply-replacements)" ]]; then
-            echo "Using clang-apply-replacements from $(command -v clang-apply-replacements)"
-            CLANG_TIDY+=(-fix -clang-apply-replacements-binary="$(command -v clang-apply-replacements)")
+          CLANG_TIDY=("${CLANG_TIDY_PYTHON}" run-clang-tidy.py -j "$(nproc)")
+          if [[ -x "${CLANG_APPLY_REPLACEMENTS_BIN}" ]]; then
+            echo "Using clang-apply-replacements from ${CLANG_APPLY_REPLACEMENTS_BIN}"
+            CLANG_TIDY+=(-fix -clang-apply-replacements-binary="${CLANG_APPLY_REPLACEMENTS_BIN}")
           else
             echo "::warning::clang-apply-replacements not found in PATH, automatic fixing disabled."
           fi
@@ -281,7 +295,7 @@ jobs:
 
           CXX_FILES=$(find src -type f \( -iname "*.[ch]pp" -o -iname "*.cc" -o -iname "*.c" -o -iname "*.h" \))
           rc=0
-          "${CLANG_TIDY[@]}" -clang-tidy-binary="$(command -v clang-tidy)" \
+          "${CLANG_TIDY[@]}" -clang-tidy-binary="${CLANG_TIDY_BIN}" \
             -exclude-header-filter='^(3rdparty|tvm)/.*$' \
             -p="cmake-build" ${CXX_FILES} || rc="$?"
           rm -rf cmake-build run-clang-tidy.py
@@ -291,11 +305,6 @@ jobs:
             git diff --color=always || true
             exit "${rc}"
           fi
-
-      - name: Install uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
 
       - name: Setup Python environment
         run: |
