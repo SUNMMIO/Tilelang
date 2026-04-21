@@ -199,6 +199,7 @@ jobs:
           NPUIR_CACHE_DIR="${NPUIR_CACHE_ROOT}/${NPUIR_LLVM_COMMIT}"
           NPUIR_LLVM_SOURCE_DIR="${NPUIR_CACHE_DIR}/llvm-project"
           NPUIR_LLVM_BUILD_DIR="${NPUIR_CACHE_DIR}/llvm-project-build"
+          NPUIR_LLVM_MARKER_FILE="${NPUIR_CACHE_DIR}/llvm-project.commit"
 
           echo "NPUIR_CACHE_DIR=${NPUIR_CACHE_DIR}" >> "${GITHUB_ENV}"
           echo "NPUIR_LLVM_SOURCE_DIR=${NPUIR_LLVM_SOURCE_DIR}" >> "${GITHUB_ENV}"
@@ -208,8 +209,8 @@ jobs:
           exec 9>"${lock_file}"
           flock 9
 
-          if [[ -d "${NPUIR_LLVM_SOURCE_DIR}/.git" ]] && [[ -f "${NPUIR_LLVM_SOURCE_DIR}/llvm/CMakeLists.txt" ]]; then
-            current_rev="$(git -C "${NPUIR_LLVM_SOURCE_DIR}" rev-parse HEAD || true)"
+          if [[ -f "${NPUIR_LLVM_MARKER_FILE}" ]] && [[ -f "${NPUIR_LLVM_SOURCE_DIR}/llvm/CMakeLists.txt" ]]; then
+            current_rev="$(<"${NPUIR_LLVM_MARKER_FILE}")"
           else
             current_rev=""
           fi
@@ -217,29 +218,36 @@ jobs:
           if [[ "${current_rev}" == "${NPUIR_LLVM_COMMIT}" ]]; then
             echo "Reusing cached llvm-project checkout at ${current_rev}"
           else
-            tmp_dir="${NPUIR_LLVM_SOURCE_DIR}.tmp"
-            rm -rf "${tmp_dir}"
-            git init --quiet "${tmp_dir}"
-            git -C "${tmp_dir}" remote add origin https://github.com/llvm/llvm-project.git
+            archive_url="https://codeload.github.com/llvm/llvm-project/tar.gz/${NPUIR_LLVM_COMMIT}"
+            archive_file="${NPUIR_CACHE_DIR}/llvm-project-${NPUIR_LLVM_COMMIT}.tar.gz"
+            extract_root="${NPUIR_CACHE_DIR}/llvm-project-extract.tmp"
+            source_tmp="${NPUIR_CACHE_DIR}/llvm-project.tmp"
 
-            fetched=0
-            for attempt in 1 2 3; do
-              if git -C "${tmp_dir}" fetch --filter=blob:none --depth 1 origin "${NPUIR_LLVM_COMMIT}"; then
-                fetched=1
-                break
-              fi
-              echo "::warning::llvm-project fetch attempt ${attempt} failed; retrying"
-              sleep $(( attempt * 10 ))
-            done
+            rm -rf "${extract_root}" "${source_tmp}"
+            mkdir -p "${NPUIR_CACHE_DIR}" "${extract_root}"
 
-            if (( fetched == 0 )); then
-              echo "::error::Failed to fetch llvm-project commit ${NPUIR_LLVM_COMMIT}"
+            wget \
+              --tries=5 \
+              --waitretry=10 \
+              --retry-connrefused \
+              --timeout=60 \
+              --output-document="${archive_file}" \
+              "${archive_url}"
+
+            tar -xzf "${archive_file}" -C "${extract_root}"
+            extracted_dir="$(find "${extract_root}" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+            if [[ -z "${extracted_dir}" ]] || [[ ! -f "${extracted_dir}/llvm/CMakeLists.txt" ]]; then
+              echo "::error::Extracted llvm-project archive is missing llvm/CMakeLists.txt"
               exit 1
             fi
 
-            git -C "${tmp_dir}" checkout --detach FETCH_HEAD
+            mv "${extracted_dir}" "${source_tmp}"
             rm -rf "${NPUIR_LLVM_SOURCE_DIR}" "${NPUIR_LLVM_BUILD_DIR}"
-            mv "${tmp_dir}" "${NPUIR_LLVM_SOURCE_DIR}"
+            mv "${source_tmp}" "${NPUIR_LLVM_SOURCE_DIR}"
+            printf '%s\n' "${NPUIR_LLVM_COMMIT}" > "${NPUIR_LLVM_SOURCE_DIR}/.tilelang-source-commit"
+            printf '%s\n' "${NPUIR_LLVM_COMMIT}" > "${NPUIR_LLVM_MARKER_FILE}"
+            rm -f "${archive_file}"
+            rm -rf "${extract_root}"
           fi
 
           du -sh "${NPUIR_CACHE_DIR}" 2>/dev/null || true
