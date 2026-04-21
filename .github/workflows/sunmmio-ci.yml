@@ -349,7 +349,7 @@ jobs:
         run: |
           echo "=== Cache usage before pruning ==="
           du -sh /ci-cache/* 2>/dev/null || true
-          # Remove uv cache entries not used in the last 7 days
-          uv cache prune --ci 2>/dev/null || true
+          # Keep warm prebuilt wheels on this persistent self-hosted runner.
+          uv cache prune 2>/dev/null || true
           echo "=== Cache usage after pruning ==="
           du -sh /ci-cache/* 2>/dev/null || true
