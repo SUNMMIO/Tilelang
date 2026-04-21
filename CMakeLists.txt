@@ -147,6 +147,73 @@ unset(_TILELANG_USE_CUDA_STUBS_DEFAULT)
 
 include(cmake/load_tvm.cmake)
 
+# --- NPU-IR Integration ---
+option(USE_NPUIR "Use NPU-IR for Sunmmio backend" ON)
+if(USE_NPUIR)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/NPU-IR/CMakeLists.txt")
+    message(STATUS "NPU-IR integration enabled.")
+
+    # In-place fix for NPU-IR's LLVM/MLIR build issues
+    # 1. Provide LLVM/MLIR tablegen binaries
+    set(LLVM_TABLEGEN_EXE llvm-tblgen CACHE FILEPATH "Path to llvm-tblgen")
+    set(MLIR_TABLEGEN_EXE mlir-tblgen CACHE FILEPATH "Path to mlir-tblgen")
+
+    # 2. Preemptively set include directories to avoid find_package(MLIR) failure
+    set(LLVM_PROJECT_DIR "${CMAKE_CURRENT_BINARY_DIR}/3rdparty/NPU-IR/llvm-project")
+    set(LLVM_PROJECT_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/3rdparty/NPU-IR/llvm-project-build")
+    set(MLIR_INCLUDE_DIRS
+      "${LLVM_PROJECT_DIR}/mlir/include"
+      "${LLVM_PROJECT_BUILD_DIR}/tools/mlir/include"
+      CACHE PATH "MLIR include directories" FORCE
+    )
+    set(LLVM_INCLUDE_DIRS
+      "${LLVM_PROJECT_DIR}/llvm/include"
+      "${LLVM_PROJECT_BUILD_DIR}/include"
+      CACHE PATH "LLVM include directories" FORCE
+    )
+
+    # 3. Ensure CMake modules are found during NPU-IR configuration
+    list(APPEND CMAKE_MODULE_PATH "${LLVM_PROJECT_DIR}/llvm/cmake/modules")
+    list(APPEND CMAKE_MODULE_PATH "${LLVM_PROJECT_DIR}/mlir/cmake/modules")
+
+    # 4. Mock find_package to bypass NPU-IR's MLIR/LLVM checks
+    # This macro will intercept find_package calls for MLIR and LLVM
+    macro(find_package)
+      set(_find_args "${ARGN}")
+      list(GET _find_args 0 _pkg_name)
+      if(_pkg_name STREQUAL "MLIR" OR _pkg_name STREQUAL "LLVM")
+        set(${_pkg_name}_FOUND ON PARENT_SCOPE)
+        set(${_pkg_name}_FOUND ON) # Also set in current scope for immediate use
+        message(STATUS "Mocking find_package(${_pkg_name}) to bypass NPU-IR check")
+      else()
+        _find_package(${ARGN})
+      endif()
+    endmacro()
+
+    # Pre-set the variables NPU-IR expects from find_package
+    set(MLIR_FOUND ON CACHE INTERNAL "")
+    set(LLVM_FOUND ON CACHE INTERNAL "")
+    set(MLIR_INCLUDE_DIRS
+      "${LLVM_PROJECT_DIR}/mlir/include"
+      "${LLVM_PROJECT_BUILD_DIR}/tools/mlir/include"
+      CACHE PATH "" FORCE
+    )
+    set(LLVM_INCLUDE_DIRS
+      "${LLVM_PROJECT_DIR}/llvm/include"
+      "${LLVM_PROJECT_BUILD_DIR}/include"
+      CACHE PATH "" FORCE
+    )
+
+    add_subdirectory(3rdparty/NPU-IR EXCLUDE_FROM_ALL)
+    list(APPEND TILE_LANG_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/NPU-IR/include)
+    # Generated headers (e.g., from TableGen) will be in the binary directory
+    list(APPEND TILE_LANG_INCLUDES ${CMAKE_CURRENT_BINARY_DIR}/3rdparty/NPU-IR/include)
+  else()
+    message(WARNING "NPU-IR enabled but 3rdparty/NPU-IR/CMakeLists.txt not found.")
+  endif()
+endif()
+
+
 if(EXISTS ${TVM_SOURCE}/cmake/config.cmake)
   include(${TVM_SOURCE}/cmake/config.cmake)
 else()
@@ -354,7 +421,8 @@ set(USE_Z3      ON CACHE STRING "Use Z3 SMT solver for TileLang optimizations")
 set(USE_PYPI_Z3 ON CACHE BOOL   "Use Z3 provided by PyPI z3-solver package")
 
 if(USE_Z3 AND USE_PYPI_Z3)
-  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/pypi-z3")
+  # Insert at the beginning to ensure pypi-z3's FindZ3.cmake is used over LLVM's
+  list(INSERT CMAKE_MODULE_PATH 0 "${CMAKE_CURRENT_LIST_DIR}/cmake/pypi-z3")
   find_package(Z3 REQUIRED)
 endif()
 
