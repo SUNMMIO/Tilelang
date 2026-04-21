@@ -185,24 +185,28 @@ jobs:
             3rdparty/cutlass \
             3rdparty/tvm
 
-      - name: Configure SSH for private NPU-IR submodule
+      - name: Resolve pinned NPU-IR commit
         if: steps.npuir-mode.outputs.available == '1'
-        env:
-          SUNMMIONPUIR: ${{ secrets.SUNMMIONPUIR }}
+        id: npuir-ref
         run: |
           set -euo pipefail
-          install -m 700 -d "${HOME}/.ssh"
-          printf '%s\n' "${SUNMMIONPUIR}" > "${HOME}/.ssh/sunmmio_npuir"
-          chmod 600 "${HOME}/.ssh/sunmmio_npuir"
-          ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> "${HOME}/.ssh/known_hosts"
+          NPUIR_SHA="$(git ls-tree HEAD 3rdparty/NPU-IR | awk '{print $3}')"
+          if [[ -z "${NPUIR_SHA}" ]]; then
+            echo "::error::Could not determine the pinned NPU-IR commit from the superproject gitlink."
+            exit 1
+          fi
+          echo "sha=${NPUIR_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "Pinned NPU-IR commit: ${NPUIR_SHA}"
 
       - name: Checkout private NPU-IR submodule
         if: steps.npuir-mode.outputs.available == '1'
-        run: |
-          set -euo pipefail
-          export GIT_SSH_COMMAND="ssh -i ${HOME}/.ssh/sunmmio_npuir -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
-          git submodule sync -- 3rdparty/NPU-IR
-          git -c protocol.version=2 submodule update --init --force --recursive 3rdparty/NPU-IR
+        uses: actions/checkout@v6
+        with:
+          repository: SUNMMIO/NPU-IR
+          ref: ${{ steps.npuir-ref.outputs.sha }}
+          path: 3rdparty/NPU-IR
+          ssh-key: ${{ secrets.SUNMMIONPUIR }}
+          fetch-depth: 1
 
       - name: Report submodule state
         run: |
