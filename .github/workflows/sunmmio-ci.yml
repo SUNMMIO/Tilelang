@@ -321,6 +321,8 @@ jobs:
 
       - name: Install project (wheel form)
         run: |
+          # Reuse the same cached NPU-IR/LLVM tree during the wheel build.
+          export CMAKE_ARGS="${CMAKE_ARGS} -DTILELANG_NPUIR_BINARY_DIR=${NPUIR_CACHE_DIR}"
           uv pip install -v .
 
       - name: Run Python test suite
