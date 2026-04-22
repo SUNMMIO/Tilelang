@@ -478,14 +478,7 @@ def test_sunmmio_codegen_coverage_report_has_no_missing_entries(tmp_path, kernel
 if __name__ == "__main__":
     tilelang.testing.main()
 import pytest
-import re
-import numpy as np
-import os
-import json
-import tilelang.language as T
 import tilelang.testing
-from tilelang import tvm as tvm
-from tilelang.utils.target import determine_target
 
 # PRINT = os.getenv("SUNMMIO_TEST_PRINT", "false").lower() in ("1", "true", "yes", "on")
 PRINT = True

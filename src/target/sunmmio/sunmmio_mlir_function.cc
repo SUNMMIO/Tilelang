@@ -3,14 +3,14 @@
 namespace tvm {
 namespace codegen {
 
-SunmmioMlirFunction::SunmmioMlirFunction(SunmmioMlirContext& ctx) : ctx_(ctx) {}
+SunmmioMlirFunction::SunmmioMlirFunction(SunmmioMlirContext &ctx) : ctx_(ctx) {}
 
 void SunmmioMlirFunction::BeginModule() { ctx_.module_open = true; }
 
 void SunmmioMlirFunction::EndModule() { ctx_.module_open = false; }
 
-void SunmmioMlirFunction::BeginFunction(const std::string& name,
-                                        const std::vector<BuilderArg>& args) {
+void SunmmioMlirFunction::BeginFunction(const std::string &name,
+                                        const std::vector<BuilderArg> &args) {
   (void)args;
   ctx_.function_open = true;
   ctx_.current_function = name;
@@ -23,10 +23,10 @@ void SunmmioMlirFunction::EndFunction() {
 
 void SunmmioMlirFunction::EmitReturn() {}
 
-void SunmmioMlirFunction::BeginFor(const std::string& iv,
-                                   const SunMMIOValue& lb,
-                                   const SunMMIOValue& ub,
-                                   const SunMMIOValue& step) {
+void SunmmioMlirFunction::BeginFor(const std::string &iv,
+                                   const SunMMIOValue &lb,
+                                   const SunMMIOValue &ub,
+                                   const SunMMIOValue &step) {
   (void)iv;
   (void)lb;
   (void)ub;
@@ -40,7 +40,7 @@ void SunmmioMlirFunction::EndFor() {
   }
 }
 
-void SunmmioMlirFunction::BeginIf(const SunMMIOValue& cond) {
+void SunmmioMlirFunction::BeginIf(const SunMMIOValue &cond) {
   (void)cond;
   ctx_.insertion_point_stack.push_back("if.then");
 }
@@ -57,11 +57,11 @@ void SunmmioMlirFunction::EndIf() {
   }
 }
 
-void SunmmioMlirFunction::EmitAssert(const SunMMIOValue& cond,
-                                     const std::string& msg_text) {
+void SunmmioMlirFunction::EmitAssert(const SunMMIOValue &cond,
+                                     const std::string &msg_text) {
   (void)cond;
   (void)msg_text;
 }
 
-}  // namespace codegen
-}  // namespace tvm
+} // namespace codegen
+} // namespace tvm

@@ -421,8 +421,7 @@ private:
   bool module_open_{false};
 };
 
-CodeGenTileLangSunMMIO::CodeGenTileLangSunMMIO(
-    BuilderBackendKind backend_kind)
+CodeGenTileLangSunMMIO::CodeGenTileLangSunMMIO(BuilderBackendKind backend_kind)
     : backend_kind_(backend_kind) {}
 
 void CodeGenTileLangSunMMIO::Init() {

@@ -3,11 +3,10 @@
 namespace tvm {
 namespace codegen {
 
-SunmmioMlirExpr::SunmmioMlirExpr(SunmmioMlirContext& ctx) : ctx_(ctx) {}
+SunmmioMlirExpr::SunmmioMlirExpr(SunmmioMlirContext &ctx) : ctx_(ctx) {}
 
-SunMMIOValue SunmmioMlirExpr::ConstantInt(const std::string& result_name,
-                                          int64_t v,
-                                          const SunMMIOType& type,
+SunMMIOValue SunmmioMlirExpr::ConstantInt(const std::string &result_name,
+                                          int64_t v, const SunMMIOType &type,
                                           DataType dtype) {
   (void)v;
   SunMMIOValue out{dtype, result_name, type};
@@ -15,9 +14,9 @@ SunMMIOValue SunmmioMlirExpr::ConstantInt(const std::string& result_name,
   return out;
 }
 
-SunMMIOValue SunmmioMlirExpr::ConstantFloat(const std::string& result_name,
-                                            const std::string& literal,
-                                            const SunMMIOType& type,
+SunMMIOValue SunmmioMlirExpr::ConstantFloat(const std::string &result_name,
+                                            const std::string &literal,
+                                            const SunMMIOType &type,
                                             DataType dtype) {
   (void)literal;
   SunMMIOValue out{dtype, result_name, type};
@@ -25,9 +24,9 @@ SunMMIOValue SunmmioMlirExpr::ConstantFloat(const std::string& result_name,
   return out;
 }
 
-SunMMIOValue SunmmioMlirExpr::Cast(const std::string& result_name,
-                                   const SunMMIOValue& v,
-                                   const SunMMIOType& dst_type,
+SunMMIOValue SunmmioMlirExpr::Cast(const std::string &result_name,
+                                   const SunMMIOValue &v,
+                                   const SunMMIOType &dst_type,
                                    DataType dst_dtype) {
   (void)v;
   SunMMIOValue out{dst_dtype, result_name, dst_type};
@@ -35,11 +34,11 @@ SunMMIOValue SunmmioMlirExpr::Cast(const std::string& result_name,
   return out;
 }
 
-SunMMIOValue SunmmioMlirExpr::Binary(const std::string& result_name,
+SunMMIOValue SunmmioMlirExpr::Binary(const std::string &result_name,
                                      BinaryOp op, ArithmeticFlavor flavor,
-                                     const SunMMIOValue& a,
-                                     const SunMMIOValue& b,
-                                     const SunMMIOType& result_type,
+                                     const SunMMIOValue &a,
+                                     const SunMMIOValue &b,
+                                     const SunMMIOType &result_type,
                                      DataType dtype) {
   (void)op;
   (void)flavor;
@@ -50,11 +49,11 @@ SunMMIOValue SunmmioMlirExpr::Binary(const std::string& result_name,
   return out;
 }
 
-SunMMIOValue SunmmioMlirExpr::Compare(const std::string& result_name,
+SunMMIOValue SunmmioMlirExpr::Compare(const std::string &result_name,
                                       CompareOp op, CompareDomain domain,
-                                      const SunMMIOValue& a,
-                                      const SunMMIOValue& b,
-                                      const SunMMIOType& operand_type) {
+                                      const SunMMIOValue &a,
+                                      const SunMMIOValue &b,
+                                      const SunMMIOType &operand_type) {
   (void)op;
   (void)domain;
   (void)a;
@@ -66,11 +65,11 @@ SunMMIOValue SunmmioMlirExpr::Compare(const std::string& result_name,
   return out;
 }
 
-SunMMIOValue SunmmioMlirExpr::Select(const std::string& result_name,
-                                     const SunMMIOValue& cond,
-                                     const SunMMIOValue& tv,
-                                     const SunMMIOValue& fv,
-                                     const SunMMIOType& result_type,
+SunMMIOValue SunmmioMlirExpr::Select(const std::string &result_name,
+                                     const SunMMIOValue &cond,
+                                     const SunMMIOValue &tv,
+                                     const SunMMIOValue &fv,
+                                     const SunMMIOType &result_type,
                                      DataType dtype) {
   (void)cond;
   (void)tv;
@@ -80,11 +79,11 @@ SunMMIOValue SunmmioMlirExpr::Select(const std::string& result_name,
   return out;
 }
 
-SunMMIOValue SunmmioMlirExpr::Ramp(const std::string& result_name,
-                                   const SunMMIOValue& base,
-                                   const SunMMIOValue& stride, int lanes,
-                                   const SunMMIOType& elem_type,
-                                   const SunMMIOType& vec_type,
+SunMMIOValue SunmmioMlirExpr::Ramp(const std::string &result_name,
+                                   const SunMMIOValue &base,
+                                   const SunMMIOValue &stride, int lanes,
+                                   const SunMMIOType &elem_type,
+                                   const SunMMIOType &vec_type,
                                    DataType dtype) {
   (void)base;
   (void)stride;
@@ -95,10 +94,10 @@ SunMMIOValue SunmmioMlirExpr::Ramp(const std::string& result_name,
   return out;
 }
 
-SunMMIOValue SunmmioMlirExpr::Broadcast(const std::string& result_name,
-                                        const SunMMIOValue& scalar, int lanes,
-                                        const SunMMIOType& scalar_type,
-                                        const SunMMIOType& vec_type,
+SunMMIOValue SunmmioMlirExpr::Broadcast(const std::string &result_name,
+                                        const SunMMIOValue &scalar, int lanes,
+                                        const SunMMIOType &scalar_type,
+                                        const SunMMIOType &vec_type,
                                         DataType dtype) {
   (void)scalar;
   (void)lanes;
@@ -108,5 +107,5 @@ SunMMIOValue SunmmioMlirExpr::Broadcast(const std::string& result_name,
   return out;
 }
 
-}  // namespace codegen
-}  // namespace tvm
+} // namespace codegen
+} // namespace tvm

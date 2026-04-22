@@ -10,11 +10,12 @@ namespace tvm {
 namespace codegen {
 namespace {
 
-CodeGenTileLangSunMMIO::BuilderBackendKind ParseBackendKind(
-    const ffi::String &backend) {
+CodeGenTileLangSunMMIO::BuilderBackendKind
+ParseBackendKind(const ffi::String &backend) {
   std::string mode = static_cast<std::string>(backend);
-  std::transform(mode.begin(), mode.end(), mode.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
   if (mode == "text" || mode == "textdebug") {
     return CodeGenTileLangSunMMIO::BuilderBackendKind::kTextDebug;
   }

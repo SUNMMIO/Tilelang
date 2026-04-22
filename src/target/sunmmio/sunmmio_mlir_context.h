@@ -22,7 +22,7 @@ struct SunmmioMlirContext {
   void Clear();
 };
 
-}  // namespace codegen
-}  // namespace tvm
+} // namespace codegen
+} // namespace tvm
 
-#endif  // TVM_TL_TARGET_SUNMMIO_MLIR_CONTEXT_H_
+#endif // TVM_TL_TARGET_SUNMMIO_MLIR_CONTEXT_H_

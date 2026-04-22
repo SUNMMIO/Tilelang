@@ -5,5 +5,5 @@ namespace codegen {
 
 void SunmmioMlirContext::Clear() { *this = SunmmioMlirContext(); }
 
-}  // namespace codegen
-}  // namespace tvm
+} // namespace codegen
+} // namespace tvm
