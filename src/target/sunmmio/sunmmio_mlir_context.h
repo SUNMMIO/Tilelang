@@ -3,6 +3,11 @@
 
 #include "codegen_sunmmio.h"
 
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OwningOpRef.h"
+
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -11,6 +16,12 @@ namespace tvm {
 namespace codegen {
 
 struct SunmmioMlirContext {
+  SunmmioMlirContext();
+
+  mlir::MLIRContext mlir_ctx;
+  mlir::OpBuilder builder;
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+
   bool module_open{false};
   bool function_open{false};
   std::string current_function;

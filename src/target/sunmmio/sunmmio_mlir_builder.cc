@@ -5,6 +5,8 @@
 #include "sunmmio_mlir_function.h"
 #include "sunmmio_mlir_memory.h"
 
+#include "llvm/Support/raw_ostream.h"
+
 namespace tvm {
 namespace codegen {
 
@@ -21,8 +23,13 @@ void SuvmSunmmioBuilder::Init() { Clear(); }
 void SuvmSunmmioBuilder::Clear() { ctx_.Clear(); }
 
 std::string SuvmSunmmioBuilder::Finish() {
-  // TODO(@sunmmio-mlir): serialize real NPU-IR/MLIR module.
-  return "module {\n  // TODO: SuvmSunmmioBuilder NPU-IR lowering\n}\n";
+  if (!ctx_.module) {
+    return "";
+  }
+  std::string out;
+  llvm::raw_string_ostream os(out);
+  ctx_.module->print(os);
+  return os.str();
 }
 
 void SuvmSunmmioBuilder::BeginModule() { function_->BeginModule(); }
