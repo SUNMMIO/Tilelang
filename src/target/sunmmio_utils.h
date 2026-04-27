@@ -31,9 +31,9 @@ struct SunmmioMeshConfig {
 SunmmioTileProcessorConfig
 GetSunmmioTileProcessorConfig(ffi::Optional<Target> target);
 SunmmioTileProcessorConfig GetSunmmioTileProcessorConfig(Target target);
-ffi::Array<PrimExpr> GetSunmmioZZBlockShape(ffi::Optional<Target> target,
-                                            DataType dtype);
-ffi::Array<PrimExpr> GetSunmmioZZBlockShape(Target target, DataType dtype);
+ffi::Array<PrimExpr> GetSunmmioLayoutBlockShape(ffi::Optional<Target> target,
+                                                DataType dtype);
+ffi::Array<PrimExpr> GetSunmmioLayoutBlockShape(Target target, DataType dtype);
 SunmmioMeshConfig GetSunmmioMeshConfig(ffi::Optional<Target> target);
 SunmmioMeshConfig GetSunmmioMeshConfig(Target target);
 

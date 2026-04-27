@@ -463,7 +463,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
         const int rank = static_cast<int>(src->shape.size());
         Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
         auto layout = sunmmio::MakeZZ(
-            src->shape, axes, GetSunmmioZZBlockShape(T.target, src->dtype));
+            src->shape, axes, GetSunmmioLayoutBlockShape(T.target, src->dtype));
         result.Set(src, layout);
       }
     }
@@ -473,7 +473,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
         const int rank = static_cast<int>(dst->shape.size());
         Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
         auto layout = sunmmio::MakeZZ(
-            dst->shape, axes, GetSunmmioZZBlockShape(T.target, dst->dtype));
+            dst->shape, axes, GetSunmmioLayoutBlockShape(T.target, dst->dtype));
         result.Set(dst, layout);
       }
     }

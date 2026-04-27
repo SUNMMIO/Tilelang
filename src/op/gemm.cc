@@ -852,7 +852,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
         << "Sunmmio GEMM A layout inference requires rank >= 2.";
     Array<Integer> axes_a{Integer(rank_a - 2), Integer(rank_a - 1)};
     auto l = sunmmio::MakeZZ(a_->shape, axes_a,
-                             GetSunmmioZZBlockShape(T.target, a_->dtype));
+                             GetSunmmioLayoutBlockShape(T.target, a_->dtype));
     results.Set(a_, l);
 
     const int rank_b = static_cast<int>(b_->shape.size());
@@ -860,7 +860,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
         << "Sunmmio GEMM B layout inference requires rank >= 2.";
     Array<Integer> axes_b{Integer(rank_b - 2), Integer(rank_b - 1)};
     l = sunmmio::MakeZZ(b_->shape, axes_b,
-                        GetSunmmioZZBlockShape(T.target, b_->dtype));
+                        GetSunmmioLayoutBlockShape(T.target, b_->dtype));
     results.Set(b_, l);
 
     const int rank_c = static_cast<int>(c_->shape.size());
@@ -868,7 +868,7 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
         << "Sunmmio GEMM C layout inference requires rank >= 2.";
     Array<Integer> axes_c{Integer(rank_c - 2), Integer(rank_c - 1)};
     l = sunmmio::MakeZZ(c_->shape, axes_c,
-                        GetSunmmioZZBlockShape(T.target, c_->dtype));
+                        GetSunmmioLayoutBlockShape(T.target, c_->dtype));
     results.Set(c_, l);
   } else {
     ICHECK(0) << "Not supported " << T.target->str();

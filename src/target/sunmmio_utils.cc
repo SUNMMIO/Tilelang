@@ -23,7 +23,7 @@ SunmmioTileProcessorConfig MakeSunmmioA4EConfig() {
 }
 
 ffi::Array<PrimExpr> MakeSunmmioA4EBlockShape(DataType dtype) {
-  // A4E currently uses the same logical ZZ block for all element dtypes.
+  // A4E currently uses the same logical layout block for all element dtypes.
   (void)dtype;
   return {tir::make_const(DataType::Int(32), 32),
           tir::make_const(DataType::Int(32), 32)};
@@ -116,15 +116,15 @@ SunmmioTileProcessorConfig GetSunmmioTileProcessorConfig(Target target) {
   return MakeSunmmioA4EConfig();
 }
 
-ffi::Array<PrimExpr> GetSunmmioZZBlockShape(ffi::Optional<Target> target,
-                                            DataType dtype) {
+ffi::Array<PrimExpr> GetSunmmioLayoutBlockShape(ffi::Optional<Target> target,
+                                                DataType dtype) {
   if (!target.defined()) {
     return MakeSunmmioA4EBlockShape(dtype);
   }
-  return GetSunmmioZZBlockShape(target.value(), dtype);
+  return GetSunmmioLayoutBlockShape(target.value(), dtype);
 }
 
-ffi::Array<PrimExpr> GetSunmmioZZBlockShape(Target target, DataType dtype) {
+ffi::Array<PrimExpr> GetSunmmioLayoutBlockShape(Target target, DataType dtype) {
   target = NormalizeTarget(target);
 
   if (!target.defined() || !TargetIsSunmmio(target)) {
@@ -139,7 +139,7 @@ ffi::Array<PrimExpr> GetSunmmioZZBlockShape(Target target, DataType dtype) {
   }
 
   LOG(WARNING) << "Unknown Sunmmio device model '" << mcpu.value()
-               << "' when querying ZZ block shape. Falling back to the "
+               << "' when querying layout block shape. Falling back to the "
                   "sunmmio-a4e defaults.";
   return MakeSunmmioA4EBlockShape(dtype);
 }
