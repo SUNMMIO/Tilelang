@@ -29,6 +29,7 @@ struct SunmmioMlirContext {
   std::vector<std::string> insertion_point_stack;
   std::unordered_map<std::string, SunMMIOValue> value_symbol_table;
   std::unordered_map<std::string, BufferBinding> buffer_symbol_table;
+  std::unordered_map<std::string, mlir::Value> mlir_value_table;
 
   void Clear();
 };

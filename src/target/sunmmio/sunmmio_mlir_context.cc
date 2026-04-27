@@ -12,6 +12,7 @@ void SunmmioMlirContext::Clear() {
   insertion_point_stack.clear();
   value_symbol_table.clear();
   buffer_symbol_table.clear();
+  mlir_value_table.clear();
   module = nullptr;
 }
 
