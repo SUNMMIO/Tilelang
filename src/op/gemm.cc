@@ -11,6 +11,8 @@
 #include <tvm/tir/op_attr_types.h>
 #include <tvm/tir/transform.h>
 
+#include "../layout/cute_layout.h"
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "tcgen5_meta.h"
 #include "utils.h"
@@ -845,13 +847,28 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
     ICHECK(c_.scope() == "shared.rsram")
         << "Invalid scope of buffer " << c_ << " in SunmmioMMA.";
 
-    const auto f =
-        ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
-    auto l = Downcast<Layout>((*f)(a_));
+    const int rank_a = static_cast<int>(a_->shape.size());
+    ICHECK_GE(rank_a, 2)
+        << "Sunmmio GEMM A layout inference requires rank >= 2.";
+    Array<Integer> axes_a{Integer(rank_a - 2), Integer(rank_a - 1)};
+    auto l = sunmmio::MakeZZ(a_->shape, axes_a,
+                             GetSunmmioZZBlockShape(T.target, a_->dtype));
     results.Set(a_, l);
-    l = Downcast<Layout>((*f)(b_));
+
+    const int rank_b = static_cast<int>(b_->shape.size());
+    ICHECK_GE(rank_b, 2)
+        << "Sunmmio GEMM B layout inference requires rank >= 2.";
+    Array<Integer> axes_b{Integer(rank_b - 2), Integer(rank_b - 1)};
+    l = sunmmio::MakeZZ(b_->shape, axes_b,
+                        GetSunmmioZZBlockShape(T.target, b_->dtype));
     results.Set(b_, l);
-    l = Downcast<Layout>((*f)(c_));
+
+    const int rank_c = static_cast<int>(c_->shape.size());
+    ICHECK_GE(rank_c, 2)
+        << "Sunmmio GEMM C layout inference requires rank >= 2.";
+    Array<Integer> axes_c{Integer(rank_c - 2), Integer(rank_c - 1)};
+    l = sunmmio::MakeZZ(c_->shape, axes_c,
+                        GetSunmmioZZBlockShape(T.target, c_->dtype));
     results.Set(c_, l);
   } else {
     ICHECK(0) << "Not supported " << T.target->str();

@@ -9,6 +9,9 @@
 #include <optional>
 #include <vector>
 
+#include <tvm/ffi/container/array.h>
+#include <tvm/ir/expr.h>
+#include <tvm/runtime/data_type.h>
 #include <tvm/target/target.h>
 
 namespace tvm {
@@ -28,6 +31,9 @@ struct SunmmioMeshConfig {
 SunmmioTileProcessorConfig
 GetSunmmioTileProcessorConfig(ffi::Optional<Target> target);
 SunmmioTileProcessorConfig GetSunmmioTileProcessorConfig(Target target);
+ffi::Array<PrimExpr> GetSunmmioZZBlockShape(ffi::Optional<Target> target,
+                                            DataType dtype);
+ffi::Array<PrimExpr> GetSunmmioZZBlockShape(Target target, DataType dtype);
 SunmmioMeshConfig GetSunmmioMeshConfig(ffi::Optional<Target> target);
 SunmmioMeshConfig GetSunmmioMeshConfig(Target target);
 

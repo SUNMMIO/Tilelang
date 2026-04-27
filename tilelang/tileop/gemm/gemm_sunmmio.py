@@ -1,5 +1,5 @@
 from .gemm_base import GemmBase
-from tilelang.layout import make_blockwise_zz_layout
+from tilelang.layout import make_zz_layout
 from tilelang import tvm as tvm
 from tvm.target import Target
 from tvm import tir
@@ -17,9 +17,9 @@ class GemmSunmmio(GemmBase):
     def infer_layout(self, target: Target, thread_nums: int):
         if self.is_gemm_sunmmio_scope():
             return {
-                self.A: make_blockwise_zz_layout(self.A),
-                self.B: make_blockwise_zz_layout(self.B),
-                self.C: make_blockwise_zz_layout(self.C),
+                self.A: make_zz_layout(self.A),
+                self.B: make_zz_layout(self.B),
+                self.C: make_zz_layout(self.C),
             }
         else:
             raise ValueError(f"Unsupported gemm combination of Sunmmio, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}")

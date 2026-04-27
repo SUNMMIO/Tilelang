@@ -4,7 +4,7 @@ and that each region can be normalized back to a BufferRegion with full metadata
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.layout import make_blockwise_zz_layout
+from tilelang.layout import make_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC, determine_target
 from tilelang.language.mesh_tensor import MeshShardingPolicy
 from tvm import tir
@@ -260,13 +260,12 @@ def test_tilelang_mesh_wrong_copy_to_dma(M, N, K, block_M, block_N, block_K, err
 
 
 def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
+    _layout = make_zz_layout((128, 128), [0, 1], (32, 32))
     MyTensor = T.MeshTensor(
         (128, 128),
         sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
         device_mesh_config=(2, 2),
-        hierarchical_dims=(4, 32, 128),
-        hierarchical_groups=((0, 2), (2, 3)),
-        hierarchical_strides=(32, 1, 4096),
+        layout=_layout,
     )
 
     @T.prim_func
@@ -278,7 +277,7 @@ def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
             D_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
 
-            T.annotate_layout({C_shared: make_blockwise_zz_layout(C_shared)})
+            T.annotate_layout({C_shared: make_zz_layout(C_shared)})
 
             for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
                 # DRAM -> RSRAM
@@ -356,4 +355,4 @@ def test_tilelang_mesh_copy_to_dma(K, block_M, block_N, block_K, lower_stmt):
         # Check layout map
         texts = extract_block_attr_lines(mod)
         for text in texts:
-            assert '"layout_map"' in text and 'C_shared: metadata["tl.Layout"]' in text
+            assert '"layout_map"' in text and ('C_shared: metadata["tl.Layout"]' in text or 'C_shared: metadata["tl.CuteLayout"]' in text)

@@ -13,7 +13,7 @@ TileLang's GEMM is divided into v1 and v2; v2 is implemented in Python, and v1 i
 - **Strict Verification of Storage Scopes:**
   - The NPU's Tensor Engine requires that operands must be stored in specific physical SRAMs. The design enforces that matrix A must be in `shared.asram`, matrix B must be in `shared.wsram`, and matrix C must be in `shared.rsram`.
 - **Layout Inference:**
-  - Tailored to the access characteristics of the NPU Tensor Engine, the hardware-specific `make_blockwise_zz_layout` (Blockwise ZZ Layout) is forcibly inferred and bound to the three matrices participating in GEMM. This ensures that the computation units achieve optimal bandwidth and alignment efficiency when fetching data.
+  - Tailored to the access characteristics of the NPU Tensor Engine, the hardware-specific ZZ layout is inferred and bound to the three matrices participating in GEMM. Developer-facing code should use `make_zz_layout`; compiler inference constructs the same layout in C++ through `sunmmio::MakeZZ` and gets the target/dtype-specific block shape from `sunmmio_utils`.
 - **Instruction Lowering:**
   - Completely strips away the traditional high-level scalar loop structures. The high-level `T.gemm` abstract node directly extracts the operand regions and encapsulates them to be lowered into the NPU-specific intrinsic call `tl.mma_sunmmio`, which is then dispatched directly to the backend compiler.
 
@@ -23,7 +23,7 @@ TileLang's GEMM is divided into v1 and v2; v2 is implemented in Python, and v1 i
   - In `LowerGemm` on the C++ side, the `kSunmmioMMA` instruction type is intercepted.
   - Strict assertions (`ICHECK`) are made on the Scopes of the three Buffers: `A->scope() == "shared.asram"`, `B->scope() == "shared.wsram"`, and `C->scope() == "shared.rsram"`. This forms a perfect closed loop with the `InferSRAMScope` Pass.
 - **Layout Inference (`InferLayout`):**
-  - On both the Python side (`gemm_sunmmio.py`) and the C++ side, `tl.layout.make_blockwise_zz_layout` is invoked on the input A, B, and C Buffers. The compiler will automatically apply this transformation during memory allocation.
+  - On both the Python side (`gemm_sunmmio.py`) and the C++ side, a buffer-shaped ZZ layout is applied to the input A, B, and C Buffers. The developer-facing API is `make_zz_layout`; the compiler path calls `sunmmio::MakeZZ` directly and uses `sunmmio_utils` as the centralized block-shape policy.
 - **Instruction Lowering (`Lower`):**
   - On the Python side, `buffer_region_to_tile_region` is used to convert the input parameters. Similar to Copy, the buffers are transformed into BufferRegions here. This design fixes the parameter length, facilitating subsequent processing. To conveniently capture the GEMM later, the GEMM is also packed into a block named `_gemm_sss`.
   - The parameters are `[A_region, B_region, C_region, transA, transB, clearAccum]`, where the first three are BufferRegions and the latter three are boolean types.
@@ -40,7 +40,7 @@ T.gemm(A_shared[0:8, 16:32], B_shared[0:16, 8:16], C_shared[8:24, 16:32], transp
 **After GEMM Extension (InferLayout & Lower)：**
 
 ```python
-# 1. Layout Inference: blockwise_zz_layout is implicitly applied to A, B, and C
+# 1. Layout Inference: ZZ layout is implicitly applied to A, B, and C
 
 # 2. Instruction Lowering: Strips scalar loops and directly emits hardware MMA instructions
 with T.block("_gemm_sss"):

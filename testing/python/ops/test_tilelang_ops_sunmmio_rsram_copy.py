@@ -197,4 +197,6 @@ def test_tilelang_rsram_copy_layout_inference():
     # Check layout map
     texts = extract_block_attr_lines(mod)
     for text in texts:
-        assert '"layout_map"' in text and 'A_shared: metadata["tl.Layout"]' in text and 'B_shared: metadata["tl.Layout"]' in text
+        assert '"layout_map"' in text
+        for buf_name in ["A_shared", "B_shared"]:
+            assert f'{buf_name}: metadata["tl.Layout"]' in text or f'{buf_name}: metadata["tl.CuteLayout"]' in text

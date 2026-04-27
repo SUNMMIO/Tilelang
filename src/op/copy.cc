@@ -9,7 +9,9 @@
  */
 
 #include "copy.h"
+#include "../layout/cute_layout.h"
 #include "../layout/tcgen05_layout.h"
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "../transform/common/attr.h"
 #include "../transform/common/loop_fusion_utils.h"
@@ -454,20 +456,24 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
   // Sunmmio DMA Layout Inference
   if (copy_inst == CopyInst::kSunmmioDMACopy ||
       copy_inst == CopyInst::kSunmmioTileCopy) {
-    const auto f =
-        ffi::Function::GetGlobal("tl.layout.make_blockwise_zz_layout");
     auto result = Map<Buffer, Layout>();
 
     if (level == InferLevel::kFree && !T.layout_map.count(src)) {
       if (src.scope() != "global" && src->shape.size() > 1) {
-        auto layout = Downcast<Layout>((*f)(src));
+        const int rank = static_cast<int>(src->shape.size());
+        Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
+        auto layout = sunmmio::MakeZZ(
+            src->shape, axes, GetSunmmioZZBlockShape(T.target, src->dtype));
         result.Set(src, layout);
       }
     }
 
     if (level == InferLevel::kFree && !T.layout_map.count(dst)) {
       if (dst.scope() != "global" && dst->shape.size() > 1) {
-        auto layout = Downcast<Layout>((*f)(dst));
+        const int rank = static_cast<int>(dst->shape.size());
+        Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
+        auto layout = sunmmio::MakeZZ(
+            dst->shape, axes, GetSunmmioZZBlockShape(T.target, dst->dtype));
         result.Set(dst, layout);
       }
     }

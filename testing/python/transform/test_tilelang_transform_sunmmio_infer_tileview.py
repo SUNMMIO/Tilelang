@@ -10,7 +10,7 @@ import tilelang
 import tilelang as tl
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.layout import make_blockwise_zz_layout
+from tilelang.layout import make_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tvm import tir
 from tvm import IRModule
@@ -122,9 +122,9 @@ def test_infer_tileview_2d_with_layout_annotation():
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    B_shared: make_blockwise_zz_layout(B_shared),
-                    C_shared: make_blockwise_zz_layout(C_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    B_shared: make_zz_layout(B_shared),
+                    C_shared: make_zz_layout(C_shared),
                 }
             )
 
@@ -317,8 +317,8 @@ def test_manual_annotation_overrides_inference():
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    C_shared: make_blockwise_zz_layout(C_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    C_shared: make_zz_layout(C_shared),
                 }
             )
 
@@ -441,9 +441,9 @@ def test_infer_tileview_2d_blockwise_fp32():
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    B_shared: make_blockwise_zz_layout(B_shared),
-                    C_shared: make_blockwise_zz_layout(C_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    B_shared: make_zz_layout(B_shared),
+                    C_shared: make_zz_layout(C_shared),
                 }
             )
 
@@ -479,9 +479,9 @@ def test_infer_tileview_blockwise_small_height():
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    B_shared: make_blockwise_zz_layout(B_shared),
-                    C_shared: make_blockwise_zz_layout(C_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    B_shared: make_zz_layout(B_shared),
+                    C_shared: make_zz_layout(C_shared),
                 }
             )
 
@@ -595,8 +595,8 @@ def test_infer_tileview_blockwise_region_height_and_width_offset():
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    C_shared: make_blockwise_zz_layout(C_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    C_shared: make_zz_layout(C_shared),
                 }
             )
 
@@ -630,8 +630,8 @@ def test_infer_tileview_blockwise_region_misaligned_width_offset_rejected():
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    C_shared: make_blockwise_zz_layout(C_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    C_shared: make_zz_layout(C_shared),
                 }
             )
 
