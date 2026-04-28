@@ -274,6 +274,21 @@ file(GLOB TILE_LANG_SRCS
   src/target/intrin_rule*.cc
 )
 
+if(USE_NPUIR)
+  file(GLOB TILE_LANG_SUNMMIO_SRCS
+    src/target/sunmmio/codegen_sunmmio.cc
+    src/target/sunmmio/sunmmio_mlir_builder.cc
+    src/target/sunmmio/sunmmio_mlir_context.cc
+    src/target/sunmmio/sunmmio_mlir_type.cc
+    src/target/sunmmio/sunmmio_mlir_function.cc
+    src/target/sunmmio/sunmmio_mlir_expr.cc
+    src/target/sunmmio/sunmmio_mlir_memory.cc
+    src/target/sunmmio/sunmmio_mlir_call.cc
+    src/target/sunmmio/rt_mod_sunmmio.cc
+  )
+  list(APPEND TILE_LANG_SRCS ${TILE_LANG_SUNMMIO_SRCS})
+endif()
+
 # Always include CPU-safe runtime helpers
 list(APPEND TILE_LANG_SRCS
   src/runtime/error_helpers.cc
@@ -432,14 +447,6 @@ elseif(USE_CUDA)
     src/runtime/runtime.cc
     src/target/ptx.cc
     src/target/codegen_cuda.cc
-    src/target/sunmmio/codegen_sunmmio.cc
-    src/target/sunmmio/sunmmio_mlir_builder.cc
-    src/target/sunmmio/sunmmio_mlir_context.cc
-    src/target/sunmmio/sunmmio_mlir_function.cc
-    src/target/sunmmio/sunmmio_mlir_expr.cc
-    src/target/sunmmio/sunmmio_mlir_memory.cc
-    src/target/sunmmio/sunmmio_mlir_call.cc
-    src/target/sunmmio/rt_mod_sunmmio.cc
     src/target/codegen_py.cc
     src/target/codegen_utils.cc
     src/target/codegen_cutedsl.cc

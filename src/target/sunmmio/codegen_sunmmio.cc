@@ -1,5 +1,6 @@
 #include "codegen_sunmmio.h"
 #include "sunmmio_mlir_builder.h"
+#include "sunmmio_mlir_type.h"
 
 #include <tvm/ir/type.h>
 #include <tvm/tir/analysis.h>
@@ -239,7 +240,9 @@ public:
   }
 
   void BeginFor(const std::string &iv, const SunMMIOValue &lb,
-                const SunMMIOValue &ub, const SunMMIOValue &step) final {
+                const SunMMIOValue &ub, const SunMMIOValue &step,
+                const ffi::Map<ffi::String, ffi::Any> &annotations) final {
+    (void)annotations;
     EmitLine("scf.for " + iv + " = " + lb.value + " to " + ub.value + " step " +
              step.value + " {");
     indent_++;
@@ -812,7 +815,7 @@ void CodeGenTileLangSunMMIO::EmitFor(const tir::ForNode *op) {
       SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
       DataType::Int(32));
   std::string iv = "%" + op->loop_var->name_hint;
-  builder_->BeginFor(iv, min, upper, step);
+  builder_->BeginFor(iv, min, upper, step, op->annotations);
   EnterScope();
   BindVar(
       op->loop_var,

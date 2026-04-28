@@ -1,15 +1,14 @@
 #ifndef TVM_TL_TARGET_CODEGEN_SUNMMIO_H_
 #define TVM_TL_TARGET_CODEGEN_SUNMMIO_H_
 
-#include <tvm/ir/expr.h>
 #include <tvm/ir/module.h>
 #include <tvm/ir/type.h>
-#include <tvm/runtime/data_type.h>
-#include <tvm/tir/expr.h>
 #include <tvm/tir/expr_functor.h>
 #include <tvm/tir/function.h>
 #include <tvm/tir/stmt.h>
 #include <tvm/tir/stmt_functor.h>
+
+#include "sunmmio_mlir_type.h"
 
 #include <memory>
 #include <set>
@@ -20,53 +19,6 @@
 
 namespace tvm {
 namespace codegen {
-
-enum class BinaryOp {
-  kAdd,
-  kSub,
-  kMul,
-  kDiv,
-  kMod,
-  kMin,
-  kMax,
-  kAnd,
-  kOr,
-  kXor
-};
-
-enum class ArithmeticFlavor { kFloat, kSignedInt, kUnsignedInt, kBool, kIndex };
-
-enum class CompareOp { kEQ, kNE, kLT, kLE, kGT, kGE };
-
-enum class CompareDomain { kFloat, kSignedInt, kUnsignedInt, kBool };
-
-struct SunMMIOType {
-  enum class Kind { kScalar, kIndex, kHandle, kVector, kMemRef, kUnknown };
-
-  Kind kind{Kind::kUnknown};
-  DataType dtype{DataType::Void()};
-  int lanes{1};
-  std::vector<PrimExpr> shape;
-};
-
-struct SunMMIOValue {
-  DataType dtype;
-  std::string value;
-  SunMMIOType type;
-};
-
-struct BuilderArg {
-  std::string name;
-  SunMMIOType type;
-};
-
-struct BufferBinding {
-  tir::Buffer buffer;
-  std::string handle;
-  SunMMIOType buffer_type;
-  std::string scope;
-  bool is_external{false};
-};
 
 class SunMMIOBuilder {
 public:
@@ -148,7 +100,8 @@ public:
                                  DataType dtype) = 0;
 
   virtual void BeginFor(const std::string &iv, const SunMMIOValue &lb,
-                        const SunMMIOValue &ub, const SunMMIOValue &step) = 0;
+                        const SunMMIOValue &ub, const SunMMIOValue &step,
+                        const ffi::Map<ffi::String, ffi::Any> &annotations) = 0;
   virtual void EndFor() = 0;
 
   virtual void BeginIf(const SunMMIOValue &cond) = 0;

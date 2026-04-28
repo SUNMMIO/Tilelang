@@ -2,10 +2,10 @@
 #define TVM_TL_TARGET_SUNMMIO_MLIR_FUNCTION_H_
 
 #include "sunmmio_mlir_context.h"
+#include "sunmmio_mlir_type.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/Value.h"
 
 namespace tvm {
 namespace codegen {
@@ -23,7 +23,8 @@ public:
   void EmitReturn();
 
   void BeginFor(const std::string &iv, const SunMMIOValue &lb,
-                const SunMMIOValue &ub, const SunMMIOValue &step);
+                const SunMMIOValue &ub, const SunMMIOValue &step,
+                const ffi::Map<ffi::String, ffi::Any> &annotations);
   void EndFor();
 
   void BeginIf(const SunMMIOValue &cond);
@@ -38,19 +39,10 @@ private:
     bool in_else{false};
   };
 
-  mlir::Location Loc() const;
-  mlir::Type MapType(const SunMMIOType &type) const;
-  mlir::Type MapElementType(DataType dtype) const;
-  mlir::Value EnsureI1(mlir::Value v);
-  mlir::Value EnsureIndex(mlir::Value v);
-  mlir::Value ResolveValueOrCreatePlaceholder(const SunMMIOValue &v,
-                                              mlir::Type expected_type);
-
   SunmmioMlirContext &ctx_;
+  SunmmioMlirType type_;
   mlir::func::FuncOp current_func_;
-  std::vector<mlir::scf::ForOp> for_stack_;
   std::vector<IfFrame> if_stack_;
-  std::unordered_map<std::string, mlir::Value> mlir_value_table_;
 };
 
 } // namespace codegen

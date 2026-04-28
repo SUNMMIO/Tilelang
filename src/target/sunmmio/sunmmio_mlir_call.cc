@@ -16,11 +16,7 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
   (void)operands;
   (void)string_args;
   (void)category;
-  SunMMIOValue out{ret_dtype, result_name, ret_type};
-  if (!result_name.empty()) {
-    ctx_.value_symbol_table[result_name] = out;
-  }
-  return out;
+  return SunMMIOValue{ret_dtype, result_name, ret_type};
 }
 
 } // namespace codegen

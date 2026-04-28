@@ -9,9 +9,7 @@ SunMMIOValue SunmmioMlirExpr::ConstantInt(const std::string &result_name,
                                           int64_t v, const SunMMIOType &type,
                                           DataType dtype) {
   (void)v;
-  SunMMIOValue out{dtype, result_name, type};
-  ctx_.value_symbol_table[result_name] = out;
-  return out;
+  return SunMMIOValue{dtype, result_name, type};
 }
 
 SunMMIOValue SunmmioMlirExpr::ConstantFloat(const std::string &result_name,
@@ -19,9 +17,7 @@ SunMMIOValue SunmmioMlirExpr::ConstantFloat(const std::string &result_name,
                                             const SunMMIOType &type,
                                             DataType dtype) {
   (void)literal;
-  SunMMIOValue out{dtype, result_name, type};
-  ctx_.value_symbol_table[result_name] = out;
-  return out;
+  return SunMMIOValue{dtype, result_name, type};
 }
 
 SunMMIOValue SunmmioMlirExpr::Cast(const std::string &result_name,
@@ -29,9 +25,7 @@ SunMMIOValue SunmmioMlirExpr::Cast(const std::string &result_name,
                                    const SunMMIOType &dst_type,
                                    DataType dst_dtype) {
   (void)v;
-  SunMMIOValue out{dst_dtype, result_name, dst_type};
-  ctx_.value_symbol_table[result_name] = out;
-  return out;
+  return SunMMIOValue{dst_dtype, result_name, dst_type};
 }
 
 SunMMIOValue SunmmioMlirExpr::Binary(const std::string &result_name,
@@ -44,9 +38,7 @@ SunMMIOValue SunmmioMlirExpr::Binary(const std::string &result_name,
   (void)flavor;
   (void)a;
   (void)b;
-  SunMMIOValue out{dtype, result_name, result_type};
-  ctx_.value_symbol_table[result_name] = out;
-  return out;
+  return SunMMIOValue{dtype, result_name, result_type};
 }
 
 SunMMIOValue SunmmioMlirExpr::Compare(const std::string &result_name,
@@ -60,9 +52,7 @@ SunMMIOValue SunmmioMlirExpr::Compare(const std::string &result_name,
   (void)b;
   (void)operand_type;
   SunMMIOType bool_type{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
-  SunMMIOValue out{DataType::Bool(), result_name, bool_type};
-  ctx_.value_symbol_table[result_name] = out;
-  return out;
+  return SunMMIOValue{DataType::Bool(), result_name, bool_type};
 }
 
 SunMMIOValue SunmmioMlirExpr::Select(const std::string &result_name,
@@ -74,9 +64,7 @@ SunMMIOValue SunmmioMlirExpr::Select(const std::string &result_name,
   (void)cond;
   (void)tv;
   (void)fv;
-  SunMMIOValue out{dtype, result_name, result_type};
-  ctx_.value_symbol_table[result_name] = out;
-  return out;
+  return SunMMIOValue{dtype, result_name, result_type};
 }
 
 SunMMIOValue SunmmioMlirExpr::Ramp(const std::string &result_name,
@@ -89,9 +77,7 @@ SunMMIOValue SunmmioMlirExpr::Ramp(const std::string &result_name,
   (void)stride;
   (void)lanes;
   (void)elem_type;
-  SunMMIOValue out{dtype, result_name, vec_type};
-  ctx_.value_symbol_table[result_name] = out;
-  return out;
+  return SunMMIOValue{dtype, result_name, vec_type};
 }
 
 SunMMIOValue SunmmioMlirExpr::Broadcast(const std::string &result_name,
@@ -102,9 +88,7 @@ SunMMIOValue SunmmioMlirExpr::Broadcast(const std::string &result_name,
   (void)scalar;
   (void)lanes;
   (void)scalar_type;
-  SunMMIOValue out{dtype, result_name, vec_type};
-  ctx_.value_symbol_table[result_name] = out;
-  return out;
+  return SunMMIOValue{dtype, result_name, vec_type};
 }
 
 } // namespace codegen

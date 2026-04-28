@@ -12,9 +12,7 @@ SunmmioMlirMemory::Alloc(const std::string &result_name,
                          const std::string &scope_name, DataType dtype) {
   (void)dyn_extents;
   (void)scope_name;
-  SunMMIOValue out{dtype, result_name, memref_type};
-  ctx_.value_symbol_table[result_name] = out;
-  return out;
+  return SunMMIOValue{dtype, result_name, memref_type};
 }
 
 SunMMIOValue SunmmioMlirMemory::Load(const std::string &result_name,
@@ -26,9 +24,7 @@ SunMMIOValue SunmmioMlirMemory::Load(const std::string &result_name,
   (void)buffer_handle;
   (void)indices;
   (void)memref_type;
-  SunMMIOValue out{dtype, result_name, result_type};
-  ctx_.value_symbol_table[result_name] = out;
-  return out;
+  return SunMMIOValue{dtype, result_name, result_type};
 }
 
 void SunmmioMlirMemory::Store(const SunMMIOValue &value,

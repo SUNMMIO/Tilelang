@@ -144,10 +144,11 @@ SunMMIOValue SuvmSunmmioBuilder::Broadcast(const std::string &result_name,
                           dtype);
 }
 
-void SuvmSunmmioBuilder::BeginFor(const std::string &iv, const SunMMIOValue &lb,
-                                  const SunMMIOValue &ub,
-                                  const SunMMIOValue &step) {
-  function_->BeginFor(iv, lb, ub, step);
+void SuvmSunmmioBuilder::BeginFor(
+    const std::string &iv, const SunMMIOValue &lb, const SunMMIOValue &ub,
+    const SunMMIOValue &step,
+    const ffi::Map<ffi::String, ffi::Any> &annotations) {
+  function_->BeginFor(iv, lb, ub, step, annotations);
 }
 
 void SuvmSunmmioBuilder::EndFor() { function_->EndFor(); }

@@ -86,7 +86,8 @@ public:
                          const SunMMIOType &vec_type, DataType dtype) final;
 
   void BeginFor(const std::string &iv, const SunMMIOValue &lb,
-                const SunMMIOValue &ub, const SunMMIOValue &step) final;
+                const SunMMIOValue &ub, const SunMMIOValue &step,
+                const ffi::Map<ffi::String, ffi::Any> &annotations) final;
   void EndFor() final;
 
   void BeginIf(const SunMMIOValue &cond) final;
