@@ -11,6 +11,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/tir/buffer.h>
 
+#include "../layout/cute_layout.h"
 #include "../layout/layout.h"
 #include "../target/sunmmio_utils.h"
 #include "tileview.h"
@@ -59,9 +60,9 @@ int64_t GetStaticIntValue(const PrimExpr &expr, int64_t fallback = -1);
 /*!
  * \brief Classify a buffer as blockwise or row-major for TileView planning.
  *
- * Today the classification is intentionally simple: presence in `layout_map`
- * means the buffer follows Sunmmio blockwise rules, otherwise the buffer is
- * treated as row-major.
+ * Uses sunmmio::IsZZLike to determine whether the buffer's CuteLayout has
+ * blockwise structure (≥2 blocked dims with row-major inner stride ordering).
+ * Row-major, ZN, 1D, and non-CuteLayout buffers are treated as kRowMajor.
  */
 LayoutClass GetLayoutClass(const Buffer &buffer,
                            const Map<Buffer, Layout> &layout_map);

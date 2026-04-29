@@ -9,6 +9,7 @@
 #include <tvm/tir/op.h>
 #include <vector>
 
+#include "../layout/cute_layout.h"
 #include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "copy.h"
@@ -53,6 +54,47 @@ TIR_DEFINE_TL_BUILTIN(broadcast_)
 
 using namespace tir;
 
+/*!
+ * \brief Sunmmio SRAM layout inference for symmetric comm ops.
+ *
+ * Propagates layout between src and dst via DeriveLayoutLike.
+ * Always proposes — TryAssign handles priority and conflict detection.
+ *
+ * No validation here: the level-based priority system in TryAssign
+ * determines whether proposals are accepted or rejected.  When a buffer
+ * is immutable (T.annotate_layout / DRAM metadata), TryAssign catches
+ * any kStrict conflict.  kCommon proposals against immutable entries
+ * are silently rejected — they arise from BFS noise (e.g., derived from
+ * kFree defaults) and are not real constraints.
+ */
+static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
+                                        const Buffer &src, const Buffer &dst,
+                                        InferLevel level) {
+  // Comm ops are propagation-only — no hard constraints at kStrict.
+  if (level >= InferLevel::kStrict)
+    return {};
+
+  LayoutMap result;
+  bool src_has = T.layout_map.count(src);
+  bool dst_has = T.layout_map.count(dst);
+
+  // Propagate: derive layout for each side from the other.
+  if (src_has) {
+    auto derived = DeriveLayoutLike(T.layout_map[src], dst->shape);
+    if (derived.defined()) {
+      result.Set(dst, derived.value());
+    }
+  }
+  if (dst_has) {
+    auto derived = DeriveLayoutLike(T.layout_map[dst], src->shape);
+    if (derived.defined()) {
+      result.Set(src, derived.value());
+    }
+  }
+
+  return result;
+}
+
 BroadcastOp::BroadcastOp(Array<PrimExpr> args,
                          Map<String, ObjectRef> annotations) {
   ObjectPtr<BroadcastOpNode> node = tvm::ffi::make_object<BroadcastOpNode>();
@@ -82,12 +124,16 @@ TileOperator BroadcastOpNode::Clone() const {
 
 LayoutMap BroadcastOpNode::InferLayout(const LayoutInferArgs &T,
                                        InferLevel level) const {
+  if (IsSunmmioSramScope(src.scope()) || IsSunmmioSramScope(dst.scope())) {
+    return SunmmioCommInferLayout(T, src, dst, level);
+  }
+
+  // Non-Sunmmio: delegate to Copy.
   Array<PrimExpr> args;
   args.push_back(src_expr);
   args.push_back(dst_expr);
   Copy copy_op = Copy(args);
-  LayoutMap out_layout = copy_op->InferLayout(T, level);
-  return out_layout;
+  return copy_op->InferLayout(T, level);
 }
 
 Stmt BroadcastOpNode::Lower(const LowerArgs &T,
@@ -221,12 +267,16 @@ TileOperator PutOpNode::Clone() const {
 
 LayoutMap PutOpNode::InferLayout(const LayoutInferArgs &T,
                                  InferLevel level) const {
+  if (IsSunmmioSramScope(src.scope()) || IsSunmmioSramScope(dst.scope())) {
+    return SunmmioCommInferLayout(T, src, dst, level);
+  }
+
+  // Non-Sunmmio: delegate to Copy.
   Array<PrimExpr> args;
   args.push_back(src_expr);
   args.push_back(dst_expr);
   Copy copy_op = Copy(args);
-  LayoutMap out_layout = copy_op->InferLayout(T, level);
-  return out_layout;
+  return copy_op->InferLayout(T, level);
 }
 
 Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
@@ -382,6 +432,10 @@ TileOperator AllgatherOpNode::Clone() const {
 LayoutMap AllgatherOpNode::ComputeLayout(const LayoutInferArgs &T,
                                          InferLevel level, Buffer src,
                                          Buffer dst) const {
+  if (IsSunmmioSramScope(src.scope()) || IsSunmmioSramScope(dst.scope())) {
+    return SunmmioCommInferLayout(T, src, dst, level);
+  }
+
   if (src.scope() == "local.fragment" && dst.scope() == "local.fragment" &&
       T.layout_map.count(src)) {
     auto src_layout = T.layout_map[src].as<Fragment>().value();
@@ -650,6 +704,10 @@ LayoutMap AllreduceOpNode::ComputeLayout(const LayoutInferArgs &T,
                                          Buffer dst, int dim) const {
   if (level >= InferLevel::kStrict)
     return {};
+
+  if (IsSunmmioSramScope(src.scope()) || IsSunmmioSramScope(dst.scope())) {
+    return SunmmioCommInferLayout(T, src, dst, level);
+  }
 
   if (src.scope() == "local.fragment" && dst.scope() == "local.fragment" &&
       T.layout_map.count(src)) {

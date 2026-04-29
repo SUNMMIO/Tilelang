@@ -174,10 +174,14 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
     # Infer shared memory SRAM scope
     mod = tilelang.transform.InferSramScope()(mod)
-    # Set layouts for reducers
     mod = tilelang.transform.LayoutReducer()(mod)
-    # Infer memory layouts for fragments and shared memory
-    mod = tilelang.transform.LayoutInference()(mod)
+    # Infer memory layouts — target-conditional
+    if target_is_sunmmio(target):
+        # Sunmmio: standalone layout inference (CuteLayout, no Fragment/thread)
+        mod = tilelang.transform.SunmmioLayoutInference()(mod)
+    else:
+        # CUDA/ROCm/Metal: Fragment-based layout inference
+        mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout
     LayoutVisual(mod)
     # Lower high-level tile operations to low-level operations

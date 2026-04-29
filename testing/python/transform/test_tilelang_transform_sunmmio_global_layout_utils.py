@@ -23,7 +23,7 @@ collected_layout_map = {}
 
 @tir.functor.visitor
 class _LayoutMapCollector(PyStmtExprVisitor):
-    """Visitor to extract layout_map from block annotations after LayoutInference."""
+    """Visitor to extract layout_map from block annotations after SunmmioLayoutInference."""
 
     def __init__(self):
         super().__init__()
@@ -62,7 +62,7 @@ def test_sunmmio_target_detection():
 def test_global_buffer_layout_populated_for_sunmmio():
     """
     Test that global buffer layouts from tensor_meta are populated into layout_map
-    during LayoutInference pass for Sunmmio target.
+    during SunmmioLayoutInference pass for Sunmmio target.
     """
     policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
     device_mesh = (2, 2)
@@ -104,13 +104,14 @@ def test_global_buffer_layout_populated_for_sunmmio():
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl.transform.InferSramScope()(mod)
-        mod = tl.transform.LayoutInference()(mod)
+        mod = tl.transform.LayoutReducer()(mod)
+        mod = tl.transform.SunmmioLayoutInference()(mod)
         mod = tl.transform.LowerTileOp()(mod)
         CollectLayoutMap()(mod)
 
     # Verify that global buffer 'A' has a layout in the layout_map
     assert "A" in collected_layout_map, (
-        f"Global buffer 'A' should be in layout_map after LayoutInference. Got: {list(collected_layout_map.keys())}"
+        f"Global buffer 'A' should be in layout_map after SunmmioLayoutInference. Got: {list(collected_layout_map.keys())}"
     )
 
     a_layout = collected_layout_map["A"]
@@ -186,7 +187,8 @@ def test_row_major_global_layout_values():
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl.transform.InferSramScope()(mod)
-        mod = tl.transform.LayoutInference()(mod)
+        mod = tl.transform.LayoutReducer()(mod)
+        mod = tl.transform.SunmmioLayoutInference()(mod)
         mod = tl.transform.LowerTileOp()(mod)
         CollectLayoutMap()(mod)
 
@@ -243,7 +245,8 @@ def test_dynamic_shape_global_buffer_layout():
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl.transform.InferSramScope()(mod)
-        mod = tl.transform.LayoutInference()(mod)
+        mod = tl.transform.LayoutReducer()(mod)
+        mod = tl.transform.SunmmioLayoutInference()(mod)
         mod = tl.transform.LowerTileOp()(mod)
         CollectLayoutMap()(mod)
 

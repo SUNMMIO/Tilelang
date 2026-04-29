@@ -22,6 +22,7 @@
 #include "../op/parallel.h"
 #include "../op/region.h"
 #include "../op/utils.h"
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "../tileview/tileview.h"
 #include "arith/ir_mutator_with_analyzer.h"
@@ -88,9 +89,7 @@ private:
       for (auto buffer : alloc_buffers) {
         if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
           buffers_to_infer.insert(buffer);
-        } else if ((buffer.scope() != "shared.asram") &&
-                   (buffer.scope() != "shared.wsram") &&
-                   (buffer.scope() != "shared.rsram")) {
+        } else if (!IsSunmmioSramScope(buffer.scope())) {
           // sram type has validated in GEMM node
           ICHECK(0) << "Invalid scope " << buffer.scope() << " of " << buffer
                     << " in Sunmmio.";
@@ -175,17 +174,17 @@ private:
           if ((buffer.scope() == "shared") ||
               (buffer.scope() == "shared.dyn")) {
             if (buffer_remap_.count(buffer)) {
-              ICHECK(buffer_remap_[buffer].scope() == "shared.asram")
+              ICHECK(buffer_remap_[buffer].scope() == kSunmmioScopeASRAM)
                   << "Infer scope shared.asram of " << buffer
                   << " in GEMM Sunmmio, but scope "
                   << buffer_remap_[buffer].scope() << " has been inferred for "
                   << buffer << ".";
             } else {
               auto remap_buffer =
-                  makeBufferWithScope(aRegion_->buffer, "shared.asram");
+                  makeBufferWithScope(aRegion_->buffer, kSunmmioScopeASRAM);
               buffer_remap_.Set(buffer, remap_buffer);
             }
-          } else if (buffer.scope() != "shared.asram") {
+          } else if (buffer.scope() != kSunmmioScopeASRAM) {
             // incorrect specification
             ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
                       << buffer << " in GEMM Sunmmio.";
@@ -195,17 +194,17 @@ private:
           if ((buffer.scope() == "shared") ||
               (buffer.scope() == "shared.dyn")) {
             if (buffer_remap_.count(buffer)) {
-              ICHECK(buffer_remap_[buffer].scope() == "shared.wsram")
+              ICHECK(buffer_remap_[buffer].scope() == kSunmmioScopeWSRAM)
                   << "Infer scope shared.wsram of " << buffer
                   << " in GEMM Sunmmio, but scope "
                   << buffer_remap_[buffer].scope() << " has been inferred for "
                   << buffer << ".";
             } else {
               auto remap_buffer =
-                  makeBufferWithScope(bRegion_->buffer, "shared.wsram");
+                  makeBufferWithScope(bRegion_->buffer, kSunmmioScopeWSRAM);
               buffer_remap_.Set(buffer, remap_buffer);
             }
-          } else if (buffer.scope() != "shared.wsram") {
+          } else if (buffer.scope() != kSunmmioScopeWSRAM) {
             // incorrect specification
             ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
                       << buffer << " in GEMM Sunmmio.";
@@ -215,17 +214,17 @@ private:
           if ((buffer.scope() == "shared") ||
               (buffer.scope() == "shared.dyn")) {
             if (buffer_remap_.count(buffer)) {
-              ICHECK(buffer_remap_[buffer].scope() == "shared.rsram")
+              ICHECK(buffer_remap_[buffer].scope() == kSunmmioScopeRSRAM)
                   << "Infer scope shared.rsram of " << buffer
                   << " in GEMM Sunmmio, but scope "
                   << buffer_remap_[buffer].scope() << " has been inferred for "
                   << buffer << ".";
             } else {
               auto remap_buffer =
-                  makeBufferWithScope(cRegion_->buffer, "shared.rsram");
+                  makeBufferWithScope(cRegion_->buffer, kSunmmioScopeRSRAM);
               buffer_remap_.Set(buffer, remap_buffer);
             }
-          } else if (buffer.scope() != "shared.rsram") {
+          } else if (buffer.scope() != kSunmmioScopeRSRAM) {
             // incorrect specification
             ICHECK(0) << "Specify invalid scope " << buffer.scope() << " of "
                       << buffer << " in GEMM Sunmmio.";
@@ -327,7 +326,7 @@ private:
   void InferUnspecifiedBuffer() {
     for (const auto &buffer : buffers_to_infer) {
       if (!buffer_remap_.count(buffer)) {
-        auto remap_buffer = makeBufferWithScope(buffer, "shared.rsram");
+        auto remap_buffer = makeBufferWithScope(buffer, kSunmmioScopeRSRAM);
         buffer_remap_.Set(buffer, remap_buffer);
       }
     }

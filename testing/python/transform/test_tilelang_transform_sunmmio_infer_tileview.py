@@ -25,7 +25,7 @@ def apply_sunmmio_passes(mod, target):
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
     mod = tilelang.transform.LayoutReducer()(mod)
-    mod = tilelang.transform.LayoutInference()(mod)
+    mod = tilelang.transform.SunmmioLayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     mod = tl.transform.LowerTilesLoop()(mod)
     return mod

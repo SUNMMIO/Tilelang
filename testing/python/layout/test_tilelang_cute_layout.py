@@ -513,7 +513,9 @@ class TestDeriveLayoutLike:
     def test_derive_4d_zz(self):
         """DeriveLayoutLike for a 4D attention buffer with ZZ on axes (1,3)."""
         src = make_zz(_imms(2, 128, 4, 64), [1, 3], _imms(32, 32))
-        dst = derive_layout_like(src, _imms(4, 64, 8, 128), None)
+        # Explicit axis_map to place blocked dims on dst axes 1 and 3
+        # (default would place them on the last 2 axes: 2 and 3).
+        dst = derive_layout_like(src, _imms(4, 64, 8, 128), [_imm(1), _imm(3)])
         assert dst is not None
         dl = [int(x) for x in get_dim_levels(dst)]
         assert dl == [1, 2, 1, 2]
@@ -552,6 +554,117 @@ class TestDeriveLayoutLike:
         derived = derive_layout_like(src, _imms(64, 256), None)
         direct = make_nzz(_imms(64, 256), [0, 1], _imms(16, 16), _imms(4, 4))
         assert is_same_layout(derived, direct)
+
+
+class TestDeriveLayoutLikeRankChanging:
+    """Tests for DeriveLayoutLike with rank-mismatched src and dst."""
+
+    def test_3d_zz_reduce_to_2d(self):
+        """Reduce: 3D ZZ → 2D. Default axis_map places ZZ on last 2 axes."""
+        src = make_zz(_imms(8, 128, 64), [1, 2], _imms(32, 32))
+        dst = derive_layout_like(src, _imms(128, 64), None)
+        assert dst is not None
+        direct = make_zz(_imms(128, 64), [0, 1], _imms(32, 32))
+        assert is_same_layout(dst, direct)
+
+    def test_3d_zn_reduce_to_2d(self):
+        """Reduce: 3D ZN → 2D. Col-major inner block preserved."""
+        src = make_zn(_imms(4, 64, 128), [1, 2], _imms(32, 32))
+        dst = derive_layout_like(src, _imms(64, 128), None)
+        assert dst is not None
+        direct = make_zn(_imms(64, 128), [0, 1], _imms(32, 32))
+        assert is_same_layout(dst, direct)
+
+    def test_3d_row_major_reduce_to_2d(self):
+        """Reduce: 3D row-major → 2D. 0 blocked dims → all row-major."""
+        src = make_row_major(_imms(8, 128, 64))
+        dst = derive_layout_like(src, _imms(128, 64), None)
+        assert dst is not None
+        direct = make_row_major(_imms(128, 64))
+        assert is_same_layout(dst, direct)
+
+    def test_2d_zz_broadcast_to_3d(self):
+        """Broadcast: 2D ZZ → 3D. Default places ZZ on last 2 axes."""
+        src = make_zz(_imms(128, 64), [0, 1], _imms(32, 32))
+        dst = derive_layout_like(src, _imms(8, 128, 64), None)
+        assert dst is not None
+        dl = [int(x) for x in get_dim_levels(dst)]
+        assert dl == [1, 2, 2]
+        # Dim 0 is row-major, dims 1-2 preserve ZZ block structure
+        ms = [int(x) for x in get_mode_shape(dst)]
+        assert ms[0] == 8  # batch, single-level
+        assert ms[1] == 32  # BM preserved
+        assert ms[3] == 32  # BN preserved
+
+    def test_4d_reduce_to_3d(self):
+        """Reduce: 4D ZZ(axes=[2,3]) → 3D. ZZ lands on last 2 of dst."""
+        src = make_zz(_imms(2, 4, 128, 64), [2, 3], _imms(32, 32))
+        dst = derive_layout_like(src, _imms(4, 128, 64), None)
+        assert dst is not None
+        dl = [int(x) for x in get_dim_levels(dst)]
+        assert dl == [1, 2, 2]
+
+    def test_explicit_axis_map(self):
+        """Explicit axis_map places ZZ on custom dst axes."""
+        src = make_zz(_imms(128, 64), [0, 1], _imms(32, 32))
+        dst = derive_layout_like(src, _imms(128, 8, 64), [_imm(0), _imm(2)])
+        assert dst is not None
+        dl = [int(x) for x in get_dim_levels(dst)]
+        assert dl == [2, 1, 2]  # ZZ on dims 0,2; row-major dim 1
+        ms = [int(x) for x in get_mode_shape(dst)]
+        assert ms[0] == 32  # BM on dst dim 0
+        assert ms[2] == 8  # row-major dst dim 1
+        assert ms[3] == 32  # BN on dst dim 2
+
+    def test_col_major_same_rank(self):
+        """Column-major src → same-rank dst preserves col-major strides."""
+        # Column-major 2D: stride pattern is (1, M) not (N, 1)
+        src = make_cute(
+            _imms(128, 64),  # logical_shape
+            _imms(128, 64),  # mode_shape (single-level each)
+            _imms(1, 128),  # mode_stride: dim 0 innermost
+            [_imm(1), _imm(1)],  # dim_levels
+        )
+        dst = derive_layout_like(src, _imms(256, 32), None)
+        assert dst is not None
+        ms = [int(x) for x in get_mode_stride(dst)]
+        # Column-major: dim 0 stride=1, dim 1 stride=256
+        assert ms[0] == 1
+        assert ms[1] == 256
+
+    def test_col_major_3d_reduce_to_2d(self):
+        """Column-major 3D → 2D preserves col-major stride ordering."""
+        # 3D column-major: strides (1, 8, 8*128) — dim 0 innermost
+        src = make_cute(
+            _imms(8, 128, 64),
+            _imms(8, 128, 64),
+            _imms(1, 8, 1024),
+            [_imm(1), _imm(1), _imm(1)],
+        )
+        dst = derive_layout_like(src, _imms(128, 64), None)
+        assert dst is not None
+        ms = [int(x) for x in get_mode_stride(dst)]
+        # Should preserve col-major: dim 0 stride=1, dim 1 stride=128
+        assert ms[0] == 1
+        assert ms[1] == 128
+
+    def test_col_major_2d_broadcast_to_3d(self):
+        """Column-major 2D → 3D. Mapped dims preserve ordering, excess is outermost."""
+        src = make_cute(
+            _imms(128, 64),
+            _imms(128, 64),
+            _imms(1, 128),
+            [_imm(1), _imm(1)],
+        )
+        dst = derive_layout_like(src, _imms(8, 128, 64), None)
+        assert dst is not None
+        ms = [int(x) for x in get_mode_stride(dst)]
+        # Mapped single-level dims go to last 2 axes → dst dims 1,2
+        # Col-major: dim 1 stride=1, dim 2 stride=128
+        # Excess dim 0 is outermost row-major
+        assert ms[1] == 1  # dim 1 innermost (from src dim 0)
+        assert ms[2] == 128  # dim 2 (from src dim 1)
+        assert ms[0] == 128 * 64  # dim 0 outermost
 
 
 # ---------------------------------------------------------------------------

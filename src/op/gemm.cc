@@ -447,11 +447,11 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   GemmInst gemm_inst = getGemmInst(block_size, T.target);
 
   if (gemm_inst == GemmInst::kSunmmioMMA) {
-    ICHECK(a_.scope() == "shared.asram")
+    ICHECK(a_.scope() == kSunmmioScopeASRAM)
         << "Invalid scope of buffer " << a_ << " in SunmmioMMA.";
-    ICHECK(b_.scope() == "shared.wsram")
+    ICHECK(b_.scope() == kSunmmioScopeWSRAM)
         << "Invalid scope of buffer " << b_ << " in SunmmioMMA.";
-    ICHECK(c_.scope() == "shared.rsram")
+    ICHECK(c_.scope() == kSunmmioScopeRSRAM)
         << "Invalid scope of buffer " << c_ << " in SunmmioMMA.";
 
     PrimExpr A_region =
@@ -840,11 +840,17 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
       ICHECK(0);
     }
   } else if (gemm_inst == GemmInst::kSunmmioMMA) {
-    ICHECK(a_.scope() == "shared.asram")
+    // Sunmmio Gemm only proposes layouts at kStrict — hardware-mandated.
+    // At kCommon/kFree the layouts are already seeded; returning empty avoids
+    // redundant TryAssign work in the inference pass.
+    if (level != InferLevel::kStrict) {
+      return {};
+    }
+    ICHECK(a_.scope() == kSunmmioScopeASRAM)
         << "Invalid scope of buffer " << a_ << " in SunmmioMMA.";
-    ICHECK(b_.scope() == "shared.wsram")
+    ICHECK(b_.scope() == kSunmmioScopeWSRAM)
         << "Invalid scope of buffer " << b_ << " in SunmmioMMA.";
-    ICHECK(c_.scope() == "shared.rsram")
+    ICHECK(c_.scope() == kSunmmioScopeRSRAM)
         << "Invalid scope of buffer " << c_ << " in SunmmioMMA.";
 
     const int rank_a = static_cast<int>(a_->shape.size());
@@ -859,8 +865,10 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
     ICHECK_GE(rank_b, 2)
         << "Sunmmio GEMM B layout inference requires rank >= 2.";
     Array<Integer> axes_b{Integer(rank_b - 2), Integer(rank_b - 1)};
-    l = sunmmio::MakeZZ(b_->shape, axes_b,
-                        GetSunmmioLayoutBlockShape(T.target, b_->dtype));
+    auto block_shape_b = GetSunmmioLayoutBlockShape(T.target, b_->dtype);
+    // transB_ => TMM.MT mode => ZZ layout; !transB_ => TMM.MN mode => ZN layout
+    l = transB_ ? sunmmio::MakeZZ(b_->shape, axes_b, block_shape_b)
+                : sunmmio::MakeZN(b_->shape, axes_b, block_shape_b);
     results.Set(b_, l);
 
     const int rank_c = static_cast<int>(c_->shape.size());

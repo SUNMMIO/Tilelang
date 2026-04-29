@@ -382,59 +382,170 @@ Optional<Layout> DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
   size_t src_rank = src_cute->GetDimLevels().size();
   size_t dst_rank = dst_shape.size();
 
-  // Build the actual axis mapping.
-  std::vector<int> mapping;
+  // --- Identify multi-mode (blocked) source dimensions. ---
+  std::vector<int> blocked_src_dims;
+  for (size_t d = 0; d < src_rank; ++d) {
+    if (src_cute->GetDimLevels()[d].IntValue() > 1)
+      blocked_src_dims.push_back(d);
+  }
+  int num_blocked = static_cast<int>(blocked_src_dims.size());
+
+  // --- Resolve axis_map: explicit or default to last N dst axes. ---
+  //
+  // axis_map has one entry per blocked src dim.  axis_map[i] = which dst
+  // dim receives the i-th blocked src dim's mode structure.
+  // When NullOpt, blocked dims are placed on the last N axes of dst.
+  // If dst doesn't have enough dims to hold all blocked dims, we cannot
+  // derive a meaningful layout — return NullOpt.
+  std::vector<int> target_axes;
   if (axis_map.defined()) {
     for (auto &v : axis_map.value()) {
-      mapping.push_back(v.IntValue());
+      target_axes.push_back(v.IntValue());
     }
-    ICHECK_EQ(mapping.size(), src_rank)
-        << "axis_map must have one entry per source dimension";
+    ICHECK_EQ(static_cast<int>(target_axes.size()), num_blocked)
+        << "axis_map must have one entry per multi-mode source dimension";
   } else {
-    // Identity mapping: src dim i → dst dim i.
-    ICHECK_EQ(src_rank, dst_rank)
-        << "DeriveLayoutLike with identity axis_map requires matching rank";
-    for (size_t i = 0; i < src_rank; ++i) {
-      mapping.push_back(static_cast<int>(i));
+    if (num_blocked > static_cast<int>(dst_rank)) {
+      // Not enough dst dims to place all blocked structure.
+      return Optional<Layout>();
     }
+    // Default: place blocked dims on the last N axes of dst.
+    for (int i = 0; i < num_blocked; ++i) {
+      target_axes.push_back(static_cast<int>(dst_rank) - num_blocked + i);
+    }
+  }
+
+  // Reverse lookup: dst_dim → index into blocked_src_dims.
+  std::unordered_map<int, int> dst_to_blocked_idx;
+  for (size_t i = 0; i < target_axes.size(); ++i) {
+    dst_to_blocked_idx[target_axes[i]] = i;
   }
 
   // --- Pass 1: build new mode_shape and dim_levels ---
   //
-  // For each dimension, preserve all inner (fixed) modes and recompute
-  // the outermost mode as ceildiv(dst_extent, product_of_inner_modes).
-  //
-  // This works uniformly for all level counts because the outermost
-  // mode is always the derived (remainder) mode — by construction in
-  // iterativeDivide and by convention in the named constructors.
+  // For each dst dim: if it maps to a blocked src dim, preserve inner
+  // (fixed) modes and recompute the outermost mode via ceildiv.
+  // Otherwise, create a single-level mode (stride assigned in Pass 2).
 
   Array<PrimExpr> new_mode_shape;
   Array<Integer> new_dim_levels;
 
-  for (size_t d = 0; d < src_rank; ++d) {
-    int nlevels = src_cute->GetDimLevels()[d].IntValue();
-    int dst_d = mapping[d];
+  for (size_t dst_d = 0; dst_d < dst_rank; ++dst_d) {
     PrimExpr dst_ext = dst_shape[dst_d];
-    new_dim_levels.push_back(Integer(nlevels));
+    auto it = dst_to_blocked_idx.find(dst_d);
 
-    // Inner modes (0 .. nlevels-2) are fixed; outermost is derived.
-    PrimExpr inner_product = make_const(DataType::Int(32), 1);
-    Array<PrimExpr> dim_shapes = src_cute->GetModeShapeOfDim(d);
-    for (int i = 0; i < nlevels - 1; ++i) {
-      new_mode_shape.push_back(dim_shapes[i]);
-      inner_product = inner_product * dim_shapes[i];
+    if (it != dst_to_blocked_idx.end()) {
+      // Blocked dst dim — derive mode structure from corresponding src dim.
+      int src_d = blocked_src_dims[it->second];
+      int nlevels = src_cute->GetDimLevels()[src_d].IntValue();
+      new_dim_levels.push_back(Integer(nlevels));
+
+      PrimExpr inner_product = make_const(DataType::Int(32), 1);
+      Array<PrimExpr> dim_shapes = src_cute->GetModeShapeOfDim(src_d);
+      for (int i = 0; i < nlevels - 1; ++i) {
+        new_mode_shape.push_back(dim_shapes[i]);
+        inner_product = inner_product * dim_shapes[i];
+      }
+      new_mode_shape.push_back(ceildiv(dst_ext, inner_product));
+    } else {
+      // Non-blocked dst dim — single-level row-major.
+      new_dim_levels.push_back(Integer(1));
+      new_mode_shape.push_back(dst_ext);
     }
-    // Outermost mode: covers the remaining extent.
-    new_mode_shape.push_back(ceildiv(dst_ext, inner_product));
   }
 
   // --- Pass 2: recover physical ordering and assign contiguous strides ---
   //
-  // The physical ordering (which mode is innermost in memory) is an
-  // invariant of the layout kind.  We recover it by sorting the source
-  // strides — the at-most-one-symbolic invariant guarantees this works.
+  // We map ALL src modes (blocked + single-level) to new mode indices,
+  // then filter RecoverPhysicalOrder through that map.  This preserves
+  // the physical stride ordering for every layout kind (row-major,
+  // column-major, ZZ, ZN, ...) without explicit kind detection.
+  //
+  // Single-level src dims are matched to non-blocked dst dims, aligned
+  // from the back: last single-level src dim → last remaining dst dim.
+  // Truly excess dst dims (when dst_rank > mapped count) get fresh
+  // row-major modes at outermost.
 
-  auto order = RecoverPhysicalOrder(src_cute);
+  auto full_order = RecoverPhysicalOrder(src_cute);
+
+  // Collect single-level src dims and non-blocked dst dims.
+  std::vector<int> single_src_dims;
+  for (size_t d = 0; d < src_rank; ++d) {
+    if (src_cute->GetDimLevels()[d].IntValue() == 1)
+      single_src_dims.push_back(d);
+  }
+  std::vector<int> nonblocked_dst_dims;
+  for (size_t dst_d = 0; dst_d < dst_rank; ++dst_d) {
+    if (dst_to_blocked_idx.find(dst_d) == dst_to_blocked_idx.end())
+      nonblocked_dst_dims.push_back(dst_d);
+  }
+
+  // Align single-level src dims to non-blocked dst dims from the back.
+  // E.g. single_src=[0] nonblocked_dst=[0,1] → src dim 0 maps to dst dim 1,
+  //       dst dim 0 is excess (unmapped).
+  // E.g. single_src=[0,1,2] nonblocked_dst=[0] → src dim 2 maps to dst dim 0,
+  //       src dims 0,1 are dropped (reduced).
+  std::unordered_map<int, int> single_src_to_dst;
+  {
+    int ns = static_cast<int>(single_src_dims.size());
+    int nd = static_cast<int>(nonblocked_dst_dims.size());
+    int count = std::min(ns, nd);
+    for (int i = 0; i < count; ++i) {
+      single_src_to_dst[single_src_dims[ns - count + i]] =
+          nonblocked_dst_dims[nd - count + i];
+    }
+  }
+
+  // Build src_mode → new_mode mapping for ALL mapped modes.
+  std::unordered_map<int, int> src_mode_to_new;
+  std::vector<int> unmapped_new_indices; // excess dst dims with no src
+  int new_idx = 0;
+
+  for (size_t dst_d = 0; dst_d < dst_rank; ++dst_d) {
+    auto it = dst_to_blocked_idx.find(dst_d);
+    if (it != dst_to_blocked_idx.end()) {
+      // Blocked dst dim — map all modes from the corresponding src dim.
+      int src_d = blocked_src_dims[it->second];
+      int nlevels = src_cute->GetDimLevels()[src_d].IntValue();
+      int src_mode_start = 0;
+      for (int d2 = 0; d2 < src_d; ++d2)
+        src_mode_start += src_cute->GetDimLevels()[d2].IntValue();
+      for (int i = 0; i < nlevels; ++i)
+        src_mode_to_new[src_mode_start + i] = new_idx++;
+    } else {
+      // Check if a single-level src dim maps here.
+      bool found = false;
+      for (auto &kv : single_src_to_dst) {
+        if (kv.second == static_cast<int>(dst_d)) {
+          // Map the single src mode to this new mode index.
+          int src_d = kv.first;
+          int src_mode_start = 0;
+          for (int d2 = 0; d2 < src_d; ++d2)
+            src_mode_start += src_cute->GetDimLevels()[d2].IntValue();
+          src_mode_to_new[src_mode_start] = new_idx++;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        // Excess dst dim — no corresponding src dim.
+        unmapped_new_indices.push_back(new_idx++);
+      }
+    }
+  }
+
+  // Filter RecoverPhysicalOrder through the mapping (covers ALL mapped modes).
+  // Unmapped (excess) dst dims get fresh row-major order at outermost.
+  std::vector<int> order;
+  for (int idx : full_order) {
+    if (src_mode_to_new.count(idx))
+      order.push_back(src_mode_to_new[idx]);
+  }
+  // Excess dims: last dst dim innermost (row-major convention).
+  for (auto rit = unmapped_new_indices.rbegin();
+       rit != unmapped_new_indices.rend(); ++rit)
+    order.push_back(*rit);
+
   ICHECK_EQ(order.size(), new_mode_shape.size());
 
   Array<PrimExpr> new_mode_stride(new_mode_shape.size(), PrimExpr());
@@ -444,11 +555,7 @@ Optional<Layout> DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
     running = running * new_mode_shape[idx];
   }
 
-  // Build destination logical shape.
-  Array<PrimExpr> new_logical_shape;
-  for (size_t d = 0; d < src_rank; ++d) {
-    new_logical_shape.push_back(dst_shape[mapping[d]]);
-  }
+  Array<PrimExpr> new_logical_shape(dst_shape.begin(), dst_shape.end());
 
   return CuteLayout(new_logical_shape, new_mode_shape, new_mode_stride,
                     new_dim_levels);
@@ -466,6 +573,43 @@ bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
 // ---------------------------------------------------------------------------
 
 namespace sunmmio {
+
+bool IsZZLike(const Layout &layout) {
+  auto *cute = layout.as<CuteLayoutNode>();
+  if (!cute)
+    return false;
+
+  auto dim_levels = cute->GetDimLevels();
+
+  // Collect blocked dims (nlevels > 1).
+  std::vector<int> blocked_dims;
+  for (size_t d = 0; d < dim_levels.size(); ++d) {
+    if (dim_levels[d].IntValue() > 1)
+      blocked_dims.push_back(d);
+  }
+  if (blocked_dims.size() < 2)
+    return false;
+
+  // Last two blocked dims correspond to (ax0, ax1) in the Make* constructors.
+  int ax0 = blocked_dims[blocked_dims.size() - 2];
+  int ax1 = blocked_dims[blocked_dims.size() - 1];
+
+  // Innermost mode stride for each blocked dim.
+  PrimExpr stride_ax0 = cute->GetModeStrideOfDim(ax0)[0];
+  PrimExpr stride_ax1 = cute->GetModeStrideOfDim(ax1)[0];
+
+  // ZZ-like: ax1's innermost stride < ax0's innermost stride (row-major inner).
+  auto *s0 = stride_ax0.as<IntImmNode>();
+  auto *s1 = stride_ax1.as<IntImmNode>();
+  if (s0 && s1)
+    return s1->value < s0->value;
+
+  // Fallback: stride 1 on ax1 is the common ZZ-like pattern.
+  if (s1 && s1->value == 1)
+    return true;
+
+  return false;
+}
 
 static PrimExpr makeInt(int64_t v) { return make_const(DataType::Int(32), v); }
 

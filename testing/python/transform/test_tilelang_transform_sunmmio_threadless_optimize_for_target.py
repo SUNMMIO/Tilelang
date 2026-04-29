@@ -35,7 +35,7 @@ Kernel variants covered:
     2. T.Parallel + shared memory  — original ThreadBindingCollector bug trigger
     3. 3-D grid (bx, by, bz)       — multi-dimensional grid with arithmetic
 
-Note on target context: VectorizePlanner::Plan inside LayoutInference calls
+Note on target context: VectorizePlanner::Plan inside SunmmioLayoutInference calls
 Target::Current() at runtime. All test functions run entirely inside a
 `with tvm.target.Target(target):` block to keep the context active.
 """

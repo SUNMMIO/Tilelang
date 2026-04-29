@@ -577,6 +577,20 @@ def LowerSharedTmem():
     return _ffi_api.LowerSharedTmem()  # type: ignore
 
 
+def SunmmioLayoutInference():
+    """SunmmioLayoutInference
+
+    Standalone layout inference pass for the Sunmmio target.
+    Assigns CuteLayout to every buffer and validates layout consistency.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.SunmmioLayoutInference()  # type: ignore
+
+
 def LayoutReducer():
     """
     Return a TVM transform pass that performs layout reduction/normalization.

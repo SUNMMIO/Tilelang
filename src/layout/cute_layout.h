@@ -150,11 +150,32 @@ bool IsSameLayout(const Layout &lhs, const Layout &rhs,
 /*!
  * \brief Build a layout for dst_shape using src as the structural template.
  *
- * Preserves dim_levels and fixed inner modes; recomputes shape-dependent
- * outer modes via ceildiv.
+ * Two-pass algorithm:
  *
- * \param axis_map  Maps source logical dims to destination logical dims.
- *                  NullOpt means identity.
+ * **Pass 1 — mode structure.**  Blocked (multi-mode) src dimensions are
+ * placed on the dst dims given by axis_map: inner modes are preserved
+ * verbatim, the outermost mode is recomputed via ceildiv to cover the
+ * new logical extent.  All other dst dims receive single-level modes
+ * (one mode element equal to the logical extent).
+ *
+ * **Pass 2 — stride ordering.**  The physical stride order of the src
+ * layout (recovered via RecoverPhysicalOrder) is projected onto the new
+ * modes, so the layout *kind* (row-major, col-major, ZZ, ZN, …) is
+ * faithfully preserved without explicit kind detection.
+ *
+ * Rank-changing is handled by back-aligning single-level src dims to
+ * non-blocked dst dims:
+ *   - dst has more non-blocked dims than src → excess dst dims get
+ *     outermost (largest-stride) row-major modes (broadcast-like).
+ *   - src has more single-level dims than dst → excess src dims are
+ *     dropped (reduce-like).
+ *
+ * Returns NullOpt when src is not a CuteLayout, or when dst_rank is
+ * too small to accommodate all blocked src dims.
+ *
+ * \param axis_map  One entry per blocked src dim (in dim-index order);
+ *                  axis_map[i] = which dst dim receives that structure.
+ *                  NullOpt defaults to the last N axes of dst.
  */
 Optional<Layout>
 DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
@@ -172,6 +193,19 @@ bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
 // ---------------------------------------------------------------------------
 
 namespace sunmmio {
+
+/*!
+ * \brief Check if a layout is "ZZ-like": has blocked dims with row-major
+ * inner ordering.  Covers ZZ, ZZZ, and NZZ layouts.
+ *
+ * Structural invariant: at least 2 blocked dims (nlevels > 1), and among
+ * the last two blocked dims, the higher-indexed dim's innermost mode has
+ * a smaller stride (row-major ordering at the innermost level).
+ *
+ * Returns false for ZN (col-major inner), row-major (no blocked dims),
+ * or non-CuteLayout.
+ */
+bool IsZZLike(const Layout &layout);
 
 Layout MakeRowMajor(Array<PrimExpr> shape);
 

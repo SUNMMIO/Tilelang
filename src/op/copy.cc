@@ -453,31 +453,40 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
     return result_map;
   }
 
-  // Sunmmio DMA Layout Inference
-  if (copy_inst == CopyInst::kSunmmioDMACopy ||
-      copy_inst == CopyInst::kSunmmioTileCopy) {
-    auto result = Map<Buffer, Layout>();
-
-    if (level == InferLevel::kFree && !T.layout_map.count(src)) {
-      if (src.scope() != "global" && src->shape.size() > 1) {
-        const int rank = static_cast<int>(src->shape.size());
-        Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
-        auto layout = sunmmio::MakeZZ(
-            src->shape, axes, GetSunmmioLayoutBlockShape(T.target, src->dtype));
-        result.Set(src, layout);
+  // Sunmmio DMA Copy: no layout inference — Copy bridges any layout mismatch
+  // via dma_layout_transform in CopyNode::Lower.  Layouts are assigned
+  // by other operators
+  //
+  // Hard constraint: DRAM → ASRAM/WSRAM requires ZZ-like DRAM layout
+  // (ZZ, ZZZ, or NZZ).  DRAM layouts are user-specified and immutable,
+  // so an incompatible layout is a hard error.
+  if (copy_inst == CopyInst::kSunmmioDMACopy) {
+    if (src.scope() == "global" && (dst.scope() == kSunmmioScopeASRAM ||
+                                    dst.scope() == kSunmmioScopeWSRAM)) {
+      if (T.global_layout_map.count(src)) {
+        auto dram_layout = T.global_layout_map[src];
+        auto *cute = dram_layout.as<CuteLayoutNode>();
+        // Only validate user-specified blocked layouts (ZZ, ZN, ZZZ, NZZ).
+        // Row-major (default for unspecified DRAM) has no blocked dims and
+        // is handled by dma_layout_transform — skip the check.
+        if (cute) {
+          bool has_blocked = false;
+          for (auto nl : cute->GetDimLevels()) {
+            if (nl.IntValue() > 1) {
+              has_blocked = true;
+              break;
+            }
+          }
+          if (has_blocked) {
+            ICHECK(sunmmio::IsZZLike(dram_layout))
+                << "DRAM → " << dst.scope()
+                << " copy requires ZZ-like DRAM layout (ZZ, ZZZ, or NZZ), "
+                << "but buffer \"" << src->name << "\" has incompatible layout";
+          }
+        }
       }
     }
-
-    if (level == InferLevel::kFree && !T.layout_map.count(dst)) {
-      if (dst.scope() != "global" && dst->shape.size() > 1) {
-        const int rank = static_cast<int>(dst->shape.size());
-        Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
-        auto layout = sunmmio::MakeZZ(
-            dst->shape, axes, GetSunmmioLayoutBlockShape(T.target, dst->dtype));
-        result.Set(dst, layout);
-      }
-    }
-    return result;
+    return {};
   }
 
   // for LDSM/STSM, the layout was deduced from register layout
@@ -670,17 +679,17 @@ bool CopyNode::CheckTMemStore(Target target) const {
 bool CopyNode::CheckSunmmioDMACopy(Target target) const {
   // 1. src and dst must be legal
   bool scope_check = false;
-  if (src.scope() == "global" && dst.scope() == "shared.rsram")
+  if (src.scope() == "global" && dst.scope() == kSunmmioScopeRSRAM)
     scope_check = true;
-  if (src.scope() == "global" && dst.scope() == "shared.wsram")
+  if (src.scope() == "global" && dst.scope() == kSunmmioScopeWSRAM)
     scope_check = true;
-  if (src.scope() == "global" && dst.scope() == "shared.asram")
+  if (src.scope() == "global" && dst.scope() == kSunmmioScopeASRAM)
     scope_check = true;
-  if (src.scope() == "shared.rsram" && dst.scope() == "shared.wsram")
+  if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeWSRAM)
     scope_check = true;
-  if (src.scope() == "shared.rsram" && dst.scope() == "shared.asram")
+  if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeASRAM)
     scope_check = true;
-  if (src.scope() == "shared.rsram" && dst.scope() == "global")
+  if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == "global")
     scope_check = true;
   if (!scope_check) {
     return false;
@@ -714,7 +723,7 @@ bool CopyNode::CheckSunmmioTileCopy(Target target) const {
   // Region views are legal as long as src/dst describe the same logical copy
   // shape. Lowering will materialize a tile.domain scope over that region so
   // LegalizeTilesLoop/TilesLoop can preserve the offsets.
-  if (src.scope() != "shared.rsram" || dst.scope() != "shared.rsram") {
+  if (src.scope() != kSunmmioScopeRSRAM || dst.scope() != kSunmmioScopeRSRAM) {
     return false;
   }
   if (!have_same_region_shape(src_range, dst_range)) {

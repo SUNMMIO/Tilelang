@@ -76,8 +76,11 @@ int64_t GetStaticIntValue(const PrimExpr &expr, int64_t fallback) {
 
 LayoutClass GetLayoutClass(const Buffer &buffer,
                            const Map<Buffer, Layout> &layout_map) {
-  return layout_map.count(buffer) ? LayoutClass::kBlockwise32x32
-                                  : LayoutClass::kRowMajor;
+  if (!layout_map.count(buffer)) {
+    return LayoutClass::kRowMajor;
+  }
+  return sunmmio::IsZZLike(layout_map[buffer]) ? LayoutClass::kBlockwise32x32
+                                               : LayoutClass::kRowMajor;
 }
 
 int GetElementBits(const Buffer &buffer) {

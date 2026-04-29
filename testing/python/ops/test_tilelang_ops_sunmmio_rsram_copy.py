@@ -20,7 +20,7 @@ def apply_sunmmio_passes(mod, target):
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
     mod = tilelang.transform.LayoutReducer()(mod)
-    mod = tilelang.transform.LayoutInference()(mod)
+    mod = tilelang.transform.SunmmioLayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     mod = tl.transform.LegalizeTilesLoop()(mod)
     mod = tl.transform.TilesLoop()(mod)
@@ -194,9 +194,10 @@ def test_tilelang_rsram_copy_layout_inference():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(rsram_copy(64, 64), target)
 
-    # Check layout map
+    # Check layout map — at least one block_attr line must contain it
     texts = extract_block_attr_lines(mod)
-    for text in texts:
-        assert '"layout_map"' in text
+    layout_texts = [t for t in texts if '"layout_map"' in t]
+    assert len(layout_texts) > 0, f"No layout_map found in block attrs: {texts}"
+    for text in layout_texts:
         for buf_name in ["A_shared", "B_shared"]:
             assert f'{buf_name}: metadata["tl.Layout"]' in text or f'{buf_name}: metadata["tl.CuteLayout"]' in text
