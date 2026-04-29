@@ -27,6 +27,7 @@ public:
 
 private:
   SunmmioMlirContext &ctx_;
+  SunmmioMlirType type_;
 };
 
 } // namespace codegen

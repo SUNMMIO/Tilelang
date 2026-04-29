@@ -1,6 +1,5 @@
 #include "codegen_sunmmio.h"
 #include "sunmmio_mlir_builder.h"
-#include "sunmmio_mlir_type.h"
 
 #include <tvm/ir/type.h>
 #include <tvm/tir/analysis.h>
@@ -13,6 +12,8 @@
 #include <fstream>
 #include <iterator>
 #include <utility>
+
+#include <tvm/runtime/logging.h>
 
 namespace tvm {
 namespace codegen {
@@ -424,6 +425,24 @@ private:
   bool module_open_{false};
 };
 
+namespace {
+
+std::string GetAllocateStorageScope(const tir::Var &buffer_var) {
+  if (const auto *ptr = buffer_var->type_annotation.as<PointerTypeNode>()) {
+    const std::string &scope = ptr->storage_scope;
+    if (scope == "shared.asram" || scope == "shared.wsram" ||
+        scope == "shared.rsram") {
+      return scope;
+    } else {
+      LOG(FATAL) << "get Allocate StorageScope error:  " << scope;
+    }
+  }
+  LOG(FATAL) << "SunMMIO SUVM allocate expects PointerType buffer_var";
+  TVM_FFI_UNREACHABLE();
+}
+
+} // namespace
+
 CodeGenTileLangSunMMIO::CodeGenTileLangSunMMIO(BuilderBackendKind backend_kind)
     : backend_kind_(backend_kind) {}
 
@@ -795,14 +814,16 @@ void CodeGenTileLangSunMMIO::EmitAlloc(const tir::Var &buffer_var,
       dyn_extents.push_back(EnsureIndex(EvalExpr(extents[i])));
     }
   }
-  SunMMIOType memref_type{
-      SunMMIOType::Kind::kMemRef,
-      dtype.with_lanes(1),
-      1,
-      std::move(shape),
-  };
-  SunMMIOValue alloc = builder_->Alloc(NewValueName(), memref_type, dyn_extents,
-                                       MapStorageScope(scope_hint), dtype);
+  SunMMIOType memtensor_type;
+  memtensor_type.kind = SunMMIOType::Kind::kMemTensor;
+  memtensor_type.dtype = dtype.with_lanes(1);
+  memtensor_type.lanes = 1;
+  memtensor_type.shape = std::move(shape);
+  memtensor_type.memory_scope = scope_hint;
+  memtensor_type.byte_offset = 0;
+
+  SunMMIOValue alloc = builder_->Alloc(NewValueName(), memtensor_type,
+                                       dyn_extents, scope_hint, dtype);
   BindVar(buffer_var, alloc);
 }
 
@@ -869,50 +890,58 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::WhileNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
+  std::string scope = GetAllocateStorageScope(op->buffer_var);
   EnterScope();
-  EmitAlloc(op->buffer_var, op->dtype, op->extents, "local");
+  EmitAlloc(op->buffer_var, op->dtype, op->extents, scope);
   VisitStmtTracked(op->body);
   ExitScope();
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateConstNode *op) {
+  LOG(FATAL) << "SunMMIO SUVM allocate phase does not support "
+             << "AllocateConstNode";
   EnterScope();
-  EmitAlloc(op->buffer_var, op->dtype, op->extents, "const");
+  // EmitAlloc(op->buffer_var, op->dtype, op->extents, "const");
   VisitStmtTracked(op->body);
   ExitScope();
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::DeclBufferNode *op) {
-  RegisterBuffer(op->buffer, false, NewValueName());
-  const BufferBinding &binding = LookupBuffer(op->buffer);
-  builder_->Alloc(binding.handle, binding.buffer_type, {},
-                  MapStorageScope(op->buffer.scope()), op->buffer->dtype);
+  LOG(FATAL) << "SunMMIO SUVM allocate phase treats DeclBuffer as view/alias "
+             << "and does not handle it yet";
+  // RegisterBuffer(op->buffer, false, NewValueName());
+  // const BufferBinding &binding = LookupBuffer(op->buffer);
+  // builder_->Alloc(binding.handle, binding.buffer_type, {},
+  //                 MapStorageScope(op->buffer.scope()), op->buffer->dtype);
   VisitStmtTracked(op->body);
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferStoreNode *op) {
-  if (!buffer_registry_.count(op->buffer.get())) {
-    RegisterBuffer(op->buffer, false, NewValueName());
-    const BufferBinding &binding = LookupBuffer(op->buffer);
-    builder_->Alloc(binding.handle, binding.buffer_type, {},
-                    MapStorageScope(op->buffer.scope()), op->buffer->dtype);
-  }
+  LOG(FATAL) << "SunMMIO SUVM allocate phase does not handle BufferStore yet";
+  // if (!buffer_registry_.count(op->buffer.get())) {
+  //   RegisterBuffer(op->buffer, false, NewValueName());
+  //   const BufferBinding &binding = LookupBuffer(op->buffer);
+  //   builder_->Alloc(binding.handle, binding.buffer_type, {},
+  //                   MapStorageScope(op->buffer.scope()), op->buffer->dtype);
+  // }
   EmitStore(op->buffer, op->indices, EvalExpr(op->value));
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferRealizeNode *op) {
+  LOG(FATAL) << "SunMMIO SUVM allocate phase treats BufferRealize as "
+             << "view/alias and does not handle it yet";
   EnterScope();
-  RegisterBuffer(op->buffer, false, NewValueName());
-  const BufferBinding &binding = LookupBuffer(op->buffer);
-  std::vector<SunMMIOValue> dyn_bounds;
-  for (const Range &range : op->bounds) {
-    EvalExpr(range->min);
-    if (!range->extent.as<IntImmNode>()) {
-      dyn_bounds.push_back(EnsureIndex(EvalExpr(range->extent)));
-    }
-  }
-  builder_->Alloc(binding.handle, binding.buffer_type, dyn_bounds,
-                  MapStorageScope(op->buffer.scope()), op->buffer->dtype);
+  // RegisterBuffer(op->buffer, false, NewValueName());
+  // const BufferBinding &binding = LookupBuffer(op->buffer);
+  // std::vector<SunMMIOValue> dyn_bounds;
+  // for (const Range &range : op->bounds) {
+  //   EvalExpr(range->min);
+  //   if (!range->extent.as<IntImmNode>()) {
+  //     dyn_bounds.push_back(EnsureIndex(EvalExpr(range->extent)));
+  //   }
+  // }
+  // builder_->Alloc(binding.handle, binding.buffer_type, dyn_bounds,
+  //                 MapStorageScope(op->buffer.scope()), op->buffer->dtype);
   VisitStmtTracked(op->body);
   ExitScope();
 }
@@ -987,12 +1016,20 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockNode *op) {
       BindVar(iv->var, EvalExpr(iv->var));
     }
   }
-  for (const Buffer &alloc : op->alloc_buffers) {
-    RegisterBuffer(alloc, false, NewValueName());
-    const BufferBinding &binding = LookupBuffer(alloc);
-    builder_->Alloc(binding.handle, binding.buffer_type, {},
-                    MapStorageScope(alloc.scope()), alloc->dtype);
+  if (!op->alloc_buffers.empty()) {
+    LOG(FATAL) << "SunMMIO SUVM allocate phase treats block alloc_buffers as "
+               << "view/alias and does not handle them yet";
   }
+  if (!op->match_buffers.empty()) {
+    LOG(FATAL) << "SunMMIO SUVM allocate phase treats match_buffer as "
+               << "view/alias and does not handle it yet";
+  }
+  // for (const Buffer &alloc : op->alloc_buffers) {
+  //   RegisterBuffer(alloc, false, NewValueName());
+  //   const BufferBinding &binding = LookupBuffer(alloc);
+  //   builder_->Alloc(binding.handle, binding.buffer_type, {},
+  //                   MapStorageScope(alloc.scope()), alloc->dtype);
+  // }
   for (const MatchBufferRegion &match : op->match_buffers) {
     if (match->source.defined()) {
       RegisterBuffer(match->source->buffer, false);
@@ -1221,12 +1258,13 @@ void CodeGenTileLangSunMMIO::EmitStore(const tir::Buffer &buffer,
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::BufferLoadNode *op) {
-  if (!buffer_registry_.count(op->buffer.get())) {
-    RegisterBuffer(op->buffer, false, NewValueName());
-    const BufferBinding &b = LookupBuffer(op->buffer);
-    builder_->Alloc(b.handle, b.buffer_type, {},
-                    MapStorageScope(op->buffer.scope()), op->buffer->dtype);
-  }
+  LOG(FATAL) << "SunMMIO SUVM allocate phase does not handle BufferLoad yet";
+  // if (!buffer_registry_.count(op->buffer.get())) {
+  //   RegisterBuffer(op->buffer, false, NewValueName());
+  //   const BufferBinding &b = LookupBuffer(op->buffer);
+  //   builder_->Alloc(b.handle, b.buffer_type, {},
+  //                   MapStorageScope(op->buffer.scope()), op->buffer->dtype);
+  // }
   return EmitLoad(op->buffer, op->indices);
 }
 

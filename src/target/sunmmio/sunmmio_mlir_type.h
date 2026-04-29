@@ -38,12 +38,26 @@ enum class CompareOp { kEQ, kNE, kLT, kLE, kGT, kGE };
 enum class CompareDomain { kFloat, kSignedInt, kUnsignedInt, kBool };
 
 struct SunMMIOType {
-  enum class Kind { kScalar, kIndex, kHandle, kVector, kMemRef, kUnknown };
+  enum class Kind {
+    kScalar,
+    kIndex,
+    kHandle,
+    kVector,
+    kMemRef,
+    kMemTensor,
+    kUnknown
+
+  };
 
   Kind kind{Kind::kUnknown};
   DataType dtype{DataType::Void()};
   int lanes{1};
   std::vector<PrimExpr> shape;
+  std::vector<int64_t> layout_hshape;
+  std::vector<int64_t> layout_hstride;
+  std::vector<uint8_t> layout_dim_levels;
+  std::string memory_scope;
+  int64_t byte_offset{0};
 };
 
 struct SunMMIOValue {
