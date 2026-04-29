@@ -11,6 +11,8 @@
 #ifndef TVM_TL_LAYOUT_CUTE_LAYOUT_H_
 #define TVM_TL_LAYOUT_CUTE_LAYOUT_H_
 
+#include <optional>
+
 #include "layout.h"
 
 namespace tvm {
@@ -134,6 +136,44 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Contiguous tile step analysis
+// ---------------------------------------------------------------------------
+
+/*!
+ * \brief One step of the contiguous tile envelope.
+ *
+ * ComputeContiguousTileSteps walks a CuteLayout's coalesced stride
+ * structure and emits a sequence of steps describing the maximal
+ * contiguous tile.  Each step says "dimension `dim` varies by `extent`
+ * elements at this position in the physical ordering."
+ *
+ * The product of all step extents equals the total contiguous element
+ * count.  The planner reads these steps to enumerate legal tile shapes
+ * without layout-kind branching.
+ */
+struct ContiguousStep {
+  int dim;    ///< Logical dimension index.
+  int extent; ///< Max contiguous extent in this step.
+};
+
+/*!
+ * \brief Compute the contiguous tile envelope of a CuteLayout.
+ *
+ * Algorithm:
+ *  1. Extract concrete inner modes per logical dimension (stop at the
+ *     first symbolic shape/stride).
+ *  2. Coalesce within each dimension (merge modes where
+ *     shape * stride == next_stride).
+ *  3. Pool all modes as (shape, stride, dim), sort by stride ascending.
+ *  4. Walk while stride == running_product, emitting ContiguousStep
+ *     entries.  Stop at the first stride gap.
+ *
+ * Returns an empty vector when the layout is not a CuteLayout
+ * (caller should apply row-major fallback).
+ */
+std::vector<ContiguousStep> ComputeContiguousTileSteps(const Layout &layout);
+
+// ---------------------------------------------------------------------------
 // Free-standing layout relation APIs
 // ---------------------------------------------------------------------------
 
@@ -206,6 +246,31 @@ namespace sunmmio {
  * or non-CuteLayout.
  */
 bool IsZZLike(const Layout &layout);
+
+/*!
+ * \brief Block dimensions of a ZZ-like layout.
+ *
+ * Extracted from the innermost mode shapes of the last two blocked
+ * dimensions.  `height` corresponds to the lower-indexed blocked dim
+ * and `width` to the higher-indexed one.
+ */
+struct ZZBlockShape {
+  int height;
+  int width;
+};
+
+/*!
+ * \brief Extract the block shape from a ZZ-like CuteLayout.
+ *
+ * For a ZZ layout built with block_shape = {bh, bw}, this returns
+ * {bh, bw}.  Works for ZZ, ZZZ, and NZZ layouts — the innermost
+ * mode shape of each blocked dimension is the block extent regardless
+ * of the number of tiling levels.
+ *
+ * Returns std::nullopt when the layout is not ZZ-like or the innermost
+ * mode shapes are not compile-time constants.
+ */
+std::optional<ZZBlockShape> GetZZBlockShape(const Layout &layout);
 
 Layout MakeRowMajor(Array<PrimExpr> shape);
 

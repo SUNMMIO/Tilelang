@@ -29,6 +29,8 @@ struct SunmmioTileProcessorConfig {
   int register_bits;
   int block_height;
   int block_width;
+  /// Minimum byte-alignment for RSRAM tile rows (DMA constraint).
+  int rsram_align_bytes;
 };
 
 struct SunmmioMeshConfig {

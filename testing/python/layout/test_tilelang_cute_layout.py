@@ -820,5 +820,124 @@ class TestDiverseLayouts:
             assert actual == expected, f"hdims={hdims}, indices={indices}: got {actual}, expected {expected}"
 
 
+# ---------------------------------------------------------------------------
+# 10. ComputeContiguousTileSteps
+# ---------------------------------------------------------------------------
+
+compute_contiguous_steps = _get("tl.ComputeContiguousTileSteps")
+
+
+def _steps_to_list(result):
+    """Convert FFI result [[dim, extent], ...] to list of (dim, extent) tuples."""
+    return [(int(pair[0]), int(pair[1])) for pair in result]
+
+
+class TestComputeContiguousTileSteps:
+    def test_row_major_2d(self):
+        """Row-major(128, 256): contiguous W then H — entire buffer."""
+        layout = make_row_major(_imms(128, 256))
+        steps = _steps_to_list(compute_contiguous_steps(layout))
+        assert steps == [(1, 256), (0, 128)]
+
+    def test_row_major_3d(self):
+        """Row-major(4, 8, 16): contiguous from innermost outward."""
+        layout = make_row_major(_imms(4, 8, 16))
+        steps = _steps_to_list(compute_contiguous_steps(layout))
+        assert steps == [(2, 16), (1, 8), (0, 4)]
+
+    def test_zz_32x32(self):
+        """ZZ(128, 128) with block (32, 32): fully contiguous (ZZ preserves all)."""
+        layout = make_zz(_imms(128, 128), [0, 1], _imms(32, 32))
+        steps = _steps_to_list(compute_contiguous_steps(layout))
+        # ZZ is fully contiguous: block inner (W:32, H:32), then outer (W:4, H:4)
+        assert steps == [(1, 32), (0, 32), (1, 4), (0, 4)]
+
+    def test_zz_32x64(self):
+        """ZZ(128, 256) with block (32, 64): fully contiguous."""
+        layout = make_zz(_imms(128, 256), [0, 1], _imms(32, 64))
+        steps = _steps_to_list(compute_contiguous_steps(layout))
+        # Block: W:64, H:32; Outer: W:4, H:4
+        assert steps == [(1, 64), (0, 32), (1, 4), (0, 4)]
+
+    def test_zn_32x64(self):
+        """ZN(128, 256) with block (32, 64): fully contiguous, col-major inner."""
+        layout = make_zn(_imms(128, 256), [0, 1], _imms(32, 64))
+        steps = _steps_to_list(compute_contiguous_steps(layout))
+        # ZN: col-major inner block (H:32 first, then W coalesces across boundary).
+        # Dim 0 modes: (32, stride=1), (4, stride=8192)
+        # Dim 1 modes: (64, stride=32), (4, stride=2048) — coalesces to (256, stride=32)
+        # Walk: (0, 32), (1, 256), (0, 4)
+        assert steps == [(0, 32), (1, 256), (0, 4)]
+
+    def test_zzz_block_and_cluster(self):
+        """ZZZ with block (32, 64) and cluster (2, 4): fully contiguous (all row-major)."""
+        layout = make_zzz(_imms(256, 1024), [0, 1], _imms(32, 64), _imms(2, 4))
+        steps = _steps_to_list(compute_contiguous_steps(layout))
+        # ZZZ: all 3 levels row-major — fully contiguous.
+        # Block: W:64, H:32; Cluster: W:4, H:2; Grid: W:4, H:4
+        assert steps == [(1, 64), (0, 32), (1, 4), (0, 2), (1, 4), (0, 4)]
+
+    def test_nzz_block_and_cluster(self):
+        """NZZ with block (32, 64) and cluster (2, 4): col-major at group level."""
+        layout = make_nzz(_imms(256, 1024), [0, 1], _imms(32, 64), _imms(2, 4))
+        steps = _steps_to_list(compute_contiguous_steps(layout))
+        # NZZ = {false, false, true}: block=row, tile=row, group=col
+        # Col-major group level causes dim-0 modes CM(2) and GM(4) to coalesce.
+        # Block: W:64, H:32; Tile: W:4; then coalesced H:8; then Grid W:4
+        assert steps == [(1, 64), (0, 32), (1, 4), (0, 8), (1, 4)]
+
+    def test_dynamic_outer_mode(self):
+        """Dynamic logical shape: stride walk stops at symbolic mode boundary."""
+        M = tir.Var("M", "int32")
+        # Construct a ZZ-like layout with dynamic outer mode directly.
+        # ZZ(M, 128) with block (32, 32):
+        #   dim 0: [BM=32, QM=ceildiv(M,32)] strides [32, 4096]
+        #   dim 1: [BN=32, QN=4] strides [1, 1024]
+        cdiv = tir.ceildiv(M, _imm(32))
+        layout = make_cute(
+            [M, _imm(128)],
+            [_imm(32), cdiv, _imm(32), _imm(4)],
+            _imms(32, 4096, 1, 1024),
+            [2, 2],
+        )
+        steps = _steps_to_list(compute_contiguous_steps(layout))
+        # Block modes (static): W:32 stride=1, H:32 stride=32
+        # Dim 1 outer QN=4 stride=1024 is static, included.
+        # Dim 0 outer QM=ceildiv(M,32) is symbolic, stops there.
+        assert steps == [(1, 32), (0, 32), (1, 4)]
+
+    def test_total_contiguous_elements(self):
+        """ZZ is fully contiguous: total == buffer size."""
+        for block_shape, buf_shape in [
+            ((32, 32), (256, 256)),
+            ((32, 64), (128, 256)),
+            ((16, 128), (64, 128)),
+        ]:
+            layout = make_zz(_imms(*buf_shape), [0, 1], _imms(*block_shape))
+            steps = _steps_to_list(compute_contiguous_steps(layout))
+            total = 1
+            for _, extent in steps:
+                total *= extent
+            expected_total = buf_shape[0] * buf_shape[1]
+            assert total == expected_total, f"block_shape={block_shape}: total={total}, expected={expected_total}"
+
+    def test_zz_3d_batch(self):
+        """ZZ on last 2 dims of a 3D buffer: all modes fully contiguous."""
+        layout = make_zz(_imms(4, 128, 128), [1, 2], _imms(32, 32))
+        steps = _steps_to_list(compute_contiguous_steps(layout))
+        # Block: (2, 32), (1, 32); Outer: (2, 4), (1, 4); Batch: (0, 4)
+        assert steps == [(2, 32), (1, 32), (2, 4), (1, 4), (0, 4)]
+
+    def test_block_boundary_is_first_step(self):
+        """First two steps in ZZ always match the block shape."""
+        for bh, bw in [(32, 32), (32, 64), (16, 128)]:
+            layout = make_zz(_imms(256, 256), [0, 1], _imms(bh, bw))
+            steps = _steps_to_list(compute_contiguous_steps(layout))
+            # First step: width dim with block width
+            assert steps[0] == (1, bw)
+            # Second step: height dim with block height
+            assert steps[1] == (0, bh)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

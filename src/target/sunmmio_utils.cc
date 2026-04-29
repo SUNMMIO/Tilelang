@@ -20,7 +20,8 @@ namespace tl {
 namespace {
 
 SunmmioTileProcessorConfig MakeSunmmioA4EConfig() {
-  return {/*register_bits=*/4096, /*block_height=*/32, /*block_width=*/32};
+  return {/*register_bits=*/4096, /*block_height=*/32, /*block_width=*/32,
+          /*rsram_align_bytes=*/64};
 }
 
 ffi::Array<PrimExpr> MakeSunmmioA4EBlockShape(DataType dtype) {

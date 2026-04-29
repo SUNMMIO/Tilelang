@@ -21,14 +21,21 @@ namespace tl {
 
 using namespace tir;
 
-/// Coarse layout classes that drive Sunmmio tile legality rules.
-enum class LayoutClass {
-  /// Buffers with an explicit layout entry use the modeled 32x32 blockwise
-  /// rules.
-  kBlockwise32x32,
-  /// Buffers without a layout entry are treated as plain row-major buffers.
-  kRowMajor,
-};
+/*!
+ * \brief Compute contiguous tile steps for a buffer, with row-major fallback.
+ *
+ * If the buffer has a CuteLayout in `layout_map`, delegates to
+ * ComputeContiguousTileSteps.  Otherwise, synthesizes row-major steps
+ * from the buffer's trailing dimensions (last dim contiguous, then
+ * second-to-last dim).
+ *
+ * The returned steps describe the contiguous tile envelope that the
+ * planner uses to enumerate legal tile shapes without layout-kind
+ * branching.
+ */
+std::vector<ContiguousStep>
+GetBufferContiguousSteps(const Buffer &buffer,
+                         const Map<Buffer, Layout> &layout_map);
 
 /*!
  * \brief Canonical trailing tile pattern shared by the generic and reduction
@@ -56,16 +63,6 @@ struct TrailingTilePattern {
  * but still wants a caller-controlled default for dynamic expressions.
  */
 int64_t GetStaticIntValue(const PrimExpr &expr, int64_t fallback = -1);
-
-/*!
- * \brief Classify a buffer as blockwise or row-major for TileView planning.
- *
- * Uses sunmmio::IsZZLike to determine whether the buffer's CuteLayout has
- * blockwise structure (≥2 blocked dims with row-major inner stride ordering).
- * Row-major, ZN, 1D, and non-CuteLayout buffers are treated as kRowMajor.
- */
-LayoutClass GetLayoutClass(const Buffer &buffer,
-                           const Map<Buffer, Layout> &layout_map);
 
 /*!
  * \brief Return the scalar element bit-width used by the buffer.
@@ -184,15 +181,17 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
  *
  * This routine checks the structural legality that is common to all planners:
  * rank, trailing index-map shape, static tile extents, buffer-shape
- * divisibility, Sunmmio register-capacity limits, and blockwise-vs-row-major
- * width/height rules. Planner-specific checks such as loop binding
- * compatibility or region alignment remain in the caller.
+ * divisibility, Sunmmio register-capacity limits, and contiguous tile envelope
+ * constraints derived from the layout's stride structure.  Planner-specific
+ * checks such as loop binding compatibility or region alignment remain in the
+ * caller.
  */
-TrailingTilePattern ValidateManualTrailingTileView(
-    const Buffer &buffer, const TileView &manual_tv, int exec_rank,
-    const Map<Buffer, Layout> &layout_map,
-    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
-    const char *usage, bool enforce_blockwise_width_for_rank1);
+TrailingTilePattern
+ValidateManualTrailingTileView(const Buffer &buffer, const TileView &manual_tv,
+                               int exec_rank,
+                               const Map<Buffer, Layout> &layout_map,
+                               const SunmmioTileProcessorConfig &config,
+                               arith::Analyzer *analyzer, const char *usage);
 
 } // namespace tl
 } // namespace tvm

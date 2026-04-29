@@ -569,6 +569,83 @@ bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
 }
 
 // ---------------------------------------------------------------------------
+// ComputeContiguousTileSteps — stride-walk algorithm
+// ---------------------------------------------------------------------------
+
+std::vector<ContiguousStep> ComputeContiguousTileSteps(const Layout &layout) {
+  auto *cute = layout.as<CuteLayoutNode>();
+  if (!cute)
+    return {}; // non-CuteLayout: caller handles row-major fallback
+
+  auto dim_levels = cute->GetDimLevels();
+  int ndim = static_cast<int>(dim_levels.size());
+
+  // Step 1 & 2: extract concrete inner modes per dim, coalesce within each.
+  struct Mode {
+    int64_t shape;
+    int64_t stride;
+    int dim;
+  };
+  std::vector<Mode> modes;
+
+  for (int d = 0; d < ndim; ++d) {
+    auto shapes = cute->GetModeShapeOfDim(d);
+    auto strides = cute->GetModeStrideOfDim(d);
+    int nlevels = dim_levels[d].IntValue();
+
+    // Collect innermost consecutive static modes, stopping at the first
+    // symbolic shape or stride.
+    std::vector<std::pair<int64_t, int64_t>> dim_modes;
+    for (int i = 0; i < nlevels; ++i) {
+      auto *s = shapes[i].as<IntImmNode>();
+      auto *st = strides[i].as<IntImmNode>();
+      if (!s || !st)
+        break; // stop at symbolic boundary
+      if (s->value == 1)
+        continue; // skip trivial modes
+      dim_modes.push_back({s->value, st->value});
+    }
+
+    // Coalesce: sort by stride ascending within this dim, then merge
+    // where shape * stride == next_stride.
+    std::sort(dim_modes.begin(), dim_modes.end(),
+              [](const auto &a, const auto &b) { return a.second < b.second; });
+
+    std::vector<std::pair<int64_t, int64_t>> coalesced;
+    for (const auto &[s, st] : dim_modes) {
+      if (!coalesced.empty() &&
+          coalesced.back().first * coalesced.back().second == st) {
+        coalesced.back().first *= s;
+      } else {
+        coalesced.push_back({s, st});
+      }
+    }
+
+    for (const auto &[s, st] : coalesced) {
+      modes.push_back({s, st, d});
+    }
+  }
+
+  // Step 3: sort all modes by stride ascending.
+  std::sort(modes.begin(), modes.end(),
+            [](const Mode &a, const Mode &b) { return a.stride < b.stride; });
+
+  // Step 4: walk while contiguous — stride must equal running product.
+  std::vector<ContiguousStep> steps;
+  int64_t running = 1;
+  for (const auto &m : modes) {
+    if (m.stride < running)
+      continue; // already covered by a prior mode
+    if (m.stride > running)
+      break; // gap — end of contiguous region
+    steps.push_back({m.dim, static_cast<int>(m.shape)});
+    running *= m.shape;
+  }
+
+  return steps;
+}
+
+// ---------------------------------------------------------------------------
 // Sunmmio named constructors
 // ---------------------------------------------------------------------------
 
@@ -609,6 +686,37 @@ bool IsZZLike(const Layout &layout) {
     return true;
 
   return false;
+}
+
+std::optional<ZZBlockShape> GetZZBlockShape(const Layout &layout) {
+  if (!IsZZLike(layout))
+    return std::nullopt;
+
+  auto *cute = layout.as<CuteLayoutNode>();
+  ICHECK(cute);
+
+  auto dim_levels = cute->GetDimLevels();
+
+  // Find the last two blocked dims (same logic as IsZZLike).
+  std::vector<int> blocked_dims;
+  for (size_t d = 0; d < dim_levels.size(); ++d) {
+    if (dim_levels[d].IntValue() > 1)
+      blocked_dims.push_back(d);
+  }
+  ICHECK_GE(blocked_dims.size(), 2);
+  int ax0 = blocked_dims[blocked_dims.size() - 2];
+  int ax1 = blocked_dims[blocked_dims.size() - 1];
+
+  // Innermost mode shape of each blocked dim is the block extent.
+  PrimExpr shape_ax0 = cute->GetModeShapeOfDim(ax0)[0];
+  PrimExpr shape_ax1 = cute->GetModeShapeOfDim(ax1)[0];
+
+  auto *s0 = shape_ax0.as<IntImmNode>();
+  auto *s1 = shape_ax1.as<IntImmNode>();
+  if (!s0 || !s1)
+    return std::nullopt;
+
+  return ZZBlockShape{static_cast<int>(s0->value), static_cast<int>(s1->value)};
 }
 
 static PrimExpr makeInt(int64_t v) { return make_const(DataType::Int(32), v); }
@@ -1031,7 +1139,17 @@ TVM_FFI_STATIC_INIT_BLOCK() {
              Array<PrimExpr> out_shapes(flatShape.begin(), flatShape.end());
              Array<PrimExpr> out_strides(flatStride.begin(), flatStride.end());
              return Array<Array<PrimExpr>>{out_shapes, out_strides};
-           });
+           })
+      .def("tl.ComputeContiguousTileSteps", [](Layout layout) {
+        auto steps = ComputeContiguousTileSteps(layout);
+        // Return as Array<Array<Integer>>: [[dim0, extent0], [dim1,
+        // extent1], ...]
+        Array<Array<Integer>> result;
+        for (const auto &step : steps) {
+          result.push_back({Integer(step.dim), Integer(step.extent)});
+        }
+        return result;
+      });
 }
 
 } // namespace tl

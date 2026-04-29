@@ -220,7 +220,7 @@ private:
       return std::nullopt;
     }
     if (call->op.same_as(tl::access_ptr())) {
-      if (call->args.size() >= 1) {
+      if (!call->args.empty()) {
         if (auto load = call->args[0].as<BufferLoadNode>()) {
           RegisterBuffer(load->buffer);
           return load->buffer;
@@ -230,7 +230,7 @@ private:
     }
     // tl.region — extract buffer from region descriptor
     if (call->op.same_as(RegionOp::Get())) {
-      if (call->args.size() >= 1) {
+      if (!call->args.empty()) {
         if (auto load = call->args[0].as<BufferLoadNode>()) {
           RegisterBuffer(load->buffer);
           return load->buffer;
@@ -244,7 +244,7 @@ private:
   Optional<Buffer> LookupBufferByVar(const Var &var) {
     if (buffer_data_to_buffers_->count(var)) {
       const auto &buffers = (*buffer_data_to_buffers_)[var];
-      if (buffers.size() > 0) {
+      if (!buffers.empty()) {
         return buffers[0];
       }
     }
@@ -259,7 +259,7 @@ private:
     // Classify by scope
     if (IsSunmmioSramScope(buf.scope())) {
       sram_buffers_->insert(buf);
-    } else if (buf.scope() == "global" || buf.scope() == "") {
+    } else if (buf.scope() == "global" || buf.scope().empty()) {
       dram_buffers_->insert(buf);
     }
 
@@ -484,7 +484,7 @@ PrimFunc SunmmioLayoutInferencePass::ApplyToIR(PrimFunc f) {
   for (const auto &[buf, entry] : layout_entries_) {
     if (IsSunmmioSramScope(buf.scope())) {
       layout_map.Set(buf, entry.layout);
-    } else if (buf.scope() == "global" || buf.scope() == "") {
+    } else if (buf.scope() == "global" || buf.scope().empty()) {
       final_global_layout_map.Set(buf, entry.layout);
     }
   }

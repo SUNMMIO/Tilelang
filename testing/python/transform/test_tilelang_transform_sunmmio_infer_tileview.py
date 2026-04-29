@@ -233,7 +233,13 @@ def test_infer_rank1_tileview_from_2d_buffer_access_with_outer_loop_var():
 # Test 3: Mixed-rank (1D + 2D) in same T.Tiles
 # ---------------------------------------------------------
 def test_infer_tileview_mixed_rank():
-    """Layout inference should let mixed-rank accesses use the densest common blockwise plan."""
+    """Mixed-rank access where the 1D buffer violates RSRAM alignment.
+
+    B_shared is 1D fp32, tiled along the height axis.  With 64-byte RSRAM
+    alignment the minimum tile width is 16 elements (64 bytes), but capacity
+    (128 elems) cannot fit a (16, 16) tile for the 2D buffers simultaneously.
+    The planner correctly rejects this.
+    """
     M, N = 128, 64
 
     @T.prim_func
@@ -257,9 +263,14 @@ def test_infer_tileview_mixed_rank():
 
     mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    with tvm.target.Target(target):
-        mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[4, 32], expected_execution_domain_axes=[0, 1])
+    with (
+        tvm.target.Target(target),
+        pytest.raises(
+            tvm.error.InternalError,
+            match="per-access feasible tileview sets do not intersect",
+        ),
+    ):
+        apply_sunmmio_passes(mod, target)
 
 
 def test_infer_tileview_swapped_domain_binding():
@@ -615,7 +626,11 @@ def test_infer_tileview_blockwise_region_height_and_width_offset():
 
 
 def test_infer_tileview_blockwise_region_misaligned_width_offset_rejected():
-    """Misaligned blockwise width offsets should reject tileview planning."""
+    """Misaligned blockwise width offsets should reject tileview planning.
+
+    With fp16 and 64-byte RSRAM alignment, the minimum tile width is 32
+    elements.  Offset 16 is not aligned to 32, so no feasible tile exists.
+    """
     src_M, src_N = 64, 64
     dst_M, dst_N = 32, 32
 
@@ -644,5 +659,11 @@ def test_infer_tileview_blockwise_region_misaligned_width_offset_rejected():
 
     mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    with tvm.target.Target(target), pytest.raises(Exception, match="Cannot infer any feasible TileView candidate"):
+    with (
+        tvm.target.Target(target),
+        pytest.raises(
+            tvm.error.InternalError,
+            match="Cannot infer any feasible TileView candidate",
+        ),
+    ):
         apply_sunmmio_passes(mod, target)

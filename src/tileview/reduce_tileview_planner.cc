@@ -188,8 +188,7 @@ TrailingTilePattern ValidateManualSrcTilePattern(
   int src_rank = static_cast<int>(src_region->region.size());
   TrailingTilePattern pattern = ValidateManualTrailingTileView(
       src_region->buffer, manual_tv, src_rank == 1 ? 1 : 2, layout_map, config,
-      analyzer, "Manual src TileView for Sunmmio reduction",
-      /*enforce_blockwise_width_for_rank1=*/true);
+      analyzer, "Manual src TileView for Sunmmio reduction");
 
   for (size_t axis = 0; axis < pattern.tile_shape.size(); ++axis) {
     int src_dim = pattern.mapped_dims[axis];
