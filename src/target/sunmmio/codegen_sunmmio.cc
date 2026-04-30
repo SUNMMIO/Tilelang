@@ -1016,20 +1016,11 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockNode *op) {
       BindVar(iv->var, EvalExpr(iv->var));
     }
   }
-  if (!op->alloc_buffers.empty()) {
-    LOG(FATAL) << "SunMMIO SUVM allocate phase treats block alloc_buffers as "
-               << "view/alias and does not handle them yet";
+  for (const Buffer &alloc : op->alloc_buffers) {
+    EmitAlloc(alloc->data, alloc->dtype, alloc->shape,
+              alloc.scope().empty() ? "global" : alloc.scope());
+    RegisterBuffer(alloc, false);
   }
-  if (!op->match_buffers.empty()) {
-    LOG(FATAL) << "SunMMIO SUVM allocate phase treats match_buffer as "
-               << "view/alias and does not handle it yet";
-  }
-  // for (const Buffer &alloc : op->alloc_buffers) {
-  //   RegisterBuffer(alloc, false, NewValueName());
-  //   const BufferBinding &binding = LookupBuffer(alloc);
-  //   builder_->Alloc(binding.handle, binding.buffer_type, {},
-  //                   MapStorageScope(alloc.scope()), alloc->dtype);
-  // }
   for (const MatchBufferRegion &match : op->match_buffers) {
     if (match->source.defined()) {
       RegisterBuffer(match->source->buffer, false);
