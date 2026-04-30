@@ -390,15 +390,40 @@ Optional<Layout> DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
   }
   int num_blocked = static_cast<int>(blocked_src_dims.size());
 
-  // --- Resolve axis_map: explicit or default to last N dst axes. ---
+  // --- Resolve axis_map ---
   //
-  // axis_map has one entry per blocked src dim.  axis_map[i] = which dst
-  // dim receives the i-th blocked src dim's mode structure.
-  // When NullOpt, blocked dims are placed on the last N axes of dst.
-  // If dst doesn't have enough dims to hold all blocked dims, we cannot
-  // derive a meaningful layout — return NullOpt.
+  // axis_map controls where each blocked (multi-mode) source dimension
+  // lands in the destination layout.  It has one entry per blocked src
+  // dim: axis_map[i] = the dst dim that receives the i-th blocked src
+  // dim's mode structure.
+  //
+  // Three cases:
+  //
+  //  1. Explicit axis_map — use it verbatim.
+  //     Example: 4D src with ZZ on dims [1,3], axis_map = {0, 2}
+  //              → dst dims 0 and 2 get the blocked structure.
+  //
+  //  2. axis_map is NullOpt, src_rank == dst_rank (same-rank derivation,
+  //     e.g. sharding a 4D tensor into a 4D sharded tensor).
+  //     Blocked dims keep their original positions (identity mapping).
+  //     Example: src blocked_dims = [1, 3] → target_axes = [1, 3].
+  //     This is the common case for MeshTensor sharding where the
+  //     tensor rank does not change and the block structure must stay
+  //     on the same logical axes.
+  //
+  //  3. axis_map is NullOpt, src_rank != dst_rank (rank-changing
+  //     derivation, e.g. reducing a 3D batched tensor to 2D).
+  //     Blocked dims are packed onto the last N axes of dst.
+  //     Example: 3D src with ZZ on dims [1, 2], dst is 2D
+  //              → target_axes = [0, 1] (last 2 of 2).
+  //     This is natural for reductions where leading batch dims are
+  //     dropped and the blocked spatial dims fill the output.
+  //
+  // If dst doesn't have enough dims to hold all blocked dims, we
+  // cannot derive a meaningful layout — return NullOpt.
   std::vector<int> target_axes;
   if (axis_map.defined()) {
+    // Case 1: explicit mapping.
     for (auto &v : axis_map.value()) {
       target_axes.push_back(v.IntValue());
     }
@@ -409,9 +434,16 @@ Optional<Layout> DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
       // Not enough dst dims to place all blocked structure.
       return Optional<Layout>();
     }
-    // Default: place blocked dims on the last N axes of dst.
-    for (int i = 0; i < num_blocked; ++i) {
-      target_axes.push_back(static_cast<int>(dst_rank) - num_blocked + i);
+    if (src_rank == dst_rank) {
+      // Case 2: same rank — identity mapping.
+      for (int i = 0; i < num_blocked; ++i) {
+        target_axes.push_back(blocked_src_dims[i]);
+      }
+    } else {
+      // Case 3: rank change — pack into last N dst axes.
+      for (int i = 0; i < num_blocked; ++i) {
+        target_axes.push_back(static_cast<int>(dst_rank) - num_blocked + i);
+      }
     }
   }
 
