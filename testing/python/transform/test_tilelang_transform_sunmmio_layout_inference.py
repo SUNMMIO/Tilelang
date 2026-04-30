@@ -43,6 +43,7 @@ def apply_passes_up_to_layout_inference(mod, target):
     mod = tl.transform.InjectAssumes()(mod)
     mod = tl.transform.Simplify()(mod)
     mod = tl.transform.InferSramScope()(mod)
+    mod = tl.transform.LegalizeSunmmioCopyPath()(mod)
     mod = tl.transform.LayoutReducer()(mod)
     mod = tl.transform.SunmmioLayoutInference()(mod)
     return mod
@@ -1041,13 +1042,29 @@ def dram_zn_to_asram_kernel():
     return tvm.IRModule({"main": kernel})
 
 
-def test_dram_zn_to_asram_fails():
-    """DRAM with ZN layout → Copy to ASRAM should fail (IsZZLike rejects ZN)."""
+def test_dram_zn_to_asram_succeeds_via_staged_rsram():
+    """DRAM with ZN layout → Copy to ASRAM succeeds via LegalizeSunmmioCopyPath staging through RSRAM.
+
+    LegalizeSunmmioCopyPath rewrites global→asram into global→rsram + rsram→asram,
+    so layout inference assigns a ZZ layout to the ASRAM buffer regardless of the
+    DRAM layout.
+    """
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = dram_zn_to_asram_kernel()
-        with pytest.raises(Exception, match="ZZ-like DRAM layout"):
-            apply_passes_up_to_layout_inference(mod, target)
+        mod = apply_passes_up_to_layout_inference(mod, target)
+
+        layout_map = {}
+
+        def visit(node):
+            if isinstance(node, tvm.tir.Block) and "layout_map" in node.annotations:
+                lm = node.annotations["layout_map"]
+                for var in lm:
+                    layout_map[var.name] = lm[var]
+
+        post_order_visit(mod["main"].body, visit)
+
+        assert "A_shared" in layout_map, f"A_shared should have an inferred layout. Got keys: {list(layout_map.keys())}"
 
 
 # ---------------------------------------------------------------------------
@@ -1311,31 +1328,3 @@ def test_broadcast_mismatched_immutable_preserves_annotations():
         assert buf_b is not None
         expected_zn = make_zn_layout(buf_b.shape, axes=[0, 1], block_shape=[32, 32])
         assert is_same_layout(layout_b, expected_zn), f"B_shared should keep ZN annotation, got {layout_b}"
-
-
-if __name__ == "__main__":
-    test_gemm_layout_inference()
-    test_gemm_transB_layout_inference()
-    test_copy_only_layout_inference()
-    test_all_sram_buffers_get_layouts()
-    test_dram_default_row_major()
-    test_reduce_blockwise_axis_gives_row_major()
-    test_reduce_outer_axis_preserves_zz()
-    test_reduce_3d_zz_blocked_axis_gives_row_major()
-    test_reduce_3d_zn_outer_axis_preserves_zn()
-    test_reduce_3d_row_major_outer_axis_preserves_row_major()
-    test_reduce_4d_zz_outer_axis_preserves_zz()
-    test_broadcast_propagates_zz()
-    test_broadcast_propagates_zn()
-    test_put_propagates_zz()
-    test_allgather_propagates_zz()
-    test_allgather_propagates_row_major()
-    test_immutable_conflict_annotate_vs_gemm()
-    test_immutable_conflict_wsram_annotate_vs_gemm()
-    test_immutable_conflict_rsram_annotate_vs_gemm()
-    test_dram_zn_to_asram_fails()
-    test_dram_zn_to_wsram_fails()
-    test_correct_annotate_accepted()
-    test_copy_reduce_copy_layout_derivation()
-    test_broadcast_mismatched_immutable_preserves_annotations()
-    print("All tests passed!")

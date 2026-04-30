@@ -683,8 +683,6 @@ bool CopyNode::CheckSunmmioDMACopy(Target target) const {
     scope_check = true;
   if (src.scope() == "global" && dst.scope() == kSunmmioScopeWSRAM)
     scope_check = true;
-  if (src.scope() == "global" && dst.scope() == kSunmmioScopeASRAM)
-    scope_check = true;
   if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeWSRAM)
     scope_check = true;
   if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeASRAM)
@@ -819,6 +817,8 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
 Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
                                    arith::Analyzer *analyzer) const {
+  /** The staging split is handled by LegalizeSunmmioCopyPath before lowering.
+   */
   PrimExpr src_region = MakeRegionExpr(src, src_range, /*access_mask=*/1);
   PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
   return Evaluate(
