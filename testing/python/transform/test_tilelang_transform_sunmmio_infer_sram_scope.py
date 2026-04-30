@@ -6,12 +6,37 @@ from tilelang.utils.target import determine_target
 import tilelang as tl
 import tilelang.language as T
 from tvm.tir.stmt_functor import post_order_visit
-from tvm.tir import BufferLoad, BufferStore, Buffer, Block
+from tvm.tir import BufferLoad, BufferStore, Buffer, Block, Call
 from typing import Set
 from tilelang.tileview import make_tileview
 from tilelang.language.mesh_tensor import MeshShardingPolicy
 
 tilelang.env.disable_cache()
+
+
+def extract_gemm_from_kernel(func):
+    stmts = []
+
+    def visit_buffer_access(node):
+        if isinstance(node, (Call)) and "gemm" in node.op.name:
+            stmts.append(node)
+
+    # Visit function body to find buffer accesses
+    post_order_visit(func.body, visit_buffer_access)
+
+    return stmts
+
+
+def extract_copy_from_kernel(func):
+    stmts = []
+
+    def visit_buffer_access(node):
+        if isinstance(node, Call) and node.op == tvm.tir.op.Op.get("tl.tileop.copy"):
+            stmts.append(node)
+
+    post_order_visit(func.body, visit_buffer_access)
+
+    return stmts
 
 
 def extract_buffers_from_kernel(func) -> Set[Buffer]:
@@ -21,6 +46,9 @@ def extract_buffers_from_kernel(func) -> Set[Buffer]:
     def visit_buffer_access(node):
         if isinstance(node, (BufferLoad, BufferStore)):
             used_buffers.add(node.buffer)
+        elif isinstance(node, Block):
+            for buffer in node.alloc_buffers:
+                used_buffers.add(buffer)
 
     # Visit function body to find buffer accesses
     post_order_visit(func.body, visit_buffer_access)
@@ -31,6 +59,18 @@ def extract_buffers_from_kernel(func) -> Set[Buffer]:
             used_buffers.add(func.buffer_map[param])
 
     return used_buffers
+
+
+def extract_blocks_from_kernel(func):
+    """Extract all blocks used in a TIR PrimFunc."""
+    blocks = []
+
+    def visit_block(node):
+        if isinstance(node, Block):
+            blocks.append(node)
+
+    post_order_visit(func.body, visit_block)
+    return blocks
 
 
 def extract_block_attrs_from_kernel(func):
@@ -538,21 +578,27 @@ def gemm_matmul_C_scope_infer_conflict(M, N, K, block_M, block_N, block_K, dtype
     return tvm.IRModule({"main": main})
 
 
+def incorrect_bufferload(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype, scope="shared.asram")
+            B_shared = T.alloc_shared((block_K, block_N), dtype, scope="shared.wsram")
+
+            for i, j in T.Tiles(A_shared, parallel=True):
+                A_shared[i, j] = B_shared[i, j]
+
+    return tvm.IRModule({"main": main})
+
+
 INCORRECT_TEST_CASES = [
     (gemm_matmul_incorrect_A_scope(128, 128, 128, 32, 32, 32), "Specify invalid scope shared.wsram of A_shared in GEMM Sunmmio."),
     (gemm_matmul_incorrect_B_scope(128, 128, 128, 32, 32, 32), "Specify invalid scope shared.asram of B_shared in GEMM Sunmmio."),
-    (
-        gemm_matmul_A_scope_infer_conflict(128, 128, 128, 32, 32, 32),
-        "Infer scope shared.asram of A_shared in GEMM Sunmmio, but scope shared.rsram has been inferred for A_shared.",
-    ),
-    (
-        gemm_matmul_B_scope_infer_conflict(128, 128, 128, 32, 32, 32),
-        "Infer scope shared.asram of B_shared in GEMM Sunmmio, but scope shared.wsram has been inferred for B_shared.",
-    ),
-    (
-        gemm_matmul_C_scope_infer_conflict(128, 128, 128, 32, 32, 32),
-        "Infer scope shared.asram of C_shared in GEMM Sunmmio, but scope shared.rsram has been inferred for C_shared.",
-    ),
+    (incorrect_bufferload(128, 128, 128, 32, 32, 32), "Invalid scope shared.wsram of B_shared in Sunmmio."),
     (
         flashattn(
             1,
@@ -836,3 +882,260 @@ def test_tilelang_data_pointer_bug_infer_sram_scope(kernel):
                 for it in after_buffers:
                     if it.scope() != "global":
                         assert it.data in list(map.keys())
+
+
+def auto_insert_copy_matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
+    @T.prim_func
+    def gemm(
+        A: T.MeshTensor(
+            (M, K),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=dtype,
+        ),
+        B: T.MeshTensor(
+            (K, N),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=dtype,
+        ),
+        C: T.MeshTensor(
+            (M, N),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=accum_dtype,
+        ),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=4):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_shared)
+                T.gemm(C_shared, B_shared, C_shared)
+                T.gemm(A_shared, C_shared, C_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return gemm
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [auto_insert_copy_matmul(128, 128, 128, 32, 32, 32)],
+)
+def test_tilelang_insert_copy_infer_sram_scope(kernel):
+    target_name = "Sunmmio"
+    target = determine_target(target_name, return_object=True)
+
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(kernel.with_attr("global_symbol", "main"))
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+
+        mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
+        mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+        mod = tilelang.transform.InjectAssumes()(mod)
+        mod = tilelang.transform.Simplify()(mod)
+
+        before_buffers = list(extract_buffers_from_kernel(list(mod.functions.values())[0]))
+        mod = tl.transform.InferSramScope()(mod)
+        after_buffers = list(extract_buffers_from_kernel(list(mod.functions.values())[0]))
+        assert len(before_buffers) == len(after_buffers) - 2
+        after_gemms = extract_gemm_from_kernel(list(mod.functions.values())[0])
+        scope_dict = {0: "shared.asram", 1: "shared.wsram", 2: "shared.rsram"}
+        for it in after_gemms:
+            args = it.args[:3]
+            for i in range(len(args)):
+                arg = args[i]
+                if isinstance(arg, Call) and arg.op == tvm.tir.op.Op.get("tl.tileop.region"):
+                    buffer = arg.args[0].buffer
+                    assert buffer.scope() == scope_dict[i]
+
+
+def sliced_conflict_matmul(dtype="float16", accum_dtype="float"):
+    @T.prim_func
+    def gemm(
+        A: T.MeshTensor(
+            (128, 128),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=dtype,
+        ),
+        B: T.MeshTensor(
+            (128, 128),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=dtype,
+        ),
+        C: T.MeshTensor(
+            (128, 128),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            hierarchical_dims=(4, 32, 128),
+            hierarchical_groups=((0, 2), (2, 3)),
+            hierarchical_strides=(32, 1, 4096),
+            dtype=accum_dtype,
+        ),
+    ):
+        with T.Kernel(1, 1, threads=128) as (bx, by):
+            A_shared = T.alloc_shared((32, 32), dtype)
+            B_shared = T.alloc_shared((32, 32), dtype)
+            C_shared = T.alloc_shared((32, 32), accum_dtype)
+
+            T.copy(A[0:32, 0:32], A_shared)
+            T.copy(B[0:32, 0:32], B_shared)
+            T.gemm(A_shared[0:16, 0:16], B_shared[0:16, 4:20], C_shared[0:16, 0:16])
+            T.gemm(B_shared[0:16, 4:20], B_shared[0:16, 4:20], C_shared[0:16, 0:16])
+            T.gemm(A_shared[0:16, 0:16], B_shared[0:16, 4:20], B_shared[0:16, 0:16])
+            T.gemm(A_shared[0:16, 0:16], A_shared[0:16, 4:20], C_shared[0:16, 0:16])
+            T.gemm(A_shared[0:16, 0:16], B_shared[0:16, 4:20], A_shared[0:16, 0:16])
+            T.gemm(C_shared[0:16, 0:16], B_shared[0:16, 4:20], C_shared[0:16, 0:16])
+            T.gemm(A_shared[0:16, 0:16], C_shared[0:16, 4:20], C_shared[0:16, 0:16])
+
+    return gemm
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [sliced_conflict_matmul()],
+)
+def test_tilelang_insert_copy_uses_compact_region_shape(kernel):
+    target_name = "Sunmmio"
+    target = determine_target(target_name, return_object=True)
+
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(kernel.with_attr("global_symbol", "main"))
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
+        mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+        mod = tilelang.transform.InjectAssumes()(mod)
+        mod = tilelang.transform.Simplify()(mod)
+        mod = tl.transform.InferSramScope()(mod)
+
+        func = list(mod.functions.values())[0]
+        after_gemms = extract_gemm_from_kernel(func)
+        after_copies = extract_copy_from_kernel(func)
+        assert len(after_gemms) == 7
+        assert len(after_copies) == 8
+
+        staged_copy_regions = [copy.args[1] for copy in after_copies[2:]]
+        staged_copy_scopes = [region.args[0].buffer.scope() for region in staged_copy_regions]
+        assert staged_copy_scopes == [
+            "shared.asram",
+            "shared.rsram",
+            "shared.wsram",
+            "shared.rsram",
+            "shared.asram",
+            "shared.wsram",
+        ]
+
+        for staged_copy_region in staged_copy_regions:
+            assert isinstance(staged_copy_region, Call)
+            assert staged_copy_region.op == tvm.tir.op.Op.get("tl.tileop.region")
+            staged_buffer = staged_copy_region.args[0].buffer
+            assert len(staged_buffer.shape) == 2
+            assert int(staged_buffer.shape[0]) == 16
+            assert int(staged_buffer.shape[1]) == 16
+
+        compact_regions = [
+            after_gemms[1].args[0],
+            after_gemms[2].args[2],
+            after_gemms[3].args[1],
+            after_gemms[4].args[2],
+            after_gemms[5].args[0],
+            after_gemms[6].args[1],
+        ]
+        expected_scopes = [
+            "shared.asram",
+            "shared.rsram",
+            "shared.wsram",
+            "shared.rsram",
+            "shared.asram",
+            "shared.wsram",
+        ]
+
+        for compact_region, expected_scope in zip(compact_regions, expected_scopes):
+            assert isinstance(compact_region, Call)
+            assert compact_region.op == tvm.tir.op.Op.get("tl.tileop.region")
+
+            compact_buffer = compact_region.args[0].buffer
+            assert compact_buffer.scope() == expected_scope
+            assert len(compact_buffer.shape) == 2
+            assert int(compact_buffer.shape[0]) == 16
+            assert int(compact_buffer.shape[1]) == 16
+            assert int(compact_region.args[0].indices[0]) == 0
+            assert int(compact_region.args[0].indices[1]) == 0
+            assert int(compact_region.args[2]) == 16
+            assert int(compact_region.args[3]) == 16
+
+
+def sibling_block_conflict_matmul(dtype="float16", accum_dtype="float32"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((128, 128), dtype),
+        B: T.Tensor((128, 128), dtype),
+        C: T.Tensor((128, 128), accum_dtype),
+    ):
+        with T.Kernel(1, 1, threads=128) as (bx, by):
+            A_shared = T.alloc_shared((32, 32), dtype)
+            B_shared = T.alloc_shared((32, 32), dtype)
+            C_shared = T.alloc_shared((32, 32), accum_dtype)
+
+            with T.block("producer"):
+                T.copy(A[0:32, 0:32], A_shared)
+                T.copy(B[0:32, 0:32], B_shared)
+                T.gemm(A_shared[0:16, 0:16], B_shared[0:16, 4:20], C_shared[0:16, 0:16])
+
+            with T.block("consumer"):
+                C_shared[0, 0] = C_shared[0, 0] + T.float32(1.0)
+
+    return main
+
+
+def test_tilelang_infer_sram_scope_does_not_leak_temp_alloc_buffers_to_sibling_blocks():
+    target_name = "Sunmmio"
+    target = determine_target(target_name, return_object=True)
+
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(sibling_block_conflict_matmul().with_attr("global_symbol", "main"))
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
+        mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+        mod = tilelang.transform.InjectAssumes()(mod)
+        mod = tilelang.transform.Simplify()(mod)
+        mod = tl.transform.InferSramScope()(mod)
+
+        func = list(mod.functions.values())[0]
+        blocks = {block.name_hint: block for block in extract_blocks_from_kernel(func) if block.name_hint in {"producer", "consumer"}}
+        root_block = next(block for block in extract_blocks_from_kernel(func) if block.name_hint == "tilelang_root")
+        root_scopes = {buf.name: buf.scope() for buf in root_block.alloc_buffers}
+        script = mod.script()
+
+        assert set(blocks.keys()) == {"producer", "consumer"}
+        assert root_scopes["A_shared"] == "shared.asram"
+        assert root_scopes["B_shared"] == "shared.wsram"
+        assert root_scopes["C_shared"] == "shared.rsram"
+        assert len(blocks["consumer"].alloc_buffers) == 0
+        assert all(region.buffer.scope() != "shared.dyn" for region in blocks["producer"].reads)
+        assert all(region.buffer.scope() != "shared.dyn" for region in blocks["consumer"].reads)
+        assert all(region.buffer.scope() == "shared.rsram" for region in blocks["consumer"].reads)
+        assert "C_shared_1 = T.Buffer" not in script

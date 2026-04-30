@@ -139,6 +139,7 @@ def test_global_buffer_layout_populated_for_sunmmio():
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl.transform.InferSramScope()(mod)
+        mod = tl.transform.LegalizeSunmmioCopyPath()(mod)
         mod = tl.transform.LayoutInference()(mod)
         mod = tl.transform.LowerTileOp()(mod)
         CollectLayoutMap()(mod)
@@ -185,6 +186,7 @@ def test_global_buffer_layout_not_populated_for_cuda():
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl.transform.InferSramScope()(mod)
+        mod = tl.transform.LegalizeSunmmioCopyPath()(mod)
         mod = tl.transform.LayoutInference()(mod)
         CollectLayoutMap()(mod)
 
@@ -267,6 +269,7 @@ def test_hierarchical_layout_values():
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl.transform.InferSramScope()(mod)
+        mod = tl.transform.LegalizeSunmmioCopyPath()(mod)
         mod = tl.transform.LayoutInference()(mod)
         mod = tl.transform.LowerTileOp()(mod)
         CollectLayoutMap()(mod)

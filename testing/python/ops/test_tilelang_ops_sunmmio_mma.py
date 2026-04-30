@@ -67,6 +67,7 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, versio
         mod = matmul(M, N, K, block_M, block_N, block_K, version)
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.InferSramScope()(mod)
+        mod = tilelang.transform.LegalizeSunmmioCopyPath()(mod)
         mod = tl.transform.LayoutInference()(mod)
         mod = tl.transform.LowerTileOp()(mod)
         texts = extract_sunmmio_mma_lines(mod)
