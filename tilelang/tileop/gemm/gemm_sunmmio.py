@@ -1,6 +1,7 @@
 from .gemm_base import GemmBase
-from tilelang.layout import make_blockwise_zz_layout
+from tilelang.layout import make_zz_layout, make_zn_layout
 from tilelang import tvm as tvm
+import tvm_ffi
 from tvm.target import Target
 from tvm import tir
 from tilelang.transform.simplify import _Simplify
@@ -12,14 +13,40 @@ from tilelang.language.utils import (
     buffer_region_to_tile_region,
 )
 
+_get_sunmmio_layout_block_shape = tvm_ffi.get_global_func("tl.target.GetSunmmioLayoutBlockShape")
+
+
+def _sunmmio_block_shape(dtype):
+    """Dtype-dependent block shape for Sunmmio A4E Tensor Core.
+
+    Delegates to the C++ GetSunmmioLayoutBlockShape via FFI so that the
+    bit-width → block-shape mapping is defined in exactly one place.
+    """
+    target = Target.current()
+    return list(_get_sunmmio_layout_block_shape(target, tvm.DataType(dtype)))
+
 
 class GemmSunmmio(GemmBase):
     def infer_layout(self, target: Target, thread_nums: int):
         if self.is_gemm_sunmmio_scope():
+            # A (ASRAM): ZZ with dtype-dependent block shape
+            a_block = _sunmmio_block_shape(self.A.dtype)
+            a_layout = make_zz_layout(self.A, block_shape=a_block)
+            # B (WSRAM): ZZ if transB (TMM.MT mode), ZN if !transB (TMM.MN mode)
+            b_block = _sunmmio_block_shape(self.B.dtype)
+            rank_b = len(self.B.shape)
+            axes_b = [rank_b - 2, rank_b - 1]
+            if self.trans_B:
+                b_layout = make_zz_layout(self.B, block_shape=b_block)
+            else:
+                b_layout = make_zn_layout(self.B.shape, axes_b, b_block)
+            # C (RSRAM): ZZ with block shape from GetSunmmioLayoutBlockShape
+            c_block = _sunmmio_block_shape(self.C.dtype)
+            c_layout = make_zz_layout(self.C, block_shape=c_block)
             return {
-                self.A: make_blockwise_zz_layout(self.A),
-                self.B: make_blockwise_zz_layout(self.B),
-                self.C: make_blockwise_zz_layout(self.C),
+                self.A: a_layout,
+                self.B: b_layout,
+                self.C: c_layout,
             }
         else:
             raise ValueError(f"Unsupported gemm combination of Sunmmio, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}")

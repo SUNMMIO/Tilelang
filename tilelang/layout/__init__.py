@@ -17,8 +17,16 @@ from .swizzle import (
     make_fully_replicated_layout_fragment,  # noqa: F401
 )
 from .gemm_sp import make_cutlass_metadata_layout  # noqa: F401
-from .hierarchical_layout import (
-    HierarchicalLayout,  # noqa: F401
-    make_hierarchical_layout,  # noqa: F401
-    make_blockwise_zz_layout,  # noqa: F401
+from .cute_layout import (
+    CuteLayout,  # noqa: F401
+    is_same_layout,  # noqa: F401
+    derive_layout_like,  # noqa: F401
+    is_layout_match,  # noqa: F401
+)
+from .sunmmio_layouts import (
+    make_row_major,  # noqa: F401
+    make_zz_layout,  # noqa: F401
+    make_zn_layout,  # noqa: F401
+    make_zzz_layout,  # noqa: F401
+    make_nzz_layout,  # noqa: F401
 )

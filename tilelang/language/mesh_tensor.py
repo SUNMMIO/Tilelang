@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import math
 from enum import Enum
 from typing import Any, TYPE_CHECKING
 
 from tvm import tir
-from tvm.tir import PrimExpr
+from tvm.tir import PrimExpr, IntImm
 from tvm.script.ir_builder.tir import buffer as tir_buffer
+
+import tvm_ffi
 
 from tilelang._typing import DType, ShapeType
 from tilelang.language.proxy import TensorProxy
@@ -19,6 +20,10 @@ __all__ = [
     "MeshTensor",
     "TensorWithMeta",
 ]
+
+# FFI functions for layout operations
+_make_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_row_major")
+_derive_layout_like = tvm_ffi.get_global_func("tl.DeriveLayoutLike")
 
 
 class MeshReplicationType(Enum):
@@ -35,7 +40,7 @@ class MeshShardingPolicy:
         self,
         x: int | None = None,
         y: int | None = None,
-        replicate: MeshReplicationType = MeshReplicationType.NONE,
+        replicate: int = MeshReplicationType.NONE,
         cross_mesh_dim: int | None = None,
     ):
         if cross_mesh_dim is not None and (x is not None or y is not None):
@@ -69,6 +74,20 @@ class TensorWithMeta:
         self.meta_data = meta_data
 
 
+def _ceildiv(a, b):
+    """Ceiling division that works for both Python int and TVM PrimExpr."""
+    if isinstance(a, int) and isinstance(b, int):
+        return (a + b - 1) // b
+    return tir.ceildiv(a, b)
+
+
+def _to_primexpr(v):
+    """Convert a value to PrimExpr if it isn't one already."""
+    if isinstance(v, int):
+        return IntImm("int32", v)
+    return v
+
+
 class MeshTensorProxy:
     """Proxy for creating distributed mesh tensors.
 
@@ -91,7 +110,7 @@ class MeshTensorProxy:
         if policy.cross_mesh_dim is not None:
             if not 0 <= policy.cross_mesh_dim < len(sharded_shape):
                 raise ValueError(f"Invalid cross_mesh_dim: {policy.cross_mesh_dim}, tensor rank is {len(sharded_shape)}")
-            sharded_shape[policy.cross_mesh_dim] = int(math.ceil(sharded_shape[policy.cross_mesh_dim] / (nrows * ncols)))
+            sharded_shape[policy.cross_mesh_dim] = _ceildiv(sharded_shape[policy.cross_mesh_dim], nrows * ncols)
             return tuple(sharded_shape)
 
         if policy.replicate == MeshReplicationType.ROW:
@@ -100,77 +119,25 @@ class MeshTensorProxy:
             if policy.y is not None:
                 if not 0 <= policy.y < len(sharded_shape):
                     raise ValueError(f"Invalid y-split dimension: {policy.y}, tensor rank is {len(sharded_shape)}")
-                sharded_shape[policy.y] = int(math.ceil(sharded_shape[policy.y] / nrows))
+                sharded_shape[policy.y] = _ceildiv(sharded_shape[policy.y], nrows)
         elif policy.replicate == MeshReplicationType.COLUMN:
             if policy.y is not None:
                 raise ValueError("Cannot shard on y-axis when replicating on columns")
             if policy.x is not None:
                 if not 0 <= policy.x < len(sharded_shape):
                     raise ValueError(f"Invalid x-split dimension: {policy.x}, tensor rank is {len(sharded_shape)}")
-                sharded_shape[policy.x] = int(math.ceil(sharded_shape[policy.x] / ncols))
+                sharded_shape[policy.x] = _ceildiv(sharded_shape[policy.x], ncols)
         elif policy.replicate == MeshReplicationType.NONE:
             if policy.x is not None:
                 if not 0 <= policy.x < len(sharded_shape):
                     raise ValueError(f"Invalid x-split dimension: {policy.x}, tensor rank is {len(sharded_shape)}")
-                sharded_shape[policy.x] = int(math.ceil(sharded_shape[policy.x] / ncols))
+                sharded_shape[policy.x] = _ceildiv(sharded_shape[policy.x], ncols)
             if policy.y is not None:
                 if not 0 <= policy.y < len(sharded_shape):
                     raise ValueError(f"Invalid y-split dimension: {policy.y}, tensor rank is {len(sharded_shape)}")
-                sharded_shape[policy.y] = int(math.ceil(sharded_shape[policy.y] / nrows))
+                sharded_shape[policy.y] = _ceildiv(sharded_shape[policy.y], nrows)
 
         return tuple(sharded_shape)
-
-    @staticmethod
-    def _get_sharded_hierarchical_layout(
-        hdims: tuple[int, ...],
-        hgroups: tuple[tuple[int, int], ...],
-        policy: MeshShardingPolicy,
-        nrows: int,
-        ncols: int,
-    ) -> tuple[int, ...]:
-        sharded_hdims = list(hdims)
-        sharded_dims = []
-
-        if policy.cross_mesh_dim is not None:
-            sharded_dims.append((policy.cross_mesh_dim, nrows * ncols))
-        else:
-            if policy.y is not None:
-                sharded_dims.append((policy.y, nrows))
-            if policy.x is not None:
-                sharded_dims.append((policy.x, ncols))
-
-        for logical_dim_to_shard, shard_factor in sharded_dims:
-            if shard_factor == 1:
-                continue
-            group_start, group_end = hgroups[logical_dim_to_shard]
-            if group_start < group_end:
-                hdim_to_shard_idx = group_start
-                hdim_to_shard = hdims[hdim_to_shard_idx]
-                if hdim_to_shard % shard_factor != 0:
-                    raise ValueError(
-                        f"The most significant hierarchical dimension ({hdim_to_shard}) of logical dimension "
-                        f"{logical_dim_to_shard} is not divisible by the shard factor ({shard_factor})."
-                    )
-                sharded_hdims[hdim_to_shard_idx] = hdim_to_shard // shard_factor
-        return tuple(sharded_hdims)
-
-    @staticmethod
-    def _derive_sharded_hstrides(
-        sharded_hdims: tuple[int, ...],
-        global_hstrides: tuple[int, ...],
-    ) -> tuple[int, ...]:
-        if not sharded_hdims:
-            return ()
-
-        perm = sorted(range(len(global_hstrides)), key=lambda i: global_hstrides[i])
-
-        sharded_hstrides = [0] * len(sharded_hdims)
-        current_stride = 1
-        for idx in perm:
-            sharded_hstrides[idx] = current_stride
-            current_stride *= sharded_hdims[idx]
-
-        return tuple(sharded_hstrides)
 
     def __call__(
         self,
@@ -178,9 +145,7 @@ class MeshTensorProxy:
         sharding_policy: MeshShardingPolicy,
         device_mesh_config: tuple[int, int],
         dtype: DType = "float32",
-        hierarchical_dims: tuple[int, ...] | None = None,
-        hierarchical_strides: tuple[int, ...] | None = None,
-        hierarchical_groups: tuple[tuple[int, int], ...] | None = None,
+        layout=None,
     ) -> TensorWithMeta:
         if isinstance(shape, (int, PrimExpr)):
             shape = (shape,)
@@ -193,22 +158,19 @@ class MeshTensorProxy:
             global_strides=TensorProxy._construct_strides(shape),
         )
 
-        if hierarchical_dims is not None:
-            sharded_hdims = self._get_sharded_hierarchical_layout(hierarchical_dims, hierarchical_groups, sharding_policy, nrows, ncols)
-            sharded_hstrides = self._derive_sharded_hstrides(sharded_hdims, hierarchical_strides)
-            meta_data["global_hdims"] = hierarchical_dims
-            meta_data["global_hstrides"] = hierarchical_strides
-            meta_data["global_hgroups"] = hierarchical_groups
-            meta_data["sharded_hdims"] = sharded_hdims
-            meta_data["sharded_hstrides"] = sharded_hstrides
-            meta_data["sharded_hgroups"] = hierarchical_groups
+        # Build global layout (CuteLayout object).
+        if layout is not None:
+            global_layout = layout
         else:
-            meta_data["global_hdims"] = shape
-            meta_data["global_hstrides"] = TensorProxy._construct_strides(shape)
-            meta_data["global_hgroups"] = tuple((i, i + 1) for i in range(len(shape)))
-            meta_data["sharded_hdims"] = sharded_shape
-            meta_data["sharded_hstrides"] = sharded_strides
-            meta_data["sharded_hgroups"] = tuple((i, i + 1) for i in range(len(shape)))
+            # Default: row-major CuteLayout
+            global_layout = _make_row_major([_to_primexpr(s) for s in shape])
+
+        # Derive sharded layout via DeriveLayoutLike.
+        sharded_shape_exprs = [_to_primexpr(s) for s in sharded_shape]
+        sharded_layout = _derive_layout_like(global_layout, sharded_shape_exprs, None)
+
+        meta_data["global_layout"] = global_layout
+        meta_data["sharded_layout"] = sharded_layout
 
         buf = tir_buffer(
             sharded_shape,
@@ -228,9 +190,7 @@ if TYPE_CHECKING:
             sharding_policy: MeshShardingPolicy,
             device_mesh_config: tuple[int, int],
             dtype: DType = "float32",
-            hierarchical_dims: tuple[int, ...] | None = None,
-            hierarchical_strides: tuple[int, ...] | None = None,
-            hierarchical_groups: tuple[tuple[int, int], ...] | None = None,
+            layout=None,
         ) -> TensorWithMeta: ...
 
 else:

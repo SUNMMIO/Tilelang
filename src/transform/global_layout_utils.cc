@@ -6,8 +6,10 @@
 
 #include "common/global_layout_utils.h"
 
+#include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 
+#include "../layout/cute_layout.h"
 #include "../layout/layout.h"
 #include "../target/utils.h"
 
@@ -19,54 +21,14 @@ using namespace tir;
 Optional<Layout>
 ParseGlobalBufferLayout(const Map<String, ObjectRef> &meta_entry,
                         const Buffer &buffer) {
-  // Extract sharded layout info
-  auto hdims_obj = meta_entry.Get("sharded_hdims");
-  auto hstrides_obj = meta_entry.Get("sharded_hstrides");
-  auto hgroups_obj = meta_entry.Get("sharded_hgroups");
-
-  if (!hdims_obj || !hstrides_obj || !hgroups_obj) {
-    return Optional<Layout>();
-  }
-
-  // Convert to arrays for makeHierarchicalLayout
-  Array<Integer> hdims_arr, hstrides_arr, logical_shape_arr;
-  Array<Array<Integer>> groups_arr;
-
-  // Parse hdims - it's an Array<Integer> from Python
-  Array<Integer> hdims = Downcast<Array<Integer>>(hdims_obj.value());
-  for (const auto &dim : hdims) {
-    hdims_arr.push_back(dim);
-  }
-
-  // Parse hstrides
-  Array<Integer> hstrides = Downcast<Array<Integer>>(hstrides_obj.value());
-  for (const auto &stride : hstrides) {
-    hstrides_arr.push_back(stride);
-  }
-
-  // Parse hgroups - Array<Array<Integer>>
-  Array<Array<Integer>> hgroups =
-      Downcast<Array<Array<Integer>>>(hgroups_obj.value());
-  for (const auto &group : hgroups) {
-    groups_arr.push_back(group);
-  }
-
-  // Use buffer shape as logical shape
-  for (size_t i = 0; i < buffer->shape.size(); ++i) {
-    if (auto *imm = buffer->shape[i].as<IntImmNode>()) {
-      logical_shape_arr.push_back(Integer(imm->value));
-    } else {
-      return Optional<Layout>(); // Dynamic shape not supported
+  // Extract the CuteLayout object stored directly by MeshTensor.
+  auto layout_obj = meta_entry.Get("sharded_layout");
+  if (layout_obj) {
+    if (auto layout = layout_obj.value().as<Layout>()) {
+      return layout.value();
     }
   }
-
-  // Verify that groups_arr matches logical shape dimensions
-  if (groups_arr.size() != logical_shape_arr.size()) {
-    return Optional<Layout>();
-  }
-
-  return makeHierarchicalLayout(hdims_arr, hstrides_arr, groups_arr,
-                                logical_shape_arr);
+  return Optional<Layout>();
 }
 
 bool PopulateGlobalBufferLayouts(const PrimFunc &f, Target target,

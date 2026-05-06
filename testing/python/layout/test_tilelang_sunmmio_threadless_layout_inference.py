@@ -1,4 +1,4 @@
-"""Tests that LayoutInference handles threadless Sunmmio kernels correctly.
+"""Tests that SunmmioLayoutInference handles threadless Sunmmio kernels correctly.
 
 Background — the ThreadBindingCollector fix (layout_inference.cc):
 
@@ -123,11 +123,11 @@ def has_parallel_for(func):
 
 
 def test_layout_inference_threadless_kernel_completes_without_error():
-    """LayoutInference must not crash on a threadless Sunmmio kernel.
+    """SunmmioLayoutInference must not crash on a threadless Sunmmio kernel.
 
     This is the base smoke test: even without T.Parallel or shared memory,
     a threadless kernel (blockIdx only, no threadIdx) must pass through
-    LayoutInference cleanly.
+    SunmmioLayoutInference cleanly.
 
     Before the fix, blockIdx was collected as a "thread binding", setting
     skip_thread_partition=False. For kernels with parallel for loops + shared
@@ -141,11 +141,13 @@ def test_layout_inference_threadless_kernel_completes_without_error():
 
     mod = tvm.tir.transform.BindTarget(target)(mod)
     mod = tl_transform.InferSramScope()(mod)
-    mod = tl_transform.LayoutInference()(mod)  # must not crash or raise
+    mod = tl_transform.LegalizeSunmmioCopyPath()(mod)
+    mod = tl_transform.LayoutReducer()(mod)
+    mod = tl_transform.SunmmioLayoutInference()(mod)  # must not crash or raise
 
 
 def test_layout_inference_threadless_kernel_has_no_threadidx_bindings():
-    """After LayoutInference a threadless kernel must carry no threadIdx bindings.
+    """After SunmmioLayoutInference a threadless kernel must carry no threadIdx bindings.
 
     The threadless execution model (skip_thread_partition=True) must be preserved
     end-to-end. If blockIdx were still collected as a thread binding the pass
@@ -158,20 +160,22 @@ def test_layout_inference_threadless_kernel_has_no_threadidx_bindings():
 
     mod = tvm.tir.transform.BindTarget(target)(mod)
     mod = tl_transform.InferSramScope()(mod)
-    mod = tl_transform.LayoutInference()(mod)
+    mod = tl_transform.LegalizeSunmmioCopyPath()(mod)
+    mod = tl_transform.LayoutReducer()(mod)
+    mod = tl_transform.SunmmioLayoutInference()(mod)
 
     thread_extents = collect_thread_extents(mod["main"])
     threadidx_tags = [t for t in thread_extents if t.startswith("threadIdx")]
 
     assert not threadidx_tags, (
-        f"Threadless Sunmmio kernel must have no threadIdx bindings after LayoutInference. "
+        f"Threadless Sunmmio kernel must have no threadIdx bindings after SunmmioLayoutInference. "
         f"Found: {thread_extents}\n"
         f"IR:\n{mod['main'].script()}"
     )
 
 
 def test_layout_inference_threadless_kernel_preserves_blockidx_bindings():
-    """After LayoutInference, blockIdx bindings must still be present.
+    """After SunmmioLayoutInference, blockIdx bindings must still be present.
 
     Guards against the fix accidentally stripping blockIdx from the IR.
     """
@@ -182,13 +186,15 @@ def test_layout_inference_threadless_kernel_preserves_blockidx_bindings():
 
     mod = tvm.tir.transform.BindTarget(target)(mod)
     mod = tl_transform.InferSramScope()(mod)
-    mod = tl_transform.LayoutInference()(mod)
+    mod = tl_transform.LegalizeSunmmioCopyPath()(mod)
+    mod = tl_transform.LayoutReducer()(mod)
+    mod = tl_transform.SunmmioLayoutInference()(mod)
 
     thread_extents = collect_thread_extents(mod["main"])
     blockidx_tags = [t for t in thread_extents if t.startswith("blockIdx")]
 
     assert blockidx_tags, (
-        f"Threadless Sunmmio kernel must still have blockIdx bindings after LayoutInference. "
+        f"Threadless Sunmmio kernel must still have blockIdx bindings after SunmmioLayoutInference. "
         f"Found extents: {thread_extents}\n"
         f"IR:\n{mod['main'].script()}"
     )
@@ -200,7 +206,7 @@ def test_layout_inference_threadless_kernel_preserves_blockidx_bindings():
 
 
 def test_layout_inference_parallel_shared_kernel_completes_without_error():
-    """LayoutInference must not crash on a Sunmmio kernel with T.Parallel + shared memory.
+    """SunmmioLayoutInference must not crash on a Sunmmio kernel with T.Parallel + shared memory.
 
     This is the exact scenario that triggered the ThreadBindingCollector bug:
     - Only blockIdx.* bindings (no threadIdx on Sunmmio)
@@ -218,13 +224,15 @@ def test_layout_inference_parallel_shared_kernel_completes_without_error():
         mod = make_sunmmio_parallel_shared_kernel(64, 64)
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl_transform.InferSramScope()(mod)
-        mod = tl_transform.LayoutInference()(mod)  # must not crash or raise
+        mod = tl_transform.LegalizeSunmmioCopyPath()(mod)
+        mod = tl_transform.LayoutReducer()(mod)
+        mod = tl_transform.SunmmioLayoutInference()(mod)  # must not crash or raise
 
 
 def test_layout_inference_parallel_shared_kernel_has_no_threadidx_bindings():
-    """After LayoutInference a Sunmmio T.Parallel kernel must have no threadIdx bindings.
+    """After SunmmioLayoutInference a Sunmmio T.Parallel kernel must have no threadIdx bindings.
 
-    Sunmmio is unconditionally threadless; LayoutInference must not inject threadIdx
+    Sunmmio is unconditionally threadless; SunmmioLayoutInference must not inject threadIdx
     when processing T.Parallel loops. If blockIdx were still collected as a thread
     binding the pass might introduce spurious threadIdx annotations.
     """
@@ -234,20 +242,22 @@ def test_layout_inference_parallel_shared_kernel_has_no_threadidx_bindings():
         mod = make_sunmmio_parallel_shared_kernel(64, 64)
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl_transform.InferSramScope()(mod)
-        mod = tl_transform.LayoutInference()(mod)
+        mod = tl_transform.LegalizeSunmmioCopyPath()(mod)
+        mod = tl_transform.LayoutReducer()(mod)
+        mod = tl_transform.SunmmioLayoutInference()(mod)
 
     thread_extents = collect_thread_extents(mod["main"])
     threadidx_tags = [t for t in thread_extents if t.startswith("threadIdx")]
 
     assert not threadidx_tags, (
         f"Sunmmio kernel with T.Parallel must have no threadIdx bindings after "
-        f"LayoutInference (Sunmmio is fully threadless). Found: {thread_extents}\n"
+        f"SunmmioLayoutInference (Sunmmio is fully threadless). Found: {thread_extents}\n"
         f"IR:\n{mod['main'].script()}"
     )
 
 
 def test_layout_inference_parallel_shared_kernel_has_no_v_thread_variable():
-    """After LayoutInference the IR must not contain a free v_thread variable.
+    """After SunmmioLayoutInference the IR must not contain a free v_thread variable.
 
     v_thread is the dummy IterVar used by PartitionLoop when no real thread binding
     exists. If it appears in the output IR it means PartitionLoop was called with
@@ -263,12 +273,14 @@ def test_layout_inference_parallel_shared_kernel_has_no_v_thread_variable():
         mod = make_sunmmio_parallel_shared_kernel(64, 64)
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl_transform.InferSramScope()(mod)
-        mod = tl_transform.LayoutInference()(mod)
+        mod = tl_transform.LegalizeSunmmioCopyPath()(mod)
+        mod = tl_transform.LayoutReducer()(mod)
+        mod = tl_transform.SunmmioLayoutInference()(mod)
 
     var_names = collect_var_names(mod["main"])
 
     assert "v_thread" not in var_names, (
-        "LayoutInference introduced a free v_thread variable for a Sunmmio kernel "
+        "SunmmioLayoutInference introduced a free v_thread variable for a Sunmmio kernel "
         "with T.Parallel. This means ThreadBindingCollector incorrectly collected "
         "blockIdx.* as a thread binding, causing PartitionLoop to run with an "
         "unbound dummy thread variable.\n"

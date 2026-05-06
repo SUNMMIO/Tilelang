@@ -275,9 +275,7 @@ std::vector<AccessTileCandidate> EnumerateManualCandidates(
   std::vector<AccessTileCandidate> candidates;
   TrailingTilePattern pattern = ValidateManualTrailingTileView(
       buffer, manual_tv, exec_rank, layout_map, config, analyzer,
-      "TileView inside T.Tiles",
-      /*enforce_blockwise_width_for_rank1=*/
-      static_cast<int>(buffer->shape.size()) >= 2);
+      "TileView inside T.Tiles");
   AddCandidateFromPattern(&candidates, buffer, indices, bindings, pattern,
                           analyzer, /*strict_checks=*/true);
   return candidates;

@@ -10,9 +10,11 @@
 #include <tvm/tir/op_attr_types.h>
 #include <tvm/tir/stmt_functor.h>
 
+#include "../layout/cute_layout.h"
 #include "../layout/layout.h"
 #include "../layout/utils.h"
 #include "../op/parallel.h"
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "../tileview/reduce_tileview_planner.h"
 #include "../tileview/tileview.h"
@@ -199,7 +201,7 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   // The lowering logic here implements tile-level reduction using a
   // combination of element-wise accumulation and specialized hardware
   // primitives.
-  ICHECK(src_scope == "shared.rsram" && dst_scope == "shared.rsram")
+  ICHECK(src_scope == kSunmmioScopeRSRAM && dst_scope == kSunmmioScopeRSRAM)
       << "For Sunmmio target, Reduce operator src and dst must be in "
          "shared.rsram scope, but got "
       << src_scope << " and " << dst_scope;
@@ -300,7 +302,7 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   // Create the 'acc' buffer in shared.rsram to hold intermediate reduction
   // values for a single tile.
   auto create_tile_buffer = [&](std::string name, Array<PrimExpr> shape) {
-    return decl_buffer(shape, this->dst->dtype, name, "shared.rsram");
+    return decl_buffer(shape, this->dst->dtype, name, kSunmmioScopeRSRAM);
   };
 
   Buffer acc =
@@ -1036,6 +1038,34 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &T,
                                     InferLevel level) const {
   if (level >= InferLevel::kStrict)
     return {};
+
+  // Sunmmio RSRAM reduce: derive dst layout from src layout and reduce axis.
+  //
+  // If the reduced dim is blocked (nlevels > 1), the block structure on
+  // that axis is destroyed → fall back to row-major.
+  // Otherwise, DeriveLayoutLike preserves the surviving blocked structure.
+  if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeRSRAM) {
+    LayoutMap result;
+    // Always propose when src has a layout — TryAssign handles priority.
+    // No guard on !T.layout_map.count(dst): level-based priority in the
+    // pass will accept or reject appropriately.
+    if (T.layout_map.count(src)) {
+      auto *src_cute = T.layout_map[src].as<CuteLayoutNode>();
+      bool reduces_blocked_dim =
+          src_cute && src_cute->GetDimLevels()[dim].IntValue() > 1;
+      if (reduces_blocked_dim) {
+        result.Set(dst, sunmmio::MakeRowMajor(dst->shape));
+      } else {
+        auto derived = DeriveLayoutLike(T.layout_map[src], dst->shape);
+        if (derived.defined()) {
+          result.Set(dst, derived.value());
+        } else {
+          result.Set(dst, sunmmio::MakeRowMajor(dst->shape));
+        }
+      }
+    }
+    return result;
+  }
 
   if (IsFragmentBuffer(src) && IsFragmentBuffer(dst) &&
       T.layout_map.count(src)) {
