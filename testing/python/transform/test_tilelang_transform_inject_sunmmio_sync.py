@@ -23,7 +23,8 @@ def LowerAndLegalize_sunmmio(
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
-    mod = tilelang.transform.LayoutInference()(mod)
+    mod = tilelang.transform.LegalizeSunmmioCopyPath()(mod)
+    mod = tilelang.transform.SunmmioLayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     mod = tilelang.transform.LegalizeTilesLoop()(mod)
     mod = tilelang.transform.TilesLoop()(mod)
@@ -41,8 +42,8 @@ def OptimizeForSunmmio_patial(
     target: Target,
 ) -> IRModule:
     mod = tilelang.transform.IfStmtBinding()(mod)
-    mod = tilelang.transform.SunmmioPipelinePlanning(debug=False)(mod)
-    mod = tilelang.transform.InjectSunmmioPipeline()(mod)
+    # mod = tilelang.transform.SunmmioPipelinePlanning(debug=False)(mod)
+    # mod = tilelang.transform.InjectSunmmioPipeline()(mod)
     mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tir.transform.Simplify()(mod)
@@ -376,7 +377,7 @@ def test_inject_sunmmio_sync_if():
 
     mod = tilelang.transform.InjectSunmmioSync()(mod)
     script = mod.script(show_meta=True)
-    print(script)
+    # print(script)
     assert "mma_sunmmio" in script
     assert "broadcast_" in script
     assert "barrier_init" in script
