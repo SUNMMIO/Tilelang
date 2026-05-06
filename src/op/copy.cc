@@ -817,7 +817,7 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
 Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
                                    arith::Analyzer *analyzer) const {
-  /** The staging split is handled by LegalizeSunmmioCopyPath before lowering.
+  /** The staging split is handled by LegalizeSunmmioDataPath before lowering.
    */
   PrimExpr src_region = MakeRegionExpr(src, src_range, /*access_mask=*/1);
   PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
