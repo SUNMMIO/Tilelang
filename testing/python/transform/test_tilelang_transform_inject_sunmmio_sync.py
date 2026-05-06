@@ -365,28 +365,6 @@ def test_inject_sunmmio_sync_if():
 
         return main
 
-    func_str = """
-            A_shared = T.decl_buffer((32, 32), "float16", scope="shared.asram")
-            B_shared = T.decl_buffer((32, 32), "float16", scope="shared.wsram")
-            C_shared = T.decl_buffer((32, 32), scope="shared.rsram")
-            D_shared = T.decl_buffer((32, 32), scope="shared.rsram")
-            A_2 = T.Buffer((128, 128), "float16", data=A, strides=(128, 1))
-            T.dma_copy(T.region(A_2[by * 32, 0], 1, 32, 32), T.region(A_shared[0, 0], 2, 32, 32), T.sync_token_id(0))
-            B_2 = T.Buffer((128, 128), "float16", data=B, strides=(128, 1))
-            T.dma_copy(T.region(B_2[0, bx * 32], 1, 32, 32), T.region(B_shared[0, 0], 2, 32, 32), T.sync_token_id(1))
-            T.wait_token(0)
-            T.wait_token(1)
-            T.mma_sunmmio(T.region(A_shared[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 1, 32, 32), T.region(C_shared[0, 0], 3, 32, 32), T.bool(False), T.bool(False), T.bool(False), T.sync_token_id(2))
-            if by == 0:
-                T.wait_token(2)
-                T.broadcast_(T.region(C_shared[0, 0], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), 1024, 0, 0, T.sync_token_id(3))
-                T.barrier_init(0, 0, 1, 2, 3)
-            T.wait_token(3)
-            T.barrier_arrive_and_wait(0)
-            T.wait_token(2)
-            C_shared[0, 0] = C_shared[0, 0] + T.float32(1.0)
-    """.strip()
-
     M, N, K = 128, 128, 128
     block_M, block_N, block_K = 32, 32, 32
     target = get_target("Sunmmio")
