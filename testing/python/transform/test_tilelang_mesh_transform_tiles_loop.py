@@ -3,7 +3,7 @@ from tilelang import tvm as tvm
 import tilelang as tl
 import tilelang.language as T
 from tilelang.tileview import make_tileview
-from tilelang.layout import make_blockwise_zz_layout
+from tilelang.layout import make_zz_layout
 from tvm import tir
 from tvm import IRModule
 
@@ -280,8 +280,8 @@ def copy_region_tiled_parallel_2d(tile_size=(8, 32), index_map=(-2, -1), dtype="
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    B_shared: make_blockwise_zz_layout(B_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    B_shared: make_zz_layout(B_shared),
                 }
             )
 
@@ -337,8 +337,8 @@ def copy_region_tiled_parallel_2d_misaligned(tile_size=(8, 32), index_map=(-2, -
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    B_shared: make_blockwise_zz_layout(B_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    B_shared: make_zz_layout(B_shared),
                 }
             )
 

@@ -31,7 +31,7 @@ bool PopulateGlobalBufferLayouts(const tir::PrimFunc &f, Target target,
                                  LayoutMap *layout_map);
 
 /*!
- * \brief Parse a single buffer's hierarchical layout from tensor_meta entry
+ * \brief Parse a single buffer's CuteLayout from tensor_meta entry
  *
  * \param meta_entry The metadata dict for one buffer
  * \param buffer The buffer to create layout for

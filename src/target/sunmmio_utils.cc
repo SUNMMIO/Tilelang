@@ -8,7 +8,9 @@
 #include <stdexcept>
 #include <string>
 
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/tir/op.h>
 
 #include "utils.h"
 
@@ -18,7 +20,24 @@ namespace tl {
 namespace {
 
 SunmmioTileProcessorConfig MakeSunmmioA4EConfig() {
-  return {/*register_bits=*/4096, /*block_height=*/32, /*block_width=*/32};
+  return {/*register_bits=*/4096, /*block_height=*/32, /*block_width=*/32,
+          /*rsram_align_bytes=*/64};
+}
+
+ffi::Array<PrimExpr> MakeSunmmioA4EBlockShape(DataType dtype) {
+  // A4E block shape depends on element bit-width:
+  //   fp32/bf16/fp16 (>=16-bit) → (32, 32)   -- includes accumulator dtype
+  //   fp8            (8-bit)    → (32, 64)
+  //   fp4            (4-bit)    → (32, 128)
+  int bits = dtype.bits();
+  int width = 32;
+  if (bits <= 4) {
+    width = 128;
+  } else if (bits <= 8) {
+    width = 64;
+  }
+  return {tir::make_const(DataType::Int(32), 32),
+          tir::make_const(DataType::Int(32), width)};
 }
 
 SunmmioMeshConfig MakeSunmmioA4EMeshConfig() {
@@ -108,6 +127,34 @@ SunmmioTileProcessorConfig GetSunmmioTileProcessorConfig(Target target) {
   return MakeSunmmioA4EConfig();
 }
 
+ffi::Array<PrimExpr> GetSunmmioLayoutBlockShape(ffi::Optional<Target> target,
+                                                DataType dtype) {
+  if (!target.defined()) {
+    return MakeSunmmioA4EBlockShape(dtype);
+  }
+  return GetSunmmioLayoutBlockShape(target.value(), dtype);
+}
+
+ffi::Array<PrimExpr> GetSunmmioLayoutBlockShape(Target target, DataType dtype) {
+  target = NormalizeTarget(target);
+
+  if (!target.defined() || !TargetIsSunmmio(target)) {
+    // Keep target-less tests and non-Sunmmio analysis fallbacks aligned with
+    // the current A4E device model until the broader target contract is strict.
+    return MakeSunmmioA4EBlockShape(dtype);
+  }
+
+  auto mcpu = target->GetAttr<tvm::ffi::String>("mcpu");
+  if (!mcpu.has_value() || mcpu.value() == "sunmmio-a4e") {
+    return MakeSunmmioA4EBlockShape(dtype);
+  }
+
+  LOG(WARNING) << "Unknown Sunmmio device model '" << mcpu.value()
+               << "' when querying layout block shape. Falling back to the "
+                  "sunmmio-a4e defaults.";
+  return MakeSunmmioA4EBlockShape(dtype);
+}
+
 SunmmioMeshConfig GetSunmmioMeshConfig(ffi::Optional<Target> target) {
   if (!target.defined()) {
     return MakeSunmmioA4EMeshConfig();
@@ -134,6 +181,13 @@ SunmmioMeshConfig GetSunmmioMeshConfig(Target target) {
                               "'device_mesh_ncol_<positive-int>'.";
 
   return {/*nrow=*/nrow.value(), /*ncol=*/ncol.value()};
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.target.GetSunmmioLayoutBlockShape",
+                        static_cast<ffi::Array<PrimExpr> (*)(Target, DataType)>(
+                            GetSunmmioLayoutBlockShape));
 }
 
 } // namespace tl

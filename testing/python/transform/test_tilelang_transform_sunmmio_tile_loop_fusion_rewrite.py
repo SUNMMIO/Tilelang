@@ -1,7 +1,7 @@
 import tilelang as tl
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.layout import make_blockwise_zz_layout
+from tilelang.layout import make_zz_layout
 from tilelang.tileview import make_tileview
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 import textwrap
@@ -43,8 +43,8 @@ def single_tile_scope_kernel(block_m=32, block_n=32, tile_size=(8, 32), dtype="f
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    B_shared: make_blockwise_zz_layout(B_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    B_shared: make_zz_layout(B_shared),
                 }
             )
             T.annotate_tileview(
@@ -72,9 +72,9 @@ def two_consecutive_tile_scopes_kernel(block_m=32, block_n=32, tile_size=(8, 32)
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    Tmp_shared: make_blockwise_zz_layout(Tmp_shared),
-                    B_shared: make_blockwise_zz_layout(B_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    Tmp_shared: make_zz_layout(Tmp_shared),
+                    B_shared: make_zz_layout(B_shared),
                 }
             )
             T.annotate_tileview(

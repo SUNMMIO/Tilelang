@@ -1,7 +1,7 @@
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.layout import make_blockwise_zz_layout
+from tilelang.layout import make_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 import pytest
 
@@ -16,8 +16,9 @@ def apply_sunmmio_passes(mod, target):
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
+    mod = tilelang.transform.LegalizeSunmmioCopyPath()(mod)
     mod = tilelang.transform.LayoutReducer()(mod)
-    mod = tilelang.transform.LayoutInference()(mod)
+    mod = tilelang.transform.SunmmioLayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     return mod
 
@@ -91,7 +92,7 @@ def reduce_kernel_with_blockwise_layout_builder(shape, reduce_axis, dtype="float
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
+                    A_shared: make_zz_layout(A_shared),
                 }
             )
 
