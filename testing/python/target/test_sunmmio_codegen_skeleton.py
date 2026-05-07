@@ -23,9 +23,7 @@ def _maybe_print_kernel_and_mlir(func, src: str):
 
 
 def _to_device_kernel_func(func):
-    return func.with_attr("global_symbol", "main").with_attr(
-        "calling_conv", int(tvm.ir.CallingConv.DEVICE_KERNEL_LAUNCH)
-    )
+    return func.with_attr("global_symbol", "main").with_attr("calling_conv", int(tvm.ir.CallingConv.DEVICE_KERNEL_LAUNCH))
 
 
 def _primfunc_from_stmt(stmt):

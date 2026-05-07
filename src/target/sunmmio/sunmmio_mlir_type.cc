@@ -1,8 +1,8 @@
 #include "sunmmio_mlir_type.h"
 
+#include "mlir/IR/BuiltinAttributes.h"
 #include "npuir/Dialect/SUVM/IR/Attributes.h"
 #include "npuir/Dialect/SUVM/IR/Types.h"
-#include "mlir/IR/BuiltinAttributes.h"
 #include "sunmmio_mlir_context.h"
 #include "tvm/runtime/logging.h"
 
