@@ -10,20 +10,20 @@ namespace tvm {
 namespace codegen {
 namespace {
 
-CodeGenTileLangSunMMIO::BuilderBackendKind
-ParseBackendKind(const ffi::String &backend) {
+void ValidateSuvmBackend(const ffi::String &backend) {
+  if (backend.empty()) {
+    return;
+  }
   std::string mode = static_cast<std::string>(backend);
   std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
     return static_cast<char>(std::tolower(c));
   });
-  if (mode == "text" || mode == "textdebug") {
-    return CodeGenTileLangSunMMIO::BuilderBackendKind::kTextDebug;
-  }
   if (mode == "suvm") {
-    return CodeGenTileLangSunMMIO::BuilderBackendKind::kSuvm;
+    return;
   }
-  LOG(FATAL) << "Unknown sunmmio builder backend: " << mode
-             << ". Expected one of: suvm, text.";
+  LOG(FATAL) << "SunMMIO text backend has been removed. "
+             << "target.build.tilelang_sunmmio_without_compile now supports "
+             << "only 'suvm' (or empty backend).";
   TVM_FFI_UNREACHABLE();
 }
 
@@ -67,7 +67,8 @@ ffi::Module BuildTileLangSunMMIO(IRModule mod, Target target) {
 
 ffi::Module BuildTileLangSunMMIOWithoutCompile(IRModule mod, Target target,
                                                ffi::String backend) {
-  CodeGenTileLangSunMMIO cg(ParseBackendKind(backend));
+  ValidateSuvmBackend(backend);
+  CodeGenTileLangSunMMIO cg;
   cg.Init();
 
   for (auto kv : mod->functions) {

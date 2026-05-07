@@ -116,13 +116,7 @@ class CodeGenTileLangSunMMIO final
     : public tir::StmtVisitor,
       public tir::ExprFunctor<SunMMIOValue(const tvm::PrimExpr &)> {
 public:
-  enum class BuilderBackendKind {
-    kSuvm,
-    kTextDebug,
-  };
-
-  explicit CodeGenTileLangSunMMIO(
-      BuilderBackendKind backend_kind = BuilderBackendKind::kSuvm);
+  CodeGenTileLangSunMMIO();
   ~CodeGenTileLangSunMMIO() noexcept override = default;
 
   void Init();
@@ -250,7 +244,6 @@ private:
                                     const std::string &detail = "") const;
 
   std::unique_ptr<SunMMIOBuilder> builder_;
-  BuilderBackendKind backend_kind_;
   bool initialized_{false};
   int ssa_counter_{0};
 
