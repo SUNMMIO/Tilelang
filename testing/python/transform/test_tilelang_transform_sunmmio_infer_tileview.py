@@ -74,6 +74,31 @@ def assert_scope_plan(mod, expected_tile_size, expected_execution_domain_axes):
     assert _to_int_list(scope_root["tile.execution_domain_axes"]) == list(expected_execution_domain_axes)
 
 
+def collect_loads(func, buffer_name):
+    loads = []
+
+    def visit(stmt, loads=loads):
+        if isinstance(stmt, tir.BufferLoad) and stmt.buffer.name == buffer_name:
+            loads.append(stmt)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return loads
+
+
+def assert_preserved_mixed_rank_load(mod, expected_tile_size):
+    script = mod["main"].script()
+    assert "T.sunmmio_unaligned_tile_load" not in script
+
+    loads = collect_loads(mod["main"], "B_shared")
+    assert loads, "Expected mixed-rank side access to remain a BufferLoad"
+    assert all(load.predicate is not None for load in loads)
+
+    tile_height = expected_tile_size[0]
+    assert any(f"* {tile_height}" in str(load.indices[0]) or f"*{tile_height}" in str(load.indices[0]) for load in loads)
+    assert all("< 128" in str(load.predicate) or "<128" in str(load.predicate) for load in loads)
+    assert all("< 64" in str(load.predicate) or "<64" in str(load.predicate) for load in loads)
+
+
 # ---------------------------------------------------------
 # Test 1: 2D T.Tiles without annotate_tileview
 # ---------------------------------------------------------
@@ -234,20 +259,21 @@ def test_infer_rank1_tileview_from_2d_buffer_access_with_outer_loop_var():
 # Test 3: Mixed-rank (1D + 2D) in same T.Tiles
 # ---------------------------------------------------------
 @pytest.mark.parametrize(
-    ("dtype", "expected_tile_size", "align_elems"),
+    ("dtype", "expected_tile_size"),
     [
-        ("float32", [4, 32], 16),
-        ("float16", [8, 32], 32),
-        ("bfloat16", [8, 32], 32),
+        ("float32", [4, 32]),
+        ("float16", [8, 32]),
+        ("bfloat16", [8, 32]),
     ],
 )
-def test_infer_tileview_mixed_rank_load(dtype, expected_tile_size, align_elems):
-    """Mixed-rank rank-1 loads fall back to aligned load plus slice.
+def test_infer_tileview_mixed_rank_load(dtype, expected_tile_size):
+    """Mixed-rank rank-1 loads stay as logical BufferLoad in LowerTilesLoop.
 
     B_shared is 1D and tiled along the height axis. Strict TileView search
     rejects tile width 1 because 64-byte RSRAM alignment requires multiple
-    elements, then the fallback search allows the side load and TilesLoop
-    rewrites it to tl.sunmmio_unaligned_tile_load.
+    elements, then the fallback search allows the side load. The eventual
+    hardware unaligned load repair is deferred to Sunmmio codegen so mid-level
+    analysis can still see a normal predicated BufferLoad.
     """
     M, N = 128, 64
 
@@ -275,22 +301,19 @@ def test_infer_tileview_mixed_rank_load(dtype, expected_tile_size, align_elems):
         mod = apply_sunmmio_passes(mod, target)
 
     assert_scope_plan(mod, expected_tile_size=expected_tile_size, expected_execution_domain_axes=[0, 1])
-    script = mod["main"].script()
-    assert "T.sunmmio_unaligned_tile_load" in script
-    assert f"// {align_elems} * {align_elems}" in script
-    assert f"% {align_elems}" in script
+    assert_preserved_mixed_rank_load(mod, expected_tile_size)
 
 
 @pytest.mark.parametrize(
-    ("dtype", "expected_tile_size", "align_elems"),
+    ("dtype", "expected_tile_size"),
     [
-        ("float32", [4, 32], 16),
-        ("float16", [8, 32], 32),
-        ("bfloat16", [8, 32], 32),
+        ("float32", [4, 32]),
+        ("float16", [8, 32]),
+        ("bfloat16", [8, 32]),
     ],
 )
-def test_infer_tileview_mixed_rank_load_inside_exp2(dtype, expected_tile_size, align_elems):
-    """Unaligned rank-1 load repair can feed another TIR PrimExpr op."""
+def test_infer_tileview_mixed_rank_load_inside_exp2(dtype, expected_tile_size):
+    """Preserved mixed-rank rank-1 BufferLoad can feed another TIR PrimExpr op."""
     M, N = 128, 64
 
     @T.prim_func
@@ -319,9 +342,7 @@ def test_infer_tileview_mixed_rank_load_inside_exp2(dtype, expected_tile_size, a
     assert_scope_plan(mod, expected_tile_size=expected_tile_size, expected_execution_domain_axes=[0, 1])
     script = mod["main"].script()
     assert "T.exp2" in script
-    assert "T.sunmmio_unaligned_tile_load" in script
-    assert f"// {align_elems} * {align_elems}" in script
-    assert f"% {align_elems}" in script
+    assert_preserved_mixed_rank_load(mod, expected_tile_size)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])

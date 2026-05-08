@@ -258,16 +258,6 @@ TVM_DLL const Op &tma_load();
 TVM_DLL const Op &dma_copy();
 
 /*!
- * \brief Sunmmio unaligned tile load legalized as aligned-line load plus slice.
- *
- * This is an internal legalization intrinsic.  The first argument is a
- * BufferLoad whose indices denote the aligned physical line base; codegen must
- * treat it as an address marker, not as a scalar load.  The second argument is
- * the scalar element offset inside the aligned line.
- */
-TVM_DLL const Op &sunmmio_unaligned_tile_load();
-
-/*!
  * \brief tvm intrinsic for mma operation of Sunmmio target.
  *
  *  \param A_region

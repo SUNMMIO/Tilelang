@@ -11,9 +11,7 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
-#include "../op/builtin.h"
 #include "../support/ffi_aliases.h"
-#include "../target/sunmmio_utils.h"
 #include "../tileview/tileview.h"
 #include "common/attr.h"
 
@@ -51,9 +49,10 @@ class TileAccessRewriter : public StmtExprMutator {
 public:
   TileAccessRewriter(const std::vector<Var> &exec_vars,
                      const std::vector<Var> &interior_vars,
-                     const Array<PrimExpr> &tile_size, int rsram_align_bytes)
+                     const Array<PrimExpr> &tile_size,
+                     Optional<PrimExpr> tile_predicate)
       : exec_vars_(exec_vars), interior_vars_(interior_vars),
-        tile_size_(tile_size), rsram_align_bytes_(rsram_align_bytes) {
+        tile_size_(tile_size), tile_predicate_(std::move(tile_predicate)) {
     ICHECK_EQ(exec_vars_.size(), interior_vars_.size());
     ICHECK_EQ(exec_vars_.size(), tile_size_.size());
 
@@ -131,54 +130,6 @@ private:
     return ExecutionIndexInfo{matched_axis, base};
   }
 
-  static int GetStaticPositiveInt(const PrimExpr &expr,
-                                  const char *diagnostic_name) {
-    const auto *imm = expr.as<IntImmNode>();
-    ICHECK(imm) << diagnostic_name << " must be a static integer, but got "
-                << expr << ".";
-    ICHECK_GT(imm->value, 0)
-        << diagnostic_name << " must be positive, but got " << expr << ".";
-    return static_cast<int>(imm->value);
-  }
-
-  std::optional<int> GetRank1RsramUnalignedLoadAlignElems(
-      const BufferLoadNode *op,
-      const NormalizedAccessIndex &access_index) const {
-    if (!access_index.matched_axis.has_value() || exec_vars_.size() != 2 ||
-        op->buffer.scope() != kSunmmioScopeRSRAM ||
-        op->buffer->shape.size() != 1 || op->indices.size() != 1) {
-      return std::nullopt;
-    }
-
-    int align_elems =
-        GetSunmmioRsramAlignmentElems(rsram_align_bytes_, op->buffer->dtype);
-    if (align_elems <= 1) {
-      return std::nullopt;
-    }
-
-    int tile_extent = GetStaticPositiveInt(
-        tile_size_[access_index.matched_axis.value()], "Tile extent");
-    if (tile_extent % align_elems == 0) {
-      return std::nullopt;
-    }
-    return align_elems;
-  }
-
-  PrimExpr MakeSunmmioUnalignedTileLoad(const BufferLoadNode *op,
-                                        const PrimExpr &normalized_index,
-                                        int align_elems) {
-    ICHECK(!op->predicate.defined())
-        << "Rank-1 RSRAM unaligned tile load does not support predicated loads "
-           "yet.";
-
-    PrimExpr align = Integer(align_elems);
-    PrimExpr aligned_base =
-        analyzer_.Simplify(floordiv(normalized_index, align) * align);
-    PrimExpr offset = analyzer_.Simplify(floormod(normalized_index, align));
-    Array<PrimExpr> args = {BufferLoad(op->buffer, {aligned_base}), offset};
-    return Call(op->dtype, sunmmio_unaligned_tile_load(), args, {}, op->span);
-  }
-
   NormalizedAccessIndex NormalizeAccessIndex(const PrimExpr &index) {
     std::optional<ExecutionIndexInfo> execution_index =
         AnalyzeExecutionIndex(index);
@@ -216,23 +167,33 @@ private:
     return var;
   }
 
+  Optional<PrimExpr> RewritePredicate(Optional<PrimExpr> predicate) {
+    if (predicate.defined()) {
+      predicate = VisitExpr(predicate.value());
+    }
+    if (!tile_predicate_.defined()) {
+      return predicate;
+    }
+    if (!predicate.defined()) {
+      return tile_predicate_;
+    }
+    return And(predicate.value(), tile_predicate_.value());
+  }
+
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    Optional<PrimExpr> predicate = RewritePredicate(op->predicate);
+
     if (op->indices.size() == 1) {
       NormalizedAccessIndex normalized = NormalizeAccessIndex(op->indices[0]);
       Array<PrimExpr> indices = {normalized.index};
-      if (std::optional<int> align_elems =
-              GetRank1RsramUnalignedLoadAlignElems(op, normalized)) {
-        return MakeSunmmioUnalignedTileLoad(op, normalized.index,
-                                            align_elems.value());
-      }
-      return BufferLoad(op->buffer, indices, op->predicate, op->span);
+      return BufferLoad(op->buffer, indices, predicate, op->span);
     }
 
     Array<PrimExpr> indices;
     for (const PrimExpr &index : op->indices) {
       indices.push_back(NormalizeAccessIndex(index).index);
     }
-    return BufferLoad(op->buffer, indices, op->predicate, op->span);
+    return BufferLoad(op->buffer, indices, predicate, op->span);
   }
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
@@ -241,10 +202,7 @@ private:
       indices.push_back(NormalizeAccessIndex(index).index);
     }
     PrimExpr value = VisitExpr(op->value);
-    Optional<PrimExpr> predicate = op->predicate;
-    if (predicate.defined()) {
-      predicate = VisitExpr(predicate.value());
-    }
+    Optional<PrimExpr> predicate = RewritePredicate(op->predicate);
     return BufferStore(op->buffer, value, indices, predicate, op->span);
   }
 
@@ -252,7 +210,7 @@ private:
   std::vector<Var> exec_vars_;
   std::vector<Var> interior_vars_;
   Array<PrimExpr> tile_size_;
-  int rsram_align_bytes_{0};
+  Optional<PrimExpr> tile_predicate_;
   std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual> subst_map_;
   std::unordered_set<const VarNode *> exec_var_nodes_;
 };
@@ -284,17 +242,12 @@ class TilesLoopRewriter : public StmtExprMutator {
 public:
   static PrimFunc Rewrite(PrimFunc f) {
     TilesLoopRewriter rewriter;
-    rewriter.tile_processor_config_ =
-        GetSunmmioTileProcessorConfig(f->GetAttr<Target>("target"));
     f.CopyOnWrite()->body = rewriter(f->body);
     f = FinalTileAttrCleanupRewriter::Rewrite(std::move(f));
     return f;
   }
 
 private:
-  SunmmioTileProcessorConfig tile_processor_config_{
-      GetSunmmioTileProcessorConfig(ffi::Optional<Target>())};
-
   // ---- Predicates ----
 
   static bool IsTileExecutionLoop(const ForNode *loop) {
@@ -317,12 +270,42 @@ private:
     return Downcast<Array<PrimExpr>>((*it).second);
   }
 
+  static Optional<Array<PrimExpr>> GetTileDomain(const ForNode *loop) {
+    auto it = loop->annotations.find(attr::kTileDomain);
+    if (it == loop->annotations.end()) {
+      return std::nullopt;
+    }
+    return Downcast<Array<PrimExpr>>((*it).second);
+  }
+
   static Optional<Array<PrimExpr>> GetExecutionDomainAxes(const ForNode *loop) {
     auto it = loop->annotations.find(attr::tile_execution_domain_axes);
     if (it == loop->annotations.end()) {
       return std::nullopt;
     }
     return Downcast<Array<PrimExpr>>((*it).second);
+  }
+
+  static Optional<PrimExpr> MakeTilePredicate(
+      const std::vector<Var> &exec_vars, const std::vector<Var> &interior_vars,
+      const Array<PrimExpr> &tile_size, const Array<PrimExpr> &domain,
+      const Array<PrimExpr> &execution_domain_axes) {
+    ICHECK_EQ(exec_vars.size(), interior_vars.size());
+    ICHECK_EQ(exec_vars.size(), tile_size.size());
+    ICHECK_EQ(exec_vars.size(), execution_domain_axes.size());
+
+    Optional<PrimExpr> predicate;
+    int domain_rank = static_cast<int>(domain.size());
+    for (size_t axis = 0; axis < exec_vars.size(); ++axis) {
+      int domain_axis =
+          NormalizeDomainAxis(execution_domain_axes[axis], domain_rank);
+      PrimExpr logical_index =
+          exec_vars[axis] * tile_size[axis] + interior_vars[axis];
+      PrimExpr axis_predicate = logical_index < domain[domain_axis];
+      predicate = predicate.defined() ? And(predicate.value(), axis_predicate)
+                                      : axis_predicate;
+    }
+    return predicate;
   }
 
   Stmt UpdateBody(const ForNode *loop, Stmt new_body) {
@@ -515,8 +498,12 @@ private:
 
     Var ti = exec_loop->loop_var;
     Var ki("ki");
-    TileAccessRewriter access_rewriter(
-        {ti}, {ki}, tile_size, tile_processor_config_.rsram_align_bytes);
+    Array<PrimExpr> domain = GetTileDomain(scope_root.get()).value();
+    Array<PrimExpr> execution_domain_axes =
+        GetExecutionDomainAxes(scope_root.get()).value();
+    Optional<PrimExpr> tile_predicate =
+        MakeTilePredicate({ti}, {ki}, tile_size, domain, execution_domain_axes);
+    TileAccessRewriter access_rewriter({ti}, {ki}, tile_size, tile_predicate);
     Stmt tiled_body = access_rewriter.Rewrite(exec_loop->body);
 
     // Create annotated interior loop
@@ -575,9 +562,13 @@ private:
 
     Var ki("ki");
     Var kj("kj");
-    TileAccessRewriter access_rewriter(
-        {ti, tj}, {ki, kj}, tile_size,
-        tile_processor_config_.rsram_align_bytes);
+    Array<PrimExpr> domain = GetTileDomain(scope_root.get()).value();
+    Array<PrimExpr> execution_domain_axes =
+        GetExecutionDomainAxes(scope_root.get()).value();
+    Optional<PrimExpr> tile_predicate = MakeTilePredicate(
+        {ti, tj}, {ki, kj}, tile_size, domain, execution_domain_axes);
+    TileAccessRewriter access_rewriter({ti, tj}, {ki, kj}, tile_size,
+                                       tile_predicate);
     Stmt tiled_body = access_rewriter.Rewrite(innermost_exec->body);
 
     // Create annotated interior loops

@@ -12,6 +12,19 @@ def apply_tiles_lowering(mod):
     return tl.transform.LowerTilesLoop()(mod)
 
 
+def collect_access_predicates(func, buffer_name):
+    predicates = []
+
+    def visitor(stmt, predicates=predicates):
+        if isinstance(stmt, tir.BufferLoad) and stmt.buffer.name == buffer_name and stmt.predicate is not None:
+            predicates.append(stmt.predicate)
+        if isinstance(stmt, tir.BufferStore) and stmt.buffer.name == buffer_name and stmt.predicate is not None:
+            predicates.append(stmt.predicate)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visitor)
+    return predicates
+
+
 # =========================================================
 # Helpers: build kernels
 # =========================================================
@@ -268,6 +281,33 @@ def dot_mul_tiled_parallel_1d(M, block_M, tile_size, index_map, dtype="float16")
     return main
 
 
+def predicated_tiled_parallel_1d(M=16, block_M=16, tile_size=(4,), index_map=(-1,), dtype="float16"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((M,), dtype),
+        B: T.Tensor((M,), dtype),
+    ):
+        with T.Kernel(T.ceildiv(M, block_M), threads=128) as (bx,):
+            A_shared = T.alloc_shared((block_M,), dtype)
+            B_shared = T.alloc_shared((block_M,), dtype)
+
+            T.annotate_tileview(
+                {
+                    A_shared: make_tileview(A_shared, tile_size, index_map),
+                    B_shared: make_tileview(B_shared, tile_size, index_map),
+                }
+            )
+
+            T.copy(A[bx * block_M], A_shared)
+
+            for i in T.Tiles([block_M], parallel=True):
+                B_shared.vstore([i], A_shared.vload([i], predicate=i < block_M // 2), predicate=i < block_M // 2)
+
+            T.copy(B_shared, B[bx * block_M])
+
+    return main
+
+
 def copy_region_tiled_parallel_2d(tile_size=(8, 32), index_map=(-2, -1), dtype="float16"):
     @T.prim_func
     def main(
@@ -489,6 +529,78 @@ def test_tiles_loop_1d():
     assert any(contains_mul(e, tile_size[0]) for e in index_exprs), "Expected i * tile_size in rewritten indices"
 
 
+def test_tiles_loop_generates_tile_predicates_1d():
+    mod = IRModule.from_expr(
+        dot_mul_tiled_parallel_1d(
+            M=1024,
+            block_M=256,
+            tile_size=(32,),
+            index_map=(-1,),
+        ).with_attr("global_symbol", "main")
+    )
+
+    mod = apply_tiles_lowering(mod)
+
+    predicates = (
+        collect_access_predicates(mod["main"], "A_shared")
+        + collect_access_predicates(mod["main"], "B_shared")
+        + collect_access_predicates(mod["main"], "C_shared")
+    )
+
+    assert predicates, "Expected LowerTilesLoop to generate tile predicates"
+    assert all("ki" in str(predicate) for predicate in predicates)
+    assert all(("* 32" in str(predicate) or "*32" in str(predicate)) for predicate in predicates)
+    assert all("< 256" in str(predicate) or "<256" in str(predicate) for predicate in predicates)
+
+
+def test_tiles_loop_rewrites_predicated_buffer_accesses():
+    mod = IRModule.from_expr(predicated_tiled_parallel_1d().with_attr("global_symbol", "main"))
+
+    mod = apply_tiles_lowering(mod)
+
+    load_predicates = []
+    store_predicates = []
+
+    def collect_predicates(stmt, load_predicates=load_predicates, store_predicates=store_predicates):
+        if isinstance(stmt, tir.BufferLoad) and stmt.buffer.name == "A_shared" and stmt.predicate is not None:
+            load_predicates.append(stmt.predicate)
+        if isinstance(stmt, tir.BufferStore) and stmt.buffer.name == "B_shared" and stmt.predicate is not None:
+            store_predicates.append(stmt.predicate)
+
+    tvm.tir.stmt_functor.post_order_visit(mod["main"].body, collect_predicates)
+
+    assert load_predicates, "Expected predicated loads after LowerTilesLoop"
+    assert store_predicates, "Expected predicated stores after LowerTilesLoop"
+    rewritten_predicates = load_predicates + store_predicates
+    assert all(("ki" in str(predicate)) and ("* 4" in str(predicate) or "*4" in str(predicate)) for predicate in rewritten_predicates)
+    assert all(("< 8" in str(predicate) or "<8" in str(predicate)) for predicate in rewritten_predicates)
+    assert all(("< 16" in str(predicate) or "<16" in str(predicate)) for predicate in rewritten_predicates)
+
+
+def test_tiles_loop_generates_tile_predicates_2d():
+    mod = IRModule.from_expr(
+        dot_mul_tiled_parallel_2d(
+            M=512,
+            N=1024,
+            block_M=256,
+            block_N=128,
+            tile_size=(2, 128),
+            index_map=(-2, -1),
+        ).with_attr("global_symbol", "main")
+    )
+
+    mod = apply_tiles_lowering(mod)
+
+    predicates = collect_access_predicates(mod["main"], "C_shared")
+
+    assert predicates, "Expected LowerTilesLoop to generate 2D tile predicates"
+    assert all("ki" in str(predicate) and "kj" in str(predicate) for predicate in predicates)
+    assert all(("* 2" in str(predicate) or "*2" in str(predicate)) for predicate in predicates)
+    assert all(("* 128" in str(predicate) or "*128" in str(predicate)) for predicate in predicates)
+    assert all(("< 256" in str(predicate) or "<256" in str(predicate)) for predicate in predicates)
+    assert all(("< 128" in str(predicate) or "<128" in str(predicate)) for predicate in predicates)
+
+
 def test_tiles_loop_region_offset_rewrite():
     """Explicit tile domains should allow offset regions without a primary buffer."""
     mod = IRModule.from_expr(copy_region_tiled_parallel_2d().with_attr("global_symbol", "main"))
@@ -517,10 +629,13 @@ def test_tiles_loop_swapped_domain_binding_rewrite():
     mod = apply_tiles_lowering(mod)
 
     c_store_indices = []
+    c_store_predicates = []
 
-    def collect_c_indices(stmt, c_store_indices=c_store_indices):
+    def collect_c_indices(stmt, c_store_indices=c_store_indices, c_store_predicates=c_store_predicates):
         if isinstance(stmt, tir.BufferStore) and stmt.buffer.name == "C_shared":
             c_store_indices.append(stmt.indices)
+            if stmt.predicate is not None:
+                c_store_predicates.append(stmt.predicate)
 
     tvm.tir.stmt_functor.post_order_visit(mod["main"].body, collect_c_indices)
 
@@ -529,6 +644,14 @@ def test_tiles_loop_swapped_domain_binding_rewrite():
         ("i * 2" in str(indices[0]) or "i*2" in str(indices[0])) and ("j * 128" in str(indices[1]) or "j*128" in str(indices[1]))
         for indices in c_store_indices
     ), "Expected the rewritten indices to follow the inferred i/j axis binding rather than lexical loop order"
+    assert c_store_predicates, "Expected generated tile predicates on the rewritten store"
+    assert any(
+        ("i * 2" in str(predicate) or "i*2" in str(predicate))
+        and ("j * 128" in str(predicate) or "j*128" in str(predicate))
+        and ("< 256" in str(predicate) or "<256" in str(predicate))
+        and ("< 128" in str(predicate) or "<128" in str(predicate))
+        for predicate in c_store_predicates
+    ), "Expected the generated predicate to follow tile.execution_domain_axes"
 
 
 # =========================================================
