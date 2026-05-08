@@ -233,32 +233,118 @@ def test_infer_rank1_tileview_from_2d_buffer_access_with_outer_loop_var():
 # ---------------------------------------------------------
 # Test 3: Mixed-rank (1D + 2D) in same T.Tiles
 # ---------------------------------------------------------
-def test_infer_tileview_mixed_rank():
-    """Mixed-rank access where the 1D buffer violates RSRAM alignment.
+@pytest.mark.parametrize(
+    ("dtype", "expected_tile_size", "align_elems"),
+    [
+        ("float32", [4, 32], 16),
+        ("float16", [8, 32], 32),
+        ("bfloat16", [8, 32], 32),
+    ],
+)
+def test_infer_tileview_mixed_rank_load(dtype, expected_tile_size, align_elems):
+    """Mixed-rank rank-1 loads fall back to aligned load plus slice.
 
-    B_shared is 1D fp32, tiled along the height axis.  With 64-byte RSRAM
-    alignment the minimum tile width is 16 elements (64 bytes), but capacity
-    (128 elems) cannot fit a (16, 16) tile for the 2D buffers simultaneously.
-    The planner correctly rejects this.
+    B_shared is 1D and tiled along the height axis. Strict TileView search
+    rejects tile width 1 because 64-byte RSRAM alignment requires multiple
+    elements, then the fallback search allows the side load and TilesLoop
+    rewrites it to tl.sunmmio_unaligned_tile_load.
     """
     M, N = 128, 64
 
     @T.prim_func
     def main(
-        A: T.Tensor((M, N), "float32"),
-        B: T.Tensor((M,), "float32"),
-        C: T.Tensor((M, N), "float32"),
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M,), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(1, threads=128) as (bx,):
-            A_shared = T.alloc_shared((M, N), "float32")
-            B_shared = T.alloc_shared((M,), "float32")
-            C_shared = T.alloc_shared((M, N), "float32")
+            A_shared = T.alloc_shared((M, N), dtype)
+            B_shared = T.alloc_shared((M,), dtype)
+            C_shared = T.alloc_shared((M, N), dtype)
 
             T.copy(A[0:M, 0:N], A_shared)
 
-            # B_shared is 1D but used inside a 2D tile loop
             for i, j in T.Tiles([M, N], parallel=True):
                 C_shared[i, j] = A_shared[i, j] + B_shared[i]
+
+            T.copy(C_shared, C[0:M, 0:N])
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    assert_scope_plan(mod, expected_tile_size=expected_tile_size, expected_execution_domain_axes=[0, 1])
+    script = mod["main"].script()
+    assert "T.sunmmio_unaligned_tile_load" in script
+    assert f"// {align_elems} * {align_elems}" in script
+    assert f"% {align_elems}" in script
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_tile_size", "align_elems"),
+    [
+        ("float32", [4, 32], 16),
+        ("float16", [8, 32], 32),
+        ("bfloat16", [8, 32], 32),
+    ],
+)
+def test_infer_tileview_mixed_rank_load_inside_exp2(dtype, expected_tile_size, align_elems):
+    """Unaligned rank-1 load repair can feed another TIR PrimExpr op."""
+    M, N = 128, 64
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M,), dtype),
+        C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((M, N), dtype)
+            B_shared = T.alloc_shared((M,), dtype)
+            C_shared = T.alloc_shared((M, N), dtype)
+
+            T.copy(A[0:M, 0:N], A_shared)
+
+            for i, j in T.Tiles([M, N], parallel=True):
+                C_shared[i, j] = A_shared[i, j] + T.exp2(B_shared[i])
+
+            T.copy(C_shared, C[0:M, 0:N])
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    assert_scope_plan(mod, expected_tile_size=expected_tile_size, expected_execution_domain_axes=[0, 1])
+    script = mod["main"].script()
+    assert "T.exp2" in script
+    assert "T.sunmmio_unaligned_tile_load" in script
+    assert f"// {align_elems} * {align_elems}" in script
+    assert f"% {align_elems}" in script
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+def test_infer_tileview_mixed_rank_store_still_rejected(dtype):
+    """The alignment-relaxed fallback is load-only, not store repair."""
+    M, N = 128, 64
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M,), dtype),
+        C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((M, N), dtype)
+            B_shared = T.alloc_shared((M,), dtype)
+            C_shared = T.alloc_shared((M, N), dtype)
+
+            T.copy(A[0:M, 0:N], A_shared)
+
+            for i, j in T.Tiles([M, N], parallel=True):
+                B_shared[i] = A_shared[i, j]
+                C_shared[i, j] = A_shared[i, j]
 
             T.copy(C_shared, C[0:M, 0:N])
 

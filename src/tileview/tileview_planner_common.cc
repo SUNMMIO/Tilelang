@@ -211,7 +211,8 @@ TileView MakeTrailingTileView(const Array<PrimExpr> &buffer_shape,
 
 std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
     const Buffer &buffer, int exec_rank, const Map<Buffer, Layout> &layout_map,
-    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer) {
+    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
+    AlignmentMode alignment_mode) {
   ICHECK(exec_rank == 1 || exec_rank == 2)
       << "TileView planning expects execution rank 1 or 2, but got "
       << exec_rank << ".";
@@ -230,16 +231,14 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
   int width_dim = buffer_rank - 1;
   int height_dim = buffer_rank - 2;
 
-  // RSRAM DMA alignment: tile row width (in bytes) must be a multiple of
-  // rsram_align_bytes.  Compute the minimum tile width in elements.
+  // RSRAM access alignment: tile row width (in bytes) must be a multiple of
+  // rsram_align_bytes. Compute the minimum tile width in elements.
   // Use bit-level arithmetic so sub-byte dtypes (fp4, int4) are handled.
   int min_width_elems = 1;
-  if (config.rsram_align_bytes > 0 && buffer.scope() == kSunmmioScopeRSRAM) {
-    int element_bits = GetElementBits(buffer);
-    int align_bits = config.rsram_align_bytes * 8;
-    if (element_bits > 0 && align_bits >= element_bits) {
-      min_width_elems = align_bits / element_bits;
-    }
+  if (alignment_mode == AlignmentMode::kStrict &&
+      config.rsram_align_bytes > 0 && buffer.scope() == kSunmmioScopeRSRAM) {
+    min_width_elems =
+        GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, buffer->dtype);
   }
 
   // Prefix-partial step walk.
@@ -388,14 +387,11 @@ ValidateManualTrailingTileView(const Buffer &buffer, const TileView &manual_tv,
       << usage << " width " << width << " must divide trailing buffer dim "
       << buffer->shape[width_dim] << " for buffer " << buffer->name << ".";
 
-  // RSRAM DMA alignment check (works for sub-byte dtypes via bit arithmetic).
+  // RSRAM access alignment check (works for sub-byte dtypes via bit
+  // arithmetic).
   if (config.rsram_align_bytes > 0 && buffer.scope() == kSunmmioScopeRSRAM) {
-    int element_bits = GetElementBits(buffer);
-    int align_bits = config.rsram_align_bytes * 8;
-    int min_w = 1;
-    if (element_bits > 0 && align_bits >= element_bits) {
-      min_w = align_bits / element_bits;
-    }
+    int min_w =
+        GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, buffer->dtype);
     ICHECK_EQ(width % min_w, 0)
         << usage << " width " << width << " must be a multiple of " << min_w
         << " elements (" << config.rsram_align_bytes

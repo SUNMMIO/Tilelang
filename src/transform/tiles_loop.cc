@@ -11,7 +11,9 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include "../op/builtin.h"
 #include "../support/ffi_aliases.h"
+#include "../target/sunmmio_utils.h"
 #include "../tileview/tileview.h"
 #include "common/attr.h"
 
@@ -49,9 +51,9 @@ class TileAccessRewriter : public StmtExprMutator {
 public:
   TileAccessRewriter(const std::vector<Var> &exec_vars,
                      const std::vector<Var> &interior_vars,
-                     const Array<PrimExpr> &tile_size)
+                     const Array<PrimExpr> &tile_size, int rsram_align_bytes)
       : exec_vars_(exec_vars), interior_vars_(interior_vars),
-        tile_size_(tile_size) {
+        tile_size_(tile_size), rsram_align_bytes_(rsram_align_bytes) {
     ICHECK_EQ(exec_vars_.size(), interior_vars_.size());
     ICHECK_EQ(exec_vars_.size(), tile_size_.size());
 
@@ -65,30 +67,38 @@ public:
   Stmt Rewrite(const Stmt &stmt) { return VisitStmt(stmt); }
 
 private:
+  struct ExecutionIndexInfo {
+    int matched_axis;
+    PrimExpr base;
+  };
+
+  struct NormalizedAccessIndex {
+    PrimExpr index;
+    std::optional<int> matched_axis;
+  };
+
   bool UsesExecVar(const PrimExpr &expr) const {
     return UsesVar(expr, [this](const VarNode *node) {
       return exec_var_nodes_.count(node) != 0;
     });
   }
 
-  PrimExpr NormalizeAccessIndex(const PrimExpr &index) {
+  std::optional<ExecutionIndexInfo>
+  AnalyzeExecutionIndex(const PrimExpr &index) {
     if (!UsesExecVar(index)) {
-      return analyzer_.Simplify(index);
+      return std::nullopt;
     }
 
-    // LegalizeTilesLoop already proved that every execution-bound access is
-    // affine, unit-coefficient, and tile-aligned. Lowering only needs to
-    // recover the matched execution axis and fold the offset into tile space.
     Array<Var> exec_vars;
     for (const Var &var : exec_vars_) {
       exec_vars.push_back(var);
     }
 
     Array<PrimExpr> coeffs = arith::DetectLinearEquation(index, exec_vars);
-    ICHECK(!coeffs.empty()) << "Internal error: TilesLoop expected "
-                               "LegalizeTilesLoop to pre-validate "
-                               "an affine tile access index, but got "
-                            << index << ".";
+    ICHECK(!coeffs.empty())
+        << "Internal error: TilesLoop expected LegalizeTilesLoop to "
+           "pre-validate an affine tile access index, but got "
+        << index << ".";
 
     int matched_axis = -1;
     PrimExpr base = analyzer_.Simplify(coeffs[coeffs.size() - 1]);
@@ -118,7 +128,69 @@ private:
            "to bind one tile execution axis, but no matching axis was found "
            "for "
         << index << ".";
+    return ExecutionIndexInfo{matched_axis, base};
+  }
 
+  static int GetStaticPositiveInt(const PrimExpr &expr,
+                                  const char *diagnostic_name) {
+    const auto *imm = expr.as<IntImmNode>();
+    ICHECK(imm) << diagnostic_name << " must be a static integer, but got "
+                << expr << ".";
+    ICHECK_GT(imm->value, 0)
+        << diagnostic_name << " must be positive, but got " << expr << ".";
+    return static_cast<int>(imm->value);
+  }
+
+  std::optional<int> GetRank1RsramUnalignedLoadAlignElems(
+      const BufferLoadNode *op,
+      const NormalizedAccessIndex &access_index) const {
+    if (!access_index.matched_axis.has_value() || exec_vars_.size() != 2 ||
+        op->buffer.scope() != kSunmmioScopeRSRAM ||
+        op->buffer->shape.size() != 1 || op->indices.size() != 1) {
+      return std::nullopt;
+    }
+
+    int align_elems =
+        GetSunmmioRsramAlignmentElems(rsram_align_bytes_, op->buffer->dtype);
+    if (align_elems <= 1) {
+      return std::nullopt;
+    }
+
+    int tile_extent = GetStaticPositiveInt(
+        tile_size_[access_index.matched_axis.value()], "Tile extent");
+    if (tile_extent % align_elems == 0) {
+      return std::nullopt;
+    }
+    return align_elems;
+  }
+
+  PrimExpr MakeSunmmioUnalignedTileLoad(const BufferLoadNode *op,
+                                        const PrimExpr &normalized_index,
+                                        int align_elems) {
+    ICHECK(!op->predicate.defined())
+        << "Rank-1 RSRAM unaligned tile load does not support predicated loads "
+           "yet.";
+
+    PrimExpr align = Integer(align_elems);
+    PrimExpr aligned_base =
+        analyzer_.Simplify(floordiv(normalized_index, align) * align);
+    PrimExpr offset = analyzer_.Simplify(floormod(normalized_index, align));
+    Array<PrimExpr> args = {BufferLoad(op->buffer, {aligned_base}), offset};
+    return Call(op->dtype, sunmmio_unaligned_tile_load(), args, {}, op->span);
+  }
+
+  NormalizedAccessIndex NormalizeAccessIndex(const PrimExpr &index) {
+    std::optional<ExecutionIndexInfo> execution_index =
+        AnalyzeExecutionIndex(index);
+    if (!execution_index.has_value()) {
+      return {analyzer_.Simplify(index), std::nullopt};
+    }
+
+    // LegalizeTilesLoop already proved that every execution-bound access is
+    // affine, unit-coefficient, and tile-aligned. Lowering only needs to
+    // recover the matched execution axis and fold the offset into tile space.
+    int matched_axis = execution_index->matched_axis;
+    PrimExpr base = execution_index->base;
     PrimExpr tile_extent = tile_size_[matched_axis];
     PrimExpr remainder = analyzer_.Simplify(floormod(base, tile_extent));
     ICHECK(analyzer_.CanProve(remainder == make_zero(remainder.dtype())))
@@ -131,7 +203,8 @@ private:
     PrimExpr tile_offset = analyzer_.Simplify(floordiv(base, tile_extent));
     PrimExpr tile_coord =
         analyzer_.Simplify(exec_vars_[matched_axis] + tile_offset);
-    return tile_coord * tile_extent + interior_vars_[matched_axis];
+    return {tile_coord * tile_extent + interior_vars_[matched_axis],
+            matched_axis};
   }
 
   PrimExpr VisitExpr_(const VarNode *op) final {
@@ -144,9 +217,20 @@ private:
   }
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    if (op->indices.size() == 1) {
+      NormalizedAccessIndex normalized = NormalizeAccessIndex(op->indices[0]);
+      Array<PrimExpr> indices = {normalized.index};
+      if (std::optional<int> align_elems =
+              GetRank1RsramUnalignedLoadAlignElems(op, normalized)) {
+        return MakeSunmmioUnalignedTileLoad(op, normalized.index,
+                                            align_elems.value());
+      }
+      return BufferLoad(op->buffer, indices, op->predicate, op->span);
+    }
+
     Array<PrimExpr> indices;
     for (const PrimExpr &index : op->indices) {
-      indices.push_back(NormalizeAccessIndex(index));
+      indices.push_back(NormalizeAccessIndex(index).index);
     }
     return BufferLoad(op->buffer, indices, op->predicate, op->span);
   }
@@ -154,7 +238,7 @@ private:
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     Array<PrimExpr> indices;
     for (const PrimExpr &index : op->indices) {
-      indices.push_back(NormalizeAccessIndex(index));
+      indices.push_back(NormalizeAccessIndex(index).index);
     }
     PrimExpr value = VisitExpr(op->value);
     Optional<PrimExpr> predicate = op->predicate;
@@ -168,6 +252,7 @@ private:
   std::vector<Var> exec_vars_;
   std::vector<Var> interior_vars_;
   Array<PrimExpr> tile_size_;
+  int rsram_align_bytes_{0};
   std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual> subst_map_;
   std::unordered_set<const VarNode *> exec_var_nodes_;
 };
@@ -199,12 +284,17 @@ class TilesLoopRewriter : public StmtExprMutator {
 public:
   static PrimFunc Rewrite(PrimFunc f) {
     TilesLoopRewriter rewriter;
+    rewriter.tile_processor_config_ =
+        GetSunmmioTileProcessorConfig(f->GetAttr<Target>("target"));
     f.CopyOnWrite()->body = rewriter(f->body);
     f = FinalTileAttrCleanupRewriter::Rewrite(std::move(f));
     return f;
   }
 
 private:
+  SunmmioTileProcessorConfig tile_processor_config_{
+      GetSunmmioTileProcessorConfig(ffi::Optional<Target>())};
+
   // ---- Predicates ----
 
   static bool IsTileExecutionLoop(const ForNode *loop) {
@@ -425,7 +515,8 @@ private:
 
     Var ti = exec_loop->loop_var;
     Var ki("ki");
-    TileAccessRewriter access_rewriter({ti}, {ki}, tile_size);
+    TileAccessRewriter access_rewriter(
+        {ti}, {ki}, tile_size, tile_processor_config_.rsram_align_bytes);
     Stmt tiled_body = access_rewriter.Rewrite(exec_loop->body);
 
     // Create annotated interior loop
@@ -484,7 +575,9 @@ private:
 
     Var ki("ki");
     Var kj("kj");
-    TileAccessRewriter access_rewriter({ti, tj}, {ki, kj}, tile_size);
+    TileAccessRewriter access_rewriter(
+        {ti, tj}, {ki, kj}, tile_size,
+        tile_processor_config_.rsram_align_bytes);
     Stmt tiled_body = access_rewriter.Rewrite(innermost_exec->body);
 
     // Create annotated interior loops

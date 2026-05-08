@@ -56,6 +56,17 @@ struct TrailingTilePattern {
 };
 
 /*!
+ * \brief Controls whether TileView planning enforces RSRAM width alignment.
+ *
+ * Relaxed mode is used only after strict plan search fails; it permits
+ * eligible rank-1 side loads to be repaired later by aligned load plus slice.
+ */
+enum class AlignmentMode {
+  kStrict,
+  kRelaxed,
+};
+
+/*!
  * \brief Return the integer value of a static `PrimExpr`, or `fallback`
  * otherwise.
  *
@@ -173,7 +184,8 @@ TileView MakeTrailingTileView(const Array<PrimExpr> &buffer_shape,
  */
 std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
     const Buffer &buffer, int exec_rank, const Map<Buffer, Layout> &layout_map,
-    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer);
+    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
+    AlignmentMode alignment_mode = AlignmentMode::kStrict);
 
 /*!
  * \brief Validate a manual trailing TileView and normalize it into a shared

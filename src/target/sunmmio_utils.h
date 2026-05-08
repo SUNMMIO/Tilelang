@@ -13,6 +13,7 @@
 #include <tvm/ffi/string.h>
 #include <tvm/ir/expr.h>
 #include <tvm/runtime/data_type.h>
+#include <tvm/runtime/logging.h>
 #include <tvm/target/target.h>
 
 namespace tvm {
@@ -29,7 +30,7 @@ struct SunmmioTileProcessorConfig {
   int register_bits;
   int block_height;
   int block_width;
-  /// Minimum byte-alignment for RSRAM tile rows (DMA constraint).
+  /// Minimum byte-alignment for RSRAM vector memory accesses.
   int rsram_align_bytes;
 };
 
@@ -54,6 +55,28 @@ SunmmioMeshConfig GetSunmmioMeshConfig(Target target);
 inline bool IsSunmmioSramScope(const ffi::String &scope) {
   return scope == kSunmmioScopeASRAM || scope == kSunmmioScopeWSRAM ||
          scope == kSunmmioScopeRSRAM;
+}
+
+/*!
+ * \brief Convert an RSRAM byte-alignment requirement into element count.
+ */
+inline int GetSunmmioRsramAlignmentElems(int rsram_align_bytes,
+                                         DataType dtype) {
+  if (rsram_align_bytes <= 0) {
+    return 1;
+  }
+  ICHECK_EQ(dtype.lanes(), 1)
+      << "Sunmmio RSRAM alignment expects scalar element dtypes, but got "
+      << dtype << ".";
+  int element_bits = dtype.bits();
+  int align_bits = rsram_align_bytes * 8;
+  if (align_bits <= element_bits) {
+    return 1;
+  }
+  ICHECK_EQ(align_bits % element_bits, 0)
+      << "RSRAM alignment " << rsram_align_bytes
+      << " bytes is not divisible by element bit-width " << element_bits << ".";
+  return align_bits / element_bits;
 }
 
 } // namespace tl
