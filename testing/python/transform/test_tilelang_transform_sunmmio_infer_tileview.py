@@ -85,6 +85,17 @@ def collect_loads(func, buffer_name):
     return loads
 
 
+def collect_stores(func, buffer_name):
+    stores = []
+
+    def visit(stmt, stores=stores):
+        if isinstance(stmt, tir.BufferStore) and stmt.buffer.name == buffer_name:
+            stores.append(stmt)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return stores
+
+
 def assert_preserved_mixed_rank_load(mod, expected_tile_size):
     script = mod["main"].script()
     assert "T.sunmmio_unaligned_tile_load" not in script
@@ -582,7 +593,7 @@ def test_infer_tileview_2d_blockwise_fp32():
 
 
 def test_infer_tileview_blockwise_small_height():
-    """Blockwise candidates should clamp height by the explicit tile domain."""
+    """Blockwise candidates may exceed a small domain and rely on masks."""
     domain_M, buffer_M, N = 4, 32, 128
 
     @T.prim_func
@@ -616,7 +627,14 @@ def test_infer_tileview_blockwise_small_height():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[4, 32], expected_execution_domain_axes=[0, 1])
+    assert_scope_plan(mod, expected_tile_size=[8, 32], expected_execution_domain_axes=[0, 1])
+
+    stores = collect_stores(mod["main"], "C_shared")
+    assert stores, "Expected lowered C_shared stores"
+    assert all(store.predicate is not None for store in stores)
+    assert any("* 8" in str(store.indices[0]) or "*8" in str(store.indices[0]) for store in stores)
+    assert all("< 4" in str(store.predicate) or "<4" in str(store.predicate) for store in stores)
+    assert all("< 128" in str(store.predicate) or "<128" in str(store.predicate) for store in stores)
 
 
 def test_infer_tileview_rowmajor_wide_row_uses_single_row_tile():

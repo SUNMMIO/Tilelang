@@ -35,10 +35,8 @@ class TileView(Node):
             Which dimensions of the buffer are tiled.
             Supports negative indices (e.g., -1 for last dim, -2 for second to last).
 
-        Raises
-        ------
-        RuntimeError
-            If buffer dimensions are not divisible by tile dimensions.
+        Tail tiles are represented explicitly: tiled dimensions use ceildiv,
+        and later lowering attaches predicates to the resulting accesses.
         """
         self.__init_handle_by_constructor__(_ffi_api.TileView, buffer_shape, tile_shape, index_map)
 
@@ -84,7 +82,8 @@ class TileView(Node):
         Get the tiled buffer shape.
 
         The tiled shape is computed by replacing each tiled dimension with
-        num_tiles (buffer_dim / tile_dim), then appending the tile dimensions.
+        num_tiles (ceildiv(buffer_dim, tile_dim)), then appending the tile
+        dimensions.
 
         For example, buffer_shape=(64, 128), tile_shape=(16, 32), index_map=(-2, -1)
         results in tiled_buffer_shape=(4, 4, 16, 32).
@@ -151,11 +150,6 @@ def make_tileview(buffer: Buffer | BufferLoad | BufferRegion, tile_shape, index_
     -------
     TileView
         A TileView object.
-
-    Raises
-    ------
-    RuntimeError
-        If buffer dimensions are not divisible by tile dimensions.
 
     Examples
     --------

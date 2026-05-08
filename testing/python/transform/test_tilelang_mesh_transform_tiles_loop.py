@@ -25,6 +25,17 @@ def collect_access_predicates(func, buffer_name):
     return predicates
 
 
+def collect_tile_execution_loops(func):
+    loops = {}
+
+    def visitor(stmt, loops=loops):
+        if isinstance(stmt, tir.For) and stmt.annotations and "tile.execution_axis" in stmt.annotations:
+            loops[int(stmt.annotations["tile.execution_axis"])] = stmt
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visitor)
+    return loops
+
+
 # =========================================================
 # Helpers: build kernels
 # =========================================================
@@ -553,6 +564,26 @@ def test_tiles_loop_generates_tile_predicates_1d():
     assert all("< 256" in str(predicate) or "<256" in str(predicate) for predicate in predicates)
 
 
+def test_legalize_tiles_loop_uses_ceildiv_for_1d_tail_domain():
+    mod = IRModule.from_expr(
+        dot_mul_tiled_parallel_1d(
+            M=250,
+            block_M=250,
+            tile_size=(32,),
+            index_map=(-1,),
+        ).with_attr("global_symbol", "main")
+    )
+
+    mod = apply_tiles_lowering(mod)
+
+    exec_loops = collect_tile_execution_loops(mod["main"])
+    assert int(exec_loops[0].extent) == 8
+
+    predicates = collect_access_predicates(mod["main"], "C_shared")
+    assert predicates, "Expected tail tile predicates on non-divisible 1D domain"
+    assert all(("< 250" in str(predicate) or "<250" in str(predicate)) for predicate in predicates)
+
+
 def test_tiles_loop_rewrites_predicated_buffer_accesses():
     mod = IRModule.from_expr(predicated_tiled_parallel_1d().with_attr("global_symbol", "main"))
 
@@ -598,6 +629,30 @@ def test_tiles_loop_generates_tile_predicates_2d():
     assert all(("* 2" in str(predicate) or "*2" in str(predicate)) for predicate in predicates)
     assert all(("* 128" in str(predicate) or "*128" in str(predicate)) for predicate in predicates)
     assert all(("< 256" in str(predicate) or "<256" in str(predicate)) for predicate in predicates)
+    assert all(("< 128" in str(predicate) or "<128" in str(predicate)) for predicate in predicates)
+
+
+def test_legalize_tiles_loop_uses_ceildiv_for_2d_tail_domain():
+    mod = IRModule.from_expr(
+        dot_mul_tiled_parallel_2d(
+            M=255,
+            N=128,
+            block_M=255,
+            block_N=128,
+            tile_size=(2, 128),
+            index_map=(-2, -1),
+        ).with_attr("global_symbol", "main")
+    )
+
+    mod = apply_tiles_lowering(mod)
+
+    exec_loops = collect_tile_execution_loops(mod["main"])
+    assert int(exec_loops[0].extent) == 128
+    assert int(exec_loops[1].extent) == 1
+
+    predicates = collect_access_predicates(mod["main"], "C_shared")
+    assert predicates, "Expected tail tile predicates on non-divisible 2D domain"
+    assert all(("< 255" in str(predicate) or "<255" in str(predicate)) for predicate in predicates)
     assert all(("< 128" in str(predicate) or "<128" in str(predicate)) for predicate in predicates)
 
 

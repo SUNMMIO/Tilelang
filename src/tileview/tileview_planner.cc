@@ -149,13 +149,6 @@ void AddRank1Candidate(std::vector<AccessTileCandidate> *candidates,
     return;
   }
 
-  if (!CanProveDivisible(analyzer, buffer->shape[mapped_dim], tile_width)) {
-    ICHECK(!strict_checks) << "Buffer dimension " << mapped_dim << " of buffer "
-                           << buffer->name << " is not divisible by tile width "
-                           << tile_width << ".";
-    return;
-  }
-
   if (strict_checks) {
     RequireDivisible(analyzer, binding.offset, tile_width, indices[mapped_dim],
                      buffer);
@@ -197,30 +190,10 @@ void AddRank2Candidate(std::vector<AccessTileCandidate> *candidates,
     return;
   }
 
-  if (!CanProveDivisible(analyzer, buffer->shape[mapped_width_dim],
-                         tile_width)) {
-    ICHECK(!strict_checks) << "Buffer width dimension " << mapped_width_dim
-                           << " of buffer " << buffer->name
-                           << " is not divisible by tile width " << tile_width
-                           << ".";
-    return;
-  }
-
   if (strict_checks) {
     RequireDivisible(analyzer, width_binding.offset, tile_width,
                      indices[mapped_width_dim], buffer);
   } else if (!CanProveDivisible(analyzer, width_binding.offset, tile_width)) {
-    return;
-  }
-
-  if (strict_checks) {
-    ICHECK(CanProveDivisible(analyzer, buffer->shape[mapped_height_dim],
-                             tile_height))
-        << "Buffer height dimension " << mapped_height_dim << " of buffer "
-        << buffer->name << " is not divisible by tile height " << tile_height
-        << ".";
-  } else if (!CanProveDivisible(analyzer, buffer->shape[mapped_height_dim],
-                                tile_height)) {
     return;
   }
 
@@ -546,12 +519,6 @@ TrySelectPlan(const Array<PrimExpr> &domain,
     const auto &exec_domain_axes = plan_candidate.execution_domain_axes;
     int tile_height = plan_candidate.tile_shape[0];
     int tile_width = plan_candidate.tile_shape[1];
-
-    if (!CanProveDivisible(analyzer, domain[exec_domain_axes[0]],
-                           tile_height) ||
-        !CanProveDivisible(analyzer, domain[exec_domain_axes[1]], tile_width)) {
-      continue;
-    }
 
     bool all_supported = true;
     for (const auto &access : accesses) {
