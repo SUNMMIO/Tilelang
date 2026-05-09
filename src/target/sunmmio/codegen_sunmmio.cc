@@ -1357,6 +1357,25 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
                         CallBucketName(bucket), op->dtype, ret_ty);
 }
 
+/*!
+ * \brief Backend input invariants for generic SunMMIO codegen.
+ *
+ * This backend is not a generic TIR code generator. It expects the input to
+ * have already been lowered into a SunMMIO-oriented form where tiled buffers
+ * are accessed through tile-aware paths rather than generic element-wise
+ * BufferLoad/BufferStore. Nodes such as BlockRealize, BufferRealize, and
+ * DeclBuffer should normally have been eliminated or lowered before reaching
+ * this layer. Likewise, generic BufferLoad/BufferStore on tiled buffers are
+ * treated as pipeline violations unless intercepted by a dedicated tile-based
+ * lowering path earlier in the pipeline.
+ *
+ * The generic SunMMIO codegen path is expected to handle control flow, scalar
+ * and index expressions, loop structure, target intrinsics, and tile-aware
+ * operations that have already been normalized into backend-expected forms.
+ * Reaching unsupported structural nodes here should fail loudly so pipeline
+ * regressions are caught early.
+ */
+
 [[noreturn]] void
 CodeGenTileLangSunMMIO::UnsupportedStmt(const Object *op,
                                         const std::string &detail) const {
