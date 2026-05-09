@@ -25,6 +25,30 @@ def collect_access_predicates(func, buffer_name):
     return predicates
 
 
+def collect_unpredicated_accesses(func, buffer_name):
+    accesses = []
+
+    def visitor(stmt, accesses=accesses):
+        if isinstance(stmt, tir.BufferLoad) and stmt.buffer.name == buffer_name and stmt.predicate is None:
+            accesses.append(stmt)
+        if isinstance(stmt, tir.BufferStore) and stmt.buffer.name == buffer_name and stmt.predicate is None:
+            accesses.append(stmt)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visitor)
+    return accesses
+
+
+def collect_if_conditions(func):
+    conditions = []
+
+    def visitor(stmt, conditions=conditions):
+        if isinstance(stmt, tir.IfThenElse):
+            conditions.append(stmt.condition)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visitor)
+    return conditions
+
+
 def collect_tile_execution_loops(func):
     loops = {}
 
@@ -540,7 +564,7 @@ def test_tiles_loop_1d():
     assert any(contains_mul(e, tile_size[0]) for e in index_exprs), "Expected i * tile_size in rewritten indices"
 
 
-def test_tiles_loop_generates_tile_predicates_1d():
+def test_tiles_loop_omits_tile_predicates_for_divisible_1d():
     mod = IRModule.from_expr(
         dot_mul_tiled_parallel_1d(
             M=1024,
@@ -558,10 +582,9 @@ def test_tiles_loop_generates_tile_predicates_1d():
         + collect_access_predicates(mod["main"], "C_shared")
     )
 
-    assert predicates, "Expected LowerTilesLoop to generate tile predicates"
-    assert all("ki" in str(predicate) for predicate in predicates)
-    assert all(("* 32" in str(predicate) or "*32" in str(predicate)) for predicate in predicates)
-    assert all("< 256" in str(predicate) or "<256" in str(predicate) for predicate in predicates)
+    assert not predicates, "Expected divisible 1D tiles to use unpredicated accesses"
+    assert collect_unpredicated_accesses(mod["main"], "C_shared")
+    assert not collect_if_conditions(mod["main"]), "Expected no full/tail branch for divisible 1D tiles"
 
 
 def test_legalize_tiles_loop_uses_ceildiv_for_1d_tail_domain():
@@ -582,6 +605,10 @@ def test_legalize_tiles_loop_uses_ceildiv_for_1d_tail_domain():
     predicates = collect_access_predicates(mod["main"], "C_shared")
     assert predicates, "Expected tail tile predicates on non-divisible 1D domain"
     assert all(("< 250" in str(predicate) or "<250" in str(predicate)) for predicate in predicates)
+    assert collect_unpredicated_accesses(mod["main"], "C_shared"), "Expected full-tile branch to use unpredicated stores"
+    if_conditions = collect_if_conditions(mod["main"])
+    assert if_conditions, "Expected scalar full/tail branch for partially divisible 1D tiles"
+    assert any("i <= 6" in str(condition) or "i<=6" in str(condition) for condition in if_conditions)
 
 
 def test_tiles_loop_rewrites_predicated_buffer_accesses():
@@ -605,10 +632,10 @@ def test_tiles_loop_rewrites_predicated_buffer_accesses():
     rewritten_predicates = load_predicates + store_predicates
     assert all(("ki" in str(predicate)) and ("* 4" in str(predicate) or "*4" in str(predicate)) for predicate in rewritten_predicates)
     assert all(("< 8" in str(predicate) or "<8" in str(predicate)) for predicate in rewritten_predicates)
-    assert all(("< 16" in str(predicate) or "<16" in str(predicate)) for predicate in rewritten_predicates)
+    assert all(("< 16" not in str(predicate) and "<16" not in str(predicate)) for predicate in rewritten_predicates)
 
 
-def test_tiles_loop_generates_tile_predicates_2d():
+def test_tiles_loop_omits_tile_predicates_for_divisible_2d():
     mod = IRModule.from_expr(
         dot_mul_tiled_parallel_2d(
             M=512,
@@ -624,12 +651,9 @@ def test_tiles_loop_generates_tile_predicates_2d():
 
     predicates = collect_access_predicates(mod["main"], "C_shared")
 
-    assert predicates, "Expected LowerTilesLoop to generate 2D tile predicates"
-    assert all("ki" in str(predicate) and "kj" in str(predicate) for predicate in predicates)
-    assert all(("* 2" in str(predicate) or "*2" in str(predicate)) for predicate in predicates)
-    assert all(("* 128" in str(predicate) or "*128" in str(predicate)) for predicate in predicates)
-    assert all(("< 256" in str(predicate) or "<256" in str(predicate)) for predicate in predicates)
-    assert all(("< 128" in str(predicate) or "<128" in str(predicate)) for predicate in predicates)
+    assert not predicates, "Expected divisible 2D tiles to use unpredicated accesses"
+    assert collect_unpredicated_accesses(mod["main"], "C_shared")
+    assert not collect_if_conditions(mod["main"]), "Expected no full/tail branch for divisible 2D tiles"
 
 
 def test_legalize_tiles_loop_uses_ceildiv_for_2d_tail_domain():
@@ -653,7 +677,11 @@ def test_legalize_tiles_loop_uses_ceildiv_for_2d_tail_domain():
     predicates = collect_access_predicates(mod["main"], "C_shared")
     assert predicates, "Expected tail tile predicates on non-divisible 2D domain"
     assert all(("< 255" in str(predicate) or "<255" in str(predicate)) for predicate in predicates)
-    assert all(("< 128" in str(predicate) or "<128" in str(predicate)) for predicate in predicates)
+    assert all(("< 128" not in str(predicate) and "<128" not in str(predicate)) for predicate in predicates)
+    assert collect_unpredicated_accesses(mod["main"], "C_shared"), "Expected full-tile branch to use unpredicated stores"
+    if_conditions = collect_if_conditions(mod["main"])
+    assert if_conditions, "Expected scalar full/tail branch for partially divisible 2D tiles"
+    assert any("i <= 126" in str(condition) or "i<=126" in str(condition) for condition in if_conditions)
 
 
 def test_tiles_loop_region_offset_rewrite():
@@ -699,14 +727,7 @@ def test_tiles_loop_swapped_domain_binding_rewrite():
         ("i * 2" in str(indices[0]) or "i*2" in str(indices[0])) and ("j * 128" in str(indices[1]) or "j*128" in str(indices[1]))
         for indices in c_store_indices
     ), "Expected the rewritten indices to follow the inferred i/j axis binding rather than lexical loop order"
-    assert c_store_predicates, "Expected generated tile predicates on the rewritten store"
-    assert any(
-        ("i * 2" in str(predicate) or "i*2" in str(predicate))
-        and ("j * 128" in str(predicate) or "j*128" in str(predicate))
-        and ("< 256" in str(predicate) or "<256" in str(predicate))
-        and ("< 128" in str(predicate) or "<128" in str(predicate))
-        for predicate in c_store_predicates
-    ), "Expected the generated predicate to follow tile.execution_domain_axes"
+    assert not c_store_predicates, "Expected divisible swapped-domain tiles to use unpredicated stores"
 
 
 # =========================================================

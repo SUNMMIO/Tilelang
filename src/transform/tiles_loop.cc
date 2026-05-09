@@ -286,26 +286,102 @@ private:
     return Downcast<Array<PrimExpr>>((*it).second);
   }
 
-  static Optional<PrimExpr> MakeTilePredicate(
+  static Optional<PrimExpr> Conjoin(Optional<PrimExpr> predicate,
+                                    PrimExpr clause) {
+    return predicate.defined() ? And(predicate.value(), clause) : clause;
+  }
+
+  struct TilePredicateInfo {
+    // No access_predicate: every tile is in bounds; emit the unpredicated body.
+    // access_predicate without full_tile_predicate: emit only the predicated
+    // body. Both predicates: emit scalar full/tail control flow.
+    Optional<PrimExpr> access_predicate;
+    Optional<PrimExpr> full_tile_predicate;
+  };
+
+  TilePredicateInfo MakeTilePredicateInfo(
       const std::vector<Var> &exec_vars, const std::vector<Var> &interior_vars,
+      const std::vector<const ForNode *> &axis_loops,
       const Array<PrimExpr> &tile_size, const Array<PrimExpr> &domain,
       const Array<PrimExpr> &execution_domain_axes) {
     ICHECK_EQ(exec_vars.size(), interior_vars.size());
+    ICHECK_EQ(exec_vars.size(), axis_loops.size());
     ICHECK_EQ(exec_vars.size(), tile_size.size());
     ICHECK_EQ(exec_vars.size(), execution_domain_axes.size());
 
-    Optional<PrimExpr> predicate;
+    TilePredicateInfo info;
+    bool may_emit_full_tile_branch = true;
+
     int domain_rank = static_cast<int>(domain.size());
     for (size_t axis = 0; axis < exec_vars.size(); ++axis) {
       int domain_axis =
           NormalizeDomainAxis(execution_domain_axes[axis], domain_rank);
+      const ForNode *axis_loop = axis_loops[axis];
+      ICHECK(axis_loop != nullptr)
+          << "TilesLoop expected one execution loop per tile axis.";
+
+      PrimExpr tile_extent = tile_size[axis];
+      PrimExpr domain_extent = domain[domain_axis];
+
+      // If the last planned tile is still inside the logical domain, this axis
+      // cannot create out-of-bounds accesses.
+      PrimExpr last_tile_end = analyzer_.Simplify(
+          (axis_loop->min + axis_loop->extent) * tile_extent);
+      if (analyzer_.CanProve(last_tile_end <= domain_extent)) {
+        continue;
+      }
+
+      // This axis has a tail tile. Every access in the tile body must be
+      // guarded by the per-element logical coordinate on this axis.
       PrimExpr logical_index =
-          exec_vars[axis] * tile_size[axis] + interior_vars[axis];
-      PrimExpr axis_predicate = logical_index < domain[domain_axis];
-      predicate = predicate.defined() ? And(predicate.value(), axis_predicate)
-                                      : axis_predicate;
+          exec_vars[axis] * tile_extent + interior_vars[axis];
+      info.access_predicate =
+          Conjoin(info.access_predicate, logical_index < domain_extent);
+
+      if (!may_emit_full_tile_branch) {
+        continue;
+      }
+
+      // If the first tile in this loop is already partial, there is no
+      // unpredicated full-tile case for the whole tile body.
+      PrimExpr first_tile_end =
+          analyzer_.Simplify((axis_loop->min + Integer(1)) * tile_extent);
+      if (analyzer_.CanProve(first_tile_end > domain_extent)) {
+        may_emit_full_tile_branch = false;
+        info.full_tile_predicate = std::nullopt;
+        continue;
+      }
+
+      // Otherwise, this axis contributes one scalar condition for choosing
+      // between the unpredicated full-tile body and the predicated tail body.
+      PrimExpr current_tile_end =
+          analyzer_.Simplify(exec_vars[axis] * tile_extent + tile_extent);
+      info.full_tile_predicate =
+          Conjoin(info.full_tile_predicate, current_tile_end <= domain_extent);
     }
-    return predicate;
+
+    if (!info.access_predicate.defined()) {
+      return info;
+    }
+
+    if (!may_emit_full_tile_branch) {
+      info.full_tile_predicate = std::nullopt;
+      return info;
+    }
+
+    ICHECK(info.full_tile_predicate.defined())
+        << "TilesLoop expected a scalar full-tile predicate when some full "
+           "tiles exist.";
+    PrimExpr predicate = analyzer_.Simplify(info.full_tile_predicate.value());
+    if (analyzer_.CanProve(predicate)) {
+      return TilePredicateInfo{};
+    }
+    if (analyzer_.CanProve(!predicate)) {
+      info.full_tile_predicate = std::nullopt;
+      return info;
+    }
+    info.full_tile_predicate = predicate;
+    return info;
   }
 
   Stmt UpdateBody(const ForNode *loop, Stmt new_body) {
@@ -441,6 +517,37 @@ private:
     return loop;
   }
 
+  template <typename BuildBody>
+  static Stmt BuildFullOrTailTileBody(const TilePredicateInfo &predicate_info,
+                                      BuildBody build_body) {
+    if (!predicate_info.access_predicate.defined()) {
+      return build_body(std::nullopt);
+    }
+    Stmt tail_body = build_body(predicate_info.access_predicate);
+    if (!predicate_info.full_tile_predicate.defined()) {
+      return tail_body;
+    }
+    return IfThenElse(predicate_info.full_tile_predicate.value(),
+                      build_body(std::nullopt), tail_body);
+  }
+
+  static Stmt Build1DInteriorBody(Var ki, const Array<PrimExpr> &tile_size,
+                                  Stmt body) {
+    return MakeTileInteriorLoop(ki, tile_size[0], ForKind::kVectorized, body,
+                                /*axis=*/0);
+  }
+
+  static Stmt Build2DInteriorBody(Var ki, Var kj,
+                                  const Array<PrimExpr> &tile_size, Stmt body) {
+    For kj_loop =
+        MakeTileInteriorLoop(kj, tile_size[1], ForKind::kVectorized, body,
+                             /*axis=*/1);
+    return MakeTileInteriorLoop(ki, tile_size[0], ForKind::kSerial, kj_loop,
+                                /*axis=*/0);
+  }
+
+  arith::Analyzer analyzer_;
+
   // ---- Main rewrite ----
 
   Stmt VisitStmt_(const ForNode *loop) final {
@@ -501,19 +608,18 @@ private:
     Array<PrimExpr> domain = GetTileDomain(scope_root.get()).value();
     Array<PrimExpr> execution_domain_axes =
         GetExecutionDomainAxes(scope_root.get()).value();
-    Optional<PrimExpr> tile_predicate =
-        MakeTilePredicate({ti}, {ki}, tile_size, domain, execution_domain_axes);
-    TileAccessRewriter access_rewriter({ti}, {ki}, tile_size, tile_predicate);
-    Stmt tiled_body = access_rewriter.Rewrite(exec_loop->body);
-
-    // Create annotated interior loop
-    For ki_loop =
-        MakeTileInteriorLoop(ki, tile_size[0], ForKind::kVectorized, tiled_body,
-                             /*axis=*/0);
+    TilePredicateInfo predicate_info = MakeTilePredicateInfo(
+        {ti}, {ki}, {exec_loop}, tile_size, domain, execution_domain_axes);
+    auto build_body = [&](Optional<PrimExpr> tile_predicate) {
+      TileAccessRewriter access_rewriter({ti}, {ki}, tile_size,
+                                         std::move(tile_predicate));
+      return Build1DInteriorBody(ki, tile_size,
+                                 access_rewriter.Rewrite(exec_loop->body));
+    };
 
     For new_exec = ffi::GetRef<For>(exec_loop);
     auto *n = new_exec.CopyOnWrite();
-    n->body = ki_loop;
+    n->body = BuildFullOrTailTileBody(predicate_info, build_body);
     n->annotations.Set(attr::tile_scope_entry, Integer(1));
 
     if (exec_loop == scope_root.get()) {
@@ -565,23 +671,20 @@ private:
     Array<PrimExpr> domain = GetTileDomain(scope_root.get()).value();
     Array<PrimExpr> execution_domain_axes =
         GetExecutionDomainAxes(scope_root.get()).value();
-    Optional<PrimExpr> tile_predicate = MakeTilePredicate(
-        {ti, tj}, {ki, kj}, tile_size, domain, execution_domain_axes);
-    TileAccessRewriter access_rewriter({ti, tj}, {ki, kj}, tile_size,
-                                       tile_predicate);
-    Stmt tiled_body = access_rewriter.Rewrite(innermost_exec->body);
-
-    // Create annotated interior loops
-    For kj_loop =
-        MakeTileInteriorLoop(kj, tile_size[1], ForKind::kVectorized, tiled_body,
-                             /*axis=*/1);
-    For ki_loop =
-        MakeTileInteriorLoop(ki, tile_size[0], ForKind::kSerial, kj_loop,
-                             /*axis=*/0);
+    TilePredicateInfo predicate_info =
+        MakeTilePredicateInfo({ti, tj}, {ki, kj}, {axis0_loop, axis1_loop},
+                              tile_size, domain, execution_domain_axes);
+    auto build_body = [&](Optional<PrimExpr> tile_predicate) {
+      TileAccessRewriter access_rewriter({ti, tj}, {ki, kj}, tile_size,
+                                         std::move(tile_predicate));
+      return Build2DInteriorBody(ki, kj, tile_size,
+                                 access_rewriter.Rewrite(innermost_exec->body));
+    };
 
     // Replace the innermost execution loop body with the tiled loops.
     For new_inner_exec = ffi::GetRef<For>(innermost_exec);
-    new_inner_exec.CopyOnWrite()->body = ki_loop;
+    new_inner_exec.CopyOnWrite()->body =
+        BuildFullOrTailTileBody(predicate_info, build_body);
 
     Stmt replaced_exec_body = LoopReplacer(innermost_exec, new_inner_exec)(
         ffi::GetRef<For>(outermost_exec)->body);

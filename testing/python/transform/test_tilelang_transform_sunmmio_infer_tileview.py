@@ -96,18 +96,27 @@ def collect_stores(func, buffer_name):
     return stores
 
 
+def collect_if_conditions(func):
+    conditions = []
+
+    def visit(stmt, conditions=conditions):
+        if isinstance(stmt, tir.IfThenElse):
+            conditions.append(stmt.condition)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return conditions
+
+
 def assert_preserved_mixed_rank_load(mod, expected_tile_size):
     script = mod["main"].script()
     assert "T.sunmmio_unaligned_tile_load" not in script
 
     loads = collect_loads(mod["main"], "B_shared")
     assert loads, "Expected mixed-rank side access to remain a BufferLoad"
-    assert all(load.predicate is not None for load in loads)
+    assert all(load.predicate is None for load in loads)
 
     tile_height = expected_tile_size[0]
     assert any(f"* {tile_height}" in str(load.indices[0]) or f"*{tile_height}" in str(load.indices[0]) for load in loads)
-    assert all("< 128" in str(load.predicate) or "<128" in str(load.predicate) for load in loads)
-    assert all("< 64" in str(load.predicate) or "<64" in str(load.predicate) for load in loads)
 
 
 # ---------------------------------------------------------
@@ -284,7 +293,7 @@ def test_infer_tileview_mixed_rank_load(dtype, expected_tile_size):
     rejects tile width 1 because 64-byte RSRAM alignment requires multiple
     elements, then the fallback search allows the side load. The eventual
     hardware unaligned load repair is deferred to Sunmmio codegen so mid-level
-    analysis can still see a normal predicated BufferLoad.
+    analysis can still see a normal BufferLoad.
     """
     M, N = 128, 64
 
@@ -634,7 +643,8 @@ def test_infer_tileview_blockwise_small_height():
     assert all(store.predicate is not None for store in stores)
     assert any("* 8" in str(store.indices[0]) or "*8" in str(store.indices[0]) for store in stores)
     assert all("< 4" in str(store.predicate) or "<4" in str(store.predicate) for store in stores)
-    assert all("< 128" in str(store.predicate) or "<128" in str(store.predicate) for store in stores)
+    assert all("< 128" not in str(store.predicate) and "<128" not in str(store.predicate) for store in stores)
+    assert not collect_if_conditions(mod["main"]), "Expected no full/tail branch when every tile is partial"
 
 
 def test_infer_tileview_rowmajor_wide_row_uses_single_row_tile():
