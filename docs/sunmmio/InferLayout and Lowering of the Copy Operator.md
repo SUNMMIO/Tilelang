@@ -14,7 +14,7 @@ Building upon the original `copy.cc`, two core copy modes specifically tailored 
   - When the movement is `shared.rsram -> shared.rsram` and it is a full buffer copy, it branches into `kSunmmioTileCopy`.
 
 - **Layout Inference:**
-  - For these two modes, if the destination/source Buffer is located on-chip and has dimensions > 1, the compiler will automatically infer and allocate a hardware-specific `make_blockwise_zz_layout` (Blockwise ZZ Layout) to avoid Bank Conflicts and adapt to subsequent computations.
+  - For these two modes, if the destination/source Buffer is located on-chip and has dimensions > 1, the compiler will automatically infer and allocate a hardware-specific ZZ layout to avoid bank conflicts and adapt to subsequent computations. Developer-facing code should use `make_zz_layout`; compiler inference constructs the same layout in C++ through `sunmmio::MakeZZ` and gets the target/dtype-specific block shape from `sunmmio_utils`.
 
 - **Instruction Lowering:**
   - For DMA Copy, it is directly lowered into the intrinsic call of `tl.dma_copy`.
@@ -30,7 +30,7 @@ The core logic is implemented in `src/op/copy.cc` and is divided into three stag
   - `CheckSunmmioTileCopy`: In addition to restricting the scopes to be `shared.rsram`, it also ensures that it is a duplication of the entire buffer through `is_full_buffer_copy`.
 
 - **Layout Inference (`InferLayout`)**
-  - At the `InferLevel::kFree` level, the Copy node is intercepted. If the buffer has not yet been bound to a layout and is not in the global scope, the globally registered layout function `tl.layout.make_blockwise_zz_layout` is called to remap the buffer, ensuring that the memory access addresses generated later conform to the NPU's ZZ Layout.
+  - At the `InferLevel::kFree` level, the Copy node is intercepted. If the buffer has not yet been bound to a layout and is not in the global scope, the compiler remaps the buffer to a ZZ layout, ensuring that the memory access addresses generated later conform to the NPU's ZZ Layout.
 
 - **Instruction Lowering (`LowerSunmmioDmaCopy` & `LowerSunmmioTileCopy`)**
   - **DMA Lowering**: Calls `MakeRegionExpr` to pack the original multi-dimensional slice accesses into Region expressions, and then emits `T.call_intrin("tl.dma_copy", src_region, dst_region)`.
@@ -50,11 +50,11 @@ T.copy(A_shared, B_shared)
 
 ```python
 # 1. global -> rsram triggers kSunmmioDMACopy
-# Inferred as Blockwise ZZ Layout, and lowered to DMA intrinsic
+# Inferred as ZZ layout, and lowered to DMA intrinsic
 T.dma_copy(T.region(A_global[0, 0], 1, 128, 128), T.region(A_rsram[0, 0], 2, 128, 128))
 
 # 2. rsram -> rsram triggers kSunmmioTileCopy
-# Inferred as Blockwise ZZ Layout, and generates a loop annotated with Tile attributes
+# Inferred as ZZ layout, and generates a loop annotated with Tile attributes
 for v0 in T.serial(64, annotations={"tile.loop_parallel": 1, "tile.loop_stage": 0, "tile.tiled_buffer": A_shared.data}):
     for v1 in T.serial(64, annotations={"tile.loop_parallel": 1, "tile.loop_stage": 0, "tile.tiled_buffer": A_shared.data}):
         B_shared[v0, v1] = A_shared[v0, v1]

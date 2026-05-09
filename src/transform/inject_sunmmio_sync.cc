@@ -177,9 +177,9 @@ struct LoopScope {
 class InjectSyncRewriter : public StmtMutator {
 public:
   InjectSyncRewriter(Map<Var, Buffer> buffer_data_to_buffer, int mesh_nrow,
-                     int mesh_ncol)
+                     int mesh_ncol, arith::Analyzer *analyzer)
       : buffer_data_to_buffer_(buffer_data_to_buffer), mesh_nrow_(mesh_nrow),
-        mesh_ncol_(mesh_ncol) {
+        mesh_ncol_(mesh_ncol), analyzer_(analyzer) {
     token_count = 0;
     barrier_count = 0;
   }
@@ -214,7 +214,8 @@ private:
   // necessary. Records the read access for future dependency checks.
   void token_process_read_buffer(const BufferRegion &buffer_region,
                                  Array<Stmt> &stmts, int curr_token_id,
-                                 bool is_log_async = true) {
+                                 bool is_async_stmt = true,
+                                 bool is_log_buffer = true) {
     Buffer src_buffer = buffer_region->buffer;
     Region src_region = buffer_region->region;
     auto src = Array<ObjectRef>{src_buffer, src_region};
@@ -225,7 +226,7 @@ private:
     // Check if the current read buffer has dependencies with existing write
     // buffers. If yes, we need to wait for the write to finish before reading.
     for (const Array<ObjectRef> &buf : write_buffers) {
-      if (is_log_async && write_buffer_token_map[buf] == curr_token_id) {
+      if (is_async_stmt && write_buffer_token_map[buf] == curr_token_id) {
         continue;
       }
       Buffer buf_buffer = Downcast<Buffer>(buf[0]);
@@ -244,7 +245,7 @@ private:
     for (int i = loop_scopes_.size() - 1; i >= 0; i--) {
       auto &scope = loop_scopes_[i];
       for (const auto &buf : scope.writes) {
-        if (is_log_async && scope.buffer_ref_to_token[buf] == curr_token_id) {
+        if (is_async_stmt && scope.buffer_ref_to_token[buf] == curr_token_id) {
           continue;
         }
         Buffer buf_buffer = Downcast<Buffer>(buf[0]);
@@ -263,7 +264,7 @@ private:
 
     // After processing the dependencies with existing buffers, we can add the
     // current read buffer to the list.
-    if (is_log_async) {
+    if (is_async_stmt && is_log_buffer) {
       read_buffers.push_back(src);
       read_buffer_token_map.Set(src, curr_token_id);
     }
@@ -274,7 +275,8 @@ private:
   // Inserts waits if necessary and records the write access.
   void token_process_write_buffer(const BufferRegion &buffer_region,
                                   Array<Stmt> &stmts, int curr_token_id,
-                                  bool is_log_async = true) {
+                                  bool is_async_stmt = true,
+                                  bool is_log_buffer = true) {
     Buffer dst_buffer = buffer_region->buffer;
     Region dst_region = buffer_region->region;
     auto dst = Array<ObjectRef>{dst_buffer, dst_region};
@@ -283,7 +285,7 @@ private:
     // Check if the current write buffer has dependencies with existing read
     // buffers. If yes, we need to wait for the read to finish before writing.
     for (const Array<ObjectRef> &buf : read_buffers) {
-      if (is_log_async && read_buffer_token_map[buf] == curr_token_id) {
+      if (is_async_stmt && read_buffer_token_map[buf] == curr_token_id) {
         continue;
       }
       Buffer buf_buffer = Downcast<Buffer>(buf[0]);
@@ -300,7 +302,7 @@ private:
     // We also need to check the dependencies with existing write buffers. If
     // yes, we need to wait for the write to finish before writing.
     for (const Array<ObjectRef> &buf : write_buffers) {
-      if (is_log_async && write_buffer_token_map[buf] == curr_token_id) {
+      if (is_async_stmt && write_buffer_token_map[buf] == curr_token_id) {
         continue;
       }
       Buffer buf_buffer = Downcast<Buffer>(buf[0]);
@@ -319,7 +321,7 @@ private:
     for (int i = loop_scopes_.size() - 1; i >= 0; i--) {
       auto &scope = loop_scopes_[i];
       for (const auto &buf : scope.writes) {
-        if (is_log_async && scope.buffer_ref_to_token[buf] == curr_token_id) {
+        if (is_async_stmt && scope.buffer_ref_to_token[buf] == curr_token_id) {
           continue;
         }
         Buffer buf_buffer = Downcast<Buffer>(buf[0]);
@@ -335,7 +337,7 @@ private:
         }
       }
       for (const auto &buf : scope.reads) {
-        if (is_log_async && scope.buffer_ref_to_token[buf] == curr_token_id) {
+        if (is_async_stmt && scope.buffer_ref_to_token[buf] == curr_token_id) {
           continue;
         }
         Buffer buf_buffer = Downcast<Buffer>(buf[0]);
@@ -354,7 +356,7 @@ private:
 
     // After processing the dependencies with existing buffers, we can add the
     // current write buffer to the list.
-    if (is_log_async) {
+    if (is_async_stmt && is_log_buffer) {
       write_buffers.push_back(dst);
       write_buffer_token_map.Set(dst, curr_token_id);
     }
@@ -373,13 +375,13 @@ private:
   // Helper to construct and inject a barrier_init call.
   // Also establishes the mappings between the generated token and barrier IDs.
   void init_barrier_(Array<Stmt> &stmts, int barrier_id, int token_id,
-                     Integer read_core, Array<Integer> write_cores = {}) {
+                     PrimExpr read_core, Array<PrimExpr> write_cores = {}) {
     Array<PrimExpr> args;
     args.push_back(barrier_id);
     args.push_back(read_core);
     if (!write_cores.empty()) {
       for (const auto &core : write_cores) {
-        if (core->value != read_core->value) {
+        if (!analyzer_->CanProve(core == read_core)) {
           args.push_back(core);
         }
       }
@@ -397,17 +399,19 @@ private:
   // considering given masks.
   void process_broadcast_barrier(const CallNode *call, int curr_token_id,
                                  int curr_barrier_id, Array<Stmt> &stmts) {
-    auto src_core = call->args[3].as<Integer>().value();
+    PrimExpr src_core = call->args[3];
     int direction = call->args[4].as<IntImm>().value()->value;
     Array<int> masks;
     for (size_t i = 5; i < call->args.size(); i++) {
       masks.push_back(call->args[i].as<IntImm>().value()->value);
     }
 
-    int src_core_row = src_core->value / mesh_ncol_;
-    int src_core_col = src_core->value % mesh_ncol_;
-    auto read_cores = Array<Integer>{src_core};
-    Array<Integer> write_cores;
+    PrimExpr src_core_row =
+        analyzer_->Simplify(tvm::floordiv(src_core, mesh_ncol_));
+    PrimExpr src_core_col =
+        analyzer_->Simplify(tvm::floormod(src_core, mesh_ncol_));
+    auto read_cores = Array<PrimExpr>{src_core};
+    Array<PrimExpr> write_cores;
     bool mask_flag = false;
     if (direction == 0) { // horizontal
       for (int j = 0; j < mesh_ncol_; j++) {
@@ -421,7 +425,8 @@ private:
           mask_flag = false;
           continue;
         }
-        write_cores.push_back(Integer(src_core_row * mesh_ncol_ + j));
+        write_cores.push_back(
+            analyzer_->Simplify(src_core_row * mesh_ncol_ + j));
       }
     } else if (direction == 1) { // vertical
       for (int i = 0; i < mesh_nrow_; i++) {
@@ -435,7 +440,8 @@ private:
           mask_flag = false;
           continue;
         }
-        write_cores.push_back(Integer(i * mesh_ncol_ + src_core_col));
+        write_cores.push_back(
+            analyzer_->Simplify(i * mesh_ncol_ + src_core_col));
       }
     }
 
@@ -628,7 +634,7 @@ private:
         token_process_read_buffer(NormalizeToBufferRegion(call->args[1]), stmts,
                                   curr_token_id);
         token_process_read_buffer(NormalizeToBufferRegion(call->args[2]), stmts,
-                                  curr_token_id, false);
+                                  curr_token_id, true, false);
         token_process_write_buffer(NormalizeToBufferRegion(call->args[2]),
                                    stmts, curr_token_id);
 
@@ -828,6 +834,7 @@ private:
   int barrier_count;
   int mesh_nrow_;
   int mesh_ncol_;
+  arith::Analyzer *analyzer_;
 
   Array<Array<ObjectRef>> read_buffers;
   Array<Array<ObjectRef>> write_buffers;
@@ -844,9 +851,9 @@ private:
 // Rewriter to analyze and manage barrier synchronizations.
 // Ensures that barriers initialized in branches are properly waited on,
 // potentially hoisting waits or handling control flow implications.
-class BarrierExtractRewriter : public StmtMutator {
+class BarrierHoistRewriter : public StmtMutator {
 public:
-  BarrierExtractRewriter(Map<int, int> barrier_to_token_map)
+  BarrierHoistRewriter(Map<int, int> barrier_to_token_map)
       : barrier_to_token_map_(barrier_to_token_map) {
     barrier_init_map_ = Map<int, int>();
     barrier_init_ids_ = {};
@@ -894,7 +901,7 @@ private:
   Stmt VisitStmt_(const IfThenElseNode *op) {
     Array<Stmt> stmts;
     auto barrier_init_then_rewriter =
-        BarrierExtractRewriter(barrier_to_token_map_);
+        BarrierHoistRewriter(barrier_to_token_map_);
     Stmt then_case = barrier_init_then_rewriter(op->then_case);
 
     auto then_barrier_init_ids =
@@ -930,7 +937,7 @@ private:
     Stmt else_case;
     if (op->else_case.defined()) {
       auto barrier_init_else_rewriter =
-          BarrierExtractRewriter(barrier_to_token_map_);
+          BarrierHoistRewriter(barrier_to_token_map_);
       else_case = barrier_init_else_rewriter(op->else_case.value());
       auto else_barrier_init_ids =
           barrier_init_else_rewriter.get_barrier_init_ids();
@@ -961,6 +968,94 @@ private:
     return SeqStmt::Flatten(stmts);
   }
 
+  Stmt VisitStmt_(const ForNode *op) {
+    Array<Stmt> stmts;
+    auto sub_rewriter = BarrierHoistRewriter(barrier_to_token_map_);
+    Stmt body = sub_rewriter(op->body);
+
+    auto sub_barrier_init_ids = sub_rewriter.get_barrier_init_ids();
+    auto sub_barrier_wait_ids = sub_rewriter.get_barrier_wait_ids();
+
+    Array<Stmt> body_stmts;
+    if (const auto *seq = body.as<SeqStmtNode>()) {
+      body_stmts = seq->seq;
+    } else {
+      body_stmts.push_back(body);
+    }
+
+    for (int barrier_id : sub_barrier_wait_ids) {
+      if (std::find(sub_barrier_init_ids.begin(), sub_barrier_init_ids.end(),
+                    barrier_id) != sub_barrier_init_ids.end()) {
+        // If the barrier was initialized inside the loop, keep it.
+        continue;
+      } else if (std::find(barrier_init_ids_.begin(), barrier_init_ids_.end(),
+                           barrier_id) == barrier_init_ids_.end()) {
+        barrier_wait_ids_.push_back(barrier_id);
+      } else {
+        stmts.push_back(Evaluate(Call(
+            DataType::Handle(), wait_token(),
+            {IntImm(DataType::Int(32), barrier_to_token_map_[barrier_id])})));
+        stmts.push_back(
+            Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
+                          {IntImm(DataType::Int(32), barrier_id)})));
+      }
+    }
+    for (int barrier_id : sub_barrier_init_ids) {
+      if (std::find(barrier_init_ids_.begin(), barrier_init_ids_.end(),
+                    barrier_id) == barrier_init_ids_.end()) {
+        barrier_init_ids_.push_back(barrier_id);
+      }
+    }
+
+    stmts.push_back(For(op->loop_var, op->min, op->extent, op->kind,
+                        SeqStmt::Flatten(body_stmts), op->thread_binding,
+                        op->annotations));
+    return SeqStmt::Flatten(stmts);
+  }
+
+  Stmt VisitStmt_(const WhileNode *op) {
+    Array<Stmt> stmts;
+    auto sub_rewriter = BarrierHoistRewriter(barrier_to_token_map_);
+    Stmt body = sub_rewriter(op->body);
+
+    auto sub_barrier_init_ids = sub_rewriter.get_barrier_init_ids();
+    auto sub_barrier_wait_ids = sub_rewriter.get_barrier_wait_ids();
+
+    Array<Stmt> body_stmts;
+    if (const auto *seq = body.as<SeqStmtNode>()) {
+      body_stmts = seq->seq;
+    } else {
+      body_stmts.push_back(body);
+    }
+
+    for (int barrier_id : sub_barrier_wait_ids) {
+      if (std::find(sub_barrier_init_ids.begin(), sub_barrier_init_ids.end(),
+                    barrier_id) != sub_barrier_init_ids.end()) {
+        // If the barrier was initialized inside the loop, keep it.
+        continue;
+      } else if (std::find(barrier_init_ids_.begin(), barrier_init_ids_.end(),
+                           barrier_id) == barrier_init_ids_.end()) {
+        barrier_wait_ids_.push_back(barrier_id);
+      } else {
+        stmts.push_back(Evaluate(Call(
+            DataType::Handle(), wait_token(),
+            {IntImm(DataType::Int(32), barrier_to_token_map_[barrier_id])})));
+        stmts.push_back(
+            Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
+                          {IntImm(DataType::Int(32), barrier_id)})));
+      }
+    }
+    for (int barrier_id : sub_barrier_init_ids) {
+      if (std::find(barrier_init_ids_.begin(), barrier_init_ids_.end(),
+                    barrier_id) == barrier_init_ids_.end()) {
+        barrier_init_ids_.push_back(barrier_id);
+      }
+    }
+
+    stmts.push_back(While(op->condition, SeqStmt::Flatten(body_stmts)));
+    return SeqStmt::Flatten(stmts);
+  }
+
 private:
   std::vector<int> barrier_init_ids_;
   std::vector<int> barrier_wait_ids_;
@@ -970,39 +1065,33 @@ private:
   Map<int, int> barrier_to_token_map_;
 };
 
-// Rewriter to inject final synchronization waits at the end of the device
-// execution scope. This ensures all pending asynchronous operations are
-// completed before the device kernel finishes.
-class DeviceScopeWaitRewriter : public StmtMutator {
+// Rewriter to inject final synchronization waits before the device function
+// returns. This ensures all pending asynchronous operations are completed
+// before the device kernel finishes, handling both explicit returns and
+// implicit function exits.
+class DeviceFuncWaitRewriter : public StmtMutator {
 public:
-  DeviceScopeWaitRewriter(Map<int, int> token_to_barrier_map)
+  DeviceFuncWaitRewriter(Map<int, int> token_to_barrier_map)
       : token_to_barrier_map_(std::move(token_to_barrier_map)) {}
 
-  Stmt VisitStmt_(const BlockNode *op) final {
-    // If the block is the device root block (e.g., "tilelang_root" or "root" in
-    // lowered IR without SplitHostDevice) we should apply the exit wait logic.
-    // For typical tilelang lowering, "tilelang_root" represents the device
-    // scope.
-    if (op->name_hint == "tilelang_root" || op->name_hint == "root") {
-      Stmt new_body = StmtMutator::VisitStmt(op->body);
+  Stmt operator()(Stmt body) { return this->VisitStmt(body); }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tir::attr::thread_extent) {
+      Stmt body = StmtMutator::VisitStmt(op->body);
 
       DeviceTokenCollector collector;
-      collector(op->body);
+      collector(body);
 
       if (collector.tokens.empty()) {
-        if (new_body.same_as(op->body)) {
-          return ffi::GetRef<Stmt>(op);
-        }
-        auto n = CopyOnWrite(op);
-        n->body = new_body;
-        return Stmt(n);
+        return AttrStmt(op->node, op->attr_key, op->value, body);
       }
 
       Array<Stmt> stmts;
-      if (const auto *seq = new_body.as<SeqStmtNode>()) {
+      if (const auto *seq = body.as<SeqStmtNode>()) {
         stmts = seq->seq;
       } else {
-        stmts.push_back(new_body);
+        stmts.push_back(body);
       }
 
       std::vector<int> tokens(collector.tokens.begin(), collector.tokens.end());
@@ -1018,11 +1107,13 @@ public:
                             {IntImm(DataType::Int(32), barrier_id)})));
         }
       }
-
-      auto n = CopyOnWrite(op);
-      n->body = SeqStmt::Flatten(stmts);
-      return Stmt(n);
+      return AttrStmt(op->node, op->attr_key, op->value,
+                      SeqStmt::Flatten(stmts));
     }
+    return StmtMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
     return StmtMutator::VisitStmt_(op);
   }
 
@@ -1076,7 +1167,9 @@ public:
 
 // Analyzer to track which tokens and barriers are currently pending (i.e.,
 // generated but not yet waited on) within a specific execution scope. Used to
-// determine if additional waits are required.
+// determine if additional waits are required. Particularly note the following
+// scenario: dependent tokens (or barriers) within a loop may lack a
+// corresponding wait (or arrive_and_wait) after the final iteration.
 class PendingAnalyzer : public StmtExprVisitor {
 public:
   PendingAnalyzer(Map<int, int> barrier_to_token_map)
@@ -1150,15 +1243,47 @@ public:
   }
 };
 
+// Collector to identify all sync tokens and barriers that are explicitly waited
+// on within a given statement.
+class ResolvedResourceCollector : public StmtExprVisitor {
+public:
+  std::set<int> resolved_tokens;
+  std::set<int> resolved_barriers;
+  Map<int, int> barrier_to_token_map_;
+
+  ResolvedResourceCollector(Map<int, int> barrier_to_token_map)
+      : barrier_to_token_map_(std::move(barrier_to_token_map)) {}
+
+  void VisitStmt_(const EvaluateNode *op) final {
+    if (const CallNode *call = op->value.as<CallNode>()) {
+      if (call->op.same_as(wait_token())) {
+        if (!call->args.empty() && call->args[0].as<IntImmNode>()) {
+          resolved_tokens.insert(call->args[0].as<IntImmNode>()->value);
+        }
+      } else if (call->op.same_as(barrier_arrive_and_wait())) {
+        if (!call->args.empty() && call->args[0].as<IntImmNode>()) {
+          int barrier_id = call->args[0].as<IntImmNode>()->value;
+          resolved_barriers.insert(barrier_id);
+          if (barrier_to_token_map_.count(barrier_id)) {
+            resolved_tokens.insert(barrier_to_token_map_[barrier_id]);
+          }
+        }
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+};
+
 // Optimization pass to remove redundant synchronization calls.
 // If a token or barrier has already been waited on in the current execution
 // path, subsequent waits are unnecessary.
 class EliminateRedundancyRewriter : public StmtMutator {
 public:
-  EliminateRedundancyRewriter(std::vector<int> parent_token_ids = {},
+  EliminateRedundancyRewriter(arith::Analyzer *analyzer = nullptr,
+                              std::vector<int> parent_token_ids = {},
                               std::vector<int> parent_barrier_ids = {},
                               Map<int, int> barrier_to_token_map = {})
-      : parent_token_ids_(std::move(parent_token_ids)),
+      : analyzer_(analyzer), parent_token_ids_(std::move(parent_token_ids)),
         parent_barrier_ids_(std::move(parent_barrier_ids)),
         barrier_to_token_map_(std::move(barrier_to_token_map)) {
     current_token_ids_ = {};
@@ -1189,7 +1314,8 @@ private:
   // Propagates the resolved token and barrier states from a block (e.g., loop
   // body or if branch) to the current scope, marking them as handled to avoid
   // redundant waits.
-  void PropagateResolvedStates(const Stmt &block) {
+  void PropagateResolvedStates(const Stmt &block,
+                               bool guaranteed_to_execute = false) {
     // Collect async resources that are created inside this block. These IDs
     // represent potential synchronization points introduced by the rewriter
     // (e.g., new tokens and barriers).
@@ -1224,6 +1350,33 @@ private:
         if (std::find(current_token_ids_.begin(), current_token_ids_.end(),
                       token_id) == current_token_ids_.end()) {
           current_token_ids_.push_back(token_id);
+        }
+      }
+    }
+
+    // If the block is guaranteed to execute, any explicit waits within the
+    // block that are not pending at the end are also resolved for the parent
+    // scope.
+    if (guaranteed_to_execute) {
+      ResolvedResourceCollector resolved_collector(barrier_to_token_map_);
+      resolved_collector(block);
+
+      for (int barrier_id : resolved_collector.resolved_barriers) {
+        if (pending_analyzer.pending_barriers.count(barrier_id) == 0) {
+          if (std::find(current_barrier_ids_.begin(),
+                        current_barrier_ids_.end(),
+                        barrier_id) == current_barrier_ids_.end()) {
+            current_barrier_ids_.push_back(barrier_id);
+          }
+        }
+      }
+
+      for (int token_id : resolved_collector.resolved_tokens) {
+        if (pending_analyzer.pending_tokens.count(token_id) == 0) {
+          if (std::find(current_token_ids_.begin(), current_token_ids_.end(),
+                        token_id) == current_token_ids_.end()) {
+            current_token_ids_.push_back(token_id);
+          }
         }
       }
     }
@@ -1273,13 +1426,15 @@ private:
 
   Stmt VisitStmt_(const IfThenElseNode *op) {
     auto eliminate_sync_then_rewriter = EliminateRedundancyRewriter(
-        get_all_token_ids(), get_all_barrier_ids(), barrier_to_token_map_);
+        analyzer_, get_all_token_ids(), get_all_barrier_ids(),
+        barrier_to_token_map_);
     auto then_case = eliminate_sync_then_rewriter(op->then_case);
 
     Stmt else_case;
     if (op->else_case.defined()) {
       auto eliminate_sync_else_rewriter = EliminateRedundancyRewriter(
-          get_all_token_ids(), get_all_barrier_ids(), barrier_to_token_map_);
+          analyzer_, get_all_token_ids(), get_all_barrier_ids(),
+          barrier_to_token_map_);
       else_case = eliminate_sync_else_rewriter(op->else_case.value());
     }
 
@@ -1290,10 +1445,22 @@ private:
 
   Stmt VisitStmt_(const ForNode *op) {
     auto eliminate_sync_loop_rewriter = EliminateRedundancyRewriter(
-        get_all_token_ids(), get_all_barrier_ids(), barrier_to_token_map_);
+        analyzer_, get_all_token_ids(), get_all_barrier_ids(),
+        barrier_to_token_map_);
     auto body = eliminate_sync_loop_rewriter(op->body);
 
-    PropagateResolvedStates(ffi::GetRef<Stmt>(op));
+    bool is_guaranteed = false;
+    if (analyzer_) {
+      if (analyzer_->CanProveGreaterEqual(op->extent, 1)) {
+        is_guaranteed = true;
+      }
+    } else if (auto extent = op->extent.as<IntImmNode>()) {
+      if (extent->value > 0) {
+        is_guaranteed = true;
+      }
+    }
+
+    PropagateResolvedStates(ffi::GetRef<Stmt>(op), is_guaranteed);
 
     return For(op->loop_var, op->min, op->extent, op->kind, body,
                op->thread_binding, op->annotations);
@@ -1301,15 +1468,24 @@ private:
 
   Stmt VisitStmt_(const WhileNode *op) {
     auto eliminate_sync_loop_rewriter = EliminateRedundancyRewriter(
-        get_all_token_ids(), get_all_barrier_ids(), barrier_to_token_map_);
+        analyzer_, get_all_token_ids(), get_all_barrier_ids(),
+        barrier_to_token_map_);
     auto body = eliminate_sync_loop_rewriter(op->body);
 
-    PropagateResolvedStates(ffi::GetRef<Stmt>(op));
+    bool is_guaranteed = false;
+    if (auto cond = op->condition.as<IntImmNode>()) {
+      if (cond->value != 0) {
+        is_guaranteed = true;
+      }
+    }
+
+    PropagateResolvedStates(ffi::GetRef<Stmt>(op), is_guaranteed);
 
     return While(op->condition, body);
   }
 
 private:
+  arith::Analyzer *analyzer_;
   // Token IDs that are already known to be waited/synchronized in outer scopes
   std::vector<int> parent_token_ids_;
   // Token IDs that have been waited/synchronized along the current execution
@@ -1338,19 +1514,19 @@ public:
     int mesh_ncol = mesh.ncol;
 
     auto inject_sync_rewriter =
-        InjectSyncRewriter(f->buffer_map, mesh_nrow, mesh_ncol);
+        InjectSyncRewriter(f->buffer_map, mesh_nrow, mesh_ncol, analyzer);
     f.CopyOnWrite()->body = inject_sync_rewriter(f->body);
 
     auto barrier_extract_rewriter =
-        BarrierExtractRewriter(inject_sync_rewriter.get_barrier_to_token_map());
+        BarrierHoistRewriter(inject_sync_rewriter.get_barrier_to_token_map());
     f.CopyOnWrite()->body = barrier_extract_rewriter(f->body);
 
-    auto device_scope_wait_rewriter = DeviceScopeWaitRewriter(
-        inject_sync_rewriter.get_token_to_barrier_map());
-    f.CopyOnWrite()->body = device_scope_wait_rewriter(f->body);
+    auto device_func_wait_rewriter =
+        DeviceFuncWaitRewriter(inject_sync_rewriter.get_token_to_barrier_map());
+    f.CopyOnWrite()->body = device_func_wait_rewriter(f->body);
 
     auto eliminate_redundancy_rewriter = EliminateRedundancyRewriter(
-        std::vector<int>({}), std::vector<int>({}),
+        analyzer, std::vector<int>({}), std::vector<int>({}),
         inject_sync_rewriter.get_barrier_to_token_map());
     f.CopyOnWrite()->body = eliminate_redundancy_rewriter(f->body);
 
@@ -1363,6 +1539,9 @@ public:
 // primitives.
 tvm::transform::Pass InjectSunmmioSync() {
   auto pass_func = [=](PrimFunc f, const IRModule &m, const PassContext &ctx) {
+    if (!f->HasNonzeroAttr(tir::attr::kIsGlobalFunc)) {
+      return f;
+    }
     arith::Analyzer analyzer;
     return SunmmioSyncRewriter::Rewrite(f, &analyzer);
   };

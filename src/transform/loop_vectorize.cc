@@ -26,6 +26,7 @@
 #include "../config.h"
 #include "../op/builtin.h"
 #include "../op/utils.h"
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "arith/int_operator.h"
 #include "arith/ir_visitor_with_analyzer.h"
@@ -177,7 +178,7 @@ public:
           256;
     } else if (tvm::tl::TargetIsSunmmio(Target::Current(false))) {
       vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
-          1024;
+          GetSunmmioTileProcessorConfig(Target::Current(false)).register_bits;
     } else {
       vector_load_bits_max_ = initial_vector_size_ = loop_extent_vector_size_ =
           128;

@@ -55,8 +55,10 @@ def core_tuple_to_id(core_id: tuple[int, int]) -> int:
     """
     mesh_shape = get_target_mesh_shape()
     row, col = core_id
-    assert 0 <= row < mesh_shape["nrow"], f"Row {row} out of bounds for mesh shape {mesh_shape}."
-    assert 0 <= col < mesh_shape["ncol"], f"Col {col} out of bounds for mesh shape {mesh_shape}."
+    if isinstance(row, int):
+        assert 0 <= row < mesh_shape["nrow"], f"Row {row} out of bounds for mesh shape {mesh_shape}."
+    if isinstance(col, int):
+        assert 0 <= col < mesh_shape["ncol"], f"Col {col} out of bounds for mesh shape {mesh_shape}."
     core_id_value = row * mesh_shape["ncol"] + col
     return core_id_value
 
@@ -182,8 +184,10 @@ def broadcast(
 
     mesh_shape = get_target_mesh_shape()
     assert isinstance(src_core, tuple) and len(src_core) == 2, "src_core must be a tuple of (row, col)."
-    assert 0 <= src_core[0] < mesh_shape["nrow"], f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
-    assert 0 <= src_core[1] < mesh_shape["ncol"], f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
+    if isinstance(src_core[0], int):
+        assert 0 <= src_core[0] < mesh_shape["nrow"], f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
+    if isinstance(src_core[1], int):
+        assert 0 <= src_core[1] < mesh_shape["ncol"], f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
 
     src_elements = 1
     for dim in src_shape:
@@ -248,11 +252,15 @@ def put(
 
     mesh_shape = get_target_mesh_shape()
     assert isinstance(src_core, tuple) and len(src_core) == 2, "src_core must be a tuple of (row, col)."
-    assert 0 <= src_core[0] < mesh_shape["nrow"], f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
-    assert 0 <= src_core[1] < mesh_shape["ncol"], f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
+    if isinstance(src_core[0], int):
+        assert 0 <= src_core[0] < mesh_shape["nrow"], f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
+    if isinstance(src_core[1], int):
+        assert 0 <= src_core[1] < mesh_shape["ncol"], f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
     assert isinstance(dst_core, tuple) and len(dst_core) == 2, "dst_core must be a tuple of (row, col)."
-    assert 0 <= dst_core[0] < mesh_shape["nrow"], f"dst_core row {dst_core[0]} out of bounds for mesh shape {mesh_shape}."
-    assert 0 <= dst_core[1] < mesh_shape["ncol"], f"dst_core col {dst_core[1]} out of bounds for mesh shape {mesh_shape}."
+    if isinstance(dst_core[0], int):
+        assert 0 <= dst_core[0] < mesh_shape["nrow"], f"dst_core row {dst_core[0]} out of bounds for mesh shape {mesh_shape}."
+    if isinstance(dst_core[1], int):
+        assert 0 <= dst_core[1] < mesh_shape["ncol"], f"dst_core col {dst_core[1]} out of bounds for mesh shape {mesh_shape}."
     src_elements = 1
     for dim in src.shape:
         src_elements *= dim

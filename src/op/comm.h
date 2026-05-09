@@ -25,7 +25,7 @@ public:
   PrimExpr src_expr, dst_expr;
   IntImm size;
   IntImm dst_offset;
-  IntImm src_core;
+  PrimExpr src_core;
   int direction;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.comm_broadcast", BroadcastOpNode,
@@ -44,7 +44,7 @@ public:
         .def_ro("dst_offset", &BroadcastOpNode::dst_offset);
   }
 
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
   LayoutMap InferLayout(const LayoutInferArgs &T,
                         InferLevel level) const override;
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
@@ -64,7 +64,7 @@ public:
   Buffer src, dst;
   Array<Range> src_range, dst_range;
   PrimExpr src_expr, dst_expr;
-  IntImm src_core, dst_core;
+  PrimExpr src_core, dst_core;
   IntImm size;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.comm_put", PutOpNode, TileOperatorNode);
@@ -81,7 +81,7 @@ public:
         .def_ro("size", &PutOpNode::size);
   }
 
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
   LayoutMap InferLayout(const LayoutInferArgs &T,
                         InferLevel level) const override;
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
@@ -112,7 +112,7 @@ public:
         .def_ro("size", &AllgatherOpNode::size);
   }
 
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
   LayoutMap ComputeLayout(const LayoutInferArgs &T, InferLevel level,
                           Buffer src, Buffer dst) const;
   LayoutMap InferLayout(const LayoutInferArgs &T,
@@ -156,7 +156,7 @@ public:
         .def_ro("dst_copy", &AllreduceOpNode::dst_copy);
   }
 
-  TileOperator Clone() const;
+  TileOperator Clone() const override;
   LayoutMap ComputeLayout(const LayoutInferArgs &T, InferLevel level,
                           Buffer src, Buffer dst, int dim) const;
   LayoutMap InferLayout(const LayoutInferArgs &T,

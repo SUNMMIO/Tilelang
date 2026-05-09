@@ -1,10 +1,12 @@
-"""Test that SUNMMIO copy lowering emits tl.dma_copy with tl.tileop.region args,
+"""Test that SUNMMIO datapath lowering emits tl.dma_copy with tl.tileop.region args,
 and that each region can be normalized back to a BufferRegion with full metadata."""
+
+import re
 
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.layout import make_blockwise_zz_layout
+from tilelang.layout import make_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC, determine_target
 from tilelang.language.mesh_tensor import MeshShardingPolicy
 from tvm import tir
@@ -29,15 +31,16 @@ def simple_copy_kernel(M, N, block_M, block_N, dtype="float16"):
 
 
 def apply_sunmmio_passes(mod, target):
-    """Apply the full SUNMMIO pass pipeline used for DMA copy lowering."""
+    """Apply the SUNMMIO pass pipeline used for datapath and DMA copy lowering."""
     mod = tvm.tir.transform.BindTarget(target)(mod)
     mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
     mod = tilelang.transform.LegalizeNegativeIndex()(mod)
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
+    mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
     mod = tilelang.transform.LayoutReducer()(mod)
-    mod = tilelang.transform.LayoutInference()(mod)
+    mod = tilelang.transform.SunmmioLayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     return mod
 
@@ -110,12 +113,21 @@ class _DmaCopyVisitor(PyStmtExprVisitor):
 
 def extract_dma_copy_lines(mod):
     """Extract T.dma_copy lines from TIR script, robust to formatting changes."""
-    return [line.lstrip() for line in mod.script().split("\n") if "T.dma_copy" in line]
+    lines = [line.lstrip() for line in mod.script().split("\n") if "T.dma_copy" in line]
+    return [re.sub(r"([A-Za-z_][A-Za-z0-9_]*_rsram_stage)(?:_\d+)?", r"\1", line) for line in lines]
 
 
 def extract_block_attr_lines(mod):
     """Extract block attributes from TIR script"""
     return [line.lstrip() for line in mod.script().split("\n") if "T.block_attr" in line]
+
+
+def extract_layout_map(mod):
+    """Extract layout_map entries keyed by buffer name from TIR."""
+    func = list(mod.functions.values())[0]
+    visitor = _DmaCopyVisitor()
+    visitor.visit_stmt(func.body)
+    return visitor.layout_map
 
 
 SIMPLE_COPY_CASES = [
@@ -260,13 +272,12 @@ def test_tilelang_mesh_wrong_copy_to_dma(M, N, K, block_M, block_N, block_K, err
 
 
 def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
+    _layout = make_zz_layout((128, 128), [0, 1], (32, 32))
     MyTensor = T.MeshTensor(
         (128, 128),
         sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
         device_mesh_config=(2, 2),
-        hierarchical_dims=(4, 32, 128),
-        hierarchical_groups=((0, 2), (2, 3)),
-        hierarchical_strides=(32, 1, 4096),
+        layout=_layout,
     )
 
     @T.prim_func
@@ -278,7 +289,7 @@ def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
             D_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
 
-            T.annotate_layout({C_shared: make_blockwise_zz_layout(C_shared)})
+            T.annotate_layout({C_shared: make_zz_layout(C_shared)})
 
             for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
                 # DRAM -> RSRAM
@@ -310,8 +321,9 @@ MESH_COPY_CASES = [
             'T.dma_copy(T.region(C[by * 64, ko * 32], 1, 64, 64), T.region(B_shared[0, 0], 2, 64, 64))',
             # DRAM <- RSRAM
             'T.dma_copy(T.region(C_shared[0, 0], 1, 64, 64), T.region(C[by * 64, ko * 32], 2, 64, 64))',
-            # DRAM -> ASRAM
-            'T.dma_copy(T.region(C[by * 64, ko * 32], 1, 64, 64), T.region(A_shared[0, 0], 2, 64, 64))',
+            # DRAM -> ASRAM (staged through RSRAM)
+            'T.dma_copy(T.region(C[by * 64, ko * 32], 1, 64, 64), T.region(C_rsram_stage[0, 0], 2, 64, 64))',
+            'T.dma_copy(T.region(C_rsram_stage[0, 0], 1, 64, 64), T.region(A_shared[0, 0], 2, 64, 64))',
             # RSRAM -> ASRAM
             'T.dma_copy(T.region(C_shared[8, 16], 1, 16, 32), T.region(A_shared[24, 8], 2, 16, 32))',
             # RSRAM -> WSRAM
@@ -327,8 +339,9 @@ MESH_COPY_CASES = [
             'T.dma_copy(T.region(C[by * 64, ko * 64], 1, 64, 64), T.region(B_shared[0, 0], 2, 64, 64))',
             # DRAM <- RSRAM
             'T.dma_copy(T.region(C_shared[0, 0], 1, 64, 64), T.region(C[by * 64, ko * 64], 2, 64, 64))',
-            # DRAM -> ASRAM
-            'T.dma_copy(T.region(C[by * 64, ko * 64], 1, 64, 64), T.region(A_shared[0, 0], 2, 64, 64))',
+            # DRAM -> ASRAM (staged through RSRAM)
+            'T.dma_copy(T.region(C[by * 64, ko * 64], 1, 64, 64), T.region(C_rsram_stage[0, 0], 2, 64, 64))',
+            'T.dma_copy(T.region(C_rsram_stage[0, 0], 1, 64, 64), T.region(A_shared[0, 0], 2, 64, 64))',
             # RSRAM -> ASRAM
             'T.dma_copy(T.region(C_shared[8, 16], 1, 16, 32), T.region(A_shared[24, 8], 2, 16, 32))',
             # RSRAM -> WSRAM
@@ -356,4 +369,6 @@ def test_tilelang_mesh_copy_to_dma(K, block_M, block_N, block_K, lower_stmt):
         # Check layout map
         texts = extract_block_attr_lines(mod)
         for text in texts:
-            assert '"layout_map"' in text and 'C_shared: metadata["tl.Layout"]' in text
+            assert '"layout_map"' in text and ('C_shared: metadata["tl.Layout"]' in text or 'C_shared: metadata["tl.CuteLayout"]' in text)
+        layout_map = extract_layout_map(mod)
+        assert "C_rsram_stage" in layout_map

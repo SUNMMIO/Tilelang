@@ -1,10 +1,10 @@
 from __future__ import annotations
+from tilelang.utils.target import target_is_sunmmio
 from tvm import tir, IRModule
 from tvm.target import Target
 import tilelang
 from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma, is_hopper, have_pdl
-from tilelang.utils.target import target_is_sunmmio
 
 
 def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
@@ -174,10 +174,16 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
     # Infer shared memory SRAM scope
     mod = tilelang.transform.InferSramScope()(mod)
-    # Set layouts for reducers
+    # Stage unsupported Sunmmio global->asram datapaths before layout inference and tile-op lowering
+    mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
     mod = tilelang.transform.LayoutReducer()(mod)
-    # Infer memory layouts for fragments and shared memory
-    mod = tilelang.transform.LayoutInference()(mod)
+    # Infer memory layouts — target-conditional
+    if target_is_sunmmio(target):
+        # Sunmmio: standalone layout inference (CuteLayout, no Fragment/thread)
+        mod = tilelang.transform.SunmmioLayoutInference()(mod)
+    else:
+        # CUDA/ROCm/Metal: Fragment-based layout inference
+        mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout
     LayoutVisual(mod)
     # Lower high-level tile operations to low-level operations
@@ -289,7 +295,10 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # MergeSharedMemoryAllocations must be applied after SplitHostDevice
     # because the merged allocation site is at the beginning of each device function
     enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
-    mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
+    if target_is_sunmmio(target):
+        mod = tilelang.transform.MergeSharedMemoryAllocationsSunmmio(enable_aggressive_merge=enable_aggressive_merge)(mod)
+    else:
+        mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.InjectFenceProxy()(mod)
     else:

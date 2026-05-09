@@ -8,6 +8,8 @@ from tvm import tir
 from tvm.tir import PyStmtExprVisitor
 from tvm.tir.transform import prim_func_pass
 import tilelang.env as env
+from tilelang.layout import make_zz_layout, make_zn_layout
+from tilelang.layout.cute_layout import is_same_layout
 
 tilelang.env.disable_cache()
 
@@ -104,20 +106,19 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, versio
         mod = matmul(M, N, K, block_M, block_N, block_K, version)
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl.transform.InferSramScope()(mod)
-        mod = tl.transform.LayoutInference()(mod)
+        mod = tl.transform.LegalizeSunmmioDataPath()(mod)
+        mod = tl.transform.LayoutReducer()(mod)
+        mod = tl.transform.SunmmioLayoutInference()(mod)
         LayoutVisual()(mod)
 
-        for i in range(block_M):
-            for j in range(block_K):
-                index = layout_func(i, j, block_K)
-                assert index == collected_result["A_shared"].map_forward_index([i, j])[0]
+        # A (ASRAM): ZZ layout with block_shape (32, 32)
+        expected_a = make_zz_layout((block_M, block_K), block_shape=(32, 32))
+        assert is_same_layout(collected_result["A_shared"], expected_a), "A_shared layout mismatch: expected ZZ(32,32)"
 
-        for i in range(block_K):
-            for j in range(block_N):
-                index = layout_func(i, j, block_N)
-                assert index == collected_result["B_shared"].map_forward_index([i, j])[0]
+        # B (WSRAM): ZN layout with block_shape (32, 32) for transB=False
+        expected_b = make_zn_layout((block_K, block_N), axes=[0, 1], block_shape=[32, 32])
+        assert is_same_layout(collected_result["B_shared"], expected_b), "B_shared layout mismatch: expected ZN(32,32)"
 
-        for i in range(block_M):
-            for j in range(block_N):
-                index = layout_func(i, j, block_N)
-                assert index == collected_result["C_shared"].map_forward_index([i, j])[0]
+        # C (RSRAM): ZZ layout with block_shape (32, 32)
+        expected_c = make_zz_layout((block_M, block_N), block_shape=(32, 32))
+        assert is_same_layout(collected_result["C_shared"], expected_c), "C_shared layout mismatch: expected ZZ(32,32)"

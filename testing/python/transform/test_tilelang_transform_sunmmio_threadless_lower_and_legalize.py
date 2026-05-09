@@ -13,7 +13,7 @@ Passes run in order (mirroring phase.py LowerAndLegalize):
     05  Simplify
     06  InferSramScope
     07  LayoutReducer
-    08  LayoutInference
+    08  SunmmioLayoutInference
     09  LowerTileOp
     10  LowerL2Persistent
     11  LegalizeVectorizedLoop
@@ -26,7 +26,7 @@ Kernel variants covered:
     3. Multi-block element-wise    — 3-D grid (bx, by, bz) with arithmetic
 
 Note on target context: VectorizePlanner::Plan (called from ParallelOpNode::InferLayout
-inside LayoutInference) calls Target::Current() at runtime. For kernels that use
+inside SunmmioLayoutInference) calls Target::Current() at runtime. For kernels that use
 T.Parallel, the target context must remain active for the duration of the pass
 cascade. All test functions therefore run entirely inside a with tvm.target.Target block.
 """
@@ -61,7 +61,7 @@ def make_parallel_shared_kernel(M, N, dtype=T.float32):
     """Threadless kernel with T.Parallel loops and shared memory.
 
     This is the exact scenario that previously triggered the
-    ThreadBindingCollector bug in LayoutInference.
+    ThreadBindingCollector bug in the layout inference pass.
     """
 
     @T.prim_func
@@ -176,11 +176,14 @@ def run_lower_and_legalize_cascade(mod, target):
     mod = tl_transform.InferSramScope()(mod)
     assert_threadless_invariants(mod, "InferSramScope")
 
+    mod = tl_transform.LegalizeSunmmioDataPath()(mod)
+    assert_threadless_invariants(mod, "LegalizeSunmmioDataPath")
+
     mod = tl_transform.LayoutReducer()(mod)
     assert_threadless_invariants(mod, "LayoutReducer")
 
-    mod = tl_transform.LayoutInference()(mod)
-    assert_threadless_invariants(mod, "LayoutInference")
+    mod = tl_transform.SunmmioLayoutInference()(mod)
+    assert_threadless_invariants(mod, "SunmmioLayoutInference")
 
     mod = tl_transform.LowerTileOp()(mod)
     assert_threadless_invariants(mod, "LowerTileOp")
@@ -231,7 +234,7 @@ def test_lower_and_legalize_cascade_parallel_shared():
       - blockIdx bindings preserved
 
     Note: target context must stay active throughout because VectorizePlanner::Plan
-    (inside LayoutInference) calls Target::Current() at runtime.
+    (inside SunmmioLayoutInference) calls Target::Current() at runtime.
     """
     target = determine_target("Sunmmio", return_object=True)
 

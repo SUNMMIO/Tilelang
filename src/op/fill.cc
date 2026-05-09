@@ -10,6 +10,7 @@
 #include <tvm/tir/op.h>
 #include <tvm/tir/op_attr_types.h>
 
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "../transform/common/attr.h"
 #include "../transform/common/loop_fusion_utils.h"
@@ -139,9 +140,9 @@ For FillNode::MakeSIMTLoop(arith::Analyzer *analyzer) const {
 Stmt FillNode::MakeSunmmioTileFill(const LowerArgs &,
                                    arith::Analyzer *analyzer) const {
   // For Sunmmio target, we strictly require the destination buffer to be in
-  // "shared.rsram" scope. This is because the vector core on Sunmmio only
+  // kSunmmioScopeRSRAM scope. This is because the vector core on Sunmmio only
   // operates on data residing in RSRAM.
-  ICHECK(dst.scope() == "shared.rsram")
+  ICHECK(dst.scope() == kSunmmioScopeRSRAM)
       << "For Sunmmio target, Fill operator destination must be in "
          "shared.rsram scope, but got "
       << dst.scope();
