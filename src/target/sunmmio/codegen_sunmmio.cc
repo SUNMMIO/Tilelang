@@ -711,9 +711,10 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateConstNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::DeclBufferNode *op) {
-  UnsupportedStmt(op,
-                  "DeclBufferNode should be lowered into a concrete view/alias "
-                  "representation before SunMMIO codegen");
+  // DeclBuffer may still survive the current pipeline. For this backend path it
+  // is treated as a benign declaration wrapper with no direct codegen effect.
+  // Dedicated view/alias lowering can be added later if required.
+  VisitStmtTracked(op->body);
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferStoreNode *op) {

@@ -240,15 +240,14 @@ def test_sunmmio_codegen_block_realize_fails_loudly():
         builder(mod, target, "suvm")
 
 
-def test_sunmmio_codegen_decl_buffer_fails_loudly():
+def test_sunmmio_codegen_decl_buffer_is_benign_wrapper():
     target = determine_target("Sunmmio", return_object=True)
     mod = tvm.IRModule({"main": make_decl_buffer_kernel()})
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
-    with pytest.raises(
-        Exception,
-        match="DeclBufferNode should be lowered into a concrete view/alias representation before SunMMIO codegen",
-    ):
-        builder(mod, target, "suvm")
+    src = builder(mod, target, "suvm").inspect_source()
+    assert src.strip()
+    assert "module" in src
+    assert "func.func @main" in src
 
 
 def test_sunmmio_codegen_buffer_realize_fails_loudly():
