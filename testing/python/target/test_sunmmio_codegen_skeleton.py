@@ -117,6 +117,52 @@ def make_intrinsic_sync_kernel():
     return _primfunc_from_stmt(stmt)
 
 
+def make_block_realize_kernel():
+    body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
+    block = tvm.tir.Block([], [], [], "B", body)
+    stmt = tvm.tir.BlockRealize([], tvm.tir.IntImm("bool", 1), block)
+    return _primfunc_from_stmt(stmt)
+
+
+def make_decl_buffer_kernel():
+    body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
+    buf = tvm.tir.decl_buffer((16, 16), "float16", name="A")
+    stmt = tvm.tir.DeclBuffer(buf, body)
+    return _primfunc_from_stmt(stmt)
+
+
+def make_buffer_realize_kernel():
+    body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
+    buf = tvm.tir.decl_buffer((16, 16), "float16", name="A")
+    bounds = [
+        tvm.ir.Range.from_min_extent(0, 16),
+        tvm.ir.Range.from_min_extent(0, 16),
+    ]
+    stmt = tvm.tir.BufferRealize(buf, bounds, tvm.tir.IntImm("bool", 1), body)
+    return _primfunc_from_stmt(stmt)
+
+
+def make_buffer_load_kernel():
+    buf = tvm.tir.decl_buffer((16, 16), "float16", name="A")
+    stmt = tvm.tir.Evaluate(
+        tvm.tir.BufferLoad(
+            buf,
+            [tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 0)],
+        )
+    )
+    return _primfunc_from_stmt(stmt)
+
+
+def make_buffer_store_kernel():
+    buf = tvm.tir.decl_buffer((16, 16), "float16", name="A")
+    stmt = tvm.tir.BufferStore(
+        buf,
+        tvm.tir.FloatImm("float16", 1.0),
+        [tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 0)],
+    )
+    return _primfunc_from_stmt(stmt)
+
+
 def make_real_tilelang_frontend_kernel():
     @T.prim_func
     def main():
@@ -183,13 +229,79 @@ def test_sunmmio_codegen_compile_path_not_implemented():
         builder(mod, target)
 
 
+def test_sunmmio_codegen_block_realize_fails_loudly():
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": make_block_realize_kernel()})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(
+        Exception,
+        match="BlockRealizeNode should be eliminated by LowerOpaqueBlock before SunMMIO codegen",
+    ):
+        builder(mod, target, "suvm")
+
+
+def test_sunmmio_codegen_decl_buffer_fails_loudly():
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": make_decl_buffer_kernel()})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(
+        Exception,
+        match="DeclBufferNode should be lowered into a concrete view/alias representation before SunMMIO codegen",
+    ):
+        builder(mod, target, "suvm")
+
+
+def test_sunmmio_codegen_buffer_realize_fails_loudly():
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": make_buffer_realize_kernel()})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(
+        Exception,
+        match="BufferRealizeNode should be lowered into a concrete view/alias representation before SunMMIO codegen",
+    ):
+        builder(mod, target, "suvm")
+
+
+def test_sunmmio_codegen_buffer_load_fails_loudly():
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": make_buffer_load_kernel()})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(
+        Exception,
+        match="generic BufferLoadNode should not reach SunMMIO codegen; tiled buffer accesses must be lowered through tile-aware paths",
+    ):
+        builder(mod, target, "suvm")
+
+
+def test_sunmmio_codegen_buffer_store_fails_loudly():
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": make_buffer_store_kernel()})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(
+        Exception,
+        match="generic BufferStoreNode should not reach SunMMIO codegen; tiled buffer stores must be lowered through tile-aware paths",
+    ):
+        builder(mod, target, "suvm")
+
+
 @pytest.mark.parametrize(
     "kernel_name,kernel_factory",
     [
         ("scalar_control", make_scalar_control_kernel),
         ("alloc_scope", make_alloc_scope_kernel),
         ("intrinsic_sync", make_intrinsic_sync_kernel),
-        ("real_tilelang_frontend", make_real_tilelang_frontend_kernel),
+        pytest.param(
+            "real_tilelang_frontend",
+            make_real_tilelang_frontend_kernel,
+            marks=pytest.mark.xfail(
+                reason=(
+                    "generic SunMMIO codegen now requires pre-lowered backend IR; "
+                    "this real frontend case still bypasses the full SunMMIO "
+                    "lowering pipeline. Revisit when the full pass pipeline lands."
+                ),
+                strict=True,
+            ),
+        ),
     ],
 )
 def test_sunmmio_codegen_coverage_report_has_no_missing_entries(tmp_path, kernel_name, kernel_factory):

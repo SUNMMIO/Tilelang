@@ -705,52 +705,27 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateConstNode *op) {
-  LOG(FATAL) << "SunMMIO SUVM allocate phase does not support "
-             << "AllocateConstNode";
-  EnterScope();
-  // EmitAlloc(op->buffer_var, op->dtype, op->extents, "const");
-  VisitStmtTracked(op->body);
-  ExitScope();
+  UnsupportedStmt(
+      op, "AllocateConstNode should be lowered/eliminated before SunMMIO "
+          "codegen");
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::DeclBufferNode *op) {
-  LOG(FATAL) << "SunMMIO SUVM allocate phase treats DeclBuffer as view/alias "
-             << "and does not handle it yet";
-  // RegisterBuffer(op->buffer, false, NewValueName());
-  // const BufferBinding &binding = LookupBuffer(op->buffer);
-  // builder_->Alloc(binding.handle, binding.buffer_type, {},
-  //                 MapStorageScope(op->buffer.scope()), op->buffer->dtype);
-  VisitStmtTracked(op->body);
+  UnsupportedStmt(op,
+                  "DeclBufferNode should be lowered into a concrete view/alias "
+                  "representation before SunMMIO codegen");
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferStoreNode *op) {
-  LOG(FATAL) << "SunMMIO SUVM allocate phase does not handle BufferStore yet";
-  // if (!buffer_registry_.count(op->buffer.get())) {
-  //   RegisterBuffer(op->buffer, false, NewValueName());
-  //   const BufferBinding &binding = LookupBuffer(op->buffer);
-  //   builder_->Alloc(binding.handle, binding.buffer_type, {},
-  //                   MapStorageScope(op->buffer.scope()), op->buffer->dtype);
-  // }
-  EmitStore(op->buffer, op->indices, EvalExpr(op->value));
+  UnsupportedStmt(
+      op, "generic BufferStoreNode should not reach SunMMIO codegen; "
+          "tiled buffer stores must be lowered through tile-aware paths");
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferRealizeNode *op) {
-  LOG(FATAL) << "SunMMIO SUVM allocate phase treats BufferRealize as "
-             << "view/alias and does not handle it yet";
-  EnterScope();
-  // RegisterBuffer(op->buffer, false, NewValueName());
-  // const BufferBinding &binding = LookupBuffer(op->buffer);
-  // std::vector<SunMMIOValue> dyn_bounds;
-  // for (const Range &range : op->bounds) {
-  //   EvalExpr(range->min);
-  //   if (!range->extent.as<IntImmNode>()) {
-  //     dyn_bounds.push_back(EnsureIndex(EvalExpr(range->extent)));
-  //   }
-  // }
-  // builder_->Alloc(binding.handle, binding.buffer_type, dyn_bounds,
-  //                 MapStorageScope(op->buffer.scope()), op->buffer->dtype);
-  VisitStmtTracked(op->body);
-  ExitScope();
+  UnsupportedStmt(
+      op, "BufferRealizeNode should be lowered into a concrete view/alias "
+          "representation before SunMMIO codegen");
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AssertStmtNode *op) {
@@ -862,51 +837,9 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockRealizeNode *op) {
-  auto is_trivially_true = [](const PrimExpr &expr) {
-    if (is_one(expr)) {
-      return true;
-    }
-    if (const auto *imm = expr.as<IntImmNode>()) {
-      return imm->value != 0;
-    }
-    return false;
-  };
-
-  EnterScope();
-  for (size_t i = 0;
-       i < op->iter_values.size() && i < op->block->iter_vars.size(); ++i) {
-    BindVar(op->block->iter_vars[i]->var, EvalExpr(op->iter_values[i]));
-  }
-  if (is_trivially_true(op->predicate)) {
-    VisitStmtTracked(op->block);
-  } else {
-    SunMMIOValue pred = EnsureType(
-        EvalExpr(op->predicate),
-        SunMMIOType{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}},
-        DataType::Bool());
-    TokenAnalyzer analyzer;
-    IterState st;
-    analyzer.AnalyzeStmt(op->block, st);
-    std::vector<int64_t> live_out_ids;
-    std::unordered_set<int64_t> live_out_seen;
-    auto add_live_out = [&](int64_t t) {
-      if (t < 0) {
-        return;
-      }
-      if (live_out_seen.insert(t).second) {
-        live_out_ids.push_back(t);
-      }
-    };
-    for (int64_t t : st.produced_order) {
-      if (t >= 0 && st.avail_tokens.count(t) != 0) {
-        add_live_out(t);
-      }
-    }
-    builder_->BeginIf(pred, live_out_ids);
-    VisitStmtTracked(op->block);
-    builder_->EndIf();
-  }
-  ExitScope();
+  UnsupportedStmt(
+      op, "BlockRealizeNode should be eliminated by LowerOpaqueBlock before "
+          "SunMMIO codegen");
 }
 
 void CodeGenTileLangSunMMIO::VisitStmtDefault_(const Object *op) {
@@ -1074,14 +1007,9 @@ void CodeGenTileLangSunMMIO::EmitStore(const tir::Buffer &buffer,
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::BufferLoadNode *op) {
-  LOG(FATAL) << "SunMMIO SUVM allocate phase does not handle BufferLoad yet";
-  // if (!buffer_registry_.count(op->buffer.get())) {
-  //   RegisterBuffer(op->buffer, false, NewValueName());
-  //   const BufferBinding &b = LookupBuffer(op->buffer);
-  //   builder_->Alloc(b.handle, b.buffer_type, {},
-  //                   MapStorageScope(op->buffer.scope()), op->buffer->dtype);
-  // }
-  return EmitLoad(op->buffer, op->indices);
+  UnsupportedExpr(
+      op, "generic BufferLoadNode should not reach SunMMIO codegen; tiled "
+          "buffer accesses must be lowered through tile-aware paths");
 }
 
 SunMMIOValue
@@ -1379,13 +1307,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
 [[noreturn]] void
 CodeGenTileLangSunMMIO::UnsupportedStmt(const Object *op,
                                         const std::string &detail) const {
-  // Intentional unsupported contract for this backend:
-  // - tir::WhileNode
-  // - legacy tir::LoadNode
-  // - tir::AnyNode
-  // - tir::ShuffleNode
-  // These forms must be eliminated before SunMMIO codegen; reaching here is
-  // a pipeline bug and should fail loudly.
+  // Generic SunMMIO codegen intentionally rejects pre-lowered structural forms.
+  // Reaching unsupported nodes here indicates a pipeline invariant violation.
   std::ostringstream os;
   os << "CodeGenTileLangSunMMIO unsupported stmt: " << op->GetTypeKey();
   if (!detail.empty()) {
@@ -1398,13 +1321,8 @@ CodeGenTileLangSunMMIO::UnsupportedStmt(const Object *op,
 [[noreturn]] void
 CodeGenTileLangSunMMIO::UnsupportedExpr(const Object *op,
                                         const std::string &detail) const {
-  // Intentional unsupported contract for this backend:
-  // - tir::WhileNode
-  // - legacy tir::LoadNode
-  // - tir::AnyNode
-  // - tir::ShuffleNode
-  // These forms must be eliminated before SunMMIO codegen; reaching here is
-  // a pipeline bug and should fail loudly.
+  // Generic SunMMIO codegen intentionally rejects pre-lowered structural forms.
+  // Reaching unsupported nodes here indicates a pipeline invariant violation.
   std::ostringstream os;
   os << "CodeGenTileLangSunMMIO unsupported expr: " << op->GetTypeKey();
   if (!detail.empty()) {
