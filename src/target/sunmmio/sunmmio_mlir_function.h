@@ -24,25 +24,21 @@ public:
 
   void BeginFor(const std::string &iv, const SunMMIOValue &lb,
                 const SunMMIOValue &ub, const SunMMIOValue &step,
-                const ffi::Map<ffi::String, ffi::Any> &annotations);
+                const ffi::Map<ffi::String, ffi::Any> &annotations,
+                const std::vector<int64_t> &live_out_token_ids);
   void EndFor();
 
-  void BeginIf(const SunMMIOValue &cond);
+  void BeginIf(const SunMMIOValue &cond,
+               const std::vector<int64_t> &live_out_token_ids);
   void BeginElse();
   void EndIf();
 
   void EmitAssert(const SunMMIOValue &cond, const std::string &msg_text);
 
 private:
-  struct IfFrame {
-    mlir::scf::IfOp op;
-    bool in_else{false};
-  };
-
   SunmmioMlirContext &ctx_;
   SunmmioMlirType type_;
   mlir::func::FuncOp current_func_;
-  std::vector<IfFrame> if_stack_;
 };
 
 } // namespace codegen

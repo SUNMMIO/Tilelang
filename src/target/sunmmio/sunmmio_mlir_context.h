@@ -11,6 +11,7 @@
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Value.h"
 
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,11 +28,59 @@ struct SunmmioMlirContext {
 
   using MLIRValueTable = std::unordered_map<std::string, mlir::Value>;
   std::vector<MLIRValueTable> mlir_value_table_stack;
+
+  std::unordered_map<int64_t, mlir::Value> token_by_id;
+
+  struct SavedToken {
+    bool existed{false};
+    mlir::Value value;
+  };
+
   struct ForFrame {
     mlir::scf::ForOp op;
     ffi::Map<ffi::String, ffi::Any> annotations;
+    // Token ids that must be carried by scf.for and materialized after the
+    // loop.
+    std::vector<int64_t> live_out_token_ids;
+    // token_id -> index into iter_tokens / produced_tokens.
+    std::unordered_map<int64_t, int> token_id_to_index;
+    // Region iter_args of scf.for (initially seeded by init_args).
+    std::vector<mlir::Value> iter_tokens;
+    // Tokens produced in the loop body; falls back to iter_tokens when empty.
+    std::vector<mlir::Value> produced_tokens;
+    // Snapshots of ctx.token_by_id to restore when closing the loop.
+    std::unordered_map<int64_t, SavedToken> saved_token_by_id;
   };
   std::vector<ForFrame> for_stack;
+
+  struct IfFrame {
+    mlir::scf::IfOp op;
+    bool in_else{false};
+    // Token ids that must be carried by scf.if and materialized after the if.
+    std::vector<int64_t> live_out_token_ids;
+    // token_id -> index into base_tokens / produced_tokens / then_yield_tokens.
+    std::unordered_map<int64_t, int> token_id_to_index;
+    // The token values seen before entering the if (used as defaults for both
+    // branches).
+    std::vector<mlir::Value> base_tokens;
+    // Tokens produced by the active branch; merged into the surrounding scope
+    // after EndIf.
+    std::vector<mlir::Value> produced_tokens;
+    // Tokens yielded from the then branch (cached to build consistent yields
+    // across branches).
+    std::vector<mlir::Value> then_yield_tokens;
+    // Snapshots of ctx.token_by_id to restore when closing the if.
+    std::unordered_map<int64_t, SavedToken> saved_token_by_id;
+  };
+  std::vector<IfFrame> if_stack;
+
+  enum class ControlKind { kFor, kIf };
+
+  struct ControlNode {
+    ControlKind kind;
+    int index{0};
+  };
+  std::vector<ControlNode> control_flow_stack;
 
   const ffi::Map<ffi::String, ffi::Any> *CurrentForAnnotations() const {
     if (for_stack.empty()) {

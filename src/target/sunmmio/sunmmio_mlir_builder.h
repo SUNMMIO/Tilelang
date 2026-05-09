@@ -87,10 +87,12 @@ public:
 
   void BeginFor(const std::string &iv, const SunMMIOValue &lb,
                 const SunMMIOValue &ub, const SunMMIOValue &step,
-                const ffi::Map<ffi::String, ffi::Any> &annotations) final;
+                const ffi::Map<ffi::String, ffi::Any> &annotations,
+                const std::vector<int64_t> &live_out_token_ids) final;
   void EndFor() final;
 
-  void BeginIf(const SunMMIOValue &cond) final;
+  void BeginIf(const SunMMIOValue &cond,
+               const std::vector<int64_t> &live_out_token_ids) final;
   void BeginElse() final;
   void EndIf() final;
 

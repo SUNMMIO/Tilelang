@@ -7,7 +7,10 @@ SunmmioMlirContext::SunmmioMlirContext() : builder(&mlir_ctx) {}
 
 void SunmmioMlirContext::Clear() {
   mlir_value_table_stack.clear();
+  token_by_id.clear();
   for_stack.clear();
+  if_stack.clear();
+  control_flow_stack.clear();
   module = nullptr;
 }
 

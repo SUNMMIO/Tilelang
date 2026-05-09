@@ -101,10 +101,12 @@ public:
 
   virtual void BeginFor(const std::string &iv, const SunMMIOValue &lb,
                         const SunMMIOValue &ub, const SunMMIOValue &step,
-                        const ffi::Map<ffi::String, ffi::Any> &annotations) = 0;
+                        const ffi::Map<ffi::String, ffi::Any> &annotations,
+                        const std::vector<int64_t> &live_out_token_ids) = 0;
   virtual void EndFor() = 0;
 
-  virtual void BeginIf(const SunMMIOValue &cond) = 0;
+  virtual void BeginIf(const SunMMIOValue &cond,
+                       const std::vector<int64_t> &live_out_token_ids) = 0;
   virtual void BeginElse() = 0;
   virtual void EndIf() = 0;
 

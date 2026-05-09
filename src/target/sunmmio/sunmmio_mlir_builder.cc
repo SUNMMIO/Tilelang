@@ -147,14 +147,16 @@ SunMMIOValue SuvmSunmmioBuilder::Broadcast(const std::string &result_name,
 void SuvmSunmmioBuilder::BeginFor(
     const std::string &iv, const SunMMIOValue &lb, const SunMMIOValue &ub,
     const SunMMIOValue &step,
-    const ffi::Map<ffi::String, ffi::Any> &annotations) {
-  function_->BeginFor(iv, lb, ub, step, annotations);
+    const ffi::Map<ffi::String, ffi::Any> &annotations,
+    const std::vector<int64_t> &live_out_token_ids) {
+  function_->BeginFor(iv, lb, ub, step, annotations, live_out_token_ids);
 }
 
 void SuvmSunmmioBuilder::EndFor() { function_->EndFor(); }
 
-void SuvmSunmmioBuilder::BeginIf(const SunMMIOValue &cond) {
-  function_->BeginIf(cond);
+void SuvmSunmmioBuilder::BeginIf(
+    const SunMMIOValue &cond, const std::vector<int64_t> &live_out_token_ids) {
+  function_->BeginIf(cond, live_out_token_ids);
 }
 
 void SuvmSunmmioBuilder::BeginElse() { function_->BeginElse(); }

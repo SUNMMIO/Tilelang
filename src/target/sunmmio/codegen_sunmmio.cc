@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <unordered_set>
 #include <utility>
 
 #include <tvm/runtime/logging.h>
@@ -416,7 +417,222 @@ void CodeGenTileLangSunMMIO::EmitAlloc(const tir::Var &buffer_var,
   BindVar(buffer_var, alloc);
 }
 
+namespace {
+struct TokenSummary {
+  std::vector<int64_t> live_out;
+};
+
+struct IterState {
+  std::unordered_set<int64_t> avail_tokens;
+
+  std::vector<int64_t> produced_order;
+  std::unordered_set<int64_t> produced_seen;
+
+  void MarkProduced(int64_t token_id) {
+    if (token_id < 0) {
+      return;
+    }
+    avail_tokens.insert(token_id);
+    if (produced_seen.insert(token_id).second) {
+      produced_order.push_back(token_id);
+    }
+  }
+};
+
+struct TokenAnalyzer {
+  static int64_t ParseTokenIdFromArgs(const ffi::Array<PrimExpr> &args) {
+    for (const PrimExpr &arg : args) {
+      if (const auto *call = arg.as<CallNode>()) {
+        if (const auto *op_node = call->op.as<OpNode>()) {
+          if (op_node->name == "tl.sync_token_id" && call->args.size() == 1) {
+            if (const auto *imm = call->args[0].as<IntImmNode>()) {
+              return static_cast<int64_t>(imm->value);
+            }
+          }
+        }
+      }
+    }
+    for (const PrimExpr &arg : args) {
+      if (const auto *imm = arg.as<IntImmNode>()) {
+        return static_cast<int64_t>(imm->value);
+      }
+    }
+    return -1;
+  }
+
+  static void MergeProducedOrder(IterState &dst,
+                                 const std::vector<int64_t> &order) {
+    for (int64_t t : order) {
+      if (t < 0) {
+        continue;
+      }
+      if (dst.produced_seen.insert(t).second) {
+        dst.produced_order.push_back(t);
+      }
+    }
+  }
+
+  TokenSummary AnalyzeFor(const tir::ForNode *for_op) {
+    IterState st;
+    AnalyzeStmt(for_op->body, st);
+
+    std::vector<int64_t> live_out_order;
+    live_out_order.reserve(st.produced_order.size());
+    for (int64_t t : st.produced_order) {
+      if (t >= 0 && st.avail_tokens.count(t) != 0) {
+        live_out_order.push_back(t);
+      }
+    }
+
+    TokenSummary summary;
+    summary.live_out = std::move(live_out_order);
+    return summary;
+  }
+
+  TokenSummary AnalyzeIf(const tir::IfThenElseNode *if_op) {
+    IterState then_st;
+    AnalyzeStmt(if_op->then_case, then_st);
+    IterState else_st;
+    if (if_op->else_case.defined()) {
+      AnalyzeStmt(if_op->else_case.value(), else_st);
+    }
+
+    std::vector<int64_t> live_out_order;
+    std::unordered_set<int64_t> live_out_set;
+    for (int64_t t : then_st.produced_order) {
+      if (t >= 0 && then_st.avail_tokens.count(t) != 0) {
+        if (live_out_set.insert(t).second) {
+          live_out_order.push_back(t);
+        }
+      }
+    }
+    for (int64_t t : else_st.produced_order) {
+      if (t >= 0 && else_st.avail_tokens.count(t) != 0) {
+        if (live_out_set.insert(t).second) {
+          live_out_order.push_back(t);
+        }
+      }
+    }
+
+    TokenSummary summary;
+    summary.live_out = std::move(live_out_order);
+    return summary;
+  }
+
+  void AnalyzeStmt(const Stmt &stmt, IterState &st) {
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const Stmt &s : seq->seq) {
+        AnalyzeStmt(s, st);
+      }
+      return;
+    }
+
+    if (const auto *inner_for = stmt.as<ForNode>()) {
+      TokenSummary inner = AnalyzeFor(inner_for);
+      for (int64_t t : inner.live_out) {
+        st.MarkProduced(t);
+      }
+
+      return;
+    }
+
+    if (const auto *block = stmt.as<BlockNode>()) {
+      if (block->init.defined()) {
+        AnalyzeStmt(block->init.value(), st);
+      }
+      AnalyzeStmt(block->body, st);
+      return;
+    }
+
+    if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+      AnalyzeStmt(realize->block, st);
+      return;
+    }
+
+    if (const auto *alloc = stmt.as<AllocateNode>()) {
+      AnalyzeStmt(alloc->body, st);
+      return;
+    }
+
+    if (const auto *alloc_const = stmt.as<AllocateConstNode>()) {
+      AnalyzeStmt(alloc_const->body, st);
+      return;
+    }
+
+    if (const auto *buf_realize = stmt.as<BufferRealizeNode>()) {
+      AnalyzeStmt(buf_realize->body, st);
+      return;
+    }
+
+    if (const auto *decl_buf = stmt.as<DeclBufferNode>()) {
+      AnalyzeStmt(decl_buf->body, st);
+      return;
+    }
+
+    if (const auto *asserts = stmt.as<AssertStmtNode>()) {
+      AnalyzeStmt(asserts->body, st);
+      return;
+    }
+
+    if (const auto *eval = stmt.as<EvaluateNode>()) {
+      if (const auto *call = eval->value.as<CallNode>()) {
+        if (const auto *op_node = call->op.as<OpNode>()) {
+          if (op_node->name == "tl.dma_copy") {
+            int64_t token_id = ParseTokenIdFromArgs(call->args);
+            st.MarkProduced(token_id);
+            return;
+          }
+          if (op_node->name == "tl.sync_null_token") {
+            int64_t token_id = ParseTokenIdFromArgs(call->args);
+            st.MarkProduced(token_id);
+            return;
+          }
+          if (op_node->name == "tl.wait_token") {
+            int64_t token_id = ParseTokenIdFromArgs(call->args);
+            if (token_id >= 0) {
+              st.avail_tokens.erase(token_id);
+            }
+            return;
+          }
+        }
+      }
+      return;
+    }
+
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      AnalyzeStmt(attr->body, st);
+      return;
+    }
+
+    if (const auto *let = stmt.as<LetStmtNode>()) {
+      AnalyzeStmt(let->body, st);
+      return;
+    }
+
+    if (const auto *ifs = stmt.as<IfThenElseNode>()) {
+      IterState then_st = st;
+      AnalyzeStmt(ifs->then_case, then_st);
+      IterState else_st = st;
+      if (ifs->else_case.defined()) {
+        AnalyzeStmt(ifs->else_case.value(), else_st);
+      }
+
+      st.avail_tokens = then_st.avail_tokens;
+      st.avail_tokens.insert(else_st.avail_tokens.begin(),
+                             else_st.avail_tokens.end());
+
+      MergeProducedOrder(st, then_st.produced_order);
+      MergeProducedOrder(st, else_st.produced_order);
+      return;
+    }
+  }
+};
+} // namespace
+
 void CodeGenTileLangSunMMIO::EmitFor(const tir::ForNode *op) {
+  TokenAnalyzer analyzer;
+  TokenSummary summary = analyzer.AnalyzeFor(op);
+
   SunMMIOValue min = EnsureIndex(EvalExpr(op->min));
   SunMMIOValue extent = EnsureIndex(EvalExpr(op->extent));
   SunMMIOValue step = EmitConstIndex(1);
@@ -425,7 +641,7 @@ void CodeGenTileLangSunMMIO::EmitFor(const tir::ForNode *op) {
       SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
       DataType::Int(32));
   std::string iv = "%" + op->loop_var->name_hint;
-  builder_->BeginFor(iv, min, upper, step, op->annotations);
+  builder_->BeginFor(iv, min, upper, step, op->annotations, summary.live_out);
   EnterScope();
   BindVar(
       op->loop_var,
@@ -442,7 +658,9 @@ void CodeGenTileLangSunMMIO::EmitIf(const tir::IfThenElseNode *op) {
       EvalExpr(op->condition),
       SunMMIOType{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}},
       DataType::Bool());
-  builder_->BeginIf(cond);
+  TokenAnalyzer analyzer;
+  TokenSummary summary = analyzer.AnalyzeIf(op);
+  builder_->BeginIf(cond, summary.live_out);
   VisitStmtTracked(op->then_case);
   if (op->else_case.defined()) {
     builder_->BeginElse();
@@ -666,7 +884,25 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockRealizeNode *op) {
         EvalExpr(op->predicate),
         SunMMIOType{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}},
         DataType::Bool());
-    builder_->BeginIf(pred);
+    TokenAnalyzer analyzer;
+    IterState st;
+    analyzer.AnalyzeStmt(op->block, st);
+    std::vector<int64_t> live_out_ids;
+    std::unordered_set<int64_t> live_out_seen;
+    auto add_live_out = [&](int64_t t) {
+      if (t < 0) {
+        return;
+      }
+      if (live_out_seen.insert(t).second) {
+        live_out_ids.push_back(t);
+      }
+    };
+    for (int64_t t : st.produced_order) {
+      if (t >= 0 && st.avail_tokens.count(t) != 0) {
+        add_live_out(t);
+      }
+    }
+    builder_->BeginIf(pred, live_out_ids);
     VisitStmtTracked(op->block);
     builder_->EndIf();
   }
@@ -1082,9 +1318,32 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
   } else if (const auto *gv = op->op.as<GlobalVarNode>()) {
     callee = gv->name_hint;
   }
+  bool is_token_intrin =
+      (callee == "tl.sync_null_token" || callee == "tl.wait_token");
   std::vector<SunMMIOValue> operands;
   std::vector<std::string> string_args;
-  for (const PrimExpr &arg : op->args) {
+  for (int i = 0, e = static_cast<int>(op->args.size()); i < e; ++i) {
+    const PrimExpr &arg = op->args[i];
+    if (const auto *call = arg.as<CallNode>()) {
+      if (const auto *op_node = call->op.as<OpNode>()) {
+        if (op_node->name == "tl.sync_token_id" && call->args.size() == 1) {
+          if (const auto *imm = call->args[0].as<IntImmNode>()) {
+            MarkVisitedNodeType("tir.IntImm");
+            string_args.push_back(
+                "token_id=" + std::to_string(static_cast<int64_t>(imm->value)));
+            continue;
+          }
+        }
+      }
+    }
+    if (is_token_intrin && i == 0) {
+      if (const auto *imm = arg.as<IntImmNode>()) {
+        MarkVisitedNodeType("tir.IntImm");
+        string_args.push_back("token_id=" +
+                              std::to_string(static_cast<int64_t>(imm->value)));
+        continue;
+      }
+    }
     if (const auto *s = arg.as<StringImmNode>()) {
       MarkVisitedNodeType("tir.StringImm");
       string_args.push_back(static_cast<std::string>(s->value));
