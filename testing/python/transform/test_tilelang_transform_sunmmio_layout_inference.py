@@ -43,7 +43,7 @@ def apply_passes_up_to_layout_inference(mod, target):
     mod = tl.transform.InjectAssumes()(mod)
     mod = tl.transform.Simplify()(mod)
     mod = tl.transform.InferSramScope()(mod)
-    mod = tl.transform.LegalizeSunmmioCopyPath()(mod)
+    mod = tl.transform.LegalizeSunmmioDataPath()(mod)
     mod = tl.transform.LayoutReducer()(mod)
     mod = tl.transform.SunmmioLayoutInference()(mod)
     return mod
@@ -1043,9 +1043,9 @@ def dram_zn_to_asram_kernel():
 
 
 def test_dram_zn_to_asram_succeeds_via_staged_rsram():
-    """DRAM with ZN layout → Copy to ASRAM succeeds via LegalizeSunmmioCopyPath staging through RSRAM.
+    """DRAM with ZN layout → Copy to ASRAM succeeds via LegalizeSunmmioDataPath staging through RSRAM.
 
-    LegalizeSunmmioCopyPath rewrites global→asram into global→rsram + rsram→asram,
+    LegalizeSunmmioDataPath rewrites global→asram into global→rsram + rsram→asram,
     so layout inference assigns a ZZ layout to the ASRAM buffer regardless of the
     DRAM layout.
     """

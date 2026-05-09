@@ -112,7 +112,7 @@ BroadcastOp::BroadcastOp(Array<PrimExpr> args,
   std::tie(node->src_range, node->dst_range) = std::tie(rgs[0], rgs[1]);
   node->size = Downcast<IntImm>(args[2]);
   node->dst_offset = Downcast<IntImm>(args[3]);
-  node->src_core = Downcast<IntImm>(args[4]);
+  node->src_core = args[4];
   node->direction = Downcast<IntImm>(args[5])->value;
   data_ = std::move(node);
 }
@@ -145,9 +145,12 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
   int mesh_ncol = mesh.ncol;
 
   // check for valid core id
-  ICHECK(src_core->value >= 0 and src_core->value < mesh_nrow * mesh_ncol)
-      << "Source core id " << src_core->value << " out of range [0, "
-      << mesh_nrow * mesh_ncol << ")";
+  if (src_core.as<IntImmNode>()) {
+    int src_core_val = src_core.as<IntImmNode>()->value;
+    ICHECK(src_core_val >= 0 and src_core_val < mesh_nrow * mesh_ncol)
+        << "Source core id " << src_core_val << " out of range [0, "
+        << mesh_nrow * mesh_ncol << ")";
+  }
 
   // check for src and dst buffer sizes
   PrimExpr src_elements = 1;
@@ -197,7 +200,6 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
   PrimExpr dst_addr =
       dst.access_ptr(2, DataType::Handle(), 1,
                      Downcast<IntImm>(dst_offset->value), src_elements);
-  int src_core_col = src_core->value % mesh_ncol;
 
   if (direction == 0 or direction == 1) {
     // 1D broadcast
@@ -211,6 +213,11 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
     return broadcast;
   } else {
     // 2D broadcast
+    ICHECK(src_core.as<IntImmNode>())
+        << "2D broadcast only supports constant source core id.";
+    int src_core_val = src_core.as<IntImmNode>()->value;
+    int src_core_col = src_core_val % mesh_ncol;
+
     Array<Stmt> seq;
     // vertical broadcast
     Array<PrimExpr> args;
@@ -255,8 +262,8 @@ PutOp::PutOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   std::tie(node->src, node->dst) = std::tie(bf[0], bf[1]);
   std::tie(node->src_range, node->dst_range) = std::tie(rgs[0], rgs[1]);
   node->size = Downcast<IntImm>(args[2]);
-  node->src_core = Downcast<IntImm>(args[3]);
-  node->dst_core = Downcast<IntImm>(args[4]);
+  node->src_core = args[3];
+  node->dst_core = args[4];
   data_ = std::move(node);
 }
 
@@ -287,12 +294,18 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   int mesh_ncol = mesh.ncol;
 
   // check for valid core id
-  ICHECK(src_core->value >= 0 and src_core->value < mesh_nrow * mesh_ncol)
-      << "Source core id " << src_core->value << " out of range [0, "
-      << mesh_nrow * mesh_ncol << ")";
-  ICHECK(dst_core->value >= 0 and dst_core->value < mesh_nrow * mesh_ncol)
-      << "Destination core id " << dst_core->value << " out of range [0, "
-      << mesh_nrow * mesh_ncol << ")";
+  if (src_core.as<IntImmNode>()) {
+    int src_core_val = src_core.as<IntImmNode>()->value;
+    ICHECK(src_core_val >= 0 and src_core_val < mesh_nrow * mesh_ncol)
+        << "Source core id " << src_core_val << " out of range [0, "
+        << mesh_nrow * mesh_ncol << ")";
+  }
+  if (dst_core.as<IntImmNode>()) {
+    int dst_core_val = dst_core.as<IntImmNode>()->value;
+    ICHECK(dst_core_val >= 0 and dst_core_val < mesh_nrow * mesh_ncol)
+        << "Destination core id " << dst_core_val << " out of range [0, "
+        << mesh_nrow * mesh_ncol << ")";
+  }
 
   // check for src and dst buffer sizes
   PrimExpr src_elements = 1;
@@ -334,10 +347,16 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   // all checks passed, generate the call
   PrimExpr src_addr = src.access_ptr(1, DataType::Handle(), 1, 0, src_elements);
   PrimExpr dst_addr = dst.access_ptr(2, DataType::Handle(), 1, 0, dst_elements);
-  int src_core_row = src_core->value / mesh_ncol;
-  int src_core_col = src_core->value % mesh_ncol;
-  int dst_core_row = dst_core->value / mesh_ncol;
-  int dst_core_col = dst_core->value % mesh_ncol;
+  ICHECK(src_core.as<IntImmNode>())
+      << "Put only supports constant source core id.";
+  ICHECK(dst_core.as<IntImmNode>())
+      << "Put only supports constant destination core id.";
+  int src_core_val = src_core.as<IntImmNode>()->value;
+  int dst_core_val = dst_core.as<IntImmNode>()->value;
+  int src_core_row = src_core_val / mesh_ncol;
+  int src_core_col = src_core_val % mesh_ncol;
+  int dst_core_row = dst_core_val / mesh_ncol;
+  int dst_core_col = dst_core_val % mesh_ncol;
 
   if (src_core_row == dst_core_row) {
     // 1D put via horizontal communication

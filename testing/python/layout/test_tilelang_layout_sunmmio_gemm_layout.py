@@ -106,7 +106,7 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, versio
         mod = matmul(M, N, K, block_M, block_N, block_K, version)
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tl.transform.InferSramScope()(mod)
-        mod = tl.transform.LegalizeSunmmioCopyPath()(mod)
+        mod = tl.transform.LegalizeSunmmioDataPath()(mod)
         mod = tl.transform.LayoutReducer()(mod)
         mod = tl.transform.SunmmioLayoutInference()(mod)
         LayoutVisual()(mod)

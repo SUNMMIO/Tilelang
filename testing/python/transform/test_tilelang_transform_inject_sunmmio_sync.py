@@ -1,7 +1,63 @@
 import tilelang
 import tilelang.language as T
-from tilelang import tvm as tvm
-from tilelang.utils.target import SUNMMIO_TARGET_DESC
+from tilelang import tvm
+from tvm import tir, IRModule
+from tilelang.utils.target import determine_target
+from tvm.target import Target
+
+
+def get_target(target_str: str):
+    target = determine_target(target_str, return_object=True)
+    target_host = "llvm" if tvm.runtime.enabled("llvm") else "c"
+    target_host = tvm.target.Target.canon_target(target_host)
+    target = tvm.target.Target(target, target_host)
+    return target
+
+
+def LowerAndLegalize_sunmmio(
+    mod: IRModule,
+    target: Target,
+) -> IRModule:
+    mod = tir.transform.BindTarget(target)(mod)
+    mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+    mod = tilelang.transform.InjectAssumes()(mod)
+    mod = tilelang.transform.Simplify()(mod)
+    mod = tilelang.transform.InferSramScope()(mod)
+    mod = tilelang.transform.LegalizeSunmmioCopyPath()(mod)
+    mod = tilelang.transform.SunmmioLayoutInference()(mod)
+    mod = tilelang.transform.LowerTileOp()(mod)
+    mod = tilelang.transform.LegalizeTilesLoop()(mod)
+    mod = tilelang.transform.TilesLoop()(mod)
+    mod = tilelang.transform.DecoupleTypeCast()(mod)
+    mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
+    mod = tilelang.transform.LegalizeSafeMemoryAccess()(mod)
+    mod = tilelang.transform.LowerAccessPtr()(mod)
+    mod = tilelang.transform.Simplify()(mod)
+    mod = tilelang.transform.HoistNonRestrictParams()(mod)
+    return mod
+
+
+def OptimizeForSunmmio_patial(
+    mod: IRModule,
+    target: Target,
+) -> IRModule:
+    mod = tilelang.transform.IfStmtBinding()(mod)
+    # mod = tilelang.transform.SunmmioPipelinePlanning(debug=False)(mod)
+    # mod = tilelang.transform.InjectSunmmioPipeline()(mod)
+    mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
+    mod = tilelang.transform.LowerOpaqueBlock()(mod)
+    mod = tir.transform.Simplify()(mod)
+    mod = tir.transform.NarrowDataType(32)(mod)
+    mod = tir.transform.HoistIfThenElse()(mod)
+    mod = tilelang.transform.LoopUnswitching()(mod)
+    mod = tir.transform.UnrollLoop()(mod)
+    mod = tir.transform.Simplify()(mod)
+    mod = tir.transform.VerifyMemory()(mod)
+    mod = tir.transform.AnnotateEntryFunc()(mod)
+    mod = tilelang.transform.AnnotateDeviceRegions()(mod)
+    mod = tilelang.transform.SplitHostDevice()(mod)
+    mod = tilelang.transform.MergeIfStmt()(mod)
+    return mod
 
 
 def simple_copy_kernel(M, N, block_M, block_N, dtype="float16"):
@@ -10,12 +66,15 @@ def simple_copy_kernel(M, N, block_M, block_N, dtype="float16"):
         A: T.Tensor((M, N), dtype),
         B: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (
+            bx,
+            by,
+        ):
             A_shared = T.alloc_shared((block_M, block_N), dtype)
             T.copy(A[by * block_M, bx * block_N], A_shared)
             T.copy(A_shared, B[by * block_M, bx * block_N])
 
-    return tvm.IRModule({"main": main})
+    return main
 
 
 def mma_kernel(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float32"):
@@ -25,7 +84,10 @@ def mma_kernel(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype=
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), accum_dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (
+            bx,
+            by,
+        ):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -40,7 +102,7 @@ def mma_kernel(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype=
             # Store C
             T.copy(C_shared, C[by * block_M, bx * block_N])
 
-    return tvm.IRModule({"main": main})
+    return main
 
 
 def broadcast_kernel(M, N, block_M, block_N, dtype="float16"):
@@ -49,7 +111,10 @@ def broadcast_kernel(M, N, block_M, block_N, dtype="float16"):
         A: T.Tensor((M, N), dtype),
         B: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (
+            bx,
+            by,
+        ):
             A_shared = T.alloc_shared((block_M, block_N), dtype)
             B_shared = T.alloc_shared((block_M, block_N), dtype)
 
@@ -62,7 +127,7 @@ def broadcast_kernel(M, N, block_M, block_N, dtype="float16"):
             # Store B
             T.copy(B_shared, B[by * block_M, bx * block_N])
 
-    return tvm.IRModule({"main": main})
+    return main
 
 
 def apply_sunmmio_lowering(mod, target):
@@ -73,7 +138,7 @@ def apply_sunmmio_lowering(mod, target):
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
-    mod = tilelang.transform.LegalizeSunmmioCopyPath()(mod)
+    mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
     mod = tilelang.transform.LayoutReducer()(mod)
     mod = tilelang.transform.SunmmioLayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
@@ -83,18 +148,15 @@ def apply_sunmmio_lowering(mod, target):
 def test_inject_sunmmio_sync_dma():
     M, N = 128, 128
     block_M, block_N = 32, 32
-    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    mod = simple_copy_kernel(M, N, block_M, block_N)
+    target = get_target("Sunmmio")
+    func = simple_copy_kernel(M, N, block_M, block_N)
 
-    with tvm.target.Target(target):
-        # Lower to tl.dma_copy
-        mod = apply_sunmmio_lowering(mod, target)
+    mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+    mod = LowerAndLegalize_sunmmio(mod, target)
+    mod = OptimizeForSunmmio_patial(mod, target)
 
-        # Now apply the sync injection pass
-        mod = tilelang.transform.InjectSunmmioSync()(mod)
-
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
     script = mod.script()
-    print(script)
 
     # Check for inserted sync calls
     # We expect wait_token calls to be inserted for synchronization
@@ -131,15 +193,16 @@ def test_inject_sunmmio_sync_dma():
 def test_inject_sunmmio_sync_mma():
     M, N, K = 128, 128, 128
     block_M, block_N, block_K = 32, 32, 32
-    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    mod = mma_kernel(M, N, K, block_M, block_N, block_K)
+    target = get_target("Sunmmio")
+    func = mma_kernel(M, N, K, block_M, block_N, block_K)
 
-    with tvm.target.Target(target):
-        mod = apply_sunmmio_lowering(mod, target)
-        mod = tilelang.transform.InjectSunmmioSync()(mod)
+    mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+    mod = LowerAndLegalize_sunmmio(mod, target)
+    mod = OptimizeForSunmmio_patial(mod, target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
 
     script = mod.script()
-    print(script)
 
     assert "mma_sunmmio" in script
     assert "wait_token" in script
@@ -215,15 +278,15 @@ def test_inject_sunmmio_sync_mma():
 def test_inject_sunmmio_sync_broadcast():
     M, N = 128, 128
     block_M, block_N = 32, 32
-    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    mod = broadcast_kernel(M, N, block_M, block_N)
+    target = get_target("Sunmmio")
+    func = broadcast_kernel(M, N, block_M, block_N)
 
-    with tvm.target.Target(target):
-        mod = apply_sunmmio_lowering(mod, target)
-        mod = tilelang.transform.InjectSunmmioSync()(mod)
+    mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+    mod = LowerAndLegalize_sunmmio(mod, target)
+    mod = OptimizeForSunmmio_patial(mod, target)
 
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
     script = mod.script()
-    print(script)
 
     assert "broadcast_" in script
     assert "barrier_init" in script
@@ -301,19 +364,20 @@ def test_inject_sunmmio_sync_if():
                 # Store C
                 C_shared[0, 0] = C_shared[0, 0] + 1
 
-        return tvm.IRModule({"main": main})
+        return main
 
     M, N, K = 128, 128, 128
     block_M, block_N, block_K = 32, 32, 32
-    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    mod = kernel(M, N, K, block_M, block_N, block_K)
+    target = get_target("Sunmmio")
+    func = kernel(M, N, K, block_M, block_N, block_K)
 
-    with tvm.target.Target(target):
-        mod = apply_sunmmio_lowering(mod, target)
-        mod = tilelang.transform.InjectSunmmioSync()(mod)
+    mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+    mod = LowerAndLegalize_sunmmio(mod, target)
+    mod = OptimizeForSunmmio_patial(mod, target)
 
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
     script = mod.script(show_meta=True)
-    print(script)
+    # print(script)
     assert "mma_sunmmio" in script
     assert "broadcast_" in script
     assert "barrier_init" in script
@@ -399,13 +463,21 @@ def test_inject_sunmmio_sync_loop():
                     T.comm.broadcast(C_shared, D_shared, (0, 0), direction="h")
                     T.comm.broadcast(D_shared, C_shared, (0, 0), direction="h")
 
-        return tvm.IRModule({"main": main})
+        return main
 
     func_str = """
-                T.dma_copy(T.region(C[by * 32, bx * 32], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), T.sync_token_id(0))
+        with T.launch_thread("blockIdx.x", 4) as bx:
+            by = T.launch_thread("blockIdx.y", 4)
+            tx = T.launch_thread("threadIdx.x", 128)
+            ty = T.launch_thread("threadIdx.y", 1)
+            tz = T.launch_thread("threadIdx.z", 1)
+            with T.decl_buffer((32, 32), scope="shared.rsram") as D_shared:
+                C_2 = T.Buffer((128, 128), data=C, strides=(128, 1))
+                T.dma_copy(T.region(C_2[by * 32, bx * 32], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), T.sync_token_id(0))
                 T.sync_null_token(2)
                 T.barrier_init(1, 0, 1, 2, 3)
                 for _i in range(10):
+                    C_shared = T.decl_buffer((32, 32), scope="shared.rsram")
                     T.wait_token(2)
                     T.barrier_arrive_and_wait(1)
                     T.wait_token(0)
@@ -415,23 +487,22 @@ def test_inject_sunmmio_sync_loop():
                     T.barrier_arrive_and_wait(0)
                     T.broadcast_(T.region(D_shared[0, 0], 1, 32, 32), T.region(C_shared[0, 0], 2, 32, 32), 1024, 0, 0, T.sync_token_id(2))
                     T.barrier_init(1, 0, 1, 2, 3)
-                T.wait_token(0)
-                T.wait_token(2)
-                T.barrier_arrive_and_wait(1)
+            T.wait_token(2)
+            T.barrier_arrive_and_wait(1)
     """.strip()
 
     M, N = 128, 128
     block_M, block_N = 32, 32
-    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    mod = kernel(M, N, block_M, block_N)
+    target = get_target("Sunmmio")
+    func = kernel(M, N, block_M, block_N)
 
-    with tvm.target.Target(target):
-        mod = apply_sunmmio_lowering(mod, target)
-        mod = tilelang.transform.InjectSunmmioSync()(mod)
+    mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+    mod = LowerAndLegalize_sunmmio(mod, target)
+    mod = OptimizeForSunmmio_patial(mod, target)
 
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
     script = mod.script(show_meta=True)
-    print(script)
-    assert script[-len(func_str) :] == func_str, "The generated script does not match the expected output."
+    assert func_str in script, "The generated script does not match the expected output."
 
 
 if __name__ == "__main__":

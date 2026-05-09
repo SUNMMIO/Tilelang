@@ -1,4 +1,4 @@
-"""Test that SUNMMIO copy lowering emits tl.dma_copy with tl.tileop.region args,
+"""Test that SUNMMIO datapath lowering emits tl.dma_copy with tl.tileop.region args,
 and that each region can be normalized back to a BufferRegion with full metadata."""
 
 import re
@@ -31,14 +31,14 @@ def simple_copy_kernel(M, N, block_M, block_N, dtype="float16"):
 
 
 def apply_sunmmio_passes(mod, target):
-    """Apply the full SUNMMIO pass pipeline used for DMA copy lowering."""
+    """Apply the SUNMMIO pass pipeline used for datapath and DMA copy lowering."""
     mod = tvm.tir.transform.BindTarget(target)(mod)
     mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
     mod = tilelang.transform.LegalizeNegativeIndex()(mod)
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
-    mod = tilelang.transform.LegalizeSunmmioCopyPath()(mod)
+    mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
     mod = tilelang.transform.LayoutReducer()(mod)
     mod = tilelang.transform.SunmmioLayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
@@ -322,8 +322,8 @@ MESH_COPY_CASES = [
             # DRAM <- RSRAM
             'T.dma_copy(T.region(C_shared[0, 0], 1, 64, 64), T.region(C[by * 64, ko * 32], 2, 64, 64))',
             # DRAM -> ASRAM (staged through RSRAM)
-            'T.dma_copy(T.region(C[by * 64, ko * 32], 1, 64, 64), T.region(A_shared_rsram_stage[0, 0], 2, 64, 64))',
-            'T.dma_copy(T.region(A_shared_rsram_stage[0, 0], 1, 64, 64), T.region(A_shared[0, 0], 2, 64, 64))',
+            'T.dma_copy(T.region(C[by * 64, ko * 32], 1, 64, 64), T.region(C_rsram_stage[0, 0], 2, 64, 64))',
+            'T.dma_copy(T.region(C_rsram_stage[0, 0], 1, 64, 64), T.region(A_shared[0, 0], 2, 64, 64))',
             # RSRAM -> ASRAM
             'T.dma_copy(T.region(C_shared[8, 16], 1, 16, 32), T.region(A_shared[24, 8], 2, 16, 32))',
             # RSRAM -> WSRAM
@@ -340,8 +340,8 @@ MESH_COPY_CASES = [
             # DRAM <- RSRAM
             'T.dma_copy(T.region(C_shared[0, 0], 1, 64, 64), T.region(C[by * 64, ko * 64], 2, 64, 64))',
             # DRAM -> ASRAM (staged through RSRAM)
-            'T.dma_copy(T.region(C[by * 64, ko * 64], 1, 64, 64), T.region(A_shared_rsram_stage[0, 0], 2, 64, 64))',
-            'T.dma_copy(T.region(A_shared_rsram_stage[0, 0], 1, 64, 64), T.region(A_shared[0, 0], 2, 64, 64))',
+            'T.dma_copy(T.region(C[by * 64, ko * 64], 1, 64, 64), T.region(C_rsram_stage[0, 0], 2, 64, 64))',
+            'T.dma_copy(T.region(C_rsram_stage[0, 0], 1, 64, 64), T.region(A_shared[0, 0], 2, 64, 64))',
             # RSRAM -> ASRAM
             'T.dma_copy(T.region(C_shared[8, 16], 1, 16, 32), T.region(A_shared[24, 8], 2, 16, 32))',
             # RSRAM -> WSRAM
@@ -371,4 +371,4 @@ def test_tilelang_mesh_copy_to_dma(K, block_M, block_N, block_K, lower_stmt):
         for text in texts:
             assert '"layout_map"' in text and ('C_shared: metadata["tl.Layout"]' in text or 'C_shared: metadata["tl.CuteLayout"]' in text)
         layout_map = extract_layout_map(mod)
-        assert "A_shared_rsram_stage" in layout_map
+        assert "C_rsram_stage" in layout_map
