@@ -23,7 +23,7 @@ def LowerAndLegalize_sunmmio(
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
-    mod = tilelang.transform.LegalizeSunmmioCopyPath()(mod)
+    mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
     mod = tilelang.transform.SunmmioLayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     mod = tilelang.transform.LegalizeTilesLoop()(mod)

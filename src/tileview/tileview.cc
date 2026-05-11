@@ -44,7 +44,7 @@ TileViewNode::TileViewNode(Array<PrimExpr> buffer_shape,
 
   // Compute tiled_buffer_shape
   // For each original dimension:
-  // - If tiled: replace with num_tiles (buffer_dim / tile_dim)
+  // - If tiled: replace with num_tiles (ceildiv(buffer_dim, tile_dim))
   // - If not tiled: keep as is
   // Then append all tile dimensions at the end
 
@@ -55,15 +55,7 @@ TileViewNode::TileViewNode(Array<PrimExpr> buffer_shape,
       PrimExpr buf_dim = buffer_shape_[d];
       PrimExpr tile_dim = tile_shape_[tile_idx];
 
-      // Check divisibility
-      PrimExpr remainder = floormod(buf_dim, tile_dim);
-      ICHECK(analyzer.CanProve(remainder == 0))
-          << "Buffer dimension " << d << " (size=" << buf_dim
-          << ") must be divisible by tile dimension " << tile_idx
-          << " (size=" << tile_dim << ")";
-
-      // num_tiles = buf_dim / tile_dim
-      PrimExpr num_tiles = analyzer.Simplify(floordiv(buf_dim, tile_dim));
+      PrimExpr num_tiles = analyzer.Simplify(ceildiv(buf_dim, tile_dim));
       tiled_shape.push_back(num_tiles);
     } else {
       tiled_shape.push_back(buffer_shape_[d]);

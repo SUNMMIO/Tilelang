@@ -74,6 +74,51 @@ def assert_scope_plan(mod, expected_tile_size, expected_execution_domain_axes):
     assert _to_int_list(scope_root["tile.execution_domain_axes"]) == list(expected_execution_domain_axes)
 
 
+def collect_loads(func, buffer_name):
+    loads = []
+
+    def visit(stmt, loads=loads):
+        if isinstance(stmt, tir.BufferLoad) and stmt.buffer.name == buffer_name:
+            loads.append(stmt)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return loads
+
+
+def collect_stores(func, buffer_name):
+    stores = []
+
+    def visit(stmt, stores=stores):
+        if isinstance(stmt, tir.BufferStore) and stmt.buffer.name == buffer_name:
+            stores.append(stmt)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return stores
+
+
+def collect_if_conditions(func):
+    conditions = []
+
+    def visit(stmt, conditions=conditions):
+        if isinstance(stmt, tir.IfThenElse):
+            conditions.append(stmt.condition)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return conditions
+
+
+def assert_preserved_mixed_rank_load(mod, expected_tile_size):
+    script = mod["main"].script()
+    assert "T.sunmmio_unaligned_tile_load" not in script
+
+    loads = collect_loads(mod["main"], "B_shared")
+    assert loads, "Expected mixed-rank side access to remain a BufferLoad"
+    assert all(load.predicate is None for load in loads)
+
+    tile_height = expected_tile_size[0]
+    assert any(f"* {tile_height}" in str(load.indices[0]) or f"*{tile_height}" in str(load.indices[0]) for load in loads)
+
+
 # ---------------------------------------------------------
 # Test 1: 2D T.Tiles without annotate_tileview
 # ---------------------------------------------------------
@@ -233,32 +278,114 @@ def test_infer_rank1_tileview_from_2d_buffer_access_with_outer_loop_var():
 # ---------------------------------------------------------
 # Test 3: Mixed-rank (1D + 2D) in same T.Tiles
 # ---------------------------------------------------------
-def test_infer_tileview_mixed_rank():
-    """Mixed-rank access where the 1D buffer violates RSRAM alignment.
+@pytest.mark.parametrize(
+    ("dtype", "expected_tile_size"),
+    [
+        ("float32", [4, 32]),
+        ("float16", [8, 32]),
+        ("bfloat16", [8, 32]),
+    ],
+)
+def test_infer_tileview_mixed_rank_load(dtype, expected_tile_size):
+    """Mixed-rank rank-1 loads stay as logical BufferLoad in LowerTilesLoop.
 
-    B_shared is 1D fp32, tiled along the height axis.  With 64-byte RSRAM
-    alignment the minimum tile width is 16 elements (64 bytes), but capacity
-    (128 elems) cannot fit a (16, 16) tile for the 2D buffers simultaneously.
-    The planner correctly rejects this.
+    B_shared is 1D and tiled along the height axis. Strict TileView search
+    rejects tile width 1 because 64-byte RSRAM alignment requires multiple
+    elements, then the fallback search allows the side load. The eventual
+    hardware unaligned load repair is deferred to Sunmmio codegen so mid-level
+    analysis can still see a normal BufferLoad.
     """
     M, N = 128, 64
 
     @T.prim_func
     def main(
-        A: T.Tensor((M, N), "float32"),
-        B: T.Tensor((M,), "float32"),
-        C: T.Tensor((M, N), "float32"),
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M,), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(1, threads=128) as (bx,):
-            A_shared = T.alloc_shared((M, N), "float32")
-            B_shared = T.alloc_shared((M,), "float32")
-            C_shared = T.alloc_shared((M, N), "float32")
+            A_shared = T.alloc_shared((M, N), dtype)
+            B_shared = T.alloc_shared((M,), dtype)
+            C_shared = T.alloc_shared((M, N), dtype)
 
             T.copy(A[0:M, 0:N], A_shared)
 
-            # B_shared is 1D but used inside a 2D tile loop
             for i, j in T.Tiles([M, N], parallel=True):
                 C_shared[i, j] = A_shared[i, j] + B_shared[i]
+
+            T.copy(C_shared, C[0:M, 0:N])
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    assert_scope_plan(mod, expected_tile_size=expected_tile_size, expected_execution_domain_axes=[0, 1])
+    assert_preserved_mixed_rank_load(mod, expected_tile_size)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_tile_size"),
+    [
+        ("float32", [4, 32]),
+        ("float16", [8, 32]),
+        ("bfloat16", [8, 32]),
+    ],
+)
+def test_infer_tileview_mixed_rank_load_inside_exp2(dtype, expected_tile_size):
+    """Preserved mixed-rank rank-1 BufferLoad can feed another TIR PrimExpr op."""
+    M, N = 128, 64
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M,), dtype),
+        C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((M, N), dtype)
+            B_shared = T.alloc_shared((M,), dtype)
+            C_shared = T.alloc_shared((M, N), dtype)
+
+            T.copy(A[0:M, 0:N], A_shared)
+
+            for i, j in T.Tiles([M, N], parallel=True):
+                C_shared[i, j] = A_shared[i, j] + T.exp2(B_shared[i])
+
+            T.copy(C_shared, C[0:M, 0:N])
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    assert_scope_plan(mod, expected_tile_size=expected_tile_size, expected_execution_domain_axes=[0, 1])
+    script = mod["main"].script()
+    assert "T.exp2" in script
+    assert_preserved_mixed_rank_load(mod, expected_tile_size)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+def test_infer_tileview_mixed_rank_store_still_rejected(dtype):
+    """The alignment-relaxed fallback is load-only, not store repair."""
+    M, N = 128, 64
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M,), dtype),
+        C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((M, N), dtype)
+            B_shared = T.alloc_shared((M,), dtype)
+            C_shared = T.alloc_shared((M, N), dtype)
+
+            T.copy(A[0:M, 0:N], A_shared)
+
+            for i, j in T.Tiles([M, N], parallel=True):
+                B_shared[i] = A_shared[i, j]
+                C_shared[i, j] = A_shared[i, j]
 
             T.copy(C_shared, C[0:M, 0:N])
 
@@ -475,7 +602,7 @@ def test_infer_tileview_2d_blockwise_fp32():
 
 
 def test_infer_tileview_blockwise_small_height():
-    """Blockwise candidates should clamp height by the explicit tile domain."""
+    """Blockwise candidates may exceed a small domain and rely on masks."""
     domain_M, buffer_M, N = 4, 32, 128
 
     @T.prim_func
@@ -509,7 +636,15 @@ def test_infer_tileview_blockwise_small_height():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[4, 32], expected_execution_domain_axes=[0, 1])
+    assert_scope_plan(mod, expected_tile_size=[8, 32], expected_execution_domain_axes=[0, 1])
+
+    stores = collect_stores(mod["main"], "C_shared")
+    assert stores, "Expected lowered C_shared stores"
+    assert all(store.predicate is not None for store in stores)
+    assert any("* 8" in str(store.indices[0]) or "*8" in str(store.indices[0]) for store in stores)
+    assert all("< 4" in str(store.predicate) or "<4" in str(store.predicate) for store in stores)
+    assert all("< 128" not in str(store.predicate) and "<128" not in str(store.predicate) for store in stores)
+    assert not collect_if_conditions(mod["main"]), "Expected no full/tail branch when every tile is partial"
 
 
 def test_infer_tileview_rowmajor_wide_row_uses_single_row_tile():
