@@ -34,34 +34,22 @@ MakeTrailingTilePatternImpl(const Array<PrimExpr> &buffer_shape,
 }
 
 void AppendRank1Pattern(std::vector<TrailingTilePattern> *patterns,
-                        const Buffer &buffer, int tile_width,
-                        arith::Analyzer *analyzer) {
+                        const Buffer &buffer, int tile_width) {
   int buffer_rank = static_cast<int>(buffer->shape.size());
   if (buffer_rank < 1) {
     return;
   }
 
-  int width_dim = buffer_rank - 1;
-  if (!CanProveDivisible(analyzer, buffer->shape[width_dim], tile_width)) {
-    return;
-  }
   patterns->push_back(MakeTrailingTilePatternImpl(buffer->shape, {tile_width}));
 }
 
 void AppendRank2Pattern(std::vector<TrailingTilePattern> *patterns,
-                        const Buffer &buffer, int tile_height, int tile_width,
-                        arith::Analyzer *analyzer) {
+                        const Buffer &buffer, int tile_height, int tile_width) {
   int buffer_rank = static_cast<int>(buffer->shape.size());
   if (buffer_rank < 2) {
     return;
   }
 
-  int height_dim = buffer_rank - 2;
-  int width_dim = buffer_rank - 1;
-  if (!CanProveDivisible(analyzer, buffer->shape[width_dim], tile_width) ||
-      !CanProveDivisible(analyzer, buffer->shape[height_dim], tile_height)) {
-    return;
-  }
   patterns->push_back(
       MakeTrailingTilePatternImpl(buffer->shape, {tile_height, tile_width}));
 }
@@ -211,7 +199,8 @@ TileView MakeTrailingTileView(const Array<PrimExpr> &buffer_shape,
 
 std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
     const Buffer &buffer, int exec_rank, const Map<Buffer, Layout> &layout_map,
-    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer) {
+    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
+    AlignmentMode alignment_mode) {
   ICHECK(exec_rank == 1 || exec_rank == 2)
       << "TileView planning expects execution rank 1 or 2, but got "
       << exec_rank << ".";
@@ -230,16 +219,14 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
   int width_dim = buffer_rank - 1;
   int height_dim = buffer_rank - 2;
 
-  // RSRAM DMA alignment: tile row width (in bytes) must be a multiple of
-  // rsram_align_bytes.  Compute the minimum tile width in elements.
+  // RSRAM access alignment: tile row width (in bytes) must be a multiple of
+  // rsram_align_bytes. Compute the minimum tile width in elements.
   // Use bit-level arithmetic so sub-byte dtypes (fp4, int4) are handled.
   int min_width_elems = 1;
-  if (config.rsram_align_bytes > 0 && buffer.scope() == kSunmmioScopeRSRAM) {
-    int element_bits = GetElementBits(buffer);
-    int align_bits = config.rsram_align_bytes * 8;
-    if (element_bits > 0 && align_bits >= element_bits) {
-      min_width_elems = align_bits / element_bits;
-    }
+  if (alignment_mode == AlignmentMode::kStrict &&
+      config.rsram_align_bytes > 0 && buffer.scope() == kSunmmioScopeRSRAM) {
+    min_width_elems =
+        GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, buffer->dtype);
   }
 
   // Prefix-partial step walk.
@@ -285,7 +272,7 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
         // Rank-1: only from leading width steps (before any non-width step).
         if (!rank1_done && h == 1 && !emitted_rank1.count(w)) {
           emitted_rank1.insert(w);
-          AppendRank1Pattern(&patterns, buffer, w, analyzer);
+          AppendRank1Pattern(&patterns, buffer, w);
         }
 
         // Rank-2.
@@ -293,7 +280,7 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
           int64_t key = static_cast<int64_t>(h) * 1000000 + w;
           if (!emitted_rank2.count(key)) {
             emitted_rank2.insert(key);
-            AppendRank2Pattern(&patterns, buffer, h, w, analyzer);
+            AppendRank2Pattern(&patterns, buffer, h, w);
           }
         }
       }
@@ -312,7 +299,7 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
           int64_t key = static_cast<int64_t>(h) * 1000000 + w;
           if (!emitted_rank2.count(key)) {
             emitted_rank2.insert(key);
-            AppendRank2Pattern(&patterns, buffer, h, w, analyzer);
+            AppendRank2Pattern(&patterns, buffer, h, w);
           }
         }
       }
@@ -329,20 +316,20 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
   // for buffers with no CuteLayout and fully dynamic shapes).
   if (!had_width_step) {
     for (int w = 1; w <= capacity_elems; ++w) {
-      AppendRank1Pattern(&patterns, buffer, w, analyzer);
+      AppendRank1Pattern(&patterns, buffer, w);
     }
     if (exec_rank == 2 && buffer_rank >= 2) {
       int64_t row_width = GetStaticIntValue(buffer->shape[width_dim]);
       if (row_width > 0) {
         int max_w = std::min(capacity_elems, static_cast<int>(row_width));
         for (int w = 1; w <= max_w; ++w) {
-          AppendRank2Pattern(&patterns, buffer, 1, w, analyzer);
+          AppendRank2Pattern(&patterns, buffer, 1, w);
         }
         if (row_width <= capacity_elems) {
           int max_h = capacity_elems / static_cast<int>(row_width);
           for (int h = 2; h <= max_h; ++h) {
             AppendRank2Pattern(&patterns, buffer, h,
-                               static_cast<int>(row_width), analyzer);
+                               static_cast<int>(row_width));
           }
         }
       }
@@ -384,18 +371,11 @@ ValidateManualTrailingTileView(const Buffer &buffer, const TileView &manual_tv,
   ICHECK_GT(width, 0) << usage
                       << " must use a positive static tile width for buffer "
                       << buffer->name << ".";
-  ICHECK(CanProveDivisible(analyzer, buffer->shape[width_dim], width))
-      << usage << " width " << width << " must divide trailing buffer dim "
-      << buffer->shape[width_dim] << " for buffer " << buffer->name << ".";
-
-  // RSRAM DMA alignment check (works for sub-byte dtypes via bit arithmetic).
+  // RSRAM access alignment check (works for sub-byte dtypes via bit
+  // arithmetic).
   if (config.rsram_align_bytes > 0 && buffer.scope() == kSunmmioScopeRSRAM) {
-    int element_bits = GetElementBits(buffer);
-    int align_bits = config.rsram_align_bytes * 8;
-    int min_w = 1;
-    if (element_bits > 0 && align_bits >= element_bits) {
-      min_w = align_bits / element_bits;
-    }
+    int min_w =
+        GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, buffer->dtype);
     ICHECK_EQ(width % min_w, 0)
         << usage << " width " << width << " must be a multiple of " << min_w
         << " elements (" << config.rsram_align_bytes
@@ -442,9 +422,6 @@ ValidateManualTrailingTileView(const Buffer &buffer, const TileView &manual_tv,
   ICHECK_GT(height, 0) << usage
                        << " must use a positive static tile height for buffer "
                        << buffer->name << ".";
-  ICHECK(CanProveDivisible(analyzer, buffer->shape[height_dim], height))
-      << usage << " height " << height << " must divide buffer dim "
-      << height_dim << " of buffer " << buffer->name << ".";
   ICHECK_LE(height * width, capacity_elems)
       << usage << " shape (" << height << ", " << width
       << ") exceeds the Sunmmio register capacity of " << capacity_elems

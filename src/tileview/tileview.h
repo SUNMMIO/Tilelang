@@ -30,7 +30,8 @@ class TileView;
  * A TileView captures:
  * - tile_shape: The shape of each tile (e.g., (16, 32) for a 2D tile)
  * - index_map: Which dimensions of the buffer are tiled
- * - tiled_buffer_shape: The shape of tiled buffer
+ * - tiled_buffer_shape: The shape of tiled buffer, using ceildiv for tiled
+ *   dimensions so tail tiles are represented explicitly.
  *
  * For Sunmmio target, the Tile unit processes fixed-size 2D tiles with
  * constraints: width must be 32, height can be 8/16/32.
