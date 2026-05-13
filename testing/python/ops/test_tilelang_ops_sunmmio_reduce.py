@@ -1,6 +1,7 @@
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
+from tilelang.layout import make_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 import pytest
 
@@ -78,6 +79,30 @@ def reduce_kernel_builder(shape, reduce_axis, dtype="float16"):
     return tvm.IRModule({"main": main})
 
 
+def reduce_kernel_with_blockwise_layout_builder(shape, reduce_axis, dtype="float32"):
+    out_shape = list(shape[:reduce_axis]) + list(shape[reduce_axis + 1 :])
+    if not out_shape:
+        out_shape = [1]
+
+    @T.prim_func
+    def main(A: T.Tensor(shape, dtype), Out: T.Tensor(out_shape, dtype)):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+
+            T.annotate_layout(
+                {
+                    A_shared: make_zz_layout(A_shared),
+                }
+            )
+
+            T.copy(A, A_shared)
+            T.reduce_sum(A_shared, Out_shared, dim=reduce_axis)
+            T.copy(Out_shared, Out)
+
+    return tvm.IRModule({"main": main})
+
+
 # (Shape, ReduceAxis, ExpectedInTileReduce)
 # For Sunmmio, all dimensions should be multiples of 32 for simplicity in these tests.
 REDUCE_TEST_CASES = [
@@ -128,6 +153,26 @@ def test_tilelang_reduce_sunmmio(shape, reduce_axis, expected_in_tile):
     )
     assert len(execution_domain_axes) == len(tile_size), "tile.execution_domain_axes rank must match tile.tile_size"
     assert set(checker.interior_axes).issuperset(set(range(len(tile_size)))), "Missing tile.interior annotations for one or more tile axes"
+
+
+def test_tilelang_reduce_sunmmio_preserves_blockwise_kept_axis_tile():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    mod = reduce_kernel_with_blockwise_layout_builder((32, 32), 1, dtype="float32")
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    checker = ReduceIRChecker()
+    checker.visit_stmt(mod["main"].body)
+
+    assert checker.scope_root is not None, "Missing tile.domain root on lowered reduction"
+    root_ann = checker.scope_root.annotations
+    tile_size = [int(x) for x in root_ann["tile.tile_size"]]
+    execution_domain_axes = [int(x) for x in root_ann["tile.execution_domain_axes"]]
+
+    assert checker.has_in_tile_reduce, "Expected vector_core_in_tile_reduce intrinsic but not found"
+    assert tile_size == [4, 32], "Reduction should preserve the blockwise kept-axis tile instead of collapsing to [1, 32]"
+    assert execution_domain_axes == [0, 1]
 
 
 if __name__ == "__main__":
