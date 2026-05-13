@@ -167,6 +167,19 @@ mlir::Type SunmmioMlirType::MapType(const SunMMIOType &type) const {
         shape, elem, layout, memory_scope, type.byte_offset);
     return mlir::Type::getFromOpaquePointer(memtensor.getAsOpaquePointer());
   }
+  case SunMMIOType::Kind::kTileView: {
+    mlir::Type elem = MapElementType(type.dtype);
+    std::vector<int64_t> shape = ExtractShape(type);
+    mlir::suvm::TileViewType tile_view =
+        mlir::suvm::TileViewType::get(shape, elem);
+    return mlir::Type::getFromOpaquePointer(tile_view.getAsOpaquePointer());
+  }
+  case SunMMIOType::Kind::kTile: {
+    mlir::Type elem = MapElementType(type.dtype);
+    std::vector<int64_t> shape = ExtractShape(type);
+    mlir::suvm::TileType tile = mlir::suvm::TileType::get(shape, elem);
+    return mlir::Type::getFromOpaquePointer(tile.getAsOpaquePointer());
+  }
   case SunMMIOType::Kind::kUnknown:
   default:
     return mlir::Type::getFromOpaquePointer(

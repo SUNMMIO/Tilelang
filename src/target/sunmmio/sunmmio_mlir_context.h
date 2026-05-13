@@ -20,6 +20,12 @@ namespace tvm {
 namespace codegen {
 
 struct SunmmioMlirContext {
+  struct MemTensorBinding {
+    SunMMIOType memtensor_type;
+    std::string ssa_name;
+    bool is_fake{false};
+  };
+
   SunmmioMlirContext();
 
   mlir::MLIRContext mlir_ctx;
@@ -30,6 +36,7 @@ struct SunmmioMlirContext {
   std::vector<MLIRValueTable> mlir_value_table_stack;
 
   std::unordered_map<int64_t, mlir::Value> token_by_id;
+  std::unordered_map<const tir::VarNode *, MemTensorBinding> memtensor_bindings;
 
   struct SavedToken {
     bool existed{false};
@@ -134,6 +141,22 @@ struct SunmmioMlirContext {
       mlir_value_table_stack.emplace_back();
     }
     mlir_value_table_stack.back()[name] = v;
+  }
+
+  const MemTensorBinding *
+  LookupMemTensorBinding(const tir::Var &buffer_var) const {
+    auto it = memtensor_bindings.find(buffer_var.get());
+    if (it == memtensor_bindings.end()) {
+      return nullptr;
+    }
+    return &it->second;
+  }
+
+  void BindMemTensor(const tir::Var &buffer_var,
+                     const SunMMIOType &memtensor_type,
+                     const std::string &ssa_name, bool is_fake = false) {
+    memtensor_bindings[buffer_var.get()] =
+        MemTensorBinding{memtensor_type, ssa_name, is_fake};
   }
 
   void Clear();

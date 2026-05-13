@@ -224,6 +224,12 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
       args.push_back({arg_name, buf_ty});
       BindVar(p, SunMMIOValue{p.dtype(), arg_name, buf_ty});
       RegisterBuffer(buffer, true, arg_name);
+      if (auto *suvm_builder =
+              dynamic_cast<SuvmSunmmioBuilder *>(builder_.get())) {
+        if (buf_ty.kind == SunMMIOType::Kind::kMemTensor) {
+          suvm_builder->Context().BindMemTensor(buffer->data, buf_ty, arg_name);
+        }
+      }
     } else {
       SunMMIOType arg_ty = MapType(p.dtype());
       args.push_back({arg_name, arg_ty});
@@ -415,6 +421,10 @@ void CodeGenTileLangSunMMIO::EmitAlloc(const tir::Var &buffer_var,
   SunMMIOValue alloc = builder_->Alloc(NewValueName(), memtensor_type,
                                        dyn_extents, scope_hint, dtype);
   BindVar(buffer_var, alloc);
+  if (auto *suvm_builder = dynamic_cast<SuvmSunmmioBuilder *>(builder_.get())) {
+    suvm_builder->Context().BindMemTensor(buffer_var, memtensor_type,
+                                          alloc.value);
+  }
 }
 
 namespace {
@@ -669,7 +679,12 @@ void CodeGenTileLangSunMMIO::EmitIf(const tir::IfThenElseNode *op) {
   builder_->EndIf();
 }
 
-void CodeGenTileLangSunMMIO::VisitStmt_(const tir::ForNode *op) { EmitFor(op); }
+void CodeGenTileLangSunMMIO::VisitStmt_(const tir::ForNode *op) {
+  if (TryLowerTilesScope(op)) {
+    return;
+  }
+  EmitFor(op);
+}
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::LetStmtNode *op) {
   SunMMIOValue value = EvalExpr(op->value);
@@ -1249,6 +1264,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
   }
   bool is_token_intrin =
       (callee == "tl.sync_null_token" || callee == "tl.wait_token");
+  bool ignore_structured_dma_operands = (callee == "tl.dma_copy");
   std::vector<SunMMIOValue> operands;
   std::vector<std::string> string_args;
   for (int i = 0, e = static_cast<int>(op->args.size()); i < e; ++i) {
@@ -1264,6 +1280,12 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
           }
         }
       }
+    }
+    if (ignore_structured_dma_operands) {
+      // The clean v4 integration currently treats tl.dma_copy as an external
+      // side-effecting op whose structured region operands are handled outside
+      // the generic scalar-expression path. Do not recurse into them here.
+      continue;
     }
     if (is_token_intrin && i == 0) {
       if (const auto *imm = arg.as<IntImmNode>()) {

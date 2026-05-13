@@ -38,8 +38,9 @@ SunmmioMlirMemory::Alloc(const std::string &result_name,
       ctx_.builder, ctx_.builder.getUnknownLoc(), tensor_type);
 
   SunMMIOValue out{dtype, result_name, updated_type};
-  // ctx_.mlir_value_symbol_table[result_name] = alloc.getResult();
-  // ctx_.value_symbol_table[result_name] = out;
+  if (!result_name.empty()) {
+    ctx_.BindMLIRValue(result_name, alloc.getResult());
+  }
   return out;
 }
 

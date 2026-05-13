@@ -20,6 +20,10 @@
 namespace tvm {
 namespace codegen {
 
+enum class TileUnaryOp {
+  kExp,
+};
+
 class SunMMIOBuilder {
 public:
   virtual ~SunMMIOBuilder() = default;
@@ -53,6 +57,11 @@ public:
                               const SunMMIOType &result_type,
                               DataType dtype) = 0;
 
+  virtual SunMMIOValue Unary(const std::string &result_name, TileUnaryOp op,
+                             const SunMMIOValue &data,
+                             const SunMMIOType &result_type,
+                             DataType dtype) = 0;
+
   virtual SunMMIOValue Compare(const std::string &result_name, CompareOp op,
                                CompareDomain domain, const SunMMIOValue &a,
                                const SunMMIOValue &b,
@@ -75,10 +84,35 @@ public:
                             const SunMMIOType &memref_type, DataType dtype,
                             const SunMMIOType &result_type) = 0;
 
+  virtual SunMMIOValue
+  GetPartitionedTileView(const std::string &result_name,
+                         const SunMMIOValue &memtensor,
+                         const std::vector<SunMMIOValue> &indices,
+                         const std::vector<int64_t> &tiled_dims,
+                         const SunMMIOType &view_type, DataType dtype) = 0;
+
+  virtual SunMMIOValue TileLoad(const std::string &result_name,
+                                const SunMMIOValue &tile_view,
+                                const SunMMIOType &tile_type,
+                                DataType dtype) = 0;
+
+  virtual SunMMIOValue TileFill(const std::string &result_name,
+                                const SunMMIOValue &scalar,
+                                const SunMMIOType &tile_type,
+                                DataType dtype) = 0;
+
+  virtual SunMMIOValue TileUnsqueeze(const std::string &result_name,
+                                     const SunMMIOValue &tile,
+                                     const SunMMIOType &tile_type, int64_t axis,
+                                     DataType dtype) = 0;
+
   virtual void Store(const SunMMIOValue &value,
                      const std::string &buffer_handle,
                      const std::vector<SunMMIOValue> &indices,
                      const SunMMIOType &memref_type) = 0;
+
+  virtual void TileStore(const SunMMIOValue &value,
+                         const SunMMIOValue &tile_view) = 0;
 
   virtual SunMMIOValue Call(const std::string &result_name,
                             const std::string &callee,
@@ -218,6 +252,7 @@ private:
   void EmitAlloc(const tir::Var &buffer_var, DataType dtype,
                  const ffi::Array<PrimExpr> &extents,
                  const std::string &scope_hint);
+  bool TryLowerTilesScope(const tir::ForNode *op);
   void EmitFor(const tir::ForNode *op);
   void EmitIf(const tir::IfThenElseNode *op);
 

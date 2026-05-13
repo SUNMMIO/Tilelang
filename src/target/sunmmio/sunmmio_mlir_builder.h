@@ -12,6 +12,7 @@ namespace codegen {
 class SunmmioMlirFunction;
 class SunmmioMlirExpr;
 class SunmmioMlirMemory;
+class SunmmioMlirTile;
 class SunmmioMlirCall;
 
 class SuvmSunmmioBuilder final : public SunMMIOBuilder {
@@ -45,6 +46,10 @@ public:
                       const SunMMIOValue &b, const SunMMIOType &result_type,
                       DataType dtype) final;
 
+  SunMMIOValue Unary(const std::string &result_name, TileUnaryOp op,
+                     const SunMMIOValue &data, const SunMMIOType &result_type,
+                     DataType dtype) final;
+
   SunMMIOValue Compare(const std::string &result_name, CompareOp op,
                        CompareDomain domain, const SunMMIOValue &a,
                        const SunMMIOValue &b,
@@ -65,9 +70,32 @@ public:
                     const SunMMIOType &memref_type, DataType dtype,
                     const SunMMIOType &result_type) final;
 
+  SunMMIOValue GetPartitionedTileView(const std::string &result_name,
+                                      const SunMMIOValue &memtensor,
+                                      const std::vector<SunMMIOValue> &indices,
+                                      const std::vector<int64_t> &tiled_dims,
+                                      const SunMMIOType &view_type,
+                                      DataType dtype) final;
+
+  SunMMIOValue TileLoad(const std::string &result_name,
+                        const SunMMIOValue &tile_view,
+                        const SunMMIOType &tile_type, DataType dtype) final;
+
+  SunMMIOValue TileFill(const std::string &result_name,
+                        const SunMMIOValue &scalar,
+                        const SunMMIOType &tile_type, DataType dtype) final;
+
+  SunMMIOValue TileUnsqueeze(const std::string &result_name,
+                             const SunMMIOValue &tile,
+                             const SunMMIOType &tile_type, int64_t axis,
+                             DataType dtype) final;
+
   void Store(const SunMMIOValue &value, const std::string &buffer_handle,
              const std::vector<SunMMIOValue> &indices,
              const SunMMIOType &memref_type) final;
+
+  void TileStore(const SunMMIOValue &value,
+                 const SunMMIOValue &tile_view) final;
 
   SunMMIOValue Call(const std::string &result_name, const std::string &callee,
                     const std::vector<SunMMIOValue> &operands,
@@ -98,11 +126,15 @@ public:
 
   void EmitAssert(const SunMMIOValue &cond, const std::string &msg_text) final;
 
+  SunmmioMlirContext &Context() { return ctx_; }
+  const SunmmioMlirContext &Context() const { return ctx_; }
+
 private:
   SunmmioMlirContext ctx_;
   std::unique_ptr<SunmmioMlirFunction> function_;
   std::unique_ptr<SunmmioMlirExpr> expr_;
   std::unique_ptr<SunmmioMlirMemory> memory_;
+  std::unique_ptr<SunmmioMlirTile> tile_;
   std::unique_ptr<SunmmioMlirCall> call_;
 };
 

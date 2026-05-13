@@ -45,6 +45,8 @@ struct SunMMIOType {
     kVector,
     kMemRef,
     kMemTensor,
+    kTileView,
+    kTile,
     kUnknown
 
   };
