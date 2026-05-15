@@ -3,6 +3,8 @@
 
 #include "sunmmio_mlir_type.h"
 
+#include "../../layout/layout.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
@@ -10,6 +12,8 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Value.h"
+#include <tvm/ffi/container/map.h>
+#include <tvm/ffi/optional.h>
 
 #include <cstdint>
 #include <string>
@@ -21,6 +25,8 @@ namespace codegen {
 
 struct SunmmioMlirContext {
   SunmmioMlirContext();
+
+  using TirLayoutMap = ffi::Map<tir::Buffer, tl::Layout>;
 
   mlir::MLIRContext mlir_ctx;
   mlir::OpBuilder builder;
@@ -52,6 +58,8 @@ struct SunmmioMlirContext {
     std::unordered_map<int64_t, SavedToken> saved_token_by_id;
   };
   std::vector<ForFrame> for_stack;
+  std::vector<TirLayoutMap> layout_map_stack;
+  std::vector<TirLayoutMap> global_layout_map_stack;
 
   struct IfFrame {
     mlir::scf::IfOp op;
@@ -135,6 +143,13 @@ struct SunmmioMlirContext {
     }
     mlir_value_table_stack.back()[name] = v;
   }
+
+  void ClearLayoutScopes();
+  void PushLayoutScope(const TirLayoutMap &layout_map,
+                       const TirLayoutMap &global_layout_map);
+  void PopLayoutScope();
+  ffi::Optional<tl::Layout> LookupLayout(const tir::Buffer &buffer) const;
+  void ApplyLayoutToType(const tir::Buffer &buffer, SunMMIOType *type) const;
 
   void Clear();
 };

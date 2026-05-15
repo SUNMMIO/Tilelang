@@ -168,5 +168,22 @@ void SuvmSunmmioBuilder::EmitAssert(const SunMMIOValue &cond,
   function_->EmitAssert(cond, msg_text);
 }
 
+void SuvmSunmmioBuilder::PushLayoutScope(
+    const TirLayoutMap &layout_map, const TirLayoutMap &global_layout_map) {
+  ctx_.PushLayoutScope(layout_map, global_layout_map);
+}
+
+void SuvmSunmmioBuilder::PopLayoutScope() { ctx_.PopLayoutScope(); }
+
+ffi::Optional<tl::Layout>
+SuvmSunmmioBuilder::LookupLayout(const tir::Buffer &buffer) const {
+  return ctx_.LookupLayout(buffer);
+}
+
+void SuvmSunmmioBuilder::ApplyLayoutToType(const tir::Buffer &buffer,
+                                           SunMMIOType *type) const {
+  ctx_.ApplyLayoutToType(buffer, type);
+}
+
 } // namespace codegen
 } // namespace tvm

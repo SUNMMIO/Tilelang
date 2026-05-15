@@ -1,10 +1,15 @@
 #include "codegen_sunmmio.h"
 #include "sunmmio_mlir_builder.h"
 
+#include "../../layout/layout.h"
+#include "../../op/region.h"
+
+#include <tvm/arith/analyzer.h>
 #include <tvm/ir/type.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
+#include <tvm/tir/stmt.h>
 #include <tvm/tir/stmt_functor.h>
 
 #include <algorithm>
@@ -21,6 +26,31 @@ namespace codegen {
 using namespace tir;
 
 namespace {
+
+class DeclBufferCollector final : public tir::StmtVisitor {
+public:
+  std::unordered_map<const tir::VarNode *, tir::Buffer> buffer_data_to_buffer;
+
+private:
+  void VisitStmt_(const tir::DeclBufferNode *op) final {
+    Record(op->buffer);
+    tir::StmtVisitor::VisitStmt_(op);
+  }
+
+  void Record(const tir::Buffer &buffer) {
+    if (!buffer.defined() || !buffer->data.defined()) {
+      return;
+    }
+    const tir::VarNode *data = buffer->data.get();
+    auto it = buffer_data_to_buffer.find(data);
+    if (it == buffer_data_to_buffer.end()) {
+      buffer_data_to_buffer.emplace(data, buffer);
+      // return;
+    } else {
+      LOG(WARNING) << "Found duplicate DeclBuffer for data var " << data;
+    }
+  }
+};
 
 std::string GetAllocateStorageScope(const tir::Var &buffer_var) {
   if (const auto *ptr = buffer_var->type_annotation.as<PointerTypeNode>()) {
@@ -56,6 +86,7 @@ void CodeGenTileLangSunMMIO::Clear() {
   ssa_counter_ = 0;
   var_table_.clear();
   buffer_registry_.clear();
+  buffer_data_to_buffer_.clear();
   attr_stack_.clear();
   scoped_vars_.clear();
   scoped_buffers_.clear();
@@ -118,6 +149,12 @@ void CodeGenTileLangSunMMIO::CollectExpectedCoverage(const tir::PrimFunc &f) {
       }
     }
   });
+}
+
+void CodeGenTileLangSunMMIO::CollectDeclBuffers(const tir::Stmt &stmt) {
+  DeclBufferCollector collector;
+  collector(stmt);
+  buffer_data_to_buffer_ = std::move(collector.buffer_data_to_buffer);
 }
 
 void CodeGenTileLangSunMMIO::WriteCoverageReport() const {
@@ -213,13 +250,28 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
   }
   ICHECK(builder_) << "CodeGenTileLangSunMMIO builder is not initialized";
   CollectExpectedCoverage(f);
+  CollectDeclBuffers(f->body);
+
+  SunMMIOBuilder::TirLayoutMap layout_map;
+  SunMMIOBuilder::TirLayoutMap global_layout_map;
+  if (auto opt =
+          f->GetAttr<SunMMIOBuilder::TirLayoutMap>(tl::attr::kLayoutMap)) {
+    layout_map = opt.value();
+  }
+  if (auto opt = f->GetAttr<SunMMIOBuilder::TirLayoutMap>(
+          tl::attr::kGlobalLayoutMap)) {
+    global_layout_map = opt.value();
+  }
+  builder_->PushLayoutScope(layout_map, global_layout_map);
+
   EnterScope();
   std::vector<BuilderArg> args;
   int arg_index = 0;
   for (const tir::Var &p : f->params) {
     std::string arg_name = "%arg" + std::to_string(arg_index++);
-    if (f->buffer_map.count(p)) {
-      const tir::Buffer &buffer = f->buffer_map.at(p);
+    auto buffer_it = buffer_data_to_buffer_.find(p.get());
+    if (buffer_it != buffer_data_to_buffer_.end()) {
+      const tir::Buffer &buffer = buffer_it->second;
       SunMMIOType buf_ty = MapBufferType(buffer);
       args.push_back({arg_name, buf_ty});
       BindVar(p, SunMMIOValue{p.dtype(), arg_name, buf_ty});
@@ -236,6 +288,7 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
   builder_->EmitReturn();
   builder_->EndFunction();
   ExitScope();
+  builder_->PopLayoutScope();
 }
 
 std::string CodeGenTileLangSunMMIO::Finish() {
@@ -286,8 +339,17 @@ CodeGenTileLangSunMMIO::MapBufferType(const tir::Buffer &buffer) const {
   for (const PrimExpr &dim : buffer->shape) {
     shape.push_back(dim);
   }
-  return SunMMIOType{SunMMIOType::Kind::kMemRef, buffer->dtype, 1,
-                     std::move(shape)};
+  SunMMIOType type;
+  type.kind = SunMMIOType::Kind::kMemTensor;
+  type.dtype = buffer->dtype.with_lanes(1);
+  type.lanes = 1;
+  type.shape = std::move(shape);
+  type.memory_scope = buffer.scope();
+  type.byte_offset = 0;
+  if (builder_) {
+    builder_->ApplyLayoutToType(buffer, &type);
+  }
+  return type;
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::SeqStmtNode *op) {
@@ -358,6 +420,15 @@ SunMMIOValue CodeGenTileLangSunMMIO::BindVar(const tir::Var &var,
   return value;
 }
 
+const SunMMIOValue &
+CodeGenTileLangSunMMIO::LookupVar(const tir::VarNode *var) const {
+  ICHECK(var != nullptr);
+  auto it = var_table_.find(var);
+  ICHECK(it != var_table_.end())
+      << "CodeGenTileLangSunMMIO: unbound var %" << var->name_hint;
+  return it->second;
+}
+
 void CodeGenTileLangSunMMIO::RegisterBuffer(const tir::Buffer &buffer,
                                             bool is_external,
                                             const std::string &handle_hint) {
@@ -374,10 +445,12 @@ void CodeGenTileLangSunMMIO::RegisterBuffer(const tir::Buffer &buffer,
   binding.is_external = is_external;
   if (!handle_hint.empty()) {
     binding.handle = handle_hint;
-  } else if (var_table_.count(buffer->data.get())) {
-    binding.handle = var_table_.at(buffer->data.get()).value;
   } else {
-    binding.handle = NewValueName();
+    const SunMMIOValue &storage = LookupVar(buffer->data.get());
+    binding.handle = storage.value;
+    if (storage.type.kind == SunMMIOType::Kind::kMemTensor) {
+      binding.buffer_type = storage.type;
+    }
   }
   buffer_registry_[buffer.get()] = std::move(binding);
   scoped_buffers_.push_back(buffer.get());
@@ -386,35 +459,37 @@ void CodeGenTileLangSunMMIO::RegisterBuffer(const tir::Buffer &buffer,
 const BufferBinding &
 CodeGenTileLangSunMMIO::LookupBuffer(const tir::Buffer &buffer) const {
   auto it = buffer_registry_.find(buffer.get());
+  if (it == buffer_registry_.end()) {
+    LOG(WARNING) << "SunMMIO LookupBuffer: missing name=" << buffer->name
+                 << ", buffer_ptr=" << buffer.get()
+                 << ", data_name=" << buffer->data->name_hint
+                 << ", data_ptr=" << buffer->data.get();
+    return buffer_registry_
+        .find(buffer_data_to_buffer_.at(buffer->data.get()).get())
+        ->second;
+  }
   ICHECK(it != buffer_registry_.end())
       << "CodeGenTileLangSunMMIO: unknown buffer " << buffer;
   return it->second;
 }
 
-void CodeGenTileLangSunMMIO::EmitAlloc(const tir::Var &buffer_var,
-                                       DataType dtype,
-                                       const ffi::Array<PrimExpr> &extents,
+void CodeGenTileLangSunMMIO::EmitAlloc(const tir::Buffer &buffer,
                                        const std::string &scope_hint) {
   std::vector<SunMMIOValue> dyn_extents;
-  std::vector<PrimExpr> shape;
-  shape.reserve(extents.size());
-  for (size_t i = 0; i < extents.size(); ++i) {
-    shape.push_back(extents[i]);
-    if (!extents[i].as<IntImmNode>()) {
-      dyn_extents.push_back(EnsureIndex(EvalExpr(extents[i])));
+  for (const PrimExpr &dim : buffer->shape) {
+    if (!dim.as<IntImmNode>()) {
+      dyn_extents.push_back(EnsureIndex(EvalExpr(dim)));
     }
   }
-  SunMMIOType memtensor_type;
-  memtensor_type.kind = SunMMIOType::Kind::kMemTensor;
-  memtensor_type.dtype = dtype.with_lanes(1);
-  memtensor_type.lanes = 1;
-  memtensor_type.shape = std::move(shape);
-  memtensor_type.memory_scope = scope_hint;
-  memtensor_type.byte_offset = 0;
+
+  SunMMIOType memtensor_type = MapBufferType(buffer);
+  if (memtensor_type.memory_scope.empty()) {
+    memtensor_type.memory_scope = scope_hint;
+  }
 
   SunMMIOValue alloc = builder_->Alloc(NewValueName(), memtensor_type,
-                                       dyn_extents, scope_hint, dtype);
-  BindVar(buffer_var, alloc);
+                                       dyn_extents, scope_hint, buffer->dtype);
+  BindVar(buffer->data, alloc);
 }
 
 namespace {
@@ -699,7 +774,13 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::WhileNode *op) {
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
   std::string scope = GetAllocateStorageScope(op->buffer_var);
   EnterScope();
-  EmitAlloc(op->buffer_var, op->dtype, op->extents, scope);
+  auto buffer_it = buffer_data_to_buffer_.find(op->buffer_var.get());
+  if (buffer_it != buffer_data_to_buffer_.end()) {
+    EmitAlloc(buffer_it->second, scope);
+  } else {
+    LOG(FATAL) << "SunMMIO SUVM allocate cannot find buffer for variable "
+               << op->buffer_var->name_hint;
+  }
   VisitStmtTracked(op->body);
   ExitScope();
 }
@@ -711,10 +792,10 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateConstNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::DeclBufferNode *op) {
-  // DeclBuffer may still survive the current pipeline. For this backend path it
-  // is treated as a benign declaration wrapper with no direct codegen effect.
-  // Dedicated view/alias lowering can be added later if required.
+  EnterScope();
+  RegisterBuffer(op->buffer, false);
   VisitStmtTracked(op->body);
+  ExitScope();
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferStoreNode *op) {
@@ -800,8 +881,6 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockNode *op) {
     }
   }
   for (const Buffer &alloc : op->alloc_buffers) {
-    EmitAlloc(alloc->data, alloc->dtype, alloc->shape,
-              alloc.scope().empty() ? "global" : alloc.scope());
     RegisterBuffer(alloc, false);
   }
   for (const MatchBufferRegion &match : op->match_buffers) {
@@ -848,23 +927,11 @@ void CodeGenTileLangSunMMIO::VisitStmtDefault_(const Object *op) {
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::VarNode *op) {
-  auto it = var_table_.find(op);
-  if (it != var_table_.end()) {
-    return it->second;
-  }
-  SunMMIOValue info{op->dtype, "%" + op->name_hint, MapType(op->dtype)};
-  var_table_[op] = info;
-  return info;
+  return LookupVar(op);
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::SizeVarNode *op) {
-  auto it = var_table_.find(op);
-  if (it != var_table_.end()) {
-    return it->second;
-  }
-  SunMMIOValue info{op->dtype, "%" + op->name_hint, MapType(op->dtype)};
-  var_table_[op] = info;
-  return info;
+  return LookupVar(op);
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::IntImmNode *op) {

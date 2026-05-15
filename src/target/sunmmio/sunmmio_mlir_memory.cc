@@ -23,7 +23,6 @@ SunmmioMlirMemory::Alloc(const std::string &result_name,
     LOG(FATAL) << "SunMMIO SUVM alloc does not support dynamic extents yet";
   }
 
-  // Reuse SunmmioMlirType::MapType for shape/layout/memory-space mapping.
   SunMMIOType updated_type = memref_type;
   if (updated_type.memory_scope.empty()) {
     updated_type.memory_scope = scope_name;
@@ -38,8 +37,7 @@ SunmmioMlirMemory::Alloc(const std::string &result_name,
       ctx_.builder, ctx_.builder.getUnknownLoc(), tensor_type);
 
   SunMMIOValue out{dtype, result_name, updated_type};
-  // ctx_.mlir_value_symbol_table[result_name] = alloc.getResult();
-  // ctx_.value_symbol_table[result_name] = out;
+  ctx_.BindMLIRValue(result_name, alloc.getResult());
   return out;
 }
 

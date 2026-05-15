@@ -98,6 +98,13 @@ public:
 
   void EmitAssert(const SunMMIOValue &cond, const std::string &msg_text) final;
 
+  void PushLayoutScope(const TirLayoutMap &layout_map,
+                       const TirLayoutMap &global_layout_map) final;
+  void PopLayoutScope() final;
+  ffi::Optional<tl::Layout> LookupLayout(const tir::Buffer &buffer) const final;
+  void ApplyLayoutToType(const tir::Buffer &buffer,
+                         SunMMIOType *type) const final;
+
 private:
   SunmmioMlirContext ctx_;
   std::unique_ptr<SunmmioMlirFunction> function_;
