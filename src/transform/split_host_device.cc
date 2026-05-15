@@ -313,10 +313,11 @@ private:
     return value;
   }
 
-  // remap 参数，复杂类型，指定key进行特殊处理
-  // 普通类型，var、buffer、primexpr，直接进行替换
-  // list,map等容器类型，如果直接包含上述普通类型，也进行替换
-  // map支持仅key或仅value进行替换的情况
+  // Remap parameters. Special handling is applied to complex types based on
+  // specific keys. Primitive types (Var, Buffer, PrimExpr) are substituted
+  // directly. Container types (List, Map) are also remapped if they contain
+  // these primitive types. For Maps, supports replacing only the keys or only
+  // the values.
   Any RemapDeviceFuncAttr(
       const String &key, const Any &value,
       const Map<tir::Var, PrimExpr> &var_remap,

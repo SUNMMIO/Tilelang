@@ -67,8 +67,6 @@ def run_sunmmio_split(mod, *, hoist=False):
 
 
 def test_sunmmio_split_host_device_propagates_hoisted_layout_attrs():
-    """测试 hoist 后的 layout attrs 能传到 Sunmmio device func.
-    同时检查 Var remap 和内部 marker 清理."""
     n = T.dynamic("n")
 
     @T.prim_func
@@ -114,9 +112,6 @@ def test_sunmmio_split_host_device_propagates_hoisted_layout_attrs():
 
 
 def test_sunmmio_split_host_device_preserves_cute_layout_attr_type():
-    """测试 layout remap 后仍保留 CuteLayout 类型.
-    Sunmmio codegen 依赖 CuteLayout 的结构化字段."""
-
     @T.prim_func
     def before(A: T.Buffer((16, 16), "float32")):
         with T.Kernel(1):
@@ -138,8 +133,6 @@ def test_sunmmio_split_host_device_preserves_cute_layout_attr_type():
 
 
 def test_sunmmio_split_host_device_remaps_marked_simple_attrs():
-    """测试标记的非 layout attrs 会保守复制并 remap。
-    标量直接 remap,Array/Map 中的元素独立 remap."""
     n = T.dynamic("n")
 
     @T.prim_func
