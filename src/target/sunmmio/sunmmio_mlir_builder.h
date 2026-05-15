@@ -79,7 +79,10 @@ public:
 
   SunMMIOValue TileLoad(const std::string &result_name,
                         const SunMMIOValue &tile_view,
-                        const SunMMIOType &tile_type, DataType dtype) final;
+                        const SunMMIOType &tile_type,
+                        const std::optional<SunMMIOValue> &mask,
+                        const std::optional<SunMMIOValue> &maskedoff,
+                        DataType dtype) final;
 
   SunMMIOValue TileFill(const std::string &result_name,
                         const SunMMIOValue &scalar,
@@ -90,18 +93,40 @@ public:
                              const SunMMIOType &tile_type, int64_t axis,
                              DataType dtype) final;
 
+  SunMMIOValue TileSlice(const std::string &result_name,
+                         const SunMMIOValue &tile,
+                         const std::vector<SunMMIOValue> &offsets,
+                         const SunMMIOType &tile_type, DataType dtype) final;
+
+  SunMMIOValue TileRectMask(const std::string &result_name,
+                            const SunMMIOValue &valid_rows,
+                            const SunMMIOValue &valid_cols,
+                            const SunMMIOType &tile_type) final;
+
+  SunMMIOValue TileSqueeze(const std::string &result_name,
+                           const SunMMIOValue &tile,
+                           const SunMMIOType &tile_type, int64_t axis,
+                           DataType dtype) final;
+
   void Store(const SunMMIOValue &value, const std::string &buffer_handle,
              const std::vector<SunMMIOValue> &indices,
              const SunMMIOType &memref_type) final;
 
-  void TileStore(const SunMMIOValue &value,
-                 const SunMMIOValue &tile_view) final;
+  void TileStore(const SunMMIOValue &value, const SunMMIOValue &tile_view,
+                 const std::optional<SunMMIOValue> &mask) final;
 
   SunMMIOValue Call(const std::string &result_name, const std::string &callee,
                     const std::vector<SunMMIOValue> &operands,
                     const std::vector<std::string> &string_args,
                     const std::string &category, DataType ret_dtype,
                     const SunMMIOType &ret_type) final;
+
+  SunMMIOValue RegionCall(const std::string &result_name,
+                          const std::string &buffer_handle,
+                          const std::vector<SunMMIOValue> &mins,
+                          const std::vector<int64_t> &extents,
+                          DataType ret_dtype,
+                          const SunMMIOType &ret_type) final;
 
   SunMMIOValue Ramp(const std::string &result_name, const SunMMIOValue &base,
                     const SunMMIOValue &stride, int lanes,
@@ -125,6 +150,12 @@ public:
   void EndIf() final;
 
   void EmitAssert(const SunMMIOValue &cond, const std::string &msg_text) final;
+  void PushLayoutScope(const TirLayoutMap &layout_map,
+                       const TirLayoutMap &global_layout_map) final;
+  void PopLayoutScope() final;
+  ffi::Optional<tl::Layout> LookupLayout(const tir::Buffer &buffer) const final;
+  void ApplyLayoutToType(const tir::Buffer &buffer,
+                         SunMMIOType *type) const final;
 
   SunmmioMlirContext &Context() { return ctx_; }
   const SunmmioMlirContext &Context() const { return ctx_; }

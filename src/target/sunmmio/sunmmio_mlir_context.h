@@ -3,6 +3,8 @@
 
 #include "sunmmio_mlir_type.h"
 
+#include "../../layout/layout.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
@@ -10,6 +12,8 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Value.h"
+#include <tvm/ffi/container/map.h>
+#include <tvm/ffi/optional.h>
 
 #include <cstdint>
 #include <string>
@@ -20,13 +24,9 @@ namespace tvm {
 namespace codegen {
 
 struct SunmmioMlirContext {
-  struct MemTensorBinding {
-    SunMMIOType memtensor_type;
-    std::string ssa_name;
-    bool is_fake{false};
-  };
-
   SunmmioMlirContext();
+
+  using TirLayoutMap = ffi::Map<tir::Buffer, tl::Layout>;
 
   mlir::MLIRContext mlir_ctx;
   mlir::OpBuilder builder;
@@ -36,7 +36,6 @@ struct SunmmioMlirContext {
   std::vector<MLIRValueTable> mlir_value_table_stack;
 
   std::unordered_map<int64_t, mlir::Value> token_by_id;
-  std::unordered_map<const tir::VarNode *, MemTensorBinding> memtensor_bindings;
 
   struct SavedToken {
     bool existed{false};
@@ -59,6 +58,8 @@ struct SunmmioMlirContext {
     std::unordered_map<int64_t, SavedToken> saved_token_by_id;
   };
   std::vector<ForFrame> for_stack;
+  std::vector<TirLayoutMap> layout_map_stack;
+  std::vector<TirLayoutMap> global_layout_map_stack;
 
   struct IfFrame {
     mlir::scf::IfOp op;
@@ -143,21 +144,12 @@ struct SunmmioMlirContext {
     mlir_value_table_stack.back()[name] = v;
   }
 
-  const MemTensorBinding *
-  LookupMemTensorBinding(const tir::Var &buffer_var) const {
-    auto it = memtensor_bindings.find(buffer_var.get());
-    if (it == memtensor_bindings.end()) {
-      return nullptr;
-    }
-    return &it->second;
-  }
-
-  void BindMemTensor(const tir::Var &buffer_var,
-                     const SunMMIOType &memtensor_type,
-                     const std::string &ssa_name, bool is_fake = false) {
-    memtensor_bindings[buffer_var.get()] =
-        MemTensorBinding{memtensor_type, ssa_name, is_fake};
-  }
+  void ClearLayoutScopes();
+  void PushLayoutScope(const TirLayoutMap &layout_map,
+                       const TirLayoutMap &global_layout_map);
+  void PopLayoutScope();
+  ffi::Optional<tl::Layout> LookupLayout(const tir::Buffer &buffer) const;
+  void ApplyLayoutToType(const tir::Buffer &buffer, SunMMIOType *type) const;
 
   void Clear();
 };

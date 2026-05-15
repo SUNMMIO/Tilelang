@@ -20,7 +20,10 @@ public:
 
   SunMMIOValue TileLoad(const std::string &result_name,
                         const SunMMIOValue &tile_view,
-                        const SunMMIOType &tile_type, DataType dtype);
+                        const SunMMIOType &tile_type,
+                        const std::optional<SunMMIOValue> &mask,
+                        const std::optional<SunMMIOValue> &maskedoff,
+                        DataType dtype);
 
   SunMMIOValue TileFill(const std::string &result_name,
                         const SunMMIOValue &scalar,
@@ -43,7 +46,23 @@ public:
                              const SunMMIOType &tile_type, int64_t axis,
                              DataType dtype);
 
-  void TileStore(const SunMMIOValue &value, const SunMMIOValue &tile_view);
+  SunMMIOValue TileSlice(const std::string &result_name,
+                         const SunMMIOValue &tile,
+                         const std::vector<SunMMIOValue> &offsets,
+                         const SunMMIOType &tile_type, DataType dtype);
+
+  SunMMIOValue TileRectMask(const std::string &result_name,
+                            const SunMMIOValue &valid_rows,
+                            const SunMMIOValue &valid_cols,
+                            const SunMMIOType &tile_type);
+
+  SunMMIOValue TileSqueeze(const std::string &result_name,
+                           const SunMMIOValue &tile,
+                           const SunMMIOType &tile_type, int64_t axis,
+                           DataType dtype);
+
+  void TileStore(const SunMMIOValue &value, const SunMMIOValue &tile_view,
+                 const std::optional<SunMMIOValue> &mask);
 
 private:
   SunmmioMlirContext &ctx_;

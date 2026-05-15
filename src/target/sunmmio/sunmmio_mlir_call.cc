@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Operation.h"
 #include "npuir/Dialect/SUVM/IR/Attributes.h"
+#include "npuir/Dialect/SUVM/IR/Ops.h"
 #include "npuir/Dialect/SUVM/IR/Types.h"
 
 #include <tvm/runtime/logging.h>
@@ -15,6 +16,64 @@ namespace tvm {
 namespace codegen {
 
 SunmmioMlirCall::SunmmioMlirCall(SunmmioMlirContext &ctx) : ctx_(ctx) {}
+
+SunMMIOValue SunmmioMlirCall::RegionCall(const std::string &result_name,
+                                         const std::string &buffer_handle,
+                                         const std::vector<SunMMIOValue> &mins,
+                                         const std::vector<int64_t> &extents,
+                                         DataType ret_dtype,
+                                         const SunMMIOType &ret_type) {
+  SunmmioMlirType type(ctx_);
+
+  mlir::Value source = ctx_.LookupMLIRValue(buffer_handle);
+  ICHECK(source) << "Missing MLIR source buffer for tl.tileop.region `"
+                 << buffer_handle << "`";
+
+  auto memtensor_ty =
+      mlir::dyn_cast<mlir::suvm::MemTensorType>(source.getType());
+  ICHECK(memtensor_ty)
+      << "tl.tileop.region expects source buffer to be a suvm.memtensor";
+
+  mlir::SmallVector<mlir::Value, 4> indices;
+  indices.reserve(mins.size());
+  for (const auto &min : mins) {
+    mlir::Value index = ctx_.LookupMLIRValue(min.value);
+    ICHECK(index) << "Missing MLIR min value in tl.tileop.region for `"
+                  << min.value << "`";
+    indices.push_back(type.EnsureIndex(index));
+  }
+
+  mlir::SmallVector<int64_t, 4> shape;
+  mlir::SmallVector<int64_t, 4> tiled_dims;
+  shape.reserve(extents.size());
+
+  if (extents.size() >= 2) {
+    for (int64_t i = 0; i < static_cast<int64_t>(extents.size()); ++i) {
+      if (extents[i] != 1) {
+        shape.push_back(extents[i]);
+        tiled_dims.push_back(i);
+      }
+    }
+    ICHECK_EQ(tiled_dims.size(), 2)
+        << "tl.tileop.region expects exactly 2 tiled dims with extent != 1, "
+           "but got "
+        << tiled_dims.size();
+  } else {
+    shape.push_back(extents[0]);
+    tiled_dims.push_back(0);
+  }
+
+  mlir::Type elem_ty = memtensor_ty.getElementType();
+  mlir::Type tile_view_ty =
+      mlir::suvm::TileViewType::get(&ctx_.mlir_ctx, shape, elem_ty);
+  auto tiled_dims_attr = ctx_.builder.getDenseI64ArrayAttr(tiled_dims);
+
+  auto view_op = mlir::suvm::GetPartitionedTileViewOp::create(
+      ctx_.builder, type.MakeDebugLoc("region"), tile_view_ty, source, indices,
+      tiled_dims_attr);
+  ctx_.BindMLIRValue(result_name, view_op->getResult(0));
+  return SunMMIOValue{ret_dtype, result_name, ret_type};
+}
 
 SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
                                    const std::string &callee,
@@ -89,6 +148,19 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
 
     ctx_.token_by_id[token_id] = produced;
   };
+  auto parse_named_bool = [&](const char *key, const char *arg_name) -> bool {
+    std::string prefix = std::string(key) + "=";
+    for (const std::string &s : string_args) {
+      if (s.rfind(prefix, 0) == 0) {
+        std::string value = s.substr(prefix.size());
+        ICHECK(value == "0" || value == "1")
+            << arg_name << " must be encoded as 0 or 1";
+        return value == "1";
+      }
+    }
+    LOG(FATAL) << arg_name << " is missing from string_args";
+    TVM_FFI_UNREACHABLE();
+  };
 
   if (callee == "tl.sync_null_token") {
     int64_t token_id = parse_token_id();
@@ -107,9 +179,7 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
       record_token_by_id(token_id, op->getResult(0));
     }
     return SunMMIOValue{ret_dtype, result_name, ret_type};
-  }
-
-  if (callee == "tl.wait_token") {
+  } else if (callee == "tl.wait_token") {
     int64_t token_id = parse_token_id();
     if (token_id < 0) {
       LOG(FATAL) << "tl.wait_token requires token_id";
@@ -145,87 +215,101 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     st.addOperands(tok);
     (void)ctx_.builder.create(st);
     return SunMMIOValue{ret_dtype, result_name, ret_type};
-  }
+  } else if (callee == "tl.dma_copy") {
+    ICHECK_GE(operands.size(), 2)
+        << "tl.dma_copy expects src and dst tile views";
 
-  if (callee == "tl.dma_copy") {
-    // (1) Build types (token/layout/memory spaces/MemTensor/TileView)
-    mlir::Type token_ty = mlir::suvm::TokenType::get(&ctx_.mlir_ctx);
-    mlir::Type elem_ty = ctx_.builder.getIntegerType(8);
-    mlir::SmallVector<int64_t, 2> shape = {1, 1};
-    mlir::SmallVector<int64_t, 2> stride = {1, 1};
-    mlir::SmallVector<uint8_t, 2> dim_levels = {1, 1};
-    auto layout =
-        mlir::suvm::LayoutAttr::get(&ctx_.mlir_ctx, shape, stride, dim_levels);
-    auto ms_global = mlir::suvm::MemorySpaceAttr::get(
-        &ctx_.mlir_ctx, mlir::suvm::MemorySpace::global);
-    auto ms_rsram = mlir::suvm::MemorySpaceAttr::get(
-        &ctx_.mlir_ctx, mlir::suvm::MemorySpace::rsram);
-    mlir::Type mem_src_ty =
-        mlir::suvm::MemTensorType::get(shape, elem_ty, layout, ms_global, 0);
-    mlir::Type mem_dst_ty =
-        mlir::suvm::MemTensorType::get(shape, elem_ty, layout, ms_rsram, 0);
-    mlir::Type tv_ty =
-        mlir::suvm::TileViewType::get(&ctx_.mlir_ctx, shape, elem_ty);
+    mlir::Value src = ctx_.LookupMLIRValue(operands[0].value);
+    ICHECK(src) << "Missing MLIR source tile view for tl.dma_copy `"
+                << operands[0].value << "`";
+    auto src_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(src.getType());
+    ICHECK(src_ty) << "tl.dma_copy expects source to be a suvm.tile_view";
 
-    // (2) Emit IR: alloc -> get_partitioned_tile_view -> copy_async
-    mlir::OperationState alloc_src_st(type.Loc(), "suvm.alloc");
-    alloc_src_st.addTypes(mem_src_ty);
-    mlir::Operation *alloc_src_op = ctx_.builder.create(alloc_src_st);
+    mlir::Value dst = ctx_.LookupMLIRValue(operands[1].value);
+    ICHECK(dst) << "Missing MLIR destination tile view for tl.dma_copy `"
+                << operands[1].value << "`";
+    auto dst_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(dst.getType());
+    ICHECK(dst_ty) << "tl.dma_copy expects destination to be a suvm.tile_view";
 
-    mlir::OperationState alloc_dst_st(type.Loc(), "suvm.alloc");
-    alloc_dst_st.addTypes(mem_dst_ty);
-    mlir::Operation *alloc_dst_op = ctx_.builder.create(alloc_dst_st);
+    auto copy_op = mlir::suvm::CopyAsyncOp::create(
+        ctx_.builder, type.MakeDebugLoc("dma_copy"), src, dst, nullptr);
 
-    mlir::Value c0 =
-        mlir::arith::ConstantIndexOp::create(ctx_.builder, type.Loc(), 0);
-    auto tiled_dims = ctx_.builder.getDenseI64ArrayAttr({0, 1});
+    ctx_.BindMLIRValue(result_name, copy_op->getResult(0));
 
-    mlir::OperationState view_src_st(type.Loc(),
-                                     "suvm.get_partitioned_tile_view");
-    view_src_st.addOperands({alloc_src_op->getResult(0), c0, c0});
-    view_src_st.addAttribute("tiled_dims", tiled_dims);
-    view_src_st.addTypes(tv_ty);
-    mlir::Operation *view_src_op = ctx_.builder.create(view_src_st);
-
-    mlir::OperationState view_dst_st(type.Loc(),
-                                     "suvm.get_partitioned_tile_view");
-    view_dst_st.addOperands({alloc_dst_op->getResult(0), c0, c0});
-    view_dst_st.addAttribute("tiled_dims", tiled_dims);
-    view_dst_st.addTypes(tv_ty);
-    mlir::Operation *view_dst_op = ctx_.builder.create(view_dst_st);
-
-    mlir::OperationState copy_st(type.Loc(), "suvm.copy_async");
-    mlir::Value view_src = view_src_op->getResult(0);
-    mlir::Value view_dst = view_dst_op->getResult(0);
-    copy_st.addOperands({view_src, view_dst});
-    copy_st.addTypes(token_ty);
-    mlir::Operation *copy_op = ctx_.builder.create(copy_st);
-
-    // (3) Record the token produced by copy_async under token_id (scope-aware).
     int64_t token_id = parse_token_id();
     if (token_id >= 0 && copy_op && copy_op->getNumResults() == 1) {
       record_token_by_id(token_id, copy_op->getResult(0));
     }
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
-  }
+  } else if (callee == "tl.mma_sunmmio") {
+    ICHECK_EQ(operands.size(), 3)
+        << "tl.mma_sunmmio expects A/B/C tile views as operands";
 
-  (void)operands;
-  (void)string_args;
-  (void)category;
-  ICHECK(ctx_.module)
-      << "MLIR module must be initialized before lowering Sunmmio calls";
-  mlir::TypedAttr value_attr = ctx_.builder.getIntegerAttr(
-      mlir::Type::getFromOpaquePointer(
-          ctx_.builder.getF32Type().getAsOpaquePointer()),
-      0);
-  auto fake_op = mlir::arith::ConstantOp::create(
-      ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc("fake_call"),
-      value_attr);
-  fake_op->setAttr("sunmmio.fake", ctx_.builder.getStringAttr("call"));
-  mlir::Value call_value = fake_op.getResult();
-  ctx_.BindMLIRValue(result_name, call_value);
-  return SunMMIOValue{ret_dtype, result_name, ret_type};
+    mlir::Value a = ctx_.LookupMLIRValue(operands[0].value);
+    ICHECK(a) << "Missing MLIR activation tile view for tl.mma_sunmmio `"
+              << operands[0].value << "`";
+    auto a_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(a.getType());
+    ICHECK(a_ty) << "tl.mma_sunmmio expects activation to be a suvm.tile_view";
+
+    mlir::Value w = ctx_.LookupMLIRValue(operands[1].value);
+    ICHECK(w) << "Missing MLIR weight tile view for tl.mma_sunmmio `"
+              << operands[1].value << "`";
+    auto w_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(w.getType());
+    ICHECK(w_ty) << "tl.mma_sunmmio expects weight to be a suvm.tile_view";
+
+    mlir::Value c = ctx_.LookupMLIRValue(operands[2].value);
+    ICHECK(c) << "Missing MLIR accumulator tile view for tl.mma_sunmmio `"
+              << operands[2].value << "`";
+    auto c_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(c.getType());
+    ICHECK(c_ty) << "tl.mma_sunmmio expects accumulator to be a suvm.tile_view";
+
+    bool trans_a = parse_named_bool("trans_a", "tl.mma_sunmmio transA");
+    ICHECK(!trans_a)
+        << "tl.mma_sunmmio lowering to suvm.tc.mma does not support transA";
+    bool trans_b = parse_named_bool("trans_b", "tl.mma_sunmmio transB");
+    bool clear_accum =
+        parse_named_bool("clear_accum", "tl.mma_sunmmio clearAccum");
+
+    mlir::UnitAttr acc_attr =
+        clear_accum ? mlir::UnitAttr() : ctx_.builder.getUnitAttr();
+    mlir::UnitAttr trans_attr =
+        trans_b ? ctx_.builder.getUnitAttr() : mlir::UnitAttr();
+
+    auto mma_op = mlir::suvm::TcMmaOp::create(ctx_.builder,
+                                              type.MakeDebugLoc("mma_sunmmio"),
+                                              c, a, w, c, acc_attr, trans_attr);
+
+    ctx_.BindMLIRValue(result_name, mma_op->getResult(0));
+
+    int64_t token_id = parse_token_id();
+    if (token_id >= 0 && mma_op && mma_op->getNumResults() == 1) {
+      record_token_by_id(token_id, mma_op->getResult(0));
+    }
+
+    return SunMMIOValue{ret_dtype, result_name, ret_type};
+  } else {
+    (void)operands;
+    (void)string_args;
+    (void)category;
+    LOG(INFO) << "Calling " << callee << " with operands ";
+    for (const auto &op : operands) {
+      LOG(INFO) << op.value << " ";
+    }
+    ICHECK(ctx_.module)
+        << "MLIR module must be initialized before lowering Sunmmio calls";
+    mlir::TypedAttr value_attr = ctx_.builder.getIntegerAttr(
+        mlir::Type::getFromOpaquePointer(
+            ctx_.builder.getF32Type().getAsOpaquePointer()),
+        0);
+    auto fake_op = mlir::arith::ConstantOp::create(
+        ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc("fake_call"),
+        value_attr);
+    fake_op->setAttr("sunmmio.fake", ctx_.builder.getStringAttr("call"));
+    mlir::Value call_value = fake_op.getResult();
+    ctx_.BindMLIRValue(result_name, call_value);
+    return SunMMIOValue{ret_dtype, result_name, ret_type};
+  }
 }
 
 } // namespace codegen

@@ -133,11 +133,12 @@ SunMMIOValue SuvmSunmmioBuilder::GetPartitionedTileView(
                                        tiled_dims, view_type, dtype);
 }
 
-SunMMIOValue SuvmSunmmioBuilder::TileLoad(const std::string &result_name,
-                                          const SunMMIOValue &tile_view,
-                                          const SunMMIOType &tile_type,
-                                          DataType dtype) {
-  return tile_->TileLoad(result_name, tile_view, tile_type, dtype);
+SunMMIOValue SuvmSunmmioBuilder::TileLoad(
+    const std::string &result_name, const SunMMIOValue &tile_view,
+    const SunMMIOType &tile_type, const std::optional<SunMMIOValue> &mask,
+    const std::optional<SunMMIOValue> &maskedoff, DataType dtype) {
+  return tile_->TileLoad(result_name, tile_view, tile_type, mask, maskedoff,
+                         dtype);
 }
 
 SunMMIOValue SuvmSunmmioBuilder::TileFill(const std::string &result_name,
@@ -154,6 +155,28 @@ SunMMIOValue SuvmSunmmioBuilder::TileUnsqueeze(const std::string &result_name,
   return tile_->TileUnsqueeze(result_name, tile, tile_type, axis, dtype);
 }
 
+SunMMIOValue
+SuvmSunmmioBuilder::TileSlice(const std::string &result_name,
+                              const SunMMIOValue &tile,
+                              const std::vector<SunMMIOValue> &offsets,
+                              const SunMMIOType &tile_type, DataType dtype) {
+  return tile_->TileSlice(result_name, tile, offsets, tile_type, dtype);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::TileRectMask(const std::string &result_name,
+                                              const SunMMIOValue &valid_rows,
+                                              const SunMMIOValue &valid_cols,
+                                              const SunMMIOType &tile_type) {
+  return tile_->TileRectMask(result_name, valid_rows, valid_cols, tile_type);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::TileSqueeze(const std::string &result_name,
+                                             const SunMMIOValue &tile,
+                                             const SunMMIOType &tile_type,
+                                             int64_t axis, DataType dtype) {
+  return tile_->TileSqueeze(result_name, tile, tile_type, axis, dtype);
+}
+
 void SuvmSunmmioBuilder::Store(const SunMMIOValue &value,
                                const std::string &buffer_handle,
                                const std::vector<SunMMIOValue> &indices,
@@ -162,8 +185,9 @@ void SuvmSunmmioBuilder::Store(const SunMMIOValue &value,
 }
 
 void SuvmSunmmioBuilder::TileStore(const SunMMIOValue &value,
-                                   const SunMMIOValue &tile_view) {
-  tile_->TileStore(value, tile_view);
+                                   const SunMMIOValue &tile_view,
+                                   const std::optional<SunMMIOValue> &mask) {
+  tile_->TileStore(value, tile_view, mask);
 }
 
 SunMMIOValue SuvmSunmmioBuilder::Call(
@@ -173,6 +197,14 @@ SunMMIOValue SuvmSunmmioBuilder::Call(
     DataType ret_dtype, const SunMMIOType &ret_type) {
   return call_->Call(result_name, callee, operands, string_args, category,
                      ret_dtype, ret_type);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::RegionCall(
+    const std::string &result_name, const std::string &buffer_handle,
+    const std::vector<SunMMIOValue> &mins, const std::vector<int64_t> &extents,
+    DataType ret_dtype, const SunMMIOType &ret_type) {
+  return call_->RegionCall(result_name, buffer_handle, mins, extents, ret_dtype,
+                           ret_type);
 }
 
 SunMMIOValue SuvmSunmmioBuilder::Ramp(const std::string &result_name,
@@ -217,6 +249,23 @@ void SuvmSunmmioBuilder::EndIf() { function_->EndIf(); }
 void SuvmSunmmioBuilder::EmitAssert(const SunMMIOValue &cond,
                                     const std::string &msg_text) {
   function_->EmitAssert(cond, msg_text);
+}
+
+void SuvmSunmmioBuilder::PushLayoutScope(
+    const TirLayoutMap &layout_map, const TirLayoutMap &global_layout_map) {
+  ctx_.PushLayoutScope(layout_map, global_layout_map);
+}
+
+void SuvmSunmmioBuilder::PopLayoutScope() { ctx_.PopLayoutScope(); }
+
+ffi::Optional<tl::Layout>
+SuvmSunmmioBuilder::LookupLayout(const tir::Buffer &buffer) const {
+  return ctx_.LookupLayout(buffer);
+}
+
+void SuvmSunmmioBuilder::ApplyLayoutToType(const tir::Buffer &buffer,
+                                           SunMMIOType *type) const {
+  ctx_.ApplyLayoutToType(buffer, type);
 }
 
 } // namespace codegen

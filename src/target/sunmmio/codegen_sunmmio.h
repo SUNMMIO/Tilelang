@@ -8,9 +8,11 @@
 #include <tvm/tir/stmt.h>
 #include <tvm/tir/stmt_functor.h>
 
+#include "../../layout/layout.h"
 #include "sunmmio_mlir_type.h"
 
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -27,6 +29,8 @@ enum class TileUnaryOp {
 class SunMMIOBuilder {
 public:
   virtual ~SunMMIOBuilder() = default;
+
+  using TirLayoutMap = ffi::Map<tir::Buffer, tl::Layout>;
 
   virtual void Init() = 0;
   virtual void Clear() = 0;
@@ -94,6 +98,8 @@ public:
   virtual SunMMIOValue TileLoad(const std::string &result_name,
                                 const SunMMIOValue &tile_view,
                                 const SunMMIOType &tile_type,
+                                const std::optional<SunMMIOValue> &mask,
+                                const std::optional<SunMMIOValue> &maskedoff,
                                 DataType dtype) = 0;
 
   virtual SunMMIOValue TileFill(const std::string &result_name,
@@ -106,13 +112,30 @@ public:
                                      const SunMMIOType &tile_type, int64_t axis,
                                      DataType dtype) = 0;
 
+  virtual SunMMIOValue TileSlice(const std::string &result_name,
+                                 const SunMMIOValue &tile,
+                                 const std::vector<SunMMIOValue> &offsets,
+                                 const SunMMIOType &tile_type,
+                                 DataType dtype) = 0;
+
+  virtual SunMMIOValue TileRectMask(const std::string &result_name,
+                                    const SunMMIOValue &valid_rows,
+                                    const SunMMIOValue &valid_cols,
+                                    const SunMMIOType &tile_type) = 0;
+
+  virtual SunMMIOValue TileSqueeze(const std::string &result_name,
+                                   const SunMMIOValue &tile,
+                                   const SunMMIOType &tile_type, int64_t axis,
+                                   DataType dtype) = 0;
+
   virtual void Store(const SunMMIOValue &value,
                      const std::string &buffer_handle,
                      const std::vector<SunMMIOValue> &indices,
                      const SunMMIOType &memref_type) = 0;
 
   virtual void TileStore(const SunMMIOValue &value,
-                         const SunMMIOValue &tile_view) = 0;
+                         const SunMMIOValue &tile_view,
+                         const std::optional<SunMMIOValue> &mask) = 0;
 
   virtual SunMMIOValue Call(const std::string &result_name,
                             const std::string &callee,
@@ -120,6 +143,13 @@ public:
                             const std::vector<std::string> &string_args,
                             const std::string &category, DataType ret_dtype,
                             const SunMMIOType &ret_type) = 0;
+
+  virtual SunMMIOValue RegionCall(const std::string &result_name,
+                                  const std::string &buffer_handle,
+                                  const std::vector<SunMMIOValue> &mins,
+                                  const std::vector<int64_t> &extents,
+                                  DataType ret_dtype,
+                                  const SunMMIOType &ret_type) = 0;
 
   virtual SunMMIOValue Ramp(const std::string &result_name,
                             const SunMMIOValue &base,
@@ -146,6 +176,23 @@ public:
 
   virtual void EmitAssert(const SunMMIOValue &cond,
                           const std::string &msg_text) = 0;
+
+  virtual void PushLayoutScope(const TirLayoutMap &layout_map,
+                               const TirLayoutMap &global_layout_map) {
+    (void)layout_map;
+    (void)global_layout_map;
+  }
+  virtual void PopLayoutScope() {}
+  virtual ffi::Optional<tl::Layout>
+  LookupLayout(const tir::Buffer &buffer) const {
+    (void)buffer;
+    return ffi::Optional<tl::Layout>();
+  }
+  virtual void ApplyLayoutToType(const tir::Buffer &buffer,
+                                 SunMMIOType *type) const {
+    (void)buffer;
+    (void)type;
+  }
 };
 
 class CodeGenTileLangSunMMIO final
@@ -235,6 +282,7 @@ private:
   SunMMIOValue EvalExpr(const tvm::PrimExpr &expr);
   void VisitStmtTracked(const tir::Stmt &stmt);
   void CollectExpectedCoverage(const tir::PrimFunc &f);
+  void CollectDeclBuffers(const tir::Stmt &stmt);
   void MarkVisitedNodeType(const std::string &type_key);
   void MarkVisitedCallOpFromExpr(const tvm::PrimExpr &expr);
   void WriteCoverageReport() const;
@@ -249,9 +297,7 @@ private:
                         const ffi::Array<PrimExpr> &indices);
   void EmitStore(const tir::Buffer &buffer, const ffi::Array<PrimExpr> &indices,
                  const SunMMIOValue &value);
-  void EmitAlloc(const tir::Var &buffer_var, DataType dtype,
-                 const ffi::Array<PrimExpr> &extents,
-                 const std::string &scope_hint);
+  void EmitAlloc(const tir::Buffer &buffer, const std::string &scope_hint);
   bool TryLowerTilesScope(const tir::ForNode *op);
   void EmitFor(const tir::ForNode *op);
   void EmitIf(const tir::IfThenElseNode *op);
@@ -267,6 +313,7 @@ private:
   ArithmeticFlavor GetArithmeticFlavor(DataType dtype) const;
   CompareDomain GetCompareDomain(DataType dtype) const;
   SunMMIOValue BindVar(const tir::Var &var, const SunMMIOValue &value);
+  const SunMMIOValue &LookupVar(const tir::VarNode *var) const;
   void RegisterBuffer(const tir::Buffer &buffer, bool is_external,
                       const std::string &handle_hint = "");
   const BufferBinding &LookupBuffer(const tir::Buffer &buffer) const;
@@ -286,6 +333,7 @@ private:
 
   std::unordered_map<const tir::VarNode *, SunMMIOValue> var_table_;
   std::unordered_map<const tir::BufferNode *, BufferBinding> buffer_registry_;
+  std::unordered_map<const tir::VarNode *, tir::Buffer> buffer_data_to_buffer_;
   std::vector<ScopedAttr> attr_stack_;
 
   std::vector<const tir::VarNode *> scoped_vars_;

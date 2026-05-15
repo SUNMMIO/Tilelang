@@ -16,6 +16,12 @@ public:
                     const std::string &category, DataType ret_dtype,
                     const SunMMIOType &ret_type);
 
+  SunMMIOValue RegionCall(const std::string &result_name,
+                          const std::string &buffer_handle,
+                          const std::vector<SunMMIOValue> &mins,
+                          const std::vector<int64_t> &extents,
+                          DataType ret_dtype, const SunMMIOType &ret_type);
+
 private:
   SunmmioMlirContext &ctx_;
 };
