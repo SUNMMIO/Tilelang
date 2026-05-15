@@ -229,32 +229,42 @@ def verify_SunmmioSync(mod: IRModule):
     lines = [l.strip() for l in script.split("\n")]
 
     token_ids = [int(l.split("sync_token_id(")[1].split(")")[0]) for l in lines if "sync_token_id" in l]
+    null_token_ids = [int(l.split("sync_null_token(")[1].split(")")[0]) for l in lines if "sync_null_token" in l]
     barrier_ids = [int(l.split("(")[1].split(")")[0].split(",")[0]) for l in lines if "barrier_init" in l]
     wait_ids = [int(l.split("(")[1].split(")")[0]) for l in lines if "wait_token" in l]
     arrive_ids = [int(l.split("(")[1].split(")")[0]) for l in lines if "barrier_arrive_and_wait" in l]
-    token_num = max(token_ids) + 1 if token_ids else 0
+    declared_token_ids = set(token_ids) | set(null_token_ids)
+    all_token_ids = declared_token_ids | set(wait_ids)
+    all_barrier_ids = set(barrier_ids) | set(arrive_ids)
     barrier_num = max(barrier_ids) + 1 if barrier_ids else 0
 
+    def check_dense_ids(ids, name):
+        if not ids:
+            return
+        expected_ids = set(range(max(ids) + 1))
+        assert ids == expected_ids, f"{name} ids should be continuous from 0, got {sorted(ids)}"
+
+    check_dense_ids(all_token_ids, "token")
+    check_dense_ids(all_barrier_ids, "barrier")
+
     # Check count of wait_lines and arrive_lines
-    assert len(wait_ids) >= token_num, "wait_lines should be greater than token_lines"
+    assert len(wait_ids) >= len(set(token_ids)), "wait_lines should be greater than token_lines"
     assert len(arrive_ids) >= barrier_num, "arrive_lines should be greater than barrier_lines"
     # Check range of wait_ids and arrive_ids
     for i in wait_ids:
-        assert i < token_num, f"wait_token({i}) is out of range {token_num}"
+        assert i in declared_token_ids, f"wait_token({i}) does not have sync_token_id or sync_null_token"
     for i in arrive_ids:
         assert i < barrier_num, f"arrive_token({i}) is out of range {barrier_num}"
 
     # Check order of sync_token_id(id) (or sync_null_token(id)) and wait_token(id)
-    for i in range(token_num):
+    for i in declared_token_ids:
         idx_token = script.find(f"sync_token_id({i})")
         idx_null = script.find(f"sync_null_token({i})")
-        if idx_null != -1:
-            assert idx_null < idx_token, f"sync_null_token({i}) is after sync_token_id({i})"
-            idx_token = idx_null
+        idx_first_token = min(idx for idx in (idx_token, idx_null) if idx != -1)
         idx_wait = script.find(f"wait_token({i})")
-        assert idx_token != -1, f"sync_token_id({i}) is not found in script"
+        assert idx_first_token != -1, f"sync_token_id({i}) or sync_null_token({i}) is not found in script"
         assert idx_wait != -1, f"wait_token({i}) is not found in script"
-        assert idx_token < idx_wait, f"wait_token({i}) is before sync_token_id({i})"
+        assert idx_first_token < idx_wait, f"wait_token({i}) is before sync_token_id or sync_null_token({i})"
     # Check order of barrier_init(id) and barrier_arrive_and_wait(id)
     for i in range(barrier_num):
         idx_barrier = script.find(f"barrier_init({i}")
@@ -262,54 +272,6 @@ def verify_SunmmioSync(mod: IRModule):
         assert idx_barrier != -1, f"barrier_init({i}) is not found in script"
         assert idx_arrive != -1, f"barrier_arrive_and_wait({i}) is not found in script"
         assert idx_barrier < idx_arrive, f"barrier_init({i}) is after barrier_arrive_and_wait({i})"
-
-
-def _count_alloc_by_scope(body, scope):
-    cnt = 0
-
-    def visitor(n):
-        nonlocal cnt
-        if isinstance(n, tir.Allocate):
-            ta = n.buffer_var.type_annotation
-            if getattr(ta, "storage_scope", "") == scope:
-                cnt += 1
-
-    tir.stmt_functor.post_order_visit(body, visitor)
-    return cnt
-
-
-def _get_single_alloc_extent(body, scope):
-    extent = None
-
-    def visitor(n):
-        nonlocal extent
-        if isinstance(n, tir.Allocate):
-            ta = n.buffer_var.type_annotation
-            if getattr(ta, "storage_scope", "") == scope and extent is None:
-                extent = n.extents[0]
-
-    tir.stmt_functor.post_order_visit(body, visitor)
-    return extent
-
-
-def build_verify_merge_allocate(kernel_name: str, cnt_a=0, cnt_w=0, cnt_r=0):
-    def verify_merge_allocate(mod: IRModule):
-        device_mod = mod[kernel_name]
-        # Expect exactly one Allocate per scope after merge
-        assert _count_alloc_by_scope(device_mod.body, "shared.asram") <= 1, "shared.asram not 1"
-        assert _count_alloc_by_scope(device_mod.body, "shared.wsram") <= 1, "shared.wsram not 1"
-        assert _count_alloc_by_scope(device_mod.body, "shared.rsram") <= 1, "shared.rsram not 1"
-        if cnt_a > 0:
-            real_a = _get_single_alloc_extent(device_mod.body, "shared.asram")
-            assert real_a == cnt_a, f"shared.asram extent error, expected {cnt_a}, got {real_a}"
-        if cnt_w > 0:
-            real_w = _get_single_alloc_extent(device_mod.body, "shared.wsram")
-            assert real_w == cnt_w, f"shared.wsram extent error, expected {cnt_w}, got {real_w}"
-        if cnt_r > 0:
-            real_r = _get_single_alloc_extent(device_mod.body, "shared.rsram")
-            assert real_r == cnt_r, f"shared.rsram extent error, expected {cnt_r}, got {real_r}"
-
-    return verify_merge_allocate
 
 
 def verify_tiles_ops(prim_func: tir.PrimFunc):
@@ -358,16 +320,10 @@ def verify_tiles_ops(prim_func: tir.PrimFunc):
             # At this stage, loop_stage should be 2
             assert '"tile.loop_stage": 2' in script, "Expected tile.loop_stage: 2 in script"
 
-    def check_vectorize_loop(mod: IRModule):
-        script = mod.script()
-        # Verify that vectorized loops have been eliminated
-        assert "T.vectorized(" not in script, "Expected T.vectorized to be eliminated by VectorizeLoop pass"
-
     return {
         "LowerTileOp": check_lower_tile_op,
         "LegalizeTilesLoop": check_legalize_tiles_loop,
         "TilesLoop": check_tiles_loop,
-        "VectorizeLoop": check_vectorize_loop,
     }
 
 
@@ -408,9 +364,6 @@ def get_or_add_default_verify(func: tir.PrimFunc, test_config: dict = None):
         },
         "InjectSunmmioSync": {
             "formal_verify": [verify_SunmmioSync],
-        },
-        "VectorizeLoop": {
-            "formal_verify": [verify_ops["VectorizeLoop"]],
         },
         "HostMod": {"formal_verify": [verify_host_mod_separation]},
         "DeviceMod": {

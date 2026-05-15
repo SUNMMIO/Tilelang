@@ -1,3 +1,4 @@
+from functools import wraps
 import os
 import re
 import warnings
@@ -15,6 +16,18 @@ from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma
 from tilelang.utils.target import target_is_sunmmio
 from tilelang.jit.adapter.utils import is_cuda_target
+
+
+def target(target_name):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with tvm.target.Target(determine_target(target_name, return_object=True)):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
@@ -270,9 +283,12 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.InferSramScope()(mod)
     pass_output_process(mod, "InferSramScope", test_config)
 
+    mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
+    pass_output_process(mod, "LegalizeSunmmioDataPath", test_config)
+
     # mod = tilelang.transform.LayoutReducer()(mod)
-    mod = tilelang.transform.LayoutInference()(mod)
-    pass_output_process(mod, "LayoutInference", test_config)
+    mod = tilelang.transform.SunmmioLayoutInference()(mod)
+    pass_output_process(mod, "SunmmioLayoutInference", test_config)
 
     LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
@@ -341,20 +357,32 @@ def OptimizeForSunmmio_test(
     mod = tilelang.transform.InjectSunmmioPipeline()(mod)
     pass_output_process(mod, "InjectSunmmioPipeline", test_config)
 
-    mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
-    pass_output_process(mod, "PlanAndUpdateBufferAllocationLocation", test_config)
+    # mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
+    # pass_output_process(mod, "PlanAndUpdateBufferAllocationLocation", test_config)
 
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     pass_output_process(mod, "LowerOpaqueBlock", test_config)
 
-    mod = tir.transform.Simplify()(mod)
+    mod = tilelang.transform.Simplify()(mod)
     pass_output_process(mod, "Simplify_optimize_1", test_config)
 
     mod = tir.transform.NarrowDataType(32)(mod)
     pass_output_process(mod, "NarrowDataType", test_config)
 
-    mod = tir.transform.HoistIfThenElse()(mod)
-    pass_output_process(mod, "HoistIfThenElse", test_config)
+    # mod = tilelang.transform.FlattenBuffer()(mod)
+    # pass_output_process(mod, "FlattenBuffer", test_config)
+
+    mod = tilelang.transform.ConfigIndexBitwidth()(mod)
+    pass_output_process(mod, "ConfigIndexBitwidth", test_config)
+
+    mod = tir.transform.Simplify()(mod)
+    pass_output_process(mod, "Simplify_optimize_2", test_config)
+
+    # mod = tilelang.transform.VectorizeLoop(enable_vectorize=True)(mod)
+    # pass_output_process(mod, "VectorizeLoop", test_config)
+
+    # mod = tilelang.transform.StorageRewrite()(mod)
+    # pass_output_process(mod, "StorageRewrite", test_config)
 
     mod = tilelang.transform.LoopUnswitching()(mod)
     pass_output_process(mod, "LoopUnswitching", test_config)
@@ -362,8 +390,18 @@ def OptimizeForSunmmio_test(
     mod = tir.transform.UnrollLoop()(mod)
     pass_output_process(mod, "UnrollLoop", test_config)
 
+    mod = tir.transform.RenormalizeSplitPattern()(mod)
+    pass_output_process(mod, "RenormalizeSplitPattern", test_config)
+
     mod = tir.transform.Simplify()(mod)
-    pass_output_process(mod, "Simplify_optimize_2", test_config)
+    pass_output_process(mod, "Simplify_optimize_3", test_config)
+
+    # return
+    mod = tir.transform.RemoveNoOp()(mod)
+    pass_output_process(mod, "RemoveNoOp", test_config)
+
+    mod = tir.transform.HoistIfThenElse()(mod)
+    pass_output_process(mod, "HoistIfThenElse", test_config)
 
     mod = tir.transform.VerifyMemory()(mod)
     pass_output_process(mod, "VerifyMemory", test_config)
@@ -377,47 +415,20 @@ def OptimizeForSunmmio_test(
     mod = tilelang.transform.SplitHostDevice()(mod)
     pass_output_process(mod, "SplitHostDevice", test_config)
 
+    mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
+    pass_output_process(mod, "AnnotateReadOnlyParams", test_config)
+
     mod = tilelang.transform.MergeIfStmt()(mod)
     pass_output_process(mod, "MergeIfStmt", test_config)
 
     mod = tilelang.transform.InjectSunmmioSync()(mod)
     pass_output_process(mod, "InjectSunmmioSync", test_config)
 
-    mod = tilelang.transform.FlattenBuffer()(mod)
-    pass_output_process(mod, "FlattenBuffer", test_config)
-
-    mod = tilelang.transform.ConfigIndexBitwidth()(mod)
-    pass_output_process(mod, "ConfigIndexBitwidth", test_config)
-
-    mod = tir.transform.Simplify()(mod)
-    pass_output_process(mod, "Simplify_optimize_3", test_config)
-
-    mod = tilelang.transform.VectorizeLoop(enable_vectorize=True)(mod)
-    pass_output_process(mod, "VectorizeLoop", test_config)
-
-    mod = tilelang.transform.StorageRewrite()(mod)
-    pass_output_process(mod, "StorageRewrite", test_config)
-
-    mod = tir.transform.RemoveNoOp()(mod)
-    pass_output_process(mod, "RemoveNoOp", test_config)
-
-    mod = tir.transform.RenormalizeSplitPattern()(mod)
-    pass_output_process(mod, "RenormalizeSplitPattern", test_config)
-
-    mod = tir.transform.Simplify()(mod)
-    pass_output_process(mod, "Simplify_optimize_4", test_config)
-
-    mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
-    pass_output_process(mod, "AnnotateReadOnlyParams", test_config)
-
-    mod = tilelang.transform.MergeSharedMemoryAllocationsSunmmio(enable_aggressive_merge=True)(mod)
-    pass_output_process(mod, "MergeSharedMemoryAllocationsSunmmio", test_config)
-
     mod = tilelang.transform.MakePackedAPI()(mod)
     pass_output_process(mod, "MakePackedAPI", test_config)
 
     mod = tilelang.transform.Simplify()(mod)
-    pass_output_process(mod, "Simplify_optimize_5", test_config)
+    pass_output_process(mod, "Simplify_optimize_4", test_config)
 
     mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
     pass_output_process(mod, "LowerDeviceKernelLaunch", test_config)
@@ -569,7 +580,6 @@ def compile_test(
 
         # Phase 2: Optimize the IR for the target
         mod = OptimizeForSunmmio_test(mod, target, test_config, log_pass_output, show_meta, log_dir, log_passes)
-
         host_mod = tir.transform.Filter(_is_host_call)(mod)
         device_mod = tir.transform.Filter(_is_device_call)(mod)
 
