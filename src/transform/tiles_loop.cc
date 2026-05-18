@@ -517,18 +517,28 @@ private:
     return loop;
   }
 
-  template <typename BuildBody>
+  // Build the full and tail bodies through separate callbacks instead of
+  // reusing one body builder with the same interior Vars. The two branches of
+  // an IfThenElse are separate binding scopes, but later ConvertSSA passes only
+  // rewrite some predicated BufferLoad/BufferStore fields conservatively. If
+  // both branches share the same ki/kj Var objects, ConvertSSA may rename the
+  // tail loop binders while leaving the tail predicates attached to the old
+  // Vars, producing unbound ki_1/kj_1 references in vload/vstore predicates.
+  // Giving full and tail branches distinct Var objects keeps each predicate
+  // tied to the loop that actually binds it.
+  template <typename BuildFullBody, typename BuildTailBody>
   static Stmt BuildFullOrTailTileBody(const TilePredicateInfo &predicate_info,
-                                      BuildBody build_body) {
+                                      BuildFullBody build_full_body,
+                                      BuildTailBody build_tail_body) {
     if (!predicate_info.access_predicate.defined()) {
-      return build_body(std::nullopt);
+      return build_full_body();
     }
-    Stmt tail_body = build_body(predicate_info.access_predicate);
+    Stmt tail_body = build_tail_body(predicate_info.access_predicate);
     if (!predicate_info.full_tile_predicate.defined()) {
       return tail_body;
     }
     return IfThenElse(predicate_info.full_tile_predicate.value(),
-                      build_body(std::nullopt), tail_body);
+                      build_full_body(), tail_body);
   }
 
   static Stmt Build1DInteriorBody(Var ki, const Array<PrimExpr> &tile_size,
@@ -604,13 +614,14 @@ private:
     }
 
     Var ti = exec_loop->loop_var;
-    Var ki("ki");
+    Var full_ki("ki");
+    Var tail_ki("ki");
     Array<PrimExpr> domain = GetTileDomain(scope_root.get()).value();
     Array<PrimExpr> execution_domain_axes =
         GetExecutionDomainAxes(scope_root.get()).value();
     TilePredicateInfo predicate_info = MakeTilePredicateInfo(
-        {ti}, {ki}, {exec_loop}, tile_size, domain, execution_domain_axes);
-    auto build_body = [&](Optional<PrimExpr> tile_predicate) {
+        {ti}, {tail_ki}, {exec_loop}, tile_size, domain, execution_domain_axes);
+    auto build_body = [&](Var ki, Optional<PrimExpr> tile_predicate) {
       TileAccessRewriter access_rewriter({ti}, {ki}, tile_size,
                                          std::move(tile_predicate));
       return Build1DInteriorBody(ki, tile_size,
@@ -619,7 +630,11 @@ private:
 
     For new_exec = ffi::GetRef<For>(exec_loop);
     auto *n = new_exec.CopyOnWrite();
-    n->body = BuildFullOrTailTileBody(predicate_info, build_body);
+    n->body = BuildFullOrTailTileBody(
+        predicate_info, [&]() { return build_body(full_ki, std::nullopt); },
+        [&](Optional<PrimExpr> tile_predicate) {
+          return build_body(tail_ki, std::move(tile_predicate));
+        });
     n->annotations.Set(attr::tile_scope_entry, Integer(1));
 
     if (exec_loop == scope_root.get()) {
@@ -666,15 +681,17 @@ private:
     Var ti = axis0_loop->loop_var;
     Var tj = axis1_loop->loop_var;
 
-    Var ki("ki");
-    Var kj("kj");
+    Var full_ki("ki");
+    Var full_kj("kj");
+    Var tail_ki("ki");
+    Var tail_kj("kj");
     Array<PrimExpr> domain = GetTileDomain(scope_root.get()).value();
     Array<PrimExpr> execution_domain_axes =
         GetExecutionDomainAxes(scope_root.get()).value();
-    TilePredicateInfo predicate_info =
-        MakeTilePredicateInfo({ti, tj}, {ki, kj}, {axis0_loop, axis1_loop},
-                              tile_size, domain, execution_domain_axes);
-    auto build_body = [&](Optional<PrimExpr> tile_predicate) {
+    TilePredicateInfo predicate_info = MakeTilePredicateInfo(
+        {ti, tj}, {tail_ki, tail_kj}, {axis0_loop, axis1_loop}, tile_size,
+        domain, execution_domain_axes);
+    auto build_body = [&](Var ki, Var kj, Optional<PrimExpr> tile_predicate) {
       TileAccessRewriter access_rewriter({ti, tj}, {ki, kj}, tile_size,
                                          std::move(tile_predicate));
       return Build2DInteriorBody(ki, kj, tile_size,
@@ -683,8 +700,12 @@ private:
 
     // Replace the innermost execution loop body with the tiled loops.
     For new_inner_exec = ffi::GetRef<For>(innermost_exec);
-    new_inner_exec.CopyOnWrite()->body =
-        BuildFullOrTailTileBody(predicate_info, build_body);
+    new_inner_exec.CopyOnWrite()->body = BuildFullOrTailTileBody(
+        predicate_info,
+        [&]() { return build_body(full_ki, full_kj, std::nullopt); },
+        [&](Optional<PrimExpr> tile_predicate) {
+          return build_body(tail_ki, tail_kj, std::move(tile_predicate));
+        });
 
     Stmt replaced_exec_body = LoopReplacer(innermost_exec, new_inner_exec)(
         ffi::GetRef<For>(outermost_exec)->body);
