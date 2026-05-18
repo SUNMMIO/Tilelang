@@ -336,9 +336,7 @@ def all_gather(
         expected_recv_shape = [recv_num] + list(send_buffer.shape)
     else:
         ndim = len(send_buffer.shape)
-        assert isinstance(axis, int) and -ndim <= axis < ndim, (
-            f"axis {axis} out of range for send buffer with {ndim} dimensions."
-        )
+        assert isinstance(axis, int) and -ndim <= axis < ndim, f"axis {axis} out of range for send buffer with {ndim} dimensions."
         normalized_axis = axis if axis >= 0 else axis + ndim
         assert normalized_axis == 0 or normalized_axis == ndim - 1, (
             f"Only axis=0 or axis=-1 (last dim) are currently supported, got axis={axis} "

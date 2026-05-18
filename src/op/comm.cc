@@ -585,8 +585,7 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
   }
   int slice_axis = (axis > 0) ? (recv_rank - 1) : 0;
   ICHECK(analyzer->CanProve(FloorMod(recv_range[slice_axis]->extent,
-                                     IntImm(DataType::Int(32), recv_num)) ==
-                            0))
+                                     IntImm(DataType::Int(32), recv_num)) == 0))
       << "Recv extent along slice axis " << slice_axis << " ("
       << recv_range[slice_axis]->extent << ") must be divisible by recv_num ("
       << recv_num << ").";
