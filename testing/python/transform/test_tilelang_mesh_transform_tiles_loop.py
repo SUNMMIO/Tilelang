@@ -3,13 +3,61 @@ from tilelang import tvm as tvm
 import tilelang as tl
 import tilelang.language as T
 from tilelang.tileview import make_tileview
-from tilelang.layout import make_blockwise_zz_layout
+from tilelang.layout import make_zz_layout
 from tvm import tir
 from tvm import IRModule
 
 
 def apply_tiles_lowering(mod):
     return tl.transform.LowerTilesLoop()(mod)
+
+
+def collect_access_predicates(func, buffer_name):
+    predicates = []
+
+    def visitor(stmt, predicates=predicates):
+        if isinstance(stmt, tir.BufferLoad) and stmt.buffer.name == buffer_name and stmt.predicate is not None:
+            predicates.append(stmt.predicate)
+        if isinstance(stmt, tir.BufferStore) and stmt.buffer.name == buffer_name and stmt.predicate is not None:
+            predicates.append(stmt.predicate)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visitor)
+    return predicates
+
+
+def collect_unpredicated_accesses(func, buffer_name):
+    accesses = []
+
+    def visitor(stmt, accesses=accesses):
+        if isinstance(stmt, tir.BufferLoad) and stmt.buffer.name == buffer_name and stmt.predicate is None:
+            accesses.append(stmt)
+        if isinstance(stmt, tir.BufferStore) and stmt.buffer.name == buffer_name and stmt.predicate is None:
+            accesses.append(stmt)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visitor)
+    return accesses
+
+
+def collect_if_conditions(func):
+    conditions = []
+
+    def visitor(stmt, conditions=conditions):
+        if isinstance(stmt, tir.IfThenElse):
+            conditions.append(stmt.condition)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visitor)
+    return conditions
+
+
+def collect_tile_execution_loops(func):
+    loops = {}
+
+    def visitor(stmt, loops=loops):
+        if isinstance(stmt, tir.For) and stmt.annotations and "tile.execution_axis" in stmt.annotations:
+            loops[int(stmt.annotations["tile.execution_axis"])] = stmt
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visitor)
+    return loops
 
 
 # =========================================================
@@ -268,6 +316,33 @@ def dot_mul_tiled_parallel_1d(M, block_M, tile_size, index_map, dtype="float16")
     return main
 
 
+def predicated_tiled_parallel_1d(M=16, block_M=16, tile_size=(4,), index_map=(-1,), dtype="float16"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((M,), dtype),
+        B: T.Tensor((M,), dtype),
+    ):
+        with T.Kernel(T.ceildiv(M, block_M), threads=128) as (bx,):
+            A_shared = T.alloc_shared((block_M,), dtype)
+            B_shared = T.alloc_shared((block_M,), dtype)
+
+            T.annotate_tileview(
+                {
+                    A_shared: make_tileview(A_shared, tile_size, index_map),
+                    B_shared: make_tileview(B_shared, tile_size, index_map),
+                }
+            )
+
+            T.copy(A[bx * block_M], A_shared)
+
+            for i in T.Tiles([block_M], parallel=True):
+                B_shared.vstore([i], A_shared.vload([i], predicate=i < block_M // 2), predicate=i < block_M // 2)
+
+            T.copy(B_shared, B[bx * block_M])
+
+    return main
+
+
 def copy_region_tiled_parallel_2d(tile_size=(8, 32), index_map=(-2, -1), dtype="float16"):
     @T.prim_func
     def main(
@@ -280,8 +355,8 @@ def copy_region_tiled_parallel_2d(tile_size=(8, 32), index_map=(-2, -1), dtype="
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    B_shared: make_blockwise_zz_layout(B_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    B_shared: make_zz_layout(B_shared),
                 }
             )
 
@@ -337,8 +412,8 @@ def copy_region_tiled_parallel_2d_misaligned(tile_size=(8, 32), index_map=(-2, -
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    B_shared: make_blockwise_zz_layout(B_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    B_shared: make_zz_layout(B_shared),
                 }
             )
 
@@ -489,6 +564,126 @@ def test_tiles_loop_1d():
     assert any(contains_mul(e, tile_size[0]) for e in index_exprs), "Expected i * tile_size in rewritten indices"
 
 
+def test_tiles_loop_omits_tile_predicates_for_divisible_1d():
+    mod = IRModule.from_expr(
+        dot_mul_tiled_parallel_1d(
+            M=1024,
+            block_M=256,
+            tile_size=(32,),
+            index_map=(-1,),
+        ).with_attr("global_symbol", "main")
+    )
+
+    mod = apply_tiles_lowering(mod)
+
+    predicates = (
+        collect_access_predicates(mod["main"], "A_shared")
+        + collect_access_predicates(mod["main"], "B_shared")
+        + collect_access_predicates(mod["main"], "C_shared")
+    )
+
+    assert not predicates, "Expected divisible 1D tiles to use unpredicated accesses"
+    assert collect_unpredicated_accesses(mod["main"], "C_shared")
+    assert not collect_if_conditions(mod["main"]), "Expected no full/tail branch for divisible 1D tiles"
+
+
+def test_legalize_tiles_loop_uses_ceildiv_for_1d_tail_domain():
+    mod = IRModule.from_expr(
+        dot_mul_tiled_parallel_1d(
+            M=250,
+            block_M=250,
+            tile_size=(32,),
+            index_map=(-1,),
+        ).with_attr("global_symbol", "main")
+    )
+
+    mod = apply_tiles_lowering(mod)
+
+    exec_loops = collect_tile_execution_loops(mod["main"])
+    assert int(exec_loops[0].extent) == 8
+
+    predicates = collect_access_predicates(mod["main"], "C_shared")
+    assert predicates, "Expected tail tile predicates on non-divisible 1D domain"
+    assert all(("< 250" in str(predicate) or "<250" in str(predicate)) for predicate in predicates)
+    assert collect_unpredicated_accesses(mod["main"], "C_shared"), "Expected full-tile branch to use unpredicated stores"
+    if_conditions = collect_if_conditions(mod["main"])
+    assert if_conditions, "Expected scalar full/tail branch for partially divisible 1D tiles"
+    assert any("i <= 6" in str(condition) or "i<=6" in str(condition) for condition in if_conditions)
+
+
+def test_tiles_loop_rewrites_predicated_buffer_accesses():
+    mod = IRModule.from_expr(predicated_tiled_parallel_1d().with_attr("global_symbol", "main"))
+
+    mod = apply_tiles_lowering(mod)
+
+    load_predicates = []
+    store_predicates = []
+
+    def collect_predicates(stmt, load_predicates=load_predicates, store_predicates=store_predicates):
+        if isinstance(stmt, tir.BufferLoad) and stmt.buffer.name == "A_shared" and stmt.predicate is not None:
+            load_predicates.append(stmt.predicate)
+        if isinstance(stmt, tir.BufferStore) and stmt.buffer.name == "B_shared" and stmt.predicate is not None:
+            store_predicates.append(stmt.predicate)
+
+    tvm.tir.stmt_functor.post_order_visit(mod["main"].body, collect_predicates)
+
+    assert load_predicates, "Expected predicated loads after LowerTilesLoop"
+    assert store_predicates, "Expected predicated stores after LowerTilesLoop"
+    rewritten_predicates = load_predicates + store_predicates
+    assert all(("ki" in str(predicate)) and ("* 4" in str(predicate) or "*4" in str(predicate)) for predicate in rewritten_predicates)
+    assert all(("< 8" in str(predicate) or "<8" in str(predicate)) for predicate in rewritten_predicates)
+    assert all(("< 16" not in str(predicate) and "<16" not in str(predicate)) for predicate in rewritten_predicates)
+
+
+def test_tiles_loop_omits_tile_predicates_for_divisible_2d():
+    mod = IRModule.from_expr(
+        dot_mul_tiled_parallel_2d(
+            M=512,
+            N=1024,
+            block_M=256,
+            block_N=128,
+            tile_size=(2, 128),
+            index_map=(-2, -1),
+        ).with_attr("global_symbol", "main")
+    )
+
+    mod = apply_tiles_lowering(mod)
+
+    predicates = collect_access_predicates(mod["main"], "C_shared")
+
+    assert not predicates, "Expected divisible 2D tiles to use unpredicated accesses"
+    assert collect_unpredicated_accesses(mod["main"], "C_shared")
+    assert not collect_if_conditions(mod["main"]), "Expected no full/tail branch for divisible 2D tiles"
+
+
+def test_legalize_tiles_loop_uses_ceildiv_for_2d_tail_domain():
+    mod = IRModule.from_expr(
+        dot_mul_tiled_parallel_2d(
+            M=255,
+            N=128,
+            block_M=255,
+            block_N=128,
+            tile_size=(2, 128),
+            index_map=(-2, -1),
+        ).with_attr("global_symbol", "main")
+    )
+
+    mod = apply_tiles_lowering(mod)
+
+    exec_loops = collect_tile_execution_loops(mod["main"])
+    assert int(exec_loops[0].extent) == 128
+    assert int(exec_loops[1].extent) == 1
+
+    predicates = collect_access_predicates(mod["main"], "C_shared")
+    assert predicates, "Expected tail tile predicates on non-divisible 2D domain"
+    assert all(("< 255" in str(predicate) or "<255" in str(predicate)) for predicate in predicates)
+    assert all(("< 128" not in str(predicate) and "<128" not in str(predicate)) for predicate in predicates)
+    assert collect_unpredicated_accesses(mod["main"], "C_shared"), "Expected full-tile branch to use unpredicated stores"
+    if_conditions = collect_if_conditions(mod["main"])
+    assert if_conditions, "Expected scalar full/tail branch for partially divisible 2D tiles"
+    assert any("i <= 126" in str(condition) or "i<=126" in str(condition) for condition in if_conditions)
+
+
 def test_tiles_loop_region_offset_rewrite():
     """Explicit tile domains should allow offset regions without a primary buffer."""
     mod = IRModule.from_expr(copy_region_tiled_parallel_2d().with_attr("global_symbol", "main"))
@@ -517,10 +712,13 @@ def test_tiles_loop_swapped_domain_binding_rewrite():
     mod = apply_tiles_lowering(mod)
 
     c_store_indices = []
+    c_store_predicates = []
 
-    def collect_c_indices(stmt, c_store_indices=c_store_indices):
+    def collect_c_indices(stmt, c_store_indices=c_store_indices, c_store_predicates=c_store_predicates):
         if isinstance(stmt, tir.BufferStore) and stmt.buffer.name == "C_shared":
             c_store_indices.append(stmt.indices)
+            if stmt.predicate is not None:
+                c_store_predicates.append(stmt.predicate)
 
     tvm.tir.stmt_functor.post_order_visit(mod["main"].body, collect_c_indices)
 
@@ -529,6 +727,7 @@ def test_tiles_loop_swapped_domain_binding_rewrite():
         ("i * 2" in str(indices[0]) or "i*2" in str(indices[0])) and ("j * 128" in str(indices[1]) or "j*128" in str(indices[1]))
         for indices in c_store_indices
     ), "Expected the rewritten indices to follow the inferred i/j axis binding rather than lexical loop order"
+    assert not c_store_predicates, "Expected divisible swapped-domain tiles to use unpredicated stores"
 
 
 # =========================================================

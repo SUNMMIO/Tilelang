@@ -10,7 +10,7 @@ import tilelang
 import tilelang as tl
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.layout import make_blockwise_zz_layout
+from tilelang.layout import make_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tvm import tir
 from tvm import IRModule
@@ -24,9 +24,9 @@ def apply_sunmmio_passes(mod, target):
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
-    mod = tilelang.transform.LegalizeSunmmioCopyPath()(mod)
+    mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
     mod = tilelang.transform.LayoutReducer()(mod)
-    mod = tilelang.transform.LayoutInference()(mod)
+    mod = tilelang.transform.SunmmioLayoutInference()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     mod = tl.transform.LowerTilesLoop()(mod)
     return mod
@@ -72,6 +72,51 @@ def assert_scope_plan(mod, expected_tile_size, expected_execution_domain_axes):
     assert execution_axes == list(range(len(expected_tile_size)))
     assert _to_int_list(scope_root["tile.tile_size"]) == list(expected_tile_size)
     assert _to_int_list(scope_root["tile.execution_domain_axes"]) == list(expected_execution_domain_axes)
+
+
+def collect_loads(func, buffer_name):
+    loads = []
+
+    def visit(stmt, loads=loads):
+        if isinstance(stmt, tir.BufferLoad) and stmt.buffer.name == buffer_name:
+            loads.append(stmt)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return loads
+
+
+def collect_stores(func, buffer_name):
+    stores = []
+
+    def visit(stmt, stores=stores):
+        if isinstance(stmt, tir.BufferStore) and stmt.buffer.name == buffer_name:
+            stores.append(stmt)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return stores
+
+
+def collect_if_conditions(func):
+    conditions = []
+
+    def visit(stmt, conditions=conditions):
+        if isinstance(stmt, tir.IfThenElse):
+            conditions.append(stmt.condition)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return conditions
+
+
+def assert_preserved_mixed_rank_load(mod, expected_tile_size):
+    script = mod["main"].script()
+    assert "T.sunmmio_unaligned_tile_load" not in script
+
+    loads = collect_loads(mod["main"], "B_shared")
+    assert loads, "Expected mixed-rank side access to remain a BufferLoad"
+    assert all(load.predicate is None for load in loads)
+
+    tile_height = expected_tile_size[0]
+    assert any(f"* {tile_height}" in str(load.indices[0]) or f"*{tile_height}" in str(load.indices[0]) for load in loads)
 
 
 # ---------------------------------------------------------
@@ -123,9 +168,9 @@ def test_infer_tileview_2d_with_layout_annotation():
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    B_shared: make_blockwise_zz_layout(B_shared),
-                    C_shared: make_blockwise_zz_layout(C_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    B_shared: make_zz_layout(B_shared),
+                    C_shared: make_zz_layout(C_shared),
                 }
             )
 
@@ -233,24 +278,38 @@ def test_infer_rank1_tileview_from_2d_buffer_access_with_outer_loop_var():
 # ---------------------------------------------------------
 # Test 3: Mixed-rank (1D + 2D) in same T.Tiles
 # ---------------------------------------------------------
-def test_infer_tileview_mixed_rank():
-    """Layout inference should let mixed-rank accesses use the densest common blockwise plan."""
+@pytest.mark.parametrize(
+    ("dtype", "expected_tile_size"),
+    [
+        ("float32", [4, 32]),
+        ("float16", [8, 32]),
+        ("bfloat16", [8, 32]),
+    ],
+)
+def test_infer_tileview_mixed_rank_load(dtype, expected_tile_size):
+    """Mixed-rank rank-1 loads stay as logical BufferLoad in LowerTilesLoop.
+
+    B_shared is 1D and tiled along the height axis. Strict TileView search
+    rejects tile width 1 because 64-byte RSRAM alignment requires multiple
+    elements, then the fallback search allows the side load. The eventual
+    hardware unaligned load repair is deferred to Sunmmio codegen so mid-level
+    analysis can still see a normal BufferLoad.
+    """
     M, N = 128, 64
 
     @T.prim_func
     def main(
-        A: T.Tensor((M, N), "float32"),
-        B: T.Tensor((M,), "float32"),
-        C: T.Tensor((M, N), "float32"),
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M,), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(1, threads=128) as (bx,):
-            A_shared = T.alloc_shared((M, N), "float32")
-            B_shared = T.alloc_shared((M,), "float32")
-            C_shared = T.alloc_shared((M, N), "float32")
+            A_shared = T.alloc_shared((M, N), dtype)
+            B_shared = T.alloc_shared((M,), dtype)
+            C_shared = T.alloc_shared((M, N), dtype)
 
             T.copy(A[0:M, 0:N], A_shared)
 
-            # B_shared is 1D but used inside a 2D tile loop
             for i, j in T.Tiles([M, N], parallel=True):
                 C_shared[i, j] = A_shared[i, j] + B_shared[i]
 
@@ -260,7 +319,86 @@ def test_infer_tileview_mixed_rank():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[4, 32], expected_execution_domain_axes=[0, 1])
+
+    assert_scope_plan(mod, expected_tile_size=expected_tile_size, expected_execution_domain_axes=[0, 1])
+    assert_preserved_mixed_rank_load(mod, expected_tile_size)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_tile_size"),
+    [
+        ("float32", [4, 32]),
+        ("float16", [8, 32]),
+        ("bfloat16", [8, 32]),
+    ],
+)
+def test_infer_tileview_mixed_rank_load_inside_exp2(dtype, expected_tile_size):
+    """Preserved mixed-rank rank-1 BufferLoad can feed another TIR PrimExpr op."""
+    M, N = 128, 64
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M,), dtype),
+        C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((M, N), dtype)
+            B_shared = T.alloc_shared((M,), dtype)
+            C_shared = T.alloc_shared((M, N), dtype)
+
+            T.copy(A[0:M, 0:N], A_shared)
+
+            for i, j in T.Tiles([M, N], parallel=True):
+                C_shared[i, j] = A_shared[i, j] + T.exp2(B_shared[i])
+
+            T.copy(C_shared, C[0:M, 0:N])
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    assert_scope_plan(mod, expected_tile_size=expected_tile_size, expected_execution_domain_axes=[0, 1])
+    script = mod["main"].script()
+    assert "T.exp2" in script
+    assert_preserved_mixed_rank_load(mod, expected_tile_size)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+def test_infer_tileview_mixed_rank_store_still_rejected(dtype):
+    """The alignment-relaxed fallback is load-only, not store repair."""
+    M, N = 128, 64
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M,), dtype),
+        C: T.Tensor((M, N), dtype),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((M, N), dtype)
+            B_shared = T.alloc_shared((M,), dtype)
+            C_shared = T.alloc_shared((M, N), dtype)
+
+            T.copy(A[0:M, 0:N], A_shared)
+
+            for i, j in T.Tiles([M, N], parallel=True):
+                B_shared[i] = A_shared[i, j]
+                C_shared[i, j] = A_shared[i, j]
+
+            T.copy(C_shared, C[0:M, 0:N])
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with (
+        tvm.target.Target(target),
+        pytest.raises(
+            tvm.error.InternalError,
+            match="per-access feasible tileview sets do not intersect",
+        ),
+    ):
+        apply_sunmmio_passes(mod, target)
 
 
 def test_infer_tileview_swapped_domain_binding():
@@ -318,8 +456,8 @@ def test_manual_annotation_overrides_inference():
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    C_shared: make_blockwise_zz_layout(C_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    C_shared: make_zz_layout(C_shared),
                 }
             )
 
@@ -442,9 +580,9 @@ def test_infer_tileview_2d_blockwise_fp32():
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    B_shared: make_blockwise_zz_layout(B_shared),
-                    C_shared: make_blockwise_zz_layout(C_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    B_shared: make_zz_layout(B_shared),
+                    C_shared: make_zz_layout(C_shared),
                 }
             )
 
@@ -464,7 +602,7 @@ def test_infer_tileview_2d_blockwise_fp32():
 
 
 def test_infer_tileview_blockwise_small_height():
-    """Blockwise candidates should clamp height by the explicit tile domain."""
+    """Blockwise candidates may exceed a small domain and rely on masks."""
     domain_M, buffer_M, N = 4, 32, 128
 
     @T.prim_func
@@ -480,9 +618,9 @@ def test_infer_tileview_blockwise_small_height():
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    B_shared: make_blockwise_zz_layout(B_shared),
-                    C_shared: make_blockwise_zz_layout(C_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    B_shared: make_zz_layout(B_shared),
+                    C_shared: make_zz_layout(C_shared),
                 }
             )
 
@@ -498,7 +636,15 @@ def test_infer_tileview_blockwise_small_height():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[4, 32], expected_execution_domain_axes=[0, 1])
+    assert_scope_plan(mod, expected_tile_size=[8, 32], expected_execution_domain_axes=[0, 1])
+
+    stores = collect_stores(mod["main"], "C_shared")
+    assert stores, "Expected lowered C_shared stores"
+    assert all(store.predicate is not None for store in stores)
+    assert any("* 8" in str(store.indices[0]) or "*8" in str(store.indices[0]) for store in stores)
+    assert all("< 4" in str(store.predicate) or "<4" in str(store.predicate) for store in stores)
+    assert all("< 128" not in str(store.predicate) and "<128" not in str(store.predicate) for store in stores)
+    assert not collect_if_conditions(mod["main"]), "Expected no full/tail branch when every tile is partial"
 
 
 def test_infer_tileview_rowmajor_wide_row_uses_single_row_tile():
@@ -596,8 +742,8 @@ def test_infer_tileview_blockwise_region_height_and_width_offset():
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    C_shared: make_blockwise_zz_layout(C_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    C_shared: make_zz_layout(C_shared),
                 }
             )
 
@@ -616,7 +762,11 @@ def test_infer_tileview_blockwise_region_height_and_width_offset():
 
 
 def test_infer_tileview_blockwise_region_misaligned_width_offset_rejected():
-    """Misaligned blockwise width offsets should reject tileview planning."""
+    """Misaligned blockwise width offsets should reject tileview planning.
+
+    With fp16 and 64-byte RSRAM alignment, the minimum tile width is 32
+    elements.  Offset 16 is not aligned to 32, so no feasible tile exists.
+    """
     src_M, src_N = 64, 64
     dst_M, dst_N = 32, 32
 
@@ -631,8 +781,8 @@ def test_infer_tileview_blockwise_region_misaligned_width_offset_rejected():
 
             T.annotate_layout(
                 {
-                    A_shared: make_blockwise_zz_layout(A_shared),
-                    C_shared: make_blockwise_zz_layout(C_shared),
+                    A_shared: make_zz_layout(A_shared),
+                    C_shared: make_zz_layout(C_shared),
                 }
             )
 
@@ -645,5 +795,11 @@ def test_infer_tileview_blockwise_region_misaligned_width_offset_rejected():
 
     mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    with tvm.target.Target(target), pytest.raises(Exception, match="Cannot infer any feasible TileView candidate"):
+    with (
+        tvm.target.Target(target),
+        pytest.raises(
+            tvm.error.InternalError,
+            match="Cannot infer any feasible TileView candidate",
+        ),
+    ):
         apply_sunmmio_passes(mod, target)

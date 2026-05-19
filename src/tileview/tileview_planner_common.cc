@@ -6,6 +6,7 @@
 #include "tileview_planner_common.h"
 
 #include <algorithm>
+#include <unordered_set>
 
 #include <tvm/runtime/logging.h>
 #include <tvm/tir/op.h>
@@ -33,34 +34,22 @@ MakeTrailingTilePatternImpl(const Array<PrimExpr> &buffer_shape,
 }
 
 void AppendRank1Pattern(std::vector<TrailingTilePattern> *patterns,
-                        const Buffer &buffer, int tile_width,
-                        arith::Analyzer *analyzer) {
+                        const Buffer &buffer, int tile_width) {
   int buffer_rank = static_cast<int>(buffer->shape.size());
   if (buffer_rank < 1) {
     return;
   }
 
-  int width_dim = buffer_rank - 1;
-  if (!CanProveDivisible(analyzer, buffer->shape[width_dim], tile_width)) {
-    return;
-  }
   patterns->push_back(MakeTrailingTilePatternImpl(buffer->shape, {tile_width}));
 }
 
 void AppendRank2Pattern(std::vector<TrailingTilePattern> *patterns,
-                        const Buffer &buffer, int tile_height, int tile_width,
-                        arith::Analyzer *analyzer) {
+                        const Buffer &buffer, int tile_height, int tile_width) {
   int buffer_rank = static_cast<int>(buffer->shape.size());
   if (buffer_rank < 2) {
     return;
   }
 
-  int height_dim = buffer_rank - 2;
-  int width_dim = buffer_rank - 1;
-  if (!CanProveDivisible(analyzer, buffer->shape[width_dim], tile_width) ||
-      !CanProveDivisible(analyzer, buffer->shape[height_dim], tile_height)) {
-    return;
-  }
   patterns->push_back(
       MakeTrailingTilePatternImpl(buffer->shape, {tile_height, tile_width}));
 }
@@ -74,10 +63,30 @@ int64_t GetStaticIntValue(const PrimExpr &expr, int64_t fallback) {
   return fallback;
 }
 
-LayoutClass GetLayoutClass(const Buffer &buffer,
-                           const Map<Buffer, Layout> &layout_map) {
-  return layout_map.count(buffer) ? LayoutClass::kBlockwise32x32
-                                  : LayoutClass::kRowMajor;
+std::vector<ContiguousStep>
+GetBufferContiguousSteps(const Buffer &buffer,
+                         const Map<Buffer, Layout> &layout_map) {
+  if (layout_map.count(buffer)) {
+    auto steps = ComputeContiguousTileSteps(layout_map[buffer]);
+    if (!steps.empty())
+      return steps;
+  }
+  // Row-major fallback: trailing dim is contiguous, then second-to-last.
+  int buffer_rank = static_cast<int>(buffer->shape.size());
+  std::vector<ContiguousStep> steps;
+  if (buffer_rank >= 1) {
+    int64_t w = GetStaticIntValue(buffer->shape[buffer_rank - 1]);
+    if (w > 0) {
+      steps.push_back({buffer_rank - 1, static_cast<int>(w)});
+      if (buffer_rank >= 2) {
+        int64_t h = GetStaticIntValue(buffer->shape[buffer_rank - 2]);
+        if (h > 0) {
+          steps.push_back({buffer_rank - 2, static_cast<int>(h)});
+        }
+      }
+    }
+  }
+  return steps;
 }
 
 int GetElementBits(const Buffer &buffer) {
@@ -190,7 +199,8 @@ TileView MakeTrailingTileView(const Array<PrimExpr> &buffer_shape,
 
 std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
     const Buffer &buffer, int exec_rank, const Map<Buffer, Layout> &layout_map,
-    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer) {
+    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
+    AlignmentMode alignment_mode) {
   ICHECK(exec_rank == 1 || exec_rank == 2)
       << "TileView planning expects execution rank 1 or 2, but got "
       << exec_rank << ".";
@@ -202,59 +212,139 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
   }
 
   int capacity_elems = GetCapacityElems(buffer, config);
-  LayoutClass layout_class = GetLayoutClass(buffer, layout_map);
+  auto steps = GetBufferContiguousSteps(buffer, layout_map);
 
-  if (layout_class == LayoutClass::kBlockwise32x32) {
-    AppendRank1Pattern(&patterns, buffer, config.block_width, analyzer);
-  } else {
-    for (int tile_width = 1; tile_width <= capacity_elems; ++tile_width) {
-      AppendRank1Pattern(&patterns, buffer, tile_width, analyzer);
+  // Identify the trailing buffer dimensions (width = last, height =
+  // second-to-last).
+  int width_dim = buffer_rank - 1;
+  int height_dim = buffer_rank - 2;
+
+  // RSRAM access alignment: tile row width (in bytes) must be a multiple of
+  // rsram_align_bytes. Compute the minimum tile width in elements.
+  // Use bit-level arithmetic so sub-byte dtypes (fp4, int4) are handled.
+  int min_width_elems = 1;
+  if (alignment_mode == AlignmentMode::kStrict &&
+      config.rsram_align_bytes > 0 && buffer.scope() == kSunmmioScopeRSRAM) {
+    min_width_elems =
+        GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, buffer->dtype);
+  }
+
+  // Prefix-partial step walk.
+  //
+  // The contiguous step sequence defines a linear memory ordering.  A legal
+  // tile of shape (h, w) must correspond to a contiguous sub-sequence in that
+  // ordering.  At step k, the only new tiles are those formed by fully
+  // consuming steps [0..k-1] and *partially* consuming step k:
+  //
+  //   - If step k is a width step:  h = forced_h, w = forced_w * partial
+  //   - If step k is a height step: h = forced_h * partial, w = forced_w
+  //
+  // where `forced_w` / `forced_h` are the accumulated width/height extents
+  // from all fully consumed prior steps.  `partial` ranges from 1 to the
+  // step's extent (capped by register capacity).
+  //
+  // This model correctly handles:
+  //   - Row-major: single W step of full row width → all sub-widths valid
+  //   - ZZ block: W then H step → inner-block (h,w) combos, then outer steps
+  //   - ZN: H-first ordering → only narrow width tiles
+  //
+  // Dedup sets avoid emitting the same (h,w) at multiple step boundaries.
+
+  std::unordered_set<int> emitted_rank1;
+  std::unordered_set<int64_t> emitted_rank2;
+
+  int forced_w = 1;        // min width forced by fully consumed W steps
+  int forced_h = 1;        // min height forced by fully consumed H steps
+  bool rank1_done = false; // rank-1 only from leading W steps
+  bool had_width_step = false;
+
+  for (const auto &step : steps) {
+    if (step.dim == width_dim) {
+      had_width_step = true;
+      for (int partial = 1; partial <= step.extent; ++partial) {
+        int w = forced_w * partial;
+        int h = forced_h;
+        if (h * w > capacity_elems)
+          break;
+        if (w % min_width_elems != 0)
+          continue;
+
+        // Rank-1: only from leading width steps (before any non-width step).
+        if (!rank1_done && h == 1 && !emitted_rank1.count(w)) {
+          emitted_rank1.insert(w);
+          AppendRank1Pattern(&patterns, buffer, w);
+        }
+
+        // Rank-2.
+        if (exec_rank == 2 && buffer_rank >= 2) {
+          int64_t key = static_cast<int64_t>(h) * 1000000 + w;
+          if (!emitted_rank2.count(key)) {
+            emitted_rank2.insert(key);
+            AppendRank2Pattern(&patterns, buffer, h, w);
+          }
+        }
+      }
+      forced_w *= step.extent;
+    } else if (step.dim == height_dim) {
+      rank1_done = true;
+      for (int partial = 1; partial <= step.extent; ++partial) {
+        int h = forced_h * partial;
+        int w = forced_w;
+        if (h * w > capacity_elems)
+          break;
+        if (w % min_width_elems != 0)
+          continue;
+
+        if (exec_rank == 2 && buffer_rank >= 2) {
+          int64_t key = static_cast<int64_t>(h) * 1000000 + w;
+          if (!emitted_rank2.count(key)) {
+            emitted_rank2.insert(key);
+            AppendRank2Pattern(&patterns, buffer, h, w);
+          }
+        }
+      }
+      forced_h *= step.extent;
+    } else {
+      // Non-trailing dim step — cannot tile into this dimension,
+      // so subsequent steps are unreachable for trailing tiles.
+      break;
     }
   }
 
-  if (exec_rank != 2 || buffer_rank < 2) {
-    return patterns;
-  }
-
-  int64_t row_width = GetStaticIntValue(buffer->shape[buffer_rank - 1]);
-  if (layout_class == LayoutClass::kBlockwise32x32) {
-    int max_height =
-        std::min(config.block_height, capacity_elems / config.block_width);
-    for (int tile_height = 1; tile_height <= max_height; ++tile_height) {
-      AppendRank2Pattern(&patterns, buffer, tile_height, config.block_width,
-                         analyzer);
+  // If no steps contributed to width (empty steps or no width-dim steps),
+  // fall back to brute-force enumeration up to capacity (preserves behavior
+  // for buffers with no CuteLayout and fully dynamic shapes).
+  if (!had_width_step) {
+    for (int w = 1; w <= capacity_elems; ++w) {
+      AppendRank1Pattern(&patterns, buffer, w);
     }
-    return patterns;
+    if (exec_rank == 2 && buffer_rank >= 2) {
+      int64_t row_width = GetStaticIntValue(buffer->shape[width_dim]);
+      if (row_width > 0) {
+        int max_w = std::min(capacity_elems, static_cast<int>(row_width));
+        for (int w = 1; w <= max_w; ++w) {
+          AppendRank2Pattern(&patterns, buffer, 1, w);
+        }
+        if (row_width <= capacity_elems) {
+          int max_h = capacity_elems / static_cast<int>(row_width);
+          for (int h = 2; h <= max_h; ++h) {
+            AppendRank2Pattern(&patterns, buffer, h,
+                               static_cast<int>(row_width));
+          }
+        }
+      }
+    }
   }
 
-  if (row_width <= 0) {
-    return patterns;
-  }
-
-  int max_single_row_width =
-      std::min(capacity_elems, static_cast<int>(row_width));
-  for (int tile_width = 1; tile_width <= max_single_row_width; ++tile_width) {
-    AppendRank2Pattern(&patterns, buffer, /*tile_height=*/1, tile_width,
-                       analyzer);
-  }
-
-  if (row_width > capacity_elems) {
-    return patterns;
-  }
-
-  int max_height = capacity_elems / static_cast<int>(row_width);
-  for (int tile_height = 2; tile_height <= max_height; ++tile_height) {
-    AppendRank2Pattern(&patterns, buffer, tile_height,
-                       static_cast<int>(row_width), analyzer);
-  }
   return patterns;
 }
 
-TrailingTilePattern ValidateManualTrailingTileView(
-    const Buffer &buffer, const TileView &manual_tv, int exec_rank,
-    const Map<Buffer, Layout> &layout_map,
-    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
-    const char *usage, bool enforce_blockwise_width_for_rank1) {
+TrailingTilePattern
+ValidateManualTrailingTileView(const Buffer &buffer, const TileView &manual_tv,
+                               int exec_rank,
+                               const Map<Buffer, Layout> &layout_map,
+                               const SunmmioTileProcessorConfig &config,
+                               arith::Analyzer *analyzer, const char *usage) {
   int tv_rank = static_cast<int>(manual_tv->TileDim());
   int buffer_rank = static_cast<int>(buffer->shape.size());
   ICHECK_EQ(static_cast<int>(manual_tv->BufferShape().size()), buffer_rank)
@@ -276,69 +366,115 @@ TrailingTilePattern ValidateManualTrailingTileView(
       << buffer->name << ".";
 
   int capacity_elems = GetCapacityElems(buffer, config);
-  LayoutClass layout_class = GetLayoutClass(buffer, layout_map);
   int width_dim = buffer_rank - 1;
   int width = GetStaticIntValue(manual_tv->TileShape()[tv_rank - 1]);
   ICHECK_GT(width, 0) << usage
                       << " must use a positive static tile width for buffer "
                       << buffer->name << ".";
-  ICHECK(CanProveDivisible(analyzer, buffer->shape[width_dim], width))
-      << usage << " width " << width << " must divide trailing buffer dim "
-      << buffer->shape[width_dim] << " for buffer " << buffer->name << ".";
-
-  if (layout_class == LayoutClass::kBlockwise32x32 &&
-      (tv_rank == 2 || enforce_blockwise_width_for_rank1)) {
-    ICHECK_EQ(width, config.block_width)
-        << usage << " must use trailing width " << config.block_width
-        << " for buffer " << buffer->name << ".";
-  } else {
-    ICHECK_LE(width, capacity_elems)
-        << usage << " width " << width
-        << " exceeds the Sunmmio register capacity of " << capacity_elems
-        << " elements for buffer " << buffer->name << ".";
+  // RSRAM access alignment check (works for sub-byte dtypes via bit
+  // arithmetic).
+  if (config.rsram_align_bytes > 0 && buffer.scope() == kSunmmioScopeRSRAM) {
+    int min_w =
+        GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, buffer->dtype);
+    ICHECK_EQ(width % min_w, 0)
+        << usage << " width " << width << " must be a multiple of " << min_w
+        << " elements (" << config.rsram_align_bytes
+        << "-byte RSRAM alignment) for buffer " << buffer->name << ".";
   }
 
+  ICHECK_LE(width, capacity_elems)
+      << usage << " width " << width
+      << " exceeds the Sunmmio register capacity of " << capacity_elems
+      << " elements for buffer " << buffer->name << ".";
+
+  // Prefix-step legality: the manual tile must be achievable by walking
+  // the contiguous step sequence.  At each step the only new tiles are
+  // formed by fully consuming prior steps and partially consuming the
+  // current one — the same model used by enumeration.
+  auto steps = GetBufferContiguousSteps(buffer, layout_map);
+  int height_dim = buffer_rank - 2;
+
   if (tv_rank == 1) {
+    // Rank-1: width must come from leading width steps only (before any
+    // non-width step).
+    if (!steps.empty()) {
+      bool valid = false;
+      int fw = 1;
+      for (const auto &step : steps) {
+        if (step.dim != width_dim)
+          break;
+        if (width >= fw && width <= fw * step.extent && width % fw == 0) {
+          valid = true;
+          break;
+        }
+        fw *= step.extent;
+      }
+      ICHECK(valid)
+          << usage << " width " << width
+          << " is not contiguous in the layout step structure for buffer "
+          << buffer->name << ".";
+    }
     return MakeTrailingTilePatternImpl(buffer->shape, {width});
   }
 
-  int height_dim = buffer_rank - 2;
+  // Rank-2 from here.
   int height = GetStaticIntValue(manual_tv->TileShape()[0]);
   ICHECK_GT(height, 0) << usage
                        << " must use a positive static tile height for buffer "
                        << buffer->name << ".";
-  ICHECK(CanProveDivisible(analyzer, buffer->shape[height_dim], height))
-      << usage << " height " << height << " must divide buffer dim "
-      << height_dim << " of buffer " << buffer->name << ".";
-
-  if (layout_class == LayoutClass::kBlockwise32x32) {
-    ICHECK_LE(height * width, capacity_elems)
-        << usage << " shape (" << height << ", " << width
-        << ") exceeds the Sunmmio register capacity of " << capacity_elems
-        << " elements for buffer " << buffer->name << ".";
-    ICHECK_LE(height, config.block_height)
-        << usage << " height " << height << " exceeds the modeled block "
-        << "height " << config.block_height << " for buffer " << buffer->name
-        << ".";
-    return MakeTrailingTilePatternImpl(buffer->shape, {height, width});
-  }
-
-  int64_t row_width = GetStaticIntValue(buffer->shape[width_dim]);
-  ICHECK_GT(row_width, 0) << usage
-                          << " requires a static trailing row width for buffer "
-                          << buffer->name << ".";
-  ICHECK_LE(width, row_width)
-      << usage << " width " << width << " exceeds trailing buffer dimension "
-      << row_width << " for buffer " << buffer->name << ".";
-  if (height > 1) {
-    ICHECK_EQ(width, row_width)
-        << usage << " multi-row width must match trailing buffer dimension "
-        << row_width << " for buffer " << buffer->name << ".";
-  }
   ICHECK_LE(height * width, capacity_elems)
       << usage << " shape (" << height << ", " << width
       << ") exceeds the Sunmmio register capacity of " << capacity_elems
       << " elements for buffer " << buffer->name << ".";
+
+  if (!steps.empty()) {
+    // Prefix-step legality for rank-2: walk steps, checking if the
+    // manual (height, width) matches some partial consumption.
+    bool valid = false;
+    int fw = 1, fh = 1;
+    for (const auto &step : steps) {
+      if (step.dim == width_dim) {
+        // At a width step: tile must have h == forced_h and
+        // w == forced_w * partial for some 1 <= partial <= extent.
+        if (height == fh && width >= fw && width <= fw * step.extent &&
+            width % fw == 0) {
+          valid = true;
+          break;
+        }
+        fw *= step.extent;
+      } else if (step.dim == height_dim) {
+        // At a height step: tile must have w == forced_w and
+        // h == forced_h * partial for some 1 <= partial <= extent.
+        if (width == fw && height >= fh && height <= fh * step.extent &&
+            height % fh == 0) {
+          valid = true;
+          break;
+        }
+        fh *= step.extent;
+      } else {
+        break;
+      }
+    }
+    ICHECK(valid)
+        << usage << " shape (" << height << ", " << width
+        << ") is not contiguous in the layout step structure for buffer "
+        << buffer->name << ".";
+  } else {
+    // Row-major fallback for buffers with no layout info (dynamic shapes).
+    int64_t row_width = GetStaticIntValue(buffer->shape[width_dim]);
+    ICHECK_GT(row_width, 0)
+        << usage << " requires a static trailing row width for buffer "
+        << buffer->name << ".";
+    ICHECK_LE(width, row_width)
+        << usage << " width " << width << " exceeds trailing buffer dimension "
+        << row_width << " for buffer " << buffer->name << ".";
+    if (height > 1) {
+      ICHECK_EQ(width, row_width)
+          << usage << " multi-row width must match trailing buffer dimension "
+          << row_width << " for buffer " << buffer->name << ".";
+    }
+  }
+
   return MakeTrailingTilePatternImpl(buffer->shape, {height, width});
 }
 

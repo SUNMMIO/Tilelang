@@ -2,8 +2,12 @@ import math
 import pytest
 
 import tilelang.language as T
-from tilelang.language.mesh_tensor import MeshTensorProxy as MeshTensorAnnot, MeshShardingPolicy, MeshReplicationType
-from tilelang.language.proxy import TensorProxy as TensorAnnot
+from tilelang.language.mesh_tensor import MeshTensorProxy, MeshShardingPolicy, MeshReplicationType
+from tilelang.layout import make_zz_layout, make_zn_layout
+from tvm import tir
+
+
+# ─── _get_sharded_shape tests (unchanged — pure shape math) ─────────────
 
 
 @pytest.mark.parametrize(
@@ -17,7 +21,7 @@ from tilelang.language.proxy import TensorProxy as TensorAnnot
 def test_get_sharded_shape_replicate_all(shape, nrows, ncols):
     policy = MeshShardingPolicy(replicate=MeshReplicationType.ALL)
     expected_shape = shape
-    assert MeshTensorAnnot._get_sharded_shape(shape, policy, nrows, ncols) == expected_shape
+    assert MeshTensorProxy._get_sharded_shape(shape, policy, nrows, ncols) == expected_shape
 
 
 @pytest.mark.parametrize(
@@ -37,7 +41,7 @@ def test_get_sharded_shape_cross_mesh_dim(shape, cross_mesh_dim, nrows, ncols):
     expected_shape_list[cross_mesh_dim] = math.ceil(shape[cross_mesh_dim] / total_cores)
     expected_shape = tuple(expected_shape_list)
 
-    assert MeshTensorAnnot._get_sharded_shape(shape, policy, nrows, ncols) == expected_shape
+    assert MeshTensorProxy._get_sharded_shape(shape, policy, nrows, ncols) == expected_shape
 
 
 @pytest.mark.parametrize(
@@ -49,7 +53,7 @@ def test_get_sharded_shape_cross_mesh_dim(shape, cross_mesh_dim, nrows, ncols):
 )
 def test_get_sharded_shape_cross_mesh_dim_invalid(shape, cross_mesh_dim, nrows, ncols):
     with pytest.raises(ValueError, match="Invalid cross_mesh_dim"):
-        MeshTensorAnnot._get_sharded_shape(shape, MeshShardingPolicy(cross_mesh_dim=cross_mesh_dim), nrows, ncols)
+        MeshTensorProxy._get_sharded_shape(shape, MeshShardingPolicy(cross_mesh_dim=cross_mesh_dim), nrows, ncols)
 
 
 @pytest.mark.parametrize(
@@ -67,7 +71,7 @@ def test_get_sharded_shape_replicate_row(shape, y_dim, nrows, ncols):
     expected_shape_list[y_dim] = math.ceil(shape[y_dim] / nrows)
     expected_shape = tuple(expected_shape_list)
 
-    assert MeshTensorAnnot._get_sharded_shape(shape, policy, nrows, ncols) == expected_shape
+    assert MeshTensorProxy._get_sharded_shape(shape, policy, nrows, ncols) == expected_shape
 
 
 @pytest.mark.parametrize(
@@ -85,7 +89,7 @@ def test_get_sharded_shape_replicate_row(shape, y_dim, nrows, ncols):
 )
 def test_get_sharded_shape_replicate_row_invalid(shape, policy, nrows, ncols, error_msg):
     with pytest.raises(ValueError, match=error_msg):
-        MeshTensorAnnot._get_sharded_shape(shape, policy, nrows, ncols)
+        MeshTensorProxy._get_sharded_shape(shape, policy, nrows, ncols)
 
 
 @pytest.mark.parametrize(
@@ -103,7 +107,7 @@ def test_get_sharded_shape_replicate_column(shape, x_dim, nrows, ncols):
     expected_shape_list[x_dim] = math.ceil(shape[x_dim] / ncols)
     expected_shape = tuple(expected_shape_list)
 
-    assert MeshTensorAnnot._get_sharded_shape(shape, policy, nrows, ncols) == expected_shape
+    assert MeshTensorProxy._get_sharded_shape(shape, policy, nrows, ncols) == expected_shape
 
 
 @pytest.mark.parametrize(
@@ -121,7 +125,7 @@ def test_get_sharded_shape_replicate_column(shape, x_dim, nrows, ncols):
 )
 def test_get_sharded_shape_replicate_column_invalid(shape, policy, nrows, ncols, error_msg):
     with pytest.raises(ValueError, match=error_msg):
-        MeshTensorAnnot._get_sharded_shape(shape, policy, nrows, ncols)
+        MeshTensorProxy._get_sharded_shape(shape, policy, nrows, ncols)
 
 
 @pytest.mark.parametrize(
@@ -143,7 +147,7 @@ def test_get_sharded_shape_none_replication(shape, x_dim, y_dim, nrows, ncols):
         expected_shape_list[x_dim] = math.ceil(shape[x_dim] / ncols)
     expected_shape = tuple(expected_shape_list)
 
-    assert MeshTensorAnnot._get_sharded_shape(shape, policy, nrows, ncols) == expected_shape
+    assert MeshTensorProxy._get_sharded_shape(shape, policy, nrows, ncols) == expected_shape
 
 
 @pytest.mark.parametrize(
@@ -155,7 +159,10 @@ def test_get_sharded_shape_none_replication(shape, x_dim, y_dim, nrows, ncols):
 )
 def test_get_sharded_shape_none_replication_invalid(shape, policy, nrows, ncols, error_msg):
     with pytest.raises(ValueError, match=error_msg):
-        MeshTensorAnnot._get_sharded_shape(shape, policy, nrows, ncols)
+        MeshTensorProxy._get_sharded_shape(shape, policy, nrows, ncols)
+
+
+# ─── MeshTensor __call__ basic tests ─────────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -171,14 +178,16 @@ def test_get_sharded_shape_none_replication_invalid(shape, policy, nrows, ncols,
     ],
 )
 def test_call_method(shape, device_mesh_config, policy):
-    proxy = MeshTensorAnnot()
+    proxy = MeshTensorProxy()
     nrows, ncols = device_mesh_config
 
-    buffer = proxy(shape, policy, device_mesh_config)
+    result = proxy(shape, policy, device_mesh_config)
 
-    expected_shape = MeshTensorAnnot._get_sharded_shape(shape, policy, nrows, ncols)
+    expected_shape = MeshTensorProxy._get_sharded_shape(shape, policy, nrows, ncols)
+    assert tuple(result.buffer.shape) == expected_shape
 
-    assert tuple(buffer.buffer.shape) == expected_shape
+
+# ─── Default row-major layout tests ──────────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -190,356 +199,280 @@ def test_call_method(shape, device_mesh_config, policy):
     ],
 )
 def test_default_row_major_layout(shape, device_mesh_config, policy):
-    proxy = MeshTensorAnnot()
+    proxy = MeshTensorProxy()
     nrows, ncols = device_mesh_config
 
     tensor_with_meta = proxy(shape, policy, device_mesh_config)
-    sharded_shape = MeshTensorAnnot._get_sharded_shape(shape, policy, nrows, ncols)
-    expected_sharded_strides = TensorAnnot._construct_strides(sharded_shape)
-    expected_global_strides = TensorAnnot._construct_strides(shape)
+    sharded_shape = MeshTensorProxy._get_sharded_shape(shape, policy, nrows, ncols)
 
-    # Verify the sharded buffer
+    # Verify the sharded buffer shape
     assert tuple(tensor_with_meta.buffer.shape) == sharded_shape
-    assert tuple(tensor_with_meta.buffer.strides) == expected_sharded_strides
 
-    # Verify the metadata
+    # Verify CuteLayout metadata is present
     meta = tensor_with_meta.meta_data
     assert meta["global_shape"] == shape
-    assert meta["global_strides"] == expected_global_strides
-    assert meta["global_hdims"] == shape
-    assert meta["global_hstrides"] == expected_global_strides
-    assert meta["global_hgroups"] == tuple((i, i + 1) for i in range(len(shape)))
+    assert "global_layout" in meta
+    assert "sharded_layout" in meta
 
-    assert meta["sharded_hdims"] == sharded_shape
-    assert meta["sharded_hstrides"] == expected_sharded_strides
-    assert meta["sharded_hgroups"] == tuple((i, i + 1) for i in range(len(sharded_shape)))
+    # Global layout should have dim_levels = (1, 1, ...) for row-major
+    import tvm_ffi
 
+    _dim_levels = tvm_ffi.get_global_func("tl.CuteLayout_dim_levels")
+    global_dl = _dim_levels(meta["global_layout"])
+    assert len(global_dl) == len(shape)
+    for dl in global_dl:
+        assert dl == 1
 
-@pytest.mark.parametrize(
-    "M_val, N_val, K_val, device_mesh_config, policyA, policyB, policyC",
-    [
-        (100, 200, 300, (4, 4), MeshShardingPolicy(x=1, y=0), MeshShardingPolicy(x=1, y=0), MeshShardingPolicy(x=1, y=0)),
-        (128, 256, 512, (2, 8), MeshShardingPolicy(x=1, y=0), MeshShardingPolicy(x=1, y=0), MeshShardingPolicy(x=1, y=0)),
-        (
-            100,
-            200,
-            300,
-            (2, 2),
-            MeshShardingPolicy(cross_mesh_dim=1),
-            MeshShardingPolicy(cross_mesh_dim=1),
-            MeshShardingPolicy(cross_mesh_dim=1),
-        ),
-        (
-            100,
-            200,
-            300,
-            (2, 2),
-            MeshShardingPolicy(replicate=MeshReplicationType.ALL),
-            MeshShardingPolicy(cross_mesh_dim=1),
-            MeshShardingPolicy(y=0, x=1),
-        ),
-    ],
-)
-def test_mesh_tensor_annot_non_hierarchical(M_val, N_val, K_val, device_mesh_config, policyA, policyB, policyC):
-    def get_expected_str(buffer_name, handle_name, shape, policy):
-        annot = MeshTensorAnnot()
-        sharded_buffer = annot(shape, policy, device_mesh_config)
-        sharded_shape = tuple(sharded_buffer.buffer.shape)
-        strides = TensorAnnot._construct_strides(sharded_shape)
-        stride_str = f", strides={strides}" if strides else ""
-        return f"{buffer_name} = T.match_buffer({handle_name}, {sharded_shape}{stride_str})"
-
-    def example_tensor_annot(M: T.PrimExpr, N: T.PrimExpr, K: T.PrimExpr):
-        A_tensor = T.MeshTensor((M, K), policyA, device_mesh_config, dtype="float32")
-        B_tensor = T.MeshTensor((K, N), policyB, device_mesh_config, dtype="float32")
-        C_tensor = T.MeshTensor((M, N), policyC, device_mesh_config, dtype="float32")
-
-        @T.prim_func
-        def kernel(A: A_tensor, B: B_tensor, C: C_tensor):
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
-
-        return kernel
-
-    ker = example_tensor_annot(M_val, N_val, K_val)
-    script = str(ker)
-
-    expected_A_str = get_expected_str("A", "A_handle", (M_val, K_val), policyA)
-    expected_B_str = get_expected_str("B", "B_handle", (K_val, N_val), policyB)
-    expected_C_str = get_expected_str("C", "C_handle", (M_val, N_val), policyC)
-    assert expected_A_str in script
-    assert expected_B_str in script
-    assert expected_C_str in script
-
-    assert "tensor_meta" in ker.attrs
-    tensor_meta = ker.attrs["tensor_meta"]
-    expected_A_global_shape = (M_val, K_val)
-    assert tuple(tensor_meta["A"]["global_shape"]) == expected_A_global_shape
-    expected_B_global_shape = (K_val, N_val)
-    assert tuple(tensor_meta["B"]["global_shape"]) == expected_B_global_shape
-    expected_C_global_shape = (M_val, N_val)
-    assert tuple(tensor_meta["C"]["global_shape"]) == expected_C_global_shape
+    sharded_dl = _dim_levels(meta["sharded_layout"])
+    assert len(sharded_dl) == len(shape)
+    for dl in sharded_dl:
+        assert dl == 1
 
 
-@pytest.mark.parametrize(
-    "shape, device_mesh_config, policy, hdims, hgroups, hstrides, expected_sharded_hdims, expected_sharded_hstrides",
-    [
-        # Case 1: 1 hierarchy per logical dim
-        (
-            (128, 256),
-            (2, 4),
-            MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE),
-            (128, 256),
-            ((0, 1), (1, 2)),
-            (256, 1),
-            (64, 64),
-            (64, 1),
-        ),
-        # Case 2: 3 hierarchies per logical dim
-        (
-            (128, 128),
-            (2, 2),
-            MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE),
-            (2, 4, 16, 2, 4, 16),
-            ((0, 3), (3, 6)),
-            (8192, 1024, 16, 4096, 256, 1),
-            (1, 4, 16, 1, 4, 16),
-            (4096, 1024, 16, 4096, 256, 1),
-        ),
-        # Case 3: Replicate ROW
-        (
-            (128, 128),
-            (2, 2),
-            MeshShardingPolicy(y=0, replicate=MeshReplicationType.ROW),
-            (4, 32, 4, 32),
-            ((0, 2), (2, 4)),
-            (1024, 1, 4096, 32),
-            (2, 32, 4, 32),
-            (1024, 1, 2048, 32),
-        ),
-        # Case 4: Cross mesh dim
-        (
-            (128, 128),
-            (2, 2),
-            MeshShardingPolicy(cross_mesh_dim=0),
-            (4, 32, 128),
-            ((0, 2), (2, 3)),
-            (32, 1, 4096),
-            (1, 32, 128),
-            (32, 1, 32),
-        ),
-    ],
-)
-def test_mesh_tensor_annot_hierarchical(
-    shape, device_mesh_config, policy, hdims, hgroups, hstrides, expected_sharded_hdims, expected_sharded_hstrides
-):
-    def example_tensor_annot(shape):
-        MyTensor = T.MeshTensor(
-            shape,
-            policy,
-            device_mesh_config,
-            dtype="float32",
-            hierarchical_dims=hdims,
-            hierarchical_groups=hgroups,
-            hierarchical_strides=hstrides,
-        )
-
-        @T.prim_func
-        def kernel(A: MyTensor):
-            pass
-
-        return kernel
-
-    ker = example_tensor_annot(shape)
-    assert "tensor_meta" in ker.attrs
-    tensor_meta = ker.attrs["tensor_meta"]
-
-    meta_A = tensor_meta["A"]
-    assert tuple(meta_A["global_shape"]) == shape
-    assert tuple(meta_A["global_hdims"]) == hdims
-    assert tuple(meta_A["global_hstrides"]) == hstrides
-    assert tuple(map(tuple, meta_A["global_hgroups"])) == hgroups
-
-    assert tuple(meta_A["sharded_hdims"]) == expected_sharded_hdims
-    assert tuple(meta_A["sharded_hstrides"]) == expected_sharded_hstrides
-    assert tuple(map(tuple, meta_A["sharded_hgroups"])) == hgroups
+# ─── Layout parameter tests ─────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    "shape, device_mesh_config, policy, hdims, hgroups, hstrides, expected_sharded_hdims, expected_sharded_hstrides",
-    [
-        # Case 1: 1 hierarchy per logical dim
-        (
-            (128, 256),
-            (2, 4),
-            MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE),
-            (128, 256),
-            ((0, 1), (1, 2)),
-            (256, 1),
-            (64, 64),
-            (64, 1),
-        ),
-        # Case 2: 2 hierarchies per logical dim (NN)
-        (
-            (128, 128),
-            (2, 2),
-            MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE),
-            (4, 32, 4, 32),
-            ((0, 2), (2, 4)),
-            (1024, 1, 4096, 32),
-            (2, 32, 2, 32),
-            (1024, 1, 2048, 32),
-        ),
-        # Case 3: 3 hierarchies per logical dim (ZZZ)
-        (
-            (128, 128),
-            (2, 2),
-            MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE),
-            (2, 4, 16, 2, 4, 16),
-            ((0, 3), (3, 6)),
-            (8192, 1024, 16, 4096, 256, 1),
-            (1, 4, 16, 1, 4, 16),
-            (4096, 1024, 16, 4096, 256, 1),
-        ),
-        # Case 4: Replicate ROW
-        (
-            (128, 128),
-            (2, 2),
-            MeshShardingPolicy(y=0, replicate=MeshReplicationType.ROW),
-            (4, 32, 4, 32),
-            ((0, 2), (2, 4)),
-            (1024, 1, 4096, 32),
-            (2, 32, 4, 32),
-            (1024, 1, 2048, 32),
-        ),
-        # Case 5: Replicate ALL
-        (
-            (128, 128),
-            (2, 2),
-            MeshShardingPolicy(replicate=MeshReplicationType.ALL),
-            (4, 32, 4, 32),
-            ((0, 2), (2, 4)),
-            (1024, 1, 4096, 32),
-            (4, 32, 4, 32),
-            (1024, 1, 4096, 32),
-        ),
-        # Case 6: Cross mesh dim
-        (
-            (128, 128),
-            (2, 2),
-            MeshShardingPolicy(cross_mesh_dim=0),
-            (4, 32, 128),
-            ((0, 2), (2, 3)),
-            (32, 1, 4096),
-            (1, 32, 128),
-            (32, 1, 32),
-        ),
-        # Case 7: 2 hierarchies per logical dim (ZZ)
-        (
-            (128, 128),
-            (2, 2),
-            MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE),
-            (4, 32, 4, 32),
-            ((0, 2), (2, 4)),
-            (4096, 32, 1024, 1),
-            (2, 32, 2, 32),
-            (2048, 32, 1024, 1),
-        ),
-    ],
-)
-def test_call_method_with_hierarchical_layout(
-    shape, device_mesh_config, policy, hdims, hgroups, hstrides, expected_sharded_hdims, expected_sharded_hstrides
-):
-    proxy = MeshTensorAnnot()
-    tensor_with_meta = proxy(
-        shape,
-        policy,
-        device_mesh_config,
-        hierarchical_dims=hdims,
-        hierarchical_groups=hgroups,
-        hierarchical_strides=hstrides,
+class TestLayoutParam:
+    """Tests for MeshTensor with explicit layout= parameter."""
+
+    def test_zz_layout_basic(self):
+        """ZZ layout is stored and sharded correctly."""
+        proxy = MeshTensorProxy()
+        shape = (128, 128)
+        policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
+        device_mesh = (2, 2)
+
+        layout = make_zz_layout(shape, [0, 1], (32, 32))
+        tensor = proxy(shape, policy, device_mesh, layout=layout)
+
+        meta = tensor.meta_data
+        assert "global_layout" in meta
+        assert "sharded_layout" in meta
+
+        # Global layout should have 2 modes per dim (block + grid)
+        import tvm_ffi
+
+        _dim_levels = tvm_ffi.get_global_func("tl.CuteLayout_dim_levels")
+        _mode_shape = tvm_ffi.get_global_func("tl.CuteLayout_mode_shape")
+
+        global_dl = _dim_levels(meta["global_layout"])
+        assert tuple(int(v) for v in global_dl) == (2, 2)
+
+        # Sharded: each dim sharded by 2 → grid goes from 4 to 2
+        sharded_ms = _mode_shape(meta["sharded_layout"])
+        # block preserved at 32, grid = 64/32 = 2
+        assert int(sharded_ms[0]) == 32  # block dim0
+        assert int(sharded_ms[1]) == 2  # grid dim0 (128/2/32 = 2)
+        assert int(sharded_ms[2]) == 32  # block dim1
+        assert int(sharded_ms[3]) == 2  # grid dim1
+
+    def test_zn_layout(self):
+        """ZN layout is stored and sharded correctly."""
+        proxy = MeshTensorProxy()
+        shape = (128, 128)
+        policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
+        device_mesh = (2, 2)
+
+        layout = make_zn_layout(shape, [0, 1], (32, 32))
+        tensor = proxy(shape, policy, device_mesh, layout=layout)
+
+        import tvm_ffi
+
+        _dim_levels = tvm_ffi.get_global_func("tl.CuteLayout_dim_levels")
+        _mode_stride = tvm_ffi.get_global_func("tl.CuteLayout_mode_stride")
+
+        meta = tensor.meta_data
+        global_dl = _dim_levels(meta["global_layout"])
+        assert tuple(int(v) for v in global_dl) == (2, 2)
+
+        # ZN has column-major inner block — stride pattern differs from ZZ
+        global_strides = _mode_stride(meta["global_layout"])
+        sharded_strides = _mode_stride(meta["sharded_layout"])
+
+        # Inner block strides should match (same block ordering)
+        # The physical ordering is preserved by DeriveLayoutLike
+        assert int(global_strides[0]) == int(sharded_strides[0])  # innermost stride preserved
+        assert int(global_strides[2]) == int(sharded_strides[2])  # inner block dim1 stride
+
+    def test_replicate_all_preserves_layout(self):
+        """ALL replication leaves layout unchanged."""
+        proxy = MeshTensorProxy()
+        shape = (128, 128)
+        policy = MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+        device_mesh = (2, 2)
+
+        layout = make_zz_layout(shape, [0, 1], (32, 32))
+        tensor = proxy(shape, policy, device_mesh, layout=layout)
+
+        import tvm_ffi
+
+        _mode_shape = tvm_ffi.get_global_func("tl.CuteLayout_mode_shape")
+        _same_layout = tvm_ffi.get_global_func("tl.IsSameLayout")
+
+        meta = tensor.meta_data
+        # Global and sharded should be identical for ALL replication
+        assert _same_layout(meta["global_layout"], meta["sharded_layout"])
+
+    def test_4d_zz_layout(self):
+        """4D tensor with ZZ tiling on selected axes."""
+        proxy = MeshTensorProxy()
+        shape = (2, 128, 4, 128)
+        policy = MeshShardingPolicy(y=1, x=3, replicate=MeshReplicationType.NONE)
+        device_mesh = (2, 2)
+
+        layout = make_zz_layout(shape, [1, 3], (32, 32))
+        tensor = proxy(shape, policy, device_mesh, layout=layout)
+
+        import tvm_ffi
+
+        _dim_levels = tvm_ffi.get_global_func("tl.CuteLayout_dim_levels")
+        _mode_shape = tvm_ffi.get_global_func("tl.CuteLayout_mode_shape")
+
+        meta = tensor.meta_data
+        sharded_dl = _dim_levels(meta["sharded_layout"])
+        # dims 0, 2 have 1 level; dims 1, 3 have 2 levels
+        assert tuple(int(v) for v in sharded_dl) == (1, 2, 1, 2)
+
+        sharded_ms = _mode_shape(meta["sharded_layout"])
+        # dim 0: untiled, shape 2 (not sharded)
+        assert int(sharded_ms[0]) == 2
+        # dim 1: sharded by nrows=2 → 64, block=32, grid=2
+        assert int(sharded_ms[1]) == 32
+        assert int(sharded_ms[2]) == 2
+        # dim 2: untiled, shape 4 (not sharded)
+        assert int(sharded_ms[3]) == 4
+        # dim 3: sharded by ncols=2 → 64, block=32, grid=2
+        assert int(sharded_ms[4]) == 32
+        assert int(sharded_ms[5]) == 2
+
+
+# ─── Kernel integration test ────────────────────────────────────────────
+
+
+def test_mesh_tensor_in_kernel():
+    """MeshTensor with layout flows through kernel definition correctly."""
+    policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
+    device_mesh = (2, 2)
+    M, N, K = 128, 128, 128
+
+    A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
+    B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
+    C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
+
+    A_tensor = T.MeshTensor((M, K), policy, device_mesh, "float16", layout=A_layout)
+    B_tensor = T.MeshTensor((K, N), policy, device_mesh, "float16", layout=B_layout)
+    C_tensor = T.MeshTensor((M, N), policy, device_mesh, "float32", layout=C_layout)
+
+    @T.prim_func
+    def kernel(A: A_tensor, B: B_tensor, C: C_tensor):
+        sharded_M, sharded_K = A.shape
+        _, sharded_N = B.shape
+
+    assert "tensor_meta" in kernel.attrs
+    tensor_meta = kernel.attrs["tensor_meta"]
+    assert "A" in tensor_meta
+    assert "sharded_layout" in tensor_meta["A"]
+    assert "global_layout" in tensor_meta["A"]
+
+
+# ─── Dynamic shape tests ────────────────────────────────────────────────
+
+
+class TestDynamicShapeSharding:
+    """Tests for _get_sharded_shape with symbolic PrimExpr dimensions."""
+
+    @pytest.mark.parametrize(
+        "nrows, ncols, policy",
+        [
+            (2, 2, MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)),
+            (4, 2, MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)),
+            (2, 4, MeshShardingPolicy(x=1, replicate=MeshReplicationType.COLUMN)),
+            (4, 1, MeshShardingPolicy(y=0, replicate=MeshReplicationType.ROW)),
+            (2, 2, MeshShardingPolicy(cross_mesh_dim=0)),
+        ],
     )
+    def test_get_sharded_shape_symbolic(self, nrows, ncols, policy):
+        """_get_sharded_shape returns PrimExpr ceildiv for symbolic dims."""
+        M = tir.Var("M", "int32")
+        N = tir.Var("N", "int32")
+        shape = (M, N)
+        result = MeshTensorProxy._get_sharded_shape(shape, policy, nrows, ncols)
 
-    # Check sharded shape
-    nrows, ncols = device_mesh_config
-    # This logic for expected shape needs to be more robust for different ranks and policies
-    expected_sharded_shape = list(shape)
-    if policy.cross_mesh_dim is not None:
-        expected_sharded_shape[policy.cross_mesh_dim] //= nrows * ncols
-    else:
-        if policy.replicate not in [MeshReplicationType.ALL, MeshReplicationType.COLUMN] and policy.y is not None:
-            expected_sharded_shape[policy.y] //= nrows
-        if policy.replicate not in [MeshReplicationType.ALL, MeshReplicationType.ROW] and policy.x is not None:
-            expected_sharded_shape[policy.x] //= ncols
+        # Verify result is a tuple of length 2
+        assert len(result) == 2
 
-    assert tuple(tensor_with_meta.buffer.shape) == tuple(expected_sharded_shape)
+        # Substitute concrete values and verify against the concrete-shape path
+        concrete_M, concrete_N = 128, 256
+        concrete_shape = (concrete_M, concrete_N)
+        concrete_result = MeshTensorProxy._get_sharded_shape(concrete_shape, policy, nrows, ncols)
 
-    # Check metadata
-    meta = tensor_with_meta.meta_data
-    assert meta["global_shape"] == shape
-    assert meta["global_hdims"] == hdims
-    assert meta["global_hstrides"] == hstrides
-    assert meta["global_hgroups"] == hgroups
+        for i in range(2):
+            if isinstance(result[i], tir.PrimExpr):
+                substituted = tir.stmt_functor.substitute(
+                    result[i], {M: tir.IntImm("int32", concrete_M), N: tir.IntImm("int32", concrete_N)}
+                )
+                from tvm import arith
 
-    # Check sharded hierarchical layout
-    assert meta["sharded_hdims"] == expected_sharded_hdims
-    assert meta["sharded_hstrides"] == expected_sharded_hstrides
-    assert meta["sharded_hgroups"] == hgroups
+                analyzer = arith.Analyzer()
+                simplified = analyzer.simplify(substituted)
+                assert simplified.value == concrete_result[i], (
+                    f"dim {i}: symbolic result evaluates to {simplified.value}, expected {concrete_result[i]}"
+                )
+            else:
+                assert result[i] == concrete_result[i]
+
+    def test_get_sharded_shape_replicate_all_symbolic(self):
+        """ALL replication returns shape unchanged for symbolic dims."""
+        M = tir.Var("M", "int32")
+        N = tir.Var("N", "int32")
+        shape = (M, N)
+        policy = MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+        result = MeshTensorProxy._get_sharded_shape(shape, policy, 4, 4)
+        assert result == shape
+
+    def test_get_sharded_shape_mixed_symbolic_concrete(self):
+        """Mix of symbolic and concrete dims: only the sharded dim becomes PrimExpr."""
+        M = tir.Var("M", "int32")
+        shape = (M, 256)
+        policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
+        result = MeshTensorProxy._get_sharded_shape(shape, policy, 2, 4)
+
+        # dim 0 (y-sharded by nrows=2): symbolic ceildiv
+        assert isinstance(result[0], tir.PrimExpr)
+        # dim 1 (x-sharded by ncols=4): concrete 256/4 = 64
+        assert result[1] == 64
 
 
-@pytest.mark.parametrize(
-    "shape, device_mesh_config, policy, hdims, hgroups, hstrides, error_msg_match",
-    [
-        # Case 1: 1 hierarchy, not divisible
-        (
-            (129, 256),
-            (2, 4),
+class TestDynamicShapeCallMethod:
+    """Tests for MeshTensorProxy.__call__ with symbolic shapes."""
+
+    @pytest.mark.parametrize(
+        "policy",
+        [
             MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE),
-            (129, 256),
-            ((0, 1), (1, 2)),
-            (256, 1),
-            r"The most significant hierarchical dimension \(129\) of logical dimension 0 is not divisible by the shard factor \(2\).",
-        ),
-        # Case 2: 2 hierarchies, not divisible
-        (
-            (120, 128),
-            (2, 2),
-            MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE),
-            (5, 24, 4, 32),
-            ((0, 2), (2, 4)),
-            (24, 1, 1, 1),
-            r"The most significant hierarchical dimension \(5\) of logical dimension 0 is not divisible by the shard factor \(2\).",
-        ),
-        # Case 3: 3 hierarchies, not divisible
-        (
-            (117, 256),
-            (2, 4),
-            MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE),
-            (9, 13, 1, 32, 8, 1),
-            ((0, 3), (3, 6)),
-            (13, 1, 1, 8, 1, 1),
-            r"The most significant hierarchical dimension \(9\) of logical dimension 0 is not divisible by the shard factor \(2\).",
-        ),
-        # Case 4: cross_mesh_dim, not divisible
-        (
-            (129, 128),
-            (2, 2),
-            MeshShardingPolicy(cross_mesh_dim=0),
-            (5, 25, 128),
-            ((0, 2), (2, 3)),
-            (25, 1, 1),
-            r"The most significant hierarchical dimension \(5\) of logical dimension 0 is not divisible by the shard factor \(4\).",
-        ),
-    ],
-)
-def test_call_method_with_hierarchical_layout_invalid(shape, device_mesh_config, policy, hdims, hgroups, hstrides, error_msg_match):
-    proxy = MeshTensorAnnot()
-    with pytest.raises(ValueError, match=error_msg_match):
-        proxy(
-            shape,
-            policy,
-            device_mesh_config,
-            hierarchical_dims=hdims,
-            hierarchical_groups=hgroups,
-            hierarchical_strides=hstrides,
-        )
+            MeshShardingPolicy(replicate=MeshReplicationType.ALL),
+            MeshShardingPolicy(cross_mesh_dim=1),
+            MeshShardingPolicy(y=0, replicate=MeshReplicationType.ROW),
+            MeshShardingPolicy(x=1, replicate=MeshReplicationType.COLUMN),
+        ],
+    )
+    def test_call_default_row_major_symbolic(self, policy):
+        """MeshTensor construction with symbolic shapes produces valid metadata."""
+        M = tir.Var("M", "int32")
+        K = tir.Var("K", "int32")
+        shape = (M, K)
+        device_mesh = (2, 2)
+        proxy = MeshTensorProxy()
+
+        tensor_with_meta = proxy(shape, policy, device_mesh)
+        meta = tensor_with_meta.meta_data
+
+        # Global shape should be the original symbolic shape
+        assert meta["global_shape"] == shape
+
+        # CuteLayout objects should be present
+        assert "global_layout" in meta
+        assert "sharded_layout" in meta
+
+        # Buffer should be created successfully
+        assert len(tensor_with_meta.buffer.shape) == 2

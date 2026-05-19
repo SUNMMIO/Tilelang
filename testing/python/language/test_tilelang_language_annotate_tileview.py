@@ -4,7 +4,6 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang import tvm as tvm
 from tilelang.tileview import TileView, make_tileview
 from tvm import tir
 
@@ -82,22 +81,25 @@ def test_tileview_equality(tv1_args, tv2_args, should_be_equal):
 
 
 # =============================================================================
-# Test cases for non-divisible dimensions (should raise error)
-# Format: (buffer_shape, tile_shape, index_map)
+# Test cases for non-divisible dimensions (ceildiv tail tiles)
+# Format: (buffer_shape, tile_shape, index_map, expected_tiled_shape)
 # =============================================================================
-TILEVIEW_ERROR_CASES = [
-    pytest.param([64, 128], [15, 32], [-2, -1], id="dim0_not_divisible"),
-    pytest.param([64, 128], [16, 30], [-2, -1], id="dim1_not_divisible"),
-    pytest.param([64, 128], [17, 33], [-2, -1], id="both_dims_not_divisible"),
-    pytest.param([100, 100], [32, 32], [-2, -1], id="100_not_divisible_by_32"),
+TILEVIEW_CEILDIV_CASES = [
+    pytest.param([64, 128], [15, 32], [-2, -1], [5, 4, 15, 32], id="dim0_tail"),
+    pytest.param([64, 128], [16, 30], [-2, -1], [4, 5, 16, 30], id="dim1_tail"),
+    pytest.param([64, 128], [17, 33], [-2, -1], [4, 4, 17, 33], id="both_dims_tail"),
+    pytest.param([100, 100], [32, 32], [-2, -1], [4, 4, 32, 32], id="100_by_32_tail"),
 ]
 
 
-@pytest.mark.parametrize("buffer_shape, tile_shape, index_map", TILEVIEW_ERROR_CASES)
-def test_tileview_non_divisible_error(buffer_shape, tile_shape, index_map):
-    """Test that TileView raises error for non-divisible dimensions."""
-    with pytest.raises(tvm.error.InternalError):
-        TileView(buffer_shape, tile_shape, index_map)
+@pytest.mark.parametrize("buffer_shape, tile_shape, index_map, expected_tiled_shape", TILEVIEW_CEILDIV_CASES)
+def test_tileview_non_divisible_uses_ceildiv(buffer_shape, tile_shape, index_map, expected_tiled_shape):
+    """Test that TileView represents non-divisible dimensions with tail tiles."""
+    tv = TileView(buffer_shape, tile_shape, index_map)
+
+    assert len(tv.tiled_buffer_shape) == len(expected_tiled_shape)
+    for i, expected in enumerate(expected_tiled_shape):
+        assert int(tv.tiled_buffer_shape[i]) == expected
 
 
 def test_tileview_repr():

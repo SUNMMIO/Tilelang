@@ -70,15 +70,15 @@ def InferSramScope():
     return _ffi_api.InferSramScope()  # type: ignore
 
 
-def LegalizeSunmmioCopyPath():
-    """Split Sunmmio global->asram copies into staged rsram copies.
+def LegalizeSunmmioDataPath():
+    """Stage unsupported Sunmmio global->asram data-transfer paths through rsram.
 
     Returns
     -------
     fpass : tvm.transform.Pass
         The result pass
     """
-    return _ffi_api.LegalizeSunmmioCopyPath()  # type: ignore
+    return _ffi_api.LegalizeSunmmioDataPath()  # type: ignore
 
 
 def LowerTileOp():
@@ -349,6 +349,17 @@ def LowerTilesLoop():
     return _ffi_api.LowerTilesLoop()  # type: ignore
 
 
+def SunmmioTileLoopFusion():
+    """SunmmioTileLoopFusion
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.SunmmioTileLoopFusion()  # type: ignore
+
+
 def LegalizeSafeMemoryAccess():
     """LegalizeLoopVectorize
 
@@ -586,6 +597,20 @@ def LowerDeviceKernelLaunch():
 def LowerSharedTmem():
     """LowerSharedTmem"""
     return _ffi_api.LowerSharedTmem()  # type: ignore
+
+
+def SunmmioLayoutInference():
+    """SunmmioLayoutInference
+
+    Standalone layout inference pass for the Sunmmio target.
+    Assigns CuteLayout to every buffer and validates layout consistency.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.SunmmioLayoutInference()  # type: ignore
 
 
 def LayoutReducer():

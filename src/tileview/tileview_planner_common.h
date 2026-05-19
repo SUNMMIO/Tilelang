@@ -11,6 +11,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/tir/buffer.h>
 
+#include "../layout/cute_layout.h"
 #include "../layout/layout.h"
 #include "../target/sunmmio_utils.h"
 #include "tileview.h"
@@ -20,14 +21,21 @@ namespace tl {
 
 using namespace tir;
 
-/// Coarse layout classes that drive Sunmmio tile legality rules.
-enum class LayoutClass {
-  /// Buffers with an explicit layout entry use the modeled 32x32 blockwise
-  /// rules.
-  kBlockwise32x32,
-  /// Buffers without a layout entry are treated as plain row-major buffers.
-  kRowMajor,
-};
+/*!
+ * \brief Compute contiguous tile steps for a buffer, with row-major fallback.
+ *
+ * If the buffer has a CuteLayout in `layout_map`, delegates to
+ * ComputeContiguousTileSteps.  Otherwise, synthesizes row-major steps
+ * from the buffer's trailing dimensions (last dim contiguous, then
+ * second-to-last dim).
+ *
+ * The returned steps describe the contiguous tile envelope that the
+ * planner uses to enumerate legal tile shapes without layout-kind
+ * branching.
+ */
+std::vector<ContiguousStep>
+GetBufferContiguousSteps(const Buffer &buffer,
+                         const Map<Buffer, Layout> &layout_map);
 
 /*!
  * \brief Canonical trailing tile pattern shared by the generic and reduction
@@ -48,6 +56,17 @@ struct TrailingTilePattern {
 };
 
 /*!
+ * \brief Controls whether TileView planning enforces RSRAM width alignment.
+ *
+ * Relaxed mode is used only after strict plan search fails; it permits
+ * eligible rank-1 side loads to be repaired later by aligned load plus slice.
+ */
+enum class AlignmentMode {
+  kStrict,
+  kRelaxed,
+};
+
+/*!
  * \brief Return the integer value of a static `PrimExpr`, or `fallback`
  * otherwise.
  *
@@ -55,16 +74,6 @@ struct TrailingTilePattern {
  * but still wants a caller-controlled default for dynamic expressions.
  */
 int64_t GetStaticIntValue(const PrimExpr &expr, int64_t fallback = -1);
-
-/*!
- * \brief Classify a buffer as blockwise or row-major for TileView planning.
- *
- * Today the classification is intentionally simple: presence in `layout_map`
- * means the buffer follows Sunmmio blockwise rules, otherwise the buffer is
- * treated as row-major.
- */
-LayoutClass GetLayoutClass(const Buffer &buffer,
-                           const Map<Buffer, Layout> &layout_map);
 
 /*!
  * \brief Return the scalar element bit-width used by the buffer.
@@ -175,7 +184,8 @@ TileView MakeTrailingTileView(const Array<PrimExpr> &buffer_shape,
  */
 std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
     const Buffer &buffer, int exec_rank, const Map<Buffer, Layout> &layout_map,
-    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer);
+    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
+    AlignmentMode alignment_mode = AlignmentMode::kStrict);
 
 /*!
  * \brief Validate a manual trailing TileView and normalize it into a shared
@@ -183,15 +193,17 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
  *
  * This routine checks the structural legality that is common to all planners:
  * rank, trailing index-map shape, static tile extents, buffer-shape
- * divisibility, Sunmmio register-capacity limits, and blockwise-vs-row-major
- * width/height rules. Planner-specific checks such as loop binding
- * compatibility or region alignment remain in the caller.
+ * divisibility, Sunmmio register-capacity limits, and contiguous tile envelope
+ * constraints derived from the layout's stride structure.  Planner-specific
+ * checks such as loop binding compatibility or region alignment remain in the
+ * caller.
  */
-TrailingTilePattern ValidateManualTrailingTileView(
-    const Buffer &buffer, const TileView &manual_tv, int exec_rank,
-    const Map<Buffer, Layout> &layout_map,
-    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
-    const char *usage, bool enforce_blockwise_width_for_rank1);
+TrailingTilePattern
+ValidateManualTrailingTileView(const Buffer &buffer, const TileView &manual_tv,
+                               int exec_rank,
+                               const Map<Buffer, Layout> &layout_map,
+                               const SunmmioTileProcessorConfig &config,
+                               arith::Analyzer *analyzer, const char *usage);
 
 } // namespace tl
 } // namespace tvm

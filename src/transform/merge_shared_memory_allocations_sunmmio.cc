@@ -45,6 +45,7 @@
 #include "../op/comm.h"
 #include "../op/region.h"
 #include "../op/utils.h"
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "runtime/thread_storage_scope.h"
 #include "tir/transforms/ir_utils.h"
@@ -58,9 +59,9 @@ using namespace tir;
 using runtime::StorageRank;
 using runtime::StorageScope;
 
-static const std::string ScopeA = "shared.asram";
-static const std::string ScopeW = "shared.wsram";
-static const std::string ScopeR = "shared.rsram";
+static constexpr const char *ScopeA = kSunmmioScopeASRAM;
+static constexpr const char *ScopeW = kSunmmioScopeWSRAM;
+static constexpr const char *ScopeR = kSunmmioScopeRSRAM;
 static bool IsScope(const Var &v, const std::string &scope) {
   return GetPtrStorageScope(v) == scope;
 }

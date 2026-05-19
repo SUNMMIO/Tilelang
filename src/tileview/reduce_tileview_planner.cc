@@ -25,10 +25,9 @@ struct ReduceTileCandidate {
   TileView dst_tileview;
   std::vector<int> execution_domain_axes;
   int reduce_tile_axis{-1};
-  bool tiles_reduce_dim{false};
-  int useful_spatial_tiled_dims{0};
-  int dst_tile_elems{1};
+  int reduce_tile_extent{1}; // tile extent on the reduce dim (1 if not tiled)
   int src_tile_elems{1};
+  int dst_tile_elems{1};
 };
 
 Array<PrimExpr> RegionExtents(const BufferRegion &region) {
@@ -157,7 +156,7 @@ ReduceTileCandidate MakeCandidate(const Array<PrimExpr> &source_domain,
     int src_dim = src_pattern.mapped_dims[axis];
     if (src_dim == reduce_dim) {
       candidate.reduce_tile_axis = axis;
-      candidate.tiles_reduce_dim = true;
+      candidate.reduce_tile_extent = src_pattern.tile_shape[axis];
       continue;
     }
     int dst_dim = src_dim_to_dst_dim[src_dim];
@@ -165,13 +164,6 @@ ReduceTileCandidate MakeCandidate(const Array<PrimExpr> &source_domain,
                           << " does not map to any destination dim.";
     dst_exec_axes.push_back(dst_dim);
     dst_tile_shape.push_back(src_tile_shape[axis]);
-
-    PrimExpr tile_extent = analyzer->Simplify(src_tile_shape[axis]);
-    PrimExpr domain_extent = analyzer->Simplify(source_domain[src_dim]);
-    if (analyzer->CanProve(tile_extent > make_zero(tile_extent.dtype())) &&
-        analyzer->CanProve(domain_extent > tile_extent)) {
-      candidate.useful_spatial_tiled_dims += 1;
-    }
   }
 
   candidate.dst_tileview = makeTileView(
@@ -188,8 +180,7 @@ TrailingTilePattern ValidateManualSrcTilePattern(
   int src_rank = static_cast<int>(src_region->region.size());
   TrailingTilePattern pattern = ValidateManualTrailingTileView(
       src_region->buffer, manual_tv, src_rank == 1 ? 1 : 2, layout_map, config,
-      analyzer, "Manual src TileView for Sunmmio reduction",
-      /*enforce_blockwise_width_for_rank1=*/true);
+      analyzer, "Manual src TileView for Sunmmio reduction");
 
   for (size_t axis = 0; axis < pattern.tile_shape.size(); ++axis) {
     int src_dim = pattern.mapped_dims[axis];
@@ -306,25 +297,59 @@ PlanReduceTileViews(const BufferRegion &src_region,
       << ". The source candidates are incompatible with the reduction "
          "projection and any manual dst TileView hint.";
 
+  // Score candidates to minimize total tile-unit dispatches.
+  //
+  // The Sunmmio reduction algorithm (see reduce.cc MakeSunmmioTileReduce)
+  // accumulates element-wise across K/t_K iterations, then calls a single
+  // hardware in-tile reduction at the end of each spatial position:
+  //
+  //   N_total = (S_spatial / dst_tile_elems) * (K / t_K + 1)
+  //
+  // where t_K = reduce_tile_extent (1 if reduce dim is not tiled).
+  // Since S_spatial is constant across candidates, the ranking is
+  // determined by the score:
+  //
+  //   score = (K + t_K) / src_tile_elems     (lower is better)
+  //
+  // When K is statically known (IntImm), we compare scores exactly via
+  // cross-multiplication.  When K is dynamic, we fall back to a proxy:
+  //   1. src_tile_elems ↑  (dominates for large K)
+  //   2. reduce_tile_extent ↓  (breaks ties; fewer hardware reductions)
+  //
+  // Tiebreaks: simpler tile rank, then deterministic axis ordering.
+
+  // Extract static K from source_domain[reduce_dim] if possible.
+  int64_t K_static = -1;
+  {
+    const auto *imm = source_domain[reduce_dim].as<IntImmNode>();
+    if (imm) {
+      K_static = imm->value;
+    }
+  }
+
   std::sort(
       compatible_candidates.begin(), compatible_candidates.end(),
-      [](const ReduceTileCandidate &lhs, const ReduceTileCandidate &rhs) {
-        if (lhs.tiles_reduce_dim != rhs.tiles_reduce_dim) {
-          return lhs.tiles_reduce_dim > rhs.tiles_reduce_dim;
+      [K_static](const ReduceTileCandidate &a, const ReduceTileCandidate &b) {
+        if (K_static > 0) {
+          // Static K: exact score comparison.
+          // a better iff (K + a.t_K) * b.src < (K + b.t_K) * a.src
+          int64_t lhs = (K_static + a.reduce_tile_extent) *
+                        static_cast<int64_t>(b.src_tile_elems);
+          int64_t rhs = (K_static + b.reduce_tile_extent) *
+                        static_cast<int64_t>(a.src_tile_elems);
+          if (lhs != rhs)
+            return lhs < rhs;
+        } else {
+          // Dynamic K: proxy ordering.
+          if (a.src_tile_elems != b.src_tile_elems)
+            return a.src_tile_elems > b.src_tile_elems;
+          if (a.reduce_tile_extent != b.reduce_tile_extent)
+            return a.reduce_tile_extent < b.reduce_tile_extent;
         }
-        if (lhs.useful_spatial_tiled_dims != rhs.useful_spatial_tiled_dims) {
-          return lhs.useful_spatial_tiled_dims > rhs.useful_spatial_tiled_dims;
-        }
-        if (lhs.dst_tile_elems != rhs.dst_tile_elems) {
-          return lhs.dst_tile_elems < rhs.dst_tile_elems;
-        }
-        if (lhs.src_tile_elems != rhs.src_tile_elems) {
-          return lhs.src_tile_elems > rhs.src_tile_elems;
-        }
-        if (lhs.src_tileview->TileDim() != rhs.src_tileview->TileDim()) {
-          return lhs.src_tileview->TileDim() < rhs.src_tileview->TileDim();
-        }
-        return lhs.execution_domain_axes < rhs.execution_domain_axes;
+        // Deterministic tiebreaks.
+        if (a.src_tileview->TileDim() != b.src_tileview->TileDim())
+          return a.src_tileview->TileDim() < b.src_tileview->TileDim();
+        return a.execution_domain_axes < b.execution_domain_axes;
       });
 
   const ReduceTileCandidate &best = compatible_candidates.front();

@@ -23,6 +23,7 @@
 #include "../op/parallel.h"
 #include "../op/region.h"
 #include "../op/utils.h"
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "../tileview/tileview.h"
 #include "arith/ir_mutator_with_analyzer.h"
@@ -192,9 +193,9 @@ private:
 
   static bool CanCopyDirectly(const std::string &src_scope,
                               const std::string &dst_scope) {
-    return src_scope == "shared.rsram" &&
-           (dst_scope == "shared.asram" || dst_scope == "shared.wsram" ||
-            dst_scope == "shared.rsram");
+    return src_scope == kSunmmioScopeRSRAM &&
+           (dst_scope == kSunmmioScopeASRAM ||
+            dst_scope == kSunmmioScopeWSRAM || dst_scope == kSunmmioScopeRSRAM);
   }
 
   bool InInfoCollectionPhase() const { return phase_ == Phase::kCollectInfo; }
@@ -230,9 +231,7 @@ private:
       if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
         buffers_to_infer.insert(buffer);
         original_alloc_buffers_.insert(buffer);
-      } else if ((buffer.scope() != "shared.asram") &&
-                 (buffer.scope() != "shared.wsram") &&
-                 (buffer.scope() != "shared.rsram")) {
+      } else if (!IsSunmmioSramScope(buffer.scope())) {
         // SRAM scopes should already have been validated at the GEMM sites.
         ICHECK(0) << "Invalid scope " << buffer.scope() << " of " << buffer
                   << " in Sunmmio.";
@@ -413,9 +412,12 @@ private:
   }
 
   void CollectGemmScopes(const CallNode *call) {
-    CollectOperandScope(NormalizeToBufferRegion(call->args[0]), "shared.asram");
-    CollectOperandScope(NormalizeToBufferRegion(call->args[1]), "shared.wsram");
-    CollectOperandScope(NormalizeToBufferRegion(call->args[2]), "shared.rsram");
+    CollectOperandScope(NormalizeToBufferRegion(call->args[0]),
+                        kSunmmioScopeASRAM);
+    CollectOperandScope(NormalizeToBufferRegion(call->args[1]),
+                        kSunmmioScopeWSRAM);
+    CollectOperandScope(NormalizeToBufferRegion(call->args[2]),
+                        kSunmmioScopeRSRAM);
   }
 
   Stmt ResolveGemmConflicts(const CallNode *call) {
@@ -426,9 +428,12 @@ private:
     Array<Stmt> seq;
     std::unordered_map<std::string, PrimExpr> new_args;
 
-    ResolveOperandConflict(a_region, "A", "A", "shared.asram", &seq, &new_args);
-    ResolveOperandConflict(b_region, "B", "B", "shared.wsram", &seq, &new_args);
-    ResolveOperandConflict(c_region, "C", "C", "shared.rsram", &seq, &new_args);
+    ResolveOperandConflict(a_region, "A", "A", kSunmmioScopeASRAM, &seq,
+                           &new_args);
+    ResolveOperandConflict(b_region, "B", "B", kSunmmioScopeWSRAM, &seq,
+                           &new_args);
+    ResolveOperandConflict(c_region, "C", "C", kSunmmioScopeRSRAM, &seq,
+                           &new_args);
 
     if (seq.empty() || new_args.empty()) {
       return Evaluate(tvm::ffi::GetRef<Call>(call));
@@ -509,13 +514,13 @@ private:
       auto buffer = load->buffer;
       if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
         if (buffer_remap_.count(buffer)) {
-          ICHECK(buffer_remap_[buffer].scope() == "shared.rsram")
+          ICHECK(buffer_remap_[buffer].scope() == kSunmmioScopeRSRAM)
               << "Buffer " << buffer
               << " used in BufferLoad should be shared.rsram.";
         } else {
           buffers_to_infer.insert(buffer);
         }
-      } else if ((buffer.scope() != "shared.rsram") &&
+      } else if ((buffer.scope() != kSunmmioScopeRSRAM) &&
                  (buffer.scope() != "global")) {
         ICHECK(0) << "Invalid scope " << buffer.scope() << " of " << buffer
                   << " in Sunmmio.";
@@ -594,7 +599,7 @@ private:
   void InferUnspecifiedBuffer() {
     for (const auto &buffer : buffers_to_infer) {
       if (!buffer_remap_.count(buffer)) {
-        auto remap_buffer = makeBufferWithScope(buffer, "shared.rsram");
+        auto remap_buffer = makeBufferWithScope(buffer, kSunmmioScopeRSRAM);
         buffer_remap_.Set(buffer, remap_buffer);
       }
     }

@@ -1,7 +1,7 @@
 import tilelang
 import pytest
 from tilelang import tvm as tvm
-from tilelang.layout.hierarchical_layout import make_blockwise_zz_layout
+from tilelang.layout import make_zz_layout
 from tilelang.utils.target import determine_target
 import tilelang as tl
 import tilelang.language as T
@@ -638,7 +638,7 @@ def dot_mul_tiled_parallel(M, N, block_M, block_N, tile_size, index_map, dtype="
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_N), dtype)
             T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, index_map)})
-            T.annotate_layout({A_shared: make_blockwise_zz_layout(A_shared)})
+            T.annotate_layout({A_shared: make_zz_layout(A_shared)})
             B_shared = T.alloc_shared((block_M, block_N), dtype)
             T.annotate_tileview({B_shared: make_tileview(B_shared, tile_size, index_map)})
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -722,7 +722,7 @@ def dot_mul_tiled_parallel_specified_scope(M, N, block_M, block_N, tile_size, in
         A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
             T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, index_map)})
-            T.annotate_layout({A_shared: make_blockwise_zz_layout(A_shared)})
+            T.annotate_layout({A_shared: make_zz_layout(A_shared)})
 
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             T.annotate_tileview({B_shared: make_tileview(B_shared, tile_size, index_map)})
@@ -785,34 +785,32 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
     tile_size = (8, 8)
     index_map = (-2, -1)
 
+    A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
+    B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
+    C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
+
     @T.prim_func
     def gemm(
         A: T.MeshTensor(
             (M, K),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
             device_mesh_config=(2, 2),
-            hierarchical_dims=(4, 32, 128),
-            hierarchical_groups=((0, 2), (2, 3)),
-            hierarchical_strides=(32, 1, 4096),
             dtype=dtype,
+            layout=A_layout,
         ),
         B: T.MeshTensor(
             (K, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
             device_mesh_config=(2, 2),
-            hierarchical_dims=(4, 32, 128),
-            hierarchical_groups=((0, 2), (2, 3)),
-            hierarchical_strides=(32, 1, 4096),
             dtype=dtype,
+            layout=B_layout,
         ),
         C: T.MeshTensor(
             (M, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
             device_mesh_config=(2, 2),
-            hierarchical_dims=(4, 32, 128),
-            hierarchical_groups=((0, 2), (2, 3)),
-            hierarchical_strides=(32, 1, 4096),
             dtype=accum_dtype,
+            layout=C_layout,
         ),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
@@ -885,34 +883,32 @@ def test_tilelang_data_pointer_bug_infer_sram_scope(kernel):
 
 
 def auto_insert_copy_matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
+    A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
+    B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
+    C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
+
     @T.prim_func
     def gemm(
         A: T.MeshTensor(
             (M, K),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
             device_mesh_config=(2, 2),
-            hierarchical_dims=(4, 32, 128),
-            hierarchical_groups=((0, 2), (2, 3)),
-            hierarchical_strides=(32, 1, 4096),
             dtype=dtype,
+            layout=A_layout,
         ),
         B: T.MeshTensor(
             (K, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
             device_mesh_config=(2, 2),
-            hierarchical_dims=(4, 32, 128),
-            hierarchical_groups=((0, 2), (2, 3)),
-            hierarchical_strides=(32, 1, 4096),
             dtype=dtype,
+            layout=B_layout,
         ),
         C: T.MeshTensor(
             (M, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
             device_mesh_config=(2, 2),
-            hierarchical_dims=(4, 32, 128),
-            hierarchical_groups=((0, 2), (2, 3)),
-            hierarchical_strides=(32, 1, 4096),
             dtype=accum_dtype,
+            layout=C_layout,
         ),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
@@ -966,34 +962,32 @@ def test_tilelang_insert_copy_infer_sram_scope(kernel):
 
 
 def sliced_conflict_matmul(dtype="float16", accum_dtype="float"):
+    A_layout = make_zz_layout((128, 128), [0, 1], (32, 32))
+    B_layout = make_zz_layout((128, 128), [0, 1], (32, 32))
+    C_layout = make_zz_layout((128, 128), [0, 1], (32, 32))
+
     @T.prim_func
     def gemm(
         A: T.MeshTensor(
             (128, 128),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
             device_mesh_config=(2, 2),
-            hierarchical_dims=(4, 32, 128),
-            hierarchical_groups=((0, 2), (2, 3)),
-            hierarchical_strides=(32, 1, 4096),
             dtype=dtype,
+            layout=A_layout,
         ),
         B: T.MeshTensor(
             (128, 128),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
             device_mesh_config=(2, 2),
-            hierarchical_dims=(4, 32, 128),
-            hierarchical_groups=((0, 2), (2, 3)),
-            hierarchical_strides=(32, 1, 4096),
             dtype=dtype,
+            layout=B_layout,
         ),
         C: T.MeshTensor(
             (128, 128),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
             device_mesh_config=(2, 2),
-            hierarchical_dims=(4, 32, 128),
-            hierarchical_groups=((0, 2), (2, 3)),
-            hierarchical_strides=(32, 1, 4096),
             dtype=accum_dtype,
+            layout=C_layout,
         ),
     ):
         with T.Kernel(1, 1, threads=128) as (bx, by):

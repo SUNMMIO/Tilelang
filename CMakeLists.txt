@@ -21,6 +21,12 @@ option(
   ON
 )
 
+option(
+  TILELANG_BUILD_CPP_TESTS
+  "Build repo-local C++ unit tests under testing/cpp."
+  OFF
+)
+
 if(
   TILELANG_UPDATE_SUBMODULES
   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.gitmodules"
@@ -252,9 +258,11 @@ set(TILE_LANG_INCLUDES ${TVM_INCLUDES})
 # Collect source files
 file(GLOB TILE_LANG_SRCS
   src/*.cc
+  src/analysis/*.cc
   src/layout/*.cc
   src/tileview/*.cc
   src/transform/*.cc
+  src/transform/sunmmio_tile_loop_fusion/*.cc
   src/transform/common/*.cc
   src/op/*.cc
   src/target/utils.cc
@@ -447,7 +455,16 @@ if(USE_Z3 AND USE_PYPI_Z3)
 endif()
 
 # Include tvm after configs have been populated
+# TileLang owns the repo-local C++ test surface under testing/cpp. Disable
+# vendored TVM GTest discovery here so `ctest` does not pick up the excluded
+# upstream `cpptest` target as a stale *_NOT_BUILT placeholder.
+if(TILELANG_BUILD_CPP_TESTS)
+  set(USE_GTEST OFF CACHE STRING "Disable vendored TVM GTest integration in TileLang builds" FORCE)
+endif()
 add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)
+if(TILELANG_BUILD_CPP_TESTS)
+  set_property(DIRECTORY "${TVM_SOURCE}" PROPERTY TEST_INCLUDE_FILES "")
+endif()
 
 # Resolve compile warnings in tvm
 add_compile_definitions(DMLC_USE_LOGGING_LIBRARY=<tvm/runtime/logging.h>)
@@ -498,6 +515,11 @@ set_target_properties(tilelang_cython_wrapper PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
   ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
 )
+
+# Source-tree Python imports expect the wrapper to live in build/lib alongside
+# the shared libraries. Make it part of explicit `tilelang` builds so pytest can
+# run from a fresh build tree without extra manual steps.
+add_dependencies(tilelang tilelang_cython_wrapper)
 
 # Install the extension into tilelang/lib inside the wheel
 install(TARGETS tilelang_cython_wrapper
@@ -591,3 +613,9 @@ install(
   RUNTIME DESTINATION tilelang/lib
   ARCHIVE DESTINATION tilelang/lib
 )
+
+if(TILELANG_BUILD_CPP_TESTS)
+  include(CTest)
+  enable_testing()
+  add_subdirectory(testing/cpp)
+endif()

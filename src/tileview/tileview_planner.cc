@@ -6,6 +6,7 @@
 #include "tileview_planner.h"
 
 #include <algorithm>
+#include <optional>
 #include <unordered_set>
 #include <utility>
 
@@ -42,8 +43,8 @@ struct AccessTileCandidate {
 struct AccessInfo {
   Buffer buffer;
   Array<PrimExpr> indices;
-  std::vector<IndexBinding> bindings;
-  std::vector<AccessTileCandidate> candidates;
+  std::vector<AccessTileCandidate> strict_candidates;
+  std::vector<AccessTileCandidate> relaxed_candidates;
 };
 
 struct ExecutionPlanCandidate {
@@ -148,13 +149,6 @@ void AddRank1Candidate(std::vector<AccessTileCandidate> *candidates,
     return;
   }
 
-  if (!CanProveDivisible(analyzer, buffer->shape[mapped_dim], tile_width)) {
-    ICHECK(!strict_checks) << "Buffer dimension " << mapped_dim << " of buffer "
-                           << buffer->name << " is not divisible by tile width "
-                           << tile_width << ".";
-    return;
-  }
-
   if (strict_checks) {
     RequireDivisible(analyzer, binding.offset, tile_width, indices[mapped_dim],
                      buffer);
@@ -196,30 +190,10 @@ void AddRank2Candidate(std::vector<AccessTileCandidate> *candidates,
     return;
   }
 
-  if (!CanProveDivisible(analyzer, buffer->shape[mapped_width_dim],
-                         tile_width)) {
-    ICHECK(!strict_checks) << "Buffer width dimension " << mapped_width_dim
-                           << " of buffer " << buffer->name
-                           << " is not divisible by tile width " << tile_width
-                           << ".";
-    return;
-  }
-
   if (strict_checks) {
     RequireDivisible(analyzer, width_binding.offset, tile_width,
                      indices[mapped_width_dim], buffer);
   } else if (!CanProveDivisible(analyzer, width_binding.offset, tile_width)) {
-    return;
-  }
-
-  if (strict_checks) {
-    ICHECK(CanProveDivisible(analyzer, buffer->shape[mapped_height_dim],
-                             tile_height))
-        << "Buffer height dimension " << mapped_height_dim << " of buffer "
-        << buffer->name << " is not divisible by tile height " << tile_height
-        << ".";
-  } else if (!CanProveDivisible(analyzer, buffer->shape[mapped_height_dim],
-                                tile_height)) {
     return;
   }
 
@@ -275,9 +249,7 @@ std::vector<AccessTileCandidate> EnumerateManualCandidates(
   std::vector<AccessTileCandidate> candidates;
   TrailingTilePattern pattern = ValidateManualTrailingTileView(
       buffer, manual_tv, exec_rank, layout_map, config, analyzer,
-      "TileView inside T.Tiles",
-      /*enforce_blockwise_width_for_rank1=*/
-      static_cast<int>(buffer->shape.size()) >= 2);
+      "TileView inside T.Tiles");
   AddCandidateFromPattern(&candidates, buffer, indices, bindings, pattern,
                           analyzer, /*strict_checks=*/true);
   return candidates;
@@ -287,11 +259,12 @@ std::vector<AccessTileCandidate> EnumerateInferredCandidates(
     const Buffer &buffer, const Array<PrimExpr> &indices,
     const std::vector<IndexBinding> &bindings, int exec_rank,
     const Map<Buffer, Layout> &layout_map,
-    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer) {
+    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
+    AlignmentMode alignment_mode = AlignmentMode::kStrict) {
   std::vector<AccessTileCandidate> candidates;
   for (const TrailingTilePattern &pattern :
-       EnumerateInferredTrailingTilePatterns(buffer, exec_rank, layout_map,
-                                             config, analyzer)) {
+       EnumerateInferredTrailingTilePatterns(
+           buffer, exec_rank, layout_map, config, analyzer, alignment_mode)) {
     AddCandidateFromPattern(&candidates, buffer, indices, bindings, pattern,
                             analyzer, /*strict_checks=*/false);
   }
@@ -302,7 +275,8 @@ std::vector<AccessTileCandidate> EnumerateAccessTileCandidates(
     const BufferAccessRecord &access, const std::vector<IndexBinding> &bindings,
     int exec_rank, const TileViewMap &manual_tileviews,
     const Map<Buffer, Layout> &layout_map,
-    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer) {
+    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
+    AlignmentMode alignment_mode = AlignmentMode::kStrict) {
   auto manual_it = manual_tileviews.find(access.buffer->data);
   if (manual_it != manual_tileviews.end()) {
     return EnumerateManualCandidates(access.buffer, access.indices, bindings,
@@ -311,7 +285,26 @@ std::vector<AccessTileCandidate> EnumerateAccessTileCandidates(
   }
 
   return EnumerateInferredCandidates(access.buffer, access.indices, bindings,
-                                     exec_rank, layout_map, config, analyzer);
+                                     exec_rank, layout_map, config, analyzer,
+                                     alignment_mode);
+}
+
+bool IsEligibleRank1LoadForRelaxedAlignmentSearch(
+    const BufferAccessRecord &access, const std::vector<IndexBinding> &bindings,
+    int exec_rank) {
+  if (access.is_store || exec_rank != 2 || access.buffer->shape.size() != 1 ||
+      access.indices.size() != 1 || bindings.size() != 1) {
+    return false;
+  }
+
+  const IndexBinding &binding = bindings[0];
+  return binding.uses_loop_var && binding.domain_axis >= 0;
+}
+
+const std::vector<AccessTileCandidate> &
+CandidatesForSearch(const AccessInfo &access, AlignmentMode mode) {
+  return mode == AlignmentMode::kRelaxed ? access.relaxed_candidates
+                                         : access.strict_candidates;
 }
 
 bool UsesExecutionAxisInNonTiledDims(const AccessTileCandidate &candidate,
@@ -364,9 +357,9 @@ bool Supports2DPlan(const AccessTileCandidate &candidate,
 }
 
 std::vector<ExecutionPlanCandidate>
-CollectRank2PlanCandidates(const AccessInfo &access) {
+CollectRank2PlanCandidates(const std::vector<AccessTileCandidate> &candidates) {
   std::vector<ExecutionPlanCandidate> plans;
-  for (const auto &candidate : access.candidates) {
+  for (const auto &candidate : candidates) {
     if (candidate.tile_shape.size() != 2) {
       continue;
     }
@@ -381,6 +374,181 @@ CollectRank2PlanCandidates(const AccessInfo &access) {
     }
   }
   return plans;
+}
+
+std::optional<TileViewPlan>
+TrySelectPlan(const Array<PrimExpr> &domain,
+              const std::vector<AccessInfo> &accesses, int domain_rank,
+              int exec_rank, arith::Analyzer *analyzer, AlignmentMode mode,
+              bool fail_on_error) {
+  for (const auto &access : accesses) {
+    if (CandidatesForSearch(access, mode).empty()) {
+      if (fail_on_error) {
+        LOG(FATAL)
+            << "Cannot infer any feasible TileView candidate for access to "
+               "buffer "
+            << access.buffer->name << " with indices " << access.indices << ".";
+      }
+      return std::nullopt;
+    }
+  }
+
+  if (exec_rank == 1) {
+    std::vector<int> plan_extents;
+    for (const auto &access : accesses) {
+      for (const auto &candidate : CandidatesForSearch(access, mode)) {
+        if (Supports1DPlan(candidate)) {
+          plan_extents.push_back(candidate.tile_shape[0]);
+        }
+      }
+    }
+
+    if (plan_extents.empty()) {
+      if (fail_on_error) {
+        LOG(FATAL) << "Cannot infer any feasible 1D execution tileview for "
+                      "T.Tiles domain "
+                   << domain << ".";
+      }
+      return std::nullopt;
+    }
+
+    std::sort(plan_extents.begin(), plan_extents.end());
+    plan_extents.erase(std::unique(plan_extents.begin(), plan_extents.end()),
+                       plan_extents.end());
+    std::sort(plan_extents.begin(), plan_extents.end(), std::greater<int>());
+
+    for (int tile_extent : plan_extents) {
+      bool all_supported = true;
+      for (const auto &access : accesses) {
+        const auto &candidates = CandidatesForSearch(access, mode);
+        bool access_supported =
+            std::any_of(candidates.begin(), candidates.end(),
+                        [&](const AccessTileCandidate &candidate) {
+                          return Supports1DPlan(candidate, tile_extent);
+                        });
+        if (!access_supported) {
+          all_supported = false;
+          break;
+        }
+      }
+
+      if (all_supported) {
+        return TileViewPlan{
+            makeTileView(domain, {Integer(tile_extent)}, {Integer(-1)}), {0}};
+      }
+    }
+
+    if (fail_on_error) {
+      LOG(FATAL) << "Cannot infer a common 1D execution tileview for T.Tiles "
+                 << "domain " << domain
+                 << ". The per-access feasible tileview sets do not intersect.";
+    }
+    return std::nullopt;
+  }
+
+  std::vector<ExecutionPlanCandidate> plan_candidates;
+  bool saw_rank2_candidates = false;
+  for (const auto &access : accesses) {
+    std::vector<ExecutionPlanCandidate> access_plan_candidates =
+        CollectRank2PlanCandidates(CandidatesForSearch(access, mode));
+    if (access_plan_candidates.empty()) {
+      continue;
+    }
+
+    if (!saw_rank2_candidates) {
+      plan_candidates = std::move(access_plan_candidates);
+      saw_rank2_candidates = true;
+      continue;
+    }
+
+    std::vector<ExecutionPlanCandidate> common_plan_candidates;
+    for (const auto &plan_candidate : plan_candidates) {
+      bool supported = std::any_of(
+          access_plan_candidates.begin(), access_plan_candidates.end(),
+          [&](const ExecutionPlanCandidate &access_plan_candidate) {
+            return SameIntVector(plan_candidate.execution_domain_axes,
+                                 access_plan_candidate.execution_domain_axes) &&
+                   SameIntVector(plan_candidate.tile_shape,
+                                 access_plan_candidate.tile_shape);
+          });
+      if (supported) {
+        common_plan_candidates.push_back(plan_candidate);
+      }
+    }
+    plan_candidates = std::move(common_plan_candidates);
+  }
+
+  if (!saw_rank2_candidates) {
+    if (fail_on_error) {
+      LOG(FATAL)
+          << "2D T.Tiles requires at least one access with a feasible rank-2 "
+             "TileView candidate.";
+    }
+    return std::nullopt;
+  }
+
+  if (plan_candidates.empty()) {
+    if (fail_on_error) {
+      LOG(FATAL)
+          << "Cannot infer a common execution tileview for T.Tiles domain "
+          << domain
+          << ". The rank-2 access candidates do not share a common axis "
+             "binding and tile shape.";
+    }
+    return std::nullopt;
+  }
+
+  std::sort(
+      plan_candidates.begin(), plan_candidates.end(),
+      [](const ExecutionPlanCandidate &lhs, const ExecutionPlanCandidate &rhs) {
+        int lhs_elems = TileElements(lhs.tile_shape);
+        int rhs_elems = TileElements(rhs.tile_shape);
+        if (lhs_elems != rhs_elems) {
+          return lhs_elems > rhs_elems;
+        }
+        if (lhs.tile_shape[0] != rhs.tile_shape[0]) {
+          return lhs.tile_shape[0] > rhs.tile_shape[0];
+        }
+        if (lhs.tile_shape[1] != rhs.tile_shape[1]) {
+          return lhs.tile_shape[1] > rhs.tile_shape[1];
+        }
+        return lhs.execution_domain_axes < rhs.execution_domain_axes;
+      });
+
+  for (const auto &plan_candidate : plan_candidates) {
+    const auto &exec_domain_axes = plan_candidate.execution_domain_axes;
+    int tile_height = plan_candidate.tile_shape[0];
+    int tile_width = plan_candidate.tile_shape[1];
+
+    bool all_supported = true;
+    for (const auto &access : accesses) {
+      const auto &candidates = CandidatesForSearch(access, mode);
+      bool access_supported =
+          std::any_of(candidates.begin(), candidates.end(),
+                      [&](const AccessTileCandidate &candidate) {
+                        return Supports2DPlan(candidate, plan_candidate);
+                      });
+      if (!access_supported) {
+        all_supported = false;
+        break;
+      }
+    }
+
+    if (all_supported) {
+      return TileViewPlan{
+          makeTileView(domain, {Integer(tile_height), Integer(tile_width)},
+                       {Integer(exec_domain_axes[0] - domain_rank),
+                        Integer(exec_domain_axes[1] - domain_rank)}),
+          exec_domain_axes};
+    }
+  }
+
+  if (fail_on_error) {
+    LOG(FATAL) << "Cannot infer a common execution tileview for T.Tiles domain "
+               << domain
+               << ". The per-access feasible tileview sets do not intersect.";
+  }
+  return std::nullopt;
 }
 
 } // namespace
@@ -425,152 +593,33 @@ TileViewPlan PlanTileViewsForTilesScope(
     std::vector<AccessTileCandidate> candidates = EnumerateAccessTileCandidates(
         access, bindings, exec_rank, manual_tileviews, layout_map,
         tile_processor_config, &analyzer);
-    ICHECK(!candidates.empty())
-        << "Cannot infer any feasible TileView candidate for access to buffer "
-        << access.buffer->name << " with indices " << access.indices << ".";
+    std::vector<AccessTileCandidate> relaxed_candidates = candidates;
+    if (IsEligibleRank1LoadForRelaxedAlignmentSearch(access, bindings,
+                                                     exec_rank)) {
+      relaxed_candidates = EnumerateAccessTileCandidates(
+          access, bindings, exec_rank, manual_tileviews, layout_map,
+          tile_processor_config, &analyzer, AlignmentMode::kRelaxed);
+    }
+
     analyzed_accesses.push_back({access.buffer, access.indices,
-                                 std::move(bindings), std::move(candidates)});
+                                 std::move(candidates),
+                                 std::move(relaxed_candidates)});
   }
 
-  if (exec_rank == 1) {
-    std::vector<int> plan_extents;
-    for (const auto &access : analyzed_accesses) {
-      for (const auto &candidate : access.candidates) {
-        if (Supports1DPlan(candidate)) {
-          plan_extents.push_back(candidate.tile_shape[0]);
-        }
-      }
-    }
-
-    ICHECK(!plan_extents.empty())
-        << "Cannot infer any feasible 1D execution tileview for T.Tiles domain "
-        << domain << ".";
-
-    std::sort(plan_extents.begin(), plan_extents.end());
-    plan_extents.erase(std::unique(plan_extents.begin(), plan_extents.end()),
-                       plan_extents.end());
-    std::sort(plan_extents.begin(), plan_extents.end(), std::greater<int>());
-
-    for (int tile_extent : plan_extents) {
-      bool all_supported = true;
-      for (const auto &access : analyzed_accesses) {
-        bool access_supported =
-            std::any_of(access.candidates.begin(), access.candidates.end(),
-                        [&](const AccessTileCandidate &candidate) {
-                          return Supports1DPlan(candidate, tile_extent);
-                        });
-        if (!access_supported) {
-          all_supported = false;
-          break;
-        }
-      }
-
-      if (all_supported) {
-        return {makeTileView(domain, {Integer(tile_extent)}, {Integer(-1)}),
-                {0}};
-      }
-    }
-
-    LOG(FATAL) << "Cannot infer a common 1D execution tileview for T.Tiles "
-               << "domain " << domain
-               << ". The per-access feasible tileview sets do not intersect.";
-    return {TileView(), {}};
+  if (auto plan = TrySelectPlan(domain, analyzed_accesses, domain_rank,
+                                exec_rank, &analyzer, AlignmentMode::kStrict,
+                                /*fail_on_error=*/false)) {
+    return plan.value();
   }
 
-  std::vector<ExecutionPlanCandidate> plan_candidates;
-  bool saw_rank2_candidates = false;
-  for (const auto &access : analyzed_accesses) {
-    std::vector<ExecutionPlanCandidate> access_plan_candidates =
-        CollectRank2PlanCandidates(access);
-    if (access_plan_candidates.empty()) {
-      continue;
-    }
-
-    if (!saw_rank2_candidates) {
-      plan_candidates = std::move(access_plan_candidates);
-      saw_rank2_candidates = true;
-      continue;
-    }
-
-    std::vector<ExecutionPlanCandidate> common_plan_candidates;
-    for (const auto &plan_candidate : plan_candidates) {
-      bool supported = std::any_of(
-          access_plan_candidates.begin(), access_plan_candidates.end(),
-          [&](const ExecutionPlanCandidate &access_plan_candidate) {
-            return SameIntVector(plan_candidate.execution_domain_axes,
-                                 access_plan_candidate.execution_domain_axes) &&
-                   SameIntVector(plan_candidate.tile_shape,
-                                 access_plan_candidate.tile_shape);
-          });
-      if (supported) {
-        common_plan_candidates.push_back(plan_candidate);
-      }
-    }
-    plan_candidates = std::move(common_plan_candidates);
+  if (auto plan = TrySelectPlan(domain, analyzed_accesses, domain_rank,
+                                exec_rank, &analyzer, AlignmentMode::kRelaxed,
+                                /*fail_on_error=*/false)) {
+    return plan.value();
   }
 
-  ICHECK(saw_rank2_candidates)
-      << "2D T.Tiles requires at least one access with a feasible rank-2 "
-         "TileView candidate.";
-  ICHECK(!plan_candidates.empty())
-      << "Cannot infer a common execution tileview for T.Tiles domain "
-      << domain
-      << ". The rank-2 access candidates do not share a common axis binding "
-         "and tile shape.";
-
-  std::sort(
-      plan_candidates.begin(), plan_candidates.end(),
-      [](const ExecutionPlanCandidate &lhs, const ExecutionPlanCandidate &rhs) {
-        int lhs_elems = TileElements(lhs.tile_shape);
-        int rhs_elems = TileElements(rhs.tile_shape);
-        if (lhs_elems != rhs_elems) {
-          return lhs_elems > rhs_elems;
-        }
-        if (lhs.tile_shape[0] != rhs.tile_shape[0]) {
-          return lhs.tile_shape[0] > rhs.tile_shape[0];
-        }
-        if (lhs.tile_shape[1] != rhs.tile_shape[1]) {
-          return lhs.tile_shape[1] > rhs.tile_shape[1];
-        }
-        return lhs.execution_domain_axes < rhs.execution_domain_axes;
-      });
-
-  for (const auto &plan_candidate : plan_candidates) {
-    const auto &exec_domain_axes = plan_candidate.execution_domain_axes;
-    int tile_height = plan_candidate.tile_shape[0];
-    int tile_width = plan_candidate.tile_shape[1];
-
-    if (!CanProveDivisible(&analyzer, domain[exec_domain_axes[0]],
-                           tile_height) ||
-        !CanProveDivisible(&analyzer, domain[exec_domain_axes[1]],
-                           tile_width)) {
-      continue;
-    }
-
-    bool all_supported = true;
-    for (const auto &access : analyzed_accesses) {
-      bool access_supported =
-          std::any_of(access.candidates.begin(), access.candidates.end(),
-                      [&](const AccessTileCandidate &candidate) {
-                        return Supports2DPlan(candidate, plan_candidate);
-                      });
-      if (!access_supported) {
-        all_supported = false;
-        break;
-      }
-    }
-
-    if (all_supported) {
-      return {makeTileView(domain, {Integer(tile_height), Integer(tile_width)},
-                           {Integer(exec_domain_axes[0] - domain_rank),
-                            Integer(exec_domain_axes[1] - domain_rank)}),
-              exec_domain_axes};
-    }
-  }
-
-  LOG(FATAL) << "Cannot infer a common execution tileview for T.Tiles domain "
-             << domain
-             << ". The per-access feasible tileview sets do not intersect.";
+  TrySelectPlan(domain, analyzed_accesses, domain_rank, exec_rank, &analyzer,
+                AlignmentMode::kRelaxed, /*fail_on_error=*/true);
   return {TileView(), {}};
 }
 
