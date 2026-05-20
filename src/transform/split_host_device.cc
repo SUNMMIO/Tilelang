@@ -328,6 +328,62 @@ private:
     return RemapSimpleAttrValue(value, var_remap, remap_buffer);
   }
 
+  class BufferRefReplacer : public tir::StmtExprMutator {
+  public:
+    explicit BufferRefReplacer(Map<tir::Buffer, tir::Buffer> buffer_remap)
+        : buffer_remap_(std::move(buffer_remap)) {}
+
+  private:
+    tir::Buffer RemapBuffer(const tir::Buffer &buffer) {
+      if (buffer_remap_.count(buffer)) {
+        return buffer_remap_[buffer];
+      }
+      return buffer;
+    }
+
+    PrimExpr VisitExpr_(const tir::BufferLoadNode *op) final {
+      tir::BufferLoad load =
+          Downcast<tir::BufferLoad>(tir::StmtExprMutator::VisitExpr_(op));
+      tir::Buffer new_buffer = RemapBuffer(load->buffer);
+      if (!new_buffer.same_as(load->buffer)) {
+        load.CopyOnWrite()->buffer = new_buffer;
+      }
+      return load;
+    }
+
+    tir::Stmt VisitStmt_(const tir::BufferStoreNode *op) final {
+      tir::BufferStore store =
+          Downcast<tir::BufferStore>(tir::StmtExprMutator::VisitStmt_(op));
+      tir::Buffer new_buffer = RemapBuffer(store->buffer);
+      if (!new_buffer.same_as(store->buffer)) {
+        store.CopyOnWrite()->buffer = new_buffer;
+      }
+      return store;
+    }
+
+    tir::Stmt VisitStmt_(const tir::DeclBufferNode *op) final {
+      tir::DeclBuffer decl =
+          Downcast<tir::DeclBuffer>(tir::StmtExprMutator::VisitStmt_(op));
+      tir::Buffer new_buffer = RemapBuffer(decl->buffer);
+      if (!new_buffer.same_as(decl->buffer)) {
+        decl.CopyOnWrite()->buffer = new_buffer;
+      }
+      return decl;
+    }
+
+    tir::Stmt VisitStmt_(const tir::BufferRealizeNode *op) final {
+      tir::BufferRealize realize =
+          Downcast<tir::BufferRealize>(tir::StmtExprMutator::VisitStmt_(op));
+      tir::Buffer new_buffer = RemapBuffer(realize->buffer);
+      if (!new_buffer.same_as(realize->buffer)) {
+        realize.CopyOnWrite()->buffer = new_buffer;
+      }
+      return realize;
+    }
+
+    Map<tir::Buffer, tir::Buffer> buffer_remap_;
+  };
+
   tir::Stmt SplitDeviceFunc(tir::Stmt body, tvm::Target device_target) {
     // First, analyze undefined variables in the device body
     auto [old_params, buffers_to_declare] =
@@ -364,9 +420,6 @@ private:
       var_remap.Set(old_var, new_var);
       name_to_var[old_var->name_hint] = new_var;
     }
-
-    // Substitute old variables with new ones in the body
-    body = tir::Substitute(body, var_remap);
 
     // Remap buffers to use new variables.  Keep a cache so DeclBuffer and
     // function attributes that reference the same old Buffer also share the
@@ -406,6 +459,14 @@ private:
       new_buffers_to_declare.push_back(remap_buffer(buf));
     }
     buffers_to_declare = new_buffers_to_declare;
+
+    // Remap buffer references explicitly before substituting Vars.  The
+    // remapped buffers already contain the new parameter Vars, so Substitute
+    // will not create a second set of remapped Buffer objects.
+    body = BufferRefReplacer(buffer_remap)(body);
+
+    // Substitute old variables with new ones in the body
+    body = tir::Substitute(body, var_remap);
 
     // CodeGenCPU is used for some device-side targets, such as
     // "ext_dev", and expects to be able to return a int32_t status

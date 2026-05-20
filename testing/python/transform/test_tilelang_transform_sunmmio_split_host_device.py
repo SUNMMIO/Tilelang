@@ -54,6 +54,28 @@ def get_param_by_name(func, name):
     return None
 
 
+def collect_declared_buffers(stmt):
+    buffers = []
+
+    def visit(node):
+        if isinstance(node, tir.DeclBuffer):
+            buffers.append(node.buffer)
+
+    tir.stmt_functor.post_order_visit(stmt, visit)
+    return buffers
+
+
+def collect_accessed_buffers(stmt):
+    buffers = []
+
+    def visit(node):
+        if isinstance(node, (tir.BufferLoad, tir.BufferStore)):
+            buffers.append(node.buffer)
+
+    tir.stmt_functor.post_order_visit(stmt, visit)
+    return buffers
+
+
 def run_sunmmio_split(mod, *, hoist=False):
     target = make_sunmmio_target_with_host()
     with tvm.target.Target(target):
@@ -130,6 +152,47 @@ def test_sunmmio_split_host_device_preserves_cute_layout_attr_type():
     assert list(remapped_layout.mode_shape) == list(layout.mode_shape)
     assert list(remapped_layout.mode_stride) == list(layout.mode_stride)
     assert list(remapped_layout.dim_levels) == list(layout.dim_levels)
+
+
+def test_sunmmio_split_host_device_decl_body_and_attrs_use_same_buffer():
+    @T.prim_func
+    def before(A: T.Buffer((16, 16), "float32")):
+        with T.Kernel(1):
+            A[0, 0] = A[0, 0]
+
+    func = before.with_attr("global_symbol", "main")
+    buffer = func.buffer_map[func.params[0]]
+    layout = CuteLayout([16, 16], [4, 4, 16], [64, 16, 1], [2, 1])._inner
+    func = (
+        func.with_attr("layout_map", {buffer: layout})
+        .with_attr("buffer_attr", buffer)
+        .with_attr("tl.device_func_attr_keys", ["layout_map", "buffer_attr"])
+    )
+
+    mod = run_sunmmio_split(tvm.IRModule.from_expr(func))
+    device_func = get_device_func(mod)
+
+    layout_buffer = next(iter(device_func.attrs["layout_map"].keys()))
+    attr_buffer = device_func.attrs["buffer_attr"]
+    assert isinstance(layout_buffer, tir.Buffer)
+    assert isinstance(attr_buffer, tir.Buffer)
+    assert layout_buffer.same_as(attr_buffer)
+
+    declared_buffers = collect_declared_buffers(device_func.body)
+    accessed_buffers = collect_accessed_buffers(device_func.body)
+    assert declared_buffers, "Expected device body to declare parameter buffers"
+    assert accessed_buffers, "Expected device body to access the parameter buffer"
+
+    declared_attr_buffers = [buffer for buffer in declared_buffers if buffer.name == attr_buffer.name]
+    accessed_attr_buffers = [buffer for buffer in accessed_buffers if buffer.name == attr_buffer.name]
+    assert declared_attr_buffers, "Expected DeclBuffer for the func_attr buffer"
+    assert accessed_attr_buffers, "Expected body accesses for the func_attr buffer"
+    assert all(buffer.same_as(attr_buffer) for buffer in declared_attr_buffers), (
+        "func_attr buffer should be the same object as every same-name DeclBuffer buffer"
+    )
+    assert all(buffer.same_as(attr_buffer) for buffer in accessed_attr_buffers), (
+        "func_attr buffer should be the same object as every same-name body access buffer"
+    )
 
 
 def test_sunmmio_split_host_device_remaps_marked_simple_attrs():
