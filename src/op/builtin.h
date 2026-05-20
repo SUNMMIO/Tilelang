@@ -32,6 +32,10 @@ static constexpr const char *kLocalVarInit = "tl.local_var_init";
 // that must NOT be marked with the restrict qualifier in codegen.
 // Type: Array<tir::Var>
 static constexpr const char *kNonRestrictParams = "tl.non_restrict_params";
+// A PrimFunc-level internal marker listing attrs that SplitHostDevice should
+// propagate to generated device functions.
+// Type: Array<String>
+static constexpr const char *kDeviceFuncAttrKeys = "tl.device_func_attr_keys";
 } // namespace attr
 
 static constexpr const char *kDebugMergeSharedMemoryAllocations =

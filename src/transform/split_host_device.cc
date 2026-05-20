@@ -33,6 +33,12 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <functional>
+#include <optional>
+#include <utility>
+
+#include "../layout/cute_layout.h"
+#include "../layout/layout.h"
 #include "../op/builtin.h"
 #include "common/assume.h"
 #include "tir/analysis/var_use_def_analysis.h"
@@ -62,6 +68,10 @@ public:
     for (auto param : params.value()) {
       non_restrict_params_.push_back(param);
     }
+  }
+
+  void SetExtraDeviceFuncAttrs(Map<String, Any> attrs) {
+    extra_device_func_attrs_ = std::move(attrs);
   }
 
   tir::Stmt VisitStmt_(const tir::AttrStmtNode *op) final {
@@ -134,6 +144,246 @@ private:
     return body;
   }
 
+  static Layout RemapLayout(const Layout &layout,
+                            const Map<tir::Var, PrimExpr> &var_remap) {
+    auto substitute = [&](const PrimExpr &expr) {
+      return tir::Substitute(expr, var_remap);
+    };
+
+    Array<PrimExpr> input_size = layout->InputShape().Map(
+        [&](const PrimExpr &expr) { return substitute(expr); });
+    Array<PrimExpr> forward_index = layout->GetForwardIndex().Map(
+        [&](const PrimExpr &expr) { return substitute(expr); });
+
+    if (auto cute = layout.as<CuteLayoutNode>()) {
+      Array<PrimExpr> logical_shape = cute->GetLogicalShape().Map(
+          [&](const PrimExpr &expr) { return substitute(expr); });
+      Array<PrimExpr> mode_shape = cute->GetModeShape().Map(
+          [&](const PrimExpr &expr) { return substitute(expr); });
+      Array<PrimExpr> mode_stride = cute->GetModeStride().Map(
+          [&](const PrimExpr &expr) { return substitute(expr); });
+      return CuteLayout(logical_shape, mode_shape, mode_stride,
+                        cute->GetDimLevels());
+    }
+
+    if (auto fragment = layout.as<FragmentNode>()) {
+      Fragment remapped(input_size, forward_index,
+                        substitute(fragment->GetForwardThread()),
+                        substitute(fragment->ReplicateExtent()), std::nullopt);
+      Range thread_range = fragment->ThreadRange();
+      if (thread_range.defined()) {
+        remapped = remapped->BindThreadRange(Range(
+            substitute(thread_range->min), substitute(thread_range->extent)));
+      }
+      return remapped;
+    }
+
+    return Layout(input_size, forward_index);
+  }
+
+  Any RemapLayoutMapAttr(
+      const String &key, const Any &value,
+      const Map<tir::Var, PrimExpr> &var_remap,
+      const std::function<tir::Buffer(const tir::Buffer &)> &remap_buffer) {
+    if (auto layout_map = value.as<Map<tir::Buffer, Layout>>()) {
+      Map<tir::Buffer, Layout> remapped_layout_map;
+      for (const auto &[buffer, layout] : layout_map.value()) {
+        remapped_layout_map.Set(remap_buffer(buffer),
+                                RemapLayout(layout, var_remap));
+      }
+      return remapped_layout_map;
+    }
+
+    if (auto layout_map = value.as<Map<tir::Var, Layout>>()) {
+      Map<tir::Var, Layout> remapped_layout_map;
+      for (const auto &[var, layout] : layout_map.value()) {
+        tir::Var remapped_var = var;
+        if (var_remap.count(var)) {
+          remapped_var = Downcast<tir::Var>(var_remap[var]);
+        }
+        remapped_layout_map.Set(remapped_var, RemapLayout(layout, var_remap));
+      }
+      return remapped_layout_map;
+    }
+
+    LOG(FATAL) << "Unsupported `" << key
+               << "` attr type for device function propagation: "
+               << value.GetTypeKey();
+    return Any();
+  }
+
+  struct SimpleAttrRemapResult {
+    Any value;
+    bool changed{false};
+  };
+
+  static std::optional<SimpleAttrRemapResult> TryRemapSimpleScalarAttrValue(
+      const Any &value, const Map<tir::Var, PrimExpr> &var_remap,
+      const std::function<tir::Buffer(const tir::Buffer &)> &remap_buffer) {
+    if (auto var = value.as<tir::Var>()) {
+      tir::Var remapped_var = var.value();
+      if (var_remap.count(var.value())) {
+        remapped_var = Downcast<tir::Var>(var_remap[var.value()]);
+      }
+      return SimpleAttrRemapResult{remapped_var,
+                                   !remapped_var.same_as(var.value())};
+    }
+
+    if (auto buffer = value.as<tir::Buffer>()) {
+      tir::Buffer remapped_buffer = remap_buffer(buffer.value());
+      return SimpleAttrRemapResult{remapped_buffer,
+                                   !remapped_buffer.same_as(buffer.value())};
+    }
+
+    if (auto expr = value.as<PrimExpr>()) {
+      PrimExpr remapped_expr = tir::Substitute(expr.value(), var_remap);
+      return SimpleAttrRemapResult{remapped_expr,
+                                   !remapped_expr.same_as(expr.value())};
+    }
+
+    return std::nullopt;
+  }
+
+  static std::optional<SimpleAttrRemapResult> TryRemapSimpleArrayAttrValue(
+      const Any &value, const Map<tir::Var, PrimExpr> &var_remap,
+      const std::function<tir::Buffer(const tir::Buffer &)> &remap_buffer) {
+    if (auto array = value.as<Array<Any>>()) {
+      Array<Any> remapped_array;
+      bool changed = false;
+      for (const Any &item : array.value()) {
+        auto remapped_item =
+            TryRemapSimpleScalarAttrValue(item, var_remap, remap_buffer);
+        if (remapped_item) {
+          remapped_array.push_back(remapped_item->value);
+          changed = changed || remapped_item->changed;
+        } else {
+          remapped_array.push_back(item);
+        }
+      }
+      if (changed) {
+        return SimpleAttrRemapResult{remapped_array, true};
+      }
+      return SimpleAttrRemapResult{value, false};
+    }
+
+    return std::nullopt;
+  }
+
+  static std::optional<SimpleAttrRemapResult> TryRemapSimpleMapAttrValue(
+      const Any &value, const Map<tir::Var, PrimExpr> &var_remap,
+      const std::function<tir::Buffer(const tir::Buffer &)> &remap_buffer) {
+    if (auto map = value.as<Map<Any, Any>>()) {
+      Map<Any, Any> remapped_map;
+      bool changed = false;
+      for (const auto &[key, map_value] : map.value()) {
+        auto remapped_key =
+            TryRemapSimpleScalarAttrValue(key, var_remap, remap_buffer);
+        auto remapped_value =
+            TryRemapSimpleScalarAttrValue(map_value, var_remap, remap_buffer);
+        const Any &new_key = remapped_key ? remapped_key->value : key;
+        const Any &new_value =
+            remapped_value ? remapped_value->value : map_value;
+        remapped_map.Set(new_key, new_value);
+        changed = changed || (remapped_key && remapped_key->changed) ||
+                  (remapped_value && remapped_value->changed);
+      }
+      if (changed) {
+        return SimpleAttrRemapResult{remapped_map, true};
+      }
+      return SimpleAttrRemapResult{value, false};
+    }
+
+    return std::nullopt;
+  }
+
+  static Any RemapSimpleAttrValue(
+      const Any &value, const Map<tir::Var, PrimExpr> &var_remap,
+      const std::function<tir::Buffer(const tir::Buffer &)> &remap_buffer) {
+    if (auto scalar =
+            TryRemapSimpleScalarAttrValue(value, var_remap, remap_buffer)) {
+      return scalar->value;
+    }
+    if (auto array =
+            TryRemapSimpleArrayAttrValue(value, var_remap, remap_buffer)) {
+      return array->value;
+    }
+    if (auto map = TryRemapSimpleMapAttrValue(value, var_remap, remap_buffer)) {
+      return map->value;
+    }
+    return value;
+  }
+
+  // Remap parameters. Special handling is applied to complex types based on
+  // specific keys. Primitive types (Var, Buffer, PrimExpr) are substituted
+  // directly. Container types (List, Map) are also remapped if they contain
+  // these primitive types. For Maps, supports replacing only the keys or only
+  // the values.
+  Any RemapDeviceFuncAttr(
+      const String &key, const Any &value,
+      const Map<tir::Var, PrimExpr> &var_remap,
+      const std::function<tir::Buffer(const tir::Buffer &)> &remap_buffer) {
+    if (key == tl::attr::kLayoutMap || key == tl::attr::kGlobalLayoutMap) {
+      return RemapLayoutMapAttr(key, value, var_remap, remap_buffer);
+    }
+    return RemapSimpleAttrValue(value, var_remap, remap_buffer);
+  }
+
+  class BufferRefReplacer : public tir::StmtExprMutator {
+  public:
+    explicit BufferRefReplacer(Map<tir::Buffer, tir::Buffer> buffer_remap)
+        : buffer_remap_(std::move(buffer_remap)) {}
+
+  private:
+    tir::Buffer RemapBuffer(const tir::Buffer &buffer) {
+      if (buffer_remap_.count(buffer)) {
+        return buffer_remap_[buffer];
+      }
+      return buffer;
+    }
+
+    PrimExpr VisitExpr_(const tir::BufferLoadNode *op) final {
+      tir::BufferLoad load =
+          Downcast<tir::BufferLoad>(tir::StmtExprMutator::VisitExpr_(op));
+      tir::Buffer new_buffer = RemapBuffer(load->buffer);
+      if (!new_buffer.same_as(load->buffer)) {
+        load.CopyOnWrite()->buffer = new_buffer;
+      }
+      return load;
+    }
+
+    tir::Stmt VisitStmt_(const tir::BufferStoreNode *op) final {
+      tir::BufferStore store =
+          Downcast<tir::BufferStore>(tir::StmtExprMutator::VisitStmt_(op));
+      tir::Buffer new_buffer = RemapBuffer(store->buffer);
+      if (!new_buffer.same_as(store->buffer)) {
+        store.CopyOnWrite()->buffer = new_buffer;
+      }
+      return store;
+    }
+
+    tir::Stmt VisitStmt_(const tir::DeclBufferNode *op) final {
+      tir::DeclBuffer decl =
+          Downcast<tir::DeclBuffer>(tir::StmtExprMutator::VisitStmt_(op));
+      tir::Buffer new_buffer = RemapBuffer(decl->buffer);
+      if (!new_buffer.same_as(decl->buffer)) {
+        decl.CopyOnWrite()->buffer = new_buffer;
+      }
+      return decl;
+    }
+
+    tir::Stmt VisitStmt_(const tir::BufferRealizeNode *op) final {
+      tir::BufferRealize realize =
+          Downcast<tir::BufferRealize>(tir::StmtExprMutator::VisitStmt_(op));
+      tir::Buffer new_buffer = RemapBuffer(realize->buffer);
+      if (!new_buffer.same_as(realize->buffer)) {
+        realize.CopyOnWrite()->buffer = new_buffer;
+      }
+      return realize;
+    }
+
+    Map<tir::Buffer, tir::Buffer> buffer_remap_;
+  };
+
   tir::Stmt SplitDeviceFunc(tir::Stmt body, tvm::Target device_target) {
     // First, analyze undefined variables in the device body
     auto [old_params, buffers_to_declare] =
@@ -171,12 +421,16 @@ private:
       name_to_var[old_var->name_hint] = new_var;
     }
 
-    // Substitute old variables with new ones in the body
-    body = tir::Substitute(body, var_remap);
+    // Remap buffers to use new variables.  Keep a cache so DeclBuffer and
+    // function attributes that reference the same old Buffer also share the
+    // same remapped Buffer.
+    Map<tir::Buffer, tir::Buffer> buffer_remap;
+    std::function<tir::Buffer(const tir::Buffer &)> remap_buffer =
+        [&](const tir::Buffer &buf) -> tir::Buffer {
+      if (buffer_remap.count(buf)) {
+        return buffer_remap[buf];
+      }
 
-    // Also remap buffers to use new variables
-    Array<tir::Buffer> new_buffers_to_declare;
-    for (const auto &buf : buffers_to_declare) {
       auto new_shape = buf->shape.Map(
           [&](const PrimExpr &e) { return tir::Substitute(e, var_remap); });
       auto new_strides = buf->strides.Map(
@@ -185,13 +439,34 @@ private:
       auto new_data = var_remap.count(buf->data)
                           ? Downcast<tir::Var>(var_remap[buf->data])
                           : buf->data;
+
+      if (new_data.same_as(buf->data) && new_shape.same_as(buf->shape) &&
+          new_strides.same_as(buf->strides) &&
+          new_elem_offset.same_as(buf->elem_offset)) {
+        return buf;
+      }
+
       tir::Buffer new_buf(new_data, buf->dtype, new_shape, new_strides,
                           new_elem_offset, buf->name, buf->data_alignment,
                           buf->offset_factor, buf->buffer_type,
                           buf->axis_separators, buf->span);
-      new_buffers_to_declare.push_back(new_buf);
+      buffer_remap.Set(buf, new_buf);
+      return new_buf;
+    };
+
+    Array<tir::Buffer> new_buffers_to_declare;
+    for (const auto &buf : buffers_to_declare) {
+      new_buffers_to_declare.push_back(remap_buffer(buf));
     }
     buffers_to_declare = new_buffers_to_declare;
+
+    // Remap buffer references explicitly before substituting Vars.  The
+    // remapped buffers already contain the new parameter Vars, so Substitute
+    // will not create a second set of remapped Buffer objects.
+    body = BufferRefReplacer(buffer_remap)(body);
+
+    // Substitute old variables with new ones in the body
+    body = tir::Substitute(body, var_remap);
 
     // CodeGenCPU is used for some device-side targets, such as
     // "ext_dev", and expects to be able to return a int32_t status
@@ -240,6 +515,14 @@ private:
          {tir::attr::kIsGlobalFunc, true},
          {tl::attr::kNonRestrictParams, remapped_non_restrict_params}});
 
+    Map<String, Any> remapped_extra_device_func_attrs;
+    for (const auto &[key, value] : extra_device_func_attrs_) {
+      remapped_extra_device_func_attrs.Set(
+          key, RemapDeviceFuncAttr(key, value, var_remap, remap_buffer));
+    }
+    device_func =
+        WithAttrs(std::move(device_func), remapped_extra_device_func_attrs);
+
     GlobalVar kernel_symbol_global = var_supply_();
     (*device_mod_)->Add(kernel_symbol_global, device_func);
     // Use old_params as call arguments (host-side variables)
@@ -268,11 +551,30 @@ private:
   std::function<GlobalVar()> var_supply_;
   // Collect assumes in host side
   Array<const tir::AttrStmtNode *> host_assumes_;
+  Map<String, Any> extra_device_func_attrs_;
 };
 
 tir::PrimFunc SplitHostDevice(tir::PrimFunc func, IRModule *device_mod,
                               std::function<GlobalVar()> var_supply) {
   HostDeviceSplitter splitter(device_mod, std::move(var_supply));
+  // 保存需要保留到device_function的属性
+  Map<String, Any> extra_device_func_attrs;
+  if (func->attrs.defined()) {
+    if (auto opt_keys =
+            func->GetAttr<Array<String>>(tl::attr::kDeviceFuncAttrKeys)) {
+      for (const String &key : opt_keys.value()) {
+        if (key == tl::attr::kDeviceFuncAttrKeys) {
+          continue;
+        }
+        if (auto it = func->attrs->dict.find(key);
+            it != func->attrs->dict.end()) {
+          extra_device_func_attrs.Set(key, (*it).second);
+        }
+      }
+    }
+  }
+  splitter.SetExtraDeviceFuncAttrs(std::move(extra_device_func_attrs));
+
   // Propagate non-restrict parameter list from host func to device kernels
   if (auto opt = func->GetAttr<Array<tir::Var>>(tl::attr::kNonRestrictParams)) {
     splitter.SetNonRestrictParams(opt.value());
@@ -295,6 +597,10 @@ tir::PrimFunc SplitHostDevice(tir::PrimFunc func, IRModule *device_mod,
         }
       }
     }
+  }
+  if (func->attrs.defined() &&
+      func->attrs->dict.count(tl::attr::kDeviceFuncAttrKeys)) {
+    func = tvm::WithoutAttr(std::move(func), tl::attr::kDeviceFuncAttrKeys);
   }
   return func;
 }

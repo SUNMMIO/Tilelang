@@ -555,6 +555,10 @@ def HoistNonRestrictParams():
     return _ffi_api.HoistNonRestrictParams()  # type: ignore
 
 
+def HoistBlockAnnotationsToFuncAttrs():
+    return _ffi_api.HoistBlockAnnotationsToFuncAttrs()  # type: ignore
+
+
 def StorageRewrite():
     """StorageRewrite
 
