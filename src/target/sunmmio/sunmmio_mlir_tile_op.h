@@ -1,5 +1,5 @@
-#ifndef TVM_TL_TARGET_SUNMMIO_MLIR_TILE_H_
-#define TVM_TL_TARGET_SUNMMIO_MLIR_TILE_H_
+#ifndef TVM_TL_TARGET_SUNMMIO_MLIR_TILE_OP_H_
+#define TVM_TL_TARGET_SUNMMIO_MLIR_TILE_OP_H_
 
 #include "codegen_sunmmio.h"
 #include "sunmmio_mlir_context.h"
@@ -7,9 +7,9 @@
 namespace tvm {
 namespace codegen {
 
-class SunmmioMlirTile {
+class SunmmioMlirTileOp {
 public:
-  explicit SunmmioMlirTile(SunmmioMlirContext &ctx);
+  explicit SunmmioMlirTileOp(SunmmioMlirContext &ctx);
 
   SunMMIOValue GetPartitionedTileView(const std::string &result_name,
                                       const SunMMIOValue &memtensor,
@@ -41,6 +41,10 @@ public:
                      const SunMMIOValue &data, const SunMMIOType &result_type,
                      DataType dtype);
 
+  SunMMIOValue Compare(const std::string &result_name, CompareOp op,
+                       CompareDomain domain, const SunMMIOValue &a,
+                       const SunMMIOValue &b, const SunMMIOType &operand_type);
+
   SunMMIOValue TileUnsqueeze(const std::string &result_name,
                              const SunMMIOValue &tile,
                              const SunMMIOType &tile_type, int64_t axis,
@@ -55,6 +59,26 @@ public:
                             const SunMMIOValue &valid_rows,
                             const SunMMIOValue &valid_cols,
                             const SunMMIOType &tile_type);
+
+  SunMMIOValue TileAxisMask(const std::string &result_name, int64_t axis,
+                            const SunMMIOValue &valid_extent,
+                            const SunMMIOType &tile_type);
+
+  SunMMIOValue TileMaskAnd(const std::string &result_name,
+                           const SunMMIOValue &lhs, const SunMMIOValue &rhs,
+                           const SunMMIOType &tile_type);
+
+  SunMMIOValue TileSelect(const std::string &result_name,
+                          const SunMMIOValue &mask,
+                          const SunMMIOValue &true_value,
+                          const SunMMIOValue &false_value,
+                          const SunMMIOType &result_type, DataType dtype);
+
+  SunMMIOValue TileReduce(const std::string &result_name,
+                          const std::string &predicate,
+                          const SunMMIOValue &data,
+                          const SunMMIOType &result_type, int64_t axis,
+                          DataType dtype);
 
   SunMMIOValue TileSqueeze(const std::string &result_name,
                            const SunMMIOValue &tile,
@@ -72,4 +96,4 @@ private:
 } // namespace codegen
 } // namespace tvm
 
-#endif // TVM_TL_TARGET_SUNMMIO_MLIR_TILE_H_
+#endif // TVM_TL_TARGET_SUNMMIO_MLIR_TILE_OP_H_

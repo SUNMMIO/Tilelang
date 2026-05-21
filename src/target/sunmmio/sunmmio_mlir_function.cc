@@ -5,8 +5,11 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Verifier.h"
+#include "npuir/Dialect/SUVM/IR/Attributes.h"
 #include "npuir/Dialect/SUVM/IR/Dialect.h"
 #include "npuir/Dialect/SUVM/IR/Types.h"
+
+#include <algorithm>
 
 namespace tvm {
 namespace codegen {
@@ -24,6 +27,9 @@ void SunmmioMlirFunction::BeginModule() {
   ctx_.mlir_ctx.getOrLoadDialect<mlir::affine::AffineDialect>();
 
   ctx_.module = mlir::ModuleOp::create(ctx_.builder.getUnknownLoc());
+  ctx_.module->getOperation()->setAttr(
+      "suvm.device_arch", mlir::suvm::DeviceArchAttr::get(
+                              &ctx_.mlir_ctx, mlir::suvm::DeviceArch::a4e));
   ctx_.builder.setInsertionPointToEnd(ctx_.module->getBody());
   current_func_ = mlir::func::FuncOp();
   ctx_.for_stack.clear();
@@ -119,8 +125,7 @@ void SunmmioMlirFunction::BeginFor(
   frame.iter_tokens.assign(for_op.getRegionIterArgs().begin(),
                            for_op.getRegionIterArgs().end());
   frame.produced_tokens.assign(frame.iter_tokens.size(), mlir::Value());
-  for (int i = 0, e = static_cast<int>(frame.live_out_token_ids.size()); i < e;
-       ++i) {
+  for (int i = 0, e = static_cast<int>(live_out_token_ids.size()); i < e; ++i) {
     frame.token_id_to_index[frame.live_out_token_ids[i]] = i;
   }
   ctx_.for_stack.push_back(std::move(frame));
@@ -129,6 +134,58 @@ void SunmmioMlirFunction::BeginFor(
       static_cast<int>(ctx_.for_stack.size()) - 1});
   ctx_.PushMLIRValueScope();
   ctx_.BindMLIRValue(iv, for_op.getInductionVar());
+  ctx_.builder.setInsertionPointToStart(for_op.getBody());
+}
+
+void SunmmioMlirFunction::BeginFor(
+    const std::string &iv, const SunMMIOValue &lb, const SunMMIOValue &ub,
+    const SunMMIOValue &step,
+    const ffi::Map<ffi::String, ffi::Any> &annotations,
+    const std::vector<SunMMIOValue> &live_out_values) {
+  mlir::Value lb_v = type_.EnsureIndex(
+      type_.ResolveValueOrCreatePlaceholder(lb, ctx_.builder.getIndexType()));
+  mlir::Value ub_v = type_.EnsureIndex(
+      type_.ResolveValueOrCreatePlaceholder(ub, ctx_.builder.getIndexType()));
+  mlir::Value step_v = type_.EnsureIndex(
+      type_.ResolveValueOrCreatePlaceholder(step, ctx_.builder.getIndexType()));
+
+  mlir::SmallVector<mlir::Value, 8> init_args;
+  init_args.reserve(live_out_values.size());
+  for (const SunMMIOValue &value : live_out_values) {
+    mlir::Type expected_type = type_.MapType(value.type);
+    mlir::Value init = ctx_.LookupMLIRValue(value.value);
+    if (!init) {
+      init = type_.ResolveValueOrCreatePlaceholder(value, expected_type);
+    }
+    init_args.push_back(init);
+  }
+
+  mlir::scf::ForOp for_op = mlir::scf::ForOp::create(
+      ctx_.builder, type_.Loc(), lb_v, ub_v, step_v, init_args);
+
+  SunmmioMlirContext::ForFrame frame;
+  frame.op = for_op;
+  frame.annotations = annotations;
+  frame.live_out_value_names.reserve(live_out_values.size());
+  for (const SunMMIOValue &value : live_out_values) {
+    frame.live_out_value_names.push_back(value.value);
+  }
+  frame.iter_tokens.assign(for_op.getRegionIterArgs().begin(),
+                           for_op.getRegionIterArgs().end());
+  frame.produced_tokens.assign(frame.iter_tokens.size(), mlir::Value());
+  ctx_.for_stack.push_back(std::move(frame));
+  ctx_.control_flow_stack.push_back(SunmmioMlirContext::ControlNode{
+      SunmmioMlirContext::ControlKind::kFor,
+      static_cast<int>(ctx_.for_stack.size()) - 1});
+  ctx_.PushMLIRValueScope();
+  ctx_.BindMLIRValue(iv, for_op.getInductionVar());
+  SunmmioMlirContext::ForFrame &active_frame = ctx_.for_stack.back();
+  for (int i = 0,
+           e = static_cast<int>(active_frame.live_out_value_names.size());
+       i < e; ++i) {
+    ctx_.BindMLIRValue(active_frame.live_out_value_names[i],
+                       active_frame.iter_tokens[i]);
+  }
   ctx_.builder.setInsertionPointToStart(for_op.getBody());
 }
 
@@ -228,6 +285,10 @@ void SunmmioMlirFunction::EndFor() {
     }
   }
   ctx_.PopMLIRValueScope();
+  for (int i = 0, e = static_cast<int>(frame.live_out_value_names.size());
+       i < e; ++i) {
+    ctx_.BindMLIRValue(frame.live_out_value_names[i], for_op.getResult(i));
+  }
 }
 
 void SunmmioMlirFunction::BeginIf(
@@ -302,6 +363,50 @@ void SunmmioMlirFunction::BeginIf(
   }
 }
 
+void SunmmioMlirFunction::BeginIf(
+    const SunMMIOValue &cond,
+    const std::vector<SunMMIOValue> &live_out_values) {
+  mlir::Value cond_v = type_.EnsureI1(
+      type_.ResolveValueOrCreatePlaceholder(cond, ctx_.builder.getI1Type()));
+  mlir::SmallVector<mlir::Type, 8> result_types;
+  result_types.reserve(live_out_values.size());
+  for (const SunMMIOValue &value : live_out_values) {
+    result_types.push_back(type_.MapType(value.type));
+  }
+
+  mlir::scf::IfOp if_op = mlir::scf::IfOp::create(ctx_.builder, type_.Loc(),
+                                                  result_types, cond_v, true);
+
+  ctx_.if_stack.emplace_back();
+  SunmmioMlirContext::IfFrame &frame = ctx_.if_stack.back();
+  frame.op = if_op;
+  frame.in_else = false;
+  frame.live_out_value_names.reserve(live_out_values.size());
+  frame.base_tokens.reserve(live_out_values.size());
+  frame.produced_tokens.reserve(live_out_values.size());
+  for (const SunMMIOValue &value : live_out_values) {
+    frame.live_out_value_names.push_back(value.value);
+    mlir::Value base = ctx_.LookupMLIRValue(value.value);
+    if (!base) {
+      base = type_.ResolveValueOrCreatePlaceholder(value,
+                                                   type_.MapType(value.type));
+    }
+    frame.base_tokens.push_back(base);
+  }
+
+  ctx_.control_flow_stack.push_back(SunmmioMlirContext::ControlNode{
+      SunmmioMlirContext::ControlKind::kIf,
+      static_cast<int>(ctx_.if_stack.size()) - 1});
+  ctx_.PushMLIRValueScope();
+  ctx_.builder.setInsertionPointToStart(&if_op.getThenRegion().front());
+
+  for (int i = 0, e = static_cast<int>(frame.live_out_value_names.size());
+       i < e; ++i) {
+    frame.produced_tokens.push_back(frame.base_tokens[i]);
+    ctx_.BindMLIRValue(frame.live_out_value_names[i], frame.base_tokens[i]);
+  }
+}
+
 void SunmmioMlirFunction::BeginElse() {
   if (ctx_.if_stack.empty()) {
     if (ctx_.module) {
@@ -336,6 +441,15 @@ void SunmmioMlirFunction::BeginElse() {
   mlir::Type token_ty = mlir::suvm::TokenType::get(&ctx_.mlir_ctx);
   frame.produced_tokens.clear();
   frame.produced_tokens.reserve(frame.live_out_token_ids.size());
+  if (!frame.live_out_value_names.empty()) {
+    frame.produced_tokens.reserve(frame.live_out_value_names.size());
+    for (int i = 0, e = static_cast<int>(frame.live_out_value_names.size());
+         i < e; ++i) {
+      ctx_.BindMLIRValue(frame.live_out_value_names[i], frame.base_tokens[i]);
+      frame.produced_tokens.push_back(frame.base_tokens[i]);
+    }
+    return;
+  }
   // Seed the else-branch scope from base_tokens (create suvm.null_token when
   // missing) and publish them into ctx_.token_by_id for in-branch lookups.
   for (int i = 0, e = static_cast<int>(frame.live_out_token_ids.size()); i < e;
@@ -467,8 +581,11 @@ void SunmmioMlirFunction::EndIf() {
       }
     }
   }
-
   ctx_.PopMLIRValueScope();
+  for (int i = 0, e = static_cast<int>(frame.live_out_value_names.size());
+       i < e; ++i) {
+    ctx_.BindMLIRValue(frame.live_out_value_names[i], if_op.getResult(i));
+  }
 }
 
 void SunmmioMlirFunction::EmitAssert(const SunMMIOValue &cond,

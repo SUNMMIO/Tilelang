@@ -132,6 +132,19 @@ void ApplyDebugRsramTailPadding(SunMMIOType *memtensor_type) {
       BuildFlatDimLevelsLocal(memtensor_type->shape.size());
 }
 
+bool IsSunmmioReduceRegisterTempBuffer(const tir::Buffer &buffer) {
+  if (!buffer.defined()) {
+    return false;
+  }
+  const std::string scope = buffer.scope();
+  if (scope != "shared.rsram" && scope != "rsram") {
+    return false;
+  }
+  const std::string name = buffer->name;
+  return name.size() >= 4 && (name.rfind("_acc") == name.size() - 4 ||
+                              name.rfind("_res") == name.size() - 4);
+}
+
 } // namespace
 
 CodeGenTileLangSunMMIO::CodeGenTileLangSunMMIO() = default;
@@ -857,7 +870,16 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
   EnterScope();
   auto buffer_it = buffer_data_to_buffer_.find(op->buffer_var.get());
   if (buffer_it != buffer_data_to_buffer_.end()) {
-    EmitAlloc(buffer_it->second, scope);
+    const tir::Buffer &buffer = buffer_it->second;
+    if (IsSunmmioReduceRegisterTempBuffer(buffer)) {
+      // TIR materializes reduce intermediates as alloc_buffer so the algorithm
+      // can be expressed with BufferLoad/Store.  On SunMMIO these values live
+      // in vector-core tile registers and are lowered inside the Tiles scope as
+      // SSA tiles, not as rsram memtensors.
+      RegisterBuffer(buffer, false);
+    } else {
+      EmitAlloc(buffer, scope);
+    }
   } else {
     LOG(FATAL) << "SunMMIO SUVM allocate cannot find buffer for variable "
                << op->buffer_var->name_hint;

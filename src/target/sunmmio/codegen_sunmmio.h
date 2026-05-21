@@ -23,7 +23,16 @@ namespace tvm {
 namespace codegen {
 
 enum class TileUnaryOp {
+  kAbs,
+  kCeil,
   kExp,
+  kFloor,
+  kLn,
+  kNeg,
+  kRecip,
+  kRound,
+  kRsqrt,
+  kTrunc,
 };
 
 class SunMMIOBuilder {
@@ -77,6 +86,9 @@ public:
                               const SunMMIOType &result_type,
                               DataType dtype) = 0;
 
+  virtual SunMMIOValue BindValueAlias(const std::string &result_name,
+                                      const SunMMIOValue &value) = 0;
+
   virtual SunMMIOValue Alloc(const std::string &result_name,
                              const SunMMIOType &memref_type,
                              const std::vector<SunMMIOValue> &dyn_extents,
@@ -123,6 +135,27 @@ public:
                                     const SunMMIOValue &valid_cols,
                                     const SunMMIOType &tile_type) = 0;
 
+  virtual SunMMIOValue TileAxisMask(const std::string &result_name,
+                                    int64_t axis,
+                                    const SunMMIOValue &valid_extent,
+                                    const SunMMIOType &tile_type) = 0;
+
+  virtual SunMMIOValue TileMaskAnd(const std::string &result_name,
+                                   const SunMMIOValue &lhs,
+                                   const SunMMIOValue &rhs,
+                                   const SunMMIOType &tile_type) = 0;
+
+  virtual SunMMIOValue
+  TileSelect(const std::string &result_name, const SunMMIOValue &mask,
+             const SunMMIOValue &true_value, const SunMMIOValue &false_value,
+             const SunMMIOType &result_type, DataType dtype) = 0;
+
+  virtual SunMMIOValue TileReduce(const std::string &result_name,
+                                  const std::string &predicate,
+                                  const SunMMIOValue &data,
+                                  const SunMMIOType &result_type, int64_t axis,
+                                  DataType dtype) = 0;
+
   virtual SunMMIOValue TileSqueeze(const std::string &result_name,
                                    const SunMMIOValue &tile,
                                    const SunMMIOType &tile_type, int64_t axis,
@@ -167,10 +200,16 @@ public:
                         const SunMMIOValue &ub, const SunMMIOValue &step,
                         const ffi::Map<ffi::String, ffi::Any> &annotations,
                         const std::vector<int64_t> &live_out_token_ids) = 0;
+  virtual void BeginFor(const std::string &iv, const SunMMIOValue &lb,
+                        const SunMMIOValue &ub, const SunMMIOValue &step,
+                        const ffi::Map<ffi::String, ffi::Any> &annotations,
+                        const std::vector<SunMMIOValue> &live_out_values) = 0;
   virtual void EndFor() = 0;
 
   virtual void BeginIf(const SunMMIOValue &cond,
                        const std::vector<int64_t> &live_out_token_ids) = 0;
+  virtual void BeginIf(const SunMMIOValue &cond,
+                       const std::vector<SunMMIOValue> &live_out_values) = 0;
   virtual void BeginElse() = 0;
   virtual void EndIf() = 0;
 

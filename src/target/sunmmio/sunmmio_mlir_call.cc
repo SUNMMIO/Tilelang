@@ -298,10 +298,18 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     }
     ICHECK(ctx_.module)
         << "MLIR module must be initialized before lowering Sunmmio calls";
-    mlir::TypedAttr value_attr = ctx_.builder.getIntegerAttr(
-        mlir::Type::getFromOpaquePointer(
-            ctx_.builder.getF32Type().getAsOpaquePointer()),
-        0);
+    mlir::Type result_type = SunmmioMlirType(ctx_).MapType(ret_type);
+    mlir::TypedAttr value_attr;
+    if (auto float_ty = mlir::dyn_cast<mlir::FloatType>(result_type)) {
+      value_attr = ctx_.builder.getFloatAttr(float_ty, 0.0);
+    } else if (result_type.isIndex()) {
+      value_attr = ctx_.builder.getIndexAttr(0);
+    } else if (auto int_ty = mlir::dyn_cast<mlir::IntegerType>(result_type)) {
+      value_attr = ctx_.builder.getIntegerAttr(int_ty, 0);
+    } else {
+      result_type = ctx_.builder.getI32Type();
+      value_attr = ctx_.builder.getIntegerAttr(result_type, 0);
+    }
     auto fake_op = mlir::arith::ConstantOp::create(
         ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc("fake_call"),
         value_attr);
