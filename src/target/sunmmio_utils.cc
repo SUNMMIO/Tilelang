@@ -20,8 +20,12 @@ namespace tl {
 namespace {
 
 SunmmioTileProcessorConfig MakeSunmmioA4EConfig() {
-  return {/*register_bits=*/4096, /*block_height=*/32, /*block_width=*/32,
-          /*rsram_align_bytes=*/64};
+  return {/*register_bits=*/4096,
+          /*block_height=*/32,
+          /*block_width=*/32,
+          /*rsram_align_bytes=*/64,
+          /*asram_bank_stripe_bytes=*/1024,
+          /*bf16_gemm_single_pass_max_rows=*/16};
 }
 
 ffi::Array<PrimExpr> MakeSunmmioA4EBlockShape(DataType dtype) {
@@ -188,6 +192,13 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def("tl.target.GetSunmmioLayoutBlockShape",
                         static_cast<ffi::Array<PrimExpr> (*)(Target, DataType)>(
                             GetSunmmioLayoutBlockShape));
+  // Expose annotation-key constants used by the Sunmmio bf16 GEMM legalization
+  // pass so the Python frontend can refer to the same string without
+  // duplicating the literal.
+  refl::GlobalDef().def("tl.target.GetAttrSrcOffsetByte",
+                        []() { return tvm::ffi::String(kAttrSrcOffsetByte); });
+  refl::GlobalDef().def("tl.target.GetFieldAccOffsetByte",
+                        []() { return tvm::ffi::String(kFieldAccOffsetByte); });
 }
 
 } // namespace tl

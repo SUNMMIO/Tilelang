@@ -7,6 +7,7 @@
 #ifndef TVM_TL_OP_GEMM_H_
 #define TVM_TL_OP_GEMM_H_
 
+#include "../target/sunmmio_utils.h"
 #include "operator.h"
 
 namespace tvm {
@@ -135,6 +136,10 @@ public:
   tir::BufferLoad mbar_; // mbar is optional, only used for TCGEN5MMA
   Array<PrimExpr> cCoords_;
   mutable GemmWarpPolicy policy_;
+  // Byte offset added to the accumulator pointer at codegen. Set by the
+  // Sunmmio bf16 GEMM legalization pass to select the second stripe-parity's
+  // starting row in RSRAM. User code leaves it at 0.
+  int accOffsetByte_ = 0;
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.Gemm", GemmNode, TileOperatorNode);
 
   static void RegisterReflection() {
@@ -160,7 +165,8 @@ public:
         .def_ro("wgWait", &GemmNode::wgWait_)
         .def_ro("mbar", &GemmNode::mbar_)
         .def_ro("cCoords", &GemmNode::cCoords_)
-        .def_ro("policy", &GemmNode::policy_);
+        .def_ro("policy", &GemmNode::policy_)
+        .def_ro(kFieldAccOffsetByte, &GemmNode::accOffsetByte_);
   }
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;

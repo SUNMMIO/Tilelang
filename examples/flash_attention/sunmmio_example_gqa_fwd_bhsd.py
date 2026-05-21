@@ -8,7 +8,7 @@ def flashattn(batch, heads, seq_len, dim, groups=1, block_M=64, block_N=64, num_
     head_kv = heads // groups
     q_shape = [batch, seq_len, heads, dim]
     kv_shape = [batch, seq_len, head_kv, dim]
-    dtype = T.float16
+    dtype = T.bfloat16
     accum_dtype = T.float32
 
     shard_policy = T.MeshShardingPolicy(y=0, x=2)
@@ -39,6 +39,11 @@ def flashattn(batch, heads, seq_len, dim, groups=1, block_M=64, block_N=64, num_
             V_shared = T.alloc_shared([block_N, dim], dtype)
             O_shared = T.alloc_shared([block_M, dim], dtype)
             acc_s = T.alloc_shared([block_M, block_N], accum_dtype)
+            # RSRAM-resident dtype-cast staging for the PV gemm input. A
+            # Sunmmio DMA copy cannot change dtype, so the fp32->dtype cast
+            # is done here by the Tile unit (in RSRAM) and only then DMA'd
+            # into acc_s_cast (ASRAM, the PV gemm's A operand).
+            acc_s_cast_local = T.alloc_shared([block_M, block_N], dtype)
             acc_s_cast = T.alloc_shared([block_M, block_N], dtype)
             acc_o = T.alloc_shared([block_M, dim], accum_dtype)
             scores_max = T.alloc_shared([block_M], accum_dtype)
@@ -47,45 +52,55 @@ def flashattn(batch, heads, seq_len, dim, groups=1, block_M=64, block_N=64, num_
             scores_sum = T.alloc_shared([block_M], accum_dtype)
             logsum = T.alloc_shared([block_M], accum_dtype)
 
-            # Persistent loop
-            for bz, by, bx in T.Persistent(sharded_batch, sharded_heads, T.ceildiv(seq_len, block_M)):
-                T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
-                T.fill(acc_o, 0)
-                T.fill(logsum, 0)
-                T.fill(scores_max, -T.infinity(accum_dtype))
+            # Each core iterates its own sharded work domain with plain
+            # nested loops. The MeshTensor sharding already distributes data
+            # (batch / heads) across the core mesh, so no persistent
+            # core-distribution loop is needed here.
+            for bz in T.serial(sharded_batch):
+                for by in T.serial(sharded_heads):
+                    for bx in T.serial(T.ceildiv(seq_len, block_M)):
+                        T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
+                        T.fill(acc_o, 0)
+                        T.fill(logsum, 0)
+                        T.fill(scores_max, -T.infinity(accum_dtype))
 
-                loop_range = T.min(T.ceildiv(seq_len, block_N), T.ceildiv((bx + 1) * block_M, block_N))
+                        loop_range = T.min(T.ceildiv(seq_len, block_N), T.ceildiv((bx + 1) * block_M, block_N))
 
-                # loop over K/V blocks
-                for k in T.Pipelined(loop_range, num_stages=num_stages):
-                    T.copy(K[bz, k * block_N : (k + 1) * block_N, by // groups, :], K_shared)
-                    for i, j in T.Tiles([block_M, block_N]):
-                        acc_s[i, j] = T.if_then_else(bx * block_M + i >= k * block_N + j, 0, -T.infinity(acc_s.dtype))
-                    T.gemm(Q_shared, K_shared, acc_s, transpose_B=True)
+                        # loop over K/V blocks
+                        for k in T.Pipelined(loop_range, num_stages=num_stages):
+                            T.copy(K[bz, k * block_N : (k + 1) * block_N, by // groups, :], K_shared)
+                            for i, j in T.Tiles([block_M, block_N]):
+                                acc_s[i, j] = T.if_then_else(bx * block_M + i >= k * block_N + j, 0, -T.infinity(acc_s.dtype))
+                            T.gemm(Q_shared, K_shared, acc_s, transpose_B=True)
 
-                    T.copy(scores_max, scores_max_prev)
-                    T.fill(scores_max, -T.infinity(accum_dtype))
-                    T.reduce_max(acc_s, scores_max, dim=1, clear=False)
-                    for i in T.Tiles(block_M):
-                        scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
-                    for i in T.Tiles(block_M):
-                        scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
-                    for i, j in T.Tiles([block_M, block_N]):
-                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
-                    T.reduce_sum(acc_s, scores_sum, dim=1)
-                    for i in T.Tiles([block_M]):
-                        logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                    T.copy(acc_s, acc_s_cast)
+                            T.copy(scores_max, scores_max_prev)
+                            T.fill(scores_max, -T.infinity(accum_dtype))
+                            T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                            for i in T.Tiles([block_M]):
+                                scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+                            for i in T.Tiles([block_M]):
+                                scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+                            for i, j in T.Tiles([block_M, block_N]):
+                                acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                            T.reduce_sum(acc_s, scores_sum, dim=1)
+                            for i in T.Tiles([block_M]):
+                                logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+                            # Cast fp32 probabilities -> dtype with the Tile
+                            # unit in RSRAM, then DMA the same-dtype result
+                            # into ASRAM.
+                            for i, j in T.Tiles([block_M, block_N]):
+                                acc_s_cast_local[i, j] = acc_s[i, j]
+                            T.copy(acc_s_cast_local, acc_s_cast)
 
-                    for i, j in T.Tiles([block_M, dim]):
-                        acc_o[i, j] *= scores_scale[i]
+                            for i, j in T.Tiles([block_M, dim]):
+                                acc_o[i, j] *= scores_scale[i]
 
-                    T.copy(V[bz, k * block_N : (k + 1) * block_N, by // groups, :], V_shared)
-                    T.gemm(acc_s_cast, V_shared, acc_o)
+                            T.copy(V[bz, k * block_N : (k + 1) * block_N, by // groups, :], V_shared)
+                            T.gemm(acc_s_cast, V_shared, acc_o)
 
-                for i, j in T.Tiles([block_M, dim]):
-                    acc_o[i, j] /= logsum[i]
-                T.copy(acc_o, O_shared)
-                T.copy(O_shared, Output[bz, bx * block_M : (bx + 1) * block_M, by, :])
+                        for i, j in T.Tiles([block_M, dim]):
+                            acc_o[i, j] /= logsum[i]
+                        T.copy(acc_o, O_shared)
+                        T.copy(O_shared, Output[bz, bx * block_M : (bx + 1) * block_M, by, :])
 
     return main

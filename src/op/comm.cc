@@ -113,6 +113,10 @@ BroadcastOp::BroadcastOp(Array<PrimExpr> args,
   node->size = Downcast<IntImm>(args[2]);
   node->src_core = args[3];
   node->direction = Downcast<IntImm>(args[4])->value;
+  // Optional trailing positional arg; default 0.
+  if (args.size() > 5) {
+    node->srcOffsetByte_ = Downcast<IntImm>(args[5])->value;
+  }
   data_ = std::move(node);
 }
 
@@ -194,7 +198,10 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
                << ", must be 0 (horizontal) or 1 (vertical) or 2 (all).";
   }
 
-  // all checks passed, generate the call
+  // all checks passed, generate the call. srcOffsetByte_ is appended as the
+  // final positional arg of every broadcast_() emitted by this BroadcastOp,
+  // so codegen reads it from a stable call-arg slot — no AttrStmt wrapper.
+  PrimExpr src_offset_imm = IntImm(DataType::Int(32), srcOffsetByte_);
   if (direction == 0 or direction == 1) {
     // 1D broadcast
     Array<PrimExpr> args;
@@ -203,6 +210,7 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
     args.push_back(Downcast<IntImm>(broadcast_elements));
     args.push_back(src_core);
     args.push_back(direction);
+    args.push_back(src_offset_imm);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return broadcast;
   } else {
@@ -220,6 +228,7 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
     args.push_back(Downcast<IntImm>(broadcast_elements));
     args.push_back(src_core);
     args.push_back(1); // direction: vertical
+    args.push_back(src_offset_imm);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     seq.push_back(broadcast);
     // horizontal broadcast
@@ -230,6 +239,7 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
       args.push_back(Downcast<IntImm>(broadcast_elements));
       args.push_back(int(i * mesh_ncol) + src_core_col);
       args.push_back(0); // direction: horizontal
+      args.push_back(src_offset_imm);
       Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
       seq.push_back(broadcast);
     }
@@ -360,6 +370,10 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     args.push_back(Downcast<IntImm>(broadcast_elements));
     args.push_back(src_core);
     args.push_back(0); // direction: horizontal
+    // PutOp doesn't use src_offset_byte. Push 0 here so the mask args below
+    // start at position [6], matching the broadcast_() arg-layout contract
+    // (position [5] is src_offset_byte).
+    args.push_back(IntImm(DataType::Int(32), 0));
     for (int j = 0; j < mesh_ncol; j++) {
       if (j != dst_core_col) {
         args.push_back(IntImm(DataType::Int(32),
@@ -376,6 +390,9 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     args.push_back(Downcast<IntImm>(broadcast_elements));
     args.push_back(src_core);
     args.push_back(1); // direction: vertical
+    // PutOp doesn't use src_offset_byte. Push 0 here so mask args start at
+    // position [6], matching broadcast_()'s arg-layout contract.
+    args.push_back(IntImm(DataType::Int(32), 0));
     for (int i = 0; i < mesh_nrow; i++) {
       if (i != dst_core_row) {
         args.push_back(IntImm(DataType::Int(32),
@@ -394,6 +411,9 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     args1.push_back(Downcast<IntImm>(broadcast_elements));
     args1.push_back(src_core);
     args1.push_back(1); // direction: vertical
+    // PutOp doesn't use src_offset_byte. Push 0 here so mask args start at
+    // position [6], matching broadcast_()'s arg-layout contract.
+    args1.push_back(IntImm(DataType::Int(32), 0));
     for (int i = 0; i < mesh_nrow; i++) {
       if (i != dst_core_row) {
         args1.push_back(IntImm(DataType::Int(32),
@@ -409,6 +429,9 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     args2.push_back(Downcast<IntImm>(broadcast_elements));
     args2.push_back(IntImm(DataType::Int(32), intermediate_core_id));
     args2.push_back(0); // direction: horizontal
+    // PutOp doesn't use src_offset_byte. Push 0 here so mask args start at
+    // position [6], matching broadcast_()'s arg-layout contract.
+    args2.push_back(IntImm(DataType::Int(32), 0));
     for (int j = 0; j < mesh_ncol; j++) {
       if (j != dst_core_col) {
         args2.push_back(IntImm(DataType::Int(32),
@@ -435,6 +458,7 @@ AllgatherOp::AllgatherOp(Array<PrimExpr> args,
   node->size = Downcast<IntImm>(args[3]);
   // axis is optional for backwards compatibility: -1 = legacy mode.
   node->axis = (args.size() > 4) ? Downcast<IntImm>(args[4])->value : -1;
+  node->annotations = annotations;
   data_ = std::move(node);
 }
 
@@ -614,6 +638,12 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
 
   Array<Stmt> bcast_stmts;
 
+  // Propagate src_offset_byte (read from this op's annotations) into each
+  // BroadcastOp we construct, so it lands as the final positional arg of
+  // every emitted broadcast_() call. No AttrStmt wrapping needed.
+  int src_offset_byte = GetSrcOffsetByte();
+  PrimExpr src_offset_imm = IntImm(DataType::Int(32), src_offset_byte);
+
   auto emit = [&](Array<Range> dst_ranges, IntImm bcast_elems, int src_core_id,
                   int bcast_dir, bool src_from_send) {
     Array<PrimExpr> args;
@@ -626,6 +656,7 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
     args.push_back(bcast_elems);
     args.push_back(IntImm(DataType::Int(32), src_core_id));
     args.push_back(IntImm(DataType::Int(32), bcast_dir));
+    args.push_back(src_offset_imm);
     BroadcastOp bcast(args);
     bcast_stmts.push_back(bcast->Lower(T, analyzer));
   };

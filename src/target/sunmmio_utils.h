@@ -26,12 +26,40 @@ constexpr const char *kSunmmioScopeASRAM = "shared.asram";
 constexpr const char *kSunmmioScopeWSRAM = "shared.wsram";
 constexpr const char *kSunmmioScopeRSRAM = "shared.rsram";
 
+// ---------------------------------------------------------------------------
+// Op annotation keys used by the Sunmmio bf16 GEMM legalization pass.
+// ---------------------------------------------------------------------------
+// Annotation key on CopyNode / AllgatherOpNode whose value is an IntImm
+// giving the byte offset added to the source pointer at codegen. Set by the
+// LegalizeSunmmioGemm pass to re-stage south-bound A data into the
+// destination's north bank for the second bf16 TC half-pass. The value
+// propagates to the leaf intrinsic (tl.dma_copy / tl.broadcast_) as a
+// trailing positional arg.
+constexpr const char *kAttrSrcOffsetByte = "src_offset_byte";
+
+// Reflection field name for the Gemm/GemmPy node member accOffsetByte_. It
+// is the Python-visible name registered via def_ro and consumed via
+// getattr(node, kFieldAccOffsetByte) in GemmBase. The Sunmmio bf16 GEMM
+// legalization pass sets this field on the cloned second-pass Gemm to
+// select the second stripe-parity's starting row in the RSRAM accumulator.
+constexpr const char *kFieldAccOffsetByte = "accOffsetByte";
+
 struct SunmmioTileProcessorConfig {
   int register_bits;
   int block_height;
   int block_width;
   /// Minimum byte-alignment for RSRAM vector memory accesses.
   int rsram_align_bytes;
+  /// ASRAM north/south bank stripe width in bytes. The bf16 tensor core can
+  /// only read from the north bank, so legalization of bf16 GEMM duplicates
+  /// the A-operand writer with a source-pointer offset of this many bytes so
+  /// that what previously landed in destination south now lands in north.
+  int asram_bank_stripe_bytes;
+  /// Largest bf16 GEMM row count (M-extent) the bf16 tensor core consumes
+  /// from the ASRAM north bank in a single pass. A bf16 GEMM whose row count
+  /// does not exceed this fits entirely in the north bank and needs no
+  /// two-pass legalization.
+  int bf16_gemm_single_pass_max_rows;
 };
 
 struct SunmmioMeshConfig {

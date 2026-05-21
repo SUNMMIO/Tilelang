@@ -473,7 +473,7 @@ def test_inject_sunmmio_sync_loop():
             tz = T.launch_thread("threadIdx.z", 1)
             with T.decl_buffer((32, 32), scope="shared.rsram") as D_shared:
                 C_2 = T.Buffer((128, 128), data=C, strides=(128, 1))
-                T.dma_copy(T.region(C_2[by * 32, bx * 32], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), T.sync_token_id(0))
+                T.dma_copy(T.region(C_2[by * 32, bx * 32], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), 0, T.sync_token_id(0))
                 T.sync_null_token(2)
                 T.barrier_init(1, 0, 1, 2, 3)
                 for _i in range(10):
@@ -481,11 +481,11 @@ def test_inject_sunmmio_sync_loop():
                     T.wait_token(2)
                     T.barrier_arrive_and_wait(1)
                     T.wait_token(0)
-                    T.broadcast_(T.region(C_shared[0, 0], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), 1024, 0, 0, T.sync_token_id(1))
+                    T.broadcast_(T.region(C_shared[0, 0], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), 1024, 0, 0, 0, T.sync_token_id(1))
                     T.barrier_init(0, 0, 1, 2, 3)
                     T.wait_token(1)
                     T.barrier_arrive_and_wait(0)
-                    T.broadcast_(T.region(D_shared[0, 0], 1, 32, 32), T.region(C_shared[0, 0], 2, 32, 32), 1024, 0, 0, T.sync_token_id(2))
+                    T.broadcast_(T.region(D_shared[0, 0], 1, 32, 32), T.region(C_shared[0, 0], 2, 32, 32), 1024, 0, 0, 0, T.sync_token_id(2))
                     T.barrier_init(1, 0, 1, 2, 3)
             T.wait_token(2)
             T.barrier_arrive_and_wait(1)

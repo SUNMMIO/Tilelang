@@ -42,9 +42,12 @@ def matmul(M, N, K, block_M, block_N, block_K, version, dtype=T.float16, accum_d
     return tvm.IRModule({"main": main})
 
 
+# The trailing `, 0` is the acc_offset_byte arg (default 0). It is set
+# non-zero only by the LegalizeSunmmioGemm pass for bf16 + ASRAM A-operand
+# GEMMs; standard GEMMs always emit 0 here.
 stmts = [
-    "T.mma_sunmmio(T.region(A_shared[0, 16], 1, 8, 16), T.region(B_shared[0, 8], 1, 16, 8), T.region(C_shared[8, 16], 3, 16, 16), T.bool(True), T.bool(True), T.bool(False))",
-    "T.mma_sunmmio(T.region(A_shared[0, 16], 1, 8, 16), T.region(B_shared[0, 8], 1, 16, 8), T.region(C_shared[8, 16], 3, 16, 16), T.bool(True), T.bool(True), T.bool(False))",
+    "T.mma_sunmmio(T.region(A_shared[0, 16], 1, 8, 16), T.region(B_shared[0, 8], 1, 16, 8), T.region(C_shared[8, 16], 3, 16, 16), T.bool(True), T.bool(True), T.bool(False), 0)",
+    "T.mma_sunmmio(T.region(A_shared[0, 16], 1, 8, 16), T.region(B_shared[0, 8], 1, 16, 8), T.region(C_shared[8, 16], 3, 16, 16), T.bool(True), T.bool(True), T.bool(False), 0)",
 ]
 TEST_CASES = [
     # gemm v1

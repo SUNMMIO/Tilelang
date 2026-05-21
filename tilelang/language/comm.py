@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+import tvm_ffi
 from tvm import tir
 import tilelang.language as T
 from tilelang.utils.language import (
@@ -15,6 +16,10 @@ from tilelang.utils.language import (
 )
 
 from tilelang.carver.arch.driver import get_sunmmio_device_mesh_config
+
+# Mirror of kAttrSrcOffsetByte in src/target/sunmmio_utils.h. Resolved at
+# import time via FFI so the single source of truth stays in C++.
+ATTR_SRC_OFFSET_BYTE = str(tvm_ffi.get_global_func("tl.target.GetAttrSrcOffsetByte")())
 
 DIRECTION_MAP = {"horizontal": 0, "h": 0, "vertical": 1, "v": 1, "all": 2, "a": 2}
 REDUCE_TYPE_LIST = (
@@ -279,6 +284,7 @@ def all_gather(
     direction: Literal["horizontal", "h", "vertical", "v", "all", "a"] = "all",
     size: int = -1,
     axis: int | None = None,
+    src_offset_byte: int = 0,
 ):
     """Perform an all-gather operation from a send buffer to a receive buffer
     by emitting the TIR intrinsic tl.tileop.comm_allgather.
@@ -301,6 +307,10 @@ def all_gather(
         that existing axis: ``recv_buffer.shape[axis] == K * send_buffer.shape[axis]``
         and all other dimensions match ``send_buffer``. Only ``axis=0`` and
         ``axis=-1`` (the last dim) are currently supported.
+    src_offset_byte : int
+        Byte offset added to the source pointer at codegen. Default 0. Set by the
+        Sunmmio bf16 GEMM legalization pass to re-stage south-bound A data into a
+        destination buffer's north bank. User code should leave this at 0.
     Returns
     -------
     tir.Call
@@ -356,6 +366,8 @@ def all_gather(
         send_elements *= dim
     assert size <= send_elements, f"size {size} exceeds send buffer size {send_elements}."
 
+    assert isinstance(src_offset_byte, int) and src_offset_byte >= 0, "src_offset_byte must be a non-negative integer."
+
     send_buffer_region = to_buffer_region(send_buffer)
     recv_buffer_region = to_buffer_region(recv_buffer)
 
@@ -366,7 +378,8 @@ def all_gather(
         size,
         axis_arg,
     )
-    return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_allgather"), *args)
+    ann = {ATTR_SRC_OFFSET_BYTE: src_offset_byte} if src_offset_byte != 0 else None
+    return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_allgather"), *args, annotations=ann)
 
 
 def all_reduce(
