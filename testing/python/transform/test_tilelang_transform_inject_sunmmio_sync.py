@@ -1,3 +1,4 @@
+import re
 import tilelang
 import tilelang.language as T
 from tilelang import tvm
@@ -335,6 +336,21 @@ def test_inject_sunmmio_sync_broadcast():
     assert idx_wait1 < idx_barrier_wait
     assert idx_barrier_wait < idx_dma1
     assert idx_dma1 < idx_wait2
+
+    # Regression (PR #164): broadcast_ carries src_offset_byte at arg slot 5,
+    # so core-mask indices begin at slot 6. The barrier-mask parser must skip
+    # the offset slot — otherwise the offset value (0) is misread as a mask
+    # and core 0 is dropped from the barrier's write set. A horizontal
+    # broadcast from core (0,0) writes the whole mesh row 0 = cores {0,1,2,3}.
+    barrier_init_lines = [l for l in lines if "barrier_init" in l]
+    assert barrier_init_lines, "expected a barrier_init for the broadcast"
+    init_nums = [int(x) for x in re.findall(r"-?\d+", barrier_init_lines[0])]
+    write_cores = set(init_nums[1:])  # arg 0 is the barrier id
+    assert write_cores == {0, 1, 2, 3}, (
+        f"broadcast barrier write-core set must be the full mesh row "
+        f"{{0,1,2,3}}; got {write_cores} — core 0 dropped means the "
+        f"src_offset_byte slot was misparsed as a core mask"
+    )
 
 
 def test_inject_sunmmio_sync_if():

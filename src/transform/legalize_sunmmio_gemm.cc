@@ -745,6 +745,28 @@ Action MakeReissueAction(const GemmReachingDef &g, const CallNode *writer,
   return entry;
 }
 
+// True iff `first` is visited strictly before `second` in a post-order walk
+// of `body`. For two distinct leaf Call statements that are not in an
+// ancestor relationship, this is their textual — hence per-iteration
+// execution — order. Used to confirm an InPlace writer actually precedes
+// (dominates) its gemm within the scope they share.
+bool StmtCallPrecedes(const Stmt &body, const CallNode *first,
+                      const CallNode *second) {
+  int counter = 0;
+  int first_at = -1;
+  int second_at = -1;
+  PostOrderVisit(body, [&](const ObjectRef &node) {
+    if (node.get() == first)
+      first_at = counter;
+    else if (node.get() == second)
+      second_at = counter;
+    ++counter;
+  });
+  ICHECK(first_at >= 0 && second_at >= 0)
+      << "StmtCallPrecedes: writer or gemm not found in body.";
+  return first_at < second_at;
+}
+
 std::vector<Action> BuildPlan(const Stmt &body,
                               const std::vector<GemmReachingDef> &gemms,
                               const ScopePathCollector &paths) {
@@ -783,9 +805,20 @@ std::vector<Action> BuildPlan(const Stmt &body,
     if (consumer_set.size() == 1) {
       auto git = paths.paths.find(g.gemm);
       ICHECK(git != paths.paths.end());
-      if (wit->second == git->second) {
+      bool co_scoped = (wit->second == git->second);
+      // InPlace is correct only if the co-scoped writer runs *before* the
+      // gemm every iteration — that running writer is the free stripe-0
+      // restore. A writer that follows its gemm is, today, already rejected
+      // upstream: Phase 1 records the gemm on the two-pass For walk's first
+      // pass too, where its reaching def is still NONE (or MULTIPLE with a
+      // pre-loop writer), and ValidateGemms rejects on that. This explicit
+      // program-order check makes the InPlace precondition local and
+      // robust rather than an emergent cross-phase property — and if it
+      // ever does fail, Reissue (which emits its own restore) is the
+      // correct fallback.
+      if (co_scoped && StmtCallPrecedes(body, writer, g.gemm)) {
         plan.push_back(MakeInPlaceAction(g, writer));
-      } else if (IsPathPrefix(wit->second, git->second)) {
+      } else if (co_scoped || IsPathPrefix(wit->second, git->second)) {
         ReissueSource src = AnalyzeReissueSource(body, writer, g.a_dist->name);
         plan.push_back(MakeReissueAction(g, writer, src));
       } else {
@@ -804,8 +837,13 @@ std::vector<Action> BuildPlan(const Stmt &body,
     a_dist_done.insert(g.a_dist.get());
 
     auto run = FindGroupableRun(body, consumer_set);
-    bool writer_co_scoped =
-        run.has_value() && paths.paths.at(run->front()) == wit->second;
+    // InPlaceGroup keeps the writer, so the writer must be co-scoped with
+    // the run AND precede its first gemm — same dominance requirement as
+    // single-consumer InPlace. If it follows, fall through to per-consumer
+    // Reissue.
+    bool writer_co_scoped = run.has_value() &&
+                            paths.paths.at(run->front()) == wit->second &&
+                            StmtCallPrecedes(body, writer, run->front());
 
     if (run.has_value() && writer_co_scoped) {
       // Groupable: one [G1..Gn, W', G1'..Gn'] block, writer kept.

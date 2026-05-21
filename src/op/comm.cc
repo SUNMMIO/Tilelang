@@ -139,6 +139,16 @@ LayoutMap BroadcastOpNode::InferLayout(const LayoutInferArgs &T,
   return copy_op->InferLayout(T, level);
 }
 
+// Builds the fixed positional prefix of a broadcast_() call, in the layout
+// declared by BroadcastArg (comm.h). Callers append trailing core-mask
+// indices (kBroadcastArgMaskBegin onward) as needed.
+Array<PrimExpr> MakeBroadcastArgs(PrimExpr src_region, PrimExpr dst_region,
+                                  PrimExpr size, PrimExpr src_core,
+                                  PrimExpr direction,
+                                  PrimExpr src_offset_byte) {
+  return {src_region, dst_region, size, src_core, direction, src_offset_byte};
+}
+
 Stmt BroadcastOpNode::Lower(const LowerArgs &T,
                             arith::Analyzer *analyzer) const {
   Target target = T.target;
@@ -204,13 +214,11 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
   PrimExpr src_offset_imm = IntImm(DataType::Int(32), srcOffsetByte_);
   if (direction == 0 or direction == 1) {
     // 1D broadcast
-    Array<PrimExpr> args;
-    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args.push_back(Downcast<IntImm>(broadcast_elements));
-    args.push_back(src_core);
-    args.push_back(direction);
-    args.push_back(src_offset_imm);
+    Array<PrimExpr> args =
+        MakeBroadcastArgs(MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                          Downcast<IntImm>(broadcast_elements), src_core,
+                          direction, src_offset_imm);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return broadcast;
   } else {
@@ -222,24 +230,20 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
 
     Array<Stmt> seq;
     // vertical broadcast
-    Array<PrimExpr> args;
-    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args.push_back(Downcast<IntImm>(broadcast_elements));
-    args.push_back(src_core);
-    args.push_back(1); // direction: vertical
-    args.push_back(src_offset_imm);
+    Array<PrimExpr> args =
+        MakeBroadcastArgs(MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                          Downcast<IntImm>(broadcast_elements), src_core,
+                          /*direction=*/1, src_offset_imm);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     seq.push_back(broadcast);
     // horizontal broadcast
     for (int i = 0; i < mesh_nrow; i++) {
-      Array<PrimExpr> args;
-      args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/1));
-      args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-      args.push_back(Downcast<IntImm>(broadcast_elements));
-      args.push_back(int(i * mesh_ncol) + src_core_col);
-      args.push_back(0); // direction: horizontal
-      args.push_back(src_offset_imm);
+      Array<PrimExpr> args = MakeBroadcastArgs(
+          MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
+          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+          Downcast<IntImm>(broadcast_elements),
+          int(i * mesh_ncol) + src_core_col, /*direction=*/0, src_offset_imm);
       Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
       seq.push_back(broadcast);
     }
@@ -363,17 +367,13 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   int dst_core_col = dst_core_val % mesh_ncol;
 
   if (src_core_row == dst_core_row) {
-    // 1D put via horizontal communication
-    Array<PrimExpr> args;
-    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args.push_back(Downcast<IntImm>(broadcast_elements));
-    args.push_back(src_core);
-    args.push_back(0); // direction: horizontal
-    // PutOp doesn't use src_offset_byte. Push 0 here so the mask args below
-    // start at position [6], matching the broadcast_() arg-layout contract
-    // (position [5] is src_offset_byte).
-    args.push_back(IntImm(DataType::Int(32), 0));
+    // 1D put via horizontal communication. PutOp does not use
+    // src_offset_byte, so it passes 0 in that slot; masks follow.
+    Array<PrimExpr> args = MakeBroadcastArgs(
+        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/0,
+        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
     for (int j = 0; j < mesh_ncol; j++) {
       if (j != dst_core_col) {
         args.push_back(IntImm(DataType::Int(32),
@@ -383,16 +383,12 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     Stmt put = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return put;
   } else if (src_core_col == dst_core_col) {
-    // 1D put via vertical communication
-    Array<PrimExpr> args;
-    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args.push_back(Downcast<IntImm>(broadcast_elements));
-    args.push_back(src_core);
-    args.push_back(1); // direction: vertical
-    // PutOp doesn't use src_offset_byte. Push 0 here so mask args start at
-    // position [6], matching broadcast_()'s arg-layout contract.
-    args.push_back(IntImm(DataType::Int(32), 0));
+    // 1D put via vertical communication.
+    Array<PrimExpr> args = MakeBroadcastArgs(
+        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/1,
+        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
     for (int i = 0; i < mesh_nrow; i++) {
       if (i != dst_core_row) {
         args.push_back(IntImm(DataType::Int(32),
@@ -405,15 +401,11 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     Array<Stmt> seq;
     // vertical transfer from src core to intermediate core
     int intermediate_core_id = dst_core_row * mesh_ncol + src_core_col;
-    Array<PrimExpr> args1;
-    args1.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args1.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args1.push_back(Downcast<IntImm>(broadcast_elements));
-    args1.push_back(src_core);
-    args1.push_back(1); // direction: vertical
-    // PutOp doesn't use src_offset_byte. Push 0 here so mask args start at
-    // position [6], matching broadcast_()'s arg-layout contract.
-    args1.push_back(IntImm(DataType::Int(32), 0));
+    Array<PrimExpr> args1 = MakeBroadcastArgs(
+        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/1,
+        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
     for (int i = 0; i < mesh_nrow; i++) {
       if (i != dst_core_row) {
         args1.push_back(IntImm(DataType::Int(32),
@@ -423,15 +415,12 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     Stmt put1 = Evaluate(Call(DataType::Handle(), broadcast_(), args1));
     seq.push_back(put1);
     // horizontal transfer from intermediate core to dst core
-    Array<PrimExpr> args2;
-    args2.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/1));
-    args2.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args2.push_back(Downcast<IntImm>(broadcast_elements));
-    args2.push_back(IntImm(DataType::Int(32), intermediate_core_id));
-    args2.push_back(0); // direction: horizontal
-    // PutOp doesn't use src_offset_byte. Push 0 here so mask args start at
-    // position [6], matching broadcast_()'s arg-layout contract.
-    args2.push_back(IntImm(DataType::Int(32), 0));
+    Array<PrimExpr> args2 = MakeBroadcastArgs(
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        Downcast<IntImm>(broadcast_elements),
+        IntImm(DataType::Int(32), intermediate_core_id), /*direction=*/0,
+        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
     for (int j = 0; j < mesh_ncol; j++) {
       if (j != dst_core_col) {
         args2.push_back(IntImm(DataType::Int(32),

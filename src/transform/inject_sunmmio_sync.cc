@@ -399,10 +399,15 @@ private:
   // considering given masks.
   void process_broadcast_barrier(const CallNode *call, int curr_token_id,
                                  int curr_barrier_id, Array<Stmt> &stmts) {
-    PrimExpr src_core = call->args[3];
-    int direction = call->args[4].as<IntImm>().value()->value;
+    ICHECK_GE(call->args.size(), static_cast<size_t>(kBroadcastArgMaskBegin))
+        << "broadcast_() call is missing its fixed argument prefix.";
+    PrimExpr src_core = call->args[kBroadcastArgSrcCore];
+    int direction =
+        call->args[kBroadcastArgDirection].as<IntImm>().value()->value;
+    // Trailing core-mask indices start at kBroadcastArgMaskBegin — past the
+    // src_offset_byte slot at kBroadcastArgSrcOffsetByte.
     Array<int> masks;
-    for (size_t i = 5; i < call->args.size(); i++) {
+    for (size_t i = kBroadcastArgMaskBegin; i < call->args.size(); i++) {
       masks.push_back(call->args[i].as<IntImm>().value()->value);
     }
 
