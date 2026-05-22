@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <unordered_map>
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tir/stmt_functor.h>
@@ -11,6 +12,7 @@
 #include "../tileview/tileview.h"
 #include "../tileview/tileview_planner.h"
 #include "common/attr.h"
+#include "common/constr_visitor.h"
 
 namespace tvm {
 namespace tl {
@@ -70,6 +72,274 @@ private:
   }
 
   bool found_{false};
+};
+
+class TilesParallelWriteChecker : public ConstrVisitor {
+public:
+  static void Check(const For &scope_root) {
+    TilesParallelWriteChecker checker;
+    checker(scope_root);
+  }
+
+  static bool IsParallelTileLoop(const ForNode *op) {
+    auto it = op->annotations.find(attr::tile_level_loop);
+    if (it == op->annotations.end()) {
+      return false;
+    }
+    if (const auto *imm = (*it).second.as<IntImmNode>()) {
+      return imm->value != 0;
+    }
+    return true;
+  }
+
+private:
+  bool CanProveExprEqual(const PrimExpr &lhs, const PrimExpr &rhs,
+                         arith::Analyzer *analyzer) const {
+    PrimExpr lhs_simpl = analyzer->Simplify(lhs);
+    PrimExpr rhs_simpl = analyzer->Simplify(rhs);
+
+    if (StructuralEqual()(lhs_simpl, rhs_simpl)) {
+      return true;
+    }
+    if (analyzer->CanProve(lhs_simpl == rhs_simpl)) {
+      return true;
+    }
+
+    const Object *lhs_node = lhs_simpl.get();
+    const Object *rhs_node = rhs_simpl.get();
+    if (lhs_node == nullptr || rhs_node == nullptr ||
+        lhs_node->type_index() != rhs_node->type_index()) {
+      return false;
+    }
+
+    if (const auto *lhs_load = lhs_simpl.as<BufferLoadNode>()) {
+      const auto *rhs_load = rhs_simpl.as<BufferLoadNode>();
+      ICHECK(rhs_load);
+      if (!lhs_load->buffer.same_as(rhs_load->buffer) ||
+          lhs_load->indices.size() != rhs_load->indices.size()) {
+        return false;
+      }
+      for (size_t i = 0; i < lhs_load->indices.size(); ++i) {
+        if (!analyzer->CanProve(lhs_load->indices[i] == rhs_load->indices[i])) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    if (const auto *lhs_add = lhs_simpl.as<AddNode>()) {
+      const auto *rhs_add = rhs_simpl.as<AddNode>();
+      ICHECK(rhs_add);
+      return CanProveExprEqual(lhs_add->a, rhs_add->a, analyzer) &&
+             CanProveExprEqual(lhs_add->b, rhs_add->b, analyzer);
+    }
+    if (const auto *lhs_sub = lhs_simpl.as<SubNode>()) {
+      const auto *rhs_sub = rhs_simpl.as<SubNode>();
+      ICHECK(rhs_sub);
+      return CanProveExprEqual(lhs_sub->a, rhs_sub->a, analyzer) &&
+             CanProveExprEqual(lhs_sub->b, rhs_sub->b, analyzer);
+    }
+    if (const auto *lhs_mul = lhs_simpl.as<MulNode>()) {
+      const auto *rhs_mul = rhs_simpl.as<MulNode>();
+      ICHECK(rhs_mul);
+      return CanProveExprEqual(lhs_mul->a, rhs_mul->a, analyzer) &&
+             CanProveExprEqual(lhs_mul->b, rhs_mul->b, analyzer);
+    }
+    if (const auto *lhs_div = lhs_simpl.as<DivNode>()) {
+      const auto *rhs_div = rhs_simpl.as<DivNode>();
+      ICHECK(rhs_div);
+      return CanProveExprEqual(lhs_div->a, rhs_div->a, analyzer) &&
+             CanProveExprEqual(lhs_div->b, rhs_div->b, analyzer);
+    }
+    if (const auto *lhs_mod = lhs_simpl.as<ModNode>()) {
+      const auto *rhs_mod = rhs_simpl.as<ModNode>();
+      ICHECK(rhs_mod);
+      return CanProveExprEqual(lhs_mod->a, rhs_mod->a, analyzer) &&
+             CanProveExprEqual(lhs_mod->b, rhs_mod->b, analyzer);
+    }
+    if (const auto *lhs_floordiv = lhs_simpl.as<FloorDivNode>()) {
+      const auto *rhs_floordiv = rhs_simpl.as<FloorDivNode>();
+      ICHECK(rhs_floordiv);
+      return CanProveExprEqual(lhs_floordiv->a, rhs_floordiv->a, analyzer) &&
+             CanProveExprEqual(lhs_floordiv->b, rhs_floordiv->b, analyzer);
+    }
+    if (const auto *lhs_floormod = lhs_simpl.as<FloorModNode>()) {
+      const auto *rhs_floormod = rhs_simpl.as<FloorModNode>();
+      ICHECK(rhs_floormod);
+      return CanProveExprEqual(lhs_floormod->a, rhs_floormod->a, analyzer) &&
+             CanProveExprEqual(lhs_floormod->b, rhs_floormod->b, analyzer);
+    }
+    if (const auto *lhs_min = lhs_simpl.as<MinNode>()) {
+      const auto *rhs_min = rhs_simpl.as<MinNode>();
+      ICHECK(rhs_min);
+      return CanProveExprEqual(lhs_min->a, rhs_min->a, analyzer) &&
+             CanProveExprEqual(lhs_min->b, rhs_min->b, analyzer);
+    }
+    if (const auto *lhs_max = lhs_simpl.as<MaxNode>()) {
+      const auto *rhs_max = rhs_simpl.as<MaxNode>();
+      ICHECK(rhs_max);
+      return CanProveExprEqual(lhs_max->a, rhs_max->a, analyzer) &&
+             CanProveExprEqual(lhs_max->b, rhs_max->b, analyzer);
+    }
+    if (const auto *lhs_cast = lhs_simpl.as<CastNode>()) {
+      const auto *rhs_cast = rhs_simpl.as<CastNode>();
+      ICHECK(rhs_cast);
+      return lhs_cast->dtype == rhs_cast->dtype &&
+             CanProveExprEqual(lhs_cast->value, rhs_cast->value, analyzer);
+    }
+    if (const auto *lhs_not = lhs_simpl.as<NotNode>()) {
+      const auto *rhs_not = rhs_simpl.as<NotNode>();
+      ICHECK(rhs_not);
+      return CanProveExprEqual(lhs_not->a, rhs_not->a, analyzer);
+    }
+    if (const auto *lhs_and = lhs_simpl.as<AndNode>()) {
+      const auto *rhs_and = rhs_simpl.as<AndNode>();
+      ICHECK(rhs_and);
+      return CanProveExprEqual(lhs_and->a, rhs_and->a, analyzer) &&
+             CanProveExprEqual(lhs_and->b, rhs_and->b, analyzer);
+    }
+    if (const auto *lhs_or = lhs_simpl.as<OrNode>()) {
+      const auto *rhs_or = rhs_simpl.as<OrNode>();
+      ICHECK(rhs_or);
+      return CanProveExprEqual(lhs_or->a, rhs_or->a, analyzer) &&
+             CanProveExprEqual(lhs_or->b, rhs_or->b, analyzer);
+    }
+    if (const auto *lhs_eq = lhs_simpl.as<EQNode>()) {
+      const auto *rhs_eq = rhs_simpl.as<EQNode>();
+      ICHECK(rhs_eq);
+      return CanProveExprEqual(lhs_eq->a, rhs_eq->a, analyzer) &&
+             CanProveExprEqual(lhs_eq->b, rhs_eq->b, analyzer);
+    }
+    if (const auto *lhs_ne = lhs_simpl.as<NENode>()) {
+      const auto *rhs_ne = rhs_simpl.as<NENode>();
+      ICHECK(rhs_ne);
+      return CanProveExprEqual(lhs_ne->a, rhs_ne->a, analyzer) &&
+             CanProveExprEqual(lhs_ne->b, rhs_ne->b, analyzer);
+    }
+    if (const auto *lhs_lt = lhs_simpl.as<LTNode>()) {
+      const auto *rhs_lt = rhs_simpl.as<LTNode>();
+      ICHECK(rhs_lt);
+      return CanProveExprEqual(lhs_lt->a, rhs_lt->a, analyzer) &&
+             CanProveExprEqual(lhs_lt->b, rhs_lt->b, analyzer);
+    }
+    if (const auto *lhs_le = lhs_simpl.as<LENode>()) {
+      const auto *rhs_le = rhs_simpl.as<LENode>();
+      ICHECK(rhs_le);
+      return CanProveExprEqual(lhs_le->a, rhs_le->a, analyzer) &&
+             CanProveExprEqual(lhs_le->b, rhs_le->b, analyzer);
+    }
+    if (const auto *lhs_gt = lhs_simpl.as<GTNode>()) {
+      const auto *rhs_gt = rhs_simpl.as<GTNode>();
+      ICHECK(rhs_gt);
+      return CanProveExprEqual(lhs_gt->a, rhs_gt->a, analyzer) &&
+             CanProveExprEqual(lhs_gt->b, rhs_gt->b, analyzer);
+    }
+    if (const auto *lhs_ge = lhs_simpl.as<GENode>()) {
+      const auto *rhs_ge = rhs_simpl.as<GENode>();
+      ICHECK(rhs_ge);
+      return CanProveExprEqual(lhs_ge->a, rhs_ge->a, analyzer) &&
+             CanProveExprEqual(lhs_ge->b, rhs_ge->b, analyzer);
+    }
+    if (const auto *lhs_select = lhs_simpl.as<SelectNode>()) {
+      const auto *rhs_select = rhs_simpl.as<SelectNode>();
+      ICHECK(rhs_select);
+      return CanProveExprEqual(lhs_select->condition, rhs_select->condition,
+                               analyzer) &&
+             CanProveExprEqual(lhs_select->true_value, rhs_select->true_value,
+                               analyzer) &&
+             CanProveExprEqual(lhs_select->false_value, rhs_select->false_value,
+                               analyzer);
+    }
+
+    return false;
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    bool is_tile_loop = op->annotations.count(attr::tile_level_loop);
+    bool is_parallel_tile_loop = IsParallelTileLoop(op);
+
+    if (is_tile_loop && is_parallel_tile_loop) {
+      parallel_tile_loop_vars_.push_back(op->loop_var);
+      ConstrVisitor::VisitStmt_(op);
+      parallel_tile_loop_vars_.pop_back();
+      return;
+    }
+
+    ConstrVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    if (parallel_tile_loop_vars_.empty() || op->buffer.scope() == "local.var" ||
+        op->buffer.scope() == "local") {
+      StmtExprVisitor::VisitStmt_(op);
+      return;
+    }
+
+    ConstrSet cset{constr_stack_};
+    ffi::Map<Var, PrimExpr> subs = MakeIterationSubstitution();
+    cset.Extend(cset.Substitute(subs));
+
+    PrimExpr same_destination = Bool(true);
+    for (const auto &idx : op->indices) {
+      same_destination =
+          tir::And(same_destination, idx == tir::Substitute(idx, subs));
+    }
+
+    PrimExpr distinct_iteration = Bool(false);
+    for (const auto &var : parallel_tile_loop_vars_) {
+      distinct_iteration = tir::Or(distinct_iteration,
+                                   var != Downcast<Var>(subs.Get(var).value()));
+    }
+
+    PrimExpr first_predicate =
+        op->predicate.defined() ? op->predicate.value() : Bool(true);
+    PrimExpr second_predicate = tir::Substitute(first_predicate, subs);
+
+    PrimExpr conflict_guard =
+        tir::And(tir::And(same_destination, distinct_iteration),
+                 tir::And(first_predicate, second_predicate));
+    PrimExpr other_value = tir::Substitute(op->value, subs);
+
+    arith::Analyzer guard_analyzer;
+    cset.Populate(guard_analyzer);
+
+    arith::Analyzer equal_analyzer;
+    cset.Populate(equal_analyzer);
+    equal_analyzer.EnterConstraint(conflict_guard);
+
+    if (!guard_analyzer.z3_prover.CanProve(tir::Not(conflict_guard)) &&
+        !CanProveExprEqual(op->value, other_value, &equal_analyzer)) {
+      LOG(FATAL)
+          << "Implicit reduction in T.Tiles is not supported. Distinct "
+             "parallel tile iterations can write different values to the same "
+             "destination element in BufferStore to '"
+          << op->buffer->name
+          << "'. Please use explicit T.atomic_add or dedicated reduction "
+             "loops.";
+    }
+
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  ffi::Map<Var, PrimExpr> MakeIterationSubstitution() const {
+    ffi::Map<Var, PrimExpr> subs;
+    for (const auto &var : parallel_tile_loop_vars_) {
+      subs.Set(var, Var(var->name_hint + "<OTHER>", var.dtype()));
+    }
+    for (const auto &constr : constr_stack_) {
+      if (!constr.var.defined()) {
+        continue;
+      }
+      if (subs.count(constr.var)) {
+        continue;
+      }
+      subs.Set(constr.var,
+               Var(constr.var->name_hint + "<OTHER>", constr.var.dtype()));
+    }
+    return subs;
+  }
+
+  std::vector<Var> parallel_tile_loop_vars_;
 };
 
 /* ============================================================
@@ -191,6 +461,9 @@ private:
           Downcast<Array<PrimExpr>>(loop->annotations.at(attr::kTileDomain));
       ICHECK(!NestedTilesScopeDetector::Exists(loop->body))
           << "Nested T.Tiles scopes are not supported.";
+      if (TilesParallelWriteChecker::IsParallelTileLoop(loop)) {
+        TilesParallelWriteChecker::Check(ffi::GetRef<For>(loop));
+      }
       auto scope_loops = CollectTileLoopChain(loop);
       ICHECK_GE(scope_loops.size(), domain.size())
           << "T.Tiles scope loop rank does not cover the declared domain rank.";
