@@ -413,8 +413,9 @@ void SunmmioLayoutInferencePass::PropagateBFS() {
 
     // Generic kCommon via operator InferLayout.
     // Each op returns layout assignments for its operands (or {} if it has
-    // nothing to propose).  Copy returns {} — it bridges any mismatch via
-    // dma_layout_transform and does not propagate layouts.
+    // nothing to propose).  Copy returns {} — it does not propagate layouts;
+    // a DRAM<->RSRAM mismatch is bridged later in CopyNode::Lower by
+    // splitting into a dma_copy plus a sunmmio_layout_transform.
     auto args = BuildInferArgs();
     auto updates = op_list_[op_idx]->InferLayout(args, InferLevel::kCommon);
 

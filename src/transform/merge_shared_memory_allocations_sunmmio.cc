@@ -243,7 +243,8 @@ public:
     StmtExprVisitor::VisitExpr_(op);
     // 识别异步操作：dma_copy/mma_sunmmio/broadcast，提取sync_token_id和关联buffer
     if (op->op.same_as(tl::dma_copy()) || op->op.same_as(tl::broadcast_()) ||
-        op->op.same_as(tl::mma_sunmmio())) {
+        op->op.same_as(tl::mma_sunmmio()) ||
+        op->op.same_as(tl::sunmmio_layout_transform())) {
 
       // 提取sync_token_id（最后一个参数为T.sync_token_id(id)）
       ICHECK_GE(op->args.size(), 1) << "异步操作必须包含sync_token_id参数";
@@ -439,7 +440,8 @@ private:
   }
 
   void VisitExpr_(const CallNode *op) {
-    if (op->op.same_as(tl::mma_sunmmio()) || op->op.same_as(tl::dma_copy())) {
+    if (op->op.same_as(tl::mma_sunmmio()) || op->op.same_as(tl::dma_copy()) ||
+        op->op.same_as(tl::sunmmio_layout_transform())) {
       // These intrinsics introduce stricter SMEM alignment requirements; mark
       // the subtree.
       under_alignment_scope_ = true;

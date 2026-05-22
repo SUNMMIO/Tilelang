@@ -921,6 +921,13 @@ private:
       return workspace.access_ptr(2); // write
     };
 
+    // Lets a tile op's Lower() register the layout of a buffer it introduced
+    // (e.g. a Sunmmio staging buffer) so it reaches the layout annotation.
+    RegisterLayoutCallback register_layout = [this](Buffer buffer,
+                                                    Layout layout) {
+      layout_map_.Set(buffer, layout);
+    };
+
     Range thread_bounds;
 
     if (analyzer_->const_int_bound.IsBound(thread_var_->var)) {
@@ -944,7 +951,7 @@ private:
     auto lowered = tile_op->Lower(
         LowerArgs{target_, thread_bounds, thread_var_->var, callback,
                   layout_map_, buffer_remap_, let_var_to_expr,
-                  global_layout_map_, tileview_map_},
+                  global_layout_map_, tileview_map_, register_layout},
         analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
