@@ -821,8 +821,16 @@ Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
                                    arith::Analyzer *analyzer) const {
   PrimExpr src_region = MakeRegionExpr(src, src_range, /*access_mask=*/1);
   PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
+  // src_offset_byte is read from this CopyNode's annotations (set by the
+  // Sunmmio bf16 GEMM legalization pass) and emitted as a trailing positional
+  // arg of the dma_copy intrinsic. Default 0; codegen adds it to the source
+  // pointer of the emitted ODMA call. In practice a non-zero offset only ever
+  // lands on a copy that takes the fast path below — the layout-transform
+  // legs carry the (zero) default.
+  PrimExpr src_offset_imm = IntImm(DataType::Int(32), GetSrcOffsetByte());
   auto dma = [&](PrimExpr a, PrimExpr b) {
-    return Evaluate(Call(DataType::Handle(), dma_copy(), {a, b}));
+    return Evaluate(
+        Call(DataType::Handle(), dma_copy(), {a, b, src_offset_imm}));
   };
 
   // Layout of a buffer: DRAM lives in global_layout_map, on-chip in layout_map.

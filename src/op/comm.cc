@@ -113,6 +113,10 @@ BroadcastOp::BroadcastOp(Array<PrimExpr> args,
   node->size = Downcast<IntImm>(args[2]);
   node->src_core = args[3];
   node->direction = Downcast<IntImm>(args[4])->value;
+  // Optional trailing positional arg; default 0.
+  if (args.size() > 5) {
+    node->srcOffsetByte_ = Downcast<IntImm>(args[5])->value;
+  }
   data_ = std::move(node);
 }
 
@@ -133,6 +137,16 @@ LayoutMap BroadcastOpNode::InferLayout(const LayoutInferArgs &T,
   args.push_back(dst_expr);
   Copy copy_op = Copy(args);
   return copy_op->InferLayout(T, level);
+}
+
+// Builds the fixed positional prefix of a broadcast_() call, in the layout
+// declared by BroadcastArg (comm.h). Callers append trailing core-mask
+// indices (kBroadcastArgMaskBegin onward) as needed.
+Array<PrimExpr> MakeBroadcastArgs(PrimExpr src_region, PrimExpr dst_region,
+                                  PrimExpr size, PrimExpr src_core,
+                                  PrimExpr direction,
+                                  PrimExpr src_offset_byte) {
+  return {src_region, dst_region, size, src_core, direction, src_offset_byte};
 }
 
 Stmt BroadcastOpNode::Lower(const LowerArgs &T,
@@ -194,15 +208,17 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
                << ", must be 0 (horizontal) or 1 (vertical) or 2 (all).";
   }
 
-  // all checks passed, generate the call
+  // all checks passed, generate the call. srcOffsetByte_ is appended as the
+  // final positional arg of every broadcast_() emitted by this BroadcastOp,
+  // so codegen reads it from a stable call-arg slot — no AttrStmt wrapper.
+  PrimExpr src_offset_imm = IntImm(DataType::Int(32), srcOffsetByte_);
   if (direction == 0 or direction == 1) {
     // 1D broadcast
-    Array<PrimExpr> args;
-    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args.push_back(Downcast<IntImm>(broadcast_elements));
-    args.push_back(src_core);
-    args.push_back(direction);
+    Array<PrimExpr> args =
+        MakeBroadcastArgs(MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                          Downcast<IntImm>(broadcast_elements), src_core,
+                          direction, src_offset_imm);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return broadcast;
   } else {
@@ -214,22 +230,20 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
 
     Array<Stmt> seq;
     // vertical broadcast
-    Array<PrimExpr> args;
-    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args.push_back(Downcast<IntImm>(broadcast_elements));
-    args.push_back(src_core);
-    args.push_back(1); // direction: vertical
+    Array<PrimExpr> args =
+        MakeBroadcastArgs(MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                          Downcast<IntImm>(broadcast_elements), src_core,
+                          /*direction=*/1, src_offset_imm);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     seq.push_back(broadcast);
     // horizontal broadcast
     for (int i = 0; i < mesh_nrow; i++) {
-      Array<PrimExpr> args;
-      args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/1));
-      args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-      args.push_back(Downcast<IntImm>(broadcast_elements));
-      args.push_back(int(i * mesh_ncol) + src_core_col);
-      args.push_back(0); // direction: horizontal
+      Array<PrimExpr> args = MakeBroadcastArgs(
+          MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
+          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+          Downcast<IntImm>(broadcast_elements),
+          int(i * mesh_ncol) + src_core_col, /*direction=*/0, src_offset_imm);
       Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
       seq.push_back(broadcast);
     }
@@ -353,13 +367,13 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   int dst_core_col = dst_core_val % mesh_ncol;
 
   if (src_core_row == dst_core_row) {
-    // 1D put via horizontal communication
-    Array<PrimExpr> args;
-    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args.push_back(Downcast<IntImm>(broadcast_elements));
-    args.push_back(src_core);
-    args.push_back(0); // direction: horizontal
+    // 1D put via horizontal communication. PutOp does not use
+    // src_offset_byte, so it passes 0 in that slot; masks follow.
+    Array<PrimExpr> args = MakeBroadcastArgs(
+        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/0,
+        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
     for (int j = 0; j < mesh_ncol; j++) {
       if (j != dst_core_col) {
         args.push_back(IntImm(DataType::Int(32),
@@ -369,13 +383,12 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     Stmt put = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return put;
   } else if (src_core_col == dst_core_col) {
-    // 1D put via vertical communication
-    Array<PrimExpr> args;
-    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args.push_back(Downcast<IntImm>(broadcast_elements));
-    args.push_back(src_core);
-    args.push_back(1); // direction: vertical
+    // 1D put via vertical communication.
+    Array<PrimExpr> args = MakeBroadcastArgs(
+        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/1,
+        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
     for (int i = 0; i < mesh_nrow; i++) {
       if (i != dst_core_row) {
         args.push_back(IntImm(DataType::Int(32),
@@ -388,12 +401,11 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     Array<Stmt> seq;
     // vertical transfer from src core to intermediate core
     int intermediate_core_id = dst_core_row * mesh_ncol + src_core_col;
-    Array<PrimExpr> args1;
-    args1.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args1.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args1.push_back(Downcast<IntImm>(broadcast_elements));
-    args1.push_back(src_core);
-    args1.push_back(1); // direction: vertical
+    Array<PrimExpr> args1 = MakeBroadcastArgs(
+        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/1,
+        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
     for (int i = 0; i < mesh_nrow; i++) {
       if (i != dst_core_row) {
         args1.push_back(IntImm(DataType::Int(32),
@@ -403,12 +415,12 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     Stmt put1 = Evaluate(Call(DataType::Handle(), broadcast_(), args1));
     seq.push_back(put1);
     // horizontal transfer from intermediate core to dst core
-    Array<PrimExpr> args2;
-    args2.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/1));
-    args2.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args2.push_back(Downcast<IntImm>(broadcast_elements));
-    args2.push_back(IntImm(DataType::Int(32), intermediate_core_id));
-    args2.push_back(0); // direction: horizontal
+    Array<PrimExpr> args2 = MakeBroadcastArgs(
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        Downcast<IntImm>(broadcast_elements),
+        IntImm(DataType::Int(32), intermediate_core_id), /*direction=*/0,
+        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
     for (int j = 0; j < mesh_ncol; j++) {
       if (j != dst_core_col) {
         args2.push_back(IntImm(DataType::Int(32),
@@ -435,6 +447,7 @@ AllgatherOp::AllgatherOp(Array<PrimExpr> args,
   node->size = Downcast<IntImm>(args[3]);
   // axis is optional for backwards compatibility: -1 = legacy mode.
   node->axis = (args.size() > 4) ? Downcast<IntImm>(args[4])->value : -1;
+  node->annotations = annotations;
   data_ = std::move(node);
 }
 
@@ -614,6 +627,12 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
 
   Array<Stmt> bcast_stmts;
 
+  // Propagate src_offset_byte (read from this op's annotations) into each
+  // BroadcastOp we construct, so it lands as the final positional arg of
+  // every emitted broadcast_() call. No AttrStmt wrapping needed.
+  int src_offset_byte = GetSrcOffsetByte();
+  PrimExpr src_offset_imm = IntImm(DataType::Int(32), src_offset_byte);
+
   auto emit = [&](Array<Range> dst_ranges, IntImm bcast_elems, int src_core_id,
                   int bcast_dir, bool src_from_send) {
     Array<PrimExpr> args;
@@ -626,6 +645,7 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
     args.push_back(bcast_elems);
     args.push_back(IntImm(DataType::Int(32), src_core_id));
     args.push_back(IntImm(DataType::Int(32), bcast_dir));
+    args.push_back(src_offset_imm);
     BroadcastOp bcast(args);
     bcast_stmts.push_back(bcast->Lower(T, analyzer));
   };

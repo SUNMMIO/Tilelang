@@ -539,6 +539,35 @@ private:
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     auto store = Downcast<BufferStore>(IRMutatorWithAnalyzer::VisitStmt_(op));
+    if (InInfoCollectionPhase()) {
+      // A plain BufferStore to a shared buffer is a Tile-/Scalar-unit output.
+      // Both units operate on RSRAM, so the destination must be RSRAM -- the
+      // write-side counterpart of the BufferLoad rule below. The scope is
+      // bound eagerly (not deferred to InferUnspecifiedBuffer) so it wins
+      // over a later GEMM operand claim: a buffer that is both a Tile-unit
+      // output and a GEMM A/B operand is left in RSRAM, and the resulting
+      // buffer-vs-GEMM scope mismatch is resolved by a staging copy in
+      // Phase 2 (ResolveGemmConflicts).
+      auto buffer = store->buffer;
+      if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
+        if (buffer_remap_.count(buffer)) {
+          // Already bound: RSRAM is consistent; ASRAM/WSRAM means a GEMM
+          // operand use was collected first, i.e. the consuming GEMM
+          // precedes the Tile-unit write that produces its operand.
+          ICHECK(buffer_remap_[buffer].scope() == kSunmmioScopeRSRAM)
+              << "InferSramScope: buffer " << buffer
+              << " is written by a Tile-unit op and must be "
+              << kSunmmioScopeRSRAM << ", but it was already bound to "
+              << buffer_remap_[buffer].scope()
+              << " by an earlier GEMM operand use. The Tile-unit write that "
+                 "produces a GEMM operand must precede that GEMM.";
+        } else {
+          buffer_remap_.Set(buffer,
+                            makeBufferWithScope(buffer, kSunmmioScopeRSRAM));
+        }
+      }
+      return store;
+    }
     if (!InScopeRewritePhase()) {
       return store;
     }

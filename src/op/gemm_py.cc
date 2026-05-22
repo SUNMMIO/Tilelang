@@ -87,6 +87,11 @@ GemmPy::GemmPy(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   }
   node->cCoords_ = Array<PrimExpr>(
       {args[17].as<PrimExpr>().value(), args[18].as<PrimExpr>().value()});
+  // Optional positional arg, defaults to 0. Set by the Sunmmio bf16 GEMM
+  // legalization pass via a cloned Call with an extended args list.
+  if (args.size() > 19) {
+    node->accOffsetByte_ = args[19].as<IntImm>().value()->value;
+  }
   data_ = std::move(node);
 }
 
