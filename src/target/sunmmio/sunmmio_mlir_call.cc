@@ -289,6 +289,29 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     }
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
+  } else if (callee == "tir.ret") {
+    ICHECK_EQ(operands.size(), 1) << "tir.ret expects one operand";
+
+    const SunMMIOValue &ret = operands[0];
+    bool is_zero = ret.value == "0";
+    if (!is_zero) {
+      mlir::Value ret_value = ctx_.LookupMLIRValue(ret.value);
+      if (ret_value) {
+        if (auto const_op =
+                ret_value.getDefiningOp<mlir::arith::ConstantOp>()) {
+          if (auto int_attr =
+                  mlir::dyn_cast<mlir::IntegerAttr>(const_op.getValue())) {
+            is_zero = int_attr.getInt() == 0;
+          }
+        }
+      }
+    }
+
+    ICHECK(is_zero) << "SunMMIO device kernel only supports T.ret(0); got "
+                    << ret.value;
+    return SunMMIOValue{
+        DataType::Void(), "",
+        SunMMIOType{SunMMIOType::Kind::kUnknown, DataType::Void(), 1, {}}};
   } else {
     (void)operands;
     (void)string_args;
@@ -301,8 +324,8 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         << "MLIR module must be initialized before lowering Sunmmio calls";
     mlir::Type result_type = SunmmioMlirType(ctx_).MapType(ret_type);
     mlir::TypedAttr value_attr;
-    if (auto float_ty = mlir::dyn_cast<mlir::FloatType>(result_type)) {
-      value_attr = ctx_.builder.getFloatAttr(float_ty, 0.0);
+    if (mlir::isa<mlir::FloatType>(result_type)) {
+      value_attr = ctx_.builder.getFloatAttr(result_type, 0.0);
     } else if (result_type.isIndex()) {
       value_attr = ctx_.builder.getIndexAttr(0);
     } else if (auto int_ty = mlir::dyn_cast<mlir::IntegerType>(result_type)) {

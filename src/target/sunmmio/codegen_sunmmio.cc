@@ -9,11 +9,13 @@
 #include <tvm/ir/type.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
+#include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt.h>
 #include <tvm/tir/stmt_functor.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
@@ -943,6 +945,17 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AssertStmtNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::EvaluateNode *op) {
+  if (const auto *call = op->value.as<tir::CallNode>()) {
+    if (call->op.same_as(tir::builtin::ret())) {
+      MarkVisitedCallOpFromExpr(op->value);
+      ICHECK_EQ(call->args.size(), 1) << "tir.ret expects one argument";
+      const auto *imm = call->args[0].as<tir::IntImmNode>();
+      ICHECK(imm && imm->value == 0)
+          << "SunMMIO device kernel only supports T.ret(0)";
+      MarkVisitedNodeType("tir.IntImm");
+      return;
+    }
+  }
   (void)EvalExpr(op->value);
 }
 

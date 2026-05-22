@@ -4,6 +4,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/Verifier.h"
 #include "npuir/Dialect/SUVM/IR/Attributes.h"
 #include "npuir/Dialect/SUVM/IR/Dialect.h"
@@ -81,6 +82,11 @@ void SunmmioMlirFunction::EndFunction() {
 }
 
 void SunmmioMlirFunction::EmitReturn() {
+  mlir::Block *block = ctx_.builder.getInsertionBlock();
+  if (block != nullptr && !block->empty() &&
+      block->back().hasTrait<mlir::OpTrait::IsTerminator>()) {
+    return;
+  }
   mlir::func::ReturnOp::create(ctx_.builder, type_.Loc());
 }
 
