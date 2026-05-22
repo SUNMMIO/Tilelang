@@ -46,6 +46,7 @@ private:
     auto it = buffer_data_to_buffer.find(data);
     if (it == buffer_data_to_buffer.end()) {
       buffer_data_to_buffer.emplace(data, buffer);
+      // return;
     } else {
       LOG(WARNING) << "Found duplicate DeclBuffer for data var " << data;
     }
@@ -421,7 +422,7 @@ CodeGenTileLangSunMMIO::MapBufferType(const tir::Buffer &buffer) const {
   }
   SunMMIOType type;
   type.kind = SunMMIOType::Kind::kMemTensor;
-  type.dtype = CanonicalizeSuvmDType(buffer->dtype).with_lanes(1);
+  type.dtype = buffer->dtype.with_lanes(1);
   type.shape = std::move(shape);
   type.memory_scope = buffer.scope();
   type.byte_offset = 0;
@@ -746,6 +747,11 @@ struct TokenAnalyzer {
             st.MarkProduced(token_id);
             return;
           }
+          if (op_node->name == "tl.mma_sunmmio") {
+            int64_t token_id = ParseTokenIdFromArgs(call->args);
+            st.MarkProduced(token_id);
+            return;
+          }
           if (op_node->name == "tl.sync_null_token") {
             int64_t token_id = ParseTokenIdFromArgs(call->args);
             st.MarkProduced(token_id);
@@ -878,7 +884,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
       // SSA tiles, not as rsram memtensors.
       RegisterBuffer(buffer, false);
     } else {
-      EmitAlloc(buffer, scope);
+      EmitAlloc(buffer_it->second, scope);
     }
   } else {
     LOG(FATAL) << "SunMMIO SUVM allocate cannot find buffer for variable "

@@ -45,6 +45,7 @@ SunMMIOValue SunmmioMlirCall::RegionCall(const std::string &result_name,
 
   mlir::SmallVector<int64_t, 4> shape;
   mlir::SmallVector<int64_t, 4> tiled_dims;
+
   shape.reserve(extents.size());
 
   if (extents.size() >= 2) {
@@ -55,8 +56,8 @@ SunMMIOValue SunmmioMlirCall::RegionCall(const std::string &result_name,
       }
     }
     ICHECK_EQ(tiled_dims.size(), 2)
-        << "tl.tileop.region expects exactly 2 tiled dims with extent != 1, "
-           "but got "
+        << "tl.tileop.region expects exactly 2 tiled "
+           "dims with extent != 1, but got "
         << tiled_dims.size();
   } else {
     shape.push_back(extents[0]);

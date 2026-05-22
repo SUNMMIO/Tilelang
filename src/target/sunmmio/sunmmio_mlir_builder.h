@@ -189,6 +189,13 @@ public:
   SunmmioMlirContext &Context() { return ctx_; }
   const SunmmioMlirContext &Context() const { return ctx_; }
 
+  void PushLayoutScope(const TirLayoutMap &layout_map,
+                       const TirLayoutMap &global_layout_map) final;
+  void PopLayoutScope() final;
+  ffi::Optional<tl::Layout> LookupLayout(const tir::Buffer &buffer) const final;
+  void ApplyLayoutToType(const tir::Buffer &buffer,
+                         SunMMIOType *type) const final;
+
 private:
   SunmmioMlirContext ctx_;
   std::unique_ptr<SunmmioMlirFunction> function_;

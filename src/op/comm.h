@@ -24,7 +24,6 @@ public:
   Array<Range> src_range, dst_range;
   PrimExpr src_expr, dst_expr;
   IntImm size;
-  IntImm dst_offset;
   PrimExpr src_core;
   int direction;
 
@@ -38,10 +37,7 @@ public:
         .def_ro("dst", &BroadcastOpNode::dst)
         .def_ro("src_range", &BroadcastOpNode::src_range)
         .def_ro("dst_range", &BroadcastOpNode::dst_range)
-        .def_ro("src_core", &BroadcastOpNode::src_core)
-        // .def_ro("direction", &BroadcastOpNode::direction)
-        // .def_ro("size", &BroadcastOpNode::size)
-        .def_ro("dst_offset", &BroadcastOpNode::dst_offset);
+        .def_ro("src_core", &BroadcastOpNode::src_core);
   }
 
   TileOperator Clone() const override;
@@ -99,6 +95,10 @@ public:
   PrimExpr send, recv;
   int direction;
   IntImm size;
+  // -1 sentinel = legacy mode (recv has an extra leading axis of length K).
+  // Otherwise the (already-normalized non-negative) axis along which recv
+  // concatenates the K per-core contributions.
+  int axis;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.comm_allgather", AllgatherOpNode,
                                     TileOperatorNode);
