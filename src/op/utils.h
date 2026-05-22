@@ -68,6 +68,12 @@ inline bool IsSharedBuffer(const Buffer &buffer, bool allow_dynamic = true) {
   }
 }
 
+inline bool IsSunmmioSharedBuffer(const Buffer &buffer) {
+  return buffer.defined() &&
+         (buffer.scope() == "shared.asram" ||
+          buffer.scope() == "shared.wsram" || buffer.scope() == "shared.rsram");
+}
+
 inline bool IsGlobalBuffer(const Buffer &buffer) {
   return buffer.defined() && buffer.scope() == "global";
 }

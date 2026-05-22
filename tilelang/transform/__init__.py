@@ -686,6 +686,28 @@ def LowerLDGSTG():
     return _ffi_api.LowerLDGSTG()  # type: ignore
 
 
+def SunmmioPipelinePlanning(debug: bool = False):
+    """SunmmioPipelinePlanning
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.SunmmioPipelinePlanning(debug)  # type: ignore
+
+
+def InjectSunmmioPipeline():
+    """InjectSunmmioPipeline
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.InjectSunmmioPipeline()  # type: ignore
+
+
 def MergeSharedMemoryAllocationsSunmmio(
     enable_aggressive_merge: bool = False,
     asram_align_bytes: int = 2048,
