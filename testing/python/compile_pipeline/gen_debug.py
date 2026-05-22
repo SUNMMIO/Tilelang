@@ -38,14 +38,18 @@ def main() -> int:
     if args.log_passes.strip():
         log_passes = [p.strip() for p in args.log_passes.split(",") if p.strip()]
 
-    requested_cases = [args.case] if args.case != "all" else [
-        "summa",
-        "sync",
-        "comm",
-        "flashattn",
-        "mma_3times",
-        "overall",
-    ]
+    requested_cases = (
+        [args.case]
+        if args.case != "all"
+        else [
+            "summa",
+            "sync",
+            "comm",
+            "flashattn",
+            "mma_3times",
+            "overall",
+        ]
+    )
 
     any_failed = False
     for case in requested_cases:
