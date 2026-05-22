@@ -6,6 +6,7 @@
 #include "sunmmio_mlir_memory.h"
 #include "sunmmio_mlir_tile_op.h"
 
+#include "npuir/Dialect/SUVM/IR/Ops.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace tvm {
@@ -307,6 +308,21 @@ void SuvmSunmmioBuilder::EndIf() { function_->EndIf(); }
 void SuvmSunmmioBuilder::EmitAssert(const SunMMIOValue &cond,
                                     const std::string &msg_text) {
   function_->EmitAssert(cond, msg_text);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::GetCoreId(const std::string &result_name,
+                                           DataType dtype) {
+  SunMMIOType i64_type{SunMMIOType::Kind::kScalar, DataType::Int(64), 1, {}};
+  auto core_id = mlir::suvm::GetCoreIdOp::create(
+      ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc("get_core_id"),
+      ctx_.builder.getI64Type());
+  ctx_.BindMLIRValue(result_name, core_id.getResult());
+  SunMMIOValue value{DataType::Int(64), result_name, i64_type};
+  SunMMIOType dst_type{SunMMIOType::Kind::kScalar, dtype, 1, {}};
+  if (dtype == DataType::Int(64)) {
+    return value;
+  }
+  return expr_->Cast(result_name, value, dst_type, dtype);
 }
 
 void SuvmSunmmioBuilder::PushLayoutScope(

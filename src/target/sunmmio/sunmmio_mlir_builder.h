@@ -179,6 +179,8 @@ public:
   void EndIf() final;
 
   void EmitAssert(const SunMMIOValue &cond, const std::string &msg_text) final;
+  SunMMIOValue GetCoreId(const std::string &result_name, DataType dtype) final;
+
   void PushLayoutScope(const TirLayoutMap &layout_map,
                        const TirLayoutMap &global_layout_map) final;
   void PopLayoutScope() final;
@@ -188,13 +190,6 @@ public:
 
   SunmmioMlirContext &Context() { return ctx_; }
   const SunmmioMlirContext &Context() const { return ctx_; }
-
-  void PushLayoutScope(const TirLayoutMap &layout_map,
-                       const TirLayoutMap &global_layout_map) final;
-  void PopLayoutScope() final;
-  ffi::Optional<tl::Layout> LookupLayout(const tir::Buffer &buffer) const final;
-  void ApplyLayoutToType(const tir::Buffer &buffer,
-                         SunMMIOType *type) const final;
 
 private:
   SunmmioMlirContext ctx_;

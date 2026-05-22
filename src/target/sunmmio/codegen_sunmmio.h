@@ -215,6 +215,8 @@ public:
 
   virtual void EmitAssert(const SunMMIOValue &cond,
                           const std::string &msg_text) = 0;
+  virtual SunMMIOValue GetCoreId(const std::string &result_name,
+                                 DataType dtype) = 0;
 
   virtual void PushLayoutScope(const TirLayoutMap &layout_map,
                                const TirLayoutMap &global_layout_map) {

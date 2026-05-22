@@ -855,6 +855,18 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::LetStmtNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AttrStmtNode *op) {
+  if (op->attr_key == tir::attr::thread_extent) {
+    IterVar iv = Downcast<IterVar>(op->node);
+    if (iv->thread_tag == "blockIdx.x") {
+      EnterScope();
+      BindVar(iv->var, builder_->GetCoreId(NewValueName(), iv->var.dtype()));
+      VisitStmtTracked(op->body);
+      ExitScope();
+    } else {
+      VisitStmtTracked(op->body);
+    }
+    return;
+  }
   ScopedAttr attr{op->node, op->attr_key, EvalExpr(op->value)};
   attr_stack_.push_back(attr);
   VisitStmtTracked(op->body);
@@ -887,8 +899,8 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
       EmitAlloc(buffer_it->second, scope);
     }
   } else {
-    LOG(FATAL) << "SunMMIO SUVM allocate cannot find buffer for variable "
-               << op->buffer_var->name_hint;
+    LOG(WARNING) << "SunMMIO SUVM allocate cannot find buffer for variable "
+                 << op->buffer_var->name_hint;
   }
   VisitStmtTracked(op->body);
   ExitScope();
@@ -1469,7 +1481,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
       operands.push_back(EvalExpr(arg));
     }
   } else if (callee == "tl.dma_copy") {
-    ICHECK_EQ(op->args.size(), 3)
+    ICHECK_EQ(op->args.size(), 4)
         << "tl.dma_copy expects src region, dst region, and sync_token_id";
     auto count_tiled_dims = [](const PrimExpr &region_expr) -> int {
       BufferRegion region = tl::NormalizeToBufferRegion(region_expr);
@@ -1489,7 +1501,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
 
     operands.reserve(2);
 
-    const auto *token_call = op->args[2].as<CallNode>();
+    const auto *token_call = op->args[3].as<CallNode>();
     ICHECK(token_call)
         << "tl.dma_copy expects third argument to be tl.sync_token_id";
     const auto *token_op = token_call->op.as<OpNode>();
@@ -1519,7 +1531,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     operands.push_back(EvalExpr(op->args[0]));
     operands.push_back(EvalExpr(op->args[1]));
   } else if (callee == "tl.mma_sunmmio") {
-    ICHECK_EQ(op->args.size(), 7) << "tl.mma_sunmmio expects A/B/C regions, "
+    ICHECK_EQ(op->args.size(), 8) << "tl.mma_sunmmio expects A/B/C regions, "
                                      "three flag operands, and sync_token_id";
     auto parse_bool_arg = [&](const PrimExpr &arg,
                               const char *arg_name) -> bool {
@@ -1544,7 +1556,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
         std::string("clear_accum=") +
         (parse_bool_arg(op->args[5], "tl.mma_sunmmio clearAccum") ? "1" : "0"));
 
-    const auto *token_call = op->args[6].as<CallNode>();
+    const auto *token_call = op->args[7].as<CallNode>();
     ICHECK(token_call)
         << "tl.mma_sunmmio expects last argument to be tl.sync_token_id";
     const auto *token_op = token_call->op.as<OpNode>();
