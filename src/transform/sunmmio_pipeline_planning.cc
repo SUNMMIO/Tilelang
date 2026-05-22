@@ -545,7 +545,7 @@ public:
           }
           float out_loop_single_cost = 0;
           if (const auto seq = current->body.as<SeqStmtNode>()) {
-            // temp 
+            // temp
             // ICHECK(seq->seq.size() >= 3) << "Error format of reduce op";
             // init of reduce
             if (const auto if_stmt = seq->seq[0].as<IfThenElseNode>()) {
