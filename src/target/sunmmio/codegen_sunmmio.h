@@ -330,6 +330,8 @@ private:
   void CollectDeclBuffers(const tir::Stmt &stmt);
   void MarkVisitedNodeType(const std::string &type_key);
   void MarkVisitedCallOpFromExpr(const tvm::PrimExpr &expr);
+  bool TryConsumeSyncTokenId(const tvm::PrimExpr &expr,
+                             std::vector<std::string> *string_args);
   void WriteCoverageReport() const;
   void CheckCoverageOrFail() const;
   SunMMIOValue EmitBinary(const char *op_name, const tvm::PrimExpr &lhs,
