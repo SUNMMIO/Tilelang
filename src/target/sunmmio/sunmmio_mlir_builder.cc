@@ -305,6 +305,17 @@ void SuvmSunmmioBuilder::BeginElse() { function_->BeginElse(); }
 
 void SuvmSunmmioBuilder::EndIf() { function_->EndIf(); }
 
+void SuvmSunmmioBuilder::BeginWhile(
+    const std::vector<int64_t> &live_out_token_ids) {
+  function_->BeginWhile(live_out_token_ids);
+}
+
+void SuvmSunmmioBuilder::BeginWhileBody(const SunMMIOValue &cond) {
+  function_->BeginWhileBody(cond);
+}
+
+void SuvmSunmmioBuilder::EndWhile() { function_->EndWhile(); }
+
 void SuvmSunmmioBuilder::EmitAssert(const SunMMIOValue &cond,
                                     const std::string &msg_text) {
   function_->EmitAssert(cond, msg_text);

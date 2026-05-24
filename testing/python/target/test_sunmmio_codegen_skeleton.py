@@ -197,15 +197,17 @@ def test_sunmmio_codegen_without_compile_emits_nonempty_suvm_source():
     assert "func.func @main" in src
 
 
-def test_sunmmio_codegen_unsupported_stmt_fails_loudly():
+def test_sunmmio_codegen_while_emits_scf_while():
     cond = tvm.tir.LT(tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 1))
     body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
     stmt = tvm.tir.While(cond, body)
     target = determine_target("Sunmmio", return_object=True)
     mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt)})
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
-    with pytest.raises(Exception, match="CodeGenTileLangSunMMIO unsupported stmt: tir.While"):
-        builder(mod, target, "suvm")
+    src = builder(mod, target, "suvm").inspect_source()
+    assert "scf.while" in src
+    assert "scf.condition" in src
+    assert "scf.yield" in src
 
 
 def test_sunmmio_codegen_shuffle_fails_loudly():

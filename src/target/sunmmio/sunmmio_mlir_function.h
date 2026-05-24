@@ -39,6 +39,10 @@ public:
   void BeginElse();
   void EndIf();
 
+  void BeginWhile(const std::vector<int64_t> &live_out_token_ids);
+  void BeginWhileBody(const SunMMIOValue &cond);
+  void EndWhile();
+
   void EmitAssert(const SunMMIOValue &cond, const std::string &msg_text);
 
 private:

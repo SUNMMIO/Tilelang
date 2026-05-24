@@ -11,9 +11,37 @@
 #include "npuir/Dialect/SUVM/IR/Types.h"
 
 #include <algorithm>
+#include <unordered_map>
 
 namespace tvm {
 namespace codegen {
+
+namespace {
+
+mlir::Value CreateNullToken(SunmmioMlirContext &ctx, SunmmioMlirType &type) {
+  mlir::Type token_ty = mlir::suvm::TokenType::get(&ctx.mlir_ctx);
+  mlir::OperationState st(type.Loc(), "suvm.null_token");
+  st.addTypes(token_ty);
+  mlir::Operation *op = ctx.builder.create(st);
+  return op->getResult(0);
+}
+
+void RestoreSavedTokens(
+    SunmmioMlirContext &ctx,
+    const std::unordered_map<int64_t, SunmmioMlirContext::SavedToken>
+        &saved_tokens) {
+  for (const auto &kv : saved_tokens) {
+    int64_t token_id = kv.first;
+    const SunmmioMlirContext::SavedToken &saved = kv.second;
+    if (saved.existed) {
+      ctx.token_by_id[token_id] = saved.value;
+    } else {
+      ctx.token_by_id.erase(token_id);
+    }
+  }
+}
+
+} // namespace
 
 SunmmioMlirFunction::SunmmioMlirFunction(SunmmioMlirContext &ctx)
     : ctx_(ctx), type_(ctx) {}
@@ -35,6 +63,7 @@ void SunmmioMlirFunction::BeginModule() {
   current_func_ = mlir::func::FuncOp();
   ctx_.for_stack.clear();
   ctx_.if_stack.clear();
+  ctx_.while_stack.clear();
   ctx_.control_flow_stack.clear();
   ctx_.ClearMLIRValueScopes();
 }
@@ -63,6 +92,7 @@ void SunmmioMlirFunction::BeginFunction(const std::string &name,
   ctx_.PushMLIRValueScope();
   ctx_.if_stack.clear();
   ctx_.for_stack.clear();
+  ctx_.while_stack.clear();
   ctx_.control_flow_stack.clear();
 
   mlir::Block *entry = func.addEntryBlock();
@@ -76,6 +106,7 @@ void SunmmioMlirFunction::EndFunction() {
   current_func_ = mlir::func::FuncOp();
   ctx_.if_stack.clear();
   ctx_.for_stack.clear();
+  ctx_.while_stack.clear();
   ctx_.control_flow_stack.clear();
   ctx_.ClearMLIRValueScopes();
   ctx_.builder.setInsertionPointToEnd(ctx_.module->getBody());
@@ -276,8 +307,19 @@ void SunmmioMlirFunction::EndFor() {
           }
           break;
         }
-      } else {
+      } else if (nit->kind == SunmmioMlirContext::ControlKind::kIf) {
         SunmmioMlirContext::IfFrame &outer = ctx_.if_stack[nit->index];
+        auto tit = outer.token_id_to_index.find(token_id);
+        if (tit != outer.token_id_to_index.end()) {
+          int idx = tit->second;
+          if (idx >= 0 &&
+              idx < static_cast<int>(outer.produced_tokens.size())) {
+            outer.produced_tokens[idx] = v;
+          }
+          break;
+        }
+      } else {
+        SunmmioMlirContext::WhileFrame &outer = ctx_.while_stack[nit->index];
         auto tit = outer.token_id_to_index.find(token_id);
         if (tit != outer.token_id_to_index.end()) {
           int idx = tit->second;
@@ -295,6 +337,204 @@ void SunmmioMlirFunction::EndFor() {
        i < e; ++i) {
     ctx_.BindMLIRValue(frame.live_out_value_names[i], for_op.getResult(i));
   }
+}
+
+void SunmmioMlirFunction::BeginWhile(
+    const std::vector<int64_t> &live_out_token_ids) {
+  mlir::SmallVector<mlir::Value, 8> init_args;
+  init_args.reserve(live_out_token_ids.size());
+  for (int64_t token_id : live_out_token_ids) {
+    auto it = ctx_.token_by_id.find(token_id);
+    if (it != ctx_.token_by_id.end() && it->second) {
+      init_args.push_back(it->second);
+      continue;
+    }
+    init_args.push_back(CreateNullToken(ctx_, type_));
+  }
+
+  mlir::SmallVector<mlir::Type, 8> result_types;
+  result_types.reserve(init_args.size());
+  for (mlir::Value init_arg : init_args) {
+    result_types.push_back(init_arg.getType());
+  }
+
+  auto empty_builder = [](mlir::OpBuilder &, mlir::Location, mlir::ValueRange) {
+  };
+  mlir::scf::WhileOp while_op =
+      mlir::scf::WhileOp::create(ctx_.builder, type_.Loc(), result_types,
+                                 init_args, empty_builder, empty_builder);
+
+  SunmmioMlirContext::WhileFrame frame;
+  frame.op = while_op;
+  frame.in_body = false;
+  frame.live_out_token_ids = live_out_token_ids;
+
+  auto before_args = while_op.getBeforeArguments();
+  auto after_args = while_op.getAfterArguments();
+  frame.before_tokens.assign(before_args.begin(), before_args.end());
+  frame.iter_tokens.assign(after_args.begin(), after_args.end());
+  frame.produced_tokens.assign(frame.iter_tokens.size(), mlir::Value());
+  for (int i = 0, e = static_cast<int>(frame.live_out_token_ids.size()); i < e;
+       ++i) {
+    frame.token_id_to_index[frame.live_out_token_ids[i]] = i;
+  }
+
+  ctx_.while_stack.push_back(std::move(frame));
+  ctx_.control_flow_stack.push_back(SunmmioMlirContext::ControlNode{
+      SunmmioMlirContext::ControlKind::kWhile,
+      static_cast<int>(ctx_.while_stack.size()) - 1});
+
+  ctx_.PushMLIRValueScope();
+  SunmmioMlirContext::WhileFrame &active_frame = ctx_.while_stack.back();
+  for (int i = 0, e = static_cast<int>(live_out_token_ids.size()); i < e; ++i) {
+    int64_t token_id = live_out_token_ids[i];
+    if (token_id >= 0) {
+      ctx_.token_by_id[token_id] = active_frame.before_tokens[i];
+    }
+  }
+  ctx_.builder.setInsertionPointToStart(while_op.getBeforeBody());
+}
+
+void SunmmioMlirFunction::BeginWhileBody(const SunMMIOValue &cond) {
+  if (ctx_.while_stack.empty()) {
+    if (ctx_.module) {
+      ctx_.module->emitError("BeginWhileBody called without a matching "
+                             "BeginWhile");
+    }
+    return;
+  }
+
+  SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack.back();
+  frame.in_body = true;
+  mlir::Value cond_v = type_.EnsureI1(
+      type_.ResolveValueOrCreatePlaceholder(cond, ctx_.builder.getI1Type()));
+
+  mlir::SmallVector<mlir::Value, 8> condition_args;
+  condition_args.append(frame.before_tokens.begin(), frame.before_tokens.end());
+
+  mlir::Block *before_body = frame.op.getBeforeBody();
+  mlir::Operation *terminator = before_body->getTerminator();
+  mlir::scf::ConditionOp condition_op =
+      terminator ? mlir::dyn_cast<mlir::scf::ConditionOp>(terminator)
+                 : mlir::scf::ConditionOp();
+  if (condition_op) {
+    mlir::SmallVector<mlir::Value, 8> operands;
+    operands.reserve(condition_args.size() + 1);
+    operands.push_back(cond_v);
+    operands.append(condition_args.begin(), condition_args.end());
+    condition_op.getOperation()->setOperands(operands);
+  } else {
+    ctx_.builder.setInsertionPointToEnd(before_body);
+    mlir::scf::ConditionOp::create(ctx_.builder, type_.Loc(), cond_v,
+                                   condition_args);
+  }
+
+  ctx_.PopMLIRValueScope();
+  ctx_.PushMLIRValueScope();
+  for (int i = 0, e = static_cast<int>(frame.live_out_token_ids.size()); i < e;
+       ++i) {
+    int64_t token_id = frame.live_out_token_ids[i];
+    if (token_id >= 0) {
+      ctx_.token_by_id[token_id] = frame.iter_tokens[i];
+    }
+  }
+  ctx_.builder.setInsertionPointToStart(frame.op.getAfterBody());
+}
+
+void SunmmioMlirFunction::EndWhile() {
+  if (ctx_.while_stack.empty()) {
+    if (ctx_.module) {
+      ctx_.module->emitError("EndWhile called without a matching BeginWhile");
+    }
+    ctx_.PopMLIRValueScope();
+    return;
+  }
+
+  if (ctx_.control_flow_stack.empty() ||
+      ctx_.control_flow_stack.back().kind !=
+          SunmmioMlirContext::ControlKind::kWhile ||
+      ctx_.control_flow_stack.back().index !=
+          static_cast<int>(ctx_.while_stack.size()) - 1) {
+    if (ctx_.module) {
+      ctx_.module->emitError("EndWhile control_flow_stack mismatch");
+    }
+  } else {
+    ctx_.control_flow_stack.pop_back();
+  }
+
+  SunmmioMlirContext::WhileFrame frame = std::move(ctx_.while_stack.back());
+  ctx_.while_stack.pop_back();
+  mlir::scf::WhileOp while_op = frame.op;
+
+  mlir::SmallVector<mlir::Value, 8> yielded;
+  yielded.reserve(frame.iter_tokens.size());
+  for (int i = 0, e = static_cast<int>(frame.iter_tokens.size()); i < e; ++i) {
+    mlir::Value v = frame.produced_tokens[i] ? frame.produced_tokens[i]
+                                             : frame.iter_tokens[i];
+    yielded.push_back(v);
+  }
+
+  mlir::Block *after_body = while_op.getAfterBody();
+  mlir::Operation *terminator = after_body->getTerminator();
+  mlir::scf::YieldOp yield_op =
+      terminator ? mlir::dyn_cast<mlir::scf::YieldOp>(terminator)
+                 : mlir::scf::YieldOp();
+  if (yield_op) {
+    yield_op.getOperation()->setOperands(yielded);
+  } else {
+    ctx_.builder.setInsertionPointToEnd(after_body);
+    mlir::scf::YieldOp::create(ctx_.builder, type_.Loc(), yielded);
+  }
+
+  ctx_.builder.setInsertionPointAfter(while_op);
+
+  RestoreSavedTokens(ctx_, frame.saved_token_by_id);
+
+  for (int i = 0, e = static_cast<int>(frame.live_out_token_ids.size()); i < e;
+       ++i) {
+    int64_t token_id = frame.live_out_token_ids[i];
+    mlir::Value v = while_op.getResult(i);
+    ctx_.token_by_id[token_id] = v;
+    for (auto nit = ctx_.control_flow_stack.rbegin();
+         nit != ctx_.control_flow_stack.rend(); ++nit) {
+      if (nit->kind == SunmmioMlirContext::ControlKind::kFor) {
+        SunmmioMlirContext::ForFrame &outer = ctx_.for_stack[nit->index];
+        auto tit = outer.token_id_to_index.find(token_id);
+        if (tit != outer.token_id_to_index.end()) {
+          int idx = tit->second;
+          if (idx >= 0 &&
+              idx < static_cast<int>(outer.produced_tokens.size())) {
+            outer.produced_tokens[idx] = v;
+          }
+          break;
+        }
+      } else if (nit->kind == SunmmioMlirContext::ControlKind::kIf) {
+        SunmmioMlirContext::IfFrame &outer = ctx_.if_stack[nit->index];
+        auto tit = outer.token_id_to_index.find(token_id);
+        if (tit != outer.token_id_to_index.end()) {
+          int idx = tit->second;
+          if (idx >= 0 &&
+              idx < static_cast<int>(outer.produced_tokens.size())) {
+            outer.produced_tokens[idx] = v;
+          }
+          break;
+        }
+      } else {
+        SunmmioMlirContext::WhileFrame &outer = ctx_.while_stack[nit->index];
+        auto tit = outer.token_id_to_index.find(token_id);
+        if (tit != outer.token_id_to_index.end()) {
+          int idx = tit->second;
+          if (idx >= 0 &&
+              idx < static_cast<int>(outer.produced_tokens.size())) {
+            outer.produced_tokens[idx] = v;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  ctx_.PopMLIRValueScope();
 }
 
 void SunmmioMlirFunction::BeginIf(
@@ -573,8 +813,19 @@ void SunmmioMlirFunction::EndIf() {
           }
           break;
         }
-      } else {
+      } else if (nit->kind == SunmmioMlirContext::ControlKind::kIf) {
         SunmmioMlirContext::IfFrame &outer = ctx_.if_stack[nit->index];
+        auto tit = outer.token_id_to_index.find(token_id);
+        if (tit != outer.token_id_to_index.end()) {
+          int idx = tit->second;
+          if (idx >= 0 &&
+              idx < static_cast<int>(outer.produced_tokens.size())) {
+            outer.produced_tokens[idx] = v;
+          }
+          break;
+        }
+      } else {
+        SunmmioMlirContext::WhileFrame &outer = ctx_.while_stack[nit->index];
         auto tit = outer.token_id_to_index.find(token_id);
         if (tit != outer.token_id_to_index.end()) {
           int idx = tit->second;

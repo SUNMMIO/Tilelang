@@ -213,6 +213,10 @@ public:
   virtual void BeginElse() = 0;
   virtual void EndIf() = 0;
 
+  virtual void BeginWhile(const std::vector<int64_t> &live_out_token_ids) = 0;
+  virtual void BeginWhileBody(const SunMMIOValue &cond) = 0;
+  virtual void EndWhile() = 0;
+
   virtual void EmitAssert(const SunMMIOValue &cond,
                           const std::string &msg_text) = 0;
   virtual SunMMIOValue GetCoreId(const std::string &result_name,
@@ -342,6 +346,7 @@ private:
   bool TryLowerTilesScope(const tir::ForNode *op);
   void EmitFor(const tir::ForNode *op);
   void EmitIf(const tir::IfThenElseNode *op);
+  void EmitWhile(const tir::WhileNode *op);
 
   SunMMIOType MapType(tvm::DataType dtype) const;
   SunMMIOType MapBufferType(const tir::Buffer &buffer) const;

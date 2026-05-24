@@ -63,6 +63,24 @@ struct SunmmioMlirContext {
   std::vector<TirLayoutMap> layout_map_stack;
   std::vector<TirLayoutMap> global_layout_map_stack;
 
+  struct WhileFrame {
+    mlir::scf::WhileOp op;
+    bool in_body{false};
+    // Token ids that must be carried by scf.while and materialized after the
+    // loop.
+    std::vector<int64_t> live_out_token_ids;
+    // token_id -> index into iter_tokens / produced_tokens.
+    std::unordered_map<int64_t, int> token_id_to_index;
+    // Region arguments in scf.while before/after regions.
+    std::vector<mlir::Value> before_tokens;
+    std::vector<mlir::Value> iter_tokens;
+    // Tokens produced in the loop body; falls back to iter_tokens when empty.
+    std::vector<mlir::Value> produced_tokens;
+    // Snapshots of ctx.token_by_id to restore when closing the loop.
+    std::unordered_map<int64_t, SavedToken> saved_token_by_id;
+  };
+  std::vector<WhileFrame> while_stack;
+
   struct IfFrame {
     mlir::scf::IfOp op;
     bool in_else{false};
@@ -85,7 +103,7 @@ struct SunmmioMlirContext {
   };
   std::vector<IfFrame> if_stack;
 
-  enum class ControlKind { kFor, kIf };
+  enum class ControlKind { kFor, kIf, kWhile };
 
   struct ControlNode {
     ControlKind kind;
@@ -160,6 +178,9 @@ struct SunmmioMlirContext {
           frame.produced_tokens[idx] = v;
         }
         break;
+      }
+      if (it->kind == ControlKind::kWhile) {
+        continue;
       }
       IfFrame &frame = if_stack[it->index];
       auto vit = std::find(frame.live_out_value_names.begin(),

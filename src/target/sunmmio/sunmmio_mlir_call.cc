@@ -111,8 +111,20 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
           recorded = true;
           break;
         }
-      } else {
+      } else if (nit->kind == SunmmioMlirContext::ControlKind::kIf) {
         SunmmioMlirContext::IfFrame &frame = ctx_.if_stack[nit->index];
+        auto tit = frame.token_id_to_index.find(token_id);
+        if (tit != frame.token_id_to_index.end()) {
+          int idx = tit->second;
+          if (idx >= 0 &&
+              idx < static_cast<int>(frame.produced_tokens.size())) {
+            frame.produced_tokens[idx] = produced;
+          }
+          recorded = true;
+          break;
+        }
+      } else {
+        SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack[nit->index];
         auto tit = frame.token_id_to_index.find(token_id);
         if (tit != frame.token_id_to_index.end()) {
           int idx = tit->second;
@@ -142,8 +154,10 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
       };
       if (node.kind == SunmmioMlirContext::ControlKind::kFor) {
         snapshot_if_needed(ctx_.for_stack[node.index]);
-      } else {
+      } else if (node.kind == SunmmioMlirContext::ControlKind::kIf) {
         snapshot_if_needed(ctx_.if_stack[node.index]);
+      } else {
+        snapshot_if_needed(ctx_.while_stack[node.index]);
       }
     }
 
@@ -189,10 +203,26 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     mlir::Value tok;
     for (auto nit = ctx_.control_flow_stack.rbegin();
          nit != ctx_.control_flow_stack.rend(); ++nit) {
-      if (nit->kind != SunmmioMlirContext::ControlKind::kFor) {
+      if (nit->kind == SunmmioMlirContext::ControlKind::kFor) {
+        SunmmioMlirContext::ForFrame &frame = ctx_.for_stack[nit->index];
+        auto tit = frame.token_id_to_index.find(token_id);
+        if (tit == frame.token_id_to_index.end()) {
+          continue;
+        }
+        int idx = tit->second;
+        if (idx >= 0 && idx < static_cast<int>(frame.iter_tokens.size())) {
+          tok = frame.iter_tokens[idx];
+          break;
+        }
         continue;
       }
-      SunmmioMlirContext::ForFrame &frame = ctx_.for_stack[nit->index];
+      if (nit->kind != SunmmioMlirContext::ControlKind::kWhile) {
+        continue;
+      }
+      SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack[nit->index];
+      if (!frame.in_body) {
+        continue;
+      }
       auto tit = frame.token_id_to_index.find(token_id);
       if (tit == frame.token_id_to_index.end()) {
         continue;

@@ -656,6 +656,23 @@ struct TokenAnalyzer {
     return summary;
   }
 
+  TokenSummary AnalyzeWhile(const tir::WhileNode *while_op) {
+    IterState st;
+    AnalyzeStmt(while_op->body, st);
+
+    std::vector<int64_t> live_out_order;
+    live_out_order.reserve(st.produced_order.size());
+    for (int64_t t : st.produced_order) {
+      if (t >= 0 && st.avail_tokens.count(t) != 0) {
+        live_out_order.push_back(t);
+      }
+    }
+
+    TokenSummary summary;
+    summary.live_out = std::move(live_out_order);
+    return summary;
+  }
+
   TokenSummary AnalyzeIf(const tir::IfThenElseNode *if_op) {
     IterState then_st;
     AnalyzeStmt(if_op->then_case, then_st);
@@ -696,6 +713,15 @@ struct TokenAnalyzer {
 
     if (const auto *inner_for = stmt.as<ForNode>()) {
       TokenSummary inner = AnalyzeFor(inner_for);
+      for (int64_t t : inner.live_out) {
+        st.MarkProduced(t);
+      }
+
+      return;
+    }
+
+    if (const auto *inner_while = stmt.as<WhileNode>()) {
+      TokenSummary inner = AnalyzeWhile(inner_while);
       for (int64_t t : inner.live_out) {
         st.MarkProduced(t);
       }
@@ -848,6 +874,21 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::ForNode *op) {
   EmitFor(op);
 }
 
+void CodeGenTileLangSunMMIO::EmitWhile(const tir::WhileNode *op) {
+  TokenAnalyzer analyzer;
+  TokenSummary summary = analyzer.AnalyzeWhile(op);
+  builder_->BeginWhile(summary.live_out);
+  SunMMIOValue cond = EnsureType(
+      EvalExpr(op->condition),
+      SunMMIOType{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}},
+      DataType::Bool());
+  builder_->BeginWhileBody(cond);
+  EnterScope();
+  VisitStmtTracked(op->body);
+  ExitScope();
+  builder_->EndWhile();
+}
+
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::LetStmtNode *op) {
   SunMMIOValue value = EvalExpr(op->value);
   EnterScope();
@@ -880,9 +921,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::IfThenElseNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::WhileNode *op) {
-  (void)op;
-  UnsupportedStmt(
-      op, "WhileNode is not supported by SunMMIO direct MLIR lowering.");
+  EmitWhile(op);
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
