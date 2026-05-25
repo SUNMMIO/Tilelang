@@ -1576,7 +1576,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     }
   } else if (callee == "tl.dma_copy") {
     ICHECK_EQ(op->args.size(), 4)
-        << "tl.dma_copy expects src region, dst region, and sync_token_id";
+        << "tl.dma_copy expects src region, dst region, src_offset_byte, "
+           "and sync_token_id";
     auto count_tiled_dims = [](const PrimExpr &region_expr) -> int {
       BufferRegion region = tl::NormalizeToBufferRegion(region_expr);
       int count = 0;
@@ -1592,6 +1593,14 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
 
     int src_tiled_dims = count_tiled_dims(op->args[0]);
     int dst_tiled_dims = count_tiled_dims(op->args[1]);
+
+    const auto *src_offset_imm = op->args[2].as<IntImmNode>();
+    ICHECK(src_offset_imm)
+        << "tl.dma_copy src_offset_byte must be a constant IntImm";
+    int64_t src_offset_byte = static_cast<int64_t>(src_offset_imm->value);
+    ICHECK_GE(src_offset_byte, 0)
+        << "tl.dma_copy src_offset_byte must be non-negative";
+    MarkVisitedNodeType(src_offset_imm->GetTypeKey());
 
     operands.reserve(2);
 
@@ -1611,8 +1620,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
                             CallBucketName(bucket), op->dtype, ret_ty);
     }
 
-    operands.push_back(EvalExpr(op->args[0]));
-    operands.push_back(EvalExpr(op->args[1]));
+    operands.push_back(EmitRegionCall(op->args[0], src_offset_byte));
+    operands.push_back(EmitRegionCall(op->args[1]));
   } else if (callee == "tl.broadcast_") {
     ICHECK(op->args.size() == 6 || op->args.size() == 7)
         << "tl.broadcast_ expects src region, dst region, direction, mask, "
@@ -1654,7 +1663,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
                           (direction == 0 ? "row" : "col"));
   } else if (callee == "tl.mma_sunmmio") {
     ICHECK_EQ(op->args.size(), 8) << "tl.mma_sunmmio expects A/B/C regions, "
-                                     "three flag operands, and sync_token_id";
+                                     "three flag operands, acc_offset_byte, "
+                                     "and sync_token_id";
     auto parse_bool_arg = [&](const PrimExpr &arg,
                               const char *arg_name) -> bool {
       const auto *imm = arg.as<IntImmNode>();
@@ -1663,10 +1673,18 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
       return imm->value != 0;
     };
 
+    const auto *acc_offset_imm = op->args[6].as<IntImmNode>();
+    ICHECK(acc_offset_imm)
+        << "tl.mma_sunmmio acc_offset_byte must be a constant IntImm";
+    int64_t acc_offset_byte = static_cast<int64_t>(acc_offset_imm->value);
+    ICHECK_GE(acc_offset_byte, 0)
+        << "tl.mma_sunmmio acc_offset_byte must be non-negative";
+    MarkVisitedNodeType(acc_offset_imm->GetTypeKey());
+
     operands.reserve(3);
-    operands.push_back(EvalExpr(op->args[0]));
-    operands.push_back(EvalExpr(op->args[1]));
-    operands.push_back(EvalExpr(op->args[2]));
+    operands.push_back(EmitRegionCall(op->args[0]));
+    operands.push_back(EmitRegionCall(op->args[1]));
+    operands.push_back(EmitRegionCall(op->args[2], acc_offset_byte));
 
     string_args.push_back(
         std::string("trans_a=") +
