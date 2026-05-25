@@ -20,7 +20,7 @@ def _broadcast_line_no_core(src, dst, direction, mask, src_offset=0):
 
 
 _ROW_MASK_BX = (
-    'T.bitwise_or(T.bitwise_or(T.bitwise_or(T.bitwise_or(T.int64(0), '
+    "T.bitwise_or(T.bitwise_or(T.bitwise_or(T.bitwise_or(T.int64(0), "
     'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4))), '
     'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4) + T.int64(1))), '
     'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4) + T.int64(2))), '
@@ -28,7 +28,7 @@ _ROW_MASK_BX = (
 )
 
 _COL_MASK_BX = (
-    'T.bitwise_or(T.bitwise_or(T.bitwise_or(T.bitwise_or(T.int64(0), '
+    "T.bitwise_or(T.bitwise_or(T.bitwise_or(T.bitwise_or(T.int64(0), "
     'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4))), '
     'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4) + T.int64(4))), '
     'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4) + T.int64(8))), '

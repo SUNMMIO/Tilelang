@@ -177,13 +177,11 @@ public:
                             const std::string &category, DataType ret_dtype,
                             const SunMMIOType &ret_type) = 0;
 
-  virtual SunMMIOValue RegionCall(const std::string &result_name,
-                                  const std::string &buffer_handle,
-                                  const std::vector<SunMMIOValue> &mins,
-                                  const std::vector<int64_t> &extents,
-                                  DataType ret_dtype,
-                                  const SunMMIOType &ret_type,
-                                  int64_t byte_offset = 0) = 0;
+  virtual SunMMIOValue
+  RegionCall(const std::string &result_name, const std::string &buffer_handle,
+             const std::vector<SunMMIOValue> &mins,
+             const std::vector<int64_t> &extents, DataType ret_dtype,
+             const SunMMIOType &ret_type, int64_t byte_offset = 0) = 0;
 
   virtual SunMMIOValue Ramp(const std::string &result_name,
                             const SunMMIOValue &base,

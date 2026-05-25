@@ -18,13 +18,10 @@ namespace codegen {
 
 SunmmioMlirCall::SunmmioMlirCall(SunmmioMlirContext &ctx) : ctx_(ctx) {}
 
-SunMMIOValue SunmmioMlirCall::RegionCall(const std::string &result_name,
-                                         const std::string &buffer_handle,
-                                         const std::vector<SunMMIOValue> &mins,
-                                         const std::vector<int64_t> &extents,
-                                         DataType ret_dtype,
-                                         const SunMMIOType &ret_type,
-                                         int64_t byte_offset) {
+SunMMIOValue SunmmioMlirCall::RegionCall(
+    const std::string &result_name, const std::string &buffer_handle,
+    const std::vector<SunMMIOValue> &mins, const std::vector<int64_t> &extents,
+    DataType ret_dtype, const SunMMIOType &ret_type, int64_t byte_offset) {
   SunmmioMlirType type(ctx_);
 
   mlir::Value source = ctx_.LookupMLIRValue(buffer_handle);

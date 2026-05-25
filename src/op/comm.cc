@@ -689,8 +689,8 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
     Array<Range> ranges;
     for (int d = 0; d < recv_rank; d++) {
       if (d == slice_axis) {
-        PrimExpr base = analyzer->Simplify(
-            recv_range[d]->min + slot_start * slot_extent);
+        PrimExpr base =
+            analyzer->Simplify(recv_range[d]->min + slot_start * slot_extent);
         ranges.push_back(Range::FromMinExtent(base, slot_extent));
       } else {
         ranges.push_back(recv_range[d]);

@@ -246,9 +246,7 @@ def verify_comm_lower(func: tir.PrimFunc):
     # 2. Return the check function
     def check(mod: IRModule):
         script = mod.script()
-        broadcast_arg_lists = [
-            args for line in script.splitlines() if (args := broadcast_call_args(line.strip())) is not None
-        ]
+        broadcast_arg_lists = [args for line in script.splitlines() if (args := broadcast_call_args(line.strip())) is not None]
         for core, direction, mask, has_src_core in expected_broadcasts:
             if mask is None:
                 mask_pattern = r".*?"

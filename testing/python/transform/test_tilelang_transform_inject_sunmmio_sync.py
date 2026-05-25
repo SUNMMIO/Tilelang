@@ -174,9 +174,7 @@ def _make_leaf_broadcast_without_src_core_mod(target):
             tir.IntImm("int32", 0),
         )
     )
-    consume_dst = tir.Evaluate(
-        tir.BufferLoad(dst_buf, [tir.IntImm("int32", 0), tir.IntImm("int32", 0)])
-    )
+    consume_dst = tir.Evaluate(tir.BufferLoad(dst_buf, [tir.IntImm("int32", 0), tir.IntImm("int32", 0)]))
     body = tir.DeclBuffer(
         src_buf,
         tir.DeclBuffer(dst_buf, tir.SeqStmt([broadcast, consume_dst])),
@@ -414,10 +412,7 @@ def test_inject_sunmmio_sync_broadcast():
     assert barrier_init_lines, "expected a barrier_init for the broadcast"
     _, read_mask, write_mask = _parse_barrier_init_masks(barrier_init_lines[0])
     assert read_mask == 1
-    assert write_mask == 15, (
-        f"broadcast barrier write mask must cover mesh row 0; "
-        f"got {write_mask}; expected 15"
-    )
+    assert write_mask == 15, f"broadcast barrier write mask must cover mesh row 0; got {write_mask}; expected 15"
 
 
 def test_inject_sunmmio_sync_broadcast_without_src_core_full_mesh_barrier():

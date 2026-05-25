@@ -472,8 +472,7 @@ private:
     PrimExpr src_core = GetBroadcastSrcCore(call);
     PrimExpr read_mask = CoreBitMask(src_core);
     PrimExpr write_mask = call->args[kBroadcastArgMask];
-    init_barrier_(stmts, curr_barrier_id, curr_token_id, read_mask,
-                  write_mask);
+    init_barrier_(stmts, curr_barrier_id, curr_token_id, read_mask, write_mask);
   }
 
   // Extracts all buffer read and write accesses from a primitive expression
