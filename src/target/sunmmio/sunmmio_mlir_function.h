@@ -26,12 +26,22 @@ public:
                 const SunMMIOValue &ub, const SunMMIOValue &step,
                 const ffi::Map<ffi::String, ffi::Any> &annotations,
                 const std::vector<int64_t> &live_out_token_ids);
+  void BeginFor(const std::string &iv, const SunMMIOValue &lb,
+                const SunMMIOValue &ub, const SunMMIOValue &step,
+                const ffi::Map<ffi::String, ffi::Any> &annotations,
+                const std::vector<SunMMIOValue> &live_out_values);
   void EndFor();
 
   void BeginIf(const SunMMIOValue &cond,
                const std::vector<int64_t> &live_out_token_ids);
+  void BeginIf(const SunMMIOValue &cond,
+               const std::vector<SunMMIOValue> &live_out_values);
   void BeginElse();
   void EndIf();
+
+  void BeginWhile(const std::vector<int64_t> &live_out_token_ids);
+  void BeginWhileBody(const SunMMIOValue &cond);
+  void EndWhile();
 
   void EmitAssert(const SunMMIOValue &cond, const std::string &msg_text);
 

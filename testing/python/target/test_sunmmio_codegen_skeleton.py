@@ -91,8 +91,53 @@ def make_alloc_scope_kernel():
 
 
 def make_intrinsic_sync_kernel():
-    dma = tvm.tir.Call("handle", tvm.ir.Op.get("tl.dma_copy"), [])
-    mma = tvm.tir.Call("handle", tvm.ir.Op.get("tl.mma_sunmmio"), [])
+    f16 = tvm.ir.PrimType("float16")
+    a_data = tvm.tir.Var("a_data", tvm.ir.PointerType(f16, "shared.asram"))
+    b_data = tvm.tir.Var("b_data", tvm.ir.PointerType(f16, "shared.wsram"))
+    c_data = tvm.tir.Var("c_data", tvm.ir.PointerType(f16, "shared.rsram"))
+    a_buf = tvm.tir.decl_buffer((32, 32), "float16", name="A", data=a_data, scope="shared.asram")
+    b_buf = tvm.tir.decl_buffer((32, 32), "float16", name="B", data=b_data, scope="shared.wsram")
+    c_buf = tvm.tir.decl_buffer((32, 32), "float16", name="C", data=c_data, scope="shared.rsram")
+
+    def region(buf, access):
+        return tvm.tir.call_intrin(
+            "handle",
+            tvm.ir.Op.get("tl.tileop.region"),
+            tvm.tir.BufferLoad(
+                buf,
+                [tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 0)],
+            ),
+            tvm.tir.IntImm("int32", access),
+            tvm.tir.IntImm("int32", 32),
+            tvm.tir.IntImm("int32", 32),
+        )
+
+    def sync_token(token_id):
+        return tvm.tir.call_intrin(
+            "handle",
+            tvm.ir.Op.get("tl.sync_token_id"),
+            tvm.tir.IntImm("int32", token_id),
+        )
+
+    dma = tvm.tir.Call(
+        "handle",
+        tvm.ir.Op.get("tl.dma_copy"),
+        [region(a_buf, 1), region(c_buf, 2), tvm.tir.IntImm("int32", 0), sync_token(0)],
+    )
+    mma = tvm.tir.Call(
+        "handle",
+        tvm.ir.Op.get("tl.mma_sunmmio"),
+        [
+            region(a_buf, 1),
+            region(b_buf, 1),
+            region(c_buf, 3),
+            tvm.tir.IntImm("bool", 0),
+            tvm.tir.IntImm("bool", 0),
+            tvm.tir.IntImm("bool", 0),
+            tvm.tir.IntImm("int32", 0),
+            sync_token(1),
+        ],
+    )
     sync = tvm.tir.Call(
         "handle",
         tvm.ir.Op.get("tir.tvm_storage_sync"),
@@ -114,7 +159,8 @@ def make_intrinsic_sync_kernel():
     pred = tvm.tir.LT(i, tvm.tir.IntImm("int32", 2))
     if_stmt = tvm.tir.IfThenElse(pred, loop_body, tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0)))
     stmt = tvm.tir.For(i, 0, 4, tvm.tir.ForKind.SERIAL, if_stmt)
-    return _primfunc_from_stmt(stmt)
+    stmt = tvm.tir.DeclBuffer(a_buf, tvm.tir.DeclBuffer(b_buf, tvm.tir.DeclBuffer(c_buf, stmt)))
+    return _to_device_kernel_func(tvm.tir.PrimFunc([a_data, b_data, c_data], stmt))
 
 
 def make_block_realize_kernel():
@@ -197,15 +243,17 @@ def test_sunmmio_codegen_without_compile_emits_nonempty_suvm_source():
     assert "func.func @main" in src
 
 
-def test_sunmmio_codegen_unsupported_stmt_fails_loudly():
+def test_sunmmio_codegen_while_emits_scf_while():
     cond = tvm.tir.LT(tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 1))
     body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
     stmt = tvm.tir.While(cond, body)
     target = determine_target("Sunmmio", return_object=True)
     mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt)})
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
-    with pytest.raises(Exception, match="CodeGenTileLangSunMMIO unsupported stmt: tir.While"):
-        builder(mod, target, "suvm")
+    src = builder(mod, target, "suvm").inspect_source()
+    assert "scf.while" in src
+    assert "scf.condition" in src
+    assert "scf.yield" in src
 
 
 def test_sunmmio_codegen_shuffle_fails_loudly():

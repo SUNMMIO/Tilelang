@@ -1082,6 +1082,91 @@ def test_tilelang_insert_copy_uses_compact_region_shape(kernel):
             assert int(compact_region.args[3]) == 16
 
 
+def tile_store_feeds_gemm_a(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
+    """A shared buffer written by a Tile-unit elementwise loop and then
+    consumed as a GEMM A operand.
+
+    The Tile-unit BufferStore demands RSRAM while the GEMM A use demands
+    ASRAM. InferSramScope must keep the buffer in RSRAM (so the Tile-unit
+    write stays valid) and resolve the GEMM operand with a staging copy
+    into an ASRAM temporary.
+    """
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        C: T.Tensor((M, N), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            A_cast = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=2):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                for i, j in T.Tiles([block_M, block_K]):
+                    A_cast[i, j] = A_shared[i, j]
+                T.gemm(A_cast, B_shared, C_shared)
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return tvm.IRModule({"main": main})
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [tile_store_feeds_gemm_a(128, 128, 128, 32, 32, 32)],
+)
+def test_tilelang_infer_sram_scope_resolves_tile_store_vs_gemm_operand(kernel):
+    """A buffer that is both a Tile-unit output and a GEMM A operand must be
+    kept in RSRAM, with a staging copy inserted -- not silently bound to
+    ASRAM (which would leave a Tile-unit op writing the ASRAM A bank)."""
+    target_name = "Sunmmio"
+    target = determine_target(target_name, return_object=True)
+
+    with tvm.target.Target(target):
+        mod = kernel
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
+        mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+        mod = tilelang.transform.InjectAssumes()(mod)
+        mod = tilelang.transform.Simplify()(mod)
+
+        before_buffers = list(extract_buffers_from_kernel(list(mod.functions.values())[0]))
+        mod = tl.transform.InferSramScope()(mod)
+        func = list(mod.functions.values())[0]
+        after_buffers = list(extract_buffers_from_kernel(func))
+
+        # Exactly one ASRAM staging temporary was inserted for the conflict.
+        assert len(after_buffers) == len(before_buffers) + 1
+
+        # The GEMM operands carry the expected SRAM scopes; the A operand is
+        # now the inserted ASRAM staging buffer.
+        after_gemms = extract_gemm_from_kernel(func)
+        assert len(after_gemms) == 1
+        scope_dict = {0: "shared.asram", 1: "shared.wsram", 2: "shared.rsram"}
+        for i, arg in enumerate(after_gemms[0].args[:3]):
+            assert isinstance(arg, Call)
+            assert arg.op == tvm.tir.op.Op.get("tl.tileop.region")
+            assert arg.args[0].buffer.scope() == scope_dict[i]
+
+        # The Tile-unit BufferStore that produces the A operand stays in
+        # RSRAM -- it was not silently bound to ASRAM.
+        tile_store_scopes = []
+
+        def collect_a_cast_store(node):
+            if isinstance(node, BufferStore) and node.buffer.name == "A_cast":
+                tile_store_scopes.append(node.buffer.scope())
+
+        post_order_visit(func.body, collect_a_cast_store)
+        assert tile_store_scopes
+        assert all(scope == "shared.rsram" for scope in tile_store_scopes)
+
+
 def sibling_block_conflict_matmul(dtype="float16", accum_dtype="float32"):
     @T.prim_func
     def main(

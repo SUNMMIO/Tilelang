@@ -129,8 +129,9 @@ PrimFunc HoistBlockAnnotationsToFuncAttrs(PrimFunc f) {
     }
     f = WithAttr(std::move(f), key, value);
   }
+  auto device_func_attr_keys = MergeDeviceFuncAttrKeys(f);
   f = WithAttr(std::move(f), tl::attr::kDeviceFuncAttrKeys,
-               MergeDeviceFuncAttrKeys(f));
+               device_func_attr_keys);
   return f;
 }
 

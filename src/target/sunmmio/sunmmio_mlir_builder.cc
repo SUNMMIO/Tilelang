@@ -4,7 +4,9 @@
 #include "sunmmio_mlir_expr.h"
 #include "sunmmio_mlir_function.h"
 #include "sunmmio_mlir_memory.h"
+#include "sunmmio_mlir_tile_op.h"
 
+#include "npuir/Dialect/SUVM/IR/Ops.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace tvm {
@@ -14,6 +16,7 @@ SuvmSunmmioBuilder::SuvmSunmmioBuilder()
     : function_(std::make_unique<SunmmioMlirFunction>(ctx_)),
       expr_(std::make_unique<SunmmioMlirExpr>(ctx_)),
       memory_(std::make_unique<SunmmioMlirMemory>(ctx_)),
+      tile_(std::make_unique<SunmmioMlirTileOp>(ctx_)),
       call_(std::make_unique<SunmmioMlirCall>(ctx_)) {}
 
 SuvmSunmmioBuilder::~SuvmSunmmioBuilder() = default;
@@ -60,6 +63,10 @@ SunMMIOValue SuvmSunmmioBuilder::Cast(const std::string &result_name,
                                       const SunMMIOValue &v,
                                       const SunMMIOType &dst_type,
                                       DataType dst_dtype) {
+  if (v.type.kind == SunMMIOType::Kind::kTile &&
+      dst_type.kind == SunMMIOType::Kind::kTile) {
+    return tile_->Cast(result_name, v, dst_type, dst_dtype);
+  }
   return expr_->Cast(result_name, v, dst_type, dst_dtype);
 }
 
@@ -69,7 +76,17 @@ SunMMIOValue SuvmSunmmioBuilder::Binary(const std::string &result_name,
                                         const SunMMIOValue &b,
                                         const SunMMIOType &result_type,
                                         DataType dtype) {
+  if (result_type.kind == SunMMIOType::Kind::kTile) {
+    return tile_->Binary(result_name, op, flavor, a, b, result_type, dtype);
+  }
   return expr_->Binary(result_name, op, flavor, a, b, result_type, dtype);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::Unary(const std::string &result_name,
+                                       TileUnaryOp op, const SunMMIOValue &data,
+                                       const SunMMIOType &result_type,
+                                       DataType dtype) {
+  return tile_->Unary(result_name, op, data, result_type, dtype);
 }
 
 SunMMIOValue SuvmSunmmioBuilder::Compare(const std::string &result_name,
@@ -77,6 +94,9 @@ SunMMIOValue SuvmSunmmioBuilder::Compare(const std::string &result_name,
                                          const SunMMIOValue &a,
                                          const SunMMIOValue &b,
                                          const SunMMIOType &operand_type) {
+  if (operand_type.kind == SunMMIOType::Kind::kTile) {
+    return tile_->Compare(result_name, op, domain, a, b, operand_type);
+  }
   return expr_->Compare(result_name, op, domain, a, b, operand_type);
 }
 
@@ -87,6 +107,14 @@ SunMMIOValue SuvmSunmmioBuilder::Select(const std::string &result_name,
                                         const SunMMIOType &result_type,
                                         DataType dtype) {
   return expr_->Select(result_name, cond, tv, fv, result_type, dtype);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::BindValueAlias(const std::string &result_name,
+                                                const SunMMIOValue &value) {
+  mlir::Value mlir_value = ctx_.LookupMLIRValue(value.value);
+  ICHECK(mlir_value) << "Cannot alias missing MLIR value " << value.value;
+  ctx_.BindMLIRValue(result_name, mlir_value);
+  return SunMMIOValue{value.dtype, result_name, value.type};
 }
 
 SunMMIOValue
@@ -108,11 +136,103 @@ SunMMIOValue SuvmSunmmioBuilder::Load(const std::string &result_name,
                        result_type);
 }
 
+SunMMIOValue SuvmSunmmioBuilder::GetPartitionedTileView(
+    const std::string &result_name, const SunMMIOValue &memtensor,
+    const std::vector<SunMMIOValue> &indices,
+    const std::vector<int64_t> &tiled_dims, const SunMMIOType &view_type,
+    DataType dtype) {
+  return tile_->GetPartitionedTileView(result_name, memtensor, indices,
+                                       tiled_dims, view_type, dtype);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::TileLoad(
+    const std::string &result_name, const SunMMIOValue &tile_view,
+    const SunMMIOType &tile_type, const std::optional<SunMMIOValue> &mask,
+    const std::optional<SunMMIOValue> &maskedoff, DataType dtype) {
+  return tile_->TileLoad(result_name, tile_view, tile_type, mask, maskedoff,
+                         dtype);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::TileFill(const std::string &result_name,
+                                          const SunMMIOValue &scalar,
+                                          const SunMMIOType &tile_type,
+                                          DataType dtype) {
+  return tile_->TileFill(result_name, scalar, tile_type, dtype);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::TileUnsqueeze(const std::string &result_name,
+                                               const SunMMIOValue &tile,
+                                               const SunMMIOType &tile_type,
+                                               int64_t axis, DataType dtype) {
+  return tile_->TileUnsqueeze(result_name, tile, tile_type, axis, dtype);
+}
+
+SunMMIOValue
+SuvmSunmmioBuilder::TileSlice(const std::string &result_name,
+                              const SunMMIOValue &tile,
+                              const std::vector<SunMMIOValue> &offsets,
+                              const SunMMIOType &tile_type, DataType dtype) {
+  return tile_->TileSlice(result_name, tile, offsets, tile_type, dtype);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::TileRectMask(const std::string &result_name,
+                                              const SunMMIOValue &valid_rows,
+                                              const SunMMIOValue &valid_cols,
+                                              const SunMMIOType &tile_type) {
+  return tile_->TileRectMask(result_name, valid_rows, valid_cols, tile_type);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::TileAxisMask(const std::string &result_name,
+                                              int64_t axis,
+                                              const SunMMIOValue &valid_extent,
+                                              const SunMMIOType &tile_type) {
+  return tile_->TileAxisMask(result_name, axis, valid_extent, tile_type);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::TileMaskAnd(const std::string &result_name,
+                                             const SunMMIOValue &lhs,
+                                             const SunMMIOValue &rhs,
+                                             const SunMMIOType &tile_type) {
+  return tile_->TileMaskAnd(result_name, lhs, rhs, tile_type);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::TileSelect(const std::string &result_name,
+                                            const SunMMIOValue &mask,
+                                            const SunMMIOValue &true_value,
+                                            const SunMMIOValue &false_value,
+                                            const SunMMIOType &result_type,
+                                            DataType dtype) {
+  return tile_->TileSelect(result_name, mask, true_value, false_value,
+                           result_type, dtype);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::TileReduce(const std::string &result_name,
+                                            const std::string &predicate,
+                                            const SunMMIOValue &data,
+                                            const SunMMIOType &result_type,
+                                            int64_t axis, DataType dtype) {
+  return tile_->TileReduce(result_name, predicate, data, result_type, axis,
+                           dtype);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::TileSqueeze(const std::string &result_name,
+                                             const SunMMIOValue &tile,
+                                             const SunMMIOType &tile_type,
+                                             int64_t axis, DataType dtype) {
+  return tile_->TileSqueeze(result_name, tile, tile_type, axis, dtype);
+}
+
 void SuvmSunmmioBuilder::Store(const SunMMIOValue &value,
                                const std::string &buffer_handle,
                                const std::vector<SunMMIOValue> &indices,
                                const SunMMIOType &memref_type) {
   memory_->Store(value, buffer_handle, indices, memref_type);
+}
+
+void SuvmSunmmioBuilder::TileStore(const SunMMIOValue &value,
+                                   const SunMMIOValue &tile_view,
+                                   const std::optional<SunMMIOValue> &mask) {
+  tile_->TileStore(value, tile_view, mask);
 }
 
 SunMMIOValue SuvmSunmmioBuilder::Call(
@@ -160,6 +280,14 @@ void SuvmSunmmioBuilder::BeginFor(
   function_->BeginFor(iv, lb, ub, step, annotations, live_out_token_ids);
 }
 
+void SuvmSunmmioBuilder::BeginFor(
+    const std::string &iv, const SunMMIOValue &lb, const SunMMIOValue &ub,
+    const SunMMIOValue &step,
+    const ffi::Map<ffi::String, ffi::Any> &annotations,
+    const std::vector<SunMMIOValue> &live_out_values) {
+  function_->BeginFor(iv, lb, ub, step, annotations, live_out_values);
+}
+
 void SuvmSunmmioBuilder::EndFor() { function_->EndFor(); }
 
 void SuvmSunmmioBuilder::BeginIf(
@@ -167,13 +295,45 @@ void SuvmSunmmioBuilder::BeginIf(
   function_->BeginIf(cond, live_out_token_ids);
 }
 
+void SuvmSunmmioBuilder::BeginIf(
+    const SunMMIOValue &cond,
+    const std::vector<SunMMIOValue> &live_out_values) {
+  function_->BeginIf(cond, live_out_values);
+}
+
 void SuvmSunmmioBuilder::BeginElse() { function_->BeginElse(); }
 
 void SuvmSunmmioBuilder::EndIf() { function_->EndIf(); }
 
+void SuvmSunmmioBuilder::BeginWhile(
+    const std::vector<int64_t> &live_out_token_ids) {
+  function_->BeginWhile(live_out_token_ids);
+}
+
+void SuvmSunmmioBuilder::BeginWhileBody(const SunMMIOValue &cond) {
+  function_->BeginWhileBody(cond);
+}
+
+void SuvmSunmmioBuilder::EndWhile() { function_->EndWhile(); }
+
 void SuvmSunmmioBuilder::EmitAssert(const SunMMIOValue &cond,
                                     const std::string &msg_text) {
   function_->EmitAssert(cond, msg_text);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::GetCoreId(const std::string &result_name,
+                                           DataType dtype) {
+  SunMMIOType i64_type{SunMMIOType::Kind::kScalar, DataType::Int(64), 1, {}};
+  auto core_id = mlir::suvm::GetCoreIdOp::create(
+      ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc("get_core_id"),
+      ctx_.builder.getI64Type());
+  ctx_.BindMLIRValue(result_name, core_id.getResult());
+  SunMMIOValue value{DataType::Int(64), result_name, i64_type};
+  SunMMIOType dst_type{SunMMIOType::Kind::kScalar, dtype, 1, {}};
+  if (dtype == DataType::Int(64)) {
+    return value;
+  }
+  return expr_->Cast(result_name, value, dst_type, dtype);
 }
 
 void SuvmSunmmioBuilder::PushLayoutScope(

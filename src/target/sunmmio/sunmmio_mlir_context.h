@@ -15,6 +15,7 @@
 #include <tvm/ffi/container/map.h>
 #include <tvm/ffi/optional.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -45,6 +46,7 @@ struct SunmmioMlirContext {
   struct ForFrame {
     mlir::scf::ForOp op;
     ffi::Map<ffi::String, ffi::Any> annotations;
+    std::vector<std::string> live_out_value_names;
     // Token ids that must be carried by scf.for and materialized after the
     // loop.
     std::vector<int64_t> live_out_token_ids;
@@ -61,9 +63,28 @@ struct SunmmioMlirContext {
   std::vector<TirLayoutMap> layout_map_stack;
   std::vector<TirLayoutMap> global_layout_map_stack;
 
+  struct WhileFrame {
+    mlir::scf::WhileOp op;
+    bool in_body{false};
+    // Token ids that must be carried by scf.while and materialized after the
+    // loop.
+    std::vector<int64_t> live_out_token_ids;
+    // token_id -> index into iter_tokens / produced_tokens.
+    std::unordered_map<int64_t, int> token_id_to_index;
+    // Region arguments in scf.while before/after regions.
+    std::vector<mlir::Value> before_tokens;
+    std::vector<mlir::Value> iter_tokens;
+    // Tokens produced in the loop body; falls back to iter_tokens when empty.
+    std::vector<mlir::Value> produced_tokens;
+    // Snapshots of ctx.token_by_id to restore when closing the loop.
+    std::unordered_map<int64_t, SavedToken> saved_token_by_id;
+  };
+  std::vector<WhileFrame> while_stack;
+
   struct IfFrame {
     mlir::scf::IfOp op;
     bool in_else{false};
+    std::vector<std::string> live_out_value_names;
     // Token ids that must be carried by scf.if and materialized after the if.
     std::vector<int64_t> live_out_token_ids;
     // token_id -> index into base_tokens / produced_tokens / then_yield_tokens.
@@ -82,7 +103,7 @@ struct SunmmioMlirContext {
   };
   std::vector<IfFrame> if_stack;
 
-  enum class ControlKind { kFor, kIf };
+  enum class ControlKind { kFor, kIf, kWhile };
 
   struct ControlNode {
     ControlKind kind;
@@ -142,6 +163,38 @@ struct SunmmioMlirContext {
       mlir_value_table_stack.emplace_back();
     }
     mlir_value_table_stack.back()[name] = v;
+    for (auto it = control_flow_stack.rbegin(); it != control_flow_stack.rend();
+         ++it) {
+      if (it->kind == ControlKind::kFor) {
+        ForFrame &frame = for_stack[it->index];
+        auto vit = std::find(frame.live_out_value_names.begin(),
+                             frame.live_out_value_names.end(), name);
+        if (vit == frame.live_out_value_names.end()) {
+          continue;
+        }
+        int idx = static_cast<int>(
+            std::distance(frame.live_out_value_names.begin(), vit));
+        if (idx >= 0 && idx < static_cast<int>(frame.produced_tokens.size())) {
+          frame.produced_tokens[idx] = v;
+        }
+        break;
+      }
+      if (it->kind == ControlKind::kWhile) {
+        continue;
+      }
+      IfFrame &frame = if_stack[it->index];
+      auto vit = std::find(frame.live_out_value_names.begin(),
+                           frame.live_out_value_names.end(), name);
+      if (vit == frame.live_out_value_names.end()) {
+        continue;
+      }
+      int idx = static_cast<int>(
+          std::distance(frame.live_out_value_names.begin(), vit));
+      if (idx >= 0 && idx < static_cast<int>(frame.produced_tokens.size())) {
+        frame.produced_tokens[idx] = v;
+      }
+      break;
+    }
   }
 
   void ClearLayoutScopes();

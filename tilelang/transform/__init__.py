@@ -360,6 +360,23 @@ def SunmmioTileLoopFusion():
     return _ffi_api.SunmmioTileLoopFusion()  # type: ignore
 
 
+def LegalizeSunmmioGemm():
+    """LegalizeSunmmioGemm — expand each bf16 ASRAM GEMM into the two-pass
+    form required by the Sunmmio bf16 tensor core (TC reads only ASRAM
+    north). For each matching GEMM, duplicates the direct A-operand writer
+    (Copy or AllgatherOp) with annotation ``src_offset_byte = 1024`` and
+    duplicates the GEMM with annotation ``acc_offset_byte`` computed from
+    the C dtype and TC block shape. Runs between layout inference and
+    LowerTileOp.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LegalizeSunmmioGemm()  # type: ignore
+
+
 def LegalizeSafeMemoryAccess():
     """LegalizeLoopVectorize
 
@@ -667,6 +684,28 @@ def LowerLDGSTG():
         The result pass
     """
     return _ffi_api.LowerLDGSTG()  # type: ignore
+
+
+def SunmmioPipelinePlanning(debug: bool = False):
+    """SunmmioPipelinePlanning
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.SunmmioPipelinePlanning(debug)  # type: ignore
+
+
+def InjectSunmmioPipeline():
+    """InjectSunmmioPipeline
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.InjectSunmmioPipeline()  # type: ignore
 
 
 def MergeSharedMemoryAllocationsSunmmio(

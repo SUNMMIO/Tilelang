@@ -60,7 +60,7 @@ class GemmSunmmio(GemmBase):
             B_arg = buffer_region_to_tile_region(self.BRegion, "r", [r for r in B_shape])
             C_arg = buffer_region_to_tile_region(self.CRegion, "rw", [r for r in C_shape])
 
-            args = [A_arg, B_arg, C_arg, self.trans_A, self.trans_B, self.clear_accum]
+            args = [A_arg, B_arg, C_arg, self.trans_A, self.trans_B, self.clear_accum, self.acc_offset_byte]
 
             @T.prim_func
             def _gemm_sss() -> None:

@@ -36,6 +36,9 @@ public:
   int kPack_ = 1;
   int wgWait_ = 0;
   mutable GemmWarpPolicy policy_;
+  // Byte offset added to the accumulator pointer at codegen. Set by the
+  // Sunmmio bf16 GEMM legalization pass. User code leaves it at 0.
+  int accOffsetByte_ = 0;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.GemmPy", GemmPyNode, TileOperatorNode);
 
@@ -62,7 +65,8 @@ public:
         .def_ro("cCoords", &GemmPyNode::cCoords_)
         .def_ro("kPack", &GemmPyNode::kPack_)
         .def_ro("wgWait", &GemmPyNode::wgWait_)
-        .def_ro("policy", &GemmPyNode::policy_);
+        .def_ro("policy", &GemmPyNode::policy_)
+        .def_ro(kFieldAccOffsetByte, &GemmPyNode::accOffsetByte_);
   }
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;

@@ -18,6 +18,13 @@
 namespace tvm {
 namespace codegen {
 
+inline DataType CanonicalizeSuvmDType(DataType dtype) {
+  if (dtype.is_float16()) {
+    return DataType::BFloat(16, dtype.lanes());
+  }
+  return dtype;
+}
+
 enum class BinaryOp {
   kAdd,
   kSub,
@@ -45,6 +52,8 @@ struct SunMMIOType {
     kVector,
     kMemRef,
     kMemTensor,
+    kTileView,
+    kTile,
     kUnknown
 
   };

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import tvm_ffi
 from tilelang import tvm as tvm
 from tvm.target import Target
 from tvm.ir import Range
@@ -10,6 +11,10 @@ from tilelang.utils.language import is_shared, is_fragment
 from tilelang.tileop.base import GemmWarpPolicy
 from tvm.ir.base import Node
 from tvm.ir import PrimExpr
+
+# Mirror of kFieldAccOffsetByte in src/target/sunmmio_utils.h. Resolved at
+# import time via FFI so the reflection field name stays in one place.
+FIELD_ACC_OFFSET_BYTE = str(tvm_ffi.get_global_func("tl.target.GetFieldAccOffsetByte")())
 
 
 @dataclass
@@ -122,6 +127,10 @@ class GemmBase:
     @property
     def policy(self) -> GemmWarpPolicy:
         return getattr(self.gemm_node, "policy", None)
+
+    @property
+    def acc_offset_byte(self) -> int:
+        return getattr(self.gemm_node, FIELD_ACC_OFFSET_BYTE, 0)
 
     @property
     def mbarptr(self) -> PrimExpr:

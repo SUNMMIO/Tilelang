@@ -285,12 +285,14 @@ file(GLOB TILE_LANG_SRCS
 if(USE_NPUIR)
   file(GLOB TILE_LANG_SUNMMIO_SRCS
     src/target/sunmmio/codegen_sunmmio.cc
+    src/target/sunmmio/sunmmio_codegen_tiles_loop.cc
     src/target/sunmmio/sunmmio_mlir_builder.cc
     src/target/sunmmio/sunmmio_mlir_context.cc
     src/target/sunmmio/sunmmio_mlir_type.cc
     src/target/sunmmio/sunmmio_mlir_function.cc
     src/target/sunmmio/sunmmio_mlir_expr.cc
     src/target/sunmmio/sunmmio_mlir_memory.cc
+    src/target/sunmmio/sunmmio_mlir_tile_op.cc
     src/target/sunmmio/sunmmio_mlir_call.cc
     src/target/sunmmio/rt_mod_sunmmio.cc
   )

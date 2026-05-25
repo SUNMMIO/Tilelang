@@ -111,8 +111,20 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
           recorded = true;
           break;
         }
-      } else {
+      } else if (nit->kind == SunmmioMlirContext::ControlKind::kIf) {
         SunmmioMlirContext::IfFrame &frame = ctx_.if_stack[nit->index];
+        auto tit = frame.token_id_to_index.find(token_id);
+        if (tit != frame.token_id_to_index.end()) {
+          int idx = tit->second;
+          if (idx >= 0 &&
+              idx < static_cast<int>(frame.produced_tokens.size())) {
+            frame.produced_tokens[idx] = produced;
+          }
+          recorded = true;
+          break;
+        }
+      } else {
+        SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack[nit->index];
         auto tit = frame.token_id_to_index.find(token_id);
         if (tit != frame.token_id_to_index.end()) {
           int idx = tit->second;
@@ -142,8 +154,10 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
       };
       if (node.kind == SunmmioMlirContext::ControlKind::kFor) {
         snapshot_if_needed(ctx_.for_stack[node.index]);
-      } else {
+      } else if (node.kind == SunmmioMlirContext::ControlKind::kIf) {
         snapshot_if_needed(ctx_.if_stack[node.index]);
+      } else {
+        snapshot_if_needed(ctx_.while_stack[node.index]);
       }
     }
 
@@ -189,10 +203,26 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     mlir::Value tok;
     for (auto nit = ctx_.control_flow_stack.rbegin();
          nit != ctx_.control_flow_stack.rend(); ++nit) {
-      if (nit->kind != SunmmioMlirContext::ControlKind::kFor) {
+      if (nit->kind == SunmmioMlirContext::ControlKind::kFor) {
+        SunmmioMlirContext::ForFrame &frame = ctx_.for_stack[nit->index];
+        auto tit = frame.token_id_to_index.find(token_id);
+        if (tit == frame.token_id_to_index.end()) {
+          continue;
+        }
+        int idx = tit->second;
+        if (idx >= 0 && idx < static_cast<int>(frame.iter_tokens.size())) {
+          tok = frame.iter_tokens[idx];
+          break;
+        }
         continue;
       }
-      SunmmioMlirContext::ForFrame &frame = ctx_.for_stack[nit->index];
+      if (nit->kind != SunmmioMlirContext::ControlKind::kWhile) {
+        continue;
+      }
+      SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack[nit->index];
+      if (!frame.in_body) {
+        continue;
+      }
       auto tit = frame.token_id_to_index.find(token_id);
       if (tit == frame.token_id_to_index.end()) {
         continue;
@@ -289,6 +319,29 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     }
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
+  } else if (callee == "tir.ret") {
+    ICHECK_EQ(operands.size(), 1) << "tir.ret expects one operand";
+
+    const SunMMIOValue &ret = operands[0];
+    bool is_zero = ret.value == "0";
+    if (!is_zero) {
+      mlir::Value ret_value = ctx_.LookupMLIRValue(ret.value);
+      if (ret_value) {
+        if (auto const_op =
+                ret_value.getDefiningOp<mlir::arith::ConstantOp>()) {
+          if (auto int_attr =
+                  mlir::dyn_cast<mlir::IntegerAttr>(const_op.getValue())) {
+            is_zero = int_attr.getInt() == 0;
+          }
+        }
+      }
+    }
+
+    ICHECK(is_zero) << "SunMMIO device kernel only supports T.ret(0); got "
+                    << ret.value;
+    return SunMMIOValue{
+        DataType::Void(), "",
+        SunMMIOType{SunMMIOType::Kind::kUnknown, DataType::Void(), 1, {}}};
   } else {
     (void)operands;
     (void)string_args;
@@ -299,10 +352,18 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     }
     ICHECK(ctx_.module)
         << "MLIR module must be initialized before lowering Sunmmio calls";
-    mlir::TypedAttr value_attr = ctx_.builder.getIntegerAttr(
-        mlir::Type::getFromOpaquePointer(
-            ctx_.builder.getF32Type().getAsOpaquePointer()),
-        0);
+    mlir::Type result_type = SunmmioMlirType(ctx_).MapType(ret_type);
+    mlir::TypedAttr value_attr;
+    if (mlir::isa<mlir::FloatType>(result_type)) {
+      value_attr = ctx_.builder.getFloatAttr(result_type, 0.0);
+    } else if (result_type.isIndex()) {
+      value_attr = ctx_.builder.getIndexAttr(0);
+    } else if (auto int_ty = mlir::dyn_cast<mlir::IntegerType>(result_type)) {
+      value_attr = ctx_.builder.getIntegerAttr(int_ty, 0);
+    } else {
+      result_type = ctx_.builder.getI32Type();
+      value_attr = ctx_.builder.getIntegerAttr(result_type, 0);
+    }
     auto fake_op = mlir::arith::ConstantOp::create(
         ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc("fake_call"),
         value_attr);

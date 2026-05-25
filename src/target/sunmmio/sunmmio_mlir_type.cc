@@ -93,6 +93,7 @@ mlir::Location SunmmioMlirType::MakeDebugLoc(const std::string &tag) const {
 }
 
 mlir::Type SunmmioMlirType::MapElementType(DataType dtype) const {
+  dtype = CanonicalizeSuvmDType(dtype);
   if (dtype.is_bool()) {
     return mlir::Type::getFromOpaquePointer(
         ctx_.builder.getI1Type().getAsOpaquePointer());
@@ -124,9 +125,12 @@ mlir::Type SunmmioMlirType::MapElementType(DataType dtype) const {
 }
 
 mlir::Type SunmmioMlirType::MapType(const SunMMIOType &type) const {
-  switch (type.kind) {
+  SunMMIOType canonical_type = type;
+  canonical_type.dtype = CanonicalizeSuvmDType(type.dtype);
+
+  switch (canonical_type.kind) {
   case SunMMIOType::Kind::kScalar:
-    return MapElementType(type.dtype);
+    return MapElementType(canonical_type.dtype);
   case SunMMIOType::Kind::kIndex:
     return mlir::Type::getFromOpaquePointer(
         ctx_.builder.getIndexType().getAsOpaquePointer());
@@ -134,38 +138,54 @@ mlir::Type SunmmioMlirType::MapType(const SunMMIOType &type) const {
     return mlir::Type::getFromOpaquePointer(
         ctx_.builder.getIntegerType(64).getAsOpaquePointer());
   case SunMMIOType::Kind::kVector: {
-    mlir::Type elem = MapElementType(type.dtype);
+    mlir::Type elem = MapElementType(canonical_type.dtype);
     return mlir::Type::getFromOpaquePointer(
-        mlir::VectorType::get({type.lanes}, elem).getAsOpaquePointer());
+        mlir::VectorType::get({canonical_type.lanes}, elem)
+            .getAsOpaquePointer());
   }
   case SunMMIOType::Kind::kMemRef: {
-    mlir::Type elem = MapElementType(type.dtype);
-    std::vector<int64_t> shape = ExtractShape(type);
+    mlir::Type elem = MapElementType(canonical_type.dtype);
+    std::vector<int64_t> shape = ExtractShape(canonical_type);
     return mlir::Type::getFromOpaquePointer(
         mlir::MemRefType::get(shape, elem).getAsOpaquePointer());
   }
   case SunMMIOType::Kind::kMemTensor: {
-    mlir::Type elem = MapElementType(type.dtype);
-    std::vector<int64_t> shape = ExtractShape(type);
+    mlir::Type elem = MapElementType(canonical_type.dtype);
+    std::vector<int64_t> shape = ExtractShape(canonical_type);
 
-    std::vector<int64_t> layout_hshape =
-        type.layout_hshape.empty() ? shape : type.layout_hshape;
+    std::vector<int64_t> layout_hshape = canonical_type.layout_hshape.empty()
+                                             ? shape
+                                             : canonical_type.layout_hshape;
     std::vector<int64_t> layout_hstride =
-        type.layout_hstride.empty() ? BuildRowMajorStrides(layout_hshape)
-                                    : type.layout_hstride;
-    std::vector<uint8_t> dim_levels = type.layout_dim_levels.empty()
+        canonical_type.layout_hstride.empty()
+            ? BuildRowMajorStrides(layout_hshape)
+            : canonical_type.layout_hstride;
+    std::vector<uint8_t> dim_levels = canonical_type.layout_dim_levels.empty()
                                           ? BuildFlatDimLevels(shape.size())
-                                          : type.layout_dim_levels;
+                                          : canonical_type.layout_dim_levels;
 
-    ValidateLayout(type, layout_hshape, layout_hstride, dim_levels);
+    ValidateLayout(canonical_type, layout_hshape, layout_hstride, dim_levels);
 
     mlir::suvm::LayoutAttr layout = mlir::suvm::LayoutAttr::get(
         &ctx_.mlir_ctx, layout_hshape, layout_hstride, dim_levels);
     mlir::suvm::MemorySpaceAttr memory_scope =
-        MapMemorySpaceAttr(&ctx_.mlir_ctx, type.memory_scope);
+        MapMemorySpaceAttr(&ctx_.mlir_ctx, canonical_type.memory_scope);
     mlir::suvm::MemTensorType memtensor = mlir::suvm::MemTensorType::get(
-        shape, elem, layout, memory_scope, type.byte_offset);
+        shape, elem, layout, memory_scope, canonical_type.byte_offset);
     return mlir::Type::getFromOpaquePointer(memtensor.getAsOpaquePointer());
+  }
+  case SunMMIOType::Kind::kTileView: {
+    mlir::Type elem = MapElementType(canonical_type.dtype);
+    std::vector<int64_t> shape = ExtractShape(canonical_type);
+    mlir::suvm::TileViewType tile_view =
+        mlir::suvm::TileViewType::get(shape, elem);
+    return mlir::Type::getFromOpaquePointer(tile_view.getAsOpaquePointer());
+  }
+  case SunMMIOType::Kind::kTile: {
+    mlir::Type elem = MapElementType(canonical_type.dtype);
+    std::vector<int64_t> shape = ExtractShape(canonical_type);
+    mlir::suvm::TileType tile = mlir::suvm::TileType::get(shape, elem);
+    return mlir::Type::getFromOpaquePointer(tile.getAsOpaquePointer());
   }
   case SunMMIOType::Kind::kUnknown:
   default:

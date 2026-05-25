@@ -133,6 +133,7 @@ void SunmmioMlirContext::Clear() {
   token_by_id.clear();
   for_stack.clear();
   if_stack.clear();
+  while_stack.clear();
   control_flow_stack.clear();
   ClearLayoutScopes();
   module = nullptr;

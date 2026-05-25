@@ -293,7 +293,10 @@ private:
 };
 
 PrimFunc TLLowerOpaqueBlock(PrimFunc f) {
-  return OpaqueBlockLower::Rewrite(std::move(f));
+  PrimFunc lowered = OpaqueBlockLower::Rewrite(std::move(f));
+  auto *fptr = lowered.CopyOnWrite();
+  fptr->body = ConvertSSA(std::move(fptr->body));
+  return lowered;
 }
 
 tir::transform::Pass LowerOpaqueBlock() {

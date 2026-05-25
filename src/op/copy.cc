@@ -821,8 +821,14 @@ Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
    */
   PrimExpr src_region = MakeRegionExpr(src, src_range, /*access_mask=*/1);
   PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
-  return Evaluate(
-      Call(DataType::Handle(), dma_copy(), {src_region, dst_region}));
+  // src_offset_byte is read from this CopyNode's annotations (set by the
+  // Sunmmio bf16 GEMM legalization pass) and emitted as a trailing positional
+  // arg of the dma_copy intrinsic. Default 0; codegen adds it to the source
+  // pointer of the emitted ODMA call. Direct positional propagation —
+  // no AttrStmt wrapper.
+  PrimExpr src_offset_imm = IntImm(DataType::Int(32), GetSrcOffsetByte());
+  return Evaluate(Call(DataType::Handle(), dma_copy(),
+                       {src_region, dst_region, src_offset_imm}));
 }
 
 Stmt CopyNode::LowerSunmmioTileCopy(const LowerArgs &T,
