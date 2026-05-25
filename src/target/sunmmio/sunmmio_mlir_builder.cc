@@ -247,9 +247,9 @@ SunMMIOValue SuvmSunmmioBuilder::Call(
 SunMMIOValue SuvmSunmmioBuilder::RegionCall(
     const std::string &result_name, const std::string &buffer_handle,
     const std::vector<SunMMIOValue> &mins, const std::vector<int64_t> &extents,
-    DataType ret_dtype, const SunMMIOType &ret_type) {
+    DataType ret_dtype, const SunMMIOType &ret_type, int64_t byte_offset) {
   return call_->RegionCall(result_name, buffer_handle, mins, extents, ret_dtype,
-                           ret_type);
+                           ret_type, byte_offset);
 }
 
 SunMMIOValue SuvmSunmmioBuilder::Ramp(const std::string &result_name,

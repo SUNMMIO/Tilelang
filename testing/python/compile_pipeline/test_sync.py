@@ -85,19 +85,19 @@ def test_sync():
                     T.wait_token(0)
                     C_shared_1[i * 1024] = T.Cast("float16", T.Cast("float32", C_shared_1[i * 1024]) + T.float32(1.0))
                 T.sync_null_token(2)
-                T.barrier_init(1, 0, 1, 2, 3)
+                T.barrier_init(1, T.int64(1), T.int64(15))
                 for _i in range(10):
                     E_shared = T.allocate([1048576], "float16", "shared.rsram")
                     T.wait_token(2)
                     T.barrier_arrive_and_wait(1)
                     E_shared_1 = T.Buffer((1048576,), "float16", data=E_shared, scope="shared.rsram")
                     T.broadcast_(T.region(D_shared_1[0], 1, 1048576), T.region(E_shared_1[0], 2, 1048576), 1048576, 0, 0, T.sync_token_id(1))
-                    T.barrier_init(0, 0, 1, 2, 3)
+                    T.barrier_init(0, T.int64(1), T.int64(15))
                     T.wait_token(1)
                     T.barrier_arrive_and_wait(0)
                     E_shared_1[0] = T.Cast("float16", T.Cast("float32", E_shared_1[0]) + T.float32(1.0))
                     T.broadcast_(T.region(E_shared_1[0], 1, 1048576), T.region(D_shared_1[0], 2, 1048576), 1048576, 0, 0, T.sync_token_id(2))
-                    T.barrier_init(1, 0, 1, 2, 3)
+                    T.barrier_init(1, T.int64(1), T.int64(15))
             T.wait_token(2)
             T.barrier_arrive_and_wait(1)
         return 0
@@ -118,11 +118,11 @@ def test_sync():
         'with T.launch_thread("blockIdx.x", 16) as bx:',
         "T.mma_sunmmio(T.region(A_shared[0, 0], 1, 1024, 1024), T.region(B_shared[0, 0], 1, 1024, 1024), T.region(C_shared[0, 0], 3, 1024, 1024), T.bool(False), T.bool(False), T.bool(False), 0, T.sync_token_id(0))",
         "T.sync_null_token(2)",
-        "T.barrier_init(1, 0, 1, 2, 3)",
+        "T.barrier_init(1, T.int64(1), T.int64(15))",
         "T.broadcast_(T.region(D_shared[0, 0], 1, 1024, 1024), T.region(E_shared[0, 0], 2, 1024, 1024), 0, 15, 0, 0, T.sync_token_id(1))",
-        "T.barrier_init(0, 0, 1, 2, 3)",
+        "T.barrier_init(0, T.int64(1), T.int64(15))",
         "T.broadcast_(T.region(E_shared[0, 0], 1, 1024, 1024), T.region(D_shared[0, 0], 2, 1024, 1024), 0, 15, 0, 0, T.sync_token_id(2))",
-        "T.barrier_init(1, 0, 1, 2, 3)",
+        "T.barrier_init(1, T.int64(1), T.int64(15))",
         "T.wait_token(2)",
         "T.barrier_arrive_and_wait(1)",
     ]

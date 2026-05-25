@@ -117,11 +117,11 @@ def test_summa():
                 A_1 = T.Buffer((16384,), "float16", data=A)
                 A_shared_1 = T.Buffer((1024,), "float16", data=A_shared, scope="shared.asram")
                 T.broadcast_(T.region(A_1[by * 4096 + k_tile * 32], 1, 4000), T.region(A_shared_1[0], 2, 1024), 1024, by * 4 + k_tile, 0, T.sync_token_id(0))
-                T.barrier_init(0, by * 4 + k_tile, by * 4, by * 4 + 1, by * 4 + 2, by * 4 + 3)
+                T.barrier_init(0, T.int64(1) << T.Cast("int64", by * 4 + k_tile), T.bitwise_or(T.bitwise_or(T.int64(1) << T.Cast("int64", by * 4), T.int64(1) << T.Cast("int64", by * 4 + 1)), T.bitwise_or(T.int64(1) << T.Cast("int64", by * 4 + 2), T.int64(1) << T.Cast("int64", by * 4 + 3))))
                 B_1 = T.Buffer((16384,), "float16", data=B)
                 B_shared_1 = T.Buffer((1024,), "float16", data=B_shared, scope="shared.wsram")
                 T.broadcast_(T.region(B_1[k_tile * 4096 + bx * 32], 1, 4000), T.region(B_shared_1[0], 2, 1024), 1024, k_tile * 4 + bx, 1, T.sync_token_id(1))
-                T.barrier_init(1, k_tile * 4 + bx, bx, bx + 4, bx + 8, bx + 12)
+                T.barrier_init(1, T.int64(1) << T.Cast("int64", k_tile * 4 + bx), T.bitwise_or(T.bitwise_or(T.int64(1) << T.Cast("int64", bx), T.int64(1) << T.Cast("int64", bx + 4)), T.bitwise_or(T.int64(1) << T.Cast("int64", bx + 8), T.int64(1) << T.Cast("int64", bx + 12))))
                 T.wait_token(0)
                 T.barrier_arrive_and_wait(0)
                 T.wait_token(1)
@@ -148,9 +148,9 @@ def test_summa():
         'with T.launch_thread("blockIdx.x", 16) as bx:',
         "T.dma_copy(T.region(A_1[bx * 32, 0], 1, 32, 32), T.region(A_rsram_stage[0, 0], 2, 32, 32), 0, T.sync_token_id(0))",
         "T.broadcast_(T.region(A_rsram_stage[0, 0], 1, 32, 32), T.region(A_shared[0, 0], 2, 32, 32), 0, 15, 0, 0, T.sync_token_id(1))",
-        "T.barrier_init(0, 0, 1, 2, 3)",
+        "T.barrier_init(0, T.int64(1), T.int64(15))",
         "T.broadcast_(T.region(B_1[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 2, 32, 32), 1, 4369, 0, 0, T.sync_token_id(2))",
-        "T.barrier_init(1, 0, 4, 8, 12)",
+        "T.barrier_init(1, T.int64(1), T.int64(4369))",
         "T.mma_sunmmio(T.region(A_shared[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 1, 32, 32), T.region(C_local[0, 0], 3, 32, 32), T.bool(False), T.bool(False), T.bool(False), 0, T.sync_token_id(3))",
         "T.dma_copy(T.region(C_local[0, 0], 1, 32, 32), T.region(C_1[bx * 32, 0], 2, 32, 32), 0, T.sync_token_id(4))",
         "T.wait_token(4)",

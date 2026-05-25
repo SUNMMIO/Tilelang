@@ -131,6 +131,73 @@ def broadcast_kernel(M, N, block_M, block_N, dtype="float16"):
     return main
 
 
+def _pointer_var(name, dtype="float16", scope="shared.rsram"):
+    return tir.Var(name, tvm.ir.PointerType(tvm.ir.PrimType(dtype), scope))
+
+
+def _region(buf, access):
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.tileop.region"),
+        tir.BufferLoad(buf, [tir.IntImm("int32", 0), tir.IntImm("int32", 0)]),
+        tir.IntImm("int32", access),
+        tir.IntImm("int32", 32),
+        tir.IntImm("int32", 32),
+    )
+
+
+def _make_leaf_broadcast_without_src_core_mod(target):
+    src_data = _pointer_var("src")
+    dst_data = _pointer_var("dst")
+    src_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="src_buf",
+        data=src_data,
+        scope="shared.rsram",
+    )
+    dst_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="dst_buf",
+        data=dst_data,
+        scope="shared.rsram",
+    )
+    broadcast = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.broadcast_"),
+            _region(src_buf, 1),
+            _region(dst_buf, 2),
+            tir.IntImm("int32", 0),
+            tir.IntImm("int64", 15),
+            tir.IntImm("int32", 0),
+        )
+    )
+    consume_dst = tir.Evaluate(
+        tir.BufferLoad(dst_buf, [tir.IntImm("int32", 0), tir.IntImm("int32", 0)])
+    )
+    body = tir.DeclBuffer(
+        src_buf,
+        tir.DeclBuffer(dst_buf, tir.SeqStmt([broadcast, consume_dst])),
+    )
+    func = tir.PrimFunc([src_data, dst_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
+def _parse_barrier_init_masks(line):
+    match = re.search(
+        r"barrier_init\((\d+), T\.(?:int64|Cast\(\"int64\", )\(?(\d+)\)?, "
+        r"T\.(?:int64|Cast\(\"int64\", )\(?(\d+)\)?\)",
+        line,
+    )
+    assert match, f"expected barrier_init(id, read_mask, write_mask), got: {line}"
+    return [int(match.group(i)) for i in range(1, 4)]
+
+
 def apply_sunmmio_lowering(mod, target):
     # This sequence lowers T.copy to tl.dma_copy and T.gemm to tl.mma_sunmmio
     mod = tvm.tir.transform.BindTarget(target)(mod)
@@ -337,20 +404,44 @@ def test_inject_sunmmio_sync_broadcast():
     assert idx_barrier_wait < idx_dma1
     assert idx_dma1 < idx_wait2
 
-    # Regression (PR #164): broadcast_ carries a core bitmask at arg slot 3
-    # and src_offset_byte at slot 5. The barrier parser must decode the
-    # bitmask instead of deriving write cores from the offset/source-core slots.
+    # Regression (PR #164): broadcast_ carries a core bitmask at arg slot 3,
+    # src_offset_byte at slot 4, and optional src_core before the sync token.
+    # The barrier parser must decode the bitmask instead of deriving write
+    # cores from the offset/source-core slots.
     # A horizontal broadcast from core (0,0) writes the whole mesh row 0 =
     # cores {0,1,2,3}.
     barrier_init_lines = [l for l in lines if "barrier_init" in l]
     assert barrier_init_lines, "expected a barrier_init for the broadcast"
-    init_nums = [int(x) for x in re.findall(r"-?\d+", barrier_init_lines[0])]
-    write_cores = set(init_nums[1:])  # arg 0 is the barrier id
-    assert write_cores == {0, 1, 2, 3}, (
-        f"broadcast barrier write-core set must be the full mesh row "
-        f"{{0,1,2,3}}; got {write_cores}; core 0 dropped means the "
-        f"broadcast bitmask was parsed incorrectly"
+    _, read_mask, write_mask = _parse_barrier_init_masks(barrier_init_lines[0])
+    assert read_mask == 1
+    assert write_mask == 15, (
+        f"broadcast barrier write mask must cover mesh row 0; "
+        f"got {write_mask}; expected 15"
     )
+
+
+def test_inject_sunmmio_sync_broadcast_without_src_core_full_mesh_barrier():
+    target = get_target("Sunmmio")
+    mod = _make_leaf_broadcast_without_src_core_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    script = mod.script()
+
+    assert "broadcast_" in script
+    assert "barrier_init" in script
+    assert "barrier_arrive_and_wait" in script
+
+    lines = [l.strip() for l in script.split("\n")]
+    broadcast_lines = [l for l in lines if "broadcast_" in l]
+    assert len(broadcast_lines) == 1
+    assert "T.sync_token_id(0)" in broadcast_lines[0]
+    assert ", 0, T.sync_token_id(0)" in broadcast_lines[0]
+
+    barrier_init_lines = [l for l in lines if "barrier_init" in l]
+    assert len(barrier_init_lines) == 1
+    _, read_mask, write_mask = _parse_barrier_init_masks(barrier_init_lines[0])
+    assert read_mask == (1 << 16) - 1
+    assert write_mask == (1 << 16) - 1
 
 
 def test_inject_sunmmio_sync_if():
@@ -537,5 +628,6 @@ if __name__ == "__main__":
     test_inject_sunmmio_sync_dma()
     test_inject_sunmmio_sync_mma()
     test_inject_sunmmio_sync_broadcast()
+    test_inject_sunmmio_sync_broadcast_without_src_core_full_mesh_barrier()
     test_inject_sunmmio_sync_if()
     test_inject_sunmmio_sync_loop()

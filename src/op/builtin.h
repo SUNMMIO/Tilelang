@@ -935,8 +935,8 @@ TVM_DLL const Op &stg256();
  *
  * Args:
  *   barrier_id: The identifier of the barrier.
- *   read_core: The core ID that reads data.
- *   write_cores...: The core IDs that write data.
+ *   read_mask: i64 bitmask of core IDs that read/source data.
+ *   write_mask: i64 bitmask of core IDs that write/receive data.
  */
 TVM_DLL const Op &barrier_init();
 

@@ -125,7 +125,7 @@ def test_overall():
                         C_shared[i * 256 + ki * 64 + j * 32:i * 256 + ki * 64 + j * 32 + 32] = C_shared[i * 256 + ki * 64 + j * 32:i * 256 + ki * 64 + j * 32 + 32] + Bias_shared[i * 256 + ki * 64 + j * 32 + 4096:i * 256 + ki * 64 + j * 32 + 4096 + 32]
             C_remote = T.Buffer((4096,), data=buf_shmem, scope="shared.rsram")
             T.broadcast_(T.region(C_shared[0], 1, 4096), T.region(C_remote[4096], 2, 4096), 4096, 0, 0, T.sync_token_id(13))
-            T.barrier_init(0, 0, 1, 2, 3)
+            T.barrier_init(0, T.int64(1), T.int64(15))
             T.wait_token(13)
             T.barrier_arrive_and_wait(0)
             C_1 = T.Buffer((1024,), data=C)
@@ -140,21 +140,21 @@ def test_overall():
         "C = T.match_buffer(C_handle, (32, 32), strides=(32, 1))",
         'bx = T.launch_thread("blockIdx.x", 16)',
         "for w in range(1):",
-        "T.dma_copy(T.region(A[bx * 64, 0], 1, 64, 32), T.region(A_rsram_stage[0, 0], 2, 64, 32))",
-        "T.dma_copy(T.region(B[0, 0], 1, 32, 64), T.region(B_shared[0, 0], 2, 32, 64))",
-        "T.broadcast_(T.region(C_shared[0, 0], 1, 64, 64), T.region(C_remote[0, 0], 2, 64, 64), 4096, 0, 0)",
-        "T.dma_copy(T.region(C_remote[0, 0], 1, 64, 64), T.region(C[bx * 64, 0], 2, 64, 64))",
+        "T.dma_copy(T.region(A[bx * 64, 0], 1, 64, 32), T.region(A_rsram_stage[0, 0], 2, 64, 32), 0)",
+        "T.dma_copy(T.region(B[0, 0], 1, 32, 64), T.region(B_shared[0, 0], 2, 32, 64), 0)",
+        "T.broadcast_(T.region(C_shared[0, 0], 1, 64, 64), T.region(C_remote[0, 0], 2, 64, 64), 0, T.int64(15), 0, 0)",
+        "T.dma_copy(T.region(C_remote[0, 0], 1, 64, 64), T.region(C[bx * 64, 0], 2, 64, 64), 0)",
     ]
 
     script_InjectSunmmioSync = [
         'with T.launch_thread("blockIdx.x", 16) as bx:',
-        "T.dma_copy(T.region(A_2[bx * 64, 0], 1, 64, 32), T.region(A_rsram_stage[0, 0, 0], 2, 1, 64, 32), T.sync_token_id(0))",
-        "T.dma_copy(T.region(B_2[0, 0], 1, 32, 64), T.region(B_shared[0, 0, 0], 2, 1, 32, 64), T.sync_token_id(1))",
-        "T.mma_sunmmio(T.region(A_shared[0, 0, 0], 1, 1, 64, 32), T.region(B_shared[0, 0, 0], 1, 1, 32, 64), T.region(C_shared[0, 0], 3, 64, 64), T.bool(False), T.bool(False), T.bool(False), T.sync_token_id(3))",
-        "T.dma_copy(T.region(Bias_2[bx * 64, 0], 1, 64, 64), T.region(Bias_shared[0, 0], 2, 64, 64), T.sync_token_id(4))",
-        "T.broadcast_(T.region(C_shared[0, 0], 1, 64, 64), T.region(C_remote[0, 0], 2, 64, 64), 4096, 0, 0, T.sync_token_id(5))",
-        "T.barrier_init(0, 0, 1, 2, 3)",
-        "T.dma_copy(T.region(C_remote[0, 0], 1, 64, 64), T.region(C_2[bx * 64, 0], 2, 64, 64), T.sync_token_id(6))",
+        "T.dma_copy(T.region(A_1[bx * 64, 0], 1, 64, 32), T.region(A_rsram_stage[0, 0, 0], 2, 1, 64, 32), 0, T.sync_token_id(0))",
+        "T.dma_copy(T.region(B_1[0, 0], 1, 32, 64), T.region(B_shared[0, 0, 0], 2, 1, 32, 64), 0, T.sync_token_id(1))",
+        "T.mma_sunmmio(T.region(A_shared[0, 0, 0], 1, 1, 64, 32), T.region(B_shared[0, 0, 0], 1, 1, 32, 64), T.region(C_shared[0, 0], 3, 64, 64), T.bool(False), T.bool(False), T.bool(False), 0, T.sync_token_id(3))",
+        "T.dma_copy(T.region(Bias_1[bx * 64, 0], 1, 64, 64), T.region(Bias_shared[0, 0], 2, 64, 64), 0, T.sync_token_id(4))",
+        "T.broadcast_(T.region(C_shared[0, 0], 1, 64, 64), T.region(C_remote[0, 0], 2, 64, 64), 0, 15, 0, 0, T.sync_token_id(5))",
+        "T.barrier_init(0, T.int64(1), T.int64(15))",
+        "T.dma_copy(T.region(C_remote[0, 0], 1, 64, 64), T.region(C_1[bx * 64, 0], 2, 64, 64), 0, T.sync_token_id(6))",
         "T.wait_token(6)",
     ]
 

@@ -52,8 +52,8 @@ TIR_DEFINE_TL_BUILTIN(broadcast_)
 // src_region, dst_region,
 // direction(0: horizontal/row, 1: vertical/col),
 // mask(i64 bitmask of receiving cores),
-// src_core,
-// src_offset_byte
+// src_offset_byte,
+// optional src_core
 
 using namespace tir;
 
@@ -128,13 +128,13 @@ PrimExpr MakeVerticalMask(PrimExpr src_core, int mesh_nrow, int mesh_ncol) {
 
 void AppendBroadcastArgs(Array<PrimExpr> *args, PrimExpr src_region,
                          PrimExpr dst_region, int direction, PrimExpr mask,
-                         PrimExpr src_core, PrimExpr src_offset_byte) {
+                         PrimExpr src_offset_byte, PrimExpr src_core) {
   args->push_back(src_region);
   args->push_back(dst_region);
   args->push_back(I32Imm(direction));
   args->push_back(mask);
-  args->push_back(src_core);
   args->push_back(src_offset_byte);
+  args->push_back(src_core);
 }
 
 } // namespace
@@ -293,7 +293,7 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
     AppendBroadcastArgs(&args,
                         MakeRegionExpr(src, src_range, /*access_mask=*/1),
                         MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-                        direction, mask, src_core, src_offset_imm);
+                        direction, mask, src_offset_imm, src_core);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return broadcast;
   } else {
@@ -310,7 +310,7 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
         &args, MakeRegionExpr(src, src_range, /*access_mask=*/1),
         MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
         /*direction=*/1, MakeVerticalMask(src_core, mesh_nrow, mesh_ncol),
-        src_core, src_offset_imm);
+        src_offset_imm, src_core);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     seq.push_back(broadcast);
     // horizontal broadcast
@@ -321,7 +321,7 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
           &args, MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
           MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
           /*direction=*/0, MakeHorizontalMask(row_src_core, mesh_ncol),
-          row_src_core, src_offset_imm);
+          src_offset_imm, row_src_core);
       Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
       seq.push_back(broadcast);
     }
@@ -447,7 +447,7 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     AppendBroadcastArgs(
         &args, MakeRegionExpr(src, src_range, /*access_mask=*/1),
         MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        /*direction=*/0, MakeCoreMask({dst_core_val}), src_core, I32Imm(0));
+        /*direction=*/0, MakeCoreMask({dst_core_val}), I32Imm(0), src_core);
     Stmt put = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return put;
   } else if (src_core_col == dst_core_col) {
@@ -456,7 +456,7 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     AppendBroadcastArgs(
         &args, MakeRegionExpr(src, src_range, /*access_mask=*/1),
         MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        /*direction=*/1, MakeCoreMask({dst_core_val}), src_core, I32Imm(0));
+        /*direction=*/1, MakeCoreMask({dst_core_val}), I32Imm(0), src_core);
     Stmt put = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return put;
   } else {
@@ -468,7 +468,7 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
                         MakeRegionExpr(src, src_range, /*access_mask=*/1),
                         MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
                         /*direction=*/1, MakeCoreMask({intermediate_core_id}),
-                        src_core, I32Imm(0));
+                        I32Imm(0), src_core);
     Stmt put1 = Evaluate(Call(DataType::Handle(), broadcast_(), args1));
     seq.push_back(put1);
     // horizontal transfer from intermediate core to dst core
@@ -478,7 +478,7 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
                         MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
                         MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
                         /*direction=*/0, MakeCoreMask({dst_core_val}),
-                        intermediate_core, I32Imm(0));
+                        I32Imm(0), intermediate_core);
     Stmt put2 = Evaluate(Call(DataType::Handle(), broadcast_(), args2));
     seq.push_back(put2);
     return SeqStmt::Flatten(seq);
@@ -680,8 +680,8 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
   Array<Stmt> bcast_stmts;
 
   // Propagate src_offset_byte (read from this op's annotations) into each
-  // BroadcastOp we construct, so it lands as the final positional arg of
-  // every emitted broadcast_() call. No AttrStmt wrapping needed.
+  // BroadcastOp we construct, so every emitted broadcast_() carries it before
+  // the optional src_core and sync_token_id args. No AttrStmt wrapping needed.
   int src_offset_byte = GetSrcOffsetByte();
   PrimExpr src_offset_imm = IntImm(DataType::Int(32), src_offset_byte);
 

@@ -1507,6 +1507,40 @@ const char *CodeGenTileLangSunMMIO::CallBucketName(CallBucket bucket) const {
   return "unsupported";
 }
 
+SunMMIOValue
+CodeGenTileLangSunMMIO::EmitRegionCall(const tvm::PrimExpr &region_expr,
+                                       int64_t byte_offset) {
+  if (region_expr.defined()) {
+    MarkVisitedNodeType(region_expr->GetTypeKey());
+    MarkVisitedCallOpFromExpr(region_expr);
+  }
+  if (const auto *region_call = region_expr.as<tir::CallNode>()) {
+    if (!region_call->args.empty()) {
+      if (const auto *load = region_call->args[0].as<tir::BufferLoadNode>()) {
+        MarkVisitedNodeType(load->GetTypeKey());
+      }
+    }
+  }
+
+  BufferRegion region = tl::NormalizeToBufferRegion(region_expr);
+  const BufferBinding &binding = LookupBuffer(region->buffer);
+  std::vector<SunMMIOValue> mins;
+  std::vector<int64_t> extents;
+  mins.reserve(region->region.size());
+  extents.reserve(region->region.size());
+  for (const Range &range : region->region) {
+    mins.push_back(EvalExpr(range->min));
+    const auto *extent_imm = range->extent.as<IntImmNode>();
+    ICHECK(extent_imm) << "tl.tileop.region extent must be IntImm";
+    MarkVisitedNodeType(range->extent->GetTypeKey());
+    extents.push_back(static_cast<int64_t>(extent_imm->value));
+  }
+  SunMMIOType ret_ty = MapType(region_expr.dtype());
+  std::string result_name = region_expr.dtype().is_void() ? "" : NewValueName();
+  return builder_->RegionCall(result_name, binding.handle, mins, extents,
+                              region_expr.dtype(), ret_ty, byte_offset);
+}
+
 SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
   CallBucket bucket = ClassifyCall(op);
   if (bucket == CallBucket::kUnsupported) {
@@ -1521,29 +1555,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
   std::vector<SunMMIOValue> operands;
   std::vector<std::string> string_args;
   if (callee == "tl.tileop.region") {
-    if (!op->args.empty()) {
-      if (const auto *load = op->args[0].as<tir::BufferLoadNode>()) {
-        MarkVisitedNodeType(load->GetTypeKey());
-      }
-    }
-    BufferRegion region =
-        tl::NormalizeToBufferRegion(tvm::ffi::GetRef<PrimExpr>(op));
-    const BufferBinding &binding = LookupBuffer(region->buffer);
-    std::vector<SunMMIOValue> mins;
-    std::vector<int64_t> extents;
-    mins.reserve(region->region.size());
-    extents.reserve(region->region.size());
-    for (const Range &range : region->region) {
-      mins.push_back(EvalExpr(range->min));
-      const auto *extent_imm = range->extent.as<IntImmNode>();
-      ICHECK(extent_imm) << "tl.tileop.region extent must be IntImm";
-      MarkVisitedNodeType(range->extent->GetTypeKey());
-      extents.push_back(static_cast<int64_t>(extent_imm->value));
-    }
-    SunMMIOType ret_ty = MapType(op->dtype);
-    std::string result_name = op->dtype.is_void() ? "" : NewValueName();
-    return builder_->RegionCall(result_name, binding.handle, mins, extents,
-                                op->dtype, ret_ty);
+    return EmitRegionCall(tvm::ffi::GetRef<PrimExpr>(op));
   } else if (callee == "tl.sync_null_token" || callee == "tl.wait_token") {
     for (int i = 0, e = static_cast<int>(op->args.size()); i < e; ++i) {
       const PrimExpr &arg = op->args[i];
@@ -1602,9 +1614,9 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     operands.push_back(EvalExpr(op->args[0]));
     operands.push_back(EvalExpr(op->args[1]));
   } else if (callee == "tl.broadcast_") {
-    ICHECK(op->args.size() == 7)
+    ICHECK(op->args.size() == 6 || op->args.size() == 7)
         << "tl.broadcast_ expects src region, dst region, direction, mask, "
-           "src_core, src_offset_byte, and sync_token_id";
+           "src_offset_byte, optional src_core, and sync_token_id";
 
     ICHECK(TryConsumeSyncTokenId(op->args.back(), &string_args))
         << "tl.broadcast_ expects last argument to be tl.sync_token_id";
@@ -1619,23 +1631,27 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
         << direction;
     MarkVisitedNodeType(direction_imm->GetTypeKey());
 
+    int64_t src_offset_byte = 0;
     const auto *src_offset_imm =
         op->args[tl::kBroadcastArgSrcOffsetByte].as<IntImmNode>();
     ICHECK(src_offset_imm)
         << "tl.broadcast_ src_offset_byte must be a constant IntImm";
+    src_offset_byte = static_cast<int64_t>(src_offset_imm->value);
+    ICHECK_GE(src_offset_byte, 0)
+        << "tl.broadcast_ src_offset_byte must be non-negative";
     MarkVisitedNodeType(src_offset_imm->GetTypeKey());
 
     operands.reserve(4);
-    operands.push_back(EvalExpr(op->args[tl::kBroadcastArgSrc]));
-    operands.push_back(EvalExpr(op->args[tl::kBroadcastArgDst]));
+    operands.push_back(
+        EmitRegionCall(op->args[tl::kBroadcastArgSrc], src_offset_byte));
+    operands.push_back(EmitRegionCall(op->args[tl::kBroadcastArgDst]));
     operands.push_back(EvalExpr(op->args[tl::kBroadcastArgMask]));
-    operands.push_back(EvalExpr(op->args[tl::kBroadcastArgSrcCore]));
+    if (op->args.size() == 7) {
+      operands.push_back(EvalExpr(op->args[op->args.size() - 2]));
+    }
 
     string_args.push_back(std::string("direction=") +
                           (direction == 0 ? "row" : "col"));
-    string_args.push_back(
-        "src_offset_byte=" +
-        std::to_string(static_cast<int64_t>(src_offset_imm->value)));
   } else if (callee == "tl.mma_sunmmio") {
     ICHECK_EQ(op->args.size(), 8) << "tl.mma_sunmmio expects A/B/C regions, "
                                      "three flag operands, and sync_token_id";

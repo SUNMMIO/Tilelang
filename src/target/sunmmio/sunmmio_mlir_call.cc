@@ -23,7 +23,8 @@ SunMMIOValue SunmmioMlirCall::RegionCall(const std::string &result_name,
                                          const std::vector<SunMMIOValue> &mins,
                                          const std::vector<int64_t> &extents,
                                          DataType ret_dtype,
-                                         const SunMMIOType &ret_type) {
+                                         const SunMMIOType &ret_type,
+                                         int64_t byte_offset) {
   SunmmioMlirType type(ctx_);
 
   mlir::Value source = ctx_.LookupMLIRValue(buffer_handle);
@@ -34,6 +35,21 @@ SunMMIOValue SunmmioMlirCall::RegionCall(const std::string &result_name,
       mlir::dyn_cast<mlir::suvm::MemTensorType>(source.getType());
   ICHECK(memtensor_ty)
       << "tl.tileop.region expects source buffer to be a suvm.memtensor";
+
+  mlir::Value source_for_view = source;
+  if (byte_offset != 0) {
+    ICHECK_GE(byte_offset, 0)
+        << "tl.tileop.region byte_offset must be non-negative";
+    int64_t shifted_offset = memtensor_ty.getByteOffset() + byte_offset;
+    auto shifted_ty = mlir::suvm::MemTensorType::get(
+        memtensor_ty.getShape(), memtensor_ty.getElementType(),
+        memtensor_ty.getLayout(), memtensor_ty.getMemorySpace(),
+        shifted_offset);
+    auto shift_op = mlir::suvm::ShiftMemTensorOp::create(
+        ctx_.builder, type.MakeDebugLoc("shift_memtensor"), shifted_ty, source,
+        static_cast<uint64_t>(byte_offset));
+    source_for_view = shift_op.getResult();
+  }
 
   mlir::SmallVector<mlir::Value, 4> indices;
   indices.reserve(mins.size());
@@ -71,8 +87,8 @@ SunMMIOValue SunmmioMlirCall::RegionCall(const std::string &result_name,
   auto tiled_dims_attr = ctx_.builder.getDenseI64ArrayAttr(tiled_dims);
 
   auto view_op = mlir::suvm::GetPartitionedTileViewOp::create(
-      ctx_.builder, type.MakeDebugLoc("region"), tile_view_ty, source, indices,
-      tiled_dims_attr);
+      ctx_.builder, type.MakeDebugLoc("region"), tile_view_ty, source_for_view,
+      indices, tiled_dims_attr);
   ctx_.BindMLIRValue(result_name, view_op->getResult(0));
   return SunMMIOValue{ret_dtype, result_name, ret_type};
 }
