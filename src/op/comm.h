@@ -117,6 +117,9 @@ public:
   // Otherwise the (already-normalized non-negative) axis along which recv
   // concatenates the K per-core contributions.
   int axis;
+  // Current core id, passed from the Python frontend as the blockIdx.x binding.
+  // Optional during migration so older 5-argument call sites remain parseable.
+  PrimExpr cid;
   // Supported annotation keys:
   //   - kAttrSrcOffsetByte ("src_offset_byte"): IntImm, byte offset added to
   //     the source pointer at codegen. Set by the Sunmmio bf16 GEMM
@@ -134,6 +137,8 @@ public:
         .def_ro("recv", &AllgatherOpNode::recv)
         .def_ro("direction", &AllgatherOpNode::direction)
         .def_ro("size", &AllgatherOpNode::size)
+        .def_ro("axis", &AllgatherOpNode::axis)
+        .def_ro("cid", &AllgatherOpNode::cid)
         .def_ro("annotations", &AllgatherOpNode::annotations);
   }
 

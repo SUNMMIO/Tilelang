@@ -137,6 +137,17 @@ void AppendBroadcastArgs(Array<PrimExpr> *args, PrimExpr src_region,
   args->push_back(src_core);
 }
 
+Stmt MakeBroadcastLeaf(PrimExpr src_region, PrimExpr dst_region, int direction,
+                       PrimExpr mask, PrimExpr src_offset_byte) {
+  Array<PrimExpr> args;
+  args.push_back(src_region);
+  args.push_back(dst_region);
+  args.push_back(I32Imm(direction));
+  args.push_back(mask);
+  args.push_back(src_offset_byte);
+  return Evaluate(Call(DataType::Handle(), broadcast_(), args));
+}
+
 } // namespace
 
 /*!
@@ -492,6 +503,8 @@ TIR_REGISTER_TL_TILE_OP(PutOp, comm_put)
 
 AllgatherOp::AllgatherOp(Array<PrimExpr> args,
                          Map<String, ObjectRef> annotations) {
+  ICHECK_GE(args.size(), 4)
+      << "Allgather expects at least send, recv, direction, and size.";
   ObjectPtr<AllgatherOpNode> node = tvm::ffi::make_object<AllgatherOpNode>();
   node->send = args[0];
   node->recv = args[1];
@@ -499,6 +512,9 @@ AllgatherOp::AllgatherOp(Array<PrimExpr> args,
   node->size = Downcast<IntImm>(args[3]);
   // axis is optional for backwards compatibility: -1 = legacy mode.
   node->axis = (args.size() > 4) ? Downcast<IntImm>(args[4])->value : -1;
+  // cid is optional during migration: new Python frontend calls pass the
+  // blockIdx.x binding, while older internal C++ call sites may still omit it.
+  node->cid = (args.size() > 5) ? args[5] : PrimExpr();
   node->annotations = annotations;
   data_ = std::move(node);
 }
@@ -627,6 +643,15 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
       << "Receive buffer size not enough for allgather: required "
       << (Downcast<IntImm>(send_elements)->value * recv_num) << ", but got "
       << Downcast<IntImm>(recv_elements)->value;
+  PrimExpr bcast_elements = (size->value < 0) ? send_elements : PrimExpr(size);
+  ICHECK(Downcast<IntImm>(bcast_elements)->value <=
+         Downcast<IntImm>(send_elements)->value)
+      << "Allgather size larger than send buffer size: "
+      << Downcast<IntImm>(bcast_elements)->value << " vs "
+      << Downcast<IntImm>(send_elements)->value;
+
+  ICHECK(cid.defined())
+      << "Allgather dynamic-region lowering requires current core id.";
 
   // Unified lowering for all axis modes. Every per-core contribution lands
   // in an equal-size slot along a single axis of recv ("slice_axis"). Slot
@@ -656,19 +681,16 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
       << recv_num << ").";
   PrimExpr slot_extent_p1 = analyzer->Simplify(FloorDiv(
       recv_range[slice_axis]->extent, IntImm(DataType::Int(32), recv_num)));
-  IntImm bcast_size_imm =
-      (size->value < 0) ? Downcast<IntImm>(send_elements) : size;
 
   // Build a sub-region of recv spanning a single slab of width `slot_extent`
   // along `slice_axis`, starting at slot index `slot_start`. All other dims
   // pass through `recv_range` unchanged.
-  auto make_slab = [&](int slot_start, PrimExpr slot_extent) {
+  auto make_slab = [&](PrimExpr slot_start, PrimExpr slot_extent) {
     Array<Range> ranges;
     for (int d = 0; d < recv_rank; d++) {
       if (d == slice_axis) {
         PrimExpr base = analyzer->Simplify(
-            recv_range[d]->min +
-            IntImm(DataType::Int(32), slot_start) * slot_extent);
+            recv_range[d]->min + slot_start * slot_extent);
         ranges.push_back(Range::FromMinExtent(base, slot_extent));
       } else {
         ranges.push_back(recv_range[d]);
@@ -685,72 +707,56 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
   int src_offset_byte = GetSrcOffsetByte();
   PrimExpr src_offset_imm = IntImm(DataType::Int(32), src_offset_byte);
 
-  auto emit = [&](Array<Range> dst_ranges, IntImm bcast_elems, int src_core_id,
-                  int bcast_dir, bool src_from_send) {
-    Array<PrimExpr> args;
-    if (src_from_send) {
-      args.push_back(MakeRegionExpr(send_buffer, send_range, /*mask=*/1));
-    } else {
-      args.push_back(MakeRegionExpr(recv_buffer, dst_ranges, /*mask=*/1));
-    }
-    args.push_back(MakeRegionExpr(recv_buffer, dst_ranges, /*mask=*/2));
-    args.push_back(bcast_elems);
-    args.push_back(IntImm(DataType::Int(32), src_core_id));
-    args.push_back(IntImm(DataType::Int(32), bcast_dir));
-    args.push_back(src_offset_imm);
-    BroadcastOp bcast(args);
-    bcast_stmts.push_back(bcast->Lower(T, analyzer));
+  PrimExpr current_core = cid;
+  PrimExpr mesh_ncol_expr = IntImm(current_core.dtype(), mesh_ncol);
+  PrimExpr current_row =
+      analyzer->Simplify(floordiv(current_core, mesh_ncol_expr));
+  PrimExpr current_col =
+      analyzer->Simplify(floormod(current_core, mesh_ncol_expr));
+
+  auto emit_from_send = [&](Array<Range> dst_ranges, int bcast_dir,
+                            PrimExpr mask) {
+    bcast_stmts.push_back(MakeBroadcastLeaf(
+        MakeRegionExpr(send_buffer, send_range, /*access_mask=*/1),
+        MakeRegionExpr(recv_buffer, dst_ranges, /*access_mask=*/2), bcast_dir,
+        analyzer->Simplify(mask), src_offset_imm));
+  };
+
+  auto emit_from_recv = [&](Array<Range> slab_ranges, int bcast_dir,
+                            PrimExpr mask) {
+    bcast_stmts.push_back(MakeBroadcastLeaf(
+        MakeRegionExpr(recv_buffer, slab_ranges, /*access_mask=*/1),
+        MakeRegionExpr(recv_buffer, slab_ranges, /*access_mask=*/2), bcast_dir,
+        analyzer->Simplify(mask), src_offset_imm));
   };
 
   if (direction == 0) { // horizontal
-    for (int i = 0; i < mesh_nrow; i++) {
-      for (int j = 0; j < mesh_ncol; j++) {
-        emit(make_slab(/*slot_start=*/j, slot_extent_p1), bcast_size_imm,
-             /*src_core=*/i * mesh_ncol + j, /*bcast_dir=*/0,
-             /*src_from_send=*/true);
-      }
-    }
+    emit_from_send(make_slab(current_col, slot_extent_p1), /*bcast_dir=*/0,
+                   MakeHorizontalMask(current_core, mesh_ncol));
   } else if (direction == 1) { // vertical
-    for (int j = 0; j < mesh_ncol; j++) {
-      for (int i = 0; i < mesh_nrow; i++) {
-        emit(make_slab(/*slot_start=*/i, slot_extent_p1), bcast_size_imm,
-             /*src_core=*/i * mesh_ncol + j, /*bcast_dir=*/1,
-             /*src_from_send=*/true);
-      }
-    }
+    emit_from_send(make_slab(current_row, slot_extent_p1), /*bcast_dir=*/1,
+                   MakeVerticalMask(current_core, mesh_nrow, mesh_ncol));
   } else { // direction == 2 ("all")
-    // Phase 1: horizontal. Core (i,j) lands at slot (i*ncol + j).
-    for (int i = 0; i < mesh_nrow; i++) {
-      for (int j = 0; j < mesh_ncol; j++) {
-        emit(make_slab(/*slot_start=*/i * mesh_ncol + j, slot_extent_p1),
-             bcast_size_imm,
-             /*src_core=*/i * mesh_ncol + j, /*bcast_dir=*/0,
-             /*src_from_send=*/true);
-      }
-    }
+    // Phase 1: horizontal. The current core lands at its global slot.
+    emit_from_send(make_slab(current_core, slot_extent_p1), /*bcast_dir=*/0,
+                   MakeHorizontalMask(current_core, mesh_ncol));
+
     // Phase 2: vertical. Each row's mesh_ncol-wide gathered slab (rows
     // i*ncol .. (i+1)*ncol of phase-1 slots) is broadcast to every row in
     // each column.
     PrimExpr row_extent = analyzer->Simplify(
         IntImm(DataType::Int(32), mesh_ncol) * slot_extent_p1);
-    IntImm row_size_imm =
-        IntImm(DataType::Int(32), bcast_size_imm->value * mesh_ncol);
-    for (int j = 0; j < mesh_ncol; j++) {
-      for (int i = 0; i < mesh_nrow; i++) {
-        // slab index `i` covers slots [i*ncol .. (i+1)*ncol) of phase 1;
-        // offset along slice_axis is i * row_extent = i*ncol * slot_extent_p1.
-        emit(make_slab(/*slot_index=*/i, row_extent), row_size_imm,
-             /*src_core=*/i * mesh_ncol + j, /*bcast_dir=*/1,
-             /*src_from_send=*/false);
-      }
-    }
+    // slab index `current_row` covers slots
+    // [current_row*ncol .. (current_row+1)*ncol) of phase 1.
+    emit_from_recv(make_slab(current_row, row_extent), /*bcast_dir=*/1,
+                   MakeVerticalMask(current_core, mesh_nrow, mesh_ncol));
   }
 
   return SeqStmt::Flatten(bcast_stmts);
 }
 
 TIR_REGISTER_TL_TILE_OP(AllgatherOp, comm_allgather)
-    .set_num_inputs(5)
+    .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -971,6 +977,9 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
       row_allgather_args.push_back(
           IntImm(DataType::Int(32), 0)); // direction = horizontal
       row_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
+      row_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // axis
+      row_allgather_args.push_back(
+          Call(DataType::Int(32), comm_current_core(), {})); // cid
       AllgatherOp row_allgather_op = AllgatherOp(row_allgather_args);
       Stmt row_allgather_stmt = row_allgather_op->Lower(T, analyzer);
       stmts.push_back(row_allgather_stmt);
@@ -995,6 +1004,9 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
       col_allgather_args.push_back(
           IntImm(DataType::Int(32), 1)); // direction = vertical
       col_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
+      col_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // axis
+      col_allgather_args.push_back(
+          Call(DataType::Int(32), comm_current_core(), {})); // cid
       AllgatherOp col_allgather_op = AllgatherOp(col_allgather_args);
       Stmt col_allgather_stmt = col_allgather_op->Lower(T, analyzer);
       stmts.push_back(col_allgather_stmt);
@@ -1030,6 +1042,9 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
       row_allgather_args.push_back(
           IntImm(DataType::Int(32), 0)); // direction = horizontal
       row_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
+      row_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // axis
+      row_allgather_args.push_back(
+          Call(DataType::Int(32), comm_current_core(), {})); // cid
       AllgatherOp row_allgather_op = AllgatherOp(row_allgather_args);
       Stmt row_allgather_stmt = row_allgather_op->Lower(T, analyzer);
       stmts.push_back(row_allgather_stmt);
@@ -1056,6 +1071,9 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
       col_allgather_args.push_back(
           IntImm(DataType::Int(32), 1)); // direction = vertical
       col_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
+      col_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // axis
+      col_allgather_args.push_back(
+          Call(DataType::Int(32), comm_current_core(), {})); // cid
       AllgatherOp col_allgather_op = AllgatherOp(col_allgather_args);
       Stmt col_allgather_stmt = col_allgather_op->Lower(T, analyzer);
       stmts.push_back(col_allgather_stmt);

@@ -8,6 +8,62 @@ def verify_comm_lower(func: tir.PrimFunc):
     current_mesh_nrow = 4
     current_mesh_ncol = 4
 
+    def split_top_level_args(arg_str):
+        args = []
+        start = 0
+        depth = 0
+        in_string = False
+        escape = False
+        for idx, ch in enumerate(arg_str):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                args.append(arg_str[start:idx].strip())
+                start = idx + 1
+        tail = arg_str[start:].strip()
+        if tail:
+            args.append(tail)
+        return args
+
+    def broadcast_call_args(line):
+        prefix = "T.broadcast_("
+        start = line.find(prefix)
+        if start < 0:
+            return None
+        arg_start = start + len(prefix)
+        depth = 1
+        in_string = False
+        escape = False
+        for idx in range(arg_start, len(line)):
+            ch = line[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return split_top_level_args(line[arg_start:idx])
+        return None
+
     def make_core_mask(core_ids):
         mask = 0
         for core_id in core_ids:
@@ -33,8 +89,8 @@ def verify_comm_lower(func: tir.PrimFunc):
             return 0 if direction_val.value == "h" else 1 if direction_val.value == "v" else 2
         return int(direction_val) if isinstance(direction_val, tir.IntImm) else 0
 
-    def add_expected(src_core, direction, mask=None):
-        expected_broadcasts.append((stringify_expr(src_core), direction, mask))
+    def add_expected(src_core, direction, mask=None, has_src_core=True):
+        expected_broadcasts.append((stringify_expr(src_core) if src_core is not None else None, direction, mask, has_src_core))
 
     def get_region_size(node):
         if isinstance(node, tir.Call) and node.op.name == "tl.tileop.region":
@@ -169,27 +225,12 @@ def verify_comm_lower(func: tir.PrimFunc):
                         size = analyzer.simplify(size0)
 
                 if direction == 0:  # horizontal
-                    for i in range(current_mesh_nrow):
-                        mask = make_core_mask(i * current_mesh_ncol + j for j in range(current_mesh_ncol))
-                        for j in range(current_mesh_ncol):
-                            add_expected(tir.IntImm("int32", i * current_mesh_ncol + j), 0, mask)
+                    add_expected(None, 0, None, has_src_core=False)
                 elif direction == 1:  # vertical
-                    for j in range(current_mesh_ncol):
-                        mask = make_core_mask(i * current_mesh_ncol + j for i in range(current_mesh_nrow))
-                        for i in range(current_mesh_nrow):
-                            add_expected(tir.IntImm("int32", i * current_mesh_ncol + j), 1, mask)
+                    add_expected(None, 1, None, has_src_core=False)
                 elif direction == 2:  # all
-                    # horizontal first
-                    for i in range(current_mesh_nrow):
-                        mask = make_core_mask(i * current_mesh_ncol + j for j in range(current_mesh_ncol))
-                        for j in range(current_mesh_ncol):
-                            add_expected(tir.IntImm("int32", i * current_mesh_ncol + j), 0, mask)
-                    # then vertical
-                    allgather_size = analyzer.simplify(size * current_mesh_ncol)
-                    for j in range(current_mesh_ncol):
-                        mask = make_core_mask(i * current_mesh_ncol + j for i in range(current_mesh_nrow))
-                        for i in range(current_mesh_nrow):
-                            add_expected(tir.IntImm("int32", i * current_mesh_ncol + j), 1, mask)
+                    add_expected(None, 0, None, has_src_core=False)
+                    add_expected(None, 1, None, has_src_core=False)
 
     if not isinstance(func, tir.PrimFunc):
         raise ValueError(f"Expected PrimFunc, got {type(func)}")
@@ -205,17 +246,40 @@ def verify_comm_lower(func: tir.PrimFunc):
     # 2. Return the check function
     def check(mod: IRModule):
         script = mod.script()
-        for core, direction, mask in expected_broadcasts:
-            # Match T.broadcast_(..., direction, mask, src_core, ...)
-            escaped_core = re.escape(core).replace(r"\ ", r"\s*")
+        broadcast_arg_lists = [
+            args for line in script.splitlines() if (args := broadcast_call_args(line.strip())) is not None
+        ]
+        for core, direction, mask, has_src_core in expected_broadcasts:
             if mask is None:
                 mask_pattern = r".*?"
             else:
                 mask_pattern = rf"(?:T\.int64\({mask}\)|{mask})"
-            pattern = rf"T\.broadcast_\(.*?,\s*.*?,\s*{direction},\s*{mask_pattern},\s*{escaped_core}(?:,|\))"
-            assert re.search(pattern, script), (
-                f"Expected broadcast_ with core={core}, direction={direction}, mask={mask} not found in IRModule"
-            )
+            if has_src_core:
+                # Match T.broadcast_(..., direction, mask, src_offset_byte, src_core, ...)
+                escaped_core = re.escape(core).replace(r"\ ", r"\s*")
+                pattern = rf"T\.broadcast_\(.*?,\s*.*?,\s*{direction},\s*{mask_pattern},\s*.*?,\s*{escaped_core}(?:,|\))"
+                message = f"Expected broadcast_ with core={core}, direction={direction}, mask={mask} not found in IRModule"
+            else:
+                # Match the dynamic allgather form without src_core:
+                # T.broadcast_(src_region, dst_region, direction, mask, src_offset_byte[, sync_token_id])
+                message = f"Expected broadcast_ without src_core, direction={direction}, mask={mask} not found in IRModule"
+                found = False
+                for args in broadcast_arg_lists:
+                    if len(args) == 5:
+                        fixed_args = args
+                    elif len(args) == 6 and args[-1].startswith("T.sync_token_id("):
+                        fixed_args = args[:-1]
+                    else:
+                        continue
+                    if fixed_args[2] != str(direction):
+                        continue
+                    if mask is not None and fixed_args[3] not in {f"T.int64({mask})", str(mask)}:
+                        continue
+                    found = True
+                    break
+                assert found, message
+                continue
+            assert re.search(pattern, script), message
 
     return check
 

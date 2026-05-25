@@ -1556,6 +1556,9 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
   std::vector<std::string> string_args;
   if (callee == "tl.tileop.region") {
     return EmitRegionCall(tvm::ffi::GetRef<PrimExpr>(op));
+  } else if (callee == "tl.comm_current_core") {
+    std::string result_name = NewValueName();
+    return builder_->GetCoreId(result_name, op->dtype);
   } else if (callee == "tl.sync_null_token" || callee == "tl.wait_token") {
     for (int i = 0, e = static_cast<int>(op->args.size()); i < e; ++i) {
       const PrimExpr &arg = op->args[i];
@@ -1623,12 +1626,15 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     operands.push_back(EmitRegionCall(op->args[0], src_offset_byte));
     operands.push_back(EmitRegionCall(op->args[1]));
   } else if (callee == "tl.broadcast_") {
-    ICHECK(op->args.size() == 6 || op->args.size() == 7)
+    size_t non_token_args = op->args.size();
+    if (non_token_args > 0 &&
+        TryConsumeSyncTokenId(op->args.back(), &string_args)) {
+      --non_token_args;
+    }
+    ICHECK(non_token_args == static_cast<size_t>(tl::kBroadcastArgCount) ||
+           non_token_args == static_cast<size_t>(tl::kBroadcastArgCount + 1))
         << "tl.broadcast_ expects src region, dst region, direction, mask, "
-           "src_offset_byte, optional src_core, and sync_token_id";
-
-    ICHECK(TryConsumeSyncTokenId(op->args.back(), &string_args))
-        << "tl.broadcast_ expects last argument to be tl.sync_token_id";
+           "src_offset_byte, optional src_core, and optional sync_token_id";
 
     const auto *direction_imm =
         op->args[tl::kBroadcastArgDirection].as<IntImmNode>();
@@ -1655,8 +1661,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
         EmitRegionCall(op->args[tl::kBroadcastArgSrc], src_offset_byte));
     operands.push_back(EmitRegionCall(op->args[tl::kBroadcastArgDst]));
     operands.push_back(EvalExpr(op->args[tl::kBroadcastArgMask]));
-    if (op->args.size() == 7) {
-      operands.push_back(EvalExpr(op->args[op->args.size() - 2]));
+    if (non_token_args == static_cast<size_t>(tl::kBroadcastArgCount + 1)) {
+      operands.push_back(EvalExpr(op->args[tl::kBroadcastArgSrcCore]));
     }
 
     string_args.push_back(std::string("direction=") +

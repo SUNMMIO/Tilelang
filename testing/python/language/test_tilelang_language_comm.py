@@ -12,68 +12,66 @@ def _broadcast_lines(script):
 
 
 def _broadcast_line(src, dst, direction, mask, core, src_offset=0):
-    return f"T.broadcast_({src}, {dst}, {direction}, T.int64({mask}), {core}, {src_offset})"
+    return f"T.broadcast_({src}, {dst}, {direction}, T.int64({mask}), {src_offset}, {core})"
+
+
+def _broadcast_line_no_core(src, dst, direction, mask, src_offset=0):
+    return f"T.broadcast_({src}, {dst}, {direction}, {mask}, {src_offset})"
+
+
+_ROW_MASK_BX = (
+    'T.bitwise_or(T.bitwise_or(T.bitwise_or(T.bitwise_or(T.int64(0), '
+    'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4))), '
+    'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4) + T.int64(1))), '
+    'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4) + T.int64(2))), '
+    'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4) + T.int64(3)))'
+)
+
+_COL_MASK_BX = (
+    'T.bitwise_or(T.bitwise_or(T.bitwise_or(T.bitwise_or(T.int64(0), '
+    'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4))), '
+    'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4) + T.int64(4))), '
+    'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4) + T.int64(8))), '
+    'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4) + T.int64(12)))'
+)
 
 
 def _expected_axis0_all_lines(buffer):
-    expected = []
-    row_masks = [15, 240, 3840, 61440]
-    col_masks = [4369, 8738, 17476, 34952]
     src = "T.region(A_shared[0, 0], 1, 128, 128)"
-    for row, row_mask in enumerate(row_masks):
-        for col in range(4):
-            core = row * 4 + col
-            expected.append(_broadcast_line(src, f"T.region({buffer}[{core * 128}, 0], 2, 128, 128)", 0, row_mask, core))
-    for col, col_mask in enumerate(col_masks):
-        for row in range(4):
-            core = row * 4 + col
-            start = row * 512
-            expected.append(
-                _broadcast_line(
-                    f"T.region({buffer}[{start}, 0], 1, 512, 128)",
-                    f"T.region({buffer}[{start}, 0], 2, 512, 128)",
-                    1,
-                    col_mask,
-                    core,
-                )
-            )
-    return expected
+    return [
+        _broadcast_line_no_core(src, f"T.region({buffer}[bx * 128, 0], 2, 128, 128)", 0, _ROW_MASK_BX),
+        _broadcast_line_no_core(
+            f"T.region({buffer}[bx // 4 * 512, 0], 1, 512, 128)",
+            f"T.region({buffer}[bx // 4 * 512, 0], 2, 512, 128)",
+            1,
+            _COL_MASK_BX,
+        ),
+    ]
 
 
 def _expected_axis_last_horizontal_lines(buffer):
-    expected = []
-    row_masks = [15, 240, 3840, 61440]
     src = "T.region(A_shared[0, 0], 1, 128, 128)"
-    for row, row_mask in enumerate(row_masks):
-        for col in range(4):
-            core = row * 4 + col
-            expected.append(_broadcast_line(src, f"T.region({buffer}[0, {col * 128}], 2, 128, 128)", 0, row_mask, core))
-    return expected
+    return [
+        _broadcast_line_no_core(
+            src,
+            f"T.region({buffer}[0, bx % 4 * 128], 2, 128, 128)",
+            0,
+            _ROW_MASK_BX,
+        )
+    ]
 
 
 def _expected_axis_last_all_lines(buffer):
-    expected = []
-    row_masks = [15, 240, 3840, 61440]
-    col_masks = [4369, 8738, 17476, 34952]
     src = "T.region(A_shared[0, 0], 1, 128, 128)"
-    for row, row_mask in enumerate(row_masks):
-        for col in range(4):
-            core = row * 4 + col
-            expected.append(_broadcast_line(src, f"T.region({buffer}[0, {core * 128}], 2, 128, 128)", 0, row_mask, core))
-    for col, col_mask in enumerate(col_masks):
-        for row in range(4):
-            core = row * 4 + col
-            start = row * 512
-            expected.append(
-                _broadcast_line(
-                    f"T.region({buffer}[0, {start}], 1, 128, 512)",
-                    f"T.region({buffer}[0, {start}], 2, 128, 512)",
-                    1,
-                    col_mask,
-                    core,
-                )
-            )
-    return expected
+    return [
+        _broadcast_line_no_core(src, f"T.region({buffer}[0, bx * 128], 2, 128, 128)", 0, _ROW_MASK_BX),
+        _broadcast_line_no_core(
+            f"T.region({buffer}[0, bx // 4 * 512], 1, 128, 512)",
+            f"T.region({buffer}[0, bx // 4 * 512], 2, 128, 512)",
+            1,
+            _COL_MASK_BX,
+        ),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -86,9 +84,9 @@ def test_comm_python_api(M, N, block_M, block_N, dtype, accum_dtype):
     func_str = """
         T.comm_broadcast(A_shared[0:128, 0:128], B_shared[0:128, 0:128], -1, 6, 2)
         T.comm_put(A_shared[0:128, 0:128], B_shared[0:128, 0:128], -1, 6, 11)
-        T.comm_allgather(A_shared[0:128, 0:128], C_shared[0:16, 0:128, 0:128], 2, -1, -1)
-        T.comm_allgather(A_shared[0:128, 0:128], R0_shared[0:2048, 0:128], 2, -1, 0)
-        T.comm_allgather(A_shared[0:128, 0:128], R1_shared[0:128, 0:2048], 2, -1, 1)""".strip()
+        T.comm_allgather(A_shared[0:128, 0:128], C_shared[0:16, 0:128, 0:128], 2, -1, -1, bx)
+        T.comm_allgather(A_shared[0:128, 0:128], R0_shared[0:2048, 0:128], 2, -1, 0, bx)
+        T.comm_allgather(A_shared[0:128, 0:128], R1_shared[0:128, 0:2048], 2, -1, 1, bx)""".strip()
 
     @T.prim_func
     def main(
@@ -119,11 +117,11 @@ def test_comm_python_api(M, N, block_M, block_N, dtype, accum_dtype):
 )
 def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
     expected = [
-        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(17476), 6, 0)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(15), 2, 0)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(240), 6, 0)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(3840), 10, 0)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(61440), 14, 0)",
+        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(17476), 0, 6)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(15), 0, 2)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(240), 0, 6)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(3840), 0, 10)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(61440), 0, 14)",
     ]
 
     @T.prim_func
@@ -153,9 +151,9 @@ def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
 )
 def test_comm_broadcast_lower_custom_mesh(M, N, block_M, block_N, dtype):
     expected = [
-        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(36), 5, 0)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(7), 2, 0)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(56), 5, 0)",
+        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(36), 0, 5)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(7), 0, 2)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(56), 0, 5)",
     ]
 
     @T.prim_func
@@ -195,8 +193,8 @@ def test_comm_broadcast_lower_custom_mesh(M, N, block_M, block_N, dtype):
 )
 def test_comm_put_lower(M, N, block_M, block_N, dtype, accum_dtype):
     expected = [
-        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(1024), 6, 0)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(2048), 10, 0)",
+        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(1024), 0, 6)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(2048), 0, 10)",
     ]
 
     @T.prim_func
@@ -225,26 +223,20 @@ def test_comm_put_lower(M, N, block_M, block_N, dtype, accum_dtype):
     ],
 )
 def test_comm_all_gather_lower(M, N, block_M, block_N, dtype, accum_dtype):
-    expected = []
-    row_masks = [15, 240, 3840, 61440]
-    col_masks = [4369, 8738, 17476, 34952]
-    for row, row_mask in enumerate(row_masks):
-        for col in range(4):
-            core = row * 4 + col
-            expected.append(
-                "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), "
-                f"T.region(C_shared[{core}, 0, 0], 2, 1, 128, 128), "
-                f"0, T.int64({row_mask}), {core}, 0)"
-            )
-    for col, col_mask in enumerate(col_masks):
-        for row in range(4):
-            core = row * 4 + col
-            start = row * 4
-            expected.append(
-                f"T.broadcast_(T.region(C_shared[{start}, 0, 0], 1, 4, 128, 128), "
-                f"T.region(C_shared[{start}, 0, 0], 2, 4, 128, 128), "
-                f"1, T.int64({col_mask}), {core}, 0)"
-            )
+    expected = [
+        _broadcast_line_no_core(
+            "T.region(A_shared[0, 0], 1, 128, 128)",
+            "T.region(C_shared[bx, 0, 0], 2, 1, 128, 128)",
+            0,
+            _ROW_MASK_BX,
+        ),
+        _broadcast_line_no_core(
+            "T.region(C_shared[bx // 4 * 4, 0, 0], 1, 4, 128, 128)",
+            "T.region(C_shared[bx // 4 * 4, 0, 0], 2, 4, 128, 128)",
+            1,
+            _COL_MASK_BX,
+        ),
+    ]
 
     @T.prim_func
     def main(

@@ -370,6 +370,7 @@ def all_gather(
 
     send_buffer_region = to_buffer_region(send_buffer)
     recv_buffer_region = to_buffer_region(recv_buffer)
+    cid = T.get_block_binding(0)
 
     args = (
         send_buffer_region,
@@ -377,6 +378,7 @@ def all_gather(
         DIRECTION_MAP[direction.lower()],
         size,
         axis_arg,
+        cid,
     )
     ann = {ATTR_SRC_OFFSET_BYTE: src_offset_byte} if src_offset_byte != 0 else None
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_allgather"), *args, annotations=ann)
