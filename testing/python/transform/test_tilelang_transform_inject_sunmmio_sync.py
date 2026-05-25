@@ -1,5 +1,4 @@
 import re
-import warnings
 import tilelang
 import tilelang.language as T
 from tilelang import tvm
@@ -338,19 +337,19 @@ def test_inject_sunmmio_sync_broadcast():
     assert idx_barrier_wait < idx_dma1
     assert idx_dma1 < idx_wait2
 
-    # Regression (PR #164): broadcast_ carries src_offset_byte at arg slot 5,
-    # so core-mask indices begin at slot 6. The barrier-mask parser must skip
-    # the offset slot — otherwise the offset value (0) is misread as a mask
-    # and core 0 is dropped from the barrier's write set. A horizontal
-    # broadcast from core (0,0) writes the whole mesh row 0 = cores {0,1,2,3}.
+    # Regression (PR #164): broadcast_ carries a core bitmask at arg slot 3
+    # and src_offset_byte at slot 5. The barrier parser must decode the
+    # bitmask instead of deriving write cores from the offset/source-core slots.
+    # A horizontal broadcast from core (0,0) writes the whole mesh row 0 =
+    # cores {0,1,2,3}.
     barrier_init_lines = [l for l in lines if "barrier_init" in l]
     assert barrier_init_lines, "expected a barrier_init for the broadcast"
     init_nums = [int(x) for x in re.findall(r"-?\d+", barrier_init_lines[0])]
     write_cores = set(init_nums[1:])  # arg 0 is the barrier id
     assert write_cores == {0, 1, 2, 3}, (
         f"broadcast barrier write-core set must be the full mesh row "
-        f"{{0,1,2,3}}; got {write_cores} — core 0 dropped means the "
-        f"src_offset_byte slot was misparsed as a core mask"
+        f"{{0,1,2,3}}; got {write_cores}; core 0 dropped means the "
+        f"broadcast bitmask was parsed incorrectly"
     )
 
 
@@ -482,32 +481,6 @@ def test_inject_sunmmio_sync_loop():
 
         return main
 
-    func_str = """
-        with T.launch_thread("blockIdx.x", 4) as bx:
-            by = T.launch_thread("blockIdx.y", 4)
-            tx = T.launch_thread("threadIdx.x", 128)
-            ty = T.launch_thread("threadIdx.y", 1)
-            tz = T.launch_thread("threadIdx.z", 1)
-            with T.decl_buffer((32, 32), scope="shared.rsram") as D_shared:
-                C_2 = T.Buffer((128, 128), data=C, strides=(128, 1))
-                T.dma_copy(T.region(C_2[by * 32, bx * 32], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), 0, T.sync_token_id(0))
-                T.sync_null_token(2)
-                T.barrier_init(1, 0, 1, 2, 3)
-                for _i in range(10):
-                    C_shared = T.decl_buffer((32, 32), scope="shared.rsram")
-                    T.wait_token(2)
-                    T.barrier_arrive_and_wait(1)
-                    T.wait_token(0)
-                    T.broadcast_(T.region(C_shared[0, 0], 1, 32, 32), T.region(D_shared[0, 0], 2, 32, 32), 1024, 0, 0, 0, T.sync_token_id(1))
-                    T.barrier_init(0, 0, 1, 2, 3)
-                    T.wait_token(1)
-                    T.barrier_arrive_and_wait(0)
-                    T.broadcast_(T.region(D_shared[0, 0], 1, 32, 32), T.region(C_shared[0, 0], 2, 32, 32), 1024, 0, 0, 0, T.sync_token_id(2))
-                    T.barrier_init(1, 0, 1, 2, 3)
-            T.wait_token(2)
-            T.barrier_arrive_and_wait(1)
-    """.strip()
-
     M, N = 128, 128
     block_M, block_N = 32, 32
     target = get_target("Sunmmio")
@@ -519,10 +492,45 @@ def test_inject_sunmmio_sync_loop():
 
     mod = tilelang.transform.InjectSunmmioSync()(mod)
     script = mod.script(show_meta=True)
-    # Temporary Solution
-    if func_str not in script:
-        warnings.warn("The generated script does not match the expected output.", stacklevel=2)
-    # assert func_str in script, "The generated script does not match the expected output."
+    lines = script.splitlines()
+
+    def extract_call_id(line, marker):
+        match = re.search(rf"{re.escape(marker)}\((\d+)\)", line)
+        assert match, f"Cannot parse {marker} in line: {line}"
+        return int(match.group(1))
+
+    broadcast_entries = [
+        (idx, line.strip(), extract_call_id(line, "sync_token_id"))
+        for idx, line in enumerate(lines)
+        if "broadcast_" in line and "sync_token_id(" in line
+    ]
+    assert len(broadcast_entries) == 2
+
+    first_bcast_idx, first_bcast_line, first_token = broadcast_entries[0]
+    second_bcast_idx, second_bcast_line, second_token = broadcast_entries[1]
+    assert first_token == 1
+    assert second_token == 2
+    assert ", 0, 15, 0, 0, T.sync_token_id(1)" in first_bcast_line
+    assert ", 0, 15, 0, 0, T.sync_token_id(2)" in second_bcast_line
+
+    wait_entries = [(idx, line.strip(), extract_call_id(line, "wait_token")) for idx, line in enumerate(lines) if "wait_token(" in line]
+    barrier_entries = []
+    for idx, line in enumerate(lines):
+        match = re.search(r"barrier_init\(([^)]*)\)", line)
+        if match:
+            args = match.group(1).strip()
+            barrier_entries.append((idx, line.strip(), int(args.split(",", 1)[0]), "," not in args))
+    wait_token_2_before_first = [idx for idx, _, token in wait_entries if token == 2 and idx < first_bcast_idx]
+    wait_token_0_before_first = [idx for idx, _, token in wait_entries if token == 0 and idx < first_bcast_idx]
+    wait_token_1_between = [idx for idx, _, token in wait_entries if token == 1 and first_bcast_idx < idx < second_bcast_idx]
+    assert wait_token_2_before_first
+    assert wait_token_0_before_first
+    assert wait_token_1_between
+
+    barrier0_after_first = [idx for idx, _, barrier_id, _ in barrier_entries if barrier_id == 0 and idx > first_bcast_idx]
+    barrier1_after_second = [idx for idx, _, barrier_id, _ in barrier_entries if barrier_id == 1 and idx > second_bcast_idx]
+    assert barrier0_after_first and min(barrier0_after_first) < min(wait_token_1_between)
+    assert barrier1_after_second
 
 
 if __name__ == "__main__":

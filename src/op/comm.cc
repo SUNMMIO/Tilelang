@@ -6,6 +6,7 @@
 #include "comm.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <tvm/tir/op.h>
 #include <vector>
 
@@ -48,11 +49,95 @@ TIR_DEFINE_TL_BUILTIN(broadcast_)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
-// src_buffer, dst_buffer, size(IntImm), src_core(IntImm)
-// direction(0: horizontal, 1: vertical),
-// *mask(optional: IntImm list of core ids to exclude)
+// src_region, dst_region,
+// direction(0: horizontal/row, 1: vertical/col),
+// mask(i64 bitmask of receiving cores),
+// src_core,
+// src_offset_byte
 
 using namespace tir;
+
+namespace {
+
+PrimExpr I32Imm(int64_t value) { return IntImm(DataType::Int(32), value); }
+
+PrimExpr I64Imm(int64_t value) { return IntImm(DataType::Int(64), value); }
+
+PrimExpr AsI64(PrimExpr value) {
+  if (value.dtype() == DataType::Int(64)) {
+    return value;
+  }
+  return Cast(DataType::Int(64), value);
+}
+
+PrimExpr CoreBit(PrimExpr core_id) { return I64Imm(1) << AsI64(core_id); }
+
+PrimExpr MakeCoreMask(const std::vector<int> &core_ids) {
+  uint64_t mask = 0;
+  for (int core_id : core_ids) {
+    ICHECK_GE(core_id, 0);
+    ICHECK_LT(core_id, 64)
+        << "tl.broadcast_ mask currently supports core ids in [0, 64)";
+    mask |= (uint64_t{1} << core_id);
+  }
+  return I64Imm(static_cast<int64_t>(mask));
+}
+
+PrimExpr MakeHorizontalMask(PrimExpr src_core, int mesh_ncol) {
+  if (const auto *imm = src_core.as<IntImmNode>()) {
+    int src_core_val = static_cast<int>(imm->value);
+    int row = src_core_val / mesh_ncol;
+    std::vector<int> core_ids;
+    core_ids.reserve(mesh_ncol);
+    for (int j = 0; j < mesh_ncol; ++j) {
+      core_ids.push_back(row * mesh_ncol + j);
+    }
+    return MakeCoreMask(core_ids);
+  }
+
+  PrimExpr ncol = IntImm(src_core.dtype(), mesh_ncol);
+  PrimExpr row = floordiv(src_core, ncol);
+  PrimExpr row_base = AsI64(row * ncol);
+  PrimExpr mask = I64Imm(0);
+  for (int j = 0; j < mesh_ncol; ++j) {
+    mask = mask | CoreBit(row_base + I64Imm(j));
+  }
+  return mask;
+}
+
+PrimExpr MakeVerticalMask(PrimExpr src_core, int mesh_nrow, int mesh_ncol) {
+  if (const auto *imm = src_core.as<IntImmNode>()) {
+    int src_core_val = static_cast<int>(imm->value);
+    int col = src_core_val % mesh_ncol;
+    std::vector<int> core_ids;
+    core_ids.reserve(mesh_nrow);
+    for (int i = 0; i < mesh_nrow; ++i) {
+      core_ids.push_back(i * mesh_ncol + col);
+    }
+    return MakeCoreMask(core_ids);
+  }
+
+  PrimExpr ncol = IntImm(src_core.dtype(), mesh_ncol);
+  PrimExpr col = floormod(src_core, ncol);
+  PrimExpr mask = I64Imm(0);
+  for (int i = 0; i < mesh_nrow; ++i) {
+    mask = mask | CoreBit(I64Imm(i * mesh_ncol) + AsI64(col));
+  }
+  return mask;
+}
+
+void AppendBroadcastArgs(Array<PrimExpr> *args, PrimExpr src_region,
+                         PrimExpr dst_region, int direction, PrimExpr mask,
+                         PrimExpr src_core, PrimExpr src_offset_byte) {
+  args->push_back(src_region);
+  args->push_back(dst_region);
+  args->push_back(I32Imm(direction));
+  args->push_back(mask);
+  args->push_back(src_core);
+  args->push_back(src_offset_byte);
+}
+
+} // namespace
 
 /*!
  * \brief Sunmmio SRAM layout inference for symmetric comm ops.
@@ -139,16 +224,6 @@ LayoutMap BroadcastOpNode::InferLayout(const LayoutInferArgs &T,
   return copy_op->InferLayout(T, level);
 }
 
-// Builds the fixed positional prefix of a broadcast_() call, in the layout
-// declared by BroadcastArg (comm.h). Callers append trailing core-mask
-// indices (kBroadcastArgMaskBegin onward) as needed.
-Array<PrimExpr> MakeBroadcastArgs(PrimExpr src_region, PrimExpr dst_region,
-                                  PrimExpr size, PrimExpr src_core,
-                                  PrimExpr direction,
-                                  PrimExpr src_offset_byte) {
-  return {src_region, dst_region, size, src_core, direction, src_offset_byte};
-}
-
 Stmt BroadcastOpNode::Lower(const LowerArgs &T,
                             arith::Analyzer *analyzer) const {
   Target target = T.target;
@@ -208,17 +283,17 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
                << ", must be 0 (horizontal) or 1 (vertical) or 2 (all).";
   }
 
-  // all checks passed, generate the call. srcOffsetByte_ is appended as the
-  // final positional arg of every broadcast_() emitted by this BroadcastOp,
-  // so codegen reads it from a stable call-arg slot — no AttrStmt wrapper.
   PrimExpr src_offset_imm = IntImm(DataType::Int(32), srcOffsetByte_);
   if (direction == 0 or direction == 1) {
     // 1D broadcast
-    Array<PrimExpr> args =
-        MakeBroadcastArgs(MakeRegionExpr(src, src_range, /*access_mask=*/1),
-                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-                          Downcast<IntImm>(broadcast_elements), src_core,
-                          direction, src_offset_imm);
+    Array<PrimExpr> args;
+    PrimExpr mask = direction == 0
+                        ? MakeHorizontalMask(src_core, mesh_ncol)
+                        : MakeVerticalMask(src_core, mesh_nrow, mesh_ncol);
+    AppendBroadcastArgs(&args,
+                        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                        direction, mask, src_core, src_offset_imm);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return broadcast;
   } else {
@@ -230,20 +305,23 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
 
     Array<Stmt> seq;
     // vertical broadcast
-    Array<PrimExpr> args =
-        MakeBroadcastArgs(MakeRegionExpr(src, src_range, /*access_mask=*/1),
-                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-                          Downcast<IntImm>(broadcast_elements), src_core,
-                          /*direction=*/1, src_offset_imm);
+    Array<PrimExpr> args;
+    AppendBroadcastArgs(
+        &args, MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        /*direction=*/1, MakeVerticalMask(src_core, mesh_nrow, mesh_ncol),
+        src_core, src_offset_imm);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     seq.push_back(broadcast);
     // horizontal broadcast
     for (int i = 0; i < mesh_nrow; i++) {
-      Array<PrimExpr> args = MakeBroadcastArgs(
-          MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
+      Array<PrimExpr> args;
+      PrimExpr row_src_core = I32Imm(i * mesh_ncol + src_core_col);
+      AppendBroadcastArgs(
+          &args, MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
           MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-          Downcast<IntImm>(broadcast_elements),
-          int(i * mesh_ncol) + src_core_col, /*direction=*/0, src_offset_imm);
+          /*direction=*/0, MakeHorizontalMask(row_src_core, mesh_ncol),
+          row_src_core, src_offset_imm);
       Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
       seq.push_back(broadcast);
     }
@@ -352,9 +430,6 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       << (Downcast<IntImm>(broadcast_elements)->value) << " vs "
       << Downcast<IntImm>(dst_elements)->value;
 
-  // all checks passed, generate the call
-  PrimExpr src_addr = src.access_ptr(1, DataType::Handle(), 1, 0, src_elements);
-  PrimExpr dst_addr = dst.access_ptr(2, DataType::Handle(), 1, 0, dst_elements);
   ICHECK(src_core.as<IntImmNode>())
       << "Put only supports constant source core id.";
   ICHECK(dst_core.as<IntImmNode>())
@@ -367,66 +442,43 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   int dst_core_col = dst_core_val % mesh_ncol;
 
   if (src_core_row == dst_core_row) {
-    // 1D put via horizontal communication. PutOp does not use
-    // src_offset_byte, so it passes 0 in that slot; masks follow.
-    Array<PrimExpr> args = MakeBroadcastArgs(
-        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+    // 1D put via horizontal communication
+    Array<PrimExpr> args;
+    AppendBroadcastArgs(
+        &args, MakeRegionExpr(src, src_range, /*access_mask=*/1),
         MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/0,
-        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
-    for (int j = 0; j < mesh_ncol; j++) {
-      if (j != dst_core_col) {
-        args.push_back(IntImm(DataType::Int(32),
-                              j)); // mask: all cores except dst_core_col
-      }
-    }
+        /*direction=*/0, MakeCoreMask({dst_core_val}), src_core, I32Imm(0));
     Stmt put = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return put;
   } else if (src_core_col == dst_core_col) {
-    // 1D put via vertical communication.
-    Array<PrimExpr> args = MakeBroadcastArgs(
-        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+    // 1D put via vertical communication
+    Array<PrimExpr> args;
+    AppendBroadcastArgs(
+        &args, MakeRegionExpr(src, src_range, /*access_mask=*/1),
         MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/1,
-        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
-    for (int i = 0; i < mesh_nrow; i++) {
-      if (i != dst_core_row) {
-        args.push_back(IntImm(DataType::Int(32),
-                              i)); // mask: all cores except dst_core_row
-      }
-    }
+        /*direction=*/1, MakeCoreMask({dst_core_val}), src_core, I32Imm(0));
     Stmt put = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return put;
   } else {
     Array<Stmt> seq;
     // vertical transfer from src core to intermediate core
     int intermediate_core_id = dst_core_row * mesh_ncol + src_core_col;
-    Array<PrimExpr> args1 = MakeBroadcastArgs(
-        MakeRegionExpr(src, src_range, /*access_mask=*/1),
-        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/1,
-        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
-    for (int i = 0; i < mesh_nrow; i++) {
-      if (i != dst_core_row) {
-        args1.push_back(IntImm(DataType::Int(32),
-                               i)); // mask: all cores except dst_core_row
-      }
-    }
+    Array<PrimExpr> args1;
+    AppendBroadcastArgs(&args1,
+                        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                        /*direction=*/1, MakeCoreMask({intermediate_core_id}),
+                        src_core, I32Imm(0));
     Stmt put1 = Evaluate(Call(DataType::Handle(), broadcast_(), args1));
     seq.push_back(put1);
     // horizontal transfer from intermediate core to dst core
-    Array<PrimExpr> args2 = MakeBroadcastArgs(
-        MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
-        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        Downcast<IntImm>(broadcast_elements),
-        IntImm(DataType::Int(32), intermediate_core_id), /*direction=*/0,
-        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
-    for (int j = 0; j < mesh_ncol; j++) {
-      if (j != dst_core_col) {
-        args2.push_back(IntImm(DataType::Int(32),
-                               j)); // mask: all cores except dst_core_col
-      }
-    }
+    Array<PrimExpr> args2;
+    PrimExpr intermediate_core = I32Imm(intermediate_core_id);
+    AppendBroadcastArgs(&args2,
+                        MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
+                        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                        /*direction=*/0, MakeCoreMask({dst_core_val}),
+                        intermediate_core, I32Imm(0));
     Stmt put2 = Evaluate(Call(DataType::Handle(), broadcast_(), args2));
     seq.push_back(put2);
     return SeqStmt::Flatten(seq);

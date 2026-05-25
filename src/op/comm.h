@@ -18,18 +18,16 @@ TVM_DLL const Op &comm_is_current_core();
 TVM_DLL const Op &broadcast_();
 
 // Positional argument layout of the broadcast_() leaf intrinsic. Producers
-// (comm.cc, via MakeBroadcastArgs) and consumers (the broadcast-barrier
-// analysis in InjectSunmmioSync) must index it through these constants —
-// never bare integers. Trailing core-mask indices, if any, occupy
-// kBroadcastArgMaskBegin onward.
+// (comm.cc, via AppendBroadcastArgs) and consumers (the broadcast-barrier
+// analysis in InjectSunmmioSync) must index it through these constants.
 enum BroadcastArg : int {
   kBroadcastArgSrc = 0,           // source region
   kBroadcastArgDst = 1,           // destination region
-  kBroadcastArgSize = 2,          // element count
-  kBroadcastArgSrcCore = 3,       // source core id
-  kBroadcastArgDirection = 4,     // 0 = horizontal, 1 = vertical
+  kBroadcastArgDirection = 2,     // 0 = horizontal/row, 1 = vertical/col
+  kBroadcastArgMask = 3,          // i64 bitmask of receiving cores
+  kBroadcastArgSrcCore = 4,       // source core id
   kBroadcastArgSrcOffsetByte = 5, // source-pointer byte offset
-  kBroadcastArgMaskBegin = 6,     // first trailing core-mask index
+  kBroadcastArgCount = 6,
 };
 
 using namespace tir;

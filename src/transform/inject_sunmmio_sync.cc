@@ -32,6 +32,7 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <cstdint>
 #include <set>
 #include <utility>
 
@@ -394,59 +395,42 @@ private:
   }
 
   // Analyzes a broadcast operation and initializes a barrier for it.
-  // Calculates the read core and write cores based on the mesh topology
-  // (rows/cols) and the broadcast direction (horizontal or vertical),
-  // considering given masks.
+  // tl.broadcast_ uses args = [src_region, dst_region, direction, mask,
+  // src_core, src_offset_byte, optional sync_token_id]. The mask is an i64
+  // bitmask of receiving cores.
   void process_broadcast_barrier(const CallNode *call, int curr_token_id,
                                  int curr_barrier_id, Array<Stmt> &stmts) {
-    ICHECK_GE(call->args.size(), static_cast<size_t>(kBroadcastArgMaskBegin))
+    ICHECK_GE(call->args.size(), static_cast<size_t>(kBroadcastArgCount))
         << "broadcast_() call is missing its fixed argument prefix.";
     PrimExpr src_core = call->args[kBroadcastArgSrcCore];
     int direction =
         call->args[kBroadcastArgDirection].as<IntImm>().value()->value;
-    // Trailing core-mask indices start at kBroadcastArgMaskBegin — past the
-    // src_offset_byte slot at kBroadcastArgSrcOffsetByte.
-    Array<int> masks;
-    for (size_t i = kBroadcastArgMaskBegin; i < call->args.size(); i++) {
-      masks.push_back(call->args[i].as<IntImm>().value()->value);
-    }
-
-    PrimExpr src_core_row =
-        analyzer_->Simplify(tvm::floordiv(src_core, mesh_ncol_));
-    PrimExpr src_core_col =
-        analyzer_->Simplify(tvm::floormod(src_core, mesh_ncol_));
-    auto read_cores = Array<PrimExpr>{src_core};
+    ICHECK(direction == 0 || direction == 1)
+        << "tl.broadcast_ barrier only supports direction 0 or 1, got "
+        << direction;
     Array<PrimExpr> write_cores;
-    bool mask_flag = false;
-    if (direction == 0) { // horizontal
-      for (int j = 0; j < mesh_ncol_; j++) {
-        for (const auto &mask : masks) {
-          if (mask == j) {
-            mask_flag = true;
-            break;
-          }
+    int total_cores = mesh_nrow_ * mesh_ncol_;
+    if (const auto *mask_imm = call->args[kBroadcastArgMask].as<IntImmNode>()) {
+      uint64_t core_mask = static_cast<uint64_t>(mask_imm->value);
+      for (int core_id = 0; core_id < total_cores; ++core_id) {
+        if ((core_mask & (uint64_t{1} << core_id)) != 0) {
+          write_cores.push_back(IntImm(DataType::Int(32), core_id));
         }
-        if (mask_flag) {
-          mask_flag = false;
-          continue;
-        }
-        write_cores.push_back(
-            analyzer_->Simplify(src_core_row * mesh_ncol_ + j));
       }
-    } else if (direction == 1) { // vertical
-      for (int i = 0; i < mesh_nrow_; i++) {
-        for (const auto &mask : masks) {
-          if (mask == i) {
-            mask_flag = true;
-            break;
-          }
+    } else {
+      PrimExpr ncol = IntImm(src_core.dtype(), mesh_ncol_);
+      PrimExpr src_core_row = analyzer_->Simplify(floordiv(src_core, ncol));
+      PrimExpr src_core_col = analyzer_->Simplify(floormod(src_core, ncol));
+      if (direction == 0) {
+        for (int j = 0; j < mesh_ncol_; ++j) {
+          write_cores.push_back(analyzer_->Simplify(
+              src_core_row * mesh_ncol_ + IntImm(src_core.dtype(), j)));
         }
-        if (mask_flag) {
-          mask_flag = false;
-          continue;
+      } else {
+        for (int i = 0; i < mesh_nrow_; ++i) {
+          write_cores.push_back(analyzer_->Simplify(
+              IntImm(src_core.dtype(), i * mesh_ncol_) + src_core_col));
         }
-        write_cores.push_back(
-            analyzer_->Simplify(i * mesh_ncol_ + src_core_col));
       }
     }
 

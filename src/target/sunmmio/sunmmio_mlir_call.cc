@@ -3,6 +3,7 @@
 #include "sunmmio_mlir_type.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Operation.h"
 #include "npuir/Dialect/SUVM/IR/Attributes.h"
 #include "npuir/Dialect/SUVM/IR/Ops.h"
@@ -91,6 +92,41 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
       }
     }
     return -1;
+  };
+  auto parse_named_string = [&](const char *key) -> std::string {
+    std::string prefix = std::string(key) + "=";
+    for (const std::string &s : string_args) {
+      if (s.rfind(prefix, 0) == 0) {
+        return s.substr(prefix.size());
+      }
+    }
+    return "";
+  };
+  auto ensure_i64 = [&](mlir::Value value,
+                        const char *arg_name) -> mlir::Value {
+    ICHECK(value) << arg_name << " is missing";
+    mlir::Type ty = value.getType();
+    mlir::Type i64_ty = ctx_.builder.getI64Type();
+    if (ty == i64_ty) {
+      return value;
+    }
+    if (ty.isIndex()) {
+      return mlir::arith::IndexCastOp::create(ctx_.builder, type.Loc(), i64_ty,
+                                              value)
+          .getResult();
+    }
+    auto int_ty = mlir::dyn_cast<mlir::IntegerType>(ty);
+    ICHECK(int_ty) << arg_name << " must be an integer or index value";
+    unsigned width = int_ty.getWidth();
+    ICHECK_NE(width, 64U) << arg_name << " has unsupported integer type";
+    if (width < 64) {
+      return mlir::arith::ExtUIOp::create(ctx_.builder, type.Loc(), i64_ty,
+                                          value)
+          .getResult();
+    }
+    return mlir::arith::TruncIOp::create(ctx_.builder, type.Loc(), i64_ty,
+                                         value)
+        .getResult();
   };
   auto record_token_by_id = [&](int64_t token_id, mlir::Value produced) {
     if (token_id < 0 || !produced) {
@@ -270,6 +306,94 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     int64_t token_id = parse_token_id();
     if (token_id >= 0 && copy_op && copy_op->getNumResults() == 1) {
       record_token_by_id(token_id, copy_op->getResult(0));
+    }
+
+    return SunMMIOValue{ret_dtype, result_name, ret_type};
+  } else if (callee == "tl.broadcast_") {
+    ICHECK(operands.size() == 3 || operands.size() == 4)
+        << "tl.broadcast_ expects src, dst, mask, and optional src_core "
+           "operands";
+
+    mlir::Value src = ctx_.LookupMLIRValue(operands[0].value);
+    ICHECK(src) << "Missing MLIR source tile view for tl.broadcast_ `"
+                << operands[0].value << "`";
+    auto src_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(src.getType());
+    ICHECK(src_ty) << "tl.broadcast_ expects source to be a suvm.tile_view";
+
+    mlir::Value dst = ctx_.LookupMLIRValue(operands[1].value);
+    ICHECK(dst) << "Missing MLIR destination tile view for tl.broadcast_ `"
+                << operands[1].value << "`";
+    auto dst_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(dst.getType());
+    ICHECK(dst_ty)
+        << "tl.broadcast_ expects destination to be a suvm.tile_view";
+
+    mlir::Value mask = ctx_.LookupMLIRValue(operands[2].value);
+    if (!mask) {
+      mask = type.ResolveValueOrCreatePlaceholder(operands[2],
+                                                  ctx_.builder.getI64Type());
+    }
+    mask = ensure_i64(mask, "tl.broadcast_ mask");
+
+    std::string direction_name = parse_named_string("direction");
+    ICHECK(direction_name == "row" || direction_name == "col")
+        << "tl.broadcast_ direction must be encoded as row or col";
+    int64_t direction_value = direction_name == "row" ? 0 : 1;
+    auto direction_attr = ctx_.builder.getIntegerAttr(
+        ctx_.builder.getIntegerType(32), direction_value);
+
+    auto create_mcast = [&]() -> mlir::Value {
+      auto mcast_op = mlir::suvm::MulticastTokOp::create(
+          ctx_.builder, type.MakeDebugLoc("broadcast"), src, dst, mask,
+          direction_attr);
+      return mcast_op->getResult(0);
+    };
+
+    mlir::Value produced;
+    if (operands.size() == 4) {
+      mlir::Value src_core = ctx_.LookupMLIRValue(operands[3].value);
+      if (!src_core) {
+        src_core = type.ResolveValueOrCreatePlaceholder(
+            operands[3], ctx_.builder.getI64Type());
+      }
+      src_core = ensure_i64(src_core, "tl.broadcast_ src_core");
+
+      mlir::Value core_id = mlir::suvm::GetCoreIdOp::create(
+                                ctx_.builder, type.MakeDebugLoc("get_core_id"))
+                                .getResult();
+      core_id = ensure_i64(core_id, "suvm.get_core_id result");
+      mlir::Value is_src = mlir::arith::CmpIOp::create(
+          ctx_.builder, type.Loc(), mlir::arith::CmpIPredicate::eq, core_id,
+          src_core);
+
+      mlir::Type token_ty = mlir::suvm::TokenType::get(&ctx_.mlir_ctx);
+      auto if_op = mlir::scf::IfOp::create(ctx_.builder, type.Loc(), token_ty,
+                                           is_src, /*withElseRegion=*/true);
+
+      mlir::Block &then_block = if_op.getThenRegion().front();
+      ctx_.builder.setInsertionPointToStart(&then_block);
+      mlir::Value mcast_token = create_mcast();
+      mlir::scf::YieldOp::create(ctx_.builder, type.Loc(), mcast_token);
+
+      mlir::Block &else_block = if_op.getElseRegion().front();
+      ctx_.builder.setInsertionPointToStart(&else_block);
+      mlir::Value null_token =
+          mlir::suvm::NullTokenOp::create(ctx_.builder,
+                                          type.MakeDebugLoc("broadcast_null"))
+              .getResult();
+      mlir::scf::YieldOp::create(ctx_.builder, type.Loc(), null_token);
+
+      ctx_.builder.setInsertionPointAfter(if_op);
+      produced = if_op.getResult(0);
+    } else {
+      produced = create_mcast();
+    }
+
+    if (!result_name.empty()) {
+      ctx_.BindMLIRValue(result_name, produced);
+    }
+    int64_t token_id = parse_token_id();
+    if (token_id >= 0) {
+      record_token_by_id(token_id, produced);
     }
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};

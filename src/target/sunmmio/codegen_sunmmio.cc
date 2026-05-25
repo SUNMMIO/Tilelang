@@ -2,6 +2,7 @@
 #include "sunmmio_mlir_builder.h"
 
 #include "../../layout/layout.h"
+#include "../../op/comm.h"
 #include "../../op/region.h"
 #include "../../op/utils.h"
 
@@ -1444,7 +1445,7 @@ CodeGenTileLangSunMMIO::ClassifyCall(const tir::CallNode *op) const {
   }
   std::string name = op_node->name;
   if (name == "tl.mma_sunmmio" || name == "tl.dma_copy" ||
-      name.find("sunmmio") != std::string::npos) {
+      name == "tl.broadcast_" || name.find("sunmmio") != std::string::npos) {
     return CallBucket::kSunMMIOIntrinsic;
   }
   if (name.rfind("tl.", 0) == 0) {
@@ -1600,6 +1601,41 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
 
     operands.push_back(EvalExpr(op->args[0]));
     operands.push_back(EvalExpr(op->args[1]));
+  } else if (callee == "tl.broadcast_") {
+    ICHECK(op->args.size() == 7)
+        << "tl.broadcast_ expects src region, dst region, direction, mask, "
+           "src_core, src_offset_byte, and sync_token_id";
+
+    ICHECK(TryConsumeSyncTokenId(op->args.back(), &string_args))
+        << "tl.broadcast_ expects last argument to be tl.sync_token_id";
+
+    const auto *direction_imm =
+        op->args[tl::kBroadcastArgDirection].as<IntImmNode>();
+    ICHECK(direction_imm)
+        << "tl.broadcast_ direction must be a constant IntImm";
+    int64_t direction = static_cast<int64_t>(direction_imm->value);
+    ICHECK(direction == 0 || direction == 1)
+        << "tl.broadcast_ MLIR lowering only supports direction 0 or 1, got "
+        << direction;
+    MarkVisitedNodeType(direction_imm->GetTypeKey());
+
+    const auto *src_offset_imm =
+        op->args[tl::kBroadcastArgSrcOffsetByte].as<IntImmNode>();
+    ICHECK(src_offset_imm)
+        << "tl.broadcast_ src_offset_byte must be a constant IntImm";
+    MarkVisitedNodeType(src_offset_imm->GetTypeKey());
+
+    operands.reserve(4);
+    operands.push_back(EvalExpr(op->args[tl::kBroadcastArgSrc]));
+    operands.push_back(EvalExpr(op->args[tl::kBroadcastArgDst]));
+    operands.push_back(EvalExpr(op->args[tl::kBroadcastArgMask]));
+    operands.push_back(EvalExpr(op->args[tl::kBroadcastArgSrcCore]));
+
+    string_args.push_back(std::string("direction=") +
+                          (direction == 0 ? "row" : "col"));
+    string_args.push_back(
+        "src_offset_byte=" +
+        std::to_string(static_cast<int64_t>(src_offset_imm->value)));
   } else if (callee == "tl.mma_sunmmio") {
     ICHECK_EQ(op->args.size(), 8) << "tl.mma_sunmmio expects A/B/C regions, "
                                      "three flag operands, and sync_token_id";

@@ -7,6 +7,75 @@ from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 
 
+def _broadcast_lines(script):
+    return [line.strip() for line in script.splitlines() if "T.broadcast_(" in line]
+
+
+def _broadcast_line(src, dst, direction, mask, core, src_offset=0):
+    return f"T.broadcast_({src}, {dst}, {direction}, T.int64({mask}), {core}, {src_offset})"
+
+
+def _expected_axis0_all_lines(buffer):
+    expected = []
+    row_masks = [15, 240, 3840, 61440]
+    col_masks = [4369, 8738, 17476, 34952]
+    src = "T.region(A_shared[0, 0], 1, 128, 128)"
+    for row, row_mask in enumerate(row_masks):
+        for col in range(4):
+            core = row * 4 + col
+            expected.append(_broadcast_line(src, f"T.region({buffer}[{core * 128}, 0], 2, 128, 128)", 0, row_mask, core))
+    for col, col_mask in enumerate(col_masks):
+        for row in range(4):
+            core = row * 4 + col
+            start = row * 512
+            expected.append(
+                _broadcast_line(
+                    f"T.region({buffer}[{start}, 0], 1, 512, 128)",
+                    f"T.region({buffer}[{start}, 0], 2, 512, 128)",
+                    1,
+                    col_mask,
+                    core,
+                )
+            )
+    return expected
+
+
+def _expected_axis_last_horizontal_lines(buffer):
+    expected = []
+    row_masks = [15, 240, 3840, 61440]
+    src = "T.region(A_shared[0, 0], 1, 128, 128)"
+    for row, row_mask in enumerate(row_masks):
+        for col in range(4):
+            core = row * 4 + col
+            expected.append(_broadcast_line(src, f"T.region({buffer}[0, {col * 128}], 2, 128, 128)", 0, row_mask, core))
+    return expected
+
+
+def _expected_axis_last_all_lines(buffer):
+    expected = []
+    row_masks = [15, 240, 3840, 61440]
+    col_masks = [4369, 8738, 17476, 34952]
+    src = "T.region(A_shared[0, 0], 1, 128, 128)"
+    for row, row_mask in enumerate(row_masks):
+        for col in range(4):
+            core = row * 4 + col
+            expected.append(_broadcast_line(src, f"T.region({buffer}[0, {core * 128}], 2, 128, 128)", 0, row_mask, core))
+    for col, col_mask in enumerate(col_masks):
+        for row in range(4):
+            core = row * 4 + col
+            start = row * 512
+            expected.append(
+                _broadcast_line(
+                    f"T.region({buffer}[0, {start}], 1, 128, 512)",
+                    f"T.region({buffer}[0, {start}], 2, 128, 512)",
+                    1,
+                    col_mask,
+                    core,
+                )
+            )
+    return expected
+
+
 @pytest.mark.parametrize(
     "M, N, block_M, block_N, dtype, accum_dtype",
     [
@@ -49,12 +118,13 @@ def test_comm_python_api(M, N, block_M, block_N, dtype, accum_dtype):
     ],
 )
 def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
-    func_str = """
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 6, 1, 0)
-            T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 2, 0, 0)
-            T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 6, 0, 0)
-            T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 10, 0, 0)
-            T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 14, 0, 0)""".strip()
+    expected = [
+        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(17476), 6, 0)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(15), 2, 0)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(240), 6, 0)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(3840), 10, 0)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(61440), 14, 0)",
+    ]
 
     @T.prim_func
     def main(
@@ -72,7 +142,7 @@ def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
-        assert mod.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
+        assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 
 
 @pytest.mark.parametrize(
@@ -82,10 +152,11 @@ def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
     ],
 )
 def test_comm_broadcast_lower_custom_mesh(M, N, block_M, block_N, dtype):
-    func_str = """
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 5, 1, 0)
-            T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 2, 0, 0)
-            T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 5, 0, 0)""".strip()
+    expected = [
+        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(36), 5, 0)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(7), 2, 0)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(56), 5, 0)",
+    ]
 
     @T.prim_func
     def main(
@@ -113,7 +184,7 @@ def test_comm_broadcast_lower_custom_mesh(M, N, block_M, block_N, dtype):
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
-        assert mod.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
+        assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 
 
 @pytest.mark.parametrize(
@@ -123,9 +194,10 @@ def test_comm_broadcast_lower_custom_mesh(M, N, block_M, block_N, dtype):
     ],
 )
 def test_comm_put_lower(M, N, block_M, block_N, dtype, accum_dtype):
-    func_str = """
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 6, 1, 0, 0, 1, 3)
-            T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 16384, 10, 0, 0, 0, 1, 2)""".strip()
+    expected = [
+        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(1024), 6, 0)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(2048), 10, 0)",
+    ]
 
     @T.prim_func
     def main(
@@ -143,7 +215,7 @@ def test_comm_put_lower(M, N, block_M, block_N, dtype, accum_dtype):
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
-        assert mod.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
+        assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 
 
 @pytest.mark.parametrize(
@@ -153,39 +225,26 @@ def test_comm_put_lower(M, N, block_M, block_N, dtype, accum_dtype):
     ],
 )
 def test_comm_all_gather_lower(M, N, block_M, block_N, dtype, accum_dtype):
-    func_str = """
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[0, 0, 0], 2, 1, 128, 128), 16384, 0, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[1, 0, 0], 2, 1, 128, 128), 16384, 1, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[2, 0, 0], 2, 1, 128, 128), 16384, 2, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[3, 0, 0], 2, 1, 128, 128), 16384, 3, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[4, 0, 0], 2, 1, 128, 128), 16384, 4, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[5, 0, 0], 2, 1, 128, 128), 16384, 5, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[6, 0, 0], 2, 1, 128, 128), 16384, 6, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[7, 0, 0], 2, 1, 128, 128), 16384, 7, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[8, 0, 0], 2, 1, 128, 128), 16384, 8, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[9, 0, 0], 2, 1, 128, 128), 16384, 9, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[10, 0, 0], 2, 1, 128, 128), 16384, 10, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[11, 0, 0], 2, 1, 128, 128), 16384, 11, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[12, 0, 0], 2, 1, 128, 128), 16384, 12, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[13, 0, 0], 2, 1, 128, 128), 16384, 13, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[14, 0, 0], 2, 1, 128, 128), 16384, 14, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(C_shared[15, 0, 0], 2, 1, 128, 128), 16384, 15, 0, 0)
-            T.broadcast_(T.region(C_shared[0, 0, 0], 1, 4, 128, 128), T.region(C_shared[0, 0, 0], 2, 4, 128, 128), 65536, 0, 1, 0)
-            T.broadcast_(T.region(C_shared[4, 0, 0], 1, 4, 128, 128), T.region(C_shared[4, 0, 0], 2, 4, 128, 128), 65536, 4, 1, 0)
-            T.broadcast_(T.region(C_shared[8, 0, 0], 1, 4, 128, 128), T.region(C_shared[8, 0, 0], 2, 4, 128, 128), 65536, 8, 1, 0)
-            T.broadcast_(T.region(C_shared[12, 0, 0], 1, 4, 128, 128), T.region(C_shared[12, 0, 0], 2, 4, 128, 128), 65536, 12, 1, 0)
-            T.broadcast_(T.region(C_shared[0, 0, 0], 1, 4, 128, 128), T.region(C_shared[0, 0, 0], 2, 4, 128, 128), 65536, 1, 1, 0)
-            T.broadcast_(T.region(C_shared[4, 0, 0], 1, 4, 128, 128), T.region(C_shared[4, 0, 0], 2, 4, 128, 128), 65536, 5, 1, 0)
-            T.broadcast_(T.region(C_shared[8, 0, 0], 1, 4, 128, 128), T.region(C_shared[8, 0, 0], 2, 4, 128, 128), 65536, 9, 1, 0)
-            T.broadcast_(T.region(C_shared[12, 0, 0], 1, 4, 128, 128), T.region(C_shared[12, 0, 0], 2, 4, 128, 128), 65536, 13, 1, 0)
-            T.broadcast_(T.region(C_shared[0, 0, 0], 1, 4, 128, 128), T.region(C_shared[0, 0, 0], 2, 4, 128, 128), 65536, 2, 1, 0)
-            T.broadcast_(T.region(C_shared[4, 0, 0], 1, 4, 128, 128), T.region(C_shared[4, 0, 0], 2, 4, 128, 128), 65536, 6, 1, 0)
-            T.broadcast_(T.region(C_shared[8, 0, 0], 1, 4, 128, 128), T.region(C_shared[8, 0, 0], 2, 4, 128, 128), 65536, 10, 1, 0)
-            T.broadcast_(T.region(C_shared[12, 0, 0], 1, 4, 128, 128), T.region(C_shared[12, 0, 0], 2, 4, 128, 128), 65536, 14, 1, 0)
-            T.broadcast_(T.region(C_shared[0, 0, 0], 1, 4, 128, 128), T.region(C_shared[0, 0, 0], 2, 4, 128, 128), 65536, 3, 1, 0)
-            T.broadcast_(T.region(C_shared[4, 0, 0], 1, 4, 128, 128), T.region(C_shared[4, 0, 0], 2, 4, 128, 128), 65536, 7, 1, 0)
-            T.broadcast_(T.region(C_shared[8, 0, 0], 1, 4, 128, 128), T.region(C_shared[8, 0, 0], 2, 4, 128, 128), 65536, 11, 1, 0)
-            T.broadcast_(T.region(C_shared[12, 0, 0], 1, 4, 128, 128), T.region(C_shared[12, 0, 0], 2, 4, 128, 128), 65536, 15, 1, 0)""".strip()
+    expected = []
+    row_masks = [15, 240, 3840, 61440]
+    col_masks = [4369, 8738, 17476, 34952]
+    for row, row_mask in enumerate(row_masks):
+        for col in range(4):
+            core = row * 4 + col
+            expected.append(
+                "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), "
+                f"T.region(C_shared[{core}, 0, 0], 2, 1, 128, 128), "
+                f"0, T.int64({row_mask}), {core}, 0)"
+            )
+    for col, col_mask in enumerate(col_masks):
+        for row in range(4):
+            core = row * 4 + col
+            start = row * 4
+            expected.append(
+                f"T.broadcast_(T.region(C_shared[{start}, 0, 0], 1, 4, 128, 128), "
+                f"T.region(C_shared[{start}, 0, 0], 2, 4, 128, 128), "
+                f"1, T.int64({col_mask}), {core}, 0)"
+            )
 
     @T.prim_func
     def main(
@@ -203,7 +262,7 @@ def test_comm_all_gather_lower(M, N, block_M, block_N, dtype, accum_dtype):
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
-        assert mod.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
+        assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 
 
 @pytest.mark.parametrize(
@@ -213,39 +272,7 @@ def test_comm_all_gather_lower(M, N, block_M, block_N, dtype, accum_dtype):
     ],
 )
 def test_comm_all_gather_axis0_all_lower(M, N, block_M, block_N, dtype):
-    func_str = """
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 0], 2, 128, 128), 16384, 0, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[128, 0], 2, 128, 128), 16384, 1, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[256, 0], 2, 128, 128), 16384, 2, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[384, 0], 2, 128, 128), 16384, 3, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[512, 0], 2, 128, 128), 16384, 4, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[640, 0], 2, 128, 128), 16384, 5, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[768, 0], 2, 128, 128), 16384, 6, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[896, 0], 2, 128, 128), 16384, 7, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[1024, 0], 2, 128, 128), 16384, 8, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[1152, 0], 2, 128, 128), 16384, 9, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[1280, 0], 2, 128, 128), 16384, 10, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[1408, 0], 2, 128, 128), 16384, 11, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[1536, 0], 2, 128, 128), 16384, 12, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[1664, 0], 2, 128, 128), 16384, 13, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[1792, 0], 2, 128, 128), 16384, 14, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[1920, 0], 2, 128, 128), 16384, 15, 0, 0)
-            T.broadcast_(T.region(R_shared[0, 0], 1, 512, 128), T.region(R_shared[0, 0], 2, 512, 128), 65536, 0, 1, 0)
-            T.broadcast_(T.region(R_shared[512, 0], 1, 512, 128), T.region(R_shared[512, 0], 2, 512, 128), 65536, 4, 1, 0)
-            T.broadcast_(T.region(R_shared[1024, 0], 1, 512, 128), T.region(R_shared[1024, 0], 2, 512, 128), 65536, 8, 1, 0)
-            T.broadcast_(T.region(R_shared[1536, 0], 1, 512, 128), T.region(R_shared[1536, 0], 2, 512, 128), 65536, 12, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 0], 1, 512, 128), T.region(R_shared[0, 0], 2, 512, 128), 65536, 1, 1, 0)
-            T.broadcast_(T.region(R_shared[512, 0], 1, 512, 128), T.region(R_shared[512, 0], 2, 512, 128), 65536, 5, 1, 0)
-            T.broadcast_(T.region(R_shared[1024, 0], 1, 512, 128), T.region(R_shared[1024, 0], 2, 512, 128), 65536, 9, 1, 0)
-            T.broadcast_(T.region(R_shared[1536, 0], 1, 512, 128), T.region(R_shared[1536, 0], 2, 512, 128), 65536, 13, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 0], 1, 512, 128), T.region(R_shared[0, 0], 2, 512, 128), 65536, 2, 1, 0)
-            T.broadcast_(T.region(R_shared[512, 0], 1, 512, 128), T.region(R_shared[512, 0], 2, 512, 128), 65536, 6, 1, 0)
-            T.broadcast_(T.region(R_shared[1024, 0], 1, 512, 128), T.region(R_shared[1024, 0], 2, 512, 128), 65536, 10, 1, 0)
-            T.broadcast_(T.region(R_shared[1536, 0], 1, 512, 128), T.region(R_shared[1536, 0], 2, 512, 128), 65536, 14, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 0], 1, 512, 128), T.region(R_shared[0, 0], 2, 512, 128), 65536, 3, 1, 0)
-            T.broadcast_(T.region(R_shared[512, 0], 1, 512, 128), T.region(R_shared[512, 0], 2, 512, 128), 65536, 7, 1, 0)
-            T.broadcast_(T.region(R_shared[1024, 0], 1, 512, 128), T.region(R_shared[1024, 0], 2, 512, 128), 65536, 11, 1, 0)
-            T.broadcast_(T.region(R_shared[1536, 0], 1, 512, 128), T.region(R_shared[1536, 0], 2, 512, 128), 65536, 15, 1, 0)""".strip()
+    expected = _expected_axis0_all_lines("R_shared")
 
     @T.prim_func
     def main(
@@ -264,7 +291,7 @@ def test_comm_all_gather_axis0_all_lower(M, N, block_M, block_N, dtype):
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
-        assert mod.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
+        assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 
 
 @pytest.mark.parametrize(
@@ -274,23 +301,7 @@ def test_comm_all_gather_axis0_all_lower(M, N, block_M, block_N, dtype):
     ],
 )
 def test_comm_all_gather_axis_last_horizontal_lower(M, N, block_M, block_N, dtype):
-    func_str = """
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 0], 2, 128, 128), 16384, 0, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 128], 2, 128, 128), 16384, 1, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 256], 2, 128, 128), 16384, 2, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 384], 2, 128, 128), 16384, 3, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 0], 2, 128, 128), 16384, 4, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 128], 2, 128, 128), 16384, 5, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 256], 2, 128, 128), 16384, 6, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 384], 2, 128, 128), 16384, 7, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 0], 2, 128, 128), 16384, 8, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 128], 2, 128, 128), 16384, 9, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 256], 2, 128, 128), 16384, 10, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 384], 2, 128, 128), 16384, 11, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 0], 2, 128, 128), 16384, 12, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 128], 2, 128, 128), 16384, 13, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 256], 2, 128, 128), 16384, 14, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 384], 2, 128, 128), 16384, 15, 0, 0)""".strip()
+    expected = _expected_axis_last_horizontal_lines("R_shared")
 
     @T.prim_func
     def main(
@@ -309,7 +320,7 @@ def test_comm_all_gather_axis_last_horizontal_lower(M, N, block_M, block_N, dtyp
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
-        assert mod.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
+        assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 
 
 @pytest.mark.parametrize(
@@ -319,39 +330,7 @@ def test_comm_all_gather_axis_last_horizontal_lower(M, N, block_M, block_N, dtyp
     ],
 )
 def test_comm_all_gather_axis_last_all_lower(M, N, block_M, block_N, dtype):
-    func_str = """
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 0], 2, 128, 128), 16384, 0, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 128], 2, 128, 128), 16384, 1, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 256], 2, 128, 128), 16384, 2, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 384], 2, 128, 128), 16384, 3, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 512], 2, 128, 128), 16384, 4, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 640], 2, 128, 128), 16384, 5, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 768], 2, 128, 128), 16384, 6, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 896], 2, 128, 128), 16384, 7, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 1024], 2, 128, 128), 16384, 8, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 1152], 2, 128, 128), 16384, 9, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 1280], 2, 128, 128), 16384, 10, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 1408], 2, 128, 128), 16384, 11, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 1536], 2, 128, 128), 16384, 12, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 1664], 2, 128, 128), 16384, 13, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 1792], 2, 128, 128), 16384, 14, 0, 0)
-            T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(R_shared[0, 1920], 2, 128, 128), 16384, 15, 0, 0)
-            T.broadcast_(T.region(R_shared[0, 0], 1, 128, 512), T.region(R_shared[0, 0], 2, 128, 512), 65536, 0, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 512], 1, 128, 512), T.region(R_shared[0, 512], 2, 128, 512), 65536, 4, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 1024], 1, 128, 512), T.region(R_shared[0, 1024], 2, 128, 512), 65536, 8, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 1536], 1, 128, 512), T.region(R_shared[0, 1536], 2, 128, 512), 65536, 12, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 0], 1, 128, 512), T.region(R_shared[0, 0], 2, 128, 512), 65536, 1, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 512], 1, 128, 512), T.region(R_shared[0, 512], 2, 128, 512), 65536, 5, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 1024], 1, 128, 512), T.region(R_shared[0, 1024], 2, 128, 512), 65536, 9, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 1536], 1, 128, 512), T.region(R_shared[0, 1536], 2, 128, 512), 65536, 13, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 0], 1, 128, 512), T.region(R_shared[0, 0], 2, 128, 512), 65536, 2, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 512], 1, 128, 512), T.region(R_shared[0, 512], 2, 128, 512), 65536, 6, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 1024], 1, 128, 512), T.region(R_shared[0, 1024], 2, 128, 512), 65536, 10, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 1536], 1, 128, 512), T.region(R_shared[0, 1536], 2, 128, 512), 65536, 14, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 0], 1, 128, 512), T.region(R_shared[0, 0], 2, 128, 512), 65536, 3, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 512], 1, 128, 512), T.region(R_shared[0, 512], 2, 128, 512), 65536, 7, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 1024], 1, 128, 512), T.region(R_shared[0, 1024], 2, 128, 512), 65536, 11, 1, 0)
-            T.broadcast_(T.region(R_shared[0, 1536], 1, 128, 512), T.region(R_shared[0, 1536], 2, 128, 512), 65536, 15, 1, 0)""".strip()
+    expected = _expected_axis_last_all_lines("R_shared")
 
     @T.prim_func
     def main(
@@ -370,7 +349,7 @@ def test_comm_all_gather_axis_last_all_lower(M, N, block_M, block_N, dtype):
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
-        assert mod.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
+        assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 
 
 '''
