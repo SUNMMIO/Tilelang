@@ -109,6 +109,30 @@ def test_comm_python_api(M, N, block_M, block_N, dtype, accum_dtype):
     assert main.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
 
 
+def test_comm_buffer_like_region_python_api():
+    @T.prim_func
+    def main(A: T.Tensor((128, 128), "float32")):
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared([128, 128], "float32", scope="shared.rsram")
+            B_shared = T.alloc_shared([128, 128], "float32", scope="shared.rsram")
+            C_shared = T.alloc_shared([4, 64, 64], "float32", scope="shared.rsram")
+            Out_shared = T.alloc_shared([128], "float32", scope="shared.rsram")
+            T.copy(A, A_shared)
+
+            T.comm.broadcast(A_shared[8:72, 16:80], B_shared[24:88, 32:96], (0, 0), direction="h")
+            T.comm.put(A_shared[0:64, 0:64], B_shared[32:96, 32:96], (0, 0), (0, 1))
+            T.comm.all_gather(A_shared[8:72, 16:80], C_shared[0:4, 0:64, 0:64], direction="h")
+            T.comm.all_reduce(A_shared[8:72, 16:80], Out_shared[32:96], "sum", "h", dim=1)
+
+    script = main.script()
+    assert "T.comm_broadcast(A_shared[8:72, 16:80], B_shared[24:88, 32:96], -1, 0, 0)" in script
+    assert "T.comm_put(A_shared[0:64, 0:64], B_shared[32:96, 32:96], -1, 0, 1)" in script
+    assert "T.comm_allgather(A_shared[8:72, 16:80], C_shared[0:4, 0:64, 0:64], 0, -1, -1, bx)" in script
+    assert (
+        'T.comm_allreduce(A_shared[8:72, 16:80], Out_shared[32:96], buffer[0:4, 0:64], buffer_1[0:4, 0:64], "sum", 0, 1, T.bool(True))'
+    ) in script
+
+
 @pytest.mark.parametrize(
     "M, N, block_M, block_N, dtype, accum_dtype",
     [
