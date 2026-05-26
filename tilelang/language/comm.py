@@ -442,9 +442,18 @@ def all_reduce(
 
     mesh_shape = get_target_mesh_shape()
 
-    # Create temporary buffers for row and column allgather results
-    row_allgather = T.alloc_fragment(list([mesh_shape["nrow"]] + out.shape), out.dtype)
-    col_allgather = T.alloc_fragment(list([mesh_shape["ncol"]] + out.shape), out.dtype)
+    # Create temporary buffers for row and column allgather results.  Keep the
+    # temporaries in the output scope because the lowered Sunmmio path feeds
+    # them back into ReduceOp and broadcast_.
+    out_scope = out.scope()
+
+    def alloc_tmp(shape):
+        if out_scope.startswith("shared"):
+            return T.alloc_shared(shape, out.dtype, scope=out_scope)
+        return T.alloc_fragment(shape, out.dtype, scope=out_scope)
+
+    row_allgather = alloc_tmp([mesh_shape["ncol"]] + list(out.shape))
+    col_allgather = alloc_tmp([mesh_shape["nrow"]] + list(out.shape))
 
     buffer_region = to_buffer_region(buffer)
     out_region = to_buffer_region(out)
@@ -464,7 +473,7 @@ def all_reduce(
 
     # If not clearing, allocate an output copy buffer to hold intermediate results
     if not clear:
-        out_copy = T.alloc_fragment(list(out.shape), out.dtype)
+        out_copy = alloc_tmp(list(out.shape))
         out_copy_region = to_buffer_region(out_copy)
         args = (
             buffer_region,

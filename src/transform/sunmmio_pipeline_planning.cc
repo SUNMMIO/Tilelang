@@ -1,3 +1,4 @@
+#include "../op/comm.h"
 #include "../op/utils.h"
 #include "common/ast_traverser.h"
 #include "tvm/ir/expr.h"
@@ -35,6 +36,36 @@ namespace tl {
 using namespace tir;
 
 int ceil_div(int a, int b) { return (a + b - 1) / b; }
+
+bool IsSunmmioODMAOp(const CallNode *call) {
+  return call && (call->op.same_as(Op::Get("tl.dma_copy")) ||
+                  call->op.same_as(broadcast_()));
+}
+
+int GetRegionNumElements(const PrimExpr &region_expr) {
+  BufferRegion region = NormalizeToBufferRegion(region_expr);
+  int nums = 1;
+  for (const Range &range : region->region) {
+    const auto *extent = range->extent.as<IntImmNode>();
+    ICHECK(extent) << "SunmmioPipelinePlanning only supports static region "
+                      "extents for ODMA cost estimation: "
+                   << region_expr;
+    nums *= extent->value;
+  }
+  return nums;
+}
+
+float GetODMADelay(const CallNode *call) {
+  if (call->op.same_as(Op::Get("tl.dma_copy"))) {
+    int nums = GetRegionNumElements(call->args[0]);
+    return 50 + ceil_div(nums, 512);
+  }
+  if (call->op.same_as(broadcast_())) {
+    int nums = GetRegionNumElements(call->args[kBroadcastArgSrc]);
+    return 50 + ceil_div(nums, 512);
+  }
+  ICHECK(0) << "Can't identify ODMA delay for call " << call->op;
+}
 
 bool PipelineRegionIntersect(const Region &region1, const Region &region2) {
   ICHECK(region1.size() == region2.size());
@@ -402,7 +433,7 @@ public:
     } else if (const auto *eval = stmt.as<EvaluateNode>()) {
       // set ODMA for dma_copy and hlink/vlink, etc
       if (const auto *call = eval->value.as<CallNode>()) {
-        if (call->op.same_as(Op::Get("tl.dma_copy"))) {
+        if (IsSunmmioODMAOp(call)) {
           type = DeviceType::ODMA;
           set = true;
         }
@@ -453,18 +484,8 @@ public:
     } else if (type == DeviceType::ODMA) {
       if (const auto *eval = stmt.as<EvaluateNode>()) {
         if (const auto *call = eval->value.as<CallNode>()) {
-          if (call->op.same_as(Op::Get("tl.dma_copy"))) {
-            // LOG(INFO) << call->args;
-            auto src = call->args[0].as<CallNode>();
-            auto dtype = src->args[0]->dtype;
-            auto nums = 1;
-            for (int i = 2; i < src->args.size(); i++) {
-              nums *= src->args[i].as<IntImmNode>()->value;
-            }
-            auto num_kb = ceil_div(nums, 512);
-            float delay = 50 + num_kb;
-            // LOG(INFO) << "copy delay: " << delay;
-            return delay;
+          if (IsSunmmioODMAOp(call)) {
+            return GetODMADelay(call);
           }
         }
       }

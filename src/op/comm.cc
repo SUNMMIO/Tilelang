@@ -897,47 +897,75 @@ LayoutMap AllreduceOpNode::InferLayout(const LayoutInferArgs &T,
                                        InferLevel level) const {
   LayoutMap lm;
 
-  Array<PrimExpr> dst_layout_args;
-  dst_layout_args.push_back(src);
-  dst_layout_args.push_back(dst);
-  dst_layout_args.push_back(type);
-  dst_layout_args.push_back(dim);
-  dst_layout_args.push_back(clear);
-  ReduceOp dst_layout_op = ReduceOp(dst_layout_args);
-  LayoutMap dst_layout_map = dst_layout_op->InferLayout(T, InferLevel::kFree);
-  for (const auto &kv : dst_layout_map) {
-    lm.Set(kv.first, kv.second);
-  }
+  bool should_clear = clear.as<Bool>().value();
+  ICHECK(should_clear || dst_copy.defined())
+      << "Allreduce clear=false requires a dst_copy temporary buffer.";
 
-  if (dst_copy.defined()) {
-    Array<PrimExpr> dst_copy_layout_args;
-    dst_copy_layout_args.push_back(src);
-    dst_copy_layout_args.push_back(dst_copy);
-    dst_copy_layout_args.push_back(type);
-    dst_copy_layout_args.push_back(dim);
-    dst_copy_layout_args.push_back(clear);
-    ReduceOp dst_copy_layout_op = ReduceOp(dst_copy_layout_args);
-    LayoutMap dst_copy_layout_map =
-        dst_copy_layout_op->InferLayout(T, InferLevel::kFree);
-    for (const auto &kv : dst_copy_layout_map) {
+  LayoutInferArgs local_T = T;
+  LayoutMap known_layout = T.layout_map;
+  local_T.layout_map = known_layout;
+
+  auto merge_layout = [&](const LayoutMap &layout) {
+    for (const auto &kv : layout) {
       lm.Set(kv.first, kv.second);
+      known_layout.Set(kv.first, kv.second);
     }
-  }
+    local_T.layout_map = known_layout;
+  };
 
-  Buffer row_allgather_buffer = NormalizeToBufferRegion(row_allgather)->buffer;
-  LayoutMap row_allgather_layout =
-      ComputeLayout(T, InferLevel::kFree, NormalizeToBufferRegion(src)->buffer,
-                    row_allgather_buffer, dim->value);
-  for (const auto &kv : row_allgather_layout) {
-    lm.Set(kv.first, kv.second);
-  }
+  auto infer_reduce = [&](PrimExpr reduce_src, PrimExpr reduce_dst,
+                          PrimExpr reduce_dim, bool reduce_clear) {
+    Array<PrimExpr> args;
+    args.push_back(reduce_src);
+    args.push_back(reduce_dst);
+    args.push_back(type);
+    args.push_back(reduce_dim);
+    args.push_back(Bool(reduce_clear));
+    ReduceOp reduce_op = ReduceOp(args);
+    merge_layout(reduce_op->InferLayout(local_T, level));
+  };
 
-  Buffer col_allgather_buffer = NormalizeToBufferRegion(col_allgather)->buffer;
-  LayoutMap col_allgather_layout =
-      ComputeLayout(T, InferLevel::kFree, NormalizeToBufferRegion(src)->buffer,
-                    col_allgather_buffer, dim->value);
-  for (const auto &kv : col_allgather_layout) {
-    lm.Set(kv.first, kv.second);
+  auto infer_allgather = [&](PrimExpr send, PrimExpr recv, int gather_dir) {
+    Array<PrimExpr> args;
+    args.push_back(send);
+    args.push_back(recv);
+    args.push_back(IntImm(DataType::Int(32), gather_dir));
+    args.push_back(IntImm(DataType::Int(32), -1)); // size
+    args.push_back(IntImm(DataType::Int(32), -1)); // axis
+    args.push_back(Call(DataType::Int(32), comm_current_core(), {}));
+    AllgatherOp allgather_op = AllgatherOp(args);
+    merge_layout(allgather_op->InferLayout(local_T, level));
+  };
+
+  if (should_clear) {
+    infer_reduce(src, dst, dim, /*reduce_clear=*/true);
+
+    if (direction == 0 || direction == 2) {
+      infer_allgather(dst, row_allgather, /*gather_dir=*/0);
+      infer_reduce(row_allgather, dst, IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/true);
+    }
+
+    if (direction == 1 || direction == 2) {
+      infer_allgather(dst, col_allgather, /*gather_dir=*/1);
+      infer_reduce(col_allgather, dst, IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/true);
+    }
+  } else {
+    infer_reduce(src, dst_copy, dim, /*reduce_clear=*/true);
+
+    if (direction == 0 || direction == 2) {
+      infer_allgather(dst_copy, row_allgather, /*gather_dir=*/0);
+      infer_reduce(row_allgather, direction == 0 ? dst : dst_copy,
+                   IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/direction == 2);
+    }
+
+    if (direction == 1 || direction == 2) {
+      infer_allgather(dst_copy, col_allgather, /*gather_dir=*/1);
+      infer_reduce(col_allgather, dst, IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/false);
+    }
   }
 
   return lm;
@@ -947,147 +975,75 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
                             arith::Analyzer *analyzer) const {
   Target target = T.target;
   ICHECK(TargetIsSunmmio(target)) << "Allreduce only supports SUNMMIO targets.";
-  auto mesh = GetSunmmioMeshConfig(target);
-  int mesh_nrow = mesh.nrow;
-  int mesh_ncol = mesh.ncol;
 
   ICHECK(direction == 0 || direction == 1 || direction == 2)
       << "Invalid allreduce direction " << direction
       << ", must be 0 (row-wise) or 1 (column-wise) or 2 (all).";
 
+  bool should_clear = clear.as<Bool>().value();
+  ICHECK(should_clear || dst_copy.defined())
+      << "Allreduce clear=false requires a dst_copy temporary buffer.";
+
   Array<Stmt> stmts;
 
-  if (clear.as<Bool>().value() == true) {
-    // Local reduce to dst
-    Array<PrimExpr> local_reduce_args;
-    local_reduce_args.push_back(src);
-    local_reduce_args.push_back(dst);
-    local_reduce_args.push_back(type);
-    local_reduce_args.push_back(dim);
-    local_reduce_args.push_back(IntImm(DataType::Int(32), 1)); // clear = true
-    ReduceOp local_reduce_op = ReduceOp(local_reduce_args);
-    Stmt local_reduce_stmt = local_reduce_op->Lower(T, analyzer);
-    stmts.push_back(local_reduce_stmt);
+  auto append_reduce = [&](PrimExpr reduce_src, PrimExpr reduce_dst,
+                           PrimExpr reduce_dim, bool reduce_clear) {
+    Array<PrimExpr> args;
+    args.push_back(reduce_src);
+    args.push_back(reduce_dst);
+    args.push_back(type);
+    args.push_back(reduce_dim);
+    args.push_back(Bool(reduce_clear));
+    ReduceOp reduce_op = ReduceOp(args);
+    stmts.push_back(reduce_op->Lower(T, analyzer));
+  };
 
-    if (direction == 0 or direction == 2) { // row-wise
-      // Allgather dst in rows to row_allgather
-      Array<PrimExpr> row_allgather_args;
-      row_allgather_args.push_back(dst);
-      row_allgather_args.push_back(row_allgather);
-      row_allgather_args.push_back(
-          IntImm(DataType::Int(32), 0)); // direction = horizontal
-      row_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
-      row_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // axis
-      row_allgather_args.push_back(
-          Call(DataType::Int(32), comm_current_core(), {})); // cid
-      AllgatherOp row_allgather_op = AllgatherOp(row_allgather_args);
-      Stmt row_allgather_stmt = row_allgather_op->Lower(T, analyzer);
-      stmts.push_back(row_allgather_stmt);
+  auto append_allgather = [&](PrimExpr send, PrimExpr recv, int gather_dir) {
+    Array<PrimExpr> args;
+    args.push_back(send);
+    args.push_back(recv);
+    args.push_back(IntImm(DataType::Int(32), gather_dir));
+    args.push_back(IntImm(DataType::Int(32), -1)); // size
+    args.push_back(IntImm(DataType::Int(32), -1)); // axis
+    args.push_back(Call(DataType::Int(32), comm_current_core(), {}));
+    AllgatherOp allgather_op = AllgatherOp(args);
+    stmts.push_back(allgather_op->Lower(T, analyzer));
+  };
 
-      // Local reduce from row_allgather to dst
-      Array<PrimExpr> row_reduce_args;
-      row_reduce_args.push_back(row_allgather);
-      row_reduce_args.push_back(dst);
-      row_reduce_args.push_back(type);
-      row_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // dim
-      row_reduce_args.push_back(IntImm(DataType::Int(32), 1)); // clear = true
-      ReduceOp row_reduce_op = ReduceOp(row_reduce_args);
-      Stmt row_reduce_stmt = row_reduce_op->Lower(T, analyzer);
-      stmts.push_back(row_reduce_stmt);
+  auto append_row_stage = [&](PrimExpr send, PrimExpr reduce_dst,
+                              bool reduce_clear) {
+    append_allgather(send, row_allgather, /*gather_dir=*/0);
+    append_reduce(row_allgather, reduce_dst, IntImm(DataType::Int(32), 0),
+                  reduce_clear);
+  };
+
+  auto append_col_stage = [&](PrimExpr send, PrimExpr reduce_dst,
+                              bool reduce_clear) {
+    append_allgather(send, col_allgather, /*gather_dir=*/1);
+    append_reduce(col_allgather, reduce_dst, IntImm(DataType::Int(32), 0),
+                  reduce_clear);
+  };
+
+  if (should_clear) {
+    append_reduce(src, dst, dim, /*reduce_clear=*/true);
+
+    if (direction == 0 || direction == 2) {
+      append_row_stage(dst, dst, /*reduce_clear=*/true);
     }
 
-    if (direction == 1 or direction == 2) { // column-wise
-      // Allgather dst in columns to col_allgather
-      Array<PrimExpr> col_allgather_args;
-      col_allgather_args.push_back(dst);
-      col_allgather_args.push_back(col_allgather);
-      col_allgather_args.push_back(
-          IntImm(DataType::Int(32), 1)); // direction = vertical
-      col_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
-      col_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // axis
-      col_allgather_args.push_back(
-          Call(DataType::Int(32), comm_current_core(), {})); // cid
-      AllgatherOp col_allgather_op = AllgatherOp(col_allgather_args);
-      Stmt col_allgather_stmt = col_allgather_op->Lower(T, analyzer);
-      stmts.push_back(col_allgather_stmt);
-
-      // Local reduce from col_allgather to dst
-      Array<PrimExpr> col_reduce_args;
-      col_reduce_args.push_back(col_allgather);
-      col_reduce_args.push_back(dst);
-      col_reduce_args.push_back(type);
-      col_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // dim
-      col_reduce_args.push_back(IntImm(DataType::Int(32), 1)); // clear = true
-      ReduceOp col_reduce_op = ReduceOp(col_reduce_args);
-      Stmt col_reduce_stmt = col_reduce_op->Lower(T, analyzer);
-      stmts.push_back(col_reduce_stmt);
+    if (direction == 1 || direction == 2) {
+      append_col_stage(dst, dst, /*reduce_clear=*/true);
     }
   } else {
-    // Local reduce to dst_copy
-    Array<PrimExpr> local_reduce_args;
-    local_reduce_args.push_back(src);
-    local_reduce_args.push_back(dst_copy);
-    local_reduce_args.push_back(type);
-    local_reduce_args.push_back(dim);
-    local_reduce_args.push_back(IntImm(DataType::Int(32), 1)); // clear = true
-    ReduceOp local_reduce_op = ReduceOp(local_reduce_args);
-    Stmt local_reduce_stmt = local_reduce_op->Lower(T, analyzer);
-    stmts.push_back(local_reduce_stmt);
+    append_reduce(src, dst_copy, dim, /*reduce_clear=*/true);
 
-    if (direction == 0 or direction == 2) { // row-wise
-      // Allgather dst in rows to row_allgather
-      Array<PrimExpr> row_allgather_args;
-      row_allgather_args.push_back(dst_copy);
-      row_allgather_args.push_back(row_allgather);
-      row_allgather_args.push_back(
-          IntImm(DataType::Int(32), 0)); // direction = horizontal
-      row_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
-      row_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // axis
-      row_allgather_args.push_back(
-          Call(DataType::Int(32), comm_current_core(), {})); // cid
-      AllgatherOp row_allgather_op = AllgatherOp(row_allgather_args);
-      Stmt row_allgather_stmt = row_allgather_op->Lower(T, analyzer);
-      stmts.push_back(row_allgather_stmt);
-
-      // Local reduce from row_allgather to dst
-      Array<PrimExpr> row_reduce_args;
-      row_reduce_args.push_back(row_allgather);
-      row_reduce_args.push_back(direction == 0 ? dst : dst_copy);
-      row_reduce_args.push_back(type);
-      row_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // dim
-      row_reduce_args.push_back(IntImm(
-          DataType::Int(32),
-          direction == 0 ? 0 : 1)); // clear = direction == 0 ? false : true
-      ReduceOp row_reduce_op = ReduceOp(row_reduce_args);
-      Stmt row_reduce_stmt = row_reduce_op->Lower(T, analyzer);
-      stmts.push_back(row_reduce_stmt);
+    if (direction == 0 || direction == 2) {
+      append_row_stage(dst_copy, direction == 0 ? dst : dst_copy,
+                       /*reduce_clear=*/direction == 2);
     }
 
-    if (direction == 1 or direction == 2) { // column-wise
-      // Allgather dst in columns to col_allgather
-      Array<PrimExpr> col_allgather_args;
-      col_allgather_args.push_back(dst_copy);
-      col_allgather_args.push_back(col_allgather);
-      col_allgather_args.push_back(
-          IntImm(DataType::Int(32), 1)); // direction = vertical
-      col_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
-      col_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // axis
-      col_allgather_args.push_back(
-          Call(DataType::Int(32), comm_current_core(), {})); // cid
-      AllgatherOp col_allgather_op = AllgatherOp(col_allgather_args);
-      Stmt col_allgather_stmt = col_allgather_op->Lower(T, analyzer);
-      stmts.push_back(col_allgather_stmt);
-
-      // Local reduce from col_allgather to dst
-      Array<PrimExpr> col_reduce_args;
-      col_reduce_args.push_back(col_allgather);
-      col_reduce_args.push_back(dst);
-      col_reduce_args.push_back(type);
-      col_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // dim
-      col_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // clear = false
-      ReduceOp col_reduce_op = ReduceOp(col_reduce_args);
-      Stmt col_reduce_stmt = col_reduce_op->Lower(T, analyzer);
-      stmts.push_back(col_reduce_stmt);
+    if (direction == 1 || direction == 2) {
+      append_col_stage(dst_copy, dst, /*reduce_clear=*/false);
     }
   }
 
