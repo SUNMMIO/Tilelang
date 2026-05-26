@@ -27,24 +27,6 @@ namespace tl {
   }                                                                            \
   TVM_REGISTER_OP("tl." #OpName)                                               \
       .set_attr<TScriptPrinterName>("TScriptPrinterName", #OpName)
-TIR_DEFINE_TL_BUILTIN(comm_barrier)
-    .set_num_inputs(-1)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(comm_fence)
-    .set_num_inputs(0)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(CoreId).set_num_inputs(1).set_attr<TCallEffectKind>(
-    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(comm_current_core)
-    .set_num_inputs(0)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(comm_is_current_core)
-    .set_num_inputs(-1)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(broadcast_)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
@@ -175,13 +157,13 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
   bool dst_has = T.layout_map.count(dst);
 
   // Propagate: derive layout for each side from the other.
-  if (src_has) {
+  if (src_has && IsSunmmioSramScope(dst.scope())) {
     auto derived = DeriveLayoutLike(T.layout_map[src], dst->shape);
     if (derived.defined()) {
       result.Set(dst, derived.value());
     }
   }
-  if (dst_has) {
+  if (dst_has && IsSunmmioSramScope(src.scope())) {
     auto derived = DeriveLayoutLike(T.layout_map[dst], src->shape);
     if (derived.defined()) {
       result.Set(src, derived.value());
@@ -193,9 +175,11 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
 
 void CheckSunmmioCommBuffers(const char *op_name, const Buffer &src,
                              const Buffer &dst) {
-  ICHECK(IsSunmmioSramScope(src.scope()) && IsSunmmioSramScope(dst.scope()))
-      << op_name << " only supports Sunmmio SRAM buffers after datapath "
-      << "legalization, got src buffer " << src->name << " scope "
+  bool valid_src = src.scope() == "global" || src.scope().empty() ||
+                   IsSunmmioSramScope(src.scope());
+  ICHECK(valid_src && IsSunmmioSramScope(dst.scope()))
+      << op_name << " expects src to be global or Sunmmio SRAM and dst to be "
+      << "Sunmmio SRAM, got src buffer " << src->name << " scope "
       << src.scope() << " and dst buffer " << dst->name << " scope "
       << dst.scope();
 }
@@ -697,6 +681,8 @@ TIR_REGISTER_TL_TILE_OP(AllgatherOp, comm_allgather)
 
 AllreduceOp::AllreduceOp(Array<PrimExpr> args,
                          Map<String, ObjectRef> annotations) {
+  ICHECK(args.size() == 9 || args.size() == 10)
+      << "Allreduce expects 9 or 10 inputs, got " << args.size();
   ObjectPtr<AllreduceOpNode> node = tvm::ffi::make_object<AllreduceOpNode>();
   node->src = args[0];
   node->dst = args[1];
@@ -707,8 +693,11 @@ AllreduceOp::AllreduceOp(Array<PrimExpr> args,
   node->direction = Downcast<IntImm>(args[5])->value;
   node->dim = Downcast<IntImm>(args[6]);
   node->clear = Downcast<IntImm>(args[7]);
-  if (args.size() > 8) {
+  if (args.size() == 10) {
     node->dst_copy = args[8];
+    node->cid = args[9];
+  } else {
+    node->cid = args[8];
   }
   data_ = std::move(node);
 }
@@ -737,6 +726,8 @@ LayoutMap AllreduceOpNode::InferLayout(const LayoutInferArgs &T,
   bool should_clear = clear.as<Bool>().value();
   ICHECK(should_clear || dst_copy.defined())
       << "Allreduce clear=false requires a dst_copy temporary buffer.";
+  ICHECK(cid.defined())
+      << "Allreduce dynamic allgather lowering requires current core id.";
 
   LayoutInferArgs local_T = T;
   LayoutMap known_layout = T.layout_map;
@@ -781,7 +772,7 @@ LayoutMap AllreduceOpNode::InferLayout(const LayoutInferArgs &T,
     args.push_back(IntImm(DataType::Int(32), gather_dir));
     args.push_back(IntImm(DataType::Int(32), -1)); // size
     args.push_back(IntImm(DataType::Int(32), -1)); // axis
-    args.push_back(Call(DataType::Int(32), comm_current_core(), {}));
+    args.push_back(cid);
     AllgatherOp allgather_op = AllgatherOp(args);
     merge_layout(allgather_op->InferLayout(local_T, level));
   };
@@ -832,6 +823,8 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
   bool should_clear = clear.as<Bool>().value();
   ICHECK(should_clear || dst_copy.defined())
       << "Allreduce clear=false requires a dst_copy temporary buffer.";
+  ICHECK(cid.defined())
+      << "Allreduce dynamic allgather lowering requires current core id.";
 
   Array<Stmt> stmts;
 
@@ -854,7 +847,7 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
     args.push_back(IntImm(DataType::Int(32), gather_dir));
     args.push_back(IntImm(DataType::Int(32), -1)); // size
     args.push_back(IntImm(DataType::Int(32), -1)); // axis
-    args.push_back(Call(DataType::Int(32), comm_current_core(), {}));
+    args.push_back(cid);
     AllgatherOp allgather_op = AllgatherOp(args);
     stmts.push_back(allgather_op->Lower(T, analyzer));
   };

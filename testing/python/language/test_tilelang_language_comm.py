@@ -129,7 +129,7 @@ def test_comm_buffer_like_region_python_api():
     assert "T.comm_put(A_shared[0:64, 0:64], B_shared[32:96, 32:96], -1, 0, 1)" in script
     assert "T.comm_allgather(A_shared[8:72, 16:80], C_shared[0:4, 0:64, 0:64], 0, -1, -1, bx)" in script
     assert (
-        'T.comm_allreduce(A_shared[8:72, 16:80], Out_shared[32:96], buffer[0:4, 0:64], buffer_1[0:4, 0:64], "sum", 0, 1, T.bool(True))'
+        'T.comm_allreduce(A_shared[8:72, 16:80], Out_shared[32:96], buffer[0:4, 0:64], buffer_1[0:4, 0:64], "sum", 0, 1, T.bool(True), bx)'
     ) in script
 
 

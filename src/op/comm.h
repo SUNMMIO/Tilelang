@@ -12,9 +12,6 @@
 namespace tvm {
 namespace tl {
 
-TVM_DLL const Op &CoreId();
-TVM_DLL const Op &comm_current_core();
-TVM_DLL const Op &comm_is_current_core();
 TVM_DLL const Op &broadcast_();
 
 // Positional argument layout of the broadcast_() leaf intrinsic. Producers
@@ -177,6 +174,7 @@ public:
   int direction;
   IntImm dim;
   IntImm clear;
+  PrimExpr cid;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.comm_allreduce", AllreduceOpNode,
                                     TileOperatorNode);
@@ -192,7 +190,8 @@ public:
         .def_ro("dim", &AllreduceOpNode::dim)
         .def_ro("clear", &AllreduceOpNode::clear)
         .def_ro("direction", &AllreduceOpNode::direction)
-        .def_ro("dst_copy", &AllreduceOpNode::dst_copy);
+        .def_ro("dst_copy", &AllreduceOpNode::dst_copy)
+        .def_ro("cid", &AllreduceOpNode::cid);
   }
 
   TileOperator Clone() const override;

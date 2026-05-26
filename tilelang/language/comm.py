@@ -69,78 +69,6 @@ def core_tuple_to_id(core_id: tuple[int, int]) -> int:
     return core_id_value
 
 
-def core_id_to_tuple(core_id: tir.Call) -> tuple[int, int]:
-    """Convert a linear core id into 2D (row, col) coordinates on the mesh.
-
-    Parameters
-    ----------
-    core_id : tir.Call
-        A linear core identifier (or a TIR expression that yields one).
-
-    Returns
-    -------
-    tuple[int, int]
-        The (row, col) coordinates corresponding to the linear core id.
-
-    Notes
-    -----
-    The conversion uses the current target mesh shape obtained via
-    get_target_mesh_shape().
-    """
-    mesh_shape = get_target_mesh_shape()
-    core_id_value = core_id
-    row = core_id_value // mesh_shape["ncol"]
-    col = core_id_value % mesh_shape["ncol"]
-    return (row, col)
-
-
-def CoreId(core_id: int | tuple[int, int]):
-    """Convert a core identifier to a linear core ID for the target mesh.
-
-    Parameters
-    ----------
-    core_id : int or tuple[int, int]
-        Either a linear core id (int) or a 2-tuple (row, col) specifying the
-        core coordinates on the target mesh.
-
-    Returns
-    -------
-    int
-        The linear core id mapped into [0, mesh_nrow * mesh_ncol).
-
-    Raises
-    ------
-    AssertionError, ValueError
-        If the provided coordinates are out of bounds or the type is invalid.
-    """
-    mesh_shape = get_target_mesh_shape()
-    if isinstance(core_id, tuple):
-        core_id_value = core_tuple_to_id(core_id)
-    elif isinstance(core_id, int):
-        core_id_value = core_id
-        assert 0 <= core_id_value < mesh_shape["nrow"] * mesh_shape["ncol"], (
-            f"Core ID {core_id_value} out of bounds for mesh shape {mesh_shape}"
-        )
-    else:
-        raise ValueError("core_id must be either a tuple[int, int] or an int.")
-    return tir.call_intrin("handle", tir.op.Op.get("tl.CoreId"), core_id_value)
-
-
-def current_core():
-    """Get the current core's identifier.
-
-    Returns
-    -------
-    tir.Call
-        The TIR intrinsic call handle for `tl.comm_current_core`.
-
-    Examples
-    --------
-    >>> current_core()
-    """
-    return tir.call_intrin("handle", tir.op.Op.get("tl.comm_current_core"))
-
-
 def _const_int(value):
     if isinstance(value, int):
         return value
@@ -501,6 +429,7 @@ def all_reduce(
     out_region = to_buffer_region(out, access_type="w")
     row_allgather_region = to_buffer_region(row_allgather, access_type="rw")
     col_allgather_region = to_buffer_region(col_allgather, access_type="rw")
+    cid = T.get_block_binding(0)
 
     args = (
         buffer_region,
@@ -511,6 +440,7 @@ def all_reduce(
         DIRECTION_MAP[direction.lower()],
         dim,
         clear,
+        cid,
     )
 
     # If not clearing, allocate an output copy buffer to hold intermediate results
@@ -527,6 +457,7 @@ def all_reduce(
             dim,
             clear,
             out_copy_region,
+            cid,
         )
 
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_allreduce"), *args)

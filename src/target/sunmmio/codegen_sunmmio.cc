@@ -1556,9 +1556,6 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
   std::vector<std::string> string_args;
   if (callee == "tl.tileop.region") {
     return EmitRegionCall(tvm::ffi::GetRef<PrimExpr>(op));
-  } else if (callee == "tl.comm_current_core") {
-    std::string result_name = NewValueName();
-    return builder_->GetCoreId(result_name, op->dtype);
   } else if (callee == "tl.sync_null_token" || callee == "tl.wait_token") {
     for (int i = 0, e = static_cast<int>(op->args.size()); i < e; ++i) {
       const PrimExpr &arg = op->args[i];

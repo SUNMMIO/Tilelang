@@ -74,7 +74,7 @@ def test_tilelang_allreduce_frontend_allocates_rsram_temporaries():
     assert (
         "T.comm_allreduce(A_shared[0:32, 0:32], Out_shared[0:32], "
         'buffer[0:4, 0:32], buffer_1[0:4, 0:32], "sum", 2, 1, '
-        "T.bool(False), buffer_2[0:32])"
+        "T.bool(False), buffer_2[0:32], bx)"
     ) in script
 
 
