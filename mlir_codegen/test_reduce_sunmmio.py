@@ -213,7 +213,7 @@ def main():
     label, func, expected_in_tile, clear = build_case()
     log_root = os.environ.get(
         "TL_REDUCE_LOG_ROOT",
-        "/home/cedu/projects/Tilelang-Mesh/tilelang_mesh/mlir_codegen/logs_reduce_sunmmio",
+        os.path.join(os.path.dirname(__file__), "logs_reduce_sunmmio"),
     )
     log_dir = os.path.join(log_root, label)
     os.makedirs(log_dir, exist_ok=True)

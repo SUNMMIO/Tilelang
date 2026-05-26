@@ -90,7 +90,7 @@ def main():
     func = tile_elementwise_ops_test(2, 256, 128, 2, 256, 128)
     log_dir = os.environ.get(
         "TL_TILE_OPS_LOG_DIR",
-        "/home/cedu/projects/Tilelang-Mesh/tilelang_mesh/mlir_codegen/logs_tile_ops_sunmmio",
+        os.path.join(os.path.dirname(__file__), "logs_tile_ops_sunmmio"),
     )
     os.makedirs(log_dir, exist_ok=True)
 

@@ -127,8 +127,9 @@ func = test_1d_tiles(M, block_M, tile_size, index_map, "bfloat16", "bfloat16")
 func.show()
 
 
-log_dir = "/home/cedu/projects/Tilelang-Mesh/tilelang_mesh/mlir_codegen/logs_tiles_sunmmio"
 import os
+
+log_dir = os.path.join(os.path.dirname(__file__), "logs_tiles_sunmmio")
 
 os.makedirs(log_dir, exist_ok=True)
 host_mod, device_mod = compile_test(func, out_idx=[2], target="Sunmmio", log_pass_output=True, log_dir=log_dir)

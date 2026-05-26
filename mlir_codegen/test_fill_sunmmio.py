@@ -51,8 +51,9 @@ func.show()
 #     jit_kernel = tilelang.compile(func, target="Sunmmio", verbose=True)
 # except Exception as e:
 #     print(e)
-log_dir = "/home/cedu/projects/Tilelang-Mesh/tilelang_mesh/mlir_codegen/logs_fill_sunmmio"
 import os
+
+log_dir = os.path.join(os.path.dirname(__file__), "logs_fill_sunmmio")
 
 os.makedirs(log_dir, exist_ok=True)
 host_mod, device_mod = compile_test(func, out_idx=[2], target="Sunmmio", log_pass_output=True, log_dir=log_dir)
