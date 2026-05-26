@@ -370,7 +370,6 @@ def all_gather(
 
     _, send_dtype, send_shape = _get_buffer_info(send_buffer)
     _, recv_dtype, recv_shape = _get_buffer_info(recv_buffer)
-    print(send_shape, recv_shape)
     assert send_dtype == recv_dtype, f"Source and destination buffer dtypes must match for all_gather. Got {send_dtype} vs {recv_dtype}."
     mesh_shape = get_target_mesh_shape()
 

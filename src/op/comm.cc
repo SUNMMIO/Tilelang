@@ -191,6 +191,15 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
   return result;
 }
 
+void CheckSunmmioCommBuffers(const char *op_name, const Buffer &src,
+                             const Buffer &dst) {
+  ICHECK(IsSunmmioSramScope(src.scope()) && IsSunmmioSramScope(dst.scope()))
+      << op_name << " only supports Sunmmio SRAM buffers after datapath "
+      << "legalization, got src buffer " << src->name << " scope "
+      << src.scope() << " and dst buffer " << dst->name << " scope "
+      << dst.scope();
+}
+
 BroadcastOp::BroadcastOp(Array<PrimExpr> args,
                          Map<String, ObjectRef> annotations) {
   ObjectPtr<BroadcastOpNode> node = tvm::ffi::make_object<BroadcastOpNode>();
@@ -223,16 +232,8 @@ TileOperator BroadcastOpNode::Clone() const {
 
 LayoutMap BroadcastOpNode::InferLayout(const LayoutInferArgs &T,
                                        InferLevel level) const {
-  if (IsSunmmioSramScope(src.scope()) || IsSunmmioSramScope(dst.scope())) {
-    return SunmmioCommInferLayout(T, src, dst, level);
-  }
-
-  // Non-Sunmmio: delegate to Copy.
-  Array<PrimExpr> args;
-  args.push_back(src_expr);
-  args.push_back(dst_expr);
-  Copy copy_op = Copy(args);
-  return copy_op->InferLayout(T, level);
+  CheckSunmmioCommBuffers("T.comm.broadcast", src, dst);
+  return SunmmioCommInferLayout(T, src, dst, level);
 }
 
 Stmt BroadcastOpNode::Lower(const LowerArgs &T,
@@ -371,16 +372,8 @@ TileOperator PutOpNode::Clone() const {
 
 LayoutMap PutOpNode::InferLayout(const LayoutInferArgs &T,
                                  InferLevel level) const {
-  if (IsSunmmioSramScope(src.scope()) || IsSunmmioSramScope(dst.scope())) {
-    return SunmmioCommInferLayout(T, src, dst, level);
-  }
-
-  // Non-Sunmmio: delegate to Copy.
-  Array<PrimExpr> args;
-  args.push_back(src_expr);
-  args.push_back(dst_expr);
-  Copy copy_op = Copy(args);
-  return copy_op->InferLayout(T, level);
+  CheckSunmmioCommBuffers("T.comm.put", src, dst);
+  return SunmmioCommInferLayout(T, src, dst, level);
 }
 
 Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
@@ -528,70 +521,12 @@ TileOperator AllgatherOpNode::Clone() const {
 LayoutMap AllgatherOpNode::ComputeLayout(const LayoutInferArgs &T,
                                          InferLevel level, Buffer src,
                                          Buffer dst) const {
-  if (IsSunmmioSramScope(src.scope()) || IsSunmmioSramScope(dst.scope())) {
-    return SunmmioCommInferLayout(T, src, dst, level);
+  if (level >= InferLevel::kStrict) {
+    return {};
   }
 
-  if (src.scope() == "local.fragment" && dst.scope() == "local.fragment" &&
-      T.layout_map.count(src)) {
-    auto src_layout = T.layout_map[src].as<Fragment>().value();
-
-    PrimExpr src_rep_extent = src_layout->ReplicateExtent();
-
-    Array<PrimExpr> fwd;
-    fwd.push_back(InputPlaceholder(0));
-    for (int i = 0; i < static_cast<int>(src->shape.size()); i++) {
-      fwd.push_back(InputPlaceholder(i + 1));
-    }
-    auto thd = src_layout->ForwardThread(fwd, std::nullopt);
-
-    Fragment dst_layout =
-        Fragment(dst->shape, {}, thd, src_rep_extent, std::nullopt)
-            ->CondenseReplicateVar()
-            ->BindThreadRange(T.thread_bounds);
-
-    if (!T.layout_map.count(dst))
-      return {{dst, dst_layout}};
-    else {
-      // Check if computed layout is compatible with existing: the existing one
-      // must strictly contains the computed layout
-      auto orig_dst_layout =
-          T.layout_map.Get(dst).value().as<Fragment>().value();
-      ICHECK(dst_layout->InputDim() == orig_dst_layout->InputDim());
-      Array<PrimExpr> indices;
-      indices.reserve(dst_layout->InputDim());
-      arith::Analyzer inner_analyzer;
-      for (int i = 0; i < dst_layout->InputDim(); ++i) {
-        auto x = InputPlaceholder(i);
-        indices.push_back(x);
-        // should be literal - literal = 0, any analyzer will work
-        ICHECK(is_zero(inner_analyzer.Simplify(
-            dst_layout->InputShape()[i] - orig_dst_layout->InputShape()[i])));
-        inner_analyzer.Bind(x, Range(0, dst_layout->InputShape()[i]));
-      }
-
-      ICHECK(as_const_int(dst_layout->ReplicateExtent()));
-      ICHECK(as_const_int(src_layout->ReplicateExtent()));
-      auto dst_rep = *as_const_int(dst_layout->ReplicateExtent());
-      auto src_rep = *as_const_int(src_layout->ReplicateExtent());
-      if (dst_rep < src_rep ||
-          !ProveFragmentContains(orig_dst_layout, dst_layout, indices, indices,
-                                 inner_analyzer)) {
-        std::ostringstream oss;
-        oss << "Layout may conflict with ReduceOp for buffer " << dst << " vs. "
-            << src << "\nLHS = " << src_layout->DebugOutput()
-            << "\nRHS = " << orig_dst_layout->DebugOutput()
-            << "\nYou may need to use a shared memory to transform the "
-               "layout";
-        throw LayoutConflictException(oss.str());
-      }
-
-      if (dst_rep > src_rep) {
-        return {{dst, dst_layout}};
-      }
-    }
-  }
-  return {};
+  CheckSunmmioCommBuffers("T.comm.all_gather", src, dst);
+  return SunmmioCommInferLayout(T, src, dst, level);
 }
 
 LayoutMap AllgatherOpNode::InferLayout(const LayoutInferArgs &T,
@@ -790,107 +725,9 @@ LayoutMap AllreduceOpNode::ComputeLayout(const LayoutInferArgs &T,
   if (level >= InferLevel::kStrict)
     return {};
 
-  if (IsSunmmioSramScope(src.scope()) || IsSunmmioSramScope(dst.scope())) {
-    return SunmmioCommInferLayout(T, src, dst, level);
-  }
-
-  if (src.scope() == "local.fragment" && dst.scope() == "local.fragment" &&
-      T.layout_map.count(src)) {
-    auto src_layout = T.layout_map[src].as<Fragment>().value();
-
-    PrimExpr indice_rep_extent = src->shape[dim];
-    PrimExpr src_rep_extent = src_layout->ReplicateExtent();
-    PrimExpr dest_buffer_rep_extent = indice_rep_extent * src_rep_extent;
-
-    Array<PrimExpr> fwd;
-    fwd.push_back(InputPlaceholder(0));
-    for (int i = 0; i < static_cast<int>(src->shape.size()); i++) {
-      if (i == dim) {
-        ;
-      } else if (i < dim) {
-        fwd.push_back(InputPlaceholder(i + 1));
-      } else if (i > dim) {
-        fwd.push_back(InputPlaceholder(i - 1 + 1));
-      }
-    }
-    auto thd = src_layout->ForwardThread(
-        fwd, FloorDiv(ReplicationPlaceholder(), indice_rep_extent));
-
-    // Ensure the thread count is divisible by the replicate extent.
-    // Otherwise, we cannot infer a valid fragment<->fragment layout.
-    {
-      arith::Analyzer analyzer;
-      PrimExpr num_threads = T.thread_bounds->extent;
-      // Though the dest_buffer_rep_extent will be compressed at
-      // CondenseReplicateVar, we need to check the divisibility here to avoid
-      // the issue that the thread count is not divisible by the replicate
-      // extent.
-      if (!analyzer.CanProve(FloorMod(num_threads, dest_buffer_rep_extent) ==
-                             0) &&
-          !analyzer.CanProve(FloorMod(dest_buffer_rep_extent, num_threads) ==
-                             0)) {
-        ICHECK(false) << "ReduceOp fragment layout inference failed: "
-                         "num_threads % replicate_extent != 0. "
-                      << "This mapping requires the block's thread count to be "
-                         "divisible by the "
-                      << "replicate extent. "
-                      << "Try one of: (1) choose a thread block size divisible "
-                         "by replicate_extent; "
-                      << "(2) pick a different reduce dimension or adjust the "
-                         "source fragment layout; "
-                      << "Details: num_threads=" << num_threads
-                      << ", replicate_extent=" << indice_rep_extent
-                      << ", src=" << src << ", dst=" << dst;
-      }
-    }
-
-    Fragment dst_layout =
-        Fragment(dst->shape, {}, thd, dest_buffer_rep_extent, std::nullopt)
-            ->CondenseReplicateVar()
-            ->BindThreadRange(T.thread_bounds);
-
-    if (!T.layout_map.count(dst))
-      return {{dst, dst_layout}};
-    else {
-      // Check if computed layout is compatible with existing: the existing one
-      // must strictly contains the computed layout
-      auto orig_dst_layout =
-          T.layout_map.Get(dst).value().as<Fragment>().value();
-      ICHECK(dst_layout->InputDim() == orig_dst_layout->InputDim());
-      Array<PrimExpr> indices;
-      indices.reserve(dst_layout->InputDim());
-      arith::Analyzer inner_analyzer;
-      for (int i = 0; i < dst_layout->InputDim(); ++i) {
-        auto x = InputPlaceholder(i);
-        indices.push_back(x);
-        // should be literal - literal = 0, any analyzer will work
-        ICHECK(is_zero(inner_analyzer.Simplify(
-            dst_layout->InputShape()[i] - orig_dst_layout->InputShape()[i])));
-        inner_analyzer.Bind(x, Range(0, dst_layout->InputShape()[i]));
-      }
-
-      ICHECK(as_const_int(dst_layout->ReplicateExtent()));
-      ICHECK(as_const_int(src_layout->ReplicateExtent()));
-      auto dst_rep = *as_const_int(dst_layout->ReplicateExtent());
-      auto src_rep = *as_const_int(src_layout->ReplicateExtent());
-      if (dst_rep < src_rep ||
-          !ProveFragmentContains(orig_dst_layout, dst_layout, indices, indices,
-                                 inner_analyzer)) {
-        std::ostringstream oss;
-        oss << "Layout may conflict with ReduceOp for buffer " << dst << " vs. "
-            << src << "\nLHS = " << src_layout->DebugOutput()
-            << "\nRHS = " << orig_dst_layout->DebugOutput()
-            << "\nYou may need to use a shared memory to transform the "
-               "layout";
-        throw LayoutConflictException(oss.str());
-      }
-
-      if (dst_rep > src_rep) {
-        return {{dst, dst_layout}};
-      }
-    }
-  }
-  return {};
+  (void)dim;
+  CheckSunmmioCommBuffers("T.comm.all_reduce", src, dst);
+  return SunmmioCommInferLayout(T, src, dst, level);
 }
 
 LayoutMap AllreduceOpNode::InferLayout(const LayoutInferArgs &T,
@@ -903,10 +740,22 @@ LayoutMap AllreduceOpNode::InferLayout(const LayoutInferArgs &T,
 
   LayoutInferArgs local_T = T;
   LayoutMap known_layout = T.layout_map;
+  LayoutMap proposed_layout;
   local_T.layout_map = known_layout;
 
   auto merge_layout = [&](const LayoutMap &layout) {
     for (const auto &kv : layout) {
+      if (proposed_layout.count(kv.first)) {
+        Layout existing = proposed_layout[kv.first];
+        if (!IsSameLayout(existing, kv.second, T.analyzer)) {
+          LOG(FATAL) << "Allreduce layout conflict on buffer \""
+                     << kv.first->name << "\""
+                     << "\n  existing: " << existing->DebugOutput()
+                     << "\n  proposed: " << kv.second->DebugOutput();
+        }
+        continue;
+      }
+      proposed_layout.Set(kv.first, kv.second);
       lm.Set(kv.first, kv.second);
       known_layout.Set(kv.first, kv.second);
     }
