@@ -1,5 +1,6 @@
 import tilelang
 import tilelang.language as T
+from tilelang.carver.arch import driver
 from tilelang.utils.target import determine_target
 from compile_pipeline import compile_test
 from sunmmio_test_utils import save_final_ast, save_final_mlir, verify_final_mlir
@@ -8,29 +9,42 @@ tilelang.env.disable_cache()
 
 
 def fill_tiled_test(B, M, N, block_B, block_M, block_N, tile_size, index_map, dtype="float16"):
+    device_mesh_config = driver.get_sunmmio_device_mesh_config()
+    nrows, ncols = device_mesh_config
+    ncores = nrows * ncols
+    grid_b = T.ceildiv(B, block_B)
+    grid_m = T.ceildiv(M, block_M)
+    grid_n = T.ceildiv(N, block_N)
+
     @T.prim_func
     def main(A: T.Tensor((B, M, N), dtype)):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), T.ceildiv(B, block_B), threads=1) as (bx, by, bz):
+        with T.Kernel(ncores) as _cid:
             A_shared = T.alloc_shared((block_B, block_M, block_N), dtype)
             # T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, index_map)})
 
-            # 1. Fill the entire buffer
-            T.fill(A_shared, T.float16(1.0))
+            for bz in T.serial(grid_b):
+                for by in T.serial(grid_m):
+                    for bx in T.serial(grid_n):
+                        if (bz * grid_m * grid_n + by * grid_n + bx) % ncores == _cid:
+                            # 1. Fill the entire buffer
+                            T.fill(A_shared, T.float16(1.0))
 
-            # 2. Fill a region of the buffer (e.g., first half of M dimension)
-            # Region: A_shared[0:block_B, 0:block_M//2, 0:block_N]
-            # Since block_M=256, block_M//2 = 128. tile_size[0]=32, so 128 is divisible by 32.
-            # This should generate a loop over 4 tiles (128/32).
-            T.fill(A_shared[0:block_B, 0 : block_M // 2, 0:block_N], T.float16(2.0))
+                            # 2. Fill a region of the buffer (e.g., first half of M dimension)
+                            T.fill(A_shared[0:block_B, 0 : block_M // 2, 0:block_N], T.float16(2.0))
 
-            # 3. Fill a region with offset (e.g., second half of M dimension)
-            # Region: A_shared[0:block_B, block_M//2:block_M, 0:block_N]
-            # Offset is 128 (4 tiles), extent is 128 (4 tiles).
-            T.fill(A_shared[0:block_B, block_M // 2 : block_M, 0:block_N], T.float16(3.0))
+                            # 3. Fill a region with offset (e.g., second half of M dimension)
+                            T.fill(A_shared[0:block_B, block_M // 2 : block_M, 0:block_N], T.float16(3.0))
 
-            T.clear(A_shared)
+                            T.clear(A_shared)
 
-            T.copy(A_shared, A[bz * block_B : (bz + 1) * block_B, by * block_M : (by + 1) * block_M, bx * block_N : (bx + 1) * block_N])
+                            T.copy(
+                                A_shared,
+                                A[
+                                    bz * block_B : (bz + 1) * block_B,
+                                    by * block_M : (by + 1) * block_M,
+                                    bx * block_N : (bx + 1) * block_N,
+                                ],
+                            )
 
     return main
 

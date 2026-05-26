@@ -70,6 +70,7 @@ import os
 
 import tilelang
 import tilelang.language as T
+from tilelang.carver.arch import driver
 from compile_pipeline import compile_test
 from sunmmio_test_utils import save_final_ast, save_final_mlir, verify_final_mlir
 from tilelang.utils.target import determine_target
@@ -145,30 +146,112 @@ def reduce_tiled_test(
 ):
     out_shape_full = (B, M) if reduce_axis == 2 else (B, N) if reduce_axis == 1 else (M, N)
     out_shape_block = (block_B, block_M) if reduce_axis == 2 else (block_B, block_N) if reduce_axis == 1 else (block_M, block_N)
+    device_mesh_config = driver.get_sunmmio_device_mesh_config()
+    nrows, ncols = device_mesh_config
+    ncores = nrows * ncols
+    grid_b = T.ceildiv(B, block_B)
+    grid_m = T.ceildiv(M, block_M)
+    grid_n = T.ceildiv(N, block_N)
 
     @T.prim_func
     def main(A: T.Tensor((B, M, N), dtype), Out: T.Tensor(out_shape_full, dtype)):
-        with T.Kernel(
-            T.ceildiv(N, block_N) if reduce_axis != 2 else T.ceildiv(M, block_M),
-            T.ceildiv(B, block_B) if reduce_axis != 0 else T.ceildiv(M, block_M),
-            threads=128,
-        ) as (bx, bz):
+        with T.Kernel(ncores) as _cid:
             A_shared = T.alloc_shared((block_B, block_M, block_N), dtype, scope="shared.rsram")
             Out_shared = T.alloc_shared(out_shape_block, dtype, scope="shared.rsram")
 
-            if reduce_axis != 0:
-                T.copy(A[bz * block_B : (bz + 1) * block_B, 0:block_M, 0:block_N], A_shared)
-            else:
-                T.copy(A[0:block_B, 0:block_M, 0:block_N], A_shared)
-
-            T.reduce_abssum(A_shared, Out_shared, dim=reduce_axis, clear=clear)
-
             if reduce_axis == 2:
-                T.copy(Out_shared, Out[bz * block_B : (bz + 1) * block_B, 0:block_M])
+                for bz in T.serial(grid_b):
+                    for by in T.serial(grid_m):
+                        if (bz * grid_m + by) % ncores == _cid:
+                            if clear:
+                                T.fill(Out_shared, 0)
+                            else:
+                                T.copy(
+                                    Out[
+                                        bz * block_B : (bz + 1) * block_B,
+                                        by * block_M : (by + 1) * block_M,
+                                    ],
+                                    Out_shared,
+                                )
+                            for bx in T.serial(grid_n):
+                                T.copy(
+                                    A[
+                                        bz * block_B : (bz + 1) * block_B,
+                                        by * block_M : (by + 1) * block_M,
+                                        bx * block_N : (bx + 1) * block_N,
+                                    ],
+                                    A_shared,
+                                )
+                                T.reduce_abssum(A_shared, Out_shared, dim=reduce_axis, clear=False)
+                            T.copy(
+                                Out_shared,
+                                Out[
+                                    bz * block_B : (bz + 1) * block_B,
+                                    by * block_M : (by + 1) * block_M,
+                                ],
+                            )
             elif reduce_axis == 1:
-                T.copy(Out_shared, Out[bz * block_B : (bz + 1) * block_B, 0:block_N])
+                for bz in T.serial(grid_b):
+                    for bx in T.serial(grid_n):
+                        if (bz * grid_n + bx) % ncores == _cid:
+                            if clear:
+                                T.fill(Out_shared, 0)
+                            else:
+                                T.copy(
+                                    Out[
+                                        bz * block_B : (bz + 1) * block_B,
+                                        bx * block_N : (bx + 1) * block_N,
+                                    ],
+                                    Out_shared,
+                                )
+                            for by in T.serial(grid_m):
+                                T.copy(
+                                    A[
+                                        bz * block_B : (bz + 1) * block_B,
+                                        by * block_M : (by + 1) * block_M,
+                                        bx * block_N : (bx + 1) * block_N,
+                                    ],
+                                    A_shared,
+                                )
+                                T.reduce_abssum(A_shared, Out_shared, dim=reduce_axis, clear=False)
+                            T.copy(
+                                Out_shared,
+                                Out[
+                                    bz * block_B : (bz + 1) * block_B,
+                                    bx * block_N : (bx + 1) * block_N,
+                                ],
+                            )
             else:
-                T.copy(Out_shared, Out[0:block_M, 0:block_N])
+                for by in T.serial(grid_m):
+                    for bx in T.serial(grid_n):
+                        if (by * grid_n + bx) % ncores == _cid:
+                            if clear:
+                                T.fill(Out_shared, 0)
+                            else:
+                                T.copy(
+                                    Out[
+                                        by * block_M : (by + 1) * block_M,
+                                        bx * block_N : (bx + 1) * block_N,
+                                    ],
+                                    Out_shared,
+                                )
+                            for bz in T.serial(grid_b):
+                                T.copy(
+                                    A[
+                                        bz * block_B : (bz + 1) * block_B,
+                                        by * block_M : (by + 1) * block_M,
+                                        bx * block_N : (bx + 1) * block_N,
+                                    ],
+                                    A_shared,
+                                )
+                                T.reduce_abssum(A_shared, Out_shared, dim=reduce_axis, clear=False)
+                            T.copy(
+                                Out_shared,
+                                Out[
+                                    by * block_M : (by + 1) * block_M,
+                                    bx * block_N : (bx + 1) * block_N,
+                                ],
+                            )
 
     return main
 
