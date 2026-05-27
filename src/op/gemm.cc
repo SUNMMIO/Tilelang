@@ -89,6 +89,11 @@ Gemm::Gemm(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   }
   node->cCoords_ = Array<PrimExpr>(
       {args[17].as<PrimExpr>().value(), args[18].as<PrimExpr>().value()});
+  // Optional positional arg, defaults to 0. Set by the Sunmmio bf16 GEMM
+  // legalization pass via a cloned Call with an extended args list.
+  if (args.size() > 19) {
+    node->accOffsetByte_ = args[19].as<IntImm>().value()->value;
+  }
   data_ = std::move(node);
 }
 
@@ -460,14 +465,20 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         MakeRegionExpr(bRegion_->buffer, bRegion_->region, /*access_mask=*/1);
     PrimExpr C_region =
         MakeRegionExpr(cRegion_->buffer, cRegion_->region, /*access_mask=*/3);
-    Array<PrimExpr> args = {A_region,      B_region,      C_region,
-                            Bool(transA_), Bool(transB_), clearAccum_};
+    // accOffsetByte_ is the byte offset added to the accumulator pointer at
+    // codegen. Set by the Sunmmio bf16 GEMM legalization pass; user code
+    // leaves it at 0. Passed positionally so codegen reads it from a stable
+    // call-arg slot — no AttrStmt wrapper needed.
+    Array<PrimExpr> args = {A_region,
+                            B_region,
+                            C_region,
+                            Bool(transA_),
+                            Bool(transB_),
+                            clearAccum_,
+                            IntImm(DataType::Int(32), accOffsetByte_)};
 
     const auto &op = mma_sunmmio();
-    Stmt mma_sunmmio;
-    mma_sunmmio = Evaluate(Call(DataType::Handle(), op, args));
-
-    return mma_sunmmio;
+    return Evaluate(Call(DataType::Handle(), op, args));
   }
 
   auto [warp_m, warp_n] =

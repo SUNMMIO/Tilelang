@@ -156,15 +156,19 @@ def test_tilelang_dma_copy(M, N, block_M, block_N):
 
     call = visitor.dma_copy_calls[0]
 
-    # dma_copy should have exactly 2 arguments (src_region, dst_region)
-    assert len(call.args) == 2, f"Expected 2 args for dma_copy, got {len(call.args)}"
+    # dma_copy has 3 arguments: src_region, dst_region, src_offset_byte.
+    # src_offset_byte is 0 outside of bf16 GEMM legalization.
+    assert len(call.args) == 3, f"Expected 3 args for dma_copy, got {len(call.args)}"
 
-    # Each argument should be a tl.tileop.region Call
-    for i, arg in enumerate(call.args):
+    # The first two arguments should be tl.tileop.region Calls; the third is
+    # an IntImm src_offset_byte (default 0).
+    for i in range(2):
+        arg = call.args[i]
         assert isinstance(arg, tir.Call), f"dma_copy arg[{i}] should be a Call, got {type(arg)}"
         assert hasattr(arg.op, "name") and arg.op.name == "tl.tileop.region", (
             f"dma_copy arg[{i}] should be tl.tileop.region, got {arg.op.name}"
         )
+    assert int(call.args[2]) == 0, f"dma_copy src_offset_byte (arg[2]) should default to 0, got {int(call.args[2])}"
 
     # --- Normalize regions back to buffer metadata ---
     src_buf, src_ranges, src_mask = normalize_region(call.args[0])
@@ -316,36 +320,36 @@ MESH_COPY_CASES = [
         128, 64, 64, 32,
         [
             # DRAM -> RSRAM
-            'T.dma_copy(T.region(C[by * 64, ko * 32], 1, 64, 64), T.region(C_shared[0, 0], 2, 64, 64))',
+            'T.dma_copy(T.region(C[by * 64, ko * 32], 1, 64, 64), T.region(C_shared[0, 0], 2, 64, 64), 0)',
             # DRAM -> WSRAM
-            'T.dma_copy(T.region(C[by * 64, ko * 32], 1, 64, 64), T.region(B_shared[0, 0], 2, 64, 64))',
+            'T.dma_copy(T.region(C[by * 64, ko * 32], 1, 64, 64), T.region(B_shared[0, 0], 2, 64, 64), 0)',
             # DRAM <- RSRAM
-            'T.dma_copy(T.region(C_shared[0, 0], 1, 64, 64), T.region(C[by * 64, ko * 32], 2, 64, 64))',
+            'T.dma_copy(T.region(C_shared[0, 0], 1, 64, 64), T.region(C[by * 64, ko * 32], 2, 64, 64), 0)',
             # DRAM -> ASRAM (staged through RSRAM)
-            'T.dma_copy(T.region(C[by * 64, ko * 32], 1, 64, 64), T.region(C_rsram_stage[0, 0], 2, 64, 64))',
-            'T.dma_copy(T.region(C_rsram_stage[0, 0], 1, 64, 64), T.region(A_shared[0, 0], 2, 64, 64))',
+            'T.dma_copy(T.region(C[by * 64, ko * 32], 1, 64, 64), T.region(C_rsram_stage[0, 0], 2, 64, 64), 0)',
+            'T.dma_copy(T.region(C_rsram_stage[0, 0], 1, 64, 64), T.region(A_shared[0, 0], 2, 64, 64), 0)',
             # RSRAM -> ASRAM
-            'T.dma_copy(T.region(C_shared[8, 16], 1, 16, 32), T.region(A_shared[24, 8], 2, 16, 32))',
+            'T.dma_copy(T.region(C_shared[8, 16], 1, 16, 32), T.region(A_shared[24, 8], 2, 16, 32), 0)',
             # RSRAM -> WSRAM
-            'T.dma_copy(T.region(C_shared[8, 48], 1, 24, 8), T.region(B_shared[40, 0], 2, 24, 8))',
+            'T.dma_copy(T.region(C_shared[8, 48], 1, 24, 8), T.region(B_shared[40, 0], 2, 24, 8), 0)',
         ],
     ),
     (
         256, 64, 64, 64,
         [
             # DRAM -> RSRAM
-            'T.dma_copy(T.region(C[by * 64, ko * 64], 1, 64, 64), T.region(C_shared[0, 0], 2, 64, 64))',
+            'T.dma_copy(T.region(C[by * 64, ko * 64], 1, 64, 64), T.region(C_shared[0, 0], 2, 64, 64), 0)',
             # DRAM -> WSRAM
-            'T.dma_copy(T.region(C[by * 64, ko * 64], 1, 64, 64), T.region(B_shared[0, 0], 2, 64, 64))',
+            'T.dma_copy(T.region(C[by * 64, ko * 64], 1, 64, 64), T.region(B_shared[0, 0], 2, 64, 64), 0)',
             # DRAM <- RSRAM
-            'T.dma_copy(T.region(C_shared[0, 0], 1, 64, 64), T.region(C[by * 64, ko * 64], 2, 64, 64))',
+            'T.dma_copy(T.region(C_shared[0, 0], 1, 64, 64), T.region(C[by * 64, ko * 64], 2, 64, 64), 0)',
             # DRAM -> ASRAM (staged through RSRAM)
-            'T.dma_copy(T.region(C[by * 64, ko * 64], 1, 64, 64), T.region(C_rsram_stage[0, 0], 2, 64, 64))',
-            'T.dma_copy(T.region(C_rsram_stage[0, 0], 1, 64, 64), T.region(A_shared[0, 0], 2, 64, 64))',
+            'T.dma_copy(T.region(C[by * 64, ko * 64], 1, 64, 64), T.region(C_rsram_stage[0, 0], 2, 64, 64), 0)',
+            'T.dma_copy(T.region(C_rsram_stage[0, 0], 1, 64, 64), T.region(A_shared[0, 0], 2, 64, 64), 0)',
             # RSRAM -> ASRAM
-            'T.dma_copy(T.region(C_shared[8, 16], 1, 16, 32), T.region(A_shared[24, 8], 2, 16, 32))',
+            'T.dma_copy(T.region(C_shared[8, 16], 1, 16, 32), T.region(A_shared[24, 8], 2, 16, 32), 0)',
             # RSRAM -> WSRAM
-            'T.dma_copy(T.region(C_shared[8, 48], 1, 24, 8), T.region(B_shared[40, 0], 2, 24, 8))',
+            'T.dma_copy(T.region(C_shared[8, 48], 1, 24, 8), T.region(B_shared[40, 0], 2, 24, 8), 0)',
         ],
     ),
 ]

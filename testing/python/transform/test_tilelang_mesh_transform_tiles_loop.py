@@ -494,6 +494,92 @@ def nested_tiles_different_buffers(M, N, block_M, block_N, tile_size, index_map,
     return main
 
 
+def implicit_reduce_direct_tiled_parallel_2d(dtype="float16"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((32, 32), dtype),
+        B: T.Tensor((32, 32), dtype),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((32, 32), dtype)
+            B_shared = T.alloc_shared((32, 32), dtype)
+
+            T.copy(A[0:32, 0:32], A_shared)
+            T.copy(B[0:32, 0:32], B_shared)
+
+            for i, j in T.Tiles([32, 32], parallel=True):
+                A_shared[i, 0] = A_shared[i, 0] + B_shared[i, j]
+
+    return main
+
+
+def implicit_reduce_let_stmt_tiled_parallel_2d(dtype="float16"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((32, 32), dtype),
+        B: T.Tensor((32, 32), dtype),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((32, 32), dtype)
+            B_shared = T.alloc_shared((32, 32), dtype)
+
+            T.copy(A[0:32, 0:32], A_shared)
+            T.copy(B[0:32, 0:32], B_shared)
+
+            for i, j in T.Tiles([32, 32], parallel=True):
+                with T.LetStmt(A_shared[i, 0] + B_shared[i, j]) as temp:
+                    A_shared[i, 0] = temp
+
+    return main
+
+
+def rank_mismatch_but_safe_tiled_parallel_2d(dtype="float16"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((32, 32), dtype),
+        B: T.Tensor((32,), dtype),
+        C: T.Tensor((32, 32), dtype),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((32, 32), dtype)
+            B_shared = T.alloc_shared((32,), dtype)
+            C_shared = T.alloc_shared((32, 32), dtype)
+
+            T.copy(A[0:32, 0:32], A_shared)
+
+            for i in T.Parallel(32):
+                B_shared[i] = T.cast(0, dtype)
+
+            for i, j in T.Tiles([32, 32], parallel=True):
+                C_shared[i, j] = A_shared[i, j]
+                B_shared[i] = A_shared[0, i] * A_shared[0, i]
+
+            T.copy(C_shared, C[0:32, 0:32])
+
+    return main
+
+
+def explicit_atomic_add_tiled_parallel_2d(dtype="float32"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((32, 32), dtype),
+        B: T.Tensor((32,), dtype),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((32, 32), dtype)
+            B_shared = T.alloc_shared((32,), dtype)
+
+            T.copy(A[0:32, 0:32], A_shared)
+
+            for i in T.Parallel(32):
+                B_shared[i] = T.cast(0, dtype)
+
+            for i, j in T.Tiles([32, 32], parallel=True):
+                T.atomic_add(B_shared[i], A_shared[i, j])
+
+    return main
+
+
 def test_tiles_loop_1d():
     """
     LowerTilesLoop pass contract test for 1D tile_size.
@@ -939,3 +1025,29 @@ def test_lower_tiles_loop_nested_scopes_rejected():
 
     with pytest.raises(Exception, match="Nested T.Tiles scopes are not supported"):
         apply_tiles_lowering(mod)
+
+
+def test_lower_tiles_loop_rejects_implicit_reduce_direct():
+    mod = IRModule.from_expr(implicit_reduce_direct_tiled_parallel_2d().with_attr("global_symbol", "main"))
+
+    with pytest.raises(Exception, match="Implicit reduction in T.Tiles is not supported"):
+        apply_tiles_lowering(mod)
+
+
+def test_lower_tiles_loop_rejects_implicit_reduce_let_stmt():
+    mod = IRModule.from_expr(implicit_reduce_let_stmt_tiled_parallel_2d().with_attr("global_symbol", "main"))
+
+    with pytest.raises(Exception, match="Implicit reduction in T.Tiles is not supported"):
+        apply_tiles_lowering(mod)
+
+
+def test_lower_tiles_loop_allows_rank_mismatch_when_value_is_iteration_invariant():
+    mod = IRModule.from_expr(rank_mismatch_but_safe_tiled_parallel_2d().with_attr("global_symbol", "main"))
+
+    apply_tiles_lowering(mod)
+
+
+def test_lower_tiles_loop_allows_explicit_atomic_add():
+    mod = IRModule.from_expr(explicit_atomic_add_tiled_parallel_2d().with_attr("global_symbol", "main"))
+
+    apply_tiles_lowering(mod)
