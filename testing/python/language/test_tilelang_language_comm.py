@@ -11,6 +11,18 @@ def _broadcast_lines(script):
     return [line.strip() for line in script.splitlines() if "T.broadcast_(" in line]
 
 
+def _collect_calls(func, op_name):
+    calls = []
+    op = tvm.tir.op.Op.get(op_name)
+
+    def visit(node):
+        if isinstance(node, tvm.tir.Call) and node.op.same_as(op):
+            calls.append(node)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return calls
+
+
 def _broadcast_line(src, dst, direction, mask, core, src_offset=0):
     return f"T.broadcast_({src}, {dst}, {direction}, T.int64({mask}), {src_offset}, {core})"
 
@@ -131,6 +143,56 @@ def test_comm_buffer_like_region_python_api():
     assert (
         'T.comm_allreduce(A_shared[8:72, 16:80], Out_shared[32:96], buffer[0:4, 0:64], buffer_1[0:4, 0:64], "sum", 0, 1, T.bool(True), bx)'
     ) in script
+
+
+def test_comm_dynamic_core_python_api():
+    @T.prim_func
+    def main(A: T.Tensor((128, 128), "float32")):
+        with T.Kernel(16, threads=128) as bx:
+            A_shared = T.alloc_shared([128, 128], "float32", scope="shared.rsram")
+            B_shared = T.alloc_shared([128, 128], "float32", scope="shared.rsram")
+            T.copy(A, A_shared)
+
+            T.comm.broadcast(A_shared, B_shared, bx, direction="h")
+            T.comm.put(A_shared, B_shared, bx, (bx + 1) % 16)
+
+    broadcast_calls = _collect_calls(main, "tl.tileop.comm_broadcast")
+    put_calls = _collect_calls(main, "tl.tileop.comm_put")
+    assert len(broadcast_calls) == 1
+    assert len(put_calls) == 1
+    assert isinstance(broadcast_calls[0].args[3], tvm.tir.Var)
+    assert tvm.ir.structural_equal(broadcast_calls[0].args[3], put_calls[0].args[3])
+    assert tvm.ir.structural_equal(put_calls[0].args[4], (put_calls[0].args[3] + 1) % 16)
+
+
+def test_comm_dynamic_core_lower():
+    @T.prim_func
+    def main(A: T.Tensor((128, 128), "float32")):
+        with T.Kernel(16, threads=128) as bx:
+            A_shared = T.alloc_shared([128, 128], "float32", scope="shared.rsram")
+            B_shared = T.alloc_shared([128, 128], "float32", scope="shared.rsram")
+            T.copy(A, A_shared)
+
+            T.comm.broadcast(A_shared, B_shared, bx, direction="all")
+            T.comm.put(A_shared, B_shared, bx, (bx + 1) % 16)
+
+    mod = tvm.IRModule({"main": main})
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.LowerTileOp()(mod)
+
+    broadcast_calls = _collect_calls(mod["main"], "tl.broadcast_")
+    if_nodes = []
+
+    def visit(node):
+        if isinstance(node, tvm.tir.IfThenElse):
+            if_nodes.append(node)
+
+    tvm.tir.stmt_functor.post_order_visit(mod["main"].body, visit)
+    assert len(broadcast_calls) == 9
+    assert all(len(call.args) == 6 for call in broadcast_calls)
+    assert if_nodes, "Dynamic put lowering should emit runtime routing branches."
 
 
 @pytest.mark.parametrize(

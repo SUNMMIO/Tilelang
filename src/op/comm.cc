@@ -45,6 +45,13 @@ PrimExpr I32Imm(int64_t value) { return IntImm(DataType::Int(32), value); }
 
 PrimExpr I64Imm(int64_t value) { return IntImm(DataType::Int(64), value); }
 
+PrimExpr AsI32(PrimExpr value) {
+  if (value.dtype() == DataType::Int(32)) {
+    return value;
+  }
+  return Cast(DataType::Int(32), value);
+}
+
 PrimExpr AsI64(PrimExpr value) {
   if (value.dtype() == DataType::Int(64)) {
     return value;
@@ -63,6 +70,13 @@ PrimExpr MakeCoreMask(const std::vector<int> &core_ids) {
     mask |= (uint64_t{1} << core_id);
   }
   return I64Imm(static_cast<int64_t>(mask));
+}
+
+PrimExpr MakeSingleCoreMask(PrimExpr core_id) {
+  if (const auto *imm = core_id.as<IntImmNode>()) {
+    return MakeCoreMask({static_cast<int>(imm->value)});
+  }
+  return CoreBit(core_id);
 }
 
 PrimExpr MakeHorizontalMask(PrimExpr src_core, int mesh_ncol) {
@@ -294,10 +308,9 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
     return broadcast;
   } else {
     // 2D broadcast
-    ICHECK(src_core.as<IntImmNode>())
-        << "2D broadcast only supports constant source core id.";
-    int src_core_val = src_core.as<IntImmNode>()->value;
-    int src_core_col = src_core_val % mesh_ncol;
+    PrimExpr src_core_i32 = AsI32(src_core);
+    PrimExpr src_core_col =
+        analyzer->Simplify(floormod(src_core_i32, I32Imm(mesh_ncol)));
 
     Array<Stmt> seq;
     // vertical broadcast
@@ -312,12 +325,18 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
     // horizontal broadcast
     for (int i = 0; i < mesh_nrow; i++) {
       Array<PrimExpr> args;
-      PrimExpr row_src_core = I32Imm(i * mesh_ncol + src_core_col);
-      AppendBroadcastArgs(
-          &args, MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
-          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-          /*direction=*/0, MakeHorizontalMask(row_src_core, mesh_ncol),
-          src_offset_imm, row_src_core);
+      PrimExpr row_src_core =
+          analyzer->Simplify(I32Imm(i * mesh_ncol) + src_core_col);
+      std::vector<int> row_cores;
+      row_cores.reserve(mesh_ncol);
+      for (int j = 0; j < mesh_ncol; ++j) {
+        row_cores.push_back(i * mesh_ncol + j);
+      }
+      AppendBroadcastArgs(&args,
+                          MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
+                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                          /*direction=*/0, MakeCoreMask(row_cores),
+                          src_offset_imm, row_src_core);
       Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
       seq.push_back(broadcast);
     }
@@ -418,12 +437,59 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       << (Downcast<IntImm>(broadcast_elements)->value) << " vs "
       << Downcast<IntImm>(dst_elements)->value;
 
-  ICHECK(src_core.as<IntImmNode>())
-      << "Put only supports constant source core id.";
-  ICHECK(dst_core.as<IntImmNode>())
-      << "Put only supports constant destination core id.";
-  int src_core_val = src_core.as<IntImmNode>()->value;
-  int dst_core_val = dst_core.as<IntImmNode>()->value;
+  auto make_put_broadcast = [&](PrimExpr src_region, PrimExpr dst_region,
+                                int direction, PrimExpr mask,
+                                PrimExpr bcast_src_core) {
+    Array<PrimExpr> args;
+    AppendBroadcastArgs(&args, src_region, dst_region, direction,
+                        analyzer->Simplify(mask), I32Imm(0),
+                        analyzer->Simplify(bcast_src_core));
+    return Evaluate(Call(DataType::Handle(), broadcast_(), args));
+  };
+
+  const auto *src_core_imm = src_core.as<IntImmNode>();
+  const auto *dst_core_imm = dst_core.as<IntImmNode>();
+  if (!src_core_imm || !dst_core_imm) {
+    PrimExpr src_core_i32 = AsI32(src_core);
+    PrimExpr dst_core_i32 = AsI32(dst_core);
+    PrimExpr mesh_ncol_expr = I32Imm(mesh_ncol);
+    PrimExpr src_core_row =
+        analyzer->Simplify(floordiv(src_core_i32, mesh_ncol_expr));
+    PrimExpr src_core_col =
+        analyzer->Simplify(floormod(src_core_i32, mesh_ncol_expr));
+    PrimExpr dst_core_row =
+        analyzer->Simplify(floordiv(dst_core_i32, mesh_ncol_expr));
+    PrimExpr dst_core_col =
+        analyzer->Simplify(floormod(dst_core_i32, mesh_ncol_expr));
+    PrimExpr intermediate_core =
+        analyzer->Simplify(dst_core_row * mesh_ncol_expr + src_core_col);
+
+    PrimExpr src_read = MakeRegionExpr(src, src_range, /*access_mask=*/1);
+    PrimExpr dst_write = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
+    PrimExpr dst_read = MakeRegionExpr(dst, dst_range, /*access_mask=*/1);
+
+    Stmt horizontal =
+        make_put_broadcast(src_read, dst_write, /*direction=*/0,
+                           MakeSingleCoreMask(dst_core_i32), src_core_i32);
+    Stmt vertical =
+        make_put_broadcast(src_read, dst_write, /*direction=*/1,
+                           MakeSingleCoreMask(dst_core_i32), src_core_i32);
+    Array<Stmt> diagonal_seq;
+    diagonal_seq.push_back(make_put_broadcast(
+        src_read, dst_write, /*direction=*/1,
+        MakeSingleCoreMask(intermediate_core), src_core_i32));
+    diagonal_seq.push_back(make_put_broadcast(
+        dst_read, dst_write, /*direction=*/0, MakeSingleCoreMask(dst_core_i32),
+        intermediate_core));
+    Stmt diagonal = SeqStmt::Flatten(diagonal_seq);
+
+    return IfThenElse(
+        src_core_row == dst_core_row, horizontal,
+        IfThenElse(src_core_col == dst_core_col, vertical, diagonal));
+  }
+
+  int src_core_val = src_core_imm->value;
+  int dst_core_val = dst_core_imm->value;
   int src_core_row = src_core_val / mesh_ncol;
   int src_core_col = src_core_val % mesh_ncol;
   int dst_core_row = dst_core_val / mesh_ncol;
@@ -431,43 +497,31 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
   if (src_core_row == dst_core_row) {
     // 1D put via horizontal communication
-    Array<PrimExpr> args;
-    AppendBroadcastArgs(
-        &args, MakeRegionExpr(src, src_range, /*access_mask=*/1),
-        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        /*direction=*/0, MakeCoreMask({dst_core_val}), I32Imm(0), src_core);
-    Stmt put = Evaluate(Call(DataType::Handle(), broadcast_(), args));
-    return put;
+    return make_put_broadcast(MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                              MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                              /*direction=*/0, MakeCoreMask({dst_core_val}),
+                              src_core);
   } else if (src_core_col == dst_core_col) {
     // 1D put via vertical communication
-    Array<PrimExpr> args;
-    AppendBroadcastArgs(
-        &args, MakeRegionExpr(src, src_range, /*access_mask=*/1),
-        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        /*direction=*/1, MakeCoreMask({dst_core_val}), I32Imm(0), src_core);
-    Stmt put = Evaluate(Call(DataType::Handle(), broadcast_(), args));
-    return put;
+    return make_put_broadcast(MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                              MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                              /*direction=*/1, MakeCoreMask({dst_core_val}),
+                              src_core);
   } else {
     Array<Stmt> seq;
     // vertical transfer from src core to intermediate core
     int intermediate_core_id = dst_core_row * mesh_ncol + src_core_col;
-    Array<PrimExpr> args1;
-    AppendBroadcastArgs(&args1,
-                        MakeRegionExpr(src, src_range, /*access_mask=*/1),
-                        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-                        /*direction=*/1, MakeCoreMask({intermediate_core_id}),
-                        I32Imm(0), src_core);
-    Stmt put1 = Evaluate(Call(DataType::Handle(), broadcast_(), args1));
+    Stmt put1 = make_put_broadcast(
+        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2), /*direction=*/1,
+        MakeCoreMask({intermediate_core_id}), src_core);
     seq.push_back(put1);
     // horizontal transfer from intermediate core to dst core
-    Array<PrimExpr> args2;
     PrimExpr intermediate_core = I32Imm(intermediate_core_id);
-    AppendBroadcastArgs(&args2,
-                        MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
-                        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-                        /*direction=*/0, MakeCoreMask({dst_core_val}),
-                        I32Imm(0), intermediate_core);
-    Stmt put2 = Evaluate(Call(DataType::Handle(), broadcast_(), args2));
+    Stmt put2 = make_put_broadcast(
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2), /*direction=*/0,
+        MakeCoreMask({dst_core_val}), intermediate_core);
     seq.push_back(put2);
     return SeqStmt::Flatten(seq);
   }

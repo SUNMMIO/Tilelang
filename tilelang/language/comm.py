@@ -34,6 +34,9 @@ REDUCE_TYPE_LIST = (
     "bitxor",
 )
 
+CoreCoord = int | tir.PrimExpr
+CoreSpec = CoreCoord | tuple[CoreCoord, CoreCoord]
+
 
 def get_target_mesh_shape() -> dict[str, int]:
     """Get the target mesh shape as a dictionary with 'nrow' and 'ncol' keys."""
@@ -41,32 +44,53 @@ def get_target_mesh_shape() -> dict[str, int]:
     return {"nrow": nrow, "ncol": ncol}
 
 
-def core_tuple_to_id(core_id: tuple[int, int]) -> int:
-    """Convert 2D (row, col) coordinates on the mesh into a linear core id.
+def _check_core_coord(coord: CoreCoord, limit: int, name: str):
+    if isinstance(coord, bool):
+        raise TypeError(f"{name} must be an integer or TIR PrimExpr, got bool.")
+    coord_int = _const_int(coord)
+    if coord_int is not None:
+        assert 0 <= coord_int < limit, f"{name} {coord_int} out of bounds for limit {limit}."
+    elif not isinstance(coord, tir.PrimExpr):
+        raise TypeError(f"{name} must be an integer or TIR PrimExpr, got {type(coord)}.")
+
+
+def core_to_id(core_id: CoreSpec, name: str = "core") -> CoreCoord:
+    """Normalize a linear core id or 2D mesh coordinate into a linear core id.
 
     Parameters
     ----------
-    core_id : tuple[int, int]
-        A tuple specifying the (row, col) coordinates of the core on the mesh.
+    core_id : int | tir.PrimExpr | tuple[int | tir.PrimExpr, int | tir.PrimExpr]
+        Either a linear core id, or a tuple specifying the (row, col)
+        coordinates of the core on the mesh.
+    name : str
+        User-facing argument name used in diagnostics.
 
     Returns
     -------
-    int
-        The linear core id corresponding to the provided coordinates.
+    int | tir.PrimExpr
+        The normalized linear core id.
 
     Notes
     -----
-    The conversion uses the current target mesh shape obtained via
-    get_target_mesh_shape().
+    Dynamic TIR expressions are allowed. Compile-time bounds checks are only
+    performed when the id or coordinate is statically known.
     """
     mesh_shape = get_target_mesh_shape()
-    row, col = core_id
-    if isinstance(row, int):
-        assert 0 <= row < mesh_shape["nrow"], f"Row {row} out of bounds for mesh shape {mesh_shape}."
-    if isinstance(col, int):
-        assert 0 <= col < mesh_shape["ncol"], f"Col {col} out of bounds for mesh shape {mesh_shape}."
-    core_id_value = row * mesh_shape["ncol"] + col
-    return core_id_value
+    if isinstance(core_id, tuple):
+        assert len(core_id) == 2, f"{name} must be a linear core id or a tuple of (row, col)."
+        row, col = core_id
+        _check_core_coord(row, mesh_shape["nrow"], f"{name} row")
+        _check_core_coord(col, mesh_shape["ncol"], f"{name} col")
+        return row * mesh_shape["ncol"] + col
+
+    _check_core_coord(core_id, mesh_shape["nrow"] * mesh_shape["ncol"], name)
+    return core_id
+
+
+def core_tuple_to_id(core_id: tuple[CoreCoord, CoreCoord]) -> CoreCoord:
+    """Convert 2D (row, col) coordinates on the mesh into a linear core id."""
+    assert isinstance(core_id, tuple) and len(core_id) == 2, "core_id must be a tuple of (row, col)."
+    return core_to_id(core_id)
 
 
 def _const_int(value):
@@ -133,7 +157,7 @@ def _get_buffer_info(buf: BufferLikeType):
 def broadcast(
     src: BufferLikeType,
     dst: BufferLikeType,
-    src_core: tuple[int, int],
+    src_core: CoreSpec,
     direction: Literal["horizontal", "h", "vertical", "v", "all", "a"] = "all",
     size: int = -1,
 ):
@@ -145,8 +169,10 @@ def broadcast(
         Source buffer containing data to broadcast.
     dst : BufferLikeType
         Destination buffer to receive the broadcasted data.
-    src_core : tuple[int, int]
-        (row, col) coordinates of the source core on the target mesh.
+    src_core : int | tir.PrimExpr | tuple[int | tir.PrimExpr, int | tir.PrimExpr]
+        Linear source core id, or (row, col) coordinates of the source core on
+        the target mesh. Dynamic TIR expressions such as the block id returned
+        by ``T.Kernel`` are allowed.
     direction : Literal["horizontal", "h", "vertical", "v", "all", "a"]
         Direction of broadcast: "horizontal" (or "h") for row-wise, "vertical" (or "v") for column-wise,
         and "all" (or "a") for all cores.
@@ -159,6 +185,7 @@ def broadcast(
     Examples
     --------
     >>> broadcast(A, B, (1, 2), direction="horizontal")
+    >>> broadcast(A, B, cid, direction="horizontal")
     """
     _, src_dtype, src_shape = _get_buffer_info(src)
     _, dst_dtype, dst_shape = _get_buffer_info(dst)
@@ -167,20 +194,13 @@ def broadcast(
     if not _shape_compatible(src_shape, dst_shape):
         raise ValueError("Source and destination buffer must have the same number of dimensions for broadcast.")
 
-    mesh_shape = get_target_mesh_shape()
-    assert isinstance(src_core, tuple) and len(src_core) == 2, "src_core must be a tuple of (row, col)."
-    if isinstance(src_core[0], int):
-        assert 0 <= src_core[0] < mesh_shape["nrow"], f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
-    if isinstance(src_core[1], int):
-        assert 0 <= src_core[1] < mesh_shape["ncol"], f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
-
     _check_size(size, src_shape, "source")
 
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
 
     src_region = to_buffer_region(src, access_type="r")
     dst_region = to_buffer_region(dst, access_type="w")
-    src_core_id = core_tuple_to_id(src_core)
+    src_core_id = core_to_id(src_core, "src_core")
 
     args = (
         src_region,
@@ -195,8 +215,8 @@ def broadcast(
 def put(
     src: BufferLikeType,
     dst: BufferLikeType,
-    src_core: tuple[int, int],
-    dst_core: tuple[int, int],
+    src_core: CoreSpec,
+    dst_core: CoreSpec,
     size: int = -1,
 ):
     """Put data from a source buffer on a specific source core to a destination buffer on a specific destination core
@@ -207,10 +227,13 @@ def put(
         Source buffer containing data to put.
     dst : BufferLikeType
         Destination buffer to receive the data.
-    src_core : tuple[int, int]
-        (row, col) coordinates of the source core on the target mesh.
-    dst_core : tuple[int, int]
-        (row, col) coordinates of the destination core on the target mesh.
+    src_core : int | tir.PrimExpr | tuple[int | tir.PrimExpr, int | tir.PrimExpr]
+        Linear source core id, or (row, col) coordinates of the source core on
+        the target mesh. Dynamic TIR expressions such as the block id returned
+        by ``T.Kernel`` are allowed.
+    dst_core : int | tir.PrimExpr | tuple[int | tir.PrimExpr, int | tir.PrimExpr]
+        Linear destination core id, or (row, col) coordinates of the destination
+        core on the target mesh. Dynamic TIR expressions are allowed.
     size : int
         Number of elements to put. If -1, the entire source buffer is used.
     Returns
@@ -220,6 +243,7 @@ def put(
     Examples
     --------
     >>> put(A, B, (1, 2), (2, 3))
+    >>> put(A, B, cid, (cid + 1) % 16)
     """
     _, src_dtype, src_shape = _get_buffer_info(src)
     _, dst_dtype, dst_shape = _get_buffer_info(dst)
@@ -228,23 +252,12 @@ def put(
     if not _shape_compatible(src_shape, dst_shape):
         raise ValueError("Source and destination buffer must have the same number of dimensions for put.")
 
-    mesh_shape = get_target_mesh_shape()
-    assert isinstance(src_core, tuple) and len(src_core) == 2, "src_core must be a tuple of (row, col)."
-    if isinstance(src_core[0], int):
-        assert 0 <= src_core[0] < mesh_shape["nrow"], f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
-    if isinstance(src_core[1], int):
-        assert 0 <= src_core[1] < mesh_shape["ncol"], f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
-    assert isinstance(dst_core, tuple) and len(dst_core) == 2, "dst_core must be a tuple of (row, col)."
-    if isinstance(dst_core[0], int):
-        assert 0 <= dst_core[0] < mesh_shape["nrow"], f"dst_core row {dst_core[0]} out of bounds for mesh shape {mesh_shape}."
-    if isinstance(dst_core[1], int):
-        assert 0 <= dst_core[1] < mesh_shape["ncol"], f"dst_core col {dst_core[1]} out of bounds for mesh shape {mesh_shape}."
     _check_size(size, src_shape, "source")
 
     src_region = to_buffer_region(src, access_type="r")
     dst_region = to_buffer_region(dst, access_type="w")
-    src_core_id = core_tuple_to_id(src_core)
-    dst_core_id = core_tuple_to_id(dst_core)
+    src_core_id = core_to_id(src_core, "src_core")
+    dst_core_id = core_to_id(dst_core, "dst_core")
     args = (src_region, dst_region, size, src_core_id, dst_core_id)
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_put"), *args)
 
