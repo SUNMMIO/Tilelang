@@ -49,6 +49,65 @@ def fill_tiled_test(B, M, N, block_B, block_M, block_N, tile_size, index_map, dt
     return main
 
 
+PYTEST_FILL_CONFIG = dict(
+    B=16,
+    M=256,
+    N=128,
+    block_B=16,
+    block_M=256,
+    block_N=128,
+    tile_size=(32, 32),
+    index_map=(-2, -1),
+)
+
+
+def build_pytest_fill_case(dtype="float16"):
+    return fill_tiled_test(dtype=dtype, **PYTEST_FILL_CONFIG)
+
+
+def compile_fill_case(func, log_dir):
+    log_dir = os.fspath(log_dir)
+    os.makedirs(log_dir, exist_ok=True)
+
+    host_mod, device_mod = compile_test(
+        func,
+        out_idx=[0],
+        target="Sunmmio",
+        log_pass_output=True,
+        log_dir=log_dir,
+    )
+    save_final_ast(log_dir, device_mod, echo=False)
+
+    target = determine_target("Sunmmio", return_object=True)
+    mlir_mod = tvm.get_global_func("target.build.tilelang_sunmmio_without_compile")(device_mod, target, "suvm")
+    mlir_source = mlir_mod.inspect_source()
+    mlir_path = save_final_mlir(log_dir, mlir_source, echo=False)
+    verify_final_mlir(log_dir, mlir_path)
+
+    return {
+        "host_mod": host_mod,
+        "device_mod": device_mod,
+        "log_dir": log_dir,
+        "mlir_source": mlir_source,
+        "mlir_path": mlir_path,
+    }
+
+
+def test_fill_lowers_to_tile_fill_and_tile_store(tmp_path):
+    result = compile_fill_case(build_pytest_fill_case(), tmp_path / "fill_lowering")
+    mlir_source = result["mlir_source"]
+    assert "suvm.tile.fill" in mlir_source
+    assert "suvm.tile.store" in mlir_source
+
+
+def test_fill_should_write_back_to_global_memory(tmp_path):
+    result = compile_fill_case(build_pytest_fill_case(), tmp_path / "fill_writeback")
+    mlir_source = result["mlir_source"]
+    assert "get_partitioned_tile_view %arg0" in mlir_source
+    assert "suvm.copy_async" in mlir_source
+    assert '{sunmmio.fake = "call"}' not in mlir_source
+
+
 B = 64
 M = 512
 N = 1024
