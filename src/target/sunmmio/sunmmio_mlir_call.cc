@@ -312,7 +312,8 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     ICHECK(dst_ty) << "tl.dma_copy expects destination to be a suvm.tile_view";
 
     auto copy_op = mlir::suvm::CopyAsyncOp::create(
-        ctx_.builder, type.MakeDebugLoc("dma_copy"), src, dst, nullptr);
+        ctx_.builder, type.MakeDebugLoc("dma_copy"), src, dst,
+        mlir::suvm::PadModeAttr{}, mlir::suvm::OdmaChannelAttr{});
 
     ctx_.BindMLIRValue(result_name, copy_op->getResult(0));
 
@@ -357,7 +358,7 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     auto create_mcast = [&]() -> mlir::Value {
       auto mcast_op = mlir::suvm::MulticastTokOp::create(
           ctx_.builder, type.MakeDebugLoc("broadcast"), src, dst, mask,
-          direction_attr);
+          direction_attr, mlir::suvm::OdmaChannelAttr{});
       return mcast_op->getResult(0);
     };
 
