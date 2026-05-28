@@ -134,7 +134,9 @@ SunMMIOValue SunmmioMlirTileOp::GetPartitionedTileView(
     DataType dtype) {
   mlir::Type result_type = MapMlirType(ctx_, view_type);
   mlir::Value view_value;
-  if (view_type.shape.size() == 2) {
+  bool supports_real_2d_view =
+      view_type.shape.size() == 2 && memtensor.type.shape.size() >= 2;
+  if (supports_real_2d_view) {
     mlir::Value memtensor_value =
         ctx_.LookupOrCreateFakeValue(memtensor, "fake_missing_memtensor");
     mlir::OperationState st(MapMlirLoc(ctx_), "suvm.get_partitioned_tile_view");
@@ -151,10 +153,17 @@ SunMMIOValue SunmmioMlirTileOp::GetPartitionedTileView(
     st.addTypes(result_type);
     view_value = ctx_.builder.create(st)->getResult(0);
   } else {
-    LOG(WARNING)
-        << "Using provisional 1D tile_view placeholder for clean v4 Tiles "
-           "lowering; replace with real SUVM 1D tile_view once dialect "
-           "support lands";
+    if (view_type.shape.size() == 2) {
+      LOG(WARNING)
+          << "Using provisional 2D tile_view placeholder for unsupported "
+             "rank-1/unit-tile adaptation in clean v4 Tiles lowering; replace "
+             "with real SUVM tile_view once dialect support lands";
+    } else {
+      LOG(WARNING)
+          << "Using provisional 1D tile_view placeholder for clean v4 Tiles "
+             "lowering; replace with real SUVM 1D tile_view once dialect "
+             "support lands";
+    }
     std::vector<mlir::Value> operands;
     operands.reserve(1 + indices.size());
     operands.push_back(
@@ -597,6 +606,53 @@ SunmmioMlirTileOp::TileSlice(const std::string &result_name,
     ctx_.BindMLIRValue(result_name, tile_value);
   }
   return SunMMIOValue{dtype, result_name, tile_type};
+}
+
+SunMMIOValue SunmmioMlirTileOp::TileInsertSlice(
+    const std::string &result_name, const SunMMIOValue &base,
+    const SunMMIOValue &slice, const std::vector<SunMMIOValue> &offsets,
+    const SunMMIOType &result_type, DataType dtype) {
+  mlir::Type result_mlir_type = MapMlirType(ctx_, result_type);
+  mlir::Value base_value =
+      ctx_.LookupOrCreateFakeValue(base, "fake_missing_tile_insert_slice_base");
+  mlir::Value slice_value = ctx_.LookupOrCreateFakeValue(
+      slice, "fake_missing_tile_insert_slice_slice");
+  std::vector<mlir::Value> operands;
+  operands.reserve(2 + offsets.size());
+  operands.push_back(base_value);
+  operands.push_back(slice_value);
+  SunmmioMlirType type(ctx_);
+  for (const SunMMIOValue &offset : offsets) {
+    operands.push_back(type.EnsureIndex(type.ResolveValueOrCreatePlaceholder(
+        offset, ctx_.builder.getIndexType())));
+  }
+  mlir::Value tile_value = CreateTypedPlaceholderWithOperands(
+      ctx_, result_mlir_type, operands, "fake_tile_insert_slice");
+  if (mlir::Operation *def = tile_value.getDefiningOp()) {
+    llvm::SmallVector<int64_t, 4> static_offsets;
+    bool has_static_offsets = true;
+    for (const SunMMIOValue &offset : offsets) {
+      mlir::Value offset_value = ctx_.LookupMLIRValue(offset.value);
+      if (!offset_value) {
+        has_static_offsets = false;
+        break;
+      }
+      if (auto cst = mlir::getConstantIntValue(offset_value)) {
+        static_offsets.push_back(*cst);
+      } else {
+        has_static_offsets = false;
+        break;
+      }
+    }
+    if (has_static_offsets) {
+      def->setAttr("offsets",
+                   ctx_.builder.getDenseI64ArrayAttr(static_offsets));
+    }
+  }
+  if (!result_name.empty()) {
+    ctx_.BindMLIRValue(result_name, tile_value);
+  }
+  return SunMMIOValue{dtype, result_name, result_type};
 }
 
 SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,

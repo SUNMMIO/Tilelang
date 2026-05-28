@@ -130,6 +130,13 @@ public:
                                  const SunMMIOType &tile_type,
                                  DataType dtype) = 0;
 
+  virtual SunMMIOValue TileInsertSlice(const std::string &result_name,
+                                       const SunMMIOValue &base,
+                                       const SunMMIOValue &slice,
+                                       const std::vector<SunMMIOValue> &offsets,
+                                       const SunMMIOType &result_type,
+                                       DataType dtype) = 0;
+
   virtual SunMMIOValue TileRectMask(const std::string &result_name,
                                     const SunMMIOValue &valid_rows,
                                     const SunMMIOValue &valid_cols,

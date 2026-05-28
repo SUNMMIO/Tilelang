@@ -175,6 +175,14 @@ SuvmSunmmioBuilder::TileSlice(const std::string &result_name,
   return tile_->TileSlice(result_name, tile, offsets, tile_type, dtype);
 }
 
+SunMMIOValue SuvmSunmmioBuilder::TileInsertSlice(
+    const std::string &result_name, const SunMMIOValue &base,
+    const SunMMIOValue &slice, const std::vector<SunMMIOValue> &offsets,
+    const SunMMIOType &result_type, DataType dtype) {
+  return tile_->TileInsertSlice(result_name, base, slice, offsets, result_type,
+                                dtype);
+}
+
 SunMMIOValue SuvmSunmmioBuilder::TileRectMask(const std::string &result_name,
                                               const SunMMIOValue &valid_rows,
                                               const SunMMIOValue &valid_cols,
