@@ -61,6 +61,23 @@ PrimExpr AsI64(PrimExpr value) {
 
 PrimExpr CoreBit(PrimExpr core_id) { return I64Imm(1) << AsI64(core_id); }
 
+Stmt AssertPutDistinctCores(PrimExpr src_core, PrimExpr dst_core, Stmt body,
+                            arith::Analyzer *analyzer) {
+  PrimExpr distinct = AsI32(src_core) != AsI32(dst_core);
+  if (analyzer) {
+    distinct = analyzer->Simplify(distinct);
+  }
+  if (const auto *imm = distinct.as<IntImmNode>()) {
+    ICHECK_NE(imm->value, 0)
+        << "T.comm.put requires src_core and dst_core to be different";
+    return body;
+  }
+  return AssertStmt(distinct,
+                    StringImm("T.comm.put requires src_core and dst_core to "
+                              "be different"),
+                    body);
+}
+
 PrimExpr MakeCoreMask(const std::vector<int> &core_ids) {
   uint64_t mask = 0;
   for (int core_id : core_ids) {
@@ -399,6 +416,8 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         << "Destination core id " << dst_core_val << " out of range [0, "
         << mesh_nrow * mesh_ncol << ")";
   }
+  ICHECK(!analyzer || !analyzer->CanProve(AsI32(src_core) == AsI32(dst_core)))
+      << "T.comm.put requires src_core and dst_core to be different";
 
   // check for src and dst buffer sizes
   PrimExpr src_elements = 1;
@@ -483,13 +502,16 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         intermediate_core));
     Stmt diagonal = SeqStmt::Flatten(diagonal_seq);
 
-    return IfThenElse(
+    Stmt routed = IfThenElse(
         src_core_row == dst_core_row, horizontal,
         IfThenElse(src_core_col == dst_core_col, vertical, diagonal));
+    return AssertPutDistinctCores(src_core_i32, dst_core_i32, routed, analyzer);
   }
 
   int src_core_val = src_core_imm->value;
   int dst_core_val = dst_core_imm->value;
+  ICHECK_NE(src_core_val, dst_core_val)
+      << "T.comm.put requires src_core and dst_core to be different";
   int src_core_row = src_core_val / mesh_ncol;
   int src_core_col = src_core_val % mesh_ncol;
   int dst_core_row = dst_core_val / mesh_ncol;

@@ -929,14 +929,12 @@ TVM_DLL const Op &stg256();
 /*!
  * \brief Initialize a synchronization barrier.
  *
- * This intrinsic initializes a barrier used for cross-core synchronization.
- * It is primarily used in the InjectSunmmioSync pass to manage data
- * dependencies across different cores (e.g. read/write cores).
+ * This intrinsic initializes a reusable barrier for the participating cores.
+ * The same initialized barrier may be reused by multiple arrive-and-wait
+ * synchronization events with the same participant mask.
  *
  * Args:
- *   barrier_id: The identifier of the barrier.
- *   read_mask: i64 bitmask of core IDs that read/source data.
- *   write_mask: i64 bitmask of core IDs that write/receive data.
+ *   participant_mask: i64 bitmask of core IDs that participate.
  */
 TVM_DLL const Op &barrier_init();
 
@@ -944,11 +942,11 @@ TVM_DLL const Op &barrier_init();
  * \brief Arrive at a barrier and wait.
  *
  * This intrinsic blocks execution until the barrier is reached by all
- * participants. It is used in conjunction with barrier_init to synchronize
- * execution.
+ * cores in the participant mask. It is used in conjunction with barrier_init
+ * to synchronize execution.
  *
  * Args:
- *   barrier_id: The identifier of the barrier to wait on.
+ *   participant_mask: i64 bitmask of core IDs that participate.
  */
 TVM_DLL const Op &barrier_arrive_and_wait();
 

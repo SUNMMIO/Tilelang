@@ -1386,6 +1386,12 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitBinary(const char *op_name,
     bin_op = BinaryOp::kAnd;
   else if (op == "or")
     bin_op = BinaryOp::kOr;
+  else if (op == "xor")
+    bin_op = BinaryOp::kXor;
+  else if (op == "shl")
+    bin_op = BinaryOp::kShl;
+  else if (op == "shr")
+    bin_op = BinaryOp::kShr;
   else
     UnsupportedExpr(lhs.get(), "Unsupported binary op in EmitBinary: " + op);
 
@@ -1574,6 +1580,27 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
       }
       operands.push_back(EvalExpr(arg));
     }
+  } else if (callee == "tl.barrier_init" ||
+             callee == "tl.barrier_arrive_and_wait") {
+    ICHECK_GE(op->args.size(), 1U)
+        << callee << " expects participant_mask argument";
+    const PrimExpr &mask = op->args[0];
+    if (const auto *imm = mask.as<IntImmNode>()) {
+      MarkVisitedNodeType("tir.IntImm");
+      int64_t mask_value = static_cast<int64_t>(imm->value);
+      if (mask_value >= 0) {
+        string_args.push_back("participant_mask=" + std::to_string(mask_value));
+      }
+    } else {
+      operands.push_back(EvalExpr(mask));
+    }
+    for (size_t i = 1; i < op->args.size(); ++i) {
+      const auto *imm = op->args[i].as<IntImmNode>();
+      ICHECK(imm) << callee << " candidate masks must be IntImm";
+      MarkVisitedNodeType("tir.IntImm");
+      string_args.push_back("candidate_mask=" +
+                            std::to_string(static_cast<int64_t>(imm->value)));
+    }
   } else if (callee == "tl.dma_copy") {
     ICHECK_EQ(op->args.size(), 4)
         << "tl.dma_copy expects src region, dst region, src_offset_byte, "
@@ -1622,6 +1649,23 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
 
     operands.push_back(EmitRegionCall(op->args[0], src_offset_byte));
     operands.push_back(EmitRegionCall(op->args[1]));
+  } else if (callee == "tir.bitwise_and" || callee == "tir.bitwise_or" ||
+             callee == "tir.bitwise_xor" || callee == "tir.shift_left" ||
+             callee == "tir.shift_right") {
+    ICHECK_EQ(op->args.size(), 2) << callee << " expects exactly two arguments";
+    if (callee == "tir.bitwise_and") {
+      return EmitBinary("and", op->args[0], op->args[1], op->dtype);
+    }
+    if (callee == "tir.bitwise_or") {
+      return EmitBinary("or", op->args[0], op->args[1], op->dtype);
+    }
+    if (callee == "tir.bitwise_xor") {
+      return EmitBinary("xor", op->args[0], op->args[1], op->dtype);
+    }
+    if (callee == "tir.shift_left") {
+      return EmitBinary("shl", op->args[0], op->args[1], op->dtype);
+    }
+    return EmitBinary("shr", op->args[0], op->args[1], op->dtype);
   } else if (callee == "tl.broadcast_") {
     size_t non_token_args = op->args.size();
     if (non_token_args > 0 &&

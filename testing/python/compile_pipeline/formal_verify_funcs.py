@@ -288,13 +288,9 @@ def verify_SunmmioSync(mod: IRModule):
 
     token_ids = [int(l.split("sync_token_id(")[1].split(")")[0]) for l in lines if "sync_token_id" in l]
     null_token_ids = [int(l.split("sync_null_token(")[1].split(")")[0]) for l in lines if "sync_null_token" in l]
-    barrier_ids = [int(l.split("(")[1].split(")")[0].split(",")[0]) for l in lines if "barrier_init" in l]
     wait_ids = [int(l.split("(")[1].split(")")[0]) for l in lines if "wait_token" in l]
-    arrive_ids = [int(l.split("(")[1].split(")")[0]) for l in lines if "barrier_arrive_and_wait" in l]
     declared_token_ids = set(token_ids) | set(null_token_ids)
     all_token_ids = declared_token_ids | set(wait_ids)
-    all_barrier_ids = set(barrier_ids) | set(arrive_ids)
-    barrier_num = max(barrier_ids) + 1 if barrier_ids else 0
 
     def check_dense_ids(ids, name):
         if not ids:
@@ -303,16 +299,17 @@ def verify_SunmmioSync(mod: IRModule):
         assert ids == expected_ids, f"{name} ids should be continuous from 0, got {sorted(ids)}"
 
     check_dense_ids(all_token_ids, "token")
-    check_dense_ids(all_barrier_ids, "barrier")
+
+    barrier_init_masks = [l.split("barrier_init(", 1)[1].rsplit(")", 1)[0] for l in lines if "barrier_init(" in l]
+    arrive_masks = [l.split("barrier_arrive_and_wait(", 1)[1].rsplit(")", 1)[0] for l in lines if "barrier_arrive_and_wait(" in l]
+    initialized_masks = set(barrier_init_masks)
 
     # Check count of wait_lines and arrive_lines
     assert len(wait_ids) >= len(set(token_ids)), "wait_lines should be greater than token_lines"
-    assert len(arrive_ids) >= barrier_num, "arrive_lines should be greater than barrier_lines"
-    # Check range of wait_ids and arrive_ids
     for i in wait_ids:
         assert i in declared_token_ids, f"wait_token({i}) does not have sync_token_id or sync_null_token"
-    for i in arrive_ids:
-        assert i < barrier_num, f"arrive_token({i}) is out of range {barrier_num}"
+    for mask in arrive_masks:
+        assert mask in initialized_masks, f"barrier_arrive_and_wait({mask}) does not have barrier_init({mask})"
 
     # Check order of sync_token_id(id) (or sync_null_token(id)) and wait_token(id)
     for i in declared_token_ids:
@@ -323,13 +320,14 @@ def verify_SunmmioSync(mod: IRModule):
         assert idx_first_token != -1, f"sync_token_id({i}) or sync_null_token({i}) is not found in script"
         assert idx_wait != -1, f"wait_token({i}) is not found in script"
         assert idx_first_token < idx_wait, f"wait_token({i}) is before sync_token_id or sync_null_token({i})"
-    # Check order of barrier_init(id) and barrier_arrive_and_wait(id)
-    for i in range(barrier_num):
-        idx_barrier = script.find(f"barrier_init({i}")
-        idx_arrive = script.find(f"barrier_arrive_and_wait({i})")
-        assert idx_barrier != -1, f"barrier_init({i}) is not found in script"
-        assert idx_arrive != -1, f"barrier_arrive_and_wait({i}) is not found in script"
-        assert idx_barrier < idx_arrive, f"barrier_init({i}) is after barrier_arrive_and_wait({i})"
+    # Check order of barrier_init(mask) and barrier_arrive_and_wait(mask).
+    for mask in initialized_masks:
+        idx_barrier = script.find(f"barrier_init({mask})")
+        idx_arrive = script.find(f"barrier_arrive_and_wait({mask})")
+        if idx_arrive == -1:
+            continue
+        assert idx_barrier != -1, f"barrier_init({mask}) is not found in script"
+        assert idx_barrier < idx_arrive, f"barrier_init({mask}) is after barrier_arrive_and_wait({mask})"
 
 
 def verify_tiles_ops(prim_func: tir.PrimFunc):

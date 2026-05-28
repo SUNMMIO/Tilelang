@@ -105,6 +105,8 @@ def test_summa():
             C_local = T.allocate([1024], "float32", "shared.rsram")
             A_shared = T.allocate([1024], "float16", "shared.asram")
             B_shared = T.allocate([1024], "float16", "shared.wsram")
+            T.barrier_init(T.int64(15))
+            T.barrier_init(T.int64(4369))
             by = T.launch_thread("blockIdx.y", 4)
             tx = T.launch_thread("threadIdx.x", 128)
             ty = T.launch_thread("threadIdx.y", 1)
@@ -114,18 +116,18 @@ def test_summa():
             T.sync_null_token(2)
             for k_tile in range(4):
                 T.wait_token(2)
+                T.barrier_arrive_and_wait(T.int64(15))
                 A_1 = T.Buffer((16384,), "float16", data=A)
                 A_shared_1 = T.Buffer((1024,), "float16", data=A_shared, scope="shared.asram")
                 T.broadcast_(T.region(A_1[by * 4096 + k_tile * 32], 1, 4000), T.region(A_shared_1[0], 2, 1024), 1024, by * 4 + k_tile, 0, T.sync_token_id(0))
-                T.barrier_init(0, T.int64(1) << T.Cast("int64", by * 4 + k_tile), T.bitwise_or(T.bitwise_or(T.int64(1) << T.Cast("int64", by * 4), T.int64(1) << T.Cast("int64", by * 4 + 1)), T.bitwise_or(T.int64(1) << T.Cast("int64", by * 4 + 2), T.int64(1) << T.Cast("int64", by * 4 + 3))))
                 B_1 = T.Buffer((16384,), "float16", data=B)
                 B_shared_1 = T.Buffer((1024,), "float16", data=B_shared, scope="shared.wsram")
+                T.barrier_arrive_and_wait(T.int64(4369))
                 T.broadcast_(T.region(B_1[k_tile * 4096 + bx * 32], 1, 4000), T.region(B_shared_1[0], 2, 1024), 1024, k_tile * 4 + bx, 1, T.sync_token_id(1))
-                T.barrier_init(1, T.int64(1) << T.Cast("int64", k_tile * 4 + bx), T.bitwise_or(T.bitwise_or(T.int64(1) << T.Cast("int64", bx), T.int64(1) << T.Cast("int64", bx + 4)), T.bitwise_or(T.int64(1) << T.Cast("int64", bx + 8), T.int64(1) << T.Cast("int64", bx + 12))))
                 T.wait_token(0)
-                T.barrier_arrive_and_wait(0)
+                T.barrier_arrive_and_wait(T.int64(15))
                 T.wait_token(1)
-                T.barrier_arrive_and_wait(1)
+                T.barrier_arrive_and_wait(T.int64(4369))
                 T.mma_sunmmio(T.region(A_shared_1[0], 1, 1024), T.region(B_shared_1[0], 1, 1024), T.region(C_local_1[0], 3, 1024), T.bool(False), T.bool(False), T.bool(False), T.sync_token_id(2))
             T.wait_token(2)
             C_1 = T.Buffer((16384,), data=C)
@@ -147,10 +149,14 @@ def test_summa():
     script_InjectSunmmioSync = [
         'with T.launch_thread("blockIdx.x", 16) as bx:',
         "T.dma_copy(T.region(A_1[bx * 32, 0], 1, 32, 32), T.region(A_rsram_stage[0, 0], 2, 32, 32), 0, T.sync_token_id(0))",
+        "T.barrier_init(T.int64(15))",
+        "T.barrier_init(T.int64(4369))",
+        "T.barrier_arrive_and_wait(T.int64(15))",
         "T.broadcast_(T.region(A_rsram_stage[0, 0], 1, 32, 32), T.region(A_shared[0, 0], 2, 32, 32), 0, 15, 0, 0, T.sync_token_id(1))",
-        "T.barrier_init(0, T.int64(1), T.int64(15))",
+        "T.barrier_arrive_and_wait(T.int64(4369))",
         "T.broadcast_(T.region(B_1[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 2, 32, 32), 1, 4369, 0, 0, T.sync_token_id(2))",
-        "T.barrier_init(1, T.int64(1), T.int64(4369))",
+        "T.barrier_arrive_and_wait(T.int64(15))",
+        "T.barrier_arrive_and_wait(T.int64(4369))",
         "T.mma_sunmmio(T.region(A_shared[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 1, 32, 32), T.region(C_local[0, 0], 3, 32, 32), T.bool(False), T.bool(False), T.bool(False), 0, T.sync_token_id(3))",
         "T.dma_copy(T.region(C_local[0, 0], 1, 32, 32), T.region(C_1[bx * 32, 0], 2, 32, 32), 0, T.sync_token_id(4))",
         "T.wait_token(4)",

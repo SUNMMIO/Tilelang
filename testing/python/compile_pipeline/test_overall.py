@@ -78,6 +78,7 @@ def test_overall():
             buf_shmem = T.allocate([32768], "uint8", "shared.rsram")
             A_shared = T.allocate([4096], "float16", "shared.asram")
             B_shared = T.allocate([4096], "float16", "shared.wsram")
+            T.barrier_init(T.int64(15))
             by = T.launch_thread("blockIdx.y", 2)
             tx = T.launch_thread("threadIdx.x", 128)
             ty = T.launch_thread("threadIdx.y", 1)
@@ -124,10 +125,10 @@ def test_overall():
                         T.wait_token(12)
                         C_shared[i * 256 + ki * 64 + j * 32:i * 256 + ki * 64 + j * 32 + 32] = C_shared[i * 256 + ki * 64 + j * 32:i * 256 + ki * 64 + j * 32 + 32] + Bias_shared[i * 256 + ki * 64 + j * 32 + 4096:i * 256 + ki * 64 + j * 32 + 4096 + 32]
             C_remote = T.Buffer((4096,), data=buf_shmem, scope="shared.rsram")
+            T.barrier_arrive_and_wait(T.int64(15))
             T.broadcast_(T.region(C_shared[0], 1, 4096), T.region(C_remote[4096], 2, 4096), 4096, 0, 0, T.sync_token_id(13))
-            T.barrier_init(0, T.int64(1), T.int64(15))
             T.wait_token(13)
-            T.barrier_arrive_and_wait(0)
+            T.barrier_arrive_and_wait(T.int64(15))
             C_1 = T.Buffer((1024,), data=C)
             T.dma_copy(T.region(C_remote[4096], 1, 4096), T.region(C_1[by * 2048 + bx * 64], 2, 2080), T.sync_token_id(14))
             T.wait_token(14)
@@ -152,8 +153,10 @@ def test_overall():
         "T.dma_copy(T.region(B_1[0, 0], 1, 32, 64), T.region(B_shared[0, 0, 0], 2, 1, 32, 64), 0, T.sync_token_id(1))",
         "T.mma_sunmmio(T.region(A_shared[0, 0, 0], 1, 1, 64, 32), T.region(B_shared[0, 0, 0], 1, 1, 32, 64), T.region(C_shared[0, 0], 3, 64, 64), T.bool(False), T.bool(False), T.bool(False), 0, T.sync_token_id(3))",
         "T.dma_copy(T.region(Bias_1[bx * 64, 0], 1, 64, 64), T.region(Bias_shared[0, 0], 2, 64, 64), 0, T.sync_token_id(4))",
+        "T.barrier_init(T.int64(15))",
+        "T.barrier_arrive_and_wait(T.int64(15))",
         "T.broadcast_(T.region(C_shared[0, 0], 1, 64, 64), T.region(C_remote[0, 0], 2, 64, 64), 0, 15, 0, 0, T.sync_token_id(5))",
-        "T.barrier_init(0, T.int64(1), T.int64(15))",
+        "T.barrier_arrive_and_wait(T.int64(15))",
         "T.dma_copy(T.region(C_remote[0, 0], 1, 64, 64), T.region(C_1[bx * 64, 0], 2, 64, 64), 0, T.sync_token_id(6))",
         "T.wait_token(6)",
     ]

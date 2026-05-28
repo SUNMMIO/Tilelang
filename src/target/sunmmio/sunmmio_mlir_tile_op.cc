@@ -24,7 +24,7 @@ mlir::Value GetTileCastOp(SunmmioMlirContext &ctx, mlir::Value src_value,
   mlir::Type dst_mlir_type = MapMlirType(ctx, dst_type);
   auto tile_type = mlir::dyn_cast<mlir::suvm::TileType>(dst_mlir_type);
   ICHECK(tile_type) << "Expected SUVM tile type for tile.cast result";
-  return ctx.builder.create<mlir::suvm::TileCastOp>(loc, tile_type, src_value)
+  return mlir::suvm::TileCastOp::create(ctx.builder, loc, tile_type, src_value)
       .getResult();
 }
 
@@ -284,25 +284,24 @@ SunMMIOValue SunmmioMlirTileOp::Binary(const std::string &result_name,
         binary_value = CreateTypedPlaceholderWithOperands(
             ctx_, result_mlir_type, {lhs, rhs}, "fake_tile_addf");
       } else {
-        binary_value =
-            ctx_.builder
-                .create<mlir::suvm::TileAddFOp>(loc, tile_type, lhs, rhs)
-                .getResult();
+        binary_value = mlir::suvm::TileAddFOp::create(ctx_.builder, loc,
+                                                      tile_type, lhs, rhs)
+                           .getResult();
       }
     } else {
       binary_value =
-          ctx_.builder.create<mlir::suvm::TileAddIOp>(loc, tile_type, lhs, rhs)
+          mlir::suvm::TileAddIOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
               .getResult();
     }
     break;
   case BinaryOp::kSub:
     if (flavor == ArithmeticFlavor::kFloat) {
       binary_value =
-          ctx_.builder.create<mlir::suvm::TileSubFOp>(loc, tile_type, lhs, rhs)
+          mlir::suvm::TileSubFOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
               .getResult();
     } else {
       binary_value =
-          ctx_.builder.create<mlir::suvm::TileSubIOp>(loc, tile_type, lhs, rhs)
+          mlir::suvm::TileSubIOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
               .getResult();
     }
     break;
@@ -310,57 +309,77 @@ SunMMIOValue SunmmioMlirTileOp::Binary(const std::string &result_name,
     ICHECK(flavor == ArithmeticFlavor::kFloat)
         << "SUVM tile integer multiply is not currently available";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileMulFOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileMulFOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kDiv:
     ICHECK(flavor == ArithmeticFlavor::kFloat)
         << "SUVM tile integer division is not currently available";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileDivFOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileDivFOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kMod:
     ICHECK(flavor == ArithmeticFlavor::kFloat)
         << "SUVM tile remainder is only available for floating-point tiles";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileRemFOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileRemFOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kMin:
     ICHECK(flavor == ArithmeticFlavor::kFloat)
         << "SUVM tile min currently supports floating-point tiles only";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileMinFOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileMinFOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kMax:
     ICHECK(flavor == ArithmeticFlavor::kFloat)
         << "SUVM tile max currently supports floating-point tiles only";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileMaxFOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileMaxFOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kAnd:
     ICHECK(flavor != ArithmeticFlavor::kFloat)
         << "SUVM tile.andi expects integer-like tiles";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileAndIOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileAndIOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kOr:
     ICHECK(flavor != ArithmeticFlavor::kFloat)
         << "SUVM tile.ori expects integer-like tiles";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileOrIOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileOrIOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kXor:
     ICHECK(flavor != ArithmeticFlavor::kFloat)
         << "SUVM tile.xori expects integer-like tiles";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileXorIOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileXorIOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
+    break;
+  case BinaryOp::kShl:
+    ICHECK(flavor != ArithmeticFlavor::kFloat)
+        << "SUVM tile.shlli expects integer-like tiles";
+    binary_value =
+        mlir::suvm::TileShllIOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
+            .getResult();
+    break;
+  case BinaryOp::kShr:
+    ICHECK(flavor != ArithmeticFlavor::kFloat)
+        << "SUVM tile shift-right expects integer-like tiles";
+    if (flavor == ArithmeticFlavor::kUnsignedInt) {
+      binary_value = mlir::suvm::TileShrlIOp::create(ctx_.builder, loc,
+                                                     tile_type, lhs, rhs)
+                         .getResult();
+    } else {
+      binary_value = mlir::suvm::TileShraIOp::create(ctx_.builder, loc,
+                                                     tile_type, lhs, rhs)
+                         .getResult();
+    }
     break;
   default:
     LOG(FATAL) << "Unsupported clean v4 tile binary op";
@@ -474,15 +493,13 @@ SunMMIOValue SunmmioMlirTileOp::Compare(const std::string &result_name,
   mlir::Value compare_value;
   if (domain == CompareDomain::kFloat) {
     compare_value =
-        ctx_.builder
-            .create<mlir::suvm::TileCmpFOp>(
-                loc, tile_type, GetTileCmpFloatPredicate(op), lhs, rhs)
+        mlir::suvm::TileCmpFOp::create(ctx_.builder, loc, tile_type,
+                                       GetTileCmpFloatPredicate(op), lhs, rhs)
             .getResult();
   } else {
-    compare_value = ctx_.builder
-                        .create<mlir::suvm::TileCmpIOp>(
-                            loc, tile_type,
-                            GetTileCmpIntegerPredicate(op, domain), lhs, rhs)
+    compare_value = mlir::suvm::TileCmpIOp::create(
+                        ctx_.builder, loc, tile_type,
+                        GetTileCmpIntegerPredicate(op, domain), lhs, rhs)
                         .getResult();
   }
 
