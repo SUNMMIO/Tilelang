@@ -14,7 +14,7 @@ def _build_sunmmio_source_from_stmt(stmt):
     return builder(mod, target, "suvm").inspect_source()
 
 
-def _make_tile_valued_aligned_store_stmt():
+def _make_nonzero_offset_aligned_store_stmt():
     bf16 = tvm.ir.PrimType("bfloat16")
     one = tvm.tir.IntImm("bool", 1)
 
@@ -28,16 +28,13 @@ def _make_tile_valued_aligned_store_stmt():
 
     tile_i = tvm.tir.Var("tile_i", "int32")
     ki = tvm.tir.Var("ki", "int32")
-    tile_base = tvm.tir.Mul(tile_i, tvm.tir.IntImm("int32", 8))
-    elem_index = tvm.tir.Add(tile_base, ki)
+    base = tvm.tir.IntImm("int32", 8)
 
-    # These 1D tiled loads are lowered through the regular tile access path,
-    # so the add result is a logical tile value rather than a scalar.
     value = tvm.tir.Add(
-        tvm.tir.BufferLoad(a_buf, [elem_index]),
-        tvm.tir.BufferLoad(b_buf, [elem_index]),
+        tvm.tir.BufferLoad(a_buf, [ki + base]),
+        tvm.tir.BufferLoad(b_buf, [ki + base]),
     )
-    store = tvm.tir.BufferStore(out_buf, value, [elem_index])
+    store = tvm.tir.BufferStore(out_buf, value, [ki + base])
 
     inner = tvm.tir.For(
         ki,
@@ -54,11 +51,11 @@ def _make_tile_valued_aligned_store_stmt():
     outer = tvm.tir.For(
         tile_i,
         0,
-        8,
+        1,
         tvm.tir.ForKind.SERIAL,
         inner,
         annotations={
-            "tile.domain": [tvm.tir.IntImm("int32", 64)],
+            "tile.domain": [tvm.tir.IntImm("int32", 8)],
             "tile.execution_axis": tvm.tir.IntImm("int32", 0),
             "tile.execution_domain_axes": [tvm.tir.IntImm("int32", 0)],
             "tile.scope_entry": tvm.tir.IntImm("int32", 1),
@@ -90,8 +87,10 @@ def _make_tile_valued_aligned_store_stmt():
     )
 
 
-def test_sunmmio_codegen_aligned_1d_store_uses_insert_slice_bridge():
-    src = _build_sunmmio_source_from_stmt(_make_tile_valued_aligned_store_stmt())
-    assert "fake_tile_insert_slice" in src
-    assert "fake_tile_load" in src
-    assert "fake_tile_unsqueeze" in src
+def test_sunmmio_codegen_aligned_1d_store_uses_nonzero_insert_slice_offset():
+    src = _build_sunmmio_source_from_stmt(_make_nonzero_offset_aligned_store_stmt())
+    assert "suvm.tile.insert_slice" in src
+    assert "suvm.tile.unsqueeze" in src
+    assert "fake_partitioned_tile_view" in src
+    assert "fake_tile_store" in src
+    assert "offsets = array<i64: 8, 0>" in src

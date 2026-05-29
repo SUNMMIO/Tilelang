@@ -395,6 +395,10 @@ MatchTiledIndex(const PrimExpr &index, const Var &exec, const Var &interior,
   if (seen_interior && seen_exec && const_offset % tile_extent == 0) {
     return TiledIndexMatch{const_offset / tile_extent, true};
   }
+  if (allow_standalone_interior && seen_interior && !seen_exec &&
+      const_offset % tile_extent == 0) {
+    return TiledIndexMatch{const_offset / tile_extent, false};
+  }
   return std::nullopt;
 }
 
@@ -597,11 +601,16 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
               NewValueName(), logical_offsets[dim],
               SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
               DataType::Int(32));
-          exec_index = builder_->Binary(
-              NewValueName(), BinaryOp::kAdd, ArithmeticFlavor::kIndex,
-              exec_index, offset,
-              SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
-              DataType::Int(32));
+          exec_index = logical_uses_execution_index[dim]
+                           ? builder_->Binary(
+                                 NewValueName(), BinaryOp::kAdd,
+                                 ArithmeticFlavor::kIndex, exec_index, offset,
+                                 SunMMIOType{SunMMIOType::Kind::kIndex,
+                                             DataType::Int(32),
+                                             1,
+                                             {}},
+                                 DataType::Int(32))
+                           : offset;
         }
         access.partition_indices.push_back(exec_index);
       } else {
@@ -1144,7 +1153,24 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         DataType::Int(32));
   };
 
+  auto get_const_index_value =
+      [&](const SunMMIOValue &value) -> std::optional<int64_t> {
+    mlir::Value mlir_value = mlir_ctx->LookupMLIRValue(value.value);
+    if (!mlir_value) {
+      return std::nullopt;
+    }
+    if (auto cst = mlir::getConstantIntValue(mlir_value)) {
+      return static_cast<int64_t>(*cst);
+    }
+    return std::nullopt;
+  };
+
   auto add_index = [&](const SunMMIOValue &lhs, const SunMMIOValue &rhs) {
+    auto lhs_cst = get_const_index_value(lhs);
+    auto rhs_cst = get_const_index_value(rhs);
+    if (lhs_cst.has_value() && rhs_cst.has_value()) {
+      return make_index_const(*lhs_cst + *rhs_cst);
+    }
     return builder_->Binary(
         NewValueName(), BinaryOp::kAdd, ArithmeticFlavor::kIndex, lhs, rhs,
         SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
@@ -1152,6 +1178,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   };
 
   auto mul_index = [&](const SunMMIOValue &lhs, const SunMMIOValue &rhs) {
+    auto lhs_cst = get_const_index_value(lhs);
+    auto rhs_cst = get_const_index_value(rhs);
+    if (lhs_cst.has_value() && rhs_cst.has_value()) {
+      return make_index_const(*lhs_cst * *rhs_cst);
+    }
     return builder_->Binary(
         NewValueName(), BinaryOp::kMul, ArithmeticFlavor::kIndex, lhs, rhs,
         SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
@@ -1159,6 +1190,12 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   };
 
   auto div_index = [&](const SunMMIOValue &lhs, const SunMMIOValue &rhs) {
+    auto lhs_cst = get_const_index_value(lhs);
+    auto rhs_cst = get_const_index_value(rhs);
+    if (lhs_cst.has_value() && rhs_cst.has_value()) {
+      ICHECK_NE(*rhs_cst, 0) << "index division by zero in aligned 1D lowering";
+      return make_index_const(*lhs_cst / *rhs_cst);
+    }
     return builder_->Binary(
         NewValueName(), BinaryOp::kDiv, ArithmeticFlavor::kIndex, lhs, rhs,
         SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
@@ -1166,6 +1203,12 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   };
 
   auto mod_index = [&](const SunMMIOValue &lhs, const SunMMIOValue &rhs) {
+    auto lhs_cst = get_const_index_value(lhs);
+    auto rhs_cst = get_const_index_value(rhs);
+    if (lhs_cst.has_value() && rhs_cst.has_value()) {
+      ICHECK_NE(*rhs_cst, 0) << "index modulo by zero in aligned 1D lowering";
+      return make_index_const(*lhs_cst % *rhs_cst);
+    }
     return builder_->Binary(
         NewValueName(), BinaryOp::kMod, ArithmeticFlavor::kIndex, lhs, rhs,
         SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
