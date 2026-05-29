@@ -167,6 +167,13 @@ SunMMIOValue SuvmSunmmioBuilder::TileUnsqueeze(const std::string &result_name,
   return tile_->TileUnsqueeze(result_name, tile, tile_type, axis, dtype);
 }
 
+SunMMIOValue SuvmSunmmioBuilder::TileBroadcast(const std::string &result_name,
+                                               const SunMMIOValue &tile,
+                                               const SunMMIOType &tile_type,
+                                               DataType dtype) {
+  return tile_->TileBroadcast(result_name, tile, tile_type, dtype);
+}
+
 SunMMIOValue
 SuvmSunmmioBuilder::TileSlice(const std::string &result_name,
                               const SunMMIOValue &tile,

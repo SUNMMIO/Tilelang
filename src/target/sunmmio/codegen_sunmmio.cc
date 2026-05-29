@@ -110,6 +110,11 @@ void ApplyDebugRsramTailPadding(SunMMIOType *memtensor_type) {
   if (memtensor_type->shape.size() < 2) {
     return;
   }
+  if (!memtensor_type->layout_hshape.empty() ||
+      !memtensor_type->layout_hstride.empty() ||
+      !memtensor_type->layout_dim_levels.empty()) {
+    return;
+  }
 
   std::vector<int64_t> layout_hshape;
   layout_hshape.reserve(memtensor_type->shape.size());

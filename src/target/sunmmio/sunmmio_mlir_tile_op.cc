@@ -531,6 +531,23 @@ SunMMIOValue SunmmioMlirTileOp::TileUnsqueeze(const std::string &result_name,
   return SunMMIOValue{dtype, result_name, tile_type};
 }
 
+SunMMIOValue SunmmioMlirTileOp::TileBroadcast(const std::string &result_name,
+                                              const SunMMIOValue &tile,
+                                              const SunMMIOType &tile_type,
+                                              DataType dtype) {
+  mlir::Type result_type = MapMlirType(ctx_, tile_type);
+  mlir::Value input =
+      ctx_.LookupOrCreateFakeValue(tile, "fake_missing_tile_broadcast_src");
+  mlir::Value tile_value =
+      mlir::suvm::TileBroadcastOp::create(ctx_.builder, MapMlirLoc(ctx_),
+                                          result_type, input)
+          .getResult();
+  if (!result_name.empty()) {
+    ctx_.BindMLIRValue(result_name, tile_value);
+  }
+  return SunMMIOValue{dtype, result_name, tile_type};
+}
+
 SunMMIOValue
 SunmmioMlirTileOp::TileSlice(const std::string &result_name,
                              const SunMMIOValue &tile,

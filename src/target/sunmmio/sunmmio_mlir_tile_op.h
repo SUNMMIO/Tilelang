@@ -50,6 +50,10 @@ public:
                              const SunMMIOType &tile_type, int64_t axis,
                              DataType dtype);
 
+  SunMMIOValue TileBroadcast(const std::string &result_name,
+                             const SunMMIOValue &tile,
+                             const SunMMIOType &tile_type, DataType dtype);
+
   SunMMIOValue TileSlice(const std::string &result_name,
                          const SunMMIOValue &tile,
                          const std::vector<SunMMIOValue> &offsets,

@@ -638,24 +638,23 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
             break;
           }
         }
-        ICHECK(unit_dim.has_value())
-            << "Cannot promote 1D reduce writeback access to a 2D unit tile "
-               "view without a spare memtensor dimension";
-        int64_t existing_dim = access.tiled_dims[0];
-        // Keep tile_view dimensions in memtensor/layout order.  For reduce axis
-        // 1 this intentionally creates a row-major 1xN view instead of a Nx1
-        // view with tiled_dims=[data_dim, unit_dim]; RHS unit-vector tiles are
-        // re-oriented later with squeeze/unsqueeze when needed.
-        if (*unit_dim < existing_dim) {
-          access.tiled_dims.insert(access.tiled_dims.begin(), *unit_dim);
-          access.tile_axes.insert(access.tile_axes.begin(), unit_axis);
-          access.tile_shape.insert(access.tile_shape.begin(), 1);
-        } else {
-          access.tiled_dims.push_back(*unit_dim);
-          access.tile_axes.push_back(unit_axis);
-          access.tile_shape.push_back(1);
+        if (unit_dim.has_value()) {
+          int64_t existing_dim = access.tiled_dims[0];
+          // Keep tile_view dimensions in memtensor/layout order.  For reduce
+          // axis 1 this intentionally creates a row-major 1xN view instead of
+          // a Nx1 view with tiled_dims=[data_dim, unit_dim]; RHS unit-vector
+          // tiles are re-oriented later with squeeze/unsqueeze when needed.
+          if (*unit_dim < existing_dim) {
+            access.tiled_dims.insert(access.tiled_dims.begin(), *unit_dim);
+            access.tile_axes.insert(access.tile_axes.begin(), unit_axis);
+            access.tile_shape.insert(access.tile_shape.begin(), 1);
+          } else {
+            access.tiled_dims.push_back(*unit_dim);
+            access.tile_axes.push_back(unit_axis);
+            access.tile_shape.push_back(1);
+          }
+          access.promoted_unit_tile_view = true;
         }
-        access.promoted_unit_tile_view = true;
       }
     }
 
@@ -972,6 +971,19 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     return dtype.is_float() || dtype.is_bfloat16();
   };
 
+  auto arithmetic_flavor_for_dtype = [](DataType dtype) {
+    if (dtype.is_float() || dtype.is_bfloat16()) {
+      return ArithmeticFlavor::kFloat;
+    }
+    if (dtype.is_uint()) {
+      return ArithmeticFlavor::kUnsignedInt;
+    }
+    if (dtype.is_bool()) {
+      return ArithmeticFlavor::kBool;
+    }
+    return ArithmeticFlavor::kSignedInt;
+  };
+
   auto is_tile_compare_operand = [](const SunMMIOValue &lhs,
                                     const SunMMIOValue &rhs) {
     return IsTileLike(lhs) || IsTileLike(rhs);
@@ -1060,6 +1072,20 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     if (src_shape.size() == 2 && dst_shape.size() == 2) {
       std::optional<int64_t> src_unit_axis = unit_axis_for_2d_shape(src_shape);
       std::optional<int64_t> dst_unit_axis = unit_axis_for_2d_shape(dst_shape);
+      if (src_unit_axis.has_value()) {
+        bool can_broadcast = true;
+        for (size_t i = 0; i < src_shape.size(); ++i) {
+          if (src_shape[i] != dst_shape[i] && src_shape[i] != 1) {
+            can_broadcast = false;
+            break;
+          }
+        }
+        if (can_broadcast) {
+          SunMMIOType dst_type = MakeTileType(value.dtype, dst_shape);
+          return builder_->TileBroadcast(NewValueName(), value, dst_type,
+                                         value.dtype);
+        }
+      }
       if (src_unit_axis.has_value() && dst_unit_axis.has_value() &&
           unit_vector_extent(src_shape, *src_unit_axis) ==
               unit_vector_extent(dst_shape, *dst_unit_axis)) {
@@ -1446,8 +1472,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       if (IsScalarLike(lhs) && IsScalarLike(rhs)) {
         SunMMIOType result_type{
             SunMMIOType::Kind::kScalar, result_dtype, 1, {}};
-        return builder_->Binary(NewValueName(), op, ArithmeticFlavor::kFloat,
-                                lhs, rhs, result_type, result_dtype);
+        lhs = EnsureType(lhs, result_type, result_dtype);
+        rhs = EnsureType(rhs, result_type, result_dtype);
+        return builder_->Binary(NewValueName(), op,
+                                arithmetic_flavor_for_dtype(result_dtype), lhs,
+                                rhs, result_type, result_dtype);
       }
       std::vector<int64_t> result_shape;
       if (IsTileLike(lhs)) {
@@ -1613,6 +1642,12 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     }
     if (const auto *call = expr.as<CallNode>()) {
       const auto *op_node = call->op.as<OpNode>();
+      if (op_node && op_node->name == "tl.infinity") {
+        DataType dtype = CanonicalizeSuvmDType(call->dtype).with_lanes(1);
+        SunMMIOType scalar_type{SunMMIOType::Kind::kScalar, dtype, 1, {}};
+        return builder_->ConstantFloat(NewValueName(), "inf", scalar_type,
+                                       dtype);
+      }
       if (op_node && call->args.size() >= 3 &&
           op_node->name == "tir.if_then_else") {
         return emit_select(call->args[0], call->args[1], call->args[2],
@@ -1620,6 +1655,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       }
       if (op_node && call->args.size() == 1 && op_node->name == "tir.exp") {
         return emit_unary(TileUnaryOp::kExp, call->args[0], call->dtype);
+      }
+      if (op_node && call->args.size() == 1 && op_node->name == "tir.exp2") {
+        PrimExpr scaled_arg = call->args[0] * FloatImm(call->args[0].dtype(),
+                                                       0.69314718055994530942);
+        return emit_unary(TileUnaryOp::kExp, scaled_arg, call->dtype);
       }
       if (op_node && call->args.size() == 1 &&
           (op_node->name == "tir.fabs" || op_node->name == "tir.abs")) {
