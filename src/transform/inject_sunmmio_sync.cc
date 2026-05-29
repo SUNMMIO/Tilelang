@@ -185,6 +185,37 @@ std::optional<int64_t> EvalInt64(PrimExpr expr, arith::Analyzer *analyzer) {
       return std::optional<int64_t>(a - (*div) * b);
     });
   }
+  if (const auto *op = expr.as<EQNode>()) {
+    return eval_binary(op->a, op->b,
+                       [](int64_t a, int64_t b) { return a == b ? 1 : 0; });
+  }
+  if (const auto *op = expr.as<NENode>()) {
+    return eval_binary(op->a, op->b,
+                       [](int64_t a, int64_t b) { return a != b ? 1 : 0; });
+  }
+  if (const auto *op = expr.as<LTNode>()) {
+    return eval_binary(op->a, op->b,
+                       [](int64_t a, int64_t b) { return a < b ? 1 : 0; });
+  }
+  if (const auto *op = expr.as<LENode>()) {
+    return eval_binary(op->a, op->b,
+                       [](int64_t a, int64_t b) { return a <= b ? 1 : 0; });
+  }
+  if (const auto *op = expr.as<GTNode>()) {
+    return eval_binary(op->a, op->b,
+                       [](int64_t a, int64_t b) { return a > b ? 1 : 0; });
+  }
+  if (const auto *op = expr.as<GENode>()) {
+    return eval_binary(op->a, op->b,
+                       [](int64_t a, int64_t b) { return a >= b ? 1 : 0; });
+  }
+  if (const auto *op = expr.as<SelectNode>()) {
+    std::optional<int64_t> cond = EvalInt64(op->condition, analyzer);
+    if (!cond) {
+      return std::nullopt;
+    }
+    return EvalInt64(*cond != 0 ? op->true_value : op->false_value, analyzer);
+  }
   if (const auto *call = expr.as<CallNode>()) {
     const auto *op = call->op.as<OpNode>();
     if (!op || call->args.size() != 2) {
@@ -806,13 +837,83 @@ private:
     }
   }
 
-  bool CanProveCoreInMask(PrimExpr core, PrimExpr mask) {
-    if (!analyzer_) {
-      return false;
+  PrimExpr LocalMaskBitSet(PrimExpr local_mask, int local_index) {
+    PrimExpr bit = I64Imm(static_cast<int64_t>(uint64_t{1} << local_index));
+    return (AsI64(local_mask) & bit) != I64Imm(0);
+  }
+
+  std::optional<int64_t>
+  TryExpandBroadcastLocalMaskImm(const PrimExpr &local_mask, int direction,
+                                 const PrimExpr &src_core) {
+    std::optional<int64_t> local_value = EvalInt64(local_mask, analyzer_);
+    std::optional<int64_t> src_value = EvalInt64(src_core, analyzer_);
+    if (!local_value || !src_value) {
+      return std::nullopt;
     }
-    PrimExpr core_bit = CoreBitMask(core);
-    PrimExpr masked = analyzer_->Simplify(AsI64(mask) & AsI64(core_bit));
-    return analyzer_->CanProve(masked != I64Imm(0));
+
+    int total_cores = mesh_nrow_ * mesh_ncol_;
+    ICHECK_GE(*src_value, 0);
+    ICHECK_LT(*src_value, total_cores);
+
+    int src_row = static_cast<int>(*src_value) / mesh_ncol_;
+    int src_col = static_cast<int>(*src_value) % mesh_ncol_;
+    int axis_len = direction == 0 ? mesh_ncol_ : mesh_nrow_;
+    uint64_t valid_local_mask =
+        axis_len == 64 ? ~uint64_t{0} : ((uint64_t{1} << axis_len) - 1);
+    uint64_t local = UnsignedMask(*local_value);
+    ICHECK_EQ(local & ~valid_local_mask, 0U)
+        << "tl.broadcast_ direction-local mask has bits outside the active "
+           "mesh axis";
+
+    uint64_t global = 0;
+    if (direction == 0) {
+      for (int col = 0; col < mesh_ncol_; ++col) {
+        if ((local & (uint64_t{1} << col)) != 0) {
+          global |= uint64_t{1} << (src_row * mesh_ncol_ + col);
+        }
+      }
+    } else {
+      for (int row = 0; row < mesh_nrow_; ++row) {
+        if ((local & (uint64_t{1} << row)) != 0) {
+          global |= uint64_t{1} << (row * mesh_ncol_ + src_col);
+        }
+      }
+    }
+    return static_cast<int64_t>(global);
+  }
+
+  PrimExpr ExpandBroadcastLocalMask(const PrimExpr &local_mask, int direction,
+                                    const PrimExpr &src_core) {
+    if (std::optional<int64_t> imm =
+            TryExpandBroadcastLocalMaskImm(local_mask, direction, src_core)) {
+      return I64Imm(*imm);
+    }
+
+    PrimExpr src_core_i64 = AsI64(src_core);
+    PrimExpr ncol = I64Imm(mesh_ncol_);
+    PrimExpr src_row = floordiv(src_core_i64, ncol);
+    PrimExpr src_col = floormod(src_core_i64, ncol);
+    PrimExpr global_mask = I64Imm(0);
+
+    if (direction == 0) {
+      for (int col = 0; col < mesh_ncol_; ++col) {
+        PrimExpr global_core = src_row * ncol + I64Imm(col);
+        PrimExpr bit = CoreBitMask(global_core);
+        global_mask = Select(LocalMaskBitSet(local_mask, col),
+                             AsI64(global_mask) | AsI64(bit), global_mask);
+      }
+    } else {
+      ICHECK_EQ(direction, 1)
+          << "tl.broadcast_ local mask expansion only supports direction 0/1";
+      for (int row = 0; row < mesh_nrow_; ++row) {
+        PrimExpr global_core = I64Imm(row * mesh_ncol_) + src_col;
+        PrimExpr bit = CoreBitMask(global_core);
+        global_mask = Select(LocalMaskBitSet(local_mask, row),
+                             AsI64(global_mask) | AsI64(bit), global_mask);
+      }
+    }
+
+    return analyzer_ ? analyzer_->Simplify(global_mask) : global_mask;
   }
 
   // Inserts wait_token and optional barrier_wait instructions.
@@ -954,11 +1055,11 @@ private:
     stmts.push_back(Evaluate(Call(call->dtype, call->op, new_args)));
   }
 
-  // Computes the participant core mask for a broadcast operation.
+  // Computes the global participant core mask for a broadcast operation.
   // tl.broadcast_ uses args = [src_region, dst_region, direction, mask,
   // src_offset_byte, optional src_core, optional sync_token_id]. The optional
   // src_core is immediately before sync_token_id when the token is present.
-  // The mask is an i64 bitmask of receiving cores.
+  // The broadcast mask is direction-local; barriers still use global core ids.
   PrimExpr BroadcastParticipantMask(const CallNode *call) {
     ICHECK_GE(call->args.size(), static_cast<size_t>(kBroadcastArgCount))
         << "broadcast_() call is missing its fixed argument prefix.";
@@ -969,11 +1070,19 @@ private:
       return FullCoreMask(total_cores);
     }
 
-    PrimExpr src_core = GetBroadcastSrcCore(call);
-    PrimExpr write_mask = call->args[kBroadcastArgMask];
-    if (CanProveCoreInMask(src_core, write_mask)) {
-      return analyzer_->Simplify(AsI64(write_mask));
+    int direction = -1;
+    if (const auto *direction_imm =
+            call->args[kBroadcastArgDirection].as<IntImmNode>()) {
+      direction = static_cast<int>(direction_imm->value);
     }
+    ICHECK(direction == 0 || direction == 1)
+        << "tl.broadcast_ barrier mask expansion only supports horizontal or "
+           "vertical leaf broadcasts";
+
+    PrimExpr src_core = GetBroadcastSrcCore(call);
+    PrimExpr local_mask = call->args[kBroadcastArgMask];
+    PrimExpr write_mask =
+        ExpandBroadcastLocalMask(local_mask, direction, src_core);
     PrimExpr read_mask = CoreBitMask(src_core);
     PrimExpr participant_mask = AsI64(read_mask) | AsI64(write_mask);
     return analyzer_ ? analyzer_->Simplify(participant_mask) : participant_mask;

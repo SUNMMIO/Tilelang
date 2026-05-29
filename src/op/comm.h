@@ -21,7 +21,7 @@ enum BroadcastArg : int {
   kBroadcastArgSrc = 0,           // source region
   kBroadcastArgDst = 1,           // destination region
   kBroadcastArgDirection = 2,     // 0 = horizontal/row, 1 = vertical/col
-  kBroadcastArgMask = 3,          // i64 bitmask of receiving cores
+  kBroadcastArgMask = 3,          // i64 direction-local receiver bitmask
   kBroadcastArgSrcOffsetByte = 4, // source-pointer byte offset
   kBroadcastArgCount = 5,         // fixed args before optional src_core/token
   kBroadcastArgSrcCore = 5,       // optional; immediately before sync token

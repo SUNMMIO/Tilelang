@@ -205,7 +205,7 @@ def make_dynamic_broadcast_mask_kernel():
     stmt = tvm.tir.For(
         bx,
         tvm.tir.IntImm("int32", 0),
-        tvm.tir.IntImm("int32", 4),
+        tvm.tir.IntImm("int32", 3),
         tvm.tir.ForKind.SERIAL,
         tvm.tir.Evaluate(broadcast),
     )

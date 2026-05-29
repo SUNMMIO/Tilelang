@@ -5,15 +5,12 @@
 
 #include "comm.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <tvm/tir/op.h>
-#include <vector>
 
 #include "../layout/cute_layout.h"
 #include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
-#include "copy.h"
 #include "reduce.h"
 #include "utils.h"
 
@@ -33,7 +30,7 @@ TIR_DEFINE_TL_BUILTIN(broadcast_)
                                Integer(CallEffectKind::kOpaque));
 // src_region, dst_region,
 // direction(0: horizontal/row, 1: vertical/col),
-// mask(i64 bitmask of receiving cores),
+// mask(i64 direction-local bitmask of receiving cores),
 // src_offset_byte,
 // optional src_core
 
@@ -59,8 +56,6 @@ PrimExpr AsI64(PrimExpr value) {
   return Cast(DataType::Int(64), value);
 }
 
-PrimExpr CoreBit(PrimExpr core_id) { return I64Imm(1) << AsI64(core_id); }
-
 Stmt AssertPutDistinctCores(PrimExpr src_core, PrimExpr dst_core, Stmt body,
                             arith::Analyzer *analyzer) {
   PrimExpr distinct = AsI32(src_core) != AsI32(dst_core);
@@ -78,65 +73,31 @@ Stmt AssertPutDistinctCores(PrimExpr src_core, PrimExpr dst_core, Stmt body,
                     body);
 }
 
-PrimExpr MakeCoreMask(const std::vector<int> &core_ids) {
-  uint64_t mask = 0;
-  for (int core_id : core_ids) {
-    ICHECK_GE(core_id, 0);
-    ICHECK_LT(core_id, 64)
-        << "tl.broadcast_ mask currently supports core ids in [0, 64)";
-    mask |= (uint64_t{1} << core_id);
-  }
+PrimExpr MakeFullLocalMask(int axis_len) {
+  ICHECK_GE(axis_len, 0);
+  ICHECK_LE(axis_len, 64)
+      << "tl.broadcast_ local mask currently supports at most 64 receivers";
+  uint64_t mask =
+      axis_len == 64 ? ~uint64_t{0} : ((uint64_t{1} << axis_len) - 1);
   return I64Imm(static_cast<int64_t>(mask));
 }
 
-PrimExpr MakeSingleCoreMask(PrimExpr core_id) {
-  if (const auto *imm = core_id.as<IntImmNode>()) {
-    return MakeCoreMask({static_cast<int>(imm->value)});
+PrimExpr MakeLocalSingleBit(PrimExpr local_index) {
+  if (const auto *imm = local_index.as<IntImmNode>()) {
+    ICHECK_GE(imm->value, 0);
+    ICHECK_LT(imm->value, 64)
+        << "tl.broadcast_ local mask currently supports indices in [0, 64)";
+    return I64Imm(static_cast<int64_t>(uint64_t{1} << imm->value));
   }
-  return CoreBit(core_id);
+  return I64Imm(1) << AsI64(local_index);
 }
 
-PrimExpr MakeHorizontalMask(PrimExpr src_core, int mesh_ncol) {
-  if (const auto *imm = src_core.as<IntImmNode>()) {
-    int src_core_val = static_cast<int>(imm->value);
-    int row = src_core_val / mesh_ncol;
-    std::vector<int> core_ids;
-    core_ids.reserve(mesh_ncol);
-    for (int j = 0; j < mesh_ncol; ++j) {
-      core_ids.push_back(row * mesh_ncol + j);
-    }
-    return MakeCoreMask(core_ids);
-  }
-
-  PrimExpr ncol = IntImm(src_core.dtype(), mesh_ncol);
-  PrimExpr row = floordiv(src_core, ncol);
-  PrimExpr row_base = AsI64(row * ncol);
-  PrimExpr mask = I64Imm(0);
-  for (int j = 0; j < mesh_ncol; ++j) {
-    mask = mask | CoreBit(row_base + I64Imm(j));
-  }
-  return mask;
+PrimExpr MakeHorizontalMask(int mesh_ncol) {
+  return MakeFullLocalMask(mesh_ncol);
 }
 
-PrimExpr MakeVerticalMask(PrimExpr src_core, int mesh_nrow, int mesh_ncol) {
-  if (const auto *imm = src_core.as<IntImmNode>()) {
-    int src_core_val = static_cast<int>(imm->value);
-    int col = src_core_val % mesh_ncol;
-    std::vector<int> core_ids;
-    core_ids.reserve(mesh_nrow);
-    for (int i = 0; i < mesh_nrow; ++i) {
-      core_ids.push_back(i * mesh_ncol + col);
-    }
-    return MakeCoreMask(core_ids);
-  }
-
-  PrimExpr ncol = IntImm(src_core.dtype(), mesh_ncol);
-  PrimExpr col = floormod(src_core, ncol);
-  PrimExpr mask = I64Imm(0);
-  for (int i = 0; i < mesh_nrow; ++i) {
-    mask = mask | CoreBit(I64Imm(i * mesh_ncol) + AsI64(col));
-  }
-  return mask;
+PrimExpr MakeVerticalMask(int mesh_nrow) {
+  return MakeFullLocalMask(mesh_nrow);
 }
 
 void AppendBroadcastArgs(Array<PrimExpr> *args, PrimExpr src_region,
@@ -314,9 +275,8 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
   if (direction == 0 or direction == 1) {
     // 1D broadcast
     Array<PrimExpr> args;
-    PrimExpr mask = direction == 0
-                        ? MakeHorizontalMask(src_core, mesh_ncol)
-                        : MakeVerticalMask(src_core, mesh_nrow, mesh_ncol);
+    PrimExpr mask = direction == 0 ? MakeHorizontalMask(mesh_ncol)
+                                   : MakeVerticalMask(mesh_nrow);
     AppendBroadcastArgs(&args,
                         MakeRegionExpr(src, src_range, /*access_mask=*/1),
                         MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
@@ -335,8 +295,7 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
     AppendBroadcastArgs(
         &args, MakeRegionExpr(src, src_range, /*access_mask=*/1),
         MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        /*direction=*/1, MakeVerticalMask(src_core, mesh_nrow, mesh_ncol),
-        src_offset_imm, src_core);
+        /*direction=*/1, MakeVerticalMask(mesh_nrow), src_offset_imm, src_core);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     seq.push_back(broadcast);
     // horizontal broadcast
@@ -344,15 +303,10 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
       Array<PrimExpr> args;
       PrimExpr row_src_core =
           analyzer->Simplify(I32Imm(i * mesh_ncol) + src_core_col);
-      std::vector<int> row_cores;
-      row_cores.reserve(mesh_ncol);
-      for (int j = 0; j < mesh_ncol; ++j) {
-        row_cores.push_back(i * mesh_ncol + j);
-      }
       AppendBroadcastArgs(&args,
                           MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
                           MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-                          /*direction=*/0, MakeCoreMask(row_cores),
+                          /*direction=*/0, MakeHorizontalMask(mesh_ncol),
                           src_offset_imm, row_src_core);
       Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
       seq.push_back(broadcast);
@@ -489,16 +443,16 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
     Stmt horizontal =
         make_put_broadcast(src_read, dst_write, /*direction=*/0,
-                           MakeSingleCoreMask(dst_core_i32), src_core_i32);
+                           MakeLocalSingleBit(dst_core_col), src_core_i32);
     Stmt vertical =
         make_put_broadcast(src_read, dst_write, /*direction=*/1,
-                           MakeSingleCoreMask(dst_core_i32), src_core_i32);
+                           MakeLocalSingleBit(dst_core_row), src_core_i32);
     Array<Stmt> diagonal_seq;
+    diagonal_seq.push_back(
+        make_put_broadcast(src_read, dst_write, /*direction=*/1,
+                           MakeLocalSingleBit(dst_core_row), src_core_i32));
     diagonal_seq.push_back(make_put_broadcast(
-        src_read, dst_write, /*direction=*/1,
-        MakeSingleCoreMask(intermediate_core), src_core_i32));
-    diagonal_seq.push_back(make_put_broadcast(
-        dst_read, dst_write, /*direction=*/0, MakeSingleCoreMask(dst_core_i32),
+        dst_read, dst_write, /*direction=*/0, MakeLocalSingleBit(dst_core_col),
         intermediate_core));
     Stmt diagonal = SeqStmt::Flatten(diagonal_seq);
 
@@ -519,16 +473,16 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
   if (src_core_row == dst_core_row) {
     // 1D put via horizontal communication
-    return make_put_broadcast(MakeRegionExpr(src, src_range, /*access_mask=*/1),
-                              MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-                              /*direction=*/0, MakeCoreMask({dst_core_val}),
-                              src_core);
+    return make_put_broadcast(
+        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        /*direction=*/0, MakeLocalSingleBit(I32Imm(dst_core_col)), src_core);
   } else if (src_core_col == dst_core_col) {
     // 1D put via vertical communication
-    return make_put_broadcast(MakeRegionExpr(src, src_range, /*access_mask=*/1),
-                              MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-                              /*direction=*/1, MakeCoreMask({dst_core_val}),
-                              src_core);
+    return make_put_broadcast(
+        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        /*direction=*/1, MakeLocalSingleBit(I32Imm(dst_core_row)), src_core);
   } else {
     Array<Stmt> seq;
     // vertical transfer from src core to intermediate core
@@ -536,14 +490,14 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     Stmt put1 = make_put_broadcast(
         MakeRegionExpr(src, src_range, /*access_mask=*/1),
         MakeRegionExpr(dst, dst_range, /*access_mask=*/2), /*direction=*/1,
-        MakeCoreMask({intermediate_core_id}), src_core);
+        MakeLocalSingleBit(I32Imm(dst_core_row)), src_core);
     seq.push_back(put1);
     // horizontal transfer from intermediate core to dst core
     PrimExpr intermediate_core = I32Imm(intermediate_core_id);
     Stmt put2 = make_put_broadcast(
         MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
         MakeRegionExpr(dst, dst_range, /*access_mask=*/2), /*direction=*/0,
-        MakeCoreMask({dst_core_val}), intermediate_core);
+        MakeLocalSingleBit(I32Imm(dst_core_col)), intermediate_core);
     seq.push_back(put2);
     return SeqStmt::Flatten(seq);
   }
@@ -727,14 +681,14 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
 
   if (direction == 0) { // horizontal
     emit_from_send(make_slab(current_col, slot_extent_p1), /*bcast_dir=*/0,
-                   MakeHorizontalMask(current_core, mesh_ncol));
+                   MakeHorizontalMask(mesh_ncol));
   } else if (direction == 1) { // vertical
     emit_from_send(make_slab(current_row, slot_extent_p1), /*bcast_dir=*/1,
-                   MakeVerticalMask(current_core, mesh_nrow, mesh_ncol));
+                   MakeVerticalMask(mesh_nrow));
   } else { // direction == 2 ("all")
     // Phase 1: horizontal. The current core lands at its global slot.
     emit_from_send(make_slab(current_core, slot_extent_p1), /*bcast_dir=*/0,
-                   MakeHorizontalMask(current_core, mesh_ncol));
+                   MakeHorizontalMask(mesh_ncol));
 
     // Phase 2: vertical. Each row's mesh_ncol-wide gathered slab (rows
     // i*ncol .. (i+1)*ncol of phase-1 slots) is broadcast to every row in
@@ -744,7 +698,7 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
     // slab index `current_row` covers slots
     // [current_row*ncol .. (current_row+1)*ncol) of phase 1.
     emit_from_recv(make_slab(current_row, row_extent), /*bcast_dir=*/1,
-                   MakeVerticalMask(current_core, mesh_nrow, mesh_ncol));
+                   MakeVerticalMask(mesh_nrow));
   }
 
   return SeqStmt::Flatten(bcast_stmts);

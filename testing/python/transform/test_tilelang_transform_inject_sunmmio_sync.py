@@ -204,8 +204,7 @@ def _make_dynamic_row_broadcast_mod(target):
         scope="shared.rsram",
     )
     bx = tir.Var("bx", "int32")
-    bx_i64 = tir.Cast("int64", bx)
-    mask = tir.shift_left(tir.IntImm("int64", 15), bx_i64 * tir.IntImm("int64", 4))
+    mask = tir.IntImm("int64", 15)
     broadcast = tir.Evaluate(
         tir.call_intrin(
             "handle",
@@ -255,8 +254,8 @@ def _make_dynamic_row_pair_broadcast_mod(target):
         scope="shared.rsram",
     )
     bx = tir.Var("bx", "int32")
-    dst_core = bx + tir.IntImm("int32", 1)
-    pair_mask = tir.shift_left(tir.IntImm("int64", 1), tir.Cast("int64", dst_core))
+    dst_col = bx + tir.IntImm("int32", 1)
+    pair_mask = tir.shift_left(tir.IntImm("int64", 1), tir.Cast("int64", dst_col))
     broadcast = tir.Evaluate(
         tir.call_intrin(
             "handle",
@@ -273,7 +272,7 @@ def _make_dynamic_row_pair_broadcast_mod(target):
     loop = tir.For(
         bx,
         tir.IntImm("int32", 0),
-        tir.IntImm("int32", 16),
+        tir.IntImm("int32", 3),
         tir.ForKind.SERIAL,
         tir.SeqStmt([broadcast, consume_dst]),
     )
@@ -515,7 +514,7 @@ def test_inject_sunmmio_sync_broadcast():
     assert idx_post_barrier_wait < idx_dma1
     assert idx_dma1 < idx_wait2
 
-    # Regression (PR #164): broadcast_ carries a core bitmask at arg slot 3,
+    # Regression (PR #164): broadcast_ carries a receiving mask at arg slot 3,
     # src_offset_byte at slot 4, and optional src_core before the sync token.
     # The barrier parser must decode the bitmask instead of deriving write
     # cores from the offset/source-core slots.
@@ -571,7 +570,6 @@ def test_inject_sunmmio_sync_dynamic_broadcast_mask_candidates():
     for line in barrier_wait_lines:
         args = _parse_barrier_args(line, "barrier_arrive_and_wait")
         assert args[-4:] == [15, 240, 3840, 61440]
-        assert "T.shift_left(T.int64(15)" in line
 
 
 def test_inject_sunmmio_sync_dynamic_pair_mask_candidates():
@@ -581,7 +579,7 @@ def test_inject_sunmmio_sync_dynamic_pair_mask_candidates():
     mod = tilelang.transform.InjectSunmmioSync()(mod)
     script = mod.script()
 
-    pair_candidates = [3, 6, 12, 48, 96, 192, 768, 1536, 3072, 12288, 24576, 49152]
+    pair_candidates = [3, 6, 12]
     lines = [l.strip() for l in script.split("\n")]
     barrier_init_lines = [l for l in lines if "barrier_init(" in l]
     barrier_wait_lines = [l for l in lines if "barrier_arrive_and_wait(" in l]

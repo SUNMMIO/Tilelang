@@ -143,7 +143,7 @@ def test_summa():
         'bx = T.launch_thread("blockIdx.x", 16)',
         "for w in range(1):",
         "T.broadcast_(T.region(A_rsram_stage[0, 0], 1, 32, 32), T.region(A_shared[0, 0], 2, 32, 32), 0, T.int64(15), 0, 0)",
-        "T.broadcast_(T.region(B[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 2, 32, 32), 1, T.int64(4369), 0, 0)",
+        "T.broadcast_(T.region(B[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 2, 32, 32), 1, T.int64(15), 0, 0)",
     ]
 
     script_InjectSunmmioSync = [
@@ -154,7 +154,7 @@ def test_summa():
         "T.barrier_arrive_and_wait(T.int64(15))",
         "T.broadcast_(T.region(A_rsram_stage[0, 0], 1, 32, 32), T.region(A_shared[0, 0], 2, 32, 32), 0, 15, 0, 0, T.sync_token_id(1))",
         "T.barrier_arrive_and_wait(T.int64(4369))",
-        "T.broadcast_(T.region(B_1[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 2, 32, 32), 1, 4369, 0, 0, T.sync_token_id(2))",
+        "T.broadcast_(T.region(B_1[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 2, 32, 32), 1, 15, 0, 0, T.sync_token_id(2))",
         "T.barrier_arrive_and_wait(T.int64(15))",
         "T.barrier_arrive_and_wait(T.int64(4369))",
         "T.mma_sunmmio(T.region(A_shared[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 1, 32, 32), T.region(C_local[0, 0], 3, 32, 32), T.bool(False), T.bool(False), T.bool(False), 0, T.sync_token_id(3))",
