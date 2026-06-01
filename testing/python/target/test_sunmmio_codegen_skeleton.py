@@ -163,6 +163,103 @@ def make_intrinsic_sync_kernel():
     return _to_device_kernel_func(tvm.tir.PrimFunc([a_data, b_data, c_data], stmt))
 
 
+def make_dynamic_broadcast_mask_kernel():
+    f16 = tvm.ir.PrimType("float16")
+    src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(f16, "shared.rsram"))
+    dst_data = tvm.tir.Var("dst_data", tvm.ir.PointerType(f16, "shared.asram"))
+    src_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Src", data=src_data, scope="shared.rsram")
+    dst_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Dst", data=dst_data, scope="shared.asram")
+
+    def region(buf, access):
+        return tvm.tir.call_intrin(
+            "handle",
+            tvm.ir.Op.get("tl.tileop.region"),
+            tvm.tir.BufferLoad(
+                buf,
+                [tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 0)],
+            ),
+            tvm.tir.IntImm("int32", access),
+            tvm.tir.IntImm("int32", 32),
+            tvm.tir.IntImm("int32", 32),
+        )
+
+    bx = tvm.tir.Var("bx", "int32")
+    bx_i64 = tvm.tir.Cast("int64", bx)
+    one = tvm.tir.IntImm("int64", 1)
+    mask = tvm.tir.bitwise_or(
+        tvm.tir.shift_left(one, bx_i64),
+        tvm.tir.shift_left(one, bx_i64 + tvm.tir.IntImm("int64", 1)),
+    )
+    broadcast = tvm.tir.Call(
+        "handle",
+        tvm.ir.Op.get("tl.broadcast_"),
+        [
+            region(src_buf, 1),
+            region(dst_buf, 2),
+            tvm.tir.IntImm("int32", 0),
+            mask,
+            tvm.tir.IntImm("int32", 0),
+            bx,
+        ],
+    )
+    stmt = tvm.tir.For(
+        bx,
+        tvm.tir.IntImm("int32", 0),
+        tvm.tir.IntImm("int32", 4),
+        tvm.tir.ForKind.SERIAL,
+        tvm.tir.Evaluate(broadcast),
+    )
+    stmt = tvm.tir.DeclBuffer(src_buf, tvm.tir.DeclBuffer(dst_buf, stmt))
+    return _to_device_kernel_func(tvm.tir.PrimFunc([src_data, dst_data], stmt))
+
+
+def make_reusable_barrier_kernel():
+    mask = tvm.tir.IntImm("int64", 15)
+    barrier_init = tvm.tir.Call("handle", tvm.ir.Op.get("tl.barrier_init"), [mask])
+    barrier_wait = tvm.tir.Call("handle", tvm.ir.Op.get("tl.barrier_arrive_and_wait"), [mask])
+    stmt = tvm.tir.SeqStmt(
+        [
+            tvm.tir.Evaluate(barrier_init),
+            tvm.tir.Evaluate(barrier_wait),
+            tvm.tir.Evaluate(barrier_wait),
+        ]
+    )
+    return _primfunc_from_stmt(stmt)
+
+
+def make_dynamic_barrier_kernel():
+    bx = tvm.tir.Var("bx", "int32")
+    bx_i64 = tvm.tir.Cast("int64", bx)
+    mask = tvm.tir.shift_left(
+        tvm.tir.IntImm("int64", 15),
+        bx_i64 * tvm.tir.IntImm("int64", 4),
+    )
+    candidates = [15, 240, 3840, 61440]
+    barrier_init = tvm.tir.Call(
+        "handle",
+        tvm.ir.Op.get("tl.barrier_init"),
+        [tvm.tir.IntImm("int64", -1)] + [tvm.tir.IntImm("int64", candidate) for candidate in candidates],
+    )
+    barrier_wait = tvm.tir.Call(
+        "handle",
+        tvm.ir.Op.get("tl.barrier_arrive_and_wait"),
+        [mask] + [tvm.tir.IntImm("int64", candidate) for candidate in candidates],
+    )
+    stmt = tvm.tir.SeqStmt(
+        [
+            tvm.tir.Evaluate(barrier_init),
+            tvm.tir.For(
+                bx,
+                tvm.tir.IntImm("int32", 0),
+                tvm.tir.IntImm("int32", 4),
+                tvm.tir.ForKind.SERIAL,
+                tvm.tir.Evaluate(barrier_wait),
+            ),
+        ]
+    )
+    return _primfunc_from_stmt(stmt)
+
+
 def make_block_realize_kernel():
     body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
     block = tvm.tir.Block([], [], [], "B", body)
@@ -254,6 +351,35 @@ def test_sunmmio_codegen_while_emits_scf_while():
     assert "scf.while" in src
     assert "scf.condition" in src
     assert "scf.yield" in src
+
+
+def test_sunmmio_codegen_lowers_reusable_barrier():
+    src = build_sunmmio_source_without_compile(make_reusable_barrier_kernel())
+    assert "suvm.barrier.init mask = 15 : !suvm.barrier" in src
+    assert src.count("suvm.barrier.init") == 1
+    assert src.count("suvm.barrier.arrive_and_wait") == 2
+    assert "sunmmio.fake" not in src
+
+
+def test_sunmmio_codegen_lowers_dynamic_barrier_candidates():
+    src = build_sunmmio_source_without_compile(make_dynamic_barrier_kernel())
+    for mask in [15, 240, 3840, 61440]:
+        assert f"suvm.barrier.init mask = {mask} : !suvm.barrier" in src
+    assert src.count("suvm.barrier.init") == 4
+    assert src.count("suvm.barrier.arrive_and_wait") == 4
+    assert "arith.shli" in src
+    assert "arith.cmpi eq" in src
+    assert "cf.assert" in src
+    assert "scf.if" in src
+    assert "sunmmio.fake" not in src
+
+
+def test_sunmmio_codegen_lowers_dynamic_broadcast_mask():
+    src = build_sunmmio_source_without_compile(make_dynamic_broadcast_mask_kernel())
+    assert "arith.shli" in src
+    assert "arith.ori" in src
+    assert "suvm.mcast_tok" in src
+    assert "sunmmio.fake" not in src
 
 
 def test_sunmmio_codegen_shuffle_fails_loudly():

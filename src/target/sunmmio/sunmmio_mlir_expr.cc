@@ -350,6 +350,22 @@ SunMMIOValue SunmmioMlirExpr::Binary(const std::string &result_name,
                                                result_mlir_type, lhs, rhs)
                        .getResult();
     break;
+  case BinaryOp::kShl:
+    binary_value = mlir::arith::ShLIOp::create(ctx_.builder, loc,
+                                               result_mlir_type, lhs, rhs)
+                       .getResult();
+    break;
+  case BinaryOp::kShr:
+    if (flavor == ArithmeticFlavor::kUnsignedInt) {
+      binary_value = mlir::arith::ShRUIOp::create(ctx_.builder, loc,
+                                                  result_mlir_type, lhs, rhs)
+                         .getResult();
+    } else {
+      binary_value = mlir::arith::ShRSIOp::create(ctx_.builder, loc,
+                                                  result_mlir_type, lhs, rhs)
+                         .getResult();
+    }
+    break;
   }
 
   ctx_.BindMLIRValue(result_name, binary_value);

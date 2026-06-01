@@ -724,6 +724,43 @@ def test_broadcast_propagates_zn():
         assert is_same_layout(layout_b, expected_zn), f"B_shared should be ZN(32,32) from broadcast, got {layout_b}"
 
 
+def broadcast_from_global_to_rsram_kernel():
+    """Broadcast directly from a global input into RSRAM."""
+    block_M, block_N = 64, 64
+    dtype = T.float16
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((block_M, block_N), dtype),
+        B: T.Tensor((block_M, block_N), dtype),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
+
+            T.comm.broadcast(A, B_shared, (1, 2), direction="h")
+            T.copy(B_shared, B[0, 0])
+
+    return tvm.IRModule({"main": main})
+
+
+def test_broadcast_accepts_global_src_for_layout_inference():
+    """Comm layout inference should accept global src and keep DRAM layout separate."""
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        mod = broadcast_from_global_to_rsram_kernel()
+        mod = apply_passes_up_to_layout_inference(mod, target)
+
+        func = list(mod.functions.values())[0]
+        layout_map, global_layout_map = extract_layout_maps(func)
+        assert layout_map is not None
+        assert global_layout_map is not None
+
+        buf_b, _ = get_buf_by_name(layout_map, "B_shared")
+        assert buf_b is not None, "B_shared not in layout_map"
+        assert all(buf.name != "A" for buf in layout_map)
+        assert any(buf.name == "A" for buf in global_layout_map)
+
+
 # ---------------------------------------------------------------------------
 # Test: Put propagates ZZ layout between src and dst
 # ---------------------------------------------------------------------------

@@ -8,6 +8,90 @@ def verify_comm_lower(func: tir.PrimFunc):
     current_mesh_nrow = 4
     current_mesh_ncol = 4
 
+    def split_top_level_args(arg_str):
+        args = []
+        start = 0
+        depth = 0
+        in_string = False
+        escape = False
+        for idx, ch in enumerate(arg_str):
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                args.append(arg_str[start:idx].strip())
+                start = idx + 1
+        tail = arg_str[start:].strip()
+        if tail:
+            args.append(tail)
+        return args
+
+    def broadcast_call_args(line):
+        prefix = "T.broadcast_("
+        start = line.find(prefix)
+        if start < 0:
+            return None
+        arg_start = start + len(prefix)
+        depth = 1
+        in_string = False
+        escape = False
+        for idx in range(arg_start, len(line)):
+            ch = line[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return split_top_level_args(line[arg_start:idx])
+        return None
+
+    def make_core_mask(core_ids):
+        mask = 0
+        for core_id in core_ids:
+            mask |= 1 << core_id
+        return mask
+
+    def horizontal_mask(src_core):
+        if not isinstance(src_core, tir.IntImm):
+            return None
+        src_core_val = int(src_core)
+        row = src_core_val // current_mesh_ncol
+        return make_core_mask(row * current_mesh_ncol + j for j in range(current_mesh_ncol))
+
+    def vertical_mask(src_core):
+        if not isinstance(src_core, tir.IntImm):
+            return None
+        src_core_val = int(src_core)
+        col = src_core_val % current_mesh_ncol
+        return make_core_mask(i * current_mesh_ncol + col for i in range(current_mesh_nrow))
+
+    def direction_from_arg(direction_val):
+        if isinstance(direction_val, tir.StringImm):
+            return 0 if direction_val.value == "h" else 1 if direction_val.value == "v" else 2
+        return int(direction_val) if isinstance(direction_val, tir.IntImm) else 0
+
+    def add_expected(src_core, direction, mask=None, has_src_core=True):
+        expected_broadcasts.append((stringify_expr(src_core) if src_core is not None else None, direction, mask, has_src_core))
+
     def get_region_size(node):
         if isinstance(node, tir.Call) and node.op.name == "tl.tileop.region":
             size = 1
@@ -54,7 +138,7 @@ def verify_comm_lower(func: tir.PrimFunc):
         nonlocal current_mesh_nrow, current_mesh_ncol
         if isinstance(node, tir.Call) and node.op.name.startswith("tl.tileop.comm_"):
             if node.op.name == "tl.tileop.comm_broadcast":
-                # args: src, dst, size, dst_offset, src_core, direction
+                # args: src, dst, size, src_core, direction
                 size_expr = node.args[2]
                 if isinstance(size_expr, tir.IntImm) and int(size_expr) > 0:
                     size = analyzer.simplify(size_expr)
@@ -70,28 +154,20 @@ def verify_comm_lower(func: tir.PrimFunc):
                     else:
                         size = analyzer.simplify(size0)
 
-                src_core = node.args[4]
-                direction_val = node.args[5]
-                if isinstance(direction_val, tir.StringImm):
-                    direction = 0 if direction_val.value == "h" else 1 if direction_val.value == "v" else 2
-                else:
-                    direction = int(direction_val) if isinstance(direction_val, tir.IntImm) else 0
+                src_core = node.args[3]
+                direction = direction_from_arg(node.args[4])
 
                 if direction == 0 or direction == 1:
-                    expected_broadcasts.append((stringify_expr(size), stringify_expr(src_core), direction))
+                    mask = horizontal_mask(src_core) if direction == 0 else vertical_mask(src_core)
+                    add_expected(src_core, direction, mask)
                 elif direction == 2 and isinstance(src_core, tir.IntImm):
                     # 2D broadcast: only supports constant src_core in C++
                     src_core_val = int(src_core)
                     src_core_col = src_core_val % current_mesh_ncol
-                    expected_broadcasts.append((stringify_expr(size), stringify_expr(src_core), 1))
+                    add_expected(src_core, 1, vertical_mask(src_core))
                     for i in range(current_mesh_nrow):
-                        expected_broadcasts.append(
-                            (
-                                stringify_expr(size),
-                                str(i * current_mesh_ncol + src_core_col),
-                                0,
-                            )
-                        )
+                        row_src_core = tir.IntImm("int32", i * current_mesh_ncol + src_core_col)
+                        add_expected(row_src_core, 0, horizontal_mask(row_src_core))
 
             elif node.op.name == "tl.tileop.comm_put":
                 # args: src, dst, size, src_core, dst_core
@@ -121,21 +197,17 @@ def verify_comm_lower(func: tir.PrimFunc):
                     )
 
                     if src_row == dst_row:
-                        expected_broadcasts.append((stringify_expr(size), stringify_expr(src_core), 0))
+                        add_expected(src_core, 0, make_core_mask([dst_core_val]))
                     elif src_col == dst_col:
-                        expected_broadcasts.append((stringify_expr(size), stringify_expr(src_core), 1))
+                        add_expected(src_core, 1, make_core_mask([dst_core_val]))
                     else:
                         intermediate_core = dst_row * current_mesh_ncol + src_col
-                        expected_broadcasts.append((stringify_expr(size), stringify_expr(src_core), 1))
-                        expected_broadcasts.append((stringify_expr(size), str(intermediate_core), 0))
+                        add_expected(src_core, 1, make_core_mask([intermediate_core]))
+                        add_expected(tir.IntImm("int32", intermediate_core), 0, make_core_mask([dst_core_val]))
 
             elif node.op.name == "tl.tileop.comm_allgather":
                 # args: send, recv, direction, size
-                direction_val = node.args[2]
-                if isinstance(direction_val, tir.StringImm):
-                    direction = 0 if direction_val.value == "h" else 1 if direction_val.value == "v" else 2
-                else:
-                    direction = int(direction_val) if isinstance(direction_val, tir.IntImm) else 0
+                direction = direction_from_arg(node.args[2])
 
                 size_expr = node.args[3]
                 if isinstance(size_expr, tir.IntImm) and int(size_expr) > 0:
@@ -153,47 +225,12 @@ def verify_comm_lower(func: tir.PrimFunc):
                         size = analyzer.simplify(size0)
 
                 if direction == 0:  # horizontal
-                    for i in range(current_mesh_nrow):
-                        for j in range(current_mesh_ncol):
-                            expected_broadcasts.append(
-                                (
-                                    stringify_expr(size),
-                                    str(i * current_mesh_ncol + j),
-                                    0,
-                                )
-                            )
+                    add_expected(None, 0, None, has_src_core=False)
                 elif direction == 1:  # vertical
-                    for j in range(current_mesh_ncol):
-                        for i in range(current_mesh_nrow):
-                            expected_broadcasts.append(
-                                (
-                                    stringify_expr(size),
-                                    str(i * current_mesh_ncol + j),
-                                    1,
-                                )
-                            )
+                    add_expected(None, 1, None, has_src_core=False)
                 elif direction == 2:  # all
-                    # horizontal first
-                    for i in range(current_mesh_nrow):
-                        for j in range(current_mesh_ncol):
-                            expected_broadcasts.append(
-                                (
-                                    stringify_expr(size),
-                                    str(i * current_mesh_ncol + j),
-                                    0,
-                                )
-                            )
-                    # then vertical
-                    allgather_size = analyzer.simplify(size * current_mesh_ncol)
-                    for j in range(current_mesh_ncol):
-                        for i in range(current_mesh_nrow):
-                            expected_broadcasts.append(
-                                (
-                                    stringify_expr(allgather_size),
-                                    str(i * current_mesh_ncol + j),
-                                    1,
-                                )
-                            )
+                    add_expected(None, 0, None, has_src_core=False)
+                    add_expected(None, 1, None, has_src_core=False)
 
     if not isinstance(func, tir.PrimFunc):
         raise ValueError(f"Expected PrimFunc, got {type(func)}")
@@ -209,17 +246,38 @@ def verify_comm_lower(func: tir.PrimFunc):
     # 2. Return the check function
     def check(mod: IRModule):
         script = mod.script()
-        for size, core, direction in expected_broadcasts:
-            # Match T.broadcast_(..., size, core, direction, ...)
-            if size == "1":
-                size_pattern = r"\d+"
+        broadcast_arg_lists = [args for line in script.splitlines() if (args := broadcast_call_args(line.strip())) is not None]
+        for core, direction, mask, has_src_core in expected_broadcasts:
+            if mask is None:
+                mask_pattern = r".*?"
             else:
-                size_pattern = re.escape(size).replace(r"\ ", r"\s*")
-            escaped_core = re.escape(core).replace(r"\ ", r"\s*")
-            pattern = rf"T\.broadcast_\(.*?,\s*.*?,\s*{size_pattern},\s*{escaped_core},\s*{direction}"
-            assert re.search(pattern, script), (
-                f"Expected broadcast_ with size={size}, core={core}, direction={direction} not found in IRModule"
-            )
+                mask_pattern = rf"(?:T\.int64\({mask}\)|{mask})"
+            if has_src_core:
+                # Match T.broadcast_(..., direction, mask, src_offset_byte, src_core, ...)
+                escaped_core = re.escape(core).replace(r"\ ", r"\s*")
+                pattern = rf"T\.broadcast_\(.*?,\s*.*?,\s*{direction},\s*{mask_pattern},\s*.*?,\s*{escaped_core}(?:,|\))"
+                message = f"Expected broadcast_ with core={core}, direction={direction}, mask={mask} not found in IRModule"
+            else:
+                # Match the dynamic allgather form without src_core:
+                # T.broadcast_(src_region, dst_region, direction, mask, src_offset_byte[, sync_token_id])
+                message = f"Expected broadcast_ without src_core, direction={direction}, mask={mask} not found in IRModule"
+                found = False
+                for args in broadcast_arg_lists:
+                    if len(args) == 5:
+                        fixed_args = args
+                    elif len(args) == 6 and args[-1].startswith("T.sync_token_id("):
+                        fixed_args = args[:-1]
+                    else:
+                        continue
+                    if fixed_args[2] != str(direction):
+                        continue
+                    if mask is not None and fixed_args[3] not in {f"T.int64({mask})", str(mask)}:
+                        continue
+                    found = True
+                    break
+                assert found, message
+                continue
+            assert re.search(pattern, script), message
 
     return check
 
@@ -230,13 +288,9 @@ def verify_SunmmioSync(mod: IRModule):
 
     token_ids = [int(l.split("sync_token_id(")[1].split(")")[0]) for l in lines if "sync_token_id" in l]
     null_token_ids = [int(l.split("sync_null_token(")[1].split(")")[0]) for l in lines if "sync_null_token" in l]
-    barrier_ids = [int(l.split("(")[1].split(")")[0].split(",")[0]) for l in lines if "barrier_init" in l]
     wait_ids = [int(l.split("(")[1].split(")")[0]) for l in lines if "wait_token" in l]
-    arrive_ids = [int(l.split("(")[1].split(")")[0]) for l in lines if "barrier_arrive_and_wait" in l]
     declared_token_ids = set(token_ids) | set(null_token_ids)
     all_token_ids = declared_token_ids | set(wait_ids)
-    all_barrier_ids = set(barrier_ids) | set(arrive_ids)
-    barrier_num = max(barrier_ids) + 1 if barrier_ids else 0
 
     def check_dense_ids(ids, name):
         if not ids:
@@ -245,16 +299,17 @@ def verify_SunmmioSync(mod: IRModule):
         assert ids == expected_ids, f"{name} ids should be continuous from 0, got {sorted(ids)}"
 
     check_dense_ids(all_token_ids, "token")
-    check_dense_ids(all_barrier_ids, "barrier")
+
+    barrier_init_masks = [l.split("barrier_init(", 1)[1].rsplit(")", 1)[0] for l in lines if "barrier_init(" in l]
+    arrive_masks = [l.split("barrier_arrive_and_wait(", 1)[1].rsplit(")", 1)[0] for l in lines if "barrier_arrive_and_wait(" in l]
+    initialized_masks = set(barrier_init_masks)
 
     # Check count of wait_lines and arrive_lines
     assert len(wait_ids) >= len(set(token_ids)), "wait_lines should be greater than token_lines"
-    assert len(arrive_ids) >= barrier_num, "arrive_lines should be greater than barrier_lines"
-    # Check range of wait_ids and arrive_ids
     for i in wait_ids:
         assert i in declared_token_ids, f"wait_token({i}) does not have sync_token_id or sync_null_token"
-    for i in arrive_ids:
-        assert i < barrier_num, f"arrive_token({i}) is out of range {barrier_num}"
+    for mask in arrive_masks:
+        assert mask in initialized_masks, f"barrier_arrive_and_wait({mask}) does not have barrier_init({mask})"
 
     # Check order of sync_token_id(id) (or sync_null_token(id)) and wait_token(id)
     for i in declared_token_ids:
@@ -265,13 +320,14 @@ def verify_SunmmioSync(mod: IRModule):
         assert idx_first_token != -1, f"sync_token_id({i}) or sync_null_token({i}) is not found in script"
         assert idx_wait != -1, f"wait_token({i}) is not found in script"
         assert idx_first_token < idx_wait, f"wait_token({i}) is before sync_token_id or sync_null_token({i})"
-    # Check order of barrier_init(id) and barrier_arrive_and_wait(id)
-    for i in range(barrier_num):
-        idx_barrier = script.find(f"barrier_init({i}")
-        idx_arrive = script.find(f"barrier_arrive_and_wait({i})")
-        assert idx_barrier != -1, f"barrier_init({i}) is not found in script"
-        assert idx_arrive != -1, f"barrier_arrive_and_wait({i}) is not found in script"
-        assert idx_barrier < idx_arrive, f"barrier_init({i}) is after barrier_arrive_and_wait({i})"
+    # Check order of barrier_init(mask) and barrier_arrive_and_wait(mask).
+    for mask in initialized_masks:
+        idx_barrier = script.find(f"barrier_init({mask})")
+        idx_arrive = script.find(f"barrier_arrive_and_wait({mask})")
+        if idx_arrive == -1:
+            continue
+        assert idx_barrier != -1, f"barrier_init({mask}) is not found in script"
+        assert idx_barrier < idx_arrive, f"barrier_init({mask}) is after barrier_arrive_and_wait({mask})"
 
 
 def verify_tiles_ops(prim_func: tir.PrimFunc):

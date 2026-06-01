@@ -35,7 +35,9 @@ enum class BinaryOp {
   kMax,
   kAnd,
   kOr,
-  kXor
+  kXor,
+  kShl,
+  kShr
 };
 
 enum class ArithmeticFlavor { kFloat, kSignedInt, kUnsignedInt, kBool, kIndex };

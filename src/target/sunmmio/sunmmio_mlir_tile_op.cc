@@ -24,7 +24,7 @@ mlir::Value GetTileCastOp(SunmmioMlirContext &ctx, mlir::Value src_value,
   mlir::Type dst_mlir_type = MapMlirType(ctx, dst_type);
   auto tile_type = mlir::dyn_cast<mlir::suvm::TileType>(dst_mlir_type);
   ICHECK(tile_type) << "Expected SUVM tile type for tile.cast result";
-  return ctx.builder.create<mlir::suvm::TileCastOp>(loc, tile_type, src_value)
+  return mlir::suvm::TileCastOp::create(ctx.builder, loc, tile_type, src_value)
       .getResult();
 }
 
@@ -134,7 +134,9 @@ SunMMIOValue SunmmioMlirTileOp::GetPartitionedTileView(
     DataType dtype) {
   mlir::Type result_type = MapMlirType(ctx_, view_type);
   mlir::Value view_value;
-  if (view_type.shape.size() == 2) {
+  bool supports_real_2d_view =
+      view_type.shape.size() == 2 && memtensor.type.shape.size() >= 2;
+  if (supports_real_2d_view) {
     mlir::Value memtensor_value =
         ctx_.LookupOrCreateFakeValue(memtensor, "fake_missing_memtensor");
     mlir::OperationState st(MapMlirLoc(ctx_), "suvm.get_partitioned_tile_view");
@@ -151,10 +153,17 @@ SunMMIOValue SunmmioMlirTileOp::GetPartitionedTileView(
     st.addTypes(result_type);
     view_value = ctx_.builder.create(st)->getResult(0);
   } else {
-    LOG(WARNING)
-        << "Using provisional 1D tile_view placeholder for clean v4 Tiles "
-           "lowering; replace with real SUVM 1D tile_view once dialect "
-           "support lands";
+    if (view_type.shape.size() == 2) {
+      LOG(WARNING)
+          << "Using provisional 2D tile_view placeholder for unsupported "
+             "rank-1/unit-tile adaptation in clean v4 Tiles lowering; replace "
+             "with real SUVM tile_view once dialect support lands";
+    } else {
+      LOG(WARNING)
+          << "Using provisional 1D tile_view placeholder for clean v4 Tiles "
+             "lowering; replace with real SUVM 1D tile_view once dialect "
+             "support lands";
+    }
     std::vector<mlir::Value> operands;
     operands.reserve(1 + indices.size());
     operands.push_back(
@@ -284,25 +293,24 @@ SunMMIOValue SunmmioMlirTileOp::Binary(const std::string &result_name,
         binary_value = CreateTypedPlaceholderWithOperands(
             ctx_, result_mlir_type, {lhs, rhs}, "fake_tile_addf");
       } else {
-        binary_value =
-            ctx_.builder
-                .create<mlir::suvm::TileAddFOp>(loc, tile_type, lhs, rhs)
-                .getResult();
+        binary_value = mlir::suvm::TileAddFOp::create(ctx_.builder, loc,
+                                                      tile_type, lhs, rhs)
+                           .getResult();
       }
     } else {
       binary_value =
-          ctx_.builder.create<mlir::suvm::TileAddIOp>(loc, tile_type, lhs, rhs)
+          mlir::suvm::TileAddIOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
               .getResult();
     }
     break;
   case BinaryOp::kSub:
     if (flavor == ArithmeticFlavor::kFloat) {
       binary_value =
-          ctx_.builder.create<mlir::suvm::TileSubFOp>(loc, tile_type, lhs, rhs)
+          mlir::suvm::TileSubFOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
               .getResult();
     } else {
       binary_value =
-          ctx_.builder.create<mlir::suvm::TileSubIOp>(loc, tile_type, lhs, rhs)
+          mlir::suvm::TileSubIOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
               .getResult();
     }
     break;
@@ -310,57 +318,77 @@ SunMMIOValue SunmmioMlirTileOp::Binary(const std::string &result_name,
     ICHECK(flavor == ArithmeticFlavor::kFloat)
         << "SUVM tile integer multiply is not currently available";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileMulFOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileMulFOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kDiv:
     ICHECK(flavor == ArithmeticFlavor::kFloat)
         << "SUVM tile integer division is not currently available";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileDivFOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileDivFOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kMod:
     ICHECK(flavor == ArithmeticFlavor::kFloat)
         << "SUVM tile remainder is only available for floating-point tiles";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileRemFOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileRemFOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kMin:
     ICHECK(flavor == ArithmeticFlavor::kFloat)
         << "SUVM tile min currently supports floating-point tiles only";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileMinFOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileMinFOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kMax:
     ICHECK(flavor == ArithmeticFlavor::kFloat)
         << "SUVM tile max currently supports floating-point tiles only";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileMaxFOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileMaxFOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kAnd:
     ICHECK(flavor != ArithmeticFlavor::kFloat)
         << "SUVM tile.andi expects integer-like tiles";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileAndIOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileAndIOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kOr:
     ICHECK(flavor != ArithmeticFlavor::kFloat)
         << "SUVM tile.ori expects integer-like tiles";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileOrIOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileOrIOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
     break;
   case BinaryOp::kXor:
     ICHECK(flavor != ArithmeticFlavor::kFloat)
         << "SUVM tile.xori expects integer-like tiles";
     binary_value =
-        ctx_.builder.create<mlir::suvm::TileXorIOp>(loc, tile_type, lhs, rhs)
+        mlir::suvm::TileXorIOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
             .getResult();
+    break;
+  case BinaryOp::kShl:
+    ICHECK(flavor != ArithmeticFlavor::kFloat)
+        << "SUVM tile.shlli expects integer-like tiles";
+    binary_value =
+        mlir::suvm::TileShllIOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
+            .getResult();
+    break;
+  case BinaryOp::kShr:
+    ICHECK(flavor != ArithmeticFlavor::kFloat)
+        << "SUVM tile shift-right expects integer-like tiles";
+    if (flavor == ArithmeticFlavor::kUnsignedInt) {
+      binary_value = mlir::suvm::TileShrlIOp::create(ctx_.builder, loc,
+                                                     tile_type, lhs, rhs)
+                         .getResult();
+    } else {
+      binary_value = mlir::suvm::TileShraIOp::create(ctx_.builder, loc,
+                                                     tile_type, lhs, rhs)
+                         .getResult();
+    }
     break;
   default:
     LOG(FATAL) << "Unsupported clean v4 tile binary op";
@@ -474,15 +502,13 @@ SunMMIOValue SunmmioMlirTileOp::Compare(const std::string &result_name,
   mlir::Value compare_value;
   if (domain == CompareDomain::kFloat) {
     compare_value =
-        ctx_.builder
-            .create<mlir::suvm::TileCmpFOp>(
-                loc, tile_type, GetTileCmpFloatPredicate(op), lhs, rhs)
+        mlir::suvm::TileCmpFOp::create(ctx_.builder, loc, tile_type,
+                                       GetTileCmpFloatPredicate(op), lhs, rhs)
             .getResult();
   } else {
-    compare_value = ctx_.builder
-                        .create<mlir::suvm::TileCmpIOp>(
-                            loc, tile_type,
-                            GetTileCmpIntegerPredicate(op, domain), lhs, rhs)
+    compare_value = mlir::suvm::TileCmpIOp::create(
+                        ctx_.builder, loc, tile_type,
+                        GetTileCmpIntegerPredicate(op, domain), lhs, rhs)
                         .getResult();
   }
 
@@ -497,17 +523,30 @@ SunMMIOValue SunmmioMlirTileOp::TileUnsqueeze(const std::string &result_name,
                                               const SunMMIOType &tile_type,
                                               int64_t axis, DataType dtype) {
   mlir::Type result_type = MapMlirType(ctx_, tile_type);
-  LOG(WARNING)
-      << "Using provisional tile.unsqueeze placeholder in clean v4 Tiles "
-         "lowering; replace with real SUVM tile.unsqueeze once dialect "
-         "support lands";
   mlir::Value input =
       ctx_.LookupOrCreateFakeValue(tile, "fake_missing_tile_unsqueeze_src");
-  mlir::Value tile_value = CreateTypedPlaceholderWithOperands(
-      ctx_, result_type, {input}, "fake_tile_unsqueeze");
-  if (mlir::Operation *def = tile_value.getDefiningOp()) {
-    def->setAttr("axis", ctx_.builder.getI64IntegerAttr(axis));
+  mlir::OperationState st(MapMlirLoc(ctx_), "suvm.tile.unsqueeze");
+  st.addOperands(input);
+  st.addAttribute("axes", ctx_.builder.getDenseI64ArrayAttr({axis}));
+  st.addTypes(result_type);
+  mlir::Value tile_value = ctx_.builder.create(st)->getResult(0);
+  if (!result_name.empty()) {
+    ctx_.BindMLIRValue(result_name, tile_value);
   }
+  return SunMMIOValue{dtype, result_name, tile_type};
+}
+
+SunMMIOValue SunmmioMlirTileOp::TileBroadcast(const std::string &result_name,
+                                              const SunMMIOValue &tile,
+                                              const SunMMIOType &tile_type,
+                                              DataType dtype) {
+  mlir::Type result_type = MapMlirType(ctx_, tile_type);
+  mlir::Value input =
+      ctx_.LookupOrCreateFakeValue(tile, "fake_missing_tile_broadcast_src");
+  mlir::Value tile_value =
+      mlir::suvm::TileBroadcastOp::create(ctx_.builder, MapMlirLoc(ctx_),
+                                          result_type, input)
+          .getResult();
   if (!result_name.empty()) {
     ctx_.BindMLIRValue(result_name, tile_value);
   }
@@ -580,6 +619,66 @@ SunmmioMlirTileOp::TileSlice(const std::string &result_name,
     ctx_.BindMLIRValue(result_name, tile_value);
   }
   return SunMMIOValue{dtype, result_name, tile_type};
+}
+
+SunMMIOValue SunmmioMlirTileOp::TileInsertSlice(
+    const std::string &result_name, const SunMMIOValue &base,
+    const SunMMIOValue &slice, const std::vector<SunMMIOValue> &offsets,
+    const SunMMIOType &result_type, DataType dtype) {
+  mlir::Type result_mlir_type = MapMlirType(ctx_, result_type);
+  mlir::Value base_value =
+      ctx_.LookupOrCreateFakeValue(base, "fake_missing_tile_insert_slice_base");
+  mlir::Value slice_value = ctx_.LookupOrCreateFakeValue(
+      slice, "fake_missing_tile_insert_slice_slice");
+  std::vector<mlir::Value> operands;
+  operands.reserve(2 + offsets.size());
+  operands.push_back(base_value);
+  operands.push_back(slice_value);
+  SunmmioMlirType type(ctx_);
+  for (const SunMMIOValue &offset : offsets) {
+    operands.push_back(type.EnsureIndex(type.ResolveValueOrCreatePlaceholder(
+        offset, ctx_.builder.getIndexType())));
+  }
+  llvm::SmallVector<int64_t, 4> static_offsets;
+  bool has_static_offsets = true;
+  for (const SunMMIOValue &offset : offsets) {
+    mlir::Value offset_value = ctx_.LookupMLIRValue(offset.value);
+    if (!offset_value) {
+      has_static_offsets = false;
+      break;
+    }
+    if (auto cst = mlir::getConstantIntValue(offset_value)) {
+      static_offsets.push_back(*cst);
+    } else {
+      has_static_offsets = false;
+      break;
+    }
+  }
+
+  mlir::Value tile_value;
+  if (has_static_offsets) {
+    llvm::SmallVector<int64_t, 4> sizes;
+    for (const PrimExpr &dim : slice.type.shape) {
+      const auto *imm = dim.as<IntImmNode>();
+      ICHECK(imm)
+          << "tile.insert_slice currently expects static slice result shape";
+      sizes.push_back(static_cast<int64_t>(imm->value));
+    }
+    mlir::OperationState st(MapMlirLoc(ctx_), "suvm.tile.insert_slice");
+    st.addOperands({slice_value, base_value});
+    st.addAttribute("offsets",
+                    ctx_.builder.getDenseI64ArrayAttr(static_offsets));
+    st.addAttribute("sizes", ctx_.builder.getDenseI64ArrayAttr(sizes));
+    st.addTypes(result_mlir_type);
+    tile_value = ctx_.builder.create(st)->getResult(0);
+  } else {
+    tile_value = CreateTypedPlaceholderWithOperands(
+        ctx_, result_mlir_type, operands, "fake_tile_insert_slice");
+  }
+  if (!result_name.empty()) {
+    ctx_.BindMLIRValue(result_name, tile_value);
+  }
+  return SunMMIOValue{dtype, result_name, result_type};
 }
 
 SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
@@ -767,17 +866,13 @@ SunMMIOValue SunmmioMlirTileOp::TileSqueeze(const std::string &result_name,
                                             const SunMMIOType &tile_type,
                                             int64_t axis, DataType dtype) {
   mlir::Type result_type = MapMlirType(ctx_, tile_type);
-  LOG(WARNING)
-      << "Using provisional tile.squeeze placeholder in clean v4 Tiles "
-         "lowering; replace with real SUVM tile.squeeze once dialect "
-         "support lands";
   mlir::Value input =
       ctx_.LookupOrCreateFakeValue(tile, "fake_missing_tile_squeeze_src");
-  mlir::Value tile_value = CreateTypedPlaceholderWithOperands(
-      ctx_, result_type, {input}, "fake_tile_squeeze");
-  if (mlir::Operation *def = tile_value.getDefiningOp()) {
-    def->setAttr("axis", ctx_.builder.getI64IntegerAttr(axis));
-  }
+  mlir::OperationState st(MapMlirLoc(ctx_), "suvm.tile.squeeze");
+  st.addOperands(input);
+  st.addAttribute("axes", ctx_.builder.getDenseI64ArrayAttr({axis}));
+  st.addTypes(result_type);
+  mlir::Value tile_value = ctx_.builder.create(st)->getResult(0);
   if (!result_name.empty()) {
     ctx_.BindMLIRValue(result_name, tile_value);
   }
@@ -787,15 +882,18 @@ SunMMIOValue SunmmioMlirTileOp::TileSqueeze(const std::string &result_name,
 void SunmmioMlirTileOp::TileStore(const SunMMIOValue &value,
                                   const SunMMIOValue &tile_view,
                                   const std::optional<SunMMIOValue> &mask) {
-  if (value.type.shape.size() != 2 || tile_view.type.shape.size() != 2) {
+  mlir::Value base =
+      ctx_.LookupOrCreateFakeValue(tile_view, "fake_missing_tile_store_view");
+  bool fake_view_boundary =
+      base.getDefiningOp() && base.getDefiningOp()->hasAttr("sunmmio.fake");
+  if (value.type.shape.size() != 2 || tile_view.type.shape.size() != 2 ||
+      fake_view_boundary) {
     LOG(WARNING)
-        << "Using provisional 1D tile.store placeholder in clean v4 Tiles "
-           "lowering; replace with real SUVM 1D tile.store once dialect "
-           "support lands";
+        << "Using provisional tile.store placeholder in clean v4 Tiles "
+           "lowering when the tile_view boundary is still fake or 1D support "
+           "is unavailable";
     mlir::Value data =
         ctx_.LookupOrCreateFakeValue(value, "fake_missing_tile_store_value");
-    mlir::Value base =
-        ctx_.LookupOrCreateFakeValue(tile_view, "fake_missing_tile_store_view");
     mlir::OperationState st(MapMlirLoc(ctx_),
                             "builtin.unrealized_conversion_cast");
     st.addOperands({data, base});
@@ -807,8 +905,6 @@ void SunmmioMlirTileOp::TileStore(const SunMMIOValue &value,
   }
   mlir::Value data =
       ctx_.LookupOrCreateFakeValue(value, "fake_missing_tile_store_value");
-  mlir::Value base =
-      ctx_.LookupOrCreateFakeValue(tile_view, "fake_missing_tile_store_view");
   mlir::Value mask_value;
   if (mask.has_value()) {
     mask_value = ctx_.LookupOrCreateFakeValue(mask.value(),

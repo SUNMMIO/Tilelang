@@ -50,10 +50,20 @@ public:
                              const SunMMIOType &tile_type, int64_t axis,
                              DataType dtype);
 
+  SunMMIOValue TileBroadcast(const std::string &result_name,
+                             const SunMMIOValue &tile,
+                             const SunMMIOType &tile_type, DataType dtype);
+
   SunMMIOValue TileSlice(const std::string &result_name,
                          const SunMMIOValue &tile,
                          const std::vector<SunMMIOValue> &offsets,
                          const SunMMIOType &tile_type, DataType dtype);
+
+  SunMMIOValue TileInsertSlice(const std::string &result_name,
+                               const SunMMIOValue &base,
+                               const SunMMIOValue &slice,
+                               const std::vector<SunMMIOValue> &offsets,
+                               const SunMMIOType &result_type, DataType dtype);
 
   SunMMIOValue TileRectMask(const std::string &result_name,
                             const SunMMIOValue &valid_rows,

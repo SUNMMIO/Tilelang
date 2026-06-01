@@ -2,6 +2,7 @@
 #define AST_TRAVERSER_H
 
 #include "../../op/builtin.h"
+#include "../../op/comm.h"
 #include "../../op/utils.h"
 #include "tvm/ir/expr.h"
 #include "tvm/runtime/logging.h"
@@ -264,9 +265,11 @@ public:
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
 
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
-      // } else if (call->op.same_as(broadcast_())) {
-      //   read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
-      //   write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
+    } else if (call->op.same_as(broadcast_())) {
+      read_buffer_regions_.insert(
+          NormalizeToBufferRegion(call->args[kBroadcastArgSrc]));
+      write_buffer_regions_.insert(
+          NormalizeToBufferRegion(call->args[kBroadcastArgDst]));
     } else {
       auto [read_regions, write_regions] = buffer_region_collector(op->value);
       for (auto it : read_regions) {

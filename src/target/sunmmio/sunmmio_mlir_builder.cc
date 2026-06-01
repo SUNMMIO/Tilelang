@@ -167,12 +167,27 @@ SunMMIOValue SuvmSunmmioBuilder::TileUnsqueeze(const std::string &result_name,
   return tile_->TileUnsqueeze(result_name, tile, tile_type, axis, dtype);
 }
 
+SunMMIOValue SuvmSunmmioBuilder::TileBroadcast(const std::string &result_name,
+                                               const SunMMIOValue &tile,
+                                               const SunMMIOType &tile_type,
+                                               DataType dtype) {
+  return tile_->TileBroadcast(result_name, tile, tile_type, dtype);
+}
+
 SunMMIOValue
 SuvmSunmmioBuilder::TileSlice(const std::string &result_name,
                               const SunMMIOValue &tile,
                               const std::vector<SunMMIOValue> &offsets,
                               const SunMMIOType &tile_type, DataType dtype) {
   return tile_->TileSlice(result_name, tile, offsets, tile_type, dtype);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::TileInsertSlice(
+    const std::string &result_name, const SunMMIOValue &base,
+    const SunMMIOValue &slice, const std::vector<SunMMIOValue> &offsets,
+    const SunMMIOType &result_type, DataType dtype) {
+  return tile_->TileInsertSlice(result_name, base, slice, offsets, result_type,
+                                dtype);
 }
 
 SunMMIOValue SuvmSunmmioBuilder::TileRectMask(const std::string &result_name,
@@ -247,9 +262,9 @@ SunMMIOValue SuvmSunmmioBuilder::Call(
 SunMMIOValue SuvmSunmmioBuilder::RegionCall(
     const std::string &result_name, const std::string &buffer_handle,
     const std::vector<SunMMIOValue> &mins, const std::vector<int64_t> &extents,
-    DataType ret_dtype, const SunMMIOType &ret_type) {
+    DataType ret_dtype, const SunMMIOType &ret_type, int64_t byte_offset) {
   return call_->RegionCall(result_name, buffer_handle, mins, extents, ret_dtype,
-                           ret_type);
+                           ret_type, byte_offset);
 }
 
 SunMMIOValue SuvmSunmmioBuilder::Ramp(const std::string &result_name,

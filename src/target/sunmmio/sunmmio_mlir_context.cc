@@ -131,6 +131,7 @@ void SunmmioMlirContext::ApplyLayoutToType(const tir::Buffer &buffer,
 void SunmmioMlirContext::Clear() {
   mlir_value_table_stack.clear();
   token_by_id.clear();
+  barrier_by_mask.clear();
   for_stack.clear();
   if_stack.clear();
   while_stack.clear();

@@ -6,6 +6,7 @@
 #include "comm.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <tvm/tir/op.h>
 #include <vector>
 
@@ -26,33 +27,141 @@ namespace tl {
   }                                                                            \
   TVM_REGISTER_OP("tl." #OpName)                                               \
       .set_attr<TScriptPrinterName>("TScriptPrinterName", #OpName)
-TIR_DEFINE_TL_BUILTIN(comm_barrier)
-    .set_num_inputs(-1)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(comm_fence)
-    .set_num_inputs(0)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(CoreId).set_num_inputs(1).set_attr<TCallEffectKind>(
-    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(comm_current_core)
-    .set_num_inputs(0)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-TIR_DEFINE_TL_BUILTIN(comm_is_current_core)
-    .set_num_inputs(-1)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(broadcast_)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
-// src_buffer, dst_buffer, size(IntImm), src_core(IntImm)
-// direction(0: horizontal, 1: vertical),
-// *mask(optional: IntImm list of core ids to exclude)
+// src_region, dst_region,
+// direction(0: horizontal/row, 1: vertical/col),
+// mask(i64 bitmask of receiving cores),
+// src_offset_byte,
+// optional src_core
 
 using namespace tir;
+
+namespace {
+
+PrimExpr I32Imm(int64_t value) { return IntImm(DataType::Int(32), value); }
+
+PrimExpr I64Imm(int64_t value) { return IntImm(DataType::Int(64), value); }
+
+PrimExpr AsI32(PrimExpr value) {
+  if (value.dtype() == DataType::Int(32)) {
+    return value;
+  }
+  return Cast(DataType::Int(32), value);
+}
+
+PrimExpr AsI64(PrimExpr value) {
+  if (value.dtype() == DataType::Int(64)) {
+    return value;
+  }
+  return Cast(DataType::Int(64), value);
+}
+
+PrimExpr CoreBit(PrimExpr core_id) { return I64Imm(1) << AsI64(core_id); }
+
+Stmt AssertPutDistinctCores(PrimExpr src_core, PrimExpr dst_core, Stmt body,
+                            arith::Analyzer *analyzer) {
+  PrimExpr distinct = AsI32(src_core) != AsI32(dst_core);
+  if (analyzer) {
+    distinct = analyzer->Simplify(distinct);
+  }
+  if (const auto *imm = distinct.as<IntImmNode>()) {
+    ICHECK_NE(imm->value, 0)
+        << "T.comm.put requires src_core and dst_core to be different";
+    return body;
+  }
+  return AssertStmt(distinct,
+                    StringImm("T.comm.put requires src_core and dst_core to "
+                              "be different"),
+                    body);
+}
+
+PrimExpr MakeCoreMask(const std::vector<int> &core_ids) {
+  uint64_t mask = 0;
+  for (int core_id : core_ids) {
+    ICHECK_GE(core_id, 0);
+    ICHECK_LT(core_id, 64)
+        << "tl.broadcast_ mask currently supports core ids in [0, 64)";
+    mask |= (uint64_t{1} << core_id);
+  }
+  return I64Imm(static_cast<int64_t>(mask));
+}
+
+PrimExpr MakeSingleCoreMask(PrimExpr core_id) {
+  if (const auto *imm = core_id.as<IntImmNode>()) {
+    return MakeCoreMask({static_cast<int>(imm->value)});
+  }
+  return CoreBit(core_id);
+}
+
+PrimExpr MakeHorizontalMask(PrimExpr src_core, int mesh_ncol) {
+  if (const auto *imm = src_core.as<IntImmNode>()) {
+    int src_core_val = static_cast<int>(imm->value);
+    int row = src_core_val / mesh_ncol;
+    std::vector<int> core_ids;
+    core_ids.reserve(mesh_ncol);
+    for (int j = 0; j < mesh_ncol; ++j) {
+      core_ids.push_back(row * mesh_ncol + j);
+    }
+    return MakeCoreMask(core_ids);
+  }
+
+  PrimExpr ncol = IntImm(src_core.dtype(), mesh_ncol);
+  PrimExpr row = floordiv(src_core, ncol);
+  PrimExpr row_base = AsI64(row * ncol);
+  PrimExpr mask = I64Imm(0);
+  for (int j = 0; j < mesh_ncol; ++j) {
+    mask = mask | CoreBit(row_base + I64Imm(j));
+  }
+  return mask;
+}
+
+PrimExpr MakeVerticalMask(PrimExpr src_core, int mesh_nrow, int mesh_ncol) {
+  if (const auto *imm = src_core.as<IntImmNode>()) {
+    int src_core_val = static_cast<int>(imm->value);
+    int col = src_core_val % mesh_ncol;
+    std::vector<int> core_ids;
+    core_ids.reserve(mesh_nrow);
+    for (int i = 0; i < mesh_nrow; ++i) {
+      core_ids.push_back(i * mesh_ncol + col);
+    }
+    return MakeCoreMask(core_ids);
+  }
+
+  PrimExpr ncol = IntImm(src_core.dtype(), mesh_ncol);
+  PrimExpr col = floormod(src_core, ncol);
+  PrimExpr mask = I64Imm(0);
+  for (int i = 0; i < mesh_nrow; ++i) {
+    mask = mask | CoreBit(I64Imm(i * mesh_ncol) + AsI64(col));
+  }
+  return mask;
+}
+
+void AppendBroadcastArgs(Array<PrimExpr> *args, PrimExpr src_region,
+                         PrimExpr dst_region, int direction, PrimExpr mask,
+                         PrimExpr src_offset_byte, PrimExpr src_core) {
+  args->push_back(src_region);
+  args->push_back(dst_region);
+  args->push_back(I32Imm(direction));
+  args->push_back(mask);
+  args->push_back(src_offset_byte);
+  args->push_back(src_core);
+}
+
+Stmt MakeBroadcastLeaf(PrimExpr src_region, PrimExpr dst_region, int direction,
+                       PrimExpr mask, PrimExpr src_offset_byte) {
+  Array<PrimExpr> args;
+  args.push_back(src_region);
+  args.push_back(dst_region);
+  args.push_back(I32Imm(direction));
+  args.push_back(mask);
+  args.push_back(src_offset_byte);
+  return Evaluate(Call(DataType::Handle(), broadcast_(), args));
+}
+
+} // namespace
 
 /*!
  * \brief Sunmmio SRAM layout inference for symmetric comm ops.
@@ -79,13 +188,13 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
   bool dst_has = T.layout_map.count(dst);
 
   // Propagate: derive layout for each side from the other.
-  if (src_has) {
+  if (src_has && IsSunmmioSramScope(dst.scope())) {
     auto derived = DeriveLayoutLike(T.layout_map[src], dst->shape);
     if (derived.defined()) {
       result.Set(dst, derived.value());
     }
   }
-  if (dst_has) {
+  if (dst_has && IsSunmmioSramScope(src.scope())) {
     auto derived = DeriveLayoutLike(T.layout_map[dst], src->shape);
     if (derived.defined()) {
       result.Set(src, derived.value());
@@ -93,6 +202,17 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
   }
 
   return result;
+}
+
+void CheckSunmmioCommBuffers(const char *op_name, const Buffer &src,
+                             const Buffer &dst) {
+  bool valid_src = src.scope() == "global" || src.scope().empty() ||
+                   IsSunmmioSramScope(src.scope());
+  ICHECK(valid_src && IsSunmmioSramScope(dst.scope()))
+      << op_name << " expects src to be global or Sunmmio SRAM and dst to be "
+      << "Sunmmio SRAM, got src buffer " << src->name << " scope "
+      << src.scope() << " and dst buffer " << dst->name << " scope "
+      << dst.scope();
 }
 
 BroadcastOp::BroadcastOp(Array<PrimExpr> args,
@@ -127,26 +247,8 @@ TileOperator BroadcastOpNode::Clone() const {
 
 LayoutMap BroadcastOpNode::InferLayout(const LayoutInferArgs &T,
                                        InferLevel level) const {
-  if (IsSunmmioSramScope(src.scope()) || IsSunmmioSramScope(dst.scope())) {
-    return SunmmioCommInferLayout(T, src, dst, level);
-  }
-
-  // Non-Sunmmio: delegate to Copy.
-  Array<PrimExpr> args;
-  args.push_back(src_expr);
-  args.push_back(dst_expr);
-  Copy copy_op = Copy(args);
-  return copy_op->InferLayout(T, level);
-}
-
-// Builds the fixed positional prefix of a broadcast_() call, in the layout
-// declared by BroadcastArg (comm.h). Callers append trailing core-mask
-// indices (kBroadcastArgMaskBegin onward) as needed.
-Array<PrimExpr> MakeBroadcastArgs(PrimExpr src_region, PrimExpr dst_region,
-                                  PrimExpr size, PrimExpr src_core,
-                                  PrimExpr direction,
-                                  PrimExpr src_offset_byte) {
-  return {src_region, dst_region, size, src_core, direction, src_offset_byte};
+  CheckSunmmioCommBuffers("T.comm.broadcast", src, dst);
+  return SunmmioCommInferLayout(T, src, dst, level);
 }
 
 Stmt BroadcastOpNode::Lower(const LowerArgs &T,
@@ -208,42 +310,50 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
                << ", must be 0 (horizontal) or 1 (vertical) or 2 (all).";
   }
 
-  // all checks passed, generate the call. srcOffsetByte_ is appended as the
-  // final positional arg of every broadcast_() emitted by this BroadcastOp,
-  // so codegen reads it from a stable call-arg slot — no AttrStmt wrapper.
   PrimExpr src_offset_imm = IntImm(DataType::Int(32), srcOffsetByte_);
   if (direction == 0 or direction == 1) {
     // 1D broadcast
-    Array<PrimExpr> args =
-        MakeBroadcastArgs(MakeRegionExpr(src, src_range, /*access_mask=*/1),
-                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-                          Downcast<IntImm>(broadcast_elements), src_core,
-                          direction, src_offset_imm);
+    Array<PrimExpr> args;
+    PrimExpr mask = direction == 0
+                        ? MakeHorizontalMask(src_core, mesh_ncol)
+                        : MakeVerticalMask(src_core, mesh_nrow, mesh_ncol);
+    AppendBroadcastArgs(&args,
+                        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                        direction, mask, src_offset_imm, src_core);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return broadcast;
   } else {
     // 2D broadcast
-    ICHECK(src_core.as<IntImmNode>())
-        << "2D broadcast only supports constant source core id.";
-    int src_core_val = src_core.as<IntImmNode>()->value;
-    int src_core_col = src_core_val % mesh_ncol;
+    PrimExpr src_core_i32 = AsI32(src_core);
+    PrimExpr src_core_col =
+        analyzer->Simplify(floormod(src_core_i32, I32Imm(mesh_ncol)));
 
     Array<Stmt> seq;
     // vertical broadcast
-    Array<PrimExpr> args =
-        MakeBroadcastArgs(MakeRegionExpr(src, src_range, /*access_mask=*/1),
-                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-                          Downcast<IntImm>(broadcast_elements), src_core,
-                          /*direction=*/1, src_offset_imm);
+    Array<PrimExpr> args;
+    AppendBroadcastArgs(
+        &args, MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        /*direction=*/1, MakeVerticalMask(src_core, mesh_nrow, mesh_ncol),
+        src_offset_imm, src_core);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     seq.push_back(broadcast);
     // horizontal broadcast
     for (int i = 0; i < mesh_nrow; i++) {
-      Array<PrimExpr> args = MakeBroadcastArgs(
-          MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
-          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-          Downcast<IntImm>(broadcast_elements),
-          int(i * mesh_ncol) + src_core_col, /*direction=*/0, src_offset_imm);
+      Array<PrimExpr> args;
+      PrimExpr row_src_core =
+          analyzer->Simplify(I32Imm(i * mesh_ncol) + src_core_col);
+      std::vector<int> row_cores;
+      row_cores.reserve(mesh_ncol);
+      for (int j = 0; j < mesh_ncol; ++j) {
+        row_cores.push_back(i * mesh_ncol + j);
+      }
+      AppendBroadcastArgs(&args,
+                          MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
+                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                          /*direction=*/0, MakeCoreMask(row_cores),
+                          src_offset_imm, row_src_core);
       Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
       seq.push_back(broadcast);
     }
@@ -282,16 +392,8 @@ TileOperator PutOpNode::Clone() const {
 
 LayoutMap PutOpNode::InferLayout(const LayoutInferArgs &T,
                                  InferLevel level) const {
-  if (IsSunmmioSramScope(src.scope()) || IsSunmmioSramScope(dst.scope())) {
-    return SunmmioCommInferLayout(T, src, dst, level);
-  }
-
-  // Non-Sunmmio: delegate to Copy.
-  Array<PrimExpr> args;
-  args.push_back(src_expr);
-  args.push_back(dst_expr);
-  Copy copy_op = Copy(args);
-  return copy_op->InferLayout(T, level);
+  CheckSunmmioCommBuffers("T.comm.put", src, dst);
+  return SunmmioCommInferLayout(T, src, dst, level);
 }
 
 Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
@@ -314,6 +416,8 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         << "Destination core id " << dst_core_val << " out of range [0, "
         << mesh_nrow * mesh_ncol << ")";
   }
+  ICHECK(!analyzer || !analyzer->CanProve(AsI32(src_core) == AsI32(dst_core)))
+      << "T.comm.put requires src_core and dst_core to be different";
 
   // check for src and dst buffer sizes
   PrimExpr src_elements = 1;
@@ -352,82 +456,94 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       << (Downcast<IntImm>(broadcast_elements)->value) << " vs "
       << Downcast<IntImm>(dst_elements)->value;
 
-  // all checks passed, generate the call
-  PrimExpr src_addr = src.access_ptr(1, DataType::Handle(), 1, 0, src_elements);
-  PrimExpr dst_addr = dst.access_ptr(2, DataType::Handle(), 1, 0, dst_elements);
-  ICHECK(src_core.as<IntImmNode>())
-      << "Put only supports constant source core id.";
-  ICHECK(dst_core.as<IntImmNode>())
-      << "Put only supports constant destination core id.";
-  int src_core_val = src_core.as<IntImmNode>()->value;
-  int dst_core_val = dst_core.as<IntImmNode>()->value;
+  auto make_put_broadcast = [&](PrimExpr src_region, PrimExpr dst_region,
+                                int direction, PrimExpr mask,
+                                PrimExpr bcast_src_core) {
+    Array<PrimExpr> args;
+    AppendBroadcastArgs(&args, src_region, dst_region, direction,
+                        analyzer->Simplify(mask), I32Imm(0),
+                        analyzer->Simplify(bcast_src_core));
+    return Evaluate(Call(DataType::Handle(), broadcast_(), args));
+  };
+
+  const auto *src_core_imm = src_core.as<IntImmNode>();
+  const auto *dst_core_imm = dst_core.as<IntImmNode>();
+  if (!src_core_imm || !dst_core_imm) {
+    PrimExpr src_core_i32 = AsI32(src_core);
+    PrimExpr dst_core_i32 = AsI32(dst_core);
+    PrimExpr mesh_ncol_expr = I32Imm(mesh_ncol);
+    PrimExpr src_core_row =
+        analyzer->Simplify(floordiv(src_core_i32, mesh_ncol_expr));
+    PrimExpr src_core_col =
+        analyzer->Simplify(floormod(src_core_i32, mesh_ncol_expr));
+    PrimExpr dst_core_row =
+        analyzer->Simplify(floordiv(dst_core_i32, mesh_ncol_expr));
+    PrimExpr dst_core_col =
+        analyzer->Simplify(floormod(dst_core_i32, mesh_ncol_expr));
+    PrimExpr intermediate_core =
+        analyzer->Simplify(dst_core_row * mesh_ncol_expr + src_core_col);
+
+    PrimExpr src_read = MakeRegionExpr(src, src_range, /*access_mask=*/1);
+    PrimExpr dst_write = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
+    PrimExpr dst_read = MakeRegionExpr(dst, dst_range, /*access_mask=*/1);
+
+    Stmt horizontal =
+        make_put_broadcast(src_read, dst_write, /*direction=*/0,
+                           MakeSingleCoreMask(dst_core_i32), src_core_i32);
+    Stmt vertical =
+        make_put_broadcast(src_read, dst_write, /*direction=*/1,
+                           MakeSingleCoreMask(dst_core_i32), src_core_i32);
+    Array<Stmt> diagonal_seq;
+    diagonal_seq.push_back(make_put_broadcast(
+        src_read, dst_write, /*direction=*/1,
+        MakeSingleCoreMask(intermediate_core), src_core_i32));
+    diagonal_seq.push_back(make_put_broadcast(
+        dst_read, dst_write, /*direction=*/0, MakeSingleCoreMask(dst_core_i32),
+        intermediate_core));
+    Stmt diagonal = SeqStmt::Flatten(diagonal_seq);
+
+    Stmt routed = IfThenElse(
+        src_core_row == dst_core_row, horizontal,
+        IfThenElse(src_core_col == dst_core_col, vertical, diagonal));
+    return AssertPutDistinctCores(src_core_i32, dst_core_i32, routed, analyzer);
+  }
+
+  int src_core_val = src_core_imm->value;
+  int dst_core_val = dst_core_imm->value;
+  ICHECK_NE(src_core_val, dst_core_val)
+      << "T.comm.put requires src_core and dst_core to be different";
   int src_core_row = src_core_val / mesh_ncol;
   int src_core_col = src_core_val % mesh_ncol;
   int dst_core_row = dst_core_val / mesh_ncol;
   int dst_core_col = dst_core_val % mesh_ncol;
 
   if (src_core_row == dst_core_row) {
-    // 1D put via horizontal communication. PutOp does not use
-    // src_offset_byte, so it passes 0 in that slot; masks follow.
-    Array<PrimExpr> args = MakeBroadcastArgs(
-        MakeRegionExpr(src, src_range, /*access_mask=*/1),
-        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/0,
-        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
-    for (int j = 0; j < mesh_ncol; j++) {
-      if (j != dst_core_col) {
-        args.push_back(IntImm(DataType::Int(32),
-                              j)); // mask: all cores except dst_core_col
-      }
-    }
-    Stmt put = Evaluate(Call(DataType::Handle(), broadcast_(), args));
-    return put;
+    // 1D put via horizontal communication
+    return make_put_broadcast(MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                              MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                              /*direction=*/0, MakeCoreMask({dst_core_val}),
+                              src_core);
   } else if (src_core_col == dst_core_col) {
-    // 1D put via vertical communication.
-    Array<PrimExpr> args = MakeBroadcastArgs(
-        MakeRegionExpr(src, src_range, /*access_mask=*/1),
-        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/1,
-        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
-    for (int i = 0; i < mesh_nrow; i++) {
-      if (i != dst_core_row) {
-        args.push_back(IntImm(DataType::Int(32),
-                              i)); // mask: all cores except dst_core_row
-      }
-    }
-    Stmt put = Evaluate(Call(DataType::Handle(), broadcast_(), args));
-    return put;
+    // 1D put via vertical communication
+    return make_put_broadcast(MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                              MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                              /*direction=*/1, MakeCoreMask({dst_core_val}),
+                              src_core);
   } else {
     Array<Stmt> seq;
     // vertical transfer from src core to intermediate core
     int intermediate_core_id = dst_core_row * mesh_ncol + src_core_col;
-    Array<PrimExpr> args1 = MakeBroadcastArgs(
+    Stmt put1 = make_put_broadcast(
         MakeRegionExpr(src, src_range, /*access_mask=*/1),
-        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/1,
-        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
-    for (int i = 0; i < mesh_nrow; i++) {
-      if (i != dst_core_row) {
-        args1.push_back(IntImm(DataType::Int(32),
-                               i)); // mask: all cores except dst_core_row
-      }
-    }
-    Stmt put1 = Evaluate(Call(DataType::Handle(), broadcast_(), args1));
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2), /*direction=*/1,
+        MakeCoreMask({intermediate_core_id}), src_core);
     seq.push_back(put1);
     // horizontal transfer from intermediate core to dst core
-    Array<PrimExpr> args2 = MakeBroadcastArgs(
+    PrimExpr intermediate_core = I32Imm(intermediate_core_id);
+    Stmt put2 = make_put_broadcast(
         MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
-        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        Downcast<IntImm>(broadcast_elements),
-        IntImm(DataType::Int(32), intermediate_core_id), /*direction=*/0,
-        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
-    for (int j = 0; j < mesh_ncol; j++) {
-      if (j != dst_core_col) {
-        args2.push_back(IntImm(DataType::Int(32),
-                               j)); // mask: all cores except dst_core_col
-      }
-    }
-    Stmt put2 = Evaluate(Call(DataType::Handle(), broadcast_(), args2));
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2), /*direction=*/0,
+        MakeCoreMask({dst_core_val}), intermediate_core);
     seq.push_back(put2);
     return SeqStmt::Flatten(seq);
   }
@@ -440,6 +556,8 @@ TIR_REGISTER_TL_TILE_OP(PutOp, comm_put)
 
 AllgatherOp::AllgatherOp(Array<PrimExpr> args,
                          Map<String, ObjectRef> annotations) {
+  ICHECK_GE(args.size(), 4)
+      << "Allgather expects at least send, recv, direction, and size.";
   ObjectPtr<AllgatherOpNode> node = tvm::ffi::make_object<AllgatherOpNode>();
   node->send = args[0];
   node->recv = args[1];
@@ -447,6 +565,9 @@ AllgatherOp::AllgatherOp(Array<PrimExpr> args,
   node->size = Downcast<IntImm>(args[3]);
   // axis is optional for backwards compatibility: -1 = legacy mode.
   node->axis = (args.size() > 4) ? Downcast<IntImm>(args[4])->value : -1;
+  // cid is optional during migration: new Python frontend calls pass the
+  // blockIdx.x binding, while older internal C++ call sites may still omit it.
+  node->cid = (args.size() > 5) ? args[5] : PrimExpr();
   node->annotations = annotations;
   data_ = std::move(node);
 }
@@ -460,70 +581,12 @@ TileOperator AllgatherOpNode::Clone() const {
 LayoutMap AllgatherOpNode::ComputeLayout(const LayoutInferArgs &T,
                                          InferLevel level, Buffer src,
                                          Buffer dst) const {
-  if (IsSunmmioSramScope(src.scope()) || IsSunmmioSramScope(dst.scope())) {
-    return SunmmioCommInferLayout(T, src, dst, level);
+  if (level >= InferLevel::kStrict) {
+    return {};
   }
 
-  if (src.scope() == "local.fragment" && dst.scope() == "local.fragment" &&
-      T.layout_map.count(src)) {
-    auto src_layout = T.layout_map[src].as<Fragment>().value();
-
-    PrimExpr src_rep_extent = src_layout->ReplicateExtent();
-
-    Array<PrimExpr> fwd;
-    fwd.push_back(InputPlaceholder(0));
-    for (int i = 0; i < static_cast<int>(src->shape.size()); i++) {
-      fwd.push_back(InputPlaceholder(i + 1));
-    }
-    auto thd = src_layout->ForwardThread(fwd, std::nullopt);
-
-    Fragment dst_layout =
-        Fragment(dst->shape, {}, thd, src_rep_extent, std::nullopt)
-            ->CondenseReplicateVar()
-            ->BindThreadRange(T.thread_bounds);
-
-    if (!T.layout_map.count(dst))
-      return {{dst, dst_layout}};
-    else {
-      // Check if computed layout is compatible with existing: the existing one
-      // must strictly contains the computed layout
-      auto orig_dst_layout =
-          T.layout_map.Get(dst).value().as<Fragment>().value();
-      ICHECK(dst_layout->InputDim() == orig_dst_layout->InputDim());
-      Array<PrimExpr> indices;
-      indices.reserve(dst_layout->InputDim());
-      arith::Analyzer inner_analyzer;
-      for (int i = 0; i < dst_layout->InputDim(); ++i) {
-        auto x = InputPlaceholder(i);
-        indices.push_back(x);
-        // should be literal - literal = 0, any analyzer will work
-        ICHECK(is_zero(inner_analyzer.Simplify(
-            dst_layout->InputShape()[i] - orig_dst_layout->InputShape()[i])));
-        inner_analyzer.Bind(x, Range(0, dst_layout->InputShape()[i]));
-      }
-
-      ICHECK(as_const_int(dst_layout->ReplicateExtent()));
-      ICHECK(as_const_int(src_layout->ReplicateExtent()));
-      auto dst_rep = *as_const_int(dst_layout->ReplicateExtent());
-      auto src_rep = *as_const_int(src_layout->ReplicateExtent());
-      if (dst_rep < src_rep ||
-          !ProveFragmentContains(orig_dst_layout, dst_layout, indices, indices,
-                                 inner_analyzer)) {
-        std::ostringstream oss;
-        oss << "Layout may conflict with ReduceOp for buffer " << dst << " vs. "
-            << src << "\nLHS = " << src_layout->DebugOutput()
-            << "\nRHS = " << orig_dst_layout->DebugOutput()
-            << "\nYou may need to use a shared memory to transform the "
-               "layout";
-        throw LayoutConflictException(oss.str());
-      }
-
-      if (dst_rep > src_rep) {
-        return {{dst, dst_layout}};
-      }
-    }
-  }
-  return {};
+  CheckSunmmioCommBuffers("T.comm.all_gather", src, dst);
+  return SunmmioCommInferLayout(T, src, dst, level);
 }
 
 LayoutMap AllgatherOpNode::InferLayout(const LayoutInferArgs &T,
@@ -575,6 +638,15 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
       << "Receive buffer size not enough for allgather: required "
       << (Downcast<IntImm>(send_elements)->value * recv_num) << ", but got "
       << Downcast<IntImm>(recv_elements)->value;
+  PrimExpr bcast_elements = (size->value < 0) ? send_elements : PrimExpr(size);
+  ICHECK(Downcast<IntImm>(bcast_elements)->value <=
+         Downcast<IntImm>(send_elements)->value)
+      << "Allgather size larger than send buffer size: "
+      << Downcast<IntImm>(bcast_elements)->value << " vs "
+      << Downcast<IntImm>(send_elements)->value;
+
+  ICHECK(cid.defined())
+      << "Allgather dynamic-region lowering requires current core id.";
 
   // Unified lowering for all axis modes. Every per-core contribution lands
   // in an equal-size slot along a single axis of recv ("slice_axis"). Slot
@@ -604,19 +676,16 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
       << recv_num << ").";
   PrimExpr slot_extent_p1 = analyzer->Simplify(FloorDiv(
       recv_range[slice_axis]->extent, IntImm(DataType::Int(32), recv_num)));
-  IntImm bcast_size_imm =
-      (size->value < 0) ? Downcast<IntImm>(send_elements) : size;
 
   // Build a sub-region of recv spanning a single slab of width `slot_extent`
   // along `slice_axis`, starting at slot index `slot_start`. All other dims
   // pass through `recv_range` unchanged.
-  auto make_slab = [&](int slot_start, PrimExpr slot_extent) {
+  auto make_slab = [&](PrimExpr slot_start, PrimExpr slot_extent) {
     Array<Range> ranges;
     for (int d = 0; d < recv_rank; d++) {
       if (d == slice_axis) {
-        PrimExpr base = analyzer->Simplify(
-            recv_range[d]->min +
-            IntImm(DataType::Int(32), slot_start) * slot_extent);
+        PrimExpr base =
+            analyzer->Simplify(recv_range[d]->min + slot_start * slot_extent);
         ranges.push_back(Range::FromMinExtent(base, slot_extent));
       } else {
         ranges.push_back(recv_range[d]);
@@ -628,82 +697,68 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
   Array<Stmt> bcast_stmts;
 
   // Propagate src_offset_byte (read from this op's annotations) into each
-  // BroadcastOp we construct, so it lands as the final positional arg of
-  // every emitted broadcast_() call. No AttrStmt wrapping needed.
+  // BroadcastOp we construct, so every emitted broadcast_() carries it before
+  // the optional src_core and sync_token_id args. No AttrStmt wrapping needed.
   int src_offset_byte = GetSrcOffsetByte();
   PrimExpr src_offset_imm = IntImm(DataType::Int(32), src_offset_byte);
 
-  auto emit = [&](Array<Range> dst_ranges, IntImm bcast_elems, int src_core_id,
-                  int bcast_dir, bool src_from_send) {
-    Array<PrimExpr> args;
-    if (src_from_send) {
-      args.push_back(MakeRegionExpr(send_buffer, send_range, /*mask=*/1));
-    } else {
-      args.push_back(MakeRegionExpr(recv_buffer, dst_ranges, /*mask=*/1));
-    }
-    args.push_back(MakeRegionExpr(recv_buffer, dst_ranges, /*mask=*/2));
-    args.push_back(bcast_elems);
-    args.push_back(IntImm(DataType::Int(32), src_core_id));
-    args.push_back(IntImm(DataType::Int(32), bcast_dir));
-    args.push_back(src_offset_imm);
-    BroadcastOp bcast(args);
-    bcast_stmts.push_back(bcast->Lower(T, analyzer));
+  PrimExpr current_core = cid;
+  PrimExpr mesh_ncol_expr = IntImm(current_core.dtype(), mesh_ncol);
+  PrimExpr current_row =
+      analyzer->Simplify(floordiv(current_core, mesh_ncol_expr));
+  PrimExpr current_col =
+      analyzer->Simplify(floormod(current_core, mesh_ncol_expr));
+
+  auto emit_from_send = [&](Array<Range> dst_ranges, int bcast_dir,
+                            PrimExpr mask) {
+    bcast_stmts.push_back(MakeBroadcastLeaf(
+        MakeRegionExpr(send_buffer, send_range, /*access_mask=*/1),
+        MakeRegionExpr(recv_buffer, dst_ranges, /*access_mask=*/2), bcast_dir,
+        analyzer->Simplify(mask), src_offset_imm));
+  };
+
+  auto emit_from_recv = [&](Array<Range> slab_ranges, int bcast_dir,
+                            PrimExpr mask) {
+    bcast_stmts.push_back(MakeBroadcastLeaf(
+        MakeRegionExpr(recv_buffer, slab_ranges, /*access_mask=*/1),
+        MakeRegionExpr(recv_buffer, slab_ranges, /*access_mask=*/2), bcast_dir,
+        analyzer->Simplify(mask), src_offset_imm));
   };
 
   if (direction == 0) { // horizontal
-    for (int i = 0; i < mesh_nrow; i++) {
-      for (int j = 0; j < mesh_ncol; j++) {
-        emit(make_slab(/*slot_start=*/j, slot_extent_p1), bcast_size_imm,
-             /*src_core=*/i * mesh_ncol + j, /*bcast_dir=*/0,
-             /*src_from_send=*/true);
-      }
-    }
+    emit_from_send(make_slab(current_col, slot_extent_p1), /*bcast_dir=*/0,
+                   MakeHorizontalMask(current_core, mesh_ncol));
   } else if (direction == 1) { // vertical
-    for (int j = 0; j < mesh_ncol; j++) {
-      for (int i = 0; i < mesh_nrow; i++) {
-        emit(make_slab(/*slot_start=*/i, slot_extent_p1), bcast_size_imm,
-             /*src_core=*/i * mesh_ncol + j, /*bcast_dir=*/1,
-             /*src_from_send=*/true);
-      }
-    }
+    emit_from_send(make_slab(current_row, slot_extent_p1), /*bcast_dir=*/1,
+                   MakeVerticalMask(current_core, mesh_nrow, mesh_ncol));
   } else { // direction == 2 ("all")
-    // Phase 1: horizontal. Core (i,j) lands at slot (i*ncol + j).
-    for (int i = 0; i < mesh_nrow; i++) {
-      for (int j = 0; j < mesh_ncol; j++) {
-        emit(make_slab(/*slot_start=*/i * mesh_ncol + j, slot_extent_p1),
-             bcast_size_imm,
-             /*src_core=*/i * mesh_ncol + j, /*bcast_dir=*/0,
-             /*src_from_send=*/true);
-      }
-    }
+    // Phase 1: horizontal. The current core lands at its global slot.
+    emit_from_send(make_slab(current_core, slot_extent_p1), /*bcast_dir=*/0,
+                   MakeHorizontalMask(current_core, mesh_ncol));
+
     // Phase 2: vertical. Each row's mesh_ncol-wide gathered slab (rows
     // i*ncol .. (i+1)*ncol of phase-1 slots) is broadcast to every row in
     // each column.
     PrimExpr row_extent = analyzer->Simplify(
         IntImm(DataType::Int(32), mesh_ncol) * slot_extent_p1);
-    IntImm row_size_imm =
-        IntImm(DataType::Int(32), bcast_size_imm->value * mesh_ncol);
-    for (int j = 0; j < mesh_ncol; j++) {
-      for (int i = 0; i < mesh_nrow; i++) {
-        // slab index `i` covers slots [i*ncol .. (i+1)*ncol) of phase 1;
-        // offset along slice_axis is i * row_extent = i*ncol * slot_extent_p1.
-        emit(make_slab(/*slot_index=*/i, row_extent), row_size_imm,
-             /*src_core=*/i * mesh_ncol + j, /*bcast_dir=*/1,
-             /*src_from_send=*/false);
-      }
-    }
+    // slab index `current_row` covers slots
+    // [current_row*ncol .. (current_row+1)*ncol) of phase 1.
+    emit_from_recv(make_slab(current_row, row_extent), /*bcast_dir=*/1,
+                   MakeVerticalMask(current_core, mesh_nrow, mesh_ncol));
   }
 
   return SeqStmt::Flatten(bcast_stmts);
 }
 
 TIR_REGISTER_TL_TILE_OP(AllgatherOp, comm_allgather)
-    .set_num_inputs(5)
+    .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
 AllreduceOp::AllreduceOp(Array<PrimExpr> args,
                          Map<String, ObjectRef> annotations) {
+  ICHECK(args.size() == 9 || args.size() == 10)
+      << "Allreduce expects 9 or 10 inputs, got " << args.size();
   ObjectPtr<AllreduceOpNode> node = tvm::ffi::make_object<AllreduceOpNode>();
   node->src = args[0];
   node->dst = args[1];
@@ -714,8 +769,11 @@ AllreduceOp::AllreduceOp(Array<PrimExpr> args,
   node->direction = Downcast<IntImm>(args[5])->value;
   node->dim = Downcast<IntImm>(args[6]);
   node->clear = Downcast<IntImm>(args[7]);
-  if (args.size() > 8) {
+  if (args.size() == 10) {
     node->dst_copy = args[8];
+    node->cid = args[9];
+  } else {
+    node->cid = args[8];
   }
   data_ = std::move(node);
 }
@@ -732,154 +790,98 @@ LayoutMap AllreduceOpNode::ComputeLayout(const LayoutInferArgs &T,
   if (level >= InferLevel::kStrict)
     return {};
 
-  if (IsSunmmioSramScope(src.scope()) || IsSunmmioSramScope(dst.scope())) {
-    return SunmmioCommInferLayout(T, src, dst, level);
-  }
-
-  if (src.scope() == "local.fragment" && dst.scope() == "local.fragment" &&
-      T.layout_map.count(src)) {
-    auto src_layout = T.layout_map[src].as<Fragment>().value();
-
-    PrimExpr indice_rep_extent = src->shape[dim];
-    PrimExpr src_rep_extent = src_layout->ReplicateExtent();
-    PrimExpr dest_buffer_rep_extent = indice_rep_extent * src_rep_extent;
-
-    Array<PrimExpr> fwd;
-    fwd.push_back(InputPlaceholder(0));
-    for (int i = 0; i < static_cast<int>(src->shape.size()); i++) {
-      if (i == dim) {
-        ;
-      } else if (i < dim) {
-        fwd.push_back(InputPlaceholder(i + 1));
-      } else if (i > dim) {
-        fwd.push_back(InputPlaceholder(i - 1 + 1));
-      }
-    }
-    auto thd = src_layout->ForwardThread(
-        fwd, FloorDiv(ReplicationPlaceholder(), indice_rep_extent));
-
-    // Ensure the thread count is divisible by the replicate extent.
-    // Otherwise, we cannot infer a valid fragment<->fragment layout.
-    {
-      arith::Analyzer analyzer;
-      PrimExpr num_threads = T.thread_bounds->extent;
-      // Though the dest_buffer_rep_extent will be compressed at
-      // CondenseReplicateVar, we need to check the divisibility here to avoid
-      // the issue that the thread count is not divisible by the replicate
-      // extent.
-      if (!analyzer.CanProve(FloorMod(num_threads, dest_buffer_rep_extent) ==
-                             0) &&
-          !analyzer.CanProve(FloorMod(dest_buffer_rep_extent, num_threads) ==
-                             0)) {
-        ICHECK(false) << "ReduceOp fragment layout inference failed: "
-                         "num_threads % replicate_extent != 0. "
-                      << "This mapping requires the block's thread count to be "
-                         "divisible by the "
-                      << "replicate extent. "
-                      << "Try one of: (1) choose a thread block size divisible "
-                         "by replicate_extent; "
-                      << "(2) pick a different reduce dimension or adjust the "
-                         "source fragment layout; "
-                      << "Details: num_threads=" << num_threads
-                      << ", replicate_extent=" << indice_rep_extent
-                      << ", src=" << src << ", dst=" << dst;
-      }
-    }
-
-    Fragment dst_layout =
-        Fragment(dst->shape, {}, thd, dest_buffer_rep_extent, std::nullopt)
-            ->CondenseReplicateVar()
-            ->BindThreadRange(T.thread_bounds);
-
-    if (!T.layout_map.count(dst))
-      return {{dst, dst_layout}};
-    else {
-      // Check if computed layout is compatible with existing: the existing one
-      // must strictly contains the computed layout
-      auto orig_dst_layout =
-          T.layout_map.Get(dst).value().as<Fragment>().value();
-      ICHECK(dst_layout->InputDim() == orig_dst_layout->InputDim());
-      Array<PrimExpr> indices;
-      indices.reserve(dst_layout->InputDim());
-      arith::Analyzer inner_analyzer;
-      for (int i = 0; i < dst_layout->InputDim(); ++i) {
-        auto x = InputPlaceholder(i);
-        indices.push_back(x);
-        // should be literal - literal = 0, any analyzer will work
-        ICHECK(is_zero(inner_analyzer.Simplify(
-            dst_layout->InputShape()[i] - orig_dst_layout->InputShape()[i])));
-        inner_analyzer.Bind(x, Range(0, dst_layout->InputShape()[i]));
-      }
-
-      ICHECK(as_const_int(dst_layout->ReplicateExtent()));
-      ICHECK(as_const_int(src_layout->ReplicateExtent()));
-      auto dst_rep = *as_const_int(dst_layout->ReplicateExtent());
-      auto src_rep = *as_const_int(src_layout->ReplicateExtent());
-      if (dst_rep < src_rep ||
-          !ProveFragmentContains(orig_dst_layout, dst_layout, indices, indices,
-                                 inner_analyzer)) {
-        std::ostringstream oss;
-        oss << "Layout may conflict with ReduceOp for buffer " << dst << " vs. "
-            << src << "\nLHS = " << src_layout->DebugOutput()
-            << "\nRHS = " << orig_dst_layout->DebugOutput()
-            << "\nYou may need to use a shared memory to transform the "
-               "layout";
-        throw LayoutConflictException(oss.str());
-      }
-
-      if (dst_rep > src_rep) {
-        return {{dst, dst_layout}};
-      }
-    }
-  }
-  return {};
+  (void)dim;
+  CheckSunmmioCommBuffers("T.comm.all_reduce", src, dst);
+  return SunmmioCommInferLayout(T, src, dst, level);
 }
 
 LayoutMap AllreduceOpNode::InferLayout(const LayoutInferArgs &T,
                                        InferLevel level) const {
   LayoutMap lm;
 
-  Array<PrimExpr> dst_layout_args;
-  dst_layout_args.push_back(src);
-  dst_layout_args.push_back(dst);
-  dst_layout_args.push_back(type);
-  dst_layout_args.push_back(dim);
-  dst_layout_args.push_back(clear);
-  ReduceOp dst_layout_op = ReduceOp(dst_layout_args);
-  LayoutMap dst_layout_map = dst_layout_op->InferLayout(T, InferLevel::kFree);
-  for (const auto &kv : dst_layout_map) {
-    lm.Set(kv.first, kv.second);
-  }
+  bool should_clear = clear.as<Bool>().value();
+  ICHECK(should_clear || dst_copy.defined())
+      << "Allreduce clear=false requires a dst_copy temporary buffer.";
+  ICHECK(cid.defined())
+      << "Allreduce dynamic allgather lowering requires current core id.";
 
-  if (dst_copy.defined()) {
-    Array<PrimExpr> dst_copy_layout_args;
-    dst_copy_layout_args.push_back(src);
-    dst_copy_layout_args.push_back(dst_copy);
-    dst_copy_layout_args.push_back(type);
-    dst_copy_layout_args.push_back(dim);
-    dst_copy_layout_args.push_back(clear);
-    ReduceOp dst_copy_layout_op = ReduceOp(dst_copy_layout_args);
-    LayoutMap dst_copy_layout_map =
-        dst_copy_layout_op->InferLayout(T, InferLevel::kFree);
-    for (const auto &kv : dst_copy_layout_map) {
+  LayoutInferArgs local_T = T;
+  LayoutMap known_layout = T.layout_map;
+  LayoutMap proposed_layout;
+  local_T.layout_map = known_layout;
+
+  auto merge_layout = [&](const LayoutMap &layout) {
+    for (const auto &kv : layout) {
+      if (proposed_layout.count(kv.first)) {
+        Layout existing = proposed_layout[kv.first];
+        if (!IsSameLayout(existing, kv.second, T.analyzer)) {
+          LOG(FATAL) << "Allreduce layout conflict on buffer \""
+                     << kv.first->name << "\""
+                     << "\n  existing: " << existing->DebugOutput()
+                     << "\n  proposed: " << kv.second->DebugOutput();
+        }
+        continue;
+      }
+      proposed_layout.Set(kv.first, kv.second);
       lm.Set(kv.first, kv.second);
+      known_layout.Set(kv.first, kv.second);
     }
-  }
+    local_T.layout_map = known_layout;
+  };
 
-  Buffer row_allgather_buffer = NormalizeToBufferRegion(row_allgather)->buffer;
-  LayoutMap row_allgather_layout =
-      ComputeLayout(T, InferLevel::kFree, NormalizeToBufferRegion(src)->buffer,
-                    row_allgather_buffer, dim->value);
-  for (const auto &kv : row_allgather_layout) {
-    lm.Set(kv.first, kv.second);
-  }
+  auto infer_reduce = [&](PrimExpr reduce_src, PrimExpr reduce_dst,
+                          PrimExpr reduce_dim, bool reduce_clear) {
+    Array<PrimExpr> args;
+    args.push_back(reduce_src);
+    args.push_back(reduce_dst);
+    args.push_back(type);
+    args.push_back(reduce_dim);
+    args.push_back(Bool(reduce_clear));
+    ReduceOp reduce_op = ReduceOp(args);
+    merge_layout(reduce_op->InferLayout(local_T, level));
+  };
 
-  Buffer col_allgather_buffer = NormalizeToBufferRegion(col_allgather)->buffer;
-  LayoutMap col_allgather_layout =
-      ComputeLayout(T, InferLevel::kFree, NormalizeToBufferRegion(src)->buffer,
-                    col_allgather_buffer, dim->value);
-  for (const auto &kv : col_allgather_layout) {
-    lm.Set(kv.first, kv.second);
+  auto infer_allgather = [&](PrimExpr send, PrimExpr recv, int gather_dir) {
+    Array<PrimExpr> args;
+    args.push_back(send);
+    args.push_back(recv);
+    args.push_back(IntImm(DataType::Int(32), gather_dir));
+    args.push_back(IntImm(DataType::Int(32), -1)); // size
+    args.push_back(IntImm(DataType::Int(32), -1)); // axis
+    args.push_back(cid);
+    AllgatherOp allgather_op = AllgatherOp(args);
+    merge_layout(allgather_op->InferLayout(local_T, level));
+  };
+
+  if (should_clear) {
+    infer_reduce(src, dst, dim, /*reduce_clear=*/true);
+
+    if (direction == 0 || direction == 2) {
+      infer_allgather(dst, row_allgather, /*gather_dir=*/0);
+      infer_reduce(row_allgather, dst, IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/true);
+    }
+
+    if (direction == 1 || direction == 2) {
+      infer_allgather(dst, col_allgather, /*gather_dir=*/1);
+      infer_reduce(col_allgather, dst, IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/true);
+    }
+  } else {
+    infer_reduce(src, dst_copy, dim, /*reduce_clear=*/true);
+
+    if (direction == 0 || direction == 2) {
+      infer_allgather(dst_copy, row_allgather, /*gather_dir=*/0);
+      infer_reduce(row_allgather, direction == 0 ? dst : dst_copy,
+                   IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/direction == 2);
+    }
+
+    if (direction == 1 || direction == 2) {
+      infer_allgather(dst_copy, col_allgather, /*gather_dir=*/1);
+      infer_reduce(col_allgather, dst, IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/false);
+    }
   }
 
   return lm;
@@ -889,135 +891,77 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
                             arith::Analyzer *analyzer) const {
   Target target = T.target;
   ICHECK(TargetIsSunmmio(target)) << "Allreduce only supports SUNMMIO targets.";
-  auto mesh = GetSunmmioMeshConfig(target);
-  int mesh_nrow = mesh.nrow;
-  int mesh_ncol = mesh.ncol;
 
   ICHECK(direction == 0 || direction == 1 || direction == 2)
       << "Invalid allreduce direction " << direction
       << ", must be 0 (row-wise) or 1 (column-wise) or 2 (all).";
 
+  bool should_clear = clear.as<Bool>().value();
+  ICHECK(should_clear || dst_copy.defined())
+      << "Allreduce clear=false requires a dst_copy temporary buffer.";
+  ICHECK(cid.defined())
+      << "Allreduce dynamic allgather lowering requires current core id.";
+
   Array<Stmt> stmts;
 
-  if (clear.as<Bool>().value() == true) {
-    // Local reduce to dst
-    Array<PrimExpr> local_reduce_args;
-    local_reduce_args.push_back(src);
-    local_reduce_args.push_back(dst);
-    local_reduce_args.push_back(type);
-    local_reduce_args.push_back(dim);
-    local_reduce_args.push_back(IntImm(DataType::Int(32), 1)); // clear = true
-    ReduceOp local_reduce_op = ReduceOp(local_reduce_args);
-    Stmt local_reduce_stmt = local_reduce_op->Lower(T, analyzer);
-    stmts.push_back(local_reduce_stmt);
+  auto append_reduce = [&](PrimExpr reduce_src, PrimExpr reduce_dst,
+                           PrimExpr reduce_dim, bool reduce_clear) {
+    Array<PrimExpr> args;
+    args.push_back(reduce_src);
+    args.push_back(reduce_dst);
+    args.push_back(type);
+    args.push_back(reduce_dim);
+    args.push_back(Bool(reduce_clear));
+    ReduceOp reduce_op = ReduceOp(args);
+    stmts.push_back(reduce_op->Lower(T, analyzer));
+  };
 
-    if (direction == 0 or direction == 2) { // row-wise
-      // Allgather dst in rows to row_allgather
-      Array<PrimExpr> row_allgather_args;
-      row_allgather_args.push_back(dst);
-      row_allgather_args.push_back(row_allgather);
-      row_allgather_args.push_back(
-          IntImm(DataType::Int(32), 0)); // direction = horizontal
-      row_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
-      AllgatherOp row_allgather_op = AllgatherOp(row_allgather_args);
-      Stmt row_allgather_stmt = row_allgather_op->Lower(T, analyzer);
-      stmts.push_back(row_allgather_stmt);
+  auto append_allgather = [&](PrimExpr send, PrimExpr recv, int gather_dir) {
+    Array<PrimExpr> args;
+    args.push_back(send);
+    args.push_back(recv);
+    args.push_back(IntImm(DataType::Int(32), gather_dir));
+    args.push_back(IntImm(DataType::Int(32), -1)); // size
+    args.push_back(IntImm(DataType::Int(32), -1)); // axis
+    args.push_back(cid);
+    AllgatherOp allgather_op = AllgatherOp(args);
+    stmts.push_back(allgather_op->Lower(T, analyzer));
+  };
 
-      // Local reduce from row_allgather to dst
-      Array<PrimExpr> row_reduce_args;
-      row_reduce_args.push_back(row_allgather);
-      row_reduce_args.push_back(dst);
-      row_reduce_args.push_back(type);
-      row_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // dim
-      row_reduce_args.push_back(IntImm(DataType::Int(32), 1)); // clear = true
-      ReduceOp row_reduce_op = ReduceOp(row_reduce_args);
-      Stmt row_reduce_stmt = row_reduce_op->Lower(T, analyzer);
-      stmts.push_back(row_reduce_stmt);
+  auto append_row_stage = [&](PrimExpr send, PrimExpr reduce_dst,
+                              bool reduce_clear) {
+    append_allgather(send, row_allgather, /*gather_dir=*/0);
+    append_reduce(row_allgather, reduce_dst, IntImm(DataType::Int(32), 0),
+                  reduce_clear);
+  };
+
+  auto append_col_stage = [&](PrimExpr send, PrimExpr reduce_dst,
+                              bool reduce_clear) {
+    append_allgather(send, col_allgather, /*gather_dir=*/1);
+    append_reduce(col_allgather, reduce_dst, IntImm(DataType::Int(32), 0),
+                  reduce_clear);
+  };
+
+  if (should_clear) {
+    append_reduce(src, dst, dim, /*reduce_clear=*/true);
+
+    if (direction == 0 || direction == 2) {
+      append_row_stage(dst, dst, /*reduce_clear=*/true);
     }
 
-    if (direction == 1 or direction == 2) { // column-wise
-      // Allgather dst in columns to col_allgather
-      Array<PrimExpr> col_allgather_args;
-      col_allgather_args.push_back(dst);
-      col_allgather_args.push_back(col_allgather);
-      col_allgather_args.push_back(
-          IntImm(DataType::Int(32), 1)); // direction = vertical
-      col_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
-      AllgatherOp col_allgather_op = AllgatherOp(col_allgather_args);
-      Stmt col_allgather_stmt = col_allgather_op->Lower(T, analyzer);
-      stmts.push_back(col_allgather_stmt);
-
-      // Local reduce from col_allgather to dst
-      Array<PrimExpr> col_reduce_args;
-      col_reduce_args.push_back(col_allgather);
-      col_reduce_args.push_back(dst);
-      col_reduce_args.push_back(type);
-      col_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // dim
-      col_reduce_args.push_back(IntImm(DataType::Int(32), 1)); // clear = true
-      ReduceOp col_reduce_op = ReduceOp(col_reduce_args);
-      Stmt col_reduce_stmt = col_reduce_op->Lower(T, analyzer);
-      stmts.push_back(col_reduce_stmt);
+    if (direction == 1 || direction == 2) {
+      append_col_stage(dst, dst, /*reduce_clear=*/true);
     }
   } else {
-    // Local reduce to dst_copy
-    Array<PrimExpr> local_reduce_args;
-    local_reduce_args.push_back(src);
-    local_reduce_args.push_back(dst_copy);
-    local_reduce_args.push_back(type);
-    local_reduce_args.push_back(dim);
-    local_reduce_args.push_back(IntImm(DataType::Int(32), 1)); // clear = true
-    ReduceOp local_reduce_op = ReduceOp(local_reduce_args);
-    Stmt local_reduce_stmt = local_reduce_op->Lower(T, analyzer);
-    stmts.push_back(local_reduce_stmt);
+    append_reduce(src, dst_copy, dim, /*reduce_clear=*/true);
 
-    if (direction == 0 or direction == 2) { // row-wise
-      // Allgather dst in rows to row_allgather
-      Array<PrimExpr> row_allgather_args;
-      row_allgather_args.push_back(dst_copy);
-      row_allgather_args.push_back(row_allgather);
-      row_allgather_args.push_back(
-          IntImm(DataType::Int(32), 0)); // direction = horizontal
-      row_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
-      AllgatherOp row_allgather_op = AllgatherOp(row_allgather_args);
-      Stmt row_allgather_stmt = row_allgather_op->Lower(T, analyzer);
-      stmts.push_back(row_allgather_stmt);
-
-      // Local reduce from row_allgather to dst
-      Array<PrimExpr> row_reduce_args;
-      row_reduce_args.push_back(row_allgather);
-      row_reduce_args.push_back(direction == 0 ? dst : dst_copy);
-      row_reduce_args.push_back(type);
-      row_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // dim
-      row_reduce_args.push_back(IntImm(
-          DataType::Int(32),
-          direction == 0 ? 0 : 1)); // clear = direction == 0 ? false : true
-      ReduceOp row_reduce_op = ReduceOp(row_reduce_args);
-      Stmt row_reduce_stmt = row_reduce_op->Lower(T, analyzer);
-      stmts.push_back(row_reduce_stmt);
+    if (direction == 0 || direction == 2) {
+      append_row_stage(dst_copy, direction == 0 ? dst : dst_copy,
+                       /*reduce_clear=*/direction == 2);
     }
 
-    if (direction == 1 or direction == 2) { // column-wise
-      // Allgather dst in columns to col_allgather
-      Array<PrimExpr> col_allgather_args;
-      col_allgather_args.push_back(dst_copy);
-      col_allgather_args.push_back(col_allgather);
-      col_allgather_args.push_back(
-          IntImm(DataType::Int(32), 1)); // direction = vertical
-      col_allgather_args.push_back(IntImm(DataType::Int(32), -1)); // size
-      AllgatherOp col_allgather_op = AllgatherOp(col_allgather_args);
-      Stmt col_allgather_stmt = col_allgather_op->Lower(T, analyzer);
-      stmts.push_back(col_allgather_stmt);
-
-      // Local reduce from col_allgather to dst
-      Array<PrimExpr> col_reduce_args;
-      col_reduce_args.push_back(col_allgather);
-      col_reduce_args.push_back(dst);
-      col_reduce_args.push_back(type);
-      col_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // dim
-      col_reduce_args.push_back(IntImm(DataType::Int(32), 0)); // clear = false
-      ReduceOp col_reduce_op = ReduceOp(col_reduce_args);
-      Stmt col_reduce_stmt = col_reduce_op->Lower(T, analyzer);
-      stmts.push_back(col_reduce_stmt);
+    if (direction == 1 || direction == 2) {
+      append_col_stage(dst_copy, dst, /*reduce_clear=*/false);
     }
   }
 

@@ -96,10 +96,22 @@ public:
                              const SunMMIOType &tile_type, int64_t axis,
                              DataType dtype) final;
 
+  SunMMIOValue TileBroadcast(const std::string &result_name,
+                             const SunMMIOValue &tile,
+                             const SunMMIOType &tile_type,
+                             DataType dtype) final;
+
   SunMMIOValue TileSlice(const std::string &result_name,
                          const SunMMIOValue &tile,
                          const std::vector<SunMMIOValue> &offsets,
                          const SunMMIOType &tile_type, DataType dtype) final;
+
+  SunMMIOValue TileInsertSlice(const std::string &result_name,
+                               const SunMMIOValue &base,
+                               const SunMMIOValue &slice,
+                               const std::vector<SunMMIOValue> &offsets,
+                               const SunMMIOType &result_type,
+                               DataType dtype) final;
 
   SunMMIOValue TileRectMask(const std::string &result_name,
                             const SunMMIOValue &valid_rows,
@@ -148,8 +160,8 @@ public:
                           const std::string &buffer_handle,
                           const std::vector<SunMMIOValue> &mins,
                           const std::vector<int64_t> &extents,
-                          DataType ret_dtype,
-                          const SunMMIOType &ret_type) final;
+                          DataType ret_dtype, const SunMMIOType &ret_type,
+                          int64_t byte_offset = 0) final;
 
   SunMMIOValue Ramp(const std::string &result_name, const SunMMIOValue &base,
                     const SunMMIOValue &stride, int lanes,

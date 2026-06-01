@@ -124,11 +124,23 @@ public:
                                      const SunMMIOType &tile_type, int64_t axis,
                                      DataType dtype) = 0;
 
+  virtual SunMMIOValue TileBroadcast(const std::string &result_name,
+                                     const SunMMIOValue &tile,
+                                     const SunMMIOType &tile_type,
+                                     DataType dtype) = 0;
+
   virtual SunMMIOValue TileSlice(const std::string &result_name,
                                  const SunMMIOValue &tile,
                                  const std::vector<SunMMIOValue> &offsets,
                                  const SunMMIOType &tile_type,
                                  DataType dtype) = 0;
+
+  virtual SunMMIOValue TileInsertSlice(const std::string &result_name,
+                                       const SunMMIOValue &base,
+                                       const SunMMIOValue &slice,
+                                       const std::vector<SunMMIOValue> &offsets,
+                                       const SunMMIOType &result_type,
+                                       DataType dtype) = 0;
 
   virtual SunMMIOValue TileRectMask(const std::string &result_name,
                                     const SunMMIOValue &valid_rows,
@@ -177,12 +189,11 @@ public:
                             const std::string &category, DataType ret_dtype,
                             const SunMMIOType &ret_type) = 0;
 
-  virtual SunMMIOValue RegionCall(const std::string &result_name,
-                                  const std::string &buffer_handle,
-                                  const std::vector<SunMMIOValue> &mins,
-                                  const std::vector<int64_t> &extents,
-                                  DataType ret_dtype,
-                                  const SunMMIOType &ret_type) = 0;
+  virtual SunMMIOValue
+  RegionCall(const std::string &result_name, const std::string &buffer_handle,
+             const std::vector<SunMMIOValue> &mins,
+             const std::vector<int64_t> &extents, DataType ret_dtype,
+             const SunMMIOType &ret_type, int64_t byte_offset = 0) = 0;
 
   virtual SunMMIOValue Ramp(const std::string &result_name,
                             const SunMMIOValue &base,
@@ -340,6 +351,8 @@ private:
                        const tvm::PrimExpr &rhs);
   SunMMIOValue EmitCast(const SunMMIOValue &v, tvm::DataType target_dtype);
   SunMMIOValue EmitCall(const tir::CallNode *op);
+  SunMMIOValue EmitRegionCall(const tvm::PrimExpr &region_expr,
+                              int64_t byte_offset = 0);
   SunMMIOValue EmitLoad(const tir::Buffer &buffer,
                         const ffi::Array<PrimExpr> &indices);
   void EmitStore(const tir::Buffer &buffer, const ffi::Array<PrimExpr> &indices,
