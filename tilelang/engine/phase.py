@@ -171,7 +171,7 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # Inject assumes to speedup tvm prover
     mod = tilelang.transform.InjectAssumes()(mod)
     # Simplify the IR expressions
-    mod = tilelang.transform.Simplify()(mod)
+    mod = tilelang.transform.Simplify()(mod)  
     if target_is_sunmmio(target):
         # Infer Sunmmio shared memory SRAM scope
         mod = tilelang.transform.InferSramScope()(mod)
