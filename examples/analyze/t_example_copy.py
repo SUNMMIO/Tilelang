@@ -101,7 +101,25 @@ def codegen_sunmmio_suvm_from_kernel(kernel):
                 pass_configs={tilelang.PassConfigKey.TL_AST_PRINT_ENABLE: True},
             )
 
-    host_mod, device_mod = compile_test(kernel, target="Sunmmio")
+    pass_dump_dir = output_dir / "t_example_copy_passes"
+    host_mod, device_mod = compile_test(
+        kernel,
+        target="Sunmmio",
+        log_pass_output=True,
+        show_meta=False,
+        log_dir=str(pass_dump_dir),
+        log_passes=[
+            "InferSramScope",
+            "LegalizeSunmmioDataPath",
+            "SunmmioLayoutInference",
+            "LowerTileOp",
+            "LegalizeTilesLoop",
+            "TilesLoop",
+            "InjectSunmmioPipeline",
+            "LowerOpaqueBlock",
+            "DeviceMod",
+        ],
+    )
 
     target = determine_target("Sunmmio", return_object=True)
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
@@ -117,6 +135,7 @@ def codegen_sunmmio_suvm_from_kernel(kernel):
     suvm_mlir_path.write_text(src, encoding="utf-8")
 
     print(f"Saved AST to {ast_path}")
+    print(f"Saved pass dumps to {pass_dump_dir}")
     print(f"Saved device TIR to {device_tir_path}")
     print(f"Saved SUVM MLIR to {suvm_mlir_path}")
 
