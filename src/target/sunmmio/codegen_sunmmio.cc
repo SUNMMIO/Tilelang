@@ -809,6 +809,11 @@ struct TokenAnalyzer {
             st.MarkProduced(token_id);
             return;
           }
+          if (op_node->name == "tl.broadcast_") {
+            int64_t token_id = ParseTokenIdFromArgs(call->args);
+            st.MarkProduced(token_id);
+            return;
+          }
           if (op_node->name == "tl.sync_null_token") {
             int64_t token_id = ParseTokenIdFromArgs(call->args);
             st.MarkProduced(token_id);
