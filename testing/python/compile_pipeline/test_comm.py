@@ -6,21 +6,9 @@ from compile_pipeline import compile_test, target
 from formal_verify_funcs import *
 
 
-_ROW_MASK_BX = (
-    "T.bitwise_or(T.bitwise_or(T.bitwise_or(T.bitwise_or(T.int64(0), "
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4))), '
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4) + T.int64(1))), '
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4) + T.int64(2))), '
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4) + T.int64(3)))'
-)
+_ROW_MASK_BX = "T.int64(15)"
 
-_COL_MASK_BX = (
-    "T.bitwise_or(T.bitwise_or(T.bitwise_or(T.bitwise_or(T.int64(0), "
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4))), '
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4) + T.int64(4))), '
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4) + T.int64(8))), '
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4) + T.int64(12)))'
-)
+_COL_MASK_BX = "T.int64(15)"
 
 
 @target("Sunmmio")
@@ -90,9 +78,9 @@ def test_comm():
         "C = T.match_buffer(C_handle, (4096, 4096), strides=(4096, 1))",
         'bx = T.launch_thread("blockIdx.x", 16)',
         "for w in range(1):",
-        "T.broadcast_(T.region(A_shared[0, 0], 1, 1024, 1024), T.region(A_remote_1[0, 0], 2, 1024, 1024), 1, T.int64(4369), 0, 0)",
-        "T.broadcast_(T.region(A_remote_1[0, 0], 1, 1024, 1024), T.region(A_remote_1[0, 0], 2, 1024, 1024), 0, T.int64(61440), 0, 12)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 1024, 1024), T.region(B_remote_1[0, 0], 2, 1024, 1024), 1, T.int64(1024), 0, 6)",
+        "T.broadcast_(T.region(A_shared[0, 0], 1, 1024, 1024), T.region(A_remote_1[0, 0], 2, 1024, 1024), 1, T.int64(15), 0, 0)",
+        "T.broadcast_(T.region(A_remote_1[0, 0], 1, 1024, 1024), T.region(A_remote_1[0, 0], 2, 1024, 1024), 0, T.int64(15), 0, 12)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 1024, 1024), T.region(B_remote_1[0, 0], 2, 1024, 1024), 1, T.int64(4), 0, 6)",
         f"T.broadcast_(T.region(C_shared[0, 0], 1, 1024, 1024), T.region(C_allgather_1[bx, 0, 0], 2, 1, 1024, 1024), 0, {_ROW_MASK_BX}, 0)",
         f"T.broadcast_(T.region(C_allgather_1[bx // 4 * 4, 0, 0], 1, 4, 1024, 1024), T.region(C_allgather_1[bx // 4 * 4, 0, 0], 2, 4, 1024, 1024), 1, {_COL_MASK_BX}, 0)",
         f"T.broadcast_(T.region(C_shared[0, 0], 1, 1024, 1024), T.region(C_allgather_2[bx % 4, 0, 0], 2, 1, 1024, 1024), 0, {_ROW_MASK_BX}, 0)",

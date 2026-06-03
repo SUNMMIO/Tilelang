@@ -1,6 +1,8 @@
 from tilelang import tvm
 from tilelang.utils.target import determine_target
 
+# os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
+
 
 def _to_device_kernel_func(func):
     return func.with_attr("global_symbol", "main").with_attr("calling_conv", int(tvm.ir.CallingConv.DEVICE_KERNEL_LAUNCH))

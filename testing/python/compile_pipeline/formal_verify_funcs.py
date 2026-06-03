@@ -64,25 +64,14 @@ def verify_comm_lower(func: tir.PrimFunc):
                     return split_top_level_args(line[arg_start:idx])
         return None
 
-    def make_core_mask(core_ids):
-        mask = 0
-        for core_id in core_ids:
-            mask |= 1 << core_id
-        return mask
+    def full_local_mask(axis_len):
+        return (1 << axis_len) - 1
 
     def horizontal_mask(src_core):
-        if not isinstance(src_core, tir.IntImm):
-            return None
-        src_core_val = int(src_core)
-        row = src_core_val // current_mesh_ncol
-        return make_core_mask(row * current_mesh_ncol + j for j in range(current_mesh_ncol))
+        return full_local_mask(current_mesh_ncol)
 
     def vertical_mask(src_core):
-        if not isinstance(src_core, tir.IntImm):
-            return None
-        src_core_val = int(src_core)
-        col = src_core_val % current_mesh_ncol
-        return make_core_mask(i * current_mesh_ncol + col for i in range(current_mesh_nrow))
+        return full_local_mask(current_mesh_nrow)
 
     def direction_from_arg(direction_val):
         if isinstance(direction_val, tir.StringImm):
@@ -197,13 +186,13 @@ def verify_comm_lower(func: tir.PrimFunc):
                     )
 
                     if src_row == dst_row:
-                        add_expected(src_core, 0, make_core_mask([dst_core_val]))
+                        add_expected(src_core, 0, 1 << dst_col)
                     elif src_col == dst_col:
-                        add_expected(src_core, 1, make_core_mask([dst_core_val]))
+                        add_expected(src_core, 1, 1 << dst_row)
                     else:
                         intermediate_core = dst_row * current_mesh_ncol + src_col
-                        add_expected(src_core, 1, make_core_mask([intermediate_core]))
-                        add_expected(tir.IntImm("int32", intermediate_core), 0, make_core_mask([dst_core_val]))
+                        add_expected(src_core, 1, 1 << dst_row)
+                        add_expected(tir.IntImm("int32", intermediate_core), 0, 1 << dst_col)
 
             elif node.op.name == "tl.tileop.comm_allgather":
                 # args: send, recv, direction, size

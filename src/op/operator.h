@@ -24,6 +24,9 @@ namespace tl {
 using namespace tir;
 
 using AddWorkspaceCallback = std::function<PrimExpr(int, DataType)>;
+// Callback for a tile op's Lower() to register the layout of a buffer it
+// introduced (e.g. a staging buffer), so later passes/codegen see it.
+using RegisterLayoutCallback = std::function<void(Buffer, Layout)>;
 using LayoutMap = Map<Buffer, Layout>;
 using TileViewMap = Map<Var, TileView>;
 using BufferMap = Map<Var, Buffer>;
@@ -60,6 +63,9 @@ struct LowerArgs {
   Map<Var, PrimExpr> let_var_to_expr;
   LayoutMap global_layout_map;
   TileViewMap tileview_map;
+  // Registers the layout of a buffer created during lowering (e.g. a Sunmmio
+  // staging buffer). May be unset; check before calling.
+  RegisterLayoutCallback RegisterLayout;
 };
 
 struct LayoutInferArgs {

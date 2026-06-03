@@ -19,6 +19,7 @@ PRINT = os.getenv("SUNMMIO_TEST_PRINT", "true").lower() in (
     "yes",
     "on",
 )
+# os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 
 def _maybe_print_kernel_and_codegen(label: str, obj, src: str):

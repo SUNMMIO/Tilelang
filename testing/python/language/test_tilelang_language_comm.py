@@ -31,21 +31,9 @@ def _broadcast_line_no_core(src, dst, direction, mask, src_offset=0):
     return f"T.broadcast_({src}, {dst}, {direction}, {mask}, {src_offset})"
 
 
-_ROW_MASK_BX = (
-    "T.bitwise_or(T.bitwise_or(T.bitwise_or(T.bitwise_or(T.int64(0), "
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4))), '
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4) + T.int64(1))), '
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4) + T.int64(2))), '
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) // T.int64(4) * T.int64(4) + T.int64(3)))'
-)
+_ROW_MASK_BX = "T.int64(15)"
 
-_COL_MASK_BX = (
-    "T.bitwise_or(T.bitwise_or(T.bitwise_or(T.bitwise_or(T.int64(0), "
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4))), '
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4) + T.int64(4))), '
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4) + T.int64(8))), '
-    'T.shift_left(T.int64(1), T.Cast("int64", bx) % T.int64(4) + T.int64(12)))'
-)
+_COL_MASK_BX = "T.int64(15)"
 
 
 def _expected_axis0_all_lines(buffer):
@@ -203,11 +191,11 @@ def test_comm_dynamic_core_lower():
 )
 def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
     expected = [
-        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(17476), 0, 6)",
+        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(15), 0, 6)",
         "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(15), 0, 2)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(240), 0, 6)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(3840), 0, 10)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(61440), 0, 14)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(15), 0, 6)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(15), 0, 10)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(15), 0, 14)",
     ]
 
     @T.prim_func
@@ -237,9 +225,9 @@ def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
 )
 def test_comm_broadcast_lower_custom_mesh(M, N, block_M, block_N, dtype):
     expected = [
-        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(36), 0, 5)",
+        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(3), 0, 5)",
         "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(7), 0, 2)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(56), 0, 5)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(7), 0, 5)",
     ]
 
     @T.prim_func
@@ -279,8 +267,8 @@ def test_comm_broadcast_lower_custom_mesh(M, N, block_M, block_N, dtype):
 )
 def test_comm_put_lower(M, N, block_M, block_N, dtype, accum_dtype):
     expected = [
-        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(1024), 0, 6)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(2048), 0, 10)",
+        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(4), 0, 6)",
+        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(8), 0, 10)",
     ]
 
     @T.prim_func

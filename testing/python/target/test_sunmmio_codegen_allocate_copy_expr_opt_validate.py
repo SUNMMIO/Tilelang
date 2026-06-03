@@ -20,6 +20,7 @@ import os
 
 # print flag
 os.environ["SUNMMIO_TEST_PRINT"] = "1"
+# os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 
 def basic_allocate_copy_mma_kernel(

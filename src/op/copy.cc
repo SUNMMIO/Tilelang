@@ -453,9 +453,10 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
     return result_map;
   }
 
-  // Sunmmio DMA Copy: no layout inference — Copy bridges any layout mismatch
-  // via dma_layout_transform in CopyNode::Lower.  Layouts are assigned
-  // by other operators
+  // Sunmmio DMA Copy: no layout inference here.  CopyNode::Lower bridges a
+  // DRAM<->RSRAM layout mismatch by splitting the copy into a dma_copy plus a
+  // sunmmio_layout_transform through an RSRAM staging buffer.  Layouts are
+  // assigned by other operators.
   //
   // Hard constraint: DRAM → ASRAM/WSRAM requires ZZ-like DRAM layout
   // (ZZ, ZZZ, or NZZ).  DRAM layouts are user-specified and immutable,
@@ -468,7 +469,8 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
         auto *cute = dram_layout.as<CuteLayoutNode>();
         // Only validate user-specified blocked layouts (ZZ, ZN, ZZZ, NZZ).
         // Row-major (default for unspecified DRAM) has no blocked dims and
-        // is handled by dma_layout_transform — skip the check.
+        // is handled by the dma_copy / layout-transform split — skip the
+        // check.
         if (cute) {
           bool has_blocked = false;
           for (auto nl : cute->GetDimLevels()) {
@@ -817,18 +819,121 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
 Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
                                    arith::Analyzer *analyzer) const {
-  /** The staging split is handled by LegalizeSunmmioDataPath before lowering.
-   */
   PrimExpr src_region = MakeRegionExpr(src, src_range, /*access_mask=*/1);
   PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
   // src_offset_byte is read from this CopyNode's annotations (set by the
   // Sunmmio bf16 GEMM legalization pass) and emitted as a trailing positional
   // arg of the dma_copy intrinsic. Default 0; codegen adds it to the source
-  // pointer of the emitted ODMA call. Direct positional propagation —
-  // no AttrStmt wrapper.
+  // pointer of the emitted ODMA call. In practice a non-zero offset only ever
+  // lands on a copy that takes the fast path below — the layout-transform
+  // legs carry the (zero) default.
   PrimExpr src_offset_imm = IntImm(DataType::Int(32), GetSrcOffsetByte());
-  return Evaluate(Call(DataType::Handle(), dma_copy(),
-                       {src_region, dst_region, src_offset_imm}));
+  auto dma = [&](PrimExpr a, PrimExpr b) {
+    return Evaluate(
+        Call(DataType::Handle(), dma_copy(), {a, b, src_offset_imm}));
+  };
+
+  // Layout of a buffer: DRAM lives in global_layout_map, on-chip in layout_map.
+  auto layout_of = [&](const Buffer &b) -> Layout {
+    const LayoutMap &m =
+        (b.scope() == "global") ? T.global_layout_map : T.layout_map;
+    return m.count(b) ? m[b] : Layout();
+  };
+  Layout src_layout = layout_of(src), dst_layout = layout_of(dst);
+
+  bool is_dram_rsram =
+      (src.scope() == "global" && dst.scope() == kSunmmioScopeRSRAM) ||
+      (src.scope() == kSunmmioScopeRSRAM && dst.scope() == "global");
+
+  // Fast path: a non-DRAM<->RSRAM copy, or matching/unknown layouts, lowers
+  // to a plain dma_copy.  IsLayoutMatch compares layout *kind* regardless of
+  // logical shape — a copy moves a tile, so the buffers differ in shape.
+  if (!is_dram_rsram || !src_layout.defined() || !dst_layout.defined() ||
+      IsLayoutMatch(src_layout, dst_layout, analyzer)) {
+    return dma(src_region, dst_region);
+  }
+
+  // Mismatched DRAM<->RSRAM copy.  The DRAM-side layout drives the staging
+  // buffer.
+  bool src_is_dram = src.scope() == "global";
+  const Buffer &dram = src_is_dram ? src : dst;
+  const Layout &dram_layout = src_is_dram ? src_layout : dst_layout;
+  const Layout &rsram_layout = src_is_dram ? dst_layout : src_layout;
+  const Array<Range> &dram_range = src_is_dram ? src_range : dst_range;
+  bool dram_is_zz = sunmmio::IsZZLike(dram_layout);
+  bool rsram_is_zz = sunmmio::IsZZLike(rsram_layout);
+
+  // The fast path already returned for matching layouts.  The transform
+  // supports exactly one pairing — one ZZ-like side, one row-major side —
+  // and rejects everything else (ZZ<->ZZ with mismatched blocks, ZZ<->ZN,
+  // ...).  ZN occurs only on the DRAM->WSRAM path, never DRAM<->RSRAM.
+  auto is_row_major = [](const Layout &l) {
+    return IsSameLayout(l, sunmmio::MakeRowMajor(l->InputShape()));
+  };
+  bool supported = (dram_is_zz && is_row_major(rsram_layout)) ||
+                   (rsram_is_zz && is_row_major(dram_layout));
+  ICHECK(supported)
+      << "sunmmio layout transform supports only a ZZ-like <-> row-major "
+         "pair, got DRAM "
+      << dram_layout->DebugOutput() << " and RSRAM "
+      << rsram_layout->DebugOutput() << ".";
+
+  Layout zz_layout = dram_is_zz ? dram_layout : rsram_layout;
+  auto zz_block = sunmmio::GetZZBlockShape(zz_layout);
+  ICHECK(zz_block.has_value())
+      << "sunmmio layout transform: cannot extract a ZZ block shape.";
+
+  // A ZZ block that exactly covers the buffer is a single block — physically
+  // identical to row-major — so a plain dma_copy already moves correct data.
+  if (auto *cute = zz_layout.as<CuteLayoutNode>()) {
+    Array<PrimExpr> shape = cute->GetLogicalShape();
+    int rank = static_cast<int>(shape.size());
+    if (rank >= 2 &&
+        analyzer->CanProveEqual(shape[rank - 2], zz_block->height) &&
+        analyzer->CanProveEqual(shape[rank - 1], zz_block->width)) {
+      return dma(src_region, dst_region);
+    }
+  }
+
+  // RSRAM staging buffer mirroring the DRAM-side layout, so its dma_copy leg
+  // is a plain layout-preserving transfer.
+  Array<PrimExpr> stage_shape;
+  Array<Range> stage_range;
+  for (const Range &r : dram_range) {
+    stage_shape.push_back(r->extent);
+    stage_range.push_back(Range::FromMinExtent(0, r->extent));
+  }
+  Buffer stage = decl_buffer(stage_shape, dram->dtype,
+                             dram->name + "_layout_stage", kSunmmioScopeRSRAM);
+  // A ZZ staging buffer must announce its layout; row-major is the default for
+  // an unregistered Sunmmio buffer and needs no entry.
+  if (dram_is_zz) {
+    auto stage_layout = DeriveLayoutLike(dram_layout, stage_shape,
+                                         Optional<Array<Integer>>(), analyzer);
+    ICHECK(stage_layout.defined() && T.RegisterLayout != nullptr)
+        << "sunmmio layout transform: cannot register the staging layout.";
+    T.RegisterLayout(stage, stage_layout.value());
+  }
+
+  // The copy lowers to leg_a(src -> stage) then leg_b(stage -> dst): the
+  // DRAM-side leg is a plain dma_copy, the RSRAM-side leg is the transform.
+  // The transform carries only the two regions — codegen recovers each
+  // buffer's layout (ZZ vs row-major, block shape) from layout_map.
+  PrimExpr stage_w = MakeRegionExpr(stage, stage_range, /*access_mask=*/2);
+  PrimExpr stage_r = MakeRegionExpr(stage, stage_range, /*access_mask=*/1);
+  auto xform = [&](PrimExpr a, PrimExpr b) {
+    return Evaluate(
+        Call(DataType::Handle(), sunmmio_layout_transform(), {a, b}));
+  };
+  Stmt leg_a =
+      src_is_dram ? dma(src_region, stage_w) : xform(src_region, stage_w);
+  Stmt leg_b =
+      src_is_dram ? xform(stage_r, dst_region) : dma(stage_r, dst_region);
+
+  // Wrap in a Block so the staging buffer is allocated at this site.
+  Block stage_block({}, {}, {}, "sunmmio_layout_transform",
+                    SeqStmt({leg_a, leg_b}), std::nullopt, {stage}, {}, {});
+  return BlockRealize({}, Bool(true), stage_block);
 }
 
 Stmt CopyNode::LowerSunmmioTileCopy(const LowerArgs &T,
