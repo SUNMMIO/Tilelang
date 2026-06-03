@@ -140,6 +140,10 @@ public:
                                 const SunMMIOType &tile_type,
                                 DataType dtype) = 0;
 
+  virtual SunMMIOValue TileRange(const std::string &result_name,
+                                 const SunMMIOType &tile_type,
+                                 DataType dtype) = 0;
+
   virtual SunMMIOValue TileUnsqueeze(const std::string &result_name,
                                      const SunMMIOValue &tile,
                                      const SunMMIOType &tile_type, int64_t axis,

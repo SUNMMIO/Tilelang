@@ -268,6 +268,27 @@ def test_dot_mul_tiled_parallel_2d_codegen_validates_with_npuir_opt(tmp_path):
     assert_source_contains(src, ("suvm.tile.mulf", "suvm.tile.exp"))
 
 
+def test_dot_mul_tiled_parallel_3d_tail_codegen_validates_loose_with_npuir_opt(tmp_path):
+    src = validate_sunmmio_codegen_loose(
+        dot_mul_tiled_parallel_3d(
+            batch=64,
+            m=510,
+            n=254,
+            block_b=32,
+            block_m=255,
+            block_n=127,
+            dtype="float16",
+            accum_dtype="float16",
+        ),
+        tmp_path,
+        mlir_filename="dot_mul_tiled_parallel_3d_tail_suvm.mlir",
+        expected_tokens=("suvm.tile.select", "suvm.tile.range", "suvm.tile.andi"),
+    )
+    assert_source_contains(src, ("scf.if", "suvm.tile.select", "suvm.tile.range", "suvm.tile.andi"))
+    assert "fake_tile_range" not in src
+    assert "fake_tile_mask_and" not in src
+
+
 @pytest.mark.parametrize(
     "case_name,kernel_factory,expected_tokens",
     [

@@ -54,17 +54,6 @@ mlir::Value CreateTypedPlaceholderWithOperands(
   return cast_op->getResult(0);
 }
 
-std::vector<int64_t> StaticShapeOf(const SunMMIOType &type) {
-  std::vector<int64_t> shape;
-  shape.reserve(type.shape.size());
-  for (const PrimExpr &dim : type.shape) {
-    const auto *imm = dim.as<IntImmNode>();
-    ICHECK(imm) << "Expected static tile shape in SUVM tile op lowering";
-    shape.push_back(static_cast<int64_t>(imm->value));
-  }
-  return shape;
-}
-
 mlir::suvm::VCmpFPredicate GetTileCmpFloatPredicate(CompareOp op) {
   switch (op) {
   case CompareOp::kEQ:
@@ -134,9 +123,10 @@ SunMMIOValue SunmmioMlirTileOp::GetPartitionedTileView(
     DataType dtype) {
   mlir::Type result_type = MapMlirType(ctx_, view_type);
   mlir::Value view_value;
-  bool supports_real_2d_view =
-      view_type.shape.size() == 2 && memtensor.type.shape.size() >= 2;
-  if (supports_real_2d_view) {
+  bool can_emit_real_view = view_type.shape.size() == tiled_dims.size() &&
+                            view_type.shape.size() <= 2 &&
+                            memtensor.type.shape.size() >= tiled_dims.size();
+  if (can_emit_real_view) {
     mlir::Value memtensor_value =
         ctx_.LookupOrCreateFakeValue(memtensor, "fake_missing_memtensor");
     mlir::OperationState st(MapMlirLoc(ctx_), "suvm.get_partitioned_tile_view");
@@ -153,17 +143,8 @@ SunMMIOValue SunmmioMlirTileOp::GetPartitionedTileView(
     st.addTypes(result_type);
     view_value = ctx_.builder.create(st)->getResult(0);
   } else {
-    if (view_type.shape.size() == 2) {
-      LOG(WARNING)
-          << "Using provisional 2D tile_view placeholder for unsupported "
-             "rank-1/unit-tile adaptation in clean v4 Tiles lowering; replace "
-             "with real SUVM tile_view once dialect support lands";
-    } else {
-      LOG(WARNING)
-          << "Using provisional 1D tile_view placeholder for clean v4 Tiles "
-             "lowering; replace with real SUVM 1D tile_view once dialect "
-             "support lands";
-    }
+    LOG(WARNING) << "Using provisional tile_view placeholder for unsupported "
+                    "rank adaptation in clean v4 Tiles lowering";
     std::vector<mlir::Value> operands;
     operands.reserve(1 + indices.size());
     operands.push_back(
@@ -230,24 +211,35 @@ SunMMIOValue SunmmioMlirTileOp::TileFill(const std::string &result_name,
                                          DataType dtype) {
   mlir::Type result_type = MapMlirType(ctx_, tile_type);
   mlir::Value tile_value;
-  if (tile_type.shape.size() == 2) {
-    mlir::Value scalar_value =
-        ctx_.LookupOrCreateFakeValue(scalar, "fake_missing_tile_fill_scalar");
-    mlir::OperationState st(MapMlirLoc(ctx_), "suvm.tile.fill");
-    st.addOperands(scalar_value);
-    st.addTypes(result_type);
-    tile_value = ctx_.builder.create(st)->getResult(0);
-  } else {
-    LOG(WARNING)
-        << "Using provisional 1D tile.fill placeholder for clean v4 Tiles "
-           "lowering; replace with real SUVM 1D tile.fill once dialect "
-           "support lands";
-    tile_value = CreateTypedPlaceholder(ctx_, result_type, "fake_tile_fill");
-  }
+  mlir::Value scalar_value =
+      ctx_.LookupOrCreateFakeValue(scalar, "fake_missing_tile_fill_scalar");
+  mlir::OperationState st(MapMlirLoc(ctx_), "suvm.tile.fill");
+  st.addOperands(scalar_value);
+  st.addTypes(result_type);
+  tile_value = ctx_.builder.create(st)->getResult(0);
   if (!result_name.empty()) {
     ctx_.BindMLIRValue(result_name, tile_value);
   }
   return SunMMIOValue{dtype, result_name, tile_type};
+}
+
+SunMMIOValue SunmmioMlirTileOp::TileRange(const std::string &result_name,
+                                          const SunMMIOType &tile_type,
+                                          DataType dtype) {
+  ICHECK_EQ(tile_type.shape.size(), 1U)
+      << "suvm.tile.range expects a rank-1 tile result";
+  ICHECK(CanonicalizeSuvmDType(dtype).is_int() ||
+         CanonicalizeSuvmDType(dtype).is_uint())
+      << "suvm.tile.range expects an integer tile element type";
+  mlir::Value tile_value =
+      mlir::suvm::TileRangeOp::create(ctx_.builder, MapMlirLoc(ctx_),
+                                      MapMlirType(ctx_, tile_type))
+          .getResult();
+  if (!result_name.empty()) {
+    ctx_.BindMLIRValue(result_name, tile_value);
+  }
+  return SunMMIOValue{CanonicalizeSuvmDType(dtype).with_lanes(1), result_name,
+                      tile_type};
 }
 
 SunMMIOValue SunmmioMlirTileOp::Cast(const std::string &result_name,
@@ -282,21 +274,9 @@ SunMMIOValue SunmmioMlirTileOp::Binary(const std::string &result_name,
   switch (op) {
   case BinaryOp::kAdd:
     if (flavor == ArithmeticFlavor::kFloat) {
-      // The checked-in SUVM verifier currently requires tile.addf operands to
-      // have the exact result shape.  T.Tiles uses unit-tile broadcast operands
-      // such as 8x1 in 8x32 + 8x1.  Keep that compact form as a fake op until
-      // the dialect supports the intended broadcast semantics directly.
-      bool needs_unit_broadcast =
-          StaticShapeOf(a.type) != StaticShapeOf(result_type) ||
-          StaticShapeOf(b.type) != StaticShapeOf(result_type);
-      if (needs_unit_broadcast) {
-        binary_value = CreateTypedPlaceholderWithOperands(
-            ctx_, result_mlir_type, {lhs, rhs}, "fake_tile_addf");
-      } else {
-        binary_value = mlir::suvm::TileAddFOp::create(ctx_.builder, loc,
-                                                      tile_type, lhs, rhs)
-                           .getResult();
-      }
+      binary_value =
+          mlir::suvm::TileAddFOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
+              .getResult();
     } else {
       binary_value =
           mlir::suvm::TileAddIOp::create(ctx_.builder, loc, tile_type, lhs, rhs)
@@ -739,18 +719,18 @@ SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
   SunMMIOType mask_full_type =
       make_tile_type(DataType::Bool(), {rows_dim, cols_dim});
 
-  // New dialect design: tile.range produces a 1D tile.  The checked-in NPU-IR
-  // still models tile.range as 1xN, so keep this range as a fake 1D value until
-  // that update lands, then replace this placeholder with suvm.tile.range.
-  mlir::Value range = CreateTypedPlaceholder(
-      ctx_, MapMlirType(ctx_, range_type), "fake_tile_range");
+  mlir::Value range =
+      mlir::suvm::TileRangeOp::create(ctx_.builder, MapMlirLoc(ctx_),
+                                      MapMlirType(ctx_, range_type))
+          .getResult();
 
   int64_t unsqueeze_axis = axis == 0 ? 1 : 0;
-  mlir::Value range_2d = CreateTypedPlaceholderWithOperands(
-      ctx_, MapMlirType(ctx_, range_2d_type), {range}, "fake_tile_unsqueeze");
-  if (mlir::Operation *def = range_2d.getDefiningOp()) {
-    def->setAttr("axis", ctx_.builder.getI64IntegerAttr(unsqueeze_axis));
-  }
+  mlir::OperationState unsqueeze_st(MapMlirLoc(ctx_), "suvm.tile.unsqueeze");
+  unsqueeze_st.addOperands(range);
+  unsqueeze_st.addAttribute(
+      "axes", ctx_.builder.getDenseI64ArrayAttr({unsqueeze_axis}));
+  unsqueeze_st.addTypes(MapMlirType(ctx_, range_2d_type));
+  mlir::Value range_2d = ctx_.builder.create(unsqueeze_st)->getResult(0);
 
   mlir::Value valid_i32 = to_i32_scalar(
       valid_extent, axis == 0 ? "tail_mask_rows" : "tail_mask_cols");
@@ -780,12 +760,10 @@ SunMMIOValue SunmmioMlirTileOp::TileMaskAnd(const std::string &result_name,
       ctx_.LookupOrCreateFakeValue(lhs, "fake_missing_tile_mask_lhs");
   mlir::Value rhs_value =
       ctx_.LookupOrCreateFakeValue(rhs, "fake_missing_tile_mask_rhs");
-  // The final rectangular tail mask is row_mask && col_mask.  The SUVM
-  // dialect is expected to make tile.andi accept i1 tiles; until that lands,
-  // keep this as an explicit fake op so the generated MLIR still records the
-  // intended dataflow without using verifier-invalid i1<->i32 casts.
-  mlir::Value mask_value = CreateTypedPlaceholderWithOperands(
-      ctx_, result_type, {lhs_value, rhs_value}, "fake_tile_mask_and");
+  mlir::Value mask_value =
+      mlir::suvm::TileAndIOp::create(ctx_.builder, MapMlirLoc(ctx_),
+                                     result_type, lhs_value, rhs_value)
+          .getResult();
   if (!result_name.empty()) {
     ctx_.BindMLIRValue(result_name, mask_value);
   }

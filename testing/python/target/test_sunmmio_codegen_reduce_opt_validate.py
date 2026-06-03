@@ -193,6 +193,17 @@ def test_reduce_generic_in_tile_codegen_generates_expected_ops(tmp_path, shape, 
         expected_tokens=("suvm.copy_async", "suvm.tile.reduce"),
     )
     assert_source_contains(src, ("suvm.tile.reduce", "sum"))
+    if shape == (32, 256, 128) and reduce_axis == 2:
+        aligned_view_lines = [
+            line
+            for line in src.splitlines()
+            if "suvm.get_partitioned_tile_view" in line
+            and "!suvm.memtensor<32x256xbf16" in line
+            and "tiled_dims = [1]" in line
+            and "-> !suvm.tile_view<32xbf16>" in line
+        ]
+        assert aligned_view_lines
+        assert any("indices = [%arg2," in line or "(%3, %arg2," in line for line in aligned_view_lines)
 
 
 @pytest.mark.parametrize("reduce_axis,clear", [(1, False), (2, True)])
@@ -204,6 +215,20 @@ def test_reduce_tiled_in_tile_codegen_generates_expected_ops(tmp_path, reduce_ax
         expected_tokens=("suvm.copy_async", "suvm.tile.reduce"),
     )
     assert_source_contains(src, ("suvm.tile.reduce", "sum"))
+
+
+def test_reduce_small_1d_result_uses_aligned_store_bridge(tmp_path):
+    src = validate_sunmmio_codegen_loose(
+        reduce_kernel_builder((32, 64, 256), 2, clear=True),
+        tmp_path,
+        mlir_filename="reduce_small_1d_result_aligned_store_suvm.mlir",
+        expected_tokens=("suvm.tile.reduce", "fake_tile_insert_slice", "fake_tile_store"),
+    )
+    assert_source_contains(src, ("suvm.tile.reduce", "!suvm.tile<8x1xbf16>", "!suvm.tile<32x1xbf16>"))
+    assert "!suvm.tile<32xbf16>, !suvm.tile_view<32xbf16> to i32" in src
+    assert '!suvm.tile<8xbf16>, !suvm.tile_view<8xbf16> to i32 {sunmmio.fake = "fake_tile_store"}' not in src
+    assert "!suvm.tile_view<32x1xbf16>" not in src
+    assert "fake_partitioned_tile_view" not in src
 
 
 if __name__ == "__main__":

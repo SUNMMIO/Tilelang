@@ -128,7 +128,8 @@ def test_flashattn_gqa_fwd_bhsd_codegen_passes_loose_npuir_opt(tmp_path):
         expected_tokens=("suvm.copy_async", "suvm.tc.mma", "suvm.tile.reduce"),
         opt_args=("--verify-each",),
     )
-    assert_source_contains(src, ("suvm.tc.mma", "suvm.tile.reduce"))
+    assert_source_contains(src, ("suvm.tc.mma", "suvm.tile.reduce", "suvm.tile.range", "suvm.tile.cmpi", "suvm.tile.select"))
+    assert "fake_missing_binary" not in src
 
 
 if __name__ == "__main__":

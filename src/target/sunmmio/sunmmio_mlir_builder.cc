@@ -191,6 +191,12 @@ SunMMIOValue SuvmSunmmioBuilder::TileFill(const std::string &result_name,
   return tile_->TileFill(result_name, scalar, tile_type, dtype);
 }
 
+SunMMIOValue SuvmSunmmioBuilder::TileRange(const std::string &result_name,
+                                           const SunMMIOType &tile_type,
+                                           DataType dtype) {
+  return tile_->TileRange(result_name, tile_type, dtype);
+}
+
 SunMMIOValue SuvmSunmmioBuilder::TileUnsqueeze(const std::string &result_name,
                                                const SunMMIOValue &tile,
                                                const SunMMIOType &tile_type,

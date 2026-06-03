@@ -96,6 +96,9 @@ public:
                         const SunMMIOValue &scalar,
                         const SunMMIOType &tile_type, DataType dtype) final;
 
+  SunMMIOValue TileRange(const std::string &result_name,
+                         const SunMMIOType &tile_type, DataType dtype) final;
+
   SunMMIOValue TileUnsqueeze(const std::string &result_name,
                              const SunMMIOValue &tile,
                              const SunMMIOType &tile_type, int64_t axis,
