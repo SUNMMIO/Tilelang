@@ -804,6 +804,11 @@ struct TokenAnalyzer {
             st.MarkProduced(token_id);
             return;
           }
+          if (op_node->name == "tl.sunmmio_layout_transform") {
+            int64_t token_id = ParseTokenIdFromArgs(call->args);
+            st.MarkProduced(token_id);
+            return;
+          }
           if (op_node->name == "tl.mma_sunmmio") {
             int64_t token_id = ParseTokenIdFromArgs(call->args);
             st.MarkProduced(token_id);
@@ -1659,6 +1664,42 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
 
     operands.push_back(EmitRegionCall(op->args[0], src_offset_byte));
     operands.push_back(EmitRegionCall(op->args[1]));
+  } else if (callee == "tl.sunmmio_layout_transform") {
+    ICHECK_EQ(op->args.size(), 3)
+        << "tl.sunmmio_layout_transform expects src region, dst region, and "
+           "sync_token_id";
+    auto count_tiled_dims = [](const PrimExpr &region_expr) -> int {
+      BufferRegion region = tl::NormalizeToBufferRegion(region_expr);
+      int count = 0;
+      for (const Range &range : region->region) {
+        const auto *extent_imm = range->extent.as<IntImmNode>();
+        ICHECK(extent_imm)
+            << "tl.sunmmio_layout_transform region extent must be IntImm";
+        if (extent_imm->value != 1) {
+          ++count;
+        }
+      }
+      return count;
+    };
+
+    int src_tiled_dims = count_tiled_dims(op->args[0]);
+    int dst_tiled_dims = count_tiled_dims(op->args[1]);
+    ICHECK_EQ(src_tiled_dims, 2)
+        << "tl.sunmmio_layout_transform expects source region to have exactly "
+           "2 tiled dims, got "
+        << src_tiled_dims;
+    ICHECK_EQ(dst_tiled_dims, 2)
+        << "tl.sunmmio_layout_transform expects destination region to have "
+           "exactly 2 tiled dims, got "
+        << dst_tiled_dims;
+
+    operands.reserve(2);
+    operands.push_back(EmitRegionCall(op->args[0]));
+    operands.push_back(EmitRegionCall(op->args[1]));
+
+    ICHECK(TryConsumeSyncTokenId(op->args[2], &string_args))
+        << "tl.sunmmio_layout_transform expects third argument to be "
+           "tl.sync_token_id";
   } else if (callee == "tir.bitwise_and" || callee == "tir.bitwise_or" ||
              callee == "tir.bitwise_xor" || callee == "tir.shift_left" ||
              callee == "tir.shift_right") {

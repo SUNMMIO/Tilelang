@@ -39,6 +39,7 @@ int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
 bool IsSunmmioODMAOp(const CallNode *call) {
   return call && (call->op.same_as(Op::Get("tl.dma_copy")) ||
+                  call->op.same_as(Op::Get("tl.sunmmio_layout_transform")) ||
                   call->op.same_as(broadcast_()));
 }
 
@@ -57,6 +58,10 @@ int GetRegionNumElements(const PrimExpr &region_expr) {
 
 float GetODMADelay(const CallNode *call) {
   if (call->op.same_as(Op::Get("tl.dma_copy"))) {
+    int nums = GetRegionNumElements(call->args[0]);
+    return 50 + ceil_div(nums, 512);
+  }
+  if (call->op.same_as(Op::Get("tl.sunmmio_layout_transform"))) {
     int nums = GetRegionNumElements(call->args[0]);
     return 50 + ceil_div(nums, 512);
   }
