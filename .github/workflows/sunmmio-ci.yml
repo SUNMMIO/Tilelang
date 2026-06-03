@@ -338,6 +338,9 @@ jobs:
           exec 9>"${lock_file}"
           flock 9
           cmake -S . -B cmake-build --fresh ${CLANG_TIDY_CMAKE_OPTIONS} ${TILELANG_NPUIR_CMAKE_ARGS}
+          if [[ "${TILELANG_NPUIR_CMAKE_ARGS}" != *"-DUSE_NPUIR=OFF"* ]]; then
+            cmake --build cmake-build --target mlir-headers llvm-headers -j "$(nproc)"
+          fi
           flock -u 9
 
           CXX_FILES=$(find src -type f \( -iname "*.[ch]pp" -o -iname "*.cc" -o -iname "*.c" -o -iname "*.h" \))
