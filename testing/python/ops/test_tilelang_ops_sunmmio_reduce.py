@@ -23,6 +23,11 @@ def apply_sunmmio_passes(mod, target):
     return mod
 
 
+def assert_reduce_lowering_is_ssa(mod):
+    """Reduce lowering should be SSA-clean before LowerOpaqueBlock/ConvertSSA."""
+    assert tvm.tir.analysis.verify_ssa(mod["main"]), mod.script()
+
+
 @tvm.tir.functor.visitor
 class ReduceIRChecker(tvm.tir.PyStmtExprVisitor):
     def __init__(self, target_buffer_name="Out_shared"):
@@ -103,6 +108,27 @@ def reduce_kernel_with_blockwise_layout_builder(shape, reduce_axis, dtype="float
     return tvm.IRModule({"main": main})
 
 
+def multi_reduce_kernel_builder(shape=(32, 128, 128), reduce_axis=1, dtype="float16"):
+    out_shape = list(shape[:reduce_axis]) + list(shape[reduce_axis + 1 :])
+    if not out_shape:
+        out_shape = [1]
+
+    @T.prim_func
+    def main(A: T.Tensor(shape, dtype), Out0: T.Tensor(out_shape, dtype), Out1: T.Tensor(out_shape, dtype)):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            Out0_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+            Out1_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+
+            T.copy(A, A_shared)
+            T.reduce_sum(A_shared, Out0_shared, dim=reduce_axis)
+            T.reduce_sum(A_shared, Out1_shared, dim=reduce_axis)
+            T.copy(Out0_shared, Out0)
+            T.copy(Out1_shared, Out1)
+
+    return tvm.IRModule({"main": main})
+
+
 # (Shape, ReduceAxis, ExpectedInTileReduce)
 # For Sunmmio, all dimensions should be multiples of 32 for simplicity in these tests.
 REDUCE_TEST_CASES = [
@@ -131,6 +157,7 @@ def test_tilelang_reduce_sunmmio(shape, reduce_axis, expected_in_tile):
 
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
+    assert_reduce_lowering_is_ssa(mod)
 
     checker = ReduceIRChecker()
     checker.visit_stmt(mod["main"].body)
@@ -161,6 +188,7 @@ def test_tilelang_reduce_sunmmio_preserves_blockwise_kept_axis_tile():
 
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
+    assert_reduce_lowering_is_ssa(mod)
 
     checker = ReduceIRChecker()
     checker.visit_stmt(mod["main"].body)
@@ -173,6 +201,16 @@ def test_tilelang_reduce_sunmmio_preserves_blockwise_kept_axis_tile():
     assert checker.has_in_tile_reduce, "Expected vector_core_in_tile_reduce intrinsic but not found"
     assert tile_size == [4, 32], "Reduction should preserve the blockwise kept-axis tile instead of collapsing to [1, 32]"
     assert execution_domain_axes == [0, 1]
+
+
+def test_tilelang_reduce_sunmmio_multiple_reduces_are_ssa_clean():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    mod = multi_reduce_kernel_builder()
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    assert_reduce_lowering_is_ssa(mod)
 
 
 if __name__ == "__main__":
