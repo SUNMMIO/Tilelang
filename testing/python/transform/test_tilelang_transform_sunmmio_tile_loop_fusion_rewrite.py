@@ -541,10 +541,22 @@ def _expect_loop_body_seq(scope_loop):
     return _as_seq(body)
 
 
-def _expect_reduce_block(stmt):
-    assert isinstance(stmt, tvm.tir.Block)
-    assert stmt.name_hint == "reduce_tile_op"
+def _unwrap_block_realize(stmt):
+    if isinstance(stmt, tvm.tir.BlockRealize):
+        return stmt.block
     return stmt
+
+
+def _is_reduce_block(stmt):
+    block = _unwrap_block_realize(stmt)
+    return isinstance(block, tvm.tir.Block) and block.name_hint == "reduce_tile_op"
+
+
+def _expect_reduce_block(stmt):
+    block = _unwrap_block_realize(stmt)
+    assert isinstance(block, tvm.tir.Block)
+    assert block.name_hint == "reduce_tile_op"
+    return block
 
 
 def _collect_buffer_accesses(stmt):
@@ -588,6 +600,8 @@ def _semantic_leaf_tag(stmt):
         return _semantic_leaf_tag(stmt.body)
     if isinstance(stmt, tvm.tir.AttrStmt):
         return _semantic_leaf_tag(stmt.body)
+    if isinstance(stmt, tvm.tir.BlockRealize):
+        return _semantic_leaf_tag(stmt.block)
     if isinstance(stmt, tvm.tir.Block):
         assert stmt.name_hint == "reduce_tile_op"
         allocs = {buf.name for buf in stmt.alloc_buffers}
@@ -807,15 +821,18 @@ def test_sunmmio_tile_loop_fusion_rewrite_preserves_flash_reduction_local_scratc
 
     top_level_reduce_block = _expect_single_match(
         stmts,
-        lambda stmt: isinstance(stmt, tvm.tir.Block) and stmt.name_hint == "reduce_tile_op",
+        _is_reduce_block,
         "top-level flash reduce_max block",
     )
+    assert isinstance(top_level_reduce_block, tvm.tir.BlockRealize)
+    top_level_reduce_block = _expect_reduce_block(top_level_reduce_block)
 
     fused_tile = _expect_single_match(
         _find_scope_entry_loops(stmts, tile_size=[4, 32], extent=8),
         lambda loop: _semantic_tags(_expect_loop_body_seq(loop)) == ["acc_s", "acc_s_cast", "reduce_scores_sum"],
         "flash fused tile shell with local reduce_scores_sum block",
     )
+    assert isinstance(_expect_loop_body_seq(fused_tile)[2], tvm.tir.BlockRealize)
     fused_reduce = _expect_reduce_block(_expect_loop_body_seq(fused_tile)[2])
     fused_reduce_body = _as_seq(fused_reduce.body)
 
