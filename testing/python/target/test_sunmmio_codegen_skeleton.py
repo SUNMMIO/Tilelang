@@ -4,9 +4,11 @@ import os
 import pytest
 import tilelang.testing
 import tilelang.language as T
+from tilelang.layout import make_zz_layout
 from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 
+# os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 PRINT = True
 
 
@@ -95,9 +97,11 @@ def make_intrinsic_sync_kernel():
     a_data = tvm.tir.Var("a_data", tvm.ir.PointerType(f16, "shared.asram"))
     b_data = tvm.tir.Var("b_data", tvm.ir.PointerType(f16, "shared.wsram"))
     c_data = tvm.tir.Var("c_data", tvm.ir.PointerType(f16, "shared.rsram"))
+    d_data = tvm.tir.Var("d_data", tvm.ir.PointerType(f16, "shared.rsram"))
     a_buf = tvm.tir.decl_buffer((32, 32), "float16", name="A", data=a_data, scope="shared.asram")
     b_buf = tvm.tir.decl_buffer((32, 32), "float16", name="B", data=b_data, scope="shared.wsram")
     c_buf = tvm.tir.decl_buffer((32, 32), "float16", name="C", data=c_data, scope="shared.rsram")
+    d_buf = tvm.tir.decl_buffer((32, 32), "float16", name="D", data=d_data, scope="shared.rsram")
 
     def region(buf, access):
         return tvm.tir.call_intrin(
@@ -138,6 +142,11 @@ def make_intrinsic_sync_kernel():
             sync_token(1),
         ],
     )
+    transform = tvm.tir.Call(
+        "handle",
+        tvm.ir.Op.get("tl.sunmmio_layout_transform"),
+        [region(c_buf, 1), region(d_buf, 2), sync_token(2)],
+    )
     sync = tvm.tir.Call(
         "handle",
         tvm.ir.Op.get("tir.tvm_storage_sync"),
@@ -152,6 +161,7 @@ def make_intrinsic_sync_kernel():
             tvm.tir.Evaluate(dma),
             tvm.tir.Evaluate(sync),
             tvm.tir.Evaluate(mma),
+            tvm.tir.Evaluate(transform),
             tvm.tir.Evaluate(ramp),
             tvm.tir.Evaluate(bcast),
         ]
@@ -159,8 +169,54 @@ def make_intrinsic_sync_kernel():
     pred = tvm.tir.LT(i, tvm.tir.IntImm("int32", 2))
     if_stmt = tvm.tir.IfThenElse(pred, loop_body, tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0)))
     stmt = tvm.tir.For(i, 0, 4, tvm.tir.ForKind.SERIAL, if_stmt)
-    stmt = tvm.tir.DeclBuffer(a_buf, tvm.tir.DeclBuffer(b_buf, tvm.tir.DeclBuffer(c_buf, stmt)))
-    return _to_device_kernel_func(tvm.tir.PrimFunc([a_data, b_data, c_data], stmt))
+    stmt = tvm.tir.DeclBuffer(
+        a_buf,
+        tvm.tir.DeclBuffer(
+            b_buf,
+            tvm.tir.DeclBuffer(c_buf, tvm.tir.DeclBuffer(d_buf, stmt)),
+        ),
+    )
+    return _to_device_kernel_func(tvm.tir.PrimFunc([a_data, b_data, c_data, d_data], stmt)).with_attr(
+        "layout_map",
+        {c_buf: make_zz_layout(c_buf, axes=[0, 1], block_shape=(32, 32))},
+    )
+
+
+def make_layout_transform_kernel():
+    f16 = tvm.ir.PrimType("float16")
+    src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(f16, "shared.rsram"))
+    dst_data = tvm.tir.Var("dst_data", tvm.ir.PointerType(f16, "shared.rsram"))
+    src_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Src", data=src_data, scope="shared.rsram")
+    dst_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Dst", data=dst_data, scope="shared.rsram")
+
+    def region(buf, access):
+        return tvm.tir.call_intrin(
+            "handle",
+            tvm.ir.Op.get("tl.tileop.region"),
+            tvm.tir.BufferLoad(
+                buf,
+                [tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 0)],
+            ),
+            tvm.tir.IntImm("int32", access),
+            tvm.tir.IntImm("int32", 32),
+            tvm.tir.IntImm("int32", 32),
+        )
+
+    sync_token = tvm.tir.call_intrin(
+        "handle",
+        tvm.ir.Op.get("tl.sync_token_id"),
+        tvm.tir.IntImm("int32", 0),
+    )
+    transform = tvm.tir.Call(
+        "handle",
+        tvm.ir.Op.get("tl.sunmmio_layout_transform"),
+        [region(src_buf, 1), region(dst_buf, 2), sync_token],
+    )
+    stmt = tvm.tir.DeclBuffer(src_buf, tvm.tir.DeclBuffer(dst_buf, tvm.tir.Evaluate(transform)))
+    return _to_device_kernel_func(tvm.tir.PrimFunc([src_data, dst_data], stmt)).with_attr(
+        "layout_map",
+        {src_buf: make_zz_layout(src_buf, axes=[0, 1], block_shape=(32, 32))},
+    )
 
 
 def make_dynamic_broadcast_mask_kernel():
@@ -379,6 +435,12 @@ def test_sunmmio_codegen_lowers_dynamic_broadcast_mask():
     assert "arith.shli" in src
     assert "arith.ori" in src
     assert "suvm.mcast_tok" in src
+    assert "sunmmio.fake" not in src
+
+
+def test_sunmmio_codegen_lowers_layout_transform():
+    src = build_sunmmio_source_without_compile(make_layout_transform_kernel())
+    assert "suvm.transform_layout_async" in src
     assert "sunmmio.fake" not in src
 
 

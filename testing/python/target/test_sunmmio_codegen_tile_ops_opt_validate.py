@@ -13,6 +13,7 @@ from sunmmio_codegen_validation_utils import (
 
 tilelang.env.disable_cache()
 os.environ["SUNMMIO_TEST_PRINT"] = "0"
+# os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 LOOSE_OPT_ARGS = ("--verify-each",)
 

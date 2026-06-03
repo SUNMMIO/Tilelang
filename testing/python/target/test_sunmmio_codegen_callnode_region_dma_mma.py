@@ -5,6 +5,7 @@ from tilelang.utils.target import SUNMMIO_TARGET_DESC
 
 from compile_pipeline import compile_test
 
+# os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 tilelang.env.disable_cache()
 
 
