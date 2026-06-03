@@ -713,8 +713,9 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
     alloc_buffers.push_back(dst_res.value());
   }
 
-  body = Block({}, {}, {}, "reduce_tile_op", body, std::nullopt, alloc_buffers,
-               {}, {});
+  body = BlockRealize({}, Bool(true),
+                      Block({}, {}, {}, "reduce_tile_op", body, std::nullopt,
+                            alloc_buffers, {}, {}));
 
   return body;
 }

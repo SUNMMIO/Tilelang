@@ -78,6 +78,21 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
   bool src_has = T.layout_map.count(src);
   bool dst_has = T.layout_map.count(dst);
 
+  // ZN WSRAM dst: its src is staged as ZZ (the transfer does ZZ->ZN), so infer
+  // ZZ for src. dst is already determined (ZN from GEMM); propose nothing for
+  // it.
+  if (dst_has && dst.scope() == kSunmmioScopeWSRAM &&
+      !sunmmio::IsZZLike(T.layout_map[dst])) {
+    int rank = static_cast<int>(src->shape.size());
+    if (IsSunmmioSramScope(src.scope()) && rank >= 2) {
+      Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
+      result.Set(src, sunmmio::MakeZZ(
+                          src->shape, axes,
+                          GetSunmmioLayoutBlockShape(T.target, src->dtype)));
+    }
+    return result;
+  }
+
   // Propagate: derive layout for each side from the other.
   if (src_has) {
     auto derived = DeriveLayoutLike(T.layout_map[src], dst->shape);
