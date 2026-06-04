@@ -8,6 +8,7 @@ from tilelang._typing import BufferLikeType
 from tilelang.utils.language import (
     to_buffer_region,
     prim_expr_equal,
+    legalize_pairwise_extents,
 )
 from tilelang.language.utils import get_extent
 from tilelang.utils.target import target_is_sunmmio
@@ -346,8 +347,12 @@ def copy(
         src = _encode_normalized_region(src_region, access_type="r")
         dst = _encode_normalized_region(dst_region, access_type="w")
     else:
-        src = to_buffer_region(src, access_type="r", extents=dst_extent)
-        dst = to_buffer_region(dst, access_type="w", extents=src_extent)
+        assert src_extent or dst_extent, "Can't deduce copy extents from args"
+        src_extent = list(src_extent) if src_extent else [1] * len(dst_extent)
+        dst_extent = list(dst_extent) if dst_extent else [1] * len(src_extent)
+        src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
+        src = to_buffer_region(src, access_type="r", extents=src_extent)
+        dst = to_buffer_region(dst, access_type="w", extents=dst_extent)
 
     # Build annotations dict
     ann = annotations.copy() if annotations else {}
