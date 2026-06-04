@@ -1824,8 +1824,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         return emit_binary(BinaryOp::kMod, call->args[0], call->args[1],
                            call->dtype);
       }
-      if (op_node && call->args.size() >= 1 &&
-          op_node->name == "tl.ieee_frcp") {
+      if (op_node && !call->args.empty() && op_node->name == "tl.ieee_frcp") {
         return emit_unary(TileUnaryOp::kRecip, call->args[0], call->dtype);
       }
       if (op_node && call->args.size() == 1 &&
