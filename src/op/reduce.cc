@@ -315,13 +315,13 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   }
 
   // Create outer loop variables for each dimension of the source tensor.
-  // Tiled dimensions will have extents = region_extent / tile_size.
+  // Tiled dimensions use ceildiv so tail tiles remain in the loop nest.
   Array<IterVar> loop_vars;
   loop_vars.reserve(src_ndim);
   for (int i = 0; i < src_ndim; i++) {
     PrimExpr extent = source_domain[i];
     if (src_dim_to_tile_size.count(i)) {
-      extent = truncdiv(extent, src_dim_to_tile_size[i]);
+      extent = analyzer->Simplify(ceildiv(extent, src_dim_to_tile_size[i]));
     }
     Var var("i" + std::to_string(i), extent->dtype);
     loop_vars.push_back({Range(0, extent), var, IterVarType::kDataPar});
@@ -500,17 +500,61 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   // correct Tile semantics.
 
   // Step 1: Accumulate (Tile-to-Tile accumulation using element-wise
-  // operations)
-  Array<Var> accumulate_vars = make_interior_vars(src_tile_shape.size());
-  Array<PrimExpr> accumulate_src_idx = get_src_indices(accumulate_vars);
-  Array<PrimExpr> accumulate_acc_idx = get_acc_indices(accumulate_vars);
-  Stmt accumulate_stmt =
-      BufferStore(acc,
-                  this->MakeReduce(BufferLoad(acc, accumulate_acc_idx),
-                                   BufferLoad(this->src, accumulate_src_idx)),
-                  accumulate_acc_idx);
-  accumulate_stmt = wrap_interior(accumulate_stmt, accumulate_vars,
-                                  src_tile_shape, all_src_axes);
+  // operations). If the reduced tiled dimension has a tail tile, invalid lanes
+  // must be masked on the source load before the in-tile reduce runs.
+  auto make_reduce_axis_tail_predicate = [&](const Array<Var> &interior_vars) {
+    ICHECK(is_dim_tiled);
+    ICHECK_GE(reduce_tile_axis, 0);
+    PrimExpr tile_extent = src_tile_shape[reduce_tile_axis];
+    PrimExpr logical_index = loop_vars[this->dim]->var * tile_extent +
+                             interior_vars[reduce_tile_axis];
+    return logical_index < source_domain[this->dim];
+  };
+
+  auto make_accumulate_stmt = [&](bool use_tail_predicate) {
+    Array<Var> accumulate_vars = make_interior_vars(src_tile_shape.size());
+    Array<PrimExpr> accumulate_src_idx = get_src_indices(accumulate_vars);
+    Array<PrimExpr> accumulate_acc_idx = get_acc_indices(accumulate_vars);
+
+    PrimExpr src_value;
+    if (use_tail_predicate) {
+      PrimExpr predicate = make_reduce_axis_tail_predicate(accumulate_vars);
+      src_value = BufferLoad(this->src, accumulate_src_idx,
+                             Optional<PrimExpr>(predicate));
+    } else {
+      src_value = BufferLoad(this->src, accumulate_src_idx);
+    }
+
+    Stmt stmt = BufferStore(
+        acc, this->MakeReduce(BufferLoad(acc, accumulate_acc_idx), src_value),
+        accumulate_acc_idx);
+    return wrap_interior(stmt, accumulate_vars, src_tile_shape, all_src_axes);
+  };
+
+  Stmt accumulate_stmt = make_accumulate_stmt(/*use_tail_predicate=*/false);
+  if (is_dim_tiled) {
+    PrimExpr reduce_tile_extent = src_tile_shape[reduce_tile_axis];
+    PrimExpr reduce_extent_remainder = analyzer->Simplify(
+        floormod(source_domain[this->dim], reduce_tile_extent));
+    PrimExpr zero_remainder = make_zero(reduce_extent_remainder.dtype());
+    bool has_reduce_axis_tail =
+        !analyzer->CanProve(reduce_extent_remainder == zero_remainder);
+    if (has_reduce_axis_tail) {
+      PrimExpr full_reduce_tile = analyzer->Simplify(
+          loop_vars[this->dim]->var * reduce_tile_extent + reduce_tile_extent <=
+          source_domain[this->dim]);
+      Stmt tail_accumulate_stmt =
+          make_accumulate_stmt(/*use_tail_predicate=*/true);
+      if (analyzer->CanProve(full_reduce_tile)) {
+        // Keep the aligned fast path.
+      } else if (analyzer->CanProve(!full_reduce_tile)) {
+        accumulate_stmt = tail_accumulate_stmt;
+      } else {
+        accumulate_stmt =
+            IfThenElse(full_reduce_tile, accumulate_stmt, tail_accumulate_stmt);
+      }
+    }
+  }
 
   // Step 2: Init (Guarded: only run on the first step of the reduction loop)
   Array<Var> init_vars = make_interior_vars(src_tile_shape.size());

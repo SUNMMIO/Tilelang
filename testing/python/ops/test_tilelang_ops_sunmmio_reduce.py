@@ -2,6 +2,7 @@ import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
 from tilelang.layout import make_zz_layout
+from tilelang.tileview import make_tileview
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 import pytest
 
@@ -108,6 +109,32 @@ def reduce_kernel_with_blockwise_layout_builder(shape, reduce_axis, dtype="float
     return tvm.IRModule({"main": main})
 
 
+def reduce_kernel_with_tileview_builder(shape, reduce_axis, tile_size=(8, 32), dtype="float16", clear=True, reduce_op="sum"):
+    out_shape = list(shape[:reduce_axis]) + list(shape[reduce_axis + 1 :])
+    if not out_shape:
+        out_shape = [1]
+
+    @T.prim_func
+    def main(A: T.Tensor(shape, dtype), Out: T.Tensor(out_shape, dtype)):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+
+            T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, (-2, -1))})
+            T.copy(A, A_shared)
+            if reduce_op == "sum":
+                T.reduce_sum(A_shared, Out_shared, dim=reduce_axis, clear=clear)
+            elif reduce_op == "max":
+                T.reduce_max(A_shared, Out_shared, dim=reduce_axis, clear=clear)
+            elif reduce_op == "min":
+                T.reduce_min(A_shared, Out_shared, dim=reduce_axis, clear=clear)
+            else:
+                raise ValueError(f"Unsupported reduce_op={reduce_op}")
+            T.copy(Out_shared, Out)
+
+    return tvm.IRModule({"main": main})
+
+
 def multi_reduce_kernel_builder(shape=(32, 128, 128), reduce_axis=1, dtype="float16"):
     out_shape = list(shape[:reduce_axis]) + list(shape[reduce_axis + 1 :])
     if not out_shape:
@@ -127,6 +154,42 @@ def multi_reduce_kernel_builder(shape=(32, 128, 128), reduce_axis=1, dtype="floa
             T.copy(Out1_shared, Out1)
 
     return tvm.IRModule({"main": main})
+
+
+def _collect_buffer_loads(func, buffer_name):
+    loads = []
+
+    def visitor(node):
+        if isinstance(node, tvm.tir.BufferLoad) and node.buffer.name == buffer_name:
+            loads.append(node)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visitor)
+    return loads
+
+
+def _collect_buffer_stores(func, buffer_name):
+    stores = []
+
+    def visitor(node):
+        if isinstance(node, tvm.tir.BufferStore) and node.buffer.name == buffer_name:
+            stores.append(node)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visitor)
+    return stores
+
+
+def _collect_tile_loop_extents(func):
+    extents = []
+
+    @tvm.tir.functor.visitor
+    class TileLoopVisitor(tvm.tir.PyStmtExprVisitor):
+        def visit_for_(self, op):
+            if op.annotations and "tile.domain" in op.annotations or op.annotations and "tile.execution_axis" in op.annotations:
+                extents.append(int(op.extent))
+            super().visit_for_(op)
+
+    TileLoopVisitor().visit_stmt(func.body)
+    return extents
 
 
 # (Shape, ReduceAxis, ExpectedInTileReduce)
@@ -211,6 +274,72 @@ def test_tilelang_reduce_sunmmio_multiple_reduces_are_ssa_clean():
         mod = apply_sunmmio_passes(mod, target)
 
     assert_reduce_lowering_is_ssa(mod)
+
+
+def test_tilelang_reduce_sunmmio_tiled_axis_tail_load_is_predicated():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    mod = reduce_kernel_with_tileview_builder((8, 63, 250), reduce_axis=2)
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+    assert_reduce_lowering_is_ssa(mod)
+
+    func = mod["main"]
+    tile_loop_extents = _collect_tile_loop_extents(func)
+    assert tile_loop_extents.count(8) >= 3, "Expected ceildiv tile extents for dimensions 8, 63, and 250"
+    assert 7 not in tile_loop_extents, "truncdiv(63, 8) would drop the spatial tail tile"
+
+    a_load_predicates = [load.predicate for load in _collect_buffer_loads(func, "A_shared") if load.predicate is not None]
+    assert a_load_predicates, "Expected predicated source loads for reduce-axis tail tile"
+    assert any("< 250" in str(predicate) or "<250" in str(predicate) for predicate in a_load_predicates)
+    assert all("< 63" not in str(predicate) and "<63" not in str(predicate) for predicate in a_load_predicates)
+
+    out_store_predicates = [store.predicate for store in _collect_buffer_stores(func, "Out_shared") if store.predicate is not None]
+    assert not out_store_predicates, "Reduce final write-back should remain unpredicated"
+
+
+@pytest.mark.parametrize(
+    "reduce_op",
+    [
+        "max",
+        "min",
+    ],
+)
+def test_tilelang_reduce_sunmmio_tiled_axis_tail_uses_predicated_update(reduce_op):
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    mod = reduce_kernel_with_tileview_builder((8, 63, 250), reduce_axis=2, reduce_op=reduce_op)
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+    assert_reduce_lowering_is_ssa(mod)
+
+    script = mod.script()
+    assert "if_then_else" not in script
+    a_load_predicates = [load.predicate for load in _collect_buffer_loads(mod["main"], "A_shared") if load.predicate is not None]
+    acc_store_predicates = [
+        store.predicate for store in _collect_buffer_stores(mod["main"], "Out_shared_acc") if store.predicate is not None
+    ]
+    assert a_load_predicates
+    assert not acc_store_predicates
+    assert any("< 250" in str(predicate) or "<250" in str(predicate) for predicate in a_load_predicates)
+
+
+def test_tilelang_reduce_sunmmio_non_tiled_axis_tail_has_no_reduce_predicate():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    mod = reduce_kernel_with_tileview_builder((8, 63, 250), reduce_axis=0)
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+    assert_reduce_lowering_is_ssa(mod)
+
+    checker = ReduceIRChecker()
+    checker.visit_stmt(mod["main"].body)
+    assert not checker.has_in_tile_reduce
+
+    a_load_predicates = [load.predicate for load in _collect_buffer_loads(mod["main"], "A_shared") if load.predicate is not None]
+    out_store_predicates = [store.predicate for store in _collect_buffer_stores(mod["main"], "Out_shared") if store.predicate is not None]
+    assert not a_load_predicates
+    assert not out_store_predicates
 
 
 if __name__ == "__main__":
