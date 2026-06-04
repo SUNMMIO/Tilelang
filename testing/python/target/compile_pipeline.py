@@ -1,3 +1,4 @@
+from functools import wraps
 import os
 import re
 import warnings
@@ -15,6 +16,18 @@ from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma
 from tilelang.utils.target import target_is_sunmmio
 from tilelang.jit.adapter.utils import is_cuda_target
+
+
+def target(target_name):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with tvm.target.Target(determine_target(target_name, return_object=True)):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:

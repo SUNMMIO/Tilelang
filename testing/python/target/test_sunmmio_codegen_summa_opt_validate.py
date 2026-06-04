@@ -6,6 +6,7 @@ import tilelang.testing
 from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
+from compile_pipeline import target
 from sunmmio_codegen_validation_utils import (
     assert_source_contains,
     validate_sunmmio_codegen_with_npuir_opt,
@@ -19,6 +20,7 @@ os.environ["SUNMMIO_TEST_PRINT"] = "0"
 LOOSE_OPT_ARGS = ("--verify-each",)
 
 
+@target("Sunmmio")
 def summa_matmul(
     M=128,
     N=128,

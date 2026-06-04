@@ -6,7 +6,7 @@ from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 import tilelang.testing
 
-from compile_pipeline import compile_test
+from compile_pipeline import compile_test, target
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 
 
@@ -64,6 +64,7 @@ def assert_contains_all(src: str, tokens):
     assert not missing, f"missing expected tokens: {missing}\n{src}"
 
 
+@target("Sunmmio")
 def allocate_dma_copy_kernel(
     M=512,
     N=512,
@@ -101,6 +102,7 @@ def allocate_dma_copy_kernel(
     return main
 
 
+@target("Sunmmio")
 def offset_region_copy_kernel(
     M=512,
     N=512,

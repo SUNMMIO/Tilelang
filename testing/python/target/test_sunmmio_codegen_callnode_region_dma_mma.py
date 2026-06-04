@@ -3,12 +3,13 @@ import tilelang.language as T
 from tilelang import tvm as tvm
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 
-from compile_pipeline import compile_test
+from compile_pipeline import compile_test, target
 
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 tilelang.env.disable_cache()
 
 
+@target("Sunmmio")
 def gemm_matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float16):
     @T.prim_func
     def main(

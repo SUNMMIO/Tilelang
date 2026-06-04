@@ -1,6 +1,7 @@
 import inspect
 import os
 import subprocess
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -225,6 +226,46 @@ def validate_suvm_mlir_with_npuir_opt(
     return result
 
 
+def simplify_suvm_mlir(
+    src: str,
+    *,
+    opt_args: Sequence[str] = ("--verify-each", "--canonicalize", "--cse"),
+    print_output: bool | None = None,
+) -> str:
+    npuir_opt = find_npuir_opt()
+    with tempfile.NamedTemporaryFile("w", suffix=".mlir", encoding="utf-8", delete=False) as f:
+        f.write(src)
+        mlir_path = Path(f.name)
+
+    try:
+        command = [str(npuir_opt), str(mlir_path), *opt_args]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if _print_enabled(print_output):
+            print("===================== npuir-opt simplify command =====================")
+            print(" ".join(command))
+            print("===================== npuir-opt simplified stdout =====================")
+            print(result.stdout)
+            print("===================== npuir-opt simplify stderr =====================")
+            print(result.stderr)
+
+        assert result.returncode == 0, (
+            "npuir-opt failed while simplifying SUVM MLIR\n"
+            f"command: {' '.join(command)}\n"
+            f"mlir: {mlir_path}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+        return result.stdout
+    finally:
+        mlir_path.unlink(missing_ok=True)
+
+
 def validate_sunmmio_codegen_with_npuir_opt(
     kernel,
     tmp_path: Path,
@@ -234,6 +275,9 @@ def validate_sunmmio_codegen_with_npuir_opt(
     opt_args: Sequence[str] = ("-suvm-device-validate",),
     print_ir: bool | None = None,
     print_opt: bool | None = None,
+    simplify_mlir: bool = True,
+    simplify_opt_args: Sequence[str] = ("--verify-each", "--canonicalize", "--cse"),
+    print_simplify: bool | None = None,
     log_ir: bool | None = None,
     log_dir: Path | str | None = None,
     log_subdir: str | None = None,
@@ -272,6 +316,21 @@ def validate_sunmmio_codegen_with_npuir_opt(
             log_dir=log_dir,
             log_subdir=log_subdir,
         )
+    if simplify_mlir:
+        src = simplify_suvm_mlir(
+            src,
+            opt_args=simplify_opt_args,
+            print_output=print_simplify,
+        )
+        if log_enabled:
+            simplified_filename = f"{Path(mlir_filename).stem}.simplified.mlir"
+            write_sunmmio_codegen_logs(
+                case_name=simplified_filename,
+                mlir_src=src,
+                log_ir=True,
+                log_dir=log_dir,
+                log_subdir=log_subdir,
+            )
     validate_suvm_mlir_with_npuir_opt(
         src,
         tmp_path,

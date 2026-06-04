@@ -4,6 +4,7 @@ import tilelang.testing
 from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 
+from compile_pipeline import target
 from sunmmio_codegen_validation_utils import (
     assert_source_contains,
     validate_suvm_mlir_with_npuir_opt,
@@ -113,6 +114,7 @@ def _with_decl_buffers(stmt, buffers):
     return stmt
 
 
+@target("Sunmmio")
 def _broadcast_stmt(*, direction=0, mask=None, src_core=None, token_id=None, wait=False):
     src_data, dst_data, src_buf, dst_buf = _shared_buffers()
     stmts = [tvm.tir.Evaluate(_broadcast(src_buf, dst_buf, direction=direction, mask=mask, src_core=src_core, token_id=token_id))]

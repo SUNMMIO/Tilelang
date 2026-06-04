@@ -1,6 +1,8 @@
 from tilelang import tvm
 from tilelang.utils.target import determine_target
 
+from compile_pipeline import target
+
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 
@@ -16,6 +18,7 @@ def _build_sunmmio_source_from_stmt(stmt):
     return builder(mod, target, "suvm").inspect_source()
 
 
+@target("Sunmmio")
 def _make_nonzero_offset_aligned_store_stmt():
     bf16 = tvm.ir.PrimType("bfloat16")
     one = tvm.tir.IntImm("bool", 1)

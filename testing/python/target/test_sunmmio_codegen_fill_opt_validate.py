@@ -5,6 +5,7 @@ import tilelang.language as T
 import tilelang.testing
 from tilelang.carver.arch import driver
 
+from compile_pipeline import target
 from sunmmio_codegen_validation_utils import validate_sunmmio_codegen_with_npuir_opt
 
 
@@ -25,6 +26,7 @@ def validate_sunmmio_codegen_loose(kernel, tmp_path, *, mlir_filename, expected_
     )
 
 
+@target("Sunmmio")
 def fill_tiled_test(
     b=64,
     m=512,
@@ -65,6 +67,7 @@ def fill_tiled_test(
     return main
 
 
+@target("Sunmmio")
 def fill_tiled_2d_test(
     m=512,
     n=1024,
