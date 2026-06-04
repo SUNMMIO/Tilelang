@@ -10,7 +10,9 @@ from tilelang.utils.language import (
     prim_expr_equal,
 )
 from tilelang.language.utils import get_extent
+from tilelang.utils.target import target_is_sunmmio
 from tvm import tir
+from tvm.target import Target
 
 
 _OperandKind = Literal["buffer", "region", "load"]
@@ -67,6 +69,14 @@ def _expr_is_one(expr: tir.PrimExpr) -> bool:
     return prim_expr_equal(expr, 1)
 
 
+def _expr_is_squeezable_one(expr: tir.PrimExpr) -> bool:
+    if _expr_is_one(expr):
+        return True
+    if isinstance(expr, tir.Min):
+        return _expr_is_one(expr.a) or _expr_is_one(expr.b)
+    return False
+
+
 def _expr_equal(lhs: tir.PrimExpr, rhs: tir.PrimExpr) -> bool:
     return prim_expr_equal(lhs, rhs)
 
@@ -76,7 +86,7 @@ def _expr_gt(lhs: tir.PrimExpr, rhs: tir.PrimExpr) -> bool:
     rhs_int = _as_static_int(rhs)
     return lhs_int is not None and rhs_int is not None and lhs_int > rhs_int
 
-
+# 显式 BufferRegion 越界时触发 warning
 def _warn_explicit_oob(buffer: tir.Buffer, dim: int, min_value: tir.PrimExpr, extent: tir.PrimExpr, shape: tir.PrimExpr) -> None:
     warnings.warn(
         "T.copy explicit BufferRegion exceeds buffer shape and will be clipped: "
@@ -84,7 +94,7 @@ def _warn_explicit_oob(buffer: tir.Buffer, dim: int, min_value: tir.PrimExpr, ex
         stacklevel=3,
     )
 
-
+# 实现range的缩放
 def _clip_extent_to_shape(
     buffer: tir.Buffer,
     dim: int,
@@ -118,7 +128,7 @@ def _clip_extent_to_shape(
 def _int_one() -> tir.IntImm:
     return tir.IntImm("int32", 1)
 
-
+# BufferLoad 根据另一侧 extents 推断自己的 extents。
 def _infer_load_extents_from_peer(load: _CopyRegionSpec, peer_extents: list[tir.PrimExpr]) -> list[tir.PrimExpr]:
     rank = len(load.mins)
     extents = list(peer_extents)
@@ -150,6 +160,20 @@ def _clip_region_to_shape(spec: _CopyRegionSpec, mins: list[tir.PrimExpr], exten
 def _normalize_copy_regions(src: _CopyRegionSpec, dst: _CopyRegionSpec) -> tuple[_NormalizedCopyRegion, _NormalizedCopyRegion]:
     if src.kind == "load" and dst.kind == "load":
         raise AssertionError("BufferLoad-to-BufferLoad copy should be handled by the scalar BufferStore fast path")
+
+    if src.kind == "load" and dst.kind == "region":
+        assert dst.extents is not None
+        dst_region = _clip_region_to_shape(dst, dst.mins, list(dst.extents))
+        src_extents = _infer_load_extents_from_peer(src, dst_region.extents)
+        src_region = _clip_region_to_shape(src, src.mins, src_extents)
+        return src_region, dst_region
+
+    if src.kind == "region" and dst.kind == "load":
+        assert src.extents is not None
+        src_region = _clip_region_to_shape(src, src.mins, list(src.extents))
+        dst_extents = _infer_load_extents_from_peer(dst, src_region.extents)
+        dst_region = _clip_region_to_shape(dst, dst.mins, dst_extents)
+        return src_region, dst_region
 
     src_extents = src.extents
     dst_extents = dst.extents
@@ -201,13 +225,27 @@ def _suffix_axis_map(src: _NormalizedCopyRegion, dst: _NormalizedCopyRegion) -> 
     return [(i, i) for i in range(matched_rank)]
 
 
+def _squeezed_axis_map(src: _NormalizedCopyRegion, dst: _NormalizedCopyRegion) -> list[tuple[int, int]]:
+    src_axes = [(dim, extent) for dim, extent in enumerate(src.extents) if not _expr_is_squeezable_one(extent)]
+    dst_axes = [(dim, extent) for dim, extent in enumerate(dst.extents) if not _expr_is_squeezable_one(extent)]
+
+    if len(src_axes) != len(dst_axes):
+        raise ValueError(
+            "T.copy rank mismatch: mixed-region copy requires the same number of "
+            "non-1 extents after squeezing unit dimensions; "
+            f"src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
+        )
+
+    return [(src_dim, dst_dim) for (src_dim, _), (dst_dim, _) in zip(src_axes, dst_axes)]
+
+
 def _validate_and_adjust_copy_regions(
     src: _NormalizedCopyRegion,
     dst: _NormalizedCopyRegion,
     *,
     require_exact_match: bool,
 ) -> tuple[_NormalizedCopyRegion, _NormalizedCopyRegion]:
-    axis_map = _suffix_axis_map(src, dst)
+    axis_map = _suffix_axis_map(src, dst) if require_exact_match else _squeezed_axis_map(src, dst)
     dst_extents = list(dst.extents)
 
     for src_dim, dst_dim in axis_map:
@@ -292,16 +330,24 @@ def copy(
         # In this case, lower it to a simple BufferStore: buffer_b[i] = buffer_a[i]
         return tir.BufferStore(dst.buffer, src, dst.indices)
 
-    src_spec = _extract_copy_region_spec(src)
-    dst_spec = _extract_copy_region_spec(dst)
-    src_region, dst_region = _normalize_copy_regions(src_spec, dst_spec)
-    src_region, dst_region = _validate_and_adjust_copy_regions(
-        src_region,
-        dst_region,
-        require_exact_match=src_spec.kind == "buffer" and dst_spec.kind == "buffer",
-    )
-    src = _encode_normalized_region(src_region, access_type="r")
-    dst = _encode_normalized_region(dst_region, access_type="w")
+    target = Target.current(allow_none=True)
+    if target and target_is_sunmmio(target):
+        # get original info. e.g. T.copy(A, C) -> src_spec = {kind: "buffer", buffer = A, mins = [0,0,0], extents = A.shape, explicit_extents = False}
+        src_spec = _extract_copy_region_spec(src)
+        dst_spec = _extract_copy_region_spec(dst)
+        # transfer spec into normalized region: buffer + mins + extents
+        src_region, dst_region = _normalize_copy_regions(src_spec, dst_spec)
+        # check rank and extents
+        src_region, dst_region = _validate_and_adjust_copy_regions(
+            src_region,
+            dst_region,
+            require_exact_match=src_spec.kind == "buffer" and dst_spec.kind == "buffer",
+        )
+        src = _encode_normalized_region(src_region, access_type="r")
+        dst = _encode_normalized_region(dst_region, access_type="w")
+    else:
+        src = to_buffer_region(src, access_type="r", extents=dst_extent)
+        dst = to_buffer_region(dst, access_type="w", extents=src_extent)
 
     # Build annotations dict
     ann = annotations.copy() if annotations else {}
