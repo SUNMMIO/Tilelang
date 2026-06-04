@@ -277,6 +277,9 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.SunmmioLayoutInference()(mod)
     pass_output_process(mod, "SunmmioLayoutInference", test_config)
 
+    mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
+    pass_output_process(mod, "LegalizeSunmmioGemm", test_config)
+
     LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     pass_output_process(mod, "LowerTileOp", test_config)
@@ -287,6 +290,8 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.TilesLoop()(mod)
     pass_output_process(mod, "TilesLoop", test_config)
 
+    mod = tilelang.transform.SunmmioTileLoopFusion()(mod)
+    pass_output_process(mod, "SunmmioTileLoopFusion", test_config)
     # mod = tilelang.transform.LowerL2Persistent()(mod)
     # mod = tilelang.transform.DecoupleTypeCast()(mod)
     # pass_output_process(mod, "DecoupleTypeCast", test_config)
