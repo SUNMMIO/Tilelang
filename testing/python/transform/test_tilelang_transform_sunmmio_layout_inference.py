@@ -60,6 +60,46 @@ def LayoutVisual():
     return prim_func_pass(pass_fn, opt_level=0)
 
 
+def apply_passes_up_to_layout_inference(mod, target):
+    """Run the canonical Sunmmio layout-inference pipeline."""
+    mod = tvm.tir.transform.BindTarget(target)(mod)
+    mod = tl.transform.AddWrapperForSingleBufStore()(mod)
+    mod = tl.transform.LegalizeNegativeIndex()(mod)
+    mod = tl.transform.InjectAssumes()(mod)
+    mod = tl.transform.Simplify()(mod)
+    mod = tl.transform.InferSramScope()(mod)
+    mod = tl.transform.LegalizeSunmmioDataPath()(mod)
+    mod = tl.transform.LayoutReducer()(mod)
+    mod = tl.transform.SunmmioLayoutInference()(mod)
+    return mod
+
+
+def extract_layout_maps(func):
+    """Return the SRAM and DRAM layout maps from block annotations."""
+    layout_map = None
+    global_layout_map = None
+
+    def visit(node):
+        nonlocal layout_map, global_layout_map
+        if isinstance(node, tir.Block):
+            anns = node.annotations
+            if "layout_map" in anns:
+                layout_map = anns["layout_map"]
+            if "global_layout_map" in anns:
+                global_layout_map = anns["global_layout_map"]
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return layout_map, global_layout_map
+
+
+def get_buf_by_name(layout_map, name):
+    """Return ``(buffer, layout)`` for a layout-map entry by buffer name."""
+    for buf, layout in layout_map.items():
+        if buf.name == name:
+            return buf, layout
+    return None, None
+
+
 def run_sunmmio_layout_inference(mod, target):
     """Run the canonical Sunmmio layout-inference pipeline and return the
     inferred per-buffer layouts as ``{buffer_name: Layout}``.
@@ -68,15 +108,7 @@ def run_sunmmio_layout_inference(mod, target):
     wrap this call in ``pytest.raises`` (they never reach the capture step).
     """
     with tvm.target.Target(target):
-        mod = tvm.tir.transform.BindTarget(target)(mod)
-        mod = tl.transform.AddWrapperForSingleBufStore()(mod)
-        mod = tl.transform.LegalizeNegativeIndex()(mod)
-        mod = tl.transform.InjectAssumes()(mod)
-        mod = tl.transform.Simplify()(mod)
-        mod = tl.transform.InferSramScope()(mod)
-        mod = tl.transform.LegalizeSunmmioDataPath()(mod)
-        mod = tl.transform.LayoutReducer()(mod)
-        mod = tl.transform.SunmmioLayoutInference()(mod)
+        mod = apply_passes_up_to_layout_inference(mod, target)
         LayoutVisual()(mod)
     return dict(collected_result)
 
