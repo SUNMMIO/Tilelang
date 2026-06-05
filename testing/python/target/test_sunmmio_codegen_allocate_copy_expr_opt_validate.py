@@ -1,3 +1,5 @@
+import os
+
 import tilelang
 import tilelang.language as T
 import tilelang.testing
@@ -17,10 +19,7 @@ from sunmmio_codegen_validation_utils import (
 tilelang.env.disable_cache()
 
 # Debug logs from this file:
-import os
-
-# print flag
-os.environ["SUNMMIO_TEST_PRINT"] = "1"
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 

@@ -9,21 +9,10 @@ from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 
 from compile_pipeline import target
+from sunmmio_codegen_validation_utils import print_sunmmio_codegen_debug
 
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
-PRINT = True
-
-
-def _maybe_print_kernel_and_mlir(func, src: str):
-    if not PRINT:
-        return
-    print("=== TVM Kernel ===")
-    if hasattr(func, "script"):
-        print(func.script())
-    else:
-        print(func)
-    print("=== SunMMIO SUVM MLIR ===")
-    print(src)
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 
 
 def _to_device_kernel_func(func):
@@ -43,7 +32,7 @@ def build_sunmmio_module_without_compile(func):
 
 def build_sunmmio_source_without_compile(func):
     src = build_sunmmio_module_without_compile(func).inspect_source()
-    _maybe_print_kernel_and_mlir(func, src)
+    print_sunmmio_codegen_debug(label="TVM Kernel", ir_obj=func, mlir_src=src)
     return src
 
 
@@ -52,7 +41,7 @@ def build_sunmmio_source_from_stmt(stmt):
     mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt)})
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
     src = builder(mod, target, "suvm").inspect_source()
-    _maybe_print_kernel_and_mlir(mod["main"], src)
+    print_sunmmio_codegen_debug(label="TVM Kernel", ir_obj=mod["main"], mlir_src=src)
     return src
 
 

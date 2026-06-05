@@ -1,11 +1,15 @@
+import os
+
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 
 from compile_pipeline import compile_test, target
+from sunmmio_codegen_validation_utils import print_sunmmio_codegen_debug
 
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 tilelang.env.disable_cache()
 
 
@@ -47,7 +51,7 @@ def test_sunmmio_codegen_lowers_region_dma_copy_and_mma():
         _, device_mod = compile_test(mod, target=target, remove_header=True)
 
     src = build_sunmmio_source_without_compile(device_mod)
-    print(src)
+    print_sunmmio_codegen_debug(label="Lowered device", ir_obj=device_mod, mlir_src=src)
 
     assert "suvm.get_partitioned_tile_view" in src
     assert "suvm.copy_async" in src
