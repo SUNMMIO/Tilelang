@@ -17,10 +17,26 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace tvm {
 namespace codegen {
+
+using SunMMIOCallAttrValue =
+    std::variant<int64_t, bool, std::string, std::vector<int64_t>>;
+
+using SunMMIOCallAttrs = std::unordered_map<std::string, SunMMIOCallAttrValue>;
+
+namespace SunMMIOCallAttrKey {
+constexpr const char *kTokenId = "token_id";
+constexpr const char *kDirection = "direction";
+constexpr const char *kTransA = "trans_a";
+constexpr const char *kTransB = "trans_b";
+constexpr const char *kClearAccum = "clear_accum";
+constexpr const char *kParticipantMask = "participant_mask";
+constexpr const char *kCandidateMasks = "candidate_masks";
+} // namespace SunMMIOCallAttrKey
 
 enum class TileUnaryOp {
   kAbs,
@@ -185,7 +201,7 @@ public:
   virtual SunMMIOValue Call(const std::string &result_name,
                             const std::string &callee,
                             const std::vector<SunMMIOValue> &operands,
-                            const std::vector<std::string> &string_args,
+                            const SunMMIOCallAttrs &attrs,
                             const std::string &category, DataType ret_dtype,
                             const SunMMIOType &ret_type) = 0;
 
@@ -342,7 +358,7 @@ private:
   void MarkVisitedNodeType(const std::string &type_key);
   void MarkVisitedCallOpFromExpr(const tvm::PrimExpr &expr);
   bool TryConsumeSyncTokenId(const tvm::PrimExpr &expr,
-                             std::vector<std::string> *string_args);
+                             SunMMIOCallAttrs *attrs);
   void WriteCoverageReport() const;
   void CheckCoverageOrFail() const;
   SunMMIOValue EmitBinary(const char *op_name, const tvm::PrimExpr &lhs,

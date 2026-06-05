@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace tvm {
@@ -97,47 +99,63 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
 SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
                                    const std::string &callee,
                                    const std::vector<SunMMIOValue> &operands,
-                                   const std::vector<std::string> &string_args,
+                                   const SunMMIOCallAttrs &attrs,
                                    const std::string &category,
                                    DataType ret_dtype,
                                    const SunMMIOType &ret_type) {
   SunmmioMlirType type(ctx_);
-  auto parse_token_id = [&]() -> int64_t {
-    for (const std::string &s : string_args) {
-      if (s.rfind("token_id=", 0) == 0) {
-        return std::stoll(s.substr(9));
-      }
+  auto get_int_attr = [&](const char *key) -> std::optional<int64_t> {
+    auto it = attrs.find(key);
+    if (it == attrs.end()) {
+      return std::nullopt;
     }
-    return -1;
+    const int64_t *value = std::get_if<int64_t>(&it->second);
+    ICHECK(value) << "SunMMIO call attr `" << key << "` must be int64_t";
+    return *value;
   };
-  auto parse_named_string = [&](const char *key) -> std::string {
-    std::string prefix = std::string(key) + "=";
-    for (const std::string &s : string_args) {
-      if (s.rfind(prefix, 0) == 0) {
-        return s.substr(prefix.size());
-      }
+  auto get_bool_attr = [&](const char *key) -> std::optional<bool> {
+    auto it = attrs.find(key);
+    if (it == attrs.end()) {
+      return std::nullopt;
     }
-    return "";
+    const bool *value = std::get_if<bool>(&it->second);
+    ICHECK(value) << "SunMMIO call attr `" << key << "` must be bool";
+    return *value;
   };
-  auto parse_participant_mask = [&]() -> int64_t {
-    for (const std::string &s : string_args) {
-      if (s.rfind("participant_mask=", 0) == 0) {
-        return std::stoll(s.substr(17));
-      }
+  auto get_string_attr = [&](const char *key) -> std::optional<std::string> {
+    auto it = attrs.find(key);
+    if (it == attrs.end()) {
+      return std::nullopt;
     }
-    return -1;
+    const std::string *value = std::get_if<std::string>(&it->second);
+    ICHECK(value) << "SunMMIO call attr `" << key << "` must be string";
+    return *value;
   };
-  auto parse_candidate_masks = [&]() -> std::vector<int64_t> {
+  auto get_int_vector_attr = [&](const char *key) -> std::vector<int64_t> {
+    auto it = attrs.find(key);
+    if (it == attrs.end()) {
+      return {};
+    }
+    const std::vector<int64_t> *value =
+        std::get_if<std::vector<int64_t>>(&it->second);
+    ICHECK(value) << "SunMMIO call attr `" << key
+                  << "` must be vector<int64_t>";
     std::vector<int64_t> masks;
-    for (const std::string &s : string_args) {
-      if (s.rfind("candidate_mask=", 0) == 0) {
-        int64_t mask = std::stoll(s.substr(15));
-        if (std::find(masks.begin(), masks.end(), mask) == masks.end()) {
-          masks.push_back(mask);
-        }
+    for (int64_t mask : *value) {
+      if (std::find(masks.begin(), masks.end(), mask) == masks.end()) {
+        masks.push_back(mask);
       }
     }
     return masks;
+  };
+  auto parse_token_id = [&]() -> int64_t {
+    return get_int_attr(SunMMIOCallAttrKey::kTokenId).value_or(-1);
+  };
+  auto parse_participant_mask = [&]() -> int64_t {
+    return get_int_attr(SunMMIOCallAttrKey::kParticipantMask).value_or(-1);
+  };
+  auto parse_candidate_masks = [&]() -> std::vector<int64_t> {
+    return get_int_vector_attr(SunMMIOCallAttrKey::kCandidateMasks);
   };
   auto ensure_i64 = [&](mlir::Value value,
                         const char *arg_name) -> mlir::Value {
@@ -236,17 +254,12 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
 
     ctx_.token_by_id[token_id] = produced;
   };
-  auto parse_named_bool = [&](const char *key, const char *arg_name) -> bool {
-    std::string prefix = std::string(key) + "=";
-    for (const std::string &s : string_args) {
-      if (s.rfind(prefix, 0) == 0) {
-        std::string value = s.substr(prefix.size());
-        ICHECK(value == "0" || value == "1")
-            << arg_name << " must be encoded as 0 or 1";
-        return value == "1";
-      }
+  auto require_bool_attr = [&](const char *key, const char *arg_name) -> bool {
+    std::optional<bool> value = get_bool_attr(key);
+    if (value.has_value()) {
+      return *value;
     }
-    LOG(FATAL) << arg_name << " is missing from string_args";
+    LOG(FATAL) << arg_name << " is missing from attrs";
     TVM_FFI_UNREACHABLE();
   };
   auto ensure_barrier_for_mask = [&](int64_t mask) -> mlir::Value {
@@ -501,7 +514,8 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     }
     mask = ensure_i64(mask, "tl.broadcast_ mask");
 
-    std::string direction_name = parse_named_string("direction");
+    std::string direction_name =
+        get_string_attr(SunMMIOCallAttrKey::kDirection).value_or("");
     ICHECK(direction_name == "row" || direction_name == "col")
         << "tl.broadcast_ direction must be encoded as row or col";
     auto direction = direction_name == "row" ? mlir::suvm::McastDirection::row
@@ -585,12 +599,14 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     auto c_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(c.getType());
     ICHECK(c_ty) << "tl.mma_sunmmio expects accumulator to be a suvm.tile_view";
 
-    bool trans_a = parse_named_bool("trans_a", "tl.mma_sunmmio transA");
+    bool trans_a =
+        require_bool_attr(SunMMIOCallAttrKey::kTransA, "tl.mma_sunmmio transA");
     ICHECK(!trans_a)
         << "tl.mma_sunmmio lowering to suvm.tc.mma does not support transA";
-    bool trans_b = parse_named_bool("trans_b", "tl.mma_sunmmio transB");
-    bool clear_accum =
-        parse_named_bool("clear_accum", "tl.mma_sunmmio clearAccum");
+    bool trans_b =
+        require_bool_attr(SunMMIOCallAttrKey::kTransB, "tl.mma_sunmmio transB");
+    bool clear_accum = require_bool_attr(SunMMIOCallAttrKey::kClearAccum,
+                                         "tl.mma_sunmmio clearAccum");
 
     mlir::UnitAttr acc_attr =
         clear_accum ? mlir::UnitAttr() : ctx_.builder.getUnitAttr();
@@ -634,7 +650,7 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         SunMMIOType{SunMMIOType::Kind::kUnknown, DataType::Void(), 1, {}}};
   } else {
     (void)operands;
-    (void)string_args;
+    (void)attrs;
     (void)category;
     LOG(INFO) << "Calling " << callee << " with operands ";
     for (const auto &op : operands) {

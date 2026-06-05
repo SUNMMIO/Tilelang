@@ -221,8 +221,8 @@ void CodeGenTileLangSunMMIO::MarkVisitedCallOpFromExpr(
   }
 }
 
-bool CodeGenTileLangSunMMIO::TryConsumeSyncTokenId(
-    const tvm::PrimExpr &expr, std::vector<std::string> *string_args) {
+bool CodeGenTileLangSunMMIO::TryConsumeSyncTokenId(const tvm::PrimExpr &expr,
+                                                   SunMMIOCallAttrs *attrs) {
   const auto *call = expr.as<tir::CallNode>();
   if (!call) {
     return false;
@@ -239,8 +239,7 @@ bool CodeGenTileLangSunMMIO::TryConsumeSyncTokenId(
   const auto *imm = call->args[0].as<IntImmNode>();
   ICHECK(imm) << "tl.sync_token_id expects an IntImm token id";
   MarkVisitedNodeType(imm->GetTypeKey());
-  string_args->push_back("token_id=" +
-                         std::to_string(static_cast<int64_t>(imm->value)));
+  (*attrs)[SunMMIOCallAttrKey::kTokenId] = static_cast<int64_t>(imm->value);
   return true;
 }
 
@@ -1574,7 +1573,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     callee = gv->name_hint;
   }
   std::vector<SunMMIOValue> operands;
-  std::vector<std::string> string_args;
+  SunMMIOCallAttrs attrs;
   if (callee == "tl.tileop.region") {
     return EmitRegionCall(tvm::ffi::GetRef<PrimExpr>(op));
   } else if (callee == "tl.sync_null_token" || callee == "tl.wait_token") {
@@ -1583,14 +1582,13 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
       if (i == 0) {
         if (const auto *imm = arg.as<IntImmNode>()) {
           MarkVisitedNodeType("tir.IntImm");
-          string_args.push_back(
-              "token_id=" + std::to_string(static_cast<int64_t>(imm->value)));
+          attrs[SunMMIOCallAttrKey::kTokenId] =
+              static_cast<int64_t>(imm->value);
           continue;
         }
       }
       if (const auto *s = arg.as<StringImmNode>()) {
         MarkVisitedNodeType("tir.StringImm");
-        string_args.push_back(static_cast<std::string>(s->value));
         continue;
       }
       operands.push_back(EvalExpr(arg));
@@ -1604,17 +1602,24 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
       MarkVisitedNodeType("tir.IntImm");
       int64_t mask_value = static_cast<int64_t>(imm->value);
       if (mask_value >= 0) {
-        string_args.push_back("participant_mask=" + std::to_string(mask_value));
+        attrs[SunMMIOCallAttrKey::kParticipantMask] = mask_value;
       }
     } else {
       operands.push_back(EvalExpr(mask));
     }
+    std::vector<int64_t> candidate_masks;
     for (size_t i = 1; i < op->args.size(); ++i) {
       const auto *imm = op->args[i].as<IntImmNode>();
       ICHECK(imm) << callee << " candidate masks must be IntImm";
       MarkVisitedNodeType("tir.IntImm");
-      string_args.push_back("candidate_mask=" +
-                            std::to_string(static_cast<int64_t>(imm->value)));
+      int64_t candidate_mask = static_cast<int64_t>(imm->value);
+      if (std::find(candidate_masks.begin(), candidate_masks.end(),
+                    candidate_mask) == candidate_masks.end()) {
+        candidate_masks.push_back(candidate_mask);
+      }
+    }
+    if (!candidate_masks.empty()) {
+      attrs[SunMMIOCallAttrKey::kCandidateMasks] = std::move(candidate_masks);
     }
   } else if (callee == "tl.dma_copy") {
     ICHECK_EQ(op->args.size(), 4)
@@ -1646,7 +1651,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
 
     operands.reserve(2);
 
-    ICHECK(TryConsumeSyncTokenId(op->args[3], &string_args))
+    ICHECK(TryConsumeSyncTokenId(op->args[3], &attrs))
         << "tl.dma_copy expects fourth argument to be tl.sync_token_id";
 
     if (src_tiled_dims != 2 || dst_tiled_dims != 2) {
@@ -1658,7 +1663,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
              "until multi-dim copy lowering lands.";
       SunMMIOType ret_ty = MapType(op->dtype);
       std::string result_name = op->dtype.is_void() ? "" : NewValueName();
-      return builder_->Call(result_name, "tl.sync_null_token", {}, string_args,
+      return builder_->Call(result_name, "tl.sync_null_token", {}, attrs,
                             CallBucketName(bucket), op->dtype, ret_ty);
     }
 
@@ -1697,7 +1702,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     operands.push_back(EmitRegionCall(op->args[0]));
     operands.push_back(EmitRegionCall(op->args[1]));
 
-    ICHECK(TryConsumeSyncTokenId(op->args[2], &string_args))
+    ICHECK(TryConsumeSyncTokenId(op->args[2], &attrs))
         << "tl.sunmmio_layout_transform expects third argument to be "
            "tl.sync_token_id";
   } else if (callee == "tir.bitwise_and" || callee == "tir.bitwise_or" ||
@@ -1719,8 +1724,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     return EmitBinary("shr", op->args[0], op->args[1], op->dtype);
   } else if (callee == "tl.broadcast_") {
     size_t non_token_args = op->args.size();
-    if (non_token_args > 0 &&
-        TryConsumeSyncTokenId(op->args.back(), &string_args)) {
+    if (non_token_args > 0 && TryConsumeSyncTokenId(op->args.back(), &attrs)) {
       --non_token_args;
     }
     ICHECK(non_token_args == static_cast<size_t>(tl::kBroadcastArgCount) ||
@@ -1757,8 +1761,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
       operands.push_back(EvalExpr(op->args[tl::kBroadcastArgSrcCore]));
     }
 
-    string_args.push_back(std::string("direction=") +
-                          (direction == 0 ? "row" : "col"));
+    attrs[SunMMIOCallAttrKey::kDirection] =
+        std::string(direction == 0 ? "row" : "col");
   } else if (callee == "tl.mma_sunmmio") {
     ICHECK_EQ(op->args.size(), 8) << "tl.mma_sunmmio expects A/B/C regions, "
                                      "three flag operands, acc_offset_byte, "
@@ -1784,27 +1788,23 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     operands.push_back(EmitRegionCall(op->args[1]));
     operands.push_back(EmitRegionCall(op->args[2], acc_offset_byte));
 
-    string_args.push_back(
-        std::string("trans_a=") +
-        (parse_bool_arg(op->args[3], "tl.mma_sunmmio transA") ? "1" : "0"));
-    string_args.push_back(
-        std::string("trans_b=") +
-        (parse_bool_arg(op->args[4], "tl.mma_sunmmio transB") ? "1" : "0"));
-    string_args.push_back(
-        std::string("clear_accum=") +
-        (parse_bool_arg(op->args[5], "tl.mma_sunmmio clearAccum") ? "1" : "0"));
+    attrs[SunMMIOCallAttrKey::kTransA] =
+        parse_bool_arg(op->args[3], "tl.mma_sunmmio transA");
+    attrs[SunMMIOCallAttrKey::kTransB] =
+        parse_bool_arg(op->args[4], "tl.mma_sunmmio transB");
+    attrs[SunMMIOCallAttrKey::kClearAccum] =
+        parse_bool_arg(op->args[5], "tl.mma_sunmmio clearAccum");
 
-    ICHECK(TryConsumeSyncTokenId(op->args[7], &string_args))
+    ICHECK(TryConsumeSyncTokenId(op->args[7], &attrs))
         << "tl.mma_sunmmio expects last argument to be tl.sync_token_id";
   } else {
     for (int i = 0, e = static_cast<int>(op->args.size()); i < e; ++i) {
       const PrimExpr &arg = op->args[i];
-      if (TryConsumeSyncTokenId(arg, &string_args)) {
+      if (TryConsumeSyncTokenId(arg, &attrs)) {
         continue;
       }
       if (const auto *s = arg.as<StringImmNode>()) {
         MarkVisitedNodeType("tir.StringImm");
-        string_args.push_back(static_cast<std::string>(s->value));
         continue;
       }
       operands.push_back(EvalExpr(arg));
@@ -1813,7 +1813,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
   DataType ret_dtype = CanonicalizeSuvmDType(op->dtype);
   SunMMIOType ret_ty = MapType(ret_dtype);
   std::string result_name = op->dtype.is_void() ? "" : NewValueName();
-  return builder_->Call(result_name, callee, operands, string_args,
+  return builder_->Call(result_name, callee, operands, attrs,
                         CallBucketName(bucket), ret_dtype, ret_ty);
 }
 

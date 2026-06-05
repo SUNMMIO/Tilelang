@@ -250,13 +250,15 @@ void SuvmSunmmioBuilder::TileStore(const SunMMIOValue &value,
   tile_->TileStore(value, tile_view, mask);
 }
 
-SunMMIOValue SuvmSunmmioBuilder::Call(
-    const std::string &result_name, const std::string &callee,
-    const std::vector<SunMMIOValue> &operands,
-    const std::vector<std::string> &string_args, const std::string &category,
-    DataType ret_dtype, const SunMMIOType &ret_type) {
-  return call_->Call(result_name, callee, operands, string_args, category,
-                     ret_dtype, ret_type);
+SunMMIOValue SuvmSunmmioBuilder::Call(const std::string &result_name,
+                                      const std::string &callee,
+                                      const std::vector<SunMMIOValue> &operands,
+                                      const SunMMIOCallAttrs &attrs,
+                                      const std::string &category,
+                                      DataType ret_dtype,
+                                      const SunMMIOType &ret_type) {
+  return call_->Call(result_name, callee, operands, attrs, category, ret_dtype,
+                     ret_type);
 }
 
 SunMMIOValue SuvmSunmmioBuilder::RegionCall(

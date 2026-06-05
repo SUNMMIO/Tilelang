@@ -152,9 +152,8 @@ public:
 
   SunMMIOValue Call(const std::string &result_name, const std::string &callee,
                     const std::vector<SunMMIOValue> &operands,
-                    const std::vector<std::string> &string_args,
-                    const std::string &category, DataType ret_dtype,
-                    const SunMMIOType &ret_type) final;
+                    const SunMMIOCallAttrs &attrs, const std::string &category,
+                    DataType ret_dtype, const SunMMIOType &ret_type) final;
 
   SunMMIOValue RegionCall(const std::string &result_name,
                           const std::string &buffer_handle,
