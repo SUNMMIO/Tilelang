@@ -72,7 +72,7 @@ def flashattn_gqa_fwd_bhsd(
             for bz in T.serial(sharded_batch):
                 for by in T.serial(sharded_heads):
                     for bx in T.serial(T.ceildiv(seq_len, block_M)):
-                        T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)  # [1, block_M, 1, dim] -> [block_M, dim]
+                        T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
                         T.fill(acc_o, 0)
                         T.fill(logsum, 0)
                         T.fill(scores_max, -T.infinity(accum_dtype))
