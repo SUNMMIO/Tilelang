@@ -519,8 +519,13 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
     PrimExpr src_value;
     if (use_tail_predicate) {
       PrimExpr predicate = make_reduce_axis_tail_predicate(accumulate_vars);
-      src_value = BufferLoad(this->src, accumulate_src_idx,
-                             Optional<PrimExpr>(predicate));
+      PrimExpr masked_load = BufferLoad(this->src, accumulate_src_idx,
+                                        Optional<PrimExpr>(predicate));
+      // BufferLoad::predicate masks memory lanes only.  The false-lane value
+      // must still be made explicit so max/min/etc. reduce invalid lanes with
+      // their identity value instead of whatever the target chooses for a
+      // masked-off load.
+      src_value = if_then_else(predicate, masked_load, this->MakeInitValue());
     } else {
       src_value = BufferLoad(this->src, accumulate_src_idx);
     }
