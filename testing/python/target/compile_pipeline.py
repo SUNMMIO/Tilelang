@@ -309,8 +309,8 @@ def LowerAndLegalize_sunmmio_test(
     # mod = tilelang.transform.DecoupleTypeCast()(mod)
     # pass_output_process(mod, "DecoupleTypeCast", test_config)
 
-    mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
-    pass_output_process(mod, "LegalizeVectorizedLoop", test_config)
+    # mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
+    # pass_output_process(mod, "LegalizeVectorizedLoop", test_config)
 
     mod = tilelang.transform.LegalizeSafeMemoryAccess()(mod)
     pass_output_process(mod, "LegalizeSafeMemoryAccess", test_config)
