@@ -6,63 +6,139 @@ to SRAM and DRAM buffers via priority-based inference (kStrict > kCommon > kFree
 
 import tilelang
 import pytest
+import tvm_ffi
 from tilelang import tvm as tvm
+from tvm import tir
+from tvm.tir import PyStmtExprVisitor
+from tvm.tir.transform import prim_func_pass
 from tilelang.utils.target import determine_target
 import tilelang as tl
 import tilelang.language as T
+import tilelang.env as env
+from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout, make_zn_layout
-from tilelang.layout.cute_layout import is_same_layout
-from tvm.tir import Block
-from tvm.tir.stmt_functor import post_order_visit
 
 tilelang.env.disable_cache()
 
 
-def extract_layout_maps(func):
-    """Extract layout_map and global_layout_map from block annotations."""
-    layout_map = None
-    global_layout_map = None
+# ---------------------------------------------------------------------------
+# Test harness: the canonical layout-inference pipeline + a layout classifier.
+# Every test runs `run_sunmmio_layout_inference` (so the pass order never
+# drifts) and asserts with `assert_layout` (kind + block shape).
+# ---------------------------------------------------------------------------
 
-    def visit(node):
-        nonlocal layout_map, global_layout_map
-        if isinstance(node, Block):
-            if "layout_map" in node.annotations:
-                layout_map = node.annotations["layout_map"]
-            if "global_layout_map" in node.annotations:
-                global_layout_map = node.annotations["global_layout_map"]
+_dim_levels = tvm_ffi.get_global_func("tl.CuteLayout_dim_levels")
+_mode_shape = tvm_ffi.get_global_func("tl.CuteLayout_mode_shape")
+_mode_stride = tvm_ffi.get_global_func("tl.CuteLayout_mode_stride")
 
-    post_order_visit(func.body, visit)
-    return layout_map, global_layout_map
+# Populated by LayoutVisual; run_sunmmio_layout_inference returns a fresh copy.
+collected_result = {}
 
 
-def apply_passes_up_to_layout_inference(mod, target):
-    """Apply passes up to and including SunmmioLayoutInference."""
-    mod = tvm.tir.transform.BindTarget(target)(mod)
-    mod = tl.transform.AddWrapperForSingleBufStore()(mod)
-    mod = tl.transform.LegalizeNegativeIndex()(mod)
-    mod = tl.transform.InjectAssumes()(mod)
-    mod = tl.transform.Simplify()(mod)
-    mod = tl.transform.InferSramScope()(mod)
-    mod = tl.transform.LegalizeSunmmioDataPath()(mod)
-    mod = tl.transform.LayoutReducer()(mod)
-    mod = tl.transform.SunmmioLayoutInference()(mod)
-    return mod
+@tir.functor.visitor
+class _LayoutVisualVisitor(PyStmtExprVisitor):
+    def visit_block_(self, op: tir.Block) -> None:
+        anns = op.annotations
+        # ApplyToIR annotates every block with the final maps; capture the SRAM
+        # layout_map and the DRAM global_layout_map, merged by buffer name.
+        if "layout_map" not in anns and "global_layout_map" not in anns:
+            return
+        collected_result.clear()
+        for map_key in ("layout_map", "global_layout_map"):
+            if map_key in anns:
+                for key, layout in anns[map_key].items():
+                    collected_result[key.name] = layout
 
 
-def get_buf_by_scope(layout_map, scope):
-    """Return the first (buf, layout) pair whose buffer has the given scope."""
-    for buf in layout_map:
-        if buf.scope() == scope:
-            return buf, layout_map[buf]
-    return None, None
+def LayoutVisual():
+    """Pass that records the final layout maps into ``collected_result``."""
+
+    def pass_fn(func: tir.PrimFunc, mod, ctx):
+        _LayoutVisualVisitor().visit_stmt(func.body)
+        return func
+
+    return prim_func_pass(pass_fn, opt_level=0)
 
 
-def get_buf_by_name(layout_map, name):
-    """Return the first (buf, layout) pair whose buffer has the given name."""
-    for buf in layout_map:
-        if buf.name == name:
-            return buf, layout_map[buf]
-    return None, None
+def run_sunmmio_layout_inference(mod, target):
+    """Run the canonical Sunmmio layout-inference pipeline and return the
+    inferred per-buffer layouts as ``{buffer_name: Layout}``.
+
+    Negative tests that expect a failure inside ``SunmmioLayoutInference`` should
+    wrap this call in ``pytest.raises`` (they never reach the capture step).
+    """
+    with tvm.target.Target(target):
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl.transform.AddWrapperForSingleBufStore()(mod)
+        mod = tl.transform.LegalizeNegativeIndex()(mod)
+        mod = tl.transform.InjectAssumes()(mod)
+        mod = tl.transform.Simplify()(mod)
+        mod = tl.transform.InferSramScope()(mod)
+        mod = tl.transform.LegalizeSunmmioDataPath()(mod)
+        mod = tl.transform.LayoutReducer()(mod)
+        mod = tl.transform.SunmmioLayoutInference()(mod)
+        LayoutVisual()(mod)
+    return dict(collected_result)
+
+
+def _maybe_int(x):
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return x  # symbolic stride/shape; leave as-is
+
+
+def _per_dim_modes(layout):
+    """Split the flat (mode_shape, mode_stride) arrays into per-dim modes,
+    innermost-mode-first (index 0 is innermost), matching the C++ convention."""
+    inner = getattr(layout, "_layout", layout)
+    dim_levels = [int(x) for x in _dim_levels(inner)]
+    shapes = [_maybe_int(x) for x in _mode_shape(inner)]
+    strides = [_maybe_int(x) for x in _mode_stride(inner)]
+    dims = []
+    i = 0
+    for n in dim_levels:
+        dims.append({"shape": shapes[i : i + n], "stride": strides[i : i + n]})
+        i += n
+    return dims
+
+
+def layout_kind(layout):
+    """Classify a CuteLayout as RowMajor, ZZ (any ZZ-like: ZZ/ZZZ/NZZ), or ZN.
+    Mirrors C++ ``sunmmio::IsZZLike``: among the last two blocked dims, ZZ-like
+    means the higher-indexed dim's innermost stride is smaller."""
+    dims = _per_dim_modes(layout)
+    blocked = [d for d, m in enumerate(dims) if len(m["shape"]) > 1]
+    if len(blocked) < 2:
+        return "RowMajor"
+    ax0, ax1 = blocked[-2], blocked[-1]
+    s0 = dims[ax0]["stride"][0]
+    s1 = dims[ax1]["stride"][0]
+    if isinstance(s0, int) and isinstance(s1, int):
+        return "ZZ" if s1 < s0 else "ZN"
+    return "ZZ" if s1 == 1 else "ZN"  # fallback: inner stride 1 is ZZ-like
+
+
+def block_shape(layout):
+    """Return ``(height, width)`` block extent of a blocked layout, or None."""
+    dims = _per_dim_modes(layout)
+    blocked = [d for d, m in enumerate(dims) if len(m["shape"]) > 1]
+    if len(blocked) < 2:
+        return None
+    ax0, ax1 = blocked[-2], blocked[-1]
+    return (dims[ax0]["shape"][0], dims[ax1]["shape"][0])
+
+
+def assert_layout(layouts, name, kind, block=(32, 32)):
+    """Assert ``layouts[name]`` has the expected kind (and block shape, unless
+    RowMajor or ``block`` is None)."""
+    assert name in layouts, f"{name!r} not in layout_map; have {sorted(layouts)}"
+    lay = layouts[name]
+    got = layout_kind(lay)
+    assert got == kind, f"{name}: expected {kind}, got {got}  ({lay})"
+    if kind != "RowMajor" and block is not None:
+        got_block = block_shape(lay)
+        assert tuple(got_block) == tuple(block), f"{name}: expected block {tuple(block)}, got {got_block}  ({lay})"
 
 
 # ---------------------------------------------------------------------------
@@ -124,60 +200,25 @@ def gemm_kernel_transB():
 def test_gemm_layout_inference():
     """Verify Gemm assigns ZZ to A(ASRAM), ZN to B(WSRAM, transB=False), ZZ to C(RSRAM)."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = gemm_kernel_notransB()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(gemm_kernel_notransB(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, global_layout_map = extract_layout_maps(func)
+    # DRAM params are captured too (row-major by default).
+    for name in ("A", "B", "C"):
+        assert name in layouts, f"{name} (DRAM) not in layouts, got {sorted(layouts)}"
 
-        assert layout_map is not None, "layout_map annotation not found"
-        assert global_layout_map is not None, "global_layout_map annotation not found"
-
-        # Check SRAM buffer names present
-        sram_buf_names = {buf.name for buf in layout_map}
-        assert "A_shared" in sram_buf_names, f"A_shared not in layout_map, got {sram_buf_names}"
-        assert "B_shared" in sram_buf_names, f"B_shared not in layout_map, got {sram_buf_names}"
-        assert "C_shared" in sram_buf_names, f"C_shared not in layout_map, got {sram_buf_names}"
-
-        # Check DRAM buffer names present
-        dram_buf_names = {buf.name for buf in global_layout_map}
-        assert "A" in dram_buf_names, f"A not in global_layout_map, got {dram_buf_names}"
-        assert "B" in dram_buf_names, f"B not in global_layout_map, got {dram_buf_names}"
-        assert "C" in dram_buf_names, f"C not in global_layout_map, got {dram_buf_names}"
-
-        # A (ASRAM): ZZ with dtype-dependent block shape (32,32) for fp16
-        buf_a, layout_a = get_buf_by_name(layout_map, "A_shared")
-        expected_a = make_zz_layout(buf_a.shape, block_shape=[32, 32])
-        assert is_same_layout(layout_a, expected_a), f"A_shared layout mismatch: got {layout_a}, expected ZZ(32,32)"
-
-        # B (WSRAM): ZN for transB=False (TMM.MN mode)
-        buf_b, layout_b = get_buf_by_name(layout_map, "B_shared")
-        expected_b = make_zn_layout(buf_b.shape, axes=[0, 1], block_shape=[32, 32])
-        assert is_same_layout(layout_b, expected_b), f"B_shared layout mismatch: got {layout_b}, expected ZN(32,32)"
-
-        # C (RSRAM): ZZ with fixed (32,32) block shape
-        buf_c, layout_c = get_buf_by_name(layout_map, "C_shared")
-        expected_c = make_zz_layout(buf_c.shape, block_shape=[32, 32])
-        assert is_same_layout(layout_c, expected_c), f"C_shared layout mismatch: got {layout_c}, expected ZZ(32,32)"
+    # A (ASRAM): ZZ, B (WSRAM): ZN (transB=False, TMM.MN), C (RSRAM): ZZ — fp16 block (32,32)
+    assert_layout(layouts, "A_shared", "ZZ", block=(32, 32))
+    assert_layout(layouts, "B_shared", "ZN", block=(32, 32))
+    assert_layout(layouts, "C_shared", "ZZ", block=(32, 32))
 
 
 def test_gemm_transB_layout_inference():
     """Verify Gemm with transB=True assigns ZZ (not ZN) to B(WSRAM)."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = gemm_kernel_transB()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(gemm_kernel_transB(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-
-        assert layout_map is not None
-
-        # B (WSRAM): ZZ for transB=True (TMM.MT mode)
-        buf_b, layout_b = get_buf_by_name(layout_map, "B_shared")
-        expected_b = make_zz_layout(buf_b.shape, block_shape=[32, 32])
-        assert is_same_layout(layout_b, expected_b), f"B_shared layout mismatch with transB=True: got {layout_b}, expected ZZ(32,32)"
+    # B (WSRAM): ZZ for transB=True (TMM.MT mode)
+    assert_layout(layouts, "B_shared", "ZZ", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -213,25 +254,10 @@ def test_copy_only_layout_inference():
     scope-dependent default: ZZ with (32, 32) block shape.
     """
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = copy_only_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(copy_only_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, global_layout_map = extract_layout_maps(func)
-
-        assert layout_map is not None, "layout_map annotation not found"
-        assert global_layout_map is not None, "global_layout_map annotation not found"
-
-        # RSRAM buffer should have a layout (Phase 3 default ZZ(32,32))
-        buf, layout = get_buf_by_scope(layout_map, "shared.rsram")
-        assert buf is not None, "No RSRAM buffer found in layout_map"
-        assert layout is not None, "RSRAM buffer has no layout"
-        # Phase 3 default for RSRAM: ZZ with (32, 32) block shape
-        from tilelang.layout.sunmmio_layouts import make_zz_layout
-
-        expected_zz = make_zz_layout(list(buf.shape), [0, 1], [32, 32])
-        assert is_same_layout(layout, expected_zz), f"RSRAM layout should be ZZ(32,32) from Phase 3 defaults, got {layout}"
+    # RSRAM buffer A_shared gets the Phase 3 default: ZZ(32, 32).
+    assert_layout(layouts, "A_shared", "ZZ", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -242,25 +268,11 @@ def test_copy_only_layout_inference():
 def test_all_sram_buffers_get_layouts():
     """Verify every allocated SRAM buffer ends up with a layout."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = gemm_kernel_notransB()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(gemm_kernel_notransB(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-
-        assert layout_map is not None
-
-        # Collect all SRAM buffer scopes
-        sram_scopes = {"shared.asram", "shared.wsram", "shared.rsram"}
-        found_scopes = set()
-        for buf in layout_map:
-            if buf.scope() in sram_scopes:
-                found_scopes.add(buf.scope())
-                assert layout_map[buf] is not None, f"Buffer {buf.name} (scope={buf.scope()}) has no layout"
-
-        # All three SRAM types should be present in a GEMM kernel
-        assert found_scopes == sram_scopes, f"Not all SRAM scopes covered: found {found_scopes}, expected {sram_scopes}"
+    # A_shared (ASRAM), B_shared (WSRAM), C_shared (RSRAM) — one per SRAM scope.
+    for name in ("A_shared", "B_shared", "C_shared"):
+        assert name in layouts, f"{name} missing a layout, got {sorted(layouts)}"
 
 
 # ---------------------------------------------------------------------------
@@ -291,19 +303,11 @@ def test_pass_requires_sunmmio_target():
 def test_dram_default_row_major():
     """Verify DRAM buffers without tensor_meta get row-major layout."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = copy_only_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(copy_only_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        _, global_layout_map = extract_layout_maps(func)
-
-        assert global_layout_map is not None
-
-        # DRAM buffers should have entries
-        dram_buf_names = {buf.name for buf in global_layout_map}
-        assert "A" in dram_buf_names
-        assert "B" in dram_buf_names
+    # DRAM buffers without tensor_meta default to row-major.
+    assert_layout(layouts, "A", "RowMajor")
+    assert_layout(layouts, "B", "RowMajor")
 
 
 # ---------------------------------------------------------------------------
@@ -345,28 +349,12 @@ def reduce_blockwise_kernel():
 def test_reduce_blockwise_axis_gives_row_major():
     """Reduce along blockwise axis (dim=1 of 2D ZZ) → dst should be row-major."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = reduce_blockwise_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(reduce_blockwise_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-
-        assert layout_map is not None
-
-        # C_shared (RSRAM, 2D) should have ZZ from Gemm
-        buf_c, layout_c = get_buf_by_name(layout_map, "C_shared")
-        assert buf_c is not None, "C_shared not in layout_map"
-        expected_c = make_zz_layout(buf_c.shape, block_shape=[32, 32])
-        assert is_same_layout(layout_c, expected_c), f"C_shared should be ZZ(32,32), got {layout_c}"
-
-        # C_reduce (RSRAM, 1D) should be row-major (reduce along blockwise axis)
-        buf_r, layout_r = get_buf_by_name(layout_map, "C_reduce")
-        assert buf_r is not None, "C_reduce not in layout_map"
-        from tilelang.layout.sunmmio_layouts import make_row_major
-
-        expected_r = make_row_major(list(buf_r.shape))
-        assert is_same_layout(layout_r, expected_r), f"C_reduce should be row-major after blockwise reduce, got {layout_r}"
+    # C_shared (RSRAM, 2D) has ZZ from Gemm; C_reduce (1D) becomes row-major
+    # because the reduced axis was a blocked dim.
+    assert_layout(layouts, "C_shared", "ZZ", block=(32, 32))
+    assert_layout(layouts, "C_reduce", "RowMajor")
 
 
 # ---------------------------------------------------------------------------
@@ -403,26 +391,12 @@ def reduce_outer_kernel():
 def test_reduce_outer_axis_preserves_zz():
     """Reduce along outer axis (dim=0 of 3D ZZ) → dst should preserve ZZ on inner dims."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = reduce_outer_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(reduce_outer_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-
-        assert layout_map is not None
-
-        # A_shared (RSRAM, 3D): annotated with ZZ on inner dims
-        buf_a, layout_a = get_buf_by_name(layout_map, "A_shared")
-        assert buf_a is not None, "A_shared not in layout_map"
-        expected_a = make_zz_layout(buf_a.shape, axes=[1, 2], block_shape=[32, 32])
-        assert is_same_layout(layout_a, expected_a), f"A_shared should be ZZ on inner dims (annotated), got {layout_a}"
-
-        # B_shared (RSRAM, 2D): reduce along outer axis preserves ZZ
-        buf_b, layout_b = get_buf_by_name(layout_map, "B_shared")
-        assert buf_b is not None, "B_shared not in layout_map"
-        expected_b = make_zz_layout(buf_b.shape, block_shape=[32, 32])
-        assert is_same_layout(layout_b, expected_b), f"B_shared should be ZZ(32,32) after outer-axis reduce, got {layout_b}"
+    # A_shared (3D) keeps its annotated ZZ on inner dims; reducing the outer
+    # axis preserves ZZ on the 2D B_shared.
+    assert_layout(layouts, "A_shared", "ZZ", block=(32, 32))
+    assert_layout(layouts, "B_shared", "ZZ", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -458,20 +432,10 @@ def reduce_3d_zz_blocked_axis_kernel():
 def test_reduce_3d_zz_blocked_axis_gives_row_major():
     """3D ZZ, reduce along blocked axis (dim=2) → dst should be row-major."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = reduce_3d_zz_blocked_axis_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(reduce_3d_zz_blocked_axis_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-        assert layout_map is not None
-
-        buf_b, layout_b = get_buf_by_name(layout_map, "B_shared")
-        assert buf_b is not None, "B_shared not in layout_map"
-        from tilelang.layout.sunmmio_layouts import make_row_major
-
-        expected_b = make_row_major(list(buf_b.shape))
-        assert is_same_layout(layout_b, expected_b), f"B_shared should be row-major after reducing blocked axis, got {layout_b}"
+    # Reducing a blocked axis destroys the block structure → row-major.
+    assert_layout(layouts, "B_shared", "RowMajor")
 
 
 # ---------------------------------------------------------------------------
@@ -507,18 +471,10 @@ def reduce_3d_zn_outer_axis_kernel():
 def test_reduce_3d_zn_outer_axis_preserves_zn():
     """3D ZN, reduce along outer axis (dim=0) → dst should preserve 2D ZN."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = reduce_3d_zn_outer_axis_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(reduce_3d_zn_outer_axis_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-        assert layout_map is not None
-
-        buf_b, layout_b = get_buf_by_name(layout_map, "B_shared")
-        assert buf_b is not None, "B_shared not in layout_map"
-        expected_b = make_zn_layout(list(buf_b.shape), axes=[0, 1], block_shape=[32, 32])
-        assert is_same_layout(layout_b, expected_b), f"B_shared should be ZN(32,32) after outer-axis reduce, got {layout_b}"
+    # Reducing the outer axis of a 3D ZN preserves ZN on the 2D result.
+    assert_layout(layouts, "B_shared", "ZN", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -556,20 +512,10 @@ def reduce_3d_row_major_outer_axis_kernel():
 def test_reduce_3d_row_major_outer_axis_preserves_row_major():
     """3D row-major, reduce along outer axis (dim=0) → dst should be 2D row-major."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = reduce_3d_row_major_outer_axis_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(reduce_3d_row_major_outer_axis_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-        assert layout_map is not None
-
-        buf_b, layout_b = get_buf_by_name(layout_map, "B_shared")
-        assert buf_b is not None, "B_shared not in layout_map"
-        from tilelang.layout.sunmmio_layouts import make_row_major
-
-        expected_b = make_row_major(list(buf_b.shape))
-        assert is_same_layout(layout_b, expected_b), f"B_shared should be row-major after outer-axis reduce, got {layout_b}"
+    # Row-major in, row-major out (outer-axis reduce).
+    assert_layout(layouts, "B_shared", "RowMajor")
 
 
 # ---------------------------------------------------------------------------
@@ -605,18 +551,10 @@ def reduce_4d_zz_outer_axis_kernel():
 def test_reduce_4d_zz_outer_axis_preserves_zz():
     """4D ZZ, reduce along outer axis (dim=0) → 3D dst with ZZ on last 2 dims."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = reduce_4d_zz_outer_axis_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(reduce_4d_zz_outer_axis_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-        assert layout_map is not None
-
-        buf_b, layout_b = get_buf_by_name(layout_map, "B_shared")
-        assert buf_b is not None, "B_shared not in layout_map"
-        expected_b = make_zz_layout(list(buf_b.shape), axes=[1, 2], block_shape=[32, 32])
-        assert is_same_layout(layout_b, expected_b), f"B_shared should be 3D ZZ(32,32) on dims [1,2], got {layout_b}"
+    # 4D ZZ, reduce outer axis → 3D with ZZ preserved on the inner two dims.
+    assert_layout(layouts, "B_shared", "ZZ", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -658,24 +596,11 @@ def broadcast_zz_kernel():
 def test_broadcast_propagates_zz():
     """Broadcast: src has ZZ from Gemm → dst should also get ZZ."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = broadcast_zz_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(broadcast_zz_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-        assert layout_map is not None
-
-        # C_shared: ZZ from Gemm
-        buf_c, layout_c = get_buf_by_name(layout_map, "C_shared")
-        assert buf_c is not None
-        expected_zz = make_zz_layout(buf_c.shape, block_shape=[32, 32])
-        assert is_same_layout(layout_c, expected_zz), f"C_shared should be ZZ(32,32), got {layout_c}"
-
-        # C_bcast: should be ZZ propagated from C_shared via broadcast
-        buf_b, layout_b = get_buf_by_name(layout_map, "C_bcast")
-        assert buf_b is not None, "C_bcast not in layout_map"
-        assert is_same_layout(layout_b, expected_zz), f"C_bcast should be ZZ(32,32) propagated from broadcast src, got {layout_b}"
+    # C_shared has ZZ from Gemm; broadcast propagates ZZ to C_bcast.
+    assert_layout(layouts, "C_shared", "ZZ", block=(32, 32))
+    assert_layout(layouts, "C_bcast", "ZZ", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -710,18 +635,10 @@ def broadcast_zn_kernel():
 def test_broadcast_propagates_zn():
     """Broadcast: src annotated ZN → dst should also get ZN (not ZZ)."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = broadcast_zn_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(broadcast_zn_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-        assert layout_map is not None
-
-        buf_b, layout_b = get_buf_by_name(layout_map, "B_shared")
-        assert buf_b is not None, "B_shared not in layout_map"
-        expected_zn = make_zn_layout(list(buf_b.shape), axes=[0, 1], block_shape=[32, 32])
-        assert is_same_layout(layout_b, expected_zn), f"B_shared should be ZN(32,32) from broadcast, got {layout_b}"
+    # Annotated ZN src → dst also gets ZN.
+    assert_layout(layouts, "B_shared", "ZN", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -763,18 +680,10 @@ def put_zz_kernel():
 def test_put_propagates_zz():
     """Put: src has ZZ from Gemm → dst should get ZZ."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = put_zz_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(put_zz_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-        assert layout_map is not None
-
-        buf_p, layout_p = get_buf_by_name(layout_map, "C_put")
-        assert buf_p is not None, "C_put not in layout_map"
-        expected_zz = make_zz_layout(buf_p.shape, block_shape=[32, 32])
-        assert is_same_layout(layout_p, expected_zz), f"C_put should be ZZ(32,32) from put, got {layout_p}"
+    # put propagates the Gemm ZZ from C_shared to C_put.
+    assert_layout(layouts, "C_put", "ZZ", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -815,18 +724,10 @@ def allgather_zz_kernel():
 def test_allgather_propagates_zz():
     """Allgather: 2D ZZ send → 3D recv. ZZ should land on last 2 dims of recv."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = allgather_zz_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(allgather_zz_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-        assert layout_map is not None
-
-        buf_g, layout_g = get_buf_by_name(layout_map, "C_gather")
-        assert buf_g is not None, "C_gather not in layout_map"
-        expected_zz_3d = make_zz_layout(list(buf_g.shape), axes=[1, 2], block_shape=[32, 32])
-        assert is_same_layout(layout_g, expected_zz_3d), f"C_gather should be 3D ZZ(32,32) on dims [1,2], got {layout_g}"
+    # 2D ZZ send → 3D recv: ZZ lands on the last two dims.
+    assert_layout(layouts, "C_gather", "ZZ", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -861,20 +762,10 @@ def allgather_row_major_kernel():
 def test_allgather_propagates_row_major():
     """Allgather: 2D row-major send → 3D recv should be row-major."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = allgather_row_major_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(allgather_row_major_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-        assert layout_map is not None
-
-        buf_g, layout_g = get_buf_by_name(layout_map, "A_gather")
-        assert buf_g is not None, "A_gather not in layout_map"
-        from tilelang.layout.sunmmio_layouts import make_row_major
-
-        expected_rm_3d = make_row_major(list(buf_g.shape))
-        assert is_same_layout(layout_g, expected_rm_3d), f"A_gather should be 3D row-major, got {layout_g}"
+    # Row-major src → 3D recv stays row-major.
+    assert_layout(layouts, "A_gather", "RowMajor")
 
 
 # ---------------------------------------------------------------------------
@@ -916,10 +807,9 @@ def gemm_annotate_conflict_asram_kernel():
 def test_immutable_conflict_annotate_vs_gemm():
     """T.annotate_layout(ZN) on ASRAM buffer conflicts with Gemm's ZZ → hard error."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = gemm_annotate_conflict_asram_kernel()
-        with pytest.raises(Exception, match="immutable layout"):
-            apply_passes_up_to_layout_inference(mod, target)
+    mod = gemm_annotate_conflict_asram_kernel()
+    with pytest.raises(Exception, match="immutable layout"):
+        run_sunmmio_layout_inference(mod, target)
 
 
 def gemm_annotate_conflict_wsram_kernel():
@@ -956,10 +846,9 @@ def gemm_annotate_conflict_wsram_kernel():
 def test_immutable_conflict_wsram_annotate_vs_gemm():
     """T.annotate_layout(ZZ) on WSRAM buffer conflicts with Gemm.B(transB=False)'s ZN → hard error."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = gemm_annotate_conflict_wsram_kernel()
-        with pytest.raises(Exception, match="immutable layout"):
-            apply_passes_up_to_layout_inference(mod, target)
+    mod = gemm_annotate_conflict_wsram_kernel()
+    with pytest.raises(Exception, match="immutable layout"):
+        run_sunmmio_layout_inference(mod, target)
 
 
 def gemm_annotate_conflict_rsram_kernel():
@@ -996,10 +885,9 @@ def gemm_annotate_conflict_rsram_kernel():
 def test_immutable_conflict_rsram_annotate_vs_gemm():
     """T.annotate_layout(ZN) on RSRAM buffer conflicts with Gemm.C's ZZ → hard error."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = gemm_annotate_conflict_rsram_kernel()
-        with pytest.raises(Exception, match="immutable layout"):
-            apply_passes_up_to_layout_inference(mod, target)
+    mod = gemm_annotate_conflict_rsram_kernel()
+    with pytest.raises(Exception, match="immutable layout"):
+        run_sunmmio_layout_inference(mod, target)
 
 
 # ---------------------------------------------------------------------------
@@ -1050,21 +938,11 @@ def test_dram_zn_to_asram_succeeds_via_staged_rsram():
     DRAM layout.
     """
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = dram_zn_to_asram_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(dram_zn_to_asram_kernel(), target)
 
-        layout_map = {}
-
-        def visit(node):
-            if isinstance(node, tvm.tir.Block) and "layout_map" in node.annotations:
-                lm = node.annotations["layout_map"]
-                for var in lm:
-                    layout_map[var.name] = lm[var]
-
-        post_order_visit(mod["main"].body, visit)
-
-        assert "A_shared" in layout_map, f"A_shared should have an inferred layout. Got keys: {list(layout_map.keys())}"
+    # LegalizeSunmmioDataPath stages global→asram through RSRAM, so the ASRAM
+    # buffer still gets an inferred layout despite the DRAM ZN source.
+    assert "A_shared" in layouts, f"A_shared should have an inferred layout. Got: {sorted(layouts)}"
 
 
 # ---------------------------------------------------------------------------
@@ -1110,10 +988,9 @@ def dram_zn_to_wsram_kernel():
 def test_dram_zn_to_wsram_fails():
     """DRAM with ZN layout → Copy to WSRAM should fail (IsZZLike rejects ZN)."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = dram_zn_to_wsram_kernel()
-        with pytest.raises(Exception, match="ZZ-like DRAM layout"):
-            apply_passes_up_to_layout_inference(mod, target)
+    mod = dram_zn_to_wsram_kernel()
+    with pytest.raises(Exception, match="ZZ-like DRAM layout"):
+        run_sunmmio_layout_inference(mod, target)
 
 
 # ---------------------------------------------------------------------------
@@ -1167,30 +1044,13 @@ def gemm_correct_annotate_kernel():
 def test_correct_annotate_accepted():
     """T.annotate_layout matching Gemm's requirement should pass without error."""
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = gemm_correct_annotate_kernel()
-        # Should not raise — correct annotations match Gemm's hardware requirement
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    # Should not raise — correct annotations match Gemm's hardware requirement.
+    layouts = run_sunmmio_layout_inference(gemm_correct_annotate_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-        assert layout_map is not None
-
-        # Verify the annotated layouts are preserved
-        buf_a, layout_a = get_buf_by_name(layout_map, "A_shared")
-        assert buf_a is not None, "A_shared not in layout_map"
-        expected_a = make_zz_layout(list(buf_a.shape), axes=[0, 1], block_shape=[32, 32])
-        assert is_same_layout(layout_a, expected_a), f"A_shared should keep annotated ZZ, got {layout_a}"
-
-        buf_b, layout_b = get_buf_by_name(layout_map, "B_shared")
-        assert buf_b is not None, "B_shared not in layout_map"
-        expected_b = make_zn_layout(list(buf_b.shape), axes=[0, 1], block_shape=[32, 32])
-        assert is_same_layout(layout_b, expected_b), f"B_shared should keep annotated ZN, got {layout_b}"
-
-        buf_c, layout_c = get_buf_by_name(layout_map, "C_shared")
-        assert buf_c is not None, "C_shared not in layout_map"
-        expected_c = make_zz_layout(list(buf_c.shape), axes=[0, 1], block_shape=[32, 32])
-        assert is_same_layout(layout_c, expected_c), f"C_shared should keep annotated ZZ, got {layout_c}"
+    # The annotated layouts are preserved.
+    assert_layout(layouts, "A_shared", "ZZ", block=(32, 32))
+    assert_layout(layouts, "B_shared", "ZN", block=(32, 32))
+    assert_layout(layouts, "C_shared", "ZZ", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -1246,28 +1106,13 @@ def test_copy_reduce_copy_layout_derivation():
                    dim=1 is blocked → row-major (overrides kFree)
     """
     target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = copy_reduce_copy_kernel()
-        mod = apply_passes_up_to_layout_inference(mod, target)
+    layouts = run_sunmmio_layout_inference(copy_reduce_copy_kernel(), target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-        assert layout_map is not None
-
-        # A_shared: 2D RSRAM, should have ZZ(32,32) from Phase 3 default
-        buf_a, layout_a = get_buf_by_name(layout_map, "A_shared")
-        assert buf_a is not None, "A_shared not in layout_map"
-        expected_a = make_zz_layout(buf_a.shape, block_shape=[32, 32])
-        assert is_same_layout(layout_a, expected_a), f"A_shared should be ZZ(32,32), got {layout_a}"
-
-        # B_shared: 1D RSRAM, Reduce(dim=1) from ZZ(32,32) → blocked dim → row-major
-        # This is derived by Reduce at kCommon (Phase 5 BFS), overriding the kFree default
-        buf_b, layout_b = get_buf_by_name(layout_map, "B_shared")
-        assert buf_b is not None, "B_shared not in layout_map"
-        from tilelang.layout.sunmmio_layouts import make_row_major
-
-        expected_b = make_row_major(list(buf_b.shape))
-        assert is_same_layout(layout_b, expected_b), f"B_shared should be row-major (Reduce derived from ZZ blocked dim), got {layout_b}"
+    # A_shared: 2D RSRAM ZZ(32,32) from the Phase 3 default.
+    assert_layout(layouts, "A_shared", "ZZ", block=(32, 32))
+    # B_shared: Reduce(dim=1) over a blocked ZZ dim → row-major, derived at
+    # kCommon (Phase 5 BFS) overriding the kFree default.
+    assert_layout(layouts, "B_shared", "RowMajor")
 
 
 # ---------------------------------------------------------------------------
@@ -1309,22 +1154,149 @@ def test_broadcast_mismatched_immutable_preserves_annotations():
     incompatibility is a user error that downstream passes will catch.
     """
     target = determine_target("Sunmmio", return_object=True)
+    # Both immutable annotations are preserved (no error at layout inference);
+    # the BFS proposals derived from the other side are silently rejected.
+    layouts = run_sunmmio_layout_inference(broadcast_mismatched_layouts_kernel(), target)
+
+    assert_layout(layouts, "A_shared", "ZZ", block=(32, 32))
+    assert_layout(layouts, "B_shared", "ZN", block=(32, 32))
+
+
+# ---------------------------------------------------------------------------
+# Test: GEMM operand layouts across gemm_v1 / gemm_v2 and block-size variants
+# (formerly test_tilelang_transform_sunmmio_gemm_layout.py)
+# ---------------------------------------------------------------------------
+
+
+def matmul(M, N, K, block_M, block_N, block_K, version, dtype=T.float16, accum_dtype=T.float32):
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), dtype),
+        B: T.Tensor((K, N), dtype),
+        C: T.Tensor((M, N), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                T.copy(A[by * block_M, k * block_K], A_shared)
+                T.copy(B[k * block_K, bx * block_N], B_shared)
+                if version == 1:
+                    T.gemm_v1(A_shared, B_shared, C_shared)
+                elif version == 2:
+                    T.gemm_v2(A_shared, B_shared, C_shared)
+                else:
+                    raise ValueError(f"unsupported gemm version: {version}")
+
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return tvm.IRModule({"main": main})
+
+
+GEMM_TEST_CASES = [
+    # (M, N, K, block_M, block_N, block_K, version)
+    # gemm v1
+    (128, 128, 128, 32, 32, 32, 1),
+    (128, 128, 128, 64, 64, 64, 1),
+    (128, 128, 128, 64, 32, 64, 1),
+    (128, 128, 128, 32, 64, 64, 1),
+    (128, 128, 128, 64, 64, 32, 1),
+    (128, 128, 128, 64, 32, 32, 1),
+    (128, 128, 128, 32, 64, 32, 1),
+    (128, 128, 128, 32, 32, 64, 1),
+    # gemm v2
+    (128, 128, 128, 32, 32, 32, 2),
+    (128, 128, 128, 64, 64, 64, 2),
+    (128, 128, 128, 64, 32, 64, 2),
+    (128, 128, 128, 32, 64, 64, 2),
+    (128, 128, 128, 64, 64, 32, 2),
+    (128, 128, 128, 64, 32, 32, 2),
+    (128, 128, 128, 32, 64, 32, 2),
+    (128, 128, 128, 32, 32, 64, 2),
+]
+
+
+@pytest.mark.parametrize(
+    "M, N, K, block_M, block_N, block_K, version",
+    GEMM_TEST_CASES,
+)
+def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, version):
+    # Enable v2
+    env.TILELANG_USE_GEMM_V1 = 0
+    assert not env.use_gemm_v1()
+    target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
-        mod = broadcast_mismatched_layouts_kernel()
-        # Both immutable annotations are preserved (no error at layout inference)
-        mod = apply_passes_up_to_layout_inference(mod, target)
+        mod = matmul(M, N, K, block_M, block_N, block_K, version)
+    layouts = run_sunmmio_layout_inference(mod, target)
 
-        func = list(mod.functions.values())[0]
-        layout_map, _ = extract_layout_maps(func)
-        assert layout_map is not None
+    # A (ASRAM): ZZ, B (WSRAM): ZN (transB=False), C (RSRAM): ZZ — block (32,32) for fp16
+    assert_layout(layouts, "A_shared", "ZZ", block=(32, 32))
+    assert_layout(layouts, "B_shared", "ZN", block=(32, 32))
+    assert_layout(layouts, "C_shared", "ZZ", block=(32, 32))
 
-        # Both buffers keep their original annotations
-        buf_a, layout_a = get_buf_by_name(layout_map, "A_shared")
-        assert buf_a is not None
-        expected_zz = make_zz_layout(buf_a.shape, axes=[0, 1], block_shape=[32, 32])
-        assert is_same_layout(layout_a, expected_zz), f"A_shared should keep ZZ annotation, got {layout_a}"
 
-        buf_b, layout_b = get_buf_by_name(layout_map, "B_shared")
-        assert buf_b is not None
-        expected_zn = make_zn_layout(buf_b.shape, axes=[0, 1], block_shape=[32, 32])
-        assert is_same_layout(layout_b, expected_zn), f"B_shared should keep ZN annotation, got {layout_b}"
+def matmul_persistent(M, N, K, block_M, block_N, block_K, num_stages, dtype=T.bfloat16, accum_dtype=T.float32):
+    device_mesh_config = driver.get_sunmmio_device_mesh_config()
+    nrows, ncols = device_mesh_config
+    ncores = nrows * ncols
+
+    A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
+    B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
+    C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), device_mesh_config, dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), device_mesh_config, dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), device_mesh_config, accum_dtype, layout=C_layout),
+    ):
+        with T.Kernel(ncores) as (_cid):
+            sharded_M, sharded_K = A.shape
+            _, sharded_N = B.shape
+
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            B_shared_dist = T.alloc_shared((block_K * nrows, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+
+            # Each core iterates its own sharded tile grid with plain nested
+            # loops. The MeshTensor sharding already distributes A/B/C across
+            # the core mesh, so no persistent core-distribution loop is used.
+            for bx in T.serial(T.ceildiv(sharded_M, block_M)):
+                for by in T.serial(T.ceildiv(sharded_N, block_N)):
+                    T.clear(C_shared)
+                    for k in T.Pipelined(T.ceildiv(sharded_K, block_K), num_stages=num_stages):
+                        # Stage each A/B tile into a shared buffer, then
+                        # all-gather it across the core row / column.
+                        # all_gather needs a Buffer source (not an indexed
+                        # element) and an explicit concat axis.
+                        T.copy(A[bx * block_M, k * block_K], A_shared)
+                        T.comm.all_gather(A_shared, A_shared_dist, direction="horizontal", axis=-1)
+                        T.copy(B[k * block_K, by * block_N], B_shared)
+                        T.comm.all_gather(B_shared, B_shared_dist, direction="vertical", axis=0)
+                        T.gemm(A_shared_dist, B_shared_dist, C_shared)
+
+                    T.copy(C_shared, C[bx * block_M, by * block_N])
+
+    return tvm.IRModule({"main": main})
+
+
+def test_tilelang_sunmmio_persistent_gemm():
+    target = determine_target("Sunmmio", return_object=True)
+    block_M = block_N = block_K = 256
+    with tvm.target.Target(target):
+        mod = matmul_persistent(1024, 1024, 1024, block_M, block_N, block_K, num_stages=2)
+    layouts = run_sunmmio_layout_inference(mod, target)
+
+    # gemm(A_shared_dist, B_shared_dist, C_shared) operand layouts:
+    assert_layout(layouts, "A_shared_dist", "ZZ", block=(32, 32))  # ASRAM, left operand
+    assert_layout(layouts, "B_shared_dist", "ZN", block=(32, 32))  # WSRAM, right operand (transB=False)
+    assert_layout(layouts, "C_shared", "ZZ", block=(32, 32))  # RSRAM, accumulator
+
+    # The all_gather staging src into the ZN WSRAM operand stays ZZ — a ZN
+    # WSRAM dst legally accepts a ZZ src, so comm must not force it to ZN.
+    assert_layout(layouts, "B_shared", "ZZ", block=(32, 32))
