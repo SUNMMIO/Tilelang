@@ -9,6 +9,7 @@ from tvm.tir import Buffer, BufferLoad, BufferRegion
 from .swizzle import _get_buffer_info
 
 _make_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_row_major")
+_make_aligned_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_aligned_row_major")
 _make_zz = tvm_ffi.get_global_func("tl.sunmmio.make_zz")
 _make_zn = tvm_ffi.get_global_func("tl.sunmmio.make_zn")
 _make_zzz = tvm_ffi.get_global_func("tl.sunmmio.make_zzz")
@@ -18,6 +19,18 @@ _make_nzz = tvm_ffi.get_global_func("tl.sunmmio.make_nzz")
 def make_row_major(shape):
     """Create a row-major CuteLayout."""
     return _make_row_major(shape)
+
+
+def make_aligned_row_major(shape_or_buffer, dtype, align_bytes=64):
+    """Create an alignment-padded row-major CuteLayout for RSRAM.
+
+    The leading-dimension stride is padded so that each row of the innermost
+    (contiguous) axis starts on an ``align_bytes`` boundary. The padding lives
+    only in the strides; the logical shape is preserved. Rank < 2 falls back to
+    plain row-major.
+    """
+    shape = _normalize_shape(shape_or_buffer)
+    return _make_aligned_row_major(shape, dtype, align_bytes)
 
 
 def _to_expr(v):

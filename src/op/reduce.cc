@@ -1054,16 +1054,36 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &T,
       auto *src_cute = T.layout_map[src].as<CuteLayoutNode>();
       bool reduces_blocked_dim =
           src_cute && src_cute->GetDimLevels()[dim].IntValue() > 1;
-      if (reduces_blocked_dim) {
-        result.Set(dst, sunmmio::MakeRowMajor(dst->shape));
-      } else {
-        auto derived = DeriveLayoutLike(T.layout_map[src], dst->shape);
-        if (derived.defined()) {
-          result.Set(dst, derived.value());
-        } else {
-          result.Set(dst, sunmmio::MakeRowMajor(dst->shape));
+      int align_bytes =
+          GetSunmmioTileProcessorConfig(T.target).rsram_align_bytes;
+      // True if any logical dim of `layout` is blocked (dim_levels > 1), i.e.
+      // it carries tiling structure that is inherently block-aligned.  A plain
+      // row-major layout (all dim_levels == 1) returns false.
+      auto HasBlockedDim = [](const Layout &layout) {
+        if (const auto *cute = layout.as<CuteLayoutNode>()) {
+          for (const Integer &lvl : cute->GetDimLevels()) {
+            if (lvl.IntValue() > 1)
+              return true;
+          }
         }
+        return false;
+      };
+      // Reducing a non-blocked axis can preserve surviving blocked structure
+      // (already block-aligned).  Keep DeriveLayoutLike's result only when
+      // blocks actually survive; any unblocked (row-major) outcome (a
+      // blocked-axis reduction, a fully-unblocked src / chained reduce, or a
+      // failed derivation) goes through MakeAlignedRowMajor so each row stays
+      // RSRAM-aligned.
+      Layout dst_layout;
+      if (!reduces_blocked_dim) {
+        auto derived = DeriveLayoutLike(T.layout_map[src], dst->shape);
+        if (derived.defined() && HasBlockedDim(derived.value()))
+          dst_layout = derived.value();
       }
+      if (!dst_layout.defined())
+        dst_layout =
+            sunmmio::MakeAlignedRowMajor(dst->shape, dst->dtype, align_bytes);
+      result.Set(dst, dst_layout);
     }
     return result;
   }

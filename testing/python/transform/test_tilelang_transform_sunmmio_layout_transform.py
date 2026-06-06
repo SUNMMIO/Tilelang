@@ -10,12 +10,13 @@ sunmmio_example_gemm.py does — T.MeshTensor on the Sunmmio device mesh,
 carrying an explicit layout.
 """
 
+import pytest
 import tilelang
 import tilelang as tl
 import tilelang.language as T
 from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
-from tilelang.layout import make_row_major, make_zz_layout
+from tilelang.layout import make_row_major, make_zz_layout, make_aligned_row_major
 from tilelang.language.mesh_tensor import MeshReplicationType
 from tilelang.carver.arch import driver
 from tvm import tir
@@ -175,6 +176,25 @@ def zz_dram_reduce_kernel():
     return tvm.IRModule({"main": main})
 
 
+def padded_rsram_copy_kernel(rows, cols):
+    """Unpadded row-major DRAM <-> alignment-padded row-major RSRAM, both
+    directions.  The leading-dimension pitch mismatch (e.g. cols 40 -> 64)
+    forces a pad/unpad sunmmio_layout_transform rather than a plain dma_copy."""
+
+    @T.prim_func
+    def main(
+        A: _dram((rows, cols), make_row_major((rows, cols))),
+        B: _dram((rows, cols), make_row_major((rows, cols))),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            X = T.alloc_shared((rows, cols), DTYPE, scope="shared.rsram")
+            T.annotate_layout({X: make_aligned_row_major((rows, cols), "float16", 64)})
+            T.copy(A, X)  # DRAM(unpadded) -> RSRAM(padded): PAD
+            T.copy(X, B)  # RSRAM(padded) -> DRAM(unpadded): UNPAD
+
+    return tvm.IRModule({"main": main})
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -236,6 +256,101 @@ def test_matched_layout_stays_plain_dma_copy():
         assert names.count("tl.dma_copy") == 1, names
         assert "tl.sunmmio_layout_transform" not in names, names
         assert staging_buffers(func) == [], [b.name for b in staging_buffers(func)]
+
+
+def test_padded_rsram_copy_splits_into_pad_unpad():
+    """A padded RSRAM <-> unpadded DRAM copy splits into dma + transform in BOTH
+    directions: the store leg must not fast-path despite IsLayoutMatch ignoring
+    the leading-dimension padding."""
+    target = determine_target("Sunmmio", return_object=True)
+    mod = padded_rsram_copy_kernel(2, 40)  # 40 -> padded 64; leading 2 <= 32
+    with tvm.target.Target(target):
+        mod = apply_passes_through_lower_tile_op(mod, target)
+        func = list(mod.functions.values())[0]
+
+        names = collect_call_names(func)
+        # One dma_copy + one transform per copy (PAD on load, UNPAD on store).
+        assert names.count("tl.dma_copy") == 2, names
+        assert names.count("tl.sunmmio_layout_transform") == 2, names
+        stages = staging_buffers(func)
+        assert len(stages) == 2, [b.name for b in stages]
+
+
+def test_padded_rsram_copy_rejects_leading_dim_over_32():
+    """pad/unpad supports only a leading dimension (product of all dims except
+    the last) <= 32; a larger one must fail loudly."""
+    target = determine_target("Sunmmio", return_object=True)
+    mod = padded_rsram_copy_kernel(40, 40)  # leading 40 > 32
+    with tvm.target.Target(target), pytest.raises(Exception, match="leading dimension"):
+        apply_passes_through_lower_tile_op(mod, target)
+
+
+def test_padded_rsram_copy_leading_dim_32_is_allowed():
+    """Leading dim exactly 32 is at the limit and allowed (boundary)."""
+    target = determine_target("Sunmmio", return_object=True)
+    mod = padded_rsram_copy_kernel(32, 40)  # leading 32 == limit
+    with tvm.target.Target(target):
+        mod = apply_passes_through_lower_tile_op(mod, target)
+        func = list(mod.functions.values())[0]
+        assert collect_call_names(func).count("tl.sunmmio_layout_transform") == 2
+
+
+def test_padded_rsram_copy_leading_dim_33_rejected():
+    """Leading dim 33 is one past the limit and rejected (boundary)."""
+    target = determine_target("Sunmmio", return_object=True)
+    mod = padded_rsram_copy_kernel(33, 40)  # leading 33 > limit
+    with tvm.target.Target(target), pytest.raises(Exception, match="leading dimension"):
+        apply_passes_through_lower_tile_op(mod, target)
+
+
+def padded_rsram_copy_kernel_3d(d0, d1, cols):
+    @T.prim_func
+    def main(
+        A: _dram((d0, d1, cols), make_row_major((d0, d1, cols))),
+        B: _dram((d0, d1, cols), make_row_major((d0, d1, cols))),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            X = T.alloc_shared((d0, d1, cols), DTYPE, scope="shared.rsram")
+            T.annotate_layout({X: make_aligned_row_major((d0, d1, cols), "float16", 64)})
+            T.copy(A, X)
+            T.copy(X, B)
+
+    return tvm.IRModule({"main": main})
+
+
+def test_padded_rsram_copy_rank3_splits():
+    """Rank-3 padded copy: the 32-limit is on the product of all dims except the
+    last (2*3 = 6 <= 32), and the inner 40 -> 64 padding still drives a split."""
+    target = determine_target("Sunmmio", return_object=True)
+    mod = padded_rsram_copy_kernel_3d(2, 3, 40)
+    with tvm.target.Target(target):
+        mod = apply_passes_through_lower_tile_op(mod, target)
+        func = list(mod.functions.values())[0]
+        assert collect_call_names(func).count("tl.sunmmio_layout_transform") == 2
+
+
+def test_aligned_rsram_copy_already_32_multiple_stays_plain():
+    """When the RSRAM 'aligned' layout is a no-op (inner already a 32-multiple)
+    it matches the unpadded DRAM, so the copy stays a plain dma_copy."""
+    target = determine_target("Sunmmio", return_object=True)
+
+    @T.prim_func
+    def main(
+        A: _dram((2, 64), make_row_major((2, 64))),
+        B: _dram((2, 64), make_row_major((2, 64))),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            X = T.alloc_shared((2, 64), DTYPE, scope="shared.rsram")
+            T.annotate_layout({X: make_aligned_row_major((2, 64), "float16", 64)})
+            T.copy(A, X)
+            T.copy(X, B)
+
+    with tvm.target.Target(target):
+        mod = apply_passes_through_lower_tile_op(tvm.IRModule({"main": main}), target)
+        func = list(mod.functions.values())[0]
+        names = collect_call_names(func)
+        assert "tl.sunmmio_layout_transform" not in names, names
+        assert names.count("tl.dma_copy") == 2, names
 
 
 def test_sync_injected_between_dma_and_transform():

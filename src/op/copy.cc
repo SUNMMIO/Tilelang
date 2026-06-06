@@ -845,15 +845,13 @@ Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
       (src.scope() == "global" && dst.scope() == kSunmmioScopeRSRAM) ||
       (src.scope() == kSunmmioScopeRSRAM && dst.scope() == "global");
 
-  // Fast path: a non-DRAM<->RSRAM copy, or matching/unknown layouts, lowers
-  // to a plain dma_copy.  IsLayoutMatch compares layout *kind* regardless of
-  // logical shape — a copy moves a tile, so the buffers differ in shape.
-  if (!is_dram_rsram || !src_layout.defined() || !dst_layout.defined() ||
-      IsLayoutMatch(src_layout, dst_layout, analyzer)) {
+  // Non-DRAM<->RSRAM copies, or copies with unknown layouts, lower to a plain
+  // dma_copy.
+  if (!is_dram_rsram || !src_layout.defined() || !dst_layout.defined()) {
     return dma(src_region, dst_region);
   }
 
-  // Mismatched DRAM<->RSRAM copy.  The DRAM-side layout drives the staging
+  // Determine the DRAM / RSRAM sides; the DRAM-side layout drives the staging
   // buffer.
   bool src_is_dram = src.scope() == "global";
   const Buffer &dram = src_is_dram ? src : dst;
@@ -863,36 +861,65 @@ Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
   bool dram_is_zz = sunmmio::IsZZLike(dram_layout);
   bool rsram_is_zz = sunmmio::IsZZLike(rsram_layout);
 
-  // The fast path already returned for matching layouts.  The transform
-  // supports exactly one pairing — one ZZ-like side, one row-major side —
-  // and rejects everything else (ZZ<->ZZ with mismatched blocks, ZZ<->ZN,
-  // ...).  ZN occurs only on the DRAM->WSRAM path, never DRAM<->RSRAM.
   auto is_row_major = [](const Layout &l) {
     return IsSameLayout(l, sunmmio::MakeRowMajor(l->InputShape()));
   };
+  // The RSRAM side is alignment-padded row-major when it is not ZZ and not the
+  // plain row-major of its shape (its leading dimension is padded). A plain
+  // dma_copy cannot bridge that pitch gap; it needs a pad/unpad transform in
+  // both directions (IsLayoutMatch is blind to padding and would otherwise
+  // wrongly fast-path the store leg).
+  bool rsram_is_padded_rm = !rsram_is_zz && !is_row_major(rsram_layout);
+
+  // Fast path: a plain dma_copy suffices when the layouts match and the RSRAM
+  // side carries no leading-dimension padding.
+  if (IsLayoutMatch(src_layout, dst_layout, analyzer) && !rsram_is_padded_rm) {
+    return dma(src_region, dst_region);
+  }
+
+  // The transform supports one ZZ-like side paired with a row-major side, or a
+  // padded RSRAM row-major paired with an unpadded DRAM row-major.
   bool supported = (dram_is_zz && is_row_major(rsram_layout)) ||
-                   (rsram_is_zz && is_row_major(dram_layout));
+                   (rsram_is_zz && is_row_major(dram_layout)) ||
+                   (rsram_is_padded_rm && is_row_major(dram_layout));
   ICHECK(supported)
-      << "sunmmio layout transform supports only a ZZ-like <-> row-major "
-         "pair, got DRAM "
+      << "sunmmio layout transform supports a ZZ-like <-> row-major or a "
+         "padded <-> unpadded row-major pair, got DRAM "
       << dram_layout->DebugOutput() << " and RSRAM "
       << rsram_layout->DebugOutput() << ".";
 
-  Layout zz_layout = dram_is_zz ? dram_layout : rsram_layout;
-  auto zz_block = sunmmio::GetZZBlockShape(zz_layout);
-  ICHECK(zz_block.has_value())
-      << "sunmmio layout transform: cannot extract a ZZ block shape.";
+  if (dram_is_zz || rsram_is_zz) {
+    Layout zz_layout = dram_is_zz ? dram_layout : rsram_layout;
+    auto zz_block = sunmmio::GetZZBlockShape(zz_layout);
+    ICHECK(zz_block.has_value())
+        << "sunmmio layout transform: cannot extract a ZZ block shape.";
 
-  // A ZZ block that exactly covers the buffer is a single block — physically
-  // identical to row-major — so a plain dma_copy already moves correct data.
-  if (auto *cute = zz_layout.as<CuteLayoutNode>()) {
-    Array<PrimExpr> shape = cute->GetLogicalShape();
-    int rank = static_cast<int>(shape.size());
-    if (rank >= 2 &&
-        analyzer->CanProveEqual(shape[rank - 2], zz_block->height) &&
-        analyzer->CanProveEqual(shape[rank - 1], zz_block->width)) {
-      return dma(src_region, dst_region);
+    // A ZZ block that exactly covers the buffer is a single block, physically
+    // identical to row-major, so a plain dma_copy already moves correct data.
+    if (auto *cute = zz_layout.as<CuteLayoutNode>()) {
+      Array<PrimExpr> shape = cute->GetLogicalShape();
+      int rank = static_cast<int>(shape.size());
+      if (rank >= 2 &&
+          analyzer->CanProveEqual(shape[rank - 2], zz_block->height) &&
+          analyzer->CanProveEqual(shape[rank - 1], zz_block->width)) {
+        return dma(src_region, dst_region);
+      }
     }
+  } else {
+    // Padded <-> unpadded row-major: the pad/unpad builtin can only transform a
+    // leading dimension (product of all dims except the last) up to 32.
+    int rank = static_cast<int>(dram_range.size());
+    int64_t leading = 1;
+    for (int i = 0; i < rank - 1; ++i) {
+      const int64_t *ext = as_const_int(dram_range[i]->extent);
+      ICHECK(ext) << "sunmmio pad/unpad layout transform: leading extents must "
+                     "be static.";
+      leading *= *ext;
+    }
+    ICHECK(leading <= 32)
+        << "sunmmio pad/unpad layout transform requires the leading dimension "
+           "(product of all dims except the last) <= 32, but got "
+        << leading << ".";
   }
 
   // RSRAM staging buffer mirroring the DRAM-side layout, so its dma_copy leg

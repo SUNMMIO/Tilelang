@@ -274,6 +274,21 @@ std::optional<ZZBlockShape> GetZZBlockShape(const Layout &layout);
 
 Layout MakeRowMajor(Array<PrimExpr> shape);
 
+/*!
+ * \brief Row-major CuteLayout with the innermost extent padded for alignment.
+ *
+ * Rounds the innermost (contiguous) extent up to a multiple of `align_bytes`
+ * (expressed in elements of `dtype`) and stores it as the covered/physical
+ * extent in `mode_shape`, so the tile/DMA unit can read a full alignment-sized
+ * extent and every row starts on an aligned offset — required for RSRAM vector
+ * accesses.  The padding lands in `mode_shape`; `logical_shape` keeps the true
+ * extent so iteration domains stay correct.  Strides are dense row-major over
+ * the padded `mode_shape`, so alignment propagates to every outer dimension.
+ * Applies to rank >= 1 (a rank-1 [N] buffer becomes covered [round_up(N)]).
+ */
+Layout MakeAlignedRowMajor(Array<PrimExpr> shape, DataType dtype,
+                           int align_bytes);
+
 Layout MakeZZ(Array<PrimExpr> shape, Array<Integer> axes,
               Array<PrimExpr> block_shape);
 

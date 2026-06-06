@@ -10,7 +10,7 @@ from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 import tilelang as tl
 import tilelang.language as T
-from tilelang.layout import make_zz_layout, make_zn_layout
+from tilelang.layout import make_zz_layout, make_zn_layout, make_row_major
 from tilelang.layout.cute_layout import is_same_layout
 from tvm.tir import Block
 from tvm.tir.stmt_functor import post_order_visit
@@ -1328,3 +1328,48 @@ def test_broadcast_mismatched_immutable_preserves_annotations():
         assert buf_b is not None
         expected_zn = make_zn_layout(buf_b.shape, axes=[0, 1], block_shape=[32, 32])
         assert is_same_layout(layout_b, expected_zn), f"B_shared should keep ZN annotation, got {layout_b}"
+
+
+# ---------------------------------------------------------------------------
+# Test: rank-<2 RSRAM default is alignment-padded row-major; ASRAM/WSRAM
+# rank-<2 buffers are illegal and rejected.
+# ---------------------------------------------------------------------------
+
+
+def _rank1_copy_kernel(scope):
+    """A rank-1 SRAM buffer touched only by copies, so it falls to the kFree
+    scope default (no op-derived layout)."""
+
+    @T.prim_func
+    def main(A: T.Tensor((40,), "float16"), B: T.Tensor((40,), "float16")):
+        with T.Kernel(1, threads=128) as (bx,):
+            X = T.alloc_shared((40,), "float16", scope=scope)
+            T.copy(A, X)
+            T.copy(X, B)
+
+    return tvm.IRModule({"main": main})
+
+
+def test_rsram_rank1_copy_buffer_matches_unpadded_dram():
+    """A rank-1 RSRAM buffer touched only by copies is layout-matched to the
+    unpadded DRAM by propagation, which overrides the aligned kFree default.
+
+    This is correct: a pure DMA passthrough is never tile-accessed, so it needs
+    no leading-dim padding, and matching keeps the copy a plain dma_copy. The
+    aligned default only survives for buffers an op explicitly assigns (e.g. a
+    reduce output, covered by the reduce tests)."""
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        mod = apply_passes_up_to_layout_inference(_rank1_copy_kernel("shared.rsram"), target)
+        func = list(mod.functions.values())[0]
+        layout_map, _ = extract_layout_maps(func)
+        _, x_layout = get_buf_by_name(layout_map, "X")
+        assert x_layout is not None
+        assert is_same_layout(x_layout, make_row_major((40,)))
+
+
+def test_rank1_asram_buffer_is_rejected():
+    """ASRAM/WSRAM only accept rank-2 tensors; a rank-1 one must fail loudly."""
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target), pytest.raises(Exception, match="rank-2"):
+        apply_passes_up_to_layout_inference(_rank1_copy_kernel("shared.asram"), target)

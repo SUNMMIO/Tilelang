@@ -776,6 +776,52 @@ Layout MakeRowMajor(Array<PrimExpr> shape) {
   return CuteLayout(shape, mode_shape, mode_stride, dim_levels);
 }
 
+Layout MakeAlignedRowMajor(Array<PrimExpr> shape, DataType dtype,
+                           int align_bytes) {
+  int rank = shape.size();
+  if (rank < 1)
+    return MakeRowMajor(shape);
+
+  int elem_bytes = dtype.bytes();
+  if (elem_bytes < 1)
+    elem_bytes = 1;
+  // Number of elements that fill one alignment unit (e.g. 64B / 2B = 32 for
+  // bf16).
+  int align_elems = align_bytes / elem_bytes;
+  if (align_elems < 1)
+    align_elems = 1;
+
+  Array<PrimExpr> mode_shape;
+  Array<PrimExpr> mode_stride;
+  Array<Integer> dim_levels;
+
+  // Round the innermost (contiguous) extent up to a multiple of align_elems and
+  // store it as the covered/physical extent in mode_shape.  This gives the
+  // tile/DMA unit a full alignment-sized extent to read and makes every row
+  // start on an aligned offset.  logical_shape keeps the true extent so
+  // iteration domains stay correct.  A rank-1 [N] buffer becomes covered
+  // [round_up(N)], with no leading-dimension stride needed.
+  for (int d = 0; d < rank; ++d)
+    mode_shape.push_back(shape[d]);
+  mode_shape.Set(rank - 1, ceildiv(shape[rank - 1], makeInt(align_elems)) *
+                               makeInt(align_elems));
+
+  // Dense row-major strides over the PADDED mode_shape, so alignment propagates
+  // to every outer dimension automatically.
+  std::vector<PrimExpr> strides(rank);
+  strides[rank - 1] = makeInt(1);
+  for (int i = rank - 2; i >= 0; --i) {
+    strides[i] = strides[i + 1] * mode_shape[i + 1];
+  }
+
+  for (int d = 0; d < rank; ++d) {
+    mode_stride.push_back(strides[d]);
+    dim_levels.push_back(Integer(1));
+  }
+
+  return CuteLayout(shape, mode_shape, mode_stride, dim_levels);
+}
+
 /*!
  * \brief Build a row-major CuteAlgebraLayout from a logical shape.
  *
@@ -1094,6 +1140,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            [](Layout lhs, Layout rhs) { return IsLayoutMatch(lhs, rhs); })
       .def("tl.sunmmio.make_row_major",
            [](Array<PrimExpr> shape) { return sunmmio::MakeRowMajor(shape); })
+      .def("tl.sunmmio.make_aligned_row_major",
+           [](Array<PrimExpr> shape, DataType dtype, int align_bytes) {
+             return sunmmio::MakeAlignedRowMajor(shape, dtype, align_bytes);
+           })
       .def("tl.sunmmio.make_zz",
            [](Array<PrimExpr> shape, Array<Integer> axes,
               Array<PrimExpr> block_shape) {
