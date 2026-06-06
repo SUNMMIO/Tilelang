@@ -555,6 +555,38 @@ class TestDeriveLayoutLike:
         direct = make_nzz(_imms(64, 256), [0, 1], _imms(16, 16), _imms(4, 4))
         assert is_same_layout(derived, direct)
 
+    def test_derive_from_dynamic_2d_source(self):
+        """Derive from a 2D source whose extents are dynamic (one symbolic
+        stride)."""
+        M = tir.Var("m", "int32")
+        K = tir.Var("k", "int32")
+        src = make_zz([M, K], [0, 1], _imms(32, 32))
+        derived = derive_layout_like(src, _imms(256, 64), None)
+        assert derived is not None
+        direct = make_zz(_imms(256, 64), [0, 1], _imms(32, 32))
+        assert is_same_layout(derived, direct)
+
+    def test_derive_from_dynamic_higher_rank_source(self):
+        """RecoverPhysicalOrder (Option A) handles several symbolic strides:
+        derive from a 4D source whose two tiled extents are dynamic.  The
+        non-tiled batch sits physically outside the tiled counts, so the
+        source carries multiple symbolic strides."""
+        S = tir.Var("s", "int32")
+        D = tir.Var("d", "int32")
+        src = make_zz([_imm(2), S, _imm(4), D], [1, 3], _imms(32, 32))
+        derived = derive_layout_like(src, _imms(2, 128, 4, 64), [_imm(1), _imm(3)])
+        assert derived is not None
+        direct = make_zz(_imms(2, 128, 4, 64), [1, 3], _imms(32, 32))
+        assert is_same_layout(derived, direct)
+
+    def test_is_layout_match_dynamic_higher_rank(self):
+        """IsLayoutMatch on a dynamic higher-rank layout: derivation +
+        symbolic SameLayout over several symbolic strides (Option A)."""
+        S = tir.Var("s", "int32")
+        D = tir.Var("d", "int32")
+        dyn = make_zz([_imm(2), S, _imm(4), D], [1, 3], _imms(32, 32))
+        assert is_layout_match(dyn, dyn)
+
 
 class TestDeriveLayoutLikeRankChanging:
     """Tests for DeriveLayoutLike with rank-mismatched src and dst."""

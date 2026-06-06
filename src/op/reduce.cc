@@ -315,13 +315,13 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   }
 
   // Create outer loop variables for each dimension of the source tensor.
-  // Tiled dimensions will have extents = region_extent / tile_size.
+  // Tiled dimensions use ceildiv so tail tiles remain in the loop nest.
   Array<IterVar> loop_vars;
   loop_vars.reserve(src_ndim);
   for (int i = 0; i < src_ndim; i++) {
     PrimExpr extent = source_domain[i];
     if (src_dim_to_tile_size.count(i)) {
-      extent = truncdiv(extent, src_dim_to_tile_size[i]);
+      extent = analyzer->Simplify(ceildiv(extent, src_dim_to_tile_size[i]));
     }
     Var var("i" + std::to_string(i), extent->dtype);
     loop_vars.push_back({Range(0, extent), var, IterVarType::kDataPar});
@@ -345,20 +345,8 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
     dst_buf_dim_to_tile_axis[dim] = i;
   }
 
-  // Create interior loop variables (ki, kj, ...) for element-wise operations
-  // inside a Tile.
-  Array<Var> interior_vars;
   Array<PrimExpr> src_tile_shape = tv_src->TileShape();
-  interior_vars.reserve(src_tile_shape.size());
-  for (size_t i = 0; i < src_tile_shape.size(); i++) {
-    interior_vars.push_back(Var("k" + std::string{char('i' + i)}));
-  }
-
-  // Map output tiled axes to the same interior variables used by source to
-  // ensure coordinate consistency.
-  Array<Var> dst_interior_vars_mapped;
   Array<PrimExpr> dst_tile_shape = tv_dst->TileShape();
-  dst_interior_vars_mapped.reserve(tv_dst->IndexMap().size());
   auto dst_dim_to_src_dim = [&](int dst_dim) {
     for (int src_dim = 0; src_dim < src_ndim; ++src_dim) {
       if (plan.src_dim_to_dst_dim[src_dim] == dst_dim) {
@@ -369,40 +357,59 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
                << " back to a source dim for Sunmmio reduction.";
     return -1;
   };
-  for (size_t i = 0; i < tv_dst->IndexMap().size(); i++) {
-    int dst_dim_val = tv_dst->IndexMap()[i].as<IntImmNode>()->value;
-    if (dst_dim_val < 0)
-      dst_dim_val += dst_ndim;
 
-    // Match output dimension to the corresponding source dimension to find the
-    // correct interior variable.
-    int target_src_dim = dst_dim_to_src_dim(dst_dim_val);
-
-    bool found = false;
-    for (size_t j = 0; j < tv_src->IndexMap().size(); j++) {
-      int src_dim_val = tv_src->IndexMap()[j].as<IntImmNode>()->value;
-      if (src_dim_val < 0)
-        src_dim_val += src_ndim;
-      if (src_dim_val == target_src_dim) {
-        dst_interior_vars_mapped.push_back(interior_vars[j]);
-        found = true;
-        break;
-      }
+  // Create interior loop variables (ki, kj, ...) for one element-wise tile
+  // loop nest. These Vars are loop binders, so each sibling loop nest must get
+  // its own Var objects to keep TIR SSA-clean.
+  auto make_interior_vars = [](size_t rank) {
+    Array<Var> vars;
+    vars.reserve(rank);
+    for (size_t i = 0; i < rank; i++) {
+      vars.push_back(Var("k" + std::string{char('i' + i)}));
     }
-    ICHECK(found) << "Could not map dst tiled axis to src tiled axis";
-  }
+    return vars;
+  };
+
+  // Map output tiled axes to the interior variables used by the corresponding
+  // source axes. The mapping is derived per loop nest, so dst indices and src
+  // indices in the same nest reference the same Var objects.
+  auto map_dst_interior_vars = [&](const Array<Var> &src_interior_vars) {
+    Array<Var> mapped;
+    mapped.reserve(tv_dst->IndexMap().size());
+    for (size_t i = 0; i < tv_dst->IndexMap().size(); i++) {
+      int dst_dim_val = tv_dst->IndexMap()[i].as<IntImmNode>()->value;
+      if (dst_dim_val < 0)
+        dst_dim_val += dst_ndim;
+
+      int target_src_dim = dst_dim_to_src_dim(dst_dim_val);
+
+      bool found = false;
+      for (size_t j = 0; j < tv_src->IndexMap().size(); j++) {
+        int src_dim_val = tv_src->IndexMap()[j].as<IntImmNode>()->value;
+        if (src_dim_val < 0)
+          src_dim_val += src_ndim;
+        if (src_dim_val == target_src_dim) {
+          mapped.push_back(src_interior_vars[j]);
+          found = true;
+          break;
+        }
+      }
+      ICHECK(found) << "Could not map dst tiled axis to src tiled axis";
+    }
+    return mapped;
+  };
 
   // Helper functions to generate indices for element-wise TIR access.
   // Large buffers use (loop_var * tile_size + interior_var), while 'acc' uses
   // (interior_var).
-  auto get_src_indices = [&]() {
+  auto get_src_indices = [&](const Array<Var> &src_interior_vars) {
     Array<PrimExpr> indices;
     for (int i = 0; i < src_ndim; i++) {
       PrimExpr base = this->srcRegion_->region[i]->min;
       if (src_buf_dim_to_tile_axis.count(i)) {
         int axis = src_buf_dim_to_tile_axis.at(i);
         indices.push_back(base + loop_vars[i]->var * src_tile_shape[axis] +
-                          interior_vars[axis]);
+                          src_interior_vars[axis]);
       } else {
         indices.push_back(base + loop_vars[i]->var);
       }
@@ -410,11 +417,11 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
     return indices;
   };
 
-  auto get_acc_indices = [&]() {
+  auto get_acc_indices = [&](const Array<Var> &src_interior_vars) {
     Array<PrimExpr> indices;
     for (int i = 0; i < src_ndim; i++) {
       if (src_buf_dim_to_tile_axis.count(i)) {
-        indices.push_back(interior_vars[src_buf_dim_to_tile_axis.at(i)]);
+        indices.push_back(src_interior_vars[src_buf_dim_to_tile_axis.at(i)]);
       } else {
         indices.push_back(make_zero(DataType::Int(32)));
       }
@@ -422,7 +429,7 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
     return indices;
   };
 
-  auto get_dst_indices = [&]() {
+  auto get_dst_indices = [&](const Array<Var> &dst_interior_vars_mapped) {
     Array<PrimExpr> indices;
     for (int i = 0; i < dst_ndim; i++) {
       PrimExpr base = this->dstRegion_->region[i]->min;
@@ -444,7 +451,7 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
     return indices;
   };
 
-  auto get_res_indices = [&]() {
+  auto get_res_indices = [&](const Array<Var> &dst_interior_vars_mapped) {
     Array<PrimExpr> indices;
     for (int i = 0; i < dst_ndim; i++) {
       if (dst_buf_dim_to_tile_axis.count(i)) {
@@ -456,11 +463,6 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
     }
     return indices;
   };
-
-  Array<PrimExpr> src_idx = get_src_indices();
-  Array<PrimExpr> acc_idx = get_acc_indices();
-  Array<PrimExpr> dst_idx = get_dst_indices();
-  Array<PrimExpr> res_idx = get_res_indices();
 
   // Wraps a Stmt with interior loops (ki, kj, ...) representing element-wise
   // execution of a Tile. The innermost loop is marked as vectorized.
@@ -498,16 +500,70 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   // correct Tile semantics.
 
   // Step 1: Accumulate (Tile-to-Tile accumulation using element-wise
-  // operations)
-  Stmt accumulate_stmt =
-      BufferStore(acc,
-                  this->MakeReduce(BufferLoad(acc, acc_idx),
-                                   BufferLoad(this->src, src_idx)),
-                  acc_idx);
-  accumulate_stmt = wrap_interior(accumulate_stmt, interior_vars,
-                                  src_tile_shape, all_src_axes);
+  // operations). If the reduced tiled dimension has a tail tile, invalid lanes
+  // must be masked on the source load before the in-tile reduce runs.
+  auto make_reduce_axis_tail_predicate = [&](const Array<Var> &interior_vars) {
+    ICHECK(is_dim_tiled);
+    ICHECK_GE(reduce_tile_axis, 0);
+    PrimExpr tile_extent = src_tile_shape[reduce_tile_axis];
+    PrimExpr logical_index = loop_vars[this->dim]->var * tile_extent +
+                             interior_vars[reduce_tile_axis];
+    return logical_index < source_domain[this->dim];
+  };
+
+  auto make_accumulate_stmt = [&](bool use_tail_predicate) {
+    Array<Var> accumulate_vars = make_interior_vars(src_tile_shape.size());
+    Array<PrimExpr> accumulate_src_idx = get_src_indices(accumulate_vars);
+    Array<PrimExpr> accumulate_acc_idx = get_acc_indices(accumulate_vars);
+
+    PrimExpr src_value;
+    if (use_tail_predicate) {
+      PrimExpr predicate = make_reduce_axis_tail_predicate(accumulate_vars);
+      PrimExpr masked_load = BufferLoad(this->src, accumulate_src_idx,
+                                        Optional<PrimExpr>(predicate));
+      // BufferLoad::predicate masks memory lanes only.  The false-lane value
+      // must still be made explicit so max/min/etc. reduce invalid lanes with
+      // their identity value instead of whatever the target chooses for a
+      // masked-off load.
+      src_value = if_then_else(predicate, masked_load, this->MakeInitValue());
+    } else {
+      src_value = BufferLoad(this->src, accumulate_src_idx);
+    }
+
+    Stmt stmt = BufferStore(
+        acc, this->MakeReduce(BufferLoad(acc, accumulate_acc_idx), src_value),
+        accumulate_acc_idx);
+    return wrap_interior(stmt, accumulate_vars, src_tile_shape, all_src_axes);
+  };
+
+  Stmt accumulate_stmt = make_accumulate_stmt(/*use_tail_predicate=*/false);
+  if (is_dim_tiled) {
+    PrimExpr reduce_tile_extent = src_tile_shape[reduce_tile_axis];
+    PrimExpr reduce_extent_remainder = analyzer->Simplify(
+        floormod(source_domain[this->dim], reduce_tile_extent));
+    PrimExpr zero_remainder = make_zero(reduce_extent_remainder.dtype());
+    bool has_reduce_axis_tail =
+        !analyzer->CanProve(reduce_extent_remainder == zero_remainder);
+    if (has_reduce_axis_tail) {
+      PrimExpr full_reduce_tile = analyzer->Simplify(
+          loop_vars[this->dim]->var * reduce_tile_extent + reduce_tile_extent <=
+          source_domain[this->dim]);
+      Stmt tail_accumulate_stmt =
+          make_accumulate_stmt(/*use_tail_predicate=*/true);
+      if (analyzer->CanProve(full_reduce_tile)) {
+        // Keep the aligned fast path.
+      } else if (analyzer->CanProve(!full_reduce_tile)) {
+        accumulate_stmt = tail_accumulate_stmt;
+      } else {
+        accumulate_stmt =
+            IfThenElse(full_reduce_tile, accumulate_stmt, tail_accumulate_stmt);
+      }
+    }
+  }
 
   // Step 2: Init (Guarded: only run on the first step of the reduction loop)
+  Array<Var> init_vars = make_interior_vars(src_tile_shape.size());
+  Array<PrimExpr> init_acc_idx = get_acc_indices(init_vars);
   Stmt init_stmt;
   if (this->clear || is_dim_tiled) {
     // If we are reducing along a tiled axis, we MUST initialize 'acc' with the
@@ -518,18 +574,19 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
     // times (resulting in "multiple additions"). The correct approach for
     // clear=False + is_dim_tiled is to accumulate the pure reduced result into
     // 'dst' during the finalize step.
-    init_stmt = BufferStore(acc, this->MakeInitValue(), acc_idx);
+    init_stmt = BufferStore(acc, this->MakeInitValue(), init_acc_idx);
   } else {
     // For non-tiled axis reduction, 'acc' shape matches 'dst' shape within the
     // tile, so we can safely load the initial value.
-    PrimExpr init_val = BufferLoad(this->dst, dst_idx);
+    Array<Var> init_dst_vars = map_dst_interior_vars(init_vars);
+    Array<PrimExpr> init_dst_idx = get_dst_indices(init_dst_vars);
+    PrimExpr init_val = BufferLoad(this->dst, init_dst_idx);
     if (this->type->isAbsSum() || this->type->isAbsMax()) {
       init_val = tvm::abs(init_val);
     }
-    init_stmt = BufferStore(acc, init_val, acc_idx);
+    init_stmt = BufferStore(acc, init_val, init_acc_idx);
   }
-  init_stmt =
-      wrap_interior(init_stmt, interior_vars, src_tile_shape, all_src_axes);
+  init_stmt = wrap_interior(init_stmt, init_vars, src_tile_shape, all_src_axes);
 
   // Step 3: Finalize (Guarded: run on the last step of the reduction loop)
   Stmt finalize_stmt;
@@ -602,8 +659,12 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
                          IntImm(DataType::Int(32), reduce_tile_axis)}));
 
       // 4. Final accumulation from dst_res to dst
-      PrimExpr dst_val = BufferLoad(this->dst, dst_idx);
-      PrimExpr res_val = BufferLoad(dst_res_buf, res_idx);
+      Array<Var> finalize_src_vars = make_interior_vars(src_tile_shape.size());
+      Array<Var> finalize_dst_vars = map_dst_interior_vars(finalize_src_vars);
+      Array<PrimExpr> finalize_dst_idx = get_dst_indices(finalize_dst_vars);
+      Array<PrimExpr> finalize_res_idx = get_res_indices(finalize_dst_vars);
+      PrimExpr dst_val = BufferLoad(this->dst, finalize_dst_idx);
+      PrimExpr res_val = BufferLoad(dst_res_buf, finalize_res_idx);
       if (this->type->isAbsSum() || this->type->isAbsMax()) {
         dst_val = tvm::abs(dst_val);
       }
@@ -617,8 +678,8 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
       } else {
         LOG(FATAL) << "Unsupported reduce type for Sunmmio accumulation";
       }
-      Stmt add_res_stmt = BufferStore(this->dst, update, dst_idx);
-      add_res_stmt = wrap_interior(add_res_stmt, dst_interior_vars_mapped,
+      Stmt add_res_stmt = BufferStore(this->dst, update, finalize_dst_idx);
+      add_res_stmt = wrap_interior(add_res_stmt, finalize_dst_vars,
                                    dst_tile_shape, all_dst_axes);
 
       finalize_stmt = SeqStmt({in_tile_reduce_stmt, add_res_stmt});
@@ -626,9 +687,14 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   } else {
     // If reduction is NOT along a tiled axis (e.g. Batch axis), 'acc' already
     // holds the result.
-    Stmt store_stmt = BufferStore(this->dst, BufferLoad(acc, acc_idx), dst_idx);
+    Array<Var> store_vars = make_interior_vars(src_tile_shape.size());
+    Array<Var> store_dst_vars = map_dst_interior_vars(store_vars);
+    Array<PrimExpr> store_acc_idx = get_acc_indices(store_vars);
+    Array<PrimExpr> store_dst_idx = get_dst_indices(store_dst_vars);
+    Stmt store_stmt =
+        BufferStore(this->dst, BufferLoad(acc, store_acc_idx), store_dst_idx);
     store_stmt =
-        wrap_interior(store_stmt, interior_vars, src_tile_shape, all_src_axes);
+        wrap_interior(store_stmt, store_vars, src_tile_shape, all_src_axes);
     finalize_stmt = store_stmt;
   }
 

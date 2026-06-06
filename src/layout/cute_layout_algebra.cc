@@ -7,6 +7,7 @@
 
 #include "cute_layout_algebra.h"
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tir/op.h>
@@ -28,6 +29,20 @@ int64_t toConcrete(const PrimExpr &expr) {
   auto *imm = expr.as<IntImmNode>();
   ICHECK(imm) << "CuTe algebra requires a concrete integer, got: " << expr;
   return imm->value;
+}
+
+bool tryConstInt(const PrimExpr &expr, int64_t *out) {
+  if (const auto *imm = expr.as<IntImmNode>()) {
+    *out = imm->value;
+    return true;
+  }
+  arith::Analyzer analyzer;
+  PrimExpr simplified = analyzer.Simplify(expr);
+  if (const auto *imm = simplified.as<IntImmNode>()) {
+    *out = imm->value;
+    return true;
+  }
+  return false;
 }
 
 static PrimExpr makeInt(int64_t v) { return make_const(DataType::Int(32), v); }
@@ -197,72 +212,62 @@ CuteAlgebraLayout coalesce(const CuteAlgebraLayout &layout) {
   auto flatStride = flattenExprTuple(layout.stride);
   ICHECK_EQ(flatShape.size(), flatStride.size());
 
-  std::vector<int64_t> resultShape{1};
-  std::vector<int64_t> resultStride{0};
+  // Sentinel (shape 1, stride 0) — matches the original accumulator seed.
+  std::vector<PrimExpr> resultShape{makeInt(1)};
+  std::vector<PrimExpr> resultStride{makeInt(0)};
 
   for (size_t i = 0; i < flatShape.size(); ++i) {
-    auto *shapeImm = flatShape[i].as<IntImmNode>();
-    auto *strideImm = flatStride[i].as<IntImmNode>();
+    int64_t s;
+    bool shapeConst = tryConstInt(flatShape[i], &s);
 
-    // If either is symbolic, we cannot merge — keep as separate mode.
-    if (!shapeImm || !strideImm) {
-      // Flush the current concrete accumulator as-is, then add the
-      // symbolic mode as a standalone entry.  We cannot coalesce across
-      // symbolic boundaries.
-      //
-      // For our use case (block/tiler layouts), all values are concrete,
-      // so this path should not be hit.  We add it for safety.
-      ICHECK(shapeImm && strideImm)
-          << "CuTe coalesce expects concrete modes, got shape=" << flatShape[i]
-          << " stride=" << flatStride[i];
+    // Drop trivial (shape-1) modes.  A symbolic shape can never be proven to
+    // be 1, so it is always kept.
+    if (shapeConst && s == 1)
+      continue;
+
+    int64_t backShape;
+    bool backShapeConst = tryConstInt(resultShape.back(), &backShape);
+
+    // Replace the sentinel / a leading shape-1 mode in place.
+    if (backShapeConst && backShape == 1) {
+      resultShape.back() = flatShape[i];
+      resultStride.back() = flatStride[i];
       continue;
     }
 
-    int64_t s = shapeImm->value;
-    int64_t d = strideImm->value;
-
-    if (s == 1)
-      continue;
-
-    if (resultShape.back() == 1) {
-      resultShape.back() = s;
-      resultStride.back() = d;
-      continue;
-    }
-
-    if (resultShape.back() * resultStride.back() == d) {
-      resultShape.back() *= s;
+    // Merge into the previous mode only when contiguity is provable (all
+    // concrete): back.shape * back.stride == this.stride.  Symbolic modes
+    // cannot be merged and fall through to a standalone entry below.
+    int64_t backStride, d;
+    if (shapeConst && backShapeConst &&
+        tryConstInt(resultStride.back(), &backStride) &&
+        tryConstInt(flatStride[i], &d) && backShape * backStride == d) {
+      resultShape.back() = makeInt(backShape * s);
       continue;
     }
 
-    resultShape.push_back(s);
-    resultStride.push_back(d);
+    resultShape.push_back(flatShape[i]);
+    resultStride.push_back(flatStride[i]);
   }
 
-  std::vector<PrimExpr> rs, rd;
-  rs.reserve(resultShape.size());
-  rd.reserve(resultStride.size());
-  for (size_t i = 0; i < resultShape.size(); ++i) {
-    rs.push_back(makeInt(resultShape[i]));
-    rd.push_back(makeInt(resultStride[i]));
+  if (resultShape.size() == 1) {
+    return CuteAlgebraLayout(resultShape[0], resultStride[0]);
   }
-
-  if (rs.size() == 1) {
-    return CuteAlgebraLayout(rs[0], rd[0]);
-  }
-  return CuteAlgebraLayout(rs, rd);
+  return CuteAlgebraLayout(resultShape, resultStride);
 }
 
 // ---------------------------------------------------------------------------
 // complement
 // ---------------------------------------------------------------------------
 
-CuteAlgebraLayout complement(const CuteAlgebraLayout &layout, int64_t maxIdx) {
+CuteAlgebraLayout complement(const CuteAlgebraLayout &layout, PrimExpr maxIdx) {
   auto flatStride = flattenExprTuple(layout.stride);
   auto flatShape = flattenExprTuple(layout.shape);
   ICHECK_EQ(flatStride.size(), flatShape.size());
 
-  // Build (stride, shape) pairs and sort by concrete stride.
+  // Build (stride, shape) pairs and sort by stride.  The input layout is
+  // always a tiler/block layout, so these are compile-time constants; sorting
+  // modes by stride is inherently a concrete operation.
   std::vector<std::pair<int64_t, int64_t>> pairs;
   pairs.reserve(flatShape.size());
   for (size_t i = 0; i < flatShape.size(); ++i) {
@@ -271,8 +276,8 @@ CuteAlgebraLayout complement(const CuteAlgebraLayout &layout, int64_t maxIdx) {
   std::sort(pairs.begin(), pairs.end(),
             [](const auto &a, const auto &b) { return a.first < b.first; });
 
-  std::vector<int64_t> resultShape;
-  std::vector<int64_t> resultStride;
+  std::vector<PrimExpr> resultShape;
+  std::vector<PrimExpr> resultStride;
   int64_t currentIdx = 1;
 
   for (const auto &[stride, shape] : pairs) {
@@ -281,25 +286,18 @@ CuteAlgebraLayout complement(const CuteAlgebraLayout &layout, int64_t maxIdx) {
     ICHECK(currentIdx <= shape * stride)
         << "complement: currentIdx=" << currentIdx
         << " > shape*stride=" << shape * stride;
-    resultShape.push_back(stride / currentIdx);
-    resultStride.push_back(currentIdx);
+    resultShape.push_back(makeInt(stride / currentIdx));
+    resultStride.push_back(makeInt(currentIdx));
     currentIdx = shape * stride;
   }
 
-  resultShape.push_back(ceilDivInt(maxIdx, currentIdx));
-  resultStride.push_back(currentIdx);
+  // The free-dimension extent is the only possibly-symbolic mode: it carries
+  // the (dynamic) total domain extent maxIdx.  ceildiv folds to an IntImm for
+  // concrete maxIdx and stays symbolic otherwise.
+  resultShape.push_back(tvm::ceildiv(maxIdx, makeInt(currentIdx)));
+  resultStride.push_back(makeInt(currentIdx));
 
-  // Convert to PrimExpr and coalesce.
-  std::vector<PrimExpr> rs, rd;
-  rs.reserve(resultShape.size());
-  rd.reserve(resultStride.size());
-  for (size_t i = 0; i < resultShape.size(); ++i) {
-    rs.push_back(makeInt(resultShape[i]));
-    rd.push_back(makeInt(resultStride[i]));
-  }
-
-  CuteAlgebraLayout result(rs, rd);
-  return coalesce(result);
+  return coalesce(CuteAlgebraLayout(resultShape, resultStride));
 }
 
 // ---------------------------------------------------------------------------
@@ -331,61 +329,69 @@ CuteAlgebraLayout composition(const CuteAlgebraLayout &layoutA,
   }
 
   ICHECK(!layoutB.stride.isTuple);
-  int64_t bStride = toConcrete(layoutB.stride.value);
-  if (bStride == 0) {
+  PrimExpr restStride = layoutB.stride.value;
+  int64_t bStrideConst;
+  if (tryConstInt(restStride, &bStrideConst) && bStrideConst == 0) {
     return CuteAlgebraLayout(layoutB.shape.value, makeInt(0));
   }
 
-  int64_t restShape = toConcrete(layoutB.shape.value);
-  int64_t restStride = bStride;
+  PrimExpr restShape = layoutB.shape.value; // may be symbolic
 
   CuteAlgebraLayout flatA = coalesce(layoutA);
   auto flatAShape = flattenExprTuple(flatA.shape);
   auto flatAStride = flattenExprTuple(flatA.stride);
 
-  std::vector<int64_t> resultShape;
-  std::vector<int64_t> resultStride;
+  std::vector<PrimExpr> resultShape;
+  std::vector<PrimExpr> resultStride;
 
-  for (size_t i = 0; i + 1 < flatAShape.size(); ++i) {
-    int64_t currShape = toConcrete(flatAShape[i]);
-    int64_t currStride = toConcrete(flatAStride[i]);
+  // Splitting a multi-mode left operand across B's stride is inherently
+  // concrete (it makes modular divisibility decisions).  Every layout-
+  // construction path feeds a single-mode A here (the loop is skipped), so it
+  // only runs for the concrete algebra (e.g. zippedProduct); require concrete
+  // operands with a clear message via toConcrete.
+  if (flatAShape.size() > 1) {
+    int64_t restShapeC = toConcrete(restShape);
+    int64_t restStrideC = toConcrete(restStride);
+    for (size_t i = 0; i + 1 < flatAShape.size(); ++i) {
+      int64_t currShape = toConcrete(flatAShape[i]);
+      int64_t currStride = toConcrete(flatAStride[i]);
 
-    if (currShape % restStride != 0 && restStride % currShape != 0) {
-      return CuteAlgebraLayout(int64_t(1), int64_t(0));
+      if (currShape % restStrideC != 0 && restStrideC % currShape != 0) {
+        return CuteAlgebraLayout(int64_t(1), int64_t(0));
+      }
+
+      int64_t newShape =
+          std::min(std::max(int64_t(1), currShape / restStrideC), restShapeC);
+      if (restShapeC % newShape != 0) {
+        return CuteAlgebraLayout(int64_t(1), int64_t(0));
+      }
+
+      if (newShape != 1) {
+        resultShape.push_back(makeInt(newShape));
+        resultStride.push_back(makeInt(restStrideC * currStride));
+      }
+
+      restShapeC /= newShape;
+      restStrideC = ceilDivInt(restStrideC, currShape);
     }
-
-    int64_t newShape =
-        std::min(std::max(int64_t(1), currShape / restStride), restShape);
-    if (restShape % newShape != 0) {
-      return CuteAlgebraLayout(int64_t(1), int64_t(0));
-    }
-
-    if (newShape != 1) {
-      resultShape.push_back(newShape);
-      resultStride.push_back(restStride * currStride);
-    }
-
-    restShape /= newShape;
-    restStride = ceilDivInt(restStride, currShape);
+    restShape = makeInt(restShapeC);
+    restStride = makeInt(restStrideC);
   }
 
-  if (restShape != 1 || resultShape.empty()) {
+  // Final (outermost) mode — pure arithmetic that supports a symbolic
+  // restShape and a symbolic left-operand stride.
+  int64_t restShapeConst;
+  bool restIsOne =
+      tryConstInt(restShape, &restShapeConst) && restShapeConst == 1;
+  if (!restIsOne || resultShape.empty()) {
     resultShape.push_back(restShape);
-    resultStride.push_back(restStride * toConcrete(flatAStride.back()));
+    resultStride.push_back(restStride * flatAStride.back());
   }
 
-  std::vector<PrimExpr> rs, rd;
-  rs.reserve(resultShape.size());
-  rd.reserve(resultStride.size());
-  for (size_t i = 0; i < resultShape.size(); ++i) {
-    rs.push_back(makeInt(resultShape[i]));
-    rd.push_back(makeInt(resultStride[i]));
+  if (resultShape.size() == 1) {
+    return CuteAlgebraLayout(resultShape[0], resultStride[0]);
   }
-
-  if (rs.size() == 1) {
-    return CuteAlgebraLayout(rs[0], rd[0]);
-  }
-  return CuteAlgebraLayout(rs, rd);
+  return CuteAlgebraLayout(resultShape, resultStride);
 }
 
 // ---------------------------------------------------------------------------
@@ -409,9 +415,10 @@ CuteAlgebraLayout logicalProduct(const CuteAlgebraLayout &layoutA,
   }
 
   // logicalProduct(A, B) = (A, composition(complement(A, A.size * B.cosize),
-  // B))
-  int64_t aSize = toConcrete(layoutA.size());
-  int64_t bCosize = toConcrete(layoutB.cosize());
+  // B)).  size()/cosize() are pure products, passed straight to complement as
+  // its (possibly symbolic) maxIdx — no concreteness required here.
+  PrimExpr aSize = layoutA.size();
+  PrimExpr bCosize = layoutB.cosize();
 
   auto comp = complement(layoutA, aSize * bCosize);
   auto composed = composition(comp, layoutB, false);
@@ -448,8 +455,10 @@ CuteAlgebraLayout logicalDivide(const CuteAlgebraLayout &layoutA,
     return CuteAlgebraLayout(modes);
   }
 
-  // Non-byMode: composition(A, (B, complement(B, A.size())))
-  int64_t aSize = toConcrete(layoutA.size());
+  // Non-byMode: composition(A, (B, complement(B, A.size()))).  A.size() is a
+  // pure product passed to complement as maxIdx, so a dynamic extent flows
+  // through here unchanged.
+  PrimExpr aSize = layoutA.size();
   auto comp = complement(layoutB, aSize);
   std::vector<CuteAlgebraLayout> inner{layoutB, comp};
   return composition(layoutA, CuteAlgebraLayout(inner), false);
