@@ -504,14 +504,13 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     std::string direction_name = parse_named_string("direction");
     ICHECK(direction_name == "row" || direction_name == "col")
         << "tl.broadcast_ direction must be encoded as row or col";
-    int64_t direction_value = direction_name == "row" ? 0 : 1;
-    auto direction_attr = ctx_.builder.getIntegerAttr(
-        ctx_.builder.getIntegerType(32), direction_value);
+    auto direction = direction_name == "row" ? mlir::suvm::McastDirection::row
+                                             : mlir::suvm::McastDirection::col;
 
     auto create_mcast = [&]() -> mlir::Value {
       auto mcast_op = mlir::suvm::MulticastTokOp::create(
           ctx_.builder, type.MakeDebugLoc("broadcast"), src, dst, mask,
-          direction_attr, mlir::suvm::OdmaChannelAttr{});
+          direction, mlir::suvm::OdmaChannelAttr{});
       return mcast_op->getResult(0);
     };
 

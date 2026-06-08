@@ -6,6 +6,7 @@ import tilelang.testing
 from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
+from compile_pipeline import target
 from sunmmio_codegen_validation_utils import (
     assert_source_contains,
     validate_sunmmio_codegen_with_npuir_opt,
@@ -13,10 +14,11 @@ from sunmmio_codegen_validation_utils import (
 
 
 tilelang.env.disable_cache()
-os.environ["SUNMMIO_TEST_PRINT"] = "1"
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 
+@target("Sunmmio")
 def flashattn_gqa_fwd_bhsd(
     batch=1,
     heads=4,

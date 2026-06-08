@@ -135,6 +135,17 @@ ExprTuple prefixProduct(const ExprTuple &value, PrimExpr init);
 /*! \brief Extract a concrete int64_t from a PrimExpr, with ICHECK. */
 int64_t toConcrete(const PrimExpr &expr);
 
+/*!
+ * \brief Try to read a compile-time constant integer from a PrimExpr.
+ *
+ * Simplifies the expression and, if it folds to an IntImm, writes the value
+ * to \p out and returns true.  Returns false for genuinely symbolic
+ * expressions (e.g. those involving dynamic shape variables).  Used to gate
+ * the opportunistic concrete fast-paths (coalesce merging, trailing-mode
+ * trimming) while letting symbolic values flow through unchanged.
+ */
+bool tryConstInt(const PrimExpr &expr, int64_t *out);
+
 // ---------------------------------------------------------------------------
 // Core CuTe algebra operations
 // ---------------------------------------------------------------------------
@@ -142,8 +153,15 @@ int64_t toConcrete(const PrimExpr &expr);
 /*! \brief Merge compatible consecutive modes. */
 CuteAlgebraLayout coalesce(const CuteAlgebraLayout &layout);
 
-/*! \brief Compute the complement (free index space) of a layout. */
-CuteAlgebraLayout complement(const CuteAlgebraLayout &layout, int64_t maxIdx);
+/*!
+ * \brief Compute the complement (free index space) of a layout.
+ *
+ * The input \p layout is always a tiler/block layout whose modes are
+ * compile-time constants (sorting modes by stride is inherently concrete).
+ * \p maxIdx — the total domain extent — may be symbolic; it appears only in
+ * the final free-dimension extent, so dynamic shapes flow through here.
+ */
+CuteAlgebraLayout complement(const CuteAlgebraLayout &layout, PrimExpr maxIdx);
 
 /*! \brief Compose two layouts. */
 CuteAlgebraLayout composition(const CuteAlgebraLayout &layoutA,

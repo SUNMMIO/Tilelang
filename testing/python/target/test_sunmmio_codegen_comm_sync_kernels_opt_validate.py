@@ -5,18 +5,20 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 
+from compile_pipeline import target
 from sunmmio_codegen_validation_utils import (
     validate_sunmmio_codegen_with_npuir_opt,
 )
 
 
 tilelang.env.disable_cache()
-os.environ["SUNMMIO_TEST_PRINT"] = "0"
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 LOOSE_OPT_ARGS = ("--verify-each",)
 
 
+@target("Sunmmio")
 def comm_broadcast_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16"):
     @T.prim_func
     def main(
@@ -34,6 +36,7 @@ def comm_broadcast_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16")
     return main
 
 
+@target("Sunmmio")
 def comm_put_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16"):
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype)):
@@ -47,6 +50,7 @@ def comm_put_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16"):
     return main
 
 
+@target("Sunmmio")
 def comm_all_gather_kernel(
     *,
     M=128,
@@ -78,6 +82,7 @@ def comm_all_gather_kernel(
     return main
 
 
+@target("Sunmmio")
 def sync_simple_copy_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16"):
     @T.prim_func
     def main(
@@ -93,6 +98,7 @@ def sync_simple_copy_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16
     return main
 
 
+@target("Sunmmio")
 def sync_mma_kernel(
     M=128,
     N=128,
@@ -122,6 +128,7 @@ def sync_mma_kernel(
     return main
 
 
+@target("Sunmmio")
 def sync_if_broadcast_kernel(
     M=128,
     N=128,
@@ -154,6 +161,7 @@ def sync_if_broadcast_kernel(
     return main
 
 
+@target("Sunmmio")
 def sync_loop_broadcast_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float32"):
     @T.prim_func
     def main(C: T.Tensor((M, N), dtype)):

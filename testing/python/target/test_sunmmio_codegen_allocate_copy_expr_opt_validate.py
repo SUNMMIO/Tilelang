@@ -1,3 +1,5 @@
+import os
+
 import tilelang
 import tilelang.language as T
 import tilelang.testing
@@ -6,6 +8,7 @@ from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 from tilelang.utils.target import determine_target
 
+from compile_pipeline import target
 from sunmmio_codegen_validation_utils import (
     assert_source_contains,
     validate_suvm_mlir_with_npuir_opt,
@@ -16,13 +19,11 @@ from sunmmio_codegen_validation_utils import (
 tilelang.env.disable_cache()
 
 # Debug logs from this file:
-import os
-
-# print flag
-os.environ["SUNMMIO_TEST_PRINT"] = "1"
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 
+@target("Sunmmio")
 def basic_allocate_copy_mma_kernel(
     M=32,
     N=32,
@@ -64,6 +65,7 @@ def basic_allocate_copy_mma_kernel(
     return main
 
 
+@target("Sunmmio")
 def allocate_dma_copy_kernel_plus(
     M=512,
     N=512,
@@ -108,6 +110,7 @@ def allocate_dma_copy_kernel_plus(
     return main
 
 
+@target("Sunmmio")
 def offset_region_copy_kernel_plus(
     M=512,
     N=512,

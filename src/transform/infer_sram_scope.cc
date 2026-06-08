@@ -233,8 +233,11 @@ private:
         original_alloc_buffers_.insert(buffer);
       } else if (!IsSunmmioSramScope(buffer.scope())) {
         // SRAM scopes should already have been validated at the GEMM sites.
-        ICHECK(0) << "Invalid scope " << buffer.scope() << " of " << buffer
-                  << " in Sunmmio.";
+        LOG(FATAL) << "Invalid scope " << buffer.scope() << " of " << buffer
+                   << " in Sunmmio. On-chip buffers must be allocated in a "
+                      "Sunmmio SRAM scope (shared.asram / shared.wsram / "
+                      "shared.rsram); '"
+                   << buffer.scope() << "' is not supported.";
       }
     }
   }
@@ -514,16 +517,30 @@ private:
       auto buffer = load->buffer;
       if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
         if (buffer_remap_.count(buffer)) {
-          ICHECK(buffer_remap_[buffer].scope() == kSunmmioScopeRSRAM)
-              << "Buffer " << buffer
-              << " used in BufferLoad should be shared.rsram.";
+          if (buffer_remap_[buffer].scope() != kSunmmioScopeRSRAM) {
+            LOG(FATAL) << "Invalid scope " << buffer_remap_[buffer].scope()
+                       << " of " << buffer
+                       << " in Sunmmio. It is read on-chip but was already "
+                          "placed in "
+                       << buffer_remap_[buffer].scope()
+                       << " (e.g. as a GEMM A/B operand); on-chip reads must "
+                          "come from "
+                       << kSunmmioScopeRSRAM
+                       << ". A buffer cannot be both a GEMM operand and a "
+                          "comm/copy/reduce source -- stage it through RSRAM "
+                          "first.";
+          }
         } else {
           buffers_to_infer.insert(buffer);
         }
       } else if ((buffer.scope() != kSunmmioScopeRSRAM) &&
                  (buffer.scope() != "global")) {
-        ICHECK(0) << "Invalid scope " << buffer.scope() << " of " << buffer
-                  << " in Sunmmio.";
+        LOG(FATAL) << "Invalid scope " << buffer.scope() << " of " << buffer
+                   << " in Sunmmio. On-chip operands read outside GEMM must be "
+                      "in "
+                   << kSunmmioScopeRSRAM << " (or global); '" << buffer.scope()
+                   << "' is not a valid read scope here (ASRAM/WSRAM are "
+                      "GEMM-only operand scopes).";
       }
       return load;
     }
@@ -554,13 +571,17 @@ private:
           // Already bound: RSRAM is consistent; ASRAM/WSRAM means a GEMM
           // operand use was collected first, i.e. the consuming GEMM
           // precedes the Tile-unit write that produces its operand.
-          ICHECK(buffer_remap_[buffer].scope() == kSunmmioScopeRSRAM)
-              << "InferSramScope: buffer " << buffer
-              << " is written by a Tile-unit op and must be "
-              << kSunmmioScopeRSRAM << ", but it was already bound to "
-              << buffer_remap_[buffer].scope()
-              << " by an earlier GEMM operand use. The Tile-unit write that "
-                 "produces a GEMM operand must precede that GEMM.";
+          if (buffer_remap_[buffer].scope() != kSunmmioScopeRSRAM) {
+            LOG(FATAL)
+                << "Invalid scope " << buffer_remap_[buffer].scope() << " of "
+                << buffer
+                << " in Sunmmio. It is written by a Tile-unit op and "
+                   "must be "
+                << kSunmmioScopeRSRAM << ", but it was already bound to "
+                << buffer_remap_[buffer].scope()
+                << " by an earlier GEMM operand use. The Tile-unit write "
+                   "that produces a GEMM operand must precede that GEMM.";
+          }
         } else {
           buffer_remap_.Set(buffer,
                             makeBufferWithScope(buffer, kSunmmioScopeRSRAM));

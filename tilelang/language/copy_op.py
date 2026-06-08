@@ -12,7 +12,7 @@ from tilelang.utils.language import (
 )
 from tilelang.language.utils import get_extent
 from tilelang.utils.target import target_is_sunmmio
-from tvm import tir
+from tvm import ir, tir
 from tvm.target import Target
 
 
@@ -123,8 +123,7 @@ def _clip_extent_to_shape(
             _warn_explicit_oob(buffer, dim, min_value, extent, shape)
         return tir.IntImm(extent.dtype if hasattr(extent, "dtype") else "int32", clipped)
 
-    clipped = tir.min(extent, shape - min_value)
-    return clipped
+    return extent
 
 
 def _int_one() -> tir.IntImm:
@@ -348,6 +347,8 @@ def copy(
         src = _encode_normalized_region(src_region, access_type="r")
         dst = _encode_normalized_region(dst_region, access_type="w")
     else:
+        if isinstance(src, tir.Buffer) and isinstance(dst, tir.Buffer):
+            ir.assert_structural_equal(src.shape, dst.shape)
         assert src_extent or dst_extent, "Can't deduce copy extents from args"
         src_extent = list(src_extent) if src_extent else [1] * len(dst_extent)
         dst_extent = list(dst_extent) if dst_extent else [1] * len(src_extent)

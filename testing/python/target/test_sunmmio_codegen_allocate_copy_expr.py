@@ -6,32 +6,16 @@ from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 import tilelang.testing
 
-from compile_pipeline import compile_test
+from compile_pipeline import compile_test, target
+from sunmmio_codegen_validation_utils import print_sunmmio_codegen_debug
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 
 
 tilelang.env.disable_cache()
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 
 CODEGEN_BACKEND = "suvm"
-PRINT = os.getenv("SUNMMIO_TEST_PRINT", "true").lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
-
-
-def _maybe_print_kernel_and_codegen(label: str, obj, src: str):
-    if not PRINT:
-        return
-    print(f"=== {label} TIR ===")
-    if hasattr(obj, "script"):
-        print(obj.script())
-    else:
-        print(obj)
-    print(f"=== SunMMIO {CODEGEN_BACKEND.upper()} Codegen ===")
-    print(src)
 
 
 def _to_device_kernel_func(func):
@@ -45,7 +29,7 @@ def codegen_sunmmio_suvm_from_kernel(kernel):
     target = determine_target("Sunmmio", return_object=True)
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
     src = builder(device_mod, target, CODEGEN_BACKEND).inspect_source()
-    _maybe_print_kernel_and_codegen("Lowered device", device_mod, src)
+    print_sunmmio_codegen_debug(label="Lowered device", ir_obj=device_mod, mlir_src=src)
     return src
 
 
@@ -55,7 +39,7 @@ def build_sunmmio_source_from_stmt(stmt):
     mod = tvm.IRModule({"main": func})
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
     src = builder(mod, target, CODEGEN_BACKEND).inspect_source()
-    _maybe_print_kernel_and_codegen("Direct non-tile expr", mod, src)
+    print_sunmmio_codegen_debug(label="Direct non-tile expr", ir_obj=mod, mlir_src=src)
     return src
 
 
@@ -64,6 +48,7 @@ def assert_contains_all(src: str, tokens):
     assert not missing, f"missing expected tokens: {missing}\n{src}"
 
 
+@target("Sunmmio")
 def allocate_dma_copy_kernel(
     M=512,
     N=512,
@@ -101,6 +86,7 @@ def allocate_dma_copy_kernel(
     return main
 
 
+@target("Sunmmio")
 def offset_region_copy_kernel(
     M=512,
     N=512,

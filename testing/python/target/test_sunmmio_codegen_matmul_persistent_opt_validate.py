@@ -8,6 +8,7 @@ from tilelang import tvm
 from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
+from compile_pipeline import target
 from sunmmio_codegen_validation_utils import (
     assert_source_contains,
     lower_sunmmio_kernel_to_device_tir,
@@ -17,12 +18,13 @@ from sunmmio_codegen_validation_utils import (
 
 
 tilelang.env.disable_cache()
-os.environ["SUNMMIO_TEST_PRINT"] = "0"
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 LOOSE_OPT_ARGS = ("--verify-each",)
 
 
+@target("Sunmmio")
 def matmul_persistent_kernel(
     M=128,
     N=128,

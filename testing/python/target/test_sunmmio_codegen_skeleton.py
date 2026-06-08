@@ -8,20 +8,11 @@ from tilelang.layout import make_zz_layout
 from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 
+from compile_pipeline import target
+from sunmmio_codegen_validation_utils import print_sunmmio_codegen_debug
+
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
-PRINT = True
-
-
-def _maybe_print_kernel_and_mlir(func, src: str):
-    if not PRINT:
-        return
-    print("=== TVM Kernel ===")
-    if hasattr(func, "script"):
-        print(func.script())
-    else:
-        print(func)
-    print("=== SunMMIO SUVM MLIR ===")
-    print(src)
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 
 
 def _to_device_kernel_func(func):
@@ -41,7 +32,7 @@ def build_sunmmio_module_without_compile(func):
 
 def build_sunmmio_source_without_compile(func):
     src = build_sunmmio_module_without_compile(func).inspect_source()
-    _maybe_print_kernel_and_mlir(func, src)
+    print_sunmmio_codegen_debug(label="TVM Kernel", ir_obj=func, mlir_src=src)
     return src
 
 
@@ -50,10 +41,11 @@ def build_sunmmio_source_from_stmt(stmt):
     mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt)})
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
     src = builder(mod, target, "suvm").inspect_source()
-    _maybe_print_kernel_and_mlir(mod["main"], src)
+    print_sunmmio_codegen_debug(label="TVM Kernel", ir_obj=mod["main"], mlir_src=src)
     return src
 
 
+@target("Sunmmio")
 def make_scalar_control_kernel():
     i = tvm.tir.Var("i", "int32")
     j = tvm.tir.Var("j", "int32")
@@ -77,6 +69,7 @@ def make_scalar_control_kernel():
     return _primfunc_from_stmt(outer_for)
 
 
+@target("Sunmmio")
 def make_alloc_scope_kernel():
     f16 = tvm.ir.PrimType("float16")
     one = tvm.tir.IntImm("bool", 1)
@@ -92,6 +85,7 @@ def make_alloc_scope_kernel():
     return _primfunc_from_stmt(stmt)
 
 
+@target("Sunmmio")
 def make_intrinsic_sync_kernel():
     f16 = tvm.ir.PrimType("float16")
     a_data = tvm.tir.Var("a_data", tvm.ir.PointerType(f16, "shared.asram"))
@@ -182,6 +176,7 @@ def make_intrinsic_sync_kernel():
     )
 
 
+@target("Sunmmio")
 def make_layout_transform_kernel():
     f16 = tvm.ir.PrimType("float16")
     src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(f16, "shared.rsram"))
@@ -219,6 +214,7 @@ def make_layout_transform_kernel():
     )
 
 
+@target("Sunmmio")
 def make_dynamic_broadcast_mask_kernel():
     f16 = tvm.ir.PrimType("float16")
     src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(f16, "shared.rsram"))
@@ -269,6 +265,7 @@ def make_dynamic_broadcast_mask_kernel():
     return _to_device_kernel_func(tvm.tir.PrimFunc([src_data, dst_data], stmt))
 
 
+@target("Sunmmio")
 def make_reusable_barrier_kernel():
     mask = tvm.tir.IntImm("int64", 15)
     barrier_init = tvm.tir.Call("handle", tvm.ir.Op.get("tl.barrier_init"), [mask])
@@ -283,6 +280,7 @@ def make_reusable_barrier_kernel():
     return _primfunc_from_stmt(stmt)
 
 
+@target("Sunmmio")
 def make_dynamic_barrier_kernel():
     bx = tvm.tir.Var("bx", "int32")
     bx_i64 = tvm.tir.Cast("int64", bx)
@@ -316,6 +314,7 @@ def make_dynamic_barrier_kernel():
     return _primfunc_from_stmt(stmt)
 
 
+@target("Sunmmio")
 def make_block_realize_kernel():
     body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
     block = tvm.tir.Block([], [], [], "B", body)
@@ -323,6 +322,7 @@ def make_block_realize_kernel():
     return _primfunc_from_stmt(stmt)
 
 
+@target("Sunmmio")
 def make_decl_buffer_kernel():
     body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
     buf = tvm.tir.decl_buffer((16, 16), "float16", name="A")
@@ -330,6 +330,7 @@ def make_decl_buffer_kernel():
     return _primfunc_from_stmt(stmt)
 
 
+@target("Sunmmio")
 def make_buffer_realize_kernel():
     body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
     buf = tvm.tir.decl_buffer((16, 16), "float16", name="A")
@@ -341,6 +342,7 @@ def make_buffer_realize_kernel():
     return _primfunc_from_stmt(stmt)
 
 
+@target("Sunmmio")
 def make_buffer_load_kernel():
     buf = tvm.tir.decl_buffer((16, 16), "float16", name="A")
     stmt = tvm.tir.Evaluate(
@@ -352,6 +354,7 @@ def make_buffer_load_kernel():
     return _primfunc_from_stmt(stmt)
 
 
+@target("Sunmmio")
 def make_buffer_store_kernel():
     buf = tvm.tir.decl_buffer((16, 16), "float16", name="A")
     stmt = tvm.tir.BufferStore(
@@ -362,6 +365,7 @@ def make_buffer_store_kernel():
     return _primfunc_from_stmt(stmt)
 
 
+@target("Sunmmio")
 def make_real_tilelang_frontend_kernel():
     @T.prim_func
     def main():

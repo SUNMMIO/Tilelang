@@ -1,3 +1,4 @@
+from functools import wraps
 import os
 import re
 import warnings
@@ -15,6 +16,18 @@ from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma
 from tilelang.utils.target import target_is_sunmmio
 from tilelang.jit.adapter.utils import is_cuda_target
+
+
+def target(target_name):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with tvm.target.Target(determine_target(target_name, return_object=True)):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def allow_warp_specialized(pass_ctx: PassContext | None = None, target: Target | None = None) -> bool:
@@ -277,6 +290,9 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.SunmmioLayoutInference()(mod)
     pass_output_process(mod, "SunmmioLayoutInference", test_config)
 
+    mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
+    pass_output_process(mod, "LegalizeSunmmioGemm", test_config)
+
     LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     pass_output_process(mod, "LowerTileOp", test_config)
@@ -287,12 +303,14 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.TilesLoop()(mod)
     pass_output_process(mod, "TilesLoop", test_config)
 
+    mod = tilelang.transform.SunmmioTileLoopFusion()(mod)
+    pass_output_process(mod, "SunmmioTileLoopFusion", test_config)
     # mod = tilelang.transform.LowerL2Persistent()(mod)
     # mod = tilelang.transform.DecoupleTypeCast()(mod)
     # pass_output_process(mod, "DecoupleTypeCast", test_config)
 
-    mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
-    pass_output_process(mod, "LegalizeVectorizedLoop", test_config)
+    # mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
+    # pass_output_process(mod, "LegalizeVectorizedLoop", test_config)
 
     mod = tilelang.transform.LegalizeSafeMemoryAccess()(mod)
     pass_output_process(mod, "LegalizeSafeMemoryAccess", test_config)

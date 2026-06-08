@@ -5,6 +5,7 @@ import tilelang.language as T
 import tilelang.testing
 from tilelang.carver.arch import driver
 
+from compile_pipeline import target
 from sunmmio_codegen_validation_utils import (
     assert_source_contains,
     validate_sunmmio_codegen_with_npuir_opt,
@@ -12,7 +13,7 @@ from sunmmio_codegen_validation_utils import (
 
 
 tilelang.env.disable_cache()
-os.environ["SUNMMIO_TEST_PRINT"] = "0"
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 LOOSE_OPT_ARGS = ("--verify-each",)
@@ -28,6 +29,7 @@ def validate_sunmmio_codegen_loose(kernel, tmp_path, *, mlir_filename, expected_
     )
 
 
+@target("Sunmmio")
 def tile_elementwise_ops_test(
     batch=2,
     m=256,
@@ -109,6 +111,7 @@ def tile_elementwise_ops_test(
     return main
 
 
+@target("Sunmmio")
 def tile_elementwise_ops_2d_test(
     m=256,
     n=1024,
