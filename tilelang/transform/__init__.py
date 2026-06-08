@@ -80,9 +80,11 @@ def LegalizeSunmmioDataPath():
     """
     return _ffi_api.LegalizeSunmmioDataPath()  # type: ignore
 
+
 def ValidateCopyTileView():
     """ValidateCopyTileView"""
     return _ffi_api.ValidateCopyTileView()  # type: ignore
+
 
 def LowerTileOp():
     """LowerTileOp

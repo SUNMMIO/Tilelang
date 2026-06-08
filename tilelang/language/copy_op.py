@@ -87,7 +87,8 @@ def _expr_gt(lhs: tir.PrimExpr, rhs: tir.PrimExpr) -> bool:
     rhs_int = _as_static_int(rhs)
     return lhs_int is not None and rhs_int is not None and lhs_int > rhs_int
 
-# 显式 BufferRegion 越界时触发 warning
+
+# Warn when an explicit BufferRegion exceeds the buffer shape.
 def _warn_explicit_oob(buffer: tir.Buffer, dim: int, min_value: tir.PrimExpr, extent: tir.PrimExpr, shape: tir.PrimExpr) -> None:
     warnings.warn(
         "T.copy explicit BufferRegion exceeds buffer shape and will be clipped: "
@@ -95,7 +96,8 @@ def _warn_explicit_oob(buffer: tir.Buffer, dim: int, min_value: tir.PrimExpr, ex
         stacklevel=3,
     )
 
-# 实现range的缩放
+
+# Clip extents so the region stays within the buffer shape.
 def _clip_extent_to_shape(
     buffer: tir.Buffer,
     dim: int,
@@ -111,8 +113,7 @@ def _clip_extent_to_shape(
 
     if min_int is not None and shape_int is not None and (min_int < 0 or min_int >= shape_int):
         raise ValueError(
-            "T.copy region starts outside buffer shape: "
-            f"{buffer.name}[dim={dim}], min={min_value}, extent={extent}, shape={shape}"
+            f"T.copy region starts outside buffer shape: {buffer.name}[dim={dim}], min={min_value}, extent={extent}, shape={shape}"
         )
 
     if min_int is not None and extent_int is not None and shape_int is not None:
@@ -129,7 +130,7 @@ def _clip_extent_to_shape(
 def _int_one() -> tir.IntImm:
     return tir.IntImm("int32", 1)
 
-# BufferLoad 根据另一侧 extents 推断自己的 extents。
+
 def _infer_load_extents_from_peer(load: _CopyRegionSpec, peer_extents: list[tir.PrimExpr]) -> list[tir.PrimExpr]:
     rank = len(load.mins)
     extents = list(peer_extents)
@@ -202,7 +203,7 @@ def _suffix_axis_map(src: _NormalizedCopyRegion, dst: _NormalizedCopyRegion) -> 
     matched_rank = min(src_rank, dst_rank)
 
     if src_rank > dst_rank:
-        extra_extents = src.extents[:src_rank - dst_rank]
+        extra_extents = src.extents[: src_rank - dst_rank]
         for dim, extent in enumerate(extra_extents):
             if not _expr_is_one(extent):
                 raise ValueError(
@@ -213,7 +214,7 @@ def _suffix_axis_map(src: _NormalizedCopyRegion, dst: _NormalizedCopyRegion) -> 
         return [(src_rank - matched_rank + i, i) for i in range(matched_rank)]
 
     if dst_rank > src_rank:
-        extra_extents = dst.extents[:dst_rank - src_rank]
+        extra_extents = dst.extents[: dst_rank - src_rank]
         for dim, extent in enumerate(extra_extents):
             if not _expr_is_one(extent):
                 raise ValueError(
