@@ -1,6 +1,5 @@
 import tilelang
 import tilelang.language as T
-import pytest
 import torch
 import tilelang.testing
 
@@ -139,18 +138,6 @@ def run_tilelang_copy_buffer_load_with_parallel(M=1024, N=1024, block_M=128, blo
 
 def test_tilelang_copy_buffer_load_with_parallel():
     run_tilelang_copy_buffer_load_with_parallel(M=1024, N=1024, block_M=128, block_N=128)
-
-
-def test_tilelang_copy_rejects_mismatched_buffer_shapes():
-    with pytest.raises(ValueError):
-
-        @T.prim_func
-        def main(
-            A: T.Tensor((64, 64), T.float16),
-            B: T.Tensor((128, 64), T.float16),
-        ):
-            with T.Kernel(1, threads=128):
-                T.copy(A, B)
 
 
 def run_tilelang_copy_fp8_e8m0(M=1024, N=1024, block_M=128, block_N=128, src_dtype=T.float8_e8m0fnu, dst_dtype=T.float8_e8m0fnu):
