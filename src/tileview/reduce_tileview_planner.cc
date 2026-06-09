@@ -191,11 +191,6 @@ TrailingTilePattern ValidateManualSrcTilePattern(
         << " requires the source region offset on dim " << src_dim
         << " to be aligned, but got " << src_region->region[src_dim]->min
         << ".";
-    ICHECK(CanProveDivisible(analyzer, src_region->region[src_dim]->extent,
-                             tile_extent))
-        << "Manual src TileView extent " << tile_extent
-        << " must divide the source region extent on dim " << src_dim
-        << ", but got " << src_region->region[src_dim]->extent << ".";
   }
   return pattern;
 }
@@ -216,8 +211,7 @@ std::vector<ReduceTileCandidate> EnumerateInferredCandidates(
       int src_dim = pattern.mapped_dims[axis];
       int tile_extent = pattern.tile_shape[axis];
       if (!CanProveDivisible(analyzer, src_region->region[src_dim]->min,
-                             tile_extent) ||
-          !CanProveDivisible(analyzer, source_domain[src_dim], tile_extent)) {
+                             tile_extent)) {
         aligned = false;
         break;
       }
@@ -303,13 +297,13 @@ PlanReduceTileViews(const BufferRegion &src_region,
   // accumulates element-wise across K/t_K iterations, then calls a single
   // hardware in-tile reduction at the end of each spatial position:
   //
-  //   N_total = (S_spatial / dst_tile_elems) * (K / t_K + 1)
+  //   N_total = (S_spatial / dst_tile_elems) * (ceildiv(K, t_K) + 1)
   //
   // where t_K = reduce_tile_extent (1 if reduce dim is not tiled).
   // Since S_spatial is constant across candidates, the ranking is
   // determined by the score:
   //
-  //   score = (K + t_K) / src_tile_elems     (lower is better)
+  //   score = (ceildiv(K, t_K) + 1) / dst_tile_elems     (lower is better)
   //
   // When K is statically known (IntImm), we compare scores exactly via
   // cross-multiplication.  When K is dynamic, we fall back to a proxy:
@@ -332,11 +326,14 @@ PlanReduceTileViews(const BufferRegion &src_region,
       [K_static](const ReduceTileCandidate &a, const ReduceTileCandidate &b) {
         if (K_static > 0) {
           // Static K: exact score comparison.
-          // a better iff (K + a.t_K) * b.src < (K + b.t_K) * a.src
-          int64_t lhs = (K_static + a.reduce_tile_extent) *
-                        static_cast<int64_t>(b.src_tile_elems);
-          int64_t rhs = (K_static + b.reduce_tile_extent) *
-                        static_cast<int64_t>(a.src_tile_elems);
+          // a better iff (ceildiv(K, a.t_K) + 1) / a.dst <
+          //              (ceildiv(K, b.t_K) + 1) / b.dst
+          int64_t lhs_steps =
+              (K_static + a.reduce_tile_extent - 1) / a.reduce_tile_extent + 1;
+          int64_t rhs_steps =
+              (K_static + b.reduce_tile_extent - 1) / b.reduce_tile_extent + 1;
+          int64_t lhs = lhs_steps * static_cast<int64_t>(b.dst_tile_elems);
+          int64_t rhs = rhs_steps * static_cast<int64_t>(a.dst_tile_elems);
           if (lhs != rhs)
             return lhs < rhs;
         } else {

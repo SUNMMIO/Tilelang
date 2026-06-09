@@ -313,14 +313,38 @@ void CuteLayoutNode::RegisterReflection() {
 // ---------------------------------------------------------------------------
 
 /*!
+ * \brief Decompose a stride into (#symbolic factors, concrete coefficient).
+ *
+ * Layout strides are products of mode shapes (running prefix products), so a
+ * stride is a Mul-tree of IntImm and symbolic (dynamic count) factors.  We
+ * fold the concrete leaves into a coefficient and count the symbolic ones.
+ */
+static void CollectStrideFactors(const PrimExpr &e, int *sym_count,
+                                 int64_t *coeff) {
+  if (const auto *mul = e.as<MulNode>()) {
+    CollectStrideFactors(mul->a, sym_count, coeff);
+    CollectStrideFactors(mul->b, sym_count, coeff);
+    return;
+  }
+  int64_t c;
+  if (cute::tryConstInt(e, &c)) {
+    *coeff *= c;
+  } else {
+    ++(*sym_count);
+  }
+}
+
+/*!
  * \brief Extract the physical ordering (permutation) of modes from strides.
  *
  * For a contiguous CuteLayout, the strides encode the physical ordering:
  * the mode with the smallest stride is physically innermost, etc.
  *
- * Invariant: at most one mode has a symbolic (non-IntImm) stride, and
- * it is always the physically outermost (last in the ordering).  All
- * other strides are concrete and sortable.
+ * The strides form a single nested product chain (each outer stride equals an
+ * inner stride times an inner shape), so even when several are symbolic they
+ * are totally ordered by the key (#symbolic factors, concrete coefficient):
+ * the innermost has the fewest symbolic factors / smallest coefficient.  For
+ * all-concrete layouts this degrades to sorting by stride value.
  *
  * \return A permutation vector: physical_order[0] is the innermost mode
  *         index, physical_order[n-1] is the outermost.
@@ -329,30 +353,25 @@ static std::vector<int> RecoverPhysicalOrder(const CuteLayoutNode *layout) {
   auto strides = layout->GetModeStride();
   int n = strides.size();
 
-  std::vector<int> concrete_modes;
-  std::vector<int> symbolic_modes;
+  std::vector<std::pair<int, int64_t>> keys(n);
   for (int i = 0; i < n; ++i) {
-    if (strides[i].as<IntImmNode>()) {
-      concrete_modes.push_back(i);
-    } else {
-      symbolic_modes.push_back(i);
-    }
+    int sym_count = 0;
+    int64_t coeff = 1;
+    CollectStrideFactors(strides[i], &sym_count, &coeff);
+    keys[i] = {sym_count, coeff};
   }
-  ICHECK_LE(symbolic_modes.size(), 1)
-      << "CuteLayout invariant violated: more than one symbolic stride. "
-      << "Got " << symbolic_modes.size()
-      << " symbolic strides in layout: " << layout->DebugOutput();
 
-  // Sort concrete modes by stride value (ascending = innermost first).
-  std::sort(concrete_modes.begin(), concrete_modes.end(), [&](int a, int b) {
-    return strides[a].as<IntImmNode>()->value <
-           strides[b].as<IntImmNode>()->value;
+  std::vector<int> order(n);
+  for (int i = 0; i < n; ++i)
+    order[i] = i;
+
+  // Innermost first: fewer symbolic factors, then smaller concrete coefficient.
+  std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+    if (keys[a].first != keys[b].first)
+      return keys[a].first < keys[b].first;
+    return keys[a].second < keys[b].second;
   });
-
-  // Symbolic mode (if any) is the physically outermost — append last.
-  concrete_modes.insert(concrete_modes.end(), symbolic_modes.begin(),
-                        symbolic_modes.end());
-  return concrete_modes;
+  return order;
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,7 +1156,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
             std::vector<PrimExpr> s(shapes.begin(), shapes.end());
             std::vector<PrimExpr> d(strides.begin(), strides.end());
             cute::CuteAlgebraLayout layout(s, d);
-            auto result = cute::complement(layout, max_idx);
+            auto result = cute::complement(
+                layout, make_const(DataType::Int(32), max_idx));
             auto flatShape = cute::flattenExprTuple(result.shape);
             auto flatStride = cute::flattenExprTuple(result.stride);
             Array<PrimExpr> out_shapes(flatShape.begin(), flatShape.end());
