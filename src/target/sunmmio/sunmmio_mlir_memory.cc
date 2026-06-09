@@ -35,6 +35,14 @@ SunmmioMlirMemory::Alloc(const std::string &result_name,
 
   mlir::suvm::AllocOp alloc = mlir::suvm::AllocOp::create(
       ctx_.builder, ctx_.builder.getUnknownLoc(), tensor_type);
+  mlir::suvm::MemorySpace memory_space =
+      tensor_type.getMemorySpace().getValue();
+  if (memory_space == mlir::suvm::MemorySpace::asram ||
+      memory_space == mlir::suvm::MemorySpace::wsram) {
+    alloc->setAttr("suvm.ping_pong",
+                   mlir::suvm::PingPongAttr::get(&ctx_.mlir_ctx,
+                                                 mlir::suvm::PingPong::ping));
+  }
 
   SunMMIOValue out{dtype, result_name, updated_type};
   ctx_.BindMLIRValue(result_name, alloc.getResult());

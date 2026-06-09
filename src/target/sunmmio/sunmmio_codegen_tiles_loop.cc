@@ -1081,20 +1081,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     if (src_shape.size() == 2 && dst_shape.size() == 2) {
       std::optional<int64_t> src_unit_axis = unit_axis_for_2d_shape(src_shape);
       std::optional<int64_t> dst_unit_axis = unit_axis_for_2d_shape(dst_shape);
-      if (src_unit_axis.has_value()) {
-        bool can_broadcast = true;
-        for (size_t i = 0; i < src_shape.size(); ++i) {
-          if (src_shape[i] != dst_shape[i] && src_shape[i] != 1) {
-            can_broadcast = false;
-            break;
-          }
-        }
-        if (can_broadcast) {
-          SunMMIOType dst_type = MakeTileType(value.dtype, dst_shape);
-          return builder_->TileBroadcast(NewValueName(), value, dst_type,
-                                         value.dtype);
-        }
-      }
+
       if (src_unit_axis.has_value() && dst_unit_axis.has_value() &&
           unit_vector_extent(src_shape, *src_unit_axis) ==
               unit_vector_extent(dst_shape, *dst_unit_axis)) {
@@ -1808,6 +1795,19 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       }
       if (op_node && call->args.size() == 1 && op_node->name == "tir.log") {
         return emit_unary(TileUnaryOp::kLn, call->args[0], call->dtype);
+      }
+      if (op_node && call->args.size() == 1 && op_node->name == "tir.log2") {
+        SunMMIOValue ln_value =
+            emit_unary(TileUnaryOp::kLn, call->args[0], call->dtype);
+        DataType result_dtype = ln_value.dtype;
+        SunMMIOType scale_type{SunMMIOType::Kind::kScalar, result_dtype, 1, {}};
+        SunMMIOValue log2e = builder_->ConstantFloat(
+            NewValueName(), "1.4426950408889634", scale_type, result_dtype);
+        SunMMIOType result_type =
+            MakeTileType(result_dtype, ExtractStaticShape(ln_value.type));
+        return builder_->Binary(NewValueName(), BinaryOp::kMul,
+                                ArithmeticFlavor::kFloat, ln_value, log2e,
+                                result_type, result_dtype);
       }
       if (op_node && call->args.size() == 1 && op_node->name == "tir.round") {
         return emit_unary(TileUnaryOp::kRound, call->args[0], call->dtype,
