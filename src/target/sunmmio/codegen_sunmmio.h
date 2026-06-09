@@ -89,6 +89,11 @@ public:
   virtual SunMMIOValue BindValueAlias(const std::string &result_name,
                                       const SunMMIOValue &value) = 0;
 
+  virtual SunMMIOValue
+  BindLayout(const std::string &result_name, const SunMMIOValue &source,
+             const std::vector<SunMMIOValue> &dynamic_shapes,
+             const std::vector<SunMMIOValue> &dynamic_strides) = 0;
+
   virtual SunMMIOValue Alloc(const std::string &result_name,
                              const SunMMIOType &memref_type,
                              const std::vector<SunMMIOValue> &dyn_extents,
@@ -335,6 +340,12 @@ private:
     SunMMIOValue value;
   };
 
+  struct PendingExternalBuffer {
+    tir::Buffer buffer;
+    std::string handle;
+    SunMMIOType type;
+  };
+
   SunMMIOValue EvalExpr(const tvm::PrimExpr &expr);
   void VisitStmtTracked(const tir::Stmt &stmt);
   void CollectExpectedCoverage(const tir::PrimFunc &f);
@@ -375,6 +386,10 @@ private:
   CompareDomain GetCompareDomain(DataType dtype) const;
   SunMMIOValue BindVar(const tir::Var &var, const SunMMIOValue &value);
   const SunMMIOValue &LookupVar(const tir::VarNode *var) const;
+  SunMMIOValue MaterializeDynamicLayoutExpr(const tvm::PrimExpr &expr);
+  std::vector<SunMMIOValue>
+  CollectDynamicLayoutValues(const std::vector<PrimExpr> &exprs);
+  void BindExternalBufferLayout(const PendingExternalBuffer &pending);
   void RegisterBuffer(const tir::Buffer &buffer, bool is_external,
                       const std::string &handle_hint = "");
   const BufferBinding &LookupBuffer(const tir::Buffer &buffer) const;

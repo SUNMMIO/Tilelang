@@ -64,8 +64,8 @@ struct SunMMIOType {
   DataType dtype{DataType::Void()};
   int lanes{1};
   std::vector<PrimExpr> shape;
-  std::vector<int64_t> layout_hshape;
-  std::vector<int64_t> layout_hstride;
+  std::vector<PrimExpr> layout_hshape;
+  std::vector<PrimExpr> layout_hstride;
   std::vector<uint8_t> layout_dim_levels;
   std::string memory_scope;
   int64_t byte_offset{0};

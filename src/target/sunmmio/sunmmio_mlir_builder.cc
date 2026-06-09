@@ -117,6 +117,37 @@ SunMMIOValue SuvmSunmmioBuilder::BindValueAlias(const std::string &result_name,
   return SunMMIOValue{value.dtype, result_name, value.type};
 }
 
+SunMMIOValue SuvmSunmmioBuilder::BindLayout(
+    const std::string &result_name, const SunMMIOValue &source,
+    const std::vector<SunMMIOValue> &dynamic_shapes,
+    const std::vector<SunMMIOValue> &dynamic_strides) {
+  mlir::Value source_value = ctx_.LookupMLIRValue(source.value);
+  ICHECK(source_value) << "Cannot bind layout for missing MLIR value "
+                       << source.value;
+
+  SunmmioMlirType type(ctx_);
+  mlir::SmallVector<mlir::Value, 4> shape_values;
+  mlir::SmallVector<mlir::Value, 4> stride_values;
+  shape_values.reserve(dynamic_shapes.size());
+  stride_values.reserve(dynamic_strides.size());
+  for (const SunMMIOValue &value : dynamic_shapes) {
+    mlir::Value mlir_value = ctx_.LookupMLIRValue(value.value);
+    ICHECK(mlir_value) << "Missing dynamic layout shape value " << value.value;
+    shape_values.push_back(type.EnsureIndex(mlir_value));
+  }
+  for (const SunMMIOValue &value : dynamic_strides) {
+    mlir::Value mlir_value = ctx_.LookupMLIRValue(value.value);
+    ICHECK(mlir_value) << "Missing dynamic layout stride value " << value.value;
+    stride_values.push_back(type.EnsureIndex(mlir_value));
+  }
+
+  auto bind_op = mlir::suvm::BindLayoutOp::create(
+      ctx_.builder, type.MakeDebugLoc("bind_layout"), source_value.getType(),
+      source_value, shape_values, stride_values);
+  ctx_.BindMLIRValue(result_name, bind_op.getResult());
+  return SunMMIOValue{source.dtype, result_name, source.type};
+}
+
 SunMMIOValue
 SuvmSunmmioBuilder::Alloc(const std::string &result_name,
                           const SunMMIOType &memref_type,

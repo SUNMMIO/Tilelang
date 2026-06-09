@@ -82,12 +82,20 @@ int64_t RoundUpToMultiple(int64_t value, int64_t multiple) {
   return ((value + multiple - 1) / multiple) * multiple;
 }
 
-std::vector<int64_t>
-BuildRowMajorStridesLocal(const std::vector<int64_t> &shape) {
-  std::vector<int64_t> strides(shape.size(), 1);
+std::vector<PrimExpr>
+BuildRowMajorStrideExprsLocal(const std::vector<int64_t> &shape) {
+  std::vector<PrimExpr> strides(shape.size());
+  if (shape.empty()) {
+    return strides;
+  }
+  std::vector<int64_t> stride_values(shape.size(), 1);
   for (int i = static_cast<int>(shape.size()) - 2; i >= 0; --i) {
-    strides[static_cast<size_t>(i)] =
-        shape[static_cast<size_t>(i + 1)] * strides[static_cast<size_t>(i + 1)];
+    stride_values[static_cast<size_t>(i)] =
+        shape[static_cast<size_t>(i + 1)] *
+        stride_values[static_cast<size_t>(i + 1)];
+  }
+  for (size_t i = 0; i < stride_values.size(); ++i) {
+    strides[i] = IntImm(DataType::Int(32), stride_values[i]);
   }
   return strides;
 }
@@ -135,8 +143,12 @@ void ApplyDebugRsramTailPadding(SunMMIOType *memtensor_type) {
   layout_hshape[layout_hshape.size() - 1] =
       RoundUpToMultiple(layout_hshape[layout_hshape.size() - 1], 32);
 
-  memtensor_type->layout_hshape = layout_hshape;
-  memtensor_type->layout_hstride = BuildRowMajorStridesLocal(layout_hshape);
+  memtensor_type->layout_hshape.clear();
+  memtensor_type->layout_hshape.reserve(layout_hshape.size());
+  for (int64_t dim : layout_hshape) {
+    memtensor_type->layout_hshape.push_back(IntImm(DataType::Int(32), dim));
+  }
+  memtensor_type->layout_hstride = BuildRowMajorStrideExprsLocal(layout_hshape);
   memtensor_type->layout_dim_levels =
       BuildFlatDimLevelsLocal(memtensor_type->shape.size());
 }
@@ -377,6 +389,7 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
 
   EnterScope();
   std::vector<BuilderArg> args;
+  std::vector<PendingExternalBuffer> pending_external_buffers;
   int arg_index = 0;
   for (const tir::Var &p : f->params) {
     std::string arg_name = "%arg" + std::to_string(arg_index++);
@@ -387,6 +400,7 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
       args.push_back({arg_name, buf_ty});
       BindVar(p, SunMMIOValue{p.dtype(), arg_name, buf_ty});
       RegisterBuffer(buffer, true, arg_name);
+      pending_external_buffers.push_back({buffer, arg_name, buf_ty});
     } else {
       SunMMIOType arg_ty = MapType(p.dtype());
       args.push_back({arg_name, arg_ty});
@@ -395,6 +409,9 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
   }
 
   builder_->BeginFunction(gvar->name_hint, args);
+  for (const PendingExternalBuffer &pending : pending_external_buffers) {
+    BindExternalBufferLayout(pending);
+  }
   VisitStmtTracked(f->body);
   builder_->EmitReturn();
   builder_->EndFunction();
@@ -548,6 +565,71 @@ CodeGenTileLangSunMMIO::LookupVar(const tir::VarNode *var) const {
   auto *self = const_cast<CodeGenTileLangSunMMIO *>(this);
   self->BindVar(tvm::ffi::GetRef<tir::Var>(var), fake_value);
   return self->var_table_.find(var)->second;
+}
+
+SunMMIOValue CodeGenTileLangSunMMIO::MaterializeDynamicLayoutExpr(
+    const tvm::PrimExpr &expr) {
+  arith::Analyzer analyzer;
+  PrimExpr simplified = analyzer.Simplify(expr);
+  tir::PostOrderVisit(simplified, [&](const ObjectRef &node) {
+    if (!node.defined()) {
+      return;
+    }
+    if (const auto *var = node.as<VarNode>()) {
+      ICHECK(var_table_.count(var))
+          << "SunMMIO dynamic layout expression depends on unbound runtime "
+             "variable "
+          << var->name_hint << " in " << simplified;
+      return;
+    }
+    ICHECK(!node.as<BufferLoadNode>() && !node.as<ProducerLoadNode>() &&
+           !node.as<CallNode>() && !node.as<RampNode>() &&
+           !node.as<BroadcastNode>() && !node.as<ShuffleNode>() &&
+           !node.as<LetNode>())
+        << "SunMMIO dynamic layout expression must be scalar arithmetic over "
+           "runtime parameters, got unsupported node "
+        << node->GetTypeKey() << " in " << simplified;
+  });
+  return EnsureIndex(EvalExpr(simplified));
+}
+
+std::vector<SunMMIOValue> CodeGenTileLangSunMMIO::CollectDynamicLayoutValues(
+    const std::vector<PrimExpr> &exprs) {
+  std::vector<SunMMIOValue> values;
+  values.reserve(exprs.size());
+  for (const PrimExpr &expr : exprs) {
+    arith::Analyzer analyzer;
+    PrimExpr simplified = analyzer.Simplify(expr);
+    if (simplified.as<IntImmNode>()) {
+      continue;
+    }
+    values.push_back(MaterializeDynamicLayoutExpr(simplified));
+  }
+  return values;
+}
+
+void CodeGenTileLangSunMMIO::BindExternalBufferLayout(
+    const PendingExternalBuffer &pending) {
+  std::vector<SunMMIOValue> dynamic_shapes =
+      CollectDynamicLayoutValues(pending.type.layout_hshape);
+  std::vector<SunMMIOValue> dynamic_strides =
+      CollectDynamicLayoutValues(pending.type.layout_hstride);
+  if (dynamic_shapes.empty() && dynamic_strides.empty()) {
+    return;
+  }
+
+  SunMMIOValue source{pending.buffer->dtype, pending.handle, pending.type};
+  std::string bound_handle = pending.handle + "_layout";
+  SunMMIOValue bound = builder_->BindLayout(bound_handle, source,
+                                            dynamic_shapes, dynamic_strides);
+
+  var_table_[pending.buffer->data.get()] = bound;
+  auto it = buffer_registry_.find(pending.buffer.get());
+  ICHECK(it != buffer_registry_.end())
+      << "Missing registered external buffer for dynamic layout binding: "
+      << pending.buffer->name;
+  it->second.handle = bound.value;
+  it->second.buffer_type = bound.type;
 }
 
 void CodeGenTileLangSunMMIO::RegisterBuffer(const tir::Buffer &buffer,

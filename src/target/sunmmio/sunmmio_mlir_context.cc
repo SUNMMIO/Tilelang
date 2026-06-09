@@ -2,7 +2,6 @@
 
 #include "../../layout/cute_layout.h"
 
-#include <tvm/arith/analyzer.h>
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
 
@@ -33,17 +32,6 @@ LookupLayoutInMap(const SunmmioMlirContext::TirLayoutMap &layout_map,
     }
   }
   return ffi::Optional<tl::Layout>();
-}
-
-int64_t StaticIntValue(const PrimExpr &expr, arith::Analyzer *analyzer,
-                       const char *field_name, const tl::Layout &layout) {
-  PrimExpr simplified = analyzer->Simplify(expr);
-  if (const auto *imm = simplified.as<tir::IntImmNode>()) {
-    return imm->value;
-  }
-  LOG(FATAL) << "SunMMIO SUVM layout " << field_name << " must be static, got "
-             << simplified << " in layout: " << layout->DebugOutput();
-  TVM_FFI_UNREACHABLE();
 }
 
 } // namespace
@@ -112,12 +100,10 @@ void SunmmioMlirContext::ApplyLayoutToType(const tir::Buffer &buffer,
   type->layout_dim_levels.clear();
 
   for (const PrimExpr &dim : cute->GetModeShape()) {
-    type->layout_hshape.push_back(
-        StaticIntValue(dim, &analyzer, "mode_shape", layout));
+    type->layout_hshape.push_back(analyzer.Simplify(dim));
   }
   for (const PrimExpr &stride : cute->GetModeStride()) {
-    type->layout_hstride.push_back(
-        StaticIntValue(stride, &analyzer, "mode_stride", layout));
+    type->layout_hstride.push_back(analyzer.Simplify(stride));
   }
   for (const Integer &level : cute->GetDimLevels()) {
     int64_t value = level.IntValue();

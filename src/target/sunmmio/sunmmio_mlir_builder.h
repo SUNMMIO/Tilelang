@@ -62,6 +62,11 @@ public:
   SunMMIOValue BindValueAlias(const std::string &result_name,
                               const SunMMIOValue &value) final;
 
+  SunMMIOValue
+  BindLayout(const std::string &result_name, const SunMMIOValue &source,
+             const std::vector<SunMMIOValue> &dynamic_shapes,
+             const std::vector<SunMMIOValue> &dynamic_strides) final;
+
   SunMMIOValue Alloc(const std::string &result_name,
                      const SunMMIOType &memref_type,
                      const std::vector<SunMMIOValue> &dyn_extents,

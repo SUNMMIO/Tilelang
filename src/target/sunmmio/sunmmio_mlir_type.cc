@@ -5,6 +5,7 @@
 #include "npuir/Dialect/SUVM/IR/Types.h"
 #include "sunmmio_mlir_context.h"
 #include "tvm/runtime/logging.h"
+#include <tvm/arith/analyzer.h>
 
 namespace tvm {
 namespace codegen {
@@ -23,14 +24,30 @@ std::vector<int64_t> ExtractShape(const SunMMIOType &type) {
   return shape;
 }
 
-std::vector<int64_t> BuildRowMajorStrides(llvm::ArrayRef<int64_t> shape) {
-  std::vector<int64_t> strides(shape.size(), 1);
-  for (int i = static_cast<int>(shape.size()) - 2; i >= 0; --i) {
-    if (shape[static_cast<size_t>(i + 1)] == mlir::ShapedType::kDynamic ||
-        strides[static_cast<size_t>(i + 1)] == mlir::ShapedType::kDynamic) {
-      strides[static_cast<size_t>(i)] = mlir::ShapedType::kDynamic;
-      continue;
+std::vector<int64_t> ExtractLayoutExprs(llvm::ArrayRef<PrimExpr> exprs) {
+  arith::Analyzer analyzer;
+  std::vector<int64_t> values;
+  values.reserve(exprs.size());
+  for (const PrimExpr &expr : exprs) {
+    PrimExpr simplified = analyzer.Simplify(expr);
+    const auto *imm = simplified.as<tvm::tir::IntImmNode>();
+    if (imm) {
+      values.push_back(static_cast<int64_t>(imm->value));
+    } else {
+      values.push_back(mlir::ShapedType::kDynamic);
     }
+  }
+  return values;
+}
+
+std::vector<PrimExpr> BuildRowMajorStrideExprs(llvm::ArrayRef<PrimExpr> shape) {
+  std::vector<PrimExpr> strides(shape.size());
+  if (shape.empty()) {
+    return strides;
+  }
+  DataType dtype = shape.back().dtype();
+  strides[strides.size() - 1] = tvm::IntImm(dtype, 1);
+  for (int i = static_cast<int>(shape.size()) - 2; i >= 0; --i) {
     strides[static_cast<size_t>(i)] =
         shape[static_cast<size_t>(i + 1)] * strides[static_cast<size_t>(i + 1)];
   }
@@ -153,13 +170,17 @@ mlir::Type SunmmioMlirType::MapType(const SunMMIOType &type) const {
     mlir::Type elem = MapElementType(canonical_type.dtype);
     std::vector<int64_t> shape = ExtractShape(canonical_type);
 
-    std::vector<int64_t> layout_hshape = canonical_type.layout_hshape.empty()
-                                             ? shape
+    std::vector<PrimExpr> layout_hshape_exprs =
+        canonical_type.layout_hshape.empty() ? canonical_type.shape
                                              : canonical_type.layout_hshape;
-    std::vector<int64_t> layout_hstride =
+    std::vector<PrimExpr> layout_hstride_exprs =
         canonical_type.layout_hstride.empty()
-            ? BuildRowMajorStrides(layout_hshape)
+            ? BuildRowMajorStrideExprs(layout_hshape_exprs)
             : canonical_type.layout_hstride;
+    std::vector<int64_t> layout_hshape =
+        ExtractLayoutExprs(layout_hshape_exprs);
+    std::vector<int64_t> layout_hstride =
+        ExtractLayoutExprs(layout_hstride_exprs);
     std::vector<uint8_t> dim_levels = canonical_type.layout_dim_levels.empty()
                                           ? BuildFlatDimLevels(shape.size())
                                           : canonical_type.layout_dim_levels;
