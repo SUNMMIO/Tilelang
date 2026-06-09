@@ -20,7 +20,8 @@ tilelang.env.disable_cache()
 
 # Debug logs from this file:
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
-# os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
+# os.environ["SUNMMIO_TEST_PRINT"] = "1"
+# dtype = T.bfloat16
 
 
 @target("Sunmmio")
@@ -265,7 +266,14 @@ def test_basic_allocate_copy_mma_codegen_validates_with_npuir_opt(tmp_path):
         basic_allocate_copy_mma_kernel(),
         tmp_path,
         mlir_filename="basic_allocate_copy_mma_suvm.mlir",
-        expected_tokens=("suvm.alloc", "suvm.copy_async", "suvm.tc.mma"),
+        expected_tokens=(
+            "suvm.alloc",
+            "suvm.ping_pong = #suvm.ping_pong<ping>",
+            "#suvm.memory_space<asram>",
+            "#suvm.memory_space<wsram>",
+            "suvm.copy_async",
+            "suvm.tc.mma",
+        ),
     )
 
 
