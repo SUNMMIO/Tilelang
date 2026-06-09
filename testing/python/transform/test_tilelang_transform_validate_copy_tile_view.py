@@ -10,6 +10,7 @@ from tilelang.utils.target import SUNMMIO_TARGET_DESC
 
 DTYPE = "float16"
 
+
 @pytest.fixture(autouse=True)
 def disable_tilelang_cache():
     cache_was_enabled = tilelang.env.is_cache_enabled()
@@ -21,6 +22,7 @@ def disable_tilelang_cache():
             tilelang.env.enable_cache()
         else:
             tilelang.env.disable_cache()
+
 
 def _make_copy_kernel(copy_case):
     @T.prim_func
