@@ -155,7 +155,8 @@ def test_sunmmio_codegen_aligned_1d_store_uses_nonzero_insert_slice_offset():
     src = _build_sunmmio_source_from_stmt(_make_nonzero_offset_aligned_store_stmt())
     assert "suvm.tile.insert_slice" in src
     assert "suvm.tile.unsqueeze" in src
-    assert "fake_tile_store" in src
+    assert "suvm.tile.store" in src
+    assert "fake_tile_store" not in src
     assert "!suvm.tile<32xbf16>" in src
     assert "!suvm.tile_view<32xbf16>" in src
     assert "!suvm.tile_view<32x1xbf16>" not in src

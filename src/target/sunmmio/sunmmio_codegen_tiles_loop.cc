@@ -105,6 +105,104 @@ ParseStaticIntArray(const ffi::Map<ffi::String, ffi::Any> &annotations,
   return result;
 }
 
+std::optional<int64_t> TryGetIntImm(const PrimExpr &expr) {
+  if (const auto *imm = expr.as<IntImmNode>()) {
+    return static_cast<int64_t>(imm->value);
+  }
+  return std::nullopt;
+}
+
+bool ContainsFloorDivOrMod(const PrimExpr &expr) {
+  bool found = false;
+  tir::PostOrderVisit(expr, [&](const ObjectRef &obj) {
+    found = found || obj.as<FloorDivNode>() != nullptr ||
+            obj.as<FloorModNode>() != nullptr;
+  });
+  return found;
+}
+
+bool ContainsAnyVar(const PrimExpr &expr,
+                    const std::vector<const VarNode *> &vars) {
+  bool found = false;
+  tir::PostOrderVisit(expr, [&](const ObjectRef &obj) {
+    if (found) {
+      return;
+    }
+    if (const auto *var = obj.as<VarNode>()) {
+      found = std::find(vars.begin(), vars.end(), var) != vars.end();
+    }
+  });
+  return found;
+}
+
+std::optional<PrimExpr> TryRewritePositiveFloorDivTailCompare(
+    const PrimExpr &condition,
+    const std::vector<const VarNode *> &interior_vars) {
+  auto rewrite = [&](const PrimExpr &lhs,
+                     const PrimExpr &rhs) -> std::optional<PrimExpr> {
+    auto rhs_imm = TryGetIntImm(rhs);
+    if (!rhs_imm.has_value()) {
+      return std::nullopt;
+    }
+
+    std::vector<PrimExpr> terms;
+    std::function<void(const PrimExpr &)> flatten_add =
+        [&](const PrimExpr &expr) {
+          if (const auto *add = expr.as<AddNode>()) {
+            flatten_add(add->a);
+            flatten_add(add->b);
+            return;
+          }
+          terms.push_back(expr);
+        };
+    flatten_add(lhs);
+
+    std::optional<PrimExpr> div_numerator;
+    int64_t divisor = 0;
+    PrimExpr linear_part;
+    for (const PrimExpr &term : terms) {
+      if (const auto *div = term.as<FloorDivNode>()) {
+        if (div_numerator.has_value()) {
+          return std::nullopt;
+        }
+        auto imm_divisor = TryGetIntImm(div->b);
+        if (!imm_divisor.has_value() || imm_divisor.value() <= 0 ||
+            ContainsFloorDivOrMod(div->a) ||
+            !ContainsAnyVar(div->a, interior_vars)) {
+          return std::nullopt;
+        }
+        div_numerator = div->a;
+        divisor = imm_divisor.value();
+        continue;
+      }
+      if (ContainsFloorDivOrMod(term)) {
+        return std::nullopt;
+      }
+      if (ContainsAnyVar(term, interior_vars)) {
+        return std::nullopt;
+      }
+      linear_part = linear_part.defined() ? linear_part + term : term;
+    }
+
+    if (!div_numerator.has_value()) {
+      return std::nullopt;
+    }
+
+    DataType dtype = div_numerator.value().dtype();
+    PrimExpr divisor_expr = IntImm(dtype, divisor);
+    PrimExpr scaled_lhs = (linear_part.defined() ? linear_part * divisor_expr
+                                                 : PrimExpr(IntImm(dtype, 0))) +
+                          div_numerator.value();
+    PrimExpr scaled_rhs = IntImm(dtype, rhs_imm.value() * divisor);
+    return scaled_lhs < scaled_rhs;
+  };
+
+  if (const auto *lt = condition.as<LTNode>()) {
+    return rewrite(lt->a, lt->b);
+  }
+  return std::nullopt;
+}
+
 std::vector<const ForNode *> CollectLinearForChain(const ForNode *root) {
   std::vector<const ForNode *> loops;
   const ForNode *current = root;
@@ -307,6 +405,18 @@ std::vector<int64_t> ExtractStaticShape(const SunMMIOType &type) {
   return shape;
 }
 
+std::vector<int64_t> ExtractStaticPrimExprs(llvm::ArrayRef<PrimExpr> exprs,
+                                            const char *what) {
+  std::vector<int64_t> values;
+  values.reserve(exprs.size());
+  for (const PrimExpr &expr : exprs) {
+    const auto *imm = expr.as<IntImmNode>();
+    ICHECK(imm) << what << " must be static for 64B-aligned 1D access";
+    values.push_back(static_cast<int64_t>(imm->value));
+  }
+  return values;
+}
+
 bool StaticShapesEqual(const SunMMIOType &a, const SunMMIOType &b) {
   return ExtractStaticShape(a) == ExtractStaticShape(b);
 }
@@ -473,17 +583,13 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     scope.interior_axis1_loop = full_loops.second;
     ICHECK(scope.interior_axis0_loop != nullptr)
         << "Tiles full-tile branch is missing interior axis 0 loop";
-    scope.full_tile_block_body = scope.interior_axis1_loop != nullptr
-                                     ? scope.interior_axis1_loop->body
-                                     : scope.interior_axis0_loop->body;
+    scope.full_tile_block_body = scope.full_tile_body;
     auto tail_loops = FindInteriorLoops(scope.tail_tile_body);
     scope.tail_interior_axis0_loop = tail_loops.first;
     scope.tail_interior_axis1_loop = tail_loops.second;
     ICHECK(scope.tail_interior_axis0_loop != nullptr)
         << "Tiles tail-tile branch is missing interior axis 0 loop";
-    scope.tail_tile_block_body = scope.tail_interior_axis1_loop != nullptr
-                                     ? scope.tail_interior_axis1_loop->body
-                                     : scope.tail_interior_axis0_loop->body;
+    scope.tail_tile_block_body = scope.tail_tile_body;
     scope.tile_block_body = scope.full_tile_block_body;
   } else {
     auto loops = FindInteriorLoops(tile_scope_stmt);
@@ -491,9 +597,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     scope.interior_axis1_loop = loops.second;
     ICHECK(scope.interior_axis0_loop != nullptr)
         << "Tiles scope is missing interior axis 0 loop";
-    scope.tile_block_body = scope.interior_axis1_loop != nullptr
-                                ? scope.interior_axis1_loop->body
-                                : scope.interior_axis0_loop->body;
+    scope.tile_block_body = tile_scope_stmt;
   }
 
   auto warn_token_stmt = [&](const Stmt &body) {
@@ -1272,14 +1376,18 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     int64_t tiled_dim = access.tiled_dims[0];
     ICHECK_LT(tiled_dim, static_cast<int64_t>(memtensor_shape.size()));
 
-    std::vector<int64_t> layout_shape = memtensor_type.layout_hshape.empty()
-                                            ? memtensor_shape
-                                            : memtensor_type.layout_hshape;
+    std::vector<int64_t> layout_shape =
+        memtensor_type.layout_hshape.empty()
+            ? memtensor_shape
+            : ExtractStaticPrimExprs(memtensor_type.layout_hshape,
+                                     "layout shape");
     ICHECK_EQ(layout_shape.size(), memtensor_shape.size())
         << "64B-aligned 1D access expects layout rank to match memtensor rank";
-    std::vector<int64_t> strides = memtensor_type.layout_hstride.empty()
-                                       ? std::vector<int64_t>{}
-                                       : memtensor_type.layout_hstride;
+    std::vector<int64_t> strides =
+        memtensor_type.layout_hstride.empty()
+            ? std::vector<int64_t>{}
+            : ExtractStaticPrimExprs(memtensor_type.layout_hstride,
+                                     "layout stride");
     if (strides.empty()) {
       strides.assign(layout_shape.size(), 1);
       for (int dim = static_cast<int>(memtensor_shape.size()) - 2; dim >= 0;
@@ -1789,7 +1897,21 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     auto emit_select = [&](const PrimExpr &condition,
                            const PrimExpr &true_value_expr,
                            const PrimExpr &false_value_expr, DataType dtype) {
-      SunMMIOValue cond = lower_expr(condition, state, std::nullopt);
+      PrimExpr condition_to_lower = condition;
+      if (ContainsFloorDivOrMod(condition)) {
+        std::vector<const VarNode *> interior_vars;
+        if (state->interior_axis0_loop != nullptr) {
+          interior_vars.push_back(state->interior_axis0_loop->loop_var.get());
+        }
+        if (state->interior_axis1_loop != nullptr) {
+          interior_vars.push_back(state->interior_axis1_loop->loop_var.get());
+        }
+        if (auto rewritten = TryRewritePositiveFloorDivTailCompare(
+                condition, interior_vars)) {
+          condition_to_lower = rewritten.value();
+        }
+      }
+      SunMMIOValue cond = lower_expr(condition_to_lower, state, std::nullopt);
       SunMMIOValue true_value =
           lower_expr(true_value_expr, state, preferred_dtype);
       SunMMIOValue false_value =
@@ -1809,8 +1931,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           result_shape = ExtractStaticShape(cond.type);
         }
         if (IsTileLike(cond)) {
-          result_shape = merge_broadcast_shapes(ExtractStaticShape(cond.type),
-                                                result_shape);
+          cond = reorient_unit_tile_to_shape(cond, result_shape);
+          std::vector<int64_t> cond_shape = ExtractStaticShape(cond.type);
+          if (cond_shape != result_shape) {
+            result_shape = merge_broadcast_shapes(cond_shape, result_shape);
+          }
         }
         DataType result_dtype = choose_result_dtype(dtype, preferred_dtype);
         SunMMIOType scalar_type{
@@ -1915,13 +2040,40 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         SunMMIOValue view = get_or_create_tile_view(access, state);
         SunMMIOType tile_type =
             MakeTileType(load->buffer->dtype, access.tile_shape);
-        // Tail masking is applied at store time with tile.select(new, old).
-        // Loads intentionally fetch the whole padded tile; this avoids relying
-        // on masked tile.load semantics and preserves the old destination
-        // values explicitly before the final unmasked store.
+        std::optional<SunMMIOValue> load_mask;
+        std::optional<SunMMIOValue> load_maskedoff;
+        if (load->predicate.defined()) {
+          SunMMIOValue lowered_mask =
+              lower_expr(load->predicate.value(), state, std::nullopt);
+          lowered_mask =
+              broadcast_tile_to_shape(lowered_mask, access.tile_shape);
+          DataType value_dtype =
+              CanonicalizeSuvmDType(load->buffer->dtype).with_lanes(1);
+          SunMMIOType scalar_type{
+              SunMMIOType::Kind::kScalar, value_dtype, 1, {}};
+          SunMMIOValue zero =
+              value_dtype.is_float() || value_dtype.is_bfloat16()
+                  ? builder_->ConstantFloat(NewValueName(), "0.0", scalar_type,
+                                            value_dtype)
+                  : builder_->ConstantInt(NewValueName(), 0, scalar_type,
+                                          value_dtype);
+          load_maskedoff =
+              builder_->TileFill(NewValueName(), zero, tile_type, value_dtype);
+          load_mask = lowered_mask;
+        }
+        // Always load the full padded tile.  Tail stores preserve old
+        // destination values explicitly with tile.select, and predicated loads
+        // are represented as load + select so this path does not depend on
+        // masked tile.load dialect semantics.
         tile = builder_->TileLoad(
             NewValueName(), view, tile_type, std::nullopt, std::nullopt,
             CanonicalizeSuvmDType(load->buffer->dtype).with_lanes(1));
+        if (load_mask.has_value()) {
+          tile = builder_->TileSelect(
+              NewValueName(), load_mask.value(), tile, load_maskedoff.value(),
+              tile_type,
+              CanonicalizeSuvmDType(load->buffer->dtype).with_lanes(1));
+        }
       }
       if (!access.promoted_unit_tile_view) {
         state->current_tile_values.emplace(load->buffer.get(), tile);
@@ -2064,7 +2216,13 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     if (const auto *div = expr.as<DivNode>()) {
       return emit_binary(BinaryOp::kDiv, div->a, div->b, div->dtype);
     }
+    if (const auto *div = expr.as<FloorDivNode>()) {
+      return emit_binary(BinaryOp::kDiv, div->a, div->b, div->dtype);
+    }
     if (const auto *mod = expr.as<ModNode>()) {
+      return emit_binary(BinaryOp::kMod, mod->a, mod->b, mod->dtype);
+    }
+    if (const auto *mod = expr.as<FloorModNode>()) {
       return emit_binary(BinaryOp::kMod, mod->a, mod->b, mod->dtype);
     }
     if (const auto *min = expr.as<MinNode>()) {
@@ -2202,6 +2360,33 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       for (const Stmt &s : seq->seq) {
         lower_stmt(s, state);
       }
+      return;
+    }
+    if (const auto *loop = stmt.as<ForNode>()) {
+      auto axis = GetInteriorAxisAnnotation(loop);
+      if (!axis.has_value()) {
+        UnsupportedStmt(loop,
+                        "Clean v4 tiles lowering only supports tile.interior "
+                        "loops inside T.Tiles bodies");
+      }
+      TileBlockState loop_state = *state;
+      if (axis.value() == 0) {
+        loop_state.interior_axis0_loop = loop;
+        loop_state.interior_axis1_loop = nullptr;
+      } else if (axis.value() == 1) {
+        loop_state.interior_axis1_loop = loop;
+      } else {
+        UnsupportedStmt(loop,
+                        "Clean v4 tiles lowering currently supports up to 2D "
+                        "interior loops");
+      }
+      lower_stmt(loop->body, &loop_state);
+      state->tile_view_cache = loop_state.tile_view_cache;
+      state->current_tile_values = loop_state.current_tile_values;
+      state->register_tile_values = loop_state.register_tile_values;
+      state->register_unsqueeze_axes = loop_state.register_unsqueeze_axes;
+      state->local_tile_values = loop_state.local_tile_values;
+      state->local_unit_tile_axes = loop_state.local_unit_tile_axes;
       return;
     }
     if (IsTokenLikeTileStmt(stmt)) {
