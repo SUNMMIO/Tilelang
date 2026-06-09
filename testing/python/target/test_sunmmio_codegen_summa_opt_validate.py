@@ -15,7 +15,7 @@ from sunmmio_codegen_validation_utils import (
 
 tilelang.env.disable_cache()
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
-# os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
+os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 LOOSE_OPT_ARGS = ("--verify-each",)
 
@@ -50,8 +50,10 @@ def summa_matmul(
         C: T.MeshTensor(C_shape, shard_policy, device_mesh_config, accum_dtype, layout=C_layout),  # type: ignore
     ):
         with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_K = A.shape
+            sharded_M, _ = A.shape
             _, sharded_N = B.shape
+            core_row = _cid // ncols
+            core_col = _cid % ncols
 
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
@@ -60,27 +62,34 @@ def summa_matmul(
             for bx in T.serial(T.ceildiv(sharded_M, block_M)):
                 for by in T.serial(T.ceildiv(sharded_N, block_N)):
                     T.clear(C_local)
-                    K_steps = T.ceildiv(sharded_K, block_K)
+                    K_steps = T.ceildiv(K, block_K)
 
                     for k_tile in range(K_steps):
+                        a_src_col = k_tile % ncols
+                        b_src_row = k_tile % nrows
+                        a_local_k = (k_tile // ncols) * block_K
+                        b_local_k = (k_tile // nrows) * block_K
+
                         T.comm.broadcast(
                             A[
                                 bx * block_M : bx * block_M + block_M,
-                                k_tile * block_K : k_tile * block_K + block_K,
+                                a_local_k : a_local_k + block_K,
                             ],
                             A_shared,
-                            (0, 0),
+                            (core_row, a_src_col),
                             direction="h",
                         )
                         T.comm.broadcast(
                             B[
-                                k_tile * block_K : k_tile * block_K + block_K,
+                                b_local_k : b_local_k + block_K,
                                 by * block_N : by * block_N + block_N,
                             ],
                             B_shared,
-                            (0, 0),
+                            (b_src_row, core_col),
                             direction="v",
                         )
+                        # Sunmmio MMA consumes B in the transposed operand mode;
+                        # algorithmically this is still the SUMMA B(k, j) panel.
                         T.gemm(A_shared, B_shared, C_local, transpose_B=True)
 
                     T.copy(C_local, C[bx * block_M, by * block_N])

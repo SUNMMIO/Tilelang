@@ -1,6 +1,7 @@
 #ifndef TVM_TL_TARGET_SUNMMIO_MLIR_CALL_H_
 #define TVM_TL_TARGET_SUNMMIO_MLIR_CALL_H_
 
+#include "codegen_sunmmio.h"
 #include "sunmmio_mlir_context.h"
 
 namespace tvm {
@@ -12,9 +13,8 @@ public:
 
   SunMMIOValue Call(const std::string &result_name, const std::string &callee,
                     const std::vector<SunMMIOValue> &operands,
-                    const std::vector<std::string> &string_args,
-                    const std::string &category, DataType ret_dtype,
-                    const SunMMIOType &ret_type);
+                    const SunMMIOCallAttrs &attrs, const std::string &category,
+                    DataType ret_dtype, const SunMMIOType &ret_type);
 
   SunMMIOValue RegionCall(const std::string &result_name,
                           const std::string &buffer_handle,

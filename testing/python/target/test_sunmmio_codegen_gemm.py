@@ -1,10 +1,8 @@
 import os
 
-import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang import tvm
 from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
@@ -122,22 +120,13 @@ def test_matmul_persistent_lowers_to_expected_sunmmio_device_tir():
     assert_source_contains(
         src,
         (
-            f"T.decl_buffer(({num_stages}, {block_M}, {block_K * ncols})",
-            f"T.decl_buffer(({num_stages}, {block_K * nrows}, {block_N})",
-            f"T.decl_buffer(({num_stages}, {block_M}, {block_K})",
+            f"T.decl_buffer(({block_M}, {block_K * ncols})",
+            f"T.decl_buffer(({block_K * nrows}, {block_N})",
+            f"T.decl_buffer(({block_M}, {block_N})",
         ),
     )
 
 
-@pytest.mark.xfail(
-    raises=tvm.error.InternalError,
-    reason=(
-        "matmul_persistent all_gather pipeline currently lowers staged shared buffers "
-        "to rank-3 decl_buffer views, while SunMMIO MLIR type mapping still expects "
-        "layout rank to match the original 2-D buffer shape."
-    ),
-    strict=True,
-)
 def test_matmul_persistent_codegen_generates_expected_suvm_ops(tmp_path):
     src = validate_sunmmio_codegen_with_npuir_opt(
         matmul_persistent_kernel(),
