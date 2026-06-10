@@ -24,10 +24,11 @@ def make_row_major(shape):
 def make_aligned_row_major(shape_or_buffer, dtype, align_bytes=64):
     """Create an alignment-padded row-major CuteLayout for RSRAM.
 
-    The leading-dimension stride is padded so that each row of the innermost
-    (contiguous) axis starts on an ``align_bytes`` boundary. The padding lives
-    only in the strides; the logical shape is preserved. Rank < 2 falls back to
-    plain row-major.
+    The innermost extent is rounded up to a multiple of ``align_bytes`` (in
+    ``dtype`` elements) and stored as the covered extent; strides are dense
+    row-major over the padded extents, so every outer stride lands on an
+    ``align_bytes`` boundary. The logical shape keeps the true extents.
+    Rank-1 ``[N]`` pads its covered extent to ``round_up(N)``.
     """
     shape = _normalize_shape(shape_or_buffer)
     return _make_aligned_row_major(shape, dtype, align_bytes)

@@ -929,11 +929,12 @@ private:
     RegisterScratchBufferCallback register_scratch = [this](Buffer buffer,
                                                             Layout layout) {
       layout_map_.Set(buffer, layout);
-      if (!workspace_stack_.empty()) {
-        workspace_stack_.back().push_back(buffer);
-      } else {
-        workspace_stack_.emplace_back(Array<Buffer>{buffer});
-      }
+      // A stack entry is pushed for every block being visited; with no entry
+      // there is no enclosing block to allocate the buffer in.
+      ICHECK(!workspace_stack_.empty())
+          << "RegisterScratchBuffer for " << buffer->name
+          << " called outside any block; the buffer would never be allocated.";
+      workspace_stack_.back().push_back(buffer);
     };
 
     Range thread_bounds;

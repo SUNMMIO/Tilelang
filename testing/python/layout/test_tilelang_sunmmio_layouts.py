@@ -244,6 +244,14 @@ def test_make_aligned_row_major_int8_uses_64_elem_granularity():
     assert _covered(layout) == [2, 128]
 
 
+def test_make_aligned_row_major_fp4_uses_128_elem_granularity():
+    # fp4 (4-bit): 64B = 128 elems; round_up(100, 128) = 128, exact for 256.
+    layout = make_aligned_row_major((2, 100), "float4_e2m1fn", 64)
+    assert _eval(layout, 1, 0) == 128
+    assert _covered(layout) == [2, 128]
+    assert is_same_layout(make_aligned_row_major((2, 256), "float4_e2m1fn", 64), make_row_major((2, 256)))
+
+
 def test_make_aligned_row_major_rank4_propagates():
     # (2,3,4,40) bf16: inner 40->64; strides 4*64=256, 3*256=768.
     layout = make_aligned_row_major((2, 3, 4, 40), "float16", 64)

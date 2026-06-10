@@ -878,12 +878,13 @@ Layout MakeAlignedRowMajor(Array<PrimExpr> shape, DataType dtype,
   if (rank < 1)
     return MakeRowMajor(shape);
 
-  int elem_bytes = dtype.bytes();
-  if (elem_bytes < 1)
-    elem_bytes = 1;
-  // Number of elements that fill one alignment unit (e.g. 64B / 2B = 32 for
-  // bf16).
-  int align_elems = align_bytes / elem_bytes;
+  // Number of elements that fill one alignment unit (e.g. 64B = 32 bf16 or
+  // 128 fp4 elements). Bit arithmetic keeps sub-byte dtypes exact.
+  int elem_bits = dtype.bits();
+  ICHECK_GT(elem_bits, 0) << "MakeAlignedRowMajor requires a positive element "
+                             "bit-width, but got dtype "
+                          << dtype;
+  int align_elems = align_bytes * 8 / elem_bits;
   if (align_elems < 1)
     align_elems = 1;
 
