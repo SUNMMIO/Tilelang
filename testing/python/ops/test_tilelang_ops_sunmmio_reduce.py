@@ -32,19 +32,9 @@ def assert_reduce_lowering_is_ssa(mod):
     assert tvm.tir.analysis.verify_ssa(mod["main"]), mod.script()
 
 
-def _infer_layout_map(mod, target):
-    """Run the Sunmmio pipeline up to SunmmioLayoutInference and return the
-    inferred {buffer_name: layout} from the block's layout_map annotation."""
-    mod = tvm.tir.transform.BindTarget(target)(mod)
-    mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
-    mod = tilelang.transform.LegalizeNegativeIndex()(mod)
-    mod = tilelang.transform.InjectAssumes()(mod)
-    mod = tilelang.transform.Simplify()(mod)
-    mod = tilelang.transform.InferSramScope()(mod)
-    mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
-    mod = tilelang.transform.LayoutReducer()(mod)
-    mod = tilelang.transform.SunmmioLayoutInference()(mod)
-
+def _layout_map(mod):
+    """Extract {buffer_name: layout} from a module's block layout_map
+    annotations (the module having been lowered via apply_sunmmio_passes)."""
     result = {}
 
     def visit(node):
@@ -538,13 +528,13 @@ def test_tilelang_reduce_sunmmio_blocked_axis_yields_aligned_rowmajor():
         with T.Kernel(1, threads=128) as (bx,):
             A_shared = T.alloc_shared((64, 40), "float16", scope="shared.rsram")
             Out_shared = T.alloc_shared((40,), "float16", scope="shared.rsram")
-            T.annotate_layout({A_shared: make_zz_layout(A_shared)})
             T.copy(A, A_shared)
             T.reduce_sum(A_shared, Out_shared, dim=0)
             T.copy(Out_shared, Out)
 
     with tvm.target.Target(target):
-        layouts = _infer_layout_map(tvm.IRModule({"main": main}), target)
+        mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
+    layouts = _layout_map(mod)
 
     out = layouts["Out_shared"]
     assert is_same_layout(out, make_aligned_row_major((40,), "float16", 64))
@@ -561,13 +551,13 @@ def test_tilelang_reduce_sunmmio_3d_blocked_axis_aligned():
         with T.Kernel(1, threads=128) as (bx,):
             A_shared = T.alloc_shared((2, 40, 256), "float16", scope="shared.rsram")
             Out_shared = T.alloc_shared((2, 40), "float16", scope="shared.rsram")
-            T.annotate_layout({A_shared: make_zz_layout(A_shared)})
             T.copy(A, A_shared)
             T.reduce_sum(A_shared, Out_shared, dim=2)
             T.copy(Out_shared, Out)
 
     with tvm.target.Target(target):
-        layouts = _infer_layout_map(tvm.IRModule({"main": main}), target)
+        mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
+    layouts = _layout_map(mod)
     assert is_same_layout(layouts["Out_shared"], make_aligned_row_major((2, 40), "float16", 64))
 
 
@@ -583,14 +573,14 @@ def test_tilelang_reduce_sunmmio_chained_reduce_stays_aligned():
             A_shared = T.alloc_shared((8, 64, 40), "float16", scope="shared.rsram")
             M_shared = T.alloc_shared((8, 40), "float16", scope="shared.rsram")
             Out_shared = T.alloc_shared((40,), "float16", scope="shared.rsram")
-            T.annotate_layout({A_shared: make_zz_layout(A_shared)})
             T.copy(A, A_shared)
             T.reduce_sum(A_shared, M_shared, dim=1)  # blocked axis -> aligned (8,40)
             T.reduce_sum(M_shared, Out_shared, dim=0)  # off unblocked -> aligned
             T.copy(Out_shared, Out)
 
     with tvm.target.Target(target):
-        layouts = _infer_layout_map(tvm.IRModule({"main": main}), target)
+        mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
+    layouts = _layout_map(mod)
     assert is_same_layout(layouts["M_shared"], make_aligned_row_major((8, 40), "float16", 64))
     assert is_same_layout(layouts["Out_shared"], make_aligned_row_major((40,), "float16", 64))
     assert not is_same_layout(layouts["Out_shared"], make_row_major((40,)))
@@ -606,13 +596,13 @@ def test_tilelang_reduce_sunmmio_nonblocked_reduce_preserves_zz():
         with T.Kernel(1, threads=128) as (bx,):
             A_shared = T.alloc_shared((40, 64, 64), "float16", scope="shared.rsram")
             Out_shared = T.alloc_shared((64, 64), "float16", scope="shared.rsram")
-            T.annotate_layout({A_shared: make_zz_layout(A_shared)})
             T.copy(A, A_shared)
             T.reduce_sum(A_shared, Out_shared, dim=0)
             T.copy(Out_shared, Out)
 
     with tvm.target.Target(target):
-        layouts = _infer_layout_map(tvm.IRModule({"main": main}), target)
+        mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
+    layouts = _layout_map(mod)
     out = layouts["Out_shared"]
     assert is_same_layout(out, make_zz_layout((64, 64), [0, 1], (32, 32)))
     assert not is_same_layout(out, make_row_major((64, 64)))
@@ -628,13 +618,13 @@ def test_tilelang_reduce_sunmmio_aligned_dst_is_noop_when_32_multiple():
         with T.Kernel(1, threads=128) as (bx,):
             A_shared = T.alloc_shared((64, 64), "float16", scope="shared.rsram")
             Out_shared = T.alloc_shared((64,), "float16", scope="shared.rsram")
-            T.annotate_layout({A_shared: make_zz_layout(A_shared)})
             T.copy(A, A_shared)
             T.reduce_sum(A_shared, Out_shared, dim=0)
             T.copy(Out_shared, Out)
 
     with tvm.target.Target(target):
-        layouts = _infer_layout_map(tvm.IRModule({"main": main}), target)
+        mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
+    layouts = _layout_map(mod)
     assert is_same_layout(layouts["Out_shared"], make_row_major((64,)))
 
 
@@ -652,16 +642,14 @@ def test_tilelang_reduce_sunmmio_aligned_output_lowers_end_to_end():
         with T.Kernel(1, threads=128) as (bx,):
             A_shared = T.alloc_shared((40, 64), "float16", scope="shared.rsram")
             Out_shared = T.alloc_shared((40,), "float16", scope="shared.rsram")
-            T.annotate_layout({A_shared: make_zz_layout(A_shared)})
             T.copy(A, A_shared)
             T.reduce_sum(A_shared, Out_shared, dim=1)
             T.copy(Out_shared, Out)
 
-    mod_in = tvm.IRModule({"main": main})
     with tvm.target.Target(target):
-        layouts = _infer_layout_map(tvm.IRModule({"main": main}), target)
-        assert is_same_layout(layouts["Out_shared"], make_aligned_row_major((40,), "float16", 64))
-        mod = apply_sunmmio_passes(mod_in, target)
+        mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
+    layouts = _layout_map(mod)
+    assert is_same_layout(layouts["Out_shared"], make_aligned_row_major((40,), "float16", 64))
 
     names = []
     post_order_visit(

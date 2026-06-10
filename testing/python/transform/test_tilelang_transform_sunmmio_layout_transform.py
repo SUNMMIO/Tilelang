@@ -72,6 +72,20 @@ def staging_buffers(func):
     return [b for b in collect_alloc_buffers(func) if b.name.endswith("_layout_stage")]
 
 
+def transform_leg_region_ranks(func):
+    """Return [(rankA, rankB), ...], the rank of each region argument of every
+    sunmmio_layout_transform call.  A region is T.region(buf[...], mask, *exts),
+    so its rank is len(args) - 2."""
+    legs = []
+
+    def visit(node):
+        if isinstance(node, tir.Call) and hasattr(node.op, "name") and node.op.name == "tl.sunmmio_layout_transform":
+            legs.append((len(node.args[0].args) - 2, len(node.args[1].args) - 2))
+
+    post_order_visit(func.body, visit)
+    return legs
+
+
 def extract_layout_map(func):
     """Return the layout_map from the function's block annotations."""
     layout_map = {}
@@ -327,6 +341,164 @@ def test_padded_rsram_copy_rank3_splits():
         mod = apply_passes_through_lower_tile_op(mod, target)
         func = list(mod.functions.values())[0]
         assert collect_call_names(func).count("tl.sunmmio_layout_transform") == 2
+
+
+def unit_dim_source_kernel():
+    """4D DRAM sliced with unit dims (A[0,:,0,:], logical [2,64]) into a 2D ZZ
+    RSRAM buffer.  The copy frontend's shape check sees the squeezed [2,64], but
+    the lowered DRAM source region keeps its full 4D extents [1,2,1,64] (a
+    region's rank equals its buffer's).  The staging must follow the RSRAM
+    region [2,64] so the transform leg is rank-matched; the DMA leg carries the
+    degenerate dims and folds them away."""
+
+    @T.prim_func
+    def main(A: _dram((2, 2, 2, 64), make_row_major((2, 2, 2, 64)))):
+        with T.Kernel(1, threads=128) as (bx,):
+            S = T.alloc_shared((2, 64), DTYPE, scope="shared.rsram")
+            T.annotate_layout({S: make_zz_layout((2, 64), [0, 1], (32, 32))})
+            T.copy(A[0, :, 0, :], S)  # DRAM region [1,2,1,64] -> ZZ RSRAM [2,64]
+
+    return tvm.IRModule({"main": main})
+
+
+def test_unit_dim_source_staging_follows_rsram_shape():
+    """A unit-dim 4D DRAM source: the staging follows the RSRAM region [2,64],
+    not the 4D DRAM region, so the transform leg is rank-matched (2D <-> 2D)."""
+    target = determine_target("Sunmmio", return_object=True)
+    mod = unit_dim_source_kernel()
+    with tvm.target.Target(target):
+        mod = apply_passes_through_lower_tile_op(mod, target)
+        func = list(mod.functions.values())[0]
+
+        names = collect_call_names(func)
+        assert names.count("tl.sunmmio_layout_transform") == 1, names
+
+        # Staging follows the RSRAM region [2,64], not the 4D DRAM region.
+        stages = staging_buffers(func)
+        assert len(stages) == 1, [b.name for b in stages]
+        assert [int(x) for x in stages[0].shape] == [2, 64], stages[0].shape
+
+        # The transform leg pairs the [2,64] staging with the [2,64] RSRAM
+        # buffer: both rank 2.  (Before the fix the staging was [1,2,1,64], so
+        # the transform leg was a broken 4D <-> 2D pairing.)
+        assert transform_leg_region_ranks(func) == [(2, 2)], transform_leg_region_ranks(func)
+
+
+def unit_dim_dest_kernel():
+    """Store direction: ZZ RSRAM -> row-major DRAM 4D dest sliced with unit dims
+    (B[0,:,0,:]).  The matched ZZ->ZZ load stays a plain dma_copy; only the store
+    splits, and its staging follows the RSRAM region [2,64], not the 4D dest."""
+
+    @T.prim_func
+    def main(
+        A: _dram((2, 64), make_zz_layout((2, 64), [0, 1], (32, 32))),
+        B: _dram((2, 2, 2, 64), make_row_major((2, 2, 2, 64))),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            X = T.alloc_shared((2, 64), DTYPE, scope="shared.rsram")
+            T.annotate_layout({X: make_zz_layout((2, 64), [0, 1], (32, 32))})
+            T.copy(A, X)  # ZZ DRAM -> ZZ RSRAM: matched, plain dma
+            T.copy(X, B[0, :, 0, :])  # ZZ RSRAM -> rm DRAM 4D unit-dim: store split
+
+    return tvm.IRModule({"main": main})
+
+
+def test_unit_dim_dest_staging_follows_rsram_shape():
+    """Store direction with a unit-dim 4D DRAM dest: the staging follows the
+    RSRAM region [2,64] and the transform leg is rank-matched (2D <-> 2D)."""
+    target = determine_target("Sunmmio", return_object=True)
+    mod = unit_dim_dest_kernel()
+    with tvm.target.Target(target):
+        mod = apply_passes_through_lower_tile_op(mod, target)
+        func = list(mod.functions.values())[0]
+
+        names = collect_call_names(func)
+        # Matched load (plain dma) + store split (dma + transform).
+        assert names.count("tl.dma_copy") == 2, names
+        assert names.count("tl.sunmmio_layout_transform") == 1, names
+
+        stages = staging_buffers(func)
+        assert len(stages) == 1, [b.name for b in stages]
+        assert [int(x) for x in stages[0].shape] == [2, 64], stages[0].shape
+        assert transform_leg_region_ranks(func) == [(2, 2)], transform_leg_region_ranks(func)
+
+
+def unit_dim_source_pad_kernel():
+    """Pad/unpad path with a unit-dim source: 4D DRAM slice [1,2,1,40] -> padded
+    (aligned) RSRAM [2,40].  Exercises the 32-limit branch with unit dims (the
+    leading product 1*2*1 = 2 stays <= 32)."""
+
+    @T.prim_func
+    def main(A: _dram((2, 2, 2, 40), make_row_major((2, 2, 2, 40)))):
+        with T.Kernel(1, threads=128) as (bx,):
+            X = T.alloc_shared((2, 40), DTYPE, scope="shared.rsram")
+            T.annotate_layout({X: make_aligned_row_major((2, 40), "float16", 64)})
+            T.copy(A[0, :, 0, :], X)  # DRAM [1,2,1,40] -> padded RSRAM [2,40]
+
+    return tvm.IRModule({"main": main})
+
+
+def test_unit_dim_source_pad_unpad_path():
+    """Unit-dim source on the pad/unpad path: staging follows the RSRAM region
+    [2,40] and the pad transform leg is rank-matched."""
+    target = determine_target("Sunmmio", return_object=True)
+    mod = unit_dim_source_pad_kernel()
+    with tvm.target.Target(target):
+        mod = apply_passes_through_lower_tile_op(mod, target)
+        func = list(mod.functions.values())[0]
+
+        assert collect_call_names(func).count("tl.sunmmio_layout_transform") == 1
+        stages = staging_buffers(func)
+        assert len(stages) == 1, [b.name for b in stages]
+        assert [int(x) for x in stages[0].shape] == [2, 40], stages[0].shape
+        assert transform_leg_region_ranks(func) == [(2, 2)], transform_leg_region_ranks(func)
+
+
+def leading_unit_dim_3d_kernel():
+    """Unit dim in the leading position of a 3D source: A[0,:,:] -> [1,2,64]
+    region into a ZZ RSRAM [2,64].  Varies the squeezed-dim position/rank."""
+
+    @T.prim_func
+    def main(A: _dram((2, 2, 64), make_row_major((2, 2, 64)))):
+        with T.Kernel(1, threads=128) as (bx,):
+            S = T.alloc_shared((2, 64), DTYPE, scope="shared.rsram")
+            T.annotate_layout({S: make_zz_layout((2, 64), [0, 1], (32, 32))})
+            T.copy(A[0, :, :], S)  # DRAM [1,2,64] -> ZZ RSRAM [2,64]
+
+    return tvm.IRModule({"main": main})
+
+
+def test_leading_unit_dim_3d_source():
+    """A 3D source with a leading unit dim: staging follows the RSRAM region
+    [2,64] and the transform leg is rank-matched."""
+    target = determine_target("Sunmmio", return_object=True)
+    mod = leading_unit_dim_3d_kernel()
+    with tvm.target.Target(target):
+        mod = apply_passes_through_lower_tile_op(mod, target)
+        func = list(mod.functions.values())[0]
+
+        assert collect_call_names(func).count("tl.sunmmio_layout_transform") == 1
+        stages = staging_buffers(func)
+        assert len(stages) == 1, [b.name for b in stages]
+        assert [int(x) for x in stages[0].shape] == [2, 64], stages[0].shape
+        assert transform_leg_region_ranks(func) == [(2, 2)], transform_leg_region_ranks(func)
+
+
+def test_matched_rank_staging_equals_rsram_region():
+    """Backward-compat: with no unit dims the RSRAM region equals the DRAM
+    region, so anchoring the staging on the RSRAM side leaves the staging shape
+    (and every transform leg) unchanged."""
+    target = determine_target("Sunmmio", return_object=True)
+    mod = mismatched_copy_kernel()  # (M,N) row-major DRAM <-> ZZ RSRAM, both dirs
+    with tvm.target.Target(target):
+        mod = apply_passes_through_lower_tile_op(mod, target)
+        func = list(mod.functions.values())[0]
+
+        stages = staging_buffers(func)
+        assert len(stages) == 2, [b.name for b in stages]
+        for b in stages:
+            assert [int(x) for x in b.shape] == [M, N], b.shape
+        assert transform_leg_region_ranks(func) == [(2, 2), (2, 2)], transform_leg_region_ranks(func)
 
 
 def test_aligned_rsram_copy_already_32_multiple_stays_plain():

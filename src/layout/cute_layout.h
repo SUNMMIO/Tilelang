@@ -223,7 +223,24 @@ DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
                  arith::Analyzer *analyzer = nullptr);
 
 /*!
+ * \brief Canonicalize a physically-row-major layout to plain row-major.
+ *
+ * Coalesces each logical dimension's modes (drop static size-1 modes, merge
+ * provably-contiguous neighbours, never across dims) and returns the result
+ * only if it fully reduces to the plain row-major of the logical shape -- i.e.
+ * the layout is physically contiguous row-major, such as a single-block ZZ.
+ * Anything that still carries real structure (a multi-block ZZ, an alignment-
+ * padded row-major, or a partially-degenerate ZZ with one single-block dim) is
+ * returned unchanged, so DeriveLayoutLike can still shape-adapt it.  Symbolic
+ * modes are kept verbatim; non-CuteLayout inputs are returned unchanged.
+ */
+Layout CoalesceLayout(const Layout &layout);
+
+/*!
  * \brief Same layout kind, possibly for different logical shapes.
+ *
+ * Operands are coalesced first, so representations that describe the same byte
+ * map (e.g. a single-block ZZ vs row-major) compare equal.
  */
 bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
                    arith::Analyzer *analyzer = nullptr);
@@ -277,14 +294,11 @@ Layout MakeRowMajor(Array<PrimExpr> shape);
 /*!
  * \brief Row-major CuteLayout with the innermost extent padded for alignment.
  *
- * Rounds the innermost (contiguous) extent up to a multiple of `align_bytes`
- * (expressed in elements of `dtype`) and stores it as the covered/physical
- * extent in `mode_shape`, so the tile/DMA unit can read a full alignment-sized
- * extent and every row starts on an aligned offset — required for RSRAM vector
- * accesses.  The padding lands in `mode_shape`; `logical_shape` keeps the true
- * extent so iteration domains stay correct.  Strides are dense row-major over
- * the padded `mode_shape`, so alignment propagates to every outer dimension.
- * Applies to rank >= 1 (a rank-1 [N] buffer becomes covered [round_up(N)]).
+ * Rounds the innermost extent up to a multiple of `align_bytes` (in `dtype`
+ * elements) and stores it as the covered extent in `mode_shape`, so each row
+ * starts on an aligned offset (required for RSRAM access).  `logical_shape`
+ * keeps the true extent; strides are dense row-major over the padded
+ * `mode_shape`.  Rank-1 [N] becomes covered [round_up(N)].
  */
 Layout MakeAlignedRowMajor(Array<PrimExpr> shape, DataType dtype,
                            int align_bytes);

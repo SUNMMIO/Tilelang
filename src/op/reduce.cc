@@ -1106,11 +1106,9 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &T,
   if (level >= InferLevel::kStrict)
     return {};
 
-  // Sunmmio RSRAM reduce: derive dst layout from src layout and reduce axis.
-  //
-  // If the reduced dim is blocked (nlevels > 1), the block structure on
-  // that axis is destroyed → fall back to row-major.
-  // Otherwise, DeriveLayoutLike preserves the surviving blocked structure.
+  // Sunmmio RSRAM reduce: derive the dst layout from the src. A surviving
+  // blocked (ZZ) structure is kept via DeriveLayoutLike; any row-major result
+  // is alignment-padded so each row stays RSRAM-aligned.
   if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeRSRAM) {
     LayoutMap result;
     // Always propose when src has a layout — TryAssign handles priority.
@@ -1122,9 +1120,8 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &T,
           src_cute && src_cute->GetDimLevels()[dim].IntValue() > 1;
       int align_bytes =
           GetSunmmioTileProcessorConfig(T.target).rsram_align_bytes;
-      // True if any logical dim of `layout` is blocked (dim_levels > 1), i.e.
-      // it carries tiling structure that is inherently block-aligned.  A plain
-      // row-major layout (all dim_levels == 1) returns false.
+      // True if `layout` has any blocked dim (dim_levels > 1), i.e. already-
+      // aligned tiling; a plain row-major (all dim_levels == 1) returns false.
       auto HasBlockedDim = [](const Layout &layout) {
         if (const auto *cute = layout.as<CuteLayoutNode>()) {
           for (const Integer &lvl : cute->GetDimLevels()) {
@@ -1134,12 +1131,9 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &T,
         }
         return false;
       };
-      // Reducing a non-blocked axis can preserve surviving blocked structure
-      // (already block-aligned).  Keep DeriveLayoutLike's result only when
-      // blocks actually survive; any unblocked (row-major) outcome (a
-      // blocked-axis reduction, a fully-unblocked src / chained reduce, or a
-      // failed derivation) goes through MakeAlignedRowMajor so each row stays
-      // RSRAM-aligned.
+      // Keep DeriveLayoutLike's result only when it preserves blocks (already
+      // block-aligned); any row-major outcome (blocked-axis reduce, chained
+      // unblocked src, failed derivation) goes through MakeAlignedRowMajor.
       Layout dst_layout;
       if (!reduces_blocked_dim) {
         auto derived = DeriveLayoutLike(T.layout_map[src], dst->shape);

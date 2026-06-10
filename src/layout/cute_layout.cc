@@ -612,11 +612,90 @@ Optional<Layout> DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
                     new_dim_levels);
 }
 
+Layout CoalesceLayout(const Layout &layout) {
+  const auto *cute = layout.as<CuteLayoutNode>();
+  if (!cute)
+    return layout; // non-CuteLayout: nothing to coalesce
+
+  Array<PrimExpr> logical_shape = cute->GetLogicalShape();
+  Array<Integer> dim_levels = cute->GetDimLevels();
+
+  Array<PrimExpr> mode_shape, mode_stride;
+  Array<Integer> new_levels;
+  for (size_t d = 0; d < dim_levels.size(); ++d) {
+    Array<PrimExpr> shapes = cute->GetModeShapeOfDim(d);
+    Array<PrimExpr> strides = cute->GetModeStrideOfDim(d);
+    int nlevels = dim_levels[d].IntValue();
+
+    // Per-dimension coalesce (storage order preserved -- never sort, that would
+    // change the index->offset map): drop static size-1 modes, and merge into
+    // the previous mode when both are static and contiguous.
+    std::vector<std::pair<PrimExpr, PrimExpr>> modes; // (shape, stride)
+    for (int i = 0; i < nlevels; ++i) {
+      const auto *cur_sh = shapes[i].as<IntImmNode>();
+      if (cur_sh && cur_sh->value == 1)
+        continue; // drop a degenerate (size-1) mode
+      if (!modes.empty() && cur_sh) {
+        const auto *pm = modes.back().first.as<IntImmNode>();
+        const auto *ps = modes.back().second.as<IntImmNode>();
+        const auto *cs = strides[i].as<IntImmNode>();
+        if (pm && ps && cs && pm->value * ps->value == cs->value) {
+          modes.back().first =
+              IntImm(modes.back().first.dtype(), pm->value * cur_sh->value);
+          continue; // merge: inner.shape * inner.stride == outer.stride
+        }
+      }
+      modes.push_back({shapes[i], strides[i]});
+    }
+    if (modes.empty()) // all modes were size-1: a logical extent-1 dim
+      modes.push_back(
+          {IntImm(shapes[0].dtype(), 1), IntImm(strides[0].dtype(), 0)});
+
+    new_levels.push_back(Integer(static_cast<int>(modes.size())));
+    for (const auto &[sh, st] : modes) {
+      mode_shape.push_back(sh);
+      mode_stride.push_back(st);
+    }
+  }
+  Layout coalesced =
+      CuteLayout(logical_shape, mode_shape, mode_stride, new_levels);
+  // Only commit the coalesced form when it fully reduces to the plain row-major
+  // of the logical shape -- i.e. the layout is physically contiguous row-major
+  // (e.g. a single-block ZZ). Otherwise it still carries real structure: a
+  // multi-block ZZ, alignment padding, or a partially-degenerate mix (a ZZ with
+  // one single-block dim, common for sharded buffers), which other layouts
+  // match against via DeriveLayoutLike's shape adaptation. Collapsing those
+  // per-dim would drop the block grid that adaptation relies on, so keep the
+  // original.
+  if (IsSameLayout(coalesced, sunmmio::MakeRowMajor(logical_shape)))
+    return coalesced;
+  return layout;
+}
+
 bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
                    arith::Analyzer *analyzer) {
-  auto derived = DeriveLayoutLike(lhs, rhs->InputShape(),
-                                  Optional<Array<Integer>>(), analyzer);
-  return derived.defined() && IsSameLayout(derived.value(), rhs, analyzer);
+  // Compare on canonical (coalesced) forms so representations describing the
+  // same byte map agree -- e.g. a single-block ZZ coalesces to row-major and
+  // matches a row-major buffer. Checked in both directions: DeriveLayoutLike
+  // rebuilds the template at the target's shape with tight strides, dropping
+  // the template's padding, so a single direction only sees padding on rhs;
+  // both directions give each layout a turn as rhs (so a tight and an
+  // alignment- padded row-major do not match), while unpadded layouts of
+  // different shapes still match.
+  Layout cl = CoalesceLayout(lhs), cr = CoalesceLayout(rhs);
+  // Identical coalesced forms => identical byte map. Covers the reflexive and
+  // same-shape cases, including over-covered dims (covered > logical, e.g. a ZZ
+  // whose logical extent is below the block size) that DeriveLayoutLike would
+  // otherwise tighten and miss.
+  if (IsSameLayout(cl, cr, analyzer))
+    return true;
+  // Different logical shapes, same kind: re-derive each onto the other's shape.
+  auto fwd = DeriveLayoutLike(cl, cr->InputShape(), Optional<Array<Integer>>(),
+                              analyzer);
+  auto bwd = DeriveLayoutLike(cr, cl->InputShape(), Optional<Array<Integer>>(),
+                              analyzer);
+  return fwd.defined() && IsSameLayout(fwd.value(), cr, analyzer) &&
+         bwd.defined() && IsSameLayout(bwd.value(), cl, analyzer);
 }
 
 // ---------------------------------------------------------------------------
@@ -814,12 +893,9 @@ Layout MakeAlignedRowMajor(Array<PrimExpr> shape, DataType dtype,
   Array<PrimExpr> mode_stride;
   Array<Integer> dim_levels;
 
-  // Round the innermost (contiguous) extent up to a multiple of align_elems and
-  // store it as the covered/physical extent in mode_shape.  This gives the
-  // tile/DMA unit a full alignment-sized extent to read and makes every row
-  // start on an aligned offset.  logical_shape keeps the true extent so
-  // iteration domains stay correct.  A rank-1 [N] buffer becomes covered
-  // [round_up(N)], with no leading-dimension stride needed.
+  // Pad the innermost (contiguous) extent to a multiple of align_elems and
+  // store it as the covered extent in mode_shape; logical_shape keeps the true
+  // extent.
   for (int d = 0; d < rank; ++d)
     mode_shape.push_back(shape[d]);
   mode_shape.Set(rank - 1, ceildiv(shape[rank - 1], makeInt(align_elems)) *
@@ -1157,6 +1233,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            })
       .def("tl.IsLayoutMatch",
            [](Layout lhs, Layout rhs) { return IsLayoutMatch(lhs, rhs); })
+      .def("tl.CoalesceLayout",
+           [](Layout layout) { return CoalesceLayout(layout); })
       .def("tl.sunmmio.make_row_major",
            [](Array<PrimExpr> shape) { return sunmmio::MakeRowMajor(shape); })
       .def("tl.sunmmio.make_aligned_row_major",

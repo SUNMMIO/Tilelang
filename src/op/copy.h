@@ -293,12 +293,21 @@ protected:
   Stmt LowerNormalCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
 
   /*!
-   * \brief Generate lowering for SUNMMIO DMA copy.
+   * \brief Lower a SUNMMIO DMA copy by dispatching on the (src, dst) scope
+   * pair.
    *
-   * Emits a tl.dma_copy(src_region, dst_region) intrinsic that preserves full
-   * buffer region semantics for later SUNMMIO codegen consumption.
+   * DRAM<->RSRAM is layout-aware (LowerSunmmioDramRsramCopy); DRAM->WSRAM and
+   * RSRAM->ASRAM/WSRAM are plain tl.dma_copy transfers.
    */
   Stmt LowerSunmmioDmaCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
+
+  /*!
+   * \brief Lower a DRAM<->RSRAM copy, bridging a layout mismatch via a staged
+   * RSRAM buffer plus a tl.sunmmio_layout_transform. Falls back to a plain
+   * tl.dma_copy when the two layouts already match.
+   */
+  Stmt LowerSunmmioDramRsramCopy(const LowerArgs &T,
+                                 arith::Analyzer *analyzer) const;
 
   /*!
    * \brief Generate lowering for SUNMMIO Tile-based copy.
