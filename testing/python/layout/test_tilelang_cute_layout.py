@@ -35,7 +35,7 @@ same_layout = _get("tl.CuteLayout_same_layout")
 is_same_layout = _get("tl.IsSameLayout")
 derive_layout_like = _get("tl.DeriveLayoutLike")
 is_layout_match = _get("tl.IsLayoutMatch")
-coalesce_layout = _get("tl.CoalesceLayout")
+canonicalize_to_row_major = _get("tl.TryCanonicalizeToRowMajor")
 
 ANA = tvm.arith.Analyzer()
 
@@ -413,32 +413,32 @@ class TestLayoutRelations:
         assert is_layout_match(aligned, tight)
 
 
-class TestCoalesceLayout:
-    def test_single_block_zz_coalesces_to_row_major(self):
+class TestCanonicalizeToRowMajor:
+    def test_single_block_zz_canonicalizes_to_row_major(self):
         # A ZZ whose block spans the whole buffer has a size-1 block grid; it
         # coalesces to the plain row-major of its shape.
         zz = make_zz(_imms(32, 32), [0, 1], _imms(32, 32))
-        assert is_same_layout(coalesce_layout(zz), make_row_major(_imms(32, 32)))
+        assert is_same_layout(canonicalize_to_row_major(zz), make_row_major(_imms(32, 32)))
 
     def test_multi_block_zz_stays_blocked(self):
         # A real (multi-block) ZZ does NOT coalesce to row-major.
         zz = make_zz(_imms(128, 128), [0, 1], _imms(32, 32))
-        assert not is_same_layout(coalesce_layout(zz), make_row_major(_imms(128, 128)))
+        assert not is_same_layout(canonicalize_to_row_major(zz), make_row_major(_imms(128, 128)))
 
     def test_padded_row_major_stays_padded(self):
         # Coalescing preserves the pitch gap of an alignment-padded row-major,
         # so it stays distinct from the tight row-major.
         padded = make_aligned_row_major(_imms(2, 40), "float16", 64)  # 40 -> 64
-        assert not is_same_layout(coalesce_layout(padded), make_row_major(_imms(2, 40)))
+        assert not is_same_layout(canonicalize_to_row_major(padded), make_row_major(_imms(2, 40)))
 
     def test_row_major_is_a_fixed_point(self):
         rm = make_row_major(_imms(8, 40))
-        assert is_same_layout(coalesce_layout(rm), rm)
+        assert is_same_layout(canonicalize_to_row_major(rm), rm)
 
-    def test_coalesce_is_idempotent(self):
+    def test_canonicalize_is_idempotent(self):
         zz = make_zz(_imms(32, 32), [0, 1], _imms(32, 32))
-        once = coalesce_layout(zz)
-        assert is_same_layout(coalesce_layout(once), once)
+        once = canonicalize_to_row_major(zz)
+        assert is_same_layout(canonicalize_to_row_major(once), once)
 
 
 # ---------------------------------------------------------------------------

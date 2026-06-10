@@ -612,7 +612,7 @@ Optional<Layout> DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
                     new_dim_levels);
 }
 
-Layout CoalesceLayout(const Layout &layout) {
+Layout TryCanonicalizeToRowMajor(const Layout &layout) {
   const auto *cute = layout.as<CuteLayoutNode>();
   if (!cute)
     return layout; // non-CuteLayout: nothing to coalesce
@@ -659,14 +659,11 @@ Layout CoalesceLayout(const Layout &layout) {
   }
   Layout coalesced =
       CuteLayout(logical_shape, mode_shape, mode_stride, new_levels);
-  // Only commit the coalesced form when it fully reduces to the plain row-major
-  // of the logical shape -- i.e. the layout is physically contiguous row-major
-  // (e.g. a single-block ZZ). Otherwise it still carries real structure: a
-  // multi-block ZZ, alignment padding, or a partially-degenerate mix (a ZZ with
-  // one single-block dim, common for sharded buffers), which other layouts
-  // match against via DeriveLayoutLike's shape adaptation. Collapsing those
-  // per-dim would drop the block grid that adaptation relies on, so keep the
-  // original.
+  // Coalescing preserves the byte map but rewrites the mode structure that
+  // DeriveLayoutLike reads as the layout kind, so a partial coalesce would
+  // change how IsLayoutMatch shape-adapts the layout. Commit only when all
+  // structure is gone (plain row-major); keep anything still blocked or
+  // padded unchanged.
   if (IsSameLayout(coalesced, sunmmio::MakeRowMajor(logical_shape)))
     return coalesced;
   return layout;
@@ -674,15 +671,16 @@ Layout CoalesceLayout(const Layout &layout) {
 
 bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
                    arith::Analyzer *analyzer) {
-  // Compare on canonical (coalesced) forms so representations describing the
-  // same byte map agree -- e.g. a single-block ZZ coalesces to row-major and
-  // matches a row-major buffer. Checked in both directions: DeriveLayoutLike
-  // rebuilds the template at the target's shape with tight strides, dropping
-  // the template's padding, so a single direction only sees padding on rhs;
-  // both directions give each layout a turn as rhs (so a tight and an
-  // alignment- padded row-major do not match), while unpadded layouts of
+  // Compare on canonical forms so representations describing the
+  // same byte map agree -- e.g. a single-block ZZ canonicalizes to row-major
+  // and matches a row-major buffer. Checked in both directions:
+  // DeriveLayoutLike rebuilds the template at the target's shape with tight
+  // strides, dropping the template's padding, so a single direction only sees
+  // padding on rhs; both directions give each layout a turn as rhs (so a tight
+  // and an alignment- padded row-major do not match), while unpadded layouts of
   // different shapes still match.
-  Layout cl = CoalesceLayout(lhs), cr = CoalesceLayout(rhs);
+  Layout cl = TryCanonicalizeToRowMajor(lhs),
+         cr = TryCanonicalizeToRowMajor(rhs);
   // Identical coalesced forms => identical byte map. Covers the reflexive and
   // same-shape cases, including over-covered dims (covered > logical, e.g. a ZZ
   // whose logical extent is below the block size) that DeriveLayoutLike would
@@ -1233,8 +1231,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            })
       .def("tl.IsLayoutMatch",
            [](Layout lhs, Layout rhs) { return IsLayoutMatch(lhs, rhs); })
-      .def("tl.CoalesceLayout",
-           [](Layout layout) { return CoalesceLayout(layout); })
+      .def("tl.TryCanonicalizeToRowMajor",
+           [](Layout layout) { return TryCanonicalizeToRowMajor(layout); })
       .def("tl.sunmmio.make_row_major",
            [](Array<PrimExpr> shape) { return sunmmio::MakeRowMajor(shape); })
       .def("tl.sunmmio.make_aligned_row_major",

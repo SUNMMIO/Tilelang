@@ -223,24 +223,22 @@ DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
                  arith::Analyzer *analyzer = nullptr);
 
 /*!
- * \brief Canonicalize a physically-row-major layout to plain row-major.
+ * \brief Canonicalize a physically-row-major layout to plain row-major;
+ *        return anything else unchanged.
  *
- * Coalesces each logical dimension's modes (drop static size-1 modes, merge
- * provably-contiguous neighbours, never across dims) and returns the result
- * only if it fully reduces to the plain row-major of the logical shape -- i.e.
- * the layout is physically contiguous row-major, such as a single-block ZZ.
- * Anything that still carries real structure (a multi-block ZZ, an alignment-
- * padded row-major, or a partially-degenerate ZZ with one single-block dim) is
- * returned unchanged, so DeriveLayoutLike can still shape-adapt it.  Symbolic
- * modes are kept verbatim; non-CuteLayout inputs are returned unchanged.
+ * Per dim, drops static size-1 modes and merges contiguous neighbours, then
+ * commits only if that reduces to plain row-major of the logical shape (e.g.
+ * a single-block ZZ).  Mode coalescing preserves the byte map but changes the
+ * mode structure that DeriveLayoutLike interprets as the layout kind, so a
+ * partial coalesce must never escape; only fully-row-major results are safe.
  */
-Layout CoalesceLayout(const Layout &layout);
+Layout TryCanonicalizeToRowMajor(const Layout &layout);
 
 /*!
  * \brief Same layout kind, possibly for different logical shapes.
  *
- * Operands are coalesced first, so representations that describe the same byte
- * map (e.g. a single-block ZZ vs row-major) compare equal.
+ * Operands are canonicalized first, so representations that describe the same
+ * byte map (e.g. a single-block ZZ vs row-major) compare equal.
  */
 bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
                    arith::Analyzer *analyzer = nullptr);

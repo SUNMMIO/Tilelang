@@ -30,8 +30,7 @@ SunmmioTileProcessorConfig MakeSunmmioA4EConfig() {
 
 ffi::Array<PrimExpr> MakeSunmmioA4EBlockShape(DataType dtype) {
   // A4E uses a (32, 32) block for every element dtype so that buffers of
-  // different dtypes (e.g. an fp16 source and fp8 destination of a cast
-  // copy) share the same tile shapes in elements.
+  // different dtypes share the same tile shapes in elements.
   (void)dtype;
   return {tir::make_const(DataType::Int(32), 32),
           tir::make_const(DataType::Int(32), 32)};
