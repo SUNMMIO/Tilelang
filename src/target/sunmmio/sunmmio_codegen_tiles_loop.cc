@@ -378,6 +378,15 @@ bool ContainsVectorCoreInTileReduce(const Stmt &stmt) {
   if (const auto *loop = stmt.as<ForNode>()) {
     return ContainsVectorCoreInTileReduce(loop->body);
   }
+  if (const auto *alloc = stmt.as<AllocateNode>()) {
+    return ContainsVectorCoreInTileReduce(alloc->body);
+  }
+  if (const auto *decl = stmt.as<DeclBufferNode>()) {
+    return ContainsVectorCoreInTileReduce(decl->body);
+  }
+  if (const auto *let = stmt.as<LetStmtNode>()) {
+    return ContainsVectorCoreInTileReduce(let->body);
+  }
   return false;
 }
 
@@ -893,6 +902,31 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     return MakeTileType(buffer->dtype, tile_shape);
   };
 
+  auto make_reduce_register_tile_type_from_buffer = [&](const Buffer &buffer) {
+    std::vector<int64_t> tile_shape;
+    tile_shape.reserve(buffer->shape.size());
+    std::optional<int64_t> single_non_unit_dim;
+    for (int64_t dim = 0; dim < static_cast<int64_t>(buffer->shape.size());
+         ++dim) {
+      const PrimExpr &extent = buffer->shape[static_cast<size_t>(dim)];
+      const auto *extent_imm = extent.as<IntImmNode>();
+      ICHECK(extent_imm) << "Reduce register temp shape must be static";
+      if (extent_imm->value != 1) {
+        tile_shape.push_back(static_cast<int64_t>(extent_imm->value));
+        single_non_unit_dim = single_non_unit_dim.has_value()
+                                  ? std::optional<int64_t>()
+                                  : std::optional<int64_t>(dim);
+      }
+    }
+    if (tile_shape.empty()) {
+      tile_shape.push_back(1);
+    }
+    ICHECK(tile_shape.size() == 1 || tile_shape.size() == 2)
+        << "Reduce register temp expects one or two non-unit extents";
+    SunMMIOType tile_type = MakeTileType(buffer->dtype, tile_shape);
+    return std::make_pair(tile_type, single_non_unit_dim);
+  };
+
   auto make_register_value_name = [&](const Buffer &buffer) {
     return "__tile_reg_" + buffer->name;
   };
@@ -940,14 +974,17 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           state->register_tile_types.count(buffer.get())) {
         return;
       }
-      TileAccessInfo access = analyze_access(buffer, indices, state);
-      SunMMIOType tile_type = MakeTileType(buffer->dtype, access.tile_shape);
+      (void)indices;
+      auto [tile_type, single_non_unit_dim] =
+          make_reduce_register_tile_type_from_buffer(buffer);
       state->register_tile_types[buffer.get()] = tile_type;
       state->register_tile_values[buffer.get()] =
           make_register_tile_value(buffer, tile_type);
-      if (access.tile_rank == 1 && access.unsqueeze_axis >= 0 &&
+      if (ExtractStaticShape(tile_type).size() == 1 &&
+          single_non_unit_dim.has_value() &&
           !state->register_unsqueeze_axes.count(buffer.get())) {
-        state->register_unsqueeze_axes[buffer.get()] = access.unsqueeze_axis;
+        state->register_unsqueeze_axes[buffer.get()] =
+            single_non_unit_dim.value() == 0 ? 1 : 0;
       }
     };
 
@@ -1018,6 +1055,20 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         visit_expr(loop->min);
         visit_expr(loop->extent);
         visit_stmt(loop->body);
+        return;
+      }
+      if (const auto *let = s.as<LetStmtNode>()) {
+        visit_expr(let->value);
+        visit_stmt(let->body);
+        return;
+      }
+      if (const auto *alloc = s.as<AllocateNode>()) {
+        visit_expr(alloc->condition);
+        visit_stmt(alloc->body);
+        return;
+      }
+      if (const auto *decl = s.as<DeclBufferNode>()) {
+        visit_stmt(decl->body);
         return;
       }
       if (const auto *store = s.as<BufferStoreNode>()) {
@@ -2878,6 +2929,32 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       state->local_unit_tile_axes = let_state.local_unit_tile_axes;
       return;
     }
+    if (const auto *alloc = stmt.as<AllocateNode>()) {
+      auto buffer_it = buffer_data_to_buffer_.find(alloc->buffer_var.get());
+      if (buffer_it != buffer_data_to_buffer_.end() &&
+          IsReduceRegisterTempBuffer(buffer_it->second)) {
+        EnterScope();
+        RegisterBuffer(buffer_it->second, false);
+        lower_reduce_stmt(alloc->body, state);
+        ExitScope();
+        return;
+      }
+      UnsupportedStmt(alloc,
+                      "T.Tiles hybrid lowering only supports Allocate for "
+                      "reduce register temporaries");
+    }
+    if (const auto *decl = stmt.as<DeclBufferNode>()) {
+      if (IsReduceRegisterTempBuffer(decl->buffer)) {
+        EnterScope();
+        RegisterBuffer(decl->buffer, false);
+        lower_reduce_stmt(decl->body, state);
+        ExitScope();
+        return;
+      }
+      UnsupportedStmt(decl,
+                      "T.Tiles hybrid lowering only supports DeclBuffer for "
+                      "reduce register temporaries");
+    }
     if (const auto *store = stmt.as<BufferStoreNode>()) {
       auto local_it = state->local_tile_values.find(store->buffer.get());
       if (local_it != state->local_tile_values.end()) {
@@ -3138,14 +3215,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   lower_reduce_stmt = [&](const Stmt &stmt, TileBlockState *state) {
     if (const auto *seq = stmt.as<SeqStmtNode>()) {
       for (const Stmt &s : seq->seq) {
-        // A reduce tile body has conditional init/finalize phases around the
-        // straight-line accumulation phase.  Values stored inside one guarded
-        // branch are not valid SSA values outside that branch, so do not let
-        // tile-value cache entries leak across top-level phases.
-        state->current_tile_values.clear();
         lower_reduce_stmt(s, state);
       }
-      state->current_tile_values.clear();
       return;
     }
     if (const auto *ifs = stmt.as<IfThenElseNode>()) {
@@ -3179,6 +3250,19 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       state->register_tile_values = then_state.register_tile_values;
       state->local_tile_values = saved_locals;
       state->local_unit_tile_axes = saved_local_axes;
+      return;
+    }
+    if (const auto *let = stmt.as<LetStmtNode>()) {
+      SunMMIOValue value = lower_expr(let->value, state, std::nullopt);
+      TileBlockState let_state = *state;
+      let_state.let_values[let->var.get()] = value;
+      lower_reduce_stmt(let->body, &let_state);
+      state->tile_view_cache = let_state.tile_view_cache;
+      state->current_tile_values = let_state.current_tile_values;
+      state->register_tile_values = let_state.register_tile_values;
+      state->register_unsqueeze_axes = let_state.register_unsqueeze_axes;
+      state->local_tile_values = let_state.local_tile_values;
+      state->local_unit_tile_axes = let_state.local_unit_tile_axes;
       return;
     }
     if (const auto *loop = stmt.as<ForNode>()) {
@@ -3238,8 +3322,39 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                         "interior loops");
       }
       lower_reduce_stmt(loop->body, &loop_state);
+      state->tile_view_cache = loop_state.tile_view_cache;
       state->current_tile_values = loop_state.current_tile_values;
+      state->register_tile_values = loop_state.register_tile_values;
+      state->register_unsqueeze_axes = loop_state.register_unsqueeze_axes;
+      state->local_tile_values = loop_state.local_tile_values;
+      state->local_unit_tile_axes = loop_state.local_unit_tile_axes;
       return;
+    }
+    if (const auto *alloc = stmt.as<AllocateNode>()) {
+      auto buffer_it = buffer_data_to_buffer_.find(alloc->buffer_var.get());
+      if (buffer_it != buffer_data_to_buffer_.end() &&
+          IsReduceRegisterTempBuffer(buffer_it->second)) {
+        EnterScope();
+        RegisterBuffer(buffer_it->second, false);
+        lower_reduce_stmt(alloc->body, state);
+        ExitScope();
+        return;
+      }
+      UnsupportedStmt(alloc,
+                      "T.Tiles hybrid lowering only supports Allocate for "
+                      "reduce register temporaries");
+    }
+    if (const auto *decl = stmt.as<DeclBufferNode>()) {
+      if (IsReduceRegisterTempBuffer(decl->buffer)) {
+        EnterScope();
+        RegisterBuffer(decl->buffer, false);
+        lower_reduce_stmt(decl->body, state);
+        ExitScope();
+        return;
+      }
+      UnsupportedStmt(decl,
+                      "T.Tiles hybrid lowering only supports DeclBuffer for "
+                      "reduce register temporaries");
     }
     if (IsTokenLikeTileStmt(stmt)) {
       return;
@@ -3275,7 +3390,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       full_state.tile_mask.reset();
       full_state.interior_axis0_loop = scope.interior_axis0_loop;
       full_state.interior_axis1_loop = scope.interior_axis1_loop;
-      lower_stmt(scope.full_tile_block_body, &full_state);
+      if (scope.is_reduce_scope || !state->register_tile_values.empty()) {
+        lower_reduce_stmt(scope.full_tile_block_body, &full_state);
+      } else {
+        lower_stmt(scope.full_tile_block_body, &full_state);
+      }
       builder_->BeginElse();
       TailMaskInfo mask_info = build_tail_mask_info(state);
       builder_->BeginIf(mask_info.row_tail_cond, std::vector<int64_t>{});
@@ -3297,7 +3416,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       builder_->EndIf();
       return;
     }
-    if (scope.is_reduce_scope) {
+    if (scope.is_reduce_scope || !state->register_tile_values.empty()) {
       lower_reduce_stmt(scope.tile_block_body, state);
       return;
     }
@@ -3320,7 +3439,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         DataType::Int(32));
     std::string iv = "%" + loop->loop_var->name_hint;
     std::vector<SunMMIOValue> live_out_values;
-    if (scope.is_reduce_scope) {
+    if (scope.is_reduce_scope || !state->register_tile_values.empty()) {
       live_out_values = collect_register_live_out_values(state);
       builder_->BeginFor(iv, min, upper, step, loop->annotations,
                          live_out_values);
@@ -3344,8 +3463,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   state.mlir_ctx = mlir_ctx;
   state.interior_axis0_loop = scope.interior_axis0_loop;
   state.interior_axis1_loop = scope.interior_axis1_loop;
-  if (scope.is_reduce_scope) {
-    discover_reduce_register_temps(scope.tile_block_body, &state);
+  discover_reduce_register_temps(tile_scope_stmt, &state);
+  if (!state.register_tile_types.empty()) {
     initialize_reduce_register_temps(&state);
   }
   emit_loop_nest(0, &state);
