@@ -310,24 +310,6 @@ def test_sunmmio_copy_frontend_supports_rank_lower_bufferload_to_buffer():
     _assert_region_extents(script, None, 2, [128, 128])
 
 
-def test_sunmmio_copy_frontend_keeps_dynamic_bufferload_extents_static():
-    @target("Sunmmio")
-    def make_kernel():
-        @T.prim_func
-        def kernel(A: T.Tensor((128, 128), DTYPE)):
-            with T.Kernel(2, 2) as (bx, by):
-                A_shared = T.alloc_shared((64, 32), DTYPE)
-                T.copy(A[by * 64, bx * 32], A_shared)
-
-        return kernel
-
-    script = tvm.IRModule({"main": make_kernel()}).script()
-
-    _assert_region_extents(script, "A", 1, [64, 32])
-    _assert_region_extents(script, None, 2, [64, 32])
-    assert "T.min" not in script
-
-
 def test_sunmmio_copy_frontend_supports_squeezed_middle_singleton_dims():
     script = _build_script("region_to_region_rank_squeeze_middle_singleton")
 

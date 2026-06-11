@@ -298,6 +298,9 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
     pass_output_process(mod, "LegalizeSunmmioGemm", test_config)
 
+    mod = tilelang.transform.ValidateCopyTileView()(mod)
+    pass_output_process(mod, "ValidateCopyTileView", test_config)
+
     LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     pass_output_process(mod, "LowerTileOp", test_config)
