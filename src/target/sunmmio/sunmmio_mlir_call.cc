@@ -67,22 +67,22 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
   mlir::SmallVector<int64_t, 4> tiled_dims;
 
   shape.reserve(extents.size());
-
-  if (extents.size() >= 2) {
-    for (int64_t i = 0; i < static_cast<int64_t>(extents.size()); ++i) {
-      if (extents[i] != 1) {
-        shape.push_back(extents[i]);
-        tiled_dims.push_back(i);
-      }
+  for (int64_t i = 0; i < static_cast<int64_t>(extents.size()); ++i) {
+    if (extents[i] != 1) {
+      shape.push_back(extents[i]);
+      tiled_dims.push_back(i);
     }
-    ICHECK_GE(tiled_dims.size(), 1)
-        << "tl.tileop.region expects at least 1 tiled "
-           "dim with extent != 1, but got "
-        << tiled_dims.size();
-  } else {
-    shape.push_back(extents[0]);
+  }
+  if (shape.empty()) {
+    ICHECK(!extents.empty())
+        << "tl.tileop.region expects at least one region dimension";
+    shape.push_back(1);
     tiled_dims.push_back(0);
   }
+  ICHECK(shape.size() == 1 || shape.size() == 2)
+      << "tl.tileop.region expects one or two tiled dims with extent != 1, "
+         "but got "
+      << shape.size();
 
   mlir::Type elem_ty = memtensor_ty.getElementType();
   mlir::Type tile_view_ty =
