@@ -1736,19 +1736,6 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     ICHECK(TryConsumeSyncTokenId(op->args[3], &attrs))
         << "tl.dma_copy expects fourth argument to be tl.sync_token_id";
 
-    if (src_tiled_dims != 2 || dst_tiled_dims != 2) {
-      LOG(WARNING)
-          << "SunMMIO tl.dma_copy fallback: expected 2 tiled dims on both "
-             "regions, got src="
-          << src_tiled_dims << ", dst=" << dst_tiled_dims
-          << ". Emitting null_token so migrated tiles codegen can proceed "
-             "until multi-dim copy lowering lands.";
-      SunMMIOType ret_ty = MapType(op->dtype);
-      std::string result_name = op->dtype.is_void() ? "" : NewValueName();
-      return builder_->Call(result_name, "tl.sync_null_token", {}, attrs,
-                            CallBucketName(bucket), op->dtype, ret_ty);
-    }
-
     operands.push_back(EmitRegionCall(op->args[0], src_offset_byte));
     operands.push_back(EmitRegionCall(op->args[1]));
   } else if (callee == "tl.sunmmio_layout_transform") {
