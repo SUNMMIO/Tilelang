@@ -11,18 +11,19 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <algorithm>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "../layout/cute_layout.h"
+#include "../layout/layout.h"
 #include "../op/builtin.h"
 #include "../op/copy.h"
 #include "../op/operator.h"
 #include "../op/utils.h"
 #include "../target/utils.h"
-#include "../tileview/tileview.h"
 #include "common/attr.h"
 
 namespace tvm {
@@ -47,8 +48,16 @@ public:
   }
 
 private:
+  struct DimLayoutInfo {
+    bool has_layout{false};
+    bool has_dynamic_outer_mode{false};
+    int64_t coalesced_extent{1};
+    int64_t inner_static_mode_shape{1};
+  };
+
   struct ScopeFrame {
-    Map<Var, TileView> tileview_map;
+    LayoutMap layout_map;
+    LayoutMap global_layout_map;
   };
 
   void VisitStmt_(const BlockNode *op) final {
@@ -80,12 +89,67 @@ private:
       frame = scope_stack_.back();
     }
 
-    if (block->annotations.count(attr::kTileViewMap)) {
-      frame.tileview_map = block->annotations.at(attr::kTileViewMap)
-                               .as<Map<Var, TileView>>()
-                               .value();
-    }
+    CollectLayoutAnnotation(block, attr::kLayoutMap, &frame.layout_map);
+    CollectLayoutAnnotation(block, attr::kGlobalLayoutMap,
+                            &frame.global_layout_map);
     scope_stack_.push_back(std::move(frame));
+  }
+
+  void CollectLayoutAnnotation(const BlockNode *block, const char *attr_key,
+                               LayoutMap *dst) {
+    if (!block->annotations.count(attr_key)) {
+      return;
+    }
+
+    auto layout_map_obj = block->annotations.Get(attr_key).value();
+    if (auto layout_map = layout_map_obj.as<LayoutMap>()) {
+      for (const auto &[buffer, layout] : layout_map.value()) {
+        dst->Set(buffer, layout);
+      }
+      return;
+    }
+
+    if (auto layout_map = layout_map_obj.as<Map<Var, Layout>>()) {
+      std::vector<Buffer> block_buffers;
+      for (const Buffer &buffer : block->alloc_buffers) {
+        AddBufferIfMissing(&block_buffers, buffer);
+      }
+      for (const BufferRegion &region : block->reads) {
+        AddBufferIfMissing(&block_buffers, region->buffer);
+      }
+      for (const BufferRegion &region : block->writes) {
+        AddBufferIfMissing(&block_buffers, region->buffer);
+      }
+      for (const MatchBufferRegion &match_buffer : block->match_buffers) {
+        AddBufferIfMissing(&block_buffers, match_buffer->buffer);
+      }
+
+      for (const auto &[buffer_var, layout] : layout_map.value()) {
+        bool found = false;
+        for (const Buffer &buffer : block_buffers) {
+          if (buffer->data.same_as(buffer_var)) {
+            dst->Set(buffer, layout);
+            found = true;
+          }
+        }
+        ICHECK(found) << attr_key
+                      << " annotation references unknown buffer var "
+                      << buffer_var << ".";
+      }
+      return;
+    }
+
+    LOG(FATAL) << "Unsupported " << attr_key << " annotation type.";
+  }
+
+  static void AddBufferIfMissing(std::vector<Buffer> *buffers,
+                                 const Buffer &buffer) {
+    for (const Buffer &existing : *buffers) {
+      if (existing.same_as(buffer)) {
+        return;
+      }
+    }
+    buffers->push_back(buffer);
   }
 
   void ValidateCopyCall(const CallNode *call, const char *op_name,
@@ -96,21 +160,11 @@ private:
     BufferRegion src = NormalizeToBufferRegion(call->args[arg_base]);
     BufferRegion dst = NormalizeToBufferRegion(call->args[arg_base + 1]);
 
-    Optional<TileView> src_tileview = LookupTileView(src->buffer);
-    Optional<TileView> dst_tileview = LookupTileView(dst->buffer);
-    Optional<TileView> src_validation_tileview =
-        src_tileview.defined() ? src_tileview : dst_tileview;
-    Optional<TileView> dst_validation_tileview =
-        dst_tileview.defined() ? dst_tileview : src_tileview;
-
-    ValidateRegionCanFormTileView(src, src_validation_tileview, op_name, "src");
-    ValidateRegionCanFormTileView(dst, dst_validation_tileview, op_name, "dst");
-    ValidateTileViewMetadata(src, src_tileview, op_name, "src");
-    ValidateTileViewMetadata(dst, dst_tileview, op_name, "dst");
+    ValidateRegionCanFormTileView(src, op_name, "src");
+    ValidateRegionCanFormTileView(dst, op_name, "dst");
   }
 
   void ValidateRegionCanFormTileView(const BufferRegion &region,
-                                     const Optional<TileView> &maybe_tileview,
                                      const char *op_name,
                                      const char *operand_name) {
     ICHECK(region.defined())
@@ -125,8 +179,8 @@ private:
         << region->region.size() << " does not match buffer "
         << region->buffer->name << " rank " << region->buffer->shape.size();
 
-    std::unordered_map<size_t, PrimExpr> tile_size_by_dim =
-        BuildTileSizeByDim(region->buffer, maybe_tileview);
+    Layout layout = LookupLayout(region->buffer, op_name, operand_name);
+    std::vector<int> tiled_dims;
     for (size_t dim = 0; dim < region->region.size(); ++dim) {
       const Range &range = region->region[dim];
       ICHECK(range.defined())
@@ -136,77 +190,18 @@ private:
           << op_name << " " << operand_name << " extent at dim " << dim
           << " is undefined for buffer " << region->buffer->name;
 
-      const PrimExpr &shape = region->buffer->shape[dim];
-      ValidateMinAlignmentToTileSize(range->min, tile_size_by_dim, dim, region,
-                                     op_name, operand_name);
-      ValidateStaticMinIsShapeFactor(range->min, shape, region, dim, op_name,
-                                     operand_name);
-      ValidateExtentIsShapeFactor(range->extent, shape, region, dim, op_name,
-                                  operand_name);
-    }
-  }
+      if (analyzer_.CanProveEqual(range->extent, 1)) {
+        continue;
+      }
 
-  void ValidateTileViewMetadata(const BufferRegion &region, const char *op_name,
-                                const char *operand_name) {
-    ValidateTileViewMetadata(region, LookupTileView(region->buffer), op_name,
-                             operand_name);
-  }
-
-  void ValidateTileViewMetadata(const BufferRegion &region,
-                                const Optional<TileView> &maybe_tileview,
-                                const char *op_name, const char *operand_name) {
-    if (!maybe_tileview.defined()) {
-      // Explicit TileView metadata is optional for raw copy/dma_copy regions.
-      // The backend can construct a tile view directly from region extents.
-      return;
+      tiled_dims.push_back(static_cast<int>(dim));
+      ValidateTiledDim(region, layout, dim, op_name, operand_name);
     }
 
-    TileView tileview = maybe_tileview.value();
-    ICHECK(tileview->TileDim() == 1 || tileview->TileDim() == 2)
-        << op_name << " " << operand_name << " buffer " << region->buffer->name
-        << " has unsupported TileView rank " << tileview->TileDim()
-        << "; Sunmmio copy tile views must be 1D or 2D.";
-  }
-
-  std::unordered_map<size_t, PrimExpr>
-  BuildTileSizeByDim(const Buffer &buffer,
-                     const Optional<TileView> &maybe_tileview) {
-    std::unordered_map<size_t, PrimExpr> tile_size_by_dim;
-    if (!maybe_tileview.defined()) {
-      return tile_size_by_dim;
-    }
-
-    TileView tileview = maybe_tileview.value();
-    Array<PrimExpr> tile_shape = tileview->TileShape();
-    Array<PrimExpr> index_map = tileview->IndexMap();
-    ICHECK_EQ(tile_shape.size(), index_map.size())
-        << "TileView for buffer " << buffer->name
-        << " has mismatched tile_shape and index_map ranks";
-
-    int buffer_rank = static_cast<int>(buffer->shape.size());
-    for (size_t tile_axis = 0; tile_axis < index_map.size(); ++tile_axis) {
-      int mapped_dim =
-          NormalizeMappedDim(index_map[tile_axis], buffer_rank, buffer->name);
-      tile_size_by_dim.emplace(static_cast<size_t>(mapped_dim),
-                               tile_shape[tile_axis]);
-    }
-    return tile_size_by_dim;
-  }
-
-  static int NormalizeMappedDim(const PrimExpr &expr, int ndim,
-                                const std::string &buffer_name) {
-    const auto *imm = expr.as<IntImmNode>();
-    ICHECK(imm) << "TileView index_map entries must be IntImm, but got " << expr
-                << " for buffer " << buffer_name;
-    int mapped_dim = static_cast<int>(imm->value);
-    if (mapped_dim < 0) {
-      mapped_dim += ndim;
-    }
-    ICHECK(mapped_dim >= 0 && mapped_dim < ndim)
-        << "TileView index_map entry " << expr
-        << " is out of bounds for buffer " << buffer_name << " with rank "
-        << ndim;
-    return mapped_dim;
+    ICHECK(tiled_dims.size() == 1 || tiled_dims.size() == 2)
+        << op_name << " " << operand_name << " region for buffer "
+        << region->buffer->name << " must form a 1D or 2D tile_view, but got "
+        << tiled_dims.size() << " non-unit region extents.";
   }
 
   std::optional<int64_t> TryGetStaticInt(const PrimExpr &expr) {
@@ -227,84 +222,187 @@ private:
     return analyzer_.CanProveEqual(remainder, 0);
   }
 
-  void ValidateMinAlignmentToTileSize(
-      const PrimExpr &min,
-      const std::unordered_map<size_t, PrimExpr> &tile_size_by_dim, size_t dim,
-      const BufferRegion &region, const char *op_name,
-      const char *operand_name) {
-    auto it = tile_size_by_dim.find(dim);
-    if (it == tile_size_by_dim.end()) {
-      return;
-    }
+  void ValidateTiledDim(const BufferRegion &region, const Layout &layout,
+                        size_t dim, const char *op_name,
+                        const char *operand_name) {
+    const Range &range = region->region[dim];
+    const PrimExpr &buffer_shape = region->buffer->shape[dim];
+    const PrimExpr &region_min = range->min;
+    const PrimExpr &region_extent = range->extent;
 
-    const PrimExpr &tile_size = it->second;
-    ICHECK(CanProveDivisible(min, tile_size))
-        << op_name << " " << operand_name << " region min at dim " << dim
-        << " for buffer " << region->buffer->name << " must align to TileView "
-        << "tile size " << tile_size << ", but got min=" << min << ".";
-  }
-
-  void ValidateStaticMinIsShapeFactor(const PrimExpr &min,
-                                      const PrimExpr &shape,
-                                      const BufferRegion &region, size_t dim,
-                                      const char *op_name,
-                                      const char *operand_name) {
-    if (analyzer_.CanProveEqual(min, 0)) {
-      return;
-    }
-
-    std::optional<int64_t> min_value = TryGetStaticInt(min);
-    if (!min_value.has_value()) {
-      return;
-    }
-
-    ICHECK_GT(min_value.value(), 0)
-        << op_name << " " << operand_name << " region min at dim " << dim
-        << " for buffer " << region->buffer->name
-        << " must be non-negative, but got min=" << min << ".";
-    ICHECK(CanProveDivisible(shape, Integer(min_value.value())))
-        << op_name << " " << operand_name << " region min at dim " << dim
-        << " for buffer " << region->buffer->name
-        << " must be zero or a factor of buffer shape " << shape
-        << ", but got min=" << min << ".";
-  }
-
-  void ValidateExtentIsShapeFactor(const PrimExpr &extent,
-                                   const PrimExpr &shape,
-                                   const BufferRegion &region, size_t dim,
-                                   const char *op_name,
-                                   const char *operand_name) {
-    ICHECK(analyzer_.CanProveGreaterEqual(extent, 1))
+    std::optional<int64_t> static_extent = TryGetStaticInt(region_extent);
+    ICHECK(static_extent.has_value() && static_extent.value() > 0)
         << op_name << " " << operand_name << " region extent at dim " << dim
         << " for buffer " << region->buffer->name
-        << " must be positive, but got extent=" << extent << ".";
-    ICHECK(CanProveDivisible(shape, extent))
+        << " must be a positive compile-time constant, but got extent="
+        << region_extent << ".";
+
+    DimLayoutInfo info = GetDimLayoutInfo(layout, dim, region->buffer);
+
+    ICHECK(!analyzer_.CanProve(region_min < make_zero(region_min.dtype())))
+        << op_name << " " << operand_name << " region min at dim " << dim
+        << " for buffer " << region->buffer->name
+        << " must be non-negative, but got min=" << region_min << ".";
+    ICHECK(CanProveDivisible(region_min, region_extent))
+        << op_name << " " << operand_name << " region min at dim " << dim
+        << " for buffer " << region->buffer->name
+        << " must align to region extent " << region_extent
+        << ", but got min=" << region_min << ".";
+    if (info.has_dynamic_outer_mode) {
+      ICHECK(!analyzer_.CanProve(region_min + region_extent > buffer_shape))
+          << op_name << " " << operand_name << " region at dim " << dim
+          << " for buffer " << region->buffer->name
+          << " must stay within buffer shape " << buffer_shape
+          << ", but got min=" << region_min << " and extent=" << region_extent
+          << ".";
+    } else {
+      ICHECK(analyzer_.CanProve(region_min + region_extent <= buffer_shape))
+          << op_name << " " << operand_name << " region at dim " << dim
+          << " for buffer " << region->buffer->name
+          << " must stay within buffer shape " << buffer_shape
+          << ", but got min=" << region_min << " and extent=" << region_extent
+          << ".";
+    }
+
+    if (info.has_dynamic_outer_mode) {
+      ICHECK_EQ(static_extent.value() % info.inner_static_mode_shape, 0)
+          << op_name << " " << operand_name << " region extent at dim " << dim
+          << " for buffer " << region->buffer->name
+          << " must be a multiple of dynamic layout inner static mode shape "
+          << info.inner_static_mode_shape
+          << ", but got extent=" << region_extent << ".";
+      return;
+    }
+
+    ICHECK(CanProveDivisible(buffer_shape, region_extent))
         << op_name << " " << operand_name << " region extent at dim " << dim
         << " for buffer " << region->buffer->name
-        << " must be a factor of buffer shape " << shape
-        << ", but got extent=" << extent << ".";
+        << " must divide buffer shape " << buffer_shape
+        << ", but got extent=" << region_extent << ".";
+
+    if (info.coalesced_extent < static_extent.value()) {
+      ICHECK_EQ(static_extent.value() % info.coalesced_extent, 0)
+          << op_name << " " << operand_name << " region extent at dim " << dim
+          << " for buffer " << region->buffer->name
+          << " must be compatible with coalesced extent "
+          << info.coalesced_extent << ", but got extent=" << region_extent
+          << ".";
+    } else {
+      ICHECK_EQ(info.coalesced_extent % static_extent.value(), 0)
+          << op_name << " " << operand_name << " region extent at dim " << dim
+          << " for buffer " << region->buffer->name
+          << " must be compatible with coalesced extent "
+          << info.coalesced_extent << ", but got extent=" << region_extent
+          << ".";
+    }
   }
 
-  Optional<TileView> LookupTileView(const Buffer &buffer) const {
-    if (scope_stack_.empty()) {
-      return Optional<TileView>();
+  DimLayoutInfo GetDimLayoutInfo(const Layout &layout, size_t dim,
+                                 const Buffer &buffer) {
+    DimLayoutInfo info;
+    info.has_layout = true;
+
+    if (const auto *cute = layout.as<CuteLayoutNode>()) {
+      Array<PrimExpr> mode_shapes =
+          cute->GetModeShapeOfDim(static_cast<int>(dim));
+      Array<PrimExpr> mode_strides =
+          cute->GetModeStrideOfDim(static_cast<int>(dim));
+      ICHECK_EQ(mode_shapes.size(), mode_strides.size())
+          << "CuteLayout mode shape/stride mismatch for buffer " << buffer->name
+          << " dim " << dim << ".";
+      ICHECK(!mode_shapes.empty()) << "CuteLayout has no modes for buffer "
+                                   << buffer->name << " dim " << dim << ".";
+
+      const auto *inner_shape = mode_shapes[0].as<IntImmNode>();
+      ICHECK(inner_shape) << "CuteLayout inner mode shape for buffer "
+                          << buffer->name << " dim " << dim
+                          << " must be static, but got " << mode_shapes[0]
+                          << ".";
+      info.inner_static_mode_shape = inner_shape->value;
+
+      const bool outer_dynamic =
+          mode_shapes.size() > 1 &&
+          !mode_shapes[mode_shapes.size() - 1].as<IntImmNode>();
+      info.has_dynamic_outer_mode = outer_dynamic;
+      info.coalesced_extent =
+          ComputeDimCoalescedExtent(mode_shapes, mode_strides);
+      return info;
     }
 
-    const ScopeFrame &frame = scope_stack_.back();
-    if (frame.tileview_map.count(buffer->data)) {
-      return frame.tileview_map[buffer->data];
+    std::optional<int64_t> shape_value = TryGetStaticInt(buffer->shape[dim]);
+    ICHECK(shape_value.has_value() && shape_value.value() > 0)
+        << "Non-CuteLayout buffer " << buffer->name << " dim " << dim
+        << " requires static positive buffer.shape, but got "
+        << buffer->shape[dim] << ".";
+    info.coalesced_extent = shape_value.value();
+    info.inner_static_mode_shape = shape_value.value();
+    return info;
+  }
+
+  int64_t ComputeDimCoalescedExtent(const Array<PrimExpr> &mode_shapes,
+                                    const Array<PrimExpr> &mode_strides) {
+    std::vector<std::pair<int64_t, int64_t>> static_modes;
+    for (size_t i = 0; i < mode_shapes.size(); ++i) {
+      const auto *shape = mode_shapes[i].as<IntImmNode>();
+      const auto *stride = mode_strides[i].as<IntImmNode>();
+      if (!shape || !stride) {
+        break;
+      }
+      if (shape->value == 1) {
+        continue;
+      }
+      static_modes.push_back({shape->value, stride->value});
     }
 
-    // Some passes remap Buffer objects while preserving the user-facing buffer
-    // name.  Keep a conservative name-based fallback so validation can still
-    // see manual TileView hints after those remaps.
-    for (const auto &kv : frame.tileview_map) {
-      const Var &var = kv.first;
-      if (var->name_hint == buffer->data->name_hint) {
+    ICHECK(!static_modes.empty())
+        << "Cannot compute coalesced extent from layout with no static modes.";
+    std::sort(static_modes.begin(), static_modes.end(),
+              [](const auto &a, const auto &b) { return a.second < b.second; });
+
+    int64_t coalesced_extent = static_modes[0].first;
+    int64_t running_stride = static_modes[0].second;
+    for (size_t i = 1; i < static_modes.size(); ++i) {
+      if (coalesced_extent * running_stride != static_modes[i].second) {
+        break;
+      }
+      coalesced_extent *= static_modes[i].first;
+    }
+    return coalesced_extent;
+  }
+
+  Layout LookupLayout(const Buffer &buffer, const char *op_name,
+                      const char *operand_name) const {
+    if (!scope_stack_.empty()) {
+      const ScopeFrame &frame = scope_stack_.back();
+      if (auto layout = LookupLayoutInMap(frame.layout_map, buffer)) {
+        return layout.value();
+      }
+      if (auto layout = LookupLayoutInMap(frame.global_layout_map, buffer)) {
+        return layout.value();
+      }
+    }
+
+    ICHECK(false) << op_name << " " << operand_name << " buffer "
+                  << buffer->name
+                  << " requires layout_map/global_layout_map metadata for "
+                     "tile_view validation.";
+    return Layout();
+  }
+
+  std::optional<Layout> LookupLayoutInMap(const LayoutMap &layout_map,
+                                          const Buffer &buffer) const {
+    if (layout_map.count(buffer)) {
+      return layout_map[buffer];
+    }
+
+    for (const auto &kv : layout_map) {
+      const Buffer &candidate = kv.first;
+      if (candidate->data.same_as(buffer->data) ||
+          candidate->data->name_hint == buffer->data->name_hint) {
         return kv.second;
       }
     }
-    return Optional<TileView>();
+    return std::nullopt;
   }
 
   arith::Analyzer analyzer_;
