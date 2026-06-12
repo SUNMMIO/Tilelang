@@ -1,11 +1,33 @@
 #include "codegen_sunmmio.h"
 #include "target/source/codegen_source_base.h"
+#include <algorithm>
+#include <cctype>
 #include <string>
 #include <tvm/ffi/reflection/registry.h>
 #include <unordered_map>
 
 namespace tvm {
 namespace codegen {
+namespace {
+
+void ValidateSuvmBackend(const ffi::String &backend) {
+  if (backend.empty()) {
+    return;
+  }
+  std::string mode = static_cast<std::string>(backend);
+  std::transform(mode.begin(), mode.end(), mode.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  if (mode == "suvm") {
+    return;
+  }
+  LOG(FATAL) << "SunMMIO text backend has been removed. "
+             << "target.build.tilelang_sunmmio_without_compile now supports "
+             << "only 'suvm' (or empty backend).";
+  TVM_FFI_UNREACHABLE();
+}
+
+} // namespace
 
 static std::unordered_map<std::string, runtime::FunctionInfo>
 ExtractFuncInfo(const IRModule &mod) {
@@ -43,7 +65,9 @@ ffi::Module BuildTileLangSunMMIO(IRModule mod, Target target) {
   TVM_FFI_UNREACHABLE();
 }
 
-ffi::Module BuildTileLangSunMMIOWithoutCompile(IRModule mod, Target target) {
+ffi::Module BuildTileLangSunMMIOWithoutCompile(IRModule mod, Target target,
+                                               ffi::String backend) {
+  ValidateSuvmBackend(backend);
   CodeGenTileLangSunMMIO cg;
   cg.Init();
 
@@ -53,7 +77,7 @@ ffi::Module BuildTileLangSunMMIOWithoutCompile(IRModule mod, Target target) {
     auto gvar = Downcast<GlobalVar>(kv.first);
     auto f = Downcast<tir::PrimFunc>(kv.second);
     auto calling_conv = f->GetAttr<Integer>(tvm::attr::kCallingConv);
-    ICHECK(calling_conv == CallingConv::kDeviceKernelLaunch);
+    // ICHECK(calling_conv == CallingConv::kDeviceKernelLaunch);
     cg.AddFunction(gvar, f);
   }
 

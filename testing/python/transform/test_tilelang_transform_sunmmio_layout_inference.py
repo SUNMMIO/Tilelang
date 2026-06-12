@@ -60,6 +60,46 @@ def LayoutVisual():
     return prim_func_pass(pass_fn, opt_level=0)
 
 
+def apply_passes_up_to_layout_inference(mod, target):
+    """Run the canonical Sunmmio layout-inference pipeline."""
+    mod = tvm.tir.transform.BindTarget(target)(mod)
+    mod = tl.transform.AddWrapperForSingleBufStore()(mod)
+    mod = tl.transform.LegalizeNegativeIndex()(mod)
+    mod = tl.transform.InjectAssumes()(mod)
+    mod = tl.transform.Simplify()(mod)
+    mod = tl.transform.InferSramScope()(mod)
+    mod = tl.transform.LegalizeSunmmioDataPath()(mod)
+    mod = tl.transform.LayoutReducer()(mod)
+    mod = tl.transform.SunmmioLayoutInference()(mod)
+    return mod
+
+
+def extract_layout_maps(func):
+    """Return the SRAM and DRAM layout maps from block annotations."""
+    layout_map = None
+    global_layout_map = None
+
+    def visit(node):
+        nonlocal layout_map, global_layout_map
+        if isinstance(node, tir.Block):
+            anns = node.annotations
+            if "layout_map" in anns:
+                layout_map = anns["layout_map"]
+            if "global_layout_map" in anns:
+                global_layout_map = anns["global_layout_map"]
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return layout_map, global_layout_map
+
+
+def get_buf_by_name(layout_map, name):
+    """Return ``(buffer, layout)`` for a layout-map entry by buffer name."""
+    for buf, layout in layout_map.items():
+        if buf.name == name:
+            return buf, layout
+    return None, None
+
+
 def run_sunmmio_layout_inference(mod, target):
     """Run the canonical Sunmmio layout-inference pipeline and return the
     inferred per-buffer layouts as ``{buffer_name: Layout}``.
@@ -68,15 +108,7 @@ def run_sunmmio_layout_inference(mod, target):
     wrap this call in ``pytest.raises`` (they never reach the capture step).
     """
     with tvm.target.Target(target):
-        mod = tvm.tir.transform.BindTarget(target)(mod)
-        mod = tl.transform.AddWrapperForSingleBufStore()(mod)
-        mod = tl.transform.LegalizeNegativeIndex()(mod)
-        mod = tl.transform.InjectAssumes()(mod)
-        mod = tl.transform.Simplify()(mod)
-        mod = tl.transform.InferSramScope()(mod)
-        mod = tl.transform.LegalizeSunmmioDataPath()(mod)
-        mod = tl.transform.LayoutReducer()(mod)
-        mod = tl.transform.SunmmioLayoutInference()(mod)
+        mod = apply_passes_up_to_layout_inference(mod, target)
         LayoutVisual()(mod)
     return dict(collected_result)
 
@@ -639,6 +671,43 @@ def test_broadcast_propagates_zn():
 
     # Annotated ZN src → dst also gets ZN.
     assert_layout(layouts, "B_shared", "ZN", block=(32, 32))
+
+
+def broadcast_from_global_to_rsram_kernel():
+    """Broadcast directly from a global input into RSRAM."""
+    block_M, block_N = 64, 64
+    dtype = T.float16
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((block_M, block_N), dtype),
+        B: T.Tensor((block_M, block_N), dtype),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
+
+            T.comm.broadcast(A, B_shared, (1, 2), direction="h")
+            T.copy(B_shared, B[0, 0])
+
+    return tvm.IRModule({"main": main})
+
+
+def test_broadcast_accepts_global_src_for_layout_inference():
+    """Comm layout inference should accept global src and keep DRAM layout separate."""
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        mod = broadcast_from_global_to_rsram_kernel()
+        mod = apply_passes_up_to_layout_inference(mod, target)
+
+        func = list(mod.functions.values())[0]
+        layout_map, global_layout_map = extract_layout_maps(func)
+        assert layout_map is not None
+        assert global_layout_map is not None
+
+        buf_b, _ = get_buf_by_name(layout_map, "B_shared")
+        assert buf_b is not None, "B_shared not in layout_map"
+        assert all(buf.name != "A" for buf in layout_map)
+        assert any(buf.name == "A" for buf in global_layout_map)
 
 
 # ---------------------------------------------------------------------------

@@ -20,7 +20,7 @@ The design is mainly divided into two layers: frontend interface design and back
 In `tilelang/language/comm.py`, a unified communication interface is designed with "ease of use" and "safety" as core considerations:
 
 - **2D Mesh Topology**: Use `(row, col)` 2D coordinates to express core positions, which is more intuitive for Mesh topology.
-- **Core ID Management**: Conversion between coordinates and linear Core IDs is handled in the frontend via `core_tuple_to_id`, `core_id_to_tuple`, and `CoreId`, reducing the burden of manual ID management.
+- **Core ID Management**: Conversion between coordinates and linear Core IDs is handled in the frontend via `core_tuple_to_id` and `core_id_to_tuple`, reducing the burden of manual ID management.
 - **Unified Direction**: A `direction` parameter is provided, supporting `horizontal`, `vertical`, and `all` directions, mapped to internal integer encodings.
 - **Early Error Detection**: Checks for dtype, shape, buffer size, Mesh boundaries, and `size` parameters are performed in the frontend to catch errors during the DSL stage.
 
@@ -67,8 +67,7 @@ The overall design philosophy is to provide rich semantics at the frontend while
 In `tilelang/language/comm.py`, the following specific implementations were completed:
 
 - **Mesh Configuration**: Retrieve the target Mesh scale (`nrow`, `ncol`) via `get_sunmmio_device_mesh_config()`.
-- **Core ID Management**: Implementation of `core_tuple_to_id`, `core_id_to_tuple`, and `CoreId`.
-- **Current Core Query**: Providing `current_core()`.
+- **Core ID Management**: Implementation of `core_tuple_to_id` and `core_id_to_tuple`.
 - **Parameter Validation**:
   - `broadcast` and `put` check dtype and shape compatibility of source/destination buffers.
   - Check if `src_core` and `dst_core` are within Mesh boundaries.

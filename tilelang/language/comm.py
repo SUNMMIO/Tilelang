@@ -9,8 +9,9 @@ from __future__ import annotations
 from typing import Literal
 
 import tvm_ffi
-from tvm import tir
+from tvm import ir, tir
 import tilelang.language as T
+from tilelang._typing import BufferLikeType
 from tilelang.utils.language import (
     to_buffer_region,
 )
@@ -33,6 +34,9 @@ REDUCE_TYPE_LIST = (
     "bitxor",
 )
 
+CoreCoord = int | tir.PrimExpr
+CoreSpec = CoreCoord | tuple[CoreCoord, CoreCoord]
+
 
 def get_target_mesh_shape() -> dict[str, int]:
     """Get the target mesh shape as a dictionary with 'nrow' and 'ncol' keys."""
@@ -40,116 +44,120 @@ def get_target_mesh_shape() -> dict[str, int]:
     return {"nrow": nrow, "ncol": ncol}
 
 
-def core_tuple_to_id(core_id: tuple[int, int]) -> int:
-    """Convert 2D (row, col) coordinates on the mesh into a linear core id.
+def _check_core_coord(coord: CoreCoord, limit: int, name: str):
+    if isinstance(coord, bool):
+        raise TypeError(f"{name} must be an integer or TIR PrimExpr, got bool.")
+    coord_int = _const_int(coord)
+    if coord_int is not None:
+        assert 0 <= coord_int < limit, f"{name} {coord_int} out of bounds for limit {limit}."
+    elif not isinstance(coord, tir.PrimExpr):
+        raise TypeError(f"{name} must be an integer or TIR PrimExpr, got {type(coord)}.")
+
+
+def core_to_id(core_id: CoreSpec, name: str = "core") -> CoreCoord:
+    """Normalize a linear core id or 2D mesh coordinate into a linear core id.
 
     Parameters
     ----------
-    core_id : tuple[int, int]
-        A tuple specifying the (row, col) coordinates of the core on the mesh.
+    core_id : int | tir.PrimExpr | tuple[int | tir.PrimExpr, int | tir.PrimExpr]
+        Either a linear core id, or a tuple specifying the (row, col)
+        coordinates of the core on the mesh.
+    name : str
+        User-facing argument name used in diagnostics.
 
     Returns
     -------
-    int
-        The linear core id corresponding to the provided coordinates.
+    int | tir.PrimExpr
+        The normalized linear core id.
 
     Notes
     -----
-    The conversion uses the current target mesh shape obtained via
-    get_target_mesh_shape().
-    """
-    mesh_shape = get_target_mesh_shape()
-    row, col = core_id
-    if isinstance(row, int):
-        assert 0 <= row < mesh_shape["nrow"], f"Row {row} out of bounds for mesh shape {mesh_shape}."
-    if isinstance(col, int):
-        assert 0 <= col < mesh_shape["ncol"], f"Col {col} out of bounds for mesh shape {mesh_shape}."
-    core_id_value = row * mesh_shape["ncol"] + col
-    return core_id_value
-
-
-def core_id_to_tuple(core_id: tir.Call) -> tuple[int, int]:
-    """Convert a linear core id into 2D (row, col) coordinates on the mesh.
-
-    Parameters
-    ----------
-    core_id : tir.Call
-        A linear core identifier (or a TIR expression that yields one).
-
-    Returns
-    -------
-    tuple[int, int]
-        The (row, col) coordinates corresponding to the linear core id.
-
-    Notes
-    -----
-    The conversion uses the current target mesh shape obtained via
-    get_target_mesh_shape().
-    """
-    mesh_shape = get_target_mesh_shape()
-    core_id_value = core_id
-    row = core_id_value // mesh_shape["ncol"]
-    col = core_id_value % mesh_shape["ncol"]
-    return (row, col)
-
-
-def CoreId(core_id: int | tuple[int, int]):
-    """Convert a core identifier to a linear core ID for the target mesh.
-
-    Parameters
-    ----------
-    core_id : int or tuple[int, int]
-        Either a linear core id (int) or a 2-tuple (row, col) specifying the
-        core coordinates on the target mesh.
-
-    Returns
-    -------
-    int
-        The linear core id mapped into [0, mesh_nrow * mesh_ncol).
-
-    Raises
-    ------
-    AssertionError, ValueError
-        If the provided coordinates are out of bounds or the type is invalid.
+    Dynamic TIR expressions are allowed. Compile-time bounds checks are only
+    performed when the id or coordinate is statically known.
     """
     mesh_shape = get_target_mesh_shape()
     if isinstance(core_id, tuple):
-        core_id_value = core_tuple_to_id(core_id)
-    elif isinstance(core_id, int):
-        core_id_value = core_id
-        assert 0 <= core_id_value < mesh_shape["nrow"] * mesh_shape["ncol"], (
-            f"Core ID {core_id_value} out of bounds for mesh shape {mesh_shape}"
-        )
-    else:
-        raise ValueError("core_id must be either a tuple[int, int] or an int.")
-    return tir.call_intrin("handle", tir.op.Op.get("tl.CoreId"), core_id_value)
+        assert len(core_id) == 2, f"{name} must be a linear core id or a tuple of (row, col)."
+        row, col = core_id
+        _check_core_coord(row, mesh_shape["nrow"], f"{name} row")
+        _check_core_coord(col, mesh_shape["ncol"], f"{name} col")
+        return row * mesh_shape["ncol"] + col
+
+    _check_core_coord(core_id, mesh_shape["nrow"] * mesh_shape["ncol"], name)
+    return core_id
 
 
-def current_core():
-    """Get the current core's identifier.
-
-    Returns
-    -------
-    tir.Call
-        The TIR intrinsic call handle for `tl.comm_current_core`.
-
-    Examples
-    --------
-    >>> current_core()
-    """
-    return tir.call_intrin("handle", tir.op.Op.get("tl.comm_current_core"))
+def core_tuple_to_id(core_id: tuple[CoreCoord, CoreCoord]) -> CoreCoord:
+    """Convert 2D (row, col) coordinates on the mesh into a linear core id."""
+    assert isinstance(core_id, tuple) and len(core_id) == 2, "core_id must be a tuple of (row, col)."
+    return core_to_id(core_id)
 
 
-def _get_buffer_info(buf):
-    if isinstance(buf, tir.BufferRegion):
-        return buf.buffer.dtype, [r.extent for r in buf.region]
-    return buf.dtype, buf.shape
+def _const_int(value):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, tir.IntImm):
+        return int(value.value)
+    return None
+
+
+def _extent_equal(lhs, rhs) -> bool:
+    lhs_int = _const_int(lhs)
+    rhs_int = _const_int(rhs)
+    if lhs_int is not None and rhs_int is not None:
+        return lhs_int == rhs_int
+    try:
+        return bool(ir.structural_equal(lhs, rhs))
+    except (TypeError, ValueError):
+        return False
+
+
+def _extent_is_one(extent) -> bool:
+    extent_int = _const_int(extent)
+    if extent_int is not None:
+        return extent_int == 1
+    return _extent_equal(extent, tir.IntImm("int32", 1))
+
+
+def _shape_equal(lhs, rhs) -> bool:
+    return len(lhs) == len(rhs) and all(_extent_equal(lhs_extent, rhs_extent) for lhs_extent, rhs_extent in zip(lhs, rhs))
+
+
+def _shape_compatible(lhs, rhs) -> bool:
+    return len(lhs) == len(rhs) and all(
+        _extent_equal(lhs_extent, rhs_extent) or _extent_is_one(lhs_extent) or _extent_is_one(rhs_extent)
+        for lhs_extent, rhs_extent in zip(lhs, rhs)
+    )
+
+
+def _const_product(extents):
+    result = 1
+    for extent in extents:
+        extent_int = _const_int(extent)
+        if extent_int is None:
+            return None
+        result *= extent_int
+    return result
+
+
+def _check_size(size: int, extents, op_name: str):
+    assert isinstance(size, int) and size >= -1, "size must be an integer >= -1."
+    elements = _const_product(extents)
+    if size >= 0 and elements is not None:
+        assert size <= elements, f"size {size} exceeds {op_name} buffer size {elements}."
+
+
+def _get_buffer_info(buf: BufferLikeType):
+    region = to_buffer_region(buf)
+    if not isinstance(region, tir.BufferRegion):
+        raise TypeError(f"Expected a buffer-like object, got {type(buf)}.")
+    return region.buffer, region.buffer.dtype, list(r.extent for r in region.region)
 
 
 def broadcast(
-    src: T.Buffer,
-    dst: T.Buffer,
-    src_core: tuple[int, int],
+    src: BufferLikeType,
+    dst: BufferLikeType,
+    src_core: CoreSpec,
     direction: Literal["horizontal", "h", "vertical", "v", "all", "a"] = "all",
     size: int = -1,
 ):
@@ -157,12 +165,14 @@ def broadcast(
     on all cores in the specified direction by emitting the TIR intrinsic tl.tileop.comm_broadcast.
     Parameters
     ----------
-    src : T.Buffer
+    src : BufferLikeType
         Source buffer containing data to broadcast.
-    dst : T.Buffer
+    dst : BufferLikeType
         Destination buffer to receive the broadcasted data.
-    src_core : tuple[int, int]
-        (row, col) coordinates of the source core on the target mesh.
+    src_core : int | tir.PrimExpr | tuple[int | tir.PrimExpr, int | tir.PrimExpr]
+        Linear source core id, or (row, col) coordinates of the source core on
+        the target mesh. Dynamic TIR expressions such as the block id returned
+        by ``T.Kernel`` are allowed.
     direction : Literal["horizontal", "h", "vertical", "v", "all", "a"]
         Direction of broadcast: "horizontal" (or "h") for row-wise, "vertical" (or "v") for column-wise,
         and "all" (or "a") for all cores.
@@ -175,36 +185,22 @@ def broadcast(
     Examples
     --------
     >>> broadcast(A, B, (1, 2), direction="horizontal")
+    >>> broadcast(A, B, cid, direction="horizontal")
     """
-    src_dtype, src_shape = _get_buffer_info(src)
-    dst_dtype, dst_shape = _get_buffer_info(dst)
+    _, src_dtype, src_shape = _get_buffer_info(src)
+    _, dst_dtype, dst_shape = _get_buffer_info(dst)
 
     assert src_dtype == dst_dtype, f"Source and destination buffer dtypes must match for broadcast. Got {src_dtype} vs {dst_dtype}."
-    if len(src_shape) != len(dst_shape):
+    if not _shape_compatible(src_shape, dst_shape):
         raise ValueError("Source and destination buffer must have the same number of dimensions for broadcast.")
-    for i in range(len(src_shape)):
-        assert src_shape[i] == dst_shape[i] or src_shape[i] == 1 or dst_shape[i] == 1, (
-            f"Source buffer shape  and destination buffer shape must match for broadcast. Got {src_shape} vs {dst_shape}."
-        )
 
-    mesh_shape = get_target_mesh_shape()
-    assert isinstance(src_core, tuple) and len(src_core) == 2, "src_core must be a tuple of (row, col)."
-    if isinstance(src_core[0], int):
-        assert 0 <= src_core[0] < mesh_shape["nrow"], f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
-    if isinstance(src_core[1], int):
-        assert 0 <= src_core[1] < mesh_shape["ncol"], f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
-
-    src_elements = 1
-    for dim in src_shape:
-        src_elements *= dim
-    assert isinstance(size, int) and size >= -1, "size must be an integer >= -1."
-    assert size <= src_elements, f"size {size} exceeds source buffer size {src_elements}."
+    _check_size(size, src_shape, "source")
 
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
 
-    src_region = to_buffer_region(src)
-    dst_region = to_buffer_region(dst)
-    src_core_id = core_tuple_to_id(src_core)
+    src_region = to_buffer_region(src, access_type="r")
+    dst_region = to_buffer_region(dst, access_type="w")
+    src_core_id = core_to_id(src_core, "src_core")
 
     args = (
         src_region,
@@ -217,24 +213,27 @@ def broadcast(
 
 
 def put(
-    src: T.Buffer,
-    dst: T.Buffer,
-    src_core: tuple[int, int],
-    dst_core: tuple[int, int],
+    src: BufferLikeType,
+    dst: BufferLikeType,
+    src_core: CoreSpec,
+    dst_core: CoreSpec,
     size: int = -1,
 ):
     """Put data from a source buffer on a specific source core to a destination buffer on a specific destination core
     by emitting the TIR intrinsic tl.tileop.comm_put.
     Parameters
     ----------
-    src : T.Buffer
+    src : BufferLikeType
         Source buffer containing data to put.
-    dst : T.Buffer
+    dst : BufferLikeType
         Destination buffer to receive the data.
-    src_core : tuple[int, int]
-        (row, col) coordinates of the source core on the target mesh.
-    dst_core : tuple[int, int]
-        (row, col) coordinates of the destination core on the target mesh.
+    src_core : int | tir.PrimExpr | tuple[int | tir.PrimExpr, int | tir.PrimExpr]
+        Linear source core id, or (row, col) coordinates of the source core on
+        the target mesh. Dynamic TIR expressions such as the block id returned
+        by ``T.Kernel`` are allowed.
+    dst_core : int | tir.PrimExpr | tuple[int | tir.PrimExpr, int | tir.PrimExpr]
+        Linear destination core id, or (row, col) coordinates of the destination
+        core on the target mesh. Dynamic TIR expressions are allowed.
     size : int
         Number of elements to put. If -1, the entire source buffer is used.
     Returns
@@ -244,43 +243,28 @@ def put(
     Examples
     --------
     >>> put(A, B, (1, 2), (2, 3))
+    >>> put(A, B, cid, (cid + 1) % 16)
     """
-    assert src.dtype == dst.dtype, f"Source and destination buffer dtypes must match for put. Got {src.dtype} vs {dst.dtype}."
-    if len(src.shape) != len(dst.shape):
+    _, src_dtype, src_shape = _get_buffer_info(src)
+    _, dst_dtype, dst_shape = _get_buffer_info(dst)
+
+    assert src_dtype == dst_dtype, f"Source and destination buffer dtypes must match for put. Got {src_dtype} vs {dst_dtype}."
+    if not _shape_compatible(src_shape, dst_shape):
         raise ValueError("Source and destination buffer must have the same number of dimensions for put.")
-    for i in range(len(src.shape)):
-        assert src.shape[i] == dst.shape[i] or src.shape[i] == 1 or dst.shape[i] == 1, (
-            f"Source buffer shape and destination buffer shape must be compatible for put. Got {src.shape} vs {dst.shape}."
-        )
 
-    mesh_shape = get_target_mesh_shape()
-    assert isinstance(src_core, tuple) and len(src_core) == 2, "src_core must be a tuple of (row, col)."
-    if isinstance(src_core[0], int):
-        assert 0 <= src_core[0] < mesh_shape["nrow"], f"src_core row {src_core[0]} out of bounds for mesh shape {mesh_shape}."
-    if isinstance(src_core[1], int):
-        assert 0 <= src_core[1] < mesh_shape["ncol"], f"src_core col {src_core[1]} out of bounds for mesh shape {mesh_shape}."
-    assert isinstance(dst_core, tuple) and len(dst_core) == 2, "dst_core must be a tuple of (row, col)."
-    if isinstance(dst_core[0], int):
-        assert 0 <= dst_core[0] < mesh_shape["nrow"], f"dst_core row {dst_core[0]} out of bounds for mesh shape {mesh_shape}."
-    if isinstance(dst_core[1], int):
-        assert 0 <= dst_core[1] < mesh_shape["ncol"], f"dst_core col {dst_core[1]} out of bounds for mesh shape {mesh_shape}."
-    src_elements = 1
-    for dim in src.shape:
-        src_elements *= dim
-    assert isinstance(size, int) and size >= -1, "size must be an integer >= -1."
-    assert size <= src_elements, f"size {size} exceeds source buffer size {src_elements}."
+    _check_size(size, src_shape, "source")
 
-    src_region = to_buffer_region(src)
-    dst_region = to_buffer_region(dst)
-    src_core_id = core_tuple_to_id(src_core)
-    dst_core_id = core_tuple_to_id(dst_core)
+    src_region = to_buffer_region(src, access_type="r")
+    dst_region = to_buffer_region(dst, access_type="w")
+    src_core_id = core_to_id(src_core, "src_core")
+    dst_core_id = core_to_id(dst_core, "dst_core")
     args = (src_region, dst_region, size, src_core_id, dst_core_id)
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_put"), *args)
 
 
 def all_gather(
-    send_buffer: T.Buffer,
-    recv_buffer: T.Buffer,
+    send_buffer: BufferLikeType,
+    recv_buffer: BufferLikeType,
     direction: Literal["horizontal", "h", "vertical", "v", "all", "a"] = "all",
     size: int = -1,
     axis: int | None = None,
@@ -290,9 +274,9 @@ def all_gather(
     by emitting the TIR intrinsic tl.tileop.comm_allgather.
     Parameters
     ----------
-    send_buffer : T.Buffer
+    send_buffer : BufferLikeType
         Buffer containing data to send.
-    recv_buffer : T.Buffer
+    recv_buffer : BufferLikeType
         Buffer to receive gathered data.
     direction : Literal["horizontal", "h", "vertical", "v", "all", "a"]
         Direction of all-gather: "horizontal" (or "h") for row-wise, "vertical" (or "v") for column-wise,
@@ -325,9 +309,9 @@ def all_gather(
     """
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
 
-    assert send_buffer.dtype == recv_buffer.dtype, (
-        f"Source and destination buffer dtypes must match for all_gather. Got {send_buffer.dtype} vs {recv_buffer.dtype}."
-    )
+    _, send_dtype, send_shape = _get_buffer_info(send_buffer)
+    _, recv_dtype, recv_shape = _get_buffer_info(recv_buffer)
+    assert send_dtype == recv_dtype, f"Source and destination buffer dtypes must match for all_gather. Got {send_dtype} vs {recv_dtype}."
     mesh_shape = get_target_mesh_shape()
 
     recv_num = 1
@@ -343,9 +327,9 @@ def all_gather(
     # non-negative index before being forwarded.
     if axis is None:
         axis_arg = -1
-        expected_recv_shape = [recv_num] + list(send_buffer.shape)
+        expected_recv_shape = [recv_num] + list(send_shape)
     else:
-        ndim = len(send_buffer.shape)
+        ndim = len(send_shape)
         assert isinstance(axis, int) and -ndim <= axis < ndim, f"axis {axis} out of range for send buffer with {ndim} dimensions."
         normalized_axis = axis if axis >= 0 else axis + ndim
         assert normalized_axis == 0 or normalized_axis == ndim - 1, (
@@ -353,23 +337,20 @@ def all_gather(
             f"(normalized to {normalized_axis}) for {ndim}-D send buffer."
         )
         axis_arg = normalized_axis
-        expected_recv_shape = list(send_buffer.shape)
-        expected_recv_shape[normalized_axis] = recv_num * send_buffer.shape[normalized_axis]
+        expected_recv_shape = list(send_shape)
+        expected_recv_shape[normalized_axis] = recv_num * send_shape[normalized_axis]
 
-    assert list(recv_buffer.shape) == expected_recv_shape, (
-        f"Receive buffer shape must be {expected_recv_shape} to hold gathered data from {recv_num} cores, but got {recv_buffer.shape}."
+    assert _shape_equal(recv_shape, expected_recv_shape), (
+        f"Receive buffer shape must be {expected_recv_shape} to hold gathered data from {recv_num} cores, but got {recv_shape}."
     )
 
-    assert isinstance(size, int) and size >= -1, "size must be an integer >= -1."
-    send_elements = 1
-    for dim in send_buffer.shape:
-        send_elements *= dim
-    assert size <= send_elements, f"size {size} exceeds send buffer size {send_elements}."
+    _check_size(size, send_shape, "send")
 
     assert isinstance(src_offset_byte, int) and src_offset_byte >= 0, "src_offset_byte must be a non-negative integer."
 
-    send_buffer_region = to_buffer_region(send_buffer)
-    recv_buffer_region = to_buffer_region(recv_buffer)
+    send_buffer_region = to_buffer_region(send_buffer, access_type="r")
+    recv_buffer_region = to_buffer_region(recv_buffer, access_type="w")
+    cid = T.get_block_binding(0)
 
     args = (
         send_buffer_region,
@@ -377,14 +358,15 @@ def all_gather(
         DIRECTION_MAP[direction.lower()],
         size,
         axis_arg,
+        cid,
     )
     ann = {ATTR_SRC_OFFSET_BYTE: src_offset_byte} if src_offset_byte != 0 else None
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_allgather"), *args, annotations=ann)
 
 
 def all_reduce(
-    buffer: T.Buffer,
-    out: T.Buffer,
+    buffer: BufferLikeType,
+    out: BufferLikeType,
     reduce_type: str,
     direction: Literal["horizontal", "h", "vertical", "v", "all", "a"],
     dim: int = -1,
@@ -394,9 +376,9 @@ def all_reduce(
     by emitting the TIR intrinsic tl.tileop.comm_allreduce.
     Parameters
     ----------
-    buffer : T.Buffer
+    buffer : BufferLikeType
         Input buffer containing data to reduce.
-    out : T.Buffer
+    out : BufferLikeType
         Output buffer to store the reduced result.
     reduce_type : str
         Type of reduction operation (e.g., "sum", "max", etc.).
@@ -415,21 +397,24 @@ def all_reduce(
     --------
     >>> all_reduce(A_local, E_local, "sum", "all", dim=-1, clear=False)
     """
-    assert isinstance(dim, int) and dim >= -1 and dim < len(buffer.shape), (
-        f"dim {dim} out of bounds for buffer with {len(buffer.shape)} dimensions."
+    _, _, buffer_shape = _get_buffer_info(buffer)
+    out_buffer, out_dtype, out_shape = _get_buffer_info(out)
+
+    assert isinstance(dim, int) and dim >= -1 and dim < len(buffer_shape), (
+        f"dim {dim} out of bounds for buffer with {len(buffer_shape)} dimensions."
     )
     if dim == -1:
-        dim = len(buffer.shape) - 1
+        dim = len(buffer_shape) - 1
 
     expected_shapes = [
-        buffer.shape[:dim] + buffer.shape[dim + 1 :],
-        buffer.shape[:dim] + [1] + buffer.shape[dim + 1 :],
+        buffer_shape[:dim] + buffer_shape[dim + 1 :],
+        buffer_shape[:dim] + [1] + buffer_shape[dim + 1 :],
     ]
-    if list(out.shape) not in expected_shapes:
+    if not any(_shape_equal(out_shape, expected_shape) for expected_shape in expected_shapes):
         expected_shapes_str = " or ".join(map(str, expected_shapes))
         raise ValueError(
-            f"Invalid reduce output shape, buffer shape is {buffer.shape}, dim is {dim}, "
-            f"output shape is {out.shape}, expected shapes are {expected_shapes_str}"
+            f"Invalid reduce output shape, buffer shape is {buffer_shape}, dim is {dim}, "
+            f"output shape is {out_shape}, expected shapes are {expected_shapes_str}"
         )
 
     reduce_type = reduce_type.lower()
@@ -440,14 +425,24 @@ def all_reduce(
 
     mesh_shape = get_target_mesh_shape()
 
-    # Create temporary buffers for row and column allgather results
-    row_allgather = T.alloc_fragment(list([mesh_shape["nrow"]] + out.shape), out.dtype)
-    col_allgather = T.alloc_fragment(list([mesh_shape["ncol"]] + out.shape), out.dtype)
+    # Create temporary buffers for row and column allgather results.  Keep the
+    # temporaries in the output scope because the lowered Sunmmio path feeds
+    # them back into ReduceOp and broadcast_.
+    out_scope = out_buffer.scope()
 
-    buffer_region = to_buffer_region(buffer)
-    out_region = to_buffer_region(out)
-    row_allgather_region = to_buffer_region(row_allgather)
-    col_allgather_region = to_buffer_region(col_allgather)
+    def alloc_tmp(shape):
+        if out_scope.startswith("shared"):
+            return T.alloc_shared(shape, out_dtype, scope=out_scope)
+        return T.alloc_fragment(shape, out_dtype, scope=out_scope)
+
+    row_allgather = alloc_tmp([mesh_shape["ncol"]] + list(out_shape))
+    col_allgather = alloc_tmp([mesh_shape["nrow"]] + list(out_shape))
+
+    buffer_region = to_buffer_region(buffer, access_type="r")
+    out_region = to_buffer_region(out, access_type="w")
+    row_allgather_region = to_buffer_region(row_allgather, access_type="rw")
+    col_allgather_region = to_buffer_region(col_allgather, access_type="rw")
+    cid = T.get_block_binding(0)
 
     args = (
         buffer_region,
@@ -458,12 +453,13 @@ def all_reduce(
         DIRECTION_MAP[direction.lower()],
         dim,
         clear,
+        cid,
     )
 
     # If not clearing, allocate an output copy buffer to hold intermediate results
     if not clear:
-        out_copy = T.alloc_fragment(list(out.shape), out.dtype)
-        out_copy_region = to_buffer_region(out_copy)
+        out_copy = alloc_tmp(list(out_shape))
+        out_copy_region = to_buffer_region(out_copy, access_type="rw")
         args = (
             buffer_region,
             out_region,
@@ -474,6 +470,7 @@ def all_reduce(
             dim,
             clear,
             out_copy_region,
+            cid,
         )
 
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_allreduce"), *args)
