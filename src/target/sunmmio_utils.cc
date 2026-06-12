@@ -29,19 +29,11 @@ SunmmioTileProcessorConfig MakeSunmmioA4EConfig() {
 }
 
 ffi::Array<PrimExpr> MakeSunmmioA4EBlockShape(DataType dtype) {
-  // A4E block shape depends on element bit-width:
-  //   fp32/bf16/fp16 (>=16-bit) → (32, 32)   -- includes accumulator dtype
-  //   fp8            (8-bit)    → (32, 64)
-  //   fp4            (4-bit)    → (32, 128)
-  int bits = dtype.bits();
-  int width = 32;
-  if (bits <= 4) {
-    width = 128;
-  } else if (bits <= 8) {
-    width = 64;
-  }
+  // A4E uses a (32, 32) block for every element dtype so that buffers of
+  // different dtypes share the same tile shapes in elements.
+  (void)dtype;
   return {tir::make_const(DataType::Int(32), 32),
-          tir::make_const(DataType::Int(32), width)};
+          tir::make_const(DataType::Int(32), 32)};
 }
 
 SunmmioMeshConfig MakeSunmmioA4EMeshConfig() {

@@ -223,7 +223,22 @@ DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
                  arith::Analyzer *analyzer = nullptr);
 
 /*!
+ * \brief Canonicalize a physically-row-major layout to plain row-major;
+ *        return anything else unchanged.
+ *
+ * Per dim, drops static size-1 modes and merges contiguous neighbours, then
+ * commits only if that reduces to plain row-major of the logical shape (e.g.
+ * a single-block ZZ).  Mode coalescing preserves the byte map but changes the
+ * mode structure that DeriveLayoutLike interprets as the layout kind, so a
+ * partial coalesce must never escape; only fully-row-major results are safe.
+ */
+Layout TryCanonicalizeToRowMajor(const Layout &layout);
+
+/*!
  * \brief Same layout kind, possibly for different logical shapes.
+ *
+ * Operands are canonicalized first, so representations that describe the same
+ * byte map (e.g. a single-block ZZ vs row-major) compare equal.
  */
 bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
                    arith::Analyzer *analyzer = nullptr);
@@ -273,6 +288,18 @@ struct ZZBlockShape {
 std::optional<ZZBlockShape> GetZZBlockShape(const Layout &layout);
 
 Layout MakeRowMajor(Array<PrimExpr> shape);
+
+/*!
+ * \brief Row-major CuteLayout with the innermost extent padded for alignment.
+ *
+ * Rounds the innermost extent up to a multiple of `align_bytes` (in `dtype`
+ * elements) and stores it as the covered extent in `mode_shape`, so each row
+ * starts on an aligned offset (required for RSRAM access).  `logical_shape`
+ * keeps the true extent; strides are dense row-major over the padded
+ * `mode_shape`.  Rank-1 [N] becomes covered [round_up(N)].
+ */
+Layout MakeAlignedRowMajor(Array<PrimExpr> shape, DataType dtype,
+                           int align_bytes);
 
 Layout MakeZZ(Array<PrimExpr> shape, Array<Integer> axes,
               Array<PrimExpr> block_shape);

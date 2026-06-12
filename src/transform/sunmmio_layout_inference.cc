@@ -345,7 +345,17 @@ void SunmmioLayoutInferencePass::AssignDefaults() {
       TryAssign(buf, sunmmio::MakeZZ(buf->shape, axes, block_shape),
                 InferLevel::kFree, -1);
     } else {
-      TryAssign(buf, sunmmio::MakeRowMajor(buf->shape), InferLevel::kFree, -1);
+      // rank < 2 is only legal for RSRAM; ASRAM/WSRAM require rank-2 tensors.
+      ICHECK(scope == kSunmmioScopeRSRAM)
+          << "Sunmmio " << scope << " buffer '" << buf->name << "' has rank "
+          << rank << "; ASRAM/WSRAM only accept rank-2 tensors.";
+      // RSRAM row-major must be alignment-padded so each row is RSRAM-aligned.
+      int align_bytes =
+          GetSunmmioTileProcessorConfig(target_).rsram_align_bytes;
+      TryAssign(
+          buf,
+          sunmmio::MakeAlignedRowMajor(buf->shape, buf->dtype, align_bytes),
+          InferLevel::kFree, -1);
     }
   }
 

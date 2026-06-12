@@ -54,6 +54,21 @@ void AppendRank2Pattern(std::vector<TrailingTilePattern> *patterns,
       MakeTrailingTilePatternImpl(buffer->shape, {tile_height, tile_width}));
 }
 
+// Every legal trailing tile is a contiguous chunk of h*w elements whose base
+// offsets are multiples of the chunk size, so RSRAM alignment holds iff the
+// chunk byte size is a multiple of rsram_align_bytes. Bit arithmetic keeps
+// sub-byte dtypes (fp4, int4) exact.
+bool TileChunkRsramAligned(const Buffer &buffer,
+                           const SunmmioTileProcessorConfig &config,
+                           int tile_height, int tile_width) {
+  if (config.rsram_align_bytes <= 0 || buffer.scope() != kSunmmioScopeRSRAM) {
+    return true;
+  }
+  int64_t chunk_bits =
+      static_cast<int64_t>(tile_height) * tile_width * GetElementBits(buffer);
+  return chunk_bits % (static_cast<int64_t>(config.rsram_align_bytes) * 8) == 0;
+}
+
 } // namespace
 
 int64_t GetStaticIntValue(const PrimExpr &expr, int64_t fallback) {
@@ -219,15 +234,9 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
   int width_dim = buffer_rank - 1;
   int height_dim = buffer_rank - 2;
 
-  // RSRAM access alignment: tile row width (in bytes) must be a multiple of
-  // rsram_align_bytes. Compute the minimum tile width in elements.
-  // Use bit-level arithmetic so sub-byte dtypes (fp4, int4) are handled.
-  int min_width_elems = 1;
-  if (alignment_mode == AlignmentMode::kStrict &&
-      config.rsram_align_bytes > 0 && buffer.scope() == kSunmmioScopeRSRAM) {
-    min_width_elems =
-        GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, buffer->dtype);
-  }
+  // RSRAM access alignment: the contiguous tile chunk must be a multiple of
+  // rsram_align_bytes (see TileChunkRsramAligned). Relaxed mode skips it.
+  bool check_alignment = alignment_mode == AlignmentMode::kStrict;
 
   // Prefix-partial step walk.
   //
@@ -266,7 +275,7 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
         int h = forced_h;
         if (h * w > capacity_elems)
           break;
-        if (w % min_width_elems != 0)
+        if (check_alignment && !TileChunkRsramAligned(buffer, config, h, w))
           continue;
 
         // Rank-1: only from leading width steps (before any non-width step).
@@ -292,7 +301,7 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
         int w = forced_w;
         if (h * w > capacity_elems)
           break;
-        if (w % min_width_elems != 0)
+        if (check_alignment && !TileChunkRsramAligned(buffer, config, h, w))
           continue;
 
         if (exec_rank == 2 && buffer_rank >= 2) {
@@ -371,17 +380,6 @@ ValidateManualTrailingTileView(const Buffer &buffer, const TileView &manual_tv,
   ICHECK_GT(width, 0) << usage
                       << " must use a positive static tile width for buffer "
                       << buffer->name << ".";
-  // RSRAM access alignment check (works for sub-byte dtypes via bit
-  // arithmetic).
-  if (config.rsram_align_bytes > 0 && buffer.scope() == kSunmmioScopeRSRAM) {
-    int min_w =
-        GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, buffer->dtype);
-    ICHECK_EQ(width % min_w, 0)
-        << usage << " width " << width << " must be a multiple of " << min_w
-        << " elements (" << config.rsram_align_bytes
-        << "-byte RSRAM alignment) for buffer " << buffer->name << ".";
-  }
-
   ICHECK_LE(width, capacity_elems)
       << usage << " width " << width
       << " exceeds the Sunmmio register capacity of " << capacity_elems
@@ -414,6 +412,10 @@ ValidateManualTrailingTileView(const Buffer &buffer, const TileView &manual_tv,
           << " is not contiguous in the layout step structure for buffer "
           << buffer->name << ".";
     }
+    ICHECK(TileChunkRsramAligned(buffer, config, 1, width))
+        << usage << " width " << width << " elements is not a multiple of the "
+        << config.rsram_align_bytes << "-byte RSRAM alignment for buffer "
+        << buffer->name << ".";
     return MakeTrailingTilePatternImpl(buffer->shape, {width});
   }
 
@@ -426,6 +428,10 @@ ValidateManualTrailingTileView(const Buffer &buffer, const TileView &manual_tv,
       << usage << " shape (" << height << ", " << width
       << ") exceeds the Sunmmio register capacity of " << capacity_elems
       << " elements for buffer " << buffer->name << ".";
+  ICHECK(TileChunkRsramAligned(buffer, config, height, width))
+      << usage << " shape (" << height << ", " << width
+      << ") is not a multiple of the " << config.rsram_align_bytes
+      << "-byte RSRAM alignment for buffer " << buffer->name << ".";
 
   if (!steps.empty()) {
     // Prefix-step legality for rank-2: walk steps, checking if the

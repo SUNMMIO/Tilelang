@@ -1,5 +1,6 @@
 """Regression tests for Sunmmio shared.rsram -> shared.rsram copy lowering."""
 
+import pytest
 import tilelang
 import tilelang as tl
 import tilelang.language as T
@@ -202,3 +203,58 @@ def test_tilelang_rsram_copy_layout_inference():
     for text in layout_texts:
         for buf_name in ["A_shared", "B_shared"]:
             assert f'{buf_name}: metadata["tl.Layout"]' in text or f'{buf_name}: metadata["tl.CuteLayout"]' in text
+
+
+def rsram_narrow_cast_copy(shape=(64, 64), dtype="float16", dst_dtype=T.float8_e4m3fn):
+    """Build a kernel with a shared.rsram -> shared.rsram T.copy that narrows dtype."""
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, 1, threads=128) as (_bx, _by):
+            y_q_local = T.alloc_shared(shape, dtype)
+            y_q_local_narrow = T.alloc_shared(shape, dst_dtype)
+            T.copy(y_q_local, y_q_local_narrow)
+
+    return tvm.IRModule({"main": main})
+
+
+def check_rsram_narrow_cast_copy(dst_dtype, shape=(64, 64)):
+    target = determine_target("Sunmmio", return_object=True)
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(rsram_narrow_cast_copy(shape, dst_dtype=dst_dtype), target)
+
+    func = mod["main"]
+    stores = collect_buffer_stores(func, "y_q_local_narrow")
+
+    assert extract_dma_copy_lines(mod) == []
+    assert collect_loops_with_attr(func, "tile.scope_entry")
+    assert collect_loops_with_attr(func, "tile.interior")
+    assert stores
+    assert all(expr_has_cast(store.value, str(dst_dtype), "float16") for store in stores)
+
+
+def test_tilelang_rsram_fp8_cast_copy():
+    check_rsram_narrow_cast_copy(T.float8_e4m3fn)
+
+
+def test_tilelang_rsram_fp4_cast_copy():
+    check_rsram_narrow_cast_copy(T.float4_e2m1fn)
+
+
+@pytest.mark.parametrize("shape", [(128,), (256,), (1024,)])
+@pytest.mark.parametrize("dst_dtype", [T.float8_e4m3fn, T.float4_e2m1fn])
+def test_tilelang_rsram_narrow_cast_copy_rank1(shape, dst_dtype):
+    check_rsram_narrow_cast_copy(dst_dtype, shape)
+
+
+@pytest.mark.parametrize("shape", [(32, 128), (16, 32), (96, 64), (64, 96)])
+@pytest.mark.parametrize("dst_dtype", [T.float8_e4m3fn, T.float4_e2m1fn])
+def test_tilelang_rsram_narrow_cast_copy_rank2(shape, dst_dtype):
+    check_rsram_narrow_cast_copy(dst_dtype, shape)
+
+
+@pytest.mark.parametrize("shape", [(4, 64, 64), (2, 32, 128), (3, 16, 32)])
+@pytest.mark.parametrize("dst_dtype", [T.float8_e4m3fn, T.float4_e2m1fn])
+def test_tilelang_rsram_narrow_cast_copy_rank3(shape, dst_dtype):
+    check_rsram_narrow_cast_copy(dst_dtype, shape)

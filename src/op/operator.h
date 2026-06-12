@@ -24,10 +24,10 @@ namespace tl {
 using namespace tir;
 
 using AddWorkspaceCallback = std::function<PrimExpr(int, DataType)>;
-using AddAllocBufferCallback = std::function<void(Buffer)>;
-// Callback for a tile op's Lower() to register the layout of a buffer it
-// introduced (e.g. a staging buffer), so later passes/codegen see it.
-using RegisterLayoutCallback = std::function<void(Buffer, Layout)>;
+// Callback for a tile op's Lower() to adopt a scratch buffer it introduced
+// during lowering (e.g. a Sunmmio staging buffer): the pass both allocates it
+// in the enclosing block and records its layout so later passes/codegen see it.
+using RegisterScratchBufferCallback = std::function<void(Buffer, Layout)>;
 using LayoutMap = Map<Buffer, Layout>;
 using TileViewMap = Map<Var, TileView>;
 using BufferMap = Map<Var, Buffer>;
@@ -57,7 +57,6 @@ struct LowerArgs {
   Range thread_bounds;
   Var thread_var;
   AddWorkspaceCallback AddWorkspace;
-  AddAllocBufferCallback AddAllocBuffer;
   LayoutMap layout_map;
   Map<Buffer, Buffer> buffer_remap;
   // Map from LetStmt variable to its bound expression, for resolving
@@ -65,9 +64,10 @@ struct LowerArgs {
   Map<Var, PrimExpr> let_var_to_expr;
   LayoutMap global_layout_map;
   TileViewMap tileview_map;
-  // Registers the layout of a buffer created during lowering (e.g. a Sunmmio
-  // staging buffer). May be unset; check before calling.
-  RegisterLayoutCallback RegisterLayout;
+  // Adopts a scratch buffer created during lowering (e.g. a Sunmmio staging
+  // buffer): allocates it in the enclosing block and records its layout. May be
+  // unset; check before calling.
+  RegisterScratchBufferCallback RegisterScratchBuffer;
 };
 
 struct LayoutInferArgs {

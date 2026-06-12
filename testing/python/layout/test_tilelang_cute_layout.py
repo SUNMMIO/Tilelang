@@ -20,6 +20,7 @@ def _get(name):
 
 make_cute = _get("tl.make_cute_layout")
 make_row_major = _get("tl.sunmmio.make_row_major")
+make_aligned_row_major = _get("tl.sunmmio.make_aligned_row_major")
 make_zz = _get("tl.sunmmio.make_zz")
 make_zn = _get("tl.sunmmio.make_zn")
 make_zzz = _get("tl.sunmmio.make_zzz")
@@ -34,6 +35,7 @@ same_layout = _get("tl.CuteLayout_same_layout")
 is_same_layout = _get("tl.IsSameLayout")
 derive_layout_like = _get("tl.DeriveLayoutLike")
 is_layout_match = _get("tl.IsLayoutMatch")
+canonicalize_to_row_major = _get("tl.TryCanonicalizeToRowMajor")
 
 ANA = tvm.arith.Analyzer()
 
@@ -391,6 +393,52 @@ class TestLayoutRelations:
         a = make_zz(_imms(128, 128), [0, 1], _imms(32, 32))
         b = make_zz(_imms(256, 64), [0, 1], _imms(32, 32))
         assert is_layout_match(a, b)
+
+    def test_is_layout_match_padded_vs_tight_row_major(self):
+        # An alignment-padded row-major (logical [2,40], covered [2,64]) has a
+        # different pitch from the tight row-major of the same shape, so they
+        # must NOT match -- in either direction (IsLayoutMatch is symmetric).
+        tight = make_row_major(_imms(2, 40))
+        padded = make_aligned_row_major(_imms(2, 40), "float16", 64)  # 40 -> 64
+        assert not is_layout_match(tight, padded)
+        assert not is_layout_match(padded, tight)
+
+    def test_is_layout_match_aligned_noop_matches_tight(self):
+        # Inner extent 64 is already a multiple of the alignment (64B / 2B = 32
+        # elems), so covered == logical: the aligned layout IS the tight
+        # row-major and they match both ways.
+        tight = make_row_major(_imms(2, 64))
+        aligned = make_aligned_row_major(_imms(2, 64), "float16", 64)
+        assert is_layout_match(tight, aligned)
+        assert is_layout_match(aligned, tight)
+
+
+class TestCanonicalizeToRowMajor:
+    def test_single_block_zz_canonicalizes_to_row_major(self):
+        # A ZZ whose block spans the whole buffer has a size-1 block grid; it
+        # coalesces to the plain row-major of its shape.
+        zz = make_zz(_imms(32, 32), [0, 1], _imms(32, 32))
+        assert is_same_layout(canonicalize_to_row_major(zz), make_row_major(_imms(32, 32)))
+
+    def test_multi_block_zz_stays_blocked(self):
+        # A real (multi-block) ZZ does NOT coalesce to row-major.
+        zz = make_zz(_imms(128, 128), [0, 1], _imms(32, 32))
+        assert not is_same_layout(canonicalize_to_row_major(zz), make_row_major(_imms(128, 128)))
+
+    def test_padded_row_major_stays_padded(self):
+        # Coalescing preserves the pitch gap of an alignment-padded row-major,
+        # so it stays distinct from the tight row-major.
+        padded = make_aligned_row_major(_imms(2, 40), "float16", 64)  # 40 -> 64
+        assert not is_same_layout(canonicalize_to_row_major(padded), make_row_major(_imms(2, 40)))
+
+    def test_row_major_is_a_fixed_point(self):
+        rm = make_row_major(_imms(8, 40))
+        assert is_same_layout(canonicalize_to_row_major(rm), rm)
+
+    def test_canonicalize_is_idempotent(self):
+        zz = make_zz(_imms(32, 32), [0, 1], _imms(32, 32))
+        once = canonicalize_to_row_major(zz)
+        assert is_same_layout(canonicalize_to_row_major(once), once)
 
 
 # ---------------------------------------------------------------------------
