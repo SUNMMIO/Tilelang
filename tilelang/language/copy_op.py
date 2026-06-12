@@ -130,9 +130,10 @@ def _warn_explicit_oob(buffer: tir.Buffer, dim: int, min_value: tir.PrimExpr, ex
     )
 
 
-# Clip copy extents to the remaining buffer shape.  Static out-of-bounds
-# explicit regions warn before clipping; dynamic bounds are preserved as a
-# symbolic min expression.
+# Clip copy extents to the remaining buffer shape. Static out-of-bounds
+# explicit regions warn before clipping. For inferred BufferLoad regions we
+# keep dynamic extents unchanged so Sunmmio DMA lowering still sees static tile
+# sizes instead of expressions such as T.min(tile, shape - min).
 def _clip_extent_to_shape(
     buffer: tir.Buffer,
     dim: int,
@@ -141,6 +142,7 @@ def _clip_extent_to_shape(
     shape: tir.PrimExpr,
     *,
     warn_if_clipped: bool,
+    clip_dynamic: bool,
 ) -> tir.PrimExpr:
     min_int = _as_static_int(min_value)
     extent_int = _as_static_int(extent)
@@ -157,6 +159,9 @@ def _clip_extent_to_shape(
         if clipped < extent_int and warn_if_clipped:
             _warn_explicit_oob(buffer, dim, min_value, extent, shape)
         return tir.IntImm(extent.dtype if hasattr(extent, "dtype") else "int32", clipped)
+
+    if not clip_dynamic:
+        return extent
 
     return tir.min(extent, shape - min_value)
 
@@ -188,6 +193,7 @@ def _clip_region_to_shape(spec: _CopyRegionSpec, mins: list[tir.PrimExpr], exten
             extent,
             shape[dim],
             warn_if_clipped=spec.explicit_extents,
+            clip_dynamic=spec.kind != "load",
         )
         for dim, (min_value, extent) in enumerate(zip(mins, extents))
     ]
