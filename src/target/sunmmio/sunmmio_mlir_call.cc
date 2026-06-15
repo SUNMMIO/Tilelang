@@ -75,9 +75,9 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
         tiled_dims.push_back(i);
       }
     }
-    ICHECK_EQ(tiled_dims.size(), 2)
-        << "tl.tileop.region expects exactly 2 tiled "
-           "dims with extent != 1, but got "
+    ICHECK_GE(tiled_dims.size(), 1)
+        << "tl.tileop.region expects at least 1 tiled "
+           "dim with extent != 1, but got "
         << tiled_dims.size();
   } else {
     shape.push_back(extents[0]);
