@@ -1369,3 +1369,39 @@ def test_tilelang_sunmmio_persistent_gemm():
     # The all_gather staging src into the ZN WSRAM operand stays ZZ — a ZN
     # WSRAM dst legally accepts a ZZ src, so comm must not force it to ZN.
     assert_layout(layouts, "B_shared", "ZZ", block=(32, 32))
+
+
+# ---------------------------------------------------------------------------
+# Test: RSRAM rank-<2 default, and the illegal rank-<2 ASRAM/WSRAM guard added
+# alongside the alignment-padded row-major (MakeAlignedRowMajor) work.
+# ---------------------------------------------------------------------------
+
+
+def _rank1_copy_kernel(scope):
+    """A rank-1 SRAM buffer touched only by copies, so it falls to the kFree
+    scope default (no op-derived layout)."""
+
+    @T.prim_func
+    def main(A: T.Tensor((40,), "float16"), B: T.Tensor((40,), "float16")):
+        with T.Kernel(1, threads=128) as (bx,):
+            X = T.alloc_shared((40,), "float16", scope=scope)
+            T.copy(A, X)
+            T.copy(X, B)
+
+    return tvm.IRModule({"main": main})
+
+
+def test_rsram_rank1_copy_buffer_is_row_major():
+    """A rank-1 RSRAM buffer touched only by copies is layout-matched to the
+    unpadded DRAM by propagation, overriding the aligned kFree default -- correct,
+    since a pure DMA passthrough is never tile-accessed."""
+    target = determine_target("Sunmmio", return_object=True)
+    layouts = run_sunmmio_layout_inference(_rank1_copy_kernel("shared.rsram"), target)
+    assert_layout(layouts, "X", "RowMajor")
+
+
+def test_rank1_asram_buffer_is_rejected():
+    """ASRAM/WSRAM only accept rank-2 tensors; a rank-1 one must fail loudly."""
+    target = determine_target("Sunmmio", return_object=True)
+    with pytest.raises(Exception, match="rank-2"):
+        run_sunmmio_layout_inference(_rank1_copy_kernel("shared.asram"), target)

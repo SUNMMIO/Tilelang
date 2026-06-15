@@ -9,6 +9,7 @@ from tvm.tir import Buffer, BufferLoad, BufferRegion
 from .swizzle import _get_buffer_info
 
 _make_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_row_major")
+_make_aligned_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_aligned_row_major")
 _make_zz = tvm_ffi.get_global_func("tl.sunmmio.make_zz")
 _make_zn = tvm_ffi.get_global_func("tl.sunmmio.make_zn")
 _make_zzz = tvm_ffi.get_global_func("tl.sunmmio.make_zzz")
@@ -18,6 +19,19 @@ _make_nzz = tvm_ffi.get_global_func("tl.sunmmio.make_nzz")
 def make_row_major(shape):
     """Create a row-major CuteLayout."""
     return _make_row_major(shape)
+
+
+def make_aligned_row_major(shape_or_buffer, dtype, align_bytes=64):
+    """Create an alignment-padded row-major CuteLayout for RSRAM.
+
+    The innermost extent is rounded up to a multiple of ``align_bytes`` (in
+    ``dtype`` elements) and stored as the covered extent; strides are dense
+    row-major over the padded extents, so every outer stride lands on an
+    ``align_bytes`` boundary. The logical shape keeps the true extents.
+    Rank-1 ``[N]`` pads its covered extent to ``round_up(N)``.
+    """
+    shape = _normalize_shape(shape_or_buffer)
+    return _make_aligned_row_major(shape, dtype, align_bytes)
 
 
 def _to_expr(v):

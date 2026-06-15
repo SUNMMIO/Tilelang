@@ -1106,11 +1106,9 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &T,
   if (level >= InferLevel::kStrict)
     return {};
 
-  // Sunmmio RSRAM reduce: derive dst layout from src layout and reduce axis.
-  //
-  // If the reduced dim is blocked (nlevels > 1), the block structure on
-  // that axis is destroyed → fall back to row-major.
-  // Otherwise, DeriveLayoutLike preserves the surviving blocked structure.
+  // Sunmmio RSRAM reduce: derive the dst layout from the src. A surviving
+  // blocked (ZZ) structure is kept via DeriveLayoutLike; any row-major result
+  // is alignment-padded so each row stays RSRAM-aligned.
   if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeRSRAM) {
     LayoutMap result;
     // Always propose when src has a layout — TryAssign handles priority.
@@ -1120,16 +1118,32 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &T,
       auto *src_cute = T.layout_map[src].as<CuteLayoutNode>();
       bool reduces_blocked_dim =
           src_cute && src_cute->GetDimLevels()[dim].IntValue() > 1;
-      if (reduces_blocked_dim) {
-        result.Set(dst, sunmmio::MakeRowMajor(dst->shape));
-      } else {
-        auto derived = DeriveLayoutLike(T.layout_map[src], dst->shape);
-        if (derived.defined()) {
-          result.Set(dst, derived.value());
-        } else {
-          result.Set(dst, sunmmio::MakeRowMajor(dst->shape));
+      int align_bytes =
+          GetSunmmioTileProcessorConfig(T.target).rsram_align_bytes;
+      // True if `layout` has any blocked dim (dim_levels > 1), i.e. already-
+      // aligned tiling; a plain row-major (all dim_levels == 1) returns false.
+      auto HasBlockedDim = [](const Layout &layout) {
+        if (const auto *cute = layout.as<CuteLayoutNode>()) {
+          for (const Integer &lvl : cute->GetDimLevels()) {
+            if (lvl.IntValue() > 1)
+              return true;
+          }
         }
+        return false;
+      };
+      // Keep DeriveLayoutLike's result only when it preserves blocks (already
+      // block-aligned); any row-major outcome (blocked-axis reduce, chained
+      // unblocked src, failed derivation) goes through MakeAlignedRowMajor.
+      Layout dst_layout;
+      if (!reduces_blocked_dim) {
+        auto derived = DeriveLayoutLike(T.layout_map[src], dst->shape);
+        if (derived.defined() && HasBlockedDim(derived.value()))
+          dst_layout = derived.value();
       }
+      if (!dst_layout.defined())
+        dst_layout =
+            sunmmio::MakeAlignedRowMajor(dst->shape, dst->dtype, align_bytes);
+      result.Set(dst, dst_layout);
     }
     return result;
   }

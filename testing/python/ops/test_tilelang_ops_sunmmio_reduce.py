@@ -1,9 +1,12 @@
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.layout import make_zz_layout
+from tilelang.layout import make_zz_layout, make_aligned_row_major, make_row_major
+from tilelang.layout.cute_layout import is_same_layout
 from tilelang.tileview import make_tileview
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
+from tvm.tir import Block
+from tvm.tir.stmt_functor import post_order_visit
 import pytest
 
 tilelang.env.disable_cache()
@@ -27,6 +30,20 @@ def apply_sunmmio_passes(mod, target):
 def assert_reduce_lowering_is_ssa(mod):
     """Reduce lowering should be SSA-clean before LowerOpaqueBlock/ConvertSSA."""
     assert tvm.tir.analysis.verify_ssa(mod["main"]), mod.script()
+
+
+def _layout_map(mod):
+    """Extract {buffer_name: layout} from a module's block layout_map
+    annotations (the module having been lowered via apply_sunmmio_passes)."""
+    result = {}
+
+    def visit(node):
+        if isinstance(node, Block) and "layout_map" in node.annotations:
+            for buf, layout in node.annotations["layout_map"].items():
+                result[buf.name] = layout
+
+    post_order_visit(mod["main"].body, visit)
+    return result
 
 
 @tvm.tir.functor.visitor
@@ -499,6 +516,147 @@ def test_tilelang_reduce_sunmmio_non_tiled_axis_tail_has_no_reduce_predicate():
     out_store_predicates = [store.predicate for store in _collect_buffer_stores(mod["main"], "Out_shared") if store.predicate is not None]
     assert not a_load_predicates
     assert not out_store_predicates
+
+
+def test_tilelang_reduce_sunmmio_blocked_axis_yields_aligned_rowmajor():
+    """Reducing a blocked (ZZ) axis to a non-32-multiple output gives the dst an
+    alignment-padded row-major layout (e.g. (40,) -> covered 64), not plain."""
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+
+    @T.prim_func
+    def main(A: T.Tensor((64, 40), "float16"), Out: T.Tensor((40,), "float16")):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((64, 40), "float16", scope="shared.rsram")
+            Out_shared = T.alloc_shared((40,), "float16", scope="shared.rsram")
+            T.copy(A, A_shared)
+            T.reduce_sum(A_shared, Out_shared, dim=0)
+            T.copy(Out_shared, Out)
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
+    layouts = _layout_map(mod)
+
+    out = layouts["Out_shared"]
+    assert is_same_layout(out, make_aligned_row_major((40,), "float16", 64))
+    assert not is_same_layout(out, make_row_major((40,)))
+
+
+def test_tilelang_reduce_sunmmio_3d_blocked_axis_aligned():
+    """3D ZZ source, reduce the inner blocked axis -> 2D aligned row-major dst
+    with a non-32-multiple inner extent (the (2,40,256) -> (2,40) shape)."""
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+
+    @T.prim_func
+    def main(A: T.Tensor((2, 40, 256), "float16"), Out: T.Tensor((2, 40), "float16")):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((2, 40, 256), "float16", scope="shared.rsram")
+            Out_shared = T.alloc_shared((2, 40), "float16", scope="shared.rsram")
+            T.copy(A, A_shared)
+            T.reduce_sum(A_shared, Out_shared, dim=2)
+            T.copy(Out_shared, Out)
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
+    layouts = _layout_map(mod)
+    assert is_same_layout(layouts["Out_shared"], make_aligned_row_major((2, 40), "float16", 64))
+
+
+def test_tilelang_reduce_sunmmio_chained_reduce_stays_aligned():
+    """Reducing twice: the first reduce makes an (8,40) aligned row-major; the
+    second reduce off that *unblocked* buffer must stay aligned (the chained
+    path goes through DeriveLayoutLike -> MakeAlignedRowMajor, not plain)."""
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+
+    @T.prim_func
+    def main(A: T.Tensor((8, 64, 40), "float16"), Out: T.Tensor((40,), "float16")):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((8, 64, 40), "float16", scope="shared.rsram")
+            M_shared = T.alloc_shared((8, 40), "float16", scope="shared.rsram")
+            Out_shared = T.alloc_shared((40,), "float16", scope="shared.rsram")
+            T.copy(A, A_shared)
+            T.reduce_sum(A_shared, M_shared, dim=1)  # blocked axis -> aligned (8,40)
+            T.reduce_sum(M_shared, Out_shared, dim=0)  # off unblocked -> aligned
+            T.copy(Out_shared, Out)
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
+    layouts = _layout_map(mod)
+    assert is_same_layout(layouts["M_shared"], make_aligned_row_major((8, 40), "float16", 64))
+    assert is_same_layout(layouts["Out_shared"], make_aligned_row_major((40,), "float16", 64))
+    assert not is_same_layout(layouts["Out_shared"], make_row_major((40,)))
+
+
+def test_tilelang_reduce_sunmmio_nonblocked_reduce_preserves_zz():
+    """Reducing a NON-blocked leading axis keeps the surviving ZZ block
+    structure (DeriveLayoutLike path), not a flat row-major."""
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+
+    @T.prim_func
+    def main(A: T.Tensor((40, 64, 64), "float16"), Out: T.Tensor((64, 64), "float16")):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((40, 64, 64), "float16", scope="shared.rsram")
+            Out_shared = T.alloc_shared((64, 64), "float16", scope="shared.rsram")
+            T.copy(A, A_shared)
+            T.reduce_sum(A_shared, Out_shared, dim=0)
+            T.copy(Out_shared, Out)
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
+    layouts = _layout_map(mod)
+    out = layouts["Out_shared"]
+    assert is_same_layout(out, make_zz_layout((64, 64), [0, 1], (32, 32)))
+    assert not is_same_layout(out, make_row_major((64, 64)))
+
+
+def test_tilelang_reduce_sunmmio_aligned_dst_is_noop_when_32_multiple():
+    """A 32-multiple reduce output gets no padding: aligned row-major collapses
+    to plain row-major (no spurious covered-extent inflation)."""
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+
+    @T.prim_func
+    def main(A: T.Tensor((64, 64), "float16"), Out: T.Tensor((64,), "float16")):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((64, 64), "float16", scope="shared.rsram")
+            Out_shared = T.alloc_shared((64,), "float16", scope="shared.rsram")
+            T.copy(A, A_shared)
+            T.reduce_sum(A_shared, Out_shared, dim=0)
+            T.copy(Out_shared, Out)
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
+    layouts = _layout_map(mod)
+    assert is_same_layout(layouts["Out_shared"], make_row_major((64,)))
+
+
+def test_tilelang_reduce_sunmmio_aligned_output_lowers_end_to_end():
+    """End-to-end (through LowerTileOp): reduce dim1 of a ZZ (40,64) source — a
+    blocked axis with a 32-multiple inner extent — yields an aligned, covered-
+    padded (40,) output that lowers and stores to unpadded DRAM via an unpad
+    transform.  Two sunmmio_layout_transforms: ZZ-reblock on the load, unpad on
+    the store.  This proves the aligned (covered != logical) reduce dst is fully
+    lowerable, not just inferred."""
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+
+    @T.prim_func
+    def main(A: T.Tensor((40, 64), "float16"), Out: T.Tensor((40,), "float16")):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((40, 64), "float16", scope="shared.rsram")
+            Out_shared = T.alloc_shared((40,), "float16", scope="shared.rsram")
+            T.copy(A, A_shared)
+            T.reduce_sum(A_shared, Out_shared, dim=1)
+            T.copy(Out_shared, Out)
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
+    layouts = _layout_map(mod)
+    assert is_same_layout(layouts["Out_shared"], make_aligned_row_major((40,), "float16", 64))
+
+    names = []
+    post_order_visit(
+        mod["main"].body,
+        lambda n: names.append(n.op.name) if isinstance(n, tvm.tir.Call) and hasattr(n.op, "name") else None,
+    )
+    assert names.count("tl.sunmmio_layout_transform") == 2, names
 
 
 if __name__ == "__main__":
