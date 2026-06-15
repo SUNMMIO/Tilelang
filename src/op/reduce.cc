@@ -581,9 +581,6 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
     Array<Var> init_dst_vars = map_dst_interior_vars(init_vars);
     Array<PrimExpr> init_dst_idx = get_dst_indices(init_dst_vars);
     PrimExpr init_val = BufferLoad(this->dst, init_dst_idx);
-    if (this->type->isAbsSum() || this->type->isAbsMax()) {
-      init_val = tvm::abs(init_val);
-    }
     init_stmt = BufferStore(acc, init_val, init_acc_idx);
   }
   init_stmt = wrap_interior(init_stmt, init_vars, src_tile_shape, all_src_axes);
@@ -665,9 +662,6 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
       Array<PrimExpr> finalize_res_idx = get_res_indices(finalize_dst_vars);
       PrimExpr dst_val = BufferLoad(this->dst, finalize_dst_idx);
       PrimExpr res_val = BufferLoad(dst_res_buf, finalize_res_idx);
-      if (this->type->isAbsSum() || this->type->isAbsMax()) {
-        dst_val = tvm::abs(dst_val);
-      }
       PrimExpr update;
       if (this->type->isSum() || this->type->isAbsSum()) {
         update = dst_val + res_val;

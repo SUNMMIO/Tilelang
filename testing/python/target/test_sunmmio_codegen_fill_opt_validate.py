@@ -55,14 +55,15 @@ def fill_tiled_test(
                         T.fill(A_shared[0:block_b, 0 : block_m // 2, 0:block_n], T.float16(2.0))
                         T.fill(A_shared[0:block_b, block_m // 2 : block_m, 0:block_n], T.float16(3.0))
                         T.clear(A_shared)
-                        T.copy(
-                            A_shared,
-                            A[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                        )
+                        for bb in T.serial(block_b):
+                            T.copy(
+                                A_shared[bb, :, :],
+                                A[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                            )
 
     return main
 

@@ -15,7 +15,7 @@ from sunmmio_codegen_validation_utils import (
 
 tilelang.env.disable_cache()
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
-# os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
+os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 
 REDUCE_IN_TILE_CASES = [
@@ -54,7 +54,11 @@ def reduce_kernel_builder(shape, reduce_axis, dtype="float16", clear=True):
             A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
             Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
 
-            T.copy(A, A_shared)
+            if len(shape) == 3:
+                for bb in T.serial(shape[0]):
+                    T.copy(A[bb, :, :], A_shared[bb, :, :])
+            else:
+                T.copy(A, A_shared)
             T.reduce_sum(A_shared, Out_shared, dim=reduce_axis, clear=clear)
             T.copy(Out_shared, Out)
 
@@ -103,14 +107,15 @@ def reduce_tiled_test(
                                 Out_shared,
                             )
                         for bx in T.serial(grid_n):
-                            T.copy(
-                                A[
-                                    bz * block_b : (bz + 1) * block_b,
-                                    by * block_m : (by + 1) * block_m,
-                                    bx * block_n : (bx + 1) * block_n,
-                                ],
-                                A_shared,
-                            )
+                            for bb in T.serial(block_b):
+                                T.copy(
+                                    A[
+                                        bz * block_b + bb,
+                                        by * block_m : (by + 1) * block_m,
+                                        bx * block_n : (bx + 1) * block_n,
+                                    ],
+                                    A_shared[bb, :, :],
+                                )
                             T.reduce_abssum(A_shared, Out_shared, dim=reduce_axis, clear=False)
                         T.copy(
                             Out_shared,
@@ -133,14 +138,15 @@ def reduce_tiled_test(
                                 Out_shared,
                             )
                         for by in T.serial(grid_m):
-                            T.copy(
-                                A[
-                                    bz * block_b : (bz + 1) * block_b,
-                                    by * block_m : (by + 1) * block_m,
-                                    bx * block_n : (bx + 1) * block_n,
-                                ],
-                                A_shared,
-                            )
+                            for bb in T.serial(block_b):
+                                T.copy(
+                                    A[
+                                        bz * block_b + bb,
+                                        by * block_m : (by + 1) * block_m,
+                                        bx * block_n : (bx + 1) * block_n,
+                                    ],
+                                    A_shared[bb, :, :],
+                                )
                             T.reduce_abssum(A_shared, Out_shared, dim=reduce_axis, clear=False)
                         T.copy(
                             Out_shared,
@@ -163,14 +169,15 @@ def reduce_tiled_test(
                                 Out_shared,
                             )
                         for bz in T.serial(grid_b):
-                            T.copy(
-                                A[
-                                    bz * block_b : (bz + 1) * block_b,
-                                    by * block_m : (by + 1) * block_m,
-                                    bx * block_n : (bx + 1) * block_n,
-                                ],
-                                A_shared,
-                            )
+                            for bb in T.serial(block_b):
+                                T.copy(
+                                    A[
+                                        bz * block_b + bb,
+                                        by * block_m : (by + 1) * block_m,
+                                        bx * block_n : (bx + 1) * block_n,
+                                    ],
+                                    A_shared[bb, :, :],
+                                )
                             T.reduce_abssum(A_shared, Out_shared, dim=reduce_axis, clear=False)
                         T.copy(
                             Out_shared,

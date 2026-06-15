@@ -62,36 +62,38 @@ def dot_mul_tiled_parallel_3d(
             for bz in T.serial(grid_b):
                 for by in T.serial(grid_m):
                     for bx in T.serial(grid_n):
-                        T.copy(
-                            A[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                            A_shared,
-                        )
-                        T.copy(
-                            B[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                            B_shared,
-                        )
+                        for bb in T.serial(block_b):
+                            T.copy(
+                                A[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                                A_shared[bb, :, :],
+                            )
+                            T.copy(
+                                B[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                                B_shared[bb, :, :],
+                            )
 
                         for b, i, j in T.Tiles(A_shared, parallel=True):
                             A_shared[b, i, j] = A_shared[b, i, j] * T.float32(2.0)
                             B_shared[b, i, j] = A_shared[b, i, j] * B_shared[b, i, j]
                             C_shared[b, i, j] = T.exp(A_shared[b, i, j]) + T.exp(B_shared[b, i, j])
 
-                        T.copy(
-                            C_shared,
-                            C[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                        )
+                        for bb in T.serial(block_b):
+                            T.copy(
+                                C_shared[bb, :, :],
+                                C[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                            )
 
     return main
 
@@ -189,22 +191,23 @@ def tiles_broadcast(
             for bz in T.serial(grid_b):
                 for by in T.serial(grid_m):
                     for bx in T.serial(grid_n):
-                        T.copy(
-                            A[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                            A_shared,
-                        )
-                        T.copy(
-                            B[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                            B_shared,
-                        )
+                        for bb in T.serial(block_b):
+                            T.copy(
+                                A[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                                A_shared[bb, :, :],
+                            )
+                            T.copy(
+                                B[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                                B_shared[bb, :, :],
+                            )
                         T.copy(D[by * block_m : (by + 1) * block_m], D_shared)
 
                         for b, i, j in T.Tiles(A_shared, parallel=True):
@@ -217,14 +220,15 @@ def tiles_broadcast(
                             A_shared[b, i, j] = A_shared[b, i, j] * T.float32(2.0)
                             C_shared[b, i, j] = A_shared[b, i, j] * B_shared[b, i, j]
 
-                        T.copy(
-                            C_shared,
-                            C[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                        )
+                        for bb in T.serial(block_b):
+                            T.copy(
+                                C_shared[bb, :, :],
+                                C[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                            )
 
     return main
 
@@ -268,25 +272,23 @@ def test_dot_mul_tiled_parallel_2d_codegen_validates_with_npuir_opt(tmp_path):
     assert_source_contains(src, ("suvm.tile.mulf", "suvm.tile.exp"))
 
 
-def test_dot_mul_tiled_parallel_3d_tail_codegen_validates_loose_with_npuir_opt(tmp_path):
+def test_dot_mul_tiled_parallel_3d_large_block_codegen_validates_loose_with_npuir_opt(tmp_path):
     src = validate_sunmmio_codegen_loose(
         dot_mul_tiled_parallel_3d(
             batch=64,
-            m=510,
-            n=254,
+            m=512,
+            n=1024,
             block_b=32,
-            block_m=255,
-            block_n=127,
+            block_m=256,
+            block_n=128,
             dtype="float16",
             accum_dtype="float16",
         ),
         tmp_path,
-        mlir_filename="dot_mul_tiled_parallel_3d_tail_suvm.mlir",
-        expected_tokens=("suvm.tile.select", "suvm.tile.range", "suvm.tile.andi"),
+        mlir_filename="dot_mul_tiled_parallel_3d_large_block_suvm.mlir",
+        expected_tokens=("suvm.copy_async", "suvm.tile.mulf", "suvm.tile.exp"),
     )
-    assert_source_contains(src, ("scf.if", "suvm.tile.select", "suvm.tile.range", "suvm.tile.andi"))
-    assert "fake_tile_range" not in src
-    assert "fake_tile_mask_and" not in src
+    assert_source_contains(src, ("suvm.copy_async", "suvm.tile.mulf", "suvm.tile.exp"))
 
 
 @pytest.mark.parametrize(

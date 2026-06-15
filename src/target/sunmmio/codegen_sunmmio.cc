@@ -70,89 +70,6 @@ std::string GetAllocateStorageScope(const tir::Var &buffer_var) {
   TVM_FFI_UNREACHABLE();
 }
 
-std::optional<int64_t> GetStaticInt64(const PrimExpr &expr) {
-  if (const auto *imm = expr.as<IntImmNode>()) {
-    return static_cast<int64_t>(imm->value);
-  }
-  return std::nullopt;
-}
-
-int64_t RoundUpToMultiple(int64_t value, int64_t multiple) {
-  ICHECK_GT(multiple, 0);
-  return ((value + multiple - 1) / multiple) * multiple;
-}
-
-std::vector<PrimExpr>
-BuildRowMajorStrideExprsLocal(const std::vector<int64_t> &shape) {
-  std::vector<PrimExpr> strides(shape.size());
-  if (shape.empty()) {
-    return strides;
-  }
-  std::vector<int64_t> stride_values(shape.size(), 1);
-  for (int i = static_cast<int>(shape.size()) - 2; i >= 0; --i) {
-    stride_values[static_cast<size_t>(i)] =
-        shape[static_cast<size_t>(i + 1)] *
-        stride_values[static_cast<size_t>(i + 1)];
-  }
-  for (size_t i = 0; i < stride_values.size(); ++i) {
-    strides[i] = IntImm(DataType::Int(32), stride_values[i]);
-  }
-  return strides;
-}
-
-std::vector<uint8_t> BuildFlatDimLevelsLocal(size_t rank) {
-  return std::vector<uint8_t>(rank, 1);
-}
-
-void ApplyDebugRsramTailPadding(SunMMIOType *memtensor_type) {
-  if (memtensor_type == nullptr) {
-    return;
-  }
-  if (memtensor_type->kind != SunMMIOType::Kind::kMemTensor) {
-    return;
-  }
-  if (memtensor_type->memory_scope != "shared.rsram" &&
-      memtensor_type->memory_scope != "rsram") {
-    return;
-  }
-  if (memtensor_type->shape.size() < 2) {
-    return;
-  }
-  if (!memtensor_type->layout_hshape.empty() ||
-      !memtensor_type->layout_hstride.empty() ||
-      !memtensor_type->layout_dim_levels.empty()) {
-    return;
-  }
-
-  std::vector<int64_t> layout_hshape;
-  layout_hshape.reserve(memtensor_type->shape.size());
-  for (const PrimExpr &dim : memtensor_type->shape) {
-    auto value = GetStaticInt64(dim);
-    if (!value.has_value()) {
-      return;
-    }
-    layout_hshape.push_back(*value);
-  }
-
-  // Temporary hack: assume the padded layout for current SunMMIO Tiles tail
-  // cases is already conceptually available and materialize a verifier-friendly
-  // row-major covered shape here so the remaining tail-tile codegen work can
-  // proceed.
-  layout_hshape[layout_hshape.size() - 2] =
-      RoundUpToMultiple(layout_hshape[layout_hshape.size() - 2], 8);
-  layout_hshape[layout_hshape.size() - 1] =
-      RoundUpToMultiple(layout_hshape[layout_hshape.size() - 1], 32);
-
-  memtensor_type->layout_hshape.clear();
-  memtensor_type->layout_hshape.reserve(layout_hshape.size());
-  for (int64_t dim : layout_hshape) {
-    memtensor_type->layout_hshape.push_back(IntImm(DataType::Int(32), dim));
-  }
-  memtensor_type->layout_hstride = BuildRowMajorStrideExprsLocal(layout_hshape);
-  memtensor_type->layout_dim_levels =
-      BuildFlatDimLevelsLocal(memtensor_type->shape.size());
-}
-
 bool IsSunmmioReduceRegisterTempBuffer(const tir::Buffer &buffer) {
   if (!buffer.defined()) {
     return false;
@@ -476,9 +393,6 @@ CodeGenTileLangSunMMIO::MapBufferType(const tir::Buffer &buffer) const {
   if (builder_) {
     builder_->ApplyLayoutToType(buffer, &type);
   }
-  if (buffer.scope() == "shared.rsram" || buffer.scope() == "rsram") {
-    ApplyDebugRsramTailPadding(&type);
-  }
   return type;
 }
 
@@ -692,6 +606,12 @@ void CodeGenTileLangSunMMIO::EmitAlloc(const tir::Buffer &buffer,
   SunMMIOValue alloc = builder_->Alloc(NewValueName(), memtensor_type,
                                        dyn_extents, scope_hint, buffer->dtype);
   BindVar(buffer->data, alloc);
+
+  auto it = buffer_registry_.find(buffer.get());
+  if (it != buffer_registry_.end()) {
+    it->second.handle = alloc.value;
+    it->second.buffer_type = alloc.type;
+  }
 }
 
 namespace {

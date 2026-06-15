@@ -1,4 +1,5 @@
 from tilelang import tvm
+from tilelang.layout import make_aligned_row_major
 from tilelang.utils.target import determine_target
 
 from compile_pipeline import target
@@ -14,6 +15,13 @@ def _build_sunmmio_source_from_stmt(stmt):
     target = determine_target("Sunmmio", return_object=True)
     func = _to_device_kernel_func(tvm.tir.PrimFunc([], stmt))
     mod = tvm.IRModule({"main": func})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    return builder(mod, target, "suvm").inspect_source()
+
+
+def _build_sunmmio_source_from_func(func):
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": _to_device_kernel_func(func)})
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
     return builder(mod, target, "suvm").inspect_source()
 
@@ -151,6 +159,13 @@ def _make_row_major_padded_2d_aligned_store_stmt():
     )
 
 
+def _make_row_major_padded_2d_aligned_store_func():
+    stmt = _make_row_major_padded_2d_aligned_store_stmt()
+    out_buf = stmt.buffer
+    layout_map = {out_buf: make_aligned_row_major((2, 40), tvm.DataType("bfloat16"), 64)}
+    return tvm.tir.PrimFunc([], stmt).with_attr("layout_map", layout_map)
+
+
 def test_sunmmio_codegen_aligned_1d_store_uses_nonzero_insert_slice_offset():
     src = _build_sunmmio_source_from_stmt(_make_nonzero_offset_aligned_store_stmt())
     assert "suvm.tile.insert_slice" in src
@@ -161,12 +176,13 @@ def test_sunmmio_codegen_aligned_1d_store_uses_nonzero_insert_slice_offset():
     assert "!suvm.tile_view<32xbf16>" in src
     assert "!suvm.tile_view<32x1xbf16>" not in src
     assert "fake_partitioned_tile_view" not in src
-    assert "offsets = array<i64: 8, 0>" in src
+    assert "fake_missing_memtensor" not in src
+    assert "[8, 0] [8, 1]" in src
 
 
 def test_sunmmio_codegen_row_major_padded_2d_aligned_store_uses_row_block_indices():
-    src = _build_sunmmio_source_from_stmt(_make_row_major_padded_2d_aligned_store_stmt())
-    assert "#suvm.layout<(8, 64), (64, 1)>" in src
+    src = _build_sunmmio_source_from_func(_make_row_major_padded_2d_aligned_store_func())
+    assert "#suvm.layout<(2, 64), (64, 1)>" in src
     aligned_view_lines = [
         line
         for line in src.splitlines()
@@ -175,5 +191,6 @@ def test_sunmmio_codegen_row_major_padded_2d_aligned_store_uses_row_block_indice
         and "-> !suvm.tile_view<32xbf16>" in line
     ]
     assert aligned_view_lines
-    assert any(", %arg0," in line for line in aligned_view_lines)
+    assert any("indices = [%arg0," in line for line in aligned_view_lines)
     assert "fake_partitioned_tile_view" not in src
+    assert "fake_missing_memtensor" not in src

@@ -60,22 +60,23 @@ def tile_elementwise_ops_test(
             for bz in T.serial(grid_b):
                 for by in T.serial(grid_m):
                     for bx in T.serial(grid_n):
-                        T.copy(
-                            A[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                            A_shared,
-                        )
-                        T.copy(
-                            B[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                            B_shared,
-                        )
+                        for bb in T.serial(block_b):
+                            T.copy(
+                                A[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                                A_shared[bb, :, :],
+                            )
+                            T.copy(
+                                B[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                                B_shared[bb, :, :],
+                            )
 
                         for b, i, j in T.Tiles(A_shared, parallel=True):
                             x = T.max(A_shared[b, i, j], B_shared[b, i, j])
@@ -99,14 +100,15 @@ def tile_elementwise_ops_test(
                                 + rem_b
                             )
 
-                        T.copy(
-                            C_shared,
-                            C[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                        )
+                        for bb in T.serial(block_b):
+                            T.copy(
+                                C_shared[bb, :, :],
+                                C[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                            )
 
     return main
 
