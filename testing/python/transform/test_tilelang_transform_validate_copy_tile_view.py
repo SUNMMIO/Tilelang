@@ -4,7 +4,7 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm
-from tilelang.layout import make_row_major, make_zz_layout
+from tilelang.layout import make_row_major, make_zn_layout, make_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 
 
@@ -25,37 +25,171 @@ def disable_tilelang_cache():
 
 
 def _make_copy_kernel(copy_case):
-    if copy_case.startswith("zz_"):
-        shape = (96, 96)
+    if copy_case == "dynamic_extent_warns_and_passes":
+        shape = (T.dynamic("m"), 96)
+        layout = make_row_major(shape)
+    elif copy_case.startswith("dynamic_outer_"):
+        shape = (T.dynamic("m"), 96)
         layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
+    elif copy_case == "zz_block_non_major_dim_multi_block":
+        shape = (128, 128)
+        layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
+    elif copy_case.startswith("zz_") or copy_case.startswith("zn_"):
+        shape = (96, 96)
+        if copy_case.startswith("zn_"):
+            layout = make_zn_layout(shape, axes=[0, 1], block_shape=(32, 32))
+        else:
+            layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
     else:
         shape = (128, 128)
         layout = make_row_major(shape)
 
-    @T.prim_func
-    def kernel(A: T.Tensor(shape, DTYPE)):
-        with T.Kernel(1):
-            A_shared = T.alloc_shared(shape, DTYPE)
-            T.annotate_layout({A: layout, A_shared: layout})
+    if copy_case == "row_major_aligned_grid_tile":
 
-            if copy_case == "row_major_aligned_grid_tile":
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[0:64, 0:64], A_shared[64:128, 64:128])
-            elif copy_case == "row_major_min_not_region_extent_aligned":
+
+    elif copy_case == "row_major_min_not_region_extent_aligned":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[32:96, 0:64], A_shared[0:64, 0:64])
-            elif copy_case == "row_major_extent_not_buffer_shape_factor":
+
+    elif copy_case == "row_major_extent_not_buffer_shape_factor":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[0:96, 0:96], A_shared[0:96, 0:96])
-            elif copy_case == "row_major_1d_tile_view":
+
+    elif copy_case == "row_major_1d_tile_view":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[0, 64:128], A_shared[1, 64:128])
-            elif copy_case == "zz_block_equal":
+
+    elif copy_case == "zz_block_equal":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[0:32, 0:32], A_shared[32:64, 32:64])
-            elif copy_case == "zz_block_inner_split":
+
+    elif copy_case == "zz_block_non_major_dim_split":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
+                T.copy(A[0:32, 0:16], A_shared[32:64, 16:32])
+
+    elif copy_case == "zz_block_non_major_dim_multi_block":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
+                T.copy(A[0:32, 0:64], A_shared[32:64, 0:64])
+
+    elif copy_case == "zn_block_non_major_dim_split":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
+                T.copy(A[0:16, 0:96], A_shared[16:32, 0:96])
+
+    elif copy_case == "zz_block_both_dims_split":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[0:16, 0:16], A_shared[16:32, 16:32])
-            elif copy_case == "zz_whole_dim":
+
+    elif copy_case == "zz_whole_dim":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[0:96, 0:96], A_shared[0:96, 0:96])
-            elif copy_case == "zz_extent_not_coalesced_compatible":
+
+    elif copy_case == "zz_block_major_dim_split":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
+                T.copy(A[0:16, 0:32], A_shared[16:32, 32:64])
+
+    elif copy_case == "zz_block_offset_inside_tile":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
+                T.copy(A[16:48, 0:32], A_shared[0:32, 32:64])
+
+    elif copy_case == "zz_extent_not_coalesced_compatible":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[0:48, 0:48], A_shared[0:48, 0:48])
-            else:
-                raise ValueError(f"unknown copy case: {copy_case}")
+
+    elif copy_case == "dynamic_extent_warns_and_passes":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
+                T.copy(A[0 : shape[0], 0:32], A_shared[0 : shape[0], 32:64])
+
+    elif copy_case == "dynamic_outer_static_extent_equal_block":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
+                T.copy(A[0:32, 0:32], A_shared[32:64, 32:64])
+
+    elif copy_case == "dynamic_outer_static_extent_split_block":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(1):
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
+                T.copy(A[0:16, 0:32], A_shared[16:32, 32:64])
+
+    else:
+        raise ValueError(f"unknown copy case: {copy_case}")
 
     return tvm.IRModule({"main": kernel})
 
@@ -82,6 +216,8 @@ def _make_inferred_layout_copy_kernel(copy_case):
                 T.copy(A[32:96, 0:64], A_shared[0:64, 0:64])
             elif copy_case == "zz_extent_not_coalesced_compatible":
                 T.copy(A[0:48, 0:48], A_shared[0:48, 0:48])
+            elif copy_case == "zz_block_equal":
+                T.copy(A[0:32, 0:32], A_shared[32:64, 32:64])
             else:
                 raise ValueError(f"unknown copy case: {copy_case}")
 
@@ -105,8 +241,12 @@ def _run_kernel_pipeline_to_validate_copy_tile_view(copy_case):
         "row_major_aligned_grid_tile",
         "row_major_1d_tile_view",
         "zz_block_equal",
-        "zz_block_inner_split",
+        "zz_block_non_major_dim_split",
+        "zz_block_non_major_dim_multi_block",
+        "zn_block_non_major_dim_split",
         "zz_whole_dim",
+        "dynamic_extent_warns_and_passes",
+        "dynamic_outer_static_extent_equal_block",
     ],
 )
 def test_sunmmio_validate_copy_tile_view_accepts_legal_regions(copy_case):
@@ -125,8 +265,24 @@ def test_sunmmio_validate_copy_tile_view_accepts_legal_regions(copy_case):
             "must divide buffer shape",
         ),
         (
+            "zz_block_both_dims_split",
+            "must be on the non-major dimension",
+        ),
+        (
+            "zz_block_major_dim_split",
+            "must be on the non-major dimension",
+        ),
+        (
+            "zz_block_offset_inside_tile",
+            "must align to region extent",
+        ),
+        (
             "zz_extent_not_coalesced_compatible",
             "must be compatible with coalesced extent",
+        ),
+        (
+            "dynamic_outer_static_extent_split_block",
+            "must be a multiple of dynamic layout inner static mode shape",
         ),
     ],
 )
@@ -136,7 +292,7 @@ def test_sunmmio_validate_copy_tile_view_rejects_illegal_regions(copy_case, erro
 
 
 def test_sunmmio_validate_copy_tile_view_accepts_kernel_after_layout_inference():
-    _run_kernel_pipeline_to_validate_copy_tile_view("row_major_aligned_grid_tile")
+    _run_kernel_pipeline_to_validate_copy_tile_view("zz_block_equal")
 
 
 @pytest.mark.parametrize(

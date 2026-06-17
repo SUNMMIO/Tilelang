@@ -12,6 +12,7 @@
 #include <tvm/tir/transform.h>
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 #include <string>
 #include <utility>
@@ -51,6 +52,8 @@ private:
   struct DimLayoutInfo {
     bool has_layout{false};
     bool has_dynamic_outer_mode{false};
+    bool is_blockwise{false};
+    bool is_blockwise_non_major_dim{false};
     int64_t coalesced_extent{1};
     int64_t inner_static_mode_shape{1};
   };
@@ -231,11 +234,15 @@ private:
     const PrimExpr &region_extent = range->extent;
 
     std::optional<int64_t> static_extent = TryGetStaticInt(region_extent);
-    ICHECK(static_extent.has_value() && static_extent.value() > 0)
-        << op_name << " " << operand_name << " region extent at dim " << dim
-        << " for buffer " << region->buffer->name
-        << " must be a positive compile-time constant, but got extent="
-        << region_extent << ".";
+    if (!static_extent.has_value() || static_extent.value() <= 0) {
+      LOG(WARNING) << op_name << " " << operand_name
+                   << " region extent at dim " << dim << " for buffer "
+                   << region->buffer->name
+                   << " is not a positive compile-time constant; skip "
+                      "tile_view validation for this dimension. extent="
+                   << region_extent << ".";
+      return;
+    }
 
     DimLayoutInfo info = GetDimLayoutInfo(layout, dim, region->buffer);
 
@@ -280,6 +287,31 @@ private:
         << " must divide buffer shape " << buffer_shape
         << ", but got extent=" << region_extent << ".";
 
+    if (info.is_blockwise) {
+      const bool splits_coalesced_block =
+          info.coalesced_extent % static_extent.value() == 0;
+      const bool covers_whole_coalesced_blocks =
+          static_extent.value() % info.coalesced_extent == 0;
+      ICHECK(splits_coalesced_block || covers_whole_coalesced_blocks)
+          << op_name << " " << operand_name
+          << " blockwise region extent at dim " << dim << " for buffer "
+          << region->buffer->name
+          << " must be compatible with coalesced extent "
+          << info.coalesced_extent << ", but got extent=" << region_extent
+          << ".";
+      if (splits_coalesced_block &&
+          static_extent.value() < info.coalesced_extent) {
+        ICHECK(info.is_blockwise_non_major_dim)
+            << op_name << " " << operand_name
+            << " blockwise region extent at dim " << dim << " for buffer "
+            << region->buffer->name
+            << " splits coalesced extent " << info.coalesced_extent
+            << " and must be on the non-major dimension, but got extent="
+            << region_extent << ".";
+      }
+      return;
+    }
+
     if (info.coalesced_extent < static_extent.value()) {
       ICHECK_EQ(static_extent.value() % info.coalesced_extent, 0)
           << op_name << " " << operand_name << " region extent at dim " << dim
@@ -320,6 +352,12 @@ private:
                           << ".";
       info.inner_static_mode_shape = inner_shape->value;
 
+      info.is_blockwise = mode_shapes.size() > 1;
+      if (info.is_blockwise) {
+        info.is_blockwise_non_major_dim =
+            IsBlockwiseNonMajorDim(cute, static_cast<int>(dim), buffer);
+      }
+
       const bool outer_dynamic =
           mode_shapes.size() > 1 &&
           !mode_shapes[mode_shapes.size() - 1].as<IntImmNode>();
@@ -337,6 +375,42 @@ private:
     info.coalesced_extent = shape_value.value();
     info.inner_static_mode_shape = shape_value.value();
     return info;
+  }
+
+  bool IsBlockwiseNonMajorDim(const CuteLayoutNode *layout, int dim,
+                              const Buffer &buffer) {
+    auto dim_levels = layout->GetDimLevels();
+    int64_t min_innermost_stride = std::numeric_limits<int64_t>::max();
+    std::optional<int64_t> dim_innermost_stride;
+    bool found_blockwise_dim = false;
+
+    for (size_t candidate_dim = 0; candidate_dim < dim_levels.size();
+         ++candidate_dim) {
+      if (dim_levels[candidate_dim].IntValue() <= 1) {
+        continue;
+      }
+      found_blockwise_dim = true;
+      Array<PrimExpr> strides =
+          layout->GetModeStrideOfDim(static_cast<int>(candidate_dim));
+      ICHECK(!strides.empty())
+          << "Blockwise CuteLayout has no strides for buffer " << buffer->name
+          << " dim " << candidate_dim << ".";
+      std::optional<int64_t> stride = TryGetStaticInt(strides[0]);
+      ICHECK(stride.has_value())
+          << "Blockwise CuteLayout innermost stride for buffer " << buffer->name
+          << " dim " << candidate_dim
+          << " must be a compile-time constant, but got " << strides[0]
+          << ".";
+      min_innermost_stride = std::min(min_innermost_stride, stride.value());
+      if (static_cast<int>(candidate_dim) == dim) {
+        dim_innermost_stride = stride;
+      }
+    }
+
+    ICHECK(found_blockwise_dim && dim_innermost_stride.has_value())
+        << "Blockwise CuteLayout metadata missing for buffer " << buffer->name
+        << " dim " << dim << ".";
+    return dim_innermost_stride.value() == min_innermost_stride;
   }
 
   int64_t ComputeDimCoalescedExtent(const Array<PrimExpr> &mode_shapes,
