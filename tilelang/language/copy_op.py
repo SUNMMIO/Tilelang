@@ -67,38 +67,6 @@ def _as_static_int(expr: Any) -> int | None:
     return None
 
 
-def _as_shape_expr(expr: Any) -> tir.PrimExpr:
-    if isinstance(expr, int):
-        return tir.IntImm("int32", expr)
-    return expr
-
-
-def _get_clip_shape(buffer: tir.Buffer) -> list[tir.PrimExpr]:
-    try:
-        from tilelang.language.eager.builder import Builder
-    except ImportError:
-        return list(buffer.shape)
-
-    builder = Builder.current()
-    if builder is None:
-        return list(buffer.shape)
-
-    metadata = getattr(builder, "_metadata", {})
-    buffer_names = [str(buffer.name)]
-    for attr in ("name_hint", "name"):
-        value = getattr(buffer.data, attr, None)
-        if value is not None:
-            buffer_names.append(str(value))
-    for name in buffer_names:
-        meta = metadata.get(name)
-        if not meta:
-            continue
-        global_shape = meta.get("global_shape")
-        if global_shape is not None and len(global_shape) == len(buffer.shape):
-            return [_as_shape_expr(dim) for dim in global_shape]
-    return list(buffer.shape)
-
-
 def _expr_is_one(expr: tir.PrimExpr) -> bool:
     return prim_expr_equal(expr, 1)
 
@@ -179,11 +147,10 @@ def _infer_load_extents_from_peer(load: _CopyRegionSpec, peer_extents: list[tir.
 
 
 def _clip_region_to_shape(spec: _CopyRegionSpec, mins: list[tir.PrimExpr], extents: list[tir.PrimExpr]) -> _NormalizedCopyRegion:
-    shape = _get_clip_shape(spec.buffer)
-    if len(mins) != len(extents) or len(extents) != len(shape):
+    if len(mins) != len(extents) or len(extents) != len(spec.buffer.shape):
         raise ValueError(
             "T.copy region rank does not match buffer rank before clipping: "
-            f"{spec.buffer.name}, mins={len(mins)}, extents={len(extents)}, shape={len(shape)}"
+            f"{spec.buffer.name}, mins={len(mins)}, extents={len(extents)}, shape={len(spec.buffer.shape)}"
         )
     clipped_extents = [
         _clip_extent_to_shape(
@@ -191,9 +158,10 @@ def _clip_region_to_shape(spec: _CopyRegionSpec, mins: list[tir.PrimExpr], exten
             dim,
             min_value,
             extent,
-            shape[dim],
+            spec.buffer.shape[dim],
             warn_if_clipped=spec.explicit_extents,
             clip_dynamic=spec.kind != "load",
+            # clip_dynamic = True,
         )
         for dim, (min_value, extent) in enumerate(zip(mins, extents))
     ]
