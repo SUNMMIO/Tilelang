@@ -255,20 +255,20 @@ private:
         << " for buffer " << region->buffer->name
         << " must align to region extent " << region_extent
         << ", but got min=" << region_min << ".";
-    if (info.has_dynamic_outer_mode) {
-      ICHECK(!analyzer_.CanProve(region_min + region_extent > buffer_shape))
-          << op_name << " " << operand_name << " region at dim " << dim
-          << " for buffer " << region->buffer->name
-          << " must stay within buffer shape " << buffer_shape
-          << ", but got min=" << region_min << " and extent=" << region_extent
-          << ".";
-    } else {
-      ICHECK(analyzer_.CanProve(region_min + region_extent <= buffer_shape))
-          << op_name << " " << operand_name << " region at dim " << dim
-          << " for buffer " << region->buffer->name
-          << " must stay within buffer shape " << buffer_shape
-          << ", but got min=" << region_min << " and extent=" << region_extent
-          << ".";
+    PrimExpr region_end = analyzer_.Simplify(region_min + region_extent);
+    ICHECK(!analyzer_.CanProve(region_end > buffer_shape))
+        << op_name << " " << operand_name << " region at dim " << dim
+        << " for buffer " << region->buffer->name
+        << " must stay within buffer shape " << buffer_shape
+        << ", but got min=" << region_min << " and extent=" << region_extent
+        << ".";
+    if (!analyzer_.CanProve(region_end <= buffer_shape)) {
+      LOG(WARNING) << op_name << " " << operand_name << " region at dim "
+                   << dim << " for buffer " << region->buffer->name
+                   << " cannot be proven within buffer shape " << buffer_shape
+                   << "; skip bounds validation for this dimension. min="
+                   << region_min << ", extent=" << region_extent
+                   << ", end=" << region_end << ".";
     }
 
     if (info.has_dynamic_outer_mode) {

@@ -80,6 +80,15 @@ def _make_copy_kernel(copy_case):
                 T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[0, 64:128], A_shared[1, 64:128])
 
+    elif copy_case == "row_major_dynamic_min_bounds_unknown":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel(4) as bx:
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
+                T.copy(A[bx * 32 : (bx + 1) * 32, 0:64], A_shared[0:32, 0:64])
+
     elif copy_case == "zz_block_equal":
 
         @T.prim_func
@@ -240,6 +249,7 @@ def _run_kernel_pipeline_to_validate_copy_tile_view(copy_case):
     [
         "row_major_aligned_grid_tile",
         "row_major_1d_tile_view",
+        "row_major_dynamic_min_bounds_unknown",
         "zz_block_equal",
         "zz_block_non_major_dim_split",
         "zz_block_non_major_dim_multi_block",
