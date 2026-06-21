@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import torch
 
+from functools import wraps
 from platform import mac_ver
-from typing import Literal
+from typing import Any, Callable, Literal
 from tilelang import tvm as tvm
 from tilelang import _ffi_api
 from tvm.target import Target
@@ -31,6 +32,20 @@ def describe_supported_targets() -> dict[str, str]:
     Return a mapping of supported target names to usage descriptions.
     """
     return dict(SUPPORTED_TARGETS)
+
+
+def target_context(target_name: str | Target | Literal["auto"] = "auto") -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Run the decorated function under a resolved TVM target context."""
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            with tvm.target.Target(determine_target(target_name, return_object=True)):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def check_cuda_availability() -> bool:
