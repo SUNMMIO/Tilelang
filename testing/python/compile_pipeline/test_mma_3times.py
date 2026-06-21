@@ -42,8 +42,6 @@ def kernel_mma_3times_single_thread(M=16, N=16, K=16, block_M=128, block_N=128, 
             B_shared3 = T.alloc_shared((block_K, block_N), dtype)
             # Allocate multiple accumulation memories related to C (simulate intermediate results in different MMA stages)
             C_shared1 = T.alloc_shared((block_M, block_N), dtype)
-            # C_shared2 = T.alloc_shared((block_M, block_N), dtype)
-            # C_shared3 = T.alloc_shared((block_M, block_N), dtype)
 
             for _bx, _by in T.Persistent(
                 [T.ceildiv(sharded_N, block_N), T.ceildiv(sharded_M, block_M)],
@@ -79,6 +77,7 @@ def test_mma_3times():
     test_config = {}
     test_config = get_or_add_default_verify(func, test_config)
     compile_test(func, target="Sunmmio", test_config=test_config)
+    # compile_test(func, out_idx=[2], target="Sunmmio", log_pass_output=True, log_dir=os.path.join(os.path.dirname(__file__), "_debug", "mma_3times"), remove_header=True)
 
 
 if __name__ == "__main__":
