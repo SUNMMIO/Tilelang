@@ -32,6 +32,10 @@ static constexpr const char *kLocalVarInit = "tl.local_var_init";
 // that must NOT be marked with the restrict qualifier in codegen.
 // Type: Array<tir::Var>
 static constexpr const char *kNonRestrictParams = "tl.non_restrict_params";
+// A PrimFunc-level internal marker listing attrs that SplitHostDevice should
+// propagate to generated device functions.
+// Type: Array<String>
+static constexpr const char *kDeviceFuncAttrKeys = "tl.device_func_attr_keys";
 } // namespace attr
 
 static constexpr const char *kDebugMergeSharedMemoryAllocations =
@@ -256,6 +260,27 @@ TVM_DLL const Op &tma_load();
  * \param dst_region  A tl.tileop.region PrimExpr describing the destination.
  */
 TVM_DLL const Op &dma_copy();
+
+/*!
+ * \brief Re-block an RSRAM buffer between ZZ and row-major layout.
+ *
+ * Emitted by the SUNMMIO copy lowering path when a DRAM<->RSRAM copy has
+ * mismatched src/dst layouts. The mismatched copy is split into a plain
+ * tl.dma_copy through an RSRAM staging buffer plus this transform, which
+ * runs on the tile unit (asynchronous, like DMA) and re-blocks the data
+ * between the staging buffer and the other RSRAM buffer.
+ *
+ * tl.sunmmio_layout_transform(src_region, dst_region)
+ *
+ * Each region's buffer carries its layout in the layout_map /
+ * global_layout_map block annotations, so codegen recovers the direction
+ * (ZZ vs row-major) and the ZZ block shape from there — the op itself needs
+ * only the two regions.
+ *
+ * \param src_region  A tl.tileop.region PrimExpr describing the source.
+ * \param dst_region  A tl.tileop.region PrimExpr describing the destination.
+ */
+TVM_DLL const Op &sunmmio_layout_transform();
 
 /*!
  * \brief tvm intrinsic for mma operation of Sunmmio target.

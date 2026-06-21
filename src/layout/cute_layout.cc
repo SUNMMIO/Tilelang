@@ -313,14 +313,38 @@ void CuteLayoutNode::RegisterReflection() {
 // ---------------------------------------------------------------------------
 
 /*!
+ * \brief Decompose a stride into (#symbolic factors, concrete coefficient).
+ *
+ * Layout strides are products of mode shapes (running prefix products), so a
+ * stride is a Mul-tree of IntImm and symbolic (dynamic count) factors.  We
+ * fold the concrete leaves into a coefficient and count the symbolic ones.
+ */
+static void CollectStrideFactors(const PrimExpr &e, int *sym_count,
+                                 int64_t *coeff) {
+  if (const auto *mul = e.as<MulNode>()) {
+    CollectStrideFactors(mul->a, sym_count, coeff);
+    CollectStrideFactors(mul->b, sym_count, coeff);
+    return;
+  }
+  int64_t c;
+  if (cute::tryConstInt(e, &c)) {
+    *coeff *= c;
+  } else {
+    ++(*sym_count);
+  }
+}
+
+/*!
  * \brief Extract the physical ordering (permutation) of modes from strides.
  *
  * For a contiguous CuteLayout, the strides encode the physical ordering:
  * the mode with the smallest stride is physically innermost, etc.
  *
- * Invariant: at most one mode has a symbolic (non-IntImm) stride, and
- * it is always the physically outermost (last in the ordering).  All
- * other strides are concrete and sortable.
+ * The strides form a single nested product chain (each outer stride equals an
+ * inner stride times an inner shape), so even when several are symbolic they
+ * are totally ordered by the key (#symbolic factors, concrete coefficient):
+ * the innermost has the fewest symbolic factors / smallest coefficient.  For
+ * all-concrete layouts this degrades to sorting by stride value.
  *
  * \return A permutation vector: physical_order[0] is the innermost mode
  *         index, physical_order[n-1] is the outermost.
@@ -329,30 +353,25 @@ static std::vector<int> RecoverPhysicalOrder(const CuteLayoutNode *layout) {
   auto strides = layout->GetModeStride();
   int n = strides.size();
 
-  std::vector<int> concrete_modes;
-  std::vector<int> symbolic_modes;
+  std::vector<std::pair<int, int64_t>> keys(n);
   for (int i = 0; i < n; ++i) {
-    if (strides[i].as<IntImmNode>()) {
-      concrete_modes.push_back(i);
-    } else {
-      symbolic_modes.push_back(i);
-    }
+    int sym_count = 0;
+    int64_t coeff = 1;
+    CollectStrideFactors(strides[i], &sym_count, &coeff);
+    keys[i] = {sym_count, coeff};
   }
-  ICHECK_LE(symbolic_modes.size(), 1)
-      << "CuteLayout invariant violated: more than one symbolic stride. "
-      << "Got " << symbolic_modes.size()
-      << " symbolic strides in layout: " << layout->DebugOutput();
 
-  // Sort concrete modes by stride value (ascending = innermost first).
-  std::sort(concrete_modes.begin(), concrete_modes.end(), [&](int a, int b) {
-    return strides[a].as<IntImmNode>()->value <
-           strides[b].as<IntImmNode>()->value;
+  std::vector<int> order(n);
+  for (int i = 0; i < n; ++i)
+    order[i] = i;
+
+  // Innermost first: fewer symbolic factors, then smaller concrete coefficient.
+  std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+    if (keys[a].first != keys[b].first)
+      return keys[a].first < keys[b].first;
+    return keys[a].second < keys[b].second;
   });
-
-  // Symbolic mode (if any) is the physically outermost — append last.
-  concrete_modes.insert(concrete_modes.end(), symbolic_modes.begin(),
-                        symbolic_modes.end());
-  return concrete_modes;
+  return order;
 }
 
 // ---------------------------------------------------------------------------
@@ -593,11 +612,88 @@ Optional<Layout> DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
                     new_dim_levels);
 }
 
+Layout TryCanonicalizeToRowMajor(const Layout &layout) {
+  const auto *cute = layout.as<CuteLayoutNode>();
+  if (!cute)
+    return layout; // non-CuteLayout: nothing to coalesce
+
+  Array<PrimExpr> logical_shape = cute->GetLogicalShape();
+  Array<Integer> dim_levels = cute->GetDimLevels();
+
+  Array<PrimExpr> mode_shape, mode_stride;
+  Array<Integer> new_levels;
+  for (size_t d = 0; d < dim_levels.size(); ++d) {
+    Array<PrimExpr> shapes = cute->GetModeShapeOfDim(d);
+    Array<PrimExpr> strides = cute->GetModeStrideOfDim(d);
+    int nlevels = dim_levels[d].IntValue();
+
+    // Per-dimension coalesce (storage order preserved -- never sort, that would
+    // change the index->offset map): drop static size-1 modes, and merge into
+    // the previous mode when both are static and contiguous.
+    std::vector<std::pair<PrimExpr, PrimExpr>> modes; // (shape, stride)
+    for (int i = 0; i < nlevels; ++i) {
+      const auto *cur_sh = shapes[i].as<IntImmNode>();
+      if (cur_sh && cur_sh->value == 1)
+        continue; // drop a degenerate (size-1) mode
+      if (!modes.empty() && cur_sh) {
+        const auto *pm = modes.back().first.as<IntImmNode>();
+        const auto *ps = modes.back().second.as<IntImmNode>();
+        const auto *cs = strides[i].as<IntImmNode>();
+        if (pm && ps && cs && pm->value * ps->value == cs->value) {
+          modes.back().first =
+              IntImm(modes.back().first.dtype(), pm->value * cur_sh->value);
+          continue; // merge: inner.shape * inner.stride == outer.stride
+        }
+      }
+      modes.push_back({shapes[i], strides[i]});
+    }
+    if (modes.empty()) // all modes were size-1: a logical extent-1 dim
+      modes.push_back(
+          {IntImm(shapes[0].dtype(), 1), IntImm(strides[0].dtype(), 0)});
+
+    new_levels.push_back(Integer(static_cast<int>(modes.size())));
+    for (const auto &[sh, st] : modes) {
+      mode_shape.push_back(sh);
+      mode_stride.push_back(st);
+    }
+  }
+  Layout coalesced =
+      CuteLayout(logical_shape, mode_shape, mode_stride, new_levels);
+  // Coalescing preserves the byte map but rewrites the mode structure that
+  // DeriveLayoutLike reads as the layout kind, so a partial coalesce would
+  // change how IsLayoutMatch shape-adapts the layout. Commit only when all
+  // structure is gone (plain row-major); keep anything still blocked or
+  // padded unchanged.
+  if (IsSameLayout(coalesced, sunmmio::MakeRowMajor(logical_shape)))
+    return coalesced;
+  return layout;
+}
+
 bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
                    arith::Analyzer *analyzer) {
-  auto derived = DeriveLayoutLike(lhs, rhs->InputShape(),
-                                  Optional<Array<Integer>>(), analyzer);
-  return derived.defined() && IsSameLayout(derived.value(), rhs, analyzer);
+  // Compare on canonical forms so representations describing the
+  // same byte map agree -- e.g. a single-block ZZ canonicalizes to row-major
+  // and matches a row-major buffer. Checked in both directions:
+  // DeriveLayoutLike rebuilds the template at the target's shape with tight
+  // strides, dropping the template's padding, so a single direction only sees
+  // padding on rhs; both directions give each layout a turn as rhs (so a tight
+  // and an alignment- padded row-major do not match), while unpadded layouts of
+  // different shapes still match.
+  Layout cl = TryCanonicalizeToRowMajor(lhs),
+         cr = TryCanonicalizeToRowMajor(rhs);
+  // Identical coalesced forms => identical byte map. Covers the reflexive and
+  // same-shape cases, including over-covered dims (covered > logical, e.g. a ZZ
+  // whose logical extent is below the block size) that DeriveLayoutLike would
+  // otherwise tighten and miss.
+  if (IsSameLayout(cl, cr, analyzer))
+    return true;
+  // Different logical shapes, same kind: re-derive each onto the other's shape.
+  auto fwd = DeriveLayoutLike(cl, cr->InputShape(), Optional<Array<Integer>>(),
+                              analyzer);
+  auto bwd = DeriveLayoutLike(cr, cl->InputShape(), Optional<Array<Integer>>(),
+                              analyzer);
+  return fwd.defined() && IsSameLayout(fwd.value(), cr, analyzer) &&
+         bwd.defined() && IsSameLayout(bwd.value(), cl, analyzer);
 }
 
 // ---------------------------------------------------------------------------
@@ -769,6 +865,50 @@ Layout MakeRowMajor(Array<PrimExpr> shape) {
 
   for (int d = 0; d < rank; ++d) {
     mode_shape.push_back(shape[d]);
+    mode_stride.push_back(strides[d]);
+    dim_levels.push_back(Integer(1));
+  }
+
+  return CuteLayout(shape, mode_shape, mode_stride, dim_levels);
+}
+
+Layout MakeAlignedRowMajor(Array<PrimExpr> shape, DataType dtype,
+                           int align_bytes) {
+  int rank = shape.size();
+  if (rank < 1)
+    return MakeRowMajor(shape);
+
+  // Number of elements that fill one alignment unit (e.g. 64B = 32 bf16 or
+  // 128 fp4 elements). Bit arithmetic keeps sub-byte dtypes exact.
+  int elem_bits = dtype.bits();
+  ICHECK_GT(elem_bits, 0) << "MakeAlignedRowMajor requires a positive element "
+                             "bit-width, but got dtype "
+                          << dtype;
+  int align_elems = align_bytes * 8 / elem_bits;
+  if (align_elems < 1)
+    align_elems = 1;
+
+  Array<PrimExpr> mode_shape;
+  Array<PrimExpr> mode_stride;
+  Array<Integer> dim_levels;
+
+  // Pad the innermost (contiguous) extent to a multiple of align_elems and
+  // store it as the covered extent in mode_shape; logical_shape keeps the true
+  // extent.
+  for (int d = 0; d < rank; ++d)
+    mode_shape.push_back(shape[d]);
+  mode_shape.Set(rank - 1, ceildiv(shape[rank - 1], makeInt(align_elems)) *
+                               makeInt(align_elems));
+
+  // Dense row-major strides over the PADDED mode_shape, so alignment propagates
+  // to every outer dimension automatically.
+  std::vector<PrimExpr> strides(rank);
+  strides[rank - 1] = makeInt(1);
+  for (int i = rank - 2; i >= 0; --i) {
+    strides[i] = strides[i + 1] * mode_shape[i + 1];
+  }
+
+  for (int d = 0; d < rank; ++d) {
     mode_stride.push_back(strides[d]);
     dim_levels.push_back(Integer(1));
   }
@@ -1092,8 +1232,14 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            })
       .def("tl.IsLayoutMatch",
            [](Layout lhs, Layout rhs) { return IsLayoutMatch(lhs, rhs); })
+      .def("tl.TryCanonicalizeToRowMajor",
+           [](Layout layout) { return TryCanonicalizeToRowMajor(layout); })
       .def("tl.sunmmio.make_row_major",
            [](Array<PrimExpr> shape) { return sunmmio::MakeRowMajor(shape); })
+      .def("tl.sunmmio.make_aligned_row_major",
+           [](Array<PrimExpr> shape, DataType dtype, int align_bytes) {
+             return sunmmio::MakeAlignedRowMajor(shape, dtype, align_bytes);
+           })
       .def("tl.sunmmio.make_zz",
            [](Array<PrimExpr> shape, Array<Integer> axes,
               Array<PrimExpr> block_shape) {
@@ -1137,7 +1283,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
             std::vector<PrimExpr> s(shapes.begin(), shapes.end());
             std::vector<PrimExpr> d(strides.begin(), strides.end());
             cute::CuteAlgebraLayout layout(s, d);
-            auto result = cute::complement(layout, max_idx);
+            auto result = cute::complement(
+                layout, make_const(DataType::Int(32), max_idx));
             auto flatShape = cute::flattenExprTuple(result.shape);
             auto flatStride = cute::flattenExprTuple(result.stride);
             Array<PrimExpr> out_shapes(flatShape.begin(), flatShape.end());

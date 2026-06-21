@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+import tvm_ffi
 from tvm import tir
 import tilelang.language as T
 from tilelang.utils.language import (
@@ -15,6 +16,10 @@ from tilelang.utils.language import (
 )
 
 from tilelang.carver.arch.driver import get_sunmmio_device_mesh_config
+
+# Mirror of kAttrSrcOffsetByte in src/target/sunmmio_utils.h. Resolved at
+# import time via FFI so the single source of truth stays in C++.
+ATTR_SRC_OFFSET_BYTE = str(tvm_ffi.get_global_func("tl.target.GetAttrSrcOffsetByte")())
 
 DIRECTION_MAP = {"horizontal": 0, "h": 0, "vertical": 1, "v": 1, "all": 2, "a": 2}
 REDUCE_TYPE_LIST = (
@@ -200,13 +205,11 @@ def broadcast(
     src_region = to_buffer_region(src)
     dst_region = to_buffer_region(dst)
     src_core_id = core_tuple_to_id(src_core)
-    dst_offset = 0  # Always 0 for now
 
     args = (
         src_region,
         dst_region,
         size,
-        dst_offset,
         src_core_id,
         DIRECTION_MAP[direction.lower()],
     )
@@ -280,6 +283,8 @@ def all_gather(
     recv_buffer: T.Buffer,
     direction: Literal["horizontal", "h", "vertical", "v", "all", "a"] = "all",
     size: int = -1,
+    axis: int | None = None,
+    src_offset_byte: int = 0,
 ):
     """Perform an all-gather operation from a send buffer to a receive buffer
     by emitting the TIR intrinsic tl.tileop.comm_allgather.
@@ -294,6 +299,18 @@ def all_gather(
         and "all" (or "a") for all cores.
     size : int
         Number of elements to send from each core. If -1, the entire send buffer is used.
+    axis : int, optional
+        Axis along which gathered data is concatenated. When ``axis`` is ``None``
+        (default), a new leading axis is introduced and ``recv_buffer`` must have
+        shape ``[K, *send_buffer.shape]`` where ``K`` is the number of contributing
+        cores. When ``axis`` is an integer, gathered data is concatenated along
+        that existing axis: ``recv_buffer.shape[axis] == K * send_buffer.shape[axis]``
+        and all other dimensions match ``send_buffer``. Only ``axis=0`` and
+        ``axis=-1`` (the last dim) are currently supported.
+    src_offset_byte : int
+        Byte offset added to the source pointer at codegen. Default 0. Set by the
+        Sunmmio bf16 GEMM legalization pass to re-stage south-bound A data into a
+        destination buffer's north bank. User code should leave this at 0.
     Returns
     -------
     tir.Call
@@ -301,6 +318,10 @@ def all_gather(
     Examples
     --------
     >>> all_gather(A_local, C_local, direction="horizontal")
+    >>> # send [d0, d1], 4-col mesh, axis=0 -> recv [4*d0, d1]
+    >>> all_gather(A_local, R_local, direction="horizontal", axis=0)
+    >>> # send [d0, d1], 4-col mesh, axis=-1 -> recv [d0, 4*d1]
+    >>> all_gather(A_local, R_local, direction="horizontal", axis=-1)
     """
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
 
@@ -317,7 +338,24 @@ def all_gather(
     elif direction.lower() in ["all", "a"]:
         recv_num = mesh_shape["nrow"] * mesh_shape["ncol"]
 
-    expected_recv_shape = [recv_num] + list(send_buffer.shape)
+    # Sentinel -1 in the wire format means "no axis specified" (legacy
+    # new-leading-axis semantics). User-facing axis is normalized to a
+    # non-negative index before being forwarded.
+    if axis is None:
+        axis_arg = -1
+        expected_recv_shape = [recv_num] + list(send_buffer.shape)
+    else:
+        ndim = len(send_buffer.shape)
+        assert isinstance(axis, int) and -ndim <= axis < ndim, f"axis {axis} out of range for send buffer with {ndim} dimensions."
+        normalized_axis = axis if axis >= 0 else axis + ndim
+        assert normalized_axis == 0 or normalized_axis == ndim - 1, (
+            f"Only axis=0 or axis=-1 (last dim) are currently supported, got axis={axis} "
+            f"(normalized to {normalized_axis}) for {ndim}-D send buffer."
+        )
+        axis_arg = normalized_axis
+        expected_recv_shape = list(send_buffer.shape)
+        expected_recv_shape[normalized_axis] = recv_num * send_buffer.shape[normalized_axis]
+
     assert list(recv_buffer.shape) == expected_recv_shape, (
         f"Receive buffer shape must be {expected_recv_shape} to hold gathered data from {recv_num} cores, but got {recv_buffer.shape}."
     )
@@ -328,6 +366,8 @@ def all_gather(
         send_elements *= dim
     assert size <= send_elements, f"size {size} exceeds send buffer size {send_elements}."
 
+    assert isinstance(src_offset_byte, int) and src_offset_byte >= 0, "src_offset_byte must be a non-negative integer."
+
     send_buffer_region = to_buffer_region(send_buffer)
     recv_buffer_region = to_buffer_region(recv_buffer)
 
@@ -336,8 +376,10 @@ def all_gather(
         recv_buffer_region,
         DIRECTION_MAP[direction.lower()],
         size,
+        axis_arg,
     )
-    return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_allgather"), *args)
+    ann = {ATTR_SRC_OFFSET_BYTE: src_offset_byte} if src_offset_byte != 0 else None
+    return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_allgather"), *args, annotations=ann)
 
 
 def all_reduce(

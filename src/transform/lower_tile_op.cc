@@ -921,6 +921,22 @@ private:
       return workspace.access_ptr(2); // write
     };
 
+    // Lets a tile op's Lower() adopt a scratch buffer it introduced (e.g. a
+    // Sunmmio staging buffer): record its layout so it reaches the layout
+    // annotation, and allocate it in the enclosing block (alongside workspaces)
+    // so the buffer lives outside any pipelined loop and can be
+    // double-buffered.
+    RegisterScratchBufferCallback register_scratch = [this](Buffer buffer,
+                                                            Layout layout) {
+      layout_map_.Set(buffer, layout);
+      // A stack entry is pushed for every block being visited; with no entry
+      // there is no enclosing block to allocate the buffer in.
+      ICHECK(!workspace_stack_.empty())
+          << "RegisterScratchBuffer for " << buffer->name
+          << " called outside any block; the buffer would never be allocated.";
+      workspace_stack_.back().push_back(buffer);
+    };
+
     Range thread_bounds;
 
     if (analyzer_->const_int_bound.IsBound(thread_var_->var)) {
@@ -944,7 +960,7 @@ private:
     auto lowered = tile_op->Lower(
         LowerArgs{target_, thread_bounds, thread_var_->var, callback,
                   layout_map_, buffer_remap_, let_var_to_expr,
-                  global_layout_map_, tileview_map_},
+                  global_layout_map_, tileview_map_, register_scratch},
         analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }

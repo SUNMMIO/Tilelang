@@ -20,24 +20,20 @@ namespace tl {
 namespace {
 
 SunmmioTileProcessorConfig MakeSunmmioA4EConfig() {
-  return {/*register_bits=*/4096, /*block_height=*/32, /*block_width=*/32,
-          /*rsram_align_bytes=*/64};
+  return {/*register_bits=*/4096,
+          /*block_height=*/32,
+          /*block_width=*/32,
+          /*rsram_align_bytes=*/64,
+          /*asram_bank_stripe_bytes=*/1024,
+          /*bf16_gemm_single_pass_max_rows=*/16};
 }
 
 ffi::Array<PrimExpr> MakeSunmmioA4EBlockShape(DataType dtype) {
-  // A4E block shape depends on element bit-width:
-  //   fp32/bf16/fp16 (>=16-bit) → (32, 32)   -- includes accumulator dtype
-  //   fp8            (8-bit)    → (32, 64)
-  //   fp4            (4-bit)    → (32, 128)
-  int bits = dtype.bits();
-  int width = 32;
-  if (bits <= 4) {
-    width = 128;
-  } else if (bits <= 8) {
-    width = 64;
-  }
+  // A4E uses a (32, 32) block for every element dtype so that buffers of
+  // different dtypes share the same tile shapes in elements.
+  (void)dtype;
   return {tir::make_const(DataType::Int(32), 32),
-          tir::make_const(DataType::Int(32), width)};
+          tir::make_const(DataType::Int(32), 32)};
 }
 
 SunmmioMeshConfig MakeSunmmioA4EMeshConfig() {
@@ -188,6 +184,13 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def("tl.target.GetSunmmioLayoutBlockShape",
                         static_cast<ffi::Array<PrimExpr> (*)(Target, DataType)>(
                             GetSunmmioLayoutBlockShape));
+  // Expose annotation-key constants used by the Sunmmio bf16 GEMM legalization
+  // pass so the Python frontend can refer to the same string without
+  // duplicating the literal.
+  refl::GlobalDef().def("tl.target.GetAttrSrcOffsetByte",
+                        []() { return tvm::ffi::String(kAttrSrcOffsetByte); });
+  refl::GlobalDef().def("tl.target.GetFieldAccOffsetByte",
+                        []() { return tvm::ffi::String(kFieldAccOffsetByte); });
 }
 
 } // namespace tl

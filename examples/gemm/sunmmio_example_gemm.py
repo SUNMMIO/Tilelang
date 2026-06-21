@@ -3,7 +3,7 @@ from tilelang.layout import make_zz_layout
 from tilelang.carver.arch import driver
 
 
-def matmul_persistent(M, N, K, block_M, block_N, block_K, num_stages, dtype=T.float16, accum_dtype=T.float32):
+def matmul_persistent(M, N, K, block_M, block_N, block_K, num_stages, dtype=T.bfloat16, accum_dtype=T.float32):
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
@@ -28,15 +28,23 @@ def matmul_persistent(M, N, K, block_M, block_N, block_K, num_stages, dtype=T.fl
             B_shared_dist = T.alloc_shared((block_K * nrows, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
-            for bx, by in T.Persistent(T.ceildiv(sharded_M, block_M), T.ceildiv(sharded_N, block_N)):
-                T.clear(C_shared)
-                for k in T.Pipelined(T.ceildiv(sharded_K, block_K), num_stages=num_stages):
-                    T.copy(A[bx * block_M, k * block_K], A_shared)
-                    T.comm.all_gather(A_shared, A_shared_dist, group="col")
-                    T.copy(B[k * block_K, by * block_N], B_shared)
-                    T.comm.all_gather(B_shared, B_shared_dist, group="row")
-                    T.gemm(A_shared, B_shared, C_shared)
+            # Each core iterates its own sharded tile grid with plain nested
+            # loops. The MeshTensor sharding already distributes A/B/C across
+            # the core mesh, so no persistent core-distribution loop is used.
+            for bx in T.serial(T.ceildiv(sharded_M, block_M)):
+                for by in T.serial(T.ceildiv(sharded_N, block_N)):
+                    T.clear(C_shared)
+                    for k in T.Pipelined(T.ceildiv(sharded_K, block_K), num_stages=num_stages):
+                        # Stage each A/B tile into a shared buffer, then
+                        # all-gather it across the core row / column.
+                        # all_gather needs a Buffer source (not an indexed
+                        # element) and an explicit concat axis.
+                        T.copy(A[bx * block_M, k * block_K], A_shared)
+                        T.comm.all_gather(A_shared, A_shared_dist, direction="horizontal", axis=-1)
+                        T.copy(B[k * block_K, by * block_N], B_shared)
+                        T.comm.all_gather(B_shared, B_shared_dist, direction="vertical", axis=0)
+                        T.gemm(A_shared_dist, B_shared_dist, C_shared)
 
-                T.copy(C_shared, C[bx * block_M, by * block_N])
+                    T.copy(C_shared, C[bx * block_M, by * block_N])
 
     return main

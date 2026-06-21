@@ -6,6 +6,7 @@
 #ifndef TVM_TL_OP_COPY_H_
 #define TVM_TL_OP_COPY_H_
 
+#include "../target/sunmmio_utils.h"
 #include "operator.h"
 #include "parallel.h"
 
@@ -129,6 +130,10 @@ public:
   //   - attr::kParallelLoopLayout ("parallel_loop_layout"): Fragment, loop
   //     layout hint applied to the outermost generated parallel loop of this
   //     copy's SIMT loop nest.
+  //   - kAttrSrcOffsetByte ("src_offset_byte"): IntImm, byte offset added to
+  //     the source pointer at codegen. Set by the Sunmmio bf16 GEMM
+  //     legalization pass to re-stage south-bound A data into a destination
+  //     buffer's north bank.
 
   mutable ParallelOp par_op_; // Optional associated parallelization operator
 
@@ -161,6 +166,15 @@ public:
       }
     }
     return 0; // default: evict_normal
+  }
+
+  int GetSrcOffsetByte() const {
+    if (auto val = annotations.Get(kAttrSrcOffsetByte)) {
+      if (auto int_val = val->as<IntImmNode>()) {
+        return int_val->value;
+      }
+    }
+    return 0;
   }
 
   /*!
@@ -279,12 +293,21 @@ protected:
   Stmt LowerNormalCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
 
   /*!
-   * \brief Generate lowering for SUNMMIO DMA copy.
+   * \brief Lower a SUNMMIO DMA copy by dispatching on the (src, dst) scope
+   * pair.
    *
-   * Emits a tl.dma_copy(src_region, dst_region) intrinsic that preserves full
-   * buffer region semantics for later SUNMMIO codegen consumption.
+   * DRAM<->RSRAM is layout-aware (LowerSunmmioDramRsramCopy); DRAM->WSRAM and
+   * RSRAM->ASRAM/WSRAM are plain tl.dma_copy transfers.
    */
   Stmt LowerSunmmioDmaCopy(const LowerArgs &T, arith::Analyzer *analyzer) const;
+
+  /*!
+   * \brief Lower a DRAM<->RSRAM copy, bridging a layout mismatch via a staged
+   * RSRAM buffer plus a tl.sunmmio_layout_transform. Falls back to a plain
+   * tl.dma_copy when the two layouts already match.
+   */
+  Stmt LowerSunmmioDramRsramCopy(const LowerArgs &T,
+                                 arith::Analyzer *analyzer) const;
 
   /*!
    * \brief Generate lowering for SUNMMIO Tile-based copy.

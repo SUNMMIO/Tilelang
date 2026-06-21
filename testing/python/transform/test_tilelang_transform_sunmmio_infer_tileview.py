@@ -395,7 +395,7 @@ def test_infer_tileview_mixed_rank_store_still_rejected(dtype):
         tvm.target.Target(target),
         pytest.raises(
             tvm.error.InternalError,
-            match="per-access feasible tileview sets do not intersect",
+            match="Implicit reduction in T.Tiles is not supported.",
         ),
     ):
         apply_sunmmio_passes(mod, target)

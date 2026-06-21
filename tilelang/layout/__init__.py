@@ -25,6 +25,7 @@ from .cute_layout import (
 )
 from .sunmmio_layouts import (
     make_row_major,  # noqa: F401
+    make_aligned_row_major,  # noqa: F401
     make_zz_layout,  # noqa: F401
     make_zn_layout,  # noqa: F401
     make_zzz_layout,  # noqa: F401

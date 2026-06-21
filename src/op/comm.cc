@@ -78,6 +78,21 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
   bool src_has = T.layout_map.count(src);
   bool dst_has = T.layout_map.count(dst);
 
+  // ZN WSRAM dst: its src is staged as ZZ (the transfer does ZZ->ZN), so infer
+  // ZZ for src. dst is already determined (ZN from GEMM); propose nothing for
+  // it.
+  if (dst_has && dst.scope() == kSunmmioScopeWSRAM &&
+      !sunmmio::IsZZLike(T.layout_map[dst])) {
+    int rank = static_cast<int>(src->shape.size());
+    if (IsSunmmioSramScope(src.scope()) && rank >= 2) {
+      Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
+      result.Set(src, sunmmio::MakeZZ(
+                          src->shape, axes,
+                          GetSunmmioLayoutBlockShape(T.target, src->dtype)));
+    }
+    return result;
+  }
+
   // Propagate: derive layout for each side from the other.
   if (src_has) {
     auto derived = DeriveLayoutLike(T.layout_map[src], dst->shape);
@@ -111,9 +126,12 @@ BroadcastOp::BroadcastOp(Array<PrimExpr> args,
   std::tie(node->src, node->dst) = std::tie(bf[0], bf[1]);
   std::tie(node->src_range, node->dst_range) = std::tie(rgs[0], rgs[1]);
   node->size = Downcast<IntImm>(args[2]);
-  node->dst_offset = Downcast<IntImm>(args[3]);
-  node->src_core = args[4];
-  node->direction = Downcast<IntImm>(args[5])->value;
+  node->src_core = args[3];
+  node->direction = Downcast<IntImm>(args[4])->value;
+  // Optional trailing positional arg; default 0.
+  if (args.size() > 5) {
+    node->srcOffsetByte_ = Downcast<IntImm>(args[5])->value;
+  }
   data_ = std::move(node);
 }
 
@@ -134,6 +152,16 @@ LayoutMap BroadcastOpNode::InferLayout(const LayoutInferArgs &T,
   args.push_back(dst_expr);
   Copy copy_op = Copy(args);
   return copy_op->InferLayout(T, level);
+}
+
+// Builds the fixed positional prefix of a broadcast_() call, in the layout
+// declared by BroadcastArg (comm.h). Callers append trailing core-mask
+// indices (kBroadcastArgMaskBegin onward) as needed.
+Array<PrimExpr> MakeBroadcastArgs(PrimExpr src_region, PrimExpr dst_region,
+                                  PrimExpr size, PrimExpr src_core,
+                                  PrimExpr direction,
+                                  PrimExpr src_offset_byte) {
+  return {src_region, dst_region, size, src_core, direction, src_offset_byte};
 }
 
 Stmt BroadcastOpNode::Lower(const LowerArgs &T,
@@ -171,7 +199,7 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
       << "Broadcast size larger than data size: " << size->value << " vs "
       << Downcast<IntImm>(src_elements)->value;
 
-  // check for size and dst_offset
+  // check for size
   PrimExpr broadcast_elements;
   if (size->value < 0) {
     broadcast_elements = src_elements;
@@ -183,11 +211,11 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
       << "Broadcast size Larger than source buffer size: "
       << (Downcast<IntImm>(broadcast_elements)->value) << " vs "
       << Downcast<IntImm>(src_elements)->value;
-  ICHECK((Downcast<IntImm>(broadcast_elements)->value + dst_offset->value) <=
+  ICHECK((Downcast<IntImm>(broadcast_elements)->value) <=
          Downcast<IntImm>(dst_elements)->value)
-      << "Broadcast size + dst_offset larger than destination buffer size: "
-      << (Downcast<IntImm>(broadcast_elements)->value + dst_offset->value)
-      << " vs " << Downcast<IntImm>(dst_elements)->value;
+      << "Broadcast size larger than destination buffer size: "
+      << (Downcast<IntImm>(broadcast_elements)->value) << " vs "
+      << Downcast<IntImm>(dst_elements)->value;
 
   // check for valid direction
   if (direction != 0 and direction != 1 and direction != 2) {
@@ -195,20 +223,17 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
                << ", must be 0 (horizontal) or 1 (vertical) or 2 (all).";
   }
 
-  // all checks passed, generate the call
-  PrimExpr src_addr = src.access_ptr(1, DataType::Handle(), 1, 0, src_elements);
-  PrimExpr dst_addr =
-      dst.access_ptr(2, DataType::Handle(), 1,
-                     Downcast<IntImm>(dst_offset->value), src_elements);
-
+  // all checks passed, generate the call. srcOffsetByte_ is appended as the
+  // final positional arg of every broadcast_() emitted by this BroadcastOp,
+  // so codegen reads it from a stable call-arg slot — no AttrStmt wrapper.
+  PrimExpr src_offset_imm = IntImm(DataType::Int(32), srcOffsetByte_);
   if (direction == 0 or direction == 1) {
     // 1D broadcast
-    Array<PrimExpr> args;
-    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args.push_back(Downcast<IntImm>(broadcast_elements));
-    args.push_back(src_core);
-    args.push_back(direction);
+    Array<PrimExpr> args =
+        MakeBroadcastArgs(MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                          Downcast<IntImm>(broadcast_elements), src_core,
+                          direction, src_offset_imm);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return broadcast;
   } else {
@@ -220,22 +245,20 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
 
     Array<Stmt> seq;
     // vertical broadcast
-    Array<PrimExpr> args;
-    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args.push_back(Downcast<IntImm>(broadcast_elements));
-    args.push_back(src_core);
-    args.push_back(1); // direction: vertical
+    Array<PrimExpr> args =
+        MakeBroadcastArgs(MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                          Downcast<IntImm>(broadcast_elements), src_core,
+                          /*direction=*/1, src_offset_imm);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     seq.push_back(broadcast);
     // horizontal broadcast
     for (int i = 0; i < mesh_nrow; i++) {
-      Array<PrimExpr> args;
-      args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/1));
-      args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-      args.push_back(Downcast<IntImm>(broadcast_elements));
-      args.push_back(int(i * mesh_ncol) + src_core_col);
-      args.push_back(0); // direction: horizontal
+      Array<PrimExpr> args = MakeBroadcastArgs(
+          MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
+          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+          Downcast<IntImm>(broadcast_elements),
+          int(i * mesh_ncol) + src_core_col, /*direction=*/0, src_offset_imm);
       Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
       seq.push_back(broadcast);
     }
@@ -244,7 +267,7 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
 }
 
 TIR_REGISTER_TL_TILE_OP(BroadcastOp, comm_broadcast)
-    .set_num_inputs(6)
+    .set_num_inputs(5)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
@@ -359,13 +382,13 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   int dst_core_col = dst_core_val % mesh_ncol;
 
   if (src_core_row == dst_core_row) {
-    // 1D put via horizontal communication
-    Array<PrimExpr> args;
-    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args.push_back(Downcast<IntImm>(broadcast_elements));
-    args.push_back(src_core);
-    args.push_back(0); // direction: horizontal
+    // 1D put via horizontal communication. PutOp does not use
+    // src_offset_byte, so it passes 0 in that slot; masks follow.
+    Array<PrimExpr> args = MakeBroadcastArgs(
+        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/0,
+        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
     for (int j = 0; j < mesh_ncol; j++) {
       if (j != dst_core_col) {
         args.push_back(IntImm(DataType::Int(32),
@@ -375,13 +398,12 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     Stmt put = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return put;
   } else if (src_core_col == dst_core_col) {
-    // 1D put via vertical communication
-    Array<PrimExpr> args;
-    args.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args.push_back(Downcast<IntImm>(broadcast_elements));
-    args.push_back(src_core);
-    args.push_back(1); // direction: vertical
+    // 1D put via vertical communication.
+    Array<PrimExpr> args = MakeBroadcastArgs(
+        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/1,
+        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
     for (int i = 0; i < mesh_nrow; i++) {
       if (i != dst_core_row) {
         args.push_back(IntImm(DataType::Int(32),
@@ -394,12 +416,11 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     Array<Stmt> seq;
     // vertical transfer from src core to intermediate core
     int intermediate_core_id = dst_core_row * mesh_ncol + src_core_col;
-    Array<PrimExpr> args1;
-    args1.push_back(MakeRegionExpr(src, src_range, /*access_mask=*/1));
-    args1.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args1.push_back(Downcast<IntImm>(broadcast_elements));
-    args1.push_back(src_core);
-    args1.push_back(1); // direction: vertical
+    Array<PrimExpr> args1 = MakeBroadcastArgs(
+        MakeRegionExpr(src, src_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        Downcast<IntImm>(broadcast_elements), src_core, /*direction=*/1,
+        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
     for (int i = 0; i < mesh_nrow; i++) {
       if (i != dst_core_row) {
         args1.push_back(IntImm(DataType::Int(32),
@@ -409,12 +430,12 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     Stmt put1 = Evaluate(Call(DataType::Handle(), broadcast_(), args1));
     seq.push_back(put1);
     // horizontal transfer from intermediate core to dst core
-    Array<PrimExpr> args2;
-    args2.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/1));
-    args2.push_back(MakeRegionExpr(dst, dst_range, /*access_mask=*/2));
-    args2.push_back(Downcast<IntImm>(broadcast_elements));
-    args2.push_back(IntImm(DataType::Int(32), intermediate_core_id));
-    args2.push_back(0); // direction: horizontal
+    Array<PrimExpr> args2 = MakeBroadcastArgs(
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
+        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+        Downcast<IntImm>(broadcast_elements),
+        IntImm(DataType::Int(32), intermediate_core_id), /*direction=*/0,
+        /*src_offset_byte=*/IntImm(DataType::Int(32), 0));
     for (int j = 0; j < mesh_ncol; j++) {
       if (j != dst_core_col) {
         args2.push_back(IntImm(DataType::Int(32),
@@ -439,6 +460,9 @@ AllgatherOp::AllgatherOp(Array<PrimExpr> args,
   node->recv = args[1];
   node->direction = Downcast<IntImm>(args[2])->value;
   node->size = Downcast<IntImm>(args[3]);
+  // axis is optional for backwards compatibility: -1 = legacy mode.
+  node->axis = (args.size() > 4) ? Downcast<IntImm>(args[4])->value : -1;
+  node->annotations = annotations;
   data_ = std::move(node);
 }
 
@@ -567,130 +591,129 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
       << (Downcast<IntImm>(send_elements)->value * recv_num) << ", but got "
       << Downcast<IntImm>(recv_elements)->value;
 
-  // all checks passed, generate the calls
+  // Unified lowering for all axis modes. Every per-core contribution lands
+  // in an equal-size slot along a single axis of recv ("slice_axis"). Slot
+  // offset is encoded in the region's `min`, not in a separate offset arg.
+  //
+  //   axis == -1 (sentinel, "no axis") or axis == 0 -> slice_axis = 0
+  //     legacy recv [K, d0, ...]:        slot_extent = 1
+  //     axis=0 recv [K*d0, d1, ...]:     slot_extent = d0
+  //   axis > 0 (last dim of send)        -> slice_axis = recv_rank - 1
+  //     axis=-1 recv [d0, ..., K*dn-1]:  slot_extent = dn-1
+  Buffer send_buffer = send_region->buffer;
+  Buffer recv_buffer = recv_region->buffer;
+  int recv_rank = static_cast<int>(recv_range.size());
+  ICHECK_GT(recv_rank, 0) << "Allgather recv must have at least one dim.";
+  if (axis > 0) {
+    ICHECK_EQ(axis, static_cast<int>(send_range.size()) - 1)
+        << "Only axis = last dim of send is supported; got axis=" << axis
+        << " for send rank=" << send_range.size();
+    ICHECK_EQ(recv_range.size(), send_range.size())
+        << "In axis mode, recv and send must have the same rank.";
+  }
+  int slice_axis = (axis > 0) ? (recv_rank - 1) : 0;
+  ICHECK(analyzer->CanProve(FloorMod(recv_range[slice_axis]->extent,
+                                     IntImm(DataType::Int(32), recv_num)) == 0))
+      << "Recv extent along slice axis " << slice_axis << " ("
+      << recv_range[slice_axis]->extent << ") must be divisible by recv_num ("
+      << recv_num << ").";
+  PrimExpr slot_extent_p1 = analyzer->Simplify(FloorDiv(
+      recv_range[slice_axis]->extent, IntImm(DataType::Int(32), recv_num)));
+  IntImm bcast_size_imm =
+      (size->value < 0) ? Downcast<IntImm>(send_elements) : size;
+
+  // Build a sub-region of recv spanning a single slab of width `slot_extent`
+  // along `slice_axis`, starting at slot index `slot_start`. All other dims
+  // pass through `recv_range` unchanged.
+  auto make_slab = [&](int slot_start, PrimExpr slot_extent) {
+    Array<Range> ranges;
+    for (int d = 0; d < recv_rank; d++) {
+      if (d == slice_axis) {
+        PrimExpr base = analyzer->Simplify(
+            recv_range[d]->min +
+            IntImm(DataType::Int(32), slot_start) * slot_extent);
+        ranges.push_back(Range::FromMinExtent(base, slot_extent));
+      } else {
+        ranges.push_back(recv_range[d]);
+      }
+    }
+    return ranges;
+  };
+
   Array<Stmt> bcast_stmts;
+
+  // Propagate src_offset_byte (read from this op's annotations) into each
+  // BroadcastOp we construct, so it lands as the final positional arg of
+  // every emitted broadcast_() call. No AttrStmt wrapping needed.
+  int src_offset_byte = GetSrcOffsetByte();
+  PrimExpr src_offset_imm = IntImm(DataType::Int(32), src_offset_byte);
+
+  auto emit = [&](Array<Range> dst_ranges, IntImm bcast_elems, int src_core_id,
+                  int bcast_dir, bool src_from_send) {
+    Array<PrimExpr> args;
+    if (src_from_send) {
+      args.push_back(MakeRegionExpr(send_buffer, send_range, /*mask=*/1));
+    } else {
+      args.push_back(MakeRegionExpr(recv_buffer, dst_ranges, /*mask=*/1));
+    }
+    args.push_back(MakeRegionExpr(recv_buffer, dst_ranges, /*mask=*/2));
+    args.push_back(bcast_elems);
+    args.push_back(IntImm(DataType::Int(32), src_core_id));
+    args.push_back(IntImm(DataType::Int(32), bcast_dir));
+    args.push_back(src_offset_imm);
+    BroadcastOp bcast(args);
+    bcast_stmts.push_back(bcast->Lower(T, analyzer));
+  };
 
   if (direction == 0) { // horizontal
     for (int i = 0; i < mesh_nrow; i++) {
-      for (size_t j = 0; j < mesh_ncol; j++) {
-        Array<PrimExpr> args;
-        args.push_back(send);
-        args.push_back(recv);
-        args.push_back(size);
-        args.push_back(IntImm(DataType::Int(32), j) * send_elements); // offset
-        args.push_back(
-            IntImm(DataType::Int(32), i * mesh_ncol + j)); // src_core
-        args.push_back(0); // direction: horizontal
-        BroadcastOp bcast = BroadcastOp(args);
-        Stmt bcast_stmt = bcast->Lower(T, analyzer);
-        bcast_stmts.push_back(bcast_stmt);
+      for (int j = 0; j < mesh_ncol; j++) {
+        emit(make_slab(/*slot_start=*/j, slot_extent_p1), bcast_size_imm,
+             /*src_core=*/i * mesh_ncol + j, /*bcast_dir=*/0,
+             /*src_from_send=*/true);
       }
     }
   } else if (direction == 1) { // vertical
     for (int j = 0; j < mesh_ncol; j++) {
-      for (size_t i = 0; i < mesh_nrow; i++) {
-        Array<PrimExpr> args;
-        args.push_back(send);
-        args.push_back(recv);
-        args.push_back(size);
-        args.push_back(IntImm(DataType::Int(32), i) * send_elements); // offset
-        args.push_back(
-            IntImm(DataType::Int(32), i * mesh_ncol + j)); // src_core
-        args.push_back(1); // direction: vertical
-        BroadcastOp bcast = BroadcastOp(args);
-        Stmt bcast_stmt = bcast->Lower(T, analyzer);
-        bcast_stmts.push_back(bcast_stmt);
+      for (int i = 0; i < mesh_nrow; i++) {
+        emit(make_slab(/*slot_start=*/i, slot_extent_p1), bcast_size_imm,
+             /*src_core=*/i * mesh_ncol + j, /*bcast_dir=*/1,
+             /*src_from_send=*/true);
       }
     }
-  } else if (direction == 2) { // all
-    // first do horizontal allgather
+  } else { // direction == 2 ("all")
+    // Phase 1: horizontal. Core (i,j) lands at slot (i*ncol + j).
     for (int i = 0; i < mesh_nrow; i++) {
-      for (size_t j = 0; j < mesh_ncol; j++) {
-        Array<PrimExpr> args;
-        args.push_back(send);
-        args.push_back(recv);
-        args.push_back(size);
-        args.push_back(IntImm(DataType::Int(32), i * mesh_ncol + j) *
-                       send_elements); // offset
-        args.push_back(
-            IntImm(DataType::Int(32), i * mesh_ncol + j)); // src_core
-        args.push_back(0); // direction: horizontal
-        BroadcastOp bcast = BroadcastOp(args);
-        Stmt bcast_stmt = bcast->Lower(T, analyzer);
-        bcast_stmts.push_back(bcast_stmt);
+      for (int j = 0; j < mesh_ncol; j++) {
+        emit(make_slab(/*slot_start=*/i * mesh_ncol + j, slot_extent_p1),
+             bcast_size_imm,
+             /*src_core=*/i * mesh_ncol + j, /*bcast_dir=*/0,
+             /*src_from_send=*/true);
       }
     }
-    // then do vertical allgather
-    Buffer recv_buffer = recv_region->buffer;
-    int allgather_size =
-        (size->value < 0) ? Downcast<IntImm>(send_elements)->value * mesh_ncol
-                          : size->value * mesh_ncol;
-
-    // Try to slice along the first dimension to avoid flattening
-    // This produces cleaner TIR when the buffer shape is aligned with the mesh
-    bool use_flatten = true;
-    PrimExpr dim0_extent = 0;
-    PrimExpr stride0 = 1;
-
-    if (!recv_buffer->shape.empty()) {
-      for (size_t k = 1; k < recv_buffer->shape.size(); k++) {
-        stride0 *= recv_buffer->shape[k];
-      }
-      stride0 = analyzer->Simplify(stride0);
-
-      PrimExpr row_size = IntImm(DataType::Int(32), mesh_ncol) * send_elements;
-      if (analyzer->CanProve(FloorMod(row_size, stride0) == 0)) {
-        dim0_extent = analyzer->Simplify(FloorDiv(row_size, stride0));
-        use_flatten = false;
-      }
-    }
-
-    Buffer target_buffer = recv_buffer;
-    if (use_flatten && recv_buffer->shape.size() > 1) {
-      target_buffer =
-          Buffer(recv_buffer->data, recv_buffer->dtype, {recv_elements}, {1},
-                 recv_buffer->elem_offset, recv_buffer->name + "_flat",
-                 recv_buffer->data_alignment, recv_buffer->offset_factor,
-                 recv_buffer->buffer_type);
-    }
-
+    // Phase 2: vertical. Each row's mesh_ncol-wide gathered slab (rows
+    // i*ncol .. (i+1)*ncol of phase-1 slots) is broadcast to every row in
+    // each column.
+    PrimExpr row_extent = analyzer->Simplify(
+        IntImm(DataType::Int(32), mesh_ncol) * slot_extent_p1);
+    IntImm row_size_imm =
+        IntImm(DataType::Int(32), bcast_size_imm->value * mesh_ncol);
     for (int j = 0; j < mesh_ncol; j++) {
-      for (size_t i = 0; i < mesh_nrow; i++) {
-        Array<PrimExpr> args;
-        Array<Range> ranges;
-
-        if (use_flatten) {
-          PrimExpr offset =
-              IntImm(DataType::Int(32), i * mesh_ncol) * send_elements;
-          PrimExpr extent =
-              IntImm(DataType::Int(32), mesh_ncol) * send_elements;
-          ranges.push_back(Range::FromMinExtent(offset, extent));
-        } else {
-          // Slice along the first dimension
-          ranges.push_back(Range::FromMinExtent(
-              IntImm(DataType::Int(32), i) * dim0_extent, dim0_extent));
-          for (size_t k = 1; k < recv_buffer->shape.size(); k++) {
-            ranges.push_back(Range::FromMinExtent(0, recv_buffer->shape[k]));
-          }
-        }
-
-        args.push_back(MakeRegionExpr(target_buffer, ranges, 1));
-        args.push_back(MakeRegionExpr(target_buffer, ranges, 2));
-        args.push_back(IntImm(DataType::Int(32), allgather_size)); // size
-        args.push_back(
-            IntImm(DataType::Int(32), i * mesh_ncol + j)); // src_core
-        args.push_back(1); // direction: vertical
-        Stmt bcast_stmt =
-            Evaluate(Call(DataType::Handle(), broadcast_(), args));
-        bcast_stmts.push_back(bcast_stmt);
+      for (int i = 0; i < mesh_nrow; i++) {
+        // slab index `i` covers slots [i*ncol .. (i+1)*ncol) of phase 1;
+        // offset along slice_axis is i * row_extent = i*ncol * slot_extent_p1.
+        emit(make_slab(/*slot_index=*/i, row_extent), row_size_imm,
+             /*src_core=*/i * mesh_ncol + j, /*bcast_dir=*/1,
+             /*src_from_send=*/false);
       }
     }
   }
+
   return SeqStmt::Flatten(bcast_stmts);
 }
 
 TIR_REGISTER_TL_TILE_OP(AllgatherOp, comm_allgather)
-    .set_num_inputs(4)
+    .set_num_inputs(5)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
