@@ -135,6 +135,34 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
     tilelang.analysis.FragmentLoopChecker()(mod)
 
 
+def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
+    mod = tir.transform.BindTarget(target)(mod)
+    if should_force_let_inline():
+        mod = tilelang.transform.LetInline()(mod)
+
+    mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+    mod = tilelang.transform.InjectAssumes()(mod)
+    mod = tilelang.transform.Simplify()(mod)
+
+    mod = tilelang.transform.InferSramScope()(mod)
+    mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
+    mod = tilelang.transform.SunmmioLayoutInference()(mod)
+    mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
+
+    LayoutVisual(mod)
+    mod = tilelang.transform.LowerTileOp()(mod)
+    mod = tilelang.transform.LegalizeTilesLoop()(mod)
+    mod = tilelang.transform.TilesLoop()(mod)
+    mod = tilelang.transform.SunmmioTileLoopFusion()(mod)
+
+    mod = tilelang.transform.LegalizeSafeMemoryAccess()(mod)
+    mod = tilelang.transform.LowerAccessPtr()(mod)
+    mod = tilelang.transform.Simplify()(mod)
+    mod = tilelang.transform.HoistNonRestrictParams()(mod)
+    mod = tilelang.transform.HoistBlockAnnotationsToFuncAttrs()(mod)
+    return mod
+
+
 def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # Bind the target device information to the module
     """
@@ -157,6 +185,9 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     Returns:
         IRModule: The transformed module, ready for target-specific optimization passes.
     """
+    if target_is_sunmmio(target):
+        return LowerAndLegalizeSunmmio(mod, target)
+
     mod = tir.transform.BindTarget(target)(mod)
     if should_force_let_inline():
         # Force-let inline whenever the pass config requests it.
@@ -172,22 +203,10 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.InjectAssumes()(mod)
     # Simplify the IR expressions
     mod = tilelang.transform.Simplify()(mod)
-    if target_is_sunmmio(target):
-        # Infer Sunmmio shared memory SRAM scope
-        mod = tilelang.transform.InferSramScope()(mod)
-        # Stage unsupported Sunmmio global->asram datapaths before layout inference and tile-op lowering
-        mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
-        # Infer memory layouts — target-conditional
-        # Sunmmio: standalone layout inference (CuteLayout, no Fragment/thread)
-        mod = tilelang.transform.LayoutReducer()(mod)
-        mod = tilelang.transform.SunmmioLayoutInference()(mod)
-        # Legalize Sunmmio Bf16 Gemm
-        mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
-    else:
-        # Infer memory layouts — target-conditional
-        mod = tilelang.transform.LayoutReducer()(mod)
-        # CUDA/ROCm/Metal: Fragment-based layout inference
-        mod = tilelang.transform.LayoutInference()(mod)
+    # Infer memory layouts — target-conditional
+    mod = tilelang.transform.LayoutReducer()(mod)
+    # CUDA/ROCm/Metal: Fragment-based layout inference
+    mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout
     LayoutVisual(mod)
     # Lower high-level tile operations to low-level operations
@@ -215,7 +234,43 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     return mod
 
 
+def OptimizeForSunmmio(mod: IRModule, target: Target) -> IRModule:
+    mod = tilelang.transform.IfStmtBinding()(mod)
+    mod = tilelang.transform.SunmmioPipelinePlanning(debug=False)(mod)
+    mod = tilelang.transform.InjectSunmmioPipeline()(mod)
+
+    mod = tilelang.transform.LowerOpaqueBlock()(mod)
+    mod = tilelang.transform.Simplify()(mod)
+    mod = tir.transform.NarrowDataType(32)(mod)
+    mod = tilelang.transform.ConfigIndexBitwidth()(mod)
+    mod = tir.transform.Simplify()(mod)
+
+    mod = tilelang.transform.LoopUnswitching()(mod)
+    mod = tir.transform.UnrollLoop()(mod)
+    mod = tir.transform.RenormalizeSplitPattern()(mod)
+    mod = tir.transform.Simplify()(mod)
+    mod = tir.transform.RemoveNoOp()(mod)
+    mod = tir.transform.HoistIfThenElse()(mod)
+
+    mod = tir.transform.VerifyMemory()(mod)
+    mod = tir.transform.AnnotateEntryFunc()(mod)
+    mod = tilelang.transform.AnnotateDeviceRegions()(mod)
+    mod = tilelang.transform.SplitHostDevice()(mod)
+    mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
+
+    mod = tilelang.transform.MergeIfStmt()(mod)
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+
+    mod = tilelang.transform.MakePackedAPI()(mod)
+    mod = tilelang.transform.Simplify()(mod)
+    mod = tilelang.transform.LowerDeviceKernelLaunch()(mod)
+    return mod
+
+
 def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
+    if target_is_sunmmio(target):
+        return OptimizeForSunmmio(mod, target)
+
     pass_ctx = tilelang.transform.get_pass_context()
     # Lower the shared.barrier into specific initialization slot
     mod = tilelang.transform.LowerSharedBarrier()(mod)
@@ -236,17 +291,6 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.LowerOpaqueBlock()(mod)
         if is_hopper(target):
             mod = tilelang.transform.RewriteWgmmaSync()(mod)
-    elif target_is_sunmmio(target):
-        # sunmmio target support dma
-        mod = tilelang.transform.IfStmtBinding()(mod)
-        mod = tilelang.transform.MultiVersionBuffer()(mod)
-        print("Before InjectSunmmioSynchronization...\n", mod)
-        mod = tilelang.transform.InjectSunmmioSync()(mod)
-        print("After InjectSunmmioSynchronization...\n", mod)
-
-        mod = tilelang.transform.PipelinePlanning()(mod)
-        mod = tilelang.transform.InjectSoftwarePipeline()(mod)
-        mod = tilelang.transform.MergeIfStmt()(mod)
     else:
         mod = tilelang.transform.IfStmtBinding()(mod)
         mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
@@ -299,10 +343,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     # MergeSharedMemoryAllocations must be applied after SplitHostDevice
     # because the merged allocation site is at the beginning of each device function
     enable_aggressive_merge = should_enable_aggressive_merge(pass_ctx=pass_ctx, target=target)
-    if target_is_sunmmio(target):
-        mod = tilelang.transform.MergeSharedMemoryAllocationsSunmmio(enable_aggressive_merge=enable_aggressive_merge)(mod)
-    else:
-        mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
+    mod = tilelang.transform.MergeSharedMemoryAllocations(enable_aggressive_merge=enable_aggressive_merge)(mod)
     if allow_tma_and_warp_specialized(pass_ctx=pass_ctx, target=target):
         mod = tilelang.transform.InjectFenceProxy()(mod)
     else:
