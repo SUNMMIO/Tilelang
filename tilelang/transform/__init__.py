@@ -92,15 +92,15 @@ def ResolveSunmmioMeshSymbols():
     return _ffi_api.ResolveSunmmioMeshSymbols()  # type: ignore
 
 
-def ValidateCopyTileView():
-    """ValidateCopyTileView
+def ValidateTileViewRegions():
+    """ValidateTileViewRegions
 
     Returns
     -------
     fpass : tvm.transform.Pass
         The result pass
     """
-    return _ffi_api.ValidateCopyTileView()  # type: ignore
+    return _ffi_api.ValidateTileViewRegions()  # type: ignore
 
 
 def LowerTileOp():

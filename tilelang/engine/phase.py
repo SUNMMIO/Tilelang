@@ -156,7 +156,7 @@ def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
     mod = tilelang.transform.SunmmioLayoutInference()(mod)
     mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
-    mod = tilelang.transform.ValidateCopyTileView()(mod)
+    mod = tilelang.transform.ValidateTileViewRegions()(mod)
 
     LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
