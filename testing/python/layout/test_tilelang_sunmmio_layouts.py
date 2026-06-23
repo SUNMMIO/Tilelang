@@ -33,6 +33,7 @@ def _eval(layout, *indices):
 
 _storage_size = tvm_ffi.get_global_func("tl.CuteLayout_storage_size")
 _covered_shape = tvm_ffi.get_global_func("tl.CuteLayout_covered_shape")
+_derive_layout_like = tvm_ffi.get_global_func("tl.DeriveLayoutLike")
 
 
 def _covered(layout):
@@ -212,6 +213,19 @@ def test_make_aligned_row_major_rank1_pads_extent():
     # is distinct from the plain [40] row-major, but a no-op once 32-aligned.
     assert not is_same_layout(make_aligned_row_major((40,), "float16", 64), make_row_major((40,)))
     assert is_same_layout(make_aligned_row_major((64,), "float16", 64), make_row_major((64,)))
+
+
+@pytest.mark.xfail(
+    reason="DeriveLayoutLike currently drops rank-1 aligned row-major covered extent padding.",
+    strict=True,
+)
+def test_derive_layout_like_preserves_rank1_aligned_row_major_padding():
+    aligned = make_aligned_row_major((1000,), "float16", 64)
+    derived = _derive_layout_like(aligned, _imms(1000), None)
+
+    assert _covered(aligned) == [1024]
+    assert _covered(derived) == [1024]
+    assert not is_same_layout(derived, make_row_major((1000,)))
 
 
 def test_make_aligned_row_major_storage_and_covered():

@@ -4,6 +4,7 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang.carver.arch import driver
+from tilelang.layout import make_zz_layout
 
 from compile_pipeline import target
 from sunmmio_codegen_validation_utils import (
@@ -42,15 +43,18 @@ def tile_elementwise_ops_test(
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
+    shard_policy = T.MeshShardingPolicy()
+    tensor_shape = (batch, m, n)
+    tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
     grid_b = T.ceildiv(batch, block_b)
     grid_m = T.ceildiv(m, block_m)
     grid_n = T.ceildiv(n, block_n)
 
     @T.prim_func
     def main(
-        A: T.Tensor((batch, m, n), dtype),
-        B: T.Tensor((batch, m, n), dtype),
-        C: T.Tensor((batch, m, n), dtype),
+        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
     ):
         with T.Kernel(ncores):
             A_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
@@ -124,14 +128,17 @@ def tile_elementwise_ops_2d_test(
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
+    shard_policy = T.MeshShardingPolicy()
+    tensor_shape = (m, n)
+    tensor_layout = make_zz_layout(tensor_shape, [0, 1], (32, 32))
     grid_m = T.ceildiv(m, block_m)
     grid_n = T.ceildiv(n, block_n)
 
     @T.prim_func
     def main(
-        A: T.Tensor((m, n), dtype),
-        B: T.Tensor((m, n), dtype),
-        C: T.Tensor((m, n), dtype),
+        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
     ):
         with T.Kernel(ncores):
             A_shared = T.alloc_shared((block_m, block_n), dtype)

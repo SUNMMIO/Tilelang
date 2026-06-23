@@ -660,21 +660,66 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
       Array<Var> finalize_dst_vars = map_dst_interior_vars(finalize_src_vars);
       Array<PrimExpr> finalize_dst_idx = get_dst_indices(finalize_dst_vars);
       Array<PrimExpr> finalize_res_idx = get_res_indices(finalize_dst_vars);
-      PrimExpr dst_val = BufferLoad(this->dst, finalize_dst_idx);
-      PrimExpr res_val = BufferLoad(dst_res_buf, finalize_res_idx);
-      PrimExpr update;
-      if (this->type->isSum() || this->type->isAbsSum()) {
-        update = dst_val + res_val;
-      } else if (this->type->isMax() || this->type->isAbsMax()) {
-        update = Max(dst_val, res_val);
-      } else if (this->type->isMin()) {
-        update = Min(dst_val, res_val);
-      } else {
-        LOG(FATAL) << "Unsupported reduce type for Sunmmio accumulation";
-      }
+      auto make_finalize_update = [&](const PrimExpr &dst_val,
+                                      const PrimExpr &res_val) {
+        PrimExpr update;
+        if (this->type->isSum() || this->type->isAbsSum()) {
+          update = dst_val + res_val;
+        } else if (this->type->isMax() || this->type->isAbsMax()) {
+          update = Max(dst_val, res_val);
+        } else if (this->type->isMin()) {
+          update = Min(dst_val, res_val);
+        } else {
+          LOG(FATAL) << "Unsupported reduce type for Sunmmio accumulation";
+        }
+        return update;
+      };
+      PrimExpr update =
+          make_finalize_update(BufferLoad(this->dst, finalize_dst_idx),
+                               BufferLoad(dst_res_buf, finalize_res_idx));
       Stmt add_res_stmt = BufferStore(this->dst, update, finalize_dst_idx);
-      add_res_stmt = wrap_interior(add_res_stmt, finalize_dst_vars,
-                                   dst_tile_shape, all_dst_axes);
+      if (dst_tile_shape.empty()) {
+        // Reducing a rank-1 tile into a scalar dst removes all surviving tile
+        // axes.  The scalar dst still lives in RSRAM and must be exposed to
+        // SunMMIO codegen as a tile operation so the aligned 1D bridge can
+        // perform the 64B read-modify-write.
+        ICHECK_EQ(dst_ndim, 1)
+            << "Sunmmio scalar reduce finalize expects a rank-1 destination "
+               "buffer region";
+        int aligned_elems = GetSunmmioRsramAlignmentElems(
+            GetSunmmioTileProcessorConfig(T.target).rsram_align_bytes,
+            this->dst->dtype);
+        ICHECK_GT(aligned_elems, 0)
+            << "Sunmmio scalar reduce finalize expects a positive RSRAM "
+               "alignment tile extent";
+        Var ki("ki");
+        Array<PrimExpr> scalar_dst_idx{this->dstRegion_->region[0]->min + ki};
+        PrimExpr scalar_update =
+            make_finalize_update(BufferLoad(this->dst, scalar_dst_idx),
+                                 BufferLoad(dst_res_buf, finalize_res_idx));
+        Stmt predicated_store =
+            BufferStore(this->dst, scalar_update, scalar_dst_idx, ki == 0);
+        Map<String, ObjectRef> interior_annotations;
+        interior_annotations.Set(attr::tile_interior, Integer(1));
+        interior_annotations.Set(attr::tile_interior_axis, Integer(0));
+        predicated_store =
+            For(ki, 0, Integer(aligned_elems), ForKind::kVectorized,
+                predicated_store, std::nullopt, interior_annotations);
+        Var i0("i0");
+        Map<String, ObjectRef> domain_annotations;
+        domain_annotations.Set(attr::kTileDomain, Array<PrimExpr>{Integer(1)});
+        domain_annotations.Set(attr::tile_tile_size,
+                               Array<PrimExpr>{Integer(aligned_elems)});
+        domain_annotations.Set(attr::tile_execution_axis, Integer(0));
+        domain_annotations.Set(attr::tile_execution_domain_axes,
+                               Array<PrimExpr>{Integer(0)});
+        domain_annotations.Set(attr::tile_scope_entry, Integer(1));
+        add_res_stmt = For(i0, 0, 1, ForKind::kSerial, predicated_store,
+                           std::nullopt, domain_annotations);
+      } else {
+        add_res_stmt = wrap_interior(add_res_stmt, finalize_dst_vars,
+                                     dst_tile_shape, all_dst_axes);
+      }
 
       finalize_stmt = SeqStmt({in_tile_reduce_stmt, add_res_stmt});
     }

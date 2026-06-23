@@ -151,11 +151,16 @@ Stmt FillNode::MakeSunmmioTileFill(const LowerArgs &,
   Array<PrimExpr> dst_indices;
   loop_vars.reserve(region.size());
   dst_indices.reserve(region.size());
+  bool keep_singleton_loop_for_aligned_1d =
+      dst->shape.size() == 1 && region.size() == 1 && is_one(dst->shape[0]) &&
+      is_one(region[0]->extent) && is_zero(region[0]->min);
   int loop_idx = 0;
-  for (const Range &range : region) {
+  for (size_t dim = 0; dim < region.size(); ++dim) {
+    const Range &range = region[dim];
     // Singleton dimensions do not need a loop. Keep the constant region min so
     // the resulting BufferStore still points at the correct slice.
-    if (is_one(range->extent)) {
+    if (is_one(range->extent) &&
+        !(keep_singleton_loop_for_aligned_1d && dim == region.size() - 1)) {
       dst_indices.push_back(range->min);
       continue;
     }

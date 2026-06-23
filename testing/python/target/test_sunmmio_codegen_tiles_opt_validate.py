@@ -5,6 +5,7 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang.carver.arch import driver
+from tilelang.layout import make_row_major, make_zz_layout
 
 from compile_pipeline import target
 from sunmmio_codegen_validation_utils import (
@@ -15,7 +16,7 @@ from sunmmio_codegen_validation_utils import (
 
 tilelang.env.disable_cache()
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
-# os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
+os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 LOOSE_OPT_ARGS = ("--verify-each",)
 
@@ -44,15 +45,18 @@ def dot_mul_tiled_parallel_3d(
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
+    shard_policy = T.MeshShardingPolicy()
+    tensor_shape = (batch, m, n)
+    tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
     grid_b = T.ceildiv(batch, block_b)
     grid_m = T.ceildiv(m, block_m)
     grid_n = T.ceildiv(n, block_n)
 
     @T.prim_func
     def main(
-        A: T.Tensor((batch, m, n), dtype),
-        B: T.Tensor((batch, m, n), dtype),
-        C: T.Tensor((batch, m, n), dtype),
+        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, accum_dtype, layout=tensor_layout),  # type: ignore
     ):
         with T.Kernel(ncores):
             A_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
@@ -110,14 +114,17 @@ def dot_mul_tiled_parallel_2d(
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
+    shard_policy = T.MeshShardingPolicy()
+    tensor_shape = (m, n)
+    tensor_layout = make_zz_layout(tensor_shape, [0, 1], (32, 32))
     grid_m = T.ceildiv(m, block_m)
     grid_n = T.ceildiv(n, block_n)
 
     @T.prim_func
     def main(
-        A: T.Tensor((m, n), dtype),
-        B: T.Tensor((m, n), dtype),
-        C: T.Tensor((m, n), dtype),
+        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, accum_dtype, layout=tensor_layout),  # type: ignore
     ):
         with T.Kernel(ncores):
             A_shared = T.alloc_shared((block_m, block_n), dtype)
@@ -171,16 +178,21 @@ def tiles_broadcast(
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
+    shard_policy = T.MeshShardingPolicy()
+    tensor_shape = (batch, m, n)
+    tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
+    vector_shape = (m,)
+    vector_layout = make_row_major(vector_shape)
     grid_b = T.ceildiv(batch, block_b)
     grid_m = T.ceildiv(m, block_m)
     grid_n = T.ceildiv(n, block_n)
 
     @T.prim_func
     def main(
-        A: T.Tensor((batch, m, n), dtype),
-        B: T.Tensor((batch, m, n), dtype),
-        C: T.Tensor((batch, m, n), dtype),
-        D: T.Tensor((m,), dtype),
+        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, accum_dtype, layout=tensor_layout),  # type: ignore
+        D: T.MeshTensor(vector_shape, shard_policy, device_mesh_config, dtype, layout=vector_layout),  # type: ignore
     ):
         with T.Kernel(ncores):
             A_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
@@ -234,17 +246,104 @@ def tiles_broadcast(
 
 
 @target("Sunmmio")
+def tiles_broadcast_copy(
+    batch=64,
+    m=512,
+    n=1024,
+    block_b=2,
+    block_m=256,
+    block_n=128,
+    dtype="bfloat16",
+    accum_dtype="bfloat16",
+):
+    device_mesh_config = driver.get_sunmmio_device_mesh_config()
+    nrows, ncols = device_mesh_config
+    ncores = nrows * ncols
+    shard_policy = T.MeshShardingPolicy()
+    tensor_shape = (batch, m, n)
+    tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
+    vector_shape = (m,)
+    vector_layout = make_row_major(vector_shape)
+    grid_b = T.ceildiv(batch, block_b)
+    grid_m = T.ceildiv(m, block_m)
+    grid_n = T.ceildiv(n, block_n)
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, accum_dtype, layout=tensor_layout),  # type: ignore
+        D: T.MeshTensor(vector_shape, shard_policy, device_mesh_config, dtype, layout=vector_layout),  # type: ignore
+    ):
+        with T.Kernel(ncores):
+            A_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
+            B_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
+            C_shared = T.alloc_shared((block_b, block_m, block_n), accum_dtype)
+            D_shared = T.alloc_shared((block_m,), dtype)
+
+            for bz in T.serial(grid_b):
+                for by in T.serial(grid_m):
+                    for bx in T.serial(grid_n):
+                        T.clear(C_shared)
+                        for bb in T.serial(block_b):
+                            T.copy(
+                                A[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                                A_shared[bb, :, :],
+                            )
+                            T.copy(
+                                B[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                                B_shared[bb, :, :],
+                            )
+                        T.copy(D[by * block_m : (by + 1) * block_m], D_shared)
+
+                        for b, i, j in T.Tiles(A_shared, parallel=True):
+                            C_shared[b, i, j] = D_shared[i]
+                            C_shared[b, i, j] = C_shared[b, i, j] * T.float32(2.0)
+
+                        for b, i, j in T.Tiles(A_shared, parallel=True):
+                            C_shared[b, i, j] = T.if_then_else(
+                                D_shared[j] >= 0,
+                                T.float32(0.0),
+                                -T.infinity(accum_dtype),
+                            )
+                            C_shared[b, i, j] = C_shared[b, i, j] * T.float32(2.0)
+
+                        for bb in T.serial(block_b):
+                            T.copy(
+                                C_shared[bb, :, :],
+                                C[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                            )
+
+    return main
+
+
+@target("Sunmmio")
 def tiles_1d(m=512, block_m=256, dtype="bfloat16", accum_dtype="bfloat16"):
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
+    shard_policy = T.MeshShardingPolicy()
+    tensor_shape = (m,)
+    tensor_layout = make_row_major(tensor_shape)
     grid_m = T.ceildiv(m, block_m)
 
     @T.prim_func
     def main(
-        A: T.Tensor((m,), dtype),
-        B: T.Tensor((m,), dtype),
-        C: T.Tensor((m,), dtype),
+        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, accum_dtype, layout=tensor_layout),  # type: ignore
     ):
         with T.Kernel(ncores):
             A_shared = T.alloc_shared((block_m,), dtype)
@@ -296,7 +395,22 @@ def test_dot_mul_tiled_parallel_3d_large_block_codegen_validates_loose_with_npui
     [
         ("dot_mul_tiled_parallel_3d", dot_mul_tiled_parallel_3d, ("suvm.tile.mulf", "suvm.tile.exp")),
         ("tiles_broadcast", tiles_broadcast, ("suvm.tile.mulf",)),
+        ("tiles_broadcast_copy", tiles_broadcast_copy, ("suvm.tile.mulf", "suvm.tile.select")),
         ("tiles_1d", tiles_1d, ("suvm.tile.mulf",)),
+        (
+            "dot_mul_tiled_parallel_3d_tail_canonical_shared",
+            lambda: dot_mul_tiled_parallel_3d(
+                batch=64,
+                m=510,
+                n=254,
+                block_b=32,
+                block_m=64,
+                block_n=64,
+                dtype="float16",
+                accum_dtype="float16",
+            ),
+            ("suvm.tile.mulf", "suvm.tile.exp"),
+        ),
     ],
 )
 def test_tiles_codegen_validates_loose_with_npuir_opt(tmp_path, case_name, kernel_factory, expected_tokens):

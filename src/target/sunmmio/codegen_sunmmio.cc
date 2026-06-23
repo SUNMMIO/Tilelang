@@ -87,6 +87,8 @@ bool IsSunmmioReduceRegisterTempBuffer(const tir::Buffer &buffer) {
 
 CodeGenTileLangSunMMIO::CodeGenTileLangSunMMIO() = default;
 
+void CodeGenTileLangSunMMIO::SetTarget(tvm::Target target) { target_ = target; }
+
 void CodeGenTileLangSunMMIO::Init() {
   Clear();
   builder_ = std::make_unique<SuvmSunmmioBuilder>();
@@ -1662,30 +1664,41 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     ICHECK_EQ(op->args.size(), 3)
         << "tl.sunmmio_layout_transform expects src region, dst region, and "
            "sync_token_id";
-    auto count_tiled_dims = [](const PrimExpr &region_expr) -> int {
-      BufferRegion region = tl::NormalizeToBufferRegion(region_expr);
-      int count = 0;
-      for (const Range &range : region->region) {
-        const auto *extent_imm = range->extent.as<IntImmNode>();
-        ICHECK(extent_imm)
-            << "tl.sunmmio_layout_transform region extent must be IntImm";
-        if (extent_imm->value != 1) {
-          ++count;
-        }
-      }
-      return count;
+    struct LayoutTransformRegionInfo {
+      int rank{0};
+      int tiled_dims{0};
     };
+    auto get_region_info =
+        [](const PrimExpr &region_expr) {
+          BufferRegion region = tl::NormalizeToBufferRegion(region_expr);
+          LayoutTransformRegionInfo info;
+          info.rank = static_cast<int>(region->region.size());
+          for (const Range &range : region->region) {
+            const auto *extent_imm = range->extent.as<IntImmNode>();
+            ICHECK(extent_imm)
+                << "tl.sunmmio_layout_transform region extent must be IntImm";
+            if (extent_imm->value != 1) {
+              ++info.tiled_dims;
+            }
+          }
+          return info;
+        };
 
-    int src_tiled_dims = count_tiled_dims(op->args[0]);
-    int dst_tiled_dims = count_tiled_dims(op->args[1]);
-    ICHECK_EQ(src_tiled_dims, 2)
-        << "tl.sunmmio_layout_transform expects source region to have exactly "
-           "2 tiled dims, got "
-        << src_tiled_dims;
-    ICHECK_EQ(dst_tiled_dims, 2)
-        << "tl.sunmmio_layout_transform expects destination region to have "
-           "exactly 2 tiled dims, got "
-        << dst_tiled_dims;
+    LayoutTransformRegionInfo src_info = get_region_info(op->args[0]);
+    LayoutTransformRegionInfo dst_info = get_region_info(op->args[1]);
+    auto is_singleton_1d_region = [](const LayoutTransformRegionInfo &info) {
+      return info.rank == 1 && info.tiled_dims == 0;
+    };
+    bool is_2d_transform = src_info.tiled_dims == 2 && dst_info.tiled_dims == 2;
+    bool is_singleton_1d_transform =
+        is_singleton_1d_region(src_info) && is_singleton_1d_region(dst_info);
+    ICHECK(is_2d_transform || is_singleton_1d_transform)
+        << "tl.sunmmio_layout_transform expects source and destination "
+           "regions to both have exactly 2 tiled dims, or to both be rank-1 "
+           "singleton regions; got source rank="
+        << src_info.rank << ", tiled dims=" << src_info.tiled_dims
+        << ", destination rank=" << dst_info.rank
+        << ", tiled dims=" << dst_info.tiled_dims;
 
     operands.reserve(2);
     operands.push_back(EmitRegionCall(op->args[0]));
