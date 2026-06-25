@@ -1,5 +1,5 @@
-#ifndef AST_TRAVERSER_H
-#define AST_TRAVERSER_H
+#ifndef STMT_READ_WRITE_COLLECTOR_H
+#define STMT_READ_WRITE_COLLECTOR_H
 
 #include "../../op/builtin.h"
 #include "../../op/utils.h"
@@ -81,9 +81,9 @@ private:
   Map<Var, Buffer> buffer_data_to_buffer_;
 };
 
-class ASTTraverser : public StmtVisitor {
+class StmtReadWriteCollector : public StmtVisitor {
 public:
-  ASTTraverser(const PrimFunc &f) {
+  StmtReadWriteCollector(const PrimFunc &f) {
     for (const auto &[_, buffer] : f->buffer_map) {
       this->buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
