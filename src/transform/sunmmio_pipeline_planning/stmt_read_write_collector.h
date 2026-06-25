@@ -61,15 +61,6 @@ private:
       if (buffer_region.defined()) {
         reads_.push_back(buffer_region);
       }
-    } else if (op->op.same_as(builtin::tvm_access_ptr())) {
-      const VarNode *buffer_var = op->args[1].as<VarNode>();
-      ICHECK(buffer_var);
-      auto it = buffer_data_to_buffer_.find(tvm::ffi::GetRef<Var>(buffer_var));
-      if (it != buffer_data_to_buffer_.end()) {
-        const Buffer &buffer = (*it).second;
-        const BufferRegion buffer_region = BufferRegion::FullRegion(buffer);
-        reads_.push_back(buffer_region);
-      }
     } else {
       ExprVisitor::VisitExpr_(op);
     }

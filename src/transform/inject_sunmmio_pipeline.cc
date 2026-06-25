@@ -270,17 +270,7 @@ private:
   PrimExpr VisitExpr_(const CallNode *op) final {
     if (!replace_flag)
       return StmtExprMutator::VisitExpr_(op);
-    if (op->op.same_as(builtin::tvm_access_ptr())) {
-      ICHECK_EQ(op->args.size(), 5U);
-      Var buffer_data = Downcast<Var>(op->args[1]);
-      if (!var_remap_.count(buffer_data)) {
-        return StmtExprMutator::VisitExpr_(op);
-      }
-      Var new_data = var_remap_[buffer_data];
-      return Call(
-          op->dtype, op->op,
-          {op->args[0], new_data, op->args[2], op->args[3], op->args[4]});
-    } else if (op->op.same_as(RegionOp::Get())) {
+    if (op->op.same_as(RegionOp::Get())) {
       RegionOp original_region(op->args);
       Buffer original_buffer = original_region->GetBuffer();
 
