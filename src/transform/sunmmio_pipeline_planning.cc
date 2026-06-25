@@ -5,8 +5,8 @@
  */
 
 #include "../op/utils.h"
-#include "sunmmio_pipeline_planning/cost_model.h"
-#include "sunmmio_pipeline_planning/hardware_types.h"
+#include "../target/sunmmio/cost_model.h"
+#include "../target/sunmmio/hardware_types.h"
 #include "sunmmio_pipeline_planning/stmt_read_write_collector.h"
 
 #include <algorithm>
