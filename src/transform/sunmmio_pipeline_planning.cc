@@ -1,7 +1,13 @@
 /*!
  * \file sunmmio_pipeline_planning.cc
- * \brief Refactored pipeline planning pass using Dataflow Propagation and Local
- * DDG.
+ * \brief
+ * This file implements a greedy software pipeline scheduling algorithm for Sunmmio.
+ * 1.1 Build a local DDG.
+ * 1.2 Identify prefetch instructions.
+ * 1.3 Identify multi-versioned buffers.
+ * 2. Unroll DDG according to num_stages, while considering prefetch instructions.
+ * 3.1 Schedule instructions in the global DDG with a b-level based greedy algorithm.
+ * 3.2 Insert prefetch instructions.
  */
 
 #include "../op/utils.h"
