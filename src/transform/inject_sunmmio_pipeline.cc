@@ -346,49 +346,9 @@ public:
   void set_loop_var_replacement(PrimExpr p) { replaced_loop_var_ = p; }
 
 private:
-  PrimExpr RewriteBufferAccess(const Call &call,
-                               const std::vector<int> &arg_indices) {
-    auto product = [](const Array<PrimExpr> &input) {
-      return foldl(
-          [](PrimExpr a, PrimExpr b, Span span) {
-            return mul(std::move(a), std::move(b), std::move(span));
-          },
-          make_const(DataType::Int(32), 1), input);
-    };
-    Array<PrimExpr> new_args = call->args;
-    for (int i : arg_indices) {
-      // const Buffer &buffer =
-      //     buffer_data_to_buffer_.at(Downcast<Var>(call->args[i]));
-      // auto it = buffer_remap_.find(buffer);
-      // if (it != buffer_remap_.end()) {
-      //   const Buffer &new_buffer = (*it).second;
-      //   const PrimExpr &old_index = call->args[i + 1];
-      //   LOG(INFO) << old_index;
-      //   PrimExpr offset;
-      //   if (new_buffer->strides.empty()) {
-      //     offset = product(buffer->shape);
-      //   } else {
-      //     offset = new_buffer->strides[0];
-      //   }
-      //   PrimExpr new_index =
-      //       old_index +
-      //       floormod(pipeline_loop_->loop_var, new_buffer->shape[0]) *
-      //       offset;
-      //   LOG(INFO) << new_index;
-      //   new_args.Set(i + 1, new_index);
-    }
-    return Call(call->dtype, call->op, new_args, call->annotations, call->span);
-  }
-
   Stmt VisitStmt_(const BlockNode *op) final {
     Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
     BlockNode *n = block.CopyOnWrite();
-    // n->reads.MutateByApply([this](const BufferRegion &buffer_region) {
-    //   return RewritePipelineBufferRegion(buffer_region);
-    // });
-    // n->writes.MutateByApply([this](const BufferRegion &buffer_region) {
-    //   return RewritePipelineBufferRegion(buffer_region);
-    // });
     return block;
   }
 
@@ -420,14 +380,6 @@ private:
     auto *n = load.CopyOnWrite();
     n->indices.Set(0, current_version_);
     return load;
-  }
-
-  PrimExpr VisitExpr_(const CallNode *op) final {
-    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
-    if (call->op.same_as(builtin::tvm_access_ptr())) {
-      return RewriteBufferAccess(call, {1});
-    }
-    return call;
   }
 
   PrimExpr VisitExpr_(const VarNode *op) final {
