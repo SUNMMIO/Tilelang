@@ -17,10 +17,6 @@ def elementwise_add(M, N, block_M, block_N, in_dtype, out_dtype):
     zz_layout = make_zz_layout((M, N))
     placement = T.MeshShardingPolicy(y=0, x=1)
 
-    nrows = T.symbolic("nrows")
-    ncols = T.symbolic("ncols")
-    ncores = nrows * ncols
-
     @T.prim_func
     def elem_add(
         A: T.MeshTensor((M, N), placement, device_mesh_config, in_dtype, layout=zz_layout),

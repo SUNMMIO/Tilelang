@@ -4,9 +4,9 @@ import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
 from tilelang.carver.arch import driver
-from tilelang.layout import make_row_major
 from tilelang.engine.phase import LowerAndLegalize
 from tilelang.utils.target import determine_target
+from tilelang.layout import make_row_major, make_aligned_row_major
 
 
 def reduction(M, block_M, in_dtype, out_dtype):
@@ -15,7 +15,7 @@ def reduction(M, block_M, in_dtype, out_dtype):
     ncores = nrows * ncols
 
     A_layout = make_row_major((M,))
-    B_layout = make_row_major((1,))
+    B_layout = make_aligned_row_major((1,), align_bytes=1024, dtype=out_dtype)
     A_placement = T.MeshShardingPolicy(y=0, replicate=T.MeshReplicationType.ROW)
     B_placement = T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)
 
@@ -31,6 +31,7 @@ def reduction(M, block_M, in_dtype, out_dtype):
             Acc_shared = T.alloc_shared((block_M), out_dtype)
             Acc_dist_shared = T.alloc_shared((ncols * block_M), out_dtype)
             B_shared = T.alloc_shared((1,), out_dtype)
+            T.annotate_layout({B_shared: B_layout})
 
             T.clear(Acc_shared)
             for bx in T.serial(T.ceildiv(sharded_M, block_M)):
