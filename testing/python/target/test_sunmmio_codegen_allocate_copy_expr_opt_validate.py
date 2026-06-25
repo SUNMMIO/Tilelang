@@ -26,19 +26,18 @@ os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 
 @target("Sunmmio")
 def basic_allocate_copy_mma_kernel(
-    M=32,
-    N=32,
-    K=32,
+    M=128,
+    N=128,
+    K=128,
     block_M=32,
     block_N=32,
     block_K=32,
     dtype=T.float16,
+    accum_dtype=T.float32,
 ):
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
-    grid_m = T.ceildiv(M, block_M)
-    grid_n = T.ceildiv(N, block_N)
 
     shard_policy = T.MeshShardingPolicy(x=1, y=0)
     A_layout = make_zz_layout((M, K))
@@ -49,18 +48,38 @@ def basic_allocate_copy_mma_kernel(
     def main(
         A: T.MeshTensor((M, K), shard_policy, device_mesh_config, dtype, layout=A_layout),  # type: ignore
         B: T.MeshTensor((K, N), shard_policy, device_mesh_config, dtype, layout=B_layout),  # type: ignore
-        C: T.MeshTensor((M, N), shard_policy, device_mesh_config, dtype, layout=C_layout),  # type: ignore
+        C: T.MeshTensor((M, N), shard_policy, device_mesh_config, accum_dtype, layout=C_layout),  # type: ignore
     ):
         with T.Kernel(ncores) as _cid:
-            A_shared = T.alloc_shared((block_M, block_K), dtype)
-            B_shared = T.alloc_shared((block_K, block_N), dtype)
-            C_shared = T.alloc_shared((block_M, block_N), dtype)
+            sharded_M, sharded_K = A.shape
+            sharded_N = B.shape[1]
+            A_shared_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
+            B_shared_dist = T.alloc_shared((block_K * nrows, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
-            for by in T.serial(grid_m):
-                for bx in T.serial(grid_n):
-                    T.copy(A[by * block_M, 0], A_shared)
-                    T.copy(B[0, bx * block_N], B_shared)
-                    T.gemm(A_shared, B_shared, C_shared, transpose_B=True)
+            for by in T.serial(T.ceildiv(sharded_M, block_M)):
+                for bx in T.serial(T.ceildiv(sharded_N, block_N)):
+                    T.clear(C_shared)
+                    for k in T.serial(T.ceildiv(sharded_K, block_K)):
+                        T.comm.all_gather(
+                            A[
+                                by * block_M : (by + 1) * block_M,
+                                k * block_K : (k + 1) * block_K,
+                            ],
+                            A_shared_dist,
+                            direction="horizontal",
+                            axis=-1,
+                        )
+                        T.comm.all_gather(
+                            B[
+                                k * block_K : (k + 1) * block_K,
+                                bx * block_N : (bx + 1) * block_N,
+                            ],
+                            B_shared_dist,
+                            direction="vertical",
+                            axis=0,
+                        )
+                        T.gemm(A_shared_dist, B_shared_dist, C_shared)
                     T.copy(C_shared, C[by * block_M, bx * block_N])
 
     return main
@@ -70,7 +89,7 @@ def basic_allocate_copy_mma_kernel(
 def allocate_dma_copy_kernel_plus(
     M=512,
     N=512,
-    K=256,
+    K=512,
     block_M=32,
     block_N=32,
     block_K=32,
@@ -79,7 +98,6 @@ def allocate_dma_copy_kernel_plus(
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
-    grid_n = T.ceildiv(K, block_K)
 
     shard_policy = T.MeshShardingPolicy(x=1, y=0)
     A_layout = make_zz_layout((M, K))
@@ -91,30 +109,34 @@ def allocate_dma_copy_kernel_plus(
         C: T.MeshTensor((M, N), shard_policy, device_mesh_config, dtype, layout=C_layout),  # type: ignore
     ):
         with T.Kernel(ncores) as _cid:
+            sharded_M, sharded_K = A.shape
+            _, sharded_N = C.shape
+            grid_m = T.ceildiv(sharded_M, block_M)
+            grid_k = T.ceildiv(sharded_K, block_K)
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), dtype)
 
-            for bx in T.serial(grid_n):
+            for bx in T.serial(T.ceildiv(sharded_N, block_N)):
                 # Index exprs: add/mul/rem/min/max on DMA copy paths.
-                ko = (bx + bx) % grid_n
-                m_tile = bx * block_M
+                ko = (bx + bx) % grid_k
+                m_tile = (bx % grid_m) * block_M
                 n_tile = bx * block_N
-                m_offset = m_tile + T.min(bx, 1)
-                n_offset = n_tile + T.max(bx - 1, 0)
+                m_offset = m_tile + T.min(T.min(bx, 1), T.max(sharded_M - m_tile - block_M, 0))
+                n_offset = n_tile + T.min(T.max(bx - 1, 0), T.max(sharded_N - n_tile - block_N, 0))
 
                 T.copy(A[m_offset, ko * block_K], A_shared)
                 T.copy(A[ko * block_K, n_offset], B_shared)
-                T.gemm(A_shared, B_shared, C_shared, transpose_B=True)
-                T.copy(C_shared, C[m_offset, n_offset])
+                T.gemm(A_shared, B_shared, C_shared)
+                # need all_gather or reduce to cover real-world scenarios
 
     return main
 
 
 @target("Sunmmio")
 def offset_region_copy_kernel_plus(
-    M=512,
-    N=512,
+    M=2048,
+    N=2048,
     block_M=64,
     block_N=64,
     tile_M=32,
@@ -124,8 +146,6 @@ def offset_region_copy_kernel_plus(
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
-    grid_m = T.ceildiv(M, block_M)
-    grid_n = T.ceildiv(N, block_N)
 
     shard_policy = T.MeshShardingPolicy(x=1, y=0)
     A_layout = make_zz_layout((M, N))
@@ -137,10 +157,12 @@ def offset_region_copy_kernel_plus(
         B: T.MeshTensor((M, N), shard_policy, device_mesh_config, dtype, layout=B_layout),  # type: ignore
     ):
         with T.Kernel(ncores) as _cid:
+            sharded_M = A.shape[0]
+            sharded_N = A.shape[1]
             A_rsram = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
 
-            for by in T.serial(grid_m):
-                for bx in T.serial(grid_n):
+            for by in T.serial(T.ceildiv(sharded_M, block_M)):
+                for bx in T.serial(T.ceildiv(sharded_N, block_N)):
                     # Integer exprs: add/sub/mul/div/rem for copy offsets.
                     sum_idx = bx + by
                     diff_idx = bx - by
@@ -271,6 +293,7 @@ def test_basic_allocate_copy_mma_codegen_validates_with_npuir_opt(tmp_path):
             "suvm.ping_pong = #suvm.ping_pong<ping>",
             "#suvm.memory_space<asram>",
             "#suvm.memory_space<wsram>",
+            "suvm.mcast_tok",
             "suvm.copy_async",
             "suvm.tc.mma",
         ),

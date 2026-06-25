@@ -29,7 +29,6 @@ def per_token_cast_to_fp8_kernel(
     dtype = T.float32
     fp8_min = -448.0
     fp8_max = 448.0
-    grid_m = T.ceildiv(M, block_M)
     grid_n = T.ceildiv(N, group_size)
 
     assert M % block_M == 0
@@ -55,14 +54,15 @@ def per_token_cast_to_fp8_kernel(
         X_amax: T.MeshTensor(X_amax_shape, shard_policy, device_mesh_config, dtype, layout=X_amax_layout),  # type: ignore
     ):
         with T.Kernel(ncores) as _cid:
+            sharded_M, sharded_N = X.shape
             x_reduce_shared = T.alloc_shared((block_M, group_size), dtype)
             x_quant_shared = T.alloc_shared((block_M, group_size), dtype)
             x_fp8_shared = T.alloc_shared((block_M, group_size), T.float8_e4m3fn)
             amax_shared = T.alloc_shared((block_M,), dtype)
             scale_shared = T.alloc_shared((block_M,), dtype)
 
-            for bx in T.serial(grid_m):
-                for by in T.serial(grid_n):
+            for bx in T.serial(T.ceildiv(sharded_M, block_M)):
+                for by in T.serial(T.ceildiv(sharded_N, group_size)):
                     T.copy(X[bx * block_M, by * group_size], x_reduce_shared)
                     T.copy(X[bx * block_M, by * group_size], x_quant_shared)
                     T.reduce_absmax(x_reduce_shared, amax_shared, dim=1)
@@ -95,7 +95,6 @@ def per_token_cast_to_fp8_kernel_rowmajor(
     dtype = T.float32
     fp8_min = -448.0
     fp8_max = 448.0
-    grid_m = T.ceildiv(M, block_M)
     grid_n = T.ceildiv(N, group_size)
 
     assert M % block_M == 0
@@ -122,14 +121,15 @@ def per_token_cast_to_fp8_kernel_rowmajor(
         X_amax: T.MeshTensor(X_amax_shape, shard_policy, device_mesh_config, dtype, layout=X_amax_layout),  # type: ignore
     ):
         with T.Kernel(ncores) as _cid:
+            sharded_M, sharded_N = X.shape
             x_reduce_shared = T.alloc_shared((block_M, group_size), dtype)
             x_quant_shared = T.alloc_shared((block_M, group_size), dtype)
             x_fp8_shared = T.alloc_shared((block_M, group_size), T.float8_e4m3fn)
             amax_shared = T.alloc_shared((block_M,), dtype)
             scale_shared = T.alloc_shared((block_M,), dtype)
 
-            for bx in T.serial(grid_m):
-                for by in T.serial(grid_n):
+            for bx in T.serial(T.ceildiv(sharded_M, block_M)):
+                for by in T.serial(T.ceildiv(sharded_N, group_size)):
                     T.copy(X[bx * block_M, by * group_size], x_reduce_shared)
                     T.copy(X[bx * block_M, by * group_size], x_quant_shared)
                     T.reduce_absmax(x_reduce_shared, amax_shared, dim=1)
@@ -162,7 +162,6 @@ def per_token_cast_to_fp8_transition_kernel(
     dtype = T.float32
     fp8_min = -448.0
     fp8_max = 448.0
-    grid_m = T.ceildiv(M, block_M)
     grid_n = T.ceildiv(N, group_size)
 
     assert M % block_M == 0
@@ -188,6 +187,7 @@ def per_token_cast_to_fp8_transition_kernel(
         X_amax: T.MeshTensor(X_amax_shape, shard_policy, device_mesh_config, dtype, layout=X_amax_layout),  # type: ignore
     ):
         with T.Kernel(ncores) as _cid:
+            sharded_M, sharded_N = X.shape
             x_reduce_shared = T.alloc_shared((block_M, group_size), dtype)
             x_quant_shared = T.alloc_shared((block_M, group_size), dtype)
             x_cast_input_shared = T.alloc_shared((block_M, group_size), dtype)
@@ -215,8 +215,8 @@ def per_token_cast_to_fp8_transition_kernel(
                 }
             )
 
-            for bx in T.serial(grid_m):
-                for by in T.serial(grid_n):
+            for bx in T.serial(T.ceildiv(sharded_M, block_M)):
+                for by in T.serial(T.ceildiv(sharded_N, group_size)):
                     T.copy(X[bx * block_M, by * group_size], x_reduce_shared)
                     T.copy(X[bx * block_M, by * group_size], x_quant_shared)
                     T.copy(X[bx * block_M, by * group_size], x_cast_input_shared)
