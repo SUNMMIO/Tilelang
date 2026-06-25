@@ -17,6 +17,9 @@ def fill(buffer: BufferLikeType, value: tir.PrimExpr) -> tir.PrimExpr:
     Returns:
         A TVM intrinsic call that performs the fill operation
     """
+    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
+
+    buffer = unwrap_mesh_tensor(buffer)
     # Normalize Var with let value to its underlying object
     if isinstance(buffer, tir.Var) and has_let_value(buffer):
         buffer = get_let_value(buffer)
@@ -49,6 +52,9 @@ def clear(buffer: BufferLikeType) -> tir.PrimExpr:
     Raises:
         ValueError: If the buffer variable contains an invalid buffer region
     """
+    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
+
+    buffer = unwrap_mesh_tensor(buffer)
     if isinstance(buffer, tir.Var) and has_let_value(buffer):
         buffer_region = get_let_value(buffer)  # Get the actual buffer region from variable
         if isinstance(buffer_region, tir.BufferRegion):

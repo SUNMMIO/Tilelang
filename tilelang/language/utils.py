@@ -146,6 +146,9 @@ def get_extent(data: BufferLikeType) -> ShapeType | None:
         The shape/extents as a list-like of PrimExpr (Buffer.shape or list of region item extents), or None if the extent cannot be determined.
     """
 
+    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
+
+    data = unwrap_mesh_tensor(data)
     if isinstance(data, tir.Var) and T.has_let_value(data):
         data = T.get_let_value(data)
     if isinstance(data, tir.Buffer):

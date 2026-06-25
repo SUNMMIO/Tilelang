@@ -28,7 +28,7 @@ try:
 except ImportError:  # Python < 3.11 for Self, < 3.10 for ParamSpec
     from typing_extensions import ParamSpec, Self
 from .. import dtypes as dt
-from ..mesh_tensor import TensorWithMeta
+from ..mesh_tensor import MeshTensorValue, TensorWithMeta, unwrap_mesh_tensor
 from . import utils
 from tilelang.jit.exceptions import JITNoBuilderError, EagerJITBuildError
 import threading
@@ -468,6 +468,8 @@ class Builder(BaseBuilder):
             return value
         if isinstance(value, tir.IntImm) and value.dtype == "int32":
             return value.value
+        if isinstance(value, MeshTensorValue):
+            return value
         if isinstance(value, (Var, Buffer)):
             # Bind TVM Var/Buffer names and also record scope so reusing the same
             # Python name (e.g., loop vars like `i`) across different for-frames
@@ -530,6 +532,8 @@ class Builder(BaseBuilder):
             arg._out_idx = self.out_tensor_cnt
             self.out_tensor_cnt += 1
             return arg
+        elif isinstance(value, MeshTensorValue):
+            return value
         elif isinstance(value, (Buffer, tir.IterVar, tir.Var)):
             IRBuilder.name(name, value)
             return value
@@ -545,6 +549,7 @@ class Builder(BaseBuilder):
         self.check_continue_break()
         if annot is not self.empty:
             logger.warning("Type annotation in slice assignment has no effect", stack_info=True, stacklevel=2)
+        lval = unwrap_mesh_tensor(lval)
         if isinstance(lval, Buffer):
             tir.buffer_store(lval, value, sl)
         else:
@@ -719,7 +724,7 @@ class Builder(BaseBuilder):
     def prim_func_arg(self, name, value):
         if isinstance(value, TensorWithMeta):
             self._metadata[name] = value.meta_data
-            return tir.arg(name, value.buffer)
+            return MeshTensorValue(tir.arg(name, value.buffer), value.meta_data)
         elif isinstance(value, (Buffer, Var)):
             return tir.arg(name, value)
         elif value is self.empty:

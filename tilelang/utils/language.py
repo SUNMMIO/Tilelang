@@ -22,6 +22,9 @@ def _get_buffer(buffer_or_load_or_region: BufferLikeType) -> Buffer:
     Returns:
         Buffer: The underlying buffer object
     """
+    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
+
+    buffer_or_load_or_region = unwrap_mesh_tensor(buffer_or_load_or_region)
     if isinstance(buffer_or_load_or_region, Buffer):
         return buffer_or_load_or_region
     elif isinstance(buffer_or_load_or_region, (tir.BufferLoad, tir.BufferRegion)):
@@ -182,7 +185,9 @@ def to_buffer_region(obj: BufferLikeType, access_type: str = "rw", extents: list
     - tl.region Call -> returns the decoded BufferRegion for analysis
     """
     from tilelang.language.frame import has_let_value, get_let_value
+    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
 
+    obj = unwrap_mesh_tensor(obj)
     if isinstance(obj, tir.Var) and has_let_value(obj):
         obj = get_let_value(obj)
     # Encode into tl.region call (when extents is provided), otherwise return BufferRegion for analysis
@@ -226,6 +231,9 @@ def retrieve_shape(obj: BufferLikeType) -> list:
     - BufferRegion -> list of each range's `extent`
     - BufferLoad -> extents from `get_buffer_region_from_load(obj)`
     """
+    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
+
+    obj = unwrap_mesh_tensor(obj)
     if isinstance(obj, tir.Buffer):
         return obj.shape
     if isinstance(obj, tir.BufferRegion):
@@ -244,6 +252,9 @@ def retrieve_stride(obj: BufferLikeType) -> list:
 
     For BufferRegion and BufferLoad, uses the underlying buffer's `shape`.
     """
+    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
+
+    obj = unwrap_mesh_tensor(obj)
     if isinstance(obj, tir.Buffer):
         shape = obj.shape
     elif isinstance(obj, (tir.BufferRegion, tir.BufferLoad)):
@@ -343,6 +354,9 @@ def retrieve_offset(obj: BufferLikeType) -> list:
     - BufferRegion -> [r.min for r in region]
     - BufferLoad -> indices (or derived region minima)
     """
+    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
+
+    obj = unwrap_mesh_tensor(obj)
     if isinstance(obj, tir.Buffer):
         return [0] * len(obj.shape)
     if isinstance(obj, tir.BufferRegion):

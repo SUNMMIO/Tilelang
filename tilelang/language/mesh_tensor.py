@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from enum import Enum
 from typing import Any, TYPE_CHECKING
 
@@ -72,6 +73,68 @@ class TensorWithMeta:
     def __init__(self, buffer: tir.Buffer, meta_data: dict):
         self.buffer = buffer
         self.meta_data = meta_data
+        self._attach_meta(buffer, meta_data)
+
+    @staticmethod
+    def _attach_meta(buffer: tir.Buffer, meta_data: dict) -> None:
+        with suppress(AttributeError):
+            buffer._tilelang_mesh_tensor_meta = meta_data
+
+    @property
+    def shape(self):
+        """Return the user-visible global tensor shape."""
+        return self.meta_data["global_shape"]
+
+    @property
+    def local_shape(self):
+        """Return the uniform physical local buffer shape."""
+        return self.meta_data["local_shape"]
+
+    def get_local_extent(self, cid):
+        """Return the valid local extent on core ``cid``."""
+        return get_local_extent(self, cid)
+
+
+class MeshTensorValue:
+    """Frontend value for a MeshTensor parameter inside a TileLang function."""
+
+    def __init__(self, buffer: tir.Buffer, meta_data: dict):
+        self.buffer = buffer
+        self.meta_data = meta_data
+        TensorWithMeta._attach_meta(buffer, meta_data)
+
+    @property
+    def shape(self):
+        """Return the user-visible global tensor shape."""
+        return self.meta_data["global_shape"]
+
+    @property
+    def local_shape(self):
+        """Return the uniform physical local buffer shape."""
+        return self.meta_data["local_shape"]
+
+    def get_local_extent(self, cid):
+        """Return the valid local extent on core ``cid``."""
+        return get_local_extent(self, cid)
+
+    def __getitem__(self, keys):
+        return self.buffer[keys]
+
+    def __setitem__(self, keys, value):
+        self.buffer[keys] = value
+
+    def __getattr__(self, name):
+        return getattr(self.buffer, name)
+
+    def __repr__(self):
+        return f"MeshTensorValue(buffer={self.buffer!r}, shape={self.shape}, local_shape={self.local_shape})"
+
+
+def unwrap_mesh_tensor(value):
+    """Return the backing TIR buffer for MeshTensor wrapper values."""
+    if isinstance(value, (TensorWithMeta, MeshTensorValue)):
+        return value.buffer
+    return value
 
 
 def _ceildiv(a, b):
@@ -86,6 +149,85 @@ def _to_primexpr(v):
     if isinstance(v, int):
         return IntImm("int32", v)
     return v
+
+
+def _to_python_int(v):
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, IntImm):
+        return int(v.value)
+    return None
+
+
+def distribute_slot(D, n):
+    """Return the uniform per-core slot size."""
+    return _ceildiv(D, n)
+
+
+def distribute_valid_count(D, k, n):
+    """Return the number of valid elements on core index ``k``.
+
+    The first ``D % n`` cores receive one extra element. Supports Python ints
+    and TIR PrimExpr values.
+    """
+    d_int = _to_python_int(D)
+    k_int = _to_python_int(k)
+    n_int = _to_python_int(n)
+    if d_int is not None and k_int is not None and n_int is not None:
+        base, rem = divmod(d_int, n_int)
+        return base + (1 if k_int < rem else 0)
+
+    base = D // n
+    rem = D % n
+    rem_int = _to_python_int(rem)
+    if rem_int == 0:
+        return base
+    if rem_int is not None and k_int is not None:
+        return base + (1 if k_int < rem_int else 0)
+    return base + tir.Select(_to_primexpr(k) < _to_primexpr(rem), IntImm("int32", 1), IntImm("int32", 0))
+
+
+def lookup_mesh_tensor_meta(mesh_tensor):
+    """Return MeshTensor metadata from a wrapper, dict, or annotated Buffer."""
+    if isinstance(mesh_tensor, (TensorWithMeta, MeshTensorValue)):
+        return mesh_tensor.meta_data
+    if isinstance(mesh_tensor, dict):
+        return mesh_tensor
+    meta = getattr(mesh_tensor, "_tilelang_mesh_tensor_meta", None)
+    if meta is not None:
+        return meta
+    raise TypeError(f"Expected a MeshTensor value with metadata, got {type(mesh_tensor)}")
+
+
+def get_local_extent(mesh_tensor, cid):
+    """Return the valid local extent for ``mesh_tensor`` on linear core id ``cid``.
+
+    If both row/y and col/x shard the same tensor dimension, row sharding is
+    applied first and col sharding is applied to the row-local extent.
+    """
+    meta = lookup_mesh_tensor_meta(mesh_tensor)
+    global_shape = meta["global_shape"]
+    nrows, ncols = meta["mesh_shape"]
+    row = cid // ncols
+    col = cid % ncols
+
+    local_extent = list(global_shape)
+    cross_mesh_dim = meta.get("cross_mesh_dim", -1)
+    if cross_mesh_dim != -1:
+        local_extent[cross_mesh_dim] = distribute_valid_count(global_shape[cross_mesh_dim], cid, nrows * ncols)
+        return tuple(local_extent)
+
+    shard_y = meta.get("shard_y", -1)
+    if shard_y != -1:
+        local_extent[shard_y] = distribute_valid_count(global_shape[shard_y], row, nrows)
+
+    shard_x = meta.get("shard_x", -1)
+    if shard_x != -1:
+        local_extent[shard_x] = distribute_valid_count(local_extent[shard_x], col, ncols)
+
+    return tuple(local_extent)
 
 
 class MeshTensorProxy:
@@ -128,14 +270,14 @@ class MeshTensorProxy:
                     raise ValueError(f"Invalid x-split dimension: {policy.x}, tensor rank is {len(sharded_shape)}")
                 sharded_shape[policy.x] = _ceildiv(sharded_shape[policy.x], ncols)
         elif policy.replicate == MeshReplicationType.NONE:
-            if policy.x is not None:
-                if not 0 <= policy.x < len(sharded_shape):
-                    raise ValueError(f"Invalid x-split dimension: {policy.x}, tensor rank is {len(sharded_shape)}")
-                sharded_shape[policy.x] = _ceildiv(sharded_shape[policy.x], ncols)
             if policy.y is not None:
                 if not 0 <= policy.y < len(sharded_shape):
                     raise ValueError(f"Invalid y-split dimension: {policy.y}, tensor rank is {len(sharded_shape)}")
                 sharded_shape[policy.y] = _ceildiv(sharded_shape[policy.y], nrows)
+            if policy.x is not None:
+                if not 0 <= policy.x < len(sharded_shape):
+                    raise ValueError(f"Invalid x-split dimension: {policy.x}, tensor rank is {len(sharded_shape)}")
+                sharded_shape[policy.x] = _ceildiv(sharded_shape[policy.x], ncols)
 
         return tuple(sharded_shape)
 
@@ -156,6 +298,13 @@ class MeshTensorProxy:
         meta_data = dict(
             global_shape=shape,
             global_strides=TensorProxy._construct_strides(shape),
+            local_shape=sharded_shape,
+            local_strides=sharded_strides,
+            mesh_shape=(nrows, ncols),
+            shard_x=sharding_policy.x if sharding_policy.x is not None else -1,
+            shard_y=sharding_policy.y if sharding_policy.y is not None else -1,
+            replicate=sharding_policy.replicate.value,
+            cross_mesh_dim=sharding_policy.cross_mesh_dim if sharding_policy.cross_mesh_dim is not None else -1,
         )
 
         # Build global layout (CuteLayout object).
@@ -184,6 +333,9 @@ class MeshTensorProxy:
 if TYPE_CHECKING:
 
     class MeshTensor:
+        shape: tuple[Any, ...]
+        local_shape: tuple[Any, ...]
+
         def __new__(
             cls,
             shape: ShapeType,
@@ -192,6 +344,8 @@ if TYPE_CHECKING:
             dtype: DType = "float32",
             layout=None,
         ) -> TensorWithMeta: ...
+
+        def get_local_extent(self, cid) -> tuple[Any, ...]: ...
 
 else:
     MeshTensor = MeshTensorProxy()

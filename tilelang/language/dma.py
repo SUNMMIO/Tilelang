@@ -7,6 +7,9 @@ from tilelang.utils.language import get_buffer_region_from_load, legalize_pairwi
 
 def _get_extent(data):
     """Detect extent from Buffer / BufferRegion / BufferLoad."""
+    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
+
+    data = unwrap_mesh_tensor(data)
     if isinstance(data, tir.Buffer):
         return list(data.shape)
 
