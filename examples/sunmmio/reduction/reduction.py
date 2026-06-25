@@ -15,7 +15,7 @@ def reduction(M, K, N, block_K, block_N, in_dtype, out_dtype):
     ncores = nrows * ncols
 
     zz_layout = make_zz_layout((M, K, N))
-    placement = T.MeshShardingPolicy(y=1, x=0)
+    placement = T.MeshShardingPolicy(y=0, x=1)
     rm_layout = make_row_major((M, K))
 
     @T.prim_func
