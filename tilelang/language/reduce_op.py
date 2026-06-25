@@ -48,8 +48,9 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: in
         target = Target.current()
         # Sunmmio uses direct builtins for ReduceOp in LowerTileOp
         # Check for Sunmmio target or specific Sunmmio shared memory scopes
+        is_sunmmio_target = target is not None and target_is_sunmmio(target)
         is_sunmmio_scope = any(scope in (buffer.scope(), out.scope()) for scope in ("shared.rsram", "shared.asram", "shared.wsram"))
-        if (target and target_is_sunmmio(target)) or is_sunmmio_scope:
+        if is_sunmmio_target or is_sunmmio_scope:
             tir.call_intrin(
                 "handle",
                 tir.op.Op.get(_REDUCE_OP_KEY),
