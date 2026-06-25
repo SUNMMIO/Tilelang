@@ -85,6 +85,7 @@ struct Aligned1DAddressInfo {
 struct TiledIndexMatch {
   int64_t offset{0};
   bool uses_execution_index{false};
+  PrimExpr partition_index;
 };
 
 struct TailMaskInfo {
@@ -460,12 +461,13 @@ std::optional<int> GetInteriorAxisAnnotation(const ForNode *loop) {
 
 std::optional<TiledIndexMatch>
 MatchTiledIndex(const PrimExpr &index, const Var &exec, const Var &interior,
-                int64_t tile_extent, bool allow_standalone_interior) {
+                int64_t tile_extent, bool allow_standalone_interior,
+                arith::Analyzer *analyzer) {
   if (index.same_as(interior)) {
     if (!allow_standalone_interior) {
       return std::nullopt;
     }
-    return TiledIndexMatch{0, false};
+    return TiledIndexMatch{0, false, PrimExpr(IntImm(index.dtype(), 0))};
   }
 
   std::vector<PrimExpr> terms;
@@ -483,6 +485,7 @@ MatchTiledIndex(const PrimExpr &index, const Var &exec, const Var &interior,
   bool seen_interior = false;
   bool seen_exec = false;
   int64_t const_offset = 0;
+  PrimExpr dynamic_base;
 
   auto match_exec_mul = [&](const PrimExpr &expr) -> bool {
     const auto *mul = expr.as<MulNode>();
@@ -519,15 +522,32 @@ MatchTiledIndex(const PrimExpr &index, const Var &exec, const Var &interior,
       const_offset += static_cast<int64_t>(imm->value);
       continue;
     }
+    dynamic_base = dynamic_base.defined() ? dynamic_base + term : term;
+  }
+
+  if (!seen_interior || const_offset % tile_extent != 0) {
     return std::nullopt;
   }
 
-  if (seen_interior && seen_exec && const_offset % tile_extent == 0) {
-    return TiledIndexMatch{const_offset / tile_extent, true};
+  PrimExpr partition_index =
+      PrimExpr(IntImm(index.dtype(), const_offset / tile_extent));
+  if (dynamic_base.defined()) {
+    PrimExpr extent = PrimExpr(IntImm(index.dtype(), tile_extent));
+    PrimExpr remainder = analyzer->Simplify(floormod(dynamic_base, extent));
+    if (!analyzer->CanProve(remainder == PrimExpr(IntImm(index.dtype(), 0)))) {
+      return std::nullopt;
+    }
+    PrimExpr dynamic_partition =
+        analyzer->Simplify(floordiv(dynamic_base, extent));
+    partition_index = analyzer->Simplify(partition_index + dynamic_partition);
   }
-  if (allow_standalone_interior && seen_interior && !seen_exec &&
-      const_offset % tile_extent == 0) {
-    return TiledIndexMatch{const_offset / tile_extent, false};
+
+  if (seen_exec) {
+    partition_index = analyzer->Simplify(partition_index + exec);
+    return TiledIndexMatch{const_offset / tile_extent, true, partition_index};
+  }
+  if (allow_standalone_interior) {
+    return TiledIndexMatch{const_offset / tile_extent, false, partition_index};
   }
   return std::nullopt;
 }
@@ -677,9 +697,9 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     access.partition_indices.reserve(memtensor_shape.size());
     access.tiled_dims.clear();
 
+    arith::Analyzer analyzer;
     std::vector<int> logical_tile_axes(indices.size(), -1);
-    std::vector<int64_t> logical_offsets(indices.size(), 0);
-    std::vector<bool> logical_uses_execution_index(indices.size(), false);
+    std::vector<PrimExpr> logical_partition_indices(indices.size());
     for (int dim = 0; dim < static_cast<int>(indices.size()); ++dim) {
       for (int axis = 0; axis < static_cast<int>(scope.execution_loops.size());
            ++axis) {
@@ -719,11 +739,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           auto match =
               MatchTiledIndex(indices[dim], exec_loop->loop_var,
                               interior_loop->loop_var, scope.tile_shape[axis],
-                              /*allow_standalone_interior=*/true);
+                              /*allow_standalone_interior=*/true, &analyzer);
           if (match) {
             logical_tile_axes[dim] = axis;
-            logical_offsets[dim] = match->offset;
-            logical_uses_execution_index[dim] = match->uses_execution_index;
+            logical_partition_indices[dim] = match->partition_index;
             break;
           }
         }
@@ -740,31 +759,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         access.tiled_dims.push_back(dim);
         access.tile_shape.push_back(scope.tile_shape[axis]);
         access.tile_axes.push_back(axis);
-        SunMMIOValue exec_index =
-            logical_uses_execution_index[dim]
-                ? EvalExpr(scope.execution_loops[axis]->loop_var)
-                : builder_->ConstantInt(
-                      NewValueName(), 0,
-                      SunMMIOType{
-                          SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
-                      DataType::Int(32));
-        if (logical_offsets[dim] != 0) {
-          SunMMIOValue offset = builder_->ConstantInt(
-              NewValueName(), logical_offsets[dim],
-              SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
-              DataType::Int(32));
-          exec_index = logical_uses_execution_index[dim]
-                           ? builder_->Binary(
-                                 NewValueName(), BinaryOp::kAdd,
-                                 ArithmeticFlavor::kIndex, exec_index, offset,
-                                 SunMMIOType{SunMMIOType::Kind::kIndex,
-                                             DataType::Int(32),
-                                             1,
-                                             {}},
-                                 DataType::Int(32))
-                           : offset;
-        }
-        access.partition_indices.push_back(exec_index);
+        access.partition_indices.push_back(
+            EvalExpr(logical_partition_indices[dim]));
       } else {
         if (dim < static_cast<int>(indices.size())) {
           access.partition_indices.push_back(EvalExpr(indices[dim]));

@@ -844,8 +844,46 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   // FIXME: a DRAM<->RSRAM copy should always have both layouts assigned
   if (!src_layout.defined() || !dst_layout.defined())
     return dma(src_region, dst_region);
-  if (IsLayoutMatch(src_layout, dst_layout, analyzer))
+
+  auto make_covered_full_rank1_range =
+      [&](const Buffer &buffer, const Layout &layout,
+          const Array<Range> &ranges) -> Optional<Array<Range>> {
+    if (buffer->shape.size() != 1 || ranges.size() != 1)
+      return Optional<Array<Range>>();
+    const auto *cute = layout.as<CuteLayoutNode>();
+    if (!cute)
+      return Optional<Array<Range>>();
+    Array<PrimExpr> covered_shape = cute->GetCoveredShape();
+    if (covered_shape.size() != 1)
+      return Optional<Array<Range>>();
+    const Range &range = ranges[0];
+    if (!analyzer->CanProveEqual(range->min, make_zero(range->min.dtype())) ||
+        !analyzer->CanProveEqual(range->extent, buffer->shape[0])) {
+      return Optional<Array<Range>>();
+    }
+    if (analyzer->CanProveEqual(covered_shape[0], range->extent))
+      return Optional<Array<Range>>();
+    Array<Range> covered_ranges;
+    covered_ranges.push_back(
+        Range::FromMinExtent(range->min, covered_shape[0]));
+    return covered_ranges;
+  };
+
+  if (IsLayoutMatch(src_layout, dst_layout, analyzer)) {
+    Optional<Array<Range>> covered_src_range =
+        make_covered_full_rank1_range(src, src_layout, src_range);
+    Optional<Array<Range>> covered_dst_range =
+        make_covered_full_rank1_range(dst, dst_layout, dst_range);
+    if (covered_src_range.defined() && covered_dst_range.defined() &&
+        analyzer->CanProveEqual(covered_src_range.value()[0]->extent,
+                                covered_dst_range.value()[0]->extent)) {
+      return dma(MakeRegionExpr(src, covered_src_range.value(),
+                                /*access_mask=*/1),
+                 MakeRegionExpr(dst, covered_dst_range.value(),
+                                /*access_mask=*/2));
+    }
     return dma(src_region, dst_region);
+  }
 
   // Layout doesn't match but we still have the chance to lower if we can
   // perform layout transform
