@@ -81,7 +81,7 @@ class TensorWithMeta:
             buffer._tilelang_mesh_tensor_meta = meta_data
 
     @property
-    def shape(self):
+    def global_shape(self):
         """Return the user-visible global tensor shape."""
         return self.meta_data["global_shape"]
 
@@ -104,7 +104,7 @@ class MeshTensorValue:
         TensorWithMeta._attach_meta(buffer, meta_data)
 
     @property
-    def shape(self):
+    def global_shape(self):
         """Return the user-visible global tensor shape."""
         return self.meta_data["global_shape"]
 
@@ -124,10 +124,12 @@ class MeshTensorValue:
         self.buffer[keys] = value
 
     def __getattr__(self, name):
+        if name == "shape":
+            raise AttributeError("MeshTensor.shape is ambiguous. Use `.global_shape` or `.local_shape` instead.")
         return getattr(self.buffer, name)
 
     def __repr__(self):
-        return f"MeshTensorValue(buffer={self.buffer!r}, shape={self.shape}, local_shape={self.local_shape})"
+        return f"MeshTensorValue(buffer={self.buffer!r}, global_shape={self.global_shape}, local_shape={self.local_shape})"
 
 
 def unwrap_mesh_tensor(value):
@@ -333,7 +335,7 @@ class MeshTensorProxy:
 if TYPE_CHECKING:
 
     class MeshTensor:
-        shape: tuple[Any, ...]
+        global_shape: tuple[Any, ...]
         local_shape: tuple[Any, ...]
 
         def __new__(

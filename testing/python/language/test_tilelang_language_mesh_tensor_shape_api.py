@@ -14,7 +14,8 @@ def test_mesh_tensor_shape_api_in_kernel():
         "float16",
     )
 
-    assert tensor.shape == (513, 4097)
+    assert tensor.global_shape == (513, 4097)
+    assert not hasattr(tensor, "shape")
     assert tensor.local_shape == (129, 1025)
     assert tensor.get_local_extent(0) == (129, 1025)
     assert tensor.get_local_extent(1) == (129, 1024)
@@ -26,12 +27,13 @@ def test_mesh_tensor_shape_api_in_kernel():
         @T.prim_func
         def kernel(A: tensor):
             with T.Kernel(16) as cid:
-                global_m, global_n = A.shape
+                global_m, global_n = A.global_shape
                 local_m, local_n = A.local_shape
                 valid_m, valid_n = A.get_local_extent(cid)
                 core0_m, core0_n = A.get_local_extent(0)
                 core15_m, core15_n = A.get_local_extent(15)
 
+                assert not hasattr(A, "shape")
                 assert global_m == 513
                 assert global_n == 4097
                 assert local_m == 129
@@ -55,7 +57,8 @@ def test_mesh_tensor_same_dim_row_then_col_extent():
         "float16",
     )
 
-    assert tensor.shape == (65, 9)
+    assert tensor.global_shape == (65, 9)
+    assert not hasattr(tensor, "shape")
     assert tensor.local_shape == (5, 9)
     assert tensor.get_local_extent(0) == (5, 9)
     assert tensor.get_local_extent(1) == (4, 9)
@@ -66,13 +69,14 @@ def test_mesh_tensor_same_dim_row_then_col_extent():
         @T.prim_func
         def kernel(A: tensor):
             with T.Kernel(16) as cid:
-                global_m, global_n = A.shape
+                global_m, global_n = A.global_shape
                 local_m, local_n = A.local_shape
                 valid_m, valid_n = A.get_local_extent(cid)
                 core0_m, core0_n = A.get_local_extent(0)
                 core1_m, core1_n = A.get_local_extent(1)
                 core15_m, core15_n = A.get_local_extent(15)
 
+                assert not hasattr(A, "shape")
                 assert global_m == 65
                 assert global_n == 9
                 assert local_m == 5
