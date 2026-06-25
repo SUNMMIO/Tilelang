@@ -62,7 +62,6 @@ struct PipelineStageAssembly {
 };
 ```
 
-
 ## 3. 算法流程
 
 ### 3.1 整体流程图
@@ -172,7 +171,6 @@ struct PipelineStageAssembly {
 | Body | iter=0..2 | 计算指令(0..2) + 预取指令(1..3) |
 | Epilogue | 取决于循环余数 | 剩余的计算指令 |
 
-
 ### 3.5 全局调度（GlobalPipelineScheduler::Schedule）
 
 #### 3.5.1 依赖图构建（BuildDependencyGraph）
@@ -223,7 +221,6 @@ while (主队列非空):
 3. 拓扑顺序调度每条预取指令
 4. 在其依赖完成后的第一个足够大的空闲间隙中插入
 
-
 ## 4. 关键设计决策
 
 ### 4.1 预取指令的二阶段调度
@@ -251,7 +248,6 @@ static bool Overlap(const BufferRegion &lhs, const BufferRegion &rhs) {
 
 设计文档中已预留扩展点（`Reserve an explicit extension point for future region-level overlap analysis`）。
 
-
 ## 5. 输出格式
 
 ### 5.1 循环注解
@@ -275,7 +271,6 @@ for (i, 0, N) {
 开启 `debug=true` 时输出：
 - `prologue.log` / `body.log` / `epilogue.log`：各阶段调度详情
 - `body_graph.log`：依赖图节点和边信息
-
 
 ## 6. 用法
 
