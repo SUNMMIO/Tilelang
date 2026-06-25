@@ -1,3 +1,5 @@
+import os
+
 import tilelang.language as T
 from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
@@ -89,11 +91,10 @@ def summa_matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtyp
     return kernel
 
 
-def test_summa():
+def test_summa(is_log=False):
     func = summa_matmul(128, 128, 128, 32, 32, 32)
 
-    script_device_mode = [
-        """
+    script_device_mode = """
         with T.launch_thread("blockIdx.x", 16) as bx:
             T.barrier_init(T.int64(15))
             T.barrier_init(T.int64(4369))
@@ -121,8 +122,7 @@ def test_summa():
                 T.dma_copy(T.region(C_local[0, 0], 1, 32, 32), T.region(C_1[0, 0], 2, 32, 32), 0, T.sync_token_id(4))
             T.wait_token(4)
         return 0
-        """,
-    ]
+    """
 
     script_lower_tile_op = [
         'A = T.match_buffer(A_handle, (32, 32), "float16", strides=(32, 1))',
@@ -168,9 +168,19 @@ def test_summa():
         },
     }
     test_config = get_or_add_default_verify(func, test_config)
-    compile_test(func, target="Sunmmio", test_config=test_config)
-    # compile_test(func, out_idx=[2], target="Sunmmio", log_pass_output=True, log_dir=os.path.join(os.path.dirname(__file__), "_debug", "summa"), remove_header=True)
+    if not is_log:
+        compile_test(func, out_idx=[2], target="Sunmmio", test_config=test_config)
+    else:
+        compile_test(
+            func,
+            out_idx=[2],
+            target="Sunmmio",
+            log_pass_output=True,
+            log_dir=os.path.join(os.path.dirname(__file__), "_debug", "summa"),
+            remove_header=True,
+        )
 
 
 if __name__ == "__main__":
     test_summa()
+    # test_summa(is_log=True)
