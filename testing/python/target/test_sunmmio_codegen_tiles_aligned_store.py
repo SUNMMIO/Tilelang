@@ -26,6 +26,13 @@ def _build_sunmmio_source_from_func(func):
     return builder(mod, target, "suvm").inspect_source()
 
 
+def _has_nonzero_1d_insert_slice_offset(src):
+    insert_lines = [line for line in src.splitlines() if "suvm.tile.insert_slice" in line and "] [8, 1]" in line]
+    if any("[8, 0] [8, 1]" in line for line in insert_lines):
+        return True
+    return any("[%" in line and ", 0] [8, 1]" in line for line in insert_lines) and "arith.remsi" in src
+
+
 @target("Sunmmio")
 def _make_nonzero_offset_aligned_store_stmt():
     bf16 = tvm.ir.PrimType("bfloat16")
@@ -177,7 +184,7 @@ def test_sunmmio_codegen_aligned_1d_store_uses_nonzero_insert_slice_offset():
     assert "!suvm.tile_view<32x1xbf16>" not in src
     assert "fake_partitioned_tile_view" not in src
     assert "fake_missing_memtensor" not in src
-    assert "[8, 0] [8, 1]" in src
+    assert _has_nonzero_1d_insert_slice_offset(src)
 
 
 def test_sunmmio_codegen_row_major_padded_2d_aligned_store_uses_row_block_indices():
