@@ -5,7 +5,7 @@
  */
 
 #include "../op/utils.h"
-#include "common/ast_traverser.h"
+#include "sunmmio_pipeline_planning/ast_traverser.h"
 #include "sunmmio_pipeline_planning/cost_model.h"
 #include "sunmmio_pipeline_planning/hardware_types.h"
 
