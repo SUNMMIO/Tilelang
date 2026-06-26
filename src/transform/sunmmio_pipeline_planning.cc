@@ -1,13 +1,18 @@
 /*!
  * \file sunmmio_pipeline_planning.cc
- * \brief Refactored pipeline planning pass using Dataflow Propagation and Local
- * DDG.
+ * \brief
+ * This file implements a greedy software pipeline scheduling algorithm for
+ * Sunmmio. 1.1 Build a local DDG. 1.2 Identify prefetch instructions. 1.3
+ * Identify multi-versioned buffers.
+ * 2. Unroll DDG according to num_stages, while considering prefetch
+ * instructions. 3.1 Schedule instructions in the global DDG with a b-level
+ * based greedy algorithm. 3.2 Insert prefetch instructions.
  */
 
 #include "../op/utils.h"
-#include "common/ast_traverser.h"
-#include "sunmmio_pipeline_planning/cost_model.h"
-#include "sunmmio_pipeline_planning/hardware_types.h"
+#include "../target/sunmmio/cost_model.h"
+#include "../target/sunmmio/hardware_types.h"
+#include "sunmmio_pipeline_planning/stmt_read_write_collector.h"
 
 #include <algorithm>
 #include <deque>
@@ -97,13 +102,13 @@ public:
       : id(id), iter(iter), stmt(stmt),
         name(std::to_string(iter) + "-" + std::to_string(id)) {}
 
-  void ExtractRegions(ASTTraverser &traverser) {
-    traverser.clear();
-    traverser.traverse_stmt(stmt);
-    reads.assign(traverser.read_buffer_regions_.begin(),
-                 traverser.read_buffer_regions_.end());
-    writes.assign(traverser.write_buffer_regions_.begin(),
-                  traverser.write_buffer_regions_.end());
+  void ExtractRegions(StmtReadWriteCollector &stmt_rw_collector) {
+    stmt_rw_collector.clear();
+    stmt_rw_collector.traverse_stmt(stmt);
+    reads.assign(stmt_rw_collector.read_buffer_regions_.begin(),
+                 stmt_rw_collector.read_buffer_regions_.end());
+    writes.assign(stmt_rw_collector.write_buffer_regions_.begin(),
+                  stmt_rw_collector.write_buffer_regions_.end());
   }
 
   bool operator==(const PipelineInstruction &other) const {
@@ -1101,9 +1106,9 @@ public:
   }
 
   SunmmioPipelinePlanner(const PrimFunc &f, bool debug)
-      : traverser_(f), debug_(debug) {}
+      : stmt_rw_collector_(f), debug_(debug) {}
 
-  ASTTraverser traverser_;
+  StmtReadWriteCollector stmt_rw_collector_;
   bool debug_ = false;
 
   Stmt VisitStmt_(const ForNode *op) final {
@@ -1142,7 +1147,7 @@ public:
       PipelineInstruction instruction(static_cast<int>(i), 0,
                                       pipeline_body_seq->seq[i]);
       instruction.device_type = HardwareMapper::Map(instruction.stmt);
-      instruction.ExtractRegions(traverser_);
+      instruction.ExtractRegions(stmt_rw_collector_);
       instruction.delay =
           CostModel::EstimateDelay(instruction.device_type, instruction.stmt);
       single_iteration_instructions.push_back(instruction);

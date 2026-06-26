@@ -46,8 +46,9 @@ def allreduce_kernel(direction="all", clear=True, dtype="float32"):
 class AllreduceIRChecker(tir.PyStmtExprVisitor):
     def __init__(self):
         super().__init__()
-        self.broadcast_count = 0
-        self.in_tile_reduce_count = 0
+        self.broadcast_calls = []
+        self.dma_copy_calls = []
+        self.in_tile_reduce_calls = []
         self.rsram_alloc_names = []
 
     def visit_block_(self, op):
@@ -59,37 +60,40 @@ class AllreduceIRChecker(tir.PyStmtExprVisitor):
     def visit_call_(self, op):
         if hasattr(op, "op") and hasattr(op.op, "name"):
             if op.op.name == "tl.broadcast_":
-                self.broadcast_count += 1
+                self.broadcast_calls.append(op)
+            elif op.op.name == "tl.dma_copy":
+                self.dma_copy_calls.append(op)
             elif op.op.name == "tl.vector_core_in_tile_reduce":
-                self.in_tile_reduce_count += 1
+                self.in_tile_reduce_calls.append(op)
         super().visit_call_(op)
 
 
-def test_tilelang_allreduce_frontend_allocates_rsram_temporaries():
-    script = allreduce_kernel(direction="all", clear=False).script()
+def _region_access_mask(region_call):
+    assert isinstance(region_call, tir.Call)
+    assert region_call.op.name == "tl.tileop.region"
+    return int(region_call.args[1])
 
-    assert 'buffer = T.alloc_buffer((4, 32), scope="shared.rsram")' in script
-    assert 'buffer_1 = T.alloc_buffer((4, 32), scope="shared.rsram")' in script
-    assert 'buffer_2 = T.alloc_buffer((32,), scope="shared.rsram")' in script
-    assert (
-        "T.comm_allreduce(A_shared[0:32, 0:32], Out_shared[0:32], "
-        'buffer[0:4, 0:32], buffer_1[0:4, 0:32], "sum", 2, 1, '
-        "T.bool(False), buffer_2[0:32], bx)"
-    ) in script
+
+def _region_buffer_name(region_call):
+    assert isinstance(region_call, tir.Call)
+    assert region_call.op.name == "tl.tileop.region"
+    load = region_call.args[0]
+    assert isinstance(load, tir.BufferLoad)
+    return load.buffer.name
 
 
 @pytest.mark.parametrize(
-    "direction, clear, expected_broadcasts",
+    "direction, clear, expected_directions",
     [
-        ("h", True, 1),
-        ("v", True, 1),
-        ("all", True, 2),
-        ("h", False, 1),
-        ("v", False, 1),
-        ("all", False, 2),
+        ("h", True, [0]),
+        ("v", True, [1]),
+        ("all", True, [0, 1]),
+        ("h", False, [0]),
+        ("v", False, [1]),
+        ("all", False, [0, 1]),
     ],
 )
-def test_tilelang_allreduce_sunmmio_lowers_to_broadcast_and_tile_reduce(direction, clear, expected_broadcasts):
+def test_tilelang_allreduce_sunmmio_lowers_to_broadcast_and_tile_reduce(direction, clear, expected_directions):
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     mod = allreduce_kernel(direction=direction, clear=clear)
 
@@ -99,5 +103,16 @@ def test_tilelang_allreduce_sunmmio_lowers_to_broadcast_and_tile_reduce(directio
     checker = AllreduceIRChecker()
     checker.visit_stmt(mod["main"].body)
 
-    assert checker.broadcast_count == expected_broadcasts
-    assert checker.in_tile_reduce_count >= 2
+    assert len(checker.broadcast_calls) == len(expected_directions)
+    assert [int(call.args[2]) for call in checker.broadcast_calls] == expected_directions
+    assert all(len(call.args) == 5 for call in checker.broadcast_calls)
+    assert all(_region_access_mask(call.args[0]) == 1 for call in checker.broadcast_calls)
+    assert all(_region_access_mask(call.args[1]) == 2 for call in checker.broadcast_calls)
+    assert all(int(call.args[3]) == 15 for call in checker.broadcast_calls)
+    assert all(int(call.args[4]) == 0 for call in checker.broadcast_calls)
+    assert len(checker.in_tile_reduce_calls) >= 2
+    dma_buffer_pairs = [(_region_buffer_name(call.args[0]), _region_buffer_name(call.args[1])) for call in checker.dma_copy_calls]
+    if clear:
+        assert ("Out", "Out_shared") not in dma_buffer_pairs
+    else:
+        assert ("Out", "Out_shared") in dma_buffer_pairs

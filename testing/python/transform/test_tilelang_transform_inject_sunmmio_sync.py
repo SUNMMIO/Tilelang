@@ -370,6 +370,73 @@ def _make_mixed_level_nested_broadcast_mod(target):
     return tir.transform.BindTarget(target)(mod)
 
 
+def _make_while_pair_broadcast_mod(target):
+    src_data = _pointer_var("src")
+    dst_data = _pointer_var("dst")
+    src_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="src_buf",
+        data=src_data,
+        scope="shared.rsram",
+    )
+    dst_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="dst_buf",
+        data=dst_data,
+        scope="shared.rsram",
+    )
+    i = tir.Var("i", "int32")
+    first_broadcast = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.broadcast_"),
+            _region(src_buf, 1),
+            _region(dst_buf, 2),
+            tir.IntImm("int32", 0),
+            tir.IntImm("int64", 15),
+            tir.IntImm("int32", 0),
+            tir.IntImm("int32", 0),
+        )
+    )
+    second_broadcast = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.broadcast_"),
+            _region(dst_buf, 1),
+            _region(src_buf, 2),
+            tir.IntImm("int32", 0),
+            tir.IntImm("int64", 15),
+            tir.IntImm("int32", 0),
+            tir.IntImm("int32", 0),
+        )
+    )
+    while_loop = tir.LetStmt(
+        i,
+        tir.IntImm("int32", 0),
+        tir.While(
+            i < tir.IntImm("int32", 2),
+            tir.SeqStmt(
+                [
+                    first_broadcast,
+                    second_broadcast,
+                    tir.LetStmt(i, i + tir.IntImm("int32", 1), tir.Evaluate(0)),
+                ]
+            ),
+        ),
+    )
+    body = tir.DeclBuffer(
+        src_buf,
+        tir.DeclBuffer(dst_buf, while_loop),
+    )
+    func = tir.PrimFunc([src_data, dst_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
 def _parse_numeric_barrier_mask(line, marker="barrier_init"):
     match = re.search(rf"{marker}\((?:T\.int64\()?(-?\d+)\)?\)", line)
     assert match, f"expected {marker}(participant_mask), got: {line}"
@@ -907,6 +974,66 @@ def test_inject_sunmmio_sync_loop():
     assert barrier_wait_after_second
 
 
+def test_inject_sunmmio_sync_while_loop_carried_tokens():
+    target = get_target("Sunmmio")
+    mod = _make_while_pair_broadcast_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    script = mod.script(show_meta=True)
+    lines = script.splitlines()
+
+    def extract_call_id(line, marker):
+        match = re.search(rf"{re.escape(marker)}\((\d+)\)", line)
+        assert match, f"Cannot parse {marker} in line: {line}"
+        return int(match.group(1))
+
+    assert "while i < 2:" in script
+    assert "T.sync_null_token" in script
+
+    broadcast_entries = [
+        (idx, line.strip(), extract_call_id(line, "sync_token_id"))
+        for idx, line in enumerate(lines)
+        if "broadcast_" in line and "sync_token_id(" in line
+    ]
+    assert len(broadcast_entries) == 2
+
+    first_bcast_idx, first_bcast_line, first_token = broadcast_entries[0]
+    second_bcast_idx, second_bcast_line, second_token = broadcast_entries[1]
+    assert first_token == 0
+    assert second_token == 1
+    assert "T.sync_token_id(0)" in first_bcast_line
+    assert "T.sync_token_id(1)" in second_bcast_line
+
+    wait_entries = [(idx, line.strip(), extract_call_id(line, "wait_token")) for idx, line in enumerate(lines) if "wait_token(" in line]
+    null_token_entries = [
+        (idx, line.strip(), extract_call_id(line, "sync_null_token")) for idx, line in enumerate(lines) if "sync_null_token(" in line
+    ]
+    barrier_init_entries = [
+        (idx, line.strip(), _parse_numeric_barrier_mask(line)) for idx, line in enumerate(lines) if "barrier_init(" in line
+    ]
+    barrier_wait_entries = [
+        (idx, line.strip(), _parse_numeric_barrier_mask(line, "barrier_arrive_and_wait"))
+        for idx, line in enumerate(lines)
+        if "barrier_arrive_and_wait(" in line
+    ]
+    assert len(barrier_init_entries) == 1
+    assert barrier_init_entries[0][2] == 15
+    assert all(mask == 15 for _, _, mask in barrier_wait_entries)
+
+    while_idx = next(idx for idx, line in enumerate(lines) if "while i < 2:" in line)
+    assert any(token == second_token and idx < while_idx for idx, _, token in null_token_entries)
+
+    carried_wait_before_first = [idx for idx, _, token in wait_entries if token == second_token and while_idx < idx < first_bcast_idx]
+    wait_first_between = [idx for idx, _, token in wait_entries if token == first_token and first_bcast_idx < idx < second_bcast_idx]
+    assert carried_wait_before_first
+    assert wait_first_between
+
+    barrier_wait_before_first = [idx for idx, _, _ in barrier_wait_entries if min(carried_wait_before_first) < idx < first_bcast_idx]
+    barrier_wait_between = [idx for idx, _, _ in barrier_wait_entries if min(wait_first_between) < idx < second_bcast_idx]
+    assert barrier_wait_before_first
+    assert barrier_wait_between
+
+
 if __name__ == "__main__":
     test_inject_sunmmio_sync_dma()
     test_inject_sunmmio_sync_mma()
@@ -917,3 +1044,4 @@ if __name__ == "__main__":
     test_inject_sunmmio_sync_nested_loop_reuses_tokens_without_mixing_levels()
     test_inject_sunmmio_sync_if()
     test_inject_sunmmio_sync_loop()
+    test_inject_sunmmio_sync_while_loop_carried_tokens()
