@@ -354,6 +354,89 @@ def _make_while_pair_broadcast_mod(target):
     return tir.transform.BindTarget(target)(mod)
 
 
+def _make_mixed_level_nested_broadcast_mod(target):
+    outer_src_data = _pointer_var("outer_src")
+    outer_dst_data = _pointer_var("outer_dst")
+    inner_src_data = _pointer_var("inner_src")
+    inner_dst_data = _pointer_var("inner_dst")
+    outer_src_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="outer_src_buf",
+        data=outer_src_data,
+        scope="shared.rsram",
+    )
+    outer_dst_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="outer_dst_buf",
+        data=outer_dst_data,
+        scope="shared.rsram",
+    )
+    inner_src_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="inner_src_buf",
+        data=inner_src_data,
+        scope="shared.rsram",
+    )
+    inner_dst_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="inner_dst_buf",
+        data=inner_dst_data,
+        scope="shared.rsram",
+    )
+
+    def make_broadcast(src_buf, dst_buf, direction):
+        return tir.Evaluate(
+            tir.call_intrin(
+                "handle",
+                tir.op.Op.get("tl.broadcast_"),
+                _region(src_buf, 1),
+                _region(dst_buf, 2),
+                tir.IntImm("int32", direction),
+                tir.IntImm("int64", 15),
+                tir.IntImm("int32", 0),
+                tir.IntImm("int32", 0),
+            )
+        )
+
+    outer = tir.Var("outer", "int32")
+    inner = tir.Var("inner", "int32")
+    outer_broadcast = make_broadcast(outer_src_buf, outer_dst_buf, 0)
+    inner_broadcast = make_broadcast(inner_src_buf, inner_dst_buf, 1)
+    inner_loop = tir.For(
+        inner,
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 2),
+        tir.ForKind.SERIAL,
+        inner_broadcast,
+    )
+    outer_loop = tir.For(
+        outer,
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 2),
+        tir.ForKind.SERIAL,
+        tir.SeqStmt([outer_broadcast, inner_loop]),
+    )
+    body = tir.DeclBuffer(
+        outer_src_buf,
+        tir.DeclBuffer(
+            outer_dst_buf,
+            tir.DeclBuffer(
+                inner_src_buf,
+                tir.DeclBuffer(inner_dst_buf, outer_loop),
+            ),
+        ),
+    )
+    func = tir.PrimFunc([outer_src_data, outer_dst_data, inner_src_data, inner_dst_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
 def _parse_numeric_barrier_mask(line, marker="barrier_init"):
     match = re.search(rf"{marker}\((?:T\.int64\()?(-?\d+)\)?\)", line)
     assert match, f"expected {marker}(participant_mask), got: {line}"
@@ -658,6 +741,44 @@ def test_inject_sunmmio_sync_dynamic_pair_mask_candidates():
         assert _parse_barrier_args(line, "barrier_arrive_and_wait")[-len(pair_candidates) :] == pair_candidates
 
 
+def test_inject_sunmmio_sync_nested_loop_reuses_tokens_without_mixing_levels():
+    target = get_target("Sunmmio")
+    mod = _make_mixed_level_nested_broadcast_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    script = mod.script()
+
+    lines = [line.strip() for line in script.splitlines()]
+
+    def extract_call_id(line, marker):
+        match = re.search(rf"{re.escape(marker)}\((\d+)\)", line)
+        assert match, f"Cannot parse {marker} in line: {line}"
+        return int(match.group(1))
+
+    broadcast_entries = [
+        (idx, line, extract_call_id(line, "sync_token_id"))
+        for idx, line in enumerate(lines)
+        if "broadcast_" in line and "sync_token_id(" in line
+    ]
+    wait_ids = {extract_call_id(line, "wait_token") for line in lines if "wait_token(" in line}
+    null_ids = {extract_call_id(line, "sync_null_token") for line in lines if "sync_null_token(" in line}
+    sync_ids = {token for _, _, token in broadcast_entries}
+
+    assert len(broadcast_entries) == 2
+    outer_idx, outer_line, outer_token = broadcast_entries[0]
+    inner_idx, inner_line, inner_token = broadcast_entries[1]
+    assert outer_token != inner_token
+    assert "outer_src_buf" in outer_line and "outer_dst_buf" in outer_line
+    assert "inner_src_buf" in inner_line and "inner_dst_buf" in inner_line
+    assert outer_idx < inner_idx
+
+    # Any loop-entry null token must correspond to a real async op and a wait.
+    assert null_ids
+    assert null_ids.issubset(sync_ids)
+    assert null_ids.issubset(wait_ids)
+    assert sync_ids.issubset(wait_ids)
+
+
 def test_inject_sunmmio_sync_if():
     def kernel(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float32"):
         @T.prim_func
@@ -920,6 +1041,7 @@ if __name__ == "__main__":
     test_inject_sunmmio_sync_broadcast_without_src_core_full_mesh_barrier()
     test_inject_sunmmio_sync_dynamic_broadcast_mask_candidates()
     test_inject_sunmmio_sync_dynamic_pair_mask_candidates()
+    test_inject_sunmmio_sync_nested_loop_reuses_tokens_without_mixing_levels()
     test_inject_sunmmio_sync_if()
     test_inject_sunmmio_sync_loop()
     test_inject_sunmmio_sync_while_loop_carried_tokens()
