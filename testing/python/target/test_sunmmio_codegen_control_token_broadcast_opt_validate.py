@@ -169,6 +169,16 @@ def test_broadcast_dynamic_mask_codegen_validates_with_npuir_opt(tmp_path):
     assert "sunmmio.fake" not in src
 
 
+def test_broadcast_missing_dynamic_mask_fails_loudly():
+    src_data, dst_data, src_buf, dst_buf = _shared_buffers()
+    missing_mask = tvm.tir.Var("missing_mask", "int64")
+    body = tvm.tir.Evaluate(_broadcast(src_buf, dst_buf, mask=missing_mask, token_id=7))
+    stmt = _with_decl_buffers(body, [src_buf, dst_buf])
+
+    with pytest.raises(Exception, match="Missing MLIR value.*missing_mask"):
+        _build_sunmmio_source_from_stmt(stmt, params=[src_data, dst_data])
+
+
 def test_broadcast_with_src_core_guards_mcast_codegen_validates_with_npuir_opt(tmp_path):
     stmt, params = _broadcast_stmt(src_core=tvm.tir.IntImm("int32", 0), token_id=2, wait=True)
     src = _validate_stmt_codegen(

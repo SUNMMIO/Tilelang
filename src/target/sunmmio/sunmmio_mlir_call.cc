@@ -421,8 +421,8 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
           << "tl.barrier_arrive_and_wait dynamic mask expects one mask operand";
       mlir::Value dynamic_mask = ctx_.LookupMLIRValue(operands[0].value);
       if (!dynamic_mask) {
-        dynamic_mask = type.ResolveValueOrCreatePlaceholder(
-            operands[0], ctx_.builder.getI64Type());
+        dynamic_mask =
+            type.ResolveValue(operands[0], ctx_.builder.getI64Type());
       }
       dynamic_mask =
           ensure_i64(dynamic_mask, "tl.barrier_arrive_and_wait mask");
@@ -509,8 +509,7 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
 
     mlir::Value mask = ctx_.LookupMLIRValue(operands[2].value);
     if (!mask) {
-      mask = type.ResolveValueOrCreatePlaceholder(operands[2],
-                                                  ctx_.builder.getI64Type());
+      mask = type.ResolveValue(operands[2], ctx_.builder.getI64Type());
     }
     mask = ensure_i64(mask, "tl.broadcast_ mask");
 
@@ -532,8 +531,7 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     if (operands.size() == 4) {
       mlir::Value src_core = ctx_.LookupMLIRValue(operands[3].value);
       if (!src_core) {
-        src_core = type.ResolveValueOrCreatePlaceholder(
-            operands[3], ctx_.builder.getI64Type());
+        src_core = type.ResolveValue(operands[3], ctx_.builder.getI64Type());
       }
       src_core = ensure_i64(src_core, "tl.broadcast_ src_core");
 

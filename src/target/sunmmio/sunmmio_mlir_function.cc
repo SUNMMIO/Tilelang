@@ -131,12 +131,12 @@ void SunmmioMlirFunction::BeginFor(
     const ffi::Map<ffi::String, ffi::Any> &annotations,
     const std::vector<int64_t> &live_out_token_ids,
     const std::vector<SunMMIOValue> &live_out_values) {
-  mlir::Value lb_v = type_.EnsureIndex(
-      type_.ResolveValueOrCreatePlaceholder(lb, ctx_.builder.getIndexType()));
-  mlir::Value ub_v = type_.EnsureIndex(
-      type_.ResolveValueOrCreatePlaceholder(ub, ctx_.builder.getIndexType()));
-  mlir::Value step_v = type_.EnsureIndex(
-      type_.ResolveValueOrCreatePlaceholder(step, ctx_.builder.getIndexType()));
+  mlir::Value lb_v =
+      type_.EnsureIndex(type_.ResolveValue(lb, ctx_.builder.getIndexType()));
+  mlir::Value ub_v =
+      type_.EnsureIndex(type_.ResolveValue(ub, ctx_.builder.getIndexType()));
+  mlir::Value step_v =
+      type_.EnsureIndex(type_.ResolveValue(step, ctx_.builder.getIndexType()));
 
   mlir::SmallVector<mlir::Value, 8> init_args;
   init_args.reserve(live_out_token_ids.size() + live_out_values.size());
@@ -152,7 +152,7 @@ void SunmmioMlirFunction::BeginFor(
     mlir::Type expected_type = type_.MapType(value.type);
     mlir::Value init = ctx_.LookupMLIRValue(value.value);
     if (!init) {
-      init = type_.ResolveValueOrCreatePlaceholder(value, expected_type);
+      init = type_.ResolveValue(value, expected_type);
     }
     init_args.push_back(init);
   }
@@ -328,7 +328,7 @@ void SunmmioMlirFunction::BeginWhile(
     mlir::Type expected_type = type_.MapType(value.type);
     mlir::Value init = ctx_.LookupMLIRValue(value.value);
     if (!init) {
-      init = type_.ResolveValueOrCreatePlaceholder(value, expected_type);
+      init = type_.ResolveValue(value, expected_type);
     }
     init_args.push_back(init);
   }
@@ -399,8 +399,8 @@ void SunmmioMlirFunction::BeginWhileBody(const SunMMIOValue &cond) {
 
   SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack.back();
   frame.in_body = true;
-  mlir::Value cond_v = type_.EnsureI1(
-      type_.ResolveValueOrCreatePlaceholder(cond, ctx_.builder.getI1Type()));
+  mlir::Value cond_v =
+      type_.EnsureI1(type_.ResolveValue(cond, ctx_.builder.getI1Type()));
 
   mlir::SmallVector<mlir::Value, 8> condition_args;
   condition_args.append(frame.before_tokens.begin(), frame.before_tokens.end());
@@ -555,8 +555,8 @@ void SunmmioMlirFunction::BeginIf(
 void SunmmioMlirFunction::BeginIf(
     const SunMMIOValue &cond, const std::vector<int64_t> &live_out_token_ids,
     const std::vector<SunMMIOValue> &live_out_values) {
-  mlir::Value cond_v = type_.EnsureI1(
-      type_.ResolveValueOrCreatePlaceholder(cond, ctx_.builder.getI1Type()));
+  mlir::Value cond_v =
+      type_.EnsureI1(type_.ResolveValue(cond, ctx_.builder.getI1Type()));
   mlir::Type token_ty = mlir::suvm::TokenType::get(&ctx_.mlir_ctx);
   mlir::SmallVector<mlir::Type, 8> result_types;
   result_types.reserve(live_out_token_ids.size() + live_out_values.size());
@@ -592,8 +592,7 @@ void SunmmioMlirFunction::BeginIf(
   for (const SunMMIOValue &value : live_out_values) {
     mlir::Value base = ctx_.LookupMLIRValue(value.value);
     if (!base) {
-      base = type_.ResolveValueOrCreatePlaceholder(value,
-                                                   type_.MapType(value.type));
+      base = type_.ResolveValue(value, type_.MapType(value.type));
     }
     base_values.push_back(base);
   }
@@ -814,8 +813,8 @@ void SunmmioMlirFunction::EndIf() {
 
 void SunmmioMlirFunction::EmitAssert(const SunMMIOValue &cond,
                                      const std::string &msg_text) {
-  mlir::Value cond_v = type_.EnsureI1(
-      type_.ResolveValueOrCreatePlaceholder(cond, ctx_.builder.getI1Type()));
+  mlir::Value cond_v =
+      type_.EnsureI1(type_.ResolveValue(cond, ctx_.builder.getI1Type()));
   mlir::cf::AssertOp::create(ctx_.builder, type_.Loc(), cond_v,
                              ctx_.builder.getStringAttr(msg_text));
 }

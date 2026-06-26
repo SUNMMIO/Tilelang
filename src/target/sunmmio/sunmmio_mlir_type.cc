@@ -5,10 +5,45 @@
 #include "npuir/Dialect/SUVM/IR/Types.h"
 #include "sunmmio_mlir_context.h"
 #include "tvm/runtime/logging.h"
+#include "llvm/Support/raw_ostream.h"
 #include <tvm/arith/analyzer.h>
 
 namespace tvm {
 namespace codegen {
+
+namespace {
+
+std::string MlirTypeToString(mlir::Type type) {
+  if (!type) {
+    return "<none>";
+  }
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  type.print(os);
+  return str;
+}
+
+bool IsCompatibleResolvedType(mlir::Type actual, mlir::Type expected) {
+  if (!expected || actual == expected) {
+    return true;
+  }
+  if (expected.isIndex()) {
+    return actual.isIndex() || mlir::isa<mlir::IntegerType>(actual);
+  }
+  if (expected.isInteger(1)) {
+    return actual.isIndex() || mlir::isa<mlir::IntegerType>(actual) ||
+           mlir::isa<mlir::FloatType>(actual);
+  }
+  if (mlir::isa<mlir::IntegerType>(expected)) {
+    return actual.isIndex() || mlir::isa<mlir::IntegerType>(actual);
+  }
+  if (mlir::isa<mlir::FloatType>(expected)) {
+    return mlir::isa<mlir::FloatType>(actual);
+  }
+  return false;
+}
+
+} // namespace
 
 std::vector<int64_t> ExtractShape(const SunMMIOType &type) {
   std::vector<int64_t> shape;
@@ -217,7 +252,8 @@ mlir::Type SunmmioMlirType::MapType(const SunMMIOType &type) const {
 
 mlir::Value SunmmioMlirType::EnsureI1(mlir::Value v) {
   if (!v) {
-    return mlir::arith::ConstantIntOp::create(ctx_.builder, Loc(), 1, 1);
+    LOG(FATAL) << "Cannot coerce missing MLIR value to i1";
+    TVM_FFI_UNREACHABLE();
   }
   mlir::Type ty = v.getType();
   if (ty.isInteger(1)) {
@@ -244,12 +280,14 @@ mlir::Value SunmmioMlirType::EnsureI1(mlir::Value v) {
     return mlir::arith::CmpFOp::create(
         ctx_.builder, Loc(), mlir::arith::CmpFPredicate::ONE, v, zero);
   }
-  return mlir::arith::ConstantIntOp::create(ctx_.builder, Loc(), 1, 1);
+  LOG(FATAL) << "Cannot coerce unsupported MLIR value type to i1";
+  TVM_FFI_UNREACHABLE();
 }
 
 mlir::Value SunmmioMlirType::EnsureIndex(mlir::Value v) {
   if (!v) {
-    return mlir::arith::ConstantIndexOp::create(ctx_.builder, Loc(), 0);
+    LOG(FATAL) << "Cannot coerce missing MLIR value to index";
+    TVM_FFI_UNREACHABLE();
   }
   if (v.getType().isIndex()) {
     return v;
@@ -258,38 +296,29 @@ mlir::Value SunmmioMlirType::EnsureIndex(mlir::Value v) {
     return mlir::arith::IndexCastOp::create(ctx_.builder, Loc(),
                                             ctx_.builder.getIndexType(), v);
   }
-  return mlir::arith::ConstantIndexOp::create(ctx_.builder, Loc(), 0);
+  LOG(FATAL) << "Cannot coerce unsupported MLIR value type to index";
+  TVM_FFI_UNREACHABLE();
 }
 
-mlir::Value
-SunmmioMlirType::ResolveValueOrCreatePlaceholder(const SunMMIOValue &v,
-                                                 mlir::Type expected_type) {
+mlir::Value SunmmioMlirType::ResolveValue(const SunMMIOValue &v,
+                                          mlir::Type expected_type) {
   if (!v.value.empty()) {
     mlir::Value existing = ctx_.LookupMLIRValue(v.value);
     if (existing) {
+      if (!IsCompatibleResolvedType(existing.getType(), expected_type)) {
+        LOG(FATAL) << "MLIR value for SunMMIO SSA value `" << v.value
+                   << "` has type " << MlirTypeToString(existing.getType())
+                   << ", expected compatible with "
+                   << MlirTypeToString(expected_type);
+      }
       return existing;
     }
   }
 
-  mlir::Type ty = expected_type ? expected_type : MapType(v.type);
-  if (ty.isIndex()) {
-    return mlir::arith::ConstantIndexOp::create(ctx_.builder, Loc(), 0);
-  }
-  if (ty.isInteger(1)) {
-    return mlir::arith::ConstantIntOp::create(ctx_.builder, Loc(), 1, 1);
-  }
-  if (auto int_ty = mlir::dyn_cast<mlir::IntegerType>(ty)) {
-    return mlir::arith::ConstantIntOp::create(ctx_.builder, Loc(), 0,
-                                              int_ty.getWidth());
-  }
-  if (auto float_ty = mlir::dyn_cast<mlir::FloatType>(ty)) {
-    mlir::Type float_type =
-        mlir::Type::getFromOpaquePointer(float_ty.getAsOpaquePointer());
-    return mlir::arith::ConstantOp::create(
-               ctx_.builder, Loc(), ctx_.builder.getFloatAttr(float_type, 0.0))
-        .getResult();
-  }
-  return mlir::Value();
+  LOG(FATAL) << "Missing MLIR value for SunMMIO SSA value `"
+             << (v.value.empty() ? std::string("<unnamed>") : v.value)
+             << "`; expected type " << MlirTypeToString(expected_type);
+  TVM_FFI_UNREACHABLE();
 }
 
 } // namespace codegen

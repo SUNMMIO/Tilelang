@@ -81,8 +81,7 @@ MixedIndexList BuildMixedIndexList(SunmmioMlirContext &ctx,
     mlir::Value mlir_value =
         value.value.empty() ? mlir::Value() : ctx.LookupMLIRValue(value.value);
     if (!mlir_value) {
-      mlir_value = type.ResolveValueOrCreatePlaceholder(
-          value, ctx.builder.getIndexType());
+      mlir_value = type.ResolveValue(value, ctx.builder.getIndexType());
     }
     mlir_value = type.EnsureIndex(mlir_value);
     if (auto cst = mlir::getConstantIntValue(mlir_value)) {
@@ -175,8 +174,7 @@ SunMMIOValue SunmmioMlirTileOp::GetPartitionedTileView(
     SunmmioMlirType type(ctx_);
     for (const SunMMIOValue &idx : indices) {
       mlir::Value idx_value =
-          type.EnsureIndex(type.ResolveValueOrCreatePlaceholder(
-              idx, ctx_.builder.getIndexType()));
+          type.EnsureIndex(type.ResolveValue(idx, ctx_.builder.getIndexType()));
       st.addOperands(idx_value);
     }
     st.addAttribute("tiled_dims",
@@ -192,8 +190,8 @@ SunMMIOValue SunmmioMlirTileOp::GetPartitionedTileView(
         ctx_.LookupOrCreateFakeValue(memtensor, "fake_missing_memtensor"));
     SunmmioMlirType type(ctx_);
     for (const SunMMIOValue &idx : indices) {
-      operands.push_back(type.EnsureIndex(type.ResolveValueOrCreatePlaceholder(
-          idx, ctx_.builder.getIndexType())));
+      operands.push_back(type.EnsureIndex(
+          type.ResolveValue(idx, ctx_.builder.getIndexType())));
     }
     view_value = CreateTypedPlaceholderWithOperands(
         ctx_, result_type, operands, "fake_partitioned_tile_view");
@@ -638,8 +636,7 @@ SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
 
   auto to_i32_scalar = [&](const SunMMIOValue &value,
                            llvm::StringRef debug_tag) -> mlir::Value {
-    mlir::Value raw = type_.ResolveValueOrCreatePlaceholder(
-        value, ctx_.builder.getIndexType());
+    mlir::Value raw = type_.ResolveValue(value, ctx_.builder.getIndexType());
     if (raw.getType().isIndex()) {
       return mlir::arith::IndexCastOp::create(
           ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc(debug_tag.str()),
