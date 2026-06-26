@@ -112,11 +112,18 @@ def get_layout_visual_formats(pass_ctx: PassContext | None = None) -> list[str]:
     return formats_list
 
 
-def LayoutVisual(mod: IRModule) -> None:
+def LayoutVisual(mod: IRModule, target: Target | None = None) -> None:
     """Apply layout visualization pass if enabled."""
     if should_enable_layout_visual():
         formats = get_layout_visual_formats()
-        tilelang.analysis.LayoutVisual(formats=formats)(mod)
+        if target is not None and target_is_sunmmio(target):
+            # Sunmmio uses CuteLayouts; route to a dedicated pass so the upstream
+            # fragment visualizer stays untouched (keeps merges clean).
+            from tilelang.analysis.sunmmio_layout_visual import SunmmioLayoutVisual
+
+            SunmmioLayoutVisual(formats=formats)(mod)
+        else:
+            tilelang.analysis.LayoutVisual(formats=formats)(mod)
 
 
 def PreLowerSemanticCheck(mod: IRModule) -> None:
@@ -189,11 +196,13 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
         # CUDA/ROCm/Metal: Fragment-based layout inference
         mod = tilelang.transform.LayoutInference()(mod)
     # Visualize the layout
-    LayoutVisual(mod)
+    LayoutVisual(mod, target)
     # Lower high-level tile operations to low-level operations
     mod = tilelang.transform.LowerTileOp()(mod)
     # Plan and lower T.Tiles scopes into final tiled loops.
     mod = tilelang.transform.LowerTilesLoop()(mod)
+    # Tile Loop Fusion
+    mod = tilelang.transform.SunmmioTileLoopFusion()(mod)
     # Lower l2 persistent map
     mod = tilelang.transform.LowerL2Persistent()(mod)
     # Decouple type cast vectorization constraints before vectorization

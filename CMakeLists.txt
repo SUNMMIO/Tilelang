@@ -263,8 +263,10 @@ file(GLOB TILE_LANG_SRCS
   src/tileview/*.cc
   src/transform/*.cc
   src/transform/sunmmio_tile_loop_fusion/*.cc
+  src/transform/sunmmio_pipeline_planning/*.cc
   src/transform/common/*.cc
   src/op/*.cc
+  src/target/sunmmio/*.cc
   src/target/utils.cc
   src/target/sunmmio_utils.cc
   src/target/codegen_c_host.cc
