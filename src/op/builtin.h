@@ -28,6 +28,8 @@ static constexpr const char *kWarpSpecializationScope =
 static constexpr const char *kCustomWarpSpecialization =
     "kCustomWarpSpecialization";
 static constexpr const char *kLocalVarInit = "tl.local_var_init";
+static constexpr const char *kSunmmioAllocPingPong =
+    "tl.sunmmio_alloc_ping_pong";
 // A PrimFunc-level attribute carrying a list of handle Vars
 // that must NOT be marked with the restrict qualifier in codegen.
 // Type: Array<tir::Var>

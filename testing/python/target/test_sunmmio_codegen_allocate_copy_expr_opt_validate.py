@@ -20,7 +20,7 @@ tilelang.env.disable_cache()
 
 # Debug logs from this file:
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
-# os.environ["SUNMMIO_TEST_PRINT"] = "1"
+os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 # dtype = T.bfloat16
 
 
@@ -129,6 +129,67 @@ def allocate_dma_copy_kernel_plus(
                 T.copy(A[ko * block_K, n_offset], B_shared)
                 T.gemm(A_shared, B_shared, C_shared)
                 # need all_gather or reduce to cover real-world scenarios
+
+    return main
+
+
+@target("Sunmmio")
+def pipelined_allocate_copy_mma_kernel(
+    M=128,
+    N=128,
+    K=128,
+    block_M=32,
+    block_N=32,
+    block_K=32,
+    dtype=T.bfloat16,
+    accum_dtype=T.float32,
+):
+    device_mesh_config = driver.get_sunmmio_device_mesh_config()
+    nrows, ncols = device_mesh_config
+    ncores = nrows * ncols
+
+    shard_policy = T.MeshShardingPolicy(x=1, y=0)
+    A_layout = make_zz_layout((M, K))
+    B_layout = make_zz_layout((K, N))
+    C_layout = make_zz_layout((M, N))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((M, K), shard_policy, device_mesh_config, dtype, layout=A_layout),  # type: ignore
+        B: T.MeshTensor((K, N), shard_policy, device_mesh_config, dtype, layout=B_layout),  # type: ignore
+        C: T.MeshTensor((M, N), shard_policy, device_mesh_config, accum_dtype, layout=C_layout),  # type: ignore
+    ):
+        with T.Kernel(ncores) as _cid:
+            sharded_M, sharded_K = A.shape
+            sharded_N = B.shape[1]
+            A_shared_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
+            B_shared_dist = T.alloc_shared((block_K * nrows, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+
+            for by in T.serial(T.ceildiv(sharded_M, block_M)):
+                for bx in T.serial(T.ceildiv(sharded_N, block_N)):
+                    T.clear(C_shared)
+                    for k in T.Pipelined(T.ceildiv(sharded_K, block_K), num_stages=3):
+                        T.comm.all_gather(
+                            A[
+                                by * block_M : (by + 1) * block_M,
+                                k * block_K : (k + 1) * block_K,
+                            ],
+                            A_shared_dist,
+                            direction="horizontal",
+                            axis=-1,
+                        )
+                        T.comm.all_gather(
+                            B[
+                                k * block_K : (k + 1) * block_K,
+                                bx * block_N : (bx + 1) * block_N,
+                            ],
+                            B_shared_dist,
+                            direction="vertical",
+                            axis=0,
+                        )
+                        T.gemm(A_shared_dist, B_shared_dist, C_shared)
+                    T.copy(C_shared, C[by * block_M, bx * block_N])
 
     return main
 
@@ -306,6 +367,23 @@ def test_allocate_dma_copy_codegen_validates_with_npuir_opt(tmp_path):
         tmp_path,
         mlir_filename="allocate_dma_copy_suvm.mlir",
         expected_tokens=("suvm.copy_async", "suvm.tc.mma"),
+    )
+
+
+def test_pipelined_allocate_copy_mma_codegen_propagates_ping_pong(tmp_path):
+    validate_sunmmio_codegen_with_npuir_opt(
+        pipelined_allocate_copy_mma_kernel(),
+        tmp_path,
+        mlir_filename="pipelined_allocate_copy_mma_suvm.mlir",
+        expected_tokens=(
+            "suvm.alloc",
+            "suvm.copy_async",
+            "suvm.tc.mma",
+            "#suvm.memory_space<asram>",
+            "#suvm.memory_space<wsram>",
+            "suvm.mcast_tok",
+            "suvm.ping_pong = #suvm.ping_pong<pong>",
+        ),
     )
 
 

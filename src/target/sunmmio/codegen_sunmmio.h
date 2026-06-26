@@ -114,7 +114,8 @@ public:
   virtual SunMMIOValue Alloc(const std::string &result_name,
                              const SunMMIOType &memref_type,
                              const std::vector<SunMMIOValue> &dyn_extents,
-                             const std::string &scope_name, DataType dtype) = 0;
+                             const std::string &scope_name, DataType dtype,
+                             std::optional<std::string> ping_pong) = 0;
 
   virtual SunMMIOValue Load(const std::string &result_name,
                             const std::string &buffer_handle,
@@ -400,7 +401,8 @@ private:
                         const ffi::Array<PrimExpr> &indices);
   void EmitStore(const tir::Buffer &buffer, const ffi::Array<PrimExpr> &indices,
                  const SunMMIOValue &value);
-  void EmitAlloc(const tir::Buffer &buffer, const std::string &scope_hint);
+  void EmitAlloc(const tir::Buffer &buffer, const std::string &scope_hint,
+                 const ffi::Map<ffi::String, ffi::Any> &annotations);
   void EmitLocalVarAlloc(const tir::AllocateNode *op,
                          const tir::Buffer &buffer);
   SunMMIOValue EmitLocalVarLoad(const tir::Buffer &buffer,

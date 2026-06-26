@@ -10,11 +10,10 @@ namespace codegen {
 SunmmioMlirMemory::SunmmioMlirMemory(SunmmioMlirContext &ctx)
     : ctx_(ctx), type_(ctx) {}
 
-SunMMIOValue
-SunmmioMlirMemory::Alloc(const std::string &result_name,
-                         const SunMMIOType &memref_type,
-                         const std::vector<SunMMIOValue> &dyn_extents,
-                         const std::string &scope_name, DataType dtype) {
+SunMMIOValue SunmmioMlirMemory::Alloc(
+    const std::string &result_name, const SunMMIOType &memref_type,
+    const std::vector<SunMMIOValue> &dyn_extents, const std::string &scope_name,
+    DataType dtype, std::optional<std::string> ping_pong) {
   if (memref_type.kind != SunMMIOType::Kind::kMemTensor) {
     LOG(FATAL) << "SunMMIO SUVM alloc expects memtensor type, but got kind "
                << static_cast<int>(memref_type.kind);
@@ -39,9 +38,16 @@ SunmmioMlirMemory::Alloc(const std::string &result_name,
       tensor_type.getMemorySpace().getValue();
   if (memory_space == mlir::suvm::MemorySpace::asram ||
       memory_space == mlir::suvm::MemorySpace::wsram) {
-    alloc->setAttr("suvm.ping_pong",
-                   mlir::suvm::PingPongAttr::get(&ctx_.mlir_ctx,
-                                                 mlir::suvm::PingPong::ping));
+    mlir::suvm::PingPong ping_pong_value = mlir::suvm::PingPong::ping;
+    if (ping_pong.has_value()) {
+      if (*ping_pong == "pong") {
+        ping_pong_value = mlir::suvm::PingPong::pong;
+      } else if (*ping_pong != "ping") {
+        LOG(FATAL) << "Unsupported SunMMIO ping-pong value: " << *ping_pong;
+      }
+    }
+    alloc->setAttr("suvm.ping_pong", mlir::suvm::PingPongAttr::get(
+                                         &ctx_.mlir_ctx, ping_pong_value));
   }
 
   SunMMIOValue out{dtype, result_name, updated_type};
