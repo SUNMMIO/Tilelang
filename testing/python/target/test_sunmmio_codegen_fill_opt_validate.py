@@ -4,6 +4,7 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang.carver.arch import driver
+from tilelang.layout import make_zz_layout
 
 from compile_pipeline import target
 from sunmmio_codegen_validation_utils import validate_sunmmio_codegen_with_npuir_opt
@@ -39,12 +40,15 @@ def fill_tiled_test(
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
+    shard_policy = T.MeshShardingPolicy()
+    tensor_shape = (b, m, n)
+    tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
     grid_b = T.ceildiv(b, block_b)
     grid_m = T.ceildiv(m, block_m)
     grid_n = T.ceildiv(n, block_n)
 
     @T.prim_func
-    def main(A: T.Tensor((b, m, n), dtype)):
+    def main(A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout)):  # type: ignore
         with T.Kernel(ncores):
             A_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
 
@@ -55,14 +59,15 @@ def fill_tiled_test(
                         T.fill(A_shared[0:block_b, 0 : block_m // 2, 0:block_n], T.float16(2.0))
                         T.fill(A_shared[0:block_b, block_m // 2 : block_m, 0:block_n], T.float16(3.0))
                         T.clear(A_shared)
-                        T.copy(
-                            A_shared,
-                            A[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                        )
+                        for bb in T.serial(block_b):
+                            T.copy(
+                                A_shared[bb, :, :],
+                                A[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                            )
 
     return main
 
@@ -78,11 +83,14 @@ def fill_tiled_2d_test(
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
+    shard_policy = T.MeshShardingPolicy()
+    tensor_shape = (m, n)
+    tensor_layout = make_zz_layout(tensor_shape, [0, 1], (32, 32))
     grid_m = T.ceildiv(m, block_m)
     grid_n = T.ceildiv(n, block_n)
 
     @T.prim_func
-    def main(A: T.Tensor((m, n), dtype)):
+    def main(A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout)):  # type: ignore
         with T.Kernel(ncores):
             A_shared = T.alloc_shared((block_m, block_n), dtype)
 

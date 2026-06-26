@@ -3,6 +3,7 @@
 
 #include <tvm/ir/module.h>
 #include <tvm/ir/type.h>
+#include <tvm/target/target.h>
 #include <tvm/tir/expr_functor.h>
 #include <tvm/tir/function.h>
 #include <tvm/tir/stmt.h>
@@ -139,6 +140,10 @@ public:
                                 const SunMMIOValue &scalar,
                                 const SunMMIOType &tile_type,
                                 DataType dtype) = 0;
+
+  virtual SunMMIOValue TileRange(const std::string &result_name,
+                                 const SunMMIOType &tile_type,
+                                 DataType dtype) = 0;
 
   virtual SunMMIOValue TileUnsqueeze(const std::string &result_name,
                                      const SunMMIOValue &tile,
@@ -289,6 +294,7 @@ public:
   CodeGenTileLangSunMMIO();
   ~CodeGenTileLangSunMMIO() noexcept override = default;
 
+  void SetTarget(tvm::Target target);
   void Init();
   void Clear();
   void AddFunction(const GlobalVar &gvar, const tir::PrimFunc &f);
@@ -440,6 +446,7 @@ private:
                                     const std::string &detail = "") const;
 
   std::unique_ptr<SunMMIOBuilder> builder_;
+  tvm::Target target_;
   bool initialized_{false};
   int ssa_counter_{0};
 
