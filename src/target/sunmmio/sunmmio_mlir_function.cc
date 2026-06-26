@@ -61,11 +61,7 @@ void SunmmioMlirFunction::BeginModule() {
                               &ctx_.mlir_ctx, mlir::suvm::DeviceArch::a4e));
   ctx_.builder.setInsertionPointToEnd(ctx_.module->getBody());
   current_func_ = mlir::func::FuncOp();
-  ctx_.for_stack.clear();
-  ctx_.if_stack.clear();
-  ctx_.while_stack.clear();
-  ctx_.control_flow_stack.clear();
-  ctx_.ClearMLIRValueScopes();
+  ctx_.ClearFunctionState();
 }
 
 void SunmmioMlirFunction::EndModule() {
@@ -88,12 +84,8 @@ void SunmmioMlirFunction::BeginFunction(const std::string &name,
   ctx_.module->push_back(func);
   current_func_ = func;
 
-  ctx_.ClearMLIRValueScopes();
+  ctx_.ClearFunctionState();
   ctx_.PushMLIRValueScope();
-  ctx_.if_stack.clear();
-  ctx_.for_stack.clear();
-  ctx_.while_stack.clear();
-  ctx_.control_flow_stack.clear();
 
   mlir::Block *entry = func.addEntryBlock();
   ctx_.builder.setInsertionPointToStart(entry);
@@ -104,11 +96,7 @@ void SunmmioMlirFunction::BeginFunction(const std::string &name,
 
 void SunmmioMlirFunction::EndFunction() {
   current_func_ = mlir::func::FuncOp();
-  ctx_.if_stack.clear();
-  ctx_.for_stack.clear();
-  ctx_.while_stack.clear();
-  ctx_.control_flow_stack.clear();
-  ctx_.ClearMLIRValueScopes();
+  ctx_.ClearFunctionState();
   ctx_.builder.setInsertionPointToEnd(ctx_.module->getBody());
 }
 

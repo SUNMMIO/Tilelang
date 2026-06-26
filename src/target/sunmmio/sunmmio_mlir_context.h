@@ -124,6 +124,16 @@ struct SunmmioMlirContext {
     return &for_stack.back().annotations;
   }
 
+  void ClearFunctionState() {
+    mlir_value_table_stack.clear();
+    token_by_id.clear();
+    barrier_by_mask.clear();
+    for_stack.clear();
+    if_stack.clear();
+    while_stack.clear();
+    control_flow_stack.clear();
+  }
+
   void ClearMLIRValueScopes() { mlir_value_table_stack.clear(); }
 
   void PushMLIRValueScope() { mlir_value_table_stack.emplace_back(); }
