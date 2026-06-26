@@ -437,6 +437,89 @@ def _make_while_pair_broadcast_mod(target):
     return tir.transform.BindTarget(target)(mod)
 
 
+def _make_mixed_level_nested_broadcast_mod(target):
+    outer_src_data = _pointer_var("outer_src")
+    outer_dst_data = _pointer_var("outer_dst")
+    inner_src_data = _pointer_var("inner_src")
+    inner_dst_data = _pointer_var("inner_dst")
+    outer_src_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="outer_src_buf",
+        data=outer_src_data,
+        scope="shared.rsram",
+    )
+    outer_dst_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="outer_dst_buf",
+        data=outer_dst_data,
+        scope="shared.rsram",
+    )
+    inner_src_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="inner_src_buf",
+        data=inner_src_data,
+        scope="shared.rsram",
+    )
+    inner_dst_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="inner_dst_buf",
+        data=inner_dst_data,
+        scope="shared.rsram",
+    )
+
+    def make_broadcast(src_buf, dst_buf, direction):
+        return tir.Evaluate(
+            tir.call_intrin(
+                "handle",
+                tir.op.Op.get("tl.broadcast_"),
+                _region(src_buf, 1),
+                _region(dst_buf, 2),
+                tir.IntImm("int32", direction),
+                tir.IntImm("int64", 15),
+                tir.IntImm("int32", 0),
+                tir.IntImm("int32", 0),
+            )
+        )
+
+    outer = tir.Var("outer", "int32")
+    inner = tir.Var("inner", "int32")
+    outer_broadcast = make_broadcast(outer_src_buf, outer_dst_buf, 0)
+    inner_broadcast = make_broadcast(inner_src_buf, inner_dst_buf, 1)
+    inner_loop = tir.For(
+        inner,
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 2),
+        tir.ForKind.SERIAL,
+        inner_broadcast,
+    )
+    outer_loop = tir.For(
+        outer,
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 2),
+        tir.ForKind.SERIAL,
+        tir.SeqStmt([outer_broadcast, inner_loop]),
+    )
+    body = tir.DeclBuffer(
+        outer_src_buf,
+        tir.DeclBuffer(
+            outer_dst_buf,
+            tir.DeclBuffer(
+                inner_src_buf,
+                tir.DeclBuffer(inner_dst_buf, outer_loop),
+            ),
+        ),
+    )
+    func = tir.PrimFunc([outer_src_data, outer_dst_data, inner_src_data, inner_dst_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
 def _parse_numeric_barrier_mask(line, marker="barrier_init"):
     match = re.search(rf"{marker}\((?:T\.int64\()?(-?\d+)\)?\)", line)
     assert match, f"expected {marker}(participant_mask), got: {line}"
