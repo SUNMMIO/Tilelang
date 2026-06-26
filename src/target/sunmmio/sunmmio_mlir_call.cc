@@ -647,34 +647,10 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         DataType::Void(), "",
         SunMMIOType{SunMMIOType::Kind::kUnknown, DataType::Void(), 1, {}}};
   } else {
-    (void)operands;
-    (void)attrs;
-    (void)category;
-    LOG(INFO) << "Calling " << callee << " with operands ";
-    for (const auto &op : operands) {
-      LOG(INFO) << op.value << " ";
-    }
-    ICHECK(ctx_.module)
-        << "MLIR module must be initialized before lowering Sunmmio calls";
-    mlir::Type result_type = SunmmioMlirType(ctx_).MapType(ret_type);
-    mlir::TypedAttr value_attr;
-    if (mlir::isa<mlir::FloatType>(result_type)) {
-      value_attr = ctx_.builder.getFloatAttr(result_type, 0.0);
-    } else if (result_type.isIndex()) {
-      value_attr = ctx_.builder.getIndexAttr(0);
-    } else if (auto int_ty = mlir::dyn_cast<mlir::IntegerType>(result_type)) {
-      value_attr = ctx_.builder.getIntegerAttr(int_ty, 0);
-    } else {
-      result_type = ctx_.builder.getI32Type();
-      value_attr = ctx_.builder.getIntegerAttr(result_type, 0);
-    }
-    auto fake_op = mlir::arith::ConstantOp::create(
-        ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc("fake_call"),
-        value_attr);
-    fake_op->setAttr("sunmmio.fake", ctx_.builder.getStringAttr("call"));
-    mlir::Value call_value = fake_op.getResult();
-    ctx_.BindMLIRValue(result_name, call_value);
-    return SunMMIOValue{ret_dtype, result_name, ret_type};
+    LOG(FATAL) << "Unsupported SunMMIO call lowering for `" << callee
+               << "` (category=" << category << ", operands=" << operands.size()
+               << ")";
+    TVM_FFI_UNREACHABLE();
   }
 }
 
