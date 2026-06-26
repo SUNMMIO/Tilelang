@@ -2,7 +2,7 @@ import tilelang.language as T
 from tilelang import tvm as tvm
 from tilelang.carver.arch import driver
 from tilelang.engine.lower import canon_target_host
-from tilelang.utils.target import determine_target, target_is_sunmmio
+from tilelang.utils.target import determine_target, target_context, target_is_sunmmio
 
 
 def test_sunmmio_target():
@@ -18,6 +18,17 @@ def test_sunmmio_target():
 
     print(target)
     print(target.attrs)
+
+
+def test_target_context_decorator():
+    @target_context("Sunmmio")
+    def get_current_target():
+        target = tvm.target.Target.current()
+        assert target_is_sunmmio(target)
+        return target.attrs["mcpu"]
+
+    assert get_current_target() == "sunmmio-a4e"
+    assert get_current_target.__name__ == "get_current_target"
 
 
 def test_sunmmio_target_binding():

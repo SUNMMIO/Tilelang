@@ -1575,11 +1575,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     SunMMIOValue region_index = div_index(base_bytes, aligned_bytes);
     SunMMIOValue offset_bytes = mod_index(base_bytes, aligned_bytes);
     SunMMIOValue offset_elems = div_index(offset_bytes, elem_size);
-    SunMMIOValue region_base_elem = mul_index(region_index, aligned_elems);
 
     std::vector<SunMMIOValue> aligned_partition_indices(memtensor_shape.size(),
                                                         make_index_const(0));
-    SunMMIOValue remaining = region_base_elem;
+    SunMMIOValue remaining = mul_index(region_index, aligned_elems);
     for (int64_t dim = 0; dim < static_cast<int64_t>(memtensor_shape.size());
          ++dim) {
       int64_t stride = strides[static_cast<size_t>(dim)];

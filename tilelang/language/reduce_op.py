@@ -77,7 +77,8 @@ def reduce(buffer: BufferLikeType, out: BufferLikeType, reduce_type: ReduceKind,
         is_sunmmio_scope = any(
             scope in (src_buffer.scope(), dst_buffer.scope()) for scope in ("shared.rsram", "shared.asram", "shared.wsram")
         )
-        if (target and target_is_sunmmio(target)) or is_sunmmio_scope:
+        is_sunmmio_target = target is not None and target_is_sunmmio(target)
+        if is_sunmmio_target or is_sunmmio_scope:
             tir.call_intrin(
                 "handle",
                 tir.op.Op.get(_REDUCE_OP_KEY),

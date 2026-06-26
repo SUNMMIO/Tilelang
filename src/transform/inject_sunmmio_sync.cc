@@ -843,6 +843,26 @@ private:
     }
   }
 
+  int PreAssignLoopToken(const AsyncOpRecord &async_op,
+                         std::vector<const EvaluateNode *> *owned_ops) {
+    auto it = pre_assigned_tokens_.find(async_op.op);
+    if (it != pre_assigned_tokens_.end()) {
+      return it->second;
+    }
+
+    int token = GetNextTokenId();
+    pre_assigned_tokens_[async_op.op] = token;
+    owned_ops->push_back(async_op.op);
+    return token;
+  }
+
+  void ClearOwnedPreAssignedTokens(
+      const std::vector<const EvaluateNode *> &owned_ops) {
+    for (const EvaluateNode *op : owned_ops) {
+      pre_assigned_tokens_.erase(op);
+    }
+  }
+
   PrimExpr LocalMaskBitSet(PrimExpr local_mask, int local_index) {
     PrimExpr bit = I64Imm(static_cast<int64_t>(uint64_t{1} << local_index));
     return (AsI64(local_mask) & bit) != I64Imm(0);
@@ -1169,13 +1189,13 @@ private:
 
     LoopScope scope;
     scope.async_ops = collector.async_ops;
+    std::vector<const EvaluateNode *> owned_pre_assignments;
     for (auto &async_op : scope.async_ops) {
       // Pre-assign a stable token id for each async site in this loop.
       // This lets the body rewriter attach the same token id every iteration,
       // enabling consistent loop-carried dependency reasoning.
-      int token = GetNextTokenId();
+      int token = PreAssignLoopToken(async_op, &owned_pre_assignments);
       async_op.token = token;
-      pre_assigned_tokens_[async_op.op] = token;
 
       // Keep a back-reference from token -> call for special handling after we
       // finish rewriting the loop (e.g. broadcast barrier initialization).
@@ -1197,9 +1217,7 @@ private:
 
     scope = loop_scopes_.back();
     loop_scopes_.pop_back();
-    for (const auto &async_op : scope.async_ops) {
-      pre_assigned_tokens_.erase(async_op.op);
-    }
+    ClearOwnedPreAssignedTokens(owned_pre_assignments);
 
     InjectLoopEntryNullTokens(scope, stmts);
     stmts.push_back(loop_stmt);
@@ -1436,10 +1454,10 @@ private:
     scope.loop_extent = loop->extent;
     scope.async_ops = collector.async_ops;
 
+    std::vector<const EvaluateNode *> owned_pre_assignments;
     for (auto &async_op : scope.async_ops) {
-      int token = GetNextTokenId();
+      int token = PreAssignLoopToken(async_op, &owned_pre_assignments);
       async_op.token = token;
-      pre_assigned_tokens_[async_op.op] = token;
 
       const CallNode *call = async_op.call;
       scope.token_to_call[token] = call;
@@ -1458,9 +1476,7 @@ private:
 
     scope = loop_scopes_.back();
     loop_scopes_.pop_back();
-    for (const auto &async_op : scope.async_ops) {
-      pre_assigned_tokens_.erase(async_op.op);
-    }
+    ClearOwnedPreAssignedTokens(owned_pre_assignments);
 
     InjectLoopEntryNullTokens(scope, stmts);
     stmts.push_back(loop_stmt);

@@ -244,6 +244,8 @@ def LowerAndLegalize_sunmmio_test(
     log_dir: str = "./",
     log_passes: list[str] | None = None,
 ) -> IRModule:
+    # test_config maps pass names to optional per-pass checks, such as
+    # script_expected snippets or formal_verify callbacks.
     if test_config is None:
         test_config = {}
     out_file = os.path.join(log_dir, "passes_lower_and_legalize.log")
@@ -290,6 +292,9 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.SunmmioLayoutInference()(mod)
     pass_output_process(mod, "SunmmioLayoutInference", test_config)
 
+    mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
+    pass_output_process(mod, "LegalizeSunmmioGemm", test_config)
+
     LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     pass_output_process(mod, "LowerTileOp", test_config)
@@ -300,12 +305,14 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.TilesLoop()(mod)
     pass_output_process(mod, "TilesLoop", test_config)
 
+    mod = tilelang.transform.SunmmioTileLoopFusion()(mod)
+    pass_output_process(mod, "SunmmioTileLoopFusion", test_config)
     # mod = tilelang.transform.LowerL2Persistent()(mod)
-    mod = tilelang.transform.DecoupleTypeCast()(mod)
-    pass_output_process(mod, "DecoupleTypeCast", test_config)
+    # mod = tilelang.transform.DecoupleTypeCast()(mod)
+    # pass_output_process(mod, "DecoupleTypeCast", test_config)
 
-    mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
-    pass_output_process(mod, "LegalizeVectorizedLoop", test_config)
+    # mod = tilelang.transform.LegalizeVectorizedLoop()(mod)
+    # pass_output_process(mod, "LegalizeVectorizedLoop", test_config)
 
     mod = tilelang.transform.LegalizeSafeMemoryAccess()(mod)
     pass_output_process(mod, "LegalizeSafeMemoryAccess", test_config)
@@ -319,6 +326,9 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.HoistNonRestrictParams()(mod)
     pass_output_process(mod, "HoistNonRestrictParams", test_config)
 
+    mod = tilelang.transform.HoistBlockAnnotationsToFuncAttrs()(mod)
+    pass_output_process(mod, "HoistBlockAnnotationsToFuncAttrs", test_config)
+
     return mod
 
 
@@ -331,6 +341,8 @@ def OptimizeForSunmmio_test(
     log_dir: str = "./",
     log_passes: list[str] | None = None,
 ) -> IRModule:
+    # test_config maps pass names to optional per-pass checks, such as
+    # script_expected snippets or formal_verify callbacks.
     if test_config is None:
         test_config = {}
     out_file = os.path.join(log_dir, "passes_optimize_for_sunmmio.log")
@@ -516,9 +528,15 @@ def compile_test(
     Returns:
         tuple: (host_mod, device_mod) corresponding to the modules generated in lower.log
     """
+    # test_config maps pass names to optional per-pass checks, such as
+    # script_expected snippets or formal_verify callbacks.
     if test_config is None:
         test_config = {}
 
+    # Supported fields in test_config[pass_name]:
+    # - script_expected: string or list of strings expected in the generated TIR script.
+    # - show_generated_script: include the generated TIR script in mismatch warnings.
+    # - formal_verify: callable or list of callables used to verify the module after the pass.
     for pass_name in test_config:
         for key in test_config[pass_name]:
             assert key in [
