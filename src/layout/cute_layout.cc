@@ -472,6 +472,45 @@ Optional<Layout> DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
     dst_to_blocked_idx[target_axes[i]] = i;
   }
 
+  // Map single-level (non-blocked) src dims to non-blocked dst dims, aligned
+  // from the back; computed up front so Pass 1 can detect an unchanged axis.
+  //   single_src=[0],     nonblocked_dst=[0,1] → src 0→dst 1, dst 0 excess
+  //   single_src=[0,1,2], nonblocked_dst=[0]   → src 2→dst 0, src 0,1 dropped
+  std::vector<int> single_src_dims;
+  for (size_t d = 0; d < src_rank; ++d) {
+    if (src_cute->GetDimLevels()[d].IntValue() == 1)
+      single_src_dims.push_back(d);
+  }
+  std::vector<int> nonblocked_dst_dims;
+  for (size_t dst_d = 0; dst_d < dst_rank; ++dst_d) {
+    if (dst_to_blocked_idx.find(dst_d) == dst_to_blocked_idx.end())
+      nonblocked_dst_dims.push_back(dst_d);
+  }
+  std::unordered_map<int, int> single_src_to_dst; // src_d -> dst_d
+  std::unordered_map<int, int> dst_to_single_src; // dst_d -> src_d
+  {
+    int ns = static_cast<int>(single_src_dims.size());
+    int nd = static_cast<int>(nonblocked_dst_dims.size());
+    int count = std::min(ns, nd);
+    for (int i = 0; i < count; ++i) {
+      int src_d = single_src_dims[ns - count + i];
+      int dst_d = nonblocked_dst_dims[nd - count + i];
+      single_src_to_dst[src_d] = dst_d;
+      dst_to_single_src[dst_d] = src_d;
+    }
+  }
+
+  // Provable extent equality: static compare, falling back to the analyzer.
+  auto extents_equal = [&](const PrimExpr &a, const PrimExpr &b) {
+    const auto *ai = a.as<IntImmNode>();
+    const auto *bi = b.as<IntImmNode>();
+    if (ai && bi)
+      return ai->value == bi->value;
+    if (a.same_as(b))
+      return true;
+    return analyzer != nullptr && analyzer->CanProve(a == b);
+  };
+
   // --- Pass 1: build new mode_shape and dim_levels ---
   //
   // For each dst dim: if it maps to a blocked src dim, preserve inner
@@ -499,9 +538,20 @@ Optional<Layout> DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
       }
       new_mode_shape.push_back(ceildiv(dst_ext, inner_product));
     } else {
-      // Non-blocked dst dim — single-level row-major.
-      new_dim_levels.push_back(Integer(1));
-      new_mode_shape.push_back(dst_ext);
+      // Non-blocked dst dim. A same-extent single-level src dim is the same
+      // axis: copy its modes so covered-extent padding (mode_shape > logical,
+      // e.g. RSRAM alignment) survives. A resized axis gets a tight mode.
+      auto sit = dst_to_single_src.find(static_cast<int>(dst_d));
+      if (sit != dst_to_single_src.end() &&
+          extents_equal(src_cute->GetLogicalShape()[sit->second], dst_ext)) {
+        int src_d = sit->second;
+        new_dim_levels.push_back(src_cute->GetDimLevels()[src_d]);
+        for (const PrimExpr &s : src_cute->GetModeShapeOfDim(src_d))
+          new_mode_shape.push_back(s);
+      } else {
+        new_dim_levels.push_back(Integer(1));
+        new_mode_shape.push_back(dst_ext);
+      }
     }
   }
 
@@ -518,34 +568,6 @@ Optional<Layout> DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
   // row-major modes at outermost.
 
   auto full_order = RecoverPhysicalOrder(src_cute);
-
-  // Collect single-level src dims and non-blocked dst dims.
-  std::vector<int> single_src_dims;
-  for (size_t d = 0; d < src_rank; ++d) {
-    if (src_cute->GetDimLevels()[d].IntValue() == 1)
-      single_src_dims.push_back(d);
-  }
-  std::vector<int> nonblocked_dst_dims;
-  for (size_t dst_d = 0; dst_d < dst_rank; ++dst_d) {
-    if (dst_to_blocked_idx.find(dst_d) == dst_to_blocked_idx.end())
-      nonblocked_dst_dims.push_back(dst_d);
-  }
-
-  // Align single-level src dims to non-blocked dst dims from the back.
-  // E.g. single_src=[0] nonblocked_dst=[0,1] → src dim 0 maps to dst dim 1,
-  //       dst dim 0 is excess (unmapped).
-  // E.g. single_src=[0,1,2] nonblocked_dst=[0] → src dim 2 maps to dst dim 0,
-  //       src dims 0,1 are dropped (reduced).
-  std::unordered_map<int, int> single_src_to_dst;
-  {
-    int ns = static_cast<int>(single_src_dims.size());
-    int nd = static_cast<int>(nonblocked_dst_dims.size());
-    int count = std::min(ns, nd);
-    for (int i = 0; i < count; ++i) {
-      single_src_to_dst[single_src_dims[ns - count + i]] =
-          nonblocked_dst_dims[nd - count + i];
-    }
-  }
 
   // Build src_mode → new_mode mapping for ALL mapped modes.
   std::unordered_map<int, int> src_mode_to_new;
@@ -671,23 +693,17 @@ Layout TryCanonicalizeToRowMajor(const Layout &layout) {
 
 bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
                    arith::Analyzer *analyzer) {
-  // Compare on canonical forms so representations describing the
-  // same byte map agree -- e.g. a single-block ZZ canonicalizes to row-major
-  // and matches a row-major buffer. Checked in both directions:
-  // DeriveLayoutLike rebuilds the template at the target's shape with tight
-  // strides, dropping the template's padding, so a single direction only sees
-  // padding on rhs; both directions give each layout a turn as rhs (so a tight
-  // and an alignment- padded row-major do not match), while unpadded layouts of
-  // different shapes still match.
+  // Compare on canonical forms so equivalent representations agree -- e.g. a
+  // single-block ZZ canonicalizes to row-major and matches a row-major buffer.
   Layout cl = TryCanonicalizeToRowMajor(lhs),
          cr = TryCanonicalizeToRowMajor(rhs);
-  // Identical coalesced forms => identical byte map. Covers the reflexive and
-  // same-shape cases, including over-covered dims (covered > logical, e.g. a ZZ
-  // whose logical extent is below the block size) that DeriveLayoutLike would
-  // otherwise tighten and miss.
+  // Identical coalesced forms => identical byte map; padded and tight differ in
+  // coalesced mode_shape, so they don't match here.
   if (IsSameLayout(cl, cr, analyzer))
     return true;
-  // Different logical shapes, same kind: re-derive each onto the other's shape.
+  // Different shapes, same kind: re-derive each onto the other's shape.
+  // DeriveLayoutLike preserves padding on unchanged dims, so the
+  // padded-vs-tight distinction holds across the reshape too.
   auto fwd = DeriveLayoutLike(cl, cr->InputShape(), Optional<Array<Integer>>(),
                               analyzer);
   auto bwd = DeriveLayoutLike(cr, cl->InputShape(), Optional<Array<Integer>>(),

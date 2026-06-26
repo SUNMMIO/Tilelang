@@ -2,9 +2,11 @@
  * \file legalize_sunmmio_datapath.cc
  * \brief Legalize unsupported Sunmmio data-transfer paths.
  *
- * Rewrites global -> shared.asram transfers by inserting an RSRAM staging
- * step.  Works uniformly for any data-transfer tileop (copy, broadcast,
- * put, allgather).
+ * Rewrites transfers that have no direct datapath by inserting an RSRAM staging
+ * step: global -> shared.asram, and casting RSRAM -> shared.asram/wsram (the
+ * cast runs on the tile unit in RSRAM, then a same-dtype DMA reaches the
+ * operand SRAM).  Works for any data-transfer tileop (copy, broadcast, put,
+ * allgather).
  */
 
 #include <tvm/ffi/reflection/registry.h>
@@ -68,10 +70,13 @@ public:
   /**
    * @brief Legalize unsupported Sunmmio data-transfer paths before lowering.
    *
-   * For any data-transfer op (copy, broadcast, put, allgather) with a
-   * global -> shared.asram path, the pass:
-   * 1. Allocates a compact shared.rsram staging buffer.
-   * 2. Inserts a copy: global -> shared.rsram.
+   * For a data-transfer op (copy, broadcast, put, allgather) whose transfer has
+   * no direct datapath -- global -> shared.asram, or a casting RSRAM ->
+   * shared.asram/wsram -- the pass stages through a compact shared.rsram
+   * buffer:
+   * 1. Allocates the staging buffer (dst dtype on the cast path, else src
+   * dtype).
+   * 2. Inserts a copy: src -> staging (the cast, when dtypes differ).
    * 3. Rewrites the original op's source to use the staging buffer.
    */
   static PrimFunc Substitute(PrimFunc f) {
@@ -97,17 +102,21 @@ private:
            call->op.same_as(AllgatherOp::Get());
   }
 
-  Buffer CreateStageBuffer(const Buffer &src, const Array<Range> &src_range) {
+  // `proto` supplies the staging buffer's dtype, element type and name;
+  // `region` its shape. They are the same buffer for a plain scope-route stage,
+  // but differ for a cast stage (proto = dst, so the staging buffer takes the
+  // dst dtype and the prepended copy performs the cast).
+  Buffer CreateStageBuffer(const Buffer &proto, const Array<Range> &region) {
     ICHECK(!alloc_buffer_stack_.empty())
         << "LegalizeSunmmioDataPath expects data-transfer ops to appear "
            "inside a block.";
-    Array<Range> compact_range = MakeCompactRegionForStage(src_range);
-    std::string name = src->name + "_rsram_stage";
+    Array<Range> compact_range = MakeCompactRegionForStage(region);
+    std::string name = proto->name + "_rsram_stage";
     if (temp_buffer_counter_ != 0) {
       name += "_" + std::to_string(temp_buffer_counter_);
     }
     ++temp_buffer_counter_;
-    Buffer temp = MakeCompactBufferWithScope(src, compact_range,
+    Buffer temp = MakeCompactBufferWithScope(proto, compact_range,
                                              kSunmmioScopeRSRAM, name);
     alloc_buffer_stack_.back().push_back(temp);
     return temp;
@@ -144,16 +153,29 @@ private:
     BufferRegion src_br = NormalizeToBufferRegion(call->args[0]);
     BufferRegion dst_br = NormalizeToBufferRegion(call->args[1]);
 
-    if (src_br->buffer.scope() != "global" ||
-        dst_br->buffer.scope() != kSunmmioScopeASRAM) {
+    const std::string src_scope = src_br->buffer.scope();
+    const std::string dst_scope = dst_br->buffer.scope();
+    bool dst_is_operand =
+        dst_scope == kSunmmioScopeASRAM || dst_scope == kSunmmioScopeWSRAM;
+
+    // global -> ASRAM has no direct DMA path; stage through RSRAM (same dtype).
+    bool stage_global =
+        src_scope == "global" && dst_scope == kSunmmioScopeASRAM;
+    // Casting RSRAM -> ASRAM/WSRAM: the cast must run on the tile unit
+    // (RSRAM -> RSRAM), so stage through an RSRAM buffer of the dst dtype.
+    bool stage_cast = src_scope == kSunmmioScopeRSRAM && dst_is_operand &&
+                      src_br->buffer->dtype != dst_br->buffer->dtype;
+    if (!stage_global && !stage_cast) {
       return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
 
-    // Create an RSRAM staging buffer matching the source region shape.
-    Buffer staging = CreateStageBuffer(src_br->buffer, src_br->region);
+    // Cast path stages with the dst dtype (so the prepended copy casts);
+    // scope-route path stages with the src dtype.
+    const Buffer &proto = stage_cast ? dst_br->buffer : src_br->buffer;
+    Buffer staging = CreateStageBuffer(proto, src_br->region);
     Array<Range> staging_range = MakeCompactRegionForStage(src_br->region);
 
-    // 1. Copy: global src -> RSRAM staging buffer.
+    // 1. Copy: src -> RSRAM staging buffer (casts when src/dst dtypes differ).
     PrimExpr src_region = MakeRegionExpr(src_br->buffer, src_br->region, 1);
     PrimExpr staging_write = MakeRegionExpr(staging, staging_range, 2);
     Map<String, ObjectRef> copy_annotations = call->op.same_as(Copy::Get())
