@@ -427,6 +427,16 @@ def test_sunmmio_codegen_unsupported_call_fails_loudly():
         builder(mod, target, "suvm")
 
 
+def test_sunmmio_codegen_unsupported_dtype_fails_loudly():
+    fp8_var = tvm.tir.Var("fp8_value", tvm.DataType("float8_e4m3fn"))
+    func = _to_device_kernel_func(tvm.tir.PrimFunc([fp8_var], tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))))
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": func})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(Exception, match="Unsupported SunMMIO element dtype.*float8_e4m3fn"):
+        builder(mod, target, "suvm")
+
+
 def test_sunmmio_codegen_compile_path_not_implemented():
     target = determine_target("Sunmmio", return_object=True)
     mod = tvm.IRModule({"main": make_scalar_control_kernel()})

@@ -8,6 +8,8 @@
 #include "llvm/Support/raw_ostream.h"
 #include <tvm/arith/analyzer.h>
 
+#include <sstream>
+
 namespace tvm {
 namespace codegen {
 
@@ -21,6 +23,12 @@ std::string MlirTypeToString(mlir::Type type) {
   llvm::raw_string_ostream os(str);
   type.print(os);
   return str;
+}
+
+std::string DTypeToString(DataType dtype) {
+  std::ostringstream os;
+  os << dtype;
+  return os.str();
 }
 
 bool IsCompatibleResolvedType(mlir::Type actual, mlir::Type expected) {
@@ -172,8 +180,8 @@ mlir::Type SunmmioMlirType::MapElementType(DataType dtype) const {
     return mlir::Type::getFromOpaquePointer(
         ctx_.builder.getIntegerType(dtype.bits()).getAsOpaquePointer());
   }
-  return mlir::Type::getFromOpaquePointer(
-      ctx_.builder.getIntegerType(64).getAsOpaquePointer());
+  LOG(FATAL) << "Unsupported SunMMIO element dtype: " << DTypeToString(dtype);
+  TVM_FFI_UNREACHABLE();
 }
 
 mlir::Type SunmmioMlirType::MapType(const SunMMIOType &type) const {
@@ -244,9 +252,12 @@ mlir::Type SunmmioMlirType::MapType(const SunMMIOType &type) const {
     return mlir::Type::getFromOpaquePointer(tile.getAsOpaquePointer());
   }
   case SunMMIOType::Kind::kUnknown:
+    LOG(FATAL) << "Cannot map unknown SunMMIO type with dtype "
+               << DTypeToString(canonical_type.dtype);
+    TVM_FFI_UNREACHABLE();
   default:
-    return mlir::Type::getFromOpaquePointer(
-        ctx_.builder.getIntegerType(64).getAsOpaquePointer());
+    LOG(FATAL) << "Unsupported SunMMIO type kind";
+    TVM_FFI_UNREACHABLE();
   }
 }
 
