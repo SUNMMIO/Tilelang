@@ -351,7 +351,7 @@ def test_tilelang_reduce_sunmmio_multiple_reduces_are_ssa_clean():
     assert_reduce_lowering_is_ssa(mod)
 
 
-def test_tilelang_reduce_sunmmio_tiled_axis_tail_load_is_predicated():
+def test_tilelang_reduce_sunmmio_tiled_axis_tail_uses_if_then_else_mask():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     mod = reduce_kernel_with_tileview_builder((8, 63, 250), reduce_axis=2)
 
@@ -365,12 +365,12 @@ def test_tilelang_reduce_sunmmio_tiled_axis_tail_load_is_predicated():
     assert 7 not in tile_loop_extents, "truncdiv(63, 8) would drop the spatial tail tile"
 
     a_load_predicates = [load.predicate for load in _collect_buffer_loads(func, "A_shared") if load.predicate is not None]
-    assert a_load_predicates, "Expected predicated source loads for reduce-axis tail tile"
+    assert not a_load_predicates, "Reduce-axis tail masking should be expressed by if_then_else, not BufferLoad.predicate"
     script = mod.script()
     assert "T.if_then_else" in script
     assert "T.float16(0.0)" in script
-    assert any("< 250" in str(predicate) or "<250" in str(predicate) for predicate in a_load_predicates)
-    assert all("< 63" not in str(predicate) and "<63" not in str(predicate) for predicate in a_load_predicates)
+    assert "< 250" in script or "<250" in script
+    assert "predicate=" not in script
 
     out_store_predicates = [store.predicate for store in _collect_buffer_stores(func, "Out_shared") if store.predicate is not None]
     assert not out_store_predicates, "Reduce final write-back should remain unpredicated"
@@ -399,9 +399,9 @@ def test_tilelang_reduce_sunmmio_tiled_axis_tail_uses_predicated_update(reduce_o
     acc_store_predicates = [
         store.predicate for store in _collect_buffer_stores(mod["main"], "Out_shared_acc") if store.predicate is not None
     ]
-    assert a_load_predicates
+    assert not a_load_predicates
     assert not acc_store_predicates
-    assert any("< 250" in str(predicate) or "<250" in str(predicate) for predicate in a_load_predicates)
+    assert "< 250" in script or "<250" in script
 
 
 UNALIGNED_REDUCE_CASES = [
@@ -472,12 +472,10 @@ def test_tilelang_reduce_sunmmio_unaligned_cases_from_tir_dump(shape, reduce_axi
     reduce_tile_size = tile_size[execution_domain_axes.index(reduce_axis)] if is_reduce_axis_tiled else 1
     has_reduce_axis_tail = is_reduce_axis_tiled and shape[reduce_axis] % reduce_tile_size != 0
     if has_reduce_axis_tail:
-        assert a_load_predicates
+        assert not a_load_predicates
         assert "T.if_then_else" in script
         assert _tail_identity_text("sum") in script
-        assert any(
-            f"< {shape[reduce_axis]}" in str(predicate) or f"<{shape[reduce_axis]}" in str(predicate) for predicate in a_load_predicates
-        )
+        assert f"< {shape[reduce_axis]}" in script or f"<{shape[reduce_axis]}" in script
     else:
         assert not a_load_predicates
 
@@ -497,7 +495,8 @@ def test_tilelang_reduce_sunmmio_unaligned_tiled_axis_tail_identity(reduce_op):
     script = mod.script()
     assert "T.if_then_else" in script
     assert _tail_identity_text(reduce_op) in script
-    assert "predicate=i2 * 32 + kj < 249" in script
+    assert "i2 * 32 + kj < 249" in script
+    assert "predicate=" not in script
 
 
 def test_tilelang_reduce_sunmmio_non_tiled_axis_tail_has_no_reduce_predicate():

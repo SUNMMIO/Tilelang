@@ -4,6 +4,7 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang.carver.arch import driver
+from tilelang.layout import make_zz_layout
 
 from compile_pipeline import target
 from sunmmio_codegen_validation_utils import (
@@ -42,15 +43,18 @@ def tile_elementwise_ops_test(
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
+    shard_policy = T.MeshShardingPolicy()
+    tensor_shape = (batch, m, n)
+    tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
     grid_b = T.ceildiv(batch, block_b)
     grid_m = T.ceildiv(m, block_m)
     grid_n = T.ceildiv(n, block_n)
 
     @T.prim_func
     def main(
-        A: T.Tensor((batch, m, n), dtype),
-        B: T.Tensor((batch, m, n), dtype),
-        C: T.Tensor((batch, m, n), dtype),
+        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
     ):
         with T.Kernel(ncores):
             A_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
@@ -60,22 +64,23 @@ def tile_elementwise_ops_test(
             for bz in T.serial(grid_b):
                 for by in T.serial(grid_m):
                     for bx in T.serial(grid_n):
-                        T.copy(
-                            A[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                            A_shared,
-                        )
-                        T.copy(
-                            B[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                            B_shared,
-                        )
+                        for bb in T.serial(block_b):
+                            T.copy(
+                                A[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                                A_shared[bb, :, :],
+                            )
+                            T.copy(
+                                B[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                                B_shared[bb, :, :],
+                            )
 
                         for b, i, j in T.Tiles(A_shared, parallel=True):
                             x = T.max(A_shared[b, i, j], B_shared[b, i, j])
@@ -99,14 +104,15 @@ def tile_elementwise_ops_test(
                                 + rem_b
                             )
 
-                        T.copy(
-                            C_shared,
-                            C[
-                                bz * block_b : (bz + 1) * block_b,
-                                by * block_m : (by + 1) * block_m,
-                                bx * block_n : (bx + 1) * block_n,
-                            ],
-                        )
+                        for bb in T.serial(block_b):
+                            T.copy(
+                                C_shared[bb, :, :],
+                                C[
+                                    bz * block_b + bb,
+                                    by * block_m : (by + 1) * block_m,
+                                    bx * block_n : (bx + 1) * block_n,
+                                ],
+                            )
 
     return main
 
@@ -122,14 +128,17 @@ def tile_elementwise_ops_2d_test(
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
+    shard_policy = T.MeshShardingPolicy()
+    tensor_shape = (m, n)
+    tensor_layout = make_zz_layout(tensor_shape, [0, 1], (32, 32))
     grid_m = T.ceildiv(m, block_m)
     grid_n = T.ceildiv(n, block_n)
 
     @T.prim_func
     def main(
-        A: T.Tensor((m, n), dtype),
-        B: T.Tensor((m, n), dtype),
-        C: T.Tensor((m, n), dtype),
+        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
     ):
         with T.Kernel(ncores):
             A_shared = T.alloc_shared((block_m, block_n), dtype)

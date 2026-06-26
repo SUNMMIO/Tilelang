@@ -69,6 +69,7 @@ ffi::Module BuildTileLangSunMMIOWithoutCompile(IRModule mod, Target target,
                                                ffi::String backend) {
   ValidateSuvmBackend(backend);
   CodeGenTileLangSunMMIO cg;
+  cg.SetTarget(target);
   cg.Init();
 
   for (auto kv : mod->functions) {

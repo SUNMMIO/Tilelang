@@ -472,6 +472,35 @@ Optional<Layout> DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
     dst_to_blocked_idx[target_axes[i]] = i;
   }
 
+  // Collect and align single-level source dims to non-blocked destination dims
+  // from the back.  The mapping is needed both for shape derivation and for
+  // physical-order reconstruction below.
+  std::vector<int> single_src_dims;
+  for (size_t d = 0; d < src_rank; ++d) {
+    if (src_cute->GetDimLevels()[d].IntValue() == 1)
+      single_src_dims.push_back(d);
+  }
+  std::vector<int> nonblocked_dst_dims;
+  for (size_t dst_d = 0; dst_d < dst_rank; ++dst_d) {
+    if (dst_to_blocked_idx.find(dst_d) == dst_to_blocked_idx.end())
+      nonblocked_dst_dims.push_back(dst_d);
+  }
+
+  // E.g. single_src=[0] nonblocked_dst=[0,1] → src dim 0 maps to dst dim 1,
+  //       dst dim 0 is excess (unmapped).
+  // E.g. single_src=[0,1,2] nonblocked_dst=[0] → src dim 2 maps to dst dim 0,
+  //       src dims 0,1 are dropped (reduced).
+  std::unordered_map<int, int> single_src_to_dst;
+  {
+    int ns = static_cast<int>(single_src_dims.size());
+    int nd = static_cast<int>(nonblocked_dst_dims.size());
+    int count = std::min(ns, nd);
+    for (int i = 0; i < count; ++i) {
+      single_src_to_dst[single_src_dims[ns - count + i]] =
+          nonblocked_dst_dims[nd - count + i];
+    }
+  }
+
   // --- Pass 1: build new mode_shape and dim_levels ---
   //
   // For each dst dim: if it maps to a blocked src dim, preserve inner
@@ -501,7 +530,31 @@ Optional<Layout> DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
     } else {
       // Non-blocked dst dim — single-level row-major.
       new_dim_levels.push_back(Integer(1));
-      new_mode_shape.push_back(dst_ext);
+      std::optional<int> mapped_src_dim;
+      for (const auto &kv : single_src_to_dst) {
+        if (kv.second == static_cast<int>(dst_d)) {
+          mapped_src_dim = kv.first;
+          break;
+        }
+      }
+      if (mapped_src_dim.has_value()) {
+        Array<PrimExpr> src_covered_shape = src_cute->GetCoveredShape();
+        const PrimExpr &src_logical_ext =
+            src_cute->GetLogicalShape()[mapped_src_dim.value()];
+        const PrimExpr &src_covered_ext =
+            src_covered_shape[mapped_src_dim.value()];
+        bool same_logical_extent =
+            analyzer ? analyzer->CanProveEqual(dst_ext, src_logical_ext)
+                     : StructuralEqual()(dst_ext, src_logical_ext);
+        bool has_padding =
+            analyzer
+                ? !analyzer->CanProveEqual(src_covered_ext, src_logical_ext)
+                : !StructuralEqual()(src_covered_ext, src_logical_ext);
+        new_mode_shape.push_back(
+            same_logical_extent && has_padding ? src_covered_ext : dst_ext);
+      } else {
+        new_mode_shape.push_back(dst_ext);
+      }
     }
   }
 
@@ -518,34 +571,6 @@ Optional<Layout> DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
   // row-major modes at outermost.
 
   auto full_order = RecoverPhysicalOrder(src_cute);
-
-  // Collect single-level src dims and non-blocked dst dims.
-  std::vector<int> single_src_dims;
-  for (size_t d = 0; d < src_rank; ++d) {
-    if (src_cute->GetDimLevels()[d].IntValue() == 1)
-      single_src_dims.push_back(d);
-  }
-  std::vector<int> nonblocked_dst_dims;
-  for (size_t dst_d = 0; dst_d < dst_rank; ++dst_d) {
-    if (dst_to_blocked_idx.find(dst_d) == dst_to_blocked_idx.end())
-      nonblocked_dst_dims.push_back(dst_d);
-  }
-
-  // Align single-level src dims to non-blocked dst dims from the back.
-  // E.g. single_src=[0] nonblocked_dst=[0,1] → src dim 0 maps to dst dim 1,
-  //       dst dim 0 is excess (unmapped).
-  // E.g. single_src=[0,1,2] nonblocked_dst=[0] → src dim 2 maps to dst dim 0,
-  //       src dims 0,1 are dropped (reduced).
-  std::unordered_map<int, int> single_src_to_dst;
-  {
-    int ns = static_cast<int>(single_src_dims.size());
-    int nd = static_cast<int>(nonblocked_dst_dims.size());
-    int count = std::min(ns, nd);
-    for (int i = 0; i < count; ++i) {
-      single_src_to_dst[single_src_dims[ns - count + i]] =
-          nonblocked_dst_dims[nd - count + i];
-    }
-  }
 
   // Build src_mode → new_mode mapping for ALL mapped modes.
   std::unordered_map<int, int> src_mode_to_new;

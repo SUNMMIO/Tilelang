@@ -29,6 +29,9 @@ public:
                         const SunMMIOValue &scalar,
                         const SunMMIOType &tile_type, DataType dtype);
 
+  SunMMIOValue TileRange(const std::string &result_name,
+                         const SunMMIOType &tile_type, DataType dtype);
+
   SunMMIOValue Cast(const std::string &result_name, const SunMMIOValue &v,
                     const SunMMIOType &dst_type, DataType dst_dtype);
 
