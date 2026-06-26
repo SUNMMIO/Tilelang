@@ -66,7 +66,7 @@ void SunmmioMlirFunction::BeginModule() {
 
 void SunmmioMlirFunction::EndModule() {
   if (failed(mlir::verify(*ctx_.module))) {
-    ctx_.module->emitError("Module verification failed");
+    LOG(FATAL) << "SunMMIO MLIR module verification failed";
   }
 }
 

@@ -120,7 +120,7 @@ def make_intrinsic_sync_kernel():
     dma = tvm.tir.Call(
         "handle",
         tvm.ir.Op.get("tl.dma_copy"),
-        [region(a_buf, 1), region(c_buf, 2), tvm.tir.IntImm("int32", 0), sync_token(0)],
+        [region(c_buf, 1), region(a_buf, 2), tvm.tir.IntImm("int32", 0), sync_token(0)],
     )
     mma = tvm.tir.Call(
         "handle",
@@ -174,6 +174,41 @@ def make_intrinsic_sync_kernel():
         "layout_map",
         {c_buf: make_zz_layout(c_buf, axes=[0, 1], block_shape=(32, 32))},
     )
+
+
+@target("Sunmmio")
+def make_invalid_dma_source_kernel():
+    f16 = tvm.ir.PrimType("float16")
+    src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(f16, "shared.asram"))
+    dst_data = tvm.tir.Var("dst_data", tvm.ir.PointerType(f16, "shared.rsram"))
+    src_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Src", data=src_data, scope="shared.asram")
+    dst_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Dst", data=dst_data, scope="shared.rsram")
+
+    def region(buf, access):
+        return tvm.tir.call_intrin(
+            "handle",
+            tvm.ir.Op.get("tl.tileop.region"),
+            tvm.tir.BufferLoad(
+                buf,
+                [tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 0)],
+            ),
+            tvm.tir.IntImm("int32", access),
+            tvm.tir.IntImm("int32", 32),
+            tvm.tir.IntImm("int32", 32),
+        )
+
+    sync_token = tvm.tir.call_intrin(
+        "handle",
+        tvm.ir.Op.get("tl.sync_token_id"),
+        tvm.tir.IntImm("int32", 0),
+    )
+    dma = tvm.tir.Call(
+        "handle",
+        tvm.ir.Op.get("tl.dma_copy"),
+        [region(src_buf, 1), region(dst_buf, 2), tvm.tir.IntImm("int32", 0), sync_token],
+    )
+    stmt = tvm.tir.DeclBuffer(src_buf, tvm.tir.DeclBuffer(dst_buf, tvm.tir.Evaluate(dma)))
+    return _to_device_kernel_func(tvm.tir.PrimFunc([src_data, dst_data], stmt))
 
 
 @target("Sunmmio")
@@ -446,6 +481,14 @@ def test_sunmmio_codegen_lowers_layout_transform():
     src = build_sunmmio_source_without_compile(make_layout_transform_kernel())
     assert "suvm.transform_layout_async" in src
     assert "sunmmio.fake" not in src
+
+
+def test_sunmmio_codegen_module_verification_failure_fails_loudly():
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": make_invalid_dma_source_kernel()})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(Exception, match="SunMMIO MLIR module verification failed"):
+        builder(mod, target, "suvm")
 
 
 def test_sunmmio_codegen_shuffle_fails_loudly():
