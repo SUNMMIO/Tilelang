@@ -2,6 +2,7 @@
 #include "sunmmio_mlir_builder.h"
 
 #include "../../layout/layout.h"
+#include "../../op/builtin.h"
 #include "../../op/comm.h"
 #include "../../op/region.h"
 #include "../../op/utils.h"
@@ -83,6 +84,19 @@ bool IsSunmmioReduceRegisterTempBuffer(const tir::Buffer &buffer) {
                               name.rfind("_res") == name.size() - 4);
 }
 
+bool IsSunmmioLocalVarBuffer(const tir::Buffer &buffer) {
+  if (!buffer.defined()) {
+    return false;
+  }
+  const std::string scope = buffer.scope();
+  return scope == "local.var";
+}
+
+std::string LocalVarValueName(const tir::VarNode *var) {
+  ICHECK(var != nullptr);
+  return "%local_var_" + var->name_hint;
+}
+
 } // namespace
 
 CodeGenTileLangSunMMIO::CodeGenTileLangSunMMIO() = default;
@@ -104,12 +118,15 @@ void CodeGenTileLangSunMMIO::Clear() {
   builder_.reset();
   ssa_counter_ = 0;
   var_table_.clear();
+  local_var_table_.clear();
   buffer_registry_.clear();
   buffer_data_to_buffer_.clear();
   attr_stack_.clear();
   scoped_vars_.clear();
+  scoped_local_vars_.clear();
   scoped_buffers_.clear();
   var_scope_markers_.clear();
+  local_var_scope_markers_.clear();
   buffer_scope_markers_.clear();
   expected_node_types_.clear();
   visited_node_types_.clear();
@@ -482,6 +499,16 @@ CodeGenTileLangSunMMIO::LookupVar(const tir::VarNode *var) const {
   return self->var_table_.find(var)->second;
 }
 
+const SunMMIOValue &
+CodeGenTileLangSunMMIO::LookupLocalVar(const tir::VarNode *var) const {
+  ICHECK(var != nullptr);
+  auto it = local_var_table_.find(var);
+  ICHECK(it != local_var_table_.end())
+      << "CodeGenTileLangSunMMIO: unknown local.var buffer data "
+      << var->name_hint;
+  return it->second;
+}
+
 SunMMIOValue CodeGenTileLangSunMMIO::MaterializeDynamicLayoutExpr(
     const tvm::PrimExpr &expr) {
   arith::Analyzer analyzer;
@@ -553,6 +580,9 @@ void CodeGenTileLangSunMMIO::RegisterBuffer(const tir::Buffer &buffer,
   if (!buffer.defined()) {
     return;
   }
+  if (IsSunmmioLocalVarBuffer(buffer)) {
+    return;
+  }
   if (buffer_registry_.count(buffer.get())) {
     return;
   }
@@ -613,6 +643,109 @@ void CodeGenTileLangSunMMIO::EmitAlloc(const tir::Buffer &buffer,
   if (it != buffer_registry_.end()) {
     it->second.handle = alloc.value;
     it->second.buffer_type = alloc.type;
+  }
+}
+
+void CodeGenTileLangSunMMIO::EmitLocalVarAlloc(const tir::AllocateNode *op,
+                                               const tir::Buffer &buffer) {
+  ICHECK(IsSunmmioLocalVarBuffer(buffer));
+  ICHECK_EQ(op->ConstantAllocationSize(), 1)
+      << "local.var allocation must be scalar-sized";
+
+  PrimExpr init = tir::make_const(op->dtype, 0);
+  auto init_it = op->annotations.find(tl::attr::kLocalVarInit);
+  if (init_it != op->annotations.end()) {
+    PrimExpr user_init = Downcast<PrimExpr>((*init_it).second);
+    if (!user_init.dtype().is_void() && user_init.dtype() != op->dtype) {
+      user_init = tir::Cast(op->dtype, user_init);
+    }
+    init = user_init;
+  }
+
+  DataType dtype = CanonicalizeSuvmDType(buffer->dtype);
+  SunMMIOValue init_value = EnsureType(EvalExpr(init), MapType(dtype), dtype);
+  SunMMIOValue state = builder_->BindValueAlias(
+      LocalVarValueName(buffer->data.get()), init_value);
+  local_var_table_[buffer->data.get()] = state;
+  scoped_local_vars_.push_back(buffer->data.get());
+}
+
+SunMMIOValue
+CodeGenTileLangSunMMIO::EmitLocalVarLoad(const tir::Buffer &buffer,
+                                         const ffi::Array<PrimExpr> &indices) {
+  ICHECK(IsSunmmioLocalVarBuffer(buffer));
+  ICHECK_EQ(indices.size(), 1)
+      << "local.var buffer loads must use exactly one scalar index";
+  arith::Analyzer analyzer;
+  PrimExpr index = analyzer.Simplify(indices[0]);
+  const auto *index_imm = index.as<IntImmNode>();
+  ICHECK(index_imm && index_imm->value == 0)
+      << "local.var buffer loads only support index 0";
+  return LookupLocalVar(buffer->data.get());
+}
+
+void CodeGenTileLangSunMMIO::EmitLocalVarStore(
+    const tir::Buffer &buffer, const ffi::Array<PrimExpr> &indices,
+    const SunMMIOValue &value) {
+  ICHECK(IsSunmmioLocalVarBuffer(buffer));
+  ICHECK_EQ(indices.size(), 1)
+      << "local.var buffer stores must use exactly one scalar index";
+  arith::Analyzer analyzer;
+  PrimExpr index = analyzer.Simplify(indices[0]);
+  const auto *index_imm = index.as<IntImmNode>();
+  ICHECK(index_imm && index_imm->value == 0)
+      << "local.var buffer stores only support index 0";
+
+  const SunMMIOValue &current = LookupLocalVar(buffer->data.get());
+  DataType dtype = CanonicalizeSuvmDType(buffer->dtype);
+  SunMMIOValue casted = EnsureType(value, MapType(dtype), dtype);
+  SunMMIOValue state = builder_->BindValueAlias(current.value, casted);
+  local_var_table_[buffer->data.get()] = state;
+}
+
+std::vector<SunMMIOValue> CodeGenTileLangSunMMIO::CollectLocalVarLiveOutValues(
+    const tir::Stmt &stmt) const {
+  class Collector final : public tir::StmtVisitor {
+  public:
+    explicit Collector(const std::unordered_map<const tir::VarNode *,
+                                                SunMMIOValue> &local_var_table)
+        : local_var_table_(local_var_table) {}
+
+    std::vector<SunMMIOValue> values;
+
+  private:
+    void VisitStmt_(const tir::BufferStoreNode *op) final {
+      if (IsSunmmioLocalVarBuffer(op->buffer)) {
+        const tir::VarNode *data = op->buffer->data.get();
+        auto it = local_var_table_.find(data);
+        if (it != local_var_table_.end() && seen_.insert(data).second) {
+          values.push_back(it->second);
+        }
+      }
+      tir::StmtVisitor::VisitStmt_(op);
+    }
+
+    const std::unordered_map<const tir::VarNode *, SunMMIOValue>
+        &local_var_table_;
+    std::unordered_set<const tir::VarNode *> seen_;
+  };
+
+  Collector collector(local_var_table_);
+  collector(stmt);
+  return std::move(collector.values);
+}
+
+static void
+AppendUniqueLocalVarLiveOutValues(std::vector<SunMMIOValue> *dst,
+                                  const std::vector<SunMMIOValue> &src) {
+  std::unordered_set<std::string> seen;
+  for (const SunMMIOValue &value : *dst) {
+    seen.insert(value.value);
+  }
+  for (const SunMMIOValue &value : src) {
+    if (seen.insert(value.value).second) {
+      dst->push_back(value);
+    }
   }
 }
 
@@ -872,6 +1005,8 @@ struct TokenAnalyzer {
 void CodeGenTileLangSunMMIO::EmitFor(const tir::ForNode *op) {
   TokenAnalyzer analyzer;
   TokenSummary summary = analyzer.AnalyzeFor(op);
+  std::vector<SunMMIOValue> local_live_out_values =
+      CollectLocalVarLiveOutValues(op->body);
 
   SunMMIOValue min = EnsureIndex(EvalExpr(op->min));
   SunMMIOValue extent = EnsureIndex(EvalExpr(op->extent));
@@ -881,7 +1016,12 @@ void CodeGenTileLangSunMMIO::EmitFor(const tir::ForNode *op) {
       SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
       DataType::Int(32));
   std::string iv = "%" + op->loop_var->name_hint;
-  builder_->BeginFor(iv, min, upper, step, op->annotations, summary.live_out);
+  if (!local_live_out_values.empty()) {
+    builder_->BeginFor(iv, min, upper, step, op->annotations, summary.live_out,
+                       local_live_out_values);
+  } else {
+    builder_->BeginFor(iv, min, upper, step, op->annotations, summary.live_out);
+  }
   EnterScope();
   BindVar(
       op->loop_var,
@@ -900,7 +1040,19 @@ void CodeGenTileLangSunMMIO::EmitIf(const tir::IfThenElseNode *op) {
       DataType::Bool());
   TokenAnalyzer analyzer;
   TokenSummary summary = analyzer.AnalyzeIf(op);
-  builder_->BeginIf(cond, summary.live_out);
+  std::vector<SunMMIOValue> local_live_out_values =
+      CollectLocalVarLiveOutValues(op->then_case);
+  if (op->else_case.defined()) {
+    std::vector<SunMMIOValue> else_live_out_values =
+        CollectLocalVarLiveOutValues(op->else_case.value());
+    AppendUniqueLocalVarLiveOutValues(&local_live_out_values,
+                                      else_live_out_values);
+  }
+  if (!local_live_out_values.empty()) {
+    builder_->BeginIf(cond, summary.live_out, local_live_out_values);
+  } else {
+    builder_->BeginIf(cond, summary.live_out);
+  }
   VisitStmtTracked(op->then_case);
   if (op->else_case.defined()) {
     builder_->BeginElse();
@@ -919,7 +1071,13 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::ForNode *op) {
 void CodeGenTileLangSunMMIO::EmitWhile(const tir::WhileNode *op) {
   TokenAnalyzer analyzer;
   TokenSummary summary = analyzer.AnalyzeWhile(op);
-  builder_->BeginWhile(summary.live_out);
+  std::vector<SunMMIOValue> local_live_out_values =
+      CollectLocalVarLiveOutValues(op->body);
+  if (!local_live_out_values.empty()) {
+    builder_->BeginWhile(summary.live_out, local_live_out_values);
+  } else {
+    builder_->BeginWhile(summary.live_out);
+  }
   SunMMIOValue cond = EnsureType(
       EvalExpr(op->condition),
       SunMMIOType{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}},
@@ -967,21 +1125,25 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::WhileNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
-  std::string scope = GetAllocateStorageScope(op->buffer_var);
   EnterScope();
   auto buffer_it = buffer_data_to_buffer_.find(op->buffer_var.get());
   if (buffer_it != buffer_data_to_buffer_.end()) {
     const tir::Buffer &buffer = buffer_it->second;
-    if (IsSunmmioReduceRegisterTempBuffer(buffer)) {
+    if (IsSunmmioLocalVarBuffer(buffer)) {
+      EmitLocalVarAlloc(op, buffer);
+    } else if (IsSunmmioReduceRegisterTempBuffer(buffer)) {
       // TIR materializes reduce intermediates as alloc_buffer so the algorithm
       // can be expressed with BufferLoad/Store.  On SunMMIO these values live
       // in vector-core tile registers and are lowered inside the Tiles scope as
       // SSA tiles, not as rsram memtensors.
       RegisterBuffer(buffer, false);
     } else {
+      std::string scope = GetAllocateStorageScope(op->buffer_var);
       EmitAlloc(buffer_it->second, scope);
     }
   } else {
+    std::string scope = GetAllocateStorageScope(op->buffer_var);
+    (void)scope;
     LOG(WARNING) << "SunMMIO SUVM allocate cannot find buffer for variable "
                  << op->buffer_var->name_hint;
   }
@@ -997,12 +1159,18 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateConstNode *op) {
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::DeclBufferNode *op) {
   EnterScope();
-  RegisterBuffer(op->buffer, false);
+  if (!IsSunmmioLocalVarBuffer(op->buffer)) {
+    RegisterBuffer(op->buffer, false);
+  }
   VisitStmtTracked(op->body);
   ExitScope();
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferStoreNode *op) {
+  if (IsSunmmioLocalVarBuffer(op->buffer)) {
+    EmitLocalVarStore(op->buffer, op->indices, EvalExpr(op->value));
+    return;
+  }
   UnsupportedStmt(
       op, "generic BufferStoreNode should not reach SunMMIO codegen; "
           "tiled buffer stores must be lowered through tile-aware paths");
@@ -1269,6 +1437,9 @@ SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::SelectNode *op) {
 SunMMIOValue
 CodeGenTileLangSunMMIO::EmitLoad(const tir::Buffer &buffer,
                                  const ffi::Array<PrimExpr> &indices) {
+  if (IsSunmmioLocalVarBuffer(buffer)) {
+    return EmitLocalVarLoad(buffer, indices);
+  }
   const BufferBinding &binding = LookupBuffer(buffer);
   std::vector<SunMMIOValue> idx_vals;
   for (const PrimExpr &idx : indices) {
@@ -1282,6 +1453,10 @@ CodeGenTileLangSunMMIO::EmitLoad(const tir::Buffer &buffer,
 void CodeGenTileLangSunMMIO::EmitStore(const tir::Buffer &buffer,
                                        const ffi::Array<PrimExpr> &indices,
                                        const SunMMIOValue &value) {
+  if (IsSunmmioLocalVarBuffer(buffer)) {
+    EmitLocalVarStore(buffer, indices, value);
+    return;
+  }
   const BufferBinding &binding = LookupBuffer(buffer);
   std::vector<SunMMIOValue> idx_vals;
   for (const PrimExpr &idx : indices) {
@@ -1293,6 +1468,9 @@ void CodeGenTileLangSunMMIO::EmitStore(const tir::Buffer &buffer,
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::BufferLoadNode *op) {
+  if (IsSunmmioLocalVarBuffer(op->buffer)) {
+    return EmitLocalVarLoad(op->buffer, op->indices);
+  }
   UnsupportedExpr(
       op, "generic BufferLoadNode should not reach SunMMIO codegen; tiled "
           "buffer accesses must be lowered through tile-aware paths");
@@ -1349,11 +1527,13 @@ SunMMIOValue CodeGenTileLangSunMMIO::VisitExprDefault_(const Object *op) {
 
 void CodeGenTileLangSunMMIO::EnterScope() {
   var_scope_markers_.push_back(scoped_vars_.size());
+  local_var_scope_markers_.push_back(scoped_local_vars_.size());
   buffer_scope_markers_.push_back(scoped_buffers_.size());
 }
 
 void CodeGenTileLangSunMMIO::ExitScope() {
   ICHECK(!var_scope_markers_.empty());
+  ICHECK(!local_var_scope_markers_.empty());
   ICHECK(!buffer_scope_markers_.empty());
 
   size_t var_marker = var_scope_markers_.back();
@@ -1362,6 +1542,14 @@ void CodeGenTileLangSunMMIO::ExitScope() {
     const tir::VarNode *var = scoped_vars_.back();
     scoped_vars_.pop_back();
     var_table_.erase(var);
+  }
+
+  size_t local_var_marker = local_var_scope_markers_.back();
+  local_var_scope_markers_.pop_back();
+  while (scoped_local_vars_.size() > local_var_marker) {
+    const tir::VarNode *var = scoped_local_vars_.back();
+    scoped_local_vars_.pop_back();
+    local_var_table_.erase(var);
   }
 
   size_t buffer_marker = buffer_scope_markers_.back();

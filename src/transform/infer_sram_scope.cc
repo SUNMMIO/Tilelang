@@ -91,6 +91,8 @@ Buffer makeNewCompactBufferWithScope(const Buffer &buffer,
                 buffer->buffer_type);
 }
 
+bool IsLocalVarScope(const std::string &scope) { return scope == "local.var"; }
+
 struct BufferSourceInfo {
   Buffer src_buffer;
   Array<Range> src_region;
@@ -231,6 +233,10 @@ private:
       if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
         buffers_to_infer.insert(buffer);
         original_alloc_buffers_.insert(buffer);
+      } else if (IsLocalVarScope(buffer.scope())) {
+        // local.var is a scalar pseudo-buffer lowered as SSA in SunMMIO
+        // codegen, not an ASRAM/WSRAM/RSRAM allocation.
+        continue;
       } else if (!IsSunmmioSramScope(buffer.scope())) {
         // SRAM scopes should already have been validated at the GEMM sites.
         LOG(FATAL) << "Invalid scope " << buffer.scope() << " of " << buffer
@@ -513,6 +519,10 @@ private:
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
     auto load = Downcast<BufferLoad>(IRMutatorWithAnalyzer::VisitExpr_(op));
+    if (IsLocalVarScope(load->buffer.scope())) {
+      // local.var loads are scalar variable reads, not SRAM reads.
+      return load;
+    }
     if (InInfoCollectionPhase()) {
       auto buffer = load->buffer;
       if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
@@ -556,6 +566,10 @@ private:
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     auto store = Downcast<BufferStore>(IRMutatorWithAnalyzer::VisitStmt_(op));
+    if (IsLocalVarScope(store->buffer.scope())) {
+      // local.var stores update scalar SSA state in codegen.
+      return store;
+    }
     if (InInfoCollectionPhase()) {
       // A plain BufferStore to a shared buffer is a Tile-/Scalar-unit output.
       // Both units operate on RSRAM, so the destination must be RSRAM -- the

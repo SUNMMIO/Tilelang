@@ -25,7 +25,6 @@ def topk_full_kernel(
     block_M=32,
 ):
     dtype = T.float32
-    grid_m = T.ceildiv(M, block_M)
 
     assert M % block_M == 0
     assert N == 128
@@ -50,6 +49,7 @@ def topk_full_kernel(
         topk_indices: T.MeshTensor(topk_shape, shard_policy, device_mesh_config, T.int32, layout=topk_indices_layout),  # type: ignore
     ):
         with T.Kernel(ncores) as _cid:
+            sharded_M = logits.shape[0]
             logits_shared = T.alloc_shared((block_M, N), dtype, scope="shared.rsram")
             expand_max_idx = T.alloc_shared((block_M, N), T.int32, scope="shared.rsram")
             max_val = T.alloc_shared((block_M,), dtype, scope="shared.rsram")
@@ -62,7 +62,7 @@ def topk_full_kernel(
                 }
             )
 
-            for bx in T.serial(grid_m):
+            for bx in T.serial(T.ceildiv(sharded_M, block_M)):
                 T.copy(logits[bx * block_M, 0], logits_shared)
 
                 for k in T.serial(topk):
@@ -98,7 +98,6 @@ def topk_transition_kernel(
     block_M=32,
 ):
     dtype = T.float32
-    grid_m = T.ceildiv(M, block_M)
 
     assert M % block_M == 0
     assert N == 128
@@ -123,12 +122,13 @@ def topk_transition_kernel(
         topk_indices: T.MeshTensor(topk_shape, shard_policy, device_mesh_config, T.int32, layout=topk_indices_layout),  # type: ignore
     ):
         with T.Kernel(ncores) as _cid:
+            sharded_M = logits.shape[0]
             logits_shared = T.alloc_shared((block_M, N), dtype, scope="shared.rsram")
             expand_max_idx = T.alloc_shared((block_M, N), T.int32, scope="shared.rsram")
             max_val = T.alloc_shared((block_M,), dtype, scope="shared.rsram")
             max_idx = T.alloc_shared((block_M,), T.int32, scope="shared.rsram")
 
-            for bx in T.serial(grid_m):
+            for bx in T.serial(T.ceildiv(sharded_M, block_M)):
                 T.copy(logits[bx * block_M, 0], logits_shared)
 
                 for k in T.serial(topk):

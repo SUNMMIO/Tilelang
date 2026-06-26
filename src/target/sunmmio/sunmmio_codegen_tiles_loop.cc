@@ -24,6 +24,13 @@ namespace {
 
 using namespace tir;
 
+bool IsSunmmioLocalVarBuffer(const tir::Buffer &buffer) {
+  if (!buffer.defined()) {
+    return false;
+  }
+  return buffer.scope() == "local.var";
+}
+
 struct TilesScopeInfo {
   const ForNode *root{nullptr};
   ffi::Array<PrimExpr> domain_shape;
@@ -2433,6 +2440,9 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       return lower_expr(let->body, &let_state, preferred_dtype);
     }
     if (const auto *load = expr.as<BufferLoadNode>()) {
+      if (IsSunmmioLocalVarBuffer(load->buffer)) {
+        return EmitLocalVarLoad(load->buffer, load->indices);
+      }
       auto local_it = state->local_tile_values.find(load->buffer.get());
       if (local_it != state->local_tile_values.end()) {
         return local_it->second;
@@ -2568,6 +2578,16 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       lhs = orient_tile_operand_to_shape(lhs, result_shape);
       rhs = orient_tile_operand_to_shape(rhs, result_shape);
       SunMMIOType tile_type = MakeTileType(result_dtype, result_shape);
+      auto broadcast_scalar_to_tile = [&](SunMMIOValue value) {
+        if (IsTileLike(value)) {
+          return value;
+        }
+        SunMMIOType scalar_type{
+            SunMMIOType::Kind::kScalar, result_dtype, 1, {}};
+        value = EnsureType(value, scalar_type, result_dtype);
+        return builder_->TileFill(NewValueName(), value, tile_type,
+                                  result_dtype);
+      };
       if (supports_mixed_precision) {
         if (!IsTileLike(lhs) && !is_float_like_dtype(lhs.dtype)) {
           lhs = cast_value_to_dtype(lhs, result_dtype);
@@ -3052,6 +3072,12 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                       "reduce register temporaries");
     }
     if (const auto *store = stmt.as<BufferStoreNode>()) {
+      if (IsSunmmioLocalVarBuffer(store->buffer)) {
+        EmitLocalVarStore(
+            store->buffer, store->indices,
+            lower_expr(store->value, state, store->buffer->dtype));
+        return;
+      }
       auto local_it = state->local_tile_values.find(store->buffer.get());
       if (local_it != state->local_tile_values.end()) {
         SunMMIOType local_type = local_it->second.type;
