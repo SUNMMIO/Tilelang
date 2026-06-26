@@ -621,8 +621,9 @@ CodeGenTileLangSunMMIO::LookupBuffer(const tir::Buffer &buffer) const {
   return it->second;
 }
 
-void CodeGenTileLangSunMMIO::EmitAlloc(const tir::Buffer &buffer,
-                                       const std::string &scope_hint) {
+void CodeGenTileLangSunMMIO::EmitAlloc(
+    const tir::Buffer &buffer, const std::string &scope_hint,
+    const ffi::Map<ffi::String, ffi::Any> &annotations) {
   std::vector<SunMMIOValue> dyn_extents;
   for (const PrimExpr &dim : buffer->shape) {
     if (!dim.as<IntImmNode>()) {
@@ -635,8 +636,16 @@ void CodeGenTileLangSunMMIO::EmitAlloc(const tir::Buffer &buffer,
     memtensor_type.memory_scope = scope_hint;
   }
 
-  SunMMIOValue alloc = builder_->Alloc(NewValueName(), memtensor_type,
-                                       dyn_extents, scope_hint, buffer->dtype);
+  std::optional<std::string> ping_pong;
+  auto ping_pong_it = annotations.find(tl::attr::kSunmmioAllocPingPong);
+  if (ping_pong_it != annotations.end()) {
+    ping_pong =
+        static_cast<std::string>(Downcast<ffi::String>((*ping_pong_it).second));
+  }
+
+  SunMMIOValue alloc =
+      builder_->Alloc(NewValueName(), memtensor_type, dyn_extents, scope_hint,
+                      buffer->dtype, std::move(ping_pong));
   BindVar(buffer->data, alloc);
 
   auto it = buffer_registry_.find(buffer.get());
@@ -1139,7 +1148,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
       RegisterBuffer(buffer, false);
     } else {
       std::string scope = GetAllocateStorageScope(op->buffer_var);
-      EmitAlloc(buffer_it->second, scope);
+      EmitAlloc(buffer_it->second, scope, op->annotations);
     }
   } else {
     std::string scope = GetAllocateStorageScope(op->buffer_var);

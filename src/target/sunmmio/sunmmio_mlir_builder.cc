@@ -148,13 +148,12 @@ SunMMIOValue SuvmSunmmioBuilder::BindLayout(
   return SunMMIOValue{source.dtype, result_name, source.type};
 }
 
-SunMMIOValue
-SuvmSunmmioBuilder::Alloc(const std::string &result_name,
-                          const SunMMIOType &memref_type,
-                          const std::vector<SunMMIOValue> &dyn_extents,
-                          const std::string &scope_name, DataType dtype) {
+SunMMIOValue SuvmSunmmioBuilder::Alloc(
+    const std::string &result_name, const SunMMIOType &memref_type,
+    const std::vector<SunMMIOValue> &dyn_extents, const std::string &scope_name,
+    DataType dtype, std::optional<std::string> ping_pong) {
   return memory_->Alloc(result_name, memref_type, dyn_extents, scope_name,
-                        dtype);
+                        dtype, std::move(ping_pong));
 }
 
 SunMMIOValue SuvmSunmmioBuilder::Load(const std::string &result_name,

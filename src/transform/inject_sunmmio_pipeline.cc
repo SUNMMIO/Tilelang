@@ -5,6 +5,7 @@
 #include "../op/parallel.h"
 #include "../op/region.h"
 #include "../op/utils.h"
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "../tileview/tileview.h"
 #include "common/ast_traverser.h"
@@ -62,6 +63,7 @@ public:
     }
 
     substituter.RewriteFunctionLayoutAttrs(f);
+    substituter.RecordDefaultPingPongAttrs(f);
 
     f.CopyOnWrite()->body =
         RemapBufferRewriter::Substitute(f->body, substituter.buffer_remap_);
@@ -94,6 +96,30 @@ private:
       new_layout_map.Set(new_buffer, derived_layout.value());
     }
     f = WithAttr(std::move(f), attr::kLayoutMap, new_layout_map);
+  }
+
+  void RecordDefaultPingPongAttrs(PrimFunc &f) {
+    if (buffer_remap_.empty()) {
+      return;
+    }
+
+    Map<Var, String> alloc_ping_pong;
+    for (const auto &kv : buffer_remap_) {
+      const Buffer &buffer = kv.first;
+      if (buffer.scope() != kSunmmioScopeASRAM &&
+          buffer.scope() != kSunmmioScopeWSRAM) {
+        continue;
+      }
+      const Buffer &new_buffer = kv.second;
+      alloc_ping_pong.Set(new_buffer->data, String("pong"));
+    }
+
+    if (alloc_ping_pong.empty()) {
+      return;
+    }
+
+    f = WithAttr(std::move(f), tl::attr::kSunmmioAllocPingPong,
+                 alloc_ping_pong);
   }
 
   Buffer makeMultiVersionBuffer(const Buffer &buffer, int num_version) {

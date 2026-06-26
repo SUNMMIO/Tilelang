@@ -70,7 +70,8 @@ public:
   SunMMIOValue Alloc(const std::string &result_name,
                      const SunMMIOType &memref_type,
                      const std::vector<SunMMIOValue> &dyn_extents,
-                     const std::string &scope_name, DataType dtype) final;
+                     const std::string &scope_name, DataType dtype,
+                     std::optional<std::string> ping_pong) final;
 
   SunMMIOValue Load(const std::string &result_name,
                     const std::string &buffer_handle,

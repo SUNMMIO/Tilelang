@@ -312,7 +312,7 @@ def validate_sunmmio_codegen_with_npuir_opt(
     opt_args: Sequence[str] = ("-suvm-device-validate",),
     print_ir: bool | None = None,
     print_opt: bool | None = None,
-    simplify_mlir: bool = True,
+    simplify_mlir: bool = False,
     simplify_opt_args: Sequence[str] = ("--verify-each", "--canonicalize", "--cse"),
     print_simplify: bool | None = None,
     log_ir: bool | None = None,
