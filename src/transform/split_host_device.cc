@@ -635,7 +635,7 @@ tvm::transform::Pass SplitHostDevice() {
     }
     mod->Update(updates);
     mod->Update(device_mod);
-    IRModule before_ssa = mod;
+    const IRModule &before_ssa = mod;
     IRModule after_ssa = tir::transform::ConvertSSA()(mod);
     return NormalizePostSSAAttrs(before_ssa, after_ssa);
   };

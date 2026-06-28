@@ -198,7 +198,7 @@ IRModule NormalizePostSSAAttrs(const IRModule &before_ssa, IRModule after_ssa) {
       continue;
     }
 
-    tir::PrimFunc new_func = new_func_opt.value();
+    const tir::PrimFunc &new_func = new_func_opt.value();
     tir::PrimFunc normalized =
         NormalizeTensorMetaAfterSSA(old_func_opt.value(), new_func);
     if (!normalized.same_as(new_func)) {
