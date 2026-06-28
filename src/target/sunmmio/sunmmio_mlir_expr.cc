@@ -198,11 +198,7 @@ SunMMIOValue SunmmioMlirExpr::Cast(const std::string &result_name,
   ICHECK(ctx_.module)
       << "MLIR module must be initialized before lowering Sunmmio expressions";
 
-  // mlir::Value src_value = ctx_.LookupMLIRValue(v.value);
-  // ICHECK(src_value) << "Missing MLIR source value in Cast for `" << v.value
-  //                   << "` while lowering result `" << result_name << "`";
-  mlir::Value src_value =
-      ctx_.LookupOrCreateFakeValue(v, "fake_missing_cast_src");
+  mlir::Value src_value = ctx_.LookupValue(v, "missing_cast_src");
 
   /**
    * Materialize explicit arith casts so later MLIR lowering always sees a
@@ -224,14 +220,8 @@ SunMMIOValue SunmmioMlirExpr::Binary(const std::string &result_name,
   ICHECK(ctx_.module)
       << "MLIR module must be initialized before lowering Sunmmio expressions";
 
-  // mlir::Value lhs = ctx_.LookupMLIRValue(a.value);
-  // mlir::Value rhs = ctx_.LookupMLIRValue(b.value);
-  // ICHECK(lhs) << "Missing MLIR lhs value in Binary for `" << a.value
-  //             << "` while lowering result `" << result_name << "`";
-  // ICHECK(rhs) << "Missing MLIR rhs value in Binary for `" << b.value
-  //             << "` while lowering result `" << result_name << "`";
-  mlir::Value lhs = ctx_.LookupOrCreateFakeValue(a, "fake_missing_binary_lhs");
-  mlir::Value rhs = ctx_.LookupOrCreateFakeValue(b, "fake_missing_binary_rhs");
+  mlir::Value lhs = ctx_.LookupValue(a, "missing_binary_lhs");
+  mlir::Value rhs = ctx_.LookupValue(b, "missing_binary_rhs");
 
   mlir::Location loc = MapMlirLoc(ctx_);
   mlir::Type result_mlir_type = MapMlirType(ctx_, result_type);
@@ -381,14 +371,8 @@ SunMMIOValue SunmmioMlirExpr::Compare(const std::string &result_name,
   ICHECK(ctx_.module)
       << "MLIR module must be initialized before lowering Sunmmio expressions";
 
-  // mlir::Value lhs = ctx_.LookupMLIRValue(a.value);
-  // mlir::Value rhs = ctx_.LookupMLIRValue(b.value);
-  // ICHECK(lhs) << "Missing MLIR lhs value in Compare for `" << a.value
-  //             << "` while lowering result `" << result_name << "`";
-  // ICHECK(rhs) << "Missing MLIR rhs value in Compare for `" << b.value
-  //             << "` while lowering result `" << result_name << "`";
-  mlir::Value lhs = ctx_.LookupOrCreateFakeValue(a, "fake_missing_compare_lhs");
-  mlir::Value rhs = ctx_.LookupOrCreateFakeValue(b, "fake_missing_compare_rhs");
+  mlir::Value lhs = ctx_.LookupValue(a, "missing_compare_lhs");
+  mlir::Value rhs = ctx_.LookupValue(b, "missing_compare_rhs");
 
   mlir::Location loc = MapMlirLoc(ctx_);
   mlir::Type bool_mlir_type = MapMlirType(
@@ -421,24 +405,9 @@ SunMMIOValue SunmmioMlirExpr::Select(const std::string &result_name,
   ICHECK(ctx_.module)
       << "MLIR module must be initialized before lowering Sunmmio expressions";
 
-  // mlir::Value cond_value = ctx_.LookupMLIRValue(cond.value);
-  // mlir::Value true_value = ctx_.LookupMLIRValue(tv.value);
-  // mlir::Value false_value = ctx_.LookupMLIRValue(fv.value);
-  // ICHECK(cond_value) << "Missing MLIR condition value in Select for `"
-  //                    << cond.value << "` while lowering result `" <<
-  //                    result_name
-  //                    << "`";
-  // ICHECK(true_value) << "Missing MLIR true value in Select for `" << tv.value
-  //                    << "` while lowering result `" << result_name << "`";
-  // ICHECK(false_value) << "Missing MLIR false value in Select for `" <<
-  // fv.value
-  //                     << "` while lowering result `" << result_name << "`";
-  mlir::Value cond_value =
-      ctx_.LookupOrCreateFakeValue(cond, "fake_missing_select_cond");
-  mlir::Value true_value =
-      ctx_.LookupOrCreateFakeValue(tv, "fake_missing_select_true");
-  mlir::Value false_value =
-      ctx_.LookupOrCreateFakeValue(fv, "fake_missing_select_false");
+  mlir::Value cond_value = ctx_.LookupValue(cond, "missing_select_cond");
+  mlir::Value true_value = ctx_.LookupValue(tv, "missing_select_true");
+  mlir::Value false_value = ctx_.LookupValue(fv, "missing_select_false");
 
   mlir::Location loc = MapMlirLoc(ctx_);
   mlir::Type result_mlir_type = MapMlirType(ctx_, result_type);

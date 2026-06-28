@@ -155,23 +155,17 @@ struct SunmmioMlirContext {
     return mlir::Value();
   }
 
-  mlir::Value LookupOrCreateFakeValue(const SunMMIOValue &value,
-                                      const std::string &debug_tag) {
+  mlir::Value LookupValue(const SunMMIOValue &value,
+                          const std::string &debug_tag) const {
     mlir::Value existing = LookupMLIRValue(value.value);
     if (existing) {
       return existing;
     }
 
-    auto fake_op = mlir::arith::ConstantIntOp::create(
-        builder, SunmmioMlirType(*this).MakeDebugLoc(debug_tag), 0, 32);
-    std::string attr_str =
-        debug_tag + (value.value.empty() ? "" : ":" + value.value);
-    fake_op->setAttr("sunmmio.fake", builder.getStringAttr(attr_str));
-    mlir::Value fake_value = fake_op.getResult();
-    if (!value.value.empty()) {
-      BindMLIRValue(value.value, fake_value);
-    }
-    return fake_value;
+    LOG(FATAL) << "Missing MLIR value for SunMMIO operand `"
+               << (value.value.empty() ? std::string("<unnamed>") : value.value)
+               << "` while lowering " << debug_tag;
+    TVM_FFI_UNREACHABLE();
   }
 
   void BindMLIRValue(const std::string &name, mlir::Value v) {

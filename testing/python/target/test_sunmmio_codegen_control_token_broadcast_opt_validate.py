@@ -179,6 +179,17 @@ def test_broadcast_missing_dynamic_mask_fails_loudly():
         _build_sunmmio_source_from_stmt(stmt, params=[src_data, dst_data])
 
 
+def test_broadcast_missing_scalar_binary_operand_fails_loudly():
+    src_data, dst_data, src_buf, dst_buf = _shared_buffers()
+    missing_lhs = tvm.tir.Var("missing_lhs", "int64")
+    mask = tvm.tir.bitwise_or(missing_lhs, tvm.tir.IntImm("int64", 1))
+    body = tvm.tir.Evaluate(_broadcast(src_buf, dst_buf, mask=mask, token_id=8))
+    stmt = _with_decl_buffers(body, [src_buf, dst_buf])
+
+    with pytest.raises(Exception, match="Missing MLIR value.*missing_lhs.*missing_binary_lhs"):
+        _build_sunmmio_source_from_stmt(stmt, params=[src_data, dst_data])
+
+
 def test_broadcast_with_src_core_guards_mcast_codegen_validates_with_npuir_opt(tmp_path):
     stmt, params = _broadcast_stmt(src_core=tvm.tir.IntImm("int32", 0), token_id=2, wait=True)
     src = _validate_stmt_codegen(
@@ -315,8 +326,7 @@ def test_for_loop_carries_token_codegen_validates_with_npuir_opt(tmp_path):
 
 
 def test_if_token_merge_codegen_validates_with_npuir_opt(tmp_path):
-    i = tvm.tir.Var("i", "int32")
-    cond = tvm.tir.LT(i, tvm.tir.IntImm("int32", 1))
+    cond = tvm.tir.LT(tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 1))
     then_case = tvm.tir.Evaluate(_sync_null_token(4))
     else_case = tvm.tir.Evaluate(_sync_null_token(4))
     stmt = tvm.tir.SeqStmt(
