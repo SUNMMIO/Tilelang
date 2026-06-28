@@ -8,8 +8,8 @@ from tilelang.layout import make_zz_layout
 from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 
-from compile_pipeline import target
-from sunmmio_codegen_validation_utils import print_sunmmio_codegen_debug
+from testing.python.sunmmio.common.compile_pipeline import target
+from testing.python.sunmmio.common.codegen_validation import print_sunmmio_codegen_debug
 
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")

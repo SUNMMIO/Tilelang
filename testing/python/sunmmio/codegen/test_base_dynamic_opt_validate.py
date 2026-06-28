@@ -12,7 +12,7 @@ from tilelang.layout import (
     make_zzz_layout,
 )
 
-from sunmmio_codegen_validation_utils import (
+from testing.python.sunmmio.common.codegen_validation import (
     assert_source_contains,
     lower_sunmmio_kernel_to_device_tir,
     validate_sunmmio_codegen_with_npuir_opt,

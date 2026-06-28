@@ -5,8 +5,8 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 
-from compile_pipeline import target
-from sunmmio_codegen_validation_utils import (
+from testing.python.sunmmio.common.compile_pipeline import target
+from testing.python.sunmmio.common.codegen_validation import (
     validate_sunmmio_codegen_with_npuir_opt,
 )
 

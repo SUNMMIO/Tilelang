@@ -3,8 +3,8 @@ import tilelang.language as T
 from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
-from compile_pipeline import compile_test, target
-from formal_verify_funcs import *
+from testing.python.sunmmio.common.compile_pipeline import compile_test, target
+from testing.python.sunmmio.common.formal_verify import *
 
 
 @target("Sunmmio")

@@ -6,8 +6,8 @@ import tilelang.testing
 from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
-from compile_pipeline import target
-from sunmmio_codegen_validation_utils import validate_sunmmio_codegen_with_npuir_opt
+from testing.python.sunmmio.common.compile_pipeline import target
+from testing.python.sunmmio.common.codegen_validation import validate_sunmmio_codegen_with_npuir_opt
 
 
 tilelang.env.disable_cache()
