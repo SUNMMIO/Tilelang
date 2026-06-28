@@ -461,6 +461,16 @@ def test_sunmmio_codegen_unsupported_dtype_fails_loudly():
         builder(mod, target, "suvm")
 
 
+def test_sunmmio_codegen_unbound_tir_var_fails_loudly():
+    missing = tvm.tir.Var("missing_runtime_var", "int32")
+    stmt = tvm.tir.Evaluate(tvm.tir.Add(missing, tvm.tir.IntImm("int32", 1)))
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt)})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(Exception, match="unbound TIR var.*missing_runtime_var"):
+        builder(mod, target, "suvm")
+
+
 def test_sunmmio_codegen_compile_path_not_implemented():
     target = determine_target("Sunmmio", return_object=True)
     mod = tvm.IRModule({"main": make_scalar_control_kernel()})

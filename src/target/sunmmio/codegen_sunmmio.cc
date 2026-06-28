@@ -490,13 +490,10 @@ CodeGenTileLangSunMMIO::LookupVar(const tir::VarNode *var) const {
   if (it != var_table_.end()) {
     return it->second;
   }
-  SunMMIOValue fake_value;
-  fake_value.dtype = var->dtype;
-  fake_value.value = "%" + var->name_hint;
-  fake_value.type = MapType(var->dtype);
-  auto *self = const_cast<CodeGenTileLangSunMMIO *>(this);
-  self->BindVar(tvm::ffi::GetRef<tir::Var>(var), fake_value);
-  return self->var_table_.find(var)->second;
+  LOG(FATAL) << "CodeGenTileLangSunMMIO: unbound TIR var `" << var->name_hint
+             << "` reached SunMMIO codegen without a parameter, loop, let, "
+                "allocation, or thread binding";
+  TVM_FFI_UNREACHABLE();
 }
 
 const SunMMIOValue &
@@ -593,6 +590,11 @@ void CodeGenTileLangSunMMIO::RegisterBuffer(const tir::Buffer &buffer,
   binding.is_external = is_external;
   if (!handle_hint.empty()) {
     binding.handle = handle_hint;
+    auto storage_it = var_table_.find(buffer->data.get());
+    if (storage_it != var_table_.end() &&
+        storage_it->second.type.kind == SunMMIOType::Kind::kMemTensor) {
+      binding.buffer_type = storage_it->second.type;
+    }
   } else {
     const SunMMIOValue &storage = LookupVar(buffer->data.get());
     binding.handle = storage.value;
@@ -1169,7 +1171,10 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateConstNode *op) {
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::DeclBufferNode *op) {
   EnterScope();
   if (!IsSunmmioLocalVarBuffer(op->buffer)) {
-    RegisterBuffer(op->buffer, false);
+    auto data_it = var_table_.find(op->buffer->data.get());
+    RegisterBuffer(op->buffer, false,
+                   data_it != var_table_.end() ? data_it->second.value
+                                               : NewValueName());
   }
   VisitStmtTracked(op->body);
   ExitScope();
@@ -1269,7 +1274,10 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockNode *op) {
   EnterScope();
   for (const IterVar &iv : op->iter_vars) {
     if (!var_table_.count(iv->var.get())) {
-      BindVar(iv->var, EvalExpr(iv->var));
+      LOG(FATAL) << "CodeGenTileLangSunMMIO: unbound block iter var `"
+                 << iv->var->name_hint
+                 << "` reached SunMMIO codegen without a BlockRealize binding";
+      TVM_FFI_UNREACHABLE();
     }
   }
   for (const Buffer &alloc : op->alloc_buffers) {

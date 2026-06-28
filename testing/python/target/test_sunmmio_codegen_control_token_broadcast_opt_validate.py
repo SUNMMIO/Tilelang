@@ -175,7 +175,7 @@ def test_broadcast_missing_dynamic_mask_fails_loudly():
     body = tvm.tir.Evaluate(_broadcast(src_buf, dst_buf, mask=missing_mask, token_id=7))
     stmt = _with_decl_buffers(body, [src_buf, dst_buf])
 
-    with pytest.raises(Exception, match="Missing MLIR value.*missing_mask"):
+    with pytest.raises(Exception, match="unbound TIR var.*missing_mask"):
         _build_sunmmio_source_from_stmt(stmt, params=[src_data, dst_data])
 
 
@@ -186,7 +186,7 @@ def test_broadcast_missing_scalar_binary_operand_fails_loudly():
     body = tvm.tir.Evaluate(_broadcast(src_buf, dst_buf, mask=mask, token_id=8))
     stmt = _with_decl_buffers(body, [src_buf, dst_buf])
 
-    with pytest.raises(Exception, match="Missing MLIR value.*missing_lhs.*missing_binary_lhs"):
+    with pytest.raises(Exception, match="unbound TIR var.*missing_lhs"):
         _build_sunmmio_source_from_stmt(stmt, params=[src_data, dst_data])
 
 
