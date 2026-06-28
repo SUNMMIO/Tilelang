@@ -413,6 +413,30 @@ def test_sunmmio_codegen_shuffle_fails_loudly():
         builder(mod, target, "suvm")
 
 
+def test_sunmmio_codegen_ramp_fails_loudly():
+    ramp = tvm.tir.Ramp(
+        tvm.tir.IntImm("int32", 0),
+        tvm.tir.IntImm("int32", 1),
+        4,
+    )
+    stmt = tvm.tir.Evaluate(ramp)
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt)})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(Exception, match="Generic SunMMIO ramp expression lowering is unsupported"):
+        builder(mod, target, "suvm")
+
+
+def test_sunmmio_codegen_broadcast_fails_loudly():
+    broadcast = tvm.tir.Broadcast(tvm.tir.IntImm("int32", 7), 4)
+    stmt = tvm.tir.Evaluate(broadcast)
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt)})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(Exception, match="Generic SunMMIO broadcast expression lowering is unsupported"):
+        builder(mod, target, "suvm")
+
+
 def test_sunmmio_codegen_unsupported_call_fails_loudly():
     call = tvm.tir.call_pure_extern(
         "int32",

@@ -463,20 +463,8 @@ SunMMIOValue SunmmioMlirExpr::Ramp(const std::string &result_name,
                                    const SunMMIOType &elem_type,
                                    const SunMMIOType &vec_type,
                                    DataType dtype) {
-  ICHECK(ctx_.module)
-      << "MLIR module must be initialized before lowering Sunmmio expressions";
-  mlir::TypedAttr value_attr = ctx_.builder.getIntegerAttr(
-      mlir::Type::getFromOpaquePointer(
-          ctx_.builder.getF32Type().getAsOpaquePointer()),
-      0);
-
-  auto fake_op = mlir::arith::ConstantOp::create(
-      ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc("fake_ramp"),
-      value_attr);
-  fake_op->setAttr("sunmmio.fake", ctx_.builder.getStringAttr("ramp"));
-  mlir::Value ramp_value = fake_op.getResult();
-  ctx_.BindMLIRValue(result_name, ramp_value);
-  return SunMMIOValue{dtype, result_name, vec_type};
+  LOG(FATAL) << "Generic SunMMIO ramp expression lowering is unsupported";
+  TVM_FFI_UNREACHABLE();
 }
 
 SunMMIOValue SunmmioMlirExpr::Broadcast(const std::string &result_name,
@@ -484,22 +472,8 @@ SunMMIOValue SunmmioMlirExpr::Broadcast(const std::string &result_name,
                                         const SunMMIOType &scalar_type,
                                         const SunMMIOType &vec_type,
                                         DataType dtype) {
-  (void)scalar;
-  (void)lanes;
-  (void)scalar_type;
-  ICHECK(ctx_.module)
-      << "MLIR module must be initialized before lowering Sunmmio expressions";
-  mlir::TypedAttr value_attr = ctx_.builder.getIntegerAttr(
-      mlir::Type::getFromOpaquePointer(
-          ctx_.builder.getF32Type().getAsOpaquePointer()),
-      0);
-  auto fake_op = mlir::arith::ConstantOp::create(
-      ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc("fake_broadcast"),
-      value_attr);
-  fake_op->setAttr("sunmmio.fake", ctx_.builder.getStringAttr("broadcast"));
-  mlir::Value broadcast_value = fake_op.getResult();
-  ctx_.BindMLIRValue(result_name, broadcast_value);
-  return SunMMIOValue{dtype, result_name, vec_type};
+  LOG(FATAL) << "Generic SunMMIO broadcast expression lowering is unsupported";
+  TVM_FFI_UNREACHABLE();
 }
 
 } // namespace codegen
