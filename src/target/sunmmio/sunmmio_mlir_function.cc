@@ -1,5 +1,4 @@
 #include "sunmmio_mlir_function.h"
-#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -51,9 +50,7 @@ void SunmmioMlirFunction::BeginModule() {
   ctx_.mlir_ctx.getOrLoadDialect<mlir::func::FuncDialect>();
   ctx_.mlir_ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
   ctx_.mlir_ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
-  ctx_.mlir_ctx.getOrLoadDialect<mlir::memref::MemRefDialect>();
   ctx_.mlir_ctx.getOrLoadDialect<mlir::cf::ControlFlowDialect>();
-  ctx_.mlir_ctx.getOrLoadDialect<mlir::affine::AffineDialect>();
 
   ctx_.module = mlir::ModuleOp::create(ctx_.builder.getUnknownLoc());
   ctx_.module->getOperation()->setAttr(
