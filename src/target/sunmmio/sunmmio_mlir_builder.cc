@@ -329,7 +329,7 @@ void SuvmSunmmioBuilder::BeginFor(
     const SunMMIOValue &step,
     const ffi::Map<ffi::String, ffi::Any> &annotations,
     const std::vector<int64_t> &live_out_token_ids) {
-  function_->BeginFor(iv, lb, ub, step, annotations, live_out_token_ids);
+  function_->BeginFor(iv, lb, ub, step, annotations, live_out_token_ids, {});
 }
 
 void SuvmSunmmioBuilder::BeginFor(
@@ -337,7 +337,7 @@ void SuvmSunmmioBuilder::BeginFor(
     const SunMMIOValue &step,
     const ffi::Map<ffi::String, ffi::Any> &annotations,
     const std::vector<SunMMIOValue> &live_out_values) {
-  function_->BeginFor(iv, lb, ub, step, annotations, live_out_values);
+  function_->BeginFor(iv, lb, ub, step, annotations, {}, live_out_values);
 }
 
 void SuvmSunmmioBuilder::BeginFor(
