@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 
 from tilelang.cache.kernel_cache import KernelCache
@@ -12,6 +13,7 @@ class SunmmioKernelCache(KernelCache):
     host_kernel_path = "host_kernel.py"
     kernel_lib_path = "kernel.elf"
     llvm_ir_path = "kernel.ll"
+    abi_metadata_path = "abi.json"
 
     def _save_wrapper_kernel_code_to_disk(self, kernel: JITKernel, cache_path: str, verbose: bool = False):
         return
@@ -29,6 +31,13 @@ class SunmmioKernelCache(KernelCache):
 
         kernel_ll_path = os.path.join(cache_path, self.llvm_ir_path)
         KernelCache._safe_write_file(kernel_ll_path, "w", lambda file: file.write(artifact.llvm_ir_source))
+
+        abi = getattr(kernel.adapter, "abi", None)
+        kernel_name = abi.kernel_name if abi is not None else artifact.runtime_kernel_name
+        metadata = {"kernel_name": kernel_name}
+        metadata_path = os.path.join(cache_path, self.abi_metadata_path)
+        KernelCache._safe_write_file(metadata_path, "w", lambda file: json.dump(metadata, file, sort_keys=True))
+
         kernel.adapter.lib_generator.load_lib(kernel_elf_path)
 
     def _get_required_files(self, cache_path: str) -> list[str]:
@@ -36,6 +45,7 @@ class SunmmioKernelCache(KernelCache):
             os.path.join(cache_path, self.device_kernel_path),
             os.path.join(cache_path, self.kernel_lib_path),
             os.path.join(cache_path, self.llvm_ir_path),
+            os.path.join(cache_path, self.abi_metadata_path),
             os.path.join(cache_path, self.params_path),
         ]
 
@@ -64,20 +74,41 @@ class SunmmioKernelCache(KernelCache):
         if not device_kernel_source or not kernel_params:
             return None
 
-        return JITKernel.from_database(
+        kernel_name = self._load_abi_kernel_name(kernel_lib_path)
+        kernel = JITKernel(
             func=func,
-            host_kernel_source=host_kernel_source,
-            device_kernel_source=device_kernel_source,
-            kernel_lib_path=kernel_lib_path,
-            params=kernel_params,
-            target=target,
-            target_host=target_host,
             out_idx=out_idx,
             execution_backend=execution_backend,
+            target=target,
+            target_host=target_host,
+            from_database=True,
             pass_configs=pass_configs,
             compile_flags=compile_flags,
         )
+        if execution_backend == "sunmmio_sunsim":
+            from tilelang.jit.adapter.sunmmio import SunmmioSunsimKernelAdapter as adapter_cls
+        else:
+            from tilelang.jit.adapter.sunmmio import SunmmioKernelSuDeckAdapter as adapter_cls
 
+        kernel.adapter = adapter_cls.from_database(
+            params=kernel_params,
+            result_idx=out_idx,
+            target=target,
+            func_or_mod=func,
+            host_kernel_source=host_kernel_source,
+            device_kernel_source=device_kernel_source,
+            kernel_lib_path=kernel_lib_path,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+            kernel_name=kernel_name,
+        )
+        kernel.torch_function = kernel.adapter.func
+        return kernel
 
-class SunmmioSunsimKernelCache(SunmmioKernelCache):
-    _instance = None
+    def _load_abi_kernel_name(self, kernel_lib_path: str | None) -> str | None:
+        if kernel_lib_path is None:
+            return None
+        metadata_path = os.path.join(os.path.dirname(kernel_lib_path), self.abi_metadata_path)
+        with open(metadata_path, encoding="utf-8") as file:
+            metadata = json.load(file)
+        return metadata.get("kernel_name")

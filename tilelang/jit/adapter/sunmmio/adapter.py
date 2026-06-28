@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 from collections.abc import Sequence
+from dataclasses import replace
 
 from tvm import tir
 from tvm.target import Target
@@ -36,6 +37,7 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
         pass_configs: dict[str, Any] | None = None,
         compile_flags: list[str] | None = None,
         kernel_lib_path: str | os.PathLike[str] | None = None,
+        kernel_name: str | None = None,
     ):
         self.params = params
         self.result_idx = self._legalize_result_idx(result_idx)
@@ -54,6 +56,8 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
             device_mod=device_mod,
             params=params,
         )
+        if kernel_name is not None:
+            self.abi = replace(self.abi, kernel_name=kernel_name)
         self.kernel_name = self.abi.kernel_name
         self.runtime_kernel_name = self.kernel_name
         self.host_mod = host_mod
@@ -89,6 +93,7 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
         verbose: bool = False,
         pass_configs: dict[str, Any] | None = None,
         compile_flags: list[str] | None = None,
+        kernel_name: str | None = None,
     ):
         if kernel_lib_path is None or not os.path.exists(kernel_lib_path):
             raise FileNotFoundError(f"Cached Sunmmio kernel artifact does not exist: {kernel_lib_path}")
@@ -105,6 +110,7 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
             pass_configs=pass_configs,
             compile_flags=compile_flags,
             kernel_lib_path=kernel_lib_path,
+            kernel_name=kernel_name,
         )
 
     def _convert_torch_func(self) -> Callable[..., Any]:

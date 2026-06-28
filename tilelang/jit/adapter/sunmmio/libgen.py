@@ -32,7 +32,6 @@ DEFAULT_NPUIR_OPT_ARGS = (
 
 SUNMMIO_CLANG_CFLAGS = (
     "--target=riscv64-sunmmio-elf",
-    "-mcpu=sunmmio-a4e",
     "-O2",
 )
 SUNMMIO_LDFLAGS = (
@@ -175,9 +174,6 @@ _SUNSIM_PWLN_TABLE_WORDS = (
     0xBFDAC634,
 )
 _C_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_MLIR_FUNC_RE = re.compile(r"(?m)^\s*func\.func\s+(?:private\s+)?@([A-Za-z_][A-Za-z0-9_]*)\s*\(")
-_LLVM_KERNEL_DEFINE_RE = re.compile(r"(?m)^define\b.*@([A-Za-z_][A-Za-z0-9_]*)\s*\(.*!sunmmio\.kernel_meta\b")
-_LLVM_DEFINE_RE = re.compile(r"(?m)^define\b.*@([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 PathLike = str | os.PathLike[str]
 
 
@@ -271,6 +267,13 @@ def _split_compile_flags(compile_flags: list[str] | None, existing: Sequence[str
     return [item for flag in compile_flags for item in flag.split() if item not in existing_set]
 
 
+def _target_mcpu(target: Target) -> str:
+    mcpu = target.attrs.get("mcpu") if target.attrs is not None else None
+    if mcpu is None:
+        raise ValueError(f"Sunmmio target is missing required `mcpu` attribute: {target}")
+    return str(mcpu)
+
+
 def _run_command(
     command: Sequence[str | os.PathLike[str]],
     *,
@@ -350,19 +353,6 @@ int main(void) {{
     """
 
 
-def _extract_mlir_kernel_name(mlir_source: str) -> str | None:
-    match = _MLIR_FUNC_RE.search(mlir_source)
-    return match.group(1) if match else None
-
-
-def _extract_llvm_kernel_name(llvm_ir: str) -> str | None:
-    match = _LLVM_KERNEL_DEFINE_RE.search(llvm_ir)
-    if match:
-        return match.group(1)
-    match = _LLVM_DEFINE_RE.search(llvm_ir)
-    return match.group(1) if match else None
-
-
 class SunmmioLibraryGenerator(LibraryGenerator):
     """Generate Sunmmio library artifacts from TileLang SUVM MLIR."""
 
@@ -376,6 +366,7 @@ class SunmmioLibraryGenerator(LibraryGenerator):
 
     def _compile_flags(self, toolchain: SunmmioToolchain) -> list[str]:
         cflags = toolchain.cflags()
+        cflags.append(f"-mcpu={_target_mcpu(self.target)}")
         cflags += _split_compile_flags(self.compile_flags, cflags)
         return cflags
 
@@ -393,7 +384,7 @@ class SunmmioLibraryGenerator(LibraryGenerator):
             raise RuntimeError(f"Cached Sunmmio ELF is missing sibling LLVM IR artifact: {elf_path}")
 
         llvm_ir_source = llvm_ir_path.read_text(encoding="utf-8")
-        runtime_kernel_name = _extract_llvm_kernel_name(llvm_ir_source) or getattr(self, "runtime_kernel_name", "kernel")
+        runtime_kernel_name = getattr(self, "runtime_kernel_name", "kernel")
         self.artifact = SunmmioKernelArtifact(
             elf_path=str(elf_path),
             llvm_ir_source=llvm_ir_source,
@@ -477,10 +468,6 @@ class SunmmioSuDeckLibraryGenerator(SunmmioLibraryGenerator):
         self.kernel_name = kernel_name
         self.runtime_kernel_name = kernel_name
 
-    def update_mlir_source(self, mlir_source: str):
-        super().update_mlir_source(mlir_source)
-        self.runtime_kernel_name = _extract_mlir_kernel_name(mlir_source) or self.runtime_kernel_name
-
     def compile_lib(
         self,
         timeout: float | None = None,
@@ -500,7 +487,6 @@ class SunmmioSuDeckLibraryGenerator(SunmmioLibraryGenerator):
             timeout=timeout,
         )
 
-        self.runtime_kernel_name = _extract_llvm_kernel_name(llvm_ir) or self.runtime_kernel_name
         self.artifact = SunmmioKernelArtifact(
             elf_path=str(elf_path),
             llvm_ir_source=llvm_ir,
@@ -520,10 +506,6 @@ class SunmmioSunsimLibraryGenerator(SunmmioLibraryGenerator):
         self.kernel_name = kernel_name
         self.runtime_kernel_name = kernel_name
 
-    def update_mlir_source(self, mlir_source: str):
-        super().update_mlir_source(mlir_source)
-        self.runtime_kernel_name = _extract_mlir_kernel_name(mlir_source) or self.runtime_kernel_name
-
     def compile_lib(
         self,
         timeout: float | None = None,
@@ -535,9 +517,6 @@ class SunmmioSunsimLibraryGenerator(SunmmioLibraryGenerator):
 
         llvm_path = build_dir / "kernel.ll"
         llvm_ir = self.materialize_llvm_ir(output_path=llvm_path)
-        self.runtime_kernel_name = (
-            _extract_llvm_kernel_name(llvm_ir) or _extract_mlir_kernel_name(self.mlir_source) or self.runtime_kernel_name
-        )
         thunk_path = self._write_main_thunk(build_dir)
         kernel_obj = self._compile_kernel_obj(sunmmio_toolchain, llvm_path, build_dir, timeout)
         thunk_obj = self._compile_thunk_obj(sunmmio_toolchain, thunk_path, build_dir, timeout)
