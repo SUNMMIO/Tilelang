@@ -29,32 +29,6 @@ mlir::Value GetTileCastOp(SunmmioMlirContext &ctx, mlir::Value src_value,
       .getResult();
 }
 
-mlir::Value CreateTypedPlaceholder(SunmmioMlirContext &ctx,
-                                   mlir::Type result_type,
-                                   llvm::StringRef tag) {
-  mlir::Location loc = SunmmioMlirType(ctx).MakeDebugLoc(tag.str());
-  mlir::Value seed =
-      mlir::arith::ConstantIntOp::create(ctx.builder, loc, 0, 32);
-  mlir::OperationState st(loc, "builtin.unrealized_conversion_cast");
-  st.addOperands(seed);
-  st.addTypes(result_type);
-  mlir::Operation *cast_op = ctx.builder.create(st);
-  cast_op->setAttr("sunmmio.fake", ctx.builder.getStringAttr(tag));
-  return cast_op->getResult(0);
-}
-
-mlir::Value CreateTypedPlaceholderWithOperands(
-    SunmmioMlirContext &ctx, mlir::Type result_type,
-    llvm::ArrayRef<mlir::Value> operands, llvm::StringRef tag) {
-  mlir::Location loc = SunmmioMlirType(ctx).MakeDebugLoc(tag.str());
-  mlir::OperationState st(loc, "builtin.unrealized_conversion_cast");
-  st.addOperands(operands);
-  st.addTypes(result_type);
-  mlir::Operation *cast_op = ctx.builder.create(st);
-  cast_op->setAttr("sunmmio.fake", ctx.builder.getStringAttr(tag));
-  return cast_op->getResult(0);
-}
-
 llvm::SmallVector<int64_t, 4> StaticShapeVector(const SunMMIOType &type,
                                                 llvm::StringRef op_name) {
   llvm::SmallVector<int64_t, 4> shape;
@@ -161,43 +135,30 @@ SunMMIOValue SunmmioMlirTileOp::GetPartitionedTileView(
     const std::vector<SunMMIOValue> &indices,
     const std::vector<int64_t> &tiled_dims, const SunMMIOType &view_type,
     DataType dtype) {
-  mlir::Type result_type = MapMlirType(ctx_, view_type);
-  mlir::Value view_value;
   bool can_emit_real_view = view_type.shape.size() == tiled_dims.size() &&
                             view_type.shape.size() <= 2 &&
                             memtensor.type.shape.size() >= tiled_dims.size();
-  if (can_emit_real_view) {
-    mlir::Value memtensor_value =
-        ctx_.LookupValue(memtensor, "missing_memtensor");
-    mlir::OperationState st(MapMlirLoc(ctx_), "suvm.get_partitioned_tile_view");
-    st.addOperands(memtensor_value);
-    SunmmioMlirType type(ctx_);
-    for (const SunMMIOValue &idx : indices) {
-      mlir::Value idx_value =
-          type.EnsureIndex(type.ResolveValue(idx, ctx_.builder.getIndexType()));
-      st.addOperands(idx_value);
-    }
-    st.addAttribute("tiled_dims",
-                    ctx_.builder.getDenseI64ArrayAttr(tiled_dims));
-    st.addTypes(result_type);
-    view_value = ctx_.builder.create(st)->getResult(0);
-  } else {
-    LOG(WARNING) << "Using provisional tile_view placeholder for unsupported "
-                    "rank adaptation in clean v4 Tiles lowering";
-    std::vector<mlir::Value> operands;
-    operands.reserve(1 + indices.size());
-    operands.push_back(ctx_.LookupValue(memtensor, "missing_memtensor"));
-    SunmmioMlirType type(ctx_);
-    for (const SunMMIOValue &idx : indices) {
-      operands.push_back(type.EnsureIndex(
-          type.ResolveValue(idx, ctx_.builder.getIndexType())));
-    }
-    view_value = CreateTypedPlaceholderWithOperands(
-        ctx_, result_type, operands, "fake_partitioned_tile_view");
-    if (mlir::Operation *def = view_value.getDefiningOp()) {
-      def->setAttr("tiled_dims", ctx_.builder.getDenseI64ArrayAttr(tiled_dims));
-    }
+  if (!can_emit_real_view) {
+    LOG(FATAL) << "Unsupported SunMMIO tile_view rank adaptation: view_rank="
+               << view_type.shape.size() << ", tiled_dims=" << tiled_dims.size()
+               << ", memtensor_rank=" << memtensor.type.shape.size();
+    TVM_FFI_UNREACHABLE();
   }
+
+  mlir::Type result_type = MapMlirType(ctx_, view_type);
+  mlir::Value memtensor_value =
+      ctx_.LookupValue(memtensor, "missing_memtensor");
+  mlir::OperationState st(MapMlirLoc(ctx_), "suvm.get_partitioned_tile_view");
+  st.addOperands(memtensor_value);
+  SunmmioMlirType type(ctx_);
+  for (const SunMMIOValue &idx : indices) {
+    mlir::Value idx_value =
+        type.EnsureIndex(type.ResolveValue(idx, ctx_.builder.getIndexType()));
+    st.addOperands(idx_value);
+  }
+  st.addAttribute("tiled_dims", ctx_.builder.getDenseI64ArrayAttr(tiled_dims));
+  st.addTypes(result_type);
+  mlir::Value view_value = ctx_.builder.create(st)->getResult(0);
   if (!result_name.empty()) {
     ctx_.BindMLIRValue(result_name, view_value);
   }
@@ -800,18 +761,8 @@ void SunmmioMlirTileOp::TileStore(const SunMMIOValue &value,
   ICHECK_EQ(value.type.shape.size(), tile_view.type.shape.size())
       << "suvm.tile.store expects data and tile_view ranks to match";
   if (fake_view_boundary) {
-    LOG(WARNING)
-        << "Using provisional tile.store placeholder in clean v4 Tiles "
-           "lowering when the tile_view boundary is still fake";
-    mlir::Value data = ctx_.LookupValue(value, "missing_tile_store_value");
-    mlir::OperationState st(MapMlirLoc(ctx_),
-                            "builtin.unrealized_conversion_cast");
-    st.addOperands({data, base});
-    st.addTypes(ctx_.builder.getI32Type());
-    mlir::Operation *fake_store = ctx_.builder.create(st);
-    fake_store->setAttr("sunmmio.fake",
-                        ctx_.builder.getStringAttr("fake_tile_store"));
-    return;
+    LOG(FATAL) << "Unsupported SunMMIO tile.store with fake tile_view boundary";
+    TVM_FFI_UNREACHABLE();
   }
   mlir::Value data = ctx_.LookupValue(value, "missing_tile_store_value");
   mlir::Value mask_value;
