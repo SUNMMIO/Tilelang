@@ -41,6 +41,7 @@
 #include "../layout/layout.h"
 #include "../op/builtin.h"
 #include "common/assume.h"
+#include "common/post_ssa_attr_normalizer.h"
 #include "tir/analysis/var_use_def_analysis.h"
 #include "tvm/node/cast.h"
 #include "tvm/runtime/logging.h"
@@ -634,7 +635,9 @@ tvm::transform::Pass SplitHostDevice() {
     }
     mod->Update(updates);
     mod->Update(device_mod);
-    return tir::transform::ConvertSSA()(mod);
+    IRModule before_ssa = mod;
+    IRModule after_ssa = tir::transform::ConvertSSA()(mod);
+    return NormalizePostSSAAttrs(before_ssa, after_ssa);
   };
 
   return tvm::transform::CreateModulePass(pass_func, 0, "tl.SplitHostDevice",
