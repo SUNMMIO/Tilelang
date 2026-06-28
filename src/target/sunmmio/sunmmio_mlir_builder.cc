@@ -26,9 +26,8 @@ void SuvmSunmmioBuilder::Init() { Clear(); }
 void SuvmSunmmioBuilder::Clear() { ctx_.Clear(); }
 
 std::string SuvmSunmmioBuilder::Finish() {
-  if (!ctx_.module) {
-    return "";
-  }
+  ICHECK(ctx_.module)
+      << "SuvmSunmmioBuilder::Finish called without an initialized MLIR module";
   std::string out;
   llvm::raw_string_ostream os(out);
   ctx_.module->print(os);

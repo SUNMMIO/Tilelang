@@ -449,12 +449,15 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         ctx_.builder, type.MakeDebugLoc("dma_copy"), src, dst,
         mlir::suvm::PadModeAttr{}, mlir::suvm::OdmaChannelAttr{});
 
-    ctx_.BindMLIRValue(result_name, copy_op->getResult(0));
+    ICHECK(!result_name.empty()) << "tl.dma_copy expects a token result";
+    ICHECK(copy_op && copy_op->getNumResults() == 1)
+        << "tl.dma_copy lowering expects one token result";
+    mlir::Value produced = copy_op->getResult(0);
+    ctx_.BindMLIRValue(result_name, produced);
 
     int64_t token_id = parse_token_id();
-    if (token_id >= 0 && copy_op && copy_op->getNumResults() == 1) {
-      record_token_by_id(token_id, copy_op->getResult(0));
-    }
+    ICHECK_GE(token_id, 0) << "tl.dma_copy requires sync_token_id";
+    record_token_by_id(token_id, produced);
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.sunmmio_layout_transform") {
@@ -481,12 +484,17 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         ctx_.builder, type.MakeDebugLoc("sunmmio_layout_transform"), src, dst,
         mlir::suvm::PadModeAttr{}, mlir::suvm::OdmaChannelAttr{});
 
-    ctx_.BindMLIRValue(result_name, transform_op->getResult(0));
+    ICHECK(!result_name.empty())
+        << "tl.sunmmio_layout_transform expects a token result";
+    ICHECK(transform_op && transform_op->getNumResults() == 1)
+        << "tl.sunmmio_layout_transform lowering expects one token result";
+    mlir::Value produced = transform_op->getResult(0);
+    ctx_.BindMLIRValue(result_name, produced);
 
     int64_t token_id = parse_token_id();
-    if (token_id >= 0 && transform_op && transform_op->getNumResults() == 1) {
-      record_token_by_id(token_id, transform_op->getResult(0));
-    }
+    ICHECK_GE(token_id, 0)
+        << "tl.sunmmio_layout_transform requires sync_token_id";
+    record_token_by_id(token_id, produced);
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.broadcast_") {
@@ -566,13 +574,12 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
       produced = create_mcast();
     }
 
-    if (!result_name.empty()) {
-      ctx_.BindMLIRValue(result_name, produced);
-    }
+    ICHECK(!result_name.empty()) << "tl.broadcast_ expects a token result";
+    ICHECK(produced) << "tl.broadcast_ lowering expects one token result";
+    ctx_.BindMLIRValue(result_name, produced);
     int64_t token_id = parse_token_id();
-    if (token_id >= 0) {
-      record_token_by_id(token_id, produced);
-    }
+    ICHECK_GE(token_id, 0) << "tl.broadcast_ requires sync_token_id";
+    record_token_by_id(token_id, produced);
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.mma_sunmmio") {
@@ -615,12 +622,15 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
                                               type.MakeDebugLoc("mma_sunmmio"),
                                               c, a, w, c, acc_attr, trans_attr);
 
-    ctx_.BindMLIRValue(result_name, mma_op->getResult(0));
+    ICHECK(!result_name.empty()) << "tl.mma_sunmmio expects a token result";
+    ICHECK(mma_op && mma_op->getNumResults() == 1)
+        << "tl.mma_sunmmio lowering expects one token result";
+    mlir::Value produced = mma_op->getResult(0);
+    ctx_.BindMLIRValue(result_name, produced);
 
     int64_t token_id = parse_token_id();
-    if (token_id >= 0 && mma_op && mma_op->getNumResults() == 1) {
-      record_token_by_id(token_id, mma_op->getResult(0));
-    }
+    ICHECK_GE(token_id, 0) << "tl.mma_sunmmio requires sync_token_id";
+    record_token_by_id(token_id, produced);
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tir.ret") {

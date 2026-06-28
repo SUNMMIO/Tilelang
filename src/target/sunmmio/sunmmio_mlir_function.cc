@@ -191,11 +191,9 @@ void SunmmioMlirFunction::BeginFor(
 
 void SunmmioMlirFunction::EndFor() {
   if (ctx_.for_stack.empty()) {
-    if (ctx_.module) {
-      ctx_.module->emitError("EndFor called without a matching BeginFor");
-    }
+    LOG(FATAL) << "EndFor called without a matching BeginFor";
     ctx_.PopMLIRValueScope();
-    return;
+    TVM_FFI_UNREACHABLE();
   }
 
   if (ctx_.control_flow_stack.empty() ||
@@ -203,9 +201,8 @@ void SunmmioMlirFunction::EndFor() {
           SunmmioMlirContext::ControlKind::kFor ||
       ctx_.control_flow_stack.back().index !=
           static_cast<int>(ctx_.for_stack.size()) - 1) {
-    if (ctx_.module) {
-      ctx_.module->emitError("EndFor control_flow_stack mismatch");
-    }
+    LOG(FATAL) << "EndFor control_flow_stack mismatch";
+    TVM_FFI_UNREACHABLE();
   } else {
     ctx_.control_flow_stack.pop_back();
   }
@@ -387,11 +384,8 @@ void SunmmioMlirFunction::BeginWhile(
 
 void SunmmioMlirFunction::BeginWhileBody(const SunMMIOValue &cond) {
   if (ctx_.while_stack.empty()) {
-    if (ctx_.module) {
-      ctx_.module->emitError("BeginWhileBody called without a matching "
-                             "BeginWhile");
-    }
-    return;
+    LOG(FATAL) << "BeginWhileBody called without a matching BeginWhile";
+    TVM_FFI_UNREACHABLE();
   }
 
   SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack.back();
@@ -439,11 +433,9 @@ void SunmmioMlirFunction::BeginWhileBody(const SunMMIOValue &cond) {
 
 void SunmmioMlirFunction::EndWhile() {
   if (ctx_.while_stack.empty()) {
-    if (ctx_.module) {
-      ctx_.module->emitError("EndWhile called without a matching BeginWhile");
-    }
+    LOG(FATAL) << "EndWhile called without a matching BeginWhile";
     ctx_.PopMLIRValueScope();
-    return;
+    TVM_FFI_UNREACHABLE();
   }
 
   if (ctx_.control_flow_stack.empty() ||
@@ -451,9 +443,8 @@ void SunmmioMlirFunction::EndWhile() {
           SunmmioMlirContext::ControlKind::kWhile ||
       ctx_.control_flow_stack.back().index !=
           static_cast<int>(ctx_.while_stack.size()) - 1) {
-    if (ctx_.module) {
-      ctx_.module->emitError("EndWhile control_flow_stack mismatch");
-    }
+    LOG(FATAL) << "EndWhile control_flow_stack mismatch";
+    TVM_FFI_UNREACHABLE();
   } else {
     ctx_.control_flow_stack.pop_back();
   }
@@ -639,17 +630,13 @@ void SunmmioMlirFunction::BeginIf(
 
 void SunmmioMlirFunction::BeginElse() {
   if (ctx_.if_stack.empty()) {
-    if (ctx_.module) {
-      ctx_.module->emitError("BeginElse called without a matching BeginIf");
-    }
-    return;
+    LOG(FATAL) << "BeginElse called without a matching BeginIf";
+    TVM_FFI_UNREACHABLE();
   }
   SunmmioMlirContext::IfFrame &frame = ctx_.if_stack.back();
   if (frame.in_else) {
-    if (ctx_.module) {
-      ctx_.module->emitError("BeginElse called twice for the same scf.if");
-    }
-    return;
+    LOG(FATAL) << "BeginElse called twice for the same scf.if";
+    TVM_FFI_UNREACHABLE();
   }
   frame.then_yield_tokens = frame.produced_tokens;
   // Restore ctx_.token_by_id overrides made in the then-branch before entering
@@ -688,11 +675,9 @@ void SunmmioMlirFunction::BeginElse() {
 
 void SunmmioMlirFunction::EndIf() {
   if (ctx_.if_stack.empty()) {
-    if (ctx_.module) {
-      ctx_.module->emitError("EndIf called without a matching BeginIf");
-    }
+    LOG(FATAL) << "EndIf called without a matching BeginIf";
     ctx_.PopMLIRValueScope();
-    return;
+    TVM_FFI_UNREACHABLE();
   }
 
   if (ctx_.control_flow_stack.empty() ||
@@ -700,9 +685,8 @@ void SunmmioMlirFunction::EndIf() {
           SunmmioMlirContext::ControlKind::kIf ||
       ctx_.control_flow_stack.back().index !=
           static_cast<int>(ctx_.if_stack.size()) - 1) {
-    if (ctx_.module) {
-      ctx_.module->emitError("EndIf control_flow_stack mismatch");
-    }
+    LOG(FATAL) << "EndIf control_flow_stack mismatch";
+    TVM_FFI_UNREACHABLE();
   } else {
     ctx_.control_flow_stack.pop_back();
   }

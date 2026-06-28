@@ -19,6 +19,12 @@ mlir::Type MapMlirType(SunmmioMlirContext &ctx, const SunMMIOType &type) {
   return SunmmioMlirType(ctx).MapType(type);
 }
 
+void BindRequiredResult(SunmmioMlirContext &ctx, const std::string &result_name,
+                        mlir::Value value, llvm::StringRef op_name) {
+  ICHECK(!result_name.empty()) << op_name.str() << " expects a named result";
+  ctx.BindMLIRValue(result_name, value);
+}
+
 mlir::Value GetTileCastOp(SunmmioMlirContext &ctx, mlir::Value src_value,
                           const SunMMIOType &dst_type) {
   mlir::Location loc = MapMlirLoc(ctx);
@@ -159,9 +165,8 @@ SunMMIOValue SunmmioMlirTileOp::GetPartitionedTileView(
   st.addAttribute("tiled_dims", ctx_.builder.getDenseI64ArrayAttr(tiled_dims));
   st.addTypes(result_type);
   mlir::Value view_value = ctx_.builder.create(st)->getResult(0);
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, view_value);
-  }
+  BindRequiredResult(ctx_, result_name, view_value,
+                     "suvm.get_partitioned_tile_view");
   return SunMMIOValue{dtype, result_name, view_type};
 }
 
@@ -186,9 +191,7 @@ SunMMIOValue SunmmioMlirTileOp::TileLoad(
                                ctx_.builder, MapMlirLoc(ctx_), result_type,
                                base, mask_value, maskedoff_value)
                                .getResult();
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, tile_value);
-  }
+  BindRequiredResult(ctx_, result_name, tile_value, "suvm.tile.load");
   return SunMMIOValue{dtype, result_name, tile_type};
 }
 
@@ -204,9 +207,7 @@ SunMMIOValue SunmmioMlirTileOp::TileFill(const std::string &result_name,
   st.addOperands(scalar_value);
   st.addTypes(result_type);
   tile_value = ctx_.builder.create(st)->getResult(0);
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, tile_value);
-  }
+  BindRequiredResult(ctx_, result_name, tile_value, "suvm.tile.fill");
   return SunMMIOValue{dtype, result_name, tile_type};
 }
 
@@ -222,9 +223,7 @@ SunMMIOValue SunmmioMlirTileOp::TileRange(const std::string &result_name,
       mlir::suvm::TileRangeOp::create(ctx_.builder, MapMlirLoc(ctx_),
                                       MapMlirType(ctx_, tile_type))
           .getResult();
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, tile_value);
-  }
+  BindRequiredResult(ctx_, result_name, tile_value, "suvm.tile.range");
   return SunMMIOValue{CanonicalizeSuvmDType(dtype).with_lanes(1), result_name,
                       tile_type};
 }
@@ -235,9 +234,7 @@ SunMMIOValue SunmmioMlirTileOp::Cast(const std::string &result_name,
                                      DataType dst_dtype) {
   mlir::Value src_value = ctx_.LookupValue(v, "missing_tile_cast_src");
   mlir::Value cast_value = GetTileCastOp(ctx_, src_value, dst_type);
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, cast_value);
-  }
+  BindRequiredResult(ctx_, result_name, cast_value, "suvm.tile.cast");
   return SunMMIOValue{dst_dtype, result_name, dst_type};
 }
 
@@ -357,9 +354,7 @@ SunMMIOValue SunmmioMlirTileOp::Binary(const std::string &result_name,
   default:
     LOG(FATAL) << "Unsupported clean v4 tile binary op";
   }
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, binary_value);
-  }
+  BindRequiredResult(ctx_, result_name, binary_value, "suvm.tile.binary");
   return SunMMIOValue{dtype, result_name, result_type};
 }
 
@@ -439,9 +434,7 @@ SunMMIOValue SunmmioMlirTileOp::Unary(const std::string &result_name,
     LOG(FATAL) << "Unsupported clean v4 tile unary op";
   }
 
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, unary_value);
-  }
+  BindRequiredResult(ctx_, result_name, unary_value, "suvm.tile.unary");
   return SunMMIOValue{dtype, result_name, result_type};
 }
 
@@ -473,9 +466,7 @@ SunMMIOValue SunmmioMlirTileOp::Compare(const std::string &result_name,
                         .getResult();
   }
 
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, compare_value);
-  }
+  BindRequiredResult(ctx_, result_name, compare_value, "suvm.tile.compare");
   return SunMMIOValue{DataType::Bool(), result_name, result_type};
 }
 
@@ -490,9 +481,7 @@ SunMMIOValue SunmmioMlirTileOp::TileUnsqueeze(const std::string &result_name,
   st.addAttribute("axes", ctx_.builder.getDenseI64ArrayAttr({axis}));
   st.addTypes(result_type);
   mlir::Value tile_value = ctx_.builder.create(st)->getResult(0);
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, tile_value);
-  }
+  BindRequiredResult(ctx_, result_name, tile_value, "suvm.tile.unsqueeze");
   return SunMMIOValue{dtype, result_name, tile_type};
 }
 
@@ -506,9 +495,7 @@ SunMMIOValue SunmmioMlirTileOp::TileBroadcast(const std::string &result_name,
       mlir::suvm::TileBroadcastOp::create(ctx_.builder, MapMlirLoc(ctx_),
                                           result_type, input)
           .getResult();
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, tile_value);
-  }
+  BindRequiredResult(ctx_, result_name, tile_value, "suvm.tile.broadcast");
   return SunMMIOValue{dtype, result_name, tile_type};
 }
 
@@ -529,9 +516,7 @@ SunmmioMlirTileOp::TileSlice(const std::string &result_name,
           ctx_.builder.getDenseI64ArrayAttr(mixed_offsets.static_values),
           ctx_.builder.getDenseI64ArrayAttr(static_sizes))
           .getResult();
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, tile_value);
-  }
+  BindRequiredResult(ctx_, result_name, tile_value, "suvm.tile.extract_slice");
   return SunMMIOValue{dtype, result_name, tile_type};
 }
 
@@ -554,9 +539,7 @@ SunMMIOValue SunmmioMlirTileOp::TileInsertSlice(
           ctx_.builder.getDenseI64ArrayAttr(mixed_offsets.static_values),
           ctx_.builder.getDenseI64ArrayAttr(static_sizes))
           .getResult();
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, tile_value);
-  }
+  BindRequiredResult(ctx_, result_name, tile_value, "suvm.tile.insert_slice");
   return SunMMIOValue{dtype, result_name, result_type};
 }
 
@@ -643,9 +626,7 @@ SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
           ctx_.builder, MapMlirLoc(ctx_), MapMlirType(ctx_, mask_full_type),
           mlir::suvm::VCmpIPredicate::slt, range_full, valid_i32)
           .getResult();
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, mask_value);
-  }
+  BindRequiredResult(ctx_, result_name, mask_value, "suvm.tile.axis_mask");
   return SunMMIOValue{DataType::Bool(), result_name, tile_type};
 }
 
@@ -660,9 +641,7 @@ SunMMIOValue SunmmioMlirTileOp::TileMaskAnd(const std::string &result_name,
       mlir::suvm::TileAndIOp::create(ctx_.builder, MapMlirLoc(ctx_),
                                      result_type, lhs_value, rhs_value)
           .getResult();
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, mask_value);
-  }
+  BindRequiredResult(ctx_, result_name, mask_value, "suvm.tile.mask_and");
   return SunMMIOValue{DataType::Bool(), result_name, tile_type};
 }
 
@@ -695,9 +674,7 @@ SunMMIOValue SunmmioMlirTileOp::TileSelect(const std::string &result_name,
                                        result_mlir_type, mask_value,
                                        true_mlir_value, false_mlir_value)
           .getResult();
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, select_value);
-  }
+  BindRequiredResult(ctx_, result_name, select_value, "suvm.tile.select");
   return SunMMIOValue{dtype, result_name, result_type};
 }
 
@@ -727,9 +704,7 @@ SunMMIOValue SunmmioMlirTileOp::TileReduce(const std::string &result_name,
                                        result_mlir_type, reduce_predicate,
                                        input, static_cast<uint64_t>(axis))
           .getResult();
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, reduce_value);
-  }
+  BindRequiredResult(ctx_, result_name, reduce_value, "suvm.tile.reduce");
   return SunMMIOValue{dtype, result_name, result_type};
 }
 
@@ -744,9 +719,7 @@ SunMMIOValue SunmmioMlirTileOp::TileSqueeze(const std::string &result_name,
   st.addAttribute("axes", ctx_.builder.getDenseI64ArrayAttr({axis}));
   st.addTypes(result_type);
   mlir::Value tile_value = ctx_.builder.create(st)->getResult(0);
-  if (!result_name.empty()) {
-    ctx_.BindMLIRValue(result_name, tile_value);
-  }
+  BindRequiredResult(ctx_, result_name, tile_value, "suvm.tile.squeeze");
   return SunMMIOValue{dtype, result_name, tile_type};
 }
 

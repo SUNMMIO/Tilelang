@@ -26,10 +26,24 @@ LookupLayoutInMap(const SunmmioMlirContext::TirLayoutMap &layout_map,
   }
   for (const auto &kv : layout_map) {
     const tir::Buffer &candidate = kv.first;
-    if (candidate->data.same_as(buffer->data) ||
-        candidate->name == buffer->name) {
+    if (candidate->data.same_as(buffer->data)) {
       return kv.second;
     }
+  }
+  ffi::Optional<tl::Layout> name_match;
+  int name_match_count = 0;
+  for (const auto &kv : layout_map) {
+    const tir::Buffer &candidate = kv.first;
+    if (candidate->name == buffer->name) {
+      name_match = kv.second;
+      ++name_match_count;
+    }
+  }
+  ICHECK_LE(name_match_count, 1)
+      << "SunMMIO layout lookup found multiple buffers named `" << buffer->name
+      << "`; use data-var or exact buffer mapping to disambiguate";
+  if (name_match.defined()) {
+    return name_match;
   }
   return ffi::Optional<tl::Layout>();
 }

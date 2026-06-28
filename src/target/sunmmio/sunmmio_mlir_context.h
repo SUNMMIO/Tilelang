@@ -169,6 +169,8 @@ struct SunmmioMlirContext {
   }
 
   void BindMLIRValue(const std::string &name, mlir::Value v) {
+    ICHECK(!name.empty()) << "Cannot bind unnamed MLIR value";
+    ICHECK(v) << "Cannot bind null MLIR value for `" << name << "`";
     if (mlir_value_table_stack.empty()) {
       mlir_value_table_stack.emplace_back();
     }

@@ -9,6 +9,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/type.h>
+#include <tvm/node/structural_equal.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/expr.h>
@@ -90,6 +91,19 @@ bool IsSunmmioLocalVarBuffer(const tir::Buffer &buffer) {
   }
   const std::string scope = buffer.scope();
   return scope == "local.var";
+}
+
+bool SameTypeShape(const SunMMIOType &lhs, const SunMMIOType &rhs) {
+  if (lhs.shape.size() != rhs.shape.size()) {
+    return false;
+  }
+  StructuralEqual equal;
+  for (size_t i = 0; i < lhs.shape.size(); ++i) {
+    if (!equal(lhs.shape[i], rhs.shape[i])) {
+      return false;
+    }
+  }
+  return true;
 }
 
 std::string LocalVarValueName(const tir::VarNode *var) {
@@ -442,8 +456,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EnsureType(const SunMMIOValue &v,
                                                 const SunMMIOType &target_type,
                                                 DataType dtype) {
   if (v.type.kind == target_type.kind && v.type.dtype == target_type.dtype &&
-      v.type.lanes == target_type.lanes &&
-      v.type.shape.size() == target_type.shape.size()) {
+      v.type.lanes == target_type.lanes && SameTypeShape(v.type, target_type)) {
     return v;
   }
   return builder_->Cast(NewValueName(), v, target_type, dtype);
@@ -610,16 +623,19 @@ const BufferBinding &
 CodeGenTileLangSunMMIO::LookupBuffer(const tir::Buffer &buffer) const {
   auto it = buffer_registry_.find(buffer.get());
   if (it == buffer_registry_.end()) {
-    LOG(WARNING) << "SunMMIO LookupBuffer: missing name=" << buffer->name
-                 << ", buffer_ptr=" << buffer.get()
-                 << ", data_name=" << buffer->data->name_hint
-                 << ", data_ptr=" << buffer->data.get();
-    return buffer_registry_
-        .find(buffer_data_to_buffer_.at(buffer->data.get()).get())
-        ->second;
+    auto data_it = buffer_data_to_buffer_.find(buffer->data.get());
+    ICHECK(data_it != buffer_data_to_buffer_.end())
+        << "SunMMIO LookupBuffer: missing buffer registration for name="
+        << buffer->name << ", buffer_ptr=" << buffer.get()
+        << ", data_name=" << buffer->data->name_hint
+        << ", data_ptr=" << buffer->data.get();
+    auto fallback_it = buffer_registry_.find(data_it->second.get());
+    ICHECK(fallback_it != buffer_registry_.end())
+        << "SunMMIO LookupBuffer: fallback buffer for name=" << buffer->name
+        << " is not registered; fallback_name=" << data_it->second->name
+        << ", fallback_ptr=" << data_it->second.get();
+    return fallback_it->second;
   }
-  ICHECK(it != buffer_registry_.end())
-      << "CodeGenTileLangSunMMIO: unknown buffer " << buffer;
   return it->second;
 }
 
@@ -1153,10 +1169,9 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
       EmitAlloc(buffer_it->second, scope, op->annotations);
     }
   } else {
-    std::string scope = GetAllocateStorageScope(op->buffer_var);
-    (void)scope;
-    LOG(WARNING) << "SunMMIO SUVM allocate cannot find buffer for variable "
-                 << op->buffer_var->name_hint;
+    LOG(FATAL) << "SunMMIO SUVM allocate cannot find buffer for variable "
+               << op->buffer_var->name_hint;
+    TVM_FFI_UNREACHABLE();
   }
   VisitStmtTracked(op->body);
   ExitScope();
@@ -1654,7 +1669,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCast(const SunMMIOValue &v,
   target_dtype = CanonicalizeSuvmDType(target_dtype);
   SunMMIOType dst = MapType(target_dtype);
   if (v.type.kind == dst.kind && v.type.dtype == dst.dtype &&
-      v.type.lanes == dst.lanes && v.type.shape.size() == dst.shape.size()) {
+      v.type.lanes == dst.lanes && SameTypeShape(v.type, dst)) {
     return v;
   }
   return builder_->Cast(NewValueName(), v, dst, target_dtype);
@@ -1931,13 +1946,15 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     return EmitBinary("shr", op->args[0], op->args[1], op->dtype);
   } else if (callee == "tl.broadcast_") {
     size_t non_token_args = op->args.size();
-    if (non_token_args > 0 && TryConsumeSyncTokenId(op->args.back(), &attrs)) {
-      --non_token_args;
-    }
+    bool has_sync_token =
+        non_token_args > 0 && TryConsumeSyncTokenId(op->args.back(), &attrs);
+    ICHECK(has_sync_token)
+        << "tl.broadcast_ expects last argument to be tl.sync_token_id";
+    --non_token_args;
     ICHECK(non_token_args == static_cast<size_t>(tl::kBroadcastArgCount) ||
            non_token_args == static_cast<size_t>(tl::kBroadcastArgCount + 1))
         << "tl.broadcast_ expects src region, dst region, direction, mask, "
-           "src_offset_byte, optional src_core, and optional sync_token_id";
+           "src_offset_byte, optional src_core, and sync_token_id";
 
     const auto *direction_imm =
         op->args[tl::kBroadcastArgDirection].as<IntImmNode>();

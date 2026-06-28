@@ -78,10 +78,26 @@ def make_alloc_scope_kernel():
     rsram = tvm.tir.Var("rsram_buf", tvm.ir.PointerType(f16, "shared.rsram"))
     wsram = tvm.tir.Var("wsram_buf", tvm.ir.PointerType(f16, "shared.wsram"))
     asram = tvm.tir.Var("asram_buf", tvm.ir.PointerType(f16, "shared.asram"))
+    rsram_buf = tvm.tir.decl_buffer((16, 16), "float16", name="Rsram", data=rsram, scope="shared.rsram")
+    wsram_buf = tvm.tir.decl_buffer((16, 16), "float16", name="Wsram", data=wsram, scope="shared.wsram")
+    asram_buf = tvm.tir.decl_buffer((16, 16), "float16", name="Asram", data=asram, scope="shared.asram")
 
     stmt = tvm.tir.Allocate(rsram, "float16", [16, 16], one, body)
     stmt = tvm.tir.Allocate(wsram, "float16", [16, 16], one, stmt)
     stmt = tvm.tir.Allocate(asram, "float16", [16, 16], one, stmt)
+    stmt = tvm.tir.DeclBuffer(rsram_buf, stmt)
+    stmt = tvm.tir.DeclBuffer(wsram_buf, stmt)
+    stmt = tvm.tir.DeclBuffer(asram_buf, stmt)
+    return _primfunc_from_stmt(stmt)
+
+
+@target("Sunmmio")
+def make_allocate_without_decl_buffer_kernel():
+    f16 = tvm.ir.PrimType("float16")
+    one = tvm.tir.IntImm("bool", 1)
+    body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
+    asram = tvm.tir.Var("asram_buf", tvm.ir.PointerType(f16, "shared.asram"))
+    stmt = tvm.tir.Allocate(asram, "float16", [16, 16], one, body)
     return _primfunc_from_stmt(stmt)
 
 
@@ -196,6 +212,11 @@ def make_dynamic_broadcast_mask_kernel():
             mask,
             tvm.tir.IntImm("int32", 0),
             bx,
+            tvm.tir.call_intrin(
+                "handle",
+                tvm.ir.Op.get("tl.sync_token_id"),
+                tvm.tir.IntImm("int32", 0),
+            ),
         ],
     )
     stmt = tvm.tir.For(
@@ -529,6 +550,17 @@ def test_sunmmio_codegen_buffer_store_fails_loudly():
     with pytest.raises(
         Exception,
         match="generic BufferStoreNode should not reach SunMMIO codegen; tiled buffer stores must be lowered through tile-aware paths",
+    ):
+        builder(mod, target, "suvm")
+
+
+def test_sunmmio_codegen_allocate_without_decl_buffer_fails_loudly():
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": make_allocate_without_decl_buffer_kernel()})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(
+        Exception,
+        match="SunMMIO SUVM allocate cannot find buffer for variable asram_buf",
     ):
         builder(mod, target, "suvm")
 
