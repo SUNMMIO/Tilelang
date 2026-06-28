@@ -31,7 +31,7 @@ DEFAULT_NPUIR_OPT_ARGS = (
 )
 
 SUNMMIO_CLANG_CFLAGS = (
-    "--target=riscv64-unknown-elf",
+    "--target=riscv64-sunmmio-elf",
     "-mcpu=sunmmio-a4e",
     "-O2",
 )
@@ -239,7 +239,6 @@ class NpuirTools:
 @dataclass(frozen=True)
 class SunmmioToolchain:
     clangxx: Path
-    sysroot: Path
 
     @classmethod
     def resolve(cls) -> SunmmioToolchain:
@@ -253,18 +252,11 @@ class SunmmioToolchain:
                 "Sunmmio clang++",
                 [toolchain_path / "clang" / "bin" / "clang++"],
                 executable=True,
-            ),
-            sysroot=_find_existing_path(
-                "Sunmmio sysroot",
-                [
-                    toolchain_path / "sysroot" / "riscv64-unknown-elf",
-                    toolchain_path / "gcc" / "riscv64-unknown-elf",
-                ],
-            ),
+            )
         )
 
     def cflags(self) -> list[str]:
-        return [f"--sysroot={self.sysroot}", *SUNMMIO_CLANG_CFLAGS]
+        return list(SUNMMIO_CLANG_CFLAGS)
 
 
 def _sanitize_llvm_ir_for_sunmmio_toolchain(llvm_ir: str) -> str:

@@ -97,9 +97,7 @@ def test_sunmmio_toolchain_resolves_only_from_env(tmp_path, monkeypatch):
 
     toolchain_root = tmp_path / "toolchain"
     clangxx = toolchain_root / "clang" / "bin" / "clang++"
-    sysroot = toolchain_root / "sysroot" / "riscv64-unknown-elf"
     clangxx.parent.mkdir(parents=True)
-    sysroot.mkdir(parents=True)
     clangxx.write_text("#!/bin/sh\n", encoding="utf-8")
     clangxx.chmod(0o755)
     monkeypatch.setenv("SUNMMIO_TOOLCHAIN", str(toolchain_root))
@@ -107,7 +105,8 @@ def test_sunmmio_toolchain_resolves_only_from_env(tmp_path, monkeypatch):
     toolchain = SunmmioToolchain.resolve()
 
     assert toolchain.clangxx == clangxx
-    assert toolchain.sysroot == sysroot
+    assert toolchain.cflags()[0] == "--target=riscv64-sunmmio-elf"
+    assert all(not flag.startswith("--sysroot=") for flag in toolchain.cflags())
 
 
 def test_sunmmio_cache_persists_artifacts_through_libgen(tmp_path):
@@ -176,7 +175,7 @@ def test_sunmmio_sudeck_compile_emits_kernel_elf_without_thunk(tmp_path, monkeyp
     generator = SunmmioSuDeckLibraryGenerator(target, "kernel")
     llvm_source = "define void @kernel(ptr %0) #0 !sunmmio.kernel_meta !1 { ret void }"
 
-    fake_toolchain = SunmmioToolchain(clangxx=tmp_path / "clang++", sysroot=tmp_path / "sysroot")
+    fake_toolchain = SunmmioToolchain(clangxx=tmp_path / "clang++")
     commands = []
 
     def fake_resolve():
@@ -208,6 +207,8 @@ def test_sunmmio_sudeck_compile_emits_kernel_elf_without_thunk(tmp_path, monkeyp
     assert not (tmp_path / "main_thunk.o").exists()
     assert len(commands) == 2
     assert commands[0][:2] == [str(fake_toolchain.clangxx), "-c"]
+    assert "--target=riscv64-sunmmio-elf" in commands[0]
+    assert all(not flag.startswith("--sysroot=") for command in commands for flag in command)
     assert str(tmp_path / "kernel.ll") in commands[0]
     assert str(tmp_path / "kernel.o") in commands[0]
     assert commands[1][0] == str(fake_toolchain.clangxx)
@@ -584,12 +585,14 @@ define void @elem_add_kernel(ptr addrspace(4) %0) #0 !sunmmio.kernel_meta !1 {
         Path(output_path).write_text(llvm_source, encoding="utf-8")
         return llvm_source
 
-    fake_toolchain = SunmmioToolchain(clangxx=tmp_path / "clang++", sysroot=tmp_path / "sysroot")
+    fake_toolchain = SunmmioToolchain(clangxx=tmp_path / "clang++")
+    commands = []
 
     def fake_resolve():
         return fake_toolchain
 
     def fake_run_command(command, **kwargs):
+        commands.append([str(part) for part in command])
         output_path = Path(command[command.index("-o") + 1])
         output_path.write_bytes(b"artifact")
 
@@ -612,6 +615,9 @@ define void @elem_add_kernel(ptr addrspace(4) %0) #0 !sunmmio.kernel_meta !1 {
     assert 'section(".r.sram.common")' in thunk
     assert "static inline void pwln_init()" in thunk
     assert "void elem_add(void *args);" not in thunk
+    assert len(commands) == 3
+    assert all("--target=riscv64-sunmmio-elf" in command for command in commands)
+    assert all(not flag.startswith("--sysroot=") for command in commands for flag in command)
 
 
 @tilelang.jit(target="sunmmio", out_idx=[2])
