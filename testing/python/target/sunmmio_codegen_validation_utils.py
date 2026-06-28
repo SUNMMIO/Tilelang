@@ -9,11 +9,11 @@ import pytest
 from compile_pipeline import compile_test
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tilelang import tvm as tvm
+from tilelang.jit.adapter.sunmmio.libgen import NpuirTools
 from tilelang.utils.target import determine_target
 
 
 CODEGEN_BACKEND = "suvm"
-NPUIR_OPT_ENV = "NPUIR_OPT"
 # SUNMMIO_TEST_PRINT=1 prints selected TIR/MLIR debug output to stdout.
 PRINT_ENV = "SUNMMIO_TEST_PRINT"
 # SUNMMIO_TEST_LOG_IR=1 writes kernel/TIR/MLIR snapshots for codegen tests.
@@ -164,17 +164,10 @@ def _repo_root() -> Path:
 
 
 def find_npuir_opt() -> Path:
-    candidates = []
-    if os.getenv(NPUIR_OPT_ENV):
-        candidates.append(Path(os.environ[NPUIR_OPT_ENV]))
-    candidates.append(_repo_root() / "build" / "bin" / "npuir-opt")
-
-    for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return candidate
-
-    candidate_text = "\n".join(str(candidate) for candidate in candidates)
-    pytest.fail(f"npuir-opt executable not found. Checked:\n{candidate_text}")
+    try:
+        return NpuirTools.resolve().opt
+    except FileNotFoundError as exc:
+        pytest.fail(str(exc))
 
 
 def assert_source_contains(src: str, tokens: Sequence[str]) -> None:
