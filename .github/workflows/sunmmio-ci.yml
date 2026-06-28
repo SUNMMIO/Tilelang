@@ -159,19 +159,21 @@ jobs:
           fetch-depth: 0
           set-safe-directory: true
 
-      - name: Determine NPU-IR access mode
-        id: npuir-mode
+      - name: Determine Sunmmio access mode
+        id: sunmmio-mode
         env:
           HAS_PRIVATE_NPUIR_ACCESS: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         run: |
           set -euo pipefail
           if [[ "${HAS_PRIVATE_NPUIR_ACCESS}" == "true" ]]; then
             echo "available=1" >> "${GITHUB_OUTPUT}"
-            echo "TILELANG_NPUIR_CMAKE_ARGS=" >> "${GITHUB_ENV}"
-            echo "Running full CI with private NPU-IR access."
+            echo "TILELANG_SUNMMIO_CMAKE_ARGS=-DUSE_SUNMMIO=ON" >> "${GITHUB_ENV}"
+            echo "TILELANG_SUNMMIO_PYTEST_MARK_EXPR=not sunmmio_closed_runtime" >> "${GITHUB_ENV}"
+            echo "Running Sunmmio codegen CI with private NPU-IR access."
           else
             echo "available=0" >> "${GITHUB_OUTPUT}"
-            echo "TILELANG_NPUIR_CMAKE_ARGS=-DUSE_NPUIR=OFF" >> "${GITHUB_ENV}"
+            echo "TILELANG_SUNMMIO_CMAKE_ARGS=-DUSE_SUNMMIO=OFF" >> "${GITHUB_ENV}"
+            echo "TILELANG_SUNMMIO_PYTEST_MARK_EXPR=not sunmmio_closed_runtime" >> "${GITHUB_ENV}"
             echo "Running fork-safe CI without private NPU-IR checkout."
           fi
 
@@ -186,7 +188,7 @@ jobs:
             3rdparty/tvm
 
       - name: Resolve pinned NPU-IR commit
-        if: steps.npuir-mode.outputs.available == '1'
+        if: steps.sunmmio-mode.outputs.available == '1'
         id: npuir-ref
         run: |
           set -euo pipefail
@@ -199,7 +201,7 @@ jobs:
           echo "Pinned NPU-IR commit: ${NPUIR_SHA}"
 
       - name: Checkout private NPU-IR submodule
-        if: steps.npuir-mode.outputs.available == '1'
+        if: steps.sunmmio-mode.outputs.available == '1'
         uses: actions/checkout@v6
         with:
           repository: SUNMMIO/NPU-IR
@@ -224,7 +226,7 @@ jobs:
           uv pip install --python .clang-tidy-venv/bin/python -v -r requirements-lint.txt
 
       - name: Read LLVM pin from NPU-IR
-        if: steps.npuir-mode.outputs.available == '1'
+        if: steps.sunmmio-mode.outputs.available == '1'
         run: |
           set -euo pipefail
 
@@ -249,7 +251,7 @@ jobs:
           echo "Using NPU-IR LLVM pin ${NPUIR_LLVM_COMMIT}"
 
       - name: Prepare cached LLVM checkout for NPU-IR
-        if: steps.npuir-mode.outputs.available == '1'
+        if: steps.sunmmio-mode.outputs.available == '1'
         run: |
           set -euo pipefail
 
@@ -261,7 +263,7 @@ jobs:
           echo "NPUIR_CACHE_DIR=${NPUIR_CACHE_DIR}" >> "${GITHUB_ENV}"
           echo "NPUIR_LLVM_SOURCE_DIR=${NPUIR_LLVM_SOURCE_DIR}" >> "${GITHUB_ENV}"
           echo "NPUIR_LLVM_BUILD_DIR=${NPUIR_LLVM_BUILD_DIR}" >> "${GITHUB_ENV}"
-          echo "TILELANG_NPUIR_CMAKE_ARGS=-DTILELANG_NPUIR_BINARY_DIR=${NPUIR_CACHE_DIR}" >> "${GITHUB_ENV}"
+          echo "TILELANG_SUNMMIO_CMAKE_ARGS=-DUSE_SUNMMIO=ON -DTILELANG_NPUIR_BINARY_DIR=${NPUIR_CACHE_DIR}" >> "${GITHUB_ENV}"
 
           lock_file="${NPUIR_CACHE_ROOT}/llvm-project.lock"
           exec 9>"${lock_file}"
@@ -317,7 +319,7 @@ jobs:
           CLANG_TIDY_BIN=".clang-tidy-venv/bin/clang-tidy"
           CLANG_APPLY_REPLACEMENTS_BIN=".clang-tidy-venv/bin/clang-apply-replacements"
           echo "\$ ${CLANG_TIDY_BIN} --version" && "${CLANG_TIDY_BIN}" --version
-          echo "Using NPU-IR CMake args: ${TILELANG_NPUIR_CMAKE_ARGS}"
+          echo "Using Sunmmio CMake args: ${TILELANG_SUNMMIO_CMAKE_ARGS}"
 
           # Run clang-tidy before provisioning the heavyweight Python/CUDA test env.
           # The clang-tidy configure only needs system Python and CUDA headers.
@@ -333,12 +335,12 @@ jobs:
           fi
 
           # Reuse the persistent NPU-IR/LLVM cache when available; otherwise
-          # configure clang-tidy with NPU-IR disabled for fork-safe CI.
+          # configure clang-tidy with Sunmmio disabled for fork-safe CI.
           lock_file="${NPUIR_CACHE_ROOT}/llvm-project.lock"
           exec 9>"${lock_file}"
           flock 9
-          cmake -S . -B cmake-build --fresh ${CLANG_TIDY_CMAKE_OPTIONS} ${TILELANG_NPUIR_CMAKE_ARGS}
-          if [[ "${TILELANG_NPUIR_CMAKE_ARGS}" != *"-DUSE_NPUIR=OFF"* ]]; then
+          cmake -S . -B cmake-build --fresh ${CLANG_TIDY_CMAKE_OPTIONS} ${TILELANG_SUNMMIO_CMAKE_ARGS}
+          if [[ "${TILELANG_SUNMMIO_CMAKE_ARGS}" == *"-DUSE_SUNMMIO=ON"* ]]; then
             cmake --build cmake-build --target mlir-headers llvm-headers -j "$(nproc)"
           fi
           flock -u 9
@@ -372,8 +374,8 @@ jobs:
       - name: Install project (wheel form)
         run: |
           # Match the wheel build mode to the checkout mode:
-          # use the cached NPU-IR tree when available, otherwise disable NPU-IR.
-          export CMAKE_ARGS="${CMAKE_ARGS} ${TILELANG_NPUIR_CMAKE_ARGS}"
+          # use the cached NPU-IR tree when available, otherwise disable Sunmmio.
+          export CMAKE_ARGS="${CMAKE_ARGS} ${TILELANG_SUNMMIO_CMAKE_ARGS}"
           uv pip install -v .
 
       - name: Run Python test suite
@@ -386,7 +388,9 @@ jobs:
             uv run --no-project -m --
             pytest --verbose --color=yes --durations=0 --showlocals --cache-clear
           )
-          "${PYTEST[@]}" -c pytest.ini ./python
+          PYTEST_MARK_EXPR="${TILELANG_SUNMMIO_PYTEST_MARK_EXPR:-not sunmmio_closed_runtime}"
+          echo "Using pytest marker expression: ${PYTEST_MARK_EXPR}"
+          "${PYTEST[@]}" -c pytest.ini -m "${PYTEST_MARK_EXPR}" ./python
 
       - name: List generated files
         if: ${{ !cancelled() }}

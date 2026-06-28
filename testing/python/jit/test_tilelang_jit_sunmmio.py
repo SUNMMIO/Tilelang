@@ -220,6 +220,9 @@ def test_sunmmio_sudeck_compile_emits_kernel_elf_without_thunk(tmp_path, monkeyp
         assert "main_thunk.o" not in command
 
 
+@pytest.mark.sunmmio_toolchain
+@pytest.mark.sunmmio_sunsim
+@pytest.mark.sunmmio_closed_runtime
 def test_sunmmio_sunsim_elementwise_add_example_executes(tmp_path):
     _require_sunmmio_codegen()
     _require_npuir_tools()
@@ -265,6 +268,9 @@ def test_sunmmio_sunsim_elementwise_add_example_executes(tmp_path):
             tilelang.env.disable_cache()
 
 
+@pytest.mark.sunmmio_toolchain
+@pytest.mark.sunmmio_sunsim
+@pytest.mark.sunmmio_closed_runtime
 def test_sunmmio_sunsim_dynamic_elementwise_add_example_executes(tmp_path):
     _require_sunmmio_codegen()
     _require_npuir_tools()
@@ -642,6 +648,8 @@ def elementwise_add_jit(M, N, block_M, block_N, in_dtype, out_dtype):
     return elem_add
 
 
+@pytest.mark.sunmmio_toolchain
+@pytest.mark.sunmmio_closed_runtime
 def test_sunmmio_jit_lowercase_target_generates_suvm_source():
     _require_sunmmio_codegen()
     _require_npuir_tools()
@@ -679,6 +687,8 @@ def row_major_copy_jit(M, N, dtype):
     return copy_kernel
 
 
+@pytest.mark.sunmmio_toolchain
+@pytest.mark.sunmmio_closed_runtime
 def test_sunmmio_jit_row_major_copy_lowers_to_llvm_ir(tmp_path):
     _require_sunmmio_codegen()
     _require_npuir_tools()
@@ -698,6 +708,8 @@ def test_sunmmio_jit_row_major_copy_lowers_to_llvm_ir(tmp_path):
     assert "su_odma_submit_direct" in llvm_ir
 
 
+@pytest.mark.sunmmio_toolchain
+@pytest.mark.sunmmio_closed_runtime
 def test_sunmmio_jit_cache_saves_llvm_ir(tmp_path, monkeypatch):
     _require_sunmmio_codegen()
     _require_npuir_tools()
