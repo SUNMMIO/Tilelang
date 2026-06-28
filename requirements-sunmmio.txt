@@ -1,0 +1,9 @@
+# Runtime requirements for Sunmmio execution backends.
+#
+# `sunsim` is hosted on the Sunmmio package index; its package metadata owns
+# transitive Python dependencies such as pyelftools and pyyaml.
+
+--requirement requirements.txt
+--extra-index-url https://gitlab.sunmmio.com:6226/api/v4/projects/118/packages/pypi/simple
+
+sunsim
