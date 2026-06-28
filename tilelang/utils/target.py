@@ -21,6 +21,7 @@ SUPPORTED_TARGETS: dict[str, str] = {
     "webgpu": "WebGPU target for browser/WebGPU runtimes.",
     "c": "C source backend.",
     "cutedsl": "CuTe DSL GPU target.",
+    "sunmmio": "Sunmmio target (A4E device)",
     "Sunmmio": "Sunmmio target (A4E device)",
 }
 
@@ -207,7 +208,7 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
                 normalized_target = target.strip()
                 if not normalized_target:
                     raise AssertionError(f"Target {target} is not supported")
-                if normalized_target == "Sunmmio":
+                if normalized_target.lower() == "sunmmio":
                     normalized_target = SUNMMIO_TARGET_DESC
                 try:
                     Target(normalized_target)

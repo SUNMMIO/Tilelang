@@ -42,12 +42,23 @@ _P = ParamSpec("_P")
 _KP = ParamSpec("_KP")
 _T = TypeVar("_T")
 _Ret = TypeVar("_Ret")
+ExecutionBackend = Literal[
+    "auto",
+    "dlpack",
+    "tvm_ffi",
+    "cython",
+    "nvrtc",
+    "torch",
+    "cutedsl",
+    "sunmmio",
+    "sunmmio_sunsim",
+]
 
 
 def compile(
     func: PrimFunc[_KP, _T] = None,
     out_idx: list[int] | int | None = None,
-    execution_backend: Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
+    execution_backend: ExecutionBackend | None = None,
     target: str | Target | None = None,
     target_host: str | Target | None = None,
     verbose: bool | None = None,
@@ -63,7 +74,7 @@ def compile(
         The TileLang TIR function to compile and wrap.
     out_idx : Union[List[int], int], optional
         Index(es) of the output tensors to return (default: None).
-    execution_backend : Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
+    execution_backend : ExecutionBackend, optional
         Execution backend to use for kernel execution. If None, reads from
         TILELANG_EXECUTION_BACKEND environment variable (defaults to "auto").
     target : Union[str, Target], optional
@@ -110,7 +121,7 @@ def compile(
 def par_compile(
     funcs: Iterable[PrimFunc[_KP, _T]],
     out_idx: list[int] | int | None = None,
-    execution_backend: Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
+    execution_backend: ExecutionBackend | None = None,
     target: str | Target | None = None,
     target_host: str | Target | None = None,
     verbose: bool | None = None,
@@ -128,7 +139,7 @@ def par_compile(
         The TileLang TIR functions to compile and wrap.
     out_idx : Union[List[int], int], optional
         Index(es) of the output tensors to return (default: None).
-    execution_backend : Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
+    execution_backend : ExecutionBackend, optional
         Execution backend to use for kernel execution. If None, reads from
         TILELANG_EXECUTION_BACKEND environment variable (defaults to "auto").
     target : Union[str, Target], optional
@@ -264,7 +275,7 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
     """
 
     out_idx: list[int] | int | None
-    execution_backend: Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None
+    execution_backend: ExecutionBackend | None
     target: str | Target | None
     target_host: str | Target | None
     verbose: bool | None
@@ -291,11 +302,17 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         """
         Retrieve a TIR (Tensor Intermediate Representation) PrimFunc from the stored callable or object.
         """
+        from tilelang.utils.target import determine_target
+
         self.initialize_jit_mode(*args, **kwargs)
         if isinstance(self.func, PrimFunc):
             tir = self.func
         elif callable(self.func):
-            tir = self.func(*args, **kwargs)
+            if self.target is None:
+                tir = self.func(*args, **kwargs)
+            else:
+                with tvm.target.Target(determine_target(self.target, return_object=True)):
+                    tir = self.func(*args, **kwargs)
         else:
             raise ValueError(f"Invalid function type: {type(self.func)}")
         assert isinstance(tir, PrimFunc), f"target function must be a PrimFunc but got {type(tir)}"
@@ -446,9 +463,6 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
             return kernel(*kernel_args.values())
         else:
             return kernel
-
-
-ExecutionBackend = Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"]
 
 
 @overload

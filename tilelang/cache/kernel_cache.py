@@ -37,7 +37,7 @@ class KernelCache:
     _instance = None  # For implementing singleton pattern
     _lock = threading.Lock()  # For thread safety
     _memory_cache = {}  # In-memory cache dictionary
-    execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "tvm_ffi"
+    execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "sunmmio", "sunmmio_sunsim"] = "tvm_ffi"
     device_kernel_path = "device_kernel.cu"
     host_kernel_path = "host_kernel.cu"
     kernel_lib_path = "kernel_lib.so"
@@ -128,7 +128,7 @@ class KernelCache:
         self,
         func: Callable,
         out_idx: list[int],
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "tvm_ffi",
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "sunmmio", "sunmmio_sunsim"] = "tvm_ffi",
         args=None,
         target: str | Target = "auto",
         target_host: str | Target = None,
@@ -174,7 +174,7 @@ class KernelCache:
         *args,
         target: str | Target,
         target_host: str | Target | None = None,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "tvm_ffi",
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "sunmmio", "sunmmio_sunsim"] = "tvm_ffi",
         verbose: bool,
         pass_configs: dict | None = None,
         compile_flags: list[str] | str | None = None,
@@ -379,7 +379,7 @@ class KernelCache:
         target: str | Target = "auto",
         target_host: str | Target | None = None,
         out_idx: list[int] | None = None,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "tvm_ffi",
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "sunmmio", "sunmmio_sunsim"] = "tvm_ffi",
         pass_configs: dict | None = None,
         compile_flags: list[str] | str | None = None,
         func: Callable | None = None,
@@ -513,7 +513,7 @@ class KernelCache:
         target: str | Target,
         target_host: str | Target | None,
         out_idx: list[int] | None,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"],
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "sunmmio", "sunmmio_sunsim"],
         pass_configs: dict | None,
         compile_flags: list[str] | str | None,
     ) -> JITKernel | None:

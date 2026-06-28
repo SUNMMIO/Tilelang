@@ -13,6 +13,7 @@ from tilelang.jit.adapter.cython.kernel_cache import CythonKernelCache
 from tilelang.jit.adapter.nvrtc.kernel_cache import NVRTCKernelCache
 from tilelang.jit.adapter.torch.kernel_cache import TorchKernelCache
 from tilelang.jit.adapter.kernel_cache import TVMFFIKernelCache
+from tilelang.jit.adapter.sunmmio.kernel_cache import SunmmioKernelCache, SunmmioSunsimKernelCache
 
 if TYPE_CHECKING:
     from .kernel_cache import KernelCache
@@ -23,6 +24,8 @@ _dispatch_map: dict[str, KernelCache] = {
     "cython": CythonKernelCache(),
     "nvrtc": NVRTCKernelCache(),
     "cutedsl": CuTeDSLKernelCache(),
+    "sunmmio": SunmmioKernelCache(),
+    "sunmmio_sunsim": SunmmioSunsimKernelCache(),
     "torch": TorchKernelCache(),
 }
 
@@ -33,7 +36,17 @@ def cached(
     *args,
     target: str | Target | None = None,
     target_host: str | Target | None = None,
-    execution_backend: Literal["auto", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
+    execution_backend: Literal[
+        "auto",
+        "tvm_ffi",
+        "cython",
+        "nvrtc",
+        "torch",
+        "cutedsl",
+        "sunmmio",
+        "sunmmio_sunsim",
+    ]
+    | None = None,
     verbose: bool | None = None,
     pass_configs: dict | None = None,
     compile_flags: list[str] | str | None = None,
