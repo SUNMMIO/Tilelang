@@ -462,6 +462,9 @@ private:
   static float AnalyzeEvaluate(const EvaluateNode &eval) {
     const auto *call = eval.value.as<CallNode>();
     ICHECK(call) << "VectorCore Evaluate must wrap a CallNode.";
+    ICHECK(call->op == Op::Get("tl.vector_core_in_tile_reduce"))
+        << "VectorCore Evaluate must wrap a tl.vector_core_in_tile_reduce "
+           "call.";
     const auto *reduce_kind = call->args[0].as<StringImmNode>();
     ICHECK(reduce_kind)
         << "VectorCore Evaluate call must carry a StringImm reduce kind.";
@@ -496,7 +499,8 @@ private:
       return cost;
     }
     if (const auto *if_stmt = stmt.as<IfThenElseNode>()) {
-      // The condition is evaluated whenever the surrounding stmt executes, so
+      // The condition is evaluated whenever the surrounding stmt executes,
+      // so
       // its cost belongs to the current repeated context. Without branch
       // probability information, conservatively charge the more expensive
       // branch together with the condition.
@@ -516,7 +520,7 @@ private:
     if (const auto *eval = stmt.as<EvaluateNode>()) {
       return {AnalyzeEvaluate(*eval), 0.0f};
     }
-    ICHECK(0) << "Unsupported VectorCore stmt shape in cost model: " << stmt;
+    ICHECK(0) << "Unsupported VectorCore stmt in cost model: " << stmt;
     return {0.0f, 0.0f};
   }
 
