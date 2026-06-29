@@ -872,6 +872,14 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
                                        Optional<Array<Integer>>(), analyzer);
   ICHECK(T.RegisterScratchBuffer && stage_layout.defined())
       << "sunmmio layout transform: cannot build the staging layout.";
+  // stage_layout is the DRAM layout re-derived onto the copied region's shape.
+  // The whole-buffer IsLayoutMatch above can't see a region match -- a 256x256
+  // ZZ buffer never structurally matches a 32x32 RSRAM tile -- but a
+  // block-aligned slice of that buffer has the very layout the RSRAM side
+  // wants. When the region layouts agree the transform leg would be an
+  // identity, so emit a plain DMA and skip the staging buffer entirely.
+  if (IsLayoutMatch(stage_layout.value(), rsram_layout, analyzer))
+    return dma(src_region, dst_region);
   T.RegisterScratchBuffer(stage, stage_layout.value());
 
   // Pad/unpad transforms walk one tile-register row per leading index, so when
