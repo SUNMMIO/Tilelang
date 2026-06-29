@@ -1,5 +1,4 @@
 #include "sunmmio_mlir_function.h"
-#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -51,9 +50,7 @@ void SunmmioMlirFunction::BeginModule() {
   ctx_.mlir_ctx.getOrLoadDialect<mlir::func::FuncDialect>();
   ctx_.mlir_ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
   ctx_.mlir_ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
-  ctx_.mlir_ctx.getOrLoadDialect<mlir::memref::MemRefDialect>();
   ctx_.mlir_ctx.getOrLoadDialect<mlir::cf::ControlFlowDialect>();
-  ctx_.mlir_ctx.getOrLoadDialect<mlir::affine::AffineDialect>();
 
   ctx_.module = mlir::ModuleOp::create(ctx_.builder.getUnknownLoc());
   ctx_.module->getOperation()->setAttr(
@@ -61,16 +58,12 @@ void SunmmioMlirFunction::BeginModule() {
                               &ctx_.mlir_ctx, mlir::suvm::DeviceArch::a4e));
   ctx_.builder.setInsertionPointToEnd(ctx_.module->getBody());
   current_func_ = mlir::func::FuncOp();
-  ctx_.for_stack.clear();
-  ctx_.if_stack.clear();
-  ctx_.while_stack.clear();
-  ctx_.control_flow_stack.clear();
-  ctx_.ClearMLIRValueScopes();
+  ctx_.ClearFunctionState();
 }
 
 void SunmmioMlirFunction::EndModule() {
   if (failed(mlir::verify(*ctx_.module))) {
-    ctx_.module->emitError("Module verification failed");
+    LOG(FATAL) << "SunMMIO MLIR module verification failed";
   }
 }
 
@@ -88,12 +81,8 @@ void SunmmioMlirFunction::BeginFunction(const std::string &name,
   ctx_.module->push_back(func);
   current_func_ = func;
 
-  ctx_.ClearMLIRValueScopes();
+  ctx_.ClearFunctionState();
   ctx_.PushMLIRValueScope();
-  ctx_.if_stack.clear();
-  ctx_.for_stack.clear();
-  ctx_.while_stack.clear();
-  ctx_.control_flow_stack.clear();
 
   mlir::Block *entry = func.addEntryBlock();
   ctx_.builder.setInsertionPointToStart(entry);
@@ -104,11 +93,7 @@ void SunmmioMlirFunction::BeginFunction(const std::string &name,
 
 void SunmmioMlirFunction::EndFunction() {
   current_func_ = mlir::func::FuncOp();
-  ctx_.if_stack.clear();
-  ctx_.for_stack.clear();
-  ctx_.while_stack.clear();
-  ctx_.control_flow_stack.clear();
-  ctx_.ClearMLIRValueScopes();
+  ctx_.ClearFunctionState();
   ctx_.builder.setInsertionPointToEnd(ctx_.module->getBody());
 }
 
@@ -125,30 +110,14 @@ void SunmmioMlirFunction::BeginFor(
     const std::string &iv, const SunMMIOValue &lb, const SunMMIOValue &ub,
     const SunMMIOValue &step,
     const ffi::Map<ffi::String, ffi::Any> &annotations,
-    const std::vector<int64_t> &live_out_token_ids) {
-  BeginFor(iv, lb, ub, step, annotations, live_out_token_ids, {});
-}
-
-void SunmmioMlirFunction::BeginFor(
-    const std::string &iv, const SunMMIOValue &lb, const SunMMIOValue &ub,
-    const SunMMIOValue &step,
-    const ffi::Map<ffi::String, ffi::Any> &annotations,
-    const std::vector<SunMMIOValue> &live_out_values) {
-  BeginFor(iv, lb, ub, step, annotations, {}, live_out_values);
-}
-
-void SunmmioMlirFunction::BeginFor(
-    const std::string &iv, const SunMMIOValue &lb, const SunMMIOValue &ub,
-    const SunMMIOValue &step,
-    const ffi::Map<ffi::String, ffi::Any> &annotations,
     const std::vector<int64_t> &live_out_token_ids,
     const std::vector<SunMMIOValue> &live_out_values) {
-  mlir::Value lb_v = type_.EnsureIndex(
-      type_.ResolveValueOrCreatePlaceholder(lb, ctx_.builder.getIndexType()));
-  mlir::Value ub_v = type_.EnsureIndex(
-      type_.ResolveValueOrCreatePlaceholder(ub, ctx_.builder.getIndexType()));
-  mlir::Value step_v = type_.EnsureIndex(
-      type_.ResolveValueOrCreatePlaceholder(step, ctx_.builder.getIndexType()));
+  mlir::Value lb_v =
+      type_.EnsureIndex(type_.ResolveValue(lb, ctx_.builder.getIndexType()));
+  mlir::Value ub_v =
+      type_.EnsureIndex(type_.ResolveValue(ub, ctx_.builder.getIndexType()));
+  mlir::Value step_v =
+      type_.EnsureIndex(type_.ResolveValue(step, ctx_.builder.getIndexType()));
 
   mlir::SmallVector<mlir::Value, 8> init_args;
   init_args.reserve(live_out_token_ids.size() + live_out_values.size());
@@ -164,7 +133,7 @@ void SunmmioMlirFunction::BeginFor(
     mlir::Type expected_type = type_.MapType(value.type);
     mlir::Value init = ctx_.LookupMLIRValue(value.value);
     if (!init) {
-      init = type_.ResolveValueOrCreatePlaceholder(value, expected_type);
+      init = type_.ResolveValue(value, expected_type);
     }
     init_args.push_back(init);
   }
@@ -224,11 +193,9 @@ void SunmmioMlirFunction::BeginFor(
 
 void SunmmioMlirFunction::EndFor() {
   if (ctx_.for_stack.empty()) {
-    if (ctx_.module) {
-      ctx_.module->emitError("EndFor called without a matching BeginFor");
-    }
+    LOG(FATAL) << "EndFor called without a matching BeginFor";
     ctx_.PopMLIRValueScope();
-    return;
+    TVM_FFI_UNREACHABLE();
   }
 
   if (ctx_.control_flow_stack.empty() ||
@@ -236,9 +203,8 @@ void SunmmioMlirFunction::EndFor() {
           SunmmioMlirContext::ControlKind::kFor ||
       ctx_.control_flow_stack.back().index !=
           static_cast<int>(ctx_.for_stack.size()) - 1) {
-    if (ctx_.module) {
-      ctx_.module->emitError("EndFor control_flow_stack mismatch");
-    }
+    LOG(FATAL) << "EndFor control_flow_stack mismatch";
+    TVM_FFI_UNREACHABLE();
   } else {
     ctx_.control_flow_stack.pop_back();
   }
@@ -358,7 +324,7 @@ void SunmmioMlirFunction::BeginWhile(
     mlir::Type expected_type = type_.MapType(value.type);
     mlir::Value init = ctx_.LookupMLIRValue(value.value);
     if (!init) {
-      init = type_.ResolveValueOrCreatePlaceholder(value, expected_type);
+      init = type_.ResolveValue(value, expected_type);
     }
     init_args.push_back(init);
   }
@@ -420,17 +386,14 @@ void SunmmioMlirFunction::BeginWhile(
 
 void SunmmioMlirFunction::BeginWhileBody(const SunMMIOValue &cond) {
   if (ctx_.while_stack.empty()) {
-    if (ctx_.module) {
-      ctx_.module->emitError("BeginWhileBody called without a matching "
-                             "BeginWhile");
-    }
-    return;
+    LOG(FATAL) << "BeginWhileBody called without a matching BeginWhile";
+    TVM_FFI_UNREACHABLE();
   }
 
   SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack.back();
   frame.in_body = true;
-  mlir::Value cond_v = type_.EnsureI1(
-      type_.ResolveValueOrCreatePlaceholder(cond, ctx_.builder.getI1Type()));
+  mlir::Value cond_v =
+      type_.EnsureI1(type_.ResolveValue(cond, ctx_.builder.getI1Type()));
 
   mlir::SmallVector<mlir::Value, 8> condition_args;
   condition_args.append(frame.before_tokens.begin(), frame.before_tokens.end());
@@ -472,11 +435,9 @@ void SunmmioMlirFunction::BeginWhileBody(const SunMMIOValue &cond) {
 
 void SunmmioMlirFunction::EndWhile() {
   if (ctx_.while_stack.empty()) {
-    if (ctx_.module) {
-      ctx_.module->emitError("EndWhile called without a matching BeginWhile");
-    }
+    LOG(FATAL) << "EndWhile called without a matching BeginWhile";
     ctx_.PopMLIRValueScope();
-    return;
+    TVM_FFI_UNREACHABLE();
   }
 
   if (ctx_.control_flow_stack.empty() ||
@@ -484,9 +445,8 @@ void SunmmioMlirFunction::EndWhile() {
           SunmmioMlirContext::ControlKind::kWhile ||
       ctx_.control_flow_stack.back().index !=
           static_cast<int>(ctx_.while_stack.size()) - 1) {
-    if (ctx_.module) {
-      ctx_.module->emitError("EndWhile control_flow_stack mismatch");
-    }
+    LOG(FATAL) << "EndWhile control_flow_stack mismatch";
+    TVM_FFI_UNREACHABLE();
   } else {
     ctx_.control_flow_stack.pop_back();
   }
@@ -585,8 +545,8 @@ void SunmmioMlirFunction::BeginIf(
 void SunmmioMlirFunction::BeginIf(
     const SunMMIOValue &cond, const std::vector<int64_t> &live_out_token_ids,
     const std::vector<SunMMIOValue> &live_out_values) {
-  mlir::Value cond_v = type_.EnsureI1(
-      type_.ResolveValueOrCreatePlaceholder(cond, ctx_.builder.getI1Type()));
+  mlir::Value cond_v =
+      type_.EnsureI1(type_.ResolveValue(cond, ctx_.builder.getI1Type()));
   mlir::Type token_ty = mlir::suvm::TokenType::get(&ctx_.mlir_ctx);
   mlir::SmallVector<mlir::Type, 8> result_types;
   result_types.reserve(live_out_token_ids.size() + live_out_values.size());
@@ -622,8 +582,7 @@ void SunmmioMlirFunction::BeginIf(
   for (const SunMMIOValue &value : live_out_values) {
     mlir::Value base = ctx_.LookupMLIRValue(value.value);
     if (!base) {
-      base = type_.ResolveValueOrCreatePlaceholder(value,
-                                                   type_.MapType(value.type));
+      base = type_.ResolveValue(value, type_.MapType(value.type));
     }
     base_values.push_back(base);
   }
@@ -673,17 +632,13 @@ void SunmmioMlirFunction::BeginIf(
 
 void SunmmioMlirFunction::BeginElse() {
   if (ctx_.if_stack.empty()) {
-    if (ctx_.module) {
-      ctx_.module->emitError("BeginElse called without a matching BeginIf");
-    }
-    return;
+    LOG(FATAL) << "BeginElse called without a matching BeginIf";
+    TVM_FFI_UNREACHABLE();
   }
   SunmmioMlirContext::IfFrame &frame = ctx_.if_stack.back();
   if (frame.in_else) {
-    if (ctx_.module) {
-      ctx_.module->emitError("BeginElse called twice for the same scf.if");
-    }
-    return;
+    LOG(FATAL) << "BeginElse called twice for the same scf.if";
+    TVM_FFI_UNREACHABLE();
   }
   frame.then_yield_tokens = frame.produced_tokens;
   // Restore ctx_.token_by_id overrides made in the then-branch before entering
@@ -722,11 +677,9 @@ void SunmmioMlirFunction::BeginElse() {
 
 void SunmmioMlirFunction::EndIf() {
   if (ctx_.if_stack.empty()) {
-    if (ctx_.module) {
-      ctx_.module->emitError("EndIf called without a matching BeginIf");
-    }
+    LOG(FATAL) << "EndIf called without a matching BeginIf";
     ctx_.PopMLIRValueScope();
-    return;
+    TVM_FFI_UNREACHABLE();
   }
 
   if (ctx_.control_flow_stack.empty() ||
@@ -734,9 +687,8 @@ void SunmmioMlirFunction::EndIf() {
           SunmmioMlirContext::ControlKind::kIf ||
       ctx_.control_flow_stack.back().index !=
           static_cast<int>(ctx_.if_stack.size()) - 1) {
-    if (ctx_.module) {
-      ctx_.module->emitError("EndIf control_flow_stack mismatch");
-    }
+    LOG(FATAL) << "EndIf control_flow_stack mismatch";
+    TVM_FFI_UNREACHABLE();
   } else {
     ctx_.control_flow_stack.pop_back();
   }
@@ -844,8 +796,8 @@ void SunmmioMlirFunction::EndIf() {
 
 void SunmmioMlirFunction::EmitAssert(const SunMMIOValue &cond,
                                      const std::string &msg_text) {
-  mlir::Value cond_v = type_.EnsureI1(
-      type_.ResolveValueOrCreatePlaceholder(cond, ctx_.builder.getI1Type()));
+  mlir::Value cond_v =
+      type_.EnsureI1(type_.ResolveValue(cond, ctx_.builder.getI1Type()));
   mlir::cf::AssertOp::create(ctx_.builder, type_.Loc(), cond_v,
                              ctx_.builder.getStringAttr(msg_text));
 }
