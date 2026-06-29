@@ -13,3 +13,27 @@ Near-memory computing and distributed memory systems have become key approaches 
 
 ## Latest News
 - 10/30/2025 📦:
+
+## HiGHS for ILP Pipeline
+The Sunmmio ILP pipeline passes depend on the HiGHS C++ library at build time.
+
+This repository manages HiGHS as a source dependency:
+
+```text
+3rdparty/highs/
+  ... HiGHS source submodule ...
+build/3rdparty/highs-install/
+  ... generated install prefix ...
+```
+
+Before building, fetch submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+During the TileLang build, CMake will automatically build HiGHS from
+`3rdparty/highs` and install it to `build/3rdparty/highs-install`.
+
+The generated install prefix under `build/3rdparty/highs-install` is a build
+artifact and should not be committed.

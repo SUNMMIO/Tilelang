@@ -1,8 +1,7 @@
-import json
-import os
-import shutil
-from pathlib import Path
 import pytest
+import os
+import json
+from pathlib import Path
 from tilelang import tvm as tvm
 import tilelang as tl
 import tilelang.language as T
@@ -13,9 +12,7 @@ from tilelang.language.mesh_tensor import MeshShardingPolicy
 _get_logical_shape = tvm.ffi.get_global_func("tl.CuteLayout_logical_shape")
 
 
-_TEST_OUTPUT_DIR = Path(
-    "/home/yesimeng/Tilelang/testing/python/transform/out_sunmmio_pipeline_greedy"
-)
+_TEST_OUTPUT_DIR = Path("/home/yesimeng/Tilelang/testing/python/transform/out_sunmmio_pipeline_ilp")
 
 
 def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="bfloat16", accum_dtype="float"):
@@ -538,38 +535,111 @@ CASES = [
         lambda: matmul(1024, 1024, 1024, 128, 128, 32, num_stages=3),
         {
             "A_rsram_stage": [3, 128, 32],
-            "A_shared": [3, 128, 32],
-            "B_shared": [3, 32, 128],
+            "A_shared_ping": [128, 32],
+            "A_shared_pong": [128, 32],
+            "B_shared_ping": [32, 128],
+            "B_shared_pong": [32, 128],
         },
     ),
     (
         "flashattn",
         lambda: flashattn(num_stages=3),
         {
-            "K_shared": [3, 64, 128],
-            "acc_s": [3, 64, 64],
-            "acc_s_cast": [3, 64, 64],
-            "V_shared": [3, 64, 128],
+            "K_shared_ping": [64, 128],
+            "K_shared_pong": [64, 128],
+            "acc_s_cast_ping": [64, 64],
+            "acc_s_cast_pong": [64, 64],
+            "V_shared_ping": [64, 128],
+            "V_shared_pong": [64, 128],
+            "scores_max_prev": [3, 64],
+            "scores_scale": [3, 64],
         },
     ),
     (
         "flashdecoding",
         lambda: flashdecoding(num_stages=3),
         {
-            "K_shared": [3, 128, 128],
+            "K_shared_ping": [128, 128],
+            "K_shared_pong": [128, 128],
             "mask_local": [3, 128],
-            "acc_s": [3, 64, 128],
-            "acc_s_cast": [3, 64, 128],
-            "V_shared": [3, 128, 128],
+            "acc_s_cast_ping": [64, 128],
+            "acc_s_cast_pong": [64, 128],
+            "V_shared_ping": [128, 128],
+            "V_shared_pong": [128, 128],
+            "scores_max_prev": [3, 64],
+            "scores_scale": [3, 64],
         },
     ),
     (
         "flashmladecode",
         lambda: flashmladecode(num_stages=3),
         {
-            "KV_shared": [3, 64, 512],
-            "KV_shared2": [3, 64, 512],
-            "K_pe_shared": [3, 64, 64],
+            "KV_shared_ping": [64, 512],
+            "KV_shared_pong": [64, 512],
+            "KV_shared2_ping": [64, 512],
+            "KV_shared2_pong": [64, 512],
+            "K_pe_shared_ping": [64, 64],
+            "K_pe_shared_pong": [64, 64],
+            "S_shared_ping": [64, 64],
+            "S_shared_pong": [64, 64],
+            "scores_max_prev": [3, 64],
+            "scores_scale": [3, 64],
+        },
+    ),
+    (
+        "matmul2",
+        lambda: matmul(1024, 1024, 1024, 128, 128, 32, num_stages=2),
+        {
+            "A_rsram_stage": [2, 128, 32],
+            "A_shared_ping": [ 128, 32],
+            "A_shared_pong": [ 128, 32],
+            "B_shared_ping": [ 32, 128],
+            "B_shared_pong": [ 32, 128],
+        },
+    ),
+    (
+        "flashattn2",
+        lambda: flashattn(num_stages=2),
+        {
+            "K_shared_ping": [ 64, 128],
+            "K_shared_pong": [ 64, 128],
+            "acc_s_cast_ping": [ 64, 64],
+            "acc_s_cast_pong": [ 64, 64],
+            "V_shared_ping": [ 64, 128],
+            "V_shared_pong": [ 64, 128],
+            "scores_max_prev": [2, 64],
+            "scores_scale": [2, 64],
+        },
+    ),
+    (
+        "flashdecoding2",
+        lambda: flashdecoding(num_stages=2),
+        {
+            "K_shared_ping": [ 128, 128],
+            "K_shared_pong": [ 128, 128],
+            "mask_local": [2, 128],
+            "acc_s_cast_ping": [ 64, 128],
+            "acc_s_cast_pong": [ 64, 128],
+            "V_shared_ping": [ 128, 128],
+            "V_shared_pong": [ 128, 128],
+            "scores_max_prev": [2, 64],
+            "scores_scale": [2, 64],
+        },
+    ),
+    (
+        "flashmladecode2",
+        lambda: flashmladecode(num_stages=2),
+        {
+            "KV_shared_ping": [ 64, 512],
+            "KV_shared_pong": [ 64, 512],
+            "KV_shared2_ping": [ 64, 512],
+            "KV_shared2_pong": [ 64, 512],
+            "K_pe_shared_ping": [ 64, 64],
+            "K_pe_shared_pong": [ 64, 64],
+            "S_shared_ping": [ 64, 64],
+            "S_shared_pong": [ 64, 64],
+            "scores_max_prev": [2, 64],
+            "scores_scale": [2, 64],
         },
     ),
 ]
@@ -620,9 +690,17 @@ def assert_multiversioned_func_layouts(func, expected_shapes):
         assert buffer_shapes[buffer_name] == expected_shape, buffer_shapes
 
 
+def assert_layout_names_absent(func, forbidden_names):
+    assert "layout_map" in func.attrs
+    layout_map = func.attrs["layout_map"]
+    layout_names = {buffer.name for buffer, _ in layout_map.items()}
+    for name in forbidden_names:
+        assert name not in layout_names, layout_names
+
+
 def _write_ir(path: Path, mod: tvm.IRModule) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(mod.script(show_meta=True).strip() + "\n", encoding="utf-8")
+    path.write_text(mod.script(show_meta=True).strip() + "\n")
 
 
 def _annotation_to_python(value):
@@ -665,6 +743,7 @@ def _extract_pipeline_annotations(stmt):
                 "prologue_orders" in ann
                 or "body_orders" in ann
                 or "epilogue_orders" in ann
+                or "runtime_multiversion_buffers" in ann
             ):
                 result = ann
                 return
@@ -698,9 +777,14 @@ def _write_pipeline_annotations(path: Path, mod: tvm.IRModule) -> None:
     if annotations is not None:
         for key, value in annotations.items():
             payload[str(key)] = _annotation_to_python(value)
-    path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _annotation_buffer_names(annotations, key):
+    if key not in annotations:
+        return []
+    value = annotations[key]
+    return sorted(buffer.name for buffer in value)
 
 
 def _artifact_paths(case_name: str) -> dict[str, Path]:
@@ -708,13 +792,11 @@ def _artifact_paths(case_name: str) -> dict[str, Path]:
     return {
         "case_dir": case_dir,
         "before_pipeline_ir": case_dir / "00_before_pipeline_ir.py",
-        "after_planning_ir": case_dir / "01_after_pipeline_planning_ir.py",
+        "after_planning_ir": case_dir / "01_after_pipeline_planning_ilp_ir.py",
         "planning_annotations": case_dir / "01a_pipeline_annotations.json",
-        "after_inject_ir": case_dir / "02_after_inject_pipeline_ir.py",
-        "body_graph_log": case_dir / "body_graph.log",
-        "body_log": case_dir / "body.log",
-        "prologue_log": case_dir / "prologue.log",
-        "epilogue_log": case_dir / "epilogue.log",
+        "after_inject_ir": case_dir / "02_after_inject_pipeline_ilp_ir.py",
+        "problem_json": case_dir / "ilp_problem.json",
+        "solution_json": case_dir / "ilp_solution.json",
     }
 
 
@@ -737,32 +819,6 @@ class _ScopedEnv:
                 os.environ[key] = old_value
 
 
-class _ScopedCwd:
-    def __init__(self, path: Path):
-        self._path = path
-        self._old: str | None = None
-
-    def __enter__(self):
-        self._old = os.getcwd()
-        os.chdir(self._path)
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        assert self._old is not None
-        os.chdir(self._old)
-
-
-def _capture_scheduler_logs(case_dir: Path) -> None:
-    case_dir.mkdir(parents=True, exist_ok=True)
-    for log_name in ("body_graph.log", "body.log", "prologue.log", "epilogue.log"):
-        src = Path(log_name)
-        dst = case_dir / log_name
-        if src.exists():
-            shutil.copyfile(src, dst)
-        elif dst.exists():
-            dst.unlink()
-
-
 @pytest.mark.parametrize(
     "case_name,kernel,expected_layout_shapes",
     CASES,
@@ -772,18 +828,107 @@ def test_tilelang_transform_sunmmio_pipeline(case_name, kernel, expected_layout_
     name = SUNMMIO_TARGET_DESC
     target = tvm.target.Target(name)
     artifacts = _artifact_paths(case_name)
-    artifacts["case_dir"].parent.mkdir(parents=True, exist_ok=True)
 
-    with _ScopedCwd(artifacts["case_dir"].parent):
-        with tvm.target.Target(target):
-            mod = tvm.IRModule.from_expr(kernel().with_attr("global_symbol", "main"))
-            mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
-            mod = tl.transform.IfStmtBinding()(mod)
-            _write_ir(artifacts["before_pipeline_ir"], mod)
-            mod = tl.transform.SunmmioPipelinePlanning(debug=True)(mod)
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(kernel().with_attr("global_symbol", "main"))
+        mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+        mod = tl.transform.IfStmtBinding()(mod)
+        _write_ir(artifacts["before_pipeline_ir"], mod)
+        with _ScopedEnv(
+            {
+                "TL_SUNMMIO_ILP_FASTER": "20",
+                "TL_SUNMMIO_ILP_PROBLEM_JSON": str(artifacts["problem_json"]),
+                "TL_SUNMMIO_ILP_SOLUTION_JSON": str(artifacts["solution_json"]),
+            }
+        ):
+            mod = tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
             _write_ir(artifacts["after_planning_ir"], mod)
             _write_pipeline_annotations(artifacts["planning_annotations"], mod)
-            _capture_scheduler_logs(artifacts["case_dir"])
-            mod = tl.transform.InjectSunmmioPipeline()(mod)
-            _write_ir(artifacts["after_inject_ir"], mod)
-            assert_multiversioned_func_layouts(mod["main"], expected_layout_shapes)
+            mod = tl.transform.InjectSunmmioPipelineILP()(mod)
+        _write_ir(artifacts["after_inject_ir"], mod)
+        assert_multiversioned_func_layouts(mod["main"], expected_layout_shapes)
+
+
+def test_tilelang_transform_sunmmio_pipeline_bank_internal_multiversion_numstage4():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(
+            matmul(1024, 1024, 1024, 128, 128, 32, num_stages=4).with_attr(
+                "global_symbol", "main"
+            )
+        )
+        mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+        mod = tl.transform.IfStmtBinding()(mod)
+        with _ScopedEnv({"TL_SUNMMIO_ILP_FASTER": "20"}):
+            mod = tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
+            mod = tl.transform.InjectSunmmioPipelineILP()(mod)
+
+        assert_multiversioned_func_layouts(
+            mod["main"],
+            {
+                "A_rsram_stage": [4, 128, 32],
+                "A_shared_ping": [128, 32],
+                "A_shared_pong": [128, 32],
+                "B_shared_ping": [32, 128],
+                "B_shared_pong": [32, 128],
+            },
+        )
+        assert_layout_names_absent(mod["main"], ["A_shared", "B_shared"])
+
+
+def test_tilelang_transform_sunmmio_pipeline_banked_buffers_no_version_axis_numstage2():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(
+            matmul(1024, 1024, 1024, 128, 128, 32, num_stages=2).with_attr(
+                "global_symbol", "main"
+            )
+        )
+        mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+        mod = tl.transform.IfStmtBinding()(mod)
+        mod = tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
+        mod = tl.transform.InjectSunmmioPipelineILP()(mod)
+
+        assert_multiversioned_func_layouts(
+            mod["main"],
+            {
+                "A_rsram_stage": [2, 128, 32],
+                "A_shared_ping": [128, 32],
+                "A_shared_pong": [128, 32],
+                "B_shared_ping": [32, 128],
+                "B_shared_pong": [32, 128],
+            },
+        )
+        assert_layout_names_absent(mod["main"], ["A_shared", "B_shared"])
+
+
+def test_tilelang_transform_sunmmio_pipeline_annotations_separate_banked_from_runtime_multiversion_numstage3():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(
+            matmul(1024, 1024, 1024, 128, 128, 32, num_stages=3).with_attr(
+                "global_symbol", "main"
+            )
+        )
+        mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+        mod = tl.transform.IfStmtBinding()(mod)
+        with _ScopedEnv({"TL_SUNMMIO_ILP_FASTER": "20"}):
+            mod = tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
+
+        annotations = _extract_pipeline_annotations(mod["main"].body)
+        assert annotations is not None
+        assert _annotation_buffer_names(annotations, "versioned_buffers") == [
+            "A_rsram_stage",
+            "A_shared",
+            "B_shared",
+        ]
+        assert _annotation_buffer_names(
+            annotations, "runtime_multiversion_buffers"
+        ) == ["A_rsram_stage"]
+        assert _annotation_buffer_names(annotations, "runtime_banked_buffers") == [
+            "A_shared",
+            "B_shared",
+        ]

@@ -8,6 +8,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+include(ExternalProject)
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND "$ENV{CIBUILDWHEEL}")
   # Warning came from tvm submodule
   string(APPEND CMAKE_CXX_FLAGS " -Wno-dangling-reference")
@@ -283,6 +289,46 @@ file(GLOB TILE_LANG_SRCS
   src/target/intrin_rule*.cc
 )
 
+set(TILELANG_HIGHS_INSTALL_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/3rdparty/highs-install"
+    CACHE PATH "Install prefix for the vendored HiGHS build")
+set(TILELANG_HIGHS_SOURCE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/highs"
+    CACHE PATH "Source directory for the vendored HiGHS submodule")
+set(TILELANG_HIGHS_INCLUDE_DIR
+    "${TILELANG_HIGHS_INSTALL_DIR}/include")
+set(TILELANG_HIGHS_LIBRARY
+    "${TILELANG_HIGHS_INSTALL_DIR}/lib/libhighs.so")
+
+if(NOT EXISTS "${TILELANG_HIGHS_SOURCE_DIR}/CMakeLists.txt")
+  message(FATAL_ERROR
+    "HiGHS source is missing. Please run `git submodule update --init --recursive` "
+    "to fetch 3rdparty/highs.")
+endif()
+
+ExternalProject_Add(tilelang_highs
+  SOURCE_DIR "${TILELANG_HIGHS_SOURCE_DIR}"
+  CMAKE_ARGS
+    -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+    -DCMAKE_INSTALL_PREFIX=${TILELANG_HIGHS_INSTALL_DIR}
+    -DBUILD_SHARED_LIBS=ON
+    -DHIGHS_BUILD_SHARED=ON
+    -DHIGHS_BUILD_STATIC=OFF
+    -DHIGHS_BUILD_EXAMPLES=OFF
+    -DHIGHS_BUILD_TESTING=OFF
+    -DHIGHS_BUILD_PYTHON=OFF
+  BUILD_BYPRODUCTS
+    "${TILELANG_HIGHS_LIBRARY}"
+  UPDATE_DISCONNECTED TRUE
+  INSTALL_DIR "${TILELANG_HIGHS_INSTALL_DIR}"
+)
+
+if(NOT EXISTS "${TILELANG_HIGHS_INCLUDE_DIR}/highs/Highs.h")
+  message(STATUS "TileLang: HiGHS headers will be installed to ${TILELANG_HIGHS_INSTALL_DIR}")
+endif()
+list(APPEND TILE_LANG_INCLUDES ${TILELANG_HIGHS_INCLUDE_DIR})
+list(APPEND TILE_LANG_INCLUDES ${TILELANG_HIGHS_INCLUDE_DIR}/highs)
+
 if(USE_NPUIR)
   file(GLOB TILE_LANG_SUNMMIO_SRCS
     src/target/sunmmio/codegen_sunmmio.cc
@@ -510,9 +556,11 @@ endif()
 if(TARGET llvm-headers)
   add_dependencies(tilelang_objs llvm-headers)
 endif()
+add_dependencies(tilelang_objs tilelang_highs)
 
 add_library(tilelang SHARED $<TARGET_OBJECTS:tilelang_objs>)
 target_link_libraries(tilelang PUBLIC tvm)
+target_link_libraries(tilelang PRIVATE ${TILELANG_HIGHS_LIBRARY})
 
 if(TARGET MLIRIR)
   target_link_libraries(tilelang PRIVATE
