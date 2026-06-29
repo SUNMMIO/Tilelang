@@ -851,6 +851,14 @@ def macro(func: Callable[_P, _T] = None) -> Macro[_P, _T]:
 from typing import _eval_type
 import re
 
+_EVAL_TYPE_SUPPORTS_TYPE_PARAMS = "type_params" in inspect.signature(_eval_type).parameters
+
+
+def _eval_type_compat(value, globalns, localns):
+    if _EVAL_TYPE_SUPPORTS_TYPE_PARAMS:
+        return _eval_type(value, globalns=globalns, localns=localns, type_params=())
+    return _eval_type(value, globalns=globalns, localns=localns)
+
 
 def get_type_hints(func):
     annot = getattr(func, "__annotations__", None)
@@ -908,7 +916,7 @@ def get_type_hints(func):
                 value = ForwardRef(value, module=func.__module__)
             else:
                 value = ForwardRef(value, is_argument=True)
-            hints[name] = _eval_type(value, globalns=globalns, localns=localns)
+            hints[name] = _eval_type_compat(value, globalns=globalns, localns=localns)
         else:
             hints[name] = value
     return hints

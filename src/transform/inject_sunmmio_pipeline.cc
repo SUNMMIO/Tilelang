@@ -5,12 +5,13 @@
 #include "../op/parallel.h"
 #include "../op/region.h"
 #include "../op/utils.h"
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "../tileview/tileview.h"
-#include "common/ast_traverser.h"
 #include "common/loop_fusion_utils.h"
 #include "common/remap_buffer_rewriter.h"
-#include "common/sunmmio_pipeline_utils.h"
+#include "sunmmio_pipeline_planning/stmt_read_write_collector.h"
+#include "sunmmio_pipeline_planning/sunmmio_pipeline_utils.h"
 #include "tir/transforms/ir_utils.h"
 #include "tvm/ir/attrs.h"
 #include "tvm/ir/expr.h"
@@ -62,6 +63,7 @@ public:
     }
 
     substituter.RewriteFunctionLayoutAttrs(f);
+    substituter.RecordDefaultPingPongAttrs(f);
 
     f.CopyOnWrite()->body =
         RemapBufferRewriter::Substitute(f->body, substituter.buffer_remap_);
@@ -94,6 +96,30 @@ private:
       new_layout_map.Set(new_buffer, derived_layout.value());
     }
     f = WithAttr(std::move(f), attr::kLayoutMap, new_layout_map);
+  }
+
+  void RecordDefaultPingPongAttrs(PrimFunc &f) {
+    if (buffer_remap_.empty()) {
+      return;
+    }
+
+    Map<Var, String> alloc_ping_pong;
+    for (const auto &kv : buffer_remap_) {
+      const Buffer &buffer = kv.first;
+      if (buffer.scope() != kSunmmioScopeASRAM &&
+          buffer.scope() != kSunmmioScopeWSRAM) {
+        continue;
+      }
+      const Buffer &new_buffer = kv.second;
+      alloc_ping_pong.Set(new_buffer->data, String("pong"));
+    }
+
+    if (alloc_ping_pong.empty()) {
+      return;
+    }
+
+    f = WithAttr(std::move(f), tl::attr::kSunmmioAllocPingPong,
+                 alloc_ping_pong);
   }
 
   Buffer makeMultiVersionBuffer(const Buffer &buffer, int num_version) {
@@ -460,8 +486,8 @@ public:
 private:
   explicit SunmmioPipelineInjector(Optional<String> global_symbol,
                                    const PrimFunc &f)
-      : global_symbol_(std::move(global_symbol)), traverser_(f) {
-    traverser_.clear();
+      : global_symbol_(std::move(global_symbol)), stmt_rw_collector(f) {
+    stmt_rw_collector.clear();
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
@@ -667,7 +693,7 @@ private:
 
   Map<Var, Buffer> buffer_data_to_buffer_;
   Optional<String> global_symbol_;
-  ASTTraverser traverser_;
+  StmtReadWriteCollector stmt_rw_collector;
 };
 
 tvm::transform::Pass InjectSunmmioPipeline() {

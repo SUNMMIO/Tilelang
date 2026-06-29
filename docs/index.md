@@ -41,6 +41,13 @@ programming_guides/type_system
 
 :::{toctree}
 :maxdepth: 1
+:caption: SUNMMIO
+
+sunmmio/sunmmio_tilelang_user_guide
+:::
+
+:::{toctree}
+:maxdepth: 1
 :caption: DEEP LEARNING OPERATORS
 
 deeplearning_operators/elementwise

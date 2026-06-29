@@ -29,7 +29,15 @@ else:
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
-    """Ensure that at least one test is collected. Error out if all tests are skipped."""
+    """Require at least one test outcome unless pytest is only collecting tests."""
+    # --collect-only intentionally stops before running tests, so pytest will not
+    # populate passed/failed/xfailed stats even when collection succeeds.
+    if config.option.collectonly:
+        return
+
+    # Treat runs with only skipped or deselected tests as invalid. This catches
+    # accidental over-filtering, unavailable environments, and empty selections
+    # that would otherwise look like a successful no-op test run.
     known_types = {
         "failed",
         "passed",

@@ -7,15 +7,32 @@ from tvm import tir
 from tvm.target import Target
 from tilelang.language import copy, macro, alloc_shared, alloc_fragment
 from tilelang.utils.language import to_buffer_region, retrieve_shape, _get_buffer
+from tilelang.utils.language import prim_expr_equal
 from tilelang.utils.language import is_shared, is_fragment
 from tilelang.utils.target import target_is_sunmmio
 from tvm.script.ir_builder import IRBuilder
 
 
-def _legalize_dim(buffer: tir.Buffer, dim: int):
+def _legalize_dim_for_rank(rank: int, dim: int):
     if dim < 0:
-        dim = len(buffer.shape) + dim
+        dim = rank + dim
+    if dim < 0 or dim >= rank:
+        raise ValueError(f"Reduction axis {dim} is out of bounds for rank {rank}")
     return dim
+
+
+def _legalize_dim(buffer: BufferLikeType, dim: int):
+    return _legalize_dim_for_rank(len(retrieve_shape(buffer)), dim)
+
+
+def _shape_matches(actual, expected):
+    if len(actual) != len(expected):
+        return False
+    return all(prim_expr_equal(lhs, rhs) for lhs, rhs in zip(actual, expected))
+
+
+def _as_reduce_region_arg(obj: BufferLikeType, access_type: str):
+    return to_buffer_region(obj, access_type=access_type, extents=list(retrieve_shape(obj)))
 
 
 _REDUCE_OP_KEY = "tl.tileop.reduce"
@@ -24,37 +41,49 @@ ReduceKind = Literal["sum", "abssum", "max", "absmax", "min", "bitand", "bitor",
 
 
 # NOTE(chaofan): T.reduce is implemented as a macro, so no return
-def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: int, clear: bool) -> None:
+def reduce(buffer: BufferLikeType, out: BufferLikeType, reduce_type: ReduceKind, dim: int, clear: bool) -> None:
     """Perform a reduction operation on a buffer along a specified dimension.
 
     Args:
-        buffer (tir.Buffer): Input buffer to reduce
-        out (tir.Buffer): Output buffer to store results
+        buffer: Input buffer or buffer region to reduce
+        out: Output buffer or buffer region to store results
         reduce_type (str): Type of reduction ('max', 'min', 'sum', 'abssum')
         dim (int): Dimension along which to perform reduction
         clear (bool): Whether to initialize the output buffer before reduction
     """
+    buffer_shape = list(retrieve_shape(buffer))
+    out_shape = list(retrieve_shape(out))
+    dim = _legalize_dim_for_rank(len(buffer_shape), dim)
+
     # input shape: [X, d, Y], expected output shape: [X, Y] or [X, 1, Y]
-    expected_shapes = [buffer.shape[:dim] + buffer.shape[dim + 1 :], buffer.shape[:dim] + [1] + buffer.shape[dim + 1 :]]
-    if list(out.shape) not in expected_shapes:
+    expected_shapes = [
+        buffer_shape[:dim] + buffer_shape[dim + 1 :],
+        buffer_shape[:dim] + [tir.IntImm("int32", 1)] + buffer_shape[dim + 1 :],
+    ]
+    if not any(_shape_matches(out_shape, expected_shape) for expected_shape in expected_shapes):
         expected_shapes_str = " or ".join(map(str, expected_shapes))
         raise ValueError(
-            f"Invalid reduce output shape, buffer shape is {buffer.shape}, dim is {dim}, "
-            f"output shape is {out.shape}, expected shapes are {expected_shapes_str}"
+            f"Invalid reduce output shape, buffer shape is {buffer_shape}, dim is {dim}, "
+            f"output shape is {out_shape}, expected shapes are {expected_shapes_str}"
         )
 
     @macro
-    def reduce_macro(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clear: bool) -> None:
+    def reduce_macro(buffer: BufferLikeType, out: BufferLikeType, reduce_type: str, dim: int, clear: bool) -> None:
         target = Target.current()
         # Sunmmio uses direct builtins for ReduceOp in LowerTileOp
         # Check for Sunmmio target or specific Sunmmio shared memory scopes
-        is_sunmmio_scope = any(scope in (buffer.scope(), out.scope()) for scope in ("shared.rsram", "shared.asram", "shared.wsram"))
-        if (target and target_is_sunmmio(target)) or is_sunmmio_scope:
+        src_buffer = _get_buffer(buffer)
+        dst_buffer = _get_buffer(out)
+        is_sunmmio_scope = any(
+            scope in (src_buffer.scope(), dst_buffer.scope()) for scope in ("shared.rsram", "shared.asram", "shared.wsram")
+        )
+        is_sunmmio_target = target is not None and target_is_sunmmio(target)
+        if is_sunmmio_target or is_sunmmio_scope:
             tir.call_intrin(
                 "handle",
                 tir.op.Op.get(_REDUCE_OP_KEY),
-                to_buffer_region(buffer, access_type="r"),
-                to_buffer_region(out, access_type="w"),
+                _as_reduce_region_arg(buffer, access_type="r"),
+                _as_reduce_region_arg(out, access_type="w"),
                 reduce_type,
                 dim,
                 clear,
@@ -62,12 +91,12 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: in
             return
 
         if is_shared(buffer) and is_shared(out):
-            red_frag_in = alloc_fragment(buffer.shape, buffer.dtype)
-            red_frag_out = alloc_fragment(out.shape, out.dtype)
+            red_frag_in = alloc_fragment(buffer_shape, src_buffer.dtype)
+            red_frag_out = alloc_fragment(out_shape, dst_buffer.dtype)
 
             # rename buffers
-            IRBuilder.name(buffer.name + "_frag", red_frag_in)
-            IRBuilder.name(out.name + "_frag", red_frag_out)
+            IRBuilder.name(src_buffer.name + "_frag", red_frag_in)
+            IRBuilder.name(dst_buffer.name + "_frag", red_frag_out)
 
             if not clear:
                 copy(out, red_frag_out)
@@ -76,30 +105,30 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: in
             tir.call_intrin(
                 "handle",
                 tir.op.Op.get(_REDUCE_OP_KEY),
-                to_buffer_region(red_frag_in, access_type="r"),
-                to_buffer_region(red_frag_out, access_type="w"),
+                _as_reduce_region_arg(red_frag_in, access_type="r"),
+                _as_reduce_region_arg(red_frag_out, access_type="w"),
                 reduce_type,
                 dim,
                 clear,
             )
             copy(red_frag_out, out)
         elif is_shared(buffer) and is_fragment(out):
-            red_frag_in = alloc_fragment(buffer.shape, buffer.dtype)
-            IRBuilder.name(buffer.name + "_frag", red_frag_in)
+            red_frag_in = alloc_fragment(buffer_shape, src_buffer.dtype)
+            IRBuilder.name(src_buffer.name + "_frag", red_frag_in)
 
             copy(buffer, red_frag_in)
             tir.call_intrin(
                 "handle",
                 tir.op.Op.get(_REDUCE_OP_KEY),
-                to_buffer_region(red_frag_in, access_type="r"),
-                to_buffer_region(out, access_type="w"),
+                _as_reduce_region_arg(red_frag_in, access_type="r"),
+                _as_reduce_region_arg(out, access_type="w"),
                 reduce_type,
                 dim,
                 clear,
             )
         elif is_fragment(buffer) and is_shared(out):
-            red_frag_out = alloc_fragment(out.shape, out.dtype)
-            IRBuilder.name(out.name + "_frag", red_frag_out)
+            red_frag_out = alloc_fragment(out_shape, dst_buffer.dtype)
+            IRBuilder.name(dst_buffer.name + "_frag", red_frag_out)
 
             if not clear:
                 copy(out, red_frag_out)
@@ -107,8 +136,8 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: in
             tir.call_intrin(
                 "handle",
                 tir.op.Op.get(_REDUCE_OP_KEY),
-                to_buffer_region(buffer, access_type="r"),
-                to_buffer_region(red_frag_out, access_type="w"),
+                _as_reduce_region_arg(buffer, access_type="r"),
+                _as_reduce_region_arg(red_frag_out, access_type="w"),
                 reduce_type,
                 dim,
                 clear,
@@ -118,19 +147,19 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: ReduceKind, dim: in
             tir.call_intrin(
                 "handle",
                 tir.op.Op.get(_REDUCE_OP_KEY),
-                to_buffer_region(buffer, access_type="r"),
-                to_buffer_region(out, access_type="w"),
+                _as_reduce_region_arg(buffer, access_type="r"),
+                _as_reduce_region_arg(out, access_type="w"),
                 reduce_type,
                 dim,
                 clear,
             )
         else:
-            raise ValueError(f"Invalid buffer scopes: {buffer.scope()} and {out.scope()}")
+            raise ValueError(f"Invalid buffer scopes: {src_buffer.scope()} and {dst_buffer.scope()}")
 
     reduce_macro(buffer, out, reduce_type, dim, clear)
 
 
-def reduce_max(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
+def reduce_max(buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True) -> None:
     """Perform reduce max on input buffer, store the result to output buffer
 
     Parameters
@@ -151,7 +180,7 @@ def reduce_max(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
     reduce(buffer, out, "max", dim, clear)
 
 
-def reduce_min(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
+def reduce_min(buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True) -> None:
     """Perform reduce min on input buffer, store the result to output buffer.
 
     Args:
@@ -167,7 +196,7 @@ def reduce_min(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
     reduce(buffer, out, "min", dim, clear)
 
 
-def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
+def reduce_sum(buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True) -> None:
     """Perform reduce sum on input buffer, store the result to output buffer.
 
     Args:
@@ -192,7 +221,7 @@ def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
     reduce(buffer, out, "sum", dim, clear)
 
 
-def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
+def reduce_abssum(buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True) -> None:
     """Perform reduce absolute sum on input buffer, store the result to output buffer.
 
     Args:
@@ -207,7 +236,7 @@ def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: boo
     reduce(buffer, out, "abssum", dim, clear)
 
 
-def reduce_absmax(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
+def reduce_absmax(buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True) -> None:
     """Perform reduce absolute max on input buffer, store the result to output buffer.
 
     Args:
@@ -222,7 +251,7 @@ def reduce_absmax(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: boo
     reduce(buffer, out, "absmax", dim, clear)
 
 
-def reduce_bitand(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
+def reduce_bitand(buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True) -> None:
     """Perform reduce bitwise-and on input buffer, store the result to output buffer.
 
     Args:
@@ -237,7 +266,7 @@ def reduce_bitand(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: boo
     reduce(buffer, out, "bitand", dim, clear)
 
 
-def reduce_bitor(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
+def reduce_bitor(buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True) -> None:
     """Perform reduce bitwise-or on input buffer, store the result to output buffer.
 
     Args:
@@ -252,7 +281,7 @@ def reduce_bitor(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool
     reduce(buffer, out, "bitor", dim, clear)
 
 
-def reduce_bitxor(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True) -> None:
+def reduce_bitxor(buffer: BufferLikeType, out: BufferLikeType, dim: int = -1, clear: bool = True) -> None:
     """Perform reduce bitwise-xor on input buffer, store the result to output buffer.
 
     Args:

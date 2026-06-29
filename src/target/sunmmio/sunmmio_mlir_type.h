@@ -102,8 +102,7 @@ public:
   mlir::Type MapType(const SunMMIOType &type) const;
   mlir::Value EnsureI1(mlir::Value v);
   mlir::Value EnsureIndex(mlir::Value v);
-  mlir::Value ResolveValueOrCreatePlaceholder(const SunMMIOValue &v,
-                                              mlir::Type expected_type);
+  mlir::Value ResolveValue(const SunMMIOValue &v, mlir::Type expected_type);
 
 private:
   SunmmioMlirContext &ctx_;

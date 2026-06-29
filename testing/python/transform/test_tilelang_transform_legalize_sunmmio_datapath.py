@@ -601,3 +601,107 @@ def test_legalize_sunmmio_datapath_on_allgather_from_dram():
     # No allgather should remain with global source
     global_allgathers = [edge for edge in comm_edges if edge["src_scope"] == "global"]
     assert len(global_allgathers) == 0
+
+
+def cast_copy_to_operand(block_M, block_N, dst_scope, src_dtype=T.float32, dst_dtype=T.float16):
+    """RSRAM(src_dtype) -> ASRAM/WSRAM(dst_dtype) copy with explicit scopes.
+
+    The global->rsram load stays direct; the rsram->operand copy is the one the
+    pass must split into a tile-cast (rsram->rsram) plus a same-dtype DMA when
+    the src/dst dtypes differ.
+    """
+
+    @T.prim_func
+    def main(X: T.Tensor((block_M, block_N), src_dtype)):
+        with T.Kernel(1, 1, threads=128) as (bx, by):
+            prob = T.alloc_shared((block_M, block_N), src_dtype, scope="shared.rsram")
+            prob_cast = T.alloc_shared((block_M, block_N), dst_dtype, scope=dst_scope)
+            T.copy(X, prob)
+            T.copy(prob, prob_cast)
+
+    return tvm.IRModule({"main": main})
+
+
+def test_legalize_sunmmio_datapath_casts_rsram_to_asram():
+    """A casting RSRAM(f32)->ASRAM(f16) copy splits into a tile-cast (rsram->rsram)
+    plus a same-dtype DMA (rsram->asram), staging through an f16 RSRAM buffer."""
+    target = determine_target("Sunmmio", return_object=True)
+
+    with tvm.target.Target(target):
+        mod = run_legalize_sunmmio_datapath_no_infer_scope(cast_copy_to_operand(32, 32, "shared.asram"), target)
+
+    func = mod["main"]
+    root_block = next(block for block in extract_blocks(func) if block.name_hint == "tilelang_root")
+    copy_edges = extract_copy_edges(func)
+
+    stage_buffers = [buf for buf in root_block.alloc_buffers if buf.name.startswith("prob_cast_rsram_stage")]
+    assert len(stage_buffers) == 1
+    # Staging buffer takes the *dst* dtype so the prepended copy performs the cast.
+    assert stage_buffers[0].scope() == "shared.rsram"
+    assert str(stage_buffers[0].dtype) == "float16"
+    assert [int(dim) for dim in stage_buffers[0].shape] == [32, 32]
+
+    cast_leg = [edge for edge in copy_edges if edge["src_name"] == "prob" and edge["dst_name"].startswith("prob_cast_rsram_stage")]
+    move_leg = [edge for edge in copy_edges if edge["src_name"].startswith("prob_cast_rsram_stage") and edge["dst_name"] == "prob_cast"]
+
+    assert len(cast_leg) == 1
+    assert cast_leg[0]["src_scope"] == "shared.rsram"
+    assert cast_leg[0]["dst_scope"] == "shared.rsram"
+    assert cast_leg[0]["src_access_mask"] == 1
+    assert cast_leg[0]["dst_access_mask"] == 2
+
+    assert len(move_leg) == 1
+    assert move_leg[0]["src_scope"] == "shared.rsram"
+    assert move_leg[0]["dst_scope"] == "shared.asram"
+    assert move_leg[0]["src_mins"] == ["0", "0"]
+    assert move_leg[0]["dst_extents"] == ["32", "32"]
+    assert move_leg[0]["src_access_mask"] == 1
+    assert move_leg[0]["dst_access_mask"] == 2
+
+    # The original rsram->asram cast copy must not survive intact.
+    direct_cast = [edge for edge in copy_edges if edge["src_name"] == "prob" and edge["dst_name"] == "prob_cast"]
+    assert len(direct_cast) == 0
+
+
+def test_legalize_sunmmio_datapath_casts_rsram_to_wsram():
+    """The same split applies for the WSRAM operand scope (GEMM operand B)."""
+    target = determine_target("Sunmmio", return_object=True)
+
+    with tvm.target.Target(target):
+        mod = run_legalize_sunmmio_datapath_no_infer_scope(cast_copy_to_operand(32, 32, "shared.wsram"), target)
+
+    func = mod["main"]
+    root_block = next(block for block in extract_blocks(func) if block.name_hint == "tilelang_root")
+    copy_edges = extract_copy_edges(func)
+
+    stage_buffers = [buf for buf in root_block.alloc_buffers if buf.name.startswith("prob_cast_rsram_stage")]
+    assert len(stage_buffers) == 1
+    assert stage_buffers[0].scope() == "shared.rsram"
+    assert str(stage_buffers[0].dtype) == "float16"
+
+    move_leg = [edge for edge in copy_edges if edge["src_name"].startswith("prob_cast_rsram_stage") and edge["dst_name"] == "prob_cast"]
+    assert len(move_leg) == 1
+    assert move_leg[0]["src_scope"] == "shared.rsram"
+    assert move_leg[0]["dst_scope"] == "shared.wsram"
+
+
+def test_legalize_sunmmio_datapath_same_dtype_rsram_to_asram_not_split():
+    """A same-dtype RSRAM->ASRAM copy is a legal DMA and must not be staged."""
+    target = determine_target("Sunmmio", return_object=True)
+
+    with tvm.target.Target(target):
+        mod = run_legalize_sunmmio_datapath_no_infer_scope(
+            cast_copy_to_operand(32, 32, "shared.asram", src_dtype=T.float16, dst_dtype=T.float16),
+            target,
+        )
+
+    func = mod["main"]
+    root_block = next(block for block in extract_blocks(func) if block.name_hint == "tilelang_root")
+    copy_edges = extract_copy_edges(func)
+
+    assert not [buf for buf in root_block.alloc_buffers if buf.name.startswith("prob_cast_rsram_stage")]
+
+    direct_cast = [edge for edge in copy_edges if edge["src_name"] == "prob" and edge["dst_name"] == "prob_cast"]
+    assert len(direct_cast) == 1
+    assert direct_cast[0]["src_scope"] == "shared.rsram"
+    assert direct_cast[0]["dst_scope"] == "shared.asram"

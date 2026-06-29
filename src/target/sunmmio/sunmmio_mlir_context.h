@@ -48,6 +48,7 @@ struct SunmmioMlirContext {
     mlir::scf::ForOp op;
     ffi::Map<ffi::String, ffi::Any> annotations;
     std::vector<std::string> live_out_value_names;
+    int value_index_offset{0};
     // Token ids that must be carried by scf.for and materialized after the
     // loop.
     std::vector<int64_t> live_out_token_ids;
@@ -67,15 +68,18 @@ struct SunmmioMlirContext {
   struct WhileFrame {
     mlir::scf::WhileOp op;
     bool in_body{false};
+    std::vector<std::string> live_out_value_names;
+    int value_index_offset{0};
     // Token ids that must be carried by scf.while and materialized after the
     // loop.
     std::vector<int64_t> live_out_token_ids;
     // token_id -> index into iter_tokens / produced_tokens.
     std::unordered_map<int64_t, int> token_id_to_index;
-    // Region arguments in scf.while before/after regions.
+    // Region arguments in scf.while before/after regions.  Token live-outs are
+    // stored first, followed by scalar value live-outs.
     std::vector<mlir::Value> before_tokens;
     std::vector<mlir::Value> iter_tokens;
-    // Tokens produced in the loop body; falls back to iter_tokens when empty.
+    // Values produced in the loop body; falls back to iter_tokens when empty.
     std::vector<mlir::Value> produced_tokens;
     // Snapshots of ctx.token_by_id to restore when closing the loop.
     std::unordered_map<int64_t, SavedToken> saved_token_by_id;
@@ -86,6 +90,7 @@ struct SunmmioMlirContext {
     mlir::scf::IfOp op;
     bool in_else{false};
     std::vector<std::string> live_out_value_names;
+    int value_index_offset{0};
     // Token ids that must be carried by scf.if and materialized after the if.
     std::vector<int64_t> live_out_token_ids;
     // token_id -> index into base_tokens / produced_tokens / then_yield_tokens.
@@ -119,6 +124,16 @@ struct SunmmioMlirContext {
     return &for_stack.back().annotations;
   }
 
+  void ClearFunctionState() {
+    mlir_value_table_stack.clear();
+    token_by_id.clear();
+    barrier_by_mask.clear();
+    for_stack.clear();
+    if_stack.clear();
+    while_stack.clear();
+    control_flow_stack.clear();
+  }
+
   void ClearMLIRValueScopes() { mlir_value_table_stack.clear(); }
 
   void PushMLIRValueScope() { mlir_value_table_stack.emplace_back(); }
@@ -140,26 +155,22 @@ struct SunmmioMlirContext {
     return mlir::Value();
   }
 
-  mlir::Value LookupOrCreateFakeValue(const SunMMIOValue &value,
-                                      const std::string &debug_tag) {
+  mlir::Value LookupValue(const SunMMIOValue &value,
+                          const std::string &debug_tag) const {
     mlir::Value existing = LookupMLIRValue(value.value);
     if (existing) {
       return existing;
     }
 
-    auto fake_op = mlir::arith::ConstantIntOp::create(
-        builder, SunmmioMlirType(*this).MakeDebugLoc(debug_tag), 0, 32);
-    std::string attr_str =
-        debug_tag + (value.value.empty() ? "" : ":" + value.value);
-    fake_op->setAttr("sunmmio.fake", builder.getStringAttr(attr_str));
-    mlir::Value fake_value = fake_op.getResult();
-    if (!value.value.empty()) {
-      BindMLIRValue(value.value, fake_value);
-    }
-    return fake_value;
+    LOG(FATAL) << "Missing MLIR value for SunMMIO operand `"
+               << (value.value.empty() ? std::string("<unnamed>") : value.value)
+               << "` while lowering " << debug_tag;
+    TVM_FFI_UNREACHABLE();
   }
 
   void BindMLIRValue(const std::string &name, mlir::Value v) {
+    ICHECK(!name.empty()) << "Cannot bind unnamed MLIR value";
+    ICHECK(v) << "Cannot bind null MLIR value for `" << name << "`";
     if (mlir_value_table_stack.empty()) {
       mlir_value_table_stack.emplace_back();
     }
@@ -175,13 +186,29 @@ struct SunmmioMlirContext {
         }
         int idx = static_cast<int>(
             std::distance(frame.live_out_value_names.begin(), vit));
+        idx += frame.value_index_offset;
         if (idx >= 0 && idx < static_cast<int>(frame.produced_tokens.size())) {
           frame.produced_tokens[idx] = v;
         }
         break;
       }
       if (it->kind == ControlKind::kWhile) {
-        continue;
+        WhileFrame &frame = while_stack[it->index];
+        if (!frame.in_body) {
+          continue;
+        }
+        auto vit = std::find(frame.live_out_value_names.begin(),
+                             frame.live_out_value_names.end(), name);
+        if (vit == frame.live_out_value_names.end()) {
+          continue;
+        }
+        int idx = static_cast<int>(
+            std::distance(frame.live_out_value_names.begin(), vit));
+        idx += frame.value_index_offset;
+        if (idx >= 0 && idx < static_cast<int>(frame.produced_tokens.size())) {
+          frame.produced_tokens[idx] = v;
+        }
+        break;
       }
       IfFrame &frame = if_stack[it->index];
       auto vit = std::find(frame.live_out_value_names.begin(),
@@ -191,6 +218,7 @@ struct SunmmioMlirContext {
       }
       int idx = static_cast<int>(
           std::distance(frame.live_out_value_names.begin(), vit));
+      idx += frame.value_index_offset;
       if (idx >= 0 && idx < static_cast<int>(frame.produced_tokens.size())) {
         frame.produced_tokens[idx] = v;
       }
