@@ -463,8 +463,8 @@ private:
     const auto *call = eval.value.as<CallNode>();
     ICHECK(call) << "VectorCore Evaluate must wrap a CallNode.";
     ICHECK(call->op == Op::Get("tl.vector_core_in_tile_reduce"))
-        << "VectorCore Evaluate must wrap a tl.vector_core_in_tile_reduce "
-           "call.";
+        << "An intrinsic on VectorCore should be "
+           "tl.vector_core_in_tile_reduce.";
     const auto *reduce_kind = call->args[0].as<StringImmNode>();
     ICHECK(reduce_kind)
         << "VectorCore Evaluate call must carry a StringImm reduce kind.";
