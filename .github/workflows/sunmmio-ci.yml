@@ -376,6 +376,21 @@ jobs:
           export CMAKE_ARGS="${CMAKE_ARGS} ${TILELANG_NPUIR_CMAKE_ARGS}"
           uv pip install -v .
 
+      - name: Build npuir-opt for codegen validation
+        if: steps.npuir-mode.outputs.available == '1'
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTILELANG_UPDATE_SUBMODULES=OFF \
+            -DUSE_CUDA=ON \
+            -DUSE_Z3=OFF \
+            -DPython3_EXECUTABLE=/usr/bin/python3.12 \
+            -DPython_EXECUTABLE=/usr/bin/python3.12 \
+            ${TILELANG_NPUIR_CMAKE_ARGS}
+          cmake --build build --target npuir-opt -j "$(nproc)"
+          test -x build/bin/npuir-opt
+
       - name: Run Python test suite
         run: |
           . .venv/bin/activate

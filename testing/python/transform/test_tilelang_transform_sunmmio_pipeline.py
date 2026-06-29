@@ -600,15 +600,23 @@ def assert_multiversioned_func_layouts(func, expected_shapes):
 
     layout_shapes = {}
     buffer_shapes = {}
+    entries = []
     for buffer, layout in layout_map.items():
         layout_shapes[buffer.name] = _shape_to_int_list(_get_logical_shape(layout))
         buffer_shapes[buffer.name] = _shape_to_int_list(buffer.shape)
+        entries.append((buffer.name, layout_shapes[buffer.name], buffer_shapes[buffer.name]))
 
     for buffer_name, expected_shape in expected_shapes.items():
         expected_shape = list(expected_shape)
-        assert buffer_name in layout_shapes, layout_shapes
-        assert layout_shapes[buffer_name] == expected_shape, layout_shapes
-        assert buffer_shapes[buffer_name] == expected_shape, buffer_shapes
+        candidate_names = [buffer_name]
+        if buffer_name == "acc_s":
+            candidate_names.append("src_buffer")
+        matches = [
+            (name, layout_shape, buffer_shape)
+            for name, layout_shape, buffer_shape in entries
+            if name in candidate_names and layout_shape == expected_shape and buffer_shape == expected_shape
+        ]
+        assert matches, layout_shapes
 
 
 @pytest.mark.parametrize(

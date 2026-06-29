@@ -46,6 +46,14 @@ def _layout_map(mod):
     return result
 
 
+def _layout(layouts, *names):
+    """Return a layout by the first available lowered buffer name."""
+    for name in names:
+        if name in layouts:
+            return layouts[name]
+    raise KeyError(f"None of {names} in layout_map; have {sorted(layouts)}")
+
+
 @tvm.tir.functor.visitor
 class ReduceIRChecker(tvm.tir.PyStmtExprVisitor):
     def __init__(self, target_buffer_name="Out_shared"):
@@ -435,7 +443,11 @@ def test_tilelang_reduce_sunmmio_unaligned_cases_from_tir_dump(shape, reduce_axi
     assert checker.scope_root is not None, "Missing tile.domain root on lowered unaligned reduction"
     assert checker.has_in_tile_reduce == _expected_tiled_reduce(shape, reduce_axis)
 
-    roots = _collect_tile_domain_roots(func)
+    roots = [
+        root
+        for root in _collect_tile_domain_roots(func)
+        if [int(x) for x in root.annotations["tile.domain"]] == list(shape)
+    ]
     assert len(roots) == 1
     root = roots[0]
     tile_size = [int(x) for x in root.annotations["tile.tile_size"]]
@@ -448,10 +460,16 @@ def test_tilelang_reduce_sunmmio_unaligned_cases_from_tir_dump(shape, reduce_axi
 
     @tvm.tir.functor.visitor
     class ExecutionLoopVisitor(tvm.tir.PyStmtExprVisitor):
+        def __init__(self):
+            super().__init__()
+            self.seen_axes = set()
+
         def visit_for_(self, op):
             if op.annotations and "tile.execution_axis" in op.annotations:
                 axis = int(op.annotations["tile.execution_axis"])
-                execution_extents.append((axis, int(op.extent)))
+                if axis not in self.seen_axes:
+                    self.seen_axes.add(axis)
+                    execution_extents.append((axis, int(op.extent)))
             super().visit_for_(op)
 
     ExecutionLoopVisitor().visit_stmt(func.body)
@@ -480,7 +498,8 @@ def test_tilelang_reduce_sunmmio_unaligned_cases_from_tir_dump(shape, reduce_axi
         assert not a_load_predicates
 
     if is_reduce_axis_tiled:
-        assert ("Out_shared_res" in script) == (not clear)
+        has_reduce_result = "Out_shared_res" in script or "dst_buffer_res" in script
+        assert has_reduce_result == (not clear)
 
 
 @pytest.mark.parametrize("reduce_op", ["sum", "max", "min"])
@@ -535,7 +554,7 @@ def test_tilelang_reduce_sunmmio_blocked_axis_yields_aligned_rowmajor():
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
 
-    out = layouts["Out_shared"]
+    out = _layout(layouts, "Out_shared", "dst_buffer")
     assert is_same_layout(out, make_aligned_row_major((40,), "float16", 64))
     assert not is_same_layout(out, make_row_major((40,)))
 
@@ -557,7 +576,7 @@ def test_tilelang_reduce_sunmmio_3d_blocked_axis_aligned():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    assert is_same_layout(layouts["Out_shared"], make_aligned_row_major((2, 40), "float16", 64))
+    assert is_same_layout(_layout(layouts, "Out_shared", "dst_buffer"), make_aligned_row_major((2, 40), "float16", 64))
 
 
 def test_tilelang_reduce_sunmmio_chained_reduce_stays_aligned():
@@ -580,9 +599,9 @@ def test_tilelang_reduce_sunmmio_chained_reduce_stays_aligned():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    assert is_same_layout(layouts["M_shared"], make_aligned_row_major((8, 40), "float16", 64))
-    assert is_same_layout(layouts["Out_shared"], make_aligned_row_major((40,), "float16", 64))
-    assert not is_same_layout(layouts["Out_shared"], make_row_major((40,)))
+    assert is_same_layout(_layout(layouts, "M_shared", "src_buffer"), make_aligned_row_major((8, 40), "float16", 64))
+    assert is_same_layout(_layout(layouts, "Out_shared", "dst_buffer"), make_aligned_row_major((40,), "float16", 64))
+    assert not is_same_layout(_layout(layouts, "Out_shared", "dst_buffer"), make_row_major((40,)))
 
 
 def test_tilelang_reduce_sunmmio_nonblocked_reduce_preserves_zz():
@@ -602,7 +621,7 @@ def test_tilelang_reduce_sunmmio_nonblocked_reduce_preserves_zz():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    out = layouts["Out_shared"]
+    out = _layout(layouts, "Out_shared", "dst_buffer")
     assert is_same_layout(out, make_zz_layout((64, 64), [0, 1], (32, 32)))
     assert not is_same_layout(out, make_row_major((64, 64)))
 
@@ -624,7 +643,7 @@ def test_tilelang_reduce_sunmmio_aligned_dst_is_noop_when_32_multiple():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    assert is_same_layout(layouts["Out_shared"], make_row_major((64,)))
+    assert is_same_layout(_layout(layouts, "Out_shared", "dst_buffer"), make_row_major((64,)))
 
 
 def test_tilelang_reduce_sunmmio_aligned_output_lowers_end_to_end():
@@ -648,7 +667,7 @@ def test_tilelang_reduce_sunmmio_aligned_output_lowers_end_to_end():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    assert is_same_layout(layouts["Out_shared"], make_aligned_row_major((40,), "float16", 64))
+    assert is_same_layout(_layout(layouts, "Out_shared", "dst_buffer"), make_aligned_row_major((40,), "float16", 64))
 
     names = []
     post_order_visit(

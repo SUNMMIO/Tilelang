@@ -608,7 +608,7 @@ INCORRECT_TEST_CASES = [
             False,
             groups=16,
         ),
-        "Invalid scope local.fragment of acc_s_frag in Sunmmio.",
+        r"Invalid scope local\.fragment of (acc_s_frag|src_buffer_frag) in Sunmmio\.",
     ),
 ]
 
