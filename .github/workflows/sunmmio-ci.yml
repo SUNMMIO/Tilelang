@@ -77,7 +77,7 @@ jobs:
       PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu128
       UV_INDEX: https://download.pytorch.org/whl/cu128
       CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON -DUSE_Z3=OFF -DTILELANG_UPDATE_SUBMODULES=OFF -DPython3_EXECUTABLE=/usr/bin/python3.12 -DPython_EXECUTABLE=/usr/bin/python3.12"
-      CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF"
+      CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=ON"
       XDG_CACHE_HOME: /ci-cache
       PIP_CACHE_DIR: /ci-cache/pip
       UV_CACHE_DIR: /ci-cache/uv
@@ -373,8 +373,8 @@ jobs:
 
       - name: Install project (wheel form)
         run: |
-          # Match the wheel build mode to the checkout mode:
-          # use the cached NPU-IR tree when available, otherwise disable Sunmmio.
+          # Always build CUDA in this NVIDIA test lane; Sunmmio is enabled only
+          # when the private NPU-IR checkout/cache is available.
           export CMAKE_ARGS="${CMAKE_ARGS} ${TILELANG_SUNMMIO_CMAKE_ARGS}"
           uv pip install -v .
 
