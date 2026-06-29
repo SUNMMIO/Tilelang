@@ -310,19 +310,32 @@ class KernelCache:
 
     @staticmethod
     def _safe_write_file(path: str, mode: str, operation: Callable):
-        # Random a temporary file within the same FS as the cache directory
-        temp_path = os.path.join(env.TILELANG_TMP_DIR, f"{os.getpid()}_{uuid.uuid4()}")
-        with open(temp_path, mode) as temp_file:
-            operation(temp_file)
+        # Stage the temporary file next to the destination so os.replace is
+        # atomic and does not fail when TILELANG_TMP_DIR is on another device.
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        temp_path = os.path.join(directory, f".{os.getpid()}_{uuid.uuid4()}.tmp")
+        try:
+            with open(temp_path, mode) as temp_file:
+                operation(temp_file)
 
-        # Use atomic POSIX replace, so other processes cannot see a partial write
-        os.replace(temp_path, path)
+            # Use atomic POSIX replace, so other processes cannot see a partial write
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
     @classmethod
     def _safe_write_executable(cls, executable: Executable, path: str):
-        temp_path = os.path.join(env.TILELANG_TMP_DIR, f"{os.getpid()}_{uuid.uuid4()}.so")
-        executable.export_library(temp_path, **cls._get_compile_args())
-        os.replace(temp_path, path)
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        temp_path = os.path.join(directory, f".{os.getpid()}_{uuid.uuid4()}.so")
+        try:
+            executable.export_library(temp_path, **cls._get_compile_args())
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
     def _save_kernel_to_disk(self, key: str, kernel: JITKernel, func: Callable = None, verbose: bool = False):
         """

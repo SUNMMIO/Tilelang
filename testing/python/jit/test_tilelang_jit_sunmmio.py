@@ -46,6 +46,15 @@ def _load_sunmmio_dynamic_elementwise_example():
     return module
 
 
+def _load_sunmmio_dynamic_exp2_example():
+    example_path = Path(__file__).resolve().parents[3] / "examples" / "sunmmio" / "elementwise" / "elementwise_exp2_dynamic.py"
+    spec = importlib.util.spec_from_file_location("tilelang_sunmmio_dynamic_elementwise_exp2_example", example_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _require_npuir_tools():
     try:
         return NpuirTools.resolve()
@@ -351,6 +360,53 @@ def test_sunmmio_sunsim_dynamic_elementwise_add_example_executes(tmp_path):
             tilelang.env.disable_cache()
 
 
+@pytest.mark.sunmmio_toolchain
+@pytest.mark.sunmmio_sunsim
+@pytest.mark.sunmmio_closed_runtime
+def test_sunmmio_sunsim_dynamic_elementwise_exp2_example_executes(tmp_path):
+    _require_sunmmio_codegen()
+    _require_npuir_tools()
+    _require_sunmmio_toolchain()
+
+    pytest.importorskip("sunsim")
+
+    from tilelang.cache import _dispatch_map
+
+    example = _load_sunmmio_dynamic_exp2_example()
+    cache_root = tmp_path / "cache"
+    tmp_root = tmp_path / "tmp"
+    old_cache_dir = tilelang.env.TILELANG_CACHE_DIR
+    old_tmp_dir = tilelang.env.TILELANG_TMP_DIR
+    was_cache_enabled = tilelang.env.is_cache_enabled()
+
+    try:
+        tilelang.env.TILELANG_CACHE_DIR = str(cache_root)
+        tilelang.env.TILELANG_TMP_DIR = str(tmp_root)
+        tilelang.env.enable_cache()
+        cache_root.mkdir(parents=True, exist_ok=True)
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        example.elementwise_exp2_dynamic._kernel_cache.clear()
+        _dispatch_map["sunmmio_sunsim"]._memory_cache.clear()
+
+        shapes = [(64, 64), (96, 160), (129, 257)]
+        for shape in shapes:
+            result = example.main(*shape)
+            assert result.exit_code == 0
+
+        elf_files = list(cache_root.glob("*/kernel.elf"))
+
+        assert len(elf_files) == 1
+    finally:
+        example.elementwise_exp2_dynamic._kernel_cache.clear()
+        _dispatch_map["sunmmio_sunsim"]._memory_cache.clear()
+        tilelang.env.TILELANG_CACHE_DIR = old_cache_dir
+        tilelang.env.TILELANG_TMP_DIR = old_tmp_dir
+        if was_cache_enabled:
+            tilelang.env.enable_cache()
+        else:
+            tilelang.env.disable_cache()
+
+
 def test_sunmmio_sunsim_dynamic_elementwise_add_jit_binds_shape_abi():
     _require_sunmmio_codegen()
 
@@ -380,6 +436,37 @@ def test_sunmmio_sunsim_dynamic_elementwise_add_jit_binds_shape_abi():
     assert "func.func @elem_add_kernel" in device_source
     assert "%arg3: i32" in device_source
     assert "%arg4: i32" in device_source
+
+
+def test_sunmmio_sunsim_dynamic_elementwise_exp2_jit_binds_shape_abi():
+    _require_sunmmio_codegen()
+
+    example = _load_sunmmio_dynamic_exp2_example()
+    prim_func = example.elementwise_exp2_dynamic.get_tir(
+        block_M=32,
+        block_N=32,
+        in_dtype=T.float32,
+        out_dtype=T.float32,
+    )
+    artifact = tilelang.lower(
+        prim_func,
+        target="sunmmio",
+        enable_host_codegen=False,
+        enable_device_compile=False,
+    )
+
+    host_source = artifact.host_mod.script()
+    device_source = artifact.kernel_source
+
+    assert example.elementwise_exp2_dynamic.execution_backend == "sunmmio_sunsim"
+    assert len(artifact.params) == 2
+    assert all(not param.is_scalar() for param in artifact.params)
+    assert 'with T.LetStmt(T.Cast("int32", elem_exp2_A_shape_1[0]), var=m)' in host_source
+    assert 'with T.LetStmt(T.Cast("int32", elem_exp2_A_shape_1[1]), var=n)' in host_source
+    assert 'T.call_extern("int32", "elem_exp2_kernel", A.data, B.data, m, n)' in host_source
+    assert "func.func @elem_exp2_kernel" in device_source
+    assert "%arg2: i32" in device_source
+    assert "%arg3: i32" in device_source
 
 
 def test_sunmmio_abi_extracts_dynamic_shape_bindings():
