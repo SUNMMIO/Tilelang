@@ -61,6 +61,9 @@ private:
       if (buffer_region.defined()) {
         reads_.push_back(buffer_region);
       }
+    } else if (op->op.same_as(builtin::tvm_access_ptr())) {
+      ICHECK(0)
+          << "tvm_access_ptr call is not supported in current implementation.";
     } else {
       ExprVisitor::VisitExpr_(op);
     }
