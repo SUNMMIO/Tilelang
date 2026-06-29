@@ -443,11 +443,7 @@ def test_tilelang_reduce_sunmmio_unaligned_cases_from_tir_dump(shape, reduce_axi
     assert checker.scope_root is not None, "Missing tile.domain root on lowered unaligned reduction"
     assert checker.has_in_tile_reduce == _expected_tiled_reduce(shape, reduce_axis)
 
-    roots = [
-        root
-        for root in _collect_tile_domain_roots(func)
-        if [int(x) for x in root.annotations["tile.domain"]] == list(shape)
-    ]
+    roots = [root for root in _collect_tile_domain_roots(func) if [int(x) for x in root.annotations["tile.domain"]] == list(shape)]
     assert len(roots) == 1
     root = roots[0]
     tile_size = [int(x) for x in root.annotations["tile.tile_size"]]
