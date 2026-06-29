@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
-from compile_pipeline import compile_test
+from testing.python.sunmmio.common.compile_pipeline import compile_test
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
@@ -18,7 +18,7 @@ NPUIR_OPT_ENV = "NPUIR_OPT"
 PRINT_ENV = "SUNMMIO_TEST_PRINT"
 # SUNMMIO_TEST_LOG_IR=1 writes kernel/TIR/MLIR snapshots for codegen tests.
 # SUNMMIO_TEST_LOG_DIR overrides the default log root:
-# testing/python/target/_debug/sunmmio_codegen_logs/<test_file>/
+# testing/python/sunmmio/codegen/_debug/<test_file>/
 LOG_IR_ENV = "SUNMMIO_TEST_LOG_IR"
 LOG_DIR_ENV = "SUNMMIO_TEST_LOG_DIR"
 BASE_EXPECTED_TOKENS = (
@@ -80,7 +80,7 @@ def print_sunmmio_codegen_debug(
 
 
 def _default_codegen_log_root() -> Path:
-    return Path(__file__).resolve().parent / "_debug" / "sunmmio_codegen_logs"
+    return Path(__file__).resolve().parents[1] / "codegen" / "_debug"
 
 
 def _current_test_file_stem() -> str:

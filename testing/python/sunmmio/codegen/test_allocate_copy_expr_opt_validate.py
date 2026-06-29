@@ -8,8 +8,8 @@ from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 from tilelang.utils.target import determine_target
 
-from compile_pipeline import target
-from sunmmio_codegen_validation_utils import (
+from testing.python.sunmmio.common.compile_pipeline import target
+from testing.python.sunmmio.common.codegen_validation import (
     assert_source_contains,
     validate_suvm_mlir_with_npuir_opt,
     validate_sunmmio_codegen_with_npuir_opt,

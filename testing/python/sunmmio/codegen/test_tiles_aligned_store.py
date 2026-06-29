@@ -2,7 +2,7 @@ from tilelang import tvm
 from tilelang.layout import make_aligned_row_major
 from tilelang.utils.target import determine_target
 
-from compile_pipeline import target
+from testing.python.sunmmio.common.compile_pipeline import target
 
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 

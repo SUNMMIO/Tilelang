@@ -1,11 +1,12 @@
 import os
 
+import pytest
 import tilelang.testing
 from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 
-from compile_pipeline import target
-from sunmmio_codegen_validation_utils import (
+from testing.python.sunmmio.common.compile_pipeline import target
+from testing.python.sunmmio.common.codegen_validation import (
     assert_source_contains,
     validate_suvm_mlir_with_npuir_opt,
     write_sunmmio_codegen_logs,
@@ -20,10 +21,10 @@ def _to_device_kernel_func(func):
     return func.with_attr("global_symbol", "main").with_attr("calling_conv", int(tvm.ir.CallingConv.DEVICE_KERNEL_LAUNCH))
 
 
-def _primfunc_from_stmt(stmt, params=None):
+def _primfunc_from_stmt(stmt, params=None, name="main"):
     if params is None:
         params = []
-    return _to_device_kernel_func(tvm.tir.PrimFunc(params, stmt))
+    return _to_device_kernel_func(tvm.tir.PrimFunc(params, stmt)).with_attr("global_symbol", name)
 
 
 def _build_sunmmio_source_from_stmt(stmt, params=None):
@@ -31,6 +32,12 @@ def _build_sunmmio_source_from_stmt(stmt, params=None):
     mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt, params=params)})
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
     return mod, builder(mod, target, "suvm").inspect_source()
+
+
+def _build_sunmmio_source_from_module(mod):
+    target = determine_target("Sunmmio", return_object=True)
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    return builder(mod, target, "suvm").inspect_source()
 
 
 def _validate_stmt_codegen(stmt, tmp_path, *, mlir_filename, expected_tokens=(), params=None):
@@ -162,6 +169,36 @@ def test_broadcast_dynamic_mask_codegen_validates_with_npuir_opt(tmp_path):
     assert "sunmmio.fake" not in src
 
 
+def test_broadcast_missing_dynamic_mask_fails_loudly():
+    src_data, dst_data, src_buf, dst_buf = _shared_buffers()
+    missing_mask = tvm.tir.Var("missing_mask", "int64")
+    body = tvm.tir.Evaluate(_broadcast(src_buf, dst_buf, mask=missing_mask, token_id=7))
+    stmt = _with_decl_buffers(body, [src_buf, dst_buf])
+
+    with pytest.raises(Exception, match="unbound TIR var.*missing_mask"):
+        _build_sunmmio_source_from_stmt(stmt, params=[src_data, dst_data])
+
+
+def test_broadcast_missing_scalar_binary_operand_fails_loudly():
+    src_data, dst_data, src_buf, dst_buf = _shared_buffers()
+    missing_lhs = tvm.tir.Var("missing_lhs", "int64")
+    mask = tvm.tir.bitwise_or(missing_lhs, tvm.tir.IntImm("int64", 1))
+    body = tvm.tir.Evaluate(_broadcast(src_buf, dst_buf, mask=mask, token_id=8))
+    stmt = _with_decl_buffers(body, [src_buf, dst_buf])
+
+    with pytest.raises(Exception, match="unbound TIR var.*missing_lhs"):
+        _build_sunmmio_source_from_stmt(stmt, params=[src_data, dst_data])
+
+
+def test_broadcast_missing_sync_token_fails_loudly():
+    src_data, dst_data, src_buf, dst_buf = _shared_buffers()
+    body = tvm.tir.Evaluate(_broadcast(src_buf, dst_buf))
+    stmt = _with_decl_buffers(body, [src_buf, dst_buf])
+
+    with pytest.raises(Exception, match="tl.broadcast_.*sync_token_id"):
+        _build_sunmmio_source_from_stmt(stmt, params=[src_data, dst_data])
+
+
 def test_broadcast_with_src_core_guards_mcast_codegen_validates_with_npuir_opt(tmp_path):
     stmt, params = _broadcast_stmt(src_core=tvm.tir.IntImm("int32", 0), token_id=2, wait=True)
     src = _validate_stmt_codegen(
@@ -205,6 +242,38 @@ def test_static_barrier_reuses_single_init_codegen_validates_with_npuir_opt(tmp_
     assert "suvm.barrier.init mask = 15 : !suvm.barrier" in src
     assert src.count("suvm.barrier.init") == 1
     assert src.count("suvm.barrier.arrive_and_wait") == 2
+
+
+def test_token_state_does_not_leak_between_functions():
+    token_id = 11
+    producer = _primfunc_from_stmt(
+        tvm.tir.Evaluate(_sync_null_token(token_id)),
+        name="a_producer",
+    )
+    consumer = _primfunc_from_stmt(
+        tvm.tir.Evaluate(_wait_token(token_id)),
+        name="z_consumer",
+    )
+    mod = tvm.IRModule({"a_producer": producer, "z_consumer": consumer})
+
+    with pytest.raises(Exception, match=f"tl.wait_token token_id={token_id} has no corresponding sync_token"):
+        _build_sunmmio_source_from_module(mod)
+
+
+def test_barrier_state_does_not_leak_between_functions():
+    mask = tvm.tir.IntImm("int64", 15)
+    initializer = _primfunc_from_stmt(
+        tvm.tir.Evaluate(tvm.tir.Call("handle", tvm.ir.Op.get("tl.barrier_init"), [mask])),
+        name="a_initializer",
+    )
+    waiter = _primfunc_from_stmt(
+        tvm.tir.Evaluate(tvm.tir.Call("handle", tvm.ir.Op.get("tl.barrier_arrive_and_wait"), [mask])),
+        name="z_waiter",
+    )
+    mod = tvm.IRModule({"a_initializer": initializer, "z_waiter": waiter})
+
+    with pytest.raises(Exception, match="has no corresponding tl.barrier_init"):
+        _build_sunmmio_source_from_module(mod)
 
 
 def test_dynamic_barrier_candidates_codegen_validates_with_npuir_opt(tmp_path):
@@ -266,8 +335,7 @@ def test_for_loop_carries_token_codegen_validates_with_npuir_opt(tmp_path):
 
 
 def test_if_token_merge_codegen_validates_with_npuir_opt(tmp_path):
-    i = tvm.tir.Var("i", "int32")
-    cond = tvm.tir.LT(i, tvm.tir.IntImm("int32", 1))
+    cond = tvm.tir.LT(tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 1))
     then_case = tvm.tir.Evaluate(_sync_null_token(4))
     else_case = tvm.tir.Evaluate(_sync_null_token(4))
     stmt = tvm.tir.SeqStmt(

@@ -8,8 +8,8 @@ from tilelang.layout import make_zz_layout
 from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 
-from compile_pipeline import target
-from sunmmio_codegen_validation_utils import print_sunmmio_codegen_debug
+from testing.python.sunmmio.common.compile_pipeline import target
+from testing.python.sunmmio.common.codegen_validation import print_sunmmio_codegen_debug
 
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
@@ -78,24 +78,36 @@ def make_alloc_scope_kernel():
     rsram = tvm.tir.Var("rsram_buf", tvm.ir.PointerType(f16, "shared.rsram"))
     wsram = tvm.tir.Var("wsram_buf", tvm.ir.PointerType(f16, "shared.wsram"))
     asram = tvm.tir.Var("asram_buf", tvm.ir.PointerType(f16, "shared.asram"))
+    rsram_buf = tvm.tir.decl_buffer((16, 16), "float16", name="Rsram", data=rsram, scope="shared.rsram")
+    wsram_buf = tvm.tir.decl_buffer((16, 16), "float16", name="Wsram", data=wsram, scope="shared.wsram")
+    asram_buf = tvm.tir.decl_buffer((16, 16), "float16", name="Asram", data=asram, scope="shared.asram")
 
     stmt = tvm.tir.Allocate(rsram, "float16", [16, 16], one, body)
     stmt = tvm.tir.Allocate(wsram, "float16", [16, 16], one, stmt)
     stmt = tvm.tir.Allocate(asram, "float16", [16, 16], one, stmt)
+    stmt = tvm.tir.DeclBuffer(rsram_buf, stmt)
+    stmt = tvm.tir.DeclBuffer(wsram_buf, stmt)
+    stmt = tvm.tir.DeclBuffer(asram_buf, stmt)
     return _primfunc_from_stmt(stmt)
 
 
 @target("Sunmmio")
-def make_intrinsic_sync_kernel():
+def make_allocate_without_decl_buffer_kernel():
     f16 = tvm.ir.PrimType("float16")
-    a_data = tvm.tir.Var("a_data", tvm.ir.PointerType(f16, "shared.asram"))
-    b_data = tvm.tir.Var("b_data", tvm.ir.PointerType(f16, "shared.wsram"))
-    c_data = tvm.tir.Var("c_data", tvm.ir.PointerType(f16, "shared.rsram"))
-    d_data = tvm.tir.Var("d_data", tvm.ir.PointerType(f16, "shared.rsram"))
-    a_buf = tvm.tir.decl_buffer((32, 32), "float16", name="A", data=a_data, scope="shared.asram")
-    b_buf = tvm.tir.decl_buffer((32, 32), "float16", name="B", data=b_data, scope="shared.wsram")
-    c_buf = tvm.tir.decl_buffer((32, 32), "float16", name="C", data=c_data, scope="shared.rsram")
-    d_buf = tvm.tir.decl_buffer((32, 32), "float16", name="D", data=d_data, scope="shared.rsram")
+    one = tvm.tir.IntImm("bool", 1)
+    body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
+    asram = tvm.tir.Var("asram_buf", tvm.ir.PointerType(f16, "shared.asram"))
+    stmt = tvm.tir.Allocate(asram, "float16", [16, 16], one, body)
+    return _primfunc_from_stmt(stmt)
+
+
+@target("Sunmmio")
+def make_invalid_dma_source_kernel():
+    f16 = tvm.ir.PrimType("float16")
+    src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(f16, "shared.asram"))
+    dst_data = tvm.tir.Var("dst_data", tvm.ir.PointerType(f16, "shared.rsram"))
+    src_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Src", data=src_data, scope="shared.asram")
+    dst_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Dst", data=dst_data, scope="shared.rsram")
 
     def region(buf, access):
         return tvm.tir.call_intrin(
@@ -110,70 +122,18 @@ def make_intrinsic_sync_kernel():
             tvm.tir.IntImm("int32", 32),
         )
 
-    def sync_token(token_id):
-        return tvm.tir.call_intrin(
-            "handle",
-            tvm.ir.Op.get("tl.sync_token_id"),
-            tvm.tir.IntImm("int32", token_id),
-        )
-
+    sync_token = tvm.tir.call_intrin(
+        "handle",
+        tvm.ir.Op.get("tl.sync_token_id"),
+        tvm.tir.IntImm("int32", 0),
+    )
     dma = tvm.tir.Call(
         "handle",
         tvm.ir.Op.get("tl.dma_copy"),
-        [region(a_buf, 1), region(c_buf, 2), tvm.tir.IntImm("int32", 0), sync_token(0)],
+        [region(src_buf, 1), region(dst_buf, 2), tvm.tir.IntImm("int32", 0), sync_token],
     )
-    mma = tvm.tir.Call(
-        "handle",
-        tvm.ir.Op.get("tl.mma_sunmmio"),
-        [
-            region(a_buf, 1),
-            region(b_buf, 1),
-            region(c_buf, 3),
-            tvm.tir.IntImm("bool", 0),
-            tvm.tir.IntImm("bool", 0),
-            tvm.tir.IntImm("bool", 0),
-            tvm.tir.IntImm("int32", 0),
-            sync_token(1),
-        ],
-    )
-    transform = tvm.tir.Call(
-        "handle",
-        tvm.ir.Op.get("tl.sunmmio_layout_transform"),
-        [region(c_buf, 1), region(d_buf, 2), sync_token(2)],
-    )
-    sync = tvm.tir.Call(
-        "handle",
-        tvm.ir.Op.get("tir.tvm_storage_sync"),
-        [tvm.tir.StringImm("shared")],
-    )
-    ramp = tvm.tir.Ramp(tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 1), 4)
-    bcast = tvm.tir.Broadcast(tvm.tir.FloatImm("float32", 1.25), 4)
-
-    i = tvm.tir.Var("i", "int32")
-    loop_body = tvm.tir.SeqStmt(
-        [
-            tvm.tir.Evaluate(dma),
-            tvm.tir.Evaluate(sync),
-            tvm.tir.Evaluate(mma),
-            tvm.tir.Evaluate(transform),
-            tvm.tir.Evaluate(ramp),
-            tvm.tir.Evaluate(bcast),
-        ]
-    )
-    pred = tvm.tir.LT(i, tvm.tir.IntImm("int32", 2))
-    if_stmt = tvm.tir.IfThenElse(pred, loop_body, tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0)))
-    stmt = tvm.tir.For(i, 0, 4, tvm.tir.ForKind.SERIAL, if_stmt)
-    stmt = tvm.tir.DeclBuffer(
-        a_buf,
-        tvm.tir.DeclBuffer(
-            b_buf,
-            tvm.tir.DeclBuffer(c_buf, tvm.tir.DeclBuffer(d_buf, stmt)),
-        ),
-    )
-    return _to_device_kernel_func(tvm.tir.PrimFunc([a_data, b_data, c_data, d_data], stmt)).with_attr(
-        "layout_map",
-        {c_buf: make_zz_layout(c_buf, axes=[0, 1], block_shape=(32, 32))},
-    )
+    stmt = tvm.tir.DeclBuffer(src_buf, tvm.tir.DeclBuffer(dst_buf, tvm.tir.Evaluate(dma)))
+    return _to_device_kernel_func(tvm.tir.PrimFunc([src_data, dst_data], stmt))
 
 
 @target("Sunmmio")
@@ -252,6 +212,11 @@ def make_dynamic_broadcast_mask_kernel():
             mask,
             tvm.tir.IntImm("int32", 0),
             bx,
+            tvm.tir.call_intrin(
+                "handle",
+                tvm.ir.Op.get("tl.sync_token_id"),
+                tvm.tir.IntImm("int32", 0),
+            ),
         ],
     )
     stmt = tvm.tir.For(
@@ -448,6 +413,14 @@ def test_sunmmio_codegen_lowers_layout_transform():
     assert "sunmmio.fake" not in src
 
 
+def test_sunmmio_codegen_module_verification_failure_fails_loudly():
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": make_invalid_dma_source_kernel()})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(Exception, match="SunMMIO MLIR module verification failed"):
+        builder(mod, target, "suvm")
+
+
 def test_sunmmio_codegen_shuffle_fails_loudly():
     shuffle = tvm.tir.Shuffle(
         [tvm.tir.Broadcast(tvm.tir.IntImm("int32", 7), 4)],
@@ -458,6 +431,64 @@ def test_sunmmio_codegen_shuffle_fails_loudly():
     mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt)})
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
     with pytest.raises(Exception, match="CodeGenTileLangSunMMIO unsupported expr: tir.Shuffle"):
+        builder(mod, target, "suvm")
+
+
+def test_sunmmio_codegen_ramp_fails_loudly():
+    ramp = tvm.tir.Ramp(
+        tvm.tir.IntImm("int32", 0),
+        tvm.tir.IntImm("int32", 1),
+        4,
+    )
+    stmt = tvm.tir.Evaluate(ramp)
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt)})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(Exception, match="Generic SunMMIO ramp expression lowering is unsupported"):
+        builder(mod, target, "suvm")
+
+
+def test_sunmmio_codegen_broadcast_fails_loudly():
+    broadcast = tvm.tir.Broadcast(tvm.tir.IntImm("int32", 7), 4)
+    stmt = tvm.tir.Evaluate(broadcast)
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt)})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(Exception, match="Generic SunMMIO broadcast expression lowering is unsupported"):
+        builder(mod, target, "suvm")
+
+
+def test_sunmmio_codegen_unsupported_call_fails_loudly():
+    call = tvm.tir.call_pure_extern(
+        "int32",
+        "unsupported_external_call",
+        tvm.tir.IntImm("int32", 1),
+    )
+    stmt = tvm.tir.Evaluate(call)
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt)})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(Exception, match="Unsupported SunMMIO call lowering.*tir.call_pure_extern"):
+        builder(mod, target, "suvm")
+
+
+def test_sunmmio_codegen_unsupported_dtype_fails_loudly():
+    fp8_var = tvm.tir.Var("fp8_value", tvm.DataType("float8_e4m3fn"))
+    func = _to_device_kernel_func(tvm.tir.PrimFunc([fp8_var], tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))))
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": func})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(Exception, match="Unsupported SunMMIO element dtype.*float8_e4m3fn"):
+        builder(mod, target, "suvm")
+
+
+def test_sunmmio_codegen_unbound_tir_var_fails_loudly():
+    missing = tvm.tir.Var("missing_runtime_var", "int32")
+    stmt = tvm.tir.Evaluate(tvm.tir.Add(missing, tvm.tir.IntImm("int32", 1)))
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt)})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(Exception, match="unbound TIR var.*missing_runtime_var"):
         builder(mod, target, "suvm")
 
 
@@ -523,12 +554,22 @@ def test_sunmmio_codegen_buffer_store_fails_loudly():
         builder(mod, target, "suvm")
 
 
+def test_sunmmio_codegen_allocate_without_decl_buffer_fails_loudly():
+    target = determine_target("Sunmmio", return_object=True)
+    mod = tvm.IRModule({"main": make_allocate_without_decl_buffer_kernel()})
+    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
+    with pytest.raises(
+        Exception,
+        match="SunMMIO SUVM allocate cannot find buffer for variable asram_buf",
+    ):
+        builder(mod, target, "suvm")
+
+
 @pytest.mark.parametrize(
     "kernel_name,kernel_factory",
     [
         ("scalar_control", make_scalar_control_kernel),
         ("alloc_scope", make_alloc_scope_kernel),
-        ("intrinsic_sync", make_intrinsic_sync_kernel),
         pytest.param(
             "real_tilelang_frontend",
             make_real_tilelang_frontend_kernel,

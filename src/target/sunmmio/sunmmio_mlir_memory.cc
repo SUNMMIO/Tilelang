@@ -61,32 +61,17 @@ SunMMIOValue SunmmioMlirMemory::Load(const std::string &result_name,
                                      const SunMMIOType &memref_type,
                                      DataType dtype,
                                      const SunMMIOType &result_type) {
-  (void)buffer_handle;
-  (void)indices;
-  (void)memref_type;
-  ICHECK(ctx_.module)
-      << "MLIR module must be initialized before lowering Sunmmio memory ops";
-  mlir::TypedAttr value_attr = ctx_.builder.getIntegerAttr(
-      mlir::Type::getFromOpaquePointer(
-          ctx_.builder.getF32Type().getAsOpaquePointer()),
-      0);
-  auto fake_op = mlir::arith::ConstantOp::create(
-      ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc("fake_load"),
-      value_attr);
-  fake_op->setAttr("sunmmio.fake", ctx_.builder.getStringAttr("load"));
-  mlir::Value load_value = fake_op.getResult();
-  ctx_.BindMLIRValue(result_name, load_value);
-  return SunMMIOValue{dtype, result_name, result_type};
+  LOG(FATAL) << "Generic SunMMIO memory load lowering is unsupported for `"
+             << buffer_handle << "` with " << indices.size() << " indices";
+  TVM_FFI_UNREACHABLE();
 }
 
 void SunmmioMlirMemory::Store(const SunMMIOValue &value,
                               const std::string &buffer_handle,
                               const std::vector<SunMMIOValue> &indices,
                               const SunMMIOType &memref_type) {
-  (void)value;
-  (void)buffer_handle;
-  (void)indices;
-  (void)memref_type;
+  LOG(FATAL) << "Generic SunMMIO memory store lowering is unsupported for `"
+             << buffer_handle << "` with " << indices.size() << " indices";
 }
 
 } // namespace codegen
