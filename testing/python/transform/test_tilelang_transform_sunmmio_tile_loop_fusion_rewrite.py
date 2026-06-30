@@ -611,6 +611,10 @@ def _semantic_leaf_tag(stmt):
             return "reduce_scores_max"
         if "row_sum_acc" in allocs:
             return "reduce_row_sum"
+        if "dst_buffer_acc" in allocs:
+            if "dst_buffer_res" in allocs:
+                return "reduce_row_sum"
+            return "reduce_scores_sum"
         raise AssertionError(f"Unknown reduction block alloc buffers: {sorted(allocs)}")
 
     reads, writes = _collect_buffer_accesses(stmt)
@@ -623,9 +627,20 @@ def _semantic_leaf_tag(stmt):
         return "scores_max_prev"
     if write_set == {"scores_max"}:
         return "scores_max"
+    if write_set == {"dst_buffer"}:
+        if not reads:
+            return "scores_max"
+        if "scores_max_prev" in reads:
+            return "scores_max"
+        if "src_buffer" in reads:
+            return "reduce_row_sum"
     if write_set == {"scores_scale"}:
         return "scores_scale"
     if write_set == {"acc_s"}:
+        return "acc_s"
+    if write_set == {"src_buffer"}:
+        if "a_shared" in reads:
+            return "a_square"
         return "acc_s"
     if write_set == {"acc_s_cast"}:
         return "acc_s_cast"
@@ -843,9 +858,9 @@ def test_sunmmio_tile_loop_fusion_rewrite_preserves_flash_reduction_local_scratc
     top_level_allocs = [buf.name for buf in top_level_reduce_block.alloc_buffers]
     fused_allocs = [buf.name for buf in fused_reduce.alloc_buffers]
 
-    assert top_level_allocs.count("scores_max_acc") == 1
-    assert top_level_allocs.count("scores_max_res") == 1
-    assert fused_allocs.count("scores_sum_acc") == 1
+    assert top_level_allocs.count("dst_buffer_acc") == 1
+    assert top_level_allocs.count("dst_buffer_res") == 1
+    assert fused_allocs.count("dst_buffer_acc") == 1
 
 
 def test_sunmmio_tile_loop_fusion_rewrite_hoists_common_attr_wrapper():

@@ -383,10 +383,11 @@ def test_reduce_blockwise_axis_gives_row_major():
     target = determine_target("Sunmmio", return_object=True)
     layouts = run_sunmmio_layout_inference(reduce_blockwise_kernel(), target)
 
-    # C_shared (RSRAM, 2D) has ZZ from Gemm; C_reduce (1D) becomes row-major
-    # because the reduced axis was a blocked dim.
-    assert_layout(layouts, "C_shared", "ZZ", block=(32, 32))
-    assert_layout(layouts, "C_reduce", "RowMajor")
+    # Reduce lowering materializes the reduced source/result as canonical
+    # src_buffer/dst_buffer entries. The source keeps C_shared's ZZ layout, and
+    # the result becomes row-major because the reduced axis was blocked.
+    assert_layout(layouts, "src_buffer", "ZZ", block=(32, 32))
+    assert_layout(layouts, "dst_buffer", "RowMajor")
 
 
 # ---------------------------------------------------------------------------
@@ -425,10 +426,10 @@ def test_reduce_outer_axis_preserves_zz():
     target = determine_target("Sunmmio", return_object=True)
     layouts = run_sunmmio_layout_inference(reduce_outer_kernel(), target)
 
-    # A_shared (3D) keeps its annotated ZZ on inner dims; reducing the outer
-    # axis preserves ZZ on the 2D B_shared.
-    assert_layout(layouts, "A_shared", "ZZ", block=(32, 32))
-    assert_layout(layouts, "B_shared", "ZZ", block=(32, 32))
+    # Reduce lowering rewrites the source/result to canonical buffer names.
+    # Reducing the outer axis preserves ZZ on the 2D result.
+    assert_layout(layouts, "src_buffer", "ZZ", block=(32, 32))
+    assert_layout(layouts, "dst_buffer", "ZZ", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -466,8 +467,8 @@ def test_reduce_3d_zz_blocked_axis_gives_row_major():
     target = determine_target("Sunmmio", return_object=True)
     layouts = run_sunmmio_layout_inference(reduce_3d_zz_blocked_axis_kernel(), target)
 
-    # Reducing a blocked axis destroys the block structure → row-major.
-    assert_layout(layouts, "B_shared", "RowMajor")
+    # Reducing a blocked axis destroys the block structure.
+    assert_layout(layouts, "dst_buffer", "RowMajor")
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +507,7 @@ def test_reduce_3d_zn_outer_axis_preserves_zn():
     layouts = run_sunmmio_layout_inference(reduce_3d_zn_outer_axis_kernel(), target)
 
     # Reducing the outer axis of a 3D ZN preserves ZN on the 2D result.
-    assert_layout(layouts, "B_shared", "ZN", block=(32, 32))
+    assert_layout(layouts, "dst_buffer", "ZN", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +548,7 @@ def test_reduce_3d_row_major_outer_axis_preserves_row_major():
     layouts = run_sunmmio_layout_inference(reduce_3d_row_major_outer_axis_kernel(), target)
 
     # Row-major in, row-major out (outer-axis reduce).
-    assert_layout(layouts, "B_shared", "RowMajor")
+    assert_layout(layouts, "dst_buffer", "RowMajor")
 
 
 # ---------------------------------------------------------------------------
@@ -585,8 +586,8 @@ def test_reduce_4d_zz_outer_axis_preserves_zz():
     target = determine_target("Sunmmio", return_object=True)
     layouts = run_sunmmio_layout_inference(reduce_4d_zz_outer_axis_kernel(), target)
 
-    # 4D ZZ, reduce outer axis → 3D with ZZ preserved on the inner two dims.
-    assert_layout(layouts, "B_shared", "ZZ", block=(32, 32))
+    # 4D ZZ, reduce outer axis: 3D with ZZ preserved on the inner two dims.
+    assert_layout(layouts, "dst_buffer", "ZZ", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -1177,11 +1178,11 @@ def test_copy_reduce_copy_layout_derivation():
     target = determine_target("Sunmmio", return_object=True)
     layouts = run_sunmmio_layout_inference(copy_reduce_copy_kernel(), target)
 
-    # A_shared: 2D RSRAM ZZ(32,32) from the Phase 3 default.
-    assert_layout(layouts, "A_shared", "ZZ", block=(32, 32))
-    # B_shared: Reduce(dim=1) over a blocked ZZ dim → row-major, derived at
-    # kCommon (Phase 5 BFS) overriding the kFree default.
-    assert_layout(layouts, "B_shared", "RowMajor")
+    # Reduce lowering materializes canonical src_buffer/dst_buffer entries.
+    # src_buffer keeps the Phase 3 default ZZ(32,32), and dst_buffer is derived
+    # as row-major from reducing a blocked ZZ dim.
+    assert_layout(layouts, "src_buffer", "ZZ", block=(32, 32))
+    assert_layout(layouts, "dst_buffer", "RowMajor")
 
 
 # ---------------------------------------------------------------------------

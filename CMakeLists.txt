@@ -89,11 +89,12 @@ else()
 endif()
 
 # Configs
-set(TILELANG_BACKENDS CUDA ROCM METAL)
+set(TILELANG_BACKENDS CUDA ROCM METAL SUNMMIO)
 
 set(TILELANG_BACKEND_DOC_CUDA "Enable CUDA backend (ON/OFF/or CUDA SDK path)")
 set(TILELANG_BACKEND_DOC_ROCM "Enable ROCm backend (ON/OFF/or ROCm SDK path)")
 set(TILELANG_BACKEND_DOC_METAL "Enable Metal backend")
+set(TILELANG_BACKEND_DOC_SUNMMIO "Enable Sunmmio backend and embedded NPU-IR integration")
 
 # TVM's config.cmake redefines USE_* options later, so we cache the user's choice
 # (including explicit -DUSE_XXX arguments) before we include TVM and restore it
@@ -133,6 +134,16 @@ foreach(BACKEND IN LISTS TILELANG_BACKENDS)
   tilelang_define_backend_option(${BACKEND})
 endforeach()
 
+if(NOT TILELANG_USER_OVERRIDE_USE_SUNMMIO)
+  if($ENV{USE_SUNMMIO})
+    set(USE_SUNMMIO ON)
+    set(TILELANG_OPTION_USE_SUNMMIO ON)
+  elseif(DEFINED ENV{USE_SUNMMIO} AND NOT $ENV{USE_SUNMMIO})
+    set(USE_SUNMMIO OFF)
+    set(TILELANG_OPTION_USE_SUNMMIO OFF)
+  endif()
+endif()
+
 set(PREBUILD_CYTHON ON)
 
 # CUDA stub libraries (cuda/cudart/nvrtc) are used to build wheels that can run
@@ -153,11 +164,10 @@ unset(_TILELANG_USE_CUDA_STUBS_DEFAULT)
 
 include(cmake/load_tvm.cmake)
 
-# --- NPU-IR Integration ---
-option(USE_NPUIR "Use NPU-IR for Sunmmio backend" ON)
-if(USE_NPUIR)
+# --- Sunmmio / NPU-IR Integration ---
+if(USE_SUNMMIO)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/NPU-IR/CMakeLists.txt")
-    message(STATUS "NPU-IR integration enabled.")
+    message(STATUS "Sunmmio backend enabled with embedded NPU-IR integration.")
 
     set(
       TILELANG_NPUIR_BINARY_DIR
@@ -241,7 +251,7 @@ if(USE_NPUIR)
     list(APPEND TILE_LANG_INCLUDES ${MLIR_INCLUDE_DIRS})
     list(APPEND TILE_LANG_INCLUDES ${LLVM_INCLUDE_DIRS})
   else()
-    message(WARNING "NPU-IR enabled but 3rdparty/NPU-IR/CMakeLists.txt not found.")
+    message(FATAL_ERROR "USE_SUNMMIO=ON requires 3rdparty/NPU-IR. Please initialize submodules or provide an NPU-IR SDK.")
   endif()
 endif()
 
@@ -284,7 +294,7 @@ file(GLOB TILE_LANG_SRCS
   src/target/intrin_rule*.cc
 )
 
-if(USE_NPUIR)
+if(USE_SUNMMIO)
   file(GLOB TILE_LANG_SUNMMIO_SRCS
     src/target/sunmmio/codegen_sunmmio.cc
     src/target/sunmmio/sunmmio_codegen_tiles_loop.cc
@@ -515,6 +525,18 @@ endif()
 add_library(tilelang SHARED $<TARGET_OBJECTS:tilelang_objs>)
 target_link_libraries(tilelang PUBLIC tvm)
 
+set(TILELANG_NPUIR_TOOL_TARGETS)
+if(USE_SUNMMIO)
+  foreach(_tilelang_npuir_tool IN ITEMS npuir-opt npuir-translate)
+    if(NOT TARGET ${_tilelang_npuir_tool})
+      message(FATAL_ERROR "USE_SUNMMIO=ON requires NPU-IR target `${_tilelang_npuir_tool}`.")
+    endif()
+    add_dependencies(tilelang ${_tilelang_npuir_tool})
+    list(APPEND TILELANG_NPUIR_TOOL_TARGETS ${_tilelang_npuir_tool})
+  endforeach()
+  unset(_tilelang_npuir_tool)
+endif()
+
 if(TARGET MLIRIR)
   target_link_libraries(tilelang PRIVATE
     MLIRIR
@@ -665,6 +687,15 @@ install(
   RUNTIME DESTINATION tilelang/lib
   ARCHIVE DESTINATION tilelang/lib
 )
+
+if(TILELANG_NPUIR_TOOL_TARGETS)
+  install(
+    TARGETS ${TILELANG_NPUIR_TOOL_TARGETS}
+    RUNTIME DESTINATION tilelang/bin
+    LIBRARY DESTINATION tilelang/lib
+    ARCHIVE DESTINATION tilelang/lib
+  )
+endif()
 
 if(TILELANG_BUILD_CPP_TESTS)
   include(CTest)

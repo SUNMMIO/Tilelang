@@ -10,7 +10,10 @@ def ref_program(x, y):
     return x.astype("float32") + y.astype("float32")
 
 
-def _elementwise_add_prim_func(M, N, block_M, block_N, in_dtype, out_dtype):
+def _elementwise_add_prim_func(block_M, block_N, in_dtype, out_dtype):
+    M = T.dynamic("m")
+    N = T.dynamic("n")
+
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
     ncores = nrows * ncols
@@ -43,8 +46,8 @@ def _elementwise_add_prim_func(M, N, block_M, block_N, in_dtype, out_dtype):
 
 
 @tilelang.jit(target="sunmmio", execution_backend="sunmmio_sunsim")
-def elementwise_add(M, N, block_M, block_N, in_dtype, out_dtype):
-    return _elementwise_add_prim_func(M, N, block_M, block_N, in_dtype, out_dtype)
+def elementwise_add_dynamic(block_M, block_N, in_dtype, out_dtype):
+    return _elementwise_add_prim_func(block_M, block_N, in_dtype, out_dtype)
 
 
 def main(M=1024, N=1024):
@@ -56,9 +59,7 @@ def main(M=1024, N=1024):
     a = rng.standard_normal((M, N)).astype(np.float32).astype(ml_dtypes.bfloat16)
     b = rng.standard_normal((M, N)).astype(np.float32).astype(ml_dtypes.bfloat16)
 
-    kernel = elementwise_add(
-        M,
-        N,
+    kernel = elementwise_add_dynamic(
         block_M=32,
         block_N=32,
         in_dtype=T.bfloat16,

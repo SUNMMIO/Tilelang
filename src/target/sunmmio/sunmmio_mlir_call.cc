@@ -56,11 +56,13 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
 
   mlir::SmallVector<mlir::Value, 4> indices;
   indices.reserve(mins.size());
-  for (const auto &min : mins) {
+  for (int64_t i = 0; i < static_cast<int64_t>(mins.size()); ++i) {
+    const auto &min = mins[i];
     mlir::Value index = ctx_.LookupMLIRValue(min.value);
     ICHECK(index) << "Missing MLIR min value in tl.tileop.region for `"
                   << min.value << "`";
-    indices.push_back(type.EnsureIndex(index));
+    index = type.EnsureIndex(index);
+    indices.push_back(index);
   }
 
   mlir::SmallVector<int64_t, 4> shape;
@@ -188,10 +190,10 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
       return;
     }
     bool recorded = false;
-    for (auto nit = ctx_.control_flow_stack.rbegin();
-         nit != ctx_.control_flow_stack.rend(); ++nit) {
-      if (nit->kind == SunmmioMlirContext::ControlKind::kFor) {
-        SunmmioMlirContext::ForFrame &frame = ctx_.for_stack[nit->index];
+    if (!ctx_.control_flow_stack.empty()) {
+      SunmmioMlirContext::ControlNode &node = ctx_.control_flow_stack.back();
+      if (node.kind == SunmmioMlirContext::ControlKind::kFor) {
+        SunmmioMlirContext::ForFrame &frame = ctx_.for_stack[node.index];
         auto tit = frame.token_id_to_index.find(token_id);
         if (tit != frame.token_id_to_index.end()) {
           int idx = tit->second;
@@ -200,10 +202,9 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
             frame.produced_tokens[idx] = produced;
           }
           recorded = true;
-          break;
         }
-      } else if (nit->kind == SunmmioMlirContext::ControlKind::kIf) {
-        SunmmioMlirContext::IfFrame &frame = ctx_.if_stack[nit->index];
+      } else if (node.kind == SunmmioMlirContext::ControlKind::kIf) {
+        SunmmioMlirContext::IfFrame &frame = ctx_.if_stack[node.index];
         auto tit = frame.token_id_to_index.find(token_id);
         if (tit != frame.token_id_to_index.end()) {
           int idx = tit->second;
@@ -212,10 +213,9 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
             frame.produced_tokens[idx] = produced;
           }
           recorded = true;
-          break;
         }
       } else {
-        SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack[nit->index];
+        SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack[node.index];
         auto tit = frame.token_id_to_index.find(token_id);
         if (tit != frame.token_id_to_index.end()) {
           int idx = tit->second;
@@ -224,7 +224,6 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
             frame.produced_tokens[idx] = produced;
           }
           recorded = true;
-          break;
         }
       }
     }
@@ -270,13 +269,15 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     }
     mlir::IntegerAttr mask_attr = ctx_.builder.getI64IntegerAttr(mask);
     auto barrier_op = mlir::suvm::BarrierInitOp::create(
-        ctx_.builder, type.MakeDebugLoc("barrier_init"), mask_attr);
+        ctx_.builder, type.MakeDebugLoc("barrier_init"), mlir::Value{},
+        mask_attr);
     ctx_.barrier_by_mask[mask] = barrier_op.getBarrier();
     return barrier_op.getBarrier();
   };
   auto emit_barrier_arrive_and_wait = [&](mlir::Value barrier) {
     (void)mlir::suvm::BarrierArriveAndWaitOp::create(
-        ctx_.builder, type.MakeDebugLoc("barrier_arrive_and_wait"), barrier);
+        ctx_.builder, type.MakeDebugLoc("barrier_arrive_and_wait"), barrier,
+        mlir::IntegerAttr{});
   };
   auto emit_dynamic_barrier_wait = [&](mlir::Value dynamic_mask,
                                        const std::vector<int64_t> &candidates) {
@@ -344,8 +345,12 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
       TVM_FFI_UNREACHABLE();
     }
     mlir::Value tok;
+    auto current_it = ctx_.token_by_id.find(token_id);
+    if (current_it != ctx_.token_by_id.end()) {
+      tok = current_it->second;
+    }
     for (auto nit = ctx_.control_flow_stack.rbegin();
-         nit != ctx_.control_flow_stack.rend(); ++nit) {
+         !tok && nit != ctx_.control_flow_stack.rend(); ++nit) {
       if (nit->kind == SunmmioMlirContext::ControlKind::kFor) {
         SunmmioMlirContext::ForFrame &frame = ctx_.for_stack[nit->index];
         auto tit = frame.token_id_to_index.find(token_id);

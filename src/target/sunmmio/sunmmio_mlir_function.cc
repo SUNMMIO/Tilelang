@@ -170,6 +170,24 @@ void SunmmioMlirFunction::BeginFor(
     ctx_.BindMLIRValue(active_frame.live_out_value_names[i],
                        active_frame.iter_tokens[value_idx]);
   }
+  for (int i = 0, e = static_cast<int>(active_frame.live_out_token_ids.size());
+       i < e; ++i) {
+    int64_t token_id = active_frame.live_out_token_ids[i];
+    if (token_id < 0) {
+      continue;
+    }
+    if (active_frame.saved_token_by_id.find(token_id) ==
+        active_frame.saved_token_by_id.end()) {
+      SunmmioMlirContext::SavedToken saved;
+      auto it = ctx_.token_by_id.find(token_id);
+      if (it != ctx_.token_by_id.end()) {
+        saved.existed = true;
+        saved.value = it->second;
+      }
+      active_frame.saved_token_by_id[token_id] = saved;
+    }
+    ctx_.token_by_id[token_id] = active_frame.iter_tokens[i];
+  }
   ctx_.builder.setInsertionPointToStart(for_op.getBody());
 }
 

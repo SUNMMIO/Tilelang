@@ -538,7 +538,7 @@ CASES = [
         lambda: flashattn(num_stages=3),
         {
             "K_shared": [3, 64, 128],
-            "acc_s": [3, 64, 64],
+            "src_buffer": [3, 64, 64],
             "acc_s_cast": [3, 64, 64],
             "V_shared": [3, 64, 128],
         },
@@ -549,7 +549,7 @@ CASES = [
         {
             "K_shared": [3, 128, 128],
             "mask_local": [3, 128],
-            "acc_s": [3, 64, 128],
+            "src_buffer": [3, 64, 128],
             "acc_s_cast": [3, 64, 128],
             "V_shared": [3, 128, 128],
         },
