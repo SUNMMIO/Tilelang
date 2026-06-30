@@ -46,6 +46,53 @@ def _layout_map(mod):
     return result
 
 
+def _layout_logical_shape(layout):
+    return tuple(int(x) for x in layout.logical_shape)
+
+
+def _compute_layouts_for_shape(layouts, shape):
+    """Return layouts for non-staging RSRAM compute buffers with this logical shape.
+
+    LegalizeSunmmioDataPath rewrites user buffers such as Out_shared into
+    compact compute buffers such as dst_buffer, plus row-major layout_stage
+    buffers on the DRAM boundary.  These tests care about the compute layout,
+    so skip the staging aliases.
+    """
+    target_shape = tuple(shape)
+    return [
+        (name, layout) for name, layout in layouts.items() if "layout_stage" not in name and _layout_logical_shape(layout) == target_shape
+    ]
+
+
+def _assert_compute_layout(layouts, shape, expected_layout):
+    candidates = _compute_layouts_for_shape(layouts, shape)
+    assert candidates, f"Missing compute layout for shape {shape}; layouts={list(layouts)}"
+    assert any(is_same_layout(layout, expected_layout) for _, layout in candidates), (
+        f"No compute layout for shape {shape} matches expected {expected_layout}; "
+        f"candidates={[(name, layout) for name, layout in candidates]}"
+    )
+
+
+def _assert_no_compute_layout(layouts, shape, unexpected_layout):
+    candidates = _compute_layouts_for_shape(layouts, shape)
+    assert candidates, f"Missing compute layout for shape {shape}; layouts={list(layouts)}"
+    assert not any(is_same_layout(layout, unexpected_layout) for _, layout in candidates), (
+        f"Unexpected compute layout for shape {shape}: {unexpected_layout}; candidates={[(name, layout) for name, layout in candidates]}"
+    )
+
+
+def _collect_alloc_buffer_names(func):
+    names = []
+
+    def visit(node):
+        if isinstance(node, Block):
+            for buf in node.alloc_buffers:
+                names.append(buf.name)
+
+    post_order_visit(func.body, visit)
+    return names
+
+
 @tvm.tir.functor.visitor
 class ReduceIRChecker(tvm.tir.PyStmtExprVisitor):
     def __init__(self, target_buffer_name="Out_shared"):
@@ -278,17 +325,25 @@ def _tile_domain(loop):
 
 
 def _collect_execution_loop_extents(root):
+    """Collect execution loops under one tile.domain, ignoring nested domains."""
     execution_extents = []
 
     @tvm.tir.functor.visitor
     class ExecutionLoopVisitor(tvm.tir.PyStmtExprVisitor):
+        def __init__(self):
+            super().__init__()
+            self.depth = 0
+
         def visit_for_(self, op):
-            if not op.same_as(root) and op.annotations and "tile.domain" in op.annotations:
+            ann = op.annotations
+            if self.depth > 0 and ann and "tile.domain" in ann:
                 return
-            if op.annotations and "tile.execution_axis" in op.annotations:
-                axis = int(op.annotations["tile.execution_axis"])
+            if ann and "tile.execution_axis" in ann:
+                axis = int(ann["tile.execution_axis"])
                 execution_extents.append((axis, int(op.extent)))
+            self.depth += 1
             super().visit_for_(op)
+            self.depth -= 1
 
     ExecutionLoopVisitor().visit_stmt(root)
     return execution_extents
@@ -531,7 +586,8 @@ def test_tilelang_reduce_sunmmio_unaligned_cases_from_tir_dump(shape, reduce_axi
         assert not a_load_predicates
 
     if is_reduce_axis_tiled:
-        assert ("dst_buffer_res" in script) == (not clear)
+        has_reduce_result_buffer = any(name.endswith("_res") for name in _collect_alloc_buffer_names(func))
+        assert has_reduce_result_buffer == (not clear)
 
 
 @pytest.mark.parametrize("reduce_op", ["sum", "max", "min"])
@@ -586,9 +642,8 @@ def test_tilelang_reduce_sunmmio_blocked_axis_yields_aligned_rowmajor():
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
 
-    out = _get_lowered_reduce_dst_layout(layouts)
-    assert is_same_layout(out, make_aligned_row_major((40,), "float16", 64))
-    assert not is_same_layout(out, make_row_major((40,)))
+    _assert_compute_layout(layouts, (40,), make_aligned_row_major((40,), "float16", 64))
+    _assert_no_compute_layout(layouts, (40,), make_row_major((40,)))
 
 
 def test_tilelang_reduce_sunmmio_3d_blocked_axis_aligned():
@@ -608,7 +663,7 @@ def test_tilelang_reduce_sunmmio_3d_blocked_axis_aligned():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    assert is_same_layout(_get_lowered_reduce_dst_layout(layouts), make_aligned_row_major((2, 40), "float16", 64))
+    _assert_compute_layout(layouts, (2, 40), make_aligned_row_major((2, 40), "float16", 64))
 
 
 def test_tilelang_reduce_sunmmio_chained_reduce_stays_aligned():
@@ -631,10 +686,9 @@ def test_tilelang_reduce_sunmmio_chained_reduce_stays_aligned():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    assert any(is_same_layout(layout, make_aligned_row_major((8, 40), "float16", 64)) for layout in layouts.values())
-    out = _get_lowered_reduce_dst_layout(layouts)
-    assert is_same_layout(out, make_aligned_row_major((40,), "float16", 64))
-    assert not is_same_layout(out, make_row_major((40,)))
+    _assert_compute_layout(layouts, (8, 40), make_aligned_row_major((8, 40), "float16", 64))
+    _assert_compute_layout(layouts, (40,), make_aligned_row_major((40,), "float16", 64))
+    _assert_no_compute_layout(layouts, (40,), make_row_major((40,)))
 
 
 def test_tilelang_reduce_sunmmio_nonblocked_reduce_preserves_zz():
@@ -654,9 +708,8 @@ def test_tilelang_reduce_sunmmio_nonblocked_reduce_preserves_zz():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    out = _get_lowered_reduce_dst_layout(layouts)
-    assert is_same_layout(out, make_zz_layout((64, 64), [0, 1], (32, 32)))
-    assert not is_same_layout(out, make_row_major((64, 64)))
+    _assert_compute_layout(layouts, (64, 64), make_zz_layout((64, 64), [0, 1], (32, 32)))
+    _assert_no_compute_layout(layouts, (64, 64), make_row_major((64, 64)))
 
 
 def test_tilelang_reduce_sunmmio_aligned_dst_is_noop_when_32_multiple():
@@ -676,7 +729,7 @@ def test_tilelang_reduce_sunmmio_aligned_dst_is_noop_when_32_multiple():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    assert is_same_layout(_get_lowered_reduce_dst_layout(layouts), make_row_major((64,)))
+    _assert_compute_layout(layouts, (64,), make_row_major((64,)))
 
 
 def test_tilelang_reduce_sunmmio_aligned_output_lowers_end_to_end():
@@ -700,7 +753,7 @@ def test_tilelang_reduce_sunmmio_aligned_output_lowers_end_to_end():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    assert is_same_layout(_get_lowered_reduce_dst_layout(layouts), make_aligned_row_major((40,), "float16", 64))
+    _assert_compute_layout(layouts, (40,), make_aligned_row_major((40,), "float16", 64))
 
     names = []
     post_order_visit(
