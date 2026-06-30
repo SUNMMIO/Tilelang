@@ -1772,12 +1772,15 @@ CodeGenTileLangSunMMIO::EmitRegionCall(const tvm::PrimExpr &region_expr,
   std::vector<int64_t> extents;
   mins.reserve(region->region.size());
   extents.reserve(region->region.size());
+  arith::Analyzer analyzer;
   for (const Range &range : region->region) {
-    mins.push_back(EvalExpr(range->min));
     const auto *extent_imm = range->extent.as<IntImmNode>();
     ICHECK(extent_imm) << "tl.tileop.region extent must be IntImm";
     MarkVisitedNodeType(range->extent->GetTypeKey());
     extents.push_back(static_cast<int64_t>(extent_imm->value));
+    PrimExpr min = floordiv(range->min, range->extent);
+    min = analyzer.Simplify(min);
+    mins.push_back(EvalExpr(min));
   }
   SunMMIOType ret_ty = MapType(region_expr.dtype());
   std::string result_name = region_expr.dtype().is_void() ? "" : NewValueName();

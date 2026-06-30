@@ -62,12 +62,6 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
     ICHECK(index) << "Missing MLIR min value in tl.tileop.region for `"
                   << min.value << "`";
     index = type.EnsureIndex(index);
-    if (i < static_cast<int64_t>(extents.size()) && extents[i] != 1) {
-      mlir::Value tile_extent = mlir::arith::ConstantIndexOp::create(
-          ctx_.builder, type.MakeDebugLoc("region"), extents[i]);
-      index = mlir::arith::DivSIOp::create(
-          ctx_.builder, type.MakeDebugLoc("region"), index, tile_extent);
-    }
     indices.push_back(index);
   }
 
