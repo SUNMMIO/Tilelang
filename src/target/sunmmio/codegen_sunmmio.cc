@@ -601,6 +601,11 @@ void CodeGenTileLangSunMMIO::RegisterBuffer(const tir::Buffer &buffer,
   binding.scope = buffer.scope();
   binding.buffer_type = MapBufferType(buffer);
   binding.is_external = is_external;
+  if (IsSunmmioReduceRegisterTempBuffer(buffer)) {
+    buffer_registry_[buffer.get()] = std::move(binding);
+    scoped_buffers_.push_back(buffer.get());
+    return;
+  }
   if (!handle_hint.empty()) {
     binding.handle = handle_hint;
     auto storage_it = var_table_.find(buffer->data.get());
