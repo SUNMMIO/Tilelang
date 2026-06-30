@@ -105,6 +105,17 @@ struct TailMaskInfo {
   SunMMIOType mask_type;
 };
 
+std::optional<int> GetExecutionAxisAnnotation(const ForNode *loop) {
+  if (loop == nullptr) {
+    return std::nullopt;
+  }
+  auto axis_it = loop->annotations.find(tl::attr::tile_execution_axis);
+  if (axis_it == loop->annotations.end()) {
+    return std::nullopt;
+  }
+  return static_cast<int>(Downcast<Integer>((*axis_it).second)->value);
+}
+
 std::vector<int64_t>
 ParseStaticIntArray(const ffi::Map<ffi::String, ffi::Any> &annotations,
                     const char *key) {
@@ -708,14 +719,12 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
 
     arith::Analyzer analyzer;
     std::vector<int> logical_tile_axes(indices.size(), -1);
+    std::vector<int64_t> logical_tile_shapes(indices.size(), -1);
     std::vector<PrimExpr> logical_partition_indices(indices.size());
     for (int dim = 0; dim < static_cast<int>(indices.size()); ++dim) {
-      for (int axis = 0; axis < static_cast<int>(scope.execution_loops.size());
+      for (int axis = 0; axis < static_cast<int>(scope.tile_shape.size());
            ++axis) {
         const ForNode *exec_loop = scope.execution_loops[axis];
-        if (exec_loop == nullptr) {
-          continue;
-        }
 
         std::vector<const ForNode *> candidate_interior_loops;
         auto push_candidate = [&](const ForNode *loop) {
@@ -739,18 +748,37 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
             axis == 0 ? state->interior_axis0_loop : state->interior_axis1_loop;
         if (primary_loop != nullptr) {
           auto extent = GetStaticLoopExtent(primary_loop);
-          if (!extent) {
+          if (!extent ||
+              (exec_loop == nullptr && *extent != scope.tile_shape[axis])) {
             push_candidate(primary_loop);
           }
         }
 
         for (const ForNode *interior_loop : candidate_interior_loops) {
-          auto match =
-              MatchTiledIndex(indices[dim], exec_loop->loop_var,
-                              interior_loop->loop_var, scope.tile_shape[axis],
-                              /*allow_standalone_interior=*/true, &analyzer);
+          std::optional<TiledIndexMatch> match;
+          int64_t matched_tile_extent = scope.tile_shape[axis];
+          std::optional<int64_t> interior_extent =
+              GetStaticLoopExtent(interior_loop);
+          bool is_full_scope_axis =
+              !interior_extent.has_value() ||
+              interior_extent.value() == scope.tile_shape[axis];
+          if (exec_loop == nullptr && !is_full_scope_axis &&
+              indices[dim].same_as(interior_loop->loop_var)) {
+            matched_tile_extent = interior_extent.value();
+            match = TiledIndexMatch{0, false,
+                                    PrimExpr(IntImm(indices[dim].dtype(), 0))};
+          } else if (exec_loop != nullptr) {
+            match =
+                MatchTiledIndex(indices[dim], exec_loop->loop_var,
+                                interior_loop->loop_var, scope.tile_shape[axis],
+                                /*allow_standalone_interior=*/true, &analyzer);
+          } else if (indices[dim].same_as(interior_loop->loop_var)) {
+            match = TiledIndexMatch{0, false,
+                                    PrimExpr(IntImm(indices[dim].dtype(), 0))};
+          }
           if (match) {
             logical_tile_axes[dim] = axis;
+            logical_tile_shapes[dim] = matched_tile_extent;
             logical_partition_indices[dim] = match->partition_index;
             break;
           }
@@ -766,7 +794,9 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           logical_tile_axes[dim] >= 0) {
         int axis = logical_tile_axes[dim];
         access.tiled_dims.push_back(dim);
-        access.tile_shape.push_back(scope.tile_shape[axis]);
+        access.tile_shape.push_back(logical_tile_shapes[dim] > 0
+                                        ? logical_tile_shapes[dim]
+                                        : scope.tile_shape[axis]);
         access.tile_axes.push_back(axis);
         access.partition_indices.push_back(
             EvalExpr(logical_partition_indices[dim]));
@@ -1534,6 +1564,18 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         DataType::Int(32));
   };
 
+  auto sub_index = [&](const SunMMIOValue &lhs, const SunMMIOValue &rhs) {
+    auto lhs_cst = get_const_index_value(lhs);
+    auto rhs_cst = get_const_index_value(rhs);
+    if (lhs_cst.has_value() && rhs_cst.has_value()) {
+      return make_index_const(*lhs_cst - *rhs_cst);
+    }
+    return builder_->Binary(
+        NewValueName(), BinaryOp::kSub, ArithmeticFlavor::kIndex, lhs, rhs,
+        SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
+        DataType::Int(32));
+  };
+
   auto mul_index = [&](const SunMMIOValue &lhs, const SunMMIOValue &rhs) {
     auto lhs_cst = get_const_index_value(lhs);
     auto rhs_cst = get_const_index_value(rhs);
@@ -1542,6 +1584,18 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     }
     return builder_->Binary(
         NewValueName(), BinaryOp::kMul, ArithmeticFlavor::kIndex, lhs, rhs,
+        SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
+        DataType::Int(32));
+  };
+
+  auto min_index = [&](const SunMMIOValue &lhs, const SunMMIOValue &rhs) {
+    auto lhs_cst = get_const_index_value(lhs);
+    auto rhs_cst = get_const_index_value(rhs);
+    if (lhs_cst.has_value() && rhs_cst.has_value()) {
+      return make_index_const(std::min(*lhs_cst, *rhs_cst));
+    }
+    return builder_->Binary(
+        NewValueName(), BinaryOp::kMin, ArithmeticFlavor::kIndex, lhs, rhs,
         SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
         DataType::Int(32));
   };
@@ -2052,9 +2106,49 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       return false;
     }
 
+    auto normalize_exec_var = [&](const PrimExpr &expr) {
+      std::vector<const VarNode *> vars;
+      tir::PostOrderVisit(expr, [&](const ObjectRef &obj) {
+        const auto *var = obj.as<VarNode>();
+        if (var == nullptr || var == exec_loop->loop_var.get() ||
+            var == interior_loop->loop_var.get()) {
+          return;
+        }
+        if (std::find(vars.begin(), vars.end(), var) == vars.end()) {
+          vars.push_back(var);
+        }
+      });
+      if (vars.size() != 1) {
+        return expr;
+      }
+      PrimExpr candidate = tir::Substitute(
+          expr, {{ffi::GetRef<Var>(vars[0]), exec_loop->loop_var}});
+      arith::Analyzer check_analyzer;
+      Array<Var> check_vars{exec_loop->loop_var, interior_loop->loop_var};
+      Array<PrimExpr> check_coeffs =
+          arith::DetectLinearEquation(candidate, check_vars);
+      if (check_coeffs.empty() || check_coeffs.size() != 3U) {
+        return expr;
+      }
+      PrimExpr exec_coeff = check_analyzer.Simplify(check_coeffs[0]);
+      PrimExpr interior_coeff = check_analyzer.Simplify(check_coeffs[1]);
+      if (!check_analyzer.CanProve(
+              exec_coeff ==
+              make_const(exec_coeff.dtype(),
+                         static_cast<int64_t>(scope.tile_shape[axis])))) {
+        return expr;
+      }
+      if (!check_analyzer.CanProve(interior_coeff ==
+                                   make_const(interior_coeff.dtype(), 1))) {
+        return expr;
+      }
+      return candidate;
+    };
+
+    PrimExpr lhs = normalize_exec_var(lt->a);
     arith::Analyzer analyzer;
     Array<Var> vars{exec_loop->loop_var, interior_loop->loop_var};
-    Array<PrimExpr> coeffs = arith::DetectLinearEquation(lt->a, vars);
+    Array<PrimExpr> coeffs = arith::DetectLinearEquation(lhs, vars);
     if (coeffs.empty()) {
       return false;
     }
@@ -2089,9 +2183,20 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   auto is_canonical_tail_load_predicate = [&](const PrimExpr &predicate,
                                               TileBlockState *state,
                                               const TileAccessInfo &access) {
+    if (access.tile_shape != scope.tile_shape) {
+      return false;
+    }
+
+    if (scope.tile_shape.size() == 1) {
+      return is_canonical_tail_axis_predicate(predicate, state, 0);
+    }
+
+    if (scope.is_reduce_scope) {
+      return false;
+    }
+
     if (!state->tile_mask.has_value() || !scope.tail_predicate.defined() ||
-        scope.is_reduce_scope || scope.tile_shape.size() != 2 ||
-        access.tile_shape != scope.tile_shape) {
+        scope.tile_shape.size() != 2) {
       return false;
     }
 
@@ -3308,7 +3413,12 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       std::string cache_key = make_tile_cache_key(access);
       std::optional<SunMMIOValue> mask =
           (access.tile_rank == 2) ? state->tile_mask : std::nullopt;
-      if (access.requires_aligned_1d_load && store->predicate.defined()) {
+      bool canonical_aligned_tail_store =
+          access.requires_aligned_1d_load && store->predicate.defined() &&
+          is_canonical_tail_load_predicate(store->predicate.value(), state,
+                                           access);
+      if (access.requires_aligned_1d_load && store->predicate.defined() &&
+          !canonical_aligned_tail_store) {
         mask = lower_expr(store->predicate.value(), state, std::nullopt);
       }
       std::optional<SunMMIOValue> dst_view;
@@ -3327,6 +3437,26 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       std::optional<SunMMIOValue> updated_aligned_tile;
       erase_current_values_for_buffer(state, store->buffer.get());
       if (access.requires_aligned_1d_load) {
+        if (!mask.has_value() && store->predicate.defined() &&
+            is_canonical_tail_load_predicate(store->predicate.value(), state,
+                                             access)) {
+          SunMMIOValue valid_lanes;
+          int64_t mask_axis = access.unsqueeze_axis == 1 ? 0 : 1;
+          if (state->interior_axis0_loop != nullptr) {
+            SunMMIOValue tile_extent = make_index_const(scope.tile_shape[0]);
+            SunMMIOValue domain_extent = EnsureIndex(
+                EvalExpr(scope.domain_shape[scope.execution_domain_axes[0]]));
+            SunMMIOValue exec_index =
+                EnsureIndex(EvalExpr(scope.execution_loops[0]->loop_var));
+            valid_lanes = min_index(
+                tile_extent,
+                sub_index(domain_extent, mul_index(exec_index, tile_extent)));
+          }
+          SunMMIOType mask_type =
+              MakeTileType(DataType::Bool(), access.aligned_load_shape);
+          mask = builder_->TileAxisMask(NewValueName(), mask_axis, valid_lanes,
+                                        mask_type);
+        }
         updated_aligned_tile = store_aligned_1d_tile(access, rhs, mask, state);
       } else {
         if (!dst_view.has_value()) {
@@ -3597,6 +3727,30 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           auto loops = FindInteriorLoops(scope.tile_block_body);
           scope.interior_axis0_loop = loops.first;
           scope.interior_axis1_loop = loops.second;
+        } else if (auto exec_axis = GetExecutionAxisAnnotation(loop);
+                   exec_axis.has_value() && exec_axis.value() == 1) {
+          auto loops = FindInteriorLoops(loop->body);
+          if (loops.first != nullptr && loops.second != nullptr) {
+            auto axis0_extent = GetStaticLoopExtent(loops.first);
+            auto axis1_extent = GetStaticLoopExtent(loops.second);
+            ICHECK(axis0_extent.has_value() && axis1_extent.has_value())
+                << "Hybrid local tile fragment expects static interior "
+                   "extents";
+            saved_scope = scope;
+            scope = TilesScopeInfo{};
+            scope.root = loop;
+            scope.domain_shape = ffi::Array<PrimExpr>{
+                Integer(axis0_extent.value()),
+                loop->extent * Integer(axis1_extent.value())};
+            scope.domain_loops = {loop};
+            scope.execution_loops = {nullptr, loop};
+            scope.interior_axis0_loop = loops.first;
+            scope.interior_axis1_loop = loops.second;
+            scope.execution_domain_axes = {0, 1};
+            scope.tile_shape = {axis0_extent.value(), axis1_extent.value()};
+            scope.tile_block_body = loop->body;
+            scope.is_reduce_scope = IsReduceLikeTileBody(scope.tile_block_body);
+          }
         }
         SunMMIOValue min = EnsureIndex(EvalExpr(loop->min));
         SunMMIOValue extent = EnsureIndex(EvalExpr(loop->extent));
