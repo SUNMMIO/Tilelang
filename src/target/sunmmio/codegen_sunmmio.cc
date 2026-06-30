@@ -563,7 +563,7 @@ std::vector<SunMMIOValue> CodeGenTileLangSunMMIO::CollectDynamicLayoutValues(
 void CodeGenTileLangSunMMIO::BindExternalBufferLayout(
     const PendingExternalBuffer &pending) {
   std::vector<SunMMIOValue> dynamic_shapes =
-      CollectDynamicLayoutValues(pending.type.shape);
+      CollectDynamicLayoutValues(pending.type.layout_hshape);
   std::vector<SunMMIOValue> dynamic_strides =
       CollectDynamicLayoutValues(pending.type.layout_hstride);
   if (dynamic_shapes.empty() && dynamic_strides.empty()) {
