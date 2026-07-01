@@ -5,6 +5,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ir/attrs.h>
 #include <tvm/ir/transform.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
@@ -12,6 +13,8 @@
 
 #include <unordered_map>
 
+#include "../layout/cute_layout.h"
+#include "../layout/layout.h"
 #include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 
@@ -76,6 +79,54 @@ public:
                     buffer->buffer_type, buffer->axis_separators, buffer->span);
     buffer_cache_[buffer.get()] = resolved;
     return resolved;
+  }
+
+  Layout ResolveLayout(const Layout &layout) {
+    if (auto *cute = layout.as<CuteLayoutNode>()) {
+      Array<PrimExpr> logical_shape;
+      logical_shape.reserve(cute->GetLogicalShape().size());
+      for (const auto &extent : cute->GetLogicalShape()) {
+        logical_shape.push_back(VisitExpr(extent));
+      }
+
+      Array<PrimExpr> mode_shape;
+      mode_shape.reserve(cute->GetModeShape().size());
+      for (const auto &extent : cute->GetModeShape()) {
+        mode_shape.push_back(VisitExpr(extent));
+      }
+
+      Array<PrimExpr> mode_stride;
+      mode_stride.reserve(cute->GetModeStride().size());
+      for (const auto &stride : cute->GetModeStride()) {
+        mode_stride.push_back(VisitExpr(stride));
+      }
+
+      return CuteLayout(logical_shape, mode_shape, mode_stride,
+                        cute->GetDimLevels());
+    }
+    return layout;
+  }
+
+  Map<String, ObjectRef> ResolveTensorMeta(const Map<String, ObjectRef> &meta) {
+    Map<String, ObjectRef> resolved_meta;
+    for (const auto &[tensor_name, entry_obj] : meta) {
+      auto entry = entry_obj.as<Map<String, ObjectRef>>();
+      if (!entry.has_value()) {
+        resolved_meta.Set(tensor_name, entry_obj);
+        continue;
+      }
+
+      Map<String, ObjectRef> resolved_entry;
+      for (const auto &[key, value] : entry.value()) {
+        if (auto layout = value.as<Layout>()) {
+          resolved_entry.Set(key, ResolveLayout(layout.value()));
+        } else {
+          resolved_entry.Set(key, value);
+        }
+      }
+      resolved_meta.Set(tensor_name, resolved_entry);
+    }
+    return resolved_meta;
   }
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
@@ -148,8 +199,14 @@ PrimFunc ResolvePrimFunc(PrimFunc func) {
     buffer_map.Set(var, resolver.ResolveBuffer(buffer));
   }
 
+  DictAttrs attrs = func->attrs;
+  if (auto tensor_meta = func->GetAttr<Map<String, ObjectRef>>("tensor_meta")) {
+    attrs = WithAttr(std::move(attrs), ffi::String("tensor_meta"),
+                     ffi::Any(resolver.ResolveTensorMeta(tensor_meta.value())));
+  }
+
   Stmt body = resolver.ResolveStmt(func->body);
-  return PrimFunc(func->params, body, func->ret_type, buffer_map, func->attrs,
+  return PrimFunc(func->params, body, func->ret_type, buffer_map, attrs,
                   func->span);
 }
 

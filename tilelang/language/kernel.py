@@ -302,6 +302,10 @@ def Kernel(
         if cur_target is not None and target_is_sunmmio(cur_target):
             attrs["tilelang.is_sunmmio_kernel_frame"] = True
             threads = None
+            if len(blocks) == 0:
+                from tilelang.language.mesh_symbols import mesh_ncores
+
+                blocks = (mesh_ncores(),)
 
     is_sunmmio = attrs.get("tilelang.is_sunmmio_kernel_frame", False)
     if not is_cpu and not is_sunmmio and threads is None:
