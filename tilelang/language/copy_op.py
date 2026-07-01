@@ -8,6 +8,7 @@ from tilelang.utils.language import (
     legalize_pairwise_extents,
 )
 from tilelang.language.utils import get_extent
+from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
 from tvm import ir, tir
 
 
@@ -58,10 +59,8 @@ def copy(
       and passed through to the backend; low-level loop construction and any
       scope-specific decisions happen during lowering.
     """
-    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
-
-    src = unwrap_mesh_tensor(src)
-    dst = unwrap_mesh_tensor(dst)
+    src = _unwrap_mesh_tensor(src)
+    dst = _unwrap_mesh_tensor(dst)
 
     if isinstance(src, tir.Buffer) and isinstance(dst, tir.Buffer):
         ir.assert_structural_equal(src.shape, dst.shape)

@@ -28,7 +28,7 @@ try:
 except ImportError:  # Python < 3.11 for Self, < 3.10 for ParamSpec
     from typing_extensions import ParamSpec, Self
 from .. import dtypes as dt
-from ..mesh_tensor import MeshTensorValue, TensorWithMeta, unwrap_mesh_tensor
+from ..mesh_tensor import MeshTensorValue, TensorWithMeta, _unwrap_mesh_tensor
 from . import utils
 from tilelang.jit.exceptions import JITNoBuilderError, EagerJITBuildError
 import threading
@@ -549,7 +549,7 @@ class Builder(BaseBuilder):
         self.check_continue_break()
         if annot is not self.empty:
             logger.warning("Type annotation in slice assignment has no effect", stack_info=True, stacklevel=2)
-        lval = unwrap_mesh_tensor(lval)
+        lval = _unwrap_mesh_tensor(lval)
         if isinstance(lval, Buffer):
             tir.buffer_store(lval, value, sl)
         else:

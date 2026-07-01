@@ -7,6 +7,7 @@ from tvm.tir import Buffer, BufferRegion, BufferLoad
 from tvm import tir
 from tilelang.utils.language import get_buffer_elems
 from tilelang._typing import BufferLikeType
+from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
 
 
 def any_of(buffer: BufferLikeType) -> tir.PrimExpr:
@@ -18,9 +19,7 @@ def any_of(buffer: BufferLikeType) -> tir.PrimExpr:
     Returns:
         A TVM intrinsic call that performs the any operation
     """
-    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
-
-    buffer = unwrap_mesh_tensor(buffer)
+    buffer = _unwrap_mesh_tensor(buffer)
     return_type: str = "bool"
     if isinstance(buffer, Buffer):
         elems = get_buffer_elems(buffer)
@@ -60,9 +59,7 @@ def all_of(buffer: BufferLikeType) -> tir.PrimExpr:
     Returns:
         A TVM intrinsic call that performs the any operation
     """
-    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
-
-    buffer = unwrap_mesh_tensor(buffer)
+    buffer = _unwrap_mesh_tensor(buffer)
     return_type: str = "bool"
     if isinstance(buffer, Buffer):
         elems = get_buffer_elems(buffer)

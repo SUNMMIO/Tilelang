@@ -6,6 +6,14 @@ from tilelang.utils.target import determine_target
 SUNMMIO_TARGET = determine_target("Sunmmio", return_object=True)
 
 
+def test_mesh_sharding_policy_normalizes_integer_replicate():
+    policy = T.MeshShardingPolicy(replicate=0)
+    assert policy.replicate is T.MeshReplicationType.NONE
+
+    tensor = T.MeshTensor((8, 16), policy, (2, 4), "float16")
+    assert tensor.local_shape == (8, 16)
+
+
 def test_mesh_tensor_shape_api_in_kernel():
     tensor = T.MeshTensor(
         (513, 4097),

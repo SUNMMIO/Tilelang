@@ -7,6 +7,7 @@ from tvm import ir, tir
 from tvm.tir import PrimExpr, BufferLoad, op
 from tilelang import language as T
 from tilelang._typing import BufferLikeType, ShapeType
+from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
 
 
 def region(buffer: BufferLoad, access_type: str, *args: PrimExpr) -> PrimExpr:
@@ -146,9 +147,7 @@ def get_extent(data: BufferLikeType) -> ShapeType | None:
         The shape/extents as a list-like of PrimExpr (Buffer.shape or list of region item extents), or None if the extent cannot be determined.
     """
 
-    from tilelang.language.mesh_tensor import unwrap_mesh_tensor
-
-    data = unwrap_mesh_tensor(data)
+    data = _unwrap_mesh_tensor(data)
     if isinstance(data, tir.Var) and T.has_let_value(data):
         data = T.get_let_value(data)
     if isinstance(data, tir.Buffer):

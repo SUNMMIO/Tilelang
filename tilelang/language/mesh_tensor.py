@@ -20,6 +20,7 @@ __all__ = [
     "MeshShardingPolicy",
     "MeshTensor",
     "TensorWithMeta",
+    "get_local_extent",
 ]
 
 # FFI functions for layout operations
@@ -41,9 +42,12 @@ class MeshShardingPolicy:
         self,
         x: int | None = None,
         y: int | None = None,
-        replicate: int = MeshReplicationType.NONE,
+        replicate: int | MeshReplicationType = MeshReplicationType.NONE,
         cross_mesh_dim: int | None = None,
     ):
+        if isinstance(replicate, int):
+            replicate = MeshReplicationType(replicate)
+
         if cross_mesh_dim is not None and (x is not None or y is not None):
             raise ValueError("cross_mesh_dim is mutually exclusive with x/y splits")
         if sum(v is not None for v in [x, y, cross_mesh_dim]) > 2:
@@ -132,7 +136,7 @@ class MeshTensorValue:
         return f"MeshTensorValue(buffer={self.buffer!r}, global_shape={self.global_shape}, local_shape={self.local_shape})"
 
 
-def unwrap_mesh_tensor(value):
+def _unwrap_mesh_tensor(value):
     """Return the backing TIR buffer for MeshTensor wrapper values."""
     if isinstance(value, (TensorWithMeta, MeshTensorValue)):
         return value.buffer
@@ -161,11 +165,6 @@ def _to_python_int(v):
     if isinstance(v, IntImm):
         return int(v.value)
     return None
-
-
-def distribute_slot(D, n):
-    """Return the uniform per-core slot size."""
-    return _ceildiv(D, n)
 
 
 def distribute_valid_count(D, k, n):
