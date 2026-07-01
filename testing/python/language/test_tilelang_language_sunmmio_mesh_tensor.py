@@ -7,6 +7,19 @@ from tilelang.layout import make_zz_layout, make_zn_layout
 from tvm import tir
 
 
+def _expr_has_call(expr, op_name):
+    found = False
+    op = tir.op.Op.get(op_name)
+
+    def visit(node):
+        nonlocal found
+        if isinstance(node, tir.Call) and hasattr(node.op, "same_as") and node.op.same_as(op):
+            found = True
+
+    tir.stmt_functor.post_order_visit(expr, visit)
+    return found
+
+
 # ─── _get_sharded_shape tests (unchanged — pure shape math) ─────────────
 
 
@@ -185,6 +198,17 @@ def test_call_method(shape, device_mesh_config, policy):
 
     expected_shape = MeshTensorProxy._get_sharded_shape(shape, policy, nrows, ncols)
     assert tuple(result.buffer.shape) == expected_shape
+
+
+def test_call_method_defaults_to_symbolic_mesh_config():
+    proxy = MeshTensorProxy()
+    policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
+
+    result = proxy((128, 256), policy, "float32")
+
+    assert _expr_has_call(result.buffer.shape[0], "tl.mesh_nrows")
+    assert _expr_has_call(result.buffer.shape[1], "tl.mesh_ncols")
+    assert result.buffer.dtype == "float32"
 
 
 # ─── Default row-major layout tests ──────────────────────────────────────

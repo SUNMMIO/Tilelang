@@ -81,6 +81,16 @@ public:
     return resolved;
   }
 
+  BufferRegion ResolveBufferRegion(const BufferRegion &region) {
+    Array<Range> ranges;
+    ranges.reserve(region->region.size());
+    for (const auto &range : region->region) {
+      ranges.push_back(Range::FromMinExtent(VisitExpr(range->min),
+                                            VisitExpr(range->extent)));
+    }
+    return BufferRegion(ResolveBuffer(region->buffer), ranges);
+  }
+
   Layout ResolveLayout(const Layout &layout) {
     if (auto *cute = layout.as<CuteLayoutNode>()) {
       Array<PrimExpr> logical_shape;
@@ -136,7 +146,11 @@ public:
     for (const auto &index : op->indices) {
       indices.push_back(VisitExpr(index));
     }
-    return BufferLoad(buffer, indices, std::nullopt, op->span);
+    Optional<PrimExpr> predicate = std::nullopt;
+    if (op->predicate.defined()) {
+      predicate = VisitExpr(op->predicate.value());
+    }
+    return BufferLoad(buffer, indices, predicate, op->span);
   }
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
@@ -147,7 +161,11 @@ public:
     for (const auto &index : op->indices) {
       indices.push_back(VisitExpr(index));
     }
-    return BufferStore(buffer, value, indices, std::nullopt, op->span);
+    Optional<PrimExpr> predicate = std::nullopt;
+    if (op->predicate.defined()) {
+      predicate = VisitExpr(op->predicate.value());
+    }
+    return BufferStore(buffer, value, indices, predicate, op->span);
   }
 
   Stmt VisitStmt_(const DeclBufferNode *op) final {
@@ -167,11 +185,26 @@ public:
     }
     node->alloc_buffers = std::move(alloc_buffers);
 
+    Array<BufferRegion> reads;
+    reads.reserve(node->reads.size());
+    for (const auto &region : node->reads) {
+      reads.push_back(ResolveBufferRegion(region));
+    }
+    node->reads = std::move(reads);
+
+    Array<BufferRegion> writes;
+    writes.reserve(node->writes.size());
+    for (const auto &region : node->writes) {
+      writes.push_back(ResolveBufferRegion(region));
+    }
+    node->writes = std::move(writes);
+
     Array<MatchBufferRegion> match_buffers;
     match_buffers.reserve(node->match_buffers.size());
     for (const auto &match_buffer : node->match_buffers) {
       Buffer buffer = ResolveBuffer(match_buffer->buffer);
-      match_buffers.push_back(MatchBufferRegion(buffer, match_buffer->source));
+      match_buffers.push_back(
+          MatchBufferRegion(buffer, ResolveBufferRegion(match_buffer->source)));
     }
     node->match_buffers = std::move(match_buffers);
 

@@ -13,6 +13,18 @@ def make_kernel(threads):
     return tvm.IRModule({"main": kernel})
 
 
+def collect_calls(func, op_name):
+    calls = []
+    op = tvm.tir.op.Op.get(op_name)
+
+    def visit(node):
+        if isinstance(node, tvm.tir.Call) and hasattr(node.op, "same_as") and node.op.same_as(op):
+            calls.append(node)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return calls
+
+
 @pytest.mark.parametrize("requested_threads", [1, 32, 128, 256])
 def test_sunmmio_kernel_has_no_threadidx(requested_threads):
     """T.Kernel on Sunmmio emits no threadIdx bindings regardless of the threads= argument.
@@ -42,6 +54,23 @@ def test_sunmmio_kernel_default_has_no_threadidx():
 
     script = mod.script()
     assert "threadIdx" not in script, f"Sunmmio kernel must have no threadIdx bindings (threadless). Got:\n{script}"
+
+
+def test_sunmmio_kernel_without_blocks_defaults_to_mesh_ncores():
+    """T.Kernel() on Sunmmio uses the symbolic mesh core count as block extent."""
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+
+        @T.prim_func
+        def kernel(A: T.Tensor((128,), T.float32)):
+            with T.Kernel() as cid:
+                A[cid] = A[cid]
+
+        mod = tvm.IRModule({"main": kernel})
+
+    script = mod.script()
+    assert "threadIdx" not in script, f"Sunmmio kernel must have no threadIdx bindings (threadless). Got:\n{script}"
+    assert collect_calls(mod["main"], "tl.mesh_ncores"), f"T.Kernel() should default to symbolic Sunmmio mesh cores. Got:\n{script}"
 
 
 def test_non_sunmmio_kernel_respects_threads():
