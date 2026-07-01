@@ -48,6 +48,55 @@ using namespace tir;
 using namespace ffi;
 
 namespace {
+// MeshTensor buffer_map entries are physically sharded. The packed API
+// validates user-facing tensors, so use tensor_meta global shape/strides for
+// binding.
+Optional<Buffer> MaybeMakeAPIBufferFromTensorMeta(const PrimFunc &func,
+                                                  const Buffer &buffer) {
+  auto tensor_meta_opt = func->GetAttr<Map<String, ObjectRef>>("tensor_meta");
+  if (!tensor_meta_opt) {
+    return std::nullopt;
+  }
+
+  auto tensor_meta = tensor_meta_opt.value();
+  String buffer_name = buffer->name;
+  if (!tensor_meta.count(buffer_name)) {
+    return std::nullopt;
+  }
+
+  auto meta_entry_obj = tensor_meta[buffer_name];
+  auto meta_entry = meta_entry_obj.as<Map<String, ObjectRef>>();
+  if (!meta_entry) {
+    return std::nullopt;
+  }
+
+  auto global_shape_obj = meta_entry.value().Get("global_shape");
+  if (!global_shape_obj) {
+    return std::nullopt;
+  }
+
+  auto global_shape = Downcast<Array<PrimExpr>>(global_shape_obj.value());
+  ICHECK_EQ(global_shape.size(), buffer->shape.size())
+      << "Packed API buffer view for " << buffer->name
+      << " has rank mismatch between tensor_meta.global_shape " << global_shape
+      << " and physical buffer shape " << buffer->shape;
+
+  Array<PrimExpr> global_strides;
+  if (auto global_strides_obj = meta_entry.value().Get("global_strides")) {
+    global_strides = Downcast<Array<PrimExpr>>(global_strides_obj.value());
+    ICHECK(global_strides.empty() ||
+           global_strides.size() == global_shape.size())
+        << "Packed API buffer view for " << buffer->name
+        << " has rank mismatch between tensor_meta.global_strides "
+        << global_strides << " and tensor_meta.global_shape " << global_shape;
+  }
+
+  return Buffer(buffer->data, buffer->dtype, global_shape, global_strides,
+                buffer->elem_offset, buffer->name, buffer->data_alignment,
+                buffer->offset_factor, buffer->buffer_type,
+                buffer->axis_separators, buffer->span);
+}
+
 class ReturnRewriter : public StmtMutator {
 public:
   explicit ReturnRewriter(Var ret_var) : ret_var_(ret_var) {}
@@ -296,7 +345,8 @@ PrimFunc MakePackedAPI(PrimFunc func) {
   // Need to delay binding of the buffers, in case some arguments also
   // appear in the buffer.
   std::vector<std::pair<PrimExpr, Var>> var_def;
-  std::vector<std::pair<Var, Buffer>> buffer_def;
+  std::vector<std::pair<Var, Buffer>> api_buffer_def;
+  std::vector<std::pair<Var, Buffer>> physical_buffer_def;
 
   // First, collect a reverse map from Buffer->data var to parameter var so we
   // can detect whether a buffer is actually used by the function body. In
@@ -493,7 +543,12 @@ PrimFunc MakePackedAPI(PrimFunc func) {
     if (func_ptr->buffer_map.count(param)) {
       // buffer binding now depends on type index
       // if the index is Tensor handle, we need to offset to get the DLTensor*
-      buffer_def.emplace_back(param, func_ptr->buffer_map[param]);
+      Buffer physical_buffer = func_ptr->buffer_map[param];
+      Buffer api_buffer =
+          MaybeMakeAPIBufferFromTensorMeta(func, physical_buffer)
+              .value_or(physical_buffer);
+      api_buffer_def.emplace_back(param, api_buffer);
+      physical_buffer_def.emplace_back(param, physical_buffer);
     }
   }
 
@@ -513,9 +568,9 @@ PrimFunc MakePackedAPI(PrimFunc func) {
     binder.Bind(param, expr, name_hint + "." + param->name_hint, true);
   }
 
-  binder.BindDLTensors(buffer_def, device_type, device_id, name_hint,
+  binder.BindDLTensors(api_buffer_def, device_type, device_id, name_hint,
                        used_param_buffers);
-  for (const auto &[var, buffer] : buffer_def) {
+  for (const auto &[var, buffer] : physical_buffer_def) {
     // Prefer buffer data var name in diagnostics to avoid exposing low-level
     // handle vars
     arg_buffer_declarations.push_back(DeclBuffer(buffer, nop));

@@ -62,11 +62,19 @@ public:
 
 private:
   void VisitExpr_(const BufferLoadNode *op) final {
+    if (op->buffer.scope() == "local.var") {
+      StmtExprVisitor::VisitExpr_(op);
+      return;
+    }
     accesses_.push_back({op->buffer, op->indices, /*is_store=*/false});
     StmtExprVisitor::VisitExpr_(op);
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
+    if (op->buffer.scope() == "local.var") {
+      StmtExprVisitor::VisitStmt_(op);
+      return;
+    }
     accesses_.push_back({op->buffer, op->indices, /*is_store=*/true});
     StmtExprVisitor::VisitStmt_(op);
   }

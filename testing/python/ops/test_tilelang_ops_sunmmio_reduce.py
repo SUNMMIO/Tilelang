@@ -221,6 +221,30 @@ def _collect_buffer_stores(func, buffer_name):
     return stores
 
 
+def _collect_buffer_loads_any(func, buffer_names):
+    loads = []
+    buffer_names = set(buffer_names)
+
+    def visitor(node):
+        if isinstance(node, tvm.tir.BufferLoad) and node.buffer.name in buffer_names:
+            loads.append(node)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visitor)
+    return loads
+
+
+def _collect_buffer_stores_any(func, buffer_names):
+    stores = []
+    buffer_names = set(buffer_names)
+
+    def visitor(node):
+        if isinstance(node, tvm.tir.BufferStore) and node.buffer.name in buffer_names:
+            stores.append(node)
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visitor)
+    return stores
+
+
 def _collect_tile_loop_extents(func):
     extents = []
 
@@ -247,6 +271,39 @@ def _collect_tile_domain_roots(func):
 
     TileDomainVisitor().visit_stmt(func.body)
     return roots
+
+
+def _tile_domain(loop):
+    return [int(x) for x in loop.annotations["tile.domain"]]
+
+
+def _collect_execution_loop_extents(root):
+    execution_extents = []
+
+    @tvm.tir.functor.visitor
+    class ExecutionLoopVisitor(tvm.tir.PyStmtExprVisitor):
+        def visit_for_(self, op):
+            if not op.same_as(root) and op.annotations and "tile.domain" in op.annotations:
+                return
+            if op.annotations and "tile.execution_axis" in op.annotations:
+                axis = int(op.annotations["tile.execution_axis"])
+                execution_extents.append((axis, int(op.extent)))
+            super().visit_for_(op)
+
+    ExecutionLoopVisitor().visit_stmt(root)
+    return execution_extents
+
+
+def _get_lowered_reduce_dst_layout(layouts, fallback_name="Out_shared"):
+    if "dst_buffer" in layouts:
+        return layouts["dst_buffer"]
+    return layouts[fallback_name]
+
+
+def _get_lowered_reduce_src_layout(layouts, fallback_name):
+    if "src_buffer" in layouts:
+        return layouts["src_buffer"]
+    return layouts[fallback_name]
 
 
 def _ceildiv(lhs, rhs):
@@ -351,7 +408,7 @@ def test_tilelang_reduce_sunmmio_multiple_reduces_are_ssa_clean():
     assert_reduce_lowering_is_ssa(mod)
 
 
-def test_tilelang_reduce_sunmmio_tiled_axis_tail_load_is_predicated():
+def test_tilelang_reduce_sunmmio_tiled_axis_tail_uses_if_then_else_mask():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     mod = reduce_kernel_with_tileview_builder((8, 63, 250), reduce_axis=2)
 
@@ -365,12 +422,12 @@ def test_tilelang_reduce_sunmmio_tiled_axis_tail_load_is_predicated():
     assert 7 not in tile_loop_extents, "truncdiv(63, 8) would drop the spatial tail tile"
 
     a_load_predicates = [load.predicate for load in _collect_buffer_loads(func, "A_shared") if load.predicate is not None]
-    assert a_load_predicates, "Expected predicated source loads for reduce-axis tail tile"
+    assert not a_load_predicates, "Reduce-axis tail masking should be expressed by if_then_else, not BufferLoad.predicate"
     script = mod.script()
     assert "T.if_then_else" in script
     assert "T.float16(0.0)" in script
-    assert any("< 250" in str(predicate) or "<250" in str(predicate) for predicate in a_load_predicates)
-    assert all("< 63" not in str(predicate) and "<63" not in str(predicate) for predicate in a_load_predicates)
+    assert "< 250" in script or "<250" in script
+    assert "predicate=" not in script
 
     out_store_predicates = [store.predicate for store in _collect_buffer_stores(func, "Out_shared") if store.predicate is not None]
     assert not out_store_predicates, "Reduce final write-back should remain unpredicated"
@@ -399,9 +456,9 @@ def test_tilelang_reduce_sunmmio_tiled_axis_tail_uses_predicated_update(reduce_o
     acc_store_predicates = [
         store.predicate for store in _collect_buffer_stores(mod["main"], "Out_shared_acc") if store.predicate is not None
     ]
-    assert a_load_predicates
+    assert not a_load_predicates
     assert not acc_store_predicates
-    assert any("< 250" in str(predicate) or "<250" in str(predicate) for predicate in a_load_predicates)
+    assert "< 250" in script or "<250" in script
 
 
 UNALIGNED_REDUCE_CASES = [
@@ -435,26 +492,16 @@ def test_tilelang_reduce_sunmmio_unaligned_cases_from_tir_dump(shape, reduce_axi
     assert checker.scope_root is not None, "Missing tile.domain root on lowered unaligned reduction"
     assert checker.has_in_tile_reduce == _expected_tiled_reduce(shape, reduce_axis)
 
-    roots = _collect_tile_domain_roots(func)
+    roots = [root for root in _collect_tile_domain_roots(func) if _tile_domain(root) == list(shape)]
     assert len(roots) == 1
     root = roots[0]
     tile_size = [int(x) for x in root.annotations["tile.tile_size"]]
     execution_domain_axes = [int(x) for x in root.annotations["tile.execution_domain_axes"]]
-    domain = [int(x) for x in root.annotations["tile.domain"]]
+    domain = _tile_domain(root)
     assert domain == list(shape)
     assert len(tile_size) == len(execution_domain_axes)
 
-    execution_extents = []
-
-    @tvm.tir.functor.visitor
-    class ExecutionLoopVisitor(tvm.tir.PyStmtExprVisitor):
-        def visit_for_(self, op):
-            if op.annotations and "tile.execution_axis" in op.annotations:
-                axis = int(op.annotations["tile.execution_axis"])
-                execution_extents.append((axis, int(op.extent)))
-            super().visit_for_(op)
-
-    ExecutionLoopVisitor().visit_stmt(func.body)
+    execution_extents = _collect_execution_loop_extents(root)
     assert len(execution_extents) == len(tile_size)
     for axis, extent in execution_extents:
         domain_axis = execution_domain_axes[axis]
@@ -464,25 +511,27 @@ def test_tilelang_reduce_sunmmio_unaligned_cases_from_tir_dump(shape, reduce_axi
             assert extent > shape[domain_axis] // tile_size[axis]
 
     script = mod.script()
-    a_load_predicates = [load.predicate for load in _collect_buffer_loads(func, "A_shared") if load.predicate is not None]
-    acc_store_predicates = [store.predicate for store in _collect_buffer_stores(func, "Out_shared_acc") if store.predicate is not None]
+    a_load_predicates = [
+        load.predicate for load in _collect_buffer_loads_any(func, ("A_shared", "src_buffer")) if load.predicate is not None
+    ]
+    acc_store_predicates = [
+        store.predicate for store in _collect_buffer_stores_any(func, ("Out_shared_acc", "dst_buffer_acc")) if store.predicate is not None
+    ]
     assert not acc_store_predicates
 
     is_reduce_axis_tiled = reduce_axis in execution_domain_axes
     reduce_tile_size = tile_size[execution_domain_axes.index(reduce_axis)] if is_reduce_axis_tiled else 1
     has_reduce_axis_tail = is_reduce_axis_tiled and shape[reduce_axis] % reduce_tile_size != 0
     if has_reduce_axis_tail:
-        assert a_load_predicates
+        assert not a_load_predicates
         assert "T.if_then_else" in script
         assert _tail_identity_text("sum") in script
-        assert any(
-            f"< {shape[reduce_axis]}" in str(predicate) or f"<{shape[reduce_axis]}" in str(predicate) for predicate in a_load_predicates
-        )
+        assert f"< {shape[reduce_axis]}" in script or f"<{shape[reduce_axis]}" in script
     else:
         assert not a_load_predicates
 
     if is_reduce_axis_tiled:
-        assert ("Out_shared_res" in script) == (not clear)
+        assert ("dst_buffer_res" in script) == (not clear)
 
 
 @pytest.mark.parametrize("reduce_op", ["sum", "max", "min"])
@@ -497,7 +546,8 @@ def test_tilelang_reduce_sunmmio_unaligned_tiled_axis_tail_identity(reduce_op):
     script = mod.script()
     assert "T.if_then_else" in script
     assert _tail_identity_text(reduce_op) in script
-    assert "predicate=i2 * 32 + kj < 249" in script
+    assert "i2 * 32 + kj < 249" in script
+    assert "predicate=" not in script
 
 
 def test_tilelang_reduce_sunmmio_non_tiled_axis_tail_has_no_reduce_predicate():
@@ -536,7 +586,7 @@ def test_tilelang_reduce_sunmmio_blocked_axis_yields_aligned_rowmajor():
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
 
-    out = layouts["Out_shared"]
+    out = _get_lowered_reduce_dst_layout(layouts)
     assert is_same_layout(out, make_aligned_row_major((40,), "float16", 64))
     assert not is_same_layout(out, make_row_major((40,)))
 
@@ -558,7 +608,7 @@ def test_tilelang_reduce_sunmmio_3d_blocked_axis_aligned():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    assert is_same_layout(layouts["Out_shared"], make_aligned_row_major((2, 40), "float16", 64))
+    assert is_same_layout(_get_lowered_reduce_dst_layout(layouts), make_aligned_row_major((2, 40), "float16", 64))
 
 
 def test_tilelang_reduce_sunmmio_chained_reduce_stays_aligned():
@@ -581,9 +631,10 @@ def test_tilelang_reduce_sunmmio_chained_reduce_stays_aligned():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    assert is_same_layout(layouts["M_shared"], make_aligned_row_major((8, 40), "float16", 64))
-    assert is_same_layout(layouts["Out_shared"], make_aligned_row_major((40,), "float16", 64))
-    assert not is_same_layout(layouts["Out_shared"], make_row_major((40,)))
+    assert any(is_same_layout(layout, make_aligned_row_major((8, 40), "float16", 64)) for layout in layouts.values())
+    out = _get_lowered_reduce_dst_layout(layouts)
+    assert is_same_layout(out, make_aligned_row_major((40,), "float16", 64))
+    assert not is_same_layout(out, make_row_major((40,)))
 
 
 def test_tilelang_reduce_sunmmio_nonblocked_reduce_preserves_zz():
@@ -603,7 +654,7 @@ def test_tilelang_reduce_sunmmio_nonblocked_reduce_preserves_zz():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    out = layouts["Out_shared"]
+    out = _get_lowered_reduce_dst_layout(layouts)
     assert is_same_layout(out, make_zz_layout((64, 64), [0, 1], (32, 32)))
     assert not is_same_layout(out, make_row_major((64, 64)))
 
@@ -625,7 +676,7 @@ def test_tilelang_reduce_sunmmio_aligned_dst_is_noop_when_32_multiple():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    assert is_same_layout(layouts["Out_shared"], make_row_major((64,)))
+    assert is_same_layout(_get_lowered_reduce_dst_layout(layouts), make_row_major((64,)))
 
 
 def test_tilelang_reduce_sunmmio_aligned_output_lowers_end_to_end():
@@ -649,7 +700,7 @@ def test_tilelang_reduce_sunmmio_aligned_output_lowers_end_to_end():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
     layouts = _layout_map(mod)
-    assert is_same_layout(layouts["Out_shared"], make_aligned_row_major((40,), "float16", 64))
+    assert is_same_layout(_get_lowered_reduce_dst_layout(layouts), make_aligned_row_major((40,), "float16", 64))
 
     names = []
     post_order_visit(

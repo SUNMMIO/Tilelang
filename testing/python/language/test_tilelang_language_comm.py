@@ -74,6 +74,25 @@ def _expected_axis_last_all_lines(buffer):
     ]
 
 
+def _allreduce_frontend_kernel(direction="all", clear=True, dtype="float32"):
+    shape = (32, 32)
+    out_shape = (32,)
+
+    @T.prim_func
+    def main(A: T.Tensor(shape, dtype), Out: T.Tensor(out_shape, dtype)):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+
+            T.copy(A, A_shared)
+            if not clear:
+                T.copy(Out, Out_shared)
+            T.comm.all_reduce(A_shared, Out_shared, "sum", direction, dim=1, clear=clear)
+            T.copy(Out_shared, Out)
+
+    return main
+
+
 @pytest.mark.parametrize(
     "M, N, block_M, block_N, dtype, accum_dtype",
     [
@@ -107,6 +126,19 @@ def test_comm_python_api(M, N, block_M, block_N, dtype, accum_dtype):
             T.comm.all_gather(A_shared, R1_shared, direction="all", axis=-1)
 
     assert main.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
+
+
+def test_comm_allreduce_frontend_allocates_rsram_temporaries():
+    script = _allreduce_frontend_kernel(direction="all", clear=False).script()
+
+    assert 'buffer = T.alloc_buffer((4, 32), scope="shared.rsram")' in script
+    assert 'buffer_1 = T.alloc_buffer((4, 32), scope="shared.rsram")' in script
+    assert 'buffer_2 = T.alloc_buffer((32,), scope="shared.rsram")' in script
+    assert (
+        "T.comm_allreduce(A_shared[0:32, 0:32], Out_shared[0:32], "
+        'buffer[0:4, 0:32], buffer_1[0:4, 0:32], "sum", 2, 1, '
+        "T.bool(False), buffer_2[0:32], bx)"
+    ) in script
 
 
 def test_comm_buffer_like_region_python_api():

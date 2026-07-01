@@ -4,6 +4,7 @@ from collections.abc import Iterable
 
 from tvm.target import Target
 from tilelang.jit.adapter.utils import is_cutedsl_target
+from tilelang.utils.target import target_is_sunmmio
 
 # Canonical names for execution backends used internally
 _CANONICAL_MAP = {
@@ -33,6 +34,8 @@ def allowed_backends_for_target(target: Target, *, include_unavailable: bool = T
 
     if is_cutedsl_target(target):
         return ["cutedsl"]
+    elif target_is_sunmmio(target):
+        return ["sunmmio", "sunmmio_sunsim"]
     elif kind == "cuda":
         allowed = ["tvm_ffi", "nvrtc", "cython"]
     elif kind == "hip":
@@ -79,6 +82,8 @@ def resolve_execution_backend(requested: str | None, target: Target) -> str:
     if req in (None, "auto"):
         if is_cutedsl_target(target):
             return "cutedsl"
+        if target_is_sunmmio(target):
+            return "sunmmio"
         kind = _target_kind(target)
         if kind == "cuda" or kind == "metal":
             choice = "tvm_ffi"

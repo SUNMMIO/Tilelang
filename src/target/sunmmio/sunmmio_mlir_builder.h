@@ -70,7 +70,8 @@ public:
   SunMMIOValue Alloc(const std::string &result_name,
                      const SunMMIOType &memref_type,
                      const std::vector<SunMMIOValue> &dyn_extents,
-                     const std::string &scope_name, DataType dtype) final;
+                     const std::string &scope_name, DataType dtype,
+                     std::optional<std::string> ping_pong) final;
 
   SunMMIOValue Load(const std::string &result_name,
                     const std::string &buffer_handle,
@@ -95,6 +96,9 @@ public:
   SunMMIOValue TileFill(const std::string &result_name,
                         const SunMMIOValue &scalar,
                         const SunMMIOType &tile_type, DataType dtype) final;
+
+  SunMMIOValue TileRange(const std::string &result_name,
+                         const SunMMIOType &tile_type, DataType dtype) final;
 
   SunMMIOValue TileUnsqueeze(const std::string &result_name,
                              const SunMMIOValue &tile,
@@ -185,16 +189,26 @@ public:
                 const SunMMIOValue &ub, const SunMMIOValue &step,
                 const ffi::Map<ffi::String, ffi::Any> &annotations,
                 const std::vector<SunMMIOValue> &live_out_values) final;
+  void BeginFor(const std::string &iv, const SunMMIOValue &lb,
+                const SunMMIOValue &ub, const SunMMIOValue &step,
+                const ffi::Map<ffi::String, ffi::Any> &annotations,
+                const std::vector<int64_t> &live_out_token_ids,
+                const std::vector<SunMMIOValue> &live_out_values) final;
   void EndFor() final;
 
   void BeginIf(const SunMMIOValue &cond,
                const std::vector<int64_t> &live_out_token_ids) final;
   void BeginIf(const SunMMIOValue &cond,
                const std::vector<SunMMIOValue> &live_out_values) final;
+  void BeginIf(const SunMMIOValue &cond,
+               const std::vector<int64_t> &live_out_token_ids,
+               const std::vector<SunMMIOValue> &live_out_values) final;
   void BeginElse() final;
   void EndIf() final;
 
   void BeginWhile(const std::vector<int64_t> &live_out_token_ids) final;
+  void BeginWhile(const std::vector<int64_t> &live_out_token_ids,
+                  const std::vector<SunMMIOValue> &live_out_values) final;
   void BeginWhileBody(const SunMMIOValue &cond) final;
   void EndWhile() final;
 

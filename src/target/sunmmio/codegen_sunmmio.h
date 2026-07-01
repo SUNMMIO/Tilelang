@@ -3,6 +3,7 @@
 
 #include <tvm/ir/module.h>
 #include <tvm/ir/type.h>
+#include <tvm/target/target.h>
 #include <tvm/tir/expr_functor.h>
 #include <tvm/tir/function.h>
 #include <tvm/tir/stmt.h>
@@ -113,7 +114,8 @@ public:
   virtual SunMMIOValue Alloc(const std::string &result_name,
                              const SunMMIOType &memref_type,
                              const std::vector<SunMMIOValue> &dyn_extents,
-                             const std::string &scope_name, DataType dtype) = 0;
+                             const std::string &scope_name, DataType dtype,
+                             std::optional<std::string> ping_pong) = 0;
 
   virtual SunMMIOValue Load(const std::string &result_name,
                             const std::string &buffer_handle,
@@ -139,6 +141,10 @@ public:
                                 const SunMMIOValue &scalar,
                                 const SunMMIOType &tile_type,
                                 DataType dtype) = 0;
+
+  virtual SunMMIOValue TileRange(const std::string &result_name,
+                                 const SunMMIOType &tile_type,
+                                 DataType dtype) = 0;
 
   virtual SunMMIOValue TileUnsqueeze(const std::string &result_name,
                                      const SunMMIOValue &tile,
@@ -236,16 +242,26 @@ public:
                         const SunMMIOValue &ub, const SunMMIOValue &step,
                         const ffi::Map<ffi::String, ffi::Any> &annotations,
                         const std::vector<SunMMIOValue> &live_out_values) = 0;
+  virtual void BeginFor(const std::string &iv, const SunMMIOValue &lb,
+                        const SunMMIOValue &ub, const SunMMIOValue &step,
+                        const ffi::Map<ffi::String, ffi::Any> &annotations,
+                        const std::vector<int64_t> &live_out_token_ids,
+                        const std::vector<SunMMIOValue> &live_out_values) = 0;
   virtual void EndFor() = 0;
 
   virtual void BeginIf(const SunMMIOValue &cond,
                        const std::vector<int64_t> &live_out_token_ids) = 0;
   virtual void BeginIf(const SunMMIOValue &cond,
                        const std::vector<SunMMIOValue> &live_out_values) = 0;
+  virtual void BeginIf(const SunMMIOValue &cond,
+                       const std::vector<int64_t> &live_out_token_ids,
+                       const std::vector<SunMMIOValue> &live_out_values) = 0;
   virtual void BeginElse() = 0;
   virtual void EndIf() = 0;
 
   virtual void BeginWhile(const std::vector<int64_t> &live_out_token_ids) = 0;
+  virtual void BeginWhile(const std::vector<int64_t> &live_out_token_ids,
+                          const std::vector<SunMMIOValue> &live_out_values) = 0;
   virtual void BeginWhileBody(const SunMMIOValue &cond) = 0;
   virtual void EndWhile() = 0;
 
@@ -279,6 +295,7 @@ public:
   CodeGenTileLangSunMMIO();
   ~CodeGenTileLangSunMMIO() noexcept override = default;
 
+  void SetTarget(tvm::Target target);
   void Init();
   void Clear();
   void AddFunction(const GlobalVar &gvar, const tir::PrimFunc &f);
@@ -384,7 +401,17 @@ private:
                         const ffi::Array<PrimExpr> &indices);
   void EmitStore(const tir::Buffer &buffer, const ffi::Array<PrimExpr> &indices,
                  const SunMMIOValue &value);
-  void EmitAlloc(const tir::Buffer &buffer, const std::string &scope_hint);
+  void EmitAlloc(const tir::Buffer &buffer, const std::string &scope_hint,
+                 const ffi::Map<ffi::String, ffi::Any> &annotations);
+  void EmitLocalVarAlloc(const tir::AllocateNode *op,
+                         const tir::Buffer &buffer);
+  SunMMIOValue EmitLocalVarLoad(const tir::Buffer &buffer,
+                                const ffi::Array<PrimExpr> &indices);
+  void EmitLocalVarStore(const tir::Buffer &buffer,
+                         const ffi::Array<PrimExpr> &indices,
+                         const SunMMIOValue &value);
+  std::vector<SunMMIOValue>
+  CollectLocalVarLiveOutValues(const tir::Stmt &stmt) const;
   bool TryLowerTilesScope(const tir::ForNode *op);
   void EmitFor(const tir::ForNode *op);
   void EmitIf(const tir::IfThenElseNode *op);
@@ -402,6 +429,7 @@ private:
   CompareDomain GetCompareDomain(DataType dtype) const;
   SunMMIOValue BindVar(const tir::Var &var, const SunMMIOValue &value);
   const SunMMIOValue &LookupVar(const tir::VarNode *var) const;
+  const SunMMIOValue &LookupLocalVar(const tir::VarNode *var) const;
   SunMMIOValue MaterializeDynamicLayoutExpr(const tvm::PrimExpr &expr);
   std::vector<SunMMIOValue>
   CollectDynamicLayoutValues(const std::vector<PrimExpr> &exprs);
@@ -420,17 +448,21 @@ private:
                                     const std::string &detail = "") const;
 
   std::unique_ptr<SunMMIOBuilder> builder_;
+  tvm::Target target_;
   bool initialized_{false};
   int ssa_counter_{0};
 
   std::unordered_map<const tir::VarNode *, SunMMIOValue> var_table_;
+  std::unordered_map<const tir::VarNode *, SunMMIOValue> local_var_table_;
   std::unordered_map<const tir::BufferNode *, BufferBinding> buffer_registry_;
   std::unordered_map<const tir::VarNode *, tir::Buffer> buffer_data_to_buffer_;
   std::vector<ScopedAttr> attr_stack_;
 
   std::vector<const tir::VarNode *> scoped_vars_;
+  std::vector<const tir::VarNode *> scoped_local_vars_;
   std::vector<const tir::BufferNode *> scoped_buffers_;
   std::vector<size_t> var_scope_markers_;
+  std::vector<size_t> local_var_scope_markers_;
   std::vector<size_t> buffer_scope_markers_;
 
   // Traversal coverage sets for codegen completeness checking.

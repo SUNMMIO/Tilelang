@@ -37,7 +37,7 @@ class KernelCache:
     _instance = None  # For implementing singleton pattern
     _lock = threading.Lock()  # For thread safety
     _memory_cache = {}  # In-memory cache dictionary
-    execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "tvm_ffi"
+    execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "sunmmio", "sunmmio_sunsim"] = "tvm_ffi"
     device_kernel_path = "device_kernel.cu"
     host_kernel_path = "host_kernel.cu"
     kernel_lib_path = "kernel_lib.so"
@@ -128,7 +128,7 @@ class KernelCache:
         self,
         func: Callable,
         out_idx: list[int],
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "tvm_ffi",
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "sunmmio", "sunmmio_sunsim"] = "tvm_ffi",
         args=None,
         target: str | Target = "auto",
         target_host: str | Target = None,
@@ -174,7 +174,7 @@ class KernelCache:
         *args,
         target: str | Target,
         target_host: str | Target | None = None,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "tvm_ffi",
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "sunmmio", "sunmmio_sunsim"] = "tvm_ffi",
         verbose: bool,
         pass_configs: dict | None = None,
         compile_flags: list[str] | str | None = None,
@@ -310,19 +310,32 @@ class KernelCache:
 
     @staticmethod
     def _safe_write_file(path: str, mode: str, operation: Callable):
-        # Random a temporary file within the same FS as the cache directory
-        temp_path = os.path.join(env.TILELANG_TMP_DIR, f"{os.getpid()}_{uuid.uuid4()}")
-        with open(temp_path, mode) as temp_file:
-            operation(temp_file)
+        # Stage the temporary file next to the destination so os.replace is
+        # atomic and does not fail when TILELANG_TMP_DIR is on another device.
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        temp_path = os.path.join(directory, f".{os.getpid()}_{uuid.uuid4()}.tmp")
+        try:
+            with open(temp_path, mode) as temp_file:
+                operation(temp_file)
 
-        # Use atomic POSIX replace, so other processes cannot see a partial write
-        os.replace(temp_path, path)
+            # Use atomic POSIX replace, so other processes cannot see a partial write
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
     @classmethod
     def _safe_write_executable(cls, executable: Executable, path: str):
-        temp_path = os.path.join(env.TILELANG_TMP_DIR, f"{os.getpid()}_{uuid.uuid4()}.so")
-        executable.export_library(temp_path, **cls._get_compile_args())
-        os.replace(temp_path, path)
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        temp_path = os.path.join(directory, f".{os.getpid()}_{uuid.uuid4()}.so")
+        try:
+            executable.export_library(temp_path, **cls._get_compile_args())
+            os.replace(temp_path, path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
     def _save_kernel_to_disk(self, key: str, kernel: JITKernel, func: Callable = None, verbose: bool = False):
         """
@@ -379,7 +392,7 @@ class KernelCache:
         target: str | Target = "auto",
         target_host: str | Target | None = None,
         out_idx: list[int] | None = None,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "tvm_ffi",
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "sunmmio", "sunmmio_sunsim"] = "tvm_ffi",
         pass_configs: dict | None = None,
         compile_flags: list[str] | str | None = None,
         func: Callable | None = None,
@@ -513,7 +526,7 @@ class KernelCache:
         target: str | Target,
         target_host: str | Target | None,
         out_idx: list[int] | None,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"],
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "sunmmio", "sunmmio_sunsim"],
         pass_configs: dict | None,
         compile_flags: list[str] | str | None,
     ) -> JITKernel | None:

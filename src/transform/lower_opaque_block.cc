@@ -22,6 +22,7 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/ffi/string.h>
 #include <tvm/ir/attrs.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
@@ -48,6 +49,10 @@ public:
     if (auto existing =
             fptr->attrs.GetAttr<Map<Var, PrimExpr>>(tl::attr::kLocalVarInit)) {
       lower.local_var_init_map_ = existing.value();
+    }
+    if (auto existing = fptr->attrs.GetAttr<Map<Var, String>>(
+            tl::attr::kSunmmioAllocPingPong)) {
+      lower.alloc_ping_pong_map_ = existing.value();
     }
     lower.storage_align_ = CollectStorageAlignAnnotation(fptr->body);
     fptr->body = lower(std::move(fptr->body));
@@ -97,6 +102,11 @@ private:
       if (init_it != local_var_init_map_.end()) {
         const PrimExpr &init = (*init_it).second;
         allocate_annotations.Set(tl::attr::kLocalVarInit, init);
+      }
+      auto ping_pong_it = alloc_ping_pong_map_.find(buffer->data);
+      if (ping_pong_it != alloc_ping_pong_map_.end()) {
+        allocate_annotations.Set(tl::attr::kSunmmioAllocPingPong,
+                                 (*ping_pong_it).second);
       }
       body = Allocate(buffer->data, buffer->dtype, allocation_shape,
                       const_true(), std::move(body), allocate_annotations);
@@ -290,6 +300,9 @@ private:
 
   /*! \brief Local var initializers collected from block annotations. */
   Map<Var, PrimExpr> local_var_init_map_;
+
+  /*! \brief SunMMIO alloc ping-pong attrs collected from function attrs. */
+  Map<Var, String> alloc_ping_pong_map_;
 };
 
 PrimFunc TLLowerOpaqueBlock(PrimFunc f) {

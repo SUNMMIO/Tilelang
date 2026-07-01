@@ -15,7 +15,7 @@ from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR, CUTLASS_INCLUDE_DIR, TIL
 from tilelang.transform import PassConfigKey
 from tilelang.transform.metal import MarkHostMetalContext
 from tilelang.engine.param import KernelParam, CompiledArtifact
-from tilelang.utils.target import determine_target
+from tilelang.utils.target import determine_target, target_is_sunmmio
 from tilelang.engine.phase import (
     PreLowerSemanticCheck,
     LowerAndLegalize,
@@ -54,6 +54,19 @@ def get_device_call(is_device_c: bool = False) -> Callable[[tir.PrimFunc], bool]
 
 def get_host_call(is_device_c: bool = False) -> Callable[[tir.PrimFunc], bool]:
     return lambda func: not get_device_call(is_device_c)(func)
+
+
+def is_sunmmio_call(func: tir.PrimFunc):
+    attrs = func.attrs
+    return bool(attrs and "target" in attrs and target_is_sunmmio(attrs["target"]))
+
+
+def get_host_device_call(target: Target) -> tuple[Callable[[tir.PrimFunc], bool], Callable[[tir.PrimFunc], bool]]:
+    if target_is_sunmmio(target):
+        return lambda func: not is_sunmmio_call(func), is_sunmmio_call
+
+    is_device_c = is_cpu_device_backend(target)
+    return get_host_call(is_device_c=is_device_c), get_device_call(is_device_c=is_device_c)
 
 
 @tvm_ffi.register_global_func("tilelang_callback_cuda_compile", override=True)
@@ -166,6 +179,12 @@ def host_codegen(host_mod: tvm.IRModule, target_host: Target) -> tvm.IRModule:
 
 
 def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
+    if target_is_sunmmio(target):
+        build = tvm.ffi.get_global_func("target.build.tilelang_sunmmio", allow_missing=True)
+        if build is None:
+            raise ValueError("Sunmmio codegen is not available in this build. Rebuild TileLang with USE_SUNMMIO=ON.")
+        return build(device_mod, target)
+
     device_mod = tilelang.transform.LowerDeviceStorageAccessInfo()(device_mod)
     device_mod = tilelang.transform.LowerIntrin()(device_mod)
     device_mod = tir.transform.Simplify()(device_mod)
@@ -185,6 +204,12 @@ def device_codegen(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
 
 
 def device_codegen_without_compile(device_mod: tvm.IRModule, target: Target) -> tvm.IRModule:
+    if target_is_sunmmio(target):
+        build = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile", allow_missing=True)
+        if build is None:
+            raise ValueError("Sunmmio SUVM codegen is not available in this build. Rebuild TileLang with USE_SUNMMIO=ON.")
+        return build(device_mod, target, "suvm")
+
     device_mod = tilelang.transform.LowerDeviceStorageAccessInfo()(device_mod)
     device_mod = tilelang.transform.LowerIntrin()(device_mod)
     device_mod = tir.transform.Simplify()(device_mod)
@@ -239,8 +264,7 @@ def lower(
     target_host = tvm.target.Target.canon_target(target_host)
     target = tvm.target.Target(target, target_host)
 
-    _is_host_call = get_host_call(is_device_c=is_cpu_device_backend(target))
-    _is_device_call = get_device_call(is_device_c=is_cpu_device_backend(target))
+    _is_host_call, _is_device_call = get_host_device_call(target)
 
     # Before lowering, do semantic check
     PreLowerSemanticCheck(mod)

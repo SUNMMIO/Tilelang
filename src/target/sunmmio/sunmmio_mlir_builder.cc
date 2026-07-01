@@ -26,9 +26,8 @@ void SuvmSunmmioBuilder::Init() { Clear(); }
 void SuvmSunmmioBuilder::Clear() { ctx_.Clear(); }
 
 std::string SuvmSunmmioBuilder::Finish() {
-  if (!ctx_.module) {
-    return "";
-  }
+  ICHECK(ctx_.module)
+      << "SuvmSunmmioBuilder::Finish called without an initialized MLIR module";
   std::string out;
   llvm::raw_string_ostream os(out);
   ctx_.module->print(os);
@@ -148,13 +147,12 @@ SunMMIOValue SuvmSunmmioBuilder::BindLayout(
   return SunMMIOValue{source.dtype, result_name, source.type};
 }
 
-SunMMIOValue
-SuvmSunmmioBuilder::Alloc(const std::string &result_name,
-                          const SunMMIOType &memref_type,
-                          const std::vector<SunMMIOValue> &dyn_extents,
-                          const std::string &scope_name, DataType dtype) {
+SunMMIOValue SuvmSunmmioBuilder::Alloc(
+    const std::string &result_name, const SunMMIOType &memref_type,
+    const std::vector<SunMMIOValue> &dyn_extents, const std::string &scope_name,
+    DataType dtype, std::optional<std::string> ping_pong) {
   return memory_->Alloc(result_name, memref_type, dyn_extents, scope_name,
-                        dtype);
+                        dtype, std::move(ping_pong));
 }
 
 SunMMIOValue SuvmSunmmioBuilder::Load(const std::string &result_name,
@@ -189,6 +187,12 @@ SunMMIOValue SuvmSunmmioBuilder::TileFill(const std::string &result_name,
                                           const SunMMIOType &tile_type,
                                           DataType dtype) {
   return tile_->TileFill(result_name, scalar, tile_type, dtype);
+}
+
+SunMMIOValue SuvmSunmmioBuilder::TileRange(const std::string &result_name,
+                                           const SunMMIOType &tile_type,
+                                           DataType dtype) {
+  return tile_->TileRange(result_name, tile_type, dtype);
 }
 
 SunMMIOValue SuvmSunmmioBuilder::TileUnsqueeze(const std::string &result_name,
@@ -325,7 +329,7 @@ void SuvmSunmmioBuilder::BeginFor(
     const SunMMIOValue &step,
     const ffi::Map<ffi::String, ffi::Any> &annotations,
     const std::vector<int64_t> &live_out_token_ids) {
-  function_->BeginFor(iv, lb, ub, step, annotations, live_out_token_ids);
+  function_->BeginFor(iv, lb, ub, step, annotations, live_out_token_ids, {});
 }
 
 void SuvmSunmmioBuilder::BeginFor(
@@ -333,7 +337,17 @@ void SuvmSunmmioBuilder::BeginFor(
     const SunMMIOValue &step,
     const ffi::Map<ffi::String, ffi::Any> &annotations,
     const std::vector<SunMMIOValue> &live_out_values) {
-  function_->BeginFor(iv, lb, ub, step, annotations, live_out_values);
+  function_->BeginFor(iv, lb, ub, step, annotations, {}, live_out_values);
+}
+
+void SuvmSunmmioBuilder::BeginFor(
+    const std::string &iv, const SunMMIOValue &lb, const SunMMIOValue &ub,
+    const SunMMIOValue &step,
+    const ffi::Map<ffi::String, ffi::Any> &annotations,
+    const std::vector<int64_t> &live_out_token_ids,
+    const std::vector<SunMMIOValue> &live_out_values) {
+  function_->BeginFor(iv, lb, ub, step, annotations, live_out_token_ids,
+                      live_out_values);
 }
 
 void SuvmSunmmioBuilder::EndFor() { function_->EndFor(); }
@@ -349,6 +363,12 @@ void SuvmSunmmioBuilder::BeginIf(
   function_->BeginIf(cond, live_out_values);
 }
 
+void SuvmSunmmioBuilder::BeginIf(
+    const SunMMIOValue &cond, const std::vector<int64_t> &live_out_token_ids,
+    const std::vector<SunMMIOValue> &live_out_values) {
+  function_->BeginIf(cond, live_out_token_ids, live_out_values);
+}
+
 void SuvmSunmmioBuilder::BeginElse() { function_->BeginElse(); }
 
 void SuvmSunmmioBuilder::EndIf() { function_->EndIf(); }
@@ -356,6 +376,12 @@ void SuvmSunmmioBuilder::EndIf() { function_->EndIf(); }
 void SuvmSunmmioBuilder::BeginWhile(
     const std::vector<int64_t> &live_out_token_ids) {
   function_->BeginWhile(live_out_token_ids);
+}
+
+void SuvmSunmmioBuilder::BeginWhile(
+    const std::vector<int64_t> &live_out_token_ids,
+    const std::vector<SunMMIOValue> &live_out_values) {
+  function_->BeginWhile(live_out_token_ids, live_out_values);
 }
 
 void SuvmSunmmioBuilder::BeginWhileBody(const SunMMIOValue &cond) {

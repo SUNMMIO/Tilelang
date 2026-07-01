@@ -566,6 +566,13 @@ struct AsyncOpRecord {
   std::vector<AccessRecord> writes;
 };
 
+struct SyncAccessRecord {
+  const StmtNode *stmt{nullptr};
+  int order{-1};
+  std::vector<AccessRecord> reads;
+  std::vector<AccessRecord> writes;
+};
+
 class LoopAsyncCollector : public StmtVisitor {
 public:
   void VisitStmt_(const EvaluateNode *op) final {
@@ -606,7 +613,33 @@ public:
     }
     StmtVisitor::VisitStmt_(op);
   }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    SyncAccessRecord rec;
+    rec.stmt = op;
+    rec.order = order_++;
+
+    Array<Range> region;
+    region.reserve(op->indices.size());
+    for (const auto &index : op->indices) {
+      region.push_back(Range::FromMinExtent(index, 1));
+    }
+    rec.writes.push_back({op->buffer, region});
+
+    BufferAccessCollector read_collector({});
+    read_collector(op->value);
+    for (const BufferRegion &read : read_collector.GetReads()) {
+      rec.reads.push_back({read->buffer, read->region});
+    }
+
+    stmt_order[op] = rec.order;
+    sync_accesses.push_back(std::move(rec));
+    StmtVisitor::VisitStmt_(op);
+  }
+
   std::vector<AsyncOpRecord> async_ops;
+  std::vector<SyncAccessRecord> sync_accesses;
+  std::unordered_map<const StmtNode *, int> stmt_order;
 
 private:
   int order_{0};
@@ -619,9 +652,12 @@ struct LoopScope {
   Var loop_var;
   PrimExpr loop_extent;
   std::vector<AsyncOpRecord> async_ops;
+  std::vector<SyncAccessRecord> sync_accesses;
   std::map<int, std::set<int>> prev_iter_waits_by_curr_token;
+  std::map<int, std::set<int>> prev_iter_waits_by_sync_order;
   std::set<int> loop_entry_null_tokens;
   std::map<int, const CallNode *> token_to_call;
+  std::unordered_map<const StmtNode *, int> stmt_order;
 };
 
 // Main rewriter class to inject synchronization primitives.
@@ -711,6 +747,37 @@ private:
     }
     for (const auto &prev_write : prev_op.writes) {
       for (const auto &curr_write : curr_op.writes) {
+        if (AccessMayDependAcrossIterations(prev_write, curr_write, scope)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  bool HasLoopCarriedDependence(const AsyncOpRecord &prev_op,
+                                const SyncAccessRecord &curr_access,
+                                const LoopScope &scope) const {
+    if (prev_op.order < curr_access.order) {
+      return false;
+    }
+
+    for (const auto &prev_write : prev_op.writes) {
+      for (const auto &curr_read : curr_access.reads) {
+        if (AccessMayDependAcrossIterations(prev_write, curr_read, scope)) {
+          return true;
+        }
+      }
+    }
+    for (const auto &prev_read : prev_op.reads) {
+      for (const auto &curr_write : curr_access.writes) {
+        if (AccessMayDependAcrossIterations(prev_read, curr_write, scope)) {
+          return true;
+        }
+      }
+    }
+    for (const auto &prev_write : prev_op.writes) {
+      for (const auto &curr_write : curr_access.writes) {
         if (AccessMayDependAcrossIterations(prev_write, curr_write, scope)) {
           return true;
         }
@@ -809,6 +876,20 @@ private:
         scope->loop_entry_null_tokens.insert(prev_op.token);
       }
     }
+
+    for (const auto &prev_op : scope->async_ops) {
+      if (HasIntraIterationDependentSuccessor(prev_op, *scope)) {
+        continue;
+      }
+      for (const auto &curr_access : scope->sync_accesses) {
+        if (!HasLoopCarriedDependence(prev_op, curr_access, *scope)) {
+          continue;
+        }
+        scope->prev_iter_waits_by_sync_order[curr_access.order].insert(
+            prev_op.token);
+        scope->loop_entry_null_tokens.insert(prev_op.token);
+      }
+    }
   }
 
   void AnalyzeWhileLoopCarriedDependencies(LoopScope *scope) {
@@ -840,6 +921,26 @@ private:
     for (int token : scope.loop_entry_null_tokens) {
       stmts.push_back(Evaluate(Call(DataType::Handle(), sync_null_token(),
                                     {IntImm(DataType::Int(32), token)})));
+    }
+  }
+
+  int PreAssignLoopToken(const AsyncOpRecord &async_op,
+                         std::vector<const EvaluateNode *> *owned_ops) {
+    auto it = pre_assigned_tokens_.find(async_op.op);
+    if (it != pre_assigned_tokens_.end()) {
+      return it->second;
+    }
+
+    int token = GetNextTokenId();
+    pre_assigned_tokens_[async_op.op] = token;
+    owned_ops->push_back(async_op.op);
+    return token;
+  }
+
+  void ClearOwnedPreAssignedTokens(
+      const std::vector<const EvaluateNode *> &owned_ops) {
+    for (const EvaluateNode *op : owned_ops) {
+      pre_assigned_tokens_.erase(op);
     }
   }
 
@@ -947,6 +1048,29 @@ private:
         continue;
       }
       for (int token_id : it->second) {
+        if (injected_tokens.count(token_id) != 0) {
+          continue;
+        }
+        process_wait_token_and_barrier_wait(stmts, token_id);
+        injected_tokens.insert(token_id);
+      }
+    }
+  }
+
+  void InjectLoopCarriedWaitsForSyncStmt(Array<Stmt> &stmts,
+                                         const StmtNode *stmt) {
+    std::unordered_set<int> injected_tokens;
+    for (int i = static_cast<int>(loop_scopes_.size()) - 1; i >= 0; --i) {
+      auto order_it = loop_scopes_[i].stmt_order.find(stmt);
+      if (order_it == loop_scopes_[i].stmt_order.end()) {
+        continue;
+      }
+      auto waits_it =
+          loop_scopes_[i].prev_iter_waits_by_sync_order.find(order_it->second);
+      if (waits_it == loop_scopes_[i].prev_iter_waits_by_sync_order.end()) {
+        continue;
+      }
+      for (int token_id : waits_it->second) {
         if (injected_tokens.count(token_id) != 0) {
           continue;
         }
@@ -1169,13 +1293,15 @@ private:
 
     LoopScope scope;
     scope.async_ops = collector.async_ops;
+    scope.sync_accesses = collector.sync_accesses;
+    scope.stmt_order = collector.stmt_order;
+    std::vector<const EvaluateNode *> owned_pre_assignments;
     for (auto &async_op : scope.async_ops) {
       // Pre-assign a stable token id for each async site in this loop.
       // This lets the body rewriter attach the same token id every iteration,
       // enabling consistent loop-carried dependency reasoning.
-      int token = GetNextTokenId();
+      int token = PreAssignLoopToken(async_op, &owned_pre_assignments);
       async_op.token = token;
-      pre_assigned_tokens_[async_op.op] = token;
 
       // Keep a back-reference from token -> call for special handling after we
       // finish rewriting the loop (e.g. broadcast barrier initialization).
@@ -1197,9 +1323,7 @@ private:
 
     scope = loop_scopes_.back();
     loop_scopes_.pop_back();
-    for (const auto &async_op : scope.async_ops) {
-      pre_assigned_tokens_.erase(async_op.op);
-    }
+    ClearOwnedPreAssignedTokens(owned_pre_assignments);
 
     InjectLoopEntryNullTokens(scope, stmts);
     stmts.push_back(loop_stmt);
@@ -1237,6 +1361,7 @@ private:
 
   Stmt VisitStmt_(const BufferStoreNode *op) {
     Array<Stmt> stmts;
+    InjectLoopCarriedWaitsForSyncStmt(stmts, op);
 
     // For a buffer store statement, we need to check the dependencies for the
     // buffer to be stored. For example, in the statement A[i] = B[j] + C[k], we
@@ -1435,11 +1560,13 @@ private:
     scope.loop_var = loop->loop_var;
     scope.loop_extent = loop->extent;
     scope.async_ops = collector.async_ops;
+    scope.sync_accesses = collector.sync_accesses;
+    scope.stmt_order = collector.stmt_order;
 
+    std::vector<const EvaluateNode *> owned_pre_assignments;
     for (auto &async_op : scope.async_ops) {
-      int token = GetNextTokenId();
+      int token = PreAssignLoopToken(async_op, &owned_pre_assignments);
       async_op.token = token;
-      pre_assigned_tokens_[async_op.op] = token;
 
       const CallNode *call = async_op.call;
       scope.token_to_call[token] = call;
@@ -1458,9 +1585,7 @@ private:
 
     scope = loop_scopes_.back();
     loop_scopes_.pop_back();
-    for (const auto &async_op : scope.async_ops) {
-      pre_assigned_tokens_.erase(async_op.op);
-    }
+    ClearOwnedPreAssignedTokens(owned_pre_assignments);
 
     InjectLoopEntryNullTokens(scope, stmts);
     stmts.push_back(loop_stmt);
@@ -1518,12 +1643,19 @@ public:
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == tir::attr::thread_extent) {
+      bool is_outermost_thread_extent = thread_extent_depth_ == 0;
+      ++thread_extent_depth_;
       Stmt body = StmtMutator::VisitStmt(op->body);
+      --thread_extent_depth_;
 
-      DeviceTokenCollector collector;
+      if (!is_outermost_thread_extent) {
+        return AttrStmt(op->node, op->attr_key, op->value, body);
+      }
+
+      DevicePendingTokenCollector collector;
       collector(body);
 
-      if (collector.tokens.empty()) {
+      if (collector.pending_tokens.empty()) {
         return AttrStmt(op->node, op->attr_key, op->value, body);
       }
 
@@ -1534,7 +1666,8 @@ public:
         stmts.push_back(body);
       }
 
-      std::vector<int> tokens(collector.tokens.begin(), collector.tokens.end());
+      std::vector<int> tokens(collector.pending_tokens.begin(),
+                              collector.pending_tokens.end());
       std::sort(tokens.begin(), tokens.end());
 
       for (int token_id : tokens) {
@@ -1559,18 +1692,55 @@ public:
 
 private:
   TokenBarrierMap token_to_barrier_mask_;
+  int thread_extent_depth_{0};
 
-  // Helper to collect all token IDs referenced within the device block.
-  class DeviceTokenCollector : public StmtExprVisitor {
+  // Helper to collect token IDs that are still pending at device-function exit.
+  class DevicePendingTokenCollector : public StmtExprVisitor {
   public:
     void VisitExpr_(const CallNode *op) final {
       if (op->op.same_as(sync_token_id())) {
         int token_id = op->args[0].as<IntImm>().value()->value;
-        tokens.insert(token_id);
+        pending_tokens.insert(token_id);
       }
       StmtExprVisitor::VisitExpr_(op);
     }
-    std::set<int> tokens;
+
+    void VisitStmt_(const EvaluateNode *op) final {
+      if (const CallNode *call = op->value.as<CallNode>()) {
+        if (call->op.same_as(wait_token())) {
+          if (!call->args.empty() && call->args[0].as<IntImmNode>()) {
+            pending_tokens.erase(call->args[0].as<IntImmNode>()->value);
+          }
+        }
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+
+    void VisitStmt_(const IfThenElseNode *op) final {
+      auto pending_before = pending_tokens;
+
+      VisitStmt(op->then_case);
+      auto then_pending = pending_tokens;
+
+      pending_tokens = pending_before;
+      if (op->else_case.defined()) {
+        VisitStmt(op->else_case.value());
+      }
+
+      pending_tokens.insert(then_pending.begin(), then_pending.end());
+    }
+
+    void VisitStmt_(const ForNode *op) final { VisitStmt(op->body); }
+
+    void VisitStmt_(const WhileNode *op) final { VisitStmt(op->body); }
+
+    void VisitStmt_(const SeqStmtNode *op) final {
+      for (const Stmt &stmt : op->seq) {
+        VisitStmt(stmt);
+      }
+    }
+
+    std::set<int> pending_tokens;
   };
 };
 
@@ -1696,6 +1866,39 @@ private:
                      token_id) != current_token_ids_.end();
   }
 
+  void MarkTokenPending(int token_id) {
+    current_token_ids_.erase(std::remove(current_token_ids_.begin(),
+                                         current_token_ids_.end(), token_id),
+                             current_token_ids_.end());
+  }
+
+  void MarkGeneratedAsyncTokensPending(const Stmt &stmt) {
+    class Collector final : public StmtExprVisitor {
+    public:
+      void VisitStmt_(const AttrStmtNode *op) final {}
+      void VisitStmt_(const ForNode *op) final {}
+      void VisitStmt_(const IfThenElseNode *op) final {}
+      void VisitStmt_(const WhileNode *op) final {}
+
+      void VisitExpr_(const CallNode *op) final {
+        if (op->op.same_as(sync_token_id()) && !op->args.empty()) {
+          if (const auto *imm = op->args[0].as<IntImmNode>()) {
+            token_ids.push_back(imm->value);
+          }
+        }
+        StmtExprVisitor::VisitExpr_(op);
+      }
+
+      std::vector<int> token_ids;
+    };
+
+    Collector collector;
+    collector(stmt);
+    for (int token_id : collector.token_ids) {
+      MarkTokenPending(token_id);
+    }
+  }
+
   bool IsBarrierWaitForToken(const Stmt &stmt, int token_id) const {
     auto it = token_to_barrier_mask_.find(token_id);
     if (it == token_to_barrier_mask_.end()) {
@@ -1819,9 +2022,18 @@ private:
         MarkTokenResolved(token_id);
       }
       Stmt rewritten = VisitStmt(op->seq[i]);
+      MarkGeneratedAsyncTokensPending(rewritten);
       PushNonRedundantStmt(&out, rewritten);
     }
     return SeqStmt::Flatten(out);
+  }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    auto body_rewriter = EliminateRedundancyRewriter(
+        analyzer_, get_all_token_ids(), token_to_barrier_mask_);
+    Stmt body = body_rewriter(op->body);
+    PropagateResolvedStates(body, /*guaranteed_to_execute=*/true);
+    return AttrStmt(op->node, op->attr_key, op->value, body, op->span);
   }
 
   Stmt VisitStmt_(const IfThenElseNode *op) {
