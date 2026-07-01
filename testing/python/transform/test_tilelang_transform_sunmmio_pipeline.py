@@ -5,6 +5,7 @@ import tilelang.language as T
 from tilelang.engine.phase import *
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tilelang.language.mesh_tensor import MeshShardingPolicy
+from examples.gemm.sunmmio_example_gemm import matmul_persistent
 
 _get_logical_shape = tvm.ffi.get_global_func("tl.CuteLayout_logical_shape")
 
@@ -563,6 +564,16 @@ CASES = [
             "K_pe_shared": [3, 64, 64],
         },
     ),
+    (
+        "matmul_persistent",
+        lambda: matmul_persistent(1024, 1024, 1024, 128, 128, 32, num_stages=2),
+        {
+            "A_shared_dist": [2, 128, 128],
+            "A_shared": [2, 128, 32],
+            "B_shared": [2, 32, 128],
+            "B_shared_dist": [2, 128, 128],
+        },
+    ),
 ]
 
 
@@ -627,3 +638,90 @@ def test_tilelang_transform_sunmmio_pipeline(case_name, kernel, expected_layout_
         mod = tl.transform.SunmmioPipelinePlanning(debug=False)(mod)
         mod = tl.transform.InjectSunmmioPipeline()(mod)
         assert_multiversioned_func_layouts(mod["main"], expected_layout_shapes)
+
+
+def if_matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="bfloat16", accum_dtype="float"):
+    @T.prim_func
+    def gemm(
+        A: T.MeshTensor(
+            (M, K),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            dtype=dtype,
+        ),
+        B: T.MeshTensor(
+            (K, N),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            dtype=dtype,
+        ),
+        C: T.MeshTensor(
+            (M, N),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            dtype=accum_dtype,
+        ),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                if k > 1:
+                    T.copy(A[by * block_M, k * block_K], A_shared)
+                    T.copy(B[k * block_K, bx * block_N], B_shared)
+                    T.gemm(A_shared, B_shared, C_shared)
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return gemm
+
+
+def tvm_access_ptr():
+    @T.prim_func
+    def test(
+        A: T.MeshTensor(
+            (M, K),
+            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            device_mesh_config=(2, 2),
+            dtype=dtype,
+        ),
+    ):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+            A_shared = T.alloc_shared((block_M, block_K), dtype)
+            B_shared = T.alloc_shared((block_K, block_N), dtype)
+            C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                if k > 1:
+                    T.copy(A[by * block_M, k * block_K], A_shared)
+                    T.copy(B[k * block_K, bx * block_N], B_shared)
+                    T.gemm(A_shared, B_shared, C_shared)
+            T.copy(C_shared, C[by * block_M, bx * block_N])
+
+    return gemm
+
+
+ERROR_CASES = [
+    (
+        lambda: if_matmul(1024, 1024, 1024, 128, 128, 32, num_stages=3),
+        "Can not identify the hardware type for a tir.IfThenElse statement.",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "kernel,error_msg",
+    ERROR_CASES,
+)
+def test_tilelang_transform_sunmmio_pipeline_error(kernel, error_msg):
+    with pytest.raises(tvm.error.InternalError, match=error_msg):
+        name = SUNMMIO_TARGET_DESC
+        target = tvm.target.Target(name)
+
+        with tvm.target.Target(target):
+            mod = tvm.IRModule.from_expr(kernel().with_attr("global_symbol", "main"))
+            mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+            mod = tl.transform.IfStmtBinding()(mod)
+            mod = tl.transform.SunmmioPipelinePlanning(debug=False)(mod)
+            mod = tl.transform.InjectSunmmioPipeline()(mod)
