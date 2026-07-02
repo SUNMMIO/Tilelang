@@ -287,6 +287,8 @@ struct ZZBlockShape {
  */
 std::optional<ZZBlockShape> GetZZBlockShape(const Layout &layout);
 
+bool IsMXDType(DataType dtype);
+
 Layout MakeRowMajor(Array<PrimExpr> shape);
 
 /*!
@@ -312,6 +314,16 @@ Layout MakeZZZ(Array<PrimExpr> shape, Array<Integer> axes,
 
 Layout MakeNZZ(Array<PrimExpr> shape, Array<Integer> axes,
                Array<PrimExpr> block_shape, Array<PrimExpr> cluster_shape);
+
+Layout MakeMXZZ(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype);
+
+Layout MakeMXZNN(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype);
+
+Layout MakeMXRowMajor(Array<PrimExpr> shape, DataType dtype);
+
+Optional<Layout> DeriveMXLayoutLike(const Layout &src,
+                                    Array<PrimExpr> dst_shape, DataType dtype,
+                                    arith::Analyzer *analyzer = nullptr);
 
 } // namespace sunmmio
 

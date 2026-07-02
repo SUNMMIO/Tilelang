@@ -51,6 +51,19 @@ bool IsCompatibleResolvedType(mlir::Type actual, mlir::Type expected) {
   return false;
 }
 
+constexpr int kMXFP8CustomTypeCode = DataType::kCustomBegin;
+constexpr int kMXFP4CustomTypeCode = DataType::kCustomBegin + 1;
+
+bool IsMXFP8DType(DataType dtype) {
+  return dtype.code() == kMXFP8CustomTypeCode && dtype.bits() == 8 &&
+         dtype.lanes() == 1;
+}
+
+bool IsMXFP4DType(DataType dtype) {
+  return dtype.code() == kMXFP4CustomTypeCode && dtype.bits() == 4 &&
+         dtype.lanes() == 1;
+}
+
 } // namespace
 
 std::vector<int64_t> ExtractShape(const SunMMIOType &type) {
@@ -154,6 +167,26 @@ mlir::Location SunmmioMlirType::MakeDebugLoc(const std::string &tag) const {
 
 mlir::Type SunmmioMlirType::MapElementType(DataType dtype) const {
   dtype = CanonicalizeSuvmDType(dtype);
+  if (IsMXFP8DType(dtype)) {
+    return mlir::Type::getFromOpaquePointer(
+        mlir::suvm::MXFP8Type::get(&ctx_.mlir_ctx).getAsOpaquePointer());
+  }
+  if (IsMXFP4DType(dtype)) {
+    return mlir::Type::getFromOpaquePointer(
+        mlir::suvm::MXFP4Type::get(&ctx_.mlir_ctx).getAsOpaquePointer());
+  }
+  if (dtype.is_float8_e4m3fn()) {
+    return mlir::Type::getFromOpaquePointer(
+        mlir::Float8E4M3FNType::get(&ctx_.mlir_ctx).getAsOpaquePointer());
+  }
+  if (dtype.is_float4_e2m1fn()) {
+    return mlir::Type::getFromOpaquePointer(
+        mlir::Float4E2M1FNType::get(&ctx_.mlir_ctx).getAsOpaquePointer());
+  }
+  if (dtype.is_float8_e8m0fnu()) {
+    return mlir::Type::getFromOpaquePointer(
+        mlir::Float8E8M0FNUType::get(&ctx_.mlir_ctx).getAsOpaquePointer());
+  }
   if (dtype.is_bool()) {
     return mlir::Type::getFromOpaquePointer(
         ctx_.builder.getI1Type().getAsOpaquePointer());
