@@ -906,8 +906,11 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
                              dram->name + "_layout_stage", kSunmmioScopeRSRAM);
   // Staging mirrors the DRAM layout kind (so its dma leg is plain); register it
   // so it isn't taken for the default aligned RSRAM layout.
-  auto stage_layout = DeriveLayoutLike(dram_layout, stage_shape,
-                                       Optional<Array<Integer>>(), analyzer);
+  Optional<Layout> stage_layout =
+      sunmmio::IsMXDType(dram->dtype)
+          ? Optional<Layout>(sunmmio::MakeMXRowMajor(stage_shape, dram->dtype))
+          : DeriveLayoutLike(dram_layout, stage_shape,
+                             Optional<Array<Integer>>(), analyzer);
   ICHECK(T.RegisterScratchBuffer && stage_layout.defined())
       << "sunmmio layout transform: cannot build the staging layout.";
   // stage_layout is the DRAM layout re-derived onto the copied region's shape.
@@ -934,15 +937,22 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
       both_row_major = false;
       break;
     }
-    bool plain = IsLayoutMatch(
-        layout, sunmmio::MakeRowMajor(layout->InputShape()), analyzer);
+    bool mx_row_major =
+        sunmmio::IsMXDType(dtype) &&
+        IsLayoutMatch(layout,
+                      sunmmio::MakeMXRowMajor(layout->InputShape(), dtype),
+                      analyzer);
+    bool plain =
+        !mx_row_major &&
+        IsLayoutMatch(layout, sunmmio::MakeRowMajor(layout->InputShape()),
+                      analyzer);
     bool padded =
-        !plain &&
+        !plain && !mx_row_major &&
         IsLayoutMatch(layout,
                       sunmmio::MakeAlignedRowMajor(layout->InputShape(), dtype,
                                                    config.rsram_align_bytes),
                       analyzer);
-    if (!plain && !padded) {
+    if (!plain && !padded && !mx_row_major) {
       both_row_major = false;
       break;
     }

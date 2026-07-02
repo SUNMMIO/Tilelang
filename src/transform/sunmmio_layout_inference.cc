@@ -312,7 +312,9 @@ void SunmmioLayoutInferencePass::SeedImmutableLayouts(const PrimFunc &f) {
                 /*immutable=*/true);
     } else {
       // No metadata — default to row-major
-      auto row_major = sunmmio::MakeRowMajor(buf->shape);
+      auto row_major = sunmmio::IsMXDType(buf->dtype)
+                           ? sunmmio::MakeMXRowMajor(buf->shape, buf->dtype)
+                           : sunmmio::MakeRowMajor(buf->shape);
       global_layout_map_.Set(buf, row_major);
       TryAssign(buf, row_major, InferLevel::kStrict, -1, /*immutable=*/true);
     }
@@ -341,9 +343,14 @@ void SunmmioLayoutInferencePass::AssignDefaults() {
 
     if (rank >= 2) {
       Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
-      auto block_shape = GetSunmmioLayoutBlockShape(target_, buf->dtype);
-      TryAssign(buf, sunmmio::MakeZZ(buf->shape, axes, block_shape),
-                InferLevel::kFree, -1);
+      if (sunmmio::IsMXDType(buf->dtype)) {
+        TryAssign(buf, sunmmio::MakeMXZZ(buf->shape, axes, buf->dtype),
+                  InferLevel::kFree, -1);
+      } else {
+        auto block_shape = GetSunmmioLayoutBlockShape(target_, buf->dtype);
+        TryAssign(buf, sunmmio::MakeZZ(buf->shape, axes, block_shape),
+                  InferLevel::kFree, -1);
+      }
     } else {
       // rank < 2 is only legal for RSRAM; ASRAM/WSRAM require rank-2 tensors.
       ICHECK(scope == kSunmmioScopeRSRAM)

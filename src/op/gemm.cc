@@ -868,18 +868,26 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
     ICHECK_GE(rank_a, 2)
         << "Sunmmio GEMM A layout inference requires rank >= 2.";
     Array<Integer> axes_a{Integer(rank_a - 2), Integer(rank_a - 1)};
-    auto l = sunmmio::MakeZZ(a_->shape, axes_a,
-                             GetSunmmioLayoutBlockShape(T.target, a_->dtype));
+    auto l =
+        sunmmio::IsMXDType(a_->dtype)
+            ? sunmmio::MakeMXZZ(a_->shape, axes_a, a_->dtype)
+            : sunmmio::MakeZZ(a_->shape, axes_a,
+                              GetSunmmioLayoutBlockShape(T.target, a_->dtype));
     results.Set(a_, l);
 
     const int rank_b = static_cast<int>(b_->shape.size());
     ICHECK_GE(rank_b, 2)
         << "Sunmmio GEMM B layout inference requires rank >= 2.";
     Array<Integer> axes_b{Integer(rank_b - 2), Integer(rank_b - 1)};
-    auto block_shape_b = GetSunmmioLayoutBlockShape(T.target, b_->dtype);
     // transB_ => TMM.MT mode => ZZ layout; !transB_ => TMM.MN mode => ZN layout
-    l = transB_ ? sunmmio::MakeZZ(b_->shape, axes_b, block_shape_b)
-                : sunmmio::MakeZN(b_->shape, axes_b, block_shape_b);
+    if (sunmmio::IsMXDType(b_->dtype)) {
+      l = transB_ ? sunmmio::MakeMXZZ(b_->shape, axes_b, b_->dtype)
+                  : sunmmio::MakeMXZNN(b_->shape, axes_b, b_->dtype);
+    } else {
+      auto block_shape_b = GetSunmmioLayoutBlockShape(T.target, b_->dtype);
+      l = transB_ ? sunmmio::MakeZZ(b_->shape, axes_b, block_shape_b)
+                  : sunmmio::MakeZN(b_->shape, axes_b, block_shape_b);
+    }
     results.Set(b_, l);
 
     const int rank_c = static_cast<int>(c_->shape.size());

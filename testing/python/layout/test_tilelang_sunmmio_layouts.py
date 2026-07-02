@@ -10,6 +10,8 @@ from tilelang import tvm as tvm
 from tilelang.layout import (
     is_same_layout,
     make_zz_layout,
+    make_mxznn_layout,
+    make_mxzz_layout,
     make_row_major,
     make_aligned_row_major,
 )
@@ -103,8 +105,15 @@ def test_make_zz_layout_defaults_to_last_two_axes():
 
 
 def test_make_zz_layout_rejects_rank_one_default_axes():
-    with pytest.raises(ValueError, match="requires rank >= 2"):
+    with pytest.raises(ValueError, match="make_zz_layout requires rank >= 2"):
         make_zz_layout((128,))
+
+
+def test_make_mx_layouts_reject_rank_one_default_axes_with_callsite_name():
+    with pytest.raises(ValueError, match="make_mxzz_layout requires rank >= 2"):
+        make_mxzz_layout((128,), dtype=T.mxfp4)
+    with pytest.raises(ValueError, match="make_mxznn_layout requires rank >= 2"):
+        make_mxznn_layout((128,), dtype=T.mxfp8)
 
 
 def test_make_dynamic_zz_layout():
