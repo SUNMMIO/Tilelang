@@ -12,6 +12,7 @@ from tilelang.layout import (
     make_zzz_layout,
 )
 
+from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import (
     assert_source_contains,
     lower_sunmmio_kernel_to_device_tir,
@@ -68,6 +69,7 @@ def print_kernel_layouts(name, kernel):
         print_layout_info(f"{tensor_name}.sharded", meta["sharded_layout"])
 
 
+@target("Sunmmio")
 def dynamic_allocate_copy_mma_kernel(
     block_M=32,
     block_N=32,
@@ -104,7 +106,7 @@ def dynamic_allocate_copy_mma_kernel(
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             for by in T.serial(T.ceildiv(sharded_M, block_M)):
-                for bx in T.serial(T.ceildiv(sharded_N, block_N)):
+                for bn in T.serial(T.ceildiv(sharded_N, block_N)):
                     T.clear(C_shared)
                     for ko in T.serial(T.ceildiv(sharded_K, block_K)):
                         T.comm.all_gather(
@@ -119,18 +121,19 @@ def dynamic_allocate_copy_mma_kernel(
                         T.comm.all_gather(
                             B[
                                 ko * block_K : (ko + 1) * block_K,
-                                bx * block_N : (bx + 1) * block_N,
+                                bn * block_N : (bn + 1) * block_N,
                             ],
                             B_shared_dist,
                             direction="vertical",
                             axis=0,
                         )
                         T.gemm(A_shared_dist, B_shared_dist, C_shared)
-                    T.copy(C_shared, C[by * block_M, bx * block_N])
+                    T.copy(C_shared, C[by * block_M, bn * block_N])
 
     return main
 
 
+@target("Sunmmio")
 def dynamic_zz_allocate_copy_mma_kernel(
     block_M=32,
     block_N=32,
@@ -160,9 +163,9 @@ def dynamic_zz_allocate_copy_mma_kernel(
             C_shared = T.alloc_shared((block_M, block_N), dtype)
 
             for by in T.serial(T.ceildiv(sharded_M, block_M)):
-                for bx in T.serial(T.ceildiv(sharded_N, block_N)):
+                for bn in T.serial(T.ceildiv(sharded_N, block_N)):
                     T.copy(A[by * block_M, 0], A_shared)
-                    T.copy(B[0, bx * block_N], B_shared)
+                    T.copy(B[0, bn * block_N], B_shared)
                     T.gemm(A_shared, B_shared, C_shared)
                     # need all_gather or reduce to cover real-world scenarios
                     # T.copy(C_shared, C[by * block_M, bx * block_N])
@@ -204,7 +207,7 @@ def test_dynamic_allocate_copy_mma_lowers_to_device_tir():
             "m: T.int32",
             "n: T.int32",
             "for by in range((m + 31) // 32)",
-            "for bx in range((n + 31) // 32)",
+            "for bn in range((n + 31) // 32)",
             "for ko in range((k + 31) // 32)",
             "T.dma_copy",
             "T.broadcast_",
