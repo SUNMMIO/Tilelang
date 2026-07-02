@@ -3,7 +3,6 @@ from tilelang._typing import BufferLikeType
 from tvm.tir import Buffer, BufferLoad, BufferRegion, PrimExpr
 from tilelang.language.utils import region as _make_region_call
 from tilelang.language.utils import get_buffer_region_from_load
-from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
 from functools import reduce
 from tvm import IRModule, DataType
 from tvm.tir import PrimFunc
