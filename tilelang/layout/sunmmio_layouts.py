@@ -14,6 +14,9 @@ _make_zz = tvm_ffi.get_global_func("tl.sunmmio.make_zz")
 _make_zn = tvm_ffi.get_global_func("tl.sunmmio.make_zn")
 _make_zzz = tvm_ffi.get_global_func("tl.sunmmio.make_zzz")
 _make_nzz = tvm_ffi.get_global_func("tl.sunmmio.make_nzz")
+_make_mxzz = tvm_ffi.get_global_func("tl.sunmmio.make_mxzz")
+_make_mxznn = tvm_ffi.get_global_func("tl.sunmmio.make_mxznn")
+_make_mx_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_mx_row_major")
 
 
 def make_row_major(shape):
@@ -51,10 +54,17 @@ def _normalize_shape(shape_or_buffer):
     raise ValueError(f"Invalid shape or buffer: {shape_or_buffer}")
 
 
-def _normalize_axes(axes, rank):
+def _normalize_shape_and_dtype(shape_or_buffer, dtype):
+    if isinstance(shape_or_buffer, (Buffer, BufferLoad, BufferRegion)):
+        _, shape, buffer_dtype = _get_buffer_info(shape_or_buffer)
+        return list(shape), dtype or buffer_dtype
+    return _normalize_shape(shape_or_buffer), dtype
+
+
+def _normalize_axes(axes, rank, caller="make_zz_layout"):
     if axes is None:
         if rank < 2:
-            raise ValueError(f"make_zz_layout requires rank >= 2 when axes is omitted, got rank {rank}")
+            raise ValueError(f"{caller} requires rank >= 2 when axes is omitted, got rank {rank}")
         return [rank - 2, rank - 1]
     return list(axes)
 
@@ -62,7 +72,7 @@ def _normalize_axes(axes, rank):
 def make_zz_layout(shape_or_buffer, axes=None, block_shape=(32, 32)):
     """Create a ZZ (blockwise row-major) CuteLayout."""
     shape = _normalize_shape(shape_or_buffer)
-    axes = _normalize_axes(axes, len(shape))
+    axes = _normalize_axes(axes, len(shape), "make_zz_layout")
     block_shape = [_to_expr(v) for v in block_shape]
     return _make_zz(shape, axes, block_shape)
 
@@ -77,6 +87,34 @@ def make_zzz_layout(shape, axes, block_shape, cluster_shape):
     return _make_zzz(shape, axes, block_shape, cluster_shape)
 
 
+# 临时改名zzn，原来 nzz
 def make_nzz_layout(shape, axes, block_shape, cluster_shape):
     """Create a NZZ (clustered column-major) CuteLayout."""
     return _make_nzz(shape, axes, block_shape, cluster_shape)
+
+
+def make_mxzz_layout(shape_or_buffer, axes=None, dtype=None):
+    """Create an MXZZ blockwise CuteLayout for SUVM MX dtypes."""
+    shape, dtype = _normalize_shape_and_dtype(shape_or_buffer, dtype)
+    axes = _normalize_axes(axes, len(shape), "make_mxzz_layout")
+    if dtype is None:
+        raise ValueError("make_mxzz_layout requires dtype when shape_or_buffer is not a buffer-like object")
+    return _make_mxzz(shape, axes, dtype)
+
+
+# 基于 make_zzn_layout改造来的 第一个z改为了zn,所以是 znzn
+def make_mxznn_layout(shape_or_buffer, axes=None, dtype=None):
+    """Create an MXZNN blockwise CuteLayout for non-transposed MX weights."""
+    shape, dtype = _normalize_shape_and_dtype(shape_or_buffer, dtype)
+    axes = _normalize_axes(axes, len(shape), "make_mxznn_layout")
+    if dtype is None:
+        raise ValueError("make_mxznn_layout requires dtype when shape_or_buffer is not a buffer-like object")
+    return _make_mxznn(shape, axes, dtype)
+
+
+def make_mx_row_major_layout(shape_or_buffer, dtype=None):
+    """Create an MX row-major CuteLayout for SUVM MX dtypes."""
+    shape, dtype = _normalize_shape_and_dtype(shape_or_buffer, dtype)
+    if dtype is None:
+        raise ValueError("make_mx_row_major_layout requires dtype when shape_or_buffer is not a buffer-like object")
+    return _make_mx_row_major(shape, dtype)

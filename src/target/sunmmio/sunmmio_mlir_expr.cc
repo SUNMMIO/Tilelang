@@ -79,15 +79,17 @@ mlir::Value GetCastOp(SunmmioMlirContext &ctx, mlir::Value src_value,
   mlir::Location loc = MapMlirLoc(ctx);
   mlir::Type dst_mlir_type = MapMlirType(ctx, dst_type);
 
-  if (src.type.kind == dst_type.kind && src.dtype == dst_dtype &&
-      src.type.lanes == dst_type.lanes) {
+  if (src_value.getType() == dst_mlir_type && src.type.kind == dst_type.kind &&
+      src.dtype == dst_dtype && src.type.lanes == dst_type.lanes) {
+    return src_value;
+  }
+  if (src_value.getType() == dst_mlir_type) {
     return src_value;
   }
   if (dst_dtype.is_bool()) {
     return SunmmioMlirType(ctx).EnsureI1(src_value);
   }
-  if (src.type.kind == SunMMIOType::Kind::kIndex ||
-      dst_type.kind == SunMMIOType::Kind::kIndex) {
+  if (src_value.getType().isIndex() || dst_mlir_type.isIndex()) {
     return mlir::arith::IndexCastOp::create(ctx.builder, loc, dst_mlir_type,
                                             src_value)
         .getResult();
@@ -140,6 +142,16 @@ mlir::Value GetCastOp(SunmmioMlirContext &ctx, mlir::Value src_value,
   return mlir::arith::BitcastOp::create(ctx.builder, loc, dst_mlir_type,
                                         src_value)
       .getResult();
+}
+
+mlir::Value CoerceMlirValue(SunmmioMlirContext &ctx, mlir::Value src_value,
+                            const SunMMIOValue &src,
+                            const SunMMIOType &dst_type, DataType dst_dtype) {
+  mlir::Type dst_mlir_type = MapMlirType(ctx, dst_type);
+  if (src_value.getType() == dst_mlir_type) {
+    return src_value;
+  }
+  return GetCastOp(ctx, src_value, src, dst_type, dst_dtype);
 }
 
 } // namespace
@@ -225,6 +237,8 @@ SunMMIOValue SunmmioMlirExpr::Binary(const std::string &result_name,
 
   mlir::Location loc = MapMlirLoc(ctx_);
   mlir::Type result_mlir_type = MapMlirType(ctx_, result_type);
+  lhs = CoerceMlirValue(ctx_, lhs, a, result_type, dtype);
+  rhs = CoerceMlirValue(ctx_, rhs, b, result_type, dtype);
   mlir::Value binary_value;
 
   /**
@@ -377,6 +391,8 @@ SunMMIOValue SunmmioMlirExpr::Compare(const std::string &result_name,
   mlir::Location loc = MapMlirLoc(ctx_);
   mlir::Type bool_mlir_type = MapMlirType(
       ctx_, SunMMIOType{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}});
+  lhs = CoerceMlirValue(ctx_, lhs, a, operand_type, operand_type.dtype);
+  rhs = CoerceMlirValue(ctx_, rhs, b, operand_type, operand_type.dtype);
   mlir::Value compare_value;
 
   if (domain == CompareDomain::kFloat) {

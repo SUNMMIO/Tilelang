@@ -14,6 +14,7 @@ import tvm_ffi
 
 from tilelang._typing import DType, ShapeType
 from tilelang.dtypes import dtype as tilelang_dtype
+from tilelang.language import dtypes as _dtypes
 from tilelang.language.proxy import TensorProxy
 from tilelang.language.mesh_symbols import mesh_ncols, mesh_nrows
 
@@ -27,7 +28,9 @@ __all__ = [
 
 # FFI functions for layout operations
 _make_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_row_major")
+_make_mx_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_mx_row_major")
 _derive_layout_like = tvm_ffi.get_global_func("tl.DeriveLayoutLike")
+_derive_mx_layout_like = tvm_ffi.get_global_func("tl.sunmmio.derive_mx_layout_like")
 
 
 class MeshReplicationType(Enum):
@@ -245,6 +248,10 @@ def _is_dtype_like(value):
     return isinstance(value, (str, type, tilelang_dtype, ir.Type))
 
 
+def _is_mx_dtype(dtype):
+    return str(_dtypes.normalize_dtype(dtype)) in {"custom[mxfp8]8", "custom[mxfp4]4"}
+
+
 class MeshTensorProxy:
     """Proxy for creating distributed mesh tensors.
 
@@ -313,9 +320,12 @@ class MeshTensorProxy:
             device_mesh_config = None
         if device_mesh_config is None:
             device_mesh_config = (mesh_nrows(), mesh_ncols())
+        dtype = _dtypes.normalize_dtype(dtype)
         nrows, ncols = device_mesh_config
         sharded_shape = self._get_sharded_shape(shape, sharding_policy, nrows, ncols)
         sharded_strides = TensorProxy._construct_strides(sharded_shape)
+        shape_exprs = [_to_primexpr(s) for s in shape]
+        sharded_shape_exprs = [_to_primexpr(s) for s in sharded_shape]
 
         meta_data = dict(
             global_shape=shape,
@@ -334,18 +344,30 @@ class MeshTensorProxy:
             global_layout = layout
         else:
             # Default: row-major CuteLayout
-            global_layout = _make_row_major([_to_primexpr(s) for s in shape])
+            if _is_mx_dtype(dtype):
+                global_layout = _make_mx_row_major(shape_exprs, dtype)
+            else:
+                global_layout = _make_row_major(shape_exprs)
 
         # Derive sharded layout via DeriveLayoutLike.
-        sharded_shape_exprs = [_to_primexpr(s) for s in sharded_shape]
-        sharded_layout = _derive_layout_like(global_layout, sharded_shape_exprs, None)
+        if _is_mx_dtype(dtype):
+            sharded_layout = _derive_mx_layout_like(global_layout, sharded_shape_exprs, dtype)
+            if not sharded_layout:
+                raise ValueError(
+                    "MeshTensor with SUVM MX dtype only supports MX row-major, "
+                    "MXZZ, or MXZNN external layouts. Omit layout or use "
+                    "make_mx_row_major_layout(...), make_mxzz_layout(...), "
+                    "or make_mxznn_layout(...)."
+                )
+        else:
+            sharded_layout = _derive_layout_like(global_layout, sharded_shape_exprs, None)
 
         meta_data["global_layout"] = global_layout
         meta_data["sharded_layout"] = sharded_layout
 
         buf = tir_buffer(
             sharded_shape,
-            dtype=dtype,
+            dtype=_dtypes.normalize_dtype(dtype),
             strides=sharded_strides,
             scope="global",
         )
