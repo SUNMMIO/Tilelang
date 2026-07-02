@@ -7,6 +7,7 @@ from .target import (  # noqa: F401
     target_context,
 )
 from .tensor import TensorSupplyType, torch_assert_close, map_torch_type  # noqa: F401
+from .deprecated import deprecated  # noqa: F401
 from .language import (
     is_global,  # noqa: F401
     is_shared,  # noqa: F401
@@ -24,5 +25,4 @@ from .language import (
     get_prim_func_name,  # noqa: F401
     side_effect,  # noqa: F401
 )
-from .deprecated import deprecated  # noqa: F401
 from .version import build_date  # noqa: F401

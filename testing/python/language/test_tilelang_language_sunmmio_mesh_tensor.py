@@ -365,8 +365,8 @@ def test_mesh_tensor_in_kernel():
 
     @T.prim_func
     def kernel(A: A_tensor, B: B_tensor, C: C_tensor):
-        sharded_M, sharded_K = A.shape
-        _, sharded_N = B.shape
+        sharded_M, sharded_K = A.local_shape
+        _, sharded_N = B.local_shape
 
     assert "tensor_meta" in kernel.attrs
     tensor_meta = kernel.attrs["tensor_meta"]
