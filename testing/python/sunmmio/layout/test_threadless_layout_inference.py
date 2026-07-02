@@ -144,6 +144,7 @@ def test_layout_inference_threadless_kernel_completes_without_error():
         mod = make_threadless_copy_kernel(16, 16)
 
     mod = tvm.tir.transform.BindTarget(target)(mod)
+    mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
     mod = tl_transform.InferSramScope()(mod)
     mod = tl_transform.LegalizeSunmmioDataPath()(mod)
     mod = tl_transform.LayoutReducer()(mod)
@@ -163,6 +164,7 @@ def test_layout_inference_threadless_kernel_has_no_threadidx_bindings():
         mod = make_threadless_copy_kernel(16, 16)
 
     mod = tvm.tir.transform.BindTarget(target)(mod)
+    mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
     mod = tl_transform.InferSramScope()(mod)
     mod = tl_transform.LegalizeSunmmioDataPath()(mod)
     mod = tl_transform.LayoutReducer()(mod)
@@ -189,6 +191,7 @@ def test_layout_inference_threadless_kernel_preserves_blockidx_bindings():
         mod = make_threadless_copy_kernel(16, 16)
 
     mod = tvm.tir.transform.BindTarget(target)(mod)
+    mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
     mod = tl_transform.InferSramScope()(mod)
     mod = tl_transform.LegalizeSunmmioDataPath()(mod)
     mod = tl_transform.LayoutReducer()(mod)
@@ -227,6 +230,7 @@ def test_layout_inference_parallel_shared_kernel_completes_without_error():
     with tvm.target.Target(target):
         mod = make_sunmmio_parallel_shared_kernel(64, 64)
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tl_transform.InferSramScope()(mod)
         mod = tl_transform.LegalizeSunmmioDataPath()(mod)
         mod = tl_transform.LayoutReducer()(mod)
@@ -245,6 +249,7 @@ def test_layout_inference_parallel_shared_kernel_has_no_threadidx_bindings():
     with tvm.target.Target(target):
         mod = make_sunmmio_parallel_shared_kernel(64, 64)
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tl_transform.InferSramScope()(mod)
         mod = tl_transform.LegalizeSunmmioDataPath()(mod)
         mod = tl_transform.LayoutReducer()(mod)
@@ -276,6 +281,7 @@ def test_layout_inference_parallel_shared_kernel_has_no_v_thread_variable():
     with tvm.target.Target(target):
         mod = make_sunmmio_parallel_shared_kernel(64, 64)
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tl_transform.InferSramScope()(mod)
         mod = tl_transform.LegalizeSunmmioDataPath()(mod)
         mod = tl_transform.LayoutReducer()(mod)

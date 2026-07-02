@@ -16,19 +16,16 @@ def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="bfloat16", acc
         A: T.MeshTensor(
             (M, K),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=dtype,
         ),
         B: T.MeshTensor(
             (K, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=dtype,
         ),
         C: T.MeshTensor(
             (M, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=accum_dtype,
         ),
     ):
@@ -594,8 +591,7 @@ CASES = [
         lambda: matmul_persistent(1024, 1024, 1024, 128, 128, 32, num_stages=2),
         {
             "A_shared_dist": [2, 128, 128],
-            "A_shared": [2, 128, 32],
-            "B_shared": [2, 32, 128],
+            "A_rsram_stage": [2, 128, 32],
             "B_shared_dist": [2, 128, 128],
         },
     ),
@@ -604,6 +600,7 @@ CASES = [
 
 def lower_and_legalize_sunmmio_pipeline_test(mod, target):
     mod = tir.transform.BindTarget(target)(mod)
+    mod = tl.transform.ResolveSunmmioMeshSymbols()(mod)
     if should_force_let_inline():
         mod = tl.transform.LetInline()(mod)
     mod = tl.transform.LegalizeNegativeIndex()(mod)
@@ -671,19 +668,16 @@ def if_matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="bfloat16", 
         A: T.MeshTensor(
             (M, K),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=dtype,
         ),
         B: T.MeshTensor(
             (K, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=dtype,
         ),
         C: T.MeshTensor(
             (M, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=accum_dtype,
         ),
     ):
@@ -710,7 +704,6 @@ def tvm_access_ptr():
         A: T.MeshTensor(
             (M, K),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=dtype,
         ),
     ):

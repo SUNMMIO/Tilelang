@@ -65,7 +65,6 @@ def test_global_buffer_layout_populated_for_sunmmio():
     during SunmmioLayoutInference pass for Sunmmio target.
     """
     policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
-    device_mesh = (2, 2)
 
     M, N, K = 64, 64, 64
     block_M, block_N, block_K = 32, 32, 32
@@ -74,9 +73,9 @@ def test_global_buffer_layout_populated_for_sunmmio():
     B_layout = make_row_major((K, N))
     C_layout = make_row_major((M, N))
 
-    A_tensor = T.MeshTensor((M, K), policy, device_mesh, dtype="float16", layout=A_layout)
-    B_tensor = T.MeshTensor((K, N), policy, device_mesh, dtype="float16", layout=B_layout)
-    C_tensor = T.MeshTensor((M, N), policy, device_mesh, dtype="float32", layout=C_layout)
+    A_tensor = T.MeshTensor((M, K), policy, dtype="float16", layout=A_layout)
+    B_tensor = T.MeshTensor((K, N), policy, dtype="float16", layout=B_layout)
+    C_tensor = T.MeshTensor((M, N), policy, dtype="float32", layout=C_layout)
 
     @T.prim_func
     def kernel(A: A_tensor, B: B_tensor, C: C_tensor):
@@ -103,6 +102,7 @@ def test_global_buffer_layout_populated_for_sunmmio():
 
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl.transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tl.transform.InferSramScope()(mod)
         mod = tl.transform.LegalizeSunmmioDataPath()(mod)
         mod = tl.transform.LayoutReducer()(mod)
@@ -156,7 +156,6 @@ def test_row_major_global_layout_values():
     Test that the layout created from tensor_meta produces correct forward index mapping.
     """
     policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
-    device_mesh = (2, 2)
 
     M, N, K = 64, 64, 64
     block_M, block_N, block_K = 32, 32, 32
@@ -165,9 +164,9 @@ def test_row_major_global_layout_values():
     B_layout = make_row_major((K, N))
     C_layout = make_row_major((M, N))
 
-    A_tensor = T.MeshTensor((M, K), policy, device_mesh, dtype="float16", layout=A_layout)
-    B_tensor = T.MeshTensor((K, N), policy, device_mesh, dtype="float16", layout=B_layout)
-    C_tensor = T.MeshTensor((M, N), policy, device_mesh, dtype="float32", layout=C_layout)
+    A_tensor = T.MeshTensor((M, K), policy, dtype="float16", layout=A_layout)
+    B_tensor = T.MeshTensor((K, N), policy, dtype="float16", layout=B_layout)
+    C_tensor = T.MeshTensor((M, N), policy, dtype="float32", layout=C_layout)
 
     @T.prim_func
     def kernel(A: A_tensor, B: B_tensor, C: C_tensor):
@@ -188,6 +187,7 @@ def test_row_major_global_layout_values():
 
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl.transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tl.transform.InferSramScope()(mod)
         mod = tl.transform.LegalizeSunmmioDataPath()(mod)
         mod = tl.transform.LayoutReducer()(mod)
@@ -199,14 +199,15 @@ def test_row_major_global_layout_values():
 
     a_layout = collected_layout_map["A"]
 
-    # For row-major with sharded shape (32, 32), strides (32, 1):
+    # For the default Sunmmio target mesh, row-major uses sharded shape (16, 16)
+    # and strides (16, 1).
     offset_0_0 = a_layout.map_forward_index([0, 0])
     offset_0_1 = a_layout.map_forward_index([0, 1])
     offset_1_0 = a_layout.map_forward_index([1, 0])
 
     assert offset_0_0[0] == 0, f"Expected offset(0,0)=0, got {offset_0_0[0]}"
     assert offset_0_1[0] == 1, f"Expected offset(0,1)=1, got {offset_0_1[0]}"
-    assert offset_1_0[0] == 32, f"Expected offset(1,0)=32, got {offset_1_0[0]}"
+    assert offset_1_0[0] == 16, f"Expected offset(1,0)=16, got {offset_1_0[0]}"
 
 
 def test_dynamic_shape_global_buffer_layout():
@@ -219,11 +220,10 @@ def test_dynamic_shape_global_buffer_layout():
     block_M, block_N, block_K = 32, 32, 32
 
     policy = MeshShardingPolicy(replicate=MeshReplicationType.ALL)
-    device_mesh = (2, 2)
 
-    A_tensor = T.MeshTensor((M_var, K_var), policy, device_mesh, dtype="float16")
-    B_tensor = T.MeshTensor((K_var, 64), policy, device_mesh, dtype="float16")
-    C_tensor = T.MeshTensor((M_var, 64), policy, device_mesh, dtype="float32")
+    A_tensor = T.MeshTensor((M_var, K_var), policy, dtype="float16")
+    B_tensor = T.MeshTensor((K_var, 64), policy, dtype="float16")
+    C_tensor = T.MeshTensor((M_var, 64), policy, dtype="float32")
 
     @T.prim_func
     def kernel(A: A_tensor, B: B_tensor, C: C_tensor):
@@ -247,6 +247,7 @@ def test_dynamic_shape_global_buffer_layout():
 
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl.transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tl.transform.InferSramScope()(mod)
         mod = tl.transform.LegalizeSunmmioDataPath()(mod)
         mod = tl.transform.LayoutReducer()(mod)

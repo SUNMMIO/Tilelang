@@ -15,7 +15,6 @@ from tilelang.utils.target import determine_target
 import tilelang as tl
 import tilelang.language as T
 import tilelang.env as env
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout, make_zn_layout
 
 tilelang.env.disable_cache()
@@ -63,6 +62,7 @@ def LayoutVisual():
 def apply_passes_up_to_layout_inference(mod, target):
     """Run the canonical Sunmmio layout-inference pipeline."""
     mod = tvm.tir.transform.BindTarget(target)(mod)
+    mod = tl.transform.ResolveSunmmioMeshSymbols()(mod)
     mod = tl.transform.AddWrapperForSingleBufStore()(mod)
     mod = tl.transform.LegalizeNegativeIndex()(mod)
     mod = tl.transform.InjectAssumes()(mod)
@@ -988,14 +988,13 @@ def dram_zn_to_asram_kernel():
     accum_dtype = "float32"
 
     policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
-    device_mesh = (2, 2)
 
     # ZN layout on DRAM — incompatible with ASRAM (Gemm.A requires ZZ-like)
     zn_dram = make_zn_layout((M, K), axes=[0, 1], block_shape=[32, 32])
 
-    A_tensor = T.MeshTensor((M, K), policy, device_mesh, dtype=dtype, layout=zn_dram)
-    B_tensor = T.MeshTensor((K, N), policy, device_mesh, dtype=dtype)
-    C_tensor = T.MeshTensor((M, N), policy, device_mesh, dtype=accum_dtype)
+    A_tensor = T.MeshTensor((M, K), policy, dtype=dtype, layout=zn_dram)
+    B_tensor = T.MeshTensor((K, N), policy, dtype=dtype)
+    C_tensor = T.MeshTensor((M, N), policy, dtype=accum_dtype)
 
     @T.prim_func
     def kernel(A: A_tensor, B: B_tensor, C: C_tensor):
@@ -1043,14 +1042,13 @@ def dram_zn_to_wsram_kernel():
     accum_dtype = "float32"
 
     policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
-    device_mesh = (2, 2)
 
     # ZN layout on DRAM B — incompatible with WSRAM DMA (requires ZZ-like)
     zn_dram = make_zn_layout((K, N), axes=[0, 1], block_shape=[32, 32])
 
-    A_tensor = T.MeshTensor((M, K), policy, device_mesh, dtype=dtype)
-    B_tensor = T.MeshTensor((K, N), policy, device_mesh, dtype=dtype, layout=zn_dram)
-    C_tensor = T.MeshTensor((M, N), policy, device_mesh, dtype=accum_dtype)
+    A_tensor = T.MeshTensor((M, K), policy, dtype=dtype)
+    B_tensor = T.MeshTensor((K, N), policy, dtype=dtype, layout=zn_dram)
+    C_tensor = T.MeshTensor((M, N), policy, dtype=accum_dtype)
 
     @T.prim_func
     def kernel(A: A_tensor, B: B_tensor, C: C_tensor):
@@ -1325,27 +1323,24 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, versio
 
 
 def matmul_persistent(M, N, K, block_M, block_N, block_K, num_stages, dtype=T.bfloat16, accum_dtype=T.float32):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), device_mesh_config, dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), device_mesh_config, dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), device_mesh_config, accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
 
             A_shared = T.alloc_shared((block_M, block_K), dtype)
-            A_shared_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-            B_shared_dist = T.alloc_shared((block_K * nrows, block_N), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             # Each core iterates its own sharded tile grid with plain nested

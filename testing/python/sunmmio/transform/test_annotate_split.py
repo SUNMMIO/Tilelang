@@ -20,6 +20,7 @@ def make_sunmmio_target_with_host():
 def run_pre_split_passes(mod, target):
     """Run the passes required before AnnotateDeviceRegions, matching the real pipeline."""
     mod = tvm.tir.transform.BindTarget(target)(mod)
+    mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     return mod
 

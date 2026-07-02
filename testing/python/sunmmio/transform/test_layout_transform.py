@@ -18,7 +18,6 @@ from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 from tilelang.layout import make_row_major, make_zz_layout, make_aligned_row_major
 from tilelang.language.mesh_tensor import MeshReplicationType
-from tilelang.carver.arch import driver
 from tvm import tir
 from tvm.tir import Block
 from tvm.tir.stmt_functor import post_order_visit
@@ -32,6 +31,7 @@ DTYPE = T.float16
 def apply_passes_through_lower_tile_op(mod, target):
     """Apply the Sunmmio pass pipeline up to and including LowerTileOp."""
     mod = tvm.tir.transform.BindTarget(target)(mod)
+    mod = tl.transform.ResolveSunmmioMeshSymbols()(mod)
     mod = tl.transform.AddWrapperForSingleBufStore()(mod)
     mod = tl.transform.LegalizeNegativeIndex()(mod)
     mod = tl.transform.InjectAssumes()(mod)
@@ -112,9 +112,8 @@ def _dram(shape, layout):
     these are single-core layout tests (unlike the sharded GEMM example), so
     sharding must not perturb the shapes the assertions rely on.
     """
-    mesh = driver.get_sunmmio_device_mesh_config()
     policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
-    return T.MeshTensor(shape, policy, mesh, DTYPE, layout=layout)
+    return T.MeshTensor(shape, policy, DTYPE, layout=layout)
 
 
 def mismatched_copy_kernel():

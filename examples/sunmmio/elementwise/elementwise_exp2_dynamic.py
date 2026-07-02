@@ -16,15 +16,13 @@ def _elementwise_exp2_prim_func(block_M, block_N, in_dtype, out_dtype):
     M = T.dynamic("m")
     N = T.dynamic("n")
 
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-
     zz_layout = make_zz_layout((M, N))
     placement = T.MeshShardingPolicy(y=0, x=1)
 
     @T.prim_func
     def elem_exp2(
-        A: T.MeshTensor((M, N), placement, device_mesh_config, in_dtype, layout=zz_layout),
-        B: T.MeshTensor((M, N), placement, device_mesh_config, out_dtype, layout=zz_layout),
+        A: T.MeshTensor((M, N), placement, in_dtype, layout=zz_layout),
+        B: T.MeshTensor((M, N), placement, out_dtype, layout=zz_layout),
     ):
         with T.Kernel() as _cid:
             sharded_M, sharded_N = A.local_shape

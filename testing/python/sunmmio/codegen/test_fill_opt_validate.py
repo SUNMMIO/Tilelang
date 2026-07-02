@@ -3,7 +3,6 @@ import os
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import target
@@ -37,7 +36,6 @@ def fill_tiled_test(
     block_n=128,
     dtype="float16",
 ):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
     shard_policy = T.MeshShardingPolicy()
     tensor_shape = (b, m, n)
     tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
@@ -46,7 +44,7 @@ def fill_tiled_test(
     grid_n = T.ceildiv(n, block_n)
 
     @T.prim_func
-    def main(A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout)):  # type: ignore
+    def main(A: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout)):  # type: ignore
         with T.Kernel():
             A_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
 
@@ -78,7 +76,6 @@ def fill_tiled_2d_test(
     block_n=512,
     dtype="float16",
 ):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
     shard_policy = T.MeshShardingPolicy()
     tensor_shape = (m, n)
     tensor_layout = make_zz_layout(tensor_shape, [0, 1], (32, 32))
@@ -86,7 +83,7 @@ def fill_tiled_2d_test(
     grid_n = T.ceildiv(n, block_n)
 
     @T.prim_func
-    def main(A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout)):  # type: ignore
+    def main(A: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout)):  # type: ignore
         with T.Kernel():
             A_shared = T.alloc_shared((block_m, block_n), dtype)
 

@@ -2,7 +2,6 @@ import os
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import target
@@ -23,14 +22,12 @@ def alloc_var_scalar_state_kernel(
     N=32,
     dtype=T.float32,
 ):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
     A_layout = make_zz_layout((M, N))
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, N), shard_policy, device_mesh_config, dtype, layout=A_layout),  # type: ignore
+        A: T.MeshTensor((M, N), shard_policy, dtype, layout=A_layout),  # type: ignore
     ):
         with T.Kernel() as _cid:
             running = T.alloc_var(dtype, init=1.0)
@@ -54,14 +51,12 @@ def alloc_var_all_control_flow_kernel(
     N=32,
     dtype=T.float32,
 ):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
     A_layout = make_zz_layout((M, N))
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, N), shard_policy, device_mesh_config, dtype, layout=A_layout),  # type: ignore
+        A: T.MeshTensor((M, N), shard_policy, dtype, layout=A_layout),  # type: ignore
     ):
         with T.Kernel() as _cid:
             idx = T.alloc_var(T.int32, init=0)
@@ -97,8 +92,6 @@ def alloc_var_copy_mma_control_flow_kernel(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
@@ -106,9 +99,9 @@ def alloc_var_copy_mma_control_flow_kernel(
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), shard_policy, device_mesh_config, dtype, layout=A_layout),  # type: ignore
-        B: T.MeshTensor((K, N), shard_policy, device_mesh_config, dtype, layout=B_layout),  # type: ignore
-        C: T.MeshTensor((M, N), shard_policy, device_mesh_config, accum_dtype, layout=C_layout),  # type: ignore
+        A: T.MeshTensor((M, K), shard_policy, dtype, layout=A_layout),  # type: ignore
+        B: T.MeshTensor((K, N), shard_policy, dtype, layout=B_layout),  # type: ignore
+        C: T.MeshTensor((M, N), shard_policy, accum_dtype, layout=C_layout),  # type: ignore
     ):
         with T.Kernel() as _cid:
             A_shared = T.alloc_shared((block_M, block_K), dtype)
@@ -153,16 +146,14 @@ def alloc_var_tiles_kernel(
     N=32,
     dtype=T.float32,
 ):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
     A_layout = make_zz_layout((M, N))
     B_layout = make_zz_layout((M, N))
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, N), shard_policy, device_mesh_config, dtype, layout=A_layout),  # type: ignore
-        B: T.MeshTensor((M, N), shard_policy, device_mesh_config, dtype, layout=B_layout),  # type: ignore
+        A: T.MeshTensor((M, N), shard_policy, dtype, layout=A_layout),  # type: ignore
+        B: T.MeshTensor((M, N), shard_policy, dtype, layout=B_layout),  # type: ignore
     ):
         with T.Kernel() as _cid:
             A_shared = T.alloc_shared((M, N), dtype)

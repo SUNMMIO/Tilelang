@@ -1,7 +1,6 @@
 import os
 
 import tilelang.language as T
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import compile_test, target
@@ -17,7 +16,6 @@ def summa_matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtyp
     Grid size: (N/block_N, M/block_M) = (4, 4)
     """
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
 
     A_shape = (M, K)
     B_shape = (K, N)
@@ -28,9 +26,9 @@ def summa_matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtyp
 
     @T.prim_func
     def kernel(
-        A: T.MeshTensor(A_shape, shard_policy, device_mesh_config, dtype, layout=A_layout),
-        B: T.MeshTensor(B_shape, shard_policy, device_mesh_config, dtype, layout=B_layout),
-        C: T.MeshTensor(C_shape, shard_policy, device_mesh_config, accum_dtype, layout=C_layout),
+        A: T.MeshTensor(A_shape, shard_policy, dtype, layout=A_layout),
+        B: T.MeshTensor(B_shape, shard_policy, dtype, layout=B_layout),
+        C: T.MeshTensor(C_shape, shard_policy, accum_dtype, layout=C_layout),
     ):
         # Assume the current is a 4x4 processor grid (Mesh)
         # Each core is responsible for outputting a 32x32 block of matrix C

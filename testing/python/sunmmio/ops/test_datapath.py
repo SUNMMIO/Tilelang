@@ -281,7 +281,6 @@ def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
     MyTensor = T.MeshTensor(
         (128, 128),
         sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-        device_mesh_config=(2, 2),
         layout=_layout,
     )
 
