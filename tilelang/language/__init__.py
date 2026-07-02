@@ -21,6 +21,7 @@ from .mesh_tensor import (  # noqa: F401
     MeshTensor,
     TensorWithMeta,
 )
+from .mesh_symbols import mesh_nrows, mesh_ncols, mesh_ncores  # noqa: F401
 from .loop import (
     Parallel,  # noqa: F401
     Tiles,  # noqa: F401

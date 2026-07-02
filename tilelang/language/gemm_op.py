@@ -11,7 +11,7 @@ from tilelang.utils.language import (
     retrieve_shape,
     retrieve_stride,
     retrieve_offset,
-    prim_expr_equal,
+    prim_expr_equal_or_mesh_symbolic,
 )
 from tilelang.language.utils import (
     buffer_region_to_tile_region,
@@ -84,7 +84,7 @@ def _gemm_impl(
     M, N = C_shape
     K = A_shape[-2] if transpose_A else A_shape[-1]
     K_B = B_shape[-1] if transpose_B else B_shape[-2]
-    assert prim_expr_equal(K, K_B), f"T.gemm K shape check failed: K_A = {K}, K_B = {K_B}"
+    assert prim_expr_equal_or_mesh_symbolic(K, K_B), f"T.gemm K shape check failed: K_A = {K}, K_B = {K_B}"
 
     stride_a = A_stride[-2]
     stride_b = B_stride[-2]

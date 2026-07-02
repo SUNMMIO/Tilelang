@@ -6,15 +6,17 @@ from contextlib import suppress
 from enum import Enum
 from typing import Any, TYPE_CHECKING
 
-from tvm import tir
+from tvm import ir, tir
 from tvm.tir import PrimExpr, IntImm
 from tvm.script.ir_builder.tir import buffer as tir_buffer
 
 import tvm_ffi
 
 from tilelang._typing import DType, ShapeType
+from tilelang.dtypes import dtype as tilelang_dtype
 from tilelang.language import dtypes as _dtypes
 from tilelang.language.proxy import TensorProxy
+from tilelang.language.mesh_symbols import mesh_ncols, mesh_nrows
 
 __all__ = [
     "MeshReplicationType",
@@ -232,7 +234,20 @@ def get_local_extent(mesh_tensor, cid):
         local_extent[shard_x] = distribute_valid_count(local_extent[shard_x], col, ncols)
 
     return tuple(local_extent)
-  
+
+
+def _is_mesh_config(value):
+    if not isinstance(value, tuple):
+        return False
+    if len(value) != 2:
+        return False
+    return all(isinstance(v, (int, PrimExpr)) for v in value)
+
+
+def _is_dtype_like(value):
+    return isinstance(value, (str, type, tilelang_dtype, ir.Type))
+
+
 def _is_mx_dtype(dtype):
     return str(_dtypes.normalize_dtype(dtype)) in {"custom[mxfp8]8", "custom[mxfp4]4"}
 
@@ -292,12 +307,19 @@ class MeshTensorProxy:
         self,
         shape: ShapeType,
         sharding_policy: MeshShardingPolicy,
-        device_mesh_config: tuple[int, int],
+        device_mesh_config: tuple[int | PrimExpr, int | PrimExpr] | DType | None = None,
         dtype: DType = "float32",
         layout=None,
     ) -> TensorWithMeta:
         if isinstance(shape, (int, PrimExpr)):
             shape = (shape,)
+        if device_mesh_config is not None and not _is_mesh_config(device_mesh_config):
+            if not _is_dtype_like(device_mesh_config):
+                raise TypeError("device_mesh_config must be a tuple of (nrows, ncols). To omit it, pass dtype as the third argument.")
+            dtype = device_mesh_config
+            device_mesh_config = None
+        if device_mesh_config is None:
+            device_mesh_config = (mesh_nrows(), mesh_ncols())
         dtype = _dtypes.normalize_dtype(dtype)
         nrows, ncols = device_mesh_config
         sharded_shape = self._get_sharded_shape(shape, sharding_policy, nrows, ncols)
@@ -362,7 +384,7 @@ if TYPE_CHECKING:
             cls,
             shape: ShapeType,
             sharding_policy: MeshShardingPolicy,
-            device_mesh_config: tuple[int, int],
+            device_mesh_config: tuple[int | PrimExpr, int | PrimExpr] | DType | None = None,
             dtype: DType = "float32",
             layout=None,
         ) -> TensorWithMeta: ...

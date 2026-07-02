@@ -10,6 +10,12 @@ from tilelang._typing import BufferLikeType, ShapeType
 from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
 
 
+def _unwrap_mesh_tensor(value):
+    from tilelang.language.mesh_tensor import _unwrap_mesh_tensor as unwrap
+
+    return unwrap(value)
+
+
 def region(buffer: BufferLoad, access_type: str, *args: PrimExpr) -> PrimExpr:
     """Create a tl.region call for a BufferLoad and extents."""
     access_type = {"r": 1, "w": 2, "rw": 3}[access_type]
