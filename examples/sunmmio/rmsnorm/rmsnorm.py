@@ -4,18 +4,12 @@ from typing import Callable
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.carver.arch import driver
 from tilelang.engine.phase import LowerAndLegalize
 from tilelang.utils.target import determine_target
 from tilelang.layout import make_zz_layout
 
 
 def rmsnorm_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16, eps: float = 1e-12) -> "Callable":
-    # Device configuration: a row x col mesh of cores.
-    mesh = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = mesh
-    ncores = nrows * ncols
-
     zz_layout = make_zz_layout((M, N))
     # Shard rows (dim 0) across the mesh rows and the reduced dim N (dim 1)
     # across the mesh columns, mirroring the softmax example.  The RMSNorm
@@ -27,11 +21,11 @@ def rmsnorm_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16, eps: flo
 
     @T.prim_func
     def main(
-        X: T.MeshTensor((M, N), placement, mesh, dtype, zz_layout),
-        Y: T.MeshTensor((M, N), placement, mesh, dtype, zz_layout),
+        X: T.MeshTensor((M, N), placement, dtype, layout=zz_layout),
+        Y: T.MeshTensor((M, N), placement, dtype, layout=zz_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_N = X.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_N = X.local_shape
 
             X_shared = T.alloc_shared((block_M, block_N), dtype)
             Y_shared = T.alloc_shared((block_M, block_N), dtype)
@@ -39,7 +33,7 @@ def rmsnorm_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16, eps: flo
             tile_sumsq = T.alloc_shared((block_M,), accum_dtype)
             local_sumsq = T.alloc_shared((block_M,), accum_dtype)
 
-            sumsq_dist = T.alloc_shared((ncols, block_M), accum_dtype)
+            sumsq_dist = T.alloc_shared((T.mesh_ncols(), block_M), accum_dtype)
             total_sumsq = T.alloc_shared((block_M,), accum_dtype)
             inv_rms = T.alloc_shared((block_M,), accum_dtype)
 

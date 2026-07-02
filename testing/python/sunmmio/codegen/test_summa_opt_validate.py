@@ -3,7 +3,6 @@ import os
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import target
@@ -32,9 +31,6 @@ def summa_matmul(
     accum_dtype="float32",
 ):
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     A_shape = (M, K)
     B_shape = (K, N)
@@ -45,15 +41,15 @@ def summa_matmul(
 
     @T.prim_func
     def kernel(
-        A: T.MeshTensor(A_shape, shard_policy, device_mesh_config, dtype, layout=A_layout),  # type: ignore
-        B: T.MeshTensor(B_shape, shard_policy, device_mesh_config, dtype, layout=B_layout),  # type: ignore
-        C: T.MeshTensor(C_shape, shard_policy, device_mesh_config, accum_dtype, layout=C_layout),  # type: ignore
+        A: T.MeshTensor(A_shape, shard_policy, dtype, layout=A_layout),  # type: ignore
+        B: T.MeshTensor(B_shape, shard_policy, dtype, layout=B_layout),  # type: ignore
+        C: T.MeshTensor(C_shape, shard_policy, accum_dtype, layout=C_layout),  # type: ignore
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M, _ = A.shape
-            _, sharded_N = B.shape
-            core_row = _cid // ncols
-            core_col = _cid % ncols
+        with T.Kernel() as _cid:
+            sharded_M, _ = A.local_shape
+            _, sharded_N = B.local_shape
+            core_row = _cid // T.mesh_ncols()
+            core_col = _cid % T.mesh_ncols()
 
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
@@ -65,10 +61,10 @@ def summa_matmul(
                     K_steps = T.ceildiv(K, block_K)
 
                     for k_tile in range(K_steps):
-                        a_src_col = k_tile % ncols
-                        b_src_row = k_tile % nrows
-                        a_local_k = (k_tile // ncols) * block_K
-                        b_local_k = (k_tile // nrows) * block_K
+                        a_src_col = k_tile % T.mesh_ncols()
+                        b_src_row = k_tile % T.mesh_nrows()
+                        a_local_k = (k_tile // T.mesh_ncols()) * block_K
+                        b_local_k = (k_tile // T.mesh_nrows()) * block_K
 
                         T.comm.broadcast(
                             A[

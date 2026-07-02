@@ -19,18 +19,20 @@ def gemm_matmul(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
-            T.clear(C_shared)
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-                T.copy(A[by * block_M, k * block_K], A_shared)
-                T.copy(B[k * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, C_shared)
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                for by in T.serial(T.ceildiv(M, block_M)):
+                    T.clear(C_shared)
+                    for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                        T.copy(A[by * block_M, k * block_K], A_shared)
+                        T.copy(B[k * block_K, bx * block_N], B_shared)
+                        T.gemm(A_shared, B_shared, C_shared)
 
-            T.copy(C_shared, C[by * block_M, bx * block_N])
+                    T.copy(C_shared, C[by * block_M, bx * block_N])
 
     return tvm.IRModule({"main": main})
 
@@ -52,7 +54,7 @@ def flashattn(batch, heads, seq_len, dim, is_causal, groups=1, block_M=64, block
         V: T.Tensor(kv_shape, dtype),
         Output: T.Tensor(q_shape, dtype),
     ):
-        with T.Kernel(T.ceildiv(seq_len, block_M), heads, batch, threads=threads) as (bx, by, bz):
+        with T.Kernel():
             Q_shared = T.alloc_shared([block_M, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)
             V_shared = T.alloc_shared([block_N, dim], dtype)
@@ -66,49 +68,54 @@ def flashattn(batch, heads, seq_len, dim, is_causal, groups=1, block_M=64, block
             scores_sum = T.alloc_shared([block_M], accum_dtype)
             logsum = T.alloc_shared([block_M], accum_dtype)
 
-            T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
-            T.fill(acc_o, 0)
-            T.fill(logsum, 0)
-            T.fill(scores_max, -T.infinity(accum_dtype))
+            for bx in T.serial(T.ceildiv(seq_len, block_M)):
+                for by in T.serial(heads):
+                    for bz in T.serial(batch):
+                        T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
+                        T.fill(acc_o, 0)
+                        T.fill(logsum, 0)
+                        T.fill(scores_max, -T.infinity(accum_dtype))
 
-            loop_range = (
-                T.min(T.ceildiv(seq_len, block_N), T.ceildiv((bx + 1) * block_M, block_N)) if is_causal else T.ceildiv(seq_len, block_N)
-            )
+                        loop_range = (
+                            T.min(T.ceildiv(seq_len, block_N), T.ceildiv((bx + 1) * block_M, block_N))
+                            if is_causal
+                            else T.ceildiv(seq_len, block_N)
+                        )
 
-            for k in T.Pipelined(loop_range, num_stages=num_stages):
-                T.copy(K[bz, k * block_N : (k + 1) * block_N, by // groups, :], K_shared)
-                if is_causal:
-                    for i, j in T.Parallel(block_M, block_N):
-                        acc_s[i, j] = T.if_then_else(bx * block_M + i >= k * block_N + j, 0, -T.infinity(acc_s.dtype))
-                else:
-                    for i, j in T.Parallel(block_M, block_N):
-                        acc_s[i, j] = T.if_then_else(k * block_N + j >= seq_len, -T.infinity(acc_s.dtype), 0)
-                T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+                        for k in T.Pipelined(loop_range, num_stages=num_stages):
+                            T.copy(K[bz, k * block_N : (k + 1) * block_N, by // groups, :], K_shared)
+                            if is_causal:
+                                for i, j in T.Tiles([block_M, block_N], parallel=True):
+                                    acc_s[i, j] = T.if_then_else(bx * block_M + i >= k * block_N + j, 0, -T.infinity(acc_s.dtype))
+                            else:
+                                for i, j in T.Tiles([block_M, block_N], parallel=True):
+                                    acc_s[i, j] = T.if_then_else(k * block_N + j >= seq_len, -T.infinity(acc_s.dtype), 0)
+                            T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
-                T.copy(scores_max, scores_max_prev)
-                T.fill(scores_max, -T.infinity(accum_dtype))
-                T.reduce_max(acc_s, scores_max, dim=1, clear=False)
-                for i in T.Parallel(block_M):
-                    scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
-                for i in T.Parallel(block_M):
-                    scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
-                for i, j in T.Parallel(block_M, block_N):
-                    acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
-                T.reduce_sum(acc_s, scores_sum, dim=1)
-                for i in T.Parallel(block_M):
-                    logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                T.copy(acc_s, acc_s_cast)
+                            T.copy(scores_max, scores_max_prev)
+                            T.fill(scores_max, -T.infinity(accum_dtype))
+                            T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+                            for i in T.Tiles([block_M], parallel=True):
+                                scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
+                            for i in T.Tiles([block_M], parallel=True):
+                                scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+                            for i, j in T.Tiles([block_M, block_N], parallel=True):
+                                acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                            T.reduce_sum(acc_s, scores_sum, dim=1)
+                            for i in T.Tiles([block_M], parallel=True):
+                                logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+                            T.copy(acc_s, acc_s_cast)
 
-                for i, j in T.Parallel(block_M, dim):
-                    acc_o[i, j] *= scores_scale[i]
+                            for i, j in T.Tiles([block_M, dim], parallel=True):
+                                acc_o[i, j] *= scores_scale[i]
 
-                T.copy(V[bz, k * block_N : (k + 1) * block_N, by // groups, :], V_shared)
-                T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                            T.copy(V[bz, k * block_N : (k + 1) * block_N, by // groups, :], V_shared)
+                            T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
-            for i, j in T.Parallel(block_M, dim):
-                acc_o[i, j] /= logsum[i]
-            T.copy(acc_o, O_shared)
-            T.copy(O_shared, Output[bz, bx * block_M : (bx + 1) * block_M, by, :])
+                        for i, j in T.Tiles([block_M, dim], parallel=True):
+                            acc_o[i, j] /= logsum[i]
+                        T.copy(acc_o, O_shared)
+                        T.copy(O_shared, Output[bz, bx * block_M : (bx + 1) * block_M, by, :])
 
     return tvm.IRModule({"main": main})
 
@@ -376,18 +383,20 @@ def gemm_broadcast_from_dram(M, N, K, block_M, block_N, block_K, dtype=T.float16
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
-            T.clear(C_shared)
-            T.comm.broadcast(A, A_shared, (0, 0), direction="h")
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-                T.copy(B[k * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, C_shared)
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                for by in T.serial(T.ceildiv(M, block_M)):
+                    T.clear(C_shared)
+                    T.comm.broadcast(A, A_shared, (0, 0), direction="h")
+                    for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                        T.copy(B[k * block_K, bx * block_N], B_shared)
+                        T.gemm(A_shared, B_shared, C_shared)
 
-            T.copy(C_shared, C[by * block_M, bx * block_N])
+                    T.copy(C_shared, C[by * block_M, bx * block_N])
 
     return tvm.IRModule({"main": main})
 
@@ -406,18 +415,20 @@ def gemm_put_from_dram(M, N, K, block_M, block_N, block_K, dtype=T.float16, accu
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
-            T.clear(C_shared)
-            T.comm.put(A, A_shared, (0, 0), (1, 1))
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-                T.copy(B[k * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, C_shared)
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                for by in T.serial(T.ceildiv(M, block_M)):
+                    T.clear(C_shared)
+                    T.comm.put(A, A_shared, (0, 0), (1, 1))
+                    for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                        T.copy(B[k * block_K, bx * block_N], B_shared)
+                        T.gemm(A_shared, B_shared, C_shared)
 
-            T.copy(C_shared, C[by * block_M, bx * block_N])
+                    T.copy(C_shared, C[by * block_M, bx * block_N])
 
     return tvm.IRModule({"main": main})
 
@@ -510,7 +521,7 @@ def allgather_dram_to_asram(block_M, block_K, dtype=T.float16):
     def main(
         A: T.Tensor((block_M, block_K), dtype),
     ):
-        with T.Kernel(1, 1, threads=128) as (bx, by):
+        with T.Kernel():
             A_gathered = T.alloc_shared([4, block_M, block_K], dtype, scope="shared.asram")
             T.comm.all_gather(A, A_gathered, direction="h")
 
@@ -524,7 +535,7 @@ def annotated_copy_dram_to_asram(block_M, block_K, dtype=T.float16):
     def main(
         A: T.Tensor((block_M, block_K), dtype),
     ):
-        with T.Kernel(1, 1, threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype, scope="shared.asram")
             T.copy(A, A_shared, coalesced_width=4, disable_tma=True, eviction_policy="evict_last")
 
@@ -613,7 +624,7 @@ def cast_copy_to_operand(block_M, block_N, dst_scope, src_dtype=T.float32, dst_d
 
     @T.prim_func
     def main(X: T.Tensor((block_M, block_N), src_dtype)):
-        with T.Kernel(1, 1, threads=128) as (bx, by):
+        with T.Kernel():
             prob = T.alloc_shared((block_M, block_N), src_dtype, scope="shared.rsram")
             prob_cast = T.alloc_shared((block_M, block_N), dst_dtype, scope=dst_scope)
             T.copy(X, prob)

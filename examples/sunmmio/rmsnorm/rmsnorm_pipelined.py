@@ -22,17 +22,12 @@ from typing import Callable
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.carver.arch import driver
 from tilelang.engine.phase import LowerAndLegalize
 from tilelang.utils.target import determine_target
 from tilelang.layout import make_zz_layout, make_aligned_row_major
 
 
 def rmsnorm_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16, eps: float = 1e-12) -> "Callable":
-    mesh = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = mesh
-    ncores = nrows * ncols
-
     zz_layout = make_zz_layout((M, N))
     placement = T.MeshShardingPolicy(y=0, x=1)
 
@@ -40,11 +35,11 @@ def rmsnorm_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16, eps: flo
 
     @T.prim_func
     def main(
-        X: T.MeshTensor((M, N), placement, mesh, dtype, zz_layout),
-        Y: T.MeshTensor((M, N), placement, mesh, dtype, zz_layout),
+        X: T.MeshTensor((M, N), placement, dtype, layout=zz_layout),
+        Y: T.MeshTensor((M, N), placement, dtype, layout=zz_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_N = X.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_N = X.local_shape
 
             # --- Explicit scope: an elementwise + reduction kernel with no
             # tensor-core GEMM, so every on-chip buffer lives in RSRAM (the
@@ -55,7 +50,7 @@ def rmsnorm_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16, eps: flo
             x_sq = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
             tile_sumsq = T.alloc_shared((block_M,), accum_dtype, scope="shared.rsram")
             local_sumsq = T.alloc_shared((block_M,), accum_dtype, scope="shared.rsram")
-            sumsq_dist = T.alloc_shared((ncols, block_M), accum_dtype, scope="shared.rsram")
+            sumsq_dist = T.alloc_shared((T.mesh_ncols(), block_M), accum_dtype, scope="shared.rsram")
             total_sumsq = T.alloc_shared((block_M,), accum_dtype, scope="shared.rsram")
             inv_rms = T.alloc_shared((block_M,), accum_dtype, scope="shared.rsram")
 

@@ -8,7 +8,6 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm
-from tilelang.carver.arch import driver
 from tilelang.engine.param import KernelParam
 from tilelang.jit.adapter.sunmmio import (
     SunmmioKernelABI,
@@ -29,7 +28,7 @@ from tilelang.utils.target import determine_target, target_is_sunmmio
 
 
 def _load_sunmmio_elementwise_example():
-    example_path = Path(__file__).resolve().parents[3] / "examples" / "sunmmio" / "elementwise" / "elementwise_add.py"
+    example_path = Path(__file__).resolve().parents[4] / "examples" / "sunmmio" / "elementwise" / "elementwise_add.py"
     spec = importlib.util.spec_from_file_location("tilelang_sunmmio_elementwise_add_example", example_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -38,7 +37,7 @@ def _load_sunmmio_elementwise_example():
 
 
 def _load_sunmmio_dynamic_elementwise_example():
-    example_path = Path(__file__).resolve().parents[3] / "examples" / "sunmmio" / "elementwise" / "elementwise_add_dynamic.py"
+    example_path = Path(__file__).resolve().parents[4] / "examples" / "sunmmio" / "elementwise" / "elementwise_add_dynamic.py"
     spec = importlib.util.spec_from_file_location("tilelang_sunmmio_dynamic_elementwise_add_example", example_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -47,7 +46,7 @@ def _load_sunmmio_dynamic_elementwise_example():
 
 
 def _load_sunmmio_dynamic_exp2_example():
-    example_path = Path(__file__).resolve().parents[3] / "examples" / "sunmmio" / "elementwise" / "elementwise_exp2_dynamic.py"
+    example_path = Path(__file__).resolve().parents[4] / "examples" / "sunmmio" / "elementwise" / "elementwise_exp2_dynamic.py"
     spec = importlib.util.spec_from_file_location("tilelang_sunmmio_dynamic_elementwise_exp2_example", example_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -750,21 +749,18 @@ define void @elem_add_kernel(ptr addrspace(4) %0) #0 !sunmmio.kernel_meta !1 {
 @tilelang.jit(target="sunmmio", out_idx=[2])
 def elementwise_add_jit(M, N, block_M, block_N, in_dtype, out_dtype):
     """JIT version of examples/sunmmio/elementwise/elementwise_add.py."""
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     zz_layout = make_zz_layout((M, N))
     placement = T.MeshShardingPolicy(y=0, x=1)
 
     @T.prim_func
     def elem_add(
-        A: T.MeshTensor((M, N), placement, device_mesh_config, in_dtype, layout=zz_layout),
-        B: T.MeshTensor((M, N), placement, device_mesh_config, in_dtype, layout=zz_layout),
-        C: T.MeshTensor((M, N), placement, device_mesh_config, out_dtype, layout=zz_layout),
+        A: T.MeshTensor((M, N), placement, in_dtype, layout=zz_layout),
+        B: T.MeshTensor((M, N), placement, in_dtype, layout=zz_layout),
+        C: T.MeshTensor((M, N), placement, out_dtype, layout=zz_layout),
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_N = A.shape
+        with T.Kernel() as _cid:
+            sharded_M, sharded_N = A.local_shape
 
             A_shared = T.alloc_shared((block_M, block_N), in_dtype)
             B_shared = T.alloc_shared((block_M, block_N), in_dtype)

@@ -15,7 +15,6 @@ from tilelang.utils.target import determine_target
 import tilelang as tl
 import tilelang.language as T
 import tilelang.env as env
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout, make_zn_layout
 
 tilelang.env.disable_cache()
@@ -63,6 +62,7 @@ def LayoutVisual():
 def apply_passes_up_to_layout_inference(mod, target):
     """Run the canonical Sunmmio layout-inference pipeline."""
     mod = tvm.tir.transform.BindTarget(target)(mod)
+    mod = tl.transform.ResolveSunmmioMeshSymbols()(mod)
     mod = tl.transform.AddWrapperForSingleBufStore()(mod)
     mod = tl.transform.LegalizeNegativeIndex()(mod)
     mod = tl.transform.InjectAssumes()(mod)
@@ -190,18 +190,20 @@ def gemm_kernel_notransB():
         B: T.Tensor((K, N), DTYPE),
         C: T.Tensor((M, N), ACCUM_DTYPE),
     ):
-        with T.Kernel(T.ceildiv(N, BLOCK_N), T.ceildiv(M, BLOCK_M), threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((BLOCK_M, BLOCK_K), DTYPE)
             B_shared = T.alloc_shared((BLOCK_K, BLOCK_N), DTYPE)
             C_shared = T.alloc_shared((BLOCK_M, BLOCK_N), ACCUM_DTYPE)
 
-            T.clear(C_shared)
-            for k in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=3):
-                T.copy(A[by * BLOCK_M, k * BLOCK_K], A_shared)
-                T.copy(B[k * BLOCK_K, bx * BLOCK_N], B_shared)
-                T.gemm(A_shared, B_shared, C_shared, transpose_B=False)
+            for bx in T.serial(T.ceildiv(N, BLOCK_N)):
+                for by in T.serial(T.ceildiv(M, BLOCK_M)):
+                    T.clear(C_shared)
+                    for k in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=3):
+                        T.copy(A[by * BLOCK_M, k * BLOCK_K], A_shared)
+                        T.copy(B[k * BLOCK_K, bx * BLOCK_N], B_shared)
+                        T.gemm(A_shared, B_shared, C_shared, transpose_B=False)
 
-            T.copy(C_shared, C[by * BLOCK_M, bx * BLOCK_N])
+                    T.copy(C_shared, C[by * BLOCK_M, bx * BLOCK_N])
 
     return tvm.IRModule({"main": main})
 
@@ -213,18 +215,20 @@ def gemm_kernel_transB():
         B: T.Tensor((N, K), DTYPE),  # transposed shape
         C: T.Tensor((M, N), ACCUM_DTYPE),
     ):
-        with T.Kernel(T.ceildiv(N, BLOCK_N), T.ceildiv(M, BLOCK_M), threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((BLOCK_M, BLOCK_K), DTYPE)
             B_shared = T.alloc_shared((BLOCK_N, BLOCK_K), DTYPE)  # transposed tile
             C_shared = T.alloc_shared((BLOCK_M, BLOCK_N), ACCUM_DTYPE)
 
-            T.clear(C_shared)
-            for k in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=3):
-                T.copy(A[by * BLOCK_M, k * BLOCK_K], A_shared)
-                T.copy(B[bx * BLOCK_N, k * BLOCK_K], B_shared)
-                T.gemm(A_shared, B_shared, C_shared, transpose_B=True)
+            for bx in T.serial(T.ceildiv(N, BLOCK_N)):
+                for by in T.serial(T.ceildiv(M, BLOCK_M)):
+                    T.clear(C_shared)
+                    for k in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=3):
+                        T.copy(A[by * BLOCK_M, k * BLOCK_K], A_shared)
+                        T.copy(B[bx * BLOCK_N, k * BLOCK_K], B_shared)
+                        T.gemm(A_shared, B_shared, C_shared, transpose_B=True)
 
-            T.copy(C_shared, C[by * BLOCK_M, bx * BLOCK_N])
+                    T.copy(C_shared, C[by * BLOCK_M, bx * BLOCK_N])
 
     return tvm.IRModule({"main": main})
 
@@ -268,11 +272,13 @@ def copy_only_kernel():
         A: T.Tensor((M, N), dtype),
         B: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
 
-            T.copy(A[by * block_M, bx * block_N], A_shared)
-            T.copy(A_shared, B[by * block_M, bx * block_N])
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                for by in T.serial(T.ceildiv(M, block_M)):
+                    T.copy(A[by * block_M, bx * block_N], A_shared)
+                    T.copy(A_shared, B[by * block_M, bx * block_N])
 
     return tvm.IRModule({"main": main})
 
@@ -360,20 +366,21 @@ def reduce_blockwise_kernel():
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M,), accum_dtype),
     ):
-        with T.Kernel(T.ceildiv(M, block_M), threads=128) as (bx,):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
             C_reduce = T.alloc_shared((block_M,), accum_dtype, scope="shared.rsram")
 
-            T.clear(C_shared)
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-                T.copy(A[bx * block_M, k * block_K], A_shared)
-                T.copy(B[k * block_K, 0], B_shared)
-                T.gemm(A_shared, B_shared, C_shared, transpose_B=False)
+            for bx in T.serial(T.ceildiv(M, block_M)):
+                T.clear(C_shared)
+                for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                    T.copy(A[bx * block_M, k * block_K], A_shared)
+                    T.copy(B[k * block_K, 0], B_shared)
+                    T.gemm(A_shared, B_shared, C_shared, transpose_B=False)
 
-            T.reduce_sum(C_shared, C_reduce, dim=1)
-            T.copy(C_reduce, C[bx * block_M])
+                T.reduce_sum(C_shared, C_reduce, dim=1)
+                T.copy(C_reduce, C[bx * block_M])
 
     return tvm.IRModule({"main": main})
 
@@ -409,7 +416,7 @@ def reduce_outer_kernel():
         A: T.Tensor((batch, block_M, block_N), dtype),
         B: T.Tensor((block_M, block_N), dtype),
     ):
-        with T.Kernel(1, threads=128) as (bx,):
+        with T.Kernel():
             A_shared = T.alloc_shared((batch, block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
 
@@ -450,7 +457,7 @@ def reduce_3d_zz_blocked_axis_kernel():
         A: T.Tensor((batch, block_M, block_N), dtype),
         B: T.Tensor((batch, block_M), dtype),
     ):
-        with T.Kernel(1, threads=128) as (bx,):
+        with T.Kernel():
             A_shared = T.alloc_shared((batch, block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((batch, block_M), dtype, scope="shared.rsram")
 
@@ -489,7 +496,7 @@ def reduce_3d_zn_outer_axis_kernel():
         A: T.Tensor((batch, block_M, block_N), dtype),
         B: T.Tensor((block_M, block_N), dtype),
     ):
-        with T.Kernel(1, threads=128) as (bx,):
+        with T.Kernel():
             A_shared = T.alloc_shared((batch, block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
 
@@ -530,7 +537,7 @@ def reduce_3d_row_major_outer_axis_kernel():
         A: T.Tensor((batch, block_M, block_N), dtype),
         B: T.Tensor((block_M, block_N), dtype),
     ):
-        with T.Kernel(1, threads=128) as (bx,):
+        with T.Kernel():
             A_shared = T.alloc_shared((batch, block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
 
@@ -569,7 +576,7 @@ def reduce_4d_zz_outer_axis_kernel():
         A: T.Tensor((d0, d1, block_M, block_N), dtype),
         B: T.Tensor((d1, block_M, block_N), dtype),
     ):
-        with T.Kernel(1, threads=128) as (bx,):
+        with T.Kernel():
             A_shared = T.alloc_shared((d0, d1, block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((d1, block_M, block_N), dtype, scope="shared.rsram")
 
@@ -608,20 +615,22 @@ def broadcast_zz_kernel():
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), accum_dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
             C_bcast = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
 
-            T.clear(C_shared)
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-                T.copy(A[by * block_M, k * block_K], A_shared)
-                T.copy(B[k * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, C_shared, transpose_B=False)
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                for by in T.serial(T.ceildiv(M, block_M)):
+                    T.clear(C_shared)
+                    for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                        T.copy(A[by * block_M, k * block_K], A_shared)
+                        T.copy(B[k * block_K, bx * block_N], B_shared)
+                        T.gemm(A_shared, B_shared, C_shared, transpose_B=False)
 
-            T.comm.broadcast(C_shared, C_bcast, (1, 2), direction="all")
-            T.copy(C_bcast, C[by * block_M, bx * block_N])
+                    T.comm.broadcast(C_shared, C_bcast, (1, 2), direction="all")
+                    T.copy(C_bcast, C[by * block_M, bx * block_N])
 
     return tvm.IRModule({"main": main})
 
@@ -653,7 +662,7 @@ def broadcast_zn_kernel():
         A: T.Tensor((block_M, block_N), dtype),
         B: T.Tensor((block_M, block_N), dtype),
     ):
-        with T.Kernel(1, threads=128) as (bx,):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
 
@@ -684,7 +693,7 @@ def broadcast_from_global_to_rsram_kernel():
         A: T.Tensor((block_M, block_N), dtype),
         B: T.Tensor((block_M, block_N), dtype),
     ):
-        with T.Kernel(1, threads=128) as (bx,):
+        with T.Kernel():
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
 
             T.comm.broadcast(A, B_shared, (1, 2), direction="h")
@@ -729,20 +738,22 @@ def put_zz_kernel():
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), accum_dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
             C_put = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
 
-            T.clear(C_shared)
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-                T.copy(A[by * block_M, k * block_K], A_shared)
-                T.copy(B[k * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, C_shared, transpose_B=False)
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                for by in T.serial(T.ceildiv(M, block_M)):
+                    T.clear(C_shared)
+                    for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                        T.copy(A[by * block_M, k * block_K], A_shared)
+                        T.copy(B[k * block_K, bx * block_N], B_shared)
+                        T.gemm(A_shared, B_shared, C_shared, transpose_B=False)
 
-            T.comm.put(C_shared, C_put, (1, 2), (2, 3))
-            T.copy(C_put, C[by * block_M, bx * block_N])
+                    T.comm.put(C_shared, C_put, (1, 2), (2, 3))
+                    T.copy(C_put, C[by * block_M, bx * block_N])
 
     return tvm.IRModule({"main": main})
 
@@ -774,19 +785,21 @@ def allgather_zz_kernel():
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), accum_dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
             C_gather = T.alloc_shared((16, block_M, block_N), accum_dtype, scope="shared.rsram")
 
-            T.clear(C_shared)
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-                T.copy(A[by * block_M, k * block_K], A_shared)
-                T.copy(B[k * block_K, bx * block_N], B_shared)
-                T.gemm(A_shared, B_shared, C_shared, transpose_B=False)
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                for by in T.serial(T.ceildiv(M, block_M)):
+                    T.clear(C_shared)
+                    for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                        T.copy(A[by * block_M, k * block_K], A_shared)
+                        T.copy(B[k * block_K, bx * block_N], B_shared)
+                        T.gemm(A_shared, B_shared, C_shared, transpose_B=False)
 
-            T.comm.all_gather(C_shared, C_gather, direction="all")
+                    T.comm.all_gather(C_shared, C_gather, direction="all")
 
     return tvm.IRModule({"main": main})
 
@@ -818,7 +831,7 @@ def allgather_row_major_kernel():
     def main(
         A: T.Tensor((block_M, block_N), dtype),
     ):
-        with T.Kernel(1, threads=128) as (bx,):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             A_gather = T.alloc_shared((16, block_M, block_N), dtype, scope="shared.rsram")
 
@@ -859,7 +872,7 @@ def gemm_annotate_conflict_asram_kernel():
         B: T.Tensor((block_K, block_N), dtype),
         C: T.Tensor((block_M, block_N), accum_dtype),
     ):
-        with T.Kernel(1, 1, threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -898,7 +911,7 @@ def gemm_annotate_conflict_wsram_kernel():
         B: T.Tensor((block_K, block_N), dtype),
         C: T.Tensor((block_M, block_N), accum_dtype),
     ):
-        with T.Kernel(1, 1, threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -937,7 +950,7 @@ def gemm_annotate_conflict_rsram_kernel():
         B: T.Tensor((block_K, block_N), dtype),
         C: T.Tensor((block_M, block_N), accum_dtype),
     ):
-        with T.Kernel(1, 1, threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -975,18 +988,17 @@ def dram_zn_to_asram_kernel():
     accum_dtype = "float32"
 
     policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
-    device_mesh = (2, 2)
 
     # ZN layout on DRAM — incompatible with ASRAM (Gemm.A requires ZZ-like)
     zn_dram = make_zn_layout((M, K), axes=[0, 1], block_shape=[32, 32])
 
-    A_tensor = T.MeshTensor((M, K), policy, device_mesh, dtype=dtype, layout=zn_dram)
-    B_tensor = T.MeshTensor((K, N), policy, device_mesh, dtype=dtype)
-    C_tensor = T.MeshTensor((M, N), policy, device_mesh, dtype=accum_dtype)
+    A_tensor = T.MeshTensor((M, K), policy, dtype=dtype, layout=zn_dram)
+    B_tensor = T.MeshTensor((K, N), policy, dtype=dtype)
+    C_tensor = T.MeshTensor((M, N), policy, dtype=accum_dtype)
 
     @T.prim_func
     def kernel(A: A_tensor, B: B_tensor, C: C_tensor):
-        with T.Kernel(1, 1, threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -1030,18 +1042,17 @@ def dram_zn_to_wsram_kernel():
     accum_dtype = "float32"
 
     policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
-    device_mesh = (2, 2)
 
     # ZN layout on DRAM B — incompatible with WSRAM DMA (requires ZZ-like)
     zn_dram = make_zn_layout((K, N), axes=[0, 1], block_shape=[32, 32])
 
-    A_tensor = T.MeshTensor((M, K), policy, device_mesh, dtype=dtype)
-    B_tensor = T.MeshTensor((K, N), policy, device_mesh, dtype=dtype, layout=zn_dram)
-    C_tensor = T.MeshTensor((M, N), policy, device_mesh, dtype=accum_dtype)
+    A_tensor = T.MeshTensor((M, K), policy, dtype=dtype)
+    B_tensor = T.MeshTensor((K, N), policy, dtype=dtype, layout=zn_dram)
+    C_tensor = T.MeshTensor((M, N), policy, dtype=accum_dtype)
 
     @T.prim_func
     def kernel(A: A_tensor, B: B_tensor, C: C_tensor):
-        with T.Kernel(1, 1, threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -1090,7 +1101,7 @@ def gemm_correct_annotate_kernel():
         B: T.Tensor((block_K, block_N), dtype),
         C: T.Tensor((block_M, block_N), accum_dtype),
     ):
-        with T.Kernel(1, 1, threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -1154,13 +1165,14 @@ def copy_reduce_copy_kernel():
         A: T.Tensor((M, N), dtype),
         B: T.Tensor((M,), dtype),
     ):
-        with T.Kernel(T.ceildiv(M, block_M), threads=128) as (bx,):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M,), dtype, scope="shared.rsram")
 
-            T.copy(A[bx * block_M, 0], A_shared)
-            T.reduce_sum(A_shared, B_shared, dim=1)
-            T.copy(B_shared, B[bx * block_M])
+            for bx in T.serial(T.ceildiv(M, block_M)):
+                T.copy(A[bx * block_M, 0], A_shared)
+                T.reduce_sum(A_shared, B_shared, dim=1)
+                T.copy(B_shared, B[bx * block_M])
 
     return tvm.IRModule({"main": main})
 
@@ -1203,7 +1215,7 @@ def broadcast_mismatched_layouts_kernel():
         A: T.Tensor((block_M, block_N), dtype),
         B: T.Tensor((block_M, block_N), dtype),
     ):
-        with T.Kernel(1, threads=128) as (bx,):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
 
@@ -1245,23 +1257,25 @@ def matmul(M, N, K, block_M, block_N, block_K, version, dtype=T.float16, accum_d
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), accum_dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
-            T.clear(C_shared)
-            for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-                T.copy(A[by * block_M, k * block_K], A_shared)
-                T.copy(B[k * block_K, bx * block_N], B_shared)
-                if version == 1:
-                    T.gemm_v1(A_shared, B_shared, C_shared)
-                elif version == 2:
-                    T.gemm_v2(A_shared, B_shared, C_shared)
-                else:
-                    raise ValueError(f"unsupported gemm version: {version}")
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                for by in T.serial(T.ceildiv(M, block_M)):
+                    T.clear(C_shared)
+                    for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                        T.copy(A[by * block_M, k * block_K], A_shared)
+                        T.copy(B[k * block_K, bx * block_N], B_shared)
+                        if version == 1:
+                            T.gemm_v1(A_shared, B_shared, C_shared)
+                        elif version == 2:
+                            T.gemm_v2(A_shared, B_shared, C_shared)
+                        else:
+                            raise ValueError(f"unsupported gemm version: {version}")
 
-            T.copy(C_shared, C[by * block_M, bx * block_N])
+                    T.copy(C_shared, C[by * block_M, bx * block_N])
 
     return tvm.IRModule({"main": main})
 
@@ -1309,28 +1323,24 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, versio
 
 
 def matmul_persistent(M, N, K, block_M, block_N, block_K, num_stages, dtype=T.bfloat16, accum_dtype=T.float32):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
-
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), device_mesh_config, dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), device_mesh_config, dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), device_mesh_config, accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
 
             A_shared = T.alloc_shared((block_M, block_K), dtype)
-            A_shared_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-            B_shared_dist = T.alloc_shared((block_K * nrows, block_N), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             # Each core iterates its own sharded tile grid with plain nested
@@ -1384,7 +1394,7 @@ def _rank1_copy_kernel(scope):
 
     @T.prim_func
     def main(A: T.Tensor((40,), "float16"), B: T.Tensor((40,), "float16")):
-        with T.Kernel(1, threads=128) as (bx,):
+        with T.Kernel():
             X = T.alloc_shared((40,), "float16", scope=scope)
             T.copy(A, X)
             T.copy(X, B)

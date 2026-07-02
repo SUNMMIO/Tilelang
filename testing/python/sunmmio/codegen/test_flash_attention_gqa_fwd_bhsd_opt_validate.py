@@ -3,7 +3,6 @@ import os
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import target
@@ -37,9 +36,6 @@ def flashattn_gqa_fwd_bhsd(
     accum_dtype = T.float32
 
     shard_policy = T.MeshShardingPolicy(y=0, x=2)
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     Q_layout = make_zz_layout(q_shape, [1, 3], (32, 32))
     K_layout = make_zz_layout(kv_shape, [1, 3], (32, 32))
@@ -48,14 +44,14 @@ def flashattn_gqa_fwd_bhsd(
 
     @T.prim_func
     def main(
-        Q: T.MeshTensor(q_shape, shard_policy, device_mesh_config, dtype, layout=Q_layout),  # type: ignore
-        K: T.MeshTensor(kv_shape, shard_policy, device_mesh_config, dtype, layout=K_layout),  # type: ignore
-        V: T.MeshTensor(kv_shape, shard_policy, device_mesh_config, dtype, layout=V_layout),  # type: ignore
-        Output: T.MeshTensor(q_shape, shard_policy, device_mesh_config, dtype, layout=O_layout),  # type: ignore
+        Q: T.MeshTensor(q_shape, shard_policy, dtype, layout=Q_layout),  # type: ignore
+        K: T.MeshTensor(kv_shape, shard_policy, dtype, layout=K_layout),  # type: ignore
+        V: T.MeshTensor(kv_shape, shard_policy, dtype, layout=V_layout),  # type: ignore
+        Output: T.MeshTensor(q_shape, shard_policy, dtype, layout=O_layout),  # type: ignore
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_batch = Q.shape[0]
-            sharded_heads = Q.shape[2]
+        with T.Kernel() as _cid:
+            sharded_batch = Q.local_shape[0]
+            sharded_heads = Q.local_shape[2]
 
             Q_shared = T.alloc_shared([block_M, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)

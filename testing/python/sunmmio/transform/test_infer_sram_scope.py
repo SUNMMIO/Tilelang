@@ -794,21 +794,18 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
         A: T.MeshTensor(
             (M, K),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=dtype,
             layout=A_layout,
         ),
         B: T.MeshTensor(
             (K, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=dtype,
             layout=B_layout,
         ),
         C: T.MeshTensor(
             (M, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=accum_dtype,
             layout=C_layout,
         ),
@@ -892,21 +889,18 @@ def auto_insert_copy_matmul(M, N, K, block_M, block_N, block_K, dtype="float16",
         A: T.MeshTensor(
             (M, K),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=dtype,
             layout=A_layout,
         ),
         B: T.MeshTensor(
             (K, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=dtype,
             layout=B_layout,
         ),
         C: T.MeshTensor(
             (M, N),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=accum_dtype,
             layout=C_layout,
         ),
@@ -971,26 +965,23 @@ def sliced_conflict_matmul(dtype="float16", accum_dtype="float"):
         A: T.MeshTensor(
             (128, 128),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=dtype,
             layout=A_layout,
         ),
         B: T.MeshTensor(
             (128, 128),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=dtype,
             layout=B_layout,
         ),
         C: T.MeshTensor(
             (128, 128),
             sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-            device_mesh_config=(2, 2),
             dtype=accum_dtype,
             layout=C_layout,
         ),
     ):
-        with T.Kernel(1, 1, threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((32, 32), dtype)
             B_shared = T.alloc_shared((32, 32), dtype)
             C_shared = T.alloc_shared((32, 32), accum_dtype)
@@ -1174,7 +1165,7 @@ def sibling_block_conflict_matmul(dtype="float16", accum_dtype="float32"):
         B: T.Tensor((128, 128), dtype),
         C: T.Tensor((128, 128), accum_dtype),
     ):
-        with T.Kernel(1, 1, threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((32, 32), dtype)
             B_shared = T.alloc_shared((32, 32), dtype)
             C_shared = T.alloc_shared((32, 32), accum_dtype)

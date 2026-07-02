@@ -4,7 +4,6 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.carver.arch import driver
 from tilelang.layout import (
     make_mx_row_major_layout,
     make_mxznn_layout,
@@ -53,10 +52,6 @@ def matmul_mx_operand_kernel(
     b_layout_kind="default",
     accum_dtype=T.bfloat16,
 ):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
-
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
     if _is_mx_dtype(a_dtype):
         A_layout = make_mxzz_layout((M, K), dtype=a_dtype) if a_layout_kind == "mxzz" else make_mx_row_major_layout((M, K), dtype=a_dtype)
@@ -76,16 +71,16 @@ def matmul_mx_operand_kernel(
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), shard_policy, device_mesh_config, a_dtype, layout=A_layout),  # type: ignore
-        B: T.MeshTensor((K, N), shard_policy, device_mesh_config, b_dtype, layout=B_layout),  # type: ignore
-        C: T.MeshTensor((M, N), shard_policy, device_mesh_config, accum_dtype, layout=C_layout),  # type: ignore
+        A: T.MeshTensor((M, K), shard_policy, a_dtype, layout=A_layout),  # type: ignore
+        B: T.MeshTensor((K, N), shard_policy, b_dtype, layout=B_layout),  # type: ignore
+        C: T.MeshTensor((M, N), shard_policy, accum_dtype, layout=C_layout),  # type: ignore
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as _cid:
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
 
-            A_shared_dist = T.alloc_shared((block_M, block_K * ncols), a_dtype)
-            B_shared_dist = T.alloc_shared((block_K * nrows, block_N), b_dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), a_dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), b_dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             for bx in T.serial(T.ceildiv(sharded_M, block_M)):

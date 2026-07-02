@@ -20,6 +20,7 @@ def make_sunmmio_target_with_host():
 def run_pre_split_passes(mod, target):
     """Run the passes required before AnnotateDeviceRegions, matching the real pipeline."""
     mod = tvm.tir.transform.BindTarget(target)(mod)
+    mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     return mod
 
@@ -54,8 +55,10 @@ def get_device_func(mod):
 def simple_kernel(M, N, dtype=T.float32):
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
-        with T.Kernel(M, N) as (bx, by):
-            B[bx, by] = A[bx, by]
+        with T.Kernel():
+            for bx in T.serial(M):
+                for by in T.serial(N):
+                    B[bx, by] = A[bx, by]
 
     return tvm.IRModule({"main": main})
 

@@ -4,7 +4,6 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.carver.arch import driver
 from tilelang.layout import make_row_major, make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import target
@@ -42,9 +41,6 @@ def dot_mul_tiled_parallel_3d(
     dtype="bfloat16",
     accum_dtype="bfloat16",
 ):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
     shard_policy = T.MeshShardingPolicy()
     tensor_shape = (batch, m, n)
     tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
@@ -54,11 +50,11 @@ def dot_mul_tiled_parallel_3d(
 
     @T.prim_func
     def main(
-        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
-        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
-        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, accum_dtype, layout=tensor_layout),  # type: ignore
+        A: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, accum_dtype, layout=tensor_layout),  # type: ignore
     ):
-        with T.Kernel(ncores):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
             B_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
             C_shared = T.alloc_shared((block_b, block_m, block_n), accum_dtype)
@@ -111,9 +107,6 @@ def dot_mul_tiled_parallel_2d(
     dtype="bfloat16",
     accum_dtype="bfloat16",
 ):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
     shard_policy = T.MeshShardingPolicy()
     tensor_shape = (m, n)
     tensor_layout = make_zz_layout(tensor_shape, [0, 1], (32, 32))
@@ -122,11 +115,11 @@ def dot_mul_tiled_parallel_2d(
 
     @T.prim_func
     def main(
-        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
-        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
-        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, accum_dtype, layout=tensor_layout),  # type: ignore
+        A: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, accum_dtype, layout=tensor_layout),  # type: ignore
     ):
-        with T.Kernel(ncores):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_m, block_n), dtype)
             B_shared = T.alloc_shared((block_m, block_n), dtype)
             C_shared = T.alloc_shared((block_m, block_n), accum_dtype)
@@ -175,9 +168,6 @@ def tiles_broadcast(
     dtype="bfloat16",
     accum_dtype="bfloat16",
 ):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
     shard_policy = T.MeshShardingPolicy()
     tensor_shape = (batch, m, n)
     tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
@@ -189,12 +179,12 @@ def tiles_broadcast(
 
     @T.prim_func
     def main(
-        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
-        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
-        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, accum_dtype, layout=tensor_layout),  # type: ignore
-        D: T.MeshTensor(vector_shape, shard_policy, device_mesh_config, dtype, layout=vector_layout),  # type: ignore
+        A: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, accum_dtype, layout=tensor_layout),  # type: ignore
+        D: T.MeshTensor(vector_shape, shard_policy, dtype, layout=vector_layout),  # type: ignore
     ):
-        with T.Kernel(ncores):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
             B_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
             C_shared = T.alloc_shared((block_b, block_m, block_n), accum_dtype)
@@ -256,9 +246,6 @@ def tiles_broadcast_copy(
     dtype="bfloat16",
     accum_dtype="bfloat16",
 ):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
     shard_policy = T.MeshShardingPolicy()
     tensor_shape = (batch, m, n)
     tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
@@ -270,12 +257,12 @@ def tiles_broadcast_copy(
 
     @T.prim_func
     def main(
-        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
-        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
-        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, accum_dtype, layout=tensor_layout),  # type: ignore
-        D: T.MeshTensor(vector_shape, shard_policy, device_mesh_config, dtype, layout=vector_layout),  # type: ignore
+        A: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, accum_dtype, layout=tensor_layout),  # type: ignore
+        D: T.MeshTensor(vector_shape, shard_policy, dtype, layout=vector_layout),  # type: ignore
     ):
-        with T.Kernel(ncores):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
             B_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
             C_shared = T.alloc_shared((block_b, block_m, block_n), accum_dtype)
@@ -331,9 +318,6 @@ def tiles_broadcast_copy(
 
 @target("Sunmmio")
 def tiles_1d(m=512, block_m=256, dtype="bfloat16", accum_dtype="bfloat16"):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
     shard_policy = T.MeshShardingPolicy()
     tensor_shape = (m,)
     tensor_layout = make_row_major(tensor_shape)
@@ -341,11 +325,11 @@ def tiles_1d(m=512, block_m=256, dtype="bfloat16", accum_dtype="bfloat16"):
 
     @T.prim_func
     def main(
-        A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
-        B: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout),  # type: ignore
-        C: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, accum_dtype, layout=tensor_layout),  # type: ignore
+        A: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, accum_dtype, layout=tensor_layout),  # type: ignore
     ):
-        with T.Kernel(ncores):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_m,), dtype)
             B_shared = T.alloc_shared((block_m,), dtype)
             C_shared = T.alloc_shared((block_m,), accum_dtype)

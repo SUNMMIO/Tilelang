@@ -4,17 +4,12 @@ from typing import Callable
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.carver.arch import driver
 from tilelang.engine.phase import LowerAndLegalize
 from tilelang.utils.target import determine_target
 from tilelang.layout import make_zz_layout
 
 
 def softmax_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Callable":
-    mesh = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = mesh
-    ncores = nrows * ncols
-
     zz_layout = make_zz_layout((M, N))
     placement = T.MeshShardingPolicy(y=0, x=1)
 
@@ -22,9 +17,9 @@ def softmax_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Call
     scale = 1.44269504  # log2(e)
 
     @T.prim_func
-    def main(X: T.MeshTensor((M, N), placement, mesh, dtype, zz_layout), Y: T.MeshTensor((M, N), placement, mesh, dtype, zz_layout)):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_N = X.shape
+    def main(X: T.MeshTensor((M, N), placement, dtype, layout=zz_layout), Y: T.MeshTensor((M, N), placement, dtype, layout=zz_layout)):
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_N = X.local_shape
 
             X_shared = T.alloc_shared((block_M, block_N), dtype)
             Y_shared = T.alloc_shared((block_M, block_N), dtype)
@@ -33,7 +28,7 @@ def softmax_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Call
             exp_x = T.alloc_shared([block_M, block_N], accum_dtype)
             sum_exp_x = T.alloc_shared((block_M), accum_dtype)
 
-            lse_dist = T.alloc_shared((ncols, block_M), accum_dtype)
+            lse_dist = T.alloc_shared((T.mesh_ncols(), block_M), accum_dtype)
             lse_max = T.alloc_shared((block_M,), accum_dtype)
             lse_global = T.alloc_shared((block_M,), accum_dtype)
 
@@ -56,7 +51,7 @@ def softmax_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Call
                 T.reduce_max(lse_dist, lse_max, dim=0, clear=True)
 
                 # Get global lse
-                for i, j in T.Tiles([ncols, block_M]):
+                for i, j in T.Tiles([T.mesh_ncols(), block_M]):
                     lse_dist[i, j] = T.exp2(lse_dist[i, j] - lse_max[j])
                 T.reduce_sum(lse_dist, lse_global, dim=0, clear=True)
                 for i in T.Tiles([block_M]):

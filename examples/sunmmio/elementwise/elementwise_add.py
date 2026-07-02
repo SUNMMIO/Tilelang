@@ -11,21 +11,17 @@ def ref_program(x, y):
 
 
 def _elementwise_add_prim_func(M, N, block_M, block_N, in_dtype, out_dtype):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
-
     zz_layout = make_zz_layout((M, N))
     placement = T.MeshShardingPolicy(y=0, x=1)
 
     @T.prim_func
     def elem_add(
-        A: T.MeshTensor((M, N), placement, device_mesh_config, in_dtype, layout=zz_layout),
-        B: T.MeshTensor((M, N), placement, device_mesh_config, in_dtype, layout=zz_layout),
-        C: T.MeshTensor((M, N), placement, device_mesh_config, out_dtype, layout=zz_layout),
+        A: T.MeshTensor((M, N), placement, in_dtype, layout=zz_layout),
+        B: T.MeshTensor((M, N), placement, in_dtype, layout=zz_layout),
+        C: T.MeshTensor((M, N), placement, out_dtype, layout=zz_layout),
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_N = A.shape
+        with T.Kernel() as _cid:
+            sharded_M, sharded_N = A.local_shape
 
             A_shared = T.alloc_shared((block_M, block_N), in_dtype)
             B_shared = T.alloc_shared((block_M, block_N), in_dtype)
