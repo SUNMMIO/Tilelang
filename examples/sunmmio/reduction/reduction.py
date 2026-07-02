@@ -11,8 +11,7 @@ from tilelang.layout import make_zz_layout, make_row_major
 
 def reduction(M, K, N, block_K, block_N, in_dtype, out_dtype):
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
+    _, ncols = device_mesh_config
 
     zz_layout = make_zz_layout((M, K, N))
     placement = T.MeshShardingPolicy(y=0, x=1)
@@ -23,8 +22,8 @@ def reduction(M, K, N, block_K, block_N, in_dtype, out_dtype):
         A: T.MeshTensor((M, K, N), placement, device_mesh_config, in_dtype, layout=zz_layout),
         B: T.MeshTensor((M, K), placement, device_mesh_config, out_dtype, layout=rm_layout),
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_K, sharded_N = A.shape
+        with T.Kernel() as _cid:
+            sharded_M, sharded_K, sharded_N = A.local_shape
             print(sharded_M, sharded_K, sharded_N)
 
             A_shared = T.alloc_shared((block_K, block_N), in_dtype)

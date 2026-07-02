@@ -12,8 +12,6 @@ from testing.python.sunmmio.common.formal_verify import *
 def kernel_sync(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     A_shape = (M, K)
     B_shape = (M, K)
@@ -29,9 +27,9 @@ def kernel_sync(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype
         C: T.MeshTensor(C_shape, shard_policy, device_mesh_config, dtype, layout=C_layout),
     ):
         # Initialize Kernel Context
-        with T.Kernel(ncores) as _cid:
-            sharded_M, _ = A.shape
-            _, sharded_N = C.shape
+        with T.Kernel() as _cid:
+            sharded_M, _ = A.local_shape
+            _, sharded_N = C.local_shape
 
             A_shared = T.alloc_shared((1024, 1024), dtype, scope="shared.asram")
             B_shared = T.alloc_shared((1024, 1024), dtype, scope="shared.wsram")

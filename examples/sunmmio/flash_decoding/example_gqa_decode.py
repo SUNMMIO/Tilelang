@@ -12,8 +12,6 @@ from tilelang.layout import make_zz_layout, make_row_major
 def gqa_flashattn(batch, heads, kv_heads, seqlen_kv, dim, block_N=128):
     # Device configurations
     mesh = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = mesh
-    ncores = nrows * ncols
 
     scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
     shape_q = [batch, heads, dim]
@@ -41,8 +39,8 @@ def gqa_flashattn(batch, heads, kv_heads, seqlen_kv, dim, block_N=128):
         ),
         Output: T.MeshTensor(shape_o, T.MeshShardingPolicy(y=0, x=1), mesh, dtype, make_zz_layout(shape_o)),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_batch, sharded_heads, _ = Q.shape
+        with T.Kernel() as (_cid):
+            sharded_batch, sharded_heads, _ = Q.local_shape
 
             Q_shared = T.alloc_shared([block_H, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)

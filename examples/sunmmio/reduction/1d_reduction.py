@@ -11,8 +11,7 @@ from tilelang.layout import make_row_major, make_aligned_row_major
 
 def reduction(M, block_M, in_dtype, out_dtype):
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
+    _, ncols = device_mesh_config
 
     A_layout = make_row_major((M,))
     B_layout = make_aligned_row_major((1,), align_bytes=1024, dtype=out_dtype)
@@ -24,8 +23,8 @@ def reduction(M, block_M, in_dtype, out_dtype):
         A: T.MeshTensor((M), A_placement, device_mesh_config, in_dtype, layout=A_layout),
         B: T.MeshTensor((1), B_placement, device_mesh_config, out_dtype, layout=B_layout),
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M = A.shape[0]
+        with T.Kernel() as _cid:
+            sharded_M = A.local_shape[0]
 
             A_shared = T.alloc_shared((block_M), in_dtype)
             Acc_shared = T.alloc_shared((block_M), out_dtype)

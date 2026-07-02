@@ -77,7 +77,6 @@ def bf16_gemm_with_allgather(M=32, N=32, K=32, block_M=32, block_N=32, block_K=3
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -90,9 +89,9 @@ def bf16_gemm_with_allgather(M=32, N=32, K=32, block_M=32, block_N=32, block_K=3
         B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), dtype, layout=B_layout),
         C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             A_shared_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
@@ -157,7 +156,6 @@ def bf16_gemm_with_copy_to_asram(M=32, N=32, K=32, block_M=32, block_N=32, block
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -170,9 +168,9 @@ def bf16_gemm_with_copy_to_asram(M=32, N=32, K=32, block_M=32, block_N=32, block
         B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), dtype, layout=B_layout),
         C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
             # A staged via direct copy (no all_gather): full DRAM->ASRAM transfer.
             A_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
@@ -237,7 +235,6 @@ def bf16_gemm_with_hoisted_copy_writer(M=32, N=32, K=64, block_M=32, block_N=32,
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -250,9 +247,9 @@ def bf16_gemm_with_hoisted_copy_writer(M=32, N=32, K=64, block_M=32, block_N=32,
         B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), dtype, layout=B_layout),
         C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
             # A is loaded ONCE at kernel scope, before the K-loop. The
             # whole-K stripe of A is brought in; B is streamed inside the loop.
             A_shared = T.alloc_shared((block_M, sharded_K), dtype)
@@ -292,7 +289,6 @@ def bf16_gemm_with_hoisted_copy_writer_bf16_acc(M=32, N=32, K=64, block_M=32, bl
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -305,9 +301,9 @@ def bf16_gemm_with_hoisted_copy_writer_bf16_acc(M=32, N=32, K=64, block_M=32, bl
         B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), dtype, layout=B_layout),
         C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
             A_shared = T.alloc_shared((block_M, sharded_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -346,7 +342,6 @@ def bf16_gemm_with_two_independent_hoisted_writers(
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -361,9 +356,9 @@ def bf16_gemm_with_two_independent_hoisted_writers(
         C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
         C2: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
             A_shared = T.alloc_shared((block_M, sharded_K), dtype)
             A2_shared = T.alloc_shared((block_M, sharded_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
@@ -412,7 +407,6 @@ def bf16_gemm_with_hoisted_writer_dirty_source(
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -425,9 +419,9 @@ def bf16_gemm_with_hoisted_writer_dirty_source(
         B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), dtype, layout=B_layout),
         C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
             # User-declared RSRAM scratch — visible by name to the test so
             # we can verify cleanliness detects writes to it.
             A_rsram = T.alloc_shared((block_M, sharded_K), dtype, scope="shared.rsram")
@@ -467,7 +461,6 @@ def bf16_gemm_with_hoisted_allgather(M=32, N=32, K=32, block_M=32, block_N=32, b
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -480,9 +473,9 @@ def bf16_gemm_with_hoisted_allgather(M=32, N=32, K=32, block_M=32, block_N=32, b
         B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), dtype, layout=B_layout),
         C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             A_shared_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
@@ -524,7 +517,6 @@ def bf16_gemm_with_hoisted_allgather_dirty_source(
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -537,9 +529,9 @@ def bf16_gemm_with_hoisted_allgather_dirty_source(
         B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), dtype, layout=B_layout),
         C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             A_shared_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
@@ -889,7 +881,6 @@ def bf16_gemm_multi_consumer_groupable(M=32, N=32, K=32, block_M=32, block_N=32,
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -903,9 +894,9 @@ def bf16_gemm_multi_consumer_groupable(M=32, N=32, K=32, block_M=32, block_N=32,
         C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
         C2: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -946,7 +937,6 @@ def bf16_gemm_multi_consumer_non_groupable(M=32, N=32, K=32, block_M=32, block_N
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -961,9 +951,9 @@ def bf16_gemm_multi_consumer_non_groupable(M=32, N=32, K=32, block_M=32, block_N
         C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
         C2: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             B2_shared = T.alloc_shared((block_K, block_N), dtype)
@@ -1022,7 +1012,6 @@ def bf16_flash_attention_shaped(M=32, N=32, K=64, block_M=32, block_N=32, block_
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     Q_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -1037,8 +1026,8 @@ def bf16_flash_attention_shaped(M=32, N=32, K=64, block_M=32, block_N=32, block_
         V: T.MeshTensor((N, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), dtype, layout=V_layout),
         O: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=O_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = Q.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = Q.local_shape
             Q_shared = T.alloc_shared((block_M, sharded_K), dtype)  # hoisted A (Q)
             K_shared = T.alloc_shared((block_K, block_N), dtype)
             S_shared = T.alloc_shared((block_M, block_N), dtype)  # bf16 QK output
@@ -1147,7 +1136,6 @@ def bf16_gemm_no_reaching_writer(M=32, N=32, K=32, block_M=32, block_N=32, block
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -1160,8 +1148,8 @@ def bf16_gemm_no_reaching_writer(M=32, N=32, K=32, block_M=32, block_N=32, block
         B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), dtype, layout=B_layout),
         C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = A.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = A.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)  # never written
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -1190,7 +1178,6 @@ def bf16_gemm_multiple_writers(M=32, N=32, K=32, block_M=32, block_N=32, block_K
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -1204,8 +1191,8 @@ def bf16_gemm_multiple_writers(M=32, N=32, K=32, block_M=32, block_N=32, block_K
         B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), dtype, layout=B_layout),
         C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (cid):
-            sharded_M, sharded_K = A.shape
+        with T.Kernel(T.mesh_ncores()) as cid:
+            sharded_M, sharded_K = A.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -1239,7 +1226,6 @@ def bf16_gemm_diverging_scopes(M=32, N=32, K=32, block_M=32, block_N=32, block_K
     from tilelang.carver.arch import driver
 
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
-    ncores = nrows * ncols
     from tilelang.layout import make_zz_layout
 
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
@@ -1252,8 +1238,8 @@ def bf16_gemm_diverging_scopes(M=32, N=32, K=32, block_M=32, block_N=32, block_K
         B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), dtype, layout=B_layout),
         C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), (nrows, ncols), accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_K = A.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_K = A.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)

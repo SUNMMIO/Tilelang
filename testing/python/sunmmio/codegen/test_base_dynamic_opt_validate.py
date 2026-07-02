@@ -77,7 +77,6 @@ def dynamic_allocate_copy_mma_kernel(
 ):
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     M_sharded = T.dynamic("m")
     N_sharded = T.dynamic("n")
@@ -98,9 +97,9 @@ def dynamic_allocate_copy_mma_kernel(
         B: T.MeshTensor((K, N), shard_policy, device_mesh_config, dtype),  # type: ignore
         C: T.MeshTensor((M, N), shard_policy, device_mesh_config, accum_dtype),  # type: ignore
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_K = A.shape
-            sharded_N = B.shape[1]
+        with T.Kernel() as _cid:
+            sharded_M, sharded_K = A.local_shape
+            sharded_N = B.local_shape[1]
             A_shared_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
             B_shared_dist = T.alloc_shared((block_K * nrows, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -147,8 +146,6 @@ def dynamic_zz_allocate_copy_mma_kernel(
     C_layout = make_zz_layout((M, N))
 
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     shard_policy = T.MeshShardingPolicy()
 
@@ -158,9 +155,9 @@ def dynamic_zz_allocate_copy_mma_kernel(
         B: T.MeshTensor((K, N), shard_policy, device_mesh_config, dtype, layout=B_layout),  # type: ignore
         C: T.MeshTensor((M, N), shard_policy, device_mesh_config, dtype, layout=C_layout),  # type: ignore
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M = A.shape[0]
-            sharded_N = B.shape[1]
+        with T.Kernel() as _cid:
+            sharded_M = A.local_shape[0]
+            sharded_N = B.local_shape[1]
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), dtype)

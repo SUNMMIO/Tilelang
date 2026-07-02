@@ -18,8 +18,6 @@ def summa_matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtyp
     """
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     A_shape = (M, K)
     B_shape = (K, N)
@@ -36,9 +34,9 @@ def summa_matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtyp
     ):
         # Assume the current is a 4x4 processor grid (Mesh)
         # Each core is responsible for outputting a 32x32 block of matrix C
-        with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as _cid:
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
 
             # Allocate local SRAM cache
             # A_shared is placed in ASRAM (usually used for A matrix cache)

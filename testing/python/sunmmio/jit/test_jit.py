@@ -751,8 +751,6 @@ define void @elem_add_kernel(ptr addrspace(4) %0) #0 !sunmmio.kernel_meta !1 {
 def elementwise_add_jit(M, N, block_M, block_N, in_dtype, out_dtype):
     """JIT version of examples/sunmmio/elementwise/elementwise_add.py."""
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     zz_layout = make_zz_layout((M, N))
     placement = T.MeshShardingPolicy(y=0, x=1)
@@ -763,8 +761,8 @@ def elementwise_add_jit(M, N, block_M, block_N, in_dtype, out_dtype):
         B: T.MeshTensor((M, N), placement, device_mesh_config, in_dtype, layout=zz_layout),
         C: T.MeshTensor((M, N), placement, device_mesh_config, out_dtype, layout=zz_layout),
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_N = A.shape
+        with T.Kernel() as _cid:
+            sharded_M, sharded_N = A.local_shape
 
             A_shared = T.alloc_shared((block_M, block_N), in_dtype)
             B_shared = T.alloc_shared((block_M, block_N), in_dtype)

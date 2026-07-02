@@ -38,8 +38,7 @@ from tilelang.layout import make_zz_layout
 
 def mla_decode(batch, heads, kv_heads, seqlen_kv, dim, pe_dim, block_N=64, block_H=16) -> "Callable":
     mesh = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = mesh
-    ncores = nrows * ncols
+    _, ncols = mesh
 
     assert kv_heads == 1, "MLA shares a single latent KV across all query heads"
     assert heads % ncols == 0, "heads must be divisible by the mesh column count"
@@ -71,9 +70,9 @@ def mla_decode(batch, heads, kv_heads, seqlen_kv, dim, pe_dim, block_N=64, block
         K_pe: T.MeshTensor(shape_kpe, kv_policy, mesh, dtype, make_zz_layout(shape_kpe, axes=(1, 3))),
         Output: T.MeshTensor(shape_o, head_policy, mesh, dtype, make_zz_layout(shape_o)),
     ):
-        with T.Kernel(ncores) as (cid):
-            sharded_batch = Q.shape[0]
-            _, sharded_seqlen, _, _ = KV.shape
+        with T.Kernel() as (cid):
+            sharded_batch = Q.local_shape[0]
+            _, sharded_seqlen, _, _ = KV.local_shape
             # This core's column owns the global head blocks
             # [col*blocks_per_col, (col+1)*blocks_per_col).
             col = cid % ncols

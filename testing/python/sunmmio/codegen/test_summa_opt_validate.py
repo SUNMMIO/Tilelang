@@ -34,7 +34,6 @@ def summa_matmul(
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     A_shape = (M, K)
     B_shape = (K, N)
@@ -49,9 +48,9 @@ def summa_matmul(
         B: T.MeshTensor(B_shape, shard_policy, device_mesh_config, dtype, layout=B_layout),  # type: ignore
         C: T.MeshTensor(C_shape, shard_policy, device_mesh_config, accum_dtype, layout=C_layout),  # type: ignore
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M, _ = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as _cid:
+            sharded_M, _ = A.local_shape
+            _, sharded_N = B.local_shape
             core_row = _cid // ncols
             core_col = _cid % ncols
 

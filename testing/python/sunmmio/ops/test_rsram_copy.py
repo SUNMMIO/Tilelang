@@ -37,7 +37,7 @@ def rsram_copy(block_M=64, block_N=64, dtype="float16", dst_dtype=None):
 
     @T.prim_func
     def main():
-        with T.Kernel(1, 1, threads=128) as (_bx, _by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M, block_N), dst_dtype, scope="shared.rsram")
             T.copy(A_shared, B_shared)
@@ -50,7 +50,7 @@ def rsram_copy_region(block_M=64, block_N=64, dtype="float16"):
 
     @T.prim_func
     def main():
-        with T.Kernel(1, 1, threads=128) as (_bx, _by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             T.copy(A_shared[8:24, 32:64], B_shared[0:16, 0:32])
@@ -210,7 +210,7 @@ def rsram_narrow_cast_copy(shape=(64, 64), dtype="float16", dst_dtype=T.float8_e
 
     @T.prim_func
     def main():
-        with T.Kernel(1, 1, threads=128) as (_bx, _by):
+        with T.Kernel():
             y_q_local = T.alloc_shared(shape, dtype)
             y_q_local_narrow = T.alloc_shared(shape, dst_dtype)
             T.copy(y_q_local, y_q_local_narrow)

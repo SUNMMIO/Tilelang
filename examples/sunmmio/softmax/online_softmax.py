@@ -12,8 +12,7 @@ from tilelang.layout import make_zz_layout
 
 def softmax_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Callable":
     mesh = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = mesh
-    ncores = nrows * ncols
+    _, ncols = mesh
 
     zz_layout = make_zz_layout((M, N))
     placement = T.MeshShardingPolicy(y=0, x=1)
@@ -23,8 +22,8 @@ def softmax_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Call
 
     @T.prim_func
     def main(X: T.MeshTensor((M, N), placement, mesh, dtype, zz_layout), Y: T.MeshTensor((M, N), placement, mesh, dtype, zz_layout)):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_N = X.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_N = X.local_shape
 
             X_shared = T.alloc_shared((block_M, block_N), dtype)
             Y_shared = T.alloc_shared((block_M, block_N), dtype)

@@ -32,7 +32,7 @@ def partitioned_view_region_kernel(
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N, K), accum_dtype),
     ):
-        with T.Kernel(1):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, 1, block_N), accum_dtype)

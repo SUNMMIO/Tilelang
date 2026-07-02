@@ -26,8 +26,6 @@ def layout_transform_roundtrip_kernel(
     dtype=T.float16,
 ):
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     shard_policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
     dram_layout = make_zz_layout((m, n), axes=[0, 1], block_shape=(32, 32))
@@ -38,7 +36,7 @@ def layout_transform_roundtrip_kernel(
         A: T.MeshTensor((m, n), shard_policy, device_mesh_config, dtype, layout=dram_layout),  # type: ignore
         B: T.MeshTensor((m, n), shard_policy, device_mesh_config, dtype, layout=dram_layout),  # type: ignore
     ):
-        with T.Kernel(ncores, threads=128) as _cid:
+        with T.Kernel() as _cid:
             A_rsram = T.alloc_shared((m, n), dtype, scope="shared.rsram")
             T.annotate_layout({A_rsram: rsram_layout})
 

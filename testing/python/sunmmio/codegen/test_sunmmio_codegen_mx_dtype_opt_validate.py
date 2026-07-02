@@ -55,7 +55,6 @@ def matmul_mx_operand_kernel(
 ):
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
     nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
     if _is_mx_dtype(a_dtype):
@@ -80,9 +79,9 @@ def matmul_mx_operand_kernel(
         B: T.MeshTensor((K, N), shard_policy, device_mesh_config, b_dtype, layout=B_layout),  # type: ignore
         C: T.MeshTensor((M, N), shard_policy, device_mesh_config, accum_dtype, layout=C_layout),  # type: ignore
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as _cid:
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
 
             A_shared_dist = T.alloc_shared((block_M, block_K * ncols), a_dtype)
             B_shared_dist = T.alloc_shared((block_K * nrows, block_N), b_dtype)

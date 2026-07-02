@@ -69,8 +69,6 @@ def reduce_kernel_builder(shape, reduce_axis, dtype="float16", clear=True):
     out_shape = tuple(out_shape)
 
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
     shard_policy = T.MeshShardingPolicy()
     input_layout = _dram_input_layout(shape)
     output_layout = _dram_reduce_output_layout(out_shape)
@@ -80,7 +78,7 @@ def reduce_kernel_builder(shape, reduce_axis, dtype="float16", clear=True):
         A: T.MeshTensor(shape, shard_policy, device_mesh_config, dtype, layout=input_layout),  # type: ignore
         Out: T.MeshTensor(out_shape, shard_policy, device_mesh_config, dtype, layout=output_layout),  # type: ignore
     ):
-        with T.Kernel(ncores):
+        with T.Kernel():
             A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
             Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
 
@@ -104,8 +102,6 @@ def reduce_tail_region_kernel(
     dtype="float16",
 ):
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
     shard_policy = T.MeshShardingPolicy()
     input_shape = (block_m, block_n)
     output_shape = (block_m,)
@@ -119,7 +115,7 @@ def reduce_tail_region_kernel(
         A: T.MeshTensor(input_shape, shard_policy, device_mesh_config, dtype, layout=input_layout),  # type: ignore
         Out: T.MeshTensor(output_shape, shard_policy, device_mesh_config, dtype, layout=output_layout),  # type: ignore
     ):
-        with T.Kernel(ncores):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_m, block_n), dtype, scope="shared.rsram")
             Out_shared = T.alloc_shared((block_m,), dtype, scope="shared.rsram")
 
@@ -160,8 +156,6 @@ def reduce_tiled_test(
     input_shape = (b, m, n)
 
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
     shard_policy = T.MeshShardingPolicy()
     input_layout = make_zz_layout(input_shape, [1, 2], (32, 32))
     output_layout = _dram_reduce_output_layout(out_shape_full)
@@ -174,7 +168,7 @@ def reduce_tiled_test(
         A: T.MeshTensor(input_shape, shard_policy, device_mesh_config, dtype, layout=input_layout),  # type: ignore
         Out: T.MeshTensor(out_shape_full, shard_policy, device_mesh_config, dtype, layout=output_layout),  # type: ignore
     ):
-        with T.Kernel(ncores):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_b, block_m, block_n), dtype, scope="shared.rsram")
             Out_shared = T.alloc_shared(out_shape_block, dtype, scope="shared.rsram")
 

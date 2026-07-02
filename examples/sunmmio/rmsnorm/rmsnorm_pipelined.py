@@ -30,8 +30,7 @@ from tilelang.layout import make_zz_layout, make_aligned_row_major
 
 def rmsnorm_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16, eps: float = 1e-12) -> "Callable":
     mesh = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = mesh
-    ncores = nrows * ncols
+    _, ncols = mesh
 
     zz_layout = make_zz_layout((M, N))
     placement = T.MeshShardingPolicy(y=0, x=1)
@@ -43,8 +42,8 @@ def rmsnorm_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16, eps: flo
         X: T.MeshTensor((M, N), placement, mesh, dtype, zz_layout),
         Y: T.MeshTensor((M, N), placement, mesh, dtype, zz_layout),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_M, sharded_N = X.shape
+        with T.Kernel() as (_cid):
+            sharded_M, sharded_N = X.local_shape
 
             # --- Explicit scope: an elementwise + reduction kernel with no
             # tensor-core GEMM, so every on-chip buffer lives in RSRAM (the

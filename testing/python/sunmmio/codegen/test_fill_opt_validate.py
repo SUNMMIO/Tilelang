@@ -38,8 +38,6 @@ def fill_tiled_test(
     dtype="float16",
 ):
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
     shard_policy = T.MeshShardingPolicy()
     tensor_shape = (b, m, n)
     tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
@@ -49,7 +47,7 @@ def fill_tiled_test(
 
     @T.prim_func
     def main(A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout)):  # type: ignore
-        with T.Kernel(ncores):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
 
             for bz in T.serial(grid_b):
@@ -81,8 +79,6 @@ def fill_tiled_2d_test(
     dtype="float16",
 ):
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
     shard_policy = T.MeshShardingPolicy()
     tensor_shape = (m, n)
     tensor_layout = make_zz_layout(tensor_shape, [0, 1], (32, 32))
@@ -91,7 +87,7 @@ def fill_tiled_2d_test(
 
     @T.prim_func
     def main(A: T.MeshTensor(tensor_shape, shard_policy, device_mesh_config, dtype, layout=tensor_layout)):  # type: ignore
-        with T.Kernel(ncores):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_m, block_n), dtype)
 
             for by in T.serial(grid_m):

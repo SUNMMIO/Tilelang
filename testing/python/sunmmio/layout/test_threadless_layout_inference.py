@@ -47,8 +47,10 @@ def make_threadless_copy_kernel(M, N, dtype=T.float32):
 
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
-        with T.Kernel(M, N) as (bx, by):
-            B[bx, by] = A[bx, by]
+        with T.Kernel():
+            for bx in T.serial(M):
+                for by in T.serial(N):
+                    B[bx, by] = A[bx, by]
 
     return tvm.IRModule({"main": main})
 
@@ -66,12 +68,14 @@ def make_sunmmio_parallel_shared_kernel(M, N, dtype=T.float32):
 
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
-        with T.Kernel(T.ceildiv(M, 32), T.ceildiv(N, 32)) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((32, 32), dtype)
-            for i, j in T.Parallel(32, 32):
-                A_shared[i, j] = A[bx * 32 + i, by * 32 + j]
-            for i, j in T.Parallel(32, 32):
-                B[bx * 32 + i, by * 32 + j] = A_shared[i, j]
+            for bx in T.serial(T.ceildiv(M, 32)):
+                for by in T.serial(T.ceildiv(N, 32)):
+                    for i, j in T.Tiles([32, 32], parallel=True):
+                        A_shared[i, j] = A[bx * 32 + i, by * 32 + j]
+                    for i, j in T.Tiles([32, 32], parallel=True):
+                        B[bx * 32 + i, by * 32 + j] = A_shared[i, j]
 
     return tvm.IRModule({"main": main})
 

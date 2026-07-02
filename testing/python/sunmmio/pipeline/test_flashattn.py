@@ -28,8 +28,6 @@ def kernel_flashattn(
     accum_dtype = T.bfloat16
     shard_policy = T.MeshShardingPolicy(y=0, x=2)
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     Q_layout = make_zz_layout(q_shape, [1, 3], (32, 32))
     K_layout = make_zz_layout(kv_shape, [1, 3], (32, 32))
@@ -43,9 +41,9 @@ def kernel_flashattn(
         V: T.MeshTensor(kv_shape, shard_policy, device_mesh_config, dtype, layout=V_layout),
         Output: T.MeshTensor(q_shape, shard_policy, device_mesh_config, dtype, layout=O_layout),
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_batch = Q.shape[0]
-            sharded_heads = Q.shape[2]
+        with T.Kernel() as _cid:
+            sharded_batch = Q.local_shape[0]
+            sharded_heads = Q.local_shape[2]
 
             Q_shared = T.alloc_shared([block_M, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)

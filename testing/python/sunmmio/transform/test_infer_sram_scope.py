@@ -990,7 +990,7 @@ def sliced_conflict_matmul(dtype="float16", accum_dtype="float"):
             layout=C_layout,
         ),
     ):
-        with T.Kernel(1, 1, threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((32, 32), dtype)
             B_shared = T.alloc_shared((32, 32), dtype)
             C_shared = T.alloc_shared((32, 32), accum_dtype)
@@ -1174,7 +1174,7 @@ def sibling_block_conflict_matmul(dtype="float16", accum_dtype="float32"):
         B: T.Tensor((128, 128), dtype),
         C: T.Tensor((128, 128), accum_dtype),
     ):
-        with T.Kernel(1, 1, threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((32, 32), dtype)
             B_shared = T.alloc_shared((32, 32), dtype)
             C_shared = T.alloc_shared((32, 32), accum_dtype)

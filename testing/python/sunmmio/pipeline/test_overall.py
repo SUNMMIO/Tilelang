@@ -12,8 +12,6 @@ from testing.python.sunmmio.common.formal_verify import *
 def kernel_overall(M, N, K, block_M, block_N, block_K, dtype="bfloat16", accum_dtype="float32"):
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
     device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     A_shape = (M, K)
     B_shape = (K, N)
@@ -30,9 +28,9 @@ def kernel_overall(M, N, K, block_M, block_N, block_K, dtype="bfloat16", accum_d
         C: T.MeshTensor(C_shape, shard_policy, device_mesh_config, accum_dtype, layout=C_layout),
     ):
         # Initialize Kernel Context
-        with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+        with T.Kernel() as _cid:
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
 
             # [wanghz18] Automatic SRAM Scope Inference
             # We declare generic 'shared' scope, expecting InferSramScope pass to
