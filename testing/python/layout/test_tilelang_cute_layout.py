@@ -25,6 +25,10 @@ make_zz = _get("tl.sunmmio.make_zz")
 make_zn = _get("tl.sunmmio.make_zn")
 make_zzz = _get("tl.sunmmio.make_zzz")
 make_nzz = _get("tl.sunmmio.make_nzz")
+make_mx_row_major = _get("tl.sunmmio.make_mx_row_major")
+make_mxzz = _get("tl.sunmmio.make_mxzz")
+make_mxznn = _get("tl.sunmmio.make_mxznn")
+derive_mx_layout_like = _get("tl.sunmmio.derive_mx_layout_like")
 get_mode_shape = _get("tl.CuteLayout_mode_shape")
 get_mode_stride = _get("tl.CuteLayout_mode_stride")
 get_dim_levels = _get("tl.CuteLayout_dim_levels")
@@ -194,6 +198,69 @@ class TestSunmmioConstructors:
         layout = make_nzz(_imms(128, 128), [0, 1], _imms(16, 16), _imms(4, 4))
         dl = [int(x) for x in get_dim_levels(layout)]
         assert dl == [3, 3]
+
+    @pytest.mark.parametrize(
+        "shape,dtype,row_elems",
+        [
+            ((32, 64), "custom[mxfp8]8", 128),
+            ((32, 32), "custom[mxfp4]4", 256),
+        ],
+    )
+    def test_mx_row_major_covers_data_scale_and_padding(self, shape, dtype, row_elems):
+        layout = make_mx_row_major(_imms(*shape), dtype)
+
+        assert [int(x) for x in get_logical_shape(layout)] == list(shape)
+        assert [int(x) for x in get_mode_shape(layout)] == [shape[0], row_elems]
+        assert [int(x) for x in get_mode_stride(layout)] == [row_elems, 1]
+        assert [int(x) for x in get_dim_levels(layout)] == [1, 1]
+        assert [int(x) for x in get_covered_shape(layout)] == [shape[0], row_elems]
+        assert int(ANA.simplify(get_storage_size(layout))) == shape[0] * row_elems
+
+        assert _eval(layout, 0, 0) == 0
+        assert _eval(layout, 1, 0) == row_elems
+        assert _eval(layout, shape[0] - 1, shape[1] - 1) < shape[0] * row_elems
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            "custom[mxfp8]8",
+            "custom[mxfp4]4",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "layout_factory",
+        [
+            make_mx_row_major,
+            lambda shape, dtype: make_mxzz(shape, [0, 1], dtype),
+            lambda shape, dtype: make_mxznn(shape, [0, 1], dtype),
+        ],
+    )
+    def test_derive_mx_layout_like_preserves_layout_kind(self, layout_factory, dtype):
+        src = layout_factory(_imms(128, 128), dtype)
+        expected = layout_factory(_imms(32, 128), dtype)
+
+        derived = derive_mx_layout_like(src, _imms(32, 128), dtype)
+
+        assert derived
+        assert is_same_layout(derived, expected)
+
+    @pytest.mark.parametrize(
+        "layout_factory",
+        [
+            make_mxzz,
+            make_mxznn,
+        ],
+    )
+    def test_derive_mx_layout_like_preserves_non_default_axes(self, layout_factory):
+        dtype = "custom[mxfp8]8"
+        axes = [0, 2]
+        src = layout_factory(_imms(128, 4, 128), axes, dtype)
+        expected = layout_factory(_imms(32, 4, 128), axes, dtype)
+
+        derived = derive_mx_layout_like(src, _imms(32, 4, 128), dtype)
+
+        assert derived
+        assert is_same_layout(derived, expected)
 
     # --- Non-divisible (padded) shapes ---
 

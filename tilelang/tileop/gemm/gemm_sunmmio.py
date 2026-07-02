@@ -1,5 +1,5 @@
 from .gemm_base import GemmBase
-from tilelang.layout import make_zz_layout, make_zn_layout
+from tilelang.layout import make_zz_layout, make_zn_layout, make_mxzz_layout, make_mxznn_layout
 from tilelang import tvm as tvm
 import tvm_ffi
 from tvm.target import Target
@@ -26,20 +26,42 @@ def _sunmmio_block_shape(dtype):
     return list(_get_sunmmio_layout_block_shape(target, tvm.DataType(dtype)))
 
 
+def _is_mx_dtype(dtype) -> bool:
+    return _canonical_mx_dtype(dtype) is not None
+
+
+def _canonical_mx_dtype(dtype):
+    dtype = T.dtype(dtype)
+    if getattr(dtype, "type_code", None) == 129:
+        return T.mxfp8
+    if getattr(dtype, "type_code", None) == 130:
+        return T.mxfp4
+    return None
+
+
 class GemmSunmmio(GemmBase):
     def infer_layout(self, target: Target, thread_nums: int):
         if self.is_gemm_sunmmio_scope():
             # A (ASRAM): ZZ with dtype-dependent block shape
-            a_block = _sunmmio_block_shape(self.A.dtype)
-            a_layout = make_zz_layout(self.A, block_shape=a_block)
-            # B (WSRAM): ZZ if transB (TMM.MT mode), ZN if !transB (TMM.MN mode)
-            b_block = _sunmmio_block_shape(self.B.dtype)
+            if _is_mx_dtype(self.A.dtype):
+                a_layout = make_mxzz_layout(self.A, dtype=_canonical_mx_dtype(self.A.dtype))
+            else:
+                a_block = _sunmmio_block_shape(self.A.dtype)
+                a_layout = make_zz_layout(self.A, block_shape=a_block)
+            # B (WSRAM): MX uses MXZZ/MXZNN; non-MX keeps ZZ/ZN.
             rank_b = len(self.B.shape)
             axes_b = [rank_b - 2, rank_b - 1]
-            if self.trans_B:
-                b_layout = make_zz_layout(self.B, block_shape=b_block)
+            if _is_mx_dtype(self.B.dtype):
+                if self.trans_B:
+                    b_layout = make_mxzz_layout(self.B, dtype=_canonical_mx_dtype(self.B.dtype))
+                else:
+                    b_layout = make_mxznn_layout(self.B, axes_b, dtype=_canonical_mx_dtype(self.B.dtype))
             else:
-                b_layout = make_zn_layout(self.B.shape, axes_b, b_block)
+                b_block = _sunmmio_block_shape(self.B.dtype)
+                if self.trans_B:
+                    b_layout = make_zz_layout(self.B, block_shape=b_block)
+                else:
+                    b_layout = make_zn_layout(self.B.shape, axes_b, b_block)
             # C (RSRAM): ZZ with block shape from GetSunmmioLayoutBlockShape
             c_block = _sunmmio_block_shape(self.C.dtype)
             c_layout = make_zz_layout(self.C, block_shape=c_block)

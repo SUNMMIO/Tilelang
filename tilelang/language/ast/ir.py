@@ -144,6 +144,7 @@ def buffer(
         The declared buffer.
     """
     shape = (shape,) if isinstance(shape, (PrimExpr, Integral)) else shape
+    dtype = _dtypes.normalize_dtype(dtype)
     if strides is not None:
         strides = [Var(s, _dtypes.int32) if isinstance(s, str) else s for s in strides]
     else:
@@ -321,6 +322,7 @@ def match_buffer(
         else:
             raise ValueError("Shape must be specified when binding input param")
     shape = (shape,) if isinstance(shape, (PrimExpr, Integral)) else shape
+    dtype = _dtypes.normalize_dtype(dtype)
     if strides is not None:
         idx_dtype = shape[0].dtype if isinstance(shape[0], PrimExpr) else T.int32
         strides = [Var(s, idx_dtype) if isinstance(s, str) else s for s in strides]
@@ -492,6 +494,7 @@ def alloc_buffer(
         The allocated buffer.
     """
     shape = (shape,) if isinstance(shape, (PrimExpr, Integral)) else shape
+    dtype = _dtypes.normalize_dtype(dtype)
     if strides is not None:
         strides = [Var(s, T.int32) if isinstance(s, str) else s for s in strides]
     else:
@@ -1185,6 +1188,7 @@ def decl_buffer(
         The result DeclBufferFrame.
     """
     shape = (shape,) if isinstance(shape, (PrimExpr, Integral)) else shape
+    dtype = _dtypes.normalize_dtype(dtype)
     if strides is not None:
         strides = [Var(s, T.int32) if isinstance(s, str) else s for s in strides]
     else:
@@ -1486,6 +1490,8 @@ def handle(dtype: Optional[str] = None, storage_scope: str = "global", *, is_siz
     is_unknown_type = dtype is None
     if dtype is None:
         dtype = "void"
+    else:
+        dtype = _dtypes.normalize_dtype(dtype)
     return _ffi_api.Handle(  # type: ignore[attr-defined] # pylint: disable=no-member
         dtype,
         storage_scope,
@@ -1527,6 +1533,7 @@ def var(dtype: str, name: str = "") -> Var:
     res : Var
         The result tir.Var.
     """
+    dtype = _dtypes.normalize_dtype(dtype)
     return Var(name, dtype)  # pylint: disable=no-member
 
 
@@ -1549,6 +1556,7 @@ def ptr(dtype: str, storage_scope: str = "global", is_size_var: bool = False) ->
     res : Var
         The pointer.
     """
+    dtype = _dtypes.normalize_dtype(dtype)
     return _ffi_api.Ptr(dtype, storage_scope, is_size_var)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 

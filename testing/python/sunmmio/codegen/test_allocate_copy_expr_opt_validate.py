@@ -1,6 +1,5 @@
 import os
 
-import pytest
 
 import tilelang
 import tilelang.language as T
@@ -372,10 +371,6 @@ def test_allocate_dma_copy_codegen_validates_with_npuir_opt(tmp_path):
     )
 
 
-@pytest.mark.xfail(
-    reason=("Rank-expanded ping-pong staging emits copy_async tile views with mismatched tiled_dims under the current NPU-IR verifier."),
-    strict=True,
-)
 def test_pipelined_allocate_copy_mma_codegen_propagates_ping_pong(tmp_path):
     validate_sunmmio_codegen_with_npuir_opt(
         pipelined_allocate_copy_mma_kernel(),

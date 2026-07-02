@@ -134,6 +134,13 @@ from .pdl import (
     pdl_sync,  # noqa: F401
 )
 
+from tvm.script.ir_builder.tir import match_buffer as _tvm_match_buffer
+from . import dtypes as _dtypes
+
+
+def match_buffer(param, shape=None, dtype=_dtypes.float32, *args, **kwargs):  # noqa: F811
+    return _tvm_match_buffer(param, shape, _dtypes.normalize_dtype(dtype), *args, **kwargs)
+
 
 def import_source(source: str | None = None):
     # source is the source code to be imported
