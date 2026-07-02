@@ -7,7 +7,12 @@ from tvm import ir, tir
 from tvm.tir import PrimExpr, BufferLoad, op
 from tilelang import language as T
 from tilelang._typing import BufferLikeType, ShapeType
-from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
+
+
+def _unwrap_mesh_tensor(value):
+    from tilelang.language.mesh_tensor import _unwrap_mesh_tensor as unwrap
+
+    return unwrap(value)
 
 
 def region(buffer: BufferLoad, access_type: str, *args: PrimExpr) -> PrimExpr:

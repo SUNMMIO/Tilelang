@@ -3,7 +3,6 @@ from tilelang._typing import BufferLikeType
 from tvm.tir import Buffer, BufferLoad, BufferRegion, PrimExpr
 from tilelang.language.utils import region as _make_region_call
 from tilelang.language.utils import get_buffer_region_from_load
-from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
 from functools import reduce
 from tvm import IRModule, DataType
 from tvm.tir import PrimFunc
@@ -11,6 +10,12 @@ from tvm import ir, tir
 from tvm.tir.expr import CallEffectKind
 # Scope Checkers for TVM Buffers
 # These utility functions check the memory scope of a given TVM buffer.
+
+
+def _unwrap_mesh_tensor(value):
+    from tilelang.language.mesh_tensor import _unwrap_mesh_tensor as unwrap
+
+    return unwrap(value)
 
 
 def _get_buffer(buffer_or_load_or_region: BufferLikeType) -> Buffer:
@@ -415,6 +420,34 @@ def prim_expr_equal(lhs, rhs) -> bool:
     if ir.structural_equal(lhs, rhs):
         return True
     return tir.analysis.expr_deep_equal(lhs, rhs)
+
+
+_MESH_SYMBOL_OP_NAMES = ("tl.mesh_nrows", "tl.mesh_ncols", "tl.mesh_ncores")
+
+
+def prim_expr_contains_mesh_symbol(expr) -> bool:
+    """Return whether an expression contains a symbolic Sunmmio mesh builtin."""
+    if isinstance(expr, int) or not isinstance(expr, tir.PrimExpr):
+        return False
+
+    mesh_ops = [tir.op.Op.get(name) for name in _MESH_SYMBOL_OP_NAMES]
+    found = False
+
+    def visit(node):
+        nonlocal found
+        if found or not isinstance(node, tir.Call):
+            return
+        for op in mesh_ops:
+            if hasattr(node.op, "same_as") and node.op.same_as(op):
+                found = True
+                return
+
+    tir.stmt_functor.post_order_visit(expr, visit)
+    return found
+
+
+def prim_expr_equal_or_mesh_symbolic(lhs, rhs) -> bool:
+    return prim_expr_equal(lhs, rhs) or prim_expr_contains_mesh_symbol(lhs) or prim_expr_contains_mesh_symbol(rhs)
 
 
 def legalize_pairwise_extents(src_extents: list, dst_extents: list) -> tuple[list, list]:
