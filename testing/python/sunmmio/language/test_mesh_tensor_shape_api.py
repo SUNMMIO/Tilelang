@@ -34,7 +34,7 @@ def test_mesh_tensor_shape_api_in_kernel():
 
         @T.prim_func
         def kernel(A: tensor):
-            with T.Kernel(16) as cid:
+            with T.Kernel(T.mesh_ncores()) as cid:
                 global_m, global_n = A.global_shape
                 local_m, local_n = A.local_shape
                 valid_m, valid_n = A.get_local_extent(cid)
@@ -76,7 +76,7 @@ def test_mesh_tensor_same_dim_row_then_col_extent():
 
         @T.prim_func
         def kernel(A: tensor):
-            with T.Kernel(16) as cid:
+            with T.Kernel(T.mesh_ncores()) as cid:
                 global_m, global_n = A.global_shape
                 local_m, local_n = A.local_shape
                 valid_m, valid_n = A.get_local_extent(cid)
