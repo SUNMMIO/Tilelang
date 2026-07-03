@@ -336,15 +336,21 @@ private:
         (axis < 0 && recv->region.size() == send->region.size() + 1)) {
       gather_axis_for_validation = slice_axis;
     }
-    ValidateAllgatherRecvSlab(
-        make_slab(make_zero(slot_extent.dtype()), slot_extent), op_name,
-        "recv_slab", gather_axis_for_validation, slot_extent);
+
+    auto validate_slab_range = [&](int64_t slab_count, const PrimExpr &extent,
+                                   const char *operand_name) {
+      for (int64_t idx = 0; idx < slab_count; ++idx) {
+        ValidateAllgatherRecvSlab(
+            make_slab(IntImm(extent.dtype(), idx), extent), op_name,
+            operand_name, gather_axis_for_validation, slot_extent);
+      }
+    };
+
+    validate_slab_range(recv_num, slot_extent, "recv_slab");
     if (direction == 2) {
       PrimExpr row_extent = analyzer_.Simplify(
           IntImm(DataType::Int(32), mesh.ncol) * slot_extent);
-      ValidateAllgatherRecvSlab(
-          make_slab(make_zero(row_extent.dtype()), row_extent), op_name,
-          "recv_row_slab", gather_axis_for_validation, slot_extent);
+      validate_slab_range(mesh.nrow, row_extent, "recv_row_slab");
     }
   }
 
@@ -398,9 +404,12 @@ private:
         << region->region.size() << " does not match buffer "
         << region->buffer->name << " rank " << region->buffer->shape.size();
 
+    std::vector<std::optional<int64_t>> static_extents(region->region.size());
     std::vector<int> non_unit_dims;
     for (size_t dim = 0; dim < region->region.size(); ++dim) {
       ValidateRangeDefined(region, dim, op_name, operand_name);
+      static_extents[dim] =
+          ValidateBasicDim(region, dim, op_name, operand_name);
 
       const Range &range = region->region[dim];
       if (analyzer_.CanProveEqual(range->extent, 1)) {
@@ -419,10 +428,9 @@ private:
     const size_t tile_dim_begin = non_unit_dims.size() - tile_dim_count;
     for (size_t idx = 0; idx < non_unit_dims.size(); ++idx) {
       size_t dim = static_cast<size_t>(non_unit_dims[idx]);
-      if (idx < tile_dim_begin) {
-        ValidateOuterSlabDim(region, dim, op_name, operand_name);
-      } else {
-        ValidateTileViewDim(region, layout, dim, op_name, operand_name);
+      if (idx >= tile_dim_begin) {
+        ValidateTileViewDim(region, layout, dim, static_extents[dim], op_name,
+                            operand_name);
       }
     }
   }
@@ -508,16 +516,10 @@ private:
     return static_extent;
   }
 
-  void ValidateOuterSlabDim(const BufferRegion &region, size_t dim,
-                            const char *op_name, const char *operand_name) {
-    ValidateBasicDim(region, dim, op_name, operand_name);
-  }
-
   void ValidateTileViewDim(const BufferRegion &region, const Layout &layout,
-                           size_t dim, const char *op_name,
-                           const char *operand_name) {
-    std::optional<int64_t> static_extent =
-        ValidateBasicDim(region, dim, op_name, operand_name);
+                           size_t dim,
+                           const std::optional<int64_t> &static_extent,
+                           const char *op_name, const char *operand_name) {
     if (!static_extent.has_value()) {
       return;
     }

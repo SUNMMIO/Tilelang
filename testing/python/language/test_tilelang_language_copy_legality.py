@@ -13,7 +13,7 @@ from tilelang.utils.target import determine_target
 DTYPE = "float16"
 
 
-# TODO: Move this into a shared testing helper with testing/python/target/compile_pipeline.py.
+# TODO: Move this into a shared testing helper with testing/python/sunmmio/common/compile_pipeline.py.
 def target(target_name):
     def decorator(func):
         @wraps(func)
@@ -115,6 +115,9 @@ def _emit_copy_case(
     if copy_case == "region_to_region_src_lt_dst":
         C_128x128x32_shared = T.alloc_shared((128, 128, 32), DTYPE)
         return T.copy(A_128x128x128_global[0:16, 0:16, 0:16], C_128x128x32_shared[0:32, 0:32, 0:32])
+    if copy_case == "region_to_region_src_oob_clips_dst":
+        C_128x128x32_shared = T.alloc_shared((128, 128, 32), DTYPE)
+        return T.copy(A_128x128x128_global[127:129, 0:32, 0:32], C_128x128x32_shared[0:2, 0:32, 0:32])
     if copy_case == "region_to_region_extent_mismatch_dst_oob":
         C_128x128x32_shared = T.alloc_shared((128, 128, 32), DTYPE)
         return T.copy(A_128x128x128_global[0:32, 0:32, 0:32], C_128x128x32_shared[0:64, 0:64, 0:64])
@@ -188,7 +191,7 @@ def _make_copy_kernel(copy_case):
         A_1x128x1x64_global: T.Tensor((1, 128, 1, 64), DTYPE),
         Q_1x128x1x64_global: T.Tensor((1, 128, 1, 64), DTYPE),
     ):
-        with T.Kernel(1):
+        with T.Kernel():
             _emit_copy_case(
                 copy_case,
                 A_128x128x128_global,
@@ -229,6 +232,7 @@ FRONTEND_VALID_CASES = [
     "region_to_region_equal",
     "region_to_region_small_tile",
     "region_to_region_src_lt_dst",
+    "region_to_region_src_oob_clips_dst",
     "region_to_region_extent_mismatch_dst_oob",
     "region_to_region_1d_tile_view",
     "region_to_region_no_dim_reorder",
@@ -293,6 +297,14 @@ def test_sunmmio_copy_frontend_shrinks_dst_when_src_is_smaller():
 
     _assert_region_extents(script, "A_128x128x128_global", 1, [16, 16, 16])
     _assert_region_extents(script, None, 2, [16, 16, 16])
+
+
+def test_sunmmio_copy_frontend_clips_src_before_shrinking_dst():
+    with pytest.warns(UserWarning, match="will be clipped"):
+        script = _build_script("region_to_region_src_oob_clips_dst")
+
+    _assert_region_extents(script, "A_128x128x128_global", 1, [1, 32, 32])
+    _assert_region_extents(script, None, 2, [1, 32, 32])
 
 
 def test_sunmmio_copy_frontend_clips_explicit_dst_before_inferring_load_src():

@@ -237,6 +237,17 @@ def _suffix_axis_map(src: _NormalizedCopyRegion, dst: _NormalizedCopyRegion) -> 
 
 
 def _squeezed_axis_map(src: _NormalizedCopyRegion, dst: _NormalizedCopyRegion) -> list[tuple[int, int]]:
+    if len(src.extents) == len(dst.extents):
+        identity_compatible = True
+        for src_extent, dst_extent in zip(src.extents, dst.extents):
+            if _expr_equal(src_extent, dst_extent) or _expr_is_squeezable_one(src_extent):
+                continue
+            if _expr_is_squeezable_one(dst_extent) or _expr_gt(src_extent, dst_extent):
+                identity_compatible = False
+                break
+        if identity_compatible:
+            return [(i, i) for i in range(len(src.extents))]
+
     src_axes = [(dim, extent) for dim, extent in enumerate(src.extents) if not _expr_is_squeezable_one(extent)]
     dst_axes = [(dim, extent) for dim, extent in enumerate(dst.extents) if not _expr_is_squeezable_one(extent)]
 
