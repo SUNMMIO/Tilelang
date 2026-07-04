@@ -37,6 +37,7 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -324,6 +325,22 @@ public:
   std::vector<Var> vars;
 };
 
+bool ExprUsesAnyVar(const PrimExpr &expr, const std::vector<Var> &vars) {
+  if (vars.empty()) {
+    return false;
+  }
+  VarCollector collector;
+  collector(expr);
+  for (const Var &used : collector.vars) {
+    for (const Var &candidate : vars) {
+      if (used.same_as(candidate)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 std::vector<int64_t> EnumerateMaskCandidates(PrimExpr expr, int direction,
                                              int mesh_nrow, int mesh_ncol,
                                              arith::Analyzer *analyzer) {
@@ -376,23 +393,17 @@ std::vector<int64_t> EnumerateMaskCandidates(PrimExpr expr, int direction,
 Array<PrimExpr> MakeBarrierArgs(const BarrierMaskInfo &info) {
   Array<PrimExpr> args;
   args.push_back(info.expr);
-  if (!info.expr.as<IntImmNode>()) {
-    ICHECK(!info.candidates.empty())
-        << "dynamic barrier mask requires static candidate masks";
-    for (int64_t mask : info.candidates) {
-      args.push_back(I64Imm(mask));
-    }
+  for (int64_t mask : info.candidates) {
+    args.push_back(I64Imm(mask));
   }
   return args;
 }
 
 Array<PrimExpr> MakeBarrierInitArgs(const BarrierMaskInfo &info) {
-  if (info.expr.as<IntImmNode>()) {
+  if (info.candidates.empty()) {
     return MakeBarrierArgs(info);
   }
 
-  ICHECK(!info.candidates.empty())
-      << "dynamic barrier init requires static candidate masks";
   Array<PrimExpr> args;
   args.push_back(I64Imm(-1));
   for (int64_t mask : info.candidates) {
@@ -409,11 +420,6 @@ BarrierMaskInfo BarrierMaskInfoFromArgs(const Array<PrimExpr> &args) {
     const auto *imm = args[i].as<IntImmNode>();
     ICHECK(imm) << "barrier candidate masks must be IntImm";
     AddUniqueInt64(&info.candidates, static_cast<int64_t>(imm->value));
-  }
-  if (info.candidates.empty()) {
-    if (const auto *imm = info.expr.as<IntImmNode>()) {
-      AddUniqueInt64(&info.candidates, static_cast<int64_t>(imm->value));
-    }
   }
   return info;
 }
@@ -665,11 +671,13 @@ struct LoopScope {
 // to enforce correct ordering based on data dependencies.
 class InjectSyncRewriter : public StmtMutator {
 public:
-  InjectSyncRewriter(Map<Var, Buffer> buffer_data_to_buffer, int mesh_nrow,
-                     int mesh_ncol, arith::Analyzer *analyzer)
-      : buffer_data_to_buffer_(buffer_data_to_buffer), mesh_nrow_(mesh_nrow),
-        mesh_ncol_(mesh_ncol), analyzer_(analyzer) {
-    token_count = 0;
+  InjectSyncRewriter(Map<Var, Buffer> buffer_data_to_buffer,
+                     const Target &target, arith::Analyzer *analyzer)
+      : token_count(0), mesh_nrow_(0), mesh_ncol_(0), analyzer_(analyzer),
+        buffer_data_to_buffer_(buffer_data_to_buffer) {
+    SunmmioMeshConfig mesh = GetSunmmioMeshConfig(target);
+    mesh_nrow_ = mesh.nrow;
+    mesh_ncol_ = mesh.ncol;
   }
 
   TokenBarrierMap get_token_to_barrier_mask() const {
@@ -1437,8 +1445,7 @@ private:
   BarrierMaskInfo BroadcastBarrierMaskInfo(const CallNode *call) {
     BarrierMaskInfo info;
     info.expr = AsI64(BroadcastParticipantMask(call));
-    if (const auto *imm = info.expr.as<IntImmNode>()) {
-      AddUniqueInt64(&info.candidates, static_cast<int64_t>(imm->value));
+    if (info.expr.as<IntImmNode>()) {
       return info;
     }
 
@@ -2358,7 +2365,7 @@ public:
     if (HasThreadExtent(rewritten)) {
       return rewritten;
     }
-    return PrependBarrierInits(rewritten);
+    return PrependBarrierInits(rewritten, {});
   }
 
 private:
@@ -2377,17 +2384,41 @@ private:
 
   class BarrierMaskCollector : public StmtExprVisitor {
   public:
+    explicit BarrierMaskCollector(std::vector<Var> scoped_vars)
+        : scoped_vars_(std::move(scoped_vars)) {}
+
+    void VisitStmt_(const ForNode *op) final {
+      scoped_vars_.push_back(op->loop_var);
+      StmtExprVisitor::VisitStmt_(op);
+      scoped_vars_.pop_back();
+    }
+
+    void VisitStmt_(const LetStmtNode *op) final {
+      scoped_vars_.push_back(op->var);
+      StmtExprVisitor::VisitStmt_(op);
+      scoped_vars_.pop_back();
+    }
+
     void VisitStmt_(const EvaluateNode *op) final {
       if (const CallNode *call = op->value.as<CallNode>()) {
         if (call->op.same_as(barrier_arrive_and_wait()) &&
             !call->args.empty()) {
-          AddUniqueBarrierMaskInfo(&masks, BarrierMaskInfoFromArgs(call->args));
+          BarrierMaskInfo info = BarrierMaskInfoFromArgs(call->args);
+          ICHECK(!info.candidates.empty() ||
+                 !ExprUsesAnyVar(info.expr, scoped_vars_))
+              << "dynamic barrier mask depends on a local control-flow "
+                 "variable and cannot be initialized in the enclosing entry "
+                 "block required by suvm.barrier.init";
+          AddUniqueBarrierMaskInfo(&masks, info);
         }
       }
       StmtExprVisitor::VisitStmt_(op);
     }
 
     std::vector<BarrierMaskInfo> masks;
+
+  private:
+    std::vector<Var> scoped_vars_;
   };
 
   static Stmt MakeBarrierInitStmt(const BarrierMaskInfo &participant_mask) {
@@ -2401,8 +2432,9 @@ private:
     return finder.found;
   }
 
-  static Stmt PrependBarrierInits(const Stmt &body) {
-    BarrierMaskCollector collector;
+  static Stmt PrependBarrierInits(const Stmt &body,
+                                  const std::vector<Var> &scoped_vars) {
+    BarrierMaskCollector collector(scoped_vars);
     collector(body);
     if (collector.masks.empty()) {
       return body;
@@ -2432,95 +2464,31 @@ private:
       return AttrStmt(op->node, op->attr_key, op->value, body);
     }
     return AttrStmt(op->node, op->attr_key, op->value,
-                    PrependBarrierInits(body));
-  }
-};
-
-class CompactSyncIdsRewriter : public StmtExprMutator {
-public:
-  Stmt operator()(Stmt body) {
-    SyncIdCollector collector;
-    collector(body);
-    token_id_map_ = BuildDenseMap(collector.token_ids);
-    return VisitStmt(body);
+                    PrependBarrierInits(body, scoped_vars_));
   }
 
-private:
-  class SyncIdCollector : public StmtExprVisitor {
-  public:
-    void VisitExpr_(const CallNode *op) final {
-      if (IsTokenCall(op)) {
-        CollectId(op, &token_ids);
-      }
-      StmtExprVisitor::VisitExpr_(op);
+  Stmt VisitStmt_(const ForNode *op) final {
+    scoped_vars_.push_back(op->loop_var);
+    Stmt body = StmtMutator::VisitStmt(op->body);
+    scoped_vars_.pop_back();
+    if (body.same_as(op->body)) {
+      return ffi::GetRef<Stmt>(op);
     }
-
-    std::set<int> token_ids;
-
-  private:
-    static bool IsTokenCall(const CallNode *op) {
-      return op->op.same_as(sync_token_id()) ||
-             op->op.same_as(sync_null_token()) || op->op.same_as(wait_token());
-    }
-
-    static void CollectId(const CallNode *op, std::set<int> *ids) {
-      if (op->args.empty()) {
-        return;
-      }
-      if (const auto *imm = op->args[0].as<IntImmNode>()) {
-        ids->insert(imm->value);
-      }
-    }
-  };
-
-  static std::unordered_map<int, int> BuildDenseMap(const std::set<int> &ids) {
-    std::unordered_map<int, int> id_map;
-    int next_id = 0;
-    for (int old_id : ids) {
-      id_map.emplace(old_id, next_id++);
-    }
-    return id_map;
+    return For(op->loop_var, op->min, op->extent, op->kind, body,
+               op->thread_binding, op->annotations, std::nullopt, op->span);
   }
 
-  static bool IsTokenCall(const CallNode *op) {
-    return op->op.same_as(sync_token_id()) ||
-           op->op.same_as(sync_null_token()) || op->op.same_as(wait_token());
+  Stmt VisitStmt_(const LetStmtNode *op) final {
+    scoped_vars_.push_back(op->var);
+    Stmt body = StmtMutator::VisitStmt(op->body);
+    scoped_vars_.pop_back();
+    if (body.same_as(op->body)) {
+      return ffi::GetRef<Stmt>(op);
+    }
+    return LetStmt(op->var, op->value, body, op->span);
   }
 
-  PrimExpr RemapFirstArg(const CallNode *op,
-                         const std::unordered_map<int, int> &id_map) {
-    if (op->args.empty()) {
-      return ffi::GetRef<PrimExpr>(op);
-    }
-
-    const auto *imm = op->args[0].as<IntImmNode>();
-    if (!imm) {
-      return ffi::GetRef<PrimExpr>(op);
-    }
-
-    auto it = id_map.find(imm->value);
-    if (it == id_map.end()) {
-      return ffi::GetRef<PrimExpr>(op);
-    }
-
-    Array<PrimExpr> new_args = op->args;
-    new_args.Set(0, IntImm(imm->dtype, it->second));
-    return Call(op->dtype, op->op, new_args, op->annotations, op->span);
-  }
-
-  PrimExpr VisitExpr_(const CallNode *op) final {
-    PrimExpr expr = StmtExprMutator::VisitExpr_(op);
-    const auto *call = expr.as<CallNode>();
-    if (!call) {
-      return expr;
-    }
-    if (IsTokenCall(call)) {
-      return RemapFirstArg(call, token_id_map_);
-    }
-    return expr;
-  }
-
-  std::unordered_map<int, int> token_id_map_;
+  std::vector<Var> scoped_vars_;
 };
 
 // Main rewriter orchestrating the synchronization injection passes.
@@ -2533,12 +2501,9 @@ public:
 
   static PrimFunc Rewrite(PrimFunc f, arith::Analyzer *analyzer) {
     auto target = f->GetAttr<Target>(tvm::attr::kTarget).value();
-    SunmmioMeshConfig mesh = GetSunmmioMeshConfig(target);
-    int mesh_nrow = mesh.nrow;
-    int mesh_ncol = mesh.ncol;
 
     auto inject_sync_rewriter =
-        InjectSyncRewriter(f->buffer_map, mesh_nrow, mesh_ncol, analyzer);
+        InjectSyncRewriter(f->buffer_map, target, analyzer);
     f.CopyOnWrite()->body = inject_sync_rewriter(f->body);
 
     TokenBarrierMap token_to_barrier_mask =
@@ -2554,9 +2519,6 @@ public:
 
     auto init_reusable_barriers_rewriter = InitReusableBarriersRewriter();
     f.CopyOnWrite()->body = init_reusable_barriers_rewriter(f->body);
-
-    auto compact_sync_ids_rewriter = CompactSyncIdsRewriter();
-    f.CopyOnWrite()->body = compact_sync_ids_rewriter(f->body);
 
     return f;
   }
