@@ -21,6 +21,7 @@ from .mesh_tensor import (  # noqa: F401
     MeshTensor,
     TensorWithMeta,
 )
+from .mesh_symbols import mesh_nrows, mesh_ncols, mesh_ncores  # noqa: F401
 from .loop import (
     Parallel,  # noqa: F401
     Tiles,  # noqa: F401
@@ -133,6 +134,13 @@ from .pdl import (
     pdl_trigger,  # noqa: F401
     pdl_sync,  # noqa: F401
 )
+
+from tvm.script.ir_builder.tir import match_buffer as _tvm_match_buffer
+from . import dtypes as _dtypes
+
+
+def match_buffer(param, shape=None, dtype=_dtypes.float32, *args, **kwargs):  # noqa: F811
+    return _tvm_match_buffer(param, shape, _dtypes.normalize_dtype(dtype), *args, **kwargs)
 
 
 def import_source(source: str | None = None):

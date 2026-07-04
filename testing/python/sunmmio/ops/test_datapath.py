@@ -23,9 +23,11 @@ def simple_copy_kernel(M, N, block_M, block_N, dtype="float16"):
     def main(
         A: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype)
-            T.copy(A[by * block_M, bx * block_N], A_shared)
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                for by in T.serial(T.ceildiv(M, block_M)):
+                    T.copy(A[by * block_M, bx * block_N], A_shared)
 
     return tvm.IRModule({"main": main})
 
@@ -219,32 +221,31 @@ def wrong_copy(M, N, K, block_M, block_N, block_K, error_type, dtype="float16", 
         C: T.Tensor((M, N), accum_dtype),
     ):
         # Initialize Kernel Context
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype, scope="shared.asram")
             A_shared_2 = T.alloc_shared((block_M, block_K), dtype, scope="shared.asram")
             B_shared = T.alloc_shared((block_K, block_N), dtype, scope="shared.wsram")
             B_shared_2 = T.alloc_shared((block_K, block_N), dtype, scope="shared.wsram")
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
 
-            for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-                if error_type == "A->D":
-                    T.copy(A_shared, C[by * block_M, ko * block_K])
-                elif error_type == "W->D":
-                    T.copy(B_shared, C[by * block_M, ko * block_K])
-                elif error_type == "A->R":
-                    T.copy(A_shared, C_shared)
-                elif error_type == "W->R":
-                    T.copy(B_shared, C_shared)
-                elif error_type == "D<->D":
-                    T.copy(C[by * block_M, ko * block_K], B[by * block_M, ko * block_K])
-                elif error_type == "A<->A":
-                    T.copy(A_shared, A_shared_2)
-                elif error_type == "W<->W":
-                    T.copy(B_shared, B_shared_2)
-                elif error_type == "A->W":
-                    T.copy(A_shared, B_shared)
-                elif error_type == "W->A":
-                    T.copy(B_shared, A_shared)
+            if error_type == "A->D":
+                T.copy(A_shared, C[0, 0])
+            elif error_type == "W->D":
+                T.copy(B_shared, C[0, 0])
+            elif error_type == "A->R":
+                T.copy(A_shared, C_shared)
+            elif error_type == "W->R":
+                T.copy(B_shared, C_shared)
+            elif error_type == "D<->D":
+                T.copy(C[0, 0], B[0, 0])
+            elif error_type == "A<->A":
+                T.copy(A_shared, A_shared_2)
+            elif error_type == "W<->W":
+                T.copy(B_shared, B_shared_2)
+            elif error_type == "A->W":
+                T.copy(A_shared, B_shared)
+            elif error_type == "W->A":
+                T.copy(B_shared, A_shared)
 
     return tvm.IRModule({"main": main})
 
@@ -280,14 +281,13 @@ def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
     MyTensor = T.MeshTensor(
         (128, 128),
         sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
-        device_mesh_config=(2, 2),
         layout=_layout,
     )
 
     @T.prim_func
     def main(C: MyTensor):
         # Initialize Kernel Context
-        with T.Kernel(T.ceildiv(128, block_N), T.ceildiv(128, block_M), threads=128) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.asram")
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.wsram")
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
@@ -295,21 +295,23 @@ def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
 
             T.annotate_layout({C_shared: make_zz_layout(C_shared)})
 
-            for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
-                # DRAM -> RSRAM
-                T.copy(C[by * block_M, ko * block_K], C_shared)
-                # DRAM -> WSRAM
-                T.copy(C[by * block_M, ko * block_K], B_shared)
-                # DRAM <- RSRAM
-                T.copy(C_shared, C[by * block_M, ko * block_K])
-                # DRAM -> ASRAM
-                T.copy(C[by * block_M, ko * block_K], A_shared)
-                # RSRAM -> ASRAM
-                T.copy(C_shared[8:24, 16:48], A_shared[24:40, 8:40])
-                # RSRAM -> WSRAM
-                T.copy(C_shared[8:32, 48:56], B_shared[40:64, 0:8])
-                # RSRAM <-> RSRAM
-                T.copy(C_shared, D_shared)
+            for _bx in T.serial(T.ceildiv(128, block_N)):
+                for by in T.serial(T.ceildiv(128, block_M)):
+                    for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+                        # DRAM -> RSRAM
+                        T.copy(C[by * block_M, ko * block_K], C_shared)
+                        # DRAM -> WSRAM
+                        T.copy(C[by * block_M, ko * block_K], B_shared)
+                        # DRAM <- RSRAM
+                        T.copy(C_shared, C[by * block_M, ko * block_K])
+                        # DRAM -> ASRAM
+                        T.copy(C[by * block_M, ko * block_K], A_shared)
+                        # RSRAM -> ASRAM
+                        T.copy(C_shared[8:24, 16:48], A_shared[24:40, 8:40])
+                        # RSRAM -> WSRAM
+                        T.copy(C_shared[8:32, 48:56], B_shared[40:64, 0:8])
+                        # RSRAM <-> RSRAM
+                        T.copy(C_shared, D_shared)
 
     return tvm.IRModule({"main": main})
 

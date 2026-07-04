@@ -23,7 +23,7 @@ If you only need upstream TileLang, install it from PyPI with `pip install tilel
 - Upstream TileLang can be installed directly with `pip install tilelang`; that command does not install TileLang-Mesh.
 - This repository builds the `tilelang-mesh` distribution while preserving `import tilelang` compatibility.
 - This repository adds a `3rdparty/NPU-IR` submodule for the Sunmmio/SUVM backend. A recursive clone should include that submodule.
-- `USE_NPUIR` defaults to `ON`. With this enabled, CMake integrates NPU-IR and may fetch or build LLVM/MLIR sources unless you provide an existing LLVM source checkout.
+- `USE_SUNMMIO` controls the Sunmmio/SUVM backend. It defaults to `ON`, which integrates NPU-IR and builds the Sunmmio runtime/codegen path. Set `-DUSE_SUNMMIO=OFF` or `USE_SUNMMIO=0` to disable it.
 - The usual TileLang backends are still available: CUDA is selected by default on Linux when not explicitly disabled, ROCm can be selected with `USE_ROCM`, and Metal is selected by default on macOS.
 - Developer rebuilds use the repository `build` directory. After changing C++ files, rebuild from `build` with `ninja`; after adding new C++ files, rerun CMake first.
 
@@ -34,7 +34,7 @@ If you only need upstream TileLang, install it from PyPI with `pip install tilel
 - CMake >= 3.26 and a C++17 compiler.
 - Ninja is recommended for faster native builds.
 - CUDA toolkit if building the default CUDA backend.
-- Git submodules, including `3rdparty/NPU-IR`, if building with `USE_NPUIR=ON`.
+- Git submodules, including `3rdparty/NPU-IR`, if building with `USE_SUNMMIO=ON`.
 
 On Ubuntu/Debian systems:
 
@@ -70,16 +70,16 @@ conda activate mesh
 python -m pip install . -v
 ```
 
-If the machine does not have a CUDA toolkit, disable the CUDA backend explicitly:
+If the machine does not have a CUDA toolkit, disable the CUDA backend explicitly. This still builds the default Sunmmio/SUVM backend:
 
 ```bash
 CMAKE_ARGS="-DUSE_CUDA=OFF" python -m pip install . -v
 ```
 
-If you also do not need the Sunmmio/SUVM backend in that environment, disable NPU-IR as well:
+If you do not need the Sunmmio/SUVM backend in that environment, disable it explicitly:
 
 ```bash
-CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_NPUIR=OFF" python -m pip install . -v
+CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_SUNMMIO=OFF" python -m pip install . -v
 ```
 
 For project development, use an editable install:
@@ -98,29 +98,36 @@ python -c "import tilelang; print('tilelang import OK')"
 
 ### Common Build Configurations
 
-Default CUDA + NPU-IR build, non-editable:
+Default CUDA + Sunmmio/SUVM build, non-editable:
 
 ```bash
 python -m pip install . -v
 ```
 
-Default CUDA + NPU-IR build for development:
+Default CUDA + Sunmmio/SUVM build for development:
 
 ```bash
 python -m pip install -e . -v
 ```
 
-Build with an existing LLVM source checkout for NPU-IR:
+Build without Sunmmio/SUVM:
 
 ```bash
-CMAKE_ARGS="-DNPUIR_USE_LLVM_SOURCE_DIR=/path/to/llvm-project" \
+CMAKE_ARGS="-DUSE_SUNMMIO=OFF" \
   python -m pip install . -v
 ```
 
-Build with ROCm and without NPU-IR:
+Build Sunmmio/SUVM with an existing LLVM source checkout for NPU-IR:
 
 ```bash
-CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DUSE_NPUIR=OFF" \
+CMAKE_ARGS="-DUSE_SUNMMIO=ON -DNPUIR_USE_LLVM_SOURCE_DIR=/path/to/llvm-project" \
+  python -m pip install . -v
+```
+
+Build with ROCm and without Sunmmio/SUVM:
+
+```bash
+CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DUSE_SUNMMIO=OFF" \
   python -m pip install . -v
 ```
 
@@ -131,7 +138,7 @@ For frequent C++ development, configure the native build once and rebuild with N
 ```bash
 mkdir -p build
 cd build
-cmake .. -G Ninja -DUSE_CUDA=ON -DUSE_NPUIR=ON
+cmake .. -G Ninja -DUSE_CUDA=ON -DUSE_SUNMMIO=ON
 ninja
 ```
 
@@ -153,7 +160,7 @@ After adding new C++ files:
 
 ```bash
 cd build
-cmake .. -G Ninja -DUSE_CUDA=ON -DUSE_NPUIR=ON
+cmake .. -G Ninja -DUSE_CUDA=ON -DUSE_SUNMMIO=ON
 ninja
 ```
 

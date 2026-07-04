@@ -13,7 +13,7 @@ tilelang.env.disable_cache()
 
 
 def _load_elementwise_add_example():
-    example_path = Path(__file__).resolve().parents[3] / "examples" / "sunmmio" / "elementwise" / "elementwise_add.py"
+    example_path = Path(__file__).resolve().parents[4] / "examples" / "sunmmio" / "elementwise" / "elementwise_add.py"
     spec = importlib.util.spec_from_file_location("tilelang_sunmmio_elementwise_add_example_for_make_packed_api", example_path)
     assert spec is not None
     assert spec.loader is not None

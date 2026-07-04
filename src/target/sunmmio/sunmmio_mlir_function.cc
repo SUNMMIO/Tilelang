@@ -43,6 +43,73 @@ void RestoreSavedTokens(
   }
 }
 
+void SnapshotTokenIfNeeded(SunmmioMlirContext &ctx, int64_t token_id,
+                           SunmmioMlirContext::ControlNode node) {
+  auto snapshot = [&](auto &frame) {
+    if (frame.saved_token_by_id.find(token_id) !=
+        frame.saved_token_by_id.end()) {
+      return;
+    }
+    SunmmioMlirContext::SavedToken saved;
+    auto it = ctx.token_by_id.find(token_id);
+    if (it != ctx.token_by_id.end()) {
+      saved.existed = true;
+      saved.value = it->second;
+    }
+    frame.saved_token_by_id[token_id] = saved;
+  };
+
+  if (node.kind == SunmmioMlirContext::ControlKind::kFor) {
+    snapshot(ctx.for_stack[node.index]);
+  } else if (node.kind == SunmmioMlirContext::ControlKind::kIf) {
+    snapshot(ctx.if_stack[node.index]);
+  } else {
+    snapshot(ctx.while_stack[node.index]);
+  }
+}
+
+void PublishTokenToImmediateParent(SunmmioMlirContext &ctx, int64_t token_id,
+                                   mlir::Value value) {
+  if (token_id < 0 || !value) {
+    return;
+  }
+
+  if (!ctx.control_flow_stack.empty()) {
+    SunmmioMlirContext::ControlNode &node = ctx.control_flow_stack.back();
+    SnapshotTokenIfNeeded(ctx, token_id, node);
+    if (node.kind == SunmmioMlirContext::ControlKind::kFor) {
+      SunmmioMlirContext::ForFrame &parent = ctx.for_stack[node.index];
+      auto tit = parent.token_id_to_index.find(token_id);
+      if (tit != parent.token_id_to_index.end()) {
+        int idx = tit->second;
+        if (idx >= 0 && idx < static_cast<int>(parent.produced_tokens.size())) {
+          parent.produced_tokens[idx] = value;
+        }
+      }
+    } else if (node.kind == SunmmioMlirContext::ControlKind::kIf) {
+      SunmmioMlirContext::IfFrame &parent = ctx.if_stack[node.index];
+      auto tit = parent.token_id_to_index.find(token_id);
+      if (tit != parent.token_id_to_index.end()) {
+        int idx = tit->second;
+        if (idx >= 0 && idx < static_cast<int>(parent.produced_tokens.size())) {
+          parent.produced_tokens[idx] = value;
+        }
+      }
+    } else {
+      SunmmioMlirContext::WhileFrame &parent = ctx.while_stack[node.index];
+      auto tit = parent.token_id_to_index.find(token_id);
+      if (tit != parent.token_id_to_index.end()) {
+        int idx = tit->second;
+        if (idx >= 0 && idx < static_cast<int>(parent.produced_tokens.size())) {
+          parent.produced_tokens[idx] = value;
+        }
+      }
+    }
+  }
+
+  ctx.token_by_id[token_id] = value;
+}
+
 } // namespace
 
 SunmmioMlirFunction::SunmmioMlirFunction(SunmmioMlirContext &ctx)
@@ -171,6 +238,12 @@ void SunmmioMlirFunction::BeginFor(
   ctx_.PushMLIRValueScope();
   ctx_.BindMLIRValue(iv, for_op.getInductionVar());
   SunmmioMlirContext::ForFrame &active_frame = ctx_.for_stack.back();
+  for (int i = 0, e = static_cast<int>(live_out_token_ids.size()); i < e; ++i) {
+    int64_t token_id = live_out_token_ids[i];
+    if (token_id >= 0) {
+      ctx_.token_by_id[token_id] = active_frame.iter_tokens[i];
+    }
+  }
   for (int i = 0,
            e = static_cast<int>(active_frame.live_out_value_names.size());
        i < e; ++i) {
@@ -261,46 +334,9 @@ void SunmmioMlirFunction::EndFor() {
        ++i) {
     int64_t token_id = frame.live_out_token_ids[i];
     mlir::Value v = for_op.getResult(i);
-    // Publish the final loop result for this live-out token_id to the outer
-    // scope.
-    ctx_.token_by_id[token_id] = v;
-    for (auto nit = ctx_.control_flow_stack.rbegin();
-         nit != ctx_.control_flow_stack.rend(); ++nit) {
-      if (nit->kind == SunmmioMlirContext::ControlKind::kFor) {
-        SunmmioMlirContext::ForFrame &outer = ctx_.for_stack[nit->index];
-        auto tit = outer.token_id_to_index.find(token_id);
-        if (tit != outer.token_id_to_index.end()) {
-          int idx = tit->second;
-          if (idx >= 0 &&
-              idx < static_cast<int>(outer.produced_tokens.size())) {
-            outer.produced_tokens[idx] = v;
-          }
-          break;
-        }
-      } else if (nit->kind == SunmmioMlirContext::ControlKind::kIf) {
-        SunmmioMlirContext::IfFrame &outer = ctx_.if_stack[nit->index];
-        auto tit = outer.token_id_to_index.find(token_id);
-        if (tit != outer.token_id_to_index.end()) {
-          int idx = tit->second;
-          if (idx >= 0 &&
-              idx < static_cast<int>(outer.produced_tokens.size())) {
-            outer.produced_tokens[idx] = v;
-          }
-          break;
-        }
-      } else {
-        SunmmioMlirContext::WhileFrame &outer = ctx_.while_stack[nit->index];
-        auto tit = outer.token_id_to_index.find(token_id);
-        if (tit != outer.token_id_to_index.end()) {
-          int idx = tit->second;
-          if (idx >= 0 &&
-              idx < static_cast<int>(outer.produced_tokens.size())) {
-            outer.produced_tokens[idx] = v;
-          }
-          break;
-        }
-      }
-    }
+    // Publish only to the direct lexical parent.  Skipping an intermediate
+    // control-flow region would leak a value defined inside that region.
+    PublishTokenToImmediateParent(ctx_, token_id, v);
   }
   ctx_.PopMLIRValueScope();
   for (int i = 0, e = static_cast<int>(frame.live_out_value_names.size());
@@ -491,44 +527,7 @@ void SunmmioMlirFunction::EndWhile() {
        ++i) {
     int64_t token_id = frame.live_out_token_ids[i];
     mlir::Value v = while_op.getResult(i);
-    ctx_.token_by_id[token_id] = v;
-    for (auto nit = ctx_.control_flow_stack.rbegin();
-         nit != ctx_.control_flow_stack.rend(); ++nit) {
-      if (nit->kind == SunmmioMlirContext::ControlKind::kFor) {
-        SunmmioMlirContext::ForFrame &outer = ctx_.for_stack[nit->index];
-        auto tit = outer.token_id_to_index.find(token_id);
-        if (tit != outer.token_id_to_index.end()) {
-          int idx = tit->second;
-          if (idx >= 0 &&
-              idx < static_cast<int>(outer.produced_tokens.size())) {
-            outer.produced_tokens[idx] = v;
-          }
-          break;
-        }
-      } else if (nit->kind == SunmmioMlirContext::ControlKind::kIf) {
-        SunmmioMlirContext::IfFrame &outer = ctx_.if_stack[nit->index];
-        auto tit = outer.token_id_to_index.find(token_id);
-        if (tit != outer.token_id_to_index.end()) {
-          int idx = tit->second;
-          if (idx >= 0 &&
-              idx < static_cast<int>(outer.produced_tokens.size())) {
-            outer.produced_tokens[idx] = v;
-          }
-          break;
-        }
-      } else {
-        SunmmioMlirContext::WhileFrame &outer = ctx_.while_stack[nit->index];
-        auto tit = outer.token_id_to_index.find(token_id);
-        if (tit != outer.token_id_to_index.end()) {
-          int idx = tit->second;
-          if (idx >= 0 &&
-              idx < static_cast<int>(outer.produced_tokens.size())) {
-            outer.produced_tokens[idx] = v;
-          }
-          break;
-        }
-      }
-    }
+    PublishTokenToImmediateParent(ctx_, token_id, v);
   }
 
   ctx_.PopMLIRValueScope();
@@ -568,21 +567,41 @@ void SunmmioMlirFunction::BeginIf(
   for (int i = 0, e = static_cast<int>(live_out_token_ids.size()); i < e; ++i) {
     int64_t token_id = live_out_token_ids[i];
     mlir::Value base;
-    for (auto fit = ctx_.for_stack.rbegin(); fit != ctx_.for_stack.rend();
-         ++fit) {
-      auto tit = fit->token_id_to_index.find(token_id);
-      if (tit != fit->token_id_to_index.end()) {
-        int idx = tit->second;
-        if (idx >= 0 && idx < static_cast<int>(fit->iter_tokens.size())) {
-          base = fit->iter_tokens[idx];
-          break;
-        }
-      }
+    auto it = ctx_.token_by_id.find(token_id);
+    if (it != ctx_.token_by_id.end() && it->second) {
+      base = it->second;
     }
     if (!base) {
-      auto it = ctx_.token_by_id.find(token_id);
-      if (it != ctx_.token_by_id.end() && it->second) {
-        base = it->second;
+      for (auto nit = ctx_.control_flow_stack.rbegin();
+           nit != ctx_.control_flow_stack.rend(); ++nit) {
+        if (nit->kind == SunmmioMlirContext::ControlKind::kFor) {
+          SunmmioMlirContext::ForFrame &frame = ctx_.for_stack[nit->index];
+          auto tit = frame.token_id_to_index.find(token_id);
+          if (tit == frame.token_id_to_index.end()) {
+            continue;
+          }
+          int idx = tit->second;
+          if (idx >= 0 && idx < static_cast<int>(frame.iter_tokens.size())) {
+            base = frame.iter_tokens[idx];
+            break;
+          }
+          continue;
+        }
+        if (nit->kind != SunmmioMlirContext::ControlKind::kWhile) {
+          continue;
+        }
+        SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack[nit->index];
+        auto tit = frame.token_id_to_index.find(token_id);
+        if (tit == frame.token_id_to_index.end()) {
+          continue;
+        }
+        int idx = tit->second;
+        const std::vector<mlir::Value> &tokens =
+            frame.in_body ? frame.iter_tokens : frame.before_tokens;
+        if (idx >= 0 && idx < static_cast<int>(tokens.size())) {
+          base = tokens[idx];
+          break;
+        }
       }
     }
     base_values.push_back(base ? base : CreateNullToken(ctx_, type_));
@@ -755,44 +774,7 @@ void SunmmioMlirFunction::EndIf() {
        ++i) {
     int64_t token_id = frame.live_out_token_ids[i];
     mlir::Value v = if_op.getResult(i);
-    ctx_.token_by_id[token_id] = v;
-    for (auto nit = ctx_.control_flow_stack.rbegin();
-         nit != ctx_.control_flow_stack.rend(); ++nit) {
-      if (nit->kind == SunmmioMlirContext::ControlKind::kFor) {
-        SunmmioMlirContext::ForFrame &outer = ctx_.for_stack[nit->index];
-        auto tit = outer.token_id_to_index.find(token_id);
-        if (tit != outer.token_id_to_index.end()) {
-          int idx = tit->second;
-          if (idx >= 0 &&
-              idx < static_cast<int>(outer.produced_tokens.size())) {
-            outer.produced_tokens[idx] = v;
-          }
-          break;
-        }
-      } else if (nit->kind == SunmmioMlirContext::ControlKind::kIf) {
-        SunmmioMlirContext::IfFrame &outer = ctx_.if_stack[nit->index];
-        auto tit = outer.token_id_to_index.find(token_id);
-        if (tit != outer.token_id_to_index.end()) {
-          int idx = tit->second;
-          if (idx >= 0 &&
-              idx < static_cast<int>(outer.produced_tokens.size())) {
-            outer.produced_tokens[idx] = v;
-          }
-          break;
-        }
-      } else {
-        SunmmioMlirContext::WhileFrame &outer = ctx_.while_stack[nit->index];
-        auto tit = outer.token_id_to_index.find(token_id);
-        if (tit != outer.token_id_to_index.end()) {
-          int idx = tit->second;
-          if (idx >= 0 &&
-              idx < static_cast<int>(outer.produced_tokens.size())) {
-            outer.produced_tokens[idx] = v;
-          }
-          break;
-        }
-      }
-    }
+    PublishTokenToImmediateParent(ctx_, token_id, v);
   }
   ctx_.PopMLIRValueScope();
   for (int i = 0, e = static_cast<int>(frame.live_out_value_names.size());

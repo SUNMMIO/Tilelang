@@ -3,17 +3,12 @@ import argparse
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.carver.arch import driver
 from tilelang.engine.phase import LowerAndLegalize
 from tilelang.utils.target import determine_target
 from tilelang.layout import make_row_major, make_aligned_row_major
 
 
 def reduction(M, block_M, in_dtype, out_dtype):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
-
     A_layout = make_row_major((M,))
     B_layout = make_aligned_row_major((1,), align_bytes=1024, dtype=out_dtype)
     A_placement = T.MeshShardingPolicy(y=0, replicate=T.MeshReplicationType.ROW)
@@ -21,15 +16,15 @@ def reduction(M, block_M, in_dtype, out_dtype):
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M), A_placement, device_mesh_config, in_dtype, layout=A_layout),
-        B: T.MeshTensor((1), B_placement, device_mesh_config, out_dtype, layout=B_layout),
+        A: T.MeshTensor((M), A_placement, in_dtype, layout=A_layout),
+        B: T.MeshTensor((1), B_placement, out_dtype, layout=B_layout),
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M = A.shape[0]
+        with T.Kernel() as _cid:
+            sharded_M = A.local_shape[0]
 
             A_shared = T.alloc_shared((block_M), in_dtype)
             Acc_shared = T.alloc_shared((block_M), out_dtype)
-            Acc_dist_shared = T.alloc_shared((ncols * block_M), out_dtype)
+            Acc_dist_shared = T.alloc_shared((T.mesh_ncols() * block_M), out_dtype)
             B_shared = T.alloc_shared((1,), out_dtype)
             T.annotate_layout({B_shared: B_layout})
 

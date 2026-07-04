@@ -7,18 +7,19 @@ failure names exactly which pass is responsible.
 
 Passes run in order (mirroring phase.py LowerAndLegalize):
     01  BindTarget
-    02  AddWrapperForSingleBufStore
-    03  LegalizeNegativeIndex
-    04  InjectAssumes
-    05  Simplify
-    06  InferSramScope
-    07  LayoutReducer
-    08  SunmmioLayoutInference
-    09  LowerTileOp
-    10  LowerL2Persistent
-    11  LegalizeVectorizedLoop
-    12  LegalizeSafeMemoryAccess
-    13  Simplify (2nd)
+    02  ResolveSunmmioMeshSymbols
+    03  AddWrapperForSingleBufStore
+    04  LegalizeNegativeIndex
+    05  InjectAssumes
+    06  Simplify
+    07  InferSramScope
+    08  LayoutReducer
+    09  SunmmioLayoutInference
+    10  LowerTileOp
+    11  LowerL2Persistent
+    12  LegalizeVectorizedLoop
+    13  LegalizeSafeMemoryAccess
+    14  Simplify (2nd)
 
 Kernel variants covered:
     1. Simple element-wise copy    — no shared memory, no T.Parallel
@@ -51,8 +52,10 @@ def make_elementwise_copy_kernel(M, N, dtype=T.float32):
 
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
-        with T.Kernel(M, N) as (bx, by):
-            B[bx, by] = A[bx, by]
+        with T.Kernel():
+            for bx in T.serial(M):
+                for by in T.serial(N):
+                    B[bx, by] = A[bx, by]
 
     return tvm.IRModule({"main": main})
 
@@ -66,12 +69,14 @@ def make_parallel_shared_kernel(M, N, dtype=T.float32):
 
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
-        with T.Kernel(T.ceildiv(M, 32), T.ceildiv(N, 32)) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((32, 32), dtype)
-            for i, j in T.Parallel(32, 32):
-                A_shared[i, j] = A[bx * 32 + i, by * 32 + j]
-            for i, j in T.Parallel(32, 32):
-                B[bx * 32 + i, by * 32 + j] = A_shared[i, j]
+            for bx in T.serial(T.ceildiv(M, 32)):
+                for by in T.serial(T.ceildiv(N, 32)):
+                    for i, j in T.Tiles([32, 32], parallel=True):
+                        A_shared[i, j] = A[bx * 32 + i, by * 32 + j]
+                    for i, j in T.Tiles([32, 32], parallel=True):
+                        B[bx * 32 + i, by * 32 + j] = A_shared[i, j]
 
     return tvm.IRModule({"main": main})
 
@@ -81,8 +86,11 @@ def make_3d_grid_kernel(M, N, K, dtype=T.float32):
 
     @T.prim_func
     def main(A: T.Tensor((M, N, K), dtype), B: T.Tensor((M, N, K), dtype)):
-        with T.Kernel(M, N, K) as (bx, by, bz):
-            B[bx, by, bz] = A[bx, by, bz] + T.float32(1.0)
+        with T.Kernel():
+            for bx in T.serial(M):
+                for by in T.serial(N):
+                    for bz in T.serial(K):
+                        B[bx, by, bz] = A[bx, by, bz] + T.float32(1.0)
 
     return tvm.IRModule({"main": main})
 
@@ -97,7 +105,7 @@ def collect_thread_extents(func):
 
     def fvisit(node):
         if isinstance(node, tir.AttrStmt) and node.attr_key == "thread_extent":
-            extents[node.node.thread_tag] = int(node.value)
+            extents[node.node.thread_tag] = node.value
 
     post_order_visit(func.body, fvisit)
     return extents
@@ -160,6 +168,9 @@ def run_lower_and_legalize_cascade(mod, target):
     """
     mod = tir.transform.BindTarget(target)(mod)
     assert_threadless_invariants(mod, "BindTarget")
+
+    mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
+    assert_threadless_invariants(mod, "ResolveSunmmioMeshSymbols")
 
     mod = tl_transform.AddWrapperForSingleBufStore()(mod)
     assert_threadless_invariants(mod, "AddWrapperForSingleBufStore")

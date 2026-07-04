@@ -47,8 +47,10 @@ def make_threadless_copy_kernel(M, N, dtype=T.float32):
 
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
-        with T.Kernel(M, N) as (bx, by):
-            B[bx, by] = A[bx, by]
+        with T.Kernel():
+            for bx in T.serial(M):
+                for by in T.serial(N):
+                    B[bx, by] = A[bx, by]
 
     return tvm.IRModule({"main": main})
 
@@ -66,12 +68,14 @@ def make_sunmmio_parallel_shared_kernel(M, N, dtype=T.float32):
 
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype), B: T.Tensor((M, N), dtype)):
-        with T.Kernel(T.ceildiv(M, 32), T.ceildiv(N, 32)) as (bx, by):
+        with T.Kernel():
             A_shared = T.alloc_shared((32, 32), dtype)
-            for i, j in T.Parallel(32, 32):
-                A_shared[i, j] = A[bx * 32 + i, by * 32 + j]
-            for i, j in T.Parallel(32, 32):
-                B[bx * 32 + i, by * 32 + j] = A_shared[i, j]
+            for bx in T.serial(T.ceildiv(M, 32)):
+                for by in T.serial(T.ceildiv(N, 32)):
+                    for i, j in T.Tiles([32, 32], parallel=True):
+                        A_shared[i, j] = A[bx * 32 + i, by * 32 + j]
+                    for i, j in T.Tiles([32, 32], parallel=True):
+                        B[bx * 32 + i, by * 32 + j] = A_shared[i, j]
 
     return tvm.IRModule({"main": main})
 
@@ -140,6 +144,7 @@ def test_layout_inference_threadless_kernel_completes_without_error():
         mod = make_threadless_copy_kernel(16, 16)
 
     mod = tvm.tir.transform.BindTarget(target)(mod)
+    mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
     mod = tl_transform.InferSramScope()(mod)
     mod = tl_transform.LegalizeSunmmioDataPath()(mod)
     mod = tl_transform.LayoutReducer()(mod)
@@ -159,6 +164,7 @@ def test_layout_inference_threadless_kernel_has_no_threadidx_bindings():
         mod = make_threadless_copy_kernel(16, 16)
 
     mod = tvm.tir.transform.BindTarget(target)(mod)
+    mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
     mod = tl_transform.InferSramScope()(mod)
     mod = tl_transform.LegalizeSunmmioDataPath()(mod)
     mod = tl_transform.LayoutReducer()(mod)
@@ -185,6 +191,7 @@ def test_layout_inference_threadless_kernel_preserves_blockidx_bindings():
         mod = make_threadless_copy_kernel(16, 16)
 
     mod = tvm.tir.transform.BindTarget(target)(mod)
+    mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
     mod = tl_transform.InferSramScope()(mod)
     mod = tl_transform.LegalizeSunmmioDataPath()(mod)
     mod = tl_transform.LayoutReducer()(mod)
@@ -223,6 +230,7 @@ def test_layout_inference_parallel_shared_kernel_completes_without_error():
     with tvm.target.Target(target):
         mod = make_sunmmio_parallel_shared_kernel(64, 64)
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tl_transform.InferSramScope()(mod)
         mod = tl_transform.LegalizeSunmmioDataPath()(mod)
         mod = tl_transform.LayoutReducer()(mod)
@@ -241,6 +249,7 @@ def test_layout_inference_parallel_shared_kernel_has_no_threadidx_bindings():
     with tvm.target.Target(target):
         mod = make_sunmmio_parallel_shared_kernel(64, 64)
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tl_transform.InferSramScope()(mod)
         mod = tl_transform.LegalizeSunmmioDataPath()(mod)
         mod = tl_transform.LayoutReducer()(mod)
@@ -272,6 +281,7 @@ def test_layout_inference_parallel_shared_kernel_has_no_v_thread_variable():
     with tvm.target.Target(target):
         mod = make_sunmmio_parallel_shared_kernel(64, 64)
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tl_transform.InferSramScope()(mod)
         mod = tl_transform.LegalizeSunmmioDataPath()(mod)
         mod = tl_transform.LayoutReducer()(mod)

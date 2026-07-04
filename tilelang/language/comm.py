@@ -36,6 +36,7 @@ REDUCE_TYPE_LIST = (
 
 CoreCoord = int | tir.PrimExpr
 CoreSpec = CoreCoord | tuple[CoreCoord, CoreCoord]
+ACCESS_MASK = {"r": 1, "w": 2, "rw": 3}
 
 
 def get_target_mesh_shape() -> dict[str, int]:
@@ -112,6 +113,10 @@ def _extent_equal(lhs, rhs) -> bool:
         return False
 
 
+def _extent_is_dynamic(extent) -> bool:
+    return isinstance(extent, tir.PrimExpr) and _const_int(extent) is None
+
+
 def _extent_is_one(extent) -> bool:
     extent_int = _const_int(extent)
     if extent_int is not None:
@@ -123,9 +128,25 @@ def _shape_equal(lhs, rhs) -> bool:
     return len(lhs) == len(rhs) and all(_extent_equal(lhs_extent, rhs_extent) for lhs_extent, rhs_extent in zip(lhs, rhs))
 
 
+def _shape_equal_or_dynamic(lhs, rhs) -> bool:
+    if len(lhs) != len(rhs):
+        return False
+    for lhs_extent, rhs_extent in zip(lhs, rhs):
+        if _extent_equal(lhs_extent, rhs_extent):
+            continue
+        if _extent_is_dynamic(lhs_extent) or _extent_is_dynamic(rhs_extent):
+            continue
+        return False
+    return True
+
+
 def _shape_compatible(lhs, rhs) -> bool:
     return len(lhs) == len(rhs) and all(
-        _extent_equal(lhs_extent, rhs_extent) or _extent_is_one(lhs_extent) or _extent_is_one(rhs_extent)
+        _extent_equal(lhs_extent, rhs_extent)
+        or _extent_is_one(lhs_extent)
+        or _extent_is_one(rhs_extent)
+        or _extent_is_dynamic(lhs_extent)
+        or _extent_is_dynamic(rhs_extent)
         for lhs_extent, rhs_extent in zip(lhs, rhs)
     )
 
@@ -138,6 +159,29 @@ def _const_product(extents):
             return None
         result *= extent_int
     return result
+
+
+def _region_has_dynamic_extent(region: tir.BufferRegion) -> bool:
+    return any(_extent_is_dynamic(rng.extent) for rng in region.region)
+
+
+def _encode_region(region: tir.BufferRegion, access_type: str):
+    indices = [rng.min for rng in region.region]
+    extents = [rng.extent for rng in region.region]
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.tileop.region"),
+        tir.BufferLoad(region.buffer, indices),
+        tir.IntImm("int32", ACCESS_MASK[access_type]),
+        *extents,
+    )
+
+
+def _to_comm_region(obj: BufferLikeType, access_type: str):
+    region = to_buffer_region(obj, access_type=access_type)
+    if isinstance(region, tir.BufferRegion) and _region_has_dynamic_extent(region):
+        return _encode_region(region, access_type)
+    return region
 
 
 def _check_size(size: int, extents, op_name: str):
@@ -198,8 +242,8 @@ def broadcast(
 
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
 
-    src_region = to_buffer_region(src, access_type="r")
-    dst_region = to_buffer_region(dst, access_type="w")
+    src_region = _to_comm_region(src, access_type="r")
+    dst_region = _to_comm_region(dst, access_type="w")
     src_core_id = core_to_id(src_core, "src_core")
 
     args = (
@@ -254,8 +298,8 @@ def put(
 
     _check_size(size, src_shape, "source")
 
-    src_region = to_buffer_region(src, access_type="r")
-    dst_region = to_buffer_region(dst, access_type="w")
+    src_region = _to_comm_region(src, access_type="r")
+    dst_region = _to_comm_region(dst, access_type="w")
     src_core_id = core_to_id(src_core, "src_core")
     dst_core_id = core_to_id(dst_core, "dst_core")
     args = (src_region, dst_region, size, src_core_id, dst_core_id)
@@ -340,7 +384,7 @@ def all_gather(
         expected_recv_shape = list(send_shape)
         expected_recv_shape[normalized_axis] = recv_num * send_shape[normalized_axis]
 
-    assert _shape_equal(recv_shape, expected_recv_shape), (
+    assert _shape_equal_or_dynamic(recv_shape, expected_recv_shape), (
         f"Receive buffer shape must be {expected_recv_shape} to hold gathered data from {recv_num} cores, but got {recv_shape}."
     )
 
@@ -348,8 +392,8 @@ def all_gather(
 
     assert isinstance(src_offset_byte, int) and src_offset_byte >= 0, "src_offset_byte must be a non-negative integer."
 
-    send_buffer_region = to_buffer_region(send_buffer, access_type="r")
-    recv_buffer_region = to_buffer_region(recv_buffer, access_type="w")
+    send_buffer_region = _to_comm_region(send_buffer, access_type="r")
+    recv_buffer_region = _to_comm_region(recv_buffer, access_type="w")
     cid = T.get_block_binding(0)
 
     args = (
@@ -410,7 +454,7 @@ def all_reduce(
         buffer_shape[:dim] + buffer_shape[dim + 1 :],
         buffer_shape[:dim] + [1] + buffer_shape[dim + 1 :],
     ]
-    if not any(_shape_equal(out_shape, expected_shape) for expected_shape in expected_shapes):
+    if not any(_shape_equal_or_dynamic(out_shape, expected_shape) for expected_shape in expected_shapes):
         expected_shapes_str = " or ".join(map(str, expected_shapes))
         raise ValueError(
             f"Invalid reduce output shape, buffer shape is {buffer_shape}, dim is {dim}, "
@@ -438,10 +482,10 @@ def all_reduce(
     row_allgather = alloc_tmp([mesh_shape["ncol"]] + list(out_shape))
     col_allgather = alloc_tmp([mesh_shape["nrow"]] + list(out_shape))
 
-    buffer_region = to_buffer_region(buffer, access_type="r")
-    out_region = to_buffer_region(out, access_type="w")
-    row_allgather_region = to_buffer_region(row_allgather, access_type="rw")
-    col_allgather_region = to_buffer_region(col_allgather, access_type="rw")
+    buffer_region = _to_comm_region(buffer, access_type="r")
+    out_region = _to_comm_region(out, access_type="w")
+    row_allgather_region = _to_comm_region(row_allgather, access_type="rw")
+    col_allgather_region = _to_comm_region(col_allgather, access_type="rw")
     cid = T.get_block_binding(0)
 
     args = (
@@ -459,7 +503,7 @@ def all_reduce(
     # If not clearing, allocate an output copy buffer to hold intermediate results
     if not clear:
         out_copy = alloc_tmp(list(out_shape))
-        out_copy_region = to_buffer_region(out_copy, access_type="rw")
+        out_copy_region = _to_comm_region(out_copy, access_type="rw")
         args = (
             buffer_region,
             out_region,

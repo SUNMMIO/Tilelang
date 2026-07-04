@@ -345,50 +345,47 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
       TVM_FFI_UNREACHABLE();
     }
     mlir::Value tok;
-    auto current_it = ctx_.token_by_id.find(token_id);
-    if (current_it != ctx_.token_by_id.end()) {
-      tok = current_it->second;
+    auto it = ctx_.token_by_id.find(token_id);
+    if (it != ctx_.token_by_id.end() && it->second) {
+      tok = it->second;
     }
-    for (auto nit = ctx_.control_flow_stack.rbegin();
-         !tok && nit != ctx_.control_flow_stack.rend(); ++nit) {
-      if (nit->kind == SunmmioMlirContext::ControlKind::kFor) {
-        SunmmioMlirContext::ForFrame &frame = ctx_.for_stack[nit->index];
+    if (!tok) {
+      for (auto nit = ctx_.control_flow_stack.rbegin();
+           nit != ctx_.control_flow_stack.rend(); ++nit) {
+        if (nit->kind == SunmmioMlirContext::ControlKind::kFor) {
+          SunmmioMlirContext::ForFrame &frame = ctx_.for_stack[nit->index];
+          auto tit = frame.token_id_to_index.find(token_id);
+          if (tit == frame.token_id_to_index.end()) {
+            continue;
+          }
+          int idx = tit->second;
+          if (idx >= 0 && idx < static_cast<int>(frame.iter_tokens.size())) {
+            tok = frame.iter_tokens[idx];
+            break;
+          }
+          continue;
+        }
+        if (nit->kind != SunmmioMlirContext::ControlKind::kWhile) {
+          continue;
+        }
+        SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack[nit->index];
         auto tit = frame.token_id_to_index.find(token_id);
         if (tit == frame.token_id_to_index.end()) {
           continue;
         }
         int idx = tit->second;
-        if (idx >= 0 && idx < static_cast<int>(frame.iter_tokens.size())) {
-          tok = frame.iter_tokens[idx];
+        const std::vector<mlir::Value> &tokens =
+            frame.in_body ? frame.iter_tokens : frame.before_tokens;
+        if (idx >= 0 && idx < static_cast<int>(tokens.size())) {
+          tok = tokens[idx];
           break;
         }
-        continue;
-      }
-      if (nit->kind != SunmmioMlirContext::ControlKind::kWhile) {
-        continue;
-      }
-      SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack[nit->index];
-      if (!frame.in_body) {
-        continue;
-      }
-      auto tit = frame.token_id_to_index.find(token_id);
-      if (tit == frame.token_id_to_index.end()) {
-        continue;
-      }
-      int idx = tit->second;
-      if (idx >= 0 && idx < static_cast<int>(frame.iter_tokens.size())) {
-        tok = frame.iter_tokens[idx];
-        break;
       }
     }
     if (!tok) {
-      auto it = ctx_.token_by_id.find(token_id);
-      if (it == ctx_.token_by_id.end()) {
-        LOG(FATAL) << "tl.wait_token token_id=" << token_id
-                   << " has no corresponding sync_token.";
-        TVM_FFI_UNREACHABLE();
-      }
-      tok = it->second;
+      LOG(FATAL) << "tl.wait_token token_id=" << token_id
+                 << " has no corresponding sync_token.";
+      TVM_FFI_UNREACHABLE();
     }
     mlir::OperationState st(type.Loc(), "suvm.wait_token");
     st.addOperands(tok);

@@ -25,13 +25,14 @@ def comm_broadcast_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16")
         A: T.Tensor((M, N), dtype),
         B: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), threads=128) as bx:
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
 
-            T.copy(A[0, bx * block_N], A_shared)
-            T.comm.broadcast(A_shared, B_shared, (0, 0), direction="h")
-            T.copy(B_shared, B[0, bx * block_N])
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                T.copy(A[0, bx * block_N], A_shared)
+                T.comm.broadcast(A_shared, B_shared, (0, 0), direction="h")
+                T.copy(B_shared, B[0, bx * block_N])
 
     return main
 
@@ -40,12 +41,13 @@ def comm_broadcast_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16")
 def comm_put_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16"):
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype)):
-        with T.Kernel(T.ceildiv(N, block_N), threads=128) as bx:
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
 
-            T.copy(A[0, bx * block_N], A_shared)
-            T.comm.put(A_shared, B_shared, (1, 2), (2, 3))
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                T.copy(A[0, bx * block_N], A_shared)
+                T.comm.put(A_shared, B_shared, (1, 2), (2, 3))
 
     return main
 
@@ -63,7 +65,7 @@ def comm_all_gather_kernel(
 ):
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype)):
-        with T.Kernel(T.ceildiv(N, block_N), threads=128) as bx:
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             if axis == 0:
                 R_shared = T.alloc_shared((16 * block_M, block_N), dtype, scope="shared.rsram")
@@ -73,11 +75,12 @@ def comm_all_gather_kernel(
             else:
                 R_shared = T.alloc_shared((16, block_M, block_N), dtype, scope="shared.rsram")
 
-            T.copy(A[0, bx * block_N], A_shared)
-            if axis is None:
-                T.comm.all_gather(A_shared, R_shared, direction=direction)
-            else:
-                T.comm.all_gather(A_shared, R_shared, direction=direction, axis=axis)
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                T.copy(A[0, bx * block_N], A_shared)
+                if axis is None:
+                    T.comm.all_gather(A_shared, R_shared, direction=direction)
+                else:
+                    T.comm.all_gather(A_shared, R_shared, direction=direction, axis=axis)
 
     return main
 
@@ -89,11 +92,12 @@ def sync_simple_copy_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16
         A: T.Tensor((M, N), dtype),
         B: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), threads=128) as bx:
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype)
 
-            T.copy(A[0, bx * block_N], A_shared)
-            T.copy(A_shared, B[0, bx * block_N])
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                T.copy(A[0, bx * block_N], A_shared)
+                T.copy(A_shared, B[0, bx * block_N])
 
     return main
 
@@ -115,15 +119,16 @@ def sync_mma_kernel(
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), accum_dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), threads=128) as bx:
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
-            T.copy(A[0, 0], A_shared)
-            T.copy(B[0, bx * block_N], B_shared)
-            T.gemm(A_shared, B_shared, C_shared)
-            T.copy(C_shared, C[0, bx * block_N])
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                T.copy(A[0, 0], A_shared)
+                T.copy(B[0, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_shared)
+                T.copy(C_shared, C[0, bx * block_N])
 
     return main
 
@@ -145,18 +150,19 @@ def sync_if_broadcast_kernel(
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), accum_dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N), threads=128) as bx:
+        with T.Kernel():
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
             D_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
-            T.copy(A[0, 0], A_shared)
-            T.copy(B[0, bx * block_N], B_shared)
-            T.gemm(A_shared, B_shared, C_shared)
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                T.copy(A[0, 0], A_shared)
+                T.copy(B[0, bx * block_N], B_shared)
+                T.gemm(A_shared, B_shared, C_shared)
 
-            if bx == 0:
-                T.comm.broadcast(C_shared, D_shared, (0, 0), direction="h")
+                if bx == 0:
+                    T.comm.broadcast(C_shared, D_shared, (0, 0), direction="h")
 
     return main
 
@@ -165,14 +171,15 @@ def sync_if_broadcast_kernel(
 def sync_loop_broadcast_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float32"):
     @T.prim_func
     def main(C: T.Tensor((M, N), dtype)):
-        with T.Kernel(T.ceildiv(N, block_N), threads=128) as bx:
+        with T.Kernel():
             C_shared = T.alloc_shared((block_M, block_N), dtype)
             D_shared = T.alloc_shared((block_M, block_N), dtype)
 
-            T.copy(C[0, bx * block_N], D_shared)
-            for _i in range(2):
-                T.comm.broadcast(C_shared, D_shared, (0, 0), direction="h")
-                T.comm.broadcast(D_shared, C_shared, (0, 0), direction="h")
+            for bx in T.serial(T.ceildiv(N, block_N)):
+                T.copy(C[0, bx * block_N], D_shared)
+                for _i in T.serial(2):
+                    T.comm.broadcast(C_shared, D_shared, (0, 0), direction="h")
+                    T.comm.broadcast(D_shared, C_shared, (0, 0), direction="h")
 
     return main
 

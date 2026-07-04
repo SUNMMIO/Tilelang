@@ -3,7 +3,6 @@ import argparse
 import tilelang
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.carver.arch import driver
 from tilelang.engine.phase import LowerAndLegalize
 from tilelang.utils.target import determine_target
 from tilelang.layout import make_zz_layout, make_row_major
@@ -11,9 +10,6 @@ from tilelang.layout import make_zz_layout, make_row_major
 
 def gqa_flashattn(batch, heads, kv_heads, seqlen_kv, dim, block_N=128):
     # Device configurations
-    mesh = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = mesh
-    ncores = nrows * ncols
 
     scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
     shape_q = [batch, heads, dim]
@@ -29,20 +25,19 @@ def gqa_flashattn(batch, heads, kv_heads, seqlen_kv, dim, block_N=128):
 
     @T.prim_func
     def main(
-        Q: T.MeshTensor(shape_q, T.MeshShardingPolicy(y=0, x=1), mesh, dtype, make_zz_layout(shape_q)),
-        K: T.MeshTensor(shape_k, T.MeshShardingPolicy(y=0, x=2), mesh, dtype, make_zz_layout(shape_k, axes=(1, 3))),
-        V: T.MeshTensor(shape_v, T.MeshShardingPolicy(y=0, x=2), mesh, dtype, make_zz_layout(shape_k, axes=(1, 3))),
+        Q: T.MeshTensor(shape_q, T.MeshShardingPolicy(y=0, x=1), dtype, layout=make_zz_layout(shape_q)),
+        K: T.MeshTensor(shape_k, T.MeshShardingPolicy(y=0, x=2), dtype, layout=make_zz_layout(shape_k, axes=(1, 3))),
+        V: T.MeshTensor(shape_v, T.MeshShardingPolicy(y=0, x=2), dtype, layout=make_zz_layout(shape_k, axes=(1, 3))),
         mask: T.MeshTensor(
             [batch, seqlen_kv],
             T.MeshShardingPolicy(y=0, replicate=T.MeshReplicationType.ROW),
-            mesh,
             "uint16",
-            make_row_major([batch, seqlen_kv]),
+            layout=make_row_major([batch, seqlen_kv]),
         ),
-        Output: T.MeshTensor(shape_o, T.MeshShardingPolicy(y=0, x=1), mesh, dtype, make_zz_layout(shape_o)),
+        Output: T.MeshTensor(shape_o, T.MeshShardingPolicy(y=0, x=1), dtype, layout=make_zz_layout(shape_o)),
     ):
-        with T.Kernel(ncores) as (_cid):
-            sharded_batch, sharded_heads, _ = Q.shape
+        with T.Kernel() as (_cid):
+            sharded_batch, sharded_heads, _ = Q.local_shape
 
             Q_shared = T.alloc_shared([block_H, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)

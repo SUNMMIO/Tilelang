@@ -26,12 +26,14 @@ using namespace tvm::tir;
 
 namespace {
 
-// 需要将block注释提升到函数属性的annotation key列表
+// The block comment needs to be promoted to the list of annotation keys in the
+// function attributes.
 constexpr const char *kHoistedAnnotationKeys[] = {
     attr::kLayoutMap,
     attr::kGlobalLayoutMap,
 };
-// 需要保存到device_func_attr_keys列表中的属性key
+// The attribute keys that need to be propagated to the device function
+// attributes.
 constexpr const char *kDeviceFuncPropagatedAttrKeys[] = {
     attr::kLayoutMap,
     attr::kGlobalLayoutMap,

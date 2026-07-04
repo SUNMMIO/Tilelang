@@ -33,6 +33,7 @@ class BufferProxy:
         buffer_type="",
         axis_separators=None,
     ) -> tir.Buffer:
+        dtype = _dtypes.normalize_dtype(dtype)
         return buffer(
             shape,
             dtype=dtype,
@@ -68,7 +69,7 @@ class BufferProxy:
         Returns:
             A buffer created from the given parameters
         """
-        return match_buffer(pointer_var, shape, dtype=dtype, strides=strides)
+        return match_buffer(pointer_var, shape, dtype=_dtypes.normalize_dtype(dtype), strides=strides)
 
 
 class BaseTensorProxy:
@@ -100,6 +101,7 @@ class BaseTensorProxy:
         scope = scope or self.default_scope
         align = align or self.default_align
         offset_factor = offset_factor or self.default_offset_factor
+        dtype = _dtypes.normalize_dtype(dtype)
         return buffer(
             shape,
             dtype=dtype,
@@ -133,7 +135,7 @@ class BaseTensorProxy:
         Returns:
             A buffer created from the given parameters
         """
-        return match_buffer(pointer_var, shape, dtype=dtype, strides=strides)
+        return match_buffer(pointer_var, shape, dtype=_dtypes.normalize_dtype(dtype), strides=strides)
 
 
 class TensorProxy(BaseTensorProxy):
@@ -274,7 +276,7 @@ def ptr(dtype: DType | None = None, storage_scope: str = "global", *, is_size_va
     res : PrimExpr
         The new tir.Var with type handle or casted expression with type handle.
     """
-    return handle(dtype=dtype, storage_scope=storage_scope, is_size_var=is_size_var)
+    return handle(dtype=_dtypes.normalize_dtype(dtype), storage_scope=storage_scope, is_size_var=is_size_var)
 
 
 def make_tensor(ptr: Var, shape: ShapeType, dtype: DType = "float32", strides: tuple[PrimExpr, ...] | None = None) -> tir.Buffer:
