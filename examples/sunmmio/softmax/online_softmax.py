@@ -3,11 +3,16 @@ from typing import Callable
 
 import tilelang
 import tilelang.language as T
-from tilelang import tvm as tvm
 from tilelang.carver.arch import driver
-from tilelang.engine.phase import LowerAndLegalize
-from tilelang.utils.target import determine_target
 from tilelang.layout import make_zz_layout
+
+
+def ref_program(x):
+    import numpy as np
+
+    x = x.astype("float32")
+    exp_x = np.exp(x - np.max(x, axis=1, keepdims=True))
+    return exp_x / np.sum(exp_x, axis=1, keepdims=True)
 
 
 def softmax_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Callable":
@@ -72,27 +77,39 @@ def softmax_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Call
     return main
 
 
+@tilelang.jit(target="sunmmio", execution_backend="sunmmio_sunsim")
+def online_softmax(M, N, block_M, block_N, dtype):
+    return softmax_kernel(M, N, block_M, block_N, dtype)
+
+
 def main(M, N) -> None:
-    target = determine_target("Sunmmio", return_object=True)
+    import ml_dtypes
+    import numpy as np
+    import sunsim
 
-    pass_configs = {tilelang.PassConfigKey.TL_LAYOUT_VISUALIZATION_ENABLE: True}
-    with tvm.target.Target(target), tvm.transform.PassContext(config=pass_configs):
-        kernel = softmax_kernel(M, N, block_M=128, block_N=128, dtype=T.bfloat16)
-        mod = LowerAndLegalize(tvm.IRModule({"main": kernel}), target)
-        print(mod)
+    rng = np.random.default_rng(0)
+    x = rng.uniform(-4.0, 4.0, size=(M, N)).astype(np.float32).astype(ml_dtypes.bfloat16)
 
-    # ELF
+    kernel = online_softmax(
+        M,
+        N,
+        block_M=128,
+        block_N=128,
+        dtype=T.bfloat16,
+    )
 
-    # Prepare data (Torch CPU)
+    placement = [sunsim.S(0), sunsim.S(1)]
+    layout = sunsim.Layout.zz(block_dims=(0, 1))
+    y = sunsim.Output((M, N), ml_dtypes.bfloat16, placement=placement, layout=layout)
+    result = kernel(
+        sunsim.Input(x, placement=placement, layout=layout),
+        y,
+        mesh=driver.get_sunmmio_device_mesh_config(),
+        timeout=240.0,
+    )
 
-    # To torch sunmmio Sunmmio A4E zpu (Torch Sunmmio)
-    # Launch & Get Result (Compile & Torch Sunmmio Execution)
-    # SuDeck
-
-    # reference program (Torch CPU)
-
-    # Torch Sunmmio Tensor -> Torch CPU Tensor
-    # Compare (Torch CPU)
+    np.testing.assert_allclose(y.data.astype(np.float32), ref_program(x), rtol=5e-2, atol=5e-3)
+    return result
 
 
 if __name__ == "__main__":

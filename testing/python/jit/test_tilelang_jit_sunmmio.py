@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from tilelang.jit.adapter.sunmmio import (
     SunmmioKernelABI,
     SunmmioKernelAdapter,
     SunmmioKernelSuDeckAdapter,
+    SunmmioRuntimeScalar,
     SunmmioSuDeckLibraryGenerator,
     SunmmioSunsimLibraryGenerator,
 )
@@ -55,6 +57,15 @@ def _load_sunmmio_dynamic_exp2_example():
     return module
 
 
+def _load_sunmmio_online_softmax_example():
+    example_path = Path(__file__).resolve().parents[3] / "examples" / "sunmmio" / "softmax" / "online_softmax.py"
+    spec = importlib.util.spec_from_file_location("tilelang_sunmmio_online_softmax_example", example_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _require_npuir_tools():
     try:
         return NpuirTools.resolve()
@@ -78,6 +89,81 @@ def _require_sunmmio_codegen():
 
 def _runtime_scalar_sources(abi):
     return [(scalar.name, scalar.source_param_index, scalar.source_kind, scalar.source_dim) for scalar in abi.runtime_scalars]
+
+
+def test_sunmmio_abi_reorders_public_args_to_device_order():
+    abi = SunmmioKernelABI(
+        kernel_name="main_kernel",
+        public_arg_count=3,
+        public_param_names=("X", "LSE", "Y"),
+        device_param_names=("LSE", "X", "Y"),
+        runtime_scalars=(),
+    )
+
+    assert abi.materialize_runtime_args(["x", "lse", "y"], lambda *_: None) == ["lse", "x", "y"]
+
+
+def test_sunmmio_abi_reorders_public_args_before_hidden_scalars():
+    class Marker:
+        def __init__(self, shape):
+            self.shape = shape
+
+    abi = SunmmioKernelABI(
+        kernel_name="main_kernel",
+        public_arg_count=3,
+        public_param_names=("X", "LSE", "Y"),
+        device_param_names=("LSE", "X", "Y", "m"),
+        runtime_scalars=(SunmmioRuntimeScalar("m", source_param_index=0, source_kind="shape", source_dim=0),),
+    )
+    x = Marker((512, 128))
+    lse = Marker((512, 128))
+    y = Marker((512, 128))
+
+    runtime_args = abi.materialize_runtime_args(
+        [x, lse, y],
+        lambda marker, source_kind, dim_index: marker.shape[dim_index] if source_kind == "shape" else None,
+    )
+
+    assert runtime_args == [lse, x, y, 512]
+    assert abi.materialize_runtime_args([x, lse, y, 512], lambda *_: None) == [lse, x, y, 512]
+
+
+def test_sunmmio_abi_from_modules_preserves_public_and_device_orders():
+    x_buffer = tvm.tir.decl_buffer((128, 128), "bfloat16", name="X")
+    lse_buffer = tvm.tir.decl_buffer((128, 128), "float32", name="LSE")
+    y_buffer = tvm.tir.decl_buffer((128, 128), "float32", name="Y")
+    prim_func = tvm.tir.PrimFunc(
+        [x_buffer.data, lse_buffer.data, y_buffer.data],
+        tvm.tir.Evaluate(0),
+        buffer_map={
+            x_buffer.data: x_buffer,
+            lse_buffer.data: lse_buffer,
+            y_buffer.data: y_buffer,
+        },
+    ).with_attr("global_symbol", "main")
+    params = [KernelParam.from_buffer(buffer) for buffer in (x_buffer, lse_buffer, y_buffer)]
+
+    device_func = tvm.tir.PrimFunc(
+        [
+            tvm.tir.Var("LSE", "handle"),
+            tvm.tir.Var("X", "handle"),
+            tvm.tir.Var("Y", "handle"),
+        ],
+        tvm.tir.Evaluate(0),
+    ).with_attr("tir.is_global_func", True)
+    device_mod = tvm.IRModule({"main_kernel": device_func})
+
+    abi = SunmmioKernelABI.from_modules(
+        func_or_mod=prim_func,
+        host_mod=None,
+        device_mod=device_mod,
+        params=params,
+    )
+
+    assert abi.kernel_name == "main_kernel"
+    assert abi.public_param_names == ("X", "LSE", "Y")
+    assert abi.device_param_names == ("LSE", "X", "Y")
+    assert abi.materialize_runtime_args(["x", "lse", "y"], lambda *_: None) == ["lse", "x", "y"]
 
 
 def test_sunmmio_backend_resolution_accepts_lowercase_target():
@@ -495,6 +581,7 @@ def test_sunmmio_abi_extracts_dynamic_shape_bindings():
 
     assert abi.kernel_name == "elem_add_kernel"
     assert abi.public_arg_count == 3
+    assert abi.public_param_names == ("A", "B", "C")
     assert abi.runtime_scalar_names == ("m", "n")
     assert _runtime_scalar_sources(abi) == [
         ("m", 0, "shape", 0),
@@ -541,6 +628,7 @@ def test_sunmmio_abi_falls_back_to_prim_func_for_cached_dynamic_kernel():
 
     assert abi.kernel_name == "elem_add"
     assert abi.public_arg_count == 3
+    assert abi.public_param_names == ("A", "B", "C")
     assert abi.runtime_scalar_names == ("m", "n")
     assert _runtime_scalar_sources(abi) == [
         ("m", 0, "shape", 0),
@@ -567,7 +655,17 @@ def test_sunmmio_sunsim_cache_restores_abi_kernel_name_from_metadata(tmp_path):
         "define void @elem_add_kernel(ptr %0, ptr %1, ptr %2, i32 %3, i32 %4) #0 !sunmmio.kernel_meta !1 { ret void }",
         encoding="utf-8",
     )
-    (tmp_path / "abi.json").write_text(json.dumps({"kernel_name": "elem_add_kernel"}), encoding="utf-8")
+    cached_abi = SunmmioKernelABI(
+        kernel_name="elem_add_kernel",
+        public_arg_count=3,
+        public_param_names=("A", "B", "C"),
+        device_param_names=("B", "A", "C", "m", "n"),
+        runtime_scalars=(
+            SunmmioRuntimeScalar("m", source_param_index=0, source_kind="shape", source_dim=0),
+            SunmmioRuntimeScalar("n", source_param_index=0, source_kind="shape", source_dim=1),
+        ),
+    )
+    (tmp_path / "abi.json").write_text(json.dumps(cached_abi.to_json_dict()), encoding="utf-8")
 
     kernel = SunmmioKernelCache()._build_kernel(
         func=prim_func,
@@ -587,6 +685,8 @@ def test_sunmmio_sunsim_cache_restores_abi_kernel_name_from_metadata(tmp_path):
 
     assert adapter.abi.kernel_name == "elem_add_kernel"
     assert adapter.runtime_kernel_name == "elem_add_kernel"
+    assert adapter.abi.public_param_names == ("A", "B", "C")
+    assert adapter.abi.device_param_names == ("B", "A", "C", "m", "n")
     assert adapter.abi.runtime_scalar_names == ("m", "n")
     assert _runtime_scalar_sources(adapter.abi) == [
         ("m", 0, "shape", 0),
@@ -661,6 +761,48 @@ def test_sunmmio_elementwise_sync_waits_are_not_duplicated():
     assert dynamic_source.count("T.wait_token(1)") == 2
     assert dynamic_source.count("T.wait_token(2)") == 2
     assert "T.sync_null_token(2)" in dynamic_source
+
+
+def test_sunmmio_softmax_output_dma_wait_is_hoisted_before_tile_store_loop():
+    _require_sunmmio_codegen()
+
+    example = _load_sunmmio_online_softmax_example()
+    prim = example.online_softmax.get_tir(
+        2048,
+        2048,
+        block_M=256,
+        block_N=128,
+        dtype=T.bfloat16,
+    )
+    artifact = tilelang.lower(
+        prim,
+        target="sunmmio",
+        enable_host_codegen=False,
+        enable_device_compile=False,
+    )
+    lines = artifact.device_mod.script().splitlines()
+
+    output_dma_idx, output_dma_line = next(
+        (idx, line) for idx, line in enumerate(lines) if "T.dma_copy(T.region(Y_shared[0, 0]" in line and "T.sync_token_id(" in line
+    )
+    output_token = int(re.search(r"T\.sync_token_id\((\d+)\)", output_dma_line).group(1))
+    wait_marker = f"T.wait_token({output_token})"
+    null_marker = f"T.sync_null_token({output_token})"
+
+    store_idx = max(idx for idx, line in enumerate(lines[:output_dma_idx]) if "Y_shared[" in line and "] =" in line)
+    input_dma_idx = max(
+        idx for idx, line in enumerate(lines[:store_idx]) if "T.dma_copy(T.region(X_" in line and "T.sync_token_id(" in line
+    )
+    tile_store_loop_idx = next(
+        idx
+        for idx, line in enumerate(lines[input_dma_idx:store_idx], start=input_dma_idx)
+        if "for i in T.serial" in line and "tile.domain" in line
+    )
+    outer_loop_idx = max(idx for idx, line in enumerate(lines[:input_dma_idx]) if "for bx_1 in range" in line)
+
+    assert all(null_marker not in line for line in lines[outer_loop_idx:output_dma_idx])
+    assert any(wait_marker in line for line in lines[input_dma_idx:tile_store_loop_idx])
+    assert all(wait_marker not in line for line in lines[tile_store_loop_idx:output_dma_idx])
 
 
 def test_sunmmio_base_adapter_does_not_expose_sunsim_runtime_surface(tmp_path):

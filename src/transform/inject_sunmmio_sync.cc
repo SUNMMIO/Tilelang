@@ -917,8 +917,20 @@ private:
     }
   }
 
+  bool IsTokenInitializedByEnclosingLoop(int token) const {
+    for (const LoopScope &scope : loop_scopes_) {
+      if (scope.loop_entry_null_tokens.count(token) != 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   void InjectLoopEntryNullTokens(const LoopScope &scope, Array<Stmt> &stmts) {
     for (int token : scope.loop_entry_null_tokens) {
+      if (IsTokenInitializedByEnclosingLoop(token)) {
+        continue;
+      }
       stmts.push_back(Evaluate(Call(DataType::Handle(), sync_null_token(),
                                     {IntImm(DataType::Int(32), token)})));
     }
@@ -1867,6 +1879,9 @@ private:
   }
 
   void MarkTokenPending(int token_id) {
+    parent_token_ids_.erase(std::remove(parent_token_ids_.begin(),
+                                        parent_token_ids_.end(), token_id),
+                            parent_token_ids_.end());
     current_token_ids_.erase(std::remove(current_token_ids_.begin(),
                                          current_token_ids_.end(), token_id),
                              current_token_ids_.end());
@@ -2356,7 +2371,7 @@ private:
   }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
-    std::set<int> available_tokens;
+    std::set<int> available_tokens = available_tokens_;
 
     Array<Stmt> out;
     out.reserve(op->seq.size());

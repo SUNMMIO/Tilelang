@@ -1163,7 +1163,6 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
       // can be expressed with BufferLoad/Store.  On SunMMIO these values live
       // in vector-core tile registers and are lowered inside the Tiles scope as
       // SSA tiles, not as rsram memtensors.
-      RegisterBuffer(buffer, false);
     } else {
       std::string scope = GetAllocateStorageScope(op->buffer_var);
       EmitAlloc(buffer_it->second, scope, op->annotations);
@@ -1185,7 +1184,8 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateConstNode *op) {
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::DeclBufferNode *op) {
   EnterScope();
-  if (!IsSunmmioLocalVarBuffer(op->buffer)) {
+  if (!IsSunmmioLocalVarBuffer(op->buffer) &&
+      !IsSunmmioReduceRegisterTempBuffer(op->buffer)) {
     auto data_it = var_table_.find(op->buffer->data.get());
     RegisterBuffer(op->buffer, false,
                    data_it != var_table_.end() ? data_it->second.value

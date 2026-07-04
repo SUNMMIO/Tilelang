@@ -1125,6 +1125,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       lower_expr;
   std::function<void(const Stmt &, TileBlockState *)> lower_stmt;
   std::function<void(const Stmt &, TileBlockState *)> lower_reduce_stmt;
+  std::function<void(const CallNode *, TileBlockState *)>
+      lower_vector_core_in_tile_reduce;
 
   auto find_local_unit_axis_in_expr =
       [&](const PrimExpr &expr,
@@ -1339,12 +1341,6 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     SunMMIOType dst_tile_type = MakeTileType(dst_dtype, access.tile_shape);
     if (value.type.kind == SunMMIOType::Kind::kTile) {
       SunMMIOValue tile = value;
-      if (access.tile_rank == 1 && value.type.shape.size() == 2) {
-        SunMMIOType squeezed_type =
-            MakeTileType(access.buffer->dtype, access.tile_shape);
-        tile = builder_->TileSqueeze(NewValueName(), tile, squeezed_type,
-                                     access.unsqueeze_axis, dst_dtype);
-      }
       tile = reorient_unit_tile_to_shape(tile, access.tile_shape);
       if (ExtractStaticShape(tile.type) != access.tile_shape) {
         tile = broadcast_tile_to_shape(tile, access.tile_shape);
@@ -2807,8 +2803,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       SunMMIOValue data =
           lower_expr(arg, state,
                      force_f32 ? std::optional<DataType>(DataType::Float(32))
-                               : (supports_mixed_precision ? preferred_dtype
-                                                           : std::nullopt));
+                               : std::nullopt);
       if (!IsTileLike(data)) {
         UnsupportedExpr(
             expr.get(),
@@ -2936,7 +2931,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       if (op_node && call->args.size() == 1 && op_node->name == "tir.exp2") {
         PrimExpr scaled_arg = call->args[0] * FloatImm(call->args[0].dtype(),
                                                        0.69314718055994530942);
-        return emit_unary(TileUnaryOp::kExp, scaled_arg, call->dtype);
+        return emit_unary(TileUnaryOp::kExp, scaled_arg, call->dtype, true);
       }
       if (op_node && call->args.size() == 1 &&
           (op_node->name == "tir.fabs" || op_node->name == "tir.abs")) {
@@ -3031,6 +3026,31 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     if (IsTokenLikeTileStmt(stmt)) {
       return;
     }
+    if (const auto *ifs = stmt.as<IfThenElseNode>()) {
+      SunMMIOType bool_ty{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
+      SunMMIOValue cond =
+          EnsureType(EvalExpr(ifs->condition), bool_ty, DataType::Bool());
+      auto saved_cache = state->current_tile_values;
+      auto saved_registers = state->register_tile_values;
+      auto saved_locals = state->local_tile_values;
+      auto saved_local_axes = state->local_unit_tile_axes;
+
+      builder_->BeginIf(cond, std::vector<int64_t>{});
+      TileBlockState then_state = *state;
+      lower_stmt(ifs->then_case, &then_state);
+      if (ifs->else_case.defined()) {
+        builder_->BeginElse();
+        TileBlockState else_state = *state;
+        lower_stmt(ifs->else_case.value(), &else_state);
+      }
+      builder_->EndIf();
+
+      state->current_tile_values = saved_cache;
+      state->register_tile_values = saved_registers;
+      state->local_tile_values = saved_locals;
+      state->local_unit_tile_axes = saved_local_axes;
+      return;
+    }
     if (const auto *let = stmt.as<LetStmtNode>()) {
       SunMMIOValue value = lower_expr(let->value, state, std::nullopt);
       TileBlockState let_state = *state;
@@ -3049,7 +3069,6 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       if (buffer_it != buffer_data_to_buffer_.end() &&
           IsReduceRegisterTempBuffer(buffer_it->second)) {
         EnterScope();
-        RegisterBuffer(buffer_it->second, false);
         lower_reduce_stmt(alloc->body, state);
         ExitScope();
         return;
@@ -3061,7 +3080,6 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     if (const auto *decl = stmt.as<DeclBufferNode>()) {
       if (IsReduceRegisterTempBuffer(decl->buffer)) {
         EnterScope();
-        RegisterBuffer(decl->buffer, false);
         lower_reduce_stmt(decl->body, state);
         ExitScope();
         return;
@@ -3213,13 +3231,32 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       }
       return;
     }
+    if (const auto *eval = stmt.as<EvaluateNode>()) {
+      if (const auto *call = eval->value.as<CallNode>()) {
+        const auto *op_node = call->op.as<OpNode>();
+        if (op_node && op_node->name == "tl.vector_core_in_tile_reduce") {
+          lower_vector_core_in_tile_reduce(call, state);
+          return;
+        }
+        if (op_node && (op_node->name == "tl.barrier_init" ||
+                        op_node->name == "tl.barrier_arrive_and_wait")) {
+          (void)EvalExpr(eval->value);
+          return;
+        }
+        std::string op_name =
+            op_node ? std::string(op_node->name) : std::string("<non-op-call>");
+        UnsupportedStmt(eval, "Clean v4 tiles lowering does not support "
+                              "Evaluate call op `" +
+                                  op_name + "` inside T.Tiles");
+      }
+    }
     UnsupportedStmt(stmt.get(),
                     "Clean v4 tiles lowering currently supports only "
                     "SeqStmt/token Evaluate/BufferStore");
   };
 
-  auto lower_vector_core_in_tile_reduce = [&](const CallNode *call,
-                                              TileBlockState *state) {
+  lower_vector_core_in_tile_reduce = [&](const CallNode *call,
+                                         TileBlockState *state) {
     ICHECK_EQ(call->args.size(), 4U)
         << "tl.vector_core_in_tile_reduce expects predicate, dst region, src "
            "region, and axis";
@@ -3523,7 +3560,6 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       if (buffer_it != buffer_data_to_buffer_.end() &&
           IsReduceRegisterTempBuffer(buffer_it->second)) {
         EnterScope();
-        RegisterBuffer(buffer_it->second, false);
         lower_reduce_stmt(alloc->body, state);
         ExitScope();
         return;
@@ -3535,7 +3571,6 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     if (const auto *decl = stmt.as<DeclBufferNode>()) {
       if (IsReduceRegisterTempBuffer(decl->buffer)) {
         EnterScope();
-        RegisterBuffer(decl->buffer, false);
         lower_reduce_stmt(decl->body, state);
         ExitScope();
         return;

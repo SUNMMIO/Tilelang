@@ -19,8 +19,11 @@ SUNMMIO_TOOLCHAIN_ENV = "SUNMMIO_TOOLCHAIN"
 DEFAULT_NPUIR_OPT_ARGS = (
     "--verify-each",
     "-suvm-assign-dma-channels",
+    "-suvm-resolve-barriers",
     "-suvm-resolve-tokens",
     "-suvm-emit-kernel-abi",
+    "-suvm-canonicalize",
+    "-suvm-tile-split-unroll",
     "-convert-suvm-to-llvm",
     "-canonicalize",
     "-cse",

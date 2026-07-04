@@ -39,6 +39,7 @@ class SunmmioKernelABI:
 
     kernel_name: str
     public_arg_count: int
+    public_param_names: tuple[str, ...]
     device_param_names: tuple[str, ...]
     runtime_scalars: tuple[SunmmioRuntimeScalar, ...]
 
@@ -52,6 +53,7 @@ class SunmmioKernelABI:
     ) -> SunmmioKernelABI:
         prim_func = _get_primary_prim_func(func_or_mod)
         public_arg_count = len(params)
+        public_param_names = _collect_fallback_param_names(prim_func, public_arg_count)
 
         device_func, device_name = _get_device_prim_func(device_mod)
         host_func = _get_first_prim_func(host_mod)
@@ -62,33 +64,72 @@ class SunmmioKernelABI:
             kernel_name = _get_prim_func_symbol(prim_func)
 
         device_param_names = _collect_device_param_names(device_func)
+        if not device_param_names and host_call is not None:
+            device_param_names = _collect_call_arg_names(host_call)
         if not device_param_names:
-            device_param_names = _collect_fallback_param_names(prim_func, public_arg_count)
+            device_param_names = public_param_names
 
-        runtime_scalar_names = device_param_names[public_arg_count:]
+        public_param_name_set = set(public_param_names)
+        runtime_scalar_names = tuple(name for name in device_param_names if name not in public_param_name_set)
         if not runtime_scalar_names:
-            runtime_scalar_names = _collect_tensor_meta_runtime_scalar_names(prim_func, device_param_names[:public_arg_count])
+            runtime_scalar_names = _collect_tensor_meta_runtime_scalar_names(prim_func, public_param_names)
             if not runtime_scalar_names:
                 runtime_scalar_names = _collect_fallback_runtime_scalar_names(prim_func, public_arg_count)
             device_param_names = device_param_names + runtime_scalar_names
 
         metadata_func = host_func if host_func is not None else prim_func
-        symbol_sources = _collect_tensor_meta_symbol_sources(metadata_func, device_param_names[:public_arg_count])
+        symbol_sources = _collect_tensor_meta_symbol_sources(metadata_func, public_param_names)
         if not symbol_sources:
             symbol_sources = _collect_prim_func_symbol_sources(prim_func, public_arg_count)
 
-        scalar_exprs = _collect_runtime_scalar_exprs(host_call, public_arg_count, len(runtime_scalar_names))
-        if not scalar_exprs:
-            scalar_exprs = list(runtime_scalar_names)
+        scalar_exprs = _collect_runtime_scalar_exprs(host_call, device_param_names, runtime_scalar_names)
 
         runtime_scalars = _build_runtime_scalars(runtime_scalar_names, scalar_exprs, symbol_sources)
 
         return cls(
             kernel_name=kernel_name,
             public_arg_count=public_arg_count,
+            public_param_names=tuple(public_param_names),
             device_param_names=tuple(device_param_names),
             runtime_scalars=tuple(runtime_scalars),
         )
+
+    @classmethod
+    def from_json_dict(cls, data: dict[str, Any]) -> SunmmioKernelABI:
+        runtime_scalars = tuple(
+            SunmmioRuntimeScalar(
+                name=str(scalar["name"]),
+                source_param_index=scalar.get("source_param_index"),
+                source_kind=scalar.get("source_kind"),
+                source_dim=scalar.get("source_dim"),
+            )
+            for scalar in data.get("runtime_scalars", [])
+        )
+        public_param_names = tuple(str(name) for name in data.get("public_param_names", []))
+        return cls(
+            kernel_name=str(data["kernel_name"]),
+            public_arg_count=int(data.get("public_arg_count", len(public_param_names))),
+            public_param_names=public_param_names,
+            device_param_names=tuple(str(name) for name in data.get("device_param_names", public_param_names)),
+            runtime_scalars=runtime_scalars,
+        )
+
+    def to_json_dict(self) -> dict[str, Any]:
+        return {
+            "kernel_name": self.kernel_name,
+            "public_arg_count": self.public_arg_count,
+            "public_param_names": list(self.public_param_names),
+            "device_param_names": list(self.device_param_names),
+            "runtime_scalars": [
+                {
+                    "name": scalar.name,
+                    "source_param_index": scalar.source_param_index,
+                    "source_kind": scalar.source_kind,
+                    "source_dim": scalar.source_dim,
+                }
+                for scalar in self.runtime_scalars
+            ],
+        }
 
     @property
     def runtime_scalar_names(self) -> tuple[str, ...]:
@@ -114,32 +155,47 @@ class SunmmioKernelABI:
         metadata differently.
         """
 
-        if len(args) == self.full_arg_count:
-            return list(args)
-
-        if len(args) != self.public_arg_count:
+        if self.runtime_scalar_count and len(args) == self.full_arg_count:
+            public_values = args[: self.public_arg_count]
+            explicit_scalar_values = args[self.public_arg_count :]
+        elif len(args) == self.public_arg_count:
+            public_values = args
+            explicit_scalar_values = None
+        else:
             if self.runtime_scalar_count:
                 raise ValueError(
                     f"Sunmmio kernel expected {self.public_arg_count} public arguments "
-                    f"or {self.full_arg_count} explicit ABI arguments, got {len(args)}"
+                    f"or {self.full_arg_count} public arguments plus explicit scalar ABI arguments, got {len(args)}"
                 )
             raise ValueError(f"Sunmmio kernel expected {self.public_arg_count} arguments, got {len(args)}")
 
-        missing = [scalar.name for scalar in self.runtime_scalars if not scalar.is_bound]
-        if missing:
-            missing_names = ", ".join(missing)
-            raise ValueError(
-                "Sunmmio kernel has hidden scalar ABI arguments that cannot be inferred "
-                f"from tensor shape/stride metadata: {missing_names}. Pass explicit ABI arguments."
-            )
+        scalar_values: dict[str, Any] = {}
+        if explicit_scalar_values is not None:
+            scalar_values = dict(zip(self.runtime_scalar_names, explicit_scalar_values))
+        else:
+            missing = [scalar.name for scalar in self.runtime_scalars if not scalar.is_bound]
+            if missing:
+                missing_names = ", ".join(missing)
+                raise ValueError(
+                    "Sunmmio kernel has hidden scalar ABI arguments that cannot be inferred "
+                    f"from tensor shape/stride metadata: {missing_names}. Pass explicit scalar ABI arguments after the public arguments."
+                )
+            for scalar in self.runtime_scalars:
+                assert scalar.source_param_index is not None
+                assert scalar.source_kind is not None
+                assert scalar.source_dim is not None
+                source_arg = public_values[scalar.source_param_index]
+                scalar_values[scalar.name] = resolve_binding(source_arg, scalar.source_kind, scalar.source_dim)
 
-        runtime_args = list(args)
-        for scalar in self.runtime_scalars:
-            assert scalar.source_param_index is not None
-            assert scalar.source_kind is not None
-            assert scalar.source_dim is not None
-            source_arg = args[scalar.source_param_index]
-            runtime_args.append(resolve_binding(source_arg, scalar.source_kind, scalar.source_dim))
+        public_args = _build_public_arg_map(self.public_param_names, public_values)
+        runtime_args = []
+        for name in self.device_param_names:
+            if name in public_args:
+                runtime_args.append(public_args[name])
+            elif name in scalar_values:
+                runtime_args.append(scalar_values[name])
+            else:
+                raise ValueError(f"Cannot materialize Sunmmio device ABI argument {name!r}.")
         return runtime_args
 
 
@@ -210,6 +266,22 @@ def _collect_device_param_names(func: tir.PrimFunc | None) -> tuple[str, ...]:
         else:
             names.append(f"arg{index}")
     return tuple(names)
+
+
+def _collect_call_arg_names(host_call: _HostKernelCall) -> tuple[str, ...]:
+    names = []
+    for arg in host_call.args:
+        name = _expr_name(arg)
+        if name is None:
+            return ()
+        names.append(name)
+    return tuple(names)
+
+
+def _expr_name(expr: Any) -> str | None:
+    if isinstance(expr, tir.Var):
+        return expr.name
+    return _string_value(expr)
 
 
 def _collect_fallback_param_names(func: tir.PrimFunc, public_arg_count: int) -> tuple[str, ...]:
@@ -320,10 +392,18 @@ def _string_value(value: Any) -> str | None:
     return None
 
 
-def _collect_runtime_scalar_exprs(host_call: _HostKernelCall | None, public_arg_count: int, runtime_scalar_count: int) -> list[Any]:
-    if host_call is None or runtime_scalar_count == 0:
+def _collect_runtime_scalar_exprs(
+    host_call: _HostKernelCall | None,
+    device_param_names: Sequence[str],
+    runtime_scalar_names: Sequence[str],
+) -> list[Any]:
+    if not runtime_scalar_names:
         return []
-    return list(host_call.args[public_arg_count : public_arg_count + runtime_scalar_count])
+    if host_call is None:
+        return list(runtime_scalar_names)
+
+    expr_by_name = {name: host_call.args[index] for index, name in enumerate(device_param_names) if index < len(host_call.args)}
+    return [expr_by_name.get(name, name) for name in runtime_scalar_names]
 
 
 def _collect_tensor_meta_symbol_sources(
@@ -423,3 +503,12 @@ def _lookup_symbol_source(
         if name in symbol_sources:
             return symbol_sources[name]
     return None
+
+
+def _build_public_arg_map(public_param_names: Sequence[str], args: Sequence[Any]) -> dict[str, Any]:
+    public_args: dict[str, Any] = {}
+    for index, name in enumerate(public_param_names):
+        if name in public_args:
+            raise ValueError(f"Duplicate Sunmmio public ABI argument name {name!r}.")
+        public_args[name] = args[index]
+    return public_args
