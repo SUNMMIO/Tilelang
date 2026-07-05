@@ -54,6 +54,46 @@ public:
     return StmtExprMutator::VisitExpr_(op);
   }
 
+  // Loop/block annotations (e.g. `tile.domain`) can embed mesh symbols but are
+  // not visited by the default mutator, so resolve any PrimExprs inside them.
+  // Annotation values are `ffi::Any`; `as<>` is a strict no-conversion check
+  // that misses type-erased containers, so use `try_cast` for the array case.
+  ffi::Any ResolveAnnotationValue(const ffi::Any &value) {
+    if (auto arr = value.try_cast<Array<PrimExpr>>()) {
+      Array<PrimExpr> resolved;
+      resolved.reserve(arr->size());
+      bool changed = false;
+      for (const auto &elem : arr.value()) {
+        PrimExpr resolved_elem = VisitExpr(elem);
+        changed = changed || !resolved_elem.same_as(elem);
+        resolved.push_back(resolved_elem);
+      }
+      return changed ? ffi::Any(resolved) : value;
+    }
+    if (auto expr = value.as<PrimExpr>()) {
+      PrimExpr resolved_expr = VisitExpr(expr.value());
+      return resolved_expr.same_as(expr.value()) ? value
+                                                 : ffi::Any(resolved_expr);
+    }
+    return value;
+  }
+
+  Map<String, ffi::Any> ResolveAnnotations(const Map<String, ffi::Any> &ann) {
+    Map<String, ffi::Any> resolved;
+    for (const auto &[key, value] : ann) {
+      resolved.Set(key, ResolveAnnotationValue(value));
+    }
+    return resolved;
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    For loop = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+    if (!loop->annotations.empty()) {
+      loop.CopyOnWrite()->annotations = ResolveAnnotations(loop->annotations);
+    }
+    return loop;
+  }
+
   Buffer ResolveBuffer(const Buffer &buffer) {
     auto it = buffer_cache_.find(buffer.get());
     if (it != buffer_cache_.end()) {
@@ -130,6 +170,15 @@ public:
       for (const auto &[key, value] : entry.value()) {
         if (auto layout = value.as<Layout>()) {
           resolved_entry.Set(key, ResolveLayout(layout.value()));
+        } else if (auto expr = value.as<PrimExpr>()) {
+          resolved_entry.Set(key, VisitExpr(expr.value()));
+        } else if (auto arr = value.as<Array<PrimExpr>>()) {
+          Array<PrimExpr> resolved_arr;
+          resolved_arr.reserve(arr.value().size());
+          for (const auto &elem : arr.value()) {
+            resolved_arr.push_back(VisitExpr(elem));
+          }
+          resolved_entry.Set(key, resolved_arr);
         } else {
           resolved_entry.Set(key, value);
         }
@@ -207,6 +256,10 @@ public:
           MatchBufferRegion(buffer, ResolveBufferRegion(match_buffer->source)));
     }
     node->match_buffers = std::move(match_buffers);
+
+    if (!node->annotations.empty()) {
+      node->annotations = ResolveAnnotations(node->annotations);
+    }
 
     return block;
   }
