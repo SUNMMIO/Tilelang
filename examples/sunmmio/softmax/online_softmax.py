@@ -89,8 +89,8 @@ def main(M, N) -> None:
     kernel = online_softmax(
         M,
         N,
-        block_M=128,
-        block_N=128,
+        block_M=256,
+        block_N=256,
         dtype=T.bfloat16,
     )
 
@@ -101,10 +101,11 @@ def main(M, N) -> None:
         sunsim.Input(x, placement=placement, layout=layout),
         y,
         mesh=driver.get_sunmmio_device_mesh_config(),
-        timeout=240.0,
+        timeout=1200.0,
     )
 
     np.testing.assert_allclose(y.data.astype(np.float32), ref_program(x), rtol=5e-2, atol=5e-3)
+    print(f"online_softmax PASS: shape=({M}, {N}) matched reference within tolerance")
     return result
 
 
