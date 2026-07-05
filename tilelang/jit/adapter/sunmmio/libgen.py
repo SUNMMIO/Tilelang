@@ -16,23 +16,6 @@ from tilelang.jit.adapter.libgen import LibraryGenerator
 
 SUNMMIO_TOOLCHAIN_ENV = "SUNMMIO_TOOLCHAIN"
 
-DEFAULT_NPUIR_OPT_ARGS = (
-    "--verify-each",
-    "-suvm-assign-dma-channels",
-    "-suvm-resolve-barriers",
-    "-suvm-resolve-tokens",
-    "-suvm-emit-kernel-abi",
-    "-suvm-canonicalize",
-    "-suvm-tile-split-unroll",
-    "-convert-suvm-to-llvm",
-    "-canonicalize",
-    "-cse",
-    "-convert-scf-to-cf",
-    "-convert-arith-to-llvm",
-    "-convert-cf-to-llvm",
-    "-reconcile-unrealized-casts",
-)
-
 SUNMMIO_CLANG_CFLAGS = (
     "--target=riscv64-sunmmio-elf",
     "-O2",
@@ -203,36 +186,32 @@ def _find_existing_path(
     raise FileNotFoundError(f"{description} not found. Checked:\n{checked}")
 
 
+def find_npuir_tool(name: str) -> Path:
+    candidates = [Path(bin_dir) / name for bin_dir in TL_BINS]
+
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+
+    checked = "\n".join(str(candidate.resolve()) for candidate in candidates)
+    raise FileNotFoundError(
+        f"{name} executable not found in TileLang binary directories. Rebuild TileLang with USE_SUNMMIO=ON "
+        f"or install a Sunmmio-enabled TileLang package that includes NPU-IR tools. Checked:\n{checked}"
+    )
+
+
 @dataclass(frozen=True)
 class NpuirTools:
-    opt: Path
-    translate: Path
+    compile: Path
 
     @classmethod
     def resolve(cls) -> NpuirTools:
-        return cls(
-            opt=cls._find_tool("npuir-opt"),
-            translate=cls._find_tool("npuir-translate"),
-        )
-
-    @staticmethod
-    def _find_tool(name: str) -> Path:
-        candidates = [Path(bin_dir) / name for bin_dir in TL_BINS]
-
-        seen = set()
-        for candidate in candidates:
-            candidate = candidate.resolve()
-            if candidate in seen:
-                continue
-            seen.add(candidate)
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return candidate
-
-        checked = "\n".join(str(candidate.resolve()) for candidate in candidates)
-        raise FileNotFoundError(
-            f"{name} executable not found in TileLang binary directories. Rebuild TileLang with USE_SUNMMIO=ON "
-            f"or install a Sunmmio-enabled TileLang package that includes NPU-IR tools. Checked:\n{checked}"
-        )
+        return cls(compile=find_npuir_tool("npuir-compile"))
 
 
 @dataclass(frozen=True)
@@ -256,11 +235,6 @@ class SunmmioToolchain:
 
     def cflags(self) -> list[str]:
         return list(SUNMMIO_CLANG_CFLAGS)
-
-
-def _sanitize_llvm_ir_for_sunmmio_toolchain(llvm_ir: str) -> str:
-    # The current zpu clang is LLVM 17 and does not accept LLVM-19+ GEP hint flags.
-    return llvm_ir.replace("getelementptr inbounds nuw", "getelementptr inbounds").replace("getelementptr nuw", "getelementptr")
 
 
 def _split_compile_flags(compile_flags: list[str] | None, existing: Sequence[str]) -> list[str]:
@@ -400,13 +374,8 @@ class SunmmioLibraryGenerator(LibraryGenerator):
         if hasattr(self, "runtime_kernel_name"):
             self.runtime_kernel_name = runtime_kernel_name
 
-    def materialize_llvm_ir(
-        self,
-        output_path: PathLike | None = None,
-        *,
-        opt_args: Sequence[str] = DEFAULT_NPUIR_OPT_ARGS,
-    ) -> str:
-        """Lower the generated SUVM MLIR source to LLVM IR with NPU-IR tools."""
+    def materialize_llvm_ir(self, output_path: PathLike | None = None) -> str:
+        """Lower the generated SUVM MLIR source to LLVM IR with npuir-compile."""
 
         if not self.mlir_source.strip():
             raise ValueError("Sunmmio kernel has no SUVM MLIR source to lower")
@@ -417,12 +386,10 @@ class SunmmioLibraryGenerator(LibraryGenerator):
         with tempfile.TemporaryDirectory(prefix="tilelang-sunmmio-") as tmp_dir:
             input_path = Path(tmp_dir) / "kernel.mlir"
             input_path.write_text(self.mlir_source, encoding="utf-8")
-            llvm_dialect = self._run_npuir_opt(tools, input_path, opt_args)
-            llvm_ir = self._run_npuir_translate(tools, llvm_dialect, output)
-            llvm_ir = _sanitize_llvm_ir_for_sunmmio_toolchain(llvm_ir)
-            if output is not None:
-                output.write_text(llvm_ir, encoding="utf-8")
-            return llvm_ir
+            llvm_path = output if output is not None else Path(tmp_dir) / "kernel.ll"
+            llvm_path.parent.mkdir(parents=True, exist_ok=True)
+            self._run_npuir_compile(tools, input_path, llvm_path)
+            return llvm_path.read_text(encoding="utf-8")
 
     def _compile_kernel_obj(
         self,
@@ -439,25 +406,16 @@ class SunmmioLibraryGenerator(LibraryGenerator):
         )
         return kernel_obj
 
-    def _run_npuir_opt(self, tools: NpuirTools, input_path: Path, opt_args: Sequence[str]) -> str:
-        command = [str(tools.opt), str(input_path), *opt_args]
-        return _run_command(
-            command,
-            description=f"npuir-opt failed while lowering Sunmmio SUVM MLIR\nmlir: {input_path}",
-        ).stdout
-
-    def _run_npuir_translate(self, tools: NpuirTools, llvm_dialect: str, output: Path | None) -> str:
-        command = [str(tools.translate), "--mlir-to-llvmir"]
-        if output is not None:
-            output.parent.mkdir(parents=True, exist_ok=True)
-            command.extend(["-o", str(output)])
-
-        result = _run_command(
-            command,
-            input_text=llvm_dialect,
-            description="npuir-translate failed while translating Sunmmio LLVM dialect",
-        )
-        return output.read_text(encoding="utf-8") if output is not None else result.stdout
+    def _run_npuir_compile(self, tools: NpuirTools, input_path: Path, output_path: Path) -> None:
+        command = [
+            str(tools.compile),
+            f"--target={_target_mcpu(self.target)}",
+            "--emit=llvm-ir",
+            str(input_path),
+            "-o",
+            str(output_path),
+        ]
+        _run_command(command, description=f"npuir-compile failed while lowering Sunmmio SUVM MLIR\nmlir: {input_path}")
 
     def compile_lib(self, timeout: float | None = None):
         raise NotImplementedError("SunmmioLibraryGenerator only lowers to LLVM IR; use a runtime-specific generator.")
