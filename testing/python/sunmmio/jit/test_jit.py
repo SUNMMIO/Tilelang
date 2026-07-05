@@ -127,6 +127,82 @@ def test_sunmmio_abi_reorders_public_args_before_hidden_scalars():
     assert abi.materialize_runtime_args([x, lse, y, 512], lambda *_: None) == [lse, x, y, 512]
 
 
+def test_sunmmio_abi_rejects_public_arg_count_mismatch():
+    with pytest.raises(ValueError, match="public_arg_count"):
+        SunmmioKernelABI(
+            kernel_name="k",
+            public_arg_count=3,
+            public_param_names=("X", "Y"),
+            device_param_names=("X", "Y"),
+            runtime_scalars=(),
+        )
+
+
+def test_sunmmio_abi_rejects_duplicate_public_names():
+    with pytest.raises(ValueError, match="duplicate public"):
+        SunmmioKernelABI(
+            kernel_name="k",
+            public_arg_count=2,
+            public_param_names=("X", "X"),
+            device_param_names=("X", "X"),
+            runtime_scalars=(),
+        )
+
+
+def test_sunmmio_abi_rejects_duplicate_scalar_names():
+    with pytest.raises(ValueError, match="duplicate scalar"):
+        SunmmioKernelABI(
+            kernel_name="k",
+            public_arg_count=1,
+            public_param_names=("X",),
+            device_param_names=("X", "m"),
+            runtime_scalars=(
+                SunmmioRuntimeScalar("m", source_param_index=0, source_kind="shape", source_dim=0),
+                SunmmioRuntimeScalar("m", source_param_index=0, source_kind="shape", source_dim=1),
+            ),
+        )
+
+
+def test_sunmmio_abi_rejects_public_scalar_name_collision():
+    with pytest.raises(ValueError, match="collide"):
+        SunmmioKernelABI(
+            kernel_name="k",
+            public_arg_count=1,
+            public_param_names=("m",),
+            device_param_names=("m",),
+            runtime_scalars=(SunmmioRuntimeScalar("m", source_param_index=0, source_kind="shape", source_dim=0),),
+        )
+
+
+def test_sunmmio_abi_rejects_non_permutation_device_order():
+    with pytest.raises(ValueError, match="not a permutation"):
+        SunmmioKernelABI(
+            kernel_name="k",
+            public_arg_count=2,
+            public_param_names=("X", "Y"),
+            device_param_names=("X", "Z"),
+            runtime_scalars=(),
+        )
+
+
+def test_sunmmio_runtime_scalar_rejects_partial_source():
+    with pytest.raises(ValueError, match="partial source binding"):
+        SunmmioRuntimeScalar("m", source_param_index=0, source_kind="shape")
+
+
+def test_sunmmio_abi_from_json_dict_rejects_inconsistent_metadata():
+    with pytest.raises(ValueError, match="not a permutation"):
+        SunmmioKernelABI.from_json_dict(
+            {
+                "kernel_name": "k",
+                "public_arg_count": 2,
+                "public_param_names": ["X", "Y"],
+                "device_param_names": ["X", "Z"],
+                "runtime_scalars": [],
+            }
+        )
+
+
 def test_sunmmio_abi_from_modules_preserves_public_and_device_orders():
     x_buffer = tvm.tir.decl_buffer((128, 128), "bfloat16", name="X")
     lse_buffer = tvm.tir.decl_buffer((128, 128), "float32", name="LSE")

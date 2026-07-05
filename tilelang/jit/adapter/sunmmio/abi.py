@@ -23,6 +23,13 @@ class SunmmioRuntimeScalar:
     source_kind: RuntimeScalarSourceKind | None = None
     source_dim: int | None = None
 
+    def __post_init__(self) -> None:
+        source = (self.source_param_index, self.source_kind, self.source_dim)
+        if any(field is not None for field in source) and not all(field is not None for field in source):
+            raise ValueError(
+                f"Sunmmio runtime scalar {self.name!r} has a partial source binding {source}; set all three source fields or none."
+            )
+
     @property
     def is_bound(self) -> bool:
         return self.source_param_index is not None and self.source_kind is not None and self.source_dim is not None
@@ -43,6 +50,27 @@ class SunmmioKernelABI:
     device_param_names: tuple[str, ...]
     runtime_scalars: tuple[SunmmioRuntimeScalar, ...]
 
+    def __post_init__(self) -> None:
+        # Names are the reconciliation key, so they must be unique within each
+        # group, and the device order must be a permutation of public + scalars.
+        if len(self.public_param_names) != self.public_arg_count:
+            raise ValueError(
+                f"Sunmmio ABI has {len(self.public_param_names)} public param names but public_arg_count={self.public_arg_count}."
+            )
+        scalar_names = self.runtime_scalar_names
+        for group, names in (("public", self.public_param_names), ("scalar", scalar_names)):
+            if len(set(names)) != len(names):
+                raise ValueError(f"Sunmmio ABI has duplicate {group} param names: {names}.")
+        overlap = set(self.public_param_names) & set(scalar_names)
+        if overlap:
+            raise ValueError(f"Sunmmio ABI public and scalar names collide: {sorted(overlap)}.")
+        known = set(self.public_param_names) | set(scalar_names)
+        if len(self.device_param_names) != self.full_arg_count or set(self.device_param_names) != known:
+            raise ValueError(
+                f"Sunmmio device param names {self.device_param_names} are not a permutation of "
+                f"public + scalar names {tuple(sorted(known))}."
+            )
+
     @classmethod
     def from_modules(
         cls,
@@ -51,24 +79,40 @@ class SunmmioKernelABI:
         device_mod: tvm.IRModule | None,
         params: Sequence[KernelParam],
     ) -> SunmmioKernelABI:
+        """Reconstruct the device-call ABI from the lowered modules.
+
+        SplitHostDevice reorders the device kernel's params (sorted by name)
+        relative to the public signature, so we recover the device order and the
+        hidden scalar dims, plus how to compute each scalar from a public tensor.
+        """
+
+        # Public (Python-facing) side: arg count and param names.
         prim_func = _get_primary_prim_func(func_or_mod)
         public_arg_count = len(params)
         public_param_names = _collect_fallback_param_names(prim_func, public_arg_count)
 
+        # Locate the device kernel and the host-side call that invokes it;
+        # `host_call.args` are in device order too.
         device_func, device_name = _get_device_prim_func(device_mod)
         host_func = _get_first_prim_func(host_mod)
         host_call = _find_host_kernel_call(host_func, device_name)
 
+        # Entry symbol the runtime looks up: call site -> device symbol -> global symbol.
         kernel_name = host_call.name if host_call is not None else device_name
         if kernel_name is None:
             kernel_name = _get_prim_func_symbol(prim_func)
 
+        # Device param order (the permutation materialize_runtime_args inverts by
+        # name): from the device func, else the host call args, else no reorder.
         device_param_names = _collect_device_param_names(device_func)
         if not device_param_names and host_call is not None:
             device_param_names = _collect_call_arg_names(host_call)
         if not device_param_names:
             device_param_names = public_param_names
 
+        # Hidden scalars = device params that aren't public tensors (dynamic dims).
+        # If the device order carries none, derive the dim names from tensor_meta
+        # (else raw buffer shapes/strides) and append them to the device order.
         public_param_name_set = set(public_param_names)
         runtime_scalar_names = tuple(name for name in device_param_names if name not in public_param_name_set)
         if not runtime_scalar_names:
@@ -77,13 +121,14 @@ class SunmmioKernelABI:
                 runtime_scalar_names = _collect_fallback_runtime_scalar_names(prim_func, public_arg_count)
             device_param_names = device_param_names + runtime_scalar_names
 
+        # How to read each dynamic dim at runtime: name -> (tensor, shape/stride, dim).
         metadata_func = host_func if host_func is not None else prim_func
         symbol_sources = _collect_tensor_meta_symbol_sources(metadata_func, public_param_names)
         if not symbol_sources:
             symbol_sources = _collect_prim_func_symbol_sources(prim_func, public_arg_count)
 
+        # Bind each scalar to its source (unbound -> must be passed explicitly at call time).
         scalar_exprs = _collect_runtime_scalar_exprs(host_call, device_param_names, runtime_scalar_names)
-
         runtime_scalars = _build_runtime_scalars(runtime_scalar_names, scalar_exprs, symbol_sources)
 
         return cls(
@@ -152,7 +197,8 @@ class SunmmioKernelABI:
 
         `resolve_binding` is supplied by the runtime adapter because sunsim
         markers, torch tensors, and torch-sunmmio tensors expose shape/stride
-        metadata differently.
+        metadata differently. Explicit scalar arguments, when supplied, follow the
+        public arguments in ``runtime_scalar_names`` order.
         """
 
         if self.runtime_scalar_count and len(args) == self.full_arg_count:

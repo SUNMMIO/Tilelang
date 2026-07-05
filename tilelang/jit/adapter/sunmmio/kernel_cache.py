@@ -115,5 +115,9 @@ class SunmmioKernelCache(KernelCache):
         if {"public_arg_count", "public_param_names", "device_param_names", "runtime_scalars"}.issubset(metadata):
             from tilelang.jit.adapter.sunmmio import SunmmioKernelABI
 
-            return SunmmioKernelABI.from_json_dict(metadata), kernel_name
+            try:
+                return SunmmioKernelABI.from_json_dict(metadata), kernel_name
+            except ValueError:
+                # Stale/corrupt cached ABI: treat as a cache miss and recompile.
+                self.logger.warning("Ignoring inconsistent cached Sunmmio ABI metadata; recompiling")
         return None, kernel_name
