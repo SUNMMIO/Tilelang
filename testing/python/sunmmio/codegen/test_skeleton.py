@@ -247,6 +247,24 @@ def make_reusable_barrier_kernel():
 
 @target("Sunmmio")
 def make_dynamic_barrier_kernel():
+    mask = tvm.tir.Var("mask", "int64")
+    barrier_init = tvm.tir.Call("handle", tvm.ir.Op.get("tl.barrier_init"), [mask])
+    barrier_wait = tvm.tir.Call(
+        "handle",
+        tvm.ir.Op.get("tl.barrier_arrive_and_wait"),
+        [mask],
+    )
+    stmt = tvm.tir.SeqStmt(
+        [
+            tvm.tir.Evaluate(barrier_init),
+            tvm.tir.Evaluate(barrier_wait),
+        ]
+    )
+    return _to_device_kernel_func(tvm.tir.PrimFunc([mask], stmt))
+
+
+@target("Sunmmio")
+def make_dynamic_barrier_candidates_kernel():
     bx = tvm.tir.Var("bx", "int32")
     bx_i64 = tvm.tir.Cast("int64", bx)
     mask = tvm.tir.shift_left(
@@ -386,8 +404,18 @@ def test_sunmmio_codegen_lowers_reusable_barrier():
     assert "sunmmio.fake" not in src
 
 
-def test_sunmmio_codegen_lowers_dynamic_barrier_candidates():
+def test_sunmmio_codegen_lowers_dynamic_barrier_mask():
     src = build_sunmmio_source_without_compile(make_dynamic_barrier_kernel())
+    assert "suvm.barrier.init mask = %" in src
+    assert " : i64 -> !suvm.barrier" in src
+    assert src.count("suvm.barrier.init") == 1
+    assert src.count("suvm.barrier.arrive_and_wait") == 1
+    assert "cf.assert" not in src
+    assert "sunmmio.fake" not in src
+
+
+def test_sunmmio_codegen_lowers_dynamic_barrier_candidates():
+    src = build_sunmmio_source_without_compile(make_dynamic_barrier_candidates_kernel())
     for mask in [15, 240, 3840, 61440]:
         assert f"suvm.barrier.init mask = {mask} : !suvm.barrier" in src
     assert src.count("suvm.barrier.init") == 4

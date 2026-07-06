@@ -37,7 +37,8 @@ struct SunmmioMlirContext {
   std::vector<MLIRValueTable> mlir_value_table_stack;
 
   std::unordered_map<int64_t, mlir::Value> token_by_id;
-  std::unordered_map<int64_t, mlir::Value> barrier_by_mask;
+  std::unordered_map<std::string, mlir::Value> barrier_by_mask;
+  std::unordered_map<int64_t, mlir::Value> static_barrier_by_mask;
 
   struct SavedToken {
     bool existed{false};
@@ -128,6 +129,7 @@ struct SunmmioMlirContext {
     mlir_value_table_stack.clear();
     token_by_id.clear();
     barrier_by_mask.clear();
+    static_barrier_by_mask.clear();
     for_stack.clear();
     if_stack.clear();
     while_stack.clear();

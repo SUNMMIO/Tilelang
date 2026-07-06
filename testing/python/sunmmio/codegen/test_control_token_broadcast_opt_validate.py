@@ -276,6 +276,36 @@ def test_barrier_state_does_not_leak_between_functions():
         _build_sunmmio_source_from_module(mod)
 
 
+def test_dynamic_barrier_mask_codegen_validates_with_npuir_opt(tmp_path):
+    mask = tvm.tir.Var("mask", "int64")
+    barrier_init = tvm.tir.Call("handle", tvm.ir.Op.get("tl.barrier_init"), [mask])
+    barrier_wait = tvm.tir.Call(
+        "handle",
+        tvm.ir.Op.get("tl.barrier_arrive_and_wait"),
+        [mask],
+    )
+    stmt = tvm.tir.SeqStmt(
+        [
+            tvm.tir.Evaluate(barrier_init),
+            tvm.tir.Evaluate(barrier_wait),
+        ]
+    )
+
+    src = _validate_stmt_codegen(
+        stmt,
+        tmp_path,
+        params=[mask],
+        mlir_filename="dynamic_barrier_mask_suvm.mlir",
+        expected_tokens=("suvm.barrier.init", "suvm.barrier.arrive_and_wait"),
+    )
+
+    assert "suvm.barrier.init mask = %" in src
+    assert " : i64 -> !suvm.barrier" in src
+    assert src.count("suvm.barrier.init") == 1
+    assert src.count("suvm.barrier.arrive_and_wait") == 1
+    assert "cf.assert" not in src
+
+
 def test_dynamic_barrier_candidates_codegen_validates_with_npuir_opt(tmp_path):
     bx = tvm.tir.Var("bx", "int32")
     bx_i64 = tvm.tir.Cast("int64", bx)

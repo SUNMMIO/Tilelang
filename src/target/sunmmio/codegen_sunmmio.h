@@ -37,6 +37,7 @@ constexpr const char *kTransB = "trans_b";
 constexpr const char *kClearAccum = "clear_accum";
 constexpr const char *kParticipantMask = "participant_mask";
 constexpr const char *kCandidateMasks = "candidate_masks";
+constexpr const char *kBarrierMaskKey = "barrier_mask_key";
 } // namespace SunMMIOCallAttrKey
 
 enum class TileUnaryOp {

@@ -811,8 +811,8 @@ def test_sunmmio_elementwise_sync_waits_are_not_duplicated():
     static_multi_source = static_multi_artifact.device_mod.script()
 
     assert static_multi_source.count("T.dma_copy") == 3
-    assert static_multi_source.count("T.wait_token(0)") == 2
-    assert static_multi_source.count("T.wait_token(1)") == 2
+    assert static_multi_source.count("T.wait_token(0)") == 1
+    assert static_multi_source.count("T.wait_token(1)") == 1
     assert static_multi_source.count("T.wait_token(2)") == 2
     assert "T.sync_null_token(2)" in static_multi_source
 
@@ -832,8 +832,8 @@ def test_sunmmio_elementwise_sync_waits_are_not_duplicated():
     dynamic_source = dynamic_artifact.device_mod.script()
 
     assert dynamic_source.count("T.dma_copy") == 3
-    assert dynamic_source.count("T.wait_token(0)") == 2
-    assert dynamic_source.count("T.wait_token(1)") == 2
+    assert dynamic_source.count("T.wait_token(0)") == 1
+    assert dynamic_source.count("T.wait_token(1)") == 1
     assert dynamic_source.count("T.wait_token(2)") == 2
     assert "T.sync_null_token(2)" in dynamic_source
 
