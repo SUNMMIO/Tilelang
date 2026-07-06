@@ -422,23 +422,22 @@ def prim_expr_equal(lhs, rhs) -> bool:
     return tir.analysis.expr_deep_equal(lhs, rhs)
 
 
-_MESH_SYMBOL_OP_NAMES = ("tl.mesh_nrows", "tl.mesh_ncols", "tl.mesh_ncores")
-
-
 def prim_expr_contains_mesh_symbol(expr) -> bool:
-    """Return whether an expression contains a symbolic Sunmmio mesh builtin."""
+    """Return whether an expression contains a symbolic Sunmmio mesh SizeVar."""
     if isinstance(expr, int) or not isinstance(expr, tir.PrimExpr):
         return False
 
-    mesh_ops = [tir.op.Op.get(name) for name in _MESH_SYMBOL_OP_NAMES]
+    from tilelang.language.mesh_symbols import mesh_ncols, mesh_nrows
+
+    mesh_vars = (mesh_nrows(), mesh_ncols())
     found = False
 
     def visit(node):
         nonlocal found
-        if found or not isinstance(node, tir.Call):
+        if found or not isinstance(node, tir.Var):
             return
-        for op in mesh_ops:
-            if hasattr(node.op, "same_as") and node.op.same_as(op):
+        for var in mesh_vars:
+            if node.same_as(var):
                 found = True
                 return
 
