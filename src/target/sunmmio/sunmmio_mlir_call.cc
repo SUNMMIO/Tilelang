@@ -159,6 +159,12 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
   auto parse_candidate_masks = [&]() -> std::vector<int64_t> {
     return get_int_vector_attr(SunMMIOCallAttrKey::kCandidateMasks);
   };
+  auto parse_barrier_mask_key = [&]() -> std::string {
+    std::optional<std::string> key =
+        get_string_attr(SunMMIOCallAttrKey::kBarrierMaskKey);
+    ICHECK(key.has_value()) << "barrier call requires barrier_mask_key attr";
+    return *key;
+  };
   auto ensure_i64 = [&](mlir::Value value,
                         const char *arg_name) -> mlir::Value {
     ICHECK(value) << arg_name << " is missing";
@@ -261,17 +267,37 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     LOG(FATAL) << arg_name << " is missing from attrs";
     TVM_FFI_UNREACHABLE();
   };
-  auto ensure_barrier_for_mask = [&](int64_t mask) -> mlir::Value {
+  auto ensure_static_barrier_for_mask = [&](int64_t mask) -> mlir::Value {
     ICHECK_GE(mask, 0) << "barrier participant_mask must be non-negative";
-    auto it = ctx_.barrier_by_mask.find(mask);
-    if (it != ctx_.barrier_by_mask.end() && it->second) {
+    auto it = ctx_.static_barrier_by_mask.find(mask);
+    if (it != ctx_.static_barrier_by_mask.end() && it->second) {
       return it->second;
     }
     mlir::IntegerAttr mask_attr = ctx_.builder.getI64IntegerAttr(mask);
     auto barrier_op = mlir::suvm::BarrierInitOp::create(
         ctx_.builder, type.MakeDebugLoc("barrier_init"), mlir::Value{},
         mask_attr);
-    ctx_.barrier_by_mask[mask] = barrier_op.getBarrier();
+    ctx_.static_barrier_by_mask[mask] = barrier_op.getBarrier();
+    return barrier_op.getBarrier();
+  };
+  auto lookup_static_barrier_for_mask = [&](int64_t mask) -> mlir::Value {
+    auto it = ctx_.static_barrier_by_mask.find(mask);
+    ICHECK(it != ctx_.static_barrier_by_mask.end() && it->second)
+        << "tl.barrier_arrive_and_wait candidate_mask=" << mask
+        << " has no corresponding tl.barrier_init.";
+    return it->second;
+  };
+  auto ensure_dynamic_barrier_for_mask =
+      [&](mlir::Value mask, const std::string &key) -> mlir::Value {
+    mask = ensure_i64(mask, "tl.barrier_init mask");
+    auto it = ctx_.barrier_by_mask.find(key);
+    if (it != ctx_.barrier_by_mask.end() && it->second) {
+      return it->second;
+    }
+    auto barrier_op = mlir::suvm::BarrierInitOp::create(
+        ctx_.builder, type.MakeDebugLoc("barrier_init"), mask,
+        mlir::IntegerAttr{});
+    ctx_.barrier_by_mask[key] = barrier_op.getBarrier();
     return barrier_op.getBarrier();
   };
   auto emit_barrier_arrive_and_wait = [&](mlir::Value barrier) {
@@ -279,47 +305,51 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         ctx_.builder, type.MakeDebugLoc("barrier_arrive_and_wait"), barrier,
         mlir::IntegerAttr{});
   };
-  auto emit_dynamic_barrier_wait = [&](mlir::Value dynamic_mask,
-                                       const std::vector<int64_t> &candidates) {
-    ICHECK(dynamic_mask) << "dynamic barrier mask is missing";
-    ICHECK(!candidates.empty())
-        << "dynamic barrier wait requires static candidate masks";
+  auto emit_candidate_barrier_wait =
+      [&](mlir::Value dynamic_mask, const std::vector<int64_t> &candidates) {
+        ICHECK(dynamic_mask) << "dynamic barrier mask is missing";
+        ICHECK(!candidates.empty())
+            << "dynamic barrier wait requires static candidate masks";
+        dynamic_mask =
+            ensure_i64(dynamic_mask, "tl.barrier_arrive_and_wait mask");
 
-    std::function<void(size_t)> emit_case = [&](size_t index) {
-      ICHECK_LT(index, candidates.size());
-      int64_t candidate = candidates[index];
-      mlir::Value cst = mlir::arith::ConstantIntOp::create(
-                            ctx_.builder, type.Loc(), candidate, 64)
-                            .getResult();
-      mlir::Value is_match = mlir::arith::CmpIOp::create(
-          ctx_.builder, type.Loc(), mlir::arith::CmpIPredicate::eq,
-          dynamic_mask, cst);
-      auto if_op = mlir::scf::IfOp::create(ctx_.builder, type.Loc(), is_match,
-                                           /*withElseRegion=*/true);
+        std::function<void(size_t)> emit_case = [&](size_t index) {
+          ICHECK_LT(index, candidates.size());
+          int64_t candidate = candidates[index];
+          mlir::Value cst = mlir::arith::ConstantIntOp::create(
+                                ctx_.builder, type.Loc(), candidate, 64)
+                                .getResult();
+          mlir::Value is_match = mlir::arith::CmpIOp::create(
+              ctx_.builder, type.Loc(), mlir::arith::CmpIPredicate::eq,
+              dynamic_mask, cst);
+          auto if_op =
+              mlir::scf::IfOp::create(ctx_.builder, type.Loc(), is_match,
+                                      /*withElseRegion=*/true);
 
-      mlir::Block &then_block = if_op.getThenRegion().front();
-      ctx_.builder.setInsertionPointToStart(&then_block);
-      emit_barrier_arrive_and_wait(ensure_barrier_for_mask(candidate));
+          mlir::Block &then_block = if_op.getThenRegion().front();
+          ctx_.builder.setInsertionPointToStart(&then_block);
+          emit_barrier_arrive_and_wait(
+              lookup_static_barrier_for_mask(candidate));
 
-      mlir::Block &else_block = if_op.getElseRegion().front();
-      ctx_.builder.setInsertionPointToStart(&else_block);
-      if (index + 1 < candidates.size()) {
-        emit_case(index + 1);
-      } else {
-        mlir::Value always_false =
-            mlir::arith::ConstantIntOp::create(ctx_.builder, type.Loc(), 0, 1)
-                .getResult();
-        mlir::cf::AssertOp::create(
-            ctx_.builder, type.Loc(), always_false,
-            ctx_.builder.getStringAttr(
-                "dynamic barrier mask is not in candidate set"));
-      }
+          mlir::Block &else_block = if_op.getElseRegion().front();
+          ctx_.builder.setInsertionPointToStart(&else_block);
+          if (index + 1 < candidates.size()) {
+            emit_case(index + 1);
+          } else {
+            mlir::Value always_false = mlir::arith::ConstantIntOp::create(
+                                           ctx_.builder, type.Loc(), 0, 1)
+                                           .getResult();
+            mlir::cf::AssertOp::create(
+                ctx_.builder, type.Loc(), always_false,
+                ctx_.builder.getStringAttr(
+                    "dynamic barrier mask is not in candidate set"));
+          }
 
-      ctx_.builder.setInsertionPointAfter(if_op);
-    };
+          ctx_.builder.setInsertionPointAfter(if_op);
+        };
 
-    emit_case(0);
-  };
+        emit_case(0);
+      };
 
   if (callee == "tl.sync_null_token") {
     int64_t token_id = parse_token_id();
@@ -392,43 +422,55 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     (void)ctx_.builder.create(st);
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.barrier_init") {
+    std::string barrier_key = parse_barrier_mask_key();
     int64_t participant_mask = parse_participant_mask();
+    std::vector<int64_t> candidates = parse_candidate_masks();
     mlir::Value result_barrier;
     if (participant_mask >= 0) {
-      result_barrier = ensure_barrier_for_mask(participant_mask);
-    } else {
-      ICHECK_LE(operands.size(), 1U)
-          << "tl.barrier_init dynamic mask expects at most one mask operand";
-      std::vector<int64_t> candidates = parse_candidate_masks();
-      ICHECK(!candidates.empty())
-          << "tl.barrier_init dynamic mask requires candidate_mask entries";
+      result_barrier = ensure_static_barrier_for_mask(participant_mask);
+      ctx_.barrier_by_mask[barrier_key] = result_barrier;
+    } else if (!candidates.empty()) {
       for (int64_t mask : candidates) {
-        (void)ensure_barrier_for_mask(mask);
+        (void)ensure_static_barrier_for_mask(mask);
       }
+    } else {
+      ICHECK_EQ(operands.size(), 1U)
+          << "tl.barrier_init dynamic mask expects one mask operand";
+      mlir::Value dynamic_mask = ctx_.LookupMLIRValue(operands[0].value);
+      if (!dynamic_mask) {
+        dynamic_mask =
+            type.ResolveValue(operands[0], ctx_.builder.getI64Type());
+      }
+      result_barrier =
+          ensure_dynamic_barrier_for_mask(dynamic_mask, barrier_key);
     }
     if (!result_name.empty() && result_barrier) {
       ctx_.BindMLIRValue(result_name, result_barrier);
     }
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.barrier_arrive_and_wait") {
-    int64_t participant_mask = parse_participant_mask();
-    if (participant_mask >= 0) {
-      auto barrier_it = ctx_.barrier_by_mask.find(participant_mask);
-      ICHECK(barrier_it != ctx_.barrier_by_mask.end() && barrier_it->second)
-          << "tl.barrier_arrive_and_wait participant_mask=" << participant_mask
-          << " has no corresponding tl.barrier_init.";
-      emit_barrier_arrive_and_wait(barrier_it->second);
-    } else {
+    std::string barrier_key = parse_barrier_mask_key();
+    std::optional<int64_t> participant_mask =
+        get_int_attr(SunMMIOCallAttrKey::kParticipantMask);
+    std::vector<int64_t> candidates = parse_candidate_masks();
+    if (!candidates.empty()) {
       ICHECK_EQ(operands.size(), 1U)
-          << "tl.barrier_arrive_and_wait dynamic mask expects one mask operand";
+          << "tl.barrier_arrive_and_wait candidate fallback expects one mask "
+             "operand";
       mlir::Value dynamic_mask = ctx_.LookupMLIRValue(operands[0].value);
       if (!dynamic_mask) {
         dynamic_mask =
             type.ResolveValue(operands[0], ctx_.builder.getI64Type());
       }
-      dynamic_mask =
-          ensure_i64(dynamic_mask, "tl.barrier_arrive_and_wait mask");
-      emit_dynamic_barrier_wait(dynamic_mask, parse_candidate_masks());
+      emit_candidate_barrier_wait(dynamic_mask, candidates);
+    } else {
+      auto barrier_it = ctx_.barrier_by_mask.find(barrier_key);
+      ICHECK(barrier_it != ctx_.barrier_by_mask.end() && barrier_it->second)
+          << "tl.barrier_arrive_and_wait participant_mask="
+          << (participant_mask ? std::to_string(*participant_mask)
+                               : barrier_key)
+          << " has no corresponding tl.barrier_init.";
+      emit_barrier_arrive_and_wait(barrier_it->second);
     }
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.dma_copy") {

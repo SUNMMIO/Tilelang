@@ -9,6 +9,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/type.h>
+#include <tvm/node/script_printer.h>
 #include <tvm/node/structural_equal.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
@@ -1830,6 +1831,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     ICHECK_GE(op->args.size(), 1U)
         << callee << " expects participant_mask argument";
     const PrimExpr &mask = op->args[0];
+    attrs[SunMMIOCallAttrKey::kBarrierMaskKey] =
+        TVMScriptPrinter::Script(mask, std::nullopt);
     if (const auto *imm = mask.as<IntImmNode>()) {
       MarkVisitedNodeType("tir.IntImm");
       int64_t mask_value = static_cast<int64_t>(imm->value);

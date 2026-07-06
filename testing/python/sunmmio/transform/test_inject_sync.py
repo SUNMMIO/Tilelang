@@ -437,6 +437,63 @@ def _make_while_pair_broadcast_mod(target):
     return tir.transform.BindTarget(target)(mod)
 
 
+def _make_while_async_to_sync_store_mod(target):
+    src_data = _pointer_var("src")
+    dst_data = _pointer_var("dst")
+    src_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="src_buf",
+        data=src_data,
+        scope="shared.rsram",
+    )
+    dst_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="dst_buf",
+        data=dst_data,
+        scope="shared.rsram",
+    )
+    indices = [tir.IntImm("int32", 0), tir.IntImm("int32", 0)]
+    store_dst = tir.BufferStore(dst_buf, tir.BufferLoad(dst_buf, indices), indices)
+    broadcast = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.broadcast_"),
+            _region(src_buf, 1),
+            _region(dst_buf, 2),
+            tir.IntImm("int32", 0),
+            tir.IntImm("int64", 15),
+            tir.IntImm("int32", 0),
+            tir.IntImm("int32", 0),
+        )
+    )
+    i = tir.Var("i", "int32")
+    while_loop = tir.LetStmt(
+        i,
+        tir.IntImm("int32", 0),
+        tir.While(
+            i < tir.IntImm("int32", 2),
+            tir.SeqStmt(
+                [
+                    store_dst,
+                    broadcast,
+                    tir.LetStmt(i, i + tir.IntImm("int32", 1), tir.Evaluate(0)),
+                ]
+            ),
+        ),
+    )
+    body = tir.DeclBuffer(
+        src_buf,
+        tir.DeclBuffer(dst_buf, while_loop),
+    )
+    func = tir.PrimFunc([src_data, dst_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
 def _make_mixed_level_nested_broadcast_mod(target):
     outer_src_data = _pointer_var("outer_src")
     outer_dst_data = _pointer_var("outer_dst")
@@ -1117,6 +1174,41 @@ def test_inject_sunmmio_sync_while_loop_carried_tokens():
     assert barrier_wait_between
 
 
+def test_inject_sunmmio_sync_while_loop_carried_async_to_sync_store():
+    target = get_target("Sunmmio")
+    mod = _make_while_async_to_sync_store_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    script = mod.script(show_meta=True)
+    lines = script.splitlines()
+
+    def extract_call_id(line, marker):
+        match = re.search(rf"{re.escape(marker)}\((\d+)\)", line)
+        assert match, f"Cannot parse {marker} in line: {line}"
+        return int(match.group(1))
+
+    broadcast_entries = [
+        (idx, line.strip(), extract_call_id(line, "sync_token_id"))
+        for idx, line in enumerate(lines)
+        if "broadcast_" in line and "sync_token_id(" in line
+    ]
+    assert len(broadcast_entries) == 1
+    broadcast_idx, _, broadcast_token = broadcast_entries[0]
+
+    while_idx = next(idx for idx, line in enumerate(lines) if "while i < 2:" in line)
+    store_idx = next(idx for idx, line in enumerate(lines) if idx > while_idx and "dst_buf[0, 0] = dst_buf[0, 0]" in line)
+
+    null_token_entries = [
+        (idx, line.strip(), extract_call_id(line, "sync_null_token")) for idx, line in enumerate(lines) if "sync_null_token(" in line
+    ]
+    wait_entries = [(idx, line.strip(), extract_call_id(line, "wait_token")) for idx, line in enumerate(lines) if "wait_token(" in line]
+
+    assert any(token == broadcast_token and idx < while_idx for idx, _, token in null_token_entries)
+    carried_wait_before_store = [idx for idx, _, token in wait_entries if token == broadcast_token and while_idx < idx < store_idx]
+    assert carried_wait_before_store
+    assert min(carried_wait_before_store) < store_idx < broadcast_idx
+
+
 if __name__ == "__main__":
     test_inject_sunmmio_sync_dma()
     test_inject_sunmmio_sync_mma()
@@ -1128,3 +1220,4 @@ if __name__ == "__main__":
     test_inject_sunmmio_sync_if()
     test_inject_sunmmio_sync_loop()
     test_inject_sunmmio_sync_while_loop_carried_tokens()
+    test_inject_sunmmio_sync_while_loop_carried_async_to_sync_store()
