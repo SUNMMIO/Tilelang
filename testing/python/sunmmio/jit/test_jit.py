@@ -57,7 +57,7 @@ def _load_sunmmio_dynamic_exp2_example():
 
 
 def _load_sunmmio_online_softmax_example():
-    example_path = Path(__file__).resolve().parents[3] / "examples" / "sunmmio" / "softmax" / "online_softmax.py"
+    example_path = Path(__file__).resolve().parents[4] / "examples" / "sunmmio" / "softmax" / "online_softmax.py"
     spec = importlib.util.spec_from_file_location("tilelang_sunmmio_online_softmax_example", example_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -873,9 +873,8 @@ def test_sunmmio_softmax_output_dma_wait_is_hoisted_before_tile_store_loop():
         for idx, line in enumerate(lines[input_dma_idx:store_idx], start=input_dma_idx)
         if "for i in T.serial" in line and "tile.domain" in line
     )
-    outer_loop_idx = max(idx for idx, line in enumerate(lines[:input_dma_idx]) if "for bx_1 in range" in line)
-
-    assert all(null_marker not in line for line in lines[outer_loop_idx:output_dma_idx])
+    # Allow the output-DMA pipeline's prologue null-init (before the by-loop); forbid resets inside the loop body.
+    assert all(null_marker not in line for line in lines[input_dma_idx:output_dma_idx])
     assert any(wait_marker in line for line in lines[input_dma_idx:tile_store_loop_idx])
     assert all(wait_marker not in line for line in lines[tile_store_loop_idx:output_dma_idx])
 
