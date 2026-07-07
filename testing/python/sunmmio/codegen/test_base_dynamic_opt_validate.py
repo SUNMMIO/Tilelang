@@ -12,6 +12,7 @@ from tilelang.layout import (
     make_zzz_layout,
 )
 
+from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import (
     assert_source_contains,
     lower_sunmmio_kernel_to_device_tir,
@@ -68,6 +69,7 @@ def print_kernel_layouts(name, kernel):
         print_layout_info(f"{tensor_name}.sharded", meta["sharded_layout"])
 
 
+@target("Sunmmio")
 def dynamic_allocate_copy_mma_kernel(
     block_M=32,
     block_N=32,
@@ -75,9 +77,7 @@ def dynamic_allocate_copy_mma_kernel(
     dtype=T.float16,
     accum_dtype=T.float32,
 ):
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
+    nrows, ncols = driver.get_sunmmio_device_mesh_config()
 
     M_sharded = T.dynamic("m")
     N_sharded = T.dynamic("n")
@@ -94,19 +94,19 @@ def dynamic_allocate_copy_mma_kernel(
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), shard_policy, device_mesh_config, dtype),  # type: ignore
-        B: T.MeshTensor((K, N), shard_policy, device_mesh_config, dtype),  # type: ignore
-        C: T.MeshTensor((M, N), shard_policy, device_mesh_config, accum_dtype),  # type: ignore
+        A: T.MeshTensor((M, K), shard_policy, dtype),  # type: ignore
+        B: T.MeshTensor((K, N), shard_policy, dtype),  # type: ignore
+        C: T.MeshTensor((M, N), shard_policy, accum_dtype),  # type: ignore
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_K = A.shape
-            sharded_N = B.shape[1]
-            A_shared_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
-            B_shared_dist = T.alloc_shared((block_K * nrows, block_N), dtype)
+        with T.Kernel() as _cid:
+            sharded_M, sharded_K = A.local_shape
+            sharded_N = B.local_shape[1]
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             for by in T.serial(T.ceildiv(sharded_M, block_M)):
-                for bx in T.serial(T.ceildiv(sharded_N, block_N)):
+                for bn in T.serial(T.ceildiv(sharded_N, block_N)):
                     T.clear(C_shared)
                     for ko in T.serial(T.ceildiv(sharded_K, block_K)):
                         T.comm.all_gather(
@@ -121,18 +121,19 @@ def dynamic_allocate_copy_mma_kernel(
                         T.comm.all_gather(
                             B[
                                 ko * block_K : (ko + 1) * block_K,
-                                bx * block_N : (bx + 1) * block_N,
+                                bn * block_N : (bn + 1) * block_N,
                             ],
                             B_shared_dist,
                             direction="vertical",
                             axis=0,
                         )
                         T.gemm(A_shared_dist, B_shared_dist, C_shared)
-                    T.copy(C_shared, C[by * block_M, bx * block_N])
+                    T.copy(C_shared, C[by * block_M, bn * block_N])
 
     return main
 
 
+@target("Sunmmio")
 def dynamic_zz_allocate_copy_mma_kernel(
     block_M=32,
     block_N=32,
@@ -146,29 +147,25 @@ def dynamic_zz_allocate_copy_mma_kernel(
     B_layout = make_zz_layout((K, N))
     C_layout = make_zz_layout((M, N))
 
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
-
     shard_policy = T.MeshShardingPolicy()
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), shard_policy, device_mesh_config, dtype, layout=A_layout),  # type: ignore
-        B: T.MeshTensor((K, N), shard_policy, device_mesh_config, dtype, layout=B_layout),  # type: ignore
-        C: T.MeshTensor((M, N), shard_policy, device_mesh_config, dtype, layout=C_layout),  # type: ignore
+        A: T.MeshTensor((M, K), shard_policy, dtype, layout=A_layout),  # type: ignore
+        B: T.MeshTensor((K, N), shard_policy, dtype, layout=B_layout),  # type: ignore
+        C: T.MeshTensor((M, N), shard_policy, dtype, layout=C_layout),  # type: ignore
     ):
-        with T.Kernel(ncores) as _cid:
-            sharded_M = A.shape[0]
-            sharded_N = B.shape[1]
+        with T.Kernel() as _cid:
+            sharded_M = A.local_shape[0]
+            sharded_N = B.local_shape[1]
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), dtype)
 
             for by in T.serial(T.ceildiv(sharded_M, block_M)):
-                for bx in T.serial(T.ceildiv(sharded_N, block_N)):
+                for bn in T.serial(T.ceildiv(sharded_N, block_N)):
                     T.copy(A[by * block_M, 0], A_shared)
-                    T.copy(B[0, bx * block_N], B_shared)
+                    T.copy(B[0, bn * block_N], B_shared)
                     T.gemm(A_shared, B_shared, C_shared)
                     # need all_gather or reduce to cover real-world scenarios
                     # T.copy(C_shared, C[by * block_M, bx * block_N])
@@ -210,7 +207,7 @@ def test_dynamic_allocate_copy_mma_lowers_to_device_tir():
             "m: T.int32",
             "n: T.int32",
             "for by in range((m + 31) // 32)",
-            "for bx_1 in range((n + 31) // 32)",
+            "for bn in range((n + 31) // 32)",
             "for ko in range((k + 31) // 32)",
             "T.dma_copy",
             "T.broadcast_",

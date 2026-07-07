@@ -9,6 +9,7 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/type.h>
+#include <tvm/node/script_printer.h>
 #include <tvm/node/structural_equal.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
@@ -601,6 +602,11 @@ void CodeGenTileLangSunMMIO::RegisterBuffer(const tir::Buffer &buffer,
   binding.scope = buffer.scope();
   binding.buffer_type = MapBufferType(buffer);
   binding.is_external = is_external;
+  if (IsSunmmioReduceRegisterTempBuffer(buffer)) {
+    buffer_registry_[buffer.get()] = std::move(binding);
+    scoped_buffers_.push_back(buffer.get());
+    return;
+  }
   if (!handle_hint.empty()) {
     binding.handle = handle_hint;
     auto storage_it = var_table_.find(buffer->data.get());
@@ -1825,6 +1831,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     ICHECK_GE(op->args.size(), 1U)
         << callee << " expects participant_mask argument";
     const PrimExpr &mask = op->args[0];
+    attrs[SunMMIOCallAttrKey::kBarrierMaskKey] =
+        TVMScriptPrinter::Script(mask, std::nullopt);
     if (const auto *imm = mask.as<IntImmNode>()) {
       MarkVisitedNodeType("tir.IntImm");
       int64_t mask_value = static_cast<int64_t>(imm->value);

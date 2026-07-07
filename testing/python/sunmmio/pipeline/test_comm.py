@@ -1,7 +1,6 @@
 import os
 
 import tilelang.language as T
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import compile_test, target
@@ -16,9 +15,6 @@ _COL_MASK_BX = "T.int64(15)"
 @target("Sunmmio")
 def kernel_comm(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float32"):
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     A_shape = (M, K)
     B_shape = (K, N)
@@ -29,14 +25,14 @@ def kernel_comm(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype
 
     @T.prim_func
     def main(
-        A: T.MeshTensor(A_shape, shard_policy, device_mesh_config, dtype, layout=A_layout),
-        B: T.MeshTensor(B_shape, shard_policy, device_mesh_config, dtype, layout=B_layout),
-        C: T.MeshTensor(C_shape, shard_policy, device_mesh_config, accum_dtype, layout=C_layout),
+        A: T.MeshTensor(A_shape, shard_policy, dtype, layout=A_layout),
+        B: T.MeshTensor(B_shape, shard_policy, dtype, layout=B_layout),
+        C: T.MeshTensor(C_shape, shard_policy, accum_dtype, layout=C_layout),
     ):
         # Initialize Kernel Context
-        with T.Kernel(ncores) as _cid:
-            sharded_M, _ = A.shape
-            _, sharded_N = C.shape
+        with T.Kernel() as _cid:
+            sharded_M, _ = A.local_shape
+            _, sharded_N = C.local_shape
 
             A_shared = T.alloc_shared((block_M, block_K), dtype=dtype)
             A_remote_1 = T.alloc_shared((block_M, block_K), dtype=dtype)

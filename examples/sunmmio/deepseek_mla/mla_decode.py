@@ -38,8 +38,7 @@ from tilelang.layout import make_zz_layout
 
 def mla_decode(batch, heads, kv_heads, seqlen_kv, dim, pe_dim, block_N=64, block_H=16) -> "Callable":
     mesh = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = mesh
-    ncores = nrows * ncols
+    _, ncols = mesh
 
     assert kv_heads == 1, "MLA shares a single latent KV across all query heads"
     assert heads % ncols == 0, "heads must be divisible by the mesh column count"
@@ -65,18 +64,18 @@ def mla_decode(batch, heads, kv_heads, seqlen_kv, dim, pe_dim, block_N=64, block
 
     @T.prim_func
     def main(
-        Q: T.MeshTensor(shape_q, head_policy, mesh, dtype, make_zz_layout(shape_q)),
-        Q_pe: T.MeshTensor(shape_qpe, head_policy, mesh, dtype, make_zz_layout(shape_qpe)),
-        KV: T.MeshTensor(shape_kv, kv_policy, mesh, dtype, make_zz_layout(shape_kv, axes=(1, 3))),
-        K_pe: T.MeshTensor(shape_kpe, kv_policy, mesh, dtype, make_zz_layout(shape_kpe, axes=(1, 3))),
-        Output: T.MeshTensor(shape_o, head_policy, mesh, dtype, make_zz_layout(shape_o)),
+        Q: T.MeshTensor(shape_q, head_policy, dtype, layout=make_zz_layout(shape_q)),
+        Q_pe: T.MeshTensor(shape_qpe, head_policy, dtype, layout=make_zz_layout(shape_qpe)),
+        KV: T.MeshTensor(shape_kv, kv_policy, dtype, layout=make_zz_layout(shape_kv, axes=(1, 3))),
+        K_pe: T.MeshTensor(shape_kpe, kv_policy, dtype, layout=make_zz_layout(shape_kpe, axes=(1, 3))),
+        Output: T.MeshTensor(shape_o, head_policy, dtype, layout=make_zz_layout(shape_o)),
     ):
-        with T.Kernel(ncores) as (cid):
-            sharded_batch = Q.shape[0]
-            _, sharded_seqlen, _, _ = KV.shape
+        with T.Kernel() as (cid):
+            sharded_batch = Q.local_shape[0]
+            _, sharded_seqlen, _, _ = KV.local_shape
             # This core's column owns the global head blocks
             # [col*blocks_per_col, (col+1)*blocks_per_col).
-            col = cid % ncols
+            col = cid % T.mesh_ncols()
             blocks_per_col = heads_per_col // block_H
 
             # Head gather (per batch): load this core's head slice, all-gather
@@ -106,11 +105,11 @@ def mla_decode(batch, heads, kv_heads, seqlen_kv, dim, pe_dim, block_N=64, block
             lse = T.alloc_shared([block_H], accum_dtype)
 
             # Cross-row LSE-combine scratch.
-            lse_dist = T.alloc_shared([ncols, block_H], accum_dtype)
+            lse_dist = T.alloc_shared([T.mesh_ncols(), block_H], accum_dtype)
             lse_max = T.alloc_shared([block_H], accum_dtype)
             lse_denom = T.alloc_shared([block_H], accum_dtype)
             o_scaled = T.alloc_shared([block_H, dim], accum_dtype)
-            o_dist = T.alloc_shared([ncols, block_H, dim], accum_dtype)
+            o_dist = T.alloc_shared([T.mesh_ncols(), block_H, dim], accum_dtype)
             o_final = T.alloc_shared([block_H, dim], accum_dtype)
             o_cast = T.alloc_shared([block_H, dim], dtype)
 
@@ -164,7 +163,7 @@ def mla_decode(batch, heads, kv_heads, seqlen_kv, dim, pe_dim, block_N=64, block
                     # --- LSE combine across the row (the seqlen-split axis). ---
                     T.comm.all_gather(lse, lse_dist, direction="h")
                     T.reduce_max(lse_dist, lse_max, dim=0, clear=True)
-                    for c, i in T.Tiles([ncols, block_H]):
+                    for c, i in T.Tiles([T.mesh_ncols(), block_H]):
                         lse_dist[c, i] = T.exp2(lse_dist[c, i] - lse_max[i])
                     T.reduce_sum(lse_dist, lse_denom, dim=0, clear=True)
                     for i, j in T.Tiles([block_H, dim]):

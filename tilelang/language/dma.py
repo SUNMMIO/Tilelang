@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 from tvm import tir
+from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
 from tilelang.utils.language import get_buffer_region_from_load, legalize_pairwise_extents, to_buffer_region
 
 
 def _get_extent(data):
     """Detect extent from Buffer / BufferRegion / BufferLoad."""
+    data = _unwrap_mesh_tensor(data)
     if isinstance(data, tir.Buffer):
         return list(data.shape)
 

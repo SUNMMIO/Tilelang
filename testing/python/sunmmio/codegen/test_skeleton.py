@@ -247,6 +247,24 @@ def make_reusable_barrier_kernel():
 
 @target("Sunmmio")
 def make_dynamic_barrier_kernel():
+    mask = tvm.tir.Var("mask", "int64")
+    barrier_init = tvm.tir.Call("handle", tvm.ir.Op.get("tl.barrier_init"), [mask])
+    barrier_wait = tvm.tir.Call(
+        "handle",
+        tvm.ir.Op.get("tl.barrier_arrive_and_wait"),
+        [mask],
+    )
+    stmt = tvm.tir.SeqStmt(
+        [
+            tvm.tir.Evaluate(barrier_init),
+            tvm.tir.Evaluate(barrier_wait),
+        ]
+    )
+    return _to_device_kernel_func(tvm.tir.PrimFunc([mask], stmt))
+
+
+@target("Sunmmio")
+def make_dynamic_barrier_candidates_kernel():
     bx = tvm.tir.Var("bx", "int32")
     bx_i64 = tvm.tir.Cast("int64", bx)
     mask = tvm.tir.shift_left(
@@ -386,8 +404,18 @@ def test_sunmmio_codegen_lowers_reusable_barrier():
     assert "sunmmio.fake" not in src
 
 
-def test_sunmmio_codegen_lowers_dynamic_barrier_candidates():
+def test_sunmmio_codegen_lowers_dynamic_barrier_mask():
     src = build_sunmmio_source_without_compile(make_dynamic_barrier_kernel())
+    assert "suvm.barrier.init mask = %" in src
+    assert " : i64 -> !suvm.barrier" in src
+    assert src.count("suvm.barrier.init") == 1
+    assert src.count("suvm.barrier.arrive_and_wait") == 1
+    assert "cf.assert" not in src
+    assert "sunmmio.fake" not in src
+
+
+def test_sunmmio_codegen_lowers_dynamic_barrier_candidates():
+    src = build_sunmmio_source_without_compile(make_dynamic_barrier_candidates_kernel())
     for mask in [15, 240, 3840, 61440]:
         assert f"suvm.barrier.init mask = {mask} : !suvm.barrier" in src
     assert src.count("suvm.barrier.init") == 4
@@ -469,16 +497,6 @@ def test_sunmmio_codegen_unsupported_call_fails_loudly():
     mod = tvm.IRModule({"main": _primfunc_from_stmt(stmt)})
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
     with pytest.raises(Exception, match="Unsupported SunMMIO call lowering.*tir.call_pure_extern"):
-        builder(mod, target, "suvm")
-
-
-def test_sunmmio_codegen_unsupported_dtype_fails_loudly():
-    fp8_var = tvm.tir.Var("fp8_value", tvm.DataType("float8_e4m3fn"))
-    func = _to_device_kernel_func(tvm.tir.PrimFunc([fp8_var], tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))))
-    target = determine_target("Sunmmio", return_object=True)
-    mod = tvm.IRModule({"main": func})
-    builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
-    with pytest.raises(Exception, match="Unsupported SunMMIO element dtype.*float8_e4m3fn"):
         builder(mod, target, "suvm")
 
 

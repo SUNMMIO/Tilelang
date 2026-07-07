@@ -31,7 +31,7 @@ def simple_global_copy_gemm_kernel(
         B: T.Tensor((K, N), dtype),
         C: T.Tensor((M, N), accum_dtype),
     ):
-        with T.Kernel(1):
+        with T.Kernel():
             A_shared = T.alloc_shared((M, K), dtype)
             B_shared = T.alloc_shared((K, N), dtype)
             C_shared = T.alloc_shared((M, N), accum_dtype)

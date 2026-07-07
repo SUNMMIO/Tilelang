@@ -5,6 +5,7 @@
 #ifndef TVM_TL_TRANSFORM_SUNMMIO_PIPELINE_PLANNING_HARDWARE_TYPES_H_
 #define TVM_TL_TRANSFORM_SUNMMIO_PIPELINE_PLANNING_HARDWARE_TYPES_H_
 
+#include "tvm/runtime/logging.h"
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt.h>
@@ -53,9 +54,12 @@ public:
         }
       }
       return DeviceType::VectorCore;
+    } else if (const auto *for_stmt = stmt.as<ForNode>()) {
+      // Set VectorCore for tilesloop
+      return DeviceType::VectorCore;
     }
-    // Set VectorCore for all other general computation loops/statements
-    return DeviceType::VectorCore;
+    LOG(FATAL) << "Can not identify the hardware type for a "
+               << stmt->GetTypeKey() << " statement.";
   }
 };
 

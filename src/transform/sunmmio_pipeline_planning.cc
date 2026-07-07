@@ -7,6 +7,10 @@
  * 2. Unroll DDG according to num_stages, while considering prefetch
  * instructions. 3.1 Schedule instructions in the global DDG with a b-level
  * based greedy algorithm. 3.2 Insert prefetch instructions.
+ *
+ * It should be noticed that: 1. Current implementation does not support
+ * IF control flows. 2. Current implementation does not support tvm_access_ptr
+ * call.
  */
 
 #include "../op/utils.h"
