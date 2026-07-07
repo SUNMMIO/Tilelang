@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import inspect
+from contextlib import nullcontext
 from typing import (
     Any,
     Callable,
@@ -318,6 +319,13 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         assert isinstance(tir, PrimFunc), f"target function must be a PrimFunc but got {type(tir)}"
         return tir
 
+    def _target_context(self):
+        if self.target is None:
+            return nullcontext()
+        from tilelang.utils.target import determine_target
+
+        return tvm.target.Target(determine_target(self.target, return_object=True))
+
     def _infer_jit_mode(self, *args: _P.args, **kwargs: _P.kwargs) -> Literal["lazy", "eager"]:
         """
         Infer the JIT execution mode based on function behavior.
@@ -330,7 +338,8 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
         # auto: infer by checking if function returns PrimFunc directly
         if not isinstance(self.func, JITFunc):
             return "lazy"
-        is_lazy_style = self.func._is_lazy_style(*args, **kwargs)
+        with self._target_context():
+            is_lazy_style = self.func._is_lazy_style(*args, **kwargs)
         return "lazy" if is_lazy_style else "eager"
 
     def initialize_jit_mode(self, *args: _P.args, **kwargs: _P.kwargs) -> Literal["lazy", "eager"]:

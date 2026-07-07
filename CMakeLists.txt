@@ -530,7 +530,7 @@ target_link_libraries(tilelang PUBLIC tvm)
 
 set(TILELANG_NPUIR_TOOL_TARGETS)
 if(USE_SUNMMIO)
-  foreach(_tilelang_npuir_tool IN ITEMS npuir-opt npuir-translate)
+  foreach(_tilelang_npuir_tool IN ITEMS npuir-opt npuir-translate npuir-compile)
     if(NOT TARGET ${_tilelang_npuir_tool})
       message(FATAL_ERROR "USE_SUNMMIO=ON requires NPU-IR target `${_tilelang_npuir_tool}`.")
     endif()
