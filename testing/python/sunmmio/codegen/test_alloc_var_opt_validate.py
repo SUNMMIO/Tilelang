@@ -2,6 +2,7 @@ import os
 import tilelang
 import tilelang.language as T
 import tilelang.testing
+from tilelang.transform import PassConfigKey
 from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
@@ -215,6 +216,36 @@ def test_alloc_var_scalar_state_codegen_validates_with_npuir_opt(tmp_path):
     )
     assert "suvm.alloc" not in src
 
+def test_pipeline_switch(tmp_path):
+    disable_src = validate_sunmmio_codegen_with_npuir_opt(
+        alloc_var_scalar_state_kernel(),
+        tmp_path,
+        pass_configs={PassConfigKey.TL_DISABLE_SUNMMIO_PIPELINE: True},
+        mlir_filename="alloc_var_scalar_state_suvm_pipeline_disabled.mlir",
+        expected_tokens=(
+            "scf.for",
+            "scf.if",
+            "iter_args",
+            "arith.addf",
+            "arith.mulf",
+        ),
+    )
+    assert "suvm.alloc" not in disable_src
+
+    ilp_src = validate_sunmmio_codegen_with_npuir_opt(
+        alloc_var_scalar_state_kernel(),
+        tmp_path,
+        pass_configs={PassConfigKey.TL_SUNMMIO_PIPELINE_MODE: "ilp"},
+        mlir_filename="alloc_var_scalar_state_suvm_pipeline_ilp.mlir",
+        expected_tokens=(
+            "scf.for",
+            "scf.if",
+            "iter_args",
+            "arith.addf",
+            "arith.mulf",
+        ),
+    )
+    assert "suvm.alloc" not in ilp_src
 
 def test_alloc_var_all_control_flow_kernel_codegen_validates_with_npuir_opt(tmp_path):
     src = validate_sunmmio_codegen_with_npuir_opt(

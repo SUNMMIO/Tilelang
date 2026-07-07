@@ -6,7 +6,7 @@
 #define TVM_TL_TRANSFORM_SUNMMIO_PIPELINE_PLANNING_RESOURCE_TYPES_FOR_ILP_H_
 
 #include "../../op/utils.h"
-#include "hardware_types.h"
+#include "../../target/sunmmio/hardware_types.h"
 
 #include <algorithm>
 #include <tvm/runtime/logging.h>
@@ -26,7 +26,7 @@ enum class IlpResourceType : int {
   kWsramOut = 7,
   kAsramIn = 8,
   kAsramOut = 9,
-  kRsram = 10,
+  // kRsram = 10,
 };
 
 template <typename AccessInfoLike>
@@ -87,7 +87,7 @@ std::vector<int> BuildIlpResources(const Stmt &stmt, DeviceType type,
           if (dst_region->buffer.scope() == "shared.rsram" ||
               dst_region->buffer.scope() == "local") {
             add_resource(static_cast<int>(IlpResourceType::kODMA0));
-            add_resource(static_cast<int>(IlpResourceType::kRsram));
+            // add_resource(static_cast<int>(IlpResourceType::kRsram));
             return resources;
           }
         }
@@ -96,7 +96,7 @@ std::vector<int> BuildIlpResources(const Stmt &stmt, DeviceType type,
             dst_region->buffer.scope() == "shared.asram") {
           add_resource(static_cast<int>(IlpResourceType::kODMA1));
           add_resource(static_cast<int>(IlpResourceType::kAsramIn));
-          add_resource(static_cast<int>(IlpResourceType::kRsram));
+          // add_resource(static_cast<int>(IlpResourceType::kRsram));
           return resources;
         }
         add_resource(static_cast<int>(IlpResourceType::kODMA0));
@@ -104,7 +104,7 @@ std::vector<int> BuildIlpResources(const Stmt &stmt, DeviceType type,
             src_region->buffer.scope() == "local" ||
             dst_region->buffer.scope() == "shared.rsram" ||
             dst_region->buffer.scope() == "local") {
-          add_resource(static_cast<int>(IlpResourceType::kRsram));
+          // add_resource(static_cast<int>(IlpResourceType::kRsram));
         }
         if (dst_region->buffer.scope() == "shared.wsram") {
           add_resource(static_cast<int>(IlpResourceType::kWsramIn));

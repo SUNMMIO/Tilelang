@@ -534,7 +534,7 @@ CASES = [
         "matmul",
         lambda: matmul(1024, 1024, 1024, 128, 128, 32, num_stages=3),
         {
-            "A_rsram_stage": [3, 128, 32],
+            "A_rsram_stage": [128, 32],
             "A_shared_ping": [128, 32],
             "A_shared_pong": [128, 32],
             "B_shared_ping": [32, 128],
@@ -551,8 +551,8 @@ CASES = [
             "acc_s_cast_pong": [64, 64],
             "V_shared_ping": [64, 128],
             "V_shared_pong": [64, 128],
-            "scores_max_prev": [3, 64],
-            "scores_scale": [3, 64],
+            "scores_max_prev": [ 64],
+            "scores_scale": [64],
         },
     ),
     (
@@ -561,13 +561,13 @@ CASES = [
         {
             "K_shared_ping": [128, 128],
             "K_shared_pong": [128, 128],
-            "mask_local": [3, 128],
+            "mask_local": [128],
             "acc_s_cast_ping": [64, 128],
             "acc_s_cast_pong": [64, 128],
             "V_shared_ping": [128, 128],
             "V_shared_pong": [128, 128],
-            "scores_max_prev": [3, 64],
-            "scores_scale": [3, 64],
+            "scores_max_prev": [64],
+            "scores_scale": [64],
         },
     ),
     (
@@ -582,15 +582,15 @@ CASES = [
             "K_pe_shared_pong": [64, 64],
             "S_shared_ping": [64, 64],
             "S_shared_pong": [64, 64],
-            "scores_max_prev": [3, 64],
-            "scores_scale": [3, 64],
+            "scores_max_prev": [ 64],
+            "scores_scale": [ 64],
         },
     ),
     (
         "matmul2",
         lambda: matmul(1024, 1024, 1024, 128, 128, 32, num_stages=2),
         {
-            "A_rsram_stage": [2, 128, 32],
+            "A_rsram_stage": [128, 32],
             "A_shared_ping": [ 128, 32],
             "A_shared_pong": [ 128, 32],
             "B_shared_ping": [ 32, 128],
@@ -607,8 +607,8 @@ CASES = [
             "acc_s_cast_pong": [ 64, 64],
             "V_shared_ping": [ 64, 128],
             "V_shared_pong": [ 64, 128],
-            "scores_max_prev": [2, 64],
-            "scores_scale": [2, 64],
+            "scores_max_prev": [ 64],
+            "scores_scale": [ 64],
         },
     ),
     (
@@ -617,13 +617,13 @@ CASES = [
         {
             "K_shared_ping": [ 128, 128],
             "K_shared_pong": [ 128, 128],
-            "mask_local": [2, 128],
+            "mask_local": [128],
             "acc_s_cast_ping": [ 64, 128],
             "acc_s_cast_pong": [ 64, 128],
             "V_shared_ping": [ 128, 128],
             "V_shared_pong": [ 128, 128],
-            "scores_max_prev": [2, 64],
-            "scores_scale": [2, 64],
+            "scores_max_prev": [ 64],
+            "scores_scale": [ 64],
         },
     ),
     (
@@ -638,8 +638,8 @@ CASES = [
             "K_pe_shared_pong": [ 64, 64],
             "S_shared_ping": [ 64, 64],
             "S_shared_pong": [ 64, 64],
-            "scores_max_prev": [2, 64],
-            "scores_scale": [2, 64],
+            "scores_max_prev": [64],
+            "scores_scale": [64],
         },
     ),
 ]
@@ -867,7 +867,7 @@ def test_tilelang_transform_sunmmio_pipeline_bank_internal_multiversion_numstage
         assert_multiversioned_func_layouts(
             mod["main"],
             {
-                "A_rsram_stage": [4, 128, 32],
+                "A_rsram_stage": [128, 32],
                 "A_shared_ping": [128, 32],
                 "A_shared_pong": [128, 32],
                 "B_shared_ping": [32, 128],
@@ -894,7 +894,7 @@ def test_tilelang_transform_sunmmio_pipeline_banked_buffers_no_version_axis_nums
         assert_multiversioned_func_layouts(
             mod["main"],
             {
-                "A_rsram_stage": [2, 128, 32],
+                "A_rsram_stage": [128, 32],
                 "A_shared_ping": [128, 32],
                 "A_shared_pong": [128, 32],
                 "B_shared_ping": [32, 128],
@@ -927,7 +927,37 @@ def test_tilelang_transform_sunmmio_pipeline_annotations_separate_banked_from_ru
         ]
         assert _annotation_buffer_names(
             annotations, "runtime_multiversion_buffers"
-        ) == ["A_rsram_stage"]
+        ) == []
+        assert _annotation_buffer_names(annotations, "runtime_banked_buffers") == [
+            "A_shared",
+            "B_shared",
+        ]
+
+
+def test_tilelang_transform_sunmmio_pipeline_stage_shrink_uses_final_stage_and_solution_for_annotations():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(
+            matmul(1024, 1024, 1024, 128, 128, 32, num_stages=3).with_attr(
+                "global_symbol", "main"
+            )
+        )
+        mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+        mod = tl.transform.IfStmtBinding()(mod)
+        with tl.transform.PassContext(
+            config={tl.PassConfigKey.TL_SUNMMIO_ILP_STAGE_SHRINK: True}
+        ):
+            with _ScopedEnv({"TL_SUNMMIO_ILP_FASTER": "20"}):
+                mod = tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
+
+        annotations = _extract_pipeline_annotations(mod["main"].body)
+        assert annotations is not None
+        assert int(annotations["iterations"]) < 3
+        assert int(annotations["stage_count"]) == 2
+        assert _annotation_buffer_names(
+            annotations, "runtime_multiversion_buffers"
+        ) == []
         assert _annotation_buffer_names(annotations, "runtime_banked_buffers") == [
             "A_shared",
             "B_shared",

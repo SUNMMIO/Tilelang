@@ -178,10 +178,13 @@ def assert_source_contains(src: str, tokens: Sequence[str]) -> None:
 def lower_sunmmio_kernel_to_device_tir(
     kernel,
     *,
+    pass_configs: dict | None = None,
     print_ir: bool | None = None,
 ):
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    _, device_mod = compile_test(kernel, target=target, remove_header=True)
+    _, device_mod = compile_test(
+        kernel, target=target, remove_header=True, pass_configs=pass_configs
+    )
 
     assert isinstance(device_mod, tvm.IRModule)
     assert device_mod.get_global_vars()
@@ -300,6 +303,7 @@ def validate_sunmmio_codegen_with_npuir_opt(
     kernel,
     tmp_path: Path,
     *,
+    pass_configs: dict | None = None,
     mlir_filename: str = "generated_suvm.mlir",
     expected_tokens: Sequence[str] = (),
     opt_args: Sequence[str] = ("-suvm-device-validate",),
@@ -323,6 +327,7 @@ def validate_sunmmio_codegen_with_npuir_opt(
         )
     device_mod = lower_sunmmio_kernel_to_device_tir(
         kernel,
+        pass_configs=pass_configs,
         print_ir=print_ir,
     )
     if log_enabled:

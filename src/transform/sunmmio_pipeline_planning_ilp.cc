@@ -1,7 +1,8 @@
 #include "../op/utils.h"
+#include "../op/builtin.h"
 #include "common/ast_traverser.h"
-#include "sunmmio_pipeline_planning/cost_model.h"
-#include "sunmmio_pipeline_planning/hardware_types.h"
+#include "../target/sunmmio/cost_model.h"
+#include "../target/sunmmio/hardware_types.h"
 #include "sunmmio_pipeline_planning/resource_types_for_ilp.h"
 #include "tvm/arith/pattern.h"
 #include "tvm/ffi/reflection/registry.h"
@@ -23,6 +24,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -71,6 +73,12 @@ struct FlowSpec {
   int write_resource{-1};
   int read_resource{-1};
 };
+
+using SameWriteFlowKey = std::tuple<int, int>;
+
+SameWriteFlowKey MakeSameWriteFlowKey(const FlowSpec& flow) {
+  return std::make_tuple(flow.prod, flow.mem);
+}
 
 struct Problem {
   int N{0};
@@ -137,6 +145,9 @@ int PositiveMod(int value, int mod);
 
 bool CommandUsesResource(const CommandSpec& spec, int resource);
 
+BufferRegion MaterializeBufferRegion(const BufferRegion& region,
+                                     const Var& loop_var, int iter);
+
 namespace {
 
 // File-local helper to avoid colliding with the similarly named function in
@@ -175,6 +186,194 @@ int GcdInt(int a, int b) {
     b = t;
   }
   return a;
+}
+
+std::map<int, std::vector<std::pair<int, int>>> BuildResourceUsage(
+    const std::vector<CommandSpec>& specs) {
+  std::map<int, std::vector<std::pair<int, int>>> usage;
+  for (int idx = 0; idx < static_cast<int>(specs.size()); ++idx) {
+    int latency = std::max(1, specs[idx].latency);
+    for (int resource : specs[idx].resources) {
+      usage[resource].push_back({idx, latency});
+    }
+  }
+  return usage;
+}
+
+std::map<int, int> BuildResourceTotals(
+    const std::map<int, std::vector<std::pair<int, int>>>& usage) {
+  std::map<int, int> totals;
+  for (const auto& kv : usage) {
+    int total = 0;
+    for (const auto& item : kv.second) {
+      total += item.second;
+    }
+    totals[kv.first] = total;
+  }
+  return totals;
+}
+
+std::pair<int, int> FindTargetResource(
+    const std::map<int, int>& totals) {
+  int target_resource = -1;
+  int target_total = 0;
+  for (const auto& kv : totals) {
+    if (kv.second > target_total) {
+      target_resource = kv.first;
+      target_total = kv.second;
+    }
+  }
+  return {target_resource, target_total};
+}
+
+std::vector<int> CandidateFasters(int target_total, int target_upper = 69) {
+  int lower = std::max(2, CeilDiv(target_total, std::max(1, target_upper)));
+  int upper = std::max(lower, CeilDiv(target_total, 10));
+  std::vector<int> candidates;
+  for (int faster = upper; faster >= lower; --faster) {
+    candidates.push_back(faster);
+  }
+  return candidates;
+}
+
+std::vector<int> TryFactorWithOptionalBumps(
+    const std::vector<std::pair<int, int>>& items, int factor) {
+  std::vector<int> bump_indices;
+  for (const auto& item : items) {
+    int idx = item.first;
+    int latency = item.second;
+    if (latency % factor == 0) {
+      continue;
+    }
+    if ((latency + 1) % factor == 0) {
+      bump_indices.push_back(idx);
+    } else {
+      return {};
+    }
+  }
+  return bump_indices;
+}
+
+int ScaledTotalForResource(
+    const std::vector<CommandSpec>& specs, int resource, int faster,
+    const std::unordered_set<int>& bump_indices) {
+  int total = 0;
+  for (int idx = 0; idx < static_cast<int>(specs.size()); ++idx) {
+    if (std::find(specs[idx].resources.begin(), specs[idx].resources.end(),
+                  resource) == specs[idx].resources.end()) {
+      continue;
+    }
+    int latency = specs[idx].latency +
+                  (bump_indices.count(idx) ? 1 : 0);
+    total += CeilDiv(std::max(1, latency), faster);
+  }
+  return total;
+}
+
+std::vector<int> CandidateGCDs(const std::vector<int>& latencies) {
+  std::set<int, std::greater<int>> gcds;
+  for (int value : latencies) {
+    if (value <= 0) {
+      continue;
+    }
+    for (int d = 1; d * d <= value; ++d) {
+      if (value % d == 0) {
+        gcds.insert(d);
+        gcds.insert(value / d);
+      }
+    }
+  }
+  return std::vector<int>(gcds.begin(), gcds.end());
+}
+
+std::pair<int, std::vector<int>> TryGCDWithOptionalBumps(
+    const std::vector<std::pair<int, int>>& items, int target_total,
+    int target_upper = 69) {
+  std::vector<int> latencies;
+  latencies.reserve(items.size());
+  for (const auto& item : items) {
+    latencies.push_back(item.second);
+  }
+  int target_gcd_floor = std::max(1, CeilDiv(target_total, target_upper));
+  int base_g = 0;
+  for (int latency : latencies) {
+    base_g = base_g == 0 ? std::abs(latency) : GcdInt(base_g, latency);
+  }
+  if (base_g >= target_gcd_floor) {
+    return {base_g, {}};
+  }
+
+  for (int g : CandidateGCDs(latencies)) {
+    if (g < target_gcd_floor) {
+      continue;
+    }
+    std::vector<int> bump_indices;
+    bool ok = true;
+    for (const auto& item : items) {
+      int idx = item.first;
+      int latency = item.second;
+      if (latency % g == 0) {
+        continue;
+      }
+      if ((latency + 1) % g == 0) {
+        bump_indices.push_back(idx);
+      } else {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) {
+      return {g, bump_indices};
+    }
+  }
+  return {std::max(1, base_g), {}};
+}
+
+std::pair<int, std::vector<int>> AutoSelectSunmmioILPFaster(
+    const std::vector<CommandSpec>& specs, int target_upper = 69) {
+  auto usage = BuildResourceUsage(specs);
+  auto totals = BuildResourceTotals(usage);
+  auto [target_resource, target_total] = FindTargetResource(totals);
+  if (target_resource < 0 || target_total <= 0) {
+    return {1, {}};
+  }
+
+  for (int faster : CandidateFasters(target_total, target_upper)) {
+    std::vector<int> bump_vec =
+        TryFactorWithOptionalBumps(usage[target_resource], faster);
+    if (bump_vec.empty() && !usage[target_resource].empty()) {
+      bool all_divisible = true;
+      for (const auto& item : usage[target_resource]) {
+        if (item.second % faster != 0) {
+          all_divisible = false;
+          break;
+        }
+      }
+      if (!all_divisible) {
+        continue;
+      }
+    }
+    std::unordered_set<int> bump_indices(bump_vec.begin(), bump_vec.end());
+    int target_scaled_total =
+        ScaledTotalForResource(specs, target_resource, faster, bump_indices);
+    bool violations = false;
+    for (const auto& kv : totals) {
+      int scaled_total =
+          ScaledTotalForResource(specs, kv.first, faster, bump_indices);
+      if (scaled_total > target_scaled_total) {
+        violations = true;
+        break;
+      }
+    }
+    if (!violations) {
+      return {std::max(1, faster), bump_vec};
+    }
+  }
+
+  auto [gcd_value, bump_vec] =
+      TryGCDWithOptionalBumps(usage[target_resource], target_total,
+                              target_upper);
+  return {std::max(1, gcd_value), bump_vec};
 }
 
 int GetEnvInt(const char* name, int default_value) {
@@ -390,9 +589,37 @@ void MaybeExportProblemJson(const Problem& prob, bool debug) {
   }
 }
 
+std::string AddStageSuffixToPath(const std::string& path, int stage) {
+  if (path.empty()) {
+    return path;
+  }
+  std::string suffix = "_" + std::to_string(stage);
+  size_t dot = path.find_last_of('.');
+  size_t slash = path.find_last_of("/\\");
+  if (dot == std::string::npos ||
+      (slash != std::string::npos && dot < slash)) {
+    return path + suffix;
+  }
+  return path.substr(0, dot) + suffix + path.substr(dot);
+}
+
+void MaybeExportProblemJsonForStage(const Problem& prob, bool debug, int stage) {
+  std::string export_path = GetEnvString("TL_SUNMMIO_ILP_PROBLEM_JSON");
+  if (export_path.empty() && debug) {
+    export_path = "body_ilp_problem.json";
+  }
+  if (!export_path.empty()) {
+    WriteProblemJson(prob, AddStageSuffixToPath(export_path, stage));
+  }
+}
+
 std::string Name(int b) { return b == 0 ? "ping" : "pong"; }
 
 std::string MemName(int mem) { return mem == 0 ? "wsram" : "asram"; }
+
+std::string BankPhaseName(int phase) {
+  return (phase & 1) == 0 ? "ping" : "pong";
+}
 
 std::string ResourceName(int r) {
   switch (r) {
@@ -412,8 +639,8 @@ std::string ResourceName(int r) {
       return "asram.in";
     case static_cast<int>(IlpResourceType::kAsramOut):
       return "asram.out";
-    case static_cast<int>(IlpResourceType::kRsram):
-      return "rsram";
+    // case static_cast<int>(IlpResourceType::kRsram):
+    //   return "rsram";
     default:
       return "resource_" + std::to_string(r);
   }
@@ -582,7 +809,6 @@ SolutionVerifyResult VerifySolution(const Problem& prob, const SolveResult& sol)
 
   for (int a = 0; a < static_cast<int>(prob.flows.size()); ++a) {
     const auto& write_flow = prob.flows[a];
-    if (write_flow.write_resource < 0) continue;
     auto it_a = internal_pos.find(a);
     if (it_a == internal_pos.end()) continue;
     int z_write = sol.z_bank[it_a->second];
@@ -596,12 +822,14 @@ SolutionVerifyResult VerifySolution(const Problem& prob, const SolveResult& sol)
       if (it_b == internal_pos.end()) continue;
       int z_read = sol.z_bank[it_b->second];
 
-      int write_start_slot = PositiveMod(sol.m[write_flow.prod] + write_flow.w_off, sol.II);
-      int write_parity_flip = ((sol.m[write_flow.prod] + write_flow.w_off) / sol.II) & 1;
-      int read_start_slot =
-          PositiveMod(sol.m[read_flow.cons] + read_flow.delta * sol.II + read_flow.r_off, sol.II);
-      int read_parity_flip =
-          ((sol.m[read_flow.cons] + read_flow.delta * sol.II + read_flow.r_off) / sol.II) & 1;
+      int write_start_time = write_flow.resident
+                                 ? sol.m[read_flow.cons] + write_flow.w_off
+                                 : sol.t[write_flow.prod] + write_flow.w_off;
+      int write_start_slot = PositiveMod(write_start_time, sol.II);
+      int write_parity_flip = (write_start_time / sol.II) & 1;
+      int read_start_time = sol.t[read_flow.cons] + read_flow.delta * sol.II + read_flow.r_off;
+      int read_start_slot = PositiveMod(read_start_time, sol.II);
+      int read_parity_flip = (read_start_time / sol.II) & 1;
       ConflictType conflict =
           AnalyzeWriteReadConflict(write_start_slot, write_flow.w_dur, write_parity_flip,
                                    read_start_slot, read_flow.r_dur, read_parity_flip,
@@ -627,9 +855,12 @@ SolutionVerifyResult VerifySolution(const Problem& prob, const SolveResult& sol)
   return result;
 }
 
-void WriteSolutionJson(const std::string& path, const Problem& prob,
-                       const SolveResult& sol,
-                       const SolutionVerifyResult& verify) {
+void WriteSolutionJson(
+    const std::string& path, const Problem& prob, const SolveResult& sol,
+    const SolutionVerifyResult& verify,
+    const std::map<std::string, int>& runtime_bank_start_phases,
+    const std::map<std::string, int>& runtime_bank_read_delta_parities,
+    const std::map<std::string, std::map<int, int>>& runtime_bank_reader_phases) {
   std::ofstream out(path);
   ICHECK(out.is_open()) << "Failed to open ILP solution json path: " << path;
   out << std::boolalpha;
@@ -672,26 +903,79 @@ void WriteSolutionJson(const std::string& path, const Problem& prob,
   out << "  },\n";
 
   out << "  \"flows\": [";
+  bool first_flow = true;
+  std::unordered_set<std::string> emitted_resident_buffers;
   for (int v = 0; v < static_cast<int>(prob.flows.size()); ++v) {
     const auto& flow = prob.flows[v];
-    ICHECK(!flow.resident)
-        << "resident flows are no longer modeled explicitly; adjust bank capacity directly";
+    if (flow.resident) {
+      if (!emitted_resident_buffers.insert(flow.buffer_name).second) {
+        continue;
+      }
+      auto it_start_bank = runtime_bank_start_phases.find(flow.buffer_name);
+      if (it_start_bank == runtime_bank_start_phases.end()) {
+        continue;
+      }
+      int bank = it_start_bank->second;
+      int cons_start = sol.t[flow.cons] + flow.delta * sol.II + flow.r_off;
+      int cons_end = cons_start + flow.r_dur;
+      int release_time = cons_end;
+      if (!first_flow) {
+        out << ", ";
+      }
+      first_flow = false;
+      out << "{";
+      out << "\"idx\": " << v;
+      out << ", \"kind\": ";
+      WriteJsonString(out, "resident");
+      out << ", \"prod\": -1";
+      out << ", \"prod_label\": ";
+      WriteJsonString(out, "resident");
+      out << ", \"cons\": " << flow.cons;
+      out << ", \"delta\": " << flow.delta;
+      out << ", \"buffer_name\": ";
+      WriteJsonString(out, flow.buffer_name);
+      out << ", \"write_resource\": -1";
+      out << ", \"read_resource\": " << flow.read_resource;
+      out << ", \"write_resource_name\": ";
+      WriteJsonString(out, "");
+      out << ", \"read_resource_name\": ";
+      WriteJsonString(out, flow.read_resource < 0 ? "" : ResourceName(flow.read_resource));
+      out << ", \"memory\": " << flow.mem;
+      out << ", \"memory_name\": ";
+      WriteJsonString(out, MemName(flow.mem));
+      out << ", \"bank\": ";
+      WriteJsonString(out, Name(bank));
+      out << ", \"start_bank\": ";
+      WriteJsonString(out, Name(bank));
+      out << ", \"write_time\": 0";
+      out << ", \"write_end\": 0";
+      out << ", \"read_time\": " << cons_start;
+      out << ", \"read_end\": " << cons_end;
+      out << ", \"release_time\": " << release_time;
+      out << ", \"write_resource\": -1";
+      out << ", \"read_resource\": " << flow.read_resource;
+      out << "}";
+      continue;
+    }
+
     int bank = sol.z_bank[internal_pos.at(v)];
-    int prod_start = sol.t[flow.prod] + flow.w_off;
-    int prod_end = prod_start + flow.w_dur;
     int cons_start = sol.t[flow.cons] + flow.delta * sol.II + flow.r_off;
+    int prod_start =
+        sol.t[flow.prod] + flow.w_off;
+    int prod_end = prod_start + flow.w_dur;
     int cons_end = cons_start + flow.r_dur;
-    int release_time = cons_end;
-    if (v != 0) {
+    int release_time = std::max(prod_end, cons_end);
+    if (!first_flow) {
       out << ", ";
     }
+    first_flow = false;
     out << "{";
     out << "\"idx\": " << v;
     out << ", \"kind\": ";
-    WriteJsonString(out, "internal");
+    WriteJsonString(out, flow.resident ? "resident" : "internal");
     out << ", \"prod\": " << flow.prod;
     out << ", \"prod_label\": ";
-    WriteJsonString(out, std::to_string(flow.prod));
+    WriteJsonString(out, flow.prod >= 0 ? std::to_string(flow.prod) : "resident");
     out << ", \"cons\": " << flow.cons;
     out << ", \"delta\": " << flow.delta;
     out << ", \"buffer_name\": ";
@@ -707,6 +991,8 @@ void WriteSolutionJson(const std::string& path, const Problem& prob,
     WriteJsonString(out, MemName(flow.mem));
     out << ", \"bank\": ";
     WriteJsonString(out, Name(bank));
+    out << ", \"start_bank\": ";
+    WriteJsonString(out, Name(bank));
     out << ", \"write_time\": " << prod_start;
     out << ", \"write_end\": " << prod_end;
     out << ", \"read_time\": " << cons_start;
@@ -716,6 +1002,7 @@ void WriteSolutionJson(const std::string& path, const Problem& prob,
     out << ", \"read_resource\": " << flow.read_resource;
     out << "}";
   }
+
   out << "],\n";
 
   out << "  \"verify\": {";
@@ -1501,6 +1788,39 @@ FlowSpec MakeInternalFlowSpec(const Problem& problem, int prod, int cons, int de
   return flow;
 }
 
+FlowSpec MakeResidentFlowSpec(const Problem& problem, int cons, int mem,
+                              const std::string& buffer_name) {
+  FlowSpec flow;
+  flow.resident = true;
+  flow.prod = -1;
+  flow.cons = cons;
+  flow.delta = 0;
+  flow.mem = mem;
+  flow.buffer_name = buffer_name;
+  flow.fixed_bank = -1;
+  flow.fp = 1;
+  flow.initial_time = 0;
+  flow.w_off = 0;
+  flow.w_dur = 0;
+  flow.r_off = 0;
+  flow.r_dur = problem.P[cons].latency;
+  flow.write_resource = -1;
+  flow.read_resource = GetMemoryReadResource(mem);
+  return flow;
+}
+
+std::string ExtractBufferNameFromCommandLabel(const std::string& name) {
+  size_t arrow = name.find("->");
+  if (arrow == std::string::npos) {
+    return "";
+  }
+  size_t at = name.find('@', arrow + 2);
+  if (at == std::string::npos) {
+    return "";
+  }
+  return name.substr(arrow + 2, at - (arrow + 2));
+}
+
 int PositiveMod(int value, int mod) {
   if (mod <= 0) {
     return value;
@@ -1517,6 +1837,260 @@ int RuntimeVersionCount(const Buffer& buffer, int iterations) {
     return 1;
   }
   return iterations;
+}
+
+int RuntimeBankedVersionCount(const Buffer& buffer, int iterations) {
+  if (iterations <= 2 || GetPingPongMemoryKind(buffer) < 0) {
+    return 1;
+  }
+  return CeilDiv(iterations, 2);
+}
+
+struct ScheduledAccessWindow {
+  int logical_iter{0};
+  int command_iter{0};
+  int cmd_id{-1};
+  int start{0};
+  int end{0};
+  bool is_write{false};
+  BufferRegion region;
+};
+
+struct BufferInstanceLifetime {
+  int logical_iter{0};
+  int command_iter{0};
+  int first_write_cmd_id{-1};
+  int write_bank{-1};
+  int start{0};
+  int end{0};
+  std::vector<BufferRegion> access_regions;
+  std::vector<BufferRegion> write_regions;
+};
+
+std::vector<Buffer> DetectRuntimeMultiversionBuffers(
+    const std::vector<TemplateCommand>& commands,
+    const std::vector<Buffer>& versioned_buffers,
+    const std::vector<Buffer>& runtime_banked_buffers,
+    const Var& pipeline_loop_var, const SolveResult& sol, int stage_count,
+    const std::map<std::string, int>& runtime_bank_start_phases,
+    const std::map<std::string, std::map<int, int>>& runtime_bank_writer_phases) {
+  // Final runtime multiversion annotations must be derived from the selected
+  // steady-state window of the optimized solution, not from the original
+  // num_stages request before stage shrinking.
+  stage_count = std::max(stage_count, 0);
+  std::unordered_set<const BufferNode*> candidates;
+  std::unordered_set<const BufferNode*> banked_candidates;
+  for (const Buffer& buffer : runtime_banked_buffers) {
+    banked_candidates.insert(buffer.get());
+  }
+  for (const Buffer& buffer : versioned_buffers) {
+    int version_count =
+        banked_candidates.count(buffer.get())
+            ? RuntimeBankedVersionCount(buffer, stage_count)
+            : RuntimeVersionCount(buffer, stage_count);
+    if (version_count > 1) {
+      candidates.insert(buffer.get());
+    }
+  }
+  if (candidates.empty()) {
+    return {};
+  }
+
+  int max_iter_offset = 0;
+  for (const TemplateCommand& cmd : commands) {
+    for (const AccessInfo& access : cmd.accesses) {
+      max_iter_offset = std::max(max_iter_offset, access.iter_offset);
+    }
+  }
+
+  const int expanded_iters =
+      std::max(2, stage_count + max_iter_offset + 1);
+  std::unordered_map<const BufferNode*, std::vector<ScheduledAccessWindow>>
+      windows_by_buffer;
+  windows_by_buffer.reserve(candidates.size());
+
+  struct ExpandedCommand {
+    int iter{0};
+    const TemplateCommand* cmd{nullptr};
+  };
+
+  std::vector<int> producer_ids;
+  std::vector<int> body_ids;
+  producer_ids.reserve(commands.size());
+  body_ids.reserve(commands.size());
+  for (const TemplateCommand& cmd : commands) {
+    if (IsProducerLike(cmd)) {
+      producer_ids.push_back(cmd.id);
+    } else {
+      body_ids.push_back(cmd.id);
+    }
+  }
+
+  std::vector<ExpandedCommand> expanded_commands;
+  expanded_commands.reserve(expanded_iters * commands.size());
+  for (int iter = 0; iter < expanded_iters; ++iter) {
+    for (int id : body_ids) {
+      expanded_commands.push_back(ExpandedCommand{iter, &commands[id]});
+    }
+    for (int id : producer_ids) {
+      expanded_commands.push_back(ExpandedCommand{iter + 1, &commands[id]});
+    }
+  }
+  std::sort(expanded_commands.begin(), expanded_commands.end(),
+            [](const ExpandedCommand& a, const ExpandedCommand& b) {
+              if (a.iter != b.iter) {
+                return a.iter < b.iter;
+              }
+              return a.cmd->id < b.cmd->id;
+            });
+
+  for (const ExpandedCommand& expanded : expanded_commands) {
+    const int start = sol.t[expanded.cmd->id] + expanded.iter * sol.II;
+    const int end = start + expanded.cmd->spec.latency;
+    for (const AccessInfo& access : expanded.cmd->accesses) {
+      const BufferNode* buf = access.buffer().get();
+      if (!candidates.count(buf)) {
+        continue;
+      }
+      windows_by_buffer[buf].push_back(
+          ScheduledAccessWindow{
+              expanded.iter + access.iter_offset,
+              expanded.iter,
+              expanded.cmd->id,
+              start,
+              end,
+              access.is_write,
+              MaterializeBufferRegion(access.region, pipeline_loop_var,
+                                      expanded.iter)});
+    }
+  }
+
+  auto region_sets_intersect = [](const std::vector<BufferRegion>& lhs,
+                                  const std::vector<BufferRegion>& rhs) {
+    for (const BufferRegion& lhs_region : lhs) {
+      for (const BufferRegion& rhs_region : rhs) {
+        if (PipelineRegionIntersect(lhs_region->region, rhs_region->region)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  auto resolve_write_bank = [&](const Buffer& buffer,
+                                const BufferInstanceLifetime& lifetime) {
+    if (!banked_candidates.count(buffer.get())) {
+      return -1;
+    }
+    int phase = 0;
+    auto it_writer = runtime_bank_writer_phases.find(buffer->name);
+    if (it_writer != runtime_bank_writer_phases.end()) {
+      auto it_phase = it_writer->second.find(lifetime.first_write_cmd_id);
+      if (it_phase != it_writer->second.end()) {
+        phase = it_phase->second;
+      }
+    } else {
+      auto it_start = runtime_bank_start_phases.find(buffer->name);
+      if (it_start != runtime_bank_start_phases.end()) {
+        phase = it_start->second;
+      }
+    }
+    return PositiveMod(lifetime.command_iter + phase, 2);
+  };
+
+  std::vector<Buffer> runtime_multiversion_buffers;
+  for (const Buffer& buffer : versioned_buffers) {
+    if (!candidates.count(buffer.get())) {
+      continue;
+    }
+
+    auto it_windows = windows_by_buffer.find(buffer.get());
+    if (it_windows == windows_by_buffer.end()) {
+      continue;
+    }
+
+    std::unordered_map<int, std::vector<const ScheduledAccessWindow*>>
+        windows_by_logical_iter;
+    for (const ScheduledAccessWindow& window : it_windows->second) {
+      windows_by_logical_iter[window.logical_iter].push_back(&window);
+    }
+
+    std::vector<BufferInstanceLifetime> lifetimes;
+    lifetimes.reserve(windows_by_logical_iter.size());
+    for (const auto& kv : windows_by_logical_iter) {
+      int first_write_start = std::numeric_limits<int>::max();
+      const ScheduledAccessWindow* first_write_window = nullptr;
+      for (const ScheduledAccessWindow* window : kv.second) {
+        if (window->is_write) {
+          if (window->start < first_write_start) {
+            first_write_start = window->start;
+            first_write_window = window;
+          }
+        }
+      }
+      if (first_write_start == std::numeric_limits<int>::max()) {
+        continue;
+      }
+
+      BufferInstanceLifetime lifetime;
+      lifetime.logical_iter = kv.first;
+      lifetime.command_iter =
+          first_write_window == nullptr ? kv.first : first_write_window->command_iter;
+      lifetime.first_write_cmd_id =
+          first_write_window == nullptr ? -1 : first_write_window->cmd_id;
+      lifetime.start = first_write_start;
+      lifetime.end = first_write_start;
+      for (const ScheduledAccessWindow* window : kv.second) {
+        if (window->end < first_write_start) {
+          continue;
+        }
+        lifetime.end = std::max(lifetime.end, window->end);
+        lifetime.access_regions.push_back(window->region);
+        if (window->is_write) {
+          lifetime.write_regions.push_back(window->region);
+        }
+      }
+      if (!lifetime.write_regions.empty()) {
+        lifetime.write_bank = resolve_write_bank(buffer, lifetime);
+        lifetimes.push_back(std::move(lifetime));
+      }
+    }
+
+    std::sort(lifetimes.begin(), lifetimes.end(),
+              [](const BufferInstanceLifetime& a,
+                 const BufferInstanceLifetime& b) {
+                if (a.start != b.start) {
+                  return a.start < b.start;
+                }
+                return a.logical_iter < b.logical_iter;
+              });
+
+    bool needs_runtime_multiversion = false;
+    bool is_banked = banked_candidates.count(buffer.get()) != 0;
+    for (size_t i = 0; i < lifetimes.size() && !needs_runtime_multiversion; ++i) {
+      for (size_t j = i + 1; j < lifetimes.size(); ++j) {
+        if (lifetimes[j].start >= lifetimes[i].end) {
+          break;
+        }
+        if (is_banked && lifetimes[i].write_bank != lifetimes[j].write_bank) {
+          continue;
+        }
+        if (region_sets_intersect(lifetimes[i].write_regions,
+                                  lifetimes[j].access_regions) ||
+            region_sets_intersect(lifetimes[j].write_regions,
+                                  lifetimes[i].access_regions)) {
+          needs_runtime_multiversion = true;
+          break;
+        }
+      }
+    }
+
+    if (needs_runtime_multiversion) {
+      runtime_multiversion_buffers.push_back(buffer);
+    }
+  }
+
+  return runtime_multiversion_buffers;
 }
 
 TimeWindowOrderResult BuildTimeWindowOrders(
@@ -1747,15 +2321,19 @@ void BuildTemplateDependencyGraph(
 
   std::map<std::pair<int, int>, int> best_delta;
   std::map<std::tuple<int, int, const BufferNode*, int, int>, int> flow_key_to_index;
+  std::set<std::pair<int, int>> satisfied_consumer_mem;
 
   auto version_mod = [&](const BufferNode* buf) {
     if (iter_mod <= 0) {
       return 0;
     }
     if (bank_rotating_versioned.count(buf)) {
-      // Ping/pong only flips the physical bank; it does not add a runtime
-      // multiversion axis. The same bank aliases every two logical iterations.
-      return 2;
+      // Banked buffers always rotate ping/pong every iteration. When
+      // num_stages > 2 we additionally attach a runtime multiversion axis to
+      // each ping/pong bank, so the full physical alias period becomes
+      // 2 * ceil(num_stages / 2). For num_stages <= 2 this collapses to the
+      // original ping/pong-only period 2.
+      return 2 * std::max(1, CeilDiv(iter_mod, 2));
     }
     return iter_mod;
   };
@@ -1917,13 +2495,13 @@ void BuildTemplateDependencyGraph(
                                const BufferNode* buf, int src_access_idx,
                                int dst_access_idx, int mem) {
     if (mem < 0 || src_id == dst_id) {
-      return;
+      return false;
     }
     int write_resource = GetMemoryWriteResource(mem);
     int read_resource = GetMemoryReadResource(mem);
     if (!CommandUsesResource(problem->P[src_id], write_resource) ||
         !CommandUsesResource(problem->P[dst_id], read_resource)) {
-      return;
+      return false;
     }
     auto flow_key =
         std::make_tuple(src_id, dst_id, buf, src_access_idx, dst_access_idx);
@@ -1937,6 +2515,7 @@ void BuildTemplateDependencyGraph(
       problem->flows[it->second].delta =
           std::min(problem->flows[it->second].delta, delta);
     }
+    return true;
   };
 
   std::vector<int> producer_ids;
@@ -1994,6 +2573,13 @@ void BuildTemplateDependencyGraph(
       buffer_access_history;
   buffer_access_history.reserve(versioned.size() + commands.size());
 
+  struct ResidentCandidate {
+    int cmd_id{-1};
+    int mem{-1};
+    std::string buffer_name;
+  };
+  std::vector<ResidentCandidate> resident_candidates;
+
   for (int curr_idx = 0; curr_idx < static_cast<int>(expanded_commands.size());
        ++curr_idx) {
     const ExpandedCommand& curr_cmd = expanded_commands[curr_idx];
@@ -2025,10 +2611,15 @@ void BuildTemplateDependencyGraph(
         }
         maybe_record_edge(src_cmd.template_id, curr_cmd.template_id,
                           curr_cmd.iter - src_cmd.iter);
-        maybe_record_flow(src_cmd.template_id, curr_cmd.template_id,
-                          curr_cmd.iter - src_cmd.iter, buf,
-                          it->access_idx, dst_access_idx,
-                          GetPingPongMemoryKind(dst_access.buffer()));
+        int mem = GetPingPongMemoryKind(dst_access.buffer());
+        bool has_concrete_flow =
+            maybe_record_flow(src_cmd.template_id, curr_cmd.template_id,
+                              curr_cmd.iter - src_cmd.iter, buf,
+                              it->access_idx, dst_access_idx, mem);
+        if (has_concrete_flow) {
+          satisfied_consumer_mem.insert(
+              std::make_pair(curr_cmd.template_id, mem));
+        }
         break;
       }
     }
@@ -2080,6 +2671,44 @@ void BuildTemplateDependencyGraph(
     problem->dep_edges.push_back(kv.first);
     problem->delta[EdgeKey(kv.first.first, kv.first.second)] = kv.second;
   }
+
+  for (const TemplateCommand& cmd : commands) {
+    for (int mem = 0; mem <= 1; ++mem) {
+      int read_resource = GetMemoryReadResource(mem);
+      if (!CommandUsesResource(problem->P[cmd.id], read_resource)) {
+        continue;
+      }
+      std::string buffer_name = "resident_" + MemName(mem) + "_cmd_" +
+                                std::to_string(cmd.id);
+      for (const AccessInfo& access : cmd.accesses) {
+        if (access.is_write) {
+          continue;
+        }
+        if (GetPingPongMemoryKind(access.buffer()) == mem) {
+          buffer_name = access.buffer()->name;
+          break;
+        }
+      }
+      resident_candidates.push_back(
+          ResidentCandidate{cmd.id, mem, buffer_name});
+    }
+  }
+
+  std::set<std::pair<int, int>> emitted_resident_consumer_mem;
+  for (const ResidentCandidate& candidate : resident_candidates) {
+    if (satisfied_consumer_mem.count(
+            std::make_pair(candidate.cmd_id, candidate.mem)) != 0) {
+      continue;
+    }
+    if (!emitted_resident_consumer_mem.insert(
+            std::make_pair(candidate.cmd_id, candidate.mem)).second) {
+      continue;
+    }
+    problem->flows.push_back(
+        MakeResidentFlowSpec(*problem, candidate.cmd_id, candidate.mem,
+                             candidate.buffer_name));
+  }
+
 }
 
 int ResourceLowerBound(const Problem& prob) {
@@ -2193,8 +2822,6 @@ ModelVars BuildModel(Highs& highs, const Problem& prob, int II, bool optimize_t,
   vars.col_a.assign(prob.N, std::vector<HighsInt>(II, -1));
 
   for (int v = 0; v < static_cast<int>(prob.flows.size()); ++v) {
-    ICHECK(!prob.flows[v].resident)
-        << "resident flows are no longer modeled explicitly; adjust bank capacity directly";
     vars.internal_flow_ids.push_back(v);
   }
 
@@ -2304,28 +2931,48 @@ ModelVars BuildModel(Highs& highs, const Problem& prob, int II, bool optimize_t,
     vars.col_z[vv] = AddCol(highs, 0, 1, 0, true);
   }
 
+  {
+    std::map<SameWriteFlowKey, std::vector<int>> same_write_groups;
+    for (int vv = 0; vv < internal_count; ++vv) {
+      int fid = vars.internal_flow_ids[vv];
+      const FlowSpec& flow = prob.flows[fid];
+      if (flow.write_resource < 0 || flow.prod < 0) continue;
+      same_write_groups[MakeSameWriteFlowKey(flow)].push_back(vv);
+    }
+    for (const auto& kv : same_write_groups) {
+      const std::vector<int>& flows = kv.second;
+      for (size_t i = 1; i < flows.size(); ++i) {
+        AddEq(highs, {vars.col_z[flows[0]], vars.col_z[flows[i]]},
+              {1.0, -1.0}, 0.0);
+      }
+    }
+  }
+
   auto bank_build_begin = std::chrono::steady_clock::now();
   for (int a = 0; a < internal_count; ++a) {
     const auto& write_flow = prob.flows[vars.internal_flow_ids[a]];
-    if (write_flow.write_resource < 0) continue;
     for (int b = 0; b < internal_count; ++b) {
       if (a == b) continue;
       const auto& read_flow = prob.flows[vars.internal_flow_ids[b]];
       if (read_flow.read_resource < 0) continue;
       if (write_flow.mem != read_flow.mem) continue;
 
-      for (int prod_slot = 0; prod_slot < II; ++prod_slot) {
-        int write_start_slot = PositiveMod(prod_slot + write_flow.w_off, II);
-        int write_parity_flip = ((prod_slot + write_flow.w_off) / II) & 1;
+      int prod_slot_begin = write_flow.resident ? 0 : 0;
+      int prod_slot_end = write_flow.resident ? II : II;
+      for (int prod_slot = prod_slot_begin; prod_slot < prod_slot_end; ++prod_slot) {
+        int write_start_time =
+            write_flow.resident ? prod_slot + write_flow.w_off
+                                : prod_slot + write_flow.w_off;
+        int write_start_slot = PositiveMod(write_start_time, II);
+        int write_parity_flip = (write_start_time / II) & 1;
         std::map<int, int> write_slot_rho =
             BuildSlotRhoMap(write_start_slot, write_flow.w_dur, II);
         std::vector<int> diff_cons_slots;
         std::vector<int> same_cons_slots;
         std::vector<int> impossible_cons_slots;
         for (int cons_slot = 0; cons_slot < II; ++cons_slot) {
-          int read_start_slot =
-              PositiveMod(cons_slot + read_flow.delta * II + read_flow.r_off, II);
-          int read_parity_flip = write_parity_flip;
+          int read_start_slot = PositiveMod(cons_slot + read_flow.r_off, II);
+          int read_parity_flip = (write_parity_flip + read_flow.delta) & 1;
           bool saw_same = false;
           bool saw_diff = false;
           for (int step = 0; step < read_flow.r_dur; ++step) {
@@ -2358,54 +3005,75 @@ ModelVars BuildModel(Highs& highs, const Problem& prob, int II, bool optimize_t,
           }
         }
 
-        HighsInt x_prod = vars.col_x[write_flow.prod][prod_slot];
+        HighsInt x_prod =
+            write_flow.resident ? HighsInt(-1) : vars.col_x[write_flow.prod][prod_slot];
         HighsInt z_write_ping = vars.col_z[a];
         HighsInt z_read_ping = vars.col_z[b];
 
         if (!diff_cons_slots.empty()) {
-          std::vector<HighsInt> idx{x_prod, z_write_ping, z_read_ping};
-          std::vector<double> val{1.0, -1.0, -1.0};
+          std::vector<HighsInt> idx{z_write_ping, z_read_ping};
+          std::vector<double> val{-1.0, -1.0};
+          if (x_prod >= 0) {
+            idx.insert(idx.begin(), x_prod);
+            val.insert(val.begin(), 1.0);
+          }
           for (int cons_slot : diff_cons_slots) {
             idx.push_back(vars.col_x[read_flow.cons][cons_slot]);
             val.push_back(1.0);
           }
-          AddLeq(highs, idx, val, 1.0);
+          AddLeq(highs, idx, val, x_prod >= 0 ? 1.0 : 0.0);
 
-          idx = {x_prod, z_write_ping, z_read_ping};
-          val = {1.0, 1.0, 1.0};
+          idx = {z_write_ping, z_read_ping};
+          val = {1.0, 1.0};
+          if (x_prod >= 0) {
+            idx.insert(idx.begin(), x_prod);
+            val.insert(val.begin(), 1.0);
+          }
           for (int cons_slot : diff_cons_slots) {
             idx.push_back(vars.col_x[read_flow.cons][cons_slot]);
             val.push_back(1.0);
           }
-          AddLeq(highs, idx, val, 3.0);
+          AddLeq(highs, idx, val, x_prod >= 0 ? 3.0 : 2.0);
         }
 
         if (!same_cons_slots.empty()) {
-          std::vector<HighsInt> idx{x_prod, z_write_ping, z_read_ping};
-          std::vector<double> val{1.0, 1.0, -1.0};
+          std::vector<HighsInt> idx{z_write_ping, z_read_ping};
+          std::vector<double> val{1.0, -1.0};
+          if (x_prod >= 0) {
+            idx.insert(idx.begin(), x_prod);
+            val.insert(val.begin(), 1.0);
+          }
           for (int cons_slot : same_cons_slots) {
             idx.push_back(vars.col_x[read_flow.cons][cons_slot]);
             val.push_back(1.0);
           }
-          AddLeq(highs, idx, val, 2.0);
+          AddLeq(highs, idx, val, x_prod >= 0 ? 2.0 : 1.0);
 
-          idx = {x_prod, z_write_ping, z_read_ping};
-          val = {1.0, -1.0, 1.0};
+          idx = {z_write_ping, z_read_ping};
+          val = {-1.0, 1.0};
+          if (x_prod >= 0) {
+            idx.insert(idx.begin(), x_prod);
+            val.insert(val.begin(), 1.0);
+          }
           for (int cons_slot : same_cons_slots) {
             idx.push_back(vars.col_x[read_flow.cons][cons_slot]);
             val.push_back(1.0);
           }
-          AddLeq(highs, idx, val, 2.0);
+          AddLeq(highs, idx, val, x_prod >= 0 ? 2.0 : 1.0);
         }
 
         if (!impossible_cons_slots.empty()) {
-          std::vector<HighsInt> idx{x_prod};
-          std::vector<double> val{1.0};
+          std::vector<HighsInt> idx;
+          std::vector<double> val;
+          if (x_prod >= 0) {
+            idx.push_back(x_prod);
+            val.push_back(1.0);
+          }
           for (int cons_slot : impossible_cons_slots) {
             idx.push_back(vars.col_x[read_flow.cons][cons_slot]);
             val.push_back(1.0);
           }
-          AddLeq(highs, idx, val, 1.0);
+          AddLeq(highs, idx, val, x_prod >= 0 ? 1.0 : 0.0);
         }
       }
     }
@@ -2570,11 +3238,15 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
     std::vector<Buffer> runtime_multiversion_buffers;
     std::vector<Buffer> runtime_banked_buffers;
     std::map<std::string, int> runtime_bank_start_phases;
+    std::map<std::string, int> runtime_bank_read_delta_parities;
+    std::map<std::string, std::map<int, int>> runtime_bank_writer_phases;
+    std::map<std::string, std::map<int, int>> runtime_bank_reader_phases;
     int iterations{0};
   };
 
   IlpLoopAnalysis AnalyzeLoop(const For& loop,
-                              const SeqStmtNode* pipeline_body_seq) {
+                              const SeqStmtNode* pipeline_body_seq,
+                              int forced_iterations = -1) {
     IlpLoopAnalysis result;
     bool export_only = GetEnvBool("TL_SUNMMIO_ILP_EXPORT_ONLY", false);
     int num_stages = -1;
@@ -2585,6 +3257,9 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
       num_stages = imm->value;
     }
     ICHECK_GT(num_stages, 0);
+    if (forced_iterations > 0) {
+      num_stages = forced_iterations;
+    }
     result.iterations = num_stages;
 
     ASTTraverser traverser(func_);
@@ -2593,8 +3268,6 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
     result.commands.reserve(pipeline_body_seq->seq.size());
 
     std::set<int> resource_set;
-    int total_latency = 0;
-    int latency_gcd = 0;
     for (int i = 0; i < static_cast<int>(pipeline_body_seq->seq.size()); ++i) {
       const Stmt& stmt = pipeline_body_seq->seq[i];
       TemplateCommand cmd(i, stmt);
@@ -2608,9 +3281,6 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
       cmd.spec.latency = std::max(cmd.spec.latency, 1);
       cmd.spec.resources = BuildIlpResources(stmt, cmd.type, cmd.accesses);
       cmd.spec.name = cmd.name + ": " + SummarizeStmtForName(stmt);
-      total_latency += cmd.spec.latency;
-      latency_gcd = latency_gcd == 0 ? cmd.spec.latency
-                                     : GcdInt(latency_gcd, cmd.spec.latency);
       for (int resource : cmd.spec.resources) {
         resource_set.insert(resource);
       }
@@ -2627,12 +3297,49 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
       result.commands.push_back(cmd);
     }
 
-    if (latency_gcd <= 0) {
-      latency_gcd = 1;
+    result.prob.N = static_cast<int>(result.commands.size());
+    result.prob.P.resize(result.prob.N);
+    for (const TemplateCommand& cmd : result.commands) {
+      result.prob.P[cmd.id] = cmd.spec;
     }
-    int faster = GetEnvInt("TL_SUNMMIO_ILP_FASTER", 1);
+
+    int faster = 0;
+    std::vector<int> bump_indices;
+    {
+      auto pass_ctx = tvm::transform::PassContext::Current();
+      auto cfg = pass_ctx->GetConfig<Integer>(tl::kSunmmioILPFaster);
+      if (cfg.defined()) {
+        faster = static_cast<int>(cfg.value()->value);
+      }
+    }
+    if (faster <= 0) {
+      faster = GetEnvInt("TL_SUNMMIO_ILP_FASTER", 0);
+    }
+    if (faster <= 0) {
+      auto auto_selected = AutoSelectSunmmioILPFaster(result.prob.P);
+      faster = auto_selected.first;
+      bump_indices = std::move(auto_selected.second);
+    }
     if (faster <= 0) {
       faster = 1;
+    }
+
+    std::unordered_set<int> bump_index_set(bump_indices.begin(),
+                                           bump_indices.end());
+    int total_latency = 0;
+    int latency_gcd = 0;
+    for (int i = 0; i < static_cast<int>(result.commands.size()); ++i) {
+      if (bump_index_set.count(i)) {
+        result.commands[i].spec.latency += 1;
+      }
+      total_latency += result.commands[i].spec.latency;
+      latency_gcd = latency_gcd == 0 ? result.commands[i].spec.latency
+                                     : GcdInt(latency_gcd,
+                                              result.commands[i].spec.latency);
+    }
+
+    if (latency_gcd <= 0) {
+      latency_gcd = 1;
     }
     for (TemplateCommand& cmd : result.commands) {
       cmd.spec.latency /= latency_gcd;
@@ -2645,13 +3352,11 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
       total_latency = CeilDiv(total_latency, faster);
     }
 
-    result.prob.N = static_cast<int>(result.commands.size());
     result.prob.Tmax = total_latency + 10;
     result.prob.R.assign(resource_set.begin(), resource_set.end());
     for (int resource : result.prob.R) {
       result.prob.cap[resource] = 1;
     }
-    result.prob.P.resize(result.prob.N);
     for (const TemplateCommand& cmd : result.commands) {
       result.prob.P[cmd.id] = cmd.spec;
     }
@@ -2659,13 +3364,11 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
     std::sort(result.versioned_buffers.begin(), result.versioned_buffers.end(),
               [](const Buffer& a, const Buffer& b) { return a->name < b->name; });
     result.runtime_multiversion_buffers.clear();
-    for (const Buffer& buffer : result.versioned_buffers) {
-      if (RuntimeVersionCount(buffer, num_stages) > 1) {
-        result.runtime_multiversion_buffers.push_back(buffer);
-      }
-    }
     result.runtime_banked_buffers.clear();
     result.runtime_bank_start_phases.clear();
+    result.runtime_bank_read_delta_parities.clear();
+    result.runtime_bank_writer_phases.clear();
+    result.runtime_bank_reader_phases.clear();
     result.prob.versioned_buffer_names.clear();
     for (const Buffer& buffer : result.versioned_buffers) {
       result.prob.versioned_buffer_names.push_back(buffer->name);
@@ -2673,6 +3376,222 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
     BuildTemplateDependencyGraph(result.commands, num_stages, result.versioned_buffers,
                                  loop->loop_var, &result.prob);
     return result;
+  }
+
+  struct StageShrinkResult {
+    IlpLoopAnalysis analysis;
+    SolveResult sol;
+  };
+
+  bool ShouldEnableStageShrink() const {
+    auto pass_ctx = tvm::transform::PassContext::Current();
+    auto cfg = pass_ctx->GetConfig<Bool>(tl::kSunmmioILPStageShrink);
+    if (cfg.defined()) {
+      return cfg.value()->value;
+    }
+    return false;
+  }
+
+  void PopulateRuntimeBankedBuffers(IlpLoopAnalysis* analysis) const {
+    analysis->runtime_banked_buffers.clear();
+    for (const Buffer& buffer : analysis->versioned_buffers) {
+      if (analysis->runtime_bank_start_phases.count(buffer->name)) {
+        analysis->runtime_banked_buffers.push_back(buffer);
+      }
+    }
+  }
+
+  void ExportStageSolutionIfRequested(const IlpLoopAnalysis& analysis,
+                                      const SolveResult& sol, int stage) const {
+    std::string solution_json_path = GetEnvString("TL_SUNMMIO_ILP_SOLUTION_JSON");
+    if (solution_json_path.empty() || !sol.ok) {
+      return;
+    }
+    IlpLoopAnalysis export_analysis = analysis;
+    PopulateRuntimeBankMetadata(&export_analysis, sol);
+    PopulateRuntimeBankedBuffers(&export_analysis);
+    SolutionVerifyResult verify = VerifySolution(export_analysis.prob, sol);
+    WriteSolutionJson(AddStageSuffixToPath(solution_json_path, stage),
+                      export_analysis.prob, sol, verify,
+                      export_analysis.runtime_bank_start_phases,
+                      export_analysis.runtime_bank_read_delta_parities,
+                      export_analysis.runtime_bank_reader_phases);
+  }
+
+  StageShrinkResult SolveWithStageShrink(const For& loop,
+                                         const SeqStmtNode* pipeline_body_seq,
+                                         int threads) {
+    IlpLoopAnalysis base_analysis = AnalyzeLoop(loop, pipeline_body_seq);
+    MaybeExportProblemJsonForStage(base_analysis.prob, debug_,
+                                   base_analysis.iterations);
+    SolveResult base_sol = FindMinimalII(base_analysis.prob, threads);
+    ExportStageSolutionIfRequested(base_analysis, base_sol,
+                                   base_analysis.iterations);
+    if (!base_sol.ok) {
+      return {std::move(base_analysis), std::move(base_sol)};
+    }
+
+    int best_iterations = base_analysis.iterations;
+    for (int candidate_iterations = base_analysis.iterations - 1;
+         candidate_iterations >= 1; --candidate_iterations) {
+      IlpLoopAnalysis candidate_analysis =
+          AnalyzeLoop(loop, pipeline_body_seq, candidate_iterations);
+      MaybeExportProblemJsonForStage(candidate_analysis.prob, debug_,
+                                     candidate_iterations);
+      SolveResult feas =
+          SolveFixedII(candidate_analysis.prob, base_sol.II, false, threads);
+      if (!feas.ok) {
+        continue;
+      }
+      SolveResult candidate_sol =
+          SolveFixedII(candidate_analysis.prob, base_sol.II, true, threads);
+      ExportStageSolutionIfRequested(candidate_analysis, candidate_sol,
+                                     candidate_iterations);
+      best_iterations = candidate_iterations;
+    }
+
+    if (best_iterations == base_analysis.iterations) {
+      return {std::move(base_analysis), std::move(base_sol)};
+    }
+
+    IlpLoopAnalysis final_analysis =
+        AnalyzeLoop(loop, pipeline_body_seq, best_iterations);
+    MaybeExportProblemJsonForStage(final_analysis.prob, debug_,
+                                   final_analysis.iterations);
+    SolveResult final_sol = FindMinimalII(final_analysis.prob, threads);
+    ExportStageSolutionIfRequested(final_analysis, final_sol,
+                                   final_analysis.iterations);
+    return {std::move(final_analysis), std::move(final_sol)};
+  }
+
+  void PopulateRuntimeBankMetadata(IlpLoopAnalysis* analysis,
+                                   const SolveResult& sol) const {
+    std::unordered_map<int, int> internal_pos;
+    for (int i = 0; i < static_cast<int>(sol.internal_flow_ids.size()); ++i) {
+      internal_pos[sol.internal_flow_ids[i]] = i;
+    }
+    std::unordered_set<std::string> has_non_resident_flow;
+    for (int fid = 0; fid < static_cast<int>(analysis->prob.flows.size()); ++fid) {
+      const auto& flow = analysis->prob.flows[fid];
+      if (!flow.resident && !flow.buffer_name.empty()) {
+        has_non_resident_flow.insert(flow.buffer_name);
+      }
+    }
+    for (int fid = 0; fid < static_cast<int>(analysis->prob.flows.size()); ++fid) {
+      const auto& flow = analysis->prob.flows[fid];
+      if (flow.buffer_name.empty()) {
+        continue;
+      }
+      auto flow_pos = internal_pos.find(fid);
+      if (flow_pos == internal_pos.end()) {
+        continue;
+      }
+      int bank_phase = sol.z_bank[flow_pos->second];
+      bool allow_resident_to_own_bank =
+          flow.resident && !has_non_resident_flow.count(flow.buffer_name);
+      if (!flow.resident || allow_resident_to_own_bank) {
+        auto it = analysis->runtime_bank_start_phases.find(flow.buffer_name);
+        if (it == analysis->runtime_bank_start_phases.end()) {
+          analysis->runtime_bank_start_phases[flow.buffer_name] = bank_phase;
+        } else {
+          ICHECK_EQ(it->second, bank_phase)
+              << "Conflicting bank phase for runtime multiversion buffer "
+              << flow.buffer_name;
+        }
+        int delta_parity = flow.delta & 1;
+        auto it_delta =
+            analysis->runtime_bank_read_delta_parities.find(flow.buffer_name);
+        if (it_delta == analysis->runtime_bank_read_delta_parities.end()) {
+          analysis->runtime_bank_read_delta_parities[flow.buffer_name] =
+              delta_parity;
+        } else {
+          ICHECK_EQ(it_delta->second, delta_parity)
+              << "Conflicting read delta parity for banked buffer "
+              << flow.buffer_name;
+        }
+      }
+      if (flow.write_resource >= 0 && flow.prod >= 0) {
+        auto& writer_map = analysis->runtime_bank_writer_phases[flow.buffer_name];
+        auto it_writer = writer_map.find(flow.prod);
+        if (it_writer == writer_map.end()) {
+          writer_map[flow.prod] = bank_phase;
+        } else {
+          ICHECK_EQ(it_writer->second, bank_phase)
+              << "Conflicting writer bank phase for banked buffer "
+              << flow.buffer_name << " op " << flow.prod;
+        }
+      }
+      if (flow.cons >= 0 && flow.read_resource >= 0) {
+        int reader_phase =
+            flow.resident ? bank_phase : ((bank_phase + (flow.delta & 1)) & 1);
+        auto& reader_map = analysis->runtime_bank_reader_phases[flow.buffer_name];
+        auto it_reader = reader_map.find(flow.cons);
+        if (it_reader == reader_map.end()) {
+          reader_map[flow.cons] = reader_phase;
+        } else {
+          ICHECK_EQ(it_reader->second, reader_phase)
+              << "Conflicting reader bank phase for banked buffer "
+              << flow.buffer_name << " op " << flow.cons;
+        }
+      }
+    }
+  }
+
+  void PruneUnnecessaryRuntimeBanking(IlpLoopAnalysis* analysis,
+                                      const SolveResult& sol) {
+    auto mem_needs_pingpong = [&](int mem) {
+      int write_resource = GetMemoryWriteResource(mem);
+      int read_resource = GetMemoryReadResource(mem);
+      if (write_resource < 0 || read_resource < 0) {
+        return false;
+      }
+      for (int slot = 0; slot < sol.II; ++slot) {
+        int write_use = 0;
+        int read_use = 0;
+        for (int i = 0; i < analysis->prob.N; ++i) {
+          const CommandSpec& spec = analysis->prob.P[i];
+          bool uses_write =
+              std::find(spec.resources.begin(), spec.resources.end(),
+                        write_resource) != spec.resources.end();
+          bool uses_read =
+              std::find(spec.resources.begin(), spec.resources.end(),
+                        read_resource) != spec.resources.end();
+          if (!uses_write && !uses_read) {
+            continue;
+          }
+          int occ =
+              ComputeFoldedOccupancy(sol.t[i], spec.latency, sol.II, slot);
+          if (uses_write) {
+            write_use += occ;
+          }
+          if (uses_read) {
+            read_use += occ;
+          }
+        }
+        if (write_use > 0 && read_use > 0) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    bool keep_wsram = mem_needs_pingpong(/*mem=*/0);
+    bool keep_asram = mem_needs_pingpong(/*mem=*/1);
+
+    std::vector<Buffer> pruned_banked_buffers;
+    for (const Buffer& buffer : analysis->runtime_banked_buffers) {
+      int mem = GetPingPongMemoryKind(buffer);
+      bool keep = (mem == 0 && keep_wsram) || (mem == 1 && keep_asram);
+      if (keep) {
+        pruned_banked_buffers.push_back(buffer);
+      } else {
+        analysis->runtime_bank_start_phases.erase(buffer->name);
+        analysis->runtime_bank_read_delta_parities.erase(buffer->name);
+        analysis->runtime_bank_writer_phases.erase(buffer->name);
+        analysis->runtime_bank_reader_phases.erase(buffer->name);
+      }
+    }
+    analysis->runtime_banked_buffers = std::move(pruned_banked_buffers);
   }
 
   Stmt VisitStmt_(const ForNode* op) final {
@@ -2683,19 +3602,42 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
 
     const SeqStmtNode* pipeline_body_seq = GetPipelineBodySeq(loop);
     ICHECK(pipeline_body_seq != nullptr) << "Pipeline body must normalize to SeqStmt.";
-    IlpLoopAnalysis analysis = AnalyzeLoop(loop, pipeline_body_seq);
-    MaybeExportProblemJson(analysis.prob, debug_);
+    int threads = GetEnvInt("HIGHS_THREADS", 20);
+    IlpLoopAnalysis analysis;
+    SolveResult sol;
+    if (ShouldEnableStageShrink()) {
+      StageShrinkResult shrink_result =
+          SolveWithStageShrink(loop, pipeline_body_seq, threads);
+      analysis = std::move(shrink_result.analysis);
+      sol = std::move(shrink_result.sol);
+    } else {
+      analysis = AnalyzeLoop(loop, pipeline_body_seq);
+      MaybeExportProblemJson(analysis.prob, debug_);
+      sol = FindMinimalII(analysis.prob, threads);
+    }
     if (GetEnvBool("TL_SUNMMIO_ILP_EXPORT_ONLY", false)) {
       return loop;
     }
-    int threads = GetEnvInt("HIGHS_THREADS", 20);
-    SolveResult sol = FindMinimalII(analysis.prob, threads);
     ICHECK(sol.ok) << "ILP solve failed for sunmmio pipeline planning.";
+    PopulateRuntimeBankMetadata(&analysis, sol);
+    for (const Buffer& buffer : analysis.versioned_buffers) {
+      if (analysis.runtime_bank_start_phases.count(buffer->name)) {
+        analysis.runtime_banked_buffers.push_back(buffer);
+      }
+    }
+    // Disabled per current ILP annotation semantics:
+    // keep the bank-rotation decision from the solved flow model as-is, and do
+    // not prune ping/pong before annotation.
+    //
+    // PruneUnnecessaryRuntimeBanking(&analysis, sol);
     SolutionVerifyResult verify = VerifySolution(analysis.prob, sol);
     ICHECK(verify.ok) << "ILP solution verification failed: " << verify.errors.front();
     std::string solution_json_path = GetEnvString("TL_SUNMMIO_ILP_SOLUTION_JSON");
     if (!solution_json_path.empty()) {
-      WriteSolutionJson(solution_json_path, analysis.prob, sol, verify);
+      WriteSolutionJson(solution_json_path, analysis.prob, sol, verify,
+                        analysis.runtime_bank_start_phases,
+                        analysis.runtime_bank_read_delta_parities,
+                        analysis.runtime_bank_reader_phases);
     }
     if (GetEnvBool("TL_SUNMMIO_ILP_SOLVE_ONLY", false)) {
       return loop;
@@ -2708,30 +3650,6 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
                 << " ii=" << sol.II;
     }
 
-    std::unordered_map<int, int> internal_pos;
-    for (int i = 0; i < static_cast<int>(sol.internal_flow_ids.size()); ++i) {
-      internal_pos[sol.internal_flow_ids[i]] = i;
-    }
-    for (int fid = 0; fid < static_cast<int>(analysis.prob.flows.size()); ++fid) {
-      const auto& flow = analysis.prob.flows[fid];
-      if (flow.buffer_name.empty()) {
-        continue;
-      }
-      auto flow_pos = internal_pos.find(fid);
-      if (flow_pos == internal_pos.end()) {
-        continue;
-      }
-      int bank_phase = sol.z_bank[flow_pos->second];
-      auto it = analysis.runtime_bank_start_phases.find(flow.buffer_name);
-      if (it == analysis.runtime_bank_start_phases.end()) {
-        analysis.runtime_bank_start_phases[flow.buffer_name] = bank_phase;
-      } else {
-        ICHECK_EQ(it->second, bank_phase)
-            << "Conflicting bank phase for runtime multiversion buffer "
-            << flow.buffer_name;
-      }
-    }
-
     Map<String, Any> annotations;
     for (const auto& kv : op->annotations) {
       if (kv.first != "num_stages" && kv.first != "versioned_buffers") {
@@ -2740,6 +3658,10 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
     }
 
     int stage_count = CeilDiv(sol.makespan, std::max(1, sol.II));
+    analysis.runtime_multiversion_buffers = DetectRuntimeMultiversionBuffers(
+        analysis.commands, analysis.versioned_buffers, analysis.runtime_banked_buffers,
+        loop->loop_var, sol, stage_count, analysis.runtime_bank_start_phases,
+        analysis.runtime_bank_writer_phases);
     annotations.Set("iterations", Integer(analysis.iterations));
     annotations.Set("ii", Integer(sol.II));
     annotations.Set("makespan", Integer(sol.makespan));
@@ -2808,11 +3730,6 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
         analysis.runtime_multiversion_buffers.end());
     annotations.Set("runtime_multiversion_buffers",
                     runtime_multiversion_buffers_array);
-    for (const Buffer& buffer : analysis.versioned_buffers) {
-      if (analysis.runtime_bank_start_phases.count(buffer->name)) {
-        analysis.runtime_banked_buffers.push_back(buffer);
-      }
-    }
     Array<Buffer> runtime_banked_buffers_array(
         analysis.runtime_banked_buffers.begin(),
         analysis.runtime_banked_buffers.end());
@@ -2823,6 +3740,41 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
           buffer, Integer(analysis.runtime_bank_start_phases.at(buffer->name)));
     }
     annotations.Set("runtime_bank_start_phases", runtime_bank_start_phases);
+    Map<Buffer, PrimExpr> runtime_bank_read_delta_parities;
+    for (const Buffer& buffer : analysis.runtime_banked_buffers) {
+      auto it = analysis.runtime_bank_read_delta_parities.find(buffer->name);
+      if (it != analysis.runtime_bank_read_delta_parities.end()) {
+        runtime_bank_read_delta_parities.Set(buffer, Integer(it->second));
+      }
+    }
+    annotations.Set("runtime_bank_read_delta_parities",
+                    runtime_bank_read_delta_parities);
+    Map<Buffer, Map<Integer, PrimExpr>> runtime_bank_writer_phases;
+    for (const Buffer& buffer : analysis.runtime_banked_buffers) {
+      auto it = analysis.runtime_bank_writer_phases.find(buffer->name);
+      if (it == analysis.runtime_bank_writer_phases.end()) {
+        continue;
+      }
+      Map<Integer, PrimExpr> per_op;
+      for (const auto& op_phase : it->second) {
+        per_op.Set(Integer(op_phase.first), Integer(op_phase.second));
+      }
+      runtime_bank_writer_phases.Set(buffer, per_op);
+    }
+    annotations.Set("runtime_bank_writer_phases", runtime_bank_writer_phases);
+    Map<Buffer, Map<Integer, PrimExpr>> runtime_bank_reader_phases;
+    for (const Buffer& buffer : analysis.runtime_banked_buffers) {
+      auto it = analysis.runtime_bank_reader_phases.find(buffer->name);
+      if (it == analysis.runtime_bank_reader_phases.end()) {
+        continue;
+      }
+      Map<Integer, PrimExpr> per_op;
+      for (const auto& op_phase : it->second) {
+        per_op.Set(Integer(op_phase.first), Integer(op_phase.second));
+      }
+      runtime_bank_reader_phases.Set(buffer, per_op);
+    }
+    annotations.Set("runtime_bank_reader_phases", runtime_bank_reader_phases);
 
     Stmt body = this->VisitStmt(op->body);
     For new_loop = loop;
