@@ -6,6 +6,7 @@
 #include "../../op/comm.h"
 #include "../../op/region.h"
 #include "../../op/utils.h"
+#include "../sunmmio_utils.h"
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/type.h>
@@ -23,6 +24,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <sstream>
 #include <unordered_set>
 #include <utility>
 
@@ -92,6 +94,76 @@ bool IsSunmmioLocalVarBuffer(const tir::Buffer &buffer) {
   }
   const std::string scope = buffer.scope();
   return scope == "local.var";
+}
+
+bool IsSunmmioRsramScope(const std::string &scope) {
+  return scope == tl::kSunmmioScopeRSRAM || scope == "rsram";
+}
+
+bool IsSunmmioAsramScope(const std::string &scope) {
+  return scope == tl::kSunmmioScopeASRAM || scope == "asram";
+}
+
+bool IsSunmmioWsramScope(const std::string &scope) {
+  return scope == tl::kSunmmioScopeWSRAM || scope == "wsram";
+}
+
+bool IsSuvmTilePickDType(DataType dtype) {
+  dtype = CanonicalizeSuvmDType(dtype).with_lanes(1);
+  if (dtype.bits() != 16 && dtype.bits() != 32) {
+    return false;
+  }
+  return dtype.is_int() || dtype.is_uint() || dtype.is_float() ||
+         dtype.is_bfloat16();
+}
+
+SunMMIOType MakeScalarType(DataType dtype) {
+  dtype = CanonicalizeSuvmDType(dtype).with_lanes(1);
+  return SunMMIOType{SunMMIOType::Kind::kScalar, dtype, 1, {}};
+}
+
+SunMMIOType MakeTileTypeForShape(DataType dtype,
+                                 const std::vector<int64_t> &shape,
+                                 SunMMIOType::Kind kind) {
+  dtype = CanonicalizeSuvmDType(dtype).with_lanes(1);
+  SunMMIOType type;
+  type.kind = kind;
+  type.dtype = dtype;
+  type.lanes = 1;
+  for (int64_t extent : shape) {
+    type.shape.push_back(IntImm(DataType::Int(32), extent));
+  }
+  return type;
+}
+
+SunMMIOType MakeRank1TileType(DataType dtype, int64_t extent) {
+  return MakeTileTypeForShape(dtype, {extent}, SunMMIOType::Kind::kTile);
+}
+
+SunMMIOType MakeRank1TileViewType(DataType dtype, int64_t extent) {
+  return MakeTileTypeForShape(dtype, {extent}, SunMMIOType::Kind::kTileView);
+}
+
+SunMMIOType MakeRank2TileType(DataType dtype, int64_t rows, int64_t cols) {
+  return MakeTileTypeForShape(dtype, {rows, cols}, SunMMIOType::Kind::kTile);
+}
+
+SunMMIOType MakeRank2TileViewType(DataType dtype, int64_t rows, int64_t cols) {
+  return MakeTileTypeForShape(dtype, {rows, cols},
+                              SunMMIOType::Kind::kTileView);
+}
+
+std::vector<int64_t> StaticBufferShape(const tir::Buffer &buffer) {
+  std::vector<int64_t> shape;
+  shape.reserve(buffer->shape.size());
+  for (const PrimExpr &extent : buffer->shape) {
+    const auto *imm = extent.as<IntImmNode>();
+    if (!imm || imm->value <= 0) {
+      return {};
+    }
+    shape.push_back(imm->value);
+  }
+  return shape;
 }
 
 bool SameTypeShape(const SunMMIOType &lhs, const SunMMIOType &rhs) {
@@ -1488,6 +1560,100 @@ CodeGenTileLangSunMMIO::EmitLoad(const tir::Buffer &buffer,
                         binding.buffer_type, dtype, MapType(dtype));
 }
 
+SunMMIOValue
+CodeGenTileLangSunMMIO::EmitScalarTilePick(const tir::BufferLoadNode *op) {
+  const tir::Buffer &buffer = op->buffer;
+  const ffi::Array<PrimExpr> &indices = op->indices;
+  const std::string scope = buffer.scope();
+  DataType dtype = CanonicalizeSuvmDType(buffer->dtype).with_lanes(1);
+  auto describe = [&]() {
+    std::ostringstream os;
+    os << "buffer=" << buffer->name << ", scope=" << scope
+       << ", dtype=" << dtype << ", rank=" << indices.size();
+    return os.str();
+  };
+
+  if (IsSunmmioAsramScope(scope) || IsSunmmioWsramScope(scope)) {
+    UnsupportedExpr(
+        op, "Sunmmio scalar BufferLoad cannot read from ASRAM/WSRAM; stage "
+            "readable side data through RSRAM first. " +
+                describe());
+  }
+  if (!IsSunmmioRsramScope(scope)) {
+    UnsupportedExpr(
+        op, "Sunmmio scalar BufferLoad from DRAM/global must be legalized by "
+            "staging through RSRAM before codegen. " +
+                describe());
+  }
+
+  const BufferBinding &binding = LookupBuffer(buffer);
+  if (!IsSuvmTilePickDType(dtype)) {
+    UnsupportedExpr(op, "Sunmmio scalar BufferLoad tile.pick supports only "
+                        "i16/ui16/i32/ui32/bf16/f32. " +
+                            describe());
+  }
+  if (indices.size() != 1 && indices.size() != 2) {
+    UnsupportedExpr(
+        op, "Sunmmio RSRAM scalar BufferLoad tile.pick currently "
+            "supports rank-1 or rank-2 RSRAM buffers; stage higher-rank "
+            "side data into an explicit 1D/2D RSRAM buffer before pick. " +
+                describe());
+  }
+
+  const int64_t dtype_bits = static_cast<int64_t>(dtype.bits());
+  ICHECK_GT(dtype_bits, 0) << "Unexpected zero-width dtype for " << describe();
+  const tl::SunmmioTileProcessorConfig tile_processor_config =
+      tl::GetSunmmioTileProcessorConfig(target_);
+  ICHECK_GT(tile_processor_config.register_bits, 0)
+      << "Sunmmio tile.pick requires a positive vector register width";
+  ICHECK_EQ(tile_processor_config.register_bits % dtype_bits, 0)
+      << "Sunmmio vector register width " << tile_processor_config.register_bits
+      << " is not divisible by scalar dtype bit-width " << dtype_bits;
+  const int64_t tile_elems = tile_processor_config.register_bits / dtype_bits;
+  ICHECK_GT(tile_elems, 0) << "Sunmmio tile.pick produced empty tile";
+
+  SunMMIOValue memtensor{dtype, binding.handle, binding.buffer_type};
+  if (indices.size() == 1) {
+    PrimExpr tile_elems_expr = IntImm(indices[0].dtype(), tile_elems);
+    PrimExpr partition_expr = floordiv(indices[0], tile_elems_expr);
+    PrimExpr local_expr = floormod(indices[0], tile_elems_expr);
+
+    SunMMIOValue partition = EnsureIndex(EvalExpr(partition_expr));
+    SunMMIOValue local_index = EnsureIndex(EvalExpr(local_expr));
+
+    SunMMIOType tile_view_type = MakeRank1TileViewType(dtype, tile_elems);
+    SunMMIOValue tile_view = builder_->GetPartitionedTileView(
+        NewValueName(), memtensor, {partition}, {0}, tile_view_type, dtype);
+    SunMMIOType tile_type = MakeRank1TileType(dtype, tile_elems);
+    SunMMIOValue tile = builder_->TileLoad(NewValueName(), tile_view, tile_type,
+                                           std::nullopt, std::nullopt, dtype);
+    return builder_->TilePick(NewValueName(), tile, {local_index},
+                              MakeScalarType(dtype), dtype);
+  }
+
+  std::vector<int64_t> static_shape = StaticBufferShape(buffer);
+  if (static_shape.size() != 2) {
+    UnsupportedExpr(op,
+                    "Sunmmio rank-2 RSRAM scalar BufferLoad tile.pick requires "
+                    "a statically-shaped 2D RSRAM staging buffer. " +
+                        describe());
+  }
+  const int64_t rows = static_shape[0];
+  const int64_t cols = static_shape[1];
+
+  SunMMIOValue row_index = EnsureIndex(EvalExpr(indices[0]));
+  SunMMIOValue col_index = EnsureIndex(EvalExpr(indices[1]));
+  SunMMIOValue zero = EmitConstIndex(0);
+  SunMMIOType tile_view_type = MakeRank2TileViewType(dtype, rows, cols);
+  SunMMIOValue tile_view = builder_->GetPartitionedTileView(
+      NewValueName(), memtensor, {zero, zero}, {0, 1}, tile_view_type, dtype);
+  SunMMIOType tile_type = MakeRank2TileType(dtype, rows, cols);
+  SunMMIOValue tile = builder_->TileLoad(NewValueName(), tile_view, tile_type,
+                                         std::nullopt, std::nullopt, dtype);
+  return builder_->TilePick(NewValueName(), tile, {row_index, col_index},
+                            MakeScalarType(dtype), dtype);
+}
+
 void CodeGenTileLangSunMMIO::EmitStore(const tir::Buffer &buffer,
                                        const ffi::Array<PrimExpr> &indices,
                                        const SunMMIOValue &value) {
@@ -1509,9 +1675,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::VisitExpr_(const tir::BufferLoadNode *op) {
   if (IsSunmmioLocalVarBuffer(op->buffer)) {
     return EmitLocalVarLoad(op->buffer, op->indices);
   }
-  UnsupportedExpr(
-      op, "generic BufferLoadNode should not reach SunMMIO codegen; tiled "
-          "buffer accesses must be lowered through tile-aware paths");
+  return EmitScalarTilePick(op);
 }
 
 SunMMIOValue
