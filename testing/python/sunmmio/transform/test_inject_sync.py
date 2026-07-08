@@ -131,6 +131,23 @@ def broadcast_kernel(M, N, block_M, block_N, dtype="float16"):
     return main
 
 
+def loop_copy_without_body_wait_kernel(loop_iters, block_N, dtype="float16"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((loop_iters, block_N), dtype),
+        B: T.Tensor((loop_iters, block_N), dtype),
+    ):
+        with T.Kernel(1, threads=128) as _:
+            A_shared = T.alloc_shared((loop_iters, block_N), dtype)
+
+            for i in range(loop_iters):
+                T.copy(A[i : i + 1, 0:block_N], A_shared[i : i + 1, 0:block_N])
+
+            T.copy(A_shared, B)
+
+    return main
+
+
 def _pointer_var(name, dtype="float16", scope="shared.rsram"):
     return tir.Var(name, tvm.ir.PointerType(tvm.ir.PrimType(dtype), scope))
 
@@ -1164,6 +1181,28 @@ def test_inject_sunmmio_sync_dynamic_pair_mask_candidates():
         assert _parse_barrier_args(line, "barrier_arrive_and_wait")[-len(pair_candidates) :] == pair_candidates
 
 
+def test_inject_sunmmio_sync_loop_missing_wait_before_token_reuse():
+    target = get_target("Sunmmio")
+    func = loop_copy_without_body_wait_kernel(loop_iters=4, block_N=32)
+
+    mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+    mod = LowerAndLegalize_sunmmio(mod, target)
+    mod = OptimizeForSunmmio_patial(mod, target)
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    script = mod.script(show_meta=True)
+    lines = [line.strip() for line in script.splitlines()]
+
+    null_token_entries = [(idx, _extract_call_id(line, "sync_null_token")) for idx, line in enumerate(lines) if "sync_null_token(" in line]
+    assert null_token_entries
+
+    for_idx = next(idx for idx, line in enumerate(lines) if "for i in range(4):" in line)
+    null_idx, token = next((idx, token) for idx, token in null_token_entries if idx < for_idx)
+    transform_idx = next(idx for idx, line in enumerate(lines) if "sunmmio_layout_transform" in line and f"sync_token_id({token})" in line)
+    wait_idx = next(idx for idx, line in enumerate(lines) if for_idx < idx < transform_idx and f"wait_token({token})" in line)
+
+    assert null_idx < for_idx < wait_idx < transform_idx
+
+
 def test_inject_sunmmio_sync_nested_loop_reuses_tokens_without_mixing_levels():
     target = get_target("Sunmmio")
     mod = _make_mixed_level_nested_broadcast_mod(target)
@@ -1578,6 +1617,7 @@ if __name__ == "__main__":
     test_inject_sunmmio_sync_broadcast_without_src_core_full_mesh_barrier()
     test_inject_sunmmio_sync_dynamic_broadcast_mask_candidates()
     test_inject_sunmmio_sync_dynamic_pair_mask_candidates()
+    test_inject_sunmmio_sync_loop_missing_wait_before_token_reuse()
     test_inject_sunmmio_sync_nested_loop_reuses_tokens_without_mixing_levels()
     test_inject_sunmmio_sync_if()
     test_inject_sunmmio_sync_hoists_wait_before_loop_let_consumer()

@@ -2122,6 +2122,174 @@ private:
   std::map<const EvaluateNode *, int> pre_assigned_tokens_;
 };
 
+// Rewriter to repair loop-local token reuse after InjectSyncRewriter has
+// attached concrete sync_token_id/wait_token calls. If a loop body generates a
+// token but contains no wait for that token anywhere in the body, the next
+// iteration would overwrite the previous iteration's token. Insert a wait
+// before each generation site and seed the first iteration with a null token.
+class LoopMissingTokenWaitRewriter : public StmtMutator {
+public:
+  Stmt operator()(Stmt body) { return this->VisitStmt(body); }
+
+private:
+  static std::optional<int> TryGetTokenId(const CallNode *call) {
+    if (!call || call->args.empty()) {
+      return std::nullopt;
+    }
+    if (const auto *imm = call->args[0].as<IntImmNode>()) {
+      return static_cast<int>(imm->value);
+    }
+    return std::nullopt;
+  }
+
+  static Stmt MakeWaitTokenStmt(int token_id) {
+    return Evaluate(Call(DataType::Handle(), wait_token(),
+                         {IntImm(DataType::Int(32), token_id)}));
+  }
+
+  static Stmt MakeSyncNullTokenStmt(int token_id) {
+    return Evaluate(Call(DataType::Handle(), sync_null_token(),
+                         {IntImm(DataType::Int(32), token_id)}));
+  }
+
+  class LoopTokenUseCollector : public StmtExprVisitor {
+  public:
+    void VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(sync_token_id())) {
+        if (std::optional<int> token_id = TryGetTokenId(op)) {
+          generated_tokens.insert(*token_id);
+        }
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+    void VisitStmt_(const EvaluateNode *op) final {
+      if (const CallNode *call = op->value.as<CallNode>()) {
+        if (call->op.same_as(wait_token())) {
+          if (std::optional<int> token_id = TryGetTokenId(call)) {
+            waited_tokens.insert(*token_id);
+          }
+        }
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+
+    std::set<int> generated_tokens;
+    std::set<int> waited_tokens;
+  };
+
+  class GeneratedTokenCollector : public StmtExprVisitor {
+  public:
+    void VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(sync_token_id())) {
+        if (std::optional<int> token_id = TryGetTokenId(op)) {
+          tokens.insert(*token_id);
+        }
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+    void VisitStmt_(const ForNode *op) final {}
+    void VisitStmt_(const WhileNode *op) final {}
+
+    std::set<int> tokens;
+  };
+
+  static void PushFlatten(Array<Stmt> *stmts, const Stmt &stmt) {
+    if (!stmt.defined()) {
+      return;
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const Stmt &child : seq->seq) {
+        PushFlatten(stmts, child);
+      }
+      return;
+    }
+    stmts->push_back(stmt);
+  }
+
+  std::set<int> GetMissingWaitTokens(const Stmt &body) const {
+    LoopTokenUseCollector collector;
+    collector(body);
+
+    std::set<int> missing_tokens;
+    for (int token_id : collector.generated_tokens) {
+      if (collector.waited_tokens.count(token_id) == 0) {
+        missing_tokens.insert(token_id);
+      }
+    }
+    return missing_tokens;
+  }
+
+  Stmt PrependSyncNullTokens(const Stmt &loop_stmt,
+                             const std::set<int> &tokens) const {
+    if (tokens.empty()) {
+      return loop_stmt;
+    }
+    Array<Stmt> stmts;
+    for (int token_id : tokens) {
+      stmts.push_back(MakeSyncNullTokenStmt(token_id));
+    }
+    stmts.push_back(loop_stmt);
+    return SeqStmt::Flatten(stmts);
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> out;
+    for (const Stmt &stmt : op->seq) {
+      PushFlatten(&out, VisitStmt(stmt));
+    }
+    return SeqStmt::Flatten(out);
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    Stmt stmt = ffi::GetRef<Stmt>(op);
+    GeneratedTokenCollector collector;
+    collector(stmt);
+
+    Array<Stmt> stmts;
+    for (int token_id : collector.tokens) {
+      if (tokens_to_wait_before_.count(token_id) != 0) {
+        stmts.push_back(MakeWaitTokenStmt(token_id));
+      }
+    }
+    stmts.push_back(stmt);
+    return SeqStmt::Flatten(stmts);
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    Stmt body = StmtMutator::VisitStmt(op->body);
+    std::set<int> missing_tokens = GetMissingWaitTokens(body);
+    if (!missing_tokens.empty()) {
+      std::set<int> old_tokens_to_wait_before = tokens_to_wait_before_;
+      tokens_to_wait_before_ = missing_tokens;
+      body = VisitStmt(body);
+      tokens_to_wait_before_ = std::move(old_tokens_to_wait_before);
+    }
+
+    Stmt loop_stmt =
+        For(op->loop_var, op->min, op->extent, op->kind, body,
+            op->thread_binding, op->annotations, std::nullopt, op->span);
+    return PrependSyncNullTokens(loop_stmt, missing_tokens);
+  }
+
+  Stmt VisitStmt_(const WhileNode *op) final {
+    Stmt body = StmtMutator::VisitStmt(op->body);
+    std::set<int> missing_tokens = GetMissingWaitTokens(body);
+    if (!missing_tokens.empty()) {
+      std::set<int> old_tokens_to_wait_before = tokens_to_wait_before_;
+      tokens_to_wait_before_ = missing_tokens;
+      body = VisitStmt(body);
+      tokens_to_wait_before_ = std::move(old_tokens_to_wait_before);
+    }
+
+    Stmt loop_stmt = While(op->condition, body);
+    return PrependSyncNullTokens(loop_stmt, missing_tokens);
+  }
+
+  std::set<int> tokens_to_wait_before_;
+};
+
 // Rewriter to inject final synchronization waits before the device function
 // returns. This ensures all pending asynchronous operations are completed
 // before the device kernel finishes, handling both explicit returns and
@@ -2759,6 +2927,9 @@ public:
 
     TokenBarrierMap token_to_barrier_mask =
         inject_sync_rewriter.get_token_to_barrier_mask();
+
+    auto loop_missing_token_wait_rewriter = LoopMissingTokenWaitRewriter();
+    f.CopyOnWrite()->body = loop_missing_token_wait_rewriter(f->body);
 
     auto device_func_wait_rewriter =
         DeviceFuncWaitRewriter(token_to_barrier_mask);
