@@ -9,7 +9,10 @@
 #include "npuir/Dialect/SUVM/IR/Dialect.h"
 #include "npuir/Dialect/SUVM/IR/Types.h"
 
+#include "llvm/Support/raw_ostream.h"
+
 #include <algorithm>
+#include <cstdlib>
 #include <unordered_map>
 
 namespace tvm {
@@ -130,6 +133,11 @@ void SunmmioMlirFunction::BeginModule() {
 
 void SunmmioMlirFunction::EndModule() {
   if (failed(mlir::verify(*ctx_.module))) {
+    const char *dump_invalid = std::getenv("TL_SUNMMIO_DUMP_INVALID_MLIR");
+    if (dump_invalid != nullptr && std::string(dump_invalid) == "1") {
+      ctx_.module->print(llvm::errs());
+      llvm::errs() << "\n";
+    }
     LOG(FATAL) << "SunMMIO MLIR module verification failed";
   }
 }
