@@ -1055,7 +1055,7 @@ def test_inject_sunmmio_sync_broadcast():
 
     assert len(dma_lines) == 2
     assert len(bcast_lines) == 1
-    assert len(barrier_lines) >= 2
+    assert len(barrier_lines) == 1
     assert len(wait_lines) >= 3
 
     # Check instruction order:
@@ -1065,9 +1065,8 @@ def test_inject_sunmmio_sync_broadcast():
     # 4. barrier_arrive_and_wait(participant_mask)
     # 5. broadcast_ -> token 1
     # 6. wait_token(1)
-    # 7. barrier_arrive_and_wait(participant_mask)
-    # 8. dma_copy (store B) -> token 2
-    # 9. wait_token(2)
+    # 7. dma_copy (store B) -> token 2
+    # 8. wait_token(2)
 
     idx_dma0 = script.find("sync_token_id(0)")
     idx_wait0 = script.find("wait_token(0)")
@@ -1077,7 +1076,6 @@ def test_inject_sunmmio_sync_broadcast():
     idx_wait1 = script.find("wait_token(1)")
     idx_pre_barrier_wait = script.find("barrier_arrive_and_wait", idx_wait0)
     idx_dma1 = script.find("sync_token_id(2)")
-    idx_post_barrier_wait = script.find("barrier_arrive_and_wait", idx_wait1)
     idx_wait2 = script.find("wait_token(2)")
 
     # Verify order
@@ -1086,8 +1084,7 @@ def test_inject_sunmmio_sync_broadcast():
     assert idx_wait0 < idx_pre_barrier_wait < idx_bcast
     assert idx_bcast < idx_token1  # token 1 is inside broadcast
     assert idx_barrier_init < idx_wait1
-    assert idx_wait1 < idx_post_barrier_wait
-    assert idx_post_barrier_wait < idx_dma1
+    assert idx_wait1 < idx_dma1
     assert idx_dma1 < idx_wait2
 
     # Regression (PR #164): broadcast_ carries a receiving mask at arg slot 3,
@@ -1125,7 +1122,7 @@ def test_inject_sunmmio_sync_broadcast_without_src_core_full_mesh_barrier():
     assert _parse_numeric_barrier_mask(barrier_init_lines[0]) == (1 << 16) - 1
 
     barrier_wait_lines = [l for l in lines if "barrier_arrive_and_wait" in l]
-    assert len(barrier_wait_lines) == 2
+    assert len(barrier_wait_lines) == 1
     assert all(_parse_numeric_barrier_mask(line, "barrier_arrive_and_wait") == (1 << 16) - 1 for line in barrier_wait_lines)
 
 
@@ -1309,18 +1306,16 @@ def test_inject_sunmmio_sync_if():
     pre_broadcast_barrier_indices = [idx for idx, _ in barrier_wait_entries if if_idx < idx < broadcast_idx]
     assert pre_broadcast_barrier_indices
 
-    # The broadcast token must be waited on before the outer barrier wait.
+    # The broadcast token must be waited on after the broadcast. The legacy
+    # paired barrier wait after wait_token is disabled by default.
     broadcast_wait_indices = [idx for idx, _, token in wait_entries if token == broadcast_token and idx > barrier_init_idx]
     assert broadcast_wait_indices
-    post_broadcast_barrier_indices = [idx for idx, _ in barrier_wait_entries if idx > min(broadcast_wait_indices)]
-    assert post_broadcast_barrier_indices
-    barrier_wait_idx = min(post_broadcast_barrier_indices)
-    assert barrier_init_idx < min(broadcast_wait_indices) < barrier_wait_idx
+    assert not any(idx > min(broadcast_wait_indices) for idx, _ in barrier_wait_entries)
 
     # The MMA token should also be waited on after the branch before C_shared is consumed.
-    post_branch_mma_wait_indices = [idx for idx, _, token in wait_entries if token == mma_token and idx > barrier_wait_idx]
+    post_branch_mma_wait_indices = [idx for idx, _, token in wait_entries if token == mma_token and idx > broadcast_idx]
     assert post_branch_mma_wait_indices
-    assert barrier_wait_idx < min(post_branch_mma_wait_indices) < final_store_idx
+    assert min(post_branch_mma_wait_indices) < final_store_idx
 
 
 def test_inject_sunmmio_sync_loop():
@@ -1396,7 +1391,7 @@ def test_inject_sunmmio_sync_loop():
     barrier_wait_between = [idx for idx, _, _ in barrier_wait_entries if min(wait_token_1_between) < idx < second_bcast_idx]
     barrier_wait_after_second = [idx for idx, _, _ in barrier_wait_entries if idx > second_bcast_idx]
     assert barrier_wait_before_first
-    assert barrier_wait_between
+    assert not barrier_wait_between
     assert barrier_wait_after_second
 
 
@@ -1457,7 +1452,7 @@ def test_inject_sunmmio_sync_while_loop_carried_tokens():
     barrier_wait_before_first = [idx for idx, _, _ in barrier_wait_entries if min(carried_wait_before_first) < idx < first_bcast_idx]
     barrier_wait_between = [idx for idx, _, _ in barrier_wait_entries if min(wait_first_between) < idx < second_bcast_idx]
     assert barrier_wait_before_first
-    assert barrier_wait_between
+    assert not barrier_wait_between
 
 
 def test_inject_sunmmio_sync_while_loop_carried_async_to_sync_store():

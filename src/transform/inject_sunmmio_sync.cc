@@ -850,8 +850,11 @@ struct LoopScope {
 class InjectSyncRewriter : public StmtMutator {
 public:
   InjectSyncRewriter(Map<Var, Buffer> buffer_data_to_buffer,
-                     const Target &target, arith::Analyzer *analyzer)
+                     const Target &target, arith::Analyzer *analyzer,
+                     bool insert_barrier_wait_after_wait_token = false)
       : token_count(0), mesh_nrow_(0), mesh_ncol_(0), analyzer_(analyzer),
+        insert_barrier_wait_after_wait_token_(
+            insert_barrier_wait_after_wait_token),
         buffer_data_to_buffer_(buffer_data_to_buffer) {
     SunmmioMeshConfig mesh = GetSunmmioMeshConfig(target);
     mesh_nrow_ = mesh.nrow;
@@ -1281,16 +1284,13 @@ private:
     return analyzer_ ? analyzer_->Simplify(global_mask) : global_mask;
   }
 
-  // Inserts wait_token and optional barrier_wait instructions.
-  // If the token is associated with a barrier (e.g. from broadcast),
-  // we also need to wait on that barrier.
+  // Inserts wait_token and, when enabled, the legacy paired barrier_wait.
   void process_wait_token_and_barrier_wait(Array<Stmt> &stmts, int token_id) {
     stmts.push_back(Evaluate(Call(DataType::Handle(), wait_token(),
                                   {IntImm(DataType::Int(32), token_id)})));
-    // If the current token has a corresponding barrier, we need to wait for the
-    // barrier.
     auto barrier_it = token_to_barrier_mask_.find(token_id);
-    if (barrier_it != token_to_barrier_mask_.end()) {
+    if (insert_barrier_wait_after_wait_token_ &&
+        barrier_it != token_to_barrier_mask_.end()) {
       stmts.push_back(
           Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
                         MakeBarrierArgs(barrier_it->second))));
@@ -2106,6 +2106,7 @@ private:
   int mesh_nrow_;
   int mesh_ncol_;
   arith::Analyzer *analyzer_;
+  bool insert_barrier_wait_after_wait_token_;
 
   Array<Array<ObjectRef>> read_buffers;
   Array<Array<ObjectRef>> write_buffers;
