@@ -611,9 +611,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       << "tile.execution_domain_axes and tile.tile_size rank mismatch";
 
   std::vector<const ForNode *> chain = CollectLinearForChain(op);
-  ICHECK_GE(chain.size(), scope.domain_shape.size())
-      << "Tiles scope loop chain shorter than tile.domain rank";
-  for (size_t i = 0; i < scope.domain_shape.size(); ++i) {
+  ICHECK(!chain.empty()) << "Tiles scope root must be a loop";
+  const size_t domain_rank = scope.domain_shape.size();
+  const size_t shared_prefix_depth = std::min(chain.size(), domain_rank);
+  const bool has_partial_execution_prefix = shared_prefix_depth < domain_rank;
+  for (size_t i = 0; i < shared_prefix_depth; ++i) {
     scope.domain_loops.push_back(chain[i]);
   }
   scope.execution_loops.assign(scope.execution_domain_axes.size(), nullptr);
@@ -628,14 +630,28 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         << "tile.execution_axis is out of range";
     scope.execution_loops[static_cast<size_t>(exec_axis)] = loop;
   }
-  for (const ForNode *loop : scope.execution_loops) {
-    ICHECK(loop != nullptr)
-        << "Tiles scope is missing an execution loop for one tile axis";
+  if (has_partial_execution_prefix) {
+    bool has_shared_execution_loop = false;
+    for (const ForNode *loop : scope.execution_loops) {
+      has_shared_execution_loop = has_shared_execution_loop || loop != nullptr;
+    }
+    ICHECK(has_shared_execution_loop)
+        << "Partial Tiles scope must expose at least one shared execution loop";
+  } else {
+    for (const ForNode *loop : scope.execution_loops) {
+      ICHECK(loop != nullptr)
+          << "Tiles scope is missing an execution loop for one tile axis";
+    }
   }
 
   Stmt tile_scope_stmt = scope.domain_loops.back()->body;
   scope.is_reduce_scope = IsReduceLikeTileBody(tile_scope_stmt);
-  if (scope.is_reduce_scope) {
+  if (has_partial_execution_prefix) {
+    auto loops = FindInteriorLoops(tile_scope_stmt);
+    scope.interior_axis0_loop = loops.first;
+    scope.interior_axis1_loop = loops.second;
+    scope.tile_block_body = tile_scope_stmt;
+  } else if (scope.is_reduce_scope) {
     auto loops = FindInteriorLoops(tile_scope_stmt);
     scope.interior_axis0_loop = loops.first;
     scope.interior_axis1_loop = loops.second;
@@ -3856,7 +3872,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           scope.interior_axis0_loop = loops.first;
           scope.interior_axis1_loop = loops.second;
         } else if (auto exec_axis = GetExecutionAxisAnnotation(loop);
-                   exec_axis.has_value() && exec_axis.value() == 1) {
+                   exec_axis.has_value()) {
           auto loops = FindInteriorLoops(loop->body);
           if (loops.first != nullptr && loops.second != nullptr) {
             auto axis0_extent = GetStaticLoopExtent(loops.first);
@@ -3865,17 +3881,38 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                 << "Hybrid local tile fragment expects static interior "
                    "extents";
             saved_scope = scope;
+            TilesScopeInfo parent_scope = scope;
             scope = TilesScopeInfo{};
             scope.root = loop;
-            scope.domain_shape = ffi::Array<PrimExpr>{
-                Integer(axis0_extent.value()),
-                loop->extent * Integer(axis1_extent.value())};
-            scope.domain_loops = {loop};
-            scope.execution_loops = {nullptr, loop};
             scope.interior_axis0_loop = loops.first;
             scope.interior_axis1_loop = loops.second;
-            scope.execution_domain_axes = {0, 1};
-            scope.tile_shape = {axis0_extent.value(), axis1_extent.value()};
+            if (!parent_scope.execution_loops.empty() &&
+                exec_axis.value() >= 0 &&
+                static_cast<size_t>(exec_axis.value()) <
+                    parent_scope.execution_loops.size() &&
+                parent_scope.execution_loops[0] != nullptr &&
+                parent_scope.domain_loops.size() + 1 ==
+                    parent_scope.domain_shape.size()) {
+              scope.domain_shape = parent_scope.domain_shape;
+              scope.domain_loops = parent_scope.domain_loops;
+              scope.domain_loops.push_back(loop);
+              scope.execution_loops = parent_scope.execution_loops;
+              scope.execution_loops[static_cast<size_t>(exec_axis.value())] =
+                  loop;
+              scope.execution_domain_axes = parent_scope.execution_domain_axes;
+              scope.tile_shape = parent_scope.tile_shape;
+            } else {
+              ICHECK_EQ(exec_axis.value(), 1)
+                  << "Hybrid local tile fragment without a parent execution "
+                     "prefix is only supported for execution axis 1";
+              scope.domain_shape = ffi::Array<PrimExpr>{
+                  Integer(axis0_extent.value()),
+                  loop->extent * Integer(axis1_extent.value())};
+              scope.domain_loops = {loop};
+              scope.execution_loops = {nullptr, loop};
+              scope.execution_domain_axes = {0, 1};
+              scope.tile_shape = {axis0_extent.value(), axis1_extent.value()};
+            }
             scope.tile_block_body = loop->body;
             scope.is_reduce_scope = IsReduceLikeTileBody(scope.tile_block_body);
           }
@@ -3991,6 +4028,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   };
 
   auto emit_tile_stmt = [&](TileBlockState *state) {
+    if (has_partial_execution_prefix) {
+      lower_reduce_stmt(scope.tile_block_body, state);
+      return;
+    }
     if (scope.tail_predicate.defined() && scope.full_tile_body.defined() &&
         scope.tail_tile_body.defined()) {
       auto lower_tail_with_mask = [&](const SunMMIOValue &mask) {
