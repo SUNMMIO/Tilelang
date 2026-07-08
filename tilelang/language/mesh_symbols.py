@@ -13,6 +13,14 @@ _mesh_nrows_var = tir.SizeVar("mesh_nrows", "int32")
 _mesh_ncols_var = tir.SizeVar("mesh_ncols", "int32")
 
 
+def _mesh_nrows_symbol() -> PrimExpr:
+    return _mesh_nrows_var
+
+
+def _mesh_ncols_symbol() -> PrimExpr:
+    return _mesh_ncols_var
+
+
 def _current_builder():
     from tilelang.language.eager.builder import Builder
 
@@ -24,7 +32,7 @@ def mesh_nrows() -> PrimExpr:
     builder = _current_builder()
     if builder is not None:
         builder.mark_sunmmio_mesh_symbols_used()
-    return _mesh_nrows_var
+    return _mesh_nrows_symbol()
 
 
 def mesh_ncols() -> PrimExpr:
@@ -32,7 +40,7 @@ def mesh_ncols() -> PrimExpr:
     builder = _current_builder()
     if builder is not None:
         builder.mark_sunmmio_mesh_symbols_used()
-    return _mesh_ncols_var
+    return _mesh_ncols_symbol()
 
 
 def mesh_ncores() -> PrimExpr:

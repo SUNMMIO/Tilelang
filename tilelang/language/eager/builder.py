@@ -219,11 +219,11 @@ class Builder(BaseBuilder):
         from tilelang.language.mesh_symbols import (
             _MESH_NCOLS_ATTR,
             _MESH_NROWS_ATTR,
-            mesh_ncols,
-            mesh_nrows,
+            _mesh_ncols_symbol,
+            _mesh_nrows_symbol,
         )
 
-        return prim_func.with_attr(_MESH_NROWS_ATTR, mesh_nrows()).with_attr(_MESH_NCOLS_ATTR, mesh_ncols())
+        return prim_func.with_attr(_MESH_NROWS_ATTR, _mesh_nrows_symbol()).with_attr(_MESH_NCOLS_ATTR, _mesh_ncols_symbol())
 
     def mark_sunmmio_mesh_symbols_used(self):
         self._sunmmio_mesh_symbols_used = True

@@ -28,6 +28,210 @@ constexpr const char *kMeshNColsAttr = "tl.sunmmio.mesh_ncols_var";
 
 PrimExpr I32Imm(int64_t value) { return IntImm(DataType::Int(32), value); }
 
+bool IsMeshSymbolVar(const VarNode *op) {
+  return op->dtype == DataType::Int(32) &&
+         (op->name_hint == "mesh_nrows" || op->name_hint == "mesh_ncols");
+}
+
+bool ExprContainsMeshSymbol(const PrimExpr &expr) {
+  bool found = false;
+  PostOrderVisit(expr, [&found](const ObjectRef &node) {
+    if (found) {
+      return;
+    }
+    if (const auto *var = node.as<VarNode>()) {
+      found = IsMeshSymbolVar(var);
+    }
+  });
+  return found;
+}
+
+bool LayoutContainsMeshSymbol(const Layout &layout) {
+  if (auto *cute = layout.as<CuteLayoutNode>()) {
+    for (const auto &extent : cute->GetLogicalShape()) {
+      if (ExprContainsMeshSymbol(extent)) {
+        return true;
+      }
+    }
+    for (const auto &extent : cute->GetModeShape()) {
+      if (ExprContainsMeshSymbol(extent)) {
+        return true;
+      }
+    }
+    for (const auto &stride : cute->GetModeStride()) {
+      if (ExprContainsMeshSymbol(stride)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool ObjectContainsMeshSymbol(const ObjectRef &obj) {
+  if (auto expr = obj.as<PrimExpr>()) {
+    return ExprContainsMeshSymbol(expr.value());
+  }
+  if (auto layout = obj.as<Layout>()) {
+    return LayoutContainsMeshSymbol(layout.value());
+  }
+  if (auto arr = obj.as<Array<ObjectRef>>()) {
+    for (const auto &item : arr.value()) {
+      if (ObjectContainsMeshSymbol(item)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (auto map = obj.as<Map<String, ObjectRef>>()) {
+    for (const auto &[_, value] : map.value()) {
+      if (ObjectContainsMeshSymbol(value)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool AnnotationValueContainsMeshSymbol(const ffi::Any &value) {
+  if (auto arr = value.try_cast<Array<PrimExpr>>()) {
+    for (const auto &elem : arr.value()) {
+      if (ExprContainsMeshSymbol(elem)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (auto expr = value.as<PrimExpr>()) {
+    return ExprContainsMeshSymbol(expr.value());
+  }
+  if (auto obj = value.as<ObjectRef>()) {
+    return ObjectContainsMeshSymbol(obj.value());
+  }
+  return false;
+}
+
+bool AnnotationsContainMeshSymbol(const Map<String, ffi::Any> &annotations) {
+  for (const auto &[_, value] : annotations) {
+    if (AnnotationValueContainsMeshSymbol(value)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+class MeshSymbolDetector : public StmtExprVisitor {
+public:
+  bool Contains(const Stmt &stmt) {
+    VisitStmt(stmt);
+    return found_;
+  }
+
+  void VisitExpr_(const VarNode *op) final {
+    found_ = found_ || IsMeshSymbolVar(op);
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    StmtVisitor::VisitStmt_(op);
+    found_ = found_ || AnnotationsContainMeshSymbol(op->annotations);
+  }
+
+  void VisitStmt_(const DeclBufferNode *op) final {
+    StmtVisitor::VisitStmt_(op);
+    found_ = found_ || BufferContainsMeshSymbol(op->buffer);
+  }
+
+  void VisitStmt_(const BlockNode *op) final {
+    StmtVisitor::VisitStmt_(op);
+    found_ = found_ || AnnotationsContainMeshSymbol(op->annotations);
+
+    for (const auto &buffer : op->alloc_buffers) {
+      if (BufferContainsMeshSymbol(buffer)) {
+        found_ = true;
+        return;
+      }
+    }
+    for (const auto &region : op->reads) {
+      if (BufferRegionContainsMeshSymbol(region)) {
+        found_ = true;
+        return;
+      }
+    }
+    for (const auto &region : op->writes) {
+      if (BufferRegionContainsMeshSymbol(region)) {
+        found_ = true;
+        return;
+      }
+    }
+    for (const auto &match_buffer : op->match_buffers) {
+      if (BufferContainsMeshSymbol(match_buffer->buffer) ||
+          BufferRegionContainsMeshSymbol(match_buffer->source)) {
+        found_ = true;
+        return;
+      }
+    }
+  }
+
+private:
+  bool BufferContainsMeshSymbol(const Buffer &buffer) {
+    for (const auto &extent : buffer->shape) {
+      if (ExprContainsMeshSymbol(extent)) {
+        return true;
+      }
+    }
+    for (const auto &stride : buffer->strides) {
+      if (ExprContainsMeshSymbol(stride)) {
+        return true;
+      }
+    }
+    return ExprContainsMeshSymbol(buffer->elem_offset);
+  }
+
+  bool BufferRegionContainsMeshSymbol(const BufferRegion &region) {
+    if (BufferContainsMeshSymbol(region->buffer)) {
+      return true;
+    }
+    for (const auto &range : region->region) {
+      if (ExprContainsMeshSymbol(range->min) ||
+          ExprContainsMeshSymbol(range->extent)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool found_ = false;
+};
+
+bool PrimFuncContainsMeshSymbol(const PrimFunc &func) {
+  MeshSymbolDetector detector;
+  if (detector.Contains(func->body)) {
+    return true;
+  }
+  for (const auto &[_, buffer] : func->buffer_map) {
+    for (const auto &extent : buffer->shape) {
+      if (ExprContainsMeshSymbol(extent)) {
+        return true;
+      }
+    }
+    for (const auto &stride : buffer->strides) {
+      if (ExprContainsMeshSymbol(stride)) {
+        return true;
+      }
+    }
+    if (ExprContainsMeshSymbol(buffer->elem_offset)) {
+      return true;
+    }
+  }
+  if (auto tensor_meta = func->GetAttr<Map<String, ObjectRef>>("tensor_meta")) {
+    for (const auto &[_, entry_obj] : tensor_meta.value()) {
+      if (ObjectContainsMeshSymbol(entry_obj)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 PrimExpr SubstituteAndSimplify(const PrimExpr &expr,
                                const ffi::Map<Var, PrimExpr> &vmap,
                                arith::Analyzer *analyzer) {
@@ -185,6 +389,17 @@ PrimFunc ResolvePrimFunc(PrimFunc func) {
   auto nrows_var = func->GetAttr<Var>(kMeshNRowsAttr);
   auto ncols_var = func->GetAttr<Var>(kMeshNColsAttr);
   if (!nrows_var.defined() || !ncols_var.defined()) {
+    ICHECK(!nrows_var.defined() && !ncols_var.defined())
+        << "ResolveSunmmioMeshSymbols found only one Sunmmio mesh symbol "
+           "attribute. Both "
+        << kMeshNRowsAttr << " and " << kMeshNColsAttr
+        << " must be attached when a PrimFunc uses symbolic mesh dimensions.";
+    ICHECK(!PrimFuncContainsMeshSymbol(func))
+        << "ResolveSunmmioMeshSymbols found symbolic Sunmmio mesh variables "
+           "but missing PrimFunc attributes "
+        << kMeshNRowsAttr << " and " << kMeshNColsAttr
+        << ". Build the PrimFunc through TileLang frontend mesh symbol APIs or "
+           "attach both attributes before lowering.";
     return func;
   }
 

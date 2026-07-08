@@ -2,11 +2,14 @@ import tilelang
 import tilelang.language as T
 import tilelang.transform as tl_transform
 import tvm_ffi
+import pytest
 
 from tilelang import tvm as tvm
 from tilelang.engine.phase import LowerAndLegalize, OptimizeForSunmmio, PreLowerSemanticCheck
+from tilelang.language.eager.builder import Builder
 from tilelang.language.mesh_symbols import _MESH_NCOLS_ATTR, _MESH_NROWS_ATTR
 from tilelang.layout import make_zz_layout
+from tilelang.utils.language import prim_expr_contains_mesh_symbol
 from tilelang.utils.target import determine_target, target_is_sunmmio
 from tvm import tir
 from tvm.tir.stmt_functor import post_order_visit
@@ -334,6 +337,43 @@ def test_resolve_updates_default_mesh_tensor_buffer_map_and_layout_metadata():
     assert _mesh_var_hits_in_exprs(_exprs_in_buffer_metadata(func), mesh_vars) == []
     assert tuple(int(extent) for extent in buffer.shape) == (32, 24)
     assert tuple(int(extent) for extent in _layout_logical_shape(tensor_meta["sharded_layout"])) == (32, 24)
+
+
+def test_resolve_reports_mesh_vars_without_attrs():
+    target = _sunmmio_target()
+    mesh_nrows = tir.SizeVar("mesh_nrows", "int32")
+
+    func = tir.PrimFunc([], tir.Evaluate(mesh_nrows)).with_attr("target", target)
+    mod = tvm.IRModule({"main": func})
+
+    with pytest.raises(tvm.TVMError, match="missing PrimFunc attributes"):
+        tl_transform.ResolveSunmmioMeshSymbols()(mod)
+
+
+def test_resolve_reports_decl_buffer_mesh_vars_without_attrs():
+    target = _sunmmio_target()
+    mesh_nrows = tir.SizeVar("mesh_nrows", "int32")
+    data = tir.Var("data", "handle")
+    buffer = tir.decl_buffer((mesh_nrows,), "float32", data=data)
+    body = tir.DeclBuffer(buffer, tir.Evaluate(0))
+    func = tir.PrimFunc([], body).with_attr("target", target)
+    mod = tvm.IRModule({"main": func})
+
+    with pytest.raises(tvm.TVMError, match="missing PrimFunc attributes"):
+        tl_transform.ResolveSunmmioMeshSymbols()(mod)
+
+
+def test_mesh_symbol_query_has_no_builder_side_effect():
+    builder = Builder()
+
+    with builder.current_context():
+        builder._sunmmio_mesh_symbols_used = False
+        expr = T.mesh_nrows() + 1
+        assert builder._sunmmio_mesh_symbols_used
+
+        builder._sunmmio_mesh_symbols_used = False
+        assert prim_expr_contains_mesh_symbol(expr)
+        assert not builder._sunmmio_mesh_symbols_used
 
 
 def test_lower_and_optimize_resolve_kernel_default_mesh_ncores():

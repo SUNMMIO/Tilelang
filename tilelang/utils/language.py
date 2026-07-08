@@ -427,9 +427,9 @@ def prim_expr_contains_mesh_symbol(expr) -> bool:
     if isinstance(expr, int) or not isinstance(expr, tir.PrimExpr):
         return False
 
-    from tilelang.language.mesh_symbols import mesh_ncols, mesh_nrows
+    from tilelang.language.mesh_symbols import _mesh_ncols_symbol, _mesh_nrows_symbol
 
-    mesh_vars = (mesh_nrows(), mesh_ncols())
+    mesh_vars = (_mesh_nrows_symbol(), _mesh_ncols_symbol())
     found = False
 
     def visit(node):
