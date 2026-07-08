@@ -146,6 +146,23 @@ def _region(buf, access):
     )
 
 
+def _region_at(buf, access, row, col, extent_row=32, extent_col=32):
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.tileop.region"),
+        tir.BufferLoad(buf, [row, col]),
+        tir.IntImm("int32", access),
+        tir.IntImm("int32", extent_row),
+        tir.IntImm("int32", extent_col),
+    )
+
+
+def _extract_call_id(line, marker):
+    match = re.search(rf"{re.escape(marker)}\((\d+)\)", line)
+    assert match, f"Cannot parse {marker} in line: {line}"
+    return int(match.group(1))
+
+
 def _make_leaf_broadcast_without_src_core_mod(target):
     src_data = _pointer_var("src")
     dst_data = _pointer_var("dst")
@@ -488,6 +505,275 @@ def _make_while_async_to_sync_store_mod(target):
         tir.DeclBuffer(dst_buf, while_loop),
     )
     func = tir.PrimFunc([src_data, dst_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
+def _make_dma_to_loop_let_consumer_mod(target):
+    src_data = _pointer_var("src", scope="global")
+    stage_data = _pointer_var("stage")
+    src_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="src_buf",
+        data=src_data,
+        scope="global",
+    )
+    stage_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="stage_buf",
+        data=stage_data,
+        scope="shared.rsram",
+    )
+    copy = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dma_copy"),
+            _region(src_buf, 1),
+            _region(stage_buf, 2),
+            tir.IntImm("int32", 0),
+        )
+    )
+    i = tir.Var("i", "int32")
+    value = tir.Var("value", "float16")
+    consume = tir.LetStmt(
+        value,
+        tir.BufferLoad(stage_buf, [i, tir.IntImm("int32", 0)]),
+        tir.Evaluate(tir.Cast("float32", value)),
+    )
+    loop = tir.For(
+        i,
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 32),
+        tir.ForKind.SERIAL,
+        consume,
+    )
+    body = tir.DeclBuffer(
+        src_buf,
+        tir.DeclBuffer(stage_buf, tir.SeqStmt([copy, loop])),
+    )
+    func = tir.PrimFunc([src_data, stage_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
+def _make_dma_to_loop_if_consumer_mod(target):
+    src_data = _pointer_var("src", scope="global")
+    stage_data = _pointer_var("stage")
+    src_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="src_buf",
+        data=src_data,
+        scope="global",
+    )
+    stage_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="stage_buf",
+        data=stage_data,
+        scope="shared.rsram",
+    )
+    copy = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dma_copy"),
+            _region(src_buf, 1),
+            _region(stage_buf, 2),
+            tir.IntImm("int32", 0),
+        )
+    )
+    i = tir.Var("i", "int32")
+    load = tir.Cast(
+        "float32",
+        tir.BufferLoad(stage_buf, [i, tir.IntImm("int32", 0)]),
+    )
+    consume = tir.IfThenElse(
+        load > tir.FloatImm("float32", 0.0),
+        tir.Evaluate(0),
+        None,
+    )
+    loop = tir.For(
+        i,
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 32),
+        tir.ForKind.SERIAL,
+        consume,
+    )
+    body = tir.DeclBuffer(
+        src_buf,
+        tir.DeclBuffer(stage_buf, tir.SeqStmt([copy, loop])),
+    )
+    func = tir.PrimFunc([src_data, stage_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
+def _make_dma_to_hidden_load_index_consumer_mod(target):
+    idx_src_data = _pointer_var("idx_src", dtype="int32", scope="global")
+    idx_data = _pointer_var("idx", dtype="int32")
+    data_data = _pointer_var("data")
+    idx_src_buf = tir.decl_buffer(
+        (32, 32),
+        "int32",
+        name="idx_src_buf",
+        data=idx_src_data,
+        scope="global",
+    )
+    idx_buf = tir.decl_buffer(
+        (32, 32),
+        "int32",
+        name="idx_buf",
+        data=idx_data,
+        scope="shared.rsram",
+    )
+    data_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="data_buf",
+        data=data_data,
+        scope="shared.rsram",
+    )
+    copy_idx = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dma_copy"),
+            _region(idx_src_buf, 1),
+            _region(idx_buf, 2),
+            tir.IntImm("int32", 0),
+        )
+    )
+    idx = tir.BufferLoad(idx_buf, [tir.IntImm("int32", 0), tir.IntImm("int32", 0)])
+    consume = tir.Evaluate(tir.BufferLoad(data_buf, [idx, tir.IntImm("int32", 0)]))
+    body = tir.DeclBuffer(
+        idx_src_buf,
+        tir.DeclBuffer(idx_buf, tir.DeclBuffer(data_buf, tir.SeqStmt([copy_idx, consume]))),
+    )
+    func = tir.PrimFunc([idx_src_data, idx_data, data_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
+def _make_dma_to_hidden_store_index_consumer_mod(target):
+    idx_src_data = _pointer_var("idx_src", dtype="int32", scope="global")
+    idx_data = _pointer_var("idx", dtype="int32")
+    data_data = _pointer_var("data")
+    idx_src_buf = tir.decl_buffer(
+        (32, 32),
+        "int32",
+        name="idx_src_buf",
+        data=idx_src_data,
+        scope="global",
+    )
+    idx_buf = tir.decl_buffer(
+        (32, 32),
+        "int32",
+        name="idx_buf",
+        data=idx_data,
+        scope="shared.rsram",
+    )
+    data_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="data_buf",
+        data=data_data,
+        scope="shared.rsram",
+    )
+    copy_idx = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dma_copy"),
+            _region(idx_src_buf, 1),
+            _region(idx_buf, 2),
+            tir.IntImm("int32", 0),
+        )
+    )
+    idx = tir.BufferLoad(idx_buf, [tir.IntImm("int32", 0), tir.IntImm("int32", 0)])
+    consume = tir.BufferStore(
+        data_buf,
+        tir.Cast("float16", tir.IntImm("int32", 0)),
+        [idx, tir.IntImm("int32", 0)],
+    )
+    body = tir.DeclBuffer(
+        idx_src_buf,
+        tir.DeclBuffer(idx_buf, tir.DeclBuffer(data_buf, tir.SeqStmt([copy_idx, consume]))),
+    )
+    func = tir.PrimFunc([idx_src_data, idx_data, data_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
+def _make_dma_to_hidden_async_region_index_consumer_mod(target):
+    idx_src_data = _pointer_var("idx_src", dtype="int32", scope="global")
+    idx_data = _pointer_var("idx", dtype="int32")
+    data_data = _pointer_var("data")
+    out_data = _pointer_var("out", scope="global")
+    idx_src_buf = tir.decl_buffer(
+        (32, 32),
+        "int32",
+        name="idx_src_buf",
+        data=idx_src_data,
+        scope="global",
+    )
+    idx_buf = tir.decl_buffer(
+        (32, 32),
+        "int32",
+        name="idx_buf",
+        data=idx_data,
+        scope="shared.rsram",
+    )
+    data_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="data_buf",
+        data=data_data,
+        scope="shared.rsram",
+    )
+    out_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="out_buf",
+        data=out_data,
+        scope="global",
+    )
+    copy_idx = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dma_copy"),
+            _region(idx_src_buf, 1),
+            _region(idx_buf, 2),
+            tir.IntImm("int32", 0),
+        )
+    )
+    idx = tir.BufferLoad(idx_buf, [tir.IntImm("int32", 0), tir.IntImm("int32", 0)])
+    copy_data = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dma_copy"),
+            _region_at(data_buf, 1, idx, tir.IntImm("int32", 0), 1, 32),
+            _region_at(out_buf, 2, tir.IntImm("int32", 0), tir.IntImm("int32", 0), 1, 32),
+            tir.IntImm("int32", 0),
+        )
+    )
+    body = tir.DeclBuffer(
+        idx_src_buf,
+        tir.DeclBuffer(
+            idx_buf,
+            tir.DeclBuffer(data_buf, tir.DeclBuffer(out_buf, tir.SeqStmt([copy_idx, copy_data]))),
+        ),
+    )
+    func = tir.PrimFunc([idx_src_data, idx_data, data_data, out_data], body)
     func = func.with_attr("global_symbol", "main")
     func = func.with_attr("tir.is_global_func", True)
     mod = tvm.IRModule({"main": func})
@@ -1209,6 +1495,87 @@ def test_inject_sunmmio_sync_while_loop_carried_async_to_sync_store():
     assert min(carried_wait_before_store) < store_idx < broadcast_idx
 
 
+def test_inject_sunmmio_sync_hoists_wait_before_loop_let_consumer():
+    target = get_target("Sunmmio")
+    mod = _make_dma_to_loop_let_consumer_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    script = mod.script(show_meta=True)
+    lines = [line.strip() for line in script.splitlines()]
+
+    copy_idx = next(idx for idx, line in enumerate(lines) if "T.dma_copy" in line)
+    wait_idx = next(idx for idx, line in enumerate(lines) if "T.wait_token(0)" in line)
+    loop_idx = next(idx for idx, line in enumerate(lines) if "for i in range(32):" in line)
+
+    assert copy_idx < wait_idx < loop_idx
+    assert not any("T.wait_token(0)" in line for line in lines[loop_idx + 1 :])
+
+
+def test_inject_sunmmio_sync_hoists_wait_before_loop_if_condition_consumer():
+    target = get_target("Sunmmio")
+    mod = _make_dma_to_loop_if_consumer_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    script = mod.script(show_meta=True)
+    lines = [line.strip() for line in script.splitlines()]
+
+    copy_idx = next(idx for idx, line in enumerate(lines) if "T.dma_copy" in line)
+    wait_idx = next(idx for idx, line in enumerate(lines) if "T.wait_token(0)" in line)
+    loop_idx = next(idx for idx, line in enumerate(lines) if "for i in range(32):" in line)
+
+    assert copy_idx < wait_idx < loop_idx
+    assert not any("T.wait_token(0)" in line for line in lines[loop_idx + 1 :])
+
+
+def test_inject_sunmmio_sync_waits_for_hidden_buffer_load_index_read():
+    target = get_target("Sunmmio")
+    mod = _make_dma_to_hidden_load_index_consumer_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    lines = [line.strip() for line in mod.script(show_meta=True).splitlines()]
+
+    copy_idx = next(idx for idx, line in enumerate(lines) if "T.dma_copy" in line)
+    wait_idx = next(idx for idx, line in enumerate(lines) if "T.wait_token(0)" in line)
+    consume_idx = next(idx for idx, line in enumerate(lines) if "data_buf[idx_buf[0, 0], 0]" in line)
+
+    assert copy_idx < wait_idx < consume_idx
+
+
+def test_inject_sunmmio_sync_waits_for_hidden_buffer_store_index_read():
+    target = get_target("Sunmmio")
+    mod = _make_dma_to_hidden_store_index_consumer_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    lines = [line.strip() for line in mod.script(show_meta=True).splitlines()]
+
+    copy_idx = next(idx for idx, line in enumerate(lines) if "T.dma_copy" in line)
+    wait_idx = next(idx for idx, line in enumerate(lines) if "T.wait_token(0)" in line)
+    store_idx = next(idx for idx, line in enumerate(lines) if "data_buf[idx_buf[0, 0], 0] =" in line)
+
+    assert copy_idx < wait_idx < store_idx
+
+
+def test_inject_sunmmio_sync_waits_for_hidden_async_region_index_read():
+    target = get_target("Sunmmio")
+    mod = _make_dma_to_hidden_async_region_index_consumer_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    lines = [line.strip() for line in mod.script(show_meta=True).splitlines()]
+
+    dma_entries = [
+        (idx, _extract_call_id(line, "sync_token_id"))
+        for idx, line in enumerate(lines)
+        if "T.dma_copy" in line and "T.sync_token_id(" in line
+    ]
+    assert len(dma_entries) == 2
+    first_dma_idx, first_token = dma_entries[0]
+    second_dma_idx, _ = dma_entries[1]
+    assert first_token == 0
+
+    wait_idx = next(idx for idx, line in enumerate(lines) if "T.wait_token(0)" in line)
+    assert first_dma_idx < wait_idx < second_dma_idx
+
+
 if __name__ == "__main__":
     test_inject_sunmmio_sync_dma()
     test_inject_sunmmio_sync_mma()
@@ -1218,6 +1585,11 @@ if __name__ == "__main__":
     test_inject_sunmmio_sync_dynamic_pair_mask_candidates()
     test_inject_sunmmio_sync_nested_loop_reuses_tokens_without_mixing_levels()
     test_inject_sunmmio_sync_if()
+    test_inject_sunmmio_sync_hoists_wait_before_loop_let_consumer()
+    test_inject_sunmmio_sync_hoists_wait_before_loop_if_condition_consumer()
+    test_inject_sunmmio_sync_waits_for_hidden_buffer_load_index_read()
+    test_inject_sunmmio_sync_waits_for_hidden_buffer_store_index_read()
+    test_inject_sunmmio_sync_waits_for_hidden_async_region_index_read()
     test_inject_sunmmio_sync_loop()
     test_inject_sunmmio_sync_while_loop_carried_tokens()
     test_inject_sunmmio_sync_while_loop_carried_async_to_sync_store()
