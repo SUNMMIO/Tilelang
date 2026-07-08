@@ -98,10 +98,6 @@ def _warn_explicit_oob(buffer: tir.Buffer, dim: int, min_value: tir.PrimExpr, ex
     )
 
 
-# Clip copy extents to the remaining buffer shape. Static out-of-bounds
-# explicit regions warn before clipping. For inferred BufferLoad regions we
-# keep dynamic extents unchanged so Sunmmio DMA lowering still sees static tile
-# sizes instead of expressions such as T.min(tile, shape - min).
 def _clip_extent_to_shape(
     buffer: tir.Buffer,
     dim: int,
@@ -110,7 +106,6 @@ def _clip_extent_to_shape(
     shape: tir.PrimExpr,
     *,
     warn_if_clipped: bool,
-    clip_dynamic: bool,
 ) -> tir.PrimExpr:
     min_int = _as_static_int(min_value)
     extent_int = _as_static_int(extent)
@@ -128,10 +123,7 @@ def _clip_extent_to_shape(
             _warn_explicit_oob(buffer, dim, min_value, extent, shape)
         return tir.IntImm(extent.dtype if hasattr(extent, "dtype") else "int32", clipped)
 
-    if not clip_dynamic:
-        return extent
-
-    return tir.min(extent, shape - min_value)
+    return extent
 
 
 def _int_one() -> tir.IntImm:
@@ -152,7 +144,7 @@ def _clip_region_to_shape(spec: _CopyRegionSpec, mins: list[tir.PrimExpr], exten
             "T.copy region rank does not match buffer rank before clipping: "
             f"{spec.buffer.name}, mins={len(mins)}, extents={len(extents)}, shape={len(spec.buffer.shape)}"
         )
-    clipped_extents = [
+    validated_extents = [
         _clip_extent_to_shape(
             spec.buffer,
             dim,
@@ -160,12 +152,10 @@ def _clip_region_to_shape(spec: _CopyRegionSpec, mins: list[tir.PrimExpr], exten
             extent,
             spec.buffer.shape[dim],
             warn_if_clipped=spec.explicit_extents,
-            clip_dynamic=spec.kind != "load",
-            # clip_dynamic = True,
         )
         for dim, (min_value, extent) in enumerate(zip(mins, extents))
     ]
-    return _NormalizedCopyRegion(spec, list(mins), clipped_extents)
+    return _NormalizedCopyRegion(spec, list(mins), validated_extents)
 
 
 def _normalize_copy_regions(src: _CopyRegionSpec, dst: _CopyRegionSpec) -> tuple[_NormalizedCopyRegion, _NormalizedCopyRegion]:

@@ -315,6 +315,26 @@ def test_sunmmio_copy_frontend_clips_explicit_dst_before_inferring_load_src():
     _assert_region_extents(script, None, 2, [128, 128, 32])
 
 
+@target("Sunmmio")
+def _make_dynamic_explicit_region_kernel():
+    @T.prim_func
+    def kernel(A_256x128_global: T.Tensor((256, 128), DTYPE)):
+        with T.Kernel():
+            A_shared = T.alloc_shared((64, 128), DTYPE)
+            for bx in T.serial(4):
+                T.copy(A_256x128_global[bx * 32 : bx * 32 + 64, 0:128], A_shared)
+
+    return kernel
+
+
+def test_sunmmio_copy_frontend_keeps_dynamic_explicit_region_extent():
+    script = tvm.IRModule({"main": _make_dynamic_explicit_region_kernel()}).script()
+
+    assert "T.min" not in script
+    _assert_region_extents(script, "A_256x128_global", 1, [64, 128])
+    _assert_region_extents(script, None, 2, [64, 128])
+
+
 def test_sunmmio_copy_frontend_supports_rank_lower_bufferload_to_buffer():
     script = _build_script("load_to_buffer_rank_lower_full_dst")
 

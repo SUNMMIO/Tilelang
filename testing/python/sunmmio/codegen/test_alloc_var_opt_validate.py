@@ -142,8 +142,10 @@ def alloc_var_copy_mma_control_flow_kernel(
 
 @target("Sunmmio")
 def alloc_var_tiles_kernel(
-    M=32,
-    N=32,
+    M=128,
+    N=128,
+    block_M=32,
+    block_N=32,
     dtype=T.float32,
 ):
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
@@ -156,7 +158,7 @@ def alloc_var_tiles_kernel(
         B: T.MeshTensor((M, N), shard_policy, dtype, layout=B_layout),  # type: ignore
     ):
         with T.Kernel() as _cid:
-            A_shared = T.alloc_shared((M, N), dtype)
+            A_shared = T.alloc_shared((block_M, block_N), dtype)
             bias = T.alloc_var(dtype, init=1.0)
 
             T.copy(A[0, 0], A_shared)
