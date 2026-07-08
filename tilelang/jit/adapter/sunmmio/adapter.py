@@ -38,6 +38,7 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
         compile_flags: list[str] | None = None,
         kernel_lib_path: str | os.PathLike[str] | None = None,
         kernel_name: str | None = None,
+        abi: SunmmioKernelABI | None = None,
     ):
         self.params = params
         self.result_idx = self._legalize_result_idx(result_idx)
@@ -50,7 +51,7 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
         else:
             self.ir_module = func_or_mod
 
-        self.abi = SunmmioKernelABI.from_modules(
+        self.abi = abi or SunmmioKernelABI.from_modules(
             func_or_mod=self.ir_module,
             host_mod=host_mod,
             device_mod=device_mod,
@@ -94,6 +95,7 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
         pass_configs: dict[str, Any] | None = None,
         compile_flags: list[str] | None = None,
         kernel_name: str | None = None,
+        abi: SunmmioKernelABI | None = None,
     ):
         if kernel_lib_path is None or not os.path.exists(kernel_lib_path):
             raise FileNotFoundError(f"Cached Sunmmio kernel artifact does not exist: {kernel_lib_path}")
@@ -111,6 +113,7 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
             compile_flags=compile_flags,
             kernel_lib_path=kernel_lib_path,
             kernel_name=kernel_name,
+            abi=abi,
         )
 
     def _convert_torch_func(self) -> Callable[..., Any]:
@@ -200,7 +203,7 @@ class SunmmioSunsimKernelAdapter(SunmmioKernelAdapter):
             if self.abi.runtime_scalar_count:
                 raise ValueError(
                     f"Sunmmio sunsim kernel expected {expected_public_args} public arguments "
-                    f"or {expected_full_args} explicit ABI arguments, got {len(args)}"
+                    f"or {expected_full_args} public arguments plus explicit scalar ABI arguments, got {len(args)}"
                 )
             raise ValueError(f"Sunmmio sunsim kernel expected {expected_public_args} arguments, got {len(args)}")
 
@@ -225,9 +228,6 @@ class SunmmioSunsimKernelAdapter(SunmmioKernelAdapter):
                     f"Sunmmio sunsim argument {index} is a tensor slot; expected sunsim.Input, "
                     f"sunsim.Output, or sunsim.Inout, got {type(arg).__name__}."
                 )
-
-        if len(args) == expected_full_args:
-            return list(args)
 
         return self.abi.materialize_runtime_args(args, self._resolve_sunsim_marker_dim)
 

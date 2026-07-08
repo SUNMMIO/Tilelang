@@ -107,6 +107,74 @@ DictAttrs SubstituteAttrs(DictAttrs attrs, const ffi::Map<Var, PrimExpr> &vmap,
   return result;
 }
 
+// Loop/block annotations (e.g. `tile.domain`) can embed mesh symbols but are
+// not rewritten by PrimFunc specialization, so substitute PrimExprs inside
+// annotation values separately.
+ffi::Any SubstituteAnnotationValue(const ffi::Any &value,
+                                   const ffi::Map<Var, PrimExpr> &vmap,
+                                   arith::Analyzer *analyzer) {
+  if (auto arr = value.try_cast<Array<PrimExpr>>()) {
+    Array<PrimExpr> result;
+    result.reserve(arr->size());
+    for (const auto &elem : arr.value()) {
+      result.push_back(SubstituteAndSimplify(elem, vmap, analyzer));
+    }
+    return ffi::Any(result);
+  }
+
+  if (auto expr = value.as<PrimExpr>()) {
+    return ffi::Any(SubstituteAndSimplify(expr.value(), vmap, analyzer));
+  }
+
+  if (auto obj = value.as<ObjectRef>()) {
+    return ffi::Any(SubstituteObject(obj.value(), vmap, analyzer));
+  }
+
+  return value;
+}
+
+Map<String, ffi::Any>
+SubstituteAnnotations(const Map<String, ffi::Any> &annotations,
+                      const ffi::Map<Var, PrimExpr> &vmap,
+                      arith::Analyzer *analyzer) {
+  Map<String, ffi::Any> result;
+  for (const auto &[key, value] : annotations) {
+    result.Set(key, SubstituteAnnotationValue(value, vmap, analyzer));
+  }
+  return result;
+}
+
+class MeshSymbolAnnotationSubstituter : public StmtExprMutator {
+public:
+  explicit MeshSymbolAnnotationSubstituter(ffi::Map<Var, PrimExpr> vmap,
+                                           arith::Analyzer *analyzer)
+      : vmap_(std::move(vmap)), analyzer_(analyzer) {}
+
+  Stmt Substitute(const Stmt &stmt) { return VisitStmt(stmt); }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    For loop = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+    if (!loop->annotations.empty()) {
+      loop.CopyOnWrite()->annotations =
+          SubstituteAnnotations(loop->annotations, vmap_, analyzer_);
+    }
+    return loop;
+  }
+
+  Stmt VisitStmt_(const BlockNode *op) final {
+    Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
+    if (!block->annotations.empty()) {
+      block.CopyOnWrite()->annotations =
+          SubstituteAnnotations(block->annotations, vmap_, analyzer_);
+    }
+    return block;
+  }
+
+private:
+  ffi::Map<Var, PrimExpr> vmap_;
+  arith::Analyzer *analyzer_;
+};
+
 PrimFunc ResolvePrimFunc(PrimFunc func) {
   auto target = func->GetAttr<Target>(tvm::attr::kTarget);
   ICHECK(target.defined())
@@ -142,9 +210,11 @@ PrimFunc ResolvePrimFunc(PrimFunc func) {
   func = Specialize(std::move(func), param_map);
 
   arith::Analyzer analyzer;
+  Stmt body =
+      MeshSymbolAnnotationSubstituter(vmap, &analyzer).Substitute(func->body);
   DictAttrs attrs = SubstituteAttrs(func->attrs, vmap, &analyzer);
-  return PrimFunc(func->params, func->body, func->ret_type, func->buffer_map,
-                  attrs, func->span);
+  return PrimFunc(func->params, body, func->ret_type, func->buffer_map, attrs,
+                  func->span);
 }
 
 } // namespace

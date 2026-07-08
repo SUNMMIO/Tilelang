@@ -9,7 +9,7 @@ import pytest
 from testing.python.sunmmio.common.compile_pipeline import compile_test
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tilelang import tvm as tvm
-from tilelang.jit.adapter.sunmmio.libgen import NpuirTools
+from tilelang.jit.adapter.sunmmio.libgen import find_npuir_tool
 from tilelang.utils.target import determine_target
 
 
@@ -165,7 +165,7 @@ def _repo_root() -> Path:
 
 def find_npuir_opt() -> Path:
     try:
-        return NpuirTools.resolve().opt
+        return find_npuir_tool("npuir-opt")
     except FileNotFoundError as exc:
         pytest.fail(str(exc))
 

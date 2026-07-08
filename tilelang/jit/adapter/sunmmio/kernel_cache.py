@@ -33,8 +33,7 @@ class SunmmioKernelCache(KernelCache):
         KernelCache._safe_write_file(kernel_ll_path, "w", lambda file: file.write(artifact.llvm_ir_source))
 
         abi = getattr(kernel.adapter, "abi", None)
-        kernel_name = abi.kernel_name if abi is not None else artifact.runtime_kernel_name
-        metadata = {"kernel_name": kernel_name}
+        metadata = abi.to_json_dict() if abi is not None else {"kernel_name": artifact.runtime_kernel_name}
         metadata_path = os.path.join(cache_path, self.abi_metadata_path)
         KernelCache._safe_write_file(metadata_path, "w", lambda file: json.dump(metadata, file, sort_keys=True))
 
@@ -74,7 +73,7 @@ class SunmmioKernelCache(KernelCache):
         if not device_kernel_source or not kernel_params:
             return None
 
-        kernel_name = self._load_abi_kernel_name(kernel_lib_path)
+        abi, kernel_name = self._load_abi_metadata(kernel_lib_path)
         kernel = JITKernel(
             func=func,
             out_idx=out_idx,
@@ -101,14 +100,24 @@ class SunmmioKernelCache(KernelCache):
             pass_configs=pass_configs,
             compile_flags=compile_flags,
             kernel_name=kernel_name,
+            abi=abi,
         )
         kernel.torch_function = kernel.adapter.func
         return kernel
 
-    def _load_abi_kernel_name(self, kernel_lib_path: str | None) -> str | None:
+    def _load_abi_metadata(self, kernel_lib_path: str | None):
         if kernel_lib_path is None:
-            return None
+            return None, None
         metadata_path = os.path.join(os.path.dirname(kernel_lib_path), self.abi_metadata_path)
         with open(metadata_path, encoding="utf-8") as file:
             metadata = json.load(file)
-        return metadata.get("kernel_name")
+        kernel_name = metadata.get("kernel_name")
+        if {"public_arg_count", "public_param_names", "device_param_names", "runtime_scalars"}.issubset(metadata):
+            from tilelang.jit.adapter.sunmmio import SunmmioKernelABI
+
+            try:
+                return SunmmioKernelABI.from_json_dict(metadata), kernel_name
+            except ValueError:
+                # Stale/corrupt cached ABI: treat as a cache miss and recompile.
+                self.logger.warning("Ignoring inconsistent cached Sunmmio ABI metadata; recompiling")
+        return None, kernel_name
