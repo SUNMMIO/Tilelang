@@ -1846,6 +1846,22 @@ int RuntimeBankedVersionCount(const Buffer& buffer, int iterations) {
   return CeilDiv(iterations, 2);
 }
 
+std::vector<Buffer> BuildRuntimeMultiversionBuffers(
+    const std::vector<Buffer>& versioned_buffers, int iterations) {
+  if (iterations <= 1) {
+    return {};
+  }
+  std::vector<Buffer> runtime_multiversion_buffers;
+  runtime_multiversion_buffers.reserve(versioned_buffers.size());
+  for (const Buffer& buffer : versioned_buffers) {
+    if (iterations == 2 && GetPingPongMemoryKind(buffer) >= 0) {
+      continue;
+    }
+    runtime_multiversion_buffers.push_back(buffer);
+  }
+  return runtime_multiversion_buffers;
+}
+
 struct ScheduledAccessWindow {
   int logical_iter{0};
   int command_iter{0};
@@ -1867,231 +1883,228 @@ struct BufferInstanceLifetime {
   std::vector<BufferRegion> write_regions;
 };
 
-std::vector<Buffer> DetectRuntimeMultiversionBuffers(
-    const std::vector<TemplateCommand>& commands,
-    const std::vector<Buffer>& versioned_buffers,
-    const std::vector<Buffer>& runtime_banked_buffers,
-    const Var& pipeline_loop_var, const SolveResult& sol, int stage_count,
-    const std::map<std::string, int>& runtime_bank_start_phases,
-    const std::map<std::string, std::map<int, int>>& runtime_bank_writer_phases) {
-  // Final runtime multiversion annotations must be derived from the selected
-  // steady-state window of the optimized solution, not from the original
-  // num_stages request before stage shrinking.
-  stage_count = std::max(stage_count, 0);
-  std::unordered_set<const BufferNode*> candidates;
-  std::unordered_set<const BufferNode*> banked_candidates;
-  for (const Buffer& buffer : runtime_banked_buffers) {
-    banked_candidates.insert(buffer.get());
-  }
-  for (const Buffer& buffer : versioned_buffers) {
-    int version_count =
-        banked_candidates.count(buffer.get())
-            ? RuntimeBankedVersionCount(buffer, stage_count)
-            : RuntimeVersionCount(buffer, stage_count);
-    if (version_count > 1) {
-      candidates.insert(buffer.get());
-    }
-  }
-  if (candidates.empty()) {
-    return {};
-  }
+// std::vector<Buffer> DetectRuntimeMultiversionBuffers(
+//     const std::vector<TemplateCommand>& commands,
+//     const std::vector<Buffer>& versioned_buffers,
+//     const std::vector<Buffer>& runtime_banked_buffers,
+//     const Var& pipeline_loop_var, const SolveResult& sol, int iterations,
+//     const std::map<std::string, int>& runtime_bank_start_phases,
+//     const std::map<std::string, std::map<int, int>>& runtime_bank_writer_phases) {
+//   iterations = std::max(iterations, 0);
+//   std::unordered_set<const BufferNode*> candidates;
+//   std::unordered_set<const BufferNode*> banked_candidates;
+//   for (const Buffer& buffer : runtime_banked_buffers) {
+//     banked_candidates.insert(buffer.get());
+//   }
+//   for (const Buffer& buffer : versioned_buffers) {
+//     int version_count =
+//         banked_candidates.count(buffer.get())
+//             ? RuntimeBankedVersionCount(buffer, iterations)
+//             : RuntimeVersionCount(buffer, iterations);
+//     if (version_count > 1) {
+//       candidates.insert(buffer.get());
+//     }
+//   }
+//   if (candidates.empty()) {
+//     return {};
+//   }
 
-  int max_iter_offset = 0;
-  for (const TemplateCommand& cmd : commands) {
-    for (const AccessInfo& access : cmd.accesses) {
-      max_iter_offset = std::max(max_iter_offset, access.iter_offset);
-    }
-  }
+//   int max_iter_offset = 0;
+//   for (const TemplateCommand& cmd : commands) {
+//     for (const AccessInfo& access : cmd.accesses) {
+//       max_iter_offset = std::max(max_iter_offset, access.iter_offset);
+//     }
+//   }
 
-  const int expanded_iters =
-      std::max(2, stage_count + max_iter_offset + 1);
-  std::unordered_map<const BufferNode*, std::vector<ScheduledAccessWindow>>
-      windows_by_buffer;
-  windows_by_buffer.reserve(candidates.size());
+//   const int expanded_iters =
+//       std::max(2, iterations + max_iter_offset + 1);
+//   std::unordered_map<const BufferNode*, std::vector<ScheduledAccessWindow>>
+//       windows_by_buffer;
+//   windows_by_buffer.reserve(candidates.size());
 
-  struct ExpandedCommand {
-    int iter{0};
-    const TemplateCommand* cmd{nullptr};
-  };
+//   struct ExpandedCommand {
+//     int iter{0};
+//     const TemplateCommand* cmd{nullptr};
+//   };
 
-  std::vector<int> producer_ids;
-  std::vector<int> body_ids;
-  producer_ids.reserve(commands.size());
-  body_ids.reserve(commands.size());
-  for (const TemplateCommand& cmd : commands) {
-    if (IsProducerLike(cmd)) {
-      producer_ids.push_back(cmd.id);
-    } else {
-      body_ids.push_back(cmd.id);
-    }
-  }
+//   std::vector<int> producer_ids;
+//   std::vector<int> body_ids;
+//   producer_ids.reserve(commands.size());
+//   body_ids.reserve(commands.size());
+//   for (const TemplateCommand& cmd : commands) {
+//     if (IsProducerLike(cmd)) {
+//       producer_ids.push_back(cmd.id);
+//     } else {
+//       body_ids.push_back(cmd.id);
+//     }
+//   }
 
-  std::vector<ExpandedCommand> expanded_commands;
-  expanded_commands.reserve(expanded_iters * commands.size());
-  for (int iter = 0; iter < expanded_iters; ++iter) {
-    for (int id : body_ids) {
-      expanded_commands.push_back(ExpandedCommand{iter, &commands[id]});
-    }
-    for (int id : producer_ids) {
-      expanded_commands.push_back(ExpandedCommand{iter + 1, &commands[id]});
-    }
-  }
-  std::sort(expanded_commands.begin(), expanded_commands.end(),
-            [](const ExpandedCommand& a, const ExpandedCommand& b) {
-              if (a.iter != b.iter) {
-                return a.iter < b.iter;
-              }
-              return a.cmd->id < b.cmd->id;
-            });
+//   std::vector<ExpandedCommand> expanded_commands;
+//   expanded_commands.reserve(expanded_iters * commands.size());
+//   for (int iter = 0; iter < expanded_iters; ++iter) {
+//     for (int id : body_ids) {
+//       expanded_commands.push_back(ExpandedCommand{iter, &commands[id]});
+//     }
+//     for (int id : producer_ids) {
+//       expanded_commands.push_back(ExpandedCommand{iter + 1, &commands[id]});
+//     }
+//   }
+//   std::sort(expanded_commands.begin(), expanded_commands.end(),
+//             [](const ExpandedCommand& a, const ExpandedCommand& b) {
+//               if (a.iter != b.iter) {
+//                 return a.iter < b.iter;
+//               }
+//               return a.cmd->id < b.cmd->id;
+//             });
 
-  for (const ExpandedCommand& expanded : expanded_commands) {
-    const int start = sol.t[expanded.cmd->id] + expanded.iter * sol.II;
-    const int end = start + expanded.cmd->spec.latency;
-    for (const AccessInfo& access : expanded.cmd->accesses) {
-      const BufferNode* buf = access.buffer().get();
-      if (!candidates.count(buf)) {
-        continue;
-      }
-      windows_by_buffer[buf].push_back(
-          ScheduledAccessWindow{
-              expanded.iter + access.iter_offset,
-              expanded.iter,
-              expanded.cmd->id,
-              start,
-              end,
-              access.is_write,
-              MaterializeBufferRegion(access.region, pipeline_loop_var,
-                                      expanded.iter)});
-    }
-  }
+//   for (const ExpandedCommand& expanded : expanded_commands) {
+//     const int start = sol.t[expanded.cmd->id] + expanded.iter * sol.II;
+//     const int end = start + expanded.cmd->spec.latency;
+//     for (const AccessInfo& access : expanded.cmd->accesses) {
+//       const BufferNode* buf = access.buffer().get();
+//       if (!candidates.count(buf)) {
+//         continue;
+//       }
+//       windows_by_buffer[buf].push_back(
+//           ScheduledAccessWindow{
+//               expanded.iter + access.iter_offset,
+//               expanded.iter,
+//               expanded.cmd->id,
+//               start,
+//               end,
+//               access.is_write,
+//               MaterializeBufferRegion(access.region, pipeline_loop_var,
+//                                       expanded.iter)});
+//     }
+//   }
 
-  auto region_sets_intersect = [](const std::vector<BufferRegion>& lhs,
-                                  const std::vector<BufferRegion>& rhs) {
-    for (const BufferRegion& lhs_region : lhs) {
-      for (const BufferRegion& rhs_region : rhs) {
-        if (PipelineRegionIntersect(lhs_region->region, rhs_region->region)) {
-          return true;
-        }
-      }
-    }
-    return false;
-  };
+//   auto region_sets_intersect = [](const std::vector<BufferRegion>& lhs,
+//                                   const std::vector<BufferRegion>& rhs) {
+//     for (const BufferRegion& lhs_region : lhs) {
+//       for (const BufferRegion& rhs_region : rhs) {
+//         if (PipelineRegionIntersect(lhs_region->region, rhs_region->region)) {
+//           return true;
+//         }
+//       }
+//     }
+//     return false;
+//   };
 
-  auto resolve_write_bank = [&](const Buffer& buffer,
-                                const BufferInstanceLifetime& lifetime) {
-    if (!banked_candidates.count(buffer.get())) {
-      return -1;
-    }
-    int phase = 0;
-    auto it_writer = runtime_bank_writer_phases.find(buffer->name);
-    if (it_writer != runtime_bank_writer_phases.end()) {
-      auto it_phase = it_writer->second.find(lifetime.first_write_cmd_id);
-      if (it_phase != it_writer->second.end()) {
-        phase = it_phase->second;
-      }
-    } else {
-      auto it_start = runtime_bank_start_phases.find(buffer->name);
-      if (it_start != runtime_bank_start_phases.end()) {
-        phase = it_start->second;
-      }
-    }
-    return PositiveMod(lifetime.command_iter + phase, 2);
-  };
+//   auto resolve_write_bank = [&](const Buffer& buffer,
+//                                 const BufferInstanceLifetime& lifetime) {
+//     if (!banked_candidates.count(buffer.get())) {
+//       return -1;
+//     }
+//     int phase = 0;
+//     auto it_writer = runtime_bank_writer_phases.find(buffer->name);
+//     if (it_writer != runtime_bank_writer_phases.end()) {
+//       auto it_phase = it_writer->second.find(lifetime.first_write_cmd_id);
+//       if (it_phase != it_writer->second.end()) {
+//         phase = it_phase->second;
+//       }
+//     } else {
+//       auto it_start = runtime_bank_start_phases.find(buffer->name);
+//       if (it_start != runtime_bank_start_phases.end()) {
+//         phase = it_start->second;
+//       }
+//     }
+//     return PositiveMod(lifetime.command_iter + phase, 2);
+//   };
 
-  std::vector<Buffer> runtime_multiversion_buffers;
-  for (const Buffer& buffer : versioned_buffers) {
-    if (!candidates.count(buffer.get())) {
-      continue;
-    }
+//   std::vector<Buffer> runtime_multiversion_buffers;
+//   for (const Buffer& buffer : versioned_buffers) {
+//     if (!candidates.count(buffer.get())) {
+//       continue;
+//     }
 
-    auto it_windows = windows_by_buffer.find(buffer.get());
-    if (it_windows == windows_by_buffer.end()) {
-      continue;
-    }
+//     auto it_windows = windows_by_buffer.find(buffer.get());
+//     if (it_windows == windows_by_buffer.end()) {
+//       continue;
+//     }
 
-    std::unordered_map<int, std::vector<const ScheduledAccessWindow*>>
-        windows_by_logical_iter;
-    for (const ScheduledAccessWindow& window : it_windows->second) {
-      windows_by_logical_iter[window.logical_iter].push_back(&window);
-    }
+//     std::unordered_map<int, std::vector<const ScheduledAccessWindow*>>
+//         windows_by_logical_iter;
+//     for (const ScheduledAccessWindow& window : it_windows->second) {
+//       windows_by_logical_iter[window.logical_iter].push_back(&window);
+//     }
 
-    std::vector<BufferInstanceLifetime> lifetimes;
-    lifetimes.reserve(windows_by_logical_iter.size());
-    for (const auto& kv : windows_by_logical_iter) {
-      int first_write_start = std::numeric_limits<int>::max();
-      const ScheduledAccessWindow* first_write_window = nullptr;
-      for (const ScheduledAccessWindow* window : kv.second) {
-        if (window->is_write) {
-          if (window->start < first_write_start) {
-            first_write_start = window->start;
-            first_write_window = window;
-          }
-        }
-      }
-      if (first_write_start == std::numeric_limits<int>::max()) {
-        continue;
-      }
+//     std::vector<BufferInstanceLifetime> lifetimes;
+//     lifetimes.reserve(windows_by_logical_iter.size());
+//     for (const auto& kv : windows_by_logical_iter) {
+//       int first_write_start = std::numeric_limits<int>::max();
+//       const ScheduledAccessWindow* first_write_window = nullptr;
+//       for (const ScheduledAccessWindow* window : kv.second) {
+//         if (window->is_write) {
+//           if (window->start < first_write_start) {
+//             first_write_start = window->start;
+//             first_write_window = window;
+//           }
+//         }
+//       }
+//       if (first_write_start == std::numeric_limits<int>::max()) {
+//         continue;
+//       }
 
-      BufferInstanceLifetime lifetime;
-      lifetime.logical_iter = kv.first;
-      lifetime.command_iter =
-          first_write_window == nullptr ? kv.first : first_write_window->command_iter;
-      lifetime.first_write_cmd_id =
-          first_write_window == nullptr ? -1 : first_write_window->cmd_id;
-      lifetime.start = first_write_start;
-      lifetime.end = first_write_start;
-      for (const ScheduledAccessWindow* window : kv.second) {
-        if (window->end < first_write_start) {
-          continue;
-        }
-        lifetime.end = std::max(lifetime.end, window->end);
-        lifetime.access_regions.push_back(window->region);
-        if (window->is_write) {
-          lifetime.write_regions.push_back(window->region);
-        }
-      }
-      if (!lifetime.write_regions.empty()) {
-        lifetime.write_bank = resolve_write_bank(buffer, lifetime);
-        lifetimes.push_back(std::move(lifetime));
-      }
-    }
+//       BufferInstanceLifetime lifetime;
+//       lifetime.logical_iter = kv.first;
+//       lifetime.command_iter =
+//           first_write_window == nullptr ? kv.first : first_write_window->command_iter;
+//       lifetime.first_write_cmd_id =
+//           first_write_window == nullptr ? -1 : first_write_window->cmd_id;
+//       lifetime.start = first_write_start;
+//       lifetime.end = first_write_start;
+//       for (const ScheduledAccessWindow* window : kv.second) {
+//         if (window->end < first_write_start) {
+//           continue;
+//         }
+//         lifetime.end = std::max(lifetime.end, window->end);
+//         lifetime.access_regions.push_back(window->region);
+//         if (window->is_write) {
+//           lifetime.write_regions.push_back(window->region);
+//         }
+//       }
+//       if (!lifetime.write_regions.empty()) {
+//         lifetime.write_bank = resolve_write_bank(buffer, lifetime);
+//         lifetimes.push_back(std::move(lifetime));
+//       }
+//     }
 
-    std::sort(lifetimes.begin(), lifetimes.end(),
-              [](const BufferInstanceLifetime& a,
-                 const BufferInstanceLifetime& b) {
-                if (a.start != b.start) {
-                  return a.start < b.start;
-                }
-                return a.logical_iter < b.logical_iter;
-              });
+//     std::sort(lifetimes.begin(), lifetimes.end(),
+//               [](const BufferInstanceLifetime& a,
+//                  const BufferInstanceLifetime& b) {
+//                 if (a.start != b.start) {
+//                   return a.start < b.start;
+//                 }
+//                 return a.logical_iter < b.logical_iter;
+//               });
 
-    bool needs_runtime_multiversion = false;
-    bool is_banked = banked_candidates.count(buffer.get()) != 0;
-    for (size_t i = 0; i < lifetimes.size() && !needs_runtime_multiversion; ++i) {
-      for (size_t j = i + 1; j < lifetimes.size(); ++j) {
-        if (lifetimes[j].start >= lifetimes[i].end) {
-          break;
-        }
-        if (is_banked && lifetimes[i].write_bank != lifetimes[j].write_bank) {
-          continue;
-        }
-        if (region_sets_intersect(lifetimes[i].write_regions,
-                                  lifetimes[j].access_regions) ||
-            region_sets_intersect(lifetimes[j].write_regions,
-                                  lifetimes[i].access_regions)) {
-          needs_runtime_multiversion = true;
-          break;
-        }
-      }
-    }
+//     bool needs_runtime_multiversion = false;
+//     bool is_banked = banked_candidates.count(buffer.get()) != 0;
+//     for (size_t i = 0; i < lifetimes.size() && !needs_runtime_multiversion; ++i) {
+//       for (size_t j = i + 1; j < lifetimes.size(); ++j) {
+//         if (lifetimes[j].start >= lifetimes[i].end) {
+//           break;
+//         }
+//         if (is_banked && lifetimes[i].write_bank != lifetimes[j].write_bank) {
+//           continue;
+//         }
+//         if (region_sets_intersect(lifetimes[i].write_regions,
+//                                   lifetimes[j].access_regions) ||
+//             region_sets_intersect(lifetimes[j].write_regions,
+//                                   lifetimes[i].access_regions)) {
+//           needs_runtime_multiversion = true;
+//           break;
+//         }
+//       }
+//     }
 
-    if (needs_runtime_multiversion) {
-      runtime_multiversion_buffers.push_back(buffer);
-    }
-  }
+//     if (needs_runtime_multiversion) {
+//       runtime_multiversion_buffers.push_back(buffer);
+//     }
+//   }
 
-  return runtime_multiversion_buffers;
-}
+//   return runtime_multiversion_buffers;
+// }
 
 TimeWindowOrderResult BuildTimeWindowOrders(
     const std::vector<TemplateCommand>& commands, int iterations,
@@ -3658,10 +3671,13 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
     }
 
     int stage_count = CeilDiv(sol.makespan, std::max(1, sol.II));
-    analysis.runtime_multiversion_buffers = DetectRuntimeMultiversionBuffers(
-        analysis.commands, analysis.versioned_buffers, analysis.runtime_banked_buffers,
-        loop->loop_var, sol, stage_count, analysis.runtime_bank_start_phases,
-        analysis.runtime_bank_writer_phases);
+    analysis.runtime_multiversion_buffers =
+        BuildRuntimeMultiversionBuffers(analysis.versioned_buffers,
+                                        analysis.iterations);
+    // analysis.runtime_multiversion_buffers = DetectRuntimeMultiversionBuffers(
+    //     analysis.commands, analysis.versioned_buffers, analysis.runtime_banked_buffers,
+    //     loop->loop_var, sol, analysis.iterations, analysis.runtime_bank_start_phases,
+    //     analysis.runtime_bank_writer_phases);
     annotations.Set("iterations", Integer(analysis.iterations));
     annotations.Set("ii", Integer(sol.II));
     annotations.Set("makespan", Integer(sol.makespan));
