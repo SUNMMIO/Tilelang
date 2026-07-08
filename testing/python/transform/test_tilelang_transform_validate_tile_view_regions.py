@@ -196,6 +196,38 @@ def _make_copy_kernel(copy_case):
                     )
                 )
 
+    elif copy_case == "row_major_zero_extent":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel():
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
+                T.evaluate(
+                    tvm.tir.call_intrin(
+                        "handle",
+                        tvm.tir.op.Op.get("tl.tileop.copy"),
+                        _tile_region(A[0, 0], "r", 0, 64),
+                        _tile_region(A_shared[0, 0], "w", 0, 64),
+                    )
+                )
+
+    elif copy_case == "row_major_negative_extent":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel():
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
+                T.evaluate(
+                    tvm.tir.call_intrin(
+                        "handle",
+                        tvm.tir.op.Op.get("tl.tileop.copy"),
+                        _tile_region(A[0, 0], "r", -16, 64),
+                        _tile_region(A_shared[0, 0], "w", -16, 64),
+                    )
+                )
+
     elif copy_case == "zz_3d_inner_major_split_illegal":
 
         @T.prim_func
@@ -624,6 +656,14 @@ def test_sunmmio_validate_tile_view_regions_accepts_legal_regions(copy_case):
         (
             "row_major_3d_outer_slab_oob",
             "must stay within buffer shape",
+        ),
+        (
+            "row_major_zero_extent",
+            "must be positive",
+        ),
+        (
+            "row_major_negative_extent",
+            "must be positive",
         ),
         (
             "zz_3d_inner_major_split_illegal",

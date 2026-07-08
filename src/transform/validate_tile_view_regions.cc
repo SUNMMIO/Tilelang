@@ -484,14 +484,18 @@ private:
     const PrimExpr &region_extent = range->extent;
 
     std::optional<int64_t> static_extent = TryGetStaticInt(region_extent);
-    if (!static_extent.has_value() || static_extent.value() <= 0) {
+    if (!static_extent.has_value()) {
       LOG(WARNING) << op_name << " " << operand_name << " region extent at dim "
                    << dim << " for buffer " << region->buffer->name
-                   << " is not a positive compile-time constant; skip "
-                      "tile_view validation for this dimension. extent="
+                   << " is not a compile-time constant; skip tile_view "
+                      "validation for this dimension. extent="
                    << region_extent << ".";
       return std::nullopt;
     }
+    ICHECK_GT(static_extent.value(), 0)
+        << op_name << " " << operand_name << " region extent at dim " << dim
+        << " for buffer " << region->buffer->name
+        << " must be positive, but got extent=" << region_extent << ".";
 
     ICHECK(!analyzer_.CanProve(region_min < make_zero(region_min.dtype())))
         << op_name << " " << operand_name << " region min at dim " << dim
