@@ -134,6 +134,18 @@ class PassConfigKey(str, Enum):
     optimization in cases where manual synchronization is preferred or when
     synchronization is not needed. Default: False"""
 
+    TL_DISABLE_SUNMMIO_PIPELINE = "tl.disable_sunmmio_pipeline"
+    """Disable Sunmmio pipeline planning and injection. Default: False"""
+
+    TL_SUNMMIO_PIPELINE_MODE = "tl.sunmmio_pipeline_mode"
+    """Select Sunmmio pipeline implementation. Accepts: "greedy", "ilp". Default: "greedy"."""
+
+    TL_SUNMMIO_ILP_FASTER = "tl.sunmmio_ilp_faster"
+    """Override Sunmmio ILP latency scaling factor. When unset, the planner auto-selects a factor. Default: None."""
+
+    TL_SUNMMIO_ILP_STAGE_SHRINK = "tl.sunmmio_ilp_stage_shrink"
+    """Enable Sunmmio ILP stage shrink: solve at original num_stages, then try smaller stages at fixed II and reoptimize on the minimum feasible stage. Default: False."""
+
     TL_FORCE_LET_INLINE = "tl.force_let_inline"
     """Force TileLang to inline let bindings during simplification. Default: False"""
 

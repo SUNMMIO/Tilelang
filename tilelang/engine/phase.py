@@ -70,6 +70,27 @@ def should_enable_ast_print(pass_ctx: PassContext | None = None) -> bool:
     return bool(pass_ctx and pass_ctx.config.get(tilelang.PassConfigKey.TL_AST_PRINT_ENABLE, False))
 
 
+def should_enable_sunmmio_pipeline(pass_ctx: PassContext | None = None) -> bool:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    return not bool(
+        pass_ctx.config.get(tilelang.PassConfigKey.TL_DISABLE_SUNMMIO_PIPELINE, False)
+    )
+
+
+def get_sunmmio_pipeline_mode(pass_ctx: PassContext | None = None) -> str:
+    if pass_ctx is None:
+        pass_ctx = tilelang.transform.get_pass_context()
+    mode = pass_ctx.config.get(tilelang.PassConfigKey.TL_SUNMMIO_PIPELINE_MODE, "greedy")
+    mode = str(mode).strip().lower()
+    if mode not in {"greedy", "ilp"}:
+        raise ValueError(
+            f"Invalid Sunmmio pipeline mode: {mode}. "
+            "Expected one of: 'greedy', 'ilp'."
+        )
+    return mode
+
+
 def should_enable_layout_visual(pass_ctx: PassContext | None = None) -> bool:
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()
@@ -245,9 +266,16 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
 
 
 def OptimizeForSunmmio(mod: IRModule, target: Target) -> IRModule:
+    pass_ctx = tilelang.transform.get_pass_context()
     mod = tilelang.transform.IfStmtBinding()(mod)
-    mod = tilelang.transform.SunmmioPipelinePlanning(debug=False)(mod)
-    mod = tilelang.transform.InjectSunmmioPipeline()(mod)
+    if should_enable_sunmmio_pipeline(pass_ctx):
+        pipeline_mode = get_sunmmio_pipeline_mode(pass_ctx)
+        if pipeline_mode == "ilp":
+            mod = tilelang.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
+            mod = tilelang.transform.InjectSunmmioPipelineILP()(mod)
+        else:
+            mod = tilelang.transform.SunmmioPipelinePlanning(debug=False)(mod)
+            mod = tilelang.transform.InjectSunmmioPipeline()(mod)
 
     mod = tilelang.transform.LowerOpaqueBlock()(mod)
     mod = tilelang.transform.Simplify()(mod)
