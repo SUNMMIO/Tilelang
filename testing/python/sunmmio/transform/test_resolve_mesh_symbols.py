@@ -353,8 +353,7 @@ def test_resolve_reports_mesh_vars_without_attrs():
 def test_resolve_reports_decl_buffer_mesh_vars_without_attrs():
     target = _sunmmio_target()
     mesh_nrows = tir.SizeVar("mesh_nrows", "int32")
-    data = tir.Var("data", "handle")
-    buffer = tir.decl_buffer((mesh_nrows,), "float32", data=data)
+    buffer = tir.decl_buffer((mesh_nrows,), "float32")
     body = tir.DeclBuffer(buffer, tir.Evaluate(0))
     func = tir.PrimFunc([], body).with_attr("target", target)
     mod = tvm.IRModule({"main": func})
