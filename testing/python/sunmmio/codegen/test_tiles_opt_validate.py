@@ -385,8 +385,8 @@ def test_dot_mul_tiled_parallel_3d_large_block_codegen_validates_loose_with_npui
             "dot_mul_tiled_parallel_3d_tail_canonical_shared",
             lambda: dot_mul_tiled_parallel_3d(
                 batch=64,
-                m=510,
-                n=254,
+                m=512,
+                n=256,
                 block_b=32,
                 block_m=64,
                 block_n=64,

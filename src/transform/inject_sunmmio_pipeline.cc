@@ -88,8 +88,9 @@ private:
       }
 
       const Buffer &new_buffer = (*it).second;
-      Optional<Layout> derived_layout = DeriveLayoutLike(
-          layout, new_buffer->shape, Optional<Array<Integer>>(), &analyzer);
+      Optional<Layout> derived_layout =
+          DeriveLayoutLikeForDType(layout, new_buffer->shape, new_buffer->dtype,
+                                   Optional<Array<Integer>>(), &analyzer);
       ICHECK(derived_layout.defined())
           << "Failed to derive multiversioned layout for buffer "
           << buffer->name << " with shape " << new_buffer->shape;

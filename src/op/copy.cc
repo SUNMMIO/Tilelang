@@ -907,10 +907,8 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   // Staging mirrors the DRAM layout kind (so its dma leg is plain); register it
   // so it isn't taken for the default aligned RSRAM layout.
   Optional<Layout> stage_layout =
-      sunmmio::IsMXDType(dram->dtype)
-          ? Optional<Layout>(sunmmio::MakeMXRowMajor(stage_shape, dram->dtype))
-          : DeriveLayoutLike(dram_layout, stage_shape,
-                             Optional<Array<Integer>>(), analyzer);
+      DeriveLayoutLikeForDType(dram_layout, stage_shape, dram->dtype,
+                               Optional<Array<Integer>>(), analyzer);
   ICHECK(T.RegisterScratchBuffer && stage_layout.defined())
       << "sunmmio layout transform: cannot build the staging layout.";
   // stage_layout is the DRAM layout re-derived onto the copied region's shape.
@@ -921,6 +919,57 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   // identity, so emit a plain DMA and skip the staging buffer entirely.
   if (IsLayoutMatch(stage_layout.value(), rsram_layout, analyzer))
     return dma(src_region, dst_region);
+
+  auto is_mx_row_major_layout = [&](const Layout &layout,
+                                    DataType dtype) -> bool {
+    return layout.defined() && sunmmio::IsMXDType(dtype) &&
+           IsSameLayout(layout,
+                        sunmmio::MakeMXRowMajor(layout->InputShape(), dtype),
+                        analyzer);
+  };
+  auto find_mx_axes_with_levels =
+      [](const Layout &layout,
+         int expected_levels) -> Optional<Array<Integer>> {
+    const auto *cute = layout.as<CuteLayoutNode>();
+    if (!cute)
+      return Optional<Array<Integer>>();
+    Array<Integer> axes;
+    Array<Integer> dim_levels = cute->GetDimLevels();
+    for (int d = 0; d < static_cast<int>(dim_levels.size()); ++d) {
+      int levels = dim_levels[d].IntValue();
+      if (levels == 1)
+        continue;
+      if (levels != expected_levels)
+        return Optional<Array<Integer>>();
+      axes.push_back(Integer(d));
+    }
+    if (axes.size() != 2)
+      return Optional<Array<Integer>>();
+    return axes;
+  };
+  auto is_mxzz_layout = [&](const Layout &layout, DataType dtype) -> bool {
+    if (!layout.defined() || !sunmmio::IsMXDType(dtype))
+      return false;
+    Optional<Array<Integer>> axes =
+        find_mx_axes_with_levels(layout, /*expected_levels=*/2);
+    return axes.defined() &&
+           IsSameLayout(
+               layout,
+               sunmmio::MakeMXZZ(layout->InputShape(), axes.value(), dtype),
+               analyzer);
+  };
+
+  if (sunmmio::IsMXDType(dram->dtype)) {
+    bool stage_row_major =
+        is_mx_row_major_layout(stage_layout.value(), dram->dtype);
+    bool stage_mxzz = is_mxzz_layout(stage_layout.value(), dram->dtype);
+    bool rsram_row_major = is_mx_row_major_layout(rsram_layout, rsram->dtype);
+    bool rsram_mxzz = is_mxzz_layout(rsram_layout, rsram->dtype);
+    ICHECK((stage_row_major && rsram_mxzz) || (stage_mxzz && rsram_row_major))
+        << "sunmmio layout transform for MX only supports MX row-major <-> "
+           "MXZZ; unsupported layout pair for buffer "
+        << dram->name << ".";
+  }
   T.RegisterScratchBuffer(stage, stage_layout.value());
 
   // Pad/unpad transforms walk one tile-register row per leading index, so when
