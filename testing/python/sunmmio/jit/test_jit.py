@@ -774,8 +774,8 @@ def test_sunmmio_elementwise_sync_waits_are_not_duplicated():
 
     static_example = _load_sunmmio_elementwise_example()
     static_prim = static_example.elementwise_add.get_tir(
-        64,
-        64,
+        128,
+        128,
         block_M=32,
         block_N=32,
         in_dtype=T.bfloat16,
@@ -795,8 +795,8 @@ def test_sunmmio_elementwise_sync_waits_are_not_duplicated():
     assert static_source.count("T.wait_token(2)") == 1
 
     static_multi_prim = static_example.elementwise_add.get_tir(
+        128,
         256,
-        64,
         block_M=32,
         block_N=32,
         in_dtype=T.bfloat16,

@@ -20,7 +20,7 @@ os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 REDUCE_IN_TILE_CASES = [
     ((32, 1024), 1, False),
-    ((4, 1024), 0, False),
+    ((32, 1024), 0, False),
     ((1024, 4), 1, True),
     ((256, 128), 1, True),
     ((256, 128), 0, False),
