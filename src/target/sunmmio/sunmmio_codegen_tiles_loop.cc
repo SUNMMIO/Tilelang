@@ -3541,12 +3541,37 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           access.requires_aligned_1d_load && store->predicate.defined() &&
           is_canonical_tail_load_predicate(store->predicate.value(), state,
                                            access);
+      if (!access.requires_aligned_1d_load && store->predicate.defined() &&
+          !mask.has_value()) {
+        mask = lower_expr(store->predicate.value(), state, std::nullopt);
+      }
       if (access.requires_aligned_1d_load && store->predicate.defined() &&
           !canonical_aligned_tail_store) {
         mask = lower_expr(store->predicate.value(), state, std::nullopt);
       }
       std::optional<SunMMIOValue> dst_view;
       if (mask.has_value() && !access.requires_aligned_1d_load) {
+        SunMMIOValue store_mask = mask.value();
+        if (IsTileLike(store_mask)) {
+          store_mask =
+              reorient_unit_tile_to_shape(store_mask, access.tile_shape);
+          if (ExtractStaticShape(store_mask.type) != access.tile_shape) {
+            store_mask = broadcast_tile_to_shape(store_mask, access.tile_shape);
+          }
+          ICHECK(StaticShapesEqual(
+              store_mask.type,
+              MakeTileType(DataType::Bool(), access.tile_shape)))
+              << "Predicated tile store cannot normalize mask shape";
+        } else {
+          SunMMIOType bool_scalar_type{
+              SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
+          store_mask =
+              EnsureType(store_mask, bool_scalar_type, DataType::Bool());
+          store_mask = builder_->TileFill(
+              NewValueName(), store_mask,
+              MakeTileType(DataType::Bool(), access.tile_shape),
+              DataType::Bool());
+        }
         dst_view = get_or_create_tile_view(access, state);
         SunMMIOType dst_tile_type =
             MakeTileType(store->buffer->dtype, access.tile_shape);
@@ -3555,7 +3580,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
             std::nullopt,
             CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
         rhs = builder_->TileSelect(
-            NewValueName(), mask.value(), rhs, old_tile, dst_tile_type,
+            NewValueName(), store_mask, rhs, old_tile, dst_tile_type,
             CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
       }
       std::optional<SunMMIOValue> updated_aligned_tile;

@@ -270,5 +270,15 @@ def test_pick_scalar_access_codegen_with_explicit_rsram_staging(factory, mlir_fi
     )
 
 
+def test_pick_3d_predicated_1d_store_preserves_old_lanes(tmp_path):
+    validate_sunmmio_codegen_with_npuir_opt(
+        pick_3d_side_data_kernel(heads=2, q_blocks=5, k_blocks=256, out_tiles=2),
+        tmp_path,
+        mlir_filename="pick_3d_predicated_store_suvm.mlir",
+        expected_tokens=("suvm.tile.load", "suvm.tile.select", "suvm.tile.store"),
+        opt_args=("--verify-each",),
+    )
+
+
 if __name__ == "__main__":
     tilelang.testing.main()
