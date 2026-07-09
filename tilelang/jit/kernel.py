@@ -347,8 +347,6 @@ class JITKernel(Generic[_P, _T]):
                 device_mod=artifact.device_mod,
                 device_kernel_source=artifact.kernel_source,
                 verbose=verbose,
-                pass_configs=pass_configs,
-                compile_flags=compile_flags,
             )
         else:
             # Handle invalid backend.
@@ -431,8 +429,6 @@ class JITKernel(Generic[_P, _T]):
                 host_kernel_source=host_kernel_source,
                 device_kernel_source=device_kernel_source,
                 kernel_lib_path=kernel_lib_path,
-                pass_configs=pass_configs,
-                compile_flags=compile_flags,
             )
         else:
             # Handle invalid backend.
@@ -655,7 +651,7 @@ class JITKernel(Generic[_P, _T]):
 
     @property
     def kernel_source(self) -> str:
-        return self.artifact.kernel_source if self.artifact else self.adapter.kernel_global_source
+        return self.artifact.kernel_source if self.artifact else self.adapter.get_kernel_source()
 
     @property
     def host_source(self) -> str:
