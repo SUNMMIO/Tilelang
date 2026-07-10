@@ -58,5 +58,17 @@ def test_predicated_store_mask_range_uses_value_dtype_width(dtype, expected_inde
     assert re.search(rf"suvm\.tile\.range : !suvm\.tile<[^>]*x{expected_index_dtype}>", src)
 
 
+def test_float16_sunmmio_codegen_reports_unsupported_dtype(tmp_path):
+    with pytest.raises(
+        Exception,
+        match="Unsupported SunMMIO SUVM dtype.*float16.*does not support float16.*Use bfloat16",
+    ):
+        validate_sunmmio_codegen_with_npuir_opt(
+            predicated_store_mask_dtype_kernel(T.float16),
+            tmp_path,
+            mlir_filename="predicated_store_mask_float16_rejected_suvm.mlir",
+        )
+
+
 if __name__ == "__main__":
     tilelang.testing.main()
