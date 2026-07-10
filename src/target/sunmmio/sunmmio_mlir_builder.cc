@@ -228,15 +228,19 @@ SunMMIOValue SuvmSunmmioBuilder::TileInsertSlice(
 SunMMIOValue SuvmSunmmioBuilder::TileRectMask(const std::string &result_name,
                                               const SunMMIOValue &valid_rows,
                                               const SunMMIOValue &valid_cols,
-                                              const SunMMIOType &tile_type) {
-  return tile_->TileRectMask(result_name, valid_rows, valid_cols, tile_type);
+                                              const SunMMIOType &tile_type,
+                                              DataType index_dtype) {
+  return tile_->TileRectMask(result_name, valid_rows, valid_cols, tile_type,
+                             index_dtype);
 }
 
 SunMMIOValue SuvmSunmmioBuilder::TileAxisMask(const std::string &result_name,
                                               int64_t axis,
                                               const SunMMIOValue &valid_extent,
-                                              const SunMMIOType &tile_type) {
-  return tile_->TileAxisMask(result_name, axis, valid_extent, tile_type);
+                                              const SunMMIOType &tile_type,
+                                              DataType index_dtype) {
+  return tile_->TileAxisMask(result_name, axis, valid_extent, tile_type,
+                             index_dtype);
 }
 
 SunMMIOValue SuvmSunmmioBuilder::TileMaskAnd(const std::string &result_name,
