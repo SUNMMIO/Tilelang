@@ -288,24 +288,6 @@ _RUNNER_OWNED_SECTIONS = (
 )
 
 
-def _inject_odma_pool_reset(llvm_ir: str) -> str:
-    """Reset the ODMA descriptor pool (a per-core bump allocator whose state lives
-    in .bss) at each kernel entry so pool-based submits start fresh across launches.
-    A no-op (DCE'd) for direct-submit kernels that never allocate descriptors."""
-    if "@su_odma_pool_reset" in llvm_ir:
-        return llvm_ir
-    out: list[str] = []
-    declared = False
-    for line in llvm_ir.splitlines(keepends=True):
-        if not declared and line.startswith("define "):
-            out.append("declare void @su_odma_pool_reset()\n")
-            declared = True
-        out.append(line)
-        if line.startswith("define ") and "!sunmmio.kernel_meta" in line and line.rstrip().endswith("{"):
-            out.append("  call void @su_odma_pool_reset()\n")
-    return "".join(out)
-
-
 def _write_sudeck_linker_script(toolchain: SunmmioToolchain, mcpu: str, out_path: Path) -> Path:
     """Derive a runner-compatible linker script by dropping the runner-owned
     DTCM sections from the toolchain's default device.ld."""
@@ -549,9 +531,6 @@ class SunmmioLibraryGenerator(LibraryGenerator):
     def _mlir_to_llvm_ir(self, mlir_path: Path, llvm_path: Path) -> None:
         tools = NpuirTools.resolve()
         self._run_npuir_compile(tools, mlir_path, llvm_path)
-        # FIXME: Remove when NPU-IR supports
-        llvm_ir = _inject_odma_pool_reset(llvm_path.read_text(encoding="utf-8"))
-        llvm_path.write_text(llvm_ir, encoding="utf-8")
 
     def _compile_kernel_obj(
         self,
