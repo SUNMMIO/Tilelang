@@ -555,10 +555,14 @@ private:
     }
 
     if (info.has_dynamic_outer_mode) {
-      ICHECK_EQ(static_extent.value() % info.inner_static_mode_shape, 0)
+      const bool splits_inner_static_mode =
+          info.inner_static_mode_shape % static_extent.value() == 0;
+      const bool covers_whole_inner_static_modes =
+          static_extent.value() % info.inner_static_mode_shape == 0;
+      ICHECK(splits_inner_static_mode || covers_whole_inner_static_modes)
           << op_name << " " << operand_name << " region extent at dim " << dim
           << " for buffer " << region->buffer->name
-          << " must be a multiple of dynamic layout inner static mode shape "
+          << " must be compatible with dynamic layout inner static mode shape "
           << info.inner_static_mode_shape
           << ", but got extent=" << region_extent << ".";
       return;

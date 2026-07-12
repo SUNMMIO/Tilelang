@@ -345,6 +345,15 @@ def _make_copy_kernel(copy_case):
                 T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[0:16, 0:32], A_shared[16:32, 32:64])
 
+    elif copy_case == "dynamic_outer_static_extent_incompatible":
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel():
+                A_shared = T.alloc_shared(shape, DTYPE)
+                T.annotate_layout({A: layout, A_shared: layout})
+                T.copy(A[0:24, 0:32], A_shared[24:48, 32:64])
+
     elif copy_case == "dynamic_row_major_inner_mode_warns_and_passes":
 
         @T.prim_func
@@ -684,6 +693,10 @@ def test_sunmmio_validate_tile_view_regions_accepts_legal_regions(copy_case):
         (
             "zz_extent_not_coalesced_compatible",
             "must be compatible with coalesced extent",
+        ),
+        (
+            "dynamic_outer_static_extent_incompatible",
+            "must be compatible with dynamic layout inner static mode shape",
         ),
     ],
 )
