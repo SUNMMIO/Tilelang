@@ -3,10 +3,10 @@
  * \brief Legalize unsupported Sunmmio data-transfer paths.
  *
  * Rewrites transfers that have no direct datapath by inserting an RSRAM staging
- * step: global -> shared.asram, and casting RSRAM -> shared.asram/wsram (the
- * cast runs on the tile unit in RSRAM, then a same-dtype DMA reaches the
- * operand SRAM).  Works for any data-transfer tileop (copy, broadcast, put,
- * allgather).
+ * step: global-source communication, global -> shared.asram copies, and
+ * casting RSRAM -> shared.asram/wsram (the cast runs on the tile unit in RSRAM,
+ * then a same-dtype DMA reaches the operand SRAM).  Works for data-transfer
+ * tileops including copy, broadcast, put, and allgather.
  */
 
 #include <tvm/ffi/reflection/registry.h>
@@ -71,9 +71,9 @@ public:
    * @brief Legalize unsupported Sunmmio data-transfer paths before lowering.
    *
    * For a data-transfer op (copy, broadcast, put, allgather) whose transfer has
-   * no direct datapath -- global -> shared.asram, or a casting RSRAM ->
-   * shared.asram/wsram -- the pass stages through a compact shared.rsram
-   * buffer:
+   * no direct datapath -- a communication op with a global source, a global ->
+   * shared.asram copy, or a casting RSRAM -> shared.asram/wsram -- the pass
+   * stages through a compact shared.rsram buffer:
    * 1. Allocates the staging buffer (dst dtype on the cast path, else src
    * dtype).
    * 2. Inserts a copy: src -> staging (the cast, when dtypes differ).
@@ -98,6 +98,13 @@ private:
   static bool IsDataTransferOp(const CallNode *call) {
     return call->op.same_as(Copy::Get()) ||
            call->op.same_as(BroadcastOp::Get()) ||
+           call->op.same_as(PutOp::Get()) ||
+           call->op.same_as(AllgatherOp::Get());
+  }
+
+  /** Returns true for inter-core communication tileops. */
+  static bool IsCommunicationOp(const CallNode *call) {
+    return call->op.same_as(BroadcastOp::Get()) ||
            call->op.same_as(PutOp::Get()) ||
            call->op.same_as(AllgatherOp::Get());
   }
@@ -158,9 +165,14 @@ private:
     bool dst_is_operand =
         dst_scope == kSunmmioScopeASRAM || dst_scope == kSunmmioScopeWSRAM;
 
-    // global -> ASRAM has no direct DMA path; stage through RSRAM (same dtype).
+    // Communication engines cannot consume DRAM directly. Stage a global
+    // communication source through RSRAM regardless of the destination SRAM
+    // scope. Keep supported direct copies such as global -> RSRAM/WSRAM
+    // unchanged; global -> ASRAM copies still require staging.
     bool stage_global =
-        src_scope == "global" && dst_scope == kSunmmioScopeASRAM;
+        src_scope == "global" &&
+        (dst_scope == kSunmmioScopeASRAM ||
+         (IsCommunicationOp(call) && IsSunmmioSramScope(dst_scope)));
     // Casting RSRAM -> ASRAM/WSRAM: the cast must run on the tile unit
     // (RSRAM -> RSRAM), so stage through an RSRAM buffer of the dst dtype.
     bool stage_cast = src_scope == kSunmmioScopeRSRAM && dst_is_operand &&

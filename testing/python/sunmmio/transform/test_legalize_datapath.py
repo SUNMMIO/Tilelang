@@ -528,6 +528,24 @@ def allgather_dram_to_asram(block_M, block_K, dtype=T.float16):
     return tvm.IRModule({"main": main})
 
 
+def allgather_dram_to_rsram(block_M, block_K, dtype=T.float16):
+    """Build a horizontal all-gather directly from DRAM to RSRAM.
+
+    Each of four columns contributes [block_M, block_K] along axis 0, so the
+    receive buffer is [4 * block_M, block_K].
+    """
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((block_M, block_K), dtype),
+    ):
+        with T.Kernel():
+            A_gathered = T.alloc_shared((4 * block_M, block_K), dtype, scope="shared.rsram")
+            T.comm.all_gather(A, A_gathered, direction="h", axis=0)
+
+    return tvm.IRModule({"main": main})
+
+
 def annotated_copy_dram_to_asram(block_M, block_K, dtype=T.float16):
     """Build a DRAM->ASRAM copy carrying copy annotations."""
 
@@ -612,6 +630,40 @@ def test_legalize_sunmmio_datapath_on_allgather_from_dram():
     # No allgather should remain with global source
     global_allgathers = [edge for edge in comm_edges if edge["src_scope"] == "global"]
     assert len(global_allgathers) == 0
+
+
+def test_legalize_sunmmio_datapath_on_allgather_from_dram_to_rsram():
+    """All-gather cannot consume DRAM directly even when its destination is RSRAM."""
+    target = determine_target("Sunmmio", return_object=True)
+
+    with tvm.target.Target(target):
+        mod = run_legalize_sunmmio_datapath_no_infer_scope(allgather_dram_to_rsram(32, 32), target)
+
+    func = mod["main"]
+    root_block = next(block for block in extract_blocks(func) if block.name_hint == "tilelang_root")
+    copy_edges = extract_copy_edges(func)
+    comm_edges = extract_comm_edges(func, "tl.tileop.comm_allgather")
+
+    stage_buffers = [buf for buf in root_block.alloc_buffers if buf.name.startswith("A_rsram_stage")]
+    assert len(stage_buffers) == 1
+    assert stage_buffers[0].scope() == "shared.rsram"
+    assert [int(dim) for dim in stage_buffers[0].shape] == [32, 32]
+
+    a_global_to_stage = [edge for edge in copy_edges if edge["src_name"] == "A" and edge["dst_name"].startswith("A_rsram_stage")]
+    assert len(a_global_to_stage) == 1
+    assert a_global_to_stage[0]["src_scope"] == "global"
+    assert a_global_to_stage[0]["dst_scope"] == "shared.rsram"
+    assert a_global_to_stage[0]["src_extents"] == ["32", "32"]
+    assert a_global_to_stage[0]["dst_extents"] == ["32", "32"]
+
+    a_allgather = [edge for edge in comm_edges if edge["dst_name"] == "A_gathered"]
+    assert len(a_allgather) == 1
+    assert a_allgather[0]["src_name"].startswith("A_rsram_stage")
+    assert a_allgather[0]["src_scope"] == "shared.rsram"
+    assert a_allgather[0]["dst_scope"] == "shared.rsram"
+    assert a_allgather[0]["src_extents"] == ["32", "32"]
+    assert a_allgather[0]["dst_extents"] == ["128", "32"]
+    assert not [edge for edge in comm_edges if edge["src_scope"] == "global"]
 
 
 def cast_copy_to_operand(block_M, block_N, dst_scope, src_dtype=T.float32, dst_dtype=T.float16):
