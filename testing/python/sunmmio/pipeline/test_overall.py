@@ -67,7 +67,7 @@ def kernel_overall(M, N, K, block_M, block_N, block_K, dtype="bfloat16", accum_d
 
 
 def test_overall(is_log=False):
-    func = kernel_overall(128, 128, 128, 64, 64, 32)
+    func = kernel_overall(256, 256, 128, 64, 64, 32)
     script_device_mode = """
         with T.launch_thread("blockIdx.x", 16) as bx:
             T.barrier_init(T.int64(15))

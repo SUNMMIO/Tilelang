@@ -131,6 +131,23 @@ def broadcast_kernel(M, N, block_M, block_N, dtype="float16"):
     return main
 
 
+def loop_copy_without_body_wait_kernel(loop_iters, block_N, dtype="float16"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((loop_iters, block_N), dtype),
+        B: T.Tensor((loop_iters, block_N), dtype),
+    ):
+        with T.Kernel(1, threads=128) as _:
+            A_shared = T.alloc_shared((loop_iters, block_N), dtype)
+
+            for i in range(loop_iters):
+                T.copy(A[i : i + 1, 0:block_N], A_shared[i : i + 1, 0:block_N])
+
+            T.copy(A_shared, B)
+
+    return main
+
+
 def _pointer_var(name, dtype="float16", scope="shared.rsram"):
     return tir.Var(name, tvm.ir.PointerType(tvm.ir.PrimType(dtype), scope))
 
@@ -144,6 +161,23 @@ def _region(buf, access):
         tir.IntImm("int32", 32),
         tir.IntImm("int32", 32),
     )
+
+
+def _region_at(buf, access, row, col, extent_row=32, extent_col=32):
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.tileop.region"),
+        tir.BufferLoad(buf, [row, col]),
+        tir.IntImm("int32", access),
+        tir.IntImm("int32", extent_row),
+        tir.IntImm("int32", extent_col),
+    )
+
+
+def _extract_call_id(line, marker):
+    match = re.search(rf"{re.escape(marker)}\((\d+)\)", line)
+    assert match, f"Cannot parse {marker} in line: {line}"
+    return int(match.group(1))
 
 
 def _make_leaf_broadcast_without_src_core_mod(target):
@@ -494,6 +528,275 @@ def _make_while_async_to_sync_store_mod(target):
     return tir.transform.BindTarget(target)(mod)
 
 
+def _make_dma_to_loop_let_consumer_mod(target):
+    src_data = _pointer_var("src", scope="global")
+    stage_data = _pointer_var("stage")
+    src_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="src_buf",
+        data=src_data,
+        scope="global",
+    )
+    stage_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="stage_buf",
+        data=stage_data,
+        scope="shared.rsram",
+    )
+    copy = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dma_copy"),
+            _region(src_buf, 1),
+            _region(stage_buf, 2),
+            tir.IntImm("int32", 0),
+        )
+    )
+    i = tir.Var("i", "int32")
+    value = tir.Var("value", "float16")
+    consume = tir.LetStmt(
+        value,
+        tir.BufferLoad(stage_buf, [i, tir.IntImm("int32", 0)]),
+        tir.Evaluate(tir.Cast("float32", value)),
+    )
+    loop = tir.For(
+        i,
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 32),
+        tir.ForKind.SERIAL,
+        consume,
+    )
+    body = tir.DeclBuffer(
+        src_buf,
+        tir.DeclBuffer(stage_buf, tir.SeqStmt([copy, loop])),
+    )
+    func = tir.PrimFunc([src_data, stage_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
+def _make_dma_to_loop_if_consumer_mod(target):
+    src_data = _pointer_var("src", scope="global")
+    stage_data = _pointer_var("stage")
+    src_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="src_buf",
+        data=src_data,
+        scope="global",
+    )
+    stage_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="stage_buf",
+        data=stage_data,
+        scope="shared.rsram",
+    )
+    copy = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dma_copy"),
+            _region(src_buf, 1),
+            _region(stage_buf, 2),
+            tir.IntImm("int32", 0),
+        )
+    )
+    i = tir.Var("i", "int32")
+    load = tir.Cast(
+        "float32",
+        tir.BufferLoad(stage_buf, [i, tir.IntImm("int32", 0)]),
+    )
+    consume = tir.IfThenElse(
+        load > tir.FloatImm("float32", 0.0),
+        tir.Evaluate(0),
+        None,
+    )
+    loop = tir.For(
+        i,
+        tir.IntImm("int32", 0),
+        tir.IntImm("int32", 32),
+        tir.ForKind.SERIAL,
+        consume,
+    )
+    body = tir.DeclBuffer(
+        src_buf,
+        tir.DeclBuffer(stage_buf, tir.SeqStmt([copy, loop])),
+    )
+    func = tir.PrimFunc([src_data, stage_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
+def _make_dma_to_hidden_load_index_consumer_mod(target):
+    idx_src_data = _pointer_var("idx_src", dtype="int32", scope="global")
+    idx_data = _pointer_var("idx", dtype="int32")
+    data_data = _pointer_var("data")
+    idx_src_buf = tir.decl_buffer(
+        (32, 32),
+        "int32",
+        name="idx_src_buf",
+        data=idx_src_data,
+        scope="global",
+    )
+    idx_buf = tir.decl_buffer(
+        (32, 32),
+        "int32",
+        name="idx_buf",
+        data=idx_data,
+        scope="shared.rsram",
+    )
+    data_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="data_buf",
+        data=data_data,
+        scope="shared.rsram",
+    )
+    copy_idx = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dma_copy"),
+            _region(idx_src_buf, 1),
+            _region(idx_buf, 2),
+            tir.IntImm("int32", 0),
+        )
+    )
+    idx = tir.BufferLoad(idx_buf, [tir.IntImm("int32", 0), tir.IntImm("int32", 0)])
+    consume = tir.Evaluate(tir.BufferLoad(data_buf, [idx, tir.IntImm("int32", 0)]))
+    body = tir.DeclBuffer(
+        idx_src_buf,
+        tir.DeclBuffer(idx_buf, tir.DeclBuffer(data_buf, tir.SeqStmt([copy_idx, consume]))),
+    )
+    func = tir.PrimFunc([idx_src_data, idx_data, data_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
+def _make_dma_to_hidden_store_index_consumer_mod(target):
+    idx_src_data = _pointer_var("idx_src", dtype="int32", scope="global")
+    idx_data = _pointer_var("idx", dtype="int32")
+    data_data = _pointer_var("data")
+    idx_src_buf = tir.decl_buffer(
+        (32, 32),
+        "int32",
+        name="idx_src_buf",
+        data=idx_src_data,
+        scope="global",
+    )
+    idx_buf = tir.decl_buffer(
+        (32, 32),
+        "int32",
+        name="idx_buf",
+        data=idx_data,
+        scope="shared.rsram",
+    )
+    data_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="data_buf",
+        data=data_data,
+        scope="shared.rsram",
+    )
+    copy_idx = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dma_copy"),
+            _region(idx_src_buf, 1),
+            _region(idx_buf, 2),
+            tir.IntImm("int32", 0),
+        )
+    )
+    idx = tir.BufferLoad(idx_buf, [tir.IntImm("int32", 0), tir.IntImm("int32", 0)])
+    consume = tir.BufferStore(
+        data_buf,
+        tir.Cast("float16", tir.IntImm("int32", 0)),
+        [idx, tir.IntImm("int32", 0)],
+    )
+    body = tir.DeclBuffer(
+        idx_src_buf,
+        tir.DeclBuffer(idx_buf, tir.DeclBuffer(data_buf, tir.SeqStmt([copy_idx, consume]))),
+    )
+    func = tir.PrimFunc([idx_src_data, idx_data, data_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
+def _make_dma_to_hidden_async_region_index_consumer_mod(target):
+    idx_src_data = _pointer_var("idx_src", dtype="int32", scope="global")
+    idx_data = _pointer_var("idx", dtype="int32")
+    data_data = _pointer_var("data")
+    out_data = _pointer_var("out", scope="global")
+    idx_src_buf = tir.decl_buffer(
+        (32, 32),
+        "int32",
+        name="idx_src_buf",
+        data=idx_src_data,
+        scope="global",
+    )
+    idx_buf = tir.decl_buffer(
+        (32, 32),
+        "int32",
+        name="idx_buf",
+        data=idx_data,
+        scope="shared.rsram",
+    )
+    data_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="data_buf",
+        data=data_data,
+        scope="shared.rsram",
+    )
+    out_buf = tir.decl_buffer(
+        (32, 32),
+        "float16",
+        name="out_buf",
+        data=out_data,
+        scope="global",
+    )
+    copy_idx = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dma_copy"),
+            _region(idx_src_buf, 1),
+            _region(idx_buf, 2),
+            tir.IntImm("int32", 0),
+        )
+    )
+    idx = tir.BufferLoad(idx_buf, [tir.IntImm("int32", 0), tir.IntImm("int32", 0)])
+    copy_data = tir.Evaluate(
+        tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dma_copy"),
+            _region_at(data_buf, 1, idx, tir.IntImm("int32", 0), 1, 32),
+            _region_at(out_buf, 2, tir.IntImm("int32", 0), tir.IntImm("int32", 0), 1, 32),
+            tir.IntImm("int32", 0),
+        )
+    )
+    body = tir.DeclBuffer(
+        idx_src_buf,
+        tir.DeclBuffer(
+            idx_buf,
+            tir.DeclBuffer(data_buf, tir.DeclBuffer(out_buf, tir.SeqStmt([copy_idx, copy_data]))),
+        ),
+    )
+    func = tir.PrimFunc([idx_src_data, idx_data, data_data, out_data], body)
+    func = func.with_attr("global_symbol", "main")
+    func = func.with_attr("tir.is_global_func", True)
+    mod = tvm.IRModule({"main": func})
+    return tir.transform.BindTarget(target)(mod)
+
+
 def _make_mixed_level_nested_broadcast_mod(target):
     outer_src_data = _pointer_var("outer_src")
     outer_dst_data = _pointer_var("outer_dst")
@@ -769,7 +1072,7 @@ def test_inject_sunmmio_sync_broadcast():
 
     assert len(dma_lines) == 2
     assert len(bcast_lines) == 1
-    assert len(barrier_lines) >= 2
+    assert len(barrier_lines) == 1
     assert len(wait_lines) >= 3
 
     # Check instruction order:
@@ -779,9 +1082,8 @@ def test_inject_sunmmio_sync_broadcast():
     # 4. barrier_arrive_and_wait(participant_mask)
     # 5. broadcast_ -> token 1
     # 6. wait_token(1)
-    # 7. barrier_arrive_and_wait(participant_mask)
-    # 8. dma_copy (store B) -> token 2
-    # 9. wait_token(2)
+    # 7. dma_copy (store B) -> token 2
+    # 8. wait_token(2)
 
     idx_dma0 = script.find("sync_token_id(0)")
     idx_wait0 = script.find("wait_token(0)")
@@ -791,7 +1093,6 @@ def test_inject_sunmmio_sync_broadcast():
     idx_wait1 = script.find("wait_token(1)")
     idx_pre_barrier_wait = script.find("barrier_arrive_and_wait", idx_wait0)
     idx_dma1 = script.find("sync_token_id(2)")
-    idx_post_barrier_wait = script.find("barrier_arrive_and_wait", idx_wait1)
     idx_wait2 = script.find("wait_token(2)")
 
     # Verify order
@@ -800,8 +1101,7 @@ def test_inject_sunmmio_sync_broadcast():
     assert idx_wait0 < idx_pre_barrier_wait < idx_bcast
     assert idx_bcast < idx_token1  # token 1 is inside broadcast
     assert idx_barrier_init < idx_wait1
-    assert idx_wait1 < idx_post_barrier_wait
-    assert idx_post_barrier_wait < idx_dma1
+    assert idx_wait1 < idx_dma1
     assert idx_dma1 < idx_wait2
 
     # Regression (PR #164): broadcast_ carries a receiving mask at arg slot 3,
@@ -839,7 +1139,7 @@ def test_inject_sunmmio_sync_broadcast_without_src_core_full_mesh_barrier():
     assert _parse_numeric_barrier_mask(barrier_init_lines[0]) == (1 << 16) - 1
 
     barrier_wait_lines = [l for l in lines if "barrier_arrive_and_wait" in l]
-    assert len(barrier_wait_lines) == 2
+    assert len(barrier_wait_lines) == 1
     assert all(_parse_numeric_barrier_mask(line, "barrier_arrive_and_wait") == (1 << 16) - 1 for line in barrier_wait_lines)
 
 
@@ -879,6 +1179,28 @@ def test_inject_sunmmio_sync_dynamic_pair_mask_candidates():
     assert barrier_wait_lines
     for line in barrier_wait_lines:
         assert _parse_barrier_args(line, "barrier_arrive_and_wait")[-len(pair_candidates) :] == pair_candidates
+
+
+def test_inject_sunmmio_sync_loop_missing_wait_before_token_reuse():
+    target = get_target("Sunmmio")
+    func = loop_copy_without_body_wait_kernel(loop_iters=4, block_N=32)
+
+    mod = tvm.IRModule({func.attrs["global_symbol"]: func})
+    mod = LowerAndLegalize_sunmmio(mod, target)
+    mod = OptimizeForSunmmio_patial(mod, target)
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    script = mod.script(show_meta=True)
+    lines = [line.strip() for line in script.splitlines()]
+
+    null_token_entries = [(idx, _extract_call_id(line, "sync_null_token")) for idx, line in enumerate(lines) if "sync_null_token(" in line]
+    assert null_token_entries
+
+    for_idx = next(idx for idx, line in enumerate(lines) if "for i in range(4):" in line)
+    null_idx, token = next((idx, token) for idx, token in null_token_entries if idx < for_idx)
+    transform_idx = next(idx for idx, line in enumerate(lines) if "sunmmio_layout_transform" in line and f"sync_token_id({token})" in line)
+    wait_idx = next(idx for idx, line in enumerate(lines) if for_idx < idx < transform_idx and f"wait_token({token})" in line)
+
+    assert null_idx < for_idx < wait_idx < transform_idx
 
 
 def test_inject_sunmmio_sync_nested_loop_reuses_tokens_without_mixing_levels():
@@ -1023,18 +1345,16 @@ def test_inject_sunmmio_sync_if():
     pre_broadcast_barrier_indices = [idx for idx, _ in barrier_wait_entries if if_idx < idx < broadcast_idx]
     assert pre_broadcast_barrier_indices
 
-    # The broadcast token must be waited on before the outer barrier wait.
+    # The broadcast token must be waited on after the broadcast. The legacy
+    # paired barrier wait after wait_token is disabled by default.
     broadcast_wait_indices = [idx for idx, _, token in wait_entries if token == broadcast_token and idx > barrier_init_idx]
     assert broadcast_wait_indices
-    post_broadcast_barrier_indices = [idx for idx, _ in barrier_wait_entries if idx > min(broadcast_wait_indices)]
-    assert post_broadcast_barrier_indices
-    barrier_wait_idx = min(post_broadcast_barrier_indices)
-    assert barrier_init_idx < min(broadcast_wait_indices) < barrier_wait_idx
+    assert not any(idx > min(broadcast_wait_indices) for idx, _ in barrier_wait_entries)
 
     # The MMA token should also be waited on after the branch before C_shared is consumed.
-    post_branch_mma_wait_indices = [idx for idx, _, token in wait_entries if token == mma_token and idx > barrier_wait_idx]
+    post_branch_mma_wait_indices = [idx for idx, _, token in wait_entries if token == mma_token and idx > broadcast_idx]
     assert post_branch_mma_wait_indices
-    assert barrier_wait_idx < min(post_branch_mma_wait_indices) < final_store_idx
+    assert min(post_branch_mma_wait_indices) < final_store_idx
 
 
 def test_inject_sunmmio_sync_loop():
@@ -1110,7 +1430,7 @@ def test_inject_sunmmio_sync_loop():
     barrier_wait_between = [idx for idx, _, _ in barrier_wait_entries if min(wait_token_1_between) < idx < second_bcast_idx]
     barrier_wait_after_second = [idx for idx, _, _ in barrier_wait_entries if idx > second_bcast_idx]
     assert barrier_wait_before_first
-    assert barrier_wait_between
+    assert not barrier_wait_between
     assert barrier_wait_after_second
 
 
@@ -1171,7 +1491,7 @@ def test_inject_sunmmio_sync_while_loop_carried_tokens():
     barrier_wait_before_first = [idx for idx, _, _ in barrier_wait_entries if min(carried_wait_before_first) < idx < first_bcast_idx]
     barrier_wait_between = [idx for idx, _, _ in barrier_wait_entries if min(wait_first_between) < idx < second_bcast_idx]
     assert barrier_wait_before_first
-    assert barrier_wait_between
+    assert not barrier_wait_between
 
 
 def test_inject_sunmmio_sync_while_loop_carried_async_to_sync_store():
@@ -1209,6 +1529,87 @@ def test_inject_sunmmio_sync_while_loop_carried_async_to_sync_store():
     assert min(carried_wait_before_store) < store_idx < broadcast_idx
 
 
+def test_inject_sunmmio_sync_hoists_wait_before_loop_let_consumer():
+    target = get_target("Sunmmio")
+    mod = _make_dma_to_loop_let_consumer_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    script = mod.script(show_meta=True)
+    lines = [line.strip() for line in script.splitlines()]
+
+    copy_idx = next(idx for idx, line in enumerate(lines) if "T.dma_copy" in line)
+    wait_idx = next(idx for idx, line in enumerate(lines) if "T.wait_token(0)" in line)
+    loop_idx = next(idx for idx, line in enumerate(lines) if "for i in range(32):" in line)
+
+    assert copy_idx < wait_idx < loop_idx
+    assert not any("T.wait_token(0)" in line for line in lines[loop_idx + 1 :])
+
+
+def test_inject_sunmmio_sync_hoists_wait_before_loop_if_condition_consumer():
+    target = get_target("Sunmmio")
+    mod = _make_dma_to_loop_if_consumer_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    script = mod.script(show_meta=True)
+    lines = [line.strip() for line in script.splitlines()]
+
+    copy_idx = next(idx for idx, line in enumerate(lines) if "T.dma_copy" in line)
+    wait_idx = next(idx for idx, line in enumerate(lines) if "T.wait_token(0)" in line)
+    loop_idx = next(idx for idx, line in enumerate(lines) if "for i in range(32):" in line)
+
+    assert copy_idx < wait_idx < loop_idx
+    assert not any("T.wait_token(0)" in line for line in lines[loop_idx + 1 :])
+
+
+def test_inject_sunmmio_sync_waits_for_hidden_buffer_load_index_read():
+    target = get_target("Sunmmio")
+    mod = _make_dma_to_hidden_load_index_consumer_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    lines = [line.strip() for line in mod.script(show_meta=True).splitlines()]
+
+    copy_idx = next(idx for idx, line in enumerate(lines) if "T.dma_copy" in line)
+    wait_idx = next(idx for idx, line in enumerate(lines) if "T.wait_token(0)" in line)
+    consume_idx = next(idx for idx, line in enumerate(lines) if "data_buf[idx_buf[0, 0], 0]" in line)
+
+    assert copy_idx < wait_idx < consume_idx
+
+
+def test_inject_sunmmio_sync_waits_for_hidden_buffer_store_index_read():
+    target = get_target("Sunmmio")
+    mod = _make_dma_to_hidden_store_index_consumer_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    lines = [line.strip() for line in mod.script(show_meta=True).splitlines()]
+
+    copy_idx = next(idx for idx, line in enumerate(lines) if "T.dma_copy" in line)
+    wait_idx = next(idx for idx, line in enumerate(lines) if "T.wait_token(0)" in line)
+    store_idx = next(idx for idx, line in enumerate(lines) if "data_buf[idx_buf[0, 0], 0] =" in line)
+
+    assert copy_idx < wait_idx < store_idx
+
+
+def test_inject_sunmmio_sync_waits_for_hidden_async_region_index_read():
+    target = get_target("Sunmmio")
+    mod = _make_dma_to_hidden_async_region_index_consumer_mod(target)
+
+    mod = tilelang.transform.InjectSunmmioSync()(mod)
+    lines = [line.strip() for line in mod.script(show_meta=True).splitlines()]
+
+    dma_entries = [
+        (idx, _extract_call_id(line, "sync_token_id"))
+        for idx, line in enumerate(lines)
+        if "T.dma_copy" in line and "T.sync_token_id(" in line
+    ]
+    assert len(dma_entries) == 2
+    first_dma_idx, first_token = dma_entries[0]
+    second_dma_idx, _ = dma_entries[1]
+    assert first_token == 0
+
+    wait_idx = next(idx for idx, line in enumerate(lines) if "T.wait_token(0)" in line)
+    assert first_dma_idx < wait_idx < second_dma_idx
+
+
 if __name__ == "__main__":
     test_inject_sunmmio_sync_dma()
     test_inject_sunmmio_sync_mma()
@@ -1216,8 +1617,14 @@ if __name__ == "__main__":
     test_inject_sunmmio_sync_broadcast_without_src_core_full_mesh_barrier()
     test_inject_sunmmio_sync_dynamic_broadcast_mask_candidates()
     test_inject_sunmmio_sync_dynamic_pair_mask_candidates()
+    test_inject_sunmmio_sync_loop_missing_wait_before_token_reuse()
     test_inject_sunmmio_sync_nested_loop_reuses_tokens_without_mixing_levels()
     test_inject_sunmmio_sync_if()
+    test_inject_sunmmio_sync_hoists_wait_before_loop_let_consumer()
+    test_inject_sunmmio_sync_hoists_wait_before_loop_if_condition_consumer()
+    test_inject_sunmmio_sync_waits_for_hidden_buffer_load_index_read()
+    test_inject_sunmmio_sync_waits_for_hidden_buffer_store_index_read()
+    test_inject_sunmmio_sync_waits_for_hidden_async_region_index_read()
     test_inject_sunmmio_sync_loop()
     test_inject_sunmmio_sync_while_loop_carried_tokens()
     test_inject_sunmmio_sync_while_loop_carried_async_to_sync_store()

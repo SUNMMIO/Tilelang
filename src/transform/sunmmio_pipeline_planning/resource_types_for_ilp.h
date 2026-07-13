@@ -71,9 +71,14 @@ std::vector<int> BuildIlpResources(const Stmt &stmt, DeviceType type,
           call->op.same_as(Op::Get("tl.broadcast_")) ||
           call->op.same_as(Op::Get("tl.sunmmio_layout_transform"))) {
         BufferRegion src_region = NormalizeToBufferRegion(call->args[0]);
-        BufferRegion dst_region = call->op.same_as(Op::Get("tl.broadcast_"))
-                                      ? NormalizeToBufferRegion(call->args[2])
-                                      : NormalizeToBufferRegion(call->args[1]);
+        // broadcast_ argument layout is:
+        //   args[0] = src region
+        //   args[1] = dst region
+        //   args[2] = direction
+        // Resource typing only needs the source/destination buffers, so always
+        // read the destination from args[1]. Using args[2] treats the integer
+        // direction enum as a BufferRegion and crashes ILP planning.
+        BufferRegion dst_region = NormalizeToBufferRegion(call->args[1]);
         if (IsGlobalBuffer(src_region->buffer)) {
           if (dst_region->buffer.scope() == "shared.asram") {
             LOG(FATAL)

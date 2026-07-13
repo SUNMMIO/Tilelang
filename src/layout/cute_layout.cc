@@ -905,13 +905,19 @@ int64_t MXPackSize(DataType dtype) {
   if (IsMXFP8DType(dtype))
     return 2;
   if (IsMXFP4DType(dtype))
-    return 4;
+    return 2;
   LOG(FATAL) << "Expected SUVM MX dtype, got " << dtype;
   return 0;
 }
 
 PrimExpr AlignBytes(PrimExpr bytes, int64_t align) {
   return ceildiv(bytes, makeInt(align)) * makeInt(align);
+}
+
+PrimExpr AlignMXOperandBlocks(PrimExpr blocks) {
+  constexpr int64_t kMXOperandBlockAlign = 2;
+  return ceildiv(blocks, makeInt(kMXOperandBlockAlign)) *
+         makeInt(kMXOperandBlockAlign);
 }
 
 Layout MakeRowMajor(Array<PrimExpr> shape) {
@@ -1270,7 +1276,8 @@ Layout MakeMXZZ(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype) {
   constexpr int64_t kBlockW = 32;
   int64_t block_storage_elems = MXBlockStorageElems(dtype);
   PrimExpr block_m = ceildiv(shape[ax0], makeInt(kBlockH));
-  PrimExpr block_n = ceildiv(shape[ax1], makeInt(kBlockW));
+  PrimExpr block_n =
+      AlignMXOperandBlocks(ceildiv(shape[ax1], makeInt(kBlockW)));
   PrimExpr matrix_storage_elems =
       makeInt(block_storage_elems) * block_m * block_n;
 
@@ -1389,7 +1396,6 @@ Layout MakeMXRowMajor(Array<PrimExpr> shape, DataType dtype) {
     mode_shape.push_back(shape[d]);
     dim_levels.push_back(Integer(1));
   }
-  mode_shape.Set(rank - 1, row_elems);
 
   std::vector<PrimExpr> strides(rank);
   strides[rank - 1] = makeInt(1);
@@ -1462,6 +1468,20 @@ Optional<Layout> DeriveMXLayoutLike(const Layout &src,
 
 } // namespace sunmmio
 
+Optional<Layout> DeriveLayoutLikeForDType(const Layout &src,
+                                          Array<PrimExpr> dst_shape,
+                                          DataType dtype,
+                                          Optional<Array<Integer>> axis_map,
+                                          arith::Analyzer *analyzer) {
+  if (sunmmio::IsMXDType(dtype)) {
+    ICHECK(!axis_map.defined() || axis_map.value().empty())
+        << "DeriveLayoutLikeForDType does not support axis_map for SUVM MX "
+           "layouts yet.";
+    return sunmmio::DeriveMXLayoutLike(src, dst_shape, dtype, analyzer);
+  }
+  return DeriveLayoutLike(src, dst_shape, axis_map, analyzer);
+}
+
 // ---------------------------------------------------------------------------
 // FFI registration
 // ---------------------------------------------------------------------------
@@ -1499,6 +1519,11 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            [](Layout src, Array<PrimExpr> dst_shape,
               Optional<Array<Integer>> axis_map) {
              return DeriveLayoutLike(src, dst_shape, axis_map);
+           })
+      .def("tl.DeriveLayoutLikeForDType",
+           [](Layout src, Array<PrimExpr> dst_shape, DataType dtype,
+              Optional<Array<Integer>> axis_map) {
+             return DeriveLayoutLikeForDType(src, dst_shape, dtype, axis_map);
            })
       .def("tl.IsLayoutMatch",
            [](Layout lhs, Layout rhs) { return IsLayoutMatch(lhs, rhs); })

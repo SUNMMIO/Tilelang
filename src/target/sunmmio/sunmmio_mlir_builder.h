@@ -152,6 +152,11 @@ public:
                            const SunMMIOType &tile_type, int64_t axis,
                            DataType dtype) final;
 
+  SunMMIOValue TilePick(const std::string &result_name,
+                        const SunMMIOValue &tile,
+                        const std::vector<SunMMIOValue> &indices,
+                        const SunMMIOType &result_type, DataType dtype) final;
+
   void Store(const SunMMIOValue &value, const std::string &buffer_handle,
              const std::vector<SunMMIOValue> &indices,
              const SunMMIOType &memref_type) final;

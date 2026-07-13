@@ -1,5 +1,6 @@
 import pytest
 from tilelang import tvm as tvm
+from tilelang.language.mesh_symbols import _MESH_NCOLS_ATTR, _MESH_NROWS_ATTR
 from tilelang.utils.target import determine_target
 import tilelang.language as T
 
@@ -26,16 +27,21 @@ def make_mesh_ncores_kernel(threads=None):
     return tvm.IRModule({"main": kernel})
 
 
-def collect_calls(func, op_name):
-    calls = []
-    op = tvm.tir.op.Op.get(op_name)
+def collect_mesh_var_hits(func):
+    mesh_vars = {
+        "mesh_nrows": func.attrs[_MESH_NROWS_ATTR],
+        "mesh_ncols": func.attrs[_MESH_NCOLS_ATTR],
+    }
+    hits = []
 
     def visit(node):
-        if isinstance(node, tvm.tir.Call) and hasattr(node.op, "same_as") and node.op.same_as(op):
-            calls.append(node)
+        if isinstance(node, tvm.tir.Var):
+            for name, var in mesh_vars.items():
+                if node.same_as(var):
+                    hits.append(name)
 
     tvm.tir.stmt_functor.post_order_visit(func.body, visit)
-    return calls
+    return hits
 
 
 @pytest.mark.parametrize("requested_threads", [1, 32, 128, 256])
@@ -90,7 +96,10 @@ def test_sunmmio_kernel_without_blocks_defaults_to_mesh_ncores():
 
     script = mod.script()
     assert "threadIdx" not in script, f"Sunmmio kernel must have no threadIdx bindings (threadless). Got:\n{script}"
-    assert collect_calls(mod["main"], "tl.mesh_ncores"), f"T.Kernel() should default to symbolic Sunmmio mesh cores. Got:\n{script}"
+    assert set(collect_mesh_var_hits(mod["main"])) == {
+        "mesh_nrows",
+        "mesh_ncols",
+    }, f"T.Kernel() should default to symbolic Sunmmio mesh cores. Got:\n{script}"
 
 
 def test_non_sunmmio_kernel_respects_threads():
