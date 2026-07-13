@@ -265,6 +265,8 @@ private:
         op->annotations.Get("runtime_multiversion_buffers");
     auto versioned_buffers_anno = op->annotations.Get("versioned_buffers");
     auto banked_buffers_anno = op->annotations.Get("runtime_banked_buffers");
+    auto resident_banked_buffers_anno =
+        op->annotations.Get("runtime_resident_banked_buffers");
     auto used_buffers_anno = op->annotations.Get("used_buffers");
     auto iterations_anno = op->annotations.Get("iterations");
     auto bank_start_phases_anno =
@@ -334,6 +336,18 @@ private:
           }
           loop.CopyOnWrite()->annotations.Set("runtime_banked_buffers",
                                               new_banked_buffers);
+        }
+        if (resident_banked_buffers_anno) {
+          Array<Buffer> resident_buffers = Downcast<Array<Buffer>>(
+              resident_banked_buffers_anno.value());
+          Array<Buffer> new_resident_buffers;
+          for (const Buffer &buffer : resident_buffers) {
+            auto it = buffer_remap_.find(buffer);
+            new_resident_buffers.push_back(
+                it == buffer_remap_.end() ? buffer : (*it).second);
+          }
+          loop.CopyOnWrite()->annotations.Set(
+              "runtime_resident_banked_buffers", new_resident_buffers);
         }
         if (bank_start_phases_anno) {
           Map<Buffer, PrimExpr> bank_start_phases =
@@ -678,6 +692,8 @@ public:
     clear_logical_iter_parity_override();
     clear_pipeline_loop_parity_override();
   }
+
+  void clear_current_stmt_id() { current_stmt_id_ = -1; }
 
 private:
   int VersionAxis(const Buffer& buffer) const {
@@ -1133,8 +1149,9 @@ private:
         bank_writer_phases, bank_reader_phases, for_node, iterations);
     arith::Analyzer analyzer;
     auto rewrite_stmt_with_logical_iter_parity =
-        [&](const Stmt& stmt, const PrimExpr& replaced_loop_var,
+        [&](const Stmt& stmt, int stmt_id, const PrimExpr& replaced_loop_var,
             int parity) -> Stmt {
+      rewriter.set_current_stmt_id(stmt_id);
       rewriter.set_loop_var_replacement(replaced_loop_var);
       rewriter.clear_pipeline_loop_parity_override();
       if (parity >= 0) {
@@ -1143,12 +1160,14 @@ private:
         rewriter.clear_logical_iter_parity_override();
       }
       Stmt rewritten = rewriter(stmt);
+      rewriter.clear_current_stmt_id();
       rewriter.clear_parity_overrides();
       return rewritten;
     };
     auto rewrite_stmt_with_pipeline_loop_parity =
-        [&](const Stmt& stmt, const PrimExpr& replaced_loop_var,
+        [&](const Stmt& stmt, int stmt_id, const PrimExpr& replaced_loop_var,
             int parity) -> Stmt {
+      rewriter.set_current_stmt_id(stmt_id);
       rewriter.set_loop_var_replacement(replaced_loop_var);
       rewriter.clear_logical_iter_parity_override();
       if (parity >= 0) {
@@ -1157,25 +1176,30 @@ private:
         rewriter.clear_pipeline_loop_parity_override();
       }
       Stmt rewritten = rewriter(stmt);
+      rewriter.clear_current_stmt_id();
       rewriter.clear_parity_overrides();
       return rewritten;
     };
-    auto rewrite_stmt = [&](const Stmt& stmt,
+    auto rewrite_stmt = [&](const Stmt& stmt, int stmt_id,
                             const PrimExpr& replaced_loop_var) -> Stmt {
       if (banked_buffers.size() == 0) {
-        return rewrite_stmt_with_logical_iter_parity(stmt, replaced_loop_var, -1);
+        return rewrite_stmt_with_logical_iter_parity(stmt, stmt_id,
+                                                     replaced_loop_var, -1);
       }
 
       PrimExpr logical_iter =
           analyzer.Simplify(replaced_loop_var - for_node->min);
       if (logical_iter.as<IntImmNode>()) {
-        return rewrite_stmt_with_logical_iter_parity(stmt, replaced_loop_var, -1);
+        return rewrite_stmt_with_logical_iter_parity(stmt, stmt_id,
+                                                     replaced_loop_var, -1);
       }
 
       Stmt even_stmt =
-          rewrite_stmt_with_logical_iter_parity(stmt, replaced_loop_var, 0);
+          rewrite_stmt_with_logical_iter_parity(stmt, stmt_id,
+                                                replaced_loop_var, 0);
       Stmt odd_stmt =
-          rewrite_stmt_with_logical_iter_parity(stmt, replaced_loop_var, 1);
+          rewrite_stmt_with_logical_iter_parity(stmt, stmt_id,
+                                                replaced_loop_var, 1);
 
       PrimExpr is_even =
           EQ(floormod(replaced_loop_var - for_node->min, Integer(2)),
@@ -1189,7 +1213,7 @@ private:
       int id = name2id(order_str);
       Stmt stmt = pipeline_body_seq->seq[id];
       PrimExpr replaced_loop_var = 0 + iter + for_node->min;
-      stmt = rewrite_stmt(stmt, replaced_loop_var);
+      stmt = rewrite_stmt(stmt, id, replaced_loop_var);
       for_body.push_back(stmt);
     }
 
@@ -1227,9 +1251,11 @@ private:
           int id = name2id(order_str);
           Stmt stmt = pipeline_body_seq->seq[id];
           even_body.push_back(
-              rewrite_stmt_with_pipeline_loop_parity(stmt, replaced_loop_var, 0));
+              rewrite_stmt_with_pipeline_loop_parity(stmt, id,
+                                                     replaced_loop_var, 0));
           odd_body.push_back(
-              rewrite_stmt_with_pipeline_loop_parity(stmt, replaced_loop_var, 1));
+              rewrite_stmt_with_pipeline_loop_parity(stmt, id,
+                                                     replaced_loop_var, 1));
         }
         PrimExpr steady_state_is_even = EQ(floormod(for_node->loop_var, Integer(2)),
                                            Integer(0));
@@ -1243,7 +1269,7 @@ private:
               for_node->loop_var + iter_offset + for_node->min;
           int id = name2id(order_str);
           Stmt stmt = pipeline_body_seq->seq[id];
-          rewritten_body.push_back(rewrite_stmt(stmt, replaced_loop_var));
+          rewritten_body.push_back(rewrite_stmt(stmt, id, replaced_loop_var));
         }
         body = rewritten_body;
       }
@@ -1255,7 +1281,7 @@ private:
             for_node->loop_var + iter_offset + for_node->min;
         int id = name2id(order_str);
         Stmt stmt = pipeline_body_seq->seq[id];
-        rewritten_body.push_back(rewrite_stmt(stmt, replaced_loop_var));
+        rewritten_body.push_back(rewrite_stmt(stmt, id, replaced_loop_var));
       }
       body = rewritten_body;
     }
@@ -1276,7 +1302,7 @@ private:
       int id = name2id(order_str);
       Stmt stmt = pipeline_body_seq->seq[id];
       PrimExpr replaced_loop_var = epilogue_base + iter_offset;
-      stmt = rewrite_stmt(stmt, replaced_loop_var);
+      stmt = rewrite_stmt(stmt, id, replaced_loop_var);
       for_body.push_back(stmt);
     }
     return SeqStmt::Flatten(for_body);
@@ -1287,11 +1313,83 @@ private:
   ASTTraverser traverser_;
 };
 
+class ResidentPingPongInitializer : public StmtMutator {
+ public:
+  static Stmt Substitute(const Stmt& body) {
+    ResidentPingPongInitializer rewriter;
+    PostOrderVisit(body, [&](const ObjectRef& node) {
+      const auto* loop = node.as<ForNode>();
+      if (loop == nullptr) return;
+      auto residents = loop->annotations.Get("runtime_resident_banked_buffers");
+      auto peers = loop->annotations.Get("runtime_bank_peer_buffers");
+      if (!residents || !peers) return;
+      Map<Buffer, Buffer> peer_map =
+          Downcast<Map<Buffer, Buffer>>(peers.value());
+      for (const Buffer& buffer :
+           Downcast<Array<Buffer>>(residents.value())) {
+        auto it = peer_map.find(buffer);
+        if (it == peer_map.end()) continue;
+        rewriter.resident_buffers_.insert(buffer.get());
+        rewriter.peer_remap_.Set(buffer, (*it).second);
+      }
+    });
+    if (rewriter.peer_remap_.empty()) return body;
+    return rewriter(body);
+  }
+
+ private:
+  bool WritesResidentBuffer(const Stmt& stmt) const {
+    bool writes = false;
+    PostOrderVisit(stmt, [&](const ObjectRef& node) {
+      if (const auto* store = node.as<BufferStoreNode>()) {
+        writes = writes || resident_buffers_.count(store->buffer.get());
+        return;
+      }
+      const auto* evaluate = node.as<EvaluateNode>();
+      if (evaluate == nullptr) return;
+      const auto* call = evaluate->value.as<CallNode>();
+      if (call == nullptr || !call->op.same_as(dma_copy())) return;
+      BufferRegion dst = NormalizeToBufferRegion(call->args[1]);
+      writes = writes || resident_buffers_.count(dst->buffer.get());
+    });
+    return writes;
+  }
+
+  Stmt VisitStmt_(const ForNode* op) final {
+    if (op->annotations.count("runtime_resident_banked_buffers")) {
+      ++pipeline_depth_;
+      Stmt result = StmtMutator::VisitStmt_(op);
+      --pipeline_depth_;
+      return result;
+    }
+    return StmtMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode* op) final {
+    Array<Stmt> rewritten;
+    for (const Stmt& original : op->seq) {
+      Stmt stmt = VisitStmt(original);
+      rewritten.push_back(stmt);
+      if (pipeline_depth_ == 0 && !stmt.as<ForNode>() &&
+          WritesResidentBuffer(stmt)) {
+        rewritten.push_back(
+            RemapBufferRewriter::Substitute(stmt, peer_remap_));
+      }
+    }
+    return SeqStmt::Flatten(rewritten);
+  }
+
+  int pipeline_depth_{0};
+  std::unordered_set<const BufferNode*> resident_buffers_;
+  Map<Buffer, Buffer> peer_remap_;
+};
+
 tvm::transform::Pass InjectSunmmioPipelineILP() {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
     auto *fptr = f.CopyOnWrite();
     fptr->body = SunmmioILPMultiVersionBufferRewriter::Substitute(f);
+    fptr->body = ResidentPingPongInitializer::Substitute(fptr->body);
     fptr->body = SunmmioILPPipelineInjector::Inject(f);
     fptr->body = ConvertSSA(std::move(fptr->body));
     return f;

@@ -8,6 +8,7 @@ from tilelang import tvm
 from tilelang.engine.phase import should_force_let_inline
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from testing.python.transform.sunmmio_mesh_kernel_new_syntax_reference import (
+    _basic_gemm_primfunc,
     mesh_flashattn_new,
     mesh_flashdecoding_new,
     mesh_flashmladecode_new,
@@ -22,6 +23,7 @@ _TEST_OUTPUT_DIR = Path("/home/yesimeng/Tilelang/testing/python/transform/out_su
 
 def lower_and_legalize_sunmmio_pipeline_test(mod, target):
     mod = tir.transform.BindTarget(target)(mod)
+    mod = tl.transform.ResolveSunmmioMeshSymbols()(mod)
     if should_force_let_inline():
         mod = tl.transform.LetInline()(mod)
     mod = tl.transform.LegalizeNegativeIndex()(mod)
@@ -30,6 +32,7 @@ def lower_and_legalize_sunmmio_pipeline_test(mod, target):
     mod = tl.transform.InferSramScope()(mod)
     mod = tl.transform.LegalizeSunmmioDataPath()(mod)
     mod = tl.transform.SunmmioLayoutInference()(mod)
+    mod = tl.transform.LegalizeSunmmioGemm()(mod)
     mod = tl.transform.LowerTileOp()(mod)
     mod = tl.transform.LegalizeTilesLoop()(mod)
     mod = tl.transform.TilesLoop()(mod)
@@ -468,6 +471,17 @@ def _build_pipeline_modules(kernel_factory):
 
 
 STRICT_CASES = [
+    (
+        "_basic_gemm_primfunc",
+        lambda: _basic_gemm_primfunc(),{
+            "A_rsram_stage": [128, 32],
+            "A_shared_ping": [128, 32],
+            "A_shared_pong": [128, 32],
+            "B_shared_ping": [32, 128],
+            "B_shared_pong": [32, 128],
+        },
+        ["A_shared", "B_shared"],
+    ),
     (
         "matmul2",
         lambda: mesh_matmul_new(1024, 1024, 1024, 128, 128, 32, num_stages=3),

@@ -695,6 +695,21 @@ ConflictType AnalyzeWriteReadConflict(int write_start_slot, int write_dur,
   return ConflictType::kNeedSame;
 }
 
+ConflictType AnalyzeFlowConflict(const FlowSpec& write_flow,
+                                 int write_start_time,
+                                 const FlowSpec& read_flow,
+                                 int read_start_time, int ii) {
+  if (write_flow.write_resource < 0 || read_flow.read_resource < 0 ||
+      write_flow.mem != read_flow.mem) {
+    return ConflictType::kNone;
+  }
+  return AnalyzeWriteReadConflict(
+      PositiveMod(write_start_time + write_flow.w_off, ii),
+      write_flow.w_dur, ((write_start_time + write_flow.w_off) / ii) & 1,
+      PositiveMod(read_start_time + read_flow.r_off, ii), read_flow.r_dur,
+      ((read_start_time + read_flow.r_off) / ii) & 1, ii);
+}
+
 int ComputeFoldedOccupancy(int start_time, int duration, int II, int slot) {
   if (duration <= 0 || II <= 0) {
     return 0;
@@ -808,46 +823,35 @@ SolutionVerifyResult VerifySolution(const Problem& prob, const SolveResult& sol)
   }
 
   for (int a = 0; a < static_cast<int>(prob.flows.size()); ++a) {
-    const auto& write_flow = prob.flows[a];
+    const FlowSpec& write_flow = prob.flows[a];
+    if (write_flow.write_resource < 0 || write_flow.prod < 0) continue;
     auto it_a = internal_pos.find(a);
     if (it_a == internal_pos.end()) continue;
     int z_write = sol.z_bank[it_a->second];
+    int write_start_time = sol.m[write_flow.prod];
 
     for (int b = 0; b < static_cast<int>(prob.flows.size()); ++b) {
       if (a == b) continue;
-      const auto& read_flow = prob.flows[b];
-      if (read_flow.read_resource < 0) continue;
-      if (write_flow.mem != read_flow.mem) continue;
+      const FlowSpec& read_flow = prob.flows[b];
       auto it_b = internal_pos.find(b);
-      if (it_b == internal_pos.end()) continue;
+      if (it_b == internal_pos.end() || read_flow.cons < 0) continue;
       int z_read = sol.z_bank[it_b->second];
-
-      int write_start_time = write_flow.resident
-                                 ? sol.m[read_flow.cons] + write_flow.w_off
-                                 : sol.t[write_flow.prod] + write_flow.w_off;
-      int write_start_slot = PositiveMod(write_start_time, sol.II);
-      int write_parity_flip = (write_start_time / sol.II) & 1;
-      int read_start_time = sol.t[read_flow.cons] + read_flow.delta * sol.II + read_flow.r_off;
-      int read_start_slot = PositiveMod(read_start_time, sol.II);
-      int read_parity_flip = (read_start_time / sol.II) & 1;
-      ConflictType conflict =
-          AnalyzeWriteReadConflict(write_start_slot, write_flow.w_dur, write_parity_flip,
-                                   read_start_slot, read_flow.r_dur, read_parity_flip,
-                                   sol.II);
+      int read_start_time =
+          sol.m[read_flow.cons] + read_flow.delta * sol.II;
+      ConflictType conflict = AnalyzeFlowConflict(
+          write_flow, write_start_time, read_flow, read_start_time, sol.II);
       if (conflict == ConflictType::kNeedDifferent && z_write == z_read) {
         fail(&result.bank_port_ok,
              "bank port conflict requires different banks between flow " +
                  std::to_string(a) + " and flow " + std::to_string(b));
-      }
-      if (conflict == ConflictType::kNeedSame && z_write != z_read) {
+      } else if (conflict == ConflictType::kNeedSame && z_write != z_read) {
         fail(&result.bank_port_ok,
              "bank port conflict requires same banks between flow " +
                  std::to_string(a) + " and flow " + std::to_string(b));
-      }
-      if (conflict == ConflictType::kImpossible) {
+      } else if (conflict == ConflictType::kImpossible) {
         fail(&result.bank_port_ok,
-             "bank port conflict impossible between flow " + std::to_string(a) +
-                 " and flow " + std::to_string(b));
+             "bank port conflict impossible between flow " +
+                 std::to_string(a) + " and flow " + std::to_string(b));
       }
     }
   }
@@ -2321,7 +2325,9 @@ void BuildTemplateDependencyGraph(
 
   std::map<std::pair<int, int>, int> best_delta;
   std::map<std::tuple<int, int, const BufferNode*, int, int>, int> flow_key_to_index;
-  std::set<std::pair<int, int>> satisfied_consumer_mem;
+  using ConsumerAccessKey =
+      std::tuple<int, int, const BufferNode*, int>;
+  std::set<ConsumerAccessKey> satisfied_consumer_access;
 
   auto version_mod = [&](const BufferNode* buf) {
     if (iter_mod <= 0) {
@@ -2576,6 +2582,8 @@ void BuildTemplateDependencyGraph(
   struct ResidentCandidate {
     int cmd_id{-1};
     int mem{-1};
+    const BufferNode* buffer{nullptr};
+    int access_idx{-1};
     std::string buffer_name;
   };
   std::vector<ResidentCandidate> resident_candidates;
@@ -2617,8 +2625,8 @@ void BuildTemplateDependencyGraph(
                               curr_cmd.iter - src_cmd.iter, buf,
                               it->access_idx, dst_access_idx, mem);
         if (has_concrete_flow) {
-          satisfied_consumer_mem.insert(
-              std::make_pair(curr_cmd.template_id, mem));
+          satisfied_consumer_access.insert(std::make_tuple(
+              curr_cmd.template_id, mem, buf, dst_access_idx));
         }
         break;
       }
@@ -2673,35 +2681,30 @@ void BuildTemplateDependencyGraph(
   }
 
   for (const TemplateCommand& cmd : commands) {
-    for (int mem = 0; mem <= 1; ++mem) {
-      int read_resource = GetMemoryReadResource(mem);
-      if (!CommandUsesResource(problem->P[cmd.id], read_resource)) {
+    for (int access_idx = 0;
+         access_idx < static_cast<int>(cmd.accesses.size()); ++access_idx) {
+      const AccessInfo& access = cmd.accesses[access_idx];
+      if (access.is_write) continue;
+      int mem = GetPingPongMemoryKind(access.buffer());
+      if (mem < 0 || !CommandUsesResource(
+                         problem->P[cmd.id], GetMemoryReadResource(mem))) {
         continue;
       }
-      std::string buffer_name = "resident_" + MemName(mem) + "_cmd_" +
-                                std::to_string(cmd.id);
-      for (const AccessInfo& access : cmd.accesses) {
-        if (access.is_write) {
-          continue;
-        }
-        if (GetPingPongMemoryKind(access.buffer()) == mem) {
-          buffer_name = access.buffer()->name;
-          break;
-        }
-      }
-      resident_candidates.push_back(
-          ResidentCandidate{cmd.id, mem, buffer_name});
+      resident_candidates.push_back(ResidentCandidate{
+          cmd.id, mem, access.buffer().get(), access_idx,
+          access.buffer()->name});
     }
   }
 
-  std::set<std::pair<int, int>> emitted_resident_consumer_mem;
+  std::set<ConsumerAccessKey> emitted_resident_access;
   for (const ResidentCandidate& candidate : resident_candidates) {
-    if (satisfied_consumer_mem.count(
-            std::make_pair(candidate.cmd_id, candidate.mem)) != 0) {
+    ConsumerAccessKey key = std::make_tuple(
+        candidate.cmd_id, candidate.mem, candidate.buffer,
+        candidate.access_idx);
+    if (satisfied_consumer_access.count(key) != 0) {
       continue;
     }
-    if (!emitted_resident_consumer_mem.insert(
-            std::make_pair(candidate.cmd_id, candidate.mem)).second) {
+    if (!emitted_resident_access.insert(key).second) {
       continue;
     }
     problem->flows.push_back(
@@ -2951,50 +2954,21 @@ ModelVars BuildModel(Highs& highs, const Problem& prob, int II, bool optimize_t,
   auto bank_build_begin = std::chrono::steady_clock::now();
   for (int a = 0; a < internal_count; ++a) {
     const auto& write_flow = prob.flows[vars.internal_flow_ids[a]];
+    if (write_flow.write_resource < 0 || write_flow.prod < 0) continue;
     for (int b = 0; b < internal_count; ++b) {
       if (a == b) continue;
       const auto& read_flow = prob.flows[vars.internal_flow_ids[b]];
       if (read_flow.read_resource < 0) continue;
       if (write_flow.mem != read_flow.mem) continue;
 
-      int prod_slot_begin = write_flow.resident ? 0 : 0;
-      int prod_slot_end = write_flow.resident ? II : II;
-      for (int prod_slot = prod_slot_begin; prod_slot < prod_slot_end; ++prod_slot) {
-        int write_start_time =
-            write_flow.resident ? prod_slot + write_flow.w_off
-                                : prod_slot + write_flow.w_off;
-        int write_start_slot = PositiveMod(write_start_time, II);
-        int write_parity_flip = (write_start_time / II) & 1;
-        std::map<int, int> write_slot_rho =
-            BuildSlotRhoMap(write_start_slot, write_flow.w_dur, II);
+      for (int prod_slot = 0; prod_slot < II; ++prod_slot) {
         std::vector<int> diff_cons_slots;
         std::vector<int> same_cons_slots;
         std::vector<int> impossible_cons_slots;
         for (int cons_slot = 0; cons_slot < II; ++cons_slot) {
-          int read_start_slot = PositiveMod(cons_slot + read_flow.r_off, II);
-          int read_parity_flip = (write_parity_flip + read_flow.delta) & 1;
-          bool saw_same = false;
-          bool saw_diff = false;
-          for (int step = 0; step < read_flow.r_dur; ++step) {
-            int slot = (read_start_slot + step) % II;
-            auto it = write_slot_rho.find(slot);
-            if (it == write_slot_rho.end()) continue;
-            int read_rho = WrapBit(read_start_slot, slot) ^ read_parity_flip;
-            if (it->second == read_rho) {
-              saw_same = true;
-            } else {
-              saw_diff = true;
-            }
-            if (saw_same && saw_diff) break;
-          }
-          ConflictType conflict = ConflictType::kNone;
-          if (saw_same && saw_diff) {
-            conflict = ConflictType::kImpossible;
-          } else if (saw_same) {
-            conflict = ConflictType::kNeedDifferent;
-          } else if (saw_diff) {
-            conflict = ConflictType::kNeedSame;
-          }
+          ConflictType conflict = AnalyzeFlowConflict(
+              write_flow, prod_slot, read_flow,
+              cons_slot + read_flow.delta * II, II);
           if (conflict == ConflictType::kNone) continue;
           if (conflict == ConflictType::kNeedDifferent) {
             diff_cons_slots.push_back(cons_slot);
@@ -3005,8 +2979,7 @@ ModelVars BuildModel(Highs& highs, const Problem& prob, int II, bool optimize_t,
           }
         }
 
-        HighsInt x_prod =
-            write_flow.resident ? HighsInt(-1) : vars.col_x[write_flow.prod][prod_slot];
+        HighsInt x_prod = vars.col_x[write_flow.prod][prod_slot];
         HighsInt z_write_ping = vars.col_z[a];
         HighsInt z_read_ping = vars.col_z[b];
 
@@ -3237,6 +3210,7 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
     std::vector<Buffer> versioned_buffers;
     std::vector<Buffer> runtime_multiversion_buffers;
     std::vector<Buffer> runtime_banked_buffers;
+    std::vector<Buffer> runtime_resident_banked_buffers;
     std::map<std::string, int> runtime_bank_start_phases;
     std::map<std::string, int> runtime_bank_read_delta_parities;
     std::map<std::string, std::map<int, int>> runtime_bank_writer_phases;
@@ -3365,6 +3339,7 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
               [](const Buffer& a, const Buffer& b) { return a->name < b->name; });
     result.runtime_multiversion_buffers.clear();
     result.runtime_banked_buffers.clear();
+    result.runtime_resident_banked_buffers.clear();
     result.runtime_bank_start_phases.clear();
     result.runtime_bank_read_delta_parities.clear();
     result.runtime_bank_writer_phases.clear();
@@ -3489,14 +3464,26 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
       int bank_phase = sol.z_bank[flow_pos->second];
       bool allow_resident_to_own_bank =
           flow.resident && !has_non_resident_flow.count(flow.buffer_name);
+      // Keep per-op bank metadata as the primary source of truth. A single
+      // per-buffer start phase is only well-defined when either:
+      //   (1) the flow is resident-only for that buffer, or
+      //   (2) every contributing flow happens to agree.
+      //
+      // Non-resident flows of the same logical buffer can legitimately land on
+      // different banks when they represent different runtime instances. Those
+      // cases are consumed later through runtime_bank_writer_phases /
+      // runtime_bank_reader_phases, so do not force them into a single
+      // runtime_bank_start_phases entry here.
       if (!flow.resident || allow_resident_to_own_bank) {
         auto it = analysis->runtime_bank_start_phases.find(flow.buffer_name);
         if (it == analysis->runtime_bank_start_phases.end()) {
           analysis->runtime_bank_start_phases[flow.buffer_name] = bank_phase;
-        } else {
-          ICHECK_EQ(it->second, bank_phase)
-              << "Conflicting bank phase for runtime multiversion buffer "
-              << flow.buffer_name;
+        } else if (it->second != bank_phase) {
+          LOG(WARNING)
+              << "Ignoring conflicting aggregate bank phase for buffer "
+              << flow.buffer_name << ": existing=" << it->second
+              << " new=" << bank_phase
+              << ". Per-op bank metadata will be used instead.";
         }
         int delta_parity = flow.delta & 1;
         auto it_delta =
@@ -3504,11 +3491,16 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
         if (it_delta == analysis->runtime_bank_read_delta_parities.end()) {
           analysis->runtime_bank_read_delta_parities[flow.buffer_name] =
               delta_parity;
-        } else {
-          ICHECK_EQ(it_delta->second, delta_parity)
-              << "Conflicting read delta parity for banked buffer "
-              << flow.buffer_name;
+        } else if (it_delta->second != delta_parity) {
+          LOG(WARNING)
+              << "Ignoring conflicting aggregate read-delta parity for buffer "
+              << flow.buffer_name << ": existing=" << it_delta->second
+              << " new=" << delta_parity
+              << ". Per-op bank metadata will be used instead.";
         }
+      } else {
+        // For non-resident runtime instances, keep only per-op metadata and do
+        // not force a single aggregate start phase / delta parity.
       }
       if (flow.write_resource >= 0 && flow.prod >= 0) {
         auto& writer_map = analysis->runtime_bank_writer_phases[flow.buffer_name];
@@ -3620,10 +3612,27 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
     }
     ICHECK(sol.ok) << "ILP solve failed for sunmmio pipeline planning.";
     PopulateRuntimeBankMetadata(&analysis, sol);
+    std::unordered_set<std::string> resident_buffer_names;
+    for (const FlowSpec& flow : analysis.prob.flows) {
+      if (flow.resident && !flow.buffer_name.empty()) {
+        resident_buffer_names.insert(flow.buffer_name);
+      }
+    }
     for (const Buffer& buffer : analysis.versioned_buffers) {
-      if (analysis.runtime_bank_start_phases.count(buffer->name)) {
+      if (analysis.runtime_bank_start_phases.count(buffer->name) ||
+          analysis.runtime_bank_writer_phases.count(buffer->name) ||
+          analysis.runtime_bank_reader_phases.count(buffer->name)) {
         analysis.runtime_banked_buffers.push_back(buffer);
       }
+    }
+    for (const Buffer& buffer : analysis.used_buffers) {
+      if (!resident_buffer_names.count(buffer->name)) continue;
+      if (std::find(analysis.runtime_banked_buffers.begin(),
+                    analysis.runtime_banked_buffers.end(), buffer) ==
+          analysis.runtime_banked_buffers.end()) {
+        analysis.runtime_banked_buffers.push_back(buffer);
+      }
+      analysis.runtime_resident_banked_buffers.push_back(buffer);
     }
     // Disabled per current ILP annotation semantics:
     // keep the bank-rotation decision from the solved flow model as-is, and do
@@ -3734,6 +3743,11 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
         analysis.runtime_banked_buffers.begin(),
         analysis.runtime_banked_buffers.end());
     annotations.Set("runtime_banked_buffers", runtime_banked_buffers_array);
+    Array<Buffer> runtime_resident_banked_buffers_array(
+        analysis.runtime_resident_banked_buffers.begin(),
+        analysis.runtime_resident_banked_buffers.end());
+    annotations.Set("runtime_resident_banked_buffers",
+                    runtime_resident_banked_buffers_array);
     Map<Buffer, PrimExpr> runtime_bank_start_phases;
     for (const Buffer& buffer : analysis.runtime_banked_buffers) {
       runtime_bank_start_phases.Set(
