@@ -546,6 +546,37 @@ AllgatherOp::AllgatherOp(Array<PrimExpr> args,
   data_ = std::move(node);
 }
 
+bool IsCommunicationOp(const Call &call) {
+  return call->op.same_as(BroadcastOp::Get()) ||
+         call->op.same_as(PutOp::Get()) || call->op.same_as(AllgatherOp::Get());
+}
+
+bool CommunicationSourceMayUseHLink(const Call &call) {
+  ICHECK(IsCommunicationOp(call));
+  TileOperator tile_op = ParseOperator(call);
+  ICHECK(tile_op.defined());
+  if (const auto *broadcast = tile_op.as<BroadcastOpNode>()) {
+    ICHECK(broadcast->direction >= 0 && broadcast->direction <= 2)
+        << "Invalid broadcast direction " << broadcast->direction;
+    // "all" starts vertically; its horizontal phase reads the destination.
+    return broadcast->direction == 0;
+  }
+  if (const auto *allgather = tile_op.as<AllgatherOpNode>()) {
+    ICHECK(allgather->direction >= 0 && allgather->direction <= 2)
+        << "Invalid allgather direction " << allgather->direction;
+    // "all" starts horizontally from the original source.
+    // TODO: A vertical-first lowering could avoid staging if it preserves the
+    // existing row-major core-slot order.
+    return allgather->direction != 1;
+  }
+  if (tile_op.as<PutOpNode>()) {
+    // Put derives its route from core coordinates, which may be dynamic.
+    return true;
+  }
+  LOG(FATAL) << "Expected broadcast, put, or allgather communication op";
+  return true;
+}
+
 TileOperator AllgatherOpNode::Clone() const {
   auto op = tvm::ffi::make_object<AllgatherOpNode>(*this);
   return AllgatherOp(op);

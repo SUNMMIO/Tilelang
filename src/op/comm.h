@@ -165,6 +165,20 @@ public:
   static const Op &Get();
 };
 
+/**
+ * \brief Whether a TIR call is an inter-core communication tile op.
+ */
+TVM_DLL bool IsCommunicationOp(const Call &call);
+
+/**
+ * \brief Whether the leaf consuming a communication call's source may use
+ * HLink.
+ *
+ * Two-dimensional broadcast and allgather use different first-phase
+ * directions. Put is conservative because its route may be dynamic.
+ */
+TVM_DLL bool CommunicationSourceMayUseHLink(const Call &call);
+
 class AllreduceOpNode : public TileOperatorNode {
 public:
   PrimExpr src, dst;

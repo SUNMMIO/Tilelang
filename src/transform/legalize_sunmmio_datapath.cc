@@ -2,11 +2,8 @@
  * \file legalize_sunmmio_datapath.cc
  * \brief Legalize unsupported Sunmmio data-transfer paths.
  *
- * Rewrites transfers that have no direct datapath by inserting an RSRAM staging
- * step: global-source communication, global -> shared.asram copies, and
- * casting RSRAM -> shared.asram/wsram (the cast runs on the tile unit in RSRAM,
- * then a same-dtype DMA reaches the operand SRAM).  Works for data-transfer
- * tileops including copy, broadcast, put, and allgather.
+ * Stages unsupported global -> HLink communication, global -> shared.asram
+ * copies, and casting RSRAM -> global/ASRAM/WSRAM copies through RSRAM.
  */
 
 #include <tvm/ffi/reflection/registry.h>
@@ -67,18 +64,7 @@ public:
   explicit LegalizeSunmmioDataPathPass(arith::Analyzer *analyzer)
       : arith::IRMutatorWithAnalyzer(analyzer) {}
 
-  /**
-   * @brief Legalize unsupported Sunmmio data-transfer paths before lowering.
-   *
-   * For a data-transfer op (copy, broadcast, put, allgather) whose transfer has
-   * no direct datapath -- a communication op with a global source, a global ->
-   * shared.asram copy, or a casting RSRAM -> shared.asram/wsram -- the pass
-   * stages through a compact shared.rsram buffer:
-   * 1. Allocates the staging buffer (dst dtype on the cast path, else src
-   * dtype).
-   * 2. Inserts a copy: src -> staging (the cast, when dtypes differ).
-   * 3. Rewrites the original op's source to use the staging buffer.
-   */
+  /** Legalize unsupported Sunmmio data paths before tile-op lowering. */
   static PrimFunc Substitute(PrimFunc f) {
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
     if (!target.defined() || !TargetIsSunmmio(target.value())) {
@@ -93,22 +79,6 @@ public:
   }
 
 private:
-  /** Returns true for tileops that transfer data between src and dst regions.
-   */
-  static bool IsDataTransferOp(const CallNode *call) {
-    return call->op.same_as(Copy::Get()) ||
-           call->op.same_as(BroadcastOp::Get()) ||
-           call->op.same_as(PutOp::Get()) ||
-           call->op.same_as(AllgatherOp::Get());
-  }
-
-  /** Returns true for inter-core communication tileops. */
-  static bool IsCommunicationOp(const CallNode *call) {
-    return call->op.same_as(BroadcastOp::Get()) ||
-           call->op.same_as(PutOp::Get()) ||
-           call->op.same_as(AllgatherOp::Get());
-  }
-
   // `proto` supplies the staging buffer's dtype, element type and name;
   // `region` its shape. They are the same buffer for a plain scope-route stage,
   // but differ for a cast stage (proto = dst, so the staging buffer takes the
@@ -150,8 +120,14 @@ private:
   }
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
-    const auto *call = op->value.as<CallNode>();
-    if (call == nullptr || !IsDataTransferOp(call)) {
+    const auto *call_node = op->value.as<CallNode>();
+    if (call_node == nullptr) {
+      return IRMutatorWithAnalyzer::VisitStmt_(op);
+    }
+    Call call = tvm::ffi::GetRef<Call>(call_node);
+    bool is_copy = call->op.same_as(Copy::Get());
+    bool is_communication = IsCommunicationOp(call);
+    if (!is_copy && !is_communication) {
       return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
 
@@ -162,20 +138,16 @@ private:
 
     const std::string src_scope = src_br->buffer.scope();
     const std::string dst_scope = dst_br->buffer.scope();
-    bool dst_is_operand =
-        dst_scope == kSunmmioScopeASRAM || dst_scope == kSunmmioScopeWSRAM;
 
-    // Communication engines cannot consume DRAM directly. Stage a global
-    // communication source through RSRAM regardless of the destination SRAM
-    // scope. Keep supported direct copies such as global -> RSRAM/WSRAM
-    // unchanged; global -> ASRAM copies still require staging.
-    bool stage_global =
-        src_scope == "global" &&
-        (dst_scope == kSunmmioScopeASRAM ||
-         (IsCommunicationOp(call) && IsSunmmioSramScope(dst_scope)));
-    // Casting RSRAM -> ASRAM/WSRAM: the cast must run on the tile unit
-    // (RSRAM -> RSRAM), so stage through an RSRAM buffer of the dst dtype.
-    bool stage_cast = src_scope == kSunmmioScopeRSRAM && dst_is_operand &&
+    // A4E DRAM reads use ODMA0, while HLink writes use ODMA1. Such source
+    // leaves must first load into RSRAM. VLink can read DRAM directly.
+    bool stage_global = src_scope == "global" &&
+                        ((is_copy && dst_scope == kSunmmioScopeASRAM) ||
+                         (is_communication && IsSunmmioSramScope(dst_scope) &&
+                          CommunicationSourceMayUseHLink(call)));
+    // A cast from RSRAM to another DMA scope must run on the tile unit first.
+    bool stage_cast = src_scope == kSunmmioScopeRSRAM &&
+                      dst_scope != kSunmmioScopeRSRAM &&
                       src_br->buffer->dtype != dst_br->buffer->dtype;
     if (!stage_global && !stage_cast) {
       return IRMutatorWithAnalyzer::VisitStmt_(op);
@@ -190,9 +162,8 @@ private:
     // 1. Copy: src -> RSRAM staging buffer (casts when src/dst dtypes differ).
     PrimExpr src_region = MakeRegionExpr(src_br->buffer, src_br->region, 1);
     PrimExpr staging_write = MakeRegionExpr(staging, staging_range, 2);
-    Map<String, ObjectRef> copy_annotations = call->op.same_as(Copy::Get())
-                                                  ? call->annotations
-                                                  : Map<String, ObjectRef>();
+    Map<String, ObjectRef> copy_annotations =
+        is_copy ? call->annotations : Map<String, ObjectRef>();
     Stmt copy_stmt =
         Evaluate(Call(DataType::Handle(), Copy::Get(),
                       {src_region, staging_write}, copy_annotations));
