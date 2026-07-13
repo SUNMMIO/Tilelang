@@ -168,13 +168,15 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
 
   // Propagate: derive layout for each side from the other.
   if (src_has && IsSunmmioSramScope(dst.scope())) {
-    auto derived = DeriveLayoutLike(T.layout_map[src], dst->shape);
+    auto derived =
+        DeriveLayoutLikeForDType(T.layout_map[src], dst->shape, dst->dtype);
     if (derived.defined()) {
       result.Set(dst, derived.value());
     }
   }
   if (dst_has && IsSunmmioSramScope(src.scope())) {
-    auto derived = DeriveLayoutLike(T.layout_map[dst], src->shape);
+    auto derived =
+        DeriveLayoutLikeForDType(T.layout_map[dst], src->shape, src->dtype);
     if (derived.defined()) {
       result.Set(src, derived.value());
     }

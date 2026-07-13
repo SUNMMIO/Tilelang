@@ -12,11 +12,20 @@ carrying an explicit layout.
 
 import pytest
 import tilelang
+import tilelang.testing
 import tilelang as tl
 import tilelang.language as T
 from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
-from tilelang.layout import make_row_major, make_zz_layout, make_aligned_row_major
+from tilelang.layout import (
+    is_same_layout,
+    make_aligned_row_major,
+    make_mx_row_major_layout,
+    make_mxznn_layout,
+    make_mxzz_layout,
+    make_row_major,
+    make_zz_layout,
+)
 from tilelang.language.mesh_tensor import MeshReplicationType
 from tvm import tir
 from tvm.tir import Block
@@ -26,6 +35,7 @@ tilelang.env.disable_cache()
 
 M, N = 128, 128
 DTYPE = T.float16
+MX_DTYPE = T.mxfp8
 
 
 def apply_passes_through_lower_tile_op(mod, target):
@@ -116,6 +126,11 @@ def _dram(shape, layout):
     return T.MeshTensor(shape, policy, DTYPE, layout=layout)
 
 
+def _dram_typed(shape, dtype, layout):
+    policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    return T.MeshTensor(shape, policy, dtype, layout=layout)
+
+
 def mismatched_copy_kernel():
     """Row-major DRAM <-> ZZ RSRAM (default), both directions — combos 1 & 2."""
 
@@ -128,6 +143,40 @@ def mismatched_copy_kernel():
             A_shared = T.alloc_shared((M, N), DTYPE, scope="shared.rsram")
             T.copy(A, A_shared)  # DRAM(row-major) -> RSRAM(ZZ default)
             T.copy(A_shared, B)  # RSRAM(ZZ) -> DRAM(row-major)
+
+    return tvm.IRModule({"main": main})
+
+
+def mxzz_dram_to_mx_row_major_rsram_kernel():
+    @T.prim_func
+    def main(
+        A: _dram_typed(
+            (64, 64),
+            MX_DTYPE,
+            make_mxzz_layout((64, 64), dtype=MX_DTYPE),
+        ),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((64, 64), MX_DTYPE, scope="shared.rsram")
+            T.annotate_layout({A_shared: make_mx_row_major_layout((64, 64), dtype=MX_DTYPE)})
+            T.copy(A, A_shared)
+
+    return tvm.IRModule({"main": main})
+
+
+def mxznn_dram_to_mx_row_major_rsram_kernel():
+    @T.prim_func
+    def main(
+        A: _dram_typed(
+            (64, 64),
+            MX_DTYPE,
+            make_mxznn_layout((64, 64), dtype=MX_DTYPE),
+        ),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            A_shared = T.alloc_shared((64, 64), MX_DTYPE, scope="shared.rsram")
+            T.annotate_layout({A_shared: make_mx_row_major_layout((64, 64), dtype=MX_DTYPE)})
+            T.copy(A, A_shared)
 
     return tvm.IRModule({"main": main})
 
@@ -255,6 +304,35 @@ def test_zz_dram_splits_with_zz_staging():
         layout_map = extract_layout_map(func)
         registered = {b.name for b in layout_map if b.name.endswith("_layout_stage")}
         assert len(registered) == 2, registered
+
+
+def test_mxzz_dram_splits_with_mxzz_staging():
+    """MX layout transform is only valid for MXZZ <-> MX row-major.  The staging
+    buffer must preserve the DRAM MXZZ layout kind instead of becoming row-major."""
+    target = determine_target("Sunmmio", return_object=True)
+    mod = mxzz_dram_to_mx_row_major_rsram_kernel()
+    with tvm.target.Target(target):
+        mod = apply_passes_through_lower_tile_op(mod, target)
+        func = list(mod.functions.values())[0]
+
+        names = collect_call_names(func)
+        assert names.count("tl.dma_copy") == 1, names
+        assert names.count("tl.sunmmio_layout_transform") == 1, names
+
+        stages = staging_buffers(func)
+        assert len(stages) == 1, [b.name for b in stages]
+
+        layout_map = extract_layout_map(func)
+        stage_layout = layout_map[stages[0]]
+        assert is_same_layout(stage_layout, make_mxzz_layout((64, 64), dtype=MX_DTYPE))
+
+
+def test_mxznn_dram_to_mx_row_major_rsram_is_rejected():
+    """SUVM transform_layout does not support MXZNN <-> MX row-major."""
+    target = determine_target("Sunmmio", return_object=True)
+    mod = mxznn_dram_to_mx_row_major_rsram_kernel()
+    with tvm.target.Target(target), pytest.raises(Exception, match="MX row-major <-> MXZZ"):
+        apply_passes_through_lower_tile_op(mod, target)
 
 
 def test_matched_layout_stays_plain_dma_copy():

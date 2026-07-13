@@ -64,23 +64,6 @@ TIR_DEFINE_TL_BUILTIN(access_ptr)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kPure));
 
-// Sunmmio target-dependent mesh symbols. These frontend-only expressions are
-// resolved to concrete IntImm values after BindTarget.
-TIR_DEFINE_TL_BUILTIN(mesh_nrows)
-    .set_num_inputs(0)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kPure));
-
-TIR_DEFINE_TL_BUILTIN(mesh_ncols)
-    .set_num_inputs(0)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kPure));
-
-TIR_DEFINE_TL_BUILTIN(mesh_ncores)
-    .set_num_inputs(0)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kPure));
-
 // fast math related op
 TIR_DEFINE_TL_BUILTIN(__exp).set_num_inputs(1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));

@@ -2,17 +2,21 @@ import tilelang
 import tilelang.language as T
 import tilelang.transform as tl_transform
 import tvm_ffi
+import pytest
 
 from tilelang import tvm as tvm
 from tilelang.engine.phase import LowerAndLegalize, OptimizeForSunmmio, PreLowerSemanticCheck
+from tilelang.language.eager.builder import Builder
+from tilelang.language.mesh_symbols import _MESH_NCOLS_ATTR, _MESH_NROWS_ATTR
 from tilelang.layout import make_zz_layout
+from tilelang.utils.language import prim_expr_contains_mesh_symbol
 from tilelang.utils.target import determine_target, target_is_sunmmio
 from tvm import tir
 from tvm.tir.stmt_functor import post_order_visit
 
 tilelang.env.disable_cache()
 
-_MESH_OP_NAMES = ("tl.mesh_nrows", "tl.mesh_ncols", "tl.mesh_ncores")
+_MESH_VAR_NAMES = ("mesh_nrows", "mesh_ncols")
 _layout_logical_shape = tvm_ffi.get_global_func("tl.CuteLayout_logical_shape")
 
 
@@ -24,42 +28,51 @@ def _sunmmio_target_with_host(nrows=4, ncols=4):
     return tvm.target.Target(_sunmmio_target(nrows, ncols), tvm.target.Target.canon_target("llvm"))
 
 
-def _mesh_calls_in_stmt(func):
-    ops = {name: tir.op.Op.get(name) for name in _MESH_OP_NAMES}
-    calls = []
+def _mesh_vars(func):
+    assert func.attrs is not None
+    assert _MESH_NROWS_ATTR in func.attrs
+    assert _MESH_NCOLS_ATTR in func.attrs
+    return {
+        "mesh_nrows": func.attrs[_MESH_NROWS_ATTR],
+        "mesh_ncols": func.attrs[_MESH_NCOLS_ATTR],
+    }
+
+
+def _mesh_var_hits_in_stmt(func, mesh_vars):
+    hits = []
 
     def visit(node):
-        if isinstance(node, tir.Call):
-            for name, op in ops.items():
-                if hasattr(node.op, "same_as") and node.op.same_as(op):
-                    calls.append(name)
+        if isinstance(node, tir.Var):
+            for name, var in mesh_vars.items():
+                if node.same_as(var):
+                    hits.append(name)
 
     post_order_visit(func.body, visit)
-    return calls
+    return hits
 
 
-def _mesh_calls_in_mod(mod):
-    calls = []
+def _mesh_var_hits_in_mod(mod, mesh_vars):
+    hits = []
     for func in mod.functions.values():
         if isinstance(func, tir.PrimFunc):
-            calls.extend(_mesh_calls_in_stmt(func))
-            calls.extend(_mesh_calls_in_exprs(_exprs_in_buffer_metadata(func)))
-    return calls
+            hits.extend(_mesh_var_hits_in_stmt(func, mesh_vars))
+            hits.extend(_mesh_var_hits_in_exprs(_exprs_in_buffer_metadata(func), mesh_vars))
+    return hits
 
 
-def _mesh_calls_in_exprs(exprs):
-    ops = {name: tir.op.Op.get(name) for name in _MESH_OP_NAMES}
-    calls = []
+def _mesh_var_hits_in_exprs(exprs, mesh_vars):
+    hits = []
 
     def visit(node):
-        if isinstance(node, tir.Call):
-            for name, op in ops.items():
-                if hasattr(node.op, "same_as") and node.op.same_as(op):
-                    calls.append(name)
+        if isinstance(node, tir.Var):
+            for name, var in mesh_vars.items():
+                if node.same_as(var):
+                    hits.append(name)
 
     for expr in exprs:
-        tir.stmt_functor.post_order_visit(expr, visit)
-    return calls
+        if isinstance(expr, tir.PrimExpr):
+            tir.stmt_functor.post_order_visit(expr, visit)
+    return hits
 
 
 def _exprs_in_buffer_metadata(func):
@@ -127,27 +140,32 @@ def _bind_and_resolve(mod, target):
 
 
 def _lower_and_optimize(mod, target):
+    mesh_vars = _mesh_vars(mod["main"])
+
     with tvm.transform.PassContext(opt_level=3), tvm.target.Target(target):
         PreLowerSemanticCheck(mod)
         lowered = LowerAndLegalize(mod, target)
 
-    assert _mesh_calls_in_mod(lowered) == []
+    assert _mesh_var_hits_in_mod(lowered, mesh_vars) == []
     assert _thread_extents(lowered["main"])["blockIdx.x"] == 16
 
     with tvm.transform.PassContext(opt_level=3), tvm.target.Target(target):
         optimized = OptimizeForSunmmio(lowered, target)
 
     device_func = _sunmmio_device_func(optimized)
-    assert _mesh_calls_in_mod(optimized) == []
+    assert _mesh_var_hits_in_mod(optimized, mesh_vars) == []
     assert _thread_extents(device_func)["blockIdx.x"] == 16
     return optimized
 
 
 def _assert_frontend_uses_symbolic_mesh(func):
-    assert "tl.mesh_ncores" in _mesh_calls_in_stmt(func)
-    metadata_calls = _mesh_calls_in_exprs(_exprs_in_buffer_metadata(func))
-    assert "tl.mesh_nrows" in metadata_calls
-    assert "tl.mesh_ncols" in metadata_calls
+    mesh_vars = _mesh_vars(func)
+    body_hits = _mesh_var_hits_in_stmt(func, mesh_vars)
+    assert "mesh_nrows" in body_hits
+    assert "mesh_ncols" in body_hits
+    metadata_hits = _mesh_var_hits_in_exprs(_exprs_in_buffer_metadata(func), mesh_vars)
+    assert "mesh_nrows" in metadata_hits
+    assert "mesh_ncols" in metadata_hits
 
 
 def _symbolic_mesh_gemm_mod():
@@ -278,13 +296,14 @@ def test_resolve_replaces_mesh_intrinsics_in_body_and_kernel_extent():
 
         mod = tvm.IRModule({"main": main})
 
-    assert set(_mesh_calls_in_stmt(mod["main"])) == set(_MESH_OP_NAMES)
+    mesh_vars = _mesh_vars(mod["main"])
+    assert set(_mesh_var_hits_in_stmt(mod["main"], mesh_vars)) == set(_MESH_VAR_NAMES)
 
     mod = _bind_and_resolve(mod, target)
     func = mod["main"]
 
-    assert _mesh_calls_in_stmt(func) == []
-    assert _mesh_calls_in_exprs(_exprs_in_buffer_metadata(func)) == []
+    assert _mesh_var_hits_in_stmt(func, mesh_vars) == []
+    assert _mesh_var_hits_in_exprs(_exprs_in_buffer_metadata(func), mesh_vars) == []
     assert _thread_extents(func)["blockIdx.x"] == 16
     assert (4, 4, 16) in _alloc_shapes(func)
 
@@ -304,19 +323,56 @@ def test_resolve_updates_default_mesh_tensor_buffer_map_and_layout_metadata():
                     for j in T.serial(valid_N):
                         A[i, j] = A[i, j]
 
-        mod = tvm.IRModule({"main": main})
+    mod = tvm.IRModule({"main": main})
 
     unresolved_buffer = mod["main"].buffer_map[mod["main"].params[0]]
-    assert _mesh_calls_in_exprs(unresolved_buffer.shape) == ["tl.mesh_nrows", "tl.mesh_ncols"]
+    mesh_vars = _mesh_vars(mod["main"])
+    assert _mesh_var_hits_in_exprs(unresolved_buffer.shape, mesh_vars) == ["mesh_nrows", "mesh_ncols"]
 
     mod = _bind_and_resolve(mod, target)
     func = mod["main"]
     buffer = func.buffer_map[func.params[0]]
     tensor_meta = func.attrs["tensor_meta"]["A"]
 
-    assert _mesh_calls_in_exprs(_exprs_in_buffer_metadata(func)) == []
+    assert _mesh_var_hits_in_exprs(_exprs_in_buffer_metadata(func), mesh_vars) == []
     assert tuple(int(extent) for extent in buffer.shape) == (32, 24)
     assert tuple(int(extent) for extent in _layout_logical_shape(tensor_meta["sharded_layout"])) == (32, 24)
+
+
+def test_resolve_reports_mesh_vars_without_attrs():
+    target = _sunmmio_target()
+    mesh_nrows = tir.SizeVar("mesh_nrows", "int32")
+
+    func = tir.PrimFunc([], tir.Evaluate(mesh_nrows)).with_attr("target", target)
+    mod = tvm.IRModule({"main": func})
+
+    with pytest.raises(tvm.TVMError, match="missing PrimFunc attributes"):
+        tl_transform.ResolveSunmmioMeshSymbols()(mod)
+
+
+def test_resolve_reports_decl_buffer_mesh_vars_without_attrs():
+    target = _sunmmio_target()
+    mesh_nrows = tir.SizeVar("mesh_nrows", "int32")
+    buffer = tir.decl_buffer((mesh_nrows,), "float32")
+    body = tir.DeclBuffer(buffer, tir.Evaluate(0))
+    func = tir.PrimFunc([], body).with_attr("target", target)
+    mod = tvm.IRModule({"main": func})
+
+    with pytest.raises(tvm.TVMError, match="missing PrimFunc attributes"):
+        tl_transform.ResolveSunmmioMeshSymbols()(mod)
+
+
+def test_mesh_symbol_query_has_no_builder_side_effect():
+    builder = Builder()
+
+    with builder.current_context():
+        builder._sunmmio_mesh_symbols_used = False
+        expr = T.mesh_nrows() + 1
+        assert builder._sunmmio_mesh_symbols_used
+
+        builder._sunmmio_mesh_symbols_used = False
+        assert prim_expr_contains_mesh_symbol(expr)
+        assert not builder._sunmmio_mesh_symbols_used
 
 
 def test_lower_and_optimize_resolve_kernel_default_mesh_ncores():
@@ -336,20 +392,21 @@ def test_lower_and_optimize_resolve_kernel_default_mesh_ncores():
 
         mod = tvm.IRModule({"main": main})
 
-    assert set(_mesh_calls_in_stmt(mod["main"])) == set(_MESH_OP_NAMES)
+    mesh_vars = _mesh_vars(mod["main"])
+    assert set(_mesh_var_hits_in_stmt(mod["main"], mesh_vars)) == set(_MESH_VAR_NAMES)
 
     with tvm.transform.PassContext(opt_level=3), tvm.target.Target(target):
         PreLowerSemanticCheck(mod)
         lowered = LowerAndLegalize(mod, target)
 
-    assert _mesh_calls_in_mod(lowered) == []
+    assert _mesh_var_hits_in_mod(lowered, mesh_vars) == []
     assert _thread_extents(lowered["main"])["blockIdx.x"] == 16
 
     with tvm.transform.PassContext(opt_level=3), tvm.target.Target(target):
         optimized = OptimizeForSunmmio(lowered, target)
 
     device_func = _sunmmio_device_func(optimized)
-    assert _mesh_calls_in_mod(optimized) == []
+    assert _mesh_var_hits_in_mod(optimized, mesh_vars) == []
     assert _thread_extents(device_func)["blockIdx.x"] == 16
 
 
@@ -369,20 +426,28 @@ def test_lower_and_optimize_symbolic_mesh_gemm_kernel():
     assert "T.broadcast_" in script
     assert "T.mma_sunmmio" in script
     assert "tl.mesh_" not in script
+    assert "mesh_nrows" not in script
+    assert "mesh_ncols" not in script
 
 
 def test_lower_and_optimize_symbolic_mesh_all_gather_shape_kernel():
     target = _sunmmio_target_with_host()
     mod = _symbolic_mesh_all_gather_mod()
 
-    assert "tl.mesh_ncores" in _mesh_calls_in_stmt(mod["main"])
-    assert "tl.mesh_ncols" in _mesh_calls_in_exprs(_exprs_in_buffer_metadata(mod["main"]))
+    mesh_vars = _mesh_vars(mod["main"])
+    body_hits = _mesh_var_hits_in_stmt(mod["main"], mesh_vars)
+    metadata_hits = _mesh_var_hits_in_exprs(_exprs_in_buffer_metadata(mod["main"]), mesh_vars)
+    assert "mesh_nrows" in body_hits
+    assert "mesh_ncols" in body_hits
+    assert "mesh_ncols" in metadata_hits
     optimized = _lower_and_optimize(mod, target)
 
     device_func = _sunmmio_device_func(optimized)
     script = device_func.script()
     assert "T.broadcast_" in script
     assert "tl.mesh_" not in script
+    assert "mesh_nrows" not in script
+    assert "mesh_ncols" not in script
 
 
 def test_lower_and_optimize_symbolic_mesh_gqa_kernel():
@@ -399,3 +464,5 @@ def test_lower_and_optimize_symbolic_mesh_gqa_kernel():
     assert "V_shared" in script
     assert "T.mma_sunmmio" in script
     assert "tl.mesh_" not in script
+    assert "mesh_nrows" not in script
+    assert "mesh_ncols" not in script

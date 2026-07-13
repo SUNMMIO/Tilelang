@@ -161,6 +161,34 @@ def test_mx_activation_matmul_persistent_codegen_validates_loose(tmp_path, a_dty
     assert_source_contains(src, (mx_token, "suvm.mcast_tok", "suvm.tc.mma"))
 
 
+@pytest.mark.parametrize("a_dtype,mx_token,n,block_n", MX_DTYPE_CASES)
+def test_mx_row_major_activation_matmul_codegen_uses_layout_transform(tmp_path, a_dtype, mx_token, n, block_n):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        matmul_mx_operand_kernel(
+            K=256,
+            N=n,
+            block_N=block_n,
+            block_K=64,
+            a_dtype=a_dtype,
+            b_dtype=T.bfloat16,
+        ),
+        tmp_path,
+        mlir_filename=f"{_dtype_filename(a_dtype)}_row_major_activation_matmul_suvm.mlir",
+        expected_tokens=(
+            mx_token,
+            "suvm.transform_layout_async",
+            "suvm.mcast_tok",
+            "suvm.tc.mma",
+            "#suvm.memory_space<asram>",
+            "#suvm.memory_space<rsram>",
+        ),
+        opt_args=LOOSE_OPT_ARGS,
+    )
+
+    assert "sunmmio.fake" not in src
+    assert_source_contains(src, (mx_token, "suvm.transform_layout_async"))
+
+
 @pytest.mark.parametrize("mx_dtype,mx_token,n,block_n", MX_DTYPE_CASES)
 def test_mx_activation_and_weight_matmul_persistent_codegen_validates_loose(tmp_path, mx_dtype, mx_token, n, block_n):
     src = validate_sunmmio_codegen_with_npuir_opt(

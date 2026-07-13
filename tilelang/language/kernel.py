@@ -95,10 +95,11 @@ def _normalize_bindings(bindings: list[Var]) -> Var | list[Var]:
 
 
 def _is_mesh_ncores_expr(value) -> bool:
-    if not isinstance(value, tir.Call):
+    if not isinstance(value, tir.PrimExpr):
         return False
-    op = tir.op.Op.get("tl.mesh_ncores")
-    return hasattr(value.op, "same_as") and value.op.same_as(op)
+    from tilelang.language.mesh_symbols import mesh_ncores
+
+    return tir.analysis.expr_deep_equal(value, mesh_ncores())
 
 
 def _validate_sunmmio_blocks(blocks: tuple[int | tir.PrimExpr, ...]) -> None:

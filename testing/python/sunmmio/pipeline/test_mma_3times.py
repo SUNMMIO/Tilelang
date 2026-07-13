@@ -67,7 +67,7 @@ def kernel_mma_3times_single_thread(M=16, N=16, K=16, block_M=128, block_N=128, 
 
 
 def test_mma_3times(is_log=False):
-    func = kernel_mma_3times_single_thread(1024, 1024, 1024)
+    func = kernel_mma_3times_single_thread(1536, 1536, 1024)
 
     test_config = {}
     test_config = get_or_add_default_verify(func, test_config)
