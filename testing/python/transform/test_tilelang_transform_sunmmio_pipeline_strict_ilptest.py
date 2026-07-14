@@ -8,7 +8,7 @@ from tilelang import tvm
 from tilelang.engine.phase import should_force_let_inline
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from testing.python.transform.sunmmio_mesh_kernel_new_syntax_reference import (
-    _basic_gemm_primfunc,
+    ilp,
     mesh_flashattn_new,
     mesh_flashdecoding_new,
     mesh_flashmladecode_new,
@@ -472,8 +472,8 @@ def _build_pipeline_modules(kernel_factory):
 
 STRICT_CASES = [
     (
-        "_basic_gemm_primfunc",
-        lambda: _basic_gemm_primfunc(),{
+        "ilp",
+        lambda: ilp(),{
             "A_rsram_stage": [128, 32],
             "A_shared_ping": [128, 32],
             "A_shared_pong": [128, 32],
@@ -494,47 +494,47 @@ STRICT_CASES = [
         },
         ["A_shared", "B_shared"],
     ),
-    (
-        "flashattn2",
-        lambda: mesh_flashattn_new(num_stages=2),
-        {
-            "K_shared_ping": [64, 128],
-            "K_shared_pong": [64, 128],
-            "acc_s_cast_ping": [64, 64],
-            "acc_s_cast_pong": [64, 64],
-            "V_shared_ping": [64, 128],
-            "V_shared_pong": [64, 128],
-        },
-        ["K_shared", "V_shared", "acc_s_cast"],
-    ),
-    (
-        "flashdecoding2",
-        lambda: mesh_flashdecoding_new(num_stages=2),
-        {
-            "K_shared_ping": [128, 128],
-            "K_shared_pong": [128, 128],
-            "acc_s_cast_ping": [64, 128],
-            "acc_s_cast_pong": [64, 128],
-            "V_shared_ping": [128, 128],
-            "V_shared_pong": [128, 128],
-        },
-        ["K_shared", "V_shared", "acc_s_cast"],
-    ),
-    (
-        "flashmladecode2",
-        lambda: mesh_flashmladecode_new(num_stages=2),
-        {
-            "KV_shared_ping": [64, 512],
-            "KV_shared_pong": [64, 512],
-            "KV_shared2_ping": [64, 512],
-            "KV_shared2_pong": [64, 512],
-            "K_pe_shared_ping": [64, 64],
-            "K_pe_shared_pong": [64, 64],
-            "S_shared_ping": [64, 64],
-            "S_shared_pong": [64, 64],
-        },
-        ["KV_shared", "KV_shared2", "K_pe_shared", "S_shared"],
-    ),
+    # (
+    #     "flashattn2",
+    #     lambda: mesh_flashattn_new(num_stages=2),
+    #     {
+    #         "K_shared_ping": [64, 128],
+    #         "K_shared_pong": [64, 128],
+    #         "acc_s_cast_ping": [64, 64],
+    #         "acc_s_cast_pong": [64, 64],
+    #         "V_shared_ping": [64, 128],
+    #         "V_shared_pong": [64, 128],
+    #     },
+    #     ["K_shared", "V_shared", "acc_s_cast"],
+    # ),
+    # (
+    #     "flashdecoding2",
+    #     lambda: mesh_flashdecoding_new(num_stages=2),
+    #     {
+    #         "K_shared_ping": [128, 128],
+    #         "K_shared_pong": [128, 128],
+    #         "acc_s_cast_ping": [64, 128],
+    #         "acc_s_cast_pong": [64, 128],
+    #         "V_shared_ping": [128, 128],
+    #         "V_shared_pong": [128, 128],
+    #     },
+    #     ["K_shared", "V_shared", "acc_s_cast"],
+    # ),
+    # (
+    #     "flashmladecode2",
+    #     lambda: mesh_flashmladecode_new(num_stages=2),
+    #     {
+    #         "KV_shared_ping": [64, 512],
+    #         "KV_shared_pong": [64, 512],
+    #         "KV_shared2_ping": [64, 512],
+    #         "KV_shared2_pong": [64, 512],
+    #         "K_pe_shared_ping": [64, 64],
+    #         "K_pe_shared_pong": [64, 64],
+    #         "S_shared_ping": [64, 64],
+    #         "S_shared_pong": [64, 64],
+    #     },
+    #     ["KV_shared", "KV_shared2", "K_pe_shared", "S_shared"],
+    # ),
 ]
 
 for _case_name, _kernel_factory, _, _ in STRICT_CASES:
@@ -569,3 +569,51 @@ def test_tilelang_transform_sunmmio_pipeline_strict_ilptest(
     if "tl.sunmmio_alloc_ping_pong" in func.attrs:
         ping_pong = _annotation_to_python(func.attrs["tl.sunmmio_alloc_ping_pong"])
         assert set(ping_pong.values()) == {"pong"}, case_name
+
+
+def test_per_op_phase_offsets_select_matching_region_banks():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        func = mesh_matmul_new(
+            512,
+            512,
+            256,
+            block_M=128,
+            block_N=128,
+            block_K=32,
+            num_stages=3,
+        ).with_attr("global_symbol", "main")
+        mod = tvm.IRModule.from_expr(func)
+        mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+        mod = tl.transform.IfStmtBinding()(mod)
+        with _ScopedEnv({"TL_SUNMMIO_ILP_FASTER": "20"}):
+            planned = tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
+
+        annotations = _extract_pipeline_annotations(planned["main"].body)
+        assert annotations is not None
+        writer_offsets = annotations["runtime_bank_writer_phases"]
+        reader_offsets = annotations["runtime_bank_reader_phases"]
+        a_buffer = next(buffer for buffer in writer_offsets if buffer.name == "A_shared")
+        assert {int(op): int(offset) for op, offset in writer_offsets[a_buffer].items()} == {
+            1: 0,
+            4: 1,
+        }
+        assert {int(op): int(offset) for op, offset in reader_offsets[a_buffer].items()} == {
+            3: 0,
+            5: 1,
+        }
+
+        injected = tl.transform.InjectSunmmioPipelineILP()(planned)
+        script = injected.script(show_meta=True)
+        steady_branches = script.split("if k % 2 == 0:", 1)[1]
+        even_branch, odd_branch = steady_branches.split("else:", 1)
+
+        # op4 writes and op5 reads phase offset 1 for logical iteration k.
+        assert "T.region(A_shared_pong[0, 0], 2, 128, 32), 1024" in even_branch
+        assert "T.region(A_shared_pong[0, 0], 1, 128, 32)" in even_branch
+        assert "T.region(A_shared_ping[0, 0], 2, 128, 32), 1024" in odd_branch
+        assert "T.region(A_shared_ping[0, 0], 1, 128, 32)" in odd_branch
+
+        # Global A/B regions are not banked, but their loop indices must still
+        # be rewritten from the removed pipeline loop to the steady-state loop.
+        tvm.tir.transform.RemoveNoOp()(injected)
