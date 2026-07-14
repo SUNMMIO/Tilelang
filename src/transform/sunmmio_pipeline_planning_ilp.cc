@@ -64,6 +64,7 @@ struct FlowSpec {
   int mem{0};
   std::string buffer_name;
   int fixed_bank{-1};
+  int precolor{-1};
   int fp{1};
   int initial_time{0};
   int w_off{0};
@@ -557,6 +558,7 @@ void WriteProblemJson(const Problem& prob, const std::string& path) {
     out << ", \"buffer_name\": ";
     WriteJsonString(out, flow.buffer_name);
     out << ", \"fixed_bank\": " << flow.fixed_bank;
+    out << ", \"precolor\": " << flow.precolor;
     out << ", \"fp\": " << flow.fp;
     out << ", \"initial_time\": " << flow.initial_time;
     out << ", \"w_off\": " << flow.w_off;
@@ -695,19 +697,40 @@ ConflictType AnalyzeWriteReadConflict(int write_start_slot, int write_dur,
   return ConflictType::kNeedSame;
 }
 
+ConflictType MergeConflictRequirements(ConflictType lhs, ConflictType rhs) {
+  if (lhs == ConflictType::kImpossible || rhs == ConflictType::kImpossible) {
+    return ConflictType::kImpossible;
+  }
+  if (lhs == ConflictType::kNone) return rhs;
+  if (rhs == ConflictType::kNone) return lhs;
+  return lhs == rhs ? lhs : ConflictType::kImpossible;
+}
+
+ConflictType AnalyzePrecolorConflict(const FlowSpec& lhs,
+                                     const FlowSpec& rhs) {
+  if (lhs.precolor < 0 || rhs.precolor < 0 || lhs.mem != rhs.mem ||
+      lhs.buffer_name != rhs.buffer_name) {
+    return ConflictType::kNone;
+  }
+  return lhs.precolor == rhs.precolor ? ConflictType::kNeedSame
+                                      : ConflictType::kNeedDifferent;
+}
+
 ConflictType AnalyzeFlowConflict(const FlowSpec& write_flow,
                                  int write_start_time,
                                  const FlowSpec& read_flow,
                                  int read_start_time, int ii) {
+  ConflictType precolor = AnalyzePrecolorConflict(write_flow, read_flow);
   if (write_flow.write_resource < 0 || read_flow.read_resource < 0 ||
       write_flow.mem != read_flow.mem) {
-    return ConflictType::kNone;
+    return precolor;
   }
-  return AnalyzeWriteReadConflict(
+  ConflictType port = AnalyzeWriteReadConflict(
       PositiveMod(write_start_time + write_flow.w_off, ii),
       write_flow.w_dur, ((write_start_time + write_flow.w_off) / ii) & 1,
       PositiveMod(read_start_time + read_flow.r_off, ii), read_flow.r_dur,
       ((read_start_time + read_flow.r_off) / ii) & 1, ii);
+  return MergeConflictRequirements(port, precolor);
 }
 
 int ComputeFoldedOccupancy(int start_time, int duration, int II, int slot) {
@@ -1189,6 +1212,11 @@ class SunmmioStmtAccessAnalyzer : public StmtExprVisitor {
         BufferRegion c_region = NormalizeToBufferRegion(call->args[2]);
         AddAccess(c_region, false);
         AddAccess(c_region, true);
+        return;
+      }
+      if (call->op.same_as(Op::Get("tl.broadcast_"))) {
+        AddAccess(NormalizeToBufferRegion(call->args[0]), false);
+        AddAccess(NormalizeToBufferRegion(call->args[1]), true);
         return;
       }
     }
@@ -2329,6 +2357,108 @@ void BuildTemplateDependencyGraph(
       std::tuple<int, int, const BufferNode*, int>;
   std::set<ConsumerAccessKey> satisfied_consumer_access;
 
+  // Pre-color distinct producer values only when one banked buffer has more
+  // than one writer operation.  A color is a phase offset: physical_bank =
+  // (logical_iteration + phase) % 2.  Readers inherit the phase of the write
+  // that produces their value.
+  std::unordered_map<const BufferNode*, std::map<int, int>> writer_phases;
+  std::map<std::pair<int, int>, int> access_phases;
+  for (const Buffer& buffer : versioned_buffers) {
+    const BufferNode* buf = buffer.get();
+    if (!bank_rotating_versioned.count(buf)) {
+      continue;
+    }
+    std::vector<int> writer_ids;
+    for (const TemplateCommand& cmd : commands) {
+      bool writes_buffer = false;
+      for (const AccessInfo& access : cmd.accesses) {
+        writes_buffer = writes_buffer ||
+                        (access.is_write && access.buffer().get() == buf);
+      }
+      if (writes_buffer) {
+        writer_ids.push_back(cmd.id);
+      }
+    }
+    if (writer_ids.size() <= 1) {
+      continue;
+    }
+    for (size_t i = 0; i < writer_ids.size(); ++i) {
+      writer_phases[buf][writer_ids[i]] = static_cast<int>(i & 1);
+    }
+  }
+
+  for (const TemplateCommand& cmd : commands) {
+    for (int access_idx = 0;
+         access_idx < static_cast<int>(cmd.accesses.size()); ++access_idx) {
+      const AccessInfo& access = cmd.accesses[access_idx];
+      const BufferNode* buf = access.buffer().get();
+      auto phase_group = writer_phases.find(buf);
+      if (phase_group == writer_phases.end()) {
+        continue;
+      }
+      if (access.is_write) {
+        access_phases[{cmd.id, access_idx}] = phase_group->second.at(cmd.id);
+        continue;
+      }
+
+      int producer_phase = -1;
+      int producer_iter_delta = 0;
+      for (int producer_id = cmd.id - 1;
+           producer_id >= 0 && producer_phase < 0; --producer_id) {
+        const TemplateCommand& producer = commands[producer_id];
+        for (int producer_access_idx =
+                 static_cast<int>(producer.accesses.size()) - 1;
+             producer_access_idx >= 0; --producer_access_idx) {
+          const AccessInfo& producer_access =
+              producer.accesses[producer_access_idx];
+          if (!producer_access.is_write ||
+              producer_access.buffer().get() != buf) {
+            continue;
+          }
+          if (!PipelineRegionIntersect(
+                  MaterializeBufferRegion(producer_access.region,
+                                          pipeline_loop_var, 0)->region,
+                  MaterializeBufferRegion(access.region, pipeline_loop_var,
+                                          0)->region)) {
+            continue;
+          }
+          producer_phase = phase_group->second.at(producer_id);
+          break;
+        }
+      }
+      // A read before its producer in template order consumes the previous
+      // logical iteration of the last matching writer.
+      for (int producer_id = static_cast<int>(commands.size()) - 1;
+           producer_id >= cmd.id && producer_phase < 0; --producer_id) {
+        const TemplateCommand& producer = commands[producer_id];
+        for (int producer_access_idx =
+                 static_cast<int>(producer.accesses.size()) - 1;
+             producer_access_idx >= 0; --producer_access_idx) {
+          const AccessInfo& producer_access =
+              producer.accesses[producer_access_idx];
+          if (!producer_access.is_write ||
+              producer_access.buffer().get() != buf) {
+            continue;
+          }
+          if (!PipelineRegionIntersect(
+                  MaterializeBufferRegion(producer_access.region,
+                                          pipeline_loop_var, -1)->region,
+                  MaterializeBufferRegion(access.region, pipeline_loop_var,
+                                          0)->region)) {
+            continue;
+          }
+          producer_phase = phase_group->second.at(producer_id);
+          producer_iter_delta = 1;
+          break;
+        }
+      }
+      if (producer_phase >= 0) {
+        access_phases[{cmd.id, access_idx}] =
+            (producer_phase + producer_iter_delta) & 1;
+      }
+    }
+  }
+
   auto version_mod = [&](const BufferNode* buf) {
     if (iter_mod <= 0) {
       return 0;
@@ -2515,8 +2645,13 @@ void BuildTemplateDependencyGraph(
     if (it == flow_key_to_index.end()) {
       int flow_index = static_cast<int>(problem->flows.size());
       flow_key_to_index[flow_key] = flow_index;
-      problem->flows.push_back(
-          MakeInternalFlowSpec(*problem, src_id, dst_id, delta, mem, buf->name));
+      FlowSpec flow =
+          MakeInternalFlowSpec(*problem, src_id, dst_id, delta, mem, buf->name);
+      auto phase = access_phases.find({src_id, src_access_idx});
+      if (phase != access_phases.end()) {
+        flow.precolor = phase->second;
+      }
+      problem->flows.push_back(std::move(flow));
     } else {
       problem->flows[it->second].delta =
           std::min(problem->flows[it->second].delta, delta);
@@ -2562,12 +2697,20 @@ void BuildTemplateDependencyGraph(
 
   auto access_version = [&](const BufferNode* buf,
                             const ExpandedCommand& command,
-                            const AccessInfo& access) {
+                            const AccessInfo& access, int access_idx) {
     int mod = version_mod(buf);
     if (mod <= 0) {
       return command.iter + access.iter_offset;
     }
-    return PositiveMod(command.iter + access.iter_offset, mod);
+    int logical_iter = command.iter + access.iter_offset;
+    auto phase = access_phases.find({command.template_id, access_idx});
+    if (phase == access_phases.end() || mod < 2) {
+      return PositiveMod(logical_iter, mod);
+    }
+    int versions_per_bank = mod / 2;
+    int bank = PositiveMod(logical_iter + phase->second, 2);
+    int version_in_bank = PositiveMod(logical_iter / 2, versions_per_bank);
+    return version_in_bank * 2 + bank;
   };
 
   auto materialize_access = [&](const ExpandedCommand& command,
@@ -2609,8 +2752,8 @@ void BuildTemplateDependencyGraph(
         const ExpandedCommand& src_cmd = expanded_commands[it->expanded_idx];
         const AccessInfo& src_access = src_cmd.cmd->accesses[it->access_idx];
         if (versioned.count(buf) &&
-            access_version(buf, src_cmd, src_access) !=
-                access_version(buf, curr_cmd, dst_access)) {
+            access_version(buf, src_cmd, src_access, it->access_idx) !=
+                access_version(buf, curr_cmd, dst_access, dst_access_idx)) {
           continue;
         }
         if (it->type != AccessType::kWrite ||
@@ -2649,8 +2792,8 @@ void BuildTemplateDependencyGraph(
         const ExpandedCommand& src_cmd = expanded_commands[it->expanded_idx];
         const AccessInfo& src_access = src_cmd.cmd->accesses[it->access_idx];
         if (versioned.count(buf) &&
-            access_version(buf, src_cmd, src_access) !=
-                access_version(buf, curr_cmd, dst_access)) {
+            access_version(buf, src_cmd, src_access, it->access_idx) !=
+                access_version(buf, curr_cmd, dst_access, dst_access_idx)) {
           continue;
         }
         if (!PipelineRegionIntersect(dst_region->region, it->region->region)) {
@@ -3461,7 +3604,14 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
       if (flow_pos == internal_pos.end()) {
         continue;
       }
-      int bank_phase = sol.z_bank[flow_pos->second];
+      // Export one phase-offset convention for every runtime bank annotation:
+      //   physical_bank = (logical_iter_parity + phase_offset) % 2
+      // Physical bank 0 is ping and bank 1 is pong.  The offset itself is not
+      // a fixed ping/pong selection because it flips with the logical iteration.
+      int phase_offset = sol.z_bank[flow_pos->second];
+      ICHECK(phase_offset == 0 || phase_offset == 1)
+          << "ILP bank phase offset must be binary for flow " << flow.prod
+          << " -> " << flow.cons;
       bool allow_resident_to_own_bank =
           flow.resident && !has_non_resident_flow.count(flow.buffer_name);
       // Keep per-op bank metadata as the primary source of truth. A single
@@ -3477,13 +3627,15 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
       if (!flow.resident || allow_resident_to_own_bank) {
         auto it = analysis->runtime_bank_start_phases.find(flow.buffer_name);
         if (it == analysis->runtime_bank_start_phases.end()) {
-          analysis->runtime_bank_start_phases[flow.buffer_name] = bank_phase;
-        } else if (it->second != bank_phase) {
-          LOG(WARNING)
-              << "Ignoring conflicting aggregate bank phase for buffer "
-              << flow.buffer_name << ": existing=" << it->second
-              << " new=" << bank_phase
-              << ". Per-op bank metadata will be used instead.";
+          analysis->runtime_bank_start_phases[flow.buffer_name] = phase_offset;
+        } else if (it->second != phase_offset) {
+          if (flow.precolor < 0) {
+            LOG(WARNING)
+                << "Ignoring conflicting aggregate bank phase for buffer "
+                << flow.buffer_name << ": existing=" << it->second
+                << " new=" << phase_offset
+                << ". Per-op bank metadata will be used instead.";
+          }
         }
         int delta_parity = flow.delta & 1;
         auto it_delta =
@@ -3506,22 +3658,24 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
         auto& writer_map = analysis->runtime_bank_writer_phases[flow.buffer_name];
         auto it_writer = writer_map.find(flow.prod);
         if (it_writer == writer_map.end()) {
-          writer_map[flow.prod] = bank_phase;
+          writer_map[flow.prod] = phase_offset;
         } else {
-          ICHECK_EQ(it_writer->second, bank_phase)
+          ICHECK_EQ(it_writer->second, phase_offset)
               << "Conflicting writer bank phase for banked buffer "
               << flow.buffer_name << " op " << flow.prod;
         }
       }
       if (flow.cons >= 0 && flow.read_resource >= 0) {
-        int reader_phase =
-            flow.resident ? bank_phase : ((bank_phase + (flow.delta & 1)) & 1);
+        int reader_phase_offset = flow.resident
+                                      ? phase_offset
+                                      : ((phase_offset + (flow.delta & 1)) & 1);
+        ICHECK(reader_phase_offset == 0 || reader_phase_offset == 1);
         auto& reader_map = analysis->runtime_bank_reader_phases[flow.buffer_name];
         auto it_reader = reader_map.find(flow.cons);
         if (it_reader == reader_map.end()) {
-          reader_map[flow.cons] = reader_phase;
+          reader_map[flow.cons] = reader_phase_offset;
         } else {
-          ICHECK_EQ(it_reader->second, reader_phase)
+          ICHECK_EQ(it_reader->second, reader_phase_offset)
               << "Conflicting reader bank phase for banked buffer "
               << flow.buffer_name << " op " << flow.cons;
         }
@@ -3590,6 +3744,24 @@ class SunmmioPipelinePlannerILP : public StmtExprMutator {
     For loop = ffi::GetRef<For>(op);
     if (op->annotations.find("num_stages") == op->annotations.end()) {
       return StmtExprMutator::VisitStmt_(op);
+    }
+
+    // A single logical iteration has no cross-iteration overlap to schedule.
+    // Leaving it in the ILP window model can manufacture an out-of-range
+    // prologue/epilogue iteration when the solved makespan spans two IIs.
+    arith::Analyzer extent_analyzer;
+    PrimExpr simplified_extent = extent_analyzer.Simplify(op->extent);
+    if (const auto* extent = simplified_extent.as<IntImmNode>();
+        extent != nullptr && extent->value <= 1) {
+      For sequential = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+      Map<String, Any> annotations;
+      for (const auto& kv : sequential->annotations) {
+        if (kv.first != "num_stages") {
+          annotations.Set(kv.first, kv.second);
+        }
+      }
+      sequential.CopyOnWrite()->annotations = annotations;
+      return sequential;
     }
 
     const SeqStmtNode* pipeline_body_seq = GetPipelineBodySeq(loop);

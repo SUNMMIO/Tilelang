@@ -747,6 +747,10 @@ private:
     ICHECK_GE(logical_iter_parity, 0)
         << "Dynamic bank parity must resolve before selecting ping/pong for "
         << buffer->name;
+    // Bank annotations store a phase offset relative to the logical iteration:
+    //   physical_bank = (logical_iter_parity + phase_offset) % 2
+    // Physical bank 0 is ping and physical bank 1 is pong.  Annotation value
+    // 0 therefore means "same phase as the iteration", not "always ping".
     int bank = -1;
     if (current_stmt_id_ >= 0) {
       if (is_read) {
@@ -823,7 +827,17 @@ private:
       if (!rewritten_buffers_.count(buffer.get())) {
         continue;
       }
-      Buffer target_buffer = ResolveTargetBuffer(buffer, /*is_read=*/false);
+      ICHECK_GT(call->args.size(), static_cast<size_t>(i + 3));
+      int access_mask = 2;
+      if (const auto* imm = call->args[i + 3].as<IntImmNode>()) {
+        access_mask = imm->value;
+      }
+      ICHECK_NE(access_mask & 3, 0)
+          << "tvm_access_ptr must carry a read/write access mask";
+      // Read-write accesses select the writer version.  For a banked
+      // read-write operation its reader and writer offsets must agree.
+      bool is_read = (access_mask & 2) == 0;
+      Buffer target_buffer = ResolveTargetBuffer(buffer, is_read);
       PrimExpr new_index = call->args[i + 1];
       int version_axis = VersionAxis(buffer);
       if (version_axis >= 0) {
@@ -839,12 +853,22 @@ private:
   PrimExpr RewriteRegionExpr(const Call& call) {
     RegionOp original_region(call->args);
     Buffer original_buffer = original_region->GetBuffer();
-    if (!rewritten_buffers_.count(original_buffer.get())) {
-      return call;
+    Buffer target_buffer = original_buffer;
+    if (rewritten_buffers_.count(original_buffer.get())) {
+      int access_mask = original_region->GetAccessMask();
+      ICHECK_NE(access_mask & 3, 0)
+          << "tl.region must carry a read/write access mask";
+      // Region masks use 1=read, 2=write, 3=read-write.  A destination region
+      // must use the per-op writer offset; treating it as a reader can map the
+      // producer and consumer of one logical value to different ping/pong banks.
+      bool is_read = (access_mask & 2) == 0;
+      target_buffer = ResolveTargetBuffer(original_buffer, is_read);
     }
-
-    Buffer target_buffer = ResolveTargetBuffer(original_buffer, /*is_read=*/true);
-    Array<Range> new_ranges = original_region->GetRanges();
+    Array<Range> new_ranges;
+    for (const Range& range : original_region->GetRanges()) {
+      new_ranges.push_back(Range::FromMinExtent(
+          VisitExpr(range->min), VisitExpr(range->extent)));
+    }
     int version_axis = VersionAxis(original_buffer);
     if (version_axis >= 0) {
       new_ranges.Set(version_axis,
@@ -903,12 +927,15 @@ private:
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
+    // A RegionOp encodes its buffer as a transport-only BufferLoad.  Rewrite
+    // the region as a unit before generic recursion, otherwise that carrier
+    // BufferLoad selects a bank once and RewriteRegionExpr selects it again.
+    if (op->op.same_as(RegionOp::Get())) {
+      return RewriteRegionExpr(tvm::ffi::GetRef<Call>(op));
+    }
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
     if (call->op.same_as(builtin::tvm_access_ptr())) {
       return RewriteBufferAccess(call, {1});
-    }
-    if (call->op.same_as(RegionOp::Get())) {
-      return RewriteRegionExpr(call);
     }
     return call;
   }
@@ -965,7 +992,6 @@ private:
     auto iterations_anno = op->annotations.Get("iterations");
     auto ii_anno = op->annotations.Get("ii");
     auto makespan_anno = op->annotations.Get("makespan");
-    auto stage_count_anno = op->annotations.Get("stage_count");
     auto steady_state_max_iter_offset_anno =
         op->annotations.Get("steady_state_max_iter_offset");
     auto used_buffers_anno = op->annotations.Get("used_buffers");
@@ -1085,8 +1111,6 @@ private:
     int ii = ii_anno ? Downcast<IntImm>(ii_anno.value())->value : iterations;
     int makespan =
         makespan_anno ? Downcast<IntImm>(makespan_anno.value())->value : -1;
-    int stage_count =
-        stage_count_anno ? Downcast<IntImm>(stage_count_anno.value())->value : -1;
     int steady_state_max_iter_offset =
         steady_state_max_iter_offset_anno
             ? Downcast<IntImm>(steady_state_max_iter_offset_anno.value())->value
@@ -1286,17 +1310,22 @@ private:
       body = rewritten_body;
     }
 
+    // Order iteration numbers are logical offsets from the steady-state loop
+    // variable.  The largest body offset, rather than the number of ILP sample
+    // iterations or time stages, determines how many steady-state bases fit in
+    // the original loop.
     PrimExpr extent =
-        stage_count > 0 ? max(0, for_node->extent + 1 - stage_count)
-                        : max(0, for_node->extent - steady_state_max_iter_offset);
+        max(0, for_node->extent - steady_state_max_iter_offset);
     For new_for_stmt =
         For(for_node->loop_var, PrimExpr(0), extent, ForKind::kSerial,
             SeqStmt::Flatten(body), for_node->thread_binding, {});
     for_body.push_back(new_for_stmt);
 
     // Step 3.3: Rewrite the epilogue.
-    PrimExpr epilogue_base =
-        max(0, extent - (iterations - 1)) + for_node->min;
+    // Epilogue order offsets complete the final steady-state base.  `iterations`
+    // is only the finite window used to solve the ILP and must not shift the
+    // logical iteration selected here.
+    PrimExpr epilogue_base = max(0, extent - 1) + for_node->min;
     for (const auto &order_str : epilogue_orders) {
       int iter_offset = name2iter(order_str);
       int id = name2id(order_str);
@@ -1328,7 +1357,9 @@ class ResidentPingPongInitializer : public StmtMutator {
       for (const Buffer& buffer :
            Downcast<Array<Buffer>>(residents.value())) {
         auto it = peer_map.find(buffer);
-        if (it == peer_map.end()) continue;
+        ICHECK(it != peer_map.end())
+            << "Resident banked buffer " << buffer->name
+            << " must have a ping/pong peer";
         rewriter.resident_buffers_.insert(buffer.get());
         rewriter.peer_remap_.Set(buffer, (*it).second);
       }
@@ -1345,12 +1376,13 @@ class ResidentPingPongInitializer : public StmtMutator {
         writes = writes || resident_buffers_.count(store->buffer.get());
         return;
       }
-      const auto* evaluate = node.as<EvaluateNode>();
-      if (evaluate == nullptr) return;
-      const auto* call = evaluate->value.as<CallNode>();
-      if (call == nullptr || !call->op.same_as(dma_copy())) return;
-      BufferRegion dst = NormalizeToBufferRegion(call->args[1]);
-      writes = writes || resident_buffers_.count(dst->buffer.get());
+      const auto* call = node.as<CallNode>();
+      if (call == nullptr || !call->op.same_as(RegionOp::Get())) return;
+      RegionOp region(call->args);
+      if ((region->GetAccessMask() & 2) != 0) {
+        writes = writes ||
+                 resident_buffers_.count(region->GetBuffer().get());
+      }
     });
     return writes;
   }
