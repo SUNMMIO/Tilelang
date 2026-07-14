@@ -2,18 +2,18 @@ import math
 import pytest
 
 import tilelang.language as T
+from tilelang.language.mesh_symbols import mesh_ncols, mesh_nrows
 from tilelang.language.mesh_tensor import MeshTensorProxy, MeshShardingPolicy, MeshReplicationType
 from tilelang.layout import make_zz_layout, make_zn_layout
 from tvm import tir
 
 
-def _expr_has_call(expr, op_name):
+def _expr_has_var(expr, var):
     found = False
-    op = tir.op.Op.get(op_name)
 
     def visit(node):
         nonlocal found
-        if isinstance(node, tir.Call) and hasattr(node.op, "same_as") and node.op.same_as(op):
+        if isinstance(node, tir.Var) and node.same_as(var):
             found = True
 
     tir.stmt_functor.post_order_visit(expr, visit)
@@ -206,8 +206,8 @@ def test_call_method_defaults_to_symbolic_mesh_config():
 
     result = proxy((128, 256), policy, "float32")
 
-    assert _expr_has_call(result.buffer.shape[0], "tl.mesh_nrows")
-    assert _expr_has_call(result.buffer.shape[1], "tl.mesh_ncols")
+    assert _expr_has_var(result.buffer.shape[0], mesh_nrows())
+    assert _expr_has_var(result.buffer.shape[1], mesh_ncols())
     assert result.buffer.dtype == "float32"
 
 

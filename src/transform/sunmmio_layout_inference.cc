@@ -474,9 +474,10 @@ void SunmmioLayoutInferencePass::PropagateAliases() {
       if (it != layout_entries_.end() && it->second.level > InferLevel::kFree)
         continue;
 
-      // Try DeriveLayoutLike for shape adaptation
-      auto derived = DeriveLayoutLike(rep_layout, buf->shape,
-                                      Optional<Array<Integer>>(), &analyzer_);
+      // Try dtype-aware layout derivation for shape adaptation.
+      auto derived =
+          DeriveLayoutLikeForDType(rep_layout, buf->shape, buf->dtype,
+                                   Optional<Array<Integer>>(), &analyzer_);
       if (derived.defined()) {
         TryAssign(buf, derived.value(), InferLevel::kCommon, -1);
       } else if (!layout_entries_.count(buf)) {
