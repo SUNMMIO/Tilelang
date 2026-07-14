@@ -2,8 +2,7 @@
  * \file legalize_sunmmio_datapath.cc
  * \brief Legalize unsupported Sunmmio data-transfer paths.
  *
- * Stages unsupported global -> HLink communication, global -> shared.asram
- * copies, and casting RSRAM -> global/ASRAM/WSRAM copies through RSRAM.
+ * Stages unsupported copy and communication paths through RSRAM.
  */
 
 #include <tvm/ffi/reflection/registry.h>
@@ -30,39 +29,10 @@ namespace tl {
 using namespace tir;
 using namespace tir::transform;
 
-/** Builds a compact 0-based region that preserves the original extents. */
-Array<Range> MakeCompactRegionForStage(const Array<Range> &region) {
-  Array<Range> compact_region;
-  compact_region.reserve(region.size());
-  for (const Range &range : region) {
-    compact_region.push_back(Range::FromMinExtent(0, range->extent));
-  }
-  return compact_region;
-}
-
-/** Creates a compact temporary buffer whose shape matches the staged region. */
-Buffer MakeCompactBufferWithScope(const Buffer &buffer,
-                                  const Array<Range> &region,
-                                  const std::string &scope,
-                                  const std::string &name) {
-  const auto *ptr_type = buffer->data->type_annotation.as<PointerTypeNode>();
-  ICHECK(ptr_type != nullptr);
-  Type new_type = PointerType(ptr_type->element_type, scope);
-  Var new_var = Var(name, new_type);
-  Array<PrimExpr> shape;
-  shape.reserve(region.size());
-  for (const Range &range : region) {
-    shape.push_back(range->extent);
-  }
-  return Buffer(new_var, buffer->dtype, shape, {}, Integer(0), name,
-                buffer->data_alignment, buffer->offset_factor,
-                buffer->buffer_type);
-}
-
 class LegalizeSunmmioDataPathPass : public arith::IRMutatorWithAnalyzer {
 public:
-  explicit LegalizeSunmmioDataPathPass(arith::Analyzer *analyzer)
-      : arith::IRMutatorWithAnalyzer(analyzer) {}
+  LegalizeSunmmioDataPathPass(arith::Analyzer *analyzer, Target target)
+      : arith::IRMutatorWithAnalyzer(analyzer), target_(std::move(target)) {}
 
   /** Legalize unsupported Sunmmio data paths before tile-op lowering. */
   static PrimFunc Substitute(PrimFunc f) {
@@ -72,31 +42,27 @@ public:
     }
 
     arith::Analyzer analyzer;
-    LegalizeSunmmioDataPathPass rewriter(&analyzer);
+    LegalizeSunmmioDataPathPass rewriter(&analyzer, target.value());
     auto *fptr = f.CopyOnWrite();
     fptr->body = rewriter.VisitStmt(f->body);
     return f;
   }
 
 private:
-  // `proto` supplies the staging buffer's dtype, element type and name;
-  // `region` its shape. They are the same buffer for a plain scope-route stage,
-  // but differ for a cast stage (proto = dst, so the staging buffer takes the
-  // dst dtype and the prepended copy performs the cast).
-  Buffer CreateStageBuffer(const Buffer &proto, const Array<Range> &region) {
+  BufferRegion CreateStageRegion(const Buffer &stage_template,
+                                 const Array<Range> &region) {
     ICHECK(!alloc_buffer_stack_.empty())
         << "LegalizeSunmmioDataPath expects data-transfer ops to appear "
            "inside a block.";
-    Array<Range> compact_range = MakeCompactRegionForStage(region);
-    std::string name = proto->name + "_rsram_stage";
+    std::string name = stage_template->name + "_rsram_stage";
     if (temp_buffer_counter_ != 0) {
       name += "_" + std::to_string(temp_buffer_counter_);
     }
     ++temp_buffer_counter_;
-    Buffer temp = MakeCompactBufferWithScope(proto, compact_range,
-                                             kSunmmioScopeRSRAM, name);
-    alloc_buffer_stack_.back().push_back(temp);
-    return temp;
+    Buffer stage =
+        MakeCompactBufferLike(stage_template, region, kSunmmioScopeRSRAM, name);
+    alloc_buffer_stack_.back().push_back(stage);
+    return BufferRegion(stage, MakeCompactRegion(region));
   }
 
   Stmt VisitStmt_(const BlockNode *op) final {
@@ -136,54 +102,78 @@ private:
     BufferRegion src_br = NormalizeToBufferRegion(call->args[0]);
     BufferRegion dst_br = NormalizeToBufferRegion(call->args[1]);
 
-    const std::string src_scope = src_br->buffer.scope();
-    const std::string dst_scope = dst_br->buffer.scope();
-
-    // A4E DRAM reads use ODMA0, while HLink writes use ODMA1. Such source
-    // leaves must first load into RSRAM. VLink can read DRAM directly.
-    bool stage_global = src_scope == "global" &&
-                        ((is_copy && dst_scope == kSunmmioScopeASRAM) ||
-                         (is_communication && IsSunmmioSramScope(dst_scope) &&
-                          CommunicationSourceMayUseHLink(call)));
-    // A cast from RSRAM to another DMA scope must run on the tile unit first.
-    bool stage_cast = src_scope == kSunmmioScopeRSRAM &&
-                      dst_scope != kSunmmioScopeRSRAM &&
-                      src_br->buffer->dtype != dst_br->buffer->dtype;
-    if (!stage_global && !stage_cast) {
+    const Buffer &src = src_br->buffer;
+    const Buffer &dst = dst_br->buffer;
+    CommunicationDirections communication_directions =
+        CommunicationDirections::kNone;
+    if (is_copy && SupportsSunmmioDirectCopy(target_, src.scope(), src->dtype,
+                                             dst.scope(), dst->dtype)) {
       return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
 
-    // Cast path stages with the dst dtype (so the prepended copy casts);
-    // scope-route path stages with the src dtype.
-    const Buffer &proto = stage_cast ? dst_br->buffer : src_br->buffer;
-    Buffer staging = CreateStageBuffer(proto, src_br->region);
-    Array<Range> staging_range = MakeCompactRegionForStage(src_br->region);
+    if (!is_copy) {
+      communication_directions =
+          GetCommunicationSourceDirections(call, target_);
+      if (SupportsSunmmioDirectCommunication(target_, communication_directions,
+                                             src.scope(), src->dtype,
+                                             dst.scope(), dst->dtype)) {
+        return IRMutatorWithAnalyzer::VisitStmt_(op);
+      }
+    }
 
-    // 1. Copy: src -> RSRAM staging buffer (casts when src/dst dtypes differ).
-    PrimExpr src_region = MakeRegionExpr(src_br->buffer, src_br->region, 1);
-    PrimExpr staging_write = MakeRegionExpr(staging, staging_range, 2);
+    // Staging preserves the source dtype unless an RSRAM copy needs a cast.
+    Buffer stage_template = src;
+    if (is_copy && src.scope() == kSunmmioScopeRSRAM) {
+      ICHECK(src->dtype != dst->dtype)
+          << "Unsupported copy from " << src.scope() << " to " << dst.scope()
+          << " of Sunmmio target.";
+      stage_template = dst;
+    } else if (!is_copy) {
+      ICHECK(src.scope() != kSunmmioScopeRSRAM)
+          << "Unsupported communication path from " << src.scope() << " to "
+          << dst.scope() << " of Sunmmio target.";
+    }
+
+    BufferRegion staging = CreateStageRegion(stage_template, src_br->region);
+    ICHECK(SupportsSunmmioDirectCopy(target_, src.scope(), src->dtype,
+                                     staging->buffer.scope(),
+                                     staging->buffer->dtype))
+        << "Unsupported copy from " << src.scope() << " to " << dst.scope()
+        << " of Sunmmio target.";
+    if (!is_copy) {
+      ICHECK(SupportsSunmmioDirectCommunication(
+          target_, communication_directions, staging->buffer.scope(),
+          staging->buffer->dtype, dst.scope(), dst->dtype))
+          << "Unsupported communication path from " << src.scope() << " to "
+          << dst.scope() << " of Sunmmio target.";
+    }
+
+    PrimExpr src_region = MakeRegionExpr(src, src_br->region, 1);
+    PrimExpr staging_write =
+        MakeRegionExpr(staging->buffer, staging->region, 2);
     Map<String, ObjectRef> copy_annotations =
         is_copy ? call->annotations : Map<String, ObjectRef>();
     Stmt copy_stmt =
         Evaluate(Call(DataType::Handle(), Copy::Get(),
                       {src_region, staging_write}, copy_annotations));
 
-    // 2. Rewrite original op: replace src (args[0]) with staging region.
-    PrimExpr staging_read = MakeRegionExpr(staging, staging_range, 1);
     Array<PrimExpr> new_args;
-    new_args.push_back(staging_read);
+    new_args.push_back(MakeRegionExpr(staging->buffer, staging->region, 1));
     for (size_t i = 1; i < call->args.size(); i++) {
       new_args.push_back(call->args[i]);
     }
     Stmt rewritten = Evaluate(
         Call(call->dtype, Downcast<Op>(call->op), new_args, call->annotations));
+    if (is_copy) {
+      rewritten = VisitStmt(rewritten);
+    }
 
-    Array<Stmt> seq{copy_stmt, rewritten};
-    return SeqStmt::Flatten(seq);
+    return SeqStmt::Flatten(Array<Stmt>{copy_stmt, rewritten});
   }
 
   std::vector<Array<Buffer>> alloc_buffer_stack_;
   int temp_buffer_counter_ = 0;
+  Target target_;
 };
 
 Pass LegalizeSunmmioDataPath() {

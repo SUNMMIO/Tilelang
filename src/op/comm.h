@@ -165,19 +165,29 @@ public:
   static const Op &Get();
 };
 
+/** Mesh directions in which a communication call consumes its source. */
+enum class CommunicationDirections {
+  kNone,
+  kHorizontal,
+  kVertical,
+  kHorizontalAndVertical,
+};
+
 /**
  * \brief Whether a TIR call is an inter-core communication tile op.
  */
 TVM_DLL bool IsCommunicationOp(const Call &call);
 
 /**
- * \brief Whether the leaf consuming a communication call's source may use
- * HLink.
+ * \brief Mesh directions in which a communication call consumes its original
+ * source.
  *
  * Two-dimensional broadcast and allgather use different first-phase
- * directions. Put is conservative because its route may be dynamic.
+ * directions. Fixed put routes are derived from their core coordinates;
+ * dynamic put routes conservatively return both directions.
  */
-TVM_DLL bool CommunicationSourceMayUseHLink(const Call &call);
+TVM_DLL CommunicationDirections
+GetCommunicationSourceDirections(const Call &call, Target target);
 
 class AllreduceOpNode : public TileOperatorNode {
 public:

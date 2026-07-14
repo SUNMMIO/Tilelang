@@ -551,7 +551,8 @@ bool IsCommunicationOp(const Call &call) {
          call->op.same_as(PutOp::Get()) || call->op.same_as(AllgatherOp::Get());
 }
 
-bool CommunicationSourceMayUseHLink(const Call &call) {
+CommunicationDirections GetCommunicationSourceDirections(const Call &call,
+                                                         Target target) {
   ICHECK(IsCommunicationOp(call));
   TileOperator tile_op = ParseOperator(call);
   ICHECK(tile_op.defined());
@@ -559,22 +560,31 @@ bool CommunicationSourceMayUseHLink(const Call &call) {
     ICHECK(broadcast->direction >= 0 && broadcast->direction <= 2)
         << "Invalid broadcast direction " << broadcast->direction;
     // "all" starts vertically; its horizontal phase reads the destination.
-    return broadcast->direction == 0;
+    return broadcast->direction == 0 ? CommunicationDirections::kHorizontal
+                                     : CommunicationDirections::kVertical;
   }
   if (const auto *allgather = tile_op.as<AllgatherOpNode>()) {
     ICHECK(allgather->direction >= 0 && allgather->direction <= 2)
         << "Invalid allgather direction " << allgather->direction;
-    // "all" starts horizontally from the original source.
-    // TODO: A vertical-first lowering could avoid staging if it preserves the
-    // existing row-major core-slot order.
-    return allgather->direction != 1;
+    // "all" starts horizontally; its vertical phase reads the destination.
+    return allgather->direction == 1 ? CommunicationDirections::kVertical
+                                     : CommunicationDirections::kHorizontal;
   }
-  if (tile_op.as<PutOpNode>()) {
-    // Put derives its route from core coordinates, which may be dynamic.
-    return true;
+  if (const auto *put = tile_op.as<PutOpNode>()) {
+    const auto *src_core = put->src_core.as<IntImmNode>();
+    const auto *dst_core = put->dst_core.as<IntImmNode>();
+    if (src_core == nullptr || dst_core == nullptr) {
+      return CommunicationDirections::kHorizontalAndVertical;
+    }
+
+    int mesh_ncol = GetSunmmioMeshConfig(target).ncol;
+    bool same_row = src_core->value / mesh_ncol == dst_core->value / mesh_ncol;
+    // Diagonal put starts vertically; its horizontal phase reads dst.
+    return same_row ? CommunicationDirections::kHorizontal
+                    : CommunicationDirections::kVertical;
   }
   LOG(FATAL) << "Expected broadcast, put, or allgather communication op";
-  return true;
+  return CommunicationDirections::kNone;
 }
 
 TileOperator AllgatherOpNode::Clone() const {

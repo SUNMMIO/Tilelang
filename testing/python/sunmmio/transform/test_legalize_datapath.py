@@ -417,7 +417,7 @@ def gemm_broadcast_from_dram(M, N, K, block_M, block_N, block_K, dtype=T.float16
 def gemm_put_from_dram(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32):
     """Build a GEMM kernel where A is loaded via put from DRAM.
 
-    A is put from DRAM (core 0,0) to A_shared (core 1,1), and A_shared is used
+    A is put from DRAM (core 0,0) to A_shared (core 0,1), and A_shared is used
     as the left operand of T.gemm. InferSramScope should assign A_shared to
     shared.asram, triggering DRAM->ASRAM legalization for the put.
     """
@@ -436,7 +436,7 @@ def gemm_put_from_dram(M, N, K, block_M, block_N, block_K, dtype=T.float16, accu
             for bx in T.serial(T.ceildiv(N, block_N)):
                 for by in T.serial(T.ceildiv(M, block_M)):
                     T.clear(C_shared)
-                    T.comm.put(A, A_shared, (0, 0), (1, 1))
+                    T.comm.put(A, A_shared, (0, 0), (0, 1))
                     for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
                         T.copy(B[k * block_K, bx * block_N], B_shared)
                         T.gemm(A_shared, B_shared, C_shared)
@@ -777,6 +777,85 @@ def cast_copy_rsram_to_dram(block_M, block_N, src_dtype=T.float32, dst_dtype=T.f
             T.copy(value, Y)
 
     return tvm.IRModule({"main": main})
+
+
+def cast_copy_dram_to_sram(block_M, block_N, dst_scope, src_dtype=T.float32, dst_dtype=T.float16):
+    """Build a DRAM-to-SRAM copy that also requires dtype conversion."""
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((block_M, block_N), src_dtype),
+    ):
+        with T.Kernel():
+            result = T.alloc_shared((block_M, block_N), dst_dtype, scope=dst_scope)
+            T.copy(X, result)
+
+    return tvm.IRModule({"main": main})
+
+
+def test_legalize_sunmmio_datapath_casts_dram_to_rsram():
+    """DRAM loads before an RSRAM cast, requiring one source-dtype stage."""
+    target = determine_target("Sunmmio", return_object=True)
+
+    with tvm.target.Target(target):
+        mod = run_legalize_sunmmio_datapath_no_infer_scope(
+            cast_copy_dram_to_sram(32, 32, "shared.rsram"),
+            target,
+        )
+
+    func = mod["main"]
+    root_block = next(block for block in extract_blocks(func) if block.name_hint == "tilelang_root")
+    copy_edges = extract_copy_edges(func)
+
+    stage_buffers = [buf for buf in root_block.alloc_buffers if buf.name.startswith("X_rsram_stage")]
+    assert len(stage_buffers) == 1
+    assert stage_buffers[0].scope() == "shared.rsram"
+    assert str(stage_buffers[0].dtype) == "float32"
+
+    load_leg = [edge for edge in copy_edges if edge["src_name"] == "X" and edge["dst_name"].startswith("X_rsram_stage")]
+    cast_leg = [edge for edge in copy_edges if edge["src_name"].startswith("X_rsram_stage") and edge["dst_name"] == "result"]
+    assert len(load_leg) == 1
+    assert load_leg[0]["src_scope"] == "global"
+    assert load_leg[0]["dst_scope"] == "shared.rsram"
+    assert len(cast_leg) == 1
+    assert cast_leg[0]["src_scope"] == "shared.rsram"
+    assert cast_leg[0]["dst_scope"] == "shared.rsram"
+
+
+def test_legalize_sunmmio_datapath_casts_dram_to_operand_sram():
+    """DRAM-to-ASRAM/WSRAM casts require load, tile-cast, and DMA legs."""
+    target = determine_target("Sunmmio", return_object=True)
+
+    for dst_scope in ("shared.asram", "shared.wsram"):
+        with tvm.target.Target(target):
+            mod = run_legalize_sunmmio_datapath_no_infer_scope(
+                cast_copy_dram_to_sram(32, 32, dst_scope),
+                target,
+            )
+
+        func = mod["main"]
+        root_block = next(block for block in extract_blocks(func) if block.name_hint == "tilelang_root")
+        copy_edges = extract_copy_edges(func)
+        stage_buffers = [buf for buf in root_block.alloc_buffers if buf.name.endswith("rsram_stage") or "rsram_stage_" in buf.name]
+
+        assert len(stage_buffers) == 2, dst_scope
+        assert [buf.scope() for buf in stage_buffers] == ["shared.rsram", "shared.rsram"]
+        assert [str(buf.dtype) for buf in stage_buffers] == ["float32", "float16"]
+
+        load_leg = [edge for edge in copy_edges if edge["src_name"] == "X" and edge["dst_name"].startswith("X_rsram_stage")]
+        cast_leg = [
+            edge
+            for edge in copy_edges
+            if edge["src_name"].startswith("X_rsram_stage") and edge["dst_name"].startswith("result_rsram_stage")
+        ]
+        move_leg = [edge for edge in copy_edges if edge["src_name"].startswith("result_rsram_stage") and edge["dst_name"] == "result"]
+
+        assert len(load_leg) == 1, dst_scope
+        assert (load_leg[0]["src_scope"], load_leg[0]["dst_scope"]) == ("global", "shared.rsram")
+        assert len(cast_leg) == 1, dst_scope
+        assert (cast_leg[0]["src_scope"], cast_leg[0]["dst_scope"]) == ("shared.rsram", "shared.rsram")
+        assert len(move_leg) == 1, dst_scope
+        assert (move_leg[0]["src_scope"], move_leg[0]["dst_scope"]) == ("shared.rsram", dst_scope)
 
 
 def test_legalize_sunmmio_datapath_casts_rsram_to_dram():

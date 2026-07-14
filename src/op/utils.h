@@ -42,6 +42,17 @@ TVM_DLL BufferRegion NormalizeToBufferRegion(const PrimExpr &arg);
 TVM_DLL PrimExpr MakeRegionExpr(const Buffer &buffer,
                                 const Array<Range> &ranges, int access_mask);
 
+// Build a compact zero-based region with the same extents as `region`.
+TVM_DLL Array<Range> MakeCompactRegion(const Array<Range> &region);
+
+// Build a compact buffer whose shape is given by `region`'s extents.
+// Dtype, alignment, offset factor, and buffer type come from `prototype`.
+// An empty `name` preserves the prototype's data and buffer names.
+TVM_DLL Buffer MakeCompactBufferLike(const Buffer &prototype,
+                                     const Array<Range> &region,
+                                     const ffi::String &scope,
+                                     const ffi::String &name = "");
+
 // Build a tvm_access_ptr(handle) from a BufferRegion.
 // - If `require_2d` is true, checks buffer ndim >= 2.
 // - For 1D regions (when allowed), offset=min, extent=extent.
