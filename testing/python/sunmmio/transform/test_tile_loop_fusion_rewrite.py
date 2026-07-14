@@ -316,6 +316,47 @@ def _lowered_2d_tile_region(dst, expr, *, block_m=32, block_n=32, tile_size=(8, 
     ).strip()
 
 
+def _lowered_predicated_2d_tile_region(dst, src, *, block_m=4, block_n=4, tile_size=(4, 32)):
+    tile_m, tile_n = tile_size
+    outer_m = (block_m + tile_m - 1) // tile_m
+    outer_n = (block_n + tile_n - 1) // tile_n
+    row = f"i * {tile_m} + ki"
+    col = f"j * {tile_n} + kj"
+    predicate = f"{col} < {block_n}"
+    return textwrap.dedent(
+        f"""
+        for i in T.serial(
+            {outer_m},
+            annotations={{
+                "tile.domain": [T.int32({block_m}), T.int32({block_n})],
+                "tile.execution_axis": T.int32(0),
+                "tile.execution_domain_axes": [T.int32(0), T.int32(1)],
+                "tile.scope_entry": T.int32(1),
+                "tile.tile_size": [T.int32({tile_m}), T.int32({tile_n})],
+            }},
+        ):
+            for j in T.serial({outer_n}, annotations={{"tile.execution_axis": T.int32(1)}}):
+                for ki in T.serial({tile_m}, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(0)}}):
+                    for kj in T.vectorized({tile_n}, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(1)}}):
+                        {dst}.vstore([{row}, {col}], {src}.vload([{row}, {col}], predicate={predicate}), predicate={predicate})
+        """
+    ).strip()
+
+
+def predicated_two_region_lowered_kernel(dtype="float32"):
+    return _make_manual_lowered_primfunc(
+        [
+            f'A_shared = T.alloc_buffer((4, 4), "{dtype}", scope="shared.rsram")',
+            f'Tmp_shared = T.alloc_buffer((4, 4), "{dtype}", scope="shared.rsram")',
+            f'B_shared = T.alloc_buffer((4, 4), "{dtype}", scope="shared.rsram")',
+        ],
+        [
+            _lowered_predicated_2d_tile_region("Tmp_shared", "A_shared"),
+            _lowered_predicated_2d_tile_region("B_shared", "Tmp_shared"),
+        ],
+    )
+
+
 def _lowered_row_summary_region(dst, expr, *, block_m=32, block_n=32, tile_size=(8, 32)):
     tile_m, tile_n = tile_size
     outer_m = block_m // tile_m
@@ -685,6 +726,26 @@ def test_sunmmio_tile_loop_fusion_rewrites_consecutive_tile_scopes():
     )
 
     assert _semantic_tags(_expect_loop_body_seq(fused_loop)) == ["Tmp_shared", "B_shared"]
+
+
+def test_sunmmio_tile_loop_fusion_rewrites_buffer_access_predicates():
+    mod = IRModule.from_expr(predicated_two_region_lowered_kernel().with_attr("global_symbol", "main"))
+    mod = tl.transform.SunmmioTileLoopFusion()(mod)
+
+    scope_loops = _find_scope_entry_loops(_root_seq(mod), tile_size=[4, 32], extent=1)
+    assert len(scope_loops) == 1, "Expected the two predicated regions to share one fused tile shell"
+
+    predicated_accesses = []
+
+    def collect_predicated_accesses(node):
+        if isinstance(node, (tvm.tir.BufferLoad, tvm.tir.BufferStore)) and node.predicate is not None:
+            predicated_accesses.append(node)
+
+    tvm.tir.stmt_functor.post_order_visit(scope_loops[0], collect_predicated_accesses)
+
+    assert len(predicated_accesses) == 4
+    for access in predicated_accesses:
+        tvm.ir.assert_structural_equal(access.predicate, access.indices[1] < 4)
 
 
 def test_sunmmio_tile_loop_fusion_keeps_independent_readers_in_source_order():
