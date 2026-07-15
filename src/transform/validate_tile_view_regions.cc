@@ -586,25 +586,26 @@ private:
     }
 
     if (info.is_blockwise) {
-      const bool splits_coalesced_block =
+      const bool divides_coalesced_extent =
           info.coalesced_extent % static_extent.value() == 0;
       const bool covers_whole_coalesced_blocks =
           static_extent.value() % info.coalesced_extent == 0;
-      ICHECK(splits_coalesced_block || covers_whole_coalesced_blocks)
+      ICHECK(divides_coalesced_extent || covers_whole_coalesced_blocks)
           << op_name << " " << operand_name
           << " blockwise region extent at dim " << dim << " for buffer "
           << region->buffer->name
           << " must be compatible with coalesced extent "
           << info.coalesced_extent << ", but got extent=" << region_extent
           << ".";
-      if (splits_coalesced_block &&
-          static_extent.value() < info.coalesced_extent) {
-        ICHECK(info.is_blockwise_non_major_dim)
+      const bool splits_innermost_block =
+          static_extent.value() < info.inner_static_mode_shape;
+      if (divides_coalesced_extent && splits_innermost_block) {
+        ICHECK(!info.is_blockwise_non_major_dim)
             << op_name << " " << operand_name
             << " blockwise region extent at dim " << dim << " for buffer "
-            << region->buffer->name << " splits coalesced extent "
-            << info.coalesced_extent
-            << " and must be on the non-major dimension, but got extent="
+            << region->buffer->name << " splits innermost block extent "
+            << info.inner_static_mode_shape
+            << " and must not split the non-major dimension, but got extent="
             << region_extent << ".";
       }
       return;

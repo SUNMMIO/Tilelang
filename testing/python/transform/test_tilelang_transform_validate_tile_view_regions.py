@@ -49,7 +49,7 @@ def _make_copy_kernel(copy_case):
     }:
         shape = (2, 128, 128)
         layout = make_row_major(shape)
-    elif copy_case == "zz_3d_inner_major_split_illegal":
+    elif copy_case == "zz_3d_major_dim_split":
         shape = (2, 96, 96)
         layout = make_zz_layout(shape, axes=[1, 2], block_shape=(32, 32))
     elif copy_case.startswith("dynamic_outer_"):
@@ -228,7 +228,7 @@ def _make_copy_kernel(copy_case):
                     )
                 )
 
-    elif copy_case == "zz_3d_inner_major_split_illegal":
+    elif copy_case == "zz_3d_major_dim_split":
 
         @T.prim_func
         def kernel(A: T.Tensor(shape, DTYPE)):
@@ -411,7 +411,7 @@ def _run_kernel_pipeline_to_validate_tile_view_regions(copy_case):
 
 
 def _make_comm_kernel(comm_case):
-    shape = (96, 96) if comm_case.endswith("_illegal_major_split") else (128, 128)
+    shape = (96, 96) if comm_case.endswith("_illegal_non_major_split") else (128, 128)
     layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
 
     if comm_case == "broadcast_valid":
@@ -429,7 +429,7 @@ def _make_comm_kernel(comm_case):
                     direction="h",
                 )
 
-    elif comm_case == "broadcast_illegal_major_split":
+    elif comm_case == "broadcast_illegal_non_major_split":
 
         @T.prim_func
         def kernel(A: T.Tensor(shape, DTYPE)):
@@ -438,8 +438,8 @@ def _make_comm_kernel(comm_case):
                 B_shared = T.alloc_shared(shape, DTYPE)
                 T.annotate_layout({A_shared: layout, B_shared: layout})
                 T.comm.broadcast(
-                    A_shared[0:16, 0:32],
-                    B_shared[16:32, 32:64],
+                    A_shared[0:32, 0:16],
+                    B_shared[32:64, 16:32],
                     (0, 0),
                     direction="h",
                 )
@@ -636,10 +636,10 @@ def _run_comm_validate_tile_view_regions(comm_case):
         "row_major_dynamic_select_alignment_unknown",
         "row_major_3d_outer_slab_valid",
         "row_major_3d_outer_slab_clipped",
+        "zz_3d_major_dim_split",
         "zz_block_equal",
-        "zz_block_non_major_dim_split",
         "zz_block_non_major_dim_multi_block",
-        "zn_block_non_major_dim_split",
+        "zz_block_major_dim_split",
         "zz_whole_dim",
         "dynamic_extent_warns_and_passes",
         "dynamic_row_major_inner_mode_warns_and_passes",
@@ -675,16 +675,16 @@ def test_sunmmio_validate_tile_view_regions_accepts_legal_regions(copy_case):
             "must be positive",
         ),
         (
-            "zz_3d_inner_major_split_illegal",
-            "must be on the non-major dimension",
-        ),
-        (
             "zz_block_both_dims_split",
-            "must be on the non-major dimension",
+            "must not split the non-major dimension",
         ),
         (
-            "zz_block_major_dim_split",
-            "must be on the non-major dimension",
+            "zz_block_non_major_dim_split",
+            "must not split the non-major dimension",
+        ),
+        (
+            "zn_block_non_major_dim_split",
+            "must not split the non-major dimension",
         ),
         (
             "zz_block_offset_inside_tile",
@@ -746,8 +746,8 @@ def test_sunmmio_validate_tile_view_regions_accepts_comm_regions(comm_case):
     "comm_case, error_msg",
     [
         (
-            "broadcast_illegal_major_split",
-            "must be on the non-major dimension",
+            "broadcast_illegal_non_major_split",
+            "must not split the non-major dimension",
         ),
         (
             "broadcast_scalar_src_oob",
