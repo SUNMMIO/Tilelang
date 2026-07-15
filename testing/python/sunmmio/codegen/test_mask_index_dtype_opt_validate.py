@@ -5,7 +5,7 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.layout import make_aligned_row_major
+from tilelang.layout import make_aligned_row_major, make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import validate_sunmmio_codegen_with_npuir_opt
@@ -38,6 +38,43 @@ def predicated_store_mask_dtype_kernel(dtype, extent=512, valid_n=33):
     return main
 
 
+@target("Sunmmio")
+def bf16_select_with_i32_row_mask_kernel(
+    m=128,
+    n=128,
+    block_m=32,
+    block_n=32,
+    valid_rows=17,
+    valid_cols=19,
+):
+    dtype = T.bfloat16
+    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    tensor_shape = (m, n)
+    tensor_layout = make_zz_layout(tensor_shape, [0, 1], (block_m, block_n))
+
+    @T.prim_func
+    def main(
+        inp: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        out: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+    ):
+        with T.Kernel():
+            inp_shared = T.alloc_shared((block_m, block_n), dtype, scope="shared.rsram")
+            out_shared = T.alloc_shared((block_m, block_n), dtype, scope="shared.rsram")
+            valid_rows_var = T.alloc_var(T.int32, init=valid_rows)
+            valid_cols_var = T.alloc_var(T.int32, init=valid_cols)
+
+            T.copy(inp[0:block_m, 0:block_n], inp_shared)
+            for row, col in T.Tiles([block_m, block_n], parallel=True):
+                out_shared[row, col] = T.if_then_else(
+                    T.And(row < valid_rows_var, col < valid_cols_var),
+                    inp_shared[row, col],
+                    T.Cast(dtype, 0),
+                )
+            T.copy(out_shared, out[0:block_m, 0:block_n])
+
+    return main
+
+
 @pytest.mark.parametrize(
     "dtype,expected_index_dtype",
     [
@@ -56,6 +93,19 @@ def test_predicated_store_mask_range_uses_value_dtype_width(dtype, expected_inde
         opt_args=LOOSE_OPT_ARGS,
     )
     assert re.search(rf"suvm\.tile\.range : !suvm\.tile<[^>]*x{expected_index_dtype}>", src)
+
+
+def test_bf16_select_with_i32_row_mask_lowers_to_llvm(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        bf16_select_with_i32_row_mask_kernel(),
+        tmp_path,
+        mlir_filename="bf16_select_with_i32_row_mask_suvm.mlir",
+        expected_tokens=("suvm.tile.range", "suvm.tile.cmpi", "suvm.tile.select"),
+        opt_args=("--verify-each", "--suvm-to-llvm-pipeline"),
+    )
+    assert re.search(r"suvm\.tile\.range : !suvm\.tile<[^>]*xi16>", src)
+    assert re.search(r"suvm\.tile\.cmpi .* : !suvm\.tile<[^>]*xi16>", src)
+    assert "suvm.tile.addi" not in src
 
 
 def test_float16_sunmmio_codegen_reports_unsupported_dtype(tmp_path):

@@ -231,6 +231,50 @@ std::optional<PrimExpr> TryRewritePositiveFloorDivTailCompare(
   return std::nullopt;
 }
 
+std::optional<PrimExpr>
+TryRewriteAffineInteriorLT(const PrimExpr &condition,
+                           const std::vector<const VarNode *> &interior_vars) {
+  const auto *lt = condition.as<LTNode>();
+  if (lt == nullptr || interior_vars.empty() ||
+      ContainsAnyVar(lt->b, interior_vars)) {
+    return std::nullopt;
+  }
+
+  Array<Var> vars;
+  vars.reserve(interior_vars.size());
+  for (const VarNode *var : interior_vars) {
+    vars.push_back(ffi::GetRef<Var>(var));
+  }
+
+  arith::Analyzer analyzer;
+  Array<PrimExpr> coeffs = arith::DetectLinearEquation(lt->a, vars);
+  if (coeffs.empty() || coeffs.size() != vars.size() + 1) {
+    return std::nullopt;
+  }
+
+  int active_interior_vars = 0;
+  for (size_t i = 0; i < vars.size(); ++i) {
+    PrimExpr coeff = analyzer.Simplify(coeffs[i]);
+    if (analyzer.CanProve(coeff == make_zero(coeff.dtype()))) {
+      continue;
+    }
+    if (!analyzer.CanProve(coeff == make_const(coeff.dtype(), 1))) {
+      return std::nullopt;
+    }
+    ++active_interior_vars;
+  }
+  if (active_interior_vars != 1) {
+    return std::nullopt;
+  }
+
+  PrimExpr scalar_base = analyzer.Simplify(coeffs.back());
+  // Keep affine tile offsets out of i16 mask arithmetic, which SUVM cannot
+  // lower, by moving the scalar base to the other side of the comparison.
+  PrimExpr tile_part = analyzer.Simplify(lt->a - scalar_base);
+  PrimExpr adjusted_rhs = analyzer.Simplify(lt->b - scalar_base);
+  return tile_part < adjusted_rhs;
+}
+
 std::vector<const ForNode *> CollectLinearForChain(const ForNode *root) {
   std::vector<const ForNode *> loops;
   const ForNode *current = root;
@@ -2725,23 +2769,31 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     std::function<SunMMIOValue(const PrimExpr &, const std::vector<int64_t> &,
                                std::optional<DataType>)>
         lower_bool_expr_to_shape;
+    auto rewrite_mask_condition = [&](const PrimExpr &condition) {
+      PrimExpr rewritten_condition = condition;
+      std::vector<const VarNode *> interior_vars;
+      if (state->interior_axis0_loop != nullptr) {
+        interior_vars.push_back(state->interior_axis0_loop->loop_var.get());
+      }
+      if (state->interior_axis1_loop != nullptr) {
+        interior_vars.push_back(state->interior_axis1_loop->loop_var.get());
+      }
+      if (auto rewritten =
+              TryRewriteAffineInteriorLT(rewritten_condition, interior_vars)) {
+        rewritten_condition = rewritten.value();
+      }
+      if (ContainsFloorDivOrMod(rewritten_condition)) {
+        if (auto rewritten = TryRewritePositiveFloorDivTailCompare(
+                rewritten_condition, interior_vars)) {
+          rewritten_condition = rewritten.value();
+        }
+      }
+      return rewritten_condition;
+    };
     auto emit_select = [&](const PrimExpr &condition,
                            const PrimExpr &true_value_expr,
                            const PrimExpr &false_value_expr, DataType dtype) {
-      PrimExpr condition_to_lower = condition;
-      if (ContainsFloorDivOrMod(condition)) {
-        std::vector<const VarNode *> interior_vars;
-        if (state->interior_axis0_loop != nullptr) {
-          interior_vars.push_back(state->interior_axis0_loop->loop_var.get());
-        }
-        if (state->interior_axis1_loop != nullptr) {
-          interior_vars.push_back(state->interior_axis1_loop->loop_var.get());
-        }
-        if (auto rewritten = TryRewritePositiveFloorDivTailCompare(
-                condition, interior_vars)) {
-          condition_to_lower = rewritten.value();
-        }
-      }
+      PrimExpr condition_to_lower = rewrite_mask_condition(condition);
       SunMMIOValue true_value =
           lower_expr(true_value_expr, state, preferred_dtype);
       SunMMIOValue false_value =
@@ -3186,13 +3238,14 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     lower_bool_expr_to_shape =
         [&](const PrimExpr &bool_expr, const std::vector<int64_t> &target_shape,
             std::optional<DataType> mask_index_dtype) -> SunMMIOValue {
+      PrimExpr bool_expr_to_lower = rewrite_mask_condition(bool_expr);
       std::optional<DataType> integer_preferred =
           canonical_integer_preferred_dtype(mask_index_dtype);
-      if (auto compare = try_emit_compare_to_shape(bool_expr, target_shape,
-                                                   integer_preferred)) {
+      if (auto compare = try_emit_compare_to_shape(
+              bool_expr_to_lower, target_shape, integer_preferred)) {
         return compare.value();
       }
-      if (const auto *and_op = bool_expr.as<AndNode>()) {
+      if (const auto *and_op = bool_expr_to_lower.as<AndNode>()) {
         SunMMIOValue lhs = lower_bool_expr_to_shape(and_op->a, target_shape,
                                                     integer_preferred);
         SunMMIOValue rhs = lower_bool_expr_to_shape(and_op->b, target_shape,
@@ -3200,7 +3253,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         return emit_logical_values(BinaryOp::kAnd, lhs, rhs, target_shape,
                                    and_op->a, and_op->b);
       }
-      if (const auto *or_op = bool_expr.as<OrNode>()) {
+      if (const auto *or_op = bool_expr_to_lower.as<OrNode>()) {
         SunMMIOValue lhs =
             lower_bool_expr_to_shape(or_op->a, target_shape, integer_preferred);
         SunMMIOValue rhs =
@@ -3208,8 +3261,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         return emit_logical_values(BinaryOp::kOr, lhs, rhs, target_shape,
                                    or_op->a, or_op->b);
       }
-      SunMMIOValue value = lower_expr(bool_expr, state, integer_preferred);
-      return adapt_logical_tile_operand(value, target_shape, bool_expr);
+      SunMMIOValue value =
+          lower_expr(bool_expr_to_lower, state, integer_preferred);
+      return adapt_logical_tile_operand(value, target_shape,
+                                        bool_expr_to_lower);
     };
     auto emit_logical_binary = [&](BinaryOp op, const PrimExpr &lhs_expr,
                                    const PrimExpr &rhs_expr, DataType dtype) {
