@@ -8,7 +8,6 @@ from tilelang import tvm
 from tilelang.engine.phase import should_force_let_inline
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from testing.python.transform.sunmmio_mesh_kernel_new_syntax_reference import (
-    
     mesh_flashattn_new,
     mesh_flashdecoding_new,
     mesh_flashmladecode_new,
@@ -18,10 +17,7 @@ from tvm import tir
 
 
 _get_logical_shape = tvm.ffi.get_global_func("tl.CuteLayout_logical_shape")
-_TEST_OUTPUT_DIR = Path(
-    "/home/yesimeng/Tilelang/testing/python/transform/"
-    "out_sunmmio_pipeline_strict"
-)
+_TEST_OUTPUT_DIR = Path("/home/yesimeng/Tilelang/testing/python/transform/out_sunmmio_pipeline_strict")
 _SCHEDULER_LOG_NAMES = (
     "prologue.log",
     "body.log",
@@ -127,9 +123,7 @@ def _extract_pipeline_annotations(stmt):
         elif isinstance(node, tir.IfThenElse):
             visit(node.then_case)
             visit(node.else_case)
-        elif isinstance(node, tir.LetStmt):
-            visit(node.body)
-        elif isinstance(node, tir.AttrStmt):
+        elif isinstance(node, (tir.LetStmt, tir.AttrStmt)):
             visit(node.body)
 
     visit(stmt)
@@ -138,26 +132,19 @@ def _extract_pipeline_annotations(stmt):
 
 def _write_json(path: Path, value) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _write_ir(path: Path, mod: tvm.IRModule) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        mod.script(show_meta=True).strip() + "\n", encoding="utf-8"
-    )
+    path.write_text(mod.script(show_meta=True).strip() + "\n", encoding="utf-8")
 
 
 def _func_attrs(mod: tvm.IRModule):
     func = mod["main"]
     if func.attrs is None:
         return {}
-    return {
-        str(key): _annotation_to_python(value)
-        for key, value in func.attrs.items()
-    }
+    return {str(key): _annotation_to_python(value) for key, value in func.attrs.items()}
 
 
 def _artifact_paths(case_name: str) -> dict[str, Path]:
@@ -229,9 +216,7 @@ def _pipeline_instruction_count(stmt):
         elif isinstance(node, tir.IfThenElse):
             visit(node.then_case)
             visit(node.else_case)
-        elif isinstance(node, tir.LetStmt):
-            visit(node.body)
-        elif isinstance(node, tir.AttrStmt):
+        elif isinstance(node, (tir.LetStmt, tir.AttrStmt)):
             visit(node.body)
 
     visit(stmt)
@@ -243,9 +228,7 @@ def _build_and_record(case_name, kernel_factory, requested_num_stages):
     artifacts = _artifact_paths(case_name)
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     with tvm.target.Target(target):
-        mod = tvm.IRModule.from_expr(
-            kernel_factory().with_attr("global_symbol", "main")
-        )
+        mod = tvm.IRModule.from_expr(kernel_factory().with_attr("global_symbol", "main"))
         mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
         mod = tl.transform.IfStmtBinding()(mod)
         _write_ir(artifacts["before_pipeline_ir"], mod)
@@ -260,41 +243,26 @@ def _build_and_record(case_name, kernel_factory, requested_num_stages):
 
         annotations = _extract_pipeline_annotations(planned["main"].body)
         assert annotations is not None, case_name
-        annotation_payload = {
-            str(key): _annotation_to_python(value)
-            for key, value in annotations.items()
-        }
+        annotation_payload = {str(key): _annotation_to_python(value) for key, value in annotations.items()}
         _write_ir(artifacts["after_planning_ir"], planned)
         _write_json(artifacts["planning_annotations"], annotation_payload)
-        _write_json(
-            artifacts["after_planning_func_attrs"], _func_attrs(planned)
-        )
+        _write_json(artifacts["after_planning_func_attrs"], _func_attrs(planned))
 
         injected = tl.transform.InjectSunmmioPipeline()(planned)
         _write_ir(artifacts["after_inject_ir"], injected)
         _write_json(artifacts["after_inject_func_attrs"], _func_attrs(injected))
 
-    scheduler_logs = {
-        name: str(artifacts["case_dir"] / name)
-        for name in _SCHEDULER_LOG_NAMES
-        if (artifacts["case_dir"] / name).exists()
-    }
+    scheduler_logs = {name: str(artifacts["case_dir"] / name) for name in _SCHEDULER_LOG_NAMES if (artifacts["case_dir"] / name).exists()}
     manifest = {
         "case_name": case_name,
         "pipeline": "greedy",
         "requested_num_stages": requested_num_stages,
         "selected_iterations": annotation_payload.get("iterations"),
         "schedule_sizes": {
-            key: len(annotations[key])
-            for key in ("prologue_orders", "body_orders", "epilogue_orders")
-            if key in annotations
+            key: len(annotations[key]) for key in ("prologue_orders", "body_orders", "epilogue_orders") if key in annotations
         },
         "versioned_buffers": _buffer_names(annotations, "versioned_buffers"),
-        "artifacts": {
-            key: str(path)
-            for key, path in artifacts.items()
-            if key not in ("case_dir", "manifest")
-        },
+        "artifacts": {key: str(path) for key, path in artifacts.items() if key not in ("case_dir", "manifest")},
         "scheduler_logs": scheduler_logs,
     }
     _write_json(artifacts["manifest"], manifest)
@@ -304,9 +272,7 @@ def _build_and_record(case_name, kernel_factory, requested_num_stages):
 STRICT_CASES = [
     (
         "matmul_num_stages_4",
-        lambda: mesh_matmul_new(
-            1024, 1024, 1024, 128, 128, 32, num_stages=4
-        ),
+        lambda: mesh_matmul_new(1024, 1024, 1024, 128, 128, 32, num_stages=4),
         4,
         {
             "A_rsram_stage": [4, 128, 32],
@@ -363,12 +329,8 @@ STRICT_CASES = [
     STRICT_CASES,
     ids=[case[0] for case in STRICT_CASES],
 )
-def test_tilelang_transform_sunmmio_pipeline_strict(
-    case_name, kernel_factory, num_stages, expected_shapes
-):
-    planned, injected, artifacts = _build_and_record(
-        case_name, kernel_factory, num_stages
-    )
+def test_tilelang_transform_sunmmio_pipeline_strict(case_name, kernel_factory, num_stages, expected_shapes):
+    planned, injected, artifacts = _build_and_record(case_name, kernel_factory, num_stages)
 
     annotations = _extract_pipeline_annotations(planned["main"].body)
     assert int(annotations["iterations"]) == num_stages
@@ -377,14 +339,8 @@ def test_tilelang_transform_sunmmio_pipeline_strict(
     _validate_orders(annotations, instruction_count)
 
     layout_map = injected["main"].attrs["layout_map"]
-    actual_shapes = {
-        buffer.name: [int(dim) for dim in buffer.shape]
-        for buffer, _ in layout_map.items()
-    }
-    logical_shapes = {
-        buffer.name: [int(dim) for dim in _get_logical_shape(layout)]
-        for buffer, layout in layout_map.items()
-    }
+    actual_shapes = {buffer.name: [int(dim) for dim in buffer.shape] for buffer, _ in layout_map.items()}
+    logical_shapes = {buffer.name: [int(dim) for dim in _get_logical_shape(layout)] for buffer, layout in layout_map.items()}
     for name, expected_shape in expected_shapes.items():
         assert actual_shapes[name] == expected_shape
         assert logical_shapes[name] == expected_shape

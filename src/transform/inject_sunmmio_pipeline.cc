@@ -73,9 +73,9 @@ public:
         substituter.buffer_remap_.Set(buffer, ping);
         substituter.bank_peer_buffers_[buffer.get()] = pong;
       } else {
-        substituter.buffer_remap_.Set(
-            buffer, substituter.makeMultiVersionBuffer(
-                        buffer, substituter.iterations_));
+        substituter.buffer_remap_.Set(buffer,
+                                      substituter.makeMultiVersionBuffer(
+                                          buffer, substituter.iterations_));
       }
     }
 
@@ -156,8 +156,7 @@ private:
     const auto *ptr_type =
         TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
     Var new_var;
-    std::string data_name =
-        std::string(buffer->data->name_hint) + name_suffix;
+    std::string data_name = std::string(buffer->data->name_hint) + name_suffix;
     std::string buffer_name = std::string(buffer->name) + name_suffix;
     if (reuse_primary_var && var_remap_.count(buffer->data)) {
       new_var = var_remap_[buffer->data];
@@ -711,8 +710,8 @@ private:
       pipeline_allocs.push_back(it);
     }
 
-    auto rewriter = PipelineBodyRewriter(versioned_buffers, bank_peer_buffers,
-                                         for_node);
+    auto rewriter =
+        PipelineBodyRewriter(versioned_buffers, bank_peer_buffers, for_node);
     Array<Stmt> for_body;
     // Step 3.1: Rewrite prologue
     for (const auto &order_str : prologue_orders) {

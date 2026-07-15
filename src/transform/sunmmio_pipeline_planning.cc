@@ -130,8 +130,7 @@ enum class PhysicalSramBank : int {
   Count = 4,
 };
 
-static std::vector<PhysicalSramBank>
-GetOccupiedSramBanks(
+static std::vector<PhysicalSramBank> GetOccupiedSramBanks(
     const PipelineInstruction &instruction,
     const std::unordered_set<const BufferNode *> &versioned_buffers) {
   std::array<bool, static_cast<int>(PhysicalSramBank::Count)> occupied{};
@@ -141,10 +140,10 @@ GetOccupiedSramBanks(
                 instruction.iter % 2 != 0;
     if (scope == kSunmmioScopeASRAM) {
       occupied[static_cast<int>(pong ? PhysicalSramBank::ASRAMPong
-                                    : PhysicalSramBank::ASRAMPing)] = true;
+                                     : PhysicalSramBank::ASRAMPing)] = true;
     } else if (scope == kSunmmioScopeWSRAM) {
       occupied[static_cast<int>(pong ? PhysicalSramBank::WSRAMPong
-                                    : PhysicalSramBank::WSRAMPing)] = true;
+                                     : PhysicalSramBank::WSRAMPing)] = true;
     }
   };
   for (const BufferRegion &region : instruction.reads) {
@@ -964,8 +963,7 @@ public:
       float end;
     };
     std::unordered_map<DeviceType, std::vector<Interval>> busy_intervals;
-    std::array<std::vector<Interval>,
-               static_cast<int>(PhysicalSramBank::Count)>
+    std::array<std::vector<Interval>, static_cast<int>(PhysicalSramBank::Count)>
         bank_busy_intervals;
     for (const auto &instruction : schedule) {
       busy_intervals[instruction.device_type].push_back(
@@ -1075,9 +1073,8 @@ public:
         instruction->scheduled_end = start_time + duration;
         instruction->finished = true;
         for (std::vector<Interval> *resource_intervals : required_intervals) {
-          insert_interval(*resource_intervals,
-                          {instruction->scheduled_start,
-                           instruction->scheduled_end});
+          insert_interval(*resource_intervals, {instruction->scheduled_start,
+                                                instruction->scheduled_end});
         }
         schedule.push_back(*instruction);
         scheduled_prefetch += 1;
