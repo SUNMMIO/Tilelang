@@ -16,9 +16,11 @@
 #include "../op/utils.h"
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
+#include "../target/sunmmio_utils.h"
 #include "sunmmio_pipeline_planning/stmt_read_write_collector.h"
 
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <fstream>
 #include <iostream>
@@ -119,6 +121,47 @@ public:
     return name == other.name;
   }
 };
+
+enum class PhysicalSramBank : int {
+  ASRAMPing = 0,
+  ASRAMPong = 1,
+  WSRAMPing = 2,
+  WSRAMPong = 3,
+  Count = 4,
+};
+
+static std::vector<PhysicalSramBank>
+GetOccupiedSramBanks(
+    const PipelineInstruction &instruction,
+    const std::unordered_set<const BufferNode *> &versioned_buffers) {
+  std::array<bool, static_cast<int>(PhysicalSramBank::Count)> occupied{};
+  auto collect = [&](const BufferRegion &region) {
+    const String &scope = region->buffer.scope();
+    bool pong = versioned_buffers.count(region->buffer.get()) != 0 &&
+                instruction.iter % 2 != 0;
+    if (scope == kSunmmioScopeASRAM) {
+      occupied[static_cast<int>(pong ? PhysicalSramBank::ASRAMPong
+                                    : PhysicalSramBank::ASRAMPing)] = true;
+    } else if (scope == kSunmmioScopeWSRAM) {
+      occupied[static_cast<int>(pong ? PhysicalSramBank::WSRAMPong
+                                    : PhysicalSramBank::WSRAMPing)] = true;
+    }
+  };
+  for (const BufferRegion &region : instruction.reads) {
+    collect(region);
+  }
+  for (const BufferRegion &region : instruction.writes) {
+    collect(region);
+  }
+
+  std::vector<PhysicalSramBank> result;
+  for (int i = 0; i < static_cast<int>(PhysicalSramBank::Count); ++i) {
+    if (occupied[i]) {
+      result.push_back(static_cast<PhysicalSramBank>(i));
+    }
+  }
+  return result;
+}
 
 /**
  * \brief A RAW dependence edge in the single-iteration local DDG.
@@ -887,9 +930,13 @@ public:
         if (!ArePredecessorsFinished(*instruction)) {
           continue;
         }
+        if (!AreBanksFree(*instruction, time)) {
+          continue;
+        }
         for (auto &device : devices_) {
           if (device.type == instruction->device_type && !device.busy) {
             device.AssignInstruction(instruction, time);
+            ReserveBanks(*instruction, instruction->scheduled_end);
             schedule.push_back(*instruction);
             break;
           }
@@ -917,12 +964,26 @@ public:
       float end;
     };
     std::unordered_map<DeviceType, std::vector<Interval>> busy_intervals;
+    std::array<std::vector<Interval>,
+               static_cast<int>(PhysicalSramBank::Count)>
+        bank_busy_intervals;
     for (const auto &instruction : schedule) {
       busy_intervals[instruction.device_type].push_back(
           {instruction.scheduled_start, instruction.scheduled_end});
+      for (PhysicalSramBank bank :
+           GetOccupiedSramBanks(instruction, versioned_buffers_)) {
+        bank_busy_intervals[static_cast<int>(bank)].push_back(
+            {instruction.scheduled_start, instruction.scheduled_end});
+      }
     }
     for (auto &kv : busy_intervals) {
       auto &intervals = kv.second;
+      std::sort(intervals.begin(), intervals.end(),
+                [](const Interval &lhs, const Interval &rhs) {
+                  return lhs.start < rhs.start;
+                });
+    }
+    for (auto &intervals : bank_busy_intervals) {
       std::sort(intervals.begin(), intervals.end(),
                 [](const Interval &lhs, const Interval &rhs) {
                   return lhs.start < rhs.start;
@@ -985,23 +1046,41 @@ public:
       float duration = instruction->delay;
       auto &intervals = busy_intervals[instruction->device_type];
       float start_time = ready_time;
-      for (size_t i = 0; i <= intervals.size(); ++i) {
-        float gap_end = (i < intervals.size())
-                            ? intervals[i].start
-                            : std::numeric_limits<float>::max();
-        if (gap_end - start_time >= duration) {
-          instruction->scheduled_start = start_time;
-          instruction->scheduled_end = start_time + duration;
-          instruction->finished = true;
-          insert_interval(intervals, {instruction->scheduled_start,
-                                      instruction->scheduled_end});
-          schedule.push_back(*instruction);
-          scheduled_prefetch += 1;
-          break;
+      std::vector<std::vector<Interval> *> required_intervals{&intervals};
+      for (PhysicalSramBank bank :
+           GetOccupiedSramBanks(*instruction, versioned_buffers_)) {
+        required_intervals.push_back(
+            &bank_busy_intervals[static_cast<int>(bank)]);
+      }
+      while (!instruction->finished) {
+        float next_start = start_time;
+        for (const std::vector<Interval> *resource_intervals :
+             required_intervals) {
+          for (const Interval &interval : *resource_intervals) {
+            if (start_time + duration <= interval.start) {
+              break;
+            }
+            if (start_time < interval.end &&
+                start_time + duration > interval.start) {
+              next_start = std::max(next_start, interval.end);
+              break;
+            }
+          }
         }
-        if (i < intervals.size()) {
-          start_time = std::max(start_time, intervals[i].end);
+        if (next_start != start_time) {
+          start_time = next_start;
+          continue;
         }
+        instruction->scheduled_start = start_time;
+        instruction->scheduled_end = start_time + duration;
+        instruction->finished = true;
+        for (std::vector<Interval> *resource_intervals : required_intervals) {
+          insert_interval(*resource_intervals,
+                          {instruction->scheduled_start,
+                           instruction->scheduled_end});
+        }
+        schedule.push_back(*instruction);
+        scheduled_prefetch += 1;
       }
       ICHECK(instruction->finished)
           << "Failed to insert prefetch instruction " << instruction->name;
@@ -1078,6 +1157,24 @@ private:
       device.current_instruction = nullptr;
       device.instruction_end_time = std::numeric_limits<float>::max();
     }
+    bank_busy_until_.fill(-1.0f);
+  }
+
+  bool AreBanksFree(const PipelineInstruction &instruction, float time) const {
+    for (PhysicalSramBank bank :
+         GetOccupiedSramBanks(instruction, versioned_buffers_)) {
+      if (bank_busy_until_[static_cast<int>(bank)] > time) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void ReserveBanks(const PipelineInstruction &instruction, float end_time) {
+    for (PhysicalSramBank bank :
+         GetOccupiedSramBanks(instruction, versioned_buffers_)) {
+      bank_busy_until_[static_cast<int>(bank)] = end_time;
+    }
   }
 
   bool ArePredecessorsFinished(const PipelineInstruction &instruction) const {
@@ -1095,6 +1192,8 @@ private:
   }
 
   std::vector<PipelineDevice> devices_;
+  std::array<float, static_cast<int>(PhysicalSramBank::Count)>
+      bank_busy_until_{};
   std::unordered_set<const BufferNode *> versioned_buffers_;
   std::vector<std::vector<int>> predecessors_;
   std::vector<std::vector<int>> successors_;

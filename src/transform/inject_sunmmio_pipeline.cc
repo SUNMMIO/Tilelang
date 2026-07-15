@@ -31,6 +31,9 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <string>
+#include <unordered_map>
+
 namespace tvm {
 namespace tl {
 
@@ -57,9 +60,23 @@ public:
     substituter.replace_flag = true;
 
     for (auto &buffer : substituter.versioned_buffers_) {
-      substituter.buffer_remap_.Set(
-          buffer,
-          substituter.makeMultiVersionBuffer(buffer, substituter.iterations_));
+      if (substituter.IsBankedBuffer(buffer)) {
+        ICHECK_EQ(substituter.iterations_ % 2, 0)
+            << "Ping/pong multiversioning currently requires an even "
+               "num_stages, got "
+            << substituter.iterations_ << " for buffer " << buffer->name;
+        int versions_per_bank = (substituter.iterations_ + 1) / 2;
+        Buffer ping = substituter.makeMultiVersionBuffer(
+            buffer, versions_per_bank, "_ping", true);
+        Buffer pong = substituter.makeMultiVersionBuffer(
+            buffer, versions_per_bank, "_pong", false);
+        substituter.buffer_remap_.Set(buffer, ping);
+        substituter.bank_peer_buffers_[buffer.get()] = pong;
+      } else {
+        substituter.buffer_remap_.Set(
+            buffer, substituter.makeMultiVersionBuffer(
+                        buffer, substituter.iterations_));
+      }
     }
 
     substituter.RewriteFunctionLayoutAttrs(f);
@@ -95,6 +112,17 @@ private:
           << "Failed to derive multiversioned layout for buffer "
           << buffer->name << " with shape " << new_buffer->shape;
       new_layout_map.Set(new_buffer, derived_layout.value());
+      auto peer_it = bank_peer_buffers_.find(buffer.get());
+      if (peer_it != bank_peer_buffers_.end()) {
+        const Buffer &peer_buffer = peer_it->second;
+        Optional<Layout> peer_layout = DeriveLayoutLikeForDType(
+            layout, peer_buffer->shape, peer_buffer->dtype,
+            Optional<Array<Integer>>(), &analyzer);
+        ICHECK(peer_layout.defined())
+            << "Failed to derive ping/pong layout for buffer " << buffer->name
+            << " with shape " << peer_buffer->shape;
+        new_layout_map.Set(peer_buffer, peer_layout.value());
+      }
     }
     f = WithAttr(std::move(f), attr::kLayoutMap, new_layout_map);
   }
@@ -105,14 +133,8 @@ private:
     }
 
     Map<Var, String> alloc_ping_pong;
-    for (const auto &kv : buffer_remap_) {
-      const Buffer &buffer = kv.first;
-      if (buffer.scope() != kSunmmioScopeASRAM &&
-          buffer.scope() != kSunmmioScopeWSRAM) {
-        continue;
-      }
-      const Buffer &new_buffer = kv.second;
-      alloc_ping_pong.Set(new_buffer->data, String("pong"));
+    for (const auto &kv : bank_peer_buffers_) {
+      alloc_ping_pong.Set(kv.second->data, String("pong"));
     }
 
     if (alloc_ping_pong.empty()) {
@@ -123,23 +145,35 @@ private:
                  alloc_ping_pong);
   }
 
-  Buffer makeMultiVersionBuffer(const Buffer &buffer, int num_version) {
+  bool IsBankedBuffer(const Buffer &buffer) const {
+    return buffer.scope() == kSunmmioScopeASRAM ||
+           buffer.scope() == kSunmmioScopeWSRAM;
+  }
+
+  Buffer makeMultiVersionBuffer(const Buffer &buffer, int num_version,
+                                const std::string &name_suffix = "",
+                                bool reuse_primary_var = true) {
     const auto *ptr_type =
         TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
     Var new_var;
-    if (var_remap_.count(buffer->data)) {
+    std::string data_name =
+        std::string(buffer->data->name_hint) + name_suffix;
+    std::string buffer_name = std::string(buffer->name) + name_suffix;
+    if (reuse_primary_var && var_remap_.count(buffer->data)) {
       new_var = var_remap_[buffer->data];
     } else {
       Type new_type =
           PointerType(ptr_type->element_type, ptr_type->storage_scope);
-      new_var = Var(buffer->data->name_hint, new_type);
-      var_remap_.Set(buffer->data, new_var);
+      new_var = Var(data_name, new_type);
+      if (reuse_primary_var) {
+        var_remap_.Set(buffer->data, new_var);
+      }
     }
     auto shape = buffer->shape;
     shape.insert(shape.begin(), num_version);
     return Buffer(new_var, buffer->dtype, shape, {}, buffer->elem_offset,
-                  buffer->name, buffer->data_alignment, buffer->offset_factor,
-                  buffer->buffer_type);
+                  String(buffer_name), buffer->data_alignment,
+                  buffer->offset_factor, buffer->buffer_type);
   }
 
   BufferRegion
@@ -178,6 +212,19 @@ private:
         }
         loop.CopyOnWrite()->annotations.Set("versioned_buffers",
                                             new_versioned_buffers);
+        Map<Buffer, Buffer> bank_peer_buffers;
+        for (const Buffer &buffer : versioned_buffers) {
+          auto remap_it = buffer_remap_.find(buffer);
+          auto peer_it = bank_peer_buffers_.find(buffer.get());
+          if (remap_it != buffer_remap_.end() &&
+              peer_it != bank_peer_buffers_.end()) {
+            bank_peer_buffers.Set((*remap_it).second, peer_it->second);
+          }
+        }
+        if (!bank_peer_buffers.empty()) {
+          loop.CopyOnWrite()->annotations.Set("bank_peer_buffers",
+                                              bank_peer_buffers);
+        }
         Array<Buffer> used_buffers =
             Downcast<Array<Buffer>>(used_buffers_anno.value());
         Array<Buffer> new_used_buffers;
@@ -213,6 +260,10 @@ private:
       for (const auto &[buffer, layout] : map) {
         if (buffer_remap_.count(buffer)) {
           new_map.Set(buffer_remap_[buffer], layout);
+          auto peer_it = bank_peer_buffers_.find(buffer.get());
+          if (peer_it != bank_peer_buffers_.end()) {
+            new_map.Set(peer_it->second, layout);
+          }
         } else {
           new_map.Set(buffer, layout);
         }
@@ -245,15 +296,19 @@ private:
         });
 
     // do block->alloc_buffers remap
-    Array<Buffer> alloc_buffers = block->alloc_buffers;
-
-    // remove the buffers
-    alloc_buffers.MutateByApply([this](Buffer buf) {
-      if (buffer_remap_.find(buf) != buffer_remap_.end()) {
-        return buffer_remap_.at(buf);
+    Array<Buffer> alloc_buffers;
+    for (const Buffer &buf : block->alloc_buffers) {
+      auto remap_it = buffer_remap_.find(buf);
+      if (remap_it == buffer_remap_.end()) {
+        alloc_buffers.push_back(buf);
+        continue;
       }
-      return buf;
-    });
+      alloc_buffers.push_back((*remap_it).second);
+      auto peer_it = bank_peer_buffers_.find(buf.get());
+      if (peer_it != bank_peer_buffers_.end()) {
+        alloc_buffers.push_back(peer_it->second);
+      }
+    }
 
     if (!alloc_buffers.same_as(block->alloc_buffers)) {
       block.CopyOnWrite()->alloc_buffers = alloc_buffers;
@@ -356,15 +411,23 @@ private:
   Map<Buffer, Buffer> buffer_remap_;
   Map<Var, Var> var_remap_;
   Map<Var, Buffer> buffer_data_to_buffer_;
+  std::unordered_map<const BufferNode *, Buffer> bank_peer_buffers_;
 };
 
 class PipelineBodyRewriter : public StmtExprMutator {
 public:
-  PipelineBodyRewriter(Array<Buffer> used_buffers, For pipeline_loop) {
+  PipelineBodyRewriter(Array<Buffer> used_buffers,
+                       Map<Buffer, Buffer> bank_peer_buffers,
+                       For pipeline_loop) {
     used_buffers_ = used_buffers;
+    bank_peer_buffers_ = std::move(bank_peer_buffers);
     pipeline_loop_ = std::move(pipeline_loop);
     for (auto it : used_buffers) {
       buffer_data_to_buffer_.Set(it->data, it);
+      if (bank_peer_buffers_.count(it)) {
+        const Buffer &peer = bank_peer_buffers_[it];
+        buffer_data_to_buffer_.Set(peer->data, peer);
+      }
     }
   }
 
@@ -384,25 +447,28 @@ private:
     };
     Array<PrimExpr> new_args = call->args;
     for (int i : arg_indices) {
-      // const Buffer &buffer =
-      //     buffer_data_to_buffer_.at(Downcast<Var>(call->args[i]));
-      // auto it = buffer_remap_.find(buffer);
-      // if (it != buffer_remap_.end()) {
-      //   const Buffer &new_buffer = (*it).second;
-      //   const PrimExpr &old_index = call->args[i + 1];
-      //   LOG(INFO) << old_index;
-      //   PrimExpr offset;
-      //   if (new_buffer->strides.empty()) {
-      //     offset = product(buffer->shape);
-      //   } else {
-      //     offset = new_buffer->strides[0];
-      //   }
-      //   PrimExpr new_index =
-      //       old_index +
-      //       floormod(pipeline_loop_->loop_var, new_buffer->shape[0]) *
-      //       offset;
-      //   LOG(INFO) << new_index;
-      //   new_args.Set(i + 1, new_index);
+      Var data = Downcast<Var>(call->args[i]);
+      if (!buffer_data_to_buffer_.count(data)) {
+        continue;
+      }
+      const Buffer &buffer = buffer_data_to_buffer_[data];
+      if (!IsVersionedBuffer(buffer)) {
+        continue;
+      }
+      Buffer target = ResolveTargetBuffer(buffer);
+      PrimExpr offset;
+      if (!target->strides.empty()) {
+        offset = target->strides[0];
+      } else {
+        Array<PrimExpr> inner_shape;
+        for (size_t axis = 1; axis < target->shape.size(); ++axis) {
+          inner_shape.push_back(target->shape[axis]);
+        }
+        offset = product(inner_shape);
+      }
+      new_args.Set(i, target->data);
+      new_args.Set(i + 1, call->args[i + 1] +
+                              Integer(CurrentVersionSlot(buffer)) * offset);
     }
     return Call(call->dtype, call->op, new_args, call->annotations, call->span);
   }
@@ -429,9 +495,10 @@ private:
     if (!count) {
       return store;
     }
-    auto *n = store.CopyOnWrite();
-    n->indices.Set(0, current_version_);
-    return store;
+    Buffer target = ResolveTargetBuffer(store->buffer);
+    Array<PrimExpr> indices = store->indices;
+    indices.Set(0, CurrentVersionSlot(store->buffer));
+    return BufferStore(target, store->value, indices);
   }
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
@@ -444,9 +511,10 @@ private:
     if (!count) {
       return load;
     }
-    auto *n = load.CopyOnWrite();
-    n->indices.Set(0, current_version_);
-    return load;
+    Buffer target = ResolveTargetBuffer(load->buffer);
+    Array<PrimExpr> indices = load->indices;
+    indices.Set(0, CurrentVersionSlot(load->buffer));
+    return BufferLoad(target, indices);
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
@@ -465,8 +533,33 @@ private:
     return var;
   }
 
+  bool IsVersionedBuffer(const Buffer &buffer) const {
+    for (const Buffer &candidate : used_buffers_) {
+      if (candidate.same_as(buffer)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool IsBankedBuffer(const Buffer &buffer) const {
+    return bank_peer_buffers_.count(buffer) != 0;
+  }
+
+  Buffer ResolveTargetBuffer(const Buffer &buffer) const {
+    if (!IsBankedBuffer(buffer) || current_version_ % 2 == 0) {
+      return buffer;
+    }
+    return bank_peer_buffers_[buffer];
+  }
+
+  int CurrentVersionSlot(const Buffer &buffer) const {
+    return IsBankedBuffer(buffer) ? current_version_ / 2 : current_version_;
+  }
+
   Array<Buffer> used_buffers_;
   Map<Var, Buffer> buffer_data_to_buffer_;
+  Map<Buffer, Buffer> bank_peer_buffers_;
   For pipeline_loop_;
   int current_version_ = 0;
   PrimExpr replaced_loop_var_;
@@ -498,6 +591,7 @@ private:
     auto iterations_anno = op->annotations.Get("iterations");
     auto used_buffers_anno = op->annotations.Get("used_buffers");
     auto versioned_buffers_anno = op->annotations.Get("versioned_buffers");
+    auto bank_peer_buffers_anno = op->annotations.Get("bank_peer_buffers");
     auto prologue_orders_anno = op->annotations.Get("prologue_orders");
     auto body_orders_anno = op->annotations.Get("body_orders");
     auto epilogue_orders_anno = op->annotations.Get("epilogue_orders");
@@ -608,11 +702,17 @@ private:
         Downcast<Array<Buffer>>(versioned_buffers_anno.value());
     Array<Buffer> used_buffers =
         Downcast<Array<Buffer>>(used_buffers_anno.value());
+    Map<Buffer, Buffer> bank_peer_buffers;
+    if (bank_peer_buffers_anno) {
+      bank_peer_buffers =
+          Downcast<Map<Buffer, Buffer>>(bank_peer_buffers_anno.value());
+    }
     for (auto it : used_buffers) {
       pipeline_allocs.push_back(it);
     }
 
-    auto rewriter = PipelineBodyRewriter(versioned_buffers, for_node);
+    auto rewriter = PipelineBodyRewriter(versioned_buffers, bank_peer_buffers,
+                                         for_node);
     Array<Stmt> for_body;
     // Step 3.1: Rewrite prologue
     for (const auto &order_str : prologue_orders) {
