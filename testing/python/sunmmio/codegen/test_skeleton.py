@@ -71,20 +71,20 @@ def make_scalar_control_kernel():
 
 @target("Sunmmio")
 def make_alloc_scope_kernel():
-    f16 = tvm.ir.PrimType("float16")
+    bf16 = tvm.ir.PrimType("bfloat16")
     one = tvm.tir.IntImm("bool", 1)
     body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
 
-    rsram = tvm.tir.Var("rsram_buf", tvm.ir.PointerType(f16, "shared.rsram"))
-    wsram = tvm.tir.Var("wsram_buf", tvm.ir.PointerType(f16, "shared.wsram"))
-    asram = tvm.tir.Var("asram_buf", tvm.ir.PointerType(f16, "shared.asram"))
-    rsram_buf = tvm.tir.decl_buffer((16, 16), "float16", name="Rsram", data=rsram, scope="shared.rsram")
-    wsram_buf = tvm.tir.decl_buffer((16, 16), "float16", name="Wsram", data=wsram, scope="shared.wsram")
-    asram_buf = tvm.tir.decl_buffer((16, 16), "float16", name="Asram", data=asram, scope="shared.asram")
+    rsram = tvm.tir.Var("rsram_buf", tvm.ir.PointerType(bf16, "shared.rsram"))
+    wsram = tvm.tir.Var("wsram_buf", tvm.ir.PointerType(bf16, "shared.wsram"))
+    asram = tvm.tir.Var("asram_buf", tvm.ir.PointerType(bf16, "shared.asram"))
+    rsram_buf = tvm.tir.decl_buffer((16, 16), "bfloat16", name="Rsram", data=rsram, scope="shared.rsram")
+    wsram_buf = tvm.tir.decl_buffer((16, 16), "bfloat16", name="Wsram", data=wsram, scope="shared.wsram")
+    asram_buf = tvm.tir.decl_buffer((16, 16), "bfloat16", name="Asram", data=asram, scope="shared.asram")
 
-    stmt = tvm.tir.Allocate(rsram, "float16", [16, 16], one, body)
-    stmt = tvm.tir.Allocate(wsram, "float16", [16, 16], one, stmt)
-    stmt = tvm.tir.Allocate(asram, "float16", [16, 16], one, stmt)
+    stmt = tvm.tir.Allocate(rsram, "bfloat16", [16, 16], one, body)
+    stmt = tvm.tir.Allocate(wsram, "bfloat16", [16, 16], one, stmt)
+    stmt = tvm.tir.Allocate(asram, "bfloat16", [16, 16], one, stmt)
     stmt = tvm.tir.DeclBuffer(rsram_buf, stmt)
     stmt = tvm.tir.DeclBuffer(wsram_buf, stmt)
     stmt = tvm.tir.DeclBuffer(asram_buf, stmt)
@@ -93,21 +93,21 @@ def make_alloc_scope_kernel():
 
 @target("Sunmmio")
 def make_allocate_without_decl_buffer_kernel():
-    f16 = tvm.ir.PrimType("float16")
+    bf16 = tvm.ir.PrimType("bfloat16")
     one = tvm.tir.IntImm("bool", 1)
     body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
-    asram = tvm.tir.Var("asram_buf", tvm.ir.PointerType(f16, "shared.asram"))
-    stmt = tvm.tir.Allocate(asram, "float16", [16, 16], one, body)
+    asram = tvm.tir.Var("asram_buf", tvm.ir.PointerType(bf16, "shared.asram"))
+    stmt = tvm.tir.Allocate(asram, "bfloat16", [16, 16], one, body)
     return _primfunc_from_stmt(stmt)
 
 
 @target("Sunmmio")
 def make_invalid_dma_source_kernel():
-    f16 = tvm.ir.PrimType("float16")
-    src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(f16, "shared.asram"))
-    dst_data = tvm.tir.Var("dst_data", tvm.ir.PointerType(f16, "shared.rsram"))
-    src_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Src", data=src_data, scope="shared.asram")
-    dst_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Dst", data=dst_data, scope="shared.rsram")
+    bf16 = tvm.ir.PrimType("bfloat16")
+    src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(bf16, "shared.asram"))
+    dst_data = tvm.tir.Var("dst_data", tvm.ir.PointerType(bf16, "shared.rsram"))
+    src_buf = tvm.tir.decl_buffer((32, 32), "bfloat16", name="Src", data=src_data, scope="shared.asram")
+    dst_buf = tvm.tir.decl_buffer((32, 32), "bfloat16", name="Dst", data=dst_data, scope="shared.rsram")
 
     def region(buf, access):
         return tvm.tir.call_intrin(
@@ -138,11 +138,11 @@ def make_invalid_dma_source_kernel():
 
 @target("Sunmmio")
 def make_layout_transform_kernel():
-    f16 = tvm.ir.PrimType("float16")
-    src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(f16, "shared.rsram"))
-    dst_data = tvm.tir.Var("dst_data", tvm.ir.PointerType(f16, "shared.rsram"))
-    src_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Src", data=src_data, scope="shared.rsram")
-    dst_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Dst", data=dst_data, scope="shared.rsram")
+    bf16 = tvm.ir.PrimType("bfloat16")
+    src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(bf16, "shared.rsram"))
+    dst_data = tvm.tir.Var("dst_data", tvm.ir.PointerType(bf16, "shared.rsram"))
+    src_buf = tvm.tir.decl_buffer((32, 32), "bfloat16", name="Src", data=src_data, scope="shared.rsram")
+    dst_buf = tvm.tir.decl_buffer((32, 32), "bfloat16", name="Dst", data=dst_data, scope="shared.rsram")
 
     def region(buf, access):
         return tvm.tir.call_intrin(
@@ -176,11 +176,11 @@ def make_layout_transform_kernel():
 
 @target("Sunmmio")
 def make_dynamic_broadcast_mask_kernel():
-    f16 = tvm.ir.PrimType("float16")
-    src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(f16, "shared.rsram"))
-    dst_data = tvm.tir.Var("dst_data", tvm.ir.PointerType(f16, "shared.asram"))
-    src_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Src", data=src_data, scope="shared.rsram")
-    dst_buf = tvm.tir.decl_buffer((32, 32), "float16", name="Dst", data=dst_data, scope="shared.asram")
+    bf16 = tvm.ir.PrimType("bfloat16")
+    src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(bf16, "shared.rsram"))
+    dst_data = tvm.tir.Var("dst_data", tvm.ir.PointerType(bf16, "shared.asram"))
+    src_buf = tvm.tir.decl_buffer((32, 32), "bfloat16", name="Src", data=src_data, scope="shared.rsram")
+    dst_buf = tvm.tir.decl_buffer((32, 32), "bfloat16", name="Dst", data=dst_data, scope="shared.asram")
 
     def region(buf, access):
         return tvm.tir.call_intrin(
@@ -308,7 +308,7 @@ def make_block_realize_kernel():
 @target("Sunmmio")
 def make_decl_buffer_kernel():
     body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
-    buf = tvm.tir.decl_buffer((16, 16), "float16", name="A")
+    buf = tvm.tir.decl_buffer((16, 16), "bfloat16", name="A")
     stmt = tvm.tir.DeclBuffer(buf, body)
     return _primfunc_from_stmt(stmt)
 
@@ -316,7 +316,7 @@ def make_decl_buffer_kernel():
 @target("Sunmmio")
 def make_buffer_realize_kernel():
     body = tvm.tir.Evaluate(tvm.tir.IntImm("int32", 0))
-    buf = tvm.tir.decl_buffer((16, 16), "float16", name="A")
+    buf = tvm.tir.decl_buffer((16, 16), "bfloat16", name="A")
     bounds = [
         tvm.ir.Range.from_min_extent(0, 16),
         tvm.ir.Range.from_min_extent(0, 16),
@@ -327,7 +327,7 @@ def make_buffer_realize_kernel():
 
 @target("Sunmmio")
 def make_buffer_load_kernel():
-    buf = tvm.tir.decl_buffer((16, 16), "float16", name="A")
+    buf = tvm.tir.decl_buffer((16, 16), "bfloat16", name="A")
     stmt = tvm.tir.Evaluate(
         tvm.tir.BufferLoad(
             buf,
@@ -339,10 +339,10 @@ def make_buffer_load_kernel():
 
 @target("Sunmmio")
 def make_buffer_store_kernel():
-    buf = tvm.tir.decl_buffer((16, 16), "float16", name="A")
+    buf = tvm.tir.decl_buffer((16, 16), "bfloat16", name="A")
     stmt = tvm.tir.BufferStore(
         buf,
-        tvm.tir.FloatImm("float16", 1.0),
+        tvm.tir.FloatImm("bfloat16", 1.0),
         [tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 0)],
     )
     return _primfunc_from_stmt(stmt)

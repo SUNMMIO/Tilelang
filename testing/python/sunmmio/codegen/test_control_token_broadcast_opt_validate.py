@@ -52,7 +52,7 @@ def _validate_stmt_codegen(stmt, tmp_path, *, mlir_filename, expected_tokens=(),
     return src
 
 
-def _shared_buffers(dtype="float16", shape=(32, 32)):
+def _shared_buffers(dtype="bfloat16", shape=(32, 32)):
     elem_ty = tvm.ir.PrimType(dtype)
     src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(elem_ty, "shared.rsram"))
     dst_data = tvm.tir.Var("dst_data", tvm.ir.PointerType(elem_ty, "shared.asram"))

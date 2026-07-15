@@ -23,7 +23,7 @@ def partitioned_view_region_kernel(
     block_M=32,
     block_N=32,
     block_K=32,
-    dtype="float16",
+    dtype="bfloat16",
     accum_dtype="float32",
 ):
     @T.prim_func
