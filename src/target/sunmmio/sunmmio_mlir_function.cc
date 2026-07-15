@@ -307,7 +307,8 @@ void SunmmioMlirFunction::EndFor() {
 
   // Ensure the loop body terminator is an scf.yield with the computed operands.
   mlir::Block *body = for_op.getBody();
-  mlir::Operation *terminator = body->getTerminator();
+  mlir::Operation *terminator =
+      body->mightHaveTerminator() ? body->getTerminator() : nullptr;
   mlir::scf::YieldOp yield_op =
       terminator ? mlir::dyn_cast<mlir::scf::YieldOp>(terminator)
                  : mlir::scf::YieldOp();
@@ -443,7 +444,9 @@ void SunmmioMlirFunction::BeginWhileBody(const SunMMIOValue &cond) {
   condition_args.append(frame.before_tokens.begin(), frame.before_tokens.end());
 
   mlir::Block *before_body = frame.op.getBeforeBody();
-  mlir::Operation *terminator = before_body->getTerminator();
+  mlir::Operation *terminator = before_body->mightHaveTerminator()
+                                    ? before_body->getTerminator()
+                                    : nullptr;
   mlir::scf::ConditionOp condition_op =
       terminator ? mlir::dyn_cast<mlir::scf::ConditionOp>(terminator)
                  : mlir::scf::ConditionOp();
@@ -508,7 +511,8 @@ void SunmmioMlirFunction::EndWhile() {
   }
 
   mlir::Block *after_body = while_op.getAfterBody();
-  mlir::Operation *terminator = after_body->getTerminator();
+  mlir::Operation *terminator =
+      after_body->mightHaveTerminator() ? after_body->getTerminator() : nullptr;
   mlir::scf::YieldOp yield_op =
       terminator ? mlir::dyn_cast<mlir::scf::YieldOp>(terminator)
                  : mlir::scf::YieldOp();
