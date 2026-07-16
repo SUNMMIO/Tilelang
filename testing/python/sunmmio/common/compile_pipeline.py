@@ -369,17 +369,22 @@ def OptimizeForSunmmio_test(
     mod = tilelang.transform.IfStmtBinding()(mod)
     pass_output_process(mod, "IfStmtBinding", test_config)
 
-    # mod = tilelang.transform.SunmmioPipelinePlanning(debug=False)(mod)
-    # pass_output_process(mod, "SunmmioPipelinePlanning", test_config)
-
-    # mod = tilelang.transform.InjectSunmmioPipeline()(mod)
-    # pass_output_process(mod, "InjectSunmmioPipeline", test_config)
-
-    mod = tilelang.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
-    pass_output_process(mod, "SunmmioPipelinePlanningILP", test_config)
-
-    mod = tilelang.transform.InjectSunmmioPipelineILP()(mod)
-    pass_output_process(mod, "InjectSunmmioPipelineILP", test_config)
+    pass_ctx = tilelang.transform.get_pass_context()
+    pipeline_disabled = bool(pass_ctx.config.get(PassConfigKey.TL_DISABLE_SUNMMIO_PIPELINE, False))
+    if not pipeline_disabled:
+        pipeline_mode = str(pass_ctx.config.get(PassConfigKey.TL_SUNMMIO_PIPELINE_MODE, "greedy")).lower()
+        if pipeline_mode == "ilp":
+            mod = tilelang.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
+            pass_output_process(mod, "SunmmioPipelinePlanningILP", test_config)
+            mod = tilelang.transform.InjectSunmmioPipelineILP()(mod)
+            pass_output_process(mod, "InjectSunmmioPipelineILP", test_config)
+        elif pipeline_mode == "greedy":
+            mod = tilelang.transform.SunmmioPipelinePlanning(debug=False)(mod)
+            pass_output_process(mod, "SunmmioPipelinePlanning", test_config)
+            mod = tilelang.transform.InjectSunmmioPipeline()(mod)
+            pass_output_process(mod, "InjectSunmmioPipeline", test_config)
+        else:
+            raise ValueError(f"unsupported Sunmmio pipeline mode: {pipeline_mode}")
 
     # mod = tilelang.transform.PlanAndUpdateBufferAllocationLocation()(mod)
     # pass_output_process(mod, "PlanAndUpdateBufferAllocationLocation", test_config)

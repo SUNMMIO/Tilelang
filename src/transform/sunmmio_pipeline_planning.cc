@@ -1220,6 +1220,13 @@ public:
     if (num_stages <= 0) {
       return StmtExprMutator::VisitStmt_(op);
     }
+    arith::Analyzer analyzer;
+    PrimExpr simplified_extent = analyzer.Simplify(op->extent);
+    if (const auto *extent = simplified_extent.as<IntImmNode>()) {
+      if (extent->value < num_stages) {
+        return StmtExprMutator::VisitStmt_(op);
+      }
+    }
 
     // 2. Peel off the outer layers to find the true body sequence
     auto inner_stmt = op->body;
