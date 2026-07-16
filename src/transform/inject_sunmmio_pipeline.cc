@@ -33,6 +33,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace tvm {
 namespace tl {
@@ -61,15 +62,12 @@ public:
 
     for (auto &buffer : substituter.versioned_buffers_) {
       if (substituter.IsBankedBuffer(buffer)) {
-        ICHECK_EQ(substituter.iterations_ % 2, 0)
-            << "Ping/pong multiversioning currently requires an even "
-               "num_stages, got "
-            << substituter.iterations_ << " for buffer " << buffer->name;
-        int versions_per_bank = (substituter.iterations_ + 1) / 2;
-        Buffer ping = substituter.makeMultiVersionBuffer(
-            buffer, versions_per_bank, "_ping", true);
-        Buffer pong = substituter.makeMultiVersionBuffer(
-            buffer, versions_per_bank, "_pong", false);
+        int ping_versions = (substituter.iterations_ + 1) / 2;
+        int pong_versions = substituter.iterations_ / 2;
+        Buffer ping = substituter.makeMultiVersionBuffer(buffer, ping_versions,
+                                                         "_ping", true);
+        Buffer pong = substituter.makeMultiVersionBuffer(buffer, pong_versions,
+                                                         "_pong", false);
         substituter.buffer_remap_.Set(buffer, ping);
         substituter.bank_peer_buffers_[buffer.get()] = pong;
       } else {
@@ -169,7 +167,10 @@ private:
       }
     }
     auto shape = buffer->shape;
-    shape.insert(shape.begin(), num_version);
+    if (num_version > 1) {
+      shape.insert(shape.begin(), num_version);
+    }
+    buffer_has_version_axis_[new_var.get()] = num_version > 1;
     return Buffer(new_var, buffer->dtype, shape, {}, buffer->elem_offset,
                   String(buffer_name), buffer->data_alignment,
                   buffer->offset_factor, buffer->buffer_type);
@@ -181,8 +182,10 @@ private:
     if (it != buffer_remap_.end()) {
       Region new_region = buffer_region->region;
       const Buffer &new_buffer = (*it).second;
-      Range accessed_version = Range::FromMinExtent(0, 1);
-      new_region.insert(new_region.begin(), accessed_version);
+      if (HasVersionAxis(new_buffer)) {
+        Range accessed_version = Range::FromMinExtent(0, 1);
+        new_region.insert(new_region.begin(), accessed_version);
+      }
       return BufferRegion(new_buffer, new_region);
     }
     return buffer_region;
@@ -224,6 +227,19 @@ private:
           loop.CopyOnWrite()->annotations.Set("bank_peer_buffers",
                                               bank_peer_buffers);
         }
+        Array<Buffer> version_axis_buffers;
+        for (const auto &kv : buffer_remap_) {
+          if (HasVersionAxis(kv.second)) {
+            version_axis_buffers.push_back(kv.second);
+          }
+          auto peer_it = bank_peer_buffers_.find(kv.first.get());
+          if (peer_it != bank_peer_buffers_.end() &&
+              HasVersionAxis(peer_it->second)) {
+            version_axis_buffers.push_back(peer_it->second);
+          }
+        }
+        loop.CopyOnWrite()->annotations.Set("version_axis_buffers",
+                                            version_axis_buffers);
         Array<Buffer> used_buffers =
             Downcast<Array<Buffer>>(used_buffers_anno.value());
         Array<Buffer> new_used_buffers;
@@ -326,7 +342,9 @@ private:
     if (buffer_remap_.count(buffer)) {
       auto new_buffer = buffer_remap_[load->buffer];
       auto indices = load->indices;
-      indices.insert(indices.begin(), 0);
+      if (HasVersionAxis(new_buffer)) {
+        indices.insert(indices.begin(), 0);
+      }
       return BufferLoad(new_buffer, indices);
     }
     auto expr = StmtExprMutator::VisitExpr_(op);
@@ -342,7 +360,9 @@ private:
     if (buffer_remap_.count(buffer)) {
       auto new_buffer = buffer_remap_[store->buffer];
       auto indices = store->indices;
-      indices.insert(indices.begin(), 0);
+      if (HasVersionAxis(new_buffer)) {
+        indices.insert(indices.begin(), 0);
+      }
       return BufferStore(new_buffer, store->value, indices);
     }
     return store;
@@ -371,7 +391,9 @@ private:
 
       Buffer new_buffer = buffer_remap_[original_buffer];
       Array<Range> new_ranges = original_region->GetRanges();
-      new_ranges.insert(new_ranges.begin(), Range(0, 1));
+      if (HasVersionAxis(new_buffer)) {
+        new_ranges.insert(new_ranges.begin(), Range(0, 1));
+      }
 
       Array<PrimExpr> new_args;
       new_args.push_back(BufferLoad(new_buffer, [new_ranges]() {
@@ -405,22 +427,31 @@ private:
   }
 
   Array<Buffer> versioned_buffers_;
+  bool HasVersionAxis(const Buffer &buffer) const {
+    auto it = buffer_has_version_axis_.find(buffer->data.get());
+    return it != buffer_has_version_axis_.end() && it->second;
+  }
+
   int iterations_ = -1;
   bool replace_flag = false;
   Map<Buffer, Buffer> buffer_remap_;
   Map<Var, Var> var_remap_;
   Map<Var, Buffer> buffer_data_to_buffer_;
   std::unordered_map<const BufferNode *, Buffer> bank_peer_buffers_;
+  std::unordered_map<const VarNode *, bool> buffer_has_version_axis_;
 };
 
 class PipelineBodyRewriter : public StmtExprMutator {
 public:
   PipelineBodyRewriter(Array<Buffer> used_buffers,
                        Map<Buffer, Buffer> bank_peer_buffers,
-                       For pipeline_loop) {
+                       Array<Buffer> version_axis_buffers, For pipeline_loop) {
     used_buffers_ = used_buffers;
     bank_peer_buffers_ = std::move(bank_peer_buffers);
     pipeline_loop_ = std::move(pipeline_loop);
+    for (const Buffer &buffer : version_axis_buffers) {
+      version_axis_buffers_.insert(buffer.get());
+    }
     for (auto it : used_buffers) {
       buffer_data_to_buffer_.Set(it->data, it);
       if (bank_peer_buffers_.count(it)) {
@@ -455,6 +486,10 @@ private:
         continue;
       }
       Buffer target = ResolveTargetBuffer(buffer);
+      if (!HasVersionAxis(target)) {
+        new_args.Set(i, target->data);
+        continue;
+      }
       PrimExpr offset;
       if (!target->strides.empty()) {
         offset = target->strides[0];
@@ -496,7 +531,7 @@ private:
     }
     Buffer target = ResolveTargetBuffer(store->buffer);
     Array<PrimExpr> indices = store->indices;
-    indices.Set(0, CurrentVersionSlot(store->buffer));
+    RewriteIndices(store->buffer, target, &indices);
     return BufferStore(target, store->value, indices);
   }
 
@@ -512,11 +547,41 @@ private:
     }
     Buffer target = ResolveTargetBuffer(load->buffer);
     Array<PrimExpr> indices = load->indices;
-    indices.Set(0, CurrentVersionSlot(load->buffer));
+    RewriteIndices(load->buffer, target, &indices);
     return BufferLoad(target, indices);
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(RegionOp::Get())) {
+      RegionOp original_region(op->args);
+      Buffer source = original_region->GetBuffer();
+      if (IsVersionedBuffer(source)) {
+        Buffer target = ResolveTargetBuffer(source);
+        Array<Range> ranges = original_region->GetRanges();
+        if (HasVersionAxis(target)) {
+          ICHECK(HasVersionAxis(source));
+          ranges.Set(0, Range::FromMinExtent(CurrentVersionSlot(source), 1));
+        } else if (HasVersionAxis(source)) {
+          Array<Range> squeezed;
+          for (size_t i = 1; i < ranges.size(); ++i) {
+            squeezed.push_back(ranges[i]);
+          }
+          ranges = squeezed;
+        }
+
+        Array<PrimExpr> args;
+        Array<PrimExpr> mins;
+        for (const Range &range : ranges) {
+          mins.push_back(VisitExpr(range->min));
+        }
+        args.push_back(BufferLoad(target, mins));
+        args.push_back(VisitExpr(original_region->GetAccessMask()));
+        for (const Range &range : ranges) {
+          args.push_back(VisitExpr(range->extent));
+        }
+        return Call(DataType::Handle(), RegionOp::Get(), args);
+      }
+    }
     Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
     if (call->op.same_as(builtin::tvm_access_ptr())) {
       return RewriteBufferAccess(call, {1});
@@ -556,9 +621,28 @@ private:
     return IsBankedBuffer(buffer) ? current_version_ / 2 : current_version_;
   }
 
+  bool HasVersionAxis(const Buffer &buffer) const {
+    return version_axis_buffers_.count(buffer.get()) != 0;
+  }
+
+  void RewriteIndices(const Buffer &source, const Buffer &target,
+                      Array<PrimExpr> *indices) const {
+    if (HasVersionAxis(target)) {
+      ICHECK(HasVersionAxis(source));
+      indices->Set(0, CurrentVersionSlot(source));
+    } else if (HasVersionAxis(source)) {
+      Array<PrimExpr> squeezed;
+      for (size_t i = 1; i < indices->size(); ++i) {
+        squeezed.push_back((*indices)[i]);
+      }
+      *indices = squeezed;
+    }
+  }
+
   Array<Buffer> used_buffers_;
   Map<Var, Buffer> buffer_data_to_buffer_;
   Map<Buffer, Buffer> bank_peer_buffers_;
+  std::unordered_set<const BufferNode *> version_axis_buffers_;
   For pipeline_loop_;
   int current_version_ = 0;
   PrimExpr replaced_loop_var_;
@@ -591,6 +675,8 @@ private:
     auto used_buffers_anno = op->annotations.Get("used_buffers");
     auto versioned_buffers_anno = op->annotations.Get("versioned_buffers");
     auto bank_peer_buffers_anno = op->annotations.Get("bank_peer_buffers");
+    auto version_axis_buffers_anno =
+        op->annotations.Get("version_axis_buffers");
     auto prologue_orders_anno = op->annotations.Get("prologue_orders");
     auto body_orders_anno = op->annotations.Get("body_orders");
     auto epilogue_orders_anno = op->annotations.Get("epilogue_orders");
@@ -706,12 +792,17 @@ private:
       bank_peer_buffers =
           Downcast<Map<Buffer, Buffer>>(bank_peer_buffers_anno.value());
     }
+    Array<Buffer> version_axis_buffers;
+    if (version_axis_buffers_anno) {
+      version_axis_buffers =
+          Downcast<Array<Buffer>>(version_axis_buffers_anno.value());
+    }
     for (auto it : used_buffers) {
       pipeline_allocs.push_back(it);
     }
 
-    auto rewriter =
-        PipelineBodyRewriter(versioned_buffers, bank_peer_buffers, for_node);
+    auto rewriter = PipelineBodyRewriter(versioned_buffers, bank_peer_buffers,
+                                         version_axis_buffers, for_node);
     Array<Stmt> for_body;
     // Step 3.1: Rewrite prologue
     for (const auto &order_str : prologue_orders) {

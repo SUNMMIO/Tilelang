@@ -271,6 +271,18 @@ def _build_and_record(case_name, kernel_factory, requested_num_stages):
 
 STRICT_CASES = [
     (
+        "matmul_num_stages_3",
+        lambda: mesh_matmul_new(1024, 1024, 1024, 128, 128, 32, num_stages=3),
+        3,
+        {
+            "A_rsram_stage": [3, 128, 32],
+            "A_shared_ping": [2, 128, 32],
+            "A_shared_pong": [128, 32],
+            "B_shared_ping": [2, 32, 128],
+            "B_shared_pong": [32, 128],
+        },
+    ),
+    (
         "matmul_num_stages_4",
         lambda: mesh_matmul_new(1024, 1024, 1024, 128, 128, 32, num_stages=4),
         4,
@@ -287,12 +299,12 @@ STRICT_CASES = [
         lambda: mesh_flashattn_new(num_stages=2),
         2,
         {
-            "K_shared_ping": [1, 64, 128],
-            "K_shared_pong": [1, 64, 128],
-            "acc_s_cast_ping": [1, 64, 64],
-            "acc_s_cast_pong": [1, 64, 64],
-            "V_shared_ping": [1, 64, 128],
-            "V_shared_pong": [1, 64, 128],
+            "K_shared_ping": [64, 128],
+            "K_shared_pong": [64, 128],
+            "acc_s_cast_ping": [64, 64],
+            "acc_s_cast_pong": [64, 64],
+            "V_shared_ping": [64, 128],
+            "V_shared_pong": [64, 128],
         },
     ),
     (
@@ -300,10 +312,10 @@ STRICT_CASES = [
         lambda: mesh_flashdecoding_new(num_stages=2),
         2,
         {
-            "K_shared_ping": [1, 128, 128],
-            "K_shared_pong": [1, 128, 128],
-            "V_shared_ping": [1, 128, 128],
-            "V_shared_pong": [1, 128, 128],
+            "K_shared_ping": [128, 128],
+            "K_shared_pong": [128, 128],
+            "V_shared_ping": [128, 128],
+            "V_shared_pong": [128, 128],
         },
     ),
     (
@@ -311,14 +323,14 @@ STRICT_CASES = [
         lambda: mesh_flashmladecode_new(num_stages=2),
         2,
         {
-            "KV_shared_ping": [1, 64, 512],
-            "KV_shared_pong": [1, 64, 512],
-            "KV_shared2_ping": [1, 64, 512],
-            "KV_shared2_pong": [1, 64, 512],
-            "K_pe_shared_ping": [1, 64, 64],
-            "K_pe_shared_pong": [1, 64, 64],
-            "S_shared_ping": [1, 64, 64],
-            "S_shared_pong": [1, 64, 64],
+            "KV_shared_ping": [64, 512],
+            "KV_shared_pong": [64, 512],
+            "KV_shared2_ping": [64, 512],
+            "KV_shared2_pong": [64, 512],
+            "K_pe_shared_ping": [64, 64],
+            "K_pe_shared_pong": [64, 64],
+            "S_shared_ping": [64, 64],
+            "S_shared_pong": [64, 64],
         },
     ),
 ]
@@ -349,6 +361,17 @@ def test_tilelang_transform_sunmmio_pipeline_strict(case_name, kernel_factory, n
     assert {str(value) for value in ping_pong.values()} == {"pong"}
     assert all((artifacts["case_dir"] / name).exists() for name in _SCHEDULER_LOG_NAMES)
     assert artifacts["manifest"].exists()
+
+
+def test_tilelang_transform_sunmmio_pipeline_skips_when_extent_is_less_than_stages():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(mesh_matmul_new(1024, 1024, 64, 128, 128, 32, num_stages=3).with_attr("global_symbol", "main"))
+        mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+        mod = tl.transform.IfStmtBinding()(mod)
+        planned = tl.transform.SunmmioPipelinePlanning(debug=False)(mod)
+
+    assert _extract_pipeline_annotations(planned["main"].body) is None
 
 
 if __name__ == "__main__":
