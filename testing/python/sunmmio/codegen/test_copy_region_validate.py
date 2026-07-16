@@ -141,6 +141,29 @@ def zz_fully_coalesced_non_major_sub_block_copy_kernel():
 
 
 @target("Sunmmio")
+def leading_singleton_broadcast_kernel():
+    src_shape = (1, 32, 32)
+    dst_shape = (32, 32)
+    src_layout = make_zz_layout(src_shape, axes=[1, 2], block_shape=(32, 32))
+    dst_layout = make_zz_layout(dst_shape, axes=[0, 1], block_shape=(32, 32))
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            src_shared = T.alloc_shared(src_shape, DTYPE, scope="shared.rsram")
+            dst_shared = T.alloc_shared(dst_shape, DTYPE, scope="shared.rsram")
+            T.annotate_layout(
+                {
+                    src_shared: src_layout,
+                    dst_shared: dst_layout,
+                }
+            )
+            T.comm.broadcast(src_shared, dst_shared, (0, 0), direction="h")
+
+    return main
+
+
+@target("Sunmmio")
 def summa_output_copy_kernel(
     M=128,
     N=128,
@@ -237,6 +260,24 @@ def test_zz_fully_coalesced_non_major_sub_block_copy_is_rejected():
         match="must not split the non-major dimension",
     ):
         lower_sunmmio_kernel_to_device_tir(zz_fully_coalesced_non_major_sub_block_copy_kernel())
+
+
+def test_leading_singleton_broadcast_codegen_passes(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        leading_singleton_broadcast_kernel(),
+        tmp_path,
+        mlir_filename="leading_singleton_broadcast.mlir",
+        expected_tokens=(
+            "suvm.get_partitioned_tile_view",
+            "suvm.mcast_tok",
+            "suvm.wait_token",
+        ),
+        opt_args=LOOSE_OPT_ARGS,
+    )
+    assert "!suvm.tile_view<32x32xbf16>" in src
+    assert "tiled_dims = [1, 2]" in src
+    assert src.count("suvm.mcast_tok") >= 1
+    assert "sunmmio.fake" not in src
 
 
 @pytest.mark.parametrize("M,N,K", _SUMMA_COPY_SHAPES)

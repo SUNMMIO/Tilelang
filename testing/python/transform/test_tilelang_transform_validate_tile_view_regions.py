@@ -454,7 +454,7 @@ def _make_comm_kernel(comm_case):
                 T.annotate_layout({A_shared: layout, B_shared: layout})
                 T.comm.broadcast(
                     A_shared[999, 0],
-                    B_shared[0, 0],
+                    B_shared[0:32, 0:32],
                     (0, 0),
                     direction="h",
                 )
@@ -750,22 +750,27 @@ def test_sunmmio_validate_tile_view_regions_accepts_comm_regions(comm_case):
             "must not split the non-major dimension",
         ),
         (
-            "broadcast_scalar_src_oob",
-            "must stay within buffer shape",
-        ),
-        (
             "allgather_axis0_slot_extent_mismatch",
             "must equal send extent",
-        ),
-        (
-            "allgather_axis0_nonzero_recv_min_oob",
-            "must stay within buffer shape",
         ),
     ],
 )
 def test_sunmmio_validate_tile_view_regions_rejects_comm_regions(comm_case, error_msg):
     with pytest.raises(tvm.error.InternalError, match=error_msg):
         _run_comm_validate_tile_view_regions(comm_case)
+
+
+def test_sunmmio_comm_frontend_rejects_broadcast_source_oob():
+    with pytest.raises(ValueError, match="region starts outside buffer shape"):
+        _make_comm_kernel("broadcast_scalar_src_oob")
+
+
+def test_sunmmio_comm_frontend_clips_then_rejects_allgather_recv_oob():
+    with (
+        pytest.warns(UserWarning, match="explicit BufferRegion exceeds buffer shape and will be clipped"),
+        pytest.raises(ValueError, match="src extent is larger than dst extent"),
+    ):
+        _make_comm_kernel("allgather_axis0_nonzero_recv_min_oob")
 
 
 if __name__ == "__main__":
