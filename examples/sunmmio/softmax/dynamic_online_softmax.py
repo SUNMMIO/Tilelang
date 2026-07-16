@@ -15,7 +15,9 @@ def ref_program(x):
     return exp_x / np.sum(exp_x, axis=1, keepdims=True)
 
 
-def softmax_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Callable":
+def dynamic_softmax_kernel(block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Callable":
+    M, N = T.dynamic("m"), T.dynamic("n")
+
     zz_layout = make_zz_layout((M, N))
     placement = T.MeshShardingPolicy(y=0, x=1)
 
@@ -74,8 +76,8 @@ def softmax_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Call
 
 
 @tilelang.jit(target="sunmmio", execution_backend="sunmmio_sunsim")
-def online_softmax(M, N, block_M, block_N, dtype):
-    return softmax_kernel(M, N, block_M, block_N, dtype)
+def online_softmax(block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Callable":
+    return dynamic_softmax_kernel(block_M, block_N, dtype)
 
 
 def main(M, N) -> None:
@@ -87,15 +89,13 @@ def main(M, N) -> None:
     x = rng.uniform(-4.0, 4.0, size=(M, N)).astype(np.float32).astype(ml_dtypes.bfloat16)
 
     kernel = online_softmax(
-        M,
-        N,
         block_M=256,
         block_N=256,
         dtype=T.bfloat16,
     )
 
     placement = [sunsim.S(0), sunsim.S(1)]
-    layout = sunsim.Layout.zz((0, 1))
+    layout = sunsim.Layout.zz(block_dims=(0, 1))
     y = sunsim.Output((M, N), ml_dtypes.bfloat16, placement=placement, layout=layout)
     result = kernel(
         sunsim.Input(x, placement=placement, layout=layout),
@@ -105,7 +105,7 @@ def main(M, N) -> None:
     )
 
     np.testing.assert_allclose(y.data.astype(np.float32), ref_program(x), rtol=5e-2, atol=5e-3)
-    print(f"online_softmax PASS: shape=({M}, {N}) matched reference within tolerance")
+    print(f"Dynamic online_softmax PASS: shape=({M}, {N}) matched reference within tolerance")
     return result
 
 

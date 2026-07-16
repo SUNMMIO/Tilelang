@@ -1,6 +1,8 @@
 import importlib.util
 import json
 import re
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,7 @@ from tilelang.jit.adapter.sunmmio.libgen import (
     SunmmioKernelArtifact,
     SunmmioToolchain,
 )
+from tilelang.jit.adapter.sunmmio.host_wrapper import SunmmioSuDeckSourceWrapper
 from tilelang.jit.execution_backend import allowed_backends_for_target, resolve_execution_backend
 from tilelang.layout import make_row_major, make_zz_layout
 from tilelang.utils.target import determine_target, target_is_sunmmio
@@ -45,6 +48,21 @@ def _load_sunmmio_dynamic_elementwise_example():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _make_sudeck_install_root(root: Path, mesh: str = "4x4") -> tuple[Path, Path, Path]:
+    include_dir = root / "include"
+    lib_dir = root / "lib"
+    cmake_dir = lib_dir / "cmake" / "SuDeck"
+    (include_dir / "sudeck").mkdir(parents=True)
+    lib_dir.mkdir(parents=True)
+    cmake_dir.mkdir(parents=True)
+    (include_dir / "sudeck" / "context.h").write_text("// fake sudeck header\n", encoding="utf-8")
+    (cmake_dir / "SuDeckConfig.cmake").write_text("# fake sudeck cmake package\n", encoding="utf-8")
+    (cmake_dir / f"SuDeckTargets_{mesh}.cmake").write_text("# fake sudeck cmake target\n", encoding="utf-8")
+    library_path = lib_dir / f"libsudeck_{mesh}.so"
+    library_path.write_bytes(b"fake sudeck")
+    return root, include_dir, library_path
 
 
 def _load_sunmmio_dynamic_exp2_example():
@@ -97,6 +115,7 @@ def test_sunmmio_abi_reorders_public_args_to_device_order():
         public_param_names=("X", "LSE", "Y"),
         device_param_names=("LSE", "X", "Y"),
         runtime_scalars=(),
+        device_param_dtypes=("handle", "handle", "handle"),
     )
 
     assert abi.materialize_runtime_args(["x", "lse", "y"], lambda *_: None) == ["lse", "x", "y"]
@@ -113,6 +132,7 @@ def test_sunmmio_abi_reorders_public_args_before_hidden_scalars():
         public_param_names=("X", "LSE", "Y"),
         device_param_names=("LSE", "X", "Y", "m"),
         runtime_scalars=(SunmmioRuntimeScalar("m", source_param_index=0, source_kind="shape", source_dim=0),),
+        device_param_dtypes=("handle", "handle", "handle", "int32"),
     )
     x = Marker((512, 128))
     lse = Marker((512, 128))
@@ -135,6 +155,7 @@ def test_sunmmio_abi_rejects_public_arg_count_mismatch():
             public_param_names=("X", "Y"),
             device_param_names=("X", "Y"),
             runtime_scalars=(),
+            device_param_dtypes=("handle", "handle"),
         )
 
 
@@ -146,6 +167,7 @@ def test_sunmmio_abi_rejects_duplicate_public_names():
             public_param_names=("X", "X"),
             device_param_names=("X", "X"),
             runtime_scalars=(),
+            device_param_dtypes=("handle", "handle"),
         )
 
 
@@ -160,6 +182,7 @@ def test_sunmmio_abi_rejects_duplicate_scalar_names():
                 SunmmioRuntimeScalar("m", source_param_index=0, source_kind="shape", source_dim=0),
                 SunmmioRuntimeScalar("m", source_param_index=0, source_kind="shape", source_dim=1),
             ),
+            device_param_dtypes=("handle", "int32", "int32"),
         )
 
 
@@ -171,6 +194,7 @@ def test_sunmmio_abi_rejects_public_scalar_name_collision():
             public_param_names=("m",),
             device_param_names=("m",),
             runtime_scalars=(SunmmioRuntimeScalar("m", source_param_index=0, source_kind="shape", source_dim=0),),
+            device_param_dtypes=("handle",),
         )
 
 
@@ -182,6 +206,7 @@ def test_sunmmio_abi_rejects_non_permutation_device_order():
             public_param_names=("X", "Y"),
             device_param_names=("X", "Z"),
             runtime_scalars=(),
+            device_param_dtypes=("handle", "handle"),
         )
 
 
@@ -198,6 +223,7 @@ def test_sunmmio_abi_from_json_dict_rejects_inconsistent_metadata():
                 "public_arg_count": 2,
                 "public_param_names": ["X", "Y"],
                 "device_param_names": ["X", "Z"],
+                "device_param_dtypes": ["handle", "handle"],
                 "runtime_scalars": [],
             }
         )
@@ -238,7 +264,68 @@ def test_sunmmio_abi_from_modules_preserves_public_and_device_orders():
     assert abi.kernel_name == "main_kernel"
     assert abi.public_param_names == ("X", "LSE", "Y")
     assert abi.device_param_names == ("LSE", "X", "Y")
+    assert abi.device_param_dtypes == ("handle", "handle", "handle")
     assert abi.materialize_runtime_args(["x", "lse", "y"], lambda *_: None) == ["lse", "x", "y"]
+
+
+def _make_sunmmio_abi_with_host_scalar_expr(host_expr_builder):
+    m = tvm.tir.Var("m", "int32")
+    x_buffer = tvm.tir.decl_buffer((m,), "float32", name="X")
+    prim_func = tvm.tir.PrimFunc(
+        [x_buffer.data],
+        tvm.tir.Evaluate(0),
+        buffer_map={x_buffer.data: x_buffer},
+    ).with_attr("global_symbol", "main")
+    params = [KernelParam.from_buffer(x_buffer)]
+
+    device_func = tvm.tir.PrimFunc(
+        [tvm.tir.Var("X", "handle"), tvm.tir.Var("m", "int32")],
+        tvm.tir.Evaluate(0),
+    ).with_attr("tir.is_global_func", True)
+    device_mod = tvm.IRModule({"main_kernel": device_func})
+
+    host_call = tvm.tir.call_extern("int32", "main_kernel", x_buffer.data, host_expr_builder(m))
+    host_func = tvm.tir.PrimFunc([x_buffer.data], tvm.tir.Evaluate(host_call))
+    host_mod = tvm.IRModule({"host": host_func})
+
+    return SunmmioKernelABI.from_modules(
+        func_or_mod=prim_func,
+        host_mod=host_mod,
+        device_mod=device_mod,
+        params=params,
+    )
+
+
+def test_sunmmio_abi_binds_identity_cast_scalar_expr():
+    abi = _make_sunmmio_abi_with_host_scalar_expr(lambda m: tvm.tir.Cast("int32", m))
+
+    class Marker:
+        shape = (129,)
+
+    marker = Marker()
+
+    assert _runtime_scalar_sources(abi) == [("m", 0, "shape", 0)]
+    assert abi.materialize_runtime_args(
+        [marker],
+        lambda value, source_kind, dim_index: value.shape[dim_index] if source_kind == "shape" else None,
+    ) == [marker, 129]
+
+
+def test_sunmmio_abi_leaves_non_identity_scalar_expr_unbound():
+    abi = _make_sunmmio_abi_with_host_scalar_expr(lambda m: m + 1)
+
+    class Marker:
+        shape = (129,)
+
+    marker = Marker()
+
+    assert _runtime_scalar_sources(abi) == [("m", None, None, None)]
+    with pytest.raises(ValueError, match="cannot be inferred"):
+        abi.materialize_runtime_args(
+            [marker],
+            lambda value, source_kind, dim_index: value.shape[dim_index] if source_kind == "shape" else None,
+        )
+    assert abi.materialize_runtime_args([marker, 130], lambda *_: None) == [marker, 130]
 
 
 def test_sunmmio_backend_resolution_accepts_lowercase_target():
@@ -293,15 +380,17 @@ def test_sunmmio_adapter_resolves_target_before_libgen(tmp_path, monkeypatch):
     monkeypatch.setattr(SunmmioSuDeckLibraryGenerator, "__init__", record_init)
     monkeypatch.setattr(SunmmioSuDeckLibraryGenerator, "compile_lib", lambda self: None)
     monkeypatch.setattr(SunmmioSuDeckLibraryGenerator, "load_lib", lambda self, lib_path=None: None)
+    device_mod = tvm.IRModule({"kernel": tvm.tir.PrimFunc([], tvm.tir.Evaluate(0)).with_attr("tir.is_global_func", True)})
 
     adapter = SunmmioKernelSuDeckAdapter(
         params=[],
         result_idx=[],
         target="llvm -mcpu=sunmmio-test -mattr=device_mesh_nrow_4,device_mesh_ncol_4",
         func_or_mod=prim_func,
+        device_mod=device_mod,
         device_kernel_source="",
     )
-    toolchain = SunmmioToolchain(clangxx=tmp_path / "clang++")
+    toolchain = SunmmioToolchain(root=tmp_path, clangxx=tmp_path / "clang++")
     cflags = adapter.lib_generator._compile_flags(toolchain)
 
     assert len(observed_targets) == 1
@@ -309,6 +398,7 @@ def test_sunmmio_adapter_resolves_target_before_libgen(tmp_path, monkeypatch):
     assert str(observed_targets[0].attrs["mcpu"]) == "sunmmio-test"
     assert str(adapter.target.attrs["mcpu"]) == "sunmmio-test"
     assert [flag for flag in cflags if flag.startswith("-mcpu=")] == ["-mcpu=sunmmio-test"]
+    assert "kernel" in adapter.lib_generator.device_tir_source
 
 
 def test_sunmmio_cache_persists_artifacts_through_libgen(tmp_path):
@@ -325,15 +415,34 @@ def test_sunmmio_cache_persists_artifacts_through_libgen(tmp_path):
     kernel = Kernel()
     kernel.execution_backend = "sunmmio"
     kernel.adapter = Adapter()
+    kernel.adapter.abi = SunmmioKernelABI(
+        kernel_name="kernel",
+        public_arg_count=0,
+        public_param_names=(),
+        device_param_names=(),
+        runtime_scalars=(),
+        device_param_dtypes=(),
+    )
     kernel.adapter.lib_generator = SunmmioSuDeckLibraryGenerator(target, "kernel")
-    src_sudeck_elf = tmp_path / "source-sudeck.elf"
+    sudeck_build_dir = tmp_path / "sudeck-build"
+    sudeck_build_dir.mkdir()
+    src_sudeck_elf = sudeck_build_dir / "kernel.elf"
+    src_sudeck_mlir = sudeck_build_dir / "kernel.mlir"
+    src_sudeck_tir = sudeck_build_dir / "kernel.tir"
+    src_sudeck_ll = sudeck_build_dir / "kernel.ll"
     src_sudeck_elf.write_bytes(b"SUDECK_ELF")
+    src_sudeck_mlir.write_text("module {}", encoding="utf-8")
+    src_sudeck_tir.write_text("# device tir\n", encoding="utf-8")
+    src_sudeck_ll.write_text("define void @kernel() { ret void }", encoding="utf-8")
+    (sudeck_build_dir / "sudeck_launcher.so").write_bytes(b"LAUNCHER")
+    (sudeck_build_dir / "sudeck_launch.py").write_text("def call(*args):\n    return None\n", encoding="utf-8")
     kernel.adapter.lib_generator.artifact = SunmmioKernelArtifact(
-        elf_path=str(src_sudeck_elf),
-        llvm_ir_source="define void @kernel() { ret void }",
-        llvm_ir_path=str(tmp_path / "source-sudeck.ll"),
-        build_dir=str(tmp_path),
+        elf_path=src_sudeck_elf,
+        mlir_path=src_sudeck_mlir,
+        llvm_ir_path=src_sudeck_ll,
+        build_dir=sudeck_build_dir,
         runtime_kernel_name="kernel",
+        tir_path=src_sudeck_tir,
     )
 
     sunmmio_cache_dir = tmp_path / "sunmmio"
@@ -341,24 +450,38 @@ def test_sunmmio_cache_persists_artifacts_through_libgen(tmp_path):
     SunmmioKernelCache()._save_so_cubin_to_disk(kernel, str(sunmmio_cache_dir))
 
     kernel_elf = sunmmio_cache_dir / "kernel.elf"
+    kernel_mlir = sunmmio_cache_dir / "kernel.mlir"
+    kernel_tir = sunmmio_cache_dir / "kernel.tir"
     kernel_ll = sunmmio_cache_dir / "kernel.ll"
     assert kernel_elf.read_bytes() == b"SUDECK_ELF"
+    assert kernel_mlir.read_text(encoding="utf-8") == "module {}"
+    assert kernel_tir.read_text(encoding="utf-8") == "# device tir\n"
     assert kernel_ll.read_text(encoding="utf-8") == "define void @kernel() { ret void }"
-    assert json.loads((sunmmio_cache_dir / "abi.json").read_text(encoding="utf-8")) == {"kernel_name": "kernel"}
-    assert kernel.adapter.lib_generator.artifact.llvm_ir_path == str(kernel_ll)
-    assert kernel.adapter.lib_generator.artifact.llvm_ir_source == "define void @kernel() { ret void }"
-    assert kernel.adapter.lib_generator.libpath == str(kernel_elf)
+    assert json.loads((sunmmio_cache_dir / "abi.json").read_text(encoding="utf-8")) == kernel.adapter.abi.to_json_dict()
+    assert (sunmmio_cache_dir / "sudeck_launcher.so").read_bytes() == b"LAUNCHER"
+    assert (sunmmio_cache_dir / "sudeck_launch.py").exists()
+    assert kernel.adapter.lib_generator.artifact.llvm_ir_path == src_sudeck_ll
+    assert kernel.adapter.lib_generator.libpath is None
 
-    src_elf = tmp_path / "source.elf"
+    sunsim_build_dir = tmp_path / "sunsim-build"
+    sunsim_build_dir.mkdir()
+    src_elf = sunsim_build_dir / "kernel.elf"
+    src_mlir = sunsim_build_dir / "kernel.mlir"
+    src_tir = sunsim_build_dir / "kernel.tir"
+    src_ll = sunsim_build_dir / "kernel.ll"
     src_elf.write_bytes(b"ELF")
+    src_mlir.write_text("module {}", encoding="utf-8")
+    src_tir.write_text("# sunsim device tir\n", encoding="utf-8")
+    src_ll.write_text("define void @kernel() { ret void }", encoding="utf-8")
     kernel.execution_backend = "sunmmio_sunsim"
     kernel.adapter.lib_generator = SunmmioSunsimLibraryGenerator(target, "kernel")
     kernel.adapter.lib_generator.artifact = SunmmioKernelArtifact(
-        elf_path=str(src_elf),
-        llvm_ir_source="define void @kernel() { ret void }",
-        llvm_ir_path=str(tmp_path / "source.ll"),
-        build_dir=str(tmp_path),
+        elf_path=src_elf,
+        mlir_path=src_mlir,
+        llvm_ir_path=src_ll,
+        build_dir=sunsim_build_dir,
         runtime_kernel_name="kernel",
+        tir_path=src_tir,
     )
 
     sunsim_cache_dir = tmp_path / "sunsim"
@@ -366,20 +489,171 @@ def test_sunmmio_cache_persists_artifacts_through_libgen(tmp_path):
     SunmmioKernelCache()._save_so_cubin_to_disk(kernel, str(sunsim_cache_dir))
 
     assert (sunsim_cache_dir / "kernel.elf").read_bytes() == b"ELF"
+    assert (sunsim_cache_dir / "kernel.mlir").read_text(encoding="utf-8") == "module {}"
+    assert (sunsim_cache_dir / "kernel.tir").read_text(encoding="utf-8") == "# sunsim device tir\n"
     assert (sunsim_cache_dir / "kernel.ll").read_text(encoding="utf-8") == "define void @kernel() { ret void }"
-    assert json.loads((sunsim_cache_dir / "abi.json").read_text(encoding="utf-8")) == {"kernel_name": "kernel"}
+    assert json.loads((sunsim_cache_dir / "abi.json").read_text(encoding="utf-8")) == kernel.adapter.abi.to_json_dict()
     artifact = kernel.adapter.lib_generator.artifact
-    assert artifact.elf_path == str(sunsim_cache_dir / "kernel.elf")
-    assert artifact.llvm_ir_path == str(sunsim_cache_dir / "kernel.ll")
-    assert artifact.llvm_ir_source == "define void @kernel() { ret void }"
+    assert artifact.elf_path == src_elf
+    assert artifact.llvm_ir_path == src_ll
+
+
+def test_sunmmio_sudeck_dependency_uses_explicit_root(tmp_path, monkeypatch):
+    root, include_dir, library_path = _make_sudeck_install_root(tmp_path / "sudeck", sunmmio_libgen.SUNMMIO_SUDECK_MESH)
+
+    monkeypatch.setenv(sunmmio_libgen.SUNMMIO_SUDECK_ROOT_ENV, str(root))
+
+    sudeck = sunmmio_libgen.SuDeckToolchain.resolve()
+
+    assert sudeck.root == root.resolve()
+    assert sudeck.library_path == library_path.resolve()
+    assert sudeck.library_dir == library_path.parent.resolve()
+    assert sudeck.cmake_component == "mesh_4x4"
+    assert sudeck.cmake_target == "sudeck::sudeck_4x4"
+    assert str(root.resolve()) in sudeck.cmake_prefix_path().split(";")
+    assert include_dir.exists()
+
+
+def test_sunmmio_sudeck_dependency_requires_explicit_source(monkeypatch):
+    monkeypatch.delenv(sunmmio_libgen.SUNMMIO_SUDECK_ROOT_ENV, raising=False)
+
+    with pytest.raises(FileNotFoundError, match=sunmmio_libgen.SUNMMIO_SUDECK_ROOT_ENV):
+        sunmmio_libgen.SuDeckToolchain.resolve()
+
+
+def test_sunmmio_toolchain_resolves_device_ld(tmp_path):
+    device_ld = tmp_path / "sysroot" / "riscv64-unknown-elf" / "lib" / "sunmmio" / "sunmmio-a4e" / "device.ld"
+    device_ld.parent.mkdir(parents=True)
+    device_ld.write_text("SECTIONS {}\n", encoding="utf-8")
+    toolchain = SunmmioToolchain(root=tmp_path, clangxx=tmp_path / "clang++")
+
+    assert toolchain.resolve_device_ld("sunmmio-a4e") == device_ld
+
+
+def test_sunmmio_npuir_compile_error_reports_build_dir(tmp_path, monkeypatch):
+    target = determine_target("sunmmio", return_object=True)
+    generator = SunmmioSunsimLibraryGenerator(target, "kernel")
+    mlir_path = tmp_path / "kernel.mlir"
+    llvm_path = tmp_path / "kernel.ll"
+    mlir_path.write_text("module {}", encoding="utf-8")
+    captured = {}
+
+    def fake_run_command(command, **kwargs):
+        captured["description"] = kwargs["description"]
+        raise RuntimeError("npuir failed")
+
+    monkeypatch.setattr(sunmmio_libgen, "_run_command", fake_run_command)
+
+    with pytest.raises(RuntimeError, match="npuir failed"):
+        generator._run_npuir_compile(NpuirTools(compile=tmp_path / "npuir-compile"), mlir_path, llvm_path)
+
+    assert f"build_dir: {tmp_path}" in captured["description"]
+    assert f"mlir: {mlir_path}" in captured["description"]
+
+
+def test_sunmmio_load_lib_restores_optional_tir_path(tmp_path):
+    target = determine_target("sunmmio", return_object=True)
+    generator = SunmmioSunsimLibraryGenerator(target, "kernel")
+    elf_path = tmp_path / "kernel.elf"
+    mlir_path = tmp_path / "kernel.mlir"
+    ll_path = tmp_path / "kernel.ll"
+    tir_path = tmp_path / "kernel.tir"
+    elf_path.write_bytes(b"ELF")
+    mlir_path.write_text("module {}", encoding="utf-8")
+    ll_path.write_text("define void @kernel() { ret void }", encoding="utf-8")
+    tir_path.write_text("# device tir\n", encoding="utf-8")
+
+    generator.load_lib(elf_path)
+
+    assert generator.artifact.tir_path == tir_path
+
+
+def test_sunmmio_sudeck_launcher_accepts_explicit_stream_handle():
+    wrapper = SunmmioSuDeckSourceWrapper(
+        params=[("X", "tensor"), ("n", "int32")],
+        kernel_name="kernel",
+        elf_name="kernel.elf",
+        launcher_lib_name="sudeck_launcher.so",
+    )
+
+    launcher_cpp = wrapper.generate_launcher_cpp()
+    launch_module = wrapper.generate_python_module()
+
+    assert "void launch_kernel(int64_t a0, int32_t a1, int64_t stream_handle, tvm::ffi::Bytes elf, tvm::ffi::Bytes name)" in launcher_cpp
+    assert "int64_t stream_handle" in launcher_cpp
+    assert "default_stream" not in launcher_cpp
+    assert "reinterpret_cast<const Stream *>" in launcher_cpp
+    assert "Stream stream = *stream_ptr;" in launcher_cpp
+    assert "import torch" not in launch_module
+    assert "torch.sunmmio" not in launch_module
+    assert "def call(a0, a1, stream_handle):" in launch_module
+    assert "_load()(a0, a1, stream_handle, _ELF, _NAME)" in launch_module
+
+
+def test_sunmmio_sudeck_launcher_formats_empty_device_arg_list():
+    wrapper = SunmmioSuDeckSourceWrapper(
+        params=[],
+        kernel_name="kernel",
+        elf_name="kernel.elf",
+        launcher_lib_name="sudeck_launcher.so",
+    )
+
+    launcher_cpp = wrapper.generate_launcher_cpp()
+    launch_module = wrapper.generate_python_module()
+
+    assert "void launch_kernel(int64_t stream_handle, tvm::ffi::Bytes elf, tvm::ffi::Bytes name)" in launcher_cpp
+    assert "def call(stream_handle):" in launch_module
+    assert "_load()(stream_handle, _ELF, _NAME)" in launch_module
+
+
+def test_sunmmio_sudeck_adapter_passes_torch_current_stream(monkeypatch):
+    stream = object()
+    torch_mod = types.ModuleType("torch")
+    torch_mod.sunmmio = types.SimpleNamespace(
+        current_stream=lambda: stream,
+        unsafe_get_sudeck_stream_handle=lambda value: 0x1234 if value is stream else 0,
+    )
+    torch_sunmmio_mod = types.ModuleType("torch_sunmmio")
+    torch_sunmmio_sunmmio_mod = types.ModuleType("torch_sunmmio.sunmmio")
+    torch_sunmmio_sunmmio_mod.unsafe_get_sutensor_handle = lambda value: 0x5678
+    monkeypatch.setitem(sys.modules, "torch", torch_mod)
+    monkeypatch.setitem(sys.modules, "torch_sunmmio", torch_sunmmio_mod)
+    monkeypatch.setitem(sys.modules, "torch_sunmmio.sunmmio", torch_sunmmio_sunmmio_mod)
+
+    calls = []
+    adapter = object.__new__(SunmmioKernelSuDeckAdapter)
+    adapter.result_idx = []
+    adapter.abi = SunmmioKernelABI(
+        kernel_name="kernel",
+        public_arg_count=1,
+        public_param_names=("X",),
+        device_param_names=("X",),
+        runtime_scalars=(),
+        device_param_dtypes=("handle",),
+    )
+    adapter.lib_generator = types.SimpleNamespace(pymodule=types.SimpleNamespace(call=lambda *args: calls.append(args)))
+
+    func = SunmmioKernelSuDeckAdapter._convert_torch_func(adapter)
+    func("tensor")
+
+    assert calls == [(0x5678, 0x1234)]
 
 
 def test_sunmmio_sudeck_compile_emits_kernel_elf_without_thunk(tmp_path, monkeypatch):
     target = determine_target("sunmmio", return_object=True)
     generator = SunmmioSuDeckLibraryGenerator(target, "kernel")
+    generator.update_mlir_source("module {}")
+    generator.update_device_tir_source("# device tir\n")
     llvm_source = "define void @kernel(ptr %0) #0 !sunmmio.kernel_meta !1 { ret void }"
 
-    fake_toolchain = SunmmioToolchain(clangxx=tmp_path / "clang++")
+    sudeck_root, _, sudeck_library_path = _make_sudeck_install_root(tmp_path / "sudeck", sunmmio_libgen.SUNMMIO_SUDECK_MESH)
+    ffi_include = tmp_path / "ffi" / "include"
+    ffi_lib_dir = tmp_path / "ffi" / "lib"
+    ffi_library = ffi_lib_dir / "libtvm_ffi.so"
+    ffi_include.mkdir(parents=True)
+    ffi_lib_dir.mkdir(parents=True)
+    ffi_library.write_bytes(b"fake tvm ffi")
+    fake_toolchain = SunmmioToolchain(root=tmp_path, clangxx=tmp_path / "clang++")
     commands = []
 
     def fake_resolve():
@@ -387,29 +661,41 @@ def test_sunmmio_sudeck_compile_emits_kernel_elf_without_thunk(tmp_path, monkeyp
 
     def fake_run_command(command, **kwargs):
         commands.append([str(part) for part in command])
-        output_path = Path(command[command.index("-o") + 1])
-        output_path.write_bytes(b"ELF")
+        if command[0] == "cmake":
+            if "--build" in command:
+                (tmp_path / "sudeck_launcher.so").write_bytes(b"LAUNCHER")
+        else:
+            output_path = Path(command[command.index("-o") + 1])
+            output_path.write_bytes(b"ELF")
 
         class Result:
             stdout = ""
 
         return Result()
 
-    def fake_materialize_llvm_ir(output_path=None, **kwargs):
-        Path(output_path).write_text(llvm_source, encoding="utf-8")
-        return llvm_source
+    def fake_mlir_to_llvm_ir(mlir_path, llvm_path):
+        Path(llvm_path).write_text(llvm_source, encoding="utf-8")
 
+    def fake_write_sudeck_linker_script(toolchain, mcpu, out_path):
+        Path(out_path).write_text("SECTIONS {}\n", encoding="utf-8")
+        return Path(out_path)
+
+    monkeypatch.setenv(sunmmio_libgen.SUNMMIO_SUDECK_ROOT_ENV, str(sudeck_root))
     monkeypatch.setattr(sunmmio_libgen.SunmmioToolchain, "resolve", fake_resolve)
     monkeypatch.setattr(sunmmio_libgen, "_run_command", fake_run_command)
-    monkeypatch.setattr(generator, "materialize_llvm_ir", fake_materialize_llvm_ir)
+    monkeypatch.setattr(sunmmio_libgen, "_write_sudeck_linker_script", fake_write_sudeck_linker_script)
+    monkeypatch.setattr(sunmmio_libgen, "_tvm_ffi_paths", lambda: (ffi_include, ffi_library))
+    monkeypatch.setattr(generator, "_mlir_to_llvm_ir", fake_mlir_to_llvm_ir)
 
     generator.compile_lib(output_dir=tmp_path)
 
-    assert (tmp_path / "kernel.ll").read_text(encoding="utf-8") == generator.artifact.llvm_ir_source
+    assert (tmp_path / "kernel.ll").read_text(encoding="utf-8") == generator.artifact.llvm_ir_path.read_text(encoding="utf-8")
+    assert (tmp_path / "kernel.tir").read_text(encoding="utf-8") == "# device tir\n"
+    assert generator.artifact.tir_path == tmp_path / "kernel.tir"
     assert (tmp_path / "kernel.elf").read_bytes() == b"ELF"
     assert not (tmp_path / "main_thunk.cpp").exists()
     assert not (tmp_path / "main_thunk.o").exists()
-    assert len(commands) == 2
+    assert len(commands) == 4
     assert commands[0][:2] == [str(fake_toolchain.clangxx), "-c"]
     assert "--target=riscv64-sunmmio-elf" in commands[0]
     assert all(not flag.startswith("--sysroot=") for command in commands for flag in command)
@@ -421,6 +707,23 @@ def test_sunmmio_sudeck_compile_emits_kernel_elf_without_thunk(tmp_path, monkeyp
     assert str(tmp_path / "kernel.elf") in commands[1]
     assert "-nostartfiles" in commands[1]
     assert "-lnosys" in commands[1]
+    assert commands[2][:5] == ["cmake", "-S", str(tmp_path), "-B", str(tmp_path / "sudeck_launcher_cmake")]
+    assert f"-DCMAKE_PREFIX_PATH={sudeck_root.resolve()}" in commands[2]
+    assert commands[3] == [
+        "cmake",
+        "--build",
+        str(tmp_path / "sudeck_launcher_cmake"),
+        "--target",
+        "tilelang_sudeck_launcher",
+        "--config",
+        "Release",
+    ]
+    cmake_lists = (tmp_path / "CMakeLists.txt").read_text(encoding="utf-8")
+    assert "find_package(SuDeck REQUIRED COMPONENTS mesh_4x4)" in cmake_lists
+    assert "sudeck::sudeck_4x4" in cmake_lists
+    assert str(ffi_library) in cmake_lists
+    assert str(sudeck_library_path.parent.resolve()) in cmake_lists
+    assert "/usr/include/sunmmio" not in cmake_lists
     for command in commands:
         assert "main_thunk.o" not in command
 
@@ -677,7 +980,7 @@ def test_sunmmio_abi_extracts_dynamic_shape_bindings():
     assert abi.materialize_runtime_args([*args, 129, 257], lambda *_: None) == [*args, 129, 257]
 
 
-def test_sunmmio_abi_falls_back_to_prim_func_for_cached_dynamic_kernel():
+def test_sunmmio_abi_requires_lowered_device_module_for_dynamic_kernel():
     _require_sunmmio_codegen()
 
     example = _load_sunmmio_dynamic_elementwise_example()
@@ -694,21 +997,13 @@ def test_sunmmio_abi_falls_back_to_prim_func_for_cached_dynamic_kernel():
         enable_device_compile=False,
     )
 
-    abi = SunmmioKernelABI.from_modules(
-        func_or_mod=prim_func,
-        host_mod=None,
-        device_mod=None,
-        params=artifact.params,
-    )
-
-    assert abi.kernel_name == "elem_add"
-    assert abi.public_arg_count == 3
-    assert abi.public_param_names == ("A", "B", "C")
-    assert abi.runtime_scalar_names == ("m", "n")
-    assert _runtime_scalar_sources(abi) == [
-        ("m", 0, "shape", 0),
-        ("n", 0, "shape", 1),
-    ]
+    with pytest.raises(ValueError, match="requires device_mod"):
+        SunmmioKernelABI.from_modules(
+            func_or_mod=prim_func,
+            host_mod=None,
+            device_mod=None,
+            params=artifact.params,
+        )
 
 
 def test_sunmmio_sunsim_cache_restores_abi_kernel_name_from_metadata(tmp_path):
@@ -724,8 +1019,10 @@ def test_sunmmio_sunsim_cache_restores_abi_kernel_name_from_metadata(tmp_path):
     params = [KernelParam.from_buffer(prim_func.buffer_map[param]) for param in prim_func.params]
 
     elf_path = tmp_path / "kernel.elf"
+    mlir_path = tmp_path / "kernel.mlir"
     ll_path = tmp_path / "kernel.ll"
     elf_path.write_bytes(b"ELF")
+    mlir_path.write_text("module {}", encoding="utf-8")
     ll_path.write_text(
         "define void @elem_add_kernel(ptr %0, ptr %1, ptr %2, i32 %3, i32 %4) #0 !sunmmio.kernel_meta !1 { ret void }",
         encoding="utf-8",
@@ -739,6 +1036,7 @@ def test_sunmmio_sunsim_cache_restores_abi_kernel_name_from_metadata(tmp_path):
             SunmmioRuntimeScalar("m", source_param_index=0, source_kind="shape", source_dim=0),
             SunmmioRuntimeScalar("n", source_param_index=0, source_kind="shape", source_dim=1),
         ),
+        device_param_dtypes=("handle", "handle", "handle", "int32", "int32"),
     )
     (tmp_path / "abi.json").write_text(json.dumps(cached_abi.to_json_dict()), encoding="utf-8")
 
@@ -759,7 +1057,7 @@ def test_sunmmio_sunsim_cache_restores_abi_kernel_name_from_metadata(tmp_path):
     adapter = kernel.adapter
 
     assert adapter.abi.kernel_name == "elem_add_kernel"
-    assert adapter.runtime_kernel_name == "elem_add_kernel"
+    assert adapter.kernel_name == "elem_add_kernel"
     assert adapter.abi.public_param_names == ("A", "B", "C")
     assert adapter.abi.device_param_names == ("B", "A", "C", "m", "n")
     assert adapter.abi.runtime_scalar_names == ("m", "n")
@@ -896,14 +1194,14 @@ def test_sunmmio_base_adapter_does_not_expose_sunsim_runtime_surface(tmp_path):
     llvm_path = tmp_path / "kernel.ll"
 
     generator.artifact = SunmmioKernelArtifact(
-        elf_path=str(tmp_path / "kernel.elf"),
-        llvm_ir_source="define void @kernel() { ret void }",
-        llvm_ir_path=str(llvm_path),
-        build_dir=str(tmp_path),
+        elf_path=tmp_path / "kernel.elf",
+        mlir_path=tmp_path / "kernel.mlir",
+        llvm_ir_path=llvm_path,
+        build_dir=tmp_path,
         runtime_kernel_name="kernel",
     )
 
-    assert generator.artifact.llvm_ir_path == str(llvm_path)
+    assert generator.artifact.llvm_ir_path == llvm_path
     assert generator.get_lib_path() is None
 
 
@@ -925,11 +1223,10 @@ define void @elem_add_kernel(ptr addrspace(4) %0) #0 !sunmmio.kernel_meta !1 {
 }
 """
 
-    def fake_materialize_llvm_ir(output_path=None, **kwargs):
-        Path(output_path).write_text(llvm_source, encoding="utf-8")
-        return llvm_source
+    def fake_mlir_to_llvm_ir(mlir_path, llvm_path):
+        Path(llvm_path).write_text(llvm_source, encoding="utf-8")
 
-    fake_toolchain = SunmmioToolchain(clangxx=tmp_path / "clang++")
+    fake_toolchain = SunmmioToolchain(root=tmp_path, clangxx=tmp_path / "clang++")
     commands = []
 
     def fake_resolve():
@@ -947,7 +1244,7 @@ define void @elem_add_kernel(ptr addrspace(4) %0) #0 !sunmmio.kernel_meta !1 {
 
     monkeypatch.setattr(sunmmio_libgen.SunmmioToolchain, "resolve", fake_resolve)
     monkeypatch.setattr(sunmmio_libgen, "_run_command", fake_run_command)
-    monkeypatch.setattr(generator, "materialize_llvm_ir", fake_materialize_llvm_ir)
+    monkeypatch.setattr(generator, "_mlir_to_llvm_ir", fake_mlir_to_llvm_ir)
 
     generator.compile_lib(output_dir=tmp_path)
     thunk = (tmp_path / "main_thunk.cpp").read_text(encoding="utf-8")
@@ -963,7 +1260,7 @@ define void @elem_add_kernel(ptr addrspace(4) %0) #0 !sunmmio.kernel_meta !1 {
     assert all(not flag.startswith("--sysroot=") for command in commands for flag in command)
 
 
-@tilelang.jit(target="sunmmio", out_idx=[2])
+@tilelang.jit(target="sunmmio")
 def elementwise_add_jit(M, N, block_M, block_N, in_dtype, out_dtype):
     """JIT version of examples/sunmmio/elementwise/elementwise_add.py."""
 
@@ -1010,9 +1307,6 @@ def test_sunmmio_jit_lowercase_target_generates_suvm_source():
     assert "suvm.device_arch" in source
     assert "func.func @elem_add" in source
 
-    with pytest.raises(RuntimeError, match="Sunmmio SuDeck JIT runtime execution is not implemented yet"):
-        kernel(None, None)
-
 
 @tilelang.jit(target="sunmmio")
 def row_major_copy_jit(M, N, dtype):
@@ -1023,7 +1317,7 @@ def row_major_copy_jit(M, N, dtype):
         A: T.Tensor((M, N), dtype),
         B: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(1):
+        with T.Kernel():
             A_shared = T.alloc_shared((M, N), dtype, scope="shared.rsram")
             T.annotate_layout({A_shared: rsram_layout})
 
@@ -1041,11 +1335,12 @@ def test_sunmmio_jit_row_major_copy_lowers_to_llvm_ir(tmp_path):
     _require_sunmmio_toolchain()
 
     kernel = row_major_copy_jit(32, 64, T.float32)
+    mlir_path = tmp_path / "row_major_copy_jit.mlir"
     llvm_path = tmp_path / "row_major_copy_jit.ll"
 
-    llvm_ir = kernel.adapter.lib_generator.materialize_llvm_ir(
-        output_path=llvm_path,
-    )
+    kernel.adapter.lib_generator._dump_mlir(mlir_path)
+    kernel.adapter.lib_generator._mlir_to_llvm_ir(mlir_path, llvm_path)
+    llvm_ir = llvm_path.read_text(encoding="utf-8")
 
     assert llvm_path.read_text(encoding="utf-8") == llvm_ir
     assert "suvm.device_arch" in kernel.get_kernel_source()
@@ -1088,9 +1383,8 @@ def test_sunmmio_jit_cache_saves_llvm_ir(tmp_path, monkeypatch):
         llvm_ir = ll_files[0].read_text(encoding="utf-8")
         artifact = kernel.adapter.lib_generator.artifact
         assert artifact is not None
-        assert artifact.llvm_ir_source == llvm_ir
-        assert Path(artifact.llvm_ir_path) == ll_files[0]
-        assert Path(artifact.elf_path) == elf_files[0]
+        assert artifact.llvm_ir_path.read_text(encoding="utf-8") == llvm_ir
+        assert artifact.elf_path.read_bytes() == elf_files[0].read_bytes()
         assert "define void @copy_kernel" in llvm_ir
         assert "sunmmio.kernel_meta" in llvm_ir
 
@@ -1104,9 +1398,9 @@ def test_sunmmio_jit_cache_saves_llvm_ir(tmp_path, monkeypatch):
 
         cached_artifact = cached_kernel.adapter.lib_generator.artifact
         assert cached_artifact is not None
-        assert cached_artifact.llvm_ir_source == llvm_ir
-        assert Path(cached_artifact.llvm_ir_path) == ll_files[0]
-        assert Path(cached_artifact.elf_path) == elf_files[0]
+        assert cached_artifact.llvm_ir_path == ll_files[0]
+        assert cached_artifact.llvm_ir_path.read_text(encoding="utf-8") == llvm_ir
+        assert cached_artifact.elf_path == elf_files[0]
     finally:
         row_major_copy_jit._kernel_cache.clear()
         _dispatch_map["sunmmio"]._memory_cache.clear()
