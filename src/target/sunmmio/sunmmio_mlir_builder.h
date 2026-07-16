@@ -125,11 +125,13 @@ public:
   SunMMIOValue TileRectMask(const std::string &result_name,
                             const SunMMIOValue &valid_rows,
                             const SunMMIOValue &valid_cols,
-                            const SunMMIOType &tile_type) final;
+                            const SunMMIOType &tile_type,
+                            DataType index_dtype) final;
 
   SunMMIOValue TileAxisMask(const std::string &result_name, int64_t axis,
                             const SunMMIOValue &valid_extent,
-                            const SunMMIOType &tile_type) final;
+                            const SunMMIOType &tile_type,
+                            DataType index_dtype) final;
 
   SunMMIOValue TileMaskAnd(const std::string &result_name,
                            const SunMMIOValue &lhs, const SunMMIOValue &rhs,

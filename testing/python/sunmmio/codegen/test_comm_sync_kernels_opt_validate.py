@@ -19,7 +19,7 @@ LOOSE_OPT_ARGS = ("--verify-each",)
 
 
 @target("Sunmmio")
-def comm_broadcast_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16"):
+def comm_broadcast_kernel(M=128, N=128, block_M=32, block_N=32, dtype="bfloat16"):
     @T.prim_func
     def main(
         A: T.Tensor((M, N), dtype),
@@ -38,7 +38,7 @@ def comm_broadcast_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16")
 
 
 @target("Sunmmio")
-def comm_put_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16"):
+def comm_put_kernel(M=128, N=128, block_M=32, block_N=32, dtype="bfloat16"):
     @T.prim_func
     def main(A: T.Tensor((M, N), dtype)):
         with T.Kernel():
@@ -59,7 +59,7 @@ def comm_all_gather_kernel(
     N=128,
     block_M=32,
     block_N=32,
-    dtype="float16",
+    dtype="bfloat16",
     direction="all",
     axis=None,
 ):
@@ -86,7 +86,7 @@ def comm_all_gather_kernel(
 
 
 @target("Sunmmio")
-def sync_simple_copy_kernel(M=128, N=128, block_M=32, block_N=32, dtype="float16"):
+def sync_simple_copy_kernel(M=128, N=128, block_M=32, block_N=32, dtype="bfloat16"):
     @T.prim_func
     def main(
         A: T.Tensor((M, N), dtype),
@@ -110,7 +110,7 @@ def sync_mma_kernel(
     block_M=32,
     block_N=32,
     block_K=32,
-    dtype="float16",
+    dtype="bfloat16",
     accum_dtype="float32",
 ):
     @T.prim_func
@@ -141,7 +141,7 @@ def sync_if_broadcast_kernel(
     block_M=32,
     block_N=32,
     block_K=32,
-    dtype="float16",
+    dtype="bfloat16",
     accum_dtype="float32",
 ):
     @T.prim_func
@@ -268,7 +268,7 @@ def test_sync_mma_kernel_codegen_validates_with_npuir_opt(tmp_path):
     )
 
     assert src.count("suvm.copy_async") >= 3
-    assert src.count("suvm.tc.mma") == 1
+    assert src.count("suvm.tc.mma") == 2
 
 
 def test_sync_if_broadcast_kernel_codegen_validates_with_npuir_opt(tmp_path):

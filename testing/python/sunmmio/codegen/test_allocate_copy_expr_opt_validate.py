@@ -21,7 +21,6 @@ tilelang.env.disable_cache()
 # Debug logs from this file:
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
-# dtype = T.bfloat16
 
 
 @target("Sunmmio")
@@ -32,7 +31,7 @@ def basic_allocate_copy_mma_kernel(
     block_M=32,
     block_N=32,
     block_K=32,
-    dtype=T.float16,
+    dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
     shard_policy = T.MeshShardingPolicy(x=1, y=0)
@@ -89,7 +88,7 @@ def allocate_dma_copy_kernel_plus(
     block_M=32,
     block_N=32,
     block_K=32,
-    dtype=T.float16,
+    dtype=T.bfloat16,
 ):
     shard_policy = T.MeshShardingPolicy(x=1, y=0)
     A_layout = make_zz_layout((M, K))
@@ -190,7 +189,7 @@ def offset_region_copy_kernel_plus(
     block_N=64,
     tile_M=32,
     tile_N=32,
-    dtype=T.float16,
+    dtype=T.bfloat16,
 ):
     shard_policy = T.MeshShardingPolicy(x=1, y=0)
     A_layout = make_zz_layout((M, N))

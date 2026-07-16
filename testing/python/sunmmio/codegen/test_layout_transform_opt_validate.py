@@ -22,7 +22,7 @@ os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 def layout_transform_roundtrip_kernel(
     m=128,
     n=128,
-    dtype=T.float16,
+    dtype=T.bfloat16,
 ):
     shard_policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
     dram_layout = make_zz_layout((m, n), axes=[0, 1], block_shape=(32, 32))
