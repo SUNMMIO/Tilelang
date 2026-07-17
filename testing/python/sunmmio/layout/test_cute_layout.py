@@ -413,11 +413,10 @@ class TestSunmmioConstructors:
         assert _eval(layout, 0, 0, 0, 1) == 1  # BN stride = 1
         assert _eval(layout, 0, 1, 0, 0) == 32  # BM stride = BN = 32
 
-        # Non-selected axes are outermost row-major
-        selected_size = 32 * 4 * 32 * 2  # BM*QM * BN*QN = 128*64 = 8192
+        # sutensor-proto interleaves non-selected axes with the selected axes'
+        # outer modes in tensor-dimension Z order.
         mst = [int(x) for x in get_mode_stride(layout)]
-        assert mst[3] == selected_size  # nhead stride
-        assert mst[0] == selected_size * 4  # bsz stride = nhead_stride * nhead
+        assert mst == [32768, 32, 8192, 2048, 1, 1024]
 
         # Last element
         ss = int(ANA.simplify(get_storage_size(layout)))
