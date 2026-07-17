@@ -35,6 +35,8 @@ def _eval(layout, *indices):
 
 _storage_size = tvm_ffi.get_global_func("tl.CuteLayout_storage_size")
 _covered_shape = tvm_ffi.get_global_func("tl.CuteLayout_covered_shape")
+_mode_shape = tvm_ffi.get_global_func("tl.CuteLayout_mode_shape")
+_mode_stride = tvm_ffi.get_global_func("tl.CuteLayout_mode_stride")
 _derive_layout_like = tvm_ffi.get_global_func("tl.DeriveLayoutLike")
 
 
@@ -102,6 +104,30 @@ def test_make_zz_layout_defaults_to_last_two_axes():
     default_layout = make_zz_layout(shape, block_shape=(4, 32))
     explicit_layout = make_zz_layout(shape, axes=[2, 3], block_shape=(4, 32))
     assert is_same_layout(default_layout, explicit_layout)
+
+
+def test_make_zz_layout_interleaves_scalar_dims_at_outer_level():
+    """Match sutensor-proto HStride ordering for attention-style 4D ZZ."""
+    layout = make_zz_layout((2, 128, 4, 128), axes=[1, 3], block_shape=(32, 32))
+
+    assert [int(v) for v in _mode_shape(layout)] == [2, 32, 4, 4, 32, 4]
+    assert [int(v) for v in _mode_stride(layout)] == [65536, 32, 16384, 4096, 1, 1024]
+
+    # seq_outer and the scalar n_head dimension share the outermost level in
+    # tensor-dimension order; neither sits outside the full tiled hierarchy.
+    assert _eval(layout, 0, 0, 1, 0) == 4096
+    assert _eval(layout, 0, 32, 0, 0) == 16384
+    assert _eval(layout, 0, 33, 2, 65) == 26657
+
+
+def test_make_zz_layout_uses_tensor_dim_order_for_reversed_axes():
+    """Z traversal follows tensor dimensions, not the order of axes."""
+    layout = make_zz_layout((128, 64), axes=[1, 0], block_shape=(32, 32))
+
+    assert [int(v) for v in _mode_shape(layout)] == [32, 4, 32, 2]
+    assert [int(v) for v in _mode_stride(layout)] == [32, 2048, 1, 1024]
+    assert _eval(layout, 1, 0) == 32
+    assert _eval(layout, 0, 1) == 1
 
 
 def test_make_zz_layout_rejects_rank_one_default_axes():
