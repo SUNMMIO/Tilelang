@@ -6,15 +6,16 @@ emit TIR intrinsics for inter-core communication on a target mesh.
 
 from __future__ import annotations
 
-from typing import Literal
+import warnings
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import tvm_ffi
-from tvm import ir, tir
+from tvm import arith, ir, tir
 import tilelang.language as T
 from tilelang._typing import BufferLikeType
-from tilelang.utils.language import (
-    to_buffer_region,
-)
+from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
+from tilelang.utils.language import prim_expr_equal
 
 from tilelang.carver.arch.driver import get_sunmmio_device_mesh_config
 
@@ -37,6 +38,26 @@ REDUCE_TYPE_LIST = (
 CoreCoord = int | tir.PrimExpr
 CoreSpec = CoreCoord | tuple[CoreCoord, CoreCoord]
 ACCESS_MASK = {"r": 1, "w": 2, "rw": 3}
+_OperandKind = Literal["buffer", "region", "load"]
+
+# Keep operand extraction, clipping, rank matching, and destination shrinking
+# aligned with the SunMMIO path in copy_op.py.
+
+
+@dataclass(frozen=True)
+class _CommRegionSpec:
+    kind: _OperandKind
+    buffer: tir.Buffer
+    mins: list[tir.PrimExpr]
+    extents: list[tir.PrimExpr] | None
+    explicit_extents: bool
+
+
+@dataclass(frozen=True)
+class _NormalizedCommRegion:
+    spec: _CommRegionSpec
+    mins: list[tir.PrimExpr]
+    extents: list[tir.PrimExpr]
 
 
 def get_target_mesh_shape() -> dict[str, int]:
@@ -103,12 +124,10 @@ def _const_int(value):
 
 
 def _extent_equal(lhs, rhs) -> bool:
-    lhs_int = _const_int(lhs)
-    rhs_int = _const_int(rhs)
-    if lhs_int is not None and rhs_int is not None:
-        return lhs_int == rhs_int
+    if prim_expr_equal(lhs, rhs):
+        return True
     try:
-        return bool(ir.structural_equal(lhs, rhs))
+        return bool(arith.Analyzer().can_prove_equal(lhs, rhs))
     except (TypeError, ValueError):
         return False
 
@@ -117,38 +136,552 @@ def _extent_is_dynamic(extent) -> bool:
     return isinstance(extent, tir.PrimExpr) and _const_int(extent) is None
 
 
-def _extent_is_one(extent) -> bool:
+def _resolve_let_value(obj: Any) -> Any:
+    from tilelang.language.frame import get_let_value, has_let_value
+
+    if isinstance(obj, tir.Var) and has_let_value(obj):
+        return get_let_value(obj)
+    return obj
+
+
+def _extract_comm_region_spec(obj: BufferLikeType, op_name: str) -> _CommRegionSpec:
+    obj = _unwrap_mesh_tensor(_resolve_let_value(obj))
+    if isinstance(obj, tir.Buffer):
+        mins = [tir.IntImm("int32", 0) for _ in obj.shape]
+        return _CommRegionSpec("buffer", obj, mins, list(obj.shape), False)
+    if isinstance(obj, tir.BufferRegion):
+        mins = [region.min for region in obj.region]
+        extents = [region.extent for region in obj.region]
+        return _CommRegionSpec("region", obj.buffer, mins, extents, True)
+    if isinstance(obj, tir.BufferLoad):
+        return _CommRegionSpec("load", obj.buffer, list(obj.indices), None, False)
+    raise TypeError(f"Unsupported argument type for {op_name}: {type(obj)}")
+
+
+def _extent_is_squeezable_one(extent: tir.PrimExpr) -> bool:
+    if prim_expr_equal(extent, 1):
+        return True
+    if isinstance(extent, tir.Min):
+        return prim_expr_equal(extent.a, 1) or prim_expr_equal(extent.b, 1)
+    return False
+
+
+def _extent_gt(lhs: tir.PrimExpr, rhs: tir.PrimExpr) -> bool:
+    lhs_int = _const_int(lhs)
+    rhs_int = _const_int(rhs)
+    return lhs_int is not None and rhs_int is not None and lhs_int > rhs_int
+
+
+def _warn_explicit_oob(
+    op_name: str,
+    buffer: tir.Buffer,
+    dim: int,
+    min_value: tir.PrimExpr,
+    extent: tir.PrimExpr,
+    shape: tir.PrimExpr,
+) -> None:
+    warnings.warn(
+        f"{op_name} explicit BufferRegion exceeds buffer shape and will be clipped: "
+        f"{buffer.name}[dim={dim}], min={min_value}, extent={extent}, shape={shape}",
+        stacklevel=4,
+    )
+
+
+def _clip_extent_to_shape(
+    spec: _CommRegionSpec,
+    op_name: str,
+    dim: int,
+    min_value: tir.PrimExpr,
+    extent: tir.PrimExpr,
+    shape: tir.PrimExpr,
+) -> tir.PrimExpr:
+    min_int = _const_int(min_value)
+    extent_int = _const_int(extent)
+    shape_int = _const_int(shape)
+
+    if min_int is not None and shape_int is not None and (min_int < 0 or min_int >= shape_int):
+        raise ValueError(
+            f"{op_name} region starts outside buffer shape: {spec.buffer.name}[dim={dim}], min={min_value}, extent={extent}, shape={shape}"
+        )
+
+    if min_int is not None and extent_int is not None and shape_int is not None:
+        available = shape_int - min_int
+        clipped = min(extent_int, available)
+        if clipped < extent_int and spec.explicit_extents:
+            _warn_explicit_oob(op_name, spec.buffer, dim, min_value, extent, shape)
+        return tir.IntImm(extent.dtype if hasattr(extent, "dtype") else "int32", clipped)
+
+    return extent
+
+
+def _clip_region_to_shape(
+    spec: _CommRegionSpec,
+    mins: list[tir.PrimExpr],
+    extents: list[tir.PrimExpr],
+    op_name: str,
+) -> _NormalizedCommRegion:
+    if len(mins) != len(extents) or len(extents) != len(spec.buffer.shape):
+        raise ValueError(
+            f"{op_name} region rank does not match buffer rank before clipping: "
+            f"{spec.buffer.name}, mins={len(mins)}, extents={len(extents)}, shape={len(spec.buffer.shape)}"
+        )
+    clipped_extents = [
+        _clip_extent_to_shape(spec, op_name, dim, min_value, extent, shape)
+        for dim, (min_value, extent, shape) in enumerate(zip(mins, extents, spec.buffer.shape))
+    ]
+    return _NormalizedCommRegion(spec, list(mins), clipped_extents)
+
+
+def _int_one() -> tir.IntImm:
+    return tir.IntImm("int32", 1)
+
+
+def _infer_load_extents_from_peer(spec: _CommRegionSpec, peer_extents: list[tir.PrimExpr]) -> list[tir.PrimExpr]:
+    rank = len(spec.mins)
+    extents = list(peer_extents)
+    if len(extents) < rank:
+        return [_int_one() for _ in range(rank - len(extents))] + extents
+    return extents[-rank:]
+
+
+def _normalize_comm_regions(
+    src: _CommRegionSpec,
+    dst: _CommRegionSpec,
+    op_name: str,
+) -> tuple[_NormalizedCommRegion, _NormalizedCommRegion]:
+    if src.kind == "load" and dst.kind == "load":
+        raise ValueError(f"{op_name} cannot infer extents when both operands are BufferLoad values.")
+
+    if src.kind == "load" and dst.kind == "region":
+        assert dst.extents is not None
+        dst_region = _clip_region_to_shape(dst, dst.mins, list(dst.extents), op_name)
+        src_extents = _infer_load_extents_from_peer(src, dst_region.extents)
+        src_region = _clip_region_to_shape(src, src.mins, src_extents, op_name)
+        return src_region, dst_region
+
+    if src.kind == "region" and dst.kind == "load":
+        assert src.extents is not None
+        src_region = _clip_region_to_shape(src, src.mins, list(src.extents), op_name)
+        dst_extents = _infer_load_extents_from_peer(dst, src_region.extents)
+        dst_region = _clip_region_to_shape(dst, dst.mins, dst_extents, op_name)
+        return src_region, dst_region
+
+    src_extents = src.extents
+    dst_extents = dst.extents
+    if src.kind == "load":
+        assert dst_extents is not None
+        src_extents = _infer_load_extents_from_peer(src, dst_extents)
+    if dst.kind == "load":
+        assert src_extents is not None
+        dst_extents = _infer_load_extents_from_peer(dst, src_extents)
+
+    assert src_extents is not None and dst_extents is not None
+    src_region = _clip_region_to_shape(src, src.mins, list(src_extents), op_name)
+    dst_region = _clip_region_to_shape(dst, dst.mins, list(dst_extents), op_name)
+    return src_region, dst_region
+
+
+def _format_extents(extents: list[tir.PrimExpr]) -> str:
+    return "[" + ", ".join(str(extent) for extent in extents) + "]"
+
+
+def _suffix_axis_map(
+    src: _NormalizedCommRegion,
+    dst: _NormalizedCommRegion,
+    op_name: str,
+) -> list[tuple[int, int]]:
+    src_rank = len(src.extents)
+    dst_rank = len(dst.extents)
+    matched_rank = min(src_rank, dst_rank)
+
+    if src_rank > dst_rank:
+        for dim, extent in enumerate(src.extents[: src_rank - dst_rank]):
+            if not prim_expr_equal(extent, 1):
+                raise ValueError(
+                    f"{op_name} rank mismatch: src has non-1 extra leading dimension at dim {dim}, "
+                    f"extent={extent}; src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
+                )
+        return [(src_rank - matched_rank + dim, dim) for dim in range(matched_rank)]
+
+    if dst_rank > src_rank:
+        for dim, extent in enumerate(dst.extents[: dst_rank - src_rank]):
+            if not prim_expr_equal(extent, 1):
+                raise ValueError(
+                    f"{op_name} rank mismatch: dst has non-1 extra leading dimension at dim {dim}, "
+                    f"extent={extent}; src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
+                )
+        return [(dim, dst_rank - matched_rank + dim) for dim in range(matched_rank)]
+
+    return [(dim, dim) for dim in range(matched_rank)]
+
+
+def _squeezed_axis_map(
+    src: _NormalizedCommRegion,
+    dst: _NormalizedCommRegion,
+    op_name: str,
+) -> list[tuple[int, int]]:
+    if len(src.extents) == len(dst.extents):
+        identity_compatible = True
+        for src_extent, dst_extent in zip(src.extents, dst.extents):
+            if _extent_equal(src_extent, dst_extent) or _extent_is_squeezable_one(src_extent):
+                continue
+            if _extent_is_squeezable_one(dst_extent) or _extent_gt(src_extent, dst_extent):
+                identity_compatible = False
+                break
+        if identity_compatible:
+            return [(dim, dim) for dim in range(len(src.extents))]
+
+    src_axes = [(dim, extent) for dim, extent in enumerate(src.extents) if not _extent_is_squeezable_one(extent)]
+    dst_axes = [(dim, extent) for dim, extent in enumerate(dst.extents) if not _extent_is_squeezable_one(extent)]
+    if len(src_axes) != len(dst_axes):
+        raise ValueError(
+            f"{op_name} rank mismatch: mixed-region operation requires the same number of non-1 extents "
+            f"after squeezing unit dimensions; src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
+        )
+    return [(src_dim, dst_dim) for (src_dim, _), (dst_dim, _) in zip(src_axes, dst_axes)]
+
+
+def _validate_and_adjust_comm_regions(
+    src: _NormalizedCommRegion,
+    dst: _NormalizedCommRegion,
+    op_name: str,
+    *,
+    require_exact_match: bool,
+    allow_dynamic_exact_mismatch: bool = False,
+) -> tuple[_NormalizedCommRegion, _NormalizedCommRegion]:
+    axis_map = _suffix_axis_map(src, dst, op_name) if require_exact_match else _squeezed_axis_map(src, dst, op_name)
+    dst_extents = list(dst.extents)
+
+    for src_dim, dst_dim in axis_map:
+        src_extent = src.extents[src_dim]
+        dst_extent = dst.extents[dst_dim]
+        if require_exact_match:
+            if not _extent_equal(src_extent, dst_extent):
+                if allow_dynamic_exact_mismatch and (_extent_is_dynamic(src_extent) or _extent_is_dynamic(dst_extent)):
+                    continue
+                raise ValueError(
+                    f"{op_name} extent mismatch: exact match is required for Buffer-to-Buffer operation; "
+                    f"src dim {src_dim} extent={src_extent}, dst dim {dst_dim} extent={dst_extent}; "
+                    f"src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
+                )
+            continue
+
+        if _extent_gt(src_extent, dst_extent):
+            raise ValueError(
+                f"{op_name} extent mismatch: src extent is larger than dst extent at matched axis; "
+                f"src dim {src_dim} extent={src_extent}, dst dim {dst_dim} extent={dst_extent}; "
+                f"src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
+            )
+        if not _extent_equal(src_extent, dst_extent):
+            dst_extents[dst_dim] = src_extent
+
+    return src, _NormalizedCommRegion(dst.spec, dst.mins, dst_extents)
+
+
+def _normalize_one_to_one_regions(
+    src: BufferLikeType,
+    dst: BufferLikeType,
+    op_name: str,
+) -> tuple[_NormalizedCommRegion, _NormalizedCommRegion]:
+    src_spec = _extract_comm_region_spec(src, op_name)
+    dst_spec = _extract_comm_region_spec(dst, op_name)
+    src_region, dst_region = _normalize_comm_regions(src_spec, dst_spec, op_name)
+    return _validate_and_adjust_comm_regions(
+        src_region,
+        dst_region,
+        op_name,
+        require_exact_match=src_spec.kind == "buffer" and dst_spec.kind == "buffer",
+    )
+
+
+def _normalize_known_region(spec: _CommRegionSpec, op_name: str) -> _NormalizedCommRegion:
+    assert spec.extents is not None
+    return _clip_region_to_shape(spec, spec.mins, list(spec.extents), op_name)
+
+
+def _allgather_recv_num(direction: str) -> int:
+    mesh_shape = get_target_mesh_shape()
+    if direction in ("horizontal", "h"):
+        return mesh_shape["ncol"]
+    if direction in ("vertical", "v"):
+        return mesh_shape["nrow"]
+    return mesh_shape["nrow"] * mesh_shape["ncol"]
+
+
+def _normalize_allgather_axis(axis: int | None, send_rank: int) -> int:
+    if axis is None:
+        return -1
+
+    assert isinstance(axis, int) and -send_rank <= axis < send_rank, (
+        f"axis {axis} out of range for send buffer with {send_rank} dimensions."
+    )
+    normalized_axis = axis if axis >= 0 else axis + send_rank
+    assert normalized_axis == 0 or normalized_axis == send_rank - 1, (
+        f"Only axis=0 or axis=-1 (last dim) are currently supported, got axis={axis} "
+        f"(normalized to {normalized_axis}) for {send_rank}-D send buffer."
+    )
+    return normalized_axis
+
+
+def _allgather_gather_dim(axis: int) -> int:
+    return 0 if axis < 0 else axis
+
+
+def _divide_allgather_extent(
+    extent: tir.PrimExpr,
+    divisor: int,
+    op_name: str,
+    dim: int,
+    *,
+    require_divisible: bool,
+) -> tir.PrimExpr:
     extent_int = _const_int(extent)
     if extent_int is not None:
-        return extent_int == 1
-    return _extent_equal(extent, tir.IntImm("int32", 1))
+        if require_divisible and extent_int % divisor != 0:
+            raise ValueError(
+                f"{op_name} recv extent at gather dim {dim} must be divisible by "
+                f"the number of receiving cores ({divisor}), but got {extent}."
+            )
+        dtype = extent.dtype if hasattr(extent, "dtype") else "int32"
+        return tir.IntImm(dtype, extent_int // divisor)
+    return tir.floordiv(extent, divisor)
 
 
-def _shape_equal(lhs, rhs) -> bool:
-    return len(lhs) == len(rhs) and all(_extent_equal(lhs_extent, rhs_extent) for lhs_extent, rhs_extent in zip(lhs, rhs))
-
-
-def _shape_equal_or_dynamic(lhs, rhs) -> bool:
-    if len(lhs) != len(rhs):
-        return False
-    for lhs_extent, rhs_extent in zip(lhs, rhs):
-        if _extent_equal(lhs_extent, rhs_extent):
-            continue
-        if _extent_is_dynamic(lhs_extent) or _extent_is_dynamic(rhs_extent):
-            continue
-        return False
-    return True
-
-
-def _shape_compatible(lhs, rhs) -> bool:
-    return len(lhs) == len(rhs) and all(
-        _extent_equal(lhs_extent, rhs_extent)
-        or _extent_is_one(lhs_extent)
-        or _extent_is_one(rhs_extent)
-        or _extent_is_dynamic(lhs_extent)
-        or _extent_is_dynamic(rhs_extent)
-        for lhs_extent, rhs_extent in zip(lhs, rhs)
+def _allgather_slot_region(
+    recv: _NormalizedCommRegion,
+    recv_num: int,
+    axis: int,
+    op_name: str,
+    *,
+    require_exact_match: bool,
+) -> _NormalizedCommRegion:
+    if axis < 0:
+        return _NormalizedCommRegion(recv.spec, recv.mins[1:], recv.extents[1:])
+    gather_dim = _allgather_gather_dim(axis)
+    slot_extents = list(recv.extents)
+    slot_extents[gather_dim] = _divide_allgather_extent(
+        slot_extents[gather_dim],
+        recv_num,
+        op_name,
+        gather_dim,
+        require_divisible=require_exact_match,
     )
+    return _NormalizedCommRegion(recv.spec, recv.mins, slot_extents)
+
+
+def _allgather_recv_extents(slot_extents: list[tir.PrimExpr], recv_num: int, axis: int) -> list[tir.PrimExpr]:
+    assert axis >= 0
+    gather_dim = _allgather_gather_dim(axis)
+    recv_extents = list(slot_extents)
+    recv_extents[gather_dim] = recv_extents[gather_dim] * recv_num
+    return recv_extents
+
+
+def _normalize_allgather_leading_extent(
+    recv: _NormalizedCommRegion,
+    recv_num: int,
+    op_name: str,
+    *,
+    require_exact_match: bool,
+) -> _NormalizedCommRegion:
+    extent = recv.extents[0]
+    extent_int = _const_int(extent)
+    if extent_int is None:
+        return recv
+    if extent_int < recv_num:
+        raise ValueError(f"{op_name} recv leading extent is too small for {recv_num} receiving cores: got {extent}.")
+    if require_exact_match and extent_int != recv_num:
+        raise ValueError(
+            f"{op_name} recv leading extent must equal the number of receiving cores ({recv_num}) "
+            f"for Buffer-to-Buffer operation, but got {extent}."
+        )
+    if extent_int == recv_num:
+        return recv
+    recv_extents = list(recv.extents)
+    recv_extents[0] = tir.IntImm(extent.dtype if hasattr(extent, "dtype") else "int32", recv_num)
+    return _NormalizedCommRegion(recv.spec, recv.mins, recv_extents)
+
+
+def _expected_allgather_recv_extents(send_extents: list[tir.PrimExpr], recv_num: int, axis: int) -> list[tir.PrimExpr]:
+    if axis < 0:
+        return [tir.IntImm("int32", recv_num), *send_extents]
+    recv_extents = list(send_extents)
+    recv_extents[axis] = recv_extents[axis] * recv_num
+    return recv_extents
+
+
+def _normalize_allgather_regions(
+    send_buffer: BufferLikeType,
+    recv_buffer: BufferLikeType,
+    recv_num: int,
+    axis: int,
+    op_name: str,
+) -> tuple[_NormalizedCommRegion, _NormalizedCommRegion]:
+    # Apply one-to-one copy rules to send and one per-core slot in recv.
+    send_spec = _extract_comm_region_spec(send_buffer, op_name)
+    recv_spec = _extract_comm_region_spec(recv_buffer, op_name)
+    send_rank = len(send_spec.mins)
+    recv_rank = len(recv_spec.mins)
+
+    expected_recv_rank = send_rank + 1 if axis < 0 else send_rank
+    if recv_rank != expected_recv_rank:
+        mode = "new-leading-axis" if axis < 0 else f"axis={axis}"
+        raise ValueError(
+            f"{op_name} rank mismatch for {mode}: send rank is {send_rank}, recv rank must be {expected_recv_rank}, but got {recv_rank}."
+        )
+    if send_spec.kind == "load" and recv_spec.kind == "load":
+        raise ValueError(f"{op_name} cannot infer extents when both operands are BufferLoad values.")
+
+    send_region = None if send_spec.kind == "load" else _normalize_known_region(send_spec, op_name)
+    recv_region = None if recv_spec.kind == "load" else _normalize_known_region(recv_spec, op_name)
+
+    if send_region is None:
+        assert recv_region is not None
+        recv_slot = _allgather_slot_region(
+            recv_region,
+            recv_num,
+            axis,
+            op_name,
+            require_exact_match=False,
+        )
+        send_extents = _infer_load_extents_from_peer(send_spec, recv_slot.extents)
+        send_region = _clip_region_to_shape(send_spec, send_spec.mins, send_extents, op_name)
+
+    if recv_region is None:
+        recv_extents = _expected_allgather_recv_extents(send_region.extents, recv_num, axis)
+        recv_region = _clip_region_to_shape(recv_spec, recv_spec.mins, recv_extents, op_name)
+
+    require_exact_match = send_spec.kind == "buffer" and recv_spec.kind == "buffer"
+    if axis < 0:
+        recv_region = _normalize_allgather_leading_extent(
+            recv_region,
+            recv_num,
+            op_name,
+            require_exact_match=require_exact_match,
+        )
+    recv_slot = _allgather_slot_region(
+        recv_region,
+        recv_num,
+        axis,
+        op_name,
+        require_exact_match=require_exact_match,
+    )
+    send_region, recv_slot = _validate_and_adjust_comm_regions(
+        send_region,
+        recv_slot,
+        op_name,
+        require_exact_match=require_exact_match,
+        allow_dynamic_exact_mismatch=True,
+    )
+    if require_exact_match:
+        adjusted_recv_extents = recv_region.extents
+    elif axis < 0:
+        adjusted_recv_extents = [recv_region.extents[0], *recv_slot.extents]
+    else:
+        adjusted_recv_extents = _allgather_recv_extents(recv_slot.extents, recv_num, axis)
+    recv_region = _NormalizedCommRegion(recv_spec, recv_region.mins, adjusted_recv_extents)
+    return send_region, recv_region
+
+
+def _allreduce_result_region(
+    src: _NormalizedCommRegion,
+    out_rank: int,
+    dim: int,
+    op_name: str,
+) -> _NormalizedCommRegion:
+    src_rank = len(src.extents)
+    if out_rank == src_rank - 1:
+        mins = src.mins[:dim] + src.mins[dim + 1 :]
+        extents = src.extents[:dim] + src.extents[dim + 1 :]
+    elif out_rank == src_rank:
+        mins = list(src.mins)
+        extents = list(src.extents)
+        extents[dim] = _int_one()
+    else:
+        raise ValueError(
+            f"{op_name} output rank must be input rank - 1 or input rank; input rank is {src_rank}, output rank is {out_rank}."
+        )
+    return _NormalizedCommRegion(src.spec, mins, extents)
+
+
+def _infer_allreduce_input_extents(
+    src_spec: _CommRegionSpec,
+    out_region: _NormalizedCommRegion,
+    dim: int,
+    op_name: str,
+) -> list[tir.PrimExpr]:
+    src_rank = len(src_spec.mins)
+    out_rank = len(out_region.extents)
+    if out_rank == src_rank - 1:
+        extents = list(out_region.extents)
+        extents.insert(dim, src_spec.buffer.shape[dim])
+        return extents
+    if out_rank == src_rank:
+        extents = list(out_region.extents)
+        extents[dim] = src_spec.buffer.shape[dim]
+        return extents
+    raise ValueError(f"{op_name} output rank must be input rank - 1 or input rank; input rank is {src_rank}, output rank is {out_rank}.")
+
+
+def _normalize_allreduce_regions(
+    src: BufferLikeType,
+    out: BufferLikeType,
+    dim: int,
+    op_name: str,
+) -> tuple[_NormalizedCommRegion, _NormalizedCommRegion]:
+    # Apply one-to-one copy rules after removing or retaining the reduced dim.
+    src_spec = _extract_comm_region_spec(src, op_name)
+    out_spec = _extract_comm_region_spec(out, op_name)
+    src_rank = len(src_spec.mins)
+    out_rank = len(out_spec.mins)
+
+    if out_rank not in (src_rank - 1, src_rank):
+        raise ValueError(
+            f"{op_name} output rank must be input rank - 1 or input rank; input rank is {src_rank}, output rank is {out_rank}."
+        )
+    if src_spec.kind == "load" and out_spec.kind == "load":
+        raise ValueError(f"{op_name} cannot infer extents when both operands are BufferLoad values.")
+
+    src_region = None if src_spec.kind == "load" else _normalize_known_region(src_spec, op_name)
+    out_region = None if out_spec.kind == "load" else _normalize_known_region(out_spec, op_name)
+
+    if src_region is None:
+        assert out_region is not None
+        src_extents = _infer_allreduce_input_extents(src_spec, out_region, dim, op_name)
+        src_region = _clip_region_to_shape(src_spec, src_spec.mins, src_extents, op_name)
+
+    if out_region is None:
+        result_region = _allreduce_result_region(src_region, out_rank, dim, op_name)
+        out_region = _clip_region_to_shape(out_spec, out_spec.mins, result_region.extents, op_name)
+
+    result_region = _allreduce_result_region(src_region, out_rank, dim, op_name)
+    _, out_region = _validate_and_adjust_comm_regions(
+        result_region,
+        out_region,
+        op_name,
+        require_exact_match=src_spec.kind == "buffer" and out_spec.kind == "buffer",
+        allow_dynamic_exact_mismatch=True,
+    )
+    return src_region, out_region
+
+
+def _encode_normalized_region(region: _NormalizedCommRegion, access_type: str) -> tir.PrimExpr | tir.BufferRegion:
+    ranges = [ir.Range.from_min_extent(min_value, extent) for min_value, extent in zip(region.mins, region.extents)]
+    buffer_region = tir.BufferRegion(region.spec.buffer, ranges)
+    if not any(_extent_is_dynamic(extent) for extent in region.extents):
+        return buffer_region
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.tileop.region"),
+        tir.BufferLoad(region.spec.buffer, region.mins),
+        tir.IntImm("int32", ACCESS_MASK[access_type]),
+        *region.extents,
+    )
+
+
+def _encode_full_buffer_region(buffer: tir.Buffer, access_type: str, op_name: str) -> tir.PrimExpr | tir.BufferRegion:
+    spec = _extract_comm_region_spec(buffer, op_name)
+    return _encode_normalized_region(_normalize_known_region(spec, op_name), access_type)
 
 
 def _const_product(extents):
@@ -161,41 +694,11 @@ def _const_product(extents):
     return result
 
 
-def _region_has_dynamic_extent(region: tir.BufferRegion) -> bool:
-    return any(_extent_is_dynamic(rng.extent) for rng in region.region)
-
-
-def _encode_region(region: tir.BufferRegion, access_type: str):
-    indices = [rng.min for rng in region.region]
-    extents = [rng.extent for rng in region.region]
-    return tir.call_intrin(
-        "handle",
-        tir.op.Op.get("tl.tileop.region"),
-        tir.BufferLoad(region.buffer, indices),
-        tir.IntImm("int32", ACCESS_MASK[access_type]),
-        *extents,
-    )
-
-
-def _to_comm_region(obj: BufferLikeType, access_type: str):
-    region = to_buffer_region(obj, access_type=access_type)
-    if isinstance(region, tir.BufferRegion) and _region_has_dynamic_extent(region):
-        return _encode_region(region, access_type)
-    return region
-
-
 def _check_size(size: int, extents, op_name: str):
     assert isinstance(size, int) and size >= -1, "size must be an integer >= -1."
     elements = _const_product(extents)
     if size >= 0 and elements is not None:
         assert size <= elements, f"size {size} exceeds {op_name} buffer size {elements}."
-
-
-def _get_buffer_info(buf: BufferLikeType):
-    region = to_buffer_region(buf)
-    if not isinstance(region, tir.BufferRegion):
-        raise TypeError(f"Expected a buffer-like object, got {type(buf)}.")
-    return region.buffer, region.buffer.dtype, list(r.extent for r in region.region)
 
 
 def broadcast(
@@ -231,24 +734,22 @@ def broadcast(
     >>> broadcast(A, B, (1, 2), direction="horizontal")
     >>> broadcast(A, B, cid, direction="horizontal")
     """
-    _, src_dtype, src_shape = _get_buffer_info(src)
-    _, dst_dtype, dst_shape = _get_buffer_info(dst)
-
+    src_region, dst_region = _normalize_one_to_one_regions(src, dst, "T.comm.broadcast")
+    src_dtype = src_region.spec.buffer.dtype
+    dst_dtype = dst_region.spec.buffer.dtype
     assert src_dtype == dst_dtype, f"Source and destination buffer dtypes must match for broadcast. Got {src_dtype} vs {dst_dtype}."
-    if not _shape_compatible(src_shape, dst_shape):
-        raise ValueError("Source and destination buffer must have the same number of dimensions for broadcast.")
 
-    _check_size(size, src_shape, "source")
+    _check_size(size, src_region.extents, "source")
 
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
 
-    src_region = _to_comm_region(src, access_type="r")
-    dst_region = _to_comm_region(dst, access_type="w")
+    src_region_expr = _encode_normalized_region(src_region, access_type="r")
+    dst_region_expr = _encode_normalized_region(dst_region, access_type="w")
     src_core_id = core_to_id(src_core, "src_core")
 
     args = (
-        src_region,
-        dst_region,
+        src_region_expr,
+        dst_region_expr,
         size,
         src_core_id,
         DIRECTION_MAP[direction.lower()],
@@ -289,20 +790,18 @@ def put(
     >>> put(A, B, (1, 2), (2, 3))
     >>> put(A, B, cid, (cid + 1) % 16)
     """
-    _, src_dtype, src_shape = _get_buffer_info(src)
-    _, dst_dtype, dst_shape = _get_buffer_info(dst)
-
+    src_region, dst_region = _normalize_one_to_one_regions(src, dst, "T.comm.put")
+    src_dtype = src_region.spec.buffer.dtype
+    dst_dtype = dst_region.spec.buffer.dtype
     assert src_dtype == dst_dtype, f"Source and destination buffer dtypes must match for put. Got {src_dtype} vs {dst_dtype}."
-    if not _shape_compatible(src_shape, dst_shape):
-        raise ValueError("Source and destination buffer must have the same number of dimensions for put.")
 
-    _check_size(size, src_shape, "source")
+    _check_size(size, src_region.extents, "source")
 
-    src_region = _to_comm_region(src, access_type="r")
-    dst_region = _to_comm_region(dst, access_type="w")
+    src_region_expr = _encode_normalized_region(src_region, access_type="r")
+    dst_region_expr = _encode_normalized_region(dst_region, access_type="w")
     src_core_id = core_to_id(src_core, "src_core")
     dst_core_id = core_to_id(dst_core, "dst_core")
-    args = (src_region, dst_region, size, src_core_id, dst_core_id)
+    args = (src_region_expr, dst_region_expr, size, src_core_id, dst_core_id)
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_put"), *args)
 
 
@@ -353,53 +852,36 @@ def all_gather(
     """
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
 
-    _, send_dtype, send_shape = _get_buffer_info(send_buffer)
-    _, recv_dtype, recv_shape = _get_buffer_info(recv_buffer)
+    direction = direction.lower()
+    recv_num = _allgather_recv_num(direction)
+    send_spec = _extract_comm_region_spec(send_buffer, "T.comm.all_gather")
+    axis_arg = _normalize_allgather_axis(axis, len(send_spec.mins))
+    send_region, recv_region = _normalize_allgather_regions(
+        send_buffer,
+        recv_buffer,
+        recv_num,
+        axis_arg,
+        "T.comm.all_gather",
+    )
+    send_dtype = send_region.spec.buffer.dtype
+    recv_dtype = recv_region.spec.buffer.dtype
     assert send_dtype == recv_dtype, f"Source and destination buffer dtypes must match for all_gather. Got {send_dtype} vs {recv_dtype}."
-    mesh_shape = get_target_mesh_shape()
-
-    recv_num = 1
-    if direction.lower() in ["horizontal", "h"]:
-        recv_num = mesh_shape["ncol"]
-    elif direction.lower() in ["vertical", "v"]:
-        recv_num = mesh_shape["nrow"]
-    elif direction.lower() in ["all", "a"]:
-        recv_num = mesh_shape["nrow"] * mesh_shape["ncol"]
 
     # Sentinel -1 in the wire format means "no axis specified" (legacy
     # new-leading-axis semantics). User-facing axis is normalized to a
     # non-negative index before being forwarded.
-    if axis is None:
-        axis_arg = -1
-        expected_recv_shape = [recv_num] + list(send_shape)
-    else:
-        ndim = len(send_shape)
-        assert isinstance(axis, int) and -ndim <= axis < ndim, f"axis {axis} out of range for send buffer with {ndim} dimensions."
-        normalized_axis = axis if axis >= 0 else axis + ndim
-        assert normalized_axis == 0 or normalized_axis == ndim - 1, (
-            f"Only axis=0 or axis=-1 (last dim) are currently supported, got axis={axis} "
-            f"(normalized to {normalized_axis}) for {ndim}-D send buffer."
-        )
-        axis_arg = normalized_axis
-        expected_recv_shape = list(send_shape)
-        expected_recv_shape[normalized_axis] = recv_num * send_shape[normalized_axis]
-
-    assert _shape_equal_or_dynamic(recv_shape, expected_recv_shape), (
-        f"Receive buffer shape must be {expected_recv_shape} to hold gathered data from {recv_num} cores, but got {recv_shape}."
-    )
-
-    _check_size(size, send_shape, "send")
+    _check_size(size, send_region.extents, "send")
 
     assert isinstance(src_offset_byte, int) and src_offset_byte >= 0, "src_offset_byte must be a non-negative integer."
 
-    send_buffer_region = _to_comm_region(send_buffer, access_type="r")
-    recv_buffer_region = _to_comm_region(recv_buffer, access_type="w")
+    send_buffer_region = _encode_normalized_region(send_region, access_type="r")
+    recv_buffer_region = _encode_normalized_region(recv_region, access_type="w")
     cid = T.get_block_binding(0)
 
     args = (
         send_buffer_region,
         recv_buffer_region,
-        DIRECTION_MAP[direction.lower()],
+        DIRECTION_MAP[direction],
         size,
         axis_arg,
         cid,
@@ -441,25 +923,21 @@ def all_reduce(
     --------
     >>> all_reduce(A_local, E_local, "sum", "all", dim=-1, clear=False)
     """
-    _, _, buffer_shape = _get_buffer_info(buffer)
-    out_buffer, out_dtype, out_shape = _get_buffer_info(out)
-
-    assert isinstance(dim, int) and dim >= -1 and dim < len(buffer_shape), (
-        f"dim {dim} out of bounds for buffer with {len(buffer_shape)} dimensions."
-    )
+    buffer_spec = _extract_comm_region_spec(buffer, "T.comm.all_reduce")
+    buffer_rank = len(buffer_spec.mins)
+    assert isinstance(dim, int) and dim >= -1 and dim < buffer_rank, f"dim {dim} out of bounds for buffer with {buffer_rank} dimensions."
     if dim == -1:
-        dim = len(buffer_shape) - 1
+        dim = buffer_rank - 1
 
-    expected_shapes = [
-        buffer_shape[:dim] + buffer_shape[dim + 1 :],
-        buffer_shape[:dim] + [1] + buffer_shape[dim + 1 :],
-    ]
-    if not any(_shape_equal_or_dynamic(out_shape, expected_shape) for expected_shape in expected_shapes):
-        expected_shapes_str = " or ".join(map(str, expected_shapes))
-        raise ValueError(
-            f"Invalid reduce output shape, buffer shape is {buffer_shape}, dim is {dim}, "
-            f"output shape is {out_shape}, expected shapes are {expected_shapes_str}"
-        )
+    buffer_region, out_region = _normalize_allreduce_regions(
+        buffer,
+        out,
+        dim,
+        "T.comm.all_reduce",
+    )
+    out_buffer = out_region.spec.buffer
+    out_dtype = out_buffer.dtype
+    out_shape = out_region.extents
 
     reduce_type = reduce_type.lower()
     assert reduce_type in REDUCE_TYPE_LIST, f"Reduction op must be one of {REDUCE_TYPE_LIST}, but got {reduce_type}."
@@ -482,15 +960,15 @@ def all_reduce(
     row_allgather = alloc_tmp([mesh_shape["ncol"]] + list(out_shape))
     col_allgather = alloc_tmp([mesh_shape["nrow"]] + list(out_shape))
 
-    buffer_region = _to_comm_region(buffer, access_type="r")
-    out_region = _to_comm_region(out, access_type="w")
-    row_allgather_region = _to_comm_region(row_allgather, access_type="rw")
-    col_allgather_region = _to_comm_region(col_allgather, access_type="rw")
+    buffer_region_expr = _encode_normalized_region(buffer_region, access_type="r")
+    out_region_expr = _encode_normalized_region(out_region, access_type="w")
+    row_allgather_region = _encode_full_buffer_region(row_allgather, "rw", "T.comm.all_reduce")
+    col_allgather_region = _encode_full_buffer_region(col_allgather, "rw", "T.comm.all_reduce")
     cid = T.get_block_binding(0)
 
     args = (
-        buffer_region,
-        out_region,
+        buffer_region_expr,
+        out_region_expr,
         row_allgather_region,
         col_allgather_region,
         reduce_type,
@@ -503,10 +981,10 @@ def all_reduce(
     # If not clearing, allocate an output copy buffer to hold intermediate results
     if not clear:
         out_copy = alloc_tmp(list(out_shape))
-        out_copy_region = _to_comm_region(out_copy, access_type="rw")
+        out_copy_region = _encode_full_buffer_region(out_copy, "rw", "T.comm.all_reduce")
         args = (
-            buffer_region,
-            out_region,
+            buffer_region_expr,
+            out_region_expr,
             row_allgather_region,
             col_allgather_region,
             reduce_type,

@@ -34,7 +34,7 @@ def fill_tiled_test(
     block_b=16,
     block_m=256,
     block_n=128,
-    dtype="float16",
+    dtype="bfloat16",
 ):
     shard_policy = T.MeshShardingPolicy()
     tensor_shape = (b, m, n)
@@ -51,9 +51,9 @@ def fill_tiled_test(
             for bz in T.serial(grid_b):
                 for by in T.serial(grid_m):
                     for bx in T.serial(grid_n):
-                        T.fill(A_shared, T.float16(1.0))
-                        T.fill(A_shared[0:block_b, 0 : block_m // 2, 0:block_n], T.float16(2.0))
-                        T.fill(A_shared[0:block_b, block_m // 2 : block_m, 0:block_n], T.float16(3.0))
+                        T.fill(A_shared, T.bfloat16(1.0))
+                        T.fill(A_shared[0:block_b, 0 : block_m // 2, 0:block_n], T.bfloat16(2.0))
+                        T.fill(A_shared[0:block_b, block_m // 2 : block_m, 0:block_n], T.bfloat16(3.0))
                         T.clear(A_shared)
                         for bb in T.serial(block_b):
                             T.copy(
@@ -74,7 +74,7 @@ def fill_tiled_2d_test(
     n=1024,
     block_m=256,
     block_n=512,
-    dtype="float16",
+    dtype="bfloat16",
 ):
     shard_policy = T.MeshShardingPolicy()
     tensor_shape = (m, n)
@@ -89,9 +89,9 @@ def fill_tiled_2d_test(
 
             for by in T.serial(grid_m):
                 for bx in T.serial(grid_n):
-                    T.fill(A_shared, T.float16(1.0))
-                    T.fill(A_shared[0 : block_m // 2, 0:block_n], T.float16(2.0))
-                    T.fill(A_shared[block_m // 2 : block_m, 0:block_n], T.float16(3.0))
+                    T.fill(A_shared, T.bfloat16(1.0))
+                    T.fill(A_shared[0 : block_m // 2, 0:block_n], T.bfloat16(2.0))
+                    T.fill(A_shared[block_m // 2 : block_m, 0:block_n], T.bfloat16(3.0))
                     T.clear(A_shared)
                     T.copy(
                         A_shared,

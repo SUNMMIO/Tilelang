@@ -37,7 +37,7 @@ def tile_elementwise_ops_test(
     block_b=2,
     block_m=256,
     block_n=128,
-    dtype="float16",
+    dtype="bfloat16",
 ):
     shard_policy = T.MeshShardingPolicy()
     tensor_shape = (batch, m, n)
@@ -119,7 +119,7 @@ def tile_elementwise_ops_2d_test(
     n=1024,
     block_m=256,
     block_n=512,
-    dtype="float16",
+    dtype="bfloat16",
 ):
     shard_policy = T.MeshShardingPolicy()
     tensor_shape = (m, n)

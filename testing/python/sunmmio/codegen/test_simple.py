@@ -22,7 +22,7 @@ def simple_global_copy_gemm_kernel(
     M=32,
     N=32,
     K=32,
-    dtype="float16",
+    dtype="bfloat16",
     accum_dtype="float32",
 ):
     @T.prim_func
@@ -58,7 +58,7 @@ def test_simple_global_copy_gemm_codegen_validates_with_npuir_opt(tmp_path):
 
     assert "sunmmio.fake" not in src
     assert src.count("suvm.copy_async") >= 3
-    assert src.count("suvm.tc.mma") == 1
+    assert src.count("suvm.tc.mma") == 2
 
 
 if __name__ == "__main__":

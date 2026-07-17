@@ -74,7 +74,7 @@ def dynamic_allocate_copy_mma_kernel(
     block_M=32,
     block_N=32,
     block_K=32,
-    dtype=T.float16,
+    dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
     nrows, ncols = driver.get_sunmmio_device_mesh_config()
@@ -138,7 +138,7 @@ def dynamic_zz_allocate_copy_mma_kernel(
     block_M=32,
     block_N=32,
     block_K=32,
-    dtype=T.float16,
+    dtype=T.bfloat16,
 ):
     M = T.dynamic("m")
     N = T.dynamic("n")
