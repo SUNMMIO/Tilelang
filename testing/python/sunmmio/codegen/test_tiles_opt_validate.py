@@ -4,7 +4,7 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.layout import make_row_major, make_zz_layout
+from tilelang.layout import make_aligned_row_major, make_row_major, make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import (
@@ -345,6 +345,42 @@ def tiles_1d(m=512, block_m=256, dtype="bfloat16", accum_dtype="bfloat16"):
     return main
 
 
+@target("Sunmmio")
+def tiles_dynamic_extent_zz_store():
+    compute_block = 128
+    tile_block = 32
+    output_shape = (compute_block, tile_block)
+    side_shape = (256,)
+    shard_policy = T.MeshShardingPolicy()
+    output_layout = make_zz_layout(output_shape, [0, 1], (tile_block, tile_block))
+    side_layout = make_aligned_row_major(side_shape, T.int32, align_bytes=1024)
+
+    @T.prim_func
+    def main(
+        Output: T.MeshTensor(output_shape, shard_policy, T.bfloat16, layout=output_layout),  # type: ignore
+        q_lengths: T.MeshTensor(side_shape, shard_policy, T.int32, layout=side_layout),  # type: ignore
+    ):
+        with T.Kernel():
+            q_lengths_shared = T.alloc_shared(side_shape, T.int32, scope="shared.rsram")
+            source_tile = T.alloc_shared((tile_block, tile_block), T.bfloat16, scope="shared.rsram")
+            output_staging = T.alloc_shared(output_shape, T.bfloat16, scope="shared.rsram")
+            T.annotate_layout({q_lengths_shared: side_layout, output_staging: output_layout})
+            q_len = T.alloc_var(T.int32, init=0)
+
+            T.copy(q_lengths, q_lengths_shared)
+            q_len = T.max(T.min(q_lengths_shared[0], compute_block), 0)
+            T.fill(source_tile, 1)
+            T.fill(output_staging, 0)
+
+            for q_chunk in T.serial(T.ceildiv(q_len, tile_block)):
+                for row, col in T.Tiles([tile_block, tile_block], parallel=True):
+                    output_staging[q_chunk * tile_block + row, col] = source_tile[row, col]
+
+            T.copy(output_staging, Output)
+
+    return main
+
+
 def test_dot_mul_tiled_parallel_2d_codegen_validates_with_npuir_opt(tmp_path):
     src = validate_sunmmio_codegen_with_npuir_opt(
         dot_mul_tiled_parallel_2d(),
@@ -372,6 +408,16 @@ def test_dot_mul_tiled_parallel_3d_large_block_codegen_validates_loose_with_npui
         expected_tokens=("suvm.copy_async", "suvm.tile.mulf", "suvm.tile.exp"),
     )
     assert_source_contains(src, ("suvm.copy_async", "suvm.tile.mulf", "suvm.tile.exp"))
+
+
+def test_tiles_dynamic_extent_zz_store_codegen_validates_loose_with_npuir_opt(tmp_path):
+    src = validate_sunmmio_codegen_loose(
+        tiles_dynamic_extent_zz_store(),
+        tmp_path,
+        mlir_filename="tiles_dynamic_extent_zz_store_suvm.mlir",
+        expected_tokens=("scf.for", "suvm.tile.store"),
+    )
+    assert_source_contains(src, ("scf.for", "suvm.tile.store"))
 
 
 @pytest.mark.parametrize(
