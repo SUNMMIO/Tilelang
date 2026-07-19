@@ -706,19 +706,19 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
     emit_from_send(make_slab(current_row, slot_extent_p1), /*bcast_dir=*/1,
                    MakeVerticalMask(mesh_nrow));
   } else { // direction == 2 ("all")
-    // Phase 1: horizontal. The current core lands at its global slot.
-    emit_from_send(make_slab(current_core, slot_extent_p1), /*bcast_dir=*/0,
-                   MakeHorizontalMask(mesh_ncol));
-
-    // Phase 2: vertical. Each row's mesh_ncol-wide gathered slab (rows
-    // i*ncol .. (i+1)*ncol of phase-1 slots) is broadcast to every row in
-    // each column.
-    PrimExpr row_extent = analyzer->Simplify(
-        IntImm(DataType::Int(32), mesh_ncol) * slot_extent_p1);
-    // slab index `current_row` covers slots
-    // [current_row*ncol .. (current_row+1)*ncol) of phase 1.
-    emit_from_recv(make_slab(current_row, row_extent), /*bcast_dir=*/1,
+    // Phase 1: vertical. The current core lands at its row-major global slot.
+    emit_from_send(make_slab(current_core, slot_extent_p1), /*bcast_dir=*/1,
                    MakeVerticalMask(mesh_nrow));
+
+    // Phase 2: horizontal. A column's phase-1 slots are strided by ncol in
+    // row-major core order, so forward one per-source-row slab at a time.
+    // This preserves the existing recv slot mapping: slot = row*ncol + col.
+    for (int row = 0; row < mesh_nrow; ++row) {
+      PrimExpr global_slot =
+          analyzer->Simplify(I32Imm(row * mesh_ncol) + current_col);
+      emit_from_recv(make_slab(global_slot, slot_extent_p1),
+                     /*bcast_dir=*/0, MakeHorizontalMask(mesh_ncol));
+    }
   }
 
   return SeqStmt::Flatten(bcast_stmts);
@@ -830,30 +830,30 @@ LayoutMap AllreduceOpNode::InferLayout(const LayoutInferArgs &T,
   if (should_clear) {
     infer_reduce(src, dst, dim, /*reduce_clear=*/true);
 
-    if (direction == 0 || direction == 2) {
-      infer_allgather(dst, row_allgather, /*gather_dir=*/0);
-      infer_reduce(row_allgather, dst, IntImm(DataType::Int(32), 0),
-                   /*reduce_clear=*/true);
-    }
-
     if (direction == 1 || direction == 2) {
       infer_allgather(dst, col_allgather, /*gather_dir=*/1);
       infer_reduce(col_allgather, dst, IntImm(DataType::Int(32), 0),
                    /*reduce_clear=*/true);
     }
+
+    if (direction == 0 || direction == 2) {
+      infer_allgather(dst, row_allgather, /*gather_dir=*/0);
+      infer_reduce(row_allgather, dst, IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/true);
+    }
   } else {
     infer_reduce(src, dst_copy, dim, /*reduce_clear=*/true);
 
-    if (direction == 0 || direction == 2) {
-      infer_allgather(dst_copy, row_allgather, /*gather_dir=*/0);
-      infer_reduce(row_allgather, direction == 0 ? dst : dst_copy,
+    if (direction == 1 || direction == 2) {
+      infer_allgather(dst_copy, col_allgather, /*gather_dir=*/1);
+      infer_reduce(col_allgather, direction == 1 ? dst : dst_copy,
                    IntImm(DataType::Int(32), 0),
                    /*reduce_clear=*/direction == 2);
     }
 
-    if (direction == 1 || direction == 2) {
-      infer_allgather(dst_copy, col_allgather, /*gather_dir=*/1);
-      infer_reduce(col_allgather, dst, IntImm(DataType::Int(32), 0),
+    if (direction == 0 || direction == 2) {
+      infer_allgather(dst_copy, row_allgather, /*gather_dir=*/0);
+      infer_reduce(row_allgather, dst, IntImm(DataType::Int(32), 0),
                    /*reduce_clear=*/false);
     }
   }
@@ -919,23 +919,23 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
   if (should_clear) {
     append_reduce(src, dst, dim, /*reduce_clear=*/true);
 
-    if (direction == 0 || direction == 2) {
-      append_row_stage(dst, dst, /*reduce_clear=*/true);
-    }
-
     if (direction == 1 || direction == 2) {
       append_col_stage(dst, dst, /*reduce_clear=*/true);
+    }
+
+    if (direction == 0 || direction == 2) {
+      append_row_stage(dst, dst, /*reduce_clear=*/true);
     }
   } else {
     append_reduce(src, dst_copy, dim, /*reduce_clear=*/true);
 
-    if (direction == 0 || direction == 2) {
-      append_row_stage(dst_copy, direction == 0 ? dst : dst_copy,
+    if (direction == 1 || direction == 2) {
+      append_col_stage(dst_copy, direction == 1 ? dst : dst_copy,
                        /*reduce_clear=*/direction == 2);
     }
 
-    if (direction == 1 || direction == 2) {
-      append_col_stage(dst_copy, dst, /*reduce_clear=*/false);
+    if (direction == 0 || direction == 2) {
+      append_row_stage(dst_copy, dst, /*reduce_clear=*/false);
     }
   }
 

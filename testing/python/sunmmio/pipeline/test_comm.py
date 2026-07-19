@@ -79,8 +79,11 @@ def test_comm(is_log=False):
                     T.broadcast_(T.region(B_remote_1[0, 0], 1, 1024, 1024), T.region(B_remote_1[0, 0], 2, 1024, 1024), 0, T.int64(8), 0, 10)
                     T.broadcast_(T.region(B_shared[0, 0], 1, 1024, 1024), T.region(B_remote_2[0, 0], 2, 1024, 1024), 0, T.int64(8), 0, 6)
                     T.broadcast_(T.region(B_shared[0, 0], 1, 1024, 1024), T.region(B_remote_3[0, 0], 2, 1024, 1024), 1, T.int64(8), 0, 6)
-                    T.broadcast_(T.region(C_shared[0, 0], 1, 1024, 1024), T.region(C_allgather_1[bx, 0, 0], 2, 1, 1024, 1024), 0, T.int64(15), 0)
-                    T.broadcast_(T.region(C_allgather_1[bx // 4 * 4, 0, 0], 1, 4, 1024, 1024), T.region(C_allgather_1[bx // 4 * 4, 0, 0], 2, 4, 1024, 1024), 1, T.int64(15), 0)
+                    T.broadcast_(T.region(C_shared[0, 0], 1, 1024, 1024), T.region(C_allgather_1[bx, 0, 0], 2, 1, 1024, 1024), 1, T.int64(15), 0)
+                    T.broadcast_(T.region(C_allgather_1[bx % 4, 0, 0], 1, 1, 1024, 1024), T.region(C_allgather_1[bx % 4, 0, 0], 2, 1, 1024, 1024), 0, T.int64(15), 0)
+                    T.broadcast_(T.region(C_allgather_1[bx % 4 + 4, 0, 0], 1, 1, 1024, 1024), T.region(C_allgather_1[bx % 4 + 4, 0, 0], 2, 1, 1024, 1024), 0, T.int64(15), 0)
+                    T.broadcast_(T.region(C_allgather_1[bx % 4 + 8, 0, 0], 1, 1, 1024, 1024), T.region(C_allgather_1[bx % 4 + 8, 0, 0], 2, 1, 1024, 1024), 0, T.int64(15), 0)
+                    T.broadcast_(T.region(C_allgather_1[bx % 4 + 12, 0, 0], 1, 1, 1024, 1024), T.region(C_allgather_1[bx % 4 + 12, 0, 0], 2, 1, 1024, 1024), 0, T.int64(15), 0)
                     T.broadcast_(T.region(C_shared[0, 0], 1, 1024, 1024), T.region(C_allgather_2[bx % 4, 0, 0], 2, 1, 1024, 1024), 0, T.int64(15), 0)
                     T.broadcast_(T.region(C_shared[0, 0], 1, 1024, 1024), T.region(C_allgather_3[bx // 4, 0, 0], 2, 1, 1024, 1024), 1, T.int64(15), 0)
         """
