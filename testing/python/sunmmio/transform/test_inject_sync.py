@@ -183,6 +183,7 @@ def _extract_call_id(line, marker):
 def _make_leaf_broadcast_without_src_core_mod(target):
     src_data = _pointer_var("src")
     dst_data = _pointer_var("dst")
+    bx = tvm.te.thread_axis("blockIdx.x")
     src_buf = tir.decl_buffer(
         (32, 32),
         "float16",
@@ -213,6 +214,7 @@ def _make_leaf_broadcast_without_src_core_mod(target):
         src_buf,
         tir.DeclBuffer(dst_buf, tir.SeqStmt([broadcast, consume_dst])),
     )
+    body = tir.AttrStmt(bx, "thread_extent", tir.IntImm("int32", 16), body)
     func = tir.PrimFunc([src_data, dst_data], body)
     func = func.with_attr("global_symbol", "main")
     func = func.with_attr("tir.is_global_func", True)
@@ -1176,7 +1178,7 @@ def test_inject_sunmmio_sync_broadcast():
     assert all(_parse_numeric_barrier_mask(line, "barrier_arrive_and_wait") == 15 for line in barrier_lines)
 
 
-def test_inject_sunmmio_sync_broadcast_without_src_core_full_mesh_barrier():
+def test_inject_sunmmio_sync_broadcast_without_src_core_uses_current_core_mask():
     target = get_target("Sunmmio")
     mod = _make_leaf_broadcast_without_src_core_mod(target)
 
@@ -1192,14 +1194,15 @@ def test_inject_sunmmio_sync_broadcast_without_src_core_full_mesh_barrier():
     assert len(broadcast_lines) == 1
     assert "T.sync_token_id(0)" in broadcast_lines[0]
     assert ", 0, T.sync_token_id(0)" in broadcast_lines[0]
+    assert ", bx, T.sync_token_id(0)" not in broadcast_lines[0]
 
     barrier_init_lines = [l for l in lines if "barrier_init" in l]
     assert len(barrier_init_lines) == 1
-    assert _parse_numeric_barrier_mask(barrier_init_lines[0]) == (1 << 16) - 1
+    assert _parse_barrier_args(barrier_init_lines[0]) == [-1, 15, 240, 3840, 61440]
 
     barrier_wait_lines = [l for l in lines if "barrier_arrive_and_wait" in l]
     assert len(barrier_wait_lines) == 1
-    assert all(_parse_numeric_barrier_mask(line, "barrier_arrive_and_wait") == (1 << 16) - 1 for line in barrier_wait_lines)
+    assert all(_parse_barrier_args(line, "barrier_arrive_and_wait")[-4:] == [15, 240, 3840, 61440] for line in barrier_wait_lines)
 
 
 def test_inject_sunmmio_sync_dynamic_broadcast_mask_candidates():
@@ -1684,7 +1687,7 @@ if __name__ == "__main__":
     test_inject_sunmmio_sync_dma()
     test_inject_sunmmio_sync_mma()
     test_inject_sunmmio_sync_broadcast()
-    test_inject_sunmmio_sync_broadcast_without_src_core_full_mesh_barrier()
+    test_inject_sunmmio_sync_broadcast_without_src_core_uses_current_core_mask()
     test_inject_sunmmio_sync_dynamic_broadcast_mask_candidates()
     test_inject_sunmmio_sync_dynamic_pair_mask_candidates()
     test_inject_sunmmio_sync_loop_missing_wait_before_token_reuse()

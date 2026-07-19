@@ -1320,6 +1320,16 @@ private:
     return analyzer_ ? analyzer_->Simplify(global_mask) : global_mask;
   }
 
+  PrimExpr GetBroadcastBarrierSrcCore(const CallNode *call) {
+    if (BroadcastCallHasSrcCore(call)) {
+      return GetBroadcastSrcCore(call);
+    }
+    ICHECK(current_kernel_core_id_.defined())
+        << "tl.broadcast_ without optional src_core is treated as an "
+           "all_gather leaf and requires an enclosing blockIdx.x binding";
+    return current_kernel_core_id_;
+  }
+
   // Inserts wait_token and, when enabled, the legacy paired barrier_wait.
   void process_wait_token_and_barrier_wait(Array<Stmt> &stmts, int token_id) {
     stmts.push_back(Evaluate(Call(DataType::Handle(), wait_token(),
@@ -1654,10 +1664,6 @@ private:
     int total_cores = mesh_nrow_ * mesh_ncol_;
     ICHECK_LE(total_cores, 64)
         << "tl.broadcast_ barrier mask currently supports at most 64 cores";
-    if (!BroadcastCallHasSrcCore(call)) {
-      return FullCoreMask(total_cores);
-    }
-
     int direction = -1;
     if (const auto *direction_imm =
             call->args[kBroadcastArgDirection].as<IntImmNode>()) {
@@ -1667,7 +1673,7 @@ private:
         << "tl.broadcast_ barrier mask expansion only supports horizontal or "
            "vertical leaf broadcasts";
 
-    PrimExpr src_core = GetBroadcastSrcCore(call);
+    PrimExpr src_core = GetBroadcastBarrierSrcCore(call);
     PrimExpr local_mask = call->args[kBroadcastArgMask];
     PrimExpr write_mask =
         ExpandBroadcastLocalMask(local_mask, direction, src_core);
@@ -1760,7 +1766,16 @@ private:
     Array<Stmt> stmts;
     InjectLoopCarriedWaitsForSyncStmt(stmts, op);
     token_process_prim_expr(op->value, stmts);
+
+    PrimExpr old_kernel_core_id = current_kernel_core_id_;
+    if (op->attr_key == tir::attr::thread_extent) {
+      IterVar iv = Downcast<IterVar>(op->node);
+      if (iv->thread_tag == "blockIdx.x") {
+        current_kernel_core_id_ = iv->var;
+      }
+    }
     stmts.push_back(StmtMutator::VisitStmt_(op));
+    current_kernel_core_id_ = old_kernel_core_id;
     return SeqStmt::Flatten(stmts);
   }
 
@@ -2157,6 +2172,7 @@ private:
   std::set<int> available_tokens_;
 
   Map<Var, Buffer> buffer_data_to_buffer_;
+  PrimExpr current_kernel_core_id_;
   ffi::Map<Var, arith::IntSet> loop_domains_;
   std::vector<LoopScope> loop_scopes_;
   std::vector<std::set<int>> loop_hoisted_wait_tokens_stack_;
