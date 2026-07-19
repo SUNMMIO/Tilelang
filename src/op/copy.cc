@@ -679,27 +679,9 @@ bool CopyNode::CheckTMemStore(Target target) const {
 }
 
 bool CopyNode::CheckSunmmioDMACopy(Target target) const {
-  // 1. src and dst must be legal
-  bool scope_check = false;
-  if (src.scope() == "global" && dst.scope() == kSunmmioScopeRSRAM)
-    scope_check = true;
-  if (src.scope() == "global" && dst.scope() == kSunmmioScopeWSRAM)
-    scope_check = true;
-  if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeWSRAM)
-    scope_check = true;
-  if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeASRAM)
-    scope_check = true;
-  if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == "global")
-    scope_check = true;
-  if (!scope_check) {
-    return false;
-  }
-  // 2. src and dst must have the same dtype for DMA-based lowering
-  if (src->dtype != dst->dtype) {
-    ICHECK(0) << "src and dst must have the same dtype for Sunmmio DMA copy.";
-    return false;
-  }
-  return true;
+  return SupportsSunmmioDirectTransfer(
+      target, SunmmioTransferMechanism::kLocalDma, src.scope(), src->dtype,
+      dst.scope(), dst->dtype);
 }
 
 bool CopyNode::CheckSunmmioTileCopy(Target target) const {
@@ -723,7 +705,9 @@ bool CopyNode::CheckSunmmioTileCopy(Target target) const {
   // Region views are legal as long as src/dst describe the same logical copy
   // shape. Lowering will materialize a tile.domain scope over that region so
   // LegalizeTilesLoop/TilesLoop can preserve the offsets.
-  if (src.scope() != kSunmmioScopeRSRAM || dst.scope() != kSunmmioScopeRSRAM) {
+  if (!SupportsSunmmioDirectTransfer(target, SunmmioTransferMechanism::kTile,
+                                     src.scope(), src->dtype, dst.scope(),
+                                     dst->dtype)) {
     return false;
   }
   if (!have_same_region_shape(src_range, dst_range)) {
@@ -762,10 +746,13 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
   } else if (CheckTMemStore(target)) {
     return CopyInst::kTMemStore;
   } else if (TargetIsSunmmio(target)) {
-    if (CheckSunmmioDMACopy(target)) {
-      return CopyInst::kSunmmioDMACopy;
-    } else if (CheckSunmmioTileCopy(target)) {
+    // Prefer tile loops for RSRAM -> RSRAM. Local DMA may also support a
+    // same-dtype transfer, but tile lowering preserves the existing cast and
+    // region-view behavior.
+    if (CheckSunmmioTileCopy(target)) {
       return CopyInst::kSunmmioTileCopy;
+    } else if (CheckSunmmioDMACopy(target)) {
+      return CopyInst::kSunmmioDMACopy;
     }
     ICHECK(0) << "Unsupported copy from " << src.scope() << " to "
               << dst.scope() << " of Sunmmio target.";
@@ -897,10 +884,9 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   // Stage through an RSRAM buffer shaped like the RSRAM region so the transform
   // leg is rank-matched; the DMA leg carries the DRAM region.
   Array<PrimExpr> stage_shape;
-  Array<Range> stage_range;
-  for (const Range &r : rsram_range) {
+  Array<Range> stage_range = MakeCompactRegion(rsram_range);
+  for (const Range &r : stage_range) {
     stage_shape.push_back(r->extent);
-    stage_range.push_back(Range::FromMinExtent(0, r->extent));
   }
   Buffer stage = decl_buffer(stage_shape, dram->dtype,
                              dram->name + "_layout_stage", kSunmmioScopeRSRAM);

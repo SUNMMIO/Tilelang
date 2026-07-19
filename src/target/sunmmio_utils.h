@@ -19,6 +19,8 @@
 namespace tvm {
 namespace tl {
 
+enum class CommunicationDirections;
+
 // ---------------------------------------------------------------------------
 // Sunmmio on-chip SRAM scope identifiers
 // ---------------------------------------------------------------------------
@@ -48,23 +50,31 @@ struct SunmmioTileProcessorConfig {
   int register_bits;
   int block_height;
   int block_width;
-  /// Minimum byte-alignment for RSRAM vector memory accesses.
+  // Minimum byte-alignment for RSRAM vector memory accesses.
   int rsram_align_bytes;
-  /// ASRAM north/south bank stripe width in bytes. The bf16 tensor core can
-  /// only read from the north bank, so legalization of bf16 GEMM duplicates
-  /// the A-operand writer with a source-pointer offset of this many bytes so
-  /// that what previously landed in destination south now lands in north.
+  // ASRAM north/south bank stripe width in bytes. The bf16 tensor core can
+  // only read from the north bank, so legalization of bf16 GEMM duplicates
+  // the A-operand writer with a source-pointer offset of this many bytes so
+  // that what previously landed in destination south now lands in north.
   int asram_bank_stripe_bytes;
-  /// Largest bf16 GEMM row count (M-extent) the bf16 tensor core consumes
-  /// from the ASRAM north bank in a single pass. A bf16 GEMM whose row count
-  /// does not exceed this fits entirely in the north bank and needs no
-  /// two-pass legalization.
+  // Largest bf16 GEMM row count (M-extent) the bf16 tensor core consumes
+  // from the ASRAM north bank in a single pass. A bf16 GEMM whose row count
+  // does not exceed this fits entirely in the north bank and needs no
+  // two-pass legalization.
   int bf16_gemm_single_pass_max_rows;
 };
 
 struct SunmmioMeshConfig {
   int nrow;
   int ncol;
+};
+
+// Physical mechanism used by a direct Sunmmio data transfer.
+enum class SunmmioTransferMechanism {
+  kLocalDma,
+  kTile,
+  kHLink,
+  kVLink,
 };
 
 SunmmioTileProcessorConfig
@@ -76,18 +86,34 @@ ffi::Array<PrimExpr> GetSunmmioLayoutBlockShape(Target target, DataType dtype);
 SunmmioMeshConfig GetSunmmioMeshConfig(ffi::Optional<Target> target);
 SunmmioMeshConfig GetSunmmioMeshConfig(Target target);
 
-/*!
- * \brief Check whether a buffer scope is one of the Sunmmio on-chip SRAM
- * scopes.
- */
+// Return whether Sunmmio can directly transfer between two buffers using the
+// requested mechanism. This query covers memory-scope reachability and dtype
+// conversion support. Region shape, layout, alignment, and transfer-size
+// constraints are checked by their owning passes and by NPU-IR after lowering.
+bool SupportsSunmmioDirectTransfer(Target target,
+                                   SunmmioTransferMechanism mechanism,
+                                   ffi::String src_scope, DataType src_dtype,
+                                   ffi::String dst_scope, DataType dst_dtype);
+
+// Return whether a TileLang copy can transfer directly between two buffers.
+bool SupportsSunmmioDirectCopy(Target target, ffi::String src_scope,
+                               DataType src_dtype, ffi::String dst_scope,
+                               DataType dst_dtype);
+
+// Return whether a source can directly feed every communication direction.
+// The direction-to-link mapping is target-specific and remains private to the
+// Sunmmio capability implementation.
+bool SupportsSunmmioDirectCommunication(
+    Target target, CommunicationDirections directions, ffi::String src_scope,
+    DataType src_dtype, ffi::String dst_scope, DataType dst_dtype);
+
+// Check whether a buffer scope is one of the Sunmmio on-chip SRAM scopes.
 inline bool IsSunmmioSramScope(const ffi::String &scope) {
   return scope == kSunmmioScopeASRAM || scope == kSunmmioScopeWSRAM ||
          scope == kSunmmioScopeRSRAM;
 }
 
-/*!
- * \brief Convert an RSRAM byte-alignment requirement into element count.
- */
+// Convert an RSRAM byte-alignment requirement into element count.
 inline int GetSunmmioRsramAlignmentElems(int rsram_align_bytes,
                                          DataType dtype) {
   if (rsram_align_bytes <= 0) {

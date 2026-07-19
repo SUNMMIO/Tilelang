@@ -541,7 +541,21 @@ std::optional<TiledIndexMatch>
 MatchTiledIndex(const PrimExpr &index, const Var &exec, const Var &interior,
                 int64_t tile_extent, bool allow_standalone_interior,
                 arith::Analyzer *analyzer) {
-  if (index.same_as(interior)) {
+  auto matches_integer_var = [](const PrimExpr &expr, const Var &var) {
+    PrimExpr current = expr;
+    while (const auto *cast = current.as<CastNode>()) {
+      DataType source_dtype = cast->value.dtype();
+      if ((!cast->dtype.is_int() && !cast->dtype.is_uint()) ||
+          (!source_dtype.is_int() && !source_dtype.is_uint()) ||
+          cast->dtype.bits() < source_dtype.bits()) {
+        break;
+      }
+      current = cast->value;
+    }
+    return current.same_as(var);
+  };
+
+  if (matches_integer_var(index, interior)) {
     if (!allow_standalone_interior) {
       return std::nullopt;
     }
@@ -572,7 +586,7 @@ MatchTiledIndex(const PrimExpr &index, const Var &exec, const Var &interior,
     }
     auto matches = [&](const PrimExpr &var_term,
                        const PrimExpr &imm_term) -> bool {
-      if (!var_term.same_as(exec)) {
+      if (!matches_integer_var(var_term, exec)) {
         return false;
       }
       const auto *imm = imm_term.as<IntImmNode>();
@@ -582,7 +596,7 @@ MatchTiledIndex(const PrimExpr &index, const Var &exec, const Var &interior,
   };
 
   for (const PrimExpr &term : terms) {
-    if (term.same_as(interior)) {
+    if (matches_integer_var(term, interior)) {
       if (seen_interior) {
         return std::nullopt;
       }
