@@ -12,12 +12,84 @@
 #include <tvm/runtime/logging.h>
 #include <tvm/tir/op.h>
 
+#include "../op/comm.h"
 #include "utils.h"
 
 namespace tvm {
 namespace tl {
 
 namespace {
+
+enum class SunmmioMemoryScope {
+  kGlobal,
+  kASRAM,
+  kWSRAM,
+  kRSRAM,
+  kUnsupported,
+};
+
+enum class SunmmioDTypePolicy {
+  kSameDType,
+  kConversionAllowed,
+};
+
+struct SunmmioDirectTransferRule {
+  SunmmioTransferMechanism mechanism;
+  SunmmioMemoryScope src_scope;
+  SunmmioMemoryScope dst_scope;
+  SunmmioDTypePolicy dtype_policy;
+};
+
+// Temporary high-level projection of the A4E capabilities defined by NPU-IR's
+// DeviceArchitecture.td. Keep this table at TileLang's abstraction level: it
+// describes direct transfer outcomes without reproducing channel wiring,
+// alignment, descriptor, or layout constraints. Once NPU-IR exposes a stable
+// capability API, SupportsSunmmioDirectTransfer can delegate to it without
+// changing TileLang callers.
+constexpr SunmmioDirectTransferRule kSunmmioA4EDirectTransferRules[] = {
+    {SunmmioTransferMechanism::kLocalDma, SunmmioMemoryScope::kGlobal,
+     SunmmioMemoryScope::kRSRAM, SunmmioDTypePolicy::kSameDType},
+    {SunmmioTransferMechanism::kLocalDma, SunmmioMemoryScope::kGlobal,
+     SunmmioMemoryScope::kWSRAM, SunmmioDTypePolicy::kSameDType},
+    {SunmmioTransferMechanism::kLocalDma, SunmmioMemoryScope::kRSRAM,
+     SunmmioMemoryScope::kGlobal, SunmmioDTypePolicy::kSameDType},
+    {SunmmioTransferMechanism::kLocalDma, SunmmioMemoryScope::kRSRAM,
+     SunmmioMemoryScope::kASRAM, SunmmioDTypePolicy::kSameDType},
+    {SunmmioTransferMechanism::kLocalDma, SunmmioMemoryScope::kRSRAM,
+     SunmmioMemoryScope::kWSRAM, SunmmioDTypePolicy::kSameDType},
+    {SunmmioTransferMechanism::kLocalDma, SunmmioMemoryScope::kRSRAM,
+     SunmmioMemoryScope::kRSRAM, SunmmioDTypePolicy::kSameDType},
+    {SunmmioTransferMechanism::kTile, SunmmioMemoryScope::kRSRAM,
+     SunmmioMemoryScope::kRSRAM, SunmmioDTypePolicy::kConversionAllowed},
+    {SunmmioTransferMechanism::kHLink, SunmmioMemoryScope::kRSRAM,
+     SunmmioMemoryScope::kASRAM, SunmmioDTypePolicy::kSameDType},
+    {SunmmioTransferMechanism::kHLink, SunmmioMemoryScope::kRSRAM,
+     SunmmioMemoryScope::kRSRAM, SunmmioDTypePolicy::kSameDType},
+    {SunmmioTransferMechanism::kVLink, SunmmioMemoryScope::kGlobal,
+     SunmmioMemoryScope::kWSRAM, SunmmioDTypePolicy::kSameDType},
+    {SunmmioTransferMechanism::kVLink, SunmmioMemoryScope::kGlobal,
+     SunmmioMemoryScope::kRSRAM, SunmmioDTypePolicy::kSameDType},
+    {SunmmioTransferMechanism::kVLink, SunmmioMemoryScope::kRSRAM,
+     SunmmioMemoryScope::kWSRAM, SunmmioDTypePolicy::kSameDType},
+    {SunmmioTransferMechanism::kVLink, SunmmioMemoryScope::kRSRAM,
+     SunmmioMemoryScope::kRSRAM, SunmmioDTypePolicy::kSameDType},
+};
+
+SunmmioMemoryScope ParseSunmmioMemoryScope(const ffi::String &scope) {
+  if (scope.empty() || scope == "global") {
+    return SunmmioMemoryScope::kGlobal;
+  }
+  if (scope == kSunmmioScopeASRAM) {
+    return SunmmioMemoryScope::kASRAM;
+  }
+  if (scope == kSunmmioScopeWSRAM) {
+    return SunmmioMemoryScope::kWSRAM;
+  }
+  if (scope == kSunmmioScopeRSRAM) {
+    return SunmmioMemoryScope::kRSRAM;
+  }
+  return SunmmioMemoryScope::kUnsupported;
+}
 
 SunmmioTileProcessorConfig MakeSunmmioA4EConfig() {
   return {/*register_bits=*/4096,
@@ -177,6 +249,65 @@ SunmmioMeshConfig GetSunmmioMeshConfig(Target target) {
                               "'device_mesh_ncol_<positive-int>'.";
 
   return {/*nrow=*/nrow.value(), /*ncol=*/ncol.value()};
+}
+
+bool SupportsSunmmioDirectTransfer(Target target,
+                                   SunmmioTransferMechanism mechanism,
+                                   ffi::String src_scope, DataType src_dtype,
+                                   ffi::String dst_scope, DataType dst_dtype) {
+  target = NormalizeTarget(target);
+  if (!target.defined() || !TargetIsSunmmio(target)) {
+    return false;
+  }
+
+  auto mcpu = target->GetAttr<ffi::String>("mcpu");
+  if (mcpu.has_value() && mcpu.value() != "sunmmio-a4e") {
+    return false;
+  }
+
+  SunmmioMemoryScope parsed_src_scope = ParseSunmmioMemoryScope(src_scope);
+  SunmmioMemoryScope parsed_dst_scope = ParseSunmmioMemoryScope(dst_scope);
+  for (const SunmmioDirectTransferRule &rule : kSunmmioA4EDirectTransferRules) {
+    if (rule.mechanism != mechanism || rule.src_scope != parsed_src_scope ||
+        rule.dst_scope != parsed_dst_scope) {
+      continue;
+    }
+    return rule.dtype_policy == SunmmioDTypePolicy::kConversionAllowed ||
+           src_dtype == dst_dtype;
+  }
+  return false;
+}
+
+bool SupportsSunmmioDirectCopy(Target target, ffi::String src_scope,
+                               DataType src_dtype, ffi::String dst_scope,
+                               DataType dst_dtype) {
+  return SupportsSunmmioDirectTransfer(target, SunmmioTransferMechanism::kTile,
+                                       src_scope, src_dtype, dst_scope,
+                                       dst_dtype) ||
+         SupportsSunmmioDirectTransfer(
+             target, SunmmioTransferMechanism::kLocalDma, src_scope, src_dtype,
+             dst_scope, dst_dtype);
+}
+
+bool SupportsSunmmioDirectCommunication(
+    Target target, CommunicationDirections directions, ffi::String src_scope,
+    DataType src_dtype, ffi::String dst_scope, DataType dst_dtype) {
+  auto supports = [&](SunmmioTransferMechanism mechanism) {
+    return SupportsSunmmioDirectTransfer(target, mechanism, src_scope,
+                                         src_dtype, dst_scope, dst_dtype);
+  };
+  switch (directions) {
+  case CommunicationDirections::kHorizontal:
+    return supports(SunmmioTransferMechanism::kHLink);
+  case CommunicationDirections::kVertical:
+    return supports(SunmmioTransferMechanism::kVLink);
+  case CommunicationDirections::kHorizontalAndVertical:
+    return supports(SunmmioTransferMechanism::kHLink) &&
+           supports(SunmmioTransferMechanism::kVLink);
+  case CommunicationDirections::kNone:
+    return false;
+  }
+  return false;
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {

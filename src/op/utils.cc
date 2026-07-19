@@ -104,6 +104,36 @@ PrimExpr MakeRegionExpr(const Buffer &buffer, const Array<Range> &ranges,
   return Call(DataType::Handle(), RegionOp::Get(), args);
 }
 
+Array<Range> MakeCompactRegion(const Array<Range> &region) {
+  Array<Range> compact;
+  compact.reserve(region.size());
+  for (const Range &range : region) {
+    compact.push_back(Range::FromMinExtent(0, range->extent));
+  }
+  return compact;
+}
+
+Buffer MakeCompactBufferLike(const Buffer &prototype,
+                             const Array<Range> &region,
+                             const ffi::String &scope,
+                             const ffi::String &name) {
+  const auto *ptr_type = prototype->data->type_annotation.as<PointerTypeNode>();
+  ICHECK(ptr_type != nullptr);
+
+  Array<PrimExpr> shape;
+  shape.reserve(region.size());
+  for (const Range &range : region) {
+    shape.push_back(range->extent);
+  }
+
+  ffi::String data_name = name.empty() ? prototype->data->name_hint : name;
+  ffi::String buffer_name = name.empty() ? prototype->name : name;
+  Var data(data_name, PointerType(ptr_type->element_type, scope));
+  return Buffer(data, prototype->dtype, shape, {}, Integer(0), buffer_name,
+                prototype->data_alignment, prototype->offset_factor,
+                prototype->buffer_type);
+}
+
 PrimExpr MakeAccessPtrFromRegion(const BufferRegion &region, int rw_mask,
                                  bool require_2d) {
   Buffer buf = region->buffer;

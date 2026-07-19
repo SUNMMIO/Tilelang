@@ -2,6 +2,7 @@ find_package(GTest REQUIRED)
 include(GoogleTest)
 
 add_executable(tilelang_cpp_tests
+  target/sunmmio_utils_test.cc
   transform/common/substitute_with_buffer_predicates_test.cc
   transform/sunmmio_tile_loop_fusion/discovery_test.cc
   transform/sunmmio_tile_loop_fusion/cost_model_test.cc
