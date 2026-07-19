@@ -1971,7 +1971,17 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
   }
   std::vector<SunMMIOValue> operands;
   SunMMIOCallAttrs attrs;
-  if (callee == "tl.tileop.region") {
+  if (callee == "tir.if_then_else") {
+    ICHECK_EQ(op->args.size(), 3U) << "tir.if_then_else expects 3 arguments";
+    SunMMIOType bool_ty{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
+    SunMMIOValue cond =
+        EnsureType(EvalExpr(op->args[0]), bool_ty, DataType::Bool());
+    SunMMIOValue tv = EvalExpr(op->args[1]);
+    SunMMIOValue fv = EvalExpr(op->args[2]);
+    fv = EnsureType(fv, tv.type, tv.dtype);
+    DataType dtype = CanonicalizeSuvmDType(op->dtype);
+    return builder_->Select(NewValueName(), cond, tv, fv, tv.type, dtype);
+  } else if (callee == "tl.tileop.region") {
     return EmitRegionCall(tvm::ffi::GetRef<PrimExpr>(op));
   } else if (callee == "tl.sync_null_token" || callee == "tl.wait_token") {
     for (int i = 0, e = static_cast<int>(op->args.size()); i < e; ++i) {

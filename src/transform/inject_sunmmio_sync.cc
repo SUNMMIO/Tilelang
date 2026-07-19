@@ -342,6 +342,39 @@ bool ExprUsesAnyVar(const PrimExpr &expr, const std::vector<Var> &vars) {
   return false;
 }
 
+class UnsafeLoopDomainExprDetector : public ExprVisitor {
+public:
+  bool HasUnsafeExpr() const { return has_unsafe_expr_; }
+
+  void VisitExpr_(const VarNode *op) final {
+    if (op->dtype.is_handle()) {
+      has_unsafe_expr_ = true;
+    }
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final { has_unsafe_expr_ = true; }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->dtype.is_handle()) {
+      has_unsafe_expr_ = true;
+      return;
+    }
+    ExprVisitor::VisitExpr_(op);
+  }
+
+private:
+  bool has_unsafe_expr_{false};
+};
+
+bool CanUseLoopDomainForRegionCover(const PrimExpr &expr) {
+  if (!expr.defined() || expr.dtype().is_handle()) {
+    return false;
+  }
+  UnsafeLoopDomainExprDetector detector;
+  detector(expr);
+  return !detector.HasUnsafeExpr();
+}
+
 std::vector<int64_t> EnumerateMaskCandidates(PrimExpr expr, int direction,
                                              int mesh_nrow, int mesh_ncol,
                                              arith::Analyzer *analyzer) {
@@ -724,9 +757,12 @@ public:
   void VisitStmt_(const ForNode *op) final {
     RecordSyncAccess(op, {op->min, op->extent});
     ffi::Map<Var, arith::IntSet> old_loop_domains = loop_domains_;
-    loop_domains_.Set(
-        op->loop_var,
-        arith::IntSet::FromRange(Range::FromMinExtent(op->min, op->extent)));
+    if (CanUseLoopDomainForRegionCover(op->min) &&
+        CanUseLoopDomainForRegionCover(op->extent)) {
+      loop_domains_.Set(
+          op->loop_var,
+          arith::IntSet::FromRange(Range::FromMinExtent(op->min, op->extent)));
+    }
     StmtVisitor::VisitStmt_(op);
     loop_domains_ = std::move(old_loop_domains);
   }
@@ -1394,7 +1430,9 @@ private:
   AccessRecord CoverAccessForLoopHoist(const AccessRecord &access,
                                        const LoopScope &scope) const {
     if (!scope.loop_var.defined() || !scope.loop_min.defined() ||
-        !scope.loop_extent.defined()) {
+        !scope.loop_extent.defined() ||
+        !CanUseLoopDomainForRegionCover(scope.loop_min) ||
+        !CanUseLoopDomainForRegionCover(scope.loop_extent)) {
       return access;
     }
     ffi::Map<Var, arith::IntSet> loop_domain;
@@ -2065,9 +2103,12 @@ private:
     loop_hoisted_wait_tokens_stack_.push_back(hoisted_wait_tokens);
 
     ffi::Map<Var, arith::IntSet> old_loop_domains = loop_domains_;
-    loop_domains_.Set(loop->loop_var,
-                      arith::IntSet::FromRange(
-                          Range::FromMinExtent(loop->min, loop->extent)));
+    if (CanUseLoopDomainForRegionCover(loop->min) &&
+        CanUseLoopDomainForRegionCover(loop->extent)) {
+      loop_domains_.Set(loop->loop_var,
+                        arith::IntSet::FromRange(
+                            Range::FromMinExtent(loop->min, loop->extent)));
+    }
     Stmt loop_stmt = StmtMutator::VisitStmt_(loop);
     loop_domains_ = std::move(old_loop_domains);
 
