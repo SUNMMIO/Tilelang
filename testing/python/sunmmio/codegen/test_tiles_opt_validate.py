@@ -377,6 +377,31 @@ def tiles_dynamic_extent_zz_store():
                     output_staging[q_chunk * tile_block + row, col] = source_tile[row, col]
 
             T.copy(output_staging, Output)
+    return main
+
+
+@target("Sunmmio")
+def tiles_rank2_first_tile_partial(rows=4, cols=4, dtype="float32"):
+    output_shape = (32, 32)
+    output_layout = make_zz_layout(output_shape, [0, 1], (32, 32))
+    shard_policy = T.MeshShardingPolicy()
+
+    @T.prim_func
+    def main(
+        output: T.MeshTensor(output_shape, shard_policy, dtype, layout=output_layout),  # type: ignore
+    ):
+        with T.Kernel():
+            source = T.alloc_shared((rows, cols), dtype)
+            matrix = T.alloc_shared((rows, cols), dtype)
+            output_shared = T.alloc_shared(output_shape, dtype)
+
+            T.fill(source, 1.0)
+            T.fill(output_shared, 0.0)
+            for i, j in T.Tiles(matrix, parallel=True):
+                matrix[i, j] = source[i, j]
+            for i, j in T.Tiles(matrix, parallel=True):
+                output_shared[i, j] = matrix[i, j]
+            T.copy(output_shared, output)
 
     return main
 
@@ -389,6 +414,17 @@ def test_dot_mul_tiled_parallel_2d_codegen_validates_with_npuir_opt(tmp_path):
         expected_tokens=("suvm.copy_async", "suvm.tile.mulf", "suvm.tile.exp"),
     )
     assert_source_contains(src, ("suvm.tile.mulf", "suvm.tile.exp"))
+
+
+def test_tiles_rank2_first_tile_partial_builds_full_shape_mask(tmp_path):
+    src = validate_sunmmio_codegen_loose(
+        tiles_rank2_first_tile_partial(),
+        tmp_path,
+        mlir_filename="tiles_rank2_first_tile_partial_suvm.mlir",
+        expected_tokens=("suvm.tile.cmpi", "suvm.tile.select", "suvm.tile.store"),
+    )
+    assert "suvm.tile.broadcast" in src
+    assert "!suvm.tile<1x32xi1> -> !suvm.tile<4x32xi1>" not in src
 
 
 def test_dot_mul_tiled_parallel_3d_large_block_codegen_validates_loose_with_npuir_opt(tmp_path):
