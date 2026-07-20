@@ -40,6 +40,7 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kLayoutVisualizationFormats, String);
 TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioPipelineMode, String);
 TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioILPFaster, Integer);
 TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioILPStageShrink, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioILPMultiversionLifetimePruning, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDeviceCompileFlags, ffi::Array<ffi::String>);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDisableDataRaceCheck, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kEnableLowerLDGSTG, Bool);

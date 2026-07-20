@@ -803,13 +803,18 @@ private:
 
     auto rewriter = PipelineBodyRewriter(versioned_buffers, bank_peer_buffers,
                                          version_axis_buffers, for_node);
+    auto version_slot = [iterations](int iter) {
+      ICHECK_GT(iterations, 0);
+      int slot = iter % iterations;
+      return slot < 0 ? slot + iterations : slot;
+    };
     Array<Stmt> for_body;
     // Step 3.1: Rewrite prologue
     for (const auto &order_str : prologue_orders) {
       int iter = name2iter(order_str);
       int id = name2id(order_str);
       Stmt stmt = pipeline_body_seq->seq[id];
-      rewriter.set_current_version(iter);
+      rewriter.set_current_version(version_slot(iter));
       PrimExpr replaced_loop_var = 0 + iter + for_node->min;
       rewriter.set_loop_var_replacement(replaced_loop_var);
       stmt = rewriter(stmt);
@@ -822,12 +827,9 @@ private:
       int iter = name2iter(order_str);
       PrimExpr replaced_loop_var =
           iterations * for_node->loop_var + iter + for_node->min;
-      if (iter == iterations) {
-        iter = 0;
-      }
       int id = name2id(order_str);
       Stmt stmt = pipeline_body_seq->seq[id];
-      rewriter.set_current_version(iter);
+      rewriter.set_current_version(version_slot(iter));
       rewriter.set_loop_var_replacement(replaced_loop_var);
       stmt = rewriter(stmt);
       body.push_back(stmt);
@@ -854,7 +856,7 @@ private:
         int iter = name2iter(order_str);
         int id = name2id(order_str);
         Stmt stmt = pipeline_body_seq->seq[id];
-        rewriter.set_current_version(iter);
+        rewriter.set_current_version(version_slot(iter));
         PrimExpr replaced_loop_var = extent * iterations + iter + for_node->min;
         rewriter.set_loop_var_replacement(replaced_loop_var);
         stmt = rewriter(stmt);
@@ -864,15 +866,18 @@ private:
       // Dynamic epilogue loop for non-constant iterations
       Var epilogue_loop_var("epilogue_i", for_node->loop_var->dtype);
       Array<Stmt> epilogue_body;
-      for (size_t id = 0; id < pipeline_body_seq->size(); ++id) {
-        Stmt stmt = pipeline_body_seq->seq[id];
-        rewriter.set_current_version(
-            0); // Versioning is not deeply supported in dynamic epilogue yet
-        PrimExpr replaced_loop_var =
-            extent * iterations + epilogue_loop_var + for_node->min;
-        rewriter.set_loop_var_replacement(replaced_loop_var);
-        stmt = rewriter(stmt);
-        epilogue_body.push_back(stmt);
+      for (int slot = 0; slot < iterations; ++slot) {
+        Array<Stmt> slot_body;
+        for (size_t id = 0; id < pipeline_body_seq->size(); ++id) {
+          Stmt stmt = pipeline_body_seq->seq[id];
+          rewriter.set_current_version(slot);
+          PrimExpr replaced_loop_var =
+              extent * iterations + epilogue_loop_var + for_node->min;
+          rewriter.set_loop_var_replacement(replaced_loop_var);
+          slot_body.push_back(rewriter(stmt));
+        }
+        epilogue_body.push_back(IfThenElse(EQ(epilogue_loop_var, Integer(slot)),
+                                           SeqStmt::Flatten(slot_body)));
       }
       For dynamic_epilogue_for = For(
           epilogue_loop_var, PrimExpr(0), epilogue_iterations_expr,

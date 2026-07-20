@@ -132,12 +132,20 @@ enum class PhysicalSramBank : int {
 
 static std::vector<PhysicalSramBank> GetOccupiedSramBanks(
     const PipelineInstruction &instruction,
-    const std::unordered_set<const BufferNode *> &versioned_buffers) {
+    const std::unordered_set<const BufferNode *> &versioned_buffers,
+    int iter_mod) {
   std::array<bool, static_cast<int>(PhysicalSramBank::Count)> occupied{};
+  int version_slot = instruction.iter;
+  if (iter_mod > 0) {
+    version_slot %= iter_mod;
+    if (version_slot < 0) {
+      version_slot += iter_mod;
+    }
+  }
   auto collect = [&](const BufferRegion &region) {
     const String &scope = region->buffer.scope();
     bool pong = versioned_buffers.count(region->buffer.get()) != 0 &&
-                instruction.iter % 2 != 0;
+                version_slot % 2 != 0;
     if (scope == kSunmmioScopeASRAM) {
       occupied[static_cast<int>(pong ? PhysicalSramBank::ASRAMPong
                                      : PhysicalSramBank::ASRAMPing)] = true;
@@ -969,7 +977,7 @@ public:
       busy_intervals[instruction.device_type].push_back(
           {instruction.scheduled_start, instruction.scheduled_end});
       for (PhysicalSramBank bank :
-           GetOccupiedSramBanks(instruction, versioned_buffers_)) {
+           GetOccupiedSramBanks(instruction, versioned_buffers_, iter_mod_)) {
         bank_busy_intervals[static_cast<int>(bank)].push_back(
             {instruction.scheduled_start, instruction.scheduled_end});
       }
@@ -1046,7 +1054,7 @@ public:
       float start_time = ready_time;
       std::vector<std::vector<Interval> *> required_intervals{&intervals};
       for (PhysicalSramBank bank :
-           GetOccupiedSramBanks(*instruction, versioned_buffers_)) {
+           GetOccupiedSramBanks(*instruction, versioned_buffers_, iter_mod_)) {
         required_intervals.push_back(
             &bank_busy_intervals[static_cast<int>(bank)]);
       }
@@ -1159,7 +1167,7 @@ private:
 
   bool AreBanksFree(const PipelineInstruction &instruction, float time) const {
     for (PhysicalSramBank bank :
-         GetOccupiedSramBanks(instruction, versioned_buffers_)) {
+         GetOccupiedSramBanks(instruction, versioned_buffers_, iter_mod_)) {
       if (bank_busy_until_[static_cast<int>(bank)] > time) {
         return false;
       }
@@ -1169,7 +1177,7 @@ private:
 
   void ReserveBanks(const PipelineInstruction &instruction, float end_time) {
     for (PhysicalSramBank bank :
-         GetOccupiedSramBanks(instruction, versioned_buffers_)) {
+         GetOccupiedSramBanks(instruction, versioned_buffers_, iter_mod_)) {
       bank_busy_until_[static_cast<int>(bank)] = end_time;
     }
   }
