@@ -546,7 +546,8 @@ SunMMIOValue SunmmioMlirTileOp::TileInsertSlice(
 SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
                                              int64_t axis,
                                              const SunMMIOValue &valid_extent,
-                                             const SunMMIOType &tile_type) {
+                                             const SunMMIOType &tile_type,
+                                             DataType index_dtype) {
   auto make_tile_type = [&](DataType dtype,
                             std::initializer_list<int64_t> shape) {
     SunMMIOType type;
@@ -566,37 +567,78 @@ SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
     return static_cast<int64_t>(imm->value);
   };
 
-  auto to_i32_scalar = [&](const SunMMIOValue &value,
-                           llvm::StringRef debug_tag) -> mlir::Value {
+  DataType range_dtype = CanonicalizeSuvmDType(index_dtype).with_lanes(1);
+  ICHECK(range_dtype.is_int() &&
+         (range_dtype.bits() == 16 || range_dtype.bits() == 32))
+      << "TileAxisMask index dtype must be i16 or i32";
+  SunMMIOType range_scalar_type{SunMMIOType::Kind::kScalar, range_dtype, 1, {}};
+  mlir::Type range_scalar_mlir_type = MapMlirType(ctx_, range_scalar_type);
+
+  auto to_index_scalar = [&](const SunMMIOValue &value,
+                             llvm::StringRef debug_tag) -> mlir::Value {
     mlir::Value raw = type_.ResolveValue(value, ctx_.builder.getIndexType());
+    if (raw.getType() == range_scalar_mlir_type) {
+      return raw;
+    }
     if (raw.getType().isIndex()) {
       return mlir::arith::IndexCastOp::create(
           ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc(debug_tag.str()),
-          ctx_.builder.getI32Type(), raw);
-    }
-    if (raw.getType().isInteger(32)) {
-      return raw;
+          range_scalar_mlir_type, raw);
     }
     if (auto int_ty = mlir::dyn_cast<mlir::IntegerType>(raw.getType())) {
+      unsigned src_bits = int_ty.getWidth();
+      unsigned dst_bits = static_cast<unsigned>(range_dtype.bits());
+      if (src_bits == dst_bits) {
+        return raw;
+      }
+      if (src_bits > dst_bits) {
+        return mlir::arith::TruncIOp::create(
+            ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc(debug_tag.str()),
+            range_scalar_mlir_type, raw);
+      }
       return mlir::arith::ExtSIOp::create(
           ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc(debug_tag.str()),
-          ctx_.builder.getI32Type(), raw);
+          range_scalar_mlir_type, raw);
     }
     LOG(FATAL) << "TileAxisMask expects integer/index valid extent input";
     TVM_FFI_UNREACHABLE();
+    return mlir::Value();
   };
+
+  ICHECK(tile_type.shape.size() == 1 || tile_type.shape.size() == 2)
+      << "TileAxisMask expects a rank-1 or rank-2 tile";
+  if (tile_type.shape.size() == 1) {
+    ICHECK_EQ(axis, 0) << "Rank-1 TileAxisMask expects axis 0";
+    int64_t dim = extract_static_dim(0);
+    SunMMIOType range_type = make_tile_type(range_dtype, {dim});
+    SunMMIOType mask_type = make_tile_type(DataType::Bool(), {dim});
+
+    mlir::Value range =
+        mlir::suvm::TileRangeOp::create(ctx_.builder, MapMlirLoc(ctx_),
+                                        MapMlirType(ctx_, range_type))
+            .getResult();
+    mlir::Value valid_extent_value =
+        to_index_scalar(valid_extent, "tail_mask_lanes");
+    mlir::Value mask_value =
+        mlir::suvm::TileCmpIOp::create(
+            ctx_.builder, MapMlirLoc(ctx_), MapMlirType(ctx_, mask_type),
+            mlir::suvm::VCmpIPredicate::slt, range, valid_extent_value)
+            .getResult();
+    BindRequiredResult(ctx_, result_name, mask_value, "suvm.tile.axis_mask");
+    return SunMMIOValue{DataType::Bool(), result_name, tile_type};
+  }
 
   int64_t rows_dim = extract_static_dim(0);
   int64_t cols_dim = extract_static_dim(1);
   ICHECK(axis == 0 || axis == 1) << "TileAxisMask expects axis 0 or 1";
 
   int64_t range_dim = axis == 0 ? rows_dim : cols_dim;
-  SunMMIOType range_type = make_tile_type(DataType::Int(32), {range_dim});
-  SunMMIOType range_2d_type =
-      axis == 0 ? make_tile_type(DataType::Int(32), {rows_dim, 1})
-                : make_tile_type(DataType::Int(32), {1, cols_dim});
+  SunMMIOType range_type = make_tile_type(range_dtype, {range_dim});
+  SunMMIOType range_2d_type = axis == 0
+                                  ? make_tile_type(range_dtype, {rows_dim, 1})
+                                  : make_tile_type(range_dtype, {1, cols_dim});
   SunMMIOType range_full_type =
-      make_tile_type(DataType::Int(32), {rows_dim, cols_dim});
+      make_tile_type(range_dtype, {rows_dim, cols_dim});
   SunMMIOType mask_full_type =
       make_tile_type(DataType::Bool(), {rows_dim, cols_dim});
 
@@ -613,7 +655,7 @@ SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
   unsqueeze_st.addTypes(MapMlirType(ctx_, range_2d_type));
   mlir::Value range_2d = ctx_.builder.create(unsqueeze_st)->getResult(0);
 
-  mlir::Value valid_i32 = to_i32_scalar(
+  mlir::Value valid_extent_value = to_index_scalar(
       valid_extent, axis == 0 ? "tail_mask_rows" : "tail_mask_cols");
 
   mlir::Value range_full = mlir::suvm::TileBroadcastOp::create(
@@ -624,7 +666,7 @@ SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
   mlir::Value mask_value =
       mlir::suvm::TileCmpIOp::create(
           ctx_.builder, MapMlirLoc(ctx_), MapMlirType(ctx_, mask_full_type),
-          mlir::suvm::VCmpIPredicate::slt, range_full, valid_i32)
+          mlir::suvm::VCmpIPredicate::slt, range_full, valid_extent_value)
           .getResult();
   BindRequiredResult(ctx_, result_name, mask_value, "suvm.tile.axis_mask");
   return SunMMIOValue{DataType::Bool(), result_name, tile_type};
@@ -648,12 +690,13 @@ SunMMIOValue SunmmioMlirTileOp::TileMaskAnd(const std::string &result_name,
 SunMMIOValue SunmmioMlirTileOp::TileRectMask(const std::string &result_name,
                                              const SunMMIOValue &valid_rows,
                                              const SunMMIOValue &valid_cols,
-                                             const SunMMIOType &tile_type) {
+                                             const SunMMIOType &tile_type,
+                                             DataType index_dtype) {
   ICHECK(!result_name.empty()) << "TileRectMask expects a result handle";
   SunMMIOValue row_mask =
-      TileAxisMask(result_name + "_row", 0, valid_rows, tile_type);
+      TileAxisMask(result_name + "_row", 0, valid_rows, tile_type, index_dtype);
   SunMMIOValue col_mask =
-      TileAxisMask(result_name + "_col", 1, valid_cols, tile_type);
+      TileAxisMask(result_name + "_col", 1, valid_cols, tile_type, index_dtype);
   return TileMaskAnd(result_name, row_mask, col_mask, tile_type);
 }
 

@@ -546,6 +546,47 @@ AllgatherOp::AllgatherOp(Array<PrimExpr> args,
   data_ = std::move(node);
 }
 
+bool IsCommunicationOp(const Call &call) {
+  return call->op.same_as(BroadcastOp::Get()) ||
+         call->op.same_as(PutOp::Get()) || call->op.same_as(AllgatherOp::Get());
+}
+
+CommunicationDirections GetCommunicationSourceDirections(const Call &call,
+                                                         Target target) {
+  ICHECK(IsCommunicationOp(call));
+  TileOperator tile_op = ParseOperator(call);
+  ICHECK(tile_op.defined());
+  if (const auto *broadcast = tile_op.as<BroadcastOpNode>()) {
+    ICHECK(broadcast->direction >= 0 && broadcast->direction <= 2)
+        << "Invalid broadcast direction " << broadcast->direction;
+    // "all" starts vertically; its horizontal phase reads the destination.
+    return broadcast->direction == 0 ? CommunicationDirections::kHorizontal
+                                     : CommunicationDirections::kVertical;
+  }
+  if (const auto *allgather = tile_op.as<AllgatherOpNode>()) {
+    ICHECK(allgather->direction >= 0 && allgather->direction <= 2)
+        << "Invalid allgather direction " << allgather->direction;
+    // "all" starts horizontally; its vertical phase reads the destination.
+    return allgather->direction == 1 ? CommunicationDirections::kVertical
+                                     : CommunicationDirections::kHorizontal;
+  }
+  if (const auto *put = tile_op.as<PutOpNode>()) {
+    const auto *src_core = put->src_core.as<IntImmNode>();
+    const auto *dst_core = put->dst_core.as<IntImmNode>();
+    if (src_core == nullptr || dst_core == nullptr) {
+      return CommunicationDirections::kHorizontalAndVertical;
+    }
+
+    int mesh_ncol = GetSunmmioMeshConfig(target).ncol;
+    bool same_row = src_core->value / mesh_ncol == dst_core->value / mesh_ncol;
+    // Diagonal put starts vertically; its horizontal phase reads dst.
+    return same_row ? CommunicationDirections::kHorizontal
+                    : CommunicationDirections::kVertical;
+  }
+  LOG(FATAL) << "Expected broadcast, put, or allgather communication op";
+  return CommunicationDirections::kNone;
+}
+
 TileOperator AllgatherOpNode::Clone() const {
   auto op = tvm::ffi::make_object<AllgatherOpNode>(*this);
   return AllgatherOp(op);

@@ -3,6 +3,7 @@
 
 #include <tvm/ir/expr.h>
 #include <tvm/runtime/data_type.h>
+#include <tvm/runtime/logging.h>
 #include <tvm/tir/buffer.h>
 #include <tvm/tir/expr.h>
 
@@ -20,7 +21,12 @@ namespace codegen {
 
 inline DataType CanonicalizeSuvmDType(DataType dtype) {
   if (dtype.is_float16()) {
-    return DataType::BFloat(16, dtype.lanes());
+    LOG(FATAL) << "Unsupported SunMMIO SUVM dtype `" << dtype
+               << "`: the current SunMMIO vector core does not support "
+                  "float16/f16. Use bfloat16 for 16-bit floating point data or "
+                  "float32 for fp32 data. The codegen path no longer silently "
+                  "canonicalizes float16 to bfloat16 because that changes "
+                  "kernel semantics.";
   }
   return dtype;
 }

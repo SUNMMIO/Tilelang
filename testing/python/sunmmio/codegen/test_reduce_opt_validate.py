@@ -21,7 +21,7 @@ os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 REDUCE_IN_TILE_CASES = [
     ((32, 1024), 1, False),
     ((32, 1024), 0, False),
-    ((1024, 4), 1, True),
+    ((1024, 32), 1, True),
     ((256, 128), 1, True),
     ((256, 128), 0, False),
     ((256, 128), 1, False),
@@ -60,7 +60,7 @@ def _valid_extent(tile_index, block, total):
 
 
 @target("Sunmmio")
-def reduce_kernel_builder(shape, reduce_axis, dtype="float16", clear=True):
+def reduce_kernel_builder(shape, reduce_axis, dtype="bfloat16", clear=True):
     shape = tuple(shape)
     out_shape = list(shape[:reduce_axis]) + list(shape[reduce_axis + 1 :])
     if not out_shape:
@@ -97,7 +97,7 @@ def reduce_tail_region_kernel(
     n=2000,
     block_m=256,
     block_n=96,
-    dtype="float16",
+    dtype="bfloat16",
 ):
     shard_policy = T.MeshShardingPolicy()
     input_shape = (block_m, block_n)
@@ -145,7 +145,7 @@ def reduce_tiled_test(
     block_m=256,
     block_n=128,
     reduce_axis=1,
-    dtype="float16",
+    dtype="bfloat16",
     clear=False,
 ):
     out_shape_full = (b, m) if reduce_axis == 2 else (b, n) if reduce_axis == 1 else (m, n)

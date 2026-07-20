@@ -165,6 +165,134 @@ def test_comm_buffer_like_region_python_api():
     ) in script
 
 
+def test_comm_one_to_one_regions_follow_copy_normalization_rules():
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            src = T.alloc_shared((1, 64, 64), "float32", scope="shared.rsram")
+            broadcast_dst = T.alloc_shared((64, 64), "float32", scope="shared.rsram")
+            put_dst = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+            shrink_dst = T.alloc_shared((64, 64), "float32", scope="shared.rsram")
+
+            T.comm.broadcast(src, broadcast_dst, (0, 0), direction="h")
+            T.comm.put(src[0, 16, 16], put_dst, (0, 0), (0, 1))
+            T.comm.broadcast(src[0:1, 0:32, 0:32], shrink_dst, (0, 0), direction="h")
+
+    script = main.script()
+    assert "T.comm_broadcast(src[0, 0:64, 0:64], broadcast_dst[0:64, 0:64], -1, 0, 0)" in script
+    assert "T.comm_put(src[0, 16:48, 16:48], put_dst[0:32, 0:32], -1, 0, 1)" in script
+    assert "T.comm_broadcast(src[0, 0:32, 0:32], shrink_dst[0:32, 0:32], -1, 0, 0)" in script
+
+
+def test_comm_one_to_one_full_buffer_extent_mismatch_is_rejected():
+    with pytest.raises(ValueError, match="exact match is required for Buffer-to-Buffer operation"):
+
+        @T.prim_func
+        def main():
+            with T.Kernel():
+                src = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                dst = T.alloc_shared((32, 64), "float32", scope="shared.rsram")
+                T.comm.broadcast(src, dst, (0, 0), direction="h")
+
+
+def test_comm_explicit_region_oob_is_warned_and_clipped():
+    with pytest.warns(UserWarning, match="T.comm.put explicit BufferRegion exceeds buffer shape"):
+
+        @T.prim_func
+        def main():
+            with T.Kernel():
+                src = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                dst = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                T.comm.put(src[0:32, 0:32], dst[0:64, 0:64], (0, 0), (0, 1))
+
+    assert "T.comm_put(src[0:32, 0:32], dst[0:32, 0:32], -1, 0, 1)" in main.script()
+
+
+def test_comm_all_gather_regions_follow_copy_normalization_rules():
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            send = T.alloc_shared((64, 64), "float32", scope="shared.rsram")
+            recv_from_load = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+            recv_load = T.alloc_shared((4, 64, 64), "float32", scope="shared.rsram")
+            recv_shrink = T.alloc_shared((4, 64, 64), "float32", scope="shared.rsram")
+            recv_axis_shrink = T.alloc_shared((130, 64), "float32", scope="shared.rsram")
+
+            T.comm.all_gather(send[16, 16], recv_from_load, direction="h")
+            T.comm.all_gather(send[0:32, 0:32], recv_load[0, 0, 0], direction="h")
+            T.comm.all_gather(send[0:32, 0:32], recv_shrink, direction="h")
+            T.comm.all_gather(send[0:32, 0:32], recv_axis_shrink, direction="h", axis=0)
+
+    script = main.script()
+    assert "T.comm_allgather(send[16:48, 16:48], recv_from_load[0:4, 0:32, 0:32], 0, -1, -1," in script
+    assert "T.comm_allgather(send[0:32, 0:32], recv_load[0:4, 0:32, 0:32], 0, -1, -1," in script
+    assert "T.comm_allgather(send[0:32, 0:32], recv_shrink[0:4, 0:32, 0:32], 0, -1, -1," in script
+    assert "T.comm_allgather(send[0:32, 0:32], recv_axis_shrink[0:128, 0:32], 0, -1, 0," in script
+
+
+def test_comm_all_gather_buffer_load_pair_is_rejected():
+    with pytest.raises(ValueError, match="both operands are BufferLoad"):
+
+        @T.prim_func
+        def main():
+            with T.Kernel():
+                send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                recv = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+                T.comm.all_gather(send[0, 0], recv[0, 0, 0], direction="h")
+
+
+def test_comm_all_gather_full_buffer_extent_mismatch_is_rejected():
+    with pytest.raises(ValueError, match="exact match is required for Buffer-to-Buffer operation"):
+
+        @T.prim_func
+        def main():
+            with T.Kernel():
+                send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                recv = T.alloc_shared((4, 64, 32), "float32", scope="shared.rsram")
+                T.comm.all_gather(send, recv, direction="h")
+
+
+def test_comm_all_reduce_regions_follow_copy_normalization_rules():
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            src = T.alloc_shared((64, 64), "float32", scope="shared.rsram")
+            out_from_load = T.alloc_shared((32,), "float32", scope="shared.rsram")
+            out_load = T.alloc_shared((64,), "float32", scope="shared.rsram")
+            out_shrink = T.alloc_shared((64,), "float32", scope="shared.rsram")
+
+            T.comm.all_reduce(src[16, 0], out_from_load, "sum", "h", dim=1)
+            T.comm.all_reduce(src[0:32, 0:64], out_load[16], "sum", "h", dim=1)
+            T.comm.all_reduce(src[0:32, 0:64], out_shrink, "sum", "h", dim=1)
+
+    script = main.script()
+    assert "T.comm_allreduce(src[16:48, 0:64], out_from_load[0:32]" in script
+    assert "T.comm_allreduce(src[0:32, 0:64], out_load[16:48]" in script
+    assert "T.comm_allreduce(src[0:32, 0:64], out_shrink[0:32]" in script
+
+
+def test_comm_all_reduce_full_buffer_extent_mismatch_is_rejected():
+    with pytest.raises(ValueError, match="exact match is required for Buffer-to-Buffer operation"):
+
+        @T.prim_func
+        def main():
+            with T.Kernel():
+                src = T.alloc_shared((32, 64), "float32", scope="shared.rsram")
+                out = T.alloc_shared((64,), "float32", scope="shared.rsram")
+                T.comm.all_reduce(src, out, "sum", "h", dim=1)
+
+
+def test_comm_all_reduce_buffer_load_pair_is_rejected():
+    with pytest.raises(ValueError, match="both operands are BufferLoad"):
+
+        @T.prim_func
+        def main():
+            with T.Kernel():
+                src = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                out = T.alloc_shared((32,), "float32", scope="shared.rsram")
+                T.comm.all_reduce(src[0, 0], out[0], "sum", "h", dim=1)
+
+
 def test_comm_dynamic_core_python_api():
     @T.prim_func
     def main(A: T.Tensor((128, 128), "float32")):

@@ -231,6 +231,50 @@ std::optional<PrimExpr> TryRewritePositiveFloorDivTailCompare(
   return std::nullopt;
 }
 
+std::optional<PrimExpr>
+TryRewriteAffineInteriorLT(const PrimExpr &condition,
+                           const std::vector<const VarNode *> &interior_vars) {
+  const auto *lt = condition.as<LTNode>();
+  if (lt == nullptr || interior_vars.empty() ||
+      ContainsAnyVar(lt->b, interior_vars)) {
+    return std::nullopt;
+  }
+
+  Array<Var> vars;
+  vars.reserve(interior_vars.size());
+  for (const VarNode *var : interior_vars) {
+    vars.push_back(ffi::GetRef<Var>(var));
+  }
+
+  arith::Analyzer analyzer;
+  Array<PrimExpr> coeffs = arith::DetectLinearEquation(lt->a, vars);
+  if (coeffs.empty() || coeffs.size() != vars.size() + 1) {
+    return std::nullopt;
+  }
+
+  int active_interior_vars = 0;
+  for (size_t i = 0; i < vars.size(); ++i) {
+    PrimExpr coeff = analyzer.Simplify(coeffs[i]);
+    if (analyzer.CanProve(coeff == make_zero(coeff.dtype()))) {
+      continue;
+    }
+    if (!analyzer.CanProve(coeff == make_const(coeff.dtype(), 1))) {
+      return std::nullopt;
+    }
+    ++active_interior_vars;
+  }
+  if (active_interior_vars != 1) {
+    return std::nullopt;
+  }
+
+  PrimExpr scalar_base = analyzer.Simplify(coeffs.back());
+  // Keep affine tile offsets out of i16 mask arithmetic, which SUVM cannot
+  // lower, by moving the scalar base to the other side of the comparison.
+  PrimExpr tile_part = analyzer.Simplify(lt->a - scalar_base);
+  PrimExpr adjusted_rhs = analyzer.Simplify(lt->b - scalar_base);
+  return tile_part < adjusted_rhs;
+}
+
 std::vector<const ForNode *> CollectLinearForChain(const ForNode *root) {
   std::vector<const ForNode *> loops;
   const ForNode *current = root;
@@ -497,7 +541,21 @@ std::optional<TiledIndexMatch>
 MatchTiledIndex(const PrimExpr &index, const Var &exec, const Var &interior,
                 int64_t tile_extent, bool allow_standalone_interior,
                 arith::Analyzer *analyzer) {
-  if (index.same_as(interior)) {
+  auto matches_integer_var = [](const PrimExpr &expr, const Var &var) {
+    PrimExpr current = expr;
+    while (const auto *cast = current.as<CastNode>()) {
+      DataType source_dtype = cast->value.dtype();
+      if ((!cast->dtype.is_int() && !cast->dtype.is_uint()) ||
+          (!source_dtype.is_int() && !source_dtype.is_uint()) ||
+          cast->dtype.bits() < source_dtype.bits()) {
+        break;
+      }
+      current = cast->value;
+    }
+    return current.same_as(var);
+  };
+
+  if (matches_integer_var(index, interior)) {
     if (!allow_standalone_interior) {
       return std::nullopt;
     }
@@ -528,7 +586,7 @@ MatchTiledIndex(const PrimExpr &index, const Var &exec, const Var &interior,
     }
     auto matches = [&](const PrimExpr &var_term,
                        const PrimExpr &imm_term) -> bool {
-      if (!var_term.same_as(exec)) {
+      if (!matches_integer_var(var_term, exec)) {
         return false;
       }
       const auto *imm = imm_term.as<IntImmNode>();
@@ -538,7 +596,7 @@ MatchTiledIndex(const PrimExpr &index, const Var &exec, const Var &interior,
   };
 
   for (const PrimExpr &term : terms) {
-    if (term.same_as(interior)) {
+    if (matches_integer_var(term, interior)) {
       if (seen_interior) {
         return std::nullopt;
       }
@@ -1329,8 +1387,36 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     return CanonicalizeSuvmDType(dtype).with_lanes(1);
   };
 
+  auto canonical_integer_preferred_dtype =
+      [](std::optional<DataType> dtype) -> std::optional<DataType> {
+    if (!dtype.has_value()) {
+      return std::nullopt;
+    }
+    DataType canonical = CanonicalizeSuvmDType(dtype.value()).with_lanes(1);
+    if (!canonical.is_int()) {
+      return std::nullopt;
+    }
+    return canonical;
+  };
+
   auto is_float_like_dtype = [](DataType dtype) {
     return dtype.is_float() || dtype.is_bfloat16();
+  };
+
+  auto mask_index_dtype_for_value_dtype = [](DataType value_dtype) {
+    DataType dtype = CanonicalizeSuvmDType(value_dtype).with_lanes(1);
+    if (dtype.is_bfloat16() || (dtype.is_int() && dtype.bits() == 16)) {
+      return DataType::Int(16);
+    }
+    if ((dtype.is_float() && dtype.bits() == 32) ||
+        (dtype.is_int() && dtype.bits() == 32)) {
+      return DataType::Int(32);
+    }
+    LOG(FATAL) << "Unsupported masked tile dtype for SunMMIO mask index "
+                  "lowering: "
+               << dtype;
+    TVM_FFI_UNREACHABLE();
+    return DataType::Int(32);
   };
 
   auto arithmetic_flavor_for_dtype = [](DataType dtype) {
@@ -2278,6 +2364,17 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   auto is_canonical_tail_load_predicate = [&](const PrimExpr &predicate,
                                               TileBlockState *state,
                                               const TileAccessInfo &access) {
+    if (access.tile_rank == 1) {
+      ICHECK_EQ(access.tile_axes.size(), 1U);
+      int axis = access.tile_axes[0];
+      if (axis < 0 || axis >= static_cast<int>(scope.tile_shape.size()) ||
+          access.tile_shape.empty() ||
+          access.tile_shape[0] != scope.tile_shape[axis]) {
+        return false;
+      }
+      return is_canonical_tail_axis_predicate(predicate, state, axis);
+    }
+
     if (access.tile_shape != scope.tile_shape) {
       return false;
     }
@@ -2315,6 +2412,36 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       return false;
     }
     return matched_axes[0] && matched_axes[1];
+  };
+
+  auto build_canonical_tail_mask = [&](const TileAccessInfo &access,
+                                       DataType mask_index_dtype) {
+    ICHECK_EQ(access.tile_rank, 1)
+        << "Canonical single-axis tail mask expects a rank-1 tile access";
+    ICHECK_EQ(access.tile_axes.size(), 1U);
+    int axis = access.tile_axes[0];
+    ICHECK_GE(axis, 0);
+    ICHECK_LT(axis, static_cast<int>(scope.tile_shape.size()));
+    ICHECK_LT(axis, static_cast<int>(scope.execution_domain_axes.size()));
+    ICHECK_LT(axis, static_cast<int>(scope.execution_loops.size()));
+    ICHECK(scope.execution_loops[axis] != nullptr)
+        << "Canonical single-axis tail mask is missing the execution loop";
+    int domain_axis = scope.execution_domain_axes[axis];
+    ICHECK_GE(domain_axis, 0);
+    ICHECK_LT(domain_axis, static_cast<int>(scope.domain_shape.size()));
+
+    SunMMIOValue tile_extent = make_index_const(scope.tile_shape[axis]);
+    SunMMIOValue domain_extent = EnsureIndex(
+        EvalExpr(scope.domain_shape[static_cast<size_t>(domain_axis)]));
+    SunMMIOValue exec_index =
+        EnsureIndex(EvalExpr(scope.execution_loops[axis]->loop_var));
+    SunMMIOValue valid_lanes =
+        min_index(tile_extent,
+                  sub_index(domain_extent, mul_index(exec_index, tile_extent)));
+
+    SunMMIOType mask_type = MakeTileType(DataType::Bool(), access.tile_shape);
+    return builder_->TileAxisMask(NewValueName(), 0, valid_lanes, mask_type,
+                                  mask_index_dtype);
   };
 
   auto merge_broadcast_shapes = [&](const std::vector<int64_t> &lhs,
@@ -2450,8 +2577,9 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   };
 
   auto lower_interior_loop_var =
-      [&](const VarNode *var,
-          TileBlockState *state) -> std::optional<SunMMIOValue> {
+      [&](const VarNode *var, TileBlockState *state,
+          std::optional<DataType> preferred_index_dtype)
+      -> std::optional<SunMMIOValue> {
     auto try_axis = [&](const ForNode *loop,
                         int64_t axis) -> std::optional<SunMMIOValue> {
       if (loop == nullptr || loop->loop_var.get() != var) {
@@ -2465,6 +2593,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           << "Tile interior loop var lowering expects static extent";
       DataType dtype =
           CanonicalizeSuvmDType(loop->loop_var.dtype()).with_lanes(1);
+      if (auto preferred =
+              canonical_integer_preferred_dtype(preferred_index_dtype)) {
+        dtype = preferred.value();
+      }
       SunMMIOValue range = builder_->TileRange(
           NewValueName(), MakeTileType(dtype, {*extent}), dtype);
       if (scope.tile_shape.size() == 1) {
@@ -2648,25 +2780,34 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
 
   lower_expr = [&](const PrimExpr &expr, TileBlockState *state,
                    std::optional<DataType> preferred_dtype) -> SunMMIOValue {
-    std::function<SunMMIOValue(const PrimExpr &, const std::vector<int64_t> &)>
+    std::function<SunMMIOValue(const PrimExpr &, const std::vector<int64_t> &,
+                               std::optional<DataType>)>
         lower_bool_expr_to_shape;
+    auto rewrite_mask_condition = [&](const PrimExpr &condition) {
+      PrimExpr rewritten_condition = condition;
+      std::vector<const VarNode *> interior_vars;
+      if (state->interior_axis0_loop != nullptr) {
+        interior_vars.push_back(state->interior_axis0_loop->loop_var.get());
+      }
+      if (state->interior_axis1_loop != nullptr) {
+        interior_vars.push_back(state->interior_axis1_loop->loop_var.get());
+      }
+      if (auto rewritten =
+              TryRewriteAffineInteriorLT(rewritten_condition, interior_vars)) {
+        rewritten_condition = rewritten.value();
+      }
+      if (ContainsFloorDivOrMod(rewritten_condition)) {
+        if (auto rewritten = TryRewritePositiveFloorDivTailCompare(
+                rewritten_condition, interior_vars)) {
+          rewritten_condition = rewritten.value();
+        }
+      }
+      return rewritten_condition;
+    };
     auto emit_select = [&](const PrimExpr &condition,
                            const PrimExpr &true_value_expr,
                            const PrimExpr &false_value_expr, DataType dtype) {
-      PrimExpr condition_to_lower = condition;
-      if (ContainsFloorDivOrMod(condition)) {
-        std::vector<const VarNode *> interior_vars;
-        if (state->interior_axis0_loop != nullptr) {
-          interior_vars.push_back(state->interior_axis0_loop->loop_var.get());
-        }
-        if (state->interior_axis1_loop != nullptr) {
-          interior_vars.push_back(state->interior_axis1_loop->loop_var.get());
-        }
-        if (auto rewritten = TryRewritePositiveFloorDivTailCompare(
-                condition, interior_vars)) {
-          condition_to_lower = rewritten.value();
-        }
-      }
+      PrimExpr condition_to_lower = rewrite_mask_condition(condition);
       SunMMIOValue true_value =
           lower_expr(true_value_expr, state, preferred_dtype);
       SunMMIOValue false_value =
@@ -2680,11 +2821,12 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                   ? std::optional<std::vector<int64_t>>(
                         ExtractStaticShape(false_value.type))
                   : std::nullopt);
+      DataType mask_index_dtype = mask_index_dtype_for_value_dtype(dtype);
       SunMMIOValue cond =
           value_shape.has_value()
               ? lower_bool_expr_to_shape(condition_to_lower,
-                                         value_shape.value())
-              : lower_expr(condition_to_lower, state, std::nullopt);
+                                         value_shape.value(), mask_index_dtype)
+              : lower_expr(condition_to_lower, state, mask_index_dtype);
       if (IsTileLike(cond) || IsTileLike(true_value) ||
           IsTileLike(false_value)) {
         std::vector<int64_t> result_shape;
@@ -2752,7 +2894,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       if (it != state->let_values.end()) {
         return it->second;
       }
-      if (auto interior_value = lower_interior_loop_var(var, state)) {
+      if (auto interior_value =
+              lower_interior_loop_var(var, state, preferred_dtype)) {
         return *interior_value;
       }
       return LookupVar(var);
@@ -2829,8 +2972,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                                                access);
         }
         if (load->predicate.defined() && !skip_load_predicate) {
+          DataType mask_index_dtype =
+              mask_index_dtype_for_value_dtype(load->buffer->dtype);
           SunMMIOValue lowered_mask =
-              lower_expr(load->predicate.value(), state, std::nullopt);
+              lower_expr(load->predicate.value(), state, mask_index_dtype);
           lowered_mask =
               broadcast_tile_to_shape(lowered_mask, access.tile_shape);
           DataType value_dtype =
@@ -2895,13 +3040,22 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     auto emit_binary = [&](BinaryOp op, const PrimExpr &lhs_expr,
                            const PrimExpr &rhs_expr, DataType dtype) {
       bool supports_mixed_precision = supports_mixed_precision_binary(op);
+      std::optional<DataType> integer_preferred =
+          canonical_integer_preferred_dtype(preferred_dtype);
+      DataType expr_result_dtype = CanonicalizeSuvmDType(dtype).with_lanes(1);
+      bool use_integer_preferred =
+          integer_preferred.has_value() && expr_result_dtype.is_int();
       std::optional<DataType> operand_preferred_dtype =
-          supports_mixed_precision ? preferred_dtype : std::nullopt;
+          (supports_mixed_precision || use_integer_preferred) ? preferred_dtype
+                                                              : std::nullopt;
       SunMMIOValue lhs = lower_expr(lhs_expr, state, operand_preferred_dtype);
       SunMMIOValue rhs = lower_expr(rhs_expr, state, operand_preferred_dtype);
-      DataType result_dtype = supports_mixed_precision
-                                  ? choose_result_dtype(dtype, preferred_dtype)
-                                  : CanonicalizeSuvmDType(dtype).with_lanes(1);
+      DataType result_dtype =
+          use_integer_preferred
+              ? integer_preferred.value()
+              : (supports_mixed_precision
+                     ? choose_result_dtype(dtype, preferred_dtype)
+                     : expr_result_dtype);
       if (IsScalarLike(lhs) && IsScalarLike(rhs)) {
         SunMMIOType result_type{
             SunMMIOType::Kind::kScalar, result_dtype, 1, {}};
@@ -2943,101 +3097,110 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                               arithmetic_flavor_for_dtype(result_dtype), lhs,
                               rhs, tile_type, result_dtype);
     };
-    auto emit_compare_to_shape = [&](CompareOp op, const PrimExpr &lhs_expr,
-                                     const PrimExpr &rhs_expr,
-                                     const std::optional<std::vector<int64_t>>
-                                         &forced_shape) {
-      SunMMIOValue lhs = lower_expr(lhs_expr, state, std::nullopt);
-      SunMMIOValue rhs = lower_expr(rhs_expr, state, std::nullopt);
-      if (!is_tile_compare_operand(lhs, rhs) && !forced_shape.has_value()) {
-        SunMMIOType operand_type = lhs.type;
-        rhs = EnsureType(rhs, operand_type, lhs.dtype);
-        return builder_->Compare(NewValueName(), op,
-                                 GetCompareDomain(lhs.dtype), lhs, rhs,
-                                 operand_type);
-      }
-      if (!is_tile_compare_operand(lhs, rhs)) {
-        SunMMIOType operand_type = lhs.type;
-        rhs = EnsureType(rhs, operand_type, lhs.dtype);
-        return builder_->Compare(NewValueName(), op,
-                                 GetCompareDomain(lhs.dtype), lhs, rhs,
-                                 operand_type);
-      }
-      std::vector<int64_t> result_shape = forced_shape.has_value()
-                                              ? forced_shape.value()
-                                              : tile_result_shape(lhs, rhs);
-      if (!forced_shape.has_value() && result_shape.size() == 1 &&
-          (IsTileLike(lhs) || IsTileLike(rhs))) {
-        result_shape = {result_shape[0], 1};
-      }
-      SunMMIOType operand_type =
-          MakeTileType(IsTileLike(lhs) ? lhs.dtype : rhs.dtype, result_shape);
-      DataType operand_dtype = operand_type.dtype;
-      lhs = orient_tile_operand_to_shape(lhs, result_shape);
-      rhs = orient_tile_operand_to_shape(rhs, result_shape);
-      if (forced_shape.has_value()) {
-        auto operand_shape = [&](const SunMMIOValue &value) {
-          if (IsTileLike(value)) {
-            return ExtractStaticShape(value.type);
+    auto emit_compare_to_shape =
+        [&](CompareOp op, const PrimExpr &lhs_expr, const PrimExpr &rhs_expr,
+            const std::optional<std::vector<int64_t>> &forced_shape,
+            std::optional<DataType> operand_preferred_dtype) {
+          SunMMIOValue lhs =
+              lower_expr(lhs_expr, state, operand_preferred_dtype);
+          SunMMIOValue rhs =
+              lower_expr(rhs_expr, state, operand_preferred_dtype);
+          if (!is_tile_compare_operand(lhs, rhs) && !forced_shape.has_value()) {
+            SunMMIOType operand_type = lhs.type;
+            rhs = EnsureType(rhs, operand_type, lhs.dtype);
+            return builder_->Compare(NewValueName(), op,
+                                     GetCompareDomain(lhs.dtype), lhs, rhs,
+                                     operand_type);
           }
-          return std::vector<int64_t>(result_shape.size(), 1);
+          if (!is_tile_compare_operand(lhs, rhs)) {
+            SunMMIOType operand_type = lhs.type;
+            rhs = EnsureType(rhs, operand_type, lhs.dtype);
+            return builder_->Compare(NewValueName(), op,
+                                     GetCompareDomain(lhs.dtype), lhs, rhs,
+                                     operand_type);
+          }
+          std::vector<int64_t> result_shape = forced_shape.has_value()
+                                                  ? forced_shape.value()
+                                                  : tile_result_shape(lhs, rhs);
+          if (!forced_shape.has_value() && result_shape.size() == 1 &&
+              (IsTileLike(lhs) || IsTileLike(rhs))) {
+            result_shape = {result_shape[0], 1};
+          }
+          SunMMIOType operand_type = MakeTileType(
+              IsTileLike(lhs) ? lhs.dtype : rhs.dtype, result_shape);
+          DataType operand_dtype = operand_type.dtype;
+          lhs = orient_tile_operand_to_shape(lhs, result_shape);
+          rhs = orient_tile_operand_to_shape(rhs, result_shape);
+          if (forced_shape.has_value()) {
+            auto operand_shape = [&](const SunMMIOValue &value) {
+              if (IsTileLike(value)) {
+                return ExtractStaticShape(value.type);
+              }
+              return std::vector<int64_t>(result_shape.size(), 1);
+            };
+            std::vector<int64_t> inferred_shape =
+                merge_broadcast_shapes(operand_shape(lhs), operand_shape(rhs));
+            if (inferred_shape != result_shape) {
+              if (IsTileLike(lhs) &&
+                  ExtractStaticShape(lhs.type) != result_shape) {
+                lhs = broadcast_tile_to_shape(lhs, result_shape);
+              }
+              if (IsTileLike(rhs) &&
+                  ExtractStaticShape(rhs.type) != result_shape) {
+                rhs = broadcast_tile_to_shape(rhs, result_shape);
+              }
+            }
+          }
+          if (!IsTileLike(lhs) && lhs.dtype != operand_dtype) {
+            SunMMIOType scalar_type{
+                SunMMIOType::Kind::kScalar, operand_dtype, 1, {}};
+            lhs =
+                builder_->Cast(NewValueName(), lhs, scalar_type, operand_dtype);
+          }
+          if (!IsTileLike(rhs) && rhs.dtype != operand_dtype) {
+            SunMMIOType scalar_type{
+                SunMMIOType::Kind::kScalar, operand_dtype, 1, {}};
+            rhs =
+                builder_->Cast(NewValueName(), rhs, scalar_type, operand_dtype);
+          }
+          return builder_->Compare(NewValueName(), op,
+                                   GetCompareDomain(operand_dtype), lhs, rhs,
+                                   operand_type);
         };
-        std::vector<int64_t> inferred_shape =
-            merge_broadcast_shapes(operand_shape(lhs), operand_shape(rhs));
-        if (inferred_shape != result_shape) {
-          if (IsTileLike(lhs) && ExtractStaticShape(lhs.type) != result_shape) {
-            lhs = broadcast_tile_to_shape(lhs, result_shape);
-          }
-          if (IsTileLike(rhs) && ExtractStaticShape(rhs.type) != result_shape) {
-            rhs = broadcast_tile_to_shape(rhs, result_shape);
-          }
-        }
-      }
-      if (!IsTileLike(lhs) && lhs.dtype != operand_dtype) {
-        SunMMIOType scalar_type{
-            SunMMIOType::Kind::kScalar, operand_dtype, 1, {}};
-        lhs = builder_->Cast(NewValueName(), lhs, scalar_type, operand_dtype);
-      }
-      if (!IsTileLike(rhs) && rhs.dtype != operand_dtype) {
-        SunMMIOType scalar_type{
-            SunMMIOType::Kind::kScalar, operand_dtype, 1, {}};
-        rhs = builder_->Cast(NewValueName(), rhs, scalar_type, operand_dtype);
-      }
-      return builder_->Compare(NewValueName(), op,
-                               GetCompareDomain(operand_dtype), lhs, rhs,
-                               operand_type);
-    };
     auto emit_compare = [&](CompareOp op, const PrimExpr &lhs_expr,
                             const PrimExpr &rhs_expr) {
-      return emit_compare_to_shape(op, lhs_expr, rhs_expr, std::nullopt);
+      return emit_compare_to_shape(
+          op, lhs_expr, rhs_expr, std::nullopt,
+          canonical_integer_preferred_dtype(preferred_dtype));
     };
     auto try_emit_compare_to_shape =
         [&](const PrimExpr &compare_expr,
-            const std::vector<int64_t> &target_shape)
+            const std::vector<int64_t> &target_shape,
+            std::optional<DataType> operand_preferred_dtype)
         -> std::optional<SunMMIOValue> {
       if (const auto *eq = compare_expr.as<EQNode>()) {
-        return emit_compare_to_shape(CompareOp::kEQ, eq->a, eq->b,
-                                     target_shape);
+        return emit_compare_to_shape(CompareOp::kEQ, eq->a, eq->b, target_shape,
+                                     operand_preferred_dtype);
       }
       if (const auto *ne = compare_expr.as<NENode>()) {
-        return emit_compare_to_shape(CompareOp::kNE, ne->a, ne->b,
-                                     target_shape);
+        return emit_compare_to_shape(CompareOp::kNE, ne->a, ne->b, target_shape,
+                                     operand_preferred_dtype);
       }
       if (const auto *lt = compare_expr.as<LTNode>()) {
-        return emit_compare_to_shape(CompareOp::kLT, lt->a, lt->b,
-                                     target_shape);
+        return emit_compare_to_shape(CompareOp::kLT, lt->a, lt->b, target_shape,
+                                     operand_preferred_dtype);
       }
       if (const auto *le = compare_expr.as<LENode>()) {
-        return emit_compare_to_shape(CompareOp::kLE, le->a, le->b,
-                                     target_shape);
+        return emit_compare_to_shape(CompareOp::kLE, le->a, le->b, target_shape,
+                                     operand_preferred_dtype);
       }
       if (const auto *gt = compare_expr.as<GTNode>()) {
-        return emit_compare_to_shape(CompareOp::kGT, gt->a, gt->b,
-                                     target_shape);
+        return emit_compare_to_shape(CompareOp::kGT, gt->a, gt->b, target_shape,
+                                     operand_preferred_dtype);
       }
       if (const auto *ge = compare_expr.as<GENode>()) {
-        return emit_compare_to_shape(CompareOp::kGE, ge->a, ge->b,
-                                     target_shape);
+        return emit_compare_to_shape(CompareOp::kGE, ge->a, ge->b, target_shape,
+                                     operand_preferred_dtype);
       }
       return std::nullopt;
     };
@@ -3087,25 +3250,35 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                               rhs, result_type, DataType::Bool());
     };
     lower_bool_expr_to_shape =
-        [&](const PrimExpr &bool_expr,
-            const std::vector<int64_t> &target_shape) -> SunMMIOValue {
-      if (auto compare = try_emit_compare_to_shape(bool_expr, target_shape)) {
+        [&](const PrimExpr &bool_expr, const std::vector<int64_t> &target_shape,
+            std::optional<DataType> mask_index_dtype) -> SunMMIOValue {
+      PrimExpr bool_expr_to_lower = rewrite_mask_condition(bool_expr);
+      std::optional<DataType> integer_preferred =
+          canonical_integer_preferred_dtype(mask_index_dtype);
+      if (auto compare = try_emit_compare_to_shape(
+              bool_expr_to_lower, target_shape, integer_preferred)) {
         return compare.value();
       }
-      if (const auto *and_op = bool_expr.as<AndNode>()) {
-        SunMMIOValue lhs = lower_bool_expr_to_shape(and_op->a, target_shape);
-        SunMMIOValue rhs = lower_bool_expr_to_shape(and_op->b, target_shape);
+      if (const auto *and_op = bool_expr_to_lower.as<AndNode>()) {
+        SunMMIOValue lhs = lower_bool_expr_to_shape(and_op->a, target_shape,
+                                                    integer_preferred);
+        SunMMIOValue rhs = lower_bool_expr_to_shape(and_op->b, target_shape,
+                                                    integer_preferred);
         return emit_logical_values(BinaryOp::kAnd, lhs, rhs, target_shape,
                                    and_op->a, and_op->b);
       }
-      if (const auto *or_op = bool_expr.as<OrNode>()) {
-        SunMMIOValue lhs = lower_bool_expr_to_shape(or_op->a, target_shape);
-        SunMMIOValue rhs = lower_bool_expr_to_shape(or_op->b, target_shape);
+      if (const auto *or_op = bool_expr_to_lower.as<OrNode>()) {
+        SunMMIOValue lhs =
+            lower_bool_expr_to_shape(or_op->a, target_shape, integer_preferred);
+        SunMMIOValue rhs =
+            lower_bool_expr_to_shape(or_op->b, target_shape, integer_preferred);
         return emit_logical_values(BinaryOp::kOr, lhs, rhs, target_shape,
                                    or_op->a, or_op->b);
       }
-      SunMMIOValue value = lower_expr(bool_expr, state, std::nullopt);
-      return adapt_logical_tile_operand(value, target_shape, bool_expr);
+      SunMMIOValue value =
+          lower_expr(bool_expr_to_lower, state, integer_preferred);
+      return adapt_logical_tile_operand(value, target_shape,
+                                        bool_expr_to_lower);
     };
     auto emit_logical_binary = [&](BinaryOp op, const PrimExpr &lhs_expr,
                                    const PrimExpr &rhs_expr, DataType dtype) {
@@ -3113,16 +3286,20 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           merge_optional_tile_shapes(infer_tile_expr_shape(lhs_expr, state),
                                      infer_tile_expr_shape(rhs_expr, state));
       if (result_shape.has_value()) {
-        SunMMIOValue lhs =
-            lower_bool_expr_to_shape(lhs_expr, result_shape.value());
-        SunMMIOValue rhs =
-            lower_bool_expr_to_shape(rhs_expr, result_shape.value());
+        std::optional<DataType> integer_preferred =
+            canonical_integer_preferred_dtype(preferred_dtype);
+        SunMMIOValue lhs = lower_bool_expr_to_shape(
+            lhs_expr, result_shape.value(), integer_preferred);
+        SunMMIOValue rhs = lower_bool_expr_to_shape(
+            rhs_expr, result_shape.value(), integer_preferred);
         return emit_logical_values(op, lhs, rhs, result_shape.value(), lhs_expr,
                                    rhs_expr);
       }
 
-      SunMMIOValue lhs = lower_expr(lhs_expr, state, std::nullopt);
-      SunMMIOValue rhs = lower_expr(rhs_expr, state, std::nullopt);
+      std::optional<DataType> integer_preferred =
+          canonical_integer_preferred_dtype(preferred_dtype);
+      SunMMIOValue lhs = lower_expr(lhs_expr, state, integer_preferred);
+      SunMMIOValue rhs = lower_expr(rhs_expr, state, integer_preferred);
       if (IsScalarLike(lhs) && IsScalarLike(rhs)) {
         SunMMIOType result_type{SunMMIOType::Kind::kScalar,
                                 CanonicalizeSuvmDType(dtype).with_lanes(1),
@@ -3506,6 +3683,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           analyze_access(store->buffer, store->indices, state);
       bool use_forced_unit_axis = forced_unit_axis.has_value() &&
                                   !natural_access.requires_aligned_1d_load;
+      bool canonical_tail_store_for_rhs =
+          store->predicate.defined() &&
+          is_canonical_tail_load_predicate(store->predicate.value(), state,
+                                           natural_access);
       std::optional<int64_t> saved_forced_axis;
       bool had_saved_forced_axis = false;
       if (use_forced_unit_axis) {
@@ -3524,7 +3705,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
               : natural_access;
       std::optional<PrimExpr> saved_tail_store_predicate =
           state->active_tail_store_predicate;
-      if (state->tile_mask.has_value() && store->predicate.defined()) {
+      if ((state->tile_mask.has_value() || canonical_tail_store_for_rhs) &&
+          store->predicate.defined()) {
         state->active_tail_store_predicate = store->predicate.value();
       }
       SunMMIOValue raw_rhs =
@@ -3535,19 +3717,26 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                              ? normalize_for_aligned_1d_store(access, raw_rhs)
                              : normalize_for_store(access, raw_rhs);
       std::string cache_key = make_tile_cache_key(access);
+      DataType store_mask_index_dtype =
+          mask_index_dtype_for_value_dtype(store->buffer->dtype);
       std::optional<SunMMIOValue> mask =
           (access.tile_rank == 2) ? state->tile_mask : std::nullopt;
-      bool canonical_aligned_tail_store =
-          access.requires_aligned_1d_load && store->predicate.defined() &&
-          is_canonical_tail_load_predicate(store->predicate.value(), state,
-                                           access);
+      bool canonical_tail_store = store->predicate.defined() &&
+                                  is_canonical_tail_load_predicate(
+                                      store->predicate.value(), state, access);
       if (!access.requires_aligned_1d_load && store->predicate.defined() &&
           !mask.has_value()) {
-        mask = lower_expr(store->predicate.value(), state, std::nullopt);
+        if (canonical_tail_store && access.tile_rank == 1) {
+          mask = build_canonical_tail_mask(access, store_mask_index_dtype);
+        } else {
+          mask = lower_expr(store->predicate.value(), state,
+                            store_mask_index_dtype);
+        }
       }
       if (access.requires_aligned_1d_load && store->predicate.defined() &&
-          !canonical_aligned_tail_store) {
-        mask = lower_expr(store->predicate.value(), state, std::nullopt);
+          !canonical_tail_store) {
+        mask =
+            lower_expr(store->predicate.value(), state, store_mask_index_dtype);
       }
       std::optional<SunMMIOValue> dst_view;
       if (mask.has_value() && !access.requires_aligned_1d_load) {
@@ -3586,25 +3775,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       std::optional<SunMMIOValue> updated_aligned_tile;
       erase_current_values_for_buffer(state, store->buffer.get());
       if (access.requires_aligned_1d_load) {
-        if (!mask.has_value() && store->predicate.defined() &&
-            is_canonical_tail_load_predicate(store->predicate.value(), state,
-                                             access)) {
-          SunMMIOValue valid_lanes;
-          int64_t mask_axis = access.unsqueeze_axis == 1 ? 0 : 1;
-          if (state->interior_axis0_loop != nullptr) {
-            SunMMIOValue tile_extent = make_index_const(scope.tile_shape[0]);
-            SunMMIOValue domain_extent = EnsureIndex(
-                EvalExpr(scope.domain_shape[scope.execution_domain_axes[0]]));
-            SunMMIOValue exec_index =
-                EnsureIndex(EvalExpr(scope.execution_loops[0]->loop_var));
-            valid_lanes = min_index(
-                tile_extent,
-                sub_index(domain_extent, mul_index(exec_index, tile_extent)));
-          }
-          SunMMIOType mask_type =
-              MakeTileType(DataType::Bool(), access.aligned_load_shape);
-          mask = builder_->TileAxisMask(NewValueName(), mask_axis, valid_lanes,
-                                        mask_type);
+        if (!mask.has_value() && canonical_tail_store) {
+          mask = build_canonical_tail_mask(access, store_mask_index_dtype);
         }
         updated_aligned_tile = store_aligned_1d_tile(access, rhs, mask, state);
       } else {
@@ -4052,6 +4224,57 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     lower_stmt(stmt, state);
   };
 
+  auto infer_tail_mask_index_dtype = [&](const Stmt &body) {
+    auto record_dtype = [&](std::optional<DataType> *slot, DataType value_dtype,
+                            const char *context) {
+      DataType candidate = mask_index_dtype_for_value_dtype(value_dtype);
+      if (slot->has_value() && slot->value() != candidate) {
+        LOG(FATAL) << "Tail mask lowering currently requires one mask index "
+                      "dtype per tail scope; saw conflicting dtype in "
+                   << context;
+      }
+      *slot = candidate;
+    };
+
+    std::optional<DataType> store_mask_index_dtype;
+    std::optional<DataType> fallback_mask_index_dtype;
+    tir::PostOrderVisit(body, [&](const ObjectRef &obj) {
+      if (const auto *store = obj.as<BufferStoreNode>()) {
+        if (store->predicate.defined()) {
+          record_dtype(&store_mask_index_dtype, store->buffer->dtype,
+                       "predicated BufferStore");
+        }
+        return;
+      }
+      if (const auto *load = obj.as<BufferLoadNode>()) {
+        if (load->predicate.defined()) {
+          record_dtype(&fallback_mask_index_dtype, load->buffer->dtype,
+                       "predicated BufferLoad");
+        }
+        return;
+      }
+      if (const auto *select = obj.as<SelectNode>()) {
+        record_dtype(&fallback_mask_index_dtype, select->dtype, "tir.Select");
+        return;
+      }
+      if (const auto *call = obj.as<CallNode>()) {
+        const auto *op_node = call->op.as<OpNode>();
+        if (op_node && call->args.size() >= 3 &&
+            op_node->name == "tir.if_then_else") {
+          record_dtype(&fallback_mask_index_dtype, call->dtype,
+                       "tir.if_then_else");
+        }
+      }
+    });
+    if (store_mask_index_dtype.has_value()) {
+      return store_mask_index_dtype.value();
+    }
+    if (fallback_mask_index_dtype.has_value()) {
+      return fallback_mask_index_dtype.value();
+    }
+    return DataType::Int(32);
+  };
+
   auto emit_tile_stmt = [&](TileBlockState *state) {
     if (has_partial_execution_prefix) {
       lower_reduce_stmt(scope.tile_block_body, state);
@@ -4082,20 +4305,24 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       }
       builder_->BeginElse();
       TailMaskInfo mask_info = build_tail_mask_info(state);
+      DataType tail_mask_index_dtype =
+          infer_tail_mask_index_dtype(scope.tail_tile_block_body);
       builder_->BeginIf(mask_info.row_tail_cond, std::vector<int64_t>{});
       builder_->BeginIf(mask_info.col_tail_cond, std::vector<int64_t>{});
-      SunMMIOValue rect_mask =
-          builder_->TileRectMask(NewValueName(), mask_info.valid_rows,
-                                 mask_info.valid_cols, mask_info.mask_type);
+      SunMMIOValue rect_mask = builder_->TileRectMask(
+          NewValueName(), mask_info.valid_rows, mask_info.valid_cols,
+          mask_info.mask_type, tail_mask_index_dtype);
       lower_tail_with_mask(rect_mask);
       builder_->BeginElse();
-      SunMMIOValue row_mask = builder_->TileAxisMask(
-          NewValueName(), 0, mask_info.valid_rows, mask_info.mask_type);
+      SunMMIOValue row_mask =
+          builder_->TileAxisMask(NewValueName(), 0, mask_info.valid_rows,
+                                 mask_info.mask_type, tail_mask_index_dtype);
       lower_tail_with_mask(row_mask);
       builder_->EndIf();
       builder_->BeginElse();
-      SunMMIOValue col_mask = builder_->TileAxisMask(
-          NewValueName(), 1, mask_info.valid_cols, mask_info.mask_type);
+      SunMMIOValue col_mask =
+          builder_->TileAxisMask(NewValueName(), 1, mask_info.valid_cols,
+                                 mask_info.mask_type, tail_mask_index_dtype);
       lower_tail_with_mask(col_mask);
       builder_->EndIf();
       builder_->EndIf();

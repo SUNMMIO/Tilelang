@@ -165,6 +165,30 @@ public:
   static const Op &Get();
 };
 
+/** Mesh directions in which a communication call consumes its source. */
+enum class CommunicationDirections {
+  kNone,
+  kHorizontal,
+  kVertical,
+  kHorizontalAndVertical,
+};
+
+/**
+ * \brief Whether a TIR call is an inter-core communication tile op.
+ */
+TVM_DLL bool IsCommunicationOp(const Call &call);
+
+/**
+ * \brief Mesh directions in which a communication call consumes its original
+ * source.
+ *
+ * Two-dimensional broadcast and allgather use different first-phase
+ * directions. Fixed put routes are derived from their core coordinates;
+ * dynamic put routes conservatively return both directions.
+ */
+TVM_DLL CommunicationDirections
+GetCommunicationSourceDirections(const Call &call, Target target);
+
 class AllreduceOpNode : public TileOperatorNode {
 public:
   PrimExpr src, dst;
