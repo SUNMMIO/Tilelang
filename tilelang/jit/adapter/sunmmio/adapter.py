@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 from collections.abc import Sequence
-from dataclasses import replace
 
 from tvm import tir
 from tvm.target import Target
@@ -34,10 +33,7 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
         device_mod: tvm.IRModule | None = None,
         device_kernel_source: str | None = None,
         verbose: bool = False,
-        pass_configs: dict[str, Any] | None = None,
-        compile_flags: list[str] | None = None,
         kernel_lib_path: str | os.PathLike[str] | None = None,
-        kernel_name: str | None = None,
         abi: SunmmioKernelABI | None = None,
     ):
         self.params = params
@@ -57,28 +53,19 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
             device_mod=device_mod,
             params=params,
         )
-        if kernel_name is not None:
-            self.abi = replace(self.abi, kernel_name=kernel_name)
-        self.kernel_name = self.abi.kernel_name
-        self.runtime_kernel_name = self.kernel_name
         self.host_mod = host_mod
         self.device_mod = device_mod
         self.device_kernel_source = device_kernel_source or ""
-        self.kernel_global_source = self.device_kernel_source
         self.verbose = verbose
-        self.pass_configs = pass_configs
-        self.compile_flags = compile_flags
 
         self.lib_generator = self._make_lib_generator(verbose)
-        self.lib_generator.assign_pass_configs(pass_configs)
-        self.lib_generator.assign_compile_flags(compile_flags)
+        self.lib_generator.update_device_tir_source(self._format_device_mod_tir(device_mod))
         self.lib_generator.update_mlir_source(self.device_kernel_source)
         if kernel_lib_path is None:
             self.lib_generator.compile_lib()
             self.lib_generator.load_lib()
         else:
             self.lib_generator.load_lib(kernel_lib_path)
-        self.runtime_kernel_name = getattr(self.lib_generator, "runtime_kernel_name", self.runtime_kernel_name)
         self._post_init()
 
     @classmethod
@@ -92,9 +79,6 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
         device_kernel_source: str | None,
         kernel_lib_path: str | None = None,
         verbose: bool = False,
-        pass_configs: dict[str, Any] | None = None,
-        compile_flags: list[str] | None = None,
-        kernel_name: str | None = None,
         abi: SunmmioKernelABI | None = None,
     ):
         if kernel_lib_path is None or not os.path.exists(kernel_lib_path):
@@ -109,10 +93,7 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
             device_mod=None,
             device_kernel_source=device_kernel_source,
             verbose=verbose,
-            pass_configs=pass_configs,
-            compile_flags=compile_flags,
             kernel_lib_path=kernel_lib_path,
-            kernel_name=kernel_name,
             abi=abi,
         )
 
@@ -127,6 +108,32 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
     def _make_lib_generator(self, verbose: bool) -> SunmmioLibraryGenerator:
         return SunmmioLibraryGenerator(self.target, verbose)
 
+    @staticmethod
+    def _format_device_mod_tir(device_mod: tvm.IRModule | None) -> str:
+        if device_mod is None:
+            return ""
+        try:
+            return device_mod.script()
+        except Exception:
+            return str(device_mod)
+
+    @property
+    def kernel_name(self) -> str:
+        return self.abi.kernel_name
+
+    def _validate_abi_arg_count(self, args: Sequence[Any]) -> None:
+        expected_public_args = self.abi.public_arg_count
+        expected_full_args = self.abi.full_arg_count
+        if len(args) in (expected_public_args, expected_full_args):
+            return
+
+        if self.abi.runtime_scalar_count:
+            raise ValueError(
+                f"Sunmmio kernel expected {expected_public_args} public arguments "
+                f"or {expected_full_args} public arguments plus explicit scalar ABI arguments, got {len(args)}"
+            )
+        raise ValueError(f"Sunmmio kernel expected {expected_public_args} arguments, got {len(args)}")
+
     def get_kernel_source(self, kernel_only: bool = True) -> str:
         return self.device_kernel_source
 
@@ -140,13 +147,50 @@ class SunmmioKernelSuDeckAdapter(SunmmioKernelAdapter):
     """Adapter for the real Sunmmio runtime path backed by SuDeck."""
 
     def _make_lib_generator(self, verbose: bool) -> SunmmioSuDeckLibraryGenerator:
-        return SunmmioSuDeckLibraryGenerator(self.target, self.kernel_name, verbose)
+        lib_generator = SunmmioSuDeckLibraryGenerator(self.target, self.kernel_name, verbose)
+        lib_generator.update_launcher_specs(self._build_launcher_specs())
+        return lib_generator
+
+    def _build_launcher_specs(self) -> list[tuple[str, str]]:
+        """Launcher specs in device-ABI order: "tensor" for handles, else the scalar dtype."""
+        return [
+            (name, "tensor" if dtype == "handle" else dtype)
+            for name, dtype in zip(self.abi.device_param_names, self.abi.device_param_dtypes)
+        ]
+
+    def _resolve_binding(self, source: Any, source_kind: RuntimeScalarSourceKind, dim_index: int) -> int:
+        if source_kind == "shape":
+            return int(source.shape[dim_index])
+        return int(source.stride()[dim_index])
 
     def _convert_torch_func(self) -> Callable[..., Any]:
-        def func(*args: Any, **kwargs: Any):
-            raise RuntimeError(
-                "Sunmmio SuDeck JIT runtime execution is not implemented yet. Use get_kernel_source() to inspect the generated SUVM MLIR."
+        if self.result_idx:
+            raise NotImplementedError(
+                "sunmmio SuDeck execution requires explicit output tensors; do not pass out_idx. "
+                "Allocate outputs as torch_sunmmio device tensors and pass them at the call site."
             )
+
+        def func(*args: Any, **kwargs: Any):
+            import torch
+            import torch_sunmmio  # noqa: F401 - registers torch.sunmmio
+            from torch_sunmmio.sunmmio import unsafe_get_sutensor_handle
+
+            pymodule = self.lib_generator.pymodule
+            if pymodule is None:
+                raise RuntimeError("Sunmmio SuDeck launch module was not built; compile the kernel before calling it.")
+            self._validate_abi_arg_count(args)
+            runtime_args = self.abi.materialize_runtime_args(args, self._resolve_binding)
+            call_args = []
+            for dtype, value in zip(self.abi.device_param_dtypes, runtime_args):
+                if dtype == "handle":
+                    call_args.append(unsafe_get_sutensor_handle(value))
+                elif dtype.startswith(("float", "bfloat")):
+                    call_args.append(float(value))
+                else:
+                    call_args.append(int(value))
+            stream = torch.sunmmio.current_stream()
+            stream_handle = torch.sunmmio.unsafe_get_sudeck_stream_handle(stream)
+            pymodule.call(*call_args, stream_handle)
 
         return func
 
@@ -178,7 +222,6 @@ class SunmmioSunsimKernelAdapter(SunmmioKernelAdapter):
                     "Sunmmio sunsim adapter was created without a materialized ELF artifact. "
                     "Materialize the artifact through SunmmioSunsimLibraryGenerator before constructing the adapter."
                 )
-            self.runtime_kernel_name = artifact.runtime_kernel_name
             kwargs.setdefault("kernel_name", artifact.runtime_kernel_name)
             return sunsim.run(elf=artifact.elf_path, args=runtime_args, **kwargs)
 
@@ -197,19 +240,11 @@ class SunmmioSunsimKernelAdapter(SunmmioKernelAdapter):
         return sunsim
 
     def _prepare_sunsim_args(self, args: Sequence[Any], sunsim) -> list[Any]:
-        expected_public_args = self.abi.public_arg_count
-        expected_full_args = self.abi.full_arg_count
-        if len(args) not in (expected_public_args, expected_full_args):
-            if self.abi.runtime_scalar_count:
-                raise ValueError(
-                    f"Sunmmio sunsim kernel expected {expected_public_args} public arguments "
-                    f"or {expected_full_args} public arguments plus explicit scalar ABI arguments, got {len(args)}"
-                )
-            raise ValueError(f"Sunmmio sunsim kernel expected {expected_public_args} arguments, got {len(args)}")
+        self._validate_abi_arg_count(args)
 
         marker_types = (sunsim.Input, sunsim.Output, sunsim.Inout)
         descriptor_type = sunsim.Descriptor
-        for index, (arg, param) in enumerate(zip(args[:expected_public_args], self.params)):
+        for index, (arg, param) in enumerate(zip(args[: self.abi.public_arg_count], self.params)):
             if param.is_scalar():
                 if isinstance(arg, marker_types):
                     raise TypeError(

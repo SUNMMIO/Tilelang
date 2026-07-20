@@ -1042,8 +1042,10 @@ static cute::CuteAlgebraLayout buildTiler(int rank, int ax0, int ax1,
  * \param level_col_major  Per-level col-major flag, indexed from innermost
  *                         (level 0) to outermost.  Length equals the number
  *                         of levels in tiled dims.
- *                         false (Z/row-major): ax1 first, ax0 second.
- *                         true  (N/col-major): ax0 first, ax1 second.
+ *                         false (Z/row-major): higher-numbered tensor
+ *                         dimensions first (innermost).
+ *                         true  (N/col-major): lower-numbered tensor
+ *                         dimensions first (innermost).
  */
 static Layout toCuteLayout(const std::vector<std::vector<PrimExpr>> &dim_modes,
                            Array<PrimExpr> shape, int ax0, int ax1,
@@ -1062,23 +1064,23 @@ static Layout toCuteLayout(const std::vector<std::vector<PrimExpr>> &dim_modes,
   };
   std::vector<ModeRef> order;
 
-  // Tiled modes by level.
+  // Build the order level by level, matching sutensor-proto's HStride
+  // construction. Tiled dimensions contribute one mode at every level;
+  // non-tiled (scalar) dimensions contribute their sole mode at the outermost
+  // level, interleaved with the tiled outer modes by tensor-dimension order.
   for (size_t lv = 0; lv < tiled_levels; ++lv) {
-    if (level_col_major[lv]) {
-      // N (col-major): ax0 innermost.
-      order.push_back({ax0, lv});
-      order.push_back({ax1, lv});
-    } else {
-      // Z (row-major): ax1 innermost.
-      order.push_back({ax1, lv});
-      order.push_back({ax0, lv});
-    }
-  }
+    const bool col_major = level_col_major[lv];
+    const int d_start = col_major ? 0 : rank - 1;
+    const int d_end = col_major ? rank : -1;
+    const int d_step = col_major ? 1 : -1;
 
-  // Non-tiled dims: row-major (rightmost dim is innermost).
-  for (int d = rank - 1; d >= 0; --d) {
-    if (d != ax0 && d != ax1)
-      order.push_back({d, 0});
+    for (int d = d_start; d != d_end; d += d_step) {
+      if (d == ax0 || d == ax1) {
+        order.push_back({d, lv});
+      } else if (lv == tiled_levels - 1) {
+        order.push_back({d, 0});
+      }
+    }
   }
 
   // Compute contiguous strides from ordering.

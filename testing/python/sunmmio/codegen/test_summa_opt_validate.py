@@ -27,7 +27,7 @@ def summa_matmul(
     block_M=32,
     block_N=32,
     block_K=32,
-    dtype="float16",
+    dtype="bfloat16",
     accum_dtype="float32",
 ):
     shard_policy = T.MeshShardingPolicy(y=0, x=1)
@@ -51,6 +51,7 @@ def summa_matmul(
             core_row = _cid // T.mesh_ncols()
             core_col = _cid % T.mesh_ncols()
 
+            A_broadcast = T.alloc_shared((block_M, block_K), dtype, scope="shared.rsram")
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_local = T.alloc_shared((block_M, block_N), accum_dtype)
@@ -71,10 +72,11 @@ def summa_matmul(
                                 bx * block_M : bx * block_M + block_M,
                                 a_local_k : a_local_k + block_K,
                             ],
-                            A_shared,
+                            A_broadcast,
                             (core_row, a_src_col),
                             direction="h",
                         )
+                        T.copy(A_broadcast, A_shared)
                         T.comm.broadcast(
                             B[
                                 b_local_k : b_local_k + block_K,
