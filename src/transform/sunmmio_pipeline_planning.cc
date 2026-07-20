@@ -13,6 +13,7 @@
  * call.
  */
 
+#include "../op/builtin.h"
 #include "../op/utils.h"
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
@@ -21,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <deque>
 #include <fstream>
 #include <iostream>
@@ -130,10 +132,29 @@ enum class PhysicalSramBank : int {
   Count = 4,
 };
 
+using PerCommandBankPhases =
+    std::unordered_map<const BufferNode *, std::unordered_map<int, int>>;
+
+struct GreedyBankColoring {
+  PerCommandBankPhases writer_phases;
+  PerCommandBankPhases reader_phases;
+  std::vector<int> bits;
+};
+
+static int LookupBankPhase(const PerCommandBankPhases &phases,
+                           const BufferNode *buffer, int command_id) {
+  auto it_buffer = phases.find(buffer);
+  if (it_buffer == phases.end())
+    return 0;
+  auto it_command = it_buffer->second.find(command_id);
+  return it_command == it_buffer->second.end() ? 0 : it_command->second;
+}
+
 static std::vector<PhysicalSramBank> GetOccupiedSramBanks(
     const PipelineInstruction &instruction,
     const std::unordered_set<const BufferNode *> &versioned_buffers,
-    int iter_mod) {
+    int iter_mod, const PerCommandBankPhases &writer_phases,
+    const PerCommandBankPhases &reader_phases) {
   std::array<bool, static_cast<int>(PhysicalSramBank::Count)> occupied{};
   int version_slot = instruction.iter;
   if (iter_mod > 0) {
@@ -142,10 +163,12 @@ static std::vector<PhysicalSramBank> GetOccupiedSramBanks(
       version_slot += iter_mod;
     }
   }
-  auto collect = [&](const BufferRegion &region) {
+  auto collect = [&](const BufferRegion &region, bool is_write) {
     const String &scope = region->buffer.scope();
+    int phase = LookupBankPhase(is_write ? writer_phases : reader_phases,
+                                region->buffer.get(), instruction.id);
     bool pong = versioned_buffers.count(region->buffer.get()) != 0 &&
-                version_slot % 2 != 0;
+                (version_slot + phase) % 2 != 0;
     if (scope == kSunmmioScopeASRAM) {
       occupied[static_cast<int>(pong ? PhysicalSramBank::ASRAMPong
                                      : PhysicalSramBank::ASRAMPing)] = true;
@@ -155,10 +178,10 @@ static std::vector<PhysicalSramBank> GetOccupiedSramBanks(
     }
   };
   for (const BufferRegion &region : instruction.reads) {
-    collect(region);
+    collect(region, false);
   }
   for (const BufferRegion &region : instruction.writes) {
-    collect(region);
+    collect(region, true);
   }
 
   std::vector<PhysicalSramBank> result;
@@ -213,6 +236,76 @@ struct LocalDDG {
   std::unordered_map<const BufferNode *, BufferAccessInfo> buffer_access_infos;
   std::vector<const BufferNode *> buffer_order;
 };
+
+static bool IsRuntimeBankedBuffer(const BufferNode *buffer) {
+  const String &scope = tvm::ffi::GetRef<Buffer>(buffer).scope();
+  return scope == kSunmmioScopeASRAM || scope == kSunmmioScopeWSRAM;
+}
+
+static std::vector<GreedyBankColoring> BuildGreedyBankColorings(
+    const LocalDDG &local_ddg,
+    const std::unordered_set<const BufferNode *> &versioned_buffers, int faster,
+    size_t *total_candidate_count) {
+  std::vector<std::pair<const BufferNode *, int>> writers;
+  std::map<std::pair<const BufferNode *, int>, int> writer_index;
+  for (const LocalDependencyEdge &edge : local_ddg.edges) {
+    if (!versioned_buffers.count(edge.buffer) ||
+        !IsRuntimeBankedBuffer(edge.buffer)) {
+      continue;
+    }
+    std::pair<const BufferNode *, int> key{edge.buffer,
+                                           edge.producer_instruction_id};
+    if (!writer_index.count(key)) {
+      writer_index[key] = static_cast<int>(writers.size());
+      writers.push_back(key);
+    }
+  }
+
+  int search_bits = static_cast<int>(writers.size());
+  ICHECK(faster == -1 || faster > 0)
+      << "tl.sunmmio_faster must be -1 or a positive coloring budget";
+  ICHECK_LT(search_bits, static_cast<int>(sizeof(size_t) * 8))
+      << "Too many independent greedy coloring variables: " << search_bits;
+  size_t total_candidates = size_t{1} << search_bits;
+  *total_candidate_count = total_candidates;
+  size_t candidate_count =
+      faster == -1 ? total_candidates
+                   : std::min(total_candidates, static_cast<size_t>(faster));
+  std::vector<GreedyBankColoring> result;
+  result.reserve(candidate_count);
+  for (size_t mask = 0; mask < candidate_count; ++mask) {
+    GreedyBankColoring coloring;
+    coloring.bits.resize(writers.size(), 0);
+    for (size_t i = 0; i < writers.size(); ++i) {
+      coloring.bits[i] = static_cast<int>((mask >> i) & 1);
+    }
+    for (size_t i = 0; i < writers.size(); ++i) {
+      coloring.writer_phases[writers[i].first][writers[i].second] =
+          coloring.bits[i];
+    }
+
+    bool valid = true;
+    for (const LocalDependencyEdge &edge : local_ddg.edges) {
+      auto it_writer =
+          writer_index.find({edge.buffer, edge.producer_instruction_id});
+      if (it_writer == writer_index.end())
+        continue;
+      int reader_phase = coloring.bits[it_writer->second] ^ (edge.distance & 1);
+      auto &reader_map = coloring.reader_phases[edge.buffer];
+      auto [it_reader, inserted] =
+          reader_map.emplace(edge.consumer_instruction_id, reader_phase);
+      if (!inserted && it_reader->second != reader_phase) {
+        valid = false;
+        break;
+      }
+    }
+    if (valid)
+      result.push_back(std::move(coloring));
+  }
+  if (result.empty())
+    result.push_back(GreedyBankColoring{});
+  return result;
+}
 
 /**
  * \brief Build the single-iteration local DDG from read/write regions.
@@ -764,6 +857,11 @@ public:
     versioned_buffers_ = versioned_buffers;
   }
 
+  void SetBankColoring(const GreedyBankColoring &coloring) {
+    writer_phases_ = coloring.writer_phases;
+    reader_phases_ = coloring.reader_phases;
+  }
+
   void BuildDependencyGraph() {
     int instruction_count = static_cast<int>(instructions.size());
     predecessors_.assign(instruction_count, {});
@@ -786,6 +884,7 @@ public:
       BufferRegion region;
       int instruction_index;
       AccessType type;
+      int instance_id;
     };
 
     std::unordered_map<const BufferNode *, std::vector<AccessRecord>>
@@ -796,18 +895,19 @@ public:
       int current_index = topological_order_[ordered_index];
       const PipelineInstruction &current_instruction =
           instructions[current_index];
-      int current_version = GetVersionId(current_instruction);
 
       for (const BufferRegion &read_region : current_instruction.reads) {
         const BufferNode *buffer = read_region->buffer.get();
+        int current_instance =
+            GetAccessInstanceId(current_instruction, buffer, false);
         auto history_it = buffer_access_history.find(buffer);
         if (history_it == buffer_access_history.end()) {
           continue;
         }
         auto &history = history_it->second;
         for (auto it = history.rbegin(); it != history.rend(); ++it) {
-          if (ShouldSkipVersionedCrossIteration(buffer, current_version,
-                                                it->instruction_index)) {
+          if (ShouldSkipVersionedAccess(buffer, current_instance,
+                                        it->instance_id)) {
             continue;
           }
           if (it->type == AccessType::kWrite &&
@@ -820,14 +920,16 @@ public:
 
       for (const BufferRegion &write_region : current_instruction.writes) {
         const BufferNode *buffer = write_region->buffer.get();
+        int current_instance =
+            GetAccessInstanceId(current_instruction, buffer, true);
         auto history_it = buffer_access_history.find(buffer);
         if (history_it == buffer_access_history.end()) {
           continue;
         }
         auto &history = history_it->second;
         for (auto it = history.rbegin(); it != history.rend(); ++it) {
-          if (ShouldSkipVersionedCrossIteration(buffer, current_version,
-                                                it->instruction_index)) {
+          if (ShouldSkipVersionedAccess(buffer, current_instance,
+                                        it->instance_id)) {
             continue;
           }
           if (!AccessOverlapChecker::Overlap(write_region, it->region)) {
@@ -842,11 +944,15 @@ public:
 
       for (const BufferRegion &read_region : current_instruction.reads) {
         buffer_access_history[read_region->buffer.get()].push_back(
-            {read_region, current_index, AccessType::kRead});
+            {read_region, current_index, AccessType::kRead,
+             GetAccessInstanceId(current_instruction, read_region->buffer.get(),
+                                 false)});
       }
       for (const BufferRegion &write_region : current_instruction.writes) {
         buffer_access_history[write_region->buffer.get()].push_back(
-            {write_region, current_index, AccessType::kWrite});
+            {write_region, current_index, AccessType::kWrite,
+             GetAccessInstanceId(current_instruction,
+                                 write_region->buffer.get(), true)});
       }
     }
   }
@@ -977,7 +1083,8 @@ public:
       busy_intervals[instruction.device_type].push_back(
           {instruction.scheduled_start, instruction.scheduled_end});
       for (PhysicalSramBank bank :
-           GetOccupiedSramBanks(instruction, versioned_buffers_, iter_mod_)) {
+           GetOccupiedSramBanks(instruction, versioned_buffers_, iter_mod_,
+                                writer_phases_, reader_phases_)) {
         bank_busy_intervals[static_cast<int>(bank)].push_back(
             {instruction.scheduled_start, instruction.scheduled_end});
       }
@@ -1054,7 +1161,8 @@ public:
       float start_time = ready_time;
       std::vector<std::vector<Interval> *> required_intervals{&intervals};
       for (PhysicalSramBank bank :
-           GetOccupiedSramBanks(*instruction, versioned_buffers_, iter_mod_)) {
+           GetOccupiedSramBanks(*instruction, versioned_buffers_, iter_mod_,
+                                writer_phases_, reader_phases_)) {
         required_intervals.push_back(
             &bank_busy_intervals[static_cast<int>(bank)]);
       }
@@ -1124,14 +1232,24 @@ public:
   }
 
 private:
-  bool ShouldSkipVersionedCrossIteration(const BufferNode *buffer,
-                                         int current_version,
-                                         int previous_instruction_index) const {
+  bool ShouldSkipVersionedAccess(const BufferNode *buffer, int current_instance,
+                                 int previous_instance) const {
     if (versioned_buffers_.count(buffer) == 0) {
       return false;
     }
-    return GetVersionId(instructions[previous_instruction_index]) !=
-           current_version;
+    return previous_instance != current_instance;
+  }
+
+  int GetAccessInstanceId(const PipelineInstruction &instruction,
+                          const BufferNode *buffer, bool is_write) const {
+    int slot = GetVersionId(instruction);
+    if (!IsRuntimeBankedBuffer(buffer))
+      return slot;
+    int phase = LookupBankPhase(is_write ? writer_phases_ : reader_phases_,
+                                buffer, instruction.id);
+    int bank = (slot + phase) & 1;
+    int version = slot / 2;
+    return bank * std::max(1, iter_mod_) + version;
   }
 
   int GetVersionId(const PipelineInstruction &instruction) const {
@@ -1167,7 +1285,8 @@ private:
 
   bool AreBanksFree(const PipelineInstruction &instruction, float time) const {
     for (PhysicalSramBank bank :
-         GetOccupiedSramBanks(instruction, versioned_buffers_, iter_mod_)) {
+         GetOccupiedSramBanks(instruction, versioned_buffers_, iter_mod_,
+                              writer_phases_, reader_phases_)) {
       if (bank_busy_until_[static_cast<int>(bank)] > time) {
         return false;
       }
@@ -1177,7 +1296,8 @@ private:
 
   void ReserveBanks(const PipelineInstruction &instruction, float end_time) {
     for (PhysicalSramBank bank :
-         GetOccupiedSramBanks(instruction, versioned_buffers_, iter_mod_)) {
+         GetOccupiedSramBanks(instruction, versioned_buffers_, iter_mod_,
+                              writer_phases_, reader_phases_)) {
       bank_busy_until_[static_cast<int>(bank)] = end_time;
     }
   }
@@ -1200,6 +1320,8 @@ private:
   std::array<float, static_cast<int>(PhysicalSramBank::Count)>
       bank_busy_until_{};
   std::unordered_set<const BufferNode *> versioned_buffers_;
+  PerCommandBankPhases writer_phases_;
+  PerCommandBankPhases reader_phases_;
   std::vector<std::vector<int>> predecessors_;
   std::vector<std::vector<int>> successors_;
   std::vector<int> topological_order_;
@@ -1373,11 +1495,48 @@ public:
     }
 
     // 8. Stage 4: Build the global DDG and run the two-phase scheduler.
+    int faster = -1;
+    auto pass_ctx = tvm::transform::PassContext::Current();
+    auto faster_config = pass_ctx->GetConfig<Integer>(tl::kSunmmioFaster);
+    if (faster_config) {
+      faster = faster_config.value()->value;
+    } else if (const char *env_faster = std::getenv("TL_SUNMMIO_FASTER")) {
+      faster = std::stoi(env_faster);
+    }
+    size_t total_coloring_candidates = 0;
+    std::vector<GreedyBankColoring> coloring_candidates =
+        BuildGreedyBankColorings(local_ddg, versioned_buffers, faster,
+                                 &total_coloring_candidates);
+    GreedyBankColoring selected_coloring = coloring_candidates.front();
+    float selected_body_makespan = std::numeric_limits<float>::max();
+    for (const GreedyBankColoring &candidate : coloring_candidates) {
+      GlobalPipelineScheduler candidate_scheduler;
+      candidate_scheduler.instructions = stage_assembly.body_instructions;
+      candidate_scheduler.iter_mod_ = stage_assembly.iterations;
+      candidate_scheduler.SetVersionedBuffers(versioned_buffers);
+      candidate_scheduler.SetBankColoring(candidate);
+      candidate_scheduler.BuildDependencyGraph();
+      candidate_scheduler.CalculateBottomLevels();
+      std::vector<PipelineInstruction> candidate_schedule =
+          candidate_scheduler.Schedule("");
+      float makespan = 0.0f;
+      for (const PipelineInstruction &instruction : candidate_schedule) {
+        makespan = std::max(makespan, instruction.scheduled_end);
+      }
+      if (makespan < selected_body_makespan ||
+          (makespan == selected_body_makespan &&
+           candidate.bits < selected_coloring.bits)) {
+        selected_body_makespan = makespan;
+        selected_coloring = candidate;
+      }
+    }
+
     GlobalPipelineScheduler prologue_scheduler;
     prologue_scheduler.instructions = stage_assembly.prologue_instructions;
     prologue_scheduler.iter_mod_ = stage_assembly.iterations;
     prologue_scheduler.debug_ = debug_;
     prologue_scheduler.SetVersionedBuffers(versioned_buffers);
+    prologue_scheduler.SetBankColoring(selected_coloring);
     prologue_scheduler.BuildDependencyGraph();
     prologue_scheduler.CalculateBottomLevels();
     std::vector<PipelineInstruction> prologue_schedule =
@@ -1388,6 +1547,7 @@ public:
     body_scheduler.iter_mod_ = stage_assembly.iterations;
     body_scheduler.debug_ = debug_;
     body_scheduler.SetVersionedBuffers(versioned_buffers);
+    body_scheduler.SetBankColoring(selected_coloring);
     body_scheduler.BuildDependencyGraph();
     body_scheduler.CalculateBottomLevels();
     body_scheduler.DumpGraph("body_graph.log");
@@ -1401,6 +1561,7 @@ public:
       epilogue_scheduler.iter_mod_ = stage_assembly.iterations;
       epilogue_scheduler.debug_ = debug_;
       epilogue_scheduler.SetVersionedBuffers(versioned_buffers);
+      epilogue_scheduler.SetBankColoring(selected_coloring);
       epilogue_scheduler.BuildDependencyGraph();
       epilogue_scheduler.CalculateBottomLevels();
       epilogue_schedule = epilogue_scheduler.Schedule("epilogue.log");
@@ -1421,6 +1582,32 @@ public:
       }
     }
     annotations.Set("iterations", stage_assembly.iterations);
+    annotations.Set("coloring_total_candidates",
+                    Integer(total_coloring_candidates));
+    annotations.Set("coloring_evaluated_candidates",
+                    Integer(coloring_candidates.size()));
+
+    Map<Buffer, Map<Integer, PrimExpr>> runtime_bank_writer_phases;
+    for (const auto &[buffer_node, phases] : selected_coloring.writer_phases) {
+      Map<Integer, PrimExpr> per_command;
+      for (const auto &[command_id, phase] : phases) {
+        per_command.Set(Integer(command_id), Integer(phase));
+      }
+      runtime_bank_writer_phases.Set(tvm::ffi::GetRef<Buffer>(buffer_node),
+                                     per_command);
+    }
+    annotations.Set("runtime_bank_writer_phases", runtime_bank_writer_phases);
+
+    Map<Buffer, Map<Integer, PrimExpr>> runtime_bank_reader_phases;
+    for (const auto &[buffer_node, phases] : selected_coloring.reader_phases) {
+      Map<Integer, PrimExpr> per_command;
+      for (const auto &[command_id, phase] : phases) {
+        per_command.Set(Integer(command_id), Integer(phase));
+      }
+      runtime_bank_reader_phases.Set(tvm::ffi::GetRef<Buffer>(buffer_node),
+                                     per_command);
+    }
+    annotations.Set("runtime_bank_reader_phases", runtime_bank_reader_phases);
 
     Array<String> orders;
     for (const auto &instruction : prologue_schedule) {

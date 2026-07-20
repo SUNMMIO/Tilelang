@@ -3474,13 +3474,13 @@ private:
     std::vector<int> bump_indices;
     {
       auto pass_ctx = tvm::transform::PassContext::Current();
-      auto cfg = pass_ctx->GetConfig<Integer>(tl::kSunmmioILPFaster);
+      auto cfg = pass_ctx->GetConfig<Integer>(tl::kSunmmioFaster);
       if (cfg.defined()) {
         faster = static_cast<int>(cfg.value()->value);
       }
     }
     if (faster <= 0) {
-      faster = GetEnvInt("TL_SUNMMIO_ILP_FASTER", 0);
+      faster = GetEnvInt("TL_SUNMMIO_FASTER", 0);
     }
     if (faster <= 0) {
       auto auto_selected = AutoSelectSunmmioILPFaster(result.prob.P);

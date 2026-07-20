@@ -277,9 +277,9 @@ STRICT_CASES = [
         {
             "A_rsram_stage": [3, 128, 32],
             "A_shared_ping": [2, 128, 32],
-            "A_shared_pong": [128, 32],
+            "A_shared_pong": [2, 128, 32],
             "B_shared_ping": [2, 32, 128],
-            "B_shared_pong": [32, 128],
+            "B_shared_pong": [2, 32, 128],
         },
     ),
     (
@@ -346,9 +346,20 @@ def test_tilelang_transform_sunmmio_pipeline_strict(case_name, kernel_factory, n
 
     annotations = _extract_pipeline_annotations(planned["main"].body)
     assert int(annotations["iterations"]) == num_stages
+    assert int(annotations["coloring_evaluated_candidates"]) == int(annotations["coloring_total_candidates"])
     assert _buffer_names(annotations, "versioned_buffers")
     instruction_count = _pipeline_instruction_count(planned["main"].body)
     _validate_orders(annotations, instruction_count)
+
+    if case_name.startswith("matmul_num_stages_"):
+        writer_phases = annotations["runtime_bank_writer_phases"]
+        reader_phases = annotations["runtime_bank_reader_phases"]
+        a_buffer = next(buffer for buffer in writer_phases if buffer.name == "A_shared")
+        b_buffer = next(buffer for buffer in writer_phases if buffer.name == "B_shared")
+        assert {int(op): int(phase) for op, phase in writer_phases[a_buffer].items()} == {1: 0, 4: 1}
+        assert {int(op): int(phase) for op, phase in reader_phases[a_buffer].items()} == {3: 0, 5: 1}
+        assert {int(op): int(phase) for op, phase in writer_phases[b_buffer].items()} == {2: 0}
+        assert {int(op): int(phase) for op, phase in reader_phases[b_buffer].items()} == {3: 0, 5: 0}
 
     layout_map = injected["main"].attrs["layout_map"]
     actual_shapes = {buffer.name: [int(dim) for dim in buffer.shape] for buffer, _ in layout_map.items()}
@@ -372,6 +383,20 @@ def test_tilelang_transform_sunmmio_pipeline_skips_when_extent_is_less_than_stag
         planned = tl.transform.SunmmioPipelinePlanning(debug=False)(mod)
 
     assert _extract_pipeline_annotations(planned["main"].body) is None
+
+
+def test_tilelang_transform_sunmmio_pipeline_limits_coloring_search_with_faster():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(mesh_matmul_new(1024, 1024, 1024, 128, 128, 32, num_stages=3).with_attr("global_symbol", "main"))
+        mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+        mod = tl.transform.IfStmtBinding()(mod)
+        with tl.transform.PassContext(config={tl.PassConfigKey.TL_SUNMMIO_FASTER: 2}):
+            planned = tl.transform.SunmmioPipelinePlanning(debug=False)(mod)
+
+    annotations = _extract_pipeline_annotations(planned["main"].body)
+    assert int(annotations["coloring_total_candidates"]) > 2
+    assert int(annotations["coloring_evaluated_candidates"]) == 2
 
 
 if __name__ == "__main__":

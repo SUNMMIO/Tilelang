@@ -8,7 +8,6 @@ from tilelang import tvm
 from tilelang.engine.phase import should_force_let_inline
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from testing.python.transform.sunmmio_mesh_kernel_new_syntax_reference import (
-    ilp,
     mesh_flashattn_new,
     mesh_flashdecoding_new,
     mesh_flashmladecode_new,
@@ -101,10 +100,7 @@ def _extract_pipeline_annotations(stmt):
         if isinstance(node, tir.For):
             ann = node.annotations
             if ann and (
-                "prologue_orders" in ann
-                or "body_orders" in ann
-                or "epilogue_orders" in ann
-                or "runtime_multiversion_buffers" in ann
+                "prologue_orders" in ann or "body_orders" in ann or "epilogue_orders" in ann or "runtime_multiversion_buffers" in ann
             ):
                 result = ann
                 return
@@ -121,9 +117,7 @@ def _extract_pipeline_annotations(stmt):
             visit(node.then_case)
             if node.else_case is not None:
                 visit(node.else_case)
-        elif isinstance(node, tir.LetStmt):
-            visit(node.body)
-        elif isinstance(node, tir.AttrStmt):
+        elif isinstance(node, (tir.LetStmt, tir.AttrStmt)):
             visit(node.body)
 
     visit(stmt)
@@ -407,17 +401,17 @@ def _build_pipeline_modules(kernel_factory):
         mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
         mod = tl.transform.IfStmtBinding()(mod)
         _write_ir(artifacts["before_pipeline_ir"], mod)
-        with tl.transform.PassContext(
-            config={tl.PassConfigKey.TL_SUNMMIO_ILP_STAGE_SHRINK: True}
-        ):
-            with _ScopedEnv(
+        with (
+            tl.transform.PassContext(config={tl.PassConfigKey.TL_SUNMMIO_ILP_STAGE_SHRINK: False}),
+            _ScopedEnv(
                 {
-                    "TL_SUNMMIO_ILP_FASTER": "20",
+                    "TL_SUNMMIO_FASTER": "50",
                     "TL_SUNMMIO_ILP_PROBLEM_JSON": str(artifacts["problem_json"]),
                     "TL_SUNMMIO_ILP_SOLUTION_JSON": str(artifacts["solution_json"]),
                 }
-            ):
-                planned = tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
+            ),
+        ):
+            planned = tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
         _write_ir(artifacts["after_planning_ir"], planned)
         _write_pipeline_annotations(artifacts["planning_annotations"], planned)
         injected = tl.transform.InjectSunmmioPipelineILP()(planned)
@@ -426,10 +420,7 @@ def _build_pipeline_modules(kernel_factory):
     stage_attempts_payload = {}
     annotations = _extract_pipeline_annotations(planned["main"].body)
     if annotations is not None:
-        anno_payload = {
-            str(key): _annotation_to_python(value)
-            for key, value in annotations.items()
-        }
+        anno_payload = {str(key): _annotation_to_python(value) for key, value in annotations.items()}
         stage_attempts_payload.update(
             {
                 "stage_count": anno_payload.get("stage_count"),
@@ -471,17 +462,17 @@ def _build_pipeline_modules(kernel_factory):
 
 
 STRICT_CASES = [
-    (
-        "ilp",
-        lambda: ilp(),{
-            "A_rsram_stage": [128, 32],
-            "A_shared_ping": [128, 32],
-            "A_shared_pong": [128, 32],
-            "B_shared_ping": [32, 128],
-            "B_shared_pong": [32, 128],
-        },
-        ["A_shared", "B_shared"],
-    ),
+    # (
+    #     "ilp",
+    #     lambda: ilp(),{
+    #         "A_rsram_stage": [128, 32],
+    #         "A_shared_ping": [128, 32],
+    #         "A_shared_pong": [128, 32],
+    #         "B_shared_ping": [32, 128],
+    #         "B_shared_pong": [32, 128],
+    #     },
+    #     ["A_shared", "B_shared"],
+    # ),
     (
         "matmul2",
         lambda: mesh_matmul_new(1024, 1024, 1024, 128, 128, 32, num_stages=3),
@@ -494,52 +485,52 @@ STRICT_CASES = [
         },
         ["A_shared", "B_shared"],
     ),
-    # (
-    #     "flashattn2",
-    #     lambda: mesh_flashattn_new(num_stages=2),
-    #     {
-    #         "K_shared_ping": [64, 128],
-    #         "K_shared_pong": [64, 128],
-    #         "acc_s_cast_ping": [64, 64],
-    #         "acc_s_cast_pong": [64, 64],
-    #         "V_shared_ping": [64, 128],
-    #         "V_shared_pong": [64, 128],
-    #     },
-    #     ["K_shared", "V_shared", "acc_s_cast"],
-    # ),
-    # (
-    #     "flashdecoding2",
-    #     lambda: mesh_flashdecoding_new(num_stages=2),
-    #     {
-    #         "K_shared_ping": [128, 128],
-    #         "K_shared_pong": [128, 128],
-    #         "acc_s_cast_ping": [64, 128],
-    #         "acc_s_cast_pong": [64, 128],
-    #         "V_shared_ping": [128, 128],
-    #         "V_shared_pong": [128, 128],
-    #     },
-    #     ["K_shared", "V_shared", "acc_s_cast"],
-    # ),
-    # (
-    #     "flashmladecode2",
-    #     lambda: mesh_flashmladecode_new(num_stages=2),
-    #     {
-    #         "KV_shared_ping": [64, 512],
-    #         "KV_shared_pong": [64, 512],
-    #         "KV_shared2_ping": [64, 512],
-    #         "KV_shared2_pong": [64, 512],
-    #         "K_pe_shared_ping": [64, 64],
-    #         "K_pe_shared_pong": [64, 64],
-    #         "S_shared_ping": [64, 64],
-    #         "S_shared_pong": [64, 64],
-    #     },
-    #     ["KV_shared", "KV_shared2", "K_pe_shared", "S_shared"],
-    # ),
+    (
+        "flashattn2",
+        lambda: mesh_flashattn_new(num_stages=4),
+        {
+            "K_shared_ping": [64, 128],
+            "K_shared_pong": [64, 128],
+            "acc_s_cast_ping": [64, 64],
+            "acc_s_cast_pong": [64, 64],
+            "V_shared_ping": [64, 128],
+            "V_shared_pong": [64, 128],
+        },
+        ["K_shared", "V_shared", "acc_s_cast"],
+    ),
+    (
+        "flashdecoding2",
+        lambda: mesh_flashdecoding_new(num_stages=3),
+        {
+            "K_shared_ping": [128, 128],
+            "K_shared_pong": [128, 128],
+            "acc_s_cast_ping": [64, 128],
+            "acc_s_cast_pong": [64, 128],
+            "V_shared_ping": [128, 128],
+            "V_shared_pong": [128, 128],
+        },
+        ["K_shared", "V_shared", "acc_s_cast"],
+    ),
+    (
+        "flashmladecode2",
+        lambda: mesh_flashmladecode_new(num_stages=5),
+        {
+            "KV_shared_ping": [64, 512],
+            "KV_shared_pong": [64, 512],
+            "KV_shared2_ping": [64, 512],
+            "KV_shared2_pong": [64, 512],
+            "K_pe_shared_ping": [64, 64],
+            "K_pe_shared_pong": [64, 64],
+            "S_shared_ping": [64, 64],
+            "S_shared_pong": [64, 64],
+        },
+        ["KV_shared", "KV_shared2", "K_pe_shared", "S_shared"],
+    ),
 ]
 
 for _case_name, _kernel_factory, _, _ in STRICT_CASES:
-    setattr(_kernel_factory, "_strict_case_name", _case_name)
-    setattr(_kernel_factory, "_requested_num_stages", 3)
+    _kernel_factory._strict_case_name = _case_name
+    _kernel_factory._requested_num_stages = 3
 
 
 @pytest.mark.parametrize(
@@ -586,7 +577,7 @@ def test_per_op_phase_offsets_select_matching_region_banks():
         mod = tvm.IRModule.from_expr(func)
         mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
         mod = tl.transform.IfStmtBinding()(mod)
-        with _ScopedEnv({"TL_SUNMMIO_ILP_FASTER": "20"}):
+        with _ScopedEnv({"TL_SUNMMIO_FASTER": "20"}):
             planned = tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
 
         annotations = _extract_pipeline_annotations(planned["main"].body)

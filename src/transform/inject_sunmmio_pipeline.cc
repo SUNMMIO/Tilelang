@@ -63,7 +63,7 @@ public:
     for (auto &buffer : substituter.versioned_buffers_) {
       if (substituter.IsBankedBuffer(buffer)) {
         int ping_versions = (substituter.iterations_ + 1) / 2;
-        int pong_versions = substituter.iterations_ / 2;
+        int pong_versions = ping_versions;
         Buffer ping = substituter.makeMultiVersionBuffer(buffer, ping_versions,
                                                          "_ping", true);
         Buffer pong = substituter.makeMultiVersionBuffer(buffer, pong_versions,
@@ -196,6 +196,8 @@ private:
     auto versioned_buffers_anno = op->annotations.Get("versioned_buffers");
     auto used_buffers_anno = op->annotations.Get("used_buffers");
     auto iterations_anno = op->annotations.Get("iterations");
+    auto writer_phases_anno = op->annotations.Get("runtime_bank_writer_phases");
+    auto reader_phases_anno = op->annotations.Get("runtime_bank_reader_phases");
     if (versioned_buffers_anno && used_buffers_anno && iterations_anno) {
       Array<Buffer> versioned_buffers =
           Downcast<Array<Buffer>>(versioned_buffers_anno.value());
@@ -251,6 +253,24 @@ private:
           }
         }
         loop.CopyOnWrite()->annotations.Set("used_buffers", new_used_buffers);
+        auto remap_phase_annotation = [&](const Optional<Any> &annotation,
+                                          const char *name) {
+          if (!annotation)
+            return;
+          Map<Buffer, Map<Integer, PrimExpr>> phases =
+              Downcast<Map<Buffer, Map<Integer, PrimExpr>>>(annotation.value());
+          Map<Buffer, Map<Integer, PrimExpr>> remapped;
+          for (const auto &[buffer, per_command] : phases) {
+            auto it = buffer_remap_.find(buffer);
+            remapped.Set(it == buffer_remap_.end() ? buffer : (*it).second,
+                         per_command);
+          }
+          loop.CopyOnWrite()->annotations.Set(name, remapped);
+        };
+        remap_phase_annotation(writer_phases_anno,
+                               "runtime_bank_writer_phases");
+        remap_phase_annotation(reader_phases_anno,
+                               "runtime_bank_reader_phases");
       }
     }
     return loop;
@@ -445,13 +465,27 @@ class PipelineBodyRewriter : public StmtExprMutator {
 public:
   PipelineBodyRewriter(Array<Buffer> used_buffers,
                        Map<Buffer, Buffer> bank_peer_buffers,
-                       Array<Buffer> version_axis_buffers, For pipeline_loop) {
+                       Array<Buffer> version_axis_buffers,
+                       Map<Buffer, Map<Integer, PrimExpr>> writer_phases,
+                       Map<Buffer, Map<Integer, PrimExpr>> reader_phases,
+                       For pipeline_loop) {
     used_buffers_ = used_buffers;
     bank_peer_buffers_ = std::move(bank_peer_buffers);
     pipeline_loop_ = std::move(pipeline_loop);
     for (const Buffer &buffer : version_axis_buffers) {
       version_axis_buffers_.insert(buffer.get());
     }
+    auto import_phases = [](const Map<Buffer, Map<Integer, PrimExpr>> &source,
+                            auto *destination) {
+      for (const auto &[buffer, phases] : source) {
+        auto &per_command = (*destination)[buffer.get()];
+        for (const auto &[command_id, phase] : phases) {
+          per_command[command_id->value] = Downcast<IntImm>(phase)->value;
+        }
+      }
+    };
+    import_phases(writer_phases, &writer_phases_);
+    import_phases(reader_phases, &reader_phases_);
     for (auto it : used_buffers) {
       buffer_data_to_buffer_.Set(it->data, it);
       if (bank_peer_buffers_.count(it)) {
@@ -462,6 +496,7 @@ public:
   }
 
   void set_current_version(int v) { current_version_ = v; }
+  void set_current_command(int id) { current_command_id_ = id; }
 
   void set_loop_var_replacement(PrimExpr p) { replaced_loop_var_ = p; }
 
@@ -485,7 +520,7 @@ private:
       if (!IsVersionedBuffer(buffer)) {
         continue;
       }
-      Buffer target = ResolveTargetBuffer(buffer);
+      Buffer target = ResolveTargetBuffer(buffer, true);
       if (!HasVersionAxis(target)) {
         new_args.Set(i, target->data);
         continue;
@@ -529,7 +564,7 @@ private:
     if (!count) {
       return store;
     }
-    Buffer target = ResolveTargetBuffer(store->buffer);
+    Buffer target = ResolveTargetBuffer(store->buffer, true);
     Array<PrimExpr> indices = store->indices;
     RewriteIndices(store->buffer, target, &indices);
     return BufferStore(target, store->value, indices);
@@ -545,7 +580,7 @@ private:
     if (!count) {
       return load;
     }
-    Buffer target = ResolveTargetBuffer(load->buffer);
+    Buffer target = ResolveTargetBuffer(load->buffer, false);
     Array<PrimExpr> indices = load->indices;
     RewriteIndices(load->buffer, target, &indices);
     return BufferLoad(target, indices);
@@ -556,7 +591,8 @@ private:
       RegionOp original_region(op->args);
       Buffer source = original_region->GetBuffer();
       if (IsVersionedBuffer(source)) {
-        Buffer target = ResolveTargetBuffer(source);
+        bool is_write = HasCommandPhase(writer_phases_, source);
+        Buffer target = ResolveTargetBuffer(source, is_write);
         Array<Range> ranges = original_region->GetRanges();
         if (HasVersionAxis(target)) {
           ICHECK(HasVersionAxis(source));
@@ -610,8 +646,27 @@ private:
     return bank_peer_buffers_.count(buffer) != 0;
   }
 
-  Buffer ResolveTargetBuffer(const Buffer &buffer) const {
-    if (!IsBankedBuffer(buffer) || current_version_ % 2 == 0) {
+  bool HasCommandPhase(
+      const std::unordered_map<const BufferNode *, std::unordered_map<int, int>>
+          &phases,
+      const Buffer &buffer) const {
+    auto it_buffer = phases.find(buffer.get());
+    return it_buffer != phases.end() &&
+           it_buffer->second.count(current_command_id_) != 0;
+  }
+
+  int CurrentPhase(const Buffer &buffer, bool is_write) const {
+    const auto &phases = is_write ? writer_phases_ : reader_phases_;
+    auto it_buffer = phases.find(buffer.get());
+    if (it_buffer == phases.end())
+      return 0;
+    auto it_command = it_buffer->second.find(current_command_id_);
+    return it_command == it_buffer->second.end() ? 0 : it_command->second;
+  }
+
+  Buffer ResolveTargetBuffer(const Buffer &buffer, bool is_write) const {
+    if (!IsBankedBuffer(buffer) ||
+        (current_version_ + CurrentPhase(buffer, is_write)) % 2 == 0) {
       return buffer;
     }
     return bank_peer_buffers_[buffer];
@@ -645,6 +700,11 @@ private:
   std::unordered_set<const BufferNode *> version_axis_buffers_;
   For pipeline_loop_;
   int current_version_ = 0;
+  int current_command_id_ = -1;
+  std::unordered_map<const BufferNode *, std::unordered_map<int, int>>
+      writer_phases_;
+  std::unordered_map<const BufferNode *, std::unordered_map<int, int>>
+      reader_phases_;
   PrimExpr replaced_loop_var_;
 };
 
@@ -680,6 +740,8 @@ private:
     auto prologue_orders_anno = op->annotations.Get("prologue_orders");
     auto body_orders_anno = op->annotations.Get("body_orders");
     auto epilogue_orders_anno = op->annotations.Get("epilogue_orders");
+    auto writer_phases_anno = op->annotations.Get("runtime_bank_writer_phases");
+    auto reader_phases_anno = op->annotations.Get("runtime_bank_reader_phases");
 
     if (!iterations_anno || !used_buffers_anno || !versioned_buffers_anno ||
         !prologue_orders_anno || !body_orders_anno) {
@@ -797,12 +859,23 @@ private:
       version_axis_buffers =
           Downcast<Array<Buffer>>(version_axis_buffers_anno.value());
     }
+    Map<Buffer, Map<Integer, PrimExpr>> writer_phases;
+    if (writer_phases_anno) {
+      writer_phases = Downcast<Map<Buffer, Map<Integer, PrimExpr>>>(
+          writer_phases_anno.value());
+    }
+    Map<Buffer, Map<Integer, PrimExpr>> reader_phases;
+    if (reader_phases_anno) {
+      reader_phases = Downcast<Map<Buffer, Map<Integer, PrimExpr>>>(
+          reader_phases_anno.value());
+    }
     for (auto it : used_buffers) {
       pipeline_allocs.push_back(it);
     }
 
     auto rewriter = PipelineBodyRewriter(versioned_buffers, bank_peer_buffers,
-                                         version_axis_buffers, for_node);
+                                         version_axis_buffers, writer_phases,
+                                         reader_phases, for_node);
     auto version_slot = [iterations](int iter) {
       ICHECK_GT(iterations, 0);
       int slot = iter % iterations;
@@ -814,6 +887,7 @@ private:
       int iter = name2iter(order_str);
       int id = name2id(order_str);
       Stmt stmt = pipeline_body_seq->seq[id];
+      rewriter.set_current_command(id);
       rewriter.set_current_version(version_slot(iter));
       PrimExpr replaced_loop_var = 0 + iter + for_node->min;
       rewriter.set_loop_var_replacement(replaced_loop_var);
@@ -829,6 +903,7 @@ private:
           iterations * for_node->loop_var + iter + for_node->min;
       int id = name2id(order_str);
       Stmt stmt = pipeline_body_seq->seq[id];
+      rewriter.set_current_command(id);
       rewriter.set_current_version(version_slot(iter));
       rewriter.set_loop_var_replacement(replaced_loop_var);
       stmt = rewriter(stmt);
@@ -856,6 +931,7 @@ private:
         int iter = name2iter(order_str);
         int id = name2id(order_str);
         Stmt stmt = pipeline_body_seq->seq[id];
+        rewriter.set_current_command(id);
         rewriter.set_current_version(version_slot(iter));
         PrimExpr replaced_loop_var = extent * iterations + iter + for_node->min;
         rewriter.set_loop_var_replacement(replaced_loop_var);
@@ -870,6 +946,7 @@ private:
         Array<Stmt> slot_body;
         for (size_t id = 0; id < pipeline_body_seq->size(); ++id) {
           Stmt stmt = pipeline_body_seq->seq[id];
+          rewriter.set_current_command(static_cast<int>(id));
           rewriter.set_current_version(slot);
           PrimExpr replaced_loop_var =
               extent * iterations + epilogue_loop_var + for_node->min;

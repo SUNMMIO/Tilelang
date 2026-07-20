@@ -152,26 +152,26 @@ def test_isolate_wsram_version_axis_address_materialization():
 
 
 @pytest.mark.parametrize(
-    "pipeline_mode",
+    "pipeline_mode,num_stages,faster",
     (
-        "ilp",
-        pytest.param(
-            "greedy",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="greedy version-axis addresses fail SUVM-to-LLVM materialization",
-            ),
-        ),
+        ("ilp", 4, None),
+        ("greedy", 3, -1),
+        ("greedy", 4, 2),
     ),
+    ids=("ilp-stage4", "greedy-stage3-all", "greedy-stage4-faster2"),
 )
-def test_pipeline_ping_pong_codegen_phase_diagnostics(tmp_path, pipeline_mode):
-    output_dir = _DEBUG_ROOT / pipeline_mode
+def test_pipeline_ping_pong_codegen_phase_diagnostics(tmp_path, pipeline_mode, num_stages, faster):
+    case_name = f"{pipeline_mode}_stage{num_stages}" + ("" if faster is None else f"_faster{faster}")
+    output_dir = _DEBUG_ROOT / case_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    mlir_filename = f"pipeline_ping_pong_{pipeline_mode}_suvm.mlir"
+    mlir_filename = f"pipeline_ping_pong_{case_name}_suvm.mlir"
+    pass_configs = {PassConfigKey.TL_SUNMMIO_PIPELINE_MODE: pipeline_mode}
+    if faster is not None:
+        pass_configs[PassConfigKey.TL_SUNMMIO_FASTER] = faster
     src = validate_sunmmio_codegen_with_npuir_opt(
-        pipelined_gemm_kernel(),
+        pipelined_gemm_kernel(num_stages=num_stages),
         tmp_path,
-        pass_configs={PassConfigKey.TL_SUNMMIO_PIPELINE_MODE: pipeline_mode},
+        pass_configs=pass_configs,
         mlir_filename=mlir_filename,
         expected_tokens=(
             "suvm.alloc",
@@ -182,7 +182,7 @@ def test_pipeline_ping_pong_codegen_phase_diagnostics(tmp_path, pipeline_mode):
         ),
         log_ir=True,
         log_dir=_DEBUG_ROOT,
-        log_subdir=pipeline_mode,
+        log_subdir=case_name,
     )
     assert "#suvm.ping_pong<ping>" in src
     assert "#suvm.ping_pong<pong>" in src
@@ -193,7 +193,7 @@ def test_pipeline_ping_pong_codegen_phase_diagnostics(tmp_path, pipeline_mode):
         output_dir,
         "03_npuir_opt_validate",
     )
-    llvm_path = output_dir / f"pipeline_ping_pong_{pipeline_mode}.ll"
+    llvm_path = output_dir / f"pipeline_ping_pong_{case_name}.ll"
     compile_result = _run_logged(
         [
             str(find_npuir_tool("npuir-compile")),
@@ -208,6 +208,8 @@ def test_pipeline_ping_pong_codegen_phase_diagnostics(tmp_path, pipeline_mode):
     )
     summary = {
         "pipeline_mode": pipeline_mode,
+        "num_stages": num_stages,
+        "faster": faster,
         "npuir_opt_validate_returncode": opt_result.returncode,
         "npuir_compile_llvm_returncode": compile_result.returncode,
         "llvm_ir": str(llvm_path) if llvm_path.exists() else None,
