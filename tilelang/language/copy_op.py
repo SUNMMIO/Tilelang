@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Any
 import warnings
+import tilelang.utils.target as _target_utils
 from tilelang._typing import BufferLikeType
 from tilelang.utils.language import (
     to_buffer_region,
@@ -289,6 +290,43 @@ def _encode_normalized_region(region: _NormalizedCopyRegion, access_type: str) -
     return to_buffer_region(region.spec.original, access_type=access_type, extents=region.extents)
 
 
+def _prepare_copy_regions_strict(
+    src: BufferLikeType,
+    dst: BufferLikeType,
+) -> tuple[tir.PrimExpr, tir.PrimExpr]:
+    src_spec = _extract_copy_region_spec(src)
+    dst_spec = _extract_copy_region_spec(dst)
+    src_region, dst_region = _normalize_copy_regions(src_spec, dst_spec)
+    src_region, dst_region = _validate_and_adjust_copy_regions(
+        src_region,
+        dst_region,
+        require_exact_match=src_spec.kind == "buffer" and dst_spec.kind == "buffer",
+    )
+    return (
+        _encode_normalized_region(src_region, access_type="r"),
+        _encode_normalized_region(dst_region, access_type="w"),
+    )
+
+
+def _prepare_copy_regions_legacy(
+    src: BufferLikeType,
+    dst: BufferLikeType,
+    src_extent: list[tir.PrimExpr] | None,
+    dst_extent: list[tir.PrimExpr] | None,
+) -> tuple[tir.PrimExpr, tir.PrimExpr]:
+    if isinstance(src, tir.Buffer) and isinstance(dst, tir.Buffer):
+        ir.assert_structural_equal(src.shape, dst.shape)
+
+    assert src_extent or dst_extent, "Can't deduce copy extents from args"
+    src_extents = list(src_extent) if src_extent else [1] * len(dst_extent)
+    dst_extents = list(dst_extent) if dst_extent else [1] * len(src_extent)
+    src_extents, dst_extents = legalize_pairwise_extents(src_extents, dst_extents)
+    return (
+        to_buffer_region(src, access_type="r", extents=src_extents),
+        to_buffer_region(dst, access_type="w", extents=dst_extents),
+    )
+
+
 def copy(
     src: BufferLikeType,
     dst: BufferLikeType,
@@ -343,29 +381,10 @@ def copy(
         return tir.BufferStore(dst.buffer, src, dst.indices)
 
     target = Target.current(allow_none=True)
-    if target and target_is_sunmmio(target):
-        # get original info. e.g. T.copy(A, C) -> src_spec = {kind: "buffer", buffer = A, mins = [0,0,0], extents = A.shape, explicit_extents = False}
-        src_spec = _extract_copy_region_spec(src)
-        dst_spec = _extract_copy_region_spec(dst)
-        # transfer spec into normalized region: buffer + mins + extents
-        src_region, dst_region = _normalize_copy_regions(src_spec, dst_spec)
-        # check rank and extents
-        src_region, dst_region = _validate_and_adjust_copy_regions(
-            src_region,
-            dst_region,
-            require_exact_match=src_spec.kind == "buffer" and dst_spec.kind == "buffer",
-        )
-        src = _encode_normalized_region(src_region, access_type="r")
-        dst = _encode_normalized_region(dst_region, access_type="w")
+    if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION and target and target_is_sunmmio(target):
+        src, dst = _prepare_copy_regions_strict(src, dst)
     else:
-        if isinstance(src, tir.Buffer) and isinstance(dst, tir.Buffer):
-            ir.assert_structural_equal(src.shape, dst.shape)
-        assert src_extent or dst_extent, "Can't deduce copy extents from args"
-        src_extent = list(src_extent) if src_extent else [1] * len(dst_extent)
-        dst_extent = list(dst_extent) if dst_extent else [1] * len(src_extent)
-        src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
-        src = to_buffer_region(src, access_type="r", extents=src_extent)
-        dst = to_buffer_region(dst, access_type="w", extents=dst_extent)
+        src, dst = _prepare_copy_regions_legacy(src, dst, src_extent, dst_extent)
 
     # Build annotations dict
     ann = annotations.copy() if annotations else {}

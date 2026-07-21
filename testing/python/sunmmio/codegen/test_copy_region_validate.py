@@ -3,6 +3,7 @@ import os
 import pytest
 
 import tilelang
+import tilelang.utils.target as _target_utils
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm
@@ -226,6 +227,14 @@ def test_zz_non_major_sub_block_copy_is_rejected():
         match="must not split the non-major dimension",
     ):
         lower_sunmmio_kernel_to_device_tir(zz_non_major_sub_block_copy_kernel())
+
+
+def test_zz_non_major_sub_block_copy_bypasses_validator_when_disabled(monkeypatch):
+    monkeypatch.setattr(_target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", False)
+
+    lowered = lower_sunmmio_kernel_to_device_tir(zz_non_major_sub_block_copy_kernel())
+
+    assert lowered.get_global_vars()
 
 
 def test_zz_both_dims_sub_block_copy_is_rejected():

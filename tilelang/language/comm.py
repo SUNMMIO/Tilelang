@@ -12,10 +12,11 @@ from typing import Any, Literal
 
 import tvm_ffi
 from tvm import arith, ir, tir
+import tilelang.utils.target as _target_utils
 import tilelang.language as T
 from tilelang._typing import BufferLikeType
 from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
-from tilelang.utils.language import prim_expr_equal
+from tilelang.utils.language import prim_expr_equal, to_buffer_region
 
 from tilelang.carver.arch.driver import get_sunmmio_device_mesh_config
 
@@ -58,6 +59,13 @@ class _NormalizedCommRegion:
     spec: _CommRegionSpec
     mins: list[tir.PrimExpr]
     extents: list[tir.PrimExpr]
+
+
+@dataclass(frozen=True)
+class _PreparedCommRegion:
+    buffer: tir.Buffer
+    extents: list[tir.PrimExpr]
+    region: tir.PrimExpr | tir.BufferRegion
 
 
 def get_target_mesh_shape() -> dict[str, int]:
@@ -134,6 +142,46 @@ def _extent_equal(lhs, rhs) -> bool:
 
 def _extent_is_dynamic(extent) -> bool:
     return isinstance(extent, tir.PrimExpr) and _const_int(extent) is None
+
+
+def _legacy_extent_equal(lhs, rhs) -> bool:
+    lhs_int = _const_int(lhs)
+    rhs_int = _const_int(rhs)
+    if lhs_int is not None and rhs_int is not None:
+        return lhs_int == rhs_int
+    try:
+        return bool(ir.structural_equal(lhs, rhs))
+    except (TypeError, ValueError):
+        return False
+
+
+def _legacy_extent_is_one(extent) -> bool:
+    extent_int = _const_int(extent)
+    if extent_int is not None:
+        return extent_int == 1
+    return _legacy_extent_equal(extent, tir.IntImm("int32", 1))
+
+
+def _legacy_shape_equal(lhs, rhs) -> bool:
+    return len(lhs) == len(rhs) and all(_legacy_extent_equal(lhs_extent, rhs_extent) for lhs_extent, rhs_extent in zip(lhs, rhs))
+
+
+def _legacy_shape_compatible(lhs, rhs) -> bool:
+    return len(lhs) == len(rhs) and all(
+        _legacy_extent_equal(lhs_extent, rhs_extent) or _legacy_extent_is_one(lhs_extent) or _legacy_extent_is_one(rhs_extent)
+        for lhs_extent, rhs_extent in zip(lhs, rhs)
+    )
+
+
+def _prepare_comm_region_legacy(obj: BufferLikeType, access_type: str) -> _PreparedCommRegion:
+    region = to_buffer_region(obj, access_type=access_type)
+    if not isinstance(region, tir.BufferRegion):
+        raise TypeError(f"Expected a buffer-like object, got {type(obj)}.")
+    return _PreparedCommRegion(
+        buffer=region.buffer,
+        extents=[rng.extent for rng in region.region],
+        region=region,
+    )
 
 
 def _resolve_let_value(obj: Any) -> Any:
@@ -701,6 +749,121 @@ def _check_size(size: int, extents, op_name: str):
         assert size <= elements, f"size {size} exceeds {op_name} buffer size {elements}."
 
 
+def _prepare_normalized_comm_region(
+    region: _NormalizedCommRegion,
+    access_type: str,
+) -> _PreparedCommRegion:
+    return _PreparedCommRegion(
+        buffer=region.spec.buffer,
+        extents=list(region.extents),
+        region=_encode_normalized_region(region, access_type),
+    )
+
+
+def _prepare_one_to_one_operands(
+    src: BufferLikeType,
+    dst: BufferLikeType,
+    op_name: str,
+) -> tuple[_PreparedCommRegion, _PreparedCommRegion]:
+    if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION:
+        src_region, dst_region = _normalize_one_to_one_regions(src, dst, op_name)
+        return (
+            _prepare_normalized_comm_region(src_region, "r"),
+            _prepare_normalized_comm_region(dst_region, "w"),
+        )
+
+    src_region = _prepare_comm_region_legacy(src, "r")
+    dst_region = _prepare_comm_region_legacy(dst, "w")
+    if not _legacy_shape_compatible(src_region.extents, dst_region.extents):
+        operation = op_name.rsplit(".", 1)[-1]
+        raise ValueError(f"Source and destination buffer must have the same number of dimensions for {operation}.")
+    return src_region, dst_region
+
+
+def _prepare_allgather_operands(
+    send_buffer: BufferLikeType,
+    recv_buffer: BufferLikeType,
+    recv_num: int,
+    axis: int | None,
+    op_name: str,
+) -> tuple[_PreparedCommRegion, _PreparedCommRegion, int]:
+    if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION:
+        send_spec = _extract_comm_region_spec(send_buffer, op_name)
+        axis_arg = _normalize_allgather_axis(axis, len(send_spec.mins))
+        send_region, recv_region = _normalize_allgather_regions(
+            send_buffer,
+            recv_buffer,
+            recv_num,
+            axis_arg,
+            op_name,
+        )
+        return (
+            _prepare_normalized_comm_region(send_region, "r"),
+            _prepare_normalized_comm_region(recv_region, "w"),
+            axis_arg,
+        )
+
+    send_region = _prepare_comm_region_legacy(send_buffer, "r")
+    recv_region = _prepare_comm_region_legacy(recv_buffer, "w")
+    axis_arg = _normalize_allgather_axis(axis, len(send_region.extents))
+    if axis_arg < 0:
+        expected_recv_shape = [recv_num, *send_region.extents]
+    else:
+        expected_recv_shape = list(send_region.extents)
+        expected_recv_shape[axis_arg] = recv_num * send_region.extents[axis_arg]
+    assert _legacy_shape_equal(recv_region.extents, expected_recv_shape), (
+        f"Receive buffer shape must be {expected_recv_shape} to hold gathered data from {recv_num} cores, but got {recv_region.extents}."
+    )
+    return send_region, recv_region, axis_arg
+
+
+def _prepare_allreduce_operands(
+    buffer: BufferLikeType,
+    out: BufferLikeType,
+    dim: int,
+    op_name: str,
+) -> tuple[_PreparedCommRegion, _PreparedCommRegion, int]:
+    if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION:
+        buffer_spec = _extract_comm_region_spec(buffer, op_name)
+        buffer_rank = len(buffer_spec.mins)
+        assert isinstance(dim, int) and -1 <= dim < buffer_rank, f"dim {dim} out of bounds for buffer with {buffer_rank} dimensions."
+        normalized_dim = buffer_rank - 1 if dim == -1 else dim
+        buffer_region, out_region = _normalize_allreduce_regions(
+            buffer,
+            out,
+            normalized_dim,
+            op_name,
+        )
+        return (
+            _prepare_normalized_comm_region(buffer_region, "r"),
+            _prepare_normalized_comm_region(out_region, "w"),
+            normalized_dim,
+        )
+
+    buffer_region = _prepare_comm_region_legacy(buffer, "r")
+    out_region = _prepare_comm_region_legacy(out, "w")
+    buffer_rank = len(buffer_region.extents)
+    assert isinstance(dim, int) and -1 <= dim < buffer_rank, f"dim {dim} out of bounds for buffer with {buffer_rank} dimensions."
+    normalized_dim = buffer_rank - 1 if dim == -1 else dim
+    expected_shapes = [
+        buffer_region.extents[:normalized_dim] + buffer_region.extents[normalized_dim + 1 :],
+        buffer_region.extents[:normalized_dim] + [1] + buffer_region.extents[normalized_dim + 1 :],
+    ]
+    if not any(_legacy_shape_equal(out_region.extents, shape) for shape in expected_shapes):
+        expected_shapes_str = " or ".join(map(str, expected_shapes))
+        raise ValueError(
+            f"Invalid reduce output shape, buffer shape is {buffer_region.extents}, dim is {normalized_dim}, "
+            f"output shape is {out_region.extents}, expected shapes are {expected_shapes_str}"
+        )
+    return buffer_region, out_region, normalized_dim
+
+
+def _prepare_allreduce_temporary(buffer: tir.Buffer, access_type: str) -> tir.PrimExpr | tir.BufferRegion:
+    if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION:
+        return _encode_full_buffer_region(buffer, access_type, "T.comm.all_reduce")
+    return _prepare_comm_region_legacy(buffer, access_type).region
+
+
 def broadcast(
     src: BufferLikeType,
     dst: BufferLikeType,
@@ -734,22 +897,20 @@ def broadcast(
     >>> broadcast(A, B, (1, 2), direction="horizontal")
     >>> broadcast(A, B, cid, direction="horizontal")
     """
-    src_region, dst_region = _normalize_one_to_one_regions(src, dst, "T.comm.broadcast")
-    src_dtype = src_region.spec.buffer.dtype
-    dst_dtype = dst_region.spec.buffer.dtype
+    src_region, dst_region = _prepare_one_to_one_operands(src, dst, "T.comm.broadcast")
+    src_dtype = src_region.buffer.dtype
+    dst_dtype = dst_region.buffer.dtype
     assert src_dtype == dst_dtype, f"Source and destination buffer dtypes must match for broadcast. Got {src_dtype} vs {dst_dtype}."
 
     _check_size(size, src_region.extents, "source")
 
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
 
-    src_region_expr = _encode_normalized_region(src_region, access_type="r")
-    dst_region_expr = _encode_normalized_region(dst_region, access_type="w")
     src_core_id = core_to_id(src_core, "src_core")
 
     args = (
-        src_region_expr,
-        dst_region_expr,
+        src_region.region,
+        dst_region.region,
         size,
         src_core_id,
         DIRECTION_MAP[direction.lower()],
@@ -790,18 +951,16 @@ def put(
     >>> put(A, B, (1, 2), (2, 3))
     >>> put(A, B, cid, (cid + 1) % 16)
     """
-    src_region, dst_region = _normalize_one_to_one_regions(src, dst, "T.comm.put")
-    src_dtype = src_region.spec.buffer.dtype
-    dst_dtype = dst_region.spec.buffer.dtype
+    src_region, dst_region = _prepare_one_to_one_operands(src, dst, "T.comm.put")
+    src_dtype = src_region.buffer.dtype
+    dst_dtype = dst_region.buffer.dtype
     assert src_dtype == dst_dtype, f"Source and destination buffer dtypes must match for put. Got {src_dtype} vs {dst_dtype}."
 
     _check_size(size, src_region.extents, "source")
 
-    src_region_expr = _encode_normalized_region(src_region, access_type="r")
-    dst_region_expr = _encode_normalized_region(dst_region, access_type="w")
     src_core_id = core_to_id(src_core, "src_core")
     dst_core_id = core_to_id(dst_core, "dst_core")
-    args = (src_region_expr, dst_region_expr, size, src_core_id, dst_core_id)
+    args = (src_region.region, dst_region.region, size, src_core_id, dst_core_id)
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.comm_put"), *args)
 
 
@@ -854,17 +1013,15 @@ def all_gather(
 
     direction = direction.lower()
     recv_num = _allgather_recv_num(direction)
-    send_spec = _extract_comm_region_spec(send_buffer, "T.comm.all_gather")
-    axis_arg = _normalize_allgather_axis(axis, len(send_spec.mins))
-    send_region, recv_region = _normalize_allgather_regions(
+    send_region, recv_region, axis_arg = _prepare_allgather_operands(
         send_buffer,
         recv_buffer,
         recv_num,
-        axis_arg,
+        axis,
         "T.comm.all_gather",
     )
-    send_dtype = send_region.spec.buffer.dtype
-    recv_dtype = recv_region.spec.buffer.dtype
+    send_dtype = send_region.buffer.dtype
+    recv_dtype = recv_region.buffer.dtype
     assert send_dtype == recv_dtype, f"Source and destination buffer dtypes must match for all_gather. Got {send_dtype} vs {recv_dtype}."
 
     # Sentinel -1 in the wire format means "no axis specified" (legacy
@@ -874,13 +1031,11 @@ def all_gather(
 
     assert isinstance(src_offset_byte, int) and src_offset_byte >= 0, "src_offset_byte must be a non-negative integer."
 
-    send_buffer_region = _encode_normalized_region(send_region, access_type="r")
-    recv_buffer_region = _encode_normalized_region(recv_region, access_type="w")
     cid = T.get_block_binding(0)
 
     args = (
-        send_buffer_region,
-        recv_buffer_region,
+        send_region.region,
+        recv_region.region,
         DIRECTION_MAP[direction],
         size,
         axis_arg,
@@ -923,19 +1078,13 @@ def all_reduce(
     --------
     >>> all_reduce(A_local, E_local, "sum", "all", dim=-1, clear=False)
     """
-    buffer_spec = _extract_comm_region_spec(buffer, "T.comm.all_reduce")
-    buffer_rank = len(buffer_spec.mins)
-    assert isinstance(dim, int) and dim >= -1 and dim < buffer_rank, f"dim {dim} out of bounds for buffer with {buffer_rank} dimensions."
-    if dim == -1:
-        dim = buffer_rank - 1
-
-    buffer_region, out_region = _normalize_allreduce_regions(
+    buffer_region, out_region, dim = _prepare_allreduce_operands(
         buffer,
         out,
         dim,
         "T.comm.all_reduce",
     )
-    out_buffer = out_region.spec.buffer
+    out_buffer = out_region.buffer
     out_dtype = out_buffer.dtype
     out_shape = out_region.extents
 
@@ -960,15 +1109,13 @@ def all_reduce(
     row_allgather = alloc_tmp([mesh_shape["ncol"]] + list(out_shape))
     col_allgather = alloc_tmp([mesh_shape["nrow"]] + list(out_shape))
 
-    buffer_region_expr = _encode_normalized_region(buffer_region, access_type="r")
-    out_region_expr = _encode_normalized_region(out_region, access_type="w")
-    row_allgather_region = _encode_full_buffer_region(row_allgather, "rw", "T.comm.all_reduce")
-    col_allgather_region = _encode_full_buffer_region(col_allgather, "rw", "T.comm.all_reduce")
+    row_allgather_region = _prepare_allreduce_temporary(row_allgather, "rw")
+    col_allgather_region = _prepare_allreduce_temporary(col_allgather, "rw")
     cid = T.get_block_binding(0)
 
     args = (
-        buffer_region_expr,
-        out_region_expr,
+        buffer_region.region,
+        out_region.region,
         row_allgather_region,
         col_allgather_region,
         reduce_type,
@@ -981,10 +1128,10 @@ def all_reduce(
     # If not clearing, allocate an output copy buffer to hold intermediate results
     if not clear:
         out_copy = alloc_tmp(list(out_shape))
-        out_copy_region = _encode_full_buffer_region(out_copy, "rw", "T.comm.all_reduce")
+        out_copy_region = _prepare_allreduce_temporary(out_copy, "rw")
         args = (
-            buffer_region_expr,
-            out_region_expr,
+            buffer_region.region,
+            out_region.region,
             row_allgather_region,
             col_allgather_region,
             reduce_type,

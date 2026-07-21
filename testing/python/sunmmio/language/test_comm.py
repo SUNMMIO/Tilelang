@@ -1,6 +1,7 @@
 import pytest
 
 import tilelang
+import tilelang.utils.target as _target_utils
 import tilelang.language as T
 
 from tilelang import tvm as tvm
@@ -182,6 +183,55 @@ def test_comm_one_to_one_regions_follow_copy_normalization_rules():
     assert "T.comm_broadcast(src[0, 0:64, 0:64], broadcast_dst[0:64, 0:64], -1, 0, 0)" in script
     assert "T.comm_put(src[0, 16:48, 16:48], put_dst[0:32, 0:32], -1, 0, 1)" in script
     assert "T.comm_broadcast(src[0, 0:32, 0:32], shrink_dst[0:32, 0:32], -1, 0, 0)" in script
+
+
+def test_comm_legacy_path_preserves_original_regions(monkeypatch):
+    monkeypatch.setattr(_target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", False)
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            src = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+            broadcast_dst = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+            put_dst = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+            gather_send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+            gather_recv = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+            reduce_src = T.alloc_shared((32, 64), "float32", scope="shared.rsram")
+            reduce_out = T.alloc_shared((32,), "float32", scope="shared.rsram")
+
+            T.comm.broadcast(src[0:1, 0:32, 0:32], broadcast_dst[0:4, 0:32, 0:32], (0, 0), direction="h")
+            T.comm.put(src[0:1, 0:32, 0:32], put_dst[0:4, 0:32, 0:32], (0, 0), (0, 1))
+            T.comm.all_gather(gather_send, gather_recv, direction="h")
+            T.comm.all_reduce(reduce_src, reduce_out, "sum", "h", dim=1)
+
+    script = main.script()
+    assert "T.comm_broadcast(src[0, 0:32, 0:32], broadcast_dst[0:4, 0:32, 0:32]" in script
+    assert "T.comm_put(src[0, 0:32, 0:32], put_dst[0:4, 0:32, 0:32]" in script
+    assert "T.comm_allgather(gather_send[0:32, 0:32], gather_recv[0:4, 0:32, 0:32]" in script
+    assert "T.comm_allreduce(reduce_src[0:32, 0:64], reduce_out[0:32]" in script
+
+
+def test_comm_legacy_path_keeps_original_dynamic_extent_behavior(monkeypatch):
+    monkeypatch.setattr(_target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", False)
+
+    dynamic_extent = tvm.tir.Var("dynamic_extent", "int32")
+    src = tvm.tir.decl_buffer((dynamic_extent, 32), "float32", name="src", scope="shared.rsram")
+    same_shape_dst = tvm.tir.decl_buffer((dynamic_extent, 32), "float32", name="same_shape_dst", scope="shared.rsram")
+    static_dst = tvm.tir.decl_buffer((64, 32), "float32", name="static_dst", scope="shared.rsram")
+
+    with pytest.raises(ValueError, match="Cannot convert to BufferLoad"):
+        T.comm.broadcast(src, same_shape_dst, 0, direction="h")
+
+    with pytest.raises(ValueError, match="same number of dimensions for broadcast"):
+        T.comm.broadcast(src, static_dst, 0, direction="h")
+
+    gather_recv = tvm.tir.decl_buffer((4, 64, 32), "float32", name="gather_recv", scope="shared.rsram")
+    with pytest.raises(AssertionError, match="Receive buffer shape"):
+        T.comm.all_gather(src, gather_recv, direction="h")
+
+    reduce_out = tvm.tir.decl_buffer((64,), "float32", name="reduce_out", scope="shared.rsram")
+    with pytest.raises(ValueError, match="Invalid reduce output shape"):
+        T.comm.all_reduce(src, reduce_out, "sum", "h", dim=1)
 
 
 def test_comm_one_to_one_full_buffer_extent_mismatch_is_rejected():

@@ -4,6 +4,7 @@ from functools import wraps
 
 import pytest
 
+import tilelang.utils.target as _target_utils
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm
@@ -297,6 +298,15 @@ def test_sunmmio_copy_frontend_shrinks_dst_when_src_is_smaller():
 
     _assert_region_extents(script, "A_128x128x128_global", 1, [16, 16, 16])
     _assert_region_extents(script, None, 2, [16, 16, 16])
+
+
+def test_sunmmio_copy_legacy_path_skips_strict_region_validation(monkeypatch):
+    monkeypatch.setattr(_target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", False)
+
+    script = _build_script("buffer_to_region_smaller_dst")
+
+    _assert_region_extents(script, "A_128x128x128_global", 1, [128, 128, 128])
+    _assert_region_extents(script, None, 2, [128, 128, 32])
 
 
 def test_sunmmio_copy_frontend_clips_src_before_shrinking_dst():
