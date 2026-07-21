@@ -27,10 +27,14 @@ __all__ = [
 ]
 
 # FFI functions for layout operations
-_make_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_row_major")
-_make_mx_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_mx_row_major")
+_make_aligned_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_aligned_row_major")
+_make_zz = tvm_ffi.get_global_func("tl.sunmmio.make_zz")
+_make_mxzz = tvm_ffi.get_global_func("tl.sunmmio.make_mxzz")
 _derive_layout_like = tvm_ffi.get_global_func("tl.DeriveLayoutLike")
 _derive_mx_layout_like = tvm_ffi.get_global_func("tl.sunmmio.derive_mx_layout_like")
+
+_DEFAULT_ZZ_BLOCK_SHAPE = (32, 32)
+_DEFAULT_1D_ALIGNMENT_BYTES = 1024
 
 
 class MeshReplicationType(Enum):
@@ -252,6 +256,24 @@ def _is_mx_dtype(dtype):
     return str(_dtypes.normalize_dtype(dtype)) in {"custom[mxfp8]8", "custom[mxfp4]4"}
 
 
+def _make_default_mesh_tensor_layout(shape, dtype):
+    rank = len(shape)
+    if rank == 0:
+        raise ValueError("MeshTensor requires rank >= 1")
+
+    if rank == 1:
+        if _is_mx_dtype(dtype):
+            raise ValueError("Rank-1 MeshTensor does not support SUVM MX dtypes")
+        return _make_aligned_row_major(shape, dtype, _DEFAULT_1D_ALIGNMENT_BYTES)
+
+    axes = [rank - 2, rank - 1]
+    if _is_mx_dtype(dtype):
+        return _make_mxzz(shape, axes, dtype)
+
+    block_shape = [_to_primexpr(v) for v in _DEFAULT_ZZ_BLOCK_SHAPE]
+    return _make_zz(shape, axes, block_shape)
+
+
 class MeshTensorProxy:
     """Proxy for creating distributed mesh tensors.
 
@@ -339,28 +361,23 @@ class MeshTensorProxy:
             cross_mesh_dim=sharding_policy.cross_mesh_dim if sharding_policy.cross_mesh_dim is not None else -1,
         )
 
-        # Build global layout (CuteLayout object).
+        # Build global and per-shard layouts (CuteLayout objects).
         if layout is not None:
             global_layout = layout
-        else:
-            # Default: row-major CuteLayout
             if _is_mx_dtype(dtype):
-                global_layout = _make_mx_row_major(shape_exprs, dtype)
+                sharded_layout = _derive_mx_layout_like(global_layout, sharded_shape_exprs, dtype)
+                if not sharded_layout:
+                    raise ValueError(
+                        "MeshTensor with SUVM MX dtype only supports MX row-major, "
+                        "MXZZ, or MXZNN external layouts. Omit layout or use "
+                        "make_mx_row_major_layout(...), make_mxzz_layout(...), "
+                        "or make_mxznn_layout(...)."
+                    )
             else:
-                global_layout = _make_row_major(shape_exprs)
-
-        # Derive sharded layout via DeriveLayoutLike.
-        if _is_mx_dtype(dtype):
-            sharded_layout = _derive_mx_layout_like(global_layout, sharded_shape_exprs, dtype)
-            if not sharded_layout:
-                raise ValueError(
-                    "MeshTensor with SUVM MX dtype only supports MX row-major, "
-                    "MXZZ, or MXZNN external layouts. Omit layout or use "
-                    "make_mx_row_major_layout(...), make_mxzz_layout(...), "
-                    "or make_mxznn_layout(...)."
-                )
+                sharded_layout = _derive_layout_like(global_layout, sharded_shape_exprs, None)
         else:
-            sharded_layout = _derive_layout_like(global_layout, sharded_shape_exprs, None)
+            global_layout = _make_default_mesh_tensor_layout(shape_exprs, dtype)
+            sharded_layout = _make_default_mesh_tensor_layout(sharded_shape_exprs, dtype)
 
         meta_data["global_layout"] = global_layout
         meta_data["sharded_layout"] = sharded_layout
