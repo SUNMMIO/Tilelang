@@ -1908,7 +1908,7 @@ CodeGenTileLangSunMMIO::EmitScalarTilePick(const tir::BufferLoadNode *op) {
                         "i16/ui16/i32/ui32/bf16/f32. " +
                             describe());
   }
-  if (indices.size() < 1) {
+  if (indices.empty()) {
     UnsupportedExpr(op, "Sunmmio RSRAM scalar BufferLoad tile.pick currently "
                         "requires a rank >= 1 RSRAM buffer. " +
                             describe());
@@ -1979,7 +1979,7 @@ void CodeGenTileLangSunMMIO::EmitScalarTileSet(const tir::BufferStoreNode *op) {
                         "i16/ui16/i32/ui32/bf16/f32. " +
                             describe());
   }
-  if (indices.size() < 1) {
+  if (indices.empty()) {
     UnsupportedStmt(op, "Sunmmio RSRAM scalar BufferStore tile.set requires a "
                         "rank >= 1 RSRAM buffer. " +
                             describe());
