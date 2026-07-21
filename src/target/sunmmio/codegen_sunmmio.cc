@@ -11,6 +11,7 @@
 #include "../sunmmio_utils.h"
 
 #include <tvm/arith/analyzer.h>
+#include <tvm/ir/source_map.h>
 #include <tvm/ir/type.h>
 #include <tvm/node/script_printer.h>
 #include <tvm/node/structural_equal.h>
@@ -38,6 +39,52 @@ namespace codegen {
 using namespace tir;
 
 namespace {
+
+std::string FormatSpanForDiagnostic(const Span &span) {
+  if (!span.defined()) {
+    return "";
+  }
+  if (const auto *seq = span.as<SequentialSpanNode>()) {
+    if (!seq->spans.empty()) {
+      return FormatSpanForDiagnostic(seq->spans[0]);
+    }
+    return "";
+  }
+  const auto *node = span.as<SpanNode>();
+  if (!node || !node->source_name.defined()) {
+    return "";
+  }
+
+  std::ostringstream os;
+  os << static_cast<std::string>(node->source_name->name) << ":"
+     << node->line;
+  if (node->column > 0) {
+    os << ":" << node->column;
+  }
+  return os.str();
+}
+
+std::string FormatObjectSpanForDiagnostic(const Object *op) {
+  if (op == nullptr) {
+    return "";
+  }
+  if (op->IsInstance<tir::StmtNode>()) {
+    const auto *stmt = static_cast<const tir::StmtNode *>(op);
+    return FormatSpanForDiagnostic(stmt->span);
+  }
+  if (op->IsInstance<BaseExprNode>()) {
+    const auto *expr = static_cast<const BaseExprNode *>(op);
+    return FormatSpanForDiagnostic(expr->span);
+  }
+  return "";
+}
+
+void AppendObjectSpanForDiagnostic(std::ostringstream *os, const Object *op) {
+  const std::string loc = FormatObjectSpanForDiagnostic(op);
+  if (!loc.empty()) {
+    *os << "\n  at TileLang DSL: " << loc;
+  }
+}
 
 class DeclBufferCollector final : public tir::StmtVisitor {
 public:
@@ -880,9 +927,12 @@ CodeGenTileLangSunMMIO::LookupVar(const tir::VarNode *var) const {
   if (it != var_table_.end()) {
     return it->second;
   }
-  LOG(FATAL) << "CodeGenTileLangSunMMIO: unbound TIR var `" << var->name_hint
-             << "` reached SunMMIO codegen without a parameter, loop, let, "
-                "allocation, or thread binding";
+  std::ostringstream os;
+  os << "CodeGenTileLangSunMMIO: unbound TIR var `" << var->name_hint
+     << "` reached SunMMIO codegen without a parameter, loop, let, "
+        "allocation, or thread binding";
+  AppendObjectSpanForDiagnostic(&os, var);
+  LOG(FATAL) << os.str();
   TVM_FFI_UNREACHABLE();
 }
 
@@ -1507,6 +1557,10 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::LetStmtNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AttrStmtNode *op) {
+  if (op->attr_key == tl::attr::kDslSpan) {
+    VisitStmtTracked(op->body);
+    return;
+  }
   if (op->attr_key == tir::attr::thread_extent) {
     IterVar iv = Downcast<IterVar>(op->node);
     if (iv->thread_tag == "blockIdx.x") {
@@ -1550,8 +1604,11 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
       EmitAlloc(buffer_it->second, scope, op->annotations);
     }
   } else {
-    LOG(FATAL) << "SunMMIO SUVM allocate cannot find buffer for variable "
-               << op->buffer_var->name_hint;
+    std::ostringstream os;
+    os << "SunMMIO SUVM allocate cannot find buffer for variable "
+       << op->buffer_var->name_hint;
+    AppendObjectSpanForDiagnostic(&os, op);
+    LOG(FATAL) << os.str();
     TVM_FFI_UNREACHABLE();
   }
   VisitStmtTracked(op->body);
@@ -1678,9 +1735,12 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockNode *op) {
   EnterScope();
   for (const IterVar &iv : op->iter_vars) {
     if (!var_table_.count(iv->var.get())) {
-      LOG(FATAL) << "CodeGenTileLangSunMMIO: unbound block iter var `"
-                 << iv->var->name_hint
-                 << "` reached SunMMIO codegen without a BlockRealize binding";
+      std::ostringstream os;
+      os << "CodeGenTileLangSunMMIO: unbound block iter var `"
+         << iv->var->name_hint
+         << "` reached SunMMIO codegen without a BlockRealize binding";
+      AppendObjectSpanForDiagnostic(&os, op);
+      LOG(FATAL) << os.str();
       TVM_FFI_UNREACHABLE();
     }
   }
@@ -2543,23 +2603,37 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     attrs[SunMMIOCallAttrKey::kDirection] =
         std::string(direction == 0 ? "row" : "col");
   } else if (callee == "tl.mma_sunmmio") {
-    ICHECK_EQ(op->args.size(), 8) << "tl.mma_sunmmio expects A/B/C regions, "
-                                     "three flag operands, acc_offset_byte, "
-                                     "and sync_token_id";
+    auto fail_gemm = [&](const std::string &message) {
+      std::ostringstream os;
+      os << message;
+      AppendObjectSpanForDiagnostic(&os, op);
+      LOG(FATAL) << os.str();
+      TVM_FFI_UNREACHABLE();
+    };
+    if (op->args.size() != 8) {
+      fail_gemm("tl.mma_sunmmio expects A/B/C regions, three flag operands, "
+                "acc_offset_byte, and sync_token_id");
+    }
     auto parse_bool_arg = [&](const PrimExpr &arg,
                               const char *arg_name) -> bool {
       const auto *imm = arg.as<IntImmNode>();
-      ICHECK(imm) << arg_name << " must be a constant bool";
-      ICHECK(imm->dtype.is_bool()) << arg_name << " must have bool dtype";
+      if (imm == nullptr) {
+        fail_gemm(std::string(arg_name) + " must be a constant bool");
+      }
+      if (!imm->dtype.is_bool()) {
+        fail_gemm(std::string(arg_name) + " must have bool dtype");
+      }
       return imm->value != 0;
     };
 
     const auto *acc_offset_imm = op->args[6].as<IntImmNode>();
-    ICHECK(acc_offset_imm)
-        << "tl.mma_sunmmio acc_offset_byte must be a constant IntImm";
+    if (acc_offset_imm == nullptr) {
+      fail_gemm("tl.mma_sunmmio acc_offset_byte must be a constant IntImm");
+    }
     int64_t acc_offset_byte = static_cast<int64_t>(acc_offset_imm->value);
-    ICHECK_GE(acc_offset_byte, 0)
-        << "tl.mma_sunmmio acc_offset_byte must be non-negative";
+    if (acc_offset_byte < 0) {
+      fail_gemm("tl.mma_sunmmio acc_offset_byte must be non-negative");
+    }
     MarkVisitedNodeType(acc_offset_imm->GetTypeKey());
 
     operands.reserve(3);
@@ -2574,8 +2648,9 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     attrs[SunMMIOCallAttrKey::kClearAccum] =
         parse_bool_arg(op->args[5], "tl.mma_sunmmio clearAccum");
 
-    ICHECK(TryConsumeSyncTokenId(op->args[7], &attrs))
-        << "tl.mma_sunmmio expects last argument to be tl.sync_token_id";
+    if (!TryConsumeSyncTokenId(op->args[7], &attrs)) {
+      fail_gemm("tl.mma_sunmmio expects last argument to be tl.sync_token_id");
+    }
   } else {
     for (int i = 0, e = static_cast<int>(op->args.size()); i < e; ++i) {
       const PrimExpr &arg = op->args[i];
@@ -2625,6 +2700,7 @@ CodeGenTileLangSunMMIO::UnsupportedStmt(const Object *op,
   if (!detail.empty()) {
     os << " (" << detail << ")";
   }
+  AppendObjectSpanForDiagnostic(&os, op);
   LOG(FATAL) << os.str();
   TVM_FFI_UNREACHABLE();
 }
@@ -2639,6 +2715,7 @@ CodeGenTileLangSunMMIO::UnsupportedExpr(const Object *op,
   if (!detail.empty()) {
     os << " (" << detail << ")";
   }
+  AppendObjectSpanForDiagnostic(&os, op);
   LOG(FATAL) << os.str();
   TVM_FFI_UNREACHABLE();
 }

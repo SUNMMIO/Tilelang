@@ -130,7 +130,12 @@ class Ref:
         return self.bufload.buffer
 
     def store(self, value):
-        tir.buffer_store(self.bufload.buffer, value, self.bufload.indices)
+        builder = Builder.current()
+        if builder is None:
+            tir.buffer_store(self.bufload.buffer, value, self.bufload.indices)
+        else:
+            with builder.dsl_span_scope():
+                tir.buffer_store(self.bufload.buffer, value, self.bufload.indices)
 
     def load(self):
         return self.bufload
@@ -170,6 +175,8 @@ def is_var(v: Any) -> bool:
 # none: not inside eager jit, i.e. it is lazyjit
 EagerJITStage = Literal["phase1", "phase2", "none"]
 
+DSL_SPAN_ATTR = "tilelang.dsl_span"
+
 
 class Builder(BaseBuilder):
     def __init__(self):
@@ -184,9 +191,13 @@ class Builder(BaseBuilder):
         self.eager_jit_subs: dict[str, PrimExpr] = {}
         self.current_file = "<unknown>"
         self.current_line = 0
+        self.current_col = 0
+        self.current_end_line = 0
+        self.current_end_col = 0
         self.current_macro_name = "<unknown-macro>"
         # stack to record caller fileline, not callee fileline
         self.macro_fileline_stack: list[tuple[str, int, str]] = []
+        self._dsl_span_scope_depth = 0
         # Metadata collected during prim_func_arg processing
         self._metadata: dict[str, dict] = {}
         self._sunmmio_mesh_symbols_used = False
@@ -294,7 +305,74 @@ class Builder(BaseBuilder):
             if isinstance(f, frame):
                 return idx
 
+    @staticmethod
+    def _escape_dsl_span_field(value: str) -> str:
+        return value.replace("%", "%25").replace("|", "%7C")
+
+    def _encoded_dsl_span(self) -> str | None:
+        if not self.current_file or self.current_line <= 0:
+            return None
+        fields = [
+            self._escape_dsl_span_field(str(self.current_file)),
+            str(self.current_line),
+            str(max(self.current_col, 0)),
+            str(self.current_end_line or self.current_line),
+            str(max(self.current_end_col, 0)),
+            self._escape_dsl_span_field(str(self.current_macro_name)),
+        ]
+        return "|".join(fields)
+
+    def _make_dsl_span_frame(self):
+        encoded = self._encoded_dsl_span()
+        if encoded is None:
+            return None
+        return tir.attr(None, DSL_SPAN_ATTR, StringImm(encoded))
+
+    def _should_attach_dsl_span(self, frame: AbstractContextManager[Any]) -> bool:
+        if not isinstance(frame, tir.frame.TIRFrame):
+            return False
+        return not isinstance(
+            frame,
+            (
+                tir.frame.PrimFuncFrame,
+                tir.frame.AttrFrame,
+                tir.frame.ThenFrame,
+                tir.frame.ElseFrame,
+                tir.frame.BlockInitFrame,
+            ),
+        )
+
+    def _enter_dsl_span_attr_for_frame(self, frame: AbstractContextManager[Any]):
+        if not self._should_attach_dsl_span(frame):
+            return
+        span_frame = self._make_dsl_span_frame()
+        if span_frame is None:
+            return
+        self.frames.append(span_frame)
+        span_frame.__enter__()
+
+    @contextmanager
+    def dsl_span_scope(self):
+        if self._dsl_span_scope_depth > 0:
+            yield
+            return
+        span_frame = self._make_dsl_span_frame()
+        if span_frame is None:
+            yield
+            return
+        pop_idx = len(self.frames)
+        self._dsl_span_scope_depth += 1
+        self.frames.append(span_frame)
+        span_frame.__enter__()
+        try:
+            yield
+        finally:
+            while len(self.frames) > pop_idx:
+                self.frames.pop().__exit__(None, None, None)
+            self._dsl_span_scope_depth -= 1
+
     def enter_frame(self, frame: AbstractContextManager[Any]):
+        self._enter_dsl_span_attr_for_frame(frame)
         self.frames.append(frame)
         return frame.__enter__()
 
@@ -350,13 +428,16 @@ class Builder(BaseBuilder):
                 )
             self.enter_frame(val)
         elif isinstance(val, PrimExpr):
-            tir.evaluate(val)
+            with self.dsl_span_scope():
+                tir.evaluate(val)
         elif isinstance(val, (int, bool)):
-            tir.evaluate(tvm.tir.const(val))
+            with self.dsl_span_scope():
+                tir.evaluate(tvm.tir.const(val))
         elif isinstance(val, str):
             pass
         elif isinstance(val, tvm.tir.stmt.BufferStore):
-            tir.buffer_store(val.buffer, val.value, val.indices, val.predicate)
+            with self.dsl_span_scope():
+                tir.buffer_store(val.buffer, val.value, val.indices, val.predicate)
         elif isinstance(val, (Buffer, Var)):
             pass
         else:
@@ -403,13 +484,15 @@ class Builder(BaseBuilder):
         self.check_continue_break()
         # add a dummy frame for checking code after continue/break
         self.enter_frame(ContinueFrame())
-        tir.evaluate(tir.continue_loop())
+        with self.dsl_span_scope():
+            tir.evaluate(tir.continue_loop())
 
     def ctx_break(self):
         self.check_continue_break()
         # add a dummy frame for checking code after continue/break
         self.enter_frame(BreakFrame())
-        tir.evaluate(tir.break_loop())
+        with self.dsl_span_scope():
+            tir.evaluate(tir.break_loop())
 
     def ctx_while(self, cond):
         self.check_continue_break()
@@ -487,7 +570,8 @@ class Builder(BaseBuilder):
             orig_value.store(value)
             return orig_value
         if is_var(orig_value) and isinstance(value, (int, float, PrimExpr)):
-            tir.buffer_store(orig_value, value, 0)
+            with self.dsl_span_scope():
+                tir.buffer_store(orig_value, value, 0)
             return orig_value
 
         # 2. Quick return for trivil types
@@ -578,7 +662,8 @@ class Builder(BaseBuilder):
             logger.warning("Type annotation in slice assignment has no effect", stack_info=True, stacklevel=2)
         lval = _unwrap_mesh_tensor(lval)
         if isinstance(lval, Buffer):
-            tir.buffer_store(lval, value, sl)
+            with self.dsl_span_scope():
+                tir.buffer_store(lval, value, sl)
         else:
             return super().assign_slice(lval, sl, value)
 
@@ -588,7 +673,8 @@ class Builder(BaseBuilder):
             target.store(eval_op(op, target.bufload, aug_value))
             return target
         elif is_var(target):
-            tir.buffer_store(target, eval_op(op, target[0], aug_value), 0)
+            with self.dsl_span_scope():
+                tir.buffer_store(target, eval_op(op, target[0], aug_value), 0)
             return target
         elif isinstance(target, Buffer):
             raise RuntimeError(
@@ -632,7 +718,8 @@ class Builder(BaseBuilder):
     def aug_assign_slice(self, op, target, sl, aug_value):
         self.check_continue_break()
         if isinstance(target, Buffer):
-            tir.buffer_store(target, eval_op(op, target[sl], aug_value), sl)
+            with self.dsl_span_scope():
+                tir.buffer_store(target, eval_op(op, target[sl], aug_value), sl)
         else:
             return super().aug_assign_slice(op, target, sl, aug_value)
 
@@ -782,8 +869,14 @@ class Builder(BaseBuilder):
         return var
 
     def set_fileline(self, filename: str, lineno: int, name: str):
+        self.set_span(filename, lineno, 0, lineno, 0, name)
+
+    def set_span(self, filename: str, lineno: int, col: int, end_lineno: int, end_col: int, name: str):
         self.current_file = filename
         self.current_line = lineno
+        self.current_col = col
+        self.current_end_line = end_lineno
+        self.current_end_col = end_col
         self.current_macro_name = name
 
     def get_fileline_stack(self, stacklevel=1):

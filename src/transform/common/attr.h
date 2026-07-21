@@ -26,6 +26,9 @@ constexpr const char *tile_level_loop = "tile.loop_parallel";
 // iteration domain before legalization.
 constexpr const char *kTileDomain = "tile.domain";
 constexpr const char *kTileLoopStage = "tile.loop_stage";
+// Carries frontend DSL source location until AttachDslSpan converts it to
+// native TVM Span debug metadata.
+constexpr const char *kDslSpan = "tilelang.dsl_span";
 
 // ---- these attrs will be added / normalized by legalize_tiles_loop pass ----
 // tile.tile_size stores the chosen execution tile shape on the scope root.

@@ -70,6 +70,17 @@ def InferSramScope():
     return _ffi_api.InferSramScope()  # type: ignore
 
 
+def AttachDslSpan():
+    """Convert TileLang DSL source-location markers into native TVM Span metadata.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.AttachDslSpan()  # type: ignore
+
+
 def LegalizeSunmmioDataPath():
     """Stage unsupported Sunmmio global->asram data-transfer paths through rsram.
 
