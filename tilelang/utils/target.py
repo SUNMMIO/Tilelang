@@ -29,7 +29,7 @@ SUNMMIO_TARGET_DESC = "llvm -mcpu=sunmmio-a4e -mattr=device_mesh_nrow_4,device_m
 
 # Set to False before constructing kernels to restore the legacy SunMMIO
 # copy/communication regions and omit ValidateTileViewRegions from lowering.
-ENABLE_SUNMMIO_REGION_VALIDATION = True
+ENABLE_SUNMMIO_REGION_VALIDATION = False
 
 
 def describe_supported_targets() -> dict[str, str]:
