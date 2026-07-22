@@ -23,6 +23,7 @@
 #include "../op/comm.h"
 #include "../op/copy.h"
 #include "../op/operator.h"
+#include "../op/transpose.h"
 #include "../op/utils.h"
 #include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
@@ -80,6 +81,8 @@ private:
   void VisitExpr_(const CallNode *op) final {
     if (IsCopyTileOp(op)) {
       ValidateTwoRegionOp(op, "tl.tileop.copy", /*arg_base=*/0);
+    } else if (IsTransposeTileOp(op)) {
+      ValidateTwoRegionOp(op, "tl.tileop.transpose", /*arg_base=*/0);
     } else if (IsDmaCopyOp(op)) {
       ValidateTwoRegionOp(op, "tl.dma_copy", /*arg_base=*/0);
     } else if (IsCommBroadcastOp(op)) {
@@ -96,6 +99,10 @@ private:
 
   static bool IsCopyTileOp(const CallNode *call) {
     return call->op.same_as(Copy::Get());
+  }
+
+  static bool IsTransposeTileOp(const CallNode *call) {
+    return call->op.same_as(Transpose::Get());
   }
 
   static bool IsDmaCopyOp(const CallNode *call) {

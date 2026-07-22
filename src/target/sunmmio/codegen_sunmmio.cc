@@ -1499,27 +1499,12 @@ struct TokenAnalyzer {
     if (const auto *eval = stmt.as<EvaluateNode>()) {
       if (const auto *call = eval->value.as<CallNode>()) {
         if (const auto *op_node = call->op.as<OpNode>()) {
-          if (op_node->name == "tl.dma_copy") {
-            int64_t token_id = ParseTokenIdFromArgs(call->args);
-            st.MarkProduced(token_id);
-            return;
-          }
-          if (op_node->name == "tl.sunmmio_layout_transform") {
-            int64_t token_id = ParseTokenIdFromArgs(call->args);
-            st.MarkProduced(token_id);
-            return;
-          }
-          if (op_node->name == "tl.mma_sunmmio") {
-            int64_t token_id = ParseTokenIdFromArgs(call->args);
-            st.MarkProduced(token_id);
-            return;
-          }
-          if (op_node->name == "tl.broadcast_") {
-            int64_t token_id = ParseTokenIdFromArgs(call->args);
-            st.MarkProduced(token_id);
-            return;
-          }
-          if (op_node->name == "tl.sync_null_token") {
+          if (op_node->name == "tl.dma_copy" ||
+              op_node->name == "tl.sunmmio_layout_transform" ||
+              op_node->name == "tl.sunmmio_transpose" ||
+              op_node->name == "tl.mma_sunmmio" ||
+              op_node->name == "tl.broadcast_" ||
+              op_node->name == "tl.sync_null_token") {
             int64_t token_id = ParseTokenIdFromArgs(call->args);
             st.MarkProduced(token_id);
             return;
@@ -2911,6 +2896,31 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
 
     ICHECK(TryConsumeSyncTokenId(op->args[2], &attrs))
         << "tl.sunmmio_layout_transform expects third argument to be "
+           "tl.sync_token_id";
+  } else if (callee == "tl.sunmmio_transpose") {
+    ICHECK_EQ(op->args.size(), 3)
+        << "tl.sunmmio_transpose expects src region, dst region, and "
+           "sync_token_id";
+    auto validate_region = [](const PrimExpr &region_expr,
+                              const char *operand) {
+      BufferRegion region = tl::NormalizeToBufferRegion(region_expr);
+      ICHECK_EQ(region->region.size(), 2U)
+          << "tl.sunmmio_transpose " << operand << " region must be rank-2";
+      for (const Range &range : region->region) {
+        const auto *extent = range->extent.as<IntImmNode>();
+        ICHECK(extent) << "tl.sunmmio_transpose region extents must be IntImm";
+        ICHECK_GT(extent->value, 1)
+            << "tl.sunmmio_transpose requires two tiled dimensions";
+      }
+    };
+    validate_region(op->args[0], "source");
+    validate_region(op->args[1], "destination");
+
+    operands.reserve(2);
+    operands.push_back(EmitRegionCall(op->args[0]));
+    operands.push_back(EmitRegionCall(op->args[1]));
+    ICHECK(TryConsumeSyncTokenId(op->args[2], &attrs))
+        << "tl.sunmmio_transpose expects third argument to be "
            "tl.sync_token_id";
   } else if (callee == "tir.bitwise_and" || callee == "tir.bitwise_or" ||
              callee == "tir.bitwise_xor" || callee == "tir.shift_left" ||

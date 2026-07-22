@@ -634,6 +634,41 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     record_token_by_id(token_id, produced);
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
+  } else if (callee == "tl.sunmmio_transpose") {
+    ICHECK_GE(operands.size(), 2)
+        << "tl.sunmmio_transpose expects src and dst tile views";
+
+    mlir::Value src = ctx_.LookupMLIRValue(operands[0].value);
+    ICHECK(src) << "Missing MLIR source tile view for tl.sunmmio_transpose `"
+                << operands[0].value << "`";
+    auto src_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(src.getType());
+    ICHECK(src_ty)
+        << "tl.sunmmio_transpose expects source to be a suvm.tile_view";
+
+    mlir::Value dst = ctx_.LookupMLIRValue(operands[1].value);
+    ICHECK(dst)
+        << "Missing MLIR destination tile view for tl.sunmmio_transpose `"
+        << operands[1].value << "`";
+    auto dst_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(dst.getType());
+    ICHECK(dst_ty)
+        << "tl.sunmmio_transpose expects destination to be a suvm.tile_view";
+
+    auto transpose_op = mlir::suvm::TransposeAsyncOp::create(
+        ctx_.builder, type.MakeDebugLoc("sunmmio_transpose"), src, dst,
+        mlir::suvm::OdmaChannelAttr{});
+
+    ICHECK(!result_name.empty())
+        << "tl.sunmmio_transpose expects a token result";
+    ICHECK(transpose_op && transpose_op->getNumResults() == 1)
+        << "tl.sunmmio_transpose lowering expects one token result";
+    mlir::Value produced = transpose_op->getResult(0);
+    ctx_.BindMLIRValue(result_name, produced);
+
+    int64_t token_id = parse_token_id();
+    ICHECK_GE(token_id, 0) << "tl.sunmmio_transpose requires sync_token_id";
+    record_token_by_id(token_id, produced);
+
+    return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.broadcast_") {
     ICHECK(operands.size() == 3 || operands.size() == 4)
         << "tl.broadcast_ expects src, dst, mask, and optional src_core "

@@ -643,15 +643,9 @@ public:
       AsyncOpRecord rec;
       rec.op = op;
       rec.call = call;
-      if (call->op.same_as(dma_copy())) {
-        rec.order = order_++;
-        auto src = NormalizeToBufferRegion(call->args[0]);
-        auto dst = NormalizeToBufferRegion(call->args[1]);
-        rec.reads.push_back(AccessFromRegion(src));
-        AppendAsyncArgumentReads(call, {0, 1}, &rec.reads);
-        rec.writes.push_back(AccessFromRegion(dst));
-        async_ops.push_back(rec);
-      } else if (call->op.same_as(sunmmio_layout_transform())) {
+      if (call->op.same_as(dma_copy()) || call->op.same_as(broadcast_()) ||
+          call->op.same_as(sunmmio_layout_transform()) ||
+          call->op.same_as(sunmmio_transpose())) {
         rec.order = order_++;
         auto src = NormalizeToBufferRegion(call->args[0]);
         auto dst = NormalizeToBufferRegion(call->args[1]);
@@ -669,14 +663,6 @@ public:
         rec.reads.push_back(AccessFromRegion(acc));
         AppendAsyncArgumentReads(call, {0, 1, 2}, &rec.reads);
         rec.writes.push_back(AccessFromRegion(acc));
-        async_ops.push_back(rec);
-      } else if (call->op.same_as(broadcast_())) {
-        rec.order = order_++;
-        auto src = NormalizeToBufferRegion(call->args[0]);
-        auto dst = NormalizeToBufferRegion(call->args[1]);
-        rec.reads.push_back(AccessFromRegion(src));
-        AppendAsyncArgumentReads(call, {0, 1}, &rec.reads);
-        rec.writes.push_back(AccessFromRegion(dst));
         async_ops.push_back(rec);
       }
       if (!rec.reads.empty() || !rec.writes.empty()) {
@@ -1867,27 +1853,10 @@ private:
   Stmt VisitStmt_(const EvaluateNode *op) {
     const CallNode *call = op->value.as<CallNode>();
     if (call) {
-      if (call->op.same_as(dma_copy())) {
-        Array<Stmt> stmts;
-        int curr_token_id;
-        if (pre_assigned_tokens_.count(op)) {
-          curr_token_id = pre_assigned_tokens_[op];
-        } else {
-          curr_token_id = GetNextTokenId();
-        }
-
-        InjectLoopCarriedWaitsForToken(stmts, curr_token_id);
-        token_process_async_call_arguments(call, {0, 1}, stmts);
-        token_process_read_buffer(NormalizeToBufferRegion(call->args[0]), stmts,
-                                  curr_token_id);
-        token_process_write_buffer(NormalizeToBufferRegion(call->args[1]),
-                                   stmts, curr_token_id);
-
-        curr_stmt_with_token_id(call, stmts, curr_token_id);
-
-        return SeqStmt::Flatten(stmts);
-      } else if (call->op.same_as(sunmmio_layout_transform())) {
-        // Same dependency shape as dma_copy: reads args[0], writes args[1].
+      if (call->op.same_as(dma_copy()) ||
+          call->op.same_as(sunmmio_layout_transform()) ||
+          call->op.same_as(sunmmio_transpose())) {
+        // These operations read args[0] and write args[1].
         Array<Stmt> stmts;
         int curr_token_id;
         if (pre_assigned_tokens_.count(op)) {

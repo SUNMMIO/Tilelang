@@ -744,6 +744,14 @@ T.copy(
 
 Common SunMMIO paths include DRAM -> RSRAM, RSRAM -> DRAM, DRAM/RSRAM -> ASRAM, DRAM/RSRAM -> WSRAM, and RSRAM -> RSRAM. Unsupported paths are listed in 2.7.
 
+**`T.transpose`**
+
+```python
+T.transpose(src, dst)
+```
+
+`T.transpose` 使用 A4E ODMA 在 RSRAM 内完成二维矩阵转置，编译器自动插入异步同步。`src` 必须是完整的 `[M, N]` RSRAM buffer，`dst` 必须是完整的 `[N, M]` RSRAM buffer。当前支持 `bfloat16` 和 `float32`，要求静态 shape、32x32 两级 ZZ/ZN blockwise layout，不支持局部 region、原地转置或其他 memory scope。
+
 ### 3.5 Tile Loop
 
 **`T.Tiles`**
