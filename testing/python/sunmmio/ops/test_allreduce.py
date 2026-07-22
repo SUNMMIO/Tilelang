@@ -87,10 +87,10 @@ def _region_buffer_name(region_call):
     [
         ("h", True, [0]),
         ("v", True, [1]),
-        ("all", True, [0, 1]),
+        ("all", True, [1, 0]),
         ("h", False, [0]),
         ("v", False, [1]),
-        ("all", False, [0, 1]),
+        ("all", False, [1, 0]),
     ],
 )
 def test_tilelang_allreduce_sunmmio_lowers_to_broadcast_and_tile_reduce(direction, clear, expected_directions):
