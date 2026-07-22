@@ -308,7 +308,7 @@ def _prepare_copy_regions_strict(
     )
 
 
-def _prepare_copy_regions_legacy(
+def _prepare_copy_regions_compact(
     src: BufferLikeType,
     dst: BufferLikeType,
     src_extent: list[tir.PrimExpr] | None,
@@ -361,7 +361,7 @@ def copy(
     Range handling notes:
     - `Buffer` copies the full shape, `BufferRegion` uses explicit ranges, and
       `BufferLoad` starts from its indices with extents inferred from the peer.
-    - Scalar `BufferLoad -> BufferLoad` keeps the legacy fast path and lowers to
+    - Scalar `BufferLoad -> BufferLoad` keeps the scalar fast path and lowers to
       a direct `BufferStore`.
     - Rank-mismatched copies use suffix matching only: extra leading dimensions
       on the higher-rank side must have extent 1.
@@ -384,7 +384,7 @@ def copy(
     if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION and target and target_is_sunmmio(target):
         src, dst = _prepare_copy_regions_strict(src, dst)
     else:
-        src, dst = _prepare_copy_regions_legacy(src, dst, src_extent, dst_extent)
+        src, dst = _prepare_copy_regions_compact(src, dst, src_extent, dst_extent)
 
     # Build annotations dict
     ann = annotations.copy() if annotations else {}

@@ -5,6 +5,7 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm as tvm
+from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 from tilelang.utils.target import determine_target
 
@@ -34,6 +35,7 @@ def basic_allocate_copy_mma_kernel(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
+    nrows, ncols = driver.get_sunmmio_device_mesh_config()
     shard_policy = T.MeshShardingPolicy(x=1, y=0)
     A_layout = make_zz_layout((M, K))
     B_layout = make_zz_layout((K, N))
@@ -48,8 +50,8 @@ def basic_allocate_copy_mma_kernel(
         with T.Kernel() as _cid:
             sharded_M, sharded_K = A.local_shape
             sharded_N = B.local_shape[1]
-            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
-            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
+            B_shared_dist = T.alloc_shared((block_K * nrows, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             for by in T.serial(T.ceildiv(sharded_M, block_M)):
@@ -135,6 +137,7 @@ def pipelined_allocate_copy_mma_kernel(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
+    nrows, ncols = driver.get_sunmmio_device_mesh_config()
     shard_policy = T.MeshShardingPolicy(x=1, y=0)
     A_layout = make_zz_layout((M, K))
     B_layout = make_zz_layout((K, N))
@@ -149,8 +152,8 @@ def pipelined_allocate_copy_mma_kernel(
         with T.Kernel() as _cid:
             sharded_M, sharded_K = A.local_shape
             sharded_N = B.local_shape[1]
-            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
-            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
+            B_shared_dist = T.alloc_shared((block_K * nrows, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             for by in T.serial(T.ceildiv(sharded_M, block_M)):

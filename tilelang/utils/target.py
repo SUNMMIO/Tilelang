@@ -27,9 +27,18 @@ SUPPORTED_TARGETS: dict[str, str] = {
 
 SUNMMIO_TARGET_DESC = "llvm -mcpu=sunmmio-a4e -mattr=device_mesh_nrow_4,device_mesh_ncol_4"
 
-# Set to False before constructing kernels to restore the legacy SunMMIO
+# Set to False before constructing kernels to use the compact SunMMIO
 # copy/communication regions and omit ValidateTileViewRegions from lowering.
 ENABLE_SUNMMIO_REGION_VALIDATION = False
+
+
+def set_sunmmio_region_validation(enabled: bool) -> None:
+    """Enable or disable strict SunMMIO region normalization and validation."""
+    if not isinstance(enabled, bool):
+        raise TypeError(f"enabled must be a bool, got {type(enabled).__name__}")
+
+    global ENABLE_SUNMMIO_REGION_VALIDATION
+    ENABLE_SUNMMIO_REGION_VALIDATION = enabled
 
 
 def describe_supported_targets() -> dict[str, str]:

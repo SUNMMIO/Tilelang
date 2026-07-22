@@ -144,7 +144,7 @@ def _extent_is_dynamic(extent) -> bool:
     return isinstance(extent, tir.PrimExpr) and _const_int(extent) is None
 
 
-def _legacy_extent_equal(lhs, rhs) -> bool:
+def _compact_extent_equal(lhs, rhs) -> bool:
     lhs_int = _const_int(lhs)
     rhs_int = _const_int(rhs)
     if lhs_int is not None and rhs_int is not None:
@@ -155,25 +155,25 @@ def _legacy_extent_equal(lhs, rhs) -> bool:
         return False
 
 
-def _legacy_extent_is_one(extent) -> bool:
+def _compact_extent_is_one(extent) -> bool:
     extent_int = _const_int(extent)
     if extent_int is not None:
         return extent_int == 1
-    return _legacy_extent_equal(extent, tir.IntImm("int32", 1))
+    return _compact_extent_equal(extent, tir.IntImm("int32", 1))
 
 
-def _legacy_shape_equal(lhs, rhs) -> bool:
-    return len(lhs) == len(rhs) and all(_legacy_extent_equal(lhs_extent, rhs_extent) for lhs_extent, rhs_extent in zip(lhs, rhs))
+def _compact_shape_equal(lhs, rhs) -> bool:
+    return len(lhs) == len(rhs) and all(_compact_extent_equal(lhs_extent, rhs_extent) for lhs_extent, rhs_extent in zip(lhs, rhs))
 
 
-def _legacy_shape_compatible(lhs, rhs) -> bool:
+def _compact_shape_compatible(lhs, rhs) -> bool:
     return len(lhs) == len(rhs) and all(
-        _legacy_extent_equal(lhs_extent, rhs_extent) or _legacy_extent_is_one(lhs_extent) or _legacy_extent_is_one(rhs_extent)
+        _compact_extent_equal(lhs_extent, rhs_extent) or _compact_extent_is_one(lhs_extent) or _compact_extent_is_one(rhs_extent)
         for lhs_extent, rhs_extent in zip(lhs, rhs)
     )
 
 
-def _prepare_comm_region_legacy(obj: BufferLikeType, access_type: str) -> _PreparedCommRegion:
+def _prepare_comm_region_compact(obj: BufferLikeType, access_type: str) -> _PreparedCommRegion:
     region = to_buffer_region(obj, access_type=access_type)
     if not isinstance(region, tir.BufferRegion):
         raise TypeError(f"Expected a buffer-like object, got {type(obj)}.")
@@ -772,9 +772,9 @@ def _prepare_one_to_one_operands(
             _prepare_normalized_comm_region(dst_region, "w"),
         )
 
-    src_region = _prepare_comm_region_legacy(src, "r")
-    dst_region = _prepare_comm_region_legacy(dst, "w")
-    if not _legacy_shape_compatible(src_region.extents, dst_region.extents):
+    src_region = _prepare_comm_region_compact(src, "r")
+    dst_region = _prepare_comm_region_compact(dst, "w")
+    if not _compact_shape_compatible(src_region.extents, dst_region.extents):
         operation = op_name.rsplit(".", 1)[-1]
         raise ValueError(f"Source and destination buffer must have the same number of dimensions for {operation}.")
     return src_region, dst_region
@@ -803,15 +803,15 @@ def _prepare_allgather_operands(
             axis_arg,
         )
 
-    send_region = _prepare_comm_region_legacy(send_buffer, "r")
-    recv_region = _prepare_comm_region_legacy(recv_buffer, "w")
+    send_region = _prepare_comm_region_compact(send_buffer, "r")
+    recv_region = _prepare_comm_region_compact(recv_buffer, "w")
     axis_arg = _normalize_allgather_axis(axis, len(send_region.extents))
     if axis_arg < 0:
         expected_recv_shape = [recv_num, *send_region.extents]
     else:
         expected_recv_shape = list(send_region.extents)
         expected_recv_shape[axis_arg] = recv_num * send_region.extents[axis_arg]
-    assert _legacy_shape_equal(recv_region.extents, expected_recv_shape), (
+    assert _compact_shape_equal(recv_region.extents, expected_recv_shape), (
         f"Receive buffer shape must be {expected_recv_shape} to hold gathered data from {recv_num} cores, but got {recv_region.extents}."
     )
     return send_region, recv_region, axis_arg
@@ -840,8 +840,8 @@ def _prepare_allreduce_operands(
             normalized_dim,
         )
 
-    buffer_region = _prepare_comm_region_legacy(buffer, "r")
-    out_region = _prepare_comm_region_legacy(out, "w")
+    buffer_region = _prepare_comm_region_compact(buffer, "r")
+    out_region = _prepare_comm_region_compact(out, "w")
     buffer_rank = len(buffer_region.extents)
     assert isinstance(dim, int) and -1 <= dim < buffer_rank, f"dim {dim} out of bounds for buffer with {buffer_rank} dimensions."
     normalized_dim = buffer_rank - 1 if dim == -1 else dim
@@ -849,7 +849,7 @@ def _prepare_allreduce_operands(
         buffer_region.extents[:normalized_dim] + buffer_region.extents[normalized_dim + 1 :],
         buffer_region.extents[:normalized_dim] + [1] + buffer_region.extents[normalized_dim + 1 :],
     ]
-    if not any(_legacy_shape_equal(out_region.extents, shape) for shape in expected_shapes):
+    if not any(_compact_shape_equal(out_region.extents, shape) for shape in expected_shapes):
         expected_shapes_str = " or ".join(map(str, expected_shapes))
         raise ValueError(
             f"Invalid reduce output shape, buffer shape is {buffer_region.extents}, dim is {normalized_dim}, "
@@ -861,7 +861,7 @@ def _prepare_allreduce_operands(
 def _prepare_allreduce_temporary(buffer: tir.Buffer, access_type: str) -> tir.PrimExpr | tir.BufferRegion:
     if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION:
         return _encode_full_buffer_region(buffer, access_type, "T.comm.all_reduce")
-    return _prepare_comm_region_legacy(buffer, access_type).region
+    return _prepare_comm_region_compact(buffer, access_type).region
 
 
 def broadcast(

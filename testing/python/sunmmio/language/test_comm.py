@@ -32,6 +32,16 @@ def _broadcast_line_no_core(src, dst, direction, mask, src_offset=0):
     return f"T.broadcast_({src}, {dst}, {direction}, {mask}, {src_offset})"
 
 
+@pytest.fixture
+def _strict_region_validation():
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(True)
+    try:
+        yield
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+
 _ROW_MASK_BX = "T.int64(15)"
 
 _COL_MASK_BX = "T.int64(15)"
@@ -160,7 +170,7 @@ def test_comm_buffer_like_region_python_api():
     ) in script
 
 
-def test_comm_one_to_one_regions_follow_copy_normalization_rules():
+def test_comm_one_to_one_regions_follow_copy_normalization_rules(_strict_region_validation):
     @T.prim_func
     def main():
         with T.Kernel():
@@ -179,56 +189,63 @@ def test_comm_one_to_one_regions_follow_copy_normalization_rules():
     assert "T.comm_broadcast(src[0, 0:32, 0:32], shrink_dst[0:32, 0:32], -1, 0, 0)" in script
 
 
-def test_comm_legacy_path_preserves_original_regions(monkeypatch):
-    monkeypatch.setattr(_target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", False)
+def test_comm_compact_path_preserves_original_regions():
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(False)
+    try:
 
-    @T.prim_func
-    def main():
-        with T.Kernel():
-            src = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
-            broadcast_dst = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
-            put_dst = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
-            gather_send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
-            gather_recv = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
-            reduce_src = T.alloc_shared((32, 64), "float32", scope="shared.rsram")
-            reduce_out = T.alloc_shared((32,), "float32", scope="shared.rsram")
+        @T.prim_func
+        def main():
+            with T.Kernel():
+                src = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+                broadcast_dst = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+                put_dst = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+                gather_send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                gather_recv = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+                reduce_src = T.alloc_shared((32, 64), "float32", scope="shared.rsram")
+                reduce_out = T.alloc_shared((32,), "float32", scope="shared.rsram")
 
-            T.comm.broadcast(src[0:1, 0:32, 0:32], broadcast_dst[0:4, 0:32, 0:32], (0, 0), direction="h")
-            T.comm.put(src[0:1, 0:32, 0:32], put_dst[0:4, 0:32, 0:32], (0, 0), (0, 1))
-            T.comm.all_gather(gather_send, gather_recv, direction="h")
-            T.comm.all_reduce(reduce_src, reduce_out, "sum", "h", dim=1)
+                T.comm.broadcast(src[0:1, 0:32, 0:32], broadcast_dst[0:4, 0:32, 0:32], (0, 0), direction="h")
+                T.comm.put(src[0:1, 0:32, 0:32], put_dst[0:4, 0:32, 0:32], (0, 0), (0, 1))
+                T.comm.all_gather(gather_send, gather_recv, direction="h")
+                T.comm.all_reduce(reduce_src, reduce_out, "sum", "h", dim=1)
 
-    script = main.script()
-    assert "T.comm_broadcast(src[0, 0:32, 0:32], broadcast_dst[0:4, 0:32, 0:32]" in script
-    assert "T.comm_put(src[0, 0:32, 0:32], put_dst[0:4, 0:32, 0:32]" in script
-    assert "T.comm_allgather(gather_send[0:32, 0:32], gather_recv[0:4, 0:32, 0:32]" in script
-    assert "T.comm_allreduce(reduce_src[0:32, 0:64], reduce_out[0:32]" in script
-
-
-def test_comm_legacy_path_keeps_original_dynamic_extent_behavior(monkeypatch):
-    monkeypatch.setattr(_target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", False)
-
-    dynamic_extent = tvm.tir.Var("dynamic_extent", "int32")
-    src = tvm.tir.decl_buffer((dynamic_extent, 32), "float32", name="src", scope="shared.rsram")
-    same_shape_dst = tvm.tir.decl_buffer((dynamic_extent, 32), "float32", name="same_shape_dst", scope="shared.rsram")
-    static_dst = tvm.tir.decl_buffer((64, 32), "float32", name="static_dst", scope="shared.rsram")
-
-    with pytest.raises(ValueError, match="Cannot convert to BufferLoad"):
-        T.comm.broadcast(src, same_shape_dst, 0, direction="h")
-
-    with pytest.raises(ValueError, match="same number of dimensions for broadcast"):
-        T.comm.broadcast(src, static_dst, 0, direction="h")
-
-    gather_recv = tvm.tir.decl_buffer((4, 64, 32), "float32", name="gather_recv", scope="shared.rsram")
-    with pytest.raises(AssertionError, match="Receive buffer shape"):
-        T.comm.all_gather(src, gather_recv, direction="h")
-
-    reduce_out = tvm.tir.decl_buffer((64,), "float32", name="reduce_out", scope="shared.rsram")
-    with pytest.raises(ValueError, match="Invalid reduce output shape"):
-        T.comm.all_reduce(src, reduce_out, "sum", "h", dim=1)
+        script = main.script()
+        assert "T.comm_broadcast(src[0, 0:32, 0:32], broadcast_dst[0:4, 0:32, 0:32]" in script
+        assert "T.comm_put(src[0, 0:32, 0:32], put_dst[0:4, 0:32, 0:32]" in script
+        assert "T.comm_allgather(gather_send[0:32, 0:32], gather_recv[0:4, 0:32, 0:32]" in script
+        assert "T.comm_allreduce(reduce_src[0:32, 0:64], reduce_out[0:32]" in script
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
 
 
-def test_comm_one_to_one_full_buffer_extent_mismatch_is_rejected():
+def test_comm_compact_path_keeps_original_dynamic_extent_behavior():
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(False)
+    try:
+        dynamic_extent = tvm.tir.Var("dynamic_extent", "int32")
+        src = tvm.tir.decl_buffer((dynamic_extent, 32), "float32", name="src", scope="shared.rsram")
+        same_shape_dst = tvm.tir.decl_buffer((dynamic_extent, 32), "float32", name="same_shape_dst", scope="shared.rsram")
+        static_dst = tvm.tir.decl_buffer((64, 32), "float32", name="static_dst", scope="shared.rsram")
+
+        with pytest.raises(ValueError, match="Cannot convert to BufferLoad"):
+            T.comm.broadcast(src, same_shape_dst, 0, direction="h")
+
+        with pytest.raises(ValueError, match="same number of dimensions for broadcast"):
+            T.comm.broadcast(src, static_dst, 0, direction="h")
+
+        gather_recv = tvm.tir.decl_buffer((4, 64, 32), "float32", name="gather_recv", scope="shared.rsram")
+        with pytest.raises(AssertionError, match="Receive buffer shape"):
+            T.comm.all_gather(src, gather_recv, direction="h")
+
+        reduce_out = tvm.tir.decl_buffer((64,), "float32", name="reduce_out", scope="shared.rsram")
+        with pytest.raises(ValueError, match="Invalid reduce output shape"):
+            T.comm.all_reduce(src, reduce_out, "sum", "h", dim=1)
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+
+def test_comm_one_to_one_full_buffer_extent_mismatch_is_rejected(_strict_region_validation):
     with pytest.raises(ValueError, match="exact match is required for Buffer-to-Buffer operation"):
 
         @T.prim_func
@@ -239,7 +256,7 @@ def test_comm_one_to_one_full_buffer_extent_mismatch_is_rejected():
                 T.comm.broadcast(src, dst, (0, 0), direction="h")
 
 
-def test_comm_explicit_region_oob_is_warned_and_clipped():
+def test_comm_explicit_region_oob_is_warned_and_clipped(_strict_region_validation):
     with pytest.warns(UserWarning, match="T.comm.put explicit BufferRegion exceeds buffer shape"):
 
         @T.prim_func
@@ -252,7 +269,7 @@ def test_comm_explicit_region_oob_is_warned_and_clipped():
     assert "T.comm_put(src[0:32, 0:32], dst[0:32, 0:32], -1, 0, 1)" in main.script()
 
 
-def test_comm_all_gather_regions_follow_copy_normalization_rules():
+def test_comm_all_gather_regions_follow_copy_normalization_rules(_strict_region_validation):
     @T.prim_func
     def main():
         with T.Kernel():
@@ -274,7 +291,7 @@ def test_comm_all_gather_regions_follow_copy_normalization_rules():
     assert "T.comm_allgather(send[0:32, 0:32], recv_axis_shrink[0:128, 0:32], 0, -1, 0," in script
 
 
-def test_comm_all_gather_buffer_load_pair_is_rejected():
+def test_comm_all_gather_buffer_load_pair_is_rejected(_strict_region_validation):
     with pytest.raises(ValueError, match="both operands are BufferLoad"):
 
         @T.prim_func
@@ -285,7 +302,7 @@ def test_comm_all_gather_buffer_load_pair_is_rejected():
                 T.comm.all_gather(send[0, 0], recv[0, 0, 0], direction="h")
 
 
-def test_comm_all_gather_full_buffer_extent_mismatch_is_rejected():
+def test_comm_all_gather_full_buffer_extent_mismatch_is_rejected(_strict_region_validation):
     with pytest.raises(ValueError, match="exact match is required for Buffer-to-Buffer operation"):
 
         @T.prim_func
@@ -296,7 +313,7 @@ def test_comm_all_gather_full_buffer_extent_mismatch_is_rejected():
                 T.comm.all_gather(send, recv, direction="h")
 
 
-def test_comm_all_reduce_regions_follow_copy_normalization_rules():
+def test_comm_all_reduce_regions_follow_copy_normalization_rules(_strict_region_validation):
     @T.prim_func
     def main():
         with T.Kernel():
@@ -315,7 +332,7 @@ def test_comm_all_reduce_regions_follow_copy_normalization_rules():
     assert "T.comm_allreduce(src[0:32, 0:64], out_shrink[0:32]" in script
 
 
-def test_comm_all_reduce_full_buffer_extent_mismatch_is_rejected():
+def test_comm_all_reduce_full_buffer_extent_mismatch_is_rejected(_strict_region_validation):
     with pytest.raises(ValueError, match="exact match is required for Buffer-to-Buffer operation"):
 
         @T.prim_func
@@ -326,7 +343,7 @@ def test_comm_all_reduce_full_buffer_extent_mismatch_is_rejected():
                 T.comm.all_reduce(src, out, "sum", "h", dim=1)
 
 
-def test_comm_all_reduce_buffer_load_pair_is_rejected():
+def test_comm_all_reduce_buffer_load_pair_is_rejected(_strict_region_validation):
     with pytest.raises(ValueError, match="both operands are BufferLoad"):
 
         @T.prim_func

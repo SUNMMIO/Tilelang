@@ -2,6 +2,7 @@ import pytest
 from tilelang import tvm as tvm
 import tilelang as tl
 import tilelang.language as T
+import tilelang.utils.target as _target_utils
 from tilelang.engine.phase import *
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tilelang.language.mesh_tensor import MeshShardingPolicy
@@ -546,6 +547,15 @@ def flashmladecode(
         return main_no_split
 
 
+def _build_with_strict_region_validation(kernel_factory, *args, **kwargs):
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(True)
+    try:
+        return kernel_factory(*args, **kwargs)
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+
 CASES = [
     (
         "matmul",
@@ -588,7 +598,7 @@ CASES = [
     ),
     (
         "matmul_persistent",
-        lambda: matmul_persistent(1024, 1024, 1024, 128, 128, 32, num_stages=2),
+        lambda: _build_with_strict_region_validation(matmul_persistent, 1024, 1024, 1024, 128, 128, 32, num_stages=2),
         {
             "A_shared_dist": [2, 128, 128],
             "A_rsram_stage": [2, 128, 32],
