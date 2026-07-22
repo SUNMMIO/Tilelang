@@ -16,9 +16,6 @@ from tilelang.dtypes import dtype as tilelang_dtype
 from tilelang.language import dtypes as _dtypes
 from tilelang.language.placement import (
     PlacementSpec,
-    Placement,
-    Replicate,
-    Shard,
     _normalize_placement,
     _placement_metadata,
     _validate_placement,
@@ -27,9 +24,7 @@ from tilelang.language.proxy import TensorProxy
 from tilelang.language.mesh_symbols import mesh_ncols, mesh_nrows
 
 __all__ = [
-    "Placement",
-    "Replicate",
-    "Shard",
+    "PlacementSpec",
     "MeshTensor",
     "TensorWithMeta",
     "get_local_extent",
@@ -230,12 +225,12 @@ class MeshTensorProxy:
         nrows: int,
         ncols: int,
     ) -> tuple[Any, ...]:
-        row_placement, col_placement = _validate_placement(placement, len(shape))
+        placement = _validate_placement(placement, len(shape))
         sharded_shape = list(shape)
 
         for dim, extent in enumerate(sharded_shape):
-            row_shards = isinstance(row_placement, Shard) and row_placement.dim == dim
-            col_shards = isinstance(col_placement, Shard) and col_placement.dim == dim
+            row_shards = placement.row_dim == dim
+            col_shards = placement.col_dim == dim
             if not row_shards and not col_shards:
                 continue
             shard_factor = 1

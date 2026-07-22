@@ -114,7 +114,6 @@ SunMMIO kernel 也是 persistent kernel：一次 kernel 启动后，各个 core 
 import tilelang
 import tilelang.language as T
 from tilelang.carver.arch import driver
-from tilelang.language import S
 from tilelang.layout import make_zz_layout
 
 device_mesh = driver.get_sunmmio_device_mesh_config()
@@ -126,7 +125,7 @@ BM, BN, BK = 32, 32, 128
 dtype = "float16"
 accum_dtype = "float32"
 
-placement = [S(0), S(1)]
+placement = T.placement.full_shard(0, 1)
 A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
 B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
 C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
@@ -215,7 +214,7 @@ with T.Kernel(nrows * ncols) as cid:
 ```python
 A: T.MeshTensor(
     (M, K),
-    [T.S(0), T.S(1)],
+    T.placement.full_shard(0, 1),
     device_mesh_config,
     dtype,
 )
@@ -223,21 +222,19 @@ A: T.MeshTensor(
 
 `MeshTensor` 需要用户明确给出逻辑全局 shape、placement 和 dtype；device mesh config 可以显式传入，也可以省略并使用目标的符号化 mesh。`layout` 参数通常也可以省略；省略时默认 row-major，后续需要的布局由编译器根据访问模式、buffer 角色和目标规则推断或派生。这里的 `global` 是 TileLang 对 DRAM 侧 tensor 的 scope 命名，对应当前 core 的 DRAM 侧 shard。
 
-Placement 与 SuTensor 一致，直接使用长度为 2 的列表，并按固定顺序描述 mesh 的两个物理轴：`[row, col]`。每个轴只能是 `Shard(dim)` 或 `Replicate()`，简写分别为 `S(dim)` 和 `R()`。`S`、`R` 可以从 `tilelang.language` 导入；使用 `import tilelang.language as T` 时也可以写成 `T.S`、`T.R`：
+Placement API 与 torch-sunmmio 使用相同的术语和调用形式。`T.placement` 提供五个构造函数，每个函数都返回不可变的 `PlacementSpec`：
 
 ```python
-from tilelang.language import R, S
-
-full = [S(0), S(1)]
-by_row = [S(0), R()]
-by_col = [R(), S(1)]
-replicated = [R(), R()]
-across_mesh = [S(0), S(0)]
+full = T.placement.full_shard(row_dim=0, col_dim=1)
+by_row = T.placement.row_shard(dim=0)
+by_col = T.placement.col_shard(dim=1)
+replicated = T.placement.replicated()
+across_mesh = T.placement.mesh_as_line(dim=0)
 ```
 
-`[S(0), S(1)]` 表示 mesh row 轴按 `nrows` 切分 tensor 第 0 维，mesh col 轴按 `ncols` 切分第 1 维。row 和 col 具有物理含义，因此 `[S(0), S(1)]` 与 `[S(1), S(0)]` 不等价。对于矩阵类 kernel，通常需要让 placement 和算法的数据流一致：例如按 M 维分布输出行、按 N 维分布输出列，或者在 K 维上配合 `all_gather` 收集计算所需分块。
+`full_shard(0, 1)` 表示 mesh row 轴按 `nrows` 切分 tensor 第 0 维，mesh col 轴按 `ncols` 切分第 1 维。row 和 col 具有物理含义，因此 `full_shard(0, 1)` 与 `full_shard(1, 0)` 不等价。对于矩阵类 kernel，通常需要让 placement 和算法的数据流一致：例如按 M 维分布输出行、按 N 维分布输出列，或者在 K 维上配合 `all_gather` 收集计算所需分块。
 
-当两个 mesh 轴切分同一个 tensor 维度时，例如 `[S(0), S(0)]`，该维度按 `nrows * ncols` 切分，core 的 shard index 为 `row * ncols + col`。非整除 shape 的本地 slot 使用向上取整，靠后的 core 可能具有较短的有效 extent；kernel 不应假设每个 core 的有效数据完全等长。
+`mesh_as_line(0)` 将 2D mesh 按 row-major 顺序视为一条线，并把 tensor 第 0 维按 `nrows * ncols` 切分；core 的 shard index 为 `row * ncols + col`。非整除 shape 的本地 slot 使用向上取整，靠后的 core 可能具有较短的有效 extent；kernel 不应假设每个 core 的有效数据完全等长。
 
 ### 2.5 Layout
 
@@ -484,30 +481,23 @@ props = driver.get_sunmmio_device_properties()
 
 ### 3.2 MeshTensor、Placement 与 Layout
 
-**`S` / `R` Placement**
+**`T.placement` / `PlacementSpec`**
 
 ```python
-from tilelang.language import R, S
-
-full = [S(row_dim), S(col_dim)]
-by_row = [S(dim), R()]
-by_col = [R(), S(dim)]
-replicated = [R(), R()]
+full = T.placement.full_shard(row_dim, col_dim)
+by_row = T.placement.row_shard(dim)
+by_col = T.placement.col_shard(dim)
+replicated = T.placement.replicated()
+across_mesh = T.placement.mesh_as_line(dim)
 ```
 
-placement 列表可以直接传给 `T.MeshTensor`。它必须包含两个有序项，依次对应 mesh 的 row 轴和 col 轴。
+这些构造函数返回 `PlacementSpec`，可以直接传给 `T.MeshTensor`。`T.MeshTensor` 不接受裸列表形式的 placement。
 
-- `[S(row_dim), S(col_dim)]`：两个 mesh 轴分别切分指定的 tensor 维度。
-- `[S(dim), R()]`：仅 row 轴切分，col 轴复制。
-- `[R(), S(dim)]`：row 轴复制，仅 col 轴切分。
-- `[R(), R()]`：两个轴都复制。
-
-也可以使用 `T.placement.full_shard()`、`row_shard()`、`col_shard()` 和 `replicated()` 便利构造函数。它们返回同样的 placement 列表：
-
-```python
-placement = T.placement.row_shard(row_dim)
-tensor = T.MeshTensor(shape, placement, dtype)
-```
+- `full_shard(row_dim, col_dim)`：row 和 col 两个 mesh 轴分别切分指定的 tensor 维度。
+- `row_shard(dim)`：仅 row 轴切分，col 轴复制。
+- `col_shard(dim)`：row 轴复制，仅 col 轴切分。
+- `replicated()`：两个 mesh 轴都复制。
+- `mesh_as_line(dim)`：把 2D mesh 按 row-major 顺序线性化，并沿整个 mesh 切分指定维度。
 
 `row_dim`、`col_dim` 和 `dim` 都是从 0 开始的 tensor 维度索引。传入 `T.MeshTensor` 后会根据 tensor rank 进行范围检查。
 
@@ -520,7 +510,7 @@ T.MeshTensor(shape, placement, device_mesh_config=None, dtype="float32", layout=
 `MeshTensor` 用在 kernel 函数参数处，声明一个分布在 SunMMIO mesh 上的输入或输出 tensor。
 
 - `shape`：逻辑完整 shape，例如 `(M, K)`。这是用户视角下的全局 tensor shape。
-- `placement`：长度为 2 的 `[row, col]` placement 列表，描述全局 tensor 如何切分或复制到各个 core。
+- `placement`：由 `T.placement` 构造的 `PlacementSpec`，描述全局 tensor 如何切分或复制到各个 core。
 - `device_mesh_config`：形如 `(nrows, ncols)`。省略时使用符号化的目标 mesh；也可以显式传入 `driver.get_sunmmio_device_mesh_config()` 的结果。
 - `dtype`：元素类型，例如 `"float16"`、`"bfloat16"`、`"float32"`。
 - `layout`：DRAM 中的全局数据布局。省略时使用默认 row-major，编译器会根据访问模式和目标规则推断或派生后续需要的布局。用户通常不需要手动传入该参数。
@@ -1019,7 +1009,6 @@ for k in T.Pipelined(loop_extent, num_stages=3):
 import tilelang
 import tilelang.language as T
 from tilelang.carver.arch import driver
-from tilelang.language import S
 from tilelang.layout import make_zz_layout
 
 
@@ -1038,7 +1027,7 @@ def local_shard_gemm(
     nrows, ncols = device_mesh
     ncores = nrows * ncols
 
-    placement = [S(0), S(1)]
+    placement = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
@@ -1090,7 +1079,6 @@ def local_shard_gemm(
 import tilelang
 import tilelang.language as T
 from tilelang.carver.arch import driver
-from tilelang.language import S
 from tilelang.layout import make_zz_layout
 
 
@@ -1109,7 +1097,7 @@ def summa_gemm(
     nrows, ncols = device_mesh
     ncores = nrows * ncols
 
-    placement = [S(0), S(1)]
+    placement = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
@@ -1165,7 +1153,6 @@ def summa_gemm(
 import tilelang
 import tilelang.language as T
 from tilelang.carver.arch import driver
-from tilelang.language import S
 from tilelang.layout import make_zz_layout
 
 
@@ -1184,7 +1171,7 @@ def gemm_with_bias(
     nrows, ncols = device_mesh
     ncores = nrows * ncols
 
-    placement = [S(0), S(1)]
+    placement = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))

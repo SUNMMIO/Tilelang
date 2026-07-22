@@ -114,7 +114,6 @@ The simplified structure below shows a typical SunMMIO kernel. Boundary handling
 import tilelang
 import tilelang.language as T
 from tilelang.carver.arch import driver
-from tilelang.language import S
 from tilelang.layout import make_zz_layout
 
 device_mesh = driver.get_sunmmio_device_mesh_config()
@@ -126,7 +125,7 @@ BM, BN, BK = 32, 32, 128
 dtype = "float16"
 accum_dtype = "float32"
 
-placement = [S(0), S(1)]
+placement = T.placement.full_shard(0, 1)
 A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
 B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
 C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
@@ -215,7 +214,7 @@ From the execution semantics point of view, `T.Kernel(nrows * ncols)` launches a
 ```python
 A: T.MeshTensor(
     (M, K),
-    [T.S(0), T.S(1)],
+    T.placement.full_shard(0, 1),
     device_mesh_config,
     dtype,
 )
@@ -223,21 +222,19 @@ A: T.MeshTensor(
 
 `MeshTensor` requires users to provide the global logical shape, placement, and dtype. The device mesh config can be supplied explicitly or omitted to use the target's symbolic mesh. The `layout` parameter can usually be omitted as well. When omitted, the default is row-major, and later required layouts are inferred or derived by the compiler according to access patterns, buffer roles, and target rules. Here, `global` is TileLang's scope name for DRAM-side tensors, corresponding to the current core's DRAM-side shard.
 
-Following SuTensor, a placement is a two-element list describing the physical mesh axes in the fixed order `[row, col]`. Each axis is either `Shard(dim)` or `Replicate()`, abbreviated as `S(dim)` and `R()`. Import `S` and `R` from `tilelang.language`; when using `import tilelang.language as T`, `T.S` and `T.R` are also available:
+The placement API uses the same terminology and call style as torch-sunmmio. `T.placement` provides five constructors, each returning an immutable `PlacementSpec`:
 
 ```python
-from tilelang.language import R, S
-
-full = [S(0), S(1)]
-by_row = [S(0), R()]
-by_col = [R(), S(1)]
-replicated = [R(), R()]
-across_mesh = [S(0), S(0)]
+full = T.placement.full_shard(row_dim=0, col_dim=1)
+by_row = T.placement.row_shard(dim=0)
+by_col = T.placement.col_shard(dim=1)
+replicated = T.placement.replicated()
+across_mesh = T.placement.mesh_as_line(dim=0)
 ```
 
-`[S(0), S(1)]` means that the mesh row axis splits tensor dimension 0 by `nrows`, while the mesh column axis splits dimension 1 by `ncols`. Row and column have physical meaning, so `[S(0), S(1)]` and `[S(1), S(0)]` are not equivalent. For matrix kernels, placement usually needs to match the algorithm dataflow: for example, distributing output rows along M and output columns along N, or using `all_gather` along K to collect the blocks needed for computation.
+`full_shard(0, 1)` means that the mesh row axis splits tensor dimension 0 by `nrows`, while the mesh column axis splits dimension 1 by `ncols`. Row and column have physical meaning, so `full_shard(0, 1)` and `full_shard(1, 0)` are not equivalent. For matrix kernels, placement usually needs to match the algorithm dataflow: for example, distributing output rows along M and output columns along N, or using `all_gather` along K to collect the blocks needed for computation.
 
-When both mesh axes shard the same tensor dimension, as in `[S(0), S(0)]`, that dimension is split by `nrows * ncols`, and a core's shard index is `row * ncols + col`. For a non-divisible shape, the local slot is rounded up and later cores can have shorter valid extents; kernels must not assume that every core has the same amount of valid data.
+`mesh_as_line(0)` treats the 2D mesh as a row-major line and splits tensor dimension 0 by `nrows * ncols`; a core's shard index is `row * ncols + col`. For a non-divisible shape, the local slot is rounded up and later cores can have shorter valid extents; kernels must not assume that every core has the same amount of valid data.
 
 ### 2.5 Layout
 
@@ -484,30 +481,23 @@ props = driver.get_sunmmio_device_properties()
 
 ### 3.2 MeshTensor, Placement, and Layout
 
-**`S` / `R` Placement**
+**`T.placement` / `PlacementSpec`**
 
 ```python
-from tilelang.language import R, S
-
-full = [S(row_dim), S(col_dim)]
-by_row = [S(dim), R()]
-by_col = [R(), S(dim)]
-replicated = [R(), R()]
+full = T.placement.full_shard(row_dim, col_dim)
+by_row = T.placement.row_shard(dim)
+by_col = T.placement.col_shard(dim)
+replicated = T.placement.replicated()
+across_mesh = T.placement.mesh_as_line(dim)
 ```
 
-A placement list can be passed directly to `T.MeshTensor`. It must contain two ordered entries corresponding to the mesh row and column axes.
+A `PlacementSpec` returned by these constructors can be passed directly to `T.MeshTensor`. `T.MeshTensor` does not accept a raw placement list.
 
-- `[S(row_dim), S(col_dim)]`: shard the specified tensor dimensions on both mesh axes.
-- `[S(dim), R()]`: shard on rows and replicate on columns.
-- `[R(), S(dim)]`: replicate on rows and shard on columns.
-- `[R(), R()]`: replicate on both axes.
-
-The `T.placement.full_shard()`, `row_shard()`, `col_shard()`, and `replicated()` convenience constructors return the same placement lists:
-
-```python
-placement = T.placement.row_shard(row_dim)
-tensor = T.MeshTensor(shape, placement, dtype)
-```
+- `full_shard(row_dim, col_dim)`: shard the specified tensor dimensions on the row and column mesh axes.
+- `row_shard(dim)`: shard on rows and replicate on columns.
+- `col_shard(dim)`: replicate on rows and shard on columns.
+- `replicated()`: replicate on both mesh axes.
+- `mesh_as_line(dim)`: linearize the 2D mesh in row-major order and shard the specified dimension across the whole mesh.
 
 `row_dim`, `col_dim`, and `dim` are zero-based tensor dimension indices. `T.MeshTensor` validates them against the tensor rank.
 
@@ -520,7 +510,7 @@ T.MeshTensor(shape, placement, device_mesh_config=None, dtype="float32", layout=
 `MeshTensor` is used at kernel function parameter positions to declare an input or output tensor distributed on the SunMMIO mesh.
 
 - `shape`: complete logical shape, such as `(M, K)`. This is the global tensor shape from the user perspective.
-- `placement`: a two-element `[row, col]` placement list describing how the global tensor is sharded or replicated across cores.
+- `placement`: a `PlacementSpec` constructed by `T.placement`, describing how the global tensor is sharded or replicated across cores.
 - `device_mesh_config`: shaped like `(nrows, ncols)`. When omitted, the target's symbolic mesh is used; it can also be set explicitly to the result of `driver.get_sunmmio_device_mesh_config()`.
 - `dtype`: element type, such as `"float16"`, `"bfloat16"`, or `"float32"`.
 - `layout`: global data layout in DRAM. When omitted, the default row-major layout is used, and the compiler infers or derives later required layouts according to access patterns and target rules. Users usually do not need to pass this parameter manually.
@@ -1019,7 +1009,6 @@ In this kernel, each core only reads the local shard in its own DRAM, performs l
 import tilelang
 import tilelang.language as T
 from tilelang.carver.arch import driver
-from tilelang.language import S
 from tilelang.layout import make_zz_layout
 
 
@@ -1038,7 +1027,7 @@ def local_shard_gemm(
     nrows, ncols = device_mesh
     ncores = nrows * ncols
 
-    placement = [S(0), S(1)]
+    placement = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
@@ -1090,7 +1079,6 @@ This kernel shows a SUMMA-style dataflow: the same row gathers left-operand bloc
 import tilelang
 import tilelang.language as T
 from tilelang.carver.arch import driver
-from tilelang.language import S
 from tilelang.layout import make_zz_layout
 
 
@@ -1109,7 +1097,7 @@ def summa_gemm(
     nrows, ncols = device_mesh
     ncores = nrows * ncols
 
-    placement = [S(0), S(1)]
+    placement = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
@@ -1165,7 +1153,6 @@ This kernel loads a bias tile with the same shape after GEMM, and uses `T.Tiles`
 import tilelang
 import tilelang.language as T
 from tilelang.carver.arch import driver
-from tilelang.language import S
 from tilelang.layout import make_zz_layout
 
 
@@ -1184,7 +1171,7 @@ def gemm_with_bias(
     nrows, ncols = device_mesh
     ncores = nrows * ncols
 
-    placement = [S(0), S(1)]
+    placement = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
