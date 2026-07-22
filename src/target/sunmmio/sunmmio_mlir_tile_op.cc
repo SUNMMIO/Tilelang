@@ -784,6 +784,25 @@ SunmmioMlirTileOp::TilePick(const std::string &result_name,
   return SunMMIOValue{dtype, result_name, result_type};
 }
 
+SunMMIOValue
+SunmmioMlirTileOp::TileSet(const std::string &result_name,
+                           const SunMMIOValue &value, const SunMMIOValue &tile,
+                           const std::vector<SunMMIOValue> &indices,
+                           const SunMMIOType &result_type, DataType dtype) {
+  mlir::Type result_mlir_type = MapMlirType(ctx_, result_type);
+  mlir::Value value_input = ctx_.LookupValue(value, "missing_tile_set_value");
+  mlir::Value tile_input = ctx_.LookupValue(tile, "missing_tile_set_src");
+  MixedIndexList mixed_indices = BuildMixedIndexList(ctx_, indices);
+  mlir::Value tile_value =
+      mlir::suvm::TileSetOp::create(
+          ctx_.builder, MapMlirLoc(ctx_), result_mlir_type, value_input,
+          tile_input, mixed_indices.dynamic_values,
+          ctx_.builder.getDenseI64ArrayAttr(mixed_indices.static_values))
+          .getResult();
+  BindRequiredResult(ctx_, result_name, tile_value, "suvm.tile.set");
+  return SunMMIOValue{dtype, result_name, result_type};
+}
+
 void SunmmioMlirTileOp::TileStore(const SunMMIOValue &value,
                                   const SunMMIOValue &tile_view,
                                   const std::optional<SunMMIOValue> &mask) {

@@ -39,15 +39,12 @@ _COL_MASK_BX = "T.int64(15)"
 
 def _expected_axis0_all_lines(buffer):
     src = "T.region(A_shared[0, 0], 1, 128, 128)"
-    return [
-        _broadcast_line_no_core(src, f"T.region({buffer}[bx * 128, 0], 2, 128, 128)", 0, _ROW_MASK_BX),
-        _broadcast_line_no_core(
-            f"T.region({buffer}[bx // 4 * 512, 0], 1, 512, 128)",
-            f"T.region({buffer}[bx // 4 * 512, 0], 2, 512, 128)",
-            1,
-            _COL_MASK_BX,
-        ),
-    ]
+    lines = [_broadcast_line_no_core(src, f"T.region({buffer}[bx * 128, 0], 2, 128, 128)", 1, _COL_MASK_BX)]
+    for row in range(4):
+        offset = "bx % 4 * 128" if row == 0 else f"bx % 4 * 128 + {row * 512}"
+        region = f"T.region({buffer}[{offset}, 0], {{access}}, 128, 128)"
+        lines.append(_broadcast_line_no_core(region.format(access=1), region.format(access=2), 0, _ROW_MASK_BX))
+    return lines
 
 
 def _expected_axis_last_horizontal_lines(buffer):
@@ -64,15 +61,12 @@ def _expected_axis_last_horizontal_lines(buffer):
 
 def _expected_axis_last_all_lines(buffer):
     src = "T.region(A_shared[0, 0], 1, 128, 128)"
-    return [
-        _broadcast_line_no_core(src, f"T.region({buffer}[0, bx * 128], 2, 128, 128)", 0, _ROW_MASK_BX),
-        _broadcast_line_no_core(
-            f"T.region({buffer}[0, bx // 4 * 512], 1, 128, 512)",
-            f"T.region({buffer}[0, bx // 4 * 512], 2, 128, 512)",
-            1,
-            _COL_MASK_BX,
-        ),
-    ]
+    lines = [_broadcast_line_no_core(src, f"T.region({buffer}[0, bx * 128], 2, 128, 128)", 1, _COL_MASK_BX)]
+    for row in range(4):
+        offset = "bx % 4 * 128" if row == 0 else f"bx % 4 * 128 + {row * 512}"
+        region = f"T.region({buffer}[0, {offset}], {{access}}, 128, 128)"
+        lines.append(_broadcast_line_no_core(region.format(access=1), region.format(access=2), 0, _ROW_MASK_BX))
+    return lines
 
 
 def _allreduce_frontend_kernel(direction="all", clear=True, dtype="float32"):
@@ -511,16 +505,14 @@ def test_comm_all_gather_lower(M, N, block_M, block_N, dtype, accum_dtype):
         _broadcast_line_no_core(
             "T.region(A_shared[0, 0], 1, 128, 128)",
             "T.region(C_shared[bx, 0, 0], 2, 1, 128, 128)",
-            0,
-            _ROW_MASK_BX,
-        ),
-        _broadcast_line_no_core(
-            "T.region(C_shared[bx // 4 * 4, 0, 0], 1, 4, 128, 128)",
-            "T.region(C_shared[bx // 4 * 4, 0, 0], 2, 4, 128, 128)",
             1,
             _COL_MASK_BX,
-        ),
+        )
     ]
+    for row in range(4):
+        slot = "bx % 4" if row == 0 else f"bx % 4 + {row * 4}"
+        region = f"T.region(C_shared[{slot}, 0, 0], {{access}}, 1, 128, 128)"
+        expected.append(_broadcast_line_no_core(region.format(access=1), region.format(access=2), 0, _ROW_MASK_BX))
 
     @T.prim_func
     def main(
