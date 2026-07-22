@@ -11,6 +11,7 @@
 #include "common/loop_fusion_utils.h"
 #include "common/remap_buffer_rewriter.h"
 #include "common/sunmmio_pipeline_utils.h"
+#include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
 #include "tir/transforms/ir_utils.h"
 #include "tvm/ir/attrs.h"
 #include "tvm/ir/expr.h"
@@ -29,6 +30,8 @@
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
+
+#include <exception>
 
 namespace tvm {
 namespace tl {
@@ -51,10 +54,11 @@ void AppendUniqueBuffer(Array<Buffer> *buffers, const Buffer &buffer) {
   }
 }
 
-Array<Buffer> DeriveRuntimeMultiversionBuffers(
-    const Optional<Any> &runtime_buffers_anno,
-    const Optional<Any> &versioned_buffers_anno,
-    const Array<Buffer> &banked_buffers, int iterations) {
+Array<Buffer>
+DeriveRuntimeMultiversionBuffers(const Optional<Any> &runtime_buffers_anno,
+                                 const Optional<Any> &versioned_buffers_anno,
+                                 const Array<Buffer> &banked_buffers,
+                                 int iterations) {
   bool enable_banked_multiversion = iterations > 2;
   if (runtime_buffers_anno) {
     return Downcast<Array<Buffer>>(runtime_buffers_anno.value());
@@ -62,7 +66,7 @@ Array<Buffer> DeriveRuntimeMultiversionBuffers(
   if (!versioned_buffers_anno) {
     Array<Buffer> runtime_buffers;
     if (enable_banked_multiversion) {
-      for (const Buffer& buffer : banked_buffers) {
+      for (const Buffer &buffer : banked_buffers) {
         AppendUniqueBuffer(&runtime_buffers, buffer);
       }
     }
@@ -80,7 +84,7 @@ Array<Buffer> DeriveRuntimeMultiversionBuffers(
     runtime_buffers.push_back(buffer);
   }
   if (enable_banked_multiversion) {
-    for (const Buffer& buffer : banked_buffers) {
+    for (const Buffer &buffer : banked_buffers) {
       if (!banked.count(buffer.get())) {
         continue;
       }
@@ -338,16 +342,16 @@ private:
                                               new_banked_buffers);
         }
         if (resident_banked_buffers_anno) {
-          Array<Buffer> resident_buffers = Downcast<Array<Buffer>>(
-              resident_banked_buffers_anno.value());
+          Array<Buffer> resident_buffers =
+              Downcast<Array<Buffer>>(resident_banked_buffers_anno.value());
           Array<Buffer> new_resident_buffers;
           for (const Buffer &buffer : resident_buffers) {
             auto it = buffer_remap_.find(buffer);
             new_resident_buffers.push_back(
                 it == buffer_remap_.end() ? buffer : (*it).second);
           }
-          loop.CopyOnWrite()->annotations.Set(
-              "runtime_resident_banked_buffers", new_resident_buffers);
+          loop.CopyOnWrite()->annotations.Set("runtime_resident_banked_buffers",
+                                              new_resident_buffers);
         }
         if (bank_start_phases_anno) {
           Map<Buffer, PrimExpr> bank_start_phases =
@@ -365,7 +369,8 @@ private:
         }
         if (bank_read_delta_parities_anno) {
           Map<Buffer, PrimExpr> bank_read_delta_parities =
-              Downcast<Map<Buffer, PrimExpr>>(bank_read_delta_parities_anno.value());
+              Downcast<Map<Buffer, PrimExpr>>(
+                  bank_read_delta_parities_anno.value());
           Map<Buffer, PrimExpr> new_bank_read_delta_parities;
           for (const auto &[buffer, parity] : bank_read_delta_parities) {
             if (buffer_remap_.count(buffer)) {
@@ -374,8 +379,8 @@ private:
               new_bank_read_delta_parities.Set(buffer, parity);
             }
           }
-          loop.CopyOnWrite()->annotations.Set("runtime_bank_read_delta_parities",
-                                              new_bank_read_delta_parities);
+          loop.CopyOnWrite()->annotations.Set(
+              "runtime_bank_read_delta_parities", new_bank_read_delta_parities);
         }
         if (bank_writer_phases_anno) {
           Map<Buffer, Map<Integer, PrimExpr>> bank_writer_phases =
@@ -615,16 +620,14 @@ private:
 
 class SunmmioILPPipelineBodyRewriter : public StmtExprMutator {
 public:
-  SunmmioILPPipelineBodyRewriter(Array<Buffer> runtime_buffers,
-                                 Array<Buffer> version_axis_buffers,
-                                 Array<Buffer> banked_buffers,
-                                 Map<Buffer, Buffer> bank_peer_buffers,
-                                 Map<Buffer, PrimExpr> bank_start_phases,
-                                 Map<Buffer, PrimExpr> bank_read_delta_parities,
-                                 Map<Buffer, Map<Integer, PrimExpr>> bank_writer_phases,
-                                 Map<Buffer, Map<Integer, PrimExpr>> bank_reader_phases,
-                                 For pipeline_loop,
-                                 int iterations) {
+  SunmmioILPPipelineBodyRewriter(
+      Array<Buffer> runtime_buffers, Array<Buffer> version_axis_buffers,
+      Array<Buffer> banked_buffers, Map<Buffer, Buffer> bank_peer_buffers,
+      Map<Buffer, PrimExpr> bank_start_phases,
+      Map<Buffer, PrimExpr> bank_read_delta_parities,
+      Map<Buffer, Map<Integer, PrimExpr>> bank_writer_phases,
+      Map<Buffer, Map<Integer, PrimExpr>> bank_reader_phases, For pipeline_loop,
+      int iterations) {
     pipeline_loop_ = std::move(pipeline_loop);
     iterations_ = iterations;
     for (const Buffer &it : runtime_buffers) {
@@ -642,30 +645,30 @@ public:
       buffer_data_to_buffer_.Set(peer->data, peer);
     }
     for (const auto &[buffer, phase] : bank_start_phases) {
-      if (const auto* imm = phase.as<IntImmNode>()) {
+      if (const auto *imm = phase.as<IntImmNode>()) {
         buffer_bank_start_phase_[buffer.get()] = imm->value;
       }
     }
     for (const auto &[buffer, parity] : bank_read_delta_parities) {
-      if (const auto* imm = parity.as<IntImmNode>()) {
+      if (const auto *imm = parity.as<IntImmNode>()) {
         buffer_read_delta_parity_[buffer.get()] = imm->value & 1;
       }
     }
     for (const auto &[buffer, per_op] : bank_writer_phases) {
-      auto& dst = buffer_writer_phase_[buffer.get()];
+      auto &dst = buffer_writer_phase_[buffer.get()];
       for (const auto &[op_id, phase] : per_op) {
-        if (const auto* op_imm = op_id.as<IntImmNode>()) {
-          if (const auto* phase_imm = phase.as<IntImmNode>()) {
+        if (const auto *op_imm = op_id.as<IntImmNode>()) {
+          if (const auto *phase_imm = phase.as<IntImmNode>()) {
             dst[op_imm->value] = phase_imm->value;
           }
         }
       }
     }
     for (const auto &[buffer, per_op] : bank_reader_phases) {
-      auto& dst = buffer_reader_phase_[buffer.get()];
+      auto &dst = buffer_reader_phase_[buffer.get()];
       for (const auto &[op_id, phase] : per_op) {
-        if (const auto* op_imm = op_id.as<IntImmNode>()) {
-          if (const auto* phase_imm = phase.as<IntImmNode>()) {
+        if (const auto *op_imm = op_id.as<IntImmNode>()) {
+          if (const auto *phase_imm = phase.as<IntImmNode>()) {
             dst[op_imm->value] = phase_imm->value;
           }
         }
@@ -696,7 +699,7 @@ public:
   void clear_current_stmt_id() { current_stmt_id_ = -1; }
 
 private:
-  int VersionAxis(const Buffer& buffer) const {
+  int VersionAxis(const Buffer &buffer) const {
     return version_axis_buffers_.count(buffer.get()) ? 0 : -1;
   }
 
@@ -704,7 +707,7 @@ private:
     return replaced_loop_var_ - pipeline_loop_->min;
   }
 
-  PrimExpr EffectiveVersionExpr(const Buffer& buffer) const {
+  PrimExpr EffectiveVersionExpr(const Buffer &buffer) const {
     if (!version_axis_buffers_.count(buffer.get())) {
       return Integer(0);
     }
@@ -725,21 +728,21 @@ private:
       arith::Analyzer analyzer;
       PrimExpr iter_offset =
           analyzer.Simplify(LogicalIterExpr() - pipeline_loop_->loop_var);
-      if (const auto* imm = iter_offset.as<IntImmNode>()) {
+      if (const auto *imm = iter_offset.as<IntImmNode>()) {
         int parity = (pipeline_loop_parity_override_ + imm->value) % 2;
         return parity < 0 ? parity + 2 : parity;
       }
     }
     arith::Analyzer analyzer;
     PrimExpr simplified = analyzer.Simplify(LogicalIterExpr());
-    if (const auto* imm = simplified.as<IntImmNode>()) {
+    if (const auto *imm = simplified.as<IntImmNode>()) {
       int parity = imm->value % 2;
       return parity < 0 ? parity + 2 : parity;
     }
     return -1;
   }
 
-  Buffer ResolveTargetBuffer(const Buffer& buffer, bool is_read = false) const {
+  Buffer ResolveTargetBuffer(const Buffer &buffer, bool is_read = false) const {
     if (!banked_buffers_.count(buffer.get())) {
       return buffer;
     }
@@ -807,7 +810,7 @@ private:
           },
           make_const(DataType::Int(32), 1), input);
     };
-    auto axis_stride = [&](const Buffer& buffer, int axis) {
+    auto axis_stride = [&](const Buffer &buffer, int axis) {
       if (!buffer->strides.empty()) {
         return buffer->strides[axis];
       }
@@ -829,7 +832,7 @@ private:
       }
       ICHECK_GT(call->args.size(), static_cast<size_t>(i + 3));
       int access_mask = 2;
-      if (const auto* imm = call->args[i + 3].as<IntImmNode>()) {
+      if (const auto *imm = call->args[i + 3].as<IntImmNode>()) {
         access_mask = imm->value;
       }
       ICHECK_NE(access_mask & 3, 0)
@@ -850,7 +853,7 @@ private:
     return Call(call->dtype, call->op, new_args, call->annotations, call->span);
   }
 
-  PrimExpr RewriteRegionExpr(const Call& call) {
+  PrimExpr RewriteRegionExpr(const Call &call) {
     RegionOp original_region(call->args);
     Buffer original_buffer = original_region->GetBuffer();
     Buffer target_buffer = original_buffer;
@@ -860,19 +863,21 @@ private:
           << "tl.region must carry a read/write access mask";
       // Region masks use 1=read, 2=write, 3=read-write.  A destination region
       // must use the per-op writer offset; treating it as a reader can map the
-      // producer and consumer of one logical value to different ping/pong banks.
+      // producer and consumer of one logical value to different ping/pong
+      // banks.
       bool is_read = (access_mask & 2) == 0;
       target_buffer = ResolveTargetBuffer(original_buffer, is_read);
     }
     Array<Range> new_ranges;
-    for (const Range& range : original_region->GetRanges()) {
-      new_ranges.push_back(Range::FromMinExtent(
-          VisitExpr(range->min), VisitExpr(range->extent)));
+    for (const Range &range : original_region->GetRanges()) {
+      new_ranges.push_back(Range::FromMinExtent(VisitExpr(range->min),
+                                                VisitExpr(range->extent)));
     }
     int version_axis = VersionAxis(original_buffer);
     if (version_axis >= 0) {
-      new_ranges.Set(version_axis,
-                     Range::FromMinExtent(EffectiveVersionExpr(original_buffer), 1));
+      new_ranges.Set(
+          version_axis,
+          Range::FromMinExtent(EffectiveVersionExpr(original_buffer), 1));
     }
     return MakeRegionExpr(target_buffer, new_ranges,
                           original_region->GetAccessMask());
@@ -899,7 +904,8 @@ private:
     if (!rewritten_buffers_.count(store->buffer.get())) {
       return store;
     }
-    Buffer target_buffer = ResolveTargetBuffer(store->buffer, /*is_read=*/false);
+    Buffer target_buffer =
+        ResolveTargetBuffer(store->buffer, /*is_read=*/false);
     Array<PrimExpr> indices = store->indices;
     int version_axis = VersionAxis(store->buffer);
     if (version_axis >= 0) {
@@ -954,8 +960,10 @@ private:
   std::unordered_map<const BufferNode *, Buffer> bank_peer_buffers_;
   std::unordered_map<const BufferNode *, int> buffer_bank_start_phase_;
   std::unordered_map<const BufferNode *, int> buffer_read_delta_parity_;
-  std::unordered_map<const BufferNode *, std::unordered_map<int, int>> buffer_writer_phase_;
-  std::unordered_map<const BufferNode *, std::unordered_map<int, int>> buffer_reader_phase_;
+  std::unordered_map<const BufferNode *, std::unordered_map<int, int>>
+      buffer_writer_phase_;
+  std::unordered_map<const BufferNode *, std::unordered_map<int, int>>
+      buffer_reader_phase_;
   Map<Var, Buffer> buffer_data_to_buffer_;
   For pipeline_loop_;
   int iterations_ = 1;
@@ -998,8 +1006,7 @@ private:
     auto runtime_buffers_anno =
         op->annotations.Get("runtime_multiversion_buffers");
     auto versioned_buffers_anno = op->annotations.Get("versioned_buffers");
-    auto banked_buffers_anno =
-        op->annotations.Get("runtime_banked_buffers");
+    auto banked_buffers_anno = op->annotations.Get("runtime_banked_buffers");
     auto bank_start_phases_anno =
         op->annotations.Get("runtime_bank_start_phases");
     auto bank_read_delta_parities_anno =
@@ -1018,6 +1025,25 @@ private:
         !prologue_orders_anno || !body_orders_anno || !epilogue_orders_anno) {
       return for_node;
     }
+
+    arith::Analyzer extent_analyzer;
+    PrimExpr simplified_extent = extent_analyzer.Simplify(for_node->extent);
+    const auto *static_extent = simplified_extent.as<IntImmNode>();
+    auto make_sequential_fallback = [&](const std::string &reason,
+                                        bool emit_warning = true) {
+      Map<String, Any> annotations;
+      for (const auto &kv : for_node->annotations) {
+        if (kv.first != "num_stages" && kv.first != "iterations" &&
+            kv.first != "prologue_orders" && kv.first != "body_orders" &&
+            kv.first != "epilogue_orders") {
+          annotations.Set(kv.first, kv.second);
+        }
+      }
+      For sequential = for_node;
+      sequential.CopyOnWrite()->annotations = annotations;
+      return MakePipelineFallback(sequential, "ilp", "inject", reason,
+                                  emit_warning);
+    };
 
     // Step 2: Find the body and buffer allocations of the pipeline. The body
     // can be direct child of the for-loop. If the for-loop has BlockRealize as
@@ -1121,6 +1147,15 @@ private:
         Downcast<Array<String>>(body_orders_anno.value());
     Array<String> epilogue_orders =
         Downcast<Array<String>>(epilogue_orders_anno.value());
+    int max_logical_iter_offset = 0;
+    for (const String &order : body_orders) {
+      max_logical_iter_offset =
+          std::max(max_logical_iter_offset, name2iter(order));
+    }
+    if (static_extent != nullptr &&
+        static_extent->value <= max_logical_iter_offset) {
+      return make_sequential_fallback("short_extent_unsupported");
+    }
     Array<Buffer> versioned_buffers =
         Downcast<Array<Buffer>>(versioned_buffers_anno.value());
     Array<Buffer> used_buffers =
@@ -1136,7 +1171,7 @@ private:
         runtime_buffers_anno, versioned_buffers_anno, banked_buffers,
         iterations);
     Array<Buffer> rewritten_buffers = runtime_buffers;
-    for (const Buffer& buffer : banked_buffers) {
+    for (const Buffer &buffer : banked_buffers) {
       AppendUniqueBuffer(&rewritten_buffers, buffer);
     }
     Map<Buffer, PrimExpr> bank_start_phases;
@@ -1146,20 +1181,18 @@ private:
     }
     Map<Buffer, PrimExpr> bank_read_delta_parities;
     if (bank_read_delta_parities_anno) {
-      bank_read_delta_parities =
-          Downcast<Map<Buffer, PrimExpr>>(bank_read_delta_parities_anno.value());
+      bank_read_delta_parities = Downcast<Map<Buffer, PrimExpr>>(
+          bank_read_delta_parities_anno.value());
     }
     Map<Buffer, Map<Integer, PrimExpr>> bank_writer_phases;
     if (bank_writer_phases_anno) {
-      bank_writer_phases =
-          Downcast<Map<Buffer, Map<Integer, PrimExpr>>>(
-              bank_writer_phases_anno.value());
+      bank_writer_phases = Downcast<Map<Buffer, Map<Integer, PrimExpr>>>(
+          bank_writer_phases_anno.value());
     }
     Map<Buffer, Map<Integer, PrimExpr>> bank_reader_phases;
     if (bank_reader_phases_anno) {
-      bank_reader_phases =
-          Downcast<Map<Buffer, Map<Integer, PrimExpr>>>(
-              bank_reader_phases_anno.value());
+      bank_reader_phases = Downcast<Map<Buffer, Map<Integer, PrimExpr>>>(
+          bank_reader_phases_anno.value());
     }
     Map<Buffer, Buffer> bank_peer_buffers;
     if (bank_peer_buffers_anno) {
@@ -1169,11 +1202,11 @@ private:
 
     auto rewriter = SunmmioILPPipelineBodyRewriter(
         rewritten_buffers, runtime_buffers, banked_buffers, bank_peer_buffers,
-        bank_start_phases, bank_read_delta_parities,
-        bank_writer_phases, bank_reader_phases, for_node, iterations);
+        bank_start_phases, bank_read_delta_parities, bank_writer_phases,
+        bank_reader_phases, for_node, iterations);
     arith::Analyzer analyzer;
     auto rewrite_stmt_with_logical_iter_parity =
-        [&](const Stmt& stmt, int stmt_id, const PrimExpr& replaced_loop_var,
+        [&](const Stmt &stmt, int stmt_id, const PrimExpr &replaced_loop_var,
             int parity) -> Stmt {
       rewriter.set_current_stmt_id(stmt_id);
       rewriter.set_loop_var_replacement(replaced_loop_var);
@@ -1188,24 +1221,8 @@ private:
       rewriter.clear_parity_overrides();
       return rewritten;
     };
-    auto rewrite_stmt_with_pipeline_loop_parity =
-        [&](const Stmt& stmt, int stmt_id, const PrimExpr& replaced_loop_var,
-            int parity) -> Stmt {
-      rewriter.set_current_stmt_id(stmt_id);
-      rewriter.set_loop_var_replacement(replaced_loop_var);
-      rewriter.clear_logical_iter_parity_override();
-      if (parity >= 0) {
-        rewriter.set_pipeline_loop_parity_override(parity);
-      } else {
-        rewriter.clear_pipeline_loop_parity_override();
-      }
-      Stmt rewritten = rewriter(stmt);
-      rewriter.clear_current_stmt_id();
-      rewriter.clear_parity_overrides();
-      return rewritten;
-    };
-    auto rewrite_stmt = [&](const Stmt& stmt, int stmt_id,
-                            const PrimExpr& replaced_loop_var) -> Stmt {
+    auto rewrite_stmt = [&](const Stmt &stmt, int stmt_id,
+                            const PrimExpr &replaced_loop_var) -> Stmt {
       if (banked_buffers.size() == 0) {
         return rewrite_stmt_with_logical_iter_parity(stmt, stmt_id,
                                                      replaced_loop_var, -1);
@@ -1218,123 +1235,118 @@ private:
                                                      replaced_loop_var, -1);
       }
 
-      Stmt even_stmt =
-          rewrite_stmt_with_logical_iter_parity(stmt, stmt_id,
-                                                replaced_loop_var, 0);
-      Stmt odd_stmt =
-          rewrite_stmt_with_logical_iter_parity(stmt, stmt_id,
-                                                replaced_loop_var, 1);
+      Stmt even_stmt = rewrite_stmt_with_logical_iter_parity(
+          stmt, stmt_id, replaced_loop_var, 0);
+      Stmt odd_stmt = rewrite_stmt_with_logical_iter_parity(
+          stmt, stmt_id, replaced_loop_var, 1);
 
-      PrimExpr is_even =
-          EQ(floormod(replaced_loop_var - for_node->min, Integer(2)),
-             Integer(0));
+      PrimExpr is_even = EQ(
+          floormod(replaced_loop_var - for_node->min, Integer(2)), Integer(0));
       return IfThenElse(is_even, even_stmt, odd_stmt);
     };
-    Array<Stmt> for_body;
-    // Step 3.1: Rewrite prologue
-    for (const auto &order_str : prologue_orders) {
-      int iter = name2iter(order_str);
-      int id = name2id(order_str);
-      Stmt stmt = pipeline_body_seq->seq[id];
-      PrimExpr replaced_loop_var = 0 + iter + for_node->min;
-      stmt = rewrite_stmt(stmt, id, replaced_loop_var);
-      for_body.push_back(stmt);
-    }
-
-    // Step 3.2: Rewrite the for body of loop.
-    Array<Stmt> body;
-    for (const auto &order_str : body_orders) {
-      int iter_offset = name2iter(order_str);
-      PrimExpr replaced_loop_var =
-          for_node->loop_var + iter_offset + for_node->min;
-      int id = name2id(order_str);
-      Stmt stmt = pipeline_body_seq->seq[id];
-      body.push_back(stmt);
-    }
-
-    if (banked_buffers.size() != 0) {
-      bool body_has_dynamic_parity = false;
-      for (const auto &order_str : body_orders) {
-        int iter_offset = name2iter(order_str);
-        PrimExpr replaced_loop_var =
-            for_node->loop_var + iter_offset + for_node->min;
-        PrimExpr logical_iter =
-            analyzer.Simplify(replaced_loop_var - for_node->min);
-        if (!logical_iter.as<IntImmNode>()) {
-          body_has_dynamic_parity = true;
-          break;
-        }
-      }
-      if (body_has_dynamic_parity) {
-        Array<Stmt> even_body;
-        Array<Stmt> odd_body;
-        for (const auto &order_str : body_orders) {
-          int iter_offset = name2iter(order_str);
-          PrimExpr replaced_loop_var =
-              for_node->loop_var + iter_offset + for_node->min;
-          int id = name2id(order_str);
-          Stmt stmt = pipeline_body_seq->seq[id];
-          even_body.push_back(
-              rewrite_stmt_with_pipeline_loop_parity(stmt, id,
-                                                     replaced_loop_var, 0));
-          odd_body.push_back(
-              rewrite_stmt_with_pipeline_loop_parity(stmt, id,
-                                                     replaced_loop_var, 1));
-        }
-        PrimExpr steady_state_is_even = EQ(floormod(for_node->loop_var, Integer(2)),
-                                           Integer(0));
-        body = {IfThenElse(steady_state_is_even, SeqStmt::Flatten(even_body),
-                           SeqStmt::Flatten(odd_body))};
-      } else {
-        Array<Stmt> rewritten_body;
-        for (const auto &order_str : body_orders) {
-          int iter_offset = name2iter(order_str);
-          PrimExpr replaced_loop_var =
-              for_node->loop_var + iter_offset + for_node->min;
-          int id = name2id(order_str);
-          Stmt stmt = pipeline_body_seq->seq[id];
-          rewritten_body.push_back(rewrite_stmt(stmt, id, replaced_loop_var));
-        }
-        body = rewritten_body;
-      }
-    } else {
-      Array<Stmt> rewritten_body;
-      for (const auto &order_str : body_orders) {
-        int iter_offset = name2iter(order_str);
-        PrimExpr replaced_loop_var =
-            for_node->loop_var + iter_offset + for_node->min;
-        int id = name2id(order_str);
-        Stmt stmt = pipeline_body_seq->seq[id];
-        rewritten_body.push_back(rewrite_stmt(stmt, id, replaced_loop_var));
-      }
-      body = rewritten_body;
-    }
-
-    // Order iteration numbers are logical offsets from the steady-state loop
-    // variable.  The largest body offset, rather than the number of ILP sample
-    // iterations or time stages, determines how many steady-state bases fit in
-    // the original loop.
-    PrimExpr extent =
+    // A ping/pong schedule has period two.  Materialize two consecutive
+    // steady-state bases in one super-iteration so every bank choice is fixed
+    // at compile time.  In particular, do not put the same async producer's
+    // consumers in runtime even/odd branches: NPU-IR requires each token to
+    // have exactly one static wait consumer.
+    PrimExpr steady_count =
         max(0, for_node->extent - steady_state_max_iter_offset);
-    For new_for_stmt =
-        For(for_node->loop_var, PrimExpr(0), extent, ForKind::kSerial,
-            SeqStmt::Flatten(body), for_node->thread_binding, {});
-    for_body.push_back(new_for_stmt);
+    PrimExpr super_count = floordiv(steady_count, Integer(2));
 
-    // Step 3.3: Rewrite the epilogue.
-    // Epilogue order offsets complete the final steady-state base.  `iterations`
-    // is only the finite window used to solve the ILP and must not shift the
-    // logical iteration selected here.
-    PrimExpr epilogue_base = max(0, extent - 1) + for_node->min;
-    for (const auto &order_str : epilogue_orders) {
-      int iter_offset = name2iter(order_str);
-      int id = name2id(order_str);
-      Stmt stmt = pipeline_body_seq->seq[id];
-      PrimExpr replaced_loop_var = epilogue_base + iter_offset;
-      stmt = rewrite_stmt(stmt, id, replaced_loop_var);
-      for_body.push_back(stmt);
+    auto rewrite_body_at_base = [&](const PrimExpr &base,
+                                    int base_parity) -> Array<Stmt> {
+      Array<Stmt> result;
+      for (const auto &order_str : body_orders) {
+        int iter_offset = name2iter(order_str);
+        int id = name2id(order_str);
+        PrimExpr replaced_loop_var = base + iter_offset + for_node->min;
+        Stmt stmt = pipeline_body_seq->seq[id];
+        int logical_iter_parity = (base_parity + iter_offset) % 2;
+        if (logical_iter_parity < 0) {
+          logical_iter_parity += 2;
+        }
+        result.push_back(rewrite_stmt_with_logical_iter_parity(
+            stmt, id, replaced_loop_var, logical_iter_parity));
+      }
+      return result;
+    };
+
+    auto build_pipeline_variant = [&](bool has_steady_tail) -> Stmt {
+      Array<Stmt> variant;
+
+      // Prologue logical iterations are constants, so their physical banks are
+      // independent of the runtime extent parity.
+      for (const auto &order_str : prologue_orders) {
+        int iter = name2iter(order_str);
+        if (iter < 0 ||
+            (static_extent != nullptr && iter >= static_extent->value)) {
+          continue;
+        }
+        int id = name2id(order_str);
+        PrimExpr replaced_loop_var = iter + for_node->min;
+        variant.push_back(
+            rewrite_stmt(pipeline_body_seq->seq[id], id, replaced_loop_var));
+      }
+
+      PrimExpr even_base = Integer(2) * for_node->loop_var;
+      Array<Stmt> super_body = rewrite_body_at_base(even_base, 0);
+      Array<Stmt> odd_body = rewrite_body_at_base(even_base + Integer(1), 1);
+      for (const Stmt &stmt : odd_body) {
+        super_body.push_back(stmt);
+      }
+      variant.push_back(For(for_node->loop_var, PrimExpr(0), super_count,
+                            ForKind::kSerial, SeqStmt::Flatten(super_body),
+                            for_node->thread_binding, {}));
+
+      // After all complete pairs, an odd steady_count leaves base
+      // 2*super_count.  Its parity is always even.
+      if (has_steady_tail) {
+        Array<Stmt> tail_body =
+            rewrite_body_at_base(Integer(2) * super_count, 0);
+        for (const Stmt &stmt : tail_body) {
+          variant.push_back(stmt);
+        }
+      }
+
+      // The epilogue completes the last steady-state base.  Its base parity is
+      // even when steady_count is odd, and odd when steady_count is even.
+      PrimExpr epilogue_base = steady_count - Integer(1);
+      int epilogue_base_parity = has_steady_tail ? 0 : 1;
+      for (const auto &order_str : epilogue_orders) {
+        int iter_offset = name2iter(order_str);
+        int id = name2id(order_str);
+        PrimExpr replaced_loop_var =
+            epilogue_base + iter_offset + for_node->min;
+        int logical_iter_parity = (epilogue_base_parity + iter_offset) % 2;
+        if (logical_iter_parity < 0) {
+          logical_iter_parity += 2;
+        }
+        variant.push_back(rewrite_stmt_with_logical_iter_parity(
+            pipeline_body_seq->seq[id], id, replaced_loop_var,
+            logical_iter_parity));
+      }
+      return SeqStmt::Flatten(variant);
+    };
+
+    if (static_extent != nullptr) {
+      int steady_count_value =
+          static_extent->value - steady_state_max_iter_offset;
+      ICHECK_GT(steady_count_value, 0);
+      return build_pipeline_variant((steady_count_value % 2) != 0);
     }
-    return SeqStmt::Flatten(for_body);
+
+    // Specialize the complete pipeline, including its producers, by the
+    // runtime tail parity.  This outer dispatch keeps token ownership within a
+    // single branch.  Short extents take the untouched sequential loop.
+    Stmt even_variant = build_pipeline_variant(false);
+    Stmt odd_variant = build_pipeline_variant(true);
+    PrimExpr has_even_steady_count =
+        EQ(floormod(steady_count, Integer(2)), Integer(0));
+    Stmt injected =
+        IfThenElse(has_even_steady_count, even_variant, odd_variant);
+    Stmt sequential = make_sequential_fallback("runtime_short_extent", false);
+    return IfThenElse(GT(for_node->extent, Integer(max_logical_iter_offset)),
+                      injected, sequential);
   }
 
   Map<Var, Buffer> buffer_data_to_buffer_;
@@ -1343,19 +1355,20 @@ private:
 };
 
 class ResidentPingPongInitializer : public StmtMutator {
- public:
-  static Stmt Substitute(const Stmt& body) {
+public:
+  static Stmt Substitute(const Stmt &body) {
     ResidentPingPongInitializer rewriter;
-    PostOrderVisit(body, [&](const ObjectRef& node) {
-      const auto* loop = node.as<ForNode>();
-      if (loop == nullptr) return;
+    PostOrderVisit(body, [&](const ObjectRef &node) {
+      const auto *loop = node.as<ForNode>();
+      if (loop == nullptr)
+        return;
       auto residents = loop->annotations.Get("runtime_resident_banked_buffers");
       auto peers = loop->annotations.Get("runtime_bank_peer_buffers");
-      if (!residents || !peers) return;
+      if (!residents || !peers)
+        return;
       Map<Buffer, Buffer> peer_map =
           Downcast<Map<Buffer, Buffer>>(peers.value());
-      for (const Buffer& buffer :
-           Downcast<Array<Buffer>>(residents.value())) {
+      for (const Buffer &buffer : Downcast<Array<Buffer>>(residents.value())) {
         auto it = peer_map.find(buffer);
         ICHECK(it != peer_map.end())
             << "Resident banked buffer " << buffer->name
@@ -1364,30 +1377,31 @@ class ResidentPingPongInitializer : public StmtMutator {
         rewriter.peer_remap_.Set(buffer, (*it).second);
       }
     });
-    if (rewriter.peer_remap_.empty()) return body;
+    if (rewriter.peer_remap_.empty())
+      return body;
     return rewriter(body);
   }
 
- private:
-  bool WritesResidentBuffer(const Stmt& stmt) const {
+private:
+  bool WritesResidentBuffer(const Stmt &stmt) const {
     bool writes = false;
-    PostOrderVisit(stmt, [&](const ObjectRef& node) {
-      if (const auto* store = node.as<BufferStoreNode>()) {
+    PostOrderVisit(stmt, [&](const ObjectRef &node) {
+      if (const auto *store = node.as<BufferStoreNode>()) {
         writes = writes || resident_buffers_.count(store->buffer.get());
         return;
       }
-      const auto* call = node.as<CallNode>();
-      if (call == nullptr || !call->op.same_as(RegionOp::Get())) return;
+      const auto *call = node.as<CallNode>();
+      if (call == nullptr || !call->op.same_as(RegionOp::Get()))
+        return;
       RegionOp region(call->args);
       if ((region->GetAccessMask() & 2) != 0) {
-        writes = writes ||
-                 resident_buffers_.count(region->GetBuffer().get());
+        writes = writes || resident_buffers_.count(region->GetBuffer().get());
       }
     });
     return writes;
   }
 
-  Stmt VisitStmt_(const ForNode* op) final {
+  Stmt VisitStmt_(const ForNode *op) final {
     if (op->annotations.count("runtime_resident_banked_buffers")) {
       ++pipeline_depth_;
       Stmt result = StmtMutator::VisitStmt_(op);
@@ -1397,34 +1411,55 @@ class ResidentPingPongInitializer : public StmtMutator {
     return StmtMutator::VisitStmt_(op);
   }
 
-  Stmt VisitStmt_(const SeqStmtNode* op) final {
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
     Array<Stmt> rewritten;
-    for (const Stmt& original : op->seq) {
+    for (const Stmt &original : op->seq) {
       Stmt stmt = VisitStmt(original);
       rewritten.push_back(stmt);
       if (pipeline_depth_ == 0 && !stmt.as<ForNode>() &&
           WritesResidentBuffer(stmt)) {
-        rewritten.push_back(
-            RemapBufferRewriter::Substitute(stmt, peer_remap_));
+        rewritten.push_back(RemapBufferRewriter::Substitute(stmt, peer_remap_));
       }
     }
     return SeqStmt::Flatten(rewritten);
   }
 
   int pipeline_depth_{0};
-  std::unordered_set<const BufferNode*> resident_buffers_;
+  std::unordered_set<const BufferNode *> resident_buffers_;
   Map<Buffer, Buffer> peer_remap_;
 };
 
 tvm::transform::Pass InjectSunmmioPipelineILP() {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
-    auto *fptr = f.CopyOnWrite();
-    fptr->body = SunmmioILPMultiVersionBufferRewriter::Substitute(f);
-    fptr->body = ResidentPingPongInitializer::Substitute(fptr->body);
-    fptr->body = SunmmioILPPipelineInjector::Inject(f);
-    fptr->body = ConvertSSA(std::move(fptr->body));
-    return f;
+    PrimFunc original = f;
+    try {
+      PrimFunc candidate = f;
+      auto *fptr = candidate.CopyOnWrite();
+      fptr->body = SunmmioILPMultiVersionBufferRewriter::Substitute(candidate);
+      fptr->body = ResidentPingPongInitializer::Substitute(fptr->body);
+      fptr->body = SunmmioILPPipelineInjector::Inject(candidate);
+      fptr->body = ConvertSSA(std::move(fptr->body));
+      Optional<String> disallowed =
+          PipelineFallbackValidator::FindDisallowed(fptr->body);
+      if (disallowed) {
+        return MakePipelineFunctionFallback(
+            original, PipelineDiagnostic{false, "ilp", "inject_validation",
+                                         "candidate_fallback",
+                                         std::string(disallowed.value())});
+      }
+      return candidate;
+    } catch (const std::exception &error) {
+      return MakePipelineFunctionFallback(
+          original,
+          PipelineDiagnostic{false, "ilp", "inject_exception",
+                             "candidate_rewrite_failed", error.what()});
+    } catch (...) {
+      return MakePipelineFunctionFallback(
+          original,
+          PipelineDiagnostic{false, "ilp", "inject_exception",
+                             "candidate_rewrite_failed", "unknown exception"});
+    }
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectSunmmioPipelineILP", {});
 }

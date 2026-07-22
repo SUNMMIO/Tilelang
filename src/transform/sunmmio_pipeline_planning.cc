@@ -18,6 +18,7 @@
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
 #include "../target/sunmmio_utils.h"
+#include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
 #include "sunmmio_pipeline_planning/stmt_read_write_collector.h"
 
 #include <algorithm>
@@ -206,6 +207,28 @@ struct LocalDependencyEdge {
   int distance{0};
 };
 
+enum class SemanticDependencyKind { kRAW, kWAR, kWAW };
+
+struct SemanticDependencyEdge {
+  int source_instruction_id{-1};
+  int target_instruction_id{-1};
+  const BufferNode *buffer{nullptr};
+  int distance{0};
+  SemanticDependencyKind kind{SemanticDependencyKind::kRAW};
+};
+
+static const char *SemanticDependencyKindName(SemanticDependencyKind kind) {
+  switch (kind) {
+  case SemanticDependencyKind::kRAW:
+    return "RAW";
+  case SemanticDependencyKind::kWAR:
+    return "WAR";
+  case SemanticDependencyKind::kWAW:
+    return "WAW";
+  }
+  return "unknown";
+}
+
 /**
  * \brief Aggregated access information for one logical buffer in the local DDG.
  */
@@ -229,6 +252,7 @@ struct BufferAccessInfo {
  */
 struct LocalDDG {
   std::vector<LocalDependencyEdge> edges;
+  std::vector<SemanticDependencyEdge> semantic_edges;
   std::vector<std::vector<int>> forward_predecessors;
   std::vector<std::vector<int>> forward_successors;
   std::vector<std::vector<int>> backward_predecessors;
@@ -439,9 +463,239 @@ public:
       }
     }
 
+    std::set<
+        std::tuple<int, int, const BufferNode *, int, SemanticDependencyKind>>
+        semantic_unique;
+    auto add_semantic = [&](int source, int target, const BufferNode *buffer,
+                            int distance, SemanticDependencyKind kind) {
+      auto key = std::make_tuple(source, target, buffer, distance, kind);
+      if (semantic_unique.insert(key).second) {
+        ddg.semantic_edges.push_back({source, target, buffer, distance, kind});
+      }
+    };
+    for (const LocalDependencyEdge &edge : ddg.edges) {
+      add_semantic(edge.producer_instruction_id, edge.consumer_instruction_id,
+                   edge.buffer, edge.distance, SemanticDependencyKind::kRAW);
+    }
+    for (const BufferNode *buffer : ddg.buffer_order) {
+      const BufferAccessInfo &info = ddg.buffer_access_infos.at(buffer);
+      for (int reader : info.read_instruction_indices) {
+        for (int writer : info.write_instruction_indices) {
+          if (reader < writer) {
+            add_semantic(reader, writer, buffer, 0,
+                         SemanticDependencyKind::kWAR);
+          }
+        }
+      }
+      for (size_t i = 0; i < info.write_instruction_indices.size(); ++i) {
+        for (size_t j = i + 1; j < info.write_instruction_indices.size(); ++j) {
+          add_semantic(info.write_instruction_indices[i],
+                       info.write_instruction_indices[j], buffer, 0,
+                       SemanticDependencyKind::kWAW);
+        }
+      }
+      if (!info.read_instruction_indices.empty() &&
+          !info.write_instruction_indices.empty()) {
+        add_semantic(info.read_instruction_indices.back(),
+                     info.write_instruction_indices.front(), buffer, 1,
+                     SemanticDependencyKind::kWAR);
+        if (info.write_instruction_indices.size() > 1) {
+          add_semantic(info.write_instruction_indices.back(),
+                       info.write_instruction_indices.front(), buffer, 1,
+                       SemanticDependencyKind::kWAW);
+        }
+      }
+    }
+
     return ddg;
   }
 };
+
+static bool
+ValidateLocalDDG(const std::vector<PipelineInstruction> &instructions,
+                 const LocalDDG &ddg) {
+  const int instruction_count = static_cast<int>(instructions.size());
+  std::set<std::pair<int, const BufferNode *>> reads_with_producer;
+  for (const LocalDependencyEdge &edge : ddg.edges) {
+    if (edge.producer_instruction_id < 0 ||
+        edge.producer_instruction_id >= instruction_count ||
+        edge.consumer_instruction_id < 0 ||
+        edge.consumer_instruction_id >= instruction_count ||
+        edge.buffer == nullptr || edge.distance < 0) {
+      return false;
+    }
+    reads_with_producer.insert({edge.consumer_instruction_id, edge.buffer});
+  }
+  for (const SemanticDependencyEdge &edge : ddg.semantic_edges) {
+    if (edge.source_instruction_id < 0 ||
+        edge.source_instruction_id >= instruction_count ||
+        edge.target_instruction_id < 0 ||
+        edge.target_instruction_id >= instruction_count ||
+        edge.buffer == nullptr || edge.distance < 0) {
+      return false;
+    }
+  }
+  for (int id = 0; id < instruction_count; ++id) {
+    for (const BufferRegion &read : instructions[id].reads) {
+      if (IsGlobalBuffer(read->buffer)) {
+        continue;
+      }
+      auto access_it = ddg.buffer_access_infos.find(read->buffer.get());
+      if (access_it == ddg.buffer_access_infos.end() ||
+          access_it->second.write_instruction_indices.empty()) {
+        continue;
+      }
+      if (!reads_with_producer.count({id, read->buffer.get()})) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static void MaybeWriteGreedyGraphJson(
+    const std::vector<PipelineInstruction> &instructions, const LocalDDG &ddg,
+    const std::unordered_set<const BufferNode *> &versioned_buffers) {
+  const char *path = std::getenv("TL_SUNMMIO_PIPELINE_GRAPH_JSON");
+  if (path == nullptr || path[0] == '\0') {
+    return;
+  }
+  std::ofstream out(path);
+  if (!out.is_open()) {
+    LOG(WARNING) << "Cannot write pipeline graph JSON to " << path;
+    return;
+  }
+  out << "{\n  \"mode\": \"greedy\",\n  \"commands\": [\n";
+  for (size_t i = 0; i < instructions.size(); ++i) {
+    const PipelineInstruction &instruction = instructions[i];
+    out << "    {\"id\": " << instruction.id
+        << ", \"iteration_offset\": 0, \"hardware\": "
+        << static_cast<int>(instruction.device_type) << ", \"reads\": [";
+    for (size_t j = 0; j < instruction.reads.size(); ++j) {
+      if (j != 0)
+        out << ", ";
+      out << "\"" << instruction.reads[j]->buffer->name << "\"";
+    }
+    out << "], \"writes\": [";
+    for (size_t j = 0; j < instruction.writes.size(); ++j) {
+      if (j != 0)
+        out << ", ";
+      out << "\"" << instruction.writes[j]->buffer->name << "\"";
+    }
+    out << "]}" << (i + 1 == instructions.size() ? "\n" : ",\n");
+  }
+  out << "  ],\n  \"edges\": [\n";
+  for (size_t i = 0; i < ddg.semantic_edges.size(); ++i) {
+    const SemanticDependencyEdge &edge = ddg.semantic_edges[i];
+    out << "    {\"source\": " << edge.source_instruction_id
+        << ", \"target\": " << edge.target_instruction_id << ", \"buffer\": \""
+        << edge.buffer->name << "\", \"distance\": " << edge.distance
+        << ", \"kind\": \"" << SemanticDependencyKindName(edge.kind) << "\"}"
+        << (i + 1 == ddg.semantic_edges.size() ? "\n" : ",\n");
+  }
+  out << "  ],\n  \"buffers\": [\n";
+  for (size_t i = 0; i < ddg.buffer_order.size(); ++i) {
+    const BufferNode *buffer = ddg.buffer_order[i];
+    const BufferAccessInfo &access = ddg.buffer_access_infos.at(buffer);
+    out << "    {\"name\": \"" << buffer->name
+        << "\", \"global\": " << (access.is_global ? "true" : "false")
+        << ", \"loop_carried\": "
+        << (access.HasLoopCarriedDependence() ? "true" : "false")
+        << ", \"versioned\": "
+        << (versioned_buffers.count(buffer) ? "true" : "false")
+        << ", \"banked\": "
+        << (IsRuntimeBankedBuffer(buffer) ? "true" : "false")
+        << ", \"classification\": \""
+        << (access.is_global
+                ? "global"
+                : (access.HasLoopCarriedDependence() ? "loop_carried"
+                                                     : "local"))
+        << "\"}" << (i + 1 == ddg.buffer_order.size() ? "\n" : ",\n");
+  }
+  out << "  ]\n}\n";
+}
+
+static bool
+VerifyScheduledWindow(const std::vector<PipelineInstruction> &expected,
+                      const std::vector<PipelineInstruction> &scheduled,
+                      int command_count) {
+  if (expected.size() != scheduled.size())
+    return false;
+  std::multiset<std::pair<int, int>> expected_instances;
+  std::multiset<std::pair<int, int>> scheduled_instances;
+  for (const PipelineInstruction &instruction : expected) {
+    if (instruction.id < 0 || instruction.id >= command_count ||
+        instruction.iter < 0)
+      return false;
+    expected_instances.insert({instruction.iter, instruction.id});
+  }
+  for (const PipelineInstruction &instruction : scheduled) {
+    if (instruction.id < 0 || instruction.id >= command_count ||
+        instruction.iter < 0)
+      return false;
+    scheduled_instances.insert({instruction.iter, instruction.id});
+  }
+  return expected_instances == scheduled_instances;
+}
+
+static bool
+VerifyGreedySchedule(const std::vector<PipelineInstruction> &expected_prologue,
+                     const std::vector<PipelineInstruction> &expected_body,
+                     const std::vector<PipelineInstruction> &expected_epilogue,
+                     const std::vector<PipelineInstruction> &prologue,
+                     const std::vector<PipelineInstruction> &body,
+                     const std::vector<PipelineInstruction> &epilogue,
+                     bool has_epilogue, int command_count) {
+  if (!VerifyScheduledWindow(expected_prologue, prologue, command_count) ||
+      !VerifyScheduledWindow(expected_body, body, command_count)) {
+    return false;
+  }
+  return !has_epilogue ||
+         VerifyScheduledWindow(expected_epilogue, epilogue, command_count);
+}
+
+static bool VerifyDynamicLogicalCoverage(
+    int extent, int iterations, int command_count,
+    const std::vector<PipelineInstruction> &prologue,
+    const std::vector<PipelineInstruction> &body,
+    const std::map<int, std::vector<PipelineInstruction>> &epilogues) {
+  std::map<std::pair<int, int>, int> counts;
+  auto record = [&](int base, const std::vector<PipelineInstruction> &window,
+                    bool predicate_invalid) {
+    for (const PipelineInstruction &instruction : window) {
+      int logical_iter = base + instruction.iter;
+      if (instruction.id < 0 || instruction.id >= command_count) {
+        return false;
+      }
+      if (logical_iter < 0 || logical_iter >= extent) {
+        if (predicate_invalid)
+          continue;
+        return false;
+      }
+      counts[{logical_iter, instruction.id}] += 1;
+    }
+    return true;
+  };
+  if (!record(0, prologue, false))
+    return false;
+  int steady_groups = std::max(0, (extent - 1) / iterations);
+  for (int group = 0; group < steady_groups; ++group) {
+    if (!record(group * iterations, body, false))
+      return false;
+  }
+  auto epilogue_it = epilogues.find(0);
+  if (epilogue_it == epilogues.end() ||
+      !record(steady_groups * iterations, epilogue_it->second, true)) {
+    return false;
+  }
+  for (int logical_iter = 0; logical_iter < extent; ++logical_iter) {
+    for (int command = 0; command < command_count; ++command) {
+      if (counts[{logical_iter, command}] != 1)
+        return false;
+    }
+  }
+  return true;
+}
 
 /**
  * \brief Identify the prefetch instruction set on top of the local DDG.
@@ -1352,10 +1606,19 @@ public:
     }
     arith::Analyzer analyzer;
     PrimExpr simplified_extent = analyzer.Simplify(op->extent);
-    if (const auto *extent = simplified_extent.as<IntImmNode>()) {
-      if (extent->value < num_stages) {
-        return StmtExprMutator::VisitStmt_(op);
-      }
+    const auto *extent = simplified_extent.as<IntImmNode>();
+    if (extent != nullptr && extent->value < num_stages) {
+      For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+      return MakePipelineFallback(fallback, "greedy", "planning",
+                                  "short_extent_unsupported");
+    }
+    if (extent == nullptr && num_stages != 2) {
+      For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+      return MakePipelineFallback(
+          fallback,
+          PipelineDiagnostic{false, "greedy", "planning",
+                             "dynamic_version_count_unsupported",
+                             "dynamic Greedy currently requires num_stages=2"});
     }
 
     // 2. Peel off the outer layers to find the true body sequence
@@ -1381,8 +1644,17 @@ public:
     std::vector<PipelineInstruction> single_iteration_instructions;
 
     for (size_t i = 0; i < pipeline_body_seq->seq.size(); ++i) {
-      PipelineInstruction instruction(static_cast<int>(i), 0,
-                                      pipeline_body_seq->seq[i]);
+      const Stmt &stmt = pipeline_body_seq->seq[i];
+      if (!stmt.as<BlockRealizeNode>() && !stmt.as<EvaluateNode>() &&
+          !stmt.as<ForNode>()) {
+        // HardwareMapper intentionally handles hardware commands only. Scalar
+        // bookkeeping stores and conditional command groups must first be
+        // normalized before they can be scheduled safely.
+        For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+        return MakePipelineFallback(fallback, "greedy", "planning",
+                                    "unsupported_statement");
+      }
+      PipelineInstruction instruction(static_cast<int>(i), 0, stmt);
       instruction.device_type = HardwareMapper::Map(instruction.stmt);
       instruction.ExtractRegions(stmt_rw_collector_);
       instruction.delay =
@@ -1406,6 +1678,11 @@ public:
 
     // 4. Stage 2.1: Build the local DDG for a single iteration.
     LocalDDG local_ddg = LocalDDGBuilder::Build(single_iteration_instructions);
+    if (!ValidateLocalDDG(single_iteration_instructions, local_ddg)) {
+      For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+      return MakePipelineFallback(fallback, "greedy", "graph_validation",
+                                  "incomplete_access_info");
+    }
 
     if (debug_) {
       int forward_edge_count = 0;
@@ -1457,6 +1734,8 @@ public:
     std::unordered_set<const BufferNode *> versioned_buffers =
         MultiversioningIdentifier::Identify(single_iteration_instructions,
                                             local_ddg);
+    MaybeWriteGreedyGraphJson(single_iteration_instructions, local_ddg,
+                              versioned_buffers);
 
     if (debug_) {
       std::cout << "[Pipeline Planner] Identified " << versioned_buffers.size()
@@ -1555,6 +1834,7 @@ public:
         body_scheduler.Schedule("body.log");
 
     std::vector<PipelineInstruction> epilogue_schedule;
+    std::map<int, std::vector<PipelineInstruction>> dynamic_epilogue_schedules;
     if (stage_assembly.epilogue_iterations != -1) {
       GlobalPipelineScheduler epilogue_scheduler;
       epilogue_scheduler.instructions = stage_assembly.epilogue_instructions;
@@ -1565,6 +1845,71 @@ public:
       epilogue_scheduler.BuildDependencyGraph();
       epilogue_scheduler.CalculateBottomLevels();
       epilogue_schedule = epilogue_scheduler.Schedule("epilogue.log");
+    } else {
+      for (int remainder = 0; remainder < stage_assembly.iterations;
+           ++remainder) {
+        int effective_remainder =
+            remainder == 0 ? stage_assembly.iterations : remainder;
+        PipelineStageAssembly remainder_assembly =
+            PipelineWindowAssembler::Assemble(single_iteration_instructions,
+                                              num_stages,
+                                              Integer(effective_remainder));
+        GlobalPipelineScheduler epilogue_scheduler;
+        epilogue_scheduler.instructions =
+            remainder_assembly.epilogue_instructions;
+        epilogue_scheduler.iter_mod_ = stage_assembly.iterations;
+        epilogue_scheduler.SetVersionedBuffers(versioned_buffers);
+        epilogue_scheduler.SetBankColoring(selected_coloring);
+        epilogue_scheduler.BuildDependencyGraph();
+        epilogue_scheduler.CalculateBottomLevels();
+        dynamic_epilogue_schedules[remainder] = epilogue_scheduler.Schedule("");
+        if (!VerifyScheduledWindow(
+                remainder_assembly.epilogue_instructions,
+                dynamic_epilogue_schedules[remainder],
+                static_cast<int>(single_iteration_instructions.size()))) {
+          For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+          return MakePipelineFallback(
+              fallback,
+              PipelineDiagnostic{false, "greedy", "schedule_validation",
+                                 "invalid_schedule_order",
+                                 "dynamic epilogue remainder " +
+                                     std::to_string(remainder)});
+        }
+      }
+    }
+
+    if (!VerifyGreedySchedule(
+            stage_assembly.prologue_instructions,
+            stage_assembly.body_instructions,
+            stage_assembly.epilogue_instructions, prologue_schedule,
+            body_schedule, epilogue_schedule,
+            stage_assembly.epilogue_iterations != -1,
+            static_cast<int>(single_iteration_instructions.size()))) {
+      For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+      return MakePipelineFallback(
+          fallback,
+          PipelineDiagnostic{false, "greedy", "schedule_validation",
+                             "invalid_schedule_order",
+                             "scheduled window does not match assembled "
+                             "logical command instances"});
+    }
+    if (stage_assembly.epilogue_iterations == -1) {
+      int verification_extent = std::max(4, stage_assembly.iterations * 2 + 2);
+      for (int extent_value = 1; extent_value <= verification_extent;
+           ++extent_value) {
+        if (!VerifyDynamicLogicalCoverage(
+                extent_value, stage_assembly.iterations,
+                static_cast<int>(single_iteration_instructions.size()),
+                prologue_schedule, body_schedule, dynamic_epilogue_schedules)) {
+          For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+          return MakePipelineFallback(
+              fallback,
+              PipelineDiagnostic{false, "greedy", "schedule_validation",
+                                 "logical_iteration_out_of_bounds",
+                                 "coverage failed for representative extent " +
+                                     std::to_string(extent_value)});
+        }
+      }
     }
 
     if (debug_) {
@@ -1582,6 +1927,7 @@ public:
       }
     }
     annotations.Set("iterations", stage_assembly.iterations);
+    SetPipelineAppliedAnnotations(&annotations, "greedy");
     annotations.Set("coloring_total_candidates",
                     Integer(total_coloring_candidates));
     annotations.Set("coloring_evaluated_candidates",
@@ -1627,6 +1973,16 @@ public:
         orders.push_back(instruction.name);
       }
       annotations.Set("epilogue_orders", orders);
+    } else {
+      Map<Integer, Array<String>> dynamic_orders;
+      for (const auto &[remainder, schedule] : dynamic_epilogue_schedules) {
+        Array<String> remainder_orders;
+        for (const PipelineInstruction &instruction : schedule) {
+          remainder_orders.push_back(instruction.name);
+        }
+        dynamic_orders.Set(Integer(remainder), remainder_orders);
+      }
+      annotations.Set("dynamic_epilogue_orders", dynamic_orders);
     }
 
     Array<Buffer> used_buffers;

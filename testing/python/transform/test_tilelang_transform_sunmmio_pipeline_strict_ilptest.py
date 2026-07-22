@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from testing.python.transform.sunmmio_mesh_kernel_new_syntax_reference import (
     mesh_matmul_new,
 )
 from tvm import tir
+from tvm.tir.stmt_functor import ir_transform
 
 _get_logical_shape = tvm.ffi.get_global_func("tl.CuteLayout_logical_shape")
 
@@ -247,6 +249,19 @@ def _normalize_runtime_stmt(script):
     text = " ".join(script.split())
     for token in ("_ping", "_pong"):
         text = text.replace(token, "")
+    # KV_shared2 uses a leading runtime lifetime-version axis in addition to
+    # its physical ping/pong bank.  Remove only that axis when comparing the
+    # injected statement with the original two-dimensional command.
+    text = re.sub(
+        r"KV_shared2\[[^,\]]+, ([^,\]]+), ([^\]]+)\]",
+        r"KV_shared2[\1, \2]",
+        text,
+    )
+    text = re.sub(
+        r"(T\.region\(KV_shared2\[[^\]]+\], [12]), 1, ",
+        r"\1, ",
+        text,
+    )
     return _semantic_tail(text)
 
 
@@ -282,6 +297,7 @@ def _apply_iter_offset(text, iter_offset):
         text = text.replace(f"k * {step}", f"{iter_expr} * {step}")
         text = text.replace(f"(k + 1) * {step}", f"(__iter__ + 1) * {step}")
         text = text.replace(f"(k + 2) * {step}", f"(__iter__ + 2) * {step}")
+        text = text.replace(f"T.Mul({iter_offset}, {step})", f"{iter_expr} * {step}")
         text = text.replace(f"T.Mul(0, {step})", f"__iter__ * {step}")
     return text
 
@@ -292,6 +308,18 @@ def _runtime_stmt_matches_order(runtime_script, planned_stmt, iter_kind, iter_of
         iter_offset,
     )
     runtime_script = _normalize_runtime_stmt(runtime_script)
+    if iter_kind in ("steady-even", "steady-odd"):
+        base_shift = 0 if iter_kind == "steady-even" else 1
+        # Normalize the statically unrolled ping/pong super-iteration back to
+        # the logical base used by the planned statement.
+        for total_offset in range(8, 0, -1):
+            logical_offset = total_offset - base_shift
+            if logical_offset < 0:
+                continue
+            replacement = "__iter__" if logical_offset == 0 else f"(__iter__ + {logical_offset})"
+            runtime_script = runtime_script.replace("2 * k" + " + 1" * total_offset, replacement)
+        runtime_script = runtime_script.replace("2 * k", "__iter__")
+        runtime_script = re.sub(r"\(\((__iter__ \+ [0-9]+)\)\)", r"(\1)", runtime_script)
     runtime_script = _apply_iter_offset(runtime_script, iter_offset)
     return planned_script in runtime_script
 
@@ -331,10 +359,8 @@ def _find_steady_loop_parent(node):
     if isinstance(node, tir.SeqStmt):
         for idx, stmt in enumerate(node.seq):
             if isinstance(stmt, tir.For) and stmt.loop_var.name == "k":
-                body = stmt.body
-                if isinstance(body, tir.SeqStmt) and len(body.seq) == 1 and isinstance(body.seq[0], tir.IfThenElse):
-                    return node, idx, stmt, body.seq[0]
-                if isinstance(body, tir.IfThenElse):
+                body = _unwrap_seq(stmt.body)
+                if body is not None:
                     return node, idx, stmt, body
             found = _find_steady_loop_parent(stmt)
             if found is not None:
@@ -376,16 +402,16 @@ def _check_order_mapping(planned, injected):
 
     injected_found = _find_steady_loop_parent(injected["main"].body)
     assert injected_found is not None
-    steady_parent, steady_idx, steady_loop, steady_if = injected_found
+    steady_parent, steady_idx, steady_loop, steady_body = injected_found
 
     prologue_scripts = [_stmt_script(steady_parent.seq[i]) for i in range(steady_idx)]
     _find_ordered_matches(prologue_scripts, annotations["prologue_orders"], planned_body, "prologue")
 
-    then_scripts = _steady_branch_scripts(steady_if.then_case)
-    else_scripts = _steady_branch_scripts(steady_if.else_case)
     body_orders = [str(v) for v in annotations["body_orders"]]
-    _find_ordered_matches(then_scripts, body_orders, planned_body, "steady")
-    _find_ordered_matches(else_scripts, body_orders, planned_body, "steady")
+    steady_scripts = [_stmt_script(stmt) for stmt in steady_body.seq]
+    assert len(steady_scripts) == 2 * len(body_orders)
+    _find_ordered_matches(steady_scripts[: len(body_orders)], body_orders, planned_body, "steady-even")
+    _find_ordered_matches(steady_scripts[len(body_orders) :], body_orders, planned_body, "steady-odd")
 
     epilogue_scripts = [_stmt_script(stmt) for stmt in steady_parent.seq[steady_idx + 1 :]]
     _find_ordered_matches(epilogue_scripts, annotations["epilogue_orders"], planned_body, "steady")
@@ -517,8 +543,8 @@ STRICT_CASES = [
         {
             "KV_shared_ping": [64, 512],
             "KV_shared_pong": [64, 512],
-            "KV_shared2_ping": [64, 512],
-            "KV_shared2_pong": [64, 512],
+            "KV_shared2_ping": [3, 64, 512],
+            "KV_shared2_pong": [3, 64, 512],
             "K_pe_shared_ping": [64, 64],
             "K_pe_shared_pong": [64, 64],
             "S_shared_ping": [64, 64],
@@ -548,7 +574,8 @@ def test_tilelang_transform_sunmmio_pipeline_strict_ilptest(
 
     annotations = _extract_pipeline_annotations(planned["main"].body)
     assert annotations is not None, case_name
-    assert _annotation_buffer_names(annotations, "runtime_multiversion_buffers") == [], case_name
+    expected_runtime_multiversion = ["KV_shared2"] if case_name == "flashmladecode2" else []
+    assert _annotation_buffer_names(annotations, "runtime_multiversion_buffers") == expected_runtime_multiversion, case_name
     assert len(_annotation_buffer_names(annotations, "runtime_banked_buffers")) > 0, case_name
 
     _check_order_mapping(planned, injected)
@@ -596,15 +623,79 @@ def test_per_op_phase_offsets_select_matching_region_banks():
 
         injected = tl.transform.InjectSunmmioPipelineILP()(planned)
         script = injected.script(show_meta=True)
-        steady_branches = script.split("if k % 2 == 0:", 1)[1]
-        even_branch, odd_branch = steady_branches.split("else:", 1)
+        assert "if k % 2 == 0:" not in script
+        injected_found = _find_steady_loop_parent(injected["main"].body)
+        assert injected_found is not None
+        _, _, _, steady_body = injected_found
+        body_order_count = len(annotations["body_orders"])
+        assert len(steady_body.seq) == 2 * body_order_count
+        even_branch = "\n".join(_stmt_script(stmt) for stmt in steady_body.seq[:body_order_count])
+        odd_branch = "\n".join(_stmt_script(stmt) for stmt in steady_body.seq[body_order_count:])
 
-        # op4 writes and op5 reads phase offset 1 for logical iteration k.
-        assert "T.region(A_shared_pong[0, 0], 2, 128, 32), 1024" in even_branch
-        assert "T.region(A_shared_pong[0, 0], 1, 128, 32)" in even_branch
-        assert "T.region(A_shared_ping[0, 0], 2, 128, 32), 1024" in odd_branch
-        assert "T.region(A_shared_ping[0, 0], 1, 128, 32)" in odd_branch
+        # op4 writes and op5 reads phase offset 1 at logical iteration k + 1.
+        # Therefore (logical_iter + phase) is even for even k and selects ping.
+        assert "T.region(A_shared_ping[0, 0], 2, 128, 32), 1024" in even_branch
+        assert "T.region(A_shared_ping[0, 0], 1, 128, 32)" in even_branch
+        assert "T.region(A_shared_pong[0, 0], 2, 128, 32), 1024" in odd_branch
+        assert "T.region(A_shared_pong[0, 0], 1, 128, 32)" in odd_branch
 
         # Global A/B regions are not banked, but their loop indices must still
         # be rewritten from the removed pipeline loop to the steady-state loop.
         tvm.tir.transform.RemoveNoOp()(injected)
+
+
+def test_ilp_inject_failure_restores_unversioned_serial_loop():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        func = mesh_matmul_new(
+            512,
+            512,
+            256,
+            block_M=128,
+            block_N=128,
+            block_K=32,
+            num_stages=3,
+        ).with_attr("global_symbol", "main")
+        mod = tvm.IRModule.from_expr(func)
+        mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+        mod = tl.transform.IfStmtBinding()(mod)
+        with _ScopedEnv({"TL_SUNMMIO_FASTER": "20"}):
+            planned = tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
+
+        corrupted = False
+
+        def corrupt_pipeline_loop(node):
+            nonlocal corrupted
+            if corrupted or not isinstance(node, tir.For) or "body_orders" not in node.annotations:
+                return None
+            annotations = dict(node.annotations)
+            annotations["body_orders"] = ["1-999"]
+            corrupted = True
+            return tir.For(
+                node.loop_var,
+                node.min,
+                node.extent,
+                node.kind,
+                node.body,
+                node.thread_binding,
+                annotations,
+            )
+
+        planned_func = planned["main"]
+        corrupted_body = ir_transform(planned_func.body, None, corrupt_pipeline_loop, ["tir.For"])
+        corrupted_func = tir.PrimFunc(
+            planned_func.params,
+            corrupted_body,
+            planned_func.ret_type,
+            planned_func.buffer_map,
+            planned_func.attrs,
+        )
+        injected = tl.transform.InjectSunmmioPipelineILP()(tvm.IRModule.from_expr(corrupted_func))
+
+        script = injected.script(show_meta=True)
+        assert '"tl.sunmmio.pipeline.applied": T.bool(False)' in script
+        assert '"tl.sunmmio.pipeline.fallback_stage": "inject_exception"' in script
+        assert '"tl.sunmmio.pipeline.fallback_reason": "candidate_rewrite_failed"' in script
+        assert '"body_orders"' not in script
+        assert "A_shared_ping" not in script
+        assert "A_shared_pong" not in script

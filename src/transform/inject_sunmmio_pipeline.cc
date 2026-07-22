@@ -10,6 +10,7 @@
 #include "../tileview/tileview.h"
 #include "common/loop_fusion_utils.h"
 #include "common/remap_buffer_rewriter.h"
+#include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
 #include "sunmmio_pipeline_planning/stmt_read_write_collector.h"
 #include "sunmmio_pipeline_planning/sunmmio_pipeline_utils.h"
 #include "tir/transforms/ir_utils.h"
@@ -31,6 +32,7 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <exception>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -740,6 +742,8 @@ private:
     auto prologue_orders_anno = op->annotations.Get("prologue_orders");
     auto body_orders_anno = op->annotations.Get("body_orders");
     auto epilogue_orders_anno = op->annotations.Get("epilogue_orders");
+    auto dynamic_epilogue_orders_anno =
+        op->annotations.Get("dynamic_epilogue_orders");
     auto writer_phases_anno = op->annotations.Get("runtime_bank_writer_phases");
     auto reader_phases_anno = op->annotations.Get("runtime_bank_reader_phases");
 
@@ -748,6 +752,24 @@ private:
       return for_node;
     }
 
+    arith::Analyzer extent_analyzer;
+    PrimExpr simplified_extent = extent_analyzer.Simplify(for_node->extent);
+    const auto *static_extent = simplified_extent.as<IntImmNode>();
+    auto make_sequential_fallback = [&](const std::string &reason,
+                                        bool emit_warning = true) {
+      Map<String, Any> annotations;
+      for (const auto &kv : for_node->annotations) {
+        if (kv.first != "num_stages" && kv.first != "iterations" &&
+            kv.first != "prologue_orders" && kv.first != "body_orders" &&
+            kv.first != "epilogue_orders") {
+          annotations.Set(kv.first, kv.second);
+        }
+      }
+      For sequential = for_node;
+      sequential.CopyOnWrite()->annotations = annotations;
+      return MakePipelineFallback(sequential, "greedy", "inject", reason,
+                                  emit_warning);
+    };
     // Step 2: Find the body and buffer allocations of the pipeline. The body
     // can be direct child of the for-loop. If the for-loop has BlockRealize as
     // its child, the pipeline body will be the child of the block.
@@ -845,6 +867,14 @@ private:
     if (epilogue_orders_anno) {
       epilogue_orders = Downcast<Array<String>>(epilogue_orders_anno.value());
     }
+    int max_body_iter_offset = 0;
+    for (const String &order : body_orders) {
+      max_body_iter_offset = std::max(max_body_iter_offset, name2iter(order));
+    }
+    if (static_extent != nullptr &&
+        static_extent->value <= max_body_iter_offset) {
+      return make_sequential_fallback("short_extent_unsupported");
+    }
     Array<Buffer> versioned_buffers =
         Downcast<Array<Buffer>>(versioned_buffers_anno.value());
     Array<Buffer> used_buffers =
@@ -919,6 +949,8 @@ private:
 
     if (epilogue_iterations == 0) {
       extent = extent - 1;
+    } else if (epilogue_iterations == -1) {
+      extent = floordiv(max(0, for_node->extent - 1), iterations);
     }
     For new_for_stmt =
         For(for_node->loop_var, PrimExpr(0), extent, ForKind::kSerial,
@@ -939,27 +971,41 @@ private:
         for_body.push_back(stmt);
       }
     } else {
-      // Dynamic epilogue loop for non-constant iterations
-      Var epilogue_loop_var("epilogue_i", for_node->loop_var->dtype);
-      Array<Stmt> epilogue_body;
-      for (int slot = 0; slot < iterations; ++slot) {
-        Array<Stmt> slot_body;
-        for (size_t id = 0; id < pipeline_body_seq->size(); ++id) {
-          Stmt stmt = pipeline_body_seq->seq[id];
-          rewriter.set_current_command(static_cast<int>(id));
-          rewriter.set_current_version(slot);
-          PrimExpr replaced_loop_var =
-              extent * iterations + epilogue_loop_var + for_node->min;
-          rewriter.set_loop_var_replacement(replaced_loop_var);
-          slot_body.push_back(rewriter(stmt));
+      ICHECK(dynamic_epilogue_orders_anno)
+          << "Dynamic pipeline requires remainder-specific epilogue orders";
+      Map<Integer, Array<String>> dynamic_orders =
+          Downcast<Map<Integer, Array<String>>>(
+              dynamic_epilogue_orders_anno.value());
+      Optional<Array<String>> selected_orders;
+      for (const auto &kv : dynamic_orders) {
+        if (kv.first->value == 0) {
+          selected_orders = kv.second;
+          break;
         }
-        epilogue_body.push_back(IfThenElse(EQ(epilogue_loop_var, Integer(slot)),
-                                           SeqStmt::Flatten(slot_body)));
       }
-      For dynamic_epilogue_for = For(
-          epilogue_loop_var, PrimExpr(0), epilogue_iterations_expr,
-          ForKind::kSerial, SeqStmt::Flatten(epilogue_body), std::nullopt, {});
-      for_body.push_back(dynamic_epilogue_for);
+      ICHECK(selected_orders.defined())
+          << "Missing full dynamic epilogue schedule";
+      std::map<int, Array<Stmt>> epilogue_groups;
+      for (const String &order_str : selected_orders.value()) {
+        int iter = name2iter(order_str);
+        int id = name2id(order_str);
+        PrimExpr logical_iter = extent * iterations + iter;
+        PrimExpr replaced_loop_var = logical_iter + for_node->min;
+        Stmt stmt = pipeline_body_seq->seq[id];
+        rewriter.set_current_command(id);
+        rewriter.set_current_version(version_slot(iter));
+        rewriter.set_loop_var_replacement(replaced_loop_var);
+        stmt = rewriter(stmt);
+        epilogue_groups[iter].push_back(stmt);
+      }
+      Array<Stmt> epilogue_body;
+      for (const auto &[iter, group] : epilogue_groups) {
+        PrimExpr logical_iter = extent * iterations + iter;
+        PrimExpr valid = And(GE(logical_iter, Integer(0)),
+                             LT(logical_iter, for_node->extent));
+        epilogue_body.push_back(IfThenElse(valid, SeqStmt::Flatten(group)));
+      }
+      for_body.push_back(SeqStmt::Flatten(epilogue_body));
     }
     return SeqStmt::Flatten(for_body);
   }
@@ -972,12 +1018,33 @@ private:
 tvm::transform::Pass InjectSunmmioPipeline() {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
-    Stmt multiversioned_body = SunmmioMultiVersionBufferRewriter::Substitute(f);
-    auto *fptr = f.CopyOnWrite();
-    fptr->body = multiversioned_body;
-    fptr->body = SunmmioPipelineInjector::Inject(f);
-    fptr->body = ConvertSSA(std::move(fptr->body));
-    return f;
+    PrimFunc original = f;
+    try {
+      PrimFunc candidate = f;
+      auto *fptr = candidate.CopyOnWrite();
+      fptr->body = SunmmioMultiVersionBufferRewriter::Substitute(candidate);
+      fptr->body = SunmmioPipelineInjector::Inject(candidate);
+      fptr->body = ConvertSSA(std::move(fptr->body));
+      Optional<String> disallowed =
+          PipelineFallbackValidator::FindDisallowed(fptr->body);
+      if (disallowed) {
+        return MakePipelineFunctionFallback(
+            original, PipelineDiagnostic{false, "greedy", "inject_validation",
+                                         "candidate_fallback",
+                                         std::string(disallowed.value())});
+      }
+      return candidate;
+    } catch (const std::exception &error) {
+      return MakePipelineFunctionFallback(
+          original,
+          PipelineDiagnostic{false, "greedy", "inject_exception",
+                             "candidate_rewrite_failed", error.what()});
+    } catch (...) {
+      return MakePipelineFunctionFallback(
+          original,
+          PipelineDiagnostic{false, "greedy", "inject_exception",
+                             "candidate_rewrite_failed", "unknown exception"});
+    }
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectSunmmioPipeline", {});
 }

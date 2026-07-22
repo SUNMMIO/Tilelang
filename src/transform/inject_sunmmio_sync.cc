@@ -2702,10 +2702,65 @@ private:
     auto then_case = eliminate_sync_then_rewriter(op->then_case);
 
     Stmt else_case;
+    Array<Stmt> hoisted_waits;
     if (op->else_case.defined()) {
       auto eliminate_sync_else_rewriter = EliminateRedundancyRewriter(
           analyzer_, get_all_token_ids(), token_to_barrier_mask_);
       else_case = eliminate_sync_else_rewriter(op->else_case.value());
+
+      // A token produced before an if may be consumed in every branch.  Keep
+      // one static consumer by hoisting that common wait before the split.
+      // Tokens generated in either branch are deliberately excluded: moving
+      // their wait outside would violate producer dominance.
+      ResolvedResourceCollector then_resolved;
+      ResolvedResourceCollector else_resolved;
+      AsyncResourceCollector then_generated;
+      AsyncResourceCollector else_generated;
+      then_resolved(then_case);
+      else_resolved(else_case);
+      then_generated(then_case);
+      else_generated(else_case);
+
+      std::vector<int> common_waits;
+      std::set_intersection(then_resolved.resolved_tokens.begin(),
+                            then_resolved.resolved_tokens.end(),
+                            else_resolved.resolved_tokens.begin(),
+                            else_resolved.resolved_tokens.end(),
+                            std::back_inserter(common_waits));
+      common_waits.erase(
+          std::remove_if(
+              common_waits.begin(), common_waits.end(),
+              [&](int token_id) {
+                return IsTokenResolved(token_id) ||
+                       then_generated.generated_tokens.count(token_id) != 0 ||
+                       else_generated.generated_tokens.count(token_id) != 0;
+              }),
+          common_waits.end());
+
+      if (!common_waits.empty()) {
+        std::vector<int> branch_parent_tokens = get_all_token_ids();
+        branch_parent_tokens.insert(branch_parent_tokens.end(),
+                                    common_waits.begin(), common_waits.end());
+        auto remove_then_waits = EliminateRedundancyRewriter(
+            analyzer_, branch_parent_tokens, token_to_barrier_mask_);
+        auto remove_else_waits = EliminateRedundancyRewriter(
+            analyzer_, branch_parent_tokens, token_to_barrier_mask_);
+        then_case = remove_then_waits(then_case);
+        else_case = remove_else_waits(else_case);
+
+        for (int token_id : common_waits) {
+          hoisted_waits.push_back(
+              Evaluate(Call(DataType::Handle(), wait_token(),
+                            {IntImm(DataType::Int(32), token_id)})));
+          auto barrier_it = token_to_barrier_mask_.find(token_id);
+          if (barrier_it != token_to_barrier_mask_.end()) {
+            hoisted_waits.push_back(
+                Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
+                              MakeBarrierArgs(barrier_it->second))));
+          }
+          MarkTokenResolved(token_id);
+        }
+      }
 
       std::vector<int> then_tokens =
           eliminate_sync_then_rewriter.get_current_token_ids();
@@ -2725,7 +2780,8 @@ private:
     auto new_stmt = IfThenElse(op->condition, then_case, else_case);
     PropagateResolvedStates(new_stmt);
 
-    return new_stmt;
+    hoisted_waits.push_back(new_stmt);
+    return SeqStmt::Flatten(hoisted_waits);
   }
 
   Stmt VisitStmt_(const ForNode *op) {

@@ -3,6 +3,7 @@
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
 #include "common/ast_traverser.h"
+#include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
 #include "sunmmio_pipeline_planning/resource_types_for_ilp.h"
 #include "tvm/arith/pattern.h"
 #include "tvm/ffi/reflection/registry.h"
@@ -1235,6 +1236,12 @@ private:
       if (call->op.same_as(Op::Get("tl.broadcast_"))) {
         AddAccess(NormalizeToBufferRegion(call->args[0]), false);
         AddAccess(NormalizeToBufferRegion(call->args[1]), true);
+        return;
+      }
+      if (call->op.same_as(Op::Get("tl.vector_core_in_tile_reduce"))) {
+        ICHECK_GE(call->args.size(), 3U);
+        AddAccess(NormalizeToBufferRegion(call->args[1]), true);
+        AddAccess(NormalizeToBufferRegion(call->args[2]), false);
         return;
       }
     }
@@ -2903,6 +2910,42 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
   }
 }
 
+bool ValidateProblemGraph(const std::vector<TemplateCommand> &commands,
+                          const Problem &problem) {
+  if (problem.N != static_cast<int>(commands.size()) ||
+      static_cast<int>(problem.P.size()) != problem.N) {
+    return false;
+  }
+  for (int id = 0; id < problem.N; ++id) {
+    if (commands[id].id != id) {
+      return false;
+    }
+    for (const AccessInfo &access : commands[id].accesses) {
+      if (!access.region.defined() || !access.buffer().defined()) {
+        return false;
+      }
+    }
+  }
+  for (const auto &edge : problem.dep_edges) {
+    if (edge.first < 0 || edge.first >= problem.N || edge.second < 0 ||
+        edge.second >= problem.N) {
+      return false;
+    }
+    auto delta_it = problem.delta.find(EdgeKey(edge.first, edge.second));
+    if (delta_it == problem.delta.end() || delta_it->second < 0) {
+      return false;
+    }
+  }
+  for (const FlowSpec &flow : problem.flows) {
+    if (flow.cons < 0 || flow.cons >= problem.N ||
+        (!flow.resident && (flow.prod < 0 || flow.prod >= problem.N)) ||
+        flow.delta < 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
 int ResourceLowerBound(const Problem &prob) {
   int lb = 1;
   for (int r : prob.R) {
@@ -3409,6 +3452,7 @@ private:
     std::map<std::string, std::map<int, int>> runtime_bank_writer_phases;
     std::map<std::string, std::map<int, int>> runtime_bank_reader_phases;
     int iterations{0};
+    bool graph_valid{false};
   };
 
   IlpLoopAnalysis AnalyzeLoop(const For &loop,
@@ -3545,6 +3589,7 @@ private:
     BuildTemplateDependencyGraph(result.commands, num_stages,
                                  result.versioned_buffers, loop->loop_var,
                                  &result.prob);
+    result.graph_valid = ValidateProblemGraph(result.commands, result.prob);
     return result;
   }
 
@@ -3809,8 +3854,8 @@ private:
     // prologue/epilogue iteration when the solved makespan spans two IIs.
     arith::Analyzer extent_analyzer;
     PrimExpr simplified_extent = extent_analyzer.Simplify(op->extent);
-    if (const auto *extent = simplified_extent.as<IntImmNode>();
-        extent != nullptr && extent->value <= 1) {
+    const auto *extent = simplified_extent.as<IntImmNode>();
+    if (extent != nullptr && extent->value <= 1) {
       For sequential = Downcast<For>(StmtExprMutator::VisitStmt_(op));
       Map<String, Any> annotations;
       for (const auto &kv : sequential->annotations) {
@@ -3819,12 +3864,28 @@ private:
         }
       }
       sequential.CopyOnWrite()->annotations = annotations;
-      return sequential;
+      return MakePipelineFallback(sequential, "ilp", "planning",
+                                  "short_extent_unsupported");
     }
 
     const SeqStmtNode *pipeline_body_seq = GetPipelineBodySeq(loop);
     ICHECK(pipeline_body_seq != nullptr)
         << "Pipeline body must normalize to SeqStmt.";
+    for (const Stmt &stmt : pipeline_body_seq->seq) {
+      if (!stmt.as<BlockRealizeNode>() && !stmt.as<EvaluateNode>() &&
+          !stmt.as<ForNode>()) {
+        For sequential = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+        Map<String, Any> annotations;
+        for (const auto &kv : sequential->annotations) {
+          if (kv.first != "num_stages") {
+            annotations.Set(kv.first, kv.second);
+          }
+        }
+        sequential.CopyOnWrite()->annotations = annotations;
+        return MakePipelineFallback(sequential, "ilp", "planning",
+                                    "unsupported_statement");
+      }
+    }
     int threads = GetEnvInt("HIGHS_THREADS", 20);
     IlpLoopAnalysis analysis;
     SolveResult sol;
@@ -3836,12 +3897,20 @@ private:
     } else {
       analysis = AnalyzeLoop(loop, pipeline_body_seq);
       MaybeExportProblemJson(analysis.prob, debug_);
-      sol = FindMinimalII(analysis.prob, threads);
+      if (analysis.graph_valid) {
+        sol = FindMinimalII(analysis.prob, threads);
+      }
+    }
+    if (!analysis.graph_valid) {
+      return MakePipelineFallback(loop, "ilp", "graph_validation",
+                                  "incomplete_access_info");
     }
     if (GetEnvBool("TL_SUNMMIO_ILP_EXPORT_ONLY", false)) {
       return loop;
     }
-    ICHECK(sol.ok) << "ILP solve failed for sunmmio pipeline planning.";
+    if (!sol.ok) {
+      return MakePipelineFallback(loop, "ilp", "planning", "ilp_infeasible");
+    }
     PopulateRuntimeBankMetadata(&analysis, sol);
     std::unordered_set<std::string> resident_buffer_names;
     for (const FlowSpec &flow : analysis.prob.flows) {
@@ -3872,8 +3941,10 @@ private:
     //
     // PruneUnnecessaryRuntimeBanking(&analysis, sol);
     SolutionVerifyResult verify = VerifySolution(analysis.prob, sol);
-    ICHECK(verify.ok) << "ILP solution verification failed: "
-                      << verify.errors.front();
+    if (!verify.ok) {
+      return MakePipelineFallback(loop, "ilp", "planning",
+                                  "schedule_verification_failed");
+    }
     std::string solution_json_path =
         GetEnvString("TL_SUNMMIO_ILP_SOLUTION_JSON");
     if (!solution_json_path.empty()) {
@@ -3900,6 +3971,7 @@ private:
     }
 
     int stage_count = CeilDiv(sol.makespan, std::max(1, sol.II));
+    SetPipelineAppliedAnnotations(&annotations, "ilp");
     auto pass_ctx = tvm::transform::PassContext::Current();
     bool enable_lifetime_pruning =
         pass_ctx
