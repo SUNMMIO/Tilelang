@@ -239,16 +239,6 @@ across_mesh = [S(0), S(0)]
 
 When both mesh axes shard the same tensor dimension, as in `[S(0), S(0)]`, that dimension is split by `nrows * ncols`, and a core's shard index is `row * ncols + col`. For a non-divisible shape, the local slot is rounded up and later cores can have shorter valid extents; kernels must not assume that every core has the same amount of valid data.
 
-The old `T.MeshShardingPolicy(x=..., y=..., replicate=..., cross_mesh_dim=...)` form and the `T.placement` factories remain available for compatibility, but new code should pass placement lists directly:
-
-| Legacy API | New API (SuTensor style) | Compatibility factory |
-|---|---|---|
-| `T.MeshShardingPolicy(y=a, x=b)` | `[S(a), S(b)]` | `T.placement.full_shard(a, b)` |
-| `T.MeshShardingPolicy(y=a, replicate=T.MeshReplicationType.ROW)` | `[S(a), R()]` | `T.placement.row_shard(a)` |
-| `T.MeshShardingPolicy(x=b, replicate=T.MeshReplicationType.COLUMN)` | `[R(), S(b)]` | `T.placement.col_shard(b)` |
-| `T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)` | `[R(), R()]` | `T.placement.replicated()` |
-| `T.MeshShardingPolicy(cross_mesh_dim=d)` | `[S(d), S(d)]` | `T.placement.full_shard(d, d)` |
-
 ### 2.5 Layout
 
 Layout describes how a tensor or buffer is organized in memory. It is a different concept from sharding: sharding decides which core receives which part of the complete tensor, while layout decides how each shard is arranged internally.
@@ -512,10 +502,10 @@ A placement list can be passed directly to `T.MeshTensor`. It must contain two o
 - `[R(), S(dim)]`: replicate on rows and shard on columns.
 - `[R(), R()]`: replicate on both axes.
 
-`T.placement.full_shard()`, `row_shard()`, `col_shard()`, and `replicated()` remain available as equivalent compatibility factories. The list does not need a `MeshShardingPolicy` wrapper:
+The `T.placement.full_shard()`, `row_shard()`, `col_shard()`, and `replicated()` convenience constructors return the same placement lists:
 
 ```python
-placement = [S(row_dim), R()]
+placement = T.placement.row_shard(row_dim)
 tensor = T.MeshTensor(shape, placement, dtype)
 ```
 

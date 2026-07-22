@@ -20,8 +20,6 @@ from .placement import (  # noqa: F401
     Placement,
     Shard,
     Replicate,
-    MeshShardingPolicy,
-    MeshReplicationType,
     S,
     R,
 )

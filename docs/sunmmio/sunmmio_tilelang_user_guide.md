@@ -239,16 +239,6 @@ across_mesh = [S(0), S(0)]
 
 当两个 mesh 轴切分同一个 tensor 维度时，例如 `[S(0), S(0)]`，该维度按 `nrows * ncols` 切分，core 的 shard index 为 `row * ncols + col`。非整除 shape 的本地 slot 使用向上取整，靠后的 core 可能具有较短的有效 extent；kernel 不应假设每个 core 的有效数据完全等长。
 
-旧的 `T.MeshShardingPolicy(x=..., y=..., replicate=..., cross_mesh_dim=...)` 写法和 `T.placement` 工厂仍作为兼容接口保留，但新代码应直接传 placement 列表：
-
-| 旧 API | 新 API（SuTensor 风格） | 兼容工厂 |
-|---|---|---|
-| `T.MeshShardingPolicy(y=a, x=b)` | `[S(a), S(b)]` | `T.placement.full_shard(a, b)` |
-| `T.MeshShardingPolicy(y=a, replicate=T.MeshReplicationType.ROW)` | `[S(a), R()]` | `T.placement.row_shard(a)` |
-| `T.MeshShardingPolicy(x=b, replicate=T.MeshReplicationType.COLUMN)` | `[R(), S(b)]` | `T.placement.col_shard(b)` |
-| `T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)` | `[R(), R()]` | `T.placement.replicated()` |
-| `T.MeshShardingPolicy(cross_mesh_dim=d)` | `[S(d), S(d)]` | `T.placement.full_shard(d, d)` |
-
 ### 2.5 Layout
 
 Layout 描述 tensor 或 buffer 在内存中的组织方式。它和 sharding 是两个不同层面的概念：sharding 决定完整 tensor 分到哪个 core，layout 决定每个 shard 内部如何排布。
@@ -512,10 +502,10 @@ placement 列表可以直接传给 `T.MeshTensor`。它必须包含两个有序�
 - `[R(), S(dim)]`：row 轴复制，仅 col 轴切分。
 - `[R(), R()]`：两个轴都复制。
 
-`T.placement.full_shard()`、`row_shard()`、`col_shard()` 和 `replicated()` 继续作为等价的兼容工厂提供。无需用 `MeshShardingPolicy` 包装列表：
+也可以使用 `T.placement.full_shard()`、`row_shard()`、`col_shard()` 和 `replicated()` 便利构造函数。它们返回同样的 placement 列表：
 
 ```python
-placement = [S(row_dim), R()]
+placement = T.placement.row_shard(row_dim)
 tensor = T.MeshTensor(shape, placement, dtype)
 ```
 
