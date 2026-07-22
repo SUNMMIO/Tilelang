@@ -5,7 +5,7 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm
-from tilelang.layout import make_aligned_row_major
+from tilelang.layout import make_aligned_row_major, make_row_major, make_zz_layout
 from tvm import tir
 
 from testing.python.sunmmio.common.codegen_validation import validate_sunmmio_codegen_with_npuir_opt
@@ -60,6 +60,32 @@ def _assert_out_shared_store_dtype(func, dtype):
 
     tvm.tir.stmt_functor.post_order_visit(func.body, visit)
     assert checked, func.script()
+
+
+def _rsram_scalar_access_layout(shape, dtype, layout_kind, align_bytes=64):
+    if layout_kind == "row_major":
+        return make_row_major(shape)
+    if layout_kind == "aligned_row_major":
+        return make_aligned_row_major(shape, dtype, align_bytes=align_bytes)
+    if layout_kind == "zz":
+        return make_zz_layout(shape, [0, 1], (32, 32))
+    raise ValueError(f"unknown layout_kind: {layout_kind}")
+
+
+def _partitioned_tile_view_lines(src):
+    return [line for line in src.splitlines() if "suvm.get_partitioned_tile_view" in line]
+
+
+def _assert_has_rank2_partitioned_view(src):
+    view_lines = _partitioned_tile_view_lines(src)
+    assert view_lines, src
+    for line in view_lines:
+        if "!suvm.tile_view<" not in line:
+            continue
+        view_shape = line.split("!suvm.tile_view<", 1)[1].split(">", 1)[0]
+        if "x" in view_shape:
+            return
+    raise AssertionError(src)
 
 
 @target("Sunmmio")
@@ -214,6 +240,137 @@ def pick_1d_rsram_side_data_kernel(
     return main
 
 
+@target("Sunmmio")
+def pick_rank1_rsram_scalar_access_kernel(
+    n=16,
+    dtype=T.int32,
+    layout_kind="row_major",
+    align_bytes=64,
+):
+    side_shape = (n,)
+    side_layout = _rsram_scalar_access_layout(side_shape, dtype, layout_kind, align_bytes)
+
+    @T.prim_func
+    def main():
+        with T.Kernel() as cid:
+            side_data = T.alloc_shared(side_shape, dtype, scope="shared.rsram")
+            T.annotate_layout({side_data: side_layout})
+
+            idx = (cid * 5 + 3) % n
+            picked = T.alloc_var(dtype)
+            picked = side_data[idx]
+            T.evaluate(picked)
+
+    return main
+
+
+@target("Sunmmio")
+def pick_rank2_rsram_scalar_access_kernel(
+    rows=4,
+    cols=32,
+    dtype=T.int32,
+    layout_kind="row_major",
+    align_bytes=64,
+):
+    table_shape = (rows, cols)
+    table_layout = _rsram_scalar_access_layout(table_shape, dtype, layout_kind, align_bytes)
+
+    @T.prim_func
+    def main():
+        with T.Kernel() as cid:
+            table = T.alloc_shared(table_shape, dtype, scope="shared.rsram")
+            T.annotate_layout({table: table_layout})
+
+            row = (cid + 1) % rows
+            col = (cid * 17 + 3) % cols
+            picked = T.alloc_var(dtype)
+            picked = table[row, col]
+            T.evaluate(picked)
+
+    return main
+
+
+@target("Sunmmio")
+def pick_rank3_rsram_scalar_access_kernel(
+    planes=2,
+    rows=3,
+    cols=500,
+    dtype=T.int32,
+    layout_kind="aligned_row_major",
+    align_bytes=64,
+):
+    cube_shape = (planes, rows, cols)
+    cube_layout = _rsram_scalar_access_layout(cube_shape, dtype, layout_kind, align_bytes)
+
+    @T.prim_func
+    def main():
+        with T.Kernel() as cid:
+            cube = T.alloc_shared(cube_shape, dtype, scope="shared.rsram")
+            T.annotate_layout({cube: cube_layout})
+
+            plane = cid % planes
+            row = (cid + 1) % rows
+            col = (cid * 17 + 3) % cols
+            picked = T.alloc_var(dtype)
+            picked = cube[plane, row, col]
+            T.evaluate(picked)
+
+    return main
+
+
+@target("Sunmmio")
+def set_rank1_rsram_scalar_access_kernel(
+    n=16,
+    dtype=T.int32,
+    layout_kind="row_major",
+    align_bytes=64,
+    predicated=False,
+):
+    side_shape = (n,)
+    side_layout = _rsram_scalar_access_layout(side_shape, dtype, layout_kind, align_bytes)
+
+    @T.prim_func
+    def main():
+        with T.Kernel() as cid:
+            side_data = T.alloc_shared(side_shape, dtype, scope="shared.rsram")
+            T.annotate_layout({side_data: side_layout})
+
+            idx = (cid * 7 + 1) % n
+            value = T.Cast(dtype, cid)
+            if predicated:
+                side_data.vstore([idx], value, predicate=cid % 2 == 0)
+            else:
+                side_data[idx] = value
+            T.evaluate(side_data[idx])
+
+    return main
+
+
+@target("Sunmmio")
+def set_rank2_rsram_scalar_access_kernel(
+    rows=4,
+    cols=32,
+    dtype=T.int32,
+    layout_kind="row_major",
+    align_bytes=64,
+):
+    table_shape = (rows, cols)
+    table_layout = _rsram_scalar_access_layout(table_shape, dtype, layout_kind, align_bytes)
+
+    @T.prim_func
+    def main():
+        with T.Kernel() as cid:
+            table = T.alloc_shared(table_shape, dtype, scope="shared.rsram")
+            T.annotate_layout({table: table_layout})
+
+            row = (cid + 2) % rows
+            col = (cid * 11 + 5) % cols
+            table[row, col] = T.Cast(dtype, cid)
+            T.evaluate(table[row, col])
+
+    return main
+
+
 @pytest.mark.parametrize(
     "factory,buffer_name,expected_loads",
     [
@@ -250,6 +407,134 @@ def test_pick_1d_rsram_scalar_access_codegen_emits_tile_pick(tmp_path):
             "suvm.tile.pick",
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "n,expected_tile_view",
+    [
+        (16, "!suvm.tile_view<16xi32>"),
+        (32, "!suvm.tile_view<32xi32>"),
+    ],
+)
+def test_pick_rank1_plain_row_major_rsram_codegen_emits_tile_pick(n, expected_tile_view, tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        pick_rank1_rsram_scalar_access_kernel(n=n, layout_kind="row_major"),
+        tmp_path,
+        mlir_filename=f"pick_rank1_row_major_n{n}_suvm.mlir",
+        expected_tokens=("suvm.tile.load", "suvm.tile.pick", expected_tile_view),
+        opt_args=("--verify-each",),
+    )
+    assert "fake_partitioned_tile_view" not in src
+    assert "fake_missing_memtensor" not in src
+
+
+@pytest.mark.parametrize("n", [1, 8, 40])
+def test_pick_rank1_plain_row_major_rsram_rejects_illegal_transfer_sizes(n, tmp_path):
+    with pytest.raises(Exception, match="cannot infer a legal tile.pick view"):
+        validate_sunmmio_codegen_with_npuir_opt(
+            pick_rank1_rsram_scalar_access_kernel(n=n, layout_kind="row_major"),
+            tmp_path,
+            mlir_filename=f"pick_rank1_row_major_n{n}_rejected_suvm.mlir",
+            opt_args=("--verify-each",),
+        )
+
+
+def test_pick_rank1_aligned_row_major_rsram_uses_covered_extent(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        pick_rank1_rsram_scalar_access_kernel(n=40, layout_kind="aligned_row_major", align_bytes=64),
+        tmp_path,
+        mlir_filename="pick_rank1_aligned_row_major_covered_extent_suvm.mlir",
+        expected_tokens=("suvm.tile.load", "suvm.tile.pick", "!suvm.tile_view<48xi32>"),
+        opt_args=("--verify-each",),
+    )
+    assert "#suvm.layout<(48), (1)>" in src
+
+
+def test_pick_rank2_plain_row_major_rsram_codegen_emits_rank2_tile_pick(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        pick_rank2_rsram_scalar_access_kernel(rows=4, cols=32, layout_kind="row_major"),
+        tmp_path,
+        mlir_filename="pick_rank2_row_major_suvm.mlir",
+        expected_tokens=("suvm.tile.load", "suvm.tile.pick", "!suvm.tile_view<4x32xi32>"),
+        opt_args=("--verify-each",),
+    )
+    _assert_has_rank2_partitioned_view(src)
+
+
+def test_pick_rank2_aligned_row_major_rsram_uses_covered_width_for_500_cols(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        pick_rank2_rsram_scalar_access_kernel(rows=3, cols=500, layout_kind="aligned_row_major", align_bytes=64),
+        tmp_path,
+        mlir_filename="pick_rank2_aligned_row_major_500_cols_suvm.mlir",
+        expected_tokens=("suvm.tile.load", "suvm.tile.pick", "!suvm.tile_view<1x128xi32>"),
+        opt_args=("--verify-each",),
+    )
+    assert "#suvm.layout<(3, 512), (512, 1)>" in src
+
+
+def test_pick_rank3_aligned_row_major_rsram_projects_trailing_rank2_tile_view(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        pick_rank3_rsram_scalar_access_kernel(planes=2, rows=3, cols=500),
+        tmp_path,
+        mlir_filename="pick_rank3_aligned_row_major_projected_rank2_suvm.mlir",
+        expected_tokens=("suvm.tile.load", "suvm.tile.pick", "!suvm.tile_view<1x128xi32>"),
+        opt_args=("--verify-each",),
+    )
+    assert "#suvm.layout<(2, 3, 512), (1536, 512, 1)>" in src
+    assert "tiled_dims = [1, 2]" in src or "tiled_dims = array<i64: 1, 2>" in src
+    _assert_has_rank2_partitioned_view(src)
+
+
+@pytest.mark.parametrize(
+    "dtype,expected_tile_view",
+    [
+        (T.int32, "!suvm.tile_view<4x32xi32>"),
+        (T.bfloat16, "!suvm.tile_view<8x32xbf16>"),
+    ],
+)
+def test_pick_rank2_zz_rsram_uses_inner_block_tile_view(dtype, expected_tile_view, tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        pick_rank2_rsram_scalar_access_kernel(rows=64, cols=64, dtype=dtype, layout_kind="zz"),
+        tmp_path,
+        mlir_filename=f"pick_rank2_zz_{dtype}_suvm.mlir",
+        expected_tokens=("suvm.tile.load", "suvm.tile.pick", expected_tile_view),
+        opt_args=("--verify-each",),
+    )
+    assert "!suvm.tile_view<64x64" not in src
+    _assert_has_rank2_partitioned_view(src)
+
+
+def test_set_rank1_plain_row_major_rsram_codegen_emits_tile_set(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        set_rank1_rsram_scalar_access_kernel(n=16, layout_kind="row_major"),
+        tmp_path,
+        mlir_filename="set_rank1_row_major_suvm.mlir",
+        expected_tokens=("suvm.tile.load", "suvm.tile.set", "suvm.tile.store", "!suvm.tile_view<16xi32>"),
+        opt_args=("--verify-each",),
+    )
+    assert "suvm.tile.select" not in src
+
+
+def test_set_rank2_plain_row_major_rsram_codegen_emits_rank2_tile_set(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        set_rank2_rsram_scalar_access_kernel(rows=4, cols=32, layout_kind="row_major"),
+        tmp_path,
+        mlir_filename="set_rank2_row_major_suvm.mlir",
+        expected_tokens=("suvm.tile.load", "suvm.tile.set", "suvm.tile.store", "!suvm.tile_view<4x32xi32>"),
+        opt_args=("--verify-each",),
+    )
+    _assert_has_rank2_partitioned_view(src)
+
+
+def test_predicated_set_rank1_rsram_scalar_access_uses_control_flow(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        set_rank1_rsram_scalar_access_kernel(n=16, layout_kind="row_major", predicated=True),
+        tmp_path,
+        mlir_filename="set_rank1_predicated_row_major_suvm.mlir",
+        expected_tokens=("scf.if", "suvm.tile.set", "suvm.tile.store"),
+        opt_args=("--verify-each",),
+    )
+    assert "suvm.tile.select" not in src
 
 
 @pytest.mark.parametrize(

@@ -2414,6 +2414,70 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     return matched_axes[0] && matched_axes[1];
   };
 
+  auto match_canonical_rank2_predicate_axes = [&](const PrimExpr &predicate,
+                                                  TileBlockState *state) {
+    std::array<bool, 2> matched_axes{false, false};
+    if (scope.tile_shape.size() != 2) {
+      return matched_axes;
+    }
+    std::function<bool(const PrimExpr &)> collect =
+        [&](const PrimExpr &expr) -> bool {
+      if (const auto *and_op = expr.as<AndNode>()) {
+        return collect(and_op->a) && collect(and_op->b);
+      }
+      for (int axis = 0; axis < 2; ++axis) {
+        if (is_canonical_tail_axis_predicate(expr, state, axis)) {
+          matched_axes[axis] = true;
+          return true;
+        }
+      }
+      return false;
+    };
+    if (!collect(predicate)) {
+      return std::array<bool, 2>{false, false};
+    }
+    return matched_axes;
+  };
+
+  auto build_canonical_rank2_predicate_mask =
+      [&](const PrimExpr &predicate, TileBlockState *state,
+          const TileAccessInfo &access,
+          DataType mask_index_dtype) -> std::optional<SunMMIOValue> {
+    if (scope.is_reduce_scope || access.tile_rank != 2 ||
+        access.tile_shape != scope.tile_shape) {
+      return std::nullopt;
+    }
+    std::array<bool, 2> matched_axes =
+        match_canonical_rank2_predicate_axes(predicate, state);
+    if (!matched_axes[0] && !matched_axes[1]) {
+      return std::nullopt;
+    }
+
+    SunMMIOType mask_type = MakeTileType(DataType::Bool(), access.tile_shape);
+    std::optional<SunMMIOValue> mask;
+    for (int axis = 0; axis < 2; ++axis) {
+      if (!matched_axes[axis]) {
+        continue;
+      }
+      int domain_axis = scope.execution_domain_axes[axis];
+      SunMMIOValue tile_extent = make_index_const(scope.tile_shape[axis]);
+      SunMMIOValue domain_extent = EnsureIndex(
+          EvalExpr(scope.domain_shape[static_cast<size_t>(domain_axis)]));
+      SunMMIOValue exec_index =
+          EnsureIndex(EvalExpr(scope.execution_loops[axis]->loop_var));
+      SunMMIOValue valid_extent =
+          min_index(tile_extent, sub_index(domain_extent,
+                                           mul_index(exec_index, tile_extent)));
+      SunMMIOValue axis_mask = builder_->TileAxisMask(
+          NewValueName(), axis, valid_extent, mask_type, mask_index_dtype);
+      mask = mask.has_value()
+                 ? std::optional<SunMMIOValue>(builder_->TileMaskAnd(
+                       NewValueName(), mask.value(), axis_mask, mask_type))
+                 : std::optional<SunMMIOValue>(axis_mask);
+    }
+    return mask;
+  };
+
   auto build_canonical_tail_mask = [&](const TileAccessInfo &access,
                                        DataType mask_index_dtype) {
     ICHECK_EQ(access.tile_rank, 1)
@@ -2974,10 +3038,17 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         if (load->predicate.defined() && !skip_load_predicate) {
           DataType mask_index_dtype =
               mask_index_dtype_for_value_dtype(load->buffer->dtype);
-          SunMMIOValue lowered_mask =
-              lower_expr(load->predicate.value(), state, mask_index_dtype);
-          lowered_mask =
-              broadcast_tile_to_shape(lowered_mask, access.tile_shape);
+          std::optional<SunMMIOValue> canonical_mask =
+              build_canonical_rank2_predicate_mask(
+                  load->predicate.value(), state, access, mask_index_dtype);
+          SunMMIOValue lowered_mask = canonical_mask.has_value()
+                                          ? canonical_mask.value()
+                                          : lower_expr(load->predicate.value(),
+                                                       state, mask_index_dtype);
+          if (!canonical_mask.has_value()) {
+            lowered_mask =
+                broadcast_tile_to_shape(lowered_mask, access.tile_shape);
+          }
           DataType value_dtype =
               CanonicalizeSuvmDType(load->buffer->dtype).with_lanes(1);
           SunMMIOType scalar_type{
@@ -3685,8 +3756,14 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                                   !natural_access.requires_aligned_1d_load;
       bool canonical_tail_store_for_rhs =
           store->predicate.defined() &&
-          is_canonical_tail_load_predicate(store->predicate.value(), state,
-                                           natural_access);
+          (is_canonical_tail_load_predicate(store->predicate.value(), state,
+                                            natural_access) ||
+           (!scope.is_reduce_scope && natural_access.tile_rank == 2 &&
+            natural_access.tile_shape == scope.tile_shape && [&]() {
+              std::array<bool, 2> axes = match_canonical_rank2_predicate_axes(
+                  store->predicate.value(), state);
+              return axes[0] || axes[1];
+            }()));
       std::optional<int64_t> saved_forced_axis;
       bool had_saved_forced_axis = false;
       if (use_forced_unit_axis) {
@@ -3728,6 +3805,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           !mask.has_value()) {
         if (canonical_tail_store && access.tile_rank == 1) {
           mask = build_canonical_tail_mask(access, store_mask_index_dtype);
+        } else if (auto canonical_mask = build_canonical_rank2_predicate_mask(
+                       store->predicate.value(), state, access,
+                       store_mask_index_dtype)) {
+          mask = canonical_mask.value();
         } else {
           mask = lower_expr(store->predicate.value(), state,
                             store_mask_index_dtype);

@@ -567,7 +567,7 @@ def test_sunmmio_codegen_buffer_store_fails_loudly():
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
     with pytest.raises(
         Exception,
-        match="generic BufferStoreNode should not reach SunMMIO codegen; tiled buffer stores must be lowered through tile-aware paths",
+        match="Sunmmio scalar BufferStore to DRAM/global must be legalized by staging through RSRAM before codegen",
     ):
         builder(mod, target, "suvm")
 
