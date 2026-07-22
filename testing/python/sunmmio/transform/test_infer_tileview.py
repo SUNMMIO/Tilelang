@@ -401,6 +401,51 @@ def test_infer_tileview_mixed_rank_store_still_rejected(dtype):
         apply_sunmmio_passes(mod, target)
 
 
+def test_infer_tileview_falls_back_to_1d_for_scalar_side_load():
+    """A row-dependent scalar side load must not reject a 2D T.Tiles scope."""
+    M, N = 32, 64
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            x_shared = T.alloc_shared((M, N), "float32")
+            post_mix_shared = T.alloc_shared((M, M), "float32")
+            output_accum = T.alloc_shared((M, N), "float32")
+
+            for bx, by in T.Tiles([M, N], parallel=True):
+                output_accum[bx, by] = x_shared[bx, by] * post_mix_shared[bx, 0]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert_scope_plan(mod, expected_tile_size=[64], expected_execution_domain_axes=[1])
+    loads = collect_loads(mod["main"], "post_mix_shared")
+    assert loads
+    assert all(len(load.indices) == 2 for load in loads)
+
+
+def test_infer_tileview_falls_back_to_scalar_for_mixed_loop_index():
+    """An index combining two tile vars is preserved in ordinary serial loops."""
+    M, N = 8, 16
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            cm = T.alloc_shared((M, N), "float32")
+            flattened = T.alloc_shared((M * N,), "float32")
+
+            for j, k in T.Tiles([M, N], parallel=True):
+                flattened[j * N + k] = cm[j, k]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+    script = mod["main"].script()
+
+    assert "tile.domain" not in script
+    assert "tile.scope_entry" not in script
+    assert "for j, k in T.grid(8, 16)" in script
+
+
 def test_infer_tileview_swapped_domain_binding():
     """Execution axes should be inferred from access bindings, not loop order."""
     M, N = 256, 128
@@ -761,8 +806,8 @@ def test_infer_tileview_blockwise_region_height_and_width_offset():
     assert_scope_plan(mod, expected_tile_size=[8, 32], expected_execution_domain_axes=[0, 1])
 
 
-def test_infer_tileview_blockwise_region_misaligned_width_offset_rejected():
-    """Misaligned blockwise width offsets should reject tileview planning.
+def test_infer_tileview_blockwise_region_misaligned_width_offset_falls_back():
+    """Misaligned blockwise width offsets should fall back from 2D planning.
 
     With fp16 and 64-byte RSRAM alignment, the minimum tile width is 32
     elements.  Offset 16 is not aligned to 32, so no feasible tile exists.
@@ -795,11 +840,7 @@ def test_infer_tileview_blockwise_region_misaligned_width_offset_rejected():
 
     mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    with (
-        tvm.target.Target(target),
-        pytest.raises(
-            tvm.error.InternalError,
-            match="Cannot infer any feasible TileView candidate",
-        ),
-    ):
-        apply_sunmmio_passes(mod, target)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+    scope_root, _ = collect_tile_annotations(mod["main"])
+    assert scope_root is None or len(scope_root["tile.tile_size"]) == 1
