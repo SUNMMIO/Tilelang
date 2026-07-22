@@ -294,16 +294,27 @@ std::vector<AccessTileCandidate> EnumerateAccessTileCandidates(
                                      alignment_mode);
 }
 
-bool IsEligibleRank1LoadForRelaxedAlignmentSearch(
+bool IsEligibleForAligned1DBridgeSearch(
     const BufferAccessRecord &access, const std::vector<IndexBinding> &bindings,
     int exec_rank) {
-  if (access.is_store || exec_rank != 2 || access.buffer->shape.size() != 1 ||
-      access.indices.size() != 1 || bindings.size() != 1) {
+  if (access.indices.size() != bindings.size()) {
     return false;
   }
 
-  const IndexBinding &binding = bindings[0];
-  return binding.uses_loop_var && binding.domain_axis >= 0;
+  int active_dims = 0;
+  for (const IndexBinding &binding : bindings) {
+    if (binding.uses_loop_var) {
+      ++active_dims;
+    }
+  }
+
+  // A rank-1 execution store with one unit-stride binding is injective in its
+  // only active tile axis.  Stores in a higher-rank execution need additional
+  // dependence analysis before carrier read-modify-write can be made safe.
+  if (access.is_store && exec_rank != 1) {
+    return false;
+  }
+  return active_dims == 1;
 }
 
 const std::vector<AccessTileCandidate> &
@@ -453,7 +464,8 @@ TrySelectPlan(const Array<PrimExpr> &domain,
         return TileViewPlan{
             makeTileView(domain, {Integer(tile_extent)},
                          {Integer(rank1_domain_axis - domain_rank)}),
-            {rank1_domain_axis}};
+            {rank1_domain_axis},
+            mode == AlignmentMode::kRelaxed};
       }
     }
 
@@ -558,7 +570,7 @@ TrySelectPlan(const Array<PrimExpr> &domain,
           makeTileView(domain, {Integer(tile_height), Integer(tile_width)},
                        {Integer(exec_domain_axes[0] - domain_rank),
                         Integer(exec_domain_axes[1] - domain_rank)}),
-          exec_domain_axes};
+          exec_domain_axes, mode == AlignmentMode::kRelaxed};
     }
   }
 
@@ -621,8 +633,7 @@ std::optional<TileViewPlan> TryPlanTileViewsForTilesScope(
         access, bindings, exec_rank, manual_tileviews, layout_map,
         tile_processor_config, &analyzer);
     std::vector<AccessTileCandidate> relaxed_candidates = candidates;
-    if (IsEligibleRank1LoadForRelaxedAlignmentSearch(access, bindings,
-                                                     exec_rank)) {
+    if (IsEligibleForAligned1DBridgeSearch(access, bindings, exec_rank)) {
       relaxed_candidates = EnumerateAccessTileCandidates(
           access, bindings, exec_rank, manual_tileviews, layout_map,
           tile_processor_config, &analyzer, AlignmentMode::kRelaxed);

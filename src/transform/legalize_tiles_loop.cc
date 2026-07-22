@@ -497,6 +497,13 @@ private:
         return StripTileLoopAnnotations(loop);
       }
       active_tileview_plan_ = plan.value();
+      if (active_tileview_plan_.requires_aligned_1d_bridge) {
+        LOG(WARNING)
+            << "T.Tiles domain " << domain
+            << " uses a logical 1D tile smaller than the native RSRAM "
+               "alignment. Codegen will load an aligned carrier and extract "
+               "or insert the logical tile. This may degrade performance.";
+      }
       if (active_tileview_plan_.execution_domain_axes.size() < domain.size()) {
         LOG(WARNING) << "T.Tiles domain " << domain
                      << " cannot infer a full-rank TileView and is falling "

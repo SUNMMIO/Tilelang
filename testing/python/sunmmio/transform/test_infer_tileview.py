@@ -10,7 +10,7 @@ import tilelang
 import tilelang as tl
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.layout import make_zz_layout
+from tilelang.layout import make_aligned_row_major, make_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tvm import tir
 from tvm import IRModule
@@ -72,6 +72,23 @@ def assert_scope_plan(mod, expected_tile_size, expected_execution_domain_axes):
     assert execution_axes == list(range(len(expected_tile_size)))
     assert _to_int_list(scope_root["tile.tile_size"]) == list(expected_tile_size)
     assert _to_int_list(scope_root["tile.execution_domain_axes"]) == list(expected_execution_domain_axes)
+
+
+def collect_scope_plans(func):
+    plans = []
+
+    def visit(stmt):
+        if not isinstance(stmt, tir.For) or stmt.annotations is None or "tile.domain" not in stmt.annotations:
+            return
+        plans.append(
+            (
+                _to_int_list(stmt.annotations["tile.tile_size"]),
+                _to_int_list(stmt.annotations["tile.execution_domain_axes"]),
+            )
+        )
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return plans
 
 
 def collect_loads(func, buffer_name):
@@ -444,6 +461,64 @@ def test_infer_tileview_falls_back_to_scalar_for_mixed_loop_index():
     assert "tile.domain" not in script
     assert "tile.scope_entry" not in script
     assert "for j, k in T.grid(8, 16)" in script
+
+
+def test_infer_subaligned_rank1_tile_for_serialized_2d_copy():
+    """A serialized outer axis leaves a bridgeable logical 1D tile."""
+    H = 4
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            cm = T.alloc_shared((H, H), "float32", scope="shared.rsram")
+            comb = T.alloc_shared((1, H * H), "float32", scope="shared.rsram")
+            T.annotate_layout(
+                {
+                    cm: make_zz_layout((H, H), [0, 1], (32, 32)),
+                    comb: make_aligned_row_major((1, H * H), "float32", align_bytes=64),
+                }
+            )
+
+            for j in T.serial(H):
+                for k in T.Tiles([H], parallel=True):
+                    comb[0, j * H + k] = cm[j, k]
+
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main").with_attr("target", target))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert_scope_plan(mod, expected_tile_size=[H], expected_execution_domain_axes=[0])
+
+
+def test_infer_scope_local_subaligned_then_direct_rank1_tiles():
+    """The same temp buffer can use a bridged tile then a direct full row."""
+    H, W = 4, 32
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            cm = T.alloc_shared((H, W), "float32", scope="shared.rsram")
+            m_shared = T.alloc_shared((W,), "float32", scope="shared.rsram")
+            temp = T.alloc_shared((W,), "float32", scope="shared.rsram")
+            T.annotate_layout(
+                {
+                    cm: make_zz_layout((H, W), [0, 1], (32, 32)),
+                    m_shared: make_aligned_row_major((W,), "float32", align_bytes=64),
+                    temp: make_aligned_row_major((W,), "float32", align_bytes=64),
+                }
+            )
+
+            for i in T.serial(H):
+                for j in T.Tiles([H], parallel=True):
+                    temp[j] = m_shared[i * H + j]
+                for j in T.Tiles([W], parallel=True):
+                    cm[i, j] = temp[j]
+
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main").with_attr("target", target))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert sorted(collect_scope_plans(mod["main"])) == [([H], [0]), ([W], [0])]
 
 
 def test_infer_tileview_swapped_domain_binding():
