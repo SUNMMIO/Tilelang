@@ -1,5 +1,5 @@
 import re
-from tvm import tir, IRModule, arith
+from tvm import tir, IRModule, arith, ir
 
 
 def verify_comm_lower(func: tir.PrimFunc):
@@ -218,8 +218,8 @@ def verify_comm_lower(func: tir.PrimFunc):
                 elif direction == 1:  # vertical
                     add_expected(None, 1, None, has_src_core=False)
                 elif direction == 2:  # all
-                    add_expected(None, 0, None, has_src_core=False)
                     add_expected(None, 1, None, has_src_core=False)
+                    add_expected(None, 0, None, has_src_core=False)
 
     if not isinstance(func, tir.PrimFunc):
         raise ValueError(f"Expected PrimFunc, got {type(func)}")
@@ -290,15 +290,38 @@ def verify_SunmmioSync(mod: IRModule):
     check_dense_ids(all_token_ids, "token")
 
     barrier_init_masks = [l.split("barrier_init(", 1)[1].rsplit(")", 1)[0] for l in lines if "barrier_init(" in l]
-    arrive_masks = [l.split("barrier_arrive_and_wait(", 1)[1].rsplit(")", 1)[0] for l in lines if "barrier_arrive_and_wait(" in l]
     initialized_masks = set(barrier_init_masks)
+    barrier_init_calls = []
+    barrier_arrive_calls = []
+
+    def collect_barrier_calls(node):
+        if not isinstance(node, tir.Call) or not hasattr(node.op, "name"):
+            return
+        if node.op.name == "tl.barrier_init":
+            barrier_init_calls.append(node)
+        elif node.op.name == "tl.barrier_arrive_and_wait":
+            barrier_arrive_calls.append(node)
+
+    for func in mod.functions.values():
+        if isinstance(func, tir.PrimFunc):
+            tir.stmt_functor.post_order_visit(func.body, collect_barrier_calls)
+
+    def structurally_equal_args(lhs, rhs):
+        return len(lhs) == len(rhs) and all(ir.structural_equal(a, b) for a, b in zip(lhs, rhs))
+
+    def has_matching_barrier_init(arrive):
+        if len(arrive.args) == 1:
+            return any(structurally_equal_args(init.args, arrive.args) for init in barrier_init_calls)
+        # Dynamic barriers use init(-1, candidates...) and
+        # arrive_and_wait(runtime_expr, candidates...).
+        return any(len(init.args) > 1 and structurally_equal_args(init.args[1:], arrive.args[1:]) for init in barrier_init_calls)
 
     # Check count of wait_lines and arrive_lines
     assert len(wait_ids) >= len(set(token_ids)), "wait_lines should be greater than token_lines"
     for i in wait_ids:
         assert i in declared_token_ids, f"wait_token({i}) does not have sync_token_id or sync_null_token"
-    for mask in arrive_masks:
-        assert mask in initialized_masks, f"barrier_arrive_and_wait({mask}) does not have barrier_init({mask})"
+    for arrive in barrier_arrive_calls:
+        assert has_matching_barrier_init(arrive), f"{arrive} does not have a matching barrier_init"
 
     # Check order of sync_token_id(id) (or sync_null_token(id)) and wait_token(id)
     for i in declared_token_ids:
