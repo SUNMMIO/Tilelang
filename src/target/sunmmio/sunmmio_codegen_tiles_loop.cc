@@ -835,8 +835,12 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         bool primary_owns_axis = false;
         if (primary_loop != nullptr) {
           auto extent = GetStaticLoopExtent(primary_loop);
+          // Tile-loop fusion can place non-reduction regions with different
+          // logical tile extents under one execution shell.  Reduction helper
+          // loops also reuse tile.interior_axis, but retain the original
+          // shell-shape matching rules.
           if (!extent || *extent == scope.tile_shape[axis] ||
-              exec_loop == nullptr) {
+              exec_loop == nullptr || !scope.is_reduce_scope) {
             push_candidate(primary_loop);
             primary_owns_axis = true;
           }
@@ -853,21 +857,14 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
 
         for (const ForNode *interior_loop : candidate_interior_loops) {
           std::optional<TiledIndexMatch> match;
-          int64_t matched_tile_extent = scope.tile_shape[axis];
           std::optional<int64_t> interior_extent =
               GetStaticLoopExtent(interior_loop);
-          bool is_full_scope_axis =
-              !interior_extent.has_value() ||
-              interior_extent.value() == scope.tile_shape[axis];
-          if (exec_loop == nullptr && !is_full_scope_axis &&
-              indices[dim].same_as(interior_loop->loop_var)) {
-            matched_tile_extent = interior_extent.value();
-            match = TiledIndexMatch{0, false,
-                                    PrimExpr(IntImm(indices[dim].dtype(), 0))};
-          } else if (exec_loop != nullptr) {
+          int64_t matched_tile_extent =
+              interior_extent.value_or(scope.tile_shape[axis]);
+          if (exec_loop != nullptr) {
             match =
                 MatchTiledIndex(indices[dim], exec_loop->loop_var,
-                                interior_loop->loop_var, scope.tile_shape[axis],
+                                interior_loop->loop_var, matched_tile_extent,
                                 /*allow_standalone_interior=*/true, &analyzer);
           } else if (indices[dim].same_as(interior_loop->loop_var)) {
             match = TiledIndexMatch{0, false,
@@ -1923,8 +1920,6 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
             ? memtensor_shape
             : ExtractStaticPrimExprs(memtensor_type.layout_hshape,
                                      "layout shape");
-    ICHECK_EQ(layout_shape.size(), memtensor_shape.size())
-        << "Aligned 1D access expects layout rank to match memtensor rank";
     std::vector<int64_t> strides =
         memtensor_type.layout_hstride.empty()
             ? std::vector<int64_t>{}
@@ -1939,32 +1934,54 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
             layout_shape[static_cast<size_t>(dim + 1)];
       }
     }
-    ICHECK_EQ(strides.size(), memtensor_shape.size())
-        << "Aligned 1D access currently requires flat memtensor layout";
+    ICHECK_EQ(strides.size(), layout_shape.size())
+        << "Aligned 1D access expects one stride per layout mode";
     bool is_flat_layout = true;
     if (!memtensor_type.layout_dim_levels.empty()) {
       for (uint8_t level : memtensor_type.layout_dim_levels) {
         is_flat_layout = is_flat_layout && level == 1;
       }
     }
-    ICHECK(is_flat_layout)
-        << "Aligned 1D access currently requires flat memtensor layout";
+    is_flat_layout =
+        is_flat_layout && layout_shape.size() == memtensor_shape.size();
 
-    // Fast path for row-major padded layouts.  SunMMIO shared RSRAM layouts pad
-    // each row to the configured RSRAM alignment boundary.  In that case the
-    // aligned region never crosses a row, so keep every non-tiled dim index
-    // unchanged and only split the stride-1 tiled dim into block index and
-    // in-block offset.
-    if (strides[static_cast<size_t>(tiled_dim)] == 1 &&
+    std::vector<size_t> logical_mode_offsets(memtensor_shape.size());
+    if (is_flat_layout) {
+      for (size_t dim = 0; dim < memtensor_shape.size(); ++dim) {
+        logical_mode_offsets[dim] = dim;
+      }
+    } else {
+      ICHECK_EQ(memtensor_type.layout_dim_levels.size(), memtensor_shape.size())
+          << "Aligned 1D hierarchical access expects one level count per "
+             "logical memtensor dimension";
+      size_t mode_offset = 0;
+      for (size_t dim = 0; dim < memtensor_shape.size(); ++dim) {
+        int levels = memtensor_type.layout_dim_levels[dim];
+        ICHECK_GT(levels, 0);
+        logical_mode_offsets[dim] = mode_offset;
+        mode_offset += static_cast<size_t>(levels);
+        ICHECK_LE(mode_offset, layout_shape.size());
+      }
+      ICHECK_EQ(mode_offset, layout_shape.size());
+    }
+
+    // Fast path for row-major padded layouts and row-contiguous hierarchical
+    // layouts such as ZZ.  A hierarchical carrier stays inside the innermost
+    // tiled mode; every other mode begins at a carrier-aligned address.
+    size_t tiled_mode = logical_mode_offsets[static_cast<size_t>(tiled_dim)];
+    bool carrier_fits_tiled_mode =
+        is_flat_layout ||
+        layout_shape[tiled_mode] % access.aligned_load_elems == 0;
+    if (strides[tiled_mode] == 1 && carrier_fits_tiled_mode &&
         access.aligned_load_elems % access.tile_shape[0] == 0) {
       bool outer_strides_are_aligned = true;
-      for (int64_t dim = 0; dim < static_cast<int64_t>(strides.size()); ++dim) {
-        if (dim == tiled_dim) {
+      for (size_t mode = 0; mode < strides.size(); ++mode) {
+        if (mode == tiled_mode) {
           continue;
         }
         outer_strides_are_aligned =
             outer_strides_are_aligned &&
-            strides[static_cast<size_t>(dim)] % access.aligned_load_elems == 0;
+            strides[mode] % access.aligned_load_elems == 0;
       }
       if (outer_strides_are_aligned) {
         SunMMIOValue tile_partition = EnsureIndex(
@@ -1981,6 +1998,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         return Aligned1DAddressInfo{offset_elems, aligned_partition_indices};
       }
     }
+
+    ICHECK(is_flat_layout)
+        << "Aligned 1D hierarchical access requires a carrier that fits in "
+           "the stride-1 innermost tiled mode with aligned outer mode strides";
 
     SunMMIOValue linear_elem = make_index_const(0);
     for (int64_t dim = 0; dim < static_cast<int64_t>(memtensor_shape.size());
@@ -2541,7 +2562,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       [&](const PrimExpr &predicate, TileBlockState *state,
           const TileAccessInfo &access,
           DataType mask_index_dtype) -> std::optional<SunMMIOValue> {
-    if (access.tile_rank != 2 || access.tile_shape != scope.tile_shape) {
+    if (access.tile_rank != 2 || scope.tile_shape.size() != 2 ||
+        access.tile_shape.size() != 2) {
       return std::nullopt;
     }
     std::array<bool, 2> matched_axes =
@@ -2557,13 +2579,15 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         continue;
       }
       int domain_axis = scope.execution_domain_axes[axis];
-      SunMMIOValue tile_extent = make_index_const(scope.tile_shape[axis]);
+      SunMMIOValue scope_tile_extent = make_index_const(scope.tile_shape[axis]);
+      SunMMIOValue access_tile_extent =
+          make_index_const(access.tile_shape[axis]);
       const SunMMIOValue &domain_extent = domain_value(domain_axis);
       SunMMIOValue exec_index =
           EnsureIndex(EvalExpr(scope.execution_loops[axis]->loop_var));
-      SunMMIOValue valid_extent =
-          min_index(tile_extent, sub_index(domain_extent,
-                                           mul_index(exec_index, tile_extent)));
+      SunMMIOValue valid_extent = min_index(
+          access_tile_extent,
+          sub_index(domain_extent, mul_index(exec_index, scope_tile_extent)));
       SunMMIOValue axis_mask = builder_->TileAxisMask(
           NewValueName(), axis, valid_extent, mask_type, mask_index_dtype);
       mask = mask.has_value()

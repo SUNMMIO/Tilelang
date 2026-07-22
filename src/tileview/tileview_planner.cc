@@ -317,6 +317,75 @@ bool IsEligibleForAligned1DBridgeSearch(
   return active_dims == 1;
 }
 
+bool SupportsAligned1DBridgeCandidate(
+    const AccessTileCandidate &candidate, const Buffer &buffer,
+    const Map<Buffer, Layout> &layout_map,
+    const SunmmioTileProcessorConfig &config) {
+  if (candidate.tile_shape.size() != 1 ||
+      buffer.scope() != kSunmmioScopeRSRAM) {
+    return true;
+  }
+
+  int tile_extent = candidate.tile_shape[0];
+  int align_elems =
+      GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, buffer->dtype);
+  if (tile_extent > 0 && tile_extent % align_elems == 0) {
+    return true;
+  }
+  if (tile_extent <= 0 || tile_extent >= align_elems ||
+      align_elems % tile_extent != 0) {
+    return false;
+  }
+
+  auto layout_it = layout_map.find(buffer);
+  if (layout_it == layout_map.end()) {
+    return true;
+  }
+  const auto *cute = (*layout_it).second.as<CuteLayoutNode>();
+  if (cute == nullptr) {
+    return false;
+  }
+
+  Array<Integer> dim_levels = cute->GetDimLevels();
+  bool is_flat_layout =
+      std::all_of(dim_levels.begin(), dim_levels.end(),
+                  [](const Integer &levels) { return levels.IntValue() == 1; });
+  if (is_flat_layout) {
+    return true;
+  }
+
+  int buffer_rank = static_cast<int>(buffer->shape.size());
+  Array<PrimExpr> index_map = candidate.tileview->IndexMap();
+  if (index_map.size() != 1) {
+    return false;
+  }
+  int tiled_dim = NormalizeMappedDim(index_map[0], buffer_rank);
+
+  for (int dim = 0; dim < buffer_rank; ++dim) {
+    Array<PrimExpr> mode_shapes = cute->GetModeShapeOfDim(dim);
+    Array<PrimExpr> mode_strides = cute->GetModeStrideOfDim(dim);
+    if (mode_shapes.empty() || mode_shapes.size() != mode_strides.size()) {
+      return false;
+    }
+    for (int mode = 0; mode < static_cast<int>(mode_shapes.size()); ++mode) {
+      int64_t stride = GetStaticIntValue(mode_strides[mode]);
+      if (stride <= 0) {
+        return false;
+      }
+      if (dim == tiled_dim && mode == 0) {
+        int64_t inner_extent = GetStaticIntValue(mode_shapes[mode]);
+        if (stride != 1 || inner_extent <= 0 ||
+            inner_extent % align_elems != 0) {
+          return false;
+        }
+      } else if (stride % align_elems != 0) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 const std::vector<AccessTileCandidate> &
 CandidatesForSearch(const AccessInfo &access, AlignmentMode mode) {
   return mode == AlignmentMode::kRelaxed ? access.relaxed_candidates
@@ -637,6 +706,14 @@ std::optional<TileViewPlan> TryPlanTileViewsForTilesScope(
       relaxed_candidates = EnumerateAccessTileCandidates(
           access, bindings, exec_rank, manual_tileviews, layout_map,
           tile_processor_config, &analyzer, AlignmentMode::kRelaxed);
+      relaxed_candidates.erase(
+          std::remove_if(relaxed_candidates.begin(), relaxed_candidates.end(),
+                         [&](const AccessTileCandidate &candidate) {
+                           return !SupportsAligned1DBridgeCandidate(
+                               candidate, access.buffer, layout_map,
+                               tile_processor_config);
+                         }),
+          relaxed_candidates.end());
     }
 
     analyzed_accesses.push_back(
