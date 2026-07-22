@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import suppress
-from enum import Enum
 from typing import Any, TYPE_CHECKING
 
 from tvm import ir, tir
@@ -15,12 +14,25 @@ import tvm_ffi
 from tilelang._typing import DType, ShapeType
 from tilelang.dtypes import dtype as tilelang_dtype
 from tilelang.language import dtypes as _dtypes
+from tilelang.language.placement import (
+    MeshReplicationType,
+    MeshShardingPolicy,
+    PlacementSpec,
+    Placement,
+    Replicate,
+    Shard,
+    _normalize_placement,
+    _placement_metadata,
+)
 from tilelang.language.proxy import TensorProxy
 from tilelang.language.mesh_symbols import mesh_ncols, mesh_nrows
 
 __all__ = [
     "MeshReplicationType",
     "MeshShardingPolicy",
+    "Placement",
+    "Replicate",
+    "Shard",
     "MeshTensor",
     "TensorWithMeta",
     "get_local_extent",
@@ -31,49 +43,6 @@ _make_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_row_major")
 _make_mx_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_mx_row_major")
 _derive_layout_like = tvm_ffi.get_global_func("tl.DeriveLayoutLike")
 _derive_mx_layout_like = tvm_ffi.get_global_func("tl.sunmmio.derive_mx_layout_like")
-
-
-class MeshReplicationType(Enum):
-    NONE = 0  # no replication (each core has unique data)
-    ROW = 1  # replicate across X (same row)
-    COLUMN = 2  # replicate across Y (same column)
-    ALL = 3  # replicate on all cores
-
-
-class MeshShardingPolicy:
-    """Sharding Policy for MeshTensor."""
-
-    def __init__(
-        self,
-        x: int | None = None,
-        y: int | None = None,
-        replicate: int | MeshReplicationType = MeshReplicationType.NONE,
-        cross_mesh_dim: int | None = None,
-    ):
-        if isinstance(replicate, int):
-            replicate = MeshReplicationType(replicate)
-
-        if cross_mesh_dim is not None and (x is not None or y is not None):
-            raise ValueError("cross_mesh_dim is mutually exclusive with x/y splits")
-        if sum(v is not None for v in [x, y, cross_mesh_dim]) > 2:
-            raise ValueError("Invalid layout: too many splits")
-
-        self.x = x
-        self.y = y
-        self.replicate = replicate
-        self.cross_mesh_dim = cross_mesh_dim
-
-    def __repr__(self):
-        if self.cross_mesh_dim is not None:
-            return f"MeshLayout(split_dim={self.cross_mesh_dim} across XxY)"
-        parts = []
-        if self.x is not None:
-            parts.append(f"x→dim{self.x}")
-        if self.y is not None:
-            parts.append(f"y→dim{self.y}")
-        if self.replicate != MeshReplicationType.NONE:
-            parts.append(f"replicate={self.replicate.name}")
-        return "MeshLayout(" + ", ".join(parts) + ")" if parts else "MeshLayout(replicated)"
 
 
 class TensorWithMeta:
@@ -210,8 +179,8 @@ def lookup_mesh_tensor_meta(mesh_tensor):
 def get_local_extent(mesh_tensor, cid):
     """Return the valid local extent for ``mesh_tensor`` on linear core id ``cid``.
 
-    If both row/y and col/x shard the same tensor dimension, row sharding is
-    applied first and col sharding is applied to the row-local extent.
+    When both mesh axes shard the same tensor dimension, cores are ordered by
+    the row-major linear index ``row * ncols + col``.
     """
     meta = lookup_mesh_tensor_meta(mesh_tensor)
     global_shape = meta["global_shape"]
@@ -219,19 +188,35 @@ def get_local_extent(mesh_tensor, cid):
     row = cid // ncols
     col = cid % ncols
 
-    local_extent = list(global_shape)
-    cross_mesh_dim = meta.get("cross_mesh_dim", -1)
-    if cross_mesh_dim != -1:
-        local_extent[cross_mesh_dim] = distribute_valid_count(global_shape[cross_mesh_dim], cid, nrows * ncols)
+    placement_desc = meta.get("placement")
+    if placement_desc is None:
+        # Compatibility with metadata produced before the placement API change.
+        local_extent = list(global_shape)
+        cross_mesh_dim = meta.get("cross_mesh_dim", -1)
+        if cross_mesh_dim != -1:
+            local_extent[cross_mesh_dim] = distribute_valid_count(global_shape[cross_mesh_dim], cid, nrows * ncols)
+            return tuple(local_extent)
+
+        shard_y = meta.get("shard_y", -1)
+        if shard_y != -1:
+            local_extent[shard_y] = distribute_valid_count(global_shape[shard_y], row, nrows)
+
+        shard_x = meta.get("shard_x", -1)
+        if shard_x != -1:
+            local_extent[shard_x] = distribute_valid_count(local_extent[shard_x], col, ncols)
         return tuple(local_extent)
 
-    shard_y = meta.get("shard_y", -1)
-    if shard_y != -1:
-        local_extent[shard_y] = distribute_valid_count(global_shape[shard_y], row, nrows)
-
-    shard_x = meta.get("shard_x", -1)
-    if shard_x != -1:
-        local_extent[shard_x] = distribute_valid_count(local_extent[shard_x], col, ncols)
+    row_kind, row_dim, col_kind, col_dim = (_to_python_int(value) for value in placement_desc)
+    local_extent = list(global_shape)
+    for dim, extent in enumerate(global_shape):
+        row_shards = row_kind == 1 and row_dim == dim
+        col_shards = col_kind == 1 and col_dim == dim
+        if row_shards and col_shards:
+            local_extent[dim] = distribute_valid_count(extent, row * ncols + col, nrows * ncols)
+        elif row_shards:
+            local_extent[dim] = distribute_valid_count(extent, row, nrows)
+        elif col_shards:
+            local_extent[dim] = distribute_valid_count(extent, col, ncols)
 
     return tuple(local_extent)
 
@@ -255,62 +240,52 @@ def _is_mx_dtype(dtype):
 class MeshTensorProxy:
     """Proxy for creating distributed mesh tensors.
 
-    Adapts MeshShardingPolicy to compute per-core sharded shapes,
-    then delegates to the standard TIR buffer creation.
+    Computes per-core shapes from a row/column placement, then delegates to the
+    standard TIR buffer creation.
     """
 
     @staticmethod
     def _get_sharded_shape(
         shape: tuple[Any, ...],
-        policy: MeshShardingPolicy,
+        policy: PlacementSpec,
         nrows: int,
         ncols: int,
     ) -> tuple[Any, ...]:
+        policy = _normalize_placement(policy)
+        policy.validate(len(shape))
         sharded_shape = list(shape)
 
-        if policy.replicate == MeshReplicationType.ALL:
-            return tuple(sharded_shape)
-
-        if policy.cross_mesh_dim is not None:
-            if not 0 <= policy.cross_mesh_dim < len(sharded_shape):
-                raise ValueError(f"Invalid cross_mesh_dim: {policy.cross_mesh_dim}, tensor rank is {len(sharded_shape)}")
-            sharded_shape[policy.cross_mesh_dim] = _ceildiv(sharded_shape[policy.cross_mesh_dim], nrows * ncols)
-            return tuple(sharded_shape)
-
-        if policy.replicate == MeshReplicationType.ROW:
-            if policy.x is not None:
-                raise ValueError("Cannot shard on x-axis when replicating on rows")
-            if policy.y is not None:
-                if not 0 <= policy.y < len(sharded_shape):
-                    raise ValueError(f"Invalid y-split dimension: {policy.y}, tensor rank is {len(sharded_shape)}")
-                sharded_shape[policy.y] = _ceildiv(sharded_shape[policy.y], nrows)
-        elif policy.replicate == MeshReplicationType.COLUMN:
-            if policy.y is not None:
-                raise ValueError("Cannot shard on y-axis when replicating on columns")
-            if policy.x is not None:
-                if not 0 <= policy.x < len(sharded_shape):
-                    raise ValueError(f"Invalid x-split dimension: {policy.x}, tensor rank is {len(sharded_shape)}")
-                sharded_shape[policy.x] = _ceildiv(sharded_shape[policy.x], ncols)
-        elif policy.replicate == MeshReplicationType.NONE:
-            if policy.y is not None:
-                if not 0 <= policy.y < len(sharded_shape):
-                    raise ValueError(f"Invalid y-split dimension: {policy.y}, tensor rank is {len(sharded_shape)}")
-                sharded_shape[policy.y] = _ceildiv(sharded_shape[policy.y], nrows)
-            if policy.x is not None:
-                if not 0 <= policy.x < len(sharded_shape):
-                    raise ValueError(f"Invalid x-split dimension: {policy.x}, tensor rank is {len(sharded_shape)}")
-                sharded_shape[policy.x] = _ceildiv(sharded_shape[policy.x], ncols)
+        for dim, extent in enumerate(sharded_shape):
+            row_shards = isinstance(policy.row, Shard) and policy.row.dim == dim
+            col_shards = isinstance(policy.col, Shard) and policy.col.dim == dim
+            if not row_shards and not col_shards:
+                continue
+            shard_factor = 1
+            if row_shards:
+                shard_factor *= nrows
+            if col_shards:
+                shard_factor *= ncols
+            sharded_shape[dim] = _ceildiv(extent, shard_factor)
 
         return tuple(sharded_shape)
 
     def __call__(
         self,
         shape: ShapeType,
-        sharding_policy: MeshShardingPolicy,
+        placement: PlacementSpec | None = None,
         device_mesh_config: tuple[int | PrimExpr, int | PrimExpr] | DType | None = None,
         dtype: DType = "float32",
         layout=None,
+        *,
+        sharding_policy: PlacementSpec | None = None,
     ) -> TensorWithMeta:
+        if sharding_policy is not None:
+            if placement is not None:
+                raise TypeError("Specify only one of placement or the legacy sharding_policy argument")
+            placement = sharding_policy
+        if placement is None:
+            raise TypeError("MeshTensor requires a placement")
+        placement = _normalize_placement(placement)
         if isinstance(shape, (int, PrimExpr)):
             shape = (shape,)
         if device_mesh_config is not None and not _is_mesh_config(device_mesh_config):
@@ -322,7 +297,7 @@ class MeshTensorProxy:
             device_mesh_config = (mesh_nrows(), mesh_ncols())
         dtype = _dtypes.normalize_dtype(dtype)
         nrows, ncols = device_mesh_config
-        sharded_shape = self._get_sharded_shape(shape, sharding_policy, nrows, ncols)
+        sharded_shape = self._get_sharded_shape(shape, placement, nrows, ncols)
         sharded_strides = TensorProxy._construct_strides(sharded_shape)
         shape_exprs = [_to_primexpr(s) for s in shape]
         sharded_shape_exprs = [_to_primexpr(s) for s in sharded_shape]
@@ -333,10 +308,7 @@ class MeshTensorProxy:
             local_shape=sharded_shape,
             local_strides=sharded_strides,
             mesh_shape=(nrows, ncols),
-            shard_x=sharding_policy.x if sharding_policy.x is not None else -1,
-            shard_y=sharding_policy.y if sharding_policy.y is not None else -1,
-            replicate=sharding_policy.replicate.value,
-            cross_mesh_dim=sharding_policy.cross_mesh_dim if sharding_policy.cross_mesh_dim is not None else -1,
+            placement=_placement_metadata(placement),
         )
 
         # Build global layout (CuteLayout object).
@@ -383,10 +355,12 @@ if TYPE_CHECKING:
         def __new__(
             cls,
             shape: ShapeType,
-            sharding_policy: MeshShardingPolicy,
+            placement: PlacementSpec | None = None,
             device_mesh_config: tuple[int | PrimExpr, int | PrimExpr] | DType | None = None,
             dtype: DType = "float32",
             layout=None,
+            *,
+            sharding_policy: PlacementSpec | None = None,
         ) -> TensorWithMeta: ...
 
         def get_local_extent(self, cid) -> tuple[Any, ...]: ...
