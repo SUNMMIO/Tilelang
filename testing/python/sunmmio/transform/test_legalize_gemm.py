@@ -26,11 +26,7 @@ import pytest
 import tilelang as tl
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.carver.arch import driver
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
-
-
-_MESH_NROWS, _MESH_NCOLS = driver.get_sunmmio_device_mesh_config()
 
 
 def apply_pipeline_up_to_legalize_gemm(mod):
@@ -95,9 +91,9 @@ def bf16_gemm_with_allgather(M=128, N=128, K=128, block_M=32, block_N=32, block_
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)
-            A_shared_dist = T.alloc_shared((block_M, block_K * _MESH_NCOLS), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-            B_shared_dist = T.alloc_shared((block_K * _MESH_NROWS, block_N), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             T.clear(C_shared)
@@ -171,9 +167,9 @@ def bf16_gemm_with_copy_to_asram(M=128, N=128, K=128, block_M=32, block_N=32, bl
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
             # A staged via direct copy (no all_gather): full DRAM->ASRAM transfer.
-            A_dist = T.alloc_shared((block_M, block_K * _MESH_NCOLS), dtype)
+            A_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-            B_shared_dist = T.alloc_shared((block_K * _MESH_NROWS, block_N), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             T.clear(C_shared)
@@ -461,9 +457,9 @@ def bf16_gemm_with_hoisted_allgather(M=128, N=128, K=128, block_M=32, block_N=32
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)
-            A_shared_dist = T.alloc_shared((block_M, block_K * _MESH_NCOLS), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-            B_shared_dist = T.alloc_shared((block_K * _MESH_NROWS, block_N), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             # A loaded + gathered ONCE, hoisted out of the K-loop.
@@ -514,9 +510,9 @@ def bf16_gemm_with_hoisted_allgather_dirty_source(
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)
-            A_shared_dist = T.alloc_shared((block_M, block_K * _MESH_NCOLS), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-            B_shared_dist = T.alloc_shared((block_K * _MESH_NROWS, block_N), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             T.copy(A[0, 0], A_shared)

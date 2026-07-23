@@ -1,5 +1,4 @@
 import tilelang
-import tilelang.utils.target as _target_utils
 import tilelang.language as T
 import tilelang.transform as tl_transform
 import tvm_ffi
@@ -19,16 +18,6 @@ tilelang.env.disable_cache()
 
 _MESH_VAR_NAMES = ("mesh_nrows", "mesh_ncols")
 _layout_logical_shape = tvm_ffi.get_global_func("tl.CuteLayout_logical_shape")
-
-
-@pytest.fixture
-def _strict_region_validation():
-    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
-    _target_utils.set_sunmmio_region_validation(True)
-    try:
-        yield
-    finally:
-        _target_utils.set_sunmmio_region_validation(previous)
 
 
 def _sunmmio_target(nrows=4, ncols=4):
@@ -421,7 +410,7 @@ def test_lower_and_optimize_resolve_kernel_default_mesh_ncores():
     assert _thread_extents(device_func)["blockIdx.x"] == 16
 
 
-def test_lower_and_optimize_symbolic_mesh_gemm_kernel(_strict_region_validation):
+def test_lower_and_optimize_symbolic_mesh_gemm_kernel():
     target = _sunmmio_target_with_host()
     mod = _symbolic_mesh_gemm_mod()
 
@@ -441,7 +430,7 @@ def test_lower_and_optimize_symbolic_mesh_gemm_kernel(_strict_region_validation)
     assert "mesh_ncols" not in script
 
 
-def test_lower_and_optimize_symbolic_mesh_all_gather_shape_kernel(_strict_region_validation):
+def test_lower_and_optimize_symbolic_mesh_all_gather_shape_kernel():
     target = _sunmmio_target_with_host()
     mod = _symbolic_mesh_all_gather_mod()
 

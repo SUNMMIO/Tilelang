@@ -245,6 +245,40 @@ def test_comm_compact_path_keeps_original_dynamic_extent_behavior():
         _target_utils.set_sunmmio_region_validation(previous)
 
 
+def test_comm_compact_path_warns_and_accepts_unresolved_mesh_shape():
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(False)
+    try:
+        with pytest.warns(UserWarning, match="cannot resolve mesh-symbol extents"):
+
+            @T.prim_func
+            def main():
+                with T.Kernel():
+                    send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                    recv = T.alloc_shared((32, 32 * T.mesh_ncols()), "float32", scope="shared.rsram")
+                    T.comm.all_gather(send, recv, direction="h", axis=-1)
+
+        assert "mesh_ncols" in main.script()
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+
+def test_comm_compact_path_keeps_static_checks_with_unresolved_mesh_shape():
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(False)
+    try:
+        with pytest.raises(AssertionError, match="Receive buffer shape"):
+
+            @T.prim_func
+            def main():
+                with T.Kernel():
+                    send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                    recv = T.alloc_shared((64, 32 * T.mesh_ncols()), "float32", scope="shared.rsram")
+                    T.comm.all_gather(send, recv, direction="h", axis=-1)
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+
 def test_comm_one_to_one_full_buffer_extent_mismatch_is_rejected(_strict_region_validation):
     with pytest.raises(ValueError, match="exact match is required for Buffer-to-Buffer operation"):
 

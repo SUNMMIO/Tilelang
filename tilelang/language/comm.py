@@ -16,7 +16,7 @@ import tilelang.utils.target as _target_utils
 import tilelang.language as T
 from tilelang._typing import BufferLikeType
 from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
-from tilelang.utils.language import prim_expr_equal, to_buffer_region
+from tilelang.utils.language import prim_expr_contains_mesh_symbol, prim_expr_equal, to_buffer_region
 
 from tilelang.carver.arch.driver import get_sunmmio_device_mesh_config
 
@@ -162,25 +162,60 @@ def _compact_extent_is_one(extent) -> bool:
     return _compact_extent_equal(extent, tir.IntImm("int32", 1))
 
 
+def _compact_shape_matches(lhs, rhs, *, allow_broadcast: bool) -> bool:
+    if len(lhs) != len(rhs):
+        return False
+
+    has_unresolved_mesh_extent = False
+    for lhs_extent, rhs_extent in zip(lhs, rhs):
+        matches = _compact_extent_equal(lhs_extent, rhs_extent)
+        if allow_broadcast:
+            matches = matches or _compact_extent_is_one(lhs_extent) or _compact_extent_is_one(rhs_extent)
+        if matches:
+            continue
+        if prim_expr_contains_mesh_symbol(lhs_extent) or prim_expr_contains_mesh_symbol(rhs_extent):
+            has_unresolved_mesh_extent = True
+            continue
+        return False
+
+    if has_unresolved_mesh_extent:
+        warnings.warn(
+            "Compact SunMMIO communication shape validation cannot resolve mesh-symbol extents; "
+            "accepting them without frontend validation.",
+            UserWarning,
+            stacklevel=5,
+        )
+    return True
+
+
 def _compact_shape_equal(lhs, rhs) -> bool:
-    return len(lhs) == len(rhs) and all(_compact_extent_equal(lhs_extent, rhs_extent) for lhs_extent, rhs_extent in zip(lhs, rhs))
+    return _compact_shape_matches(lhs, rhs, allow_broadcast=False)
 
 
 def _compact_shape_compatible(lhs, rhs) -> bool:
-    return len(lhs) == len(rhs) and all(
-        _compact_extent_equal(lhs_extent, rhs_extent) or _compact_extent_is_one(lhs_extent) or _compact_extent_is_one(rhs_extent)
-        for lhs_extent, rhs_extent in zip(lhs, rhs)
-    )
+    return _compact_shape_matches(lhs, rhs, allow_broadcast=True)
 
 
 def _prepare_comm_region_compact(obj: BufferLikeType, access_type: str) -> _PreparedCommRegion:
     region = to_buffer_region(obj, access_type=access_type)
     if not isinstance(region, tir.BufferRegion):
         raise TypeError(f"Expected a buffer-like object, got {type(obj)}.")
+    extents = [rng.extent for rng in region.region]
+    encoded_region: tir.PrimExpr | tir.BufferRegion = region
+    if any(prim_expr_contains_mesh_symbol(extent) for extent in extents):
+        # BufferRegion call arguments cannot represent symbolic extents, so keep
+        # the original shape in an explicit tl.region call until mesh resolution.
+        encoded_region = tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.tileop.region"),
+            tir.BufferLoad(region.buffer, [rng.min for rng in region.region]),
+            tir.IntImm("int32", ACCESS_MASK[access_type]),
+            *extents,
+        )
     return _PreparedCommRegion(
         buffer=region.buffer,
-        extents=[rng.extent for rng in region.region],
-        region=region,
+        extents=extents,
+        region=encoded_region,
     )
 
 

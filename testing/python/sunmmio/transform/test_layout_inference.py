@@ -15,7 +15,6 @@ from tilelang.utils.target import determine_target
 import tilelang as tl
 import tilelang.language as T
 import tilelang.env as env
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout, make_zn_layout
 
 tilelang.env.disable_cache()
@@ -1324,7 +1323,6 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, versio
 
 
 def matmul_persistent(M, N, K, block_M, block_N, block_K, num_stages, dtype=T.bfloat16, accum_dtype=T.float32):
-    nrows, ncols = driver.get_sunmmio_device_mesh_config()
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
@@ -1340,9 +1338,9 @@ def matmul_persistent(M, N, K, block_M, block_N, block_K, num_stages, dtype=T.bf
             _, sharded_N = B.local_shape
 
             A_shared = T.alloc_shared((block_M, block_K), dtype)
-            A_shared_dist = T.alloc_shared((block_M, block_K * ncols), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-            B_shared_dist = T.alloc_shared((block_K * nrows, block_N), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             # Each core iterates its own sharded tile grid with plain nested
