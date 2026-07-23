@@ -3713,17 +3713,16 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     }
     if (const auto *store = stmt.as<BufferStoreNode>()) {
       if (IsSunmmioLocalVarBuffer(store->buffer)) {
-        EmitLocalVarStore(
-            store->buffer, store->indices,
-            lower_expr_with_context(store->value, state, store->buffer->dtype,
-                                    store));
+        EmitLocalVarStore(store->buffer, store->indices,
+                          lower_expr_with_context(store->value, state,
+                                                  store->buffer->dtype, store));
         return;
       }
       auto local_it = state->local_tile_values.find(store->buffer.get());
       if (local_it != state->local_tile_values.end()) {
         SunMMIOType local_type = local_it->second.type;
-        SunMMIOValue rhs = lower_expr_with_context(
-            store->value, state, local_type.dtype, store);
+        SunMMIOValue rhs = lower_expr_with_context(store->value, state,
+                                                   local_type.dtype, store);
         if (!IsTileLike(rhs)) {
           SunMMIOType scalar_type{
               SunMMIOType::Kind::kScalar, local_type.dtype, 1, {}};
@@ -3742,8 +3741,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       auto reg_ty_it = state->register_tile_types.find(store->buffer.get());
       if (reg_ty_it != state->register_tile_types.end()) {
         SunMMIOType reg_type = reg_ty_it->second;
-        SunMMIOValue rhs = lower_expr_with_context(
-            store->value, state, reg_type.dtype, store);
+        SunMMIOValue rhs =
+            lower_expr_with_context(store->value, state, reg_type.dtype, store);
         if (!IsTileLike(rhs)) {
           SunMMIOType scalar_type{
               SunMMIOType::Kind::kScalar, reg_type.dtype, 1, {}};

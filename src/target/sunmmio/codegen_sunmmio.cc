@@ -56,8 +56,7 @@ std::string FormatSpanForDiagnostic(const Span &span) {
   }
 
   std::ostringstream os;
-  os << static_cast<std::string>(node->source_name->name) << ":"
-     << node->line;
+  os << static_cast<std::string>(node->source_name->name) << ":" << node->line;
   if (node->column > 0) {
     os << ":" << node->column;
   }
@@ -2716,10 +2715,9 @@ CodeGenTileLangSunMMIO::UnsupportedStmt(const Object *op,
   TVM_FFI_UNREACHABLE();
 }
 
-[[noreturn]] void
-CodeGenTileLangSunMMIO::UnsupportedExpr(const Object *op,
-                                        const std::string &detail,
-                                        const Object *diagnostic_context) const {
+[[noreturn]] void CodeGenTileLangSunMMIO::UnsupportedExpr(
+    const Object *op, const std::string &detail,
+    const Object *diagnostic_context) const {
   // Generic SunMMIO codegen intentionally rejects pre-lowered structural forms.
   // Reaching unsupported nodes here indicates a pipeline invariant violation.
   std::ostringstream os;

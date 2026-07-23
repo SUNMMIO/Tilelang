@@ -104,18 +104,18 @@ Span DecodeDslSpan(const PrimExpr &value) {
   column = std::max(column, 0);
   end_line = end_line > 0 ? end_line : line;
   end_column = std::max(end_column, column);
-  return Span(SourceName::Get(UnescapeField(fields[0])), line, end_line,
-              column, end_column);
+  return Span(SourceName::Get(UnescapeField(fields[0])), line, end_line, column,
+              end_column);
 }
 
 class AttachDslSpanMutator : public StmtExprMutator {
- public:
+public:
   Stmt VisitStmt(const Stmt &stmt) override {
     Stmt ret = StmtExprMutator::VisitStmt(stmt);
     return AttachSpan(ret);
   }
 
- protected:
+protected:
   PrimExpr VisitExpr(const PrimExpr &expr) override {
     PrimExpr ret = StmtExprMutator::VisitExpr(expr);
     return AttachSpan(ret);
@@ -137,7 +137,7 @@ class AttachDslSpanMutator : public StmtExprMutator {
     return StmtExprMutator::VisitStmt_(op);
   }
 
- private:
+private:
   Span CurrentSpan() const {
     if (span_stack_.empty()) {
       return Span();
