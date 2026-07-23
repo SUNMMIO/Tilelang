@@ -111,6 +111,38 @@ private:
   Map<Buffer, Layout> layout_remap_;
 };
 
+class FillMissingSpanMutator : public StmtExprMutator {
+public:
+  explicit FillMissingSpanMutator(Span span) : span_(std::move(span)) {}
+
+  Stmt VisitStmt(const Stmt &stmt) final {
+    Stmt ret = StmtExprMutator::VisitStmt(stmt);
+    if (ret.defined() && span_.defined() && !ret->span.defined()) {
+      ret->span = span_;
+    }
+    return ret;
+  }
+
+protected:
+  PrimExpr VisitExpr(const PrimExpr &expr) final {
+    PrimExpr ret = StmtExprMutator::VisitExpr(expr);
+    if (ret.defined() && span_.defined() && !ret->span.defined()) {
+      ret->span = span_;
+    }
+    return ret;
+  }
+
+private:
+  Span span_;
+};
+
+Stmt FillMissingSpan(Stmt stmt, Span span) {
+  if (!stmt.defined() || !span.defined()) {
+    return stmt;
+  }
+  return FillMissingSpanMutator(std::move(span)).VisitStmt(stmt);
+}
+
 class LowerTileOpPass : arith::IRMutatorWithAnalyzer {
 public:
   static PrimFunc Substitute(PrimFunc f) {
@@ -962,6 +994,11 @@ private:
                   layout_map_, buffer_remap_, let_var_to_expr,
                   global_layout_map_, tileview_map_, register_scratch},
         analyzer_);
+    Span source_span = op->span;
+    if (!source_span.defined() && call != nullptr) {
+      source_span = call->span;
+    }
+    lowered = FillMissingSpan(std::move(lowered), std::move(source_span));
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
 

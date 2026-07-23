@@ -266,6 +266,9 @@ def LowerAndLegalize_sunmmio_test(
     mod = tir.transform.BindTarget(target)(mod)
     pass_output_process(mod, "BindTarget", test_config)
 
+    mod = tilelang.transform.AttachDslSpan()(mod)
+    pass_output_process(mod, "AttachDslSpan", test_config)
+
     mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
     pass_output_process(mod, "ResolveSunmmioMeshSymbols", test_config)
 

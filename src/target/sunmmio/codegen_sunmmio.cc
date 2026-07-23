@@ -2461,9 +2461,17 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
       attrs[SunMMIOCallAttrKey::kCandidateMasks] = std::move(candidate_masks);
     }
   } else if (callee == "tl.dma_copy") {
-    ICHECK_EQ(op->args.size(), 4)
-        << "tl.dma_copy expects src region, dst region, src_offset_byte, "
-           "and sync_token_id";
+    auto fail_copy = [&](const std::string &message) {
+      std::ostringstream os;
+      os << message;
+      AppendObjectSpanForDiagnostic(&os, op);
+      LOG(FATAL) << os.str();
+      TVM_FFI_UNREACHABLE();
+    };
+    if (op->args.size() != 4) {
+      fail_copy("tl.dma_copy expects src region, dst region, src_offset_byte, "
+                "and sync_token_id");
+    }
     auto count_tiled_dims = [](const PrimExpr &region_expr) -> int {
       BufferRegion region = tl::NormalizeToBufferRegion(region_expr);
       int count = 0;
@@ -2481,17 +2489,20 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     int dst_tiled_dims = count_tiled_dims(op->args[1]);
 
     const auto *src_offset_imm = op->args[2].as<IntImmNode>();
-    ICHECK(src_offset_imm)
-        << "tl.dma_copy src_offset_byte must be a constant IntImm";
+    if (src_offset_imm == nullptr) {
+      fail_copy("tl.dma_copy src_offset_byte must be a constant IntImm");
+    }
     int64_t src_offset_byte = static_cast<int64_t>(src_offset_imm->value);
-    ICHECK_GE(src_offset_byte, 0)
-        << "tl.dma_copy src_offset_byte must be non-negative";
+    if (src_offset_byte < 0) {
+      fail_copy("tl.dma_copy src_offset_byte must be non-negative");
+    }
     MarkVisitedNodeType(src_offset_imm->GetTypeKey());
 
     operands.reserve(2);
 
-    ICHECK(TryConsumeSyncTokenId(op->args[3], &attrs))
-        << "tl.dma_copy expects fourth argument to be tl.sync_token_id";
+    if (!TryConsumeSyncTokenId(op->args[3], &attrs)) {
+      fail_copy("tl.dma_copy expects fourth argument to be tl.sync_token_id");
+    }
 
     operands.push_back(EmitRegionCall(op->args[0], src_offset_byte));
     operands.push_back(EmitRegionCall(op->args[1]));
@@ -2707,7 +2718,8 @@ CodeGenTileLangSunMMIO::UnsupportedStmt(const Object *op,
 
 [[noreturn]] void
 CodeGenTileLangSunMMIO::UnsupportedExpr(const Object *op,
-                                        const std::string &detail) const {
+                                        const std::string &detail,
+                                        const Object *diagnostic_context) const {
   // Generic SunMMIO codegen intentionally rejects pre-lowered structural forms.
   // Reaching unsupported nodes here indicates a pipeline invariant violation.
   std::ostringstream os;
@@ -2715,7 +2727,12 @@ CodeGenTileLangSunMMIO::UnsupportedExpr(const Object *op,
   if (!detail.empty()) {
     os << " (" << detail << ")";
   }
-  AppendObjectSpanForDiagnostic(&os, op);
+  if (FormatObjectSpanForDiagnostic(op).empty() &&
+      diagnostic_context != nullptr) {
+    AppendObjectSpanForDiagnostic(&os, diagnostic_context);
+  } else {
+    AppendObjectSpanForDiagnostic(&os, op);
+  }
   LOG(FATAL) << os.str();
   TVM_FFI_UNREACHABLE();
 }

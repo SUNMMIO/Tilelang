@@ -1354,6 +1354,29 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   std::function<void(const Stmt &, TileBlockState *)> lower_reduce_stmt;
   std::function<void(const CallNode *, TileBlockState *)>
       lower_vector_core_in_tile_reduce;
+  std::vector<const Object *> expr_diagnostic_context_stack;
+
+  auto current_expr_diagnostic_context = [&]() -> const Object * {
+    if (expr_diagnostic_context_stack.empty()) {
+      return nullptr;
+    }
+    return expr_diagnostic_context_stack.back();
+  };
+
+  auto unsupported_expr = [&](const Object *expr,
+                              const std::string &detail) -> void {
+    UnsupportedExpr(expr, detail, current_expr_diagnostic_context());
+  };
+
+  auto lower_expr_with_context =
+      [&](const PrimExpr &expr, TileBlockState *state,
+          std::optional<DataType> preferred_dtype,
+          const Object *diagnostic_context) -> SunMMIOValue {
+    expr_diagnostic_context_stack.push_back(diagnostic_context);
+    SunMMIOValue value = lower_expr(expr, state, preferred_dtype);
+    expr_diagnostic_context_stack.pop_back();
+    return value;
+  };
 
   auto find_local_unit_axis_in_expr =
       [&](const PrimExpr &expr,
@@ -3291,7 +3314,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
             return tile;
           }
           if (tile.dtype.is_bool()) {
-            UnsupportedExpr(
+            unsupported_expr(
                 source_expr.get(),
                 "Cannot materialize bool tile broadcast with "
                 "suvm.tile.broadcast; lower the mask producer to the "
@@ -3398,7 +3421,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                      force_f32 ? std::optional<DataType>(DataType::Float(32))
                                : std::nullopt);
       if (!IsTileLike(data)) {
-        UnsupportedExpr(
+        unsupported_expr(
             expr.get(),
             "Clean v4 tiles lowering currently only supports tile-valued unary "
             "math inside T.Tiles");
@@ -3576,13 +3599,20 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         return emit_unary(TileUnaryOp::kRsqrt, call->args[0], call->dtype);
       }
     }
-    UnsupportedExpr(expr.get(),
-                    "Clean v4 tiles lowering currently supports only "
-                    "BufferLoad/add/sub/mul/div/mod/min/max/compare/select/"
-                    "cast/constants and selected unary math calls");
+    unsupported_expr(expr.get(),
+                     "Clean v4 tiles lowering currently supports only "
+                     "BufferLoad/add/sub/mul/div/mod/min/max/compare/select/"
+                     "cast/constants and selected unary math calls");
+    TVM_FFI_UNREACHABLE();
   };
 
   lower_stmt = [&](const Stmt &stmt, TileBlockState *state) {
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      if (attr->attr_key == tl::attr::kDslSpan) {
+        lower_stmt(attr->body, state);
+        return;
+      }
+    }
     if (const auto *seq = stmt.as<SeqStmtNode>()) {
       for (const Stmt &s : seq->seq) {
         lower_stmt(s, state);
@@ -3685,13 +3715,15 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       if (IsSunmmioLocalVarBuffer(store->buffer)) {
         EmitLocalVarStore(
             store->buffer, store->indices,
-            lower_expr(store->value, state, store->buffer->dtype));
+            lower_expr_with_context(store->value, state, store->buffer->dtype,
+                                    store));
         return;
       }
       auto local_it = state->local_tile_values.find(store->buffer.get());
       if (local_it != state->local_tile_values.end()) {
         SunMMIOType local_type = local_it->second.type;
-        SunMMIOValue rhs = lower_expr(store->value, state, local_type.dtype);
+        SunMMIOValue rhs = lower_expr_with_context(
+            store->value, state, local_type.dtype, store);
         if (!IsTileLike(rhs)) {
           SunMMIOType scalar_type{
               SunMMIOType::Kind::kScalar, local_type.dtype, 1, {}};
@@ -3710,7 +3742,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       auto reg_ty_it = state->register_tile_types.find(store->buffer.get());
       if (reg_ty_it != state->register_tile_types.end()) {
         SunMMIOType reg_type = reg_ty_it->second;
-        SunMMIOValue rhs = lower_expr(store->value, state, reg_type.dtype);
+        SunMMIOValue rhs = lower_expr_with_context(
+            store->value, state, reg_type.dtype, store);
         if (!IsTileLike(rhs)) {
           SunMMIOType scalar_type{
               SunMMIOType::Kind::kScalar, reg_type.dtype, 1, {}};
@@ -3786,9 +3819,9 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           store->predicate.defined()) {
         state->active_tail_store_predicate = store->predicate.value();
       }
-      SunMMIOValue raw_rhs =
-          lower_expr(store->value, state,
-                     CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
+      SunMMIOValue raw_rhs = lower_expr_with_context(
+          store->value, state,
+          CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1), store);
       state->active_tail_store_predicate = saved_tail_store_predicate;
       SunMMIOValue rhs = access.requires_aligned_1d_load
                              ? normalize_for_aligned_1d_store(access, raw_rhs)

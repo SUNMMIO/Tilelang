@@ -461,7 +461,9 @@ private:
   [[noreturn]] void UnsupportedStmt(const Object *op,
                                     const std::string &detail = "") const;
   [[noreturn]] void UnsupportedExpr(const Object *op,
-                                    const std::string &detail = "") const;
+                                    const std::string &detail = "",
+                                    const Object *diagnostic_context =
+                                        nullptr) const;
 
   std::unique_ptr<SunMMIOBuilder> builder_;
   tvm::Target target_;
