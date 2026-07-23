@@ -2443,8 +2443,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       [&](const PrimExpr &predicate, TileBlockState *state,
           const TileAccessInfo &access,
           DataType mask_index_dtype) -> std::optional<SunMMIOValue> {
-    if (scope.is_reduce_scope || access.tile_rank != 2 ||
-        access.tile_shape != scope.tile_shape) {
+    if (access.tile_rank != 2 || access.tile_shape != scope.tile_shape) {
       return std::nullopt;
     }
     std::array<bool, 2> matched_axes =
@@ -2619,6 +2618,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         << "Tile value with shape " << shape_to_string(src_shape)
         << " is not broadcastable to target shape "
         << shape_to_string(dst_shape);
+    ICHECK(!tile.dtype.is_bool())
+        << "Bool tile predicates must be lowered to the target shape directly; "
+           "cannot broadcast mask from "
+        << shape_to_string(src_shape) << " to " << shape_to_string(dst_shape);
     SunMMIOType dst_type = MakeTileType(tile.dtype, dst_shape);
     return builder_->TileBroadcast(NewValueName(), tile, dst_type, tile.dtype);
   };
@@ -3041,13 +3044,21 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           std::optional<SunMMIOValue> canonical_mask =
               build_canonical_rank2_predicate_mask(
                   load->predicate.value(), state, access, mask_index_dtype);
-          SunMMIOValue lowered_mask = canonical_mask.has_value()
-                                          ? canonical_mask.value()
-                                          : lower_expr(load->predicate.value(),
-                                                       state, mask_index_dtype);
-          if (!canonical_mask.has_value()) {
+          SunMMIOValue lowered_mask =
+              canonical_mask.has_value()
+                  ? canonical_mask.value()
+                  : lower_bool_expr_to_shape(load->predicate.value(),
+                                             access.tile_shape,
+                                             mask_index_dtype);
+          if (!IsTileLike(lowered_mask)) {
+            SunMMIOType bool_scalar_type{
+                SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
             lowered_mask =
-                broadcast_tile_to_shape(lowered_mask, access.tile_shape);
+                EnsureType(lowered_mask, bool_scalar_type, DataType::Bool());
+            lowered_mask = builder_->TileFill(
+                NewValueName(), lowered_mask,
+                MakeTileType(DataType::Bool(), access.tile_shape),
+                DataType::Bool());
           }
           DataType value_dtype =
               CanonicalizeSuvmDType(load->buffer->dtype).with_lanes(1);
