@@ -161,6 +161,7 @@ def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
 
     LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
+    mod = tilelang.transform.AttachDslSpan()(mod)
     mod = tilelang.transform.LegalizeTilesLoop()(mod)
     mod = tilelang.transform.TilesLoop()(mod)
     mod = tilelang.transform.SunmmioTileLoopFusion()(mod)

@@ -52,6 +52,7 @@ static constexpr const char *kEnableAggressiveSharedMemoryMerge =
     "tl.enable_aggressive_shared_memory_merge";
 static constexpr const char *kDisableFastMath = "tl.disable_fast_math";
 static constexpr const char *kEnableFastMath = "tl.enable_fast_math";
+static constexpr const char *kEnableDslSpan = "tl.enable_dsl_span";
 static constexpr const char *kPtxasRegisterUsageLevel =
     "tl.ptxas_register_usage_level";
 static constexpr const char *kEnablePTXASVerboseOutput =

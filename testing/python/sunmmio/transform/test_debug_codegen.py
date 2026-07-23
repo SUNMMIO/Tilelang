@@ -75,8 +75,10 @@ def debug_dsl_realistic_kernel(
 
 
 def test_debug_codegen_reports_dsl_line_for_realistic_kernel(tmp_path):
+    kernel = debug_dsl_realistic_kernel()
+
     message = _run_expected_validate_failure(
-        debug_dsl_realistic_kernel(),
+        kernel,
         tmp_path,
         mlir_filename="debug_dsl_realistic_kernel_suvm.mlir",
     )
@@ -85,6 +87,11 @@ def test_debug_codegen_reports_dsl_line_for_realistic_kernel(tmp_path):
         "SPAN_CASE_REALISTIC_TILES",
         ("unsupported expr", "tir.Call", "selected unary math calls"),
     )
+
+
+def test_debug_codegen_default_span_does_not_emit_marker_in_script():
+    kernel = debug_dsl_realistic_kernel()
+    assert "tilelang.dsl_span" not in kernel.script()
 
 
 if __name__ == "__main__":

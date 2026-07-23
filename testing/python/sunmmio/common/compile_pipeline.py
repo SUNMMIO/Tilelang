@@ -308,6 +308,9 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.LowerTileOp()(mod)
     pass_output_process(mod, "LowerTileOp", test_config)
 
+    mod = tilelang.transform.AttachDslSpan()(mod)
+    pass_output_process(mod, "AttachDslSpanAfterLowerTileOp", test_config)
+
     mod = tilelang.transform.LegalizeTilesLoop()(mod)
     pass_output_process(mod, "LegalizeTilesLoop", test_config)
 

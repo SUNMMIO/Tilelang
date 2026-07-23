@@ -147,7 +147,9 @@ class AttachDslSpanMutator : public StmtExprMutator {
 
   Stmt AttachSpan(const Stmt &stmt) const {
     Span span = CurrentSpan();
-    if (stmt.defined() && span.defined() && !stmt->span.defined()) {
+    if (stmt.defined() && stmt.as<BlockNode>() == nullptr &&
+        stmt.as<BlockRealizeNode>() == nullptr && span.defined() &&
+        !stmt->span.defined()) {
       stmt->span = span;
     }
     return stmt;

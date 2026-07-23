@@ -2,6 +2,7 @@ from __future__ import annotations
 from contextlib import contextmanager, AbstractContextManager
 from dataclasses import dataclass
 import inspect
+import os
 import sys
 
 from tilelang.language.kernel import KernelLaunchFrame
@@ -9,7 +10,7 @@ from tvm_ffi.container import Map
 from tvm.ir.base import Span
 from tvm.ir.expr import Range
 from tvm.tir.stmt import BufferRegion
-from tvm.tir.stmt_functor import substitute
+from tvm.tir.stmt_functor import post_order_visit, substitute
 from .ast import BaseBuilder, IRGenerator, eval_op, has_internal_prim_func, mutate
 from .utils import construct_strides
 from tilelang.utils import side_effect
@@ -176,6 +177,8 @@ def is_var(v: Any) -> bool:
 EagerJITStage = Literal["phase1", "phase2", "none"]
 
 DSL_SPAN_ATTR = "tilelang.dsl_span"
+DSL_SPAN_CONFIG_KEY = "tl.enable_dsl_span"
+DSL_SPAN_ENV_VAR = "TILELANG_ENABLE_DSL_SPAN"
 
 
 class Builder(BaseBuilder):
@@ -297,7 +300,10 @@ class Builder(BaseBuilder):
         self.name_inside_frame, self.macro_arg_annot = save
 
     def get(self) -> PrimFunc:
-        return self.ir_builder.get()
+        prim_func = self.ir_builder.get()
+        if self._has_dsl_span_marker(prim_func):
+            return self._attach_dsl_spans_to_prim_func(prim_func)
+        return prim_func
 
     def find_frame_idx(self, frame: type | tuple[type, ...], start=0) -> int | None:
         for idx in reversed(range(start, len(self.frames))):
@@ -309,7 +315,41 @@ class Builder(BaseBuilder):
     def _escape_dsl_span_field(value: str) -> str:
         return value.replace("%", "%25").replace("|", "%7C")
 
+    @staticmethod
+    def _dsl_span_enabled() -> bool:
+        env_value = os.environ.get(DSL_SPAN_ENV_VAR)
+        if env_value is not None:
+            return env_value.strip().lower() not in ("0", "false", "off", "no")
+        config_value = tvm.transform.PassContext.current().config.get(DSL_SPAN_CONFIG_KEY, None)
+        if config_value is not None:
+            return bool(config_value)
+        return True
+
+    @staticmethod
+    def _has_dsl_span_marker(prim_func: PrimFunc) -> bool:
+        found = False
+
+        def visit(node):
+            nonlocal found
+            if not found and getattr(node, "attr_key", None) == DSL_SPAN_ATTR:
+                found = True
+
+        post_order_visit(prim_func.body, visit)
+        return found
+
+    @staticmethod
+    def _attach_dsl_spans_to_prim_func(prim_func: PrimFunc) -> PrimFunc:
+        from tilelang import transform as tl_transform
+
+        global_symbol = "main"
+        if prim_func.attrs is not None:
+            global_symbol = str(prim_func.attrs.get("global_symbol", global_symbol))
+        mod = tvm.IRModule({global_symbol: prim_func})
+        return tl_transform.AttachDslSpan()(mod)[global_symbol]
+
     def _encoded_dsl_span(self) -> str | None:
+        if not self._dsl_span_enabled():
+            return None
         if not self.current_file or self.current_line <= 0:
             return None
         fields = [
@@ -336,6 +376,7 @@ class Builder(BaseBuilder):
             (
                 tir.frame.PrimFuncFrame,
                 tir.frame.AttrFrame,
+                tir.frame.BlockFrame,
                 tir.frame.ThenFrame,
                 tir.frame.ElseFrame,
                 tir.frame.BlockInitFrame,
