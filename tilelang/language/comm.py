@@ -166,7 +166,6 @@ def _compact_shape_matches(lhs, rhs, *, allow_broadcast: bool) -> bool:
     if len(lhs) != len(rhs):
         return False
 
-    has_unresolved_mesh_extent = False
     for lhs_extent, rhs_extent in zip(lhs, rhs):
         matches = _compact_extent_equal(lhs_extent, rhs_extent)
         if allow_broadcast:
@@ -174,17 +173,9 @@ def _compact_shape_matches(lhs, rhs, *, allow_broadcast: bool) -> bool:
         if matches:
             continue
         if prim_expr_contains_mesh_symbol(lhs_extent) or prim_expr_contains_mesh_symbol(rhs_extent):
-            has_unresolved_mesh_extent = True
             continue
         return False
 
-    if has_unresolved_mesh_extent:
-        warnings.warn(
-            "Compact SunMMIO communication shape validation cannot resolve mesh-symbol extents; "
-            "accepting them without frontend validation.",
-            UserWarning,
-            stacklevel=5,
-        )
     return True
 
 

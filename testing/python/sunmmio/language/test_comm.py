@@ -1,3 +1,5 @@
+import warnings
+
 import pytest
 
 import tilelang
@@ -245,18 +247,22 @@ def test_comm_compact_path_keeps_original_dynamic_extent_behavior():
         _target_utils.set_sunmmio_region_validation(previous)
 
 
-def test_comm_compact_path_warns_and_accepts_unresolved_mesh_shape():
+def test_comm_compact_path_accepts_unresolved_mesh_shape_without_warning():
     previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
     _target_utils.set_sunmmio_region_validation(False)
     try:
-        with pytest.warns(UserWarning, match="cannot resolve mesh-symbol extents"):
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message=".*cannot resolve mesh-symbol extents.*")
 
             @T.prim_func
             def main():
                 with T.Kernel():
                     send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
                     recv = T.alloc_shared((32, 32 * T.mesh_ncols()), "float32", scope="shared.rsram")
+                    reduce_src = T.alloc_shared((32 * T.mesh_ncols(), 32), "float32", scope="shared.rsram")
+                    reduce_out = T.alloc_shared((128,), "float32", scope="shared.rsram")
                     T.comm.all_gather(send, recv, direction="h", axis=-1)
+                    T.comm.all_reduce(reduce_src, reduce_out, "sum", "h", dim=1)
 
         assert "mesh_ncols" in main.script()
     finally:
