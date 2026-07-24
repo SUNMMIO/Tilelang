@@ -80,7 +80,7 @@ def temp_stage_subaligned_then_direct_kernel(h=4, w=32, dtype=T.float32):
 
 
 @target("Sunmmio")
-def packed_1d_to_2d_scalar_fallback_kernel(h=4, base=8, vector_size=128, matrix_size=32, dtype=T.float32):
+def packed_1d_to_2d_rank1_fallback_kernel(h=4, base=8, vector_size=128, matrix_size=32, dtype=T.float32):
     assert base + h * h <= vector_size
     out_shape, token_policy, out_layout = _matrix_output_spec(matrix_size, matrix_size, dtype)
     vector_layout = make_aligned_row_major((vector_size,), dtype, align_bytes=64)
@@ -106,7 +106,7 @@ def packed_1d_to_2d_scalar_fallback_kernel(h=4, base=8, vector_size=128, matrix_
 
 
 @target("Sunmmio")
-def packed_2d_to_1d_scalar_fallback_kernel(h=4, base=8, vector_size=128, matrix_size=32, dtype=T.float32):
+def packed_2d_to_1d_rank1_fallback_kernel(h=4, base=8, vector_size=128, matrix_size=32, dtype=T.float32):
     assert base + h * h <= vector_size
     out_shape, token_policy, out_layout = _matrix_output_spec(matrix_size, matrix_size, dtype)
     vector_layout = make_aligned_row_major((vector_size,), dtype, align_bytes=64)
@@ -145,18 +145,6 @@ def _validate_aligned_1d_bridge(kernel, tmp_path, filename):
     assert "suvm.tile.set" not in src
 
 
-def _validate_scalar_fallback(kernel, tmp_path, filename):
-    src = validate_sunmmio_codegen_with_npuir_opt(
-        kernel,
-        tmp_path,
-        mlir_filename=filename,
-        expected_tokens=("suvm.tile.pick", "suvm.tile.set"),
-        opt_args=STRICT_OPT_ARGS,
-    )
-    assert "suvm.tile.extract_slice" not in src
-    assert "suvm.tile.insert_slice" not in src
-
-
 def test_serialized_rank1_zz_slices_lower_through_aligned_carriers(tmp_path):
     _validate_aligned_1d_bridge(
         serialized_rank1_zz_slices_kernel(),
@@ -173,19 +161,19 @@ def test_temp_stage_subaligned_then_direct_lowers_to_llvm(tmp_path):
     )
 
 
-def test_packed_1d_to_2d_falls_back_to_scalar_pick_set(tmp_path):
-    _validate_scalar_fallback(
-        packed_1d_to_2d_scalar_fallback_kernel(),
+def test_packed_1d_to_2d_falls_back_to_rank1_carriers(tmp_path):
+    _validate_aligned_1d_bridge(
+        packed_1d_to_2d_rank1_fallback_kernel(),
         tmp_path,
-        "packed_1d_to_2d_scalar_fallback_suvm.mlir",
+        "packed_1d_to_2d_rank1_fallback_suvm.mlir",
     )
 
 
-def test_packed_2d_to_1d_falls_back_to_scalar_pick_set(tmp_path):
-    _validate_scalar_fallback(
-        packed_2d_to_1d_scalar_fallback_kernel(),
+def test_packed_2d_to_1d_falls_back_to_rank1_carriers(tmp_path):
+    _validate_aligned_1d_bridge(
+        packed_2d_to_1d_rank1_fallback_kernel(),
         tmp_path,
-        "packed_2d_to_1d_scalar_fallback_suvm.mlir",
+        "packed_2d_to_1d_rank1_fallback_suvm.mlir",
     )
 
 

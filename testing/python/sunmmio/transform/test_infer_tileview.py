@@ -464,8 +464,8 @@ def test_infer_tileview_keeps_2d_for_trailing_axis_side_load():
     assert all(len(load.indices) == 2 for load in loads)
 
 
-def test_infer_tileview_falls_back_to_scalar_for_packed_2d_to_1d_store():
-    """A packed store combining both tile vars falls back to serial loops."""
+def test_infer_tileview_falls_back_to_rank1_for_packed_2d_to_1d_store():
+    """A fused packed store keeps its unit-stride axis as a 1D tile."""
     H, BASE, VECTOR_SIZE, MATRIX_SIZE = 4, 8, 128, 32
 
     @T.prim_func
@@ -479,15 +479,12 @@ def test_infer_tileview_falls_back_to_scalar_for_packed_2d_to_1d_store():
 
     mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
     mod = tl.transform.LowerTilesLoop()(mod)
-    script = mod["main"].script()
 
-    assert "tile.domain" not in script
-    assert "tile.scope_entry" not in script
-    assert "for i, j in T.grid(4, 4)" in script
+    assert_scope_plan(mod, expected_tile_size=[H], expected_execution_domain_axes=[1])
 
 
-def test_infer_tileview_falls_back_to_scalar_for_packed_1d_to_2d_load():
-    """A packed load combining both tile vars falls back to serial loops."""
+def test_infer_tileview_falls_back_to_rank1_for_packed_1d_to_2d_load():
+    """A fused packed load keeps its unit-stride axis as a 1D tile."""
     H, BASE, VECTOR_SIZE, MATRIX_SIZE = 4, 8, 128, 32
 
     @T.prim_func
@@ -495,6 +492,72 @@ def test_infer_tileview_falls_back_to_scalar_for_packed_1d_to_2d_load():
         with T.Kernel(1, threads=128):
             A_shared = T.alloc_shared((VECTOR_SIZE,), "float32")
             B_shared = T.alloc_shared((MATRIX_SIZE, MATRIX_SIZE), "float32")
+
+            for i, j in T.Tiles([H, H], parallel=True):
+                B_shared[i, j] = A_shared[BASE + i * H + j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert_scope_plan(mod, expected_tile_size=[H], expected_execution_domain_axes=[1])
+
+
+def test_rank1_fallback_preserves_dynamic_tile_domain():
+    """Rank reduction keeps dynamic domain expressions in the tile scope."""
+    H, BASE, VECTOR_SIZE, MATRIX_SIZE = 4, 8, 128, 32
+
+    @T.prim_func
+    def main(valid: T.int32):
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((VECTOR_SIZE,), "float32")
+            B_shared = T.alloc_shared((MATRIX_SIZE, MATRIX_SIZE), "float32")
+
+            for i, j in T.Tiles([H, T.min(H, valid)], parallel=True):
+                B_shared[i, j] = A_shared[BASE + i * H + j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert_scope_plan(mod, expected_tile_size=[H], expected_execution_domain_axes=[1])
+    scope_root, _ = collect_tile_annotations(mod["main"])
+    assert scope_root is not None
+    assert "valid" in str(scope_root["tile.domain"][1])
+
+
+def test_infer_tileview_keeps_scalar_fallback_when_no_axis_is_unit_stride():
+    """Rank reduction must not reinterpret a strided access as a dense tile."""
+    H, BASE, VECTOR_SIZE, MATRIX_SIZE = 4, 8, 128, 32
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((VECTOR_SIZE,), "float32")
+            B_shared = T.alloc_shared((MATRIX_SIZE, MATRIX_SIZE), "float32")
+
+            for i, j in T.Tiles([H, H], parallel=True):
+                B_shared[i, j] = A_shared[BASE + i * H + j * 2]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+    script = mod["main"].script()
+
+    assert "tile.domain" not in script
+    assert "tile.scope_entry" not in script
+    assert "for i, j in T.grid(4, 4)" in script
+
+
+def test_rank1_fallback_does_not_override_rank2_manual_tileview():
+    """Rank reduction must preserve an incompatible explicit 2D TileView."""
+    from tilelang.tileview import make_tileview
+
+    H, BASE, VECTOR_SIZE, MATRIX_SIZE = 4, 8, 128, 32
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((VECTOR_SIZE,), "float32")
+            B_shared = T.alloc_shared((MATRIX_SIZE, MATRIX_SIZE), "float32")
+            T.annotate_tileview({B_shared: make_tileview(B_shared, (H, MATRIX_SIZE), (-2, -1))})
 
             for i, j in T.Tiles([H, H], parallel=True):
                 B_shared[i, j] = A_shared[BASE + i * H + j]

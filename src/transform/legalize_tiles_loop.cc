@@ -507,8 +507,8 @@ private:
       if (active_tileview_plan_.execution_domain_axes.size() < domain.size()) {
         LOG(WARNING) << "T.Tiles domain " << domain
                      << " cannot infer a full-rank TileView and is falling "
-                        "back to a 1D tile loop plus scalar tile.pick/tile.set "
-                        "accesses. This may severely degrade performance.";
+                        "back to serial outer axes plus 1D tile execution. "
+                        "This may degrade performance.";
       }
       active_scope_depth_ = 0;
       in_active_scope_ = true;

@@ -85,8 +85,10 @@ private:
 
 std::optional<IndexBinding>
 AnalyzeIndexBinding(const PrimExpr &index, const Array<Var> &loop_vars,
+                    const std::vector<int> &loop_var_domain_axes,
                     const std::unordered_set<const VarNode *> &loop_var_nodes,
                     arith::Analyzer *analyzer) {
+  ICHECK_EQ(loop_vars.size(), loop_var_domain_axes.size());
   if (!UsesVar(index, [&loop_var_nodes](const VarNode *node) {
         return loop_var_nodes.count(node) != 0;
       })) {
@@ -110,7 +112,7 @@ AnalyzeIndexBinding(const PrimExpr &index, const Array<Var> &loop_vars,
     if (!analyzer->CanProve(coeff == one) || matched_axis != -1) {
       return std::nullopt;
     }
-    matched_axis = i;
+    matched_axis = loop_var_domain_axes[i];
   }
 
   if (matched_axis < 0) {
@@ -384,6 +386,71 @@ bool SupportsAligned1DBridgeCandidate(
     }
   }
   return true;
+}
+
+std::optional<std::vector<AccessInfo>> AnalyzeAccessesForExecutionAxes(
+    const std::vector<BufferAccessRecord> &accesses,
+    const Array<Var> &execution_loop_vars,
+    const std::vector<int> &execution_domain_axes, int exec_rank,
+    const TileViewMap &manual_tileviews, const Map<Buffer, Layout> &layout_map,
+    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
+    bool rank_reduction_search) {
+  ICHECK_EQ(execution_loop_vars.size(), execution_domain_axes.size());
+
+  std::unordered_set<const VarNode *> execution_loop_var_nodes;
+  for (const Var &loop_var : execution_loop_vars) {
+    execution_loop_var_nodes.insert(loop_var.get());
+  }
+
+  std::vector<AccessInfo> analyzed_accesses;
+  analyzed_accesses.reserve(accesses.size());
+  for (const auto &access : accesses) {
+    auto manual_it = manual_tileviews.find(access.buffer->data);
+    // An explicit higher-rank TileView must not be silently replaced by a
+    // lower-rank inferred plan.
+    if (rank_reduction_search && manual_it != manual_tileviews.end() &&
+        manual_it->second->TileDim() != 1) {
+      return std::nullopt;
+    }
+
+    std::vector<IndexBinding> bindings;
+    std::unordered_set<int> used_domain_axes;
+    bindings.reserve(access.indices.size());
+    for (const PrimExpr &index : access.indices) {
+      auto binding =
+          AnalyzeIndexBinding(index, execution_loop_vars, execution_domain_axes,
+                              execution_loop_var_nodes, analyzer);
+      if (!binding.has_value()) {
+        return std::nullopt;
+      }
+      bindings.push_back(binding.value());
+      if (binding->uses_loop_var) {
+        used_domain_axes.insert(binding->domain_axis);
+      }
+    }
+
+    std::vector<AccessTileCandidate> candidates = EnumerateAccessTileCandidates(
+        access, bindings, exec_rank, manual_tileviews, layout_map, config,
+        analyzer);
+    std::vector<AccessTileCandidate> relaxed_candidates = candidates;
+    if (IsEligibleForAligned1DBridgeSearch(access, bindings, exec_rank)) {
+      relaxed_candidates = EnumerateAccessTileCandidates(
+          access, bindings, exec_rank, manual_tileviews, layout_map, config,
+          analyzer, AlignmentMode::kRelaxed);
+      relaxed_candidates.erase(
+          std::remove_if(relaxed_candidates.begin(), relaxed_candidates.end(),
+                         [&](const AccessTileCandidate &candidate) {
+                           return !SupportsAligned1DBridgeCandidate(
+                               candidate, access.buffer, layout_map, config);
+                         }),
+          relaxed_candidates.end());
+    }
+
+    analyzed_accesses.push_back(
+        {access.buffer, access.indices, std::move(used_domain_axes),
+         std::move(candidates), std::move(relaxed_candidates)});
+  }
+  return analyzed_accesses;
 }
 
 const std::vector<AccessTileCandidate> &
@@ -674,69 +741,49 @@ std::optional<TileViewPlan> TryPlanTileViewsForTilesScope(
   arith::Analyzer analyzer;
 
   Array<Var> loop_vars;
-  std::unordered_set<const VarNode *> loop_var_nodes;
+  std::vector<int> all_domain_axes;
   for (const ForNode *loop : scope_loops) {
     loop_vars.push_back(loop->loop_var);
-    loop_var_nodes.insert(loop->loop_var.get());
+    all_domain_axes.push_back(static_cast<int>(all_domain_axes.size()));
   }
 
-  std::vector<AccessInfo> analyzed_accesses;
-  analyzed_accesses.reserve(accesses.size());
-  for (const auto &access : accesses) {
-    std::vector<IndexBinding> bindings;
-    std::unordered_set<int> used_domain_axes;
-    bindings.reserve(access.indices.size());
-    for (const PrimExpr &index : access.indices) {
-      auto binding =
-          AnalyzeIndexBinding(index, loop_vars, loop_var_nodes, &analyzer);
-      if (!binding.has_value()) {
-        return std::nullopt;
-      }
-      bindings.push_back(binding.value());
-      if (binding->uses_loop_var) {
-        used_domain_axes.insert(binding->domain_axis);
-      }
+  auto full_rank_accesses = AnalyzeAccessesForExecutionAxes(
+      accesses, loop_vars, all_domain_axes, exec_rank, manual_tileviews,
+      layout_map, tile_processor_config, &analyzer,
+      /*rank_reduction_search=*/false);
+  if (full_rank_accesses.has_value()) {
+    if (auto plan = TrySelectPlan(
+            domain, full_rank_accesses.value(), domain_rank, exec_rank,
+            &analyzer, AlignmentMode::kStrict, /*fail_on_error=*/false)) {
+      return plan;
     }
 
-    std::vector<AccessTileCandidate> candidates = EnumerateAccessTileCandidates(
-        access, bindings, exec_rank, manual_tileviews, layout_map,
-        tile_processor_config, &analyzer);
-    std::vector<AccessTileCandidate> relaxed_candidates = candidates;
-    if (IsEligibleForAligned1DBridgeSearch(access, bindings, exec_rank)) {
-      relaxed_candidates = EnumerateAccessTileCandidates(
-          access, bindings, exec_rank, manual_tileviews, layout_map,
-          tile_processor_config, &analyzer, AlignmentMode::kRelaxed);
-      relaxed_candidates.erase(
-          std::remove_if(relaxed_candidates.begin(), relaxed_candidates.end(),
-                         [&](const AccessTileCandidate &candidate) {
-                           return !SupportsAligned1DBridgeCandidate(
-                               candidate, access.buffer, layout_map,
-                               tile_processor_config);
-                         }),
-          relaxed_candidates.end());
+    if (auto plan = TrySelectPlan(
+            domain, full_rank_accesses.value(), domain_rank, exec_rank,
+            &analyzer, AlignmentMode::kRelaxed, /*fail_on_error=*/false)) {
+      return plan;
     }
-
-    analyzed_accesses.push_back(
-        {access.buffer, access.indices, std::move(used_domain_axes),
-         std::move(candidates), std::move(relaxed_candidates)});
-  }
-
-  if (auto plan = TrySelectPlan(domain, analyzed_accesses, domain_rank,
-                                exec_rank, &analyzer, AlignmentMode::kStrict,
-                                /*fail_on_error=*/false)) {
-    return plan;
-  }
-
-  if (auto plan = TrySelectPlan(domain, analyzed_accesses, domain_rank,
-                                exec_rank, &analyzer, AlignmentMode::kRelaxed,
-                                /*fail_on_error=*/false)) {
-    return plan;
   }
 
   if (domain_rank > 1) {
     for (int domain_axis = domain_rank - 1; domain_axis >= 0; --domain_axis) {
+      Array<Var> rank1_loop_vars{loop_vars[domain_axis]};
+      std::vector<int> rank1_domain_axes{domain_axis};
+      auto rank1_accesses = AnalyzeAccessesForExecutionAxes(
+          accesses, rank1_loop_vars, rank1_domain_axes, /*exec_rank=*/1,
+          manual_tileviews, layout_map, tile_processor_config, &analyzer,
+          /*rank_reduction_search=*/true);
+      if (!rank1_accesses.has_value()) {
+        continue;
+      }
       if (auto plan =
-              TrySelectPlan(domain, analyzed_accesses, domain_rank,
+              TrySelectPlan(domain, rank1_accesses.value(), domain_rank,
+                            /*exec_rank=*/1, &analyzer, AlignmentMode::kStrict,
+                            /*fail_on_error=*/false, domain_axis)) {
+        return plan;
+      }
+      if (auto plan =
+              TrySelectPlan(domain, rank1_accesses.value(), domain_rank,
                             /*exec_rank=*/1, &analyzer, AlignmentMode::kRelaxed,
                             /*fail_on_error=*/false, domain_axis)) {
         return plan;
