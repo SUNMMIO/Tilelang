@@ -153,7 +153,7 @@ def distribute_valid_count(D, k, n):
         return base
     if rem_int is not None and k_int is not None:
         return base + (1 if k_int < rem_int else 0)
-    return base + tir.Select(_to_primexpr(k) < _to_primexpr(rem), IntImm("int32", 1), IntImm("int32", 0))
+    return tir.ceildiv(_to_primexpr(D) - _to_primexpr(k), _to_primexpr(n))
 
 
 def lookup_mesh_tensor_meta(mesh_tensor):
