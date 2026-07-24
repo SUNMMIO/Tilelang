@@ -4,6 +4,7 @@ from functools import wraps
 
 import pytest
 
+import tilelang.utils.target as _target_utils
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm
@@ -218,6 +219,16 @@ def _assert_region_extents(script, buffer_name, access_mask, extents):
     assert re.search(pattern, script), f"missing region for {label} with extents {extents}:\n{script}"
 
 
+@pytest.fixture
+def _strict_region_validation():
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(True)
+    try:
+        yield
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+
 FRONTEND_VALID_CASES = [
     "buffer_to_buffer_same_shape",
     "buffer_to_buffer_src_leading_one_rank2",
@@ -271,35 +282,47 @@ FRONTEND_INVALID_CASES = [
 
 
 @pytest.mark.parametrize("copy_case", FRONTEND_VALID_CASES)
-def test_sunmmio_copy_frontend_accepts_valid_cases(copy_case):
+def test_sunmmio_copy_frontend_accepts_valid_cases(copy_case, _strict_region_validation):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         _build_script(copy_case)
 
 
 @pytest.mark.parametrize("copy_case", FRONTEND_INVALID_CASES)
-def test_sunmmio_copy_frontend_rejects_invalid_cases(copy_case):
+def test_sunmmio_copy_frontend_rejects_invalid_cases(copy_case, _strict_region_validation):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         with pytest.raises(ValueError):
             _build_script(copy_case)
 
 
-def test_sunmmio_copy_frontend_shrinks_larger_explicit_destination():
+def test_sunmmio_copy_frontend_shrinks_larger_explicit_destination(_strict_region_validation):
     script = _build_script("buffer_to_region_larger_dst")
 
     _assert_region_extents(script, "A_128x128x128_global", 1, [128, 128, 128])
     _assert_region_extents(script, None, 2, [128, 128, 128])
 
 
-def test_sunmmio_copy_frontend_shrinks_dst_when_src_is_smaller():
+def test_sunmmio_copy_frontend_shrinks_dst_when_src_is_smaller(_strict_region_validation):
     script = _build_script("region_to_region_src_lt_dst")
 
     _assert_region_extents(script, "A_128x128x128_global", 1, [16, 16, 16])
     _assert_region_extents(script, None, 2, [16, 16, 16])
 
 
-def test_sunmmio_copy_frontend_clips_src_before_shrinking_dst():
+def test_sunmmio_copy_compact_path_skips_strict_region_validation():
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(False)
+    try:
+        script = _build_script("buffer_to_region_smaller_dst")
+
+        _assert_region_extents(script, "A_128x128x128_global", 1, [128, 128, 128])
+        _assert_region_extents(script, None, 2, [128, 128, 32])
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+
+def test_sunmmio_copy_frontend_clips_src_before_shrinking_dst(_strict_region_validation):
     with pytest.warns(UserWarning, match="will be clipped"):
         script = _build_script("region_to_region_src_oob_clips_dst")
 
@@ -307,7 +330,7 @@ def test_sunmmio_copy_frontend_clips_src_before_shrinking_dst():
     _assert_region_extents(script, None, 2, [1, 32, 32])
 
 
-def test_sunmmio_copy_frontend_clips_explicit_dst_before_inferring_load_src():
+def test_sunmmio_copy_frontend_clips_explicit_dst_before_inferring_load_src(_strict_region_validation):
     with pytest.warns(UserWarning, match="will be clipped"):
         script = _build_script("load_to_region_dst_oob")
 
