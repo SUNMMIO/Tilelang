@@ -1,4 +1,5 @@
 import os
+import re
 
 import pytest
 import tilelang
@@ -318,6 +319,37 @@ def test_reduce_small_1d_result_uses_aligned_store_bridge(tmp_path):
     assert "fake_tile_store" not in src
     assert "!suvm.tile_view<32x1xbf16>" not in src
     assert "fake_partitioned_tile_view" not in src
+
+
+def test_reduce_dim0_multisegment_store_uses_partition_coordinate(tmp_path):
+    src = validate_sunmmio_codegen_loose(
+        reduce_kernel_builder((4, 128), 0, dtype="float32", clear=True),
+        tmp_path,
+        mlir_filename="reduce_dim0_multisegment_store_suvm.mlir",
+        expected_tokens=("suvm.tile.reduce", "suvm.tile.store"),
+    )
+
+    div_results = {
+        match.group(1)
+        for line in src.splitlines()
+        if (match := re.match(r"\s*(%[\w.]+) = arith\.divsi\b", line))
+    }
+    destination_views = [
+        line
+        for line in src.splitlines()
+        if "suvm.get_partitioned_tile_view" in line
+        and "!suvm.memtensor<128xf32" in line
+        and "-> !suvm.tile_view<32xf32>" in line
+    ]
+    assert len(destination_views) == 1, destination_views
+
+    index_match = re.search(r"indices = \[(%[\w.]+)\]", destination_views[0])
+    assert index_match, destination_views[0]
+    assert index_match.group(1) in div_results, (
+        "The reduction destination must use the tile partition coordinate "
+        "(element offset / tile extent), not the raw element offset.\n"
+        f"destination view: {destination_views[0]}"
+    )
 
 
 def test_reduce_tail_region_codegen_uses_identity_select(tmp_path):

@@ -4043,7 +4043,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         state->current_tile_values[dst_cache_key] =
             store_aligned_1d_tile(dst_access, rhs, std::nullopt, state);
       } else {
-        SunMMIOValue dst_view = make_tile_view_from_region(dst_region, state);
+        SunMMIOValue dst_view = get_or_create_tile_view(dst_access, state);
         builder_->TileStore(rhs, dst_view, std::nullopt);
         std::string dst_cache_key = make_tile_cache_key(dst_access);
         state->current_tile_values[dst_cache_key] = builder_->BindValueAlias(
