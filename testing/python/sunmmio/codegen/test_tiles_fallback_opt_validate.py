@@ -15,7 +15,7 @@ os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 STRICT_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
 
 
-def _output_spec(h, w, dtype):
+def _matrix_output_spec(h, w, dtype):
     shape = (16, h, w)
     return shape, T.MeshShardingPolicy(cross_mesh_dim=0), make_zz_layout(shape, [1, 2], (32, 32))
 
@@ -24,7 +24,7 @@ def _output_spec(h, w, dtype):
 def serialized_rank1_zz_slices_kernel(h=4, dtype=T.float32):
     output_rows = 8
     padded_width = 32
-    out_shape, token_policy, out_layout = _output_spec(output_rows, padded_width, dtype)
+    out_shape, token_policy, out_layout = _matrix_output_spec(output_rows, padded_width, dtype)
     cm_layout = make_zz_layout((h, h), [0, 1], (32, 32))
     comb_layout = make_zz_layout((output_rows, padded_width), [0, 1], (32, 32))
 
@@ -51,7 +51,7 @@ def serialized_rank1_zz_slices_kernel(h=4, dtype=T.float32):
 @target("Sunmmio")
 def temp_stage_subaligned_then_direct_kernel(h=4, w=32, dtype=T.float32):
     output_rows = 8
-    out_shape, token_policy, out_layout = _output_spec(output_rows, w, dtype)
+    out_shape, token_policy, out_layout = _matrix_output_spec(output_rows, w, dtype)
     matrix_layout = make_zz_layout((output_rows, w), [0, 1], (32, 32))
     vector_layout = make_aligned_row_major((w,), dtype, align_bytes=64)
 
@@ -79,6 +79,60 @@ def temp_stage_subaligned_then_direct_kernel(h=4, w=32, dtype=T.float32):
     return main
 
 
+@target("Sunmmio")
+def packed_1d_to_2d_scalar_fallback_kernel(h=4, base=8, vector_size=128, matrix_size=32, dtype=T.float32):
+    assert base + h * h <= vector_size
+    out_shape, token_policy, out_layout = _matrix_output_spec(matrix_size, matrix_size, dtype)
+    vector_layout = make_aligned_row_major((vector_size,), dtype, align_bytes=64)
+    matrix_layout = make_zz_layout((matrix_size, matrix_size), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        out: T.MeshTensor(out_shape, token_policy, dtype, layout=out_layout),  # type: ignore
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared((vector_size,), dtype)
+            B_shared = T.alloc_shared((matrix_size, matrix_size), dtype)
+            T.annotate_layout({A_shared: vector_layout, B_shared: matrix_layout})
+
+            T.fill(A_shared, 1)
+            T.fill(B_shared, 0)
+            for i, j in T.Tiles([h, h], parallel=True):
+                B_shared[i, j] = A_shared[base + i * h + j]
+
+            T.copy(B_shared, out[0, 0:matrix_size, 0:matrix_size])
+
+    return main
+
+
+@target("Sunmmio")
+def packed_2d_to_1d_scalar_fallback_kernel(h=4, base=8, vector_size=128, matrix_size=32, dtype=T.float32):
+    assert base + h * h <= vector_size
+    out_shape, token_policy, out_layout = _matrix_output_spec(matrix_size, matrix_size, dtype)
+    vector_layout = make_aligned_row_major((vector_size,), dtype, align_bytes=64)
+    matrix_layout = make_zz_layout((matrix_size, matrix_size), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        out: T.MeshTensor(out_shape, token_policy, dtype, layout=out_layout),  # type: ignore
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared((vector_size,), dtype)
+            B_shared = T.alloc_shared((matrix_size, matrix_size), dtype)
+            T.annotate_layout({A_shared: vector_layout, B_shared: matrix_layout})
+
+            T.fill(A_shared, 0)
+            T.fill(B_shared, 1)
+            for i, j in T.Tiles([h, h], parallel=True):
+                A_shared[base + i * h + j] = B_shared[i, j]
+
+            for j in T.Tiles([matrix_size], parallel=True):
+                B_shared[matrix_size - 1, j] = A_shared[j]
+            T.copy(B_shared, out[0, 0:matrix_size, 0:matrix_size])
+
+    return main
+
+
 def _validate_aligned_1d_bridge(kernel, tmp_path, filename):
     src = validate_sunmmio_codegen_with_npuir_opt(
         kernel,
@@ -89,6 +143,18 @@ def _validate_aligned_1d_bridge(kernel, tmp_path, filename):
     )
     assert "suvm.tile.pick" not in src
     assert "suvm.tile.set" not in src
+
+
+def _validate_scalar_fallback(kernel, tmp_path, filename):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        kernel,
+        tmp_path,
+        mlir_filename=filename,
+        expected_tokens=("suvm.tile.pick", "suvm.tile.set"),
+        opt_args=STRICT_OPT_ARGS,
+    )
+    assert "suvm.tile.extract_slice" not in src
+    assert "suvm.tile.insert_slice" not in src
 
 
 def test_serialized_rank1_zz_slices_lower_through_aligned_carriers(tmp_path):
@@ -104,6 +170,22 @@ def test_temp_stage_subaligned_then_direct_lowers_to_llvm(tmp_path):
         temp_stage_subaligned_then_direct_kernel(),
         tmp_path,
         "temp_stage_subaligned_then_direct_suvm.mlir",
+    )
+
+
+def test_packed_1d_to_2d_falls_back_to_scalar_pick_set(tmp_path):
+    _validate_scalar_fallback(
+        packed_1d_to_2d_scalar_fallback_kernel(),
+        tmp_path,
+        "packed_1d_to_2d_scalar_fallback_suvm.mlir",
+    )
+
+
+def test_packed_2d_to_1d_falls_back_to_scalar_pick_set(tmp_path):
+    _validate_scalar_fallback(
+        packed_2d_to_1d_scalar_fallback_kernel(),
+        tmp_path,
+        "packed_2d_to_1d_scalar_fallback_suvm.mlir",
     )
 
 

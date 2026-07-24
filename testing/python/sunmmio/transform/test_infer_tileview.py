@@ -441,18 +441,41 @@ def test_infer_tileview_falls_back_to_1d_for_scalar_side_load():
     assert all(len(load.indices) == 2 for load in loads)
 
 
-def test_infer_tileview_falls_back_to_scalar_for_mixed_loop_index():
-    """An index combining two tile vars is preserved in ordinary serial loops."""
-    M, N = 8, 16
+def test_infer_tileview_keeps_2d_for_trailing_axis_side_load():
+    """A side load along the contiguous trailing axis supports the 2D plan."""
+    M, N = 32, 64
 
     @T.prim_func
     def main():
         with T.Kernel(1, threads=128):
-            cm = T.alloc_shared((M, N), "float32")
-            flattened = T.alloc_shared((M * N,), "float32")
+            x_shared = T.alloc_shared((M, N), "float32")
+            post_mix_shared = T.alloc_shared((M, M), "float32")
+            output_accum = T.alloc_shared((M, N), "float32")
 
-            for j, k in T.Tiles([M, N], parallel=True):
-                flattened[j * N + k] = cm[j, k]
+            for bx, by in T.Tiles([M, N], parallel=True):
+                output_accum[bx, by] = x_shared[bx, by] * post_mix_shared[0, by]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert_scope_plan(mod, expected_tile_size=[1, 32], expected_execution_domain_axes=[0, 1])
+    loads = collect_loads(mod["main"], "post_mix_shared")
+    assert loads
+    assert all(len(load.indices) == 2 for load in loads)
+
+
+def test_infer_tileview_falls_back_to_scalar_for_packed_2d_to_1d_store():
+    """A packed store combining both tile vars falls back to serial loops."""
+    H, BASE, VECTOR_SIZE, MATRIX_SIZE = 4, 8, 128, 32
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((VECTOR_SIZE,), "float32")
+            B_shared = T.alloc_shared((MATRIX_SIZE, MATRIX_SIZE), "float32")
+
+            for i, j in T.Tiles([H, H], parallel=True):
+                A_shared[BASE + i * H + j] = B_shared[i, j]
 
     mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
     mod = tl.transform.LowerTilesLoop()(mod)
@@ -460,7 +483,29 @@ def test_infer_tileview_falls_back_to_scalar_for_mixed_loop_index():
 
     assert "tile.domain" not in script
     assert "tile.scope_entry" not in script
-    assert "for j, k in T.grid(8, 16)" in script
+    assert "for i, j in T.grid(4, 4)" in script
+
+
+def test_infer_tileview_falls_back_to_scalar_for_packed_1d_to_2d_load():
+    """A packed load combining both tile vars falls back to serial loops."""
+    H, BASE, VECTOR_SIZE, MATRIX_SIZE = 4, 8, 128, 32
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((VECTOR_SIZE,), "float32")
+            B_shared = T.alloc_shared((MATRIX_SIZE, MATRIX_SIZE), "float32")
+
+            for i, j in T.Tiles([H, H], parallel=True):
+                B_shared[i, j] = A_shared[BASE + i * H + j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+    script = mod["main"].script()
+
+    assert "tile.domain" not in script
+    assert "tile.scope_entry" not in script
+    assert "for i, j in T.grid(4, 4)" in script
 
 
 def test_infer_subaligned_rank1_tile_for_serialized_2d_copy():
