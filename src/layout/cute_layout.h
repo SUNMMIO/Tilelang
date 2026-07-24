@@ -227,7 +227,8 @@ DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
  *        physical storage semantics.
  *
  * For SUVM MX dtypes this dispatches to sunmmio::DeriveMXLayoutLike so MX
- * row-major, MXZZ, and MXZNN keep their data/scale/padding storage strides.
+ * row-major, MXZZ, MXZNN, and MXZNZ keep their data/scale/padding storage
+ * strides.
  * Other dtypes use the generic DeriveLayoutLike path.
  */
 Optional<Layout> DeriveLayoutLikeForDType(
@@ -332,7 +333,27 @@ Layout MakeMXZZ(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype);
 
 Layout MakeMXZNN(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype);
 
+Layout MakeMXZNZ(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype);
+
 Layout MakeMXRowMajor(Array<PrimExpr> shape, DataType dtype);
+
+enum class MXLayoutKind {
+  kRowMajor,
+  kMXZZ,
+  kMXZNN,
+  kMXZNZ,
+};
+
+struct MXLayoutAnalysis {
+  MXLayoutKind kind;
+  Array<PrimExpr> logical_shape;
+  Array<PrimExpr> physical_extent;
+  Array<PrimExpr> scale_shape;
+};
+
+std::optional<MXLayoutAnalysis>
+AnalyzeMXLayout(const Layout &layout, DataType dtype,
+                arith::Analyzer *analyzer = nullptr);
 
 Optional<Layout> DeriveMXLayoutLike(const Layout &src,
                                     Array<PrimExpr> dst_shape, DataType dtype,

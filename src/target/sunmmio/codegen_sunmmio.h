@@ -236,6 +236,11 @@ public:
              const std::vector<int64_t> &extents, DataType ret_dtype,
              const SunMMIOType &ret_type, int64_t byte_offset = 0) = 0;
 
+  virtual std::pair<SunMMIOValue, SunMMIOValue>
+  MXUnpack(const std::string &scale_name, const std::string &data_name,
+           const SunMMIOValue &mx, DataType scale_dtype,
+           DataType data_dtype) = 0;
+
   virtual SunMMIOValue Ramp(const std::string &result_name,
                             const SunMMIOValue &base,
                             const SunMMIOValue &stride, int lanes,
@@ -409,6 +414,7 @@ private:
                        const tvm::PrimExpr &rhs);
   SunMMIOValue EmitCast(const SunMMIOValue &v, tvm::DataType target_dtype);
   SunMMIOValue EmitCall(const tir::CallNode *op);
+  SunMMIOValue EmitMXPackOrUnpack(const tir::CallNode *op, bool is_pack);
   SunMMIOValue EmitRegionCall(const tvm::PrimExpr &region_expr,
                               int64_t byte_offset = 0);
   SunMMIOValue EmitLoad(const tir::Buffer &buffer,

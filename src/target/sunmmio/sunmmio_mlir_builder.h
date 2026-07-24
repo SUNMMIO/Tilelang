@@ -183,6 +183,12 @@ public:
                           DataType ret_dtype, const SunMMIOType &ret_type,
                           int64_t byte_offset = 0) final;
 
+  std::pair<SunMMIOValue, SunMMIOValue> MXUnpack(const std::string &scale_name,
+                                                 const std::string &data_name,
+                                                 const SunMMIOValue &mx,
+                                                 DataType scale_dtype,
+                                                 DataType data_dtype) final;
+
   SunMMIOValue Ramp(const std::string &result_name, const SunMMIOValue &base,
                     const SunMMIOValue &stride, int lanes,
                     const SunMMIOType &elem_type, const SunMMIOType &vec_type,

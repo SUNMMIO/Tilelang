@@ -2508,6 +2508,29 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                                   mask_index_dtype);
   };
 
+  auto mx_scale_e8m0_prefix_store_extent =
+      [&](const BufferStoreNode *store, const TileAccessInfo &access,
+          TileBlockState *state) -> std::optional<int64_t> {
+    DataType dtype = CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1);
+    if (!dtype.is_float8_e8m0fnu() || access.requires_aligned_1d_load ||
+        access.tile_shape.size() != 1 || access.tile_shape[0] != 64 ||
+        access.tiled_dims.size() != 1 || !store->predicate.defined()) {
+      return std::nullopt;
+    }
+
+    int64_t tiled_dim = access.tiled_dims[0];
+    if (tiled_dim < 0 ||
+        tiled_dim >= static_cast<int64_t>(store->buffer->shape.size())) {
+      return std::nullopt;
+    }
+    const auto *extent =
+        store->buffer->shape[static_cast<size_t>(tiled_dim)].as<IntImmNode>();
+    if (!extent || extent->value != 32) {
+      return std::nullopt;
+    }
+    return static_cast<int64_t>(extent->value);
+  };
+
   auto merge_broadcast_shapes = [&](const std::vector<int64_t> &lhs,
                                     const std::vector<int64_t> &rhs) {
     ICHECK_EQ(lhs.size(), rhs.size())
@@ -3849,9 +3872,23 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
             NewValueName(), dst_view.value(), dst_tile_type, std::nullopt,
             std::nullopt,
             CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
-        rhs = builder_->TileSelect(
-            NewValueName(), store_mask, rhs, old_tile, dst_tile_type,
-            CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
+        std::optional<int64_t> mx_scale_valid_elems =
+            mx_scale_e8m0_prefix_store_extent(store, access, state);
+        if (mx_scale_valid_elems.has_value()) {
+          std::vector<SunMMIOValue> offsets{make_index_const(0)};
+          SunMMIOType slice_type =
+              MakeTileType(store->buffer->dtype, {*mx_scale_valid_elems});
+          SunMMIOValue valid_slice = builder_->TileSlice(
+              NewValueName(), rhs, offsets, slice_type,
+              CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
+          rhs = builder_->TileInsertSlice(
+              NewValueName(), old_tile, valid_slice, offsets, dst_tile_type,
+              CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
+        } else {
+          rhs = builder_->TileSelect(
+              NewValueName(), store_mask, rhs, old_tile, dst_tile_type,
+              CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
+        }
       }
       std::optional<SunMMIOValue> updated_aligned_tile;
       erase_current_values_for_buffer(state, store->buffer.get());

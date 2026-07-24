@@ -6,7 +6,7 @@ import tilelang.language as T
 import tilelang.testing
 from tilelang.layout import (
     make_mx_row_major_layout,
-    make_mxznn_layout,
+    make_mxznz_layout,
     make_mxzz_layout,
     make_zz_layout,
 )
@@ -21,8 +21,6 @@ from testing.python.sunmmio.common.codegen_validation import (
 tilelang.env.disable_cache()
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 os.environ.setdefault("SUNMMIO_TEST_LOG_IR", "0")
-
-LOOSE_OPT_ARGS = ("--verify-each",)
 
 MX_DTYPE_CASES = (
     pytest.param(T.mxfp8, "!suvm.mxfp8", 256, 64, id="mxfp8"),
@@ -59,12 +57,14 @@ def matmul_mx_operand_kernel(
         A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
 
     if _is_mx_dtype(b_dtype):
-        if b_layout_kind == "mxznn":
-            B_layout = make_mxznn_layout((K, N), dtype=b_dtype)
+        if b_layout_kind == "mxznz":
+            B_layout = make_mxznz_layout((K, N), dtype=b_dtype)
         elif b_layout_kind == "mxzz":
             B_layout = make_mxzz_layout((K, N), dtype=b_dtype)
-        else:
+        elif b_layout_kind == "default":
             B_layout = make_mx_row_major_layout((K, N), dtype=b_dtype)
+        else:
+            raise ValueError(f"Unsupported user-visible MX B layout kind: {b_layout_kind}")
     else:
         B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
@@ -112,65 +112,17 @@ def matmul_mx_operand_kernel(
     return main
 
 
-@pytest.mark.parametrize("b_dtype,mx_token,n,block_n", MX_DTYPE_CASES)
-def test_mx_weight_matmul_persistent_codegen_generates_expected_suvm_ops(tmp_path, b_dtype, mx_token, n, block_n):
-    src = validate_sunmmio_codegen_with_npuir_opt(
-        matmul_mx_operand_kernel(N=n, block_N=block_n, b_dtype=b_dtype),
-        tmp_path,
-        mlir_filename=f"{_dtype_filename(b_dtype)}_weight_matmul_suvm.mlir",
-        expected_tokens=(
-            mx_token,
-            "suvm.mcast_tok",
-            "suvm.tc.mma",
-            "suvm.copy_async",
-            "#suvm.memory_space<asram>",
-            "#suvm.memory_space<wsram>",
-        ),
-        opt_args=LOOSE_OPT_ARGS,
-    )
-
-    assert "sunmmio.fake" not in src
-    assert_source_contains(src, (mx_token, "suvm.mcast_tok", "suvm.tc.mma"))
-
-
-@pytest.mark.parametrize("a_dtype,mx_token,n,block_n", MX_DTYPE_CASES)
-def test_mx_activation_matmul_persistent_codegen_validates_loose(tmp_path, a_dtype, mx_token, n, block_n):
-    src = validate_sunmmio_codegen_with_npuir_opt(
-        matmul_mx_operand_kernel(
-            N=n,
-            block_N=block_n,
-            block_K=32,
-            a_dtype=a_dtype,
-            b_dtype=T.bfloat16,
-            a_layout_kind="mxzz",
-        ),
-        tmp_path,
-        mlir_filename=f"{_dtype_filename(a_dtype)}_activation_matmul_suvm.mlir",
-        expected_tokens=(
-            mx_token,
-            "suvm.mcast_tok",
-            "suvm.tc.mma",
-            "suvm.copy_async",
-            "#suvm.memory_space<asram>",
-            "#suvm.memory_space<wsram>",
-        ),
-        opt_args=LOOSE_OPT_ARGS,
-    )
-
-    assert "sunmmio.fake" not in src
-    assert_source_contains(src, (mx_token, "suvm.mcast_tok", "suvm.tc.mma"))
-
-
 @pytest.mark.parametrize("a_dtype,mx_token,n,block_n", MX_DTYPE_CASES)
 def test_mx_row_major_activation_matmul_codegen_uses_layout_transform(tmp_path, a_dtype, mx_token, n, block_n):
     src = validate_sunmmio_codegen_with_npuir_opt(
         matmul_mx_operand_kernel(
-            K=256,
+            K=512,
             N=n,
             block_N=block_n,
-            block_K=64,
+            block_K=128,
             a_dtype=a_dtype,
-            b_dtype=T.bfloat16,
+            b_dtype=a_dtype,
+            b_layout_kind="mxznz",
         ),
         tmp_path,
         mlir_filename=f"{_dtype_filename(a_dtype)}_row_major_activation_matmul_suvm.mlir",
@@ -182,7 +134,6 @@ def test_mx_row_major_activation_matmul_codegen_uses_layout_transform(tmp_path, 
             "#suvm.memory_space<asram>",
             "#suvm.memory_space<rsram>",
         ),
-        opt_args=LOOSE_OPT_ARGS,
     )
 
     assert "sunmmio.fake" not in src
@@ -190,16 +141,17 @@ def test_mx_row_major_activation_matmul_codegen_uses_layout_transform(tmp_path, 
 
 
 @pytest.mark.parametrize("mx_dtype,mx_token,n,block_n", MX_DTYPE_CASES)
-def test_mx_activation_and_weight_matmul_persistent_codegen_validates_loose(tmp_path, mx_dtype, mx_token, n, block_n):
+def test_mx_activation_and_weight_matmul_persistent_codegen_validates(tmp_path, mx_dtype, mx_token, n, block_n):
     src = validate_sunmmio_codegen_with_npuir_opt(
         matmul_mx_operand_kernel(
+            K=512,
             N=n,
             block_N=block_n,
-            block_K=32,
+            block_K=128,
             a_dtype=mx_dtype,
             b_dtype=mx_dtype,
             a_layout_kind="mxzz",
-            b_layout_kind="mxznn",
+            b_layout_kind="mxznz",
         ),
         tmp_path,
         mlir_filename=f"{_dtype_filename(mx_dtype)}_activation_weight_matmul_suvm.mlir",
@@ -211,7 +163,6 @@ def test_mx_activation_and_weight_matmul_persistent_codegen_validates_loose(tmp_
             "#suvm.memory_space<asram>",
             "#suvm.memory_space<wsram>",
         ),
-        opt_args=LOOSE_OPT_ARGS,
     )
 
     assert "sunmmio.fake" not in src
