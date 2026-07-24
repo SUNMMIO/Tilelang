@@ -112,8 +112,35 @@ def matmul_mx_operand_kernel(
     return main
 
 
+@pytest.mark.parametrize("b_dtype,mx_token,n,block_n", MX_DTYPE_CASES)
+def test_mx_gemm_only_b_codegen_validates(tmp_path, b_dtype, mx_token, n, block_n):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        matmul_mx_operand_kernel(
+            K=512,
+            N=n,
+            block_N=block_n,
+            block_K=128,
+            a_dtype=T.bfloat16,
+            b_dtype=b_dtype,
+            b_layout_kind="mxznz",
+        ),
+        tmp_path,
+        mlir_filename=f"{_dtype_filename(b_dtype)}_only_b_matmul_suvm.mlir",
+        expected_tokens=(
+            mx_token,
+            "suvm.mcast_tok",
+            "suvm.tc.mma",
+            "#suvm.memory_space<asram>",
+            "#suvm.memory_space<wsram>",
+        ),
+    )
+
+    assert "sunmmio.fake" not in src
+    assert_source_contains(src, (mx_token, "suvm.mcast_tok", "suvm.tc.mma"))
+
+
 @pytest.mark.parametrize("a_dtype,mx_token,n,block_n", MX_DTYPE_CASES)
-def test_mx_row_major_activation_matmul_codegen_uses_layout_transform(tmp_path, a_dtype, mx_token, n, block_n):
+def test_mx_gemm_row_major_a_uses_layout_transform_codegen_validates(tmp_path, a_dtype, mx_token, n, block_n):
     src = validate_sunmmio_codegen_with_npuir_opt(
         matmul_mx_operand_kernel(
             K=512,
@@ -125,7 +152,7 @@ def test_mx_row_major_activation_matmul_codegen_uses_layout_transform(tmp_path, 
             b_layout_kind="mxznz",
         ),
         tmp_path,
-        mlir_filename=f"{_dtype_filename(a_dtype)}_row_major_activation_matmul_suvm.mlir",
+        mlir_filename=f"{_dtype_filename(a_dtype)}_row_major_a_matmul_suvm.mlir",
         expected_tokens=(
             mx_token,
             "suvm.transform_layout_async",
@@ -137,11 +164,11 @@ def test_mx_row_major_activation_matmul_codegen_uses_layout_transform(tmp_path, 
     )
 
     assert "sunmmio.fake" not in src
-    assert_source_contains(src, (mx_token, "suvm.transform_layout_async"))
+    assert_source_contains(src, (mx_token, "suvm.transform_layout_async", "suvm.tc.mma"))
 
 
 @pytest.mark.parametrize("mx_dtype,mx_token,n,block_n", MX_DTYPE_CASES)
-def test_mx_activation_and_weight_matmul_persistent_codegen_validates(tmp_path, mx_dtype, mx_token, n, block_n):
+def test_mx_gemm_both_a_b_codegen_validates(tmp_path, mx_dtype, mx_token, n, block_n):
     src = validate_sunmmio_codegen_with_npuir_opt(
         matmul_mx_operand_kernel(
             K=512,
@@ -154,7 +181,7 @@ def test_mx_activation_and_weight_matmul_persistent_codegen_validates(tmp_path, 
             b_layout_kind="mxznz",
         ),
         tmp_path,
-        mlir_filename=f"{_dtype_filename(mx_dtype)}_activation_weight_matmul_suvm.mlir",
+        mlir_filename=f"{_dtype_filename(mx_dtype)}_both_a_b_matmul_suvm.mlir",
         expected_tokens=(
             mx_token,
             "suvm.mcast_tok",
