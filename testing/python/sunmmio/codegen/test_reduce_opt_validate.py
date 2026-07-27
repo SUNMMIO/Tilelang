@@ -329,26 +329,92 @@ def test_reduce_dim0_multisegment_store_uses_partition_coordinate(tmp_path):
         expected_tokens=("suvm.tile.reduce", "suvm.tile.store"),
     )
 
-    div_results = {
-        match.group(1)
+    definitions = {
+        match.group(1): match.group(2)
         for line in src.splitlines()
-        if (match := re.match(r"\s*(%[\w.]+) = arith\.divsi\b", line))
+        if (match := re.match(r"\s*(%[\w.]+)\s*=\s*(.+)", line))
     }
-    destination_views = [
+    source_views = [
         line
         for line in src.splitlines()
         if "suvm.get_partitioned_tile_view" in line
-        and "!suvm.memtensor<128xf32" in line
-        and "-> !suvm.tile_view<32xf32>" in line
+        and "!suvm.memtensor<4x128xf32" in line
+        and "#suvm.memory_space<rsram>" in line
+        and "-> !suvm.tile_view<4x32xf32>" in line
     ]
-    assert len(destination_views) == 1, destination_views
+    destination_stores = [
+        line
+        for line in src.splitlines()
+        if "suvm.tile.store" in line
+        and "!suvm.tile<32xf32>, !suvm.tile_view<32xf32>" in line
+    ]
+    assert len(source_views) == 1, source_views
+    assert len(destination_stores) == 1, destination_stores
 
-    index_match = re.search(r"indices = \[(%[\w.]+)\]", destination_views[0])
-    assert index_match, destination_views[0]
-    assert index_match.group(1) in div_results, (
-        "The reduction destination must use the tile partition coordinate "
-        "(element offset / tile extent), not the raw element offset.\n"
-        f"destination view: {destination_views[0]}"
+    source_indices = re.search(
+        r"indices = \[(%[\w.]+), (%[\w.]+)\]", source_views[0]
+    )
+    assert source_indices, source_views[0]
+    segment_index = source_indices.group(2)
+
+    store_match = re.search(
+        r"suvm\.tile\.store\s+%[\w.]+,\s+(%[\w.]+)\s+:",
+        destination_stores[0],
+    )
+    assert store_match, destination_stores[0]
+    destination_view = store_match.group(1)
+    destination_view_definition = definitions.get(destination_view, "")
+    assert "suvm.get_partitioned_tile_view" in destination_view_definition
+    assert "!suvm.memtensor<128xf32" in destination_view_definition
+    assert "-> !suvm.tile_view<32xf32>" in destination_view_definition
+
+    index_match = re.search(
+        r"indices = \[(%[\w.]+)\]", destination_view_definition
+    )
+    assert index_match, destination_view_definition
+    destination_index = index_match.group(1)
+
+    # Canonicalization may fold `(segment * 32) / 32` to `segment`.  Before
+    # that fold, require the complete def-use chain instead of accepting an
+    # unrelated `arith.divsi` result.
+    if destination_index == segment_index:
+        return
+
+    div_match = re.fullmatch(
+        r"arith\.divsi (%[\w.]+), (%[\w.]+) : index",
+        definitions.get(destination_index, ""),
+    )
+    assert div_match, (
+        f"destination index is not defined by divsi: {destination_view_definition}"
+    )
+    numerator, divisor = div_match.groups()
+    assert definitions.get(divisor) == "arith.constant 32 : index"
+
+    numerator_cast = re.fullmatch(
+        r"arith\.index_cast (%[\w.]+) : i32 to index",
+        definitions.get(numerator, ""),
+    )
+    assert numerator_cast, definitions.get(numerator)
+    product = numerator_cast.group(1)
+
+    multiply = re.fullmatch(
+        r"arith\.muli (%[\w.]+), (%[\w.]+) : i32",
+        definitions.get(product, ""),
+    )
+    assert multiply, definitions.get(product)
+    lhs, rhs = multiply.groups()
+    if definitions.get(lhs) == "arith.constant 32 : i32":
+        factor, segment_i32 = lhs, rhs
+    else:
+        segment_i32, factor = lhs, rhs
+    assert definitions.get(factor) == "arith.constant 32 : i32"
+    assert definitions.get(segment_i32) == (
+        f"arith.index_cast {segment_index} : index to i32"
+    ), (
+        "The reduction destination must be indexed by "
+        "(segment_index * 32) / 32.\n"
+        f"source view: {source_views[0]}\n"
+        f"destination view: {destination_view_definition}"
     )
 
 
