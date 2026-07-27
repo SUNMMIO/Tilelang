@@ -4514,9 +4514,28 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         lower_stmt(scope.full_tile_block_body, &full_state);
       }
       builder_->BeginElse();
-      TailMaskInfo mask_info = build_tail_mask_info(state);
       DataType tail_mask_index_dtype =
           infer_tail_mask_index_dtype(scope.tail_tile_block_body);
+      if (scope.tile_shape.size() == 1) {
+        ICHECK_EQ(scope.execution_loops.size(), 1U);
+        ICHECK_EQ(scope.execution_domain_axes.size(), 1U);
+        SunMMIOValue tile_extent = make_index_const(scope.tile_shape[0]);
+        SunMMIOValue exec_index =
+            EnsureIndex(EvalExpr(scope.execution_loops[0]->loop_var));
+        SunMMIOValue valid_lanes = min_index(
+            tile_extent, sub_index(domain_value(scope.execution_domain_axes[0]),
+                                   mul_index(exec_index, tile_extent)));
+        SunMMIOType mask_type =
+            MakeTileType(DataType::Bool(), scope.tile_shape);
+        SunMMIOValue mask = builder_->TileAxisMask(
+            NewValueName(), 0, valid_lanes, mask_type, tail_mask_index_dtype);
+        lower_tail_with_mask(mask);
+        builder_->EndIf();
+        return;
+      }
+      ICHECK_EQ(scope.tile_shape.size(), 2U)
+          << "Tail tile lowering supports rank-1 or rank-2 tile scopes";
+      TailMaskInfo mask_info = build_tail_mask_info(state);
       builder_->BeginIf(mask_info.row_tail_cond, std::vector<int64_t>{});
       builder_->BeginIf(mask_info.col_tail_cond, std::vector<int64_t>{});
       SunMMIOValue rect_mask = builder_->TileRectMask(
