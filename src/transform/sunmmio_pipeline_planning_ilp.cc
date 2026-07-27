@@ -98,6 +98,8 @@ struct ModelVars {
   HighsInt col_T{-1};
   std::vector<HighsInt> col_t;
   std::vector<HighsInt> col_y;
+  std::vector<HighsInt> col_y_half;
+  std::vector<HighsInt> col_start_parity;
   std::vector<HighsInt> col_m;
   std::vector<std::vector<HighsInt>> col_x;
   std::vector<std::vector<HighsInt>> col_a;
@@ -863,7 +865,7 @@ SolutionVerifyResult VerifySolution(const Problem &prob,
     if (it_a == internal_pos.end())
       continue;
     int z_write = sol.z_bank[it_a->second];
-    int write_start_time = sol.m[write_flow.prod];
+    int write_start_time = sol.t[write_flow.prod];
 
     for (int b = 0; b < static_cast<int>(prob.flows.size()); ++b) {
       if (a == b)
@@ -873,7 +875,7 @@ SolutionVerifyResult VerifySolution(const Problem &prob,
       if (it_b == internal_pos.end() || read_flow.cons < 0)
         continue;
       int z_read = sol.z_bank[it_b->second];
-      int read_start_time = sol.m[read_flow.cons] + read_flow.delta * sol.II;
+      int read_start_time = sol.t[read_flow.cons] + read_flow.delta * sol.II;
       ConflictType conflict = AnalyzeFlowConflict(
           write_flow, write_start_time, read_flow, read_start_time, sol.II);
       if (conflict == ConflictType::kNeedDifferent && z_write == z_read) {
@@ -3029,6 +3031,24 @@ void AddEq(Highs &highs, const std::vector<HighsInt> &idx,
   AddRow(highs, rhs, rhs, merged_idx, merged_val);
 }
 
+void AddConditionalParity(Highs &highs, HighsInt z_write, HighsInt z_read,
+                          HighsInt write_parity, HighsInt read_parity,
+                          HighsInt x_prod, const std::vector<HighsInt> &x_cons,
+                          int required_xor) {
+  HighsInt quotient = AddCol(highs, 0, 2, 0, true);
+  std::vector<HighsInt> idx{z_write,     z_read,   write_parity,
+                            read_parity, quotient, x_prod};
+  std::vector<double> upper{1.0, 1.0, 1.0, 1.0, -2.0, 4.0};
+  std::vector<double> lower{-1.0, -1.0, -1.0, -1.0, 2.0, 4.0};
+  for (HighsInt x : x_cons) {
+    idx.push_back(x);
+    upper.push_back(4.0);
+    lower.push_back(4.0);
+  }
+  AddLeq(highs, idx, upper, required_xor + 8.0);
+  AddLeq(highs, idx, lower, -required_xor + 8.0);
+}
+
 ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
                      int threads) {
   highs.clear();
@@ -3052,6 +3072,8 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
   ModelVars vars;
   vars.col_t.resize(prob.N);
   vars.col_y.resize(prob.N);
+  vars.col_y_half.resize(prob.N);
+  vars.col_start_parity.resize(prob.N);
   vars.col_m.resize(prob.N);
   vars.col_x.assign(prob.N, std::vector<HighsInt>(II, -1));
   vars.col_a.assign(prob.N, std::vector<HighsInt>(II, -1));
@@ -3063,6 +3085,8 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
   for (int i = 0; i < prob.N; ++i) {
     vars.col_t[i] = AddCol(highs, 0, time_ub, 0, true);
     vars.col_y[i] = AddCol(highs, 0, time_ub, 0, true);
+    vars.col_y_half[i] = AddCol(highs, 0, CeilDiv(time_ub, 2), 0, true);
+    vars.col_start_parity[i] = AddCol(highs, 0, 1, 0, true);
     vars.col_m[i] = AddCol(highs, 0, II - 1, 0, true);
   }
   for (int i = 0; i < prob.N; ++i) {
@@ -3097,6 +3121,8 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
 
     AddEq(highs, {vars.col_t[i], vars.col_y[i], vars.col_m[i]},
           {1.0, -double(II), -1.0}, 0.0);
+    AddEq(highs, {vars.col_y[i], vars.col_y_half[i], vars.col_start_parity[i]},
+          {1.0, -2.0, -1.0}, 0.0);
   }
 
   for (int i = 0; i < prob.N; ++i) {
@@ -3184,6 +3210,19 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
     }
   }
 
+  for (int a = 0; a < internal_count; ++a) {
+    const FlowSpec &lhs = prob.flows[vars.internal_flow_ids[a]];
+    for (int b = a + 1; b < internal_count; ++b) {
+      const FlowSpec &rhs = prob.flows[vars.internal_flow_ids[b]];
+      ConflictType conflict = AnalyzePrecolorConflict(lhs, rhs);
+      if (conflict == ConflictType::kNeedSame) {
+        AddEq(highs, {vars.col_z[a], vars.col_z[b]}, {1.0, -1.0}, 0.0);
+      } else if (conflict == ConflictType::kNeedDifferent) {
+        AddEq(highs, {vars.col_z[a], vars.col_z[b]}, {1.0, 1.0}, 1.0);
+      }
+    }
+  }
+
   auto bank_build_begin = std::chrono::steady_clock::now();
   for (int a = 0; a < internal_count; ++a) {
     const auto &write_flow = prob.flows[vars.internal_flow_ids[a]];
@@ -3203,9 +3242,14 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
         std::vector<int> same_cons_slots;
         std::vector<int> impossible_cons_slots;
         for (int cons_slot = 0; cons_slot < II; ++cons_slot) {
-          ConflictType conflict =
-              AnalyzeFlowConflict(write_flow, prod_slot, read_flow,
-                                  cons_slot + read_flow.delta * II, II);
+          ConflictType conflict = AnalyzeWriteReadConflict(
+              PositiveMod(prod_slot + write_flow.w_off, II), write_flow.w_dur,
+              (prod_slot + write_flow.w_off) / II & 1,
+              PositiveMod(cons_slot + read_flow.delta * II + read_flow.r_off,
+                          II),
+              read_flow.r_dur,
+              (cons_slot + read_flow.delta * II + read_flow.r_off) / II & 1,
+              II);
           if (conflict == ConflictType::kNone)
             continue;
           if (conflict == ConflictType::kNeedDifferent) {
@@ -3220,57 +3264,25 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
         HighsInt x_prod = vars.col_x[write_flow.prod][prod_slot];
         HighsInt z_write_ping = vars.col_z[a];
         HighsInt z_read_ping = vars.col_z[b];
+        HighsInt write_parity = vars.col_start_parity[write_flow.prod];
+        HighsInt read_parity = vars.col_start_parity[read_flow.cons];
 
         if (!diff_cons_slots.empty()) {
-          std::vector<HighsInt> idx{z_write_ping, z_read_ping};
-          std::vector<double> val{-1.0, -1.0};
-          if (x_prod >= 0) {
-            idx.insert(idx.begin(), x_prod);
-            val.insert(val.begin(), 1.0);
-          }
+          std::vector<HighsInt> x_cons;
           for (int cons_slot : diff_cons_slots) {
-            idx.push_back(vars.col_x[read_flow.cons][cons_slot]);
-            val.push_back(1.0);
+            x_cons.push_back(vars.col_x[read_flow.cons][cons_slot]);
           }
-          AddLeq(highs, idx, val, x_prod >= 0 ? 1.0 : 0.0);
-
-          idx = {z_write_ping, z_read_ping};
-          val = {1.0, 1.0};
-          if (x_prod >= 0) {
-            idx.insert(idx.begin(), x_prod);
-            val.insert(val.begin(), 1.0);
-          }
-          for (int cons_slot : diff_cons_slots) {
-            idx.push_back(vars.col_x[read_flow.cons][cons_slot]);
-            val.push_back(1.0);
-          }
-          AddLeq(highs, idx, val, x_prod >= 0 ? 3.0 : 2.0);
+          AddConditionalParity(highs, z_write_ping, z_read_ping, write_parity,
+                               read_parity, x_prod, x_cons, 1);
         }
 
         if (!same_cons_slots.empty()) {
-          std::vector<HighsInt> idx{z_write_ping, z_read_ping};
-          std::vector<double> val{1.0, -1.0};
-          if (x_prod >= 0) {
-            idx.insert(idx.begin(), x_prod);
-            val.insert(val.begin(), 1.0);
-          }
+          std::vector<HighsInt> x_cons;
           for (int cons_slot : same_cons_slots) {
-            idx.push_back(vars.col_x[read_flow.cons][cons_slot]);
-            val.push_back(1.0);
+            x_cons.push_back(vars.col_x[read_flow.cons][cons_slot]);
           }
-          AddLeq(highs, idx, val, x_prod >= 0 ? 2.0 : 1.0);
-
-          idx = {z_write_ping, z_read_ping};
-          val = {-1.0, 1.0};
-          if (x_prod >= 0) {
-            idx.insert(idx.begin(), x_prod);
-            val.insert(val.begin(), 1.0);
-          }
-          for (int cons_slot : same_cons_slots) {
-            idx.push_back(vars.col_x[read_flow.cons][cons_slot]);
-            val.push_back(1.0);
-          }
-          AddLeq(highs, idx, val, x_prod >= 0 ? 2.0 : 1.0);
+          AddConditionalParity(highs, z_write_ping, z_read_ping, write_parity,
+                               read_parity, x_prod, x_cons, 0);
         }
 
         if (!impossible_cons_slots.empty()) {
