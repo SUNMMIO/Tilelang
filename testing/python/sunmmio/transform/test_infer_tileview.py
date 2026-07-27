@@ -546,6 +546,38 @@ def test_infer_tileview_keeps_scalar_fallback_when_no_axis_is_unit_stride():
     assert "for i, j in T.grid(4, 4)" in script
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(T.float4_e2m1fn, id="fp4"),
+        pytest.param(T.mxfp4, id="mxfp4"),
+        pytest.param(T.mxfp8, id="mxfp8"),
+    ],
+)
+def test_subbyte_and_mx_dtypes_skip_aligned_1d_bridge(dtype, capfd):
+    """Unverified 1D dtype paths must remain on the conservative fallback."""
+    width = 32
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            src = T.alloc_shared((256,), dtype, scope="shared.rsram")
+            dst = T.alloc_shared((256,), dtype, scope="shared.rsram")
+
+            for j in T.Tiles([width], parallel=True):
+                dst[j] = src[width + j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+    captured = capfd.readouterr()
+    script = mod["main"].script()
+
+    assert "Skipping aligned 1D bridge candidates" in captured.err
+    assert "tile.domain" not in script
+    assert "tile.scope_entry" not in script
+    assert "for j in range(32)" in script
+
+
 def test_rank1_fallback_does_not_override_rank2_manual_tileview():
     """Rank reduction must preserve an incompatible explicit 2D TileView."""
     from tilelang.tileview import make_tileview

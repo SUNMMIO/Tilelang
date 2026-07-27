@@ -319,6 +319,25 @@ bool IsEligibleForAligned1DBridgeSearch(
   return active_dims == 1;
 }
 
+bool RequiresAligned1DBridgeCandidate(
+    const AccessTileCandidate &candidate, const Buffer &buffer,
+    const SunmmioTileProcessorConfig &config) {
+  if (candidate.tile_shape.size() != 1 ||
+      buffer.scope() != kSunmmioScopeRSRAM) {
+    return false;
+  }
+
+  int tile_extent = candidate.tile_shape[0];
+  int align_elems =
+      GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, buffer->dtype);
+  return tile_extent > 0 && tile_extent < align_elems &&
+         align_elems % tile_extent == 0;
+}
+
+bool SupportsAligned1DBridgeDType(DataType dtype) {
+  return dtype.bits() >= 8 && !sunmmio::IsMXDType(dtype);
+}
+
 bool SupportsAligned1DBridgeCandidate(
     const AccessTileCandidate &candidate, const Buffer &buffer,
     const Map<Buffer, Layout> &layout_map,
@@ -336,6 +355,9 @@ bool SupportsAligned1DBridgeCandidate(
   }
   if (tile_extent <= 0 || tile_extent >= align_elems ||
       align_elems % tile_extent != 0) {
+    return false;
+  }
+  if (!SupportsAligned1DBridgeDType(buffer->dtype)) {
     return false;
   }
 
@@ -394,8 +416,10 @@ std::optional<std::vector<AccessInfo>> AnalyzeAccessesForExecutionAxes(
     const std::vector<int> &execution_domain_axes, int exec_rank,
     const TileViewMap &manual_tileviews, const Map<Buffer, Layout> &layout_map,
     const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
-    bool rank_reduction_search) {
+    bool rank_reduction_search,
+    std::unordered_set<const BufferNode *> *warned_unsupported_bridge_buffers) {
   ICHECK_EQ(execution_loop_vars.size(), execution_domain_axes.size());
+  ICHECK(warned_unsupported_bridge_buffers != nullptr);
 
   std::unordered_set<const VarNode *> execution_loop_var_nodes;
   for (const Var &loop_var : execution_loop_vars) {
@@ -437,6 +461,23 @@ std::optional<std::vector<AccessInfo>> AnalyzeAccessesForExecutionAxes(
       relaxed_candidates = EnumerateAccessTileCandidates(
           access, bindings, exec_rank, manual_tileviews, layout_map, config,
           analyzer, AlignmentMode::kRelaxed);
+      bool has_unsupported_bridge =
+          !SupportsAligned1DBridgeDType(access.buffer->dtype) &&
+          std::any_of(relaxed_candidates.begin(), relaxed_candidates.end(),
+                      [&](const AccessTileCandidate &candidate) {
+                        return RequiresAligned1DBridgeCandidate(
+                            candidate, access.buffer, config);
+                      });
+      if (has_unsupported_bridge &&
+          warned_unsupported_bridge_buffers->insert(access.buffer.get())
+              .second) {
+        LOG(WARNING)
+            << "Skipping aligned 1D bridge candidates for buffer "
+            << access.buffer->name << " with dtype " << access.buffer->dtype
+            << ". Sub-byte and MX dtypes are currently supported only by "
+               "their blockwise paths; T.Tiles will try a strict plan or "
+               "scalar fallback.";
+      }
       relaxed_candidates.erase(
           std::remove_if(relaxed_candidates.begin(), relaxed_candidates.end(),
                          [&](const AccessTileCandidate &candidate) {
@@ -739,6 +780,7 @@ std::optional<TileViewPlan> TryPlanTileViewsForTilesScope(
   int exec_rank = domain_rank == 1 ? 1 : 2;
 
   arith::Analyzer analyzer;
+  std::unordered_set<const BufferNode *> warned_unsupported_bridge_buffers;
 
   Array<Var> loop_vars;
   std::vector<int> all_domain_axes;
@@ -750,7 +792,7 @@ std::optional<TileViewPlan> TryPlanTileViewsForTilesScope(
   auto full_rank_accesses = AnalyzeAccessesForExecutionAxes(
       accesses, loop_vars, all_domain_axes, exec_rank, manual_tileviews,
       layout_map, tile_processor_config, &analyzer,
-      /*rank_reduction_search=*/false);
+      /*rank_reduction_search=*/false, &warned_unsupported_bridge_buffers);
   if (full_rank_accesses.has_value()) {
     if (auto plan = TrySelectPlan(
             domain, full_rank_accesses.value(), domain_rank, exec_rank,
@@ -772,7 +814,7 @@ std::optional<TileViewPlan> TryPlanTileViewsForTilesScope(
       auto rank1_accesses = AnalyzeAccessesForExecutionAxes(
           accesses, rank1_loop_vars, rank1_domain_axes, /*exec_rank=*/1,
           manual_tileviews, layout_map, tile_processor_config, &analyzer,
-          /*rank_reduction_search=*/true);
+          /*rank_reduction_search=*/true, &warned_unsupported_bridge_buffers);
       if (!rank1_accesses.has_value()) {
         continue;
       }

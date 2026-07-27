@@ -773,9 +773,6 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       tl::GetSunmmioTileProcessorConfig(target_);
   auto populate_aligned_1d_access = [&](TileAccessInfo *access) {
     const DataType dtype = CanonicalizeSuvmDType(access->buffer->dtype);
-    const int64_t dtype_bytes = static_cast<int64_t>(dtype.bytes());
-    ICHECK_GT(dtype_bytes, 0)
-        << "Unexpected zero-sized dtype in Tiles lowering";
     const int64_t align_bytes =
         static_cast<int64_t>(tile_processor_config.rsram_align_bytes);
     ICHECK_GT(align_bytes, 0)
@@ -788,8 +785,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
 
     access->aligned_load_bytes = align_bytes;
     access->aligned_load_elems = align_elems;
-    const int64_t tile_bytes = access->tile_shape[0] * dtype_bytes;
-    access->requires_aligned_1d_load = tile_bytes < access->aligned_load_bytes;
+    access->requires_aligned_1d_load =
+        access->tile_shape[0] < access->aligned_load_elems;
     access->aligned_load_axis = access->unsqueeze_axis == 1 ? 0 : 1;
     access->aligned_load_shape =
         access->unsqueeze_axis == 1
