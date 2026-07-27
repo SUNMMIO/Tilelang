@@ -284,6 +284,14 @@ SuvmSunmmioBuilder::TilePick(const std::string &result_name,
   return tile_->TilePick(result_name, tile, indices, result_type, dtype);
 }
 
+SunMMIOValue
+SuvmSunmmioBuilder::TileSet(const std::string &result_name,
+                            const SunMMIOValue &value, const SunMMIOValue &tile,
+                            const std::vector<SunMMIOValue> &indices,
+                            const SunMMIOType &result_type, DataType dtype) {
+  return tile_->TileSet(result_name, value, tile, indices, result_type, dtype);
+}
+
 void SuvmSunmmioBuilder::Store(const SunMMIOValue &value,
                                const std::string &buffer_handle,
                                const std::vector<SunMMIOValue> &indices,

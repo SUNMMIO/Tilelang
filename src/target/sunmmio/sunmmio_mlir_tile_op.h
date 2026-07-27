@@ -103,6 +103,11 @@ public:
                         const std::vector<SunMMIOValue> &indices,
                         const SunMMIOType &result_type, DataType dtype);
 
+  SunMMIOValue TileSet(const std::string &result_name,
+                       const SunMMIOValue &value, const SunMMIOValue &tile,
+                       const std::vector<SunMMIOValue> &indices,
+                       const SunMMIOType &result_type, DataType dtype);
+
   void TileStore(const SunMMIOValue &value, const SunMMIOValue &tile_view,
                  const std::optional<SunMMIOValue> &mask);
 

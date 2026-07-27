@@ -209,6 +209,11 @@ public:
                                 const SunMMIOType &result_type,
                                 DataType dtype) = 0;
 
+  virtual SunMMIOValue
+  TileSet(const std::string &result_name, const SunMMIOValue &value,
+          const SunMMIOValue &tile, const std::vector<SunMMIOValue> &indices,
+          const SunMMIOType &result_type, DataType dtype) = 0;
+
   virtual void Store(const SunMMIOValue &value,
                      const std::string &buffer_handle,
                      const std::vector<SunMMIOValue> &indices,
@@ -420,6 +425,7 @@ private:
                          const ffi::Array<PrimExpr> &indices,
                          const SunMMIOValue &value);
   SunMMIOValue EmitScalarTilePick(const tir::BufferLoadNode *op);
+  void EmitScalarTileSet(const tir::BufferStoreNode *op);
   std::vector<SunMMIOValue>
   CollectLocalVarLiveOutValues(const tir::Stmt &stmt) const;
   bool TryLowerTilesScope(const tir::ForNode *op);
