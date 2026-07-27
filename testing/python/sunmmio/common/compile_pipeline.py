@@ -3,6 +3,7 @@ import os
 import re
 import warnings
 import tilelang
+import tilelang.utils.target as _target_utils
 from tilelang import tvm
 from tilelang.transform import PassConfigKey
 from tilelang.utils.target import determine_target
@@ -298,8 +299,9 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
     pass_output_process(mod, "LegalizeSunmmioGemm", test_config)
 
-    mod = tilelang.transform.ValidateTileViewRegions()(mod)
-    pass_output_process(mod, "ValidateTileViewRegions", test_config)
+    if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION:
+        mod = tilelang.transform.ValidateTileViewRegions()(mod)
+        pass_output_process(mod, "ValidateTileViewRegions", test_config)
 
     LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)

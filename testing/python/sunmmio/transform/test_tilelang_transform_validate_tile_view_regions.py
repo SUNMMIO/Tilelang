@@ -35,6 +35,18 @@ def disable_tilelang_cache():
             tilelang.env.disable_cache()
 
 
+@pytest.fixture
+def _strict_region_validation():
+    import tilelang.utils.target as target_utils
+
+    previous = target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    target_utils.set_sunmmio_region_validation(True)
+    try:
+        yield
+    finally:
+        target_utils.set_sunmmio_region_validation(previous)
+
+
 def _make_copy_kernel(copy_case):
     if copy_case in {
         "dynamic_extent_warns_and_passes",
@@ -44,7 +56,7 @@ def _make_copy_kernel(copy_case):
         layout = make_row_major(shape)
     elif copy_case in {
         "row_major_3d_outer_slab_valid",
-        "row_major_3d_outer_slab_clipped",
+        "row_major_3d_outer_slab_unclipped",
         "row_major_3d_outer_slab_oob",
     }:
         shape = (2, 128, 128)
@@ -171,7 +183,7 @@ def _make_copy_kernel(copy_case):
                 T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[0:2, 0:64, 0:64], A_shared[0:2, 64:128, 64:128])
 
-    elif copy_case == "row_major_3d_outer_slab_clipped":
+    elif copy_case == "row_major_3d_outer_slab_unclipped":
 
         @T.prim_func
         def kernel(A: T.Tensor(shape, DTYPE)):
@@ -635,7 +647,6 @@ def _run_comm_validate_tile_view_regions(comm_case):
         "row_major_dynamic_min_alignment_unknown",
         "row_major_dynamic_select_alignment_unknown",
         "row_major_3d_outer_slab_valid",
-        "row_major_3d_outer_slab_clipped",
         "zz_3d_major_dim_split",
         "zz_block_equal",
         "zz_block_non_major_dim_multi_block",
@@ -664,6 +675,10 @@ def test_sunmmio_validate_tile_view_regions_accepts_legal_regions(copy_case):
         ),
         (
             "row_major_3d_outer_slab_oob",
+            "must stay within buffer shape",
+        ),
+        (
+            "row_major_3d_outer_slab_unclipped",
             "must stay within buffer shape",
         ),
         (
@@ -760,12 +775,12 @@ def test_sunmmio_validate_tile_view_regions_rejects_comm_regions(comm_case, erro
         _run_comm_validate_tile_view_regions(comm_case)
 
 
-def test_sunmmio_comm_frontend_rejects_broadcast_source_oob():
+def test_sunmmio_comm_frontend_rejects_broadcast_source_oob(_strict_region_validation):
     with pytest.raises(ValueError, match="region starts outside buffer shape"):
         _make_comm_kernel("broadcast_scalar_src_oob")
 
 
-def test_sunmmio_comm_frontend_clips_then_rejects_allgather_recv_oob():
+def test_sunmmio_comm_frontend_clips_then_rejects_allgather_recv_oob(_strict_region_validation):
     with (
         pytest.warns(UserWarning, match="explicit BufferRegion exceeds buffer shape and will be clipped"),
         pytest.raises(ValueError, match="src extent is larger than dst extent"),
