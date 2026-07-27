@@ -37,6 +37,7 @@ bool IsSunmmioLocalVarBuffer(const tir::Buffer &buffer) {
 struct TilesScopeInfo {
   const ForNode *root{nullptr};
   ffi::Array<PrimExpr> domain_shape;
+  std::vector<SunMMIOValue> domain_values;
   std::vector<const ForNode *> domain_loops;
   std::vector<const ForNode *> execution_loops;
   const ForNode *interior_axis0_loop{nullptr};
@@ -1805,6 +1806,84 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         DataType::Int(32));
   };
 
+  auto materialize_domain_values = [&](TilesScopeInfo *tile_scope) {
+    tile_scope->domain_values.clear();
+    tile_scope->domain_values.reserve(tile_scope->domain_shape.size());
+    for (const PrimExpr &extent : tile_scope->domain_shape) {
+      tile_scope->domain_values.push_back(EnsureIndex(EvalExpr(extent)));
+    }
+  };
+
+  auto domain_value = [&](int domain_axis) -> const SunMMIOValue & {
+    ICHECK_GE(domain_axis, 0);
+    ICHECK_LT(static_cast<size_t>(domain_axis), scope.domain_values.size())
+        << "Tile domain axis is missing its materialized value";
+    return scope.domain_values[static_cast<size_t>(domain_axis)];
+  };
+
+  auto ceildiv_index = [&](const SunMMIOValue &value, int64_t divisor) {
+    ICHECK_GT(divisor, 0) << "Tile loop extent divisor must be positive";
+    SunMMIOValue divisor_value = make_index_const(divisor);
+    return div_index(add_index(value, make_index_const(divisor - 1)),
+                     divisor_value);
+  };
+
+  auto materialized_loop_extent =
+      [&](const ForNode *loop) -> std::optional<SunMMIOValue> {
+    auto loop_it =
+        std::find(scope.domain_loops.begin(), scope.domain_loops.end(), loop);
+    if (loop_it == scope.domain_loops.end()) {
+      return std::nullopt;
+    }
+    size_t loop_axis =
+        static_cast<size_t>(std::distance(scope.domain_loops.begin(), loop_it));
+    ICHECK_LT(loop_axis, scope.domain_values.size());
+    auto execution_axis = GetExecutionAxisAnnotation(loop);
+    if (!execution_axis.has_value()) {
+      return scope.domain_values[loop_axis];
+    }
+    ICHECK_GE(execution_axis.value(), 0);
+    ICHECK_LT(static_cast<size_t>(execution_axis.value()),
+              scope.execution_domain_axes.size());
+    ICHECK_LT(static_cast<size_t>(execution_axis.value()),
+              scope.tile_shape.size());
+    int domain_axis = scope.execution_domain_axes[execution_axis.value()];
+    return ceildiv_index(domain_value(domain_axis),
+                         scope.tile_shape[execution_axis.value()]);
+  };
+
+  auto build_full_tile_condition = [&]() {
+    SunMMIOType bool_ty{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
+    std::optional<SunMMIOValue> result;
+    for (size_t execution_axis = 0;
+         execution_axis < scope.execution_loops.size(); ++execution_axis) {
+      const ForNode *loop = scope.execution_loops[execution_axis];
+      ICHECK(loop != nullptr)
+          << "Full-tile condition is missing an execution loop";
+      ICHECK_LT(execution_axis, scope.execution_domain_axes.size());
+      ICHECK_LT(execution_axis, scope.tile_shape.size());
+      SunMMIOValue exec_index = EnsureIndex(EvalExpr(loop->loop_var));
+      SunMMIOValue tile_extent =
+          make_index_const(scope.tile_shape[execution_axis]);
+      SunMMIOValue tile_end =
+          mul_index(add_index(exec_index, make_index_const(1)), tile_extent);
+      SunMMIOValue axis_is_full = builder_->Compare(
+          NewValueName(), CompareOp::kLE, CompareDomain::kSignedInt, tile_end,
+          domain_value(scope.execution_domain_axes[execution_axis]),
+          tile_end.type);
+      axis_is_full = EnsureType(axis_is_full, bool_ty, DataType::Bool());
+      result =
+          result.has_value()
+              ? std::optional<SunMMIOValue>(builder_->Binary(
+                    NewValueName(), BinaryOp::kAnd, ArithmeticFlavor::kBool,
+                    result.value(), axis_is_full, bool_ty, DataType::Bool()))
+              : std::optional<SunMMIOValue>(axis_is_full);
+    }
+    ICHECK(result.has_value())
+        << "Full-tile condition requires at least one execution axis";
+    return result.value();
+  };
+
   auto compute_aligned_1d_address =
       [&](const TileAccessInfo &access,
           const SunMMIOType &memtensor_type) -> Aligned1DAddressInfo {
@@ -2201,10 +2280,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     SunMMIOValue exec_j = EvalExpr(scope.execution_loops[1]->loop_var);
     SunMMIOValue tile_m = make_index_const(scope.tile_shape[0]);
     SunMMIOValue tile_n = make_index_const(scope.tile_shape[1]);
-    SunMMIOValue domain_m = EnsureIndex(
-        EvalExpr(scope.domain_shape[scope.execution_domain_axes[0]]));
-    SunMMIOValue domain_n = EnsureIndex(
-        EvalExpr(scope.domain_shape[scope.execution_domain_axes[1]]));
+    SunMMIOValue domain_m = domain_value(scope.execution_domain_axes[0]);
+    SunMMIOValue domain_n = domain_value(scope.execution_domain_axes[1]);
 
     SunMMIOValue valid_rows = min_index(
         tile_m,
@@ -2460,8 +2537,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       }
       int domain_axis = scope.execution_domain_axes[axis];
       SunMMIOValue tile_extent = make_index_const(scope.tile_shape[axis]);
-      SunMMIOValue domain_extent = EnsureIndex(
-          EvalExpr(scope.domain_shape[static_cast<size_t>(domain_axis)]));
+      SunMMIOValue domain_extent = domain_value(domain_axis);
       SunMMIOValue exec_index =
           EnsureIndex(EvalExpr(scope.execution_loops[axis]->loop_var));
       SunMMIOValue valid_extent =
@@ -2494,8 +2570,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     ICHECK_LT(domain_axis, static_cast<int>(scope.domain_shape.size()));
 
     SunMMIOValue tile_extent = make_index_const(scope.tile_shape[axis]);
-    SunMMIOValue domain_extent = EnsureIndex(
-        EvalExpr(scope.domain_shape[static_cast<size_t>(domain_axis)]));
+    SunMMIOValue domain_extent = domain_value(domain_axis);
     SunMMIOValue exec_index =
         EnsureIndex(EvalExpr(scope.execution_loops[axis]->loop_var));
     SunMMIOValue valid_lanes =
@@ -4220,6 +4295,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                 parent_scope.domain_loops.size() + 1 ==
                     parent_scope.domain_shape.size()) {
               scope.domain_shape = parent_scope.domain_shape;
+              scope.domain_values = parent_scope.domain_values;
               scope.domain_loops = parent_scope.domain_loops;
               scope.domain_loops.push_back(loop);
               scope.execution_loops = parent_scope.execution_loops;
@@ -4243,8 +4319,15 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
             scope.is_reduce_scope = IsReduceLikeTileBody(scope.tile_block_body);
           }
         }
+        if (saved_scope.has_value() && scope.domain_values.empty()) {
+          materialize_domain_values(&scope);
+        }
         SunMMIOValue min = EnsureIndex(EvalExpr(loop->min));
-        SunMMIOValue extent = EnsureIndex(EvalExpr(loop->extent));
+        std::optional<SunMMIOValue> materialized_extent =
+            materialized_loop_extent(loop);
+        SunMMIOValue extent = materialized_extent.has_value()
+                                  ? materialized_extent.value()
+                                  : EnsureIndex(EvalExpr(loop->extent));
         SunMMIOValue step = EmitConstIndex(1);
         SunMMIOValue upper = builder_->Binary(
             NewValueName(), BinaryOp::kAdd, ArithmeticFlavor::kIndex, min,
@@ -4419,9 +4502,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         lower_stmt(scope.tail_tile_block_body, &tail_state);
       };
 
-      SunMMIOType bool_ty{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
-      SunMMIOValue cond =
-          EnsureType(EvalExpr(scope.tail_predicate), bool_ty, DataType::Bool());
+      SunMMIOValue cond = build_full_tile_condition();
       builder_->BeginIf(cond, std::vector<int64_t>{});
       TileBlockState full_state = *state;
       full_state.tile_mask.reset();
@@ -4472,7 +4553,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     }
     const ForNode *loop = scope.domain_loops[loop_index];
     SunMMIOValue min = EnsureIndex(EvalExpr(loop->min));
-    SunMMIOValue extent = EnsureIndex(EvalExpr(loop->extent));
+    SunMMIOValue extent = materialized_loop_extent(loop).value();
     SunMMIOValue step = EmitConstIndex(1);
     SunMMIOValue upper = builder_->Binary(
         NewValueName(), BinaryOp::kAdd, ArithmeticFlavor::kIndex, min, extent,
@@ -4504,6 +4585,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   state.mlir_ctx = mlir_ctx;
   state.interior_axis0_loop = scope.interior_axis0_loop;
   state.interior_axis1_loop = scope.interior_axis1_loop;
+  // Snapshot dynamic domains before any loop so bounds and masks share SSA.
+  materialize_domain_values(&scope);
   discover_reduce_register_temps(tile_scope_stmt, &state);
   if (!state.register_tile_types.empty()) {
     initialize_reduce_register_temps(&state);
