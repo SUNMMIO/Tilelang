@@ -133,6 +133,26 @@ def packed_2d_to_1d_rank1_fallback_kernel(h=4, base=8, vector_size=128, matrix_s
     return main
 
 
+@target("Sunmmio")
+def mixed_rank_unit_side_load_kernel(rows=64, cols=128, dtype=T.float32):
+    matrix_layout = make_aligned_row_major((rows, cols), dtype, align_bytes=64)
+    vector_layout = make_aligned_row_major((rows,), dtype, align_bytes=64)
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            A_shared = T.alloc_shared((rows, cols), dtype)
+            B_shared = T.alloc_shared((rows,), dtype)
+            T.annotate_layout({A_shared: matrix_layout, B_shared: vector_layout})
+
+            T.fill(A_shared, 1)
+            T.fill(B_shared, 2)
+            for i, j in T.Tiles([rows, cols], parallel=True):
+                A_shared[i, j] = A_shared[i, j] + B_shared[i]
+
+    return main
+
+
 def _validate_aligned_1d_bridge(kernel, tmp_path, filename):
     src = validate_sunmmio_codegen_with_npuir_opt(
         kernel,
@@ -175,6 +195,17 @@ def test_packed_2d_to_1d_falls_back_to_rank1_carriers(tmp_path):
         tmp_path,
         "packed_2d_to_1d_rank1_fallback_suvm.mlir",
     )
+
+
+def test_mixed_rank_unit_side_load_uses_carrier_pick(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        mixed_rank_unit_side_load_kernel(),
+        tmp_path,
+        mlir_filename="mixed_rank_unit_side_load_suvm.mlir",
+        expected_tokens=("!suvm.tile<1x128xf32>", "!suvm.tile_view<16xf32>", "suvm.tile.pick"),
+        opt_args=STRICT_OPT_ARGS,
+    )
+    assert "suvm.tile.extract_slice" not in src
 
 
 if __name__ == "__main__":

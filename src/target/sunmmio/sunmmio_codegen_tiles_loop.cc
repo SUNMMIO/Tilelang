@@ -581,6 +581,11 @@ MatchTiledIndex(const PrimExpr &index, const Var &exec, const Var &interior,
   PrimExpr dynamic_base;
 
   auto match_exec_mul = [&](const PrimExpr &expr) -> bool {
+    // Simplification folds exec * 1 + interior to bare exec when the logical
+    // tile extent is one and the interior coordinate is always zero.
+    if (tile_extent == 1 && matches_integer_var(expr, exec)) {
+      return true;
+    }
     const auto *mul = expr.as<MulNode>();
     if (!mul) {
       return false;
@@ -618,7 +623,9 @@ MatchTiledIndex(const PrimExpr &index, const Var &exec, const Var &interior,
     dynamic_base = dynamic_base.defined() ? dynamic_base + term : term;
   }
 
-  if (!seen_interior || const_offset % tile_extent != 0) {
+  bool has_unit_exec_without_interior = tile_extent == 1 && seen_exec;
+  if ((!seen_interior && !has_unit_exec_without_interior) ||
+      const_offset % tile_extent != 0) {
     return std::nullopt;
   }
 
@@ -2085,6 +2092,16 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       state->current_tile_values[cache_key] = builder_->BindValueAlias(
           make_current_value_name(access.buffer, cache_key), aligned_tile);
     }
+
+    DataType value_dtype =
+        CanonicalizeSuvmDType(access.buffer->dtype).with_lanes(1);
+    if (access.tile_shape[0] == 1 && SupportsSuvmTilePickDType(value_dtype)) {
+      SunMMIOType scalar_type{SunMMIOType::Kind::kScalar, value_dtype, 1, {}};
+      return builder_->TilePick(NewValueName(), aligned_tile,
+                                {aligned_address.offset_elems}, scalar_type,
+                                value_dtype);
+    }
+
     SunMMIOType aligned_2d_type =
         MakeTileType(access.buffer->dtype, access.aligned_load_shape);
     SunMMIOValue aligned_2d_tile = checked_tile_unsqueeze(

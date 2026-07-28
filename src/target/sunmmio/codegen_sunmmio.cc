@@ -112,15 +112,6 @@ bool IsSunmmioWsramScope(const std::string &scope) {
   return scope == tl::kSunmmioScopeWSRAM || scope == "wsram";
 }
 
-bool IsSuvmTilePickDType(DataType dtype) {
-  dtype = CanonicalizeSuvmDType(dtype).with_lanes(1);
-  if (dtype.bits() != 16 && dtype.bits() != 32) {
-    return false;
-  }
-  return dtype.is_int() || dtype.is_uint() || dtype.is_float() ||
-         dtype.is_bfloat16();
-}
-
 SunMMIOType MakeScalarType(DataType dtype) {
   dtype = CanonicalizeSuvmDType(dtype).with_lanes(1);
   return SunMMIOType{SunMMIOType::Kind::kScalar, dtype, 1, {}};
@@ -2074,7 +2065,7 @@ CodeGenTileLangSunMMIO::EmitScalarTilePick(const tir::BufferLoadNode *op) {
   }
 
   const BufferBinding &binding = LookupBuffer(buffer);
-  if (!IsSuvmTilePickDType(dtype)) {
+  if (!SupportsSuvmTilePickDType(dtype)) {
     UnsupportedExpr(op, "Sunmmio scalar BufferLoad tile.pick supports only "
                         "i16/ui16/i32/ui32/bf16/f32. " +
                             describe());
@@ -2148,7 +2139,7 @@ void CodeGenTileLangSunMMIO::EmitScalarTileSet(const tir::BufferStoreNode *op) {
   }
 
   const BufferBinding &binding = LookupBuffer(buffer);
-  if (!IsSuvmTilePickDType(dtype)) {
+  if (!SupportsSuvmTilePickDType(dtype)) {
     UnsupportedStmt(op, "Sunmmio scalar BufferStore tile.set supports only "
                         "i16/ui16/i32/ui32/bf16/f32. " +
                             describe());

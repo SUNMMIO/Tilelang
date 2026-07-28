@@ -501,8 +501,9 @@ private:
         LOG(WARNING)
             << "T.Tiles domain " << domain
             << " uses a logical 1D tile smaller than the native RSRAM "
-               "alignment. Codegen will load an aligned carrier and extract "
-               "or insert the logical tile. This may degrade performance.";
+               "alignment. Codegen will load an aligned carrier and pick, "
+               "extract, or insert the logical tile. This may degrade "
+               "performance.";
       }
       if (active_tileview_plan_.execution_domain_axes.size() < domain.size()) {
         LOG(WARNING) << "T.Tiles domain " << domain
