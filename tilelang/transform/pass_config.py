@@ -59,6 +59,12 @@ class PassConfigKey(str, Enum):
     TL_ENABLE_DSL_SPAN = "tl.enable_dsl_span"
     """Enable frontend DSL source spans for diagnostics. Default: True"""
 
+    TL_CHECK_SPAN_LOG_LEVEL = "tl.check_span_log_level"
+    """Check final device TIR spans at the requested FATAL or WARNING level.
+
+    Default: WARNING.
+    """
+
     TL_PTXAS_REGISTER_USAGE_LEVEL = "tl.ptxas_register_usage_level"
     """The PTXAS register usage level in [0, 10], which controls the
     aggressiveness of optimizations that affect register usage. Default: None"""

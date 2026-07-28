@@ -882,7 +882,7 @@ CodeGenTileLangSunMMIO::LookupVar(const tir::VarNode *var) const {
   if (it != var_table_.end()) {
     return it->second;
   }
-  SUNMMIO_FATAL(var)
+  SUNMMIO_LOG(FATAL, var)
       << "CodeGenTileLangSunMMIO: unbound TIR var `" << var->name_hint
       << "` reached SunMMIO codegen without a parameter, loop, let, "
          "allocation, or thread binding";
@@ -1557,7 +1557,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AllocateNode *op) {
       EmitAlloc(buffer_it->second, scope, op->annotations);
     }
   } else {
-    SUNMMIO_FATAL(op)
+    SUNMMIO_LOG(FATAL, op)
         << "SunMMIO SUVM allocate cannot find buffer for variable "
         << op->buffer_var->name_hint;
     TVM_FFI_UNREACHABLE();
@@ -1686,7 +1686,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BlockNode *op) {
   EnterScope();
   for (const IterVar &iv : op->iter_vars) {
     if (!var_table_.count(iv->var.get())) {
-      SUNMMIO_FATAL(op)
+      SUNMMIO_LOG(FATAL, op)
           << "CodeGenTileLangSunMMIO: unbound block iter var `"
           << iv->var->name_hint
           << "` reached SunMMIO codegen without a BlockRealize binding";
@@ -2636,7 +2636,7 @@ CodeGenTileLangSunMMIO::UnsupportedStmt(const Object *op,
   if (!detail.empty()) {
     os << " (" << detail << ")";
   }
-  SUNMMIO_FATAL(op) << os.str();
+  SUNMMIO_LOG(FATAL, op) << os.str();
   TVM_FFI_UNREACHABLE();
 }
 
@@ -2650,7 +2650,7 @@ CodeGenTileLangSunMMIO::UnsupportedExpr(const Object *op,
   if (!detail.empty()) {
     os << " (" << detail << ")";
   }
-  SUNMMIO_FATAL(op) << os.str();
+  SUNMMIO_LOG(FATAL, op) << os.str();
   TVM_FFI_UNREACHABLE();
 }
 } // namespace codegen

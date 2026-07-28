@@ -5,6 +5,7 @@
 #include <tvm/ir/source_map.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/runtime/object.h>
+#include <tvm/tir/function.h>
 #include <tvm/tir/stmt.h>
 
 #include <ostream>
@@ -50,6 +51,10 @@ inline std::string FormatObjectSpanForLog(const Object *op) {
     const auto *expr = static_cast<const BaseExprNode *>(op);
     return FormatSpanForLog(expr->span);
   }
+  if (op->IsInstance<tir::PrimFuncNode>()) {
+    const auto *func = static_cast<const tir::PrimFuncNode *>(op);
+    return FormatSpanForLog(func->span);
+  }
   return "";
 }
 
@@ -76,11 +81,29 @@ private:
   const Object *op_;
 };
 
+class LOGWarning {
+public:
+  LOGWarning(const char *file, int line, const Object *op)
+      : log_(file, line, TVM_LOG_LEVEL_WARNING), op_(op) {}
+
+  ~LOGWarning() { AppendObjectSpanForLog(&log_.stream(), op_); }
+
+  std::ostream &stream() { return log_.stream(); }
+
+private:
+  runtime::detail::LogMessage log_;
+  const Object *op_;
+};
+
 } // namespace log
 } // namespace tl
 } // namespace tvm
 
-#define TL_FATAL(op) ::tvm::tl::log::LOGFatal(__FILE__, __LINE__, (op)).stream()
+#define TL_LOG_FATAL(op)                                                       \
+  ::tvm::tl::log::LOGFatal(__FILE__, __LINE__, (op)).stream()
+
+#define TL_LOG_WARNING(op)                                                     \
+  ::tvm::tl::log::LOGWarning(__FILE__, __LINE__, (op)).stream()
 
 #define TL_CHECK(cond, op)                                                     \
   (cond) ? (void)0                                                             \
@@ -88,7 +111,7 @@ private:
                ::tvm::tl::log::LOGFatal(__FILE__, __LINE__, (op)).stream()     \
                    << "Check failed: (" #cond ") is false: "
 
-#define SUNMMIO_FATAL(op) TL_FATAL(op)
+#define SUNMMIO_LOG(level, op) TL_LOG_##level(op)
 
 #define SUNMMIO_CHECK(cond, op) TL_CHECK((cond), (op))
 

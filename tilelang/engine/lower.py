@@ -275,6 +275,10 @@ def lower(
     # Phase 2: Optimize the IR for the target
     mod = OptimizeForTarget(mod, target)
 
+    # check that every node have span info
+    if target_is_sunmmio():
+        mod = tilelang.transform.CheckSpan()(mod)
+
     host_mod = tir.transform.Filter(_is_host_call)(mod)
     device_mod = tir.transform.Filter(_is_device_call)(mod)
 

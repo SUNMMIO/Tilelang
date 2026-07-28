@@ -81,6 +81,20 @@ def AttachDslSpan():
     return _ffi_api.AttachDslSpan()  # type: ignore
 
 
+def CheckSpan():
+    """Check that final TIR statements and expressions carry Span metadata.
+
+    The ``tl.check_span_log_level`` pass config controls whether missing spans
+    are reported as ``FATAL`` or ``WARNING``. The default is ``WARNING``.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.CheckSpan()  # type: ignore
+
+
 def LegalizeSunmmioDataPath():
     """Stage unsupported Sunmmio global->asram data-transfer paths through rsram.
 
