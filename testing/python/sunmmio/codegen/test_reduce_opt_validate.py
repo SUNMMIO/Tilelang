@@ -329,11 +329,7 @@ def test_reduce_dim0_multisegment_store_uses_partition_coordinate(tmp_path):
         expected_tokens=("suvm.tile.reduce", "suvm.tile.store"),
     )
 
-    definitions = {
-        match.group(1): match.group(2)
-        for line in src.splitlines()
-        if (match := re.match(r"\s*(%[\w.]+)\s*=\s*(.+)", line))
-    }
+    definitions = {match.group(1): match.group(2) for line in src.splitlines() if (match := re.match(r"\s*(%[\w.]+)\s*=\s*(.+)", line))}
     source_views = [
         line
         for line in src.splitlines()
@@ -343,17 +339,12 @@ def test_reduce_dim0_multisegment_store_uses_partition_coordinate(tmp_path):
         and "-> !suvm.tile_view<4x32xf32>" in line
     ]
     destination_stores = [
-        line
-        for line in src.splitlines()
-        if "suvm.tile.store" in line
-        and "!suvm.tile<32xf32>, !suvm.tile_view<32xf32>" in line
+        line for line in src.splitlines() if "suvm.tile.store" in line and "!suvm.tile<32xf32>, !suvm.tile_view<32xf32>" in line
     ]
     assert len(source_views) == 1, source_views
     assert len(destination_stores) == 1, destination_stores
 
-    source_indices = re.search(
-        r"indices = \[(%[\w.]+), (%[\w.]+)\]", source_views[0]
-    )
+    source_indices = re.search(r"indices = \[(%[\w.]+), (%[\w.]+)\]", source_views[0])
     assert source_indices, source_views[0]
     segment_index = source_indices.group(2)
 
@@ -368,9 +359,7 @@ def test_reduce_dim0_multisegment_store_uses_partition_coordinate(tmp_path):
     assert "!suvm.memtensor<128xf32" in destination_view_definition
     assert "-> !suvm.tile_view<32xf32>" in destination_view_definition
 
-    index_match = re.search(
-        r"indices = \[(%[\w.]+)\]", destination_view_definition
-    )
+    index_match = re.search(r"indices = \[(%[\w.]+)\]", destination_view_definition)
     assert index_match, destination_view_definition
     destination_index = index_match.group(1)
 
@@ -384,9 +373,7 @@ def test_reduce_dim0_multisegment_store_uses_partition_coordinate(tmp_path):
         r"arith\.divsi (%[\w.]+), (%[\w.]+) : index",
         definitions.get(destination_index, ""),
     )
-    assert div_match, (
-        f"destination index is not defined by divsi: {destination_view_definition}"
-    )
+    assert div_match, f"destination index is not defined by divsi: {destination_view_definition}"
     numerator, divisor = div_match.groups()
     assert definitions.get(divisor) == "arith.constant 32 : index"
 
@@ -408,9 +395,7 @@ def test_reduce_dim0_multisegment_store_uses_partition_coordinate(tmp_path):
     else:
         segment_i32, factor = lhs, rhs
     assert definitions.get(factor) == "arith.constant 32 : i32"
-    assert definitions.get(segment_i32) == (
-        f"arith.index_cast {segment_index} : index to i32"
-    ), (
+    assert definitions.get(segment_i32) == (f"arith.index_cast {segment_index} : index to i32"), (
         "The reduction destination must be indexed by "
         "(segment_index * 32) / 32.\n"
         f"source view: {source_views[0]}\n"
