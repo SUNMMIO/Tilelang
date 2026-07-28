@@ -2375,9 +2375,13 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
     SunMMIOValue tile = load_tile(src_view, dtype, shape);
     builder_->TileStore(tile, dst_view, std::nullopt);
   };
-  auto emit_scale_copy = [&](const SunMMIOValue &src, const SunMMIOValue &dst) {
+  auto emit_scale_copy = [&](const SunMMIOValue &src, const SunMMIOValue &dst,
+                             tl::sunmmio::MXLayoutKind layout_kind) {
     constexpr int64_t kScaleValidElems = 32;
     constexpr int64_t kScaleAccessElems = 64;
+    ICHECK(layout_kind != tl::sunmmio::MXLayoutKind::kRowMajor)
+        << "tl.mx_pack/unpack row-major scale copy is not implemented yet; "
+           "waiting for stable suvm.unpack scale alias layout";
     std::vector<int64_t> scale_shape = ExtractStaticShape(src.type);
     std::vector<int64_t> dst_scale_shape = ExtractStaticShape(dst.type);
     std::vector<int64_t> src_physical = ExtractPhysicalExtents(src.type);
@@ -2397,8 +2401,11 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
     ICHECK_GE(dst_physical[1], kScaleValidElems)
         << "MX scale destination physical width must cover 32 logical elements";
 
-    bool use_padded_access = src_physical[1] >= kScaleAccessElems &&
-                             dst_physical[1] >= kScaleAccessElems;
+    ICHECK(src_physical[1] >= kScaleAccessElems &&
+           dst_physical[1] >= kScaleAccessElems)
+        << "MX scale copy requires source and destination physical width to "
+           "cover a 64B fp8 tile access; got source width "
+        << src_physical[1] << " and destination width " << dst_physical[1];
 
     std::string row_name = NewValueName();
     begin_for(row_name, scale_shape[0]);
@@ -2406,12 +2413,6 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
     std::vector<SunMMIOValue> indices{row, EmitConstIndex(0)};
     std::vector<int64_t> tiled_dims{0, 1};
     std::vector<int64_t> valid_shape{1, kScaleValidElems};
-    if (!use_padded_access) {
-      copy_tile(src, dst, ExpectedMXScaleDType(), indices, tiled_dims,
-                valid_shape);
-      builder_->EndFor();
-      return;
-    }
 
     std::vector<int64_t> access_shape{1, kScaleAccessElems};
     std::vector<SunMMIOValue> offsets{EmitConstIndex(0), EmitConstIndex(0)};
@@ -2560,7 +2561,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
                   "tl.mx_pack/unpack";
     break;
   }
-  emit_scale_copy(scale_src, scale_dst);
+  emit_scale_copy(scale_src, scale_dst, analysis->kind);
 
   return SunMMIOValue{op->dtype, "", MapType(op->dtype)};
 }
