@@ -1,6 +1,6 @@
 /*!
  * \file substitute_with_buffer_predicates.h
- * \brief Predicate-aware wrappers around TIR variable substitution.
+ * \brief Compatibility wrappers around TIR variable substitution.
  */
 
 #ifndef TVM_TL_TRANSFORM_COMMON_SUBSTITUTE_WITH_BUFFER_PREDICATES_H_
@@ -28,6 +28,18 @@ tir::Stmt SubstituteWithBufferPredicates(
  */
 PrimExpr SubstituteWithBufferPredicates(
     const PrimExpr &expr, const ffi::Map<tir::Var, PrimExpr> &substitutions);
+
+/*!
+ * \brief Substitute variables throughout a statement, including predicates
+ * attached to BufferLoad and BufferStore nodes and PrimExpr values embedded in
+ * For and Block annotations.
+ *
+ * Annotation arrays and maps are traversed recursively. Object types with
+ * domain-specific expression fields, such as Layout, remain the caller's
+ * responsibility.
+ */
+tir::Stmt SubstituteWithAnnotationsAndBufferPredicates(
+    const tir::Stmt &stmt, const ffi::Map<tir::Var, PrimExpr> &substitutions);
 
 } // namespace tl
 } // namespace tvm
