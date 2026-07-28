@@ -378,7 +378,7 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     mlir::IntegerAttr mask_attr = ctx_.builder.getI64IntegerAttr(mask);
     auto barrier_op = mlir::suvm::BarrierInitOp::create(
         ctx_.builder, type.MakeDebugLoc("barrier_init"), mlir::Value{},
-        mask_attr);
+        mask_attr, mlir::IntegerAttr{});
     ctx_.static_barrier_by_mask[mask] = barrier_op.getBarrier();
     return barrier_op.getBarrier();
   };
@@ -398,14 +398,13 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     }
     auto barrier_op = mlir::suvm::BarrierInitOp::create(
         ctx_.builder, type.MakeDebugLoc("barrier_init"), mask,
-        mlir::IntegerAttr{});
+        mlir::IntegerAttr{}, mlir::IntegerAttr{});
     ctx_.barrier_by_mask[key] = barrier_op.getBarrier();
     return barrier_op.getBarrier();
   };
   auto emit_barrier_arrive_and_wait = [&](mlir::Value barrier) {
     (void)mlir::suvm::BarrierArriveAndWaitOp::create(
-        ctx_.builder, type.MakeDebugLoc("barrier_arrive_and_wait"), barrier,
-        mlir::IntegerAttr{});
+        ctx_.builder, type.MakeDebugLoc("barrier_arrive_and_wait"), barrier);
   };
   auto emit_candidate_barrier_wait =
       [&](mlir::Value dynamic_mask, const std::vector<int64_t> &candidates) {
