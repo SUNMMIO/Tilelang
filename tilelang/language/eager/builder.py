@@ -2,7 +2,6 @@ from __future__ import annotations
 from contextlib import contextmanager, AbstractContextManager
 from dataclasses import dataclass
 import inspect
-import os
 import sys
 
 from tilelang.language.kernel import KernelLaunchFrame
@@ -178,7 +177,6 @@ EagerJITStage = Literal["phase1", "phase2", "none"]
 
 DSL_SPAN_ATTR = "tilelang.dsl_span"
 DSL_SPAN_CONFIG_KEY = "tl.enable_dsl_span"
-DSL_SPAN_ENV_VAR = "TILELANG_ENABLE_DSL_SPAN"
 
 
 class Builder(BaseBuilder):
@@ -317,9 +315,6 @@ class Builder(BaseBuilder):
 
     @staticmethod
     def _dsl_span_enabled() -> bool:
-        env_value = os.environ.get(DSL_SPAN_ENV_VAR)
-        if env_value is not None:
-            return env_value.strip().lower() not in ("0", "false", "off", "no")
         config_value = tvm.transform.PassContext.current().config.get(DSL_SPAN_CONFIG_KEY, None)
         if config_value is not None:
             return bool(config_value)
