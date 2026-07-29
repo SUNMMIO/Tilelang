@@ -12,7 +12,7 @@ def ref_program(x, y):
 
 def _elementwise_add_prim_func(M, N, block_M, block_N, in_dtype, out_dtype):
     zz_layout = make_zz_layout((M, N))
-    placement = T.MeshShardingPolicy(y=0, x=1)
+    placement = T.placement.full_shard(0, 1)
 
     @T.prim_func
     def elem_add(

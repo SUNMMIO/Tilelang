@@ -90,7 +90,7 @@ def dynamic_allocate_copy_mma_kernel(
     # B_layout = make_zz_layout((K, N))
     # C_layout = make_zz_layout((M, N))
 
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
 
     @T.prim_func
     def main(
@@ -147,7 +147,7 @@ def dynamic_zz_allocate_copy_mma_kernel(
     B_layout = make_zz_layout((K, N))
     C_layout = make_zz_layout((M, N))
 
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
 
     @T.prim_func
     def main(
