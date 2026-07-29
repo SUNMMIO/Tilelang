@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -127,13 +128,16 @@ def test_direct_runtime_boundary_keeps_dynamic_device_abi_without_make_packed_ap
     assert "self_handle" not in script
 
 
-def test_direct_runtime_codegen_accepts_dynamic_mesh_symbols_without_make_packed_api():
+def test_direct_runtime_codegen_accepts_dynamic_mesh_symbols_without_make_packed_api(tmp_path, monkeypatch):
     target = _sunmmio_target()
     device_mod = _device_mod_for_direct_runtime()
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile", allow_missing=True)
     if builder is None:
         pytest.skip("Sunmmio SUVM codegen is not available in this build.")
 
+    coverage_path = tmp_path / "dynamic_elementwise_coverage.json"
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_PATH", str(coverage_path))
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT", "1")
     runtime_mod = builder(device_mod, target, "suvm")
     src = runtime_mod.inspect_source()
 
@@ -150,3 +154,10 @@ def test_direct_runtime_codegen_accepts_dynamic_mesh_symbols_without_make_packed
         if token not in src
     ]
     assert not missing, f"missing expected SUVM MLIR tokens: {missing}\n{src}"
+
+    coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
+    tiles = coverage["tiles"]
+    assert tiles["missing_node_types"] == []
+    assert tiles["missing_call_ops"] == []
+    assert "tir.Mul" in tiles["expected_node_types"]
+    assert "tir.Mul" in tiles["visited_node_types"]

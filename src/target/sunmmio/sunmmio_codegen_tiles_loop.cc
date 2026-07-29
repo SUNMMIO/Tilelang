@@ -811,6 +811,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     std::vector<int64_t> logical_tile_shapes(indices.size(), -1);
     std::vector<PrimExpr> logical_partition_indices(indices.size());
     for (int dim = 0; dim < static_cast<int>(indices.size()); ++dim) {
+      MarkVisitedExprRoot(indices[dim]);
       for (int axis = 0; axis < static_cast<int>(scope.tile_shape.size());
            ++axis) {
         const ForNode *exec_loop = scope.execution_loops[axis];
@@ -870,6 +871,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                                     PrimExpr(IntImm(indices[dim].dtype(), 0))};
           }
           if (match) {
+            // MatchTiledIndex consumes the original affine index tree directly;
+            // the simplified partition index no longer contains every input
+            // node.
+            MarkVisitedExprTree(indices[dim]);
             logical_tile_axes[dim] = axis;
             logical_tile_shapes[dim] = matched_tile_extent;
             logical_partition_indices[dim] = match->partition_index;
@@ -1081,6 +1086,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       indices.push_back(EnsureIndex(EvalExpr(range->min)));
       const auto *extent_imm = range->extent.as<IntImmNode>();
       ICHECK(extent_imm) << "Tile region extent must be IntImm";
+      MarkVisitedExprRoot(range->extent);
       if (extent_imm->value != 1) {
         tiled_dims.push_back(dim);
         tile_shape.push_back(static_cast<int64_t>(extent_imm->value));
@@ -1110,6 +1116,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     for (const Range &range : region->region) {
       const auto *extent_imm = range->extent.as<IntImmNode>();
       ICHECK(extent_imm) << "Register tile region extent must be IntImm";
+      MarkVisitedExprRoot(range->extent);
       if (extent_imm->value != 1) {
         tile_shape.push_back(static_cast<int64_t>(extent_imm->value));
       }
@@ -2205,6 +2212,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       if (dim < static_cast<int64_t>(region->region.size())) {
         const auto *extent_imm = region->region[dim]->extent.as<IntImmNode>();
         ICHECK(extent_imm) << "Tile region extent must be IntImm";
+        MarkVisitedExprRoot(region->region[dim]->extent);
         extent = static_cast<int64_t>(extent_imm->value);
       }
 
@@ -2958,6 +2966,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
 
   lower_expr = [&](const PrimExpr &expr, TileBlockState *state,
                    std::optional<DataType> preferred_dtype) -> SunMMIOValue {
+    MarkVisitedExprRoot(expr);
     std::function<SunMMIOValue(const PrimExpr &, const std::vector<int64_t> &,
                                std::optional<DataType>)>
         lower_bool_expr_to_shape;
@@ -2985,6 +2994,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     auto emit_select = [&](const PrimExpr &condition,
                            const PrimExpr &true_value_expr,
                            const PrimExpr &false_value_expr, DataType dtype) {
+      MarkVisitedExprRoot(condition);
       PrimExpr condition_to_lower = rewrite_mask_condition(condition);
       SunMMIOValue true_value =
           lower_expr(true_value_expr, state, preferred_dtype);
@@ -3708,6 +3718,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   };
 
   lower_stmt = [&](const Stmt &stmt, TileBlockState *state) {
+    if (IsTokenLikeTileStmt(stmt)) {
+      return;
+    }
+    MarkVisitedNodeType(stmt->GetTypeKey());
     if (const auto *seq = stmt.as<SeqStmtNode>()) {
       for (const Stmt &s : seq->seq) {
         lower_stmt(s, state);
@@ -3715,6 +3729,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       return;
     }
     if (const auto *loop = stmt.as<ForNode>()) {
+      MarkVisitedExprRoot(loop->min);
+      MarkVisitedExprRoot(loop->extent);
+      if (loop->step.has_value()) {
+        MarkVisitedExprRoot(loop->step.value());
+      }
       auto axis = GetInteriorAxisAnnotation(loop);
       if (!axis.has_value()) {
         UnsupportedStmt(loop,
@@ -3739,9 +3758,6 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       state->register_unsqueeze_axes = loop_state.register_unsqueeze_axes;
       state->local_tile_values = loop_state.local_tile_values;
       state->local_unit_tile_axes = loop_state.local_unit_tile_axes;
-      return;
-    }
-    if (IsTokenLikeTileStmt(stmt)) {
       return;
     }
     if (const auto *ifs = stmt.as<IfThenElseNode>()) {
@@ -4065,16 +4081,28 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
 
   lower_vector_core_in_tile_reduce = [&](const CallNode *call,
                                          TileBlockState *state) {
+    MarkVisitedExprRoot(ffi::GetRef<PrimExpr>(call));
     ICHECK_EQ(call->args.size(), 4U)
         << "tl.vector_core_in_tile_reduce expects predicate, dst region, src "
            "region, and axis";
     const auto *predicate = call->args[0].as<StringImmNode>();
     ICHECK(predicate)
         << "tl.vector_core_in_tile_reduce predicate must be StringImm";
-    BufferRegion dst_region = tl::NormalizeToBufferRegion(call->args[1]);
-    BufferRegion src_region = tl::NormalizeToBufferRegion(call->args[2]);
+    MarkVisitedNodeType(predicate->GetTypeKey());
+    auto normalize_region = [&](const PrimExpr &expr) {
+      MarkVisitedExprRoot(expr);
+      if (const auto *region_call = expr.as<CallNode>()) {
+        for (const PrimExpr &arg : region_call->args) {
+          MarkVisitedExprRoot(arg);
+        }
+      }
+      return tl::NormalizeToBufferRegion(expr);
+    };
+    BufferRegion dst_region = normalize_region(call->args[1]);
+    BufferRegion src_region = normalize_region(call->args[2]);
     const auto *axis_imm = call->args[3].as<IntImmNode>();
     ICHECK(axis_imm) << "tl.vector_core_in_tile_reduce axis must be IntImm";
+    MarkVisitedNodeType(axis_imm->GetTypeKey());
     int64_t axis = static_cast<int64_t>(axis_imm->value);
     note_register_unsqueeze_axis(state, dst_region->buffer, axis);
 
@@ -4193,6 +4221,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   };
 
   lower_reduce_stmt = [&](const Stmt &stmt, TileBlockState *state) {
+    if (IsTokenLikeTileStmt(stmt)) {
+      return;
+    }
+    MarkVisitedNodeType(stmt->GetTypeKey());
     if (const auto *seq = stmt.as<SeqStmtNode>()) {
       for (const Stmt &s : seq->seq) {
         lower_reduce_stmt(s, state);
@@ -4246,6 +4278,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       return;
     }
     if (const auto *loop = stmt.as<ForNode>()) {
+      MarkVisitedExprRoot(loop->min);
+      MarkVisitedExprRoot(loop->extent);
+      if (loop->step.has_value()) {
+        MarkVisitedExprRoot(loop->step.value());
+      }
       auto axis = GetInteriorAxisAnnotation(loop);
       if (!axis.has_value()) {
         std::optional<TilesScopeInfo> saved_scope;
@@ -4449,9 +4486,6 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                       "T.Tiles hybrid lowering only supports DeclBuffer for "
                       "reduce register temporaries");
     }
-    if (IsTokenLikeTileStmt(stmt)) {
-      return;
-    }
     if (const auto *eval = stmt.as<EvaluateNode>()) {
       if (const auto *call = eval->value.as<CallNode>()) {
         const auto *op_node = call->op.as<OpNode>();
@@ -4599,6 +4633,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       return;
     }
     const ForNode *loop = scope.domain_loops[loop_index];
+    MarkVisitedNodeType(loop->GetTypeKey());
     SunMMIOValue min = EnsureIndex(EvalExpr(loop->min));
     SunMMIOValue extent = materialized_loop_extent(loop).value();
     SunMMIOValue step = EmitConstIndex(1);
