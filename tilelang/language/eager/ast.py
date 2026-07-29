@@ -620,13 +620,7 @@ class SpanAttacher(ast.NodeTransformer):
     def visit(self, node: ast.AST):
         node = self.generic_visit(node)
         if isinstance(node, ast.stmt) and hasattr(node, "lineno"):
-            col = getattr(node, "col_offset", 0)
-            end_lineno = getattr(node, "end_lineno", None) or node.lineno
-            end_col = getattr(node, "end_col_offset", None)
-            end_col = col if end_col is None else end_col
-            return quote(f"__tb.set_span({self.filename_var}, {node.lineno}, {col}, {end_lineno}, {end_col}, {self.func_name_var})") + [
-                node
-            ]
+            return quote(f"__tb.set_span({self.filename_var}, {node.lineno}, {self.func_name_var})") + [node]
         return node
 
 

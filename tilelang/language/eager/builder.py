@@ -192,9 +192,6 @@ class Builder(BaseBuilder):
         self.eager_jit_subs: dict[str, PrimExpr] = {}
         self.current_file = "<unknown>"
         self.current_line = 0
-        self.current_col = 0
-        self.current_end_line = 0
-        self.current_end_col = 0
         self.current_macro_name = "<unknown-macro>"
         # stack to record caller fileline, not callee fileline
         self.macro_fileline_stack: list[tuple[str, int, str]] = []
@@ -350,9 +347,6 @@ class Builder(BaseBuilder):
         fields = [
             self._escape_dsl_span_field(str(self.current_file)),
             str(self.current_line),
-            str(max(self.current_col, 0)),
-            str(self.current_end_line or self.current_line),
-            str(max(self.current_end_col, 0)),
             self._escape_dsl_span_field(str(self.current_macro_name)),
         ]
         return "|".join(fields)
@@ -905,14 +899,11 @@ class Builder(BaseBuilder):
         return var
 
     def set_fileline(self, filename: str, lineno: int, name: str):
-        self.set_span(filename, lineno, 0, lineno, 0, name)
+        self.set_span(filename, lineno, name)
 
-    def set_span(self, filename: str, lineno: int, col: int, end_lineno: int, end_col: int, name: str):
+    def set_span(self, filename: str, lineno: int, name: str):
         self.current_file = filename
         self.current_line = lineno
-        self.current_col = col
-        self.current_end_line = end_lineno
-        self.current_end_col = end_col
         self.current_macro_name = name
 
     def get_fileline_stack(self, stacklevel=1):

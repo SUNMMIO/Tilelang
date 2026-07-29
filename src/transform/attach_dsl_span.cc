@@ -12,7 +12,6 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
-#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -84,28 +83,19 @@ Span DecodeDslSpan(const PrimExpr &value) {
   }
   std::vector<std::string> fields =
       SplitFields(static_cast<std::string>(str->value));
-  if (fields.size() < 5) {
+  if (fields.size() != 3) {
     return Span();
   }
 
   int line = 0;
-  int column = 0;
-  int end_line = 0;
-  int end_column = 0;
-  if (!ParseInt(fields[1], &line) || !ParseInt(fields[2], &column) ||
-      !ParseInt(fields[3], &end_line) || !ParseInt(fields[4], &end_column)) {
+  if (!ParseInt(fields[1], &line)) {
     return Span();
   }
   if (line <= 0) {
     return Span();
   }
 
-  line = std::max(line, 1);
-  column = std::max(column, 0);
-  end_line = end_line > 0 ? end_line : line;
-  end_column = std::max(end_column, column);
-  return Span(SourceName::Get(UnescapeField(fields[0])), line, end_line, column,
-              end_column);
+  return Span(SourceName::Get(UnescapeField(fields[0])), line, line, 0, 0);
 }
 
 class AttachDslSpanMutator : public StmtExprMutator {
