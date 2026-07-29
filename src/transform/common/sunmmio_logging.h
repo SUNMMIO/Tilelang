@@ -33,9 +33,6 @@ inline std::string FormatSpanForLog(const Span &span) {
 
   std::ostringstream os;
   os << static_cast<std::string>(node->source_name->name) << ":" << node->line;
-  if (node->column > 0) {
-    os << ":" << node->column;
-  }
   return os.str();
 }
 

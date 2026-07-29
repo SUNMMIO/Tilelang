@@ -276,7 +276,7 @@ def lower(
     mod = OptimizeForTarget(mod, target)
 
     # check that every node have span info
-    if target_is_sunmmio():
+    if target_is_sunmmio(target):
         mod = tilelang.transform.CheckSpan()(mod)
 
     host_mod = tir.transform.Filter(_is_host_call)(mod)
