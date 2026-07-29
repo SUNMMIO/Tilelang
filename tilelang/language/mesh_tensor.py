@@ -369,9 +369,9 @@ class MeshTensorProxy:
                 if not sharded_layout:
                     raise ValueError(
                         "MeshTensor with SUVM MX dtype only supports MX row-major, "
-                        "MXZZ, or MXZNN external layouts. Omit layout or use "
+                        "MXZZ, or MXZNZ external layouts. Omit layout or use "
                         "make_mx_row_major_layout(...), make_mxzz_layout(...), "
-                        "or make_mxznn_layout(...)."
+                        "or make_mxznz_layout(...)."
                     )
             else:
                 sharded_layout = _derive_layout_like(global_layout, sharded_shape_exprs, None)

@@ -28,6 +28,7 @@ make_nzz = _get("tl.sunmmio.make_nzz")
 make_mx_row_major = _get("tl.sunmmio.make_mx_row_major")
 make_mxzz = _get("tl.sunmmio.make_mxzz")
 make_mxznn = _get("tl.sunmmio.make_mxznn")
+make_mxznz = _get("tl.sunmmio.make_mxznz")
 derive_mx_layout_like = _get("tl.sunmmio.derive_mx_layout_like")
 get_mode_shape = _get("tl.CuteLayout_mode_shape")
 get_mode_stride = _get("tl.CuteLayout_mode_stride")
@@ -223,9 +224,9 @@ class TestSunmmioConstructors:
     @pytest.mark.parametrize(
         "shape,expected_blocks",
         [
-            ((32, 32), (1, 2)),
-            ((32, 96), (1, 4)),
-            ((96, 32), (3, 2)),
+            ((32, 32), (1, 1)),
+            ((32, 96), (1, 3)),
+            ((96, 32), (3, 1)),
         ],
     )
     @pytest.mark.parametrize(
@@ -235,7 +236,7 @@ class TestSunmmioConstructors:
             "custom[mxfp4]4",
         ],
     )
-    def test_mxzz_aligns_second_axis_to_two_blocks(self, shape, expected_blocks, dtype):
+    def test_mxzz_uses_effective_block_grid_without_operand_padding(self, shape, expected_blocks, dtype):
         layout = make_mxzz(_imms(*shape), [0, 1], dtype)
         expected_m_blocks, expected_n_blocks = expected_blocks
 
@@ -244,11 +245,11 @@ class TestSunmmioConstructors:
         assert [int(x) for x in get_covered_shape(layout)] == [32 * expected_m_blocks, 32 * expected_n_blocks]
 
     @pytest.mark.parametrize(
-        "shape,expected_m_block_groups,expected_n_blocks",
+        "shape,expected_pack_size,expected_group_m,expected_group_n",
         [
-            ((32, 32), 1, 1),
-            ((96, 32), 2, 1),
-            ((32, 96), 1, 3),
+            ((64, 32), 2, 1, 1),
+            ((128, 64), 2, 2, 2),
+            ((64, 96), 2, 1, 3),
         ],
     )
     @pytest.mark.parametrize(
@@ -258,19 +259,48 @@ class TestSunmmioConstructors:
             "custom[mxfp4]4",
         ],
     )
-    def test_mxznn_packs_first_axis_in_two_block_groups(self, shape, expected_m_block_groups, expected_n_blocks, dtype):
+    def test_mxznn_uses_canonical_pack_group_layout(self, shape, expected_pack_size, expected_group_m, expected_group_n, dtype):
         layout = make_mxznn(_imms(*shape), [0, 1], dtype)
 
         assert [int(x) for x in get_logical_shape(layout)] == list(shape)
         assert [int(x) for x in get_mode_shape(layout)] == [
             32,
-            2,
-            expected_m_block_groups,
+            expected_pack_size,
+            expected_group_m,
             32,
             1,
-            expected_n_blocks,
+            expected_group_n,
         ]
-        assert [int(x) for x in get_covered_shape(layout)] == [64 * expected_m_block_groups, 32 * expected_n_blocks]
+        assert [int(x) for x in get_covered_shape(layout)] == list(shape)
+
+    @pytest.mark.parametrize(
+        "shape,expected_pack_size,expected_group_m,expected_group_n",
+        [
+            ((64, 32), 2, 1, 1),
+            ((128, 64), 2, 2, 2),
+            ((64, 96), 2, 1, 3),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            "custom[mxfp8]8",
+            "custom[mxfp4]4",
+        ],
+    )
+    def test_mxznz_uses_canonical_pack_group_layout(self, shape, expected_pack_size, expected_group_m, expected_group_n, dtype):
+        layout = make_mxznz(_imms(*shape), [0, 1], dtype)
+
+        assert [int(x) for x in get_logical_shape(layout)] == list(shape)
+        assert [int(x) for x in get_mode_shape(layout)] == [
+            32,
+            expected_pack_size,
+            expected_group_m,
+            32,
+            1,
+            expected_group_n,
+        ]
+        assert [int(x) for x in get_covered_shape(layout)] == list(shape)
 
     @pytest.mark.parametrize(
         "dtype",
@@ -285,13 +315,15 @@ class TestSunmmioConstructors:
             make_mx_row_major,
             lambda shape, dtype: make_mxzz(shape, [0, 1], dtype),
             lambda shape, dtype: make_mxznn(shape, [0, 1], dtype),
+            lambda shape, dtype: make_mxznz(shape, [0, 1], dtype),
         ],
     )
     def test_derive_mx_layout_like_preserves_layout_kind(self, layout_factory, dtype):
         src = layout_factory(_imms(128, 128), dtype)
-        expected = layout_factory(_imms(32, 128), dtype)
+        dst_shape = _imms(64, 128) if layout_factory is not make_mx_row_major else _imms(32, 128)
+        expected = layout_factory(dst_shape, dtype)
 
-        derived = derive_mx_layout_like(src, _imms(32, 128), dtype)
+        derived = derive_mx_layout_like(src, dst_shape, dtype)
 
         assert derived
         assert is_same_layout(derived, expected)
@@ -301,15 +333,17 @@ class TestSunmmioConstructors:
         [
             make_mxzz,
             make_mxznn,
+            make_mxznz,
         ],
     )
     def test_derive_mx_layout_like_preserves_non_default_axes(self, layout_factory):
         dtype = "custom[mxfp8]8"
         axes = [0, 2]
         src = layout_factory(_imms(128, 4, 128), axes, dtype)
-        expected = layout_factory(_imms(32, 4, 128), axes, dtype)
+        dst_shape = _imms(64, 4, 128) if layout_factory in (make_mxznn, make_mxznz) else _imms(32, 4, 128)
+        expected = layout_factory(dst_shape, axes, dtype)
 
-        derived = derive_mx_layout_like(src, _imms(32, 4, 128), dtype)
+        derived = derive_mx_layout_like(src, dst_shape, dtype)
 
         assert derived
         assert is_same_layout(derived, expected)
@@ -319,6 +353,7 @@ class TestSunmmioConstructors:
         [
             make_mxzz,
             make_mxznn,
+            make_mxznz,
         ],
     )
     @pytest.mark.parametrize(
@@ -331,9 +366,10 @@ class TestSunmmioConstructors:
     def test_derive_layout_like_for_dtype_preserves_mx_storage_stride(self, layout_factory, dtype):
         derive_layout_like_for_dtype = _get("tl.DeriveLayoutLikeForDType")
         src = layout_factory(_imms(128, 128), [0, 1], dtype)
-        expected = layout_factory(_imms(32, 128), [0, 1], dtype)
+        dst_shape = _imms(64, 128) if layout_factory in (make_mxznn, make_mxznz) else _imms(32, 128)
+        expected = layout_factory(dst_shape, [0, 1], dtype)
 
-        derived = derive_layout_like_for_dtype(src, _imms(32, 128), dtype, None)
+        derived = derive_layout_like_for_dtype(src, dst_shape, dtype, None)
 
         assert derived
         assert is_same_layout(derived, expected)

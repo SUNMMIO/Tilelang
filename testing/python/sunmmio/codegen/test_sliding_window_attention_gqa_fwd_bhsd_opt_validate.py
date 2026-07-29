@@ -18,31 +18,35 @@ os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 
-FLASHATTN_GQA_FWD_BHSD_CASES = [
-    (4, 4, 128, 64, 1),
-    (4, 8, 128, 64, 1),
-    (4, 8, 64, 64, 2),
-    (4, 4, 128, 64, 1),
+SLIDING_WINDOW_ATTENTION_GQA_FWD_BHSD_CASES = [
+    (1, 32, 8, 128, 128, 4, 64),
+    (1, 48, 8, 128, 128, 4, 96),
 ]
 
 
 @target("Sunmmio")
-def flashattn_gqa_fwd_bhsd(
+def sliding_window_attention_gqa_fwd_bhsd(
     batch=1,
-    heads=4,
+    q_heads=32,
+    kv_heads=8,
     seq_len=128,
-    dim=64,
-    groups=1,
+    dim=128,
+    global_window=4,
+    local_window=1024,
     block_M=64,
     block_N=64,
     num_stages=0,
 ):
     scale = (1.0 / dim) ** 0.5 * 1.44269504
-    head_kv = heads // groups
-    q_shape = [batch, seq_len, heads, dim]
-    kv_shape = [batch, seq_len, head_kv, dim]
+    groups = q_heads // kv_heads
+    q_shape = [batch, seq_len, q_heads, dim]
+    kv_shape = [batch, seq_len, kv_heads, dim]
     dtype = T.bfloat16
     accum_dtype = T.float32
+
+    assert q_heads % kv_heads == 0
+    assert global_window <= seq_len
+    assert global_window <= block_N
 
     shard_policy = T.MeshShardingPolicy(y=0, x=2)
 
@@ -91,11 +95,24 @@ def flashattn_gqa_fwd_bhsd(
                         for k in T.serial(loop_range):
                             T.copy(K[bz, k * block_N : (k + 1) * block_N, by // groups, :], K_shared)
                             for i, j in T.Tiles([block_M, block_N]):
+                                q_pos = bx * block_M + i
+                                k_pos = k * block_N + j
                                 acc_s[i, j] = T.if_then_else(
-                                    bx * block_M + i >= k * block_N + j,
-                                    0,
+                                    q_pos >= k_pos,
+                                    T.if_then_else(
+                                        k_pos > q_pos - local_window,
+                                        0,
+                                        -T.infinity(acc_s.dtype),
+                                    ),
                                     -T.infinity(acc_s.dtype),
                                 )
+                            if k == 0 and bx > 0:
+                                for i, j in T.Tiles([block_M, block_N]):
+                                    acc_s[i, j] = T.if_then_else(
+                                        j + i < global_window + i,
+                                        0,
+                                        acc_s[i, j],
+                                    )
                             T.gemm(Q_shared, K_shared, acc_s, transpose_B=True)
 
                             T.copy(scores_max, scores_max_prev)
@@ -128,16 +145,41 @@ def flashattn_gqa_fwd_bhsd(
     return main
 
 
-@pytest.mark.parametrize("batch,heads,seq_len,dim,groups", FLASHATTN_GQA_FWD_BHSD_CASES)
-def test_flashattn_gqa_fwd_bhsd_codegen_passes_loose_npuir_opt(tmp_path, batch, heads, seq_len, dim, groups):
+@pytest.mark.parametrize(
+    "batch,q_heads,kv_heads,seq_len,dim,global_window,local_window",
+    SLIDING_WINDOW_ATTENTION_GQA_FWD_BHSD_CASES,
+)
+def test_sliding_window_attention_gqa_fwd_bhsd_codegen_passes_loose_npuir_opt(
+    tmp_path,
+    batch,
+    q_heads,
+    kv_heads,
+    seq_len,
+    dim,
+    global_window,
+    local_window,
+):
     src = validate_sunmmio_codegen_with_npuir_opt(
-        flashattn_gqa_fwd_bhsd(batch=batch, heads=heads, seq_len=seq_len, dim=dim, groups=groups),
+        sliding_window_attention_gqa_fwd_bhsd(
+            batch=batch,
+            q_heads=q_heads,
+            kv_heads=kv_heads,
+            seq_len=seq_len,
+            dim=dim,
+            global_window=global_window,
+            local_window=local_window,
+        ),
         tmp_path,
-        mlir_filename=f"flashattn_gqa_fwd_bhsd_b{batch}_h{heads}_s{seq_len}_d{dim}_g{groups}_suvm.mlir",
+        mlir_filename=(
+            f"sliding_window_attention_gqa_fwd_bhsd_b{batch}_qh{q_heads}_kvh{kv_heads}"
+            f"_s{seq_len}_d{dim}_gw{global_window}_lw{local_window}_suvm.mlir"
+        ),
         expected_tokens=("suvm.copy_async", "suvm.tc.mma", "suvm.tile.reduce"),
-        # opt_args=("--verify-each",),
     )
-    assert_source_contains(src, ("suvm.tc.mma", "suvm.tile.reduce", "suvm.tile.range", "suvm.tile.cmpi", "suvm.tile.select"))
+    assert_source_contains(
+        src,
+        ("suvm.tc.mma", "suvm.tile.reduce", "suvm.tile.range", "suvm.tile.cmpi", "suvm.tile.select"),
+    )
     assert "fake_missing_binary" not in src
 
 

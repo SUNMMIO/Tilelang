@@ -2443,8 +2443,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       [&](const PrimExpr &predicate, TileBlockState *state,
           const TileAccessInfo &access,
           DataType mask_index_dtype) -> std::optional<SunMMIOValue> {
-    if (scope.is_reduce_scope || access.tile_rank != 2 ||
-        access.tile_shape != scope.tile_shape) {
+    if (access.tile_rank != 2 || access.tile_shape != scope.tile_shape) {
       return std::nullopt;
     }
     std::array<bool, 2> matched_axes =
@@ -2506,6 +2505,29 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     SunMMIOType mask_type = MakeTileType(DataType::Bool(), access.tile_shape);
     return builder_->TileAxisMask(NewValueName(), 0, valid_lanes, mask_type,
                                   mask_index_dtype);
+  };
+
+  auto mx_scale_e8m0_prefix_store_extent =
+      [&](const BufferStoreNode *store, const TileAccessInfo &access,
+          TileBlockState *state) -> std::optional<int64_t> {
+    DataType dtype = CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1);
+    if (!dtype.is_float8_e8m0fnu() || access.requires_aligned_1d_load ||
+        access.tile_shape.size() != 1 || access.tile_shape[0] != 64 ||
+        access.tiled_dims.size() != 1 || !store->predicate.defined()) {
+      return std::nullopt;
+    }
+
+    int64_t tiled_dim = access.tiled_dims[0];
+    if (tiled_dim < 0 ||
+        tiled_dim >= static_cast<int64_t>(store->buffer->shape.size())) {
+      return std::nullopt;
+    }
+    const auto *extent =
+        store->buffer->shape[static_cast<size_t>(tiled_dim)].as<IntImmNode>();
+    if (!extent || extent->value != 32) {
+      return std::nullopt;
+    }
+    return static_cast<int64_t>(extent->value);
   };
 
   auto merge_broadcast_shapes = [&](const std::vector<int64_t> &lhs,
@@ -2619,6 +2641,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         << "Tile value with shape " << shape_to_string(src_shape)
         << " is not broadcastable to target shape "
         << shape_to_string(dst_shape);
+    ICHECK(!tile.dtype.is_bool())
+        << "Bool tile predicates must be lowered to the target shape directly; "
+           "cannot broadcast mask from "
+        << shape_to_string(src_shape) << " to " << shape_to_string(dst_shape);
     SunMMIOType dst_type = MakeTileType(tile.dtype, dst_shape);
     return builder_->TileBroadcast(NewValueName(), tile, dst_type, tile.dtype);
   };
@@ -3041,13 +3067,21 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           std::optional<SunMMIOValue> canonical_mask =
               build_canonical_rank2_predicate_mask(
                   load->predicate.value(), state, access, mask_index_dtype);
-          SunMMIOValue lowered_mask = canonical_mask.has_value()
-                                          ? canonical_mask.value()
-                                          : lower_expr(load->predicate.value(),
-                                                       state, mask_index_dtype);
-          if (!canonical_mask.has_value()) {
+          SunMMIOValue lowered_mask =
+              canonical_mask.has_value()
+                  ? canonical_mask.value()
+                  : lower_bool_expr_to_shape(load->predicate.value(),
+                                             access.tile_shape,
+                                             mask_index_dtype);
+          if (!IsTileLike(lowered_mask)) {
+            SunMMIOType bool_scalar_type{
+                SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
             lowered_mask =
-                broadcast_tile_to_shape(lowered_mask, access.tile_shape);
+                EnsureType(lowered_mask, bool_scalar_type, DataType::Bool());
+            lowered_mask = builder_->TileFill(
+                NewValueName(), lowered_mask,
+                MakeTileType(DataType::Bool(), access.tile_shape),
+                DataType::Bool());
           }
           DataType value_dtype =
               CanonicalizeSuvmDType(load->buffer->dtype).with_lanes(1);
@@ -3849,9 +3883,23 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
             NewValueName(), dst_view.value(), dst_tile_type, std::nullopt,
             std::nullopt,
             CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
-        rhs = builder_->TileSelect(
-            NewValueName(), store_mask, rhs, old_tile, dst_tile_type,
-            CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
+        std::optional<int64_t> mx_scale_valid_elems =
+            mx_scale_e8m0_prefix_store_extent(store, access, state);
+        if (mx_scale_valid_elems.has_value()) {
+          std::vector<SunMMIOValue> offsets{make_index_const(0)};
+          SunMMIOType slice_type =
+              MakeTileType(store->buffer->dtype, {*mx_scale_valid_elems});
+          SunMMIOValue valid_slice = builder_->TileSlice(
+              NewValueName(), rhs, offsets, slice_type,
+              CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
+          rhs = builder_->TileInsertSlice(
+              NewValueName(), old_tile, valid_slice, offsets, dst_tile_type,
+              CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
+        } else {
+          rhs = builder_->TileSelect(
+              NewValueName(), store_mask, rhs, old_tile, dst_tile_type,
+              CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
+        }
       }
       std::optional<SunMMIOValue> updated_aligned_tile;
       erase_current_values_for_buffer(state, store->buffer.get());
@@ -4032,7 +4080,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         state->current_tile_values[dst_cache_key] =
             store_aligned_1d_tile(dst_access, rhs, std::nullopt, state);
       } else {
-        SunMMIOValue dst_view = make_tile_view_from_region(dst_region, state);
+        SunMMIOValue dst_view = get_or_create_tile_view(dst_access, state);
         builder_->TileStore(rhs, dst_view, std::nullopt);
         std::string dst_cache_key = make_tile_cache_key(dst_access);
         state->current_tile_values[dst_cache_key] = builder_->BindValueAlias(

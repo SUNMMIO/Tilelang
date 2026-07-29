@@ -324,6 +324,12 @@ SunMMIOValue SuvmSunmmioBuilder::RegionCall(
                            ret_type, byte_offset);
 }
 
+std::pair<SunMMIOValue, SunMMIOValue> SuvmSunmmioBuilder::MXUnpack(
+    const std::string &scale_name, const std::string &data_name,
+    const SunMMIOValue &mx, DataType scale_dtype, DataType data_dtype) {
+  return call_->MXUnpack(scale_name, data_name, mx, scale_dtype, data_dtype);
+}
+
 SunMMIOValue SuvmSunmmioBuilder::Ramp(const std::string &result_name,
                                       const SunMMIOValue &base,
                                       const SunMMIOValue &stride, int lanes,

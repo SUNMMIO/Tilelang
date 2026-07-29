@@ -60,6 +60,7 @@ from .allocate import (
     empty,  # noqa: F401
 )
 from .copy_op import copy, c2d_im2col  # noqa: F401
+from .mx import mx_pack, mx_unpack  # noqa: F401
 from .dma import dma_load, dma_store  # noqa: F401
 from tilelang.tileop.base import GemmWarpPolicy  # noqa: F401
 from .gemm_op import gemm, gemm_v1, gemm_v2  # noqa: F401

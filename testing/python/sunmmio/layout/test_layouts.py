@@ -8,9 +8,11 @@ import tvm_ffi
 import tilelang.language as T
 from tilelang import tvm as tvm
 from tilelang.layout import (
+    get_mx_scale_shape,
     is_same_layout,
     make_zz_layout,
-    make_mxznn_layout,
+    make_mx_row_major_layout,
+    make_mxznz_layout,
     make_mxzz_layout,
     make_row_major,
     make_aligned_row_major,
@@ -138,8 +140,38 @@ def test_make_zz_layout_rejects_rank_one_default_axes():
 def test_make_mx_layouts_reject_rank_one_default_axes_with_callsite_name():
     with pytest.raises(ValueError, match="make_mxzz_layout requires rank >= 2"):
         make_mxzz_layout((128,), dtype=T.mxfp4)
-    with pytest.raises(ValueError, match="make_mxznn_layout requires rank >= 2"):
-        make_mxznn_layout((128,), dtype=T.mxfp8)
+    with pytest.raises(ValueError, match="make_mxznz_layout requires rank >= 2"):
+        make_mxznz_layout((128,), dtype=T.mxfp8)
+
+
+@pytest.mark.parametrize("dtype", [T.mxfp8, T.mxfp4])
+def test_get_mx_scale_shape_row_major(dtype):
+    layout = make_mx_row_major_layout((32, 64), dtype=dtype)
+
+    assert tuple(int(x) for x in get_mx_scale_shape(layout, dtype)) == (32, 2)
+
+
+@pytest.mark.parametrize(
+    "layout_factory,shape,expected",
+    [
+        (make_mxzz_layout, (32, 32), (1, 32)),
+        (make_mxzz_layout, (64, 64), (4, 32)),
+        (make_mxzz_layout, (32, 96), (3, 32)),
+        (make_mxznz_layout, (64, 32), (2, 32)),
+        (make_mxznz_layout, (128, 64), (8, 32)),
+        (make_mxznz_layout, (64, 96), (6, 32)),
+    ],
+)
+@pytest.mark.parametrize("dtype", [T.mxfp8, T.mxfp4])
+def test_get_mx_scale_shape_blockwise(layout_factory, shape, expected, dtype):
+    layout = layout_factory(shape, dtype=dtype)
+
+    assert tuple(int(x) for x in get_mx_scale_shape(layout, dtype)) == expected
+
+
+def test_get_mx_scale_shape_rejects_non_mx_layout():
+    with pytest.raises(Exception, match="Unsupported MX layout"):
+        get_mx_scale_shape(make_row_major((32, 32)), T.mxfp8)
 
 
 def test_make_dynamic_zz_layout():
