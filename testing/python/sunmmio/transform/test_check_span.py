@@ -58,7 +58,8 @@ def test_check_span_warning_appends_available_dsl_span(capfd):
 
     message = capfd.readouterr().err
     assert "CheckSpan found" in message
-    assert "at TileLang DSL: test_check_span.py:7:3" in message
+    assert "at TileLang DSL: test_check_span.py:7" in message
+    assert "at TileLang DSL: test_check_span.py:7:" not in message
 
 
 def test_check_span_fatal_reports_and_stops():

@@ -1,9 +1,12 @@
+import ast
 from pathlib import Path
 
 import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
+from tilelang.language.eager.ast import SpanAttacher
+from tilelang.language.eager.builder import Builder
 
 from testing.python.sunmmio.common.codegen_validation import validate_sunmmio_codegen_with_npuir_opt
 from testing.python.sunmmio.common.compile_pipeline import target
@@ -34,12 +37,26 @@ def _run_expected_validate_failure(kernel, tmp_path, *, mlir_filename: str) -> s
 def _assert_dsl_span_diagnostic(message: str, marker: str, expected_substrings: tuple[str, ...]):
     expected_line = _line_of(marker)
     expected_file = Path(__file__).name
-    expected_loc = f"{expected_file}:{expected_line}:"
+    expected_loc = f"{expected_file}:{expected_line}"
 
     missing = [substring for substring in expected_substrings if substring not in message]
     assert not missing, f"missing expected diagnostic substrings {missing}\n{message}"
     assert "at TileLang DSL:" in message, message
     assert expected_loc in message, message
+    assert f"{expected_loc}:" not in message, message
+
+
+def test_debug_span_marker_records_only_line():
+    tree = SpanAttacher("filename", "func_name").visit(ast.parse("value = 1"))
+    span_call = tree.body[0].value
+
+    assert isinstance(span_call, ast.Call)
+    assert [ast.unparse(arg) for arg in span_call.args] == ["filename", "1", "func_name"]
+
+    builder = Builder()
+    builder.set_span("debug_kernel.py", 42, "main")
+
+    assert builder._encoded_dsl_span() == "debug_kernel.py|42|main"
 
 
 @target("Sunmmio")
@@ -82,6 +99,7 @@ def test_debug_codegen_reports_dsl_line_for_realistic_kernel(tmp_path):
         tmp_path,
         mlir_filename="debug_dsl_realistic_kernel_suvm.mlir",
     )
+    print(message)
     _assert_dsl_span_diagnostic(
         message,
         "SPAN_CASE_REALISTIC_TILES",

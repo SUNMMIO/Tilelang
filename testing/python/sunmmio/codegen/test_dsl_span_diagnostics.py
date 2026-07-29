@@ -44,8 +44,9 @@ def _assert_diagnostic(kernel, marker: str, expected: str) -> None:
     message = str(exc_info.value)
     assert expected in message, message
     assert "at TileLang DSL:" in message, message
-    location = f"{Path(__file__).name}:{_line_of(marker)}:"
+    location = f"{Path(__file__).name}:{_line_of(marker)}"
     assert location in message, message
+    assert f"{location}:" not in message, message
 
 
 def _region(buffer, access: int):
@@ -376,7 +377,11 @@ def test_fatal_reports_allocate_without_buffer_span():
     )
 
 
-@tilelang.jit(target="sunmmio", execution_backend="sunmmio_sunsim")
+@tilelang.jit(
+    target="sunmmio",
+    execution_backend="sunmmio_sunsim",
+    pass_configs={tilelang.PassConfigKey.TL_ENABLE_DSL_SPAN: True},
+)
 def unsupported_tiles_expr_jit_kernel():
     @T.prim_func
     def main(
@@ -402,7 +407,7 @@ def unsupported_tiles_expr_jit_kernel():
     return main
 
 
-def test_fatal_reports_jit_unsupported_expr_span():
+def test_pass_config_enabled_reports_jit_unsupported_expr_span():
     with pytest.raises(Exception) as exc_info:
         unsupported_tiles_expr_jit_kernel()
 
@@ -410,8 +415,49 @@ def test_fatal_reports_jit_unsupported_expr_span():
     assert "CodeGenTileLangSunMMIO unsupported expr: tir.Call" in message
     assert "selected unary math calls" in message
     assert "at TileLang DSL:" in message
-    location = f"{Path(__file__).name}:{_line_of('FATAL_UNSUPPORTED_EXPR')}:"
+    location = f"{Path(__file__).name}:{_line_of('FATAL_UNSUPPORTED_EXPR')}"
     assert location in message, message
+    assert f"{location}:" not in message, message
+
+
+@tilelang.jit(
+    target="sunmmio",
+    execution_backend="sunmmio_sunsim",
+    pass_configs={tilelang.PassConfigKey.TL_ENABLE_DSL_SPAN: False},
+)
+def unsupported_tiles_expr_no_span_jit_kernel():
+    @T.prim_func
+    def main(
+        source: T.Tensor((32, 32), "float32"),
+        output: T.Tensor((32, 32), "float32"),
+    ):
+        with T.Kernel():
+            source_shared = T.alloc_shared(
+                (32, 32),
+                "float32",
+                scope="shared.rsram",
+            )
+            output_shared = T.alloc_shared(
+                (32, 32),
+                "float32",
+                scope="shared.rsram",
+            )
+            T.copy(source[0, 0], source_shared)
+            for i, j in T.Tiles([32, 32]):
+                output_shared[i, j] = T.sin(source_shared[i, j])  # FATAL_NO_DSL_SPAN
+            T.copy(output_shared, output[0, 0])
+
+    return main
+
+
+def test_pass_config_disabled_omits_jit_unsupported_expr_span():
+    with pytest.raises(Exception) as exc_info:
+        unsupported_tiles_expr_no_span_jit_kernel()
+
+    message = str(exc_info.value)
+    assert "CodeGenTileLangSunMMIO unsupported expr: tir.Call" in message
+    assert "selected unary math calls" in message
+    assert "at TileLang DSL:" not in message, message
 
 
 if __name__ == "__main__":
