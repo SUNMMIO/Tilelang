@@ -596,7 +596,9 @@ SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
             ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc(debug_tag.str()),
             range_scalar_mlir_type, raw);
       }
-      return mlir::arith::ExtSIOp::create(
+      // TileAxisMask extents count valid, zero-based lanes.  Preserve that
+      // unsigned interpretation when a narrow extent is widened.
+      return mlir::arith::ExtUIOp::create(
           ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc(debug_tag.str()),
           range_scalar_mlir_type, raw);
     }
@@ -622,7 +624,7 @@ SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
     mlir::Value mask_value =
         mlir::suvm::TileCmpIOp::create(
             ctx_.builder, MapMlirLoc(ctx_), MapMlirType(ctx_, mask_type),
-            mlir::suvm::VCmpIPredicate::slt, range, valid_extent_value)
+            mlir::suvm::VCmpIPredicate::ult, range, valid_extent_value)
             .getResult();
     BindRequiredResult(ctx_, result_name, mask_value, "suvm.tile.axis_mask");
     return SunMMIOValue{DataType::Bool(), result_name, tile_type};
@@ -666,7 +668,7 @@ SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
   mlir::Value mask_value =
       mlir::suvm::TileCmpIOp::create(
           ctx_.builder, MapMlirLoc(ctx_), MapMlirType(ctx_, mask_full_type),
-          mlir::suvm::VCmpIPredicate::slt, range_full, valid_extent_value)
+          mlir::suvm::VCmpIPredicate::ult, range_full, valid_extent_value)
           .getResult();
   BindRequiredResult(ctx_, result_name, mask_value, "suvm.tile.axis_mask");
   return SunMMIOValue{DataType::Bool(), result_name, tile_type};
