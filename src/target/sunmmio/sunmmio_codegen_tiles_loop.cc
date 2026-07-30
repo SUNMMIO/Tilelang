@@ -2280,8 +2280,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     SunMMIOValue exec_j = EvalExpr(scope.execution_loops[1]->loop_var);
     SunMMIOValue tile_m = make_index_const(scope.tile_shape[0]);
     SunMMIOValue tile_n = make_index_const(scope.tile_shape[1]);
-    SunMMIOValue domain_m = domain_value(scope.execution_domain_axes[0]);
-    SunMMIOValue domain_n = domain_value(scope.execution_domain_axes[1]);
+    const SunMMIOValue &domain_m = domain_value(scope.execution_domain_axes[0]);
+    const SunMMIOValue &domain_n = domain_value(scope.execution_domain_axes[1]);
 
     SunMMIOValue valid_rows = min_index(
         tile_m,
@@ -2537,7 +2537,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       }
       int domain_axis = scope.execution_domain_axes[axis];
       SunMMIOValue tile_extent = make_index_const(scope.tile_shape[axis]);
-      SunMMIOValue domain_extent = domain_value(domain_axis);
+      const SunMMIOValue &domain_extent = domain_value(domain_axis);
       SunMMIOValue exec_index =
           EnsureIndex(EvalExpr(scope.execution_loops[axis]->loop_var));
       SunMMIOValue valid_extent =
@@ -2570,7 +2570,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     ICHECK_LT(domain_axis, static_cast<int>(scope.domain_shape.size()));
 
     SunMMIOValue tile_extent = make_index_const(scope.tile_shape[axis]);
-    SunMMIOValue domain_extent = domain_value(domain_axis);
+    const SunMMIOValue &domain_extent = domain_value(domain_axis);
     SunMMIOValue exec_index =
         EnsureIndex(EvalExpr(scope.execution_loops[axis]->loop_var));
     SunMMIOValue valid_lanes =
