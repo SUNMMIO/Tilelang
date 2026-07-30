@@ -37,20 +37,21 @@ def _assert_no_e8m0_tile_select(src):
         assert not ("suvm.tile.select" in line and "f8E8M0FNU" in line)
 
 
-# def _fast_log2_ceil(x):
-#     bits_x = T.reinterpret(x, T.uint32)
-#     exp_x = (bits_x >> 23) & 0xFF
-#     man_bits = bits_x & ((1 << 23) - 1)
-#     return T.cast(exp_x - 127 + T.if_then_else(man_bits != 0, 1, 0), T.int32)
+def _assert_e8m0_scale_casts(src):
+    for line in src.splitlines():
+        if "suvm.tile.cast" in line and "f8E8M0FNU" in line:
+            assert "xf32" not in line
+    for token in ("suvm.tile.ln", "suvm.tile.ceil", "suvm.tile.exp"):
+        assert token not in src
 
 
-# def _fast_pow2(exp):
-#     bits = (exp + 127) << 23
-#     return T.reinterpret(bits, T.float32)
+# A4E converts E8M0 through BF16; the stored E8M0 value is the scale source of truth.
+def _to_e8m0_scale(x):
+    return T.Cast("float8_e8m0fnu", x)
 
 
-def _ceil_pow2(x):
-    return T.exp2(T.ceil(T.log2(x)))
+def _e8m0_scale_to_fp32(x):
+    return T.Cast("float32", T.Cast("bfloat16", x))
 
 
 MX_FULL_CHAIN_CASES = (
@@ -97,6 +98,7 @@ def mx_ocp_quant_dequant_full_chain_kernel_for_debug(mx_dtype, data_dtype, data_
             amax = T.alloc_shared((64,), T.float32)
             data = T.alloc_shared(shape, data_dtype)
             scale = T.alloc_shared(scale_shape, T.float8_e8m0fnu)
+            scale_bf16_vec = T.alloc_shared((64,), T.bfloat16)
             scale_fp32_vec = T.alloc_shared((64,), T.float32)
             mx = T.alloc_shared(shape, mx_dtype)
             unpacked_data = T.alloc_shared(shape, data_dtype)
@@ -110,12 +112,13 @@ def mx_ocp_quant_dequant_full_chain_kernel_for_debug(mx_dtype, data_dtype, data_
             # group in this 32x32 test block.
             T.fill(amax, T.float32(1e-4))
             T.reduce_absmax(a_rsram, amax[0:32], dim=1, clear=True)
-            for j in T.Tiles(amax):
-                safe_amax = T.max(amax[j], T.float32(1e-4))
-                scale_fp32 = _ceil_pow2(safe_amax * T.float32(data_max_inv))
-                scale_fp32_vec[j] = scale_fp32
             for j in T.Tiles([scale_shape[1]]):
-                scale[0, j] = T.Cast("float8_e8m0fnu", scale_fp32_vec[j])
+                safe_amax = T.max(amax[j], T.float32(1e-4))
+                scale_bf16_vec[j] = T.Cast("bfloat16", safe_amax * T.float32(data_max_inv))
+            for j in T.Tiles([scale_shape[1]]):
+                scale[0, j] = _to_e8m0_scale(scale_bf16_vec[j])
+            for j in T.Tiles([scale_shape[1]]):
+                scale_fp32_vec[j] = _e8m0_scale_to_fp32(scale[0, j])
 
             T.annotate_tileview(
                 {
@@ -132,7 +135,7 @@ def mx_ocp_quant_dequant_full_chain_kernel_for_debug(mx_dtype, data_dtype, data_
             T.mx_unpack(mx, unpacked_data, unpacked_scale)
 
             for j in T.Tiles([scale_shape[1]]):
-                unpacked_scale_fp32_vec[j] = T.Cast("float32", unpacked_scale[0, j])
+                unpacked_scale_fp32_vec[j] = _e8m0_scale_to_fp32(unpacked_scale[0, j])
 
             T.annotate_tileview(
                 {
@@ -165,38 +168,47 @@ def mx_ocp_quant_dequant_full_chain_kernel_original(mx_dtype, data_dtype, data_d
     ):
         with T.Kernel():
             a_rsram = T.alloc_shared(shape, T.bfloat16)
-            amax = T.alloc_shared((32,), T.float32)
+            amax = T.alloc_shared((64,), T.float32)
             data = T.alloc_shared(shape, data_dtype)
             scale = T.alloc_shared(scale_shape, T.float8_e8m0fnu)
+            scale_bf16_vec = T.alloc_shared((64,), T.bfloat16)
+            scale_fp32_vec = T.alloc_shared((64,), T.float32)
             mx = T.alloc_shared(shape, mx_dtype)
             unpacked_data = T.alloc_shared(shape, data_dtype)
             unpacked_scale = T.alloc_shared(scale_shape, T.float8_e8m0fnu)
+            unpacked_scale_fp32_vec = T.alloc_shared((64,), T.float32)
             y_rsram = T.alloc_shared(shape, T.bfloat16)
 
             T.copy(A, a_rsram)
 
             # OCP MX quantization: each logical row is one 32-element scale
             # group in this 32x32 test block.
-            T.reduce_absmax(a_rsram, amax, dim=1, clear=True)
-            for row in T.Tiles(amax):
-                safe_amax = T.max(amax[row], T.float32(1e-4))
-                scale_fp32 = _ceil_pow2(safe_amax * T.float32(data_max_inv))
-                scale[0, row] = T.Cast("float8_e8m0fnu", scale_fp32)
-                scale[1, row] = T.Cast("float8_e8m0fnu", T.float32(1.0))
+            T.fill(amax, T.float32(1e-4))
+            T.reduce_absmax(a_rsram, amax[0:32], dim=1, clear=True)
+            for j in T.Tiles([scale_shape[1]]):
+                safe_amax = T.max(amax[j], T.float32(1e-4))
+                scale_bf16_vec[j] = T.Cast("bfloat16", safe_amax * T.float32(data_max_inv))
+
+            for j in T.Tiles([scale_shape[1]]):
+                scale[0, j] = _to_e8m0_scale(scale_bf16_vec[j])
+
+            for j in T.Tiles([scale_shape[1]]):
+                scale_fp32_vec[j] = _e8m0_scale_to_fp32(scale[0, j])
 
             for row, col in T.Tiles(data):
-                scale_fp32 = T.Cast("float32", scale[0, row])
-                raw = T.Cast("float32", a_rsram[row, col]) / scale_fp32
+                raw = T.Cast("float32", a_rsram[row, col]) / scale_fp32_vec[row]
                 clamped = T.min(T.max(raw, T.float32(-data_max)), T.float32(data_max))
                 data[row, col] = T.Cast(data_dtype_name, clamped)
 
             T.mx_pack(data, scale, mx)
             T.mx_unpack(mx, unpacked_data, unpacked_scale)
 
+            for j in T.Tiles([scale_shape[1]]):
+                unpacked_scale_fp32_vec[j] = _e8m0_scale_to_fp32(unpacked_scale[0, j])
+
             for row, col in T.Tiles(y_rsram):
                 q = T.Cast("float32", unpacked_data[row, col])
-                scale_fp32 = T.Cast("float32", unpacked_scale[0, row])
-                y_rsram[row, col] = T.Cast("bfloat16", q * scale_fp32)
+                y_rsram[row, col] = T.Cast("bfloat16", q * unpacked_scale_fp32_vec[row])
 
             T.copy(y_rsram, Y)
 
@@ -222,6 +234,7 @@ def mx_ocp_quant_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name, data_ma
             amax = T.alloc_shared((shape[0],), T.float32)
             data = T.alloc_shared(shape, data_dtype)
             scale = T.alloc_shared(scale_shape, T.float8_e8m0fnu)
+            scale_bf16_vec = T.alloc_shared((scale_shape[0] * 64,), T.bfloat16)
             scale_fp32_vec = T.alloc_shared((scale_shape[0] * 64,), T.float32)
             mx = T.alloc_shared(shape, mx_dtype)
 
@@ -234,12 +247,17 @@ def mx_ocp_quant_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name, data_ma
                 scale_base = block * 64
                 for j in T.Tiles([scale_shape[1]]):
                     safe_amax = T.max(amax[amax_base + j], T.float32(1e-4))
-                    scale_fp32_vec[scale_base + j] = _ceil_pow2(safe_amax * T.float32(data_max_inv))
+                    scale_bf16_vec[scale_base + j] = T.Cast("bfloat16", safe_amax * T.float32(data_max_inv))
 
             for block in T.serial(scale_shape[0]):
                 scale_base = block * 64
                 for j in T.Tiles([scale_shape[1]]):
-                    scale[block, j] = T.Cast("float8_e8m0fnu", scale_fp32_vec[scale_base + j])
+                    scale[block, j] = _to_e8m0_scale(scale_bf16_vec[scale_base + j])
+
+            for block in T.serial(scale_shape[0]):
+                scale_base = block * 64
+                for j in T.Tiles([scale_shape[1]]):
+                    scale_fp32_vec[scale_base + j] = _e8m0_scale_to_fp32(scale[block, j])
 
             T.annotate_tileview(
                 {
@@ -287,7 +305,7 @@ def mx_ocp_dequant_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name, data_
             for block in T.serial(scale_shape[0]):
                 scale_base = block * 64
                 for j in T.Tiles([scale_shape[1]]):
-                    scale_fp32_vec[scale_base + j] = T.Cast("float32", scale[block, j])
+                    scale_fp32_vec[scale_base + j] = _e8m0_scale_to_fp32(scale[block, j])
 
             T.annotate_tileview(
                 {
@@ -332,6 +350,7 @@ def mx_ocp_quant_generic_shape_kernel_for_debug(mx_dtype, data_dtype, data_dtype
             amax = T.alloc_shared((64,), T.float32)
             data = T.alloc_shared(shape, data_dtype)
             scale = T.alloc_shared(scale_shape, T.float8_e8m0fnu)
+            scale_bf16_vec = T.alloc_shared((scale_shape[0] * 64,), T.bfloat16)
             scale_fp32_vec = T.alloc_shared((scale_shape[0] * 64,), T.float32)
             mx = T.alloc_shared(shape, mx_dtype)
 
@@ -358,10 +377,13 @@ def mx_ocp_quant_generic_shape_kernel_for_debug(mx_dtype, data_dtype, data_dtype
                     T.reduce_absmax(tile_rsram, amax[0:32], dim=1, clear=True)
                     for row in T.Tiles([scale_shape[1]]):
                         safe_amax = T.max(amax[row], T.float32(1e-4))
-                        scale_fp32_vec[scale_base + row] = _ceil_pow2(safe_amax * T.float32(data_max_inv))
+                        scale_bf16_vec[scale_base + row] = T.Cast("bfloat16", safe_amax * T.float32(data_max_inv))
 
                     for row in T.Tiles([scale_shape[1]]):
-                        scale[block, row] = T.Cast("float8_e8m0fnu", scale_fp32_vec[scale_base + row])
+                        scale[block, row] = _to_e8m0_scale(scale_bf16_vec[scale_base + row])
+
+                    for row in T.Tiles([scale_shape[1]]):
+                        scale_fp32_vec[scale_base + row] = _e8m0_scale_to_fp32(scale[block, row])
 
                     for row, col in T.Tiles([32, 32]):
                         raw = T.Cast("float32", tile_rsram[row, col]) / scale_fp32_vec[scale_base + row]
@@ -416,7 +438,7 @@ def mx_ocp_dequant_generic_shape_kernel_for_debug(mx_dtype, data_dtype, data_dty
                     scale_base = block * 64
 
                     for row in T.Tiles([scale_shape[1]]):
-                        scale_fp32_vec[scale_base + row] = T.Cast("float32", scale[block, row])
+                        scale_fp32_vec[scale_base + row] = _e8m0_scale_to_fp32(scale[block, row])
 
                     for row, col in T.Tiles([32, 32]):
                         q = T.Cast("float32", data[row_base + row, col_base + col])
@@ -466,6 +488,8 @@ def mx_ocp_quantized_mma_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name,
             b_data = T.alloc_shared(b_shape, data_dtype)
             a_scale = T.alloc_shared(a_scale_shape, T.float8_e8m0fnu)
             b_scale = T.alloc_shared(b_scale_shape, T.float8_e8m0fnu)
+            a_scale_bf16_vec = T.alloc_shared((a_scale_shape[0] * 64,), T.bfloat16)
+            b_scale_bf16_vec = T.alloc_shared((b_scale_shape[0] * 64,), T.bfloat16)
             a_scale_fp32_vec = T.alloc_shared((a_scale_shape[0] * 64,), T.float32)
             b_scale_fp32_vec = T.alloc_shared((b_scale_shape[0] * 64,), T.float32)
             a_mx = T.alloc_shared(a_shape, mx_dtype)
@@ -511,10 +535,13 @@ def mx_ocp_quantized_mma_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name,
                 T.reduce_absmax(a_tile, amax[0:32], dim=1, clear=True)
                 for row in T.Tiles([a_scale_shape[1]]):
                     safe_amax = T.max(amax[row], T.float32(1e-4))
-                    a_scale_fp32_vec[scale_base + row] = _ceil_pow2(safe_amax * T.float32(data_max_inv))
+                    a_scale_bf16_vec[scale_base + row] = T.Cast("bfloat16", safe_amax * T.float32(data_max_inv))
 
                 for row in T.Tiles([a_scale_shape[1]]):
-                    a_scale[block_k, row] = T.Cast("float8_e8m0fnu", a_scale_fp32_vec[scale_base + row])
+                    a_scale[block_k, row] = _to_e8m0_scale(a_scale_bf16_vec[scale_base + row])
+
+                for row in T.Tiles([a_scale_shape[1]]):
+                    a_scale_fp32_vec[scale_base + row] = _e8m0_scale_to_fp32(a_scale[block_k, row])
 
                 for row, col in T.Tiles([32, 32]):
                     raw = T.Cast("float32", a_tile[row, col]) / a_scale_fp32_vec[scale_base + row]
@@ -532,10 +559,13 @@ def mx_ocp_quantized_mma_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name,
                 T.reduce_absmax(b_tile, amax[0:32], dim=1, clear=True)
                 for row in T.Tiles([b_scale_shape[1]]):
                     safe_amax = T.max(amax[row], T.float32(1e-4))
-                    b_scale_fp32_vec[scale_base + row] = _ceil_pow2(safe_amax * T.float32(data_max_inv))
+                    b_scale_bf16_vec[scale_base + row] = T.Cast("bfloat16", safe_amax * T.float32(data_max_inv))
 
                 for row in T.Tiles([b_scale_shape[1]]):
-                    b_scale[block_k, row] = T.Cast("float8_e8m0fnu", b_scale_fp32_vec[scale_base + row])
+                    b_scale[block_k, row] = _to_e8m0_scale(b_scale_bf16_vec[scale_base + row])
+
+                for row in T.Tiles([b_scale_shape[1]]):
+                    b_scale_fp32_vec[scale_base + row] = _e8m0_scale_to_fp32(b_scale[block_k, row])
 
                 for row, col in T.Tiles([32, 32]):
                     raw = T.Cast("float32", b_tile[row, col]) / b_scale_fp32_vec[scale_base + row]
@@ -594,6 +624,8 @@ def mx_ocp_quantized_mma_mxznz_weight_kernel_for_debug(mx_dtype, data_dtype, dat
             b_data = T.alloc_shared(b_shape, data_dtype)
             a_scale = T.alloc_shared(a_scale_shape, T.float8_e8m0fnu)
             b_scale = T.alloc_shared(b_scale_shape, T.float8_e8m0fnu)
+            a_scale_bf16_vec = T.alloc_shared((a_scale_shape[0] * 64,), T.bfloat16)
+            b_scale_bf16_vec = T.alloc_shared((b_scale_shape[0] * 64,), T.bfloat16)
             a_scale_fp32_vec = T.alloc_shared((a_scale_shape[0] * 64,), T.float32)
             b_scale_fp32_vec = T.alloc_shared((b_scale_shape[0] * 64,), T.float32)
             a_mx = T.alloc_shared(a_shape, mx_dtype)
@@ -639,10 +671,13 @@ def mx_ocp_quantized_mma_mxznz_weight_kernel_for_debug(mx_dtype, data_dtype, dat
                 T.reduce_absmax(a_tile, amax[0:32], dim=1, clear=True)
                 for row in T.Tiles([a_scale_shape[1]]):
                     safe_amax = T.max(amax[row], T.float32(1e-4))
-                    a_scale_fp32_vec[scale_base + row] = _ceil_pow2(safe_amax * T.float32(data_max_inv))
+                    a_scale_bf16_vec[scale_base + row] = T.Cast("bfloat16", safe_amax * T.float32(data_max_inv))
 
                 for row in T.Tiles([a_scale_shape[1]]):
-                    a_scale[block_k, row] = T.Cast("float8_e8m0fnu", a_scale_fp32_vec[scale_base + row])
+                    a_scale[block_k, row] = _to_e8m0_scale(a_scale_bf16_vec[scale_base + row])
+
+                for row in T.Tiles([a_scale_shape[1]]):
+                    a_scale_fp32_vec[scale_base + row] = _e8m0_scale_to_fp32(a_scale[block_k, row])
 
                 for row, col in T.Tiles([32, 32]):
                     raw = T.Cast("float32", a_tile[row, col]) / a_scale_fp32_vec[scale_base + row]
@@ -660,10 +695,13 @@ def mx_ocp_quantized_mma_mxznz_weight_kernel_for_debug(mx_dtype, data_dtype, dat
                 T.reduce_absmax(b_tile, amax[0:32], dim=0, clear=True)
                 for col in T.Tiles([b_scale_shape[1]]):
                     safe_amax = T.max(amax[col], T.float32(1e-4))
-                    b_scale_fp32_vec[scale_base + col] = _ceil_pow2(safe_amax * T.float32(data_max_inv))
+                    b_scale_bf16_vec[scale_base + col] = T.Cast("bfloat16", safe_amax * T.float32(data_max_inv))
 
                 for col in T.Tiles([b_scale_shape[1]]):
-                    b_scale[block_k, col] = T.Cast("float8_e8m0fnu", b_scale_fp32_vec[scale_base + col])
+                    b_scale[block_k, col] = _to_e8m0_scale(b_scale_bf16_vec[scale_base + col])
+
+                for col in T.Tiles([b_scale_shape[1]]):
+                    b_scale_fp32_vec[scale_base + col] = _e8m0_scale_to_fp32(b_scale[block_k, col])
 
                 for row, col in T.Tiles([32, 32]):
                     raw = T.Cast("float32", b_tile[row, col]) / b_scale_fp32_vec[scale_base + col]
@@ -703,6 +741,7 @@ def test_mx_ocp_quant_dequant_full_chain_codegen_logs_mlir(
         ),
     )
     _assert_no_e8m0_tile_select(src)
+    _assert_e8m0_scale_casts(src)
 
 
 @pytest.mark.parametrize("mx_dtype,data_dtype,data_dtype_name,data_max,mx_token", MX_OCP_QUANT_CASES)
@@ -727,6 +766,7 @@ def test_mx_ocp_quant_kernel_codegen_logs_mlir(
         ),
     )
     _assert_no_e8m0_tile_select(src)
+    _assert_e8m0_scale_casts(src)
 
 
 @pytest.mark.parametrize("mx_dtype,data_dtype,data_dtype_name,data_max,mx_token", MX_OCP_QUANT_CASES)
@@ -738,7 +778,7 @@ def test_mx_ocp_dequant_kernel_codegen_logs_mlir(
     data_max,
     mx_token,
 ):
-    validate_sunmmio_codegen_with_npuir_opt(
+    src = validate_sunmmio_codegen_with_npuir_opt(
         mx_ocp_dequant_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name, data_max),
         tmp_path,
         mlir_filename=f"mx_ocp_dequant_{data_dtype_name}_suvm.mlir",
@@ -750,6 +790,7 @@ def test_mx_ocp_dequant_kernel_codegen_logs_mlir(
             "suvm.tile.cast",
         ),
     )
+    _assert_e8m0_scale_casts(src)
 
 
 @pytest.mark.parametrize("mx_dtype,data_dtype,data_dtype_name,data_max,mx_token", MX_OCP_QUANT_CASES)
@@ -774,6 +815,7 @@ def test_mx_ocp_quant_generic_shape_kernel_codegen_logs_mlir(
         ),
     )
     _assert_no_e8m0_tile_select(src)
+    _assert_e8m0_scale_casts(src)
 
 
 @pytest.mark.parametrize("mx_dtype,data_dtype,data_dtype_name,data_max,mx_token", MX_OCP_QUANT_CASES)
@@ -785,7 +827,7 @@ def test_mx_ocp_dequant_generic_shape_kernel_codegen_logs_mlir(
     data_max,
     mx_token,
 ):
-    validate_sunmmio_codegen_with_npuir_opt(
+    src = validate_sunmmio_codegen_with_npuir_opt(
         mx_ocp_dequant_generic_shape_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name, data_max),
         tmp_path,
         mlir_filename=f"mx_ocp_dequant_generic_{data_dtype_name}_suvm.mlir",
@@ -797,6 +839,7 @@ def test_mx_ocp_dequant_generic_shape_kernel_codegen_logs_mlir(
             "suvm.tile.cast",
         ),
     )
+    _assert_e8m0_scale_casts(src)
 
 
 @pytest.mark.parametrize("mx_dtype,data_dtype,data_dtype_name,data_max,mx_token", MX_OCP_QUANT_CASES)
@@ -823,6 +866,7 @@ def test_mx_ocp_quantized_mma_kernel_codegen_logs_mlir(
         ),
     )
     _assert_no_e8m0_tile_select(src)
+    _assert_e8m0_scale_casts(src)
 
 
 @pytest.mark.parametrize("mx_dtype,data_dtype,data_dtype_name,data_max,mx_token", MX_OCP_QUANT_CASES)
@@ -849,6 +893,7 @@ def test_mx_ocp_quantized_mma_mxznz_weight_kernel_codegen_logs_mlir_strict(
         ),
     )
     _assert_no_e8m0_tile_select(src)
+    _assert_e8m0_scale_casts(src)
 
 
 if __name__ == "__main__":
