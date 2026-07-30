@@ -2507,27 +2507,40 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                                   mask_index_dtype);
   };
 
-  auto mx_scale_e8m0_prefix_store_extent =
-      [&](const BufferStoreNode *store, const TileAccessInfo &access,
-          TileBlockState *state) -> std::optional<int64_t> {
-    DataType dtype = CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1);
+  auto mx_scale_e8m0_prefix_extent =
+      [&](DataType value_dtype, const Buffer &buffer,
+          const TileAccessInfo &access,
+          bool predicate_defined) -> std::optional<int64_t> {
+    DataType dtype = CanonicalizeSuvmDType(value_dtype).with_lanes(1);
     if (!dtype.is_float8_e8m0fnu() || access.requires_aligned_1d_load ||
         access.tile_shape.size() != 1 || access.tile_shape[0] != 64 ||
-        access.tiled_dims.size() != 1 || !store->predicate.defined()) {
+        access.tiled_dims.size() != 1 || !predicate_defined) {
       return std::nullopt;
     }
 
     int64_t tiled_dim = access.tiled_dims[0];
     if (tiled_dim < 0 ||
-        tiled_dim >= static_cast<int64_t>(store->buffer->shape.size())) {
+        tiled_dim >= static_cast<int64_t>(buffer->shape.size())) {
       return std::nullopt;
     }
     const auto *extent =
-        store->buffer->shape[static_cast<size_t>(tiled_dim)].as<IntImmNode>();
+        buffer->shape[static_cast<size_t>(tiled_dim)].as<IntImmNode>();
     if (!extent || extent->value != 32) {
       return std::nullopt;
     }
     return static_cast<int64_t>(extent->value);
+  };
+  auto mx_scale_e8m0_prefix_load_extent =
+      [&](const BufferLoadNode *load,
+          const TileAccessInfo &access) -> std::optional<int64_t> {
+    return mx_scale_e8m0_prefix_extent(load->buffer->dtype, load->buffer,
+                                       access, load->predicate.defined());
+  };
+  auto mx_scale_e8m0_prefix_store_extent =
+      [&](const BufferStoreNode *store,
+          const TileAccessInfo &access) -> std::optional<int64_t> {
+    return mx_scale_e8m0_prefix_extent(store->buffer->dtype, store->buffer,
+                                       access, store->predicate.defined());
   };
 
   auto merge_broadcast_shapes = [&](const std::vector<int64_t> &lhs,
@@ -3032,6 +3045,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       }
       TileAccessInfo access =
           analyze_access(load->buffer, load->indices, state);
+      std::optional<int64_t> mx_scale_valid_elems =
+          mx_scale_e8m0_prefix_load_extent(load, access);
       std::string cache_key = make_tile_cache_key(access);
       if (!access.promoted_unit_tile_view && !access.requires_aligned_1d_load) {
         auto it = state->current_tile_values.find(cache_key);
@@ -3054,6 +3069,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         bool skip_load_predicate = false;
         if (load->predicate.defined()) {
           skip_load_predicate =
+              mx_scale_valid_elems.has_value() ||
               (state->active_tail_store_predicate.has_value() &&
                can_prove_expr_equal(
                    load->predicate.value(),
@@ -3828,54 +3844,45 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                              ? normalize_for_aligned_1d_store(access, raw_rhs)
                              : normalize_for_store(access, raw_rhs);
       std::string cache_key = make_tile_cache_key(access);
-      DataType store_mask_index_dtype =
-          mask_index_dtype_for_value_dtype(store->buffer->dtype);
+      std::optional<int64_t> mx_scale_valid_elems =
+          mx_scale_e8m0_prefix_store_extent(store, access);
+      std::optional<DataType> store_mask_index_dtype;
+      auto get_store_mask_index_dtype = [&]() -> DataType {
+        if (!store_mask_index_dtype.has_value()) {
+          store_mask_index_dtype =
+              mask_index_dtype_for_value_dtype(store->buffer->dtype);
+        }
+        return store_mask_index_dtype.value();
+      };
       std::optional<SunMMIOValue> mask =
           (access.tile_rank == 2) ? state->tile_mask : std::nullopt;
       bool canonical_tail_store = store->predicate.defined() &&
                                   is_canonical_tail_load_predicate(
                                       store->predicate.value(), state, access);
-      if (!access.requires_aligned_1d_load && store->predicate.defined() &&
+      if (!mx_scale_valid_elems.has_value() &&
+          !access.requires_aligned_1d_load && store->predicate.defined() &&
           !mask.has_value()) {
         if (canonical_tail_store && access.tile_rank == 1) {
-          mask = build_canonical_tail_mask(access, store_mask_index_dtype);
+          mask =
+              build_canonical_tail_mask(access, get_store_mask_index_dtype());
         } else if (auto canonical_mask = build_canonical_rank2_predicate_mask(
                        store->predicate.value(), state, access,
-                       store_mask_index_dtype)) {
+                       get_store_mask_index_dtype())) {
           mask = canonical_mask.value();
         } else {
           mask = lower_expr(store->predicate.value(), state,
-                            store_mask_index_dtype);
+                            get_store_mask_index_dtype());
         }
       }
-      if (access.requires_aligned_1d_load && store->predicate.defined() &&
+      if (!mx_scale_valid_elems.has_value() &&
+          access.requires_aligned_1d_load && store->predicate.defined() &&
           !canonical_tail_store) {
-        mask =
-            lower_expr(store->predicate.value(), state, store_mask_index_dtype);
+        mask = lower_expr(store->predicate.value(), state,
+                          get_store_mask_index_dtype());
       }
       std::optional<SunMMIOValue> dst_view;
-      if (mask.has_value() && !access.requires_aligned_1d_load) {
-        SunMMIOValue store_mask = mask.value();
-        if (IsTileLike(store_mask)) {
-          store_mask =
-              reorient_unit_tile_to_shape(store_mask, access.tile_shape);
-          if (ExtractStaticShape(store_mask.type) != access.tile_shape) {
-            store_mask = broadcast_tile_to_shape(store_mask, access.tile_shape);
-          }
-          ICHECK(StaticShapesEqual(
-              store_mask.type,
-              MakeTileType(DataType::Bool(), access.tile_shape)))
-              << "Predicated tile store cannot normalize mask shape";
-        } else {
-          SunMMIOType bool_scalar_type{
-              SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
-          store_mask =
-              EnsureType(store_mask, bool_scalar_type, DataType::Bool());
-          store_mask = builder_->TileFill(
-              NewValueName(), store_mask,
-              MakeTileType(DataType::Bool(), access.tile_shape),
-              DataType::Bool());
-        }
+      if ((mx_scale_valid_elems.has_value() || mask.has_value()) &&
+          !access.requires_aligned_1d_load) {
         dst_view = get_or_create_tile_view(access, state);
         SunMMIOType dst_tile_type =
             MakeTileType(store->buffer->dtype, access.tile_shape);
@@ -3883,8 +3890,6 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
             NewValueName(), dst_view.value(), dst_tile_type, std::nullopt,
             std::nullopt,
             CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
-        std::optional<int64_t> mx_scale_valid_elems =
-            mx_scale_e8m0_prefix_store_extent(store, access, state);
         if (mx_scale_valid_elems.has_value()) {
           std::vector<SunMMIOValue> offsets{make_index_const(0)};
           SunMMIOType slice_type =
@@ -3896,6 +3901,28 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
               NewValueName(), old_tile, valid_slice, offsets, dst_tile_type,
               CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
         } else {
+          SunMMIOValue store_mask = mask.value();
+          if (IsTileLike(store_mask)) {
+            store_mask =
+                reorient_unit_tile_to_shape(store_mask, access.tile_shape);
+            if (ExtractStaticShape(store_mask.type) != access.tile_shape) {
+              store_mask =
+                  broadcast_tile_to_shape(store_mask, access.tile_shape);
+            }
+            ICHECK(StaticShapesEqual(
+                store_mask.type,
+                MakeTileType(DataType::Bool(), access.tile_shape)))
+                << "Predicated tile store cannot normalize mask shape";
+          } else {
+            SunMMIOType bool_scalar_type{
+                SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
+            store_mask =
+                EnsureType(store_mask, bool_scalar_type, DataType::Bool());
+            store_mask = builder_->TileFill(
+                NewValueName(), store_mask,
+                MakeTileType(DataType::Bool(), access.tile_shape),
+                DataType::Bool());
+          }
           rhs = builder_->TileSelect(
               NewValueName(), store_mask, rhs, old_tile, dst_tile_type,
               CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
@@ -3905,7 +3932,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       erase_current_values_for_buffer(state, store->buffer.get());
       if (access.requires_aligned_1d_load) {
         if (!mask.has_value() && canonical_tail_store) {
-          mask = build_canonical_tail_mask(access, store_mask_index_dtype);
+          mask =
+              build_canonical_tail_mask(access, get_store_mask_index_dtype());
         }
         updated_aligned_tile = store_aligned_1d_tile(access, rhs, mask, state);
       } else {
