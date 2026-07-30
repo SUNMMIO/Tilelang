@@ -436,14 +436,6 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
           ctx_.builder.setInsertionPointToStart(&else_block);
           if (index + 1 < candidates.size()) {
             emit_case(index + 1);
-          } else {
-            mlir::Value always_false = mlir::arith::ConstantIntOp::create(
-                                           ctx_.builder, type.Loc(), 0, 1)
-                                           .getResult();
-            mlir::cf::AssertOp::create(
-                ctx_.builder, type.Loc(), always_false,
-                ctx_.builder.getStringAttr(
-                    "dynamic barrier mask is not in candidate set"));
           }
 
           ctx_.builder.setInsertionPointAfter(if_op);
