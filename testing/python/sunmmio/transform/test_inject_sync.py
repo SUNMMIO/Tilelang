@@ -1204,6 +1204,9 @@ def test_inject_sunmmio_sync_broadcast_without_src_core_uses_current_core_mask()
     assert len(barrier_wait_lines) == 1
     assert all(_parse_barrier_args(line, "barrier_arrive_and_wait")[-4:] == [15, 240, 3840, 61440] for line in barrier_wait_lines)
 
+    broadcast_idx = next(i for i, line in enumerate(lines) if "broadcast_" in line)
+    assert "barrier_arrive_and_wait" in lines[broadcast_idx - 1]
+
 
 def test_inject_sunmmio_sync_dynamic_broadcast_mask_candidates():
     target = get_target("Sunmmio")
@@ -1295,6 +1298,8 @@ def test_inject_sunmmio_sync_nested_loop_reuses_tokens_without_mixing_levels():
     assert "outer_src_buf" in outer_line and "outer_dst_buf" in outer_line
     assert "inner_src_buf" in inner_line and "inner_dst_buf" in inner_line
     assert outer_idx < inner_idx
+    assert "barrier_arrive_and_wait" in lines[outer_idx - 1]
+    assert "barrier_arrive_and_wait" in lines[inner_idx - 1]
 
     # Any loop-entry null token must correspond to a real async op and a wait.
     assert null_ids

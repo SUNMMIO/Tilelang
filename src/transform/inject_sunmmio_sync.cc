@@ -2834,6 +2834,236 @@ private:
   TokenBarrierMap token_to_barrier_mask_;
 };
 
+// A reusable barrier represents one collective epoch, so two broadcasts with
+// the same participant mask still require two arrivals.  Restore the launch
+// invariant after wait elimination: every all-gather leaf is immediately
+// preceded by its barrier.  This pass does not reorder scheduled commands.
+class EnsureAllGatherLaunchBarrierRewriter : public StmtMutator {
+public:
+  explicit EnsureAllGatherLaunchBarrierRewriter(
+      TokenBarrierMap token_to_barrier_mask)
+      : token_to_barrier_mask_(std::move(token_to_barrier_mask)) {}
+
+private:
+  static const CallNode *GetEvaluateCall(const Stmt &stmt) {
+    const auto *eval = stmt.as<EvaluateNode>();
+    return eval ? eval->value.as<CallNode>() : nullptr;
+  }
+
+  static std::optional<int> GetGeneratedToken(const CallNode *call) {
+    if (!call) {
+      return std::nullopt;
+    }
+    for (const PrimExpr &arg : call->args) {
+      const auto *nested = arg.as<CallNode>();
+      if (nested && nested->op.same_as(sync_token_id()) &&
+          !nested->args.empty()) {
+        if (const auto *imm = nested->args[0].as<IntImmNode>()) {
+          return static_cast<int>(imm->value);
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> out;
+    for (const Stmt &old_stmt : op->seq) {
+      Stmt stmt = VisitStmt(old_stmt);
+      const CallNode *call = GetEvaluateCall(stmt);
+      if (call && call->op.same_as(broadcast_()) &&
+          !BroadcastCallHasSrcCore(call)) {
+        std::optional<int> token = GetGeneratedToken(call);
+        ICHECK(token.has_value())
+            << "all-gather broadcast is missing its synchronization token";
+        auto barrier_it = token_to_barrier_mask_.find(*token);
+        ICHECK(barrier_it != token_to_barrier_mask_.end())
+            << "all-gather token " << *token << " has no barrier mask";
+
+        const CallNode *previous =
+            out.empty() ? nullptr : GetEvaluateCall(out[out.size() - 1]);
+        if (!BarrierCallMatchesInfo(previous, barrier_it->second)) {
+          out.push_back(
+              Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
+                            MakeBarrierArgs(barrier_it->second))));
+        }
+      }
+      out.push_back(stmt);
+    }
+    return SeqStmt::Flatten(out);
+  }
+
+  TokenBarrierMap token_to_barrier_mask_;
+};
+
+// Hardware waits synchronize an engine, not an individual logical token.  A
+// pipeline may schedule an operation from iteration N+1 before the existing
+// wait for iteration N's token.  If both use the same engine, the wait would
+// also consume the newly launched operation and destroy the intended overlap.
+// Move an older token's wait before the first newer reuse of its engine.  For
+// loop-carried tokens this means before the first same-engine launch in the
+// new iteration.  Cross-core barriers remain attached to collective launches.
+class MoveLoopCarriedEngineWaitsRewriter : public StmtMutator {
+private:
+  enum class AsyncEngine { kODMA0 = 0, kODMA1 = 1, kTensorCore = 2 };
+
+  static const CallNode *GetEvaluateCall(const Stmt &stmt) {
+    const auto *eval = stmt.as<EvaluateNode>();
+    return eval ? eval->value.as<CallNode>() : nullptr;
+  }
+
+  static std::optional<int> GetTokenId(const CallNode *call,
+                                       const Op &token_op) {
+    if (!call) {
+      return std::nullopt;
+    }
+    if (call->op.same_as(token_op) && !call->args.empty()) {
+      if (const auto *imm = call->args[0].as<IntImmNode>()) {
+        return static_cast<int>(imm->value);
+      }
+    }
+    for (const PrimExpr &arg : call->args) {
+      const auto *nested = arg.as<CallNode>();
+      if (nested && nested->op.same_as(token_op) && !nested->args.empty()) {
+        if (const auto *imm = nested->args[0].as<IntImmNode>()) {
+          return static_cast<int>(imm->value);
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
+  static AsyncEngine GetODMAEngine(const CallNode *call) {
+    BufferRegion src = NormalizeToBufferRegion(call->args[0]);
+    BufferRegion dst = NormalizeToBufferRegion(call->args[1]);
+    if ((src->buffer.scope() == "shared.rsram" ||
+         src->buffer.scope() == "local") &&
+        dst->buffer.scope() == "shared.asram") {
+      return AsyncEngine::kODMA1;
+    }
+    return AsyncEngine::kODMA0;
+  }
+
+  static std::optional<AsyncEngine> GetAsyncEngine(const CallNode *call) {
+    if (!call) {
+      return std::nullopt;
+    }
+    if (call->op.same_as(mma_sunmmio())) {
+      return AsyncEngine::kTensorCore;
+    }
+    if (call->op.same_as(dma_copy()) ||
+        call->op.same_as(sunmmio_layout_transform()) ||
+        call->op.same_as(broadcast_())) {
+      return GetODMAEngine(call);
+    }
+    return std::nullopt;
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    loop_stack_.push_back(op);
+    Stmt body = VisitStmt(op->body);
+    loop_stack_.pop_back();
+    return For(op->loop_var, op->min, op->extent, op->kind, body,
+               op->thread_binding, op->annotations);
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> visited;
+    for (const Stmt &stmt : op->seq) {
+      visited.push_back(VisitStmt(stmt));
+    }
+    Stmt body = SeqStmt::Flatten(visited);
+    if (loop_stack_.empty()) {
+      return body;
+    }
+    return RewriteSequence(body, loop_stack_.back());
+  }
+
+  static Stmt RewriteSequence(const Stmt &body, const ForNode *loop) {
+    const auto *seq = body.as<SeqStmtNode>();
+    if (!seq) {
+      return body;
+    }
+
+    std::map<int, AsyncEngine> token_engine;
+    std::map<int, int> generator_index;
+    std::vector<int> engine_users[3];
+    for (int i = 0, n = static_cast<int>(seq->seq.size()); i < n; ++i) {
+      const CallNode *call = GetEvaluateCall(seq->seq[i]);
+      std::optional<AsyncEngine> engine = GetAsyncEngine(call);
+      if (!engine) {
+        continue;
+      }
+      int engine_index = static_cast<int>(*engine);
+      engine_users[engine_index].push_back(i);
+      std::optional<int> token = GetTokenId(call, sync_token_id());
+      if (token) {
+        token_engine[*token] = *engine;
+        generator_index[*token] = i;
+      }
+    }
+
+    struct MovedWait {
+      Stmt stmt;
+      bool loop_carried;
+    };
+    std::map<int, std::vector<MovedWait>> moves;
+    std::set<int> removed;
+    for (int i = 0, n = static_cast<int>(seq->seq.size()); i < n; ++i) {
+      std::optional<int> token =
+          GetTokenId(GetEvaluateCall(seq->seq[i]), wait_token());
+      if (!token || !token_engine.count(*token)) {
+        continue;
+      }
+      int generator = generator_index[*token];
+      bool loop_carried = i < generator;
+      int target = i;
+      for (int user : engine_users[static_cast<int>(token_engine[*token])]) {
+        // For a carried token, no generator has run in this iteration yet, so
+        // the wait must precede the first same-engine launch.  Otherwise move
+        // it only across newer launches inserted between its generator and
+        // wait; never move it before its own generator.
+        if ((loop_carried || user > generator) && user < i) {
+          target = user;
+          break;
+        }
+      }
+      if (target == i) {
+        continue;
+      }
+      moves[target].push_back({seq->seq[i], loop_carried});
+      removed.insert(i);
+    }
+    if (moves.empty()) {
+      return body;
+    }
+
+    Array<Stmt> reordered;
+    for (int i = 0, n = static_cast<int>(seq->seq.size()); i < n; ++i) {
+      auto move_it = moves.find(i);
+      if (move_it != moves.end()) {
+        for (const MovedWait &wait : move_it->second) {
+          if (wait.loop_carried) {
+            // The carried token is initialized with sync_null_token.  NPU-IR
+            // lowers a wait on the loop block argument as a real hardware
+            // wait, so explicitly skip it on the first iteration.
+            reordered.push_back(
+                IfThenElse(loop->loop_var > loop->min, wait.stmt));
+          } else {
+            reordered.push_back(wait.stmt);
+          }
+        }
+      }
+      if (!removed.count(i)) {
+        reordered.push_back(seq->seq[i]);
+      }
+    }
+    return SeqStmt::Flatten(reordered);
+  }
+
+  std::vector<const ForNode *> loop_stack_;
+};
+
 class InitReusableBarriersRewriter : public StmtMutator {
 public:
   Stmt operator()(Stmt body) {
@@ -2988,6 +3218,14 @@ public:
     auto loop_missing_token_wait_rewriter = LoopMissingTokenWaitRewriter();
     f.CopyOnWrite()->body = loop_missing_token_wait_rewriter(f->body);
 
+    // LoopMissingTokenWaitRewriter may add a wait immediately before reuse of
+    // one logical token, after another command has already reused the same
+    // physical engine.  Apply the engine-aware ordering only after all such
+    // waits exist so none can consume newly launched work on that engine.
+    auto move_loop_carried_engine_waits_rewriter =
+        MoveLoopCarriedEngineWaitsRewriter();
+    f.CopyOnWrite()->body = move_loop_carried_engine_waits_rewriter(f->body);
+
     auto device_func_wait_rewriter =
         DeviceFuncWaitRewriter(token_to_barrier_mask);
     f.CopyOnWrite()->body = device_func_wait_rewriter(f->body);
@@ -2995,6 +3233,10 @@ public:
     auto eliminate_redundancy_rewriter = EliminateRedundancyRewriter(
         analyzer, std::vector<int>({}), token_to_barrier_mask);
     f.CopyOnWrite()->body = eliminate_redundancy_rewriter(f->body);
+
+    auto ensure_all_gather_launch_barrier_rewriter =
+        EnsureAllGatherLaunchBarrierRewriter(token_to_barrier_mask);
+    f.CopyOnWrite()->body = ensure_all_gather_launch_barrier_rewriter(f->body);
 
     auto init_reusable_barriers_rewriter = InitReusableBarriersRewriter();
     f.CopyOnWrite()->body = init_reusable_barriers_rewriter(f->body);
