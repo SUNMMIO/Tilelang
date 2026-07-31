@@ -2918,17 +2918,22 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
         << "tl.mma_sunmmio acc_offset_byte must be non-negative";
     MarkVisitedNodeType(acc_offset_imm->GetTypeKey());
 
-    operands.reserve(3);
+    operands.reserve(4);
     operands.push_back(EmitRegionCall(op->args[0]));
     operands.push_back(EmitRegionCall(op->args[1]));
     operands.push_back(EmitRegionCall(op->args[2], acc_offset_byte));
+
+    MarkVisitedNodeType(op->args[5]->GetTypeKey());
+    arith::Analyzer analyzer;
+    PrimExpr accumulate = analyzer.Simplify(tir::Not(op->args[5]));
+    SunMMIOType bool_ty{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
+    operands.push_back(
+        EnsureType(EvalExpr(accumulate), bool_ty, DataType::Bool()));
 
     attrs[SunMMIOCallAttrKey::kTransA] =
         parse_bool_arg(op->args[3], "tl.mma_sunmmio transA");
     attrs[SunMMIOCallAttrKey::kTransB] =
         parse_bool_arg(op->args[4], "tl.mma_sunmmio transB");
-    attrs[SunMMIOCallAttrKey::kClearAccum] =
-        parse_bool_arg(op->args[5], "tl.mma_sunmmio clearAccum");
 
     ICHECK(TryConsumeSyncTokenId(op->args[7], &attrs))
         << "tl.mma_sunmmio expects last argument to be tl.sync_token_id";
