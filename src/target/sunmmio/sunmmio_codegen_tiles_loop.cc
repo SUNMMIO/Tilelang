@@ -718,6 +718,9 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         << "Reduce tiles scope is missing interior axis 0 loop";
     scope.tile_block_body = tile_scope_stmt;
   } else if (const auto *ifs = tile_scope_stmt.as<IfThenElseNode>()) {
+    // This wrapper is decomposed into the full-tile and tail-tile paths below,
+    // so it never enters lower_stmt itself.
+    MarkVisitedNodeType(ifs->GetTypeKey());
     scope.tail_predicate = ifs->condition;
     scope.full_tile_body = ifs->then_case;
     scope.tail_tile_body =
@@ -2981,11 +2984,13 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       }
       if (auto rewritten =
               TryRewriteAffineInteriorLT(rewritten_condition, interior_vars)) {
+        MarkVisitedExprTree(rewritten_condition);
         rewritten_condition = rewritten.value();
       }
       if (ContainsFloorDivOrMod(rewritten_condition)) {
         if (auto rewritten = TryRewritePositiveFloorDivTailCompare(
                 rewritten_condition, interior_vars)) {
+          MarkVisitedExprTree(rewritten_condition);
           rewritten_condition = rewritten.value();
         }
       }
@@ -3458,6 +3463,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     lower_bool_expr_to_shape =
         [&](const PrimExpr &bool_expr, const std::vector<int64_t> &target_shape,
             std::optional<DataType> mask_index_dtype) -> SunMMIOValue {
+      MarkVisitedExprRoot(bool_expr);
       PrimExpr bool_expr_to_lower = rewrite_mask_condition(bool_expr);
       std::optional<DataType> integer_preferred =
           canonical_integer_preferred_dtype(mask_index_dtype);
@@ -3643,6 +3649,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     if (const auto *call = expr.as<CallNode>()) {
       const auto *op_node = call->op.as<OpNode>();
       if (op_node && op_node->name == "tl.infinity") {
+        ICHECK_EQ(call->args.size(), 1U)
+            << "tl.infinity expects one dtype argument";
+        const auto *dtype_arg = call->args[0].as<StringImmNode>();
+        ICHECK(dtype_arg) << "tl.infinity dtype must be StringImm";
+        MarkVisitedExprRoot(call->args[0]);
         DataType dtype = CanonicalizeSuvmDType(call->dtype).with_lanes(1);
         SunMMIOType scalar_type{SunMMIOType::Kind::kScalar, dtype, 1, {}};
         return builder_->ConstantFloat(NewValueName(), "inf", scalar_type,
@@ -3703,7 +3714,12 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         return emit_binary(BinaryOp::kMod, call->args[0], call->args[1],
                            call->dtype);
       }
-      if (op_node && !call->args.empty() && op_node->name == "tl.ieee_frcp") {
+      if (op_node && op_node->name == "tl.ieee_frcp") {
+        ICHECK_EQ(call->args.size(), 2U)
+            << "tl.ieee_frcp expects value and rounding mode";
+        const auto *rounding_mode = call->args[1].as<StringImmNode>();
+        ICHECK(rounding_mode) << "tl.ieee_frcp rounding mode must be StringImm";
+        MarkVisitedExprRoot(call->args[1]);
         return emit_unary(TileUnaryOp::kRecip, call->args[0], call->dtype);
       }
       if (op_node && call->args.size() == 1 &&
@@ -4089,17 +4105,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     ICHECK(predicate)
         << "tl.vector_core_in_tile_reduce predicate must be StringImm";
     MarkVisitedNodeType(predicate->GetTypeKey());
-    auto normalize_region = [&](const PrimExpr &expr) {
-      MarkVisitedExprRoot(expr);
-      if (const auto *region_call = expr.as<CallNode>()) {
-        for (const PrimExpr &arg : region_call->args) {
-          MarkVisitedExprRoot(arg);
-        }
-      }
-      return tl::NormalizeToBufferRegion(expr);
-    };
-    BufferRegion dst_region = normalize_region(call->args[1]);
-    BufferRegion src_region = normalize_region(call->args[2]);
+    BufferRegion dst_region = NormalizeRegionTracked(call->args[1]);
+    BufferRegion src_region = NormalizeRegionTracked(call->args[2]);
     const auto *axis_imm = call->args[3].as<IntImmNode>();
     ICHECK(axis_imm) << "tl.vector_core_in_tile_reduce axis must be IntImm";
     MarkVisitedNodeType(axis_imm->GetTypeKey());

@@ -13,6 +13,8 @@
 #include <tvm/tir/buffer.h>
 #include <tvm/tir/op.h>
 
+#include <functional>
+
 namespace tvm {
 namespace tl {
 
@@ -34,6 +36,13 @@ TVM_DLL bool IsBufferLikeExpr(const PrimExpr &expr);
 // to BufferRegion so ops can uniformly consume regions.
 // Note: tvm_access_ptr is no longer supported here.
 TVM_DLL BufferRegion NormalizeToBufferRegion(const PrimExpr &arg);
+
+// Report each PrimExpr root directly inspected while normalizing. Nested
+// expressions that are forwarded as Range minima are left for the downstream
+// consumer to visit.
+using RegionExprObserver = std::function<void(const PrimExpr &)>;
+TVM_DLL BufferRegion NormalizeToBufferRegion(
+    const PrimExpr &arg, const RegionExprObserver &observe_consumed_root);
 
 // Build a tl.tileop.region Call from a Buffer + Array<Range>.
 // This is the inverse of NormalizeToBufferRegion: it packages buffer, access

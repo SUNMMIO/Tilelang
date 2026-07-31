@@ -118,18 +118,18 @@ def test_simple_global_copy_gemm_codegen_validates_with_npuir_opt(tmp_path, monk
         ("suvm.tile.reduce", "suvm.tile.exp", "suvm.tile.ln", "suvm.mcast_tok"),
     )
     coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
-    outside = coverage["outside"]
+    main = coverage["main"]
     tiles = coverage["tiles"]
-    assert outside["missing_node_types"] == []
-    assert outside["missing_call_ops"] == []
+    assert main["missing_node_types"] == []
+    assert main["missing_call_ops"] == []
     assert tiles["missing_node_types"] == []
     assert tiles["missing_call_ops"] == []
 
-    assert "tir.For" in outside["expected_node_types"]
-    assert "tir.For" in outside["visited_node_types"]
+    assert "tir.For" in main["expected_node_types"]
+    assert "tir.For" in main["visited_node_types"]
     assert "tir.For" in tiles["expected_node_types"]
     assert "tir.For" in tiles["visited_node_types"]
-    assert "tl.vector_core_in_tile_reduce" not in outside["expected_call_ops"]
+    assert "tl.vector_core_in_tile_reduce" not in main["expected_call_ops"]
     assert "tl.vector_core_in_tile_reduce" in tiles["expected_call_ops"]
     assert "tl.vector_core_in_tile_reduce" in tiles["visited_call_ops"]
 

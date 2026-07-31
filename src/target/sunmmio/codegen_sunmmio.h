@@ -372,7 +372,7 @@ protected:
   SunMMIOValue VisitExprDefault_(const Object *op) override;
 
 private:
-  enum class CoverageDomain { kOutside, kTiles };
+  enum class CoverageDomain { kMain, kTiles };
 
   struct CoverageData {
     std::set<std::string> expected_node_types;
@@ -414,6 +414,7 @@ private:
   void MarkVisitedCallOpFromExpr(const tvm::PrimExpr &expr);
   void MarkVisitedExprRoot(const tvm::PrimExpr &expr);
   void MarkVisitedExprTree(const tvm::PrimExpr &expr);
+  tir::BufferRegion NormalizeRegionTracked(const tvm::PrimExpr &expr);
   bool TryConsumeSyncTokenId(const tvm::PrimExpr &expr,
                              SunMMIOCallAttrs *attrs);
   void WriteCoverageReport() const;
@@ -497,10 +498,10 @@ private:
   std::vector<size_t> local_var_scope_markers_;
   std::vector<size_t> buffer_scope_markers_;
 
-  // Tiles and non-Tiles lowering are checked independently so a common-path
-  // type/op cannot hide a missing mark in custom Tiles lowering.
-  CoverageDomain coverage_domain_{CoverageDomain::kOutside};
-  CoverageData outside_coverage_;
+  // Main and Tiles lowering are checked independently so the main path cannot
+  // hide a missing type/op mark in custom Tiles lowering.
+  CoverageDomain coverage_domain_{CoverageDomain::kMain};
+  CoverageData main_coverage_;
   CoverageData tiles_coverage_;
 };
 

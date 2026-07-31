@@ -598,9 +598,9 @@ void CodeGenTileLangSunMMIO::Clear() {
   var_scope_markers_.clear();
   local_var_scope_markers_.clear();
   buffer_scope_markers_.clear();
-  outside_coverage_ = CoverageData{};
+  main_coverage_ = CoverageData{};
   tiles_coverage_ = CoverageData{};
-  coverage_domain_ = CoverageDomain::kOutside;
+  coverage_domain_ = CoverageDomain::kMain;
   initialized_ = false;
 }
 
@@ -610,22 +610,18 @@ SunMMIOValue CodeGenTileLangSunMMIO::EvalExpr(const tvm::PrimExpr &expr) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmtTracked(const tir::Stmt &stmt) {
-  CoverageDomain saved_domain = coverage_domain_;
-  if (const auto *loop = stmt.as<tir::ForNode>();
-      loop && loop->annotations.count(tl::attr::kTileDomain)) {
-    coverage_domain_ = CoverageDomain::kTiles;
-  }
-  if (stmt.defined()) {
+  // ForNode selects its coverage domain in VisitStmt_(ForNode*) before it is
+  // marked.  All other statements inherit the domain of their lowering path.
+  if (stmt.defined() && !stmt.as<tir::ForNode>()) {
     MarkVisitedNodeType(stmt->GetTypeKey());
   }
   tir::StmtVisitor::VisitStmt(stmt);
-  coverage_domain_ = saved_domain;
 }
 
 void CodeGenTileLangSunMMIO::MarkVisitedNodeType(const std::string &type_key) {
   CoverageData &coverage = coverage_domain_ == CoverageDomain::kTiles
                                ? tiles_coverage_
-                               : outside_coverage_;
+                               : main_coverage_;
   coverage.visited_node_types.insert(type_key);
 }
 
@@ -637,7 +633,7 @@ void CodeGenTileLangSunMMIO::MarkVisitedCallOpFromExpr(
   }
   CoverageData &coverage = coverage_domain_ == CoverageDomain::kTiles
                                ? tiles_coverage_
-                               : outside_coverage_;
+                               : main_coverage_;
   if (const auto *op_node = call->op.as<OpNode>()) {
     coverage.visited_call_ops.insert(op_node->name);
   } else if (const auto *gv = call->op.as<GlobalVarNode>()) {
@@ -665,6 +661,14 @@ void CodeGenTileLangSunMMIO::MarkVisitedExprTree(const tvm::PrimExpr &expr) {
     }
     return true;
   });
+}
+
+tir::BufferRegion
+CodeGenTileLangSunMMIO::NormalizeRegionTracked(const tvm::PrimExpr &expr) {
+  return tl::NormalizeToBufferRegion(expr,
+                                     [this](const PrimExpr &consumed_root) {
+                                       MarkVisitedExprRoot(consumed_root);
+                                     });
 }
 
 bool CodeGenTileLangSunMMIO::TryConsumeSyncTokenId(const tvm::PrimExpr &expr,
@@ -713,7 +717,7 @@ void CodeGenTileLangSunMMIO::CollectExpectedCoverage(const tir::PrimFunc &f) {
       tiles_roots.push_back(ffi::GetRef<tir::For>(loop));
       return false;
     }
-    record(obj, &outside_coverage_);
+    record(obj, &main_coverage_);
     return true;
   });
 
@@ -784,7 +788,7 @@ void CodeGenTileLangSunMMIO::WriteCoverageReport() const {
   };
 
   os << "{\n";
-  write_domain("outside", outside_coverage_);
+  write_domain("main", main_coverage_);
   os << ",\n";
   write_domain("tiles", tiles_coverage_);
   os << "\n}\n";
@@ -807,7 +811,7 @@ void CodeGenTileLangSunMMIO::CheckCoverageOrFail() const {
         diff(coverage.expected_node_types, coverage.visited_node_types),
         diff(coverage.expected_call_ops, coverage.visited_call_ops)};
   };
-  MissingCoverage outside_missing = get_missing(outside_coverage_);
+  MissingCoverage main_missing = get_missing(main_coverage_);
   MissingCoverage tiles_missing = get_missing(tiles_coverage_);
 
   const char *strict_env = std::getenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT");
@@ -823,10 +827,10 @@ void CodeGenTileLangSunMMIO::CheckCoverageOrFail() const {
                    << ", missing_call_ops=" << missing.call_ops.size();
     }
   };
-  warn_missing("outside", outside_missing);
+  warn_missing("main", main_missing);
   warn_missing("tiles", tiles_missing);
 
-  if (strict && (has_missing(outside_missing) || has_missing(tiles_missing))) {
+  if (strict && (has_missing(main_missing) || has_missing(tiles_missing))) {
     std::ostringstream err;
     err << "SunMMIO codegen traversal incomplete.";
     auto append_missing = [&](const char *domain,
@@ -843,7 +847,7 @@ void CodeGenTileLangSunMMIO::CheckCoverageOrFail() const {
         err << s << "; ";
       }
     };
-    append_missing("outside", outside_missing);
+    append_missing("main", main_missing);
     append_missing("tiles", tiles_missing);
     LOG(FATAL) << err.str();
   }
@@ -1183,6 +1187,7 @@ void CodeGenTileLangSunMMIO::EmitAlloc(
     const ffi::Map<ffi::String, ffi::Any> &annotations) {
   std::vector<SunMMIOValue> dyn_extents;
   for (const PrimExpr &dim : buffer->shape) {
+    MarkVisitedExprRoot(dim);
     if (!dim.as<IntImmNode>()) {
       dyn_extents.push_back(EnsureIndex(EvalExpr(dim)));
     }
@@ -1242,12 +1247,12 @@ CodeGenTileLangSunMMIO::EmitLocalVarLoad(const tir::Buffer &buffer,
   ICHECK(IsSunmmioLocalVarBuffer(buffer));
   ICHECK_EQ(indices.size(), 1)
       << "local.var buffer loads must use exactly one scalar index";
-  MarkVisitedExprRoot(indices[0]);
   arith::Analyzer analyzer;
   PrimExpr index = analyzer.Simplify(indices[0]);
   const auto *index_imm = index.as<IntImmNode>();
   ICHECK(index_imm && index_imm->value == 0)
       << "local.var buffer loads only support index 0";
+  MarkVisitedExprTree(indices[0]);
   return LookupLocalVar(buffer->data.get());
 }
 
@@ -1257,12 +1262,12 @@ void CodeGenTileLangSunMMIO::EmitLocalVarStore(
   ICHECK(IsSunmmioLocalVarBuffer(buffer));
   ICHECK_EQ(indices.size(), 1)
       << "local.var buffer stores must use exactly one scalar index";
-  MarkVisitedExprRoot(indices[0]);
   arith::Analyzer analyzer;
   PrimExpr index = analyzer.Simplify(indices[0]);
   const auto *index_imm = index.as<IntImmNode>();
   ICHECK(index_imm && index_imm->value == 0)
       << "local.var buffer stores only support index 0";
+  MarkVisitedExprTree(indices[0]);
 
   const SunMMIOValue &current = LookupLocalVar(buffer->data.get());
   DataType dtype = CanonicalizeSuvmDType(buffer->dtype);
@@ -1630,10 +1635,17 @@ void CodeGenTileLangSunMMIO::EmitIf(const tir::IfThenElseNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::ForNode *op) {
+  CoverageDomain saved_domain = coverage_domain_;
+  if (op->annotations.count(tl::attr::kTileDomain)) {
+    coverage_domain_ = CoverageDomain::kTiles;
+  }
+  MarkVisitedNodeType(op->GetTypeKey());
   if (TryLowerTilesScope(op)) {
+    coverage_domain_ = saved_domain;
     return;
   }
   EmitFor(op);
+  coverage_domain_ = saved_domain;
 }
 
 void CodeGenTileLangSunMMIO::EmitWhile(const tir::WhileNode *op) {
@@ -2083,6 +2095,9 @@ CodeGenTileLangSunMMIO::EmitScalarTilePick(const tir::BufferLoadNode *op) {
                         "tile.pick view: " +
                             plan_failure + ". " + describe());
   }
+  for (int dim : plan->tiled_dims) {
+    MarkVisitedExprTree(indices[dim]);
+  }
 
   std::vector<SunMMIOValue> partition_indices;
   partition_indices.reserve(plan->partition_indices.size());
@@ -2153,6 +2168,9 @@ void CodeGenTileLangSunMMIO::EmitScalarTileSet(const tir::BufferStoreNode *op) {
     UnsupportedStmt(op, "Sunmmio scalar BufferStore cannot infer a legal "
                         "tile.set view: " +
                             plan_failure + ". " + describe());
+  }
+  for (int dim : plan->tiled_dims) {
+    MarkVisitedExprTree(indices[dim]);
   }
 
   std::vector<SunMMIOValue> partition_indices;
@@ -2377,13 +2395,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCast(const SunMMIOValue &v,
 SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
                                                         bool is_pack) {
   auto normalize_region = [&](const PrimExpr &expr) {
-    MarkVisitedExprRoot(expr);
-    if (const auto *call = expr.as<CallNode>()) {
-      for (const PrimExpr &arg : call->args) {
-        MarkVisitedExprRoot(arg);
-      }
-    }
-    return tl::NormalizeToBufferRegion(expr);
+    return NormalizeRegionTracked(expr);
   };
   auto check_full_region = [&](const BufferRegion &region, const char *name) {
     ICHECK_EQ(region->region.size(), region->buffer->shape.size())
@@ -2392,24 +2404,28 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
     arith::Analyzer analyzer;
     for (size_t i = 0; i < region->region.size(); ++i) {
       const Range &range = region->region[i];
-      MarkVisitedExprRoot(range->min);
-      MarkVisitedExprRoot(range->extent);
-      ICHECK(analyzer.CanProveEqual(range->min, make_zero(range->min.dtype())))
-          << "tl.mx_pack/unpack only supports full regions; " << name << " dim "
-          << i << " has min " << range->min;
-      ICHECK(analyzer.CanProveEqual(range->extent, region->buffer->shape[i]))
+      bool min_is_zero =
+          analyzer.CanProveEqual(range->min, make_zero(range->min.dtype()));
+      ICHECK(min_is_zero) << "tl.mx_pack/unpack only supports full regions; "
+                          << name << " dim " << i << " has min " << range->min;
+      MarkVisitedExprTree(range->min);
+      bool extent_matches =
+          analyzer.CanProveEqual(range->extent, region->buffer->shape[i]);
+      ICHECK(extent_matches)
           << "tl.mx_pack/unpack only supports full regions; " << name << " dim "
           << i << " has extent " << range->extent << " but buffer shape is "
           << region->buffer->shape[i];
+      MarkVisitedExprTree(range->extent);
+      MarkVisitedExprTree(region->buffer->shape[i]);
     }
   };
   auto check_rank2_static = [&](const Buffer &buffer, const char *name) {
     ICHECK_EQ(buffer->shape.size(), 2U)
         << "tl.mx_pack/unpack expects rank-2 " << name << " buffer";
     for (const PrimExpr &dim : buffer->shape) {
-      MarkVisitedExprRoot(dim);
       ICHECK(dim.as<IntImmNode>()) << "tl.mx_pack/unpack expects static "
                                    << name << " shape, got " << dim;
+      MarkVisitedExprRoot(dim);
     }
   };
   auto make_index_type = []() {
@@ -2724,14 +2740,7 @@ const char *CodeGenTileLangSunMMIO::CallBucketName(CallBucket bucket) const {
 SunMMIOValue
 CodeGenTileLangSunMMIO::EmitRegionCall(const tvm::PrimExpr &region_expr,
                                        int64_t byte_offset) {
-  MarkVisitedExprRoot(region_expr);
-  if (const auto *region_call = region_expr.as<tir::CallNode>()) {
-    for (const PrimExpr &arg : region_call->args) {
-      MarkVisitedExprRoot(arg);
-    }
-  }
-
-  BufferRegion region = tl::NormalizeToBufferRegion(region_expr);
+  BufferRegion region = NormalizeRegionTracked(region_expr);
   const BufferBinding &binding = LookupBuffer(region->buffer);
   std::vector<SunMMIOValue> mins;
   std::vector<int64_t> extents;
@@ -2739,13 +2748,13 @@ CodeGenTileLangSunMMIO::EmitRegionCall(const tvm::PrimExpr &region_expr,
   extents.reserve(region->region.size());
   arith::Analyzer analyzer;
   for (const Range &range : region->region) {
-    MarkVisitedExprRoot(range->min);
-    MarkVisitedExprRoot(range->extent);
     const auto *extent_imm = range->extent.as<IntImmNode>();
     ICHECK(extent_imm) << "tl.tileop.region extent must be IntImm";
+    MarkVisitedExprRoot(range->extent);
     extents.push_back(static_cast<int64_t>(extent_imm->value));
     PrimExpr min = floordiv(range->min, range->extent);
     min = analyzer.Simplify(min);
+    MarkVisitedExprTree(range->min);
     mins.push_back(EvalExpr(min));
   }
   SunMMIOType ret_ty = MapType(region_expr.dtype());

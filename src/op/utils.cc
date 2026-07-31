@@ -24,16 +24,38 @@ bool IsBufferLikeExpr(const PrimExpr &expr) {
 }
 
 BufferRegion NormalizeToBufferRegion(const PrimExpr &arg) {
+  return NormalizeToBufferRegion(arg, RegionExprObserver{});
+}
+
+BufferRegion
+NormalizeToBufferRegion(const PrimExpr &arg,
+                        const RegionExprObserver &observe_consumed_root) {
+  auto observe = [&](const PrimExpr &expr) {
+    if (observe_consumed_root) {
+      observe_consumed_root(expr);
+    }
+  };
+  auto observe_index = [&](const PrimExpr &index) {
+    observe(index);
+    if (const auto *ramp = index.as<RampNode>()) {
+      observe(ramp->stride);
+      observe(ramp->lanes);
+    }
+  };
+
   // Case 1: Already a BufferRegion
   if (arg->IsInstance<BufferRegionNode>()) {
+    observe(arg);
     return Downcast<BufferRegion>(arg);
   }
 
   // Case 2: BufferLoad — convert indices to ranges (Ramp -> lanes, else
   // extent=1)
   if (const auto *load = arg.as<BufferLoadNode>()) {
+    observe(arg);
     Array<Range> ranges;
     for (const PrimExpr &index : load->indices) {
+      observe_index(index);
       if (const auto *ramp = index.as<RampNode>()) {
         ICHECK(ramp->stride.as<IntImmNode>()) << "Ramp stride must be IntImm";
         ICHECK_EQ(ramp->stride.as<IntImmNode>()->value, 1)
@@ -51,6 +73,17 @@ BufferRegion NormalizeToBufferRegion(const PrimExpr &arg) {
   // Case 3: tl.region(...) — reconstruct via RegionOp (bridge)
   if (const auto *call = arg.as<CallNode>()) {
     if (call->op.same_as(RegionOp::Get())) {
+      observe(arg);
+      for (const PrimExpr &call_arg : call->args) {
+        observe(call_arg);
+      }
+      if (!call->args.empty()) {
+        if (const auto *load = call->args[0].as<BufferLoadNode>()) {
+          for (const PrimExpr &index : load->indices) {
+            observe_index(index);
+          }
+        }
+      }
       RegionOp region(call->args);
       return BufferRegion(region->GetBuffer(), region->GetRanges());
     }

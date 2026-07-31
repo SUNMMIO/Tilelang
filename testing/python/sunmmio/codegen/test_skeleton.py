@@ -398,7 +398,7 @@ def _assert_coverage_report_complete(report_path):
         "visited_call_ops",
         "missing_call_ops",
     ]
-    for domain in ("outside", "tiles"):
+    for domain in ("main", "tiles"):
         assert domain in report, f"missing coverage domain: {domain}"
         for key in required_keys:
             assert key in report[domain], f"missing {domain} coverage key: {key}"
@@ -659,9 +659,9 @@ def test_sunmmio_codegen_coverage_tracks_helper_consumed_expr_root(tmp_path, mon
 
     _assert_coverage_report_complete(report_path)
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    outside = report["outside"]
-    assert "tir.Mul" in outside["expected_node_types"]
-    assert "tir.Mul" in outside["visited_node_types"]
+    main = report["main"]
+    assert "tir.Mul" in main["expected_node_types"]
+    assert "tir.Mul" in main["visited_node_types"]
 
 
 def test_sunmmio_codegen_coverage_tracks_ret_call_node(tmp_path, monkeypatch):
@@ -673,12 +673,12 @@ def test_sunmmio_codegen_coverage_tracks_ret_call_node(tmp_path, monkeypatch):
 
     _assert_coverage_report_complete(report_path)
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    outside = report["outside"]
+    main = report["main"]
     tiles = report["tiles"]
-    assert "tir.Call" in outside["expected_node_types"]
-    assert "tir.Call" in outside["visited_node_types"]
-    assert "tir.ret" in outside["expected_call_ops"]
-    assert "tir.ret" in outside["visited_call_ops"]
+    assert "tir.Call" in main["expected_node_types"]
+    assert "tir.Call" in main["visited_node_types"]
+    assert "tir.ret" in main["expected_call_ops"]
+    assert "tir.ret" in main["visited_call_ops"]
     assert tiles["expected_node_types"] == []
     assert tiles["visited_node_types"] == []
     assert tiles["expected_call_ops"] == []
