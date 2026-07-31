@@ -116,6 +116,22 @@ static constexpr const char *kDisableDataRaceCheck =
 static constexpr const char *kDisableThreadStorageSync =
     "tl.disable_thread_storage_sync";
 
+static constexpr const char *kDisableSunmmioPipeline =
+    "tl.disable_sunmmio_pipeline";
+
+static constexpr const char *kSunmmioPipelineMode = "tl.sunmmio_pipeline_mode";
+
+static constexpr const char *kSunmmioFaster = "tl.sunmmio_faster";
+
+static constexpr const char *kSunmmioILPStageShrink =
+    "tl.sunmmio_ilp_stage_shrink";
+
+static constexpr const char *kSunmmioILPMultiversionLifetimePruning =
+    "tl.sunmmio_ilp_multiversion_lifetime_pruning";
+
+static constexpr const char *kSunmmioILPModelTCBlockingIssue =
+    "tl.sunmmio_ilp_model_tc_blocking_issue";
+
 /*!
  * \brief Force inline Let bindings during simplification.
  *
