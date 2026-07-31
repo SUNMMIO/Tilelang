@@ -1,6 +1,5 @@
 import re
 import warnings
-from functools import wraps
 
 import pytest
 
@@ -8,23 +7,10 @@ import tilelang.utils.target as _target_utils
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm
-from tilelang.utils.target import determine_target
+from testing.python.sunmmio.common.compile_pipeline import target
 
 
 DTYPE = "float16"
-
-
-# TODO: Move this into a shared testing helper with testing/python/sunmmio/common/compile_pipeline.py.
-def target(target_name):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            with tvm.target.Target(determine_target(target_name, return_object=True)):
-                return func(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
 
 
 def _emit_copy_case(
