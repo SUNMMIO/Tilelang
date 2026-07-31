@@ -16,7 +16,9 @@ _make_zzz = tvm_ffi.get_global_func("tl.sunmmio.make_zzz")
 _make_nzz = tvm_ffi.get_global_func("tl.sunmmio.make_nzz")
 _make_mxzz = tvm_ffi.get_global_func("tl.sunmmio.make_mxzz")
 _make_mxznn = tvm_ffi.get_global_func("tl.sunmmio.make_mxznn")
+_make_mxznz = tvm_ffi.get_global_func("tl.sunmmio.make_mxznz")
 _make_mx_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_mx_row_major")
+_get_mx_scale_shape = tvm_ffi.get_global_func("tl.sunmmio.get_mx_scale_shape")
 
 
 def make_row_major(shape):
@@ -102,14 +104,22 @@ def make_mxzz_layout(shape_or_buffer, axes=None, dtype=None):
     return _make_mxzz(shape, axes, dtype)
 
 
-# 基于 make_zzn_layout改造来的 第一个z改为了zn,所以是 znzn
-def make_mxznn_layout(shape_or_buffer, axes=None, dtype=None):
-    """Create an MXZNN blockwise CuteLayout for non-transposed MX weights."""
+def _make_mxznn_layout(shape_or_buffer, axes=None, dtype=None):
+    """Create the internal WSRAM MXZNN CuteLayout used by GEMM inference."""
     shape, dtype = _normalize_shape_and_dtype(shape_or_buffer, dtype)
-    axes = _normalize_axes(axes, len(shape), "make_mxznn_layout")
+    axes = _normalize_axes(axes, len(shape), "_make_mxznn_layout")
     if dtype is None:
-        raise ValueError("make_mxznn_layout requires dtype when shape_or_buffer is not a buffer-like object")
+        raise ValueError("_make_mxznn_layout requires dtype when shape_or_buffer is not a buffer-like object")
     return _make_mxznn(shape, axes, dtype)
+
+
+def make_mxznz_layout(shape_or_buffer, axes=None, dtype=None):
+    """Create an MXZNZ blockwise CuteLayout for MX data staged before MXZNN."""
+    shape, dtype = _normalize_shape_and_dtype(shape_or_buffer, dtype)
+    axes = _normalize_axes(axes, len(shape), "make_mxznz_layout")
+    if dtype is None:
+        raise ValueError("make_mxznz_layout requires dtype when shape_or_buffer is not a buffer-like object")
+    return _make_mxznz(shape, axes, dtype)
 
 
 def make_mx_row_major_layout(shape_or_buffer, dtype=None):
@@ -118,3 +128,8 @@ def make_mx_row_major_layout(shape_or_buffer, dtype=None):
     if dtype is None:
         raise ValueError("make_mx_row_major_layout requires dtype when shape_or_buffer is not a buffer-like object")
     return _make_mx_row_major(shape, dtype)
+
+
+def get_mx_scale_shape(mx_layout, dtype):
+    """Return the logical scale buffer shape required by an MX layout."""
+    return tuple(_get_mx_scale_shape(mx_layout, dtype))

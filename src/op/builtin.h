@@ -277,6 +277,22 @@ TVM_DLL const Op &tma_load();
 TVM_DLL const Op &dma_copy();
 
 /*!
+ * \brief Physically copy data/scale buffers into an MX packed buffer.
+ *
+ * Arguments are buffer-region calls:
+ *   tl.mx_pack(data_region, scale_region, mx_region)
+ */
+TVM_DLL const Op &mx_pack();
+
+/*!
+ * \brief Physically copy data/scale buffers out of an MX packed buffer.
+ *
+ * Arguments are buffer-region calls:
+ *   tl.mx_unpack(mx_region, data_region, scale_region)
+ */
+TVM_DLL const Op &mx_unpack();
+
+/*!
  * \brief Re-block an RSRAM buffer between ZZ and row-major layout.
  *
  * Emitted by the SUNMMIO copy lowering path when a DRAM<->RSRAM copy has

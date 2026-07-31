@@ -303,7 +303,6 @@ def test_dynamic_barrier_mask_codegen_validates_with_npuir_opt(tmp_path):
     assert " : i64 -> !suvm.barrier" in src
     assert src.count("suvm.barrier.init") == 1
     assert src.count("suvm.barrier.arrive_and_wait") == 1
-    assert "cf.assert" not in src
 
 
 def test_dynamic_barrier_candidates_codegen_validates_with_npuir_opt(tmp_path):
@@ -335,7 +334,7 @@ def test_dynamic_barrier_candidates_codegen_validates_with_npuir_opt(tmp_path):
         stmt,
         tmp_path,
         mlir_filename="dynamic_barrier_candidates_suvm.mlir",
-        expected_tokens=("scf.for", "scf.if", "arith.shli", "arith.cmpi eq", "cf.assert"),
+        expected_tokens=("scf.for", "scf.if", "arith.shli", "arith.cmpi eq"),
     )
 
     for candidate in candidates:

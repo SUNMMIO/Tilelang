@@ -148,8 +148,8 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
   bool src_has = T.layout_map.count(src);
   bool dst_has = T.layout_map.count(dst);
 
-  // ZN/MXZNN WSRAM dst: its src is staged as ZZ/MXZZ (the transfer does
-  // ZZ->ZN or MXZZ->MXZNN), so infer the matching source layout. dst is
+  // ZN/MXZNN WSRAM dst: its src is staged as ZZ/MXZNZ (the transfer does
+  // ZZ->ZN or MXZNZ->MXZNN), so infer the matching source layout. dst is
   // already determined (from GEMM); propose nothing for it.
   if (dst_has && dst.scope() == kSunmmioScopeWSRAM &&
       !sunmmio::IsZZLike(T.layout_map[dst])) {
@@ -157,7 +157,7 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
     if (IsSunmmioSramScope(src.scope()) && rank >= 2) {
       Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
       Layout src_layout = sunmmio::IsMXDType(src->dtype)
-                              ? sunmmio::MakeMXZZ(src->shape, axes, src->dtype)
+                              ? sunmmio::MakeMXZNZ(src->shape, axes, src->dtype)
                               : sunmmio::MakeZZ(src->shape, axes,
                                                 GetSunmmioLayoutBlockShape(
                                                     T.target, src->dtype));

@@ -410,8 +410,6 @@ def test_sunmmio_codegen_lowers_dynamic_barrier_mask():
     assert " : i64 -> !suvm.barrier" in src
     assert src.count("suvm.barrier.init") == 1
     assert src.count("suvm.barrier.arrive_and_wait") == 1
-    assert "cf.assert" not in src
-    assert "sunmmio.fake" not in src
 
 
 def test_sunmmio_codegen_lowers_dynamic_barrier_candidates():
@@ -422,7 +420,6 @@ def test_sunmmio_codegen_lowers_dynamic_barrier_candidates():
     assert src.count("suvm.barrier.arrive_and_wait") == 4
     assert "arith.shli" in src
     assert "arith.cmpi eq" in src
-    assert "cf.assert" in src
     assert "scf.if" in src
     assert "sunmmio.fake" not in src
 

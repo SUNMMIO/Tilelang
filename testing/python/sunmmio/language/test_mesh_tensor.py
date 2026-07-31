@@ -211,7 +211,7 @@ def test_call_method_defaults_to_symbolic_mesh_config():
     assert result.buffer.dtype == "float32"
 
 
-# ─── Default row-major layout tests ──────────────────────────────────────
+# Default ZZ layout tests
 
 
 @pytest.mark.parametrize(
@@ -222,7 +222,7 @@ def test_call_method_defaults_to_symbolic_mesh_config():
         ((128, 256, 512), (2, 4), MeshShardingPolicy(replicate=MeshReplicationType.ALL)),
     ],
 )
-def test_default_row_major_layout(shape, device_mesh_config, policy):
+def test_default_zz_layout(shape, device_mesh_config, policy):
     proxy = MeshTensorProxy()
     nrows, ncols = device_mesh_config
 
@@ -238,19 +238,17 @@ def test_default_row_major_layout(shape, device_mesh_config, policy):
     assert "global_layout" in meta
     assert "sharded_layout" in meta
 
-    # Global layout should have dim_levels = (1, 1, ...) for row-major
+    # Rank >= 2 defaults to ZZ on the last two dimensions.
     import tvm_ffi
 
     _dim_levels = tvm_ffi.get_global_func("tl.CuteLayout_dim_levels")
-    global_dl = _dim_levels(meta["global_layout"])
-    assert len(global_dl) == len(shape)
-    for dl in global_dl:
-        assert dl == 1
+    _same_layout = tvm_ffi.get_global_func("tl.IsSameLayout")
+    expected_dim_levels = (1,) * (len(shape) - 2) + (2, 2)
 
-    sharded_dl = _dim_levels(meta["sharded_layout"])
-    assert len(sharded_dl) == len(shape)
-    for dl in sharded_dl:
-        assert dl == 1
+    assert tuple(int(v) for v in _dim_levels(meta["global_layout"])) == expected_dim_levels
+    assert tuple(int(v) for v in _dim_levels(meta["sharded_layout"])) == expected_dim_levels
+    assert _same_layout(meta["global_layout"], make_zz_layout(shape))
+    assert _same_layout(meta["sharded_layout"], make_zz_layout(sharded_shape))
 
 
 # ─── Layout parameter tests ─────────────────────────────────────────────

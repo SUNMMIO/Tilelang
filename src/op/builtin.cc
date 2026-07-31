@@ -148,6 +148,12 @@ TIR_DEFINE_TL_BUILTIN(create_list_of_mbarrier)
 TIR_DEFINE_TL_BUILTIN(dma_copy).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(mx_pack).set_num_inputs(3).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
+TIR_DEFINE_TL_BUILTIN(mx_unpack).set_num_inputs(3).set_attr<TCallEffectKind>(
+    "TCallEffectKind", Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(sunmmio_layout_transform)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
