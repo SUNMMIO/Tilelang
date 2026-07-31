@@ -1,4 +1,5 @@
 #include "../op/builtin.h"
+#include "../op/comm.h"
 #include "../op/utils.h"
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
@@ -42,6 +43,18 @@ namespace bank_ilp_internal {
 using namespace tir;
 
 enum class Role : uint8_t { kConsumer, kProducer, kBoth, kUndefined };
+
+struct BankFlipMode {
+  bool wsram_flip{true};
+  bool asram_flip{true};
+
+  bool FlipForMem(int mem) const {
+    ICHECK(mem == 0 || mem == 1);
+    return mem == 0 ? wsram_flip : asram_flip;
+  }
+
+  int Id() const { return (wsram_flip ? 2 : 0) | (asram_flip ? 1 : 0); }
+};
 
 struct AccessInfo {
   BufferRegion region;
@@ -117,6 +130,9 @@ struct SolveResult {
   std::vector<int> y;
   std::vector<int> internal_flow_ids;
   std::vector<int> z_bank;
+  BankFlipMode bank_flip_mode;
+  bool tc_blocking_issue_modeled{true};
+  int tc_blocking_issue_constraints{0};
 };
 
 struct SolutionVerifyResult {
@@ -671,11 +687,12 @@ std::map<int, int> BuildSlotRhoMap(int start_slot, int duration, int ii) {
 ConflictType AnalyzeWriteReadConflict(int write_start_slot, int write_dur,
                                       int write_parity_flip,
                                       int read_start_slot, int read_dur,
-                                      int read_parity_flip, int ii) {
+                                      int read_parity_flip, int ii, bool flip) {
   std::map<int, int> write_rho;
   for (int step = 0; step < write_dur; ++step) {
     int slot = (write_start_slot + step) % ii;
-    write_rho[slot] = WrapBit(write_start_slot, slot) ^ write_parity_flip;
+    write_rho[slot] =
+        flip ? (WrapBit(write_start_slot, slot) ^ write_parity_flip) : 0;
   }
 
   bool saw_same = false;
@@ -685,7 +702,8 @@ ConflictType AnalyzeWriteReadConflict(int write_start_slot, int write_dur,
     auto it = write_rho.find(slot);
     if (it == write_rho.end())
       continue;
-    int read_rho = WrapBit(read_start_slot, slot) ^ read_parity_flip;
+    int read_rho =
+        flip ? (WrapBit(read_start_slot, slot) ^ read_parity_flip) : 0;
     if (it->second == read_rho) {
       saw_same = true;
     } else {
@@ -725,7 +743,7 @@ ConflictType AnalyzePrecolorConflict(const FlowSpec &lhs, const FlowSpec &rhs) {
 ConflictType AnalyzeFlowConflict(const FlowSpec &write_flow,
                                  int write_start_time,
                                  const FlowSpec &read_flow, int read_start_time,
-                                 int ii) {
+                                 int ii, const BankFlipMode &mode) {
   ConflictType precolor = AnalyzePrecolorConflict(write_flow, read_flow);
   if (write_flow.write_resource < 0 || read_flow.read_resource < 0 ||
       write_flow.mem != read_flow.mem) {
@@ -735,7 +753,8 @@ ConflictType AnalyzeFlowConflict(const FlowSpec &write_flow,
       PositiveMod(write_start_time + write_flow.w_off, ii), write_flow.w_dur,
       ((write_start_time + write_flow.w_off) / ii) & 1,
       PositiveMod(read_start_time + read_flow.r_off, ii), read_flow.r_dur,
-      ((read_start_time + read_flow.r_off) / ii) & 1, ii);
+      ((read_start_time + read_flow.r_off) / ii) & 1, ii,
+      mode.FlipForMem(write_flow.mem));
   return MergeConflictRequirements(port, precolor);
 }
 
@@ -876,8 +895,9 @@ SolutionVerifyResult VerifySolution(const Problem &prob,
         continue;
       int z_read = sol.z_bank[it_b->second];
       int read_start_time = sol.t[read_flow.cons] + read_flow.delta * sol.II;
-      ConflictType conflict = AnalyzeFlowConflict(
-          write_flow, write_start_time, read_flow, read_start_time, sol.II);
+      ConflictType conflict =
+          AnalyzeFlowConflict(write_flow, write_start_time, read_flow,
+                              read_start_time, sol.II, sol.bank_flip_mode);
       if (conflict == ConflictType::kNeedDifferent && z_write == z_read) {
         fail(&result.bank_port_ok,
              "bank port conflict requires different banks between flow " +
@@ -916,6 +936,12 @@ void WriteSolutionJson(
   out << "{\n";
   out << "  \"ii\": " << sol.II << ",\n";
   out << "  \"makespan\": " << sol.makespan << ",\n";
+  out << "  \"wsram_flip\": " << sol.bank_flip_mode.wsram_flip << ",\n";
+  out << "  \"asram_flip\": " << sol.bank_flip_mode.asram_flip << ",\n";
+  out << "  \"tc_blocking_issue_modeled\": " << sol.tc_blocking_issue_modeled
+      << ",\n";
+  out << "  \"tc_blocking_issue_constraints\": "
+      << sol.tc_blocking_issue_constraints << ",\n";
   out << "  \"bank_slot_period\": "
       << (sol.bank_slot_period > 0 ? sol.bank_slot_period : (2 * sol.II))
       << ",\n";
@@ -1618,6 +1644,32 @@ public:
       : id(id), name("cmd_" + std::to_string(id)), stmt(stmt) {}
 };
 
+const CallNode *GetSingleBroadcastCall(const Stmt &stmt) {
+  const CallNode *broadcast = nullptr;
+  PostOrderVisit(stmt, [&](const ObjectRef &obj) {
+    const auto *call = obj.as<CallNode>();
+    if (call && call->op.same_as(Op::Get("tl.broadcast_"))) {
+      ICHECK(broadcast == nullptr)
+          << "A pipeline statement may contain at most one broadcast leaf";
+      broadcast = call;
+    }
+  });
+  return broadcast;
+}
+
+bool IsAllGatherBroadcast(const TemplateCommand &cmd) {
+  const CallNode *call = GetSingleBroadcastCall(cmd.stmt);
+  if (!call) {
+    return false;
+  }
+  ICHECK(call->args.size() == static_cast<size_t>(kBroadcastArgCount) ||
+         call->args.size() == static_cast<size_t>(kBroadcastArgCount + 1))
+      << "tl.broadcast_ expects its fixed arguments and optional src_core";
+  // Before sync-token injection, a broadcast with only the fixed arguments is
+  // issued by every core and therefore implements an all-gather collective.
+  return call->args.size() == static_cast<size_t>(kBroadcastArgCount);
+}
+
 bool IsCopyStage(const TemplateCommand &cmd) {
   bool has_shared_write = false;
   bool has_global_read = false;
@@ -1938,8 +1990,8 @@ std::vector<Buffer> DetectRuntimeMultiversionBuffers(
     const std::map<std::string, int> &runtime_bank_start_phases,
     const std::map<std::string, int> &runtime_bank_read_delta_parities,
     const std::map<std::string, std::map<int, int>> &runtime_bank_writer_phases,
-    const std::map<std::string, std::map<int, int>>
-        &runtime_bank_reader_phases) {
+    const std::map<std::string, std::map<int, int>> &runtime_bank_reader_phases,
+    const std::map<std::string, int> &runtime_bank_flip_modes) {
   // Runtime versions follow the selected logical iteration count.  In
   // particular, stage shrinking changes this value independently of the
   // schedule span ceil(makespan / II).
@@ -1950,7 +2002,8 @@ std::vector<Buffer> DetectRuntimeMultiversionBuffers(
     banked_candidates.insert(buffer.get());
   }
   for (const Buffer &buffer : versioned_buffers) {
-    int version_count = banked_candidates.count(buffer.get())
+    bool is_banked = banked_candidates.count(buffer.get()) != 0;
+    int version_count = is_banked
                             ? RuntimeBankedVersionCount(buffer, iterations)
                             : RuntimeVersionCount(buffer, iterations);
     if (version_count > 1) {
@@ -1976,6 +2029,12 @@ std::vector<Buffer> DetectRuntimeMultiversionBuffers(
       return -1;
     }
     int phase = 0;
+    bool flip = true;
+    auto it_flip = runtime_bank_flip_modes.find(buffer->name);
+    if (it_flip != runtime_bank_flip_modes.end()) {
+      flip = it_flip->second != 0;
+    }
+    int iter_phase = flip ? command_iter : 0;
     const auto &phase_maps =
         is_write ? runtime_bank_writer_phases : runtime_bank_reader_phases;
     auto it_buffer = phase_maps.find(buffer->name);
@@ -1983,7 +2042,7 @@ std::vector<Buffer> DetectRuntimeMultiversionBuffers(
       auto it_phase = it_buffer->second.find(cmd_id);
       if (it_phase != it_buffer->second.end()) {
         phase = it_phase->second;
-        return PositiveMod(command_iter + phase, 2);
+        return PositiveMod(iter_phase + phase, 2);
       }
     }
     auto it_start = runtime_bank_start_phases.find(buffer->name);
@@ -1996,7 +2055,7 @@ std::vector<Buffer> DetectRuntimeMultiversionBuffers(
         phase += it_delta->second;
       }
     }
-    return PositiveMod(command_iter + phase, 2);
+    return PositiveMod(iter_phase + phase, 2);
   };
 
   int max_iter_offset = 0;
@@ -2376,12 +2435,17 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
                                   int iter_mod,
                                   const std::vector<Buffer> &versioned_buffers,
                                   const Var &pipeline_loop_var,
-                                  Problem *problem) {
+                                  const BankFlipMode &mode, Problem *problem) {
   std::unordered_set<const BufferNode *> versioned;
+  std::unordered_set<const BufferNode *> banked_versioned;
   std::unordered_set<const BufferNode *> bank_rotating_versioned;
   for (const Buffer &buffer : versioned_buffers) {
     versioned.insert(buffer.get());
-    if (GetPingPongMemoryKind(buffer) >= 0) {
+    int mem = GetPingPongMemoryKind(buffer);
+    if (mem >= 0) {
+      banked_versioned.insert(buffer.get());
+    }
+    if (mem >= 0 && mode.FlipForMem(mem)) {
       bank_rotating_versioned.insert(buffer.get());
     }
   }
@@ -2417,7 +2481,7 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
   std::map<std::pair<int, int>, int> access_phases;
   for (const Buffer &buffer : versioned_buffers) {
     const BufferNode *buf = buffer.get();
-    if (!bank_rotating_versioned.count(buf)) {
+    if (!banked_versioned.count(buf)) {
       continue;
     }
     std::vector<int> writer_ids;
@@ -2508,7 +2572,9 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
       }
       if (producer_phase >= 0) {
         access_phases[{cmd.id, access_idx}] =
-            (producer_phase + producer_iter_delta) & 1;
+            (producer_phase +
+             (bank_rotating_versioned.count(buf) ? producer_iter_delta : 0)) &
+            1;
       }
     }
   }
@@ -2758,12 +2824,17 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
     }
     int logical_iter = command.iter + access.iter_offset;
     auto phase = access_phases.find({command.template_id, access_idx});
-    if (phase == access_phases.end() || mod < 2) {
+    if (!banked_versioned.count(buf)) {
       return PositiveMod(logical_iter, mod);
     }
-    int versions_per_bank = mod / 2;
-    int bank = PositiveMod(logical_iter + phase->second, 2);
-    int version_in_bank = PositiveMod(logical_iter / 2, versions_per_bank);
+    int bank_phase = phase == access_phases.end() ? 0 : phase->second;
+    bool flip = bank_rotating_versioned.count(buf) != 0;
+    int versions_per_bank = CeilDiv(mod, 2);
+    int bank = flip ? PositiveMod(logical_iter + bank_phase, 2)
+                    : PositiveMod(bank_phase, 2);
+    int version_in_bank = flip
+                              ? PositiveMod(logical_iter / 2, versions_per_bank)
+                              : PositiveMod(logical_iter, versions_per_bank);
     return version_in_bank * 2 + bank;
   };
 
@@ -2872,6 +2943,25 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
           materialize_access(curr_cmd, access), curr_idx, access_idx,
           access.is_write ? AccessType::kWrite : AccessType::kRead});
     }
+  }
+
+  // Every core executes an all-gather broadcast and enters its participant
+  // barrier before issuing the mcast.  Row and column collectives can use
+  // different ODMA engines and buffers, so ordinary resource and data hazards
+  // do not preserve a common barrier encounter order across cores.  Chain the
+  // collectives in template order, including the loop-carried last-to-first
+  // edge, while keeping their commands and bank precolor constraints separate.
+  std::vector<int> all_gather_ids;
+  for (const TemplateCommand &cmd : commands) {
+    if (IsAllGatherBroadcast(cmd)) {
+      all_gather_ids.push_back(cmd.id);
+    }
+  }
+  for (size_t i = 1; i < all_gather_ids.size(); ++i) {
+    maybe_record_edge(all_gather_ids[i - 1], all_gather_ids[i], 0);
+  }
+  if (all_gather_ids.size() > 1) {
+    maybe_record_edge(all_gather_ids.back(), all_gather_ids.front(), 1);
   }
 
   for (const auto &kv : best_delta) {
@@ -3049,8 +3139,37 @@ void AddConditionalParity(Highs &highs, HighsInt z_write, HighsInt z_read,
   AddLeq(highs, idx, lower, -required_xor + 8.0);
 }
 
+void AddConditionalBankRelation(Highs &highs, HighsInt z_write, HighsInt z_read,
+                                HighsInt x_prod,
+                                const std::vector<HighsInt> &x_cons,
+                                int required_xor) {
+  ICHECK(required_xor == 0 || required_xor == 1);
+  std::vector<HighsInt> idx{z_write, z_read, x_prod};
+  std::vector<double> first;
+  std::vector<double> second;
+  double first_rhs = 0.0;
+  double second_rhs = 0.0;
+  if (required_xor == 0) {
+    first = {1.0, -1.0, 1.0};
+    second = {-1.0, 1.0, 1.0};
+    first_rhs = second_rhs = 2.0;
+  } else {
+    first = {1.0, 1.0, 1.0};
+    second = {-1.0, -1.0, 1.0};
+    first_rhs = 3.0;
+    second_rhs = 1.0;
+  }
+  for (HighsInt x : x_cons) {
+    idx.push_back(x);
+    first.push_back(1.0);
+    second.push_back(1.0);
+  }
+  AddLeq(highs, idx, first, first_rhs);
+  AddLeq(highs, idx, second, second_rhs);
+}
+
 ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
-                     int threads) {
+                     int threads, const BankFlipMode &mode) {
   highs.clear();
   highs.setOptionValue("output_flag", true);
   highs.setOptionValue("log_to_console", true);
@@ -3236,6 +3355,7 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
         continue;
       if (write_flow.mem != read_flow.mem)
         continue;
+      bool flip = mode.FlipForMem(write_flow.mem);
 
       for (int prod_slot = 0; prod_slot < II; ++prod_slot) {
         std::vector<int> diff_cons_slots;
@@ -3248,8 +3368,8 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
               PositiveMod(cons_slot + read_flow.delta * II + read_flow.r_off,
                           II),
               read_flow.r_dur,
-              (cons_slot + read_flow.delta * II + read_flow.r_off) / II & 1,
-              II);
+              (cons_slot + read_flow.delta * II + read_flow.r_off) / II & 1, II,
+              flip);
           if (conflict == ConflictType::kNone)
             continue;
           if (conflict == ConflictType::kNeedDifferent) {
@@ -3272,8 +3392,13 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
           for (int cons_slot : diff_cons_slots) {
             x_cons.push_back(vars.col_x[read_flow.cons][cons_slot]);
           }
-          AddConditionalParity(highs, z_write_ping, z_read_ping, write_parity,
-                               read_parity, x_prod, x_cons, 1);
+          if (flip) {
+            AddConditionalParity(highs, z_write_ping, z_read_ping, write_parity,
+                                 read_parity, x_prod, x_cons, 1);
+          } else {
+            AddConditionalBankRelation(highs, z_write_ping, z_read_ping, x_prod,
+                                       x_cons, 1);
+          }
         }
 
         if (!same_cons_slots.empty()) {
@@ -3281,8 +3406,13 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
           for (int cons_slot : same_cons_slots) {
             x_cons.push_back(vars.col_x[read_flow.cons][cons_slot]);
           }
-          AddConditionalParity(highs, z_write_ping, z_read_ping, write_parity,
-                               read_parity, x_prod, x_cons, 0);
+          if (flip) {
+            AddConditionalParity(highs, z_write_ping, z_read_ping, write_parity,
+                                 read_parity, x_prod, x_cons, 0);
+          } else {
+            AddConditionalBankRelation(highs, z_write_ping, z_read_ping, x_prod,
+                                       x_cons, 0);
+          }
         }
 
         if (!impossible_cons_slots.empty()) {
@@ -3311,13 +3441,47 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
 }
 
 SolveResult SolveFixedII(const Problem &prob, int II, bool optimize_t,
-                         int threads) {
+                         int threads, const BankFlipMode &mode) {
   auto solve_begin = std::chrono::steady_clock::now();
   LOG(INFO) << "[ILP] start solve II=" << II << " optimize_t=" << optimize_t
             << " N=" << prob.N << " edges=" << prob.dep_edges.size()
             << " flows=" << prob.flows.size();
   Highs highs;
-  ModelVars vars = BuildModel(highs, prob, II, optimize_t, threads);
+  ModelVars vars = BuildModel(highs, prob, II, optimize_t, threads, mode);
+  bool model_tc_blocking_issue =
+      tvm::transform::PassContext::Current()
+          ->GetConfig<Bool>(tl::kSunmmioILPModelTCBlockingIssue, Bool(true))
+          .value();
+  int tc_issue_constraint_count = 0;
+  if (model_tc_blocking_issue) {
+    std::vector<int> tc_commands;
+    std::unordered_set<int> tc_set;
+    for (int cmd = 0; cmd < prob.N; ++cmd) {
+      if (CommandUsesResource(prob.P[cmd],
+                              static_cast<int>(IlpResourceType::kTensorCore))) {
+        tc_commands.push_back(cmd);
+        tc_set.insert(cmd);
+      }
+    }
+    if (!tc_commands.empty()) {
+      for (int slot = 0; slot < II; ++slot) {
+        std::vector<HighsInt> idx;
+        std::vector<double> val;
+        for (int cmd = 0; cmd < prob.N; ++cmd) {
+          idx.push_back(vars.col_x[cmd][slot]);
+          val.push_back(tc_set.count(cmd) ? 1.0 - double(prob.N) : 1.0);
+        }
+        for (int tc : tc_commands) {
+          idx.push_back(vars.col_a[tc][slot]);
+          val.push_back(double(prob.N));
+        }
+        AddLeq(highs, idx, val, double(prob.N));
+        ++tc_issue_constraint_count;
+      }
+    }
+  }
+  LOG(INFO) << "[II=" << II
+            << "] TC blocking-issue constraints=" << tc_issue_constraint_count;
   highs.run();
   if (highs.getModelStatus() != HighsModelStatus::kOptimal) {
     auto solve_end = std::chrono::steady_clock::now();
@@ -3333,6 +3497,9 @@ SolveResult SolveFixedII(const Problem &prob, int II, bool optimize_t,
   res.ok = true;
   res.II = II;
   res.bank_slot_period = 2 * II;
+  res.bank_flip_mode = mode;
+  res.tc_blocking_issue_modeled = model_tc_blocking_issue;
+  res.tc_blocking_issue_constraints = tc_issue_constraint_count;
   if (!optimize_t) {
     auto solve_end = std::chrono::steady_clock::now();
     double elapsed =
@@ -3361,10 +3528,17 @@ SolveResult SolveFixedII(const Problem &prob, int II, bool optimize_t,
   return res;
 }
 
-SolveResult FindMinimalII(const Problem &prob, int threads) {
+SolveResult FindMinimalIIForMode(const Problem &prob, int threads,
+                                 const BankFlipMode &mode, int max_ii = -1) {
   int lb = std::max(1, ResourceLowerBound(prob));
   int search_begin = std::max(1, lb);
   int search_end = std::max(search_begin, std::max(1, prob.Tmax));
+  if (max_ii > 0) {
+    search_end = std::min(search_end, max_ii);
+  }
+  if (search_end < search_begin) {
+    return {};
+  }
   constexpr int kInitialWindowSpan = 10;
   int best_ii = -1;
   LOG(INFO) << "[ILP] search start=" << search_begin << " end=" << search_end
@@ -3380,7 +3554,7 @@ SolveResult FindMinimalII(const Problem &prob, int threads) {
     while (l <= r) {
       int mid = (l + r) / 2;
       LOG(INFO) << "[ILP] try feasible-only II=" << mid;
-      SolveResult feas = SolveFixedII(prob, mid, false, threads);
+      SolveResult feas = SolveFixedII(prob, mid, false, threads, mode);
       if (feas.ok) {
         window_best = mid;
         LOG(INFO) << "[ILP] feasible II=" << mid;
@@ -3399,8 +3573,36 @@ SolveResult FindMinimalII(const Problem &prob, int threads) {
     LOG(INFO) << "[ILP] no feasible II found";
     return {};
   }
-  LOG(INFO) << "[ILP] best feasible II=" << best_ii << ", optimize makespan";
-  return SolveFixedII(prob, best_ii, true, threads);
+  LOG(INFO) << "[ILP] best feasible II=" << best_ii << " mode=" << mode.Id();
+  return SolveFixedII(prob, best_ii, false, threads, mode);
+}
+
+BankFlipMode GuessBankFlipMode(const Problem &prob) {
+  auto guess_for_mem = [&](int mem) {
+    int write_resource = GetMemoryWriteResource(mem);
+    int read_resource = GetMemoryReadResource(mem);
+    int write_count = 0;
+    int read_count = 0;
+    int write_time = 0;
+    int read_time = 0;
+    for (const CommandSpec &spec : prob.P) {
+      if (CommandUsesResource(spec, write_resource)) {
+        ++write_count;
+        write_time += spec.latency;
+      }
+      if (CommandUsesResource(spec, read_resource)) {
+        ++read_count;
+        read_time += spec.latency;
+      }
+    }
+    // Bank rotation normally follows the input-side command parity.  Only let
+    // output-side parity decide when output occupancy clearly dominates input.
+    constexpr int kOutDominanceRatio = 2;
+    bool use_output =
+        read_time > kOutDominanceRatio * static_cast<long long>(write_time);
+    return ((use_output ? read_count : write_count) & 1) != 0;
+  };
+  return {guess_for_mem(/*mem=*/0), guess_for_mem(/*mem=*/1)};
 }
 
 class SunmmioPipelinePlannerILP : public StmtExprMutator {
@@ -3463,13 +3665,15 @@ private:
     std::map<std::string, int> runtime_bank_read_delta_parities;
     std::map<std::string, std::map<int, int>> runtime_bank_writer_phases;
     std::map<std::string, std::map<int, int>> runtime_bank_reader_phases;
+    std::map<std::string, int> runtime_bank_flip_modes;
     int iterations{0};
     bool graph_valid{false};
   };
 
   IlpLoopAnalysis AnalyzeLoop(const For &loop,
                               const SeqStmtNode *pipeline_body_seq,
-                              int forced_iterations = -1) {
+                              int forced_iterations = -1,
+                              const BankFlipMode &mode = BankFlipMode{}) {
     IlpLoopAnalysis result;
     bool export_only = GetEnvBool("TL_SUNMMIO_ILP_EXPORT_ONLY", false);
     int num_stages = -1;
@@ -3594,12 +3798,13 @@ private:
     result.runtime_bank_read_delta_parities.clear();
     result.runtime_bank_writer_phases.clear();
     result.runtime_bank_reader_phases.clear();
+    result.runtime_bank_flip_modes.clear();
     result.prob.versioned_buffer_names.clear();
     for (const Buffer &buffer : result.versioned_buffers) {
       result.prob.versioned_buffer_names.push_back(buffer->name);
     }
     BuildTemplateDependencyGraph(result.commands, num_stages,
-                                 result.versioned_buffers, loop->loop_var,
+                                 result.versioned_buffers, loop->loop_var, mode,
                                  &result.prob);
     result.graph_valid = ValidateProblemGraph(result.commands, result.prob);
     return result;
@@ -3609,6 +3814,63 @@ private:
     IlpLoopAnalysis analysis;
     SolveResult sol;
   };
+
+  StageShrinkResult
+  FindMinimalIIAcrossFlipModes(const For &loop,
+                               const SeqStmtNode *pipeline_body_seq,
+                               int threads, int forced_iterations = -1) {
+    IlpLoopAnalysis seed =
+        AnalyzeLoop(loop, pipeline_body_seq, forced_iterations);
+    // Try every physical-bank rotation policy.  Both modes allocate
+    // ceil(iterations / 2) versions per bank.  Flip advances the version every
+    // two iterations while rotating banks; non-flip advances the version on
+    // every iteration while keeping its precolored bank fixed.
+    BankFlipMode guessed_mode = GuessBankFlipMode(seed.prob);
+    std::vector<BankFlipMode> modes{guessed_mode};
+    for (const BankFlipMode &mode :
+         {BankFlipMode{true, true}, BankFlipMode{true, false},
+          BankFlipMode{false, true}, BankFlipMode{false, false}}) {
+      if (mode.Id() != guessed_mode.Id()) {
+        modes.push_back(mode);
+      }
+    }
+    int forced_mode = GetEnvInt("TL_SUNMMIO_ILP_FORCE_BANK_FLIP_MODE", -1);
+    if (forced_mode >= 0) {
+      ICHECK_LT(forced_mode, 4)
+          << "TL_SUNMMIO_ILP_FORCE_BANK_FLIP_MODE must be in [0, 3]";
+      modes = {BankFlipMode{(forced_mode & 2) != 0, (forced_mode & 1) != 0}};
+    }
+
+    StageShrinkResult best;
+    for (size_t index = 0; index < modes.size(); ++index) {
+      const BankFlipMode &mode = modes[index];
+      IlpLoopAnalysis candidate_analysis =
+          AnalyzeLoop(loop, pipeline_body_seq, forced_iterations, mode);
+      if (!candidate_analysis.graph_valid) {
+        continue;
+      }
+      SolveResult candidate;
+      if (!best.sol.ok || index == 0) {
+        candidate =
+            FindMinimalIIForMode(candidate_analysis.prob, threads, mode);
+      } else if (best.sol.II > 1) {
+        SolveResult probe = SolveFixedII(candidate_analysis.prob,
+                                         best.sol.II - 1, false, threads, mode);
+        if (probe.ok) {
+          candidate = FindMinimalIIForMode(candidate_analysis.prob, threads,
+                                           mode, best.sol.II - 1);
+        }
+      }
+      if (candidate.ok && (!best.sol.ok || candidate.II < best.sol.II)) {
+        best.analysis = std::move(candidate_analysis);
+        best.sol = std::move(candidate);
+      }
+    }
+    if (!best.sol.ok) {
+      return {std::move(seed), {}};
+    }
+    return best;
+  }
 
   bool ShouldEnableStageShrink() const {
     auto pass_ctx = tvm::transform::PassContext::Current();
@@ -3649,44 +3911,38 @@ private:
   StageShrinkResult SolveWithStageShrink(const For &loop,
                                          const SeqStmtNode *pipeline_body_seq,
                                          int threads) {
-    IlpLoopAnalysis base_analysis = AnalyzeLoop(loop, pipeline_body_seq);
+    StageShrinkResult mode_result =
+        FindMinimalIIAcrossFlipModes(loop, pipeline_body_seq, threads);
+    IlpLoopAnalysis base_analysis = std::move(mode_result.analysis);
+    SolveResult base_sol = std::move(mode_result.sol);
     MaybeExportProblemJsonForStage(base_analysis.prob, debug_,
-                                   base_analysis.iterations);
-    SolveResult base_sol = FindMinimalII(base_analysis.prob, threads);
-    ExportStageSolutionIfRequested(base_analysis, base_sol,
                                    base_analysis.iterations);
     if (!base_sol.ok) {
       return {std::move(base_analysis), std::move(base_sol)};
     }
 
     int best_iterations = base_analysis.iterations;
+    BankFlipMode fixed_mode = base_sol.bank_flip_mode;
     for (int candidate_iterations = base_analysis.iterations - 1;
          candidate_iterations >= 1; --candidate_iterations) {
-      IlpLoopAnalysis candidate_analysis =
-          AnalyzeLoop(loop, pipeline_body_seq, candidate_iterations);
+      IlpLoopAnalysis candidate_analysis = AnalyzeLoop(
+          loop, pipeline_body_seq, candidate_iterations, fixed_mode);
       MaybeExportProblemJsonForStage(candidate_analysis.prob, debug_,
                                      candidate_iterations);
-      SolveResult feas =
-          SolveFixedII(candidate_analysis.prob, base_sol.II, false, threads);
+      SolveResult feas = SolveFixedII(candidate_analysis.prob, base_sol.II,
+                                      false, threads, fixed_mode);
       if (!feas.ok) {
         continue;
       }
-      SolveResult candidate_sol =
-          SolveFixedII(candidate_analysis.prob, base_sol.II, true, threads);
-      ExportStageSolutionIfRequested(candidate_analysis, candidate_sol,
-                                     candidate_iterations);
       best_iterations = candidate_iterations;
     }
 
-    if (best_iterations == base_analysis.iterations) {
-      return {std::move(base_analysis), std::move(base_sol)};
-    }
-
     IlpLoopAnalysis final_analysis =
-        AnalyzeLoop(loop, pipeline_body_seq, best_iterations);
+        AnalyzeLoop(loop, pipeline_body_seq, best_iterations, fixed_mode);
     MaybeExportProblemJsonForStage(final_analysis.prob, debug_,
                                    final_analysis.iterations);
-    SolveResult final_sol = FindMinimalII(final_analysis.prob, threads);
+    SolveResult final_sol = SolveFixedII(final_analysis.prob, base_sol.II, true,
+                                         threads, fixed_mode);
     ExportStageSolutionIfRequested(final_analysis, final_sol,
                                    final_analysis.iterations);
     return {std::move(final_analysis), std::move(final_sol)};
@@ -3725,6 +3981,8 @@ private:
       ICHECK(phase_offset == 0 || phase_offset == 1)
           << "ILP bank phase offset must be binary for flow " << flow.prod
           << " -> " << flow.cons;
+      analysis->runtime_bank_flip_modes[flow.buffer_name] =
+          sol.bank_flip_mode.FlipForMem(flow.mem) ? 1 : 0;
       bool allow_resident_to_own_bank =
           flow.resident && !has_non_resident_flow.count(flow.buffer_name);
       // Keep per-op bank metadata as the primary source of truth. A single
@@ -3750,7 +4008,8 @@ private:
                 << ". Per-op bank metadata will be used instead.";
           }
         }
-        int delta_parity = flow.delta & 1;
+        int delta_parity =
+            sol.bank_flip_mode.FlipForMem(flow.mem) ? (flow.delta & 1) : 0;
         auto it_delta =
             analysis->runtime_bank_read_delta_parities.find(flow.buffer_name);
         if (it_delta == analysis->runtime_bank_read_delta_parities.end()) {
@@ -3780,9 +4039,10 @@ private:
         }
       }
       if (flow.cons >= 0 && flow.read_resource >= 0) {
-        int reader_phase_offset = flow.resident
-                                      ? phase_offset
-                                      : ((phase_offset + (flow.delta & 1)) & 1);
+        int reader_phase_offset =
+            flow.resident || !sol.bank_flip_mode.FlipForMem(flow.mem)
+                ? phase_offset
+                : ((phase_offset + (flow.delta & 1)) & 1);
         ICHECK(reader_phase_offset == 0 || reader_phase_offset == 1);
         auto &reader_map =
             analysis->runtime_bank_reader_phases[flow.buffer_name];
@@ -3850,6 +4110,7 @@ private:
         analysis->runtime_bank_read_delta_parities.erase(buffer->name);
         analysis->runtime_bank_writer_phases.erase(buffer->name);
         analysis->runtime_bank_reader_phases.erase(buffer->name);
+        analysis->runtime_bank_flip_modes.erase(buffer->name);
       }
     }
     analysis->runtime_banked_buffers = std::move(pruned_banked_buffers);
@@ -3907,10 +4168,14 @@ private:
       analysis = std::move(shrink_result.analysis);
       sol = std::move(shrink_result.sol);
     } else {
-      analysis = AnalyzeLoop(loop, pipeline_body_seq);
+      StageShrinkResult mode_result =
+          FindMinimalIIAcrossFlipModes(loop, pipeline_body_seq, threads);
+      analysis = std::move(mode_result.analysis);
+      SolveResult min_ii = std::move(mode_result.sol);
       MaybeExportProblemJson(analysis.prob, debug_);
-      if (analysis.graph_valid) {
-        sol = FindMinimalII(analysis.prob, threads);
+      if (min_ii.ok) {
+        sol = SolveFixedII(analysis.prob, min_ii.II, true, threads,
+                           min_ii.bank_flip_mode);
       }
     }
     if (!analysis.graph_valid) {
@@ -3997,7 +4262,7 @@ private:
         analysis.runtime_bank_start_phases,
         analysis.runtime_bank_read_delta_parities,
         analysis.runtime_bank_writer_phases,
-        analysis.runtime_bank_reader_phases);
+        analysis.runtime_bank_reader_phases, analysis.runtime_bank_flip_modes);
     annotations.Set("iterations", Integer(analysis.iterations));
     annotations.Set("ii", Integer(sol.II));
     annotations.Set("makespan", Integer(sol.makespan));
@@ -4008,15 +4273,18 @@ private:
     auto command_priority = [&](int id) {
       const CommandSpec &spec = analysis.prob.P[id];
       if (CommandUsesResource(spec,
-                              static_cast<int>(IlpResourceType::kTensorCore))) {
+                              static_cast<int>(IlpResourceType::kODMA1))) {
         return 0;
       }
       if (CommandUsesResource(spec,
-                              static_cast<int>(IlpResourceType::kODMA1))) {
+                              static_cast<int>(IlpResourceType::kODMA0))) {
         return 1;
       }
+      // ODMA launch is asynchronous, while tmma.mm blocks the scalar issue
+      // stream until the tensor command completes.  Submit same-time async
+      // work first so it can overlap the blocking tensor command.
       if (CommandUsesResource(spec,
-                              static_cast<int>(IlpResourceType::kODMA0))) {
+                              static_cast<int>(IlpResourceType::kTensorCore))) {
         return 2;
       }
       if (CommandUsesResource(spec,
@@ -4046,7 +4314,12 @@ private:
       if (a.absolute_start != b.absolute_start) {
         return a.absolute_start < b.absolute_start;
       }
-      return starts_earlier_and_resource_priority(a.id, b.id);
+      int a_priority = command_priority(a.id);
+      int b_priority = command_priority(b.id);
+      if (a_priority != b_priority) {
+        return a_priority < b_priority;
+      }
+      return a.id < b.id;
     };
 
     std::sort(window_orders.prologue.begin(), window_orders.prologue.end(),
@@ -4134,6 +4407,14 @@ private:
       runtime_bank_reader_phases.Set(buffer, per_op);
     }
     annotations.Set("runtime_bank_reader_phases", runtime_bank_reader_phases);
+    Map<Buffer, PrimExpr> runtime_bank_flip_modes;
+    for (const Buffer &buffer : analysis.runtime_banked_buffers) {
+      auto it = analysis.runtime_bank_flip_modes.find(buffer->name);
+      if (it != analysis.runtime_bank_flip_modes.end()) {
+        runtime_bank_flip_modes.Set(buffer, Integer(it->second));
+      }
+    }
+    annotations.Set("runtime_bank_flip_modes", runtime_bank_flip_modes);
 
     Stmt body = this->VisitStmt(op->body);
     For new_loop = loop;

@@ -1,0 +1,160 @@
+"""Focused planning and injection coverage for the SunMMIO ILP pipeline."""
+
+import json
+import os
+from contextlib import contextmanager
+from pathlib import Path
+
+import pytest
+import tilelang as tl
+from tilelang import tvm
+from tilelang.utils.target import SUNMMIO_TARGET_DESC
+from tvm import tir
+
+from testing.python.transform.sunmmio_mesh_kernel_new_syntax_reference import (
+    mesh_ffn_new,
+    mesh_flashattn_new,
+    mesh_matmul_new,
+)
+from testing.python.transform.test_tilelang_transform_sunmmio_pipeline_strict import (
+    lower_and_legalize_sunmmio_pipeline_test,
+)
+
+
+CASES = {
+    "gemm": lambda num_stages: mesh_matmul_new(1024, 1024, 1024, 128, 128, 32, num_stages=num_stages),
+    "flashattn": lambda num_stages: mesh_flashattn_new(num_stages=num_stages),
+    "ffn": lambda num_stages: mesh_ffn_new(num_stages=num_stages),
+}
+
+
+@contextmanager
+def _scoped_env(updates):
+    old = {key: os.environ.get(key) for key in updates}
+    os.environ.update({key: str(value) for key, value in updates.items()})
+    try:
+        yield
+    finally:
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _pipeline_loops(stmt):
+    loops = []
+
+    def visit(node):
+        if node is None:
+            return
+        if isinstance(node, tir.For):
+            if node.annotations and "tl.sunmmio.pipeline.requested" in node.annotations:
+                loops.append(node)
+            visit(node.body)
+        elif isinstance(node, tir.BlockRealize):
+            visit(node.block.body)
+        elif isinstance(node, tir.Block):
+            visit(node.body)
+        elif isinstance(node, tir.SeqStmt):
+            for child in node.seq:
+                visit(child)
+        elif isinstance(node, tir.IfThenElse):
+            visit(node.then_case)
+            visit(node.else_case)
+        elif isinstance(node, (tir.AttrStmt, tir.LetStmt)):
+            visit(node.body)
+
+    visit(stmt)
+    return loops
+
+
+def _lower(case_name, num_stages):
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        func = CASES[case_name](num_stages).with_attr("global_symbol", "main")
+        mod = tvm.IRModule.from_expr(func)
+        mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+        return tl.transform.IfStmtBinding()(mod)
+
+
+def _output_dir(tmp_path, case_name, num_stages, shrink):
+    configured_root = os.environ.get("SUNMMIO_ILP_PASS_TEST_OUTPUT")
+    root = Path(configured_root) if configured_root else tmp_path
+    return root / case_name / f"stage{num_stages}_shrink_{'on' if shrink else 'off'}"
+
+
+def _write_ir(path, mod):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(mod.script(show_meta=True).strip() + "\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("case_name", CASES, ids=CASES)
+@pytest.mark.parametrize("num_stages", (2, 3), ids=lambda value: f"stage{value}")
+@pytest.mark.parametrize("shrink", (False, True), ids=("no_shrink", "shrink"))
+def test_sunmmio_pipeline_ilp_planning_matrix(tmp_path, case_name, num_stages, shrink):
+    """Plan 3 kernels at stages 2/3 with stage shrinking both disabled/enabled."""
+    output_dir = _output_dir(tmp_path, case_name, num_stages, shrink)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    problem_path = output_dir / "ilp_problem.json"
+    solution_path = output_dir / "ilp_solution.json"
+
+    mod = _lower(case_name, num_stages)
+    _write_ir(output_dir / "00_before_planning.py", mod)
+    with (
+        tl.transform.PassContext(config={tl.PassConfigKey.TL_SUNMMIO_ILP_STAGE_SHRINK: shrink}),
+        _scoped_env(
+            {
+                "TL_SUNMMIO_FASTER": "200",
+                "TL_SUNMMIO_ILP_PROBLEM_JSON": problem_path,
+                "TL_SUNMMIO_ILP_SOLUTION_JSON": solution_path,
+            }
+        ),
+    ):
+        planned = tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
+    _write_ir(output_dir / "01_after_planning.py", planned)
+
+    loops = _pipeline_loops(planned["main"].body)
+    assert loops
+    for loop in loops:
+        annotations = loop.annotations
+        assert bool(annotations["tl.sunmmio.pipeline.requested"])
+        assert bool(annotations["tl.sunmmio.pipeline.applied"])
+        assert str(annotations["tl.sunmmio.pipeline.mode"]) == "ilp"
+        iterations = int(annotations["iterations"])
+        assert 1 <= iterations <= num_stages
+        if not shrink:
+            assert iterations == num_stages
+        assert annotations["body_orders"]
+        assert "runtime_bank_flip_modes" in annotations
+
+    problem_paths = sorted(output_dir.glob("ilp_problem*.json"))
+    assert problem_paths
+    assert solution_path.is_file()
+    solution = json.loads(solution_path.read_text(encoding="utf-8"))
+    assert int(solution["ii"]) > 0
+    assert solution["nodes"]
+    assert solution["flows"]
+
+
+def test_sunmmio_pipeline_ilp_inject_ffn_stage2():
+    """Exercise the injector separately on FFN's two collective pipelines."""
+    mod = _lower("ffn", 2)
+    with tl.transform.PassContext(config={tl.PassConfigKey.TL_SUNMMIO_ILP_STAGE_SHRINK: False}):
+        planned = tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
+        injected = tl.transform.InjectSunmmioPipelineILP()(planned)
+
+    assert len(_pipeline_loops(planned["main"].body)) == 2
+    script = injected.script(show_meta=True)
+    assert '"tl.sunmmio.pipeline.fallback_reason"' not in script
+    assert "_ping" in script
+    assert "_pong" in script
+    assert script.count("T.mma_sunmmio(") >= 2
+    broadcasts = []
+    tir.stmt_functor.post_order_visit(
+        injected["main"].body,
+        lambda node: broadcasts.append(node)
+        if isinstance(node, tir.Call) and isinstance(node.op, tvm.ir.Op) and node.op.name == "tl.broadcast_"
+        else None,
+    )
+    assert len(broadcasts) >= 4

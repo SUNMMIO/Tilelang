@@ -80,6 +80,28 @@ public:
   }
 };
 
+static bool HasRepeatedCollectiveDestination(const SeqStmtNode *body) {
+  std::unordered_set<const BufferNode *> destinations;
+  for (const Stmt &stmt : body->seq) {
+    bool repeated = false;
+    PostOrderVisit(stmt, [&](const ObjectRef &obj) {
+      const auto *call = obj.as<CallNode>();
+      if (!call || !call->op.same_as(Op::Get("tl.broadcast_"))) {
+        return;
+      }
+      const BufferNode *destination =
+          NormalizeToBufferRegion(call->args[1])->buffer.get();
+      if (!destinations.insert(destination).second) {
+        repeated = true;
+      }
+    });
+    if (repeated) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * \brief Pure data container representing an instruction in the pipeline.
  * It separates the AST analysis from scheduling and latency calculation.
@@ -1639,6 +1661,11 @@ public:
     const SeqStmtNode *pipeline_body_seq = inner_stmt.as<SeqStmtNode>();
     ICHECK(pipeline_body_seq) << "Pipeline body must be a SeqStmt";
     ICHECK(op->kind == ForKind::kSerial) << "Pipeline loop must be serial";
+    if (HasRepeatedCollectiveDestination(pipeline_body_seq)) {
+      For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+      return MakePipelineFallback(fallback, "greedy", "planning",
+                                  "repeated_collective_destination");
+    }
 
     // 3. Stage 1: Build the PipelineInstruction containers
     std::vector<PipelineInstruction> single_iteration_instructions;

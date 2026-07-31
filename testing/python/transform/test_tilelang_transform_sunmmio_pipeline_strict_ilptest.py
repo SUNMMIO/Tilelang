@@ -543,8 +543,8 @@ STRICT_CASES = [
         {
             "KV_shared_ping": [64, 512],
             "KV_shared_pong": [64, 512],
-            "KV_shared2_ping": [3, 64, 512],
-            "KV_shared2_pong": [3, 64, 512],
+            "KV_shared2_ping": [64, 512],
+            "KV_shared2_pong": [64, 512],
             "K_pe_shared_ping": [64, 64],
             "K_pe_shared_pong": [64, 64],
             "S_shared_ping": [64, 64],
@@ -574,7 +574,7 @@ def test_tilelang_transform_sunmmio_pipeline_strict_ilptest(
 
     annotations = _extract_pipeline_annotations(planned["main"].body)
     assert annotations is not None, case_name
-    expected_runtime_multiversion = ["KV_shared2"] if case_name == "flashmladecode2" else []
+    expected_runtime_multiversion = ["scores_max_prev"] if case_name == "flashmladecode2" else []
     assert _annotation_buffer_names(annotations, "runtime_multiversion_buffers") == expected_runtime_multiversion, case_name
     assert len(_annotation_buffer_names(annotations, "runtime_banked_buffers")) > 0, case_name
 
@@ -611,15 +611,15 @@ def test_per_op_phase_offsets_select_matching_region_banks():
         assert annotations is not None
         writer_offsets = annotations["runtime_bank_writer_phases"]
         reader_offsets = annotations["runtime_bank_reader_phases"]
+        flip_modes = annotations["runtime_bank_flip_modes"]
         a_buffer = next(buffer for buffer in writer_offsets if buffer.name == "A_shared")
-        assert {int(op): int(offset) for op, offset in writer_offsets[a_buffer].items()} == {
-            1: 0,
-            4: 1,
-        }
-        assert {int(op): int(offset) for op, offset in reader_offsets[a_buffer].items()} == {
-            3: 0,
-            5: 1,
-        }
+        writer_phases = {int(op): int(offset) for op, offset in writer_offsets[a_buffer].items()}
+        reader_phases = {int(op): int(offset) for op, offset in reader_offsets[a_buffer].items()}
+        assert writer_phases.keys() == {1, 4}
+        assert reader_phases.keys() == {3, 5}
+        assert writer_phases[1] == reader_phases[3]
+        assert writer_phases[4] == reader_phases[5]
+        assert writer_phases[1] != writer_phases[4]
 
         injected = tl.transform.InjectSunmmioPipelineILP()(planned)
         script = injected.script(show_meta=True)
@@ -632,12 +632,17 @@ def test_per_op_phase_offsets_select_matching_region_banks():
         even_branch = "\n".join(_stmt_script(stmt) for stmt in steady_body.seq[:body_order_count])
         odd_branch = "\n".join(_stmt_script(stmt) for stmt in steady_body.seq[body_order_count:])
 
-        # op4 writes and op5 reads phase offset 1 at logical iteration k + 1.
-        # Therefore (logical_iter + phase) is even for even k and selects ping.
-        assert "T.region(A_shared_ping[0, 0], 2, 128, 32), 1024" in even_branch
-        assert "T.region(A_shared_ping[0, 0], 1, 128, 32)" in even_branch
-        assert "T.region(A_shared_pong[0, 0], 2, 128, 32), 1024" in odd_branch
-        assert "T.region(A_shared_pong[0, 0], 1, 128, 32)" in odd_branch
+        flip = bool(int(flip_modes[a_buffer]))
+        # op4 uses logical iteration k + 1. In no-flip mode its phase is fixed;
+        # in flip mode the logical iteration parity is XORed into that phase.
+        even_bank_index = writer_phases[4] ^ (1 if flip else 0)
+        odd_bank_index = writer_phases[4]
+        even_bank = "ping" if even_bank_index == 0 else "pong"
+        odd_bank = "ping" if odd_bank_index == 0 else "pong"
+        assert f"T.region(A_shared_{even_bank}[0, 0], 2, 128, 32), 1024" in even_branch
+        assert f"T.region(A_shared_{even_bank}[0, 0], 1, 128, 32)" in even_branch
+        assert f"T.region(A_shared_{odd_bank}[0, 0], 2, 128, 32), 1024" in odd_branch
+        assert f"T.region(A_shared_{odd_bank}[0, 0], 1, 128, 32)" in odd_branch
 
         # Global A/B regions are not banked, but their loop indices must still
         # be rewritten from the removed pipeline loop to the steady-state loop.

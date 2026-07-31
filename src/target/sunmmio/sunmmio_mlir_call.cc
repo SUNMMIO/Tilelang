@@ -584,7 +584,7 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
 
     auto copy_op = mlir::suvm::CopyAsyncOp::create(
         ctx_.builder, type.MakeDebugLoc("dma_copy"), src, dst,
-        mlir::suvm::OdmaChannelAttr{});
+        mlir::suvm::PadModeAttr{}, mlir::suvm::OdmaChannelAttr{});
 
     ICHECK(!result_name.empty()) << "tl.dma_copy expects a token result";
     ICHECK(copy_op && copy_op->getNumResults() == 1)

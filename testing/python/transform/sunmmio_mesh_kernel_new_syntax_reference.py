@@ -36,6 +36,7 @@ from tilelang.language.mesh_tensor import MeshReplicationType
 from tilelang.layout import make_zz_layout, make_row_major
 from testing.python.sunmmio.common.compile_pipeline import target
 
+
 @target("Sunmmio")
 def ilp(
     M=128,
@@ -91,7 +92,6 @@ def ilp(
                     T.copy(C_shared, C[by * block_M, bx * block_N])
 
     return main
-
 
 
 @target("Sunmmio")
@@ -166,6 +166,99 @@ def mesh_matmul_new(
                         )
                         T.gemm(A_shared, B_shared, C_shared)
                     T.copy(C_shared, C[bx * block_M, by * block_N])
+
+    return main
+
+
+@target("Sunmmio")
+def mesh_ffn_new(
+    seq=128,
+    hidden=512,
+    inner_dim=512,
+    block_seq=32,
+    block_hidden=32,
+    block_inner=32,
+    num_stages=2,
+    dtype="bfloat16",
+    accum_dtype="float",
+):
+    """Small two-projection FFN used by the SunMMIO pipeline pass tests."""
+    activation_policy = T.MeshShardingPolicy(y=0, x=1)
+    weight_policy = T.MeshShardingPolicy(y=0, x=1)
+
+    x_shape = (seq, hidden)
+    up_weight_shape = (hidden, inner_dim)
+    mid_shape = (seq, inner_dim)
+    down_weight_shape = (inner_dim, hidden)
+
+    @T.prim_func
+    def main(
+        X: T.MeshTensor(x_shape, activation_policy, dtype, layout=make_zz_layout(x_shape)),
+        WUp: T.MeshTensor(
+            up_weight_shape,
+            weight_policy,
+            dtype,
+            layout=make_zz_layout(up_weight_shape),
+        ),
+        WDown: T.MeshTensor(
+            down_weight_shape,
+            weight_policy,
+            dtype,
+            layout=make_zz_layout(down_weight_shape),
+        ),
+        Mid: T.MeshTensor(mid_shape, activation_policy, dtype, layout=make_zz_layout(mid_shape)),
+        Y: T.MeshTensor(x_shape, activation_policy, accum_dtype, layout=make_zz_layout(x_shape)),
+    ):
+        with T.Kernel(T.mesh_ncores()):
+            lhs_local = T.alloc_shared((block_seq, block_hidden), dtype, scope="shared.rsram")
+            up_local = T.alloc_shared((block_hidden, block_inner), dtype, scope="shared.rsram")
+            lhs_shared = T.alloc_shared((block_seq, block_hidden * T.mesh_ncols()), dtype)
+            up_shared = T.alloc_shared((block_hidden * T.mesh_nrows(), block_inner), dtype)
+            mid_acc = T.alloc_shared((block_seq, block_inner), accum_dtype, scope="shared.rsram")
+            mid_tile = T.alloc_shared((block_seq, block_inner), dtype, scope="shared.rsram")
+
+            mid_local = T.alloc_shared((block_seq, block_inner), dtype, scope="shared.rsram")
+            down_local = T.alloc_shared((block_inner, block_hidden), dtype, scope="shared.rsram")
+            mid_shared = T.alloc_shared((block_seq, block_inner * T.mesh_ncols()), dtype)
+            down_shared = T.alloc_shared((block_inner * T.mesh_nrows(), block_hidden), dtype)
+            out_acc = T.alloc_shared((block_seq, block_hidden), accum_dtype, scope="shared.rsram")
+
+            hidden_blocks = T.ceildiv(X.local_shape[1], block_hidden)
+            inner_blocks = T.ceildiv(Mid.local_shape[1], block_inner)
+            for bm in T.serial(T.ceildiv(X.local_shape[0], block_seq)):
+                for bn in T.serial(inner_blocks):
+                    T.clear(mid_acc)
+                    for bk in T.Pipelined(hidden_blocks, num_stages=num_stages):
+                        T.copy(
+                            X[bm * block_seq : (bm + 1) * block_seq, bk * block_hidden : (bk + 1) * block_hidden],
+                            lhs_local,
+                        )
+                        T.copy(
+                            WUp[bk * block_hidden : (bk + 1) * block_hidden, bn * block_inner : (bn + 1) * block_inner],
+                            up_local,
+                        )
+                        T.comm.all_gather(lhs_local, lhs_shared, direction="horizontal", axis=-1)
+                        T.comm.all_gather(up_local, up_shared, direction="vertical", axis=0)
+                        T.gemm(lhs_shared, up_shared, mid_acc)
+                    for i, j in T.Tiles(mid_tile, parallel=True):
+                        mid_tile[i, j] = T.Cast(dtype, T.max(mid_acc[i, j], T.float32(0)))
+                    T.copy(mid_tile, Mid[bm * block_seq, bn * block_inner])
+
+                for bh in T.serial(hidden_blocks):
+                    T.clear(out_acc)
+                    for bn in T.Pipelined(inner_blocks, num_stages=num_stages):
+                        T.copy(
+                            Mid[bm * block_seq : (bm + 1) * block_seq, bn * block_inner : (bn + 1) * block_inner],
+                            mid_local,
+                        )
+                        T.copy(
+                            WDown[bn * block_inner : (bn + 1) * block_inner, bh * block_hidden : (bh + 1) * block_hidden],
+                            down_local,
+                        )
+                        T.comm.all_gather(mid_local, mid_shared, direction="horizontal", axis=-1)
+                        T.comm.all_gather(down_local, down_shared, direction="vertical", axis=0)
+                        T.gemm(mid_shared, down_shared, out_acc)
+                    T.copy(out_acc, Y[bm * block_seq, bh * block_hidden])
 
     return main
 
@@ -307,7 +400,6 @@ def mesh_flashdecoding_new(
     shape_k = [batch, seqlen_kv, kv_heads, dim]
     shape_v = [batch, seqlen_kv, kv_heads, dim]
     shape_o = [batch, heads, dim]
-    kv_group_num = heads // kv_heads
     assert heads % kv_heads == 0, "GQA requires kv_heads to divide heads"
 
     @T.prim_func

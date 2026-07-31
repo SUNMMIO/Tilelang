@@ -101,6 +101,7 @@ inline bool IsPipelineScheduleAnnotation(const String &key) {
       "runtime_bank_read_delta_parities",
       "runtime_bank_writer_phases",
       "runtime_bank_reader_phases",
+      "runtime_bank_flip_modes",
   };
   return keys.count(std::string(key)) != 0;
 }
