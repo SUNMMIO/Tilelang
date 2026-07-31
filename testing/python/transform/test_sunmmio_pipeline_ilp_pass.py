@@ -155,3 +155,26 @@ def test_sunmmio_pipeline_ilp_planning_matrix(tmp_path, case_name, num_stages, s
     assert int(solution["ii"]) > 0
     assert solution["nodes"]
     assert solution["flows"]
+
+
+def test_sunmmio_pipeline_ilp_inject_ffn_stage2():
+    """Exercise the injector separately on FFN's two collective pipelines."""
+    mod = _lower("ffn", 2)
+    with tl.transform.PassContext(config={tl.PassConfigKey.TL_SUNMMIO_ILP_STAGE_SHRINK: False}):
+        planned = tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
+        injected = tl.transform.InjectSunmmioPipelineILP()(planned)
+
+    assert len(_pipeline_loops(planned["main"].body)) == 2
+    script = injected.script(show_meta=True)
+    assert '"tl.sunmmio.pipeline.fallback_reason"' not in script
+    assert "_ping" in script
+    assert "_pong" in script
+    assert script.count("T.mma_sunmmio(") >= 2
+    broadcasts = []
+    tir.stmt_functor.post_order_visit(
+        injected["main"].body,
+        lambda node: broadcasts.append(node)
+        if isinstance(node, tir.Call) and isinstance(node.op, tvm.ir.Op) and node.op.name == "tl.broadcast_"
+        else None,
+    )
+    assert len(broadcasts) >= 4
