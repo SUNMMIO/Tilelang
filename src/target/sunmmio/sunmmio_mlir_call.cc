@@ -720,8 +720,9 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.mma_sunmmio") {
-    ICHECK_EQ(operands.size(), 3)
-        << "tl.mma_sunmmio expects A/B/C tile views as operands";
+    ICHECK_EQ(operands.size(), 4)
+        << "tl.mma_sunmmio expects A/B/C tile views and an accumulate "
+           "condition as operands";
 
     mlir::Value a = ctx_.LookupMLIRValue(operands[0].value);
     ICHECK(a) << "Missing MLIR activation tile view for tl.mma_sunmmio `"
@@ -741,23 +742,24 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     auto c_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(c.getType());
     ICHECK(c_ty) << "tl.mma_sunmmio expects accumulator to be a suvm.tile_view";
 
+    mlir::Value accumulate = ctx_.LookupMLIRValue(operands[3].value);
+    ICHECK(accumulate)
+        << "Missing MLIR accumulate condition for tl.mma_sunmmio `"
+        << operands[3].value << "`";
+    accumulate = type.EnsureI1(accumulate);
+
     bool trans_a =
         require_bool_attr(SunMMIOCallAttrKey::kTransA, "tl.mma_sunmmio transA");
     ICHECK(!trans_a)
         << "tl.mma_sunmmio lowering to suvm.tc.mma does not support transA";
     bool trans_b =
         require_bool_attr(SunMMIOCallAttrKey::kTransB, "tl.mma_sunmmio transB");
-    bool clear_accum = require_bool_attr(SunMMIOCallAttrKey::kClearAccum,
-                                         "tl.mma_sunmmio clearAccum");
-
-    mlir::UnitAttr acc_attr =
-        clear_accum ? mlir::UnitAttr() : ctx_.builder.getUnitAttr();
     mlir::UnitAttr trans_attr =
         trans_b ? ctx_.builder.getUnitAttr() : mlir::UnitAttr();
 
-    auto mma_op = mlir::suvm::TcMmaOp::create(ctx_.builder,
-                                              type.MakeDebugLoc("mma_sunmmio"),
-                                              c, a, w, c, acc_attr, trans_attr);
+    auto mma_op = mlir::suvm::TcMmaOp::create(
+        ctx_.builder, type.MakeDebugLoc("mma_sunmmio"), c, a, w, c, accumulate,
+        trans_attr);
 
     ICHECK(!result_name.empty()) << "tl.mma_sunmmio expects a token result";
     ICHECK(mma_op && mma_op->getNumResults() == 1)

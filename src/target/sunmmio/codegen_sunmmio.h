@@ -34,7 +34,6 @@ constexpr const char *kTokenId = "token_id";
 constexpr const char *kDirection = "direction";
 constexpr const char *kTransA = "trans_a";
 constexpr const char *kTransB = "trans_b";
-constexpr const char *kClearAccum = "clear_accum";
 constexpr const char *kParticipantMask = "participant_mask";
 constexpr const char *kCandidateMasks = "candidate_masks";
 constexpr const char *kBarrierMaskKey = "barrier_mask_key";
