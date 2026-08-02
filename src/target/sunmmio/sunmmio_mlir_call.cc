@@ -669,6 +669,11 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
       auto mcast_op = mlir::suvm::MulticastTokOp::create(
           ctx_.builder, type.MakeDebugLoc("broadcast"), src, dst, mask,
           direction, mlir::suvm::OdmaChannelAttr{});
+      ICHECK(succeeded(mcast_op.verify()))
+          << "tl.broadcast_ generated an invalid suvm.mcast_tok";
+      ICHECK(
+          succeeded(mcast_op.verifyWithDeviceArch(mlir::suvm::DeviceArch::a4e)))
+          << "tl.broadcast_ violates A4E multicast data-path constraints";
       return mcast_op->getResult(0);
     };
 
