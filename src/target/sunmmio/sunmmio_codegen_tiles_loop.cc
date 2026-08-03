@@ -1850,6 +1850,9 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     ICHECK_LT(loop_axis, scope.domain_values.size());
     auto execution_axis = GetExecutionAxisAnnotation(loop);
     if (!execution_axis.has_value()) {
+      // Tiles lowering replaces the complete source extent with the
+      // materialized domain value instead of recursively lowering it.
+      MarkVisitedExprTree(loop->extent);
       return scope.domain_values[loop_axis];
     }
     ICHECK_GE(execution_axis.value(), 0);
@@ -1858,8 +1861,12 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     ICHECK_LT(static_cast<size_t>(execution_axis.value()),
               scope.tile_shape.size());
     int domain_axis = scope.execution_domain_axes[execution_axis.value()];
-    return ceildiv_index(domain_value(domain_axis),
-                         scope.tile_shape[execution_axis.value()]);
+    SunMMIOValue extent = ceildiv_index(
+        domain_value(domain_axis), scope.tile_shape[execution_axis.value()]);
+    // The synthesized ceildiv is the lowering result for the complete source
+    // extent, whose child expressions therefore do not enter EvalExpr.
+    MarkVisitedExprTree(loop->extent);
+    return extent;
   };
 
   auto build_full_tile_condition = [&]() {
@@ -1891,6 +1898,9 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     }
     ICHECK(result.has_value())
         << "Full-tile condition requires at least one execution axis";
+    // The full-tile predicate is rebuilt from domain metadata, replacing the
+    // complete source predicate rather than recursively lowering its children.
+    MarkVisitedExprTree(scope.tail_predicate);
     return result.value();
   };
 

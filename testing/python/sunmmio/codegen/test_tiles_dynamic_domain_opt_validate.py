@@ -55,7 +55,8 @@ def dynamic_rank2_domain_kernel(h=4, matrix_size=32, dtype=T.float32):
     return main
 
 
-def test_dynamic_rank2_domain_is_materialized_once(tmp_path):
+def test_dynamic_rank2_domain_is_materialized_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT", "1")
     src = validate_sunmmio_codegen_with_npuir_opt(
         dynamic_rank2_domain_kernel(),
         tmp_path,

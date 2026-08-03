@@ -51,7 +51,8 @@ def dynamic_rank1_tail_mask_kernel(vector_size=512, dtype=T.float32):
     return main
 
 
-def test_dynamic_rank1_tail_uses_axis_mask(tmp_path):
+def test_dynamic_rank1_tail_uses_axis_mask(tmp_path, monkeypatch):
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT", "1")
     src = validate_sunmmio_codegen_with_npuir_opt(
         dynamic_rank1_tail_mask_kernel(dtype=T.bfloat16),
         tmp_path,
