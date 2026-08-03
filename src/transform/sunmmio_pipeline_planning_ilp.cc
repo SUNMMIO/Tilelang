@@ -1,3 +1,6 @@
+// Builds an ILP model that schedules a SunMMIO pipeline while respecting
+// command dependencies, hardware-resource capacities, and SRAM bank conflicts.
+
 #include "../op/builtin.h"
 #include "../op/comm.h"
 #include "../op/utils.h"
@@ -70,6 +73,15 @@ struct CommandSpec {
   std::string name;
 };
 
+// A FlowSpec is one logical lifetime of data in WSRAM (mem == 0) or ASRAM
+// (mem == 1).  It connects the command that produces the data to the command
+// that consumes it, possibly in a later logical iteration (delta).  The
+// write/read offsets and durations describe the exact bank-occupancy windows
+// relative to those command starts.  resident flows enter the loop already
+// live and may have a fixed physical bank; non-resident flows are assigned a
+// ping/pong phase by the ILP.  precolor records a bank relation known before
+// solving, while fp and initial_time carry the phase/lifetime information used
+// to compare resident and loop-internal data.
 struct FlowSpec {
   bool resident{false};
   int prod{-1};
@@ -95,6 +107,12 @@ SameWriteFlowKey MakeSameWriteFlowKey(const FlowSpec &flow) {
   return std::make_tuple(flow.prod, flow.mem);
 }
 
+// Complete scheduling problem for one template iteration.  P contains the N
+// hardware commands; dep_edges and delta encode producer-to-consumer ordering
+// across logical iterations; R/cap describe execution resources and their
+// parallel capacities.  flows adds the physical SRAM-bank lifetimes that are
+// not expressible as ordinary command dependencies.  The solver folds this
+// infinite periodic schedule into an initiation-interval-sized time window.
 struct Problem {
   int N{0};
   int Tmax{0};
@@ -351,6 +369,15 @@ TryGCDWithOptionalBumps(const std::vector<std::pair<int, int>> &items,
 std::pair<int, std::vector<int>>
 AutoSelectSunmmioILPFaster(const std::vector<CommandSpec> &specs,
                            int target_upper = 69) {
+  // HiGHS works on integral time slots, but raw cost-model latencies can make
+  // the modulo model unnecessarily large.  Scale time using the most heavily
+  // occupied resource because its total latency gives the dominant lower bound
+  // on II.  A latency may be increased by one only when that makes every
+  // command on the bottleneck exactly divisible by the scale factor; this is a
+  // conservative timing quantization, never an optimistic shortening.
+  // Formally, L_r = sum_{i uses r} d_i selects r* = argmax_r L_r.  For a
+  // candidate scale f and bump b_i in {0, 1}, the model uses
+  // d'_i = ceil((d_i + b_i) / f), with b_i = 1 only if f divides d_i + 1.
   auto usage = BuildResourceUsage(specs);
   auto totals = BuildResourceTotals(usage);
   auto [target_resource, target_total] = FindTargetResource(totals);
@@ -376,6 +403,9 @@ AutoSelectSunmmioILPFaster(const std::vector<CommandSpec> &specs,
     std::unordered_set<int> bump_indices(bump_vec.begin(), bump_vec.end());
     int target_scaled_total =
         ScaledTotalForResource(specs, target_resource, faster, bump_indices);
+    // Rounding each latency independently can change which resource is the
+    // bottleneck.  Reject such a factor: the search bound and model size must
+    // remain anchored to the resource selected from the unscaled problem.
     bool violations = false;
     for (const auto &kv : totals) {
       int scaled_total =
@@ -390,6 +420,11 @@ AutoSelectSunmmioILPFaster(const std::vector<CommandSpec> &specs,
     }
   }
 
+  // Exact factorization is not always possible.  A common divisor preserves
+  // all relative integral durations; optional +1 bumps rescue near-divisible
+  // cost estimates while keeping the scaled bottleneck below target_upper.
+  // The fallback chooses g >= ceil(L_r* / target_upper) and replaces each
+  // latency with (d_i + b_i) / g, so the reduced model remains integral.
   auto [gcd_value, bump_vec] = TryGCDWithOptionalBumps(
       usage[target_resource], target_total, target_upper);
   return {std::max(1, gcd_value), bump_vec};
@@ -2594,148 +2629,6 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
     return iter_mod;
   };
 
-#if 0
-  /*
-   * Old direct-search implementation kept for reference.
-   *
-   * It stays at template granularity and searches backward for the nearest
-   * conflicting access while using access-level iter_offset to decide whether
-   * two accesses alias the same physical version.
-   *
-   * The active implementation below instead expands the steady-state body
-   * across `num_stages` iterations, replays RAW/WAR/WAW on the expanded
-   * stream, and then compresses the result back to template-level
-   * `(src_id, dst_id, delta)` edges.
-   */
-  auto compatible_version = [&](const BufferNode* buf, int src_iter_offset,
-                                int dst_iter_offset, int delta) {
-    if (!versioned.count(buf) || iter_mod <= 0) {
-      return true;
-    }
-    return PositiveMod(src_iter_offset, iter_mod) ==
-           PositiveMod(delta + dst_iter_offset, iter_mod);
-  };
-
-  auto regions_conflict = [&](const AccessInfo& src_access,
-                              const AccessInfo& dst_access, int delta) {
-    BufferRegion src_region =
-        MaterializeBufferRegion(src_access.region, pipeline_loop_var, /*iter=*/0);
-    BufferRegion dst_region =
-        MaterializeBufferRegion(dst_access.region, pipeline_loop_var, /*iter=*/delta);
-    return PipelineRegionIntersect(src_region->region, dst_region->region);
-  };
-
-  auto maybe_record_edge_old = [&](int src_id, int dst_id, int delta) {
-    if (delta < 0) {
-      return;
-    }
-    std::pair<int, int> key{src_id, dst_id};
-    auto it = best_delta.find(key);
-    if (it == best_delta.end() || delta < it->second) {
-      best_delta[key] = delta;
-    }
-  };
-
-  auto maybe_record_flow_old = [&](int src_id, int dst_id, const BufferNode* buf,
-                                   int src_access_idx, int dst_access_idx,
-                                   int mem) {
-    if (mem < 0 || src_id == dst_id) {
-      return;
-    }
-    int write_resource = GetMemoryWriteResource(mem);
-    int read_resource = GetMemoryReadResource(mem);
-    if (!CommandUsesResource(problem->P[src_id], write_resource) ||
-        !CommandUsesResource(problem->P[dst_id], read_resource)) {
-      return;
-    }
-    auto flow_key =
-        std::make_tuple(src_id, dst_id, buf, src_access_idx, dst_access_idx);
-    if (seen_flow_keys.insert(flow_key).second) {
-      int delta = 0;
-      auto edge_it = best_delta.find({src_id, dst_id});
-      if (edge_it != best_delta.end()) {
-        delta = edge_it->second;
-      }
-      problem->flows.push_back(
-          MakeInternalFlowSpec(*problem, src_id, dst_id, delta, mem, buf->name));
-    }
-  };
-
-  int max_delta_to_search = std::max(1, iter_mod);
-  for (int dst_id = 0; dst_id < static_cast<int>(commands.size()); ++dst_id) {
-    const TemplateCommand& dst_cmd = commands[dst_id];
-    for (int dst_access_idx = 0;
-         dst_access_idx < static_cast<int>(dst_cmd.accesses.size());
-         ++dst_access_idx) {
-      const AccessInfo& dst_access = dst_cmd.accesses[dst_access_idx];
-      const BufferNode* buf = dst_access.buffer().get();
-
-      if (!dst_access.is_write) {
-        bool found = false;
-        for (int delta = 0; delta <= max_delta_to_search && !found; ++delta) {
-          int src_id = (delta == 0) ? (dst_id - 1)
-                                    : (static_cast<int>(commands.size()) - 1);
-          for (; src_id >= 0 && !found; --src_id) {
-            const TemplateCommand& src_cmd = commands[src_id];
-            for (int src_access_idx =
-                     static_cast<int>(src_cmd.accesses.size()) - 1;
-                 src_access_idx >= 0; --src_access_idx) {
-              const AccessInfo& src_access = src_cmd.accesses[src_access_idx];
-              if (!src_access.is_write || src_access.buffer().get() != buf) {
-                continue;
-              }
-              if (!compatible_version(buf, src_access.iter_offset,
-                                      dst_access.iter_offset, delta)) {
-                continue;
-              }
-              if (!regions_conflict(src_access, dst_access, delta)) {
-                continue;
-              }
-              maybe_record_edge_old(src_id, dst_id, delta);
-              maybe_record_flow_old(src_id, dst_id, buf, src_access_idx,
-                                    dst_access_idx,
-                                    GetPingPongMemoryKind(dst_access.buffer()));
-              found = true;
-              break;
-            }
-          }
-        }
-        continue;
-      }
-
-      bool stop_on_prior_write = false;
-      for (int delta = 0; delta <= max_delta_to_search && !stop_on_prior_write;
-           ++delta) {
-        int src_id = (delta == 0) ? (dst_id - 1)
-                                  : (static_cast<int>(commands.size()) - 1);
-        for (; src_id >= 0 && !stop_on_prior_write; --src_id) {
-          const TemplateCommand& src_cmd = commands[src_id];
-          for (int src_access_idx =
-                   static_cast<int>(src_cmd.accesses.size()) - 1;
-               src_access_idx >= 0; --src_access_idx) {
-            const AccessInfo& src_access = src_cmd.accesses[src_access_idx];
-            if (src_access.buffer().get() != buf) {
-              continue;
-            }
-            if (!compatible_version(buf, src_access.iter_offset,
-                                    dst_access.iter_offset, delta)) {
-              continue;
-            }
-            if (!regions_conflict(src_access, dst_access, delta)) {
-              continue;
-            }
-            maybe_record_edge_old(src_id, dst_id, delta);
-            if (src_access.is_write) {
-              stop_on_prior_write = true;
-              break;
-            }
-          }
-        }
-      }
-    }
-  }
-#endif
-
   auto maybe_record_edge = [&](int src_id, int dst_id, int delta) {
     if (delta < 0) {
       return;
@@ -3170,6 +3063,16 @@ void AddConditionalBankRelation(Highs &highs, HighsInt z_write, HighsInt z_read,
 
 ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
                      int threads, const BankFlipMode &mode) {
+  // Variable meanings for command i and modulo slot s:
+  //   t[i] = absolute start time in the representative schedule window
+  //   m[i] = t[i] mod II, selected by one-hot x[i][s]
+  //   y[i] = floor(t[i] / II) = 2*y_half[i] + start_parity[i]
+  //   a[i][s] = number of folded copies of command i occupying slot s
+  //   z[v] = ping/pong bank phase assigned to data flow v
+  //   T = makespan.  Feasibility searches leave T unpriced; the final solve
+  //       minimizes it for the already-minimal II.
+  // Domains: t_i,y_i,yh_i,m_i,a_is,T are nonnegative integers;
+  // x_is,p_i,z_v are binary, and 0 <= m_i < II.
   highs.clear();
   highs.setOptionValue("output_flag", true);
   highs.setOptionValue("log_to_console", true);
@@ -3221,6 +3124,14 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
   }
   vars.col_T = AddCol(highs, 0, time_ub, optimize_t ? 1.0 : 0.0, true);
 
+  // Choose exactly one modulo start slot and link all representations of the
+  // same start time.  t = II*y + m linearizes modulo arithmetic; splitting y
+  // into 2*y_half + parity exposes whether bank rotation has crossed an odd
+  // number of initiation intervals without introducing nonlinear arithmetic.
+  //   sum_s x[i,s] = 1
+  //   m[i] = sum_s s*x[i,s]
+  //   t[i] = II*y[i] + m[i]
+  //   y[i] = 2*y_half[i] + start_parity[i]
   for (int i = 0; i < prob.N; ++i) {
     std::vector<HighsInt> idx1;
     std::vector<double> val1;
@@ -3244,6 +3155,11 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
           {1.0, -2.0, -1.0}, 0.0);
   }
 
+  // Fold a command's [start, start + latency) interval onto the cyclic II-slot
+  // calendar.  a[i][s] can exceed one when latency > II, representing several
+  // overlapped iterations of the same command in physical slot s.
+  //   a[i,s] = sum_st x[i,st] * max(0, ceil((d_i-rel(s,st))/II))
+  // where rel(s,st) = (s-st) mod II.
   for (int i = 0; i < prob.N; ++i) {
     int dur = prob.P[i].latency;
     for (int s = 0; s < II; ++s) {
@@ -3267,6 +3183,11 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
     }
   }
 
+  // For dependency i -> j at iteration distance delta, require
+  // t[i] + latency[i] <= t[j] + delta*II.  A self-edge cannot be shifted by
+  // start times, so it is immediately infeasible when its latency exceeds the
+  // available delta initiation intervals.
+  //   t[i] + d_i <= t[j] + delta(i,j)*II
   for (const auto &e : prob.dep_edges) {
     int i = e.first;
     int j = e.second;
@@ -3282,11 +3203,18 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
            double(delta * II - d));
   }
 
+  // T bounds every command completion, making minimization of T equivalent to
+  // minimizing the representative window's makespan.
+  //   T >= t[i] + d_i, for every command i; objective: min T.
   for (int i = 0; i < prob.N; ++i) {
     AddLeq(highs, {vars.col_t[i], vars.col_T}, {1.0, -1.0},
            double(-prob.P[i].latency));
   }
 
+  // At every modulo slot, sum the folded occupancies of commands using a
+  // physical execution resource.  This models conflicts across all overlapped
+  // iterations, not merely commands visible in one template iteration.
+  //   sum_{i uses r} a[i,s] <= cap[r], for every resource r and slot s.
   for (int r : prob.R) {
     int cap = prob.cap.count(r) ? prob.cap.at(r) : 1;
     for (int s = 0; s < II; ++s) {
@@ -3312,6 +3240,10 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
   }
 
   {
+    // Multiple FlowSpecs can describe reads fed by the same physical write.
+    // They must share one write-bank phase; allowing independent z values
+    // would assign the same produced data to two banks simultaneously.
+    //   z[v] = z[w] for flows v,w with (prod[v], mem[v]) equal.
     std::map<SameWriteFlowKey, std::vector<int>> same_write_groups;
     for (int vv = 0; vv < internal_count; ++vv) {
       int fid = vars.internal_flow_ids[vv];
@@ -3329,6 +3261,10 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
     }
   }
 
+  // Precoloring captures bank identities already implied by resident buffers
+  // or frontend metadata.  Convert pairwise implications into equality or XOR
+  // constraints before considering time-dependent write/read overlap.
+  //   NeedSame: z[a] - z[b] = 0; NeedDifferent: z[a] + z[b] = 1.
   for (int a = 0; a < internal_count; ++a) {
     const FlowSpec &lhs = prob.flows[vars.internal_flow_ids[a]];
     for (int b = a + 1; b < internal_count; ++b) {
@@ -3343,6 +3279,18 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
   }
 
   auto bank_build_begin = std::chrono::steady_clock::now();
+  // Compare every SRAM write lifetime with every read lifetime in the same
+  // memory.  For each possible producer modulo slot, classify consumer slots:
+  // overlapping accesses may require equal banks, different banks, or may be
+  // impossible regardless of bank assignment.  When banks rotate across IIs,
+  // the effective bank is z XOR start_parity, hence AddConditionalParity;
+  // otherwise z alone determines the bank.  The x variables gate each relation
+  // so it is active only for the pair of start slots selected by the solver.
+  // If x[prod,sp] = x[cons,sc] = 1, enforce
+  //   z_write XOR z_read XOR parity_write XOR parity_read = required_xor
+  // for rotating banks, or z_write XOR z_read = required_xor otherwise.
+  // AddConditionalParity introduces an integer quotient to linearize the XOR;
+  // its big-M terms deactivate the equality for unselected slot pairs.
   for (int a = 0; a < internal_count; ++a) {
     const auto &write_flow = prob.flows[vars.internal_flow_ids[a]];
     if (write_flow.write_resource < 0 || write_flow.prod < 0)
@@ -3416,6 +3364,11 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
         }
 
         if (!impossible_cons_slots.empty()) {
+          // Forbid selecting the producer slot together with any consumer slot
+          // whose physical intervals conflict even when placed on opposite
+          // banks.  Since each command has one-hot x, this single inequality
+          // excludes every impossible pairing collected above.
+          //   x[prod,sp] + sum_{sc impossible} x[cons,sc] <= 1.
           std::vector<HighsInt> idx;
           std::vector<double> val;
           if (x_prod >= 0) {
@@ -3605,6 +3558,11 @@ BankFlipMode GuessBankFlipMode(const Problem &prob) {
   return {guess_for_mem(/*mem=*/0), guess_for_mem(/*mem=*/1)};
 }
 
+// Converts each annotated SunMMIO pipeline loop in a PrimFunc into a periodic
+// scheduling Problem, solves it with HiGHS, and returns the same TIR loop with
+// prologue/body/epilogue order plus multiversion and bank-phase annotations for
+// the downstream injection pass.  Unsupported or infeasible loops are returned
+// with an explicit pipeline-fallback diagnostic instead of a partial schedule.
 class SunmmioPipelinePlannerILP : public StmtExprMutator {
 public:
   static Stmt Substitute(const PrimFunc &f, bool debug) {
