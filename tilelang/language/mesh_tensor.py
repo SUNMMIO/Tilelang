@@ -15,8 +15,9 @@ from tilelang._typing import DType, ShapeType
 from tilelang.dtypes import dtype as tilelang_dtype
 from tilelang.language import dtypes as _dtypes
 from tilelang.language.placement import (
+    MeshReplicationType,
+    MeshShardingPolicy,
     PlacementSpec,
-    _normalize_placement,
     _placement_metadata,
     _validate_placement,
 )
@@ -24,6 +25,8 @@ from tilelang.language.proxy import TensorProxy
 from tilelang.language.mesh_symbols import mesh_ncols, mesh_nrows
 
 __all__ = [
+    "MeshReplicationType",
+    "MeshShardingPolicy",
     "PlacementSpec",
     "MeshTensor",
     "TensorWithMeta",
@@ -184,7 +187,25 @@ def get_local_extent(mesh_tensor, cid):
     row = cid // ncols
     col = cid % ncols
 
-    row_kind, row_dim, col_kind, col_dim = (_to_python_int(value) for value in meta["placement"])
+    placement_desc = meta.get("placement")
+    if placement_desc is None:
+        # Support metadata created before PlacementSpec became canonical.
+        local_extent = list(global_shape)
+        cross_mesh_dim = meta.get("cross_mesh_dim", -1)
+        if cross_mesh_dim != -1:
+            local_extent[cross_mesh_dim] = distribute_valid_count(global_shape[cross_mesh_dim], cid, nrows * ncols)
+            return tuple(local_extent)
+
+        shard_y = meta.get("shard_y", -1)
+        if shard_y != -1:
+            local_extent[shard_y] = distribute_valid_count(global_shape[shard_y], row, nrows)
+
+        shard_x = meta.get("shard_x", -1)
+        if shard_x != -1:
+            local_extent[shard_x] = distribute_valid_count(local_extent[shard_x], col, ncols)
+        return tuple(local_extent)
+
+    row_kind, row_dim, col_kind, col_dim = (_to_python_int(value) for value in placement_desc)
     local_extent = list(global_shape)
     for dim, extent in enumerate(global_shape):
         row_shards = row_kind == 1 and row_dim == dim
@@ -243,7 +264,7 @@ class MeshTensorProxy:
     @staticmethod
     def _get_sharded_shape(
         shape: tuple[Any, ...],
-        placement: PlacementSpec,
+        placement: PlacementSpec | MeshShardingPolicy,
         nrows: int,
         ncols: int,
     ) -> tuple[Any, ...]:
@@ -267,14 +288,22 @@ class MeshTensorProxy:
     def __call__(
         self,
         shape: ShapeType,
-        placement: PlacementSpec,
+        placement: PlacementSpec | MeshShardingPolicy | None = None,
         device_mesh_config: tuple[int | PrimExpr, int | PrimExpr] | DType | None = None,
         dtype: DType = "float32",
         layout=None,
+        *,
+        sharding_policy: PlacementSpec | MeshShardingPolicy | None = None,
     ) -> TensorWithMeta:
-        placement = _normalize_placement(placement)
+        if sharding_policy is not None:
+            if placement is not None:
+                raise TypeError("Specify only one of placement or the legacy sharding_policy argument")
+            placement = sharding_policy
+        if placement is None:
+            raise TypeError("MeshTensor requires a placement")
         if isinstance(shape, (int, PrimExpr)):
             shape = (shape,)
+        placement = _validate_placement(placement, len(shape))
         if device_mesh_config is not None and not _is_mesh_config(device_mesh_config):
             if not _is_dtype_like(device_mesh_config):
                 raise TypeError("device_mesh_config must be a tuple of (nrows, ncols). To omit it, pass dtype as the third argument.")
@@ -337,10 +366,12 @@ if TYPE_CHECKING:
         def __new__(
             cls,
             shape: ShapeType,
-            placement: PlacementSpec,
+            placement: PlacementSpec | MeshShardingPolicy | None = None,
             device_mesh_config: tuple[int | PrimExpr, int | PrimExpr] | DType | None = None,
             dtype: DType = "float32",
             layout=None,
+            *,
+            sharding_policy: PlacementSpec | MeshShardingPolicy | None = None,
         ) -> TensorWithMeta: ...
 
         def get_local_extent(self, cid) -> tuple[Any, ...]: ...

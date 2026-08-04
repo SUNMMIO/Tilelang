@@ -236,6 +236,18 @@ across_mesh = T.placement.mesh_as_line(dim=0)
 
 `mesh_as_line(0)` 将 2D mesh 按 row-major 顺序视为一条线，并把 tensor 第 0 维按 `nrows * ncols` 切分；core 的 shard index 为 `row * ncols + col`。非整除 shape 的本地 slot 使用向上取整，靠后的 core 可能具有较短的有效 extent；kernel 不应假设每个 core 的有效数据完全等长。
 
+为了兼容已有程序，旧的 `T.MeshShardingPolicy` 和 `T.MeshReplicationType` 仍然可用，但新代码应优先使用 `T.placement`：
+
+| 旧 API | 等价的新 API |
+|---|---|
+| `T.MeshShardingPolicy(y=a, x=b)` | `T.placement.full_shard(a, b)` |
+| `T.MeshShardingPolicy(y=a, replicate=T.MeshReplicationType.ROW)` | `T.placement.row_shard(a)` |
+| `T.MeshShardingPolicy(x=b, replicate=T.MeshReplicationType.COLUMN)` | `T.placement.col_shard(b)` |
+| `T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)` | `T.placement.replicated()` |
+| `T.MeshShardingPolicy(cross_mesh_dim=d)` | `T.placement.mesh_as_line(d)` |
+
+旧的 `sharding_policy=` 关键字也继续作为 `placement=` 的别名支持；同一次调用不能同时指定两者。
+
 ### 2.5 Layout
 
 Layout 描述 tensor 或 buffer 在内存中的组织方式。它和 sharding 是两个不同层面的概念：sharding 决定完整 tensor 分到哪个 core，layout 决定每个 shard 内部如何排布。

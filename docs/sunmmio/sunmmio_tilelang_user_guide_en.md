@@ -236,6 +236,18 @@ across_mesh = T.placement.mesh_as_line(dim=0)
 
 `mesh_as_line(0)` treats the 2D mesh as a row-major line and splits tensor dimension 0 by `nrows * ncols`; a core's shard index is `row * ncols + col`. For a non-divisible shape, the local slot is rounded up and later cores can have shorter valid extents; kernels must not assume that every core has the same amount of valid data.
 
+For source compatibility, the legacy `T.MeshShardingPolicy` and `T.MeshReplicationType` APIs remain available, but new code should prefer `T.placement`:
+
+| Legacy API | Equivalent new API |
+|---|---|
+| `T.MeshShardingPolicy(y=a, x=b)` | `T.placement.full_shard(a, b)` |
+| `T.MeshShardingPolicy(y=a, replicate=T.MeshReplicationType.ROW)` | `T.placement.row_shard(a)` |
+| `T.MeshShardingPolicy(x=b, replicate=T.MeshReplicationType.COLUMN)` | `T.placement.col_shard(b)` |
+| `T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)` | `T.placement.replicated()` |
+| `T.MeshShardingPolicy(cross_mesh_dim=d)` | `T.placement.mesh_as_line(d)` |
+
+The legacy `sharding_policy=` keyword is also supported as an alias for `placement=`; a call cannot specify both.
+
 ### 2.5 Layout
 
 Layout describes how a tensor or buffer is organized in memory. It is a different concept from sharding: sharding decides which core receives which part of the complete tensor, while layout decides how each shard is arranged internally.
