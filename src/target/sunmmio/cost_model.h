@@ -1,6 +1,6 @@
 /*!
  * \file cost_model.h
- * \brief Gem5-aligned execution-delay model for Sunmmio pipeline commands.
+ * \brief CostModel to estimate the execution delay of pipeline instructions.
  */
 #ifndef TVM_TL_TRANSFORM_SUNMMIO_PIPELINE_PLANNING_COST_MODEL_H_
 #define TVM_TL_TRANSFORM_SUNMMIO_PIPELINE_PLANNING_COST_MODEL_H_
@@ -13,8 +13,7 @@
 namespace tvm {
 namespace tl {
 
-// The public interface remains device-agnostic; device-specific gem5 timing
-// parameters and TIR decoding are kept in the implementation.
+// A minimal interface for CostModel
 class CostModel {
 public:
   static float EstimateDelay(DeviceType device_type, const tir::Stmt &stmt);
