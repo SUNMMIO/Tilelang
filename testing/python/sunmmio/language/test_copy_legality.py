@@ -7,6 +7,7 @@ import tilelang.utils.target as _target_utils
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm
+from tilelang.layout import make_zz_layout
 from testing.python.sunmmio.common.compile_pipeline import target
 
 
@@ -197,6 +198,42 @@ def _build_script(copy_case):
     return tvm.IRModule({"main": _make_copy_kernel(copy_case)}).script()
 
 
+@target("Sunmmio")
+def _make_let_bound_mesh_copy_kernel():
+    global_shape = (256, 256)
+    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    tensor_layout = make_zz_layout(global_shape, axes=[0, 1], block_shape=(32, 32))
+
+    @T.prim_func
+    def kernel(
+        A: T.MeshTensor(global_shape, shard_policy, T.bfloat16, layout=tensor_layout),  # type: ignore
+    ):
+        with T.Kernel():
+            local_m, local_n = A.local_shape
+            A_shared = T.alloc_shared((local_m, local_n), T.bfloat16)
+            T.copy(A, A_shared)
+
+    return kernel
+
+
+@target("Sunmmio")
+def _make_mismatched_let_bound_mesh_copy_kernel():
+    global_shape = (256, 256)
+    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    tensor_layout = make_zz_layout(global_shape, axes=[0, 1], block_shape=(32, 32))
+
+    @T.prim_func
+    def kernel(
+        A: T.MeshTensor(global_shape, shard_policy, T.bfloat16, layout=tensor_layout),  # type: ignore
+    ):
+        with T.Kernel():
+            local_m, local_n = A.local_shape
+            A_shared = T.alloc_shared((local_m, local_n + 1), T.bfloat16)
+            T.copy(A, A_shared)
+
+    return kernel
+
+
 def _assert_region_extents(script, buffer_name, access_mask, extents):
     extent_pattern = r",\s*".join(str(extent) for extent in extents)
     name_pattern = r"[A-Za-z_]\w*" if buffer_name is None else re.escape(buffer_name)
@@ -304,6 +341,30 @@ def test_sunmmio_copy_compact_path_skips_strict_region_validation():
 
         _assert_region_extents(script, "A_128x128x128_global", 1, [128, 128, 128])
         _assert_region_extents(script, None, 2, [128, 128, 32])
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+
+@pytest.mark.parametrize("strict", [False, True], ids=["compact", "strict"])
+def test_sunmmio_copy_frontend_accepts_let_bound_mesh_shape(strict):
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(strict)
+    try:
+        script = tvm.IRModule({"main": _make_let_bound_mesh_copy_kernel()}).script()
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+    assert script.strip()
+    assert "T.alloc_buffer((local_m, local_n)" not in script
+
+
+@pytest.mark.parametrize("strict", [False, True], ids=["compact", "strict"])
+def test_sunmmio_copy_frontend_rejects_mismatched_let_bound_mesh_shape(strict):
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(strict)
+    try:
+        with pytest.raises(ValueError):
+            _make_mismatched_let_bound_mesh_copy_kernel()
     finally:
         _target_utils.set_sunmmio_region_validation(previous)
 

@@ -12,6 +12,7 @@ from tilelang.utils.language import (
     legalize_pairwise_extents,
 )
 from tilelang.language.utils import get_extent
+from tilelang.language.frame import resolve_let_bound_expr
 from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
 from tilelang.utils.target import target_is_sunmmio
 from tvm import ir, tir
@@ -81,7 +82,7 @@ def _expr_is_squeezable_one(expr: tir.PrimExpr) -> bool:
 
 
 def _expr_equal(lhs: tir.PrimExpr, rhs: tir.PrimExpr) -> bool:
-    return prim_expr_equal(lhs, rhs)
+    return prim_expr_equal(resolve_let_bound_expr(lhs), resolve_let_bound_expr(rhs))
 
 
 def _expr_gt(lhs: tir.PrimExpr, rhs: tir.PrimExpr) -> bool:
@@ -315,7 +316,10 @@ def _prepare_copy_regions_compact(
     dst_extent: list[tir.PrimExpr] | None,
 ) -> tuple[tir.PrimExpr, tir.PrimExpr]:
     if isinstance(src, tir.Buffer) and isinstance(dst, tir.Buffer):
-        ir.assert_structural_equal(src.shape, dst.shape)
+        ir.assert_structural_equal(
+            [resolve_let_bound_expr(extent) for extent in src.shape],
+            [resolve_let_bound_expr(extent) for extent in dst.shape],
+        )
 
     assert src_extent or dst_extent, "Can't deduce copy extents from args"
     src_extents = list(src_extent) if src_extent else [1] * len(dst_extent)

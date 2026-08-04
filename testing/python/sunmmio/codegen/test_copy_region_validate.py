@@ -140,6 +140,24 @@ def zz_fully_coalesced_non_major_sub_block_copy_kernel():
 
 
 @target("Sunmmio")
+def let_bound_mesh_local_shape_copy_kernel():
+    global_shape = (256, 256)
+    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    tensor_layout = make_zz_layout(global_shape, axes=[0, 1], block_shape=(32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(global_shape, shard_policy, DTYPE, layout=tensor_layout),  # type: ignore
+    ):
+        with T.Kernel():
+            local_m, local_n = A.local_shape
+            A_shared = T.alloc_shared((local_m, local_n), DTYPE)
+            T.copy(A, A_shared)
+
+    return main
+
+
+@target("Sunmmio")
 def singleton_dimension_broadcast_kernel():
     src_shape = (1, 32, 32)
     dst_shape = (1, 32, 32)
@@ -253,6 +271,19 @@ def test_zz_fully_coalesced_non_major_sub_block_copy_lowers_in_compact_mode():
     lowered = lower_sunmmio_kernel_to_device_tir(zz_fully_coalesced_non_major_sub_block_copy_kernel())
 
     assert lowered.get_global_vars()
+
+
+def test_let_bound_mesh_local_shape_copy_codegen_passes(tmp_path):
+    src = _validate_copy_codegen(
+        let_bound_mesh_local_shape_copy_kernel(),
+        tmp_path,
+        "let_bound_mesh_local_shape_copy.mlir",
+        "64x64",
+    )
+
+    assert "sunmmio.fake" not in src
+    assert src.count("suvm.copy_async") == 1
+    assert src.count("suvm.get_partitioned_tile_view") == 2
 
 
 def test_singleton_dimension_broadcast_codegen_passes(tmp_path):

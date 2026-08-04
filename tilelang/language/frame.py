@@ -3,6 +3,7 @@
 from __future__ import annotations
 from tvm.ffi import register_object as _register_object
 from tvm.tir import Var, PrimExpr, BufferLoad, BufferRegion
+from tvm.tir.stmt_functor import post_order_visit, substitute
 from tvm.ir import Range
 from tvm import DataType
 from tvm.script.ir_builder.tir.frame import TIRFrame
@@ -207,3 +208,31 @@ def get_let_value(var: Var) -> PrimExpr | None:
         Optional[PrimExpr]: The bound value if found, None otherwise
     """
     return _get_let_stack().get_value(var)
+
+
+def _collect_let_bound_substitutions(expr: PrimExpr, resolved_vars: set[Var]) -> dict[Var, PrimExpr]:
+    substitutions: dict[Var, PrimExpr] = {}
+
+    def collect(node):
+        if not isinstance(node, Var) or node in resolved_vars or not has_let_value(node):
+            return
+        value = get_let_value(node)
+        if isinstance(value, PrimExpr):
+            resolved_vars.add(node)
+            substitutions[node] = value
+
+    post_order_visit(expr, collect)
+    return substitutions
+
+
+def resolve_let_bound_expr(expr: PrimExpr | int) -> PrimExpr | int:
+    """Recursively expand active frontend let bindings in a TIR expression."""
+    if not isinstance(expr, PrimExpr):
+        return expr
+
+    resolved_vars: set[Var] = set()
+    while True:
+        substitutions = _collect_let_bound_substitutions(expr, resolved_vars)
+        if not substitutions:
+            return expr
+        expr = substitute(expr, substitutions)
