@@ -4,6 +4,7 @@ import pytest
 
 import tilelang
 import tilelang.language as T
+import tilelang.utils.target as target_utils
 from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import (
     validate_sunmmio_codegen_with_npuir_opt,
@@ -19,6 +20,21 @@ TRANSPOSE_CONFIGS = [
     pytest.param(64, 128, "bfloat16", "zn", id="bfloat16-zn-64x128"),
     pytest.param(64, 128, "float32", "zz", id="float32-zz-64x128"),
 ]
+
+
+@pytest.fixture
+def _sunmmio_region_validation_guard():
+    old_value = None
+    if hasattr(target_utils, "get_sunmmio_region_validation"):
+        old_value = target_utils.get_sunmmio_region_validation()
+
+    try:
+        yield
+    finally:
+        if old_value is not None:
+            target_utils.set_sunmmio_region_validation(old_value)
+        else:
+            pass
 
 
 @target("Sunmmio")
@@ -68,12 +84,23 @@ def mesh_transpose_kernel(
     return main
 
 
+@pytest.mark.parametrize("enable_region_validation", [True, False], ids=["region_validation_on", "region_validation_off"])
 @pytest.mark.parametrize(("m", "n", "dtype", "layout_family"), TRANSPOSE_CONFIGS)
-def test_transpose_codegen_matrix(tmp_path, m, n, dtype, layout_family):
+def test_transpose_codegen_matrix(
+    tmp_path,
+    m,
+    n,
+    dtype,
+    layout_family,
+    enable_region_validation,
+    _sunmmio_region_validation_guard,
+):
+    target_utils.set_sunmmio_region_validation(enable_region_validation)
+
     src = validate_sunmmio_codegen_with_npuir_opt(
         mesh_transpose_kernel(m, n, dtype, layout_family),
         tmp_path,
-        mlir_filename=f"transpose_{dtype}_{layout_family}_{m}x{n}.mlir",
+        mlir_filename=(f"transpose_{dtype}_{layout_family}_{m}x{n}_rv_{'on' if enable_region_validation else 'off'}.mlir"),
         expected_tokens=(
             "suvm.copy_async",
             "suvm.transpose_async",
@@ -84,7 +111,14 @@ def test_transpose_codegen_matrix(tmp_path, m, n, dtype, layout_family):
     assert src.count("suvm.transpose_async") == 1
 
 
-def test_transpose_loop_codegen(tmp_path):
+@pytest.mark.parametrize("enable_region_validation", [True, False], ids=["region_validation_on", "region_validation_off"])
+def test_transpose_loop_codegen(
+    tmp_path,
+    enable_region_validation,
+    _sunmmio_region_validation_guard,
+):
+    target_utils.set_sunmmio_region_validation(enable_region_validation)
+
     src = validate_sunmmio_codegen_with_npuir_opt(
         mesh_transpose_kernel(
             64,
@@ -95,7 +129,7 @@ def test_transpose_loop_codegen(tmp_path):
             expect_transposed=False,
         ),
         tmp_path,
-        mlir_filename="transpose_loop.mlir",
+        mlir_filename=f"transpose_loop_rv_{'on' if enable_region_validation else 'off'}.mlir",
         expected_tokens=(
             "scf.for",
             "suvm.copy_async",
