@@ -372,6 +372,15 @@ protected:
   SunMMIOValue VisitExprDefault_(const Object *op) override;
 
 private:
+  enum class CoverageDomain { kMain, kTiles };
+
+  struct CoverageData {
+    std::set<std::string> expected_node_types;
+    std::set<std::string> visited_node_types;
+    std::set<std::string> expected_call_ops;
+    std::set<std::string> visited_call_ops;
+  };
+
   enum class CallBucket {
     kBuiltin,
     kExternPure,
@@ -403,6 +412,9 @@ private:
   void CollectDeclBuffers(const tir::Stmt &stmt);
   void MarkVisitedNodeType(const std::string &type_key);
   void MarkVisitedCallOpFromExpr(const tvm::PrimExpr &expr);
+  void MarkVisitedExprRoot(const tvm::PrimExpr &expr);
+  void MarkVisitedExprTree(const tvm::PrimExpr &expr);
+  tir::BufferRegion NormalizeRegionTracked(const tvm::PrimExpr &expr);
   bool TryConsumeSyncTokenId(const tvm::PrimExpr &expr,
                              SunMMIOCallAttrs *attrs);
   void WriteCoverageReport() const;
@@ -486,11 +498,11 @@ private:
   std::vector<size_t> local_var_scope_markers_;
   std::vector<size_t> buffer_scope_markers_;
 
-  // Traversal coverage sets for codegen completeness checking.
-  std::set<std::string> expected_node_types_;
-  std::set<std::string> visited_node_types_;
-  std::set<std::string> expected_call_ops_;
-  std::set<std::string> visited_call_ops_;
+  // Main and Tiles lowering are checked independently so the main path cannot
+  // hide a missing type/op mark in custom Tiles lowering.
+  CoverageDomain coverage_domain_{CoverageDomain::kMain};
+  CoverageData main_coverage_;
+  CoverageData tiles_coverage_;
 };
 
 } // namespace codegen

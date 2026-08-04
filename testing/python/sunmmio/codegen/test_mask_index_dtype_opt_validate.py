@@ -131,7 +131,8 @@ def test_bf16_select_with_i32_row_mask_lowers_to_llvm(tmp_path):
     assert "suvm.tile.addi" not in src
 
 
-def test_bf16_dynamic_rect_tail_mask_uses_unsigned_i16_compare(tmp_path):
+def test_bf16_dynamic_rect_tail_mask_uses_unsigned_i16_compare(tmp_path, monkeypatch):
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT", "1")
     src = validate_sunmmio_codegen_with_npuir_opt(
         bf16_dynamic_rect_tail_mask_kernel(),
         tmp_path,
