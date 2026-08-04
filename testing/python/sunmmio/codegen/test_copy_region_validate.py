@@ -5,7 +5,6 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang import tvm
 from tilelang.layout import make_row_major, make_zz_layout
 
 from testing.python.sunmmio.common.codegen_validation import (
@@ -140,11 +139,11 @@ def zz_fully_coalesced_non_major_sub_block_copy_kernel():
 
 
 @target("Sunmmio")
-def leading_singleton_broadcast_kernel():
+def singleton_dimension_broadcast_kernel():
     src_shape = (1, 32, 32)
-    dst_shape = (32, 32)
+    dst_shape = (1, 32, 32)
     src_layout = make_zz_layout(src_shape, axes=[1, 2], block_shape=(32, 32))
-    dst_layout = make_zz_layout(dst_shape, axes=[0, 1], block_shape=(32, 32))
+    dst_layout = make_zz_layout(dst_shape, axes=[1, 2], block_shape=(32, 32))
 
     @T.prim_func
     def main():
@@ -219,20 +218,16 @@ def test_zz_major_sub_block_copy_passes(tmp_path):
     )
 
 
-def test_zz_non_major_sub_block_copy_is_rejected():
-    with pytest.raises(
-        tvm.error.InternalError,
-        match="must not split the non-major dimension",
-    ):
-        lower_sunmmio_kernel_to_device_tir(zz_non_major_sub_block_copy_kernel())
+def test_zz_non_major_sub_block_copy_lowers_in_compact_mode():
+    lowered = lower_sunmmio_kernel_to_device_tir(zz_non_major_sub_block_copy_kernel())
+
+    assert lowered.get_global_vars()
 
 
-def test_zz_both_dims_sub_block_copy_is_rejected():
-    with pytest.raises(
-        tvm.error.InternalError,
-        match="must not split the non-major dimension",
-    ):
-        lower_sunmmio_kernel_to_device_tir(zz_both_dims_sub_block_copy_kernel())
+def test_zz_both_dims_sub_block_copy_lowers_in_compact_mode():
+    lowered = lower_sunmmio_kernel_to_device_tir(zz_both_dims_sub_block_copy_kernel())
+
+    assert lowered.get_global_vars()
 
 
 def test_zz_major_sub_block_multi_block_copy_passes(tmp_path):
@@ -253,19 +248,17 @@ def test_zz_fully_coalesced_full_block_copy_passes(tmp_path):
     )
 
 
-def test_zz_fully_coalesced_non_major_sub_block_copy_is_rejected():
-    with pytest.raises(
-        tvm.error.InternalError,
-        match="must not split the non-major dimension",
-    ):
-        lower_sunmmio_kernel_to_device_tir(zz_fully_coalesced_non_major_sub_block_copy_kernel())
+def test_zz_fully_coalesced_non_major_sub_block_copy_lowers_in_compact_mode():
+    lowered = lower_sunmmio_kernel_to_device_tir(zz_fully_coalesced_non_major_sub_block_copy_kernel())
+
+    assert lowered.get_global_vars()
 
 
-def test_leading_singleton_broadcast_codegen_passes(tmp_path):
+def test_singleton_dimension_broadcast_codegen_passes(tmp_path):
     src = validate_sunmmio_codegen_with_npuir_opt(
-        leading_singleton_broadcast_kernel(),
+        singleton_dimension_broadcast_kernel(),
         tmp_path,
-        mlir_filename="leading_singleton_broadcast.mlir",
+        mlir_filename="singleton_dimension_broadcast.mlir",
         expected_tokens=(
             "suvm.get_partitioned_tile_view",
             "suvm.mcast_tok",

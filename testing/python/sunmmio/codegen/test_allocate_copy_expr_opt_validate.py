@@ -25,8 +25,8 @@ os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 @target("Sunmmio")
 def basic_allocate_copy_mma_kernel(
-    M=128,
-    N=128,
+    M=256,
+    N=256,
     K=128,
     block_M=32,
     block_N=32,

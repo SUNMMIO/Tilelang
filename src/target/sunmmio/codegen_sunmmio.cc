@@ -1,11 +1,13 @@
 #include "codegen_sunmmio.h"
 #include "sunmmio_mlir_builder.h"
 
+#include "../../layout/cute_layout.h"
 #include "../../layout/layout.h"
 #include "../../op/builtin.h"
 #include "../../op/comm.h"
 #include "../../op/region.h"
 #include "../../op/utils.h"
+#include "../../tileview/tileview_planner_common.h"
 #include "../sunmmio_utils.h"
 
 #include <tvm/arith/analyzer.h>
@@ -25,6 +27,7 @@
 #include <fstream>
 #include <iterator>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -136,34 +139,335 @@ SunMMIOType MakeTileTypeForShape(DataType dtype,
   return type;
 }
 
-SunMMIOType MakeRank1TileType(DataType dtype, int64_t extent) {
-  return MakeTileTypeForShape(dtype, {extent}, SunMMIOType::Kind::kTile);
+std::string PrimExprArrayToString(const ffi::Array<PrimExpr> &exprs) {
+  std::ostringstream os;
+  os << "[";
+  for (size_t i = 0; i < exprs.size(); ++i) {
+    if (i != 0) {
+      os << ", ";
+    }
+    os << exprs[i];
+  }
+  os << "]";
+  return os.str();
 }
 
-SunMMIOType MakeRank1TileViewType(DataType dtype, int64_t extent) {
-  return MakeTileTypeForShape(dtype, {extent}, SunMMIOType::Kind::kTileView);
+std::string IntVectorToString(const std::vector<int64_t> &values) {
+  std::ostringstream os;
+  os << "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) {
+      os << ", ";
+    }
+    os << values[i];
+  }
+  os << "]";
+  return os.str();
 }
 
-SunMMIOType MakeRank2TileType(DataType dtype, int64_t rows, int64_t cols) {
-  return MakeTileTypeForShape(dtype, {rows, cols}, SunMMIOType::Kind::kTile);
+int64_t StaticIntOrNegative(const PrimExpr &expr, arith::Analyzer *analyzer) {
+  PrimExpr simplified = analyzer->Simplify(expr);
+  const auto *imm = simplified.as<IntImmNode>();
+  if (!imm || imm->value <= 0) {
+    return -1;
+  }
+  return imm->value;
 }
 
-SunMMIOType MakeRank2TileViewType(DataType dtype, int64_t rows, int64_t cols) {
-  return MakeTileTypeForShape(dtype, {rows, cols},
-                              SunMMIOType::Kind::kTileView);
+struct ScalarTileAccessPlan {
+  std::vector<int64_t> tile_shape;
+  std::vector<int64_t> tiled_dims;
+  std::vector<PrimExpr> partition_indices;
+  std::vector<PrimExpr> local_indices;
+};
+
+std::string DescribeScalarTileAccess(const tir::Buffer &buffer,
+                                     const ffi::Array<PrimExpr> &indices,
+                                     DataType dtype,
+                                     const ffi::Optional<tl::Layout> &layout) {
+  std::ostringstream os;
+  os << "buffer=" << buffer->name << ", scope=" << buffer.scope()
+     << ", dtype=" << dtype << ", buffer_rank=" << buffer->shape.size()
+     << ", indices=" << PrimExprArrayToString(indices)
+     << ", logical_shape=" << PrimExprArrayToString(buffer->shape);
+  if (layout.defined()) {
+    os << ", layout=" << layout.value()->DebugOutput();
+  } else {
+    os << ", layout=<plain row-major fallback>";
+  }
+  return os.str();
 }
 
-std::vector<int64_t> StaticBufferShape(const tir::Buffer &buffer) {
-  std::vector<int64_t> shape;
-  shape.reserve(buffer->shape.size());
-  for (const PrimExpr &extent : buffer->shape) {
-    const auto *imm = extent.as<IntImmNode>();
-    if (!imm || imm->value <= 0) {
+std::vector<int64_t> GetScalarAccessLayoutExtents(
+    const tir::Buffer &buffer, const ffi::Optional<tl::Layout> &layout,
+    arith::Analyzer *analyzer, std::string *failure_reason) {
+  ffi::Array<PrimExpr> extents;
+  if (layout.defined()) {
+    const auto *cute = layout.value().as<tl::CuteLayoutNode>();
+    if (!cute) {
+      if (failure_reason != nullptr) {
+        *failure_reason = "Sunmmio scalar tile access planning expects a "
+                          "CuteLayout when a layout annotation is present.";
+      }
       return {};
     }
-    shape.push_back(imm->value);
+    extents = cute->GetCoveredShape();
+  } else {
+    extents = buffer->shape;
   }
-  return shape;
+
+  std::vector<int64_t> static_extents;
+  static_extents.reserve(extents.size());
+  for (const PrimExpr &extent : extents) {
+    static_extents.push_back(StaticIntOrNegative(extent, analyzer));
+  }
+  return static_extents;
+}
+
+int64_t TileElementCount(const std::vector<int64_t> &shape) {
+  int64_t elems = 1;
+  for (int64_t extent : shape) {
+    elems *= extent;
+  }
+  return elems;
+}
+
+bool TileTransferSizeIsLegal(const tir::Buffer &buffer, DataType dtype,
+                             const std::vector<int64_t> &tile_shape,
+                             const tl::SunmmioTileProcessorConfig &config) {
+  if (!IsSunmmioRsramScope(buffer.scope())) {
+    return true;
+  }
+  if (config.rsram_align_bytes <= 0) {
+    return true;
+  }
+  int64_t tile_bits =
+      TileElementCount(tile_shape) * static_cast<int64_t>(dtype.bits());
+  if (tile_bits % 8 != 0) {
+    return false;
+  }
+  int64_t tile_bytes = tile_bits / 8;
+  return tile_bytes >= config.rsram_align_bytes &&
+         tile_bytes % config.rsram_align_bytes == 0;
+}
+
+bool CandidateExtentsAreLegal(const tl::TrailingTilePattern &pattern,
+                              const std::vector<int64_t> &layout_extents,
+                              std::string *failure_reason) {
+  for (size_t i = 0; i < pattern.mapped_dims.size(); ++i) {
+    int dim = pattern.mapped_dims[i];
+    int64_t extent = layout_extents[dim];
+    int64_t tile_extent = pattern.tile_shape[i];
+    if (extent < 0) {
+      continue;
+    }
+    if (tile_extent > extent) {
+      if (failure_reason != nullptr) {
+        std::ostringstream os;
+        os << "tile extent " << tile_extent << " exceeds layout extent "
+           << extent << " at buffer dim " << dim << ".";
+        *failure_reason = os.str();
+      }
+      return false;
+    }
+    if (extent % tile_extent != 0) {
+      if (failure_reason != nullptr) {
+        std::ostringstream os;
+        os << "layout extent " << extent << " is not divisible by tile extent "
+           << tile_extent << " at buffer dim " << dim << ".";
+        *failure_reason = os.str();
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+bool HasTrailingRowMajorContiguousOrder(
+    const tir::Buffer &buffer,
+    const ffi::Map<tir::Buffer, tl::Layout> &layout_map,
+    std::string *failure_reason) {
+  std::vector<tl::ContiguousStep> steps =
+      tl::GetBufferContiguousSteps(buffer, layout_map);
+  if (steps.empty()) {
+    if (failure_reason != nullptr) {
+      *failure_reason = "cannot recover a contiguous trailing layout step.";
+    }
+    return false;
+  }
+  int width_dim = static_cast<int>(buffer->shape.size()) - 1;
+  if (steps.front().dim != width_dim) {
+    if (failure_reason != nullptr) {
+      std::ostringstream os;
+      os << "the innermost contiguous layout step is dim " << steps.front().dim
+         << ", not the trailing width dim " << width_dim
+         << "; suvm.tile.load/store require row-major tile views.";
+      *failure_reason = os.str();
+    }
+    return false;
+  }
+  return true;
+}
+
+std::optional<tl::TrailingTilePattern>
+SelectScalarTilePattern(const tir::Buffer &buffer, int tile_rank,
+                        DataType dtype,
+                        const ffi::Map<tir::Buffer, tl::Layout> &layout_map,
+                        const std::vector<int64_t> &layout_extents,
+                        const tl::SunmmioTileProcessorConfig &config,
+                        arith::Analyzer *analyzer, std::string *last_reason) {
+  std::vector<tl::TrailingTilePattern> legal_patterns;
+  for (const tl::TrailingTilePattern &pattern :
+       tl::EnumerateInferredTrailingTilePatterns(buffer, tile_rank, layout_map,
+                                                 config, analyzer,
+                                                 tl::AlignmentMode::kStrict)) {
+    if (static_cast<int>(pattern.tile_shape.size()) != tile_rank) {
+      continue;
+    }
+    std::vector<int64_t> tile_shape(pattern.tile_shape.begin(),
+                                    pattern.tile_shape.end());
+    if (!TileTransferSizeIsLegal(buffer, dtype, tile_shape, config)) {
+      if (last_reason != nullptr) {
+        std::ostringstream os;
+        os << "tile shape " << IntVectorToString(tile_shape)
+           << " does not satisfy the " << config.rsram_align_bytes
+           << "-byte RSRAM vector-transfer size/alignment constraint.";
+        *last_reason = os.str();
+      }
+      continue;
+    }
+    if (!CandidateExtentsAreLegal(pattern, layout_extents, last_reason)) {
+      continue;
+    }
+    legal_patterns.push_back(pattern);
+  }
+
+  if (legal_patterns.empty()) {
+    return std::nullopt;
+  }
+
+  std::sort(legal_patterns.begin(), legal_patterns.end(),
+            [](const tl::TrailingTilePattern &lhs,
+               const tl::TrailingTilePattern &rhs) {
+              int lhs_elems = tl::TileElements(lhs.tile_shape);
+              int rhs_elems = tl::TileElements(rhs.tile_shape);
+              if (lhs_elems != rhs_elems) {
+                return lhs_elems > rhs_elems;
+              }
+              return lhs.tile_shape > rhs.tile_shape;
+            });
+  return legal_patterns.front();
+}
+
+std::optional<ScalarTileAccessPlan> PlanScalarTileAccess(
+    const tir::Buffer &buffer, const ffi::Array<PrimExpr> &indices,
+    DataType dtype, const ffi::Optional<tl::Layout> &layout,
+    const tl::SunmmioTileProcessorConfig &config, std::string *failure_reason) {
+  int buffer_rank = static_cast<int>(buffer->shape.size());
+  if (buffer_rank < 1) {
+    if (failure_reason != nullptr) {
+      *failure_reason = "scalar tile access requires a rank >= 1 buffer.";
+    }
+    return std::nullopt;
+  }
+  if (static_cast<int>(indices.size()) != buffer_rank) {
+    if (failure_reason != nullptr) {
+      std::ostringstream os;
+      os << "indices rank " << indices.size()
+         << " does not match source buffer rank " << buffer_rank << ".";
+      *failure_reason = os.str();
+    }
+    return std::nullopt;
+  }
+
+  arith::Analyzer analyzer;
+  ffi::Map<tir::Buffer, tl::Layout> layout_map;
+  if (layout.defined()) {
+    layout_map.Set(buffer, layout.value());
+  }
+
+  std::string local_reason;
+  std::vector<int64_t> layout_extents =
+      GetScalarAccessLayoutExtents(buffer, layout, &analyzer, &local_reason);
+  if (layout_extents.empty()) {
+    if (failure_reason != nullptr) {
+      *failure_reason = local_reason;
+    }
+    return std::nullopt;
+  }
+  if (static_cast<int>(layout_extents.size()) != buffer_rank) {
+    if (failure_reason != nullptr) {
+      std::ostringstream os;
+      os << "layout covered rank " << layout_extents.size()
+         << " does not match buffer rank " << buffer_rank << ".";
+      *failure_reason = os.str();
+    }
+    return std::nullopt;
+  }
+
+  if (!HasTrailingRowMajorContiguousOrder(buffer, layout_map, &local_reason)) {
+    if (failure_reason != nullptr) {
+      *failure_reason = local_reason;
+    }
+    return std::nullopt;
+  }
+
+  std::vector<int> ranks_to_try;
+  if (buffer_rank >= 2) {
+    ranks_to_try.push_back(2);
+  }
+  ranks_to_try.push_back(1);
+
+  std::optional<tl::TrailingTilePattern> selected;
+  for (int tile_rank : ranks_to_try) {
+    selected = SelectScalarTilePattern(buffer, tile_rank, dtype, layout_map,
+                                       layout_extents, config, &analyzer,
+                                       &local_reason);
+    if (selected.has_value()) {
+      break;
+    }
+  }
+
+  if (!selected.has_value()) {
+    if (failure_reason != nullptr) {
+      std::ostringstream os;
+      os << "cannot infer a legal trailing rank-1/rank-2 tile_view";
+      if (!local_reason.empty()) {
+        os << ": " << local_reason;
+      }
+      os << ". Use an aligned-row-major staging layout when logical extents "
+            "are "
+            "not compatible with 64B RSRAM vector transfers.";
+      *failure_reason = os.str();
+    }
+    return std::nullopt;
+  }
+
+  ScalarTileAccessPlan plan;
+  plan.tile_shape.assign(selected->tile_shape.begin(),
+                         selected->tile_shape.end());
+  plan.tiled_dims.assign(selected->mapped_dims.begin(),
+                         selected->mapped_dims.end());
+  plan.partition_indices.reserve(buffer_rank);
+  std::unordered_map<int, int64_t> tiled_dim_to_extent;
+  for (size_t i = 0; i < selected->mapped_dims.size(); ++i) {
+    tiled_dim_to_extent[selected->mapped_dims[i]] = selected->tile_shape[i];
+  }
+
+  for (int dim = 0; dim < buffer_rank; ++dim) {
+    auto it = tiled_dim_to_extent.find(dim);
+    if (it == tiled_dim_to_extent.end()) {
+      plan.partition_indices.push_back(indices[dim]);
+      continue;
+    }
+    PrimExpr tile_extent = IntImm(indices[dim].dtype(), it->second);
+    plan.partition_indices.push_back(
+        analyzer.Simplify(floordiv(indices[dim], tile_extent)));
+    plan.local_indices.push_back(
+        analyzer.Simplify(floormod(indices[dim], tile_extent)));
+  }
+
+  return plan;
 }
 
 bool SameTypeShape(const SunMMIOType &lhs, const SunMMIOType &rhs) {
@@ -182,6 +486,84 @@ bool SameTypeShape(const SunMMIOType &lhs, const SunMMIOType &rhs) {
 std::string LocalVarValueName(const tir::VarNode *var) {
   ICHECK(var != nullptr);
   return "%local_var_" + var->name_hint;
+}
+
+DataType ExpectedMXDataDType(DataType mx_dtype) {
+  ICHECK(tl::sunmmio::IsMXDType(mx_dtype))
+      << "MX pack/unpack expects mxfp8 or mxfp4, got " << mx_dtype;
+  if (mx_dtype.bits() == 8) {
+    return DataType::Float8E4M3FN();
+  }
+  if (mx_dtype.bits() == 4) {
+    return DataType::Float4E2M1FN();
+  }
+  LOG(FATAL) << "Unsupported MX dtype " << mx_dtype;
+  TVM_FFI_UNREACHABLE();
+}
+
+DataType ExpectedMXScaleDType() { return DataType::Float8E8M0FNU(); }
+
+SunMMIOType MakeTileType(DataType dtype, const std::vector<int64_t> &shape) {
+  SunMMIOType type;
+  type.kind = SunMMIOType::Kind::kTile;
+  type.dtype = CanonicalizeSuvmDType(dtype).with_lanes(1);
+  type.lanes = 1;
+  for (int64_t dim : shape) {
+    type.shape.push_back(IntImm(DataType::Int(32), dim));
+  }
+  return type;
+}
+
+SunMMIOType MakeTileViewType(DataType dtype,
+                             const std::vector<int64_t> &shape) {
+  SunMMIOType type = MakeTileType(dtype, shape);
+  type.kind = SunMMIOType::Kind::kTileView;
+  return type;
+}
+
+std::vector<int64_t> ExtractStaticPrimExprs(const std::vector<PrimExpr> &exprs,
+                                            const char *what) {
+  std::vector<int64_t> values;
+  values.reserve(exprs.size());
+  for (const PrimExpr &expr : exprs) {
+    const auto *imm = expr.as<IntImmNode>();
+    ICHECK(imm) << what << " must be static, got " << expr;
+    values.push_back(static_cast<int64_t>(imm->value));
+  }
+  return values;
+}
+
+std::vector<int64_t> ExtractStaticShape(const SunMMIOType &type) {
+  return ExtractStaticPrimExprs(type.shape, "SunMMIO type shape");
+}
+
+std::vector<int64_t> ExtractPhysicalExtents(const SunMMIOType &type) {
+  std::vector<int64_t> shape = ExtractStaticShape(type);
+  if (type.layout_hshape.empty()) {
+    return shape;
+  }
+  std::vector<int64_t> hshape =
+      ExtractStaticPrimExprs(type.layout_hshape, "SunMMIO layout shape");
+  if (type.layout_dim_levels.empty()) {
+    return hshape;
+  }
+  ICHECK_EQ(type.layout_dim_levels.size(), shape.size())
+      << "SunMMIO layout dim levels rank mismatch";
+  std::vector<int64_t> physical;
+  physical.reserve(type.layout_dim_levels.size());
+  size_t offset = 0;
+  for (uint8_t levels : type.layout_dim_levels) {
+    ICHECK_GT(levels, 0);
+    ICHECK_LE(offset + levels, hshape.size());
+    int64_t prod = 1;
+    for (uint8_t i = 0; i < levels; ++i) {
+      prod *= hshape[offset + i];
+    }
+    physical.push_back(prod);
+    offset += levels;
+  }
+  ICHECK_EQ(offset, hshape.size());
+  return physical;
 }
 
 } // namespace
@@ -1278,9 +1660,16 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferStoreNode *op) {
     EmitLocalVarStore(op->buffer, op->indices, EvalExpr(op->value));
     return;
   }
-  UnsupportedStmt(
-      op, "generic BufferStoreNode should not reach SunMMIO codegen; "
-          "tiled buffer stores must be lowered through tile-aware paths");
+  if (op->predicate.defined()) {
+    SunMMIOType bool_ty{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
+    SunMMIOValue cond =
+        EnsureType(EvalExpr(op->predicate.value()), bool_ty, DataType::Bool());
+    builder_->BeginIf(cond, std::vector<int64_t>{});
+    EmitScalarTileSet(op);
+    builder_->EndIf();
+    return;
+  }
+  EmitScalarTileSet(op);
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferRealizeNode *op) {
@@ -1566,13 +1955,18 @@ CodeGenTileLangSunMMIO::EmitScalarTilePick(const tir::BufferLoadNode *op) {
   const ffi::Array<PrimExpr> &indices = op->indices;
   const std::string scope = buffer.scope();
   DataType dtype = CanonicalizeSuvmDType(buffer->dtype).with_lanes(1);
+  auto layout = builder_->LookupLayout(buffer);
   auto describe = [&]() {
-    std::ostringstream os;
-    os << "buffer=" << buffer->name << ", scope=" << scope
-       << ", dtype=" << dtype << ", rank=" << indices.size();
-    return os.str();
+    return DescribeScalarTileAccess(buffer, indices, dtype, layout);
   };
 
+  if (op->predicate.defined()) {
+    UnsupportedExpr(op,
+                    "Sunmmio scalar BufferLoad with predicate is not supported "
+                    "yet; use an explicit if_then_else or guard the scalar "
+                    "access in control flow before codegen. " +
+                        describe());
+  }
   if (IsSunmmioAsramScope(scope) || IsSunmmioWsramScope(scope)) {
     UnsupportedExpr(
         op, "Sunmmio scalar BufferLoad cannot read from ASRAM/WSRAM; stage "
@@ -1592,66 +1986,120 @@ CodeGenTileLangSunMMIO::EmitScalarTilePick(const tir::BufferLoadNode *op) {
                         "i16/ui16/i32/ui32/bf16/f32. " +
                             describe());
   }
-  if (indices.size() != 1 && indices.size() != 2) {
-    UnsupportedExpr(
-        op, "Sunmmio RSRAM scalar BufferLoad tile.pick currently "
-            "supports rank-1 or rank-2 RSRAM buffers; stage higher-rank "
-            "side data into an explicit 1D/2D RSRAM buffer before pick. " +
-                describe());
+  if (indices.empty()) {
+    UnsupportedExpr(op, "Sunmmio RSRAM scalar BufferLoad tile.pick currently "
+                        "requires a rank >= 1 RSRAM buffer. " +
+                            describe());
   }
 
-  const int64_t dtype_bits = static_cast<int64_t>(dtype.bits());
-  ICHECK_GT(dtype_bits, 0) << "Unexpected zero-width dtype for " << describe();
   const tl::SunmmioTileProcessorConfig tile_processor_config =
       tl::GetSunmmioTileProcessorConfig(target_);
-  ICHECK_GT(tile_processor_config.register_bits, 0)
-      << "Sunmmio tile.pick requires a positive vector register width";
-  ICHECK_EQ(tile_processor_config.register_bits % dtype_bits, 0)
-      << "Sunmmio vector register width " << tile_processor_config.register_bits
-      << " is not divisible by scalar dtype bit-width " << dtype_bits;
-  const int64_t tile_elems = tile_processor_config.register_bits / dtype_bits;
-  ICHECK_GT(tile_elems, 0) << "Sunmmio tile.pick produced empty tile";
+  std::string plan_failure;
+  std::optional<ScalarTileAccessPlan> plan = PlanScalarTileAccess(
+      buffer, indices, dtype, layout, tile_processor_config, &plan_failure);
+  if (!plan.has_value()) {
+    UnsupportedExpr(op, "Sunmmio scalar BufferLoad cannot infer a legal "
+                        "tile.pick view: " +
+                            plan_failure + ". " + describe());
+  }
+
+  std::vector<SunMMIOValue> partition_indices;
+  partition_indices.reserve(plan->partition_indices.size());
+  for (const PrimExpr &idx : plan->partition_indices) {
+    partition_indices.push_back(EnsureIndex(EvalExpr(idx)));
+  }
+  std::vector<SunMMIOValue> local_indices;
+  local_indices.reserve(plan->local_indices.size());
+  for (const PrimExpr &idx : plan->local_indices) {
+    local_indices.push_back(EnsureIndex(EvalExpr(idx)));
+  }
 
   SunMMIOValue memtensor{dtype, binding.handle, binding.buffer_type};
-  if (indices.size() == 1) {
-    PrimExpr tile_elems_expr = IntImm(indices[0].dtype(), tile_elems);
-    PrimExpr partition_expr = floordiv(indices[0], tile_elems_expr);
-    PrimExpr local_expr = floormod(indices[0], tile_elems_expr);
-
-    SunMMIOValue partition = EnsureIndex(EvalExpr(partition_expr));
-    SunMMIOValue local_index = EnsureIndex(EvalExpr(local_expr));
-
-    SunMMIOType tile_view_type = MakeRank1TileViewType(dtype, tile_elems);
-    SunMMIOValue tile_view = builder_->GetPartitionedTileView(
-        NewValueName(), memtensor, {partition}, {0}, tile_view_type, dtype);
-    SunMMIOType tile_type = MakeRank1TileType(dtype, tile_elems);
-    SunMMIOValue tile = builder_->TileLoad(NewValueName(), tile_view, tile_type,
-                                           std::nullopt, std::nullopt, dtype);
-    return builder_->TilePick(NewValueName(), tile, {local_index},
-                              MakeScalarType(dtype), dtype);
-  }
-
-  std::vector<int64_t> static_shape = StaticBufferShape(buffer);
-  if (static_shape.size() != 2) {
-    UnsupportedExpr(op,
-                    "Sunmmio rank-2 RSRAM scalar BufferLoad tile.pick requires "
-                    "a statically-shaped 2D RSRAM staging buffer. " +
-                        describe());
-  }
-  const int64_t rows = static_shape[0];
-  const int64_t cols = static_shape[1];
-
-  SunMMIOValue row_index = EnsureIndex(EvalExpr(indices[0]));
-  SunMMIOValue col_index = EnsureIndex(EvalExpr(indices[1]));
-  SunMMIOValue zero = EmitConstIndex(0);
-  SunMMIOType tile_view_type = MakeRank2TileViewType(dtype, rows, cols);
+  SunMMIOType tile_view_type = MakeTileTypeForShape(
+      dtype, plan->tile_shape, SunMMIOType::Kind::kTileView);
   SunMMIOValue tile_view = builder_->GetPartitionedTileView(
-      NewValueName(), memtensor, {zero, zero}, {0, 1}, tile_view_type, dtype);
-  SunMMIOType tile_type = MakeRank2TileType(dtype, rows, cols);
+      NewValueName(), memtensor, partition_indices, plan->tiled_dims,
+      tile_view_type, dtype);
+  SunMMIOType tile_type =
+      MakeTileTypeForShape(dtype, plan->tile_shape, SunMMIOType::Kind::kTile);
   SunMMIOValue tile = builder_->TileLoad(NewValueName(), tile_view, tile_type,
                                          std::nullopt, std::nullopt, dtype);
-  return builder_->TilePick(NewValueName(), tile, {row_index, col_index},
+  return builder_->TilePick(NewValueName(), tile, local_indices,
                             MakeScalarType(dtype), dtype);
+}
+
+void CodeGenTileLangSunMMIO::EmitScalarTileSet(const tir::BufferStoreNode *op) {
+  const tir::Buffer &buffer = op->buffer;
+  const ffi::Array<PrimExpr> &indices = op->indices;
+  const std::string scope = buffer.scope();
+  DataType dtype = CanonicalizeSuvmDType(buffer->dtype).with_lanes(1);
+  auto layout = builder_->LookupLayout(buffer);
+  auto describe = [&]() {
+    return DescribeScalarTileAccess(buffer, indices, dtype, layout);
+  };
+
+  if (IsSunmmioAsramScope(scope) || IsSunmmioWsramScope(scope)) {
+    UnsupportedStmt(op,
+                    "Sunmmio scalar BufferStore cannot update ASRAM/WSRAM via "
+                    "tile.set because the old tile value must be read first; "
+                    "stage mutable scalar side data through RSRAM. " +
+                        describe());
+  }
+  if (!IsSunmmioRsramScope(scope)) {
+    UnsupportedStmt(op, "Sunmmio scalar BufferStore to DRAM/global must be "
+                        "legalized by staging through RSRAM before codegen. " +
+                            describe());
+  }
+
+  const BufferBinding &binding = LookupBuffer(buffer);
+  if (!IsSuvmTilePickDType(dtype)) {
+    UnsupportedStmt(op, "Sunmmio scalar BufferStore tile.set supports only "
+                        "i16/ui16/i32/ui32/bf16/f32. " +
+                            describe());
+  }
+  if (indices.empty()) {
+    UnsupportedStmt(op, "Sunmmio RSRAM scalar BufferStore tile.set requires a "
+                        "rank >= 1 RSRAM buffer. " +
+                            describe());
+  }
+
+  const tl::SunmmioTileProcessorConfig tile_processor_config =
+      tl::GetSunmmioTileProcessorConfig(target_);
+  std::string plan_failure;
+  std::optional<ScalarTileAccessPlan> plan = PlanScalarTileAccess(
+      buffer, indices, dtype, layout, tile_processor_config, &plan_failure);
+  if (!plan.has_value()) {
+    UnsupportedStmt(op, "Sunmmio scalar BufferStore cannot infer a legal "
+                        "tile.set view: " +
+                            plan_failure + ". " + describe());
+  }
+
+  std::vector<SunMMIOValue> partition_indices;
+  partition_indices.reserve(plan->partition_indices.size());
+  for (const PrimExpr &idx : plan->partition_indices) {
+    partition_indices.push_back(EnsureIndex(EvalExpr(idx)));
+  }
+  std::vector<SunMMIOValue> local_indices;
+  local_indices.reserve(plan->local_indices.size());
+  for (const PrimExpr &idx : plan->local_indices) {
+    local_indices.push_back(EnsureIndex(EvalExpr(idx)));
+  }
+
+  SunMMIOValue memtensor{dtype, binding.handle, binding.buffer_type};
+  SunMMIOType tile_view_type = MakeTileTypeForShape(
+      dtype, plan->tile_shape, SunMMIOType::Kind::kTileView);
+  SunMMIOValue tile_view = builder_->GetPartitionedTileView(
+      NewValueName(), memtensor, partition_indices, plan->tiled_dims,
+      tile_view_type, dtype);
+  SunMMIOType tile_type =
+      MakeTileTypeForShape(dtype, plan->tile_shape, SunMMIOType::Kind::kTile);
+  SunMMIOValue old_tile = builder_->TileLoad(
+      NewValueName(), tile_view, tile_type, std::nullopt, std::nullopt, dtype);
+  SunMMIOValue scalar_value =
+      EnsureType(EvalExpr(op->value), MakeScalarType(dtype), dtype);
+  SunMMIOValue new_tile = builder_->TileSet(
+      NewValueName(), scalar_value, old_tile, local_indices, tile_type, dtype);
+  builder_->TileStore(new_tile, tile_view, std::nullopt);
 }
 
 void CodeGenTileLangSunMMIO::EmitStore(const tir::Buffer &buffer,
@@ -1845,6 +2293,279 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCast(const SunMMIOValue &v,
   return builder_->Cast(NewValueName(), v, dst, target_dtype);
 }
 
+SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
+                                                        bool is_pack) {
+  auto trace_expr = [&](const PrimExpr &expr) {
+    tir::PostOrderVisit(expr, [&](const ObjectRef &obj) {
+      if (!obj.defined()) {
+        return;
+      }
+      MarkVisitedNodeType(obj->GetTypeKey());
+      if (const auto *call = obj.as<tir::CallNode>()) {
+        MarkVisitedCallOpFromExpr(ffi::GetRef<PrimExpr>(call));
+      }
+    });
+  };
+  auto normalize_region = [&](const PrimExpr &expr) {
+    trace_expr(expr);
+    return tl::NormalizeToBufferRegion(expr);
+  };
+  auto check_full_region = [&](const BufferRegion &region, const char *name) {
+    ICHECK_EQ(region->region.size(), region->buffer->shape.size())
+        << "tl.mx_pack/unpack " << name
+        << " region rank must match buffer rank";
+    arith::Analyzer analyzer;
+    for (size_t i = 0; i < region->region.size(); ++i) {
+      const Range &range = region->region[i];
+      ICHECK(analyzer.CanProveEqual(range->min, make_zero(range->min.dtype())))
+          << "tl.mx_pack/unpack only supports full regions; " << name << " dim "
+          << i << " has min " << range->min;
+      ICHECK(analyzer.CanProveEqual(range->extent, region->buffer->shape[i]))
+          << "tl.mx_pack/unpack only supports full regions; " << name << " dim "
+          << i << " has extent " << range->extent << " but buffer shape is "
+          << region->buffer->shape[i];
+    }
+  };
+  auto check_rank2_static = [&](const Buffer &buffer, const char *name) {
+    ICHECK_EQ(buffer->shape.size(), 2U)
+        << "tl.mx_pack/unpack expects rank-2 " << name << " buffer";
+    for (const PrimExpr &dim : buffer->shape) {
+      ICHECK(dim.as<IntImmNode>()) << "tl.mx_pack/unpack expects static "
+                                   << name << " shape, got " << dim;
+    }
+  };
+  auto make_index_type = []() {
+    return SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}};
+  };
+  auto make_loop_index = [&](const std::string &name) {
+    return SunMMIOValue{DataType::Int(32), name, make_index_type()};
+  };
+  auto begin_for = [&](const std::string &iv_name, int64_t upper) {
+    builder_->BeginFor(iv_name, EmitConstIndex(0), EmitConstIndex(upper),
+                       EmitConstIndex(1), ffi::Map<ffi::String, ffi::Any>(),
+                       std::vector<int64_t>{});
+  };
+  auto make_memtensor_value = [](const BufferBinding &binding, DataType dtype) {
+    return SunMMIOValue{CanonicalizeSuvmDType(dtype).with_lanes(1),
+                        binding.handle, binding.buffer_type};
+  };
+  auto get_tile_view = [&](const SunMMIOValue &memtensor, DataType dtype,
+                           const std::vector<SunMMIOValue> &indices,
+                           const std::vector<int64_t> &tiled_dims,
+                           const std::vector<int64_t> &shape) {
+    return builder_->GetPartitionedTileView(
+        NewValueName(), memtensor, indices, tiled_dims,
+        MakeTileViewType(dtype, shape),
+        CanonicalizeSuvmDType(dtype).with_lanes(1));
+  };
+  auto load_tile = [&](const SunMMIOValue &view, DataType dtype,
+                       const std::vector<int64_t> &shape) {
+    return builder_->TileLoad(NewValueName(), view, MakeTileType(dtype, shape),
+                              std::nullopt, std::nullopt,
+                              CanonicalizeSuvmDType(dtype).with_lanes(1));
+  };
+  auto copy_tile = [&](const SunMMIOValue &src, const SunMMIOValue &dst,
+                       DataType dtype, const std::vector<SunMMIOValue> &indices,
+                       const std::vector<int64_t> &tiled_dims,
+                       const std::vector<int64_t> &shape) {
+    SunMMIOValue src_view =
+        get_tile_view(src, dtype, indices, tiled_dims, shape);
+    SunMMIOValue dst_view =
+        get_tile_view(dst, dtype, indices, tiled_dims, shape);
+    SunMMIOValue tile = load_tile(src_view, dtype, shape);
+    builder_->TileStore(tile, dst_view, std::nullopt);
+  };
+  auto emit_scale_copy = [&](const SunMMIOValue &src, const SunMMIOValue &dst,
+                             tl::sunmmio::MXLayoutKind layout_kind) {
+    constexpr int64_t kScaleValidElems = 32;
+    constexpr int64_t kScaleAccessElems = 64;
+    ICHECK(layout_kind != tl::sunmmio::MXLayoutKind::kRowMajor)
+        << "tl.mx_pack/unpack row-major scale copy is not implemented yet; "
+           "waiting for stable suvm.unpack scale alias layout";
+    std::vector<int64_t> scale_shape = ExtractStaticShape(src.type);
+    std::vector<int64_t> dst_scale_shape = ExtractStaticShape(dst.type);
+    std::vector<int64_t> src_physical = ExtractPhysicalExtents(src.type);
+    std::vector<int64_t> dst_physical = ExtractPhysicalExtents(dst.type);
+    ICHECK(scale_shape == dst_scale_shape)
+        << "MX scale source/destination logical shapes must match";
+    ICHECK_EQ(scale_shape.size(), 2U)
+        << "MX scale alias/user buffer must be rank-2";
+    ICHECK_EQ(scale_shape[1], kScaleValidElems)
+        << "MX scale logical width must be 32, got " << scale_shape[1];
+    ICHECK_EQ(src_physical.size(), 2U)
+        << "MX scale source physical extent must be rank-2";
+    ICHECK_EQ(dst_physical.size(), 2U)
+        << "MX scale destination physical extent must be rank-2";
+    ICHECK_GE(src_physical[1], kScaleValidElems)
+        << "MX scale source physical width must cover 32 logical elements";
+    ICHECK_GE(dst_physical[1], kScaleValidElems)
+        << "MX scale destination physical width must cover 32 logical elements";
+
+    ICHECK(src_physical[1] >= kScaleAccessElems &&
+           dst_physical[1] >= kScaleAccessElems)
+        << "MX scale copy requires source and destination physical width to "
+           "cover a 64B fp8 tile access; got source width "
+        << src_physical[1] << " and destination width " << dst_physical[1];
+
+    std::string row_name = NewValueName();
+    begin_for(row_name, scale_shape[0]);
+    SunMMIOValue row = make_loop_index(row_name);
+    std::vector<SunMMIOValue> indices{row, EmitConstIndex(0)};
+    std::vector<int64_t> tiled_dims{0, 1};
+    std::vector<int64_t> valid_shape{1, kScaleValidElems};
+
+    std::vector<int64_t> access_shape{1, kScaleAccessElems};
+    std::vector<SunMMIOValue> offsets{EmitConstIndex(0), EmitConstIndex(0)};
+
+    SunMMIOValue src_view = get_tile_view(src, ExpectedMXScaleDType(), indices,
+                                          tiled_dims, access_shape);
+    SunMMIOValue src64 =
+        load_tile(src_view, ExpectedMXScaleDType(), access_shape);
+    SunMMIOValue src32 =
+        builder_->TileSlice(NewValueName(), src64, offsets,
+                            MakeTileType(ExpectedMXScaleDType(), valid_shape),
+                            ExpectedMXScaleDType());
+
+    SunMMIOValue dst_view = get_tile_view(dst, ExpectedMXScaleDType(), indices,
+                                          tiled_dims, access_shape);
+    SunMMIOValue dst64 =
+        load_tile(dst_view, ExpectedMXScaleDType(), access_shape);
+    SunMMIOValue merged = builder_->TileInsertSlice(
+        NewValueName(), dst64, src32, offsets,
+        MakeTileType(ExpectedMXScaleDType(), access_shape),
+        ExpectedMXScaleDType());
+    builder_->TileStore(merged, dst_view, std::nullopt);
+    builder_->EndFor();
+  };
+  auto emit_row_major_data_copy = [&](const SunMMIOValue &src,
+                                      const SunMMIOValue &dst, DataType dtype) {
+    std::vector<int64_t> shape = ExtractStaticShape(src.type);
+    std::vector<int64_t> physical = ExtractPhysicalExtents(src.type);
+    ICHECK_EQ(shape.size(), 2U);
+    ICHECK_EQ(physical.size(), 2U);
+    int64_t access_elems = 64 * 8 / dtype.bits();
+    ICHECK_GT(access_elems, 0);
+    ICHECK_EQ(physical[1] % access_elems, 0)
+        << "MX row-major data physical width must be aligned to 64B, got "
+        << physical[1] << " elements for dtype " << dtype;
+    int64_t col_tiles = physical[1] / access_elems;
+
+    std::string row_name = NewValueName();
+    begin_for(row_name, shape[0]);
+    SunMMIOValue row = make_loop_index(row_name);
+    std::string col_name = NewValueName();
+    begin_for(col_name, col_tiles);
+    SunMMIOValue col = make_loop_index(col_name);
+    copy_tile(src, dst, dtype, {row, col}, {0, 1}, {1, access_elems});
+    builder_->EndFor();
+    builder_->EndFor();
+  };
+  auto emit_blockwise_data_copy = [&](const SunMMIOValue &src,
+                                      const SunMMIOValue &dst, DataType dtype,
+                                      bool zn_order) {
+    std::vector<int64_t> physical = ExtractPhysicalExtents(src.type);
+    ICHECK_EQ(physical.size(), 2U);
+    ICHECK_EQ(physical[0] % 32, 0);
+    ICHECK_EQ(physical[1] % 32, 0);
+    int64_t block_m = physical[0] / 32;
+    int64_t block_n = physical[1] / 32;
+    std::vector<int64_t> tiled_dims =
+        zn_order ? std::vector<int64_t>{1, 0} : std::vector<int64_t>{0, 1};
+
+    std::string bm_name = NewValueName();
+    begin_for(bm_name, block_m);
+    SunMMIOValue bm = make_loop_index(bm_name);
+    std::string bn_name = NewValueName();
+    begin_for(bn_name, block_n);
+    SunMMIOValue bn = make_loop_index(bn_name);
+    copy_tile(src, dst, dtype, {bm, bn}, tiled_dims, {32, 32});
+    builder_->EndFor();
+    builder_->EndFor();
+  };
+
+  ICHECK_EQ(op->args.size(), 3U)
+      << (is_pack ? "tl.mx_pack" : "tl.mx_unpack") << " expects 3 args";
+  BufferRegion data_region;
+  BufferRegion scale_region;
+  BufferRegion mx_region;
+  if (is_pack) {
+    data_region = normalize_region(op->args[0]);
+    scale_region = normalize_region(op->args[1]);
+    mx_region = normalize_region(op->args[2]);
+  } else {
+    mx_region = normalize_region(op->args[0]);
+    data_region = normalize_region(op->args[1]);
+    scale_region = normalize_region(op->args[2]);
+  }
+  check_full_region(data_region, "data");
+  check_full_region(scale_region, "scale");
+  check_full_region(mx_region, "mx");
+  check_rank2_static(data_region->buffer, "data");
+  check_rank2_static(scale_region->buffer, "scale");
+  check_rank2_static(mx_region->buffer, "mx");
+
+  const Buffer &data_buffer = data_region->buffer;
+  const Buffer &scale_buffer = scale_region->buffer;
+  const Buffer &mx_buffer = mx_region->buffer;
+  ICHECK(data_buffer.scope() == tl::kSunmmioScopeRSRAM &&
+         scale_buffer.scope() == tl::kSunmmioScopeRSRAM &&
+         mx_buffer.scope() == tl::kSunmmioScopeRSRAM)
+      << "tl.mx_pack/unpack expects data, scale, and mx in shared.rsram";
+  ICHECK(data_buffer->dtype == ExpectedMXDataDType(mx_buffer->dtype))
+      << "data dtype does not match mx dtype";
+  ICHECK(scale_buffer->dtype == ExpectedMXScaleDType())
+      << "scale dtype must be float8_e8m0fnu";
+
+  ffi::Optional<tl::Layout> mx_layout_opt = builder_->LookupLayout(mx_buffer);
+  ICHECK(mx_layout_opt.defined())
+      << "tl.mx_pack/unpack requires a concrete MX layout for mx buffer";
+  arith::Analyzer analyzer;
+  auto analysis = tl::sunmmio::AnalyzeMXLayout(mx_layout_opt.value(),
+                                               mx_buffer->dtype, &analyzer);
+  ICHECK(analysis.has_value())
+      << "tl.mx_pack/unpack supports only MX row-major, MXZZ, and MXZNZ";
+  ICHECK(analysis->kind != tl::sunmmio::MXLayoutKind::kMXZNN)
+      << "tl.mx_pack/unpack does not accept MXZNN as a user mx buffer layout; "
+         "use MXZNZ for RSRAM data staged before WSRAM MXZNN";
+
+  const BufferBinding &data_binding = LookupBuffer(data_buffer);
+  const BufferBinding &scale_binding = LookupBuffer(scale_buffer);
+  const BufferBinding &mx_binding = LookupBuffer(mx_buffer);
+  SunMMIOValue mx_value = make_memtensor_value(mx_binding, mx_buffer->dtype);
+  auto unpacked = builder_->MXUnpack(NewValueName(), NewValueName(), mx_value,
+                                     ExpectedMXScaleDType(),
+                                     ExpectedMXDataDType(mx_buffer->dtype));
+  SunMMIOValue scale_alias = unpacked.first;
+  SunMMIOValue data_alias = unpacked.second;
+  SunMMIOValue data_value =
+      make_memtensor_value(data_binding, data_buffer->dtype);
+  SunMMIOValue scale_value =
+      make_memtensor_value(scale_binding, scale_buffer->dtype);
+
+  SunMMIOValue data_src = is_pack ? data_value : data_alias;
+  SunMMIOValue data_dst = is_pack ? data_alias : data_value;
+  SunMMIOValue scale_src = is_pack ? scale_value : scale_alias;
+  SunMMIOValue scale_dst = is_pack ? scale_alias : scale_value;
+
+  switch (analysis->kind) {
+  case tl::sunmmio::MXLayoutKind::kRowMajor:
+    emit_row_major_data_copy(data_src, data_dst, data_buffer->dtype);
+    break;
+  case tl::sunmmio::MXLayoutKind::kMXZZ:
+  case tl::sunmmio::MXLayoutKind::kMXZNZ:
+    emit_blockwise_data_copy(data_src, data_dst, data_buffer->dtype,
+                             /*zn_order=*/false);
+    break;
+  case tl::sunmmio::MXLayoutKind::kMXZNN:
+    LOG(FATAL) << "MXZNN is an internal WSRAM layout and is not accepted by "
+                  "tl.mx_pack/unpack";
+    break;
+  }
+  emit_scale_copy(scale_src, scale_dst, analysis->kind);
+
+  return SunMMIOValue{op->dtype, "", MapType(op->dtype)};
+}
+
 CodeGenTileLangSunMMIO::CallBucket
 CodeGenTileLangSunMMIO::ClassifyCall(const tir::CallNode *op) const {
   if (op->op.as<GlobalVarNode>()) {
@@ -1859,6 +2580,7 @@ CodeGenTileLangSunMMIO::ClassifyCall(const tir::CallNode *op) const {
   }
   std::string name = op_node->name;
   if (name == "tl.mma_sunmmio" || name == "tl.dma_copy" ||
+      name == "tl.mx_pack" || name == "tl.mx_unpack" ||
       name == "tl.broadcast_" || name.find("sunmmio") != std::string::npos) {
     return CallBucket::kSunMMIOIntrinsic;
   }
@@ -1971,8 +2693,22 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
   }
   std::vector<SunMMIOValue> operands;
   SunMMIOCallAttrs attrs;
-  if (callee == "tl.tileop.region") {
+  if (callee == "tir.if_then_else") {
+    ICHECK_EQ(op->args.size(), 3U) << "tir.if_then_else expects 3 arguments";
+    SunMMIOType bool_ty{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
+    SunMMIOValue cond =
+        EnsureType(EvalExpr(op->args[0]), bool_ty, DataType::Bool());
+    SunMMIOValue tv = EvalExpr(op->args[1]);
+    SunMMIOValue fv = EvalExpr(op->args[2]);
+    fv = EnsureType(fv, tv.type, tv.dtype);
+    DataType dtype = CanonicalizeSuvmDType(op->dtype);
+    return builder_->Select(NewValueName(), cond, tv, fv, tv.type, dtype);
+  } else if (callee == "tl.tileop.region") {
     return EmitRegionCall(tvm::ffi::GetRef<PrimExpr>(op));
+  } else if (callee == "tl.mx_pack") {
+    return EmitMXPackOrUnpack(op, /*is_pack=*/true);
+  } else if (callee == "tl.mx_unpack") {
+    return EmitMXPackOrUnpack(op, /*is_pack=*/false);
   } else if (callee == "tl.sync_null_token" || callee == "tl.wait_token") {
     for (int i = 0, e = static_cast<int>(op->args.size()); i < e; ++i) {
       const PrimExpr &arg = op->args[i];
@@ -2182,17 +2918,22 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
         << "tl.mma_sunmmio acc_offset_byte must be non-negative";
     MarkVisitedNodeType(acc_offset_imm->GetTypeKey());
 
-    operands.reserve(3);
+    operands.reserve(4);
     operands.push_back(EmitRegionCall(op->args[0]));
     operands.push_back(EmitRegionCall(op->args[1]));
     operands.push_back(EmitRegionCall(op->args[2], acc_offset_byte));
+
+    MarkVisitedNodeType(op->args[5]->GetTypeKey());
+    arith::Analyzer analyzer;
+    PrimExpr accumulate = analyzer.Simplify(tir::Not(op->args[5]));
+    SunMMIOType bool_ty{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
+    operands.push_back(
+        EnsureType(EvalExpr(accumulate), bool_ty, DataType::Bool()));
 
     attrs[SunMMIOCallAttrKey::kTransA] =
         parse_bool_arg(op->args[3], "tl.mma_sunmmio transA");
     attrs[SunMMIOCallAttrKey::kTransB] =
         parse_bool_arg(op->args[4], "tl.mma_sunmmio transB");
-    attrs[SunMMIOCallAttrKey::kClearAccum] =
-        parse_bool_arg(op->args[5], "tl.mma_sunmmio clearAccum");
 
     ICHECK(TryConsumeSyncTokenId(op->args[7], &attrs))
         << "tl.mma_sunmmio expects last argument to be tl.sync_token_id";

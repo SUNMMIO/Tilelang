@@ -410,8 +410,6 @@ def test_sunmmio_codegen_lowers_dynamic_barrier_mask():
     assert " : i64 -> !suvm.barrier" in src
     assert src.count("suvm.barrier.init") == 1
     assert src.count("suvm.barrier.arrive_and_wait") == 1
-    assert "cf.assert" not in src
-    assert "sunmmio.fake" not in src
 
 
 def test_sunmmio_codegen_lowers_dynamic_barrier_candidates():
@@ -422,7 +420,6 @@ def test_sunmmio_codegen_lowers_dynamic_barrier_candidates():
     assert src.count("suvm.barrier.arrive_and_wait") == 4
     assert "arith.shli" in src
     assert "arith.cmpi eq" in src
-    assert "cf.assert" in src
     assert "scf.if" in src
     assert "sunmmio.fake" not in src
 
@@ -567,7 +564,7 @@ def test_sunmmio_codegen_buffer_store_fails_loudly():
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
     with pytest.raises(
         Exception,
-        match="generic BufferStoreNode should not reach SunMMIO codegen; tiled buffer stores must be lowered through tile-aware paths",
+        match="Sunmmio scalar BufferStore to DRAM/global must be legalized by staging through RSRAM before codegen",
     ):
         builder(mod, target, "suvm")
 

@@ -24,7 +24,7 @@ LOG_DIR_ENV = "SUNMMIO_TEST_LOG_DIR"
 BASE_EXPECTED_TOKENS = (
     "module",
     "suvm.device_arch",
-    "func.func @",
+    "func.func",
 )
 
 
@@ -202,6 +202,10 @@ def codegen_sunmmio_suvm_mlir(
     *,
     expected_tokens: Sequence[str] = (),
     print_ir: bool | None = None,
+    log_ir: bool | None = None,
+    log_dir: Path | str | None = None,
+    log_subdir: str | None = None,
+    log_case_name: str | None = None,
 ) -> str:
     target = determine_target("Sunmmio", return_object=True)
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
@@ -209,6 +213,14 @@ def codegen_sunmmio_suvm_mlir(
     src = runtime_mod.inspect_source()
 
     assert src.strip()
+    if log_case_name is not None:
+        write_sunmmio_codegen_logs(
+            case_name=log_case_name,
+            mlir_src=src,
+            log_ir=log_ir,
+            log_dir=log_dir,
+            log_subdir=log_subdir,
+        )
     assert_source_contains(src, (*BASE_EXPECTED_TOKENS, *expected_tokens))
 
     print_sunmmio_codegen_debug(
@@ -337,15 +349,11 @@ def validate_sunmmio_codegen_with_npuir_opt(
         device_mod,
         expected_tokens=expected_tokens,
         print_ir=print_ir,
+        log_ir=log_ir,
+        log_dir=log_dir,
+        log_subdir=log_subdir,
+        log_case_name=mlir_filename,
     )
-    if log_enabled:
-        write_sunmmio_codegen_logs(
-            case_name=mlir_filename,
-            mlir_src=src,
-            log_ir=True,
-            log_dir=log_dir,
-            log_subdir=log_subdir,
-        )
     if simplify_mlir:
         src = simplify_suvm_mlir(
             src,

@@ -50,11 +50,15 @@ public:
   TileAccessRewriter(const std::vector<Var> &exec_vars,
                      const std::vector<Var> &interior_vars,
                      const Array<PrimExpr> &tile_size,
-                     Optional<PrimExpr> tile_predicate)
+                     std::vector<Optional<PrimExpr>> tile_axis_predicates)
       : exec_vars_(exec_vars), interior_vars_(interior_vars),
-        tile_size_(tile_size), tile_predicate_(std::move(tile_predicate)) {
+        tile_size_(tile_size),
+        tile_axis_predicates_(std::move(tile_axis_predicates)) {
     ICHECK_EQ(exec_vars_.size(), interior_vars_.size());
     ICHECK_EQ(exec_vars_.size(), tile_size_.size());
+    if (!tile_axis_predicates_.empty()) {
+      ICHECK_EQ(exec_vars_.size(), tile_axis_predicates_.size());
+    }
 
     for (size_t i = 0; i < exec_vars_.size(); ++i) {
       exec_var_nodes_.insert(exec_vars_[i].get());
@@ -167,42 +171,62 @@ private:
     return var;
   }
 
-  Optional<PrimExpr> RewritePredicate(Optional<PrimExpr> predicate) {
+  Optional<PrimExpr> RewritePredicate(Optional<PrimExpr> predicate,
+                                      const std::vector<bool> &matched_axes) {
     if (predicate.defined()) {
       predicate = VisitExpr(predicate.value());
     }
-    if (!tile_predicate_.defined()) {
+    if (tile_axis_predicates_.empty()) {
+      return predicate;
+    }
+
+    Optional<PrimExpr> projected_predicate;
+    for (size_t axis = 0; axis < matched_axes.size(); ++axis) {
+      if (!matched_axes[axis] || !tile_axis_predicates_[axis].defined()) {
+        continue;
+      }
+      PrimExpr clause = tile_axis_predicates_[axis].value();
+      projected_predicate = projected_predicate.defined()
+                                ? And(projected_predicate.value(), clause)
+                                : clause;
+    }
+
+    if (!projected_predicate.defined()) {
       return predicate;
     }
     if (!predicate.defined()) {
-      return tile_predicate_;
+      return projected_predicate;
     }
-    return And(predicate.value(), tile_predicate_.value());
+    return And(predicate.value(), projected_predicate.value());
+  }
+
+  std::vector<bool> MakeMatchedAxes(const Array<PrimExpr> &indices,
+                                    Array<PrimExpr> *rewritten_indices) {
+    std::vector<bool> matched_axes(exec_vars_.size(), false);
+    for (const PrimExpr &index : indices) {
+      NormalizedAccessIndex normalized = NormalizeAccessIndex(index);
+      rewritten_indices->push_back(normalized.index);
+      if (normalized.matched_axis.has_value()) {
+        matched_axes[normalized.matched_axis.value()] = true;
+      }
+    }
+    return matched_axes;
   }
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
-    Optional<PrimExpr> predicate = RewritePredicate(op->predicate);
-
-    if (op->indices.size() == 1) {
-      NormalizedAccessIndex normalized = NormalizeAccessIndex(op->indices[0]);
-      Array<PrimExpr> indices = {normalized.index};
-      return BufferLoad(op->buffer, indices, predicate, op->span);
-    }
-
     Array<PrimExpr> indices;
-    for (const PrimExpr &index : op->indices) {
-      indices.push_back(NormalizeAccessIndex(index).index);
-    }
+    std::vector<bool> matched_axes = MakeMatchedAxes(op->indices, &indices);
+    Optional<PrimExpr> predicate =
+        RewritePredicate(op->predicate, matched_axes);
     return BufferLoad(op->buffer, indices, predicate, op->span);
   }
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     Array<PrimExpr> indices;
-    for (const PrimExpr &index : op->indices) {
-      indices.push_back(NormalizeAccessIndex(index).index);
-    }
+    std::vector<bool> matched_axes = MakeMatchedAxes(op->indices, &indices);
     PrimExpr value = VisitExpr(op->value);
-    Optional<PrimExpr> predicate = RewritePredicate(op->predicate);
+    Optional<PrimExpr> predicate =
+        RewritePredicate(op->predicate, matched_axes);
     return BufferStore(op->buffer, value, indices, predicate, op->span);
   }
 
@@ -210,7 +234,7 @@ private:
   std::vector<Var> exec_vars_;
   std::vector<Var> interior_vars_;
   Array<PrimExpr> tile_size_;
-  Optional<PrimExpr> tile_predicate_;
+  std::vector<Optional<PrimExpr>> tile_axis_predicates_;
   std::unordered_map<Var, PrimExpr, ObjectPtrHash, ObjectPtrEqual> subst_map_;
   std::unordered_set<const VarNode *> exec_var_nodes_;
 };
@@ -297,6 +321,7 @@ private:
     // body. Both predicates: emit scalar full/tail control flow.
     Optional<PrimExpr> access_predicate;
     Optional<PrimExpr> full_tile_predicate;
+    std::vector<Optional<PrimExpr>> access_axis_predicates;
   };
 
   TilePredicateInfo MakeTilePredicateInfo(
@@ -310,6 +335,7 @@ private:
     ICHECK_EQ(exec_vars.size(), execution_domain_axes.size());
 
     TilePredicateInfo info;
+    info.access_axis_predicates.resize(exec_vars.size());
     bool may_emit_full_tile_branch = true;
 
     int domain_rank = static_cast<int>(domain.size());
@@ -335,8 +361,9 @@ private:
       // guarded by the per-element logical coordinate on this axis.
       PrimExpr logical_index =
           exec_vars[axis] * tile_extent + interior_vars[axis];
-      info.access_predicate =
-          Conjoin(info.access_predicate, logical_index < domain_extent);
+      PrimExpr axis_predicate = logical_index < domain_extent;
+      info.access_predicate = Conjoin(info.access_predicate, axis_predicate);
+      info.access_axis_predicates[axis] = axis_predicate;
 
       if (!may_emit_full_tile_branch) {
         continue;
@@ -533,7 +560,7 @@ private:
     if (!predicate_info.access_predicate.defined()) {
       return build_full_body();
     }
-    Stmt tail_body = build_tail_body(predicate_info.access_predicate);
+    Stmt tail_body = build_tail_body(predicate_info.access_axis_predicates);
     if (!predicate_info.full_tile_predicate.defined()) {
       return tail_body;
     }
@@ -621,19 +648,23 @@ private:
         GetExecutionDomainAxes(scope_root.get()).value();
     TilePredicateInfo predicate_info = MakeTilePredicateInfo(
         {ti}, {tail_ki}, {exec_loop}, tile_size, domain, execution_domain_axes);
-    auto build_body = [&](Var ki, Optional<PrimExpr> tile_predicate) {
-      TileAccessRewriter access_rewriter({ti}, {ki}, tile_size,
-                                         std::move(tile_predicate));
-      return Build1DInteriorBody(ki, tile_size,
-                                 access_rewriter.Rewrite(exec_loop->body));
-    };
+    auto build_body =
+        [&](Var ki, std::vector<Optional<PrimExpr>> tile_axis_predicates) {
+          TileAccessRewriter access_rewriter({ti}, {ki}, tile_size,
+                                             std::move(tile_axis_predicates));
+          return Build1DInteriorBody(ki, tile_size,
+                                     access_rewriter.Rewrite(exec_loop->body));
+        };
 
     For new_exec = ffi::GetRef<For>(exec_loop);
     auto *n = new_exec.CopyOnWrite();
     n->body = BuildFullOrTailTileBody(
-        predicate_info, [&]() { return build_body(full_ki, std::nullopt); },
-        [&](Optional<PrimExpr> tile_predicate) {
-          return build_body(tail_ki, std::move(tile_predicate));
+        predicate_info,
+        [&]() {
+          return build_body(full_ki, std::vector<Optional<PrimExpr>>{});
+        },
+        [&](const std::vector<Optional<PrimExpr>> &tile_axis_predicates) {
+          return build_body(tail_ki, tile_axis_predicates);
         });
     n->annotations.Set(attr::tile_scope_entry, Integer(1));
 
@@ -691,20 +722,25 @@ private:
     TilePredicateInfo predicate_info = MakeTilePredicateInfo(
         {ti, tj}, {tail_ki, tail_kj}, {axis0_loop, axis1_loop}, tile_size,
         domain, execution_domain_axes);
-    auto build_body = [&](Var ki, Var kj, Optional<PrimExpr> tile_predicate) {
-      TileAccessRewriter access_rewriter({ti, tj}, {ki, kj}, tile_size,
-                                         std::move(tile_predicate));
-      return Build2DInteriorBody(ki, kj, tile_size,
-                                 access_rewriter.Rewrite(innermost_exec->body));
-    };
+    auto build_body =
+        [&](Var ki, Var kj,
+            std::vector<Optional<PrimExpr>> tile_axis_predicates) {
+          TileAccessRewriter access_rewriter({ti, tj}, {ki, kj}, tile_size,
+                                             std::move(tile_axis_predicates));
+          return Build2DInteriorBody(
+              ki, kj, tile_size, access_rewriter.Rewrite(innermost_exec->body));
+        };
 
     // Replace the innermost execution loop body with the tiled loops.
     For new_inner_exec = ffi::GetRef<For>(innermost_exec);
     new_inner_exec.CopyOnWrite()->body = BuildFullOrTailTileBody(
         predicate_info,
-        [&]() { return build_body(full_ki, full_kj, std::nullopt); },
-        [&](Optional<PrimExpr> tile_predicate) {
-          return build_body(tail_ki, tail_kj, std::move(tile_predicate));
+        [&]() {
+          return build_body(full_ki, full_kj,
+                            std::vector<Optional<PrimExpr>>{});
+        },
+        [&](const std::vector<Optional<PrimExpr>> &tile_axis_predicates) {
+          return build_body(tail_ki, tail_kj, tile_axis_predicates);
         });
 
     Stmt replaced_exec_body = LoopReplacer(innermost_exec, new_inner_exec)(

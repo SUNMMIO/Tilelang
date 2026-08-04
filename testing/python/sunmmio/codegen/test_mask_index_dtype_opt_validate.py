@@ -16,6 +16,7 @@ os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 LOOSE_OPT_ARGS = ("--verify-each",)
+STRICT_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
 
 
 @target("Sunmmio")
@@ -75,6 +76,28 @@ def bf16_select_with_i32_row_mask_kernel(
     return main
 
 
+@target("Sunmmio")
+def bf16_dynamic_rect_tail_mask_kernel(block_m=32, block_n=32, valid_rows=17, valid_cols=19):
+    dtype = T.bfloat16
+    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    tensor_shape = (block_m, block_n)
+    tensor_layout = make_zz_layout(tensor_shape, [0, 1], (block_m, block_n))
+
+    @T.prim_func
+    def main(out: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout)):  # type: ignore
+        with T.Kernel():
+            out_shared = T.alloc_shared(tensor_shape, dtype, scope="shared.rsram")
+            valid_rows_var = T.alloc_var(T.int32, init=valid_rows)
+            valid_cols_var = T.alloc_var(T.int32, init=valid_cols)
+
+            T.clear(out_shared)
+            for row, col in T.Tiles([valid_rows_var, valid_cols_var], parallel=True):
+                out_shared[row, col] = T.Cast(dtype, 7)
+            T.copy(out_shared, out[0:block_m, 0:block_n])
+
+    return main
+
+
 @pytest.mark.parametrize(
     "dtype,expected_index_dtype",
     [
@@ -101,11 +124,23 @@ def test_bf16_select_with_i32_row_mask_lowers_to_llvm(tmp_path):
         tmp_path,
         mlir_filename="bf16_select_with_i32_row_mask_suvm.mlir",
         expected_tokens=("suvm.tile.range", "suvm.tile.cmpi", "suvm.tile.select"),
-        opt_args=("--verify-each", "--suvm-to-llvm-pipeline"),
+        opt_args=STRICT_OPT_ARGS,
     )
     assert re.search(r"suvm\.tile\.range : !suvm\.tile<[^>]*xi16>", src)
     assert re.search(r"suvm\.tile\.cmpi .* : !suvm\.tile<[^>]*xi16>", src)
     assert "suvm.tile.addi" not in src
+
+
+def test_bf16_dynamic_rect_tail_mask_uses_unsigned_i16_compare(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        bf16_dynamic_rect_tail_mask_kernel(),
+        tmp_path,
+        mlir_filename="bf16_dynamic_rect_tail_mask_suvm.mlir",
+        expected_tokens=("suvm.tile.range", "suvm.tile.cmpi", "suvm.tile.andi"),
+        opt_args=STRICT_OPT_ARGS,
+    )
+    assert len(re.findall(r"suvm\.tile\.cmpi\s+ult, .* : !suvm\.tile<[^>]*xi16>", src)) >= 2
+    assert not re.search(r"suvm\.tile\.cmpi\s+slt, .* : !suvm\.tile<[^>]*xi16>", src)
 
 
 def test_float16_sunmmio_codegen_reports_unsupported_dtype(tmp_path):

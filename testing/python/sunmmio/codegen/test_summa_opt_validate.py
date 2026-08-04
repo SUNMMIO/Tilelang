@@ -1,5 +1,6 @@
 import os
 
+import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
@@ -16,7 +17,13 @@ tilelang.env.disable_cache()
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
-LOOSE_OPT_ARGS = ("--verify-each",)
+
+_SHAPES = [
+    (256, 128, 128),
+    (128, 128, 128),
+    (256, 256, 128),
+    (256, 256, 256),
+]
 
 
 @target("Sunmmio")
@@ -88,25 +95,25 @@ def summa_matmul(
                         )
                         # Sunmmio MMA consumes B in the transposed operand mode;
                         # algorithmically this is still the SUMMA B(k, j) panel.
-                        T.gemm(A_shared, B_shared, C_local, transpose_B=True)
+                        T.gemm(A_shared, B_shared, C_local)
 
                     T.copy(C_local, C[bx * block_M, by * block_N])
 
     return kernel
 
 
-def test_summa_matmul_codegen_validates_with_npuir_opt(tmp_path):
+@pytest.mark.parametrize("M,N,K", _SHAPES)
+def test_summa_matmul_codegen_validates_with_npuir_opt(tmp_path, M, N, K):
     src = validate_sunmmio_codegen_with_npuir_opt(
-        summa_matmul(),
+        summa_matmul(M=M, N=N, K=K),
         tmp_path,
-        mlir_filename="summa_matmul_suvm.mlir",
+        mlir_filename=f"summa_matmul_m{M}_n{N}_k{K}_suvm.mlir",
         expected_tokens=(
             "suvm.copy_async",
             "suvm.mcast_tok",
             "suvm.tc.mma",
             "suvm.wait_token",
         ),
-        opt_args=LOOSE_OPT_ARGS,
     )
 
     assert "sunmmio.fake" not in src
@@ -127,7 +134,6 @@ def test_summa_matmul_codegen_contains_broadcast_sync_sequence(tmp_path):
             "suvm.tc.mma",
             "suvm.copy_async",
         ),
-        opt_args=LOOSE_OPT_ARGS,
     )
 
     assert_source_contains(src, ("suvm.wait_token", "suvm.tile.fill"))

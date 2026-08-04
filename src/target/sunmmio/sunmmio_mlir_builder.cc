@@ -284,6 +284,14 @@ SuvmSunmmioBuilder::TilePick(const std::string &result_name,
   return tile_->TilePick(result_name, tile, indices, result_type, dtype);
 }
 
+SunMMIOValue
+SuvmSunmmioBuilder::TileSet(const std::string &result_name,
+                            const SunMMIOValue &value, const SunMMIOValue &tile,
+                            const std::vector<SunMMIOValue> &indices,
+                            const SunMMIOType &result_type, DataType dtype) {
+  return tile_->TileSet(result_name, value, tile, indices, result_type, dtype);
+}
+
 void SuvmSunmmioBuilder::Store(const SunMMIOValue &value,
                                const std::string &buffer_handle,
                                const std::vector<SunMMIOValue> &indices,
@@ -314,6 +322,12 @@ SunMMIOValue SuvmSunmmioBuilder::RegionCall(
     DataType ret_dtype, const SunMMIOType &ret_type, int64_t byte_offset) {
   return call_->RegionCall(result_name, buffer_handle, mins, extents, ret_dtype,
                            ret_type, byte_offset);
+}
+
+std::pair<SunMMIOValue, SunMMIOValue> SuvmSunmmioBuilder::MXUnpack(
+    const std::string &scale_name, const std::string &data_name,
+    const SunMMIOValue &mx, DataType scale_dtype, DataType data_dtype) {
+  return call_->MXUnpack(scale_name, data_name, mx, scale_dtype, data_dtype);
 }
 
 SunMMIOValue SuvmSunmmioBuilder::Ramp(const std::string &result_name,

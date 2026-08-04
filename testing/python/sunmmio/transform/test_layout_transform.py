@@ -21,7 +21,7 @@ from tilelang.layout import (
     is_same_layout,
     make_aligned_row_major,
     make_mx_row_major_layout,
-    make_mxznn_layout,
+    make_mxznz_layout,
     make_mxzz_layout,
     make_row_major,
     make_zz_layout,
@@ -164,13 +164,13 @@ def mxzz_dram_to_mx_row_major_rsram_kernel():
     return tvm.IRModule({"main": main})
 
 
-def mxznn_dram_to_mx_row_major_rsram_kernel():
+def mxznz_dram_to_mx_row_major_rsram_kernel():
     @T.prim_func
     def main(
         A: _dram_typed(
             (64, 64),
             MX_DTYPE,
-            make_mxznn_layout((64, 64), dtype=MX_DTYPE),
+            make_mxznz_layout((64, 64), dtype=MX_DTYPE),
         ),
     ):
         with T.Kernel(1, threads=128) as (bx,):
@@ -327,10 +327,10 @@ def test_mxzz_dram_splits_with_mxzz_staging():
         assert is_same_layout(stage_layout, make_mxzz_layout((64, 64), dtype=MX_DTYPE))
 
 
-def test_mxznn_dram_to_mx_row_major_rsram_is_rejected():
-    """SUVM transform_layout does not support MXZNN <-> MX row-major."""
+def test_mxznz_dram_to_mx_row_major_rsram_is_rejected():
+    """SUVM transform_layout currently supports only MXZZ <-> MX row-major."""
     target = determine_target("Sunmmio", return_object=True)
-    mod = mxznn_dram_to_mx_row_major_rsram_kernel()
+    mod = mxznz_dram_to_mx_row_major_rsram_kernel()
     with tvm.target.Target(target), pytest.raises(Exception, match="MX row-major <-> MXZZ"):
         apply_passes_through_lower_tile_op(mod, target)
 

@@ -1,6 +1,9 @@
+import warnings
+
 import pytest
 
 import tilelang
+import tilelang.utils.target as _target_utils
 import tilelang.language as T
 
 from tilelang import tvm as tvm
@@ -31,6 +34,16 @@ def _broadcast_line_no_core(src, dst, direction, mask, src_offset=0):
     return f"T.broadcast_({src}, {dst}, {direction}, {mask}, {src_offset})"
 
 
+@pytest.fixture
+def _strict_region_validation():
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(True)
+    try:
+        yield
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+
 _ROW_MASK_BX = "T.int64(15)"
 
 _COL_MASK_BX = "T.int64(15)"
@@ -38,15 +51,12 @@ _COL_MASK_BX = "T.int64(15)"
 
 def _expected_axis0_all_lines(buffer):
     src = "T.region(A_shared[0, 0], 1, 128, 128)"
-    return [
-        _broadcast_line_no_core(src, f"T.region({buffer}[bx * 128, 0], 2, 128, 128)", 0, _ROW_MASK_BX),
-        _broadcast_line_no_core(
-            f"T.region({buffer}[bx // 4 * 512, 0], 1, 512, 128)",
-            f"T.region({buffer}[bx // 4 * 512, 0], 2, 512, 128)",
-            1,
-            _COL_MASK_BX,
-        ),
-    ]
+    lines = [_broadcast_line_no_core(src, f"T.region({buffer}[bx * 128, 0], 2, 128, 128)", 1, _COL_MASK_BX)]
+    for row in range(4):
+        offset = "bx % 4 * 128" if row == 0 else f"bx % 4 * 128 + {row * 512}"
+        region = f"T.region({buffer}[{offset}, 0], {{access}}, 128, 128)"
+        lines.append(_broadcast_line_no_core(region.format(access=1), region.format(access=2), 0, _ROW_MASK_BX))
+    return lines
 
 
 def _expected_axis_last_horizontal_lines(buffer):
@@ -63,15 +73,12 @@ def _expected_axis_last_horizontal_lines(buffer):
 
 def _expected_axis_last_all_lines(buffer):
     src = "T.region(A_shared[0, 0], 1, 128, 128)"
-    return [
-        _broadcast_line_no_core(src, f"T.region({buffer}[0, bx * 128], 2, 128, 128)", 0, _ROW_MASK_BX),
-        _broadcast_line_no_core(
-            f"T.region({buffer}[0, bx // 4 * 512], 1, 128, 512)",
-            f"T.region({buffer}[0, bx // 4 * 512], 2, 128, 512)",
-            1,
-            _COL_MASK_BX,
-        ),
-    ]
+    lines = [_broadcast_line_no_core(src, f"T.region({buffer}[0, bx * 128], 2, 128, 128)", 1, _COL_MASK_BX)]
+    for row in range(4):
+        offset = "bx % 4 * 128" if row == 0 else f"bx % 4 * 128 + {row * 512}"
+        region = f"T.region({buffer}[0, {offset}], {{access}}, 128, 128)"
+        lines.append(_broadcast_line_no_core(region.format(access=1), region.format(access=2), 0, _ROW_MASK_BX))
+    return lines
 
 
 def _allreduce_frontend_kernel(direction="all", clear=True, dtype="float32"):
@@ -165,7 +172,7 @@ def test_comm_buffer_like_region_python_api():
     ) in script
 
 
-def test_comm_one_to_one_regions_follow_copy_normalization_rules():
+def test_comm_one_to_one_regions_follow_copy_normalization_rules(_strict_region_validation):
     @T.prim_func
     def main():
         with T.Kernel():
@@ -184,7 +191,101 @@ def test_comm_one_to_one_regions_follow_copy_normalization_rules():
     assert "T.comm_broadcast(src[0, 0:32, 0:32], shrink_dst[0:32, 0:32], -1, 0, 0)" in script
 
 
-def test_comm_one_to_one_full_buffer_extent_mismatch_is_rejected():
+def test_comm_compact_path_preserves_original_regions():
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(False)
+    try:
+
+        @T.prim_func
+        def main():
+            with T.Kernel():
+                src = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+                broadcast_dst = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+                put_dst = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+                gather_send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                gather_recv = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
+                reduce_src = T.alloc_shared((32, 64), "float32", scope="shared.rsram")
+                reduce_out = T.alloc_shared((32,), "float32", scope="shared.rsram")
+
+                T.comm.broadcast(src[0:1, 0:32, 0:32], broadcast_dst[0:4, 0:32, 0:32], (0, 0), direction="h")
+                T.comm.put(src[0:1, 0:32, 0:32], put_dst[0:4, 0:32, 0:32], (0, 0), (0, 1))
+                T.comm.all_gather(gather_send, gather_recv, direction="h")
+                T.comm.all_reduce(reduce_src, reduce_out, "sum", "h", dim=1)
+
+        script = main.script()
+        assert "T.comm_broadcast(src[0, 0:32, 0:32], broadcast_dst[0:4, 0:32, 0:32]" in script
+        assert "T.comm_put(src[0, 0:32, 0:32], put_dst[0:4, 0:32, 0:32]" in script
+        assert "T.comm_allgather(gather_send[0:32, 0:32], gather_recv[0:4, 0:32, 0:32]" in script
+        assert "T.comm_allreduce(reduce_src[0:32, 0:64], reduce_out[0:32]" in script
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+
+def test_comm_compact_path_keeps_original_dynamic_extent_behavior():
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(False)
+    try:
+        dynamic_extent = tvm.tir.Var("dynamic_extent", "int32")
+        src = tvm.tir.decl_buffer((dynamic_extent, 32), "float32", name="src", scope="shared.rsram")
+        same_shape_dst = tvm.tir.decl_buffer((dynamic_extent, 32), "float32", name="same_shape_dst", scope="shared.rsram")
+        static_dst = tvm.tir.decl_buffer((64, 32), "float32", name="static_dst", scope="shared.rsram")
+
+        with pytest.raises(ValueError, match="Cannot convert to BufferLoad"):
+            T.comm.broadcast(src, same_shape_dst, 0, direction="h")
+
+        with pytest.raises(ValueError, match="same number of dimensions for broadcast"):
+            T.comm.broadcast(src, static_dst, 0, direction="h")
+
+        gather_recv = tvm.tir.decl_buffer((4, 64, 32), "float32", name="gather_recv", scope="shared.rsram")
+        with pytest.raises(AssertionError, match="Receive buffer shape"):
+            T.comm.all_gather(src, gather_recv, direction="h")
+
+        reduce_out = tvm.tir.decl_buffer((64,), "float32", name="reduce_out", scope="shared.rsram")
+        with pytest.raises(ValueError, match="Invalid reduce output shape"):
+            T.comm.all_reduce(src, reduce_out, "sum", "h", dim=1)
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+
+def test_comm_compact_path_accepts_unresolved_mesh_shape_without_warning():
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(False)
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message=".*cannot resolve mesh-symbol extents.*")
+
+            @T.prim_func
+            def main():
+                with T.Kernel():
+                    send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                    recv = T.alloc_shared((32, 32 * T.mesh_ncols()), "float32", scope="shared.rsram")
+                    reduce_src = T.alloc_shared((32 * T.mesh_ncols(), 32), "float32", scope="shared.rsram")
+                    reduce_out = T.alloc_shared((128,), "float32", scope="shared.rsram")
+                    T.comm.all_gather(send, recv, direction="h", axis=-1)
+                    T.comm.all_reduce(reduce_src, reduce_out, "sum", "h", dim=1)
+
+        assert "mesh_ncols" in main.script()
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+
+def test_comm_compact_path_keeps_static_checks_with_unresolved_mesh_shape():
+    previous = _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    _target_utils.set_sunmmio_region_validation(False)
+    try:
+        with pytest.raises(AssertionError, match="Receive buffer shape"):
+
+            @T.prim_func
+            def main():
+                with T.Kernel():
+                    send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                    recv = T.alloc_shared((64, 32 * T.mesh_ncols()), "float32", scope="shared.rsram")
+                    T.comm.all_gather(send, recv, direction="h", axis=-1)
+    finally:
+        _target_utils.set_sunmmio_region_validation(previous)
+
+
+def test_comm_one_to_one_full_buffer_extent_mismatch_is_rejected(_strict_region_validation):
     with pytest.raises(ValueError, match="exact match is required for Buffer-to-Buffer operation"):
 
         @T.prim_func
@@ -195,7 +296,7 @@ def test_comm_one_to_one_full_buffer_extent_mismatch_is_rejected():
                 T.comm.broadcast(src, dst, (0, 0), direction="h")
 
 
-def test_comm_explicit_region_oob_is_warned_and_clipped():
+def test_comm_explicit_region_oob_is_warned_and_clipped(_strict_region_validation):
     with pytest.warns(UserWarning, match="T.comm.put explicit BufferRegion exceeds buffer shape"):
 
         @T.prim_func
@@ -208,7 +309,7 @@ def test_comm_explicit_region_oob_is_warned_and_clipped():
     assert "T.comm_put(src[0:32, 0:32], dst[0:32, 0:32], -1, 0, 1)" in main.script()
 
 
-def test_comm_all_gather_regions_follow_copy_normalization_rules():
+def test_comm_all_gather_regions_follow_copy_normalization_rules(_strict_region_validation):
     @T.prim_func
     def main():
         with T.Kernel():
@@ -230,7 +331,7 @@ def test_comm_all_gather_regions_follow_copy_normalization_rules():
     assert "T.comm_allgather(send[0:32, 0:32], recv_axis_shrink[0:128, 0:32], 0, -1, 0," in script
 
 
-def test_comm_all_gather_buffer_load_pair_is_rejected():
+def test_comm_all_gather_buffer_load_pair_is_rejected(_strict_region_validation):
     with pytest.raises(ValueError, match="both operands are BufferLoad"):
 
         @T.prim_func
@@ -241,7 +342,7 @@ def test_comm_all_gather_buffer_load_pair_is_rejected():
                 T.comm.all_gather(send[0, 0], recv[0, 0, 0], direction="h")
 
 
-def test_comm_all_gather_full_buffer_extent_mismatch_is_rejected():
+def test_comm_all_gather_full_buffer_extent_mismatch_is_rejected(_strict_region_validation):
     with pytest.raises(ValueError, match="exact match is required for Buffer-to-Buffer operation"):
 
         @T.prim_func
@@ -252,7 +353,7 @@ def test_comm_all_gather_full_buffer_extent_mismatch_is_rejected():
                 T.comm.all_gather(send, recv, direction="h")
 
 
-def test_comm_all_reduce_regions_follow_copy_normalization_rules():
+def test_comm_all_reduce_regions_follow_copy_normalization_rules(_strict_region_validation):
     @T.prim_func
     def main():
         with T.Kernel():
@@ -271,7 +372,7 @@ def test_comm_all_reduce_regions_follow_copy_normalization_rules():
     assert "T.comm_allreduce(src[0:32, 0:64], out_shrink[0:32]" in script
 
 
-def test_comm_all_reduce_full_buffer_extent_mismatch_is_rejected():
+def test_comm_all_reduce_full_buffer_extent_mismatch_is_rejected(_strict_region_validation):
     with pytest.raises(ValueError, match="exact match is required for Buffer-to-Buffer operation"):
 
         @T.prim_func
@@ -282,7 +383,7 @@ def test_comm_all_reduce_full_buffer_extent_mismatch_is_rejected():
                 T.comm.all_reduce(src, out, "sum", "h", dim=1)
 
 
-def test_comm_all_reduce_buffer_load_pair_is_rejected():
+def test_comm_all_reduce_buffer_load_pair_is_rejected(_strict_region_validation):
     with pytest.raises(ValueError, match="both operands are BufferLoad"):
 
         @T.prim_func
@@ -461,16 +562,14 @@ def test_comm_all_gather_lower(M, N, block_M, block_N, dtype, accum_dtype):
         _broadcast_line_no_core(
             "T.region(A_shared[0, 0], 1, 128, 128)",
             "T.region(C_shared[bx, 0, 0], 2, 1, 128, 128)",
-            0,
-            _ROW_MASK_BX,
-        ),
-        _broadcast_line_no_core(
-            "T.region(C_shared[bx // 4 * 4, 0, 0], 1, 4, 128, 128)",
-            "T.region(C_shared[bx // 4 * 4, 0, 0], 2, 4, 128, 128)",
             1,
             _COL_MASK_BX,
-        ),
+        )
     ]
+    for row in range(4):
+        slot = "bx % 4" if row == 0 else f"bx % 4 + {row * 4}"
+        region = f"T.region(C_shared[{slot}, 0, 0], {{access}}, 1, 128, 128)"
+        expected.append(_broadcast_line_no_core(region.format(access=1), region.format(access=2), 0, _ROW_MASK_BX))
 
     @T.prim_func
     def main(

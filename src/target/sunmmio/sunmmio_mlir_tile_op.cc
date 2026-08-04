@@ -596,7 +596,9 @@ SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
             ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc(debug_tag.str()),
             range_scalar_mlir_type, raw);
       }
-      return mlir::arith::ExtSIOp::create(
+      // TileAxisMask extents count valid, zero-based lanes.  Preserve that
+      // unsigned interpretation when a narrow extent is widened.
+      return mlir::arith::ExtUIOp::create(
           ctx_.builder, SunmmioMlirType(ctx_).MakeDebugLoc(debug_tag.str()),
           range_scalar_mlir_type, raw);
     }
@@ -622,7 +624,7 @@ SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
     mlir::Value mask_value =
         mlir::suvm::TileCmpIOp::create(
             ctx_.builder, MapMlirLoc(ctx_), MapMlirType(ctx_, mask_type),
-            mlir::suvm::VCmpIPredicate::slt, range, valid_extent_value)
+            mlir::suvm::VCmpIPredicate::ult, range, valid_extent_value)
             .getResult();
     BindRequiredResult(ctx_, result_name, mask_value, "suvm.tile.axis_mask");
     return SunMMIOValue{DataType::Bool(), result_name, tile_type};
@@ -666,7 +668,7 @@ SunMMIOValue SunmmioMlirTileOp::TileAxisMask(const std::string &result_name,
   mlir::Value mask_value =
       mlir::suvm::TileCmpIOp::create(
           ctx_.builder, MapMlirLoc(ctx_), MapMlirType(ctx_, mask_full_type),
-          mlir::suvm::VCmpIPredicate::slt, range_full, valid_extent_value)
+          mlir::suvm::VCmpIPredicate::ult, range_full, valid_extent_value)
           .getResult();
   BindRequiredResult(ctx_, result_name, mask_value, "suvm.tile.axis_mask");
   return SunMMIOValue{DataType::Bool(), result_name, tile_type};
@@ -781,6 +783,25 @@ SunmmioMlirTileOp::TilePick(const std::string &result_name,
           ctx_.builder.getDenseI64ArrayAttr(mixed_indices.static_values))
           .getResult();
   BindRequiredResult(ctx_, result_name, scalar_value, "suvm.tile.pick");
+  return SunMMIOValue{dtype, result_name, result_type};
+}
+
+SunMMIOValue
+SunmmioMlirTileOp::TileSet(const std::string &result_name,
+                           const SunMMIOValue &value, const SunMMIOValue &tile,
+                           const std::vector<SunMMIOValue> &indices,
+                           const SunMMIOType &result_type, DataType dtype) {
+  mlir::Type result_mlir_type = MapMlirType(ctx_, result_type);
+  mlir::Value value_input = ctx_.LookupValue(value, "missing_tile_set_value");
+  mlir::Value tile_input = ctx_.LookupValue(tile, "missing_tile_set_src");
+  MixedIndexList mixed_indices = BuildMixedIndexList(ctx_, indices);
+  mlir::Value tile_value =
+      mlir::suvm::TileSetOp::create(
+          ctx_.builder, MapMlirLoc(ctx_), result_mlir_type, value_input,
+          tile_input, mixed_indices.dynamic_values,
+          ctx_.builder.getDenseI64ArrayAttr(mixed_indices.static_values))
+          .getResult();
+  BindRequiredResult(ctx_, result_name, tile_value, "suvm.tile.set");
   return SunMMIOValue{dtype, result_name, result_type};
 }
 

@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/Operation.h"
 #include "npuir/Dialect/SUVM/IR/Attributes.h"
 #include "npuir/Dialect/SUVM/IR/Ops.h"
@@ -21,6 +22,57 @@
 
 namespace tvm {
 namespace codegen {
+
+namespace {
+
+std::string MapMemoryScopeName(mlir::suvm::MemorySpace space) {
+  switch (space) {
+  case mlir::suvm::MemorySpace::global:
+    return "global";
+  case mlir::suvm::MemorySpace::asram:
+    return "shared.asram";
+  case mlir::suvm::MemorySpace::wsram:
+    return "shared.wsram";
+  case mlir::suvm::MemorySpace::rsram:
+    return "shared.rsram";
+  }
+  LOG(FATAL) << "Unsupported SUVM memory space";
+  TVM_FFI_UNREACHABLE();
+}
+
+SunMMIOType ConvertMemTensorType(mlir::suvm::MemTensorType memtensor_type,
+                                 DataType dtype) {
+  SunMMIOType type;
+  type.kind = SunMMIOType::Kind::kMemTensor;
+  type.dtype = dtype.with_lanes(1);
+  type.lanes = 1;
+  for (int64_t dim : memtensor_type.getShape()) {
+    ICHECK(!mlir::ShapedType::isDynamic(dim))
+        << "MX unpack alias memtensor must have static shape";
+    type.shape.push_back(IntImm(DataType::Int(32), dim));
+  }
+
+  mlir::suvm::LayoutAttr layout = memtensor_type.getLayout();
+  for (int64_t dim : layout.getFlattenedHShape()) {
+    ICHECK(!mlir::ShapedType::isDynamic(dim))
+        << "MX unpack alias layout shape must be static";
+    type.layout_hshape.push_back(IntImm(DataType::Int(32), dim));
+  }
+  for (int64_t stride : layout.getFlattenedHStride()) {
+    ICHECK(!mlir::ShapedType::isDynamic(stride))
+        << "MX unpack alias layout stride must be static";
+    type.layout_hstride.push_back(IntImm(DataType::Int(32), stride));
+  }
+  for (uint8_t level : layout.getDimLevels()) {
+    type.layout_dim_levels.push_back(level);
+  }
+  type.memory_scope =
+      MapMemoryScopeName(memtensor_type.getMemorySpace().getValue());
+  type.byte_offset = memtensor_type.getByteOffset();
+  return type;
+}
+
+} // namespace
 
 SunmmioMlirCall::SunmmioMlirCall(SunmmioMlirContext &ctx) : ctx_(ctx) {}
 
@@ -96,6 +148,56 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
       indices, tiled_dims_attr);
   ctx_.BindMLIRValue(result_name, view_op->getResult(0));
   return SunMMIOValue{ret_dtype, result_name, ret_type};
+}
+
+std::pair<SunMMIOValue, SunMMIOValue>
+SunmmioMlirCall::MXUnpack(const std::string &scale_name,
+                          const std::string &data_name, const SunMMIOValue &mx,
+                          DataType scale_dtype, DataType data_dtype) {
+  ICHECK(!scale_name.empty() && !data_name.empty())
+      << "MXUnpack expects named scale/data alias results";
+  SunmmioMlirType type(ctx_);
+
+  mlir::Value mx_value = ctx_.LookupMLIRValue(mx.value);
+  ICHECK(mx_value) << "Missing MLIR MX memtensor for `" << mx.value << "`";
+  auto mx_type = mlir::dyn_cast<mlir::suvm::MemTensorType>(mx_value.getType());
+  ICHECK(mx_type) << "MXUnpack expects source to be a suvm.memtensor";
+
+  mlir::Location loc = type.MakeDebugLoc("mx_unpack");
+  mlir::SmallVector<mlir::Type, 2> result_types;
+  mlir::LogicalResult inferred = mlir::suvm::UnpackOp::inferReturnTypes(
+      &ctx_.mlir_ctx, loc, mlir::ValueRange{mx_value}, mlir::DictionaryAttr(),
+      nullptr, mlir::RegionRange(), result_types);
+  ICHECK(mlir::succeeded(inferred))
+      << "Failed to infer suvm.unpack result types from MX memtensor";
+  ICHECK_EQ(result_types.size(), 2U)
+      << "suvm.unpack must infer scale and data result types";
+
+  mlir::OperationState st(loc, "suvm.unpack");
+  st.addOperands(mx_value);
+  st.addTypes(result_types);
+  mlir::Operation *unpack_op = ctx_.builder.create(st);
+  ICHECK(unpack_op && unpack_op->getNumResults() == 2)
+      << "suvm.unpack lowering expected two results";
+
+  mlir::Value scale_value = unpack_op->getResult(0);
+  mlir::Value data_value = unpack_op->getResult(1);
+  auto scale_type =
+      mlir::dyn_cast<mlir::suvm::MemTensorType>(scale_value.getType());
+  auto data_type =
+      mlir::dyn_cast<mlir::suvm::MemTensorType>(data_value.getType());
+  ICHECK(scale_type && data_type) << "suvm.unpack results must be memtensors";
+  ICHECK(scale_type.getElementType() == type.MapElementType(scale_dtype))
+      << "suvm.unpack scale dtype does not match expected TileLang dtype";
+  ICHECK(data_type.getElementType() == type.MapElementType(data_dtype))
+      << "suvm.unpack data dtype does not match expected TileLang dtype";
+
+  ctx_.BindMLIRValue(scale_name, scale_value);
+  ctx_.BindMLIRValue(data_name, data_value);
+  return {SunMMIOValue{scale_dtype, scale_name,
+                       ConvertMemTensorType(scale_type, scale_dtype)},
+          SunMMIOValue{data_dtype, data_name,
+                       ConvertMemTensorType(data_type, data_dtype)}};
 }
 
 SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
@@ -276,7 +378,7 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     mlir::IntegerAttr mask_attr = ctx_.builder.getI64IntegerAttr(mask);
     auto barrier_op = mlir::suvm::BarrierInitOp::create(
         ctx_.builder, type.MakeDebugLoc("barrier_init"), mlir::Value{},
-        mask_attr);
+        mask_attr, mlir::IntegerAttr{});
     ctx_.static_barrier_by_mask[mask] = barrier_op.getBarrier();
     return barrier_op.getBarrier();
   };
@@ -296,14 +398,13 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     }
     auto barrier_op = mlir::suvm::BarrierInitOp::create(
         ctx_.builder, type.MakeDebugLoc("barrier_init"), mask,
-        mlir::IntegerAttr{});
+        mlir::IntegerAttr{}, mlir::IntegerAttr{});
     ctx_.barrier_by_mask[key] = barrier_op.getBarrier();
     return barrier_op.getBarrier();
   };
   auto emit_barrier_arrive_and_wait = [&](mlir::Value barrier) {
     (void)mlir::suvm::BarrierArriveAndWaitOp::create(
-        ctx_.builder, type.MakeDebugLoc("barrier_arrive_and_wait"), barrier,
-        mlir::IntegerAttr{});
+        ctx_.builder, type.MakeDebugLoc("barrier_arrive_and_wait"), barrier);
   };
   auto emit_candidate_barrier_wait =
       [&](mlir::Value dynamic_mask, const std::vector<int64_t> &candidates) {
@@ -335,14 +436,6 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
           ctx_.builder.setInsertionPointToStart(&else_block);
           if (index + 1 < candidates.size()) {
             emit_case(index + 1);
-          } else {
-            mlir::Value always_false = mlir::arith::ConstantIntOp::create(
-                                           ctx_.builder, type.Loc(), 0, 1)
-                                           .getResult();
-            mlir::cf::AssertOp::create(
-                ctx_.builder, type.Loc(), always_false,
-                ctx_.builder.getStringAttr(
-                    "dynamic barrier mask is not in candidate set"));
           }
 
           ctx_.builder.setInsertionPointAfter(if_op);
@@ -491,7 +584,7 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
 
     auto copy_op = mlir::suvm::CopyAsyncOp::create(
         ctx_.builder, type.MakeDebugLoc("dma_copy"), src, dst,
-        mlir::suvm::PadModeAttr{}, mlir::suvm::OdmaChannelAttr{});
+        mlir::suvm::OdmaChannelAttr{});
 
     ICHECK(!result_name.empty()) << "tl.dma_copy expects a token result";
     ICHECK(copy_op && copy_op->getNumResults() == 1)
@@ -576,6 +669,11 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
       auto mcast_op = mlir::suvm::MulticastTokOp::create(
           ctx_.builder, type.MakeDebugLoc("broadcast"), src, dst, mask,
           direction, mlir::suvm::OdmaChannelAttr{});
+      ICHECK(succeeded(mcast_op.verify()))
+          << "tl.broadcast_ generated an invalid suvm.mcast_tok";
+      ICHECK(
+          succeeded(mcast_op.verifyWithDeviceArch(mlir::suvm::DeviceArch::a4e)))
+          << "tl.broadcast_ violates A4E multicast data-path constraints";
       return mcast_op->getResult(0);
     };
 
@@ -627,8 +725,9 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.mma_sunmmio") {
-    ICHECK_EQ(operands.size(), 3)
-        << "tl.mma_sunmmio expects A/B/C tile views as operands";
+    ICHECK_EQ(operands.size(), 4)
+        << "tl.mma_sunmmio expects A/B/C tile views and an accumulate "
+           "condition as operands";
 
     mlir::Value a = ctx_.LookupMLIRValue(operands[0].value);
     ICHECK(a) << "Missing MLIR activation tile view for tl.mma_sunmmio `"
@@ -648,23 +747,24 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     auto c_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(c.getType());
     ICHECK(c_ty) << "tl.mma_sunmmio expects accumulator to be a suvm.tile_view";
 
+    mlir::Value accumulate = ctx_.LookupMLIRValue(operands[3].value);
+    ICHECK(accumulate)
+        << "Missing MLIR accumulate condition for tl.mma_sunmmio `"
+        << operands[3].value << "`";
+    accumulate = type.EnsureI1(accumulate);
+
     bool trans_a =
         require_bool_attr(SunMMIOCallAttrKey::kTransA, "tl.mma_sunmmio transA");
     ICHECK(!trans_a)
         << "tl.mma_sunmmio lowering to suvm.tc.mma does not support transA";
     bool trans_b =
         require_bool_attr(SunMMIOCallAttrKey::kTransB, "tl.mma_sunmmio transB");
-    bool clear_accum = require_bool_attr(SunMMIOCallAttrKey::kClearAccum,
-                                         "tl.mma_sunmmio clearAccum");
-
-    mlir::UnitAttr acc_attr =
-        clear_accum ? mlir::UnitAttr() : ctx_.builder.getUnitAttr();
     mlir::UnitAttr trans_attr =
         trans_b ? ctx_.builder.getUnitAttr() : mlir::UnitAttr();
 
-    auto mma_op = mlir::suvm::TcMmaOp::create(ctx_.builder,
-                                              type.MakeDebugLoc("mma_sunmmio"),
-                                              c, a, w, c, acc_attr, trans_attr);
+    auto mma_op = mlir::suvm::TcMmaOp::create(
+        ctx_.builder, type.MakeDebugLoc("mma_sunmmio"), c, a, w, c, accumulate,
+        trans_attr);
 
     ICHECK(!result_name.empty()) << "tl.mma_sunmmio expects a token result";
     ICHECK(mma_op && mma_op->getNumResults() == 1)

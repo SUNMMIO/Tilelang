@@ -34,7 +34,6 @@ constexpr const char *kTokenId = "token_id";
 constexpr const char *kDirection = "direction";
 constexpr const char *kTransA = "trans_a";
 constexpr const char *kTransB = "trans_b";
-constexpr const char *kClearAccum = "clear_accum";
 constexpr const char *kParticipantMask = "participant_mask";
 constexpr const char *kCandidateMasks = "candidate_masks";
 constexpr const char *kBarrierMaskKey = "barrier_mask_key";
@@ -209,6 +208,11 @@ public:
                                 const SunMMIOType &result_type,
                                 DataType dtype) = 0;
 
+  virtual SunMMIOValue
+  TileSet(const std::string &result_name, const SunMMIOValue &value,
+          const SunMMIOValue &tile, const std::vector<SunMMIOValue> &indices,
+          const SunMMIOType &result_type, DataType dtype) = 0;
+
   virtual void Store(const SunMMIOValue &value,
                      const std::string &buffer_handle,
                      const std::vector<SunMMIOValue> &indices,
@@ -230,6 +234,11 @@ public:
              const std::vector<SunMMIOValue> &mins,
              const std::vector<int64_t> &extents, DataType ret_dtype,
              const SunMMIOType &ret_type, int64_t byte_offset = 0) = 0;
+
+  virtual std::pair<SunMMIOValue, SunMMIOValue>
+  MXUnpack(const std::string &scale_name, const std::string &data_name,
+           const SunMMIOValue &mx, DataType scale_dtype,
+           DataType data_dtype) = 0;
 
   virtual SunMMIOValue Ramp(const std::string &result_name,
                             const SunMMIOValue &base,
@@ -404,6 +413,7 @@ private:
                        const tvm::PrimExpr &rhs);
   SunMMIOValue EmitCast(const SunMMIOValue &v, tvm::DataType target_dtype);
   SunMMIOValue EmitCall(const tir::CallNode *op);
+  SunMMIOValue EmitMXPackOrUnpack(const tir::CallNode *op, bool is_pack);
   SunMMIOValue EmitRegionCall(const tvm::PrimExpr &region_expr,
                               int64_t byte_offset = 0);
   SunMMIOValue EmitLoad(const tir::Buffer &buffer,
@@ -420,6 +430,7 @@ private:
                          const ffi::Array<PrimExpr> &indices,
                          const SunMMIOValue &value);
   SunMMIOValue EmitScalarTilePick(const tir::BufferLoadNode *op);
+  void EmitScalarTileSet(const tir::BufferStoreNode *op);
   std::vector<SunMMIOValue>
   CollectLocalVarLiveOutValues(const tir::Stmt &stmt) const;
   bool TryLowerTilesScope(const tir::ForNode *op);

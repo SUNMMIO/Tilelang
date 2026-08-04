@@ -45,6 +45,44 @@ TEST(SubstituteWithBufferPredicatesTest, RewritesLoadAndStorePredicates) {
   EXPECT_TRUE(equal(load_node->predicate.value(), expected_predicate));
 }
 
+TEST(SubstituteWithBufferPredicatesTest,
+     RewritesLoadStorePredicatesAndAnnotations) {
+  Var old_n("old_n", DataType::Int(32));
+  Var new_n("new_n", DataType::Int(32));
+  Var i("i", DataType::Int(32));
+  Buffer src = decl_buffer({I(32)}, DataType::Float(32), "src");
+  Buffer dst = decl_buffer({I(32)}, DataType::Float(32), "dst");
+
+  PrimExpr predicate = i < old_n;
+  BufferLoad load(src, {i}, predicate);
+  Stmt store = BufferStore(dst, load, {i}, predicate);
+  ffi::Map<ffi::String, ffi::Any> annotations = {
+      {"tile.domain", ffi::Array<PrimExpr>{old_n}}};
+  Stmt loop =
+      For(i, I(0), I(1), ForKind::kSerial, store, std::nullopt, annotations);
+
+  Stmt rewritten =
+      SubstituteWithAnnotationsAndBufferPredicates(loop, {{old_n, new_n}});
+  const auto *loop_node = rewritten.as<ForNode>();
+  ASSERT_NE(loop_node, nullptr);
+  auto domain =
+      Downcast<ffi::Array<PrimExpr>>(loop_node->annotations.at("tile.domain"));
+  ASSERT_EQ(domain.size(), 1U);
+  EXPECT_TRUE(domain[0].same_as(new_n));
+
+  const auto *store_node = loop_node->body.as<BufferStoreNode>();
+  ASSERT_NE(store_node, nullptr);
+  const auto *load_node = store_node->value.as<BufferLoadNode>();
+  ASSERT_NE(load_node, nullptr);
+  ASSERT_TRUE(store_node->predicate.defined());
+  ASSERT_TRUE(load_node->predicate.defined());
+
+  PrimExpr expected_predicate = i < new_n;
+  StructuralEqual equal;
+  EXPECT_TRUE(equal(store_node->predicate.value(), expected_predicate));
+  EXPECT_TRUE(equal(load_node->predicate.value(), expected_predicate));
+}
+
 } // namespace
 } // namespace tl
 } // namespace tvm
