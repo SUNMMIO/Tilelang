@@ -13,12 +13,19 @@
  * call.
  */
 
+#include "../op/builtin.h"
+#include "../op/comm.h"
 #include "../op/utils.h"
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
+#include "../target/sunmmio_utils.h"
+#include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
+#include "sunmmio_pipeline_planning/resource_types_for_ilp.h"
 #include "sunmmio_pipeline_planning/stmt_read_write_collector.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <deque>
 #include <fstream>
 #include <iostream>
@@ -54,6 +61,9 @@
 namespace tvm {
 namespace tl {
 
+static constexpr const char *kGreedySunmmioFaster = "tl.sunmmio_faster";
+TVM_REGISTER_PASS_CONFIG_OPTION(kGreedySunmmioFaster, Integer);
+
 using namespace tir;
 
 /**
@@ -75,6 +85,28 @@ public:
   }
 };
 
+static bool HasRepeatedCollectiveDestination(const SeqStmtNode *body) {
+  std::unordered_set<const BufferNode *> destinations;
+  for (const Stmt &stmt : body->seq) {
+    bool repeated = false;
+    PostOrderVisit(stmt, [&](const ObjectRef &obj) {
+      const auto *call = obj.as<CallNode>();
+      if (!call || !call->op.same_as(Op::Get("tl.broadcast_"))) {
+        return;
+      }
+      const BufferNode *destination =
+          NormalizeToBufferRegion(call->args[1])->buffer.get();
+      if (!destinations.insert(destination).second) {
+        repeated = true;
+      }
+    });
+    if (repeated) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * \brief Pure data container representing an instruction in the pipeline.
  * It separates the AST analysis from scheduling and latency calculation.
@@ -86,6 +118,7 @@ public:
   std::string name{""};
   Stmt stmt;
   DeviceType device_type{DeviceType::Unspecified};
+  int execution_resource{-1};
 
   // True if this instruction should be placed in the prefetch queue (Shift=1)
   bool is_prefetch{false};
@@ -120,6 +153,144 @@ public:
   }
 };
 
+struct GreedyAccessInfo {
+  BufferRegion region;
+  bool is_write{false};
+
+  Buffer buffer() const { return region->buffer; }
+};
+
+static int GetGreedyExecutionResource(const PipelineInstruction &instruction) {
+  std::vector<GreedyAccessInfo> accesses;
+  accesses.reserve(instruction.reads.size() + instruction.writes.size());
+  for (const BufferRegion &read : instruction.reads) {
+    accesses.push_back({read, false});
+  }
+  for (const BufferRegion &write : instruction.writes) {
+    accesses.push_back({write, true});
+  }
+  std::vector<int> resources =
+      BuildIlpResources(instruction.stmt, instruction.device_type, accesses);
+  for (int resource : resources) {
+    if (resource == static_cast<int>(IlpResourceType::kTensorCore) ||
+        resource == static_cast<int>(IlpResourceType::kVectorCore) ||
+        resource == static_cast<int>(IlpResourceType::kODMA0) ||
+        resource == static_cast<int>(IlpResourceType::kODMA1)) {
+      return resource;
+    }
+  }
+  LOG(FATAL) << "No execution resource for greedy pipeline instruction "
+             << instruction.name;
+  return -1;
+}
+
+static int GetGreedyIssuePriority(const PipelineInstruction &instruction) {
+  int resource = instruction.execution_resource;
+  if (resource == static_cast<int>(IlpResourceType::kODMA1)) {
+    return 0;
+  }
+  if (resource == static_cast<int>(IlpResourceType::kODMA0)) {
+    return 1;
+  }
+  // DMA launch is asynchronous, while tensor commands block the scalar issue
+  // stream.  Launch same-time asynchronous work before blocking computation.
+  if (resource == static_cast<int>(IlpResourceType::kTensorCore)) {
+    return 2;
+  }
+  if (resource == static_cast<int>(IlpResourceType::kVectorCore)) {
+    return 3;
+  }
+  return 4;
+}
+
+static bool IsAllGatherInstruction(const PipelineInstruction &instruction) {
+  const CallNode *broadcast = nullptr;
+  PostOrderVisit(instruction.stmt, [&](const ObjectRef &obj) {
+    const auto *call = obj.as<CallNode>();
+    if (call && call->op.same_as(Op::Get("tl.broadcast_"))) {
+      ICHECK(broadcast == nullptr)
+          << "A pipeline statement may contain at most one broadcast leaf";
+      broadcast = call;
+    }
+  });
+  if (broadcast == nullptr) {
+    return false;
+  }
+  ICHECK(broadcast->args.size() == static_cast<size_t>(kBroadcastArgCount) ||
+         broadcast->args.size() == static_cast<size_t>(kBroadcastArgCount + 1))
+      << "tl.broadcast_ expects its fixed arguments and optional src_core";
+  return broadcast->args.size() == static_cast<size_t>(kBroadcastArgCount);
+}
+
+enum class PhysicalSramBank : int {
+  ASRAMPing = 0,
+  ASRAMPong = 1,
+  WSRAMPing = 2,
+  WSRAMPong = 3,
+  Count = 4,
+};
+
+using PerCommandBankPhases =
+    std::unordered_map<const BufferNode *, std::unordered_map<int, int>>;
+
+struct GreedyBankColoring {
+  PerCommandBankPhases writer_phases;
+  PerCommandBankPhases reader_phases;
+  std::vector<int> bits;
+};
+
+static int LookupBankPhase(const PerCommandBankPhases &phases,
+                           const BufferNode *buffer, int command_id) {
+  auto it_buffer = phases.find(buffer);
+  if (it_buffer == phases.end())
+    return 0;
+  auto it_command = it_buffer->second.find(command_id);
+  return it_command == it_buffer->second.end() ? 0 : it_command->second;
+}
+
+static std::vector<PhysicalSramBank> GetOccupiedSramBanks(
+    const PipelineInstruction &instruction,
+    const std::unordered_set<const BufferNode *> &versioned_buffers,
+    int iter_mod, const PerCommandBankPhases &writer_phases,
+    const PerCommandBankPhases &reader_phases) {
+  std::array<bool, static_cast<int>(PhysicalSramBank::Count)> occupied{};
+  int version_slot = instruction.iter;
+  if (iter_mod > 0) {
+    version_slot %= iter_mod;
+    if (version_slot < 0) {
+      version_slot += iter_mod;
+    }
+  }
+  auto collect = [&](const BufferRegion &region, bool is_write) {
+    const String &scope = region->buffer.scope();
+    int phase = LookupBankPhase(is_write ? writer_phases : reader_phases,
+                                region->buffer.get(), instruction.id);
+    bool pong = versioned_buffers.count(region->buffer.get()) != 0 &&
+                (version_slot + phase) % 2 != 0;
+    if (scope == kSunmmioScopeASRAM) {
+      occupied[static_cast<int>(pong ? PhysicalSramBank::ASRAMPong
+                                     : PhysicalSramBank::ASRAMPing)] = true;
+    } else if (scope == kSunmmioScopeWSRAM) {
+      occupied[static_cast<int>(pong ? PhysicalSramBank::WSRAMPong
+                                     : PhysicalSramBank::WSRAMPing)] = true;
+    }
+  };
+  for (const BufferRegion &region : instruction.reads) {
+    collect(region, false);
+  }
+  for (const BufferRegion &region : instruction.writes) {
+    collect(region, true);
+  }
+
+  std::vector<PhysicalSramBank> result;
+  for (int i = 0; i < static_cast<int>(PhysicalSramBank::Count); ++i) {
+    if (occupied[i]) {
+      result.push_back(static_cast<PhysicalSramBank>(i));
+    }
+  }
+  return result;
+}
+
 /**
  * \brief A RAW dependence edge in the single-iteration local DDG.
  *
@@ -132,6 +303,34 @@ struct LocalDependencyEdge {
   const BufferNode *buffer{nullptr};
   int distance{0};
 };
+
+struct TemplateOrderEdge {
+  int source_instruction_id{-1};
+  int target_instruction_id{-1};
+  int distance{0};
+};
+
+enum class SemanticDependencyKind { kRAW, kWAR, kWAW };
+
+struct SemanticDependencyEdge {
+  int source_instruction_id{-1};
+  int target_instruction_id{-1};
+  const BufferNode *buffer{nullptr};
+  int distance{0};
+  SemanticDependencyKind kind{SemanticDependencyKind::kRAW};
+};
+
+static const char *SemanticDependencyKindName(SemanticDependencyKind kind) {
+  switch (kind) {
+  case SemanticDependencyKind::kRAW:
+    return "RAW";
+  case SemanticDependencyKind::kWAR:
+    return "WAR";
+  case SemanticDependencyKind::kWAW:
+    return "WAW";
+  }
+  return "unknown";
+}
 
 /**
  * \brief Aggregated access information for one logical buffer in the local DDG.
@@ -156,6 +355,8 @@ struct BufferAccessInfo {
  */
 struct LocalDDG {
   std::vector<LocalDependencyEdge> edges;
+  std::vector<TemplateOrderEdge> ordering_edges;
+  std::vector<SemanticDependencyEdge> semantic_edges;
   std::vector<std::vector<int>> forward_predecessors;
   std::vector<std::vector<int>> forward_successors;
   std::vector<std::vector<int>> backward_predecessors;
@@ -163,6 +364,95 @@ struct LocalDDG {
   std::unordered_map<const BufferNode *, BufferAccessInfo> buffer_access_infos;
   std::vector<const BufferNode *> buffer_order;
 };
+
+static bool IsRuntimeBankedBuffer(const BufferNode *buffer) {
+  const String &scope = tvm::ffi::GetRef<Buffer>(buffer).scope();
+  return scope == kSunmmioScopeASRAM || scope == kSunmmioScopeWSRAM;
+}
+
+static std::vector<GreedyBankColoring> BuildGreedyBankColorings(
+    const LocalDDG &local_ddg,
+    const std::unordered_set<const BufferNode *> &versioned_buffers, int faster,
+    size_t *total_candidate_count) {
+  using WriterKey = std::pair<const BufferNode *, int>;
+  std::map<const BufferNode *, std::set<int>> writers_by_buffer;
+  for (const LocalDependencyEdge &edge : local_ddg.edges) {
+    if (!versioned_buffers.count(edge.buffer) ||
+        !IsRuntimeBankedBuffer(edge.buffer)) {
+      continue;
+    }
+    writers_by_buffer[edge.buffer].insert(edge.producer_instruction_id);
+  }
+
+  // Precolors are relative bank phases.  Writers 0,2,... of one buffer must
+  // stay together, writers 1,3,... must stay together, and the two classes
+  // must use opposite banks.  Search one global inversion bit per buffer
+  // instead of independently recoloring every writer.
+  struct WriterColor {
+    int variable{-1};
+    int precolor{0};
+  };
+  std::map<WriterKey, WriterColor> writer_colors;
+  int search_bits = 0;
+  for (const BufferNode *buffer : local_ddg.buffer_order) {
+    auto writers_it = writers_by_buffer.find(buffer);
+    if (writers_it == writers_by_buffer.end()) {
+      continue;
+    }
+    int precolor = 0;
+    for (int writer_id : writers_it->second) {
+      writer_colors[{buffer, writer_id}] = {search_bits, precolor};
+      precolor ^= 1;
+    }
+    ++search_bits;
+  }
+
+  ICHECK(faster == -1 || faster > 0)
+      << "tl.sunmmio_faster must be -1 or a positive coloring budget";
+  ICHECK_LT(search_bits, static_cast<int>(sizeof(size_t) * 8))
+      << "Too many independent greedy coloring variables: " << search_bits;
+  size_t total_candidates = size_t{1} << search_bits;
+  *total_candidate_count = total_candidates;
+  size_t candidate_count =
+      faster == -1 ? total_candidates
+                   : std::min(total_candidates, static_cast<size_t>(faster));
+  std::vector<GreedyBankColoring> result;
+  result.reserve(candidate_count);
+  for (size_t mask = 0; mask < candidate_count; ++mask) {
+    GreedyBankColoring coloring;
+    coloring.bits.resize(search_bits, 0);
+    for (int i = 0; i < search_bits; ++i) {
+      coloring.bits[i] = static_cast<int>((mask >> i) & 1);
+    }
+    for (const auto &[writer, color] : writer_colors) {
+      coloring.writer_phases[writer.first][writer.second] =
+          coloring.bits[color.variable] ^ color.precolor;
+    }
+
+    bool valid = true;
+    for (const LocalDependencyEdge &edge : local_ddg.edges) {
+      auto it_writer =
+          writer_colors.find({edge.buffer, edge.producer_instruction_id});
+      if (it_writer == writer_colors.end())
+        continue;
+      const WriterColor &color = it_writer->second;
+      int writer_phase = coloring.bits[color.variable] ^ color.precolor;
+      int reader_phase = writer_phase ^ (edge.distance & 1);
+      auto &reader_map = coloring.reader_phases[edge.buffer];
+      auto [it_reader, inserted] =
+          reader_map.emplace(edge.consumer_instruction_id, reader_phase);
+      if (!inserted && it_reader->second != reader_phase) {
+        valid = false;
+        break;
+      }
+    }
+    if (valid)
+      result.push_back(std::move(coloring));
+  }
+  if (result.empty())
+    result.push_back(GreedyBankColoring{});
+  return result;
+}
 
 /**
  * \brief Build the single-iteration local DDG from read/write regions.
@@ -296,9 +586,279 @@ public:
       }
     }
 
+    std::set<
+        std::tuple<int, int, const BufferNode *, int, SemanticDependencyKind>>
+        semantic_unique;
+    auto add_semantic = [&](int source, int target, const BufferNode *buffer,
+                            int distance, SemanticDependencyKind kind) {
+      auto key = std::make_tuple(source, target, buffer, distance, kind);
+      if (semantic_unique.insert(key).second) {
+        ddg.semantic_edges.push_back({source, target, buffer, distance, kind});
+      }
+    };
+    for (const LocalDependencyEdge &edge : ddg.edges) {
+      add_semantic(edge.producer_instruction_id, edge.consumer_instruction_id,
+                   edge.buffer, edge.distance, SemanticDependencyKind::kRAW);
+    }
+    for (const BufferNode *buffer : ddg.buffer_order) {
+      const BufferAccessInfo &info = ddg.buffer_access_infos.at(buffer);
+      for (int reader : info.read_instruction_indices) {
+        for (int writer : info.write_instruction_indices) {
+          if (reader < writer) {
+            add_semantic(reader, writer, buffer, 0,
+                         SemanticDependencyKind::kWAR);
+          }
+        }
+      }
+      for (size_t i = 0; i < info.write_instruction_indices.size(); ++i) {
+        for (size_t j = i + 1; j < info.write_instruction_indices.size(); ++j) {
+          add_semantic(info.write_instruction_indices[i],
+                       info.write_instruction_indices[j], buffer, 0,
+                       SemanticDependencyKind::kWAW);
+        }
+      }
+      if (!info.read_instruction_indices.empty() &&
+          !info.write_instruction_indices.empty()) {
+        add_semantic(info.read_instruction_indices.back(),
+                     info.write_instruction_indices.front(), buffer, 1,
+                     SemanticDependencyKind::kWAR);
+        if (info.write_instruction_indices.size() > 1) {
+          add_semantic(info.write_instruction_indices.back(),
+                       info.write_instruction_indices.front(), buffer, 1,
+                       SemanticDependencyKind::kWAW);
+        }
+      }
+    }
+
+    // All cores must encounter all-gather barriers in one common epoch order.
+    // Data hazards alone cannot enforce this when collectives use different
+    // buffers or ODMA directions, so preserve template order explicitly and
+    // close the chain across consecutive logical iterations.
+    std::vector<int> all_gather_ids;
+    for (const PipelineInstruction &instruction :
+         single_iteration_instructions) {
+      if (IsAllGatherInstruction(instruction)) {
+        all_gather_ids.push_back(instruction.id);
+      }
+    }
+    for (size_t i = 1; i < all_gather_ids.size(); ++i) {
+      int source = all_gather_ids[i - 1];
+      int target = all_gather_ids[i];
+      ddg.ordering_edges.push_back({source, target, 0});
+    }
+    if (all_gather_ids.size() > 1) {
+      int source = all_gather_ids.back();
+      int target = all_gather_ids.front();
+      ddg.ordering_edges.push_back({source, target, 1});
+    }
+
     return ddg;
   }
 };
+
+static bool
+ValidateLocalDDG(const std::vector<PipelineInstruction> &instructions,
+                 const LocalDDG &ddg) {
+  const int instruction_count = static_cast<int>(instructions.size());
+  std::set<std::pair<int, const BufferNode *>> reads_with_producer;
+  for (const LocalDependencyEdge &edge : ddg.edges) {
+    if (edge.producer_instruction_id < 0 ||
+        edge.producer_instruction_id >= instruction_count ||
+        edge.consumer_instruction_id < 0 ||
+        edge.consumer_instruction_id >= instruction_count ||
+        edge.buffer == nullptr || edge.distance < 0) {
+      return false;
+    }
+    reads_with_producer.insert({edge.consumer_instruction_id, edge.buffer});
+  }
+  for (const SemanticDependencyEdge &edge : ddg.semantic_edges) {
+    if (edge.source_instruction_id < 0 ||
+        edge.source_instruction_id >= instruction_count ||
+        edge.target_instruction_id < 0 ||
+        edge.target_instruction_id >= instruction_count ||
+        edge.buffer == nullptr || edge.distance < 0) {
+      return false;
+    }
+  }
+  for (const TemplateOrderEdge &edge : ddg.ordering_edges) {
+    if (edge.source_instruction_id < 0 ||
+        edge.source_instruction_id >= instruction_count ||
+        edge.target_instruction_id < 0 ||
+        edge.target_instruction_id >= instruction_count || edge.distance < 0) {
+      return false;
+    }
+  }
+  for (int id = 0; id < instruction_count; ++id) {
+    for (const BufferRegion &read : instructions[id].reads) {
+      if (IsGlobalBuffer(read->buffer)) {
+        continue;
+      }
+      auto access_it = ddg.buffer_access_infos.find(read->buffer.get());
+      if (access_it == ddg.buffer_access_infos.end() ||
+          access_it->second.write_instruction_indices.empty()) {
+        continue;
+      }
+      if (!reads_with_producer.count({id, read->buffer.get()})) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static void MaybeWriteGreedyGraphJson(
+    const std::vector<PipelineInstruction> &instructions, const LocalDDG &ddg,
+    const std::unordered_set<const BufferNode *> &versioned_buffers) {
+  const char *path = std::getenv("TL_SUNMMIO_PIPELINE_GRAPH_JSON");
+  if (path == nullptr || path[0] == '\0') {
+    return;
+  }
+  std::ofstream out(path);
+  if (!out.is_open()) {
+    LOG(WARNING) << "Cannot write pipeline graph JSON to " << path;
+    return;
+  }
+  out << "{\n  \"mode\": \"greedy\",\n  \"commands\": [\n";
+  for (size_t i = 0; i < instructions.size(); ++i) {
+    const PipelineInstruction &instruction = instructions[i];
+    out << "    {\"id\": " << instruction.id
+        << ", \"iteration_offset\": 0, \"hardware\": "
+        << static_cast<int>(instruction.device_type)
+        << ", \"resource\": " << instruction.execution_resource
+        << ", \"reads\": [";
+    for (size_t j = 0; j < instruction.reads.size(); ++j) {
+      if (j != 0)
+        out << ", ";
+      out << "\"" << instruction.reads[j]->buffer->name << "\"";
+    }
+    out << "], \"writes\": [";
+    for (size_t j = 0; j < instruction.writes.size(); ++j) {
+      if (j != 0)
+        out << ", ";
+      out << "\"" << instruction.writes[j]->buffer->name << "\"";
+    }
+    out << "]}" << (i + 1 == instructions.size() ? "\n" : ",\n");
+  }
+  out << "  ],\n  \"edges\": [\n";
+  size_t edge_index = 0;
+  size_t edge_count = ddg.semantic_edges.size() + ddg.ordering_edges.size();
+  for (const SemanticDependencyEdge &edge : ddg.semantic_edges) {
+    out << "    {\"source\": " << edge.source_instruction_id
+        << ", \"target\": " << edge.target_instruction_id << ", \"buffer\": \""
+        << edge.buffer->name << "\", \"distance\": " << edge.distance
+        << ", \"kind\": \"" << SemanticDependencyKindName(edge.kind) << "\"}"
+        << (++edge_index == edge_count ? "\n" : ",\n");
+  }
+  for (const TemplateOrderEdge &edge : ddg.ordering_edges) {
+    out << "    {\"source\": " << edge.source_instruction_id
+        << ", \"target\": " << edge.target_instruction_id
+        << ", \"buffer\": null, \"distance\": " << edge.distance
+        << ", \"kind\": \"collective_order\"}"
+        << (++edge_index == edge_count ? "\n" : ",\n");
+  }
+  out << "  ],\n  \"buffers\": [\n";
+  for (size_t i = 0; i < ddg.buffer_order.size(); ++i) {
+    const BufferNode *buffer = ddg.buffer_order[i];
+    const BufferAccessInfo &access = ddg.buffer_access_infos.at(buffer);
+    out << "    {\"name\": \"" << buffer->name
+        << "\", \"global\": " << (access.is_global ? "true" : "false")
+        << ", \"loop_carried\": "
+        << (access.HasLoopCarriedDependence() ? "true" : "false")
+        << ", \"versioned\": "
+        << (versioned_buffers.count(buffer) ? "true" : "false")
+        << ", \"banked\": "
+        << (IsRuntimeBankedBuffer(buffer) ? "true" : "false")
+        << ", \"classification\": \""
+        << (access.is_global
+                ? "global"
+                : (access.HasLoopCarriedDependence() ? "loop_carried"
+                                                     : "local"))
+        << "\"}" << (i + 1 == ddg.buffer_order.size() ? "\n" : ",\n");
+  }
+  out << "  ]\n}\n";
+}
+
+static bool
+VerifyScheduledWindow(const std::vector<PipelineInstruction> &expected,
+                      const std::vector<PipelineInstruction> &scheduled,
+                      int command_count) {
+  if (expected.size() != scheduled.size())
+    return false;
+  std::multiset<std::pair<int, int>> expected_instances;
+  std::multiset<std::pair<int, int>> scheduled_instances;
+  for (const PipelineInstruction &instruction : expected) {
+    if (instruction.id < 0 || instruction.id >= command_count ||
+        instruction.iter < 0)
+      return false;
+    expected_instances.insert({instruction.iter, instruction.id});
+  }
+  for (const PipelineInstruction &instruction : scheduled) {
+    if (instruction.id < 0 || instruction.id >= command_count ||
+        instruction.iter < 0)
+      return false;
+    scheduled_instances.insert({instruction.iter, instruction.id});
+  }
+  return expected_instances == scheduled_instances;
+}
+
+static bool
+VerifyGreedySchedule(const std::vector<PipelineInstruction> &expected_prologue,
+                     const std::vector<PipelineInstruction> &expected_body,
+                     const std::vector<PipelineInstruction> &expected_epilogue,
+                     const std::vector<PipelineInstruction> &prologue,
+                     const std::vector<PipelineInstruction> &body,
+                     const std::vector<PipelineInstruction> &epilogue,
+                     bool has_epilogue, int command_count) {
+  if (!VerifyScheduledWindow(expected_prologue, prologue, command_count) ||
+      !VerifyScheduledWindow(expected_body, body, command_count)) {
+    return false;
+  }
+  return !has_epilogue ||
+         VerifyScheduledWindow(expected_epilogue, epilogue, command_count);
+}
+
+static bool VerifyDynamicLogicalCoverage(
+    int extent, int iterations, int command_count,
+    const std::vector<PipelineInstruction> &prologue,
+    const std::vector<PipelineInstruction> &body,
+    const std::map<int, std::vector<PipelineInstruction>> &epilogues) {
+  std::map<std::pair<int, int>, int> counts;
+  auto record = [&](int base, const std::vector<PipelineInstruction> &window,
+                    bool predicate_invalid) {
+    for (const PipelineInstruction &instruction : window) {
+      int logical_iter = base + instruction.iter;
+      if (instruction.id < 0 || instruction.id >= command_count) {
+        return false;
+      }
+      if (logical_iter < 0 || logical_iter >= extent) {
+        if (predicate_invalid)
+          continue;
+        return false;
+      }
+      counts[{logical_iter, instruction.id}] += 1;
+    }
+    return true;
+  };
+  if (!record(0, prologue, false))
+    return false;
+  int steady_groups = std::max(0, (extent - 1) / iterations);
+  for (int group = 0; group < steady_groups; ++group) {
+    if (!record(group * iterations, body, false))
+      return false;
+  }
+  auto epilogue_it = epilogues.find(0);
+  if (epilogue_it == epilogues.end() ||
+      !record(steady_groups * iterations, epilogue_it->second, true)) {
+    return false;
+  }
+  for (int logical_iter = 0; logical_iter < extent; ++logical_iter) {
+    for (int command = 0; command < command_count; ++command) {
+      if (counts[{logical_iter, command}] != 1)
+        return false;
+    }
+  }
+  return true;
+}
 
 /**
  * \brief Identify the prefetch instruction set on top of the local DDG.
@@ -465,8 +1025,7 @@ private:
     }
     return call->op.same_as(Op::Get("tl.dma_copy")) ||
            call->op.same_as(Op::Get("tl.broadcast_")) ||
-           call->op.same_as(Op::Get("tl.sunmmio_layout_transform")) ||
-           call->op.same_as(Op::Get("tl.sunmmio_transpose"));
+           call->op.same_as(Op::Get("tl.sunmmio_layout_transform"));
   }
 
   static bool WasBufferReadBeforeInstruction(const LocalDDG &local_ddg,
@@ -673,7 +1232,7 @@ private:
 
 class PipelineDevice {
 public:
-  explicit PipelineDevice(DeviceType type) : type(type) {}
+  explicit PipelineDevice(int resource) : resource(resource) {}
 
   void AssignInstruction(PipelineInstruction *instruction, float time) {
     current_instruction = instruction;
@@ -692,7 +1251,7 @@ public:
     }
   }
 
-  DeviceType type{DeviceType::Unspecified};
+  int resource{-1};
   bool busy{false};
   PipelineInstruction *current_instruction{nullptr};
   float instruction_end_time{std::numeric_limits<float>::max()};
@@ -705,14 +1264,28 @@ public:
   bool debug_{false};
 
   GlobalPipelineScheduler() {
-    devices_.push_back(PipelineDevice(DeviceType::ODMA));
-    devices_.push_back(PipelineDevice(DeviceType::TensorCore));
-    devices_.push_back(PipelineDevice(DeviceType::VectorCore));
+    devices_.push_back(
+        PipelineDevice(static_cast<int>(IlpResourceType::kTensorCore)));
+    devices_.push_back(
+        PipelineDevice(static_cast<int>(IlpResourceType::kVectorCore)));
+    devices_.push_back(
+        PipelineDevice(static_cast<int>(IlpResourceType::kODMA0)));
+    devices_.push_back(
+        PipelineDevice(static_cast<int>(IlpResourceType::kODMA1)));
   }
 
   void SetVersionedBuffers(
       const std::unordered_set<const BufferNode *> &versioned_buffers) {
     versioned_buffers_ = versioned_buffers;
+  }
+
+  void SetBankColoring(const GreedyBankColoring &coloring) {
+    writer_phases_ = coloring.writer_phases;
+    reader_phases_ = coloring.reader_phases;
+  }
+
+  void SetTemplateOrderEdges(const std::vector<TemplateOrderEdge> &edges) {
+    template_order_edges_ = edges;
   }
 
   void BuildDependencyGraph() {
@@ -737,6 +1310,7 @@ public:
       BufferRegion region;
       int instruction_index;
       AccessType type;
+      int instance_id;
     };
 
     std::unordered_map<const BufferNode *, std::vector<AccessRecord>>
@@ -747,18 +1321,19 @@ public:
       int current_index = topological_order_[ordered_index];
       const PipelineInstruction &current_instruction =
           instructions[current_index];
-      int current_version = GetVersionId(current_instruction);
 
       for (const BufferRegion &read_region : current_instruction.reads) {
         const BufferNode *buffer = read_region->buffer.get();
+        int current_instance =
+            GetAccessInstanceId(current_instruction, buffer, false);
         auto history_it = buffer_access_history.find(buffer);
         if (history_it == buffer_access_history.end()) {
           continue;
         }
         auto &history = history_it->second;
         for (auto it = history.rbegin(); it != history.rend(); ++it) {
-          if (ShouldSkipVersionedCrossIteration(buffer, current_version,
-                                                it->instruction_index)) {
+          if (ShouldSkipVersionedAccess(buffer, current_instance,
+                                        it->instance_id)) {
             continue;
           }
           if (it->type == AccessType::kWrite &&
@@ -771,14 +1346,16 @@ public:
 
       for (const BufferRegion &write_region : current_instruction.writes) {
         const BufferNode *buffer = write_region->buffer.get();
+        int current_instance =
+            GetAccessInstanceId(current_instruction, buffer, true);
         auto history_it = buffer_access_history.find(buffer);
         if (history_it == buffer_access_history.end()) {
           continue;
         }
         auto &history = history_it->second;
         for (auto it = history.rbegin(); it != history.rend(); ++it) {
-          if (ShouldSkipVersionedCrossIteration(buffer, current_version,
-                                                it->instruction_index)) {
+          if (ShouldSkipVersionedAccess(buffer, current_instance,
+                                        it->instance_id)) {
             continue;
           }
           if (!AccessOverlapChecker::Overlap(write_region, it->region)) {
@@ -793,11 +1370,35 @@ public:
 
       for (const BufferRegion &read_region : current_instruction.reads) {
         buffer_access_history[read_region->buffer.get()].push_back(
-            {read_region, current_index, AccessType::kRead});
+            {read_region, current_index, AccessType::kRead,
+             GetAccessInstanceId(current_instruction, read_region->buffer.get(),
+                                 false)});
       }
       for (const BufferRegion &write_region : current_instruction.writes) {
         buffer_access_history[write_region->buffer.get()].push_back(
-            {write_region, current_index, AccessType::kWrite});
+            {write_region, current_index, AccessType::kWrite,
+             GetAccessInstanceId(current_instruction,
+                                 write_region->buffer.get(), true)});
+      }
+    }
+
+    std::map<std::pair<int, int>, int> instance_index;
+    for (int index = 0; index < instruction_count; ++index) {
+      instance_index[{instructions[index].iter, instructions[index].id}] =
+          index;
+    }
+    for (const TemplateOrderEdge &edge : template_order_edges_) {
+      for (int source_index = 0; source_index < instruction_count;
+           ++source_index) {
+        const PipelineInstruction &source = instructions[source_index];
+        if (source.id != edge.source_instruction_id) {
+          continue;
+        }
+        auto target = instance_index.find(
+            {source.iter + edge.distance, edge.target_instruction_id});
+        if (target != instance_index.end()) {
+          AddDependency(source_index, target->second);
+        }
       }
     }
   }
@@ -835,7 +1436,7 @@ public:
       }
       log_file << instruction_index << " " << instruction.name << " "
                << instruction.iter << " " << instruction.id << " "
-               << static_cast<int>(instruction.device_type) << " "
+               << instruction.execution_resource << " "
                << static_cast<int>(instruction.is_prefetch) << " "
                << bottom_level << "\n";
     }
@@ -888,9 +1489,14 @@ public:
         if (!ArePredecessorsFinished(*instruction)) {
           continue;
         }
+        if (!AreBanksFree(*instruction, time)) {
+          continue;
+        }
         for (auto &device : devices_) {
-          if (device.type == instruction->device_type && !device.busy) {
+          if (device.resource == instruction->execution_resource &&
+              !device.busy) {
             device.AssignInstruction(instruction, time);
+            ReserveBanks(*instruction, instruction->scheduled_end);
             schedule.push_back(*instruction);
             break;
           }
@@ -917,13 +1523,27 @@ public:
       float start;
       float end;
     };
-    std::unordered_map<DeviceType, std::vector<Interval>> busy_intervals;
+    std::unordered_map<int, std::vector<Interval>> busy_intervals;
+    std::array<std::vector<Interval>, static_cast<int>(PhysicalSramBank::Count)>
+        bank_busy_intervals;
     for (const auto &instruction : schedule) {
-      busy_intervals[instruction.device_type].push_back(
+      busy_intervals[instruction.execution_resource].push_back(
           {instruction.scheduled_start, instruction.scheduled_end});
+      for (PhysicalSramBank bank :
+           GetOccupiedSramBanks(instruction, versioned_buffers_, iter_mod_,
+                                writer_phases_, reader_phases_)) {
+        bank_busy_intervals[static_cast<int>(bank)].push_back(
+            {instruction.scheduled_start, instruction.scheduled_end});
+      }
     }
     for (auto &kv : busy_intervals) {
       auto &intervals = kv.second;
+      std::sort(intervals.begin(), intervals.end(),
+                [](const Interval &lhs, const Interval &rhs) {
+                  return lhs.start < rhs.start;
+                });
+    }
+    for (auto &intervals : bank_busy_intervals) {
       std::sort(intervals.begin(), intervals.end(),
                 [](const Interval &lhs, const Interval &rhs) {
                   return lhs.start < rhs.start;
@@ -984,25 +1604,43 @@ public:
       }
 
       float duration = instruction->delay;
-      auto &intervals = busy_intervals[instruction->device_type];
+      auto &intervals = busy_intervals[instruction->execution_resource];
       float start_time = ready_time;
-      for (size_t i = 0; i <= intervals.size(); ++i) {
-        float gap_end = (i < intervals.size())
-                            ? intervals[i].start
-                            : std::numeric_limits<float>::max();
-        if (gap_end - start_time >= duration) {
-          instruction->scheduled_start = start_time;
-          instruction->scheduled_end = start_time + duration;
-          instruction->finished = true;
-          insert_interval(intervals, {instruction->scheduled_start,
-                                      instruction->scheduled_end});
-          schedule.push_back(*instruction);
-          scheduled_prefetch += 1;
-          break;
+      std::vector<std::vector<Interval> *> required_intervals{&intervals};
+      for (PhysicalSramBank bank :
+           GetOccupiedSramBanks(*instruction, versioned_buffers_, iter_mod_,
+                                writer_phases_, reader_phases_)) {
+        required_intervals.push_back(
+            &bank_busy_intervals[static_cast<int>(bank)]);
+      }
+      while (!instruction->finished) {
+        float next_start = start_time;
+        for (const std::vector<Interval> *resource_intervals :
+             required_intervals) {
+          for (const Interval &interval : *resource_intervals) {
+            if (start_time + duration <= interval.start) {
+              break;
+            }
+            if (start_time < interval.end &&
+                start_time + duration > interval.start) {
+              next_start = std::max(next_start, interval.end);
+              break;
+            }
+          }
         }
-        if (i < intervals.size()) {
-          start_time = std::max(start_time, intervals[i].end);
+        if (next_start != start_time) {
+          start_time = next_start;
+          continue;
         }
+        instruction->scheduled_start = start_time;
+        instruction->scheduled_end = start_time + duration;
+        instruction->finished = true;
+        for (std::vector<Interval> *resource_intervals : required_intervals) {
+          insert_interval(*resource_intervals, {instruction->scheduled_start,
+                                                instruction->scheduled_end});
+        }
+        schedule.push_back(*instruction);
+        scheduled_prefetch += 1;
       }
       ICHECK(instruction->finished)
           << "Failed to insert prefetch instruction " << instruction->name;
@@ -1027,12 +1665,17 @@ public:
           if (lhs.scheduled_start != rhs.scheduled_start) {
             return lhs.scheduled_start < rhs.scheduled_start;
           }
+          int lhs_priority = GetGreedyIssuePriority(lhs);
+          int rhs_priority = GetGreedyIssuePriority(rhs);
+          if (lhs_priority != rhs_priority) {
+            return lhs_priority < rhs_priority;
+          }
           return lhs.name < rhs.name;
         });
     if (debug_ && log_file.is_open()) {
       for (const auto &instruction : schedule) {
         log_file << (instruction.is_prefetch ? "p:" : "") << instruction.name
-                 << " " << static_cast<int>(instruction.device_type) << " "
+                 << " " << instruction.execution_resource << " "
                  << instruction.scheduled_start << " " << instruction.delay
                  << "\n";
       }
@@ -1041,14 +1684,24 @@ public:
   }
 
 private:
-  bool ShouldSkipVersionedCrossIteration(const BufferNode *buffer,
-                                         int current_version,
-                                         int previous_instruction_index) const {
+  bool ShouldSkipVersionedAccess(const BufferNode *buffer, int current_instance,
+                                 int previous_instance) const {
     if (versioned_buffers_.count(buffer) == 0) {
       return false;
     }
-    return GetVersionId(instructions[previous_instruction_index]) !=
-           current_version;
+    return previous_instance != current_instance;
+  }
+
+  int GetAccessInstanceId(const PipelineInstruction &instruction,
+                          const BufferNode *buffer, bool is_write) const {
+    int slot = GetVersionId(instruction);
+    if (!IsRuntimeBankedBuffer(buffer))
+      return slot;
+    int phase = LookupBankPhase(is_write ? writer_phases_ : reader_phases_,
+                                buffer, instruction.id);
+    int bank = (slot + phase) & 1;
+    int version = slot / 2;
+    return bank * std::max(1, iter_mod_) + version;
   }
 
   int GetVersionId(const PipelineInstruction &instruction) const {
@@ -1079,6 +1732,26 @@ private:
       device.current_instruction = nullptr;
       device.instruction_end_time = std::numeric_limits<float>::max();
     }
+    bank_busy_until_.fill(-1.0f);
+  }
+
+  bool AreBanksFree(const PipelineInstruction &instruction, float time) const {
+    for (PhysicalSramBank bank :
+         GetOccupiedSramBanks(instruction, versioned_buffers_, iter_mod_,
+                              writer_phases_, reader_phases_)) {
+      if (bank_busy_until_[static_cast<int>(bank)] > time) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void ReserveBanks(const PipelineInstruction &instruction, float end_time) {
+    for (PhysicalSramBank bank :
+         GetOccupiedSramBanks(instruction, versioned_buffers_, iter_mod_,
+                              writer_phases_, reader_phases_)) {
+      bank_busy_until_[static_cast<int>(bank)] = end_time;
+    }
   }
 
   bool ArePredecessorsFinished(const PipelineInstruction &instruction) const {
@@ -1096,7 +1769,12 @@ private:
   }
 
   std::vector<PipelineDevice> devices_;
+  std::array<float, static_cast<int>(PhysicalSramBank::Count)>
+      bank_busy_until_{};
   std::unordered_set<const BufferNode *> versioned_buffers_;
+  PerCommandBankPhases writer_phases_;
+  PerCommandBankPhases reader_phases_;
+  std::vector<TemplateOrderEdge> template_order_edges_;
   std::vector<std::vector<int>> predecessors_;
   std::vector<std::vector<int>> successors_;
   std::vector<int> topological_order_;
@@ -1125,6 +1803,22 @@ public:
     if (num_stages <= 0) {
       return StmtExprMutator::VisitStmt_(op);
     }
+    arith::Analyzer analyzer;
+    PrimExpr simplified_extent = analyzer.Simplify(op->extent);
+    const auto *extent = simplified_extent.as<IntImmNode>();
+    if (extent != nullptr && extent->value < num_stages) {
+      For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+      return MakePipelineFallback(fallback, "greedy", "planning",
+                                  "short_extent_unsupported");
+    }
+    if (extent == nullptr && num_stages != 2) {
+      For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+      return MakePipelineFallback(
+          fallback,
+          PipelineDiagnostic{false, "greedy", "planning",
+                             "dynamic_version_count_unsupported",
+                             "dynamic Greedy currently requires num_stages=2"});
+    }
 
     // 2. Peel off the outer layers to find the true body sequence
     auto inner_stmt = op->body;
@@ -1144,15 +1838,24 @@ public:
     const SeqStmtNode *pipeline_body_seq = inner_stmt.as<SeqStmtNode>();
     ICHECK(pipeline_body_seq) << "Pipeline body must be a SeqStmt";
     ICHECK(op->kind == ForKind::kSerial) << "Pipeline loop must be serial";
-
     // 3. Stage 1: Build the PipelineInstruction containers
     std::vector<PipelineInstruction> single_iteration_instructions;
 
     for (size_t i = 0; i < pipeline_body_seq->seq.size(); ++i) {
-      PipelineInstruction instruction(static_cast<int>(i), 0,
-                                      pipeline_body_seq->seq[i]);
+      const Stmt &stmt = pipeline_body_seq->seq[i];
+      if (!stmt.as<BlockRealizeNode>() && !stmt.as<EvaluateNode>() &&
+          !stmt.as<ForNode>()) {
+        // HardwareMapper intentionally handles hardware commands only. Scalar
+        // bookkeeping stores and conditional command groups must first be
+        // normalized before they can be scheduled safely.
+        For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+        return MakePipelineFallback(fallback, "greedy", "planning",
+                                    "unsupported_statement");
+      }
+      PipelineInstruction instruction(static_cast<int>(i), 0, stmt);
       instruction.device_type = HardwareMapper::Map(instruction.stmt);
       instruction.ExtractRegions(stmt_rw_collector_);
+      instruction.execution_resource = GetGreedyExecutionResource(instruction);
       instruction.delay =
           CostModel::EstimateDelay(instruction.device_type, instruction.stmt);
       single_iteration_instructions.push_back(instruction);
@@ -1166,6 +1869,7 @@ public:
       for (const auto &instruction : single_iteration_instructions) {
         std::cout << "  - ID: " << instruction.id
                   << ", Device: " << static_cast<int>(instruction.device_type)
+                  << ", Resource: " << instruction.execution_resource
                   << ", Delay: " << instruction.delay
                   << ", Reads: " << instruction.reads.size()
                   << ", Writes: " << instruction.writes.size() << "\n";
@@ -1174,6 +1878,11 @@ public:
 
     // 4. Stage 2.1: Build the local DDG for a single iteration.
     LocalDDG local_ddg = LocalDDGBuilder::Build(single_iteration_instructions);
+    if (!ValidateLocalDDG(single_iteration_instructions, local_ddg)) {
+      For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+      return MakePipelineFallback(fallback, "greedy", "graph_validation",
+                                  "incomplete_access_info");
+    }
 
     if (debug_) {
       int forward_edge_count = 0;
@@ -1225,6 +1934,8 @@ public:
     std::unordered_set<const BufferNode *> versioned_buffers =
         MultiversioningIdentifier::Identify(single_iteration_instructions,
                                             local_ddg);
+    MaybeWriteGreedyGraphJson(single_iteration_instructions, local_ddg,
+                              versioned_buffers);
 
     if (debug_) {
       std::cout << "[Pipeline Planner] Identified " << versioned_buffers.size()
@@ -1263,11 +1974,50 @@ public:
     }
 
     // 8. Stage 4: Build the global DDG and run the two-phase scheduler.
+    int faster = -1;
+    auto pass_ctx = tvm::transform::PassContext::Current();
+    auto faster_config = pass_ctx->GetConfig<Integer>(kGreedySunmmioFaster);
+    if (faster_config) {
+      faster = faster_config.value()->value;
+    } else if (const char *env_faster = std::getenv("TL_SUNMMIO_FASTER")) {
+      faster = std::stoi(env_faster);
+    }
+    size_t total_coloring_candidates = 0;
+    std::vector<GreedyBankColoring> coloring_candidates =
+        BuildGreedyBankColorings(local_ddg, versioned_buffers, faster,
+                                 &total_coloring_candidates);
+    GreedyBankColoring selected_coloring = coloring_candidates.front();
+    float selected_body_makespan = std::numeric_limits<float>::max();
+    for (const GreedyBankColoring &candidate : coloring_candidates) {
+      GlobalPipelineScheduler candidate_scheduler;
+      candidate_scheduler.instructions = stage_assembly.body_instructions;
+      candidate_scheduler.iter_mod_ = stage_assembly.iterations;
+      candidate_scheduler.SetVersionedBuffers(versioned_buffers);
+      candidate_scheduler.SetBankColoring(candidate);
+      candidate_scheduler.SetTemplateOrderEdges(local_ddg.ordering_edges);
+      candidate_scheduler.BuildDependencyGraph();
+      candidate_scheduler.CalculateBottomLevels();
+      std::vector<PipelineInstruction> candidate_schedule =
+          candidate_scheduler.Schedule("");
+      float makespan = 0.0f;
+      for (const PipelineInstruction &instruction : candidate_schedule) {
+        makespan = std::max(makespan, instruction.scheduled_end);
+      }
+      if (makespan < selected_body_makespan ||
+          (makespan == selected_body_makespan &&
+           candidate.bits < selected_coloring.bits)) {
+        selected_body_makespan = makespan;
+        selected_coloring = candidate;
+      }
+    }
+
     GlobalPipelineScheduler prologue_scheduler;
     prologue_scheduler.instructions = stage_assembly.prologue_instructions;
     prologue_scheduler.iter_mod_ = stage_assembly.iterations;
     prologue_scheduler.debug_ = debug_;
     prologue_scheduler.SetVersionedBuffers(versioned_buffers);
+    prologue_scheduler.SetBankColoring(selected_coloring);
+    prologue_scheduler.SetTemplateOrderEdges(local_ddg.ordering_edges);
     prologue_scheduler.BuildDependencyGraph();
     prologue_scheduler.CalculateBottomLevels();
     std::vector<PipelineInstruction> prologue_schedule =
@@ -1278,6 +2028,8 @@ public:
     body_scheduler.iter_mod_ = stage_assembly.iterations;
     body_scheduler.debug_ = debug_;
     body_scheduler.SetVersionedBuffers(versioned_buffers);
+    body_scheduler.SetBankColoring(selected_coloring);
+    body_scheduler.SetTemplateOrderEdges(local_ddg.ordering_edges);
     body_scheduler.BuildDependencyGraph();
     body_scheduler.CalculateBottomLevels();
     body_scheduler.DumpGraph("body_graph.log");
@@ -1285,15 +2037,84 @@ public:
         body_scheduler.Schedule("body.log");
 
     std::vector<PipelineInstruction> epilogue_schedule;
+    std::map<int, std::vector<PipelineInstruction>> dynamic_epilogue_schedules;
     if (stage_assembly.epilogue_iterations != -1) {
       GlobalPipelineScheduler epilogue_scheduler;
       epilogue_scheduler.instructions = stage_assembly.epilogue_instructions;
       epilogue_scheduler.iter_mod_ = stage_assembly.iterations;
       epilogue_scheduler.debug_ = debug_;
       epilogue_scheduler.SetVersionedBuffers(versioned_buffers);
+      epilogue_scheduler.SetBankColoring(selected_coloring);
+      epilogue_scheduler.SetTemplateOrderEdges(local_ddg.ordering_edges);
       epilogue_scheduler.BuildDependencyGraph();
       epilogue_scheduler.CalculateBottomLevels();
       epilogue_schedule = epilogue_scheduler.Schedule("epilogue.log");
+    } else {
+      for (int remainder = 0; remainder < stage_assembly.iterations;
+           ++remainder) {
+        int effective_remainder =
+            remainder == 0 ? stage_assembly.iterations : remainder;
+        PipelineStageAssembly remainder_assembly =
+            PipelineWindowAssembler::Assemble(single_iteration_instructions,
+                                              num_stages,
+                                              Integer(effective_remainder));
+        GlobalPipelineScheduler epilogue_scheduler;
+        epilogue_scheduler.instructions =
+            remainder_assembly.epilogue_instructions;
+        epilogue_scheduler.iter_mod_ = stage_assembly.iterations;
+        epilogue_scheduler.SetVersionedBuffers(versioned_buffers);
+        epilogue_scheduler.SetBankColoring(selected_coloring);
+        epilogue_scheduler.SetTemplateOrderEdges(local_ddg.ordering_edges);
+        epilogue_scheduler.BuildDependencyGraph();
+        epilogue_scheduler.CalculateBottomLevels();
+        dynamic_epilogue_schedules[remainder] = epilogue_scheduler.Schedule("");
+        if (!VerifyScheduledWindow(
+                remainder_assembly.epilogue_instructions,
+                dynamic_epilogue_schedules[remainder],
+                static_cast<int>(single_iteration_instructions.size()))) {
+          For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+          return MakePipelineFallback(
+              fallback,
+              PipelineDiagnostic{false, "greedy", "schedule_validation",
+                                 "invalid_schedule_order",
+                                 "dynamic epilogue remainder " +
+                                     std::to_string(remainder)});
+        }
+      }
+    }
+
+    if (!VerifyGreedySchedule(
+            stage_assembly.prologue_instructions,
+            stage_assembly.body_instructions,
+            stage_assembly.epilogue_instructions, prologue_schedule,
+            body_schedule, epilogue_schedule,
+            stage_assembly.epilogue_iterations != -1,
+            static_cast<int>(single_iteration_instructions.size()))) {
+      For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+      return MakePipelineFallback(
+          fallback,
+          PipelineDiagnostic{false, "greedy", "schedule_validation",
+                             "invalid_schedule_order",
+                             "scheduled window does not match assembled "
+                             "logical command instances"});
+    }
+    if (stage_assembly.epilogue_iterations == -1) {
+      int verification_extent = std::max(4, stage_assembly.iterations * 2 + 2);
+      for (int extent_value = 1; extent_value <= verification_extent;
+           ++extent_value) {
+        if (!VerifyDynamicLogicalCoverage(
+                extent_value, stage_assembly.iterations,
+                static_cast<int>(single_iteration_instructions.size()),
+                prologue_schedule, body_schedule, dynamic_epilogue_schedules)) {
+          For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+          return MakePipelineFallback(
+              fallback,
+              PipelineDiagnostic{false, "greedy", "schedule_validation",
+                                 "logical_iteration_out_of_bounds",
+                                 "coverage failed for representative extent " +
+                                     std::to_string(extent_value)});
+        }
+      }
     }
 
     if (debug_) {
@@ -1311,6 +2132,33 @@ public:
       }
     }
     annotations.Set("iterations", stage_assembly.iterations);
+    SetPipelineAppliedAnnotations(&annotations, "greedy");
+    annotations.Set("coloring_total_candidates",
+                    Integer(total_coloring_candidates));
+    annotations.Set("coloring_evaluated_candidates",
+                    Integer(coloring_candidates.size()));
+
+    Map<Buffer, Map<Integer, PrimExpr>> runtime_bank_writer_phases;
+    for (const auto &[buffer_node, phases] : selected_coloring.writer_phases) {
+      Map<Integer, PrimExpr> per_command;
+      for (const auto &[command_id, phase] : phases) {
+        per_command.Set(Integer(command_id), Integer(phase));
+      }
+      runtime_bank_writer_phases.Set(tvm::ffi::GetRef<Buffer>(buffer_node),
+                                     per_command);
+    }
+    annotations.Set("runtime_bank_writer_phases", runtime_bank_writer_phases);
+
+    Map<Buffer, Map<Integer, PrimExpr>> runtime_bank_reader_phases;
+    for (const auto &[buffer_node, phases] : selected_coloring.reader_phases) {
+      Map<Integer, PrimExpr> per_command;
+      for (const auto &[command_id, phase] : phases) {
+        per_command.Set(Integer(command_id), Integer(phase));
+      }
+      runtime_bank_reader_phases.Set(tvm::ffi::GetRef<Buffer>(buffer_node),
+                                     per_command);
+    }
+    annotations.Set("runtime_bank_reader_phases", runtime_bank_reader_phases);
 
     Array<String> orders;
     for (const auto &instruction : prologue_schedule) {
@@ -1330,6 +2178,16 @@ public:
         orders.push_back(instruction.name);
       }
       annotations.Set("epilogue_orders", orders);
+    } else {
+      Map<Integer, Array<String>> dynamic_orders;
+      for (const auto &[remainder, schedule] : dynamic_epilogue_schedules) {
+        Array<String> remainder_orders;
+        for (const PipelineInstruction &instruction : schedule) {
+          remainder_orders.push_back(instruction.name);
+        }
+        dynamic_orders.Set(Integer(remainder), remainder_orders);
+      }
+      annotations.Set("dynamic_epilogue_orders", dynamic_orders);
     }
 
     Array<Buffer> used_buffers;
