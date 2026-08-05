@@ -109,8 +109,6 @@ struct BarrierMaskInfo {
   std::vector<int64_t> candidates;
 };
 
-using TokenBarrierMap = std::map<int, BarrierMaskInfo>;
-
 void AddUniqueInt64(std::vector<int64_t> *values, int64_t value) {
   if (std::find(values->begin(), values->end(), value) == values->end()) {
     values->push_back(value);
@@ -472,14 +470,6 @@ bool SameBarrierMaskInfo(const BarrierMaskInfo &lhs,
     }
   }
   return true;
-}
-
-bool BarrierCallMatchesInfo(const CallNode *call, const BarrierMaskInfo &info) {
-  if (!call || !call->op.same_as(barrier_arrive_and_wait()) ||
-      call->args.empty()) {
-    return false;
-  }
-  return SameBarrierMaskInfo(BarrierMaskInfoFromArgs(call->args), info);
 }
 
 void AddUniqueBarrierMaskInfo(std::vector<BarrierMaskInfo> *values,
@@ -876,29 +866,21 @@ struct LoopScope {
   std::map<int, std::set<int>> prev_iter_waits_by_curr_token;
   std::map<int, std::set<int>> prev_iter_waits_by_sync_order;
   std::set<int> loop_entry_null_tokens;
-  std::map<int, const CallNode *> token_to_call;
   std::unordered_map<const StmtNode *, int> stmt_order;
 };
 
 // Main rewriter class to inject synchronization primitives.
-// It tracks buffer accesses and inserts wait_token and barrier_wait calls
-// to enforce correct ordering based on data dependencies.
+// It tracks buffer accesses and inserts synchronization operations to enforce
+// correct ordering based on data dependencies and collective launch semantics.
 class InjectSyncRewriter : public StmtMutator {
 public:
   InjectSyncRewriter(Map<Var, Buffer> buffer_data_to_buffer,
-                     const Target &target, arith::Analyzer *analyzer,
-                     bool insert_barrier_wait_after_wait_token = false)
+                     const Target &target, arith::Analyzer *analyzer)
       : token_count(0), mesh_nrow_(0), mesh_ncol_(0), analyzer_(analyzer),
-        insert_barrier_wait_after_wait_token_(
-            insert_barrier_wait_after_wait_token),
         buffer_data_to_buffer_(buffer_data_to_buffer) {
     SunmmioMeshConfig mesh = GetSunmmioMeshConfig(target);
     mesh_nrow_ = mesh.nrow;
     mesh_ncol_ = mesh.ncol;
-  }
-
-  TokenBarrierMap get_token_to_barrier_mask() const {
-    return token_to_barrier_mask_;
   }
 
 private:
@@ -1330,17 +1312,9 @@ private:
     return current_kernel_core_id_;
   }
 
-  // Inserts wait_token and, when enabled, the legacy paired barrier_wait.
-  void process_wait_token_and_barrier_wait(Array<Stmt> &stmts, int token_id) {
+  void process_wait_token(Array<Stmt> &stmts, int token_id) {
     stmts.push_back(Evaluate(Call(DataType::Handle(), wait_token(),
                                   {IntImm(DataType::Int(32), token_id)})));
-    auto barrier_it = token_to_barrier_mask_.find(token_id);
-    if (insert_barrier_wait_after_wait_token_ &&
-        barrier_it != token_to_barrier_mask_.end()) {
-      stmts.push_back(
-          Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
-                        MakeBarrierArgs(barrier_it->second))));
-    }
   }
 
   bool IsWaitSuppressedByLoopHoist(int token_id) const {
@@ -1353,12 +1327,11 @@ private:
     return false;
   }
 
-  void maybe_process_wait_token_and_barrier_wait(Array<Stmt> &stmts,
-                                                 int token_id) {
+  void maybe_process_wait_token(Array<Stmt> &stmts, int token_id) {
     if (IsWaitSuppressedByLoopHoist(token_id)) {
       return;
     }
-    process_wait_token_and_barrier_wait(stmts, token_id);
+    process_wait_token(stmts, token_id);
   }
 
   void InjectLoopCarriedWaitsForToken(Array<Stmt> &stmts, int curr_token_id) {
@@ -1373,7 +1346,7 @@ private:
         if (injected_tokens.count(token_id) != 0) {
           continue;
         }
-        maybe_process_wait_token_and_barrier_wait(stmts, token_id);
+        maybe_process_wait_token(stmts, token_id);
         injected_tokens.insert(token_id);
       }
     }
@@ -1396,7 +1369,7 @@ private:
         if (injected_tokens.count(token_id) != 0) {
           continue;
         }
-        maybe_process_wait_token_and_barrier_wait(stmts, token_id);
+        maybe_process_wait_token(stmts, token_id);
         injected_tokens.insert(token_id);
       }
     }
@@ -1573,7 +1546,7 @@ private:
           RegionIntersect(src_region, buf_region)) {
         int token = write_buffer_token_map[buf];
         if (waited_tokens.count(token) == 0) {
-          maybe_process_wait_token_and_barrier_wait(stmts, token);
+          maybe_process_wait_token(stmts, token);
           waited_tokens.insert(token);
         }
       }
@@ -1611,7 +1584,7 @@ private:
           RegionIntersect(dst_region, buf_region)) {
         int token = read_buffer_token_map[buf];
         if (waited_tokens.count(token) == 0) {
-          maybe_process_wait_token_and_barrier_wait(stmts, token);
+          maybe_process_wait_token(stmts, token);
           waited_tokens.insert(token);
         }
       }
@@ -1628,7 +1601,7 @@ private:
           RegionIntersect(dst_region, buf_region)) {
         int token = write_buffer_token_map[buf];
         if (waited_tokens.count(token) == 0) {
-          maybe_process_wait_token_and_barrier_wait(stmts, token);
+          maybe_process_wait_token(stmts, token);
           waited_tokens.insert(token);
         }
       }
@@ -1705,13 +1678,6 @@ private:
     ICHECK(!info.candidates.empty())
         << "Could not derive static candidate masks for dynamic "
            "tl.broadcast_ barrier mask";
-    return info;
-  }
-
-  BarrierMaskInfo RecordBroadcastBarrier(const CallNode *call,
-                                         int curr_token_id) {
-    BarrierMaskInfo info = BroadcastBarrierMaskInfo(call);
-    token_to_barrier_mask_[curr_token_id] = info;
     return info;
   }
 
@@ -1806,15 +1772,6 @@ private:
       // enabling consistent loop-carried dependency reasoning.
       int token = PreAssignLoopToken(async_op, &owned_pre_assignments);
       async_op.token = token;
-
-      // Keep a back-reference from token -> call for special handling after we
-      // finish rewriting the loop (e.g. broadcast barrier initialization).
-      const CallNode *call = async_op.call;
-      scope.token_to_call[token] = call;
-
-      if (call && call->op.same_as(broadcast_())) {
-        RecordBroadcastBarrier(call, token);
-      }
     }
 
     AnalyzeWhileLoopCarriedDependencies(&scope);
@@ -1827,7 +1784,7 @@ private:
     std::set<int> hoisted_wait_tokens =
         AnalyzeHoistableWaitsForLoop(loop_scopes_.back());
     for (int token : hoisted_wait_tokens) {
-      process_wait_token_and_barrier_wait(stmts, token);
+      process_wait_token(stmts, token);
     }
     loop_hoisted_wait_tokens_stack_.push_back(hoisted_wait_tokens);
 
@@ -1983,8 +1940,7 @@ private:
 
         InjectLoopCarriedWaitsForToken(stmts, curr_token_id);
         token_process_async_call_arguments(call, {0, 1}, stmts);
-        BarrierMaskInfo participant_mask =
-            RecordBroadcastBarrier(call, curr_token_id);
+        BarrierMaskInfo participant_mask = BroadcastBarrierMaskInfo(call);
         token_process_read_buffer(NormalizeToBufferRegion(call->args[0]), stmts,
                                   curr_token_id);
         token_process_write_buffer(NormalizeToBufferRegion(call->args[1]),
@@ -2095,14 +2051,6 @@ private:
     for (auto &async_op : scope.async_ops) {
       int token = PreAssignLoopToken(async_op, &owned_pre_assignments);
       async_op.token = token;
-
-      const CallNode *call = async_op.call;
-      scope.token_to_call[token] = call;
-
-      // check if it is a broadcast
-      if (call && call->op.same_as(broadcast_())) {
-        RecordBroadcastBarrier(call, token);
-      }
     }
 
     AnalyzeLoopCarriedDependencies(&scope);
@@ -2113,7 +2061,7 @@ private:
     std::set<int> hoisted_wait_tokens =
         AnalyzeHoistableWaitsForLoop(loop_scopes_.back());
     for (int token : hoisted_wait_tokens) {
-      process_wait_token_and_barrier_wait(stmts, token);
+      process_wait_token(stmts, token);
     }
     loop_hoisted_wait_tokens_stack_.push_back(hoisted_wait_tokens);
 
@@ -2162,13 +2110,11 @@ private:
   int mesh_nrow_;
   int mesh_ncol_;
   arith::Analyzer *analyzer_;
-  bool insert_barrier_wait_after_wait_token_;
 
   Array<Array<ObjectRef>> read_buffers;
   Array<Array<ObjectRef>> write_buffers;
   Map<Array<ObjectRef>, int> read_buffer_token_map;
   Map<Array<ObjectRef>, int> write_buffer_token_map;
-  TokenBarrierMap token_to_barrier_mask_;
   std::set<int> available_tokens_;
 
   Map<Var, Buffer> buffer_data_to_buffer_;
@@ -2353,9 +2299,6 @@ private:
 // implicit function exits.
 class DeviceFuncWaitRewriter : public StmtMutator {
 public:
-  DeviceFuncWaitRewriter(TokenBarrierMap token_to_barrier_mask)
-      : token_to_barrier_mask_(std::move(token_to_barrier_mask)) {}
-
   Stmt operator()(Stmt body) { return this->VisitStmt(body); }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
@@ -2390,12 +2333,6 @@ public:
       for (int token_id : tokens) {
         stmts.push_back(Evaluate(Call(DataType::Handle(), wait_token(),
                                       {IntImm(DataType::Int(32), token_id)})));
-        auto barrier_it = token_to_barrier_mask_.find(token_id);
-        if (barrier_it != token_to_barrier_mask_.end()) {
-          stmts.push_back(
-              Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
-                            MakeBarrierArgs(barrier_it->second))));
-        }
       }
       return AttrStmt(op->node, op->attr_key, op->value,
                       SeqStmt::Flatten(stmts));
@@ -2408,7 +2345,6 @@ public:
   }
 
 private:
-  TokenBarrierMap token_to_barrier_mask_;
   int thread_extent_depth_{0};
 
   // Helper to collect token IDs that are still pending at device-function exit.
@@ -2553,18 +2489,14 @@ public:
   }
 };
 
-// Optimization pass to remove redundant token waits. Barrier arrive-and-wait is
-// kept as the paired synchronization event for the token wait that introduced
-// it; it is not used to infer token completion by participant mask.
+// Optimization pass to remove redundant token waits. Collective barriers are
+// independent launch epochs and are never inferred from or removed with a
+// token wait.
 class EliminateRedundancyRewriter : public StmtMutator {
 public:
   EliminateRedundancyRewriter(arith::Analyzer *analyzer = nullptr,
-                              std::vector<int> parent_token_ids = {},
-                              TokenBarrierMap token_to_barrier_mask = {})
-      : analyzer_(analyzer), parent_token_ids_(std::move(parent_token_ids)),
-        token_to_barrier_mask_(std::move(token_to_barrier_mask)) {
-    current_token_ids_ = {};
-  }
+                              std::vector<int> parent_token_ids = {})
+      : analyzer_(analyzer), parent_token_ids_(std::move(parent_token_ids)) {}
 
   std::vector<int> get_current_token_ids() const { return current_token_ids_; }
 
@@ -2614,19 +2546,6 @@ private:
     for (int token_id : collector.token_ids) {
       MarkTokenPending(token_id);
     }
-  }
-
-  bool IsBarrierWaitForToken(const Stmt &stmt, int token_id) const {
-    auto it = token_to_barrier_mask_.find(token_id);
-    if (it == token_to_barrier_mask_.end()) {
-      return false;
-    }
-    const auto *eval = stmt.as<EvaluateNode>();
-    if (!eval) {
-      return false;
-    }
-    const auto *call = eval->value.as<CallNode>();
-    return BarrierCallMatchesInfo(call, it->second);
   }
 
   void MarkTokenResolved(int token_id) {
@@ -2688,38 +2607,15 @@ private:
     return true;
   }
 
-  bool MatchBarrierWaitStmt(const Stmt &stmt, BarrierMaskInfo *mask) const {
-    const auto *eval = stmt.as<EvaluateNode>();
-    if (!eval) {
-      return false;
-    }
-    const auto *call = eval->value.as<CallNode>();
-    if (!call || !call->op.same_as(barrier_arrive_and_wait()) ||
-        call->args.empty()) {
-      return false;
-    }
-    *mask = BarrierMaskInfoFromArgs(call->args);
-    return true;
-  }
-
-  void PushNonRedundantStmt(Array<Stmt> *out, const Stmt &stmt) const {
+  void PushFlatten(Array<Stmt> *out, const Stmt &stmt) const {
     if (!stmt.defined()) {
       return;
     }
     if (const auto *seq = stmt.as<SeqStmtNode>()) {
       for (const Stmt &child : seq->seq) {
-        PushNonRedundantStmt(out, child);
+        PushFlatten(out, child);
       }
       return;
-    }
-    if (!out->empty()) {
-      BarrierMaskInfo prev_mask;
-      BarrierMaskInfo curr_mask;
-      if (MatchBarrierWaitStmt((*out)[out->size() - 1], &prev_mask) &&
-          MatchBarrierWaitStmt(stmt, &curr_mask) &&
-          SameBarrierMaskInfo(prev_mask, curr_mask)) {
-        return;
-      }
     }
     out->push_back(stmt);
   }
@@ -2731,37 +2627,34 @@ private:
       int token_id = -1;
       if (MatchWaitTokenStmt(op->seq[i], &token_id)) {
         if (IsTokenResolved(token_id)) {
-          if (i + 1 < n && IsBarrierWaitForToken(op->seq[i + 1], token_id)) {
-            ++i;
-          }
           continue;
         }
         MarkTokenResolved(token_id);
       }
       Stmt rewritten = VisitStmt(op->seq[i]);
       MarkGeneratedAsyncTokensPending(rewritten);
-      PushNonRedundantStmt(&out, rewritten);
+      PushFlatten(&out, rewritten);
     }
     return SeqStmt::Flatten(out);
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
-    auto body_rewriter = EliminateRedundancyRewriter(
-        analyzer_, get_all_token_ids(), token_to_barrier_mask_);
+    auto body_rewriter =
+        EliminateRedundancyRewriter(analyzer_, get_all_token_ids());
     Stmt body = body_rewriter(op->body);
     PropagateResolvedStates(body, /*guaranteed_to_execute=*/true);
     return AttrStmt(op->node, op->attr_key, op->value, body, op->span);
   }
 
   Stmt VisitStmt_(const IfThenElseNode *op) {
-    auto eliminate_sync_then_rewriter = EliminateRedundancyRewriter(
-        analyzer_, get_all_token_ids(), token_to_barrier_mask_);
+    auto eliminate_sync_then_rewriter =
+        EliminateRedundancyRewriter(analyzer_, get_all_token_ids());
     auto then_case = eliminate_sync_then_rewriter(op->then_case);
 
     Stmt else_case;
     if (op->else_case.defined()) {
-      auto eliminate_sync_else_rewriter = EliminateRedundancyRewriter(
-          analyzer_, get_all_token_ids(), token_to_barrier_mask_);
+      auto eliminate_sync_else_rewriter =
+          EliminateRedundancyRewriter(analyzer_, get_all_token_ids());
       else_case = eliminate_sync_else_rewriter(op->else_case.value());
 
       std::vector<int> then_tokens =
@@ -2786,8 +2679,8 @@ private:
   }
 
   Stmt VisitStmt_(const ForNode *op) {
-    auto eliminate_sync_loop_rewriter = EliminateRedundancyRewriter(
-        analyzer_, get_all_token_ids(), token_to_barrier_mask_);
+    auto eliminate_sync_loop_rewriter =
+        EliminateRedundancyRewriter(analyzer_, get_all_token_ids());
     auto body = eliminate_sync_loop_rewriter(op->body);
 
     bool is_guaranteed = false;
@@ -2808,8 +2701,8 @@ private:
   }
 
   Stmt VisitStmt_(const WhileNode *op) {
-    auto eliminate_sync_loop_rewriter = EliminateRedundancyRewriter(
-        analyzer_, get_all_token_ids(), token_to_barrier_mask_);
+    auto eliminate_sync_loop_rewriter =
+        EliminateRedundancyRewriter(analyzer_, get_all_token_ids());
     auto body = eliminate_sync_loop_rewriter(op->body);
 
     bool is_guaranteed = false;
@@ -2831,7 +2724,6 @@ private:
   // Token IDs that have been waited/synchronized along the current execution
   // path
   std::vector<int> current_token_ids_;
-  TokenBarrierMap token_to_barrier_mask_;
 };
 
 class InitReusableBarriersRewriter : public StmtMutator {
@@ -2982,18 +2874,14 @@ public:
         InjectSyncRewriter(f->buffer_map, target, analyzer);
     f.CopyOnWrite()->body = inject_sync_rewriter(f->body);
 
-    TokenBarrierMap token_to_barrier_mask =
-        inject_sync_rewriter.get_token_to_barrier_mask();
-
     auto loop_missing_token_wait_rewriter = LoopMissingTokenWaitRewriter();
     f.CopyOnWrite()->body = loop_missing_token_wait_rewriter(f->body);
 
-    auto device_func_wait_rewriter =
-        DeviceFuncWaitRewriter(token_to_barrier_mask);
+    auto device_func_wait_rewriter = DeviceFuncWaitRewriter();
     f.CopyOnWrite()->body = device_func_wait_rewriter(f->body);
 
-    auto eliminate_redundancy_rewriter = EliminateRedundancyRewriter(
-        analyzer, std::vector<int>({}), token_to_barrier_mask);
+    auto eliminate_redundancy_rewriter =
+        EliminateRedundancyRewriter(analyzer, std::vector<int>({}));
     f.CopyOnWrite()->body = eliminate_redundancy_rewriter(f->body);
 
     auto init_reusable_barriers_rewriter = InitReusableBarriersRewriter();
