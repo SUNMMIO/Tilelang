@@ -31,6 +31,9 @@ void ValidateShapeAndType(const Buffer &src, const Buffer &dst,
   ICHECK(src->dtype == dst->dtype)
       << "T.transpose requires matching element types, got " << src->dtype
       << " and " << dst->dtype;
+  ICHECK_EQ(src->dtype.lanes(), 1)
+      << "Sunmmio T.transpose requires scalar element types, got "
+      << src->dtype;
   ICHECK(src->dtype.is_bfloat16() ||
          (src->dtype.is_float() && src->dtype.bits() == 32))
       << "Sunmmio T.transpose supports only bfloat16 and float32, got "
@@ -109,7 +112,6 @@ TileOperator TransposeNode::Clone() const {
 
 LayoutMap TransposeNode::InferLayout(const LayoutInferArgs &T,
                                      InferLevel level) const {
-  (void)level;
   ICHECK(TargetIsSunmmio(T.target))
       << "T.transpose is currently supported only on the Sunmmio target";
   ValidateShapeAndType(src, dst, T.analyzer);
@@ -119,17 +121,54 @@ LayoutMap TransposeNode::InferLayout(const LayoutInferArgs &T,
   ICHECK_EQ(dst.scope(), kSunmmioScopeRSRAM)
       << "Sunmmio T.transpose destination must use shared.rsram, got "
       << dst.scope();
-  ICHECK(T.layout_map.count(src))
-      << "Sunmmio T.transpose source has no inferred layout";
 
-  Optional<Layout> expected = CanonicalTransposeLayout(
-      T.layout_map[src], src, dst, T.target, T.analyzer);
-  ICHECK(expected.defined())
-      << "Sunmmio T.transpose source layout must be a two-level 32x32 ZZ or "
-         "ZN layout";
+  // Transpose supports both ZZ and ZN, so it imposes no hard layout choice.
+  if (level >= InferLevel::kStrict)
+    return {};
+
+  auto get_layout_level = [&](const Buffer &buffer) {
+    if (T.layout_levels.count(buffer)) {
+      return static_cast<InferLevel>(T.layout_levels[buffer].IntValue());
+    }
+    // Layout inference implementations without provenance predate the
+    // Sunmmio kFree defaults. Treat their known layouts as established.
+    return T.layout_map.count(buffer) ? InferLevel::kCommon : InferLevel::kFree;
+  };
+
+  bool src_has_layout = T.layout_map.count(src);
+  bool dst_has_layout = T.layout_map.count(dst);
+  bool src_established =
+      src_has_layout && get_layout_level(src) > InferLevel::kFree;
+  bool dst_established =
+      dst_has_layout && get_layout_level(dst) > InferLevel::kFree;
+
+  // Two defaults do not constrain one another. Wait until another operator or
+  // annotation establishes one side, then propagate that layout family.
+  if (!src_established && !dst_established)
+    return {};
 
   LayoutMap updates;
-  updates.Set(dst, expected.value());
+  if (src_established) {
+    Optional<Layout> expected_dst = CanonicalTransposeLayout(
+        T.layout_map[src], src, dst, T.target, T.analyzer);
+    ICHECK(expected_dst.defined())
+        << "Sunmmio T.transpose source layout must be a two-level 32x32 ZZ or "
+           "ZN layout";
+    if (dst_established) {
+      ICHECK(IsSameLayout(T.layout_map[dst], expected_dst.value(), T.analyzer))
+          << "Sunmmio T.transpose operands require the same layout family";
+    } else {
+      updates.Set(dst, expected_dst.value());
+    }
+    return updates;
+  }
+
+  Optional<Layout> expected_src = CanonicalTransposeLayout(
+      T.layout_map[dst], dst, src, T.target, T.analyzer);
+  ICHECK(expected_src.defined())
+      << "Sunmmio T.transpose destination layout must be a two-level 32x32 ZZ "
+         "or ZN layout";
+  updates.Set(src, expected_src.value());
   return updates;
 }
 

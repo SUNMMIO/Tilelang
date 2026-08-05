@@ -7,8 +7,10 @@ import tilelang.language as T
 import tilelang.utils.target as target_utils
 from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import (
+    lower_sunmmio_kernel_to_device_tir,
     validate_sunmmio_codegen_with_npuir_opt,
 )
+from tilelang import tvm
 from tilelang.layout import make_zn_layout, make_zz_layout
 
 
@@ -24,17 +26,12 @@ TRANSPOSE_CONFIGS = [
 
 @pytest.fixture
 def _sunmmio_region_validation_guard():
-    old_value = None
-    if hasattr(target_utils, "get_sunmmio_region_validation"):
-        old_value = target_utils.get_sunmmio_region_validation()
+    old_value = target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
 
     try:
         yield
     finally:
-        if old_value is not None:
-            target_utils.set_sunmmio_region_validation(old_value)
-        else:
-            pass
+        target_utils.set_sunmmio_region_validation(old_value)
 
 
 @target("Sunmmio")
@@ -80,6 +77,63 @@ def mesh_transpose_kernel(
                 T.copy(dst, b)
             else:
                 T.copy(src, b)
+
+    return main
+
+
+@target("Sunmmio")
+def mesh_transpose_order_kernel(source_constraint_first):
+    """Build the same transpose layout constraints in either source order."""
+    size = 64
+    dtype = "bfloat16"
+    placement = T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)
+    zn_layout = make_zn_layout((size, size), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        a: T.MeshTensor((size, size), placement, dtype, layout=zn_layout),
+        b: T.MeshTensor((size, size), placement, dtype, layout=zn_layout),
+    ):
+        with T.Kernel():
+            zn_src = T.alloc_shared((size, size), dtype, scope="shared.rsram")
+            src = T.alloc_shared((size, size), dtype, scope="shared.rsram")
+            dst = T.alloc_shared((size, size), dtype, scope="shared.rsram")
+            T.annotate_layout({zn_src: zn_layout})
+            T.copy(a, zn_src)
+
+            if source_constraint_first:
+                T.transpose(zn_src, src)
+                T.transpose(src, dst)
+            else:
+                T.transpose(src, dst)
+                T.transpose(zn_src, src)
+
+            T.copy(dst, b)
+
+    return main
+
+
+@target("Sunmmio")
+def mesh_transpose_scope_kernel(global_operand):
+    """Build a transpose with one operand intentionally in global memory."""
+    size = 64
+    dtype = "bfloat16"
+    placement = T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)
+    layout = make_zz_layout((size, size))
+
+    @T.prim_func
+    def main(
+        a: T.MeshTensor((size, size), placement, dtype, layout=layout),
+        b: T.MeshTensor((size, size), placement, dtype, layout=layout),
+    ):
+        with T.Kernel():
+            local = T.alloc_shared((size, size), dtype, scope="shared.rsram")
+            if global_operand == "source":
+                T.transpose(a, local)
+                T.copy(local, b)
+            else:
+                T.copy(a, local)
+                T.transpose(local, b)
 
     return main
 
@@ -139,3 +193,44 @@ def test_transpose_loop_codegen(
     )
 
     assert src.count("suvm.transpose_async") == 2
+
+
+@pytest.mark.parametrize(
+    "source_constraint_first",
+    [False, True],
+    ids=["dependent_first", "constraint_first"],
+)
+def test_transpose_layout_inference_is_order_independent(
+    tmp_path,
+    source_constraint_first,
+):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        mesh_transpose_order_kernel(source_constraint_first),
+        tmp_path,
+        mlir_filename=(
+            "transpose_order_"
+            f"{'constraint_first' if source_constraint_first else 'dependent_first'}.mlir"
+        ),
+        expected_tokens=(
+            "suvm.copy_async",
+            "suvm.transpose_async",
+            "suvm.wait_token",
+        ),
+    )
+
+    assert src.count("suvm.transpose_async") == 2
+
+
+def test_transpose_rejects_vector_element_dtype():
+    with pytest.raises(tvm.error.InternalError, match="requires scalar element types"):
+        lower_sunmmio_kernel_to_device_tir(mesh_transpose_kernel(64, 64, "float32x2", "zz"))
+
+
+def test_transpose_rejects_global_source():
+    with pytest.raises(tvm.error.InternalError, match="source must use shared.rsram"):
+        lower_sunmmio_kernel_to_device_tir(mesh_transpose_scope_kernel("source"))
+
+
+def test_transpose_rejects_global_destination():
+    with pytest.raises(tvm.error.InternalError, match="destination must use shared.rsram"):
+        lower_sunmmio_kernel_to_device_tir(mesh_transpose_scope_kernel("destination"))
