@@ -1,3 +1,5 @@
+import pytest
+
 import tilelang.language as T
 from tilelang import tvm
 from tilelang.utils.target import determine_target
@@ -12,6 +14,65 @@ def test_mesh_sharding_policy_normalizes_integer_replicate():
 
     tensor = T.MeshTensor((8, 16), policy, (2, 4), "float16")
     assert tensor.local_shape == (8, 16)
+
+
+@pytest.mark.parametrize(
+    "placement, expected_kind, expected_local_shape, expected_extents",
+    [
+        (T.placement.replicated(), 0, (5,), [5, 5, 5, 5]),
+        (T.placement.row_shard(0), 1, (3,), [3, 3, 2, 2]),
+        (T.placement.col_shard(0), 2, (3,), [3, 2, 3, 2]),
+        (T.placement.full_shard(0, 0), 3, (2,), [2, 1, 1, 1]),
+        (T.placement.mesh_as_line(0), 4, (2,), [2, 1, 1, 1]),
+    ],
+)
+def test_placement_constructors_and_metadata(placement, expected_kind, expected_local_shape, expected_extents):
+    tensor = T.MeshTensor((5,), placement, (2, 2), "float16")
+
+    assert placement.kind == expected_kind
+    assert tensor.meta_data["placement_kind"] == expected_kind
+    assert tensor.local_shape == expected_local_shape
+    assert [tensor.get_local_extent(cid)[0] for cid in range(4)] == expected_extents
+
+
+def test_full_shard_same_dim_differs_from_mesh_as_line():
+    full_shard = T.MeshTensor((6,), T.placement.full_shard(0, 0), (2, 2), "float16")
+    mesh_as_line = T.MeshTensor((6,), T.placement.mesh_as_line(0), (2, 2), "float16")
+
+    assert full_shard.local_shape == mesh_as_line.local_shape == (2,)
+    assert [full_shard.get_local_extent(cid)[0] for cid in range(4)] == [2, 1, 2, 1]
+    assert [mesh_as_line.get_local_extent(cid)[0] for cid in range(4)] == [2, 2, 1, 1]
+    assert full_shard.meta_data["placement_kind"] != mesh_as_line.meta_data["placement_kind"]
+
+
+@pytest.mark.parametrize(
+    "make_placement",
+    [
+        lambda: T.placement.row_shard(-1),
+        lambda: T.placement.col_shard(-1),
+        lambda: T.placement.full_shard(-1, 0),
+        lambda: T.placement.full_shard(0, -1),
+        lambda: T.placement.mesh_as_line(-1),
+    ],
+)
+def test_placement_constructors_reject_negative_dimensions(make_placement):
+    with pytest.raises(ValueError, match="must be a non-negative int"):
+        make_placement()
+
+
+@pytest.mark.parametrize(
+    "placement",
+    [
+        T.placement.row_shard(1),
+        T.placement.col_shard(1),
+        T.placement.full_shard(0, 1),
+        T.placement.full_shard(1, 0),
+        T.placement.mesh_as_line(1),
+    ],
+)
+def test_placement_rejects_dimensions_outside_tensor_rank(placement):
+    with pytest.raises(ValueError, match=r"Invalid (row|col) shard dimension"):
+        T.MeshTensor((6,), placement, (2, 2), "float16")
 
 
 def test_mesh_tensor_shape_api_in_kernel():
