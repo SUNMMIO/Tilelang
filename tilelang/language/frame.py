@@ -5,6 +5,7 @@ from tvm.ffi import register_object as _register_object
 from tvm.tir import Var, PrimExpr, BufferLoad, BufferRegion
 from tvm.tir.stmt_functor import post_order_visit, substitute
 from tvm.ir import Range
+from tvm.arith import Analyzer
 from tvm import DataType
 from tvm.script.ir_builder.tir.frame import TIRFrame
 from collections import deque
@@ -210,29 +211,45 @@ def get_let_value(var: Var) -> PrimExpr | None:
     return _get_let_stack().get_value(var)
 
 
-def _collect_let_bound_substitutions(expr: PrimExpr, resolved_vars: set[Var]) -> dict[Var, PrimExpr]:
-    substitutions: dict[Var, PrimExpr] = {}
-
-    def collect(node):
-        if not isinstance(node, Var) or node in resolved_vars or not has_let_value(node):
-            return
-        value = get_let_value(node)
-        if isinstance(value, PrimExpr):
-            resolved_vars.add(node)
-            substitutions[node] = value
-
-    post_order_visit(expr, collect)
-    return substitutions
-
-
 def resolve_let_bound_expr(expr: PrimExpr | int) -> PrimExpr | int:
     """Recursively expand active frontend let bindings in a TIR expression."""
     if not isinstance(expr, PrimExpr):
         return expr
 
-    resolved_vars: set[Var] = set()
-    while True:
-        substitutions = _collect_let_bound_substitutions(expr, resolved_vars)
+    resolved_vars: dict[Var, PrimExpr] = {}
+    resolving_vars: set[Var] = set()
+
+    def resolve_var(var: Var) -> PrimExpr:
+        if var in resolved_vars:
+            return resolved_vars[var]
+        if var in resolving_vars or not has_let_value(var):
+            return var
+
+        value = get_let_value(var)
+        if not isinstance(value, PrimExpr):
+            return var
+
+        resolving_vars.add(var)
+        try:
+            resolved_value = resolve_expr(value)
+        finally:
+            resolving_vars.remove(var)
+        resolved_vars[var] = resolved_value
+        return resolved_value
+
+    def resolve_expr(value: PrimExpr) -> PrimExpr:
+        substitutions: dict[Var, PrimExpr] = {}
+
+        def collect(node):
+            if not isinstance(node, Var):
+                return
+            resolved_value = resolve_var(node)
+            if not resolved_value.same_as(node):
+                substitutions[node] = resolved_value
+
+        post_order_visit(value, collect)
         if not substitutions:
-            return expr
-        expr = substitute(expr, substitutions)
+            return value
+        return substitute(value, substitutions)
+
+    return Analyzer().simplify(resolve_expr(expr))

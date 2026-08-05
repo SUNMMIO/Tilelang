@@ -234,6 +234,30 @@ def _make_mismatched_let_bound_mesh_copy_kernel():
     return kernel
 
 
+@target("Sunmmio")
+def _make_let_bound_singleton_region_copy_kernel():
+    @T.prim_func
+    def kernel(A_1x8_global: T.Tensor((1, 8), DTYPE)):
+        with T.Kernel():
+            A_8_shared = T.alloc_shared((8,), DTYPE)
+            with T.LetStmt(1) as singleton:
+                T.copy(A_1x8_global[0:singleton, 0:8], A_8_shared)
+
+    return kernel
+
+
+@target("Sunmmio")
+def _make_let_bound_oversized_region_copy_kernel():
+    @T.prim_func
+    def kernel(A_8_global: T.Tensor((8,), DTYPE)):
+        with T.Kernel():
+            A_4_shared = T.alloc_shared((4,), DTYPE)
+            with T.LetStmt(8) as extent:
+                T.copy(A_8_global[0:extent], A_4_shared[0:4])
+
+    return kernel
+
+
 def _assert_region_extents(script, buffer_name, access_mask, extents):
     extent_pattern = r",\s*".join(str(extent) for extent in extents)
     name_pattern = r"[A-Za-z_]\w*" if buffer_name is None else re.escape(buffer_name)
@@ -367,6 +391,19 @@ def test_sunmmio_copy_frontend_rejects_mismatched_let_bound_mesh_shape(strict):
             _make_mismatched_let_bound_mesh_copy_kernel()
     finally:
         _target_utils.set_sunmmio_region_validation(previous)
+
+
+def test_sunmmio_copy_strict_squeezes_let_bound_singleton_extent(_strict_region_validation):
+    script = tvm.IRModule({"main": _make_let_bound_singleton_region_copy_kernel()}).script()
+
+    assert "T.min" not in script
+    _assert_region_extents(script, "A_1x8_global", 1, [1, 8])
+    _assert_region_extents(script, None, 2, [8])
+
+
+def test_sunmmio_copy_strict_rejects_let_bound_oversized_extent(_strict_region_validation):
+    with pytest.raises(ValueError, match="src extent is larger than dst extent"):
+        _make_let_bound_oversized_region_copy_kernel()
 
 
 def test_sunmmio_copy_frontend_clips_src_before_shrinking_dst(_strict_region_validation):

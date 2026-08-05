@@ -24,7 +24,6 @@ _OperandKind = Literal["buffer", "region", "load"]
 
 @dataclass(frozen=True)
 class _CopyRegionSpec:
-    original: Any
     kind: _OperandKind
     buffer: tir.Buffer
     mins: list[tir.PrimExpr]
@@ -51,17 +50,19 @@ def _extract_copy_region_spec(obj: BufferLikeType) -> _CopyRegionSpec:
     obj = _resolve_let_value(obj)
     if isinstance(obj, tir.Buffer):
         mins = [tir.IntImm("int32", 0) for _ in obj.shape]
-        return _CopyRegionSpec(obj, "buffer", obj, mins, list(obj.shape), False)
+        return _CopyRegionSpec("buffer", obj, mins, list(obj.shape), False)
     if isinstance(obj, tir.BufferRegion):
         mins = [r.min for r in obj.region]
         extents = [r.extent for r in obj.region]
-        return _CopyRegionSpec(obj, "region", obj.buffer, mins, extents, True)
+        return _CopyRegionSpec("region", obj.buffer, mins, extents, True)
     if isinstance(obj, tir.BufferLoad):
-        return _CopyRegionSpec(obj, "load", obj.buffer, list(obj.indices), None, False)
+        return _CopyRegionSpec("load", obj.buffer, list(obj.indices), None, False)
     raise TypeError(f"Unsupported argument type for T.copy: {type(obj)}")
 
 
 def _as_static_int(expr: Any) -> int | None:
+    if isinstance(expr, tir.PrimExpr):
+        expr = resolve_let_bound_expr(expr)
     if isinstance(expr, int):
         return expr
     if isinstance(expr, tir.IntImm):
@@ -70,10 +71,11 @@ def _as_static_int(expr: Any) -> int | None:
 
 
 def _expr_is_one(expr: tir.PrimExpr) -> bool:
-    return prim_expr_equal(expr, 1)
+    return prim_expr_equal(resolve_let_bound_expr(expr), 1)
 
 
 def _expr_is_squeezable_one(expr: tir.PrimExpr) -> bool:
+    expr = resolve_let_bound_expr(expr)
     if _expr_is_one(expr):
         return True
     if isinstance(expr, tir.Min):
@@ -146,18 +148,21 @@ def _clip_region_to_shape(spec: _CopyRegionSpec, mins: list[tir.PrimExpr], exten
             "T.copy region rank does not match buffer rank before clipping: "
             f"{spec.buffer.name}, mins={len(mins)}, extents={len(extents)}, shape={len(spec.buffer.shape)}"
         )
+    resolved_mins = [resolve_let_bound_expr(min_value) for min_value in mins]
+    resolved_extents = [resolve_let_bound_expr(extent) for extent in extents]
+    resolved_shapes = [resolve_let_bound_expr(shape) for shape in spec.buffer.shape]
     validated_extents = [
         _clip_extent_to_shape(
             spec.buffer,
             dim,
             min_value,
             extent,
-            spec.buffer.shape[dim],
+            resolved_shapes[dim],
             warn_if_clipped=spec.explicit_extents,
         )
-        for dim, (min_value, extent) in enumerate(zip(mins, extents))
+        for dim, (min_value, extent) in enumerate(zip(resolved_mins, resolved_extents))
     ]
-    return _NormalizedCopyRegion(spec, list(mins), validated_extents)
+    return _NormalizedCopyRegion(spec, resolved_mins, validated_extents)
 
 
 def _normalize_copy_regions(src: _CopyRegionSpec, dst: _CopyRegionSpec) -> tuple[_NormalizedCopyRegion, _NormalizedCopyRegion]:
@@ -288,7 +293,8 @@ def _validate_and_adjust_copy_regions(
 
 
 def _encode_normalized_region(region: _NormalizedCopyRegion, access_type: str) -> tir.PrimExpr:
-    return to_buffer_region(region.spec.original, access_type=access_type, extents=region.extents)
+    normalized_load = tir.BufferLoad(region.spec.buffer, region.mins)
+    return to_buffer_region(normalized_load, access_type=access_type, extents=region.extents)
 
 
 def _prepare_copy_regions_strict(

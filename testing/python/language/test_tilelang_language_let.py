@@ -1,6 +1,26 @@
+from types import SimpleNamespace
+
 import tilelang.testing
 from tilelang import tvm as tvm
 from tilelang import language as T
+import tilelang.language.frame as frame
+
+
+def test_resolve_let_bound_expr_expands_transitive_bindings():
+    a = tvm.tir.Var("a", "int32")
+    b = tvm.tir.Var("b", "int32")
+    stack = frame._get_let_stack()
+    initial_depth = len(stack)
+
+    try:
+        stack.push(SimpleNamespace(var=b, value=tvm.tir.IntImm("int32", 5)))
+        stack.push(SimpleNamespace(var=a, value=b))
+        resolved = frame.resolve_let_bound_expr(a + b)
+    finally:
+        while len(stack) > initial_depth:
+            stack.pop()
+
+    tvm.ir.assert_structural_equal(resolved, tvm.tir.IntImm("int32", 10))
 
 
 @tilelang.testing.requires_cuda
