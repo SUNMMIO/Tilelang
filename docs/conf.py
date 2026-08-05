@@ -42,7 +42,11 @@ source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
 
 myst_enable_extensions = ["colon_fence", "deflist"]
 
-redirects = {"get_started/try_out": "../index.html#getting-started"}
+redirects = {
+    "get_started/try_out": "../index.html#getting-started",
+    "sunmmio/sunmmio_tilelang_getting_started_en": "sunmmio_tilelang_getting_started.html",
+    "sunmmio/sunmmio_tilelang_user_guide_en": "sunmmio_tilelang_user_guide.html",
+}
 
 language = "en"
 
