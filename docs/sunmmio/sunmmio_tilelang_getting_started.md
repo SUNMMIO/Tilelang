@@ -6,12 +6,9 @@
 
 ### Architecture
 
-:::{figure} imgs/sunmmio_a4e_architecture.png
-:align: center
-:alt: SunMMIO NPU architecture
+![SunMMIO NPU architecture](imgs/sunmmio_a4e_architecture.png)
 
-Overall architecture of the SunMMIO NPU, including the 2D mesh, multiple types of compute units, and on-chip memory hierarchy.
-:::
+*Overall architecture of the SunMMIO NPU, including the 2D mesh, multiple types of compute units, and on-chip memory hierarchy.*
 
 The SunMMIO NPU has the following architectural features:
 
@@ -22,12 +19,9 @@ The SunMMIO NPU has the following architectural features:
 
 ### Mental Model for Writing a SunMMIO TileLang Kernel
 
-:::{figure} imgs/sunmmio_kernel_mental_model.png
-:align: center
-:alt: Mental model for SunMMIO TileLang
+![Mental model for SunMMIO TileLang](imgs/sunmmio_kernel_mental_model.png)
 
-Mental model for writing a SunMMIO TileLang kernel, covering sharding, execution, and communication.
-:::
+*Mental model for writing a SunMMIO TileLang kernel, covering sharding, execution, and communication.*
 
 Keep the following mental model in mind when writing a TileLang kernel for SunMMIO:
 
@@ -111,12 +105,9 @@ The following sections build on this example.
 
 ### 1. Sharding Mechanism
 
-:::{figure} imgs/sunmmio_mesh_sharding.png
-:align: center
-:alt: Sharding examples
+![Sharding examples](imgs/sunmmio_mesh_sharding.png)
 
-Tensor sharding methods on a Core Mesh, showing how logical dimensions map to mesh directions.
-:::
+*Tensor sharding methods on a Core Mesh, showing how logical dimensions map to mesh directions.*
 
 Use `T.MeshTensor` and `T.placement` to define how a global tensor is distributed across the mesh.
 
@@ -207,12 +198,9 @@ If a Core coordinate is written as `(row, col)`, then:
 - `...`
 - `(3, 3)` receives `C[48:64, 24:32]`.
 
-:::{figure} imgs/sunmmio_full_shard_example.png
-:align: center
-:alt: full_shard(0, 1) example
+![full_shard(0, 1) example](imgs/sunmmio_full_shard_example.png)
 
-Concrete example of `T.placement.full_shard(0, 1)`, showing how a `(64, 32)` tensor is distributed across a `4 x 4` mesh.
-:::
+*Concrete example of `T.placement.full_shard(0, 1)`, showing how a `(64, 32)` tensor is distributed across a `4 x 4` mesh.*
 
 This is how `MeshTensor` works: define the global shape, define its placement on the mesh, and each Core automatically sees its local shard.
 

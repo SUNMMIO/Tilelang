@@ -6,12 +6,9 @@
 
 ### 架构特征
 
-:::{figure} imgs/sunmmio_a4e_architecture.png
-:align: center
-:alt: SunMMIO NPU 架构图
+![SunMMIO NPU 架构图](imgs/sunmmio_a4e_architecture.png)
 
-SunMMIO NPU 的整体硬件架构，包括 2D mesh、多类计算单元和片上存储层次。
-:::
+*SunMMIO NPU 的整体硬件架构，包括 2D mesh、多类计算单元和片上存储层次。*
 
 SunMMIO NPU 的硬件架构特征为：
 
@@ -22,12 +19,9 @@ SunMMIO NPU 的硬件架构特征为：
 
 ### 编写 SunMMIO TileLang Kernel 时的 Mental Model
 
-:::{figure} imgs/sunmmio_kernel_mental_model.png
-:align: center
-:alt: SunMMIO TileLang Mental Model
+![SunMMIO TileLang Mental Model](imgs/sunmmio_kernel_mental_model.png)
 
-编写 SunMMIO TileLang kernel 时的 Mental Model，包括分片、执行和通信三层视角。
-:::
+*编写 SunMMIO TileLang kernel 时的 Mental Model，包括分片、执行和通信三层视角。*
 
 给 SunMMIO 写 TileLang kernel 时，需要有如下 Mental Model：
 
@@ -111,12 +105,9 @@ kernel = tilelang.compile(func, target="sunmmio")
 
 ### 1. Sharding 机制
 
-:::{figure} imgs/sunmmio_mesh_sharding.png
-:align: center
-:alt: Sharding 方法举例
+![Sharding 方法举例](imgs/sunmmio_mesh_sharding.png)
 
-Tensor 在 Core Mesh 上的 Sharding 方法示意，说明逻辑维度如何映射到 mesh 方向。
-:::
+*Tensor 在 Core Mesh 上的 Sharding 方法示意，说明逻辑维度如何映射到 mesh 方向。*
 
 我们用 `T.MeshTensor` 和 `T.placement` 定义全局 tensor 在 mesh 上怎么分。
 
@@ -207,12 +198,9 @@ C: T.MeshTensor(
 - `...`
 - `(3, 3)` 拿到 `C[48:64, 24:32]`
 
-:::{figure} imgs/sunmmio_full_shard_example.png
-:align: center
-:alt: full_shard(0, 1) 示例
+![full_shard(0, 1) 示例](imgs/sunmmio_full_shard_example.png)
 
-`T.placement.full_shard(0, 1)` 的具体示例，展示 `(64, 32)` tensor 在 `4 x 4` mesh 上的实际切分结果。
-:::
+*`T.placement.full_shard(0, 1)` 的具体示例，展示 `(64, 32)` tensor 在 `4 x 4` mesh 上的实际切分结果。*
 
 这就是 `MeshTensor` 的基本工作方式：先定义全局 shape，再定义 mesh 上的切分规则，然后每个 Core 自动看到自己的 local shard。
 
