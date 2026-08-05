@@ -12,18 +12,19 @@ from tilelang.utils.language import (
     legalize_pairwise_extents,
 )
 from tilelang.language.utils import get_extent
+from tilelang.language.frame import resolve_let_bound_expr
 from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
 from tilelang.utils.target import target_is_sunmmio
-from tvm import ir, tir
+from tvm import arith, ir, tir
 from tvm.target import Target
 
 
 _OperandKind = Literal["buffer", "region", "load"]
+_ExtentRelation = Literal["equal", "less_equal", "greater", "unknown"]
 
 
 @dataclass(frozen=True)
 class _CopyRegionSpec:
-    original: Any
     kind: _OperandKind
     buffer: tir.Buffer
     mins: list[tir.PrimExpr]
@@ -50,17 +51,19 @@ def _extract_copy_region_spec(obj: BufferLikeType) -> _CopyRegionSpec:
     obj = _resolve_let_value(obj)
     if isinstance(obj, tir.Buffer):
         mins = [tir.IntImm("int32", 0) for _ in obj.shape]
-        return _CopyRegionSpec(obj, "buffer", obj, mins, list(obj.shape), False)
+        return _CopyRegionSpec("buffer", obj, mins, list(obj.shape), False)
     if isinstance(obj, tir.BufferRegion):
         mins = [r.min for r in obj.region]
         extents = [r.extent for r in obj.region]
-        return _CopyRegionSpec(obj, "region", obj.buffer, mins, extents, True)
+        return _CopyRegionSpec("region", obj.buffer, mins, extents, True)
     if isinstance(obj, tir.BufferLoad):
-        return _CopyRegionSpec(obj, "load", obj.buffer, list(obj.indices), None, False)
+        return _CopyRegionSpec("load", obj.buffer, list(obj.indices), None, False)
     raise TypeError(f"Unsupported argument type for T.copy: {type(obj)}")
 
 
 def _as_static_int(expr: Any) -> int | None:
+    if isinstance(expr, tir.PrimExpr):
+        expr = resolve_let_bound_expr(expr)
     if isinstance(expr, int):
         return expr
     if isinstance(expr, tir.IntImm):
@@ -69,10 +72,11 @@ def _as_static_int(expr: Any) -> int | None:
 
 
 def _expr_is_one(expr: tir.PrimExpr) -> bool:
-    return prim_expr_equal(expr, 1)
+    return prim_expr_equal(resolve_let_bound_expr(expr), 1)
 
 
 def _expr_is_squeezable_one(expr: tir.PrimExpr) -> bool:
+    expr = resolve_let_bound_expr(expr)
     if _expr_is_one(expr):
         return True
     if isinstance(expr, tir.Min):
@@ -81,13 +85,30 @@ def _expr_is_squeezable_one(expr: tir.PrimExpr) -> bool:
 
 
 def _expr_equal(lhs: tir.PrimExpr, rhs: tir.PrimExpr) -> bool:
-    return prim_expr_equal(lhs, rhs)
+    return prim_expr_equal(resolve_let_bound_expr(lhs), resolve_let_bound_expr(rhs))
+
+
+def _extent_relation(lhs: tir.PrimExpr, rhs: tir.PrimExpr) -> _ExtentRelation:
+    resolved_lhs = resolve_let_bound_expr(lhs)
+    resolved_rhs = resolve_let_bound_expr(rhs)
+    if prim_expr_equal(resolved_lhs, resolved_rhs):
+        return "equal"
+
+    analyzer = arith.Analyzer()
+    try:
+        if analyzer.can_prove_equal(resolved_lhs, resolved_rhs):
+            return "equal"
+        if analyzer.can_prove(resolved_lhs > resolved_rhs):
+            return "greater"
+        if analyzer.can_prove(resolved_lhs <= resolved_rhs):
+            return "less_equal"
+    except (TypeError, ValueError):
+        pass
+    return "unknown"
 
 
 def _expr_gt(lhs: tir.PrimExpr, rhs: tir.PrimExpr) -> bool:
-    lhs_int = _as_static_int(lhs)
-    rhs_int = _as_static_int(rhs)
-    return lhs_int is not None and rhs_int is not None and lhs_int > rhs_int
+    return _extent_relation(lhs, rhs) == "greater"
 
 
 # Warn when an explicit BufferRegion exceeds the buffer shape.
@@ -120,9 +141,10 @@ def _clip_extent_to_shape(
     if min_int is not None and extent_int is not None and shape_int is not None:
         available = shape_int - min_int
         clipped = min(extent_int, available)
-        if clipped < extent_int and warn_if_clipped:
-            _warn_explicit_oob(buffer, dim, min_value, extent, shape)
-        return tir.IntImm(extent.dtype if hasattr(extent, "dtype") else "int32", clipped)
+        if clipped < extent_int:
+            if warn_if_clipped:
+                _warn_explicit_oob(buffer, dim, min_value, extent, shape)
+            return tir.IntImm(extent.dtype if hasattr(extent, "dtype") else "int32", clipped)
 
     return extent
 
@@ -145,18 +167,21 @@ def _clip_region_to_shape(spec: _CopyRegionSpec, mins: list[tir.PrimExpr], exten
             "T.copy region rank does not match buffer rank before clipping: "
             f"{spec.buffer.name}, mins={len(mins)}, extents={len(extents)}, shape={len(spec.buffer.shape)}"
         )
+    resolved_mins = [resolve_let_bound_expr(min_value) for min_value in mins]
+    resolved_extents = [resolve_let_bound_expr(extent) for extent in extents]
+    resolved_shapes = [resolve_let_bound_expr(shape) for shape in spec.buffer.shape]
     validated_extents = [
         _clip_extent_to_shape(
             spec.buffer,
             dim,
             min_value,
             extent,
-            spec.buffer.shape[dim],
+            resolved_shapes[dim],
             warn_if_clipped=spec.explicit_extents,
         )
-        for dim, (min_value, extent) in enumerate(zip(mins, extents))
+        for dim, (min_value, extent) in enumerate(zip(resolved_mins, resolved_extents))
     ]
-    return _NormalizedCopyRegion(spec, list(mins), validated_extents)
+    return _NormalizedCopyRegion(spec, resolved_mins, validated_extents)
 
 
 def _normalize_copy_regions(src: _CopyRegionSpec, dst: _CopyRegionSpec) -> tuple[_NormalizedCopyRegion, _NormalizedCopyRegion]:
@@ -195,6 +220,24 @@ def _normalize_copy_regions(src: _CopyRegionSpec, dst: _CopyRegionSpec) -> tuple
 
 def _format_extents(extents: list[tir.PrimExpr]) -> str:
     return "[" + ", ".join(str(extent) for extent in extents) + "]"
+
+
+def _unproven_extent_error(
+    src: _NormalizedCopyRegion,
+    dst: _NormalizedCopyRegion,
+    src_dim: int,
+    dst_dim: int,
+    *,
+    require_exact_match: bool,
+) -> ValueError:
+    requirement = "equal" if require_exact_match else "less than or equal"
+    return ValueError(
+        "T.copy extent relation is unknown in strict mode: cannot prove that the source extent is "
+        f"{requirement} to the destination extent; "
+        f"src dim {src_dim} extent={src.extents[src_dim]}, "
+        f"dst dim {dst_dim} extent={dst.extents[dst_dim]}; "
+        f"src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
+    )
 
 
 def _suffix_axis_map(src: _NormalizedCopyRegion, dst: _NormalizedCopyRegion) -> list[tuple[int, int]]:
@@ -264,30 +307,36 @@ def _validate_and_adjust_copy_regions(
     for src_dim, dst_dim in axis_map:
         src_extent = src.extents[src_dim]
         dst_extent = dst.extents[dst_dim]
+        relation = _extent_relation(src_extent, dst_extent)
 
         if require_exact_match:
-            if not _expr_equal(src_extent, dst_extent):
-                raise ValueError(
-                    "T.copy extent mismatch: exact match is required for Buffer-to-Buffer copy; "
-                    f"src dim {src_dim} extent={src_extent}, dst dim {dst_dim} extent={dst_extent}; "
-                    f"src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
-                )
-            continue
+            if relation == "equal":
+                continue
+            if relation == "unknown":
+                raise _unproven_extent_error(src, dst, src_dim, dst_dim, require_exact_match=True)
+            raise ValueError(
+                "T.copy extent mismatch: exact match is required for Buffer-to-Buffer copy; "
+                f"src dim {src_dim} extent={src_extent}, dst dim {dst_dim} extent={dst_extent}; "
+                f"src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
+            )
 
-        if _expr_gt(src_extent, dst_extent):
+        if relation == "greater":
             raise ValueError(
                 "T.copy extent mismatch: src extent is larger than dst extent at matched axis; "
                 f"src dim {src_dim} extent={src_extent}, dst dim {dst_dim} extent={dst_extent}; "
                 f"src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
             )
-        if not _expr_equal(src_extent, dst_extent):
+        if relation == "less_equal":
             dst_extents[dst_dim] = src_extent
+        elif relation == "unknown":
+            raise _unproven_extent_error(src, dst, src_dim, dst_dim, require_exact_match=False)
 
     return src, _NormalizedCopyRegion(dst.spec, dst.mins, dst_extents)
 
 
 def _encode_normalized_region(region: _NormalizedCopyRegion, access_type: str) -> tir.PrimExpr:
-    return to_buffer_region(region.spec.original, access_type=access_type, extents=region.extents)
+    normalized_load = tir.BufferLoad(region.spec.buffer, region.mins)
+    return to_buffer_region(normalized_load, access_type=access_type, extents=region.extents)
 
 
 def _prepare_copy_regions_strict(
@@ -315,7 +364,10 @@ def _prepare_copy_regions_compact(
     dst_extent: list[tir.PrimExpr] | None,
 ) -> tuple[tir.PrimExpr, tir.PrimExpr]:
     if isinstance(src, tir.Buffer) and isinstance(dst, tir.Buffer):
-        ir.assert_structural_equal(src.shape, dst.shape)
+        ir.assert_structural_equal(
+            [resolve_let_bound_expr(extent) for extent in src.shape],
+            [resolve_let_bound_expr(extent) for extent in dst.shape],
+        )
 
     assert src_extent or dst_extent, "Can't deduce copy extents from args"
     src_extents = list(src_extent) if src_extent else [1] * len(dst_extent)
@@ -367,6 +419,7 @@ def copy(
       on the higher-rank side must have extent 1.
     - For mixed region copies, `dst` may be shrunk to the matched `src` extents
       when `src <= dst`; static `src > dst` is rejected.
+    - Strict SunMMIO validation rejects extent relations that cannot be proven.
     """
     src = _unwrap_mesh_tensor(_resolve_let_value(src))
     dst = _unwrap_mesh_tensor(_resolve_let_value(dst))
