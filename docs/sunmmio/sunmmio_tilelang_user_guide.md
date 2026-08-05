@@ -220,7 +220,7 @@ A: T.MeshTensor(
 )
 ```
 
-`MeshTensor` 需要用户明确给出逻辑全局 shape、placement 和 dtype；device mesh config 可以显式传入，也可以省略并使用目标的符号化 mesh。`layout` 参数通常也可以省略；省略时默认 row-major，后续需要的布局由编译器根据访问模式、buffer 角色和目标规则推断或派生。这里的 `global` 是 TileLang 对 DRAM 侧 tensor 的 scope 命名，对应当前 core 的 DRAM 侧 shard。
+`MeshTensor` 需要用户明确给出逻辑全局 shape、placement 和 dtype；device mesh config 可以显式传入，也可以省略并使用目标的符号化 mesh。`layout` 参数通常也可以省略：普通 dtype 的 rank-1 tensor 默认使用 1024-byte 对齐的 row-major，rank >= 2 tensor 默认在最后两维使用 32x32 分块的 ZZ；MX dtype 的 rank >= 2 tensor 默认使用 MXZZ，rank 1 不受支持。这里的 `global` 是 TileLang 对 DRAM 侧 tensor 的 scope 命名，对应当前 core 的 DRAM 侧 shard。
 
 Placement API 与 torch-sunmmio 使用相同的术语和调用形式。`T.placement` 提供五个构造函数，每个函数都返回不可变的 `PlacementSpec`：
 
@@ -246,6 +246,8 @@ across_mesh = T.placement.mesh_as_line(dim=0)
 | `T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)` | `T.placement.replicated()` |
 | `T.MeshShardingPolicy(cross_mesh_dim=d)` | `T.placement.mesh_as_line(d)` |
 
+`full_shard(a, a)` 仍然保留 row 和 col 两个 mesh 轴的物理含义：先按 row 切分，再在每个 row shard 内按 col 切分，因此与旧 `MeshShardingPolicy(y=a, x=a)` 的行为一致。它不同于 `mesh_as_line(a)`；后者才会按 row-major 线性 core id 将 mesh 视为一条线。
+
 旧的 `sharding_policy=` 关键字也继续作为 `placement=` 的别名支持；同一次调用不能同时指定两者。
 
 ### 2.5 Layout
@@ -264,7 +266,7 @@ from tilelang.layout import (
 )
 ```
 
-如果 `MeshTensor` 不显式传 `layout`，当前实现会使用 row-major 作为默认全局 layout，并基于 shard shape 派生本地 shard layout。GEMM、块级搬运和核间 gather 等场景下，用户通常不需要手动声明 layout，编译器会根据访问模式、buffer 角色和目标规则推断或派生合适的数据组织。
+如果 `MeshTensor` 不显式传 `layout`，当前实现会按 rank 和 dtype 分别为 global shape 与 shard shape 构造默认 layout：普通 dtype 的 rank 1 使用 1024-byte 对齐的 row-major，rank >= 2 使用最后两维为 32x32 分块的 ZZ；MX dtype 的 rank >= 2 使用 MXZZ，rank 1 不受支持。GEMM、块级搬运和核间 gather 等场景下，用户通常不需要手动声明 layout。
 
 显式 layout 主要用于高级场景，例如需要与外部固定数据格式对接、复现已有 layout、或调试 layout 相关问题。此时可以手动构造 layout：
 
@@ -525,7 +527,7 @@ T.MeshTensor(shape, placement, device_mesh_config=None, dtype="float32", layout=
 - `placement`：由 `T.placement` 构造的 `PlacementSpec`，描述全局 tensor 如何切分或复制到各个 core。
 - `device_mesh_config`：形如 `(nrows, ncols)`。省略时使用符号化的目标 mesh；也可以显式传入 `driver.get_sunmmio_device_mesh_config()` 的结果。
 - `dtype`：元素类型，例如 `"float16"`、`"bfloat16"`、`"float32"`。
-- `layout`：DRAM 中的全局数据布局。省略时使用默认 row-major，编译器会根据访问模式和目标规则推断或派生后续需要的布局。用户通常不需要手动传入该参数。
+- `layout`：DRAM 中的全局数据布局。省略时，普通 dtype 的 rank 1 默认使用 1024-byte 对齐的 row-major，rank >= 2 默认使用 ZZ；MX dtype 的 rank >= 2 默认使用 MXZZ，rank 1 不受支持。用户通常不需要手动传入该参数。
 
 进入 kernel 后，`MeshTensor` 参数对应当前 core 可见的本地 shard。使用 `A.global_shape` 查询逻辑完整 shape，使用 `A.local_shape` 查询统一分配的本地 slot shape，使用 `A.get_local_extent(cid)` 查询指定 core 的有效 extent。
 
@@ -541,7 +543,7 @@ layout = make_row_major(shape)
 
 - `shape`：tensor 或 buffer 的逻辑 shape。
 - 返回值：可传给 `T.MeshTensor(..., layout=layout)` 或 `T.annotate_layout` 的 layout 对象。
-- 常见用途：高级场景下需要显式表达 row-major，或调试 layout 相关问题。普通 kernel 通常依赖默认 row-major 和编译器推断。
+- 常见用途：高级场景下需要显式表达 row-major，或调试 layout 相关问题。普通 kernel 通常依赖按 rank 和 dtype 选择的默认 layout。
 
 **`make_zz_layout`**
 

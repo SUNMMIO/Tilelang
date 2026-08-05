@@ -220,7 +220,7 @@ A: T.MeshTensor(
 )
 ```
 
-`MeshTensor` requires users to provide the global logical shape, placement, and dtype. The device mesh config can be supplied explicitly or omitted to use the target's symbolic mesh. The `layout` parameter can usually be omitted as well. When omitted, the default is row-major, and later required layouts are inferred or derived by the compiler according to access patterns, buffer roles, and target rules. Here, `global` is TileLang's scope name for DRAM-side tensors, corresponding to the current core's DRAM-side shard.
+`MeshTensor` requires users to provide the global logical shape, placement, and dtype. The device mesh config can be supplied explicitly or omitted to use the target's symbolic mesh. The `layout` parameter can usually be omitted as well: a rank-1 tensor with a regular dtype defaults to a 1024-byte-aligned row-major layout, while a rank >= 2 tensor defaults to a 32x32-blocked ZZ layout on its last two dimensions. A rank >= 2 tensor with an MX dtype defaults to MXZZ; rank-1 MX tensors are unsupported. Here, `global` is TileLang's scope name for DRAM-side tensors, corresponding to the current core's DRAM-side shard.
 
 The placement API uses the same terminology and call style as torch-sunmmio. `T.placement` provides five constructors, each returning an immutable `PlacementSpec`:
 
@@ -246,6 +246,8 @@ For source compatibility, the legacy `T.MeshShardingPolicy` and `T.MeshReplicati
 | `T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)` | `T.placement.replicated()` |
 | `T.MeshShardingPolicy(cross_mesh_dim=d)` | `T.placement.mesh_as_line(d)` |
 
+`full_shard(a, a)` still preserves the physical meaning of both mesh axes: it shards by row first, then shards each row-local extent by column, matching legacy `MeshShardingPolicy(y=a, x=a)`. It differs from `mesh_as_line(a)`, which treats the mesh as a row-major line and uses the linear core id.
+
 The legacy `sharding_policy=` keyword is also supported as an alias for `placement=`; a call cannot specify both.
 
 ### 2.5 Layout
@@ -264,7 +266,7 @@ from tilelang.layout import (
 )
 ```
 
-If `MeshTensor` does not explicitly pass `layout`, the current implementation uses row-major as the default global layout, and derives the local shard layout based on the shard shape. In scenarios such as GEMM, block-level data movement, and inter-core gather, users usually do not need to declare layout manually. The compiler infers or derives a suitable data organization according to access patterns, buffer roles, and target rules.
+If `MeshTensor` does not explicitly pass `layout`, the current implementation constructs defaults for the global shape and shard shape according to rank and dtype. A rank-1 tensor with a regular dtype uses a 1024-byte-aligned row-major layout; a rank >= 2 tensor uses a 32x32-blocked ZZ layout on its last two dimensions. A rank >= 2 tensor with an MX dtype uses MXZZ, while rank-1 MX tensors are unsupported. In scenarios such as GEMM, block-level data movement, and inter-core gather, users usually do not need to declare a layout manually.
 
 Explicit layout is mainly for advanced scenarios, such as interfacing with an externally fixed data format, reproducing an existing layout, or debugging layout-related issues. In those cases, users can manually construct layouts:
 
@@ -525,7 +527,7 @@ T.MeshTensor(shape, placement, device_mesh_config=None, dtype="float32", layout=
 - `placement`: a `PlacementSpec` constructed by `T.placement`, describing how the global tensor is sharded or replicated across cores.
 - `device_mesh_config`: shaped like `(nrows, ncols)`. When omitted, the target's symbolic mesh is used; it can also be set explicitly to the result of `driver.get_sunmmio_device_mesh_config()`.
 - `dtype`: element type, such as `"float16"`, `"bfloat16"`, or `"float32"`.
-- `layout`: global data layout in DRAM. When omitted, the default row-major layout is used, and the compiler infers or derives later required layouts according to access patterns and target rules. Users usually do not need to pass this parameter manually.
+- `layout`: global data layout in DRAM. When omitted, a rank-1 tensor with a regular dtype defaults to a 1024-byte-aligned row-major layout, while a rank >= 2 tensor defaults to ZZ. A rank >= 2 tensor with an MX dtype defaults to MXZZ; rank-1 MX tensors are unsupported. Users usually do not need to pass this parameter manually.
 
 After entering the kernel, a `MeshTensor` parameter corresponds to the local shard visible to the current core. Use `A.global_shape` for the complete logical shape, `A.local_shape` for the uniformly allocated local slot shape, and `A.get_local_extent(cid)` for a core's valid extent.
 
@@ -541,7 +543,7 @@ layout = make_row_major(shape)
 
 - `shape`: logical shape of the tensor or buffer.
 - Return value: a layout object that can be passed to `T.MeshTensor(..., layout=layout)` or `T.annotate_layout`.
-- Common usage: explicitly express row-major layout in advanced scenarios, or debug layout-related issues. Ordinary kernels usually rely on the default row-major layout and compiler inference.
+- Common usage: explicitly express row-major layout in advanced scenarios, or debug layout-related issues. Ordinary kernels usually rely on the default layout selected for their rank and dtype.
 
 **`make_zz_layout`**
 

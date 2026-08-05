@@ -22,6 +22,7 @@ class _PlacementKind(IntEnum):
     ROW_SHARD = 1
     COL_SHARD = 2
     FULL_SHARD = 3
+    MESH_AS_LINE = 4
 
 
 def _validate_dim(dim: int, name: str) -> None:
@@ -55,6 +56,10 @@ class PlacementSpec:
         elif self._kind == _PlacementKind.FULL_SHARD:
             _validate_dim(self.row_dim, "row_dim")
             _validate_dim(self.col_dim, "col_dim")
+        elif self._kind == _PlacementKind.MESH_AS_LINE:
+            _validate_dim(self.row_dim, "dim")
+            if self.col_dim != self.row_dim:
+                raise ValueError("MeshAsLine placement must use the same row and column shard dimension")
 
     @property
     def kind(self) -> int:
@@ -79,7 +84,7 @@ class PlacementSpec:
 
     @staticmethod
     def mesh_as_line(dim: int) -> PlacementSpec:
-        return PlacementSpec.full_shard(dim, dim)
+        return PlacementSpec(_PlacementKind.MESH_AS_LINE, row_dim=dim, col_dim=dim)
 
     def __repr__(self) -> str:
         if self._kind == _PlacementKind.REPLICATED:
@@ -90,6 +95,8 @@ class PlacementSpec:
             return f"ColShard({self.col_dim})"
         if self._kind == _PlacementKind.FULL_SHARD:
             return f"FullShard({self.row_dim}, {self.col_dim})"
+        if self._kind == _PlacementKind.MESH_AS_LINE:
+            return f"MeshAsLine({self.row_dim})"
         raise AssertionError(f"Unknown placement kind: {self._kind!r}")
 
 

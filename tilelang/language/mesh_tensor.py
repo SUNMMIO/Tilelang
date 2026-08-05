@@ -18,6 +18,7 @@ from tilelang.language.placement import (
     MeshReplicationType,
     MeshShardingPolicy,
     PlacementSpec,
+    _PlacementKind,
     _placement_metadata,
     _validate_placement,
 )
@@ -178,8 +179,9 @@ def lookup_mesh_tensor_meta(mesh_tensor):
 def get_local_extent(mesh_tensor, cid):
     """Return the valid local extent for ``mesh_tensor`` on linear core id ``cid``.
 
-    When both mesh axes shard the same tensor dimension, cores are ordered by
-    the row-major linear index ``row * ncols + col``.
+    Full sharding preserves the physical mesh-axis order: row sharding is
+    applied first, then column sharding is applied to the row-local extent.
+    ``mesh_as_line`` instead uses the row-major linear core id.
     """
     meta = lookup_mesh_tensor_meta(mesh_tensor)
     global_shape = meta["global_shape"]
@@ -207,15 +209,18 @@ def get_local_extent(mesh_tensor, cid):
 
     row_kind, row_dim, col_kind, col_dim = (_to_python_int(value) for value in placement_desc)
     local_extent = list(global_shape)
+    placement_kind = _to_python_int(meta.get("placement_kind", -1))
+    if placement_kind == _PlacementKind.MESH_AS_LINE:
+        local_extent[row_dim] = distribute_valid_count(global_shape[row_dim], cid, nrows * ncols)
+        return tuple(local_extent)
+
     for dim, extent in enumerate(global_shape):
         row_shards = row_kind == 1 and row_dim == dim
         col_shards = col_kind == 1 and col_dim == dim
-        if row_shards and col_shards:
-            local_extent[dim] = distribute_valid_count(extent, row * ncols + col, nrows * ncols)
-        elif row_shards:
+        if row_shards:
             local_extent[dim] = distribute_valid_count(extent, row, nrows)
-        elif col_shards:
-            local_extent[dim] = distribute_valid_count(extent, col, ncols)
+        if col_shards:
+            local_extent[dim] = distribute_valid_count(local_extent[dim], col, ncols)
 
     return tuple(local_extent)
 
@@ -325,6 +330,7 @@ class MeshTensorProxy:
             local_strides=sharded_strides,
             mesh_shape=(nrows, ncols),
             placement=_placement_metadata(placement),
+            placement_kind=placement.kind,
         )
 
         # Build global and per-shard layouts (CuteLayout objects).
