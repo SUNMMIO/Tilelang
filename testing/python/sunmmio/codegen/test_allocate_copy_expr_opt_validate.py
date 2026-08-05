@@ -34,7 +34,7 @@ def basic_allocate_copy_mma_kernel(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
-    shard_policy = T.MeshShardingPolicy(x=1, y=0)
+    shard_policy = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K))
     B_layout = make_zz_layout((K, N))
     C_layout = make_zz_layout((M, N))
@@ -90,7 +90,7 @@ def allocate_dma_copy_kernel_plus(
     block_K=32,
     dtype=T.bfloat16,
 ):
-    shard_policy = T.MeshShardingPolicy(x=1, y=0)
+    shard_policy = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K))
     C_layout = make_zz_layout((M, N))
 
@@ -135,7 +135,7 @@ def pipelined_allocate_copy_mma_kernel(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
-    shard_policy = T.MeshShardingPolicy(x=1, y=0)
+    shard_policy = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K))
     B_layout = make_zz_layout((K, N))
     C_layout = make_zz_layout((M, N))
@@ -191,7 +191,7 @@ def offset_region_copy_kernel_plus(
     tile_N=32,
     dtype=T.bfloat16,
 ):
-    shard_policy = T.MeshShardingPolicy(x=1, y=0)
+    shard_policy = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, N))
     B_layout = make_zz_layout((M, N))
 

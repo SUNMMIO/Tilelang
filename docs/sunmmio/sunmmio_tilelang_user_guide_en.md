@@ -102,7 +102,7 @@ Inter-core communication involves not only data transfer itself, but also the so
 
 ### 2.1 Kernel Execution Model Overview
 
-SunMMIO kernels use an SPMD (Single Program, Multiple Data) programming form: all cores execute the same kernel program, and input/output data is assigned to different cores by the `MeshTensor` sharding policy. Inside the kernel, `cid`, `row`, and `col` are used to identify the shard corresponding to the current core, and to determine on-chip buffer usage and inter-core communication roles. Users usually do not need to write separate programs for different cores. Instead, the same program uses core coordinates to describe data partitioning and cooperation.
+SunMMIO kernels use an SPMD (Single Program, Multiple Data) programming form: all cores execute the same kernel program, and input/output data is assigned to different cores by the `MeshTensor` placement. Inside the kernel, `cid`, `row`, and `col` are used to identify the shard corresponding to the current core, and to determine on-chip buffer usage and inter-core communication roles. Users usually do not need to write separate programs for different cores. Instead, the same program uses core coordinates to describe data partitioning and cooperation.
 
 SunMMIO kernels are also persistent kernels: after one kernel launch, all cores stay resident and execute the same program, using loops inside the kernel to process the tiles or work items assigned to them. The launched cores continuously complete the work covered by the current kernel until the program reaches the kernel end. The whole kernel exits together only after all cores in that launch finish execution.
 
@@ -125,14 +125,14 @@ BM, BN, BK = 32, 32, 128
 dtype = "float16"
 accum_dtype = "float32"
 
-shard_policy = T.MeshShardingPolicy(y=0, x=1)
+placement = T.placement.full_shard(0, 1)
 A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
 B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
 C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 
-A_ty = T.MeshTensor((M, K), shard_policy, device_mesh, dtype, layout=A_layout)
-B_ty = T.MeshTensor((K, N), shard_policy, device_mesh, dtype, layout=B_layout)
-C_ty = T.MeshTensor((M, N), shard_policy, device_mesh, accum_dtype, layout=C_layout)
+A_ty = T.MeshTensor((M, K), placement, device_mesh, dtype, layout=A_layout)
+B_ty = T.MeshTensor((K, N), placement, device_mesh, dtype, layout=B_layout)
+C_ty = T.MeshTensor((M, N), placement, device_mesh, accum_dtype, layout=C_layout)
 
 @tilelang.jit(target="Sunmmio")
 def gemm_kernel():
@@ -161,7 +161,7 @@ def gemm_kernel():
 The SunMMIO programming model can be summarized as:
 
 1. Use `target="Sunmmio"` to select the target.
-2. Use `MeshTensor`, `MeshShardingPolicy`, and layout to describe how logical tensors are distributed onto the 2D mesh and how they are organized in DRAM.
+2. Use `MeshTensor`, placement, and layout to describe how logical tensors are distributed onto the 2D mesh and how they are organized in DRAM.
 3. Use `T.Kernel(ncores)` to launch by core count in SPMD form, and map `cid -> (row, col)` to determine the current core coordinates.
 4. Each core loads data from the DRAM shard assigned to itself by sharding into on-chip SRAM.
 5. When data is needed across cores, use the HLink / VLink inter-core communication APIs to organize broadcast, put, all-gather, or all-reduce.
@@ -207,43 +207,48 @@ Users usually use `cid`, `row`, and `col` to decide which data block the current
 
 From the execution semantics point of view, `T.Kernel(nrows * ncols)` launches a group of persistent core instances that participate in the same kernel. Each core keeps executing within one kernel launch, usually processing multiple tiles or work items assigned to that core through loops. Even if some cores have no actual computation task at a certain stage, they should still follow the same program to the kernel end. The whole kernel is considered complete only after all participating cores finish execution.
 
-### 2.4 MeshTensor and Sharding Policy
+### 2.4 MeshTensor and Placement
 
 `T.MeshTensor` is the main abstraction for multi-core SunMMIO inputs and outputs. It is written at function parameter positions and describes how a complete logical tensor is distributed onto the 2D mesh. After entering the kernel, each core sees the local shard assigned to that core after sharding.
 
 ```python
 A: T.MeshTensor(
     (M, K),
-    T.MeshShardingPolicy(y=0, x=1),
+    T.placement.full_shard(0, 1),
     device_mesh_config,
     dtype,
 )
 ```
 
-`MeshTensor` requires users to provide the global logical shape, sharding policy, device mesh config, and dtype. The `layout` parameter can usually be omitted. When omitted, the default is row-major, and later required layouts are inferred or derived by the compiler according to access patterns, buffer roles, and target rules. Here, `global` is TileLang's scope name for DRAM-side tensors, corresponding to the current core's DRAM-side shard.
+`MeshTensor` requires users to provide the global logical shape, placement, and dtype. The device mesh config can be supplied explicitly or omitted to use the target's symbolic mesh. The `layout` parameter can usually be omitted as well: a rank-1 tensor with a regular dtype defaults to a 1024-byte-aligned row-major layout, while a rank >= 2 tensor defaults to a 32x32-blocked ZZ layout on its last two dimensions. A rank >= 2 tensor with an MX dtype defaults to MXZZ; rank-1 MX tensors are unsupported. Here, `global` is TileLang's scope name for DRAM-side tensors, corresponding to the current core's DRAM-side shard.
 
-`T.MeshShardingPolicy` determines how tensor dimensions map to the row / column directions of the mesh. A common form is:
-
-```python
-policy = T.MeshShardingPolicy(y=0, x=1)
-```
-
-This means that the mesh y / row direction splits tensor dimension 0, and the mesh x / column direction splits tensor dimension 1. For matrix kernels, sharding usually needs to match the algorithm dataflow: for example, distributing output rows along the M dimension and output columns along the N dimension, or using `all_gather` along the K dimension to collect the blocks needed for computation.
-
-Replication semantics are used to express that some data keeps identical copies on multiple cores:
-
-- `MeshReplicationType.NONE`: no replication; each core owns a different shard.
-- `MeshReplicationType.ROW`: replicated within each row.
-- `MeshReplicationType.COLUMN`: replicated within each column.
-- `MeshReplicationType.ALL`: replicated on all cores.
-
-You can also use:
+The placement API uses the same terminology and call style as torch-sunmmio. `T.placement` provides five constructors, each returning an immutable `PlacementSpec`:
 
 ```python
-T.MeshShardingPolicy(cross_mesh_dim=0)
+full = T.placement.full_shard(row_dim=0, col_dim=1)
+by_row = T.placement.row_shard(dim=0)
+by_col = T.placement.col_shard(dim=1)
+replicated = T.placement.replicated()
+across_mesh = T.placement.mesh_as_line(dim=0)
 ```
 
-This means one dimension is uniformly split along the entire mesh, namely across `nrows * ncols`. `cross_mesh_dim` is mutually exclusive with `x/y` split. Non-divisible shapes form tail shards, so users should avoid assuming that the valid data length is exactly the same on every core.
+`full_shard(0, 1)` means that the mesh row axis splits tensor dimension 0 by `nrows`, while the mesh column axis splits dimension 1 by `ncols`. Row and column have physical meaning, so `full_shard(0, 1)` and `full_shard(1, 0)` are not equivalent. For matrix kernels, placement usually needs to match the algorithm dataflow: for example, distributing output rows along M and output columns along N, or using `all_gather` along K to collect the blocks needed for computation.
+
+`mesh_as_line(0)` treats the 2D mesh as a row-major line and splits tensor dimension 0 by `nrows * ncols`; a core's shard index is `row * ncols + col`. For a non-divisible shape, the local slot is rounded up and later cores can have shorter valid extents; kernels must not assume that every core has the same amount of valid data.
+
+For source compatibility, the legacy `T.MeshShardingPolicy` and `T.MeshReplicationType` APIs remain available, but new code should prefer `T.placement`:
+
+| Legacy API | Equivalent new API |
+|---|---|
+| `T.MeshShardingPolicy(y=a, x=b)` | `T.placement.full_shard(a, b)` |
+| `T.MeshShardingPolicy(y=a, replicate=T.MeshReplicationType.ROW)` | `T.placement.row_shard(a)` |
+| `T.MeshShardingPolicy(x=b, replicate=T.MeshReplicationType.COLUMN)` | `T.placement.col_shard(b)` |
+| `T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)` | `T.placement.replicated()` |
+| `T.MeshShardingPolicy(cross_mesh_dim=d)` | `T.placement.mesh_as_line(d)` |
+
+`full_shard(a, a)` still preserves the physical meaning of both mesh axes: it shards by row first, then shards each row-local extent by column, matching legacy `MeshShardingPolicy(y=a, x=a)`. It differs from `mesh_as_line(a)`, which treats the mesh as a row-major line and uses the linear core id.
+
+The legacy `sharding_policy=` keyword is also supported as an alias for `placement=`; a call cannot specify both.
 
 ### 2.5 Layout
 
@@ -261,7 +266,7 @@ from tilelang.layout import (
 )
 ```
 
-If `MeshTensor` does not explicitly pass `layout`, the current implementation uses row-major as the default global layout, and derives the local shard layout based on the shard shape. In scenarios such as GEMM, block-level data movement, and inter-core gather, users usually do not need to declare layout manually. The compiler infers or derives a suitable data organization according to access patterns, buffer roles, and target rules.
+If `MeshTensor` does not explicitly pass `layout`, the current implementation constructs defaults for the global shape and shard shape according to rank and dtype. A rank-1 tensor with a regular dtype uses a 1024-byte-aligned row-major layout; a rank >= 2 tensor uses a 32x32-blocked ZZ layout on its last two dimensions. A rank >= 2 tensor with an MX dtype uses MXZZ, while rank-1 MX tensors are unsupported. In scenarios such as GEMM, block-level data movement, and inter-core gather, users usually do not need to declare a layout manually.
 
 Explicit layout is mainly for advanced scenarios, such as interfacing with an externally fixed data format, reproducing an existing layout, or debugging layout-related issues. In those cases, users can manually construct layouts:
 
@@ -488,48 +493,43 @@ props = driver.get_sunmmio_device_properties()
 - Return value: a device property object or dictionary. Exact fields depend on the device description provided by the runtime environment.
 - Common usage: choose block size, pipeline stage count, inter-core communication strategy, or other kernel generation parameters according to device properties.
 
-### 3.2 MeshTensor, Sharding, and Layout
+### 3.2 MeshTensor, Placement, and Layout
 
-**`T.MeshShardingPolicy`**
+**`T.placement` / `PlacementSpec`**
 
 ```python
-T.MeshShardingPolicy(
-    x=None,
-    y=None,
-    replicate=T.MeshReplicationType.NONE,
-    cross_mesh_dim=None,
-)
+full = T.placement.full_shard(row_dim, col_dim)
+by_row = T.placement.row_shard(dim)
+by_col = T.placement.col_shard(dim)
+replicated = T.placement.replicated()
+across_mesh = T.placement.mesh_as_line(dim)
 ```
 
-`MeshShardingPolicy` describes how a logical tensor maps onto the 2D mesh.
+A `PlacementSpec` returned by these constructors can be passed directly to `T.MeshTensor`. `T.MeshTensor` does not accept a raw placement list.
 
-- `x`: specifies which tensor dimension is split along the mesh column direction. If `x=1`, tensor dimension 1 is split by `ncols`.
-- `y`: specifies which tensor dimension is split along the mesh row direction. If `y=0`, tensor dimension 0 is split by `nrows`.
-- `replicate`: replication strategy. The default is `T.MeshReplicationType.NONE`.
-- `cross_mesh_dim`: specifies one tensor dimension to be split across the entire mesh, namely by `nrows * ncols`. Do not specify `x` or `y` at the same time when using `cross_mesh_dim`.
+- `full_shard(row_dim, col_dim)`: shard the specified tensor dimensions on the row and column mesh axes.
+- `row_shard(dim)`: shard on rows and replicate on columns.
+- `col_shard(dim)`: replicate on rows and shard on columns.
+- `replicated()`: replicate on both mesh axes.
+- `mesh_as_line(dim)`: linearize the 2D mesh in row-major order and shard the specified dimension across the whole mesh.
 
-Common replication strategies:
-
-- `T.MeshReplicationType.NONE`: no replication; each core holds a different shard.
-- `T.MeshReplicationType.ROW`: replicated within the same row; cannot be used together with splitting along `x`.
-- `T.MeshReplicationType.COLUMN`: replicated within the same column; cannot be used together with splitting along `y`.
-- `T.MeshReplicationType.ALL`: all cores hold the complete data.
+`row_dim`, `col_dim`, and `dim` are zero-based tensor dimension indices. `T.MeshTensor` validates them against the tensor rank.
 
 **`T.MeshTensor`**
 
 ```python
-T.MeshTensor(shape, sharding_policy, device_mesh_config, dtype="float32", layout=None)
+T.MeshTensor(shape, placement, device_mesh_config=None, dtype="float32", layout=None)
 ```
 
 `MeshTensor` is used at kernel function parameter positions to declare an input or output tensor distributed on the SunMMIO mesh.
 
 - `shape`: complete logical shape, such as `(M, K)`. This is the global tensor shape from the user perspective.
-- `sharding_policy`: a `T.MeshShardingPolicy` object describing how the global tensor is split across cores.
-- `device_mesh_config`: usually from `driver.get_sunmmio_device_mesh_config()`, shaped like `(nrows, ncols)`.
+- `placement`: a `PlacementSpec` constructed by `T.placement`, describing how the global tensor is sharded or replicated across cores.
+- `device_mesh_config`: shaped like `(nrows, ncols)`. When omitted, the target's symbolic mesh is used; it can also be set explicitly to the result of `driver.get_sunmmio_device_mesh_config()`.
 - `dtype`: element type, such as `"float16"`, `"bfloat16"`, or `"float32"`.
-- `layout`: global data layout in DRAM. When omitted, the default row-major layout is used, and the compiler infers or derives later required layouts according to access patterns and target rules. Users usually do not need to pass this parameter manually.
+- `layout`: global data layout in DRAM. When omitted, a rank-1 tensor with a regular dtype defaults to a 1024-byte-aligned row-major layout, while a rank >= 2 tensor defaults to ZZ. A rank >= 2 tensor with an MX dtype defaults to MXZZ; rank-1 MX tensors are unsupported. Users usually do not need to pass this parameter manually.
 
-After entering the kernel, a `MeshTensor` parameter corresponds to the local shard visible to the current core. Accesses such as `A.shape` and `B.shape` return the local shard shape.
+After entering the kernel, a `MeshTensor` parameter corresponds to the local shard visible to the current core. Use `A.global_shape` for the complete logical shape, `A.local_shape` for the uniformly allocated local slot shape, and `A.get_local_extent(cid)` for a core's valid extent.
 
 **`make_row_major`**
 
@@ -543,7 +543,7 @@ layout = make_row_major(shape)
 
 - `shape`: logical shape of the tensor or buffer.
 - Return value: a layout object that can be passed to `T.MeshTensor(..., layout=layout)` or `T.annotate_layout`.
-- Common usage: explicitly express row-major layout in advanced scenarios, or debug layout-related issues. Ordinary kernels usually rely on the default row-major layout and compiler inference.
+- Common usage: explicitly express row-major layout in advanced scenarios, or debug layout-related issues. Ordinary kernels usually rely on the default layout selected for their rank and dtype.
 
 **`make_zz_layout`**
 
@@ -1041,20 +1041,20 @@ def local_shard_gemm(
     nrows, ncols = device_mesh
     ncores = nrows * ncols
 
-    policy = T.MeshShardingPolicy(y=0, x=1)
+    placement = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), policy, device_mesh, dtype, layout=A_layout),  # type: ignore
-        B: T.MeshTensor((K, N), policy, device_mesh, dtype, layout=B_layout),  # type: ignore
-        C: T.MeshTensor((M, N), policy, device_mesh, accum_dtype, layout=C_layout),  # type: ignore
+        A: T.MeshTensor((M, K), placement, device_mesh, dtype, layout=A_layout),  # type: ignore
+        B: T.MeshTensor((K, N), placement, device_mesh, dtype, layout=B_layout),  # type: ignore
+        C: T.MeshTensor((M, N), placement, device_mesh, accum_dtype, layout=C_layout),  # type: ignore
     ):
         with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
 
             A_tile = T.alloc_shared((block_M, block_K), dtype)
             B_tile = T.alloc_shared((block_K, block_N), dtype)
@@ -1111,20 +1111,20 @@ def summa_gemm(
     nrows, ncols = device_mesh
     ncores = nrows * ncols
 
-    policy = T.MeshShardingPolicy(y=0, x=1)
+    placement = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), policy, device_mesh, dtype, layout=A_layout),  # type: ignore
-        B: T.MeshTensor((K, N), policy, device_mesh, dtype, layout=B_layout),  # type: ignore
-        C: T.MeshTensor((M, N), policy, device_mesh, accum_dtype, layout=C_layout),  # type: ignore
+        A: T.MeshTensor((M, K), placement, device_mesh, dtype, layout=A_layout),  # type: ignore
+        B: T.MeshTensor((K, N), placement, device_mesh, dtype, layout=B_layout),  # type: ignore
+        C: T.MeshTensor((M, N), placement, device_mesh, accum_dtype, layout=C_layout),  # type: ignore
     ):
         with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
 
             A_panel = T.alloc_shared((block_M, block_K * ncols), dtype)
             B_panel = T.alloc_shared((block_K * nrows, block_N), dtype)
@@ -1185,21 +1185,21 @@ def gemm_with_bias(
     nrows, ncols = device_mesh
     ncores = nrows * ncols
 
-    policy = T.MeshShardingPolicy(y=0, x=1)
+    placement = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), policy, device_mesh, dtype, layout=A_layout),  # type: ignore
-        B: T.MeshTensor((K, N), policy, device_mesh, dtype, layout=B_layout),  # type: ignore
-        Bias: T.MeshTensor((M, N), policy, device_mesh, accum_dtype, layout=C_layout),  # type: ignore
-        C: T.MeshTensor((M, N), policy, device_mesh, accum_dtype, layout=C_layout),  # type: ignore
+        A: T.MeshTensor((M, K), placement, device_mesh, dtype, layout=A_layout),  # type: ignore
+        B: T.MeshTensor((K, N), placement, device_mesh, dtype, layout=B_layout),  # type: ignore
+        Bias: T.MeshTensor((M, N), placement, device_mesh, accum_dtype, layout=C_layout),  # type: ignore
+        C: T.MeshTensor((M, N), placement, device_mesh, accum_dtype, layout=C_layout),  # type: ignore
     ):
         with T.Kernel(ncores) as _cid:
-            sharded_M, sharded_K = A.shape
-            _, sharded_N = B.shape
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
 
             A_tile = T.alloc_shared((block_M, block_K), dtype)
             B_tile = T.alloc_shared((block_K, block_N), dtype)

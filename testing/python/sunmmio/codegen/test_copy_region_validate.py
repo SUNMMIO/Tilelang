@@ -5,7 +5,6 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.language.mesh_tensor import MeshReplicationType
 from tilelang.layout import make_row_major, make_zz_layout
 
 from testing.python.sunmmio.common.codegen_validation import (
@@ -31,7 +30,7 @@ _SUMMA_COPY_SHAPES = (
 @target("Sunmmio")
 def zz_major_sub_block_copy_kernel():
     shape = (128, 128)
-    placement = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     global_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
 
     @T.prim_func
@@ -49,7 +48,7 @@ def zz_major_sub_block_copy_kernel():
 @target("Sunmmio")
 def zz_non_major_sub_block_copy_kernel():
     shape = (128, 128)
-    placement = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     global_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
 
     @T.prim_func
@@ -67,7 +66,7 @@ def zz_non_major_sub_block_copy_kernel():
 @target("Sunmmio")
 def zz_both_dims_sub_block_copy_kernel():
     shape = (128, 128)
-    placement = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     global_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
 
     @T.prim_func
@@ -85,7 +84,7 @@ def zz_both_dims_sub_block_copy_kernel():
 @target("Sunmmio")
 def zz_major_sub_block_multi_block_copy_kernel():
     shape = (128, 128)
-    placement = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     global_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
 
     @T.prim_func
@@ -104,7 +103,7 @@ def zz_major_sub_block_multi_block_copy_kernel():
 def zz_fully_coalesced_full_block_copy_kernel():
     shape = (64, 32)
     region_shape = (32, 32)
-    placement = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     global_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
     shared_layout = make_row_major(region_shape)
 
@@ -124,7 +123,7 @@ def zz_fully_coalesced_full_block_copy_kernel():
 @target("Sunmmio")
 def zz_fully_coalesced_non_major_sub_block_copy_kernel():
     shape = (64, 32)
-    placement = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     global_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
 
     @T.prim_func
@@ -172,7 +171,7 @@ def summa_output_copy_kernel(
     dtype="float16",
     accum_dtype="float32",
 ):
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     A_shape = (M, K)
     B_shape = (K, N)
     C_shape = (M, N)

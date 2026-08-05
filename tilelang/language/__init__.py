@@ -15,9 +15,9 @@ from .eager import *  # noqa: F401
 from .tir.ir import *  # noqa: F401
 from tilelang.layout import Layout, Fragment  # noqa: F401
 from .proxy import ptr, make_tensor, Buffer, Tensor, StridedTensor, FragmentBuffer, SharedBuffer, LocalBuffer  # noqa: F401
+from . import placement  # noqa: F401
+from .placement import MeshReplicationType, MeshShardingPolicy, PlacementSpec  # noqa: F401
 from .mesh_tensor import (  # noqa: F401
-    MeshShardingPolicy,
-    MeshReplicationType,
     MeshTensor,
     TensorWithMeta,
 )

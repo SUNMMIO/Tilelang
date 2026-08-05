@@ -26,7 +26,7 @@ def softmax_dynamic(block_M=256, block_N=128, in_dtype=T.float32, out_dtype=T.fl
     mesh_cols = 4
 
     zz_layout = make_zz_layout((M, N), [0, 1], (32, 32))
-    placement = T.MeshShardingPolicy(y=0, x=1)
+    placement = T.placement.full_shard(0, 1)
 
     accum_dtype = T.float32
     scale = 1.44269504

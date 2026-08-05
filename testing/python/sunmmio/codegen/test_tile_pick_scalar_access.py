@@ -94,7 +94,7 @@ def pick_1d_side_data_kernel(
     out_n=32,
     dtype=T.int32,
 ):
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     values_shape = (n,)
     out_shape = (out_n,)
     values_layout = make_aligned_row_major(values_shape, dtype, align_bytes=1024)
@@ -135,7 +135,7 @@ def pick_2d_side_data_kernel(
     out_n=32,
     dtype=T.int32,
 ):
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     table_shape = (rows, cols)
     out_shape = (out_n,)
     table_layout = make_aligned_row_major(table_shape, dtype, align_bytes=1024)
@@ -176,7 +176,7 @@ def pick_3d_side_data_kernel(
     out_n=32,
     dtype=T.int32,
 ):
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     mask_shape = (heads, q_blocks, k_blocks)
     out_shape = (out_tiles, out_n)
     mask_layout = make_aligned_row_major(mask_shape, dtype, align_bytes=1024)

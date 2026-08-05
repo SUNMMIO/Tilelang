@@ -41,7 +41,7 @@ def dot_mul_tiled_parallel_3d(
     dtype="bfloat16",
     accum_dtype="bfloat16",
 ):
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     tensor_shape = (batch, m, n)
     tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
     grid_b = T.ceildiv(batch, block_b)
@@ -107,7 +107,7 @@ def dot_mul_tiled_parallel_2d(
     dtype="bfloat16",
     accum_dtype="bfloat16",
 ):
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     tensor_shape = (m, n)
     tensor_layout = make_zz_layout(tensor_shape, [0, 1], (32, 32))
     grid_m = T.ceildiv(m, block_m)
@@ -168,7 +168,7 @@ def tiles_broadcast(
     dtype="bfloat16",
     accum_dtype="bfloat16",
 ):
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     tensor_shape = (batch, m, n)
     tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
     vector_shape = (m,)
@@ -246,7 +246,7 @@ def tiles_broadcast_copy(
     dtype="bfloat16",
     accum_dtype="bfloat16",
 ):
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     tensor_shape = (batch, m, n)
     tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
     vector_shape = (m,)
@@ -318,7 +318,7 @@ def tiles_broadcast_copy(
 
 @target("Sunmmio")
 def tiles_1d(m=512, block_m=256, dtype="bfloat16", accum_dtype="bfloat16"):
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     tensor_shape = (m,)
     tensor_layout = make_row_major(tensor_shape)
     grid_m = T.ceildiv(m, block_m)
@@ -351,7 +351,7 @@ def tiles_dynamic_extent_zz_store():
     tile_block = 32
     output_shape = (compute_block, tile_block)
     side_shape = (256,)
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     output_layout = make_zz_layout(output_shape, [0, 1], (tile_block, tile_block))
     side_layout = make_aligned_row_major(side_shape, T.int32, align_bytes=1024)
 
