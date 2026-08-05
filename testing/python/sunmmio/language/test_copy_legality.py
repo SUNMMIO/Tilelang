@@ -271,6 +271,18 @@ def _make_symbolic_unknown_region_copy_kernel():
 
 
 @target("Sunmmio")
+def _make_symbolic_unknown_buffer_copy_kernel():
+    n = T.dynamic("n")
+
+    @T.prim_func
+    def kernel(src: T.Tensor((n,), DTYPE), dst: T.Tensor((4,), DTYPE)):
+        with T.Kernel():
+            T.copy(src, dst)
+
+    return kernel
+
+
+@target("Sunmmio")
 def _make_memory_backed_let_extent_copy_kernel():
     @T.prim_func
     def kernel(
@@ -443,12 +455,14 @@ def test_sunmmio_copy_strict_rejects_let_bound_oversized_extent(_strict_region_v
         _make_let_bound_oversized_region_copy_kernel()
 
 
-def test_sunmmio_copy_strict_warns_and_preserves_symbolic_unknown_regions(_strict_region_validation):
-    with pytest.warns(UserWarning, match="cannot prove.*less than or equal"):
-        script = tvm.IRModule({"main": _make_symbolic_unknown_region_copy_kernel()}).script()
+def test_sunmmio_copy_strict_rejects_symbolic_unknown_regions(_strict_region_validation):
+    with pytest.raises(ValueError, match="cannot prove.*less than or equal"):
+        _make_symbolic_unknown_region_copy_kernel()
 
-    assert "T.region(src[0], 1, n)" in script
-    assert "T.region(dst[0], 2, 4)" in script
+
+def test_sunmmio_copy_strict_rejects_symbolic_unknown_buffers(_strict_region_validation):
+    with pytest.raises(ValueError, match="cannot prove.*equal"):
+        _make_symbolic_unknown_buffer_copy_kernel()
 
 
 def test_sunmmio_copy_strict_preserves_memory_backed_let_snapshot(_strict_region_validation):

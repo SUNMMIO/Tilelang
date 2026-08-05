@@ -25,7 +25,6 @@ _ExtentRelation = Literal["equal", "less_equal", "greater", "unknown"]
 
 @dataclass(frozen=True)
 class _CopyRegionSpec:
-    original: Any
     kind: _OperandKind
     buffer: tir.Buffer
     mins: list[tir.PrimExpr]
@@ -52,13 +51,13 @@ def _extract_copy_region_spec(obj: BufferLikeType) -> _CopyRegionSpec:
     obj = _resolve_let_value(obj)
     if isinstance(obj, tir.Buffer):
         mins = [tir.IntImm("int32", 0) for _ in obj.shape]
-        return _CopyRegionSpec(obj, "buffer", obj, mins, list(obj.shape), False)
+        return _CopyRegionSpec("buffer", obj, mins, list(obj.shape), False)
     if isinstance(obj, tir.BufferRegion):
         mins = [r.min for r in obj.region]
         extents = [r.extent for r in obj.region]
-        return _CopyRegionSpec(obj, "region", obj.buffer, mins, extents, True)
+        return _CopyRegionSpec("region", obj.buffer, mins, extents, True)
     if isinstance(obj, tir.BufferLoad):
-        return _CopyRegionSpec(obj, "load", obj.buffer, list(obj.indices), None, False)
+        return _CopyRegionSpec("load", obj.buffer, list(obj.indices), None, False)
     raise TypeError(f"Unsupported argument type for T.copy: {type(obj)}")
 
 
@@ -223,22 +222,21 @@ def _format_extents(extents: list[tir.PrimExpr]) -> str:
     return "[" + ", ".join(str(extent) for extent in extents) + "]"
 
 
-def _warn_unproven_extent_relation(
+def _unproven_extent_error(
     src: _NormalizedCopyRegion,
     dst: _NormalizedCopyRegion,
     src_dim: int,
     dst_dim: int,
     *,
     require_exact_match: bool,
-) -> None:
+) -> ValueError:
     requirement = "equal" if require_exact_match else "less than or equal"
-    warnings.warn(
-        "T.copy strict validation cannot prove that the source extent is "
-        f"{requirement} to the destination extent; preserving the original region "
-        "bounds for the unproven relation and deferring symbolic extent handling: "
+    return ValueError(
+        "T.copy extent relation is unknown in strict mode: cannot prove that the source extent is "
+        f"{requirement} to the destination extent; "
         f"src dim {src_dim} extent={src.extents[src_dim]}, "
-        f"dst dim {dst_dim} extent={dst.extents[dst_dim]}",
-        stacklevel=4,
+        f"dst dim {dst_dim} extent={dst.extents[dst_dim]}; "
+        f"src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
     )
 
 
@@ -302,10 +300,9 @@ def _validate_and_adjust_copy_regions(
     dst: _NormalizedCopyRegion,
     *,
     require_exact_match: bool,
-) -> tuple[_NormalizedCopyRegion, _NormalizedCopyRegion, bool]:
+) -> tuple[_NormalizedCopyRegion, _NormalizedCopyRegion]:
     axis_map = _suffix_axis_map(src, dst) if require_exact_match else _squeezed_axis_map(src, dst)
     dst_extents = list(dst.extents)
-    preserve_original = False
 
     for src_dim, dst_dim in axis_map:
         src_extent = src.extents[src_dim]
@@ -316,15 +313,7 @@ def _validate_and_adjust_copy_regions(
             if relation == "equal":
                 continue
             if relation == "unknown":
-                _warn_unproven_extent_relation(
-                    src,
-                    dst,
-                    src_dim,
-                    dst_dim,
-                    require_exact_match=True,
-                )
-                preserve_original = True
-                continue
+                raise _unproven_extent_error(src, dst, src_dim, dst_dim, require_exact_match=True)
             raise ValueError(
                 "T.copy extent mismatch: exact match is required for Buffer-to-Buffer copy; "
                 f"src dim {src_dim} extent={src_extent}, dst dim {dst_dim} extent={dst_extent}; "
@@ -340,25 +329,14 @@ def _validate_and_adjust_copy_regions(
         if relation == "less_equal":
             dst_extents[dst_dim] = src_extent
         elif relation == "unknown":
-            _warn_unproven_extent_relation(
-                src,
-                dst,
-                src_dim,
-                dst_dim,
-                require_exact_match=False,
-            )
-            preserve_original = True
+            raise _unproven_extent_error(src, dst, src_dim, dst_dim, require_exact_match=False)
 
-    return src, _NormalizedCopyRegion(dst.spec, dst.mins, dst_extents), preserve_original
+    return src, _NormalizedCopyRegion(dst.spec, dst.mins, dst_extents)
 
 
 def _encode_normalized_region(region: _NormalizedCopyRegion, access_type: str) -> tir.PrimExpr:
     normalized_load = tir.BufferLoad(region.spec.buffer, region.mins)
     return to_buffer_region(normalized_load, access_type=access_type, extents=region.extents)
-
-
-def _encode_preserving_original_bounds(region: _NormalizedCopyRegion, access_type: str) -> tir.PrimExpr:
-    return to_buffer_region(region.spec.original, access_type=access_type, extents=region.extents)
 
 
 def _prepare_copy_regions_strict(
@@ -368,15 +346,14 @@ def _prepare_copy_regions_strict(
     src_spec = _extract_copy_region_spec(src)
     dst_spec = _extract_copy_region_spec(dst)
     src_region, dst_region = _normalize_copy_regions(src_spec, dst_spec)
-    src_region, dst_region, preserve_original = _validate_and_adjust_copy_regions(
+    src_region, dst_region = _validate_and_adjust_copy_regions(
         src_region,
         dst_region,
         require_exact_match=src_spec.kind == "buffer" and dst_spec.kind == "buffer",
     )
-    encode = _encode_preserving_original_bounds if preserve_original else _encode_normalized_region
     return (
-        encode(src_region, access_type="r"),
-        encode(dst_region, access_type="w"),
+        _encode_normalized_region(src_region, access_type="r"),
+        _encode_normalized_region(dst_region, access_type="w"),
     )
 
 
@@ -442,6 +419,7 @@ def copy(
       on the higher-rank side must have extent 1.
     - For mixed region copies, `dst` may be shrunk to the matched `src` extents
       when `src <= dst`; static `src > dst` is rejected.
+    - Strict SunMMIO validation rejects extent relations that cannot be proven.
     """
     src = _unwrap_mesh_tensor(_resolve_let_value(src))
     dst = _unwrap_mesh_tensor(_resolve_let_value(dst))
