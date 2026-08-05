@@ -17,11 +17,9 @@ tilelang.env.disable_cache()
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
-LOOSE_OPT_ARGS = ("--verify-each",)
-
 
 @target("Sunmmio")
-def softmax_dynamic(block_M=128, block_N=128, in_dtype=T.float32, out_dtype=T.float32):
+def softmax_dynamic(block_M=256, block_N=128, in_dtype=T.float32, out_dtype=T.float32):
     """JIT kernel factory for dynamic-(M, N) row-wise softmax."""
     M = T.dynamic("m")
     N = T.dynamic("n")
@@ -111,7 +109,6 @@ def test_simple_global_copy_gemm_codegen_validates_with_npuir_opt(tmp_path, monk
             "suvm.tile.reduce",
             "suvm.mcast_tok",
         ),
-        opt_args=LOOSE_OPT_ARGS,
     )
     assert_source_contains(
         src,
