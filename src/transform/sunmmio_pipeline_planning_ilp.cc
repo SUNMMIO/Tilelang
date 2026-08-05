@@ -1288,6 +1288,11 @@ private:
         AddAccess(NormalizeToBufferRegion(call->args[1]), true);
         return;
       }
+      if (call->op.same_as(sunmmio_layout_transform())) {
+        AddAccess(NormalizeToBufferRegion(call->args[0]), false);
+        AddAccess(NormalizeToBufferRegion(call->args[1]), true);
+        return;
+      }
       if (call->op.same_as(mma_sunmmio())) {
         AddAccess(NormalizeToBufferRegion(call->args[0]), false);
         AddAccess(NormalizeToBufferRegion(call->args[1]), false);
