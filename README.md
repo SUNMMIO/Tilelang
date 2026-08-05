@@ -176,5 +176,6 @@ See [docker/README.md](docker/README.md) for container launch examples.
 
 ## Documentation
 
+- [SunMMIO TileLang Kernel Quick Start](docs/sunmmio/sunmmio_tilelang_getting_started.md): tutorial covering placement, kernel launch, inter-core communication, layout, and tile-level computation.
 - [SunMMIO TileLang User Guide](docs/sunmmio/sunmmio_tilelang_user_guide.md): user-facing guide for writing, migrating, and debugging TileLang kernels on the SunMMIO target.
 - [TileLang docs](docs/index.md): full documentation index, including general TileLang guides and SunMMIO-specific notes.
