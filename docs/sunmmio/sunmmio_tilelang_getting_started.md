@@ -96,6 +96,15 @@ def matmul_persistent(M, N, K, block_M, block_N, block_K, num_stages, dtype=T.bf
     return main
 ```
 
+The factory returns a `PrimFunc`. Compile it with the SunMMIO target explicitly because `target="auto"` does not detect this backend:
+
+```python
+import tilelang
+
+func = matmul_persistent(1024, 1024, 1024, 32, 32, 128, 3)
+kernel = tilelang.compile(func, target="sunmmio")
+```
+
 The following sections build on this example.
 
 ## Sharding Tensors Across the Core Mesh
@@ -649,4 +658,4 @@ Refer to the following resources together with this guide:
 - [SunMMIO TileLang user guide](sunmmio_tilelang_user_guide.md)
 - [Installation guide](../get_started/Installation.md)
 - [TileLang programming guide](../programming_guides/overview.md)
-- [SunMMIO TileLang kernel examples](https://github.com/SUNMMIO/Tilelang/tree/tilelang_mesh_main/examples)
+- [SunMMIO TileLang kernel examples](https://github.com/Sunmmio/Tilelang-mesh/tree/tilelang_mesh_main/examples)

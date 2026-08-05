@@ -96,6 +96,15 @@ def matmul_persistent(M, N, K, block_M, block_N, block_K, num_stages, dtype=T.bf
     return main
 ```
 
+这个 factory 返回 `PrimFunc`。由于 `target="auto"` 不会探测该后端，需要显式指定 SunMMIO target：
+
+```python
+import tilelang
+
+func = matmul_persistent(1024, 1024, 1024, 32, 32, 128, 3)
+kernel = tilelang.compile(func, target="sunmmio")
+```
+
 后面几节都围绕这个例子展开。
 
 ## Sharding（Tensor 在 Core Mesh 上的分片）
@@ -649,4 +658,4 @@ Tile 大小不用用户手动指定，编译器会根据 buffer layout 和它参
 - [SunMMIO TileLang 用户手册](sunmmio_tilelang_user_guide_zh_cn.md)
 - [安装文档](../get_started/Installation.md)
 - [TileLang 编程说明](../programming_guides/overview.md)
-- [SunMMIO TileLang kernel 示例](https://github.com/SUNMMIO/Tilelang/tree/tilelang_mesh_main/examples)
+- [SunMMIO TileLang kernel 示例](https://github.com/Sunmmio/Tilelang-mesh/tree/tilelang_mesh_main/examples)

@@ -1,8 +1,10 @@
-# SunMMIO TileLang 用户说明
+# SunMMIO TileLang 用户指南
+
+[English](sunmmio_tilelang_user_guide.md) | [快速入门](sunmmio_tilelang_getting_started_zh_cn.md)
 
 本文面向已经熟悉基础 TileLang、但需要在 SunMMIO 目标上编写、迁移或调试 kernel 的用户。重点说明用户在前端编程时需要理解的硬件结构、编程模型、前端函数和常见写法。
 
-文档里的硬件名称使用 `SunMMIO`，TileLang target 字符串使用当前实现中的 `Sunmmio`。
+文档里的硬件名称使用 `SunMMIO`，TileLang target 使用规范的小写字符串 `sunmmio`；target 解析器仍兼容 `Sunmmio`。
 
 ## 1. 硬件结构特点
 
@@ -113,56 +115,54 @@ SunMMIO kernel 也是 persistent kernel：一次 kernel 启动后，各个 core 
 ```python
 import tilelang
 import tilelang.language as T
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
-
-device_mesh = driver.get_sunmmio_device_mesh_config()
-nrows, ncols = device_mesh
-ncores = nrows * ncols
 
 M, N, K = 1024, 1024, 1024
 BM, BN, BK = 32, 32, 128
 dtype = "float16"
 accum_dtype = "float32"
 
-placement = T.placement.full_shard(0, 1)
+A_placement = T.placement.row_shard(0)
+B_placement = T.placement.col_shard(1)
+C_placement = T.placement.full_shard(0, 1)
 A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
 B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
 C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 
-A_ty = T.MeshTensor((M, K), placement, device_mesh, dtype, layout=A_layout)
-B_ty = T.MeshTensor((K, N), placement, device_mesh, dtype, layout=B_layout)
-C_ty = T.MeshTensor((M, N), placement, device_mesh, accum_dtype, layout=C_layout)
+A_ty = T.MeshTensor((M, K), A_placement, dtype, layout=A_layout)
+B_ty = T.MeshTensor((K, N), B_placement, dtype, layout=B_layout)
+C_ty = T.MeshTensor((M, N), C_placement, accum_dtype, layout=C_layout)
 
-@tilelang.jit(target="Sunmmio")
+@tilelang.jit(target="sunmmio")
 def gemm_kernel():
+    @T.prim_func
     def main(A: A_ty, B: B_ty, C: C_ty):
-        with T.Kernel(ncores) as cid:
-            row = cid // ncols
-            col = cid % ncols
-            local_m = 0
-            local_n = 0
+        with T.Kernel() as _cid:
+            sharded_M, sharded_K = A.local_shape
+            _, sharded_N = B.local_shape
 
             A_shared = T.alloc_shared((BM, BK), dtype)
             B_shared = T.alloc_shared((BK, BN), dtype)
             C_shared = T.alloc_shared((BM, BN), accum_dtype)
-            T.clear(C_shared)
 
-            for k in T.Pipelined(T.ceildiv(K, BK), num_stages=3):
-                T.copy(A[local_m, k * BK], A_shared)
-                T.copy(B[k * BK, local_n], B_shared)
-                T.gemm(A_shared, B_shared, C_shared)
+            for bm in T.serial(T.ceildiv(sharded_M, BM)):
+                for bn in T.serial(T.ceildiv(sharded_N, BN)):
+                    T.clear(C_shared)
+                    for bk in T.Pipelined(T.ceildiv(sharded_K, BK), num_stages=3):
+                        T.copy(A[bm * BM, bk * BK], A_shared)
+                        T.copy(B[bk * BK, bn * BN], B_shared)
+                        T.gemm(A_shared, B_shared, C_shared)
 
-            T.copy(C_shared, C[local_m, local_n])
+                    T.copy(C_shared, C[bm * BM, bn * BN])
 
     return main
 ```
 
 SunMMIO 的编程模型可以概括为：
 
-1. 用 `target="Sunmmio"` 选择目标。
+1. 用 `target="sunmmio"` 选择目标。
 2. 用 `MeshTensor`、placement 和 layout 描述逻辑 tensor 如何分布到 2D mesh 以及如何在 DRAM 中组织。
-3. 用 `T.Kernel(ncores)` 以 SPMD 方式按 core 数启动，并通过 `cid -> (row, col)` 确定当前 core 的坐标。
+3. 用 `T.Kernel()`（等价于 `T.Kernel(T.mesh_ncores())`）在符号化目标 mesh 上启动；只有算法需要显式坐标时才映射 `cid -> (row, col)`。
 4. 每个 core 从 sharding 分配给自己的 DRAM shard 搬入片上 SRAM。
 5. 需要跨 core 数据时，用 HLink / VLink 对应的核间通讯接口组织 broadcast、put、all-gather 或 all-reduce。
 6. 用 `T.gemm`、`T.Tiles`、`T.reduce*` 等接口表达片上计算。
@@ -175,14 +175,14 @@ SunMMIO 的编程模型可以概括为：
 推荐使用：
 
 ```python
-kernel = tilelang.compile(func, target="Sunmmio")
+kernel = tilelang.compile(func, target="sunmmio")
 ```
 
 或：
 
 ```python
-@tilelang.jit(target="Sunmmio")
-def kernel_factory(...):
+@tilelang.jit(target="sunmmio")
+def kernel_factory(*args, **kwargs):
     ...
 ```
 
@@ -190,22 +190,20 @@ def kernel_factory(...):
 
 ### 2.3 Kernel 启动模型
 
-SunMMIO kernel 通常按 core 数启动。`T.Kernel(ncores)` 表示为 mesh 中的每个 core 建立一个逻辑执行入口，循环变量 `cid` 是当前 core 的线性 id。
+SunMMIO kernel 在目标的符号化 mesh 上启动。`T.Kernel()` 默认使用 `T.mesh_ncores()` 作为 extent，循环变量 `cid` 是当前 core 的线性 id。显式整数 extent 可能与编译 target 绑定的 mesh 不一致，因此当前实现会拒绝这种写法。
 
 ```python
-from tilelang.carver.arch import driver
-
-nrows, ncols = driver.get_sunmmio_device_mesh_config()
-
-with T.Kernel(nrows * ncols) as cid:
-    row = cid // ncols
-    col = cid % ncols
+with T.Kernel() as cid:
+    row = cid // T.mesh_ncols()
+    col = cid % T.mesh_ncols()
     ...
 ```
 
+显式等价写法是 `T.Kernel(T.mesh_ncores())`。SunMMIO 不使用 thread extent，因此不要设置 `threads`。
+
 用户通常需要用 `cid`、`row`、`col` 决定当前 core 负责哪一块数据，以及核间通讯时当前 core 处于哪一行或哪一列。
 
-从执行语义上看，`T.Kernel(nrows * ncols)` 启动的是一组同时参与同一 kernel 的 persistent core 实例。每个 core 在一次 kernel 启动内持续执行，通常通过循环处理本 core 被分配到的多个 tile 或 work item。即使某些 core 在某个阶段没有实际计算任务，也应按照同一份程序走到 kernel 结束位置；整个 kernel 的完成以所有参与 core 都执行结束为准。
+从执行语义上看，`T.Kernel()` 启动的是一组同时参与同一 kernel 的 persistent core 实例。每个 core 在一次 kernel 启动内持续执行，通常通过循环处理本 core 被分配到的多个 tile 或 work item。即使某些 core 在某个阶段没有实际计算任务，也应按照同一份程序走到 kernel 结束位置；整个 kernel 的完成以所有参与 core 都执行结束为准。
 
 ### 2.4 MeshTensor 与 Placement
 
@@ -215,7 +213,6 @@ with T.Kernel(nrows * ncols) as cid:
 A: T.MeshTensor(
     (M, K),
     T.placement.full_shard(0, 1),
-    device_mesh_config,
     dtype,
 )
 ```
@@ -321,7 +318,7 @@ T.copy(C_shared, C[local_m, local_n])
 | ------------------------------- | ---------------------------- |
 | DRAM -> RSRAM                   | 从本 core DRAM shard 读取到 RSRAM |
 | RSRAM -> DRAM                   | 从 RSRAM 写回本 core DRAM shard  |
-| DRAM -> ASRAM/WSRAM             | 把输入搬到 Tensor Core 对应操作数区域    |
+| DRAM -> ASRAM/WSRAM             | 把输入搬到 Tensor Core 对应操作数区域；不支持的直接路径可由 legalization 经 RSRAM 中转 |
 | RSRAM -> ASRAM/WSRAM            | 从 RSRAM 准备 Tensor Core 操作数   |
 | RSRAM -> RSRAM                  | 片上 RSRAM 内部拷贝                |
 | ASRAM/WSRAM -> DRAM             | 不支持                          |
@@ -329,6 +326,8 @@ T.copy(C_shared, C[local_m, local_n])
 | ASRAM -> ASRAM / WSRAM -> WSRAM | 不支持                          |
 
 `T.copy` 可以接受完整 buffer，也可以接受切片或 region。用户应尽量让源、目标 shape 对齐，并让目标 scope 符合后续计算单元的需求：左操作数进入 ASRAM，右操作数进入 WSRAM，结果操作数和多数中间结果放 RSRAM。
+
+DMA 和 link 搬运要求源、目标 dtype 一致。改变 dtype 的 copy 只在 RSRAM 到 RSRAM 的 Tile 路径上受支持；先在 RSRAM 中完成暂存和转换，再搬到其他 SRAM scope。
 
 ### 2.8 T.Tiles
 
@@ -444,25 +443,25 @@ for k in T.Pipelined(T.ceildiv(sharded_K, block_K), num_stages=3):
 **`tilelang.compile`**
 
 ```python
-tilelang.compile(func, target="Sunmmio")
+tilelang.compile(func, target="sunmmio")
 ```
 
 `tilelang.compile` 用于把 TileLang kernel 编译到指定目标。
 
-- `func`：要编译的 kernel factory 或 prim func。
-- `target`：目标后端。SunMMIO 用户应显式写 `target="Sunmmio"`，让编译流程按 SunMMIO 的 mesh、scope、layout、copy、核间通讯和 GEMM 语义处理。
+- `func`：要编译的 `PrimFunc`。如果入口是带参数的 kernel factory，应使用 `tilelang.jit`。
+- `target`：目标后端。SunMMIO 用户应显式写 `target="sunmmio"`，让编译流程按 SunMMIO 的 mesh、scope、layout、copy、核间通讯和 GEMM 语义处理。
 
 **`tilelang.jit`**
 
 ```python
-@tilelang.jit(target="Sunmmio")
-def kernel_factory(...):
+@tilelang.jit(target="sunmmio")
+def kernel_factory(*args, **kwargs):
     ...
 ```
 
 `tilelang.jit` 用于定义可 JIT 编译的 kernel factory。
 
-- `target`：目标后端。SunMMIO kernel 建议显式写 `target="Sunmmio"`。
+- `target`：目标后端。SunMMIO kernel 建议显式写 `target="sunmmio"`。
 - 被装饰的函数：通常返回一个 `@T.prim_func` 或内部 `main` 函数。
 
 **`driver.get_sunmmio_device_mesh_config`**
@@ -473,13 +472,13 @@ from tilelang.carver.arch import driver
 nrows, ncols = driver.get_sunmmio_device_mesh_config()
 ```
 
-`get_sunmmio_device_mesh_config()` 返回当前 SunMMIO device mesh 的二维形状。
+`get_sunmmio_device_mesh_config()` 当前返回具体的默认 device mesh 形状 `(4, 4)`。
 
 - 参数：无。
 - 返回值：`(nrows, ncols)`。
 - `nrows`：mesh 的行数，对应纵向 core 数。
 - `ncols`：mesh 的列数，对应横向 core 数。
-- 常见用途：计算 `ncores = nrows * ncols`，并在 `T.Kernel(ncores)` 中把线性 `cid` 映射为 `row = cid // ncols`、`col = cid % ncols`。
+- 常见用途：host 侧检查和诊断。kernel 类型、启动 extent 和 buffer shape 通常应使用 `T.mesh_nrows()`、`T.mesh_ncols()`、`T.mesh_ncores()`，由编译 target 负责解析。
 
 **`driver.get_sunmmio_device_properties`**
 
@@ -487,11 +486,11 @@ nrows, ncols = driver.get_sunmmio_device_mesh_config()
 props = driver.get_sunmmio_device_properties()
 ```
 
-`get_sunmmio_device_properties()` 用于读取 SunMMIO 设备属性。
+`get_sunmmio_device_properties()` 返回仓库当前静态定义的 A4E device 描述，尚不会查询 runtime device。
 
-- 参数：无。
-- 返回值：设备属性对象或字典，具体字段随运行环境提供的设备描述而定。
-- 常见用途：根据设备属性选择 block size、pipeline stage、核间通讯策略或其他 kernel 生成参数。
+- `device_id`：可选 device 索引，当前未使用，默认值为 `0`。
+- 返回值：`SunmmioDeviceProperties`，包含 `mesh_config`、`RsramPerCore`、`WSRAMperCore` 和 `ASRAMPerCore` 字段。
+- 常见用途：host 侧检查；不要把这些值当作 runtime capability query。
 
 ### 3.2 MeshTensor、Placement 与 Layout
 
@@ -518,14 +517,18 @@ across_mesh = T.placement.mesh_as_line(dim)
 **`T.MeshTensor`**
 
 ```python
-T.MeshTensor(shape, placement, device_mesh_config=None, dtype="float32", layout=None)
+# 推荐的符号化 mesh 写法
+T.MeshTensor(shape, placement, dtype="float32", layout=None)
+
+# 具体 mesh 特化写法
+T.MeshTensor(shape, placement, (nrows, ncols), dtype="float32", layout=None)
 ```
 
 `MeshTensor` 用在 kernel 函数参数处，声明一个分布在 SunMMIO mesh 上的输入或输出 tensor。
 
 - `shape`：逻辑完整 shape，例如 `(M, K)`。这是用户视角下的全局 tensor shape。
 - `placement`：由 `T.placement` 构造的 `PlacementSpec`，描述全局 tensor 如何切分或复制到各个 core。
-- `device_mesh_config`：形如 `(nrows, ncols)`。省略时使用符号化的目标 mesh；也可以显式传入 `driver.get_sunmmio_device_mesh_config()` 的结果。
+- `device_mesh_config`：形如 `(nrows, ncols)`。普通 kernel 应省略它并使用符号化目标 mesh；只有需要把 tensor 类型特化到某一 mesh 时才传入具体 tuple。
 - `dtype`：元素类型，例如 `"float16"`、`"bfloat16"`、`"float32"`。
 - `layout`：DRAM 中的全局数据布局。省略时，普通 dtype 的 rank 1 默认使用 1024-byte 对齐的 row-major，rank >= 2 默认使用 ZZ；MX dtype 的 rank >= 2 默认使用 MXZZ，rank 1 不受支持。用户通常不需要手动传入该参数。
 
@@ -541,7 +544,7 @@ layout = make_row_major(shape)
 
 `make_row_major` 构造 row-major layout。
 
-- `shape`：tensor 或 buffer 的逻辑 shape。
+- `shape`：tensor 的逻辑 shape。
 - 返回值：可传给 `T.MeshTensor(..., layout=layout)` 或 `T.annotate_layout` 的 layout 对象。
 - 常见用途：高级场景下需要显式表达 row-major，或调试 layout 相关问题。普通 kernel 通常依赖按 rank 和 dtype 选择的默认 layout。
 
@@ -578,7 +581,7 @@ layout = make_zn_layout(shape, axes, block_shape)
 
 `make_zn_layout` 构造 ZN layout。
 
-- `shape`：tensor 或 buffer 的逻辑 shape。
+- `shape`：tensor 的逻辑 shape。
 - `axes`：参与布局变换的维度。
 - `block_shape`：分块形状。
 - 返回值：layout 对象。
@@ -594,7 +597,7 @@ layout = make_zzz_layout(shape, axes, block_shape, cluster_shape)
 
 `make_zzz_layout` 构造带 cluster 组织的 ZZZ layout。
 
-- `shape`：tensor 或 buffer 的逻辑 shape。
+- `shape`：tensor 的逻辑 shape。
 - `axes`：参与布局变换的维度。
 - `block_shape`：每个 block 的形状。
 - `cluster_shape`：cluster 级组织形状。
@@ -610,7 +613,7 @@ layout = make_nzz_layout(shape, axes, block_shape, cluster_shape)
 
 `make_nzz_layout` 构造带 cluster 组织的 NZZ layout。
 
-- `shape`：tensor 或 buffer 的逻辑 shape。
+- `shape`：tensor 的逻辑 shape。
 - `axes`：参与布局变换的维度。
 - `block_shape`：每个 block 的形状。
 - `cluster_shape`：cluster 级组织形状。
@@ -622,9 +625,9 @@ layout = make_nzz_layout(shape, axes, block_shape, cluster_shape)
 T.annotate_layout({buffer: layout})
 ```
 
-`T.annotate_layout` 给 buffer 或 region 显式附加 layout，属于高级用法。
+`T.annotate_layout` 给 buffer 显式附加 layout，属于高级用法。
 
-- 参数：一个 dict，key 是 buffer 或 region，value 是 layout 对象。
+- 参数：一个 dict，key 是 buffer，value 是 layout 对象。
 - `buffer`：需要标注布局的对象。
 - `layout`：由 `make_row_major`、`make_zz_layout` 等函数构造。
 - 常见用途：外部固定格式对接、复现已有 layout，或调试 layout 相关问题。普通 kernel 通常依赖编译器推断。
@@ -653,9 +656,9 @@ T.annotate_tileview({buffer: make_tileview(buffer, tile_shape, index_map)})
 T.annotate_tileview({buffer: (tile_shape, index_map)})
 ```
 
-`T.annotate_tileview` 给 buffer 或 region 标注 TileView。
+`T.annotate_tileview` 给 buffer 标注 TileView。
 
-- 参数：一个 dict，key 是 buffer 或 region。
+- 参数：一个 dict，key 是 buffer。
 - value 可以是 `make_tileview(...)` 的返回值。
 - value 也可以写成 `(tile_shape, index_map)` 的 tuple shorthand。
 - `tile_shape`：tile 形状。
@@ -715,7 +718,7 @@ T.fill(buffer, value)
 
 **`T.copy`**
 
-```python
+```text
 T.copy(
     src,
     dst,
@@ -816,7 +819,7 @@ T.comm.all_gather(
 - `direction`：参与 gather 的方向，支持 `"horizontal"` / `"h"`、`"vertical"` / `"v"`、`"all"` / `"a"`。
 - `size`：每个 core 发送的元素数，`-1` 表示使用整个 `send_buffer`。
 - `axis`：拼接维度。`None` 表示新增第 0 维；`0` 表示沿第 0 维拼接；`-1` 表示沿最后一维拼接。
-- `src_offset_byte`：源地址字节偏移，高级用法一般保持 `0`。
+- `src_offset_byte`：bf16 GEMM legalization 使用的编译器内部源地址字节偏移；用户代码必须保持为 `0`。
 - 返回值：表达 all-gather 的语句。
 
 接收 shape 需要和 `direction`、`axis` 匹配。若参与 core 数为 `K`：
@@ -949,21 +952,25 @@ T.reduce_bitxor(buffer, out, dim=-1, clear=True)
 **`T.Kernel`**
 
 ```python
-with T.Kernel(*blocks, threads=None, is_cpu=False, prelude=None) as cid:
+with T.Kernel() as cid:
+    ...
+
+# 显式等价写法
+with T.Kernel(T.mesh_ncores()) as cid:
     ...
 ```
 
 `T.Kernel` 建立 kernel/core 执行入口。
 
-- `*blocks`：grid 维度。SunMMIO 常用 `T.Kernel(ncores)`，为 mesh 中每个 core 建立一个逻辑入口。
-- `threads`：线程维度参数。SunMMIO kernel 通常不需要填写。
+- `blocks`：省略，或只传 `T.mesh_ncores()`。SunMMIO 不支持显式整数 extent 或多维 grid。
+- `threads`：保持未设置。SunMMIO 在 TileLang launch 层是 threadless kernel。
 - `is_cpu`：是否生成 CPU 形式的 kernel，SunMMIO 用户保持默认 `False`。
 - `prelude`：额外注入代码，SunMMIO 普通用户保持默认 `None`。
-- 返回值：block/core id 绑定。单维 `T.Kernel(ncores)` 返回线性 `cid`。
+- 返回值：线性 core id 绑定 `cid`。
 
 **`T.serial`**
 
-```python
+```text
 T.serial(start, stop=None, step=None, *, annotations=None)
 
 for i in T.serial(stop):
@@ -1017,16 +1024,15 @@ for k in T.Pipelined(loop_extent, num_stages=3):
 
 ### 4.1 本地 Shard GEMM
 
-这个 kernel 中，每个 core 只读取自己 DRAM 中的本地 shard，完成本地 GEMM 后写回自己的输出 shard。
+这个 kernel 中，每个 core 只读取自己 DRAM 中的本地 shard，完成本地 GEMM 后写回自己的输出 shard。`A` 沿 mesh row 切分并在 column 间复制，`B` 在 row 间复制并沿 mesh column 切分，因此每个 core 都拥有计算本地输出 tile 所需的完整 K 维。
 
 ```python
 import tilelang
 import tilelang.language as T
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
 
-@tilelang.jit(target="Sunmmio")
+@tilelang.jit(target="sunmmio")
 def local_shard_gemm(
     M=128,
     N=128,
@@ -1037,22 +1043,20 @@ def local_shard_gemm(
     dtype="float16",
     accum_dtype="float32",
 ):
-    device_mesh = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh
-    ncores = nrows * ncols
-
-    placement = T.placement.full_shard(0, 1)
+    A_placement = T.placement.row_shard(0)
+    B_placement = T.placement.col_shard(1)
+    C_placement = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), placement, device_mesh, dtype, layout=A_layout),  # type: ignore
-        B: T.MeshTensor((K, N), placement, device_mesh, dtype, layout=B_layout),  # type: ignore
-        C: T.MeshTensor((M, N), placement, device_mesh, accum_dtype, layout=C_layout),  # type: ignore
+        A: T.MeshTensor((M, K), A_placement, dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), B_placement, dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), C_placement, accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as _cid:
+        with T.Kernel() as _cid:
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
 
@@ -1092,11 +1096,10 @@ def local_shard_gemm(
 ```python
 import tilelang
 import tilelang.language as T
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
 
-@tilelang.jit(target="Sunmmio")
+@tilelang.jit(target="sunmmio")
 def summa_gemm(
     M=128,
     N=128,
@@ -1107,10 +1110,6 @@ def summa_gemm(
     dtype="float16",
     accum_dtype="float32",
 ):
-    device_mesh = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh
-    ncores = nrows * ncols
-
     placement = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
@@ -1118,16 +1117,16 @@ def summa_gemm(
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), placement, device_mesh, dtype, layout=A_layout),  # type: ignore
-        B: T.MeshTensor((K, N), placement, device_mesh, dtype, layout=B_layout),  # type: ignore
-        C: T.MeshTensor((M, N), placement, device_mesh, accum_dtype, layout=C_layout),  # type: ignore
+        A: T.MeshTensor((M, K), placement, dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), placement, dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), placement, accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as _cid:
+        with T.Kernel() as _cid:
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
 
-            A_panel = T.alloc_shared((block_M, block_K * ncols), dtype)
-            B_panel = T.alloc_shared((block_K * nrows, block_N), dtype)
+            A_panel = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
+            B_panel = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
             C_tile = T.alloc_shared((block_M, block_N), accum_dtype)
 
             for bm in T.serial(T.ceildiv(sharded_M, block_M)):
@@ -1166,11 +1165,10 @@ def summa_gemm(
 ```python
 import tilelang
 import tilelang.language as T
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
 
 
-@tilelang.jit(target="Sunmmio")
+@tilelang.jit(target="sunmmio")
 def gemm_with_bias(
     M=128,
     N=128,
@@ -1181,23 +1179,21 @@ def gemm_with_bias(
     dtype="float16",
     accum_dtype="float32",
 ):
-    device_mesh = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh
-    ncores = nrows * ncols
-
-    placement = T.placement.full_shard(0, 1)
+    A_placement = T.placement.row_shard(0)
+    B_placement = T.placement.col_shard(1)
+    C_placement = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), placement, device_mesh, dtype, layout=A_layout),  # type: ignore
-        B: T.MeshTensor((K, N), placement, device_mesh, dtype, layout=B_layout),  # type: ignore
-        Bias: T.MeshTensor((M, N), placement, device_mesh, accum_dtype, layout=C_layout),  # type: ignore
-        C: T.MeshTensor((M, N), placement, device_mesh, accum_dtype, layout=C_layout),  # type: ignore
+        A: T.MeshTensor((M, K), A_placement, dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), B_placement, dtype, layout=B_layout),
+        Bias: T.MeshTensor((M, N), C_placement, accum_dtype, layout=C_layout),
+        C: T.MeshTensor((M, N), C_placement, accum_dtype, layout=C_layout),
     ):
-        with T.Kernel(ncores) as _cid:
+        with T.Kernel() as _cid:
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
 
@@ -1240,3 +1236,17 @@ def gemm_with_bias(
 
     return main
 ```
+
+## 5. 总结
+
+- 显式使用规范的 `sunmmio` target 字符串；`auto` 不会探测该后端。
+- kernel 代码优先使用符号化 mesh 表达式，并通过 `T.Kernel()` 启动。
+- 新代码使用 `T.placement`，根据算法数据流分别选择各操作数的 placement，不要机械复用同一个 placement。
+- 通讯 region、接收 shape、SRAM scope、layout 和 dtype 都应与下一步消费它们的操作保持一致。
+
+## 相关文档
+
+- [SunMMIO TileLang 快速入门](sunmmio_tilelang_getting_started_zh_cn.md)
+- [安装文档](../get_started/Installation.md)
+- [TileLang 编程说明](../programming_guides/overview.md)
+- [SunMMIO 示例](https://github.com/Sunmmio/Tilelang-mesh/tree/tilelang_mesh_main/examples)
