@@ -258,6 +258,43 @@ def _make_let_bound_oversized_region_copy_kernel():
     return kernel
 
 
+@target("Sunmmio")
+def _make_symbolic_unknown_region_copy_kernel():
+    n = T.dynamic("n")
+
+    @T.prim_func
+    def kernel(src: T.Tensor((n,), DTYPE), dst: T.Tensor((4,), DTYPE)):
+        with T.Kernel():
+            T.copy(src[0:n], dst[0:4])
+
+    return kernel
+
+
+@target("Sunmmio")
+def _make_memory_backed_let_extent_copy_kernel():
+    @T.prim_func
+    def kernel(
+        shape: T.Tensor((1,), T.int32),
+        src: T.Tensor((8,), DTYPE),
+        dst: T.Tensor((8,), DTYPE),
+    ):
+        with T.Kernel(), T.LetStmt(shape[0]) as extent:
+            shape[0] = 4
+            T.copy(src[0:extent], dst[0:extent])
+
+    return kernel
+
+
+@target("Sunmmio")
+def _make_memory_backed_let_allocation_kernel():
+    @T.prim_func
+    def kernel(shape: T.Tensor((1,), T.int32)):
+        with T.Kernel(), T.LetStmt(shape[0]) as extent:
+            T.alloc_shared((extent,), DTYPE)
+
+    return kernel
+
+
 def _assert_region_extents(script, buffer_name, access_mask, extents):
     extent_pattern = r",\s*".join(str(extent) for extent in extents)
     name_pattern = r"[A-Za-z_]\w*" if buffer_name is None else re.escape(buffer_name)
@@ -404,6 +441,31 @@ def test_sunmmio_copy_strict_squeezes_let_bound_singleton_extent(_strict_region_
 def test_sunmmio_copy_strict_rejects_let_bound_oversized_extent(_strict_region_validation):
     with pytest.raises(ValueError, match="src extent is larger than dst extent"):
         _make_let_bound_oversized_region_copy_kernel()
+
+
+def test_sunmmio_copy_strict_warns_and_preserves_symbolic_unknown_regions(_strict_region_validation):
+    with pytest.warns(UserWarning, match="cannot prove.*less than or equal"):
+        script = tvm.IRModule({"main": _make_symbolic_unknown_region_copy_kernel()}).script()
+
+    assert "T.region(src[0], 1, n)" in script
+    assert "T.region(dst[0], 2, 4)" in script
+
+
+def test_sunmmio_copy_strict_preserves_memory_backed_let_snapshot(_strict_region_validation):
+    script = tvm.IRModule({"main": _make_memory_backed_let_extent_copy_kernel()}).script()
+
+    match = re.search(r"(?P<extent>\w+): T\.int32 = shape\[0\]", script)
+    assert match, f"missing captured let value:\n{script}"
+    extent = match.group("extent")
+    assert f"T.region(src[0], 1, {extent})" in script
+    assert f"T.region(dst[0], 2, {extent})" in script
+    assert "T.region(src[0], 1, shape[0])" not in script
+    assert "T.region(dst[0], 2, shape[0])" not in script
+
+
+def test_sunmmio_allocation_rejects_memory_backed_let_shape():
+    with pytest.raises(ValueError, match="non-invariant let binding"):
+        _make_memory_backed_let_allocation_kernel()
 
 
 def test_sunmmio_copy_frontend_clips_src_before_shrinking_dst(_strict_region_validation):

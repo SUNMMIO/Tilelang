@@ -1,8 +1,11 @@
 from types import SimpleNamespace
 
+import pytest
+
 import tilelang.testing
 from tilelang import tvm as tvm
 from tilelang import language as T
+from tilelang.language.allocate import _resolve_allocation_shape
 import tilelang.language.frame as frame
 
 
@@ -21,6 +24,23 @@ def test_resolve_let_bound_expr_expands_transitive_bindings():
             stack.pop()
 
     tvm.ir.assert_structural_equal(resolved, tvm.tir.IntImm("int32", 10))
+
+
+def test_resolve_let_bound_expr_preserves_memory_backed_binding():
+    shape = tvm.tir.decl_buffer((1,), "int32", name="shape")
+    extent = tvm.tir.Var("extent", "int32")
+    stack = frame._get_let_stack()
+    initial_depth = len(stack)
+
+    try:
+        stack.push(SimpleNamespace(var=extent, value=shape[0]))
+        resolved = frame.resolve_let_bound_expr(extent)
+        assert resolved.same_as(extent)
+        with pytest.raises(ValueError, match="non-invariant let binding"):
+            _resolve_allocation_shape((extent,))
+    finally:
+        while len(stack) > initial_depth:
+            stack.pop()
 
 
 @tilelang.testing.requires_cuda

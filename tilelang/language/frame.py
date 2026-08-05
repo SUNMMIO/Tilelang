@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from tvm.ffi import register_object as _register_object
-from tvm.tir import Var, PrimExpr, BufferLoad, BufferRegion
+from tvm.tir import Var, PrimExpr, BufferLoad, BufferRegion, Call, ProducerLoad
 from tvm.tir.stmt_functor import post_order_visit, substitute
 from tvm.ir import Range
 from tvm.arith import Analyzer
@@ -211,8 +211,36 @@ def get_let_value(var: Var) -> PrimExpr | None:
     return _get_let_stack().get_value(var)
 
 
+def _is_invariant_let_value(expr: PrimExpr) -> bool:
+    """Return whether re-evaluating an expression preserves LetStmt semantics."""
+    invariant = True
+
+    def visit(node):
+        nonlocal invariant
+        if isinstance(node, (BufferLoad, ProducerLoad, Call)):
+            invariant = False
+
+    post_order_visit(expr, visit)
+    return invariant
+
+
+def find_let_bound_vars(expr: PrimExpr | int) -> set[Var]:
+    """Collect active frontend let variables referenced by an expression."""
+    if not isinstance(expr, PrimExpr):
+        return set()
+
+    let_vars: set[Var] = set()
+
+    def collect(node):
+        if isinstance(node, Var) and has_let_value(node):
+            let_vars.add(node)
+
+    post_order_visit(expr, collect)
+    return let_vars
+
+
 def resolve_let_bound_expr(expr: PrimExpr | int) -> PrimExpr | int:
-    """Recursively expand active frontend let bindings in a TIR expression."""
+    """Recursively expand active let bindings whose values are invariant."""
     if not isinstance(expr, PrimExpr):
         return expr
 
@@ -234,6 +262,8 @@ def resolve_let_bound_expr(expr: PrimExpr | int) -> PrimExpr | int:
             resolved_value = resolve_expr(value)
         finally:
             resolving_vars.remove(var)
+        if not _is_invariant_let_value(resolved_value):
+            resolved_value = var
         resolved_vars[var] = resolved_value
         return resolved_value
 

@@ -27,14 +27,26 @@ from tvm.tir.expr import FloatImm, IntImm
 from . import dtypes as _dtypes
 from .dtypes import dtype as tl_dtype
 from .eager.builder import OutTensor
-from .frame import resolve_let_bound_expr
+from .frame import find_let_bound_vars, resolve_let_bound_expr
 from .proxy import Tensor
+
+
+def _resolve_allocation_extent(extent: PrimExpr | int) -> PrimExpr | int:
+    resolved_extent = resolve_let_bound_expr(extent)
+    unresolved_vars = find_let_bound_vars(resolved_extent)
+    if unresolved_vars:
+        names = ", ".join(sorted(var.name for var in unresolved_vars))
+        raise ValueError(
+            "TileLang allocation shape depends on non-invariant let binding(s) "
+            f"{names}; memory-backed let values cannot be inlined into a block-scoped allocation"
+        )
+    return resolved_extent
 
 
 def _resolve_allocation_shape(shape: ShapeType | PrimExpr | int) -> ShapeType | PrimExpr | int:
     if isinstance(shape, (int, PrimExpr)):
-        return resolve_let_bound_expr(shape)
-    resolved_shape = [resolve_let_bound_expr(extent) for extent in shape]
+        return _resolve_allocation_extent(shape)
+    resolved_shape = [_resolve_allocation_extent(extent) for extent in shape]
     return tuple(resolved_shape) if isinstance(shape, tuple) else resolved_shape
 
 
