@@ -1479,6 +1479,7 @@ def test_inject_sunmmio_sync_loop():
     ]
     assert len(barrier_init_entries) == 1
     assert barrier_init_entries[0][2] == 15
+    assert len(barrier_wait_entries) == 2
     assert all(mask == 15 for _, _, mask in barrier_wait_entries)
 
     wait_token_2_before_first = [idx for idx, _, token in wait_entries if token == 2 and idx < first_bcast_idx]
@@ -1492,8 +1493,8 @@ def test_inject_sunmmio_sync_loop():
     barrier_wait_between = [idx for idx, _, _ in barrier_wait_entries if min(wait_token_1_between) < idx < second_bcast_idx]
     barrier_wait_after_second = [idx for idx, _, _ in barrier_wait_entries if idx > second_bcast_idx]
     assert barrier_wait_before_first
-    assert not barrier_wait_between
-    assert barrier_wait_after_second
+    assert barrier_wait_between
+    assert not barrier_wait_after_second
 
 
 def test_inject_sunmmio_sync_while_loop_carried_tokens():
@@ -1540,6 +1541,7 @@ def test_inject_sunmmio_sync_while_loop_carried_tokens():
     ]
     assert len(barrier_init_entries) == 1
     assert barrier_init_entries[0][2] == 15
+    assert len(barrier_wait_entries) == 2
     assert all(mask == 15 for _, _, mask in barrier_wait_entries)
 
     while_idx = next(idx for idx, line in enumerate(lines) if "while i < 2:" in line)
@@ -1553,7 +1555,7 @@ def test_inject_sunmmio_sync_while_loop_carried_tokens():
     barrier_wait_before_first = [idx for idx, _, _ in barrier_wait_entries if min(carried_wait_before_first) < idx < first_bcast_idx]
     barrier_wait_between = [idx for idx, _, _ in barrier_wait_entries if min(wait_first_between) < idx < second_bcast_idx]
     assert barrier_wait_before_first
-    assert not barrier_wait_between
+    assert barrier_wait_between
 
 
 def test_inject_sunmmio_sync_while_loop_carried_async_to_sync_store():
