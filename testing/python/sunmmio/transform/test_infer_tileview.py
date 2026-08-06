@@ -546,6 +546,50 @@ def test_infer_tileview_keeps_scalar_fallback_when_no_axis_is_unit_stride():
     assert "for i, j in T.grid(4, 4)" in script
 
 
+def test_infer_tileview_keeps_scalar_fallback_when_index_mixes_tile_axes():
+    """An index that mixes both tile axes cannot be represented by a TileView."""
+    domain, shape = 4, 16
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            src = T.alloc_shared((shape, shape), "float32")
+            dst = T.alloc_shared((shape, shape), "float32")
+
+            for i, j in T.Tiles([domain, domain], parallel=True):
+                dst[i, j] = src[i + j, i + j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+    script = mod["main"].script()
+
+    assert "tile.domain" not in script
+    assert "tile.scope_entry" not in script
+    assert "for i, j in T.grid(4, 4)" in script
+
+
+def test_infer_tileview_keeps_scalar_fallback_for_incompatible_axis_order():
+    """Transposed source and row-major destination accesses share no execution plan."""
+    domain, shape = 4, 16
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            src = T.alloc_shared((shape, shape), "float32")
+            dst = T.alloc_shared((shape, shape), "float32")
+
+            for i, j in T.Tiles([domain, domain], parallel=True):
+                dst[i, j] = src[j, i]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+    script = mod["main"].script()
+
+    assert "tile.domain" not in script
+    assert "tile.scope_entry" not in script
+    assert "for i, j in T.grid(4, 4)" in script
+
+
 @pytest.mark.parametrize(
     "dtype",
     [

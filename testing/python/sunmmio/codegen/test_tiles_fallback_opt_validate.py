@@ -1,5 +1,6 @@
 import os
 
+import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
@@ -153,6 +154,63 @@ def mixed_rank_unit_side_load_kernel(rows=64, cols=128, dtype=T.float32):
     return main
 
 
+@target("Sunmmio")
+def non_unit_coefficient_scalar_fallback_kernel(domain=4, shape=16, dtype=T.float32):
+    layout = make_aligned_row_major((shape, shape), dtype, align_bytes=64)
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            src = T.alloc_shared((shape, shape), dtype)
+            dst = T.alloc_shared((shape, shape), dtype)
+            T.annotate_layout({src: layout, dst: layout})
+
+            T.fill(src, 1)
+            T.fill(dst, 0)
+            for i, j in T.Tiles([domain, domain], parallel=True):
+                dst[i, j] = src[i, 2 * j]
+
+    return main
+
+
+@target("Sunmmio")
+def multi_axis_index_scalar_fallback_kernel(domain=4, shape=16, dtype=T.float32):
+    layout = make_aligned_row_major((shape, shape), dtype, align_bytes=64)
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            src = T.alloc_shared((shape, shape), dtype)
+            dst = T.alloc_shared((shape, shape), dtype)
+            T.annotate_layout({src: layout, dst: layout})
+
+            T.fill(src, 1)
+            T.fill(dst, 0)
+            for i, j in T.Tiles([domain, domain], parallel=True):
+                dst[i, j] = src[i + j, i + j]
+
+    return main
+
+
+@target("Sunmmio")
+def transposed_access_scalar_fallback_kernel(domain=4, shape=16, dtype=T.float32):
+    layout = make_aligned_row_major((shape, shape), dtype, align_bytes=64)
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            src = T.alloc_shared((shape, shape), dtype)
+            dst = T.alloc_shared((shape, shape), dtype)
+            T.annotate_layout({src: layout, dst: layout})
+
+            T.fill(src, 1)
+            T.fill(dst, 0)
+            for i, j in T.Tiles([domain, domain], parallel=True):
+                dst[i, j] = src[j, i]
+
+    return main
+
+
 def _validate_aligned_1d_bridge(kernel, tmp_path, filename):
     src = validate_sunmmio_codegen_with_npuir_opt(
         kernel,
@@ -163,6 +221,18 @@ def _validate_aligned_1d_bridge(kernel, tmp_path, filename):
     )
     assert "suvm.tile.pick" not in src
     assert "suvm.tile.set" not in src
+
+
+def _validate_scalar_pick_set_fallback(kernel, tmp_path, filename):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        kernel,
+        tmp_path,
+        mlir_filename=filename,
+        expected_tokens=("suvm.tile.pick", "suvm.tile.set", "suvm.tile.store"),
+        opt_args=STRICT_OPT_ARGS,
+    )
+    assert "suvm.tile.extract_slice" not in src
+    assert "suvm.tile.insert_slice" not in src
 
 
 def test_serialized_rank1_zz_slices_lower_through_aligned_carriers(tmp_path):
@@ -206,6 +276,18 @@ def test_mixed_rank_unit_side_load_uses_carrier_pick(tmp_path):
         opt_args=STRICT_OPT_ARGS,
     )
     assert "suvm.tile.extract_slice" not in src
+
+
+@pytest.mark.parametrize(
+    ("factory", "filename"),
+    [
+        (non_unit_coefficient_scalar_fallback_kernel, "tiles_non_unit_coefficient_scalar_fallback_suvm.mlir"),
+        (multi_axis_index_scalar_fallback_kernel, "tiles_multi_axis_index_scalar_fallback_suvm.mlir"),
+        (transposed_access_scalar_fallback_kernel, "tiles_transposed_access_scalar_fallback_suvm.mlir"),
+    ],
+)
+def test_unplannable_tiles_fall_back_to_scalar_pick_set(factory, filename, tmp_path):
+    _validate_scalar_pick_set_fallback(factory(), tmp_path, filename)
 
 
 if __name__ == "__main__":
