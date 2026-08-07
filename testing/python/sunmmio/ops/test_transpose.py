@@ -207,10 +207,7 @@ def test_transpose_layout_inference_is_order_independent(
     src = validate_sunmmio_codegen_with_npuir_opt(
         mesh_transpose_order_kernel(source_constraint_first),
         tmp_path,
-        mlir_filename=(
-            "transpose_order_"
-            f"{'constraint_first' if source_constraint_first else 'dependent_first'}.mlir"
-        ),
+        mlir_filename=(f"transpose_order_{'constraint_first' if source_constraint_first else 'dependent_first'}.mlir"),
         expected_tokens=(
             "suvm.copy_async",
             "suvm.transpose_async",
