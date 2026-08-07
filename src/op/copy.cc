@@ -679,27 +679,9 @@ bool CopyNode::CheckTMemStore(Target target) const {
 }
 
 bool CopyNode::CheckSunmmioDMACopy(Target target) const {
-  // 1. src and dst must be legal
-  bool scope_check = false;
-  if (src.scope() == "global" && dst.scope() == kSunmmioScopeRSRAM)
-    scope_check = true;
-  if (src.scope() == "global" && dst.scope() == kSunmmioScopeWSRAM)
-    scope_check = true;
-  if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeWSRAM)
-    scope_check = true;
-  if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeASRAM)
-    scope_check = true;
-  if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == "global")
-    scope_check = true;
-  if (!scope_check) {
-    return false;
-  }
-  // 2. src and dst must have the same dtype for DMA-based lowering
-  if (src->dtype != dst->dtype) {
-    ICHECK(0) << "src and dst must have the same dtype for Sunmmio DMA copy.";
-    return false;
-  }
-  return true;
+  return SupportsSunmmioDirectTransfer(
+      target, SunmmioTransferMechanism::kLocalDma, src.scope(), src->dtype,
+      dst.scope(), dst->dtype);
 }
 
 bool CopyNode::CheckSunmmioTileCopy(Target target) const {
@@ -723,7 +705,9 @@ bool CopyNode::CheckSunmmioTileCopy(Target target) const {
   // Region views are legal as long as src/dst describe the same logical copy
   // shape. Lowering will materialize a tile.domain scope over that region so
   // LegalizeTilesLoop/TilesLoop can preserve the offsets.
-  if (src.scope() != kSunmmioScopeRSRAM || dst.scope() != kSunmmioScopeRSRAM) {
+  if (!SupportsSunmmioDirectTransfer(target, SunmmioTransferMechanism::kTile,
+                                     src.scope(), src->dtype, dst.scope(),
+                                     dst->dtype)) {
     return false;
   }
   if (!have_same_region_shape(src_range, dst_range)) {
@@ -762,10 +746,13 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
   } else if (CheckTMemStore(target)) {
     return CopyInst::kTMemStore;
   } else if (TargetIsSunmmio(target)) {
-    if (CheckSunmmioDMACopy(target)) {
-      return CopyInst::kSunmmioDMACopy;
-    } else if (CheckSunmmioTileCopy(target)) {
+    // Prefer tile loops for RSRAM -> RSRAM. Local DMA may also support a
+    // same-dtype transfer, but tile lowering preserves the existing cast and
+    // region-view behavior.
+    if (CheckSunmmioTileCopy(target)) {
       return CopyInst::kSunmmioTileCopy;
+    } else if (CheckSunmmioDMACopy(target)) {
+      return CopyInst::kSunmmioDMACopy;
     }
     ICHECK(0) << "Unsupported copy from " << src.scope() << " to "
               << dst.scope() << " of Sunmmio target.";
@@ -844,8 +831,46 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   // FIXME: a DRAM<->RSRAM copy should always have both layouts assigned
   if (!src_layout.defined() || !dst_layout.defined())
     return dma(src_region, dst_region);
-  if (IsLayoutMatch(src_layout, dst_layout, analyzer))
+
+  auto make_covered_full_rank1_range =
+      [&](const Buffer &buffer, const Layout &layout,
+          const Array<Range> &ranges) -> Optional<Array<Range>> {
+    if (buffer->shape.size() != 1 || ranges.size() != 1)
+      return Optional<Array<Range>>();
+    const auto *cute = layout.as<CuteLayoutNode>();
+    if (!cute)
+      return Optional<Array<Range>>();
+    Array<PrimExpr> covered_shape = cute->GetCoveredShape();
+    if (covered_shape.size() != 1)
+      return Optional<Array<Range>>();
+    const Range &range = ranges[0];
+    if (!analyzer->CanProveEqual(range->min, make_zero(range->min.dtype())) ||
+        !analyzer->CanProveEqual(range->extent, buffer->shape[0])) {
+      return Optional<Array<Range>>();
+    }
+    if (analyzer->CanProveEqual(covered_shape[0], range->extent))
+      return Optional<Array<Range>>();
+    Array<Range> covered_ranges;
+    covered_ranges.push_back(
+        Range::FromMinExtent(range->min, covered_shape[0]));
+    return covered_ranges;
+  };
+
+  if (IsLayoutMatch(src_layout, dst_layout, analyzer)) {
+    Optional<Array<Range>> covered_src_range =
+        make_covered_full_rank1_range(src, src_layout, src_range);
+    Optional<Array<Range>> covered_dst_range =
+        make_covered_full_rank1_range(dst, dst_layout, dst_range);
+    if (covered_src_range.defined() && covered_dst_range.defined() &&
+        analyzer->CanProveEqual(covered_src_range.value()[0]->extent,
+                                covered_dst_range.value()[0]->extent)) {
+      return dma(MakeRegionExpr(src, covered_src_range.value(),
+                                /*access_mask=*/1),
+                 MakeRegionExpr(dst, covered_dst_range.value(),
+                                /*access_mask=*/2));
+    }
     return dma(src_region, dst_region);
+  }
 
   // Layout doesn't match but we still have the chance to lower if we can
   // perform layout transform
@@ -859,17 +884,17 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   // Stage through an RSRAM buffer shaped like the RSRAM region so the transform
   // leg is rank-matched; the DMA leg carries the DRAM region.
   Array<PrimExpr> stage_shape;
-  Array<Range> stage_range;
-  for (const Range &r : rsram_range) {
+  Array<Range> stage_range = MakeCompactRegion(rsram_range);
+  for (const Range &r : stage_range) {
     stage_shape.push_back(r->extent);
-    stage_range.push_back(Range::FromMinExtent(0, r->extent));
   }
   Buffer stage = decl_buffer(stage_shape, dram->dtype,
                              dram->name + "_layout_stage", kSunmmioScopeRSRAM);
   // Staging mirrors the DRAM layout kind (so its dma leg is plain); register it
   // so it isn't taken for the default aligned RSRAM layout.
-  auto stage_layout = DeriveLayoutLike(dram_layout, stage_shape,
-                                       Optional<Array<Integer>>(), analyzer);
+  Optional<Layout> stage_layout =
+      DeriveLayoutLikeForDType(dram_layout, stage_shape, dram->dtype,
+                               Optional<Array<Integer>>(), analyzer);
   ICHECK(T.RegisterScratchBuffer && stage_layout.defined())
       << "sunmmio layout transform: cannot build the staging layout.";
   // stage_layout is the DRAM layout re-derived onto the copied region's shape.
@@ -880,6 +905,57 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   // identity, so emit a plain DMA and skip the staging buffer entirely.
   if (IsLayoutMatch(stage_layout.value(), rsram_layout, analyzer))
     return dma(src_region, dst_region);
+
+  auto is_mx_row_major_layout = [&](const Layout &layout,
+                                    DataType dtype) -> bool {
+    return layout.defined() && sunmmio::IsMXDType(dtype) &&
+           IsSameLayout(layout,
+                        sunmmio::MakeMXRowMajor(layout->InputShape(), dtype),
+                        analyzer);
+  };
+  auto find_mx_axes_with_levels =
+      [](const Layout &layout,
+         int expected_levels) -> Optional<Array<Integer>> {
+    const auto *cute = layout.as<CuteLayoutNode>();
+    if (!cute)
+      return Optional<Array<Integer>>();
+    Array<Integer> axes;
+    Array<Integer> dim_levels = cute->GetDimLevels();
+    for (int d = 0; d < static_cast<int>(dim_levels.size()); ++d) {
+      int levels = dim_levels[d].IntValue();
+      if (levels == 1)
+        continue;
+      if (levels != expected_levels)
+        return Optional<Array<Integer>>();
+      axes.push_back(Integer(d));
+    }
+    if (axes.size() != 2)
+      return Optional<Array<Integer>>();
+    return axes;
+  };
+  auto is_mxzz_layout = [&](const Layout &layout, DataType dtype) -> bool {
+    if (!layout.defined() || !sunmmio::IsMXDType(dtype))
+      return false;
+    Optional<Array<Integer>> axes =
+        find_mx_axes_with_levels(layout, /*expected_levels=*/2);
+    return axes.defined() &&
+           IsSameLayout(
+               layout,
+               sunmmio::MakeMXZZ(layout->InputShape(), axes.value(), dtype),
+               analyzer);
+  };
+
+  if (sunmmio::IsMXDType(dram->dtype)) {
+    bool stage_row_major =
+        is_mx_row_major_layout(stage_layout.value(), dram->dtype);
+    bool stage_mxzz = is_mxzz_layout(stage_layout.value(), dram->dtype);
+    bool rsram_row_major = is_mx_row_major_layout(rsram_layout, rsram->dtype);
+    bool rsram_mxzz = is_mxzz_layout(rsram_layout, rsram->dtype);
+    ICHECK((stage_row_major && rsram_mxzz) || (stage_mxzz && rsram_row_major))
+        << "sunmmio layout transform for MX only supports MX row-major <-> "
+           "MXZZ; unsupported layout pair for buffer "
+        << dram->name << ".";
+  }
   T.RegisterScratchBuffer(stage, stage_layout.value());
 
   // Pad/unpad transforms walk one tile-register row per leading index, so when
@@ -896,15 +972,22 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
       both_row_major = false;
       break;
     }
-    bool plain = IsLayoutMatch(
-        layout, sunmmio::MakeRowMajor(layout->InputShape()), analyzer);
+    bool mx_row_major =
+        sunmmio::IsMXDType(dtype) &&
+        IsLayoutMatch(layout,
+                      sunmmio::MakeMXRowMajor(layout->InputShape(), dtype),
+                      analyzer);
+    bool plain =
+        !mx_row_major &&
+        IsLayoutMatch(layout, sunmmio::MakeRowMajor(layout->InputShape()),
+                      analyzer);
     bool padded =
-        !plain &&
+        !plain && !mx_row_major &&
         IsLayoutMatch(layout,
                       sunmmio::MakeAlignedRowMajor(layout->InputShape(), dtype,
                                                    config.rsram_align_bytes),
                       analyzer);
-    if (!plain && !padded) {
+    if (!plain && !padded && !mx_row_major) {
       both_row_major = false;
       break;
     }

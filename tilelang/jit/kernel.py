@@ -21,9 +21,12 @@ from tilelang.jit.adapter import (
     CuTeDSLKernelAdapter,
     TVMFFIKernelAdapter,
     MetalKernelAdapter,
+    SunmmioKernelSuDeckAdapter,
+    SunmmioSunsimKernelAdapter,
 )
 from tilelang.profiler import Profiler, TensorSupplyType
 from tilelang.utils.target import determine_target
+from tilelang.utils.target import target_is_sunmmio
 from tilelang.contrib import nvcc as tl_nvcc
 from tilelang.transform import PassConfigKey
 import logging
@@ -63,7 +66,7 @@ class JITKernel(Generic[_P, _T]):
         self,
         func: PrimFunc = None,
         out_idx: list[int] | int = None,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] = "tvm_ffi",
+        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "sunmmio", "sunmmio_sunsim"] = "tvm_ffi",
         target: str | Target = "auto",
         target_host: str | Target = None,
         verbose: bool = False,
@@ -80,7 +83,7 @@ class JITKernel(Generic[_P, _T]):
             The TileLang TIR function to compile and wrap.
         out_idx : Union[List[int], int], optional
             Index(es) of the output tensors to return (default: None).
-        execution_backend : Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
+        execution_backend : Literal["tvm_ffi", "cython", "nvrtc", "torch", "cutedsl", "sunmmio"], optional
             Execution backend to use for kernel execution.
         target : Union[str, Target], optional
             Compilation target, either as a string or a TVM Target object (default: "auto").
@@ -115,6 +118,8 @@ class JITKernel(Generic[_P, _T]):
             "nvrtc",
             "torch",
             "cutedsl",
+            "sunmmio",
+            "sunmmio_sunsim",
         ], f"Invalid execution backend. {execution_backend}"
         if execution_backend == "cython":
             from tilelang.contrib.cc import get_cplus_compiler
@@ -156,7 +161,15 @@ class JITKernel(Generic[_P, _T]):
         target: str | Target,
         target_host: str | Target,
         out_idx: list[int] | int,
-        execution_backend: Literal["tvm_ffi", "cython", "nvrtc", "torch"],
+        execution_backend: Literal[
+            "tvm_ffi",
+            "cython",
+            "nvrtc",
+            "torch",
+            "cutedsl",
+            "sunmmio",
+            "sunmmio_sunsim",
+        ],
         pass_configs: dict[str, Any] | None = None,
         compile_flags: list[str] | None = None,
     ):
@@ -322,6 +335,19 @@ class JITKernel(Generic[_P, _T]):
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
             )
+        elif execution_backend in ("sunmmio", "sunmmio_sunsim"):
+            assert target_is_sunmmio(target)
+            adapter_cls = SunmmioSunsimKernelAdapter if execution_backend == "sunmmio_sunsim" else SunmmioKernelSuDeckAdapter
+            adapter = adapter_cls(
+                params=artifact.params,
+                result_idx=out_idx,
+                target=target,
+                func_or_mod=tilelang_func,
+                host_mod=artifact.host_mod,
+                device_mod=artifact.device_mod,
+                device_kernel_source=artifact.kernel_source,
+                verbose=verbose,
+            )
         else:
             # Handle invalid backend.
             raise ValueError(f"Invalid execution backend: {execution_backend}")
@@ -393,6 +419,17 @@ class JITKernel(Generic[_P, _T]):
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
             )
+        elif execution_backend in ("sunmmio", "sunmmio_sunsim"):
+            adapter_cls = SunmmioSunsimKernelAdapter if execution_backend == "sunmmio_sunsim" else SunmmioKernelSuDeckAdapter
+            adapter = adapter_cls.from_database(
+                params=params,
+                result_idx=result_idx,
+                target=target,
+                func_or_mod=func_or_mod,
+                host_kernel_source=host_kernel_source,
+                device_kernel_source=device_kernel_source,
+                kernel_lib_path=kernel_lib_path,
+            )
         else:
             # Handle invalid backend.
             raise ValueError(f"Invalid execution backend: {execution_backend}")
@@ -443,7 +480,7 @@ class JITKernel(Generic[_P, _T]):
         str
             The source code of the compiled kernel function.
         """
-        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl"}:
+        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl", "sunmmio", "sunmmio_sunsim"}:
             return self.adapter.get_kernel_source(kernel_only=kernel_only)
         return self.artifact.kernel_source
 
@@ -451,7 +488,7 @@ class JITKernel(Generic[_P, _T]):
         """
         Returns the source code of the host function.
         """
-        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl"}:
+        if self.execution_backend in {"cython", "nvrtc", "tvm_ffi", "cutedsl", "sunmmio", "sunmmio_sunsim"}:
             return self.adapter.get_host_source()
         assert self.artifact.host_mod is not None, "host_mod is not available"
         return str(self.artifact.host_mod)
@@ -614,7 +651,7 @@ class JITKernel(Generic[_P, _T]):
 
     @property
     def kernel_source(self) -> str:
-        return self.artifact.kernel_source if self.artifact else self.adapter.kernel_global_source
+        return self.artifact.kernel_source if self.artifact else self.adapter.get_kernel_source()
 
     @property
     def host_source(self) -> str:

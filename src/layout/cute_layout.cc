@@ -865,6 +865,80 @@ std::optional<ZZBlockShape> GetZZBlockShape(const Layout &layout) {
 
 static PrimExpr makeInt(int64_t v) { return make_const(DataType::Int(32), v); }
 
+constexpr int kMXFP8CustomTypeCode = DataType::kCustomBegin;
+constexpr int kMXFP4CustomTypeCode = DataType::kCustomBegin + 1;
+
+bool IsMXFP8DType(DataType dtype) {
+  return dtype.code() == kMXFP8CustomTypeCode && dtype.bits() == 8 &&
+         dtype.lanes() == 1;
+}
+
+bool IsMXFP4DType(DataType dtype) {
+  return dtype.code() == kMXFP4CustomTypeCode && dtype.bits() == 4 &&
+         dtype.lanes() == 1;
+}
+
+bool IsMXDType(DataType dtype) {
+  return IsMXFP8DType(dtype) || IsMXFP4DType(dtype);
+}
+
+int64_t MXDataBits(DataType dtype) {
+  if (IsMXFP8DType(dtype))
+    return 8;
+  if (IsMXFP4DType(dtype))
+    return 4;
+  LOG(FATAL) << "Expected SUVM MX dtype, got " << dtype;
+  return 0;
+}
+
+int64_t MXBlockStorageElems(DataType dtype) {
+  constexpr int64_t kBlockElems = 32 * 32;
+  constexpr int64_t kBlockPrefixBytes = 256;
+  int64_t data_bits = MXDataBits(dtype);
+  int64_t data_bytes = (kBlockElems * data_bits + 7) / 8;
+  int64_t block_bytes = kBlockPrefixBytes + data_bytes;
+  ICHECK_EQ((block_bytes * 8) % data_bits, 0);
+  return block_bytes * 8 / data_bits;
+}
+
+int64_t MXPackSize(DataType dtype) {
+  if (IsMXFP8DType(dtype))
+    return 2;
+  if (IsMXFP4DType(dtype))
+    return 2;
+  LOG(FATAL) << "Expected SUVM MX dtype, got " << dtype;
+  return 0;
+}
+
+PrimExpr AlignBytes(PrimExpr bytes, int64_t align) {
+  return ceildiv(bytes, makeInt(align)) * makeInt(align);
+}
+
+PrimExpr AlignMXOperandBlocks(PrimExpr blocks) {
+  constexpr int64_t kMXOperandBlockAlign = 2;
+  return ceildiv(blocks, makeInt(kMXOperandBlockAlign)) *
+         makeInt(kMXOperandBlockAlign);
+}
+
+PrimExpr ExactDivStaticOrSymbolic(PrimExpr value, int64_t divisor,
+                                  const char *layout_name,
+                                  const char *axis_name) {
+  if (const auto *imm = value.as<IntImmNode>()) {
+    ICHECK_EQ(imm->value % divisor, 0)
+        << layout_name << " requires " << axis_name << " extent " << value
+        << " to be divisible by " << divisor;
+    return makeInt(imm->value / divisor);
+  }
+  return FloorDiv(value, makeInt(divisor));
+}
+
+bool StaticDivisibleOrSymbolic(PrimExpr value, int64_t divisor) {
+  if (const auto *imm = value.as<IntImmNode>()) {
+    return imm->value % divisor == 0;
+  }
+  return true;
+}
+
 Layout MakeRowMajor(Array<PrimExpr> shape) {
   Array<PrimExpr> mode_shape;
   Array<PrimExpr> mode_stride;
@@ -987,8 +1061,10 @@ static cute::CuteAlgebraLayout buildTiler(int rank, int ax0, int ax1,
  * \param level_col_major  Per-level col-major flag, indexed from innermost
  *                         (level 0) to outermost.  Length equals the number
  *                         of levels in tiled dims.
- *                         false (Z/row-major): ax1 first, ax0 second.
- *                         true  (N/col-major): ax0 first, ax1 second.
+ *                         false (Z/row-major): higher-numbered tensor
+ *                         dimensions first (innermost).
+ *                         true  (N/col-major): lower-numbered tensor
+ *                         dimensions first (innermost).
  */
 static Layout toCuteLayout(const std::vector<std::vector<PrimExpr>> &dim_modes,
                            Array<PrimExpr> shape, int ax0, int ax1,
@@ -1007,23 +1083,23 @@ static Layout toCuteLayout(const std::vector<std::vector<PrimExpr>> &dim_modes,
   };
   std::vector<ModeRef> order;
 
-  // Tiled modes by level.
+  // Build the order level by level, matching sutensor-proto's HStride
+  // construction. Tiled dimensions contribute one mode at every level;
+  // non-tiled (scalar) dimensions contribute their sole mode at the outermost
+  // level, interleaved with the tiled outer modes by tensor-dimension order.
   for (size_t lv = 0; lv < tiled_levels; ++lv) {
-    if (level_col_major[lv]) {
-      // N (col-major): ax0 innermost.
-      order.push_back({ax0, lv});
-      order.push_back({ax1, lv});
-    } else {
-      // Z (row-major): ax1 innermost.
-      order.push_back({ax1, lv});
-      order.push_back({ax0, lv});
-    }
-  }
+    const bool col_major = level_col_major[lv];
+    const int d_start = col_major ? 0 : rank - 1;
+    const int d_end = col_major ? rank : -1;
+    const int d_step = col_major ? 1 : -1;
 
-  // Non-tiled dims: row-major (rightmost dim is innermost).
-  for (int d = rank - 1; d >= 0; --d) {
-    if (d != ax0 && d != ax1)
-      order.push_back({d, 0});
+    for (int d = d_start; d != d_end; d += d_step) {
+      if (d == ax0 || d == ax1) {
+        order.push_back({d, lv});
+      } else if (lv == tiled_levels - 1) {
+        order.push_back({d, 0});
+      }
+    }
   }
 
   // Compute contiguous strides from ordering.
@@ -1206,7 +1282,364 @@ Layout MakeNZZ(Array<PrimExpr> shape, Array<Integer> axes,
   return toCuteLayout(dim_modes, shape, ax0, ax1, {false, false, true});
 }
 
+Layout MakeMXZZ(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype) {
+  ICHECK_EQ(axes.size(), 2) << "MakeMXZZ requires exactly 2 axes";
+  ICHECK(IsMXDType(dtype)) << "MakeMXZZ expects mxfp8 or mxfp4, got " << dtype;
+  int rank = shape.size();
+  int ax0 = axes[0].IntValue(), ax1 = axes[1].IntValue();
+  ICHECK_GE(ax0, 0);
+  ICHECK_LT(ax0, rank);
+  ICHECK_GE(ax1, 0);
+  ICHECK_LT(ax1, rank);
+  ICHECK_NE(ax0, ax1);
+
+  constexpr int64_t kBlockH = 32;
+  constexpr int64_t kBlockW = 32;
+  int64_t block_storage_elems = MXBlockStorageElems(dtype);
+  PrimExpr block_m = ceildiv(shape[ax0], makeInt(kBlockH));
+  PrimExpr block_n = ceildiv(shape[ax1], makeInt(kBlockW));
+  PrimExpr matrix_storage_elems =
+      makeInt(block_storage_elems) * block_m * block_n;
+
+  std::vector<std::vector<PrimExpr>> dim_shapes(rank);
+  std::vector<std::vector<PrimExpr>> dim_strides(rank);
+  for (int d = 0; d < rank; ++d) {
+    if (d == ax0) {
+      dim_shapes[d] = {makeInt(kBlockH), block_m};
+      dim_strides[d] = {makeInt(kBlockW),
+                        makeInt(block_storage_elems) * block_n};
+    } else if (d == ax1) {
+      dim_shapes[d] = {makeInt(kBlockW), block_n};
+      dim_strides[d] = {makeInt(1), makeInt(block_storage_elems)};
+    } else {
+      dim_shapes[d] = {shape[d]};
+    }
+  }
+
+  PrimExpr running = matrix_storage_elems;
+  for (int d = rank - 1; d >= 0; --d) {
+    if (d == ax0 || d == ax1)
+      continue;
+    dim_strides[d] = {running};
+    running = running * shape[d];
+  }
+
+  Array<PrimExpr> mode_shape;
+  Array<PrimExpr> mode_stride;
+  Array<Integer> dim_levels;
+  for (int d = 0; d < rank; ++d) {
+    ICHECK_EQ(dim_shapes[d].size(), dim_strides[d].size());
+    for (size_t lv = 0; lv < dim_shapes[d].size(); ++lv) {
+      mode_shape.push_back(dim_shapes[d][lv]);
+      mode_stride.push_back(dim_strides[d][lv]);
+    }
+    dim_levels.push_back(Integer(dim_shapes[d].size()));
+  }
+  return CuteLayout(shape, mode_shape, mode_stride, dim_levels);
+}
+
+Layout MakeMXZNN(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype) {
+  ICHECK_EQ(axes.size(), 2) << "MakeMXZNN requires exactly 2 axes";
+  ICHECK(IsMXDType(dtype)) << "MakeMXZNN expects mxfp8 or mxfp4, got " << dtype;
+  int rank = shape.size();
+  int ax0 = axes[0].IntValue(), ax1 = axes[1].IntValue();
+  ICHECK_GE(ax0, 0);
+  ICHECK_LT(ax0, rank);
+  ICHECK_GE(ax1, 0);
+  ICHECK_LT(ax1, rank);
+  ICHECK_NE(ax0, ax1);
+
+  constexpr int64_t kBlockH = 32;
+  constexpr int64_t kBlockW = 32;
+  int64_t pack_size = MXPackSize(dtype);
+  int64_t block_storage_elems = MXBlockStorageElems(dtype);
+  PrimExpr group_m = ExactDivStaticOrSymbolic(shape[ax0], kBlockH * pack_size,
+                                              "MakeMXZNN", "K/M");
+  PrimExpr group_n =
+      ExactDivStaticOrSymbolic(shape[ax1], kBlockW, "MakeMXZNN", "N");
+  PrimExpr block_group_elems = makeInt(block_storage_elems * pack_size);
+  PrimExpr matrix_storage_elems = block_group_elems * group_m * group_n;
+
+  std::vector<std::vector<PrimExpr>> dim_shapes(rank);
+  std::vector<std::vector<PrimExpr>> dim_strides(rank);
+  for (int d = 0; d < rank; ++d) {
+    if (d == ax0) {
+      dim_shapes[d] = {makeInt(kBlockH), makeInt(pack_size), group_m};
+      dim_strides[d] = {makeInt(1), makeInt(block_storage_elems),
+                        block_group_elems * group_n};
+    } else if (d == ax1) {
+      dim_shapes[d] = {makeInt(kBlockW), makeInt(1), group_n};
+      dim_strides[d] = {makeInt(kBlockH), block_group_elems, block_group_elems};
+    } else {
+      dim_shapes[d] = {shape[d]};
+    }
+  }
+
+  PrimExpr running = matrix_storage_elems;
+  for (int d = rank - 1; d >= 0; --d) {
+    if (d == ax0 || d == ax1)
+      continue;
+    dim_strides[d] = {running};
+    running = running * shape[d];
+  }
+
+  Array<PrimExpr> mode_shape;
+  Array<PrimExpr> mode_stride;
+  Array<Integer> dim_levels;
+  for (int d = 0; d < rank; ++d) {
+    ICHECK_EQ(dim_shapes[d].size(), dim_strides[d].size());
+    for (size_t lv = 0; lv < dim_shapes[d].size(); ++lv) {
+      mode_shape.push_back(dim_shapes[d][lv]);
+      mode_stride.push_back(dim_strides[d][lv]);
+    }
+    dim_levels.push_back(Integer(dim_shapes[d].size()));
+  }
+  return CuteLayout(shape, mode_shape, mode_stride, dim_levels);
+}
+
+Layout MakeMXZNZ(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype) {
+  ICHECK_EQ(axes.size(), 2) << "MakeMXZNZ requires exactly 2 axes";
+  ICHECK(IsMXDType(dtype)) << "MakeMXZNZ expects mxfp8 or mxfp4, got " << dtype;
+  int rank = shape.size();
+  int ax0 = axes[0].IntValue(), ax1 = axes[1].IntValue();
+  ICHECK_GE(ax0, 0);
+  ICHECK_LT(ax0, rank);
+  ICHECK_GE(ax1, 0);
+  ICHECK_LT(ax1, rank);
+  ICHECK_NE(ax0, ax1);
+
+  constexpr int64_t kBlockH = 32;
+  constexpr int64_t kBlockW = 32;
+  int64_t pack_size = MXPackSize(dtype);
+  int64_t block_storage_elems = MXBlockStorageElems(dtype);
+  PrimExpr group_m = ExactDivStaticOrSymbolic(shape[ax0], kBlockH * pack_size,
+                                              "MakeMXZNZ", "K/M");
+  PrimExpr group_n =
+      ExactDivStaticOrSymbolic(shape[ax1], kBlockW, "MakeMXZNZ", "N");
+  PrimExpr block_group_elems = makeInt(block_storage_elems * pack_size);
+  PrimExpr matrix_storage_elems = block_group_elems * group_m * group_n;
+
+  std::vector<std::vector<PrimExpr>> dim_shapes(rank);
+  std::vector<std::vector<PrimExpr>> dim_strides(rank);
+  for (int d = 0; d < rank; ++d) {
+    if (d == ax0) {
+      dim_shapes[d] = {makeInt(kBlockH), makeInt(pack_size), group_m};
+      dim_strides[d] = {makeInt(kBlockW), makeInt(block_storage_elems),
+                        block_group_elems * group_n};
+    } else if (d == ax1) {
+      dim_shapes[d] = {makeInt(kBlockW), makeInt(1), group_n};
+      dim_strides[d] = {makeInt(1), block_group_elems, block_group_elems};
+    } else {
+      dim_shapes[d] = {shape[d]};
+    }
+  }
+
+  PrimExpr running = matrix_storage_elems;
+  for (int d = rank - 1; d >= 0; --d) {
+    if (d == ax0 || d == ax1)
+      continue;
+    dim_strides[d] = {running};
+    running = running * shape[d];
+  }
+
+  Array<PrimExpr> mode_shape;
+  Array<PrimExpr> mode_stride;
+  Array<Integer> dim_levels;
+  for (int d = 0; d < rank; ++d) {
+    ICHECK_EQ(dim_shapes[d].size(), dim_strides[d].size());
+    for (size_t lv = 0; lv < dim_shapes[d].size(); ++lv) {
+      mode_shape.push_back(dim_shapes[d][lv]);
+      mode_stride.push_back(dim_strides[d][lv]);
+    }
+    dim_levels.push_back(Integer(dim_shapes[d].size()));
+  }
+  return CuteLayout(shape, mode_shape, mode_stride, dim_levels);
+}
+
+Layout MakeMXRowMajor(Array<PrimExpr> shape, DataType dtype) {
+  ICHECK(IsMXDType(dtype)) << "MakeMXRowMajor expects mxfp8 or mxfp4, got "
+                           << dtype;
+  int rank = shape.size();
+  ICHECK_GE(rank, 2) << "MakeMXRowMajor requires rank >= 2.";
+
+  int64_t data_bits = MXDataBits(dtype);
+  PrimExpr n = shape[rank - 1];
+  PrimExpr data_bytes = ceildiv(n * makeInt(data_bits), makeInt(8));
+  PrimExpr scale_bytes = ceildiv(n, makeInt(32));
+  PrimExpr row_bytes = AlignBytes(data_bytes, 64) + AlignBytes(scale_bytes, 64);
+  PrimExpr row_elems = row_bytes * makeInt(8 / data_bits);
+
+  Array<PrimExpr> mode_shape;
+  Array<PrimExpr> mode_stride;
+  Array<Integer> dim_levels;
+  for (int d = 0; d < rank; ++d) {
+    mode_shape.push_back(shape[d]);
+    dim_levels.push_back(Integer(1));
+  }
+
+  std::vector<PrimExpr> strides(rank);
+  strides[rank - 1] = makeInt(1);
+  strides[rank - 2] = row_elems;
+  PrimExpr running = row_elems * shape[rank - 2];
+  for (int d = rank - 3; d >= 0; --d) {
+    strides[d] = running;
+    running = running * shape[d];
+  }
+  for (int d = 0; d < rank; ++d) {
+    mode_stride.push_back(strides[d]);
+  }
+
+  return CuteLayout(shape, mode_shape, mode_stride, dim_levels);
+}
+
+std::optional<MXLayoutAnalysis> AnalyzeMXLayout(const Layout &layout,
+                                                DataType dtype,
+                                                arith::Analyzer *analyzer) {
+  ICHECK(IsMXDType(dtype)) << "AnalyzeMXLayout expects mxfp8 or mxfp4, got "
+                           << dtype;
+  auto *cute = layout.as<CuteLayoutNode>();
+  if (!cute) {
+    return std::nullopt;
+  }
+
+  arith::Analyzer local_analyzer;
+  arith::Analyzer *ana = analyzer ? analyzer : &local_analyzer;
+
+  Array<PrimExpr> logical_shape = cute->GetLogicalShape();
+  if (logical_shape.size() != 2) {
+    return std::nullopt;
+  }
+
+  auto make_result = [&](MXLayoutKind kind,
+                         Array<PrimExpr> scale_shape) -> MXLayoutAnalysis {
+    return MXLayoutAnalysis{kind, logical_shape, cute->GetCoveredShape(),
+                            scale_shape};
+  };
+
+  if (IsSameLayout(layout, MakeMXRowMajor(logical_shape, dtype), ana)) {
+    PrimExpr n = logical_shape[1];
+    PrimExpr rem = ana->Simplify(FloorMod(n, makeInt(32)));
+    ICHECK(ana->CanProveEqual(rem, makeInt(0)))
+        << "MX row-major layout requires N to be divisible by 32, got N=" << n;
+    return make_result(MXLayoutKind::kRowMajor,
+                       Array<PrimExpr>{logical_shape[0], n / makeInt(32)});
+  }
+
+  Array<Integer> axes{Integer(0), Integer(1)};
+  if (IsSameLayout(layout, MakeMXZZ(logical_shape, axes, dtype), ana)) {
+    PrimExpr blocks_m = ceildiv(logical_shape[0], makeInt(32));
+    PrimExpr blocks_n = ceildiv(logical_shape[1], makeInt(32));
+    return make_result(MXLayoutKind::kMXZZ,
+                       Array<PrimExpr>{blocks_m * blocks_n, makeInt(32)});
+  }
+
+  int64_t pack_size = MXPackSize(dtype);
+  bool can_build_mxzn_layout =
+      StaticDivisibleOrSymbolic(logical_shape[0], 32 * pack_size) &&
+      StaticDivisibleOrSymbolic(logical_shape[1], 32);
+  if (can_build_mxzn_layout) {
+    if (IsSameLayout(layout, MakeMXZNN(logical_shape, axes, dtype), ana)) {
+      PrimExpr blocks_m = logical_shape[0] / makeInt(32);
+      PrimExpr blocks_n = logical_shape[1] / makeInt(32);
+      return make_result(MXLayoutKind::kMXZNN,
+                         Array<PrimExpr>{blocks_m * blocks_n, makeInt(32)});
+    }
+
+    if (IsSameLayout(layout, MakeMXZNZ(logical_shape, axes, dtype), ana)) {
+      PrimExpr blocks_m = logical_shape[0] / makeInt(32);
+      PrimExpr blocks_n = logical_shape[1] / makeInt(32);
+      return make_result(MXLayoutKind::kMXZNZ,
+                         Array<PrimExpr>{blocks_m * blocks_n, makeInt(32)});
+    }
+  }
+
+  return std::nullopt;
+}
+
+Optional<Layout> DeriveMXLayoutLike(const Layout &src,
+                                    Array<PrimExpr> dst_shape, DataType dtype,
+                                    arith::Analyzer *analyzer) {
+  ICHECK(IsMXDType(dtype)) << "DeriveMXLayoutLike expects mxfp8 or mxfp4, got "
+                           << dtype;
+  auto *src_cute = src.as<CuteLayoutNode>();
+  if (!src_cute) {
+    return Optional<Layout>();
+  }
+
+  Array<PrimExpr> src_shape = src_cute->GetLogicalShape();
+  int rank = static_cast<int>(src_shape.size());
+  if (rank < 2 || static_cast<int>(dst_shape.size()) != rank) {
+    return Optional<Layout>();
+  }
+
+  if (IsSameLayout(src, MakeMXRowMajor(src_shape, dtype), analyzer)) {
+    return Optional<Layout>(MakeMXRowMajor(dst_shape, dtype));
+  }
+
+  auto find_axes_with_levels =
+      [&](int expected_levels) -> std::optional<Array<Integer>> {
+    Array<Integer> axes;
+    Array<Integer> dim_levels = src_cute->GetDimLevels();
+    for (int d = 0; d < rank; ++d) {
+      int levels = dim_levels[d].IntValue();
+      if (levels == 1) {
+        continue;
+      }
+      if (levels != expected_levels) {
+        return std::nullopt;
+      }
+      axes.push_back(Integer(d));
+    }
+    if (axes.size() != 2) {
+      return std::nullopt;
+    }
+    return axes;
+  };
+
+  if (auto axes = find_axes_with_levels(/*expected_levels=*/2)) {
+    if (IsSameLayout(src, MakeMXZZ(src_shape, *axes, dtype), analyzer)) {
+      return Optional<Layout>(MakeMXZZ(dst_shape, *axes, dtype));
+    }
+  }
+
+  if (auto axes = find_axes_with_levels(/*expected_levels=*/3)) {
+    int ax0 = (*axes)[0].IntValue();
+    int ax1 = (*axes)[1].IntValue();
+    int64_t pack_size = MXPackSize(dtype);
+    bool can_build_src =
+        StaticDivisibleOrSymbolic(src_shape[ax0], 32 * pack_size) &&
+        StaticDivisibleOrSymbolic(src_shape[ax1], 32);
+    bool can_build_dst =
+        StaticDivisibleOrSymbolic(dst_shape[ax0], 32 * pack_size) &&
+        StaticDivisibleOrSymbolic(dst_shape[ax1], 32);
+    if (can_build_src && can_build_dst) {
+      if (IsSameLayout(src, MakeMXZNN(src_shape, *axes, dtype), analyzer)) {
+        return Optional<Layout>(MakeMXZNN(dst_shape, *axes, dtype));
+      }
+      if (IsSameLayout(src, MakeMXZNZ(src_shape, *axes, dtype), analyzer)) {
+        return Optional<Layout>(MakeMXZNZ(dst_shape, *axes, dtype));
+      }
+    }
+  }
+
+  return Optional<Layout>();
+}
+
 } // namespace sunmmio
+
+Optional<Layout> DeriveLayoutLikeForDType(const Layout &src,
+                                          Array<PrimExpr> dst_shape,
+                                          DataType dtype,
+                                          Optional<Array<Integer>> axis_map,
+                                          arith::Analyzer *analyzer) {
+  if (sunmmio::IsMXDType(dtype)) {
+    ICHECK(!axis_map.defined() || axis_map.value().empty())
+        << "DeriveLayoutLikeForDType does not support axis_map for SUVM MX "
+           "layouts yet.";
+    return sunmmio::DeriveMXLayoutLike(src, dst_shape, dtype, analyzer);
+  }
+  return DeriveLayoutLike(src, dst_shape, axis_map, analyzer);
+}
 
 // ---------------------------------------------------------------------------
 // FFI registration
@@ -1246,6 +1679,11 @@ TVM_FFI_STATIC_INIT_BLOCK() {
               Optional<Array<Integer>> axis_map) {
              return DeriveLayoutLike(src, dst_shape, axis_map);
            })
+      .def("tl.DeriveLayoutLikeForDType",
+           [](Layout src, Array<PrimExpr> dst_shape, DataType dtype,
+              Optional<Array<Integer>> axis_map) {
+             return DeriveLayoutLikeForDType(src, dst_shape, dtype, axis_map);
+           })
       .def("tl.IsLayoutMatch",
            [](Layout lhs, Layout rhs) { return IsLayoutMatch(lhs, rhs); })
       .def("tl.TryCanonicalizeToRowMajor",
@@ -1275,6 +1713,33 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            [](Array<PrimExpr> shape, Array<Integer> axes,
               Array<PrimExpr> block_shape, Array<PrimExpr> cluster_shape) {
              return sunmmio::MakeNZZ(shape, axes, block_shape, cluster_shape);
+           })
+      .def("tl.sunmmio.make_mxzz",
+           [](Array<PrimExpr> shape, Array<Integer> axes, DataType dtype) {
+             return sunmmio::MakeMXZZ(shape, axes, dtype);
+           })
+      .def("tl.sunmmio.make_mxznn",
+           [](Array<PrimExpr> shape, Array<Integer> axes, DataType dtype) {
+             return sunmmio::MakeMXZNN(shape, axes, dtype);
+           })
+      .def("tl.sunmmio.make_mxznz",
+           [](Array<PrimExpr> shape, Array<Integer> axes, DataType dtype) {
+             return sunmmio::MakeMXZNZ(shape, axes, dtype);
+           })
+      .def("tl.sunmmio.make_mx_row_major",
+           [](Array<PrimExpr> shape, DataType dtype) {
+             return sunmmio::MakeMXRowMajor(shape, dtype);
+           })
+      .def("tl.sunmmio.derive_mx_layout_like",
+           [](Layout src, Array<PrimExpr> dst_shape, DataType dtype) {
+             return sunmmio::DeriveMXLayoutLike(src, dst_shape, dtype);
+           })
+      .def("tl.sunmmio.get_mx_scale_shape",
+           [](Layout layout, DataType dtype) {
+             auto analysis = sunmmio::AnalyzeMXLayout(layout, dtype);
+             ICHECK(analysis.has_value())
+                 << "Unsupported MX layout for get_mx_scale_shape";
+             return analysis->scale_shape;
            })
       // CuTe layout algebra FFI
       .def("tl.cute.zipped_product",

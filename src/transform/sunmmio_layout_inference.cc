@@ -312,7 +312,9 @@ void SunmmioLayoutInferencePass::SeedImmutableLayouts(const PrimFunc &f) {
                 /*immutable=*/true);
     } else {
       // No metadata — default to row-major
-      auto row_major = sunmmio::MakeRowMajor(buf->shape);
+      auto row_major = sunmmio::IsMXDType(buf->dtype)
+                           ? sunmmio::MakeMXRowMajor(buf->shape, buf->dtype)
+                           : sunmmio::MakeRowMajor(buf->shape);
       global_layout_map_.Set(buf, row_major);
       TryAssign(buf, row_major, InferLevel::kStrict, -1, /*immutable=*/true);
     }
@@ -341,9 +343,14 @@ void SunmmioLayoutInferencePass::AssignDefaults() {
 
     if (rank >= 2) {
       Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
-      auto block_shape = GetSunmmioLayoutBlockShape(target_, buf->dtype);
-      TryAssign(buf, sunmmio::MakeZZ(buf->shape, axes, block_shape),
-                InferLevel::kFree, -1);
+      if (sunmmio::IsMXDType(buf->dtype)) {
+        TryAssign(buf, sunmmio::MakeMXZZ(buf->shape, axes, buf->dtype),
+                  InferLevel::kFree, -1);
+      } else {
+        auto block_shape = GetSunmmioLayoutBlockShape(target_, buf->dtype);
+        TryAssign(buf, sunmmio::MakeZZ(buf->shape, axes, block_shape),
+                  InferLevel::kFree, -1);
+      }
     } else {
       // rank < 2 is only legal for RSRAM; ASRAM/WSRAM require rank-2 tensors.
       ICHECK(scope == kSunmmioScopeRSRAM)
@@ -467,9 +474,10 @@ void SunmmioLayoutInferencePass::PropagateAliases() {
       if (it != layout_entries_.end() && it->second.level > InferLevel::kFree)
         continue;
 
-      // Try DeriveLayoutLike for shape adaptation
-      auto derived = DeriveLayoutLike(rep_layout, buf->shape,
-                                      Optional<Array<Integer>>(), &analyzer_);
+      // Try dtype-aware layout derivation for shape adaptation.
+      auto derived =
+          DeriveLayoutLikeForDType(rep_layout, buf->shape, buf->dtype,
+                                   Optional<Array<Integer>>(), &analyzer_);
       if (derived.defined()) {
         TryAssign(buf, derived.value(), InferLevel::kCommon, -1);
       } else if (!layout_entries_.count(buf)) {
@@ -601,11 +609,13 @@ bool SunmmioLayoutInferencePass::TryAssign(const Buffer &buffer,
 }
 
 LayoutInferArgs SunmmioLayoutInferencePass::BuildInferArgs() const {
-  // Build current SRAM layout_map from layout_entries_
+  // Build current SRAM layout map together with each entry's provenance.
   LayoutMap current_layout_map;
+  LayoutLevelMap current_layout_levels;
   for (const auto &[buf, entry] : layout_entries_) {
     if (IsSunmmioSramScope(buf.scope())) {
       current_layout_map.Set(buf, entry.layout);
+      current_layout_levels.Set(buf, Integer(static_cast<int>(entry.level)));
     }
   }
 
@@ -618,6 +628,7 @@ LayoutInferArgs SunmmioLayoutInferencePass::BuildInferArgs() const {
       {},                 // buffer_remap
       let_var_to_expr_,   // let var bindings
       global_layout_map_, // DRAM layouts
+      current_layout_levels,
   };
 }
 

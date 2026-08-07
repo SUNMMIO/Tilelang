@@ -24,16 +24,38 @@ bool IsBufferLikeExpr(const PrimExpr &expr) {
 }
 
 BufferRegion NormalizeToBufferRegion(const PrimExpr &arg) {
+  return NormalizeToBufferRegion(arg, RegionExprObserver{});
+}
+
+BufferRegion
+NormalizeToBufferRegion(const PrimExpr &arg,
+                        const RegionExprObserver &observe_consumed_root) {
+  auto observe = [&](const PrimExpr &expr) {
+    if (observe_consumed_root) {
+      observe_consumed_root(expr);
+    }
+  };
+  auto observe_index = [&](const PrimExpr &index) {
+    observe(index);
+    if (const auto *ramp = index.as<RampNode>()) {
+      observe(ramp->stride);
+      observe(ramp->lanes);
+    }
+  };
+
   // Case 1: Already a BufferRegion
   if (arg->IsInstance<BufferRegionNode>()) {
+    observe(arg);
     return Downcast<BufferRegion>(arg);
   }
 
   // Case 2: BufferLoad — convert indices to ranges (Ramp -> lanes, else
   // extent=1)
   if (const auto *load = arg.as<BufferLoadNode>()) {
+    observe(arg);
     Array<Range> ranges;
     for (const PrimExpr &index : load->indices) {
+      observe_index(index);
       if (const auto *ramp = index.as<RampNode>()) {
         ICHECK(ramp->stride.as<IntImmNode>()) << "Ramp stride must be IntImm";
         ICHECK_EQ(ramp->stride.as<IntImmNode>()->value, 1)
@@ -51,6 +73,17 @@ BufferRegion NormalizeToBufferRegion(const PrimExpr &arg) {
   // Case 3: tl.region(...) — reconstruct via RegionOp (bridge)
   if (const auto *call = arg.as<CallNode>()) {
     if (call->op.same_as(RegionOp::Get())) {
+      observe(arg);
+      for (const PrimExpr &call_arg : call->args) {
+        observe(call_arg);
+      }
+      if (!call->args.empty()) {
+        if (const auto *load = call->args[0].as<BufferLoadNode>()) {
+          for (const PrimExpr &index : load->indices) {
+            observe_index(index);
+          }
+        }
+      }
       RegionOp region(call->args);
       return BufferRegion(region->GetBuffer(), region->GetRanges());
     }
@@ -102,6 +135,36 @@ PrimExpr MakeRegionExpr(const Buffer &buffer, const Array<Range> &ranges,
     args.push_back(r->extent);
   }
   return Call(DataType::Handle(), RegionOp::Get(), args);
+}
+
+Array<Range> MakeCompactRegion(const Array<Range> &region) {
+  Array<Range> compact;
+  compact.reserve(region.size());
+  for (const Range &range : region) {
+    compact.push_back(Range::FromMinExtent(0, range->extent));
+  }
+  return compact;
+}
+
+Buffer MakeCompactBufferLike(const Buffer &prototype,
+                             const Array<Range> &region,
+                             const ffi::String &scope,
+                             const ffi::String &name) {
+  const auto *ptr_type = prototype->data->type_annotation.as<PointerTypeNode>();
+  ICHECK(ptr_type != nullptr);
+
+  Array<PrimExpr> shape;
+  shape.reserve(region.size());
+  for (const Range &range : region) {
+    shape.push_back(range->extent);
+  }
+
+  ffi::String data_name = name.empty() ? prototype->data->name_hint : name;
+  ffi::String buffer_name = name.empty() ? prototype->name : name;
+  Var data(data_name, PointerType(ptr_type->element_type, scope));
+  return Buffer(data, prototype->dtype, shape, {}, Integer(0), buffer_name,
+                prototype->data_alignment, prototype->offset_factor,
+                prototype->buffer_type);
 }
 
 PrimExpr MakeAccessPtrFromRegion(const BufferRegion &region, int rw_mask,

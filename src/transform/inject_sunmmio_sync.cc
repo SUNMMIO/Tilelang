@@ -34,9 +34,11 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <initializer_list>
 #include <map>
 #include <optional>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -106,8 +108,6 @@ struct BarrierMaskInfo {
   PrimExpr expr;
   std::vector<int64_t> candidates;
 };
-
-using TokenBarrierMap = std::map<int, BarrierMaskInfo>;
 
 void AddUniqueInt64(std::vector<int64_t> *values, int64_t value) {
   if (std::find(values->begin(), values->end(), value) == values->end()) {
@@ -324,6 +324,55 @@ public:
   std::vector<Var> vars;
 };
 
+bool ExprUsesAnyVar(const PrimExpr &expr, const std::vector<Var> &vars) {
+  if (vars.empty()) {
+    return false;
+  }
+  VarCollector collector;
+  collector(expr);
+  for (const Var &used : collector.vars) {
+    for (const Var &candidate : vars) {
+      if (used.same_as(candidate)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+class UnsafeLoopDomainExprDetector : public ExprVisitor {
+public:
+  bool HasUnsafeExpr() const { return has_unsafe_expr_; }
+
+  void VisitExpr_(const VarNode *op) final {
+    if (op->dtype.is_handle()) {
+      has_unsafe_expr_ = true;
+    }
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final { has_unsafe_expr_ = true; }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->dtype.is_handle()) {
+      has_unsafe_expr_ = true;
+      return;
+    }
+    ExprVisitor::VisitExpr_(op);
+  }
+
+private:
+  bool has_unsafe_expr_{false};
+};
+
+bool CanUseLoopDomainForRegionCover(const PrimExpr &expr) {
+  if (!expr.defined() || expr.dtype().is_handle()) {
+    return false;
+  }
+  UnsafeLoopDomainExprDetector detector;
+  detector(expr);
+  return !detector.HasUnsafeExpr();
+}
+
 std::vector<int64_t> EnumerateMaskCandidates(PrimExpr expr, int direction,
                                              int mesh_nrow, int mesh_ncol,
                                              arith::Analyzer *analyzer) {
@@ -376,23 +425,17 @@ std::vector<int64_t> EnumerateMaskCandidates(PrimExpr expr, int direction,
 Array<PrimExpr> MakeBarrierArgs(const BarrierMaskInfo &info) {
   Array<PrimExpr> args;
   args.push_back(info.expr);
-  if (!info.expr.as<IntImmNode>()) {
-    ICHECK(!info.candidates.empty())
-        << "dynamic barrier mask requires static candidate masks";
-    for (int64_t mask : info.candidates) {
-      args.push_back(I64Imm(mask));
-    }
+  for (int64_t mask : info.candidates) {
+    args.push_back(I64Imm(mask));
   }
   return args;
 }
 
 Array<PrimExpr> MakeBarrierInitArgs(const BarrierMaskInfo &info) {
-  if (info.expr.as<IntImmNode>()) {
+  if (info.candidates.empty()) {
     return MakeBarrierArgs(info);
   }
 
-  ICHECK(!info.candidates.empty())
-      << "dynamic barrier init requires static candidate masks";
   Array<PrimExpr> args;
   args.push_back(I64Imm(-1));
   for (int64_t mask : info.candidates) {
@@ -409,11 +452,6 @@ BarrierMaskInfo BarrierMaskInfoFromArgs(const Array<PrimExpr> &args) {
     const auto *imm = args[i].as<IntImmNode>();
     ICHECK(imm) << "barrier candidate masks must be IntImm";
     AddUniqueInt64(&info.candidates, static_cast<int64_t>(imm->value));
-  }
-  if (info.candidates.empty()) {
-    if (const auto *imm = info.expr.as<IntImmNode>()) {
-      AddUniqueInt64(&info.candidates, static_cast<int64_t>(imm->value));
-    }
   }
   return info;
 }
@@ -432,14 +470,6 @@ bool SameBarrierMaskInfo(const BarrierMaskInfo &lhs,
     }
   }
   return true;
-}
-
-bool BarrierCallMatchesInfo(const CallNode *call, const BarrierMaskInfo &info) {
-  if (!call || !call->op.same_as(barrier_arrive_and_wait()) ||
-      call->args.empty()) {
-    return false;
-  }
-  return SameBarrierMaskInfo(BarrierMaskInfoFromArgs(call->args), info);
 }
 
 void AddUniqueBarrierMaskInfo(std::vector<BarrierMaskInfo> *values,
@@ -492,12 +522,34 @@ bool RegionIntersect(const Region &region1, const Region &region2) {
   return true;
 }
 
+Region
+CoverRegionWithLoopDomains(const Region &region,
+                           const ffi::Map<Var, arith::IntSet> &loop_domains) {
+  if (loop_domains.empty()) {
+    return region;
+  }
+
+  ffi::Array<arith::IntSet> relaxed = arith::EvalSet(region, loop_domains);
+  ICHECK_EQ(relaxed.size(), region.size());
+  Region covered;
+  covered.reserve(relaxed.size());
+  arith::Analyzer analyzer;
+  for (size_t i = 0; i < relaxed.size(); ++i) {
+    PrimExpr min = analyzer.Simplify(relaxed[i].min());
+    PrimExpr extent = analyzer.Simplify(relaxed[i].max() - min + 1);
+    covered.push_back(Range::FromMinExtent(min, extent));
+  }
+  return covered;
+}
+
 // Visitor to collect all buffer read and write accesses within an expression or
 // statement. This is used to identify what memory is being touched.
 class BufferAccessCollector : public ExprVisitor {
 public:
-  BufferAccessCollector(Map<Var, Buffer> buffer_data_to_buffer)
-      : buffer_data_to_buffer_(buffer_data_to_buffer) {}
+  BufferAccessCollector(Map<Var, Buffer> buffer_data_to_buffer,
+                        ffi::Map<Var, arith::IntSet> loop_domains = {})
+      : buffer_data_to_buffer_(std::move(buffer_data_to_buffer)),
+        loop_domains_(std::move(loop_domains)) {}
 
   Array<BufferRegion> GetReads() const { return reads_; }
 
@@ -510,8 +562,10 @@ private:
     for (const auto &index : indices) {
       region.push_back(Range::FromMinExtent(index, 1));
     }
-    auto load_region = BufferRegion(load_buffer, region);
+    auto load_region = BufferRegion(
+        load_buffer, CoverRegionWithLoopDomains(region, loop_domains_));
     reads_.push_back(load_region);
+    ExprVisitor::VisitExpr_(op);
   }
 
   void VisitExpr_(const CallNode *op) final {
@@ -520,6 +574,9 @@ private:
       BufferRegion buffer_region;
       if (const auto *load = op->args[0].as<BufferLoadNode>()) {
         buffer_region = BufferRegion::FullRegion(load->buffer);
+        for (const auto &index : load->indices) {
+          VisitExpr(index);
+        }
       } else if (const auto *var_node = op->args[0].as<VarNode>()) {
         Var data_var = tvm::ffi::GetRef<Var>(var_node);
         auto it = buffer_data_to_buffer_.find(data_var);
@@ -539,6 +596,7 @@ private:
         const BufferRegion buffer_region = BufferRegion::FullRegion(buffer);
         reads_.push_back(buffer_region);
       }
+      ExprVisitor::VisitExpr_(op);
     } else {
       ExprVisitor::VisitExpr_(op);
     }
@@ -547,6 +605,7 @@ private:
 private:
   Array<BufferRegion> reads_;
   Map<Var, Buffer> buffer_data_to_buffer_;
+  ffi::Map<Var, arith::IntSet> loop_domains_;
 };
 
 // Collector for asynchronous operations within a loop body.
@@ -566,50 +625,219 @@ struct AsyncOpRecord {
   std::vector<AccessRecord> writes;
 };
 
+struct SyncAccessRecord {
+  const StmtNode *stmt{nullptr};
+  int order{-1};
+  std::vector<AccessRecord> reads;
+  std::vector<AccessRecord> writes;
+};
+
 class LoopAsyncCollector : public StmtVisitor {
 public:
+  explicit LoopAsyncCollector(Map<Var, Buffer> buffer_data_to_buffer)
+      : buffer_data_to_buffer_(std::move(buffer_data_to_buffer)) {}
+
   void VisitStmt_(const EvaluateNode *op) final {
     const CallNode *call = op->value.as<CallNode>();
     if (call) {
       AsyncOpRecord rec;
       rec.op = op;
       rec.call = call;
-      rec.order = order_++;
-      if (call->op.same_as(dma_copy())) {
+      if (call->op.same_as(dma_copy()) || call->op.same_as(broadcast_()) ||
+          call->op.same_as(sunmmio_layout_transform()) ||
+          call->op.same_as(sunmmio_transpose())) {
+        rec.order = order_++;
         auto src = NormalizeToBufferRegion(call->args[0]);
         auto dst = NormalizeToBufferRegion(call->args[1]);
-        rec.reads.push_back({src->buffer, src->region});
-        rec.writes.push_back({dst->buffer, dst->region});
-        async_ops.push_back(rec);
-      } else if (call->op.same_as(sunmmio_layout_transform())) {
-        auto src = NormalizeToBufferRegion(call->args[0]);
-        auto dst = NormalizeToBufferRegion(call->args[1]);
-        rec.reads.push_back({src->buffer, src->region});
-        rec.writes.push_back({dst->buffer, dst->region});
+        rec.reads.push_back(AccessFromRegion(src));
+        AppendAsyncArgumentReads(call, {0, 1}, &rec.reads);
+        rec.writes.push_back(AccessFromRegion(dst));
         async_ops.push_back(rec);
       } else if (call->op.same_as(mma_sunmmio())) {
+        rec.order = order_++;
         auto lhs = NormalizeToBufferRegion(call->args[0]);
         auto rhs = NormalizeToBufferRegion(call->args[1]);
         auto acc = NormalizeToBufferRegion(call->args[2]);
-        rec.reads.push_back({lhs->buffer, lhs->region});
-        rec.reads.push_back({rhs->buffer, rhs->region});
-        rec.reads.push_back({acc->buffer, acc->region});
-        rec.writes.push_back({acc->buffer, acc->region});
-        async_ops.push_back(rec);
-      } else if (call->op.same_as(broadcast_())) {
-        auto src = NormalizeToBufferRegion(call->args[0]);
-        auto dst = NormalizeToBufferRegion(call->args[1]);
-        rec.reads.push_back({src->buffer, src->region});
-        rec.writes.push_back({dst->buffer, dst->region});
+        rec.reads.push_back(AccessFromRegion(lhs));
+        rec.reads.push_back(AccessFromRegion(rhs));
+        rec.reads.push_back(AccessFromRegion(acc));
+        AppendAsyncArgumentReads(call, {0, 1, 2}, &rec.reads);
+        rec.writes.push_back(AccessFromRegion(acc));
         async_ops.push_back(rec);
       }
+      if (!rec.reads.empty() || !rec.writes.empty()) {
+        StmtVisitor::VisitStmt_(op);
+        return;
+      }
     }
+    RecordSyncAccess(op, {op->value});
     StmtVisitor::VisitStmt_(op);
   }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    RecordSyncAccess(op, {op->value});
+    StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const LetStmtNode *op) final {
+    RecordSyncAccess(op, {op->value});
+    StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const WhileNode *op) final {
+    RecordSyncAccess(op, {op->condition});
+    StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const AllocateNode *op) final {
+    RecordSyncAccess(op, {op->condition});
+    StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const BufferRealizeNode *op) final {
+    RecordSyncAccess(op, {op->condition});
+    StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const AssertStmtNode *op) final {
+    RecordSyncAccess(op, {op->condition, op->message});
+    StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const BlockRealizeNode *op) final {
+    RecordSyncAccess(op, {op->predicate});
+    StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    Array<Range> region;
+    region.reserve(op->indices.size());
+    std::vector<PrimExpr> read_exprs;
+    read_exprs.reserve(op->indices.size() + 1);
+    for (const auto &index : op->indices) {
+      region.push_back(Range::FromMinExtent(index, 1));
+      read_exprs.push_back(index);
+    }
+    read_exprs.push_back(op->value);
+    RecordSyncAccess(
+        op, read_exprs,
+        {{op->buffer, CoverRegionWithLoopDomains(region, loop_domains_)}});
+    StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) final {
+    RecordSyncAccess(op, {op->condition});
+    StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    RecordSyncAccess(op, {op->min, op->extent});
+    ffi::Map<Var, arith::IntSet> old_loop_domains = loop_domains_;
+    if (CanUseLoopDomainForRegionCover(op->min) &&
+        CanUseLoopDomainForRegionCover(op->extent)) {
+      loop_domains_.Set(
+          op->loop_var,
+          arith::IntSet::FromRange(Range::FromMinExtent(op->min, op->extent)));
+    }
+    StmtVisitor::VisitStmt_(op);
+    loop_domains_ = std::move(old_loop_domains);
+  }
+
+  void VisitStmt_(const BlockNode *op) final {
+    for (const Buffer &buffer : op->alloc_buffers) {
+      buffer_data_to_buffer_.Set(buffer->data, buffer);
+    }
+    StmtVisitor::VisitStmt_(op);
+    for (const Buffer &buffer : op->alloc_buffers) {
+      buffer_data_to_buffer_.erase(buffer->data);
+    }
+  }
+
   std::vector<AsyncOpRecord> async_ops;
+  std::vector<SyncAccessRecord> sync_accesses;
+  std::unordered_map<const StmtNode *, int> stmt_order;
 
 private:
+  std::vector<AccessRecord> CollectReads(PrimExpr expr) const {
+    std::vector<AccessRecord> reads;
+    BufferAccessCollector collector(buffer_data_to_buffer_, loop_domains_);
+    collector(expr);
+    for (const BufferRegion &read : collector.GetReads()) {
+      reads.push_back({read->buffer, read->region});
+      for (const Range &range : read->region) {
+        std::vector<AccessRecord> min_reads = CollectReads(range->min);
+        reads.insert(reads.end(), min_reads.begin(), min_reads.end());
+        std::vector<AccessRecord> extent_reads = CollectReads(range->extent);
+        reads.insert(reads.end(), extent_reads.begin(), extent_reads.end());
+      }
+    }
+    return reads;
+  }
+
+  AccessRecord AccessFromRegion(const BufferRegion &region) const {
+    return {region->buffer,
+            CoverRegionWithLoopDomains(region->region, loop_domains_)};
+  }
+
+  void AppendReadsFromExpr(const PrimExpr &expr,
+                           std::vector<AccessRecord> *out) const {
+    std::vector<AccessRecord> reads = CollectReads(expr);
+    out->insert(out->end(), reads.begin(), reads.end());
+  }
+
+  void AppendRegionBoundReads(const BufferRegion &region,
+                              std::vector<AccessRecord> *out) const {
+    for (const Range &range : region->region) {
+      AppendReadsFromExpr(range->min, out);
+      AppendReadsFromExpr(range->extent, out);
+    }
+  }
+
+  void AppendAsyncArgumentReads(const CallNode *call,
+                                std::initializer_list<size_t> region_args,
+                                std::vector<AccessRecord> *out) const {
+    size_t arg_count = call->args.size();
+    if (arg_count != 0 && IsSyncTokenExpr(call->args.back())) {
+      --arg_count;
+    }
+    for (size_t i = 0; i < arg_count; ++i) {
+      if (std::find(region_args.begin(), region_args.end(), i) !=
+          region_args.end()) {
+        AppendRegionBoundReads(NormalizeToBufferRegion(call->args[i]), out);
+      } else {
+        AppendReadsFromExpr(call->args[i], out);
+      }
+    }
+  }
+
+  void RecordSyncAccess(const StmtNode *stmt,
+                        const std::vector<PrimExpr> &exprs,
+                        std::vector<AccessRecord> writes) {
+    SyncAccessRecord rec;
+    rec.stmt = stmt;
+    rec.order = order_++;
+    rec.writes = std::move(writes);
+    for (const PrimExpr &expr : exprs) {
+      std::vector<AccessRecord> reads = CollectReads(expr);
+      rec.reads.insert(rec.reads.end(), reads.begin(), reads.end());
+    }
+    if (rec.reads.empty() && rec.writes.empty()) {
+      --order_;
+      return;
+    }
+    stmt_order[stmt] = rec.order;
+    sync_accesses.push_back(std::move(rec));
+  }
+
+  void RecordSyncAccess(
+      const StmtNode *stmt, std::initializer_list<PrimExpr> exprs,
+      std::vector<AccessRecord> writes = std::vector<AccessRecord>()) {
+    RecordSyncAccess(stmt, std::vector<PrimExpr>(exprs), std::move(writes));
+  }
+
   int order_{0};
+  Map<Var, Buffer> buffer_data_to_buffer_;
+  ffi::Map<Var, arith::IntSet> loop_domains_;
 };
 
 // Represents the scope of a loop for dependency tracking.
@@ -617,27 +845,28 @@ private:
 // dependencies.
 struct LoopScope {
   Var loop_var;
+  PrimExpr loop_min;
   PrimExpr loop_extent;
   std::vector<AsyncOpRecord> async_ops;
+  std::vector<SyncAccessRecord> sync_accesses;
   std::map<int, std::set<int>> prev_iter_waits_by_curr_token;
+  std::map<int, std::set<int>> prev_iter_waits_by_sync_order;
   std::set<int> loop_entry_null_tokens;
-  std::map<int, const CallNode *> token_to_call;
+  std::unordered_map<const StmtNode *, int> stmt_order;
 };
 
 // Main rewriter class to inject synchronization primitives.
-// It tracks buffer accesses and inserts wait_token and barrier_wait calls
-// to enforce correct ordering based on data dependencies.
+// It tracks buffer accesses and inserts synchronization operations to enforce
+// correct ordering based on data dependencies and collective launch semantics.
 class InjectSyncRewriter : public StmtMutator {
 public:
-  InjectSyncRewriter(Map<Var, Buffer> buffer_data_to_buffer, int mesh_nrow,
-                     int mesh_ncol, arith::Analyzer *analyzer)
-      : buffer_data_to_buffer_(buffer_data_to_buffer), mesh_nrow_(mesh_nrow),
-        mesh_ncol_(mesh_ncol), analyzer_(analyzer) {
-    token_count = 0;
-  }
-
-  TokenBarrierMap get_token_to_barrier_mask() const {
-    return token_to_barrier_mask_;
+  InjectSyncRewriter(Map<Var, Buffer> buffer_data_to_buffer,
+                     const Target &target, arith::Analyzer *analyzer)
+      : token_count(0), mesh_nrow_(0), mesh_ncol_(0), analyzer_(analyzer),
+        buffer_data_to_buffer_(buffer_data_to_buffer) {
+    SunmmioMeshConfig mesh = GetSunmmioMeshConfig(target);
+    mesh_nrow_ = mesh.nrow;
+    mesh_ncol_ = mesh.ncol;
   }
 
 private:
@@ -719,6 +948,37 @@ private:
     return false;
   }
 
+  bool HasLoopCarriedDependence(const AsyncOpRecord &prev_op,
+                                const SyncAccessRecord &curr_access,
+                                const LoopScope &scope) const {
+    if (prev_op.order < curr_access.order) {
+      return false;
+    }
+
+    for (const auto &prev_write : prev_op.writes) {
+      for (const auto &curr_read : curr_access.reads) {
+        if (AccessMayDependAcrossIterations(prev_write, curr_read, scope)) {
+          return true;
+        }
+      }
+    }
+    for (const auto &prev_read : prev_op.reads) {
+      for (const auto &curr_write : curr_access.writes) {
+        if (AccessMayDependAcrossIterations(prev_read, curr_write, scope)) {
+          return true;
+        }
+      }
+    }
+    for (const auto &prev_write : prev_op.writes) {
+      for (const auto &curr_write : curr_access.writes) {
+        if (AccessMayDependAcrossIterations(prev_write, curr_write, scope)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   bool HasWhileLoopCarriedDependence(const AsyncOpRecord &prev_op,
                                      const AsyncOpRecord &curr_op) const {
     if (prev_op.order < curr_op.order) {
@@ -749,6 +1009,37 @@ private:
     return false;
   }
 
+  bool
+  HasWhileLoopCarriedDependence(const AsyncOpRecord &prev_op,
+                                const SyncAccessRecord &curr_access) const {
+    if (prev_op.order < curr_access.order) {
+      return false;
+    }
+
+    for (const auto &prev_write : prev_op.writes) {
+      for (const auto &curr_read : curr_access.reads) {
+        if (AccessMayDependWithinIteration(prev_write, curr_read)) {
+          return true;
+        }
+      }
+    }
+    for (const auto &prev_read : prev_op.reads) {
+      for (const auto &curr_write : curr_access.writes) {
+        if (AccessMayDependWithinIteration(prev_read, curr_write)) {
+          return true;
+        }
+      }
+    }
+    for (const auto &prev_write : prev_op.writes) {
+      for (const auto &curr_write : curr_access.writes) {
+        if (AccessMayDependWithinIteration(prev_write, curr_write)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   bool HasIntraIterationDependentSuccessor(const AsyncOpRecord &producer,
                                            const LoopScope &scope) const {
     for (const auto &later_op : scope.async_ops) {
@@ -771,6 +1062,32 @@ private:
       }
       for (const auto &producer_write : producer.writes) {
         for (const auto &later_write : later_op.writes) {
+          if (AccessMayDependWithinIteration(producer_write, later_write)) {
+            return true;
+          }
+        }
+      }
+    }
+    for (const auto &later_access : scope.sync_accesses) {
+      if (later_access.order <= producer.order) {
+        continue;
+      }
+      for (const auto &producer_write : producer.writes) {
+        for (const auto &later_read : later_access.reads) {
+          if (AccessMayDependWithinIteration(producer_write, later_read)) {
+            return true;
+          }
+        }
+      }
+      for (const auto &producer_read : producer.reads) {
+        for (const auto &later_write : later_access.writes) {
+          if (AccessMayDependWithinIteration(producer_read, later_write)) {
+            return true;
+          }
+        }
+      }
+      for (const auto &producer_write : producer.writes) {
+        for (const auto &later_write : later_access.writes) {
           if (AccessMayDependWithinIteration(producer_write, later_write)) {
             return true;
           }
@@ -809,6 +1126,20 @@ private:
         scope->loop_entry_null_tokens.insert(prev_op.token);
       }
     }
+
+    for (const auto &prev_op : scope->async_ops) {
+      if (HasIntraIterationDependentSuccessor(prev_op, *scope)) {
+        continue;
+      }
+      for (const auto &curr_access : scope->sync_accesses) {
+        if (!HasLoopCarriedDependence(prev_op, curr_access, *scope)) {
+          continue;
+        }
+        scope->prev_iter_waits_by_sync_order[curr_access.order].insert(
+            prev_op.token);
+        scope->loop_entry_null_tokens.insert(prev_op.token);
+      }
+    }
   }
 
   void AnalyzeWhileLoopCarriedDependencies(LoopScope *scope) {
@@ -834,12 +1165,27 @@ private:
         scope->loop_entry_null_tokens.insert(prev_op.token);
       }
     }
+
+    for (const auto &prev_op : scope->async_ops) {
+      if (HasIntraIterationDependentSuccessor(prev_op, *scope)) {
+        continue;
+      }
+      for (const auto &curr_access : scope->sync_accesses) {
+        if (!HasWhileLoopCarriedDependence(prev_op, curr_access)) {
+          continue;
+        }
+        scope->prev_iter_waits_by_sync_order[curr_access.order].insert(
+            prev_op.token);
+        scope->loop_entry_null_tokens.insert(prev_op.token);
+      }
+    }
   }
 
   void InjectLoopEntryNullTokens(const LoopScope &scope, Array<Stmt> &stmts) {
     for (int token : scope.loop_entry_null_tokens) {
       stmts.push_back(Evaluate(Call(DataType::Handle(), sync_null_token(),
                                     {IntImm(DataType::Int(32), token)})));
+      available_tokens_.insert(token);
     }
   }
 
@@ -942,20 +1288,36 @@ private:
     return analyzer_ ? analyzer_->Simplify(global_mask) : global_mask;
   }
 
-  // Inserts wait_token and optional barrier_wait instructions.
-  // If the token is associated with a barrier (e.g. from broadcast),
-  // we also need to wait on that barrier.
-  void process_wait_token_and_barrier_wait(Array<Stmt> &stmts, int token_id) {
+  PrimExpr GetBroadcastBarrierSrcCore(const CallNode *call) {
+    if (BroadcastCallHasSrcCore(call)) {
+      return GetBroadcastSrcCore(call);
+    }
+    ICHECK(current_kernel_core_id_.defined())
+        << "tl.broadcast_ without optional src_core is treated as an "
+           "all_gather leaf and requires an enclosing blockIdx.x binding";
+    return current_kernel_core_id_;
+  }
+
+  void process_wait_token(Array<Stmt> &stmts, int token_id) {
     stmts.push_back(Evaluate(Call(DataType::Handle(), wait_token(),
                                   {IntImm(DataType::Int(32), token_id)})));
-    // If the current token has a corresponding barrier, we need to wait for the
-    // barrier.
-    auto barrier_it = token_to_barrier_mask_.find(token_id);
-    if (barrier_it != token_to_barrier_mask_.end()) {
-      stmts.push_back(
-          Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
-                        MakeBarrierArgs(barrier_it->second))));
+  }
+
+  bool IsWaitSuppressedByLoopHoist(int token_id) const {
+    for (auto it = loop_hoisted_wait_tokens_stack_.rbegin();
+         it != loop_hoisted_wait_tokens_stack_.rend(); ++it) {
+      if (it->count(token_id) != 0) {
+        return true;
+      }
     }
+    return false;
+  }
+
+  void maybe_process_wait_token(Array<Stmt> &stmts, int token_id) {
+    if (IsWaitSuppressedByLoopHoist(token_id)) {
+      return;
+    }
+    process_wait_token(stmts, token_id);
   }
 
   void InjectLoopCarriedWaitsForToken(Array<Stmt> &stmts, int curr_token_id) {
@@ -970,10 +1332,178 @@ private:
         if (injected_tokens.count(token_id) != 0) {
           continue;
         }
-        process_wait_token_and_barrier_wait(stmts, token_id);
+        maybe_process_wait_token(stmts, token_id);
         injected_tokens.insert(token_id);
       }
     }
+  }
+
+  void InjectLoopCarriedWaitsForSyncStmt(Array<Stmt> &stmts,
+                                         const StmtNode *stmt) {
+    std::unordered_set<int> injected_tokens;
+    for (int i = static_cast<int>(loop_scopes_.size()) - 1; i >= 0; --i) {
+      auto order_it = loop_scopes_[i].stmt_order.find(stmt);
+      if (order_it == loop_scopes_[i].stmt_order.end()) {
+        continue;
+      }
+      auto waits_it =
+          loop_scopes_[i].prev_iter_waits_by_sync_order.find(order_it->second);
+      if (waits_it == loop_scopes_[i].prev_iter_waits_by_sync_order.end()) {
+        continue;
+      }
+      for (int token_id : waits_it->second) {
+        if (injected_tokens.count(token_id) != 0) {
+          continue;
+        }
+        maybe_process_wait_token(stmts, token_id);
+        injected_tokens.insert(token_id);
+      }
+    }
+  }
+
+  void CollectLoopCarriedWaitsForToken(int curr_token_id,
+                                       std::set<int> *tokens) const {
+    for (int i = static_cast<int>(loop_scopes_.size()) - 1; i >= 0; --i) {
+      auto it =
+          loop_scopes_[i].prev_iter_waits_by_curr_token.find(curr_token_id);
+      if (it == loop_scopes_[i].prev_iter_waits_by_curr_token.end()) {
+        continue;
+      }
+      tokens->insert(it->second.begin(), it->second.end());
+    }
+  }
+
+  void CollectLoopCarriedWaitsForSyncStmt(const StmtNode *stmt,
+                                          std::set<int> *tokens) const {
+    for (int i = static_cast<int>(loop_scopes_.size()) - 1; i >= 0; --i) {
+      auto order_it = loop_scopes_[i].stmt_order.find(stmt);
+      if (order_it == loop_scopes_[i].stmt_order.end()) {
+        continue;
+      }
+      auto waits_it =
+          loop_scopes_[i].prev_iter_waits_by_sync_order.find(order_it->second);
+      if (waits_it == loop_scopes_[i].prev_iter_waits_by_sync_order.end()) {
+        continue;
+      }
+      tokens->insert(waits_it->second.begin(), waits_it->second.end());
+    }
+  }
+
+  bool IsTokenHoistableBeforeLoop(
+      int token_id, const std::set<int> &generated_tokens_in_loop) const {
+    return token_id >= 0 && available_tokens_.count(token_id) != 0 &&
+           generated_tokens_in_loop.count(token_id) == 0 &&
+           !IsWaitSuppressedByLoopHoist(token_id);
+  }
+
+  AccessRecord CoverAccessForLoopHoist(const AccessRecord &access,
+                                       const LoopScope &scope) const {
+    if (!scope.loop_var.defined() || !scope.loop_min.defined() ||
+        !scope.loop_extent.defined() ||
+        !CanUseLoopDomainForRegionCover(scope.loop_min) ||
+        !CanUseLoopDomainForRegionCover(scope.loop_extent)) {
+      return access;
+    }
+    ffi::Map<Var, arith::IntSet> loop_domain;
+    loop_domain.Set(scope.loop_var,
+                    arith::IntSet::FromRange(Range::FromMinExtent(
+                        scope.loop_min, scope.loop_extent)));
+    return {access.buffer,
+            CoverRegionWithLoopDomains(access.region, loop_domain)};
+  }
+
+  void AddHoistableToken(int token_id,
+                         const std::set<int> &generated_tokens_in_loop,
+                         std::set<int> *hoistable_tokens) const {
+    if (IsTokenHoistableBeforeLoop(token_id, generated_tokens_in_loop)) {
+      hoistable_tokens->insert(token_id);
+    }
+  }
+
+  void CollectHoistableWaitsForReadAccess(
+      const AccessRecord &read_access,
+      const std::set<int> &generated_tokens_in_loop,
+      std::set<int> *hoistable_tokens) const {
+    for (const Array<ObjectRef> &buf : write_buffers) {
+      Buffer buf_buffer = Downcast<Buffer>(buf[0]);
+      Region buf_region = Downcast<Region>(buf[1]);
+      if (read_access.buffer.same_as(buf_buffer) &&
+          RegionIntersect(read_access.region, buf_region)) {
+        AddHoistableToken(write_buffer_token_map[buf], generated_tokens_in_loop,
+                          hoistable_tokens);
+      }
+    }
+  }
+
+  void CollectHoistableWaitsForWriteAccess(
+      const AccessRecord &write_access,
+      const std::set<int> &generated_tokens_in_loop,
+      std::set<int> *hoistable_tokens) const {
+    for (const Array<ObjectRef> &buf : read_buffers) {
+      Buffer buf_buffer = Downcast<Buffer>(buf[0]);
+      Region buf_region = Downcast<Region>(buf[1]);
+      if (write_access.buffer.same_as(buf_buffer) &&
+          RegionIntersect(write_access.region, buf_region)) {
+        AddHoistableToken(read_buffer_token_map[buf], generated_tokens_in_loop,
+                          hoistable_tokens);
+      }
+    }
+    for (const Array<ObjectRef> &buf : write_buffers) {
+      Buffer buf_buffer = Downcast<Buffer>(buf[0]);
+      Region buf_region = Downcast<Region>(buf[1]);
+      if (write_access.buffer.same_as(buf_buffer) &&
+          RegionIntersect(write_access.region, buf_region)) {
+        AddHoistableToken(write_buffer_token_map[buf], generated_tokens_in_loop,
+                          hoistable_tokens);
+      }
+    }
+  }
+
+  std::set<int> AnalyzeHoistableWaitsForLoop(const LoopScope &scope) const {
+    std::set<int> generated_tokens_in_loop;
+    for (const auto &async_op : scope.async_ops) {
+      generated_tokens_in_loop.insert(async_op.token);
+    }
+
+    std::set<int> hoistable_tokens;
+
+    for (const auto &async_op : scope.async_ops) {
+      std::set<int> loop_carried_waits;
+      CollectLoopCarriedWaitsForToken(async_op.token, &loop_carried_waits);
+      for (int token : loop_carried_waits) {
+        AddHoistableToken(token, generated_tokens_in_loop, &hoistable_tokens);
+      }
+      for (const auto &read : async_op.reads) {
+        AccessRecord covered_read = CoverAccessForLoopHoist(read, scope);
+        CollectHoistableWaitsForReadAccess(
+            covered_read, generated_tokens_in_loop, &hoistable_tokens);
+      }
+      for (const auto &write : async_op.writes) {
+        AccessRecord covered_write = CoverAccessForLoopHoist(write, scope);
+        CollectHoistableWaitsForWriteAccess(
+            covered_write, generated_tokens_in_loop, &hoistable_tokens);
+      }
+    }
+
+    for (const auto &sync_access : scope.sync_accesses) {
+      std::set<int> loop_carried_waits;
+      CollectLoopCarriedWaitsForSyncStmt(sync_access.stmt, &loop_carried_waits);
+      for (int token : loop_carried_waits) {
+        AddHoistableToken(token, generated_tokens_in_loop, &hoistable_tokens);
+      }
+      for (const auto &read : sync_access.reads) {
+        AccessRecord covered_read = CoverAccessForLoopHoist(read, scope);
+        CollectHoistableWaitsForReadAccess(
+            covered_read, generated_tokens_in_loop, &hoistable_tokens);
+      }
+      for (const auto &write : sync_access.writes) {
+        AccessRecord covered_write = CoverAccessForLoopHoist(write, scope);
+        CollectHoistableWaitsForWriteAccess(
+            covered_write, generated_tokens_in_loop, &hoistable_tokens);
+      }
+    }
+
+    return hoistable_tokens;
   }
 
   // Analyzes a read operation on a buffer region.
@@ -1002,7 +1532,7 @@ private:
           RegionIntersect(src_region, buf_region)) {
         int token = write_buffer_token_map[buf];
         if (waited_tokens.count(token) == 0) {
-          process_wait_token_and_barrier_wait(stmts, token);
+          maybe_process_wait_token(stmts, token);
           waited_tokens.insert(token);
         }
       }
@@ -1040,7 +1570,7 @@ private:
           RegionIntersect(dst_region, buf_region)) {
         int token = read_buffer_token_map[buf];
         if (waited_tokens.count(token) == 0) {
-          process_wait_token_and_barrier_wait(stmts, token);
+          maybe_process_wait_token(stmts, token);
           waited_tokens.insert(token);
         }
       }
@@ -1057,7 +1587,7 @@ private:
           RegionIntersect(dst_region, buf_region)) {
         int token = write_buffer_token_map[buf];
         if (waited_tokens.count(token) == 0) {
-          process_wait_token_and_barrier_wait(stmts, token);
+          maybe_process_wait_token(stmts, token);
           waited_tokens.insert(token);
         }
       }
@@ -1079,6 +1609,7 @@ private:
     new_args.push_back(Call(DataType::Handle(), sync_token_id(),
                             {IntImm(DataType::Int(32), token_id)}));
     stmts.push_back(Evaluate(Call(call->dtype, call->op, new_args)));
+    available_tokens_.insert(token_id);
   }
 
   // Computes the global participant core mask for a broadcast operation.
@@ -1092,10 +1623,6 @@ private:
     int total_cores = mesh_nrow_ * mesh_ncol_;
     ICHECK_LE(total_cores, 64)
         << "tl.broadcast_ barrier mask currently supports at most 64 cores";
-    if (!BroadcastCallHasSrcCore(call)) {
-      return FullCoreMask(total_cores);
-    }
-
     int direction = -1;
     if (const auto *direction_imm =
             call->args[kBroadcastArgDirection].as<IntImmNode>()) {
@@ -1105,7 +1632,7 @@ private:
         << "tl.broadcast_ barrier mask expansion only supports horizontal or "
            "vertical leaf broadcasts";
 
-    PrimExpr src_core = GetBroadcastSrcCore(call);
+    PrimExpr src_core = GetBroadcastBarrierSrcCore(call);
     PrimExpr local_mask = call->args[kBroadcastArgMask];
     PrimExpr write_mask =
         ExpandBroadcastLocalMask(local_mask, direction, src_core);
@@ -1117,8 +1644,7 @@ private:
   BarrierMaskInfo BroadcastBarrierMaskInfo(const CallNode *call) {
     BarrierMaskInfo info;
     info.expr = AsI64(BroadcastParticipantMask(call));
-    if (const auto *imm = info.expr.as<IntImmNode>()) {
-      AddUniqueInt64(&info.candidates, static_cast<int64_t>(imm->value));
+    if (info.expr.as<IntImmNode>()) {
       return info;
     }
 
@@ -1141,13 +1667,6 @@ private:
     return info;
   }
 
-  BarrierMaskInfo RecordBroadcastBarrier(const CallNode *call,
-                                         int curr_token_id) {
-    BarrierMaskInfo info = BroadcastBarrierMaskInfo(call);
-    token_to_barrier_mask_[curr_token_id] = info;
-    return info;
-  }
-
   void process_barrier_wait(Array<Stmt> &stmts,
                             const BarrierMaskInfo &participant_mask) {
     stmts.push_back(Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
@@ -1158,23 +1677,63 @@ private:
   // and processes their dependencies to inject necessary synchronization
   // tokens.
   void token_process_prim_expr(const PrimExpr &expr, Array<Stmt> &stmts) {
-    auto buf_load_collector = BufferAccessCollector(buffer_data_to_buffer_);
+    auto buf_load_collector =
+        BufferAccessCollector(buffer_data_to_buffer_, loop_domains_);
     buf_load_collector(expr);
     Array<BufferRegion> read_regions = buf_load_collector.GetReads();
     for (const auto &read_region : read_regions) {
+      token_process_region_bounds(read_region, stmts);
       token_process_read_buffer(read_region, stmts, -1, false);
+    }
+  }
+
+  void token_process_region_bounds(const BufferRegion &buffer_region,
+                                   Array<Stmt> &stmts) {
+    for (const Range &range : buffer_region->region) {
+      token_process_prim_expr(range->min, stmts);
+      token_process_prim_expr(range->extent, stmts);
+    }
+  }
+
+  void
+  token_process_async_call_arguments(const CallNode *call,
+                                     std::initializer_list<size_t> region_args,
+                                     Array<Stmt> &stmts) {
+    size_t arg_count = call->args.size();
+    if (arg_count != 0 && IsSyncTokenExpr(call->args.back())) {
+      --arg_count;
+    }
+    for (size_t i = 0; i < arg_count; ++i) {
+      if (std::find(region_args.begin(), region_args.end(), i) !=
+          region_args.end()) {
+        token_process_region_bounds(NormalizeToBufferRegion(call->args[i]),
+                                    stmts);
+      } else {
+        token_process_prim_expr(call->args[i], stmts);
+      }
     }
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) {
     Array<Stmt> stmts;
+    InjectLoopCarriedWaitsForSyncStmt(stmts, op);
     token_process_prim_expr(op->value, stmts);
+
+    PrimExpr old_kernel_core_id = current_kernel_core_id_;
+    if (op->attr_key == tir::attr::thread_extent) {
+      IterVar iv = Downcast<IterVar>(op->node);
+      if (iv->thread_tag == "blockIdx.x") {
+        current_kernel_core_id_ = iv->var;
+      }
+    }
     stmts.push_back(StmtMutator::VisitStmt_(op));
+    current_kernel_core_id_ = old_kernel_core_id;
     return SeqStmt::Flatten(stmts);
   }
 
   Stmt VisitStmt_(const LetStmtNode *op) {
     Array<Stmt> stmts;
+    InjectLoopCarriedWaitsForSyncStmt(stmts, op);
     token_process_prim_expr(op->value, stmts);
     stmts.push_back(StmtMutator::VisitStmt_(op));
     return SeqStmt::Flatten(stmts);
@@ -1182,13 +1741,16 @@ private:
 
   Stmt VisitStmt_(const WhileNode *op) {
     Array<Stmt> stmts;
+    InjectLoopCarriedWaitsForSyncStmt(stmts, op);
     token_process_prim_expr(op->condition, stmts);
 
-    LoopAsyncCollector collector;
+    LoopAsyncCollector collector(buffer_data_to_buffer_);
     collector(op->body);
 
     LoopScope scope;
     scope.async_ops = collector.async_ops;
+    scope.sync_accesses = collector.sync_accesses;
+    scope.stmt_order = collector.stmt_order;
     std::vector<const EvaluateNode *> owned_pre_assignments;
     for (auto &async_op : scope.async_ops) {
       // Pre-assign a stable token id for each async site in this loop.
@@ -1196,36 +1758,36 @@ private:
       // enabling consistent loop-carried dependency reasoning.
       int token = PreAssignLoopToken(async_op, &owned_pre_assignments);
       async_op.token = token;
-
-      // Keep a back-reference from token -> call for special handling after we
-      // finish rewriting the loop (e.g. broadcast barrier initialization).
-      const CallNode *call = async_op.call;
-      scope.token_to_call[token] = call;
-
-      if (call && call->op.same_as(broadcast_())) {
-        RecordBroadcastBarrier(call, token);
-      }
     }
 
     AnalyzeWhileLoopCarriedDependencies(&scope);
 
+    InjectLoopEntryNullTokens(scope, stmts);
+
     // Push this loop scope so nested visitors can consult it when analyzing
     // read/write accesses inside the loop body.
     loop_scopes_.push_back(scope);
+    std::set<int> hoisted_wait_tokens =
+        AnalyzeHoistableWaitsForLoop(loop_scopes_.back());
+    for (int token : hoisted_wait_tokens) {
+      process_wait_token(stmts, token);
+    }
+    loop_hoisted_wait_tokens_stack_.push_back(hoisted_wait_tokens);
 
     Stmt loop_stmt = StmtMutator::VisitStmt_(op);
 
     scope = loop_scopes_.back();
     loop_scopes_.pop_back();
+    loop_hoisted_wait_tokens_stack_.pop_back();
     ClearOwnedPreAssignedTokens(owned_pre_assignments);
 
-    InjectLoopEntryNullTokens(scope, stmts);
     stmts.push_back(loop_stmt);
     return SeqStmt::Flatten(stmts);
   }
 
   Stmt VisitStmt_(const AllocateNode *op) {
     Array<Stmt> stmts;
+    InjectLoopCarriedWaitsForSyncStmt(stmts, op);
     token_process_prim_expr(op->condition, stmts);
     stmts.push_back(StmtMutator::VisitStmt_(op));
     return SeqStmt::Flatten(stmts);
@@ -1233,6 +1795,7 @@ private:
 
   Stmt VisitStmt_(const BufferRealizeNode *op) {
     Array<Stmt> stmts;
+    InjectLoopCarriedWaitsForSyncStmt(stmts, op);
     token_process_prim_expr(op->condition, stmts);
     stmts.push_back(StmtMutator::VisitStmt_(op));
     return SeqStmt::Flatten(stmts);
@@ -1240,6 +1803,7 @@ private:
 
   Stmt VisitStmt_(const AssertStmtNode *op) {
     Array<Stmt> stmts;
+    InjectLoopCarriedWaitsForSyncStmt(stmts, op);
     token_process_prim_expr(op->condition, stmts);
     token_process_prim_expr(op->message, stmts);
     stmts.push_back(StmtMutator::VisitStmt_(op));
@@ -1248,6 +1812,7 @@ private:
 
   Stmt VisitStmt_(const BlockRealizeNode *op) {
     Array<Stmt> stmts;
+    InjectLoopCarriedWaitsForSyncStmt(stmts, op);
     token_process_prim_expr(op->predicate, stmts);
     stmts.push_back(StmtMutator::VisitStmt_(op));
     return SeqStmt::Flatten(stmts);
@@ -1255,6 +1820,7 @@ private:
 
   Stmt VisitStmt_(const BufferStoreNode *op) {
     Array<Stmt> stmts;
+    InjectLoopCarriedWaitsForSyncStmt(stmts, op);
 
     // For a buffer store statement, we need to check the dependencies for the
     // buffer to be stored. For example, in the statement A[i] = B[j] + C[k], we
@@ -1266,7 +1832,11 @@ private:
     for (const auto &index : indices) {
       region.push_back(Range::FromMinExtent(index, 1));
     }
-    auto store_region = BufferRegion(store_buffer, region);
+    for (const auto &index : indices) {
+      token_process_prim_expr(index, stmts);
+    }
+    auto store_region = BufferRegion(
+        store_buffer, CoverRegionWithLoopDomains(region, loop_domains_));
     token_process_write_buffer(store_region, stmts, -1, false);
 
     // For a store statement, we also need to check the read dependencies for
@@ -1283,7 +1853,10 @@ private:
   Stmt VisitStmt_(const EvaluateNode *op) {
     const CallNode *call = op->value.as<CallNode>();
     if (call) {
-      if (call->op.same_as(dma_copy())) {
+      if (call->op.same_as(dma_copy()) ||
+          call->op.same_as(sunmmio_layout_transform()) ||
+          call->op.same_as(sunmmio_transpose())) {
+        // These operations read args[0] and write args[1].
         Array<Stmt> stmts;
         int curr_token_id;
         if (pre_assigned_tokens_.count(op)) {
@@ -1293,25 +1866,7 @@ private:
         }
 
         InjectLoopCarriedWaitsForToken(stmts, curr_token_id);
-        token_process_read_buffer(NormalizeToBufferRegion(call->args[0]), stmts,
-                                  curr_token_id);
-        token_process_write_buffer(NormalizeToBufferRegion(call->args[1]),
-                                   stmts, curr_token_id);
-
-        curr_stmt_with_token_id(call, stmts, curr_token_id);
-
-        return SeqStmt::Flatten(stmts);
-      } else if (call->op.same_as(sunmmio_layout_transform())) {
-        // Same dependency shape as dma_copy: reads args[0], writes args[1].
-        Array<Stmt> stmts;
-        int curr_token_id;
-        if (pre_assigned_tokens_.count(op)) {
-          curr_token_id = pre_assigned_tokens_[op];
-        } else {
-          curr_token_id = GetNextTokenId();
-        }
-
-        InjectLoopCarriedWaitsForToken(stmts, curr_token_id);
+        token_process_async_call_arguments(call, {0, 1}, stmts);
         token_process_read_buffer(NormalizeToBufferRegion(call->args[0]), stmts,
                                   curr_token_id);
         token_process_write_buffer(NormalizeToBufferRegion(call->args[1]),
@@ -1330,6 +1885,7 @@ private:
         }
 
         InjectLoopCarriedWaitsForToken(stmts, curr_token_id);
+        token_process_async_call_arguments(call, {0, 1, 2}, stmts);
         token_process_read_buffer(NormalizeToBufferRegion(call->args[0]), stmts,
                                   curr_token_id);
         token_process_read_buffer(NormalizeToBufferRegion(call->args[1]), stmts,
@@ -1350,10 +1906,10 @@ private:
         } else {
           curr_token_id = GetNextTokenId();
         }
-        BarrierMaskInfo participant_mask =
-            RecordBroadcastBarrier(call, curr_token_id);
 
         InjectLoopCarriedWaitsForToken(stmts, curr_token_id);
+        token_process_async_call_arguments(call, {0, 1}, stmts);
+        BarrierMaskInfo participant_mask = BroadcastBarrierMaskInfo(call);
         token_process_read_buffer(NormalizeToBufferRegion(call->args[0]), stmts,
                                   curr_token_id);
         token_process_write_buffer(NormalizeToBufferRegion(call->args[1]),
@@ -1367,6 +1923,7 @@ private:
     }
 
     Array<Stmt> stmts;
+    InjectLoopCarriedWaitsForSyncStmt(stmts, op);
     token_process_prim_expr(op->value, stmts);
     stmts.push_back(StmtMutator::VisitStmt_(op));
     return SeqStmt::Flatten(stmts);
@@ -1377,6 +1934,7 @@ private:
   // then merge them.
   Stmt VisitStmt_(const IfThenElseNode *op) {
     Array<Stmt> stmts;
+    InjectLoopCarriedWaitsForSyncStmt(stmts, op);
     token_process_prim_expr(op->condition, stmts);
     PrimExpr condition = this->VisitExpr(op->condition);
 
@@ -1443,42 +2001,54 @@ private:
   // dependencies.
   Stmt VisitStmt_(const ForNode *loop) final {
     Array<Stmt> stmts;
+    InjectLoopCarriedWaitsForSyncStmt(stmts, loop);
     token_process_prim_expr(loop->min, stmts);
     token_process_prim_expr(loop->extent, stmts);
 
-    LoopAsyncCollector collector;
+    LoopAsyncCollector collector(buffer_data_to_buffer_);
     collector(loop->body);
 
     LoopScope scope;
     scope.loop_var = loop->loop_var;
+    scope.loop_min = loop->min;
     scope.loop_extent = loop->extent;
     scope.async_ops = collector.async_ops;
+    scope.sync_accesses = collector.sync_accesses;
+    scope.stmt_order = collector.stmt_order;
 
     std::vector<const EvaluateNode *> owned_pre_assignments;
     for (auto &async_op : scope.async_ops) {
       int token = PreAssignLoopToken(async_op, &owned_pre_assignments);
       async_op.token = token;
-
-      const CallNode *call = async_op.call;
-      scope.token_to_call[token] = call;
-
-      // check if it is a broadcast
-      if (call && call->op.same_as(broadcast_())) {
-        RecordBroadcastBarrier(call, token);
-      }
     }
 
     AnalyzeLoopCarriedDependencies(&scope);
 
-    loop_scopes_.push_back(scope);
+    InjectLoopEntryNullTokens(scope, stmts);
 
+    loop_scopes_.push_back(scope);
+    std::set<int> hoisted_wait_tokens =
+        AnalyzeHoistableWaitsForLoop(loop_scopes_.back());
+    for (int token : hoisted_wait_tokens) {
+      process_wait_token(stmts, token);
+    }
+    loop_hoisted_wait_tokens_stack_.push_back(hoisted_wait_tokens);
+
+    ffi::Map<Var, arith::IntSet> old_loop_domains = loop_domains_;
+    if (CanUseLoopDomainForRegionCover(loop->min) &&
+        CanUseLoopDomainForRegionCover(loop->extent)) {
+      loop_domains_.Set(loop->loop_var,
+                        arith::IntSet::FromRange(
+                            Range::FromMinExtent(loop->min, loop->extent)));
+    }
     Stmt loop_stmt = StmtMutator::VisitStmt_(loop);
+    loop_domains_ = std::move(old_loop_domains);
 
     scope = loop_scopes_.back();
     loop_scopes_.pop_back();
+    loop_hoisted_wait_tokens_stack_.pop_back();
     ClearOwnedPreAssignedTokens(owned_pre_assignments);
 
-    InjectLoopEntryNullTokens(scope, stmts);
     stmts.push_back(loop_stmt);
 
     if (const auto *realize = loop->body.as<BlockRealizeNode>()) {
@@ -1514,11 +2084,182 @@ private:
   Array<Array<ObjectRef>> write_buffers;
   Map<Array<ObjectRef>, int> read_buffer_token_map;
   Map<Array<ObjectRef>, int> write_buffer_token_map;
-  TokenBarrierMap token_to_barrier_mask_;
+  std::set<int> available_tokens_;
 
   Map<Var, Buffer> buffer_data_to_buffer_;
+  PrimExpr current_kernel_core_id_;
+  ffi::Map<Var, arith::IntSet> loop_domains_;
   std::vector<LoopScope> loop_scopes_;
+  std::vector<std::set<int>> loop_hoisted_wait_tokens_stack_;
   std::map<const EvaluateNode *, int> pre_assigned_tokens_;
+};
+
+// Rewriter to repair loop-local token reuse after InjectSyncRewriter has
+// attached concrete sync_token_id/wait_token calls. If a loop body generates a
+// token but contains no wait for that token anywhere in the body, the next
+// iteration would overwrite the previous iteration's token. Insert a wait
+// before each generation site and seed the first iteration with a null token.
+class LoopMissingTokenWaitRewriter : public StmtMutator {
+public:
+  Stmt operator()(Stmt body) { return this->VisitStmt(body); }
+
+private:
+  static std::optional<int> TryGetTokenId(const CallNode *call) {
+    if (!call || call->args.empty()) {
+      return std::nullopt;
+    }
+    if (const auto *imm = call->args[0].as<IntImmNode>()) {
+      return static_cast<int>(imm->value);
+    }
+    return std::nullopt;
+  }
+
+  static Stmt MakeWaitTokenStmt(int token_id) {
+    return Evaluate(Call(DataType::Handle(), wait_token(),
+                         {IntImm(DataType::Int(32), token_id)}));
+  }
+
+  static Stmt MakeSyncNullTokenStmt(int token_id) {
+    return Evaluate(Call(DataType::Handle(), sync_null_token(),
+                         {IntImm(DataType::Int(32), token_id)}));
+  }
+
+  class LoopTokenUseCollector : public StmtExprVisitor {
+  public:
+    void VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(sync_token_id())) {
+        if (std::optional<int> token_id = TryGetTokenId(op)) {
+          generated_tokens.insert(*token_id);
+        }
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+    void VisitStmt_(const EvaluateNode *op) final {
+      if (const CallNode *call = op->value.as<CallNode>()) {
+        if (call->op.same_as(wait_token())) {
+          if (std::optional<int> token_id = TryGetTokenId(call)) {
+            waited_tokens.insert(*token_id);
+          }
+        }
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+
+    std::set<int> generated_tokens;
+    std::set<int> waited_tokens;
+  };
+
+  class GeneratedTokenCollector : public StmtExprVisitor {
+  public:
+    void VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(sync_token_id())) {
+        if (std::optional<int> token_id = TryGetTokenId(op)) {
+          tokens.insert(*token_id);
+        }
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+    void VisitStmt_(const ForNode *op) final {}
+    void VisitStmt_(const WhileNode *op) final {}
+
+    std::set<int> tokens;
+  };
+
+  static void PushFlatten(Array<Stmt> *stmts, const Stmt &stmt) {
+    if (!stmt.defined()) {
+      return;
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const Stmt &child : seq->seq) {
+        PushFlatten(stmts, child);
+      }
+      return;
+    }
+    stmts->push_back(stmt);
+  }
+
+  std::set<int> GetMissingWaitTokens(const Stmt &body) const {
+    LoopTokenUseCollector collector;
+    collector(body);
+
+    std::set<int> missing_tokens;
+    for (int token_id : collector.generated_tokens) {
+      if (collector.waited_tokens.count(token_id) == 0) {
+        missing_tokens.insert(token_id);
+      }
+    }
+    return missing_tokens;
+  }
+
+  Stmt PrependSyncNullTokens(const Stmt &loop_stmt,
+                             const std::set<int> &tokens) const {
+    if (tokens.empty()) {
+      return loop_stmt;
+    }
+    Array<Stmt> stmts;
+    for (int token_id : tokens) {
+      stmts.push_back(MakeSyncNullTokenStmt(token_id));
+    }
+    stmts.push_back(loop_stmt);
+    return SeqStmt::Flatten(stmts);
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> out;
+    for (const Stmt &stmt : op->seq) {
+      PushFlatten(&out, VisitStmt(stmt));
+    }
+    return SeqStmt::Flatten(out);
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    Stmt stmt = ffi::GetRef<Stmt>(op);
+    GeneratedTokenCollector collector;
+    collector(stmt);
+
+    Array<Stmt> stmts;
+    for (int token_id : collector.tokens) {
+      if (tokens_to_wait_before_.count(token_id) != 0) {
+        stmts.push_back(MakeWaitTokenStmt(token_id));
+      }
+    }
+    stmts.push_back(stmt);
+    return SeqStmt::Flatten(stmts);
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    Stmt body = StmtMutator::VisitStmt(op->body);
+    std::set<int> missing_tokens = GetMissingWaitTokens(body);
+    if (!missing_tokens.empty()) {
+      std::set<int> old_tokens_to_wait_before = tokens_to_wait_before_;
+      tokens_to_wait_before_ = missing_tokens;
+      body = VisitStmt(body);
+      tokens_to_wait_before_ = std::move(old_tokens_to_wait_before);
+    }
+
+    Stmt loop_stmt =
+        For(op->loop_var, op->min, op->extent, op->kind, body,
+            op->thread_binding, op->annotations, std::nullopt, op->span);
+    return PrependSyncNullTokens(loop_stmt, missing_tokens);
+  }
+
+  Stmt VisitStmt_(const WhileNode *op) final {
+    Stmt body = StmtMutator::VisitStmt(op->body);
+    std::set<int> missing_tokens = GetMissingWaitTokens(body);
+    if (!missing_tokens.empty()) {
+      std::set<int> old_tokens_to_wait_before = tokens_to_wait_before_;
+      tokens_to_wait_before_ = missing_tokens;
+      body = VisitStmt(body);
+      tokens_to_wait_before_ = std::move(old_tokens_to_wait_before);
+    }
+
+    Stmt loop_stmt = While(op->condition, body);
+    return PrependSyncNullTokens(loop_stmt, missing_tokens);
+  }
+
+  std::set<int> tokens_to_wait_before_;
 };
 
 // Rewriter to inject final synchronization waits before the device function
@@ -1527,19 +2268,23 @@ private:
 // implicit function exits.
 class DeviceFuncWaitRewriter : public StmtMutator {
 public:
-  DeviceFuncWaitRewriter(TokenBarrierMap token_to_barrier_mask)
-      : token_to_barrier_mask_(std::move(token_to_barrier_mask)) {}
-
   Stmt operator()(Stmt body) { return this->VisitStmt(body); }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key == tir::attr::thread_extent) {
+      bool is_outermost_thread_extent = thread_extent_depth_ == 0;
+      ++thread_extent_depth_;
       Stmt body = StmtMutator::VisitStmt(op->body);
+      --thread_extent_depth_;
 
-      DeviceTokenCollector collector;
+      if (!is_outermost_thread_extent) {
+        return AttrStmt(op->node, op->attr_key, op->value, body);
+      }
+
+      DevicePendingTokenCollector collector;
       collector(body);
 
-      if (collector.tokens.empty()) {
+      if (collector.pending_tokens.empty()) {
         return AttrStmt(op->node, op->attr_key, op->value, body);
       }
 
@@ -1550,18 +2295,13 @@ public:
         stmts.push_back(body);
       }
 
-      std::vector<int> tokens(collector.tokens.begin(), collector.tokens.end());
+      std::vector<int> tokens(collector.pending_tokens.begin(),
+                              collector.pending_tokens.end());
       std::sort(tokens.begin(), tokens.end());
 
       for (int token_id : tokens) {
         stmts.push_back(Evaluate(Call(DataType::Handle(), wait_token(),
                                       {IntImm(DataType::Int(32), token_id)})));
-        auto barrier_it = token_to_barrier_mask_.find(token_id);
-        if (barrier_it != token_to_barrier_mask_.end()) {
-          stmts.push_back(
-              Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
-                            MakeBarrierArgs(barrier_it->second))));
-        }
       }
       return AttrStmt(op->node, op->attr_key, op->value,
                       SeqStmt::Flatten(stmts));
@@ -1574,19 +2314,55 @@ public:
   }
 
 private:
-  TokenBarrierMap token_to_barrier_mask_;
+  int thread_extent_depth_{0};
 
-  // Helper to collect all token IDs referenced within the device block.
-  class DeviceTokenCollector : public StmtExprVisitor {
+  // Helper to collect token IDs that are still pending at device-function exit.
+  class DevicePendingTokenCollector : public StmtExprVisitor {
   public:
     void VisitExpr_(const CallNode *op) final {
       if (op->op.same_as(sync_token_id())) {
         int token_id = op->args[0].as<IntImm>().value()->value;
-        tokens.insert(token_id);
+        pending_tokens.insert(token_id);
       }
       StmtExprVisitor::VisitExpr_(op);
     }
-    std::set<int> tokens;
+
+    void VisitStmt_(const EvaluateNode *op) final {
+      if (const CallNode *call = op->value.as<CallNode>()) {
+        if (call->op.same_as(wait_token())) {
+          if (!call->args.empty() && call->args[0].as<IntImmNode>()) {
+            pending_tokens.erase(call->args[0].as<IntImmNode>()->value);
+          }
+        }
+      }
+      StmtExprVisitor::VisitStmt_(op);
+    }
+
+    void VisitStmt_(const IfThenElseNode *op) final {
+      auto pending_before = pending_tokens;
+
+      VisitStmt(op->then_case);
+      auto then_pending = pending_tokens;
+
+      pending_tokens = pending_before;
+      if (op->else_case.defined()) {
+        VisitStmt(op->else_case.value());
+      }
+
+      pending_tokens.insert(then_pending.begin(), then_pending.end());
+    }
+
+    void VisitStmt_(const ForNode *op) final { VisitStmt(op->body); }
+
+    void VisitStmt_(const WhileNode *op) final { VisitStmt(op->body); }
+
+    void VisitStmt_(const SeqStmtNode *op) final {
+      for (const Stmt &stmt : op->seq) {
+        VisitStmt(stmt);
+      }
+    }
+
+    std::set<int> pending_tokens;
   };
 };
 
@@ -1682,18 +2458,14 @@ public:
   }
 };
 
-// Optimization pass to remove redundant token waits. Barrier arrive-and-wait is
-// kept as the paired synchronization event for the token wait that introduced
-// it; it is not used to infer token completion by participant mask.
+// Optimization pass to remove redundant token waits. Collective barriers are
+// independent launch epochs and are never inferred from or removed with a
+// token wait.
 class EliminateRedundancyRewriter : public StmtMutator {
 public:
   EliminateRedundancyRewriter(arith::Analyzer *analyzer = nullptr,
-                              std::vector<int> parent_token_ids = {},
-                              TokenBarrierMap token_to_barrier_mask = {})
-      : analyzer_(analyzer), parent_token_ids_(std::move(parent_token_ids)),
-        token_to_barrier_mask_(std::move(token_to_barrier_mask)) {
-    current_token_ids_ = {};
-  }
+                              std::vector<int> parent_token_ids = {})
+      : analyzer_(analyzer), parent_token_ids_(std::move(parent_token_ids)) {}
 
   std::vector<int> get_current_token_ids() const { return current_token_ids_; }
 
@@ -1712,17 +2484,37 @@ private:
                      token_id) != current_token_ids_.end();
   }
 
-  bool IsBarrierWaitForToken(const Stmt &stmt, int token_id) const {
-    auto it = token_to_barrier_mask_.find(token_id);
-    if (it == token_to_barrier_mask_.end()) {
-      return false;
+  void MarkTokenPending(int token_id) {
+    current_token_ids_.erase(std::remove(current_token_ids_.begin(),
+                                         current_token_ids_.end(), token_id),
+                             current_token_ids_.end());
+  }
+
+  void MarkGeneratedAsyncTokensPending(const Stmt &stmt) {
+    class Collector final : public StmtExprVisitor {
+    public:
+      void VisitStmt_(const AttrStmtNode *op) final {}
+      void VisitStmt_(const ForNode *op) final {}
+      void VisitStmt_(const IfThenElseNode *op) final {}
+      void VisitStmt_(const WhileNode *op) final {}
+
+      void VisitExpr_(const CallNode *op) final {
+        if (op->op.same_as(sync_token_id()) && !op->args.empty()) {
+          if (const auto *imm = op->args[0].as<IntImmNode>()) {
+            token_ids.push_back(imm->value);
+          }
+        }
+        StmtExprVisitor::VisitExpr_(op);
+      }
+
+      std::vector<int> token_ids;
+    };
+
+    Collector collector;
+    collector(stmt);
+    for (int token_id : collector.token_ids) {
+      MarkTokenPending(token_id);
     }
-    const auto *eval = stmt.as<EvaluateNode>();
-    if (!eval) {
-      return false;
-    }
-    const auto *call = eval->value.as<CallNode>();
-    return BarrierCallMatchesInfo(call, it->second);
   }
 
   void MarkTokenResolved(int token_id) {
@@ -1784,38 +2576,15 @@ private:
     return true;
   }
 
-  bool MatchBarrierWaitStmt(const Stmt &stmt, BarrierMaskInfo *mask) const {
-    const auto *eval = stmt.as<EvaluateNode>();
-    if (!eval) {
-      return false;
-    }
-    const auto *call = eval->value.as<CallNode>();
-    if (!call || !call->op.same_as(barrier_arrive_and_wait()) ||
-        call->args.empty()) {
-      return false;
-    }
-    *mask = BarrierMaskInfoFromArgs(call->args);
-    return true;
-  }
-
-  void PushNonRedundantStmt(Array<Stmt> *out, const Stmt &stmt) const {
+  void PushFlatten(Array<Stmt> *out, const Stmt &stmt) const {
     if (!stmt.defined()) {
       return;
     }
     if (const auto *seq = stmt.as<SeqStmtNode>()) {
       for (const Stmt &child : seq->seq) {
-        PushNonRedundantStmt(out, child);
+        PushFlatten(out, child);
       }
       return;
-    }
-    if (!out->empty()) {
-      BarrierMaskInfo prev_mask;
-      BarrierMaskInfo curr_mask;
-      if (MatchBarrierWaitStmt((*out)[out->size() - 1], &prev_mask) &&
-          MatchBarrierWaitStmt(stmt, &curr_mask) &&
-          SameBarrierMaskInfo(prev_mask, curr_mask)) {
-        return;
-      }
     }
     out->push_back(stmt);
   }
@@ -1827,28 +2596,34 @@ private:
       int token_id = -1;
       if (MatchWaitTokenStmt(op->seq[i], &token_id)) {
         if (IsTokenResolved(token_id)) {
-          if (i + 1 < n && IsBarrierWaitForToken(op->seq[i + 1], token_id)) {
-            ++i;
-          }
           continue;
         }
         MarkTokenResolved(token_id);
       }
       Stmt rewritten = VisitStmt(op->seq[i]);
-      PushNonRedundantStmt(&out, rewritten);
+      MarkGeneratedAsyncTokensPending(rewritten);
+      PushFlatten(&out, rewritten);
     }
     return SeqStmt::Flatten(out);
   }
 
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    auto body_rewriter =
+        EliminateRedundancyRewriter(analyzer_, get_all_token_ids());
+    Stmt body = body_rewriter(op->body);
+    PropagateResolvedStates(body, /*guaranteed_to_execute=*/true);
+    return AttrStmt(op->node, op->attr_key, op->value, body, op->span);
+  }
+
   Stmt VisitStmt_(const IfThenElseNode *op) {
-    auto eliminate_sync_then_rewriter = EliminateRedundancyRewriter(
-        analyzer_, get_all_token_ids(), token_to_barrier_mask_);
+    auto eliminate_sync_then_rewriter =
+        EliminateRedundancyRewriter(analyzer_, get_all_token_ids());
     auto then_case = eliminate_sync_then_rewriter(op->then_case);
 
     Stmt else_case;
     if (op->else_case.defined()) {
-      auto eliminate_sync_else_rewriter = EliminateRedundancyRewriter(
-          analyzer_, get_all_token_ids(), token_to_barrier_mask_);
+      auto eliminate_sync_else_rewriter =
+          EliminateRedundancyRewriter(analyzer_, get_all_token_ids());
       else_case = eliminate_sync_else_rewriter(op->else_case.value());
 
       std::vector<int> then_tokens =
@@ -1873,8 +2648,8 @@ private:
   }
 
   Stmt VisitStmt_(const ForNode *op) {
-    auto eliminate_sync_loop_rewriter = EliminateRedundancyRewriter(
-        analyzer_, get_all_token_ids(), token_to_barrier_mask_);
+    auto eliminate_sync_loop_rewriter =
+        EliminateRedundancyRewriter(analyzer_, get_all_token_ids());
     auto body = eliminate_sync_loop_rewriter(op->body);
 
     bool is_guaranteed = false;
@@ -1895,8 +2670,8 @@ private:
   }
 
   Stmt VisitStmt_(const WhileNode *op) {
-    auto eliminate_sync_loop_rewriter = EliminateRedundancyRewriter(
-        analyzer_, get_all_token_ids(), token_to_barrier_mask_);
+    auto eliminate_sync_loop_rewriter =
+        EliminateRedundancyRewriter(analyzer_, get_all_token_ids());
     auto body = eliminate_sync_loop_rewriter(op->body);
 
     bool is_guaranteed = false;
@@ -1918,343 +2693,6 @@ private:
   // Token IDs that have been waited/synchronized along the current execution
   // path
   std::vector<int> current_token_ids_;
-  TokenBarrierMap token_to_barrier_mask_;
-};
-
-class HoistLoopWaitRewriter : public StmtMutator {
-public:
-  explicit HoistLoopWaitRewriter(TokenBarrierMap token_to_barrier_mask)
-      : token_to_barrier_mask_(std::move(token_to_barrier_mask)) {}
-
-  Stmt operator()(Stmt body) { return VisitStmt(body); }
-
-private:
-  static bool MatchWaitTokenStmt(const Stmt &s, int *token_id) {
-    const auto *eval = s.as<EvaluateNode>();
-    if (!eval) {
-      return false;
-    }
-    const auto *call = eval->value.as<CallNode>();
-    if (!call || !call->op.same_as(wait_token()) || call->args.size() != 1) {
-      return false;
-    }
-    const auto *imm = call->args[0].as<IntImmNode>();
-    if (!imm) {
-      return false;
-    }
-    *token_id = imm->value;
-    return true;
-  }
-
-  static bool
-  IsBarrierWaitForToken(const Stmt &s, int token_id,
-                        const TokenBarrierMap &token_to_barrier_mask) {
-    auto mask_it = token_to_barrier_mask.find(token_id);
-    if (mask_it == token_to_barrier_mask.end()) {
-      return false;
-    }
-    const auto *eval = s.as<EvaluateNode>();
-    if (!eval) {
-      return false;
-    }
-    const auto *call = eval->value.as<CallNode>();
-    return BarrierCallMatchesInfo(call, mask_it->second);
-  }
-
-  static Stmt MakeWaitTokenStmt(int token_id) {
-    return Evaluate(Call(DataType::Handle(), wait_token(),
-                         {IntImm(DataType::Int(32), token_id)}));
-  }
-
-  static Stmt MakeBarrierWaitStmt(const BarrierMaskInfo &participant_mask) {
-    return Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
-                         MakeBarrierArgs(participant_mask)));
-  }
-
-  class RemoveWaitsRewriter : public StmtMutator {
-  public:
-    RemoveWaitsRewriter(std::unordered_set<int> tokens,
-                        TokenBarrierMap token_to_barrier_mask)
-        : tokens_(std::move(tokens)),
-          token_to_barrier_mask_(std::move(token_to_barrier_mask)) {}
-
-    Stmt VisitStmt_(const SeqStmtNode *op) final {
-      Array<Stmt> out;
-      out.reserve(op->seq.size());
-      for (int i = 0, n = static_cast<int>(op->seq.size()); i < n; ++i) {
-        int token_id = -1;
-        if (MatchWaitTokenStmt(op->seq[i], &token_id) &&
-            tokens_.count(token_id) != 0) {
-          if (i + 1 < n && IsBarrierWaitForToken(op->seq[i + 1], token_id,
-                                                 token_to_barrier_mask_)) {
-            ++i;
-          }
-          continue;
-        }
-        Stmt ns = VisitStmt(op->seq[i]);
-        if (ns.defined()) {
-          out.push_back(ns);
-        }
-      }
-      return SeqStmt::Flatten(out);
-    }
-
-    Stmt VisitStmt_(const EvaluateNode *op) final {
-      const CallNode *call = op->value.as<CallNode>();
-      if (!call) {
-        return StmtMutator::VisitStmt_(op);
-      }
-      return StmtMutator::VisitStmt_(op);
-    }
-
-  private:
-    std::unordered_set<int> tokens_;
-    TokenBarrierMap token_to_barrier_mask_;
-  };
-
-  struct HoistPlan {
-    std::vector<Stmt> actions;
-    std::unordered_set<int> tokens_to_remove;
-  };
-
-  class LoopWaitCollector : public StmtVisitor {
-  public:
-    LoopWaitCollector(const std::set<int> &available_tokens,
-                      const std::set<int> &generated_tokens_in_loop,
-                      const TokenBarrierMap &token_to_barrier_mask)
-        : available_tokens_(available_tokens),
-          generated_tokens_in_loop_(generated_tokens_in_loop),
-          token_to_barrier_mask_(token_to_barrier_mask) {}
-
-    HoistPlan plan;
-
-    void VisitStmt_(const SeqStmtNode *op) final {
-      int n = static_cast<int>(op->seq.size());
-      int i = 0;
-      while (i < n) {
-        int t = -1;
-        if (MatchWaitTokenStmt(op->seq[i], &t)) {
-          bool token_ok =
-              available_tokens_.count(t) && !generated_tokens_in_loop_.count(t);
-          if (token_ok) {
-            plan.actions.push_back(MakeWaitTokenStmt(t));
-            auto mask_it = token_to_barrier_mask_.find(t);
-            if (mask_it != token_to_barrier_mask_.end() && i + 1 < n &&
-                IsBarrierWaitForToken(op->seq[i + 1], t,
-                                      token_to_barrier_mask_)) {
-              plan.actions.push_back(MakeBarrierWaitStmt(mask_it->second));
-              i += 2;
-            } else {
-              i += 1;
-            }
-            plan.tokens_to_remove.insert(t);
-            continue;
-          }
-          i += 1;
-          continue;
-        }
-
-        VisitStmt(op->seq[i]);
-        i += 1;
-      }
-    }
-
-    void VisitStmt_(const IfThenElseNode *op) final {
-      VisitStmt(op->then_case);
-      if (op->else_case.defined()) {
-        VisitStmt(op->else_case.value());
-      }
-    }
-
-    void VisitStmt_(const ForNode *op) final { VisitStmt(op->body); }
-
-    void VisitStmt_(const WhileNode *op) final { VisitStmt(op->body); }
-
-    void VisitStmt_(const AttrStmtNode *op) final { VisitStmt(op->body); }
-
-    void VisitStmt_(const LetStmtNode *op) final { VisitStmt(op->body); }
-
-    void VisitStmt_(const AllocateNode *op) final { VisitStmt(op->body); }
-
-    void VisitStmt_(const AssertStmtNode *op) final { VisitStmt(op->body); }
-
-    void VisitStmt_(const BufferRealizeNode *op) final { VisitStmt(op->body); }
-
-    void VisitStmt_(const BlockRealizeNode *op) final { VisitStmt(op->block); }
-
-    void VisitStmt_(const BlockNode *op) final { VisitStmt(op->body); }
-
-  private:
-    const std::set<int> &available_tokens_;
-    const std::set<int> &generated_tokens_in_loop_;
-    const TokenBarrierMap &token_to_barrier_mask_;
-  };
-
-  struct HoistResult {
-    Array<Stmt> hoisted;
-    Stmt loop_stmt;
-  };
-
-  static void UpdateAvailability(const Stmt &s,
-                                 std::set<int> *available_tokens) {
-    AsyncResourceCollector collector;
-    collector(s);
-    for (int t : collector.generated_tokens) {
-      available_tokens->insert(t);
-    }
-  }
-
-  HoistResult HoistFromFor(const ForNode *op,
-                           const std::set<int> &available_tokens) {
-    AsyncResourceCollector loop_resources;
-    loop_resources(op->body);
-
-    LoopWaitCollector collector(available_tokens,
-                                loop_resources.generated_tokens,
-                                token_to_barrier_mask_);
-    collector(op->body);
-
-    HoistPlan plan = std::move(collector.plan);
-    if (plan.actions.empty()) {
-      return {Array<Stmt>(), ffi::GetRef<Stmt>(op)};
-    }
-
-    Array<Stmt> hoisted;
-    for (const Stmt &action : plan.actions) {
-      hoisted.push_back(action);
-    }
-
-    RemoveWaitsRewriter remover(std::move(plan.tokens_to_remove),
-                                token_to_barrier_mask_);
-    Stmt new_body = remover(op->body);
-    Stmt new_loop = For(op->loop_var, op->min, op->extent, op->kind, new_body,
-                        op->thread_binding, op->annotations);
-    return {hoisted, new_loop};
-  }
-
-  HoistResult HoistFromWhile(const WhileNode *op,
-                             const std::set<int> &available_tokens) {
-    AsyncResourceCollector loop_resources;
-    loop_resources(op->body);
-
-    LoopWaitCollector collector(available_tokens,
-                                loop_resources.generated_tokens,
-                                token_to_barrier_mask_);
-    collector(op->body);
-
-    HoistPlan plan = std::move(collector.plan);
-    if (plan.actions.empty()) {
-      return {Array<Stmt>(), ffi::GetRef<Stmt>(op)};
-    }
-
-    Array<Stmt> hoisted;
-    for (const Stmt &action : plan.actions) {
-      hoisted.push_back(action);
-    }
-
-    RemoveWaitsRewriter remover(std::move(plan.tokens_to_remove),
-                                token_to_barrier_mask_);
-    Stmt new_body = remover(op->body);
-    Stmt new_loop = While(op->condition, new_body);
-    return {hoisted, new_loop};
-  }
-
-  Stmt VisitStmt_(const SeqStmtNode *op) final {
-    std::set<int> available_tokens;
-
-    Array<Stmt> out;
-    out.reserve(op->seq.size());
-    for (const Stmt &s : op->seq) {
-      available_tokens_ = available_tokens;
-
-      Stmt ns = VisitStmt(s);
-      if (ns.defined()) {
-        out.push_back(ns);
-        UpdateAvailability(ns, &available_tokens);
-      }
-    }
-
-    available_tokens_ = available_tokens;
-    return SeqStmt::Flatten(out);
-  }
-
-  Stmt VisitStmt_(const IfThenElseNode *op) final {
-    auto entry_tokens = available_tokens_;
-
-    available_tokens_ = entry_tokens;
-    Stmt then_case = VisitStmt(op->then_case);
-    auto then_end_tokens = available_tokens_;
-
-    ffi::Optional<Stmt> else_case = std::nullopt;
-    auto else_end_tokens = entry_tokens;
-    if (op->else_case.defined()) {
-      available_tokens_ = entry_tokens;
-      Stmt else_stmt = VisitStmt(op->else_case.value());
-      else_case = else_stmt;
-      else_end_tokens = available_tokens_;
-    }
-
-    available_tokens_ = entry_tokens;
-    UpdateAvailability(then_case, &available_tokens_);
-    if (else_case.defined()) {
-      UpdateAvailability(else_case.value(), &available_tokens_);
-    }
-
-    for (int t : then_end_tokens) {
-      available_tokens_.insert(t);
-    }
-    for (int t : else_end_tokens) {
-      available_tokens_.insert(t);
-    }
-
-    return IfThenElse(op->condition, then_case, else_case);
-  }
-
-  Stmt VisitStmt_(const ForNode *op) final {
-    auto entry_tokens = available_tokens_;
-
-    PrimExpr min = VisitExpr(op->min);
-    PrimExpr extent = VisitExpr(op->extent);
-    Stmt new_body = VisitStmt(op->body);
-    available_tokens_ = entry_tokens;
-    Stmt loop = For(op->loop_var, min, extent, op->kind, new_body,
-                    op->thread_binding, op->annotations);
-
-    HoistResult res = HoistFromFor(loop.as<ForNode>(), available_tokens_);
-    if (res.hoisted.empty()) {
-      UpdateAvailability(loop, &available_tokens_);
-      return loop;
-    }
-    Array<Stmt> seq = res.hoisted;
-    seq.push_back(res.loop_stmt);
-    Stmt out = SeqStmt::Flatten(seq);
-    UpdateAvailability(out, &available_tokens_);
-    return out;
-  }
-
-  Stmt VisitStmt_(const WhileNode *op) final {
-    auto entry_tokens = available_tokens_;
-
-    PrimExpr condition = VisitExpr(op->condition);
-    Stmt new_body = VisitStmt(op->body);
-    available_tokens_ = entry_tokens;
-    Stmt loop = While(condition, new_body);
-
-    HoistResult res = HoistFromWhile(loop.as<WhileNode>(), available_tokens_);
-    if (res.hoisted.empty()) {
-      UpdateAvailability(loop, &available_tokens_);
-      return loop;
-    }
-    Array<Stmt> seq = res.hoisted;
-    seq.push_back(res.loop_stmt);
-    Stmt out = SeqStmt::Flatten(seq);
-    UpdateAvailability(out, &available_tokens_);
-    return out;
-  }
-
-private:
-  std::set<int> available_tokens_;
-  TokenBarrierMap token_to_barrier_mask_;
 };
 
 class InitReusableBarriersRewriter : public StmtMutator {
@@ -2264,7 +2702,7 @@ public:
     if (HasThreadExtent(rewritten)) {
       return rewritten;
     }
-    return PrependBarrierInits(rewritten);
+    return PrependBarrierInits(rewritten, {});
   }
 
 private:
@@ -2283,17 +2721,41 @@ private:
 
   class BarrierMaskCollector : public StmtExprVisitor {
   public:
+    explicit BarrierMaskCollector(std::vector<Var> scoped_vars)
+        : scoped_vars_(std::move(scoped_vars)) {}
+
+    void VisitStmt_(const ForNode *op) final {
+      scoped_vars_.push_back(op->loop_var);
+      StmtExprVisitor::VisitStmt_(op);
+      scoped_vars_.pop_back();
+    }
+
+    void VisitStmt_(const LetStmtNode *op) final {
+      scoped_vars_.push_back(op->var);
+      StmtExprVisitor::VisitStmt_(op);
+      scoped_vars_.pop_back();
+    }
+
     void VisitStmt_(const EvaluateNode *op) final {
       if (const CallNode *call = op->value.as<CallNode>()) {
         if (call->op.same_as(barrier_arrive_and_wait()) &&
             !call->args.empty()) {
-          AddUniqueBarrierMaskInfo(&masks, BarrierMaskInfoFromArgs(call->args));
+          BarrierMaskInfo info = BarrierMaskInfoFromArgs(call->args);
+          ICHECK(!info.candidates.empty() ||
+                 !ExprUsesAnyVar(info.expr, scoped_vars_))
+              << "dynamic barrier mask depends on a local control-flow "
+                 "variable and cannot be initialized in the enclosing entry "
+                 "block required by suvm.barrier.init";
+          AddUniqueBarrierMaskInfo(&masks, info);
         }
       }
       StmtExprVisitor::VisitStmt_(op);
     }
 
     std::vector<BarrierMaskInfo> masks;
+
+  private:
+    std::vector<Var> scoped_vars_;
   };
 
   static Stmt MakeBarrierInitStmt(const BarrierMaskInfo &participant_mask) {
@@ -2307,8 +2769,9 @@ private:
     return finder.found;
   }
 
-  static Stmt PrependBarrierInits(const Stmt &body) {
-    BarrierMaskCollector collector;
+  static Stmt PrependBarrierInits(const Stmt &body,
+                                  const std::vector<Var> &scoped_vars) {
+    BarrierMaskCollector collector(scoped_vars);
     collector(body);
     if (collector.masks.empty()) {
       return body;
@@ -2338,95 +2801,31 @@ private:
       return AttrStmt(op->node, op->attr_key, op->value, body);
     }
     return AttrStmt(op->node, op->attr_key, op->value,
-                    PrependBarrierInits(body));
-  }
-};
-
-class CompactSyncIdsRewriter : public StmtExprMutator {
-public:
-  Stmt operator()(Stmt body) {
-    SyncIdCollector collector;
-    collector(body);
-    token_id_map_ = BuildDenseMap(collector.token_ids);
-    return VisitStmt(body);
+                    PrependBarrierInits(body, scoped_vars_));
   }
 
-private:
-  class SyncIdCollector : public StmtExprVisitor {
-  public:
-    void VisitExpr_(const CallNode *op) final {
-      if (IsTokenCall(op)) {
-        CollectId(op, &token_ids);
-      }
-      StmtExprVisitor::VisitExpr_(op);
+  Stmt VisitStmt_(const ForNode *op) final {
+    scoped_vars_.push_back(op->loop_var);
+    Stmt body = StmtMutator::VisitStmt(op->body);
+    scoped_vars_.pop_back();
+    if (body.same_as(op->body)) {
+      return ffi::GetRef<Stmt>(op);
     }
-
-    std::set<int> token_ids;
-
-  private:
-    static bool IsTokenCall(const CallNode *op) {
-      return op->op.same_as(sync_token_id()) ||
-             op->op.same_as(sync_null_token()) || op->op.same_as(wait_token());
-    }
-
-    static void CollectId(const CallNode *op, std::set<int> *ids) {
-      if (op->args.empty()) {
-        return;
-      }
-      if (const auto *imm = op->args[0].as<IntImmNode>()) {
-        ids->insert(imm->value);
-      }
-    }
-  };
-
-  static std::unordered_map<int, int> BuildDenseMap(const std::set<int> &ids) {
-    std::unordered_map<int, int> id_map;
-    int next_id = 0;
-    for (int old_id : ids) {
-      id_map.emplace(old_id, next_id++);
-    }
-    return id_map;
+    return For(op->loop_var, op->min, op->extent, op->kind, body,
+               op->thread_binding, op->annotations, std::nullopt, op->span);
   }
 
-  static bool IsTokenCall(const CallNode *op) {
-    return op->op.same_as(sync_token_id()) ||
-           op->op.same_as(sync_null_token()) || op->op.same_as(wait_token());
+  Stmt VisitStmt_(const LetStmtNode *op) final {
+    scoped_vars_.push_back(op->var);
+    Stmt body = StmtMutator::VisitStmt(op->body);
+    scoped_vars_.pop_back();
+    if (body.same_as(op->body)) {
+      return ffi::GetRef<Stmt>(op);
+    }
+    return LetStmt(op->var, op->value, body, op->span);
   }
 
-  PrimExpr RemapFirstArg(const CallNode *op,
-                         const std::unordered_map<int, int> &id_map) {
-    if (op->args.empty()) {
-      return ffi::GetRef<PrimExpr>(op);
-    }
-
-    const auto *imm = op->args[0].as<IntImmNode>();
-    if (!imm) {
-      return ffi::GetRef<PrimExpr>(op);
-    }
-
-    auto it = id_map.find(imm->value);
-    if (it == id_map.end()) {
-      return ffi::GetRef<PrimExpr>(op);
-    }
-
-    Array<PrimExpr> new_args = op->args;
-    new_args.Set(0, IntImm(imm->dtype, it->second));
-    return Call(op->dtype, op->op, new_args, op->annotations, op->span);
-  }
-
-  PrimExpr VisitExpr_(const CallNode *op) final {
-    PrimExpr expr = StmtExprMutator::VisitExpr_(op);
-    const auto *call = expr.as<CallNode>();
-    if (!call) {
-      return expr;
-    }
-    if (IsTokenCall(call)) {
-      return RemapFirstArg(call, token_id_map_);
-    }
-    return expr;
-  }
-
-  std::unordered_map<int, int> token_id_map_;
+  std::vector<Var> scoped_vars_;
 };
 
 // Main rewriter orchestrating the synchronization injection passes.
@@ -2439,34 +2838,23 @@ public:
 
   static PrimFunc Rewrite(PrimFunc f, arith::Analyzer *analyzer) {
     auto target = f->GetAttr<Target>(tvm::attr::kTarget).value();
-    SunmmioMeshConfig mesh = GetSunmmioMeshConfig(target);
-    int mesh_nrow = mesh.nrow;
-    int mesh_ncol = mesh.ncol;
 
     auto inject_sync_rewriter =
-        InjectSyncRewriter(f->buffer_map, mesh_nrow, mesh_ncol, analyzer);
+        InjectSyncRewriter(f->buffer_map, target, analyzer);
     f.CopyOnWrite()->body = inject_sync_rewriter(f->body);
 
-    TokenBarrierMap token_to_barrier_mask =
-        inject_sync_rewriter.get_token_to_barrier_mask();
+    auto loop_missing_token_wait_rewriter = LoopMissingTokenWaitRewriter();
+    f.CopyOnWrite()->body = loop_missing_token_wait_rewriter(f->body);
 
-    auto device_func_wait_rewriter =
-        DeviceFuncWaitRewriter(token_to_barrier_mask);
+    auto device_func_wait_rewriter = DeviceFuncWaitRewriter();
     f.CopyOnWrite()->body = device_func_wait_rewriter(f->body);
 
-    auto hoist_loop_wait_rewriter =
-        HoistLoopWaitRewriter(token_to_barrier_mask);
-    f.CopyOnWrite()->body = hoist_loop_wait_rewriter(f->body);
-
-    auto eliminate_redundancy_rewriter = EliminateRedundancyRewriter(
-        analyzer, std::vector<int>({}), token_to_barrier_mask);
+    auto eliminate_redundancy_rewriter =
+        EliminateRedundancyRewriter(analyzer, std::vector<int>({}));
     f.CopyOnWrite()->body = eliminate_redundancy_rewriter(f->body);
 
     auto init_reusable_barriers_rewriter = InitReusableBarriersRewriter();
     f.CopyOnWrite()->body = init_reusable_barriers_rewriter(f->body);
-
-    auto compact_sync_ids_rewriter = CompactSyncIdsRewriter();
-    f.CopyOnWrite()->body = compact_sync_ids_rewriter(f->body);
 
     return f;
   }

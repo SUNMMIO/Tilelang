@@ -434,6 +434,32 @@ static int GetArchInt(Target target) {
   return arch_int;
 }
 
+static int64_t GetStaticBufferDim(const Buffer &buffer, int axis,
+                                  const char *operand) {
+  ICHECK_GE(axis, 0);
+  ICHECK_LT(axis, static_cast<int>(buffer->shape.size()));
+  const auto *dim = buffer->shape[axis].as<IntImmNode>();
+  ICHECK(dim) << "Sunmmio MX " << operand
+              << " operand alignment check requires static shape on axis "
+              << axis << ", got " << buffer->shape[axis];
+  return static_cast<int64_t>(dim->value);
+}
+
+static void CheckSunmmioMXOperandBlockAligned(const Buffer &buffer, int axis,
+                                              const char *operand,
+                                              const char *layout_name) {
+  constexpr int64_t kMXBlockExtent = 32;
+  constexpr int64_t kOperandBlockAlign = 2;
+  int64_t extent = GetStaticBufferDim(buffer, axis, operand);
+  int64_t blocks = (extent + kMXBlockExtent - 1) / kMXBlockExtent;
+  ICHECK_EQ(blocks % kOperandBlockAlign, 0)
+      << "Sunmmio MX " << operand << " operand layout " << layout_name
+      << " requires the aligned axis block count to be a multiple of "
+      << kOperandBlockAlign << "; got " << blocks << " blocks on axis " << axis
+      << " for extent " << extent
+      << ". Explicit MX operand padding is not implemented yet.";
+}
+
 /**
  * @brief Lower the GEMM operator to a TL TIR call expression.
  *
@@ -868,18 +894,34 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
     ICHECK_GE(rank_a, 2)
         << "Sunmmio GEMM A layout inference requires rank >= 2.";
     Array<Integer> axes_a{Integer(rank_a - 2), Integer(rank_a - 1)};
-    auto l = sunmmio::MakeZZ(a_->shape, axes_a,
-                             GetSunmmioLayoutBlockShape(T.target, a_->dtype));
+    Layout l;
+    if (sunmmio::IsMXDType(a_->dtype)) {
+      CheckSunmmioMXOperandBlockAligned(a_, rank_a - 1, "A", "MXZZ");
+      l = sunmmio::MakeMXZZ(a_->shape, axes_a, a_->dtype);
+    } else {
+      l = sunmmio::MakeZZ(a_->shape, axes_a,
+                          GetSunmmioLayoutBlockShape(T.target, a_->dtype));
+    }
     results.Set(a_, l);
 
     const int rank_b = static_cast<int>(b_->shape.size());
     ICHECK_GE(rank_b, 2)
         << "Sunmmio GEMM B layout inference requires rank >= 2.";
     Array<Integer> axes_b{Integer(rank_b - 2), Integer(rank_b - 1)};
-    auto block_shape_b = GetSunmmioLayoutBlockShape(T.target, b_->dtype);
     // transB_ => TMM.MT mode => ZZ layout; !transB_ => TMM.MN mode => ZN layout
-    l = transB_ ? sunmmio::MakeZZ(b_->shape, axes_b, block_shape_b)
-                : sunmmio::MakeZN(b_->shape, axes_b, block_shape_b);
+    if (sunmmio::IsMXDType(b_->dtype)) {
+      if (transB_) {
+        CheckSunmmioMXOperandBlockAligned(b_, rank_b - 1, "B", "MXZZ");
+        l = sunmmio::MakeMXZZ(b_->shape, axes_b, b_->dtype);
+      } else {
+        CheckSunmmioMXOperandBlockAligned(b_, rank_b - 2, "B", "MXZNN");
+        l = sunmmio::MakeMXZNN(b_->shape, axes_b, b_->dtype);
+      }
+    } else {
+      auto block_shape_b = GetSunmmioLayoutBlockShape(T.target, b_->dtype);
+      l = transB_ ? sunmmio::MakeZZ(b_->shape, axes_b, block_shape_b)
+                  : sunmmio::MakeZN(b_->shape, axes_b, block_shape_b);
+    }
     results.Set(b_, l);
 
     const int rank_c = static_cast<int>(c_->shape.size());

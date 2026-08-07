@@ -24,6 +24,7 @@ TL_ROOT = os.path.dirname(os.path.abspath(__file__))
 # common top-level module names (e.g., utils, analysis) from user projects.
 TL_LIBS = [os.path.join(TL_ROOT, "lib")]
 TL_LIBS = [i for i in TL_LIBS if os.path.exists(i)]
+TL_BINS = [os.path.join(TL_ROOT, "bin")]
 
 DEV = False
 THIRD_PARTY_ROOT = os.path.join(TL_ROOT, "3rdparty")
@@ -35,6 +36,7 @@ if not os.path.exists(THIRD_PARTY_ROOT):
     # In dev builds, place artifacts under build/lib and point search path there
     # to avoid adding the entire build root to sys.path.
     TL_LIBS = [os.path.join(dev_lib_root, "lib"), os.path.join(dev_lib_root, "tvm")]
+    TL_BINS = [os.path.join(dev_lib_root, "bin")]
     THIRD_PARTY_ROOT = os.path.join(tl_dev_root, "3rdparty")
     logger.warning(f"Loading tilelang libs from dev root: {dev_lib_root}")
 

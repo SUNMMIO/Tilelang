@@ -30,6 +30,8 @@ struct ODMACost {
     kDmaBytesPerCycle = 1024,
     kLayoutTransformStartupLatency = 10,
     kLayoutTransformBytesPerCycle = 512,
+    kTransposeStartupLatency = 10,
+    kTransposeBytesPerCycle = 512,
     kBroadcastHorizontalBytesPerCycle = 1024,
     kBroadcastVerticalBytesPerCycle = 2048,
   };
@@ -337,6 +339,20 @@ float CostModel::EstimateODMADelay(const tir::Stmt &stmt) {
      * transfer. */
     return ODMACost::kLayoutTransformStartupLatency +
            ceil_div(total_bytes, ODMACost::kLayoutTransformBytesPerCycle);
+  } else if (call->op.same_as(Op::Get("tl.sunmmio_transpose"))) {
+    BufferRegion src_region = NormalizeToBufferRegion(call->args[0]);
+    int total_elements = 1;
+    for (const Range &range : src_region->region) {
+      ICHECK(range->extent.as<IntImmNode>())
+          << "ODMA sunmmio_transpose source extents must be IntImm: " << stmt;
+      total_elements *= range->extent.as<IntImmNode>()->value;
+    }
+    int bytes_per_element = ceil_div(src_region->buffer->dtype.bits() *
+                                         src_region->buffer->dtype.lanes(),
+                                     8);
+    int total_bytes = total_elements * bytes_per_element;
+    return ODMACost::kTransposeStartupLatency +
+           ceil_div(total_bytes, ODMACost::kTransposeBytesPerCycle);
   } else if (call->op.same_as(Op::Get("tl.broadcast_"))) {
     ICHECK(call->args[kBroadcastArgDirection].as<IntImmNode>())
         << "ODMA broadcast direction must be IntImm: " << stmt;

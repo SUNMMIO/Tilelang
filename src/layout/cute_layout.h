@@ -223,6 +223,20 @@ DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
                  arith::Analyzer *analyzer = nullptr);
 
 /*!
+ * \brief Derive a layout for \p dst_shape while preserving dtype-specific
+ *        physical storage semantics.
+ *
+ * For SUVM MX dtypes this dispatches to sunmmio::DeriveMXLayoutLike so MX
+ * row-major, MXZZ, MXZNN, and MXZNZ keep their data/scale/padding storage
+ * strides.
+ * Other dtypes use the generic DeriveLayoutLike path.
+ */
+Optional<Layout> DeriveLayoutLikeForDType(
+    const Layout &src, Array<PrimExpr> dst_shape, DataType dtype,
+    Optional<Array<Integer>> axis_map = Optional<Array<Integer>>(),
+    arith::Analyzer *analyzer = nullptr);
+
+/*!
  * \brief Canonicalize a physically-row-major layout to plain row-major;
  *        return anything else unchanged.
  *
@@ -287,6 +301,8 @@ struct ZZBlockShape {
  */
 std::optional<ZZBlockShape> GetZZBlockShape(const Layout &layout);
 
+bool IsMXDType(DataType dtype);
+
 Layout MakeRowMajor(Array<PrimExpr> shape);
 
 /*!
@@ -312,6 +328,36 @@ Layout MakeZZZ(Array<PrimExpr> shape, Array<Integer> axes,
 
 Layout MakeNZZ(Array<PrimExpr> shape, Array<Integer> axes,
                Array<PrimExpr> block_shape, Array<PrimExpr> cluster_shape);
+
+Layout MakeMXZZ(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype);
+
+Layout MakeMXZNN(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype);
+
+Layout MakeMXZNZ(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype);
+
+Layout MakeMXRowMajor(Array<PrimExpr> shape, DataType dtype);
+
+enum class MXLayoutKind {
+  kRowMajor,
+  kMXZZ,
+  kMXZNN,
+  kMXZNZ,
+};
+
+struct MXLayoutAnalysis {
+  MXLayoutKind kind;
+  Array<PrimExpr> logical_shape;
+  Array<PrimExpr> physical_extent;
+  Array<PrimExpr> scale_shape;
+};
+
+std::optional<MXLayoutAnalysis>
+AnalyzeMXLayout(const Layout &layout, DataType dtype,
+                arith::Analyzer *analyzer = nullptr);
+
+Optional<Layout> DeriveMXLayoutLike(const Layout &src,
+                                    Array<PrimExpr> dst_shape, DataType dtype,
+                                    arith::Analyzer *analyzer = nullptr);
 
 } // namespace sunmmio
 

@@ -1,6 +1,5 @@
 import tilelang.language as T
 from tilelang.layout import make_zz_layout
-from tilelang.carver.arch import driver
 
 
 def flashattn(batch, heads, seq_len, dim, groups=1, block_M=64, block_N=64, num_stages=0):
@@ -12,9 +11,6 @@ def flashattn(batch, heads, seq_len, dim, groups=1, block_M=64, block_N=64, num_
     accum_dtype = T.float32
 
     shard_policy = T.MeshShardingPolicy(y=0, x=2)
-    device_mesh_config = driver.get_sunmmio_device_mesh_config()
-    nrows, ncols = device_mesh_config
-    ncores = nrows * ncols
 
     Q_layout = make_zz_layout(q_shape, [1, 3], (32, 32))
     K_layout = make_zz_layout(kv_shape, [1, 3], (32, 32))
@@ -23,15 +19,15 @@ def flashattn(batch, heads, seq_len, dim, groups=1, block_M=64, block_N=64, num_
 
     @T.prim_func
     def main(
-        Q: T.MeshTensor(q_shape, shard_policy, device_mesh_config, dtype, layout=Q_layout),
-        K: T.MeshTensor(kv_shape, shard_policy, device_mesh_config, dtype, layout=K_layout),
-        V: T.MeshTensor(kv_shape, shard_policy, device_mesh_config, dtype, layout=V_layout),
-        Output: T.MeshTensor(q_shape, shard_policy, device_mesh_config, dtype, layout=O_layout),
+        Q: T.MeshTensor(q_shape, shard_policy, dtype, layout=Q_layout),
+        K: T.MeshTensor(kv_shape, shard_policy, dtype, layout=K_layout),
+        V: T.MeshTensor(kv_shape, shard_policy, dtype, layout=V_layout),
+        Output: T.MeshTensor(q_shape, shard_policy, dtype, layout=O_layout),
     ):
-        with T.Kernel(ncores) as _cid:
+        with T.Kernel() as _cid:
             # Get sharded logical shapes
-            sharded_batch = Q.shape[0]
-            sharded_heads = Q.shape[2]
+            sharded_batch = Q.local_shape[0]
+            sharded_heads = Q.local_shape[2]
 
             # Declare shared memory buffers
             Q_shared = T.alloc_shared([block_M, dim], dtype)

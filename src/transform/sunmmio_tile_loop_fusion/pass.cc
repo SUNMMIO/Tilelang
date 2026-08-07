@@ -44,6 +44,8 @@
 #include "planner.h"
 #include "utils.h"
 
+#include "../common/substitute_with_buffer_predicates.h"
+
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/ir/transform.h>
 #include <tvm/node/structural_equal.h>
@@ -225,14 +227,14 @@ Stmt BuildPrivateExecutionSuffix(const TileScopeRegion &region,
   Stmt body = region.execution_loops.empty()
                   ? region.scope_entry_for->body
                   : region.execution_loops.back()->body;
-  body = Substitute(body, subst);
+  body = SubstituteWithBufferPredicates(body, subst);
 
   for (int i = static_cast<int>(region.execution_loops.size()) - 1;
        i >= shared_depth; --i) {
     const For &loop = region.execution_loops[i];
-    body = For(loop->loop_var, Substitute(loop->min, subst),
-               Substitute(loop->extent, subst), loop->kind, body,
-               loop->thread_binding, loop->annotations);
+    body = For(loop->loop_var, SubstituteWithBufferPredicates(loop->min, subst),
+               SubstituteWithBufferPredicates(loop->extent, subst), loop->kind,
+               body, loop->thread_binding, loop->annotations);
   }
   return body;
 }
@@ -303,9 +305,10 @@ Stmt BuildScopeNode(const SunmmioTileLoopFusionPlannerTreeNode &node,
         next_shared_loop_vars.begin(), next_shared_loop_vars.begin() + depth);
     Map<Var, PrimExpr> outer_subst =
         BuildSharedLoopVarSubst(representative, outer_shared_loop_vars);
-    body = For(next_shared_loop_vars[depth], Substitute(loop->min, outer_subst),
-               Substitute(loop->extent, outer_subst), loop->kind, body,
-               loop->thread_binding, loop->annotations);
+    body = For(next_shared_loop_vars[depth],
+               SubstituteWithBufferPredicates(loop->min, outer_subst),
+               SubstituteWithBufferPredicates(loop->extent, outer_subst),
+               loop->kind, body, loop->thread_binding, loop->annotations);
   }
   return ReapplyAttrPrefix(common_attrs, body);
 }

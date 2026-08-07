@@ -9,6 +9,12 @@ from tilelang import language as T
 from tilelang._typing import BufferLikeType, ShapeType
 
 
+def _unwrap_mesh_tensor(value):
+    from tilelang.language.mesh_tensor import _unwrap_mesh_tensor as unwrap
+
+    return unwrap(value)
+
+
 def region(buffer: BufferLoad, access_type: str, *args: PrimExpr) -> PrimExpr:
     """Create a tl.region call for a BufferLoad and extents."""
     access_type = {"r": 1, "w": 2, "rw": 3}[access_type]
@@ -146,6 +152,7 @@ def get_extent(data: BufferLikeType) -> ShapeType | None:
         The shape/extents as a list-like of PrimExpr (Buffer.shape or list of region item extents), or None if the extent cannot be determined.
     """
 
+    data = _unwrap_mesh_tensor(data)
     if isinstance(data, tir.Var) and T.has_let_value(data):
         data = T.get_let_value(data)
     if isinstance(data, tir.Buffer):

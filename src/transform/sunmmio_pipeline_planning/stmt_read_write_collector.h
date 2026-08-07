@@ -232,7 +232,8 @@ public:
     if (call->op.same_as(dma_copy())) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
-    } else if (call->op.same_as(sunmmio_layout_transform())) {
+    } else if (call->op.same_as(sunmmio_layout_transform()) ||
+               call->op.same_as(sunmmio_transpose())) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
     } else if (call->op.same_as(mma_sunmmio())) {

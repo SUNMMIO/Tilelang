@@ -1,5 +1,6 @@
 from .gemm_base import GemmBase
-from tilelang.layout import make_zz_layout, make_zn_layout
+from tilelang.layout import make_zz_layout, make_zn_layout, make_mxzz_layout
+from tilelang.layout.sunmmio_layouts import _make_mxznn_layout
 from tilelang import tvm as tvm
 import tvm_ffi
 from tvm.target import Target
@@ -26,20 +27,69 @@ def _sunmmio_block_shape(dtype):
     return list(_get_sunmmio_layout_block_shape(target, tvm.DataType(dtype)))
 
 
+def _is_mx_dtype(dtype) -> bool:
+    return _canonical_mx_dtype(dtype) is not None
+
+
+def _static_int(value, what: str) -> int:
+    if isinstance(value, int):
+        return value
+    if hasattr(value, "value"):
+        return int(value.value)
+    try:
+        return int(value)
+    except TypeError as err:
+        raise ValueError(f"Sunmmio MX operand alignment check requires static {what}, got {value}") from err
+
+
+def _check_mx_operand_block_aligned(buffer, axis: int, operand: str, layout_name: str):
+    block_extent = 32
+    block_align = 2
+    extent = _static_int(buffer.shape[axis], f"{operand} shape axis {axis}")
+    blocks = (extent + block_extent - 1) // block_extent
+    if blocks % block_align != 0:
+        raise ValueError(
+            f"Sunmmio MX {operand} operand layout {layout_name} requires the aligned axis "
+            f"block count to be a multiple of {block_align}; got {blocks} blocks on axis "
+            f"{axis} for extent {extent}. Explicit MX operand padding is not implemented yet."
+        )
+
+
+def _canonical_mx_dtype(dtype):
+    dtype = T.dtype(dtype)
+    if getattr(dtype, "type_code", None) == 129:
+        return T.mxfp8
+    if getattr(dtype, "type_code", None) == 130:
+        return T.mxfp4
+    return None
+
+
 class GemmSunmmio(GemmBase):
     def infer_layout(self, target: Target, thread_nums: int):
         if self.is_gemm_sunmmio_scope():
             # A (ASRAM): ZZ with dtype-dependent block shape
-            a_block = _sunmmio_block_shape(self.A.dtype)
-            a_layout = make_zz_layout(self.A, block_shape=a_block)
-            # B (WSRAM): ZZ if transB (TMM.MT mode), ZN if !transB (TMM.MN mode)
-            b_block = _sunmmio_block_shape(self.B.dtype)
+            if _is_mx_dtype(self.A.dtype):
+                _check_mx_operand_block_aligned(self.A, -1, "A", "MXZZ")
+                a_layout = make_mxzz_layout(self.A, dtype=_canonical_mx_dtype(self.A.dtype))
+            else:
+                a_block = _sunmmio_block_shape(self.A.dtype)
+                a_layout = make_zz_layout(self.A, block_shape=a_block)
+            # B (WSRAM): MX uses MXZZ/MXZNN; non-MX keeps ZZ/ZN.
             rank_b = len(self.B.shape)
             axes_b = [rank_b - 2, rank_b - 1]
-            if self.trans_B:
-                b_layout = make_zz_layout(self.B, block_shape=b_block)
+            if _is_mx_dtype(self.B.dtype):
+                if self.trans_B:
+                    _check_mx_operand_block_aligned(self.B, rank_b - 1, "B", "MXZZ")
+                    b_layout = make_mxzz_layout(self.B, dtype=_canonical_mx_dtype(self.B.dtype))
+                else:
+                    _check_mx_operand_block_aligned(self.B, rank_b - 2, "B", "MXZNN")
+                    b_layout = _make_mxznn_layout(self.B, axes_b, dtype=_canonical_mx_dtype(self.B.dtype))
             else:
-                b_layout = make_zn_layout(self.B.shape, axes_b, b_block)
+                b_block = _sunmmio_block_shape(self.B.dtype)
+                if self.trans_B:
+                    b_layout = make_zz_layout(self.B, block_shape=b_block)
+                else:
+                    b_layout = make_zn_layout(self.B.shape, axes_b, b_block)
             # C (RSRAM): ZZ with block shape from GetSunmmioLayoutBlockShape
             c_block = _sunmmio_block_shape(self.C.dtype)
             c_layout = make_zz_layout(self.C, block_shape=c_block)

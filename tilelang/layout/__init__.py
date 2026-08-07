@@ -30,4 +30,8 @@ from .sunmmio_layouts import (
     make_zn_layout,  # noqa: F401
     make_zzz_layout,  # noqa: F401
     make_nzz_layout,  # noqa: F401
+    make_mxzz_layout,  # noqa: F401
+    make_mxznz_layout,  # noqa: F401
+    make_mx_row_major_layout,  # noqa: F401
+    get_mx_scale_shape,  # noqa: F401
 )

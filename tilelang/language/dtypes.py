@@ -3,11 +3,47 @@ from tvm import ir
 import torch
 from typing import Generic, TypeVar, Union, TYPE_CHECKING
 from tvm import tir
+from tvm.target import datatype as tvm_datatype
 import tvm.script.ir_builder.tir._ffi_api as tb_ffi
 import numpy as np
 from tilelang import logger
 
 _T = TypeVar("_T")
+
+_MXFP8_CUSTOM_TYPE_CODE = 129
+_MXFP4_CUSTOM_TYPE_CODE = 130
+_MX_DTYPE_TO_TVM_STR = {
+    "mxfp8": "custom[mxfp8]8",
+    "mxfp4": "custom[mxfp4]4",
+}
+_TVM_STR_TO_MX_DTYPE = {v: k for k, v in _MX_DTYPE_TO_TVM_STR.items()}
+
+
+def _register_custom_dtype(type_name: str, type_code: int) -> None:
+    try:
+        registered_code = tvm_datatype.get_type_code(type_name)
+    except Exception:
+        registered_code = None
+    if registered_code is not None:
+        if registered_code == type_code:
+            return
+        raise RuntimeError(
+            f"Cannot register custom dtype '{type_name}' with code {type_code}: name is already registered with code {registered_code}."
+        )
+    if tvm_datatype.get_type_registered(type_code):
+        registered_name = tvm_datatype.get_type_name(type_code)
+        if registered_name != type_name:
+            raise RuntimeError(
+                f"Cannot register custom dtype '{type_name}' with code {type_code}: code is already registered for '{registered_name}'."
+            )
+    tvm_datatype.register(type_name, type_code)
+
+
+for _type_name, _type_code in (
+    ("mxfp8", _MXFP8_CUSTOM_TYPE_CODE),
+    ("mxfp4", _MXFP4_CUSTOM_TYPE_CODE),
+):
+    _register_custom_dtype(_type_name, _type_code)
 
 if TYPE_CHECKING:
 
@@ -101,6 +137,7 @@ _CANONICAL_TO_DISPLAY_STR = {
     "short": "int16",
     "uint": "uint32",
     "ulong": "uint64",
+    **_MX_DTYPE_TO_TVM_STR,
 }
 
 _STR_TO_TORCH_DTYPE = {v: k for k, v in _TORCH_DTYPE_TO_STR.items()}
@@ -167,8 +204,13 @@ def __dtype_call__(self: dtype, expr=None, is_size_var: bool = False) -> tir.Var
 def __dtype_as_torch__(self: dtype) -> torch.dtype:
     """Convert TileLang dtype to PyTorch dtype."""
     dtype_str = str(self)
+    dtype_str = _TVM_STR_TO_MX_DTYPE.get(dtype_str, dtype_str)
 
-    if dtype_str == "float8_e4m3":
+    if dtype_str in _MX_DTYPE_TO_TVM_STR:
+        raise ValueError(
+            f"Cannot convert SUVM MX dtype '{dtype_str}' to torch.dtype. Use an explicit packed storage tensor for runtime/profiler inputs."
+        )
+    elif dtype_str == "float8_e4m3":
         # Check if we're on HIP (AMD ROCm) or CUDA
         if torch.version.hip is not None:
             # HIP backend - use float8_e4m3fnuz
@@ -215,7 +257,9 @@ __orig_dtype_new = dtype.__new__
 
 
 def __dtype_new__(cls, value: AnyDType) -> dtype:
-    if isinstance(value, str):
+    if isinstance(value, dtype):
+        return value
+    elif isinstance(value, str):
         return __orig_dtype_new(cls, _CANONICAL_TO_DISPLAY_STR.get(value, value))
     elif value in _DTYPE_TO_STR:
         return __orig_dtype_new(cls, _DTYPE_TO_STR[value])
@@ -239,6 +283,17 @@ def get_tvm_dtype(value: AnyDType) -> dtype:
     if isinstance(value, (dtype, ir.Type)):
         return value
     return dtype(value)
+
+
+def normalize_dtype(value):
+    """Normalize TileLang dtype aliases to TVM dtype strings for TIR builders."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return str(dtype(value))
+    if isinstance(value, dtype):
+        return str(value)
+    return value
 
 
 if TYPE_CHECKING:
@@ -406,6 +461,8 @@ if TYPE_CHECKING:
     class float4_e2m1fnx16(dtype): ...
     class float4_e2m1fnx32(dtype): ...
     class float4_e2m1fnx64(dtype): ...
+    class mxfp8(dtype): ...
+    class mxfp4(dtype): ...
     class bfloat16(dtype): ...
     # yapf: enable
 
@@ -573,6 +630,8 @@ else:
     float4_e2m1fnx16 = dtype("float4_e2m1fnx16")
     float4_e2m1fnx32 = dtype("float4_e2m1fnx32")
     float4_e2m1fnx64 = dtype("float4_e2m1fnx64")
+    mxfp8 = dtype("mxfp8")
+    mxfp4 = dtype("mxfp4")
     bfloat16 = dtype("bfloat16")
 
 _all_dtypes = {
@@ -739,6 +798,8 @@ _all_dtypes = {
     "float4_e2m1fnx16",
     "float4_e2m1fnx32",
     "float4_e2m1fnx64",
+    "mxfp8",
+    "mxfp4",
     "bfloat16",
 }
 

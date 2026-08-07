@@ -13,6 +13,8 @@
 #include <tvm/tir/buffer.h>
 #include <tvm/tir/op.h>
 
+#include <functional>
+
 namespace tvm {
 namespace tl {
 
@@ -35,12 +37,30 @@ TVM_DLL bool IsBufferLikeExpr(const PrimExpr &expr);
 // Note: tvm_access_ptr is no longer supported here.
 TVM_DLL BufferRegion NormalizeToBufferRegion(const PrimExpr &arg);
 
+// Report each PrimExpr root directly inspected while normalizing. Nested
+// expressions that are forwarded as Range minima are left for the downstream
+// consumer to visit.
+using RegionExprObserver = std::function<void(const PrimExpr &)>;
+TVM_DLL BufferRegion NormalizeToBufferRegion(
+    const PrimExpr &arg, const RegionExprObserver &observe_consumed_root);
+
 // Build a tl.tileop.region Call from a Buffer + Array<Range>.
 // This is the inverse of NormalizeToBufferRegion: it packages buffer, access
 // mask, and per-axis extents into a Call(RegionOp::Get(), ...) that can be
 // passed as an argument to builtins like dma_copy.
 TVM_DLL PrimExpr MakeRegionExpr(const Buffer &buffer,
                                 const Array<Range> &ranges, int access_mask);
+
+// Build a compact zero-based region with the same extents as `region`.
+TVM_DLL Array<Range> MakeCompactRegion(const Array<Range> &region);
+
+// Build a compact buffer whose shape is given by `region`'s extents.
+// Dtype, alignment, offset factor, and buffer type come from `prototype`.
+// An empty `name` preserves the prototype's data and buffer names.
+TVM_DLL Buffer MakeCompactBufferLike(const Buffer &prototype,
+                                     const Array<Range> &region,
+                                     const ffi::String &scope,
+                                     const ffi::String &name = "");
 
 // Build a tvm_access_ptr(handle) from a BufferRegion.
 // - If `require_2d` is true, checks buffer ndim >= 2.
@@ -66,6 +86,12 @@ inline bool IsSharedBuffer(const Buffer &buffer, bool allow_dynamic = true) {
   } else {
     return buffer.defined() && buffer.scope() == "shared";
   }
+}
+
+inline bool IsSunmmioSharedBuffer(const Buffer &buffer) {
+  return buffer.defined() &&
+         (buffer.scope() == "shared.asram" ||
+          buffer.scope() == "shared.wsram" || buffer.scope() == "shared.rsram");
 }
 
 inline bool IsGlobalBuffer(const Buffer &buffer) {

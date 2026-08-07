@@ -198,35 +198,6 @@ Call ReissueWriter(const CallNode *writer, Array<PrimExpr> args, int offset) {
   return Call(writer->dtype, Downcast<Op>(writer->op), args, annotations);
 }
 
-// Build a compact 0-based range matching the given source region.
-// Duplicated from the same-named helper in legalize_sunmmio_datapath.cc to
-// keep this pass self-contained.
-Array<Range> CompactRange(const Array<Range> &region) {
-  Array<Range> compact;
-  compact.reserve(region.size());
-  for (const Range &r : region) {
-    compact.push_back(Range::FromMinExtent(0, r->extent));
-  }
-  return compact;
-}
-
-// Allocate a fresh Buffer with the given shape in the given scope, copying
-// dtype/alignment/buffer_type from `template_buf`. Used to materialize the
-// ReissueFromShadow private RSRAM stage. Mirrors MakeCompactBufferWithScope in
-// legalize_sunmmio_datapath.cc — duplicated locally for the same reason.
-Buffer MakeShadowBufferLike(const Buffer &template_buf,
-                            const Array<PrimExpr> &shape,
-                            const std::string &scope, const std::string &name) {
-  const auto *ptr_type =
-      template_buf->data->type_annotation.as<PointerTypeNode>();
-  ICHECK(ptr_type != nullptr);
-  Type new_type = PointerType(ptr_type->element_type, scope);
-  Var new_var = Var(name, new_type);
-  return Buffer(new_var, template_buf->dtype, shape, {}, Integer(0), name,
-                template_buf->data_alignment, template_buf->offset_factor,
-                template_buf->buffer_type);
-}
-
 // Clone a Gemm/GemmPy Call, setting the accOffsetByte positional arg
 // (index 19 — appended after cCoords at 17/18). The Gemm and GemmPy
 // constructors both read args[19] as accOffsetByte_ when present,
@@ -687,13 +658,10 @@ ReissueSource AnalyzeReissueSource(const Stmt &body, const CallNode *writer,
   ReissueSource r;
   r.clean = SourceBufferCleanliness::Check(body, writer, src->buffer);
   if (!r.clean) {
-    Array<PrimExpr> shape;
-    shape.reserve(src->region.size());
-    for (const Range &rg : src->region)
-      shape.push_back(rg->extent);
-    r.shadow = MakeShadowBufferLike(src->buffer, shape, kSunmmioScopeRSRAM,
-                                    a_dist_name + "_legalize_stage");
-    r.shadow_range = CompactRange(src->region);
+    r.shadow =
+        MakeCompactBufferLike(src->buffer, src->region, kSunmmioScopeRSRAM,
+                              a_dist_name + "_legalize_stage");
+    r.shadow_range = MakeCompactRegion(src->region);
   }
   return r;
 }

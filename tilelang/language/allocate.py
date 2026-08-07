@@ -27,7 +27,27 @@ from tvm.tir.expr import FloatImm, IntImm
 from . import dtypes as _dtypes
 from .dtypes import dtype as tl_dtype
 from .eager.builder import OutTensor
+from .frame import find_let_bound_vars, resolve_let_bound_expr
 from .proxy import Tensor
+
+
+def _resolve_allocation_extent(extent: PrimExpr | int) -> PrimExpr | int:
+    resolved_extent = resolve_let_bound_expr(extent)
+    unresolved_vars = find_let_bound_vars(resolved_extent)
+    if unresolved_vars:
+        names = ", ".join(sorted(var.name for var in unresolved_vars))
+        raise ValueError(
+            "TileLang allocation shape depends on non-invariant let binding(s) "
+            f"{names}; memory-backed let values cannot be inlined into a block-scoped allocation"
+        )
+    return resolved_extent
+
+
+def _resolve_allocation_shape(shape: ShapeType | PrimExpr | int) -> ShapeType | PrimExpr | int:
+    if isinstance(shape, (int, PrimExpr)):
+        return _resolve_allocation_extent(shape)
+    resolved_shape = [_resolve_allocation_extent(extent) for extent in shape]
+    return tuple(resolved_shape) if isinstance(shape, tuple) else resolved_shape
 
 
 def alloc_shared(shape: ShapeType, dtype: DType, scope="shared.dyn") -> Buffer:
@@ -45,7 +65,7 @@ def alloc_shared(shape: ShapeType, dtype: DType, scope="shared.dyn") -> Buffer:
         # lei: This is a hack to handle bool type.
         # Because tilelang's merge smem pass cannot merge bool type currently.
         scope = "shared"
-    return T.alloc_buffer(shape, dtype, scope=scope)
+    return T.alloc_buffer(_resolve_allocation_shape(shape), dtype, scope=scope)
 
 
 def alloc_local(shape: ShapeType, dtype: DType, scope="local") -> Buffer:
@@ -59,7 +79,7 @@ def alloc_local(shape: ShapeType, dtype: DType, scope="local") -> Buffer:
     Returns:
         T.Buffer: A TVM buffer object allocated in local memory
     """
-    return T.alloc_buffer(shape, dtype, scope=scope)
+    return T.alloc_buffer(_resolve_allocation_shape(shape), dtype, scope=scope)
 
 
 def alloc_fragment(shape: ShapeType, dtype: DType, scope="local.fragment") -> Buffer:
@@ -73,7 +93,7 @@ def alloc_fragment(shape: ShapeType, dtype: DType, scope="local.fragment") -> Bu
     Returns:
         T.Buffer: A TVM buffer object allocated in fragment memory
     """
-    return T.alloc_buffer(shape, dtype, scope=scope)
+    return T.alloc_buffer(_resolve_allocation_shape(shape), dtype, scope=scope)
 
 
 @overload
@@ -195,7 +215,7 @@ def alloc_tmem(shape: ShapeType, dtype: DType) -> Buffer:
     """
 
     assert len(shape) == 2, "shape must be a 2D tensor for TMEM allocation"
-    return T.alloc_buffer(shape, dtype, scope="shared.tmem")
+    return T.alloc_buffer(_resolve_allocation_shape(shape), dtype, scope="shared.tmem")
 
 
 ReducerOp = Literal["sum", "max", "min"]
@@ -231,7 +251,7 @@ def alloc_reducer(shape: ShapeType, dtype: DType, op: ReducerOp = "sum", replica
         replication = "none"
     assert replication in ["all", "none"]
 
-    reducer = T.alloc_buffer(shape, dtype, scope="local.fragment")
+    reducer = T.alloc_buffer(_resolve_allocation_shape(shape), dtype, scope="local.fragment")
     block_attr({"reducer_info": {reducer.data: {"rep": replication, "op": op}}})
 
     return reducer

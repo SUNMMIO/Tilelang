@@ -51,45 +51,7 @@ namespace tl {
 
 using namespace tir;
 
-/** Creates a compact 0-based region that preserves the original extents. */
-Array<Range> MakeCompactRegion(const Array<Range> &region) {
-  Array<Range> compact_region;
-  compact_region.reserve(region.size());
-  for (const Range &range : region) {
-    compact_region.push_back(Range::FromMinExtent(0, range->extent));
-  }
-  return compact_region;
-}
-
-/** Creates a temporary buffer that keeps the original buffer shape. */
-Buffer makeNewBufferWithScope(const Buffer &buffer, std::string scope) {
-  const auto *ptr_type =
-      TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-  Type new_type = PointerType(ptr_type->element_type, scope);
-  Var new_var = Var(buffer->data->name_hint, new_type);
-  return Buffer(new_var, buffer->dtype, buffer->shape, {}, buffer->elem_offset,
-                buffer->name, buffer->data_alignment, buffer->offset_factor,
-                buffer->buffer_type);
-}
-
-/** Creates a compact temporary buffer whose shape matches the region extents.
- */
-Buffer makeNewCompactBufferWithScope(const Buffer &buffer,
-                                     const Array<Range> &region,
-                                     std::string scope) {
-  const auto *ptr_type =
-      TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
-  Type new_type = PointerType(ptr_type->element_type, scope);
-  Var new_var = Var(buffer->data->name_hint, new_type);
-  Array<PrimExpr> shape;
-  shape.reserve(region.size());
-  for (const Range &range : region) {
-    shape.push_back(range->extent);
-  }
-  return Buffer(new_var, buffer->dtype, shape, {}, Integer(0), buffer->name,
-                buffer->data_alignment, buffer->offset_factor,
-                buffer->buffer_type);
-}
+bool IsLocalVarScope(const std::string &scope) { return scope == "local.var"; }
 
 struct BufferSourceInfo {
   Buffer src_buffer;
@@ -114,7 +76,6 @@ public:
    */
   static PrimFunc Substitute(PrimFunc f) {
     arith::Analyzer analyzer;
-    InferSramScopePass substituter(&analyzer);
 
     auto target = f->GetAttr<Target>(tvm::attr::kTarget);
     ICHECK(target.defined())
@@ -124,6 +85,7 @@ public:
     if (!TargetIsSunmmio(target.value()))
       return f;
 
+    InferSramScopePass substituter(&analyzer, target.value());
     auto *fptr = f.CopyOnWrite();
 
     // Phase 1 collects buffer usage info and initial scope decisions from the
@@ -150,7 +112,9 @@ public:
   }
 
 private:
-  using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
+  InferSramScopePass(arith::Analyzer *analyzer, Target target)
+      : arith::IRMutatorWithAnalyzer(analyzer), target_(std::move(target)) {}
+
   enum class Phase {
     kCollectInfo,
     kResolveConflicts,
@@ -191,13 +155,6 @@ private:
     std::unordered_set<const VarNode *> used_buffer_vars_;
   };
 
-  static bool CanCopyDirectly(const std::string &src_scope,
-                              const std::string &dst_scope) {
-    return src_scope == kSunmmioScopeRSRAM &&
-           (dst_scope == kSunmmioScopeASRAM ||
-            dst_scope == kSunmmioScopeWSRAM || dst_scope == kSunmmioScopeRSRAM);
-  }
-
   bool InInfoCollectionPhase() const { return phase_ == Phase::kCollectInfo; }
   bool InConflictResolutionPhase() const {
     return phase_ == Phase::kResolveConflicts;
@@ -231,6 +188,10 @@ private:
       if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
         buffers_to_infer.insert(buffer);
         original_alloc_buffers_.insert(buffer);
+      } else if (IsLocalVarScope(buffer.scope())) {
+        // local.var is a scalar pseudo-buffer lowered as SSA in SunMMIO
+        // codegen, not an ASRAM/WSRAM/RSRAM allocation.
+        continue;
       } else if (!IsSunmmioSramScope(buffer.scope())) {
         // SRAM scopes should already have been validated at the GEMM sites.
         LOG(FATAL) << "Invalid scope " << buffer.scope() << " of " << buffer
@@ -347,7 +308,7 @@ private:
     Buffer buffer = region->buffer;
     if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
       if (!buffer_remap_.count(buffer)) {
-        buffer_remap_.Set(buffer, makeBufferWithScope(buffer, expected_scope));
+        buffer_remap_.Set(buffer, RemapBufferScope(buffer, expected_scope));
       }
       return;
     }
@@ -363,7 +324,8 @@ private:
                                   const std::string &current_scope,
                                   const std::string &expected_scope,
                                   const char *operand_name) {
-    if (CanCopyDirectly(current_scope, expected_scope)) {
+    if (SupportsSunmmioDirectCopy(target_, current_scope, buffer->dtype,
+                                  expected_scope, buffer->dtype)) {
       return MakeRegionExpr(buffer, requested_region, /*access_mask=*/1);
     }
 
@@ -390,8 +352,8 @@ private:
       std::string current_scope = buffer_remap_[buffer].scope();
       if (current_scope != expected_scope) {
         auto transfer_region = MakeCompactRegion(region->region);
-        auto transfer_buffer = makeNewCompactBufferWithScope(
-            buffer, transfer_region, current_scope);
+        auto transfer_buffer =
+            MakeCompactBufferLike(buffer, region->region, current_scope);
         PrimExpr src_region =
             MakeConflictCopySource(buffer, region->region, current_scope,
                                    expected_scope, operand_name);
@@ -401,7 +363,7 @@ private:
             Call(DataType::Handle(), Copy::Get(), {src_region, dst_region}, {});
         seq->push_back(Evaluate(copy_call));
         buffer_remap_.Set(transfer_buffer,
-                          makeBufferWithScope(transfer_buffer, expected_scope));
+                          RemapBufferScope(transfer_buffer, expected_scope));
         new_args->insert(
             {operand_key, MakeRegionExpr(transfer_buffer, transfer_region, 1)});
       }
@@ -513,6 +475,10 @@ private:
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
     auto load = Downcast<BufferLoad>(IRMutatorWithAnalyzer::VisitExpr_(op));
+    if (IsLocalVarScope(load->buffer.scope())) {
+      // local.var loads are scalar variable reads, not SRAM reads.
+      return load;
+    }
     if (InInfoCollectionPhase()) {
       auto buffer = load->buffer;
       if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
@@ -556,6 +522,10 @@ private:
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     auto store = Downcast<BufferStore>(IRMutatorWithAnalyzer::VisitStmt_(op));
+    if (IsLocalVarScope(store->buffer.scope())) {
+      // local.var stores update scalar SSA state in codegen.
+      return store;
+    }
     if (InInfoCollectionPhase()) {
       // A plain BufferStore to a shared buffer is a Tile-/Scalar-unit output.
       // Both units operate on RSRAM, so the destination must be RSRAM -- the
@@ -584,7 +554,7 @@ private:
           }
         } else {
           buffer_remap_.Set(buffer,
-                            makeBufferWithScope(buffer, kSunmmioScopeRSRAM));
+                            RemapBufferScope(buffer, kSunmmioScopeRSRAM));
         }
       }
       return store;
@@ -630,7 +600,7 @@ private:
     return std::move(var);
   }
 
-  Buffer makeBufferWithScope(const Buffer &buffer, std::string scope) {
+  Buffer RemapBufferScope(const Buffer &buffer, std::string scope) {
     const auto *ptr_type =
         TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
     Var new_var;
@@ -649,7 +619,7 @@ private:
   void InferUnspecifiedBuffer() {
     for (const auto &buffer : buffers_to_infer) {
       if (!buffer_remap_.count(buffer)) {
-        auto remap_buffer = makeBufferWithScope(buffer, kSunmmioScopeRSRAM);
+        auto remap_buffer = RemapBufferScope(buffer, kSunmmioScopeRSRAM);
         buffer_remap_.Set(buffer, remap_buffer);
       }
     }
@@ -665,6 +635,7 @@ private:
       original_alloc_buffers_;
 
   Phase phase_ = Phase::kCollectInfo;
+  Target target_;
 
   Optional<BufferRegion>
   TryTranslateSourceRegion(const Buffer &buffer,

@@ -1,0 +1,369 @@
+#include "sunmmio_mlir_type.h"
+
+#include "mlir/IR/BuiltinAttributes.h"
+#include "npuir/Dialect/SUVM/IR/Attributes.h"
+#include "npuir/Dialect/SUVM/IR/Types.h"
+#include "sunmmio_mlir_context.h"
+#include "tvm/runtime/logging.h"
+#include "llvm/Support/raw_ostream.h"
+#include <tvm/arith/analyzer.h>
+
+#include <sstream>
+
+namespace tvm {
+namespace codegen {
+
+namespace {
+
+std::string MlirTypeToString(mlir::Type type) {
+  if (!type) {
+    return "<none>";
+  }
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  type.print(os);
+  return str;
+}
+
+std::string DTypeToString(DataType dtype) {
+  std::ostringstream os;
+  os << dtype;
+  return os.str();
+}
+
+bool IsCompatibleResolvedType(mlir::Type actual, mlir::Type expected) {
+  if (!expected || actual == expected) {
+    return true;
+  }
+  if (expected.isIndex()) {
+    return actual.isIndex() || mlir::isa<mlir::IntegerType>(actual);
+  }
+  if (expected.isInteger(1)) {
+    return actual.isIndex() || mlir::isa<mlir::IntegerType>(actual) ||
+           mlir::isa<mlir::FloatType>(actual);
+  }
+  if (mlir::isa<mlir::IntegerType>(expected)) {
+    return actual.isIndex() || mlir::isa<mlir::IntegerType>(actual);
+  }
+  if (mlir::isa<mlir::FloatType>(expected)) {
+    return mlir::isa<mlir::FloatType>(actual);
+  }
+  return false;
+}
+
+constexpr int kMXFP8CustomTypeCode = DataType::kCustomBegin;
+constexpr int kMXFP4CustomTypeCode = DataType::kCustomBegin + 1;
+
+bool IsMXFP8DType(DataType dtype) {
+  return dtype.code() == kMXFP8CustomTypeCode && dtype.bits() == 8 &&
+         dtype.lanes() == 1;
+}
+
+bool IsMXFP4DType(DataType dtype) {
+  return dtype.code() == kMXFP4CustomTypeCode && dtype.bits() == 4 &&
+         dtype.lanes() == 1;
+}
+
+} // namespace
+
+std::vector<int64_t> ExtractShape(const SunMMIOType &type) {
+  std::vector<int64_t> shape;
+  shape.reserve(type.shape.size());
+  for (const PrimExpr &dim : type.shape) {
+    const auto *imm = dim.as<tvm::tir::IntImmNode>();
+    if (imm) {
+      shape.push_back(static_cast<int64_t>(imm->value));
+    } else {
+      shape.push_back(mlir::ShapedType::kDynamic);
+    }
+  }
+  return shape;
+}
+
+std::vector<int64_t> ExtractLayoutExprs(llvm::ArrayRef<PrimExpr> exprs) {
+  arith::Analyzer analyzer;
+  std::vector<int64_t> values;
+  values.reserve(exprs.size());
+  for (const PrimExpr &expr : exprs) {
+    PrimExpr simplified = analyzer.Simplify(expr);
+    const auto *imm = simplified.as<tvm::tir::IntImmNode>();
+    if (imm) {
+      values.push_back(static_cast<int64_t>(imm->value));
+    } else {
+      values.push_back(mlir::ShapedType::kDynamic);
+    }
+  }
+  return values;
+}
+
+std::vector<PrimExpr> BuildRowMajorStrideExprs(llvm::ArrayRef<PrimExpr> shape) {
+  std::vector<PrimExpr> strides(shape.size());
+  if (shape.empty()) {
+    return strides;
+  }
+  DataType dtype = shape.back().dtype();
+  strides[strides.size() - 1] = tvm::IntImm(dtype, 1);
+  for (int i = static_cast<int>(shape.size()) - 2; i >= 0; --i) {
+    strides[static_cast<size_t>(i)] =
+        shape[static_cast<size_t>(i + 1)] * strides[static_cast<size_t>(i + 1)];
+  }
+  return strides;
+}
+
+std::vector<uint8_t> BuildFlatDimLevels(size_t rank) {
+  return std::vector<uint8_t>(rank, 1);
+}
+
+mlir::suvm::MemorySpaceAttr MapMemorySpaceAttr(mlir::MLIRContext *ctx,
+                                               const std::string &space) {
+  using mlir::suvm::MemorySpace;
+  if (space.empty() || space == "global") {
+    return mlir::suvm::MemorySpaceAttr::get(ctx, MemorySpace::global);
+  }
+  if (space == "shared.asram" || space == "asram") {
+    return mlir::suvm::MemorySpaceAttr::get(ctx, MemorySpace::asram);
+  }
+  if (space == "shared.wsram" || space == "wsram") {
+    return mlir::suvm::MemorySpaceAttr::get(ctx, MemorySpace::wsram);
+  }
+  if (space == "shared.rsram" || space == "rsram") {
+    return mlir::suvm::MemorySpaceAttr::get(ctx, MemorySpace::rsram);
+  }
+  LOG(FATAL) << "Unsupported SUVM memory space: " << space;
+  TVM_FFI_UNREACHABLE();
+}
+
+void ValidateLayout(const SunMMIOType &type,
+                    llvm::ArrayRef<int64_t> layout_hshape,
+                    llvm::ArrayRef<int64_t> layout_hstride,
+                    llvm::ArrayRef<uint8_t> dim_levels) {
+  ICHECK_EQ(layout_hshape.size(), layout_hstride.size())
+      << "SunMMIOType layout_hshape/layout_hstride size mismatch: "
+      << layout_hshape.size() << " vs " << layout_hstride.size();
+  ICHECK_EQ(dim_levels.size(), type.shape.size())
+      << "SunMMIOType layout_dim_levels rank mismatch: " << dim_levels.size()
+      << " vs " << type.shape.size();
+
+  size_t expected_flattened_size = 0;
+  for (uint8_t level : dim_levels) {
+    ICHECK_GT(level, 0) << "SunMMIOType layout_dim_levels must be > 0";
+    expected_flattened_size += static_cast<size_t>(level);
+  }
+  ICHECK_EQ(layout_hshape.size(), expected_flattened_size)
+      << "SunMMIOType flattened layout size mismatch: got "
+      << layout_hshape.size() << ", expected " << expected_flattened_size;
+}
+
+SunmmioMlirType::SunmmioMlirType(SunmmioMlirContext &ctx) : ctx_(ctx) {}
+
+mlir::Location SunmmioMlirType::Loc() const {
+  return ctx_.builder.getUnknownLoc();
+}
+
+mlir::Location SunmmioMlirType::MakeDebugLoc(const std::string &tag) const {
+  return mlir::NameLoc::get(ctx_.builder.getStringAttr(tag),
+                            ctx_.builder.getUnknownLoc());
+}
+
+mlir::Type SunmmioMlirType::MapElementType(DataType dtype) const {
+  dtype = CanonicalizeSuvmDType(dtype);
+  if (IsMXFP8DType(dtype)) {
+    return mlir::Type::getFromOpaquePointer(
+        mlir::suvm::MXFP8Type::get(&ctx_.mlir_ctx).getAsOpaquePointer());
+  }
+  if (IsMXFP4DType(dtype)) {
+    return mlir::Type::getFromOpaquePointer(
+        mlir::suvm::MXFP4Type::get(&ctx_.mlir_ctx).getAsOpaquePointer());
+  }
+  if (dtype.is_float8_e4m3fn()) {
+    return mlir::Type::getFromOpaquePointer(
+        mlir::Float8E4M3FNType::get(&ctx_.mlir_ctx).getAsOpaquePointer());
+  }
+  if (dtype.is_float4_e2m1fn()) {
+    return mlir::Type::getFromOpaquePointer(
+        mlir::Float4E2M1FNType::get(&ctx_.mlir_ctx).getAsOpaquePointer());
+  }
+  if (dtype.is_float8_e8m0fnu()) {
+    return mlir::Type::getFromOpaquePointer(
+        mlir::Float8E8M0FNUType::get(&ctx_.mlir_ctx).getAsOpaquePointer());
+  }
+  if (dtype.is_bool()) {
+    return mlir::Type::getFromOpaquePointer(
+        ctx_.builder.getI1Type().getAsOpaquePointer());
+  }
+  if (dtype.is_float()) {
+    if (dtype.bits() == 16) {
+      return mlir::Type::getFromOpaquePointer(
+          ctx_.builder.getF16Type().getAsOpaquePointer());
+    }
+    if (dtype.bits() == 32) {
+      return mlir::Type::getFromOpaquePointer(
+          ctx_.builder.getF32Type().getAsOpaquePointer());
+    }
+    if (dtype.bits() == 64) {
+      return mlir::Type::getFromOpaquePointer(
+          ctx_.builder.getF64Type().getAsOpaquePointer());
+    }
+  }
+  if (dtype.is_bfloat16()) {
+    return mlir::Type::getFromOpaquePointer(
+        ctx_.builder.getBF16Type().getAsOpaquePointer());
+  }
+  if (dtype.is_int() || dtype.is_uint()) {
+    return mlir::Type::getFromOpaquePointer(
+        ctx_.builder.getIntegerType(dtype.bits()).getAsOpaquePointer());
+  }
+  LOG(FATAL) << "Unsupported SunMMIO element dtype: " << DTypeToString(dtype);
+  TVM_FFI_UNREACHABLE();
+}
+
+mlir::Type SunmmioMlirType::MapType(const SunMMIOType &type) const {
+  SunMMIOType canonical_type = type;
+  canonical_type.dtype = CanonicalizeSuvmDType(type.dtype);
+
+  switch (canonical_type.kind) {
+  case SunMMIOType::Kind::kScalar:
+    return MapElementType(canonical_type.dtype);
+  case SunMMIOType::Kind::kIndex:
+    return mlir::Type::getFromOpaquePointer(
+        ctx_.builder.getIndexType().getAsOpaquePointer());
+  case SunMMIOType::Kind::kHandle:
+    return mlir::Type::getFromOpaquePointer(
+        ctx_.builder.getIntegerType(64).getAsOpaquePointer());
+  case SunMMIOType::Kind::kVector: {
+    mlir::Type elem = MapElementType(canonical_type.dtype);
+    return mlir::Type::getFromOpaquePointer(
+        mlir::VectorType::get({canonical_type.lanes}, elem)
+            .getAsOpaquePointer());
+  }
+  case SunMMIOType::Kind::kMemRef: {
+    mlir::Type elem = MapElementType(canonical_type.dtype);
+    std::vector<int64_t> shape = ExtractShape(canonical_type);
+    return mlir::Type::getFromOpaquePointer(
+        mlir::MemRefType::get(shape, elem).getAsOpaquePointer());
+  }
+  case SunMMIOType::Kind::kMemTensor: {
+    mlir::Type elem = MapElementType(canonical_type.dtype);
+    std::vector<int64_t> shape = ExtractShape(canonical_type);
+
+    std::vector<PrimExpr> layout_hshape_exprs =
+        canonical_type.layout_hshape.empty() ? canonical_type.shape
+                                             : canonical_type.layout_hshape;
+    std::vector<PrimExpr> layout_hstride_exprs =
+        canonical_type.layout_hstride.empty()
+            ? BuildRowMajorStrideExprs(layout_hshape_exprs)
+            : canonical_type.layout_hstride;
+    std::vector<int64_t> layout_hshape =
+        ExtractLayoutExprs(layout_hshape_exprs);
+    std::vector<int64_t> layout_hstride =
+        ExtractLayoutExprs(layout_hstride_exprs);
+    std::vector<uint8_t> dim_levels = canonical_type.layout_dim_levels.empty()
+                                          ? BuildFlatDimLevels(shape.size())
+                                          : canonical_type.layout_dim_levels;
+
+    ValidateLayout(canonical_type, layout_hshape, layout_hstride, dim_levels);
+
+    mlir::suvm::LayoutAttr layout = mlir::suvm::LayoutAttr::get(
+        &ctx_.mlir_ctx, layout_hshape, layout_hstride, dim_levels);
+    mlir::suvm::MemorySpaceAttr memory_scope =
+        MapMemorySpaceAttr(&ctx_.mlir_ctx, canonical_type.memory_scope);
+    mlir::suvm::MemTensorType memtensor = mlir::suvm::MemTensorType::get(
+        shape, elem, layout, memory_scope, canonical_type.byte_offset);
+    return mlir::Type::getFromOpaquePointer(memtensor.getAsOpaquePointer());
+  }
+  case SunMMIOType::Kind::kTileView: {
+    mlir::Type elem = MapElementType(canonical_type.dtype);
+    std::vector<int64_t> shape = ExtractShape(canonical_type);
+    mlir::suvm::TileViewType tile_view =
+        mlir::suvm::TileViewType::get(shape, elem);
+    return mlir::Type::getFromOpaquePointer(tile_view.getAsOpaquePointer());
+  }
+  case SunMMIOType::Kind::kTile: {
+    mlir::Type elem = MapElementType(canonical_type.dtype);
+    std::vector<int64_t> shape = ExtractShape(canonical_type);
+    mlir::suvm::TileType tile = mlir::suvm::TileType::get(shape, elem);
+    return mlir::Type::getFromOpaquePointer(tile.getAsOpaquePointer());
+  }
+  case SunMMIOType::Kind::kUnknown:
+    LOG(FATAL) << "Cannot map unknown SunMMIO type with dtype "
+               << DTypeToString(canonical_type.dtype);
+    TVM_FFI_UNREACHABLE();
+  default:
+    LOG(FATAL) << "Unsupported SunMMIO type kind";
+    TVM_FFI_UNREACHABLE();
+  }
+}
+
+mlir::Value SunmmioMlirType::EnsureI1(mlir::Value v) {
+  if (!v) {
+    LOG(FATAL) << "Cannot coerce missing MLIR value to i1";
+    TVM_FFI_UNREACHABLE();
+  }
+  mlir::Type ty = v.getType();
+  if (ty.isInteger(1)) {
+    return v;
+  }
+  if (auto int_ty = mlir::dyn_cast<mlir::IntegerType>(ty)) {
+    auto zero = mlir::arith::ConstantIntOp::create(ctx_.builder, Loc(), 0,
+                                                   int_ty.getWidth());
+    return mlir::arith::CmpIOp::create(ctx_.builder, Loc(),
+                                       mlir::arith::CmpIPredicate::ne, v, zero);
+  }
+  if (ty.isIndex()) {
+    auto zero = mlir::arith::ConstantIndexOp::create(ctx_.builder, Loc(), 0);
+    return mlir::arith::CmpIOp::create(ctx_.builder, Loc(),
+                                       mlir::arith::CmpIPredicate::ne, v, zero);
+  }
+  if (auto float_ty = mlir::dyn_cast<mlir::FloatType>(ty)) {
+    mlir::Type float_type =
+        mlir::Type::getFromOpaquePointer(float_ty.getAsOpaquePointer());
+    mlir::Value zero =
+        mlir::arith::ConstantOp::create(
+            ctx_.builder, Loc(), ctx_.builder.getFloatAttr(float_type, 0.0))
+            .getResult();
+    return mlir::arith::CmpFOp::create(
+        ctx_.builder, Loc(), mlir::arith::CmpFPredicate::ONE, v, zero);
+  }
+  LOG(FATAL) << "Cannot coerce unsupported MLIR value type to i1";
+  TVM_FFI_UNREACHABLE();
+}
+
+mlir::Value SunmmioMlirType::EnsureIndex(mlir::Value v) {
+  if (!v) {
+    LOG(FATAL) << "Cannot coerce missing MLIR value to index";
+    TVM_FFI_UNREACHABLE();
+  }
+  if (v.getType().isIndex()) {
+    return v;
+  }
+  if (mlir::isa<mlir::IntegerType>(v.getType())) {
+    return mlir::arith::IndexCastOp::create(ctx_.builder, Loc(),
+                                            ctx_.builder.getIndexType(), v);
+  }
+  LOG(FATAL) << "Cannot coerce unsupported MLIR value type to index";
+  TVM_FFI_UNREACHABLE();
+}
+
+mlir::Value SunmmioMlirType::ResolveValue(const SunMMIOValue &v,
+                                          mlir::Type expected_type) {
+  if (!v.value.empty()) {
+    mlir::Value existing = ctx_.LookupMLIRValue(v.value);
+    if (existing) {
+      if (!IsCompatibleResolvedType(existing.getType(), expected_type)) {
+        LOG(FATAL) << "MLIR value for SunMMIO SSA value `" << v.value
+                   << "` has type " << MlirTypeToString(existing.getType())
+                   << ", expected compatible with "
+                   << MlirTypeToString(expected_type);
+      }
+      return existing;
+    }
+  }
+
+  LOG(FATAL) << "Missing MLIR value for SunMMIO SSA value `"
+             << (v.value.empty() ? std::string("<unnamed>") : v.value)
+             << "`; expected type " << MlirTypeToString(expected_type);
+  TVM_FFI_UNREACHABLE();
+}
+
+} // namespace codegen
+} // namespace tvm

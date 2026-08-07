@@ -59,6 +59,18 @@ nvcc = [
     "nvidia-cuda-nvcc>=13.0.48",
     "nvidia-cuda-cccl>=13.0.50",
 ]
+# if you want to build and execute Sunmmio kernels through the sunsim/gem5 path
+sunmmio = ["sunsim"]
+# explicit alias for the sunsim/gem5 execution backend
+sunmmio-sunsim = ["sunsim"]
+
+[[tool.uv.index]]
+name = "sunmmio"
+url = "https://gitlab.sunmmio.com:6226/api/v4/projects/118/packages/pypi/simple"
+explicit = true
+
+[tool.uv.sources]
+sunsim = { index = "sunmmio" }
 
 [build-system]
 requires = [

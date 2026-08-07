@@ -28,6 +28,8 @@ static constexpr const char *kWarpSpecializationScope =
 static constexpr const char *kCustomWarpSpecialization =
     "kCustomWarpSpecialization";
 static constexpr const char *kLocalVarInit = "tl.local_var_init";
+static constexpr const char *kSunmmioAllocPingPong =
+    "tl.sunmmio_alloc_ping_pong";
 // A PrimFunc-level attribute carrying a list of handle Vars
 // that must NOT be marked with the restrict qualifier in codegen.
 // Type: Array<tir::Var>
@@ -262,6 +264,22 @@ TVM_DLL const Op &tma_load();
 TVM_DLL const Op &dma_copy();
 
 /*!
+ * \brief Physically copy data/scale buffers into an MX packed buffer.
+ *
+ * Arguments are buffer-region calls:
+ *   tl.mx_pack(data_region, scale_region, mx_region)
+ */
+TVM_DLL const Op &mx_pack();
+
+/*!
+ * \brief Physically copy data/scale buffers out of an MX packed buffer.
+ *
+ * Arguments are buffer-region calls:
+ *   tl.mx_unpack(mx_region, data_region, scale_region)
+ */
+TVM_DLL const Op &mx_unpack();
+
+/*!
  * \brief Re-block an RSRAM buffer between ZZ and row-major layout.
  *
  * Emitted by the SUNMMIO copy lowering path when a DRAM<->RSRAM copy has
@@ -281,6 +299,13 @@ TVM_DLL const Op &dma_copy();
  * \param dst_region  A tl.tileop.region PrimExpr describing the destination.
  */
 TVM_DLL const Op &sunmmio_layout_transform();
+
+/*!
+ * \brief Transpose a complete 2D RSRAM matrix through the Sunmmio ODMA.
+ *
+ * tl.sunmmio_transpose(src_region, dst_region)
+ */
+TVM_DLL const Op &sunmmio_transpose();
 
 /*!
  * \brief tvm intrinsic for mma operation of Sunmmio target.

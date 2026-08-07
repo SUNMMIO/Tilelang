@@ -12,6 +12,12 @@ from tvm.tir.expr import CallEffectKind
 # These utility functions check the memory scope of a given TVM buffer.
 
 
+def _unwrap_mesh_tensor(value):
+    from tilelang.language.mesh_tensor import _unwrap_mesh_tensor as unwrap
+
+    return unwrap(value)
+
+
 def _get_buffer(buffer_or_load_or_region: BufferLikeType) -> Buffer:
     """
     Extract Buffer from Buffer, BufferLoad, or BufferRegion.
@@ -22,6 +28,7 @@ def _get_buffer(buffer_or_load_or_region: BufferLikeType) -> Buffer:
     Returns:
         Buffer: The underlying buffer object
     """
+    buffer_or_load_or_region = _unwrap_mesh_tensor(buffer_or_load_or_region)
     if isinstance(buffer_or_load_or_region, Buffer):
         return buffer_or_load_or_region
     elif isinstance(buffer_or_load_or_region, (tir.BufferLoad, tir.BufferRegion)):
@@ -183,6 +190,7 @@ def to_buffer_region(obj: BufferLikeType, access_type: str = "rw", extents: list
     """
     from tilelang.language.frame import has_let_value, get_let_value
 
+    obj = _unwrap_mesh_tensor(obj)
     if isinstance(obj, tir.Var) and has_let_value(obj):
         obj = get_let_value(obj)
     # Encode into tl.region call (when extents is provided), otherwise return BufferRegion for analysis
@@ -226,6 +234,7 @@ def retrieve_shape(obj: BufferLikeType) -> list:
     - BufferRegion -> list of each range's `extent`
     - BufferLoad -> extents from `get_buffer_region_from_load(obj)`
     """
+    obj = _unwrap_mesh_tensor(obj)
     if isinstance(obj, tir.Buffer):
         return obj.shape
     if isinstance(obj, tir.BufferRegion):
@@ -244,6 +253,7 @@ def retrieve_stride(obj: BufferLikeType) -> list:
 
     For BufferRegion and BufferLoad, uses the underlying buffer's `shape`.
     """
+    obj = _unwrap_mesh_tensor(obj)
     if isinstance(obj, tir.Buffer):
         shape = obj.shape
     elif isinstance(obj, (tir.BufferRegion, tir.BufferLoad)):
@@ -343,6 +353,7 @@ def retrieve_offset(obj: BufferLikeType) -> list:
     - BufferRegion -> [r.min for r in region]
     - BufferLoad -> indices (or derived region minima)
     """
+    obj = _unwrap_mesh_tensor(obj)
     if isinstance(obj, tir.Buffer):
         return [0] * len(obj.shape)
     if isinstance(obj, tir.BufferRegion):
@@ -409,6 +420,33 @@ def prim_expr_equal(lhs, rhs) -> bool:
     if ir.structural_equal(lhs, rhs):
         return True
     return tir.analysis.expr_deep_equal(lhs, rhs)
+
+
+def prim_expr_contains_mesh_symbol(expr) -> bool:
+    """Return whether an expression contains a symbolic Sunmmio mesh SizeVar."""
+    if isinstance(expr, int) or not isinstance(expr, tir.PrimExpr):
+        return False
+
+    from tilelang.language.mesh_symbols import _mesh_ncols_symbol, _mesh_nrows_symbol
+
+    mesh_vars = (_mesh_nrows_symbol(), _mesh_ncols_symbol())
+    found = False
+
+    def visit(node):
+        nonlocal found
+        if found or not isinstance(node, tir.Var):
+            return
+        for var in mesh_vars:
+            if node.same_as(var):
+                found = True
+                return
+
+    tir.stmt_functor.post_order_visit(expr, visit)
+    return found
+
+
+def prim_expr_equal_or_mesh_symbolic(lhs, rhs) -> bool:
+    return prim_expr_equal(lhs, rhs) or prim_expr_contains_mesh_symbol(lhs) or prim_expr_contains_mesh_symbol(rhs)
 
 
 def legalize_pairwise_extents(src_extents: list, dst_extents: list) -> tuple[list, list]:

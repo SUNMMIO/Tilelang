@@ -148,30 +148,35 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
   bool src_has = T.layout_map.count(src);
   bool dst_has = T.layout_map.count(dst);
 
-  // ZN WSRAM dst: its src is staged as ZZ (the transfer does ZZ->ZN), so infer
-  // ZZ for src. dst is already determined (ZN from GEMM); propose nothing for
-  // it.
+  // ZN/MXZNN WSRAM dst: its src is staged as ZZ/MXZNZ (the transfer does
+  // ZZ->ZN or MXZNZ->MXZNN), so infer the matching source layout. dst is
+  // already determined (from GEMM); propose nothing for it.
   if (dst_has && dst.scope() == kSunmmioScopeWSRAM &&
       !sunmmio::IsZZLike(T.layout_map[dst])) {
     int rank = static_cast<int>(src->shape.size());
     if (IsSunmmioSramScope(src.scope()) && rank >= 2) {
       Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
-      result.Set(src, sunmmio::MakeZZ(
-                          src->shape, axes,
-                          GetSunmmioLayoutBlockShape(T.target, src->dtype)));
+      Layout src_layout = sunmmio::IsMXDType(src->dtype)
+                              ? sunmmio::MakeMXZNZ(src->shape, axes, src->dtype)
+                              : sunmmio::MakeZZ(src->shape, axes,
+                                                GetSunmmioLayoutBlockShape(
+                                                    T.target, src->dtype));
+      result.Set(src, src_layout);
     }
     return result;
   }
 
   // Propagate: derive layout for each side from the other.
   if (src_has && IsSunmmioSramScope(dst.scope())) {
-    auto derived = DeriveLayoutLike(T.layout_map[src], dst->shape);
+    auto derived =
+        DeriveLayoutLikeForDType(T.layout_map[src], dst->shape, dst->dtype);
     if (derived.defined()) {
       result.Set(dst, derived.value());
     }
   }
   if (dst_has && IsSunmmioSramScope(src.scope())) {
-    auto derived = DeriveLayoutLike(T.layout_map[dst], src->shape);
+    auto derived =
+        DeriveLayoutLikeForDType(T.layout_map[dst], src->shape, src->dtype);
     if (derived.defined()) {
       result.Set(src, derived.value());
     }
@@ -541,6 +546,47 @@ AllgatherOp::AllgatherOp(Array<PrimExpr> args,
   data_ = std::move(node);
 }
 
+bool IsCommunicationOp(const Call &call) {
+  return call->op.same_as(BroadcastOp::Get()) ||
+         call->op.same_as(PutOp::Get()) || call->op.same_as(AllgatherOp::Get());
+}
+
+CommunicationDirections GetCommunicationSourceDirections(const Call &call,
+                                                         Target target) {
+  ICHECK(IsCommunicationOp(call));
+  TileOperator tile_op = ParseOperator(call);
+  ICHECK(tile_op.defined());
+  if (const auto *broadcast = tile_op.as<BroadcastOpNode>()) {
+    ICHECK(broadcast->direction >= 0 && broadcast->direction <= 2)
+        << "Invalid broadcast direction " << broadcast->direction;
+    // "all" starts vertically; its horizontal phase reads the destination.
+    return broadcast->direction == 0 ? CommunicationDirections::kHorizontal
+                                     : CommunicationDirections::kVertical;
+  }
+  if (const auto *allgather = tile_op.as<AllgatherOpNode>()) {
+    ICHECK(allgather->direction >= 0 && allgather->direction <= 2)
+        << "Invalid allgather direction " << allgather->direction;
+    // "all" starts horizontally; its vertical phase reads the destination.
+    return allgather->direction == 1 ? CommunicationDirections::kVertical
+                                     : CommunicationDirections::kHorizontal;
+  }
+  if (const auto *put = tile_op.as<PutOpNode>()) {
+    const auto *src_core = put->src_core.as<IntImmNode>();
+    const auto *dst_core = put->dst_core.as<IntImmNode>();
+    if (src_core == nullptr || dst_core == nullptr) {
+      return CommunicationDirections::kHorizontalAndVertical;
+    }
+
+    int mesh_ncol = GetSunmmioMeshConfig(target).ncol;
+    bool same_row = src_core->value / mesh_ncol == dst_core->value / mesh_ncol;
+    // Diagonal put starts vertically; its horizontal phase reads dst.
+    return same_row ? CommunicationDirections::kHorizontal
+                    : CommunicationDirections::kVertical;
+  }
+  LOG(FATAL) << "Expected broadcast, put, or allgather communication op";
+  return CommunicationDirections::kNone;
+}
+
 TileOperator AllgatherOpNode::Clone() const {
   auto op = tvm::ffi::make_object<AllgatherOpNode>(*this);
   return AllgatherOp(op);
@@ -701,19 +747,19 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
     emit_from_send(make_slab(current_row, slot_extent_p1), /*bcast_dir=*/1,
                    MakeVerticalMask(mesh_nrow));
   } else { // direction == 2 ("all")
-    // Phase 1: horizontal. The current core lands at its global slot.
-    emit_from_send(make_slab(current_core, slot_extent_p1), /*bcast_dir=*/0,
-                   MakeHorizontalMask(mesh_ncol));
-
-    // Phase 2: vertical. Each row's mesh_ncol-wide gathered slab (rows
-    // i*ncol .. (i+1)*ncol of phase-1 slots) is broadcast to every row in
-    // each column.
-    PrimExpr row_extent = analyzer->Simplify(
-        IntImm(DataType::Int(32), mesh_ncol) * slot_extent_p1);
-    // slab index `current_row` covers slots
-    // [current_row*ncol .. (current_row+1)*ncol) of phase 1.
-    emit_from_recv(make_slab(current_row, row_extent), /*bcast_dir=*/1,
+    // Phase 1: vertical. The current core lands at its row-major global slot.
+    emit_from_send(make_slab(current_core, slot_extent_p1), /*bcast_dir=*/1,
                    MakeVerticalMask(mesh_nrow));
+
+    // Phase 2: horizontal. A column's phase-1 slots are strided by ncol in
+    // row-major core order, so forward one per-source-row slab at a time.
+    // This preserves the existing recv slot mapping: slot = row*ncol + col.
+    for (int row = 0; row < mesh_nrow; ++row) {
+      PrimExpr global_slot =
+          analyzer->Simplify(I32Imm(row * mesh_ncol) + current_col);
+      emit_from_recv(make_slab(global_slot, slot_extent_p1),
+                     /*bcast_dir=*/0, MakeHorizontalMask(mesh_ncol));
+    }
   }
 
   return SeqStmt::Flatten(bcast_stmts);
@@ -825,30 +871,30 @@ LayoutMap AllreduceOpNode::InferLayout(const LayoutInferArgs &T,
   if (should_clear) {
     infer_reduce(src, dst, dim, /*reduce_clear=*/true);
 
-    if (direction == 0 || direction == 2) {
-      infer_allgather(dst, row_allgather, /*gather_dir=*/0);
-      infer_reduce(row_allgather, dst, IntImm(DataType::Int(32), 0),
-                   /*reduce_clear=*/true);
-    }
-
     if (direction == 1 || direction == 2) {
       infer_allgather(dst, col_allgather, /*gather_dir=*/1);
       infer_reduce(col_allgather, dst, IntImm(DataType::Int(32), 0),
                    /*reduce_clear=*/true);
     }
+
+    if (direction == 0 || direction == 2) {
+      infer_allgather(dst, row_allgather, /*gather_dir=*/0);
+      infer_reduce(row_allgather, dst, IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/true);
+    }
   } else {
     infer_reduce(src, dst_copy, dim, /*reduce_clear=*/true);
 
-    if (direction == 0 || direction == 2) {
-      infer_allgather(dst_copy, row_allgather, /*gather_dir=*/0);
-      infer_reduce(row_allgather, direction == 0 ? dst : dst_copy,
+    if (direction == 1 || direction == 2) {
+      infer_allgather(dst_copy, col_allgather, /*gather_dir=*/1);
+      infer_reduce(col_allgather, direction == 1 ? dst : dst_copy,
                    IntImm(DataType::Int(32), 0),
                    /*reduce_clear=*/direction == 2);
     }
 
-    if (direction == 1 || direction == 2) {
-      infer_allgather(dst_copy, col_allgather, /*gather_dir=*/1);
-      infer_reduce(col_allgather, dst, IntImm(DataType::Int(32), 0),
+    if (direction == 0 || direction == 2) {
+      infer_allgather(dst_copy, row_allgather, /*gather_dir=*/0);
+      infer_reduce(row_allgather, dst, IntImm(DataType::Int(32), 0),
                    /*reduce_clear=*/false);
     }
   }
@@ -914,23 +960,23 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
   if (should_clear) {
     append_reduce(src, dst, dim, /*reduce_clear=*/true);
 
-    if (direction == 0 || direction == 2) {
-      append_row_stage(dst, dst, /*reduce_clear=*/true);
-    }
-
     if (direction == 1 || direction == 2) {
       append_col_stage(dst, dst, /*reduce_clear=*/true);
+    }
+
+    if (direction == 0 || direction == 2) {
+      append_row_stage(dst, dst, /*reduce_clear=*/true);
     }
   } else {
     append_reduce(src, dst_copy, dim, /*reduce_clear=*/true);
 
-    if (direction == 0 || direction == 2) {
-      append_row_stage(dst_copy, direction == 0 ? dst : dst_copy,
+    if (direction == 1 || direction == 2) {
+      append_col_stage(dst_copy, direction == 1 ? dst : dst_copy,
                        /*reduce_clear=*/direction == 2);
     }
 
-    if (direction == 1 || direction == 2) {
-      append_col_stage(dst_copy, dst, /*reduce_clear=*/false);
+    if (direction == 0 || direction == 2) {
+      append_row_stage(dst_copy, dst, /*reduce_clear=*/false);
     }
   }
 

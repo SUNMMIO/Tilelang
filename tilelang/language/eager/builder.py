@@ -28,7 +28,7 @@ try:
 except ImportError:  # Python < 3.11 for Self, < 3.10 for ParamSpec
     from typing_extensions import ParamSpec, Self
 from .. import dtypes as dt
-from ..mesh_tensor import TensorWithMeta
+from ..mesh_tensor import MeshTensorValue, TensorWithMeta, _unwrap_mesh_tensor
 from . import utils
 from tilelang.jit.exceptions import JITNoBuilderError, EagerJITBuildError
 import threading
@@ -189,27 +189,44 @@ class Builder(BaseBuilder):
         self.macro_fileline_stack: list[tuple[str, int, str]] = []
         # Metadata collected during prim_func_arg processing
         self._metadata: dict[str, dict] = {}
+        self._sunmmio_mesh_symbols_used = False
 
     def attach_metadata(self, prim_func):
         """Attach collected Metadata to a PrimFunc as 'tensor_meta' attribute.
 
         Converts Python values (int, tuple, dict) to TIR types for C++ FFI compatibility.
         """
-        if not self._metadata:
+        if self._metadata:
+
+            def _convert_to_tir(value):
+                if isinstance(value, int):
+                    return tvm.tir.IntImm("int32", value)
+                elif isinstance(value, tuple):
+                    return tuple(_convert_to_tir(v) for v in value)
+                elif isinstance(value, list):
+                    return [_convert_to_tir(v) for v in value]
+                elif isinstance(value, dict):
+                    return {k: _convert_to_tir(v) for k, v in value.items()}
+                return value
+
+            prim_func = prim_func.with_attr("tensor_meta", _convert_to_tir(self._metadata))
+        return self.attach_sunmmio_mesh_symbols(prim_func)
+
+    def attach_sunmmio_mesh_symbols(self, prim_func):
+        if not self._sunmmio_mesh_symbols_used:
             return prim_func
 
-        def _convert_to_tir(value):
-            if isinstance(value, int):
-                return tvm.tir.IntImm("int32", value)
-            elif isinstance(value, tuple):
-                return tuple(_convert_to_tir(v) for v in value)
-            elif isinstance(value, list):
-                return [_convert_to_tir(v) for v in value]
-            elif isinstance(value, dict):
-                return {k: _convert_to_tir(v) for k, v in value.items()}
-            return value
+        from tilelang.language.mesh_symbols import (
+            _MESH_NCOLS_ATTR,
+            _MESH_NROWS_ATTR,
+            _mesh_ncols_symbol,
+            _mesh_nrows_symbol,
+        )
 
-        return prim_func.with_attr("tensor_meta", _convert_to_tir(self._metadata))
+        return prim_func.with_attr(_MESH_NROWS_ATTR, _mesh_nrows_symbol()).with_attr(_MESH_NCOLS_ATTR, _mesh_ncols_symbol())
+
+    def mark_sunmmio_mesh_symbols_used(self):
+        self._sunmmio_mesh_symbols_used = True
 
     @classmethod
     def current(cls) -> Self:
@@ -217,16 +234,26 @@ class Builder(BaseBuilder):
         return builder
 
     @contextmanager
-    def prim_func(self, name):
+    def current_context(self):
+        previous_builder = getattr(thread_local_storage, "builder", None)
         thread_local_storage.builder = self
         try:
+            yield
+        finally:
+            if previous_builder is None:
+                if getattr(thread_local_storage, "builder", None) is self:
+                    del thread_local_storage.builder
+            else:
+                thread_local_storage.builder = previous_builder
+
+    @contextmanager
+    def prim_func(self, name):
+        with self.current_context():
             with self.ir_builder, self.with_frame(tir.prim_func()):
                 tir.func_name(name)
                 yield
             if self.eager_jit != "phase1" and len(self.out_idx) != self.out_tensor_cnt:
                 raise RuntimeError("Not all tensor allocated from `T.empty` are returned")
-        finally:
-            del thread_local_storage.builder
 
     @contextmanager
     def macro(self, name=None, annotations=None):
@@ -468,6 +495,8 @@ class Builder(BaseBuilder):
             return value
         if isinstance(value, tir.IntImm) and value.dtype == "int32":
             return value.value
+        if isinstance(value, MeshTensorValue):
+            return value
         if isinstance(value, (Var, Buffer)):
             # Bind TVM Var/Buffer names and also record scope so reusing the same
             # Python name (e.g., loop vars like `i`) across different for-frames
@@ -530,6 +559,8 @@ class Builder(BaseBuilder):
             arg._out_idx = self.out_tensor_cnt
             self.out_tensor_cnt += 1
             return arg
+        elif isinstance(value, MeshTensorValue):
+            return value
         elif isinstance(value, (Buffer, tir.IterVar, tir.Var)):
             IRBuilder.name(name, value)
             return value
@@ -545,6 +576,7 @@ class Builder(BaseBuilder):
         self.check_continue_break()
         if annot is not self.empty:
             logger.warning("Type annotation in slice assignment has no effect", stack_info=True, stacklevel=2)
+        lval = _unwrap_mesh_tensor(lval)
         if isinstance(lval, Buffer):
             tir.buffer_store(lval, value, sl)
         else:
@@ -718,8 +750,9 @@ class Builder(BaseBuilder):
 
     def prim_func_arg(self, name, value):
         if isinstance(value, TensorWithMeta):
+            self.mark_sunmmio_mesh_symbols_used()
             self._metadata[name] = value.meta_data
-            return tir.arg(name, value.buffer)
+            return MeshTensorValue(tir.arg(name, value.buffer), value.meta_data)
         elif isinstance(value, (Buffer, Var)):
             return tir.arg(name, value)
         elif value is self.empty:
@@ -1221,21 +1254,23 @@ def prim_func(func: Callable[_P, _T] = None, *, eager_jit: bool = False) -> Prim
     def impl(func: Callable[_P, _T]) -> PrimFunc[_P, _T] | Callable[_P, PrimFunc[_P, _T]]:
         sig = inspect.signature(func)
         ir_gen = mutate(func)
-        func_annot = get_type_hints(func)
-        annot = {}
-        for param in sig.parameters.values():
-            if param.kind == param.POSITIONAL_ONLY:
-                raise TypeError(f"PrimFunc does not support positional-only parameters: `{param.name}`")
-            if param.name in ir_gen.extra_type_hints:
-                annot[param.name] = ir_gen.extra_type_hints[param.name]
-            elif param.name in func_annot:
-                annot[param.name] = func_annot[param.name]
-        for k in annot:
-            # Call callable annotations (e.g., factory functions) to get the actual type.
-            # Skip typing generics like Optional[int], Union[...], List[...] which are
-            # callable but cannot be instantiated.
-            if not isinstance(annot[k], type) and callable(annot[k]) and get_origin(annot[k]) is None:
-                annot[k] = annot[k]()
+        builder = Builder()
+        with builder.current_context():
+            func_annot = get_type_hints(func)
+            annot = {}
+            for param in sig.parameters.values():
+                if param.kind == param.POSITIONAL_ONLY:
+                    raise TypeError(f"PrimFunc does not support positional-only parameters: `{param.name}`")
+                if param.name in ir_gen.extra_type_hints:
+                    annot[param.name] = ir_gen.extra_type_hints[param.name]
+                elif param.name in func_annot:
+                    annot[param.name] = func_annot[param.name]
+            for k in annot:
+                # Call callable annotations (e.g., factory functions) to get the actual type.
+                # Skip typing generics like Optional[int], Union[...], List[...] which are
+                # callable but cannot be instantiated.
+                if not isinstance(annot[k], type) and callable(annot[k]) and get_origin(annot[k]) is None:
+                    annot[k] = annot[k]()
 
         if eager_jit:
             arg_names = list(sig.parameters.keys())
@@ -1246,7 +1281,6 @@ def prim_func(func: Callable[_P, _T] = None, *, eager_jit: bool = False) -> Prim
             return JITFunc(func, arg_names, tensor_args, tensor_args_defaults, ir_gen)
         else:
             try:
-                builder = Builder()
                 with builder.prim_func(func.__name__):
                     ir_gen.gen(builder)(**annot)
                 prim_func = builder.get()

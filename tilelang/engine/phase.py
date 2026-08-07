@@ -3,6 +3,7 @@ from tilelang.utils.target import target_is_sunmmio
 from tvm import tir, IRModule
 from tvm.target import Target
 import tilelang
+import tilelang.utils.target as _target_utils
 from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma, is_hopper, have_pdl
 
@@ -144,6 +145,7 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
 
 def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tir.transform.BindTarget(target)(mod)
+    mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
     if should_force_let_inline():
         mod = tilelang.transform.LetInline()(mod)
 
@@ -155,6 +157,8 @@ def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
     mod = tilelang.transform.SunmmioLayoutInference()(mod)
     mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
+    if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION:
+        mod = tilelang.transform.ValidateTileViewRegions()(mod)
 
     LayoutVisual(mod)
     mod = tilelang.transform.LowerTileOp()(mod)

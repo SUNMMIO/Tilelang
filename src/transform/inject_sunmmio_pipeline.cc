@@ -5,6 +5,7 @@
 #include "../op/parallel.h"
 #include "../op/region.h"
 #include "../op/utils.h"
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "../tileview/tileview.h"
 #include "common/loop_fusion_utils.h"
@@ -62,6 +63,7 @@ public:
     }
 
     substituter.RewriteFunctionLayoutAttrs(f);
+    substituter.RecordDefaultPingPongAttrs(f);
 
     f.CopyOnWrite()->body =
         RemapBufferRewriter::Substitute(f->body, substituter.buffer_remap_);
@@ -86,14 +88,39 @@ private:
       }
 
       const Buffer &new_buffer = (*it).second;
-      Optional<Layout> derived_layout = DeriveLayoutLike(
-          layout, new_buffer->shape, Optional<Array<Integer>>(), &analyzer);
+      Optional<Layout> derived_layout =
+          DeriveLayoutLikeForDType(layout, new_buffer->shape, new_buffer->dtype,
+                                   Optional<Array<Integer>>(), &analyzer);
       ICHECK(derived_layout.defined())
           << "Failed to derive multiversioned layout for buffer "
           << buffer->name << " with shape " << new_buffer->shape;
       new_layout_map.Set(new_buffer, derived_layout.value());
     }
     f = WithAttr(std::move(f), attr::kLayoutMap, new_layout_map);
+  }
+
+  void RecordDefaultPingPongAttrs(PrimFunc &f) {
+    if (buffer_remap_.empty()) {
+      return;
+    }
+
+    Map<Var, String> alloc_ping_pong;
+    for (const auto &kv : buffer_remap_) {
+      const Buffer &buffer = kv.first;
+      if (buffer.scope() != kSunmmioScopeASRAM &&
+          buffer.scope() != kSunmmioScopeWSRAM) {
+        continue;
+      }
+      const Buffer &new_buffer = kv.second;
+      alloc_ping_pong.Set(new_buffer->data, String("pong"));
+    }
+
+    if (alloc_ping_pong.empty()) {
+      return;
+    }
+
+    f = WithAttr(std::move(f), tl::attr::kSunmmioAllocPingPong,
+                 alloc_ping_pong);
   }
 
   Buffer makeMultiVersionBuffer(const Buffer &buffer, int num_version) {
@@ -270,7 +297,17 @@ private:
   PrimExpr VisitExpr_(const CallNode *op) final {
     if (!replace_flag)
       return StmtExprMutator::VisitExpr_(op);
-    if (op->op.same_as(RegionOp::Get())) {
+    if (op->op.same_as(builtin::tvm_access_ptr())) {
+      ICHECK_EQ(op->args.size(), 5U);
+      Var buffer_data = Downcast<Var>(op->args[1]);
+      if (!var_remap_.count(buffer_data)) {
+        return StmtExprMutator::VisitExpr_(op);
+      }
+      Var new_data = var_remap_[buffer_data];
+      return Call(
+          op->dtype, op->op,
+          {op->args[0], new_data, op->args[2], op->args[3], op->args[4]});
+    } else if (op->op.same_as(RegionOp::Get())) {
       RegionOp original_region(op->args);
       Buffer original_buffer = original_region->GetBuffer();
 
@@ -336,9 +373,49 @@ public:
   void set_loop_var_replacement(PrimExpr p) { replaced_loop_var_ = p; }
 
 private:
+  PrimExpr RewriteBufferAccess(const Call &call,
+                               const std::vector<int> &arg_indices) {
+    auto product = [](const Array<PrimExpr> &input) {
+      return foldl(
+          [](PrimExpr a, PrimExpr b, Span span) {
+            return mul(std::move(a), std::move(b), std::move(span));
+          },
+          make_const(DataType::Int(32), 1), input);
+    };
+    Array<PrimExpr> new_args = call->args;
+    for (int i : arg_indices) {
+      // const Buffer &buffer =
+      //     buffer_data_to_buffer_.at(Downcast<Var>(call->args[i]));
+      // auto it = buffer_remap_.find(buffer);
+      // if (it != buffer_remap_.end()) {
+      //   const Buffer &new_buffer = (*it).second;
+      //   const PrimExpr &old_index = call->args[i + 1];
+      //   LOG(INFO) << old_index;
+      //   PrimExpr offset;
+      //   if (new_buffer->strides.empty()) {
+      //     offset = product(buffer->shape);
+      //   } else {
+      //     offset = new_buffer->strides[0];
+      //   }
+      //   PrimExpr new_index =
+      //       old_index +
+      //       floormod(pipeline_loop_->loop_var, new_buffer->shape[0]) *
+      //       offset;
+      //   LOG(INFO) << new_index;
+      //   new_args.Set(i + 1, new_index);
+    }
+    return Call(call->dtype, call->op, new_args, call->annotations, call->span);
+  }
+
   Stmt VisitStmt_(const BlockNode *op) final {
     Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
     BlockNode *n = block.CopyOnWrite();
+    // n->reads.MutateByApply([this](const BufferRegion &buffer_region) {
+    //   return RewritePipelineBufferRegion(buffer_region);
+    // });
+    // n->writes.MutateByApply([this](const BufferRegion &buffer_region) {
+    //   return RewritePipelineBufferRegion(buffer_region);
+    // });
     return block;
   }
 
@@ -370,6 +447,14 @@ private:
     auto *n = load.CopyOnWrite();
     n->indices.Set(0, current_version_);
     return load;
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    Call call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    if (call->op.same_as(builtin::tvm_access_ptr())) {
+      return RewriteBufferAccess(call, {1});
+    }
+    return call;
   }
 
   PrimExpr VisitExpr_(const VarNode *op) final {

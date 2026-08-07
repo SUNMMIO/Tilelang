@@ -26,6 +26,17 @@ namespace tl {
 
 using namespace tir;
 
+namespace {
+
+constexpr int kMXFP4CustomTypeCode = DataType::kCustomBegin + 1;
+
+bool IsMXFP4DType(DataType dtype) {
+  return dtype.code() == kMXFP4CustomTypeCode && dtype.bits() == 4 &&
+         dtype.lanes() == 1;
+}
+
+} // namespace
+
 void BinderAddAssert(arith::Analyzer *ana, PrimExpr cond,
                      const std::string &arg_name, std::vector<Stmt> *asserts,
                      PrimExpr nullable_guard = PrimExpr()) {
@@ -972,8 +983,10 @@ void ArgBinder::BindDLTensors(
       }
     }
 
-    // Byte_offset field.
-    int data_bytes = GetVectorBytes(buffer->dtype);
+    // Byte_offset field. Custom mxfp4 is sub-byte, so only a zero logical
+    // element offset can be represented without defining bit-offset semantics.
+    bool is_mxfp4 = IsMXFP4DType(buffer->dtype);
+    int data_bytes = is_mxfp4 ? 0 : GetVectorBytes(buffer->dtype);
 
     if (const auto *const_offset = buffer->elem_offset.as<IntImmNode>()) {
       // Constant elem_offset: only need consistency check, no need for
@@ -983,7 +996,12 @@ void ArgBinder::BindDLTensors(
           TVMArrayGet(DataType::UInt(64), handle, builtin::kArrByteOffset),
           make_const(DataType::UInt(64), 0));
       PrimExpr expect_byte_offset =
-          make_const(DataType::UInt(64), const_offset->value * data_bytes);
+          is_mxfp4 ? make_const(DataType::UInt(64), const_offset->value)
+                   : make_const(DataType::UInt(64),
+                                const_offset->value * data_bytes);
+      ICHECK(!is_mxfp4 || const_offset->value == 0)
+          << "custom[mxfp4]4 external DLTensor currently only supports "
+             "zero elem_offset in packed API.";
       PrimExpr ok = (expect_byte_offset == actual_byte_offset);
       ffi::Array<PrimExpr> pargs;
       pargs.push_back(StringImm(tvm_error_byte_offset_mismatch));
@@ -997,6 +1015,9 @@ void ArgBinder::BindDLTensors(
           {IfThenElse(Not(is_null), IfThenElse(Not(ok), call_err), Evaluate(0)),
            nop}));
     } else {
+      ICHECK(!is_mxfp4)
+          << "custom[mxfp4]4 external DLTensor currently only supports "
+             "constant zero elem_offset in packed API.";
       PrimExpr actual_byte_offset = tvm::if_then_else(
           Not(is_null),
           TVMArrayGet(DataType::UInt(64), handle, builtin::kArrByteOffset),

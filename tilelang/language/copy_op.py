@@ -1,14 +1,382 @@
 """Copy operations exposed on the TileLang language surface."""
 
 from __future__ import annotations
+from dataclasses import dataclass
 from typing import Literal, Any
+import warnings
+import tilelang.utils.target as _target_utils
 from tilelang._typing import BufferLikeType
 from tilelang.utils.language import (
     to_buffer_region,
+    prim_expr_equal,
     legalize_pairwise_extents,
 )
 from tilelang.language.utils import get_extent
-from tvm import ir, tir
+from tilelang.language.frame import resolve_let_bound_expr
+from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
+from tilelang.utils.target import target_is_sunmmio
+from tvm import arith, ir, tir
+from tvm.target import Target
+
+
+_OperandKind = Literal["buffer", "region", "load"]
+_ExtentRelation = Literal["equal", "less_equal", "greater", "unknown"]
+
+
+@dataclass(frozen=True)
+class _CopyRegionSpec:
+    kind: _OperandKind
+    buffer: tir.Buffer
+    mins: list[tir.PrimExpr]
+    extents: list[tir.PrimExpr] | None
+    explicit_extents: bool
+
+
+@dataclass(frozen=True)
+class _NormalizedCopyRegion:
+    spec: _CopyRegionSpec
+    mins: list[tir.PrimExpr]
+    extents: list[tir.PrimExpr]
+
+
+def _resolve_let_value(obj: Any) -> Any:
+    from tilelang.language.frame import has_let_value, get_let_value
+
+    if isinstance(obj, tir.Var) and has_let_value(obj):
+        return get_let_value(obj)
+    return obj
+
+
+def _extract_copy_region_spec(obj: BufferLikeType) -> _CopyRegionSpec:
+    obj = _resolve_let_value(obj)
+    if isinstance(obj, tir.Buffer):
+        mins = [tir.IntImm("int32", 0) for _ in obj.shape]
+        return _CopyRegionSpec("buffer", obj, mins, list(obj.shape), False)
+    if isinstance(obj, tir.BufferRegion):
+        mins = [r.min for r in obj.region]
+        extents = [r.extent for r in obj.region]
+        return _CopyRegionSpec("region", obj.buffer, mins, extents, True)
+    if isinstance(obj, tir.BufferLoad):
+        return _CopyRegionSpec("load", obj.buffer, list(obj.indices), None, False)
+    raise TypeError(f"Unsupported argument type for T.copy: {type(obj)}")
+
+
+def _as_static_int(expr: Any) -> int | None:
+    if isinstance(expr, tir.PrimExpr):
+        expr = resolve_let_bound_expr(expr)
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, tir.IntImm):
+        return int(expr.value)
+    return None
+
+
+def _expr_is_one(expr: tir.PrimExpr) -> bool:
+    return prim_expr_equal(resolve_let_bound_expr(expr), 1)
+
+
+def _expr_is_squeezable_one(expr: tir.PrimExpr) -> bool:
+    expr = resolve_let_bound_expr(expr)
+    if _expr_is_one(expr):
+        return True
+    if isinstance(expr, tir.Min):
+        return _expr_is_one(expr.a) or _expr_is_one(expr.b)
+    return False
+
+
+def _expr_equal(lhs: tir.PrimExpr, rhs: tir.PrimExpr) -> bool:
+    return prim_expr_equal(resolve_let_bound_expr(lhs), resolve_let_bound_expr(rhs))
+
+
+def _extent_relation(lhs: tir.PrimExpr, rhs: tir.PrimExpr) -> _ExtentRelation:
+    resolved_lhs = resolve_let_bound_expr(lhs)
+    resolved_rhs = resolve_let_bound_expr(rhs)
+    if prim_expr_equal(resolved_lhs, resolved_rhs):
+        return "equal"
+
+    analyzer = arith.Analyzer()
+    try:
+        if analyzer.can_prove_equal(resolved_lhs, resolved_rhs):
+            return "equal"
+        if analyzer.can_prove(resolved_lhs > resolved_rhs):
+            return "greater"
+        if analyzer.can_prove(resolved_lhs <= resolved_rhs):
+            return "less_equal"
+    except (TypeError, ValueError):
+        pass
+    return "unknown"
+
+
+def _expr_gt(lhs: tir.PrimExpr, rhs: tir.PrimExpr) -> bool:
+    return _extent_relation(lhs, rhs) == "greater"
+
+
+# Warn when an explicit BufferRegion exceeds the buffer shape.
+def _warn_explicit_oob(buffer: tir.Buffer, dim: int, min_value: tir.PrimExpr, extent: tir.PrimExpr, shape: tir.PrimExpr) -> None:
+    warnings.warn(
+        "T.copy explicit BufferRegion exceeds buffer shape and will be clipped: "
+        f"{buffer.name}[dim={dim}], min={min_value}, extent={extent}, shape={shape}",
+        stacklevel=3,
+    )
+
+
+def _clip_extent_to_shape(
+    buffer: tir.Buffer,
+    dim: int,
+    min_value: tir.PrimExpr,
+    extent: tir.PrimExpr,
+    shape: tir.PrimExpr,
+    *,
+    warn_if_clipped: bool,
+) -> tir.PrimExpr:
+    min_int = _as_static_int(min_value)
+    extent_int = _as_static_int(extent)
+    shape_int = _as_static_int(shape)
+
+    if min_int is not None and shape_int is not None and (min_int < 0 or min_int >= shape_int):
+        raise ValueError(
+            f"T.copy region starts outside buffer shape: {buffer.name}[dim={dim}], min={min_value}, extent={extent}, shape={shape}"
+        )
+
+    if min_int is not None and extent_int is not None and shape_int is not None:
+        available = shape_int - min_int
+        clipped = min(extent_int, available)
+        if clipped < extent_int:
+            if warn_if_clipped:
+                _warn_explicit_oob(buffer, dim, min_value, extent, shape)
+            return tir.IntImm(extent.dtype if hasattr(extent, "dtype") else "int32", clipped)
+
+    return extent
+
+
+def _int_one() -> tir.IntImm:
+    return tir.IntImm("int32", 1)
+
+
+def _infer_load_extents_from_peer(load: _CopyRegionSpec, peer_extents: list[tir.PrimExpr]) -> list[tir.PrimExpr]:
+    rank = len(load.mins)
+    extents = list(peer_extents)
+    if len(extents) < rank:
+        return [_int_one() for _ in range(rank - len(extents))] + extents
+    return extents[-rank:]
+
+
+def _clip_region_to_shape(spec: _CopyRegionSpec, mins: list[tir.PrimExpr], extents: list[tir.PrimExpr]) -> _NormalizedCopyRegion:
+    if len(mins) != len(extents) or len(extents) != len(spec.buffer.shape):
+        raise ValueError(
+            "T.copy region rank does not match buffer rank before clipping: "
+            f"{spec.buffer.name}, mins={len(mins)}, extents={len(extents)}, shape={len(spec.buffer.shape)}"
+        )
+    resolved_mins = [resolve_let_bound_expr(min_value) for min_value in mins]
+    resolved_extents = [resolve_let_bound_expr(extent) for extent in extents]
+    resolved_shapes = [resolve_let_bound_expr(shape) for shape in spec.buffer.shape]
+    validated_extents = [
+        _clip_extent_to_shape(
+            spec.buffer,
+            dim,
+            min_value,
+            extent,
+            resolved_shapes[dim],
+            warn_if_clipped=spec.explicit_extents,
+        )
+        for dim, (min_value, extent) in enumerate(zip(resolved_mins, resolved_extents))
+    ]
+    return _NormalizedCopyRegion(spec, resolved_mins, validated_extents)
+
+
+def _normalize_copy_regions(src: _CopyRegionSpec, dst: _CopyRegionSpec) -> tuple[_NormalizedCopyRegion, _NormalizedCopyRegion]:
+    if src.kind == "load" and dst.kind == "load":
+        raise AssertionError("BufferLoad-to-BufferLoad copy should be handled by the scalar BufferStore fast path")
+
+    if src.kind == "load" and dst.kind == "region":
+        assert dst.extents is not None
+        dst_region = _clip_region_to_shape(dst, dst.mins, list(dst.extents))
+        src_extents = _infer_load_extents_from_peer(src, dst_region.extents)
+        src_region = _clip_region_to_shape(src, src.mins, src_extents)
+        return src_region, dst_region
+
+    if src.kind == "region" and dst.kind == "load":
+        assert src.extents is not None
+        src_region = _clip_region_to_shape(src, src.mins, list(src.extents))
+        dst_extents = _infer_load_extents_from_peer(dst, src_region.extents)
+        dst_region = _clip_region_to_shape(dst, dst.mins, dst_extents)
+        return src_region, dst_region
+
+    src_extents = src.extents
+    dst_extents = dst.extents
+
+    if src.kind == "load":
+        assert dst_extents is not None
+        src_extents = _infer_load_extents_from_peer(src, dst_extents)
+    if dst.kind == "load":
+        assert src_extents is not None
+        dst_extents = _infer_load_extents_from_peer(dst, src_extents)
+
+    assert src_extents is not None and dst_extents is not None
+    src_region = _clip_region_to_shape(src, src.mins, list(src_extents))
+    dst_region = _clip_region_to_shape(dst, dst.mins, list(dst_extents))
+    return src_region, dst_region
+
+
+def _format_extents(extents: list[tir.PrimExpr]) -> str:
+    return "[" + ", ".join(str(extent) for extent in extents) + "]"
+
+
+def _unproven_extent_error(
+    src: _NormalizedCopyRegion,
+    dst: _NormalizedCopyRegion,
+    src_dim: int,
+    dst_dim: int,
+    *,
+    require_exact_match: bool,
+) -> ValueError:
+    requirement = "equal" if require_exact_match else "less than or equal"
+    return ValueError(
+        "T.copy extent relation is unknown in strict mode: cannot prove that the source extent is "
+        f"{requirement} to the destination extent; "
+        f"src dim {src_dim} extent={src.extents[src_dim]}, "
+        f"dst dim {dst_dim} extent={dst.extents[dst_dim]}; "
+        f"src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
+    )
+
+
+def _suffix_axis_map(src: _NormalizedCopyRegion, dst: _NormalizedCopyRegion) -> list[tuple[int, int]]:
+    src_rank = len(src.extents)
+    dst_rank = len(dst.extents)
+    matched_rank = min(src_rank, dst_rank)
+
+    if src_rank > dst_rank:
+        extra_extents = src.extents[: src_rank - dst_rank]
+        for dim, extent in enumerate(extra_extents):
+            if not _expr_is_one(extent):
+                raise ValueError(
+                    "T.copy rank mismatch: src has non-1 extra leading dimension "
+                    f"at dim {dim}, extent={extent}; src={_format_extents(src.extents)}, "
+                    f"dst={_format_extents(dst.extents)}"
+                )
+        return [(src_rank - matched_rank + i, i) for i in range(matched_rank)]
+
+    if dst_rank > src_rank:
+        extra_extents = dst.extents[: dst_rank - src_rank]
+        for dim, extent in enumerate(extra_extents):
+            if not _expr_is_one(extent):
+                raise ValueError(
+                    "T.copy rank mismatch: dst has non-1 extra leading dimension "
+                    f"at dim {dim}, extent={extent}; src={_format_extents(src.extents)}, "
+                    f"dst={_format_extents(dst.extents)}"
+                )
+        return [(i, dst_rank - matched_rank + i) for i in range(matched_rank)]
+
+    return [(i, i) for i in range(matched_rank)]
+
+
+def _squeezed_axis_map(src: _NormalizedCopyRegion, dst: _NormalizedCopyRegion) -> list[tuple[int, int]]:
+    if len(src.extents) == len(dst.extents):
+        identity_compatible = True
+        for src_extent, dst_extent in zip(src.extents, dst.extents):
+            if _expr_equal(src_extent, dst_extent) or _expr_is_squeezable_one(src_extent):
+                continue
+            if _expr_is_squeezable_one(dst_extent) or _expr_gt(src_extent, dst_extent):
+                identity_compatible = False
+                break
+        if identity_compatible:
+            return [(i, i) for i in range(len(src.extents))]
+
+    src_axes = [(dim, extent) for dim, extent in enumerate(src.extents) if not _expr_is_squeezable_one(extent)]
+    dst_axes = [(dim, extent) for dim, extent in enumerate(dst.extents) if not _expr_is_squeezable_one(extent)]
+
+    if len(src_axes) != len(dst_axes):
+        raise ValueError(
+            "T.copy rank mismatch: mixed-region copy requires the same number of "
+            "non-1 extents after squeezing unit dimensions; "
+            f"src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
+        )
+
+    return [(src_dim, dst_dim) for (src_dim, _), (dst_dim, _) in zip(src_axes, dst_axes)]
+
+
+def _validate_and_adjust_copy_regions(
+    src: _NormalizedCopyRegion,
+    dst: _NormalizedCopyRegion,
+    *,
+    require_exact_match: bool,
+) -> tuple[_NormalizedCopyRegion, _NormalizedCopyRegion]:
+    axis_map = _suffix_axis_map(src, dst) if require_exact_match else _squeezed_axis_map(src, dst)
+    dst_extents = list(dst.extents)
+
+    for src_dim, dst_dim in axis_map:
+        src_extent = src.extents[src_dim]
+        dst_extent = dst.extents[dst_dim]
+        relation = _extent_relation(src_extent, dst_extent)
+
+        if require_exact_match:
+            if relation == "equal":
+                continue
+            if relation == "unknown":
+                raise _unproven_extent_error(src, dst, src_dim, dst_dim, require_exact_match=True)
+            raise ValueError(
+                "T.copy extent mismatch: exact match is required for Buffer-to-Buffer copy; "
+                f"src dim {src_dim} extent={src_extent}, dst dim {dst_dim} extent={dst_extent}; "
+                f"src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
+            )
+
+        if relation == "greater":
+            raise ValueError(
+                "T.copy extent mismatch: src extent is larger than dst extent at matched axis; "
+                f"src dim {src_dim} extent={src_extent}, dst dim {dst_dim} extent={dst_extent}; "
+                f"src={_format_extents(src.extents)}, dst={_format_extents(dst.extents)}"
+            )
+        if relation == "less_equal":
+            dst_extents[dst_dim] = src_extent
+        elif relation == "unknown":
+            raise _unproven_extent_error(src, dst, src_dim, dst_dim, require_exact_match=False)
+
+    return src, _NormalizedCopyRegion(dst.spec, dst.mins, dst_extents)
+
+
+def _encode_normalized_region(region: _NormalizedCopyRegion, access_type: str) -> tir.PrimExpr:
+    normalized_load = tir.BufferLoad(region.spec.buffer, region.mins)
+    return to_buffer_region(normalized_load, access_type=access_type, extents=region.extents)
+
+
+def _prepare_copy_regions_strict(
+    src: BufferLikeType,
+    dst: BufferLikeType,
+) -> tuple[tir.PrimExpr, tir.PrimExpr]:
+    src_spec = _extract_copy_region_spec(src)
+    dst_spec = _extract_copy_region_spec(dst)
+    src_region, dst_region = _normalize_copy_regions(src_spec, dst_spec)
+    src_region, dst_region = _validate_and_adjust_copy_regions(
+        src_region,
+        dst_region,
+        require_exact_match=src_spec.kind == "buffer" and dst_spec.kind == "buffer",
+    )
+    return (
+        _encode_normalized_region(src_region, access_type="r"),
+        _encode_normalized_region(dst_region, access_type="w"),
+    )
+
+
+def _prepare_copy_regions_compact(
+    src: BufferLikeType,
+    dst: BufferLikeType,
+    src_extent: list[tir.PrimExpr] | None,
+    dst_extent: list[tir.PrimExpr] | None,
+) -> tuple[tir.PrimExpr, tir.PrimExpr]:
+    if isinstance(src, tir.Buffer) and isinstance(dst, tir.Buffer):
+        ir.assert_structural_equal(
+            [resolve_let_bound_expr(extent) for extent in src.shape],
+            [resolve_let_bound_expr(extent) for extent in dst.shape],
+        )
+
+    assert src_extent or dst_extent, "Can't deduce copy extents from args"
+    src_extents = list(src_extent) if src_extent else [1] * len(dst_extent)
+    dst_extents = list(dst_extent) if dst_extent else [1] * len(src_extent)
+    src_extents, dst_extents = legalize_pairwise_extents(src_extents, dst_extents)
+    return (
+        to_buffer_region(src, access_type="r", extents=src_extents),
+        to_buffer_region(dst, access_type="w", extents=dst_extents),
+    )
 
 
 def copy(
@@ -43,24 +411,18 @@ def copy(
         tir.Call: A handle to the copy operation
 
     Range handling notes:
-    - Accepts `Buffer`/`BufferRegion`/`BufferLoad` on either side. Extents are
-      derived as follows: `Buffer -> shape`, `BufferRegion -> [r.extent]`,
-      `BufferLoad -> extents from its inferred/encoded region`.
-    - If both `src` and `dst` are scalar `BufferLoad` without region extents,
-      lowers to a direct store: `dst[...] = src`.
-    - If one side is missing extents, it is treated as all-ones with the other
-      side's rank to enable broadcasting.
-    - Extents are right-aligned and legalized via `legalize_pairwise_extents`:
-      per tail-dimension, equal keeps as-is, a `1` broadcasts to the other,
-      otherwise a conservative `tir.max` is used to remain safe for dynamic
-      shapes.
-    - The finalized extents are encoded with `tl.region` via `to_buffer_region`
-      and passed through to the backend; low-level loop construction and any
-      scope-specific decisions happen during lowering.
+    - `Buffer` copies the full shape, `BufferRegion` uses explicit ranges, and
+      `BufferLoad` starts from its indices with extents inferred from the peer.
+    - Scalar `BufferLoad -> BufferLoad` keeps the scalar fast path and lowers to
+      a direct `BufferStore`.
+    - Rank-mismatched copies use suffix matching only: extra leading dimensions
+      on the higher-rank side must have extent 1.
+    - For mixed region copies, `dst` may be shrunk to the matched `src` extents
+      when `src <= dst`; static `src > dst` is rejected.
+    - Strict SunMMIO validation rejects extent relations that cannot be proven.
     """
-    if isinstance(src, tir.Buffer) and isinstance(dst, tir.Buffer):
-        ir.assert_structural_equal(src.shape, dst.shape)
-
+    src = _unwrap_mesh_tensor(_resolve_let_value(src))
+    dst = _unwrap_mesh_tensor(_resolve_let_value(dst))
     src_extent = get_extent(src)
     dst_extent = get_extent(dst)
     # Combine the nested if statements into a single if statement as suggested by SIM102
@@ -71,17 +433,11 @@ def copy(
         # In this case, lower it to a simple BufferStore: buffer_b[i] = buffer_a[i]
         return tir.BufferStore(dst.buffer, src, dst.indices)
 
-    assert src_extent or dst_extent, "Can't deduce copy extents from args"
-    # Treat missing extent as length-matched ones to enable broadcasting.
-    src_extent = list(src_extent) if src_extent else [1] * len(dst_extent)
-    dst_extent = list(dst_extent) if dst_extent else [1] * len(src_extent)
-
-    # Align and broadcast extents from the right (tail) side.
-    src_extent, dst_extent = legalize_pairwise_extents(src_extent, dst_extent)
-
-    # Use legalized extents for src and dst respectively.
-    src = to_buffer_region(src, access_type="r", extents=src_extent)
-    dst = to_buffer_region(dst, access_type="w", extents=dst_extent)
+    target = Target.current(allow_none=True)
+    if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION and target and target_is_sunmmio(target):
+        src, dst = _prepare_copy_regions_strict(src, dst)
+    else:
+        src, dst = _prepare_copy_regions_compact(src, dst, src_extent, dst_extent)
 
     # Build annotations dict
     ann = annotations.copy() if annotations else {}

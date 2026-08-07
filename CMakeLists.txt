@@ -89,11 +89,12 @@ else()
 endif()
 
 # Configs
-set(TILELANG_BACKENDS CUDA ROCM METAL)
+set(TILELANG_BACKENDS CUDA ROCM METAL SUNMMIO)
 
 set(TILELANG_BACKEND_DOC_CUDA "Enable CUDA backend (ON/OFF/or CUDA SDK path)")
 set(TILELANG_BACKEND_DOC_ROCM "Enable ROCm backend (ON/OFF/or ROCm SDK path)")
 set(TILELANG_BACKEND_DOC_METAL "Enable Metal backend")
+set(TILELANG_BACKEND_DOC_SUNMMIO "Enable Sunmmio backend and embedded NPU-IR integration")
 
 # TVM's config.cmake redefines USE_* options later, so we cache the user's choice
 # (including explicit -DUSE_XXX arguments) before we include TVM and restore it
@@ -117,6 +118,9 @@ macro(tilelang_define_backend_option BACKEND)
   endif()
 
   set(_default OFF)
+  if(BACKEND STREQUAL "SUNMMIO")
+    set(_default ON)
+  endif()
   if(DEFINED ${_backend_var})
     set(_default "${${_backend_var}}")
   endif()
@@ -132,6 +136,16 @@ endmacro()
 foreach(BACKEND IN LISTS TILELANG_BACKENDS)
   tilelang_define_backend_option(${BACKEND})
 endforeach()
+
+if(NOT TILELANG_USER_OVERRIDE_USE_SUNMMIO)
+  if($ENV{USE_SUNMMIO})
+    set(USE_SUNMMIO ON)
+    set(TILELANG_OPTION_USE_SUNMMIO ON)
+  elseif(DEFINED ENV{USE_SUNMMIO} AND NOT $ENV{USE_SUNMMIO})
+    set(USE_SUNMMIO OFF)
+    set(TILELANG_OPTION_USE_SUNMMIO OFF)
+  endif()
+endif()
 
 set(PREBUILD_CYTHON ON)
 
@@ -153,11 +167,10 @@ unset(_TILELANG_USE_CUDA_STUBS_DEFAULT)
 
 include(cmake/load_tvm.cmake)
 
-# --- NPU-IR Integration ---
-option(USE_NPUIR "Use NPU-IR for Sunmmio backend" ON)
-if(USE_NPUIR)
+# --- Sunmmio / NPU-IR Integration ---
+if(USE_SUNMMIO)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/NPU-IR/CMakeLists.txt")
-    message(STATUS "NPU-IR integration enabled.")
+    message(STATUS "Sunmmio backend enabled with embedded NPU-IR integration.")
 
     set(
       TILELANG_NPUIR_BINARY_DIR
@@ -170,21 +183,28 @@ if(USE_NPUIR)
     set(LLVM_TABLEGEN_EXE llvm-tblgen CACHE FILEPATH "Path to llvm-tblgen")
     set(MLIR_TABLEGEN_EXE mlir-tblgen CACHE FILEPATH "Path to mlir-tblgen")
 
-    # 2. Preemptively set include directories to avoid find_package(MLIR) failure
-    set(LLVM_PROJECT_DIR "${TILELANG_NPUIR_BINARY_DIR}/llvm-project")
-    set(LLVM_PROJECT_BUILD_DIR "${TILELANG_NPUIR_BINARY_DIR}/llvm-project-build")
-    if(EXISTS "${LLVM_PROJECT_DIR}/llvm/CMakeLists.txt")
-      set(
-        NPUIR_USE_LLVM_SOURCE_DIR
-        "${LLVM_PROJECT_DIR}"
-        CACHE PATH "Path to a cached llvm-project checkout for the embedded NPU-IR build"
-        FORCE
-      )
-      message(STATUS "Using cached NPU-IR LLVM sources from ${NPUIR_USE_LLVM_SOURCE_DIR}")
+    # 2. Determine LLVM Project Directory
+    if(NPUIR_USE_LLVM_SOURCE_DIR)
+      set(LLVM_PROJECT_DIR "${NPUIR_USE_LLVM_SOURCE_DIR}")
+      message(STATUS "NPU-IR using external LLVM source: ${LLVM_PROJECT_DIR}")
     else()
-      unset(NPUIR_USE_LLVM_SOURCE_DIR CACHE)
-      message(STATUS "No cached NPU-IR LLVM sources found at ${LLVM_PROJECT_DIR}; NPU-IR will manage the checkout")
+      set(LLVM_PROJECT_DIR "${TILELANG_NPUIR_BINARY_DIR}/llvm-project")
+      if(EXISTS "${LLVM_PROJECT_DIR}/llvm/CMakeLists.txt")
+        set(
+          NPUIR_USE_LLVM_SOURCE_DIR
+          "${LLVM_PROJECT_DIR}"
+          CACHE PATH "Path to a cached llvm-project checkout for the embedded NPU-IR build"
+          FORCE
+        )
+        message(STATUS "Using cached NPU-IR LLVM sources from ${NPUIR_USE_LLVM_SOURCE_DIR}")
+      else()
+        message(STATUS "No cached NPU-IR LLVM sources found at ${LLVM_PROJECT_DIR}; NPU-IR will manage the checkout")
+      endif()
     endif()
+
+    set(LLVM_PROJECT_BUILD_DIR "${TILELANG_NPUIR_BINARY_DIR}/llvm-project-build")
+
+    # 3. Preemptively set include directories and module paths
     set(MLIR_INCLUDE_DIRS
       "${LLVM_PROJECT_DIR}/mlir/include"
       "${LLVM_PROJECT_BUILD_DIR}/tools/mlir/include"
@@ -196,7 +216,6 @@ if(USE_NPUIR)
       CACHE PATH "LLVM include directories" FORCE
     )
 
-    # 3. Ensure CMake modules are found during NPU-IR configuration
     list(APPEND CMAKE_MODULE_PATH "${LLVM_PROJECT_DIR}/llvm/cmake/modules")
     list(APPEND CMAKE_MODULE_PATH "${LLVM_PROJECT_DIR}/mlir/cmake/modules")
 
@@ -232,8 +251,10 @@ if(USE_NPUIR)
     list(APPEND TILE_LANG_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/NPU-IR/include)
     # Generated headers (e.g., from TableGen) will be in the binary directory
     list(APPEND TILE_LANG_INCLUDES ${TILELANG_NPUIR_BINARY_DIR}/include)
+    list(APPEND TILE_LANG_INCLUDES ${MLIR_INCLUDE_DIRS})
+    list(APPEND TILE_LANG_INCLUDES ${LLVM_INCLUDE_DIRS})
   else()
-    message(WARNING "NPU-IR enabled but 3rdparty/NPU-IR/CMakeLists.txt not found.")
+    message(FATAL_ERROR "USE_SUNMMIO=ON requires 3rdparty/NPU-IR. Please initialize submodules or provide an NPU-IR SDK.")
   endif()
 endif()
 
@@ -253,7 +274,7 @@ foreach(BACKEND IN LISTS TILELANG_BACKENDS)
 endforeach()
 
 # Include directories for TileLang
-set(TILE_LANG_INCLUDES ${TVM_INCLUDES})
+list(INSERT TILE_LANG_INCLUDES 0 ${TVM_INCLUDES})
 
 # Collect source files
 file(GLOB TILE_LANG_SRCS
@@ -262,11 +283,11 @@ file(GLOB TILE_LANG_SRCS
   src/layout/*.cc
   src/tileview/*.cc
   src/transform/*.cc
-  src/transform/sunmmio_tile_loop_fusion/*.cc
   src/transform/sunmmio_pipeline_planning/*.cc
+  src/transform/sunmmio_tile_loop_fusion/*.cc
   src/transform/common/*.cc
   src/op/*.cc
-  src/target/sunmmio/*.cc
+  src/target/sunmmio/cost_model.cc
   src/target/utils.cc
   src/target/sunmmio_utils.cc
   src/target/codegen_c_host.cc
@@ -275,6 +296,23 @@ file(GLOB TILE_LANG_SRCS
   # intrin_rule doesn't have system dependency
   src/target/intrin_rule*.cc
 )
+
+if(USE_SUNMMIO)
+  file(GLOB TILE_LANG_SUNMMIO_SRCS
+    src/target/sunmmio/codegen_sunmmio.cc
+    src/target/sunmmio/sunmmio_codegen_tiles_loop.cc
+    src/target/sunmmio/sunmmio_mlir_builder.cc
+    src/target/sunmmio/sunmmio_mlir_context.cc
+    src/target/sunmmio/sunmmio_mlir_type.cc
+    src/target/sunmmio/sunmmio_mlir_function.cc
+    src/target/sunmmio/sunmmio_mlir_expr.cc
+    src/target/sunmmio/sunmmio_mlir_memory.cc
+    src/target/sunmmio/sunmmio_mlir_tile_op.cc
+    src/target/sunmmio/sunmmio_mlir_call.cc
+    src/target/sunmmio/rt_mod_sunmmio.cc
+  )
+  list(APPEND TILE_LANG_SRCS ${TILE_LANG_SUNMMIO_SRCS})
+endif()
 
 # Always include CPU-safe runtime helpers
 list(APPEND TILE_LANG_SRCS
@@ -434,12 +472,10 @@ elseif(USE_CUDA)
     src/runtime/runtime.cc
     src/target/ptx.cc
     src/target/codegen_cuda.cc
-    src/target/codegen_sunmmio.cc
     src/target/codegen_py.cc
     src/target/codegen_utils.cc
     src/target/codegen_cutedsl.cc
     src/target/rt_mod_cuda.cc
-    src/target/rt_mod_sunmmio.cc
     src/target/rt_mod_cutedsl.cc
   )
   list(APPEND TILE_LANG_SRCS ${TILE_LANG_CUDA_SRCS})
@@ -482,8 +518,47 @@ endif()
 
 target_include_directories(tilelang_objs PRIVATE ${TILE_LANG_INCLUDES})
 
+if(TARGET mlir-headers)
+  add_dependencies(tilelang_objs mlir-headers)
+endif()
+if(TARGET llvm-headers)
+  add_dependencies(tilelang_objs llvm-headers)
+endif()
+
 add_library(tilelang SHARED $<TARGET_OBJECTS:tilelang_objs>)
 target_link_libraries(tilelang PUBLIC tvm)
+
+set(TILELANG_NPUIR_TOOL_TARGETS)
+if(USE_SUNMMIO)
+  foreach(_tilelang_npuir_tool IN ITEMS npuir-opt npuir-translate npuir-compile)
+    if(NOT TARGET ${_tilelang_npuir_tool})
+      message(FATAL_ERROR "USE_SUNMMIO=ON requires NPU-IR target `${_tilelang_npuir_tool}`.")
+    endif()
+    add_dependencies(tilelang ${_tilelang_npuir_tool})
+    list(APPEND TILELANG_NPUIR_TOOL_TARGETS ${_tilelang_npuir_tool})
+  endforeach()
+  unset(_tilelang_npuir_tool)
+endif()
+
+if(TARGET MLIRIR)
+  target_link_libraries(tilelang PRIVATE
+    MLIRIR
+    MLIRSupport
+    MLIRFuncDialect
+    MLIRArithDialect
+    MLIRSCFDialect
+    MLIRMemRefDialect
+    MLIRControlFlowDialect
+    MLIRAffineDialect
+    MLIRVectorDialect
+  )
+  if(TARGET SUVMIR)
+    target_link_libraries(tilelang PRIVATE SUVMIR)
+  endif()
+endif()
+if(TARGET LLVMSupport)
+  target_link_libraries(tilelang PRIVATE LLVMSupport)
+endif()
 
 # Place dev build outputs under build/lib for consistency
 set_target_properties(tilelang PROPERTIES
@@ -615,6 +690,15 @@ install(
   RUNTIME DESTINATION tilelang/lib
   ARCHIVE DESTINATION tilelang/lib
 )
+
+if(TILELANG_NPUIR_TOOL_TARGETS)
+  install(
+    TARGETS ${TILELANG_NPUIR_TOOL_TARGETS}
+    RUNTIME DESTINATION tilelang/bin
+    LIBRARY DESTINATION tilelang/lib
+    ARCHIVE DESTINATION tilelang/lib
+  )
+endif()
 
 if(TILELANG_BUILD_CPP_TESTS)
   include(CTest)

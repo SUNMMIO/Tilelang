@@ -465,7 +465,8 @@ private:
     }
     return call->op.same_as(Op::Get("tl.dma_copy")) ||
            call->op.same_as(Op::Get("tl.broadcast_")) ||
-           call->op.same_as(Op::Get("tl.sunmmio_layout_transform"));
+           call->op.same_as(Op::Get("tl.sunmmio_layout_transform")) ||
+           call->op.same_as(Op::Get("tl.sunmmio_transpose"));
   }
 
   static bool WasBufferReadBeforeInstruction(const LocalDDG &local_ddg,

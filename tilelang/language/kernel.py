@@ -94,6 +94,31 @@ def _normalize_bindings(bindings: list[Var]) -> Var | list[Var]:
     return bindings
 
 
+def _is_mesh_ncores_expr(value) -> bool:
+    if not isinstance(value, tir.PrimExpr):
+        return False
+    from tilelang.language.mesh_symbols import mesh_ncores
+
+    return tir.analysis.expr_deep_equal(value, mesh_ncores())
+
+
+def _validate_sunmmio_blocks(blocks: tuple[int | tir.PrimExpr, ...]) -> None:
+    if len(blocks) != 1:
+        raise ValueError("Sunmmio T.Kernel only supports T.Kernel() or T.Kernel(T.mesh_ncores()).")
+
+    block = blocks[0]
+    if _is_mesh_ncores_expr(block):
+        return
+
+    if isinstance(block, (int, tir.IntImm)):
+        raise ValueError(
+            f"Sunmmio T.Kernel does not support explicit integer block extents, got {int(block)}. "
+            "Use T.Kernel() or T.Kernel(T.mesh_ncores())."
+        )
+
+    raise ValueError("Sunmmio T.Kernel block extent must be T.mesh_ncores(). Use T.Kernel() or T.Kernel(T.mesh_ncores()).")
+
+
 @register_object("tl.KernelLaunchFrame")
 class KernelLaunchFrame(TIRFrame):
     """
@@ -302,6 +327,12 @@ def Kernel(
         if cur_target is not None and target_is_sunmmio(cur_target):
             attrs["tilelang.is_sunmmio_kernel_frame"] = True
             threads = None
+            if len(blocks) == 0:
+                from tilelang.language.mesh_symbols import mesh_ncores
+
+                blocks = (mesh_ncores(),)
+            else:
+                _validate_sunmmio_blocks(blocks)
 
     is_sunmmio = attrs.get("tilelang.is_sunmmio_kernel_frame", False)
     if not is_cpu and not is_sunmmio and threads is None:

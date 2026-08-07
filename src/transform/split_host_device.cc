@@ -41,6 +41,8 @@
 #include "../layout/layout.h"
 #include "../op/builtin.h"
 #include "common/assume.h"
+#include "common/post_ssa_attr_normalizer.h"
+#include "common/substitute_with_buffer_predicates.h"
 #include "tir/analysis/var_use_def_analysis.h"
 #include "tvm/node/cast.h"
 #include "tvm/runtime/logging.h"
@@ -465,8 +467,9 @@ private:
     // will not create a second set of remapped Buffer objects.
     body = BufferRefReplacer(buffer_remap)(body);
 
-    // Substitute old variables with new ones in the body
-    body = tir::Substitute(body, var_remap);
+    // Substitute old variables with new ones, including expressions embedded
+    // in buffer predicates and statement annotations.
+    body = SubstituteWithAnnotationsAndBufferPredicates(body, var_remap);
 
     // CodeGenCPU is used for some device-side targets, such as
     // "ext_dev", and expects to be able to return a int32_t status
@@ -634,7 +637,9 @@ tvm::transform::Pass SplitHostDevice() {
     }
     mod->Update(updates);
     mod->Update(device_mod);
-    return tir::transform::ConvertSSA()(mod);
+    const IRModule &before_ssa = mod;
+    IRModule after_ssa = tir::transform::ConvertSSA()(mod);
+    return NormalizePostSSAAttrs(before_ssa, after_ssa);
   };
 
   return tvm::transform::CreateModulePass(pass_func, 0, "tl.SplitHostDevice",

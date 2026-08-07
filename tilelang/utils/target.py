@@ -21,10 +21,24 @@ SUPPORTED_TARGETS: dict[str, str] = {
     "webgpu": "WebGPU target for browser/WebGPU runtimes.",
     "c": "C source backend.",
     "cutedsl": "CuTe DSL GPU target.",
+    "sunmmio": "Sunmmio target (A4E device)",
     "Sunmmio": "Sunmmio target (A4E device)",
 }
 
 SUNMMIO_TARGET_DESC = "llvm -mcpu=sunmmio-a4e -mattr=device_mesh_nrow_4,device_mesh_ncol_4"
+
+# Set to False before constructing kernels to use the compact SunMMIO
+# copy/communication regions and omit ValidateTileViewRegions from lowering.
+ENABLE_SUNMMIO_REGION_VALIDATION = False
+
+
+def set_sunmmio_region_validation(enabled: bool) -> None:
+    """Enable or disable strict SunMMIO region normalization and validation."""
+    if not isinstance(enabled, bool):
+        raise TypeError(f"enabled must be a bool, got {type(enabled).__name__}")
+
+    global ENABLE_SUNMMIO_REGION_VALIDATION
+    ENABLE_SUNMMIO_REGION_VALIDATION = enabled
 
 
 def describe_supported_targets() -> dict[str, str]:
@@ -207,7 +221,7 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
                 normalized_target = target.strip()
                 if not normalized_target:
                     raise AssertionError(f"Target {target} is not supported")
-                if normalized_target == "Sunmmio":
+                if normalized_target.lower() == "sunmmio":
                     normalized_target = SUNMMIO_TARGET_DESC
                 try:
                     Target(normalized_target)

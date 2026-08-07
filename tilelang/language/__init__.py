@@ -15,12 +15,13 @@ from .eager import *  # noqa: F401
 from .tir.ir import *  # noqa: F401
 from tilelang.layout import Layout, Fragment  # noqa: F401
 from .proxy import ptr, make_tensor, Buffer, Tensor, StridedTensor, FragmentBuffer, SharedBuffer, LocalBuffer  # noqa: F401
+from . import placement  # noqa: F401
+from .placement import MeshReplicationType, MeshShardingPolicy, PlacementSpec  # noqa: F401
 from .mesh_tensor import (  # noqa: F401
-    MeshShardingPolicy,
-    MeshReplicationType,
     MeshTensor,
     TensorWithMeta,
 )
+from .mesh_symbols import mesh_nrows, mesh_ncols, mesh_ncores  # noqa: F401
 from .loop import (
     Parallel,  # noqa: F401
     Tiles,  # noqa: F401
@@ -59,6 +60,8 @@ from .allocate import (
     empty,  # noqa: F401
 )
 from .copy_op import copy, c2d_im2col  # noqa: F401
+from .mx import mx_pack, mx_unpack  # noqa: F401
+from .transpose_op import transpose  # noqa: F401
 from .dma import dma_load, dma_store  # noqa: F401
 from tilelang.tileop.base import GemmWarpPolicy  # noqa: F401
 from .gemm_op import gemm, gemm_v1, gemm_v2  # noqa: F401
@@ -133,6 +136,13 @@ from .pdl import (
     pdl_trigger,  # noqa: F401
     pdl_sync,  # noqa: F401
 )
+
+from tvm.script.ir_builder.tir import match_buffer as _tvm_match_buffer
+from . import dtypes as _dtypes
+
+
+def match_buffer(param, shape=None, dtype=_dtypes.float32, *args, **kwargs):  # noqa: F811
+    return _tvm_match_buffer(param, shape, _dtypes.normalize_dtype(dtype), *args, **kwargs)
 
 
 def import_source(source: str | None = None):

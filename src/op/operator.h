@@ -29,6 +29,7 @@ using AddWorkspaceCallback = std::function<PrimExpr(int, DataType)>;
 // in the enclosing block and records its layout so later passes/codegen see it.
 using RegisterScratchBufferCallback = std::function<void(Buffer, Layout)>;
 using LayoutMap = Map<Buffer, Layout>;
+using LayoutLevelMap = Map<Buffer, Integer>;
 using TileViewMap = Map<Var, TileView>;
 using BufferMap = Map<Var, Buffer>;
 
@@ -81,6 +82,9 @@ struct LayoutInferArgs {
   // fragment buffer accesses through let bindings
   Map<Var, PrimExpr> let_var_to_expr;
   LayoutMap global_layout_map;
+  // Optional provenance for entries in layout_map. Standalone Sunmmio layout
+  // inference uses this to distinguish replaceable defaults from constraints.
+  LayoutLevelMap layout_levels;
 };
 
 class TileOperator;

@@ -1,0 +1,78 @@
+#include "sunmmio_mlir_memory.h"
+
+#include "npuir/Dialect/SUVM/IR/Ops.h"
+#include "npuir/Dialect/SUVM/IR/Types.h"
+#include "tvm/runtime/logging.h"
+
+namespace tvm {
+namespace codegen {
+
+SunmmioMlirMemory::SunmmioMlirMemory(SunmmioMlirContext &ctx)
+    : ctx_(ctx), type_(ctx) {}
+
+SunMMIOValue SunmmioMlirMemory::Alloc(
+    const std::string &result_name, const SunMMIOType &memref_type,
+    const std::vector<SunMMIOValue> &dyn_extents, const std::string &scope_name,
+    DataType dtype, std::optional<std::string> ping_pong) {
+  if (memref_type.kind != SunMMIOType::Kind::kMemTensor) {
+    LOG(FATAL) << "SunMMIO SUVM alloc expects memtensor type, but got kind "
+               << static_cast<int>(memref_type.kind);
+  }
+  if (!dyn_extents.empty()) {
+    LOG(FATAL) << "SunMMIO SUVM alloc does not support dynamic extents yet";
+  }
+
+  SunMMIOType updated_type = memref_type;
+  if (updated_type.memory_scope.empty()) {
+    updated_type.memory_scope = scope_name;
+  }
+  mlir::Type mapped_type = type_.MapType(updated_type);
+  auto tensor_type = mlir::dyn_cast<mlir::suvm::MemTensorType>(mapped_type);
+  if (!tensor_type) {
+    LOG(FATAL) << "SunMMIO SUVM alloc expects suvm.memtensor result type";
+  }
+
+  mlir::suvm::AllocOp alloc = mlir::suvm::AllocOp::create(
+      ctx_.builder, ctx_.builder.getUnknownLoc(), tensor_type);
+  mlir::suvm::MemorySpace memory_space =
+      tensor_type.getMemorySpace().getValue();
+  if (memory_space == mlir::suvm::MemorySpace::asram ||
+      memory_space == mlir::suvm::MemorySpace::wsram) {
+    mlir::suvm::PingPong ping_pong_value = mlir::suvm::PingPong::ping;
+    if (ping_pong.has_value()) {
+      if (*ping_pong == "pong") {
+        ping_pong_value = mlir::suvm::PingPong::pong;
+      } else if (*ping_pong != "ping") {
+        LOG(FATAL) << "Unsupported SunMMIO ping-pong value: " << *ping_pong;
+      }
+    }
+    alloc->setAttr("suvm.ping_pong", mlir::suvm::PingPongAttr::get(
+                                         &ctx_.mlir_ctx, ping_pong_value));
+  }
+
+  SunMMIOValue out{dtype, result_name, updated_type};
+  ctx_.BindMLIRValue(result_name, alloc.getResult());
+  return out;
+}
+
+SunMMIOValue SunmmioMlirMemory::Load(const std::string &result_name,
+                                     const std::string &buffer_handle,
+                                     const std::vector<SunMMIOValue> &indices,
+                                     const SunMMIOType &memref_type,
+                                     DataType dtype,
+                                     const SunMMIOType &result_type) {
+  LOG(FATAL) << "Generic SunMMIO memory load lowering is unsupported for `"
+             << buffer_handle << "` with " << indices.size() << " indices";
+  TVM_FFI_UNREACHABLE();
+}
+
+void SunmmioMlirMemory::Store(const SunMMIOValue &value,
+                              const std::string &buffer_handle,
+                              const std::vector<SunMMIOValue> &indices,
+                              const SunMMIOType &memref_type) {
+  LOG(FATAL) << "Generic SunMMIO memory store lowering is unsupported for `"
+             << buffer_handle << "` with " << indices.size() << " indices";
+}
+
+} // namespace codegen
+} // namespace tvm
