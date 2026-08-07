@@ -31,6 +31,15 @@ inline DataType CanonicalizeSuvmDType(DataType dtype) {
   return dtype;
 }
 
+inline bool SupportsSuvmTilePickDType(DataType dtype) {
+  dtype = CanonicalizeSuvmDType(dtype).with_lanes(1);
+  if (dtype.bits() != 16 && dtype.bits() != 32) {
+    return false;
+  }
+  return dtype.is_int() || dtype.is_uint() || dtype.is_float() ||
+         dtype.is_bfloat16();
+}
+
 enum class BinaryOp {
   kAdd,
   kSub,
