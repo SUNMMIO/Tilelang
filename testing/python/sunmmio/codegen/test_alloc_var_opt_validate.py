@@ -260,7 +260,7 @@ def test_alloc_var_copy_mma_control_flow_kernel_codegen_validates_with_npuir_opt
             "scf.while",
             "scf.condition",
             "-> (!suvm.token, !suvm.token, f32, i32)",
-            "-> (!suvm.token, f32, i32)",
+            "-> (!suvm.token, f32, i32, i1)",
             "!suvm.token",
             "suvm.copy_async",
             "suvm.tc.mma",
