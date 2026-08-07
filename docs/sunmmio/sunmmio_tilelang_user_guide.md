@@ -744,6 +744,22 @@ T.copy(
 
 Common SunMMIO paths include DRAM -> RSRAM, RSRAM -> DRAM, DRAM/RSRAM -> ASRAM, DRAM/RSRAM -> WSRAM, and RSRAM -> RSRAM. Unsupported paths are listed in 2.7.
 
+**`T.transpose`**
+
+```python
+T.transpose(src, dst)
+```
+
+`T.transpose` transposes a matrix between RSRAM buffers through A4E ODMA.
+
+- `src`: a complete rank-2 RSRAM buffer with shape `[M, N]`.
+- `dst`: a complete rank-2 RSRAM buffer with shape `[N, M]`. It must not alias `src`.
+- The source and destination must have the same dtype. The supported dtypes are `bfloat16` and `float32`.
+- Shapes must be static, with every dimension a multiple of 32. Both buffers must use the same two-level 32x32 blockwise layout family, either ZZ or ZN.
+- Return value: a statement expressing the transpose operation.
+
+ODMA transpose is asynchronous. The compiler inserts synchronization before a dependent access. Slices, partial regions, and buffers outside RSRAM are not supported.
+
 ### 3.5 Tile Loop
 
 **`T.Tiles`**

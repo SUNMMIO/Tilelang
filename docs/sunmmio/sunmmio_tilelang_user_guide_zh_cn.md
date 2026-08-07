@@ -744,6 +744,22 @@ T.copy(
 
 SunMMIO 常见路径包括 DRAM -> RSRAM、RSRAM -> DRAM、DRAM/RSRAM -> ASRAM、DRAM/RSRAM -> WSRAM、RSRAM -> RSRAM。不支持路径见 2.7。
 
+**`T.transpose`**
+
+```python
+T.transpose(src, dst)
+```
+
+`T.transpose` 通过 A4E ODMA 在 RSRAM buffer 之间完成矩阵转置。
+
+- `src`：shape 为 `[M, N]` 的完整 rank-2 RSRAM buffer。
+- `dst`：shape 为 `[N, M]` 的完整 rank-2 RSRAM buffer，不能与 `src` 指向同一 buffer。
+- 源和目标的 dtype 必须一致，当前支持 `bfloat16` 和 `float32`。
+- shape 必须是静态值，且每一维都是 32 的倍数。两个 buffer 必须使用同一种两级 32x32 blockwise layout，即 ZZ 或 ZN。
+- 返回值：表达转置操作的语句。
+
+ODMA 转置是异步操作，编译器会在后续依赖访问之前插入同步。当前不支持 slice、局部 region 或 RSRAM 之外的 buffer。
+
 ### 3.5 Tile Loop
 
 **`T.Tiles`**
