@@ -7,6 +7,7 @@
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
 #include "common/ast_traverser.h"
+#include "common/sunmmio_pipeline_utils.h"
 #include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
 #include "sunmmio_pipeline_planning/resource_types_for_ilp.h"
 #include "tvm/arith/pattern.h"
@@ -213,6 +214,13 @@ long long EdgeKey(int i, int j) {
 int CeilDiv(int a, int b) {
   ICHECK_GT(b, 0);
   return (a + b - 1) / b;
+}
+
+int FloorDiv(int a, int b) {
+  ICHECK_GT(b, 0);
+  int quotient = a / b;
+  int remainder = a % b;
+  return remainder < 0 ? quotient - 1 : quotient;
 }
 
 int GcdInt(int a, int b) {
@@ -1130,99 +1138,6 @@ void WriteSolutionJson(
   out << "}\n";
 }
 
-bool IsPipelineLoopVar(const VarNode *node, const Var &pipeline_loop_var) {
-  return pipeline_loop_var.defined() && node == pipeline_loop_var.get();
-}
-
-ffi::Map<Var, PrimExpr> BuildZeroSubstitutionMap(const PrimExpr &expr,
-                                                 const Var &pipeline_loop_var) {
-  std::unordered_set<const VarNode *> vars;
-  PostOrderVisit(expr, [&](const ObjectRef &obj) {
-    if (const auto *var = obj.as<VarNode>()) {
-      if (!IsPipelineLoopVar(var, pipeline_loop_var)) {
-        vars.insert(var);
-      }
-    }
-  });
-
-  ffi::Map<Var, PrimExpr> vmap;
-  for (const VarNode *node : vars) {
-    Var var = ffi::GetRef<Var>(node);
-    vmap.Set(var, make_zero(var.dtype()));
-  }
-  return vmap;
-}
-
-int DetectIterOffsetFromExpr(const PrimExpr &expr, const Var &pipeline_loop_var,
-                             arith::Analyzer *analyzer) {
-  if (!pipeline_loop_var.defined() ||
-      !UsesVar(expr, [v = pipeline_loop_var.get()](const VarNode *node) {
-        return node == v;
-      })) {
-    return 0;
-  }
-
-  PrimExpr loop_only = expr;
-  ffi::Map<Var, PrimExpr> vmap =
-      BuildZeroSubstitutionMap(expr, pipeline_loop_var);
-  if (!vmap.empty()) {
-    loop_only = tir::Substitute(loop_only, vmap);
-  }
-  loop_only = analyzer->Simplify(loop_only);
-
-  ffi::Array<PrimExpr> coeffs = arith::DetectLinearEquation(
-      loop_only, ffi::Array<Var>{pipeline_loop_var});
-  if (coeffs.size() != 2) {
-    return 0;
-  }
-
-  PrimExpr coeff = analyzer->Simplify(coeffs[0]);
-  PrimExpr base = analyzer->Simplify(coeffs[1]);
-  const auto *coeff_int = coeff.as<IntImmNode>();
-  if (coeff_int == nullptr || coeff_int->value == 0) {
-    return 0;
-  }
-
-  PrimExpr unit_stride = coeff;
-  PrimExpr offset_expr = analyzer->Simplify(floordiv(base, unit_stride));
-  PrimExpr remainder = analyzer->Simplify(floormod(base, unit_stride));
-  if (!analyzer->CanProveEqual(remainder, make_zero(remainder.dtype()))) {
-    return 0;
-  }
-
-  const auto *offset_int = offset_expr.as<IntImmNode>();
-  if (offset_int == nullptr) {
-    return 0;
-  }
-  return static_cast<int>(offset_int->value);
-}
-
-int DetectIterOffsetFromRegion(const BufferRegion &region,
-                               const Var &pipeline_loop_var,
-                               arith::Analyzer *analyzer) {
-  int result = 0;
-  bool found = false;
-  for (const Range &range : region->region) {
-    int dim_offset =
-        DetectIterOffsetFromExpr(range->min, pipeline_loop_var, analyzer);
-    bool uses_loop_var =
-        pipeline_loop_var.defined() &&
-        UsesVar(range->min, [v = pipeline_loop_var.get()](const VarNode *node) {
-          return node == v;
-        });
-    if (!uses_loop_var) {
-      continue;
-    }
-    if (!found) {
-      result = dim_offset;
-      found = true;
-    } else if (result != dim_offset) {
-      return 0;
-    }
-  }
-  return found ? result : 0;
-}
-
 void DedupAccesses(std::vector<AccessInfo> *accesses) {
   std::vector<AccessInfo> deduped;
   deduped.reserve(accesses->size());
@@ -1269,7 +1184,8 @@ private:
   void AddAccess(const BufferRegion &region, bool is_write) {
     accesses_.push_back(AccessInfo{
         region, is_write,
-        DetectIterOffsetFromRegion(region, pipeline_loop_var_, &analyzer_)});
+        DetectPipelineIterOffsetFromRegion(region, pipeline_loop_var_,
+                                           &analyzer_)});
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
@@ -1284,6 +1200,11 @@ private:
   void VisitStmt_(const EvaluateNode *op) final {
     if (const auto *call = op->value.as<CallNode>()) {
       if (call->op.same_as(dma_copy())) {
+        AddAccess(NormalizeToBufferRegion(call->args[0]), false);
+        AddAccess(NormalizeToBufferRegion(call->args[1]), true);
+        return;
+      }
+      if (call->op.same_as(sunmmio_layout_transform())) {
         AddAccess(NormalizeToBufferRegion(call->args[0]), false);
         AddAccess(NormalizeToBufferRegion(call->args[1]), true);
         return;
@@ -2725,9 +2646,9 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
     int versions_per_bank = CeilDiv(mod, 2);
     int bank = flip ? PositiveMod(logical_iter + bank_phase, 2)
                     : PositiveMod(bank_phase, 2);
-    int version_in_bank = flip
-                              ? PositiveMod(logical_iter / 2, versions_per_bank)
-                              : PositiveMod(logical_iter, versions_per_bank);
+    int version_in_bank =
+        flip ? PositiveMod(FloorDiv(logical_iter, 2), versions_per_bank)
+             : PositiveMod(logical_iter, versions_per_bank);
     return version_in_bank * 2 + bank;
   };
 

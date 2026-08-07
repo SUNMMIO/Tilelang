@@ -178,3 +178,65 @@ def test_sunmmio_pipeline_ilp_inject_ffn_stage2():
         else None,
     )
     assert len(broadcasts) >= 4
+
+
+def _make_shifted_multiversion_pipeline():
+    k = tir.Var("k", "int32")
+    output = tir.decl_buffer((16,), "int32", name="output")
+    scratch = tir.decl_buffer((16,), "int32", name="scratch", scope="shared")
+
+    producer = tir.BufferStore(scratch, tir.IntImm("int32", 7), [k + 1])
+    consumer = tir.BufferStore(output, tir.BufferLoad(scratch, [k]), [k])
+    annotations = {
+        "iterations": 3,
+        "ii": 1,
+        "makespan": 2,
+        "steady_state_max_iter_offset": 0,
+        "used_buffers": [scratch],
+        "versioned_buffers": [scratch],
+        "runtime_multiversion_buffers": [scratch],
+        "runtime_banked_buffers": [],
+        "runtime_resident_banked_buffers": [],
+        "runtime_bank_start_phases": {},
+        "runtime_bank_read_delta_parities": {},
+        "runtime_bank_writer_phases": {},
+        "runtime_bank_reader_phases": {},
+        "runtime_bank_flip_modes": {},
+        "runtime_bank_peer_buffers": {},
+        "prologue_orders": ["0-0"],
+        "body_orders": ["1-1", "1-0"],
+        "epilogue_orders": ["8-1"],
+        "tl.sunmmio.pipeline.requested": True,
+        "tl.sunmmio.pipeline.applied": True,
+        "tl.sunmmio.pipeline.mode": "ilp",
+    }
+    loop = tir.For(
+        k,
+        0,
+        8,
+        tir.ForKind.SERIAL,
+        tir.SeqStmt([producer, consumer]),
+        annotations=annotations,
+    )
+    root = tir.Block([], [], [], "root", loop, alloc_buffers=[scratch])
+    body = tir.BlockRealize([], tir.const(True, "bool"), root)
+    func = tir.PrimFunc(
+        [output.data], body, buffer_map={output.data: output}
+    ).with_attr("global_symbol", "main")
+    return tvm.IRModule.from_expr(func)
+
+
+def test_sunmmio_pipeline_ilp_inject_shifted_access_version():
+    """A producer at k writing value k+1 must match its consumer at k+1."""
+    injected = tl.transform.InjectSunmmioPipelineILP()(
+        _make_shifted_multiversion_pipeline()
+    )
+    script = injected.script()
+
+    # Value 1 is produced in command iteration 0 and consumed in iteration 1.
+    # Both accesses must select slot 1 of the three-version buffer.
+    assert "scratch[1, T.Add(0, 1)] = 7" in script
+    assert "scratch[(k + 1) % 3, k + 1]" in script
+
+    # The next producer writes value k+2 and therefore advances to slot k+2.
+    assert "scratch[(k + 1 + 1) % 3, k + 1 + 1] = 7" in script
