@@ -832,38 +832,45 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   if (!src_layout.defined() || !dst_layout.defined())
     return dma(src_region, dst_region);
 
-  auto make_covered_full_rank1_range =
+  auto make_covered_full_innermost_row_range =
       [&](const Buffer &buffer, const Layout &layout,
           const Array<Range> &ranges) -> Optional<Array<Range>> {
-    if (buffer->shape.size() != 1 || ranges.size() != 1)
+    if (buffer->shape.empty() || ranges.size() != buffer->shape.size())
       return Optional<Array<Range>>();
     const auto *cute = layout.as<CuteLayoutNode>();
     if (!cute)
       return Optional<Array<Range>>();
     Array<PrimExpr> covered_shape = cute->GetCoveredShape();
-    if (covered_shape.size() != 1)
+    if (covered_shape.size() != buffer->shape.size())
       return Optional<Array<Range>>();
-    const Range &range = ranges[0];
-    if (!analyzer->CanProveEqual(range->min, make_zero(range->min.dtype())) ||
-        !analyzer->CanProveEqual(range->extent, buffer->shape[0])) {
+    const int innermost = static_cast<int>(ranges.size()) - 1;
+    for (int i = 0; i < innermost; ++i) {
+      if (!analyzer->CanProveEqual(ranges[i]->extent, 1))
+        return Optional<Array<Range>>();
+    }
+    const Range &row = ranges[innermost];
+    if (!analyzer->CanProveEqual(row->min, make_zero(row->min.dtype())) ||
+        !analyzer->CanProveEqual(row->extent, buffer->shape[innermost])) {
       return Optional<Array<Range>>();
     }
-    if (analyzer->CanProveEqual(covered_shape[0], range->extent))
+    if (analyzer->CanProveEqual(covered_shape[innermost], row->extent))
       return Optional<Array<Range>>();
     Array<Range> covered_ranges;
+    for (int i = 0; i < innermost; ++i)
+      covered_ranges.push_back(ranges[i]);
     covered_ranges.push_back(
-        Range::FromMinExtent(range->min, covered_shape[0]));
+        Range::FromMinExtent(row->min, covered_shape[innermost]));
     return covered_ranges;
   };
 
   if (IsLayoutMatch(src_layout, dst_layout, analyzer)) {
     Optional<Array<Range>> covered_src_range =
-        make_covered_full_rank1_range(src, src_layout, src_range);
+        make_covered_full_innermost_row_range(src, src_layout, src_range);
     Optional<Array<Range>> covered_dst_range =
-        make_covered_full_rank1_range(dst, dst_layout, dst_range);
+        make_covered_full_innermost_row_range(dst, dst_layout, dst_range);
     if (covered_src_range.defined() && covered_dst_range.defined() &&
-        analyzer->CanProveEqual(covered_src_range.value()[0]->extent,
-                                covered_dst_range.value()[0]->extent)) {
+        analyzer->CanProveEqual(covered_src_range.value().back()->extent,
+                                covered_dst_range.value().back()->extent)) {
       return dma(MakeRegionExpr(src, covered_src_range.value(),
                                 /*access_mask=*/1),
                  MakeRegionExpr(dst, covered_dst_range.value(),
