@@ -726,11 +726,12 @@ private:
     return replaced_loop_var_ - pipeline_loop_->min;
   }
 
-  PrimExpr EffectiveVersionExpr(const Buffer &buffer) const {
+  PrimExpr EffectiveVersionExpr(const Buffer &buffer,
+                                int access_iter_offset = 0) const {
     if (!version_axis_buffers_.count(buffer.get())) {
       return Integer(0);
     }
-    PrimExpr logical_iter = LogicalIterExpr();
+    PrimExpr logical_iter = LogicalIterExpr() + access_iter_offset;
     if (banked_buffers_.count(buffer.get())) {
       auto it_flip = buffer_bank_flip_.find(buffer.get());
       bool flip = it_flip == buffer_bank_flip_.end() || it_flip->second;
@@ -884,6 +885,10 @@ private:
   PrimExpr RewriteRegionExpr(const Call &call) {
     RegionOp original_region(call->args);
     Buffer original_buffer = original_region->GetBuffer();
+    arith::Analyzer analyzer;
+    int access_iter_offset = DetectPipelineIterOffsetFromRegion(
+        BufferRegion(original_buffer, original_region->GetRanges()),
+        pipeline_loop_->loop_var, &analyzer);
     Buffer target_buffer = original_buffer;
     if (rewritten_buffers_.count(original_buffer.get())) {
       int access_mask = original_region->GetAccessMask();
@@ -905,7 +910,8 @@ private:
     if (version_axis >= 0) {
       new_ranges.Set(
           version_axis,
-          Range::FromMinExtent(EffectiveVersionExpr(original_buffer), 1));
+          Range::FromMinExtent(
+              EffectiveVersionExpr(original_buffer, access_iter_offset), 1));
     }
     return MakeRegionExpr(target_buffer, new_ranges,
                           original_region->GetAccessMask());
@@ -924,6 +930,14 @@ private:
   }
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
+    Array<Range> original_ranges;
+    for (const PrimExpr &index : op->indices) {
+      original_ranges.push_back(Range::FromMinExtent(index, 1));
+    }
+    arith::Analyzer analyzer;
+    int access_iter_offset = DetectPipelineIterOffsetFromRegion(
+        BufferRegion(op->buffer, original_ranges), pipeline_loop_->loop_var,
+        &analyzer);
     int prev_stmt_id = current_stmt_id_;
     current_stmt_id_ = logical_stmt_cursor_;
     logical_stmt_cursor_ += 1;
@@ -937,12 +951,26 @@ private:
     Array<PrimExpr> indices = store->indices;
     int version_axis = VersionAxis(store->buffer);
     if (version_axis >= 0) {
-      indices.Set(version_axis, EffectiveVersionExpr(store->buffer));
+      indices.Set(version_axis,
+                  EffectiveVersionExpr(store->buffer, access_iter_offset));
     }
     return BufferStore(target_buffer, store->value, indices);
   }
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    Array<Range> original_ranges;
+    for (const PrimExpr &index : op->indices) {
+      if (const auto *ramp = index.as<RampNode>()) {
+        original_ranges.push_back(
+            Range::FromMinExtent(ramp->base, ramp->lanes));
+      } else {
+        original_ranges.push_back(Range::FromMinExtent(index, 1));
+      }
+    }
+    arith::Analyzer analyzer;
+    int access_iter_offset = DetectPipelineIterOffsetFromRegion(
+        BufferRegion(op->buffer, original_ranges), pipeline_loop_->loop_var,
+        &analyzer);
     int prev_stmt_id = current_stmt_id_;
     current_stmt_id_ = logical_stmt_cursor_;
     logical_stmt_cursor_ += 1;
@@ -955,7 +983,8 @@ private:
     Array<PrimExpr> indices = load->indices;
     int version_axis = VersionAxis(load->buffer);
     if (version_axis >= 0) {
-      indices.Set(version_axis, EffectiveVersionExpr(load->buffer));
+      indices.Set(version_axis,
+                  EffectiveVersionExpr(load->buffer, access_iter_offset));
     }
     return BufferLoad(target_buffer, indices);
   }
