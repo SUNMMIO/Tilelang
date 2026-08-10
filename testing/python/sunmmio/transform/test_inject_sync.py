@@ -792,6 +792,16 @@ def _make_loop_exit_engine_wait_placement_mod(target, engine, epilogue_engine=No
             )
         )
 
+    def make_transpose(src, dst):
+        return tir.Evaluate(
+            tir.call_intrin(
+                "handle",
+                tir.op.Op.get("tl.sunmmio_transpose"),
+                _region(src, 1),
+                _region(dst, 2),
+            )
+        )
+
     if engine == "tc":
         assert epilogue_engine == "tc"
         specs = [
@@ -807,6 +817,28 @@ def _make_loop_exit_engine_wait_placement_mod(target, engine, epilogue_engine=No
         first_async = make_mma(buffers[0], buffers[1], buffers[2])
         second_async = make_mma(buffers[3], buffers[4], buffers[5])
         consumed = buffers[2]
+    elif engine == "transpose":
+        assert epilogue_engine == "transpose"
+        specs = [
+            ("src0", "shared.rsram"),
+            ("dst0", "shared.rsram"),
+            ("src1", "shared.rsram"),
+            ("dst1", "shared.rsram"),
+        ]
+        data = [_pointer_var(name, dtype="float32", scope=scope) for name, scope in specs]
+        buffers = [
+            tir.decl_buffer(
+                (32, 32),
+                "float32",
+                name=name,
+                data=value,
+                scope=scope,
+            )
+            for value, (name, scope) in zip(data, specs)
+        ]
+        first_async = make_transpose(buffers[0], buffers[1])
+        second_async = make_transpose(buffers[2], buffers[3])
+        consumed = buffers[1]
     else:
         assert engine in ("hlink", "vlink")
         assert epilogue_engine in ("hlink", "vlink")
@@ -2062,7 +2094,10 @@ def _check_loop_exit_engine_wait_placement(engine, epilogue_engine=None, expect_
 
     mod = tilelang.transform.InjectSunmmioSync()(mod)
     lines = mod.script(show_meta=True).splitlines()
-    marker = "mma_sunmmio" if engine == "tc" else "broadcast_"
+    marker = {
+        "tc": "mma_sunmmio",
+        "transpose": "sunmmio_transpose",
+    }.get(engine, "broadcast_")
     async_entries = [
         (idx, _extract_call_id(line, "sync_token_id")) for idx, line in enumerate(lines) if marker in line and "sync_token_id(" in line
     ]
@@ -2079,6 +2114,10 @@ def _check_loop_exit_engine_wait_placement(engine, epilogue_engine=None, expect_
 
 def test_inject_sunmmio_sync_moves_loop_exit_wait_before_same_domain_tc():
     _check_loop_exit_engine_wait_placement("tc")
+
+
+def test_inject_sunmmio_sync_moves_loop_exit_wait_before_same_domain_transpose():
+    _check_loop_exit_engine_wait_placement("transpose")
 
 
 def test_inject_sunmmio_sync_moves_loop_exit_wait_before_same_domain_hlink():
@@ -2353,6 +2392,7 @@ if __name__ == "__main__":
     test_inject_sunmmio_sync_keeps_loop_exit_wait_after_other_domain_dma()
     test_inject_sunmmio_sync_finds_submit_in_transparent_wrapper()
     test_inject_sunmmio_sync_moves_loop_exit_wait_before_same_domain_tc()
+    test_inject_sunmmio_sync_moves_loop_exit_wait_before_same_domain_transpose()
     test_inject_sunmmio_sync_moves_loop_exit_wait_before_same_domain_hlink()
     test_inject_sunmmio_sync_moves_loop_exit_wait_before_same_domain_vlink()
     test_inject_sunmmio_sync_keeps_hlink_wait_after_vlink_submit()

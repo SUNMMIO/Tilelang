@@ -609,8 +609,8 @@ private:
 };
 
 // Collector for asynchronous operations within a loop body.
-// Identifies DMA copies, layout transforms, MMA operations, and Broadcasts that
-// happen asynchronously.
+// Identifies DMA copies, layout transforms, transposes, MMA operations, and
+// broadcasts that happen asynchronously.
 struct AccessRecord {
   Buffer buffer;
   Region region;
@@ -1848,7 +1848,8 @@ private:
     return SeqStmt::Flatten(stmts);
   }
 
-  // Handles specific async instructions (dma_copy, mma_sunmmio, broadcast).
+  // Handles specific async instructions (DMA, layout transform, transpose, MMA,
+  // and broadcast).
   // Assigns tokens/barriers and registers them for dependency tracking.
   Stmt VisitStmt_(const EvaluateNode *op) {
     const CallNode *call = op->value.as<CallNode>();
@@ -2304,8 +2305,9 @@ uint8_t GetPossibleAsyncWaitDomains(const CallNode *call) {
   if (!call) {
     return kUnknownWaitDomain;
   }
-  if (call->op.same_as(sunmmio_layout_transform())) {
-    // A4E layout transforms are supported only by ODMA1.
+  if (call->op.same_as(sunmmio_layout_transform()) ||
+      call->op.same_as(sunmmio_transpose())) {
+    // A4E layout transforms and full transposes are supported only by ODMA1.
     return kODMA1WaitDomain;
   }
   if (call->op.same_as(mma_sunmmio())) {
@@ -2400,6 +2402,7 @@ private:
     return call &&
            (call->op.same_as(dma_copy()) ||
             call->op.same_as(sunmmio_layout_transform()) ||
+            call->op.same_as(sunmmio_transpose()) ||
             call->op.same_as(mma_sunmmio()) || call->op.same_as(broadcast_()));
   }
 
