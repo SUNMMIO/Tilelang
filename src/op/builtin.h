@@ -129,8 +129,8 @@ static constexpr const char *kSunmmioILPStageShrink =
 static constexpr const char *kSunmmioILPMultiversionLifetimePruning =
     "tl.sunmmio_ilp_multiversion_lifetime_pruning";
 
-static constexpr const char *kSunmmioILPModelTCBlockingIssue =
-    "tl.sunmmio_ilp_model_tc_blocking_issue";
+static constexpr const char *kSunmmioILPModelVCBlockingIssue =
+    "tl.sunmmio_ilp_model_vc_blocking_issue";
 
 /*!
  * \brief Force inline Let bindings during simplification.

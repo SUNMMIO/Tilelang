@@ -150,8 +150,8 @@ struct SolveResult {
   std::vector<int> internal_flow_ids;
   std::vector<int> z_bank;
   BankFlipMode bank_flip_mode;
-  bool tc_blocking_issue_modeled{true};
-  int tc_blocking_issue_constraints{0};
+  bool vc_blocking_issue_modeled{true};
+  int vc_blocking_issue_constraints{0};
 };
 
 struct SolutionVerifyResult {
@@ -981,10 +981,10 @@ void WriteSolutionJson(
   out << "  \"makespan\": " << sol.makespan << ",\n";
   out << "  \"wsram_flip\": " << sol.bank_flip_mode.wsram_flip << ",\n";
   out << "  \"asram_flip\": " << sol.bank_flip_mode.asram_flip << ",\n";
-  out << "  \"tc_blocking_issue_modeled\": " << sol.tc_blocking_issue_modeled
+  out << "  \"vc_blocking_issue_modeled\": " << sol.vc_blocking_issue_modeled
       << ",\n";
-  out << "  \"tc_blocking_issue_constraints\": "
-      << sol.tc_blocking_issue_constraints << ",\n";
+  out << "  \"vc_blocking_issue_constraints\": "
+      << sol.vc_blocking_issue_constraints << ",\n";
   out << "  \"bank_slot_period\": "
       << (sol.bank_slot_period > 0 ? sol.bank_slot_period : (2 * sol.II))
       << ",\n";
@@ -3322,40 +3322,40 @@ SolveResult SolveFixedII(const Problem &prob, int II, bool optimize_t,
             << " flows=" << prob.flows.size();
   Highs highs;
   ModelVars vars = BuildModel(highs, prob, II, optimize_t, threads, mode);
-  bool model_tc_blocking_issue =
+  bool model_vc_blocking_issue =
       tvm::transform::PassContext::Current()
-          ->GetConfig<Bool>(tl::kSunmmioILPModelTCBlockingIssue, Bool(true))
+          ->GetConfig<Bool>(tl::kSunmmioILPModelVCBlockingIssue, Bool(true))
           .value();
-  int tc_issue_constraint_count = 0;
-  if (model_tc_blocking_issue) {
-    std::vector<int> tc_commands;
-    std::unordered_set<int> tc_set;
+  int vc_issue_constraint_count = 0;
+  if (model_vc_blocking_issue) {
+    std::vector<int> vc_commands;
+    std::unordered_set<int> vc_set;
     for (int cmd = 0; cmd < prob.N; ++cmd) {
       if (CommandUsesResource(prob.P[cmd],
-                              static_cast<int>(IlpResourceType::kTensorCore))) {
-        tc_commands.push_back(cmd);
-        tc_set.insert(cmd);
+                              static_cast<int>(IlpResourceType::kVectorCore))) {
+        vc_commands.push_back(cmd);
+        vc_set.insert(cmd);
       }
     }
-    if (!tc_commands.empty()) {
+    if (!vc_commands.empty()) {
       for (int slot = 0; slot < II; ++slot) {
         std::vector<HighsInt> idx;
         std::vector<double> val;
         for (int cmd = 0; cmd < prob.N; ++cmd) {
           idx.push_back(vars.col_x[cmd][slot]);
-          val.push_back(tc_set.count(cmd) ? 1.0 - double(prob.N) : 1.0);
+          val.push_back(vc_set.count(cmd) ? 1.0 - double(prob.N) : 1.0);
         }
-        for (int tc : tc_commands) {
-          idx.push_back(vars.col_a[tc][slot]);
+        for (int vc : vc_commands) {
+          idx.push_back(vars.col_a[vc][slot]);
           val.push_back(double(prob.N));
         }
         AddLeq(highs, idx, val, double(prob.N));
-        ++tc_issue_constraint_count;
+        ++vc_issue_constraint_count;
       }
     }
   }
   LOG(INFO) << "[II=" << II
-            << "] TC blocking-issue constraints=" << tc_issue_constraint_count;
+            << "] VC blocking-issue constraints=" << vc_issue_constraint_count;
   highs.run();
   if (highs.getModelStatus() != HighsModelStatus::kOptimal) {
     auto solve_end = std::chrono::steady_clock::now();
@@ -3372,8 +3372,8 @@ SolveResult SolveFixedII(const Problem &prob, int II, bool optimize_t,
   res.II = II;
   res.bank_slot_period = 2 * II;
   res.bank_flip_mode = mode;
-  res.tc_blocking_issue_modeled = model_tc_blocking_issue;
-  res.tc_blocking_issue_constraints = tc_issue_constraint_count;
+  res.vc_blocking_issue_modeled = model_vc_blocking_issue;
+  res.vc_blocking_issue_constraints = vc_issue_constraint_count;
   if (!optimize_t) {
     auto solve_end = std::chrono::steady_clock::now();
     double elapsed =
