@@ -149,8 +149,8 @@ class PassConfigKey(str, Enum):
     TL_SUNMMIO_ILP_MULTIVERSION_LIFETIME_PRUNING = "tl.sunmmio_ilp_multiversion_lifetime_pruning"
     """Prune unnecessary Sunmmio ILP runtime buffer versions using scheduled lifetimes. Disable to conservatively retain every theoretical version. Default: True."""
 
-    TL_SUNMMIO_ILP_MODEL_TC_BLOCKING_ISSUE = "tl.sunmmio_ilp_model_tc_blocking_issue"
-    """Model TC's blocking scalar-issue interval with lazy ILP constraints. Default: True."""
+    TL_SUNMMIO_ILP_MODEL_VC_BLOCKING_ISSUE = "tl.sunmmio_ilp_model_vc_blocking_issue"
+    """Model VC's blocking scalar-issue interval with lazy ILP constraints. Default: True."""
 
     TL_FORCE_LET_INLINE = "tl.force_let_inline"
     """Force TileLang to inline let bindings during simplification. Default: False"""
