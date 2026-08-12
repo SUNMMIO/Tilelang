@@ -1,0 +1,14 @@
+.git
+.github
+.cache
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.venv
+__pycache__
+*.py[cod]
+build
+dist
+docs/_build
+3rdparty/NPU-IR
+3rdparty/**/.git

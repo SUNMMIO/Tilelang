@@ -28,7 +28,6 @@ RUN apt-get update \
   python3-setuptools \
   gcc \
   cmake \
-  openssh-server \
   ninja-build \
   && \
   apt-get clean autoclean && \
@@ -50,17 +49,6 @@ RUN pip install --upgrade pip \
   && pip install -r /workspace/requirements-lint.txt -r /workspace/requirements-dev.txt
 
 RUN echo "LC_ALL=en_US.UTF-8" >> /etc/environment
-
-# Configure SSH
-RUN mkdir -p /var/run/sshd && \
-  echo 'root:sunlune' | chpasswd && \
-  sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
-  sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
-  sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config && \
-  mkdir -p /root/.ssh && chmod 700 /root/.ssh
-
-# Expose SSH port
-EXPOSE 22
 
 # install claude code
 RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash && \

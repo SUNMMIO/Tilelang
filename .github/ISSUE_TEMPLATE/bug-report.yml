@@ -7,8 +7,8 @@ body:
   - type: markdown
     attributes:
       value: >-
-        Please do your best to make the issue as easy to act on as possible,
-        and only submit here if there is clearly a problem with TileLang.
+        Please make the issue as easy to reproduce as possible, and only submit
+        it here if the problem is specific to TileLang-Mesh.
 
   - type: checkboxes
     id: steps
@@ -16,21 +16,23 @@ body:
       label: Required prerequisites
       description: Make sure you've completed the following steps before submitting your issue -- thank you!
       options:
-        - label: I have read the documentation <https://tilelang.com>.
+        - label: I have read the TileLang-Mesh documentation in this repository.
           required: true
         - label: >-
-            I have searched the [Issue Tracker](https://github.com/tile-ai/tilelang/issues)
-            that this hasn't already been reported. (comment there if it has.)
+            I have searched the [Issue Tracker](https://github.com/SUNMMIO/Tilelang/issues)
+            and confirmed this has not already been reported.
+          required: true
+        - label: I am not reporting credentials, private logs, or proprietary hardware information.
           required: true
 
   - type: input
     id: version
     attributes:
-      label: What version of TileLang are you using?
+      label: What version of TileLang-Mesh are you using?
       description: >-
-        Run command `python3 -c 'print(__import__("tilelang").__version__)'` in your shell
-        and paste the output here.
-      placeholder: E.g., 0.1.5
+        Run `python -m pip show tilelang-mesh` and
+        `python -c 'import tilelang; print(tilelang.__version__)'`, then paste both outputs.
+      placeholder: E.g., distribution 0.1.0, import 0.1.0
     validations:
       required: true
 
@@ -41,13 +43,17 @@ body:
       description: |
         Describe the characteristic of your environment:
 
-        - Describe how the library was installed (pip, conda, source, ...)
+        - Describe how the library was installed (Release wheel, source, ...)
         - Python version
-        - Versions of any other relevant libraries
+        - Torch and accelerator-toolkit versions
+        - Enabled backends and whether NPU-IR access is available
+        - Git commit for a source installation
 
         ```python
+        import importlib.metadata
         import sys, tilelang, torch
         print(sys.version, sys.platform)
+        print(importlib.metadata.version("tilelang-mesh"))
         print(tilelang.__version__)
         print(torch.__version__)
         ```
@@ -64,7 +70,7 @@ body:
       label: Problem description
       description: >-
         Provide a short description, state the expected behavior and what actually happens. Include
-        relevant information like what version of TileLang you are using, what system you are on, and
+        relevant information like what version of TileLang-Mesh you are using, what system you are on, and
         any useful commands / output.
     validations:
       required: true

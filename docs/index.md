@@ -1,12 +1,11 @@
-# 👋 Welcome to Tile Language
+# TileLang-Mesh Documentation
 
-[GitHub](https://github.com/tile-ai/tilelang)
+[GitHub](https://github.com/SUNMMIO/Tilelang) | [Installation](get_started/Installation.md) |
+[Changelog](https://github.com/SUNMMIO/Tilelang/blob/tilelang_mesh_main/CHANGELOG.md)
 
-Tile Language (tile-lang) is a concise domain-specific language designed to streamline
-the development of high-performance GPU/CPU kernels (e.g., GEMM, Dequant GEMM, FlashAttention, LinearAttention).
-By employing a Pythonic syntax with an underlying compiler infrastructure on top of TVM,
-tile-lang allows developers to focus on productivity without sacrificing the
-low-level optimizations necessary for state-of-the-art performance.
+TileLang-Mesh extends TileLang with mesh-aware placement, communication, and compiler support for
+distributed-memory and SunMMIO accelerators. The Python distribution is `tilelang-mesh` and the import
+package is `tilelang`; it must not be installed alongside the upstream `tilelang` distribution.
 
 :::{toctree}
 :maxdepth: 2
@@ -67,13 +66,8 @@ deeplearning_operators/deepseek_mla
 compiler_internals/letstmt_inline
 compiler_internals/inject_fence_proxy
 compiler_internals/tensor_checks
-:::
-
-:::{toctree}
-:maxdepth: 1
-:caption: API Reference
-
-autoapi/tilelang/index
+compiler_internals/sunmmio_tile_loop_fusion
+runtime_internals/stubs
 :::
 
 :::{toctree}

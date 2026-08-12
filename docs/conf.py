@@ -1,7 +1,7 @@
 # General information about the project.
-project = "TileLang <br>"
-author = "Tile Lang Contributors"
-copyright = f"2025-2025, {author}"
+project = "TileLang-Mesh"
+author = "SUNMMIO and TileLang-Mesh Contributors"
+copyright = f"2025-2026, {author}"
 
 # Version information.
 with open("../VERSION") as f:
@@ -17,26 +17,9 @@ extensions = [
     "sphinx_reredirects",
     "sphinx.ext.mathjax",
     "myst_parser",
-    "autoapi.extension",
 ]
-
-autoapi_type = "python"
-autoapi_dirs = ["../tilelang"]
-
-autoapi_options = [
-    "members",
-    "undoc-members",
-    "show-inheritance",
-    "show-module-summary",
-    "special-members",
-]
-autoapi_keep_files = False  # Useful for debugging the generated rst files
-
-autoapi_generate_api_docs = True
 
 autodoc_typehints = "description"
-
-autoapi_ignore = ["*language/ast*", "*version*", "*libinfo*", "*parser*"]
 
 source_suffix = {".rst": "restructuredtext", ".md": "markdown"}
 
@@ -50,7 +33,7 @@ redirects = {
 
 language = "en"
 
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md", "**/*libinfo*", "**/*version*"]
+exclude_patterns = ["_build", "autoapi", "Thumbs.db", ".DS_Store", "README.md", "**/*libinfo*", "**/*version*"]
 
 pygments_style = "sphinx"
 todo_include_todos = False
@@ -61,14 +44,14 @@ html_theme = "furo"
 templates_path = []
 html_static_path = ["_static"]
 html_css_files = ["custom.css"]
-footer_copyright = "© 2025-2026 TileLang"
+footer_copyright = "Copyright 2025-2026 SUNMMIO and TileLang-Mesh Contributors"
 footer_note = " "
 
 html_theme_options = {"light_logo": "img/logo-v2.png", "dark_logo": "img/logo-v2.png"}
 
 header_links = [
-    ("Home", "https://github.com/tile-ai/tilelang"),
-    ("Github", "https://github.com/tile-ai/tilelang"),
+    ("Home", "https://github.com/SUNMMIO/Tilelang"),
+    ("GitHub", "https://github.com/SUNMMIO/Tilelang"),
 ]
 
 html_context = {
@@ -76,8 +59,8 @@ html_context = {
     "footer_note": footer_note,
     "header_links": header_links,
     "display_github": True,
-    "github_user": "tile-ai",
-    "github_repo": "tilelang",
-    "github_version": "main/docs/",
+    "github_user": "SUNMMIO",
+    "github_repo": "Tilelang",
+    "github_version": "tilelang_mesh_main/docs/",
     "theme_vcs_pageview_mode": "edit",
 }

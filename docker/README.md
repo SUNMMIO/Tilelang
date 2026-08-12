@@ -1,83 +1,64 @@
-# Production Usage
+# TileLang-Mesh Containers
 
-To ease the process of installing all the dependencies, we provide a Dockerfile and a simple guideline to build a Docker image with all of above installed. The Docker image is built on top of Ubuntu 20.04, and it contains all the dependencies required to run the experiments. We only provide the Dockerfile for NVIDIA GPU, and the Dockerfile for AMD GPU will be provided upon request.
-
-```bash
-git clone --recursive https://github.com/tile-ai/tilelang TileLang
-cd TileLang/docker
-# build the image, this may take a while (around 10+ minutes on our test machine)
-# replace the version number cu124 with the one you want to use
-# replace .cu** with .rocm for AMD GPU
-docker build -t tilelang_workspace -f Dockerfile.cu124 .
-# run the container
-# if it's nvidia
-docker run -it --cap-add=SYS_ADMIN --network=host --gpus all --cap-add=SYS_PTRACE --shm-size=4G --security-opt seccomp=unconfined --security-opt apparmor=unconfined --name tilelang_test tilelang_workspace bash
-# if it's amd
-docker run -it --cap-add=SYS_ADMIN --network=host --device=/dev/kfd --device=/dev/dri  --cap-add=SYS_PTRACE --shm-size=4G --security-opt seccomp=unconfined --security-opt apparmor=unconfined --name tilelang_test tilelang_workspace bash
-```
-
-# Development
-
-## Docker build
-
-```shell
-cd ..
-docker build -t sunlune/tilelang:cuda -f ./docker/Dockerfile.cu130.dev .
-```
-
-## Launch Docker Container as a Service
+The versioned CUDA Dockerfiles clone the canonical SUNMMIO repository, initialize only public
+submodules, and build with `USE_SUNMMIO=OFF`. They do not require access to NPU-IR. Set
+`TILELANG_REF` to the release tag or exact commit that the image must contain.
 
 ```bash
-./docker/docker_run.sh -p 2222 -ws $(pwd) -n jiaqi_tilelang_dev
+git clone https://github.com/SUNMMIO/Tilelang.git
+cd Tilelang
+docker build \
+  --build-arg TILELANG_REF=v0.1.0 \
+  -t tilelang-mesh:0.1.0-cu124 \
+  -f docker/Dockerfile.cu124 docker
 ```
 
-### Enter the container for development
+Run the NVIDIA image:
 
 ```bash
-docker ps
-# The terminal output should be as follows
-CONTAINER ID   IMAGE                                        COMMAND                  CREATED          STATUS          PORTS                                     NAMES
-285477349f8d   sunlune/tilelang:cuda                             "/opt/nvidia/nvidia_…"   17 minutes ago   Up 17 minutes   0.0.0.0:2222->22/tcp, [::]:2222->22/tcp   jiaqi_tilelang_dev
-
-docker exec -it ${your_container_id} bash # in this case your_container_id = 285477349f8d
-```
-
-### Connect container via ssh
-
-As we use jump host to connect to the remote machine, the ssh port is not accessible directly. We need to config the local machine's ~/.ssh/config, add the following per your need:
-
-```yaml
-Host bj3080_jumphost
-  HostName 192.168.3.214
-  Port 11023
-  User <user>
-
-# Docker 容器配置
-Host bj3080_docker_dev
-  HostName localhost
-  Port <port>
-  User root
-  ProxyJump bj3080_jumphost
-```
-
-Then you can connect with
-```bash
-ssh bj3080_docker_dev
-
-# or use vscode to connect the docker directly
-```
-You can also use one line to connect, as below
-```bash
-ssh -J <user>@192.168.3.214:11023 root@localhost -p <port>
-```
-
-### Launch interactive docker container
-
-```shell
-docker run -it --runtime nvidia --gpus all \
-  -v "$(dirname "$PWD"):/workspace" \
-  --name jiaqi_tilelang_dev \
+docker run --rm -it \
+  --gpus all \
   --ipc=host \
-  sunlune/tilelang:cuda \
-  bash
+  --shm-size=4G \
+  tilelang-mesh:0.1.0-cu124 bash
 ```
+
+The ROCm Dockerfile uses the repository root as its build context:
+
+```bash
+docker build -t tilelang-mesh:rocm -f docker/Dockerfile.rocm .
+docker run --rm -it \
+  --device=/dev/kfd \
+  --device=/dev/dri \
+  --ipc=host \
+  tilelang-mesh:rocm
+```
+
+## Development Image
+
+`Dockerfile.cu130.dev` creates a CUDA development environment from the local repository context. It
+does not install TileLang-Mesh automatically, so mount or copy an authorized checkout and select the
+backend explicitly:
+
+```bash
+docker build -t sunmmio/tilelang-mesh:cuda-dev -f docker/Dockerfile.cu130.dev .
+
+docker run -it --rm \
+  --gpus all \
+  --ipc=host \
+  -v "${PWD}:/workspace/Tilelang" \
+  sunmmio/tilelang-mesh:cuda-dev bash
+```
+
+Inside an authorized checkout with NPU-IR access:
+
+```bash
+cd /workspace/Tilelang
+CMAKE_ARGS="-DUSE_CUDA=ON -DUSE_SUNMMIO=ON" python -m pip install -e . -v
+```
+
+For a public build, initialize only public submodules and use `USE_SUNMMIO=OFF` as described in the
+main [installation guide](../docs/get_started/Installation.md).
+
+The optional `docker/docker_run.sh` helper starts the development image in the background without
+opening an SSH service. Use `docker exec -it tilelang-mesh-dev bash` to enter it.

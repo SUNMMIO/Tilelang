@@ -646,4 +646,4 @@ Refer to the following resources together with this guide:
 - [SunMMIO TileLang user guide](sunmmio_tilelang_user_guide.md)
 - [Installation guide](../get_started/Installation.md)
 - [TileLang programming guide](../programming_guides/overview.md)
-- [SunMMIO TileLang kernel examples](https://github.com/Sunmmio/Tilelang-mesh/tree/tilelang_mesh_main/examples)
+- [SunMMIO TileLang kernel examples](https://github.com/SUNMMIO/Tilelang/tree/tilelang_mesh_main/examples)

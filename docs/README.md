@@ -1,4 +1,4 @@
-# Tile Language Documentation
+# TileLang-Mesh Documentation
 
 The documentation was built upon [Sphinx](https://www.sphinx-doc.org/en/master/).
 
@@ -7,15 +7,15 @@ The documentation was built upon [Sphinx](https://www.sphinx-doc.org/en/master/)
 Run the following command in this directory to install dependencies first:
 
 ```bash
-pip3 install -r requirements.txt
+python -m pip install -r docs/requirements.txt
 ```
 
 ## Build the Documentation
 
-Then you can build the documentation by running:
+From the repository root, build with warnings treated as errors:
 
 ```bash
-make html
+sphinx-build -W --keep-going -b html docs docs/_build/html
 ```
 
 ## View the Documentation
@@ -23,7 +23,7 @@ make html
 Run the following command to start a simple HTTP server:
 
 ```bash
-cd _build/html
+cd docs/_build/html
 python3 -m http.server
 ```
 

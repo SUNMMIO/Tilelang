@@ -4,7 +4,7 @@ This folder contains standalone scripts that deliberately trigger host-side (and
 
 Prerequisites
 - CUDA-capable environment (most scripts compile a CUDA-targeted kernel)
-- Python packages: torch, tilelang
+- Python distributions: `torch`, `tilelang-mesh` (imported as `tilelang`)
 
 Usage
 - Run any script, e.g.:

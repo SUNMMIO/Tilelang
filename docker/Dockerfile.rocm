@@ -38,8 +38,8 @@ RUN mv /opt/conda/envs/py_3.10/compiler_compat /opt/conda/envs/py_3.10/compiler_
         # Backup and modify pyproject.toml to remove torch from dependencies \
         cp pyproject.toml pyproject.toml.bak && \
         sed -i '/^[[:space:]]*\"torch/d' pyproject.toml && \
-        # Install tilelang with all dependencies except torch \
-        USE_ROCM=1 USE_CUDA=0 pip install -e . -v && \
+        # Install TileLang-Mesh with all dependencies except torch \
+        CMAKE_ARGS='-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_SUNMMIO=OFF' USE_ROCM=1 USE_CUDA=0 pip install -e . -v && \
         # Restore original pyproject.toml \
         mv pyproject.toml.bak pyproject.toml"
 

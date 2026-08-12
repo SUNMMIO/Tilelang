@@ -9,5 +9,4 @@ sphinxcontrib_httpdomain
 furo
 uvicorn
 myst-parser
-sphinx-autoapi == 3.6.0
 astroid < 4

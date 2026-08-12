@@ -1,4 +1,6 @@
-# Copied from bitblas
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+# Copied from BitBLAS.
 from enum import IntEnum
 
 

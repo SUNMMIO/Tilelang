@@ -1,19 +1,17 @@
-#!/usr/bin/bash
+#!/usr/bin/env bash
+
+set -euo pipefail
 
 # Usage: ./docker_run.sh [OPTIONS]
 # Options:
-#   -p SSH_PORT        SSH port (default: 2222)
 #   -ws WORKSPACE_DIR  Workspace directory (default: ~/workspace)
-#   -n CONTAINER_NAME  Container name (default: ccl-dev)
-# Example: ./docker_run.sh -p 2222 -ws /path/to/workspace -n jiaqi_tilelang_dev
+#   -n CONTAINER_NAME  Container name (default: tilelang-mesh-dev)
+#   -i IMAGE_NAME      Image name (default: sunmmio/tilelang-mesh:cuda-dev)
+# Example: ./docker_run.sh -ws /path/to/Tilelang -n tilelang-mesh-dev
 
 # Default values
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -p)
-      SSH_PORT="$2"
-      shift 2
-      ;;
     -ws)
       WORKSPACE_DIR="$2"
       shift 2
@@ -22,37 +20,32 @@ while [[ $# -gt 0 ]]; do
       CONTAINER_NAME="$2"
       shift 2
       ;;
+    -i)
+      IMAGE_NAME="$2"
+      shift 2
+      ;;
     *)
-      shift
+      echo "Unknown option: $1" >&2
+      exit 2
       ;;
   esac
 done
 
-IMAGE_NAME="sunlune/tilelang:cuda"
-DOCKER_RT="--runtime nvidia --gpus all"
+IMAGE_NAME=${IMAGE_NAME:-sunmmio/tilelang-mesh:cuda-dev}
+WORKSPACE_DIR=${WORKSPACE_DIR:-${PWD}}
+CONTAINER_NAME=${CONTAINER_NAME:-tilelang-mesh-dev}
 
-SSH_PORT=${SSH_PORT:-2222}
-WORKSPACE_DIR=${WORKSPACE_DIR:-~/workspace}
-CONTAINER_NAME=${CONTAINER_NAME:-ccl-dev}
-
-echo "Starting CCL Development Docker container in background..."
-echo "  SSH Port: ${SSH_PORT}"
+echo "Starting TileLang-Mesh development container in background..."
 echo "  Image: ${IMAGE_NAME}"
 echo "  Workspace: ${WORKSPACE_DIR}"
 
-# Build docker run command
-DOCKER_CMD="docker run -d ${DOCKER_RT} \
-    --ipc=host \
-    --name ${CONTAINER_NAME} \
-    -p ${SSH_PORT}:22 \
-    -v \"${WORKSPACE_DIR}:/workspace\" \
-    --cap-add=SYS_PTRACE \
-    -w /workspace"
+docker run -d \
+  --gpus all \
+  --ipc=host \
+  --name "${CONTAINER_NAME}" \
+  --mount "type=bind,src=${WORKSPACE_DIR},dst=/workspace/Tilelang" \
+  --workdir /workspace/Tilelang \
+  "${IMAGE_NAME}" \
+  tail -f /dev/null
 
-# Complete the command
-DOCKER_CMD="${DOCKER_CMD} ${IMAGE_NAME} /bin/bash -c \"service ssh start && tail -f /dev/null\""
-
-echo $DOCKER_CMD
-
-# Execute the command
-eval $DOCKER_CMD
+echo "Enter with: docker exec -it ${CONTAINER_NAME} bash"

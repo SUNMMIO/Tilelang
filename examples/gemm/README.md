@@ -28,19 +28,24 @@ TileLang is a domain-specific language designed to simplify the process of writi
 
 ### Prerequisites
 
-- **Python 3.8+**
+- **Python 3.9+**
 - **NVIDIA GPU** with a recent CUDA toolkit installed
 - **PyTorch** (optional, for easy correctness verification)
-- **tilelang**
+- **TileLang-Mesh** (`tilelang-mesh` distribution, `tilelang` import package)
 - **bitblas** (optional; used for swizzle layout utilities in the advanced examples)
 
 ### Installation
 
+Install TileLang-Mesh from a Release wheel or source by following the
+[installation guide](../../docs/get_started/Installation.md). Install the optional BitBLAS dependency
+separately when using its layout utilities:
+
 ```bash
-pip install tilelang bitblas
+python -m pip install bitblas
 ```
 
-*(Adjust accordingly if you are installing from source or using a different environment.)*
+Do not run `pip install tilelang`; that command installs the upstream TileLang distribution, which
+cannot safely coexist with TileLang-Mesh.
 
 ---
 

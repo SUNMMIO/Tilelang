@@ -9,7 +9,7 @@ Auto-Tuning Techniques for Performance Optimization
 Auto-tuning a Tile Language program involves three main steps:
 
 1. Implement the target program using Tile Language with reserved optimization parameters
-2. ​Provide candidate configurations through manual search or [auto-generation using Carver](#using-carver-to-auto-generate-candidate-configurations)
+2. Provide candidate configurations through manual search or Carver-based auto-generation described later in this guide
 3. Parallel compile and benchmark candidate configurations to identify the best performance
 
 ## Matrix Multiplication Example

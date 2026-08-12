@@ -1265,4 +1265,4 @@ def gemm_with_bias(
 - [SunMMIO TileLang quick start](sunmmio_tilelang_getting_started.md)
 - [Installation guide](../get_started/Installation.md)
 - [TileLang programming guide](../programming_guides/overview.md)
-- [SunMMIO examples](https://github.com/Sunmmio/Tilelang-mesh/tree/tilelang_mesh_main/examples)
+- [SunMMIO examples](https://github.com/SUNMMIO/Tilelang/tree/tilelang_mesh_main/examples)

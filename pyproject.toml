@@ -1,16 +1,23 @@
 [project]
 name = "tilelang-mesh"
-description = "An extension of Tilelang to support chips with distributed memory."
+description = "TileLang extensions for distributed-memory accelerators."
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [{ name = "SUNMMIO Ltd." }, { name = "TileLang Contributors" }, { name = "Tile-AI" }]
 maintainers = [{ name = "SUNMMIO", email = "loujianguang@sunmmio.com" }]
 license = "MIT"
-keywords = ["NMC", "NUMA", "Tilelang", "Code Generation", "Mesh"]
+license-files = [
+    "LICENSE",
+    "THIRDPARTYNOTICES.txt",
+    "3rdparty/tvm/LICENSE",
+    "3rdparty/tvm/NOTICE",
+    "3rdparty/tvm/licenses/*.txt",
+    "3rdparty/cutlass/LICENSE.txt",
+    "3rdparty/composable_kernel/LICENSE",
+]
+keywords = ["NMC", "NUMA", "TileLang", "Code Generation", "Mesh"]
 classifiers = [
     "Development Status :: 4 - Beta",
-    "Environment :: ZPU",
-    "Environment :: GPU",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
     "Programming Language :: C++",
@@ -27,6 +34,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dynamic = ["version"]
+
 dependencies = [
     # Pin to the last known-good wheel. apache-tvm-ffi 0.1.10 enforces
     # __slots__ on Object subclasses, which is incompatible with the pinned
@@ -47,6 +55,13 @@ dependencies = [
     "typing-extensions>=4.10.0",
     "z3-solver>=4.13.0,<4.15.5",
 ]
+
+[project.urls]
+Homepage = "https://github.com/SUNMMIO/Tilelang"
+Repository = "https://github.com/SUNMMIO/Tilelang"
+Documentation = "https://github.com/SUNMMIO/Tilelang/tree/tilelang_mesh_main/docs"
+Issues = "https://github.com/SUNMMIO/Tilelang/issues"
+Changelog = "https://github.com/SUNMMIO/Tilelang/blob/tilelang_mesh_main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # mldtypes should be greater than 0.5.1
@@ -103,7 +118,11 @@ include = [
     "./VERSION",
     ".git_commit.txt",
     "./LICENSE",
+    "CHANGELOG.md",
     "THIRDPARTYNOTICES.txt",
+    "3rdparty/tvm/LICENSE",
+    "3rdparty/cutlass/LICENSE.txt",
+    "3rdparty/composable_kernel/LICENSE",
     "version_provider.py",
     "requirements*.txt",
     "tilelang/jit/adapter/cython/cython_wrapper.pyx",
@@ -233,7 +252,7 @@ filterwarnings = ["always"]
 archs = ["auto64"]
 skip = "*musllinux*"
 build-frontend = "build"
-environment = { PYTHONDEVMODE = "1", PYTHONUNBUFFERED = "1" }
+environment = { PYTHONDEVMODE = "1", PYTHONUNBUFFERED = "1", CMAKE_ARGS = "-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_SUNMMIO=OFF" }
 environment-pass = [
     "CUDA_VERSION",
     "NO_VERSION_LABEL",
@@ -248,7 +267,7 @@ environment-pass = [
 before-build = "env -0 | sort -z | tr '\\0' '\\n'"
 windows.before-build = "set"
 test-command = [
-    "python -c 'import tilelang; print(tilelang.__version__)'",
+    "python -c 'from importlib.metadata import version; import tilelang; assert tilelang.__version__ == version(\"tilelang-mesh\")'",
 ]
 
 [tool.cibuildwheel.linux]
@@ -294,7 +313,7 @@ repair-wheel-command = "delocate-wheel --verbose --ignore-missing-dependencies -
 [[tool.cibuildwheel.overrides]]
 select = "*linux*x86_64*"
 # x86_64 runners in GitHub Actions have limited storage,
-# pre-install torch without caching to reduce disk usage during install tilelang.
+# Pre-install torch without caching to reduce disk usage while installing tilelang-mesh.
 before-test = [
     "pip install torch --no-cache-dir",
 ]
