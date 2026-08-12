@@ -83,6 +83,10 @@ jobs:
       UV_CACHE_DIR: /ci-cache/uv
       PRE_COMMIT_HOME: /ci-cache/pre-commit
       NPUIR_CACHE_ROOT: /ci-cache/npuir
+      CLANG_TIDY_VENV: /tmp/tilelang-clang-tidy-venv
+      TEST_VENV: /tmp/tilelang-test-venv
+      CLANG_TIDY_BUILD_DIR: /tmp/tilelang-clang-tidy-build
+      RUN_CLANG_TIDY_SCRIPT: /tmp/run-clang-tidy.py
     defaults:
       run:
         shell: bash
@@ -192,8 +196,8 @@ jobs:
       - name: Install clang-tidy toolchain
         run: |
           # Keep clang-tidy aligned with requirements-lint.txt instead of the base image.
-          uv venv .clang-tidy-venv --python /usr/bin/python3.12
-          uv pip install --python .clang-tidy-venv/bin/python -v -r requirements-lint.txt
+          uv venv "${CLANG_TIDY_VENV}" --python /usr/bin/python3.12
+          uv pip install --python "${CLANG_TIDY_VENV}/bin/python" -v -r requirements-lint.txt
 
       - name: Read LLVM pin from NPU-IR
         run: |
@@ -285,17 +289,17 @@ jobs:
       - name: Run clang-tidy
         id: clang-tidy
         run: |
-          CLANG_TIDY_PYTHON=".clang-tidy-venv/bin/python"
-          CLANG_TIDY_BIN=".clang-tidy-venv/bin/clang-tidy"
-          CLANG_APPLY_REPLACEMENTS_BIN=".clang-tidy-venv/bin/clang-apply-replacements"
+          CLANG_TIDY_PYTHON="${CLANG_TIDY_VENV}/bin/python"
+          CLANG_TIDY_BIN="${CLANG_TIDY_VENV}/bin/clang-tidy"
+          CLANG_APPLY_REPLACEMENTS_BIN="${CLANG_TIDY_VENV}/bin/clang-apply-replacements"
           echo "\$ ${CLANG_TIDY_BIN} --version" && "${CLANG_TIDY_BIN}" --version
           echo "Using Sunmmio CMake args: ${TILELANG_SUNMMIO_CMAKE_ARGS}"
 
           # Run clang-tidy before provisioning the Python test environment.
           RCT_URL=https://raw.githubusercontent.com/llvm/llvm-project/refs/heads/release/21.x/clang-tools-extra/clang-tidy/tool/run-clang-tidy.py
           echo "Downloading run-clang-tidy script from ${RCT_URL}"
-          curl -LsSf "${RCT_URL}" -o run-clang-tidy.py
-          CLANG_TIDY=("${CLANG_TIDY_PYTHON}" run-clang-tidy.py -j "$(nproc)")
+          curl -LsSf "${RCT_URL}" -o "${RUN_CLANG_TIDY_SCRIPT}"
+          CLANG_TIDY=("${CLANG_TIDY_PYTHON}" "${RUN_CLANG_TIDY_SCRIPT}" -j "$(nproc)")
           if [[ -x "${CLANG_APPLY_REPLACEMENTS_BIN}" ]]; then
             echo "Using clang-apply-replacements from ${CLANG_APPLY_REPLACEMENTS_BIN}"
             CLANG_TIDY+=(-fix -clang-apply-replacements-binary="${CLANG_APPLY_REPLACEMENTS_BIN}")
@@ -309,12 +313,12 @@ jobs:
           flock 9
           read -r -a CLANG_TIDY_CMAKE_OPTIONS_ARRAY <<< "${CLANG_TIDY_CMAKE_OPTIONS}"
           read -r -a TILELANG_SUNMMIO_CMAKE_ARGS_ARRAY <<< "${TILELANG_SUNMMIO_CMAKE_ARGS}"
-          cmake -S . -B cmake-build --fresh \
+          cmake -S . -B "${CLANG_TIDY_BUILD_DIR}" --fresh \
             "${CLANG_TIDY_CMAKE_OPTIONS_ARRAY[@]}" \
             "${TILELANG_SUNMMIO_CMAKE_ARGS_ARRAY[@]}"
           if [[ "${TILELANG_SUNMMIO_CMAKE_ARGS}" == *"-DUSE_SUNMMIO=ON"* ]]; then
-            cmake --build cmake-build --target tilelang_highs -j "$(nproc)"
-            cmake --build cmake-build --target mlir-headers llvm-headers -j "$(nproc)"
+            cmake --build "${CLANG_TIDY_BUILD_DIR}" --target tilelang_highs -j "$(nproc)"
+            cmake --build "${CLANG_TIDY_BUILD_DIR}" --target mlir-headers llvm-headers -j "$(nproc)"
           fi
           flock -u 9
 
@@ -322,8 +326,8 @@ jobs:
           rc=0
           "${CLANG_TIDY[@]}" -clang-tidy-binary="${CLANG_TIDY_BIN}" \
             -exclude-header-filter='^(3rdparty|tvm)/.*$' \
-            -p="cmake-build" "${CXX_FILES[@]}" || rc="$?"
-          rm -rf cmake-build run-clang-tidy.py
+            -p="${CLANG_TIDY_BUILD_DIR}" "${CXX_FILES[@]}" || rc="$?"
+          rm -rf "${CLANG_TIDY_BUILD_DIR}" "${RUN_CLANG_TIDY_SCRIPT}"
           if (( rc != 0 )); then
             echo "::error::clang-tidy found issues (exit code: ${rc}). Please run 'clang-tidy --fix' locally to fix them."
             git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -333,13 +337,13 @@ jobs:
 
       - name: Setup Python environment
         run: |
-          uv venv .venv --python /usr/bin/python3.12
-          uv pip install --python .venv/bin/python -v --upgrade pip setuptools wheel
+          uv venv "${TEST_VENV}" --python /usr/bin/python3.12
+          uv pip install --python "${TEST_VENV}/bin/python" -v --upgrade pip setuptools wheel
           uv pip install \
-            --python .venv/bin/python \
+            --python "${TEST_VENV}/bin/python" \
             --index-url https://download.pytorch.org/whl/cpu \
             torch
-          uv pip install --python .venv/bin/python -v "pytest>=6.2.4"
+          uv pip install --python "${TEST_VENV}/bin/python" -v "pytest>=6.2.4"
 
       - name: Install project (wheel form)
         run: |
@@ -347,11 +351,11 @@ jobs:
           lock_file="${NPUIR_CACHE_ROOT}/llvm-project.lock"
           exec 9>"${lock_file}"
           flock 9
-          uv pip install -v .
+          uv pip install --python "${TEST_VENV}/bin/python" -v .
 
       - name: Run SunMMIO Python tests
         run: |
-          . .venv/bin/activate
+          . "${TEST_VENV}/bin/activate"
           PYTEST=(
             uv run --no-project -m --
             pytest --verbose --color=yes --durations=0 --showlocals --cache-clear
@@ -378,3 +382,11 @@ jobs:
           uv cache prune 2>/dev/null || true
           echo "=== Cache usage after pruning ==="
           du -sh /ci-cache/* 2>/dev/null || true
+
+      - name: Restore runner workspace ownership
+        if: always()
+        run: |
+          set -euo pipefail
+          RUNNER_UID="$(stat -c '%u' "${RUNNER_TEMP}")"
+          RUNNER_GID="$(stat -c '%g' "${RUNNER_TEMP}")"
+          chown -R "${RUNNER_UID}:${RUNNER_GID}" "${GITHUB_WORKSPACE}"

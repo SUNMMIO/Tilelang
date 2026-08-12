@@ -95,6 +95,15 @@ jobs:
     env:
       NPUIR_CACHE_ROOT: /opt/ci-cache/sunmmio/npuir
     steps:
+      - name: Repair workspace ownership
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/workspace" \
+            ubuntu:24.04 \
+            chown -R "$(id -u):$(id -g)" /workspace
+
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
