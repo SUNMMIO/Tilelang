@@ -10,6 +10,8 @@ from tilelang import logger
 
 _T = TypeVar("_T")
 
+_CUSTOM_TYPE_CODE_BEGIN = 129
+_CUSTOM_TYPE_CODE_END = 256
 _MXFP8_CUSTOM_TYPE_CODE = 129
 _MXFP4_CUSTOM_TYPE_CODE = 130
 _MX_DTYPE_TO_TVM_STR = {
@@ -19,11 +21,16 @@ _MX_DTYPE_TO_TVM_STR = {
 _TVM_STR_TO_MX_DTYPE = {v: k for k, v in _MX_DTYPE_TO_TVM_STR.items()}
 
 
+def _find_registered_custom_dtype_code(type_name: str):
+    # Missing-name lookup raises through native FFI; keep import on non-throwing queries.
+    for type_code in range(_CUSTOM_TYPE_CODE_BEGIN, _CUSTOM_TYPE_CODE_END):
+        if tvm_datatype.get_type_registered(type_code) and tvm_datatype.get_type_name(type_code) == type_name:
+            return type_code
+    return None
+
+
 def _register_custom_dtype(type_name: str, type_code: int) -> None:
-    try:
-        registered_code = tvm_datatype.get_type_code(type_name)
-    except Exception:
-        registered_code = None
+    registered_code = _find_registered_custom_dtype_code(type_name)
     if registered_code is not None:
         if registered_code == type_code:
             return

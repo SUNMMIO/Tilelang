@@ -13,9 +13,9 @@ from at least the following vendored projects:
 - Marlin material from IST-DASLab (Apache-2.0)
 - FlashInfer material (Apache-2.0)
 
-Authorized SUNMMIO source builds also use SUNMMIO/NPU-IR (Apache-2.0). NPU-IR
-is access-controlled and is not included in public TileLang-Mesh release
-wheels.
+SUNMMIO builds use SUNMMIO/NPU-IR (Apache-2.0). Public TileLang-Mesh release
+wheels include binaries derived from NPU-IR but do not include its
+access-controlled source tree. The Apache-2.0 terms are reproduced below.
 
 The corresponding vendored license files are retained in their source trees
 and copied into release wheels where their source or headers are bundled.

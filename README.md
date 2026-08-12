@@ -8,8 +8,8 @@ Tile language and compiler extensions for distributed-memory accelerators
 
 TileLang-Mesh extends [TileLang](https://github.com/tile-ai/tilelang) with abstractions and
 compiler support for near-memory computing, distributed-memory AI accelerators, and networked
-accelerators. It includes the SunMMIO/SUVM backend, mesh-aware data placement and communication,
-and the upstream CUDA, ROCm, and Metal backends.
+accelerators. Its release artifacts target the SunMMIO/SUVM backend and include mesh-aware data
+placement, communication, and code generation for SunMMIO hardware.
 
 > [!IMPORTANT]
 > The Python distribution is named `tilelang-mesh`, but it provides the `tilelang` import package.
@@ -20,23 +20,23 @@ and the upstream CUDA, ROCm, and Metal backends.
 
 The repository has two supported build modes:
 
-| Build | Audience | SUNMMIO backend | NPU-IR access |
+| Build | Audience | SUNMMIO backend | NPU-IR access at install time |
 | --- | --- | --- | --- |
-| Public GitHub Release wheel | General users | Disabled | Not required |
-| Authorized source build | SunMMIO developers | Enabled by default | Required |
+| Public GitHub Release wheel | SunMMIO users | Enabled | Not required |
+| Authorized source build | SunMMIO developers | Enabled | Required while building |
 
-Public release artifacts are built with `USE_SUNMMIO=OFF` because `3rdparty/NPU-IR` is an
-access-controlled submodule. The generated GitHub "Source code" archives do not include Git
-submodules and are not buildable distributions. Use an attached wheel, or clone the repository for
-a source build. Source distributions are deferred until the NPU-IR packaging boundary is resolved.
+The release workflow uses authorized access to build the SunMMIO backend and package the required
+NPU-IR executables. It explicitly disables CUDA, ROCm, and Metal. The wheel does not contain the
+access-controlled NPU-IR source tree, so users do not need repository access to install it. The
+generated GitHub "Source code" archives omit submodules and are not buildable distributions; use an
+attached wheel, or clone the repository for an authorized source build.
 
 ## Requirements
 
 - CPython 3.9 or newer
-- Linux or macOS
+- Linux x86_64 for the published wheel
 - CMake 3.26.1 or newer and a C++17 compiler for source builds
 - Ninja is recommended
-- A CUDA toolkit for CUDA source builds
 - Access to `SUNMMIO/NPU-IR` for SUNMMIO source builds
 
 The exact Python, operating-system, architecture, and accelerator combinations tested for a release
@@ -53,17 +53,19 @@ python -m pip uninstall -y tilelang
 python -m pip install /path/to/tilelang_mesh-0.1.0-<platform>.whl
 ```
 
-Verify both the distribution metadata and import version:
+Verify the distribution version and packaged SunMMIO components:
 
 ```bash
 python -m pip show tilelang-mesh
 python -c "from importlib.metadata import version; import tilelang; print(tilelang.__version__); assert tilelang.__version__ == version('tilelang-mesh')"
+python -c "from tilelang import tvm; assert tvm.ffi.get_global_func('target.build.tilelang_sunmmio_without_compile', allow_missing=True) is not None"
+python -c "from tilelang.jit.adapter.sunmmio.libgen import find_npuir_tool; [find_npuir_tool(name) for name in ('npuir-opt', 'npuir-translate', 'npuir-compile')]"
 ```
 
 TileLang-Mesh is not currently documented as a PyPI install. Do not use `pip install tilelang` for
 this project; that command installs upstream TileLang.
 
-## Build from Source Without SUNMMIO
+## Validate a Public Source Checkout
 
 Clone the canonical repository and initialize only public submodules:
 
@@ -74,15 +76,12 @@ git submodule update --init --recursive \
   3rdparty/tvm 3rdparty/cutlass 3rdparty/composable_kernel
 ```
 
-Install with SUNMMIO disabled. Disable CUDA as well on machines without a CUDA toolkit:
+An unauthenticated checkout can build the Python frontend for import and static validation, but the
+result is not a supported SunMMIO runtime package:
 
 ```bash
 python -m pip uninstall -y tilelang
-CMAKE_ARGS="-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_SUNMMIO=OFF" \
-  python -m pip install . -v
-
-# CPU-only build
-CMAKE_ARGS="-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_SUNMMIO=OFF -DUSE_CUDA=OFF" \
+CMAKE_ARGS="-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=OFF" \
   python -m pip install . -v
 ```
 
@@ -95,35 +94,31 @@ git clone --recursive https://github.com/SUNMMIO/Tilelang.git
 cd Tilelang
 git submodule update --init --recursive
 python -m pip uninstall -y tilelang
-CMAKE_ARGS="-DUSE_SUNMMIO=ON" python -m pip install . -v
+CMAKE_ARGS="-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON" \
+  python -m pip install . -v
 ```
 
 To reuse an existing LLVM source checkout for NPU-IR:
 
 ```bash
-CMAKE_ARGS="-DUSE_SUNMMIO=ON -DNPUIR_USE_LLVM_SOURCE_DIR=/path/to/llvm-project" \
+CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON -DNPUIR_USE_LLVM_SOURCE_DIR=/path/to/llvm-project" \
   python -m pip install . -v
 ```
 
-## Common Build Configurations
+## SunMMIO Development
 
-Editable CUDA + SUNMMIO development build:
-
-```bash
-CMAKE_ARGS="-DUSE_CUDA=ON -DUSE_SUNMMIO=ON" python -m pip install -e . -v
-```
-
-ROCm build without SUNMMIO:
+Editable development build:
 
 ```bash
-CMAKE_ARGS="-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=OFF -DUSE_ROCM=ON -DUSE_SUNMMIO=OFF" \
-  python -m pip install . -v
+CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON" \
+  python -m pip install -e . -v
 ```
 
 For frequent C++ development, configure once and rebuild with Ninja:
 
 ```bash
-cmake -S . -B build -G Ninja -DUSE_CUDA=ON -DUSE_SUNMMIO=ON
+cmake -S . -B build -G Ninja \
+  -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON
 ninja -C build
 ```
 

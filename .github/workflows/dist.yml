@@ -18,6 +18,9 @@ on:
       - CMakeLists.txt
       - version_provider.py
       - tilelang/__init__.py
+      - README.md
+      - THIRDPARTYNOTICES.txt
+      - docs/get_started/Installation.md
       - maint/scripts/verify_release_install.py
       - .github/workflows/dist.yml
   push:
@@ -43,7 +46,12 @@ env:
   PIP_CACHE_DIR: "${{ github.workspace }}/.cache/pip"
   UV_CACHE_DIR: "${{ github.workspace }}/.cache/uv"
   NO_VERSION_LABEL: "ON"
-  CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_SUNMMIO=OFF"
+  CMAKE_ARGS: >-
+    -DTILELANG_UPDATE_SUBMODULES=OFF
+    -DUSE_CUDA=OFF
+    -DUSE_ROCM=OFF
+    -DUSE_METAL=OFF
+    -DUSE_SUNMMIO=ON
 
 jobs:
   validate-version:
@@ -76,20 +84,16 @@ jobs:
           echo "value=${VERSION_VALUE}" >> "${GITHUB_OUTPUT}"
 
   build-wheels:
-    name: Build wheels for Python ${{ matrix.python-version }} on ${{ matrix.target.runner }} with ${{ matrix.target.toolkit }}
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    name: Build SunMMIO wheel for Python 3.9 on Linux x86_64
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      github.actor != 'dependabot[bot]'
     needs: [validate-version]
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - { runner: ubuntu-latest, toolkit: "CUDA-12.8", test_backends: "cu118 cu130" }
-          - { runner: ubuntu-24.04-arm, toolkit: "CUDA-12.8", test_backends: "cu126 cu130" }
-          - { runner: macos-latest, toolkit: "Metal", test_backends: "" }
-        python-version:
-          - "3.9"
-    timeout-minutes: 120
-    runs-on: ${{ matrix.target.runner }}
+    timeout-minutes: 180
+    runs-on: [self-hosted, Linux, CUDA-rtx3080]
+    env:
+      NPUIR_CACHE_ROOT: /opt/ci-cache/sunmmio/npuir
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -104,41 +108,96 @@ jobs:
             3rdparty/cutlass \
             3rdparty/composable_kernel
 
-      - name: Setup ccache
-        uses: hendrikmuhs/ccache-action@v1
+      - name: Resolve pinned NPU-IR commit
+        id: npuir-ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          NPUIR_SHA="$(git ls-tree HEAD 3rdparty/NPU-IR | awk '{print $3}')"
+          if [[ -z "${NPUIR_SHA}" ]]; then
+            echo "::error::Could not determine the pinned NPU-IR commit from the superproject gitlink."
+            exit 1
+          fi
+          echo "sha=${NPUIR_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout private NPU-IR submodule
+        uses: actions/checkout@v6
         with:
-          max-size: "200MB"
-          create-symlink: true
-          evict-old-files: "7d"
-          append-timestamp: false
-          key: wheel-${{ runner.os }}-${{ runner.arch }}-${{ matrix.python-version }}-${{ hashFiles('**/*.cc') }}
-          restore-keys: |
-            wheel-${{ runner.os }}-${{ runner.arch }}-${{ matrix.python-version }}-${{ hashFiles('**/*.cc') }}
-            wheel-${{ runner.os }}-${{ runner.arch }}-${{ matrix.python-version }}
-            ${{ runner.os }}-${{ runner.arch }}
+          repository: SUNMMIO/NPU-IR
+          ref: ${{ steps.npuir-ref.outputs.sha }}
+          path: 3rdparty/NPU-IR
+          ssh-key: ${{ secrets.SUNMMIONPUIR }}
+          fetch-depth: 1
+
+      - name: Prepare cached LLVM checkout for NPU-IR
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          llvm_config="3rdparty/NPU-IR/cmake/IncludeLLVM.cmake"
+          NPUIR_LLVM_COMMIT="$(
+            grep -E '^[[:space:]]*set\(LLVM_BUILD_COMMIT_HASH[[:space:]]+' "${llvm_config}" \
+              | grep -Eo '[0-9a-f]{40}' \
+              | head -n1
+          )"
+          if [[ -z "${NPUIR_LLVM_COMMIT}" ]]; then
+            echo "::error::Could not determine the pinned LLVM commit from ${llvm_config}"
+            exit 1
+          fi
+
+          NPUIR_CACHE_DIR="${NPUIR_CACHE_ROOT}/${NPUIR_LLVM_COMMIT}"
+          NPUIR_LLVM_SOURCE_DIR="${NPUIR_CACHE_DIR}/llvm-project"
+          NPUIR_LLVM_BUILD_DIR="${NPUIR_CACHE_DIR}/llvm-project-build"
+          NPUIR_LLVM_MARKER_FILE="${NPUIR_CACHE_DIR}/llvm-project.commit"
+          mkdir -p "${NPUIR_CACHE_ROOT}"
+
+          lock_file="${NPUIR_CACHE_ROOT}/llvm-project.lock"
+          exec 9>"${lock_file}"
+          flock 9
+
+          if [[ -f "${NPUIR_LLVM_MARKER_FILE}" ]] && [[ -f "${NPUIR_LLVM_SOURCE_DIR}/llvm/CMakeLists.txt" ]]; then
+            current_rev="$(<"${NPUIR_LLVM_MARKER_FILE}")"
+          else
+            current_rev=""
+          fi
+
+          if [[ "${current_rev}" != "${NPUIR_LLVM_COMMIT}" ]]; then
+            archive_url="https://codeload.github.com/llvm/llvm-project/tar.gz/${NPUIR_LLVM_COMMIT}"
+            archive_file="${NPUIR_CACHE_DIR}/llvm-project-${NPUIR_LLVM_COMMIT}.tar.gz"
+            extract_root="${NPUIR_CACHE_DIR}/llvm-project-extract.tmp"
+            source_tmp="${NPUIR_CACHE_DIR}/llvm-project.tmp"
+
+            rm -rf "${extract_root}" "${source_tmp}"
+            mkdir -p "${NPUIR_CACHE_DIR}" "${extract_root}"
+            curl --fail --location --retry 5 --retry-all-errors \
+              --output "${archive_file}" "${archive_url}"
+            tar -xzf "${archive_file}" -C "${extract_root}"
+            extracted_dir="$(find "${extract_root}" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+            if [[ -z "${extracted_dir}" ]] || [[ ! -f "${extracted_dir}/llvm/CMakeLists.txt" ]]; then
+              echo "::error::Extracted llvm-project archive is missing llvm/CMakeLists.txt"
+              exit 1
+            fi
+
+            mv "${extracted_dir}" "${source_tmp}"
+            rm -rf "${NPUIR_LLVM_SOURCE_DIR}" "${NPUIR_LLVM_BUILD_DIR}"
+            mv "${source_tmp}" "${NPUIR_LLVM_SOURCE_DIR}"
+            printf '%s\n' "${NPUIR_LLVM_COMMIT}" > "${NPUIR_LLVM_MARKER_FILE}"
+            rm -f "${archive_file}"
+            rm -rf "${extract_root}"
+          fi
+
+          echo "NPUIR_LLVM_SOURCE_DIR=${NPUIR_LLVM_SOURCE_DIR}" >> "${GITHUB_ENV}"
+          du -sh "${NPUIR_CACHE_DIR}" 2>/dev/null || true
 
       - name: Configure wheel build
         shell: bash
         run: |
           set -euo pipefail
-          PYTHON_VERSION="${{ matrix.python-version }}"
-          PYTHON_VERSION_MAJMIN="$(echo "${PYTHON_VERSION}" | cut -d '.' -f-2)"
-          PYTHON_VERSION_MAJMIN_NODOT="${PYTHON_VERSION_MAJMIN//./}"
-          echo "CIBW_BUILD=cp${PYTHON_VERSION_MAJMIN_NODOT}-*" >> "${GITHUB_ENV}"
-
-          if [[ "${{ matrix.target.toolkit }}" == *"CUDA"* ]]; then
-            CUDA_VERSION="${{ matrix.target.toolkit }}"
-            CUDA_VERSION="${CUDA_VERSION##*-}"
-            CUDA_VERSION_MAJMIN="$(echo "${CUDA_VERSION}" | cut -d '.' -f-2)"
-            CUDA_VERSION_MAJMIN_NODOT="${CUDA_VERSION_MAJMIN//./}"
-            echo "CUDA_VERSION=${CUDA_VERSION}" >> "${GITHUB_ENV}"
-            echo "UV_TORCH_BACKEND=cu${CUDA_VERSION_MAJMIN_NODOT}" >> "${GITHUB_ENV}"
-          fi
-
-          if [[ "${RUNNER_OS}" == "Linux" ]]; then
-            HOST_CCACHE_DIR="$(ccache --get-config cache_dir)"
-            echo "CIBW_BEFORE_BUILD_LINUX=dnf install -y ccache && ccache -o cache_dir=/host${HOST_CCACHE_DIR}" >> "${GITHUB_ENV}"
-          fi
+          echo "CIBW_BUILD=cp39-manylinux_x86_64" >> "${GITHUB_ENV}"
+          HOST_CCACHE_DIR="/opt/ci-cache/sunmmio/ccache-wheel"
+          mkdir -p "${HOST_CCACHE_DIR}"
+          echo "CIBW_BEFORE_BUILD_LINUX=dnf install -y ccache && ccache -o cache_dir=/host${HOST_CCACHE_DIR}" >> "${GITHUB_ENV}"
+          echo "CIBW_ENVIRONMENT_LINUX=CMAKE_ARGS='${CMAKE_ARGS} -DNPUIR_USE_LLVM_SOURCE_DIR=/host${NPUIR_LLVM_SOURCE_DIR} -DNPUIR_ENABLE_CCACHE=ON'" >> "${GITHUB_ENV}"
 
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.3
@@ -150,7 +209,7 @@ jobs:
       - name: Setup Python and uv
         uses: astral-sh/setup-uv@v7
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.9"
           activate-environment: true
 
       - name: Test built wheels
@@ -159,51 +218,38 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for WHEEL in wheelhouse/*.whl; do
+          mapfile -t WHEELS < <(find wheelhouse -maxdepth 1 -type f -name '*.whl' -print | sort)
+          if (( ${#WHEELS[@]} != 1 )); then
+            echo "::error::Expected exactly one SunMMIO wheel, found ${#WHEELS[@]}"
+            printf '%s\n' "${WHEELS[@]}"
+            exit 1
+          fi
+          for WHEEL in "${WHEELS[@]}"; do
             echo "Testing wheel: ${WHEEL}"
             if [[ "${WHEEL}" == *"abi3"* ]]; then
               uvx abi3audit --verbose --strict "${WHEEL}"
             fi
             TEST_ROOT="$(mktemp -d -t tilelang-wheel-test)"
             uv venv "${TEST_ROOT}/venv"
+            uv pip install \
+              --python "${TEST_ROOT}/venv/bin/python" \
+              --index-url https://download.pytorch.org/whl/cpu \
+              torch
             uv pip install --python "${TEST_ROOT}/venv/bin/python" -v "${WHEEL}"
             cd /
             "${TEST_ROOT}/venv/bin/python" \
               "${GITHUB_WORKSPACE}/maint/scripts/verify_release_install.py" \
-              "${EXPECTED_VERSION}"
+              "${EXPECTED_VERSION}" \
+              --require-sunmmio
             uv pip check --python "${TEST_ROOT}/venv/bin/python"
             cd "${GITHUB_WORKSPACE}"
-          done
-
-      - name: Test built wheels with different CUDA runtimes
-        if: contains(matrix.target.toolkit, 'CUDA')
-        env:
-          EXPECTED_VERSION: ${{ needs.validate-version.outputs.version }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          export UV_PYTHON=3.12
-          for UV_TORCH_BACKEND in ${{ matrix.target.test_backends }}; do
-            export UV_TORCH_BACKEND
-            for WHEEL in wheelhouse/*.whl; do
-              TEST_ROOT="$(mktemp -d -t tilelang-cuda-wheel-test)"
-              uv venv "${TEST_ROOT}/venv"
-              uv pip install --python "${TEST_ROOT}/venv/bin/python" -v "${WHEEL}"
-              cd /
-              "${TEST_ROOT}/venv/bin/python" \
-                "${GITHUB_WORKSPACE}/maint/scripts/verify_release_install.py" \
-                "${EXPECTED_VERSION}"
-              "${TEST_ROOT}/venv/bin/python" -c "import torch; print(torch.__version__)"
-              uv pip check --python "${TEST_ROOT}/venv/bin/python"
-              cd "${GITHUB_WORKSPACE}"
-            done
           done
 
       - name: Upload wheels
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v6
         with:
-          name: wheels-${{ matrix.python-version }}-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target.toolkit }}
+          name: wheels-3.9-linux-x86_64-sunmmio
           path: wheelhouse/*.whl
           if-no-files-found: error
 

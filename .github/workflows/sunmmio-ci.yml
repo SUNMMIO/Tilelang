@@ -62,27 +62,26 @@ jobs:
           fi
 
   test:
-    name: CUDA Tests in Container (NVIDIA 3090)
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    name: SunMMIO Build and Codegen Tests
+    if: |
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      github.actor != 'dependabot[bot]'
     needs: [lint]
     runs-on: [self-hosted, Linux, CUDA-rtx3080]
     timeout-minutes: 120
     container:
-      image: nvidia/cuda:12.8.0-devel-ubuntu24.04
-      options: --gpus all --ipc=host --cap-add NET_ADMIN --sysctl net.ipv4.tcp_mtu_probing=2
+      image: ubuntu:24.04
+      options: --ipc=host --cap-add NET_ADMIN --sysctl net.ipv4.tcp_mtu_probing=2
       volumes:
         - /opt/ci-cache/sunmmio:/ci-cache
     env:
-      USE_CUDA: 1
-      PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu128
-      UV_INDEX: https://download.pytorch.org/whl/cu128
-      CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=ON -DUSE_Z3=OFF -DTILELANG_UPDATE_SUBMODULES=OFF -DPython3_EXECUTABLE=/usr/bin/python3.12 -DPython_EXECUTABLE=/usr/bin/python3.12"
-      CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=ON"
+      CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_Z3=OFF -DTILELANG_UPDATE_SUBMODULES=OFF -DPython3_EXECUTABLE=/usr/bin/python3.12 -DPython_EXECUTABLE=/usr/bin/python3.12"
+      CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON"
       XDG_CACHE_HOME: /ci-cache
       PIP_CACHE_DIR: /ci-cache/pip
       UV_CACHE_DIR: /ci-cache/uv
       PRE_COMMIT_HOME: /ci-cache/pre-commit
-      GTEST_CACHE_DIR: /ci-cache/googletest
       NPUIR_CACHE_ROOT: /ci-cache/npuir
     defaults:
       run:
@@ -90,7 +89,7 @@ jobs:
     steps:
       - name: Prepare persistent cache
         run: |
-          mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}" "${PRE_COMMIT_HOME}" "${GTEST_CACHE_DIR}" "${NPUIR_CACHE_ROOT}"
+          mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}" "${PRE_COMMIT_HOME}" "${NPUIR_CACHE_ROOT}"
           echo "Cache mount: /ci-cache"
           du -sh /ci-cache/* 2>/dev/null || echo "Cache is empty (first run)"
 
@@ -99,10 +98,10 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             python3.12 python3.12-venv python3.12-dev python3-pip wget \
-            clang-tidy cmake ninja-build git curl ca-certificates \
+            clang-tidy cmake ninja-build git curl ca-certificates file \
             build-essential pkg-config libprotobuf-dev \
-            protobuf-compiler libgflags-dev libsqlite3-dev llvm-dev \
-            iproute2 iptables curl dnsutils openssh-client
+            protobuf-compiler libgflags-dev libsqlite3-dev \
+            iproute2 iptables curl dnsutils openssh-client util-linux
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
 
       - name: Fix container networking
@@ -118,7 +117,7 @@ jobs:
 
           # Detect default interface
           IFACE=$(ip route | awk '/default/{print $5; exit}')
-          CURRENT_MTU=$(cat /sys/class/net/${IFACE}/mtu)
+          CURRENT_MTU=$(cat "/sys/class/net/${IFACE}/mtu")
           echo "Default interface: ${IFACE}, current MTU: ${CURRENT_MTU}"
 
           # Clamp MTU to 1400 to avoid PMTUD black holes caused by
@@ -137,45 +136,17 @@ jobs:
 
           # Verify connectivity to critical hosts
           echo "=== Post-fix connectivity test ==="
-          for host in github.com pypi.org download.pytorch.org; do
+          for host in github.com pypi.org; do
             curl -sS --connect-timeout 15 --max-time 30 "https://${host}" > /dev/null \
               && echo "${host}: OK" \
               || echo "::warning::${host}: FAILED"
           done
-
-      - name: Install GoogleTest from source
-        run: |
-          cd "${GTEST_CACHE_DIR}"
-          cmake -S . -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr/local
-          cmake --build build -j$(nproc)
-          cmake --install build
-          cd ..
 
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           set-safe-directory: true
-
-      - name: Determine Sunmmio access mode
-        id: sunmmio-mode
-        env:
-          HAS_PRIVATE_NPUIR_ACCESS: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        run: |
-          set -euo pipefail
-          if [[ "${HAS_PRIVATE_NPUIR_ACCESS}" == "true" ]]; then
-            echo "available=1" >> "${GITHUB_OUTPUT}"
-            echo "TILELANG_SUNMMIO_CMAKE_ARGS=-DUSE_SUNMMIO=ON" >> "${GITHUB_ENV}"
-            echo "TILELANG_SUNMMIO_PYTEST_MARK_EXPR=not sunmmio_closed_runtime" >> "${GITHUB_ENV}"
-            echo "Running Sunmmio codegen CI with private NPU-IR access."
-          else
-            echo "available=0" >> "${GITHUB_OUTPUT}"
-            echo "TILELANG_SUNMMIO_CMAKE_ARGS=-DUSE_SUNMMIO=OFF" >> "${GITHUB_ENV}"
-            echo "TILELANG_SUNMMIO_PYTEST_MARK_EXPR=not sunmmio_closed_runtime" >> "${GITHUB_ENV}"
-            echo "Running fork-safe CI without private NPU-IR checkout."
-          fi
 
       - name: Checkout public submodules
         run: |
@@ -189,7 +160,6 @@ jobs:
             3rdparty/tvm
 
       - name: Resolve pinned NPU-IR commit
-        if: steps.sunmmio-mode.outputs.available == '1'
         id: npuir-ref
         run: |
           set -euo pipefail
@@ -202,7 +172,6 @@ jobs:
           echo "Pinned NPU-IR commit: ${NPUIR_SHA}"
 
       - name: Checkout private NPU-IR submodule
-        if: steps.sunmmio-mode.outputs.available == '1'
         uses: actions/checkout@v6
         with:
           repository: SUNMMIO/NPU-IR
@@ -227,7 +196,6 @@ jobs:
           uv pip install --python .clang-tidy-venv/bin/python -v -r requirements-lint.txt
 
       - name: Read LLVM pin from NPU-IR
-        if: steps.sunmmio-mode.outputs.available == '1'
         run: |
           set -euo pipefail
 
@@ -252,7 +220,6 @@ jobs:
           echo "Using NPU-IR LLVM pin ${NPUIR_LLVM_COMMIT}"
 
       - name: Prepare cached LLVM checkout for NPU-IR
-        if: steps.sunmmio-mode.outputs.available == '1'
         run: |
           set -euo pipefail
 
@@ -261,10 +228,12 @@ jobs:
           NPUIR_LLVM_BUILD_DIR="${NPUIR_CACHE_DIR}/llvm-project-build"
           NPUIR_LLVM_MARKER_FILE="${NPUIR_CACHE_DIR}/llvm-project.commit"
 
-          echo "NPUIR_CACHE_DIR=${NPUIR_CACHE_DIR}" >> "${GITHUB_ENV}"
-          echo "NPUIR_LLVM_SOURCE_DIR=${NPUIR_LLVM_SOURCE_DIR}" >> "${GITHUB_ENV}"
-          echo "NPUIR_LLVM_BUILD_DIR=${NPUIR_LLVM_BUILD_DIR}" >> "${GITHUB_ENV}"
-          echo "TILELANG_SUNMMIO_CMAKE_ARGS=-DUSE_SUNMMIO=ON -DTILELANG_NPUIR_BINARY_DIR=${NPUIR_CACHE_DIR}" >> "${GITHUB_ENV}"
+          {
+            echo "NPUIR_CACHE_DIR=${NPUIR_CACHE_DIR}"
+            echo "NPUIR_LLVM_SOURCE_DIR=${NPUIR_LLVM_SOURCE_DIR}"
+            echo "NPUIR_LLVM_BUILD_DIR=${NPUIR_LLVM_BUILD_DIR}"
+            echo "TILELANG_SUNMMIO_CMAKE_ARGS=-DUSE_SUNMMIO=ON -DTILELANG_NPUIR_BINARY_DIR=${NPUIR_CACHE_DIR}"
+          } >> "${GITHUB_ENV}"
 
           lock_file="${NPUIR_CACHE_ROOT}/llvm-project.lock"
           exec 9>"${lock_file}"
@@ -322,8 +291,7 @@ jobs:
           echo "\$ ${CLANG_TIDY_BIN} --version" && "${CLANG_TIDY_BIN}" --version
           echo "Using Sunmmio CMake args: ${TILELANG_SUNMMIO_CMAKE_ARGS}"
 
-          # Run clang-tidy before provisioning the heavyweight Python/CUDA test env.
-          # The clang-tidy configure only needs system Python and CUDA headers.
+          # Run clang-tidy before provisioning the Python test environment.
           RCT_URL=https://raw.githubusercontent.com/llvm/llvm-project/refs/heads/release/21.x/clang-tools-extra/clang-tidy/tool/run-clang-tidy.py
           echo "Downloading run-clang-tidy script from ${RCT_URL}"
           curl -LsSf "${RCT_URL}" -o run-clang-tidy.py
@@ -335,23 +303,26 @@ jobs:
             echo "::warning::clang-apply-replacements not found in PATH, automatic fixing disabled."
           fi
 
-          # Reuse the persistent NPU-IR/LLVM cache when available; otherwise
-          # configure clang-tidy with Sunmmio disabled for fork-safe CI.
+          # Serialize access to the persistent NPU-IR/LLVM build cache.
           lock_file="${NPUIR_CACHE_ROOT}/llvm-project.lock"
           exec 9>"${lock_file}"
           flock 9
-          cmake -S . -B cmake-build --fresh ${CLANG_TIDY_CMAKE_OPTIONS} ${TILELANG_SUNMMIO_CMAKE_ARGS}
+          read -r -a CLANG_TIDY_CMAKE_OPTIONS_ARRAY <<< "${CLANG_TIDY_CMAKE_OPTIONS}"
+          read -r -a TILELANG_SUNMMIO_CMAKE_ARGS_ARRAY <<< "${TILELANG_SUNMMIO_CMAKE_ARGS}"
+          cmake -S . -B cmake-build --fresh \
+            "${CLANG_TIDY_CMAKE_OPTIONS_ARRAY[@]}" \
+            "${TILELANG_SUNMMIO_CMAKE_ARGS_ARRAY[@]}"
           if [[ "${TILELANG_SUNMMIO_CMAKE_ARGS}" == *"-DUSE_SUNMMIO=ON"* ]]; then
             cmake --build cmake-build --target tilelang_highs -j "$(nproc)"
             cmake --build cmake-build --target mlir-headers llvm-headers -j "$(nproc)"
           fi
           flock -u 9
 
-          CXX_FILES=$(find src -type f \( -iname "*.[ch]pp" -o -iname "*.cc" -o -iname "*.c" -o -iname "*.h" \))
+          mapfile -t CXX_FILES < <(find src -type f \( -iname "*.[ch]pp" -o -iname "*.cc" -o -iname "*.c" -o -iname "*.h" \))
           rc=0
           "${CLANG_TIDY[@]}" -clang-tidy-binary="${CLANG_TIDY_BIN}" \
             -exclude-header-filter='^(3rdparty|tvm)/.*$' \
-            -p="cmake-build" ${CXX_FILES} || rc="$?"
+            -p="cmake-build" "${CXX_FILES[@]}" || rc="$?"
           rm -rf cmake-build run-clang-tidy.py
           if (( rc != 0 )); then
             echo "::error::clang-tidy found issues (exit code: ${rc}). Please run 'clang-tidy --fix' locally to fix them."
@@ -364,44 +335,39 @@ jobs:
         run: |
           uv venv .venv --python /usr/bin/python3.12
           uv pip install --python .venv/bin/python -v --upgrade pip setuptools wheel
-          uv pip install --python .venv/bin/python -v -r requirements-test.txt
-          echo "import torch; print(f'torch: {torch.__version__}')" | uv run --no-project --script -
-          uv pip install --python .venv/bin/python --no-build-isolation-package=flash-attn -v -r requirements-test-cuda.txt
-          . .venv/bin/activate
-          python -c "import torch; print(f'torch: {torch.__version__}'); print(f'cuda available: {torch.cuda.is_available()}'); print(f'device: {torch.cuda.get_device_name(0)}')"
-          echo "::group::torch.utils.collect_env"
-          uv run --no-project -m -- torch.utils.collect_env
-          echo "::endgroup::"
+          uv pip install \
+            --python .venv/bin/python \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch
+          uv pip install --python .venv/bin/python -v "pytest>=6.2.4"
 
       - name: Install project (wheel form)
         run: |
-          # Always build CUDA in this NVIDIA test lane; Sunmmio is enabled only
-          # when the private NPU-IR checkout/cache is available.
           export CMAKE_ARGS="${CMAKE_ARGS} ${TILELANG_SUNMMIO_CMAKE_ARGS}"
+          lock_file="${NPUIR_CACHE_ROOT}/llvm-project.lock"
+          exec 9>"${lock_file}"
+          flock 9
           uv pip install -v .
 
-      - name: Run Python test suite
+      - name: Run SunMMIO Python tests
         run: |
           . .venv/bin/activate
-          # Add the CUDA-aware pytest-xdist scheduler plugin to PYTHONPATH
-          export PYTHONPATH="${GITHUB_WORKSPACE}/maint/scripts:${PYTHONPATH}"
-          cd testing
           PYTEST=(
             uv run --no-project -m --
             pytest --verbose --color=yes --durations=0 --showlocals --cache-clear
           )
-          PYTEST_MARK_EXPR="${TILELANG_SUNMMIO_PYTEST_MARK_EXPR:-not sunmmio_closed_runtime}"
-          echo "Using pytest marker expression: ${PYTEST_MARK_EXPR}"
-          "${PYTEST[@]}" -c pytest.ini -m "${PYTEST_MARK_EXPR}" ./python
+          "${PYTEST[@]}" \
+            -c testing/pytest.ini \
+            -m "not sunmmio_closed_runtime" \
+            testing/python/sunmmio \
+            testing/python/language/test_tilelang_language_dtypes.py
 
       - name: List generated files
         if: ${{ !cancelled() }}
         run: |
           find . -type f -name '*.py[co]' -delete
           find . -depth -type d -name "__pycache__" -exec rm -r "{}" +
-          if git status --ignored --porcelain | grep -qvE '/$'; then
-            ls -alh $(git status --ignored --porcelain | grep -vE '/$' | grep -oE '\S+$')
-          fi
+          git status --ignored --short | grep -vE '/$' || true
 
       - name: Prune caches (disk space management)
         if: always()
