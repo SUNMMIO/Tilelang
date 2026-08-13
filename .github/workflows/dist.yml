@@ -271,7 +271,7 @@ jobs:
             if [[ "${WHEEL}" == *"abi3"* ]]; then
               uvx abi3audit --verbose --strict "${WHEEL}"
             fi
-            TEST_ROOT="$(mktemp -d -t tilelang-wheel-test)"
+            TEST_ROOT="$(mktemp -d "${RUNNER_TEMP}/tilelang-wheel-test.XXXXXX")"
             uv venv "${TEST_ROOT}/venv"
             uv pip install \
               --python "${TEST_ROOT}/venv/bin/python" \
