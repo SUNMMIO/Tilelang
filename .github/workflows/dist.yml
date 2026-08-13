@@ -230,6 +230,17 @@ jobs:
           echo "CIBW_BEFORE_BUILD_LINUX=dnf install -y ccache && ccache -o cache_dir=/host${HOST_CCACHE_DIR}" >> "${GITHUB_ENV}"
           echo "CIBW_ENVIRONMENT_LINUX=CMAKE_ARGS='${CMAKE_ARGS} -DNPUIR_USE_LLVM_SOURCE_DIR=/host${NPUIR_LLVM_SOURCE_DIR} -DNPUIR_ENABLE_CCACHE=ON'" >> "${GITHUB_ENV}"
 
+      - name: Set up cibuildwheel host Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Verify cibuildwheel host Python
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${pythonLocation}/bin/python" --version
+
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.3
         with:
