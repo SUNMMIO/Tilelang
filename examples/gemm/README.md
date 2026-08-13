@@ -28,7 +28,7 @@ TileLang is a domain-specific language designed to simplify the process of writi
 
 ### Prerequisites
 
-- **Python 3.9+**
+- **Python 3.12+**
 - **NVIDIA GPU** with a recent CUDA toolkit installed
 - **PyTorch** (optional, for easy correctness verification)
 - **TileLang-Mesh** (`tilelang-mesh` distribution, `tilelang` import package)

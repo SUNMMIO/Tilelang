@@ -33,7 +33,7 @@ attached wheel, or clone the repository for an authorized source build.
 
 ## Requirements
 
-- CPython 3.9 or newer
+- CPython 3.12 or newer
 - Linux x86_64 for the published wheel
 - CMake 3.26.1 or newer and a C++17 compiler for source builds
 - Ninja is recommended
@@ -140,10 +140,6 @@ python -c "import tilelang; print(tilelang.__version__)"
 - [Full documentation index](docs/index.md)
 - [Contributing guide](CONTRIBUTING.md)
 - [Changelog](CHANGELOG.md)
-
-## Docker
-
-Container build and launch instructions are available in [docker/README.md](docker/README.md).
 
 ## License
 

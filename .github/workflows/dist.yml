@@ -84,7 +84,7 @@ jobs:
           echo "value=${VERSION_VALUE}" >> "${GITHUB_OUTPUT}"
 
   build-wheels:
-    name: Build SunMMIO wheel for Python 3.9 on Linux x86_64
+    name: Build SunMMIO wheel for Python 3.12 on Linux x86_64
     if: |
       (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
       (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
@@ -224,7 +224,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "CIBW_BUILD=cp39-manylinux_x86_64" >> "${GITHUB_ENV}"
+          echo "CIBW_BUILD=cp312-manylinux_x86_64" >> "${GITHUB_ENV}"
           HOST_CCACHE_DIR="/opt/ci-cache/sunmmio/ccache-wheel"
           mkdir -p "${HOST_CCACHE_DIR}"
           echo "CIBW_BEFORE_BUILD_LINUX=dnf install -y ccache && ccache -o cache_dir=/host${HOST_CCACHE_DIR}" >> "${GITHUB_ENV}"
@@ -251,7 +251,7 @@ jobs:
       - name: Setup Python and uv
         uses: astral-sh/setup-uv@v7
         with:
-          python-version: "3.9"
+          python-version: "3.12"
           activate-environment: true
 
       - name: Test built wheels
@@ -291,7 +291,7 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v6
         with:
-          name: wheels-3.9-linux-x86_64-sunmmio
+          name: wheels-3.12-linux-x86_64-sunmmio
           path: wheelhouse/*.whl
           if-no-files-found: error
 

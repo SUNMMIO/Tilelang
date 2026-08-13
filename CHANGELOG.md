@@ -13,7 +13,6 @@ beta software, minor releases may still contain explicitly documented compatibil
 - Distributed-memory and mesh-aware TileLang extensions for placement, communication, layout, and
   code generation.
 - SUNMMIO/SUVM backend integration for authorized source builds with NPU-IR access.
-- Public CUDA, ROCm, and Metal build paths inherited from and maintained alongside upstream TileLang.
 - English and Chinese SunMMIO kernel quick-start and user guides.
 
 ### Distribution
@@ -22,6 +21,9 @@ beta software, minor releases may still contain explicitly documented compatibil
   access-controlled NPU-IR source tree.
 - Python source distributions are deferred until the NPU-IR packaging and redistribution boundary
   has been resolved.
+- CPython 3.12 or newer is required.
+- Legacy CUDA and ROCm container definitions are not included; release artifacts target the
+  SunMMIO/SUVM backend.
 - Authorized users can enable SUNMMIO from a recursive source checkout.
 - The distribution name is `tilelang-mesh`, while the import package remains `tilelang`.
 

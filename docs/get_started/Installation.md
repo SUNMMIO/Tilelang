@@ -23,7 +23,7 @@ python -m pip uninstall tilelang-mesh
 
 ## Supported Environments
 
-The project metadata requires CPython 3.9 or newer. Published release wheels target Linux x86_64 and
+The project metadata requires CPython 3.12 or newer. Published release wheels target Linux x86_64 and
 the SunMMIO/SUVM backend. Source builds require CMake 3.26.1 or newer and a C++17 compiler.
 
 Public release artifacts and authorized SUNMMIO source builds have different capabilities:

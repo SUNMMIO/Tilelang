@@ -38,11 +38,11 @@ jobs:
           fetch-depth: 0
           set-safe-directory: true
 
-      - name: Setup Python 3.9
+      - name: Setup Python 3.12
         id: setup-pylowest
         uses: actions/setup-python@v6
         with:
-          python-version: "3.9"
+          python-version: "3.12"
           update-environment: true
           cache: pip
           cache-dependency-path: |
@@ -50,7 +50,7 @@ jobs:
             requirements*.txt
             .pre-commit-config.yaml
 
-      - name: Check AST with Python 3.9
+      - name: Check AST with Python 3.12
         run: |
           "${{ steps.setup-pylowest.outputs.python-path }}" -m compileall -q -f tilelang
 
