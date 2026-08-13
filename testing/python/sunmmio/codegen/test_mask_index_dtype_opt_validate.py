@@ -21,7 +21,7 @@ STRICT_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
 
 @target("Sunmmio")
 def predicated_store_mask_dtype_kernel(dtype, extent=512, valid_n=33):
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     tensor_shape = (extent,)
     tensor_layout = make_aligned_row_major(tensor_shape, dtype, align_bytes=1024)
 
@@ -49,7 +49,7 @@ def bf16_select_with_i32_row_mask_kernel(
     valid_cols=19,
 ):
     dtype = T.bfloat16
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     tensor_shape = (m, n)
     tensor_layout = make_zz_layout(tensor_shape, [0, 1], (block_m, block_n))
 
@@ -131,7 +131,8 @@ def test_bf16_select_with_i32_row_mask_lowers_to_llvm(tmp_path):
     assert "suvm.tile.addi" not in src
 
 
-def test_bf16_dynamic_rect_tail_mask_uses_unsigned_i16_compare(tmp_path):
+def test_bf16_dynamic_rect_tail_mask_uses_unsigned_i16_compare(tmp_path, monkeypatch):
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT", "1")
     src = validate_sunmmio_codegen_with_npuir_opt(
         bf16_dynamic_rect_tail_mask_kernel(),
         tmp_path,

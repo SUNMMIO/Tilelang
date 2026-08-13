@@ -50,7 +50,7 @@ def matmul_mx_operand_kernel(
     b_layout_kind="default",
     accum_dtype=T.bfloat16,
 ):
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     if _is_mx_dtype(a_dtype):
         A_layout = make_mxzz_layout((M, K), dtype=a_dtype) if a_layout_kind == "mxzz" else make_mx_row_major_layout((M, K), dtype=a_dtype)
     else:

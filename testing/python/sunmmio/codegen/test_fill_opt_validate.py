@@ -36,7 +36,7 @@ def fill_tiled_test(
     block_n=128,
     dtype="bfloat16",
 ):
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     tensor_shape = (b, m, n)
     tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
     grid_b = T.ceildiv(b, block_b)
@@ -76,7 +76,7 @@ def fill_tiled_2d_test(
     block_n=512,
     dtype="bfloat16",
 ):
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     tensor_shape = (m, n)
     tensor_layout = make_zz_layout(tensor_shape, [0, 1], (32, 32))
     grid_m = T.ceildiv(m, block_m)

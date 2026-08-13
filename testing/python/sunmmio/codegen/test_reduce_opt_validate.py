@@ -68,7 +68,7 @@ def reduce_kernel_builder(shape, reduce_axis, dtype="bfloat16", clear=True):
         out_shape = [1]
     out_shape = tuple(out_shape)
 
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     input_layout = _dram_input_layout(shape)
     output_layout = _dram_reduce_output_layout(out_shape)
 
@@ -100,7 +100,7 @@ def reduce_tail_region_kernel(
     block_n=96,
     dtype="bfloat16",
 ):
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     input_shape = (block_m, block_n)
     output_shape = (block_m,)
     input_layout = make_zz_layout(input_shape, [0, 1], (32, 32))
@@ -153,7 +153,7 @@ def reduce_tiled_test(
     out_shape_block = (block_b, block_m) if reduce_axis == 2 else (block_b, block_n) if reduce_axis == 1 else (block_m, block_n)
     input_shape = (b, m, n)
 
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     input_layout = make_zz_layout(input_shape, [1, 2], (32, 32))
     output_layout = _dram_reduce_output_layout(out_shape_full)
     grid_b = T.ceildiv(b, block_b)

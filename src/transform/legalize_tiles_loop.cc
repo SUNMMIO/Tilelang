@@ -361,6 +361,23 @@ public:
   }
 
 private:
+  static Stmt StripTileLoopAnnotations(const ForNode *root) {
+    class Stripper : public StmtExprMutator {
+      Stmt VisitStmt_(const ForNode *loop) final {
+        For rewritten = Downcast<For>(StmtExprMutator::VisitStmt_(loop));
+        auto *n = rewritten.CopyOnWrite();
+        n->annotations.erase(attr::tile_level_loop);
+        n->annotations.erase(attr::kTileDomain);
+        n->annotations.erase(attr::kTileLoopStage);
+        n->annotations.erase(attr::tile_tile_size);
+        n->annotations.erase(attr::tile_execution_domain_axes);
+        n->annotations.erase(attr::tile_execution_axis);
+        return rewritten;
+      }
+    } stripper;
+    return stripper(ffi::GetRef<For>(root));
+  }
+
   static void AddBufferIfMissing(std::vector<Buffer> *buffers,
                                  const Buffer &buffer) {
     auto it = std::find_if(
@@ -469,9 +486,31 @@ private:
           << "T.Tiles scope loop rank does not cover the declared domain rank.";
       scope_loops.resize(domain.size());
       auto accesses = CollectBufferAccesses(loop->body);
-      active_tileview_plan_ =
-          PlanTileViewsForTilesScope(domain, scope_loops, accesses, tileviews_,
-                                     layout_map_, tile_processor_config_);
+      auto plan = TryPlanTileViewsForTilesScope(domain, scope_loops, accesses,
+                                                tileviews_, layout_map_,
+                                                tile_processor_config_);
+      if (!plan.has_value()) {
+        LOG(WARNING) << "T.Tiles domain " << domain
+                     << " cannot infer a legal TileView and is falling back "
+                        "to scalar serial loops using tile.pick/tile.set. This "
+                        "may severely degrade performance.";
+        return StripTileLoopAnnotations(loop);
+      }
+      active_tileview_plan_ = plan.value();
+      if (active_tileview_plan_.requires_aligned_1d_bridge) {
+        LOG(WARNING)
+            << "T.Tiles domain " << domain
+            << " uses a logical 1D tile smaller than the native RSRAM "
+               "alignment. Codegen will load an aligned carrier and pick, "
+               "extract, or insert the logical tile. This may degrade "
+               "performance.";
+      }
+      if (active_tileview_plan_.execution_domain_axes.size() < domain.size()) {
+        LOG(WARNING) << "T.Tiles domain " << domain
+                     << " cannot infer a full-rank TileView and is falling "
+                        "back to serial outer axes plus 1D tile execution. "
+                        "This may degrade performance.";
+      }
       active_scope_depth_ = 0;
       in_active_scope_ = true;
     }

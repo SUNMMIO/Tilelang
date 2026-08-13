@@ -317,6 +317,13 @@ TVM_DLL const Op &mx_unpack();
 TVM_DLL const Op &sunmmio_layout_transform();
 
 /*!
+ * \brief Transpose a complete 2D RSRAM matrix through the Sunmmio ODMA.
+ *
+ * tl.sunmmio_transpose(src_region, dst_region)
+ */
+TVM_DLL const Op &sunmmio_transpose();
+
+/*!
  * \brief tvm intrinsic for mma operation of Sunmmio target.
  *
  *  \param A_region

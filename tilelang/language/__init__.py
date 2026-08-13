@@ -15,9 +15,9 @@ from .eager import *  # noqa: F401
 from .tir.ir import *  # noqa: F401
 from tilelang.layout import Layout, Fragment  # noqa: F401
 from .proxy import ptr, make_tensor, Buffer, Tensor, StridedTensor, FragmentBuffer, SharedBuffer, LocalBuffer  # noqa: F401
+from . import placement  # noqa: F401
+from .placement import MeshReplicationType, MeshShardingPolicy, PlacementSpec  # noqa: F401
 from .mesh_tensor import (  # noqa: F401
-    MeshShardingPolicy,
-    MeshReplicationType,
     MeshTensor,
     TensorWithMeta,
 )
@@ -61,6 +61,7 @@ from .allocate import (
 )
 from .copy_op import copy, c2d_im2col  # noqa: F401
 from .mx import mx_pack, mx_unpack  # noqa: F401
+from .transpose_op import transpose  # noqa: F401
 from .dma import dma_load, dma_store  # noqa: F401
 from tilelang.tileop.base import GemmWarpPolicy  # noqa: F401
 from .gemm_op import gemm, gemm_v1, gemm_v2  # noqa: F401

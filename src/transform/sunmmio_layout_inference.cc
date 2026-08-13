@@ -609,11 +609,13 @@ bool SunmmioLayoutInferencePass::TryAssign(const Buffer &buffer,
 }
 
 LayoutInferArgs SunmmioLayoutInferencePass::BuildInferArgs() const {
-  // Build current SRAM layout_map from layout_entries_
+  // Build current SRAM layout map together with each entry's provenance.
   LayoutMap current_layout_map;
+  LayoutLevelMap current_layout_levels;
   for (const auto &[buf, entry] : layout_entries_) {
     if (IsSunmmioSramScope(buf.scope())) {
       current_layout_map.Set(buf, entry.layout);
+      current_layout_levels.Set(buf, Integer(static_cast<int>(entry.level)));
     }
   }
 
@@ -626,6 +628,7 @@ LayoutInferArgs SunmmioLayoutInferencePass::BuildInferArgs() const {
       {},                 // buffer_remap
       let_var_to_expr_,   // let var bindings
       global_layout_map_, // DRAM layouts
+      current_layout_levels,
   };
 }
 

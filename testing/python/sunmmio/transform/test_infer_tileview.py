@@ -10,7 +10,7 @@ import tilelang
 import tilelang as tl
 import tilelang.language as T
 from tilelang import tvm as tvm
-from tilelang.layout import make_zz_layout
+from tilelang.layout import make_aligned_row_major, make_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tvm import tir
 from tvm import IRModule
@@ -72,6 +72,23 @@ def assert_scope_plan(mod, expected_tile_size, expected_execution_domain_axes):
     assert execution_axes == list(range(len(expected_tile_size)))
     assert _to_int_list(scope_root["tile.tile_size"]) == list(expected_tile_size)
     assert _to_int_list(scope_root["tile.execution_domain_axes"]) == list(expected_execution_domain_axes)
+
+
+def collect_scope_plans(func):
+    plans = []
+
+    def visit(stmt):
+        if not isinstance(stmt, tir.For) or stmt.annotations is None or "tile.domain" not in stmt.annotations:
+            return
+        plans.append(
+            (
+                _to_int_list(stmt.annotations["tile.tile_size"]),
+                _to_int_list(stmt.annotations["tile.execution_domain_axes"]),
+            )
+        )
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    return plans
 
 
 def collect_loads(func, buffer_name):
@@ -399,6 +416,293 @@ def test_infer_tileview_mixed_rank_store_still_rejected(dtype):
         ),
     ):
         apply_sunmmio_passes(mod, target)
+
+
+def test_infer_tileview_falls_back_to_1d_for_scalar_side_load():
+    """A row-dependent scalar side load must not reject a 2D T.Tiles scope."""
+    M, N = 32, 64
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            x_shared = T.alloc_shared((M, N), "float32")
+            post_mix_shared = T.alloc_shared((M, M), "float32")
+            output_accum = T.alloc_shared((M, N), "float32")
+
+            for bx, by in T.Tiles([M, N], parallel=True):
+                output_accum[bx, by] = x_shared[bx, by] * post_mix_shared[bx, 0]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert_scope_plan(mod, expected_tile_size=[64], expected_execution_domain_axes=[1])
+    loads = collect_loads(mod["main"], "post_mix_shared")
+    assert loads
+    assert all(len(load.indices) == 2 for load in loads)
+
+
+def test_infer_tileview_keeps_2d_for_trailing_axis_side_load():
+    """A side load along the contiguous trailing axis supports the 2D plan."""
+    M, N = 32, 64
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            x_shared = T.alloc_shared((M, N), "float32")
+            post_mix_shared = T.alloc_shared((M, M), "float32")
+            output_accum = T.alloc_shared((M, N), "float32")
+
+            for bx, by in T.Tiles([M, N], parallel=True):
+                output_accum[bx, by] = x_shared[bx, by] * post_mix_shared[0, by]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert_scope_plan(mod, expected_tile_size=[1, 32], expected_execution_domain_axes=[0, 1])
+    loads = collect_loads(mod["main"], "post_mix_shared")
+    assert loads
+    assert all(len(load.indices) == 2 for load in loads)
+
+
+def test_infer_tileview_falls_back_to_rank1_for_packed_2d_to_1d_store():
+    """A fused packed store keeps its unit-stride axis as a 1D tile."""
+    H, BASE, VECTOR_SIZE, MATRIX_SIZE = 4, 8, 128, 32
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((VECTOR_SIZE,), "float32")
+            B_shared = T.alloc_shared((MATRIX_SIZE, MATRIX_SIZE), "float32")
+
+            for i, j in T.Tiles([H, H], parallel=True):
+                A_shared[BASE + i * H + j] = B_shared[i, j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert_scope_plan(mod, expected_tile_size=[H], expected_execution_domain_axes=[1])
+
+
+def test_infer_tileview_falls_back_to_rank1_for_packed_1d_to_2d_load():
+    """A fused packed load keeps its unit-stride axis as a 1D tile."""
+    H, BASE, VECTOR_SIZE, MATRIX_SIZE = 4, 8, 128, 32
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((VECTOR_SIZE,), "float32")
+            B_shared = T.alloc_shared((MATRIX_SIZE, MATRIX_SIZE), "float32")
+
+            for i, j in T.Tiles([H, H], parallel=True):
+                B_shared[i, j] = A_shared[BASE + i * H + j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert_scope_plan(mod, expected_tile_size=[H], expected_execution_domain_axes=[1])
+
+
+def test_rank1_fallback_preserves_dynamic_tile_domain():
+    """Rank reduction keeps dynamic domain expressions in the tile scope."""
+    H, BASE, VECTOR_SIZE, MATRIX_SIZE = 4, 8, 128, 32
+
+    @T.prim_func
+    def main(valid: T.int32):
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((VECTOR_SIZE,), "float32")
+            B_shared = T.alloc_shared((MATRIX_SIZE, MATRIX_SIZE), "float32")
+
+            for i, j in T.Tiles([H, T.min(H, valid)], parallel=True):
+                B_shared[i, j] = A_shared[BASE + i * H + j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert_scope_plan(mod, expected_tile_size=[H], expected_execution_domain_axes=[1])
+    scope_root, _ = collect_tile_annotations(mod["main"])
+    assert scope_root is not None
+    assert "valid" in str(scope_root["tile.domain"][1])
+
+
+def test_infer_tileview_keeps_scalar_fallback_when_no_axis_is_unit_stride():
+    """Rank reduction must not reinterpret a strided access as a dense tile."""
+    H, BASE, VECTOR_SIZE, MATRIX_SIZE = 4, 8, 128, 32
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((VECTOR_SIZE,), "float32")
+            B_shared = T.alloc_shared((MATRIX_SIZE, MATRIX_SIZE), "float32")
+
+            for i, j in T.Tiles([H, H], parallel=True):
+                B_shared[i, j] = A_shared[BASE + i * H + j * 2]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+    script = mod["main"].script()
+
+    assert "tile.domain" not in script
+    assert "tile.scope_entry" not in script
+    assert "for i, j in T.grid(4, 4)" in script
+
+
+def test_infer_tileview_keeps_scalar_fallback_when_index_mixes_tile_axes():
+    """An index that mixes both tile axes cannot be represented by a TileView."""
+    domain, shape = 4, 16
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            src = T.alloc_shared((shape, shape), "float32")
+            dst = T.alloc_shared((shape, shape), "float32")
+
+            for i, j in T.Tiles([domain, domain], parallel=True):
+                dst[i, j] = src[i + j, i + j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+    script = mod["main"].script()
+
+    assert "tile.domain" not in script
+    assert "tile.scope_entry" not in script
+    assert "for i, j in T.grid(4, 4)" in script
+
+
+def test_infer_tileview_keeps_scalar_fallback_for_incompatible_axis_order():
+    """Transposed source and row-major destination accesses share no execution plan."""
+    domain, shape = 4, 16
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            src = T.alloc_shared((shape, shape), "float32")
+            dst = T.alloc_shared((shape, shape), "float32")
+
+            for i, j in T.Tiles([domain, domain], parallel=True):
+                dst[i, j] = src[j, i]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+    script = mod["main"].script()
+
+    assert "tile.domain" not in script
+    assert "tile.scope_entry" not in script
+    assert "for i, j in T.grid(4, 4)" in script
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        pytest.param(T.float4_e2m1fn, id="fp4"),
+        pytest.param(T.mxfp4, id="mxfp4"),
+        pytest.param(T.mxfp8, id="mxfp8"),
+    ],
+)
+def test_subbyte_and_mx_dtypes_skip_aligned_1d_bridge(dtype, capfd):
+    """Unverified 1D dtype paths must remain on the conservative fallback."""
+    width = 32
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            src = T.alloc_shared((256,), dtype, scope="shared.rsram")
+            dst = T.alloc_shared((256,), dtype, scope="shared.rsram")
+
+            for j in T.Tiles([width], parallel=True):
+                dst[j] = src[width + j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+    captured = capfd.readouterr()
+    script = mod["main"].script()
+
+    assert "Skipping aligned 1D bridge candidates" in captured.err
+    assert "tile.domain" not in script
+    assert "tile.scope_entry" not in script
+    assert "for j in range(32)" in script
+
+
+def test_rank1_fallback_does_not_override_rank2_manual_tileview():
+    """Rank reduction must preserve an incompatible explicit 2D TileView."""
+    from tilelang.tileview import make_tileview
+
+    H, BASE, VECTOR_SIZE, MATRIX_SIZE = 4, 8, 128, 32
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((VECTOR_SIZE,), "float32")
+            B_shared = T.alloc_shared((MATRIX_SIZE, MATRIX_SIZE), "float32")
+            T.annotate_tileview({B_shared: make_tileview(B_shared, (H, MATRIX_SIZE), (-2, -1))})
+
+            for i, j in T.Tiles([H, H], parallel=True):
+                B_shared[i, j] = A_shared[BASE + i * H + j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+    script = mod["main"].script()
+
+    assert "tile.domain" not in script
+    assert "tile.scope_entry" not in script
+    assert "for i, j in T.grid(4, 4)" in script
+
+
+def test_infer_subaligned_rank1_tile_for_serialized_2d_copy():
+    """A serialized outer axis leaves a bridgeable logical 1D tile."""
+    H = 4
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            cm = T.alloc_shared((H, H), "float32", scope="shared.rsram")
+            comb = T.alloc_shared((1, H * H), "float32", scope="shared.rsram")
+            T.annotate_layout(
+                {
+                    cm: make_zz_layout((H, H), [0, 1], (32, 32)),
+                    comb: make_aligned_row_major((1, H * H), "float32", align_bytes=64),
+                }
+            )
+
+            for j in T.serial(H):
+                for k in T.Tiles([H], parallel=True):
+                    comb[0, j * H + k] = cm[j, k]
+
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main").with_attr("target", target))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert_scope_plan(mod, expected_tile_size=[H], expected_execution_domain_axes=[0])
+
+
+def test_infer_scope_local_subaligned_then_direct_rank1_tiles():
+    """The same temp buffer can use a bridged tile then a direct full row."""
+    H, W = 4, 32
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            cm = T.alloc_shared((H, W), "float32", scope="shared.rsram")
+            m_shared = T.alloc_shared((W,), "float32", scope="shared.rsram")
+            temp = T.alloc_shared((W,), "float32", scope="shared.rsram")
+            T.annotate_layout(
+                {
+                    cm: make_zz_layout((H, W), [0, 1], (32, 32)),
+                    m_shared: make_aligned_row_major((W,), "float32", align_bytes=64),
+                    temp: make_aligned_row_major((W,), "float32", align_bytes=64),
+                }
+            )
+
+            for i in T.serial(H):
+                for j in T.Tiles([H], parallel=True):
+                    temp[j] = m_shared[i * H + j]
+                for j in T.Tiles([W], parallel=True):
+                    cm[i, j] = temp[j]
+
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main").with_attr("target", target))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert sorted(collect_scope_plans(mod["main"])) == [([H], [0]), ([W], [0])]
 
 
 def test_infer_tileview_swapped_domain_binding():
@@ -761,8 +1065,8 @@ def test_infer_tileview_blockwise_region_height_and_width_offset():
     assert_scope_plan(mod, expected_tile_size=[8, 32], expected_execution_domain_axes=[0, 1])
 
 
-def test_infer_tileview_blockwise_region_misaligned_width_offset_rejected():
-    """Misaligned blockwise width offsets should reject tileview planning.
+def test_infer_tileview_blockwise_region_misaligned_width_offset_falls_back():
+    """Misaligned blockwise width offsets should fall back from 2D planning.
 
     With fp16 and 64-byte RSRAM alignment, the minimum tile width is 32
     elements.  Offset 16 is not aligned to 32, so no feasible tile exists.
@@ -795,11 +1099,7 @@ def test_infer_tileview_blockwise_region_misaligned_width_offset_rejected():
 
     mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    with (
-        tvm.target.Target(target),
-        pytest.raises(
-            tvm.error.InternalError,
-            match="Cannot infer any feasible TileView candidate",
-        ),
-    ):
-        apply_sunmmio_passes(mod, target)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+    scope_root, _ = collect_tile_annotations(mod["main"])
+    assert scope_root is None or len(scope_root["tile.tile_size"]) == 1

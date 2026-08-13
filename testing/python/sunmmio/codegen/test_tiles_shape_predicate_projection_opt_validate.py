@@ -64,7 +64,8 @@ def tiles_shape_rank1_side_buffer_predicate_kernel(
     return main
 
 
-def test_tiles_shape_predicate_is_projected_to_access_axes(tmp_path):
+def test_tiles_shape_predicate_is_projected_to_access_axes(tmp_path, monkeypatch):
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT", "1")
     mlir_filename = "tiles_shape_predicate_projection_suvm.mlir"
     log_subdir = "tiles_shape_predicate_projection"
     validate_sunmmio_codegen_with_npuir_opt(

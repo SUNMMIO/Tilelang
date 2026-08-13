@@ -1,3 +1,4 @@
+import json
 import os
 
 import tilelang
@@ -16,18 +17,16 @@ tilelang.env.disable_cache()
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
-LOOSE_OPT_ARGS = ("--verify-each",)
-
 
 @target("Sunmmio")
-def softmax_dynamic(block_M=128, block_N=128, in_dtype=T.float32, out_dtype=T.float32):
+def softmax_dynamic(block_M=256, block_N=128, in_dtype=T.float32, out_dtype=T.float32):
     """JIT kernel factory for dynamic-(M, N) row-wise softmax."""
     M = T.dynamic("m")
     N = T.dynamic("n")
     mesh_cols = 4
 
     zz_layout = make_zz_layout((M, N), [0, 1], (32, 32))
-    placement = T.MeshShardingPolicy(y=0, x=1)
+    placement = T.placement.full_shard(0, 1)
 
     accum_dtype = T.float32
     scale = 1.44269504
@@ -96,7 +95,11 @@ def softmax_dynamic(block_M=128, block_N=128, in_dtype=T.float32, out_dtype=T.fl
     return softmax
 
 
-def test_simple_global_copy_gemm_codegen_validates_with_npuir_opt(tmp_path):
+def test_simple_global_copy_gemm_codegen_validates_with_npuir_opt(tmp_path, monkeypatch):
+    coverage_path = tmp_path / "softmax_dynamic_coverage.json"
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_PATH", str(coverage_path))
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT", "1")
+
     src = validate_sunmmio_codegen_with_npuir_opt(
         softmax_dynamic(),
         tmp_path,
@@ -106,9 +109,26 @@ def test_simple_global_copy_gemm_codegen_validates_with_npuir_opt(tmp_path):
             "suvm.tile.reduce",
             "suvm.mcast_tok",
         ),
-        opt_args=LOOSE_OPT_ARGS,
     )
-    assert_source_contains(src, ("suvm.tile.reduce", "suvm.tile.exp", "suvm.tile.ln", "suvm.mcast_tok"))
+    assert_source_contains(
+        src,
+        ("suvm.tile.reduce", "suvm.tile.exp", "suvm.tile.ln", "suvm.mcast_tok"),
+    )
+    coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
+    main = coverage["main"]
+    tiles = coverage["tiles"]
+    assert main["missing_node_types"] == []
+    assert main["missing_call_ops"] == []
+    assert tiles["missing_node_types"] == []
+    assert tiles["missing_call_ops"] == []
+
+    assert "tir.For" in main["expected_node_types"]
+    assert "tir.For" in main["visited_node_types"]
+    assert "tir.For" in tiles["expected_node_types"]
+    assert "tir.For" in tiles["visited_node_types"]
+    assert "tl.vector_core_in_tile_reduce" not in main["expected_call_ops"]
+    assert "tl.vector_core_in_tile_reduce" in tiles["expected_call_ops"]
+    assert "tl.vector_core_in_tile_reduce" in tiles["visited_call_ops"]
 
 
 if __name__ == "__main__":

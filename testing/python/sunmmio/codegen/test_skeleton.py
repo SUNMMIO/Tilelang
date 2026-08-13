@@ -92,6 +92,34 @@ def make_alloc_scope_kernel():
 
 
 @target("Sunmmio")
+def make_helper_consumed_expr_root_kernel():
+    data = tvm.tir.Var(
+        "local_data",
+        tvm.ir.PointerType(tvm.ir.PrimType("int32"), "local.var"),
+    )
+    buffer = tvm.tir.decl_buffer((1,), "int32", name="Local", data=data, scope="local.var")
+
+    # EmitLocalVarLoad consumes and simplifies this root expression directly,
+    # without dispatching it through EvalExpr.
+    helper_consumed_index = tvm.tir.Mul(tvm.tir.IntImm("int32", 1), tvm.tir.IntImm("int32", 0))
+    body = tvm.tir.Evaluate(tvm.tir.BufferLoad(buffer, [helper_consumed_index]))
+    stmt = tvm.tir.Allocate(
+        data,
+        "int32",
+        [tvm.tir.IntImm("int32", 1)],
+        tvm.tir.IntImm("bool", 1),
+        body,
+    )
+    stmt = tvm.tir.DeclBuffer(buffer, stmt)
+    return _primfunc_from_stmt(stmt)
+
+
+@target("Sunmmio")
+def make_ret_evaluate_kernel():
+    return _primfunc_from_stmt(tvm.tir.Evaluate(tvm.tir.ret(0)))
+
+
+@target("Sunmmio")
 def make_allocate_without_decl_buffer_kernel():
     bf16 = tvm.ir.PrimType("bfloat16")
     one = tvm.tir.IntImm("bool", 1)
@@ -102,14 +130,14 @@ def make_allocate_without_decl_buffer_kernel():
 
 
 @target("Sunmmio")
-def make_invalid_dma_source_kernel():
+def make_invalid_dma_shape_kernel():
     bf16 = tvm.ir.PrimType("bfloat16")
-    src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(bf16, "shared.asram"))
+    src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(bf16, "shared.rsram"))
     dst_data = tvm.tir.Var("dst_data", tvm.ir.PointerType(bf16, "shared.rsram"))
-    src_buf = tvm.tir.decl_buffer((32, 32), "bfloat16", name="Src", data=src_data, scope="shared.asram")
-    dst_buf = tvm.tir.decl_buffer((32, 32), "bfloat16", name="Dst", data=dst_data, scope="shared.rsram")
+    src_buf = tvm.tir.decl_buffer((32, 32), "bfloat16", name="Src", data=src_data, scope="shared.rsram")
+    dst_buf = tvm.tir.decl_buffer((16, 32), "bfloat16", name="Dst", data=dst_data, scope="shared.rsram")
 
-    def region(buf, access):
+    def region(buf, access, m, n):
         return tvm.tir.call_intrin(
             "handle",
             tvm.ir.Op.get("tl.tileop.region"),
@@ -118,8 +146,8 @@ def make_invalid_dma_source_kernel():
                 [tvm.tir.IntImm("int32", 0), tvm.tir.IntImm("int32", 0)],
             ),
             tvm.tir.IntImm("int32", access),
-            tvm.tir.IntImm("int32", 32),
-            tvm.tir.IntImm("int32", 32),
+            tvm.tir.IntImm("int32", m),
+            tvm.tir.IntImm("int32", n),
         )
 
     sync_token = tvm.tir.call_intrin(
@@ -130,7 +158,7 @@ def make_invalid_dma_source_kernel():
     dma = tvm.tir.Call(
         "handle",
         tvm.ir.Op.get("tl.dma_copy"),
-        [region(src_buf, 1), region(dst_buf, 2), tvm.tir.IntImm("int32", 0), sync_token],
+        [region(src_buf, 1, 32, 32), region(dst_buf, 2, 16, 32), tvm.tir.IntImm("int32", 0), sync_token],
     )
     stmt = tvm.tir.DeclBuffer(src_buf, tvm.tir.DeclBuffer(dst_buf, tvm.tir.Evaluate(dma)))
     return _to_device_kernel_func(tvm.tir.PrimFunc([src_data, dst_data], stmt))
@@ -370,10 +398,12 @@ def _assert_coverage_report_complete(report_path):
         "visited_call_ops",
         "missing_call_ops",
     ]
-    for key in required_keys:
-        assert key in report, f"missing coverage key: {key}"
-    assert report["missing_node_types"] == []
-    assert report["missing_call_ops"] == []
+    for domain in ("main", "tiles"):
+        assert domain in report, f"missing coverage domain: {domain}"
+        for key in required_keys:
+            assert key in report[domain], f"missing {domain} coverage key: {key}"
+        assert report[domain]["missing_node_types"] == []
+        assert report[domain]["missing_call_ops"] == []
 
 
 def test_sunmmio_codegen_without_compile_emits_nonempty_suvm_source():
@@ -440,7 +470,7 @@ def test_sunmmio_codegen_lowers_layout_transform():
 
 def test_sunmmio_codegen_module_verification_failure_fails_loudly():
     target = determine_target("Sunmmio", return_object=True)
-    mod = tvm.IRModule({"main": make_invalid_dma_source_kernel()})
+    mod = tvm.IRModule({"main": make_invalid_dma_shape_kernel()})
     builder = tvm.ffi.get_global_func("target.build.tilelang_sunmmio_without_compile")
     with pytest.raises(Exception, match="SunMMIO MLIR module verification failed"):
         builder(mod, target, "suvm")
@@ -618,6 +648,41 @@ def test_sunmmio_codegen_coverage_report_has_no_missing_entries(tmp_path, kernel
             os.environ["TL_SUNMMIO_CODEGEN_COVERAGE_STRICT"] = old_strict
 
     _assert_coverage_report_complete(report_path)
+
+
+def test_sunmmio_codegen_coverage_tracks_helper_consumed_expr_root(tmp_path, monkeypatch):
+    report_path = tmp_path / "codegen_coverage_helper_consumed_expr.json"
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_PATH", str(report_path))
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT", "1")
+
+    build_sunmmio_source_without_compile(make_helper_consumed_expr_root_kernel())
+
+    _assert_coverage_report_complete(report_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    main = report["main"]
+    assert "tir.Mul" in main["expected_node_types"]
+    assert "tir.Mul" in main["visited_node_types"]
+
+
+def test_sunmmio_codegen_coverage_tracks_ret_call_node(tmp_path, monkeypatch):
+    report_path = tmp_path / "codegen_coverage_ret.json"
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_PATH", str(report_path))
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT", "1")
+
+    build_sunmmio_source_without_compile(make_ret_evaluate_kernel())
+
+    _assert_coverage_report_complete(report_path)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    main = report["main"]
+    tiles = report["tiles"]
+    assert "tir.Call" in main["expected_node_types"]
+    assert "tir.Call" in main["visited_node_types"]
+    assert "tir.ret" in main["expected_call_ops"]
+    assert "tir.ret" in main["visited_call_ops"]
+    assert tiles["expected_node_types"] == []
+    assert tiles["visited_node_types"] == []
+    assert tiles["expected_call_ops"] == []
+    assert tiles["visited_call_ops"] == []
 
 
 if __name__ == "__main__":

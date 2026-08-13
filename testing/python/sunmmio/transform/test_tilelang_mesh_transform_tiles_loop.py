@@ -1004,11 +1004,13 @@ def test_lower_tiles_loop_region_offset_rejects_misaligned_offset():
         apply_tiles_lowering(mod)
 
 
-def test_lower_tiles_loop_conflicting_binding_rejected():
+def test_lower_tiles_loop_conflicting_binding_falls_back_to_scalar():
     mod = IRModule.from_expr(conflicting_binding_tiled_parallel_2d().with_attr("global_symbol", "main"))
 
-    with pytest.raises(Exception, match="do not share a common axis binding and tile shape"):
-        apply_tiles_lowering(mod)
+    mod = apply_tiles_lowering(mod)
+    script = mod["main"].script()
+    assert "tile.domain" not in script
+    assert "tile.scope_entry" not in script
 
 
 def test_lower_tiles_loop_nested_scopes_rejected():

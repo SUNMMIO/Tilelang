@@ -98,12 +98,21 @@ def _wait_token(token_id):
     )
 
 
-def _broadcast(src_buf, dst_buf, *, direction=0, mask=None, src_core=None, token_id=None):
+def _broadcast(
+    src_buf,
+    dst_buf,
+    *,
+    direction=0,
+    mask=None,
+    src_core=None,
+    token_id=None,
+    extents=(32, 32),
+):
     if mask is None:
         mask = tvm.tir.IntImm("int64", 15)
     args = [
-        _region(src_buf, 1),
-        _region(dst_buf, 2),
+        _region(src_buf, 1, extents=extents),
+        _region(dst_buf, 2, extents=extents),
         tvm.tir.IntImm("int32", direction),
         mask,
         tvm.tir.IntImm("int32", 0),
@@ -196,6 +205,19 @@ def test_broadcast_missing_sync_token_fails_loudly():
     stmt = _with_decl_buffers(body, [src_buf, dst_buf])
 
     with pytest.raises(Exception, match="tl.broadcast_.*sync_token_id"):
+        _build_sunmmio_source_from_stmt(stmt, params=[src_data, dst_data])
+
+
+def test_broadcast_a4e_alignment_fails_during_codegen():
+    shape = (16, 16)
+    src_data, dst_data, src_buf, dst_buf = _shared_buffers(shape=shape)
+    body = tvm.tir.Evaluate(_broadcast(src_buf, dst_buf, token_id=9, extents=shape))
+    stmt = _with_decl_buffers(body, [src_buf, dst_buf])
+
+    with pytest.raises(
+        Exception,
+        match="tl.broadcast_ violates A4E multicast data-path constraints",
+    ):
         _build_sunmmio_source_from_stmt(stmt, params=[src_data, dst_data])
 
 

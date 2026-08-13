@@ -22,7 +22,7 @@ def alloc_var_scalar_state_kernel(
     N=32,
     dtype=T.float32,
 ):
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, N))
 
     @T.prim_func
@@ -51,7 +51,7 @@ def alloc_var_all_control_flow_kernel(
     N=32,
     dtype=T.float32,
 ):
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, N))
 
     @T.prim_func
@@ -92,7 +92,7 @@ def alloc_var_copy_mma_control_flow_kernel(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
@@ -148,7 +148,7 @@ def alloc_var_tiles_kernel(
     block_N=32,
     dtype=T.float32,
 ):
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, N))
     B_layout = make_zz_layout((M, N))
 

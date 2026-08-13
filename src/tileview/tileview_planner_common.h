@@ -59,7 +59,8 @@ struct TrailingTilePattern {
  * \brief Controls whether TileView planning enforces RSRAM width alignment.
  *
  * Relaxed mode is used only after strict plan search fails; it permits
- * eligible rank-1 side loads to be repaired later by aligned load plus slice.
+ * eligible logical rank-1 loads and injective stores to be repaired later by
+ * an aligned carrier plus extract/insert slice.
  */
 enum class AlignmentMode {
   kStrict,

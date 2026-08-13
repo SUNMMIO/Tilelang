@@ -6,6 +6,7 @@
 #ifndef TVM_TL_TILEVIEW_TILEVIEW_PLANNER_H_
 #define TVM_TL_TILEVIEW_TILEVIEW_PLANNER_H_
 
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -33,6 +34,7 @@ struct BufferAccessRecord {
 struct TileViewPlan {
   TileView execution_tileview;
   std::vector<int> execution_domain_axes;
+  bool requires_aligned_1d_bridge{false};
 };
 
 std::vector<BufferAccessRecord> CollectBufferAccesses(const Stmt &stmt);
@@ -42,9 +44,10 @@ std::vector<BufferAccessRecord> CollectBufferAccesses(const Stmt &stmt);
  *
  * The planner derives feasible TileView candidates from each buffer access,
  * intersects those candidates across the scope, and returns the selected
- * execution TileView for legalization and lowering.
+ * execution TileView for legalization and lowering. Returns std::nullopt when
+ * the scope must fall back to scalar serial loops.
  */
-TileViewPlan PlanTileViewsForTilesScope(
+std::optional<TileViewPlan> TryPlanTileViewsForTilesScope(
     const Array<PrimExpr> &domain,
     const std::vector<const ForNode *> &scope_loops,
     const std::vector<BufferAccessRecord> &accesses,

@@ -235,10 +235,10 @@ public:
 
   void VisitStmt_(const EvaluateNode *op) {
     const CallNode *call = op->value.as<CallNode>();
-    if (call->op.same_as(dma_copy())) {
-      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
-      write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
-    } else if (call->op.same_as(sunmmio_layout_transform())) {
+    if (call->op.same_as(dma_copy()) ||
+        call->op.same_as(sunmmio_layout_transform()) ||
+        call->op.same_as(sunmmio_transpose()) ||
+        call->op.same_as(Op::Get("tl.broadcast_"))) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
     } else if (call->op.same_as(mma_sunmmio())) {
@@ -247,9 +247,6 @@ public:
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
 
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
-    } else if (call->op.same_as(Op::Get("tl.broadcast_"))) {
-      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
-      write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
     } else {
       auto [read_regions, write_regions] = buffer_region_collector(op->value);
       for (auto it : read_regions) {

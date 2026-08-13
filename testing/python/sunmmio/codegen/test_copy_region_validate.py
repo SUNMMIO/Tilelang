@@ -5,7 +5,6 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.language.mesh_tensor import MeshReplicationType
 from tilelang.layout import make_row_major, make_zz_layout
 
 from testing.python.sunmmio.common.codegen_validation import (
@@ -31,7 +30,7 @@ _SUMMA_COPY_SHAPES = (
 @target("Sunmmio")
 def zz_major_sub_block_copy_kernel():
     shape = (128, 128)
-    placement = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     global_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
 
     @T.prim_func
@@ -49,7 +48,7 @@ def zz_major_sub_block_copy_kernel():
 @target("Sunmmio")
 def zz_non_major_sub_block_copy_kernel():
     shape = (128, 128)
-    placement = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     global_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
 
     @T.prim_func
@@ -67,7 +66,7 @@ def zz_non_major_sub_block_copy_kernel():
 @target("Sunmmio")
 def zz_both_dims_sub_block_copy_kernel():
     shape = (128, 128)
-    placement = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     global_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
 
     @T.prim_func
@@ -85,7 +84,7 @@ def zz_both_dims_sub_block_copy_kernel():
 @target("Sunmmio")
 def zz_major_sub_block_multi_block_copy_kernel():
     shape = (128, 128)
-    placement = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     global_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
 
     @T.prim_func
@@ -104,7 +103,7 @@ def zz_major_sub_block_multi_block_copy_kernel():
 def zz_fully_coalesced_full_block_copy_kernel():
     shape = (64, 32)
     region_shape = (32, 32)
-    placement = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     global_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
     shared_layout = make_row_major(region_shape)
 
@@ -124,7 +123,7 @@ def zz_fully_coalesced_full_block_copy_kernel():
 @target("Sunmmio")
 def zz_fully_coalesced_non_major_sub_block_copy_kernel():
     shape = (64, 32)
-    placement = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     global_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
 
     @T.prim_func
@@ -135,6 +134,24 @@ def zz_fully_coalesced_non_major_sub_block_copy_kernel():
             B_shared = T.alloc_shared(shape, DTYPE, scope="shared.rsram")
             T.annotate_layout({B_shared: global_layout})
             T.copy(B[0:32, 0:8], B_shared[0:32, 0:8])
+
+    return main
+
+
+@target("Sunmmio")
+def let_bound_mesh_local_shape_copy_kernel():
+    global_shape = (256, 256)
+    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    tensor_layout = make_zz_layout(global_shape, axes=[0, 1], block_shape=(32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(global_shape, shard_policy, DTYPE, layout=tensor_layout),  # type: ignore
+    ):
+        with T.Kernel():
+            local_m, local_n = A.local_shape
+            A_shared = T.alloc_shared((local_m, local_n), DTYPE)
+            T.copy(A, A_shared)
 
     return main
 
@@ -172,7 +189,7 @@ def summa_output_copy_kernel(
     dtype="float16",
     accum_dtype="float32",
 ):
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     A_shape = (M, K)
     B_shape = (K, N)
     C_shape = (M, N)
@@ -253,6 +270,19 @@ def test_zz_fully_coalesced_non_major_sub_block_copy_lowers_in_compact_mode():
     lowered = lower_sunmmio_kernel_to_device_tir(zz_fully_coalesced_non_major_sub_block_copy_kernel())
 
     assert lowered.get_global_vars()
+
+
+def test_let_bound_mesh_local_shape_copy_codegen_passes(tmp_path):
+    src = _validate_copy_codegen(
+        let_bound_mesh_local_shape_copy_kernel(),
+        tmp_path,
+        "let_bound_mesh_local_shape_copy.mlir",
+        "64x64",
+    )
+
+    assert "sunmmio.fake" not in src
+    assert src.count("suvm.copy_async") == 1
+    assert src.count("suvm.get_partitioned_tile_view") == 2
 
 
 def test_singleton_dimension_broadcast_codegen_passes(tmp_path):

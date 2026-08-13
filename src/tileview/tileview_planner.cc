@@ -43,6 +43,7 @@ struct AccessTileCandidate {
 struct AccessInfo {
   Buffer buffer;
   Array<PrimExpr> indices;
+  std::unordered_set<int> used_domain_axes;
   std::vector<AccessTileCandidate> strict_candidates;
   std::vector<AccessTileCandidate> relaxed_candidates;
 };
@@ -82,20 +83,22 @@ private:
   std::vector<BufferAccessRecord> accesses_;
 };
 
-IndexBinding
+std::optional<IndexBinding>
 AnalyzeIndexBinding(const PrimExpr &index, const Array<Var> &loop_vars,
+                    const std::vector<int> &loop_var_domain_axes,
                     const std::unordered_set<const VarNode *> &loop_var_nodes,
                     arith::Analyzer *analyzer) {
+  ICHECK_EQ(loop_vars.size(), loop_var_domain_axes.size());
   if (!UsesVar(index, [&loop_var_nodes](const VarNode *node) {
         return loop_var_nodes.count(node) != 0;
       })) {
-    return {false, -1, analyzer->Simplify(index)};
+    return IndexBinding{false, -1, analyzer->Simplify(index)};
   }
 
   Array<PrimExpr> coeffs = arith::DetectLinearEquation(index, loop_vars);
-  ICHECK(!coeffs.empty())
-      << "T.Tiles access index must be affine in the tile loop vars, but got "
-      << index << ".";
+  if (coeffs.empty()) {
+    return std::nullopt;
+  }
 
   int matched_axis = -1;
   PrimExpr base = analyzer->Simplify(coeffs[coeffs.size() - 1]);
@@ -106,20 +109,16 @@ AnalyzeIndexBinding(const PrimExpr &index, const Array<Var> &loop_vars,
     if (analyzer->CanProve(coeff == zero)) {
       continue;
     }
-    ICHECK(analyzer->CanProve(coeff == one))
-        << "T.Tiles access index must use a tile loop var with unit "
-           "coefficient, but got coefficient "
-        << coeff << " in " << index << ".";
-    ICHECK_EQ(matched_axis, -1)
-        << "T.Tiles access index may depend on at most one tile loop var, but "
-        << "got " << index << ".";
-    matched_axis = i;
+    if (!analyzer->CanProve(coeff == one) || matched_axis != -1) {
+      return std::nullopt;
+    }
+    matched_axis = loop_var_domain_axes[i];
   }
 
-  ICHECK_GE(matched_axis, 0)
-      << "T.Tiles access index uses tile loop vars, but no matching axis was "
-      << "found for " << index << ".";
-  return {true, matched_axis, base};
+  if (matched_axis < 0) {
+    return std::nullopt;
+  }
+  return IndexBinding{true, matched_axis, base};
 }
 
 std::unordered_set<int>
@@ -297,16 +296,202 @@ std::vector<AccessTileCandidate> EnumerateAccessTileCandidates(
                                      alignment_mode);
 }
 
-bool IsEligibleRank1LoadForRelaxedAlignmentSearch(
+bool IsEligibleForAligned1DBridgeSearch(
     const BufferAccessRecord &access, const std::vector<IndexBinding> &bindings,
     int exec_rank) {
-  if (access.is_store || exec_rank != 2 || access.buffer->shape.size() != 1 ||
-      access.indices.size() != 1 || bindings.size() != 1) {
+  if (access.indices.size() != bindings.size()) {
     return false;
   }
 
-  const IndexBinding &binding = bindings[0];
-  return binding.uses_loop_var && binding.domain_axis >= 0;
+  int active_dims = 0;
+  for (const IndexBinding &binding : bindings) {
+    if (binding.uses_loop_var) {
+      ++active_dims;
+    }
+  }
+
+  // A rank-1 execution store with one unit-stride binding is injective in its
+  // only active tile axis.  Stores in a higher-rank execution need additional
+  // dependence analysis before carrier read-modify-write can be made safe.
+  if (access.is_store && exec_rank != 1) {
+    return false;
+  }
+  return active_dims == 1;
+}
+
+bool RequiresAligned1DBridgeCandidate(
+    const AccessTileCandidate &candidate, const Buffer &buffer,
+    const SunmmioTileProcessorConfig &config) {
+  if (candidate.tile_shape.size() != 1 ||
+      buffer.scope() != kSunmmioScopeRSRAM) {
+    return false;
+  }
+
+  int tile_extent = candidate.tile_shape[0];
+  int align_elems =
+      GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, buffer->dtype);
+  return tile_extent > 0 && tile_extent < align_elems &&
+         align_elems % tile_extent == 0;
+}
+
+bool SupportsAligned1DBridgeDType(DataType dtype) {
+  return dtype.bits() >= 8 && !sunmmio::IsMXDType(dtype);
+}
+
+bool SupportsAligned1DBridgeCandidate(
+    const AccessTileCandidate &candidate, const Buffer &buffer,
+    const Map<Buffer, Layout> &layout_map,
+    const SunmmioTileProcessorConfig &config) {
+  if (candidate.tile_shape.size() != 1 ||
+      buffer.scope() != kSunmmioScopeRSRAM) {
+    return true;
+  }
+
+  int tile_extent = candidate.tile_shape[0];
+  int align_elems =
+      GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, buffer->dtype);
+  if (tile_extent > 0 && tile_extent % align_elems == 0) {
+    return true;
+  }
+  if (tile_extent <= 0 || tile_extent >= align_elems ||
+      align_elems % tile_extent != 0) {
+    return false;
+  }
+  if (!SupportsAligned1DBridgeDType(buffer->dtype)) {
+    return false;
+  }
+
+  auto layout_it = layout_map.find(buffer);
+  if (layout_it == layout_map.end()) {
+    return true;
+  }
+  const auto *cute = (*layout_it).second.as<CuteLayoutNode>();
+  if (cute == nullptr) {
+    return false;
+  }
+
+  Array<Integer> dim_levels = cute->GetDimLevels();
+  bool is_flat_layout =
+      std::all_of(dim_levels.begin(), dim_levels.end(),
+                  [](const Integer &levels) { return levels.IntValue() == 1; });
+  if (is_flat_layout) {
+    return true;
+  }
+
+  int buffer_rank = static_cast<int>(buffer->shape.size());
+  Array<PrimExpr> index_map = candidate.tileview->IndexMap();
+  if (index_map.size() != 1) {
+    return false;
+  }
+  int tiled_dim = NormalizeMappedDim(index_map[0], buffer_rank);
+
+  for (int dim = 0; dim < buffer_rank; ++dim) {
+    Array<PrimExpr> mode_shapes = cute->GetModeShapeOfDim(dim);
+    Array<PrimExpr> mode_strides = cute->GetModeStrideOfDim(dim);
+    if (mode_shapes.empty() || mode_shapes.size() != mode_strides.size()) {
+      return false;
+    }
+    for (int mode = 0; mode < static_cast<int>(mode_shapes.size()); ++mode) {
+      int64_t stride = GetStaticIntValue(mode_strides[mode]);
+      if (stride <= 0) {
+        return false;
+      }
+      if (dim == tiled_dim && mode == 0) {
+        int64_t inner_extent = GetStaticIntValue(mode_shapes[mode]);
+        if (stride != 1 || inner_extent <= 0 ||
+            inner_extent % align_elems != 0) {
+          return false;
+        }
+      } else if (stride % align_elems != 0) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+std::optional<std::vector<AccessInfo>> AnalyzeAccessesForExecutionAxes(
+    const std::vector<BufferAccessRecord> &accesses,
+    const Array<Var> &execution_loop_vars,
+    const std::vector<int> &execution_domain_axes, int exec_rank,
+    const TileViewMap &manual_tileviews, const Map<Buffer, Layout> &layout_map,
+    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
+    bool rank_reduction_search,
+    std::unordered_set<const BufferNode *> *warned_unsupported_bridge_buffers) {
+  ICHECK_EQ(execution_loop_vars.size(), execution_domain_axes.size());
+  ICHECK(warned_unsupported_bridge_buffers != nullptr);
+
+  std::unordered_set<const VarNode *> execution_loop_var_nodes;
+  for (const Var &loop_var : execution_loop_vars) {
+    execution_loop_var_nodes.insert(loop_var.get());
+  }
+
+  std::vector<AccessInfo> analyzed_accesses;
+  analyzed_accesses.reserve(accesses.size());
+  for (const auto &access : accesses) {
+    auto manual_it = manual_tileviews.find(access.buffer->data);
+    // An explicit higher-rank TileView must not be silently replaced by a
+    // lower-rank inferred plan.
+    if (rank_reduction_search && manual_it != manual_tileviews.end() &&
+        manual_it->second->TileDim() != 1) {
+      return std::nullopt;
+    }
+
+    std::vector<IndexBinding> bindings;
+    std::unordered_set<int> used_domain_axes;
+    bindings.reserve(access.indices.size());
+    for (const PrimExpr &index : access.indices) {
+      auto binding =
+          AnalyzeIndexBinding(index, execution_loop_vars, execution_domain_axes,
+                              execution_loop_var_nodes, analyzer);
+      if (!binding.has_value()) {
+        return std::nullopt;
+      }
+      bindings.push_back(binding.value());
+      if (binding->uses_loop_var) {
+        used_domain_axes.insert(binding->domain_axis);
+      }
+    }
+
+    std::vector<AccessTileCandidate> candidates = EnumerateAccessTileCandidates(
+        access, bindings, exec_rank, manual_tileviews, layout_map, config,
+        analyzer);
+    std::vector<AccessTileCandidate> relaxed_candidates = candidates;
+    if (IsEligibleForAligned1DBridgeSearch(access, bindings, exec_rank)) {
+      relaxed_candidates = EnumerateAccessTileCandidates(
+          access, bindings, exec_rank, manual_tileviews, layout_map, config,
+          analyzer, AlignmentMode::kRelaxed);
+      bool has_unsupported_bridge =
+          !SupportsAligned1DBridgeDType(access.buffer->dtype) &&
+          std::any_of(relaxed_candidates.begin(), relaxed_candidates.end(),
+                      [&](const AccessTileCandidate &candidate) {
+                        return RequiresAligned1DBridgeCandidate(
+                            candidate, access.buffer, config);
+                      });
+      if (has_unsupported_bridge &&
+          warned_unsupported_bridge_buffers->insert(access.buffer.get())
+              .second) {
+        LOG(WARNING)
+            << "Skipping aligned 1D bridge candidates for buffer "
+            << access.buffer->name << " with dtype " << access.buffer->dtype
+            << ". Sub-byte and MX dtypes are currently supported only by "
+               "their blockwise paths; T.Tiles will try a strict plan or "
+               "scalar fallback.";
+      }
+      relaxed_candidates.erase(
+          std::remove_if(relaxed_candidates.begin(), relaxed_candidates.end(),
+                         [&](const AccessTileCandidate &candidate) {
+                           return !SupportsAligned1DBridgeCandidate(
+                               candidate, access.buffer, layout_map, config);
+                         }),
+          relaxed_candidates.end());
+    }
+
+    analyzed_accesses.push_back(
+        {access.buffer, access.indices, std::move(used_domain_axes),
+         std::move(candidates), std::move(relaxed_candidates)});
+  }
+  return analyzed_accesses;
 }
 
 const std::vector<AccessTileCandidate> &
@@ -325,15 +510,17 @@ bool UsesExecutionAxisInNonTiledDims(const AccessTileCandidate &candidate,
   return false;
 }
 
-bool Supports1DPlan(const AccessTileCandidate &candidate) {
+bool Supports1DPlan(const AccessTileCandidate &candidate, int domain_axis) {
   return candidate.tiled_domain_axes.size() == 1 &&
          candidate.tile_shape.size() == 1 &&
-         candidate.tiled_domain_axes[0] == 0 &&
-         !UsesExecutionAxisInNonTiledDims(candidate, {0});
+         candidate.tiled_domain_axes[0] == domain_axis &&
+         !UsesExecutionAxisInNonTiledDims(candidate, {domain_axis});
 }
 
-bool Supports1DPlan(const AccessTileCandidate &candidate, int tile_extent) {
-  return Supports1DPlan(candidate) && candidate.tile_shape[0] == tile_extent;
+bool Supports1DPlan(const AccessTileCandidate &candidate, int domain_axis,
+                    int tile_extent) {
+  return Supports1DPlan(candidate, domain_axis) &&
+         candidate.tile_shape[0] == tile_extent;
 }
 
 bool Supports2DPlan(const AccessTileCandidate &candidate,
@@ -388,8 +575,12 @@ std::optional<TileViewPlan>
 TrySelectPlan(const Array<PrimExpr> &domain,
               const std::vector<AccessInfo> &accesses, int domain_rank,
               int exec_rank, arith::Analyzer *analyzer, AlignmentMode mode,
-              bool fail_on_error) {
+              bool fail_on_error, int rank1_domain_axis = 0) {
   for (const auto &access : accesses) {
+    if (exec_rank == 1 &&
+        access.used_domain_axes.count(rank1_domain_axis) == 0) {
+      continue;
+    }
     if (CandidatesForSearch(access, mode).empty()) {
       if (fail_on_error) {
         LOG(FATAL)
@@ -404,8 +595,11 @@ TrySelectPlan(const Array<PrimExpr> &domain,
   if (exec_rank == 1) {
     std::vector<int> plan_extents;
     for (const auto &access : accesses) {
+      if (access.used_domain_axes.count(rank1_domain_axis) == 0) {
+        continue;
+      }
       for (const auto &candidate : CandidatesForSearch(access, mode)) {
-        if (Supports1DPlan(candidate)) {
+        if (Supports1DPlan(candidate, rank1_domain_axis)) {
           plan_extents.push_back(candidate.tile_shape[0]);
         }
       }
@@ -428,12 +622,15 @@ TrySelectPlan(const Array<PrimExpr> &domain,
     for (int tile_extent : plan_extents) {
       bool all_supported = true;
       for (const auto &access : accesses) {
+        if (access.used_domain_axes.count(rank1_domain_axis) == 0) {
+          continue;
+        }
         const auto &candidates = CandidatesForSearch(access, mode);
-        bool access_supported =
-            std::any_of(candidates.begin(), candidates.end(),
-                        [&](const AccessTileCandidate &candidate) {
-                          return Supports1DPlan(candidate, tile_extent);
-                        });
+        bool access_supported = std::any_of(
+            candidates.begin(), candidates.end(),
+            [&](const AccessTileCandidate &candidate) {
+              return Supports1DPlan(candidate, rank1_domain_axis, tile_extent);
+            });
         if (!access_supported) {
           all_supported = false;
           break;
@@ -442,7 +639,10 @@ TrySelectPlan(const Array<PrimExpr> &domain,
 
       if (all_supported) {
         return TileViewPlan{
-            makeTileView(domain, {Integer(tile_extent)}, {Integer(-1)}), {0}};
+            makeTileView(domain, {Integer(tile_extent)},
+                         {Integer(rank1_domain_axis - domain_rank)}),
+            {rank1_domain_axis},
+            mode == AlignmentMode::kRelaxed};
       }
     }
 
@@ -547,7 +747,7 @@ TrySelectPlan(const Array<PrimExpr> &domain,
           makeTileView(domain, {Integer(tile_height), Integer(tile_width)},
                        {Integer(exec_domain_axes[0] - domain_rank),
                         Integer(exec_domain_axes[1] - domain_rank)}),
-          exec_domain_axes};
+          exec_domain_axes, mode == AlignmentMode::kRelaxed};
     }
   }
 
@@ -565,7 +765,7 @@ std::vector<BufferAccessRecord> CollectBufferAccesses(const Stmt &stmt) {
   return BufferAccessCollector::Collect(stmt);
 }
 
-TileViewPlan PlanTileViewsForTilesScope(
+std::optional<TileViewPlan> TryPlanTileViewsForTilesScope(
     const Array<PrimExpr> &domain,
     const std::vector<const ForNode *> &scope_loops,
     const std::vector<BufferAccessRecord> &accesses,
@@ -580,55 +780,59 @@ TileViewPlan PlanTileViewsForTilesScope(
   int exec_rank = domain_rank == 1 ? 1 : 2;
 
   arith::Analyzer analyzer;
+  std::unordered_set<const BufferNode *> warned_unsupported_bridge_buffers;
 
   Array<Var> loop_vars;
-  std::unordered_set<const VarNode *> loop_var_nodes;
+  std::vector<int> all_domain_axes;
   for (const ForNode *loop : scope_loops) {
     loop_vars.push_back(loop->loop_var);
-    loop_var_nodes.insert(loop->loop_var.get());
+    all_domain_axes.push_back(static_cast<int>(all_domain_axes.size()));
   }
 
-  std::vector<AccessInfo> analyzed_accesses;
-  analyzed_accesses.reserve(accesses.size());
-  for (const auto &access : accesses) {
-    std::vector<IndexBinding> bindings;
-    bindings.reserve(access.indices.size());
-    for (const PrimExpr &index : access.indices) {
-      bindings.push_back(
-          AnalyzeIndexBinding(index, loop_vars, loop_var_nodes, &analyzer));
+  auto full_rank_accesses = AnalyzeAccessesForExecutionAxes(
+      accesses, loop_vars, all_domain_axes, exec_rank, manual_tileviews,
+      layout_map, tile_processor_config, &analyzer,
+      /*rank_reduction_search=*/false, &warned_unsupported_bridge_buffers);
+  if (full_rank_accesses.has_value()) {
+    if (auto plan = TrySelectPlan(
+            domain, full_rank_accesses.value(), domain_rank, exec_rank,
+            &analyzer, AlignmentMode::kStrict, /*fail_on_error=*/false)) {
+      return plan;
     }
 
-    std::vector<AccessTileCandidate> candidates = EnumerateAccessTileCandidates(
-        access, bindings, exec_rank, manual_tileviews, layout_map,
-        tile_processor_config, &analyzer);
-    std::vector<AccessTileCandidate> relaxed_candidates = candidates;
-    if (IsEligibleRank1LoadForRelaxedAlignmentSearch(access, bindings,
-                                                     exec_rank)) {
-      relaxed_candidates = EnumerateAccessTileCandidates(
-          access, bindings, exec_rank, manual_tileviews, layout_map,
-          tile_processor_config, &analyzer, AlignmentMode::kRelaxed);
+    if (auto plan = TrySelectPlan(
+            domain, full_rank_accesses.value(), domain_rank, exec_rank,
+            &analyzer, AlignmentMode::kRelaxed, /*fail_on_error=*/false)) {
+      return plan;
     }
-
-    analyzed_accesses.push_back({access.buffer, access.indices,
-                                 std::move(candidates),
-                                 std::move(relaxed_candidates)});
   }
 
-  if (auto plan = TrySelectPlan(domain, analyzed_accesses, domain_rank,
-                                exec_rank, &analyzer, AlignmentMode::kStrict,
-                                /*fail_on_error=*/false)) {
-    return plan.value();
+  if (domain_rank > 1) {
+    for (int domain_axis = domain_rank - 1; domain_axis >= 0; --domain_axis) {
+      Array<Var> rank1_loop_vars{loop_vars[domain_axis]};
+      std::vector<int> rank1_domain_axes{domain_axis};
+      auto rank1_accesses = AnalyzeAccessesForExecutionAxes(
+          accesses, rank1_loop_vars, rank1_domain_axes, /*exec_rank=*/1,
+          manual_tileviews, layout_map, tile_processor_config, &analyzer,
+          /*rank_reduction_search=*/true, &warned_unsupported_bridge_buffers);
+      if (!rank1_accesses.has_value()) {
+        continue;
+      }
+      if (auto plan =
+              TrySelectPlan(domain, rank1_accesses.value(), domain_rank,
+                            /*exec_rank=*/1, &analyzer, AlignmentMode::kStrict,
+                            /*fail_on_error=*/false, domain_axis)) {
+        return plan;
+      }
+      if (auto plan =
+              TrySelectPlan(domain, rank1_accesses.value(), domain_rank,
+                            /*exec_rank=*/1, &analyzer, AlignmentMode::kRelaxed,
+                            /*fail_on_error=*/false, domain_axis)) {
+        return plan;
+      }
+    }
   }
-
-  if (auto plan = TrySelectPlan(domain, analyzed_accesses, domain_rank,
-                                exec_rank, &analyzer, AlignmentMode::kRelaxed,
-                                /*fail_on_error=*/false)) {
-    return plan.value();
-  }
-
-  TrySelectPlan(domain, analyzed_accesses, domain_rank, exec_rank, &analyzer,
-                AlignmentMode::kRelaxed, /*fail_on_error=*/true);
-  return {TileView(), {}};
+  return std::nullopt;
 }
 
 } // namespace tl

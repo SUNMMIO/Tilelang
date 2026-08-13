@@ -3,7 +3,6 @@ import os
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.language.mesh_tensor import MeshReplicationType
 from tilelang.layout import make_row_major, make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import target
@@ -24,7 +23,7 @@ def layout_transform_roundtrip_kernel(
     n=128,
     dtype=T.bfloat16,
 ):
-    shard_policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    shard_policy = T.placement.replicated()
     dram_layout = make_zz_layout((m, n), axes=[0, 1], block_shape=(32, 32))
     rsram_layout = make_row_major((m, n))
 
