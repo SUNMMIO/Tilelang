@@ -150,6 +150,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
           set-safe-directory: true
 
       - name: Checkout public submodules
@@ -183,6 +184,7 @@ jobs:
           path: 3rdparty/NPU-IR
           ssh-key: ${{ secrets.SUNMMIONPUIR }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Report submodule state
         run: |
@@ -383,10 +385,18 @@ jobs:
           echo "=== Cache usage after pruning ==="
           du -sh /ci-cache/* 2>/dev/null || true
 
-      - name: Restore runner workspace ownership
+      - name: Restore runner directory ownership
         if: always()
         run: |
           set -euo pipefail
           RUNNER_UID="$(stat -c '%u' "${RUNNER_TEMP}")"
           RUNNER_GID="$(stat -c '%g' "${RUNNER_TEMP}")"
+          lock_file="${NPUIR_CACHE_ROOT}/llvm-project.lock"
+          exec 9>"${lock_file}"
+          flock 9
+          chown "${RUNNER_UID}:${RUNNER_GID}" /ci-cache "${NPUIR_CACHE_ROOT}" "${lock_file}"
+          if [[ -n "${NPUIR_CACHE_DIR:-}" ]] && [[ -d "${NPUIR_CACHE_DIR}" ]]; then
+            chown -R "${RUNNER_UID}:${RUNNER_GID}" "${NPUIR_CACHE_DIR}"
+          fi
+          flock -u 9
           chown -R "${RUNNER_UID}:${RUNNER_GID}" "${GITHUB_WORKSPACE}"

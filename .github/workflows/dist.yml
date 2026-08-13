@@ -95,14 +95,29 @@ jobs:
     env:
       NPUIR_CACHE_ROOT: /opt/ci-cache/sunmmio/npuir
     steps:
-      - name: Repair workspace ownership
+      - name: Repair runner directory ownership
         shell: bash
         run: |
           set -euo pipefail
+          RUNNER_UID="$(id -u)"
+          RUNNER_GID="$(id -g)"
+          export RUNNER_UID RUNNER_GID
           docker run --rm \
+            --env RUNNER_UID \
+            --env RUNNER_GID \
             --volume "${GITHUB_WORKSPACE}:/workspace" \
+            --volume "/opt/ci-cache/sunmmio:/ci-cache" \
             ubuntu:24.04 \
-            chown -R "$(id -u):$(id -g)" /workspace
+            sh -euc '
+              mkdir -p /ci-cache/npuir /ci-cache/ccache-wheel
+              touch /ci-cache/npuir/llvm-project.lock
+              chown -R "${RUNNER_UID}:${RUNNER_GID}" /workspace
+              chown "${RUNNER_UID}:${RUNNER_GID}" \
+                /ci-cache \
+                /ci-cache/npuir \
+                /ci-cache/npuir/llvm-project.lock \
+                /ci-cache/ccache-wheel
+            '
 
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -158,11 +173,18 @@ jobs:
           NPUIR_LLVM_SOURCE_DIR="${NPUIR_CACHE_DIR}/llvm-project"
           NPUIR_LLVM_BUILD_DIR="${NPUIR_CACHE_DIR}/llvm-project-build"
           NPUIR_LLVM_MARKER_FILE="${NPUIR_CACHE_DIR}/llvm-project.commit"
+          echo "NPUIR_CACHE_DIR=${NPUIR_CACHE_DIR}" >> "${GITHUB_ENV}"
           mkdir -p "${NPUIR_CACHE_ROOT}"
 
           lock_file="${NPUIR_CACHE_ROOT}/llvm-project.lock"
           exec 9>"${lock_file}"
           flock 9
+
+          mkdir -p "${NPUIR_CACHE_DIR}"
+          docker run --rm \
+            --volume "${NPUIR_CACHE_ROOT}:/npuir" \
+            ubuntu:24.04 \
+            chown -R "$(id -u):$(id -g)" "/npuir/${NPUIR_LLVM_COMMIT}"
 
           if [[ -f "${NPUIR_LLVM_MARKER_FILE}" ]] && [[ -f "${NPUIR_LLVM_SOURCE_DIR}/llvm/CMakeLists.txt" ]]; then
             current_rev="$(<"${NPUIR_LLVM_MARKER_FILE}")"
@@ -261,6 +283,23 @@ jobs:
           name: wheels-3.9-linux-x86_64-sunmmio
           path: wheelhouse/*.whl
           if-no-files-found: error
+
+      - name: Restore NPU-IR cache ownership
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${NPUIR_CACHE_DIR:-}" ]] || [[ ! -d "${NPUIR_CACHE_DIR}" ]]; then
+            exit 0
+          fi
+
+          lock_file="${NPUIR_CACHE_ROOT}/llvm-project.lock"
+          exec 9>"${lock_file}"
+          flock 9
+          docker run --rm \
+            --volume "${NPUIR_CACHE_DIR}:/npuir-cache" \
+            ubuntu:24.04 \
+            chown -R "$(id -u):$(id -g)" /npuir-cache
 
   collect-artifacts:
     name: Validate and collect artifacts
