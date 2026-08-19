@@ -4,7 +4,7 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.layout import make_aligned_row_major, make_row_major, make_zz_layout
+from tilelang.layout import make_aligned_row_major, make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import (

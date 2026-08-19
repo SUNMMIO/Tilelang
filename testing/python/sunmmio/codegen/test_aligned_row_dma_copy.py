@@ -433,9 +433,7 @@ def test_aligned_row_matrix_copy_uses_rank2_dma(
 
 @pytest.mark.parametrize("direction", ["load", "store"])
 def test_alignment_mismatch_falls_back_to_existing_layout_transform_path(direction):
-    mod = lower_sunmmio_kernel_to_device_tir(
-        aligned_row_alignment_mismatch_kernel(direction=direction)
-    )
+    mod = lower_sunmmio_kernel_to_device_tir(aligned_row_alignment_mismatch_kernel(direction=direction))
     src = mod.script()
     assert src.count("T.dma_copy") == 1
     assert src.count("T.sunmmio_layout_transform") == 1
