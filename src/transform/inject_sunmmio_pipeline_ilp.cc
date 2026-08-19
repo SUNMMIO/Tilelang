@@ -1542,7 +1542,7 @@ private:
 tvm::transform::Pass InjectSunmmioPipelineILP() {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
-    PrimFunc original = f;
+    const PrimFunc &original = f;
     try {
       PrimFunc candidate = f;
       auto *fptr = candidate.CopyOnWrite();
