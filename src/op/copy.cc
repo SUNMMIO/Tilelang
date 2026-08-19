@@ -832,50 +832,238 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   if (!src_layout.defined() || !dst_layout.defined())
     return dma(src_region, dst_region);
 
-  auto make_covered_full_innermost_row_range =
-      [&](const Buffer &buffer, const Layout &layout,
-          const Array<Range> &ranges) -> Optional<Array<Range>> {
-    if (buffer->shape.empty() || ranges.size() != buffer->shape.size())
-      return Optional<Array<Range>>();
-    const auto *cute = layout.as<CuteLayoutNode>();
-    if (!cute)
-      return Optional<Array<Range>>();
-    Array<PrimExpr> covered_shape = cute->GetCoveredShape();
-    if (covered_shape.size() != buffer->shape.size())
-      return Optional<Array<Range>>();
-    const int innermost = static_cast<int>(ranges.size()) - 1;
-    for (int i = 0; i < innermost; ++i) {
-      if (!analyzer->CanProveEqual(ranges[i]->extent, 1))
-        return Optional<Array<Range>>();
-    }
-    const Range &row = ranges[innermost];
-    if (!analyzer->CanProveEqual(row->min, make_zero(row->min.dtype())) ||
-        !analyzer->CanProveEqual(row->extent, buffer->shape[innermost])) {
-      return Optional<Array<Range>>();
-    }
-    if (analyzer->CanProveEqual(covered_shape[innermost], row->extent))
-      return Optional<Array<Range>>();
-    Array<Range> covered_ranges;
-    for (int i = 0; i < innermost; ++i)
-      covered_ranges.push_back(ranges[i]);
-    covered_ranges.push_back(
-        Range::FromMinExtent(row->min, covered_shape[innermost]));
-    return covered_ranges;
+  constexpr int kDramRowAlignBytes = 1024;
+  const auto &config = GetSunmmioTileProcessorConfig(T.target);
+
+  struct AlignedRowDmaCarrier {
+    bool aligned_1024{false};
+    bool row_major_family{false};
+    bool valid{false};
+    Array<Range> physical_ranges;
+    Array<PrimExpr> covered_shape;
+    Array<PrimExpr> canonical_logical_shape;
+    Array<PrimExpr> canonical_carrier_shape;
+    std::string reason;
   };
 
-  if (IsLayoutMatch(src_layout, dst_layout, analyzer)) {
-    Optional<Array<Range>> covered_src_range =
-        make_covered_full_innermost_row_range(src, src_layout, src_range);
-    Optional<Array<Range>> covered_dst_range =
-        make_covered_full_innermost_row_range(dst, dst_layout, dst_range);
-    if (covered_src_range.defined() && covered_dst_range.defined() &&
-        analyzer->CanProveEqual(covered_src_range.value().back()->extent,
-                                covered_dst_range.value().back()->extent)) {
-      return dma(MakeRegionExpr(src, covered_src_range.value(),
+  auto shape_of_ranges = [](const Array<Range> &ranges) {
+    Array<PrimExpr> shape;
+    for (const Range &range : ranges)
+      shape.push_back(range->extent);
+    return shape;
+  };
+  auto format_shape = [](const Array<PrimExpr> &shape) {
+    std::ostringstream os;
+    os << "(";
+    for (size_t i = 0; i < shape.size(); ++i) {
+      if (i)
+        os << ", ";
+      os << shape[i];
+    }
+    os << ")";
+    return os.str();
+  };
+  auto canonicalize_shape = [&](const Array<PrimExpr> &shape) {
+    Array<PrimExpr> canonical;
+    for (const PrimExpr &extent : shape) {
+      if (!analyzer->CanProveEqual(extent, 1))
+        canonical.push_back(extent);
+    }
+    return canonical;
+  };
+  auto shape_matches = [&](const Array<PrimExpr> &lhs,
+                           const Array<PrimExpr> &rhs) {
+    if (lhs.size() != rhs.size())
+      return false;
+    for (size_t i = 0; i < lhs.size(); ++i) {
+      if (!analyzer->CanProveEqual(lhs[i], rhs[i]))
+        return false;
+    }
+    return true;
+  };
+  auto bit_count_is_aligned = [&](PrimExpr element_count, DataType dtype,
+                                  int align_bytes) {
+    PrimExpr bit_count =
+        element_count *
+        make_const(element_count.dtype(), dtype.bits() * dtype.lanes());
+    PrimExpr align_bits =
+        make_const(bit_count.dtype(), static_cast<int64_t>(align_bytes) * 8);
+    return analyzer->CanProveEqual(indexmod(bit_count, align_bits),
+                                   make_zero(bit_count.dtype()));
+  };
+  auto is_aligned_row_major = [&](const Buffer &buffer, const Layout &layout,
+                                  int align_bytes) {
+    return layout.defined() && layout->InputDim() > 0 &&
+           !sunmmio::IsMXDType(buffer->dtype) &&
+           IsSameLayout(layout,
+                        sunmmio::MakeAlignedRowMajor(
+                            layout->InputShape(), buffer->dtype, align_bytes),
+                        analyzer);
+  };
+  auto is_row_major_family = [&](const Buffer &buffer, const Layout &layout) {
+    if (!layout.defined() || layout->InputDim() < 1 ||
+        sunmmio::IsMXDType(buffer->dtype)) {
+      return false;
+    }
+    if (IsSameLayout(layout, sunmmio::MakeRowMajor(layout->InputShape()),
+                     analyzer) ||
+        is_aligned_row_major(buffer, layout, kDramRowAlignBytes)) {
+      return true;
+    }
+    return config.rsram_align_bytes > 0 &&
+           is_aligned_row_major(buffer, layout, config.rsram_align_bytes);
+  };
+  auto analyze_carrier = [&](const Buffer &buffer, const Layout &layout,
+                             const Array<Range> &ranges) {
+    AlignedRowDmaCarrier carrier;
+    carrier.aligned_1024 =
+        is_aligned_row_major(buffer, layout, kDramRowAlignBytes);
+    carrier.row_major_family = is_row_major_family(buffer, layout);
+    if (!carrier.aligned_1024)
+      return carrier;
+    if (buffer->shape.empty() || ranges.size() != buffer->shape.size() ||
+        layout->InputShape().size() != buffer->shape.size()) {
+      carrier.reason = "buffer, region, and layout ranks must match";
+      return carrier;
+    }
+    for (size_t i = 0; i < buffer->shape.size(); ++i) {
+      if (!analyzer->CanProveEqual(layout->InputShape()[i], buffer->shape[i])) {
+        carrier.reason = "layout input shape does not match the buffer shape";
+        return carrier;
+      }
+    }
+    const auto *cute = layout.as<CuteLayoutNode>();
+    if (!cute) {
+      carrier.reason = "layout is not a CuteLayout";
+      return carrier;
+    }
+    carrier.covered_shape = cute->GetCoveredShape();
+    if (carrier.covered_shape.size() != buffer->shape.size()) {
+      carrier.reason = "covered shape rank does not match the buffer rank";
+      return carrier;
+    }
+
+    const int innermost = static_cast<int>(ranges.size()) - 1;
+    const Range &row = ranges[innermost];
+    if (!analyzer->CanProveEqual(row->min, make_zero(row->min.dtype()))) {
+      carrier.reason = "innermost range must start at zero";
+      return carrier;
+    }
+    if (!analyzer->CanProveEqual(row->extent, buffer->shape[innermost])) {
+      carrier.reason = "innermost range must cover the complete logical row";
+      return carrier;
+    }
+    if (analyzer->CanProve(carrier.covered_shape[innermost] <
+                           buffer->shape[innermost])) {
+      carrier.reason = "covered row is smaller than the logical row";
+      return carrier;
+    }
+    if (!analyzer->CanProve(carrier.covered_shape[innermost] >=
+                            buffer->shape[innermost])) {
+      carrier.reason =
+          "required equality could not be proven for symbolic extents";
+      return carrier;
+    }
+    if (!bit_count_is_aligned(carrier.covered_shape[innermost], buffer->dtype,
+                              kDramRowAlignBytes)) {
+      carrier.reason = "covered row byte size is not a multiple of 1024";
+      return carrier;
+    }
+
+    Array<PrimExpr> logical_shape = shape_of_ranges(ranges);
+    Array<PrimExpr> physical_shape;
+    for (int i = 0; i < innermost; ++i) {
+      carrier.physical_ranges.push_back(ranges[i]);
+      physical_shape.push_back(ranges[i]->extent);
+    }
+    carrier.physical_ranges.push_back(
+        Range::FromMinExtent(row->min, carrier.covered_shape[innermost]));
+    physical_shape.push_back(carrier.covered_shape[innermost]);
+    carrier.canonical_logical_shape = canonicalize_shape(logical_shape);
+    carrier.canonical_carrier_shape = canonicalize_shape(physical_shape);
+    if (carrier.canonical_logical_shape.empty() ||
+        carrier.canonical_carrier_shape.empty()) {
+      carrier.reason = "effective rank must be one or two";
+      return carrier;
+    }
+    if (carrier.canonical_logical_shape.size() > 2 ||
+        carrier.canonical_carrier_shape.size() > 2) {
+      carrier.reason = "effective rank exceeds two";
+      return carrier;
+    }
+    carrier.valid = true;
+    return carrier;
+  };
+  auto logical_dram_segment_is_aligned = [&]() {
+    const Array<Range> &ranges =
+        src.scope() == "global" ? src_range : dst_range;
+    const Buffer &buffer = src.scope() == "global" ? src : dst;
+    if (ranges.empty())
+      return false;
+    const Range &row = ranges.back();
+    return bit_count_is_aligned(row->min, buffer->dtype, kDramRowAlignBytes) &&
+           bit_count_is_aligned(row->extent, buffer->dtype, kDramRowAlignBytes);
+  };
+
+  AlignedRowDmaCarrier src_carrier =
+      analyze_carrier(src, src_layout, src_range);
+  AlignedRowDmaCarrier dst_carrier =
+      analyze_carrier(dst, dst_layout, dst_range);
+  auto reject_carrier = [&](const std::string &reason) -> Stmt {
+    LOG(FATAL) << "Sunmmio aligned-row DMA carrier rejected for "
+               << (src.scope() == "global" ? "DRAM->RSRAM" : "RSRAM->DRAM")
+               << " copy " << src->name << " -> " << dst->name << ":\n"
+               << "  source logical region: "
+               << format_shape(shape_of_ranges(src_range)) << "\n"
+               << "  destination logical region: "
+               << format_shape(shape_of_ranges(dst_range)) << "\n"
+               << "  source canonical logical shape: "
+               << format_shape(src_carrier.canonical_logical_shape) << "\n"
+               << "  destination canonical logical shape: "
+               << format_shape(dst_carrier.canonical_logical_shape) << "\n"
+               << "  source carrier: "
+               << format_shape(src_carrier.canonical_carrier_shape) << "\n"
+               << "  destination carrier: "
+               << format_shape(dst_carrier.canonical_carrier_shape) << "\n"
+               << "  source aligned-row-major(1024): "
+               << src_carrier.aligned_1024 << "\n"
+               << "  destination aligned-row-major(1024): "
+               << dst_carrier.aligned_1024 << "\n"
+               << "  reason: " << reason << "\n"
+               << "  required: matching 1024-byte aligned row-major full-row "
+                  "regions with one or two effective dimensions";
+    return Stmt();
+  };
+
+  if (!logical_dram_segment_is_aligned()) {
+    if (src_carrier.aligned_1024 && dst_carrier.aligned_1024) {
+      if (!src_carrier.valid)
+        return reject_carrier("source " + src_carrier.reason);
+      if (!dst_carrier.valid)
+        return reject_carrier("destination " + dst_carrier.reason);
+      if (src->dtype != dst->dtype)
+        return reject_carrier(
+            "source and destination element dtypes must match");
+      if (!shape_matches(src_carrier.canonical_logical_shape,
+                         dst_carrier.canonical_logical_shape)) {
+        return reject_carrier("canonical logical shapes do not match");
+      }
+      if (!shape_matches(src_carrier.canonical_carrier_shape,
+                         dst_carrier.canonical_carrier_shape)) {
+        return reject_carrier("canonical carrier shapes do not match");
+      }
+      return dma(MakeRegionExpr(src, src_carrier.physical_ranges,
                                 /*access_mask=*/1),
-                 MakeRegionExpr(dst, covered_dst_range.value(),
+                 MakeRegionExpr(dst, dst_carrier.physical_ranges,
                                 /*access_mask=*/2));
     }
+    if (src_carrier.aligned_1024 && dst_carrier.row_major_family)
+      return reject_carrier("destination is not 1024-byte aligned row-major");
+    if (dst_carrier.aligned_1024 && src_carrier.row_major_family)
+      return reject_carrier("source is not 1024-byte aligned row-major");
+  }
+
+  if (IsLayoutMatch(src_layout, dst_layout, analyzer)) {
     return dma(src_region, dst_region);
   }
 
@@ -969,7 +1157,6 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   // both sides are row-major and either has rows that are not rsram_align_bytes
   // aligned, the leading dimension (product of all dims but the last) must fit
   // the tile register height. Limitations for Sunmmio A4E
-  const auto &config = GetSunmmioTileProcessorConfig(T.target);
   bool both_row_major = config.rsram_align_bytes > 0;
   bool any_unaligned = false;
   for (const auto &[layout, dtype] :
