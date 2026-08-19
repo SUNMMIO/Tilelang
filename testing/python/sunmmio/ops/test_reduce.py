@@ -209,18 +209,35 @@ def unaligned_reduce_kernel_builder(shape, reduce_axis, dtype="float16", clear=T
     out_shape = list(shape[:reduce_axis]) + list(shape[reduce_axis + 1 :])
     if not out_shape:
         out_shape = [1]
+    input_boundary_layout = make_aligned_row_major(shape, dtype, 1024) if len(shape) == 1 else None
+    if input_boundary_layout is not None:
+        placement = T.placement.replicated()
+        input_type = T.MeshTensor(shape, placement, dtype, layout=input_boundary_layout)
+        output_type = T.Tensor(out_shape, dtype)
+    else:
+        input_type = T.Tensor(shape, dtype)
+        output_type = T.Tensor(out_shape, dtype)
 
     @T.prim_func
-    def main(A: T.Tensor(shape, dtype), Out: T.Tensor(out_shape, dtype)):
+    def main(A: input_type, Out: output_type):
         with T.Kernel(1, threads=128) as (bx,):
             A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
             Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
 
+            if input_boundary_layout is not None:
+                T.annotate_layout({A_shared: input_boundary_layout})
+
             T.copy(A, A_shared)
             if not clear:
-                T.copy(Out, Out_shared)
+                if input_boundary_layout is not None:
+                    # A rank-1 reduction produces an effective-rank-0 (1,) result,
+                    # which is outside the aligned-row DMA carrier contract.
+                    T.fill(Out_shared, 0)
+                else:
+                    T.copy(Out, Out_shared)
             apply_reduce_op(reduce_op, A_shared, Out_shared, reduce_axis, clear=clear)
-            T.copy(Out_shared, Out)
+            if input_boundary_layout is None:
+                T.copy(Out_shared, Out)
 
     return tvm.IRModule({"main": main})
 

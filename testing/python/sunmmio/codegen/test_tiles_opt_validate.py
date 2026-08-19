@@ -163,7 +163,7 @@ def tiles_broadcast(
     m=512,
     n=1024,
     block_b=2,
-    block_m=256,
+    block_m=512,
     block_n=128,
     dtype="bfloat16",
     accum_dtype="bfloat16",
@@ -172,7 +172,8 @@ def tiles_broadcast(
     tensor_shape = (batch, m, n)
     tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
     vector_shape = (m,)
-    vector_layout = make_row_major(vector_shape)
+    vector_layout = make_aligned_row_major(vector_shape, dtype, align_bytes=1024)
+    vector_shared_layout = make_aligned_row_major((block_m,), dtype, align_bytes=1024)
     grid_b = T.ceildiv(batch, block_b)
     grid_m = T.ceildiv(m, block_m)
     grid_n = T.ceildiv(n, block_n)
@@ -189,6 +190,7 @@ def tiles_broadcast(
             B_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
             C_shared = T.alloc_shared((block_b, block_m, block_n), accum_dtype)
             D_shared = T.alloc_shared((block_m,), dtype)
+            T.annotate_layout({D_shared: vector_shared_layout})
 
             for bz in T.serial(grid_b):
                 for by in T.serial(grid_m):
@@ -241,7 +243,7 @@ def tiles_broadcast_copy(
     m=512,
     n=1024,
     block_b=2,
-    block_m=256,
+    block_m=512,
     block_n=128,
     dtype="bfloat16",
     accum_dtype="bfloat16",
@@ -250,7 +252,8 @@ def tiles_broadcast_copy(
     tensor_shape = (batch, m, n)
     tensor_layout = make_zz_layout(tensor_shape, [1, 2], (32, 32))
     vector_shape = (m,)
-    vector_layout = make_row_major(vector_shape)
+    vector_layout = make_aligned_row_major(vector_shape, dtype, align_bytes=1024)
+    vector_shared_layout = make_aligned_row_major((block_m,), dtype, align_bytes=1024)
     grid_b = T.ceildiv(batch, block_b)
     grid_m = T.ceildiv(m, block_m)
     grid_n = T.ceildiv(n, block_n)
@@ -267,6 +270,7 @@ def tiles_broadcast_copy(
             B_shared = T.alloc_shared((block_b, block_m, block_n), dtype)
             C_shared = T.alloc_shared((block_b, block_m, block_n), accum_dtype)
             D_shared = T.alloc_shared((block_m,), dtype)
+            T.annotate_layout({D_shared: vector_shared_layout})
 
             for bz in T.serial(grid_b):
                 for by in T.serial(grid_m):
@@ -317,10 +321,12 @@ def tiles_broadcast_copy(
 
 
 @target("Sunmmio")
-def tiles_1d(m=512, block_m=256, dtype="bfloat16", accum_dtype="bfloat16"):
+def tiles_1d(m=512, block_m=512, dtype="bfloat16", accum_dtype="bfloat16"):
     shard_policy = T.placement.replicated()
     tensor_shape = (m,)
-    tensor_layout = make_row_major(tensor_shape)
+    tensor_layout = make_aligned_row_major(tensor_shape, dtype, align_bytes=1024)
+    shared_layout = make_aligned_row_major((block_m,), dtype, align_bytes=1024)
+    accum_shared_layout = make_aligned_row_major((block_m,), accum_dtype, align_bytes=1024)
     grid_m = T.ceildiv(m, block_m)
 
     @T.prim_func
@@ -333,6 +339,7 @@ def tiles_1d(m=512, block_m=256, dtype="bfloat16", accum_dtype="bfloat16"):
             A_shared = T.alloc_shared((block_m,), dtype)
             B_shared = T.alloc_shared((block_m,), dtype)
             C_shared = T.alloc_shared((block_m,), accum_dtype)
+            T.annotate_layout({A_shared: shared_layout, B_shared: shared_layout, C_shared: accum_shared_layout})
 
             for by in T.serial(grid_m):
                 T.clear(C_shared)
