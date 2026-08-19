@@ -837,7 +837,6 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
 
   struct AlignedRowDmaCarrier {
     bool aligned_1024{false};
-    bool row_major_family{false};
     bool valid{false};
     Array<Range> physical_ranges;
     Array<PrimExpr> covered_shape;
@@ -863,11 +862,14 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
     os << ")";
     return os.str();
   };
-  auto canonicalize_shape = [&](const Array<PrimExpr> &shape) {
+  auto remove_leading_singletons = [&](const Array<PrimExpr> &shape) {
     Array<PrimExpr> canonical;
+    bool found_non_singleton = false;
     for (const PrimExpr &extent : shape) {
-      if (!analyzer->CanProveEqual(extent, 1))
-        canonical.push_back(extent);
+      if (!found_non_singleton && analyzer->CanProveEqual(extent, 1))
+        continue;
+      found_non_singleton = true;
+      canonical.push_back(extent);
     }
     return canonical;
   };
@@ -893,32 +895,54 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   };
   auto is_aligned_row_major = [&](const Buffer &buffer, const Layout &layout,
                                   int align_bytes) {
-    return layout.defined() && layout->InputDim() > 0 &&
-           !sunmmio::IsMXDType(buffer->dtype) &&
-           IsSameLayout(layout,
-                        sunmmio::MakeAlignedRowMajor(
-                            layout->InputShape(), buffer->dtype, align_bytes),
-                        analyzer);
-  };
-  auto is_row_major_family = [&](const Buffer &buffer, const Layout &layout) {
-    if (!layout.defined() || layout->InputDim() < 1 ||
+    if (!layout.defined() || layout->InputDim() == 0 ||
         sunmmio::IsMXDType(buffer->dtype)) {
       return false;
     }
-    if (IsSameLayout(layout, sunmmio::MakeRowMajor(layout->InputShape()),
-                     analyzer) ||
-        is_aligned_row_major(buffer, layout, kDramRowAlignBytes)) {
+    Layout expected = sunmmio::MakeAlignedRowMajor(layout->InputShape(),
+                                                   buffer->dtype, align_bytes);
+    if (IsSameLayout(layout, expected, analyzer))
       return true;
+
+    const auto *actual_cute = layout.as<CuteLayoutNode>();
+    const auto *expected_cute = expected.as<CuteLayoutNode>();
+    if (!actual_cute || !expected_cute ||
+        actual_cute->GetDimLevels().size() !=
+            expected_cute->GetDimLevels().size()) {
+      return false;
     }
-    return config.rsram_align_bytes > 0 &&
-           is_aligned_row_major(buffer, layout, config.rsram_align_bytes);
+    for (size_t i = 0; i < actual_cute->GetDimLevels().size(); ++i) {
+      if (actual_cute->GetDimLevels()[i].IntValue() !=
+          expected_cute->GetDimLevels()[i].IntValue()) {
+        return false;
+      }
+    }
+
+    Array<PrimExpr> actual_modes = actual_cute->GetModeShape();
+    Array<PrimExpr> expected_modes = expected_cute->GetModeShape();
+    Array<PrimExpr> actual_strides = actual_cute->GetModeStride();
+    Array<PrimExpr> expected_strides = expected_cute->GetModeStride();
+    if (actual_modes.size() != expected_modes.size() ||
+        actual_strides.size() != expected_strides.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < actual_modes.size(); ++i) {
+      if (!analyzer->CanProveEqual(actual_modes[i], expected_modes[i]))
+        return false;
+      // Layout inference may choose any stride for a singleton mode; its index
+      // is always zero, so that stride has no effect on physical addressing.
+      if (!analyzer->CanProveEqual(actual_modes[i], 1) &&
+          !analyzer->CanProveEqual(actual_strides[i], expected_strides[i])) {
+        return false;
+      }
+    }
+    return true;
   };
   auto analyze_carrier = [&](const Buffer &buffer, const Layout &layout,
                              const Array<Range> &ranges) {
     AlignedRowDmaCarrier carrier;
     carrier.aligned_1024 =
         is_aligned_row_major(buffer, layout, kDramRowAlignBytes);
-    carrier.row_major_family = is_row_major_family(buffer, layout);
     if (!carrier.aligned_1024)
       return carrier;
     if (buffer->shape.empty() || ranges.size() != buffer->shape.size() ||
@@ -979,8 +1003,8 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
     carrier.physical_ranges.push_back(
         Range::FromMinExtent(row->min, carrier.covered_shape[innermost]));
     physical_shape.push_back(carrier.covered_shape[innermost]);
-    carrier.canonical_logical_shape = canonicalize_shape(logical_shape);
-    carrier.canonical_carrier_shape = canonicalize_shape(physical_shape);
+    carrier.canonical_logical_shape = remove_leading_singletons(logical_shape);
+    carrier.canonical_carrier_shape = remove_leading_singletons(physical_shape);
     if (carrier.canonical_logical_shape.empty() ||
         carrier.canonical_carrier_shape.empty()) {
       carrier.reason = "effective rank must be one or two";
@@ -994,17 +1018,6 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
     carrier.valid = true;
     return carrier;
   };
-  auto logical_dram_segment_is_aligned = [&]() {
-    const Array<Range> &ranges =
-        src.scope() == "global" ? src_range : dst_range;
-    const Buffer &buffer = src.scope() == "global" ? src : dst;
-    if (ranges.empty())
-      return false;
-    const Range &row = ranges.back();
-    return bit_count_is_aligned(row->min, buffer->dtype, kDramRowAlignBytes) &&
-           bit_count_is_aligned(row->extent, buffer->dtype, kDramRowAlignBytes);
-  };
-
   AlignedRowDmaCarrier src_carrier =
       analyze_carrier(src, src_layout, src_range);
   AlignedRowDmaCarrier dst_carrier =
@@ -1035,32 +1048,25 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
     return Stmt();
   };
 
-  if (!logical_dram_segment_is_aligned()) {
-    if (src_carrier.aligned_1024 && dst_carrier.aligned_1024) {
-      if (!src_carrier.valid)
-        return reject_carrier("source " + src_carrier.reason);
-      if (!dst_carrier.valid)
-        return reject_carrier("destination " + dst_carrier.reason);
-      if (src->dtype != dst->dtype)
-        return reject_carrier(
-            "source and destination element dtypes must match");
-      if (!shape_matches(src_carrier.canonical_logical_shape,
-                         dst_carrier.canonical_logical_shape)) {
-        return reject_carrier("canonical logical shapes do not match");
-      }
-      if (!shape_matches(src_carrier.canonical_carrier_shape,
-                         dst_carrier.canonical_carrier_shape)) {
-        return reject_carrier("canonical carrier shapes do not match");
-      }
-      return dma(MakeRegionExpr(src, src_carrier.physical_ranges,
-                                /*access_mask=*/1),
-                 MakeRegionExpr(dst, dst_carrier.physical_ranges,
-                                /*access_mask=*/2));
+  if (src_carrier.aligned_1024 && dst_carrier.aligned_1024) {
+    if (!src_carrier.valid)
+      return reject_carrier("source " + src_carrier.reason);
+    if (!dst_carrier.valid)
+      return reject_carrier("destination " + dst_carrier.reason);
+    if (src->dtype != dst->dtype)
+      return reject_carrier("source and destination element dtypes must match");
+    if (!shape_matches(src_carrier.canonical_logical_shape,
+                       dst_carrier.canonical_logical_shape)) {
+      return reject_carrier("canonical logical shapes do not match");
     }
-    if (src_carrier.aligned_1024 && dst_carrier.row_major_family)
-      return reject_carrier("destination is not 1024-byte aligned row-major");
-    if (dst_carrier.aligned_1024 && src_carrier.row_major_family)
-      return reject_carrier("source is not 1024-byte aligned row-major");
+    if (!shape_matches(src_carrier.canonical_carrier_shape,
+                       dst_carrier.canonical_carrier_shape)) {
+      return reject_carrier("canonical carrier shapes do not match");
+    }
+    return dma(MakeRegionExpr(src, src_carrier.physical_ranges,
+                              /*access_mask=*/1),
+               MakeRegionExpr(dst, dst_carrier.physical_ranges,
+                              /*access_mask=*/2));
   }
 
   if (IsLayoutMatch(src_layout, dst_layout, analyzer)) {
