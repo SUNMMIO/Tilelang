@@ -481,6 +481,7 @@ struct ActiveDefInfo {
 
 struct OverlapFacts {
   int rho{0};
+  int max_shared_execution_depth{0};
   int64_t weight_bytes{0};
 };
 
@@ -585,6 +586,8 @@ ComputeOverlapFacts(const NormalizedBufferAccess &src_access,
 
   OverlapFacts facts;
   facts.rho = ComputeRequiredSharedPrefixDepth(src_access, dst_access);
+  facts.max_shared_execution_depth =
+      std::min(src_access.home_depth, dst_access.home_depth);
   facts.weight_bytes = ComputeEdgeWeightBytes(
       src_access, dst_access, exact_overlap.value(), kind, analyzer);
   return facts;
@@ -594,8 +597,13 @@ TileScopeDependenceEdge
 MakeDependenceEdge(int src_region_index, int dst_region_index,
                    TileScopeDependenceKind kind, int src_access_index,
                    int dst_access_index, const OverlapFacts &facts) {
-  return {src_region_index,  dst_region_index, kind,
-          src_access_index,  dst_access_index, facts.rho,
+  return {src_region_index,
+          dst_region_index,
+          kind,
+          src_access_index,
+          dst_access_index,
+          facts.rho,
+          facts.max_shared_execution_depth,
           facts.weight_bytes};
 }
 

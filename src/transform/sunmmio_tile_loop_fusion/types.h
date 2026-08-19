@@ -149,6 +149,9 @@ struct TileScopeDependenceEdge {
   // rho = 1 means the edge can stay internal under a shared outer row shell;
   // rho = 2 means it needs a deeper tile shell, and so on.
   int rho{0};
+  // Deepest execution-loop prefix the source and destination may share without
+  // interleaving different executions of this dependence instance.
+  int max_shared_execution_depth{0};
   // Estimated payload cost of cutting this edge for one execution instance.
   // The planner later scales this by execution multiplicity.
   int64_t weight_bytes{0};

@@ -94,7 +94,8 @@ NormalizedBufferAccess MakeAccess(const Buffer &buffer, int home_depth,
 
 TileScopeDependenceEdge MakeRawEdge(int src_region_index, int dst_region_index,
                                     int src_access_index, int dst_access_index,
-                                    int rho, int64_t weight_bytes) {
+                                    int rho, int64_t weight_bytes,
+                                    int max_shared_execution_depth = -1) {
   TileScopeDependenceEdge edge;
   edge.src_region_index = src_region_index;
   edge.dst_region_index = dst_region_index;
@@ -102,6 +103,8 @@ TileScopeDependenceEdge MakeRawEdge(int src_region_index, int dst_region_index,
   edge.src_access_index = src_access_index;
   edge.dst_access_index = dst_access_index;
   edge.rho = rho;
+  edge.max_shared_execution_depth =
+      max_shared_execution_depth < 0 ? rho : max_shared_execution_depth;
   edge.weight_bytes = weight_bytes;
   return edge;
 }
@@ -282,6 +285,83 @@ TEST(SunmmioTileLoopFusionPlannerTest, SharedTileRawEdgeBuildsNestedTileShell) {
   EXPECT_FALSE(inner_scope.children[0].is_scope);
   EXPECT_EQ(inner_scope.children[0].region_index, 0);
   EXPECT_FALSE(inner_scope.children[1].is_scope);
+  EXPECT_EQ(inner_scope.children[1].region_index, 1);
+}
+
+TEST(SunmmioTileLoopFusionPlannerTest,
+     ShallowDependenceSplitsOnlyInnerShellDespiteProfitableTileReuse) {
+  Buffer row_buffer = MakeSharedBuffer("row_buffer", {I(8)});
+  Buffer tile_buffer = MakeSharedBuffer("tile_buffer", {I(8), I(2)});
+
+  SunmmioTileLoopFusionWindowProblem problem;
+  problem.regions = {
+      MakePlannerRegion(0, {"i", "j"}, MakeExtents({8, 2})),
+      MakePlannerRegion(1, {"i", "j"}, MakeExtents({8, 2})),
+  };
+  problem.normalized_regions.resize(2);
+  problem.normalized_regions[0].def_out = {
+      MakeAccess(row_buffer, 1, 32),
+      MakeAccess(tile_buffer, 2, 1024),
+  };
+  problem.normalized_regions[1].use_in = {
+      MakeAccess(row_buffer, 1, 32),
+      MakeAccess(tile_buffer, 2, 1024),
+  };
+  problem.graph.edges = {
+      MakeRawEdge(0, 1, 0, 0, 1, 32, 1),
+      MakeRawEdge(0, 1, 1, 1, 2, 1024, 2),
+  };
+
+  SunmmioTileLoopFusionWindowPlan plan = PlanSingleProblem(problem);
+
+  EXPECT_EQ(LeafRegionOrder(plan.tree), std::vector<int>({0, 1}));
+  ASSERT_EQ(plan.tree.size(), 1U);
+  const SunmmioTileLoopFusionPlannerTreeNode &outer_scope = plan.tree[0];
+  ASSERT_TRUE(outer_scope.is_scope);
+  EXPECT_EQ(outer_scope.shell_axes, std::vector<std::string>({"i"}));
+  ASSERT_EQ(outer_scope.children.size(), 2U);
+
+  EXPECT_FALSE(outer_scope.children[0].is_scope);
+  EXPECT_EQ(outer_scope.children[0].region_index, 0);
+  EXPECT_FALSE(outer_scope.children[1].is_scope);
+  EXPECT_EQ(outer_scope.children[1].region_index, 1);
+  EXPECT_GT(plan.score.write_cut_cost, 0);
+}
+
+TEST(SunmmioTileLoopFusionPlannerTest,
+     UnitTripInnerShellRemainsFusedAcrossShallowDependence) {
+  Buffer row_buffer = MakeSharedBuffer("row_buffer", {I(8)});
+  Buffer tile_buffer = MakeSharedBuffer("tile_buffer", {I(8), I(1)});
+
+  SunmmioTileLoopFusionWindowProblem problem;
+  problem.regions = {
+      MakePlannerRegion(0, {"i", "j"}, MakeExtents({8, 1})),
+      MakePlannerRegion(1, {"i", "j"}, MakeExtents({8, 1})),
+  };
+  problem.normalized_regions.resize(2);
+  problem.normalized_regions[0].def_out = {
+      MakeAccess(row_buffer, 1, 32),
+      MakeAccess(tile_buffer, 2, 1024),
+  };
+  problem.normalized_regions[1].use_in = {
+      MakeAccess(row_buffer, 1, 32),
+      MakeAccess(tile_buffer, 2, 1024),
+  };
+  problem.graph.edges = {
+      MakeRawEdge(0, 1, 0, 0, 1, 32, 1),
+      MakeRawEdge(0, 1, 1, 1, 2, 1024, 2),
+  };
+
+  SunmmioTileLoopFusionWindowPlan plan = PlanSingleProblem(problem);
+
+  ASSERT_EQ(plan.tree.size(), 1U);
+  const SunmmioTileLoopFusionPlannerTreeNode &outer_scope = plan.tree[0];
+  ASSERT_TRUE(outer_scope.is_scope);
+  const SunmmioTileLoopFusionPlannerTreeNode &inner_scope =
+      ExpectSingleScopeChild(outer_scope);
+  EXPECT_EQ(inner_scope.shell_axes, std::vector<std::string>({"i", "j"}));
+  ASSERT_EQ(inner_scope.children.size(), 2U);
+  EXPECT_EQ(inner_scope.children[0].region_index, 0);
   EXPECT_EQ(inner_scope.children[1].region_index, 1);
 }
 

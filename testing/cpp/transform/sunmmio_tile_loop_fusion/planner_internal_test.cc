@@ -60,6 +60,7 @@ WindowPlannerInput MakeRawCoverageInput() {
   first_edge.buffer_region_id = 10;
   first_edge.buffer_name = "debug_buffer";
   first_edge.rho = 1;
+  first_edge.max_shared_execution_depth = 1;
   first_edge.weight = 64;
   first_edge.instance_count = 1;
   first_edge.covered_use_index = 0;
@@ -114,6 +115,56 @@ TEST(SunmmioTileLoopFusionPlannerInternalTest,
   InstallResidentIfMissing(&instance_scopes, base);
   InstallResidentIfMissing(&instance_scopes, MakeResident(64, 16));
   EXPECT_EQ(instance_scopes[1].residents.size(), 2U);
+}
+
+TEST(SunmmioTileLoopFusionPlannerInternalTest,
+     PlannerStateSerializationIncludesPendingDependences) {
+  PlannerState first{DynamicBitset(2), std::vector<OpenScopeFrame>(2)};
+  PlannerState second = first;
+  first.open_scopes[1].pending_edge_indices = {1};
+  second.open_scopes[1].pending_edge_indices = {2};
+
+  EXPECT_NE(SerializePlannerState(first), SerializePlannerState(second));
+}
+
+TEST(SunmmioTileLoopFusionPlannerInternalTest,
+     ApplyActionTracksPendingWarAndWawDependences) {
+  for (TileScopeDependenceKind kind :
+       {TileScopeDependenceKind::kWAR, TileScopeDependenceKind::kWAW}) {
+    WindowPlannerInput input;
+    auto *problem = new SunmmioTileLoopFusionWindowProblem();
+    problem->regions.resize(2);
+    for (int i = 0; i < 2; ++i) {
+      problem->regions[i].global_region_index = i;
+      problem->regions[i].logical_execution_axis_keys = {"i", "j"};
+      problem->regions[i].execution_loop_extents = {
+          IntImm(DataType::Int(32), 8), IntImm(DataType::Int(32), 2)};
+    }
+
+    input.problem = problem;
+    input.regions.resize(2);
+    input.incoming_edges_by_dst.resize(2);
+    input.outgoing_edges_by_src.resize(2);
+    input.predecessor_masks.assign(2, DynamicBitset(2));
+    input.earlier_source_masks.assign(2, DynamicBitset(2));
+
+    WindowPlannerEdgeInfo edge;
+    edge.src_local_index = 0;
+    edge.dst_local_index = 1;
+    edge.kind = kind;
+    edge.max_shared_execution_depth = 1;
+    input.edges.push_back(edge);
+    input.outgoing_edges_by_src[0].push_back(0);
+    input.incoming_edges_by_dst[1].push_back(0);
+
+    PlannerState initial{DynamicBitset(2), {}};
+    TransitionResult transition = ApplyAction(input, initial, 0, 0, 2);
+
+    ASSERT_EQ(transition.next_state.open_scopes.size(), 2U);
+    EXPECT_EQ(transition.next_state.open_scopes[1].pending_edge_indices,
+              std::vector<int>({0}));
+    delete problem;
+  }
 }
 
 TEST(SunmmioTileLoopFusionPlannerInternalTest,

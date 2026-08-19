@@ -67,6 +67,54 @@ bool ResidentValueLess(const ResidentValueState &lhs,
                   rhs.home_depth, rhs.payload_bytes, rhs.instance_count);
 }
 
+bool RetainsPendingIncomingEdge(const WindowPlannerInput &input,
+                                const PlannerState &state, int close_to_depth,
+                                int region_local_index) {
+  const std::vector<int> &incoming_edges =
+      input.incoming_edges_by_dst[region_local_index];
+  for (int depth = 0; depth < close_to_depth; ++depth) {
+    const std::vector<int> &pending_edges =
+        state.open_scopes[depth].pending_edge_indices;
+    for (int edge_index : incoming_edges) {
+      if (std::binary_search(pending_edges.begin(), pending_edges.end(),
+                             edge_index)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void InstallPendingEdgeIfMissing(std::vector<OpenScopeFrame> *open_scopes,
+                                 int frame_index, int edge_index) {
+  ICHECK_GE(frame_index, 0);
+  ICHECK_LT(frame_index, static_cast<int>(open_scopes->size()));
+  std::vector<int> &pending_edges =
+      (*open_scopes)[frame_index].pending_edge_indices;
+  auto it =
+      std::lower_bound(pending_edges.begin(), pending_edges.end(), edge_index);
+  if (it == pending_edges.end() || *it != edge_index) {
+    pending_edges.insert(it, edge_index);
+  }
+}
+
+int FindPendingFrameIndex(const WindowPlannerEdgeInfo &edge,
+                          const TileScopeRegion &source_region,
+                          int open_to_depth) {
+  ICHECK_GE(edge.max_shared_execution_depth, 0);
+  ICHECK_LE(open_to_depth,
+            static_cast<int>(source_region.execution_loop_extents.size()));
+  for (int depth = edge.max_shared_execution_depth + 1; depth <= open_to_depth;
+       ++depth) {
+    const auto *extent =
+        source_region.execution_loop_extents[depth - 1].as<IntImmNode>();
+    if (extent == nullptr || extent->value != 1) {
+      return depth - 1;
+    }
+  }
+  return -1;
+}
+
 struct MutablePlannerTreeNode {
   bool is_scope{false};
   int region_index{-1};
@@ -181,7 +229,11 @@ std::string SerializePlannerState(const PlannerState &state) {
   os << SerializeDynamicBitset(state.scheduled_mask);
   for (const OpenScopeFrame &frame : state.open_scopes) {
     os << '[' << JoinAxes(frame.shell_axes) << '@'
-       << JoinExtents(frame.shell_extents) << '|';
+       << JoinExtents(frame.shell_extents) << "|P:";
+    for (int edge_index : frame.pending_edge_indices) {
+      os << edge_index << ',';
+    }
+    os << "|R:";
     for (const ResidentValueState &resident : frame.residents) {
       os << SerializeResident(resident) << ',';
     }
@@ -344,8 +396,8 @@ int64_t ComputeLiveRangeDelta(const PlannerState &state) {
  *    latter.
  * 3. Materialize uncovered reads that are not already resident, charging
  *    shared-read cost when they must be fetched.
- * 4. Kill overwritten residents and install the current region's new
- *    definitions so later actions can reuse them.
+ * 4. Kill overwritten residents, install new definitions, and record outgoing
+ *    dependences that remain incomplete under a deeper multi-trip shell.
  * 5. Mark the region scheduled, prune dead residents, and recompute the
  *    live-range and reorder score terms for the next state.
  *
@@ -386,6 +438,7 @@ TransitionResult ApplyAction(const WindowPlannerInput &input,
     result.next_state.open_scopes.push_back(
         {TakeExecutionAxisPrefix(region.logical_execution_axis_keys, depth),
          TakeExecutionExtentPrefix(region.execution_loop_extents, depth),
+         {},
          {}});
   }
 
@@ -474,6 +527,22 @@ TransitionResult ApplyAction(const WindowPlannerInput &input,
                               edge.instance_count});
   }
 
+  // An edge whose source is emitted below its maximum legal shared depth stays
+  // pending until the first deeper multi-trip frame closes. Static unit-trip
+  // shells cannot interleave executions and therefore remain legally fused.
+  // All dependence kinds carry the same source-before-destination completion
+  // obligation.
+  for (int edge_index : input.outgoing_edges_by_src[region_local_index]) {
+    const WindowPlannerEdgeInfo &edge = input.edges[edge_index];
+    int pending_frame_index =
+        FindPendingFrameIndex(edge, region, open_to_depth);
+    if (pending_frame_index < 0) {
+      continue;
+    }
+    InstallPendingEdgeIfMissing(&result.next_state.open_scopes,
+                                pending_frame_index, edge_index);
+  }
+
   // Finalize the new planner state and score terms after scheduling this
   // region.
   result.next_state.scheduled_mask = state.scheduled_mask;
@@ -551,7 +620,8 @@ MemoResult BuildSourceOrderFallbackPlan(const WindowPlannerInput &input) {
  * scheduled, closes the current shell stack to \p close_to_depth, and then
  * reopens shells for the candidate region until \p open_to_depth. Prefix reuse
  * is only legal when the kept shells match the candidate region's execution
- * prefix axes and extents.
+ * prefix axes and extents, and when no incoming dependence remains pending in
+ * that retained prefix.
  *
  * Because every planner score term is nonnegative, the search can prune any
  * branch whose immediate transition delta is already no better than the best
@@ -630,6 +700,10 @@ MemoResult SolveWindowPlan(const WindowPlannerInput &input,
       if (!PathMatchesExecutionPrefix(state.open_scopes, close_to_depth,
                                       region.logical_execution_axis_keys,
                                       region.execution_loop_extents)) {
+        continue;
+      }
+      if (RetainsPendingIncomingEdge(input, state, close_to_depth,
+                                     region_local_index)) {
         continue;
       }
       for (int open_to_depth = close_to_depth;
