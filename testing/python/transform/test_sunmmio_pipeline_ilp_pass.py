@@ -220,17 +220,13 @@ def _make_shifted_multiversion_pipeline():
     )
     root = tir.Block([], [], [], "root", loop, alloc_buffers=[scratch])
     body = tir.BlockRealize([], tir.const(True, "bool"), root)
-    func = tir.PrimFunc(
-        [output.data], body, buffer_map={output.data: output}
-    ).with_attr("global_symbol", "main")
+    func = tir.PrimFunc([output.data], body, buffer_map={output.data: output}).with_attr("global_symbol", "main")
     return tvm.IRModule.from_expr(func)
 
 
 def test_sunmmio_pipeline_ilp_inject_shifted_access_version():
     """A producer at k writing value k+1 must match its consumer at k+1."""
-    injected = tl.transform.InjectSunmmioPipelineILP()(
-        _make_shifted_multiversion_pipeline()
-    )
+    injected = tl.transform.InjectSunmmioPipelineILP()(_make_shifted_multiversion_pipeline())
     script = injected.script()
 
     # Value 1 is produced in command iteration 0 and consumed in iteration 1.
