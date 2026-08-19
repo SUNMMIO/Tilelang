@@ -1165,7 +1165,7 @@ void DedupAccesses(std::vector<AccessInfo> *accesses) {
 
 class SunmmioStmtAccessAnalyzer : public StmtExprVisitor {
 public:
-  explicit SunmmioStmtAccessAnalyzer(const PrimFunc &f) : analyzer_() {
+  explicit SunmmioStmtAccessAnalyzer(const PrimFunc &f) {
     for (const auto &kv : f->buffer_map) {
       buffer_data_to_buffer_.Set(kv.second->data, kv.second);
     }
@@ -1763,7 +1763,7 @@ std::string SummarizeStmtForName(const Stmt &stmt) {
                  ? "reduce_tile_op(" + reduce_kind + ")"
                  : "reduce_tile_op(" + reduce_kind + " -> " + reduce_dst + ")";
     }
-    if (block->block->name_hint.size() != 0) {
+    if (!block->block->name_hint.empty()) {
       return "block:" + block->block->name_hint;
     }
     return "block";
@@ -3261,6 +3261,7 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
 
         if (!diff_cons_slots.empty()) {
           std::vector<HighsInt> x_cons;
+          x_cons.reserve(diff_cons_slots.size());
           for (int cons_slot : diff_cons_slots) {
             x_cons.push_back(vars.col_x[read_flow.cons][cons_slot]);
           }
@@ -3275,6 +3276,7 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
 
         if (!same_cons_slots.empty()) {
           std::vector<HighsInt> x_cons;
+          x_cons.reserve(same_cons_slots.size());
           for (int cons_slot : same_cons_slots) {
             x_cons.push_back(vars.col_x[read_flow.cons][cons_slot]);
           }
