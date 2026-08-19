@@ -1182,10 +1182,10 @@ public:
 
 private:
   void AddAccess(const BufferRegion &region, bool is_write) {
-    accesses_.push_back(AccessInfo{
-        region, is_write,
-        DetectPipelineIterOffsetFromRegion(region, pipeline_loop_var_,
-                                           &analyzer_)});
+    accesses_.push_back(
+        AccessInfo{region, is_write,
+                   DetectPipelineIterOffsetFromRegion(
+                       region, pipeline_loop_var_, &analyzer_)});
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
@@ -2995,9 +2995,12 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
   // Domains: t_i,y_i,yh_i,m_i,a_is,T are nonnegative integers;
   // x_is,p_i,z_v are binary, and 0 <= m_i < II.
   highs.clear();
-  highs.setOptionValue("output_flag", true);
-  highs.setOptionValue("log_to_console", true);
-  highs.setOptionValue("mip_report_level", 2);
+  const bool enable_solver_log = GetEnvBool("TL_SUNMMIO_ILP_HIGHS_LOG", false);
+  highs.setOptionValue("output_flag", enable_solver_log);
+  highs.setOptionValue("log_to_console", enable_solver_log);
+  if (enable_solver_log) {
+    highs.setOptionValue("mip_report_level", 2);
+  }
   highs.setOptionValue("threads", threads);
   highs.setOptionValue("parallel", "on");
   highs.changeObjectiveSense(ObjSense::kMinimize);

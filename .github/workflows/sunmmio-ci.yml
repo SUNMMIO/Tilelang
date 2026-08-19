@@ -341,8 +341,8 @@ jobs:
           exec 9>"${lock_file}"
           flock 9
           cmake -S . -B cmake-build --fresh ${CLANG_TIDY_CMAKE_OPTIONS} ${TILELANG_SUNMMIO_CMAKE_ARGS}
-          cmake --build cmake-build --target tilelang_highs -j "$(nproc)"
           if [[ "${TILELANG_SUNMMIO_CMAKE_ARGS}" == *"-DUSE_SUNMMIO=ON"* ]]; then
+            cmake --build cmake-build --target tilelang_highs -j "$(nproc)"
             cmake --build cmake-build --target mlir-headers llvm-headers -j "$(nproc)"
           fi
           flock -u 9

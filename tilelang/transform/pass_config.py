@@ -141,7 +141,10 @@ class PassConfigKey(str, Enum):
     """Select Sunmmio pipeline implementation. Accepts: "greedy", "ilp". Default: "greedy"."""
 
     TL_SUNMMIO_FASTER = "tl.sunmmio_faster"
-    """Limit the number of greedy Sunmmio bank-coloring candidates. Use -1 to search all candidates. Default: -1."""
+    """Tune Sunmmio pipeline-planner search. In greedy mode, limit the number
+    of bank-coloring candidates; -1 searches all candidates. In ILP mode, use
+    the positive value to scale command-latency estimates. A non-positive or
+    unset ILP value selects the scaling factor automatically. Default: -1."""
 
     TL_SUNMMIO_ILP_STAGE_SHRINK = "tl.sunmmio_ilp_stage_shrink"
     """Enable Sunmmio ILP stage shrink: solve at original num_stages, then try smaller stages at fixed II and reoptimize on the minimum feasible stage. Default: False."""
