@@ -528,10 +528,11 @@ TransitionResult ApplyAction(const WindowPlannerInput &input,
   }
 
   // An edge whose source is emitted below its maximum legal shared depth stays
-  // pending until the first deeper multi-trip frame closes. Static unit-trip
-  // shells cannot interleave executions and therefore remain legally fused.
-  // All dependence kinds carry the same source-before-destination completion
-  // obligation.
+  // pending until the first deeper multi-trip frame closes. Discovery may
+  // raise that depth for a WAR edge when every destination write is proven to
+  // occur on the final iteration, which preserves safe read-before-write
+  // fusion without weakening the default barrier. Static unit-trip shells
+  // cannot interleave executions and therefore remain legally fused.
   for (int edge_index : input.outgoing_edges_by_src[region_local_index]) {
     const WindowPlannerEdgeInfo &edge = input.edges[edge_index];
     int pending_frame_index =

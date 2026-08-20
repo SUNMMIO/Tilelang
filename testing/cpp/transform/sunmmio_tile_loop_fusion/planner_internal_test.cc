@@ -128,9 +128,10 @@ TEST(SunmmioTileLoopFusionPlannerInternalTest,
 }
 
 TEST(SunmmioTileLoopFusionPlannerInternalTest,
-     ApplyActionTracksPendingWarAndWawDependences) {
+     ApplyActionTracksPendingDependences) {
   for (TileScopeDependenceKind kind :
-       {TileScopeDependenceKind::kWAR, TileScopeDependenceKind::kWAW}) {
+       {TileScopeDependenceKind::kRAW, TileScopeDependenceKind::kWAR,
+        TileScopeDependenceKind::kWAW}) {
     WindowPlannerInput input;
     auto *problem = new SunmmioTileLoopFusionWindowProblem();
     problem->regions.resize(2);

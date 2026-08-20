@@ -354,6 +354,29 @@ def _lowered_row_reduction_region(src, dst, *, block_m=64, block_n=64, tile_size
     ).strip()
 
 
+def _lowered_row_write_region(src, dst, *, block_m=64, block_n=64, tile_size=(4, 32)):
+    tile_m, tile_n = tile_size
+    outer_m = block_m // tile_m
+    outer_n = block_n // tile_n
+    return textwrap.dedent(
+        f"""
+        for i in T.serial(
+            {outer_m},
+            annotations={{
+                "tile.domain": [T.int32({block_m}), T.int32({block_n})],
+                "tile.execution_axis": T.int32(0),
+                "tile.execution_domain_axes": [T.int32(0), T.int32(1)],
+                "tile.scope_entry": T.int32(1),
+                "tile.tile_size": [T.int32({tile_m}), T.int32({tile_n})],
+            }},
+        ):
+            for j in T.serial({outer_n}, annotations={{"tile.execution_axis": T.int32(1)}}):
+                for ki in T.serial({tile_m}, annotations={{"tile.interior": T.int32(1), "tile.interior_axis": T.int32(0)}}):
+                    {dst}[i * {tile_m} + ki] = {src}[i * {tile_m} + ki, j * {tile_n}]
+        """
+    ).strip()
+
+
 def reduction_consumer_lowered_kernel(block_n=64):
     block_m = 64
     dtype = "float32"
@@ -379,6 +402,66 @@ def reduction_consumer_lowered_kernel(block_n=64):
             _lowered_2d_tile_region(
                 "b_shared",
                 "values[i * 4 + ki, j * 32 + kj] - row_max[i * 4 + ki]",
+                block_m=block_m,
+                block_n=block_n,
+                tile_size=tile_size,
+            ),
+        ],
+    )
+
+
+def war_reduction_lowered_kernel():
+    block_m = 64
+    block_n = 64
+    dtype = "float32"
+    tile_size = (4, 32)
+    return _make_manual_lowered_primfunc(
+        [
+            f'a_shared = T.alloc_buffer(({block_m}, {block_n}), "{dtype}", scope="shared.rsram")',
+            f'tile_values = T.alloc_buffer(({block_m}, {block_n}), "{dtype}", scope="shared.rsram")',
+            f'row_values = T.alloc_buffer(({block_m},), "{dtype}", scope="shared.rsram")',
+        ],
+        [
+            _lowered_2d_tile_region(
+                "tile_values",
+                "a_shared[i * 4 + ki, j * 32 + kj] + row_values[i * 4 + ki]",
+                block_m=block_m,
+                block_n=block_n,
+                tile_size=tile_size,
+            ),
+            _lowered_row_reduction_region(
+                "tile_values",
+                "row_values",
+                block_m=block_m,
+                block_n=block_n,
+                tile_size=tile_size,
+            ),
+        ],
+    )
+
+
+def unsafe_war_lowered_kernel():
+    block_m = 64
+    block_n = 64
+    dtype = "float32"
+    tile_size = (4, 32)
+    return _make_manual_lowered_primfunc(
+        [
+            f'a_shared = T.alloc_buffer(({block_m}, {block_n}), "{dtype}", scope="shared.rsram")',
+            f'tile_values = T.alloc_buffer(({block_m}, {block_n}), "{dtype}", scope="shared.rsram")',
+            f'row_values = T.alloc_buffer(({block_m},), "{dtype}", scope="shared.rsram")',
+        ],
+        [
+            _lowered_2d_tile_region(
+                "tile_values",
+                "a_shared[i * 4 + ki, j * 32 + kj] + row_values[i * 4 + ki]",
+                block_m=block_m,
+                block_n=block_n,
+                tile_size=tile_size,
+            ),
+            _lowered_row_write_region(
+                "tile_values",
+                "row_values",
                 block_m=block_m,
                 block_n=block_n,
                 tile_size=tile_size,
@@ -906,7 +989,7 @@ def test_sunmmio_tile_loop_fusion_can_share_only_the_outer_loop_prefix():
     assert all(_for_annotations(stmt).get("tile.execution_axis") == 1 for stmt in fused_body)
 
 
-def test_sunmmio_tile_loop_fusion_waits_for_multi_tile_reduction_completion():
+def test_sunmmio_tile_loop_fusion_waits_for_conditional_raw_reduction_write():
     mod = IRModule.from_expr(
         reduction_consumer_lowered_kernel().with_attr("global_symbol", "main")
     )
@@ -927,6 +1010,64 @@ def test_sunmmio_tile_loop_fusion_waits_for_multi_tile_reduction_completion():
     assert len(inner_scopes) == 2
     assert "b_shared" not in _collect_buffer_accesses(inner_scopes[0])[1]
     assert "b_shared" in _collect_buffer_accesses(inner_scopes[1])[1]
+
+
+def test_sunmmio_tile_loop_fusion_keeps_conditional_war_reduction_write_fused():
+    mod = IRModule.from_expr(
+        war_reduction_lowered_kernel().with_attr("global_symbol", "main")
+    )
+    mod = tl.transform.SunmmioTileLoopFusion()(mod)
+
+    scope_loops = _find_scope_entry_loops(_root_seq(mod))
+    assert len(scope_loops) == 1
+
+    inner_scopes = [
+        stmt
+        for stmt in _as_seq(scope_loops[0].body)
+        if isinstance(stmt, tvm.tir.For)
+        and _for_annotations(stmt).get("tile.execution_axis") == 1
+    ]
+    assert len(inner_scopes) == 1
+
+    fused_body = _as_seq(inner_scopes[0].body)
+    assert len(fused_body) == 2
+    assert _single_write_name(fused_body[0]) == "tile_values"
+    reduction_block = _expect_reduce_block(fused_body[1])
+
+    row_write_conditions = []
+
+    def collect_row_write_condition(node):
+        if not isinstance(node, tvm.tir.IfThenElse):
+            return
+        if "row_values" in _collect_buffer_accesses(node.then_case)[1]:
+            row_write_conditions.append(node.condition)
+
+    tvm.tir.stmt_functor.post_order_visit(reduction_block.body, collect_row_write_condition)
+    assert len(row_write_conditions) == 1
+    assert tvm.ir.structural_equal(
+        row_write_conditions[0],
+        inner_scopes[0].loop_var == inner_scopes[0].extent - 1,
+    )
+
+    reads, writes = _collect_buffer_accesses(inner_scopes[0])
+    assert "row_values" in reads
+    assert "row_values" in writes
+    assert "tile_values" in reads
+    assert "tile_values" in writes
+
+
+def test_sunmmio_tile_loop_fusion_splits_loop_carried_war_write():
+    mod = IRModule.from_expr(
+        unsafe_war_lowered_kernel().with_attr("global_symbol", "main")
+    )
+    mod = tl.transform.SunmmioTileLoopFusion()(mod)
+
+    scope_loops = _find_scope_entry_loops(_root_seq(mod))
+    assert len(scope_loops) == 2
+    assert [_single_write_name(loop) for loop in scope_loops] == [
+        "tile_values",
+        "row_values",
+    ]
 
 
 def test_sunmmio_tile_loop_fusion_keeps_unit_trip_reduction_consumer_fused():

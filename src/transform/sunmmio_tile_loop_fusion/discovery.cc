@@ -158,6 +158,91 @@ private:
   }
 };
 
+class LastIterationWriteCollector : public StmtVisitor {
+public:
+  explicit LastIterationWriteCollector(std::vector<For> execution_loops)
+      : execution_loops_(std::move(execution_loops)) {}
+
+  void Collect(const Stmt &stmt) { VisitStmt(stmt); }
+
+  void Invalidate(const Buffer &buffer) {
+    all_writes_last_by_depth_[buffer->data.get()] =
+        std::vector<bool>(execution_loops_.size(), false);
+  }
+
+  int GetSafeExecutionDepth(const Buffer &buffer, int available_depth) const {
+    auto it = all_writes_last_by_depth_.find(buffer->data.get());
+    if (it == all_writes_last_by_depth_.end()) {
+      return -1;
+    }
+
+    int safe_depth = available_depth;
+    while (safe_depth < static_cast<int>(it->second.size()) &&
+           it->second[safe_depth]) {
+      ++safe_depth;
+    }
+    return safe_depth > available_depth ? safe_depth : -1;
+  }
+
+private:
+  bool PathImpliesLastIteration(const For &loop) const {
+    if (path_conditions_.empty()) {
+      return false;
+    }
+
+    PrimExpr path_condition = Bool(true);
+    for (const PrimExpr &condition : path_conditions_) {
+      path_condition = tir::And(path_condition, condition);
+    }
+
+    arith::Analyzer analyzer;
+    With<arith::ConstraintContext> constraint(&analyzer, path_condition);
+    PrimExpr last_iteration = analyzer.Simplify(loop->min + loop->extent - 1);
+    return analyzer.CanProve(loop->loop_var == last_iteration);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    std::vector<bool> write_is_last;
+    write_is_last.reserve(execution_loops_.size());
+    for (const For &loop : execution_loops_) {
+      write_is_last.push_back(PathImpliesLastIteration(loop));
+    }
+
+    auto it = all_writes_last_by_depth_.find(op->buffer->data.get());
+    if (it == all_writes_last_by_depth_.end()) {
+      all_writes_last_by_depth_.emplace(op->buffer->data.get(),
+                                        std::move(write_is_last));
+      return;
+    }
+    for (size_t depth = 0; depth < it->second.size(); ++depth) {
+      it->second[depth] = it->second[depth] && write_is_last[depth];
+    }
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) final {
+    path_conditions_.push_back(op->condition);
+    VisitStmt(op->then_case);
+    path_conditions_.pop_back();
+
+    if (op->else_case.defined()) {
+      path_conditions_.push_back(tir::Not(op->condition));
+      VisitStmt(op->else_case.value());
+      path_conditions_.pop_back();
+    }
+  }
+
+  void VisitStmt_(const BlockRealizeNode *op) final {
+    path_conditions_.push_back(op->predicate);
+    VisitStmt(op->block);
+    path_conditions_.pop_back();
+  }
+
+  std::vector<For> execution_loops_;
+  std::vector<PrimExpr> path_conditions_;
+  std::unordered_map<const VarNode *, std::vector<bool>>
+      all_writes_last_by_depth_;
+};
+
 Map<Var, Buffer> CollectVisibleBuffers(const PrimFunc &func) {
   Map<Var, Buffer> buffers;
   for (const auto &kv : func->buffer_map) {
@@ -588,6 +673,13 @@ ComputeOverlapFacts(const NormalizedBufferAccess &src_access,
   facts.rho = ComputeRequiredSharedPrefixDepth(src_access, dst_access);
   facts.max_shared_execution_depth =
       std::min(src_access.home_depth, dst_access.home_depth);
+  // A destination write restricted to the final iteration cannot clobber a
+  // source read from a later iteration at any proven-safe depth.
+  if (kind == TileScopeDependenceKind::kWAR &&
+      dst_access.last_write_safe_depth >= 0) {
+    facts.max_shared_execution_depth = std::max(
+        facts.max_shared_execution_depth, dst_access.last_write_safe_depth);
+  }
   facts.weight_bytes = ComputeEdgeWeightBytes(
       src_access, dst_access, exact_overlap.value(), kind, analyzer);
   return facts;
@@ -653,9 +745,21 @@ AnalyzeOneTileScopeRegion(const PlannerVisibleRegionMatch &match,
 
   std::vector<int> available_at_execution_depths;
   available_at_execution_depths.reserve(def_out.size());
+  std::vector<int> last_write_safe_execution_depths;
+  last_write_safe_execution_depths.reserve(def_out.size());
+  LastIterationWriteCollector last_write_collector(
+      loop_collector.execution_loops);
+  last_write_collector.Collect(scope_entry_for);
+  for (const BufferRegion &region : opaque_access_collector.writes) {
+    last_write_collector.Invalidate(region->buffer);
+  }
   for (const BufferRegion &region : def_out) {
-    available_at_execution_depths.push_back(
-        ComputeAvailableExecutionDepth(region, loop_collector.execution_loops));
+    int available_depth =
+        ComputeAvailableExecutionDepth(region, loop_collector.execution_loops);
+    available_at_execution_depths.push_back(available_depth);
+    last_write_safe_execution_depths.push_back(
+        last_write_collector.GetSafeExecutionDepth(region->buffer,
+                                                   available_depth));
   }
 
   TileScopeRegion summary;
@@ -672,6 +776,7 @@ AnalyzeOneTileScopeRegion(const PlannerVisibleRegionMatch &match,
   summary.use_in = use_in;
   summary.def_out = def_out;
   summary.available_at_execution_depths = available_at_execution_depths;
+  summary.last_write_safe_execution_depths = last_write_safe_execution_depths;
   return summary;
 }
 
