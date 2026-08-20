@@ -396,9 +396,7 @@ def reduction_consumer_lowered_kernel(block_n=64):
                 block_n=block_n,
                 tile_size=tile_size,
             ),
-            _lowered_row_reduction_region(
-                "values", "row_max", block_m=block_m, block_n=block_n, tile_size=tile_size
-            ),
+            _lowered_row_reduction_region("values", "row_max", block_m=block_m, block_n=block_n, tile_size=tile_size),
             _lowered_2d_tile_region(
                 "b_shared",
                 "values[i * 4 + ki, j * 32 + kj] - row_max[i * 4 + ki]",
@@ -990,9 +988,7 @@ def test_sunmmio_tile_loop_fusion_can_share_only_the_outer_loop_prefix():
 
 
 def test_sunmmio_tile_loop_fusion_waits_for_conditional_raw_reduction_write():
-    mod = IRModule.from_expr(
-        reduction_consumer_lowered_kernel().with_attr("global_symbol", "main")
-    )
+    mod = IRModule.from_expr(reduction_consumer_lowered_kernel().with_attr("global_symbol", "main"))
     mod = tl.transform.SunmmioTileLoopFusion()(mod)
 
     outer_scope = _expect_single_match(
@@ -1003,8 +999,7 @@ def test_sunmmio_tile_loop_fusion_waits_for_conditional_raw_reduction_write():
     inner_scopes = [
         stmt
         for stmt in _as_seq(outer_scope.body)
-        if isinstance(stmt, tvm.tir.For)
-        and _for_annotations(stmt).get("tile.execution_axis") == 1
+        if isinstance(stmt, tvm.tir.For) and _for_annotations(stmt).get("tile.execution_axis") == 1
     ]
 
     assert len(inner_scopes) == 2
@@ -1013,9 +1008,7 @@ def test_sunmmio_tile_loop_fusion_waits_for_conditional_raw_reduction_write():
 
 
 def test_sunmmio_tile_loop_fusion_keeps_conditional_war_reduction_write_fused():
-    mod = IRModule.from_expr(
-        war_reduction_lowered_kernel().with_attr("global_symbol", "main")
-    )
+    mod = IRModule.from_expr(war_reduction_lowered_kernel().with_attr("global_symbol", "main"))
     mod = tl.transform.SunmmioTileLoopFusion()(mod)
 
     scope_loops = _find_scope_entry_loops(_root_seq(mod))
@@ -1024,8 +1017,7 @@ def test_sunmmio_tile_loop_fusion_keeps_conditional_war_reduction_write_fused():
     inner_scopes = [
         stmt
         for stmt in _as_seq(scope_loops[0].body)
-        if isinstance(stmt, tvm.tir.For)
-        and _for_annotations(stmt).get("tile.execution_axis") == 1
+        if isinstance(stmt, tvm.tir.For) and _for_annotations(stmt).get("tile.execution_axis") == 1
     ]
     assert len(inner_scopes) == 1
 
@@ -1057,9 +1049,7 @@ def test_sunmmio_tile_loop_fusion_keeps_conditional_war_reduction_write_fused():
 
 
 def test_sunmmio_tile_loop_fusion_splits_loop_carried_war_write():
-    mod = IRModule.from_expr(
-        unsafe_war_lowered_kernel().with_attr("global_symbol", "main")
-    )
+    mod = IRModule.from_expr(unsafe_war_lowered_kernel().with_attr("global_symbol", "main"))
     mod = tl.transform.SunmmioTileLoopFusion()(mod)
 
     scope_loops = _find_scope_entry_loops(_root_seq(mod))
@@ -1071,9 +1061,7 @@ def test_sunmmio_tile_loop_fusion_splits_loop_carried_war_write():
 
 
 def test_sunmmio_tile_loop_fusion_keeps_unit_trip_reduction_consumer_fused():
-    mod = IRModule.from_expr(
-        reduction_consumer_lowered_kernel(block_n=32).with_attr("global_symbol", "main")
-    )
+    mod = IRModule.from_expr(reduction_consumer_lowered_kernel(block_n=32).with_attr("global_symbol", "main"))
     mod = tl.transform.SunmmioTileLoopFusion()(mod)
 
     outer_scope = _expect_single_match(
@@ -1084,8 +1072,7 @@ def test_sunmmio_tile_loop_fusion_keeps_unit_trip_reduction_consumer_fused():
     inner_scopes = [
         stmt
         for stmt in _as_seq(outer_scope.body)
-        if isinstance(stmt, tvm.tir.For)
-        and _for_annotations(stmt).get("tile.execution_axis") == 1
+        if isinstance(stmt, tvm.tir.For) and _for_annotations(stmt).get("tile.execution_axis") == 1
     ]
 
     assert len(inner_scopes) == 1
