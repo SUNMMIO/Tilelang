@@ -137,6 +137,47 @@ bool IsCompatibleProjectedTileView(const Optional<TileView> &maybe_manual_tv,
   return true;
 }
 
+bool IsLegalProjectedDstTileView(const BufferRegion &dst_region,
+                                 const ReduceTileCandidate &candidate,
+                                 const Map<Buffer, Layout> &layout_map,
+                                 const SunmmioTileProcessorConfig &config,
+                                 arith::Analyzer *analyzer) {
+  const TileView &dst_tileview = candidate.dst_tileview;
+  int tile_rank = static_cast<int>(dst_tileview->TileDim());
+  if (tile_rank == 0) {
+    return true;
+  }
+
+  int dst_rank = static_cast<int>(dst_region->region.size());
+  int exec_rank = dst_rank == 1 ? 1 : 2;
+  for (const TrailingTilePattern &pattern :
+       EnumerateInferredTrailingTilePatterns(
+           dst_region->buffer, exec_rank, layout_map, config, analyzer,
+           {TileExtentPolicy::kReductionLayoutBounded,
+            AlignmentMode::kRelaxed})) {
+    if (static_cast<int>(pattern.tile_shape.size()) != tile_rank) {
+      continue;
+    }
+    bool matches = true;
+    for (int axis = 0; axis < tile_rank; ++axis) {
+      int mapped_dim =
+          NormalizeMappedDim(dst_tileview->IndexMap()[axis], dst_rank);
+      if (pattern.mapped_dims[axis] != mapped_dim ||
+          !analyzer->CanProveEqual(dst_tileview->TileShape()[axis],
+                                   Integer(pattern.tile_shape[axis])) ||
+          !CanProveDivisible(analyzer, dst_region->region[mapped_dim]->min,
+                             pattern.tile_shape[axis])) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      return true;
+    }
+  }
+  return false;
+}
+
 ReduceTileCandidate
 MakeCandidate(const Array<PrimExpr> &source_domain,
               const Array<PrimExpr> &dst_domain,
@@ -184,9 +225,7 @@ TrailingTilePattern ValidateManualSrcTilePattern(
     const Map<Buffer, Layout> &layout_map,
     const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer) {
   int src_rank = static_cast<int>(src_region->region.size());
-  TileExtentPolicy extent_policy =
-      src_rank <= 2 ? TileExtentPolicy::kReductionLayoutBounded
-                    : TileExtentPolicy::kRegisterBounded;
+  TileExtentPolicy extent_policy = TileExtentPolicy::kReductionLayoutBounded;
   TrailingTilePattern pattern = ValidateManualTrailingTileView(
       src_region->buffer, manual_tv, src_rank == 1 ? 1 : 2, layout_map, config,
       analyzer, {extent_policy, AlignmentMode::kStrict},
@@ -213,12 +252,7 @@ std::vector<ReduceTileCandidate> EnumerateInferredCandidates(
     const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer) {
   std::vector<ReduceTileCandidate> candidates;
   int exec_rank = static_cast<int>(source_domain.size()) == 1 ? 1 : 2;
-  // Higher-rank reductions can be nested under another tiled scope. Their
-  // accumulator projection is not yet isolated from the outer codegen state,
-  // so retain the register-bounded plan until that capability is available.
-  TileExtentPolicy extent_policy =
-      source_domain.size() <= 2 ? TileExtentPolicy::kReductionLayoutBounded
-                                : TileExtentPolicy::kRegisterBounded;
+  TileExtentPolicy extent_policy = TileExtentPolicy::kReductionLayoutBounded;
   int src_capacity_elems = GetCapacityElems(src_region->buffer, config);
   int dst_capacity_elems = GetCapacityElems(dst_region->buffer, config);
   for (const TrailingTilePattern &pattern :
@@ -300,7 +334,9 @@ PlanReduceTileViews(const BufferRegion &src_region,
   std::vector<ReduceTileCandidate> compatible_candidates;
   compatible_candidates.reserve(candidates.size());
   for (const ReduceTileCandidate &candidate : candidates) {
-    if (IsCompatibleProjectedTileView(hints.dst_tileview,
+    if (IsLegalProjectedDstTileView(dst_region, candidate, layout_map,
+                                    tile_processor_config, analyzer) &&
+        IsCompatibleProjectedTileView(hints.dst_tileview,
                                       candidate.dst_tileview, analyzer)) {
       compatible_candidates.push_back(candidate);
     }
