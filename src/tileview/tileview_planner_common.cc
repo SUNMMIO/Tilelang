@@ -418,7 +418,8 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
     return patterns;
   }
 
-  if (options.extent_policy == TileExtentPolicy::kTilesExecutionLayoutBounded) {
+  if (options.extent_policy == TileExtentPolicy::kTilesExecutionLayoutBounded ||
+      options.extent_policy == TileExtentPolicy::kReductionLayoutBounded) {
     if (auto envelope =
             GetTilesExecutionEnvelope(buffer, exec_rank, layout_map)) {
       return EnumerateLayoutBoundedPatterns(buffer, exec_rank, config,
@@ -574,7 +575,8 @@ TrailingTilePattern ValidateManualTrailingTileView(
       << buffer->name << ".";
 
   std::optional<TrailingTileEnvelope> execution_envelope;
-  if (options.extent_policy == TileExtentPolicy::kTilesExecutionLayoutBounded) {
+  if (options.extent_policy == TileExtentPolicy::kTilesExecutionLayoutBounded ||
+      options.extent_policy == TileExtentPolicy::kReductionLayoutBounded) {
     execution_envelope =
         GetTilesExecutionEnvelope(buffer, exec_rank, layout_map);
   }

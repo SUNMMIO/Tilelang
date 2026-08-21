@@ -72,13 +72,14 @@ enum class AlignmentMode {
  * \brief Selects the semantic extent limit used by a TileView consumer.
  *
  * Execution TileViews may span the layout-defined contiguous envelope and be
- * split into register-sized partitions later by NPU-IR. Reduction and scalar
- * carrier TileViews remain register-bounded until their lowering and cost
- * models are migrated independently.
+ * split into register-sized partitions later by NPU-IR. Reduction uses a
+ * separate policy because its lowering and cost model impose additional
+ * capability checks. Scalar carrier TileViews remain register-bounded.
  */
 enum class TileExtentPolicy {
   kRegisterBounded,
   kTilesExecutionLayoutBounded,
+  kReductionLayoutBounded,
 };
 
 struct TilePatternOptions {
