@@ -819,6 +819,25 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     std::vector<PrimExpr> logical_partition_indices(indices.size());
     for (int dim = 0; dim < static_cast<int>(indices.size()); ++dim) {
       MarkVisitedExprRoot(indices[dim]);
+      for (const ForNode *interior_loop :
+           {state->interior_axis0_loop, state->interior_axis1_loop}) {
+        if (interior_loop == nullptr ||
+            !indices[dim].same_as(interior_loop->loop_var)) {
+          continue;
+        }
+        std::optional<int> axis = GetInteriorAxisAnnotation(interior_loop);
+        std::optional<int64_t> extent = GetStaticLoopExtent(interior_loop);
+        ICHECK(axis.has_value() && extent.has_value());
+        ICHECK_GE(*axis, 0);
+        ICHECK_LT(static_cast<size_t>(*axis), scope.tile_shape.size());
+        logical_tile_axes[dim] = *axis;
+        logical_tile_shapes[dim] = *extent;
+        logical_partition_indices[dim] = IntImm(indices[dim].dtype(), 0);
+        break;
+      }
+      if (logical_tile_axes[dim] >= 0) {
+        continue;
+      }
       for (int axis = 0; axis < static_cast<int>(scope.tile_shape.size());
            ++axis) {
         const ForNode *exec_loop = scope.execution_loops[axis];
@@ -2785,7 +2804,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     ICHECK_EQ(src_shape.size(), dst_shape.size())
         << "Tile broadcast expects rank-compatible shapes";
     ICHECK(CanBroadcastShapeTo(src_shape, dst_shape))
-        << "Tile value with shape " << shape_to_string(src_shape)
+        << "Tile value " << tile.value << " with shape "
+        << shape_to_string(src_shape)
         << " is not broadcastable to target shape "
         << shape_to_string(dst_shape);
     ICHECK(!tile.dtype.is_bool())
@@ -3988,9 +4008,30 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           store->predicate.defined()) {
         state->active_tail_store_predicate = store->predicate.value();
       }
+      std::unordered_map<const BufferNode *, SunMMIOValue>
+          saved_local_unit_values;
+      if (use_forced_unit_axis && access.tile_rank == 2) {
+        tir::PostOrderVisit(store->value, [&](const ObjectRef &obj) {
+          const auto *load = obj.as<BufferLoadNode>();
+          if (!load) {
+            return;
+          }
+          auto local_it = state->local_tile_values.find(load->buffer.get());
+          if (local_it == state->local_tile_values.end() ||
+              saved_local_unit_values.count(load->buffer.get())) {
+            return;
+          }
+          saved_local_unit_values.emplace(load->buffer.get(), local_it->second);
+          local_it->second =
+              reorient_unit_tile_to_shape(local_it->second, access.tile_shape);
+        });
+      }
       SunMMIOValue raw_rhs =
           lower_expr(store->value, state,
                      CanonicalizeSuvmDType(store->buffer->dtype).with_lanes(1));
+      for (const auto &kv : saved_local_unit_values) {
+        state->local_tile_values[kv.first] = kv.second;
+      }
       state->active_tail_store_predicate = saved_tail_store_predicate;
       SunMMIOValue rhs = access.requires_aligned_1d_load
                              ? normalize_for_aligned_1d_store(access, raw_rhs)

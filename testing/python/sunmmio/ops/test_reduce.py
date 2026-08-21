@@ -454,6 +454,19 @@ def test_tilelang_reduce_sunmmio_uses_layout_bounded_zz_source_tile(dtype):
     assert execution_domain_axes == [0, 1]
 
 
+def test_tilelang_reduce_sunmmio_bounds_source_tile_by_destination_layout():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    mod = reduce_kernel_with_blockwise_layout_builder((4, 32), 1, dtype="float32")
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    checker = ReduceIRChecker()
+    checker.visit_stmt(mod["main"].body)
+    assert checker.scope_root is not None
+    assert [int(x) for x in checker.scope_root.annotations["tile.tile_size"]] == [16, 32]
+
+
 def test_tilelang_reduce_sunmmio_manual_full_zz_block_source_tile():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     mod = reduce_kernel_with_tileview_builder((128, 128), reduce_axis=1, tile_size=(32, 32))

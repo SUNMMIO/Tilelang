@@ -12,6 +12,7 @@ from testing.python.sunmmio.common.codegen_validation import (
     assert_source_contains,
     validate_sunmmio_codegen_with_npuir_opt,
 )
+from tilelang.tileview import make_tileview
 
 
 tilelang.env.disable_cache()
@@ -72,7 +73,7 @@ def _valid_extent(tile_index, block, total):
 
 
 @target("Sunmmio")
-def reduce_kernel_builder(shape, reduce_axis, dtype="bfloat16", clear=True):
+def reduce_kernel_builder(shape, reduce_axis, dtype="bfloat16", clear=True, tile_size=None):
     shape = tuple(shape)
     out_shape = list(shape[:reduce_axis]) + list(shape[reduce_axis + 1 :])
     if not out_shape:
@@ -92,6 +93,8 @@ def reduce_kernel_builder(shape, reduce_axis, dtype="bfloat16", clear=True):
             A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
             Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
 
+            if tile_size is not None:
+                T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, (-2, -1))})
             if len(shape) == 3:
                 for bb in T.serial(shape[0]):
                     T.copy(A[bb, :, :], A_shared[bb, :, :])
@@ -308,13 +311,38 @@ def test_reduce_generic_in_tile_codegen_generates_expected_ops(tmp_path, shape, 
 
 @pytest.mark.parametrize("reduce_axis,clear", [(1, False), (2, True)])
 def test_reduce_tiled_in_tile_codegen_generates_expected_ops(tmp_path, reduce_axis, clear):
-    src = validate_sunmmio_codegen_loose(
-        reduce_tiled_test(reduce_axis=reduce_axis, clear=clear),
+    kernel = (
+        reduce_tiled_test(
+            b=4,
+            m=512,
+            n=128,
+            block_b=4,
+            block_m=512,
+            block_n=128,
+            reduce_axis=reduce_axis,
+            clear=clear,
+        )
+        if reduce_axis == 2
+        else reduce_tiled_test(reduce_axis=reduce_axis, clear=clear)
+    )
+    validate = validate_sunmmio_codegen_strict if reduce_axis == 2 else validate_sunmmio_codegen_loose
+    src = validate(
+        kernel,
         tmp_path,
         mlir_filename=f"reduce_tiled_axis_{reduce_axis}_suvm.mlir",
         expected_tokens=("suvm.copy_async", "suvm.tile.reduce"),
     )
     assert_source_contains(src, ("suvm.tile.reduce", "sum"))
+    if reduce_axis == 2:
+        assert_source_contains(
+            src,
+            (
+                "!suvm.tile<32x32xbf16>",
+                "suvm.tile.squeeze",
+                "suvm.tile.unsqueeze",
+                "!suvm.tile<1x32xbf16>",
+            ),
+        )
 
 
 def test_reduce_layout_bounded_zz_block_lowers_to_llvm(tmp_path):
@@ -329,7 +357,7 @@ def test_reduce_layout_bounded_zz_block_lowers_to_llvm(tmp_path):
 
 def test_reduce_small_1d_result_uses_aligned_store_bridge(tmp_path):
     src = validate_sunmmio_codegen_loose(
-        reduce_kernel_builder((32, 64, 256), 2, clear=True),
+        reduce_kernel_builder((32, 64, 256), 2, clear=True, tile_size=(8, 32)),
         tmp_path,
         mlir_filename="reduce_small_1d_result_aligned_store_suvm.mlir",
         expected_tokens=("suvm.tile.reduce", "suvm.tile.insert_slice", "suvm.tile.store"),
