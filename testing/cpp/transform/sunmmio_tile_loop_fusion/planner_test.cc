@@ -366,7 +366,7 @@ TEST(SunmmioTileLoopFusionPlannerTest,
 }
 
 TEST(SunmmioTileLoopFusionPlannerTest,
-     LaterTileConsumerCanReorderAheadOfEarlierRowConsumer) {
+     LaterTileConsumerReordersButRank1ConsumerStaysOutsideRank2Shell) {
   Buffer row_buffer = MakeSharedBuffer("row_buffer", {I(8)});
   Buffer tile_buffer = MakeSharedBuffer("tile_buffer", {I(8), I(1)});
 
@@ -391,17 +391,17 @@ TEST(SunmmioTileLoopFusionPlannerTest,
   SunmmioTileLoopFusionWindowPlan plan = PlanSingleProblem(problem);
 
   EXPECT_EQ(LeafRegionOrder(plan.tree), std::vector<int>({0, 2, 1}));
-  EXPECT_EQ(plan.score.write_cut_cost, 0);
+  EXPECT_EQ(plan.score.write_cut_cost, 256);
   EXPECT_EQ(plan.score.shared_read_cost, 0);
   EXPECT_EQ(plan.score.reorder_penalty, 1);
 
-  ASSERT_EQ(plan.tree.size(), 1U);
+  ASSERT_EQ(plan.tree.size(), 2U);
   EXPECT_TRUE(plan.tree[0].is_scope);
   EXPECT_EQ(plan.tree[0].shell_axes, std::vector<std::string>({"i"}));
-  ASSERT_EQ(plan.tree[0].children.size(), 2U);
+  ASSERT_EQ(plan.tree[0].children.size(), 1U);
   EXPECT_TRUE(plan.tree[0].children[0].is_scope);
-  EXPECT_FALSE(plan.tree[0].children[1].is_scope);
-  EXPECT_EQ(plan.tree[0].children[1].region_index, 1);
+  EXPECT_FALSE(plan.tree[1].is_scope);
+  EXPECT_EQ(plan.tree[1].region_index, 1);
 
   const SunmmioTileLoopFusionPlannerTreeNode &inner_scope =
       plan.tree[0].children[0];

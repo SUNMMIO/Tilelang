@@ -1,7 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include "comm.h"
 #include "sunmmio_utils.h"
+#include "tileview/tileview_planner_common.h"
 
 namespace tvm {
 namespace tl {
@@ -108,6 +111,14 @@ TEST(SunmmioDirectTransferTest, A4EMapsCommunicationDirectionsToLinks) {
       target, CommunicationDirections::kHorizontalAndVertical,
       kSunmmioScopeRSRAM, DataType::Float(16), kSunmmioScopeRSRAM,
       DataType::Float(16)));
+}
+
+TEST(SunmmioTileChunkAlignmentTest, LargeStaticExtentsDoNotOverflow) {
+  constexpr int kMaxExtent = std::numeric_limits<int>::max();
+
+  EXPECT_FALSE(IsTileChunkRsramAligned(kMaxExtent, kMaxExtent, 32, 64));
+  EXPECT_TRUE(IsTileChunkRsramAligned(kMaxExtent, kMaxExtent - 15, 32, 64));
+  EXPECT_TRUE(IsTileChunkRsramAligned(kMaxExtent, kMaxExtent - 7, 32, 96));
 }
 
 } // namespace

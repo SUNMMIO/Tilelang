@@ -256,6 +256,7 @@ std::vector<AccessTileCandidate> EnumerateManualCandidates(
   std::vector<AccessTileCandidate> candidates;
   TrailingTilePattern pattern = ValidateManualTrailingTileView(
       buffer, manual_tv, exec_rank, layout_map, config, analyzer,
+      {TileExtentPolicy::kTilesExecutionLayoutBounded, AlignmentMode::kStrict},
       "TileView inside T.Tiles");
   AddCandidateFromPattern(&candidates, buffer, indices, bindings, pattern,
                           analyzer, /*strict_checks=*/true);
@@ -271,7 +272,8 @@ std::vector<AccessTileCandidate> EnumerateInferredCandidates(
   std::vector<AccessTileCandidate> candidates;
   for (const TrailingTilePattern &pattern :
        EnumerateInferredTrailingTilePatterns(
-           buffer, exec_rank, layout_map, config, analyzer, alignment_mode)) {
+           buffer, exec_rank, layout_map, config, analyzer,
+           {TileExtentPolicy::kTilesExecutionLayoutBounded, alignment_mode})) {
     AddCandidateFromPattern(&candidates, buffer, indices, bindings, pattern,
                             analyzer, /*strict_checks=*/false);
   }
@@ -709,8 +711,8 @@ TrySelectPlan(const Array<PrimExpr> &domain,
   std::sort(
       plan_candidates.begin(), plan_candidates.end(),
       [](const ExecutionPlanCandidate &lhs, const ExecutionPlanCandidate &rhs) {
-        int lhs_elems = TileElements(lhs.tile_shape);
-        int rhs_elems = TileElements(rhs.tile_shape);
+        int64_t lhs_elems = TileElements(lhs.tile_shape);
+        int64_t rhs_elems = TileElements(rhs.tile_shape);
         if (lhs_elems != rhs_elems) {
           return lhs_elems > rhs_elems;
         }

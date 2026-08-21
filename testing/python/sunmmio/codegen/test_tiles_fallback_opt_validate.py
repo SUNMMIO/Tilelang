@@ -267,15 +267,16 @@ def test_packed_2d_to_1d_falls_back_to_rank1_carriers(tmp_path):
     )
 
 
-def test_mixed_rank_unit_side_load_uses_carrier_pick(tmp_path):
+def test_mixed_rank_unit_side_load_broadcasts_rank1_tile(tmp_path):
     src = validate_sunmmio_codegen_with_npuir_opt(
         mixed_rank_unit_side_load_kernel(),
         tmp_path,
         mlir_filename="mixed_rank_unit_side_load_suvm.mlir",
-        expected_tokens=("!suvm.tile<1x128xf32>", "!suvm.tile_view<16xf32>", "suvm.tile.pick"),
+        expected_tokens=("!suvm.tile<64x128xf32>", "!suvm.tile_view<64xf32>", "suvm.tile.unsqueeze"),
         opt_args=STRICT_OPT_ARGS,
     )
     assert "suvm.tile.extract_slice" not in src
+    assert "suvm.tile.pick" not in src
 
 
 @pytest.mark.parametrize(

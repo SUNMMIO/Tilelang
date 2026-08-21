@@ -310,9 +310,10 @@ SelectScalarTilePattern(const tir::Buffer &buffer, int tile_rank,
                         arith::Analyzer *analyzer, std::string *last_reason) {
   std::vector<tl::TrailingTilePattern> legal_patterns;
   for (const tl::TrailingTilePattern &pattern :
-       tl::EnumerateInferredTrailingTilePatterns(buffer, tile_rank, layout_map,
-                                                 config, analyzer,
-                                                 tl::AlignmentMode::kStrict)) {
+       tl::EnumerateInferredTrailingTilePatterns(
+           buffer, tile_rank, layout_map, config, analyzer,
+           {tl::TileExtentPolicy::kRegisterBounded,
+            tl::AlignmentMode::kStrict})) {
     if (static_cast<int>(pattern.tile_shape.size()) != tile_rank) {
       continue;
     }
@@ -341,8 +342,8 @@ SelectScalarTilePattern(const tir::Buffer &buffer, int tile_rank,
   std::sort(legal_patterns.begin(), legal_patterns.end(),
             [](const tl::TrailingTilePattern &lhs,
                const tl::TrailingTilePattern &rhs) {
-              int lhs_elems = tl::TileElements(lhs.tile_shape);
-              int rhs_elems = tl::TileElements(rhs.tile_shape);
+              int64_t lhs_elems = tl::TileElements(lhs.tile_shape);
+              int64_t rhs_elems = tl::TileElements(rhs.tile_shape);
               if (lhs_elems != rhs_elems) {
                 return lhs_elems > rhs_elems;
               }
