@@ -26,8 +26,8 @@ struct ReduceTileCandidate {
   std::vector<int> execution_domain_axes;
   int reduce_tile_axis{-1};
   int reduce_tile_extent{1}; // tile extent on the reduce dim (1 if not tiled)
-  int src_tile_elems{1};
-  int dst_tile_elems{1};
+  int64_t src_tile_elems{1};
+  int64_t dst_tile_elems{1};
 };
 
 Array<PrimExpr> RegionExtents(const BufferRegion &region) {
@@ -180,7 +180,8 @@ TrailingTilePattern ValidateManualSrcTilePattern(
   int src_rank = static_cast<int>(src_region->region.size());
   TrailingTilePattern pattern = ValidateManualTrailingTileView(
       src_region->buffer, manual_tv, src_rank == 1 ? 1 : 2, layout_map, config,
-      analyzer, "Manual src TileView for Sunmmio reduction");
+      analyzer, {TileExtentPolicy::kRegisterBounded, AlignmentMode::kStrict},
+      "Manual src TileView for Sunmmio reduction");
 
   for (size_t axis = 0; axis < pattern.tile_shape.size(); ++axis) {
     int src_dim = pattern.mapped_dims[axis];
@@ -204,8 +205,9 @@ std::vector<ReduceTileCandidate> EnumerateInferredCandidates(
   std::vector<ReduceTileCandidate> candidates;
   int exec_rank = static_cast<int>(source_domain.size()) == 1 ? 1 : 2;
   for (const TrailingTilePattern &pattern :
-       EnumerateInferredTrailingTilePatterns(src_region->buffer, exec_rank,
-                                             layout_map, config, analyzer)) {
+       EnumerateInferredTrailingTilePatterns(
+           src_region->buffer, exec_rank, layout_map, config, analyzer,
+           {TileExtentPolicy::kRegisterBounded, AlignmentMode::kStrict})) {
     bool aligned = true;
     for (size_t axis = 0; axis < pattern.tile_shape.size(); ++axis) {
       int src_dim = pattern.mapped_dims[axis];
