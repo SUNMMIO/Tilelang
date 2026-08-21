@@ -32,6 +32,7 @@ REDUCE_IN_TILE_CASES = [
 ]
 
 LOOSE_OPT_ARGS = ("--verify-each",)
+STRICT_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
 
 
 def validate_sunmmio_codegen_loose(kernel, tmp_path, *, mlir_filename, expected_tokens=()):
@@ -41,6 +42,16 @@ def validate_sunmmio_codegen_loose(kernel, tmp_path, *, mlir_filename, expected_
         mlir_filename=mlir_filename,
         expected_tokens=expected_tokens,
         opt_args=LOOSE_OPT_ARGS,
+    )
+
+
+def validate_sunmmio_codegen_strict(kernel, tmp_path, *, mlir_filename, expected_tokens=()):
+    return validate_sunmmio_codegen_with_npuir_opt(
+        kernel,
+        tmp_path,
+        mlir_filename=mlir_filename,
+        expected_tokens=expected_tokens,
+        opt_args=STRICT_OPT_ARGS,
     )
 
 
@@ -304,6 +315,16 @@ def test_reduce_tiled_in_tile_codegen_generates_expected_ops(tmp_path, reduce_ax
         expected_tokens=("suvm.copy_async", "suvm.tile.reduce"),
     )
     assert_source_contains(src, ("suvm.tile.reduce", "sum"))
+
+
+def test_reduce_layout_bounded_zz_block_lowers_to_llvm(tmp_path):
+    src = validate_sunmmio_codegen_strict(
+        reduce_kernel_builder((512, 128), 1, dtype="bfloat16", clear=True),
+        tmp_path,
+        mlir_filename="reduce_layout_bounded_zz_block_suvm.mlir",
+        expected_tokens=("suvm.tile.reduce", "!suvm.tile<32x32xbf16>"),
+    )
+    assert_source_contains(src, ("suvm.tile.reduce", "!suvm.tile<32x32xbf16>"))
 
 
 def test_reduce_small_1d_result_uses_aligned_store_bridge(tmp_path):
