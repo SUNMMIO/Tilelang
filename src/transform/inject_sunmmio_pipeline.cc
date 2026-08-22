@@ -988,36 +988,49 @@ private:
       Map<Integer, Array<String>> dynamic_orders =
           Downcast<Map<Integer, Array<String>>>(
               dynamic_epilogue_orders_anno.value());
-      Optional<Array<String>> selected_orders;
-      for (const auto &kv : dynamic_orders) {
-        if (kv.first->value == 0) {
-          selected_orders = kv.second;
-          break;
+      auto build_dynamic_epilogue = [&](const Array<String> &schedule) {
+        Array<Stmt> epilogue_body;
+        for (const String &order_str : schedule) {
+          int iter = name2iter(order_str);
+          int id = name2id(order_str);
+          PrimExpr logical_iter = extent * iterations + iter;
+          PrimExpr replaced_loop_var = logical_iter + for_node->min;
+          Stmt stmt = pipeline_body_seq->seq[id];
+          rewriter.set_current_command(id);
+          rewriter.set_current_version(version_slot(iter));
+          rewriter.set_loop_var_replacement(replaced_loop_var);
+          stmt = rewriter(stmt);
+          PrimExpr valid = And(GE(logical_iter, Integer(0)),
+                               LT(logical_iter, for_node->extent));
+          epilogue_body.push_back(IfThenElse(valid, stmt));
+        }
+        return SeqStmt::Flatten(epilogue_body);
+      };
+
+      PrimExpr runtime_remainder =
+          floormod(for_node->extent, Integer(iterations));
+      Stmt dispatched_epilogue{nullptr};
+      for (int remainder = iterations - 1; remainder >= 0; --remainder) {
+        Optional<Array<String>> schedule;
+        for (const auto &kv : dynamic_orders) {
+          if (kv.first->value == remainder) {
+            schedule = kv.second;
+            break;
+          }
+        }
+        ICHECK(schedule.defined())
+            << "Missing dynamic epilogue schedule for remainder " << remainder;
+        Stmt branch = build_dynamic_epilogue(schedule.value());
+        if (!dispatched_epilogue.defined()) {
+          dispatched_epilogue = std::move(branch);
+        } else {
+          dispatched_epilogue =
+              IfThenElse(EQ(runtime_remainder, Integer(remainder)),
+                         std::move(branch), std::move(dispatched_epilogue));
         }
       }
-      ICHECK(selected_orders.defined())
-          << "Missing full dynamic epilogue schedule";
-      std::map<int, Array<Stmt>> epilogue_groups;
-      for (const String &order_str : selected_orders.value()) {
-        int iter = name2iter(order_str);
-        int id = name2id(order_str);
-        PrimExpr logical_iter = extent * iterations + iter;
-        PrimExpr replaced_loop_var = logical_iter + for_node->min;
-        Stmt stmt = pipeline_body_seq->seq[id];
-        rewriter.set_current_command(id);
-        rewriter.set_current_version(version_slot(iter));
-        rewriter.set_loop_var_replacement(replaced_loop_var);
-        stmt = rewriter(stmt);
-        epilogue_groups[iter].push_back(stmt);
-      }
-      Array<Stmt> epilogue_body;
-      for (const auto &[iter, group] : epilogue_groups) {
-        PrimExpr logical_iter = extent * iterations + iter;
-        PrimExpr valid = And(GE(logical_iter, Integer(0)),
-                             LT(logical_iter, for_node->extent));
-        epilogue_body.push_back(IfThenElse(valid, SeqStmt::Flatten(group)));
-      }
-      for_body.push_back(SeqStmt::Flatten(epilogue_body));
+      ICHECK(dispatched_epilogue.defined());
+      for_body.push_back(dispatched_epilogue);
     }
     return SeqStmt::Flatten(for_body);
   }

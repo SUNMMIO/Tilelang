@@ -846,7 +846,8 @@ static bool VerifyDynamicLogicalCoverage(
     if (!record(group * iterations, body, false))
       return false;
   }
-  auto epilogue_it = epilogues.find(0);
+  int remainder = extent % iterations;
+  auto epilogue_it = epilogues.find(remainder);
   if (epilogue_it == epilogues.end() ||
       !record(steady_groups * iterations, epilogue_it->second, true)) {
     return false;

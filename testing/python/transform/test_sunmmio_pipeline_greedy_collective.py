@@ -147,6 +147,119 @@ def _pipeline_loops(stmt):
     return loops
 
 
+def _make_dynamic_injector_fixture(iterations, schedules):
+    extent = tir.Var("extent", "int32")
+    loop_var = tir.Var("i", "int32")
+    commands = tir.SeqStmt(
+        [tir.Evaluate(tir.call_extern("int32", "dynamic_epilogue_marker", loop_var, command_id)) for command_id in range(2)]
+    )
+    body_orders = [f"{iteration}-{command_id}" for iteration in range(iterations) for command_id in range(2)]
+    dynamic_orders = {tir.IntImm("int32", remainder): schedule for remainder, schedule in schedules.items()}
+    loop = tir.For(
+        loop_var,
+        0,
+        extent,
+        tir.ForKind.SERIAL,
+        commands,
+        annotations={
+            "iterations": iterations,
+            "used_buffers": [],
+            "versioned_buffers": [],
+            "prologue_orders": [],
+            "body_orders": body_orders,
+            "dynamic_epilogue_orders": dynamic_orders,
+        },
+    )
+    func = tir.PrimFunc([extent], loop).with_attr("global_symbol", "main")
+    return tvm.IRModule.from_expr(func), extent
+
+
+def _dynamic_dispatch_branches(dispatch, extent, iterations):
+    branches = {}
+    current = dispatch
+    for remainder in range(iterations - 1):
+        assert isinstance(current, tir.IfThenElse)
+        expected_condition = tir.floormod(extent, iterations) == remainder
+        assert tvm.ir.structural_equal(current.condition, expected_condition, map_free_vars=True)
+        branches[remainder] = current.then_case
+        current = current.else_case
+    branches[iterations - 1] = current
+    return branches
+
+
+def _epilogue_marker_order(stmt, extent, iterations):
+    base = tir.floordiv(tir.max(0, extent - 1), iterations) * iterations
+    analyzer = tvm.arith.Analyzer()
+    order = []
+
+    def visit(node):
+        if not isinstance(node, tir.Call) or not isinstance(node.op, tvm.ir.Op):
+            return
+        if node.op.name != "tir.call_extern" or node.args[0].value != "dynamic_epilogue_marker":
+            return
+        logical_iteration = analyzer.simplify(node.args[1] - base)
+        assert isinstance(logical_iteration, tir.IntImm)
+        order.append((int(logical_iteration), int(node.args[2])))
+
+    tir.stmt_functor.post_order_visit(stmt, visit)
+    return order
+
+
+def test_dynamic_epilogue_dispatch_preserves_each_remainder_schedule():
+    schedules = {
+        0: ["0-0", "1-0", "0-1", "2-0", "1-1", "2-1"],
+        1: ["0-1", "0-0"],
+        2: ["1-0", "0-1", "0-0", "1-1"],
+    }
+    mod, extent = _make_dynamic_injector_fixture(3, schedules)
+    injected = tl.transform.InjectSunmmioPipeline()(mod)
+    body = injected["main"].body
+    assert isinstance(body, tir.SeqStmt)
+    branches = _dynamic_dispatch_branches(body.seq[-1], extent, 3)
+
+    for remainder, schedule in schedules.items():
+        expected = [tuple(map(int, order.split("-"))) for order in schedule]
+        assert _epilogue_marker_order(branches[remainder], extent, 3) == expected
+
+
+def test_dynamic_extent_planner_and_injector_select_remainder_schedule():
+    mod = _lower_ffn()
+    func = mod["main"]
+    dynamic_extent = tir.Var("dynamic_extent", "int32")
+
+    def replace_pipeline_extent(node):
+        if isinstance(node, tir.For) and node.annotations and "num_stages" in node.annotations:
+            return tir.For(
+                node.loop_var,
+                node.min,
+                dynamic_extent,
+                node.kind,
+                node.body,
+                node.thread_binding,
+                node.annotations,
+            )
+        return None
+
+    body = tir.stmt_functor.ir_transform(func.body, replace_pipeline_extent, None, ["tir.For"])
+    dynamic_func = tir.PrimFunc(
+        [*func.params, dynamic_extent],
+        body,
+        func.ret_type,
+        func.buffer_map,
+        func.attrs,
+    )
+    planned = tl.transform.SunmmioPipelinePlanning(debug=False)(tvm.IRModule({"main": dynamic_func}))
+    planned_loops = _pipeline_loops(planned["main"].body)
+    assert len(planned_loops) == 2
+    for loop in planned_loops:
+        assert bool(loop.annotations["tl.sunmmio.pipeline.applied"])
+        assert {int(key) for key in loop.annotations["dynamic_epilogue_orders"]} == {0, 1}
+
+    injected = tl.transform.InjectSunmmioPipeline()(planned)
+    assert not _pipeline_loops(injected["main"].body)
+    assert injected.script().count("dynamic_extent % 2") == 2
+
+
 def test_greedy_ffn_models_collective_order_and_relative_bank_precolors(monkeypatch, tmp_path):
     graph_path = tmp_path / "greedy_ffn_graph.json"
     monkeypatch.setenv("TL_SUNMMIO_PIPELINE_GRAPH_JSON", str(graph_path))
