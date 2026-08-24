@@ -155,18 +155,29 @@ bool IsLegalProjectedDstTileView(const BufferRegion &dst_region,
            dst_region->buffer, exec_rank, layout_map, config, analyzer,
            {TileExtentPolicy::kReductionLayoutBounded,
             AlignmentMode::kRelaxed})) {
-    if (static_cast<int>(pattern.tile_shape.size()) != tile_rank) {
+    std::vector<int> projected_pattern_dims;
+    std::vector<int> projected_pattern_shape;
+    for (size_t axis = 0; axis < pattern.tile_shape.size(); ++axis) {
+      int mapped_dim = pattern.mapped_dims[axis];
+      if (analyzer->CanProveEqual(dst_region->region[mapped_dim]->extent,
+                                  Integer(1))) {
+        continue;
+      }
+      projected_pattern_dims.push_back(mapped_dim);
+      projected_pattern_shape.push_back(pattern.tile_shape[axis]);
+    }
+    if (static_cast<int>(projected_pattern_shape.size()) != tile_rank) {
       continue;
     }
     bool matches = true;
     for (int axis = 0; axis < tile_rank; ++axis) {
       int mapped_dim =
           NormalizeMappedDim(dst_tileview->IndexMap()[axis], dst_rank);
-      if (pattern.mapped_dims[axis] != mapped_dim ||
+      if (projected_pattern_dims[axis] != mapped_dim ||
           !analyzer->CanProveEqual(dst_tileview->TileShape()[axis],
-                                   Integer(pattern.tile_shape[axis])) ||
+                                   Integer(projected_pattern_shape[axis])) ||
           !CanProveDivisible(analyzer, dst_region->region[mapped_dim]->min,
-                             pattern.tile_shape[axis])) {
+                             projected_pattern_shape[axis])) {
         matches = false;
         break;
       }
@@ -211,9 +222,13 @@ MakeCandidate(const Array<PrimExpr> &source_domain,
     dst_tile_shape.push_back(src_tile_shape[axis]);
   }
 
-  candidate.dst_tileview = makeTileView(
-      dst_domain, dst_tile_shape,
-      MakeCanonicalIndexMap(dst_rank, static_cast<int>(dst_exec_axes.size())));
+  Array<PrimExpr> dst_index_map;
+  dst_index_map.reserve(dst_exec_axes.size());
+  for (int dst_axis : dst_exec_axes) {
+    dst_index_map.push_back(IntImm(DataType::Int(32), dst_axis));
+  }
+  candidate.dst_tileview =
+      makeTileView(dst_domain, dst_tile_shape, dst_index_map);
   candidate.dst_tile_elems = TileElements(dst_tile_shape);
   candidate.dst_partitions =
       (candidate.dst_tile_elems + dst_capacity_elems - 1) / dst_capacity_elems;

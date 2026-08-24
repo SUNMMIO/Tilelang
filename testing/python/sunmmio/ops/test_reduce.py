@@ -480,6 +480,29 @@ def test_tilelang_reduce_sunmmio_manual_full_zz_block_source_tile():
     assert [int(x) for x in checker.scope_root.annotations["tile.tile_size"]] == [32, 32]
 
 
+def test_tilelang_reduce_sunmmio_rejects_incompatible_manual_destination_tileview():
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+
+    @T.prim_func
+    def main(A: T.Tensor((32, 128), "float32"), Out: T.Tensor((32,), "float32")):
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((32, 128), "float32", scope="shared.rsram")
+            Out_shared = T.alloc_shared((32,), "float32", scope="shared.rsram")
+            T.annotate_tileview({Out_shared: make_tileview(Out_shared, (64,), (-1,))})
+            T.copy(A, A_shared)
+            T.reduce_sum(A_shared, Out_shared, dim=1)
+            T.copy(Out_shared, Out)
+
+    with (
+        tvm.target.Target(target),
+        pytest.raises(
+            tvm.error.InternalError,
+            match="Cannot infer a legal Sunmmio reduction TileView plan",
+        ),
+    ):
+        apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
+
+
 def test_tilelang_reduce_sunmmio_uses_row_major_covered_source_tile():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
 

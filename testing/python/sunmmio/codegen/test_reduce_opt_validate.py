@@ -73,8 +73,16 @@ def _valid_extent(tile_index, block, total):
 
 
 @target("Sunmmio")
-def reduce_kernel_builder(shape, reduce_axis, dtype="bfloat16", clear=True, tile_size=None):
+def reduce_kernel_builder(
+    shape,
+    reduce_axis,
+    dtype="bfloat16",
+    clear=True,
+    tile_size=None,
+    out_dtype=None,
+):
     shape = tuple(shape)
+    out_dtype = out_dtype or dtype
     out_shape = list(shape[:reduce_axis]) + list(shape[reduce_axis + 1 :])
     if not out_shape:
         out_shape = [1]
@@ -87,11 +95,11 @@ def reduce_kernel_builder(shape, reduce_axis, dtype="bfloat16", clear=True, tile
     @T.prim_func
     def main(
         A: T.MeshTensor(shape, shard_policy, dtype, layout=input_layout),  # type: ignore
-        Out: T.MeshTensor(out_shape, shard_policy, dtype, layout=output_layout),  # type: ignore
+        Out: T.MeshTensor(out_shape, shard_policy, out_dtype, layout=output_layout),  # type: ignore
     ):
         with T.Kernel():
             A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
-            Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+            Out_shared = T.alloc_shared(out_shape, out_dtype, scope="shared.rsram")
 
             if tile_size is not None:
                 T.annotate_tileview({A_shared: make_tileview(A_shared, tile_size, (-2, -1))})
@@ -101,6 +109,72 @@ def reduce_kernel_builder(shape, reduce_axis, dtype="bfloat16", clear=True, tile
             else:
                 T.copy(A, A_shared)
             T.reduce_sum(A_shared, Out_shared, dim=reduce_axis, clear=clear)
+            T.copy(Out_shared, Out)
+
+    return main
+
+
+@target("Sunmmio")
+def reduce_keepdim_kernel_builder(shape=(32, 128), reduce_axis=1, dtype="float32"):
+    out_shape = list(shape)
+    out_shape[reduce_axis] = 1
+    out_shape = tuple(out_shape)
+    shard_policy = T.placement.replicated()
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(shape, shard_policy, dtype, layout=_dram_input_layout(shape)),  # type: ignore
+        Out: T.MeshTensor(out_shape, shard_policy, dtype, layout=make_row_major(out_shape)),  # type: ignore
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+            T.copy(A, A_shared)
+            T.reduce_sum(A_shared, Out_shared, dim=reduce_axis)
+
+    return main
+
+
+@target("Sunmmio")
+def reduce_dynamic_region_kernel_builder(max_k=128, dtype="float32"):
+    shape = (32, max_k)
+    out_shape = (32,)
+    shard_policy = T.placement.replicated()
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(shape, shard_policy, dtype, layout=_dram_input_layout(shape)),  # type: ignore
+        Out: T.MeshTensor(out_shape, shard_policy, dtype, layout=make_row_major(out_shape)),  # type: ignore
+        k: T.int32,
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+            T.copy(A, A_shared)
+            T.reduce_sum(A_shared[:, 0:k], Out_shared, dim=1)
+            T.copy(Out_shared, Out)
+
+    return main
+
+
+@target("Sunmmio")
+def reduce_manual_dst_tileview_kernel_builder(dst_tile_size):
+    shape = (32, 128)
+    out_shape = (32,)
+    dtype = "float32"
+    shard_policy = T.placement.replicated()
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(shape, shard_policy, dtype, layout=_dram_input_layout(shape)),  # type: ignore
+        Out: T.MeshTensor(out_shape, shard_policy, dtype, layout=make_row_major(out_shape)),  # type: ignore
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+            T.annotate_tileview({Out_shared: make_tileview(Out_shared, (dst_tile_size,), (-1,))})
+            T.copy(A, A_shared)
+            T.reduce_sum(A_shared, Out_shared, dim=1)
             T.copy(Out_shared, Out)
 
     return main
@@ -353,6 +427,77 @@ def test_reduce_layout_bounded_zz_block_lowers_to_llvm(tmp_path):
         expected_tokens=("suvm.tile.reduce", "!suvm.tile<32x32xbf16>"),
     )
     assert_source_contains(src, ("suvm.tile.reduce", "!suvm.tile<32x32xbf16>"))
+
+
+@pytest.mark.parametrize("reduce_axis", [0, 1])
+def test_reduce_bf16_source_uses_fp32_semantic_accumulator(tmp_path, reduce_axis):
+    src = validate_sunmmio_codegen_loose(
+        reduce_kernel_builder(
+            (32, 128),
+            reduce_axis,
+            dtype="bfloat16",
+            out_dtype="float32",
+        ),
+        tmp_path,
+        mlir_filename=f"reduce_bf16_to_fp32_axis_{reduce_axis}_suvm.mlir",
+        expected_tokens=("suvm.tile.cast", "suvm.tile.reduce", "xf32>"),
+    )
+    cast = re.search(
+        r"suvm\.tile\.cast .*!suvm\.tile<(\d+x\d+)xbf16> -> !suvm\.tile<\1xf32>",
+        src,
+    )
+    assert cast, src
+    assert re.search(
+        rf"suvm\.tile\.reduce\s+sum, .*: !suvm\.tile<{cast.group(1)}xf32>",
+        src,
+    )
+
+
+@pytest.mark.parametrize("reduce_axis", [0, 1])
+def test_reduce_keepdim_preserves_unit_destination_axis(tmp_path, reduce_axis):
+    src = validate_sunmmio_codegen_loose(
+        reduce_keepdim_kernel_builder(reduce_axis=reduce_axis),
+        tmp_path,
+        mlir_filename=f"reduce_keepdim_axis_{reduce_axis}_suvm.mlir",
+        expected_tokens=("suvm.tile.reduce", "xf32>"),
+    )
+    expected_out_shape = "1x128" if reduce_axis == 0 else "32x1"
+    assert f"!suvm.memtensor<{expected_out_shape}xf32" in src
+    expected_result_shape = r"1x\d+" if reduce_axis == 0 else r"\d+x1"
+    assert re.search(
+        rf"suvm\.tile\.reduce\s+sum, .*\{{axis = {reduce_axis} : i64\}}.*"
+        rf"-> !suvm\.tile<{expected_result_shape}xf32>",
+        src,
+    )
+    surviving_axis = 1 - reduce_axis
+    assert re.search(
+        rf"get_partitioned_tile_view .* tiled_dims = \[{surviving_axis}\].*"
+        rf"!suvm\.memtensor<{expected_out_shape}xf32",
+        src,
+    )
+
+
+def test_reduce_dynamic_k_is_preserved_in_raw_suvm(tmp_path):
+    src = validate_sunmmio_codegen_loose(
+        reduce_dynamic_region_kernel_builder(),
+        tmp_path,
+        mlir_filename="reduce_dynamic_k_suvm.mlir",
+        expected_tokens=("suvm.tile.reduce", "scf.for"),
+    )
+    assert re.search(r"func\.func .*\bi32\b", src)
+    assert re.search(r"scf\.for .*%arg\d+", src)
+    assert_source_contains(src, ("suvm.tile.select", "suvm.tile.reduce  sum"))
+    assert re.search(r"suvm\.tile\.reduce\s+sum, .*: !suvm\.tile<\d+x32xf32>", src)
+
+
+def test_reduce_manual_destination_tileview_is_reflected_in_raw_suvm(tmp_path):
+    src = validate_sunmmio_codegen_loose(
+        reduce_manual_dst_tileview_kernel_builder(16),
+        tmp_path,
+        mlir_filename="reduce_manual_dst_tile_16_suvm.mlir",
+        expected_tokens=("suvm.tile.reduce", "!suvm.tile<16x1xf32>"),
+    )
+    assert_source_contains(src, ("!suvm.tile<16x32xf32>", "!suvm.tile<16x1xf32>"))
 
 
 def test_reduce_small_1d_result_uses_aligned_store_bridge(tmp_path):
