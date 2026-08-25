@@ -174,13 +174,13 @@ def _make_row_major_padded_2d_aligned_store_func():
     return tvm.tir.PrimFunc([], stmt).with_attr("layout_map", layout_map)
 
 
-def _make_small_2d_zz_carrier_func(tile_rows=1, tile_cols=1):
-    f32 = tvm.ir.PrimType("float32")
+def _make_small_2d_zz_carrier_func(tile_rows=1, tile_cols=1, dtype="float32"):
+    elem_type = tvm.ir.PrimType(dtype)
     one = tvm.tir.IntImm("bool", 1)
-    src_data = tvm.tir.Var("Src_shared_data", tvm.ir.PointerType(f32, "shared.rsram"))
-    dst_data = tvm.tir.Var("Dst_shared_data", tvm.ir.PointerType(f32, "shared.rsram"))
-    src = tvm.tir.decl_buffer((64, 64), "float32", name="Src_shared", data=src_data, scope="shared.rsram")
-    dst = tvm.tir.decl_buffer((64, 64), "float32", name="Dst_shared", data=dst_data, scope="shared.rsram")
+    src_data = tvm.tir.Var("Src_shared_data", tvm.ir.PointerType(elem_type, "shared.rsram"))
+    dst_data = tvm.tir.Var("Dst_shared_data", tvm.ir.PointerType(elem_type, "shared.rsram"))
+    src = tvm.tir.decl_buffer((64, 64), dtype, name="Src_shared", data=src_data, scope="shared.rsram")
+    dst = tvm.tir.decl_buffer((64, 64), dtype, name="Dst_shared", data=dst_data, scope="shared.rsram")
 
     tile_i = tvm.tir.Var("tile_i", "int32")
     tile_j = tvm.tir.Var("tile_j", "int32")
@@ -188,7 +188,11 @@ def _make_small_2d_zz_carrier_func(tile_rows=1, tile_cols=1):
     kj = tvm.tir.Var("kj", "int32")
     row = tile_i * 4 + ki
     col = tile_j * 4 + kj
-    store = tvm.tir.BufferStore(dst, tvm.tir.BufferLoad(src, [row, col]) * 2.0, [row, col])
+    store = tvm.tir.BufferStore(
+        dst,
+        tvm.tir.BufferLoad(src, [row, col]) * tvm.tir.FloatImm(dtype, 2.0),
+        [row, col],
+    )
 
     body = tvm.tir.For(
         kj,
@@ -234,10 +238,10 @@ def _make_small_2d_zz_carrier_func(tile_rows=1, tile_cols=1):
             dst,
             tvm.tir.Allocate(
                 src_data,
-                "float32",
+                dtype,
                 [64, 64],
                 one,
-                tvm.tir.Allocate(dst_data, "float32", [64, 64], one, body),
+                tvm.tir.Allocate(dst_data, dtype, [64, 64], one, body),
             ),
         ),
     )
@@ -308,3 +312,17 @@ def test_sunmmio_codegen_small_2d_zz_carrier_uses_dynamic_slice_offset(tmp_path)
     assert insert_lines
     assert any("[%" in line for line in extract_lines)
     assert any("[%" in line for line in insert_lines)
+
+
+def test_sunmmio_codegen_small_2d_bf16_zz_slice_uses_taller_carrier(tmp_path):
+    src = _build_sunmmio_source_from_func(_make_small_2d_zz_carrier_func(dtype="bfloat16"))
+    validate_suvm_mlir_with_npuir_opt(
+        src,
+        tmp_path,
+        mlir_filename="small_2d_bf16_zz_carrier_suvm.mlir",
+        opt_args=("--verify-each",),
+    )
+    assert "!suvm.tile_view<8x32xbf16>" in src
+    assert "suvm.tile.extract_slice" in src
+    assert "[4, 4]" in src
+    assert "suvm.tile.insert_slice" in src
