@@ -13,7 +13,7 @@ from testing.python.sunmmio.common.compile_pipeline import target
 tilelang.env.disable_cache()
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 
-STRICT_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
+RAW_MLIR_OPT_ARGS = ("--verify-each",)
 
 
 def _matrix_output_spec(h, w, dtype):
@@ -155,6 +155,28 @@ def mixed_rank_unit_side_load_kernel(rows=64, cols=128, dtype=T.float32):
 
 
 @target("Sunmmio")
+def exact_small_2d_fallback_baseline_kernel(dtype=T.float32):
+    matrix_shape = (64, 64)
+    vector_shape = (500,)
+    matrix_layout = make_zz_layout(matrix_shape, [0, 1], (32, 32))
+    vector_layout = make_aligned_row_major(vector_shape, dtype, align_bytes=64)
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            A_shared = T.alloc_shared(matrix_shape, dtype)
+            B_shared = T.alloc_shared(vector_shape, dtype)
+            T.annotate_layout({A_shared: matrix_layout, B_shared: vector_layout})
+
+            T.fill(A_shared, 1)
+            T.fill(B_shared, 2)
+            for i, j in T.Tiles([4, 4], parallel=True):
+                A_shared[i, j] = A_shared[i, j] * B_shared[i]
+
+    return main
+
+
+@target("Sunmmio")
 def non_unit_coefficient_scalar_fallback_kernel(domain=4, shape=16, dtype=T.float32):
     layout = make_aligned_row_major((shape, shape), dtype, align_bytes=64)
 
@@ -217,7 +239,7 @@ def _validate_aligned_1d_bridge(kernel, tmp_path, filename):
         tmp_path,
         mlir_filename=filename,
         expected_tokens=("suvm.tile.extract_slice", "suvm.tile.insert_slice", "!suvm.tile_view<16xf32>"),
-        opt_args=STRICT_OPT_ARGS,
+        opt_args=RAW_MLIR_OPT_ARGS,
     )
     assert "suvm.tile.pick" not in src
     assert "suvm.tile.set" not in src
@@ -229,7 +251,7 @@ def _validate_scalar_pick_set_fallback(kernel, tmp_path, filename):
         tmp_path,
         mlir_filename=filename,
         expected_tokens=("suvm.tile.pick", "suvm.tile.set", "suvm.tile.store"),
-        opt_args=STRICT_OPT_ARGS,
+        opt_args=RAW_MLIR_OPT_ARGS,
     )
     assert "suvm.tile.extract_slice" not in src
     assert "suvm.tile.insert_slice" not in src
@@ -243,7 +265,7 @@ def test_serialized_rank1_zz_slices_lower_through_aligned_carriers(tmp_path):
     )
 
 
-def test_temp_stage_subaligned_then_direct_lowers_to_llvm(tmp_path):
+def test_temp_stage_subaligned_then_direct_reaches_raw_suvm(tmp_path):
     _validate_aligned_1d_bridge(
         temp_stage_subaligned_then_direct_kernel(),
         tmp_path,
@@ -273,10 +295,22 @@ def test_mixed_rank_unit_side_load_broadcasts_rank1_tile(tmp_path):
         tmp_path,
         mlir_filename="mixed_rank_unit_side_load_suvm.mlir",
         expected_tokens=("!suvm.tile<64x128xf32>", "!suvm.tile_view<64xf32>", "suvm.tile.unsqueeze"),
-        opt_args=STRICT_OPT_ARGS,
+        opt_args=RAW_MLIR_OPT_ARGS,
     )
     assert "suvm.tile.extract_slice" not in src
     assert "suvm.tile.pick" not in src
+
+
+def test_exact_small_2d_fallback_baseline_uses_current_full_rank_plan(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        exact_small_2d_fallback_baseline_kernel(),
+        tmp_path,
+        mlir_filename="exact_small_2d_fallback_baseline_suvm.mlir",
+        expected_tokens=("!suvm.tile<32x32xf32>", "suvm.tile.unsqueeze", "suvm.tile.mulf"),
+        opt_args=RAW_MLIR_OPT_ARGS,
+    )
+    assert "suvm.tile.pick" not in src
+    assert "suvm.tile.set" not in src
 
 
 @pytest.mark.parametrize(
