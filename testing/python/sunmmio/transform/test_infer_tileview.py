@@ -464,7 +464,15 @@ def test_infer_rank1_tileview_from_2d_buffer_access_with_outer_loop_var():
 # ---------------------------------------------------------
 # Test 3: Mixed-rank (1D + 2D) in same T.Tiles
 # ---------------------------------------------------------
-def test_exact_small_2d_fallback_uses_domain_sized_carrier_plan():
+@pytest.mark.parametrize(
+    "dtype,expected_tile_size",
+    [
+        ("float16", [32, 32]),
+        ("bfloat16", [4, 4]),
+        ("float32", [4, 4]),
+    ],
+)
+def test_exact_small_2d_fallback_uses_domain_sized_carrier_plan(dtype, expected_tile_size):
     """The motivating 4x4 domain avoids oversubscribing to the full ZZ block."""
     matrix_shape = (64, 64)
     vector_shape = (500,)
@@ -472,12 +480,12 @@ def test_exact_small_2d_fallback_uses_domain_sized_carrier_plan():
     @T.prim_func
     def main():
         with T.Kernel(1, threads=128):
-            A_shared = T.alloc_shared(matrix_shape, "float32", scope="shared.rsram")
-            B_shared = T.alloc_shared(vector_shape, "float32", scope="shared.rsram")
+            A_shared = T.alloc_shared(matrix_shape, dtype, scope="shared.rsram")
+            B_shared = T.alloc_shared(vector_shape, dtype, scope="shared.rsram")
             T.annotate_layout(
                 {
                     A_shared: make_zz_layout(matrix_shape, [0, 1], (32, 32)),
-                    B_shared: make_aligned_row_major(vector_shape, "float32", align_bytes=64),
+                    B_shared: make_aligned_row_major(vector_shape, dtype, align_bytes=64),
                 }
             )
 
@@ -489,23 +497,26 @@ def test_exact_small_2d_fallback_uses_domain_sized_carrier_plan():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
 
-    assert_scope_plan(mod, expected_tile_size=[4, 4], expected_execution_domain_axes=[0, 1])
+    assert_scope_plan(mod, expected_tile_size=expected_tile_size, expected_execution_domain_axes=[0, 1])
 
 
 @pytest.mark.parametrize(
-    "matrix_shape,expected_tile_size",
+    "dtype,matrix_shape,expected_tile_size",
     [
-        ((64, 32), [4, 4]),
-        ((64, 64), [64, 64]),
+        ("float32", (64, 32), [4, 4]),
+        ("float32", (64, 64), [64, 64]),
+        ("float16", (64, 64), [64, 64]),
+        ("bfloat16", (64, 64), [4, 4]),
+        ("bfloat16", (64, 128), [64, 128]),
     ],
 )
-def test_row_major_small_2d_fallback_requires_one_complete_carrier(matrix_shape, expected_tile_size):
+def test_row_major_small_2d_fallback_requires_one_complete_carrier(dtype, matrix_shape, expected_tile_size):
     @T.prim_func
     def main():
         with T.Kernel(1, threads=128):
-            src = T.alloc_shared(matrix_shape, "float32", scope="shared.rsram")
-            dst = T.alloc_shared(matrix_shape, "float32", scope="shared.rsram")
-            layout = make_aligned_row_major(matrix_shape, "float32", align_bytes=64)
+            src = T.alloc_shared(matrix_shape, dtype, scope="shared.rsram")
+            dst = T.alloc_shared(matrix_shape, dtype, scope="shared.rsram")
+            layout = make_aligned_row_major(matrix_shape, dtype, align_bytes=64)
             T.annotate_layout({src: layout, dst: layout})
 
             for i, j in T.Tiles([4, 4], parallel=True):
@@ -517,6 +528,53 @@ def test_row_major_small_2d_fallback_requires_one_complete_carrier(matrix_shape,
         mod = apply_sunmmio_passes(mod, target)
 
     assert_scope_plan(mod, expected_tile_size=expected_tile_size, expected_execution_domain_axes=[0, 1])
+
+
+def test_small_2d_fallback_does_not_override_manual_tileview():
+    from tilelang.tileview import make_tileview
+
+    shape = (64, 64)
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            src = T.alloc_shared(shape, "float32", scope="shared.rsram")
+            dst = T.alloc_shared(shape, "float32", scope="shared.rsram")
+            layout = make_zz_layout(shape, [0, 1], (32, 32))
+            T.annotate_layout({src: layout, dst: layout})
+            T.annotate_tileview({src: make_tileview(src, (32, 32), (-2, -1))})
+
+            for i, j in T.Tiles([4, 4], parallel=True):
+                dst[i, j] = src[i, j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    assert_scope_plan(mod, expected_tile_size=[32, 32], expected_execution_domain_axes=[0, 1])
+
+
+def test_dynamic_domain_does_not_select_static_small_2d_plan():
+    shape = (64, 64)
+
+    @T.prim_func
+    def main(n: T.int32):
+        with T.Kernel(1, threads=128):
+            src = T.alloc_shared(shape, "float32", scope="shared.rsram")
+            dst = T.alloc_shared(shape, "float32", scope="shared.rsram")
+            layout = make_zz_layout(shape, [0, 1], (32, 32))
+            T.annotate_layout({src: layout, dst: layout})
+
+            for i, j in T.Tiles([n, 4], parallel=True):
+                dst[i, j] = src[i, j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    assert_scope_plan(mod, expected_tile_size=[32, 32], expected_execution_domain_axes=[0, 1])
 
 
 @pytest.mark.parametrize(

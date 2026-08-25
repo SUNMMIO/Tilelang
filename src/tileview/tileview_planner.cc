@@ -423,8 +423,7 @@ GetSmall2DCarrierShape(const Buffer &buffer,
     return std::nullopt;
   }
   DataType dtype = buffer->dtype;
-  if ((!dtype.is_float() && !dtype.is_bfloat16()) ||
-      (dtype.bits() != 16 && dtype.bits() != 32)) {
+  if (!dtype.is_bfloat16() && !(dtype.is_float() && dtype.bits() == 32)) {
     return std::nullopt;
   }
   const auto *cute = layout_map[buffer].as<CuteLayoutNode>();
