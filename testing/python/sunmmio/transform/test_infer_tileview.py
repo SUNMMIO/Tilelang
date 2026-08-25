@@ -464,6 +464,34 @@ def test_infer_rank1_tileview_from_2d_buffer_access_with_outer_loop_var():
 # ---------------------------------------------------------
 # Test 3: Mixed-rank (1D + 2D) in same T.Tiles
 # ---------------------------------------------------------
+def test_exact_small_2d_fallback_baseline_prefers_full_rank_layout_tile():
+    """The motivating 4x4 domain currently expands to the legal ZZ block."""
+    matrix_shape = (64, 64)
+    vector_shape = (500,)
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared(matrix_shape, "float32", scope="shared.rsram")
+            B_shared = T.alloc_shared(vector_shape, "float32", scope="shared.rsram")
+            T.annotate_layout(
+                {
+                    A_shared: make_zz_layout(matrix_shape, [0, 1], (32, 32)),
+                    B_shared: make_aligned_row_major(vector_shape, "float32", align_bytes=64),
+                }
+            )
+
+            for i, j in T.Tiles([4, 4], parallel=True):
+                A_shared[i, j] = A_shared[i, j] * B_shared[i]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    assert_scope_plan(mod, expected_tile_size=[32, 32], expected_execution_domain_axes=[0, 1])
+
+
 @pytest.mark.parametrize(
     ("dtype", "expected_tile_size"),
     [
