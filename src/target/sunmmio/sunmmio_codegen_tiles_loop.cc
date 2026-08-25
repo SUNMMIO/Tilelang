@@ -813,8 +813,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     DataType dtype = CanonicalizeSuvmDType(access->buffer->dtype);
     bool supported_dtype = (dtype.is_float() || dtype.is_bfloat16()) &&
                            (dtype.bits() == 16 || dtype.bits() == 32);
-    if (!supported_dtype || scope.tail_predicate.defined() ||
-        access->tile_shape.size() != 2 ||
+    if (!supported_dtype || access->tile_shape.size() != 2 ||
         memtensor_type.layout_dim_levels.size() != 2 ||
         memtensor_type.layout_dim_levels[0] < 2 ||
         memtensor_type.layout_dim_levels[1] < 2) {
@@ -2347,10 +2346,28 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     SunMMIOValue carrier = builder_->TileLoad(
         NewValueName(), view, carrier_type, std::nullopt, std::nullopt,
         CanonicalizeSuvmDType(access.buffer->dtype).with_lanes(1));
-    return builder_->TileSlice(
-        NewValueName(), carrier, address.slice_offsets,
-        MakeTileType(access.buffer->dtype, access.tile_shape),
+    SunMMIOType logical_type =
+        MakeTileType(access.buffer->dtype, access.tile_shape);
+    SunMMIOValue logical_tile = builder_->TileSlice(
+        NewValueName(), carrier, address.slice_offsets, logical_type,
         CanonicalizeSuvmDType(access.buffer->dtype).with_lanes(1));
+    if (state->tile_mask.has_value()) {
+      DataType value_dtype =
+          CanonicalizeSuvmDType(access.buffer->dtype).with_lanes(1);
+      SunMMIOType scalar_type{SunMMIOType::Kind::kScalar, value_dtype, 1, {}};
+      SunMMIOValue zero =
+          value_dtype.is_float() || value_dtype.is_bfloat16()
+              ? builder_->ConstantFloat(NewValueName(), "0.0", scalar_type,
+                                        value_dtype)
+              : builder_->ConstantInt(NewValueName(), 0, scalar_type,
+                                      value_dtype);
+      SunMMIOValue maskedoff =
+          builder_->TileFill(NewValueName(), zero, logical_type, value_dtype);
+      logical_tile = builder_->TileSelect(
+          NewValueName(), state->tile_mask.value(), logical_tile, maskedoff,
+          logical_type, value_dtype);
+    }
+    return logical_tile;
   };
 
   auto store_aligned_2d_tile = [&](const TileAccessInfo &access,
