@@ -1,3 +1,5 @@
+import pytest
+
 from tilelang import tvm
 from tilelang.layout import make_aligned_row_major, make_zz_layout
 from tilelang.utils.target import determine_target
@@ -180,14 +182,16 @@ def _make_small_2d_zz_carrier_func(
     dtype="float32",
     with_side_tile=False,
     domain_shape=None,
+    matrix_shape=(64, 64),
+    matrix_layout_kind="zz",
 ):
     elem_type = tvm.ir.PrimType(dtype)
     one = tvm.tir.IntImm("bool", 1)
     src_data = tvm.tir.Var("Src_shared_data", tvm.ir.PointerType(elem_type, "shared.rsram"))
     dst_data = tvm.tir.Var("Dst_shared_data", tvm.ir.PointerType(elem_type, "shared.rsram"))
     side_data = tvm.tir.Var("Side_shared_data", tvm.ir.PointerType(elem_type, "shared.rsram"))
-    src = tvm.tir.decl_buffer((64, 64), dtype, name="Src_shared", data=src_data, scope="shared.rsram")
-    dst = tvm.tir.decl_buffer((64, 64), dtype, name="Dst_shared", data=dst_data, scope="shared.rsram")
+    src = tvm.tir.decl_buffer(matrix_shape, dtype, name="Src_shared", data=src_data, scope="shared.rsram")
+    dst = tvm.tir.decl_buffer(matrix_shape, dtype, name="Dst_shared", data=dst_data, scope="shared.rsram")
     side = tvm.tir.decl_buffer((64,), dtype, name="Side_shared", data=side_data, scope="shared.rsram")
 
     tile_i = tvm.tir.Var("tile_i", "int32")
@@ -247,15 +251,17 @@ def _make_small_2d_zz_carrier_func(
             "tile.tile_size": [4, 4],
         },
     )
-    allocated_body = tvm.tir.Allocate(dst_data, dtype, [64, 64], one, body)
-    allocated_body = tvm.tir.Allocate(src_data, dtype, [64, 64], one, allocated_body)
+    allocated_body = tvm.tir.Allocate(dst_data, dtype, list(matrix_shape), one, body)
+    allocated_body = tvm.tir.Allocate(src_data, dtype, list(matrix_shape), one, allocated_body)
     if with_side_tile:
         allocated_body = tvm.tir.Allocate(side_data, dtype, [64], one, allocated_body)
     stmt = tvm.tir.DeclBuffer(
         src,
         tvm.tir.DeclBuffer(dst, tvm.tir.DeclBuffer(side, allocated_body) if with_side_tile else allocated_body),
     )
-    layout = make_zz_layout((64, 64), [0, 1], (32, 32))
+    layout = (
+        make_zz_layout(matrix_shape, [0, 1], (32, 32)) if matrix_layout_kind == "zz" else make_aligned_row_major(matrix_shape, dtype, 64)
+    )
     layout_map = {src: layout, dst: layout}
     if with_side_tile:
         layout_map[side] = make_aligned_row_major((64,), dtype, 64)
@@ -382,3 +388,24 @@ def test_sunmmio_codegen_small_2d_carrier_masks_tail_load_and_store(tmp_path):
                 break
     assert any(logical_ops[i : i + 3] == ["extract", "select", "mul"] for i in range(len(logical_ops) - 2))
     assert any(logical_ops[i : i + 3] == ["extract", "select", "insert"] for i in range(len(logical_ops) - 2))
+
+
+def test_sunmmio_codegen_row_major_small_2d_tile_uses_single_register_carrier(tmp_path):
+    src = _build_sunmmio_source_from_func(_make_small_2d_zz_carrier_func(matrix_shape=(64, 32), matrix_layout_kind="row_major"))
+    validate_suvm_mlir_with_npuir_opt(
+        src,
+        tmp_path,
+        mlir_filename="small_2d_row_major_carrier_suvm.mlir",
+        opt_args=("--verify-each",),
+    )
+    assert "!suvm.tile_view<4x32xf32>" in src
+    assert "suvm.tile.extract_slice" in src
+    assert "suvm.tile.insert_slice" in src
+
+
+def test_sunmmio_codegen_rejects_row_major_small_2d_tile_crossing_carrier():
+    with pytest.raises(
+        tvm.error.InternalError,
+        match="must fit entirely in one 4096-bit carrier",
+    ):
+        _build_sunmmio_source_from_func(_make_small_2d_zz_carrier_func(matrix_shape=(64, 64), matrix_layout_kind="row_major"))
