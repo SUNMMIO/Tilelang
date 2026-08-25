@@ -412,6 +412,154 @@ bool SupportsAligned1DBridgeCandidate(
   return true;
 }
 
+std::optional<std::vector<int>>
+GetSmall2DCarrierShape(const Buffer &buffer,
+                       const std::vector<int> &logical_shape,
+                       const Map<Buffer, Layout> &layout_map,
+                       const SunmmioTileProcessorConfig &config) {
+  if (logical_shape.size() != 2 || logical_shape[0] <= 1 ||
+      logical_shape[1] <= 1 || buffer.scope() != kSunmmioScopeRSRAM ||
+      !layout_map.count(buffer)) {
+    return std::nullopt;
+  }
+  DataType dtype = buffer->dtype;
+  if ((!dtype.is_float() && !dtype.is_bfloat16()) ||
+      (dtype.bits() != 16 && dtype.bits() != 32)) {
+    return std::nullopt;
+  }
+  const auto *cute = layout_map[buffer].as<CuteLayoutNode>();
+  if (!cute || cute->GetDimLevels().size() != 2) {
+    return std::nullopt;
+  }
+
+  int capacity_elems = GetCapacityElems(buffer, config);
+  int carrier_height = 0;
+  int carrier_width = 0;
+  Array<Integer> dim_levels = cute->GetDimLevels();
+  if (dim_levels[0].IntValue() == 1 && dim_levels[1].IntValue() == 1) {
+    Array<PrimExpr> covered_shape = cute->GetCoveredShape();
+    Array<PrimExpr> height_strides = cute->GetModeStrideOfDim(0);
+    Array<PrimExpr> width_strides = cute->GetModeStrideOfDim(1);
+    if (covered_shape.size() != 2 || height_strides.size() != 1 ||
+        width_strides.size() != 1) {
+      return std::nullopt;
+    }
+    carrier_width = GetStaticIntValue(covered_shape[1]);
+    int covered_height = GetStaticIntValue(covered_shape[0]);
+    if (carrier_width <= 0 || covered_height <= 0 ||
+        GetStaticIntValue(width_strides[0]) != 1 ||
+        GetStaticIntValue(height_strides[0]) != carrier_width ||
+        capacity_elems % carrier_width != 0) {
+      return std::nullopt;
+    }
+    carrier_height = capacity_elems / carrier_width;
+    if (carrier_height > covered_height) {
+      return std::nullopt;
+    }
+  } else if (auto block = sunmmio::GetZZBlockShape(layout_map[buffer])) {
+    carrier_width = block->width;
+    if (carrier_width <= 0 || capacity_elems < carrier_width) {
+      return std::nullopt;
+    }
+    carrier_height = std::min(block->height, capacity_elems / carrier_width);
+  } else {
+    return std::nullopt;
+  }
+
+  if (logical_shape[0] > carrier_height || logical_shape[1] > carrier_width ||
+      carrier_height % logical_shape[0] != 0 ||
+      carrier_width % logical_shape[1] != 0) {
+    return std::nullopt;
+  }
+  return std::vector<int>{carrier_height, carrier_width};
+}
+
+std::optional<TileViewPlan> TryPlanDomainSizedSmall2D(
+    const Array<PrimExpr> &domain, const Array<Var> &loop_vars,
+    const std::vector<BufferAccessRecord> &accesses,
+    const TileViewMap &manual_tileviews, const Map<Buffer, Layout> &layout_map,
+    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer) {
+  if (domain.size() != 2 || loop_vars.size() != 2) {
+    return std::nullopt;
+  }
+  int tile_height = GetStaticIntValue(domain[0]);
+  int tile_width = GetStaticIntValue(domain[1]);
+  if (tile_height <= 1 || tile_width <= 1) {
+    return std::nullopt;
+  }
+
+  std::unordered_set<const VarNode *> loop_var_nodes{loop_vars[0].get(),
+                                                     loop_vars[1].get()};
+  bool saw_rank2_carrier = false;
+  for (const BufferAccessRecord &access : accesses) {
+    if (manual_tileviews.count(access.buffer->data)) {
+      return std::nullopt;
+    }
+    std::vector<IndexBinding> bindings;
+    bindings.reserve(access.indices.size());
+    int active_dims = 0;
+    for (const PrimExpr &index : access.indices) {
+      auto binding = AnalyzeIndexBinding(index, loop_vars, {0, 1},
+                                         loop_var_nodes, analyzer);
+      if (!binding.has_value()) {
+        return std::nullopt;
+      }
+      active_dims += binding->uses_loop_var ? 1 : 0;
+      bindings.push_back(binding.value());
+    }
+    if (active_dims == 0) {
+      continue;
+    }
+    if (active_dims == 1) {
+      if (access.is_store) {
+        return std::nullopt;
+      }
+      int mapped_dim = -1;
+      for (int dim = 0; dim < static_cast<int>(bindings.size()); ++dim) {
+        if (bindings[dim].uses_loop_var) {
+          mapped_dim = dim;
+          break;
+        }
+      }
+      int domain_axis = bindings[mapped_dim].domain_axis;
+      int tile_extent = domain_axis == 0 ? tile_height : tile_width;
+      std::vector<AccessTileCandidate> candidates;
+      AddRank1Candidate(&candidates, access.buffer, access.indices, bindings,
+                        mapped_dim, tile_extent, analyzer,
+                        /*strict_checks=*/false);
+      if (candidates.empty() ||
+          !SupportsAligned1DBridgeCandidate(candidates.front(), access.buffer,
+                                            layout_map, config)) {
+        return std::nullopt;
+      }
+      continue;
+    }
+    int rank = static_cast<int>(bindings.size());
+    if (active_dims != 2 || rank < 2 || !bindings[rank - 2].uses_loop_var ||
+        !bindings[rank - 1].uses_loop_var ||
+        bindings[rank - 2].domain_axis != 0 ||
+        bindings[rank - 1].domain_axis != 1 ||
+        !CanProveDivisible(analyzer, bindings[rank - 2].offset, tile_height) ||
+        !CanProveDivisible(analyzer, bindings[rank - 1].offset, tile_width) ||
+        !GetSmall2DCarrierShape(access.buffer, {tile_height, tile_width},
+                                layout_map, config)
+             .has_value()) {
+      return std::nullopt;
+    }
+    saw_rank2_carrier = true;
+  }
+  if (!saw_rank2_carrier) {
+    return std::nullopt;
+  }
+
+  return TileViewPlan{makeTileView(domain,
+                                   {Integer(tile_height), Integer(tile_width)},
+                                   {Integer(-2), Integer(-1)}),
+                      {0, 1},
+                      false,
+                      true};
+}
+
 std::optional<std::vector<AccessInfo>> AnalyzeAccessesForExecutionAxes(
     const std::vector<BufferAccessRecord> &accesses,
     const Array<Var> &execution_loop_vars,
@@ -791,6 +939,22 @@ std::optional<TileViewPlan> TryPlanTileViewsForTilesScope(
     all_domain_axes.push_back(static_cast<int>(all_domain_axes.size()));
   }
 
+  std::optional<TileViewPlan> small_2d_plan =
+      TryPlanDomainSizedSmall2D(domain, loop_vars, accesses, manual_tileviews,
+                                layout_map, tile_processor_config, &analyzer);
+  auto choose_normal_or_small = [&](const TileViewPlan &normal_plan) {
+    if (small_2d_plan.has_value() &&
+        normal_plan.execution_tileview->TileDim() == 2 &&
+        normal_plan.execution_domain_axes == std::vector<int>{0, 1} &&
+        (GetStaticIntValue(normal_plan.execution_tileview->TileShape()[0]) >
+             GetStaticIntValue(domain[0]) ||
+         GetStaticIntValue(normal_plan.execution_tileview->TileShape()[1]) >
+             GetStaticIntValue(domain[1]))) {
+      return small_2d_plan.value();
+    }
+    return normal_plan;
+  };
+
   auto full_rank_accesses = AnalyzeAccessesForExecutionAxes(
       accesses, loop_vars, all_domain_axes, exec_rank, manual_tileviews,
       layout_map, tile_processor_config, &analyzer,
@@ -799,14 +963,18 @@ std::optional<TileViewPlan> TryPlanTileViewsForTilesScope(
     if (auto plan = TrySelectPlan(
             domain, full_rank_accesses.value(), domain_rank, exec_rank,
             &analyzer, AlignmentMode::kStrict, /*fail_on_error=*/false)) {
-      return plan;
+      return choose_normal_or_small(plan.value());
     }
 
     if (auto plan = TrySelectPlan(
             domain, full_rank_accesses.value(), domain_rank, exec_rank,
             &analyzer, AlignmentMode::kRelaxed, /*fail_on_error=*/false)) {
-      return plan;
+      return choose_normal_or_small(plan.value());
     }
+  }
+
+  if (small_2d_plan.has_value()) {
+    return small_2d_plan;
   }
 
   if (domain_rank > 1) {

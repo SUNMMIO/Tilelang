@@ -301,16 +301,17 @@ def test_mixed_rank_unit_side_load_broadcasts_rank1_tile(tmp_path):
     assert "suvm.tile.pick" not in src
 
 
-def test_exact_small_2d_fallback_baseline_uses_current_full_rank_plan(tmp_path):
+def test_exact_small_2d_fallback_uses_register_carrier(tmp_path):
     src = validate_sunmmio_codegen_with_npuir_opt(
         exact_small_2d_fallback_baseline_kernel(),
         tmp_path,
         mlir_filename="exact_small_2d_fallback_baseline_suvm.mlir",
-        expected_tokens=("!suvm.tile<32x32xf32>", "suvm.tile.unsqueeze", "suvm.tile.mulf"),
+        expected_tokens=("!suvm.tile_view<4x32xf32>", "suvm.tile.extract_slice", "suvm.tile.mulf"),
         opt_args=RAW_MLIR_OPT_ARGS,
     )
     assert "suvm.tile.pick" not in src
     assert "suvm.tile.set" not in src
+    assert "suvm.tile.insert_slice" in src
 
 
 @pytest.mark.parametrize(
