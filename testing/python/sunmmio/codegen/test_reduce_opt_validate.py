@@ -554,18 +554,19 @@ def test_reduce_keepdim_preserves_unit_destination_axis(tmp_path, reduce_axis):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=tilelang.tvm.error.InternalError,
-    reason="rank-2 keepdim output copy needs unit-axis padded layout-transform codegen",
-)
-def test_reduce_keepdim_unit_axis_output_copy_codegen_gap(tmp_path):
-    validate_sunmmio_codegen_loose(
+def test_reduce_keepdim_unit_axis_output_copy_unpads_covered_region(tmp_path):
+    src = validate_sunmmio_codegen_loose(
         reduce_keepdim_kernel_builder(reduce_axis=1, copy_output=True),
         tmp_path,
         mlir_filename="reduce_keepdim_axis_1_output_copy_suvm.mlir",
-        expected_tokens=("suvm.tile.reduce",),
+        expected_tokens=(
+            "suvm.tile.reduce",
+            "suvm.transform_layout_async",
+            "!suvm.tile_view<32x16xf32>",
+            "!suvm.tile_view<32x1xf32>",
+        ),
     )
+    assert "suvm.transform_layout_async" in src
 
 
 def test_reduce_dynamic_k_is_preserved_in_raw_suvm(tmp_path):
