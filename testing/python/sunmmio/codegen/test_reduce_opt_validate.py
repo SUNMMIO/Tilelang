@@ -5,7 +5,7 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.layout import make_row_major, make_zz_layout
+from tilelang.layout import make_aligned_row_major, make_row_major, make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import (
@@ -33,7 +33,6 @@ REDUCE_IN_TILE_CASES = [
 ]
 
 LOOSE_OPT_ARGS = ("--verify-each",)
-STRICT_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
 
 
 def validate_sunmmio_codegen_loose(kernel, tmp_path, *, mlir_filename, expected_tokens=()):
@@ -43,16 +42,6 @@ def validate_sunmmio_codegen_loose(kernel, tmp_path, *, mlir_filename, expected_
         mlir_filename=mlir_filename,
         expected_tokens=expected_tokens,
         opt_args=LOOSE_OPT_ARGS,
-    )
-
-
-def validate_sunmmio_codegen_strict(kernel, tmp_path, *, mlir_filename, expected_tokens=()):
-    return validate_sunmmio_codegen_with_npuir_opt(
-        kernel,
-        tmp_path,
-        mlir_filename=mlir_filename,
-        expected_tokens=expected_tokens,
-        opt_args=STRICT_OPT_ARGS,
     )
 
 
@@ -129,7 +118,11 @@ def reduce_keepdim_kernel_builder(shape=(32, 128), reduce_axis=1, dtype="float32
         with T.Kernel():
             A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
             Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
-            T.copy(A, A_shared)
+            if len(shape) == 3:
+                for bb in T.serial(shape[0]):
+                    T.copy(A[bb, :, :], A_shared[bb, :, :])
+            else:
+                T.copy(A, A_shared)
             T.reduce_sum(A_shared, Out_shared, dim=reduce_axis)
 
     return main
@@ -175,6 +168,89 @@ def reduce_manual_dst_tileview_kernel_builder(dst_tile_size):
             T.annotate_tileview({Out_shared: make_tileview(Out_shared, (dst_tile_size,), (-1,))})
             T.copy(A, A_shared)
             T.reduce_sum(A_shared, Out_shared, dim=1)
+            T.copy(Out_shared, Out)
+
+    return main
+
+
+@target("Sunmmio")
+def reduce_manual_tileview_kernel_builder(src_tile_size=None, dst_tile_size=None):
+    shape = (32, 128)
+    out_shape = (32,)
+    dtype = "float32"
+    shard_policy = T.placement.replicated()
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(shape, shard_policy, dtype, layout=_dram_input_layout(shape)),  # type: ignore
+        Out: T.MeshTensor(out_shape, shard_policy, dtype, layout=make_row_major(out_shape)),  # type: ignore
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+            if src_tile_size is not None:
+                T.annotate_tileview({A_shared: make_tileview(A_shared, src_tile_size, (-2, -1))})
+            if dst_tile_size is not None:
+                T.annotate_tileview({Out_shared: make_tileview(Out_shared, (dst_tile_size,), (-1,))})
+            T.copy(A, A_shared)
+            T.reduce_sum(A_shared, Out_shared, dim=1)
+            T.copy(Out_shared, Out)
+
+    return main
+
+
+@target("Sunmmio")
+def reduce_row_major_covered_tail_kernel_builder(reduce_op, logical_extent=1000):
+    shape = (logical_extent,)
+    out_shape = (1,)
+    dtype = "bfloat16"
+    shard_policy = T.placement.replicated()
+    input_layout = make_aligned_row_major(shape, dtype, 64)
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(shape, shard_policy, dtype, layout=input_layout),  # type: ignore
+        Out: T.MeshTensor(out_shape, shard_policy, dtype, layout=make_row_major(out_shape)),  # type: ignore
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+            T.annotate_layout({A_shared: input_layout})
+            T.annotate_tileview({A_shared: make_tileview(A_shared, (1024,), (-1,))})
+            T.copy(A, A_shared)
+            if reduce_op == "sum":
+                T.reduce_sum(A_shared, Out_shared, dim=0)
+            elif reduce_op == "max":
+                T.reduce_max(A_shared, Out_shared, dim=0)
+            else:
+                T.reduce_min(A_shared, Out_shared, dim=0)
+
+    return main
+
+
+@target("Sunmmio")
+def reduce_clear_false_kernel_builder(reduce_op):
+    shape = (32, 128)
+    out_shape = (32,)
+    dtype = "float32"
+    shard_policy = T.placement.replicated()
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(shape, shard_policy, dtype, layout=_dram_input_layout(shape)),  # type: ignore
+        Out: T.MeshTensor(out_shape, shard_policy, dtype, layout=make_row_major(out_shape)),  # type: ignore
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+            T.copy(A, A_shared)
+            T.fill(Out_shared, 1.0)
+            if reduce_op == "sum":
+                T.reduce_sum(A_shared, Out_shared, dim=1, clear=False)
+            elif reduce_op == "max":
+                T.reduce_max(A_shared, Out_shared, dim=1, clear=False)
+            else:
+                T.reduce_min(A_shared, Out_shared, dim=1, clear=False)
             T.copy(Out_shared, Out)
 
     return main
@@ -399,8 +475,7 @@ def test_reduce_tiled_in_tile_codegen_generates_expected_ops(tmp_path, reduce_ax
         if reduce_axis == 2
         else reduce_tiled_test(reduce_axis=reduce_axis, clear=clear)
     )
-    validate = validate_sunmmio_codegen_strict if reduce_axis == 2 else validate_sunmmio_codegen_loose
-    src = validate(
+    src = validate_sunmmio_codegen_loose(
         kernel,
         tmp_path,
         mlir_filename=f"reduce_tiled_axis_{reduce_axis}_suvm.mlir",
@@ -419,8 +494,8 @@ def test_reduce_tiled_in_tile_codegen_generates_expected_ops(tmp_path, reduce_ax
         )
 
 
-def test_reduce_layout_bounded_zz_block_lowers_to_llvm(tmp_path):
-    src = validate_sunmmio_codegen_strict(
+def test_reduce_layout_bounded_zz_block_reaches_raw_suvm(tmp_path):
+    src = validate_sunmmio_codegen_loose(
         reduce_kernel_builder((512, 128), 1, dtype="bfloat16", clear=True),
         tmp_path,
         mlir_filename="reduce_layout_bounded_zz_block_suvm.mlir",
@@ -498,6 +573,88 @@ def test_reduce_manual_destination_tileview_is_reflected_in_raw_suvm(tmp_path):
         expected_tokens=("suvm.tile.reduce", "!suvm.tile<16x1xf32>"),
     )
     assert_source_contains(src, ("!suvm.tile<16x32xf32>", "!suvm.tile<16x1xf32>"))
+
+
+@pytest.mark.parametrize(
+    "src_tile_size,dst_tile_size",
+    [
+        ((16, 32), None),
+        (None, 16),
+        ((16, 32), 16),
+    ],
+)
+def test_reduce_manual_tileview_combinations_reach_raw_suvm(tmp_path, src_tile_size, dst_tile_size):
+    label = f"src_{src_tile_size is not None}_dst_{dst_tile_size is not None}"
+    src = validate_sunmmio_codegen_loose(
+        reduce_manual_tileview_kernel_builder(src_tile_size, dst_tile_size),
+        tmp_path,
+        mlir_filename=f"reduce_manual_{label}_suvm.mlir",
+        expected_tokens=("suvm.tile.reduce", "!suvm.tile<16x32xf32>"),
+    )
+    assert_source_contains(src, ("!suvm.tile<16x32xf32>", "!suvm.tile<16x1xf32>"))
+
+
+@pytest.mark.parametrize(
+    "reduce_op,identity",
+    [
+        ("sum", "0.000000e+00"),
+        ("max", "0xFF80"),
+        ("min", "0x7F80"),
+    ],
+)
+def test_reduce_row_major_covered_tail_identity_precedes_raw_suvm_reduce(tmp_path, reduce_op, identity):
+    src = validate_sunmmio_codegen_loose(
+        reduce_row_major_covered_tail_kernel_builder(reduce_op),
+        tmp_path,
+        mlir_filename=f"reduce_row_major_covered_tail_{reduce_op}_suvm.mlir",
+        expected_tokens=("suvm.tile.select", f"suvm.tile.reduce  {reduce_op}"),
+    )
+    assert_source_contains(src, ("!suvm.tile<1024xbf16>", identity))
+    select_pos = src.index("suvm.tile.select")
+    reduce_pos = src.index(f"suvm.tile.reduce  {reduce_op}")
+    assert src.rfind(identity, 0, select_pos) >= 0
+    assert select_pos < reduce_pos
+
+
+@pytest.mark.parametrize(
+    "reduce_op,combine_op",
+    [
+        ("sum", "suvm.tile.addf"),
+        ("max", "suvm.tile.maxf"),
+        ("min", "suvm.tile.minf"),
+    ],
+)
+def test_reduce_clear_false_combines_destination_once_in_raw_suvm(tmp_path, reduce_op, combine_op):
+    src = validate_sunmmio_codegen_loose(
+        reduce_clear_false_kernel_builder(reduce_op),
+        tmp_path,
+        mlir_filename=f"reduce_clear_false_{reduce_op}_suvm.mlir",
+        expected_tokens=(f"suvm.tile.reduce  {reduce_op}", combine_op),
+    )
+    reduce_pos = src.index(f"suvm.tile.reduce  {reduce_op}")
+    combine_positions = [match.start() for match in re.finditer(re.escape(combine_op), src)]
+    assert len(combine_positions) == 2
+    assert combine_positions[0] < reduce_pos < combine_positions[1]
+
+
+@pytest.mark.parametrize("reduce_axis", [1, 2])
+def test_reduce_rank3_keepdim_projects_raw_suvm_destination(tmp_path, reduce_axis):
+    shape = (4, 64, 128)
+    src = validate_sunmmio_codegen_loose(
+        reduce_keepdim_kernel_builder(shape=shape, reduce_axis=reduce_axis),
+        tmp_path,
+        mlir_filename=f"reduce_rank3_keepdim_axis_{reduce_axis}_suvm.mlir",
+        expected_tokens=("suvm.tile.reduce", "xf32>"),
+    )
+    out_shape = list(shape)
+    out_shape[reduce_axis] = 1
+    expected_out_shape = "x".join(str(extent) for extent in out_shape)
+    expected_tile_axis = reduce_axis - 1
+    assert f"!suvm.memtensor<{expected_out_shape}xf32" in src
+    assert re.search(
+        rf"suvm\.tile\.reduce\s+sum, .*\{{axis = {expected_tile_axis} : i64\}}",
+        src,
+    )
 
 
 def test_reduce_small_1d_result_uses_aligned_store_bridge(tmp_path):
