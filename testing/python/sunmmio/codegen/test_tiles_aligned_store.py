@@ -184,6 +184,7 @@ def _make_small_2d_zz_carrier_func(
     domain_shape=None,
     matrix_shape=(64, 64),
     matrix_layout_kind="zz",
+    explicit_predicate=False,
 ):
     elem_type = tvm.ir.PrimType(dtype)
     one = tvm.tir.IntImm("bool", 1)
@@ -205,9 +206,10 @@ def _make_small_2d_zz_carrier_func(
         kj = tvm.tir.Var(f"kj_{suffix}", "int32")
         row = tile_i * 4 + ki
         col = tile_j * 4 + kj
-        rhs = tvm.tir.BufferLoad(src, [row, col])
+        predicate = tvm.tir.And(ki < 3, kj < 2) if explicit_predicate else None
+        rhs = tvm.tir.BufferLoad(src, [row, col], predicate=predicate)
         rhs *= tvm.tir.BufferLoad(side, [row]) if with_side_tile else tvm.tir.FloatImm(dtype, 2.0)
-        store = tvm.tir.BufferStore(dst, rhs, [row, col])
+        store = tvm.tir.BufferStore(dst, rhs, [row, col], predicate=predicate)
         inner = tvm.tir.For(
             kj,
             0,
@@ -428,3 +430,16 @@ def test_sunmmio_codegen_rejects_row_major_small_2d_tile_crossing_carrier(dtype,
         _build_sunmmio_source_from_func(
             _make_small_2d_zz_carrier_func(dtype=dtype, matrix_shape=matrix_shape, matrix_layout_kind="row_major")
         )
+
+
+def test_sunmmio_codegen_small_2d_carrier_honors_explicit_load_store_predicates(tmp_path):
+    src = _build_sunmmio_source_from_func(_make_small_2d_zz_carrier_func(explicit_predicate=True))
+    validate_suvm_mlir_with_npuir_opt(
+        src,
+        tmp_path,
+        mlir_filename="small_2d_zz_carrier_explicit_predicate_suvm.mlir",
+        opt_args=("--verify-each",),
+    )
+    assert "suvm.tile.cmpi" in src
+    assert "suvm.tile.andi" in src
+    assert src.count("suvm.tile.select") >= 2

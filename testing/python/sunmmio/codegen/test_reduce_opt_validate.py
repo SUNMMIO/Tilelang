@@ -104,7 +104,7 @@ def reduce_kernel_builder(
 
 
 @target("Sunmmio")
-def reduce_keepdim_kernel_builder(shape=(32, 128), reduce_axis=1, dtype="float32"):
+def reduce_keepdim_kernel_builder(shape=(32, 128), reduce_axis=1, dtype="float32", copy_output=False):
     out_shape = list(shape)
     out_shape[reduce_axis] = 1
     out_shape = tuple(out_shape)
@@ -124,6 +124,8 @@ def reduce_keepdim_kernel_builder(shape=(32, 128), reduce_axis=1, dtype="float32
             else:
                 T.copy(A, A_shared)
             T.reduce_sum(A_shared, Out_shared, dim=reduce_axis)
+            if copy_output:
+                T.copy(Out_shared, Out)
 
     return main
 
@@ -549,6 +551,20 @@ def test_reduce_keepdim_preserves_unit_destination_axis(tmp_path, reduce_axis):
         rf"get_partitioned_tile_view .* tiled_dims = \[{surviving_axis}\].*"
         rf"!suvm\.memtensor<{expected_out_shape}xf32",
         src,
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=tilelang.tvm.error.InternalError,
+    reason="rank-2 keepdim output copy needs unit-axis padded layout-transform codegen",
+)
+def test_reduce_keepdim_unit_axis_output_copy_codegen_gap(tmp_path):
+    validate_sunmmio_codegen_loose(
+        reduce_keepdim_kernel_builder(reduce_axis=1, copy_output=True),
+        tmp_path,
+        mlir_filename="reduce_keepdim_axis_1_output_copy_suvm.mlir",
+        expected_tokens=("suvm.tile.reduce",),
     )
 
 

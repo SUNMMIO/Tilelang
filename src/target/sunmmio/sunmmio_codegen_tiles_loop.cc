@@ -3734,6 +3734,55 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         tile = load_aligned_1d_tile(access, state);
       } else if (access.requires_aligned_2d_carrier) {
         tile = load_aligned_2d_tile(access, state);
+        bool skip_load_predicate =
+            load->predicate.defined() &&
+            ((state->active_tail_store_predicate.has_value() &&
+              can_prove_expr_equal(
+                  load->predicate.value(),
+                  state->active_tail_store_predicate.value())) ||
+             is_canonical_tail_load_predicate(load->predicate.value(), state,
+                                              access));
+        if (load->predicate.defined() && !skip_load_predicate) {
+          DataType mask_index_dtype =
+              mask_index_dtype_for_value_dtype(load->buffer->dtype);
+          std::optional<SunMMIOValue> canonical_mask =
+              build_canonical_rank2_predicate_mask(
+                  load->predicate.value(), state, access, mask_index_dtype);
+          SunMMIOValue load_mask =
+              canonical_mask.has_value()
+                  ? canonical_mask.value()
+                  : lower_bool_expr_to_shape(load->predicate.value(),
+                                             access.tile_shape,
+                                             mask_index_dtype);
+          if (!IsTileLike(load_mask)) {
+            SunMMIOType bool_scalar_type{
+                SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
+            load_mask =
+                EnsureType(load_mask, bool_scalar_type, DataType::Bool());
+            load_mask = builder_->TileFill(
+                NewValueName(), load_mask,
+                MakeTileType(DataType::Bool(), access.tile_shape),
+                DataType::Bool());
+          }
+          DataType value_dtype =
+              CanonicalizeSuvmDType(load->buffer->dtype).with_lanes(1);
+          SunMMIOType scalar_type{
+              SunMMIOType::Kind::kScalar, value_dtype, 1, {}};
+          SunMMIOValue zero =
+              value_dtype.is_float() || value_dtype.is_bfloat16()
+                  ? builder_->ConstantFloat(NewValueName(), "0.0", scalar_type,
+                                            value_dtype)
+                  : builder_->ConstantInt(NewValueName(), 0, scalar_type,
+                                          value_dtype);
+          SunMMIOValue maskedoff = builder_->TileFill(
+              NewValueName(), zero,
+              MakeTileType(load->buffer->dtype, access.tile_shape),
+              value_dtype);
+          tile = builder_->TileSelect(
+              NewValueName(), load_mask, tile, maskedoff,
+              MakeTileType(load->buffer->dtype, access.tile_shape),
+              value_dtype);
+        }
       } else {
         SunMMIOValue view = get_or_create_tile_view(access, state);
         SunMMIOType tile_type =
@@ -4263,6 +4312,48 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
           !canonical_tail_store) {
         mask = lower_expr(store->predicate.value(), state,
                           get_store_mask_index_dtype());
+      }
+      if (!mx_scale_valid_elems.has_value() &&
+          access.requires_aligned_2d_carrier && store->predicate.defined() &&
+          !canonical_tail_store) {
+        std::optional<SunMMIOValue> canonical_mask =
+            build_canonical_rank2_predicate_mask(store->predicate.value(),
+                                                 state, access,
+                                                 get_store_mask_index_dtype());
+        SunMMIOValue explicit_mask =
+            canonical_mask.has_value()
+                ? canonical_mask.value()
+                : lower_expr(store->predicate.value(), state,
+                             get_store_mask_index_dtype());
+        if (!IsTileLike(explicit_mask)) {
+          SunMMIOType bool_scalar_type{
+              SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
+          explicit_mask =
+              EnsureType(explicit_mask, bool_scalar_type, DataType::Bool());
+          explicit_mask = builder_->TileFill(
+              NewValueName(), explicit_mask,
+              MakeTileType(DataType::Bool(), access.tile_shape),
+              DataType::Bool());
+        } else {
+          explicit_mask =
+              reorient_unit_tile_to_shape(explicit_mask, access.tile_shape);
+          if (ExtractStaticShape(explicit_mask.type) != access.tile_shape) {
+            ICHECK(!explicit_mask.dtype.is_bool())
+                << "Small 2D carrier store predicate cannot broadcast a bool "
+                   "tile; lower the predicate to the logical tile shape";
+            explicit_mask =
+                broadcast_tile_to_shape(explicit_mask, access.tile_shape);
+          }
+        }
+        if (mask.has_value()) {
+          mask = builder_->Binary(
+              NewValueName(), BinaryOp::kAnd, ArithmeticFlavor::kBool,
+              mask.value(), explicit_mask,
+              MakeTileType(DataType::Bool(), access.tile_shape),
+              DataType::Bool());
+        } else {
+          mask = explicit_mask;
+        }
       }
       std::optional<SunMMIOValue> dst_view;
       if ((mx_scale_valid_elems.has_value() || mask.has_value()) &&
