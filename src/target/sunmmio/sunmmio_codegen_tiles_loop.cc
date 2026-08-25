@@ -811,8 +811,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   auto populate_aligned_2d_access = [&](TileAccessInfo *access,
                                         const SunMMIOType &memtensor_type) {
     DataType dtype = CanonicalizeSuvmDType(access->buffer->dtype);
-    bool supported_dtype = (dtype.is_float() || dtype.is_bfloat16()) &&
-                           (dtype.bits() == 16 || dtype.bits() == 32);
+    bool supported_dtype =
+        dtype.is_bfloat16() || (dtype.is_float() && dtype.bits() == 32);
     if (!supported_dtype || access->promoted_unit_tile_view ||
         access->tile_shape.size() != 2 || access->tile_shape[0] <= 1 ||
         access->tile_shape[1] <= 1 ||

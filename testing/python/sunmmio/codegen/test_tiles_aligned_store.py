@@ -334,11 +334,12 @@ def test_sunmmio_codegen_small_2d_zz_carrier_uses_dynamic_slice_offset(tmp_path)
 
 
 def test_sunmmio_codegen_small_2d_bf16_zz_slice_uses_taller_carrier(tmp_path):
-    src = _build_sunmmio_source_from_func(_make_small_2d_zz_carrier_func(dtype="bfloat16"))
+    dtype = "bfloat16"
+    src = _build_sunmmio_source_from_func(_make_small_2d_zz_carrier_func(dtype=dtype))
     validate_suvm_mlir_with_npuir_opt(
         src,
         tmp_path,
-        mlir_filename="small_2d_bf16_zz_carrier_suvm.mlir",
+        mlir_filename=f"small_2d_{dtype}_zz_carrier_suvm.mlir",
         opt_args=("--verify-each",),
     )
     assert "!suvm.tile_view<8x32xbf16>" in src
@@ -390,22 +391,40 @@ def test_sunmmio_codegen_small_2d_carrier_masks_tail_load_and_store(tmp_path):
     assert any(logical_ops[i : i + 3] == ["extract", "select", "insert"] for i in range(len(logical_ops) - 2))
 
 
-def test_sunmmio_codegen_row_major_small_2d_tile_uses_single_register_carrier(tmp_path):
-    src = _build_sunmmio_source_from_func(_make_small_2d_zz_carrier_func(matrix_shape=(64, 32), matrix_layout_kind="row_major"))
+@pytest.mark.parametrize(
+    "dtype,matrix_shape,carrier_shape,mlir_dtype",
+    [
+        ("float32", (64, 32), "4x32", "f32"),
+        ("bfloat16", (64, 64), "4x64", "bf16"),
+    ],
+)
+def test_sunmmio_codegen_row_major_small_2d_tile_uses_single_register_carrier(tmp_path, dtype, matrix_shape, carrier_shape, mlir_dtype):
+    src = _build_sunmmio_source_from_func(
+        _make_small_2d_zz_carrier_func(dtype=dtype, matrix_shape=matrix_shape, matrix_layout_kind="row_major")
+    )
     validate_suvm_mlir_with_npuir_opt(
         src,
         tmp_path,
         mlir_filename="small_2d_row_major_carrier_suvm.mlir",
         opt_args=("--verify-each",),
     )
-    assert "!suvm.tile_view<4x32xf32>" in src
+    assert f"!suvm.tile_view<{carrier_shape}x{mlir_dtype}>" in src
     assert "suvm.tile.extract_slice" in src
     assert "suvm.tile.insert_slice" in src
 
 
-def test_sunmmio_codegen_rejects_row_major_small_2d_tile_crossing_carrier():
+@pytest.mark.parametrize(
+    "dtype,matrix_shape",
+    [
+        ("float32", (64, 64)),
+        ("bfloat16", (64, 128)),
+    ],
+)
+def test_sunmmio_codegen_rejects_row_major_small_2d_tile_crossing_carrier(dtype, matrix_shape):
     with pytest.raises(
         tvm.error.InternalError,
         match="must fit entirely in one 4096-bit carrier",
     ):
-        _build_sunmmio_source_from_func(_make_small_2d_zz_carrier_func(matrix_shape=(64, 64), matrix_layout_kind="row_major"))
+        _build_sunmmio_source_from_func(
+            _make_small_2d_zz_carrier_func(dtype=dtype, matrix_shape=matrix_shape, matrix_layout_kind="row_major")
+        )
