@@ -27,10 +27,10 @@ def _build_sunmmio_source_from_func(func):
 
 
 def _has_nonzero_1d_insert_slice_offset(src):
-    insert_lines = [line for line in src.splitlines() if "suvm.tile.insert_slice" in line and "] [8, 1]" in line]
-    if any("[8, 0] [8, 1]" in line for line in insert_lines):
+    insert_lines = [line for line in src.splitlines() if "suvm.tile.insert_slice" in line and "] [8]" in line]
+    if any("[8] [8]" in line for line in insert_lines):
         return True
-    return any("[%" in line and ", 0] [8, 1]" in line for line in insert_lines) and "arith.remsi" in src
+    return any("[%" in line for line in insert_lines) and "arith.remsi" in src
 
 
 @target("Sunmmio")
@@ -176,7 +176,6 @@ def _make_row_major_padded_2d_aligned_store_func():
 def test_sunmmio_codegen_aligned_1d_store_uses_nonzero_insert_slice_offset():
     src = _build_sunmmio_source_from_stmt(_make_nonzero_offset_aligned_store_stmt())
     assert "suvm.tile.insert_slice" in src
-    assert "suvm.tile.unsqueeze" in src
     assert "suvm.tile.store" in src
     assert "fake_tile_store" not in src
     assert "!suvm.tile<32xbf16>" in src

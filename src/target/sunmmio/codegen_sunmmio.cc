@@ -43,10 +43,29 @@ namespace {
 class DeclBufferCollector final : public tir::StmtVisitor {
 public:
   std::unordered_map<const tir::VarNode *, tir::Buffer> buffer_data_to_buffer;
+  std::unordered_map<const tir::VarNode *, int> reduce_register_temp_roles;
 
 private:
   void VisitStmt_(const tir::DeclBufferNode *op) final {
     Record(op->buffer);
+    tir::StmtVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const tir::AllocateNode *op) final {
+    auto role_attr = op->annotations.Get(tl::attr::kSunmmioReduceRegisterTemp);
+    if (role_attr) {
+      const auto *role = role_attr.value().as<IntImmNode>();
+      ICHECK(role) << tl::attr::kSunmmioReduceRegisterTemp
+                   << " Allocate annotation expects an integer role";
+      ICHECK(role->value ==
+                 static_cast<int>(tl::ReduceRegisterTempRole::kAccumulator) ||
+             role->value ==
+                 static_cast<int>(tl::ReduceRegisterTempRole::kResult))
+          << tl::attr::kSunmmioReduceRegisterTemp << " has unknown role value "
+          << role->value;
+      reduce_register_temp_roles[op->buffer_var.get()] =
+          static_cast<int>(role->value);
+    }
     tir::StmtVisitor::VisitStmt_(op);
   }
 
@@ -77,19 +96,6 @@ std::string GetAllocateStorageScope(const tir::Var &buffer_var) {
   }
   LOG(FATAL) << "SunMMIO SUVM allocate expects PointerType buffer_var";
   TVM_FFI_UNREACHABLE();
-}
-
-bool IsSunmmioReduceRegisterTempBuffer(const tir::Buffer &buffer) {
-  if (!buffer.defined()) {
-    return false;
-  }
-  const std::string scope = buffer.scope();
-  if (scope != "shared.rsram" && scope != "rsram") {
-    return false;
-  }
-  const std::string name = buffer->name;
-  return name.size() >= 4 && (name.rfind("_acc") == name.size() - 4 ||
-                              name.rfind("_res") == name.size() - 4);
 }
 
 bool IsSunmmioLocalVarBuffer(const tir::Buffer &buffer) {
@@ -582,6 +588,7 @@ void CodeGenTileLangSunMMIO::Clear() {
   local_var_table_.clear();
   buffer_registry_.clear();
   buffer_data_to_buffer_.clear();
+  reduce_register_temp_roles_.clear();
   attr_stack_.clear();
   scoped_vars_.clear();
   scoped_local_vars_.clear();
@@ -724,6 +731,40 @@ void CodeGenTileLangSunMMIO::CollectDeclBuffers(const tir::Stmt &stmt) {
   DeclBufferCollector collector;
   collector(stmt);
   buffer_data_to_buffer_ = std::move(collector.buffer_data_to_buffer);
+  reduce_register_temp_roles_ = std::move(collector.reduce_register_temp_roles);
+}
+
+bool CodeGenTileLangSunMMIO::IsSunmmioReduceRegisterTempBuffer(
+    const tir::Buffer &buffer) const {
+  if (!buffer.defined() || !IsSunmmioRsramScope(buffer.scope())) {
+    return false;
+  }
+  return reduce_register_temp_roles_.count(buffer->data.get()) != 0;
+}
+
+bool CodeGenTileLangSunMMIO::IsSunmmioReduceLoopCarriedTempBuffer(
+    const tir::Buffer &buffer) const {
+  if (!IsSunmmioReduceRegisterTempBuffer(buffer)) {
+    return false;
+  }
+  auto it = buffer.defined()
+                ? reduce_register_temp_roles_.find(buffer->data.get())
+                : reduce_register_temp_roles_.end();
+  return it != reduce_register_temp_roles_.end() &&
+         it->second ==
+             static_cast<int>(tl::ReduceRegisterTempRole::kAccumulator);
+}
+
+bool CodeGenTileLangSunMMIO::IsSunmmioReduceLocalTempBuffer(
+    const tir::Buffer &buffer) const {
+  if (!IsSunmmioReduceRegisterTempBuffer(buffer)) {
+    return false;
+  }
+  auto it = buffer.defined()
+                ? reduce_register_temp_roles_.find(buffer->data.get())
+                : reduce_register_temp_roles_.end();
+  return it != reduce_register_temp_roles_.end() &&
+         it->second == static_cast<int>(tl::ReduceRegisterTempRole::kResult);
 }
 
 void CodeGenTileLangSunMMIO::WriteCoverageReport() const {

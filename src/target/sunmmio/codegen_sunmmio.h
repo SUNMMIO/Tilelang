@@ -410,6 +410,9 @@ private:
   void VisitStmtTracked(const tir::Stmt &stmt);
   void CollectExpectedCoverage(const tir::PrimFunc &f);
   void CollectDeclBuffers(const tir::Stmt &stmt);
+  bool IsSunmmioReduceRegisterTempBuffer(const tir::Buffer &buffer) const;
+  bool IsSunmmioReduceLoopCarriedTempBuffer(const tir::Buffer &buffer) const;
+  bool IsSunmmioReduceLocalTempBuffer(const tir::Buffer &buffer) const;
   void MarkVisitedNodeType(const std::string &type_key);
   void MarkVisitedCallOpFromExpr(const tvm::PrimExpr &expr);
   void MarkVisitedExprRoot(const tvm::PrimExpr &expr);
@@ -489,6 +492,7 @@ private:
   std::unordered_map<const tir::VarNode *, SunMMIOValue> local_var_table_;
   std::unordered_map<const tir::BufferNode *, BufferBinding> buffer_registry_;
   std::unordered_map<const tir::VarNode *, tir::Buffer> buffer_data_to_buffer_;
+  std::unordered_map<const tir::VarNode *, int> reduce_register_temp_roles_;
   std::vector<ScopedAttr> attr_stack_;
 
   std::vector<const tir::VarNode *> scoped_vars_;
