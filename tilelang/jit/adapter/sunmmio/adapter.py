@@ -69,6 +69,36 @@ class SunmmioKernelAdapter(BaseKernelAdapter):
         self._post_init()
 
     @classmethod
+    def from_compiled_artifact(
+        cls,
+        *,
+        target: str | Target,
+        abi: SunmmioKernelABI,
+        kernel_lib_path: str | os.PathLike[str],
+        verbose: bool = False,
+    ):
+        """Load a compiled Sunmmio artifact without rebuilding its frontend kernel."""
+        if not os.path.exists(kernel_lib_path):
+            raise FileNotFoundError(f"Compiled Sunmmio kernel artifact does not exist: {kernel_lib_path}")
+
+        instance = cls.__new__(cls)
+        instance.params = []
+        instance.result_idx = []
+        instance.target = Target.canon_target(determine_target(target))
+        if not target_is_sunmmio(instance.target):
+            raise ValueError(f"SunmmioKernelAdapter requires a Sunmmio target, got {instance.target}")
+        instance.ir_module = None
+        instance.abi = abi
+        instance.host_mod = None
+        instance.device_mod = None
+        instance.device_kernel_source = ""
+        instance.verbose = verbose
+        instance.lib_generator = instance._make_lib_generator(verbose)
+        instance.lib_generator.load_lib(kernel_lib_path)
+        instance._post_init()
+        return instance
+
+    @classmethod
     def from_database(
         cls,
         params: list[KernelParam],
@@ -206,6 +236,31 @@ class SunmmioSunsimKernelAdapter(SunmmioKernelAdapter):
     def _make_lib_generator(self, verbose: bool) -> SunmmioSunsimLibraryGenerator:
         return SunmmioSunsimLibraryGenerator(self.target, self.kernel_name, verbose)
 
+    @classmethod
+    def from_compiled_artifact(
+        cls,
+        *,
+        target: str | Target,
+        abi: SunmmioKernelABI,
+        kernel_lib_path: str | os.PathLike[str],
+        parameter_kinds: Sequence[str],
+        verbose: bool = False,
+    ):
+        invalid_kinds = set(parameter_kinds) - {"tensor", "scalar"}
+        if invalid_kinds:
+            raise ValueError(f"Invalid Sunmmio parameter kinds: {sorted(invalid_kinds)}")
+        if len(parameter_kinds) != abi.public_arg_count:
+            raise ValueError(f"Sunmmio artifact has {len(parameter_kinds)} parameter kinds but ABI expects {abi.public_arg_count}.")
+
+        instance = super().from_compiled_artifact(
+            target=target,
+            abi=abi,
+            kernel_lib_path=kernel_lib_path,
+            verbose=verbose,
+        )
+        instance._artifact_parameter_kinds = tuple(parameter_kinds)
+        return instance
+
     def _convert_torch_func(self) -> Callable[..., Any]:
         if self.result_idx:
             raise NotImplementedError(
@@ -244,8 +299,11 @@ class SunmmioSunsimKernelAdapter(SunmmioKernelAdapter):
 
         marker_types = (sunsim.Input, sunsim.Output, sunsim.Inout)
         descriptor_type = sunsim.Descriptor
-        for index, (arg, param) in enumerate(zip(args[: self.abi.public_arg_count], self.params)):
-            if param.is_scalar():
+        parameter_kinds = getattr(self, "_artifact_parameter_kinds", None)
+        if parameter_kinds is None:
+            parameter_kinds = tuple("scalar" if param.is_scalar() else "tensor" for param in self.params)
+        for index, (arg, kind) in enumerate(zip(args[: self.abi.public_arg_count], parameter_kinds)):
+            if kind == "scalar":
                 if isinstance(arg, marker_types):
                     raise TypeError(
                         f"Sunmmio sunsim argument {index} is a scalar slot, but got {type(arg).__name__}. "
