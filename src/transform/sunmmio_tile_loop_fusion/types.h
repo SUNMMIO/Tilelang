@@ -73,6 +73,10 @@ struct TileScopeRegion {
   // Example: a rank-2 reduction region may still produce a row value available
   // at execution depth 1.
   std::vector<int> available_at_execution_depths;
+  // For each `def_out`, the deepest additional execution depth through which
+  // every write is provably restricted to the final iteration. A value of -1
+  // means that no such extension beyond availability was proven.
+  std::vector<int> last_write_safe_execution_depths;
 };
 
 /*!
@@ -115,13 +119,14 @@ struct NormalizedBufferAccessDim {
  *
  * The planner and dependence builder both need the same semantic facts for an
  * access: the normalized region shape, the execution-depth provenance of each
- * dimension, the depth at which the value becomes available, and the payload
- * size used by the cost model.
+ * dimension, the depth at which the value becomes available, any proven
+ * final-iteration write phase, and the payload size used by the cost model.
  */
 struct NormalizedBufferAccess {
   tir::BufferRegion region;
   std::vector<NormalizedBufferAccessDim> dims;
   int home_depth{0};
+  int last_write_safe_depth{-1};
   int64_t payload_bytes{0};
 };
 
@@ -149,6 +154,9 @@ struct TileScopeDependenceEdge {
   // rho = 1 means the edge can stay internal under a shared outer row shell;
   // rho = 2 means it needs a deeper tile shell, and so on.
   int rho{0};
+  // Deepest execution-loop prefix the source and destination may share without
+  // interleaving different executions of this dependence instance.
+  int max_shared_execution_depth{0};
   // Estimated payload cost of cutting this edge for one execution instance.
   // The planner later scales this by execution multiplicity.
   int64_t weight_bytes{0};

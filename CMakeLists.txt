@@ -555,6 +555,9 @@ endif()
 # vendored TVM GTest discovery here so `ctest` does not pick up the excluded
 # upstream `cpptest` target as a stale *_NOT_BUILT placeholder.
 if(TILELANG_BUILD_CPP_TESTS)
+  # TVM's config.cmake defines USE_GTEST as a normal variable, which shadows
+  # the cache entry under modern CMake policy behavior.
+  set(USE_GTEST OFF)
   set(USE_GTEST OFF CACHE STRING "Disable vendored TVM GTest integration in TileLang builds" FORCE)
 endif()
 add_subdirectory(${TVM_SOURCE} tvm EXCLUDE_FROM_ALL)

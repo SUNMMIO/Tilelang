@@ -140,6 +140,7 @@ BuildWindowPlannerInput(const SunmmioTileLoopFusionWindowProblem &problem) {
     planner_edge.dst_local_index = dst_it->second;
     planner_edge.kind = edge.kind;
     planner_edge.rho = edge.rho;
+    planner_edge.max_shared_execution_depth = edge.max_shared_execution_depth;
     planner_edge.weight = edge.weight_bytes;
     planner_edge.instance_count = ComputeRawEdgeInstanceCount(
         problem.regions[planner_edge.src_local_index].execution_loop_extents,

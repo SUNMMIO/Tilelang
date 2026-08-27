@@ -118,6 +118,52 @@ Stmt Make2DTileRead(const Buffer &src, const std::string &axis0_name = "i",
   return body;
 }
 
+Stmt Make2DRowSummary(const Buffer &dst, const Buffer &src,
+                      const std::string &axis0_name = "i",
+                      const std::string &axis1_name = "j") {
+  Var axis0(axis0_name, DataType::Int(32));
+  Var axis1(axis1_name, DataType::Int(32));
+  Var ki("ki", DataType::Int(32));
+  Var kj("kj", DataType::Int(32));
+
+  PrimExpr row = axis0 * I(8) + ki;
+  PrimExpr col = axis1 * I(32) + kj;
+
+  Stmt body = BufferStore(dst, BufferLoad(src, {row, col}), {row});
+  body = For(kj, 0, I(32), ForKind::kVectorized, body, Optional<IterVar>(),
+             MakeInteriorAnnotation(1));
+  body = For(ki, 0, I(8), ForKind::kSerial, body, Optional<IterVar>(),
+             MakeInteriorAnnotation(0));
+  body = For(axis1, 0, I(2), ForKind::kSerial, body, Optional<IterVar>(),
+             MakeExecutionAxisAnnotation(1));
+  body = For(axis0, 0, I(4), ForKind::kSerial, body, Optional<IterVar>(),
+             MakeScopeEntryAnnotationsWithTileSize({0, 1}, 8, 32, 32, 64));
+  return body;
+}
+
+Stmt Make2DRowConsumer(const Buffer &dst, const Buffer &src,
+                       const std::string &axis0_name = "i",
+                       const std::string &axis1_name = "j") {
+  Var axis0(axis0_name, DataType::Int(32));
+  Var axis1(axis1_name, DataType::Int(32));
+  Var ki("ki", DataType::Int(32));
+  Var kj("kj", DataType::Int(32));
+
+  PrimExpr row = axis0 * I(8) + ki;
+  PrimExpr col = axis1 * I(32) + kj;
+
+  Stmt body = BufferStore(dst, BufferLoad(src, {row}), {row, col});
+  body = For(kj, 0, I(32), ForKind::kVectorized, body, Optional<IterVar>(),
+             MakeInteriorAnnotation(1));
+  body = For(ki, 0, I(8), ForKind::kSerial, body, Optional<IterVar>(),
+             MakeInteriorAnnotation(0));
+  body = For(axis1, 0, I(2), ForKind::kSerial, body, Optional<IterVar>(),
+             MakeExecutionAxisAnnotation(1));
+  body = For(axis0, 0, I(4), ForKind::kSerial, body, Optional<IterVar>(),
+             MakeScopeEntryAnnotationsWithTileSize({0, 1}, 8, 32, 32, 64));
+  return body;
+}
+
 Stmt Make2DNarrowTileCopy(const Buffer &dst, const Buffer &src,
                           const PrimExpr &src_col_shift) {
   Var axis0("i", DataType::Int(32));
@@ -267,7 +313,31 @@ TEST(SunmmioTileLoopFusionDiscoveryTest,
   EXPECT_EQ(edge.dst_region_index, 1);
   EXPECT_EQ(edge.kind, TileScopeDependenceKind::kRAW);
   EXPECT_EQ(edge.rho, 2);
+  EXPECT_EQ(edge.max_shared_execution_depth, 2);
   EXPECT_EQ(edge.weight_bytes, 1024);
+}
+
+TEST(SunmmioTileLoopFusionDiscoveryTest,
+     RowDependenceLimitsSharedExecutionToOuterDepth) {
+  Buffer a_shared = MakeSharedBuffer("A_shared", {I(32), I(64)});
+  Buffer row_summary = MakeSharedBuffer("row_summary", {I(32)});
+  Buffer b_shared = MakeSharedBuffer("B_shared", {I(32), I(64)});
+
+  PrimFunc func = MakePrimFunc(SeqStmt(
+      Array<Stmt>{Make2DRowSummary(row_summary, a_shared),
+                  Make2DRowConsumer(b_shared, row_summary, "ii", "jj")}));
+  SunmmioTileLoopFusionProgram program =
+      BuildSunmmioTileLoopFusionProgram(func);
+  std::vector<SunmmioTileLoopFusionWindowProblem> problems =
+      BuildSunmmioTileLoopFusionWindowProblems(program);
+
+  ASSERT_EQ(problems.size(), 1U);
+  const TileScopeWindowGraph &graph = problems[0].graph;
+  ASSERT_EQ(graph.edges.size(), 1U);
+  const TileScopeDependenceEdge &edge = graph.edges[0];
+  EXPECT_EQ(edge.kind, TileScopeDependenceKind::kRAW);
+  EXPECT_EQ(edge.rho, 1);
+  EXPECT_EQ(edge.max_shared_execution_depth, 1);
 }
 
 TEST(SunmmioTileLoopFusionDiscoveryTest,
