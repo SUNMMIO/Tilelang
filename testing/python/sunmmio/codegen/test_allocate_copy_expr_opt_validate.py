@@ -365,7 +365,7 @@ def test_pipelined_allocate_copy_mma_codegen_propagates_ping_pong(tmp_path):
             "#suvm.memory_space<asram>",
             "#suvm.memory_space<wsram>",
             "suvm.mcast_tok",
-            "suvm.ping_pong = #suvm.ping_pong<pong>",
+            "suvm.ping_pong = #suvm.ping_pong<ping>",
         ),
     )
 
