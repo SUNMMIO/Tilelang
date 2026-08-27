@@ -8,6 +8,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+include(ExternalProject)
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND "$ENV{CIBUILDWHEEL}")
   # Warning came from tvm submodule
   string(APPEND CMAKE_CXX_FLAGS " -Wno-dangling-reference")
@@ -297,7 +303,59 @@ file(GLOB TILE_LANG_SRCS
   src/target/intrin_rule*.cc
 )
 
+# The ILP passes and their solver are part of the Sunmmio backend. Keep them out
+# of backend-disabled builds so a regular TileLang build does not require HiGHS.
+set(TILELANG_SUNMMIO_ILP_SRCS
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/transform/inject_sunmmio_pipeline_ilp.cc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/transform/sunmmio_pipeline_planning_ilp.cc"
+)
+list(REMOVE_ITEM TILE_LANG_SRCS ${TILELANG_SUNMMIO_ILP_SRCS})
+
 if(USE_SUNMMIO)
+  list(APPEND TILE_LANG_SRCS ${TILELANG_SUNMMIO_ILP_SRCS})
+
+  set(TILELANG_HIGHS_INSTALL_DIR
+      "${CMAKE_CURRENT_BINARY_DIR}/3rdparty/highs-install"
+      CACHE PATH "Install prefix for the vendored HiGHS build")
+  set(TILELANG_HIGHS_SOURCE_DIR
+      "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/highs"
+      CACHE PATH "Source directory for the vendored HiGHS submodule")
+  set(TILELANG_HIGHS_INCLUDE_DIR
+      "${TILELANG_HIGHS_INSTALL_DIR}/include")
+  set(TILELANG_HIGHS_LIBRARY
+      "${TILELANG_HIGHS_INSTALL_DIR}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}highs${CMAKE_STATIC_LIBRARY_SUFFIX}")
+
+  if(NOT EXISTS "${TILELANG_HIGHS_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+      "HiGHS source is missing. Please run `git submodule update --init --recursive` "
+      "to fetch 3rdparty/highs.")
+  endif()
+
+  # HiGHS is an implementation detail of libtilelang. Static linking keeps the
+  # installed package self-contained and avoids exposing a HiGHS SONAME/ABI.
+  ExternalProject_Add(tilelang_highs
+    SOURCE_DIR "${TILELANG_HIGHS_SOURCE_DIR}"
+    CMAKE_ARGS
+      -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+      -DCMAKE_INSTALL_PREFIX=${TILELANG_HIGHS_INSTALL_DIR}
+      -DCMAKE_INSTALL_LIBDIR=lib
+      -DBUILD_SHARED_LIBS=OFF
+      -DBUILD_CXX_EXE=OFF
+      -DBUILD_EXAMPLES=OFF
+      -DBUILD_TESTING=OFF
+      -DZLIB=OFF
+    BUILD_BYPRODUCTS
+      "${TILELANG_HIGHS_LIBRARY}"
+    UPDATE_DISCONNECTED TRUE
+    INSTALL_DIR "${TILELANG_HIGHS_INSTALL_DIR}"
+  )
+
+  if(NOT EXISTS "${TILELANG_HIGHS_INCLUDE_DIR}/highs/Highs.h")
+    message(STATUS "TileLang: HiGHS headers will be installed to ${TILELANG_HIGHS_INSTALL_DIR}")
+  endif()
+  list(APPEND TILE_LANG_INCLUDES ${TILELANG_HIGHS_INCLUDE_DIR})
+  list(APPEND TILE_LANG_INCLUDES ${TILELANG_HIGHS_INCLUDE_DIR}/highs)
+
   file(GLOB TILE_LANG_SUNMMIO_SRCS
     src/target/sunmmio/codegen_sunmmio.cc
     src/target/sunmmio/sunmmio_codegen_tiles_loop.cc
@@ -524,9 +582,15 @@ endif()
 if(TARGET llvm-headers)
   add_dependencies(tilelang_objs llvm-headers)
 endif()
+if(USE_SUNMMIO)
+  add_dependencies(tilelang_objs tilelang_highs)
+endif()
 
 add_library(tilelang SHARED $<TARGET_OBJECTS:tilelang_objs>)
 target_link_libraries(tilelang PUBLIC tvm)
+if(USE_SUNMMIO)
+  target_link_libraries(tilelang PRIVATE ${TILELANG_HIGHS_LIBRARY})
+endif()
 
 set(TILELANG_NPUIR_TOOL_TARGETS)
 if(USE_SUNMMIO)
