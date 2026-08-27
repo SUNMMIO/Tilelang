@@ -552,47 +552,60 @@ CASES = [
         lambda: matmul(1024, 1024, 1024, 128, 128, 32, num_stages=3),
         {
             "A_rsram_stage": [3, 128, 32],
-            "A_shared": [3, 128, 32],
-            "B_shared": [3, 32, 128],
+            "A_shared_ping": [2, 128, 32],
+            "A_shared_pong": [2, 128, 32],
+            "B_shared_ping": [2, 32, 128],
+            "B_shared_pong": [2, 32, 128],
         },
     ),
     (
         "flashattn",
         lambda: flashattn(num_stages=3),
         {
-            "K_shared": [3, 64, 128],
+            "K_shared_ping": [2, 64, 128],
+            "K_shared_pong": [2, 64, 128],
             "src_buffer": [3, 64, 64],
-            "acc_s_cast": [3, 64, 64],
-            "V_shared": [3, 64, 128],
+            "acc_s_cast_ping": [2, 64, 64],
+            "acc_s_cast_pong": [2, 64, 64],
+            "V_shared_ping": [2, 64, 128],
+            "V_shared_pong": [2, 64, 128],
         },
     ),
     (
         "flashdecoding",
         lambda: flashdecoding(num_stages=3),
         {
-            "K_shared": [3, 128, 128],
+            "K_shared_ping": [2, 128, 128],
+            "K_shared_pong": [2, 128, 128],
             "mask_local": [3, 128],
             "src_buffer": [3, 64, 128],
-            "acc_s_cast": [3, 64, 128],
-            "V_shared": [3, 128, 128],
+            "acc_s_cast_ping": [2, 64, 128],
+            "acc_s_cast_pong": [2, 64, 128],
+            "V_shared_ping": [2, 128, 128],
+            "V_shared_pong": [2, 128, 128],
         },
     ),
     (
         "flashmladecode",
         lambda: flashmladecode(num_stages=3),
         {
-            "KV_shared": [3, 64, 512],
-            "KV_shared2": [3, 64, 512],
-            "K_pe_shared": [3, 64, 64],
+            "KV_shared_ping": [2, 64, 512],
+            "KV_shared_pong": [2, 64, 512],
+            "KV_shared2_ping": [2, 64, 512],
+            "KV_shared2_pong": [2, 64, 512],
+            "K_pe_shared_ping": [2, 64, 64],
+            "K_pe_shared_pong": [2, 64, 64],
         },
     ),
     (
         "matmul_persistent",
         lambda: matmul_persistent(1024, 1024, 1024, 128, 128, 32, num_stages=2),
         {
-            "A_shared_dist": [2, 128, 128],
+            "A_shared_dist_ping": [128, 128],
+            "A_shared_dist_pong": [128, 128],
             "A_rsram_stage": [2, 128, 32],
-            "B_shared_dist": [2, 128, 128],
+            "B_shared_dist_ping": [128, 128],
+            "B_shared_dist_pong": [128, 128],
         },
     ),
 ]
@@ -724,26 +737,31 @@ def tvm_access_ptr():
     return gemm
 
 
-ERROR_CASES = [
+FALLBACK_CASES = [
     (
         lambda: if_matmul(1024, 1024, 1024, 128, 128, 32, num_stages=3),
-        "Can not identify the hardware type for a tir.IfThenElse statement.",
+        ("inject_validation", "candidate_fallback", "unsupported_statement"),
     ),
 ]
 
 
 @pytest.mark.parametrize(
-    "kernel,error_msg",
-    ERROR_CASES,
+    "kernel,expected_diagnostic",
+    FALLBACK_CASES,
 )
-def test_tilelang_transform_sunmmio_pipeline_error(kernel, error_msg):
-    with pytest.raises(tvm.error.InternalError, match=error_msg):
-        name = SUNMMIO_TARGET_DESC
-        target = tvm.target.Target(name)
+def test_tilelang_transform_sunmmio_pipeline_fallback(kernel, expected_diagnostic):
+    name = SUNMMIO_TARGET_DESC
+    target = tvm.target.Target(name)
 
-        with tvm.target.Target(target):
-            mod = tvm.IRModule.from_expr(kernel().with_attr("global_symbol", "main"))
-            mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
-            mod = tl.transform.IfStmtBinding()(mod)
-            mod = tl.transform.SunmmioPipelinePlanning(debug=False)(mod)
-            mod = tl.transform.InjectSunmmioPipeline()(mod)
+    with tvm.target.Target(target):
+        mod = tvm.IRModule.from_expr(kernel().with_attr("global_symbol", "main"))
+        mod = lower_and_legalize_sunmmio_pipeline_test(mod, target)
+        mod = tl.transform.IfStmtBinding()(mod)
+        mod = tl.transform.SunmmioPipelinePlanning(debug=False)(mod)
+        mod = tl.transform.InjectSunmmioPipeline()(mod)
+
+    stage, reason, detail = expected_diagnostic
+    script = mod.script()
+    assert f'"tl.sunmmio.pipeline.fallback_stage": "{stage}"' in script
+    assert f'"tl.sunmmio.pipeline.fallback_reason": "{reason}"' in script
+    assert f'"tl.sunmmio.pipeline.fallback_detail": "{detail}"' in script

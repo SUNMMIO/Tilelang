@@ -185,6 +185,7 @@ jobs:
           git -c protocol.version=2 submodule update --init --force --recursive \
             3rdparty/composable_kernel \
             3rdparty/cutlass \
+            3rdparty/highs \
             3rdparty/tvm
 
       - name: Resolve pinned NPU-IR commit
@@ -341,6 +342,7 @@ jobs:
           flock 9
           cmake -S . -B cmake-build --fresh ${CLANG_TIDY_CMAKE_OPTIONS} ${TILELANG_SUNMMIO_CMAKE_ARGS}
           if [[ "${TILELANG_SUNMMIO_CMAKE_ARGS}" == *"-DUSE_SUNMMIO=ON"* ]]; then
+            cmake --build cmake-build --target tilelang_highs -j "$(nproc)"
             cmake --build cmake-build --target mlir-headers llvm-headers -j "$(nproc)"
           fi
           flock -u 9

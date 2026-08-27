@@ -134,6 +134,27 @@ class PassConfigKey(str, Enum):
     optimization in cases where manual synchronization is preferred or when
     synchronization is not needed. Default: False"""
 
+    TL_DISABLE_SUNMMIO_PIPELINE = "tl.disable_sunmmio_pipeline"
+    """Disable Sunmmio pipeline planning and injection. Default: False"""
+
+    TL_SUNMMIO_PIPELINE_MODE = "tl.sunmmio_pipeline_mode"
+    """Select Sunmmio pipeline implementation. Accepts: "greedy", "ilp". Default: "greedy"."""
+
+    TL_SUNMMIO_FASTER = "tl.sunmmio_faster"
+    """Tune Sunmmio pipeline-planner search. In greedy mode, limit the number
+    of bank-coloring candidates; -1 searches all candidates. In ILP mode, use
+    the positive value to scale command-latency estimates. A non-positive or
+    unset ILP value selects the scaling factor automatically. Default: -1."""
+
+    TL_SUNMMIO_ILP_STAGE_SHRINK = "tl.sunmmio_ilp_stage_shrink"
+    """Enable Sunmmio ILP stage shrink: solve at original num_stages, then try smaller stages at fixed II and reoptimize on the minimum feasible stage. Default: False."""
+
+    TL_SUNMMIO_ILP_MULTIVERSION_LIFETIME_PRUNING = "tl.sunmmio_ilp_multiversion_lifetime_pruning"
+    """Prune unnecessary Sunmmio ILP runtime buffer versions using scheduled lifetimes. Disable to conservatively retain every theoretical version. Default: True."""
+
+    TL_SUNMMIO_ILP_MODEL_VC_BLOCKING_ISSUE = "tl.sunmmio_ilp_model_vc_blocking_issue"
+    """Model VC's blocking scalar-issue interval with lazy ILP constraints. Default: True."""
+
     TL_FORCE_LET_INLINE = "tl.force_let_inline"
     """Force TileLang to inline let bindings during simplification. Default: False"""
 
