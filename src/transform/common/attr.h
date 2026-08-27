@@ -54,6 +54,12 @@ constexpr const char *tile_interior = "tile.interior";
 // Which axis of the tile shape this interior loop corresponds to (0, 1, ...)
 constexpr const char *tile_interior_axis = "tile.interior_axis";
 
+// Marks an RSRAM buffer data var as a reduction temporary lowered to an SSA
+// tile register by the SunMMIO backend.  The integer value is a
+// ReduceRegisterTempRole.
+constexpr const char *kSunmmioReduceRegisterTemp =
+    "tile.sunmmio_reduce_register_temp";
+
 } // namespace attr
 
 enum class TileLoopStage : int {
@@ -61,6 +67,11 @@ enum class TileLoopStage : int {
   kLegalized = 1,
   kTiled = 2,
   kConsumed = 3,
+};
+
+enum class ReduceRegisterTempRole : int {
+  kAccumulator = 1,
+  kResult = 2,
 };
 
 } // namespace tl

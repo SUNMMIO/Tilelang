@@ -316,7 +316,8 @@ def test_reduce_small_1d_result_uses_aligned_store_bridge(tmp_path):
         mlir_filename="reduce_small_1d_result_aligned_store_suvm.mlir",
         expected_tokens=("suvm.tile.reduce", "suvm.tile.insert_slice", "suvm.tile.store"),
     )
-    assert_source_contains(src, ("suvm.tile.reduce", "!suvm.tile<8x1xbf16>", "!suvm.tile<32x1xbf16>"))
+    assert_source_contains(src, ("suvm.tile.reduce", "!suvm.tile<8x1xbf16>", "!suvm.tile<32xbf16>"))
+    assert "suvm.tile.unsqueeze" not in src
     assert "fake_tile_insert_slice" not in src
     assert "suvm.tile.store" in src
     assert "fake_tile_store" not in src
