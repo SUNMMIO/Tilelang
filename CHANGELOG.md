@@ -17,8 +17,8 @@ beta software, minor releases may still contain explicitly documented compatibil
 
 ### Distribution
 
-- Public GitHub Release wheels are built with `USE_SUNMMIO=OFF` and do not contain the
-  access-controlled NPU-IR source tree.
+- Public GitHub Release wheels are built with `USE_SUNMMIO=ON`, package the required NPU-IR
+  executables, and do not contain the access-controlled NPU-IR source tree.
 - Python source distributions are deferred until the NPU-IR packaging and redistribution boundary
   has been resolved.
 - CPython 3.12 or newer is required.
