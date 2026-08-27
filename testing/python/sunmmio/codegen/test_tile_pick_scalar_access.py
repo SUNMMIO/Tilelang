@@ -168,6 +168,22 @@ def pick_2d_side_data_kernel(
 
 
 @target("Sunmmio")
+def stage_2d_short_aligned_row_kernel(rows=3, cols=64, dtype=T.bfloat16):
+    table_shape = (rows, cols)
+    table_layout = make_aligned_row_major(table_shape, dtype, align_bytes=1024)
+
+    @T.prim_func
+    def main(table: T.MeshTensor(table_shape, T.placement.replicated(), dtype, layout=table_layout)):  # type: ignore
+        with T.Kernel():
+            row_shared = T.alloc_shared((cols,), dtype, scope="shared.rsram")
+            T.annotate_layout({row_shared: make_aligned_row_major((cols,), dtype, align_bytes=1024)})
+            for row in T.serial(table.local_shape[0]):
+                T.copy(table[row, :], row_shared)
+
+    return main
+
+
+@target("Sunmmio")
 def pick_3d_side_data_kernel(
     heads=2,
     q_blocks=500,
@@ -553,6 +569,17 @@ def test_pick_scalar_access_codegen_with_explicit_rsram_staging(factory, mlir_fi
         expected_tokens=("suvm.copy_async", "suvm.tile.pick"),
         opt_args=("--verify-each",),
     )
+
+
+def test_pick_2d_short_aligned_row_expands_dma_to_covered_extent(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        stage_2d_short_aligned_row_kernel(),
+        tmp_path,
+        mlir_filename="pick_2d_short_aligned_row_suvm.mlir",
+        expected_tokens=("suvm.copy_async", "!suvm.tile_view<512xbf16>"),
+        opt_args=("--verify-each", "--suvm-to-llvm-pipeline"),
+    )
+    assert "#suvm.layout<(3, 512), (512, 1)>" in src
 
 
 def test_pick_3d_predicated_1d_store_preserves_old_lanes(tmp_path):

@@ -5,7 +5,7 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.layout import make_row_major, make_zz_layout
+from tilelang.layout import make_aligned_row_major, make_row_major, make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import (
@@ -155,7 +155,8 @@ def reduce_tiled_test(
 
     shard_policy = T.placement.replicated()
     input_layout = make_zz_layout(input_shape, [1, 2], (32, 32))
-    output_layout = _dram_reduce_output_layout(out_shape_full)
+    output_layout = make_aligned_row_major(out_shape_full, dtype, align_bytes=1024)
+    output_shared_layout = make_aligned_row_major(out_shape_block, dtype, align_bytes=1024)
     grid_b = T.ceildiv(b, block_b)
     grid_m = T.ceildiv(m, block_m)
     grid_n = T.ceildiv(n, block_n)
@@ -168,6 +169,7 @@ def reduce_tiled_test(
         with T.Kernel():
             A_shared = T.alloc_shared((block_b, block_m, block_n), dtype, scope="shared.rsram")
             Out_shared = T.alloc_shared(out_shape_block, dtype, scope="shared.rsram")
+            T.annotate_layout({Out_shared: output_shared_layout})
 
             if reduce_axis == 2:
                 for bz in T.serial(grid_b):
@@ -297,8 +299,9 @@ def test_reduce_generic_in_tile_codegen_generates_expected_ops(tmp_path, shape, 
 
 @pytest.mark.parametrize("reduce_axis,clear", [(1, False), (2, True)])
 def test_reduce_tiled_in_tile_codegen_generates_expected_ops(tmp_path, reduce_axis, clear):
+    shape_overrides = {"n": 128} if reduce_axis == 1 else {"m": 256}
     src = validate_sunmmio_codegen_loose(
-        reduce_tiled_test(reduce_axis=reduce_axis, clear=clear),
+        reduce_tiled_test(reduce_axis=reduce_axis, clear=clear, **shape_overrides),
         tmp_path,
         mlir_filename=f"reduce_tiled_axis_{reduce_axis}_suvm.mlir",
         expected_tokens=("suvm.copy_async", "suvm.tile.reduce"),
