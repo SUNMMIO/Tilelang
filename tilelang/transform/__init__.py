@@ -730,9 +730,19 @@ def InjectSunmmioPipeline():
     return _ffi_api.InjectSunmmioPipeline()  # type: ignore
 
 
+def RemoveUnusedSunmmioAllocations():
+    """Remove allocations unused by executable SunMMIO TIR.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.RemoveUnusedSunmmioAllocations()  # type: ignore
+
 def SunmmioPipelinePlanningILP(debug: bool = False):
     """SunmmioPipelinePlanning
-
+    
     Returns
     -------
     fpass : tvm.transform.Pass

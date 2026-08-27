@@ -286,6 +286,7 @@ def OptimizeForSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tir.transform.RenormalizeSplitPattern()(mod)
     mod = tir.transform.Simplify()(mod)
     mod = tir.transform.RemoveNoOp()(mod)
+    mod = tilelang.transform.RemoveUnusedSunmmioAllocations()(mod)
     mod = tir.transform.HoistIfThenElse()(mod)
 
     mod = tir.transform.VerifyMemory()(mod)
