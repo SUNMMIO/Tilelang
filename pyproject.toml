@@ -84,7 +84,7 @@ requires = [
 build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
-wheel.py-api = "cp38"
+wheel.py-api = "cp39"
 cmake.version = ">=3.26.1"
 build-dir = "build"
 
@@ -119,6 +119,8 @@ include = [
     # Composable Kernel
     "3rdparty/composable_kernel/include",
     "3rdparty/composable_kernel/library",
+    # HiGHS is required to build the Sunmmio ILP pipeline planner.
+    "3rdparty/highs",
     "testing/**",
     "examples/**",
 ]

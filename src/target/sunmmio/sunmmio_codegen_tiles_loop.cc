@@ -3670,16 +3670,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                          select->false_value, select->dtype);
     }
     if (const auto *cast = expr.as<CastNode>()) {
-      SunMMIOValue value = lower_expr(cast->value, state, preferred_dtype);
+      // An explicit cast applies after its operand has been evaluated.
+      SunMMIOValue value = lower_expr(cast->value, state, std::nullopt);
       if (IsTileLike(value)) {
         DataType dst_dtype = CanonicalizeSuvmDType(cast->dtype).with_lanes(1);
         if (value.dtype == dst_dtype) {
-          return value;
-        }
-        if (preferred_dtype.has_value() && is_float_like_dtype(value.dtype) &&
-            is_float_like_dtype(dst_dtype) &&
-            value.dtype ==
-                CanonicalizeSuvmDType(preferred_dtype.value()).with_lanes(1)) {
           return value;
         }
         SunMMIOType dst_type = MakeTileType(CanonicalizeSuvmDType(cast->dtype),

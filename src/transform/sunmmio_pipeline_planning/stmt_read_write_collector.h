@@ -229,22 +229,27 @@ public:
 
   void VisitStmt_(const EvaluateNode *op) {
     const CallNode *call = op->value.as<CallNode>();
-    if (call->op.same_as(dma_copy())) {
+    if (call && call->op.same_as(dma_copy())) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
-    } else if (call->op.same_as(sunmmio_layout_transform()) ||
-               call->op.same_as(sunmmio_transpose())) {
+    } else if (call && (call->op.same_as(sunmmio_layout_transform()) ||
+                        call->op.same_as(sunmmio_transpose()))) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
-    } else if (call->op.same_as(mma_sunmmio())) {
+    } else if (call && call->op.same_as(mma_sunmmio())) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
 
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
-    } else if (call->op.same_as(Op::Get("tl.broadcast_"))) {
+    } else if (call && call->op.same_as(Op::Get("tl.broadcast_"))) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
+    } else if (call &&
+               call->op.same_as(Op::Get("tl.vector_core_in_tile_reduce"))) {
+      ICHECK_GE(call->args.size(), 3U);
+      write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
+      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
     } else {
       auto [read_regions, write_regions] = buffer_region_collector(op->value);
       for (auto it : read_regions) {
