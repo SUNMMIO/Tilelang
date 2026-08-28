@@ -61,9 +61,6 @@
 namespace tvm {
 namespace tl {
 
-static constexpr const char *kGreedySunmmioFaster = "tl.sunmmio_faster";
-TVM_REGISTER_PASS_CONFIG_OPTION(kGreedySunmmioFaster, Integer);
-
 using namespace tir;
 
 /**
@@ -1977,7 +1974,7 @@ public:
     // 8. Stage 4: Build the global DDG and run the two-phase scheduler.
     int faster = -1;
     auto pass_ctx = tvm::transform::PassContext::Current();
-    auto faster_config = pass_ctx->GetConfig<Integer>(kGreedySunmmioFaster);
+    auto faster_config = pass_ctx->GetConfig<Integer>(kSunmmioFaster);
     if (faster_config) {
       faster = faster_config.value()->value;
     } else if (const char *env_faster = std::getenv("TL_SUNMMIO_FASTER")) {

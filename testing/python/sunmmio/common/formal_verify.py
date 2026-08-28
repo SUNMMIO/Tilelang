@@ -242,6 +242,28 @@ def verify_comm_lower(func: tir.PrimFunc):
             else:
                 mask_pattern = rf"(?:T\.int64\({mask}\)|{mask})"
             if has_src_core:
+                if not core.lstrip("-").isdigit():
+                    # Lowering may inline let-bound dynamic coordinates and
+                    # rename the kernel thread variable. Verify the lowered
+                    # broadcast ABI here; per-test checks own its exact route.
+                    message = f"Expected broadcast_ with a dynamic source core, direction={direction}, mask={mask} not found in IRModule"
+                    found = False
+                    for args in broadcast_arg_lists:
+                        if len(args) == 6:
+                            fixed_args = args
+                        elif len(args) == 7 and args[-1].startswith("T.sync_token_id("):
+                            fixed_args = args[:-1]
+                        else:
+                            continue
+                        if fixed_args[2] != str(direction):
+                            continue
+                        if mask is not None and fixed_args[3] not in {f"T.int64({mask})", str(mask)}:
+                            continue
+                        found = True
+                        break
+                    assert found, message
+                    continue
+
                 # Match T.broadcast_(..., direction, mask, src_offset_byte, src_core, ...)
                 escaped_core = re.escape(core).replace(r"\ ", r"\s*")
                 pattern = rf"T\.broadcast_\(.*?,\s*.*?,\s*{direction},\s*{mask_pattern},\s*.*?,\s*{escaped_core}(?:,|\))"

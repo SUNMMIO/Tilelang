@@ -740,9 +740,10 @@ def RemoveUnusedSunmmioAllocations():
     """
     return _ffi_api.RemoveUnusedSunmmioAllocations()  # type: ignore
 
+
 def SunmmioPipelinePlanningILP(debug: bool = False):
     """SunmmioPipelinePlanning
-    
+
     Returns
     -------
     fpass : tvm.transform.Pass
