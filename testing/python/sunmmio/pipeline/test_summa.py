@@ -15,7 +15,7 @@ def summa_matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtyp
 
     Grid size: (N/block_N, M/block_M) = (4, 4)
     """
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
 
     A_shape = (M, K)
     B_shape = (K, N)

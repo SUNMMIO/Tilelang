@@ -17,7 +17,7 @@ def ref_program(x):
 
 def softmax_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Callable":
     zz_layout = make_zz_layout((M, N))
-    placement = T.MeshShardingPolicy(y=0, x=1)
+    placement = T.placement.full_shard(0, 1)
 
     accum_dtype = T.float32
     scale = 1.44269504  # log2(e)
@@ -34,7 +34,7 @@ def softmax_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Call
             exp_x = T.alloc_shared([block_M, block_N], accum_dtype)
             sum_exp_x = T.alloc_shared((block_M), accum_dtype)
 
-            lse_dist = T.alloc_shared((T.mesh_ncols(), block_M), accum_dtype)
+            lse_dist = T.alloc_shared((T.ncols(), block_M), accum_dtype)
             lse_max = T.alloc_shared((block_M,), accum_dtype)
             lse_global = T.alloc_shared((block_M,), accum_dtype)
 
@@ -57,7 +57,7 @@ def softmax_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16) -> "Call
                 T.reduce_max(lse_dist, lse_max, dim=0, clear=True)
 
                 # Get global lse
-                for i, j in T.Tiles([T.mesh_ncols(), block_M]):
+                for i, j in T.Tiles([T.ncols(), block_M]):
                     lse_dist[i, j] = T.exp2(lse_dist[i, j] - lse_max[j])
                 T.reduce_sum(lse_dist, lse_global, dim=0, clear=True)
                 for i in T.Tiles([block_M]):

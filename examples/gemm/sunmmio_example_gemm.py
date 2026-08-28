@@ -9,16 +9,16 @@ def matmul_persistent(M, N, K, block_M, block_N, block_K, num_stages, dtype=T.bf
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
 
-            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
-            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.ncols()), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             # Each core iterates its own sharded tile grid with plain nested

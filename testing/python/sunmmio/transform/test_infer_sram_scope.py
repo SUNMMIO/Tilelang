@@ -9,7 +9,6 @@ from tvm.tir.stmt_functor import post_order_visit
 from tvm.tir import BufferLoad, BufferStore, Buffer, Block, Call
 from typing import Set
 from tilelang.tileview import make_tileview
-from tilelang.language.mesh_tensor import MeshShardingPolicy
 
 tilelang.env.disable_cache()
 
@@ -793,19 +792,19 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
     def gemm(
         A: T.MeshTensor(
             (M, K),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=dtype,
             layout=A_layout,
         ),
         B: T.MeshTensor(
             (K, N),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=dtype,
             layout=B_layout,
         ),
         C: T.MeshTensor(
             (M, N),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=accum_dtype,
             layout=C_layout,
         ),
@@ -888,19 +887,19 @@ def auto_insert_copy_matmul(M, N, K, block_M, block_N, block_K, dtype="float16",
     def gemm(
         A: T.MeshTensor(
             (M, K),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=dtype,
             layout=A_layout,
         ),
         B: T.MeshTensor(
             (K, N),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=dtype,
             layout=B_layout,
         ),
         C: T.MeshTensor(
             (M, N),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=accum_dtype,
             layout=C_layout,
         ),
@@ -964,19 +963,19 @@ def sliced_conflict_matmul(dtype="float16", accum_dtype="float"):
     def gemm(
         A: T.MeshTensor(
             (128, 128),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=dtype,
             layout=A_layout,
         ),
         B: T.MeshTensor(
             (128, 128),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=dtype,
             layout=B_layout,
         ),
         C: T.MeshTensor(
             (128, 128),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=accum_dtype,
             layout=C_layout,
         ),

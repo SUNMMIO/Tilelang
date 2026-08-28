@@ -194,7 +194,7 @@ def tile_elementwise_ops_2d_test(
 def fp32_select_then_bf16_cast_test(m=32, n=32):
     input_dtype = T.float32
     output_dtype = T.bfloat16
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
     tensor_shape = (m, n)
     tensor_layout = make_zz_layout(tensor_shape, [0, 1], tensor_shape)
 

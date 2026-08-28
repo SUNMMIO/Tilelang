@@ -34,7 +34,7 @@ def tiles_shape_rank1_side_buffer_predicate_kernel(
     assert cols % 32 == 0
     assert num_tokens % 16 == 0
 
-    token_policy = T.MeshShardingPolicy(cross_mesh_dim=0)
+    token_policy = T.placement.mesh_as_line(0)
     out_shape = (num_tokens, rows, cols)
     out_layout = make_zz_layout(out_shape, [1, 2], (32, 32))
     a_layout = make_zz_layout((rows, cols), [0, 1], (32, 32))

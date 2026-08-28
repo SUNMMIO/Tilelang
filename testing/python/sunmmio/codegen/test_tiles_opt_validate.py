@@ -392,7 +392,7 @@ def tiles_dynamic_extent_zz_store():
 def tiles_rank2_first_tile_partial(rows=4, cols=4, dtype="float32"):
     output_shape = (32, 32)
     output_layout = make_zz_layout(output_shape, [0, 1], (32, 32))
-    shard_policy = T.MeshShardingPolicy()
+    shard_policy = T.placement.replicated()
 
     @T.prim_func
     def main(

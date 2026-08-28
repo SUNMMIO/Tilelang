@@ -25,16 +25,16 @@ def gqa_flashattn(batch, heads, kv_heads, seqlen_kv, dim, block_N=128):
 
     @T.prim_func
     def main(
-        Q: T.MeshTensor(shape_q, T.MeshShardingPolicy(y=0, x=1), dtype, layout=make_zz_layout(shape_q)),
-        K: T.MeshTensor(shape_k, T.MeshShardingPolicy(y=0, x=2), dtype, layout=make_zz_layout(shape_k, axes=(1, 3))),
-        V: T.MeshTensor(shape_v, T.MeshShardingPolicy(y=0, x=2), dtype, layout=make_zz_layout(shape_k, axes=(1, 3))),
+        Q: T.MeshTensor(shape_q, T.placement.full_shard(0, 1), dtype, layout=make_zz_layout(shape_q)),
+        K: T.MeshTensor(shape_k, T.placement.full_shard(0, 2), dtype, layout=make_zz_layout(shape_k, axes=(1, 3))),
+        V: T.MeshTensor(shape_v, T.placement.full_shard(0, 2), dtype, layout=make_zz_layout(shape_k, axes=(1, 3))),
         mask: T.MeshTensor(
             [batch, seqlen_kv],
-            T.MeshShardingPolicy(y=0, replicate=T.MeshReplicationType.ROW),
+            T.placement.row_shard(0),
             "uint16",
             layout=make_row_major([batch, seqlen_kv]),
         ),
-        Output: T.MeshTensor(shape_o, T.MeshShardingPolicy(y=0, x=1), dtype, layout=make_zz_layout(shape_o)),
+        Output: T.MeshTensor(shape_o, T.placement.full_shard(0, 1), dtype, layout=make_zz_layout(shape_o)),
     ):
         with T.Kernel() as (_cid):
             sharded_batch, sharded_heads, _ = Q.local_shape

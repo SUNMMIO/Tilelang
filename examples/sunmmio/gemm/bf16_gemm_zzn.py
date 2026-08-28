@@ -43,7 +43,7 @@ def matmul_persistent_zzn(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, 
         cluster_shape=(block_K // 32, block_N // 32),
     )
     C_layout = make_zz_layout((M, N))
-    placement = T.MeshShardingPolicy(y=0, x=1)
+    placement = T.placement.full_shard(0, 1)
 
     @T.prim_func
     def main(
@@ -55,8 +55,8 @@ def matmul_persistent_zzn(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, 
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
 
-            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
-            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.ncols()), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             for bx in T.serial(T.ceildiv(sharded_M, block_M)):

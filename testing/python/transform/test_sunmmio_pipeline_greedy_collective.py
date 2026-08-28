@@ -22,8 +22,8 @@ def mesh_ffn_new(
     dtype="bfloat16",
     accum_dtype="float",
 ):
-    activation_policy = T.MeshShardingPolicy(y=0, x=1)
-    weight_policy = T.MeshShardingPolicy(y=0, x=1)
+    activation_policy = T.placement.full_shard(0, 1)
+    weight_policy = T.placement.full_shard(0, 1)
     x_shape = (seq, hidden)
     up_weight_shape = (hidden, inner_dim)
     mid_shape = (seq, inner_dim)
@@ -40,14 +40,14 @@ def mesh_ffn_new(
         with T.Kernel(T.mesh_ncores()):
             lhs_local = T.alloc_shared((block_seq, block_hidden), dtype, scope="shared.rsram")
             up_local = T.alloc_shared((block_hidden, block_inner), dtype, scope="shared.rsram")
-            lhs_shared = T.alloc_shared((block_seq, block_hidden * T.mesh_ncols()), dtype)
-            up_shared = T.alloc_shared((block_hidden * T.mesh_nrows(), block_inner), dtype)
+            lhs_shared = T.alloc_shared((block_seq, block_hidden * T.ncols()), dtype)
+            up_shared = T.alloc_shared((block_hidden * T.nrows(), block_inner), dtype)
             mid_acc = T.alloc_shared((block_seq, block_inner), accum_dtype, scope="shared.rsram")
             mid_tile = T.alloc_shared((block_seq, block_inner), dtype, scope="shared.rsram")
             mid_local = T.alloc_shared((block_seq, block_inner), dtype, scope="shared.rsram")
             down_local = T.alloc_shared((block_inner, block_hidden), dtype, scope="shared.rsram")
-            mid_shared = T.alloc_shared((block_seq, block_inner * T.mesh_ncols()), dtype)
-            down_shared = T.alloc_shared((block_inner * T.mesh_nrows(), block_hidden), dtype)
+            mid_shared = T.alloc_shared((block_seq, block_inner * T.ncols()), dtype)
+            down_shared = T.alloc_shared((block_inner * T.nrows(), block_hidden), dtype)
             out_acc = T.alloc_shared((block_seq, block_hidden), accum_dtype, scope="shared.rsram")
 
             hidden_blocks = T.ceildiv(X.local_shape[1], block_hidden)

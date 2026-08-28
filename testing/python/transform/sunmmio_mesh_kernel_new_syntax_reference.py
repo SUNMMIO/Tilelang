@@ -16,13 +16,13 @@ The user guide describes a newer API shape:
     A: T.MeshTensor((M, K), shard_policy, dtype, layout=A_layout)
     with T.Kernel() as cid:
         sharded_M, sharded_K = A.local_shape
-        valid_M, valid_K = A.get_local_extent(cid)
+        valid_M, valid_K = A.get_local_extent()
 
 At the time of writing, parts of that API are still ahead of the Python DSL
 implementation in this local checkout. So the examples below do two things:
 
 - They follow the *design intent* of the new Mesh style:
-  explicit `MeshShardingPolicy`, explicit `make_zz_layout`, explicit
+  explicit `T.placement`, explicit `make_zz_layout`, explicit
   `T.MeshTensor(...)`.
 - They also stay close to constructs that already exist in the repository, so
   the examples remain grounded in the current codebase.
@@ -32,7 +32,6 @@ contract for the exact parser behavior of the current checkout.
 """
 
 import tilelang.language as T
-from tilelang.language.mesh_tensor import MeshReplicationType
 from tilelang.layout import make_zz_layout, make_row_major
 from testing.python.sunmmio.common.compile_pipeline import target
 
@@ -48,7 +47,7 @@ def ilp(
     dtype=T.bfloat16,
     accum_dtype=T.float32,
 ):
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K))
     B_layout = make_zz_layout((K, N))
     C_layout = make_zz_layout((M, N))
@@ -62,8 +61,8 @@ def ilp(
         with T.Kernel() as _cid:
             sharded_M, sharded_K = A.local_shape
             sharded_N = B.local_shape[1]
-            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
-            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.ncols()), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             for by in T.serial(T.ceildiv(sharded_M, block_M)):
@@ -114,9 +113,9 @@ def mesh_matmul_new(
     # A is row-sharded on M and replicated across mesh rows for K traversal,
     # B is col-sharded on N and replicated across mesh cols for K traversal,
     # C is sharded on both output axes.
-    a_policy = T.MeshShardingPolicy(y=0, replicate=MeshReplicationType.ROW)
-    b_policy = T.MeshShardingPolicy(x=1, replicate=MeshReplicationType.COLUMN)
-    c_policy = T.MeshShardingPolicy(y=0, x=1)
+    a_policy = T.placement.row_shard(0)
+    b_policy = T.placement.col_shard(1)
+    c_policy = T.placement.full_shard(0, 1)
 
     # 2) Layout
     # For GEMM, the compute-critical dimensions are exactly the matrix axes.
@@ -183,8 +182,8 @@ def mesh_ffn_new(
     accum_dtype="float",
 ):
     """Small two-projection FFN used by the SunMMIO pipeline pass tests."""
-    activation_policy = T.MeshShardingPolicy(y=0, x=1)
-    weight_policy = T.MeshShardingPolicy(y=0, x=1)
+    activation_policy = T.placement.full_shard(0, 1)
+    weight_policy = T.placement.full_shard(0, 1)
 
     x_shape = (seq, hidden)
     up_weight_shape = (hidden, inner_dim)
@@ -212,15 +211,15 @@ def mesh_ffn_new(
         with T.Kernel(T.mesh_ncores()):
             lhs_local = T.alloc_shared((block_seq, block_hidden), dtype, scope="shared.rsram")
             up_local = T.alloc_shared((block_hidden, block_inner), dtype, scope="shared.rsram")
-            lhs_shared = T.alloc_shared((block_seq, block_hidden * T.mesh_ncols()), dtype)
-            up_shared = T.alloc_shared((block_hidden * T.mesh_nrows(), block_inner), dtype)
+            lhs_shared = T.alloc_shared((block_seq, block_hidden * T.ncols()), dtype)
+            up_shared = T.alloc_shared((block_hidden * T.nrows(), block_inner), dtype)
             mid_acc = T.alloc_shared((block_seq, block_inner), accum_dtype, scope="shared.rsram")
             mid_tile = T.alloc_shared((block_seq, block_inner), dtype, scope="shared.rsram")
 
             mid_local = T.alloc_shared((block_seq, block_inner), dtype, scope="shared.rsram")
             down_local = T.alloc_shared((block_inner, block_hidden), dtype, scope="shared.rsram")
-            mid_shared = T.alloc_shared((block_seq, block_inner * T.mesh_ncols()), dtype)
-            down_shared = T.alloc_shared((block_inner * T.mesh_nrows(), block_hidden), dtype)
+            mid_shared = T.alloc_shared((block_seq, block_inner * T.ncols()), dtype)
+            down_shared = T.alloc_shared((block_inner * T.nrows(), block_hidden), dtype)
             out_acc = T.alloc_shared((block_seq, block_hidden), accum_dtype, scope="shared.rsram")
 
             hidden_blocks = T.ceildiv(X.local_shape[1], block_hidden)
@@ -286,8 +285,8 @@ def mesh_flashattn_new(
     # Attention tensors are not matrices. The usual choice is:
     # - shard batch on mesh rows
     # - shard heads / kv-heads on mesh cols
-    q_policy = T.MeshShardingPolicy(y=0, x=2)
-    kv_policy = T.MeshShardingPolicy(y=0, x=2)
+    q_policy = T.placement.full_shard(0, 2)
+    kv_policy = T.placement.full_shard(0, 2)
 
     # 2) Layout
     # For Q/K/V/O the compute-critical axes are typically sequence and dim.
@@ -404,16 +403,16 @@ def mesh_flashdecoding_new(
 
     @T.prim_func
     def main(
-        Q: T.MeshTensor(shape_q, T.MeshShardingPolicy(y=0, x=1), dtype, layout=make_zz_layout(shape_q)),
-        K: T.MeshTensor(shape_k, T.MeshShardingPolicy(y=0, x=2), dtype, layout=make_zz_layout(shape_k, axes=(1, 3))),
-        V: T.MeshTensor(shape_v, T.MeshShardingPolicy(y=0, x=2), dtype, layout=make_zz_layout(shape_k, axes=(1, 3))),
+        Q: T.MeshTensor(shape_q, T.placement.full_shard(0, 1), dtype, layout=make_zz_layout(shape_q)),
+        K: T.MeshTensor(shape_k, T.placement.full_shard(0, 2), dtype, layout=make_zz_layout(shape_k, axes=(1, 3))),
+        V: T.MeshTensor(shape_v, T.placement.full_shard(0, 2), dtype, layout=make_zz_layout(shape_k, axes=(1, 3))),
         mask: T.MeshTensor(
             [batch, seqlen_kv],
-            T.MeshShardingPolicy(y=0, replicate=T.MeshReplicationType.ROW),
+            T.placement.row_shard(0),
             dtype,
             layout=make_row_major([batch, seqlen_kv]),
         ),
-        Output: T.MeshTensor(shape_o, T.MeshShardingPolicy(y=0, x=1), dtype, layout=make_zz_layout(shape_o)),
+        Output: T.MeshTensor(shape_o, T.placement.full_shard(0, 1), dtype, layout=make_zz_layout(shape_o)),
     ):
         with T.Kernel() as (_cid):
             sharded_batch, sharded_heads, _ = Q.local_shape
@@ -503,8 +502,8 @@ def mesh_flashmladecode_new(
     # 1) Sharding policy
     # Q / Q_pe / Output are head-oriented tensors.
     # KV / K_pe are kv-stream tensors.
-    q_policy = T.MeshShardingPolicy(y=0, x=1)
-    kv_policy = T.MeshShardingPolicy(y=0, x=2)
+    q_policy = T.placement.full_shard(0, 1)
+    kv_policy = T.placement.full_shard(0, 2)
 
     # 2) Layout
     # Q and Q_pe use head-oriented layouts.
