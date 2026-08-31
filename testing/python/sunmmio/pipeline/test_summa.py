@@ -13,7 +13,8 @@ def summa_matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtyp
     SUMMA (Scalable Universal Matrix Multiplication Algorithm)
     for a 4x4 mesh.
 
-    Grid size: (N/block_N, M/block_M) = (4, 4)
+    Each core accumulates its local C tiles over all global K panels. For each
+    panel, A is broadcast along the current core row and B along its column.
     """
     shard_policy = T.placement.full_shard(0, 1)
 
@@ -30,58 +31,50 @@ def summa_matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtyp
         B: T.MeshTensor(B_shape, shard_policy, dtype, layout=B_layout),
         C: T.MeshTensor(C_shape, shard_policy, accum_dtype, layout=C_layout),
     ):
-        # Assume the current is a 4x4 processor grid (Mesh)
-        # Each core is responsible for outputting a 32x32 block of matrix C
         with T.Kernel() as _cid:
-            sharded_M, sharded_K = A.local_shape
+            sharded_M, _ = A.local_shape
             _, sharded_N = B.local_shape
+            core_row = _cid // T.mesh_ncols()
+            core_col = _cid % T.mesh_ncols()
 
-            # Allocate local SRAM cache
-            # A_shared is placed in ASRAM (usually used for A matrix cache)
-            # B_shared is placed in WSRAM (usually used for B matrix cache)
+            # Multicast lands in RSRAM before A is copied into MMA's ASRAM input.
+            A_broadcast = T.alloc_shared((block_M, block_K), dtype, scope="shared.rsram")
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-
-            # Local accumulator, placed in RSRAM
             C_local = T.alloc_shared((block_M, block_N), accum_dtype)
+
             for bx in T.serial(T.ceildiv(sharded_M, block_M)):
                 for by in T.serial(T.ceildiv(sharded_N, block_N)):
                     T.clear(C_local)
+                    K_steps = T.ceildiv(K, block_K)
 
-                    # Number of iterations in K dimension.
-                    K_steps = T.ceildiv(sharded_K, block_K)
-
-                    # Core loop of SUMMA algorithm
                     for k_tile in range(K_steps):
-                        # --- Step 1: Broadcast row block of matrix A ---
-                        # Broadcast directly from DRAM to asram of each core
+                        a_src_col = k_tile % T.mesh_ncols()
+                        b_src_row = k_tile % T.mesh_nrows()
+                        a_local_k = (k_tile // T.mesh_ncols()) * block_K
+                        b_local_k = (k_tile // T.mesh_nrows()) * block_K
+
                         T.comm.broadcast(
                             A[
                                 bx * block_M : bx * block_M + block_M,
-                                k_tile * block_K : k_tile * block_K + block_K,
+                                a_local_k : a_local_k + block_K,
                             ],
-                            A_shared,
-                            (0, 0),
+                            A_broadcast,
+                            (core_row, a_src_col),
                             direction="h",
                         )
-
-                        # --- Step 2: Broadcast column block of matrix B ---
-                        # Broadcast directly from DRAM to wsram of each core
+                        T.copy(A_broadcast, A_shared)
                         T.comm.broadcast(
                             B[
-                                k_tile * block_K : k_tile * block_K + block_K,
+                                b_local_k : b_local_k + block_K,
                                 by * block_N : by * block_N + block_N,
                             ],
                             B_shared,
-                            (0, 0),
+                            (b_src_row, core_col),
                             direction="v",
                         )
-
-                        # --- Step 3: Local computation ---
-                        # Each core performs local GEMM using broadcasted A_shared and B_shared
                         T.gemm(A_shared, B_shared, C_local)
 
-                    # After the loop ends, write local computation result back to DRAM
                     T.copy(C_local, C[bx * block_M, by * block_N])
 
     return kernel
@@ -90,35 +83,18 @@ def summa_matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtyp
 def test_summa(is_log=False):
     func = summa_matmul(128, 128, 128, 32, 32, 32)
 
-    script_device_mode = """
-        with T.launch_thread("blockIdx.x", 16) as bx:
-            T.barrier_init(T.int64(15))
-            T.barrier_init(T.int64(4369))
-            with T.decl_buffer((32, 32), "float16", data=A_shared.data, scope="shared.asram") as A_shared:
-                B_shared = T.decl_buffer((32, 32), "float16", data=B_shared.data, scope="shared.wsram")
-                C_local = T.decl_buffer((32, 32), data=C_local.data, scope="shared.rsram")
-                A_rsram_stage = T.decl_buffer((32, 32), "float16", data=A_rsram_stage.data, scope="shared.rsram")
-                for i0 in T.serial(8, annotations={"tile.domain": [32, 32], "tile.execution_axis": 0, "tile.execution_domain_axes": [0, 1], "tile.scope_entry": 1, "tile.tile_size": [4, 32]}):
-                    for i1 in T.serial(1, annotations={"tile.execution_axis": 1}):
-                        for ki in T.serial(4, annotations={"tile.interior": 1, "tile.interior_axis": 0}):
-                            for kj in T.vectorized(32, annotations={"tile.interior": 1, "tile.interior_axis": 1}):
-                                C_local[i0 * 4 + ki, kj] = T.float32(0.0)
-                T.dma_copy(T.region(A_1[0, 0], 1, 32, 32), T.region(A_rsram_stage[0, 0], 2, 32, 32), 0, T.sync_token_id(0))
-                T.wait_token(0)
-                T.barrier_arrive_and_wait(T.int64(15))
-                T.broadcast_(T.region(A_rsram_stage[0, 0], 1, 32, 32), T.region(A_shared[0, 0], 2, 32, 32), 0, 15, 0, 0, T.sync_token_id(1))
-                T.barrier_arrive_and_wait(T.int64(4369))
-                T.broadcast_(T.region(B_1[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 2, 32, 32), 1, 15, 0, 0, T.sync_token_id(2))
-                T.wait_token(1)
-                T.barrier_arrive_and_wait(T.int64(15))
-                T.wait_token(2)
-                T.barrier_arrive_and_wait(T.int64(4369))
-                T.mma_sunmmio(T.region(A_shared[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 1, 32, 32), T.region(C_local[0, 0], 3, 32, 32), T.bool(False), T.bool(False), T.bool(False), 0, T.sync_token_id(3))
-                T.wait_token(3)
-                T.dma_copy(T.region(C_local[0, 0], 1, 32, 32), T.region(C_1[0, 0], 2, 32, 32), 0, T.sync_token_id(4))
-            T.wait_token(4)
-        return 0
-    """
+    script_device_mode = [
+        'with T.launch_thread("blockIdx.x", 16) as bx:',
+        'with T.decl_buffer((32, 32), "float16", data=A_broadcast.data, scope="shared.rsram") as A_broadcast:',
+        'A_shared = T.decl_buffer((32, 32), "float16", data=A_shared.data, scope="shared.asram")',
+        'B_shared = T.decl_buffer((32, 32), "float16", data=B_shared.data, scope="shared.wsram")',
+        "for k_tile in range(4):",
+        "bx // 4 * 4 + k_tile",
+        "k_tile * 4 + bx % 4",
+        "T.mma_sunmmio(",
+        "T.wait_token(",
+        "T.dma_copy(T.region(C_local[0, 0]",
+    ]
 
     script_lower_tile_op = [
         'A = T.match_buffer(A_handle, (32, 32), "float16", strides=(32, 1))',
@@ -126,30 +102,25 @@ def test_summa(is_log=False):
         "C = T.match_buffer(C_handle, (32, 32), strides=(32, 1))",
         'bx = T.launch_thread("blockIdx.x", 16)',
         "for bx_1, by in T.grid(1, 1):",
-        "T.dma_copy(T.region(A[0, 0], 1, 32, 32), T.region(A_rsram_stage[0, 0], 2, 32, 32), 0)",
-        "T.broadcast_(T.region(A_rsram_stage[0, 0], 1, 32, 32), T.region(A_shared[0, 0], 2, 32, 32), 0, T.int64(15), 0, 0)",
-        "T.broadcast_(T.region(B[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 2, 32, 32), 1, T.int64(15), 0, 0)",
-        "T.dma_copy(T.region(C_local[0, 0], 1, 32, 32), T.region(C[0, 0], 2, 32, 32), 0)",
+        "for k_tile in range(4):",
+        "T.dma_copy(T.region(A[bx_1 * 32, 0], 1, 32, 32), T.region(A_rsram_stage[0, 0], 2, 32, 32), 0)",
+        "bx // 4 * 4 + k_tile",
+        "k_tile * 4 + bx % 4",
+        "T.mma_sunmmio(",
+        "T.dma_copy(T.region(C_local[0, 0], 1, 32, 32), T.region(C[bx_1 * 32, by * 32], 2, 32, 32), 0)",
     ]
 
     script_InjectSunmmioSync = [
         'with T.launch_thread("blockIdx.x", 16) as bx:',
-        "T.dma_copy(T.region(A_1[0, 0], 1, 32, 32), T.region(A_rsram_stage[0, 0], 2, 32, 32), 0, T.sync_token_id(0))",
-        "T.wait_token(0)",
-        "T.barrier_init(T.int64(15))",
-        "T.barrier_init(T.int64(4369))",
-        "T.barrier_arrive_and_wait(T.int64(15))",
-        "T.broadcast_(T.region(A_rsram_stage[0, 0], 1, 32, 32), T.region(A_shared[0, 0], 2, 32, 32), 0, 15, 0, 0, T.sync_token_id(1))",
-        "T.barrier_arrive_and_wait(T.int64(4369))",
-        "T.broadcast_(T.region(B_1[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 2, 32, 32), 1, 15, 0, 0, T.sync_token_id(2))",
-        "T.wait_token(1)",
-        "T.barrier_arrive_and_wait(T.int64(15))",
-        "T.wait_token(2)",
-        "T.barrier_arrive_and_wait(T.int64(4369))",
-        "T.mma_sunmmio(T.region(A_shared[0, 0], 1, 32, 32), T.region(B_shared[0, 0], 1, 32, 32), T.region(C_local[0, 0], 3, 32, 32), T.bool(False), T.bool(False), T.bool(False), 0, T.sync_token_id(3))",
-        "T.wait_token(3)",
-        "T.dma_copy(T.region(C_local[0, 0], 1, 32, 32), T.region(C_1[0, 0], 2, 32, 32), 0, T.sync_token_id(4))",
-        "T.wait_token(4)",
+        "T.barrier_init(",
+        "for k_tile in range(4):",
+        "bx // 4 * 4 + k_tile",
+        "k_tile * 4 + bx % 4",
+        "T.broadcast_(",
+        "T.mma_sunmmio(",
+        "T.sync_token_id(",
+        "T.wait_token(",
+        "T.dma_copy(T.region(C_local[0, 0]",
     ]
 
     test_config = {
