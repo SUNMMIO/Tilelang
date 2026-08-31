@@ -201,7 +201,7 @@ def _build_script(copy_case):
 @target("Sunmmio")
 def _make_let_bound_mesh_copy_kernel():
     global_shape = (256, 256)
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     tensor_layout = make_zz_layout(global_shape, axes=[0, 1], block_shape=(32, 32))
 
     @T.prim_func
@@ -219,7 +219,7 @@ def _make_let_bound_mesh_copy_kernel():
 @target("Sunmmio")
 def _make_mismatched_let_bound_mesh_copy_kernel():
     global_shape = (256, 256)
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     tensor_layout = make_zz_layout(global_shape, axes=[0, 1], block_shape=(32, 32))
 
     @T.prim_func

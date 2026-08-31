@@ -19,7 +19,7 @@ STRICT_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
 @target("Sunmmio")
 def dynamic_rank2_domain_kernel(h=4, matrix_size=32, dtype=T.float32):
     out_shape = (16, matrix_size, matrix_size)
-    token_policy = T.MeshShardingPolicy(cross_mesh_dim=0)
+    token_policy = T.placement.mesh_as_line(0)
     out_layout = make_zz_layout(out_shape, [1, 2], (32, 32))
     lengths_shape = (128,)
     lengths_layout = make_aligned_row_major(lengths_shape, T.int32, align_bytes=1024)
@@ -28,7 +28,7 @@ def dynamic_rank2_domain_kernel(h=4, matrix_size=32, dtype=T.float32):
     @T.prim_func
     def main(
         out: T.MeshTensor(out_shape, token_policy, dtype, layout=out_layout),  # type: ignore
-        lengths: T.MeshTensor(lengths_shape, T.MeshShardingPolicy(), T.int32, layout=lengths_layout),  # type: ignore
+        lengths: T.MeshTensor(lengths_shape, T.placement.replicated(), T.int32, layout=lengths_layout),  # type: ignore
     ):
         with T.Kernel():
             src = T.alloc_shared((matrix_size, matrix_size), dtype)

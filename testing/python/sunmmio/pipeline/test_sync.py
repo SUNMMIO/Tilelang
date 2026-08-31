@@ -9,7 +9,7 @@ from testing.python.sunmmio.common.formal_verify import *
 
 @target("Sunmmio")
 def kernel_sync(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
 
     A_shape = (M, K)
     B_shape = (M, K)

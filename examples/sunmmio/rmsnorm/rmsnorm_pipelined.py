@@ -29,7 +29,7 @@ from tilelang.layout import make_zz_layout, make_aligned_row_major
 
 def rmsnorm_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16, eps: float = 1e-12) -> "Callable":
     zz_layout = make_zz_layout((M, N))
-    placement = T.MeshShardingPolicy(y=0, x=1)
+    placement = T.placement.full_shard(0, 1)
 
     accum_dtype = T.float32
 
@@ -50,7 +50,7 @@ def rmsnorm_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16, eps: flo
             x_sq = T.alloc_shared((block_M, block_N), accum_dtype, scope="shared.rsram")
             tile_sumsq = T.alloc_shared((block_M,), accum_dtype, scope="shared.rsram")
             local_sumsq = T.alloc_shared((block_M,), accum_dtype, scope="shared.rsram")
-            sumsq_dist = T.alloc_shared((T.mesh_ncols(), block_M), accum_dtype, scope="shared.rsram")
+            sumsq_dist = T.alloc_shared((T.ncols(), block_M), accum_dtype, scope="shared.rsram")
             total_sumsq = T.alloc_shared((block_M,), accum_dtype, scope="shared.rsram")
             inv_rms = T.alloc_shared((block_M,), accum_dtype, scope="shared.rsram")
 

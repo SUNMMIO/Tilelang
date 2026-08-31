@@ -44,7 +44,7 @@ def mesh_transpose_kernel(
     expect_transposed=True,
 ):
     """Build a replicated transpose with matching DRAM and RSRAM layouts."""
-    placement = T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     src_layout = make_zz_layout((m, n)) if layout_family == "zz" else make_zn_layout((m, n), [0, 1], (32, 32))
     transposed_layout = make_zz_layout((n, m)) if layout_family == "zz" else make_zn_layout((n, m), [0, 1], (32, 32))
     output_shape = (n, m) if expect_transposed else (m, n)
@@ -86,7 +86,7 @@ def mesh_transpose_order_kernel(source_constraint_first):
     """Build the same transpose layout constraints in either source order."""
     size = 64
     dtype = "bfloat16"
-    placement = T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     zn_layout = make_zn_layout((size, size), [0, 1], (32, 32))
 
     @T.prim_func
@@ -118,7 +118,7 @@ def mesh_transpose_scope_kernel(global_operand):
     """Build a transpose with one operand intentionally in global memory."""
     size = 64
     dtype = "bfloat16"
-    placement = T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)
+    placement = T.placement.replicated()
     layout = make_zz_layout((size, size))
 
     @T.prim_func

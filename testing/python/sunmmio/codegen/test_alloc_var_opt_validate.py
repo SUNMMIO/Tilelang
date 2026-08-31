@@ -177,7 +177,7 @@ def alloc_var_conditional_loop_extent_copy_kernel(
     block_N=32,
     dtype=T.bfloat16,
 ):
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, N), [0, 1], (32, 32))
     B_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 

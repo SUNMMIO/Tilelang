@@ -32,7 +32,7 @@ def test_target_context_decorator():
 
 def test_sunmmio_target_binding():
     def example_tensor_annot(shape):
-        MyTensor = T.MeshTensor(shape, T.MeshShardingPolicy(y=0, x=1), dtype="float32")
+        MyTensor = T.MeshTensor(shape, T.placement.full_shard(0, 1), dtype="float32")
 
         @T.prim_func
         def kernel(A: MyTensor):

@@ -29,20 +29,20 @@ def softplus_1d_dynamic(block_N=256, in_dtype=T.float32, out_dtype=T.float32):
     N = T.dynamic("n")
 
     row_major_layout = make_row_major((N,))
-    placement = T.MeshShardingPolicy(cross_mesh_dim=0)
+    placement = T.placement.mesh_as_line(0)
 
     @T.prim_func
     def elem_softplus(
         A: T.MeshTensor((N,), placement, dtype=in_dtype, layout=row_major_layout),  # type: ignore
         B: T.MeshTensor((N,), placement, dtype=out_dtype, layout=row_major_layout),  # type: ignore
     ):
-        with T.Kernel() as cid:
+        with T.Kernel():
             A_shared = T.alloc_shared((block_N,), in_dtype)
             B_shared = T.alloc_shared((block_N,), out_dtype)
 
-            for bx in T.serial(T.ceildiv(A.get_local_extent(cid)[0], block_N)):
+            for bx in T.serial(T.ceildiv(A.get_local_extent()[0], block_N)):
                 T.copy(A[bx * block_N : (bx + 1) * block_N], A_shared)
-                for i in T.Tiles([T.min(block_N, A.get_local_extent(cid)[0] - bx * block_N)]):
+                for i in T.Tiles([T.min(block_N, A.get_local_extent()[0] - bx * block_N)]):
                     value = A_shared[i]
                     B_shared[i] = T.max(value, 0) + T.log(1 + T.exp(-T.abs(value)))
                 T.copy(B_shared, B[bx * block_N : (bx + 1) * block_N])
@@ -56,20 +56,20 @@ def softplus_1d_dynamic_inline(block_N=256, in_dtype=T.float32, out_dtype=T.floa
     N = T.dynamic("n")
 
     row_major_layout = make_row_major((N,))
-    placement = T.MeshShardingPolicy(cross_mesh_dim=0)
+    placement = T.placement.mesh_as_line(0)
 
     @T.prim_func
     def elem_softplus_inline(
         A: T.MeshTensor((N,), placement, dtype=in_dtype, layout=row_major_layout),  # type: ignore
         B: T.MeshTensor((N,), placement, dtype=out_dtype, layout=row_major_layout),  # type: ignore
     ):
-        with T.Kernel() as cid:
+        with T.Kernel():
             A_shared = T.alloc_shared((block_N,), in_dtype)
             B_shared = T.alloc_shared((block_N,), out_dtype)
 
-            for bx in T.serial(T.ceildiv(A.get_local_extent(cid)[0], block_N)):
+            for bx in T.serial(T.ceildiv(A.get_local_extent()[0], block_N)):
                 T.copy(A[bx * block_N : (bx + 1) * block_N], A_shared)
-                for i in T.Tiles([T.min(block_N, A.get_local_extent(cid)[0] - bx * block_N)]):
+                for i in T.Tiles([T.min(block_N, A.get_local_extent()[0] - bx * block_N)]):
                     B_shared[i] = T.max(A_shared[i], 0) + T.log(1 + T.exp(-T.abs(A_shared[i])))
                 T.copy(B_shared, B[bx * block_N : (bx + 1) * block_N])
 

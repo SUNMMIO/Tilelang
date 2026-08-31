@@ -4,7 +4,6 @@ import tilelang as tl
 import tilelang.language as T
 from tilelang.engine.phase import *
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
-from tilelang.language.mesh_tensor import MeshShardingPolicy
 from examples.gemm.sunmmio_example_gemm import matmul_persistent
 
 _get_logical_shape = tvm.ffi.get_global_func("tl.CuteLayout_logical_shape")
@@ -15,17 +14,17 @@ def matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="bfloat16", acc
     def gemm(
         A: T.MeshTensor(
             (M, K),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=dtype,
         ),
         B: T.MeshTensor(
             (K, N),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=dtype,
         ),
         C: T.MeshTensor(
             (M, N),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=accum_dtype,
         ),
     ):
@@ -680,17 +679,17 @@ def if_matmul(M, N, K, block_M, block_N, block_K, num_stages, dtype="bfloat16", 
     def gemm(
         A: T.MeshTensor(
             (M, K),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=dtype,
         ),
         B: T.MeshTensor(
             (K, N),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=dtype,
         ),
         C: T.MeshTensor(
             (M, N),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=accum_dtype,
         ),
     ):
@@ -716,7 +715,7 @@ def tvm_access_ptr():
     def test(
         A: T.MeshTensor(
             (M, K),
-            sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+            placement=T.placement.mesh_as_line(0),
             dtype=dtype,
         ),
     ):

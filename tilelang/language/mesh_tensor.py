@@ -68,8 +68,8 @@ class TensorWithMeta:
         """Return the uniform physical local buffer shape."""
         return self.meta_data["local_shape"]
 
-    def get_local_extent(self, cid):
-        """Return the valid local extent on core ``cid``."""
+    def get_local_extent(self, cid=None):
+        """Return the valid local extent on ``cid`` or the current kernel core."""
         return get_local_extent(self, cid)
 
 
@@ -91,8 +91,8 @@ class MeshTensorValue:
         """Return the uniform physical local buffer shape."""
         return self.meta_data["local_shape"]
 
-    def get_local_extent(self, cid):
-        """Return the valid local extent on core ``cid``."""
+    def get_local_extent(self, cid=None):
+        """Return the valid local extent on ``cid`` or the current kernel core."""
         return get_local_extent(self, cid)
 
     def __getitem__(self, keys):
@@ -176,13 +176,20 @@ def lookup_mesh_tensor_meta(mesh_tensor):
     raise TypeError(f"Expected a MeshTensor value with metadata, got {type(mesh_tensor)}")
 
 
-def get_local_extent(mesh_tensor, cid):
+def get_local_extent(mesh_tensor, cid=None):
     """Return the valid local extent for ``mesh_tensor`` on linear core id ``cid``.
+
+    When ``cid`` is omitted inside a kernel, use its current block binding.
 
     Full sharding preserves the physical mesh-axis order: row sharding is
     applied first, then column sharding is applied to the row-local extent.
     ``mesh_as_line`` instead uses the row-major linear core id.
     """
+    if cid is None:
+        from tilelang.language.kernel import get_block_binding
+
+        cid = get_block_binding(0)
+
     meta = lookup_mesh_tensor_meta(mesh_tensor)
     global_shape = meta["global_shape"]
     nrows, ncols = meta["mesh_shape"]
@@ -380,7 +387,7 @@ if TYPE_CHECKING:
             sharding_policy: PlacementSpec | MeshShardingPolicy | None = None,
         ) -> TensorWithMeta: ...
 
-        def get_local_extent(self, cid) -> tuple[Any, ...]: ...
+        def get_local_extent(self, cid=None) -> tuple[Any, ...]: ...
 
 else:
     MeshTensor = MeshTensorProxy()
