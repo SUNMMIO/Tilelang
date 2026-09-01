@@ -79,7 +79,7 @@ def bf16_select_with_i32_row_mask_kernel(
 @target("Sunmmio")
 def bf16_dynamic_rect_tail_mask_kernel(block_m=32, block_n=32, valid_rows=17, valid_cols=19):
     dtype = T.bfloat16
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     tensor_shape = (block_m, block_n)
     tensor_layout = make_zz_layout(tensor_shape, [0, 1], (block_m, block_n))
 

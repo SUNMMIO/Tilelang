@@ -79,8 +79,8 @@ def matmul_mx_operand_kernel(
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
 
-            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), a_dtype)
-            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), b_dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.ncols()), a_dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.nrows(), block_N), b_dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             for bx in T.serial(T.ceildiv(sharded_M, block_M)):

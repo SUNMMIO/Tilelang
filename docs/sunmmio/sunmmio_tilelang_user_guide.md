@@ -532,7 +532,7 @@ T.MeshTensor(shape, placement, (nrows, ncols), dtype="float32", layout=None)
 - `dtype`: element type, such as `"float16"`, `"bfloat16"`, or `"float32"`.
 - `layout`: global data layout in DRAM. When omitted, a rank-1 tensor with a regular dtype defaults to a 1024-byte-aligned row-major layout, while a rank >= 2 tensor defaults to ZZ. A rank >= 2 tensor with an MX dtype defaults to MXZZ; rank-1 MX tensors are unsupported. Users usually do not need to pass this parameter manually.
 
-After entering the kernel, a `MeshTensor` parameter corresponds to the local shard visible to the current core. Use `A.global_shape` for the complete logical shape, `A.local_shape` for the uniformly allocated local slot shape, and `A.get_local_extent(cid)` for a core's valid extent.
+After entering the kernel, a `MeshTensor` parameter corresponds to the local shard visible to the current core. Use `A.global_shape` for the complete logical shape, `A.local_shape` for the uniformly allocated local slot shape, and `A.get_local_extent()` for the current core's valid extent.
 
 **`make_row_major`**
 

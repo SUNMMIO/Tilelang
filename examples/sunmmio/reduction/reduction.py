@@ -10,7 +10,7 @@ from tilelang.layout import make_zz_layout, make_row_major
 
 def reduction(M, K, N, block_K, block_N, in_dtype, out_dtype):
     zz_layout = make_zz_layout((M, K, N))
-    placement = T.MeshShardingPolicy(y=0, x=1)
+    placement = T.placement.full_shard(0, 1)
     rm_layout = make_row_major((M, K))
 
     @T.prim_func
@@ -24,7 +24,7 @@ def reduction(M, K, N, block_K, block_N, in_dtype, out_dtype):
 
             A_shared = T.alloc_shared((block_K, block_N), in_dtype)
             Acc_shared = T.alloc_shared((block_K, block_N), out_dtype)
-            Acc_dist_shared = T.alloc_shared((block_K, T.mesh_ncols() * block_N), out_dtype)
+            Acc_dist_shared = T.alloc_shared((block_K, T.ncols() * block_N), out_dtype)
             B_shared = T.alloc_shared((block_K,), out_dtype)
 
             for bx in T.serial(sharded_M):

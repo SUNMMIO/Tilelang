@@ -8,7 +8,6 @@ import tilelang.language as T
 from tilelang import tvm as tvm
 from tilelang.layout import make_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC, determine_target
-from tilelang.language.mesh_tensor import MeshShardingPolicy
 from tvm import tir
 from tvm.tir import PyStmtExprVisitor
 import pytest
@@ -280,7 +279,7 @@ def copy(K, block_M, block_N, block_K, dtype="float32", accum_dtype="float32"):
     _layout = make_zz_layout((128, 128), [0, 1], (32, 32))
     MyTensor = T.MeshTensor(
         (128, 128),
-        sharding_policy=MeshShardingPolicy(cross_mesh_dim=0),
+        placement=T.placement.mesh_as_line(0),
         layout=_layout,
     )
 

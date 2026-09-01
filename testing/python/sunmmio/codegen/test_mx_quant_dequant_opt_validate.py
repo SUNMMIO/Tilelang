@@ -4,7 +4,6 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.language.mesh_tensor import MeshReplicationType
 from tilelang.layout import (
     get_mx_scale_shape,
     # make_aligned_row_major,
@@ -81,7 +80,7 @@ MX_OCP_QUANT_CASES = (
 @target("Sunmmio")
 def mx_ocp_quant_dequant_full_chain_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name, data_max):
     shape = (32, 32)
-    shard_policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    shard_policy = T.placement.replicated()
     tensor_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
     mx_layout = make_mxzz_layout(shape, dtype=mx_dtype)
     scale_shape = _int_shape(get_mx_scale_shape(mx_layout, mx_dtype))
@@ -136,7 +135,7 @@ def mx_ocp_quant_dequant_full_chain_kernel_for_debug(mx_dtype, data_dtype, data_
 @target("Sunmmio")
 def mx_ocp_quant_dequant_full_chain_kernel_original(mx_dtype, data_dtype, data_dtype_name, data_max):
     shape = (32, 32)
-    shard_policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    shard_policy = T.placement.replicated()
     tensor_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
     mx_layout = make_mxzz_layout(shape, dtype=mx_dtype)
     scale_shape = _int_shape(get_mx_scale_shape(mx_layout, mx_dtype))
@@ -199,7 +198,7 @@ def mx_ocp_quant_dequant_full_chain_kernel_original(mx_dtype, data_dtype, data_d
 @target("Sunmmio")
 def mx_ocp_quant_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name, data_max):
     shape = MX_COPY_ALIGNED_SHAPE
-    shard_policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    shard_policy = T.placement.replicated()
     tensor_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
     mx_layout = make_mxzz_layout(shape, dtype=mx_dtype)
     scale_shape = _int_shape(get_mx_scale_shape(mx_layout, mx_dtype))
@@ -244,7 +243,7 @@ def mx_ocp_quant_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name, data_ma
 @target("Sunmmio")
 def mx_ocp_dequant_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name, data_max):
     shape = MX_COPY_ALIGNED_SHAPE
-    shard_policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    shard_policy = T.placement.replicated()
     tensor_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
     mx_layout = make_mxzz_layout(shape, dtype=mx_dtype)
     scale_shape = _int_shape(get_mx_scale_shape(mx_layout, mx_dtype))
@@ -280,7 +279,7 @@ def mx_ocp_quant_generic_shape_kernel_for_debug(mx_dtype, data_dtype, data_dtype
     shape = MX_GENERIC_SHAPE
     num_m_blocks = shape[0] // 32
     num_n_blocks = shape[1] // 32
-    shard_policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    shard_policy = T.placement.replicated()
     tensor_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
     mx_layout = make_mxzz_layout(shape, dtype=mx_dtype)
     scale_shape = _int_shape(get_mx_scale_shape(mx_layout, mx_dtype))
@@ -337,7 +336,7 @@ def mx_ocp_quant_generic_shape_kernel_for_debug(mx_dtype, data_dtype, data_dtype
 @target("Sunmmio")
 def mx_ocp_quant_sharded_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name, data_max):
     global_shape = (256, 256)
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     tensor_layout = make_zz_layout(global_shape, axes=[0, 1], block_shape=(32, 32))
     mx_layout = make_mxzz_layout(global_shape, dtype=mx_dtype)
     data_max_inv = 1.0 / data_max
@@ -403,7 +402,7 @@ def mx_ocp_dequant_generic_shape_kernel_for_debug(mx_dtype, data_dtype, data_dty
     shape = MX_GENERIC_SHAPE
     num_m_blocks = shape[0] // 32
     num_n_blocks = shape[1] // 32
-    shard_policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    shard_policy = T.placement.replicated()
     tensor_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
     mx_layout = make_mxzz_layout(shape, dtype=mx_dtype)
     scale_shape = _int_shape(get_mx_scale_shape(mx_layout, mx_dtype))
@@ -448,7 +447,7 @@ def mx_ocp_quantized_mma_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name,
     c_shape = (32, 32)
     a_k_blocks = a_shape[1] // 32
     b_k_blocks = b_shape[1] // 32
-    shard_policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    shard_policy = T.placement.replicated()
     a_tensor_layout = make_zz_layout(a_shape, axes=[0, 1], block_shape=(32, 32))
     b_tensor_layout = make_zz_layout(b_shape, axes=[0, 1], block_shape=(32, 32))
     c_tensor_layout = make_zz_layout(c_shape, axes=[0, 1], block_shape=(32, 32))
@@ -552,7 +551,7 @@ def mx_ocp_quantized_mma_generic_shape_kernel_for_debug(
     num_m_blocks = M // 32
     num_n_blocks = N // 32
     num_k_blocks = K // 32
-    shard_policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    shard_policy = T.placement.replicated()
     a_tensor_layout = make_zz_layout(a_shape, axes=[0, 1], block_shape=(32, 32))
     b_tensor_layout = make_zz_layout(b_shape, axes=[0, 1], block_shape=(32, 32))
     c_tensor_layout = make_zz_layout(c_shape, axes=[0, 1], block_shape=(32, 32))
@@ -655,7 +654,7 @@ def mx_ocp_quantized_mma_mxznz_weight_kernel_for_debug(mx_dtype, data_dtype, dat
     c_shape = (32, 32)
     a_k_blocks = a_shape[1] // 32
     b_k_blocks = b_shape[0] // 32
-    shard_policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    shard_policy = T.placement.replicated()
     a_tensor_layout = make_zz_layout(a_shape, axes=[0, 1], block_shape=(32, 32))
     b_tensor_layout = make_zz_layout(b_shape, axes=[0, 1], block_shape=(32, 32))
     c_tensor_layout = make_zz_layout(c_shape, axes=[0, 1], block_shape=(32, 32))

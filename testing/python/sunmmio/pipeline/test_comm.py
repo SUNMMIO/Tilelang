@@ -14,7 +14,7 @@ _COL_MASK_BX = "T.int64(15)"
 
 @target("Sunmmio")
 def kernel_comm(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float32"):
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
 
     A_shape = (M, K)
     B_shape = (K, N)

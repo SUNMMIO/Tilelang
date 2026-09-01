@@ -17,7 +17,7 @@ def _elementwise_exp2_prim_func(block_M, block_N, in_dtype, out_dtype):
     N = T.dynamic("n")
 
     zz_layout = make_zz_layout((M, N))
-    placement = T.MeshShardingPolicy(y=0, x=1)
+    placement = T.placement.full_shard(0, 1)
 
     @T.prim_func
     def elem_exp2(

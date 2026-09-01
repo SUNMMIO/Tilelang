@@ -55,8 +55,8 @@ def summa_matmul(
         with T.Kernel() as _cid:
             sharded_M, _ = A.local_shape
             _, sharded_N = B.local_shape
-            core_row = _cid // T.mesh_ncols()
-            core_col = _cid % T.mesh_ncols()
+            core_row = _cid // T.ncols()
+            core_col = _cid % T.ncols()
 
             A_broadcast = T.alloc_shared((block_M, block_K), dtype, scope="shared.rsram")
             A_shared = T.alloc_shared((block_M, block_K), dtype)
@@ -69,10 +69,10 @@ def summa_matmul(
                     K_steps = T.ceildiv(K, block_K)
 
                     for k_tile in range(K_steps):
-                        a_src_col = k_tile % T.mesh_ncols()
-                        b_src_row = k_tile % T.mesh_nrows()
-                        a_local_k = (k_tile // T.mesh_ncols()) * block_K
-                        b_local_k = (k_tile // T.mesh_nrows()) * block_K
+                        a_src_col = k_tile % T.ncols()
+                        b_src_row = k_tile % T.nrows()
+                        a_local_k = (k_tile // T.ncols()) * block_K
+                        b_local_k = (k_tile // T.nrows()) * block_K
 
                         T.comm.broadcast(
                             A[

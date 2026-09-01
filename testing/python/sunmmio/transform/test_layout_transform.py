@@ -26,7 +26,6 @@ from tilelang.layout import (
     make_row_major,
     make_zz_layout,
 )
-from tilelang.language.mesh_tensor import MeshReplicationType
 from tvm import tir
 from tvm.tir import Block
 from tvm.tir.stmt_functor import post_order_visit
@@ -122,12 +121,12 @@ def _dram(shape, layout):
     these are single-core layout tests (unlike the sharded GEMM example), so
     sharding must not perturb the shapes the assertions rely on.
     """
-    policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    policy = T.placement.replicated()
     return T.MeshTensor(shape, policy, DTYPE, layout=layout)
 
 
 def _dram_typed(shape, dtype, layout):
-    policy = T.MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    policy = T.placement.replicated()
     return T.MeshTensor(shape, policy, dtype, layout=layout)
 
 

@@ -258,8 +258,8 @@ def test_comm_compact_path_accepts_unresolved_mesh_shape_without_warning():
             def main():
                 with T.Kernel():
                     send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
-                    recv = T.alloc_shared((32, 32 * T.mesh_ncols()), "float32", scope="shared.rsram")
-                    reduce_src = T.alloc_shared((32 * T.mesh_ncols(), 32), "float32", scope="shared.rsram")
+                    recv = T.alloc_shared((32, 32 * T.ncols()), "float32", scope="shared.rsram")
+                    reduce_src = T.alloc_shared((32 * T.ncols(), 32), "float32", scope="shared.rsram")
                     reduce_out = T.alloc_shared((128,), "float32", scope="shared.rsram")
                     T.comm.all_gather(send, recv, direction="h", axis=-1)
                     T.comm.all_reduce(reduce_src, reduce_out, "sum", "h", dim=1)
@@ -279,7 +279,7 @@ def test_comm_compact_path_keeps_static_checks_with_unresolved_mesh_shape():
             def main():
                 with T.Kernel():
                     send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
-                    recv = T.alloc_shared((64, 32 * T.mesh_ncols()), "float32", scope="shared.rsram")
+                    recv = T.alloc_shared((64, 32 * T.ncols()), "float32", scope="shared.rsram")
                     T.comm.all_gather(send, recv, direction="h", axis=-1)
     finally:
         _target_utils.set_sunmmio_region_validation(previous)

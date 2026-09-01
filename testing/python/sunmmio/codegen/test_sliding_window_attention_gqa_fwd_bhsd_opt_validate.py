@@ -48,7 +48,7 @@ def sliding_window_attention_gqa_fwd_bhsd(
     assert global_window <= seq_len
     assert global_window <= block_N
 
-    shard_policy = T.MeshShardingPolicy(y=0, x=2)
+    shard_policy = T.placement.full_shard(0, 2)
 
     Q_layout = make_zz_layout(q_shape, [1, 3], (32, 32))
     K_layout = make_zz_layout(kv_shape, [1, 3], (32, 32))
