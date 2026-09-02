@@ -46,6 +46,7 @@
 
 #include "../op/builtin.h"
 #include "../op/comm.h"
+#include "../op/dist_comm.h"
 #include "../op/utils.h"
 #include "../target/sunmmio_utils.h"
 #include "./common/attr.h"
@@ -664,6 +665,16 @@ public:
         AppendAsyncArgumentReads(call, {0, 1, 2}, &rec.reads);
         rec.writes.push_back(AccessFromRegion(acc));
         async_ops.push_back(rec);
+      } else if (call->op.same_as(dist_signal())) {
+        return;
+      } else if (call->op.same_as(dist_put_())) {
+        RecordDistPut(op, call);
+        return;
+      } else if (call->op.same_as(dist_wait_signal_())) {
+        RecordDistWaitSignal(op, call);
+        return;
+      } else if (call->op.same_as(dist_wait_send())) {
+        return;
       }
       if (!rec.reads.empty() || !rec.writes.empty()) {
         StmtVisitor::VisitStmt_(op);
@@ -758,6 +769,35 @@ public:
   std::unordered_map<const StmtNode *, int> stmt_order;
 
 private:
+  void RecordDistPut(const EvaluateNode *stmt, const CallNode *call) {
+    SyncAccessRecord rec;
+    rec.stmt = stmt;
+    rec.order = order_++;
+    BufferRegion src = NormalizeToBufferRegion(call->args[0]);
+    rec.reads.push_back(AccessFromRegion(src));
+    AppendRegionBoundReads(src, &rec.reads);
+    for (size_t index = 2; index < call->args.size(); ++index) {
+      AppendReadsFromExpr(call->args[index], &rec.reads);
+    }
+    stmt_order[stmt] = rec.order;
+    sync_accesses.push_back(std::move(rec));
+  }
+
+  void RecordDistWaitSignal(const EvaluateNode *stmt, const CallNode *call) {
+    SyncAccessRecord rec;
+    rec.stmt = stmt;
+    rec.order = order_++;
+    ICHECK_EQ(call->args.size(), 4U);
+    for (size_t index = 0; index < 3; ++index) {
+      AppendReadsFromExpr(call->args[index], &rec.reads);
+    }
+    BufferRegion dst = NormalizeToBufferRegion(call->args[3]);
+    AppendRegionBoundReads(dst, &rec.reads);
+    rec.writes.push_back(AccessFromRegion(dst));
+    stmt_order[stmt] = rec.order;
+    sync_accesses.push_back(std::move(rec));
+  }
+
   std::vector<AccessRecord> CollectReads(PrimExpr expr) const {
     std::vector<AccessRecord> reads;
     BufferAccessCollector collector(buffer_data_to_buffer_, loop_domains_);
@@ -1919,6 +1959,38 @@ private:
         process_barrier_wait(stmts, participant_mask);
         curr_stmt_with_token_id(call, stmts, curr_token_id);
 
+        return SeqStmt::Flatten(stmts);
+      } else if (call->op.same_as(dist_signal())) {
+        return StmtMutator::VisitStmt_(op);
+      } else if (call->op.same_as(dist_put_())) {
+        Array<Stmt> stmts;
+        InjectLoopCarriedWaitsForSyncStmt(stmts, op);
+        BufferRegion src = NormalizeToBufferRegion(call->args[0]);
+        token_process_region_bounds(src, stmts);
+        token_process_region_bounds(NormalizeToBufferRegion(call->args[1]),
+                                    stmts);
+        for (size_t index = 2; index < call->args.size(); ++index) {
+          token_process_prim_expr(call->args[index], stmts);
+        }
+        token_process_read_buffer(src, stmts, -1, false);
+        stmts.push_back(StmtMutator::VisitStmt_(op));
+        return SeqStmt::Flatten(stmts);
+      } else if (call->op.same_as(dist_wait_signal_())) {
+        Array<Stmt> stmts;
+        InjectLoopCarriedWaitsForSyncStmt(stmts, op);
+        ICHECK_EQ(call->args.size(), 4U);
+        for (size_t index = 0; index < 3; ++index) {
+          token_process_prim_expr(call->args[index], stmts);
+        }
+        BufferRegion dst = NormalizeToBufferRegion(call->args[3]);
+        token_process_region_bounds(dst, stmts);
+        token_process_write_buffer(dst, stmts, -1, false);
+        stmts.push_back(StmtMutator::VisitStmt_(op));
+        return SeqStmt::Flatten(stmts);
+      } else if (call->op.same_as(dist_wait_send())) {
+        Array<Stmt> stmts;
+        InjectLoopCarriedWaitsForSyncStmt(stmts, op);
+        stmts.push_back(StmtMutator::VisitStmt_(op));
         return SeqStmt::Flatten(stmts);
       }
     }
