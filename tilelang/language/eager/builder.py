@@ -190,6 +190,11 @@ class Builder(BaseBuilder):
         # Metadata collected during prim_func_arg processing
         self._metadata: dict[str, dict] = {}
         self._sunmmio_mesh_symbols_used = False
+        from tilelang.language.dist import _current_world_size
+
+        self._dist_world_size = _current_world_size(allow_none=True)
+        self._dist_rank_id_var: Var | None = None
+        self._dist_signal_decl_count = 0
 
     def attach_metadata(self, prim_func):
         """Attach collected Metadata to a PrimFunc as 'tensor_meta' attribute.
@@ -210,7 +215,8 @@ class Builder(BaseBuilder):
                 return value
 
             prim_func = prim_func.with_attr("tensor_meta", _convert_to_tir(self._metadata))
-        return self.attach_sunmmio_mesh_symbols(prim_func)
+        prim_func = self.attach_sunmmio_mesh_symbols(prim_func)
+        return self.attach_dist_metadata(prim_func)
 
     def attach_sunmmio_mesh_symbols(self, prim_func):
         if not self._sunmmio_mesh_symbols_used:
@@ -227,6 +233,49 @@ class Builder(BaseBuilder):
 
     def mark_sunmmio_mesh_symbols_used(self):
         self._sunmmio_mesh_symbols_used = True
+
+    def mark_dist_world_size(self, world_size: int):
+        if self._dist_world_size is not None and self._dist_world_size != world_size:
+            raise ValueError(f"Conflicting world_size values: {self._dist_world_size} and {world_size}")
+        self._dist_world_size = world_size
+
+    def mark_dist_rank_id(self, rank_id_var: Var):
+        if self._dist_rank_id_var is not None:
+            raise ValueError("A PrimFunc can have at most one T.dist.RankId parameter")
+        self._dist_rank_id_var = rank_id_var
+
+    def attach_dist_metadata(self, prim_func):
+        from tilelang.language.dist import _RANK_ID_PARAM_INDEX_ATTR, _WORLD_SIZE_ATTR
+
+        if self._dist_world_size is not None:
+            prim_func = prim_func.with_attr(
+                _WORLD_SIZE_ATTR,
+                tvm.tir.IntImm("int32", self._dist_world_size),
+            )
+        if self._dist_rank_id_var is not None:
+            rank_id_indices = [index for index, param in enumerate(prim_func.params) if param.same_as(self._dist_rank_id_var)]
+            if len(rank_id_indices) != 1:
+                raise RuntimeError("Failed to locate the T.dist.RankId parameter in the constructed PrimFunc")
+            prim_func = prim_func.with_attr(_RANK_ID_PARAM_INDEX_ATTR, rank_id_indices[0])
+        return prim_func
+
+    def allocate_dist_signal_decl(self) -> int:
+        kernel_frame_index = next(
+            (index for index in range(len(self.frames) - 1, -1, -1) if isinstance(self.frames[index], KernelLaunchFrame)),
+            None,
+        )
+        if kernel_frame_index is None:
+            raise RuntimeError("T.dist.signal must be called inside T.Kernel()")
+        nested_control_frames = (
+            tir.frame.ForFrame,
+            tir.frame.IfFrame,
+            tir.frame.WhileFrame,
+        )
+        if any(isinstance(frame, nested_control_frames) for frame in self.frames[kernel_frame_index + 1 :]):
+            raise RuntimeError("T.dist.signal must be declared directly in T.Kernel(), outside loops and conditionals")
+        logical_id = self._dist_signal_decl_count
+        self._dist_signal_decl_count += 1
+        return logical_id
 
     @classmethod
     def current(cls) -> Self:
@@ -543,6 +592,11 @@ class Builder(BaseBuilder):
         if name == "_":
             # use _tmp to make the generated tir more readable
             name = "_tmp"
+        from tilelang.language.dist import Signal
+
+        if isinstance(value, Signal):
+            IRBuilder.name(name, value.handle)
+            return value
         if isinstance(value, tir.meta_var):
             return value.value
         elif isinstance(value, tir.frame.IRBuilderFrame):
@@ -749,9 +803,18 @@ class Builder(BaseBuilder):
             return value
 
     def prim_func_arg(self, name, value):
+        from tilelang.language.dist import _is_rank_id_annotation
+
+        if _is_rank_id_annotation(value):
+            rank_id_var = Var(name, "int32")
+            self.mark_dist_rank_id(rank_id_var)
+            return tir.arg(name, rank_id_var)
         if isinstance(value, TensorWithMeta):
             self.mark_sunmmio_mesh_symbols_used()
             self._metadata[name] = value.meta_data
+            world_size = value.meta_data.get("world_size")
+            if world_size is not None:
+                self.mark_dist_world_size(world_size)
             return MeshTensorValue(tir.arg(name, value.buffer), value.meta_data)
         elif isinstance(value, (Buffer, Var)):
             return tir.arg(name, value)
@@ -998,6 +1061,26 @@ def const(name: str, dtype: str = "int32") -> Var | tuple[Var, ...]:
             return builder.eager_jit_subs[name]
 
 
+@contextmanager
+def _dist_world_context_from_arguments(arguments):
+    if "world_size" not in arguments:
+        yield
+        return
+
+    from tilelang.language.dist import _world_context
+
+    with _world_context(arguments["world_size"]):
+        yield
+
+
+@contextmanager
+def _dist_world_context_for_call(func, args, kwargs):
+    bound = inspect.signature(func).bind(*args, **kwargs)
+    bound.apply_defaults()
+    with _dist_world_context_from_arguments(bound.arguments):
+        yield
+
+
 @dataclass
 class TirTemplate(Generic[_P, _T]):
     """
@@ -1079,7 +1162,7 @@ class TirTemplate(Generic[_P, _T]):
         builder = Builder()
         builder.eager_jit = "phase2"
         builder.eager_jit_subs = subs
-        with builder.prim_func(self.name):
+        with _dist_world_context_from_arguments(kwargs), builder.prim_func(self.name):
             self.ir_gen.gen(builder)(**tensor_args, **kwargs)
         pf = builder.get()
         pf = builder.attach_metadata(pf)
@@ -1153,7 +1236,8 @@ class JITFunc(Generic[_P, _T]):
         except TypeError:
             return False
         try:
-            prim_func = self.orig_func(*args, **kwargs)
+            with _dist_world_context_for_call(self.orig_func, args, kwargs):
+                prim_func = self.orig_func(*args, **kwargs)
             # lazy jit must return PrimFunc
             if isinstance(prim_func, PrimFunc):
                 p1_key, _, _ = self._parse_phase1_key(*args, **kwargs)
@@ -1170,23 +1254,24 @@ class JITFunc(Generic[_P, _T]):
 
     def _build_tir_template(self, *args, **kwargs) -> TirTemplate[_P, _T]:
         """Build TIR template based on the execution mode."""
-        if self.mode == "lazy":
-            # lazy: function returns PrimFunc directly
-            return TirTemplate.from_lazy_style(self.orig_func.__name__, self.orig_func(*args, **kwargs))
-        elif self.mode == "eager":
-            # eager: trace function body through Builder to construct TIR
-            builder = Builder()
-            builder.eager_jit = "phase1"
-            with builder.prim_func(self.orig_func.__name__):
-                self.ir_gen.gen(builder)(**self.tensor_args, **kwargs)
-            pf = builder.get()
-            pf = builder.attach_metadata(pf)
-            pf.orig_func = self.orig_func
-            if builder.out_idx:
-                pf.out_idx_override = builder.out_idx
-            return TirTemplate.create(self.orig_func.__name__, pf, builder.constexpr_var, self.ir_gen)
-        else:
-            raise ValueError(f"Invalid jit mode: {self.mode}, expected 'lazy' or 'eager'")
+        with _dist_world_context_for_call(self.orig_func, args, kwargs):
+            if self.mode == "lazy":
+                # lazy: function returns PrimFunc directly
+                return TirTemplate.from_lazy_style(self.orig_func.__name__, self.orig_func(*args, **kwargs))
+            elif self.mode == "eager":
+                # eager: trace function body through Builder to construct TIR
+                builder = Builder()
+                builder.eager_jit = "phase1"
+                with builder.prim_func(self.orig_func.__name__):
+                    self.ir_gen.gen(builder)(**self.tensor_args, **kwargs)
+                pf = builder.get()
+                pf = builder.attach_metadata(pf)
+                pf.orig_func = self.orig_func
+                if builder.out_idx:
+                    pf.out_idx_override = builder.out_idx
+                return TirTemplate.create(self.orig_func.__name__, pf, builder.constexpr_var, self.ir_gen)
+            else:
+                raise ValueError(f"Invalid jit mode: {self.mode}, expected 'lazy' or 'eager'")
 
     def parse_args(self, *args, **kwargs):
         """Parse arguments and return cache key and tensor args."""
