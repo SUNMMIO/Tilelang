@@ -15,7 +15,6 @@ license-files = [
     "3rdparty/tvm/licenses/*.txt",
     "3rdparty/cutlass/LICENSE.txt",
     "3rdparty/composable_kernel/LICENSE",
-    "3rdparty/highs/LICENSE.txt",
 ]
 keywords = ["NMC", "NUMA", "TileLang", "Code Generation", "Mesh"]
 classifiers = [
@@ -121,7 +120,6 @@ include = [
     "3rdparty/tvm/LICENSE",
     "3rdparty/cutlass/LICENSE.txt",
     "3rdparty/composable_kernel/LICENSE",
-    "3rdparty/highs/LICENSE.txt",
     "version_provider.py",
     "requirements*.txt",
     "tilelang/jit/adapter/cython/cython_wrapper.pyx",
