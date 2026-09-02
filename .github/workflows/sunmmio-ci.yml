@@ -7,6 +7,9 @@ on:
       - reopened
       - ready_for_review
   workflow_dispatch:
+  push:
+    tags:
+      - "v*"
 
 permissions:
   contents: read
@@ -65,7 +68,6 @@ jobs:
     name: SunMMIO Build and Codegen Tests
     if: |
       (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
       github.actor != 'dependabot[bot]'
     needs: [lint]
     runs-on: [self-hosted, Linux, CUDA-rtx3080]
@@ -77,7 +79,7 @@ jobs:
         - /opt/ci-cache/sunmmio:/ci-cache
     env:
       CLANG_TIDY_CMAKE_OPTIONS: "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_Z3=OFF -DTILELANG_UPDATE_SUBMODULES=OFF -DPython3_EXECUTABLE=/usr/bin/python3.12 -DPython_EXECUTABLE=/usr/bin/python3.12"
-      CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON"
+      CMAKE_ARGS: "-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF"
       XDG_CACHE_HOME: /ci-cache
       PIP_CACHE_DIR: /ci-cache/pip
       UV_CACHE_DIR: /ci-cache/uv
@@ -153,6 +155,22 @@ jobs:
           persist-credentials: false
           set-safe-directory: true
 
+      - name: Determine Sunmmio access mode
+        id: sunmmio-mode
+        env:
+          HAS_PRIVATE_NPUIR_ACCESS: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          set -euo pipefail
+          if [[ "${HAS_PRIVATE_NPUIR_ACCESS}" == "true" ]]; then
+            echo "available=1" >> "${GITHUB_OUTPUT}"
+            echo "TILELANG_SUNMMIO_CMAKE_ARGS=-DUSE_SUNMMIO=ON" >> "${GITHUB_ENV}"
+            echo "Running Sunmmio codegen CI with private NPU-IR access."
+          else
+            echo "available=0" >> "${GITHUB_OUTPUT}"
+            echo "TILELANG_SUNMMIO_CMAKE_ARGS=-DUSE_SUNMMIO=OFF" >> "${GITHUB_ENV}"
+            echo "Running fork-safe CI without private NPU-IR checkout."
+          fi
+
       - name: Checkout public submodules
         run: |
           set -euo pipefail
@@ -165,6 +183,7 @@ jobs:
             3rdparty/tvm
 
       - name: Resolve pinned NPU-IR commit
+        if: steps.sunmmio-mode.outputs.available == '1'
         id: npuir-ref
         run: |
           set -euo pipefail
@@ -177,6 +196,7 @@ jobs:
           echo "Pinned NPU-IR commit: ${NPUIR_SHA}"
 
       - name: Checkout private NPU-IR submodule
+        if: steps.sunmmio-mode.outputs.available == '1'
         uses: actions/checkout@v6
         with:
           repository: SUNMMIO/NPU-IR
@@ -202,6 +222,7 @@ jobs:
           uv pip install --python "${CLANG_TIDY_VENV}/bin/python" -v -r requirements-lint.txt
 
       - name: Read LLVM pin from NPU-IR
+        if: steps.sunmmio-mode.outputs.available == '1'
         run: |
           set -euo pipefail
 
@@ -226,6 +247,7 @@ jobs:
           echo "Using NPU-IR LLVM pin ${NPUIR_LLVM_COMMIT}"
 
       - name: Prepare cached LLVM checkout for NPU-IR
+        if: steps.sunmmio-mode.outputs.available == '1'
         run: |
           set -euo pipefail
 
@@ -356,6 +378,7 @@ jobs:
           uv pip install --python "${TEST_VENV}/bin/python" -v .
 
       - name: Run SunMMIO Python tests
+        if: steps.sunmmio-mode.outputs.available == '1'
         run: |
           . "${TEST_VENV}/bin/activate"
           PYTEST=(
@@ -366,6 +389,15 @@ jobs:
             -c testing/pytest.ini \
             -m "not sunmmio_closed_runtime" \
             testing/python/sunmmio \
+            testing/python/language/test_tilelang_language_dtypes.py
+
+      - name: Run fork-safe Python tests
+        if: steps.sunmmio-mode.outputs.available != '1'
+        run: |
+          . "${TEST_VENV}/bin/activate"
+          uv run --no-project -m -- \
+            pytest --verbose --color=yes --durations=0 --showlocals --cache-clear \
+            -c testing/pytest.ini \
             testing/python/language/test_tilelang_language_dtypes.py
 
       - name: List generated files

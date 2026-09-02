@@ -2,9 +2,6 @@ name: Dist
 
 on:
   workflow_dispatch:
-  schedule:
-    # 06:00 Asia/Shanghai
-    - cron: "0 22 * * *"
   pull_request:
     types:
       - opened
@@ -14,6 +11,8 @@ on:
     paths:
       - VERSION
       - .gitmodules
+      - 3rdparty/NPU-IR
+      - 3rdparty/highs
       - pyproject.toml
       - CMakeLists.txt
       - version_provider.py
@@ -128,9 +127,10 @@ jobs:
         run: |
           git submodule sync --recursive
           git submodule update --init --recursive \
-            3rdparty/tvm \
+            3rdparty/composable_kernel \
             3rdparty/cutlass \
-            3rdparty/composable_kernel
+            3rdparty/highs \
+            3rdparty/tvm
 
       - name: Resolve pinned NPU-IR commit
         id: npuir-ref
