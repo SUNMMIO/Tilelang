@@ -10,6 +10,7 @@ from tvm.tir import PrimExpr, IntImm
 from tvm.script.ir_builder.tir import buffer as tir_buffer
 
 import tvm_ffi
+from tvm_ffi.container import Map
 
 from tilelang._typing import DType, ShapeType
 from tilelang.dtypes import dtype as tilelang_dtype
@@ -22,6 +23,13 @@ from tilelang.language.placement import (
     _placement_metadata,
     _validate_placement,
 )
+from tilelang.language.dist import (
+    RankPlacementSpec,
+    _current_world_size,
+    _rank_placement_metadata,
+    _validate_rank_placement,
+    placement as rank_placement_namespace,
+)
 from tilelang.language.proxy import TensorProxy
 from tilelang.language.mesh_symbols import mesh_ncols, mesh_nrows
 
@@ -31,6 +39,7 @@ __all__ = [
     "PlacementSpec",
     "MeshTensor",
     "TensorWithMeta",
+    "get_rank_extent",
     "get_local_extent",
 ]
 
@@ -68,9 +77,18 @@ class TensorWithMeta:
         """Return the uniform physical local buffer shape."""
         return self.meta_data["local_shape"]
 
-    def get_local_extent(self, cid=None):
+    @property
+    def rank_shape(self):
+        """Return the uniform physical shape held by one Rank."""
+        return self.meta_data.get("rank_shape", self.global_shape)
+
+    def get_rank_extent(self, rank_id):
+        """Return the valid extent held by ``rank_id``."""
+        return get_rank_extent(self, rank_id)
+
+    def get_local_extent(self, cid=None, *, rank_id=None):
         """Return the valid local extent on ``cid`` or the current kernel core."""
-        return get_local_extent(self, cid)
+        return get_local_extent(self, cid, rank_id=rank_id)
 
 
 class MeshTensorValue:
@@ -91,9 +109,18 @@ class MeshTensorValue:
         """Return the uniform physical local buffer shape."""
         return self.meta_data["local_shape"]
 
-    def get_local_extent(self, cid=None):
+    @property
+    def rank_shape(self):
+        """Return the uniform physical shape held by one Rank."""
+        return self.meta_data.get("rank_shape", self.global_shape)
+
+    def get_rank_extent(self, rank_id):
+        """Return the valid extent held by ``rank_id``."""
+        return get_rank_extent(self, rank_id)
+
+    def get_local_extent(self, cid=None, *, rank_id=None):
         """Return the valid local extent on ``cid`` or the current kernel core."""
-        return get_local_extent(self, cid)
+        return get_local_extent(self, cid, rank_id=rank_id)
 
     def __getitem__(self, keys):
         return self.buffer[keys]
@@ -168,7 +195,7 @@ def lookup_mesh_tensor_meta(mesh_tensor):
     """Return MeshTensor metadata from a wrapper, dict, or annotated Buffer."""
     if isinstance(mesh_tensor, (TensorWithMeta, MeshTensorValue)):
         return mesh_tensor.meta_data
-    if isinstance(mesh_tensor, dict):
+    if isinstance(mesh_tensor, (dict, Map)):
         return mesh_tensor
     meta = getattr(mesh_tensor, "_tilelang_mesh_tensor_meta", None)
     if meta is not None:
@@ -176,7 +203,24 @@ def lookup_mesh_tensor_meta(mesh_tensor):
     raise TypeError(f"Expected a MeshTensor value with metadata, got {type(mesh_tensor)}")
 
 
-def get_local_extent(mesh_tensor, cid=None):
+def get_rank_extent(mesh_tensor, rank_id):
+    """Return the valid logical extent assigned to ``rank_id``."""
+
+    meta = lookup_mesh_tensor_meta(mesh_tensor)
+    global_shape = meta["global_shape"]
+    placement_kind, shard_dim = (_to_python_int(value) for value in meta.get("rank_placement", (0, -1)))
+    if placement_kind == 0:
+        return tuple(global_shape)
+
+    world_size = meta.get("world_size")
+    if world_size is None:
+        raise ValueError("Rank-sharded MeshTensor metadata is missing world_size")
+    rank_extent = list(global_shape)
+    rank_extent[shard_dim] = distribute_valid_count(global_shape[shard_dim], rank_id, world_size)
+    return tuple(rank_extent)
+
+
+def get_local_extent(mesh_tensor, cid=None, *, rank_id=None):
     """Return the valid local extent for ``mesh_tensor`` on linear core id ``cid``.
 
     When ``cid`` is omitted inside a kernel, use its current block binding.
@@ -191,7 +235,13 @@ def get_local_extent(mesh_tensor, cid=None):
         cid = get_block_binding(0)
 
     meta = lookup_mesh_tensor_meta(mesh_tensor)
-    global_shape = meta["global_shape"]
+    placement_kind = _to_python_int(meta.get("rank_placement", (0, -1))[0])
+    if placement_kind == 1:
+        if rank_id is None:
+            raise ValueError("rank_id is required for get_local_extent on a Rank-sharded MeshTensor")
+        rank_extent = get_rank_extent(meta, rank_id)
+    else:
+        rank_extent = tuple(meta["global_shape"])
     nrows, ncols = meta["mesh_shape"]
     row = cid // ncols
     col = cid % ncols
@@ -199,15 +249,15 @@ def get_local_extent(mesh_tensor, cid=None):
     placement_desc = meta.get("placement")
     if placement_desc is None:
         # Support metadata created before PlacementSpec became canonical.
-        local_extent = list(global_shape)
+        local_extent = list(rank_extent)
         cross_mesh_dim = meta.get("cross_mesh_dim", -1)
         if cross_mesh_dim != -1:
-            local_extent[cross_mesh_dim] = distribute_valid_count(global_shape[cross_mesh_dim], cid, nrows * ncols)
+            local_extent[cross_mesh_dim] = distribute_valid_count(rank_extent[cross_mesh_dim], cid, nrows * ncols)
             return tuple(local_extent)
 
         shard_y = meta.get("shard_y", -1)
         if shard_y != -1:
-            local_extent[shard_y] = distribute_valid_count(global_shape[shard_y], row, nrows)
+            local_extent[shard_y] = distribute_valid_count(rank_extent[shard_y], row, nrows)
 
         shard_x = meta.get("shard_x", -1)
         if shard_x != -1:
@@ -215,13 +265,13 @@ def get_local_extent(mesh_tensor, cid=None):
         return tuple(local_extent)
 
     row_kind, row_dim, col_kind, col_dim = (_to_python_int(value) for value in placement_desc)
-    local_extent = list(global_shape)
-    placement_kind = _to_python_int(meta.get("placement_kind", -1))
-    if placement_kind == _PlacementKind.MESH_AS_LINE:
-        local_extent[row_dim] = distribute_valid_count(global_shape[row_dim], cid, nrows * ncols)
+    local_extent = list(rank_extent)
+    core_placement_kind = _to_python_int(meta.get("placement_kind", -1))
+    if core_placement_kind == _PlacementKind.MESH_AS_LINE:
+        local_extent[row_dim] = distribute_valid_count(rank_extent[row_dim], cid, nrows * ncols)
         return tuple(local_extent)
 
-    for dim, extent in enumerate(global_shape):
+    for dim, extent in enumerate(rank_extent):
         row_shards = row_kind == 1 and row_dim == dim
         col_shards = col_kind == 1 and col_dim == dim
         if row_shards:
@@ -297,6 +347,17 @@ class MeshTensorProxy:
 
         return tuple(sharded_shape)
 
+    @staticmethod
+    def _get_rank_shape(
+        shape: tuple[Any, ...],
+        placement: RankPlacementSpec,
+        world_size: int,
+    ) -> tuple[Any, ...]:
+        rank_shape = list(shape)
+        if placement.kind == 1:
+            rank_shape[placement.dim] = _ceildiv(rank_shape[placement.dim], world_size)
+        return tuple(rank_shape)
+
     def __call__(
         self,
         shape: ShapeType,
@@ -306,6 +367,7 @@ class MeshTensorProxy:
         layout=None,
         *,
         sharding_policy: PlacementSpec | MeshShardingPolicy | None = None,
+        rank_placement: RankPlacementSpec | None = None,
     ) -> TensorWithMeta:
         if sharding_policy is not None:
             if placement is not None:
@@ -316,6 +378,13 @@ class MeshTensorProxy:
         if isinstance(shape, (int, PrimExpr)):
             shape = (shape,)
         placement = _validate_placement(placement, len(shape))
+        configured_world_size = _current_world_size(allow_none=True)
+        explicit_rank_placement = rank_placement is not None
+        if rank_placement is None:
+            rank_placement = rank_placement_namespace.replicated()
+        else:
+            rank_placement = _validate_rank_placement(rank_placement, len(shape))
+        world_size = configured_world_size if configured_world_size is not None else 1
         if device_mesh_config is not None and not _is_mesh_config(device_mesh_config):
             if not _is_dtype_like(device_mesh_config):
                 raise TypeError("device_mesh_config must be a tuple of (nrows, ncols). To omit it, pass dtype as the third argument.")
@@ -325,26 +394,37 @@ class MeshTensorProxy:
             device_mesh_config = (mesh_nrows(), mesh_ncols())
         dtype = _dtypes.normalize_dtype(dtype)
         nrows, ncols = device_mesh_config
-        sharded_shape = self._get_sharded_shape(shape, placement, nrows, ncols)
+        rank_shape = self._get_rank_shape(shape, rank_placement, world_size)
+        sharded_shape = self._get_sharded_shape(rank_shape, placement, nrows, ncols)
+        rank_strides = TensorProxy._construct_strides(rank_shape)
         sharded_strides = TensorProxy._construct_strides(sharded_shape)
         shape_exprs = [_to_primexpr(s) for s in shape]
+        rank_shape_exprs = [_to_primexpr(s) for s in rank_shape]
         sharded_shape_exprs = [_to_primexpr(s) for s in sharded_shape]
 
         meta_data = dict(
             global_shape=shape,
             global_strides=TensorProxy._construct_strides(shape),
+            rank_shape=rank_shape,
+            rank_strides=rank_strides,
             local_shape=sharded_shape,
             local_strides=sharded_strides,
             mesh_shape=(nrows, ncols),
+            rank_placement=_rank_placement_metadata(rank_placement),
             placement=_placement_metadata(placement),
             placement_kind=placement.kind,
         )
+        if configured_world_size is not None or explicit_rank_placement:
+            meta_data["world_size"] = world_size
 
         # Build global and per-shard layouts (CuteLayout objects).
         if layout is not None:
             global_layout = layout
             if _is_mx_dtype(dtype):
-                sharded_layout = _derive_mx_layout_like(global_layout, sharded_shape_exprs, dtype)
+                rank_layout = _derive_mx_layout_like(global_layout, rank_shape_exprs, dtype)
+                if not rank_layout:
+                    raise ValueError("MeshTensor Rank sharding cannot derive a supported SUVM MX layout.")
+                sharded_layout = _derive_mx_layout_like(rank_layout, sharded_shape_exprs, dtype)
                 if not sharded_layout:
                     raise ValueError(
                         "MeshTensor with SUVM MX dtype only supports MX row-major, "
@@ -353,12 +433,15 @@ class MeshTensorProxy:
                         "or make_mxznz_layout(...)."
                     )
             else:
-                sharded_layout = _derive_layout_like(global_layout, sharded_shape_exprs, None)
+                rank_layout = _derive_layout_like(global_layout, rank_shape_exprs, None)
+                sharded_layout = _derive_layout_like(rank_layout, sharded_shape_exprs, None)
         else:
             global_layout = _make_default_mesh_tensor_layout(shape_exprs, dtype)
+            rank_layout = _make_default_mesh_tensor_layout(rank_shape_exprs, dtype)
             sharded_layout = _make_default_mesh_tensor_layout(sharded_shape_exprs, dtype)
 
         meta_data["global_layout"] = global_layout
+        meta_data["rank_layout"] = rank_layout
         meta_data["sharded_layout"] = sharded_layout
 
         buf = tir_buffer(
@@ -374,6 +457,7 @@ if TYPE_CHECKING:
 
     class MeshTensor:
         global_shape: tuple[Any, ...]
+        rank_shape: tuple[Any, ...]
         local_shape: tuple[Any, ...]
 
         def __new__(
@@ -385,9 +469,12 @@ if TYPE_CHECKING:
             layout=None,
             *,
             sharding_policy: PlacementSpec | MeshShardingPolicy | None = None,
+            rank_placement: RankPlacementSpec | None = None,
         ) -> TensorWithMeta: ...
 
-        def get_local_extent(self, cid=None) -> tuple[Any, ...]: ...
+        def get_rank_extent(self, rank_id) -> tuple[Any, ...]: ...
+
+        def get_local_extent(self, cid=None, *, rank_id=None) -> tuple[Any, ...]: ...
 
 else:
     MeshTensor = MeshTensorProxy()

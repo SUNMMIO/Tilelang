@@ -170,6 +170,8 @@ def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
 
     mod = tilelang.transform.InferSramScope()(mod)
+    mod = tilelang.transform.PlanDistSignals()(mod)
+    mod = tilelang.transform.LowerDistRouting()(mod)
     mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
     mod = tilelang.transform.SunmmioLayoutInference()(mod)
     mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
@@ -177,6 +179,7 @@ def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.ValidateTileViewRegions()(mod)
 
     LayoutVisual(mod)
+    mod = tilelang.transform.LowerDistCommunication()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     mod = tilelang.transform.LegalizeTilesLoop()(mod)
     mod = tilelang.transform.TilesLoop()(mod)
@@ -296,6 +299,7 @@ def OptimizeForSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
 
     mod = tilelang.transform.MergeIfStmt()(mod)
+    mod = tilelang.transform.InjectDistSync()(mod)
     mod = tilelang.transform.InjectSunmmioSync()(mod)
 
     mod = tilelang.transform.MakePackedAPI()(mod)

@@ -598,6 +598,26 @@ def HoistBlockAnnotationsToFuncAttrs():
     return _ffi_api.HoistBlockAnnotationsToFuncAttrs()  # type: ignore
 
 
+def PlanDistSignals():
+    """Infer, allocate, and validate Rank communication signal resources."""
+    return _ffi_api.PlanDistSignals()  # type: ignore
+
+
+def LowerDistRouting():
+    """Validate, plan, and lower logical Rank routes."""
+    return _ffi_api.LowerDistRouting()  # type: ignore
+
+
+def LowerDistCommunication():
+    """Plan expectations and lower Rank communication to device TIR leaves."""
+    return _ffi_api.LowerDistCommunication()  # type: ignore
+
+
+def InjectDistSync():
+    """Process Rank communication synchronization and source lifetimes."""
+    return _ffi_api.InjectDistSync()  # type: ignore
+
+
 def StorageRewrite():
     """StorageRewrite
 
