@@ -43,6 +43,7 @@
 
 #include "../op/builtin.h"
 #include "../op/comm.h"
+#include "../op/dist_comm.h"
 #include "../op/utils.h"
 #include "../target/sunmmio_utils.h"
 
@@ -749,6 +750,16 @@ private:
       SunmmioSyncUnits completed_links = PendingUnits() & kLinkUnits;
       CompleteUnits(completed_links);
       return PrependSync(StmtMutator::VisitStmt_(op), completed_links);
+    }
+
+    // Dist leaf operations own a separate completion protocol. Until that
+    // protocol is modeled in unit synchronization, leave their encoded buffer
+    // regions untouched instead of treating their vector arguments as loads.
+    if (call && (call->op.same_as(dist_put_()) ||
+                 call->op.same_as(dist_wait_signal_()) ||
+                 call->op.same_as(dist_wait_send()) ||
+                 call->op.same_as(dist_expect_()))) {
+      return StmtMutator::VisitStmt_(op);
     }
 
     std::vector<UnitAccess> accesses;

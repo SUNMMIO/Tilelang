@@ -16,10 +16,13 @@ from .tir.ir import *  # noqa: F401
 from tilelang.layout import Layout, Fragment  # noqa: F401
 from .proxy import ptr, make_tensor, Buffer, Tensor, StridedTensor, FragmentBuffer, SharedBuffer, LocalBuffer  # noqa: F401
 from . import placement  # noqa: F401
+from . import dist  # noqa: F401
 from .placement import MeshReplicationType, MeshShardingPolicy, PlacementSpec  # noqa: F401
 from .mesh_tensor import (  # noqa: F401
     MeshTensor,
     TensorWithMeta,
+    get_rank_extent,
+    get_local_extent,
 )
 from .mesh_symbols import mesh_nrows, mesh_ncols, mesh_ncores, nrows, ncols  # noqa: F401
 from .loop import (

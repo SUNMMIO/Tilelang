@@ -37,6 +37,8 @@ constexpr const char *kHoistedAnnotationKeys[] = {
 constexpr const char *kDeviceFuncPropagatedAttrKeys[] = {
     attr::kLayoutMap,
     attr::kGlobalLayoutMap,
+    "tl.dist.world_size",
+    "tl.dist.signal_counts",
 };
 
 void CopyMapEntries(const ffi::Map<ffi::Any, ffi::Any> &map,

@@ -48,9 +48,9 @@ using namespace tir;
 using namespace ffi;
 
 namespace {
-// MeshTensor buffer_map entries are physically sharded. The packed API
-// validates user-facing tensors, so use tensor_meta global shape/strides for
-// binding.
+// MeshTensor buffer_map entries are physically sharded across local cores. The
+// packed API validates the tensor held by one Rank, so prefer rank
+// shape/strides when present and fall back to the legacy global fields.
 Optional<Buffer> MaybeMakeAPIBufferFromTensorMeta(const PrimFunc &func,
                                                   const Buffer &buffer) {
   auto tensor_meta_opt = func->GetAttr<Map<String, ObjectRef>>("tensor_meta");
@@ -70,28 +70,34 @@ Optional<Buffer> MaybeMakeAPIBufferFromTensorMeta(const PrimFunc &func,
     return std::nullopt;
   }
 
-  auto global_shape_obj = meta_entry.value().Get("global_shape");
-  if (!global_shape_obj) {
+  auto api_shape_obj = meta_entry.value().Get("rank_shape");
+  if (!api_shape_obj) {
+    api_shape_obj = meta_entry.value().Get("global_shape");
+  }
+  if (!api_shape_obj) {
     return std::nullopt;
   }
 
-  auto global_shape = Downcast<Array<PrimExpr>>(global_shape_obj.value());
-  ICHECK_EQ(global_shape.size(), buffer->shape.size())
+  auto api_shape = Downcast<Array<PrimExpr>>(api_shape_obj.value());
+  ICHECK_EQ(api_shape.size(), buffer->shape.size())
       << "Packed API buffer view for " << buffer->name
-      << " has rank mismatch between tensor_meta.global_shape " << global_shape
-      << " and physical buffer shape " << buffer->shape;
+      << " has rank mismatch between tensor_meta rank/global shape "
+      << api_shape << " and physical buffer shape " << buffer->shape;
 
-  Array<PrimExpr> global_strides;
-  if (auto global_strides_obj = meta_entry.value().Get("global_strides")) {
-    global_strides = Downcast<Array<PrimExpr>>(global_strides_obj.value());
-    ICHECK(global_strides.empty() ||
-           global_strides.size() == global_shape.size())
+  Array<PrimExpr> api_strides;
+  auto api_strides_obj = meta_entry.value().Get("rank_strides");
+  if (!api_strides_obj) {
+    api_strides_obj = meta_entry.value().Get("global_strides");
+  }
+  if (api_strides_obj) {
+    api_strides = Downcast<Array<PrimExpr>>(api_strides_obj.value());
+    ICHECK(api_strides.empty() || api_strides.size() == api_shape.size())
         << "Packed API buffer view for " << buffer->name
-        << " has rank mismatch between tensor_meta.global_strides "
-        << global_strides << " and tensor_meta.global_shape " << global_shape;
+        << " has rank mismatch between tensor_meta rank/global strides "
+        << api_strides << " and tensor_meta rank/global shape " << api_shape;
   }
 
-  return Buffer(buffer->data, buffer->dtype, global_shape, global_strides,
+  return Buffer(buffer->data, buffer->dtype, api_shape, api_strides,
                 buffer->elem_offset, buffer->name, buffer->data_alignment,
                 buffer->offset_factor, buffer->buffer_type,
                 buffer->axis_separators, buffer->span);

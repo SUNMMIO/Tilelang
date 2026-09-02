@@ -33,6 +33,7 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <utility>
@@ -74,6 +75,10 @@ public:
 
   void SetExtraDeviceFuncAttrs(Map<String, Any> attrs) {
     extra_device_func_attrs_ = std::move(attrs);
+  }
+
+  void SetDistRankIdVar(Optional<tir::Var> rank_id_var) {
+    dist_rank_id_var_ = std::move(rank_id_var);
   }
 
   tir::Stmt VisitStmt_(const tir::AttrStmtNode *op) final {
@@ -407,6 +412,15 @@ private:
                   };
                   return sort_key(a) < sort_key(b);
                 });
+      if (dist_rank_id_var_) {
+        bool found =
+            std::any_of(params.begin(), params.end(), [&](const tir::Var &var) {
+              return var.same_as(dist_rank_id_var_.value());
+            });
+        if (!found) {
+          params.push_back(dist_rank_id_var_.value());
+        }
+      }
       return {params, use_def.undefined_buffers_};
     }();
 
@@ -525,6 +539,22 @@ private:
     }
     device_func =
         WithAttrs(std::move(device_func), remapped_extra_device_func_attrs);
+    if (dist_rank_id_var_) {
+      ICHECK(var_remap.count(dist_rank_id_var_.value()));
+      tir::Var device_rank_id =
+          Downcast<tir::Var>(var_remap[dist_rank_id_var_.value()]);
+      int rank_id_param_index = -1;
+      for (size_t index = 0; index < params.size(); ++index) {
+        if (params[index].same_as(device_rank_id)) {
+          rank_id_param_index = static_cast<int>(index);
+          break;
+        }
+      }
+      ICHECK_GE(rank_id_param_index, 0);
+      device_func =
+          WithAttr(std::move(device_func), "tl.dist.rank_id_param_index",
+                   rank_id_param_index);
+    }
 
     GlobalVar kernel_symbol_global = var_supply_();
     (*device_mod_)->Add(kernel_symbol_global, device_func);
@@ -555,6 +585,7 @@ private:
   // Collect assumes in host side
   Array<const tir::AttrStmtNode *> host_assumes_;
   Map<String, Any> extra_device_func_attrs_;
+  Optional<tir::Var> dist_rank_id_var_;
 };
 
 tir::PrimFunc SplitHostDevice(tir::PrimFunc func, IRModule *device_mod,
@@ -577,6 +608,17 @@ tir::PrimFunc SplitHostDevice(tir::PrimFunc func, IRModule *device_mod,
     }
   }
   splitter.SetExtraDeviceFuncAttrs(std::move(extra_device_func_attrs));
+
+  if (auto rank_id_param_index =
+          func->GetAttr<Integer>("tl.dist.rank_id_param_index")) {
+    int64_t index = rank_id_param_index.value()->value;
+    ICHECK_GE(index, 0);
+    ICHECK_LT(index, static_cast<int64_t>(func->params.size()));
+    const tir::Var &rank_id_var = func->params[index];
+    ICHECK(rank_id_var->dtype == DataType::Int(32))
+        << "T.dist.RankId parameter must have int32 dtype";
+    splitter.SetDistRankIdVar(rank_id_var);
+  }
 
   // Propagate non-restrict parameter list from host func to device kernels
   if (auto opt = func->GetAttr<Array<tir::Var>>(tl::attr::kNonRestrictParams)) {
@@ -604,6 +646,10 @@ tir::PrimFunc SplitHostDevice(tir::PrimFunc func, IRModule *device_mod,
   if (func->attrs.defined() &&
       func->attrs->dict.count(tl::attr::kDeviceFuncAttrKeys)) {
     func = tvm::WithoutAttr(std::move(func), tl::attr::kDeviceFuncAttrKeys);
+  }
+  if (func->attrs.defined() &&
+      func->attrs->dict.count("tl.dist.rank_id_param_index")) {
+    func = tvm::WithoutAttr(std::move(func), "tl.dist.rank_id_param_index");
   }
   return func;
 }
