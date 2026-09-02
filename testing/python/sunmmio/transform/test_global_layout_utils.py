@@ -10,7 +10,6 @@ from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target, SUNMMIO_TARGET_DESC, target_is_sunmmio
 import tilelang as tl
 import tilelang.language as T
-from tilelang.language.mesh_tensor import MeshShardingPolicy, MeshReplicationType
 from tilelang.layout import make_row_major
 from tvm import tir
 from tvm.tir import PyStmtExprVisitor
@@ -64,7 +63,7 @@ def test_global_buffer_layout_populated_for_sunmmio():
     Test that global buffer layouts from tensor_meta are populated into layout_map
     during SunmmioLayoutInference pass for Sunmmio target.
     """
-    policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
+    policy = T.placement.full_shard(0, 1)
 
     M, N, K = 64, 64, 64
     block_M, block_N, block_K = 32, 32, 32
@@ -155,7 +154,7 @@ def test_row_major_global_layout_values():
     """
     Test that the layout created from tensor_meta produces correct forward index mapping.
     """
-    policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
+    policy = T.placement.full_shard(0, 1)
 
     M, N, K = 64, 64, 64
     block_M, block_N, block_K = 32, 32, 32
@@ -219,7 +218,7 @@ def test_dynamic_shape_global_buffer_layout():
 
     block_M, block_N, block_K = 32, 32, 32
 
-    policy = MeshShardingPolicy(replicate=MeshReplicationType.ALL)
+    policy = T.placement.replicated()
 
     A_tensor = T.MeshTensor((M_var, K_var), policy, dtype="float16")
     B_tensor = T.MeshTensor((K_var, 64), policy, dtype="float16")

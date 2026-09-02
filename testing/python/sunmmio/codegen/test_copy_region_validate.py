@@ -141,7 +141,7 @@ def zz_fully_coalesced_non_major_sub_block_copy_kernel():
 @target("Sunmmio")
 def let_bound_mesh_local_shape_copy_kernel():
     global_shape = (256, 256)
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     tensor_layout = make_zz_layout(global_shape, axes=[0, 1], block_shape=(32, 32))
 
     @T.prim_func

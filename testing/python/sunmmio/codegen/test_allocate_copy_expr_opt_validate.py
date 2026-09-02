@@ -48,8 +48,8 @@ def basic_allocate_copy_mma_kernel(
         with T.Kernel() as _cid:
             sharded_M, sharded_K = A.local_shape
             sharded_N = B.local_shape[1]
-            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
-            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.ncols()), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             for by in T.serial(T.ceildiv(sharded_M, block_M)):
@@ -149,8 +149,8 @@ def pipelined_allocate_copy_mma_kernel(
         with T.Kernel() as _cid:
             sharded_M, sharded_K = A.local_shape
             sharded_N = B.local_shape[1]
-            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
-            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.ncols()), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             for by in T.serial(T.ceildiv(sharded_M, block_M)):
@@ -365,7 +365,7 @@ def test_pipelined_allocate_copy_mma_codegen_propagates_ping_pong(tmp_path):
             "#suvm.memory_space<asram>",
             "#suvm.memory_space<wsram>",
             "suvm.mcast_tok",
-            "suvm.ping_pong = #suvm.ping_pong<pong>",
+            "suvm.ping_pong = #suvm.ping_pong<ping>",
         ),
     )
 

@@ -980,14 +980,13 @@ def test_immutable_conflict_rsram_annotate_vs_gemm():
 
 def dram_zn_to_asram_kernel():
     """DRAM buffer with ZN layout (via MeshTensor) copied to ASRAM → IsZZLike check should fail."""
-    from tilelang.language.mesh_tensor import MeshShardingPolicy, MeshReplicationType
 
     M, K, N = 64, 32, 64
     block_M, block_K, block_N = 64, 32, 64
     dtype = "float16"
     accum_dtype = "float32"
 
-    policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
+    policy = T.placement.full_shard(0, 1)
 
     # ZN layout on DRAM — incompatible with ASRAM (Gemm.A requires ZZ-like)
     zn_dram = make_zn_layout((M, K), axes=[0, 1], block_shape=[32, 32])
@@ -1034,14 +1033,13 @@ def test_dram_zn_to_asram_succeeds_via_staged_rsram():
 
 def dram_zn_to_wsram_kernel():
     """DRAM buffer with ZN layout (via MeshTensor) copied to WSRAM → IsZZLike check should fail."""
-    from tilelang.language.mesh_tensor import MeshShardingPolicy, MeshReplicationType
 
     M, K, N = 64, 32, 64
     block_M, block_K, block_N = 64, 32, 64
     dtype = "float16"
     accum_dtype = "float32"
 
-    policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
+    policy = T.placement.full_shard(0, 1)
 
     # ZN layout on DRAM B — incompatible with WSRAM DMA (requires ZZ-like)
     zn_dram = make_zn_layout((K, N), axes=[0, 1], block_shape=[32, 32])
@@ -1329,18 +1327,18 @@ def matmul_persistent(M, N, K, block_M, block_N, block_K, num_stages, dtype=T.bf
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
 
             A_shared = T.alloc_shared((block_M, block_K), dtype)
-            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.ncols()), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             # Each core iterates its own sharded tile grid with plain nested

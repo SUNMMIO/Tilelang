@@ -11,8 +11,8 @@ from tilelang.layout import make_row_major, make_aligned_row_major
 def reduction(M, block_M, in_dtype, out_dtype):
     A_layout = make_row_major((M,))
     B_layout = make_aligned_row_major((1,), align_bytes=1024, dtype=out_dtype)
-    A_placement = T.MeshShardingPolicy(y=0, replicate=T.MeshReplicationType.ROW)
-    B_placement = T.MeshShardingPolicy(replicate=T.MeshReplicationType.ALL)
+    A_placement = T.placement.row_shard(0)
+    B_placement = T.placement.replicated()
 
     @T.prim_func
     def main(
@@ -24,7 +24,7 @@ def reduction(M, block_M, in_dtype, out_dtype):
 
             A_shared = T.alloc_shared((block_M), in_dtype)
             Acc_shared = T.alloc_shared((block_M), out_dtype)
-            Acc_dist_shared = T.alloc_shared((T.mesh_ncols() * block_M), out_dtype)
+            Acc_dist_shared = T.alloc_shared((T.ncols() * block_M), out_dtype)
             B_shared = T.alloc_shared((1,), out_dtype)
             T.annotate_layout({B_shared: B_layout})
 

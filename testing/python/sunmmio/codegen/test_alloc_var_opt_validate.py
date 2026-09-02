@@ -177,7 +177,7 @@ def alloc_var_conditional_loop_extent_copy_kernel(
     block_N=32,
     dtype=T.bfloat16,
 ):
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, N), [0, 1], (32, 32))
     B_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 
@@ -260,7 +260,7 @@ def test_alloc_var_copy_mma_control_flow_kernel_codegen_validates_with_npuir_opt
             "scf.while",
             "scf.condition",
             "-> (!suvm.token, !suvm.token, f32, i32)",
-            "-> (!suvm.token, f32, i32)",
+            "-> (!suvm.token, f32, i32, i1)",
             "!suvm.token",
             "suvm.copy_async",
             "suvm.tc.mma",

@@ -173,7 +173,7 @@ def _symbolic_mesh_gemm_mod():
     block_M, block_N, block_K = 32, 32, 32
     dtype = "bfloat16"
     accum_dtype = "float32"
-    policy = T.MeshShardingPolicy(y=0, x=1)
+    policy = T.placement.full_shard(0, 1)
     a_layout = make_zz_layout((M, K), [0, 1], (32, 32))
     b_layout = make_zz_layout((K, N), [0, 1], (32, 32))
     c_layout = make_zz_layout((M, N), [0, 1], (32, 32))
@@ -191,9 +191,9 @@ def _symbolic_mesh_gemm_mod():
                 _, sharded_N = B.local_shape
 
                 A_shared = T.alloc_shared((block_M, block_K), dtype)
-                A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
+                A_shared_dist = T.alloc_shared((block_M, block_K * T.ncols()), dtype)
                 B_shared = T.alloc_shared((block_K, block_N), dtype)
-                B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
+                B_shared_dist = T.alloc_shared((block_K * T.nrows(), block_N), dtype)
                 C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
                 for bx in T.serial(T.ceildiv(sharded_M, block_M)):
@@ -220,7 +220,7 @@ def _symbolic_mesh_all_gather_mod():
         def main(A: T.Tensor((block_M, block_N), dtype)):
             with T.Kernel() as _cid:
                 A_shared = T.alloc_shared((block_M, block_N), dtype)
-                A_shared_dist = T.alloc_shared((block_M, block_N * T.mesh_ncols()), dtype)
+                A_shared_dist = T.alloc_shared((block_M, block_N * T.ncols()), dtype)
 
                 T.copy(A, A_shared)
                 T.comm.all_gather(A_shared, A_shared_dist, direction="horizontal", axis=-1)
@@ -236,7 +236,7 @@ def _symbolic_mesh_gqa_mod():
     accum_dtype = "bfloat16"
     q_shape = [batch, seq_len, heads, dim]
     kv_shape = [batch, seq_len, head_kv, dim]
-    policy = T.MeshShardingPolicy(y=0, x=2)
+    policy = T.placement.full_shard(0, 2)
     q_layout = make_zz_layout(q_shape, [1, 3], (32, 32))
     kv_layout = make_zz_layout(kv_shape, [1, 3], (32, 32))
 
@@ -287,10 +287,10 @@ def test_resolve_replaces_mesh_intrinsics_in_body_and_kernel_extent():
         @T.prim_func
         def main():
             with T.Kernel() as cid:
-                scratch = T.alloc_shared((T.mesh_nrows(), T.mesh_ncols(), T.mesh_ncores()), "float32")
+                scratch = T.alloc_shared((T.nrows(), T.ncols(), T.mesh_ncores()), "float32")
                 scratch[0, 0, 0] = T.if_then_else(
                     cid < T.mesh_ncores(),
-                    T.Cast("float32", T.mesh_nrows() + T.mesh_ncols() + T.mesh_ncores()),
+                    T.Cast("float32", T.nrows() + T.ncols() + T.mesh_ncores()),
                     T.float32(0),
                 )
 
@@ -310,7 +310,7 @@ def test_resolve_replaces_mesh_intrinsics_in_body_and_kernel_extent():
 
 def test_resolve_updates_default_mesh_tensor_buffer_map_and_layout_metadata():
     target = _sunmmio_target()
-    policy = T.MeshShardingPolicy(y=0, x=1)
+    policy = T.placement.full_shard(0, 1)
     layout = make_zz_layout((128, 96), [0, 1], (32, 32))
 
     with tvm.target.Target(target):
@@ -318,7 +318,7 @@ def test_resolve_updates_default_mesh_tensor_buffer_map_and_layout_metadata():
         @T.prim_func
         def main(A: T.MeshTensor((128, 96), policy, "float16", layout=layout)):
             with T.Kernel() as _cid:
-                valid_M, valid_N = A.get_local_extent(_cid)
+                valid_M, valid_N = A.get_local_extent()
                 for i in T.serial(valid_M):
                     for j in T.serial(valid_N):
                         A[i, j] = A[i, j]
@@ -367,7 +367,7 @@ def test_mesh_symbol_query_has_no_builder_side_effect():
 
     with builder.current_context():
         builder._sunmmio_mesh_symbols_used = False
-        expr = T.mesh_nrows() + 1
+        expr = T.nrows() + 1
         assert builder._sunmmio_mesh_symbols_used
 
         builder._sunmmio_mesh_symbols_used = False
@@ -386,7 +386,7 @@ def test_lower_and_optimize_resolve_kernel_default_mesh_ncores():
                 scratch = T.alloc_shared((1,), "float32")
                 scratch[0] = T.if_then_else(
                     cid < T.mesh_ncores(),
-                    T.Cast("float32", T.mesh_nrows() + T.mesh_ncols() + T.mesh_ncores()),
+                    T.Cast("float32", T.nrows() + T.ncols() + T.mesh_ncores()),
                     T.float32(0),
                 )
 

@@ -18,7 +18,7 @@ STRICT_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
 
 def _matrix_output_spec(h, w, dtype):
     shape = (16, h, w)
-    return shape, T.MeshShardingPolicy(cross_mesh_dim=0), make_zz_layout(shape, [1, 2], (32, 32))
+    return shape, T.placement.mesh_as_line(0), make_zz_layout(shape, [1, 2], (32, 32))
 
 
 @target("Sunmmio")

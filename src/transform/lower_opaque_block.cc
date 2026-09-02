@@ -31,6 +31,7 @@
 #include <utility>
 
 #include "../op/builtin.h"
+#include "common/attr.h"
 #include "tir/transforms/ir_utils.h"
 
 namespace tvm {
@@ -107,6 +108,11 @@ private:
       if (ping_pong_it != alloc_ping_pong_map_.end()) {
         allocate_annotations.Set(tl::attr::kSunmmioAllocPingPong,
                                  (*ping_pong_it).second);
+      }
+      auto reduce_temp_it = reduce_register_temp_role_map_.find(buffer->data);
+      if (reduce_temp_it != reduce_register_temp_role_map_.end()) {
+        allocate_annotations.Set(tl::attr::kSunmmioReduceRegisterTemp,
+                                 (*reduce_temp_it).second);
       }
       body = Allocate(buffer->data, buffer->dtype, allocation_shape,
                       const_true(), std::move(body), allocate_annotations);
@@ -264,6 +270,17 @@ private:
                      << "` to be a PrimExpr or Map<Var, PrimExpr>, but got "
                      << kv.second.GetTypeKey();
         }
+      } else if (key == tl::attr::kSunmmioReduceRegisterTemp) {
+        ICHECK(is_block)
+            << "`" << tl::attr::kSunmmioReduceRegisterTemp
+            << "` is only supported as a per-buffer block annotation";
+        auto roles = kv.second.try_cast<Map<Var, Integer>>();
+        ICHECK(roles.has_value())
+            << "Expected `" << tl::attr::kSunmmioReduceRegisterTemp
+            << "` to be Map<Var, Integer>, but got " << kv.second.GetTypeKey();
+        for (const auto &pair : roles.value()) {
+          reduce_register_temp_role_map_.Set(pair.first, pair.second);
+        }
       } else if (!is_block) {
         // the loop annotation is preserved
         preserved_annotations.Set(key, kv.second);
@@ -303,6 +320,9 @@ private:
 
   /*! \brief SunMMIO alloc ping-pong attrs collected from function attrs. */
   Map<Var, String> alloc_ping_pong_map_;
+
+  /*! \brief SunMMIO reduction role transferred to Allocate annotations. */
+  Map<Var, Integer> reduce_register_temp_role_map_;
 };
 
 PrimFunc TLLowerOpaqueBlock(PrimFunc f) {

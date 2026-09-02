@@ -9,7 +9,7 @@ from testing.python.sunmmio.common.formal_verify import *
 
 @target("Sunmmio")
 def kernel_mma_3times_single_thread(M=16, N=16, K=16, block_M=128, block_N=128, block_K=32, dtype="float16"):
-    shard_policy = T.MeshShardingPolicy(y=0, x=1)
+    shard_policy = T.placement.full_shard(0, 1)
 
     A_shape = (M, K)
     B_shape = (K, N)

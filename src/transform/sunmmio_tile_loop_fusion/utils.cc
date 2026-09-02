@@ -78,7 +78,8 @@ NormalizedBufferAccess BuildNormalizedBufferAccess(
     const BufferRegion &region, const Map<Var, PrimExpr> &subst,
     const std::unordered_map<std::string, Var> &canonical_execution_vars,
     const std::vector<std::string> &logical_execution_axis_keys,
-    int home_depth_override, arith::Analyzer *analyzer) {
+    int home_depth_override, int last_write_safe_depth,
+    arith::Analyzer *analyzer) {
   BufferRegion normalized_region =
       NormalizeBufferRegionByLogicalExecutionAxes(region, subst);
 
@@ -107,7 +108,7 @@ NormalizedBufferAccess BuildNormalizedBufferAccess(
         static_cast<int>(normalized_region->region.size()));
   }
 
-  return {normalized_region, dims, home_depth,
+  return {normalized_region, dims, home_depth, last_write_safe_depth,
           ComputeAccessPayloadBytes(normalized_region, analyzer)};
 }
 
@@ -187,7 +188,7 @@ NormalizeRegionBoundaries(const std::vector<TileScopeRegion> &regions) {
       normalized.use_in.push_back(BuildNormalizedBufferAccess(
           buffer_region, subst, canonical_execution_vars,
           region.logical_execution_axis_keys, /*home_depth_override=*/-1,
-          &analyzer));
+          /*last_write_safe_depth=*/-1, &analyzer));
     }
 
     for (size_t i = 0; i < region.def_out.size(); ++i) {
@@ -195,9 +196,14 @@ NormalizeRegionBoundaries(const std::vector<TileScopeRegion> &regions) {
       if (i < region.available_at_execution_depths.size()) {
         home_depth = region.available_at_execution_depths[i];
       }
+      int last_write_safe_depth = -1;
+      if (i < region.last_write_safe_execution_depths.size()) {
+        last_write_safe_depth = region.last_write_safe_execution_depths[i];
+      }
       normalized.def_out.push_back(BuildNormalizedBufferAccess(
           region.def_out[i], subst, canonical_execution_vars,
-          region.logical_execution_axis_keys, home_depth, &analyzer));
+          region.logical_execution_axis_keys, home_depth, last_write_safe_depth,
+          &analyzer));
     }
 
     normalized_regions.push_back(std::move(normalized));

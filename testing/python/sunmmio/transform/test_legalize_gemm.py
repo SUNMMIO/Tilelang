@@ -83,17 +83,17 @@ def bf16_gemm_with_allgather(M=128, N=128, K=128, block_M=32, block_N=32, block_
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)
-            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.ncols()), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             T.clear(C_shared)
@@ -159,17 +159,17 @@ def bf16_gemm_with_copy_to_asram(M=128, N=128, K=128, block_M=32, block_N=32, bl
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
             # A staged via direct copy (no all_gather): full DRAM->ASRAM transfer.
-            A_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
+            A_dist = T.alloc_shared((block_M, block_K * T.ncols()), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             T.clear(C_shared)
@@ -235,9 +235,9 @@ def bf16_gemm_with_hoisted_copy_writer(M=128, N=128, K=128, block_M=32, block_N=
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
@@ -286,9 +286,9 @@ def bf16_gemm_with_hoisted_copy_writer_bf16_acc(M=128, N=128, K=128, block_M=32,
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
@@ -336,11 +336,11 @@ def bf16_gemm_with_two_independent_hoisted_writers(
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        A2: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
-        C2: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        A2: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
+        C2: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
@@ -398,9 +398,9 @@ def bf16_gemm_with_hoisted_writer_dirty_source(
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
@@ -449,17 +449,17 @@ def bf16_gemm_with_hoisted_allgather(M=128, N=128, K=128, block_M=32, block_N=32
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)
-            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.ncols()), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             # A loaded + gathered ONCE, hoisted out of the K-loop.
@@ -502,17 +502,17 @@ def bf16_gemm_with_hoisted_allgather_dirty_source(
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
             _, sharded_N = B.local_shape
             A_shared = T.alloc_shared((block_M, block_K), dtype)
-            A_shared_dist = T.alloc_shared((block_M, block_K * T.mesh_ncols()), dtype)
+            A_shared_dist = T.alloc_shared((block_M, block_K * T.ncols()), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-            B_shared_dist = T.alloc_shared((block_K * T.mesh_nrows(), block_N), dtype)
+            B_shared_dist = T.alloc_shared((block_K * T.nrows(), block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), accum_dtype)
 
             T.copy(A[0, 0], A_shared)
@@ -863,10 +863,10 @@ def bf16_gemm_multi_consumer_groupable(M=128, N=128, K=128, block_M=32, block_N=
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
-        C2: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
+        C2: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
@@ -918,11 +918,11 @@ def bf16_gemm_multi_consumer_non_groupable(
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        B2: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
-        C2: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        B2: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
+        C2: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
@@ -991,10 +991,10 @@ def bf16_flash_attention_shaped(M=128, N=128, K=128, block_M=32, block_N=32, blo
 
     @T.prim_func
     def main(
-        Q: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=Q_layout),
-        Kt: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=Kt_layout),
-        V: T.MeshTensor((N, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=V_layout),
-        O: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=O_layout),
+        Q: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=Q_layout),
+        Kt: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=Kt_layout),
+        V: T.MeshTensor((N, N), T.placement.full_shard(0, 1), dtype, layout=V_layout),
+        O: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=O_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = Q.local_shape
@@ -1111,9 +1111,9 @@ def bf16_gemm_no_reaching_writer(M=128, N=128, K=128, block_M=32, block_N=32, bl
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape
@@ -1150,10 +1150,10 @@ def bf16_gemm_multiple_writers(M=128, N=128, K=128, block_M=32, block_N=32, bloc
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        A2: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        A2: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel(T.mesh_ncores()) as cid:
             sharded_M, sharded_K = A.local_shape
@@ -1195,9 +1195,9 @@ def bf16_gemm_diverging_scopes(M=128, N=128, K=128, block_M=32, block_N=32, bloc
 
     @T.prim_func
     def main(
-        A: T.MeshTensor((M, K), T.MeshShardingPolicy(y=0, x=1), dtype, layout=A_layout),
-        B: T.MeshTensor((K, N), T.MeshShardingPolicy(y=0, x=1), dtype, layout=B_layout),
-        C: T.MeshTensor((M, N), T.MeshShardingPolicy(y=0, x=1), accum_dtype, layout=C_layout),
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), dtype, layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), dtype, layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), accum_dtype, layout=C_layout),
     ):
         with T.Kernel() as (_cid):
             sharded_M, sharded_K = A.local_shape

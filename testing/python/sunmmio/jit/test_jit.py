@@ -1171,10 +1171,18 @@ def test_sunmmio_softmax_output_dma_wait_is_hoisted_before_tile_store_loop():
         for idx, line in enumerate(lines[input_dma_idx:store_idx], start=input_dma_idx)
         if "for i in T.serial" in line and "tile.domain" in line
     )
-    # Allow the output-DMA pipeline's prologue null-init (before the by-loop); forbid resets inside the loop body.
-    assert all(null_marker not in line for line in lines[input_dma_idx:output_dma_idx])
-    assert any(wait_marker in line for line in lines[input_dma_idx:tile_store_loop_idx])
-    assert all(wait_marker not in line for line in lines[tile_store_loop_idx:output_dma_idx])
+    output_pipeline_loop_idx = max(
+        idx for idx, line in enumerate(lines[:input_dma_idx]) if re.search(r"\bfor by in (?:range|T\.serial)\(", line)
+    )
+    prologue_null_idx = max(idx for idx, line in enumerate(lines[:output_pipeline_loop_idx]) if null_marker in line)
+
+    # The previous output DMA and the next input DMA both use ODMA0. Its
+    # loop-carried wait must run after the prologue null-init but before the
+    # next input submission, or the channel-wide wait would drain that input.
+    assert all(null_marker not in line for line in lines[output_pipeline_loop_idx:output_dma_idx])
+    assert any(wait_marker in line for line in lines[output_pipeline_loop_idx:input_dma_idx])
+    assert all(wait_marker not in line for line in lines[input_dma_idx:output_dma_idx])
+    assert prologue_null_idx < output_pipeline_loop_idx < input_dma_idx < tile_store_loop_idx < output_dma_idx
 
 
 def test_sunmmio_base_adapter_does_not_expose_sunsim_runtime_surface(tmp_path):
@@ -1265,7 +1273,7 @@ def elementwise_add_jit(M, N, block_M, block_N, in_dtype, out_dtype):
     """JIT version of examples/sunmmio/elementwise/elementwise_add.py."""
 
     zz_layout = make_zz_layout((M, N))
-    placement = T.MeshShardingPolicy(y=0, x=1)
+    placement = T.placement.full_shard(0, 1)
 
     @T.prim_func
     def elem_add(

@@ -43,6 +43,16 @@ def mesh_ncols() -> PrimExpr:
     return _mesh_ncols_symbol()
 
 
+def nrows() -> PrimExpr:
+    """Return the symbolic number of rows in the current Sunmmio mesh."""
+    return mesh_nrows()
+
+
+def ncols() -> PrimExpr:
+    """Return the symbolic number of columns in the current Sunmmio mesh."""
+    return mesh_ncols()
+
+
 def mesh_ncores() -> PrimExpr:
     """Return the symbolic number of cores in the current Sunmmio mesh."""
     return mesh_nrows() * mesh_ncols()

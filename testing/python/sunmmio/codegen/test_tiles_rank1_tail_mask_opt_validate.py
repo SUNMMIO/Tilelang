@@ -26,8 +26,8 @@ def dynamic_rank1_tail_mask_kernel(vector_size=512, dtype=T.float32):
 
     @T.prim_func
     def main(
-        out: T.MeshTensor(out_shape, T.MeshShardingPolicy(), dtype, layout=out_layout),  # type: ignore
-        lengths: T.MeshTensor(lengths_shape, T.MeshShardingPolicy(), T.int32, layout=lengths_layout),  # type: ignore
+        out: T.MeshTensor(out_shape, T.placement.replicated(), dtype, layout=out_layout),  # type: ignore
+        lengths: T.MeshTensor(lengths_shape, T.placement.replicated(), T.int32, layout=lengths_layout),  # type: ignore
     ):
         with T.Kernel():
             out_shared = T.alloc_shared(out_shape, dtype)

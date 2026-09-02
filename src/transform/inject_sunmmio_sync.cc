@@ -609,8 +609,8 @@ private:
 };
 
 // Collector for asynchronous operations within a loop body.
-// Identifies DMA copies, layout transforms, MMA operations, and Broadcasts that
-// happen asynchronously.
+// Identifies DMA copies, layout transforms, transposes, MMA operations, and
+// broadcasts that happen asynchronously.
 struct AccessRecord {
   Buffer buffer;
   Region region;
@@ -1848,7 +1848,8 @@ private:
     return SeqStmt::Flatten(stmts);
   }
 
-  // Handles specific async instructions (dma_copy, mma_sunmmio, broadcast).
+  // Handles specific async instructions (DMA, layout transform, transpose, MMA,
+  // and broadcast).
   // Assigns tokens/barriers and registers them for dependency tracking.
   Stmt VisitStmt_(const EvaluateNode *op) {
     const CallNode *call = op->value.as<CallNode>();
@@ -2260,6 +2261,543 @@ private:
   }
 
   std::set<int> tokens_to_wait_before_;
+};
+
+enum AsyncWaitDomain : uint8_t {
+  kUnknownWaitDomain = 0,
+  kODMA0WaitDomain = 1 << 0,
+  kODMA1WaitDomain = 1 << 1,
+  kTCWaitDomain = 1 << 2,
+};
+
+// These masks mirror only the A4E ODMA path wiring used by NPU-IR channel
+// assignment. NPU-IR may further narrow a path using operation capabilities
+// (for example, an RSRAM-to-RSRAM strided copy is forced onto ODMA1) or its
+// final channel assignment. Ambiguous paths intentionally remain unresolved
+// here, so this pass cannot prevent a later-assigned same-channel submission
+// from appearing before an older wait in every case. A complete solution needs
+// wait placement after channel assignment, or an equivalent channel annotation
+// available at this stage.
+uint8_t GetODMAReadChannelMask(const Buffer &buffer) {
+  if (IsGlobalBuffer(buffer)) {
+    return kODMA0WaitDomain;
+  }
+  if (buffer.scope() == kSunmmioScopeRSRAM || buffer.scope() == "local") {
+    return kODMA0WaitDomain | kODMA1WaitDomain;
+  }
+  return kUnknownWaitDomain;
+}
+
+uint8_t GetODMAWriteChannelMask(const Buffer &buffer) {
+  if (IsGlobalBuffer(buffer) || buffer.scope() == kSunmmioScopeWSRAM) {
+    return kODMA0WaitDomain;
+  }
+  if (buffer.scope() == kSunmmioScopeASRAM) {
+    return kODMA1WaitDomain;
+  }
+  if (buffer.scope() == kSunmmioScopeRSRAM || buffer.scope() == "local") {
+    return kODMA0WaitDomain | kODMA1WaitDomain;
+  }
+  return kUnknownWaitDomain;
+}
+
+uint8_t GetPossibleAsyncWaitDomains(const CallNode *call) {
+  if (!call) {
+    return kUnknownWaitDomain;
+  }
+  if (call->op.same_as(sunmmio_layout_transform()) ||
+      call->op.same_as(sunmmio_transpose())) {
+    // A4E layout transforms and full transposes are supported only by ODMA1.
+    return kODMA1WaitDomain;
+  }
+  if (call->op.same_as(mma_sunmmio())) {
+    return kTCWaitDomain;
+  }
+  if (call->op.same_as(broadcast_())) {
+    const auto *direction = call->args[kBroadcastArgDirection].as<IntImmNode>();
+    // A4E HLink/VLink submissions use the ODMA1/ODMA0 queues respectively.
+    // Group them with those queues so an older channel-wide wait is placed
+    // before a newer link submission, and vice versa.
+    //
+    // This is a conservative, symmetric submission-domain alias. NPU-IR
+    // resolves multicast token waits to distinct HLink/VLink wait targets, not
+    // ODMA0/ODMA1 targets. Consequently, moving an older link wait before a
+    // newer ODMA submission may reduce otherwise valid overlap. If the shared
+    // submission queue requires only a directional ordering constraint, it
+    // should be modeled separately from the resolved wait target rather than
+    // with this symmetric domain bit.
+    if (!direction) {
+      return kODMA0WaitDomain | kODMA1WaitDomain;
+    }
+    if (direction->value == 0) {
+      return kODMA1WaitDomain;
+    }
+    if (direction->value == 1) {
+      return kODMA0WaitDomain;
+    }
+    return kODMA0WaitDomain | kODMA1WaitDomain;
+  }
+  if (call->op.same_as(dma_copy())) {
+    BufferRegion src = NormalizeToBufferRegion(call->args[0]);
+    BufferRegion dst = NormalizeToBufferRegion(call->args[1]);
+    return GetODMAReadChannelMask(src->buffer) &
+           GetODMAWriteChannelMask(dst->buffer);
+  }
+  return kUnknownWaitDomain;
+}
+
+uint8_t GetDefiniteAsyncWaitDomain(const CallNode *call) {
+  uint8_t possible_domains = GetPossibleAsyncWaitDomains(call);
+  // Leave multi-engine paths to the later channel assignment pass. Moving a
+  // wait for them here could serialize work that ends up on distinct engines.
+  if (possible_domains != kUnknownWaitDomain &&
+      (possible_domains & (possible_domains - 1)) == 0) {
+    return possible_domains;
+  }
+  return kUnknownWaitDomain;
+}
+
+// Moves a token wait before the first later submission to the same physical
+// submission domain. Token waits become engine-wide waits after token
+// resolution, so leaving an older wait after a newer same-domain submission
+// would unnecessarily drain the newer operation as well.
+class EngineAwareWaitPlacementRewriter : public StmtMutator {
+public:
+  Stmt operator()(Stmt body) {
+    TokenWaitDomainCollector collector;
+    collector(body);
+    token_wait_domains_ = std::move(collector.token_wait_domains);
+    return this->VisitStmt(body);
+  }
+
+private:
+  struct SubmitSummary {
+    uint8_t possible_domains{kUnknownWaitDomain};
+  };
+
+  static std::optional<int> TryGetTokenId(const CallNode *call) {
+    if (!call || call->args.empty()) {
+      return std::nullopt;
+    }
+    if (const auto *imm = call->args[0].as<IntImmNode>()) {
+      return static_cast<int>(imm->value);
+    }
+    return std::nullopt;
+  }
+
+  static std::optional<int> TryGetGeneratedTokenId(const CallNode *call) {
+    if (!call) {
+      return std::nullopt;
+    }
+    for (const PrimExpr &arg : call->args) {
+      const auto *token_call = arg.as<CallNode>();
+      if (token_call && token_call->op.same_as(sync_token_id())) {
+        return TryGetTokenId(token_call);
+      }
+    }
+    return std::nullopt;
+  }
+
+  static bool IsAsyncSubmit(const CallNode *call) {
+    return call &&
+           (call->op.same_as(dma_copy()) ||
+            call->op.same_as(sunmmio_layout_transform()) ||
+            call->op.same_as(sunmmio_transpose()) ||
+            call->op.same_as(mma_sunmmio()) || call->op.same_as(broadcast_()));
+  }
+
+  static bool MatchWaitTokenStmt(const Stmt &stmt, int *token_id) {
+    const auto *eval = stmt.as<EvaluateNode>();
+    if (!eval) {
+      return false;
+    }
+    const auto *call = eval->value.as<CallNode>();
+    if (!call || !call->op.same_as(wait_token())) {
+      return false;
+    }
+    std::optional<int> id = TryGetTokenId(call);
+    if (!id) {
+      return false;
+    }
+    *token_id = *id;
+    return true;
+  }
+
+  static uint8_t GetUnconditionalSubmitDomains(const Stmt &stmt) {
+    // Only recurse through statements whose body executes whenever the
+    // wrapper executes. Unrecognized control flow remains a movement barrier.
+    if (const auto *eval = stmt.as<EvaluateNode>()) {
+      return GetDefiniteAsyncWaitDomain(eval->value.as<CallNode>());
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      uint8_t domains = kUnknownWaitDomain;
+      for (const Stmt &child : seq->seq) {
+        domains |= GetUnconditionalSubmitDomains(child);
+      }
+      return domains;
+    }
+    if (const auto *attr = stmt.as<AttrStmtNode>()) {
+      return GetUnconditionalSubmitDomains(attr->body);
+    }
+    if (const auto *let = stmt.as<LetStmtNode>()) {
+      return GetUnconditionalSubmitDomains(let->body);
+    }
+    if (const auto *decl = stmt.as<DeclBufferNode>()) {
+      return GetUnconditionalSubmitDomains(decl->body);
+    }
+    if (const auto *allocate = stmt.as<AllocateNode>()) {
+      return is_one(allocate->condition)
+                 ? GetUnconditionalSubmitDomains(allocate->body)
+                 : kUnknownWaitDomain;
+    }
+    if (const auto *allocate_const = stmt.as<AllocateConstNode>()) {
+      return GetUnconditionalSubmitDomains(allocate_const->body);
+    }
+    if (const auto *realize = stmt.as<BufferRealizeNode>()) {
+      return is_one(realize->condition)
+                 ? GetUnconditionalSubmitDomains(realize->body)
+                 : kUnknownWaitDomain;
+    }
+    if (const auto *realize = stmt.as<BlockRealizeNode>()) {
+      if (!is_one(realize->predicate)) {
+        return kUnknownWaitDomain;
+      }
+      // A reduction block's init is not executed on every realization.
+      return GetUnconditionalSubmitDomains(realize->block->body);
+    }
+    return kUnknownWaitDomain;
+  }
+
+  static void PushFlatten(Array<Stmt> *out, const Stmt &stmt) {
+    if (!stmt.defined()) {
+      return;
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const Stmt &child : seq->seq) {
+        PushFlatten(out, child);
+      }
+      return;
+    }
+    out->push_back(stmt);
+  }
+
+  class TokenWaitDomainCollector : public StmtExprVisitor {
+  public:
+    void VisitExpr_(const CallNode *op) final {
+      uint8_t domain = GetDefiniteAsyncWaitDomain(op);
+      if (domain != kUnknownWaitDomain) {
+        if (std::optional<int> token_id = TryGetGeneratedTokenId(op)) {
+          auto [it, inserted] = token_wait_domains.emplace(*token_id, domain);
+          if (!inserted && it->second != domain) {
+            it->second = kUnknownWaitDomain;
+          }
+        }
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+    std::map<int, uint8_t> token_wait_domains;
+  };
+
+  class GeneratedTokenCollector : public StmtExprVisitor {
+  public:
+    void VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(sync_token_id())) {
+        if (std::optional<int> token_id = TryGetTokenId(op)) {
+          tokens.insert(*token_id);
+        }
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+    std::set<int> tokens;
+  };
+
+  class SubmitSummaryCollector : public StmtExprVisitor {
+  public:
+    void VisitExpr_(const CallNode *op) final {
+      if (IsAsyncSubmit(op)) {
+        summary.possible_domains |= GetPossibleAsyncWaitDomains(op);
+      }
+      StmtExprVisitor::VisitExpr_(op);
+    }
+
+    SubmitSummary summary;
+  };
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    ++loop_depth_;
+    Stmt result = StmtMutator::VisitStmt_(op);
+    --loop_depth_;
+    return result;
+  }
+
+  Stmt VisitStmt_(const WhileNode *op) final {
+    ++loop_depth_;
+    Stmt result = StmtMutator::VisitStmt_(op);
+    --loop_depth_;
+    return result;
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Array<Stmt> stmts;
+    for (const Stmt &stmt : op->seq) {
+      PushFlatten(&stmts, VisitStmt(stmt));
+    }
+
+    int n = static_cast<int>(stmts.size());
+    std::vector<std::set<int>> generated_tokens(n);
+    std::vector<SubmitSummary> submit_summaries(n);
+    std::vector<uint8_t> unconditional_submit_domains(n, kUnknownWaitDomain);
+    for (int i = 0; i < n; ++i) {
+      GeneratedTokenCollector token_collector;
+      token_collector(stmts[i]);
+      generated_tokens[i] = std::move(token_collector.tokens);
+
+      SubmitSummaryCollector submit_collector;
+      submit_collector(stmts[i]);
+      submit_summaries[i] = submit_collector.summary;
+      unconditional_submit_domains[i] = GetUnconditionalSubmitDomains(stmts[i]);
+    }
+
+    std::vector<std::vector<Stmt>> waits_before(n);
+    std::vector<bool> remove_wait(n, false);
+    for (int wait_index = 0; wait_index < n; ++wait_index) {
+      int token_id = -1;
+      if (!MatchWaitTokenStmt(stmts[wait_index], &token_id)) {
+        continue;
+      }
+      auto domain_it = token_wait_domains_.find(token_id);
+      if (domain_it == token_wait_domains_.end() ||
+          domain_it->second == kUnknownWaitDomain) {
+        continue;
+      }
+
+      int lower_bound = 0;
+      int last_generator = -1;
+      for (int i = 0; i < wait_index; ++i) {
+        if (generated_tokens[i].count(token_id) != 0) {
+          last_generator = i;
+        }
+      }
+      if (last_generator >= 0) {
+        lower_bound = last_generator + 1;
+      } else {
+        // A wait before its static generation site is a loop-carried wait for
+        // the previous iteration. Outside a loop, do not infer such a lifetime.
+        bool generated_later = false;
+        for (int i = wait_index + 1; i < n; ++i) {
+          generated_later |= generated_tokens[i].count(token_id) != 0;
+        }
+        if (loop_depth_ == 0 || !generated_later) {
+          continue;
+        }
+      }
+
+      int anchor = -1;
+      uint8_t wait_domain = domain_it->second;
+      for (int i = lower_bound; i < wait_index; ++i) {
+        const SubmitSummary &summary = submit_summaries[i];
+        if ((summary.possible_domains & wait_domain) == 0) {
+          continue;
+        }
+        // Transparent wrappers may contain a valid anchor, but a submit hidden
+        // under conditional or repeated control flow still blocks movement.
+        if ((unconditional_submit_domains[i] & wait_domain) != 0) {
+          anchor = i;
+        }
+        break;
+      }
+      if (anchor >= 0) {
+        waits_before[anchor].push_back(stmts[wait_index]);
+        remove_wait[wait_index] = true;
+      }
+    }
+
+    Array<Stmt> out;
+    for (int i = 0; i < n; ++i) {
+      for (const Stmt &wait : waits_before[i]) {
+        out.push_back(wait);
+      }
+      if (!remove_wait[i]) {
+        out.push_back(stmts[i]);
+      }
+    }
+    return SeqStmt::Flatten(out);
+  }
+
+  int loop_depth_{0};
+  std::map<int, uint8_t> token_wait_domains_;
+};
+
+// A loop-carried wait refers to a token produced by the previous iteration.
+// ResolveTokens intentionally merges the preheader null token with the token
+// produced in the body, so the null token alone cannot make the first wait a
+// no-op after lowering. Guard such waits explicitly on there being a previous
+// iteration. Counted loops use their induction variable; while loops carry a
+// local boolean state. This runs after wait placement so the placement pass can
+// continue to reason about plain wait statements.
+//
+// Loop-exit waits are intentionally left unconditional. The current pipeline
+// assumes loops carrying asynchronous tokens have a non-zero runtime extent;
+// zero-trip support must also predicate waits that consume loop result tokens.
+class LoopCarriedWaitConditionRewriter : public StmtMutator {
+public:
+  Stmt operator()(Stmt body) { return this->VisitStmt(body); }
+
+private:
+  struct WaitRecord {
+    const EvaluateNode *stmt{nullptr};
+    int token_id{-1};
+    int order{-1};
+  };
+
+  static std::optional<int> TryGetTokenId(const CallNode *call) {
+    if (!call || call->args.empty()) {
+      return std::nullopt;
+    }
+    if (const auto *imm = call->args[0].as<IntImmNode>()) {
+      return static_cast<int>(imm->value);
+    }
+    return std::nullopt;
+  }
+
+  static std::optional<int> TryGetGeneratedTokenId(const CallNode *call) {
+    if (!call) {
+      return std::nullopt;
+    }
+    for (const PrimExpr &arg : call->args) {
+      const auto *token_call = arg.as<CallNode>();
+      if (token_call && token_call->op.same_as(sync_token_id())) {
+        return TryGetTokenId(token_call);
+      }
+    }
+    return std::nullopt;
+  }
+
+  class LoopEventCollector : public StmtVisitor {
+  public:
+    void VisitStmt_(const EvaluateNode *op) final {
+      int order = next_order_++;
+      const auto *call = op->value.as<CallNode>();
+      if (!call) {
+        return;
+      }
+      if (call->op.same_as(wait_token())) {
+        if (std::optional<int> token_id = TryGetTokenId(call)) {
+          waits.push_back(WaitRecord{op, *token_id, order});
+        }
+        return;
+      }
+      if (nested_loop_depth_ == 0) {
+        std::optional<int> token_id = TryGetGeneratedTokenId(call);
+        if (!token_id) {
+          return;
+        }
+        auto [it, inserted] = first_generation_order.emplace(*token_id, order);
+        if (!inserted) {
+          it->second = std::min(it->second, order);
+        }
+      }
+    }
+
+    // Waits may consume an outer-loop token from inside a nested loop, but a
+    // token generated by the nested loop belongs to that loop's condition.
+    void VisitStmt_(const ForNode *op) final {
+      ++nested_loop_depth_;
+      StmtVisitor::VisitStmt_(op);
+      --nested_loop_depth_;
+    }
+
+    void VisitStmt_(const WhileNode *op) final {
+      ++nested_loop_depth_;
+      StmtVisitor::VisitStmt_(op);
+      --nested_loop_depth_;
+    }
+
+    std::vector<WaitRecord> waits;
+    std::map<int, int> first_generation_order;
+
+  private:
+    int next_order_{0};
+    int nested_loop_depth_{0};
+  };
+
+  class WaitConditionalizer : public StmtMutator {
+  public:
+    WaitConditionalizer(PrimExpr condition,
+                        std::unordered_set<const EvaluateNode *> waits)
+        : condition_(std::move(condition)), waits_(std::move(waits)) {}
+
+    Stmt VisitStmt_(const EvaluateNode *op) final {
+      if (waits_.count(op) == 0) {
+        return ffi::GetRef<Stmt>(op);
+      }
+      return IfThenElse(condition_, ffi::GetRef<Stmt>(op));
+    }
+
+  private:
+    PrimExpr condition_;
+    std::unordered_set<const EvaluateNode *> waits_;
+  };
+
+  static std::unordered_set<const EvaluateNode *>
+  FindLoopCarriedWaits(const Stmt &body) {
+    LoopEventCollector collector;
+    collector(body);
+    std::unordered_set<const EvaluateNode *> loop_carried_waits;
+    for (const WaitRecord &wait : collector.waits) {
+      auto generation_it = collector.first_generation_order.find(wait.token_id);
+      if (generation_it != collector.first_generation_order.end() &&
+          wait.order < generation_it->second) {
+        loop_carried_waits.insert(wait.stmt);
+      }
+    }
+    return loop_carried_waits;
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    Stmt body = this->VisitStmt(op->body);
+    std::unordered_set<const EvaluateNode *> loop_carried_waits =
+        FindLoopCarriedWaits(body);
+
+    if (!loop_carried_waits.empty()) {
+      PrimExpr has_previous_iteration = GT(op->loop_var, op->min);
+      body = WaitConditionalizer(has_previous_iteration,
+                                 std::move(loop_carried_waits))(body);
+    }
+
+    return For(op->loop_var, op->min, op->extent, op->kind, body,
+               op->thread_binding, op->annotations, std::nullopt, op->span);
+  }
+
+  Stmt VisitStmt_(const WhileNode *op) final {
+    Stmt body = this->VisitStmt(op->body);
+    std::unordered_set<const EvaluateNode *> loop_carried_waits =
+        FindLoopCarriedWaits(body);
+    if (loop_carried_waits.empty()) {
+      return While(op->condition, body, op->span);
+    }
+
+    Buffer has_previous_iteration =
+        decl_buffer({Integer(1)}, DataType::Bool(),
+                    "sunmmio_has_previous_iteration", "local.var");
+    PrimExpr zero = Integer(0);
+    PrimExpr condition = BufferLoad(has_previous_iteration, {zero});
+    body = WaitConditionalizer(condition, std::move(loop_carried_waits))(body);
+    Array<Stmt> loop_body{
+        body, BufferStore(has_previous_iteration, const_true(), {zero})};
+    body = SeqStmt::Flatten(loop_body);
+
+    Stmt while_stmt = While(op->condition, body, op->span);
+    while_stmt = DeclBuffer(has_previous_iteration, while_stmt);
+    Map<String, ffi::Any> annotations;
+    annotations.Set(tl::attr::kLocalVarInit,
+                    make_const(DataType::Bool(), false));
+    return Allocate(has_previous_iteration->data, has_previous_iteration->dtype,
+                    has_previous_iteration->shape, const_true(), while_stmt,
+                    annotations);
+  }
 };
 
 // Rewriter to inject final synchronization waits before the device function
@@ -2845,6 +3383,14 @@ public:
 
     auto loop_missing_token_wait_rewriter = LoopMissingTokenWaitRewriter();
     f.CopyOnWrite()->body = loop_missing_token_wait_rewriter(f->body);
+
+    auto engine_aware_wait_placement_rewriter =
+        EngineAwareWaitPlacementRewriter();
+    f.CopyOnWrite()->body = engine_aware_wait_placement_rewriter(f->body);
+
+    auto loop_carried_wait_condition_rewriter =
+        LoopCarriedWaitConditionRewriter();
+    f.CopyOnWrite()->body = loop_carried_wait_condition_rewriter(f->body);
 
     auto device_func_wait_rewriter = DeviceFuncWaitRewriter();
     f.CopyOnWrite()->body = device_func_wait_rewriter(f->body);

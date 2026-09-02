@@ -532,7 +532,7 @@ T.MeshTensor(shape, placement, (nrows, ncols), dtype="float32", layout=None)
 - `dtype`：元素类型，例如 `"float16"`、`"bfloat16"`、`"float32"`。
 - `layout`：DRAM 中的全局数据布局。省略时，普通 dtype 的 rank 1 默认使用 1024-byte 对齐的 row-major，rank >= 2 默认使用 ZZ；MX dtype 的 rank >= 2 默认使用 MXZZ，rank 1 不受支持。用户通常不需要手动传入该参数。
 
-进入 kernel 后，`MeshTensor` 参数对应当前 core 可见的本地 shard。使用 `A.global_shape` 查询逻辑完整 shape，使用 `A.local_shape` 查询统一分配的本地 slot shape，使用 `A.get_local_extent(cid)` 查询指定 core 的有效 extent。
+进入 kernel 后，`MeshTensor` 参数对应当前 core 可见的本地 shard。使用 `A.global_shape` 查询逻辑完整 shape，使用 `A.local_shape` 查询统一分配的本地 slot shape，使用 `A.get_local_extent()` 查询当前 core 的有效 extent。
 
 **`make_row_major`**
 

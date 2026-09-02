@@ -810,6 +810,19 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   }
   body = root;
 
+  // Preserve the reduction-temporary roles structurally. LowerOpaqueBlock
+  // transfers this per-buffer map to the corresponding Allocate annotations.
+  Map<Var, Integer> reduce_temp_roles;
+  reduce_temp_roles.Set(acc->data, Integer(static_cast<int>(
+                                       ReduceRegisterTempRole::kAccumulator)));
+  if (dst_res.defined()) {
+    reduce_temp_roles.Set(
+        dst_res.value()->data,
+        Integer(static_cast<int>(ReduceRegisterTempRole::kResult)));
+  }
+  Map<String, ObjectRef> block_annotations;
+  block_annotations.Set(attr::kSunmmioReduceRegisterTemp, reduce_temp_roles);
+
   // Finally, wrap the body in a Block so the accumulator temporaries are
   // allocated with the reduction scope.
   Array<Buffer> alloc_buffers;
@@ -820,7 +833,7 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
 
   body = BlockRealize({}, Bool(true),
                       Block({}, {}, {}, "reduce_tile_op", body, std::nullopt,
-                            alloc_buffers, {}, {}));
+                            alloc_buffers, {}, block_annotations));
 
   return body;
 }

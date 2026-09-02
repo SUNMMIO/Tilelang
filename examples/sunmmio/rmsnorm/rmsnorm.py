@@ -15,7 +15,7 @@ def rmsnorm_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16, eps: flo
     # across the mesh columns, mirroring the softmax example.  The RMSNorm
     # reduction is over N, which lives on the column axis, so each core holds a
     # partial sum that is combined across the row with an all_gather.
-    placement = T.MeshShardingPolicy(y=0, x=1)
+    placement = T.placement.full_shard(0, 1)
 
     accum_dtype = T.float32
 
@@ -33,7 +33,7 @@ def rmsnorm_kernel(M, N, block_M, block_N, dtype: T.dtype = T.bfloat16, eps: flo
             tile_sumsq = T.alloc_shared((block_M,), accum_dtype)
             local_sumsq = T.alloc_shared((block_M,), accum_dtype)
 
-            sumsq_dist = T.alloc_shared((T.mesh_ncols(), block_M), accum_dtype)
+            sumsq_dist = T.alloc_shared((T.ncols(), block_M), accum_dtype)
             total_sumsq = T.alloc_shared((block_M,), accum_dtype)
             inv_rms = T.alloc_shared((block_M,), accum_dtype)
 

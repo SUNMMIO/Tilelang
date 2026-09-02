@@ -45,8 +45,8 @@ def hybrid_tail_predicate_mask_kernel(
     assert mix_pad % 32 == 0
     assert comb_pad % 32 == 0
 
-    token_policy = T.MeshShardingPolicy(cross_mesh_dim=0)
-    replicated_policy = T.MeshShardingPolicy()
+    token_policy = T.placement.mesh_as_line(0)
+    replicated_policy = T.placement.replicated()
 
     gemm_mul_shape = (num_tokens, mix_pad)
     sqrsum_shape = (num_tokens,)

@@ -29,7 +29,7 @@ def main(M, N) -> None:
 
     kernel = online_softmax_sudeck(M, N, block_M=256, block_N=256, dtype=T.bfloat16)
 
-    # Match the kernel's MeshTensor(placement=MeshShardingPolicy(y=0, x=1), layout=zz):
+    # Match the kernel's MeshTensor(placement=T.placement.full_shard(0, 1), layout=zz):
     # zz block layout + full 2D shard across the mesh.
     with sm.spec(layout=sm.layout.zz(0, 1), placement=sm.placement.full_shard(0, 1)):
         x_dev = x.to("sunmmio")

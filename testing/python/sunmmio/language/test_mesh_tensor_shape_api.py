@@ -78,7 +78,7 @@ def test_placement_rejects_dimensions_outside_tensor_rank(placement):
 def test_mesh_tensor_shape_api_in_kernel():
     tensor = T.MeshTensor(
         (513, 4097),
-        T.MeshShardingPolicy(y=0, x=1),
+        T.placement.full_shard(0, 1),
         (4, 4),
         "float16",
     )
@@ -95,10 +95,10 @@ def test_mesh_tensor_shape_api_in_kernel():
 
         @T.prim_func
         def kernel(A: tensor):
-            with T.Kernel(T.mesh_ncores()) as cid:
+            with T.Kernel(T.mesh_ncores()):
                 global_m, global_n = A.global_shape
                 local_m, local_n = A.local_shape
-                valid_m, valid_n = A.get_local_extent(cid)
+                valid_m, valid_n = A.get_local_extent()
                 core0_m, core0_n = A.get_local_extent(0)
                 core15_m, core15_n = A.get_local_extent(15)
 
@@ -121,7 +121,7 @@ def test_mesh_tensor_shape_api_in_kernel():
 def test_mesh_tensor_same_dim_row_then_col_extent():
     tensor = T.MeshTensor(
         (65, 9),
-        T.MeshShardingPolicy(y=0, x=0),
+        T.placement.full_shard(0, 0),
         (4, 4),
         "float16",
     )
@@ -137,10 +137,10 @@ def test_mesh_tensor_same_dim_row_then_col_extent():
 
         @T.prim_func
         def kernel(A: tensor):
-            with T.Kernel(T.mesh_ncores()) as cid:
+            with T.Kernel(T.mesh_ncores()):
                 global_m, global_n = A.global_shape
                 local_m, local_n = A.local_shape
-                valid_m, valid_n = A.get_local_extent(cid)
+                valid_m, valid_n = A.get_local_extent()
                 core0_m, core0_n = A.get_local_extent(0)
                 core1_m, core1_n = A.get_local_extent(1)
                 core15_m, core15_n = A.get_local_extent(15)

@@ -83,8 +83,8 @@ struct WindowPlannerRegionInfo {
 /*!
  * \brief Planner-local dependence edge with precomputed multiplicity data.
  *
- * Each edge carries the legality kind, the shared-prefix depth \c rho, and the
- * specific access/region ids needed to check coverage during scheduling.
+ * Each edge carries the legality kind, reuse depth, maximum ordering-safe
+ * shared depth, and the access/region ids needed during scheduling.
  */
 struct WindowPlannerEdgeInfo {
   int src_local_index{-1};
@@ -93,6 +93,7 @@ struct WindowPlannerEdgeInfo {
   int buffer_region_id{-1};
   std::string buffer_name;
   int rho{0};
+  int max_shared_execution_depth{0};
   int64_t weight{0};
   int64_t instance_count{1};
   int covered_use_index{-1};
@@ -164,12 +165,13 @@ struct ResidentValueState {
 };
 
 /*!
- * \brief One open shared shell frame plus the residents attached to it.
+ * \brief One open shared shell frame, its residents, and incomplete edges.
  */
 struct OpenScopeFrame {
   std::vector<std::string> shell_axes;
   Array<PrimExpr> shell_extents;
   std::vector<ResidentValueState> residents;
+  std::vector<int> pending_edge_indices;
 };
 
 /*! \brief Full memoized solver state for one partial schedule. */
