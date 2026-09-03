@@ -19,7 +19,7 @@ body:
     attributes:
       label: "Milestone"
       description: "Link or name of the milestone for this release"
-      placeholder: "https://github.com/tile-ai/tilelang/milestone/XX"
+      placeholder: "https://github.com/SUNMMIO/Tilelang/milestone/XX"
 
   - type: textarea
     id: scope
@@ -42,6 +42,9 @@ body:
         - [ ] API/Breaking changes
         - [ ] Benchmarks
         - [ ] Release notes
+        - [ ] Tag/VERSION/package version alignment
+        - [ ] Public artifacts verified outside the source tree
+        - [ ] NPU-IR distribution boundary reviewed
 
   - type: checkboxes
     id: readiness
@@ -52,6 +55,8 @@ body:
         - label: "Docs updated"
         - label: "CI green; artifacts verified"
         - label: "Release notes drafted"
+        - label: "Licenses and third-party notices reviewed"
+        - label: "Release remains draft until smoke tests pass"
 
   - type: textarea
     id: notes

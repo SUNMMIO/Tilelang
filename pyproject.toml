@@ -1,23 +1,27 @@
 [project]
 name = "tilelang-mesh"
-description = "An extension of Tilelang to support chips with distributed memory."
+description = "TileLang extensions for distributed-memory accelerators."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 authors = [{ name = "SUNMMIO Ltd." }, { name = "TileLang Contributors" }, { name = "Tile-AI" }]
 maintainers = [{ name = "SUNMMIO", email = "loujianguang@sunmmio.com" }]
-license = "MIT"
-keywords = ["NMC", "NUMA", "Tilelang", "Code Generation", "Mesh"]
+# TileLang-Mesh is MIT-licensed; the remaining terms cover bundled or vendored material.
+license = "MIT AND Apache-2.0 AND (Apache-2.0 WITH LLVM-exception) AND BSD-2-Clause AND BSD-3-Clause AND Zlib AND Unlicense"
+license-files = [
+    "LICENSE",
+    "THIRDPARTYNOTICES.txt",
+    "3rdparty/tvm/LICENSE",
+    "3rdparty/tvm/NOTICE",
+    "3rdparty/tvm/licenses/*.txt",
+    "3rdparty/cutlass/LICENSE.txt",
+    "3rdparty/composable_kernel/LICENSE",
+]
+keywords = ["NMC", "NUMA", "TileLang", "Code Generation", "Mesh"]
 classifiers = [
     "Development Status :: 4 - Beta",
-    "Environment :: ZPU",
-    "Environment :: GPU",
     "Operating System :: POSIX :: Linux",
-    "Operating System :: MacOS",
     "Programming Language :: C++",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
@@ -27,6 +31,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dynamic = ["version"]
+
 dependencies = [
     # Pin to the last known-good wheel. apache-tvm-ffi 0.1.10 enforces
     # __slots__ on Object subclasses, which is incompatible with the pinned
@@ -47,6 +52,13 @@ dependencies = [
     "typing-extensions>=4.10.0",
     "z3-solver>=4.13.0,<4.15.5",
 ]
+
+[project.urls]
+Homepage = "https://github.com/SUNMMIO/Tilelang"
+Repository = "https://github.com/SUNMMIO/Tilelang"
+Documentation = "https://github.com/SUNMMIO/Tilelang/tree/tilelang_mesh_main/docs"
+Issues = "https://github.com/SUNMMIO/Tilelang/issues"
+Changelog = "https://github.com/SUNMMIO/Tilelang/blob/tilelang_mesh_main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # mldtypes should be greater than 0.5.1
@@ -84,7 +96,7 @@ requires = [
 build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
-wheel.py-api = "cp39"
+wheel.py-api = "cp312"
 cmake.version = ">=3.26.1"
 build-dir = "build"
 
@@ -103,7 +115,11 @@ include = [
     "./VERSION",
     ".git_commit.txt",
     "./LICENSE",
+    "CHANGELOG.md",
     "THIRDPARTYNOTICES.txt",
+    "3rdparty/tvm/LICENSE",
+    "3rdparty/cutlass/LICENSE.txt",
+    "3rdparty/composable_kernel/LICENSE",
     "version_provider.py",
     "requirements*.txt",
     "tilelang/jit/adapter/cython/cython_wrapper.pyx",
@@ -164,6 +180,7 @@ skip = [
 ]
 
 [tool.ruff]
+# Keep the upstream syntax baseline; requires-python defines runtime support.
 target-version = "py39"
 line-length = 140
 output-format = "full"
@@ -230,12 +247,11 @@ verbosity_assertions = 3
 filterwarnings = ["always"]
 
 [tool.cibuildwheel]
-archs = ["auto64"]
-skip = "*musllinux*"
+archs = ["x86_64"]
+build = "cp312-manylinux_x86_64"
 build-frontend = "build"
-environment = { PYTHONDEVMODE = "1", PYTHONUNBUFFERED = "1" }
+environment = { PYTHONDEVMODE = "1", PYTHONUNBUFFERED = "1", CMAKE_ARGS = "-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON" }
 environment-pass = [
-    "CUDA_VERSION",
     "NO_VERSION_LABEL",
     "NO_TOOLCHAIN_VERSION",
     "NO_GIT_VERSION",
@@ -246,55 +262,17 @@ environment-pass = [
     "CLICOLOR_FORCE",
 ]
 before-build = "env -0 | sort -z | tr '\\0' '\\n'"
-windows.before-build = "set"
+before-test = "pip install --index-url https://download.pytorch.org/whl/cpu torch"
 test-command = [
-    "python -c 'import tilelang; print(tilelang.__version__)'",
+    "python -c 'from importlib.metadata import version; import tilelang; assert tilelang.__version__ == version(\"tilelang-mesh\")'",
+    "python -c 'from tilelang import tvm; assert tvm.ffi.get_global_func(\"target.build.tilelang_sunmmio_without_compile\", allow_missing=True) is not None'",
+    "python -c 'from tilelang.jit.adapter.sunmmio.libgen import find_npuir_tool; [find_npuir_tool(name) for name in (\"npuir-opt\", \"npuir-translate\", \"npuir-compile\")]'",
 ]
 
 [tool.cibuildwheel.linux]
 environment.PYTHONDEVMODE = "1"
 environment.PYTHONUNBUFFERED = "1"
-environment.PATH = "/usr/local/cuda/bin:$PATH"
-environment.LD_LIBRARY_PATH = "/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH"
+environment.CMAKE_ARGS = "-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON"
 manylinux-x86_64-image  = "manylinux_2_28"  # AlmaLinux 8
-manylinux-aarch64-image = "manylinux_2_34"  # Z3 requires
-# Install CUDA runtime and stub driver library
-# manylinux_2_28 uses gcc 14, which needs CUDA >=12.8
-before-all = """
-set -eux
-
-cat /etc/*-release
-uname -a
-
-case "$(uname -m)" in
-    "x86_64")
-        DEFAULT_CUDA_VERSION="12.8"
-        dnf config-manager --add-repo https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
-        ;;
-    "aarch64")
-        DEFAULT_CUDA_VERSION="12.8"
-        dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/sbsa/cuda-rhel8.repo
-        ;;
-    *)
-        exit 1
-        ;;
-esac
-
-cudaver="$(echo "${CUDA_VERSION:-$DEFAULT_CUDA_VERSION}" | cut -d '.' -f-2)"
-v="${cudaver//./-}"
-dnf install -y "cuda-minimal-build-${v}" "cuda-driver-devel-${v}" "cuda-nvrtc-devel-${v}"
-dnf clean all
-"""
 # Do not bundle libtvm_ffi.so and libz3.so because they are shipped by the dependency packages.
-repair-wheel-command = "auditwheel -v repair --exclude libtvm_ffi.so --exclude libz3.so --exclude libcuda.so.1 --exclude '/usr/local/cuda*' -w {dest_dir} {wheel}"
-
-[tool.cibuildwheel.macos]
-repair-wheel-command = "delocate-wheel --verbose --ignore-missing-dependencies --no-sanitize-rpaths --require-archs {delocate_archs} -w {dest_dir} -v {wheel}"
-
-[[tool.cibuildwheel.overrides]]
-select = "*linux*x86_64*"
-# x86_64 runners in GitHub Actions have limited storage,
-# pre-install torch without caching to reduce disk usage during install tilelang.
-before-test = [
-    "pip install torch --no-cache-dir",
-]
+repair-wheel-command = "auditwheel -v repair --exclude libtvm_ffi.so --exclude libz3.so -w {dest_dir} {wheel}"

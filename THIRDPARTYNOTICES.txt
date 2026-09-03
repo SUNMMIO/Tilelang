@@ -1,5 +1,74 @@
-BitBLAS uses third-party material as listed below. The attached notices are
-provided for informational purposes only.
+TileLang-Mesh uses third-party material as listed below. The attached notices
+and vendored license files are provided for attribution and license compliance.
+
+The components included in a particular source or binary distribution depend
+on the enabled backends. The public TileLang-Mesh release includes or derives
+from at least the following vendored projects:
+
+- Apache TVM (Apache-2.0): https://github.com/TileLang/tvm
+- NVIDIA CUTLASS (BSD-3-Clause, with separately licensed files as documented
+  by CUTLASS): https://github.com/NVIDIA/cutlass
+- AMD Composable Kernel (MIT): https://github.com/ROCm/composable_kernel
+- HiGHS (MIT): https://github.com/ERGO-Code/HiGHS
+- Microsoft BitBLAS (MIT): https://github.com/microsoft/BitBLAS
+- Marlin material from IST-DASLab (Apache-2.0)
+- FlashInfer material (Apache-2.0)
+
+SUNMMIO builds use SUNMMIO/NPU-IR (Apache-2.0 WITH LLVM-exception). Public
+TileLang-Mesh release wheels include binaries derived from NPU-IR but do not
+include its access-controlled source tree. The Apache-2.0 terms and LLVM
+Exception applicable to NPU-IR are reproduced below.
+
+The corresponding vendored license files are retained in their source trees
+and copied into release wheels where their source or headers are bundled.
+
+Notice for ERGO-Code/HiGHS
+-------------------------------
+MIT License
+
+Copyright (c) 2026 HiGHS
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Notice for microsoft/BitBLAS
+-------------------------------
+MIT License
+
+Copyright (c) Microsoft Corporation.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE
 
 Notice for apache/tvm
 -------------------------------
@@ -204,6 +273,25 @@ Notice for apache/tvm
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+
+LLVM Exceptions to the Apache 2.0 License
+------------------------------------------
+
+The following exception applies to SUNMMIO/NPU-IR.
+
+As an exception, if, as a result of your compiling your source code, portions
+of this Software are embedded into an Object form of such source code, you
+may redistribute such embedded portions in such Object form without complying
+with the conditions of Sections 4(a), 4(b) and 4(d) of the License.
+
+In addition, if you combine or link compiled forms of this Software with
+software that is licensed under the GPLv2 ("Combined Software") and if a
+court of competent jurisdiction determines that the patent provision (Section
+3), the indemnity provision (Section 9) or other Section of the License
+conflicts with the conditions of the GPLv2, you may retroactively and
+prospectively choose to deem waived or otherwise exclude such Section(s) of
+the License, but only in their entirety and only with respect to the Combined
+Software.
 
 ------------------------------------------------------------------------------------
 Notice for IST-DASLab/marlin/

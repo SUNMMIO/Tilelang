@@ -646,4 +646,4 @@ Tile 大小不用用户手动指定，编译器会根据 buffer layout 和它参
 - [SunMMIO TileLang 用户手册](sunmmio_tilelang_user_guide_zh_cn.md)
 - [安装文档](../get_started/Installation.md)
 - [TileLang 编程说明](../programming_guides/overview.md)
-- [SunMMIO TileLang kernel 示例](https://github.com/Sunmmio/Tilelang-mesh/tree/tilelang_mesh_main/examples)
+- [SunMMIO TileLang kernel 示例](https://github.com/SUNMMIO/Tilelang/tree/tilelang_mesh_main/examples)

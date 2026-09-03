@@ -9,11 +9,11 @@ body:
       label: Required prerequisites
       description: Make sure you've completed the following steps before submitting your issue -- thank you!
       options:
-        - label: I have read the documentation <https://tilelang.com>.
+        - label: I have read the TileLang-Mesh documentation in this repository.
           required: true
         - label: >-
-            I have searched the [Issue Tracker](https://github.com/tile-ai/tilelang/issues)
-            that this hasn't already been reported. (comment there if it has.)
+            I have searched the [Issue Tracker](https://github.com/SUNMMIO/Tilelang/issues)
+            and confirmed this has not already been answered.
           required: true
 
   - type: textarea

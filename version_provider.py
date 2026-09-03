@@ -12,7 +12,7 @@ ROOT = Path(__file__).parent
 base_version = (ROOT / "VERSION").read_text().strip()
 # When installing a sdist,
 # the installed version needs to match the sdist version,
-# so pip will complain when we install `tilelang-0.1.6.post2+gitxxxx.tar.gz`.
+# so pip will complain when we install `tilelang_mesh-0.1.0+gitxxxx.tar.gz`.
 # To workaround that, when building sdist,
 # we do not add version label and use a file to store the git hash instead.
 git_pin = ROOT / ".git_commit.txt"

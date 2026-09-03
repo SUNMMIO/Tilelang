@@ -1,110 +1,112 @@
-# Contributing
+# Contributing to TileLang-Mesh
 
-That would be awesome if you want to contribute something to TileLang!
+Bug reports, documentation improvements, tests, and code contributions are welcome. Use the
+[SUNMMIO/Tilelang issue tracker](https://github.com/SUNMMIO/Tilelang/issues) for questions and proposed
+changes.
 
-## Table of Contents  <!-- omit in toc --> <!-- markdownlint-disable heading-increment -->
+## Before Opening a Pull Request
 
-- [Report Bugs](#report-bugs)
-- [Ask Questions](#ask-questions)
-- [Submit Pull Requests](#submit-pull-requests)
-- [Setup Development Environment](#setup-development-environment)
-- [Install Develop Version](#install-develop-version)
-- [Lint Check](#lint-check)
-- [Test Locally](#test-locally)
-- [Build Wheels](#build-wheels)
-- [Documentation](#documentation)
+- Search existing issues and pull requests.
+- Keep changes focused and include tests for behavior changes.
+- Update user documentation when installation, APIs, targets, or behavior change.
+- Do not include credentials, private build logs, proprietary hardware details, or generated binaries.
 
-## Report Bugs
+## Clone the Repository
 
-If you run into any weird behavior while using TileLang, feel free to open a new issue in this repository! Please run a **search before opening** a new issue, to make sure that someone else hasn't already reported or solved the bug you've found.
-
-Any issue you open must include:
-
-- Code snippet that reproduces the bug with a minimal setup.
-- A clear explanation of what the issue is.
-
-## Ask Questions
-
-Please ask questions in issues.
-
-## Submit Pull Requests
-
-All pull requests are super welcomed and greatly appreciated! Issues in need of a solution are marked with a [`♥ help`](https://github.com/ianstormtaylor/TileLang/issues?q=is%3Aissue+is%3Aopen+label%3A%22%E2%99%A5+help%22) label if you're looking for somewhere to start.
-
-If you're new to contributing to TileLang, you can follow the following guidelines before submitting a pull request.
-
-> [!NOTE]
-> Please include tests and docs with every pull request if applicable!
-
-## Setup Development Environment
-
-Before contributing to TileLang, please follow the instructions below to setup.
-
-1. Fork TileLang ([fork](https://github.com/tile-ai/tilelang/fork)) on GitHub and clone the repository.
-
-    ```bash
-    git clone --recurse-submodules git@github.com:<your username>/tilelang.git  # use the SSH protocol
-    cd tilelang
-
-    git remote add upstream git@github.com:tile-ai/tilelang.git
-    ```
-
-2. Setup a development environment:
-
-    ```bash
-    uv venv --seed .venv  # use `python3 -m venv .venv` if you don't have `uv`
-
-    source .venv/bin/activate
-    python3 -m pip install --upgrade pip setuptools wheel "build[uv]"
-    uv pip install --requirements requirements-dev.txt
-    ```
-
-3. Setup the [`pre-commit`](https://pre-commit.com) hooks:
-
-    ```bash
-    pre-commit install --install-hooks
-    ```
-
-Then you are ready to rock. Thanks for contributing to TileLang!
-
-## Install Develop Version
-
-To install TileLang in an "editable" mode, run:
+Fork [SUNMMIO/Tilelang](https://github.com/SUNMMIO/Tilelang/fork), then clone your fork:
 
 ```bash
-python3 -m pip install --no-build-isolation --verbose --editable .
+git clone git@github.com:<your-user>/Tilelang.git
+cd Tilelang
+git remote add upstream https://github.com/SUNMMIO/Tilelang.git
 ```
 
-in the main directory. This installation is removable by:
+Contributors without NPU-IR access should initialize only public submodules:
 
 ```bash
-python3 -m pip uninstall tilelang
+git submodule update --init --recursive \
+  3rdparty/tvm 3rdparty/cutlass 3rdparty/composable_kernel
 ```
 
-We also recommend installing TileLang in a more manual way for better control over the build process, by compiling the C++ extensions first and set the `PYTHONPATH`. See [Working from Source via `PYTHONPATH`](https://tilelang.com/get_started/Installation.html#working-from-source-via-pythonpath) for detailed instructions.
-
-## Lint Check
-
-To check the linting, run:
+Authorized SUNMMIO contributors can initialize all submodules:
 
 ```bash
-pre-commit run --all-files
+git submodule update --init --recursive
 ```
 
-## Test Locally
-
-To run the tests, start by building the project as described in the [Setup Development Environment](#setup-development-environment) section.
-
-Then you can rerun the tests with:
+## Development Environment
 
 ```bash
-python3 -m pytest testing
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel "build[uv]"
+python -m pip install -r requirements-dev.txt
+pre-commit install --install-hooks
 ```
 
-## Build Wheels
+Install a public-backend editable build:
 
-_TBA_
+```bash
+CMAKE_ARGS="-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_SUNMMIO=OFF" \
+  python -m pip install --no-build-isolation --editable . -v
+```
 
-## Documentation
+Authorized SUNMMIO build:
 
-_TBA_
+```bash
+CMAKE_ARGS="-DUSE_SUNMMIO=ON" \
+  python -m pip install --no-build-isolation --editable . -v
+```
+
+The distribution is `tilelang-mesh` and the import package is `tilelang`. Do not install upstream
+`tilelang` in the same environment. Uninstall this project with:
+
+```bash
+python -m pip uninstall tilelang-mesh
+```
+
+## Checks
+
+Run formatting and static checks before submitting:
+
+```bash
+pre-commit run --all-files --show-diff-on-failure
+```
+
+Select tests appropriate to the changed backend. Public contributors can disable SUNMMIO; tests
+marked `sunmmio_closed_runtime` require access-controlled dependencies.
+
+```bash
+pytest testing/python/<relevant-test-file>.py
+```
+
+For C++ changes, configure and run the repo-local C++ tests when applicable:
+
+```bash
+cmake -S . -B build -G Ninja -DTILELANG_BUILD_CPP_TESTS=ON
+ninja -C build
+ctest --test-dir build --output-on-failure
+```
+
+Build documentation with warnings treated as errors:
+
+```bash
+python -m pip install -r docs/requirements.txt
+sphinx-build -W --keep-going -b html docs docs/_build/html
+```
+
+Packaging changes should build and validate a wheel, then install it from outside the source tree.
+Source-distribution validation remains deferred until the NPU-IR packaging boundary is resolved.
+
+## Pull Request Content
+
+Describe:
+
+- What changed and why
+- Supported and affected backends
+- Tests run and their results
+- API or behavior compatibility impact
+- Documentation updates
+- Any remaining limitation
+
+Release-facing changes should add an entry to [CHANGELOG.md](CHANGELOG.md).

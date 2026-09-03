@@ -1,3 +1,6 @@
+// Portions derived from SUNMMIO/NPU-IR's Layout.cpp.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
 /*!
  * \file layout/cute_layout_algebra.cc
  * \brief CuTe layout algebra implementation.
