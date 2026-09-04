@@ -110,6 +110,54 @@ def _make_nonzero_offset_aligned_store_stmt():
     )
 
 
+def _make_cross_carrier_rank1_func(dtype="bfloat16"):
+    elem_type = tvm.ir.PrimType(dtype)
+    one = tvm.tir.IntImm("bool", 1)
+
+    src_data = tvm.tir.Var("Src_shared_data", tvm.ir.PointerType(elem_type, "shared.rsram"))
+    dst_data = tvm.tir.Var("Dst_shared_data", tvm.ir.PointerType(elem_type, "shared.rsram"))
+    src = tvm.tir.decl_buffer((64,), dtype, name="Src_shared", data=src_data, scope="shared.rsram")
+    dst = tvm.tir.decl_buffer((64,), dtype, name="Dst_shared", data=dst_data, scope="shared.rsram")
+
+    segment = tvm.tir.Var("segment", "int32")
+    tile_i = tvm.tir.Var("tile_i", "int32")
+    lane = tvm.tir.Var("lane", "int32")
+    index = segment * 14 + tile_i * 14 + lane
+    store = tvm.tir.BufferStore(dst, tvm.tir.BufferLoad(src, [index]), [index])
+
+    interior = tvm.tir.For(
+        lane,
+        0,
+        14,
+        tvm.tir.ForKind.SERIAL,
+        store,
+        annotations={
+            "tile.interior": tvm.tir.IntImm("int32", 1),
+            "tile.interior_axis": tvm.tir.IntImm("int32", 0),
+        },
+    )
+    tile_scope = tvm.tir.For(
+        tile_i,
+        0,
+        1,
+        tvm.tir.ForKind.SERIAL,
+        interior,
+        annotations={
+            "tile.domain": [tvm.tir.IntImm("int32", 14)],
+            "tile.execution_axis": tvm.tir.IntImm("int32", 0),
+            "tile.execution_domain_axes": [tvm.tir.IntImm("int32", 0)],
+            "tile.scope_entry": tvm.tir.IntImm("int32", 1),
+            "tile.tile_size": [tvm.tir.IntImm("int32", 14)],
+        },
+    )
+    body = tvm.tir.For(segment, 0, 4, tvm.tir.ForKind.SERIAL, tile_scope)
+    body = tvm.tir.Allocate(dst_data, dtype, [64], one, body)
+    body = tvm.tir.Allocate(src_data, dtype, [64], one, body)
+    stmt = tvm.tir.DeclBuffer(src, tvm.tir.DeclBuffer(dst, body))
+    layout = make_aligned_row_major((64,), dtype, 64)
+    return tvm.tir.PrimFunc([], stmt).with_attr("layout_map", {src: layout, dst: layout})
+
+
 def _make_row_major_padded_2d_aligned_store_stmt():
     bf16 = tvm.ir.PrimType("bfloat16")
     one = tvm.tir.IntImm("bool", 1)
@@ -281,6 +329,35 @@ def test_sunmmio_codegen_aligned_1d_store_uses_nonzero_insert_slice_offset():
     assert "fake_partitioned_tile_view" not in src
     assert "fake_missing_memtensor" not in src
     assert _has_nonzero_1d_insert_slice_offset(src)
+
+
+@pytest.mark.parametrize(
+    "dtype,carrier,wide,mlir_dtype",
+    [
+        ("bfloat16", 32, 64, "bf16"),
+        ("float32", 16, 32, "f32"),
+    ],
+)
+def test_cross_carrier_rank1_load_uses_runtime_carrier_window(
+    dtype, carrier, wide, mlir_dtype, tmp_path
+):
+    src = _build_sunmmio_source_from_func(_make_cross_carrier_rank1_func(dtype=dtype))
+    validate_suvm_mlir_with_npuir_opt(
+        src,
+        tmp_path,
+        mlir_filename=f"rank1_cross_load_{dtype}.mlir",
+        opt_args=("--verify-each",),
+    )
+    assert f"!suvm.tile_view<{carrier}x{mlir_dtype}>" in src
+    assert f"!suvm.tile<{wide}x{mlir_dtype}>" in src
+    assert f"!suvm.tile_view<{wide}x{mlir_dtype}>" not in src
+    assert "scf.if" in src
+    assert any(
+        "suvm.tile.extract_slice" in line
+        and "[14]" in line
+        and f"!suvm.tile<{wide}x{mlir_dtype}>" in line
+        for line in src.splitlines()
+    )
 
 
 def test_sunmmio_codegen_row_major_padded_2d_aligned_store_uses_row_block_indices():
