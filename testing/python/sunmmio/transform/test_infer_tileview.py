@@ -461,6 +461,104 @@ def test_infer_rank1_tileview_from_2d_buffer_access_with_outer_loop_var():
     assert_scope_plan(mod, expected_tile_size=[32], expected_execution_domain_axes=[0])
 
 
+@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
+def test_infer_complete_rank1_nondivisor_domain(dtype):
+    """Original rank-1 scopes may keep a complete non-divisor domain tile."""
+    storage_width = 64
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            src = T.alloc_shared((storage_width,), dtype, scope="shared.rsram")
+            dst = T.alloc_shared((storage_width,), dtype, scope="shared.rsram")
+            layout = make_aligned_row_major((storage_width,), dtype, align_bytes=64)
+            T.annotate_layout({src: layout, dst: layout})
+
+            for segment in T.serial(4):
+                for j in T.Tiles([14], parallel=True):
+                    dst[segment * 14 + j] = src[segment * 14 + j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    assert_scope_plan(mod, expected_tile_size=[14], expected_execution_domain_axes=[0])
+
+
+def test_fp16_nondivisor_rank1_keeps_legacy_plan():
+    """FP16 remains outside the cross-carrier aligned-1D bridge."""
+    storage_width = 64
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            src = T.alloc_shared((storage_width,), "float16", scope="shared.rsram")
+            dst = T.alloc_shared((storage_width,), "float16", scope="shared.rsram")
+            layout = make_aligned_row_major((storage_width,), "float16", align_bytes=64)
+            T.annotate_layout({src: layout, dst: layout})
+
+            for segment in T.serial(4):
+                for j in T.Tiles([14], parallel=True):
+                    dst[segment * 14 + j] = src[segment * 14 + j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    assert_scope_plan(mod, expected_tile_size=[2], expected_execution_domain_axes=[0])
+
+
+def test_zz_nondivisor_rank1_keeps_legacy_plan():
+    """Hierarchical layouts do not receive the flat-layout relaxation."""
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            src = T.alloc_shared((32, 64), "bfloat16", scope="shared.rsram")
+            dst = T.alloc_shared((32, 64), "bfloat16", scope="shared.rsram")
+            layout = make_zz_layout((32, 64), [0, 1], (32, 32))
+            T.annotate_layout({src: layout, dst: layout})
+
+            for segment in T.serial(4):
+                for j in T.Tiles([14], parallel=True):
+                    dst[0, segment * 14 + j] = src[0, segment * 14 + j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    assert_scope_plan(mod, expected_tile_size=[2], expected_execution_domain_axes=[0])
+
+
+def test_rank2_domain_does_not_enable_nondivisor_side_bridge():
+    """Rank reduction from an original 2D scope keeps the legacy search space."""
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            matrix = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            side = T.alloc_shared((28,), "bfloat16", scope="shared.rsram")
+            T.annotate_layout(
+                {
+                    matrix: make_zz_layout((32, 32), [0, 1], (32, 32)),
+                    side: make_aligned_row_major((28,), "bfloat16", align_bytes=64),
+                }
+            )
+
+            for i, j in T.Tiles([4, 14], parallel=True):
+                matrix[i, j] = matrix[i, j] + side[j]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+
+    assert all(tile_size != [4, 14] for tile_size, _ in collect_scope_plans(mod["main"]))
+
+
 # ---------------------------------------------------------
 # Test 3: Mixed-rank (1D + 2D) in same T.Tiles
 # ---------------------------------------------------------
