@@ -1,5 +1,6 @@
 import os
 import re
+import warnings
 
 import pytest
 import tilelang
@@ -33,6 +34,7 @@ REDUCE_IN_TILE_CASES = [
 ]
 
 LOOSE_OPT_ARGS = ("--verify-each",)
+STRICT_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
 
 
 def validate_sunmmio_codegen_loose(kernel, tmp_path, *, mlir_filename, expected_tokens=()):
@@ -42,6 +44,16 @@ def validate_sunmmio_codegen_loose(kernel, tmp_path, *, mlir_filename, expected_
         mlir_filename=mlir_filename,
         expected_tokens=expected_tokens,
         opt_args=LOOSE_OPT_ARGS,
+    )
+
+
+def validate_sunmmio_codegen_strict(kernel, tmp_path, *, mlir_filename, expected_tokens=()):
+    return validate_sunmmio_codegen_with_npuir_opt(
+        kernel,
+        tmp_path,
+        mlir_filename=mlir_filename,
+        expected_tokens=expected_tokens,
+        opt_args=STRICT_OPT_ARGS,
     )
 
 
@@ -104,7 +116,7 @@ def reduce_kernel_builder(
 
 
 @target("Sunmmio")
-def reduce_keepdim_kernel_builder(shape=(32, 128), reduce_axis=1, dtype="float32", copy_output=False):
+def reduce_keepdim_kernel_builder(shape=(32, 128), reduce_axis=1, dtype="float32"):
     out_shape = list(shape)
     out_shape[reduce_axis] = 1
     out_shape = tuple(out_shape)
@@ -124,8 +136,6 @@ def reduce_keepdim_kernel_builder(shape=(32, 128), reduce_axis=1, dtype="float32
             else:
                 T.copy(A, A_shared)
             T.reduce_sum(A_shared, Out_shared, dim=reduce_axis)
-            if copy_output:
-                T.copy(Out_shared, Out)
 
     return main
 
@@ -202,7 +212,13 @@ def reduce_manual_tileview_kernel_builder(src_tile_size=None, dst_tile_size=None
 
 
 @target("Sunmmio")
-def reduce_row_major_covered_tail_kernel_builder(reduce_op, logical_extent=1000):
+def reduce_row_major_covered_tail_kernel_builder(
+    reduce_op,
+    logical_extent=1000,
+    tile_extent=1024,
+    initialize_with_fill=False,
+    clear=True,
+):
     shape = (logical_extent,)
     out_shape = (1,)
     dtype = "bfloat16"
@@ -218,14 +234,19 @@ def reduce_row_major_covered_tail_kernel_builder(reduce_op, logical_extent=1000)
             A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
             Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
             T.annotate_layout({A_shared: input_layout})
-            T.annotate_tileview({A_shared: make_tileview(A_shared, (1024,), (-1,))})
-            T.copy(A, A_shared)
-            if reduce_op == "sum":
-                T.reduce_sum(A_shared, Out_shared, dim=0)
-            elif reduce_op == "max":
-                T.reduce_max(A_shared, Out_shared, dim=0)
+            T.annotate_tileview({A_shared: make_tileview(A_shared, (tile_extent,), (-1,))})
+            if initialize_with_fill:
+                T.fill(A_shared, 1.0)
             else:
-                T.reduce_min(A_shared, Out_shared, dim=0)
+                T.copy(A, A_shared)
+            if not clear:
+                T.fill(Out_shared, 1.0)
+            if reduce_op == "sum":
+                T.reduce_sum(A_shared, Out_shared, dim=0, clear=clear)
+            elif reduce_op == "max":
+                T.reduce_max(A_shared, Out_shared, dim=0, clear=clear)
+            else:
+                T.reduce_min(A_shared, Out_shared, dim=0, clear=clear)
 
     return main
 
@@ -519,43 +540,43 @@ def test_reduce_bf16_source_uses_fp32_semantic_accumulator(tmp_path, reduce_axis
     )
 
 
-@pytest.mark.parametrize("reduce_axis", [0, 1])
-def test_reduce_keepdim_preserves_unit_destination_axis(tmp_path, reduce_axis):
-    src = validate_sunmmio_codegen_loose(
-        reduce_keepdim_kernel_builder(reduce_axis=reduce_axis),
+def test_reduce_keepdim_trailing_unit_axis_warns_before_lowering():
+    with pytest.warns(
+        UserWarning,
+        match="may cause layout issues and prevent the kernel from compiling",
+    ) as caught:
+        kernel = reduce_keepdim_kernel_builder(reduce_axis=1)
+
+    assert kernel is not None
+    assert caught[0].filename == __file__
+
+
+def test_reduce_keepdim_leading_unit_axis_does_not_warn():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        reduce_keepdim_kernel_builder(reduce_axis=0)
+
+    assert not any("trailing unit-dimension output" in str(item.message) for item in caught)
+
+
+def test_reduce_keepdim_leading_unit_destination_axis_lowers_strict(tmp_path):
+    src = validate_sunmmio_codegen_strict(
+        reduce_keepdim_kernel_builder(reduce_axis=0),
         tmp_path,
-        mlir_filename=f"reduce_keepdim_axis_{reduce_axis}_suvm.mlir",
+        mlir_filename="reduce_keepdim_axis_0_suvm.mlir",
         expected_tokens=("suvm.tile.reduce", "xf32>"),
     )
-    expected_out_shape = "1x128" if reduce_axis == 0 else "32x1"
-    assert f"!suvm.memtensor<{expected_out_shape}xf32" in src
-    expected_result_shape = r"1x\d+" if reduce_axis == 0 else r"\d+x1"
+    assert "!suvm.memtensor<1x128xf32" in src
     assert re.search(
-        rf"suvm\.tile\.reduce\s+sum, .*\{{axis = {reduce_axis} : i64\}}.*"
-        rf"-> !suvm\.tile<{expected_result_shape}xf32>",
+        r"suvm\.tile\.reduce\s+sum, .*\{axis = 0 : i64\}.*"
+        r"-> !suvm\.tile<1x\d+xf32>",
         src,
     )
-    surviving_axis = 1 - reduce_axis
     assert re.search(
-        rf"get_partitioned_tile_view .* tiled_dims = \[{surviving_axis}\].*"
-        rf"!suvm\.memtensor<{expected_out_shape}xf32",
+        r"get_partitioned_tile_view .* tiled_dims = \[1\].*"
+        r"!suvm\.memtensor<1x128xf32",
         src,
     )
-
-
-def test_reduce_keepdim_unit_axis_output_copy_unpads_covered_region(tmp_path):
-    src = validate_sunmmio_codegen_loose(
-        reduce_keepdim_kernel_builder(reduce_axis=1, copy_output=True),
-        tmp_path,
-        mlir_filename="reduce_keepdim_axis_1_output_copy_suvm.mlir",
-        expected_tokens=(
-            "suvm.tile.reduce",
-            "suvm.transform_layout_async",
-            "!suvm.tile_view<32x16xf32>",
-            "!suvm.tile_view<32x1xf32>",
-        ),
-    )
-    assert "suvm.transform_layout_async" in src
 
 
 def test_reduce_dynamic_k_is_preserved_in_raw_suvm(tmp_path):
@@ -616,10 +637,72 @@ def test_reduce_row_major_covered_tail_identity_precedes_raw_suvm_reduce(tmp_pat
         expected_tokens=("suvm.tile.select", f"suvm.tile.reduce  {reduce_op}"),
     )
     assert_source_contains(src, ("!suvm.tile<1024xbf16>", identity))
+    assert_source_contains(
+        src,
+        (
+            "!suvm.tile<1x1024xbf16>",
+            "!suvm.tile<1x1xbf16>",
+            "suvm.tile.pick",
+            "suvm.tile.set",
+        ),
+    )
     select_pos = src.index("suvm.tile.select")
     reduce_pos = src.index(f"suvm.tile.reduce  {reduce_op}")
     assert src.rfind(identity, 0, select_pos) >= 0
     assert select_pos < reduce_pos
+    assert re.search(rf"suvm\.tile\.reduce\s+{reduce_op}, .*\{{axis = 1 : i64\}}", src)
+
+
+@pytest.mark.parametrize("reduce_op", ["sum", "max", "min"])
+def test_reduce_rank1_lowers_via_rank2_carrier(tmp_path, reduce_op):
+    src = validate_sunmmio_codegen_strict(
+        reduce_row_major_covered_tail_kernel_builder(
+            reduce_op,
+            logical_extent=32,
+            tile_extent=32,
+            initialize_with_fill=True,
+        ),
+        tmp_path,
+        mlir_filename=f"reduce_rank1_{reduce_op}_strict.mlir",
+        expected_tokens=("suvm.tile.reduce",),
+    )
+    assert "!suvm.tile<1x32x" in src
+    assert "!suvm.tile<1x1x" in src
+    assert re.search(rf"suvm\.tile\.reduce\s+{reduce_op}, .*\{{axis = 1 : i64\}}", src)
+    assert "suvm.tile.pick" in src
+    assert "suvm.tile.set" in src
+
+
+@pytest.mark.parametrize(
+    "reduce_op,combine_op",
+    [
+        ("sum", "suvm.tile.addf"),
+        ("max", "suvm.tile.maxf"),
+        ("min", "suvm.tile.minf"),
+    ],
+)
+def test_reduce_rank1_clear_false_combines_and_stores_scalar(
+    tmp_path,
+    reduce_op,
+    combine_op,
+):
+    src = validate_sunmmio_codegen_strict(
+        reduce_row_major_covered_tail_kernel_builder(
+            reduce_op,
+            logical_extent=32,
+            tile_extent=32,
+            initialize_with_fill=True,
+            clear=False,
+        ),
+        tmp_path,
+        mlir_filename=f"reduce_rank1_{reduce_op}_clear_false_strict.mlir",
+        expected_tokens=("suvm.tile.reduce", combine_op),
+    )
+    assert "!suvm.tile<1x32x" in src
+    assert "!suvm.tile<1x1x" in src
+    assert re.search(rf"suvm\.tile\.reduce\s+{reduce_op}, .*\{{axis = 1 : i64\}}", src)
+    assert "suvm.tile.pick" in src
+    assert "suvm.tile.set" in src
 
 
 @pytest.mark.parametrize(
