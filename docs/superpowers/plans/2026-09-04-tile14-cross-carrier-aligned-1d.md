@@ -35,25 +35,27 @@
 
 - [ ] **Step 1: Add the BF16/FP32 planner test and scope guards**
 
-Add a parameterized kernel whose logical storage has 28 elements and whose aligned covered width is 32. The literal expected execution tile is 14:
+Add a parameterized kernel with 64-element aligned storage and four serial
+14-element segments. The literal expected execution tile is 14:
 
 ```python
 @pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
 def test_infer_complete_rank1_nondivisor_domain(dtype):
-    logical_width = 28
+    storage_width = 64
     tile_width = 14
 
     @T.prim_func
     def main():
         with T.Kernel(1, threads=128):
-            src = T.alloc_shared((logical_width,), dtype, scope="shared.rsram")
-            dst = T.alloc_shared((logical_width,), dtype, scope="shared.rsram")
+            src = T.alloc_shared((storage_width,), dtype, scope="shared.rsram")
+            dst = T.alloc_shared((storage_width,), dtype, scope="shared.rsram")
             layout = make_aligned_row_major(
-                (logical_width,), dtype, align_bytes=64
+                (storage_width,), dtype, align_bytes=64
             )
             T.annotate_layout({src: layout, dst: layout})
-            for j in T.Tiles([tile_width]):
-                dst[j] = src[j]
+            for segment in T.serial(4):
+                for j in T.Tiles([tile_width]):
+                    dst[segment * tile_width + j] = src[segment * tile_width + j]
 
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     mod = IRModule.from_expr(
@@ -69,19 +71,20 @@ Add three literal counterexamples in the same file:
 
 ```python
 def test_fp16_nondivisor_rank1_keeps_legacy_plan():
-    logical_width = 28
+    storage_width = 64
 
     @T.prim_func
     def main():
         with T.Kernel(1, threads=128):
-            src = T.alloc_shared((logical_width,), "float16", scope="shared.rsram")
-            dst = T.alloc_shared((logical_width,), "float16", scope="shared.rsram")
+            src = T.alloc_shared((storage_width,), "float16", scope="shared.rsram")
+            dst = T.alloc_shared((storage_width,), "float16", scope="shared.rsram")
             layout = make_aligned_row_major(
-                (logical_width,), "float16", align_bytes=64
+                (storage_width,), "float16", align_bytes=64
             )
             T.annotate_layout({src: layout, dst: layout})
-            for j in T.Tiles([14]):
-                dst[j] = src[j]
+            for segment in T.serial(4):
+                for j in T.Tiles([14]):
+                    dst[segment * 14 + j] = src[segment * 14 + j]
 
     mod = lower_for_sunmmio(main)
     assert_scope_plan(mod, [2], [0])
@@ -91,12 +94,13 @@ def test_zz_nondivisor_rank1_keeps_legacy_plan():
     @T.prim_func
     def main():
         with T.Kernel(1, threads=128):
-            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
-            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
-            layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+            src = T.alloc_shared((32, 64), "bfloat16", scope="shared.rsram")
+            dst = T.alloc_shared((32, 64), "bfloat16", scope="shared.rsram")
+            layout = make_zz_layout((32, 64), [0, 1], (32, 32))
             T.annotate_layout({src: layout, dst: layout})
-            for j in T.Tiles([14]):
-                dst[0, j] = src[0, j]
+            for segment in T.serial(4):
+                for j in T.Tiles([14]):
+                    dst[0, segment * 14 + j] = src[0, segment * 14 + j]
 
     mod = lower_for_sunmmio(main)
     assert_scope_plan(mod, [2], [0])
