@@ -2166,19 +2166,27 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     return builder_->TileFill(NewValueName(), zero, tile_type, value_dtype);
   };
 
-  auto load_aligned_1d_carrier = [&](const TileAccessInfo &access,
-                                     const Aligned1DAddressInfo &address,
-                                     TileBlockState *state) -> SunMMIOValue {
+  auto get_aligned_1d_view =
+      [&](const TileAccessInfo &access,
+          const Aligned1DAddressInfo &address) -> SunMMIOValue {
     const BufferBinding &binding = LookupBuffer(access.buffer);
     DataType value_dtype =
         CanonicalizeSuvmDType(access.buffer->dtype).with_lanes(1);
     SunMMIOValue memtensor{value_dtype, binding.handle, binding.buffer_type};
-    std::string cache_key = make_tile_cache_key(access, address);
     SunMMIOType aligned_view_type =
         MakeTileViewType(access.buffer->dtype, {access.aligned_load_elems});
-    SunMMIOValue aligned_view = builder_->GetPartitionedTileView(
+    return builder_->GetPartitionedTileView(
         NewValueName(), memtensor, address.partition_indices, access.tiled_dims,
         aligned_view_type, value_dtype);
+  };
+
+  auto load_aligned_1d_carrier = [&](const TileAccessInfo &access,
+                                     const Aligned1DAddressInfo &address,
+                                     TileBlockState *state) -> SunMMIOValue {
+    DataType value_dtype =
+        CanonicalizeSuvmDType(access.buffer->dtype).with_lanes(1);
+    std::string cache_key = make_tile_cache_key(access, address);
+    SunMMIOValue aligned_view = get_aligned_1d_view(access, address);
     SunMMIOType aligned_tile_type =
         MakeTileType(access.buffer->dtype, {access.aligned_load_elems});
     auto current_it = state->current_tile_values.find(cache_key);
@@ -2375,6 +2383,105 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     return builder_->BindValueAlias(
         make_current_value_name(access.buffer, cache_key), merged_tile);
   };
+
+  auto store_cross_carrier_aligned_1d_tile =
+      [&](const TileAccessInfo &access, const SunMMIOValue &value,
+          const std::optional<SunMMIOValue> &store_mask,
+          TileBlockState *state) {
+        ICHECK(access.requires_aligned_1d_load &&
+               access.may_cross_aligned_1d_carrier);
+        ICHECK_EQ(access.tiled_dims.size(), 1U)
+            << "Cross-carrier aligned 1D store expects one tiled dimension";
+
+        const BufferBinding &binding = LookupBuffer(access.buffer);
+        Aligned1DAddressInfo address =
+            compute_aligned_1d_address(access, binding.buffer_type);
+        SunMMIOValue first = load_aligned_1d_carrier(access, address, state);
+        DataType value_dtype =
+            CanonicalizeSuvmDType(access.buffer->dtype).with_lanes(1);
+        SunMMIOType logical_type =
+            MakeTileType(access.buffer->dtype, access.tile_shape);
+        SunMMIOType carrier_type =
+            MakeTileType(access.buffer->dtype, {access.aligned_load_elems});
+        SunMMIOType wide_type =
+            MakeTileType(access.buffer->dtype, {2 * access.aligned_load_elems});
+
+        SunMMIOValue source = value;
+        if (source.type.shape.size() != 1) {
+          source = reorient_unit_tile_to_shape(source, access.tile_shape);
+        }
+        ICHECK(StaticShapesEqual(source.type, logical_type))
+            << "Cross-carrier aligned 1D store source must be rank-1";
+
+        std::optional<SunMMIOValue> normalized_mask;
+        if (store_mask.has_value()) {
+          SunMMIOValue mask = store_mask.value();
+          if (IsTileLike(mask)) {
+            mask = reorient_unit_tile_to_shape(mask, access.tile_shape);
+            if (ExtractStaticShape(mask.type) != access.tile_shape) {
+              mask = broadcast_tile_to_shape(mask, access.tile_shape);
+            }
+            ICHECK(StaticShapesEqual(
+                mask.type, MakeTileType(DataType::Bool(), access.tile_shape)))
+                << "Cross-carrier aligned 1D store cannot normalize mask shape";
+          } else {
+            SunMMIOType bool_scalar_type{
+                SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
+            mask = EnsureType(mask, bool_scalar_type, DataType::Bool());
+            mask = builder_->TileFill(
+                NewValueName(), mask,
+                MakeTileType(DataType::Bool(), access.tile_shape),
+                DataType::Bool());
+          }
+          normalized_mask = mask;
+        }
+
+        auto merge_logical_slice = [&](const SunMMIOValue &old_tile,
+                                       const SunMMIOType &old_tile_type) {
+          SunMMIOValue logical_value = source;
+          if (normalized_mask.has_value()) {
+            SunMMIOValue old_slice = builder_->TileSlice(
+                NewValueName(), old_tile, {address.offset_elems}, logical_type,
+                value_dtype);
+            logical_value = builder_->TileSelect(
+                NewValueName(), normalized_mask.value(), source, old_slice,
+                logical_type, value_dtype);
+          }
+          return builder_->TileInsertSlice(
+              NewValueName(), old_tile, logical_value, {address.offset_elems},
+              old_tile_type, value_dtype);
+        };
+
+        SunMMIOValue tile_end = add_index(
+            address.offset_elems, make_index_const(access.tile_shape[0]));
+        SunMMIOValue cross = builder_->Compare(
+            NewValueName(), CompareOp::kGT, CompareDomain::kSignedInt, tile_end,
+            make_index_const(access.aligned_load_elems), tile_end.type);
+        builder_->BeginIf(cross, std::vector<int64_t>{});
+        Aligned1DAddressInfo next_address =
+            next_aligned_1d_address(access, address);
+        SunMMIOValue second =
+            load_aligned_1d_carrier(access, next_address, state);
+        SunMMIOValue wide = combine_aligned_1d_carriers(access, first, second);
+        SunMMIOValue updated_wide = merge_logical_slice(wide, wide_type);
+        SunMMIOValue updated_first = builder_->TileSlice(
+            NewValueName(), updated_wide, {make_index_const(0)}, carrier_type,
+            value_dtype);
+        SunMMIOValue updated_second =
+            builder_->TileSlice(NewValueName(), updated_wide,
+                                {make_index_const(access.aligned_load_elems)},
+                                carrier_type, value_dtype);
+        builder_->TileStore(updated_first, get_aligned_1d_view(access, address),
+                            std::nullopt);
+        builder_->TileStore(updated_second,
+                            get_aligned_1d_view(access, next_address),
+                            std::nullopt);
+        builder_->BeginElse();
+        SunMMIOValue updated_fast = merge_logical_slice(first, carrier_type);
+        builder_->TileStore(updated_fast, get_aligned_1d_view(access, address),
+                            std::nullopt);
+        builder_->EndIf();
+      };
 
   auto compute_aligned_2d_address = [&](const TileAccessInfo &access) {
     ICHECK(access.requires_aligned_2d_carrier);
@@ -4575,7 +4682,28 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       }
       std::optional<SunMMIOValue> updated_aligned_tile;
       erase_current_values_for_buffer(state, store->buffer.get());
-      if (access.requires_aligned_1d_load) {
+      if (access.may_cross_aligned_1d_carrier) {
+        ICHECK(!single_lane_zero_store)
+            << "Cross-carrier aligned 1D store does not support singleton "
+               "writeback";
+        ICHECK_EQ(scope.domain_shape.size(), 1U)
+            << "Cross-carrier aligned 1D stores require an original rank-1 "
+               "T.Tiles scope";
+        ICHECK_EQ(scope.execution_loops.size(), 1U);
+        ICHECK(scope.execution_domain_axes == std::vector<int>({0}));
+        std::optional<int64_t> domain_extent =
+            TryGetIntImm(scope.domain_shape[0]);
+        ICHECK(domain_extent.has_value() &&
+               domain_extent.value() == access.tile_shape[0])
+            << "Cross-carrier aligned 1D stores require one complete static "
+               "domain tile";
+        if (!mask.has_value() && canonical_tail_store) {
+          mask =
+              build_canonical_tail_mask(access, get_store_mask_index_dtype());
+        }
+        store_cross_carrier_aligned_1d_tile(access, rhs, mask, state);
+        erase_current_values_for_buffer(state, store->buffer.get());
+      } else if (access.requires_aligned_1d_load) {
         if (!mask.has_value() && canonical_tail_store) {
           mask =
               build_canonical_tail_mask(access, get_store_mask_index_dtype());
@@ -4593,7 +4721,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       if (access.promoted_unit_tile_view) {
         erase_current_values_for_buffer(state, store->buffer.get());
       } else if (updated_aligned_tile.has_value() &&
-                 access.requires_aligned_1d_load) {
+                 access.requires_aligned_1d_load &&
+                 !access.may_cross_aligned_1d_carrier) {
         Aligned1DAddressInfo aligned_address = compute_aligned_1d_address(
             access, LookupBuffer(access.buffer).buffer_type);
         std::string aligned_cache_key =

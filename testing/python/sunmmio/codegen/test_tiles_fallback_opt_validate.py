@@ -14,6 +14,7 @@ tilelang.env.disable_cache()
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 
 RAW_MLIR_OPT_ARGS = ("--verify-each",)
+STRICT_MLIR_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
 
 
 def _matrix_output_spec(h, w, dtype):
@@ -177,6 +178,24 @@ def exact_small_2d_fallback_baseline_kernel(dtype=T.float32):
 
 
 @target("Sunmmio")
+def cross_carrier_rank1_kernel(dtype=T.float32):
+    layout = make_aligned_row_major((64,), dtype, align_bytes=64)
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            src = T.alloc_shared((64,), dtype)
+            dst = T.alloc_shared((64,), dtype)
+            T.annotate_layout({src: layout, dst: layout})
+
+            for segment in T.serial(4):
+                for lane in T.Tiles([14], parallel=True):
+                    dst[segment * 14 + lane] = src[segment * 14 + lane]
+
+    return main
+
+
+@target("Sunmmio")
 def non_unit_coefficient_scalar_fallback_kernel(domain=4, shape=16, dtype=T.float32):
     layout = make_aligned_row_major((shape, shape), dtype, align_bytes=64)
 
@@ -312,6 +331,30 @@ def test_exact_small_2d_fallback_uses_register_carrier(tmp_path):
     assert "suvm.tile.pick" not in src
     assert "suvm.tile.set" not in src
     assert "suvm.tile.insert_slice" in src
+
+
+@pytest.mark.parametrize(
+    "dtype,carrier,wide,mlir_dtype",
+    [
+        (T.bfloat16, 32, 64, "bf16"),
+        (T.float32, 16, 32, "f32"),
+    ],
+)
+def test_cross_carrier_rank1_full_pipeline(dtype, carrier, wide, mlir_dtype, tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        cross_carrier_rank1_kernel(dtype),
+        tmp_path,
+        mlir_filename=f"rank1_cross_pipeline_{mlir_dtype}.mlir",
+        expected_tokens=(
+            f"!suvm.tile_view<{carrier}x{mlir_dtype}>",
+            f"!suvm.tile<{wide}x{mlir_dtype}>",
+            "scf.if",
+        ),
+        opt_args=STRICT_MLIR_OPT_ARGS,
+    )
+    assert f"!suvm.tile_view<{wide}x{mlir_dtype}>" not in src
+    assert src.count("scf.if") >= 2
+    assert src.count("suvm.tile.store") >= 3
 
 
 @pytest.mark.parametrize(

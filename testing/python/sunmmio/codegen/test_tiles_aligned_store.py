@@ -110,27 +110,42 @@ def _make_nonzero_offset_aligned_store_stmt():
     )
 
 
-def _make_cross_carrier_rank1_func(dtype="bfloat16"):
+def _make_cross_carrier_rank1_func(
+    dtype="bfloat16", explicit_predicate=False, read_after_store=False
+):
     elem_type = tvm.ir.PrimType(dtype)
     one = tvm.tir.IntImm("bool", 1)
 
     src_data = tvm.tir.Var("Src_shared_data", tvm.ir.PointerType(elem_type, "shared.rsram"))
     dst_data = tvm.tir.Var("Dst_shared_data", tvm.ir.PointerType(elem_type, "shared.rsram"))
+    out_data = tvm.tir.Var("Out_shared_data", tvm.ir.PointerType(elem_type, "shared.rsram"))
     src = tvm.tir.decl_buffer((64,), dtype, name="Src_shared", data=src_data, scope="shared.rsram")
     dst = tvm.tir.decl_buffer((64,), dtype, name="Dst_shared", data=dst_data, scope="shared.rsram")
+    out = tvm.tir.decl_buffer((64,), dtype, name="Out_shared", data=out_data, scope="shared.rsram")
 
     segment = tvm.tir.Var("segment", "int32")
     tile_i = tvm.tir.Var("tile_i", "int32")
     lane = tvm.tir.Var("lane", "int32")
     index = segment * 14 + tile_i * 14 + lane
-    store = tvm.tir.BufferStore(dst, tvm.tir.BufferLoad(src, [index]), [index])
+    predicate = lane < 13 if explicit_predicate else None
+    store = tvm.tir.BufferStore(
+        dst,
+        tvm.tir.BufferLoad(src, [index], predicate=predicate),
+        [index],
+        predicate=predicate,
+    )
+    interior_body = store
+    if read_after_store:
+        interior_body = tvm.tir.SeqStmt(
+            [store, tvm.tir.BufferStore(out, tvm.tir.BufferLoad(dst, [index]), [index])]
+        )
 
     interior = tvm.tir.For(
         lane,
         0,
         14,
         tvm.tir.ForKind.SERIAL,
-        store,
+        interior_body,
         annotations={
             "tile.interior": tvm.tir.IntImm("int32", 1),
             "tile.interior_axis": tvm.tir.IntImm("int32", 0),
@@ -151,11 +166,17 @@ def _make_cross_carrier_rank1_func(dtype="bfloat16"):
         },
     )
     body = tvm.tir.For(segment, 0, 4, tvm.tir.ForKind.SERIAL, tile_scope)
+    if read_after_store:
+        body = tvm.tir.Allocate(out_data, dtype, [64], one, body)
     body = tvm.tir.Allocate(dst_data, dtype, [64], one, body)
     body = tvm.tir.Allocate(src_data, dtype, [64], one, body)
-    stmt = tvm.tir.DeclBuffer(src, tvm.tir.DeclBuffer(dst, body))
     layout = make_aligned_row_major((64,), dtype, 64)
-    return tvm.tir.PrimFunc([], stmt).with_attr("layout_map", {src: layout, dst: layout})
+    layout_map = {src: layout, dst: layout}
+    if read_after_store:
+        body = tvm.tir.DeclBuffer(out, body)
+        layout_map[out] = layout
+    stmt = tvm.tir.DeclBuffer(src, tvm.tir.DeclBuffer(dst, body))
+    return tvm.tir.PrimFunc([], stmt).with_attr("layout_map", layout_map)
 
 
 def _make_row_major_padded_2d_aligned_store_stmt():
@@ -358,6 +379,87 @@ def test_cross_carrier_rank1_load_uses_runtime_carrier_window(
         and f"!suvm.tile<{wide}x{mlir_dtype}>" in line
         for line in src.splitlines()
     )
+
+
+@pytest.mark.parametrize(
+    "dtype,wide,mlir_dtype",
+    [
+        ("bfloat16", 64, "bf16"),
+        ("float32", 32, "f32"),
+    ],
+)
+def test_cross_carrier_rank1_store_uses_independent_runtime_branch(
+    dtype, wide, mlir_dtype, tmp_path
+):
+    src = _build_sunmmio_source_from_func(_make_cross_carrier_rank1_func(dtype=dtype))
+    validate_suvm_mlir_with_npuir_opt(
+        src,
+        tmp_path,
+        mlir_filename=f"rank1_cross_store_{dtype}.mlir",
+        opt_args=("--verify-each",),
+    )
+    assert src.count("scf.if") >= 2
+    assert "suvm.tile.insert_slice" in src
+    assert src.count("suvm.tile.store") >= 3
+    assert f"!suvm.tile_view<{wide}x{mlir_dtype}>" not in src
+
+
+@pytest.mark.parametrize(
+    "dtype,mlir_dtype",
+    [
+        ("bfloat16", "bf16"),
+        ("float32", "f32"),
+    ],
+)
+def test_cross_carrier_rank1_predicate_selects_logical_tile(
+    dtype, mlir_dtype, tmp_path
+):
+    src = _build_sunmmio_source_from_func(
+        _make_cross_carrier_rank1_func(dtype=dtype, explicit_predicate=True)
+    )
+    validate_suvm_mlir_with_npuir_opt(
+        src,
+        tmp_path,
+        mlir_filename=f"rank1_cross_predicate_{dtype}.mlir",
+        opt_args=("--verify-each",),
+    )
+    select_lines = [line for line in src.splitlines() if "suvm.tile.select" in line]
+    assert select_lines
+    assert all(f"!suvm.tile<14x{mlir_dtype}>" in line for line in select_lines)
+
+
+def test_cross_carrier_rank1_store_invalidates_destination_value_cache(tmp_path):
+    src = _build_sunmmio_source_from_func(
+        _make_cross_carrier_rank1_func(dtype="float32", read_after_store=True)
+    )
+    validate_suvm_mlir_with_npuir_opt(
+        src,
+        tmp_path,
+        mlir_filename="rank1_cross_store_then_load_float32.mlir",
+        opt_args=("--verify-each",),
+    )
+
+    destination_views = set()
+    saw_destination_store = False
+    saw_destination_reload = False
+    for line in src.splitlines():
+        stripped = line.strip()
+        if "suvm.get_partitioned_tile_view %1 " in stripped:
+            destination_views.add(stripped.split(" =", 1)[0])
+            continue
+        if "suvm.tile.store" in stripped and any(f", {view} " in stripped for view in destination_views):
+            saw_destination_store = True
+            continue
+        if (
+            saw_destination_store
+            and "suvm.tile.load" in stripped
+            and any(f" {view} " in stripped for view in destination_views)
+        ):
+            saw_destination_reload = True
+            break
+
+    assert saw_destination_store
+    assert saw_destination_reload
 
 
 def test_sunmmio_codegen_row_major_padded_2d_aligned_store_uses_row_block_indices():
