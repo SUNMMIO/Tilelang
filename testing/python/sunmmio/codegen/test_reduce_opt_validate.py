@@ -116,6 +116,33 @@ def reduce_kernel_builder(
 
 
 @target("Sunmmio")
+def mixed_dtype_reduce_pipeline_builder():
+    shape = (256, 128)
+    out_shape = (256,)
+    shard_policy = T.placement.replicated()
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(shape, shard_policy, "bfloat16", layout=_dram_input_layout(shape)),  # type: ignore
+        Out: T.MeshTensor(out_shape, shard_policy, "float32", layout=make_row_major(out_shape)),  # type: ignore
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared(shape, "bfloat16", scope="shared.rsram")
+            Max_shared = T.alloc_shared(out_shape, "bfloat16", scope="shared.rsram")
+            Exp_shared = T.alloc_shared(shape, "float32", scope="shared.rsram")
+            Sum_shared = T.alloc_shared(out_shape, "float32", scope="shared.rsram")
+
+            T.copy(A, A_shared)
+            T.reduce_max(A_shared, Max_shared, dim=1, clear=True)
+            for i, j in T.Tiles(shape):
+                Exp_shared[i, j] = T.Cast("float32", A_shared[i, j] - Max_shared[i])
+            T.reduce_sum(Exp_shared, Sum_shared, dim=1, clear=True)
+            T.copy(Sum_shared, Out)
+
+    return main
+
+
+@target("Sunmmio")
 def reduce_keepdim_kernel_builder(shape=(32, 128), reduce_axis=1, dtype="float32"):
     out_shape = list(shape)
     out_shape[reduce_axis] = 1
@@ -514,6 +541,16 @@ def test_reduce_layout_bounded_zz_block_reaches_raw_suvm(tmp_path):
         expected_tokens=("suvm.tile.reduce", "!suvm.tile<32x32xbf16>"),
     )
     assert_source_contains(src, ("suvm.tile.reduce", "!suvm.tile<32x32xbf16>"))
+
+
+def test_reduce_register_aliases_distinguish_same_named_mixed_dtype_temps(tmp_path):
+    src = validate_sunmmio_codegen_strict(
+        mixed_dtype_reduce_pipeline_builder(),
+        tmp_path,
+        mlir_filename="reduce_mixed_dtype_register_alias_suvm.mlir",
+        expected_tokens=("!suvm.tile<32x32xbf16>", "!suvm.tile<32x32xf32>"),
+    )
+    assert src.count("suvm.tile.reduce") == 2
 
 
 @pytest.mark.parametrize("reduce_axis", [0, 1])

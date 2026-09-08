@@ -1235,8 +1235,20 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     return std::make_pair(tile_type, single_non_unit_dim);
   };
 
+  std::unordered_map<const BufferNode *, std::string> register_value_names;
   auto make_register_value_name = [&](const Buffer &buffer) {
-    return "__tile_reg_" + buffer->name;
+    auto existing = register_value_names.find(buffer.get());
+    if (existing != register_value_names.end()) {
+      return existing->second;
+    }
+    // Reduction rewrites may create distinct temporary buffers with the same
+    // human-readable name, so the MLIR alias must also carry SSA identity.
+    std::string unique_id = NewValueName();
+    ICHECK(!unique_id.empty() && unique_id.front() == '%');
+    std::string value_name =
+        "__tile_reg_" + buffer->name + "_" + unique_id.substr(1);
+    register_value_names.emplace(buffer.get(), value_name);
+    return value_name;
   };
 
   auto make_register_tile_value = [&](const Buffer &buffer,
