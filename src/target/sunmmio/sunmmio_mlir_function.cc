@@ -74,12 +74,13 @@ void SunmmioMlirFunction::EmitReturn() {
       block->back().hasTrait<mlir::OpTrait::IsTerminator>()) {
     return;
   }
-  if (ctx_.pending_sync_units != static_cast<mlir::suvm::SyncUnits>(0)) {
-    mlir::suvm::SyncUnits units = ctx_.pending_sync_units;
+  if (ctx_.pending_sync_units != SunmmioMlirContext::kNoSyncUnits) {
+    SunmmioMlirContext::SyncUnitMask units_mask = ctx_.pending_sync_units;
+    mlir::suvm::SyncUnits units = SunmmioMlirContext::ToSyncUnits(units_mask);
     mlir::suvm::SyncOp::create(
         ctx_.builder, type_.MakeDebugLoc("function_exit_sync"),
         mlir::suvm::SyncUnitsAttr::get(&ctx_.mlir_ctx, units));
-    ctx_.CompletePendingSyncUnits(units);
+    ctx_.CompletePendingSyncUnits(units_mask);
   }
   mlir::func::ReturnOp::create(ctx_.builder, type_.Loc());
 }
@@ -149,7 +150,8 @@ void SunmmioMlirFunction::EndFor() {
 
   SunmmioMlirContext::ForFrame frame = std::move(ctx_.for_stack.back());
   ctx_.for_stack.pop_back();
-  mlir::suvm::SyncUnits body_pending_sync_units = ctx_.pending_sync_units;
+  SunmmioMlirContext::SyncUnitMask body_pending_sync_units =
+      ctx_.pending_sync_units;
   mlir::SmallVector<mlir::Value, 8> yielded;
   yielded.reserve(frame.iter_values.size());
   for (int i = 0, e = static_cast<int>(frame.iter_values.size()); i < e; ++i) {
@@ -274,7 +276,8 @@ void SunmmioMlirFunction::EndWhile() {
 
   SunmmioMlirContext::WhileFrame frame = std::move(ctx_.while_stack.back());
   ctx_.while_stack.pop_back();
-  mlir::suvm::SyncUnits body_pending_sync_units = ctx_.pending_sync_units;
+  SunmmioMlirContext::SyncUnitMask body_pending_sync_units =
+      ctx_.pending_sync_units;
   mlir::SmallVector<mlir::Value, 8> yielded;
   yielded.reserve(frame.iter_values.size());
   for (int i = 0, e = static_cast<int>(frame.iter_values.size()); i < e; ++i) {
@@ -378,9 +381,9 @@ void SunmmioMlirFunction::EndIf() {
 
   SunmmioMlirContext::IfFrame frame = std::move(ctx_.if_stack.back());
   ctx_.if_stack.pop_back();
-  mlir::suvm::SyncUnits then_pending_sync_units =
+  SunmmioMlirContext::SyncUnitMask then_pending_sync_units =
       frame.in_else ? frame.then_pending_sync_units : ctx_.pending_sync_units;
-  mlir::suvm::SyncUnits else_pending_sync_units =
+  SunmmioMlirContext::SyncUnitMask else_pending_sync_units =
       frame.in_else ? ctx_.pending_sync_units : frame.entry_pending_sync_units;
   mlir::SmallVector<mlir::Value, 8> then_yield;
   mlir::SmallVector<mlir::Value, 8> else_yield;

@@ -53,7 +53,7 @@ void VerifyA4EMulticastOp(OpType op, const char *callee) {
       << callee << " violates A4E multicast data-path constraints";
 }
 
-mlir::suvm::SyncUnits MapSyncUnits(int64_t mask) {
+SunmmioMlirContext::SyncUnitMask MapSyncUnits(int64_t mask) {
   constexpr tl::SunmmioSyncUnits kKnownUnits =
       tl::kSunmmioSyncOdma0 | tl::kSunmmioSyncOdma1 | tl::kSunmmioSyncTc |
       tl::kSunmmioSyncHlink | tl::kSunmmioSyncVlink | tl::kSunmmioSyncVector |
@@ -62,10 +62,10 @@ mlir::suvm::SyncUnits MapSyncUnits(int64_t mask) {
   ICHECK_EQ(static_cast<tl::SunmmioSyncUnits>(mask) & ~kKnownUnits, 0U)
       << "Sunmmio sync unit mask contains unsupported bits: " << mask;
 
-  mlir::suvm::SyncUnits units = static_cast<mlir::suvm::SyncUnits>(0);
+  SunmmioMlirContext::SyncUnitMask units = SunmmioMlirContext::kNoSyncUnits;
   auto add = [&](tl::SunmmioSyncUnits bit, mlir::suvm::SyncUnits unit) {
     if ((static_cast<tl::SunmmioSyncUnits>(mask) & bit) != 0) {
-      units = units | unit;
+      units |= SunmmioMlirContext::ToSyncUnitMask(unit);
     }
   };
   add(tl::kSunmmioSyncOdma0, mlir::suvm::SyncUnits::odma0);
@@ -478,13 +478,14 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.sunmmio_sync") {
     int64_t mask = get_int_attr(SunMMIOCallAttrKey::kSyncUnits).value_or(0);
-    mlir::suvm::SyncUnits units = MapSyncUnits(mask);
-    ICHECK(units != static_cast<mlir::suvm::SyncUnits>(0))
+    SunmmioMlirContext::SyncUnitMask units_mask = MapSyncUnits(mask);
+    ICHECK_NE(units_mask, SunmmioMlirContext::kNoSyncUnits)
         << "tl.sunmmio_sync requires at least one hardware unit";
+    mlir::suvm::SyncUnits units = SunmmioMlirContext::ToSyncUnits(units_mask);
     mlir::suvm::SyncOp::create(
         ctx_.builder, type.MakeDebugLoc("sunmmio_sync"),
         mlir::suvm::SyncUnitsAttr::get(&ctx_.mlir_ctx, units));
-    ctx_.CompletePendingSyncUnits(units);
+    ctx_.CompletePendingSyncUnits(units_mask);
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.dma_copy") {
     ICHECK_GE(operands.size(), 2)

@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,6 +30,9 @@ struct SunmmioMlirContext {
   SunmmioMlirContext();
 
   using TirLayoutMap = ffi::Map<tir::Buffer, tl::Layout>;
+  // Empty and combined states are masks, not named SyncUnits enumerators.
+  using SyncUnitMask = uint32_t;
+  static constexpr SyncUnitMask kNoSyncUnits = 0U;
 
   mlir::MLIRContext mlir_ctx;
   mlir::OpBuilder builder;
@@ -39,23 +43,30 @@ struct SunmmioMlirContext {
 
   std::unordered_map<std::string, mlir::Value> barrier_by_mask;
   std::unordered_map<int64_t, mlir::Value> static_barrier_by_mask;
-  mlir::suvm::SyncUnits pending_sync_units{
-      static_cast<mlir::suvm::SyncUnits>(0)};
+  SyncUnitMask pending_sync_units{kNoSyncUnits};
 
-  static mlir::suvm::SyncUnits MergeSyncUnits(mlir::suvm::SyncUnits lhs,
-                                              mlir::suvm::SyncUnits rhs) {
-    return static_cast<mlir::suvm::SyncUnits>(static_cast<uint32_t>(lhs) |
-                                              static_cast<uint32_t>(rhs));
+  static SyncUnitMask ToSyncUnitMask(mlir::suvm::SyncUnits units) {
+    return static_cast<SyncUnitMask>(units);
+  }
+
+  static mlir::suvm::SyncUnits ToSyncUnits(SyncUnitMask mask) {
+    std::optional<mlir::suvm::SyncUnits> units =
+        mlir::suvm::symbolizeSyncUnits(mask);
+    ICHECK(units) << "Invalid SUVM synchronization unit mask: " << mask;
+    return *units;
+  }
+
+  static SyncUnitMask MergeSyncUnits(SyncUnitMask lhs, SyncUnitMask rhs) {
+    return lhs | rhs;
   }
 
   void AddPendingSyncUnits(mlir::suvm::SyncUnits units) {
-    pending_sync_units = MergeSyncUnits(pending_sync_units, units);
+    pending_sync_units =
+        MergeSyncUnits(pending_sync_units, ToSyncUnitMask(units));
   }
 
-  void CompletePendingSyncUnits(mlir::suvm::SyncUnits units) {
-    pending_sync_units = static_cast<mlir::suvm::SyncUnits>(
-        static_cast<uint32_t>(pending_sync_units) &
-        ~static_cast<uint32_t>(units));
+  void CompletePendingSyncUnits(SyncUnitMask units) {
+    pending_sync_units &= ~units;
   }
 
   struct ForFrame {
@@ -64,8 +75,7 @@ struct SunmmioMlirContext {
     std::vector<std::string> live_out_value_names;
     std::vector<mlir::Value> iter_values;
     std::vector<mlir::Value> produced_values;
-    mlir::suvm::SyncUnits entry_pending_sync_units{
-        static_cast<mlir::suvm::SyncUnits>(0)};
+    SyncUnitMask entry_pending_sync_units{kNoSyncUnits};
   };
   std::vector<ForFrame> for_stack;
   std::vector<TirLayoutMap> layout_map_stack;
@@ -78,10 +88,8 @@ struct SunmmioMlirContext {
     std::vector<mlir::Value> before_values;
     std::vector<mlir::Value> iter_values;
     std::vector<mlir::Value> produced_values;
-    mlir::suvm::SyncUnits entry_pending_sync_units{
-        static_cast<mlir::suvm::SyncUnits>(0)};
-    mlir::suvm::SyncUnits condition_pending_sync_units{
-        static_cast<mlir::suvm::SyncUnits>(0)};
+    SyncUnitMask entry_pending_sync_units{kNoSyncUnits};
+    SyncUnitMask condition_pending_sync_units{kNoSyncUnits};
   };
   std::vector<WhileFrame> while_stack;
 
@@ -92,10 +100,8 @@ struct SunmmioMlirContext {
     std::vector<mlir::Value> base_values;
     std::vector<mlir::Value> produced_values;
     std::vector<mlir::Value> then_yield_values;
-    mlir::suvm::SyncUnits entry_pending_sync_units{
-        static_cast<mlir::suvm::SyncUnits>(0)};
-    mlir::suvm::SyncUnits then_pending_sync_units{
-        static_cast<mlir::suvm::SyncUnits>(0)};
+    SyncUnitMask entry_pending_sync_units{kNoSyncUnits};
+    SyncUnitMask then_pending_sync_units{kNoSyncUnits};
   };
   std::vector<IfFrame> if_stack;
 
@@ -118,7 +124,7 @@ struct SunmmioMlirContext {
     mlir_value_table_stack.clear();
     barrier_by_mask.clear();
     static_barrier_by_mask.clear();
-    pending_sync_units = static_cast<mlir::suvm::SyncUnits>(0);
+    pending_sync_units = kNoSyncUnits;
     for_stack.clear();
     if_stack.clear();
     while_stack.clear();
