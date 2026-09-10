@@ -13,8 +13,24 @@ namespace tl {
 
 TVM_DLL const Op &dist_signal_decl();
 TVM_DLL const Op &dist_signal();
+TVM_DLL const Op &dist_signal_group_decl();
+TVM_DLL const Op &dist_signal_group();
+TVM_DLL const Op &dist_signal_ref();
+TVM_DLL const Op &dist_signal_route();
+TVM_DLL const Op &dist_signal_group_route();
+TVM_DLL const Op &dist_barrier();
+TVM_DLL const Op &dist_signal_put();
+TVM_DLL const Op &dist_signal_put_();
+TVM_DLL const Op &dist_wait_barrier();
+TVM_DLL const Op &dist_wait_barrier_();
 TVM_DLL const Op &dist_put_();
 TVM_DLL const Op &dist_wait_signal_();
+TVM_DLL const Op &dist_completion();
+TVM_DLL const Op &dist_completion_has_pending();
+TVM_DLL const Op &dist_wait_any();
+TVM_DLL const Op &dist_wait_any_();
+TVM_DLL const Op &dist_wait_completion_all();
+TVM_DLL const Op &dist_completion_init_();
 TVM_DLL const Op &dist_wait_all();
 TVM_DLL const Op &dist_wait_send();
 TVM_DLL const Op &dist_expect();
