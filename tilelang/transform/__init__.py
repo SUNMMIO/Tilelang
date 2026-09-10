@@ -598,6 +598,11 @@ def HoistBlockAnnotationsToFuncAttrs():
     return _ffi_api.HoistBlockAnnotationsToFuncAttrs()  # type: ignore
 
 
+def LowerDistCollectives():
+    """Lower high-level Rank collectives to logical P2P operations."""
+    return _ffi_api.LowerDistCollectives()  # type: ignore
+
+
 def PlanDistSignals():
     """Infer, allocate, and validate Rank communication signal resources."""
     return _ffi_api.PlanDistSignals()  # type: ignore
