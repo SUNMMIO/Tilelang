@@ -529,6 +529,37 @@ def test_sunmmio_toolchain_resolves_device_ld(tmp_path):
     assert toolchain.resolve_device_ld("sunmmio-a4e") == device_ld
 
 
+def test_sunmmio_sudeck_linker_script_preserves_runner_owned_symbols(tmp_path):
+    device_ld = tmp_path / "sysroot" / "riscv64-unknown-elf" / "lib" / "sunmmio" / "sunmmio-a4e" / "device.ld"
+    device_ld.parent.mkdir(parents=True)
+    device_ld.write_text(
+        """\
+SECTIONS {
+  .dtcm.scratch (NOLOAD) : { _dtcm_scratch_start = .; } > DTCM_SCRATCH
+  .dtcm.tagtrace (NOLOAD) : { _dtcm_tagtrace_start = .; } > DTCM_TAGTRACE
+  .stack (NOLOAD) : { _stack = .; } > STACK
+}
+PROVIDE(__stack_start = _stack);
+PROVIDE(__stack_end = _stack_end);
+""",
+        encoding="utf-8",
+    )
+    toolchain = SunmmioToolchain(root=tmp_path, clangxx=tmp_path / "clang++")
+
+    output = sunmmio_libgen._write_sudeck_linker_script(toolchain, "sunmmio-a4e", tmp_path / "sudeck.ld")
+    text = output.read_text(encoding="utf-8")
+
+    assert ".dtcm.scratch" not in text
+    assert ".dtcm.tagtrace" not in text
+    assert ".stack (NOLOAD)" not in text
+    assert "PROVIDE(__stack_start = DTCM_STACK_START);" in text
+    assert "PROVIDE(__stack_end = DTCM_STACK_START + DTCM_STACK_SIZE);" in text
+    assert "PROVIDE(_dtcm_scratch_start = DTCM_SCRATCH_START);" in text
+    assert "PROVIDE(_dtcm_scratch_end = DTCM_SCRATCH_START + DTCM_SCRATCH_SIZE);" in text
+    assert "PROVIDE(_dtcm_tagtrace_start = DTCM_TAGTRACE_START);" in text
+    assert "PROVIDE(_dtcm_tagtrace_end = DTCM_TAGTRACE_START + DTCM_TAGTRACE_SIZE);" in text
+
+
 def test_sunmmio_npuir_compile_error_reports_build_dir(tmp_path, monkeypatch):
     target = determine_target("sunmmio", return_object=True)
     generator = SunmmioSunsimLibraryGenerator(target, "kernel")
