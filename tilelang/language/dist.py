@@ -8,7 +8,7 @@ from enum import Enum, IntEnum
 import threading
 from collections.abc import Iterator
 
-from tvm import tir
+from tvm import arith, tir
 from tvm.script.ir_builder import tir as tir_builder
 
 
@@ -133,26 +133,53 @@ class Signal:
 
     _requested_kind: SignalKind | None
     _logical_id: int
-    handle: tir.Var
+    handle: tir.PrimExpr
     _builder: object
+    _group_member: bool = False
 
 
 @dataclass(frozen=True)
 class SignalList:
-    """A compile-time-sized group of independent receiver signals."""
+    """A compile-time-sized group of homogeneous receiver signals."""
 
-    _signals: tuple[Signal, ...]
+    _requested_kind: SignalKind | None
+    _logical_id: int
+    _count: int
+    handle: tir.Var
+    _builder: object
 
     def __len__(self) -> int:
-        return len(self._signals)
+        return self._count
 
     def __iter__(self) -> Iterator[Signal]:
-        return iter(self._signals)
+        return (self[index] for index in range(self._count))
 
     def __getitem__(self, index: int) -> Signal:
         if isinstance(index, bool) or not isinstance(index, int):
             raise TypeError("T.dist.SignalList only supports compile-time integer indexing")
-        return self._signals[index]
+        if index < 0:
+            index += self._count
+        if not 0 <= index < self._count:
+            raise IndexError("T.dist.SignalList index out of range")
+        member = tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dist_signal_ref"),
+            self.handle,
+            tir.IntImm("int32", index),
+        )
+        return Signal(
+            self._requested_kind,
+            self._logical_id,
+            member,
+            self._builder,
+            _group_member=True,
+        )
+
+    def _as_group_handle(self) -> tir.Var:
+        builder = _current_dist_builder()
+        if self._builder is not builder:
+            raise ValueError("A T.dist SignalList cannot be used across different PrimFuncs")
+        return self.handle
 
 
 def _is_rank_id_annotation(value) -> bool:
@@ -217,12 +244,52 @@ def signal(*, kind: SignalKind | None = None) -> Signal:
     return Signal(kind, logical_id, signal_handle, builder)
 
 
-def signals(count: int, *, kind: SignalKind | None = None) -> SignalList:
-    """Declare a compile-time-sized group of independent receiver signals."""
+def _resolve_signal_count(count) -> int:
+    if isinstance(count, int) and not isinstance(count, bool):
+        return count
+    if isinstance(count, tir.PrimExpr):
+        from tilelang.language.comm import get_target_mesh_shape
+        from tilelang.language.mesh_symbols import _mesh_ncols_symbol, _mesh_nrows_symbol
 
-    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        mesh = get_target_mesh_shape()
+        resolved = tir.stmt_functor.substitute(
+            count,
+            {
+                _mesh_nrows_symbol(): tir.IntImm("int32", mesh["nrow"]),
+                _mesh_ncols_symbol(): tir.IntImm("int32", mesh["ncol"]),
+            },
+        )
+        resolved = arith.Analyzer().simplify(resolved)
+        if isinstance(resolved, tir.IntImm):
+            return int(resolved.value)
+    raise ValueError(f"count must be a positive compile-time int, got {count!r}")
+
+
+def signals(count: int | tir.PrimExpr, *, kind: SignalKind | None = None) -> SignalList:
+    """Declare a compile-time-sized homogeneous receiver-signal group."""
+
+    if kind is not None and not isinstance(kind, SignalKind):
+        raise TypeError(f"kind must be a T.dist.SignalKind, got {kind!r}")
+    count = _resolve_signal_count(count)
+    if count <= 0:
         raise ValueError(f"count must be a positive compile-time int, got {count!r}")
-    return SignalList(tuple(signal(kind=kind) for _ in range(count)))
+    from tilelang.language.kernel import KernelLaunchFrame
+
+    if KernelLaunchFrame.Current() is None:
+        raise RuntimeError("T.dist.signals must be called inside T.Kernel()")
+    builder = _current_dist_builder()
+    logical_id = builder.allocate_dist_signal_decl()
+    requested_kind = "auto" if kind is None else kind.value
+    group_call = tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.dist_signal_group_decl"),
+        tir.StringImm(requested_kind),
+        tir.IntImm("int32", logical_id),
+        tir.IntImm("int32", count),
+    )
+    group_frame = tir_builder.LetStmt(group_call)
+    builder.enter_frame(group_frame)
+    return SignalList(kind, logical_id, count, group_frame.var, builder)
 
 
 def _current_core_id() -> tir.PrimExpr:
@@ -347,13 +414,19 @@ def wait_signal(signal: Signal, *, dst):
     )
 
 
-def wait_all(signal_list: SignalList, *, dst):
-    """Wait until every signal in ``signal_list`` reaches its expectation."""
+def wait_all(signal_list, *, dst=None):
+    """Wait for a static signal list or drain an all-to-allv completion."""
+
+    if isinstance(signal_list, DistCompletion):
+        if dst is not None:
+            raise TypeError("T.dist.wait_all(completion) does not accept dst")
+        return _wait_completion_all(signal_list)
 
     if not isinstance(signal_list, SignalList):
-        raise TypeError(f"signal_list must be created by T.dist.signals, got {type(signal_list).__name__}")
-    for item in signal_list:
-        _check_signal(item)
+        raise TypeError(f"T.dist.wait_all expects a SignalList or DistCompletion, got {type(signal_list).__name__}")
+    if dst is None:
+        raise TypeError("T.dist.wait_all(signal_list) requires dst")
+    group_handle = signal_list._as_group_handle()
 
     from tilelang.language.comm import _prepare_comm_region_compact
 
@@ -362,7 +435,7 @@ def wait_all(signal_list: SignalList, *, dst):
         "handle",
         tir.op.Op.get("tl.dist_wait_all"),
         dst_region.region,
-        *(item.handle for item in signal_list),
+        group_handle,
     )
 
 
@@ -374,19 +447,42 @@ def wait():
     return tir.call_intrin("handle", tir.op.Op.get("tl.dist_wait_send"))
 
 
+from .dist_collective import (  # noqa: E402
+    CollectiveDomain,
+    DistCompletion,
+    _wait_completion_all,
+    all_gather,
+    all_reduce,
+    all_to_all,
+    all_to_allv,
+    barrier,
+    has_pending,
+    wait_any,
+)
+
+
 __all__ = [
     "RankId",
     "RankPlacementSpec",
     "Signal",
     "SignalList",
     "SignalKind",
+    "CollectiveDomain",
+    "DistCompletion",
+    "all_gather",
+    "all_reduce",
+    "all_to_all",
+    "all_to_allv",
+    "barrier",
     "placement",
     "put",
     "routed_put",
     "signal",
     "signals",
+    "has_pending",
     "wait",
     "wait_all",
+    "wait_any",
     "wait_signal",
     "world_size",
 ]

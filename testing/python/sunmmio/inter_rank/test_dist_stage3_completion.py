@@ -9,19 +9,40 @@ from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 
 
 @tilelang.jit(target="sunmmio")
-def signal_list_kernel_factory(world_size: int = 1):
+def signal_list_kernel_factory(signal_kind=None, world_size: int = 1):
     @T.prim_func
     def main(rank_id: T.dist.RankId):
         with T.Kernel():
             src0 = T.alloc_shared((32,), T.bfloat16)
             src1 = T.alloc_shared((32,), T.bfloat16)
             dst = T.alloc_shared((64,), T.bfloat16)
-            signal_list = T.dist.signals(2)
+            signal_list = T.dist.signals(2, kind=signal_kind)
             peer_rank = (rank_id + 1) % world_size
 
             T.dist.put(src0, dst[0:32], dst_rank=peer_rank, signal=signal_list[0])
             T.dist.put(src1, dst[32:64], dst_rank=peer_rank, signal=signal_list[1])
             T.dist.wait_all(signal_list, dst=dst)
+            T.dist.wait()
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
+def mixed_scope_signal_list_kernel_factory(world_size: int = 1):
+    placement = T.placement.replicated()
+
+    @T.prim_func
+    def main(
+        B: T.MeshTensor((32,), placement, T.bfloat16),  # type: ignore
+        rank_id: T.dist.RankId,
+    ):
+        with T.Kernel():
+            src = T.alloc_shared((32,), T.bfloat16)
+            dst = T.alloc_shared((32,), T.bfloat16)
+            signal_list = T.dist.signals(2)
+            peer_rank = (rank_id + 1) % world_size
+            T.dist.put(src, dst, dst_rank=peer_rank, signal=signal_list[0])
+            T.dist.put(src, B, dst_rank=peer_rank, signal=signal_list[1])
             T.dist.wait()
 
     return main
@@ -240,13 +261,13 @@ def invalid_route_kernel_factory(routes, world_size: int = 1):
 
 
 @tilelang.jit(target="sunmmio")
-def multiple_sender_one_signal_kernel_factory(world_size: int = 1):
+def multiple_sender_one_signal_kernel_factory(signal_kind=None, world_size: int = 1):
     @T.prim_func
     def main(rank_id: T.dist.RankId):
         with T.Kernel():
             src = T.alloc_shared((32,), T.bfloat16)
             dst = T.alloc_shared((32,), T.bfloat16)
-            signal = T.dist.signal()
+            signal = T.dist.signal(kind=signal_kind)
             T.dist.put(src, dst, dst_rank=0, signal=signal)
             T.dist.wait_signal(signal, dst=dst)
 
@@ -268,11 +289,17 @@ def _op_names(mod):
 
 def test_signals_and_wait_all_expand_to_independent_waits():
     func = signal_list_kernel_factory.get_tir(world_size=4)
-    assert _op_names(tvm.IRModule({"main": func})).count("tl.dist_wait_all") == 1
+    frontend_names = _op_names(tvm.IRModule({"main": func}))
+    assert frontend_names.count("tl.dist_signal_group_decl") == 1
+    assert "tl.dist_signal_decl" not in frontend_names
+    assert frontend_names.count("tl.dist_signal_ref") == 2
+    assert frontend_names.count("tl.dist_wait_all") == 1
 
     result = lower_to_device_tir(func, capture_passes=("tl.PlanDistSignals", "tl.LowerDistCommunication"))
     planned = result.pass_snapshot("tl.PlanDistSignals").mod["main"]
-    assert int(planned.attrs["tl.dist.signal_counts"]["sram_flagreg_inc"]) == 2
+    assert int(planned.attrs["tl.dist.signal_counts"]["sram_flagreg_inc"]) == 0
+    assert int(planned.attrs["tl.dist.signal_counts"]["sram_flagreg_value"]) == 2
+    assert 'T.dist_signal_group("sram_flagreg_value", 0, 2)' in planned.script()
 
     lowered_names = _op_names(result.pass_snapshot("tl.LowerDistCommunication").mod)
     assert "tl.dist_wait_all" not in lowered_names
@@ -289,6 +316,40 @@ def test_signal_list_rejects_dynamic_indexing():
                 with T.Kernel():
                     signal_list = T.dist.signals(2)
                     T.evaluate(signal_list[rank_id])
+
+            return main
+
+        invalid_kernel_factory.get_tir(world_size=4)
+
+
+def test_signal_list_explicit_inc_kind_is_planned_as_one_group():
+    func = signal_list_kernel_factory.get_tir(
+        signal_kind=T.dist.SignalKind.SRAM_FLAGREG_INC,
+        world_size=4,
+    )
+    result = lower_to_device_tir(func, capture_passes="tl.PlanDistSignals")
+    planned = result.pass_snapshot("tl.PlanDistSignals").mod["main"]
+
+    assert int(planned.attrs["tl.dist.signal_counts"]["sram_flagreg_inc"]) == 2
+    assert 'T.dist_signal_group("sram_flagreg_inc", 0, 2)' in planned.script()
+
+
+def test_signal_list_rejects_mixed_destination_scopes():
+    func = mixed_scope_signal_list_kernel_factory.get_tir(world_size=4)
+    with pytest.raises(tvm.error.InternalError, match="inconsistent destination scopes"):
+        lower_to_device_tir(func)
+
+
+def test_signal_list_rejects_out_of_range_static_index():
+    with pytest.raises(IndexError, match="index out of range"):
+
+        @tilelang.jit(target="sunmmio")
+        def invalid_kernel_factory(world_size: int = 1):
+            @T.prim_func
+            def main(rank_id: T.dist.RankId):
+                with T.Kernel():
+                    signal_list = T.dist.signals(2)
+                    T.evaluate(signal_list[2])
 
             return main
 
@@ -418,7 +479,22 @@ def test_explicit_route_rejects_invalid_endpoints_and_duplicates(routes, message
         lower_to_device_tir(func)
 
 
-def test_one_signal_rejects_multiple_physical_senders():
+def test_increment_signal_allows_multiple_physical_senders():
     func = multiple_sender_one_signal_kernel_factory.get_tir(world_size=4)
+    result = lower_to_device_tir(func, capture_passes="tl.InjectDistSync")
+    script = result.pass_snapshot("tl.InjectDistSync").mod.script()
+    assert "signal_expect" in script
+    assert "T.Select(rank_id == 0, 3, 0)" in script
+
+
+@pytest.mark.parametrize(
+    "signal_kind",
+    [T.dist.SignalKind.SRAM_FLAGREG_VALUE, T.dist.SignalKind.SRAM_MEMORY],
+)
+def test_value_and_memory_signals_reject_multiple_physical_senders(signal_kind):
+    func = multiple_sender_one_signal_kernel_factory.get_tir(
+        signal_kind=signal_kind,
+        world_size=4,
+    )
     with pytest.raises(tvm.error.InternalError, match="multiple physical senders"):
         lower_to_device_tir(func)

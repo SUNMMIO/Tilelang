@@ -79,6 +79,61 @@ PrimFunc SunmmioLayoutInferencePass::Run(PrimFunc f) {
 
 namespace {
 
+bool IsCompatibleLayoutForInference(const Layout &lhs, const Layout &rhs,
+                                    arith::Analyzer *analyzer) {
+  if (IsSameLayout(lhs, rhs, analyzer)) {
+    return true;
+  }
+
+  const auto *lhs_cute = lhs.as<CuteLayoutNode>();
+  const auto *rhs_cute = rhs.as<CuteLayoutNode>();
+  if (!lhs_cute || !rhs_cute) {
+    return false;
+  }
+
+  Array<PrimExpr> lhs_logical_shape = lhs_cute->GetLogicalShape();
+  Array<PrimExpr> rhs_logical_shape = rhs_cute->GetLogicalShape();
+  Array<PrimExpr> lhs_mode_shape = lhs_cute->GetModeShape();
+  Array<PrimExpr> rhs_mode_shape = rhs_cute->GetModeShape();
+  Array<PrimExpr> lhs_mode_stride = lhs_cute->GetModeStride();
+  Array<PrimExpr> rhs_mode_stride = rhs_cute->GetModeStride();
+  Array<Integer> lhs_dim_levels = lhs_cute->GetDimLevels();
+  Array<Integer> rhs_dim_levels = rhs_cute->GetDimLevels();
+
+  if (lhs_logical_shape.size() != rhs_logical_shape.size() ||
+      lhs_mode_shape.size() != rhs_mode_shape.size() ||
+      lhs_mode_stride.size() != rhs_mode_stride.size() ||
+      lhs_dim_levels.size() != rhs_dim_levels.size()) {
+    return false;
+  }
+  for (size_t index = 0; index < lhs_logical_shape.size(); ++index) {
+    if (!analyzer->CanProveEqual(lhs_logical_shape[index],
+                                 rhs_logical_shape[index])) {
+      return false;
+    }
+  }
+  for (size_t index = 0; index < lhs_dim_levels.size(); ++index) {
+    if (lhs_dim_levels[index].IntValue() != rhs_dim_levels[index].IntValue()) {
+      return false;
+    }
+  }
+  for (size_t index = 0; index < lhs_mode_shape.size(); ++index) {
+    if (!analyzer->CanProveEqual(lhs_mode_shape[index],
+                                 rhs_mode_shape[index])) {
+      return false;
+    }
+    PrimExpr one = make_const(lhs_mode_shape[index].dtype(), 1);
+    if (analyzer->CanProveEqual(lhs_mode_shape[index], one)) {
+      continue;
+    }
+    if (!analyzer->CanProveEqual(lhs_mode_stride[index],
+                                 rhs_mode_stride[index])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /*!
  * \brief IR visitor that collects TileOps, T.Tiles buffers,
  *        annotations, buffer aliases, and LetStmt bindings.
@@ -566,7 +621,7 @@ bool SunmmioLayoutInferencePass::TryAssign(const Buffer &buffer,
     auto &existing = it->second;
     if (existing.is_immutable) {
       // Same layout is fine — silently deduplicate.
-      if (IsSameLayout(existing.layout, layout, &analyzer_)) {
+      if (IsCompatibleLayoutForInference(existing.layout, layout, &analyzer_)) {
         return false;
       }
       // Different layout proposed for an immutable buffer.
@@ -589,7 +644,7 @@ bool SunmmioLayoutInferencePass::TryAssign(const Buffer &buffer,
       return true;
     }
     if (level == existing.level) {
-      if (IsSameLayout(existing.layout, layout, &analyzer_)) {
+      if (IsCompatibleLayoutForInference(existing.layout, layout, &analyzer_)) {
         return false; // same layout, no change
       }
       // Same level, different layout — irreconcilable conflict.

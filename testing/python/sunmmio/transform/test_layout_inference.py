@@ -721,6 +721,59 @@ def test_broadcast_accepts_global_src_for_layout_inference():
 
 
 # ---------------------------------------------------------------------------
+# Test: repeated comm propagation ignores stride differences on unit modes
+# ---------------------------------------------------------------------------
+
+
+def comm_put_singleton_stride_kernel():
+    """Two row transfers that previously derived equivalent singleton strides."""
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            src = T.alloc_shared((2, 4, 4, 8), T.bfloat16, scope="shared.rsram")
+            dst = T.alloc_shared((2, 4, 4, 8), T.bfloat16, scope="shared.rsram")
+            T.comm.put(src, dst, (1, 0), (0, 0))
+            T.comm.put(src, dst, (2, 0), (0, 0))
+
+    return tvm.IRModule({"main": main})
+
+
+def test_comm_put_accepts_equivalent_singleton_mode_strides():
+    target = determine_target("Sunmmio", return_object=True)
+    layouts = run_sunmmio_layout_inference(comm_put_singleton_stride_kernel(), target)
+
+    assert_layout(layouts, "src", "ZZ", block=(32, 32))
+    assert_layout(layouts, "dst", "ZZ", block=(32, 32))
+
+
+def comm_put_non_singleton_conflict_kernel():
+    """Two incompatible source layouts must still conflict on one destination."""
+
+    shape = (64, 64)
+    zz = make_zz_layout(shape, axes=[0, 1], block_shape=[32, 32])
+    zn = make_zn_layout(shape, axes=[0, 1], block_shape=[32, 32])
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            zz_src = T.alloc_shared(shape, T.float16, scope="shared.rsram")
+            zn_src = T.alloc_shared(shape, T.float16, scope="shared.rsram")
+            dst = T.alloc_shared(shape, T.float16, scope="shared.rsram")
+            T.annotate_layout({zz_src: zz, zn_src: zn})
+            T.comm.put(zz_src, dst, (0, 0), (1, 0))
+            T.comm.put(zn_src, dst, (2, 0), (1, 0))
+
+    return tvm.IRModule({"main": main})
+
+
+def test_comm_put_still_rejects_non_singleton_layout_conflict():
+    target = determine_target("Sunmmio", return_object=True)
+    with pytest.raises(tvm.error.InternalError, match='layout conflict on buffer "dst"'):
+        run_sunmmio_layout_inference(comm_put_non_singleton_conflict_kernel(), target)
+
+
+# ---------------------------------------------------------------------------
 # Test: Put propagates ZZ layout between src and dst
 # ---------------------------------------------------------------------------
 

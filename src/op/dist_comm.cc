@@ -32,9 +32,42 @@ using namespace tir;
 TIR_DEFINE_DIST_BUILTIN(dist_signal_decl, "tl.dist_signal_decl",
                         "dist_signal_decl", 2, kPure);
 TIR_DEFINE_DIST_BUILTIN(dist_signal, "tl.dist_signal", "dist_signal", 2, kPure);
+TIR_DEFINE_DIST_BUILTIN(dist_signal_group_decl, "tl.dist_signal_group_decl",
+                        "dist_signal_group_decl", 3, kPure);
+TIR_DEFINE_DIST_BUILTIN(dist_signal_group, "tl.dist_signal_group",
+                        "dist_signal_group", 3, kPure);
+TIR_DEFINE_DIST_BUILTIN(dist_signal_ref, "tl.dist_signal_ref",
+                        "dist_signal_ref", 2, kPure);
+TIR_DEFINE_DIST_BUILTIN(dist_signal_route, "tl.dist_signal_route",
+                        "dist_signal_route", 2, kPure);
+TIR_DEFINE_DIST_BUILTIN(dist_signal_group_route, "tl.dist_signal_group_route",
+                        "dist_signal_group_route", 4, kPure);
+TIR_DEFINE_DIST_BUILTIN(dist_barrier, "tl.dist_barrier", "dist_barrier", 2,
+                        kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_signal_put, "tl.dist_signal_put",
+                        "dist_signal_put", 3, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_signal_put_, "tl.dist_signal_put_",
+                        "dist_signal_put_", 4, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_wait_barrier, "tl.dist_wait_barrier",
+                        "dist_wait_barrier", 1, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_wait_barrier_, "tl.dist_wait_barrier_",
+                        "dist_wait_barrier_", 3, kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_put_, "tl.dist_put_", "dist_put_", 6, kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_wait_signal_, "tl.dist_wait_signal_",
                         "dist_wait_signal_", 4, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_completion, "tl.dist_completion",
+                        "dist_completion", 4, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_completion_has_pending,
+                        "tl.dist_completion_has_pending",
+                        "dist_completion_has_pending", 1, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_wait_any, "tl.dist_wait_any", "dist_wait_any", 1,
+                        kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_wait_any_, "tl.dist_wait_any_", "dist_wait_any_",
+                        7, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_wait_completion_all, "tl.dist_wait_completion_all",
+                        "dist_wait_completion_all", 1, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_completion_init_, "tl.dist_completion_init_",
+                        "dist_completion_init_", 7, kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_wait_all, "tl.dist_wait_all", "dist_wait_all", -1,
                         kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_wait_send, "tl.dist_wait_send", "dist_wait_send",
@@ -60,20 +93,49 @@ TIR_DEFINE_DIST_BUILTIN(dist_routed_put, "tl.dist_routed_put",
 namespace {
 
 LayoutMap InferMatchingLayouts(const LayoutInferArgs &T, const Buffer &src,
-                               const Buffer &dst, InferLevel level) {
+                               const Array<Range> &src_range, const Buffer &dst,
+                               const Array<Range> &dst_range,
+                               InferLevel level) {
   if (level >= InferLevel::kStrict) {
     return {};
   }
 
   LayoutMap result;
-  if (T.layout_map.count(src) && IsSunmmioSramScope(dst.scope())) {
+  bool src_has = T.layout_map.count(src);
+  bool dst_has = T.layout_map.count(dst);
+  auto get_layout_level = [&](const Buffer &buffer) {
+    if (T.layout_levels.count(buffer)) {
+      return static_cast<InferLevel>(T.layout_levels[buffer].IntValue());
+    }
+    return T.layout_map.count(buffer) ? InferLevel::kCommon : InferLevel::kFree;
+  };
+  InferLevel src_level = get_layout_level(src);
+  InferLevel dst_level = get_layout_level(dst);
+  auto region_is_full = [&](const Buffer &buffer, const Array<Range> &region) {
+    if (region.size() != buffer->shape.size()) {
+      return false;
+    }
+    for (size_t dim = 0; dim < region.size(); ++dim) {
+      if (!T.analyzer->CanProveEqual(region[dim]->min, 0) ||
+          !T.analyzer->CanProveEqual(region[dim]->extent, buffer->shape[dim])) {
+        return false;
+      }
+    }
+    return true;
+  };
+  bool src_region_is_full = region_is_full(src, src_range);
+  bool dst_region_is_full = region_is_full(dst, dst_range);
+
+  if (src_has && dst_region_is_full && IsSunmmioSramScope(dst.scope()) &&
+      src_level >= dst_level) {
     auto derived =
         DeriveLayoutLikeForDType(T.layout_map[src], dst->shape, dst->dtype);
     if (derived.defined()) {
       result.Set(dst, derived.value());
     }
   }
-  if (T.layout_map.count(dst) && IsSunmmioSramScope(src.scope())) {
+  if (dst_has && src_region_is_full && IsSunmmioSramScope(src.scope()) &&
+      dst_level >= src_level) {
     auto derived =
         DeriveLayoutLikeForDType(T.layout_map[dst], src->shape, src->dtype);
     if (derived.defined()) {
@@ -138,7 +200,7 @@ LayoutMap DistPutOpNode::InferLayout(const LayoutInferArgs &T,
   ValidateDistTransfer(src, dst, "T.dist.put");
   ICHECK(src->dtype == dst->dtype)
       << "T.dist.put source and destination dtypes must match";
-  return InferMatchingLayouts(T, src, dst, level);
+  return InferMatchingLayouts(T, src, src_range, dst, dst_range, level);
 }
 
 Stmt DistPutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
@@ -185,7 +247,7 @@ LayoutMap DistPeerPutOpNode::InferLayout(const LayoutInferArgs &T,
   ValidateDistTransfer(src, dst, "T.dist.peer_put");
   ICHECK(src->dtype == dst->dtype)
       << "T.dist.peer_put source and destination dtypes must match";
-  return InferMatchingLayouts(T, src, dst, level);
+  return InferMatchingLayouts(T, src, src_range, dst, dst_range, level);
 }
 
 Stmt DistPeerPutOpNode::Lower(const LowerArgs &T,
@@ -237,7 +299,8 @@ LayoutMap DistRoutedPeerPutOpNode::InferLayout(const LayoutInferArgs &T,
   for (size_t index = 0; index < src.size(); ++index) {
     ValidateDistTransfer(src[index], dst[index], "T.dist.routed_peer_put");
     ICHECK(src[index]->dtype == dst[index]->dtype);
-    LayoutMap inferred = InferMatchingLayouts(T, src[index], dst[index], level);
+    LayoutMap inferred = InferMatchingLayouts(
+        T, src[index], src_ranges[index], dst[index], dst_ranges[index], level);
     for (const auto &entry : inferred) {
       result.Set(entry.first, entry.second);
     }

@@ -127,8 +127,9 @@ Stmt MakeBroadcastLeaf(PrimExpr src_region, PrimExpr dst_region, int direction,
 /*!
  * \brief Sunmmio SRAM layout inference for symmetric comm ops.
  *
- * Propagates layout between src and dst via DeriveLayoutLike.
- * Always proposes — TryAssign handles priority and conflict detection.
+ * Propagates layout between src and dst via DeriveLayoutLike. Provenance
+ * prevents a lower-confidence default from flowing back into an established
+ * layout, and a partial target region cannot determine the whole target buffer.
  *
  * No validation here: the level-based priority system in TryAssign
  * determines whether proposals are accepted or rejected.  When a buffer
@@ -137,9 +138,26 @@ Stmt MakeBroadcastLeaf(PrimExpr src_region, PrimExpr dst_region, int direction,
  * are silently rejected — they arise from BFS noise (e.g., derived from
  * kFree defaults) and are not real constraints.
  */
+static bool RegionCoversWholeBuffer(const Buffer &buffer,
+                                    const Array<Range> &region,
+                                    arith::Analyzer *analyzer) {
+  if (region.size() != buffer->shape.size()) {
+    return false;
+  }
+  for (size_t dim = 0; dim < region.size(); ++dim) {
+    if (!analyzer->CanProveEqual(region[dim]->min, 0) ||
+        !analyzer->CanProveEqual(region[dim]->extent, buffer->shape[dim])) {
+      return false;
+    }
+  }
+  return true;
+}
+
 static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
                                         const Buffer &src, const Buffer &dst,
-                                        InferLevel level) {
+                                        InferLevel level,
+                                        bool src_region_is_full = true,
+                                        bool dst_region_is_full = true) {
   // Comm ops are propagation-only — no hard constraints at kStrict.
   if (level >= InferLevel::kStrict)
     return {};
@@ -147,6 +165,16 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
   LayoutMap result;
   bool src_has = T.layout_map.count(src);
   bool dst_has = T.layout_map.count(dst);
+  auto get_layout_level = [&](const Buffer &buffer) {
+    if (T.layout_levels.count(buffer)) {
+      return static_cast<InferLevel>(T.layout_levels[buffer].IntValue());
+    }
+    // Layout inference implementations without provenance predate kFree
+    // defaults. Treat their known layouts as established.
+    return T.layout_map.count(buffer) ? InferLevel::kCommon : InferLevel::kFree;
+  };
+  InferLevel src_level = get_layout_level(src);
+  InferLevel dst_level = get_layout_level(dst);
 
   // ZN/MXZNN WSRAM dst: its src is staged as ZZ/MXZNZ (the transfer does
   // ZZ->ZN or MXZNZ->MXZNN), so infer the matching source layout. dst is
@@ -167,14 +195,16 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
   }
 
   // Propagate: derive layout for each side from the other.
-  if (src_has && IsSunmmioSramScope(dst.scope())) {
+  if (src_has && dst_region_is_full && IsSunmmioSramScope(dst.scope()) &&
+      src_level >= dst_level) {
     auto derived =
         DeriveLayoutLikeForDType(T.layout_map[src], dst->shape, dst->dtype);
     if (derived.defined()) {
       result.Set(dst, derived.value());
     }
   }
-  if (dst_has && IsSunmmioSramScope(src.scope())) {
+  if (dst_has && src_region_is_full && IsSunmmioSramScope(src.scope()) &&
+      dst_level >= src_level) {
     auto derived =
         DeriveLayoutLikeForDType(T.layout_map[dst], src->shape, src->dtype);
     if (derived.defined()) {
@@ -367,7 +397,10 @@ TileOperator PutOpNode::Clone() const {
 LayoutMap PutOpNode::InferLayout(const LayoutInferArgs &T,
                                  InferLevel level) const {
   CheckSunmmioCommBuffers("T.comm.put", src, dst);
-  return SunmmioCommInferLayout(T, src, dst, level);
+  bool src_region_is_full = RegionCoversWholeBuffer(src, src_range, T.analyzer);
+  bool dst_region_is_full = RegionCoversWholeBuffer(dst, dst_range, T.analyzer);
+  return SunmmioCommInferLayout(T, src, dst, level, src_region_is_full,
+                                dst_region_is_full);
 }
 
 Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
