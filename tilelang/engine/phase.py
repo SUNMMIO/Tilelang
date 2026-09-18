@@ -191,6 +191,7 @@ def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.HoistNonRestrictParams()(mod)
     mod = tilelang.transform.HoistBlockAnnotationsToFuncAttrs()(mod)
+    mod = tilelang.transform.ResolveSunmmioUnit()(mod)
     return mod
 
 

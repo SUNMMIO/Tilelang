@@ -23,8 +23,8 @@ enum BroadcastArg : int {
   kBroadcastArgDirection = 2,     // 0 = horizontal/row, 1 = vertical/col
   kBroadcastArgMask = 3,          // i64 direction-local receiver bitmask
   kBroadcastArgSrcOffsetByte = 4, // source-pointer byte offset
-  kBroadcastArgCount = 5,         // fixed args before optional src_core/token
-  kBroadcastArgSrcCore = 5,       // optional; immediately before sync token
+  kBroadcastArgCount = 5,   // fixed args before optional src_core/metadata
+  kBroadcastArgSrcCore = 5, // optional; before odma_unit
 };
 
 using namespace tir;

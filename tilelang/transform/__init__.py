@@ -28,7 +28,12 @@ def ClusterPlanning():
 
 
 def InjectSunmmioSync():
-    """InjectSunmmioSync
+    """Inject SunMMIO unit synchronization and collective launch/completion barriers.
+
+    The pass tracks buffer-region dependencies for asynchronous hardware units,
+    emits tokenless unit-sync markers, and initializes reusable barriers for
+    multicast launches.
+
     Returns
     -------
     fpass : tvm.transform.Pass
@@ -90,6 +95,17 @@ def ResolveSunmmioMeshSymbols():
         The result pass
     """
     return _ffi_api.ResolveSunmmioMeshSymbols()  # type: ignore
+
+
+def ResolveSunmmioUnit():
+    """Attach the selected sending ODMA unit to Sunmmio transfer calls.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.ResolveSunmmioUnit()  # type: ignore
 
 
 def ValidateTileViewRegions():

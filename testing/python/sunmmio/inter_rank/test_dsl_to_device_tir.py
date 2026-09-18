@@ -64,12 +64,16 @@ def test_simple_broadcast_dsl_lowers_to_sunmmio_device_kernel_tir():
     assert inject_sync_snapshot.execution.phase == "OptimizeForTarget"
     inject_sync_op_names = _collect_call_op_names(inject_sync_snapshot.mod)
     assert "tl.barrier_arrive_and_wait" in inject_sync_op_names
-    assert "tl.sync_token_id" in inject_sync_op_names
+    assert "tl.sunmmio_sync" in inject_sync_op_names
+    assert "tl.sync_token_id" not in inject_sync_op_names
+    assert "tl.wait_token" not in inject_sync_op_names
 
     device_op_names = _collect_call_op_names(device_func)
     assert device_op_names.count("tl.broadcast_") == 1
     assert "tl.barrier_arrive_and_wait" in device_op_names
-    assert "tl.sync_token_id" in device_op_names
+    assert "tl.sunmmio_sync" in device_op_names
+    assert "tl.sync_token_id" not in device_op_names
+    assert "tl.wait_token" not in device_op_names
 
 
 if __name__ == "__main__":

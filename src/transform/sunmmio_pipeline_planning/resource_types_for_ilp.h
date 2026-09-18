@@ -7,6 +7,7 @@
 
 #include "../../op/utils.h"
 #include "../../target/sunmmio/hardware_types.h"
+#include "../../target/sunmmio_utils.h"
 
 #include <algorithm>
 #include <tvm/runtime/logging.h>
@@ -70,7 +71,8 @@ BuildIlpResources(const Stmt &stmt, DeviceType type,
     if (const auto *call = eval->value.as<CallNode>()) {
       if (call->op.same_as(Op::Get("tl.dma_copy")) ||
           call->op.same_as(Op::Get("tl.broadcast_")) ||
-          call->op.same_as(Op::Get("tl.sunmmio_layout_transform"))) {
+          call->op.same_as(Op::Get("tl.sunmmio_layout_transform")) ||
+          call->op.same_as(Op::Get("tl.sunmmio_transpose"))) {
         BufferRegion src_region = NormalizeToBufferRegion(call->args[0]);
         // broadcast_ argument layout is:
         //   args[0] = src region
@@ -80,38 +82,12 @@ BuildIlpResources(const Stmt &stmt, DeviceType type,
         // read the destination from args[1]. Using args[2] treats the integer
         // direction enum as a BufferRegion and crashes ILP planning.
         BufferRegion dst_region = NormalizeToBufferRegion(call->args[1]);
-        if (IsGlobalBuffer(src_region->buffer)) {
-          if (dst_region->buffer.scope() == "shared.asram") {
-            LOG(FATAL)
-                << "ILP graph does not model DRAM -> ASRAM dma path yet.";
-          }
-          if (dst_region->buffer.scope() == "shared.wsram") {
-            add_resource(static_cast<int>(IlpResourceType::kODMA0));
-            add_resource(static_cast<int>(IlpResourceType::kWsramIn));
-            return resources;
-          }
-          if (dst_region->buffer.scope() == "shared.rsram" ||
-              dst_region->buffer.scope() == "local") {
-            add_resource(static_cast<int>(IlpResourceType::kODMA0));
-            // add_resource(static_cast<int>(IlpResourceType::kRsram));
-            return resources;
-          }
-        }
-        if ((src_region->buffer.scope() == "shared.rsram" ||
-             src_region->buffer.scope() == "local") &&
-            dst_region->buffer.scope() == "shared.asram") {
-          add_resource(static_cast<int>(IlpResourceType::kODMA1));
-          add_resource(static_cast<int>(IlpResourceType::kAsramIn));
-          // add_resource(static_cast<int>(IlpResourceType::kRsram));
-          return resources;
-        }
-        add_resource(static_cast<int>(IlpResourceType::kODMA0));
-        if (src_region->buffer.scope() == "shared.rsram" ||
-            src_region->buffer.scope() == "local" ||
-            dst_region->buffer.scope() == "shared.rsram" ||
-            dst_region->buffer.scope() == "local") {
-          // add_resource(static_cast<int>(IlpResourceType::kRsram));
-        }
+        std::optional<SunmmioOdmaUnit> unit = GetSunmmioOdmaUnit(call);
+        ICHECK(unit.has_value())
+            << "Sunmmio pipeline planning requires resolved ODMA units";
+        add_resource(static_cast<int>(*unit == SunmmioOdmaUnit::kOdma0
+                                          ? IlpResourceType::kODMA0
+                                          : IlpResourceType::kODMA1));
         if (dst_region->buffer.scope() == "shared.wsram") {
           add_resource(static_cast<int>(IlpResourceType::kWsramIn));
         }

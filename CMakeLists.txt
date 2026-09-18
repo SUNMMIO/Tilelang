@@ -184,6 +184,14 @@ if(USE_SUNMMIO)
       CACHE PATH "Binary directory for the embedded NPU-IR build"
     )
 
+    if(NPUIR_USE_LLVM_INSTALL_DIR)
+      # Import MLIR in this scope so TileLang can use its headers and targets.
+      set(LLVM_DIR "${NPUIR_USE_LLVM_INSTALL_DIR}/lib/cmake/llvm")
+      set(MLIR_DIR "${NPUIR_USE_LLVM_INSTALL_DIR}/lib/cmake/mlir")
+      find_package(MLIR REQUIRED CONFIG PATHS "${MLIR_DIR}" NO_DEFAULT_PATH)
+    endif()
+
+    if(NOT NPUIR_USE_LLVM_INSTALL_DIR)
     # In-place fix for NPU-IR's LLVM/MLIR build issues
     # 1. Provide LLVM/MLIR tablegen binaries
     set(LLVM_TABLEGEN_EXE llvm-tblgen CACHE FILEPATH "Path to llvm-tblgen")
@@ -252,6 +260,7 @@ if(USE_SUNMMIO)
       "${LLVM_PROJECT_BUILD_DIR}/include"
       CACHE PATH "" FORCE
     )
+    endif()
 
     add_subdirectory(3rdparty/NPU-IR "${TILELANG_NPUIR_BINARY_DIR}" EXCLUDE_FROM_ALL)
     list(APPEND TILE_LANG_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/NPU-IR/include)
@@ -368,6 +377,7 @@ if(USE_SUNMMIO)
     src/target/sunmmio/sunmmio_mlir_tile_op.cc
     src/target/sunmmio/sunmmio_mlir_call.cc
     src/target/sunmmio/rt_mod_sunmmio.cc
+    src/target/sunmmio/resolve_sunmmio_unit.cc
   )
   list(APPEND TILE_LANG_SRCS ${TILE_LANG_SUNMMIO_SRCS})
 endif()
