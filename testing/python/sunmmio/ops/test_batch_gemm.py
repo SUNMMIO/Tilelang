@@ -26,10 +26,7 @@ def batch_gemm(
     w_batch=None,
 ):
     a_shape = (batch, 32, 32) if a_batched else (32, 32)
-    w_shape = (
-        (w_batch if w_batch is not None else batch, 32, 32)
-        if w_batched else (32, 32)
-    )
+    w_shape = (w_batch if w_batch is not None else batch, 32, 32) if w_batched else (32, 32)
     c_shape = (batch, 32, 32) if output_batched else (32, 32)
 
     @T.prim_func
@@ -107,20 +104,21 @@ def test_batch_gemm_operand_regions(a_batched, w_batched, output_batched):
         (True, False, True): "shared-w-b2",
         (True, True, False): "reduction-b2",
     }.get((a_batched, w_batched, output_batched))
-    mod = lower_batch_gemm(batch_gemm(
-        a_batched=a_batched,
-        w_batched=w_batched,
-        output_batched=output_batched,
-    ), ir_case=ir_case)
+    mod = lower_batch_gemm(
+        batch_gemm(
+            a_batched=a_batched,
+            w_batched=w_batched,
+            output_batched=output_batched,
+        ),
+        ir_case=ir_case,
+    )
     mmas = collect_calls(mod, "tl.mma_sunmmio")
     assert len(mmas) == 2  # BF16 A uses the two ASRAM stripes for M=32.
     for mma in mmas:
         expected_a = (2, 32, 32) if a_batched else (32, 32)
         expected_w = (2, 32, 32) if w_batched else (32, 32)
         expected_c = (2, 32, 32) if output_batched else (32, 32)
-        assert [region_shape(region) for region in mma.args[:3]] == [
-            expected_a, expected_w, expected_c
-        ]
+        assert [region_shape(region) for region in mma.args[:3]] == [expected_a, expected_w, expected_c]
         if not output_batched:
             assert not bool(mma.args[5])  # Clear once, then accumulate across batches.
 
@@ -130,9 +128,7 @@ def test_batch_one_keeps_rank_three():
     mmas = collect_calls(mod, "tl.mma_sunmmio")
     assert len(mmas) == 2
     for mma in mmas:
-        assert [region_shape(region) for region in mma.args[:3]] == [
-            (1, 32, 32), (1, 32, 32), (1, 32, 32)
-        ]
+        assert [region_shape(region) for region in mma.args[:3]] == [(1, 32, 32), (1, 32, 32), (1, 32, 32)]
 
 
 def test_partial_batch_uses_compact_regions():
@@ -153,14 +149,7 @@ def test_batch_gemm_rejects_mismatched_input_batches(output_batched):
 
 def test_weight_copy_expands_but_mma_stays_batched():
     mod = lower_batch_gemm(batch_gemm())
-    weight_copies = [
-        call
-        for call in collect_calls(mod, "tl.dma_copy")
-        if call.args[0].args[0].buffer.name == "W"
-    ]
+    weight_copies = [call for call in collect_calls(mod, "tl.dma_copy") if call.args[0].args[0].buffer.name == "W"]
     assert len(weight_copies) == 2
     assert all(region_shape(call.args[0]) == (1, 32, 32) for call in weight_copies)
-    assert all(
-        region_shape(mma.args[1]) == (2, 32, 32)
-        for mma in collect_calls(mod, "tl.mma_sunmmio")
-    )
+    assert all(region_shape(mma.args[1]) == (2, 32, 32) for mma in collect_calls(mod, "tl.mma_sunmmio"))

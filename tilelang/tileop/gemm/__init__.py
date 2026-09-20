@@ -140,18 +140,10 @@ class GemmPy(Node, Scriptable):
                 batch = region.region[0]
                 extent = batch.extent
                 if not isinstance(extent, tir.IntImm) or int(extent) <= 0:
-                    raise ValueError(
-                        f"Sunmmio Batch GEMM requires {operand} batch extent "
-                        f"to be a positive static IntImm, got {extent}"
-                    )
+                    raise ValueError(f"Sunmmio Batch GEMM requires {operand} batch extent to be a positive static IntImm, got {extent}")
                 if not isinstance(batch.min, tir.IntImm) or int(batch.min) < 0:
-                    raise ValueError(
-                        f"Sunmmio Batch GEMM requires {operand} batch min "
-                        f"to be a non-negative static IntImm, got {batch.min}"
-                    )
-                if not analyzer.can_prove(
-                    batch.min + extent <= region.buffer.shape[0]
-                ):
+                    raise ValueError(f"Sunmmio Batch GEMM requires {operand} batch min to be a non-negative static IntImm, got {batch.min}")
+                if not analyzer.can_prove(batch.min + extent <= region.buffer.shape[0]):
                     raise ValueError(
                         f"Sunmmio Batch GEMM requires {operand} batch region "
                         "to stay within buffer axis 0, "
@@ -171,9 +163,7 @@ class GemmPy(Node, Scriptable):
             or has_batch_semantics(self.bRegion, is_output=False)
             or has_batch_semantics(self.cRegion, is_output=True)
         ):
-            raise ValueError(
-                "T.gemm batch semantics are currently supported only on the Sunmmio target"
-            )
+            raise ValueError("T.gemm batch semantics are currently supported only on the Sunmmio target")
 
     def _select_gemm_instruction(self, thread_nums: int, target: Target) -> GemmInst:
         """Select the appropriate GEMM instruction based on target and thread configuration.

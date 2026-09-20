@@ -109,11 +109,7 @@ def batch_gemm_kernel(
     placement = T.placement.replicated()
     A_axes = [len(A_shape) - 2, len(A_shape) - 1]
     B_axes = [len(B_shape) - 2, len(B_shape) - 1]
-    A_layout = (
-        make_mxzz_layout(A_shape, A_axes, dtype=a_dtype)
-        if _is_mx_dtype(a_dtype)
-        else make_zz_layout(A_shape, A_axes, (32, 32))
-    )
+    A_layout = make_mxzz_layout(A_shape, A_axes, dtype=a_dtype) if _is_mx_dtype(a_dtype) else make_zz_layout(A_shape, A_axes, (32, 32))
     B_layout = (
         make_mxzz_layout(B_shape, B_axes, dtype=b_dtype)
         if _is_mx_dtype(b_dtype) and transpose_b
@@ -121,9 +117,7 @@ def batch_gemm_kernel(
         if _is_mx_dtype(b_dtype)
         else make_zz_layout(B_shape, B_axes, (32, 32))
     )
-    C_layout = make_zz_layout(
-        C_shape, [len(C_shape) - 2, len(C_shape) - 1], (32, 32)
-    )
+    C_layout = make_zz_layout(C_shape, [len(C_shape) - 2, len(C_shape) - 1], (32, 32))
 
     @T.prim_func
     def main(
@@ -220,9 +214,7 @@ def partial_batch_gemm_kernel(
     placement = T.placement.replicated()
     A_layout = make_zz_layout(A_shape, [1, 2], (32, 32))
     B_layout = make_zz_layout(B_shape, [1, 2], (32, 32))
-    C_layout = make_zz_layout(
-        C_shape, [len(C_shape) - 2, len(C_shape) - 1], (32, 32)
-    )
+    C_layout = make_zz_layout(C_shape, [len(C_shape) - 2, len(C_shape) - 1], (32, 32))
 
     @T.prim_func
     def main(
@@ -342,10 +334,7 @@ def test_batch_gemm_rank3_output_codegen_validates_with_npuir_opt(tmp_path, vers
     result = subprocess.run(command, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     llvm_ir = llvm_path.read_text(encoding="utf-8")
-    assert (
-        "call void @su_tc_bmm_init(i64 0, i64 2048, i64 2048, i64 4096, i64 4096)"
-        in llvm_ir
-    )
+    assert "call void @su_tc_bmm_init(i64 0, i64 2048, i64 2048, i64 4096, i64 4096)" in llvm_ir
     assert llvm_ir.count("i32 2056, i64 2") == 2
 
 
@@ -375,9 +364,7 @@ def test_batch_gemm_reduction_codegen_validates_with_npuir_opt(tmp_path):
         pytest.param(True, False, False, id="batched-a-shared-w-reduction"),
     ],
 )
-def test_batch_gemm_mixed_rank_codegen_validates_with_npuir_opt(
-    tmp_path, a_batched, b_batched, output_batched
-):
+def test_batch_gemm_mixed_rank_codegen_validates_with_npuir_opt(tmp_path, a_batched, b_batched, output_batched):
     src = validate_sunmmio_codegen_with_npuir_opt(
         batch_gemm_kernel(
             a_batched=a_batched,
@@ -385,10 +372,7 @@ def test_batch_gemm_mixed_rank_codegen_validates_with_npuir_opt(
             output_batched=output_batched,
         ),
         tmp_path,
-        mlir_filename=(
-            f"batch_gemm_a{3 if a_batched else 2}_w{3 if b_batched else 2}_"
-            f"c{3 if output_batched else 2}_suvm.mlir"
-        ),
+        mlir_filename=(f"batch_gemm_a{3 if a_batched else 2}_w{3 if b_batched else 2}_c{3 if output_batched else 2}_suvm.mlir"),
         expected_tokens=("suvm.copy_async", "suvm.tc.mma"),
         opt_args=LOOSE_OPT_ARGS,
     )
@@ -442,9 +426,7 @@ def test_batch_gemm_reduction_dynamic_clear_is_conditional(tmp_path):
 
 @pytest.mark.parametrize("version", [1, 2])
 @pytest.mark.parametrize("output_batched", [True, False])
-def test_batch_gemm_m16_uses_full_physical_mma_carrier(
-    tmp_path, version, output_batched
-):
+def test_batch_gemm_m16_uses_full_physical_mma_carrier(tmp_path, version, output_batched):
     output_rank = 3 if output_batched else 2
     mlir_filename = f"batch_gemm_v{version}_m16_c{output_rank}_suvm.mlir"
     src = validate_sunmmio_codegen_with_npuir_opt(
@@ -456,18 +438,10 @@ def test_batch_gemm_m16_uses_full_physical_mma_carrier(
     )
 
     assert "!suvm.tile_view<2x32x32xbf16>" in src
-    mma_output_type = (
-        "!suvm.tile_view<2x32x32xf32>"
-        if output_batched
-        else "!suvm.tile_view<32x32xf32>"
-    )
+    mma_output_type = "!suvm.tile_view<2x32x32xf32>" if output_batched else "!suvm.tile_view<32x32xf32>"
     assert mma_output_type in src
     assert "suvm.transform_layout_async" not in src
-    logical_output_type = (
-        "!suvm.tile_view<2x16x32xf32>"
-        if output_batched
-        else "!suvm.tile_view<16x32xf32>"
-    )
+    logical_output_type = "!suvm.tile_view<2x16x32xf32>" if output_batched else "!suvm.tile_view<16x32xf32>"
     assert logical_output_type in src
 
     llvm_path = tmp_path / f"batch_gemm_v{version}_m16_c{output_rank}.ll"
@@ -527,15 +501,10 @@ def test_batch_gemm_bf16_output_validates(tmp_path, output_batched):
         )
     ],
 )
-def test_batch_gemm_mx_codegen_and_physical_stride(
-    tmp_path, mx_dtype, a_is_mx, output_batched, transpose_b
-):
+def test_batch_gemm_mx_codegen_and_physical_stride(tmp_path, mx_dtype, a_is_mx, output_batched, transpose_b):
     a_dtype = mx_dtype if a_is_mx else T.bfloat16
     mx_name = "mxfp8" if mx_dtype == T.mxfp8 else "mxfp4"
-    case = (
-        f"batch_gemm_{mx_name if a_is_mx else 'bf16'}_{mx_name}_"
-        f"c{3 if output_batched else 2}_{'mt' if transpose_b else 'mn'}"
-    )
+    case = f"batch_gemm_{mx_name if a_is_mx else 'bf16'}_{mx_name}_c{3 if output_batched else 2}_{'mt' if transpose_b else 'mn'}"
     mlir_path = tmp_path / f"{case}.mlir"
     src = validate_sunmmio_codegen_with_npuir_opt(
         batch_gemm_kernel(
@@ -579,11 +548,7 @@ def test_batch_gemm_mx_codegen_and_physical_stride(
     mx_stride = 2048
     a_stride = mx_stride if _is_mx_dtype(a_dtype) else 4096
     c_stride = 4096 if output_batched else 0
-    assert (
-        f"call void @su_tc_bmm_init(i64 0, i64 {a_stride}, i64 {mx_stride}, "
-        f"i64 {c_stride}, i64 {c_stride})"
-        in llvm_ir
-    )
+    assert f"call void @su_tc_bmm_init(i64 0, i64 {a_stride}, i64 {mx_stride}, i64 {c_stride}, i64 {c_stride})" in llvm_ir
     assert llvm_ir.count("i32 2056, i64 2") == mma_count
 
 
@@ -601,15 +566,11 @@ def test_batch_gemm_batch4_validates(tmp_path):
 
 @pytest.mark.parametrize("version", [1, 2])
 @pytest.mark.parametrize("output_batched", [True, False])
-def test_partial_batch_gemm_uses_compact_physical_allocation(
-    tmp_path, version, output_batched
-):
+def test_partial_batch_gemm_uses_compact_physical_allocation(tmp_path, version, output_batched):
     output_rank = 3 if output_batched else 2
     mlir_path = tmp_path / f"partial_batch_v{version}_c{output_rank}.mlir"
     src = validate_sunmmio_codegen_with_npuir_opt(
-        partial_batch_gemm_kernel(
-            version=version, output_batched=output_batched
-        ),
+        partial_batch_gemm_kernel(version=version, output_batched=output_batched),
         tmp_path,
         mlir_filename=mlir_path.name,
         expected_tokens=("suvm.copy_async", "suvm.tc.mma"),
@@ -640,10 +601,7 @@ def test_partial_batch_gemm_uses_compact_physical_allocation(
     assert result.returncode == 0, result.stderr
     llvm_ir = llvm_path.read_text(encoding="utf-8")
     c_stride = 4096 if output_batched else 0
-    assert (
-        "call void @su_tc_bmm_init(i64 0, i64 2048, i64 2048, "
-        f"i64 {c_stride}, i64 {c_stride})" in llvm_ir
-    )
+    assert f"call void @su_tc_bmm_init(i64 0, i64 2048, i64 2048, i64 {c_stride}, i64 {c_stride})" in llvm_ir
 
 
 @pytest.mark.parametrize("version", [1, 2])

@@ -47,6 +47,7 @@ sunmmio/sunmmio_tilelang_getting_started_zh_cn
 sunmmio/sunmmio_tilelang_user_guide
 sunmmio/sunmmio_tilelang_user_guide_zh_cn
 sunmmio/pipeline_cost_model_calibration
+sunmmio/sunmmio_batch_gemm_implementation_zh_cn
 :::
 
 :::{toctree}
