@@ -1376,7 +1376,10 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
       }
       return rank;
     };
-    if (tiled_rank(src_view) <= 2 && tiled_rank(dst_view) <= 2)
+    // Row-major pad/unpad and higher-rank copies use the generic transform.
+    if (both_row_major || src_view->region.size() != 3 ||
+        dst_view->region.size() != 3 ||
+        (tiled_rank(src_view) <= 2 && tiled_rank(dst_view) <= 2))
       return emit(a, b);
 
     ICHECK_EQ(src_view->region.size(), 3U)
@@ -1423,12 +1426,10 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
     Array<Range> src_physical = physical_ranges(src_view);
     Array<Range> dst_physical = physical_ranges(dst_view);
     for (size_t i = 1; i < src_physical.size(); ++i) {
-      ICHECK(analyzer->CanProveEqual(src_physical[i]->extent,
-                                     dst_physical[i]->extent))
-          << "Sunmmio rank-3 layout transform physical matrix extents must "
-             "match, got "
-          << shape_of_ranges(src_physical) << " and "
-          << shape_of_ranges(dst_physical);
+      // The generic transform handles padding between different carriers.
+      if (!analyzer->CanProveEqual(src_physical[i]->extent,
+                                   dst_physical[i]->extent))
+        return emit(a, b);
     }
 
     auto batch_slice = [](Array<Range> ranges, int64_t batch) {
