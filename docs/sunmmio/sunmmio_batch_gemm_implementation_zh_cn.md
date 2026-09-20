@@ -21,12 +21,12 @@ A/W 均为三维时，参与本次调用的 **batch region extent 必须一致**
 - TileLang 在最后两维推导硬件矩阵布局：A 为 ZZ（MX 用 MXZZ），
   C 为 ZZ；W 根据 `transpose_B` 为 ZZ/ZN（MX 用 MXZZ/MXZNN）。
   [TileLang layout 推导](../../src/op/gemm.cc)和
-  [NPU-IR MMA 校验](../../3rdparty/NPU-IR/lib/Dialect/SUVM/IR/MmaOps.cpp)
+  [NPU-IR MMA 校验](https://github.com/SUNMMIO/NPU-IR/blob/6d5faa9adad7bd3d6c2626d217945e5bfd093c43/lib/Dialect/SUVM/IR/MmaOps.cpp)
   都实施这些约束。
 - rank-3 batch 维必须是**单层 flat layout dimension**，其 stride 静态，
   且可换算成整存储单元和整字节。各 operand 的物理 batch stride 可以不同；
   二维共享 operand 的 stride 为 0。
-  [stride 规则](../../3rdparty/NPU-IR/lib/Dialect/SUVM/IR/OpsUtil.cpp)
+  [stride 规则](https://github.com/SUNMMIO/NPU-IR/blob/6d5faa9adad7bd3d6c2626d217945e5bfd093c43/lib/Dialect/SUVM/IR/OpsUtil.cpp)
   以实际物理 layout 计算，不能按逻辑 shape 和 dtype 简单相乘。
 - MMA TileView 必须覆盖矩阵的完整物理 tile：例如逻辑 M=16 的 ZZ
   layout 占用 32 行时，SRAM 必须**真实分配** 32 行 carrier。
