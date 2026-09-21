@@ -59,7 +59,6 @@ def lower_batch_gemm(mod, ir_case=None):
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tir.transform.BindTarget(target)(mod)
-        mod = tilelang.transform.LegalizeSunmmioBatchGemmViews()(mod)
         mod = tilelang.transform.InferSramScope()(mod)
         mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
         mod = tilelang.transform.LayoutReducer()(mod)

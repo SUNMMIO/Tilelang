@@ -12,14 +12,18 @@
 #include <tvm/tir/utils.h>
 
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <memory>
 #include <queue>
 #include <unordered_map>
+#include <vector>
 
 #include "../layout/utils.h"
 #include "../op/builtin.h"
 #include "../op/copy.h"
+#include "../op/gemm.h"
+#include "../op/gemm_py.h"
 #include "../op/parallel.h"
 #include "../op/region.h"
 #include "../op/utils.h"
@@ -59,6 +63,130 @@ struct BufferSourceInfo {
   Array<Range> dst_region;
 };
 
+namespace {
+
+bool NeedsCompactBatchView(const BufferRegion &region,
+                           arith::Analyzer *analyzer) {
+  if (region->region.size() != 3)
+    return false;
+  const Range &batch = region->region[0];
+  return !analyzer->CanProveEqual(batch->min, make_zero(batch->min.dtype())) ||
+         !analyzer->CanProveEqual(batch->extent, region->buffer->shape[0]);
+}
+
+// Materialize partial batch views before assigning SRAM banks: A4E cannot
+// copy data out of ASRAM, and layout inference needs real compact allocations.
+class CompactBatchViewRewriter : public StmtExprMutator {
+public:
+  explicit CompactBatchViewRewriter(arith::Analyzer *analyzer)
+      : analyzer_(analyzer) {}
+
+private:
+  arith::Analyzer *analyzer_;
+  int scratch_index_{0};
+  std::vector<std::vector<Buffer>> block_scratch_;
+
+  Stmt VisitStmt_(const BlockNode *op) final {
+    block_scratch_.emplace_back();
+    Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
+    std::vector<Buffer> scratch = std::move(block_scratch_.back());
+    block_scratch_.pop_back();
+    if (scratch.empty())
+      return block;
+
+    Array<Buffer> alloc_buffers = block->alloc_buffers;
+    for (const Buffer &buffer : scratch)
+      alloc_buffers.push_back(buffer);
+    block.CopyOnWrite()->alloc_buffers = std::move(alloc_buffers);
+    return block;
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    if (!call ||
+        (!call->op.same_as(Gemm::Get()) && !call->op.same_as(GemmPy::Get())))
+      return StmtExprMutator::VisitStmt_(op);
+    ICHECK_GE(call->args.size(), 10U);
+
+    std::array<BufferRegion, 3> regions = {
+        NormalizeToBufferRegion(call->args[0]),
+        NormalizeToBufferRegion(call->args[1]),
+        NormalizeToBufferRegion(call->args[2]),
+    };
+    bool needs_fallback = false;
+    for (const BufferRegion &region : regions)
+      needs_fallback |= NeedsCompactBatchView(region, analyzer_);
+    if (!needs_fallback)
+      return tvm::ffi::GetRef<Stmt>(op);
+
+    ICHECK(!block_scratch_.empty())
+        << "Sunmmio partial Batch GEMM must be nested in a block";
+    Array<PrimExpr> new_args = call->args;
+    Array<Stmt> before;
+    Array<Stmt> after;
+    static constexpr const char *kNames[] = {"a", "b", "c"};
+
+    for (size_t i = 0; i < regions.size(); ++i) {
+      const BufferRegion &region = regions[i];
+      if (!NeedsCompactBatchView(region, analyzer_))
+        continue;
+
+      const Range &batch = region->region[0];
+      const auto *batch_min = batch->min.as<IntImmNode>();
+      const auto *batch_extent = batch->extent.as<IntImmNode>();
+      ICHECK(batch_min && batch_min->value >= 0 && batch_extent &&
+             batch_extent->value > 0)
+          << "Sunmmio Batch GEMM partial view requires a non-negative static "
+             "batch min and positive static extent, got min "
+          << batch->min << ", extent " << batch->extent;
+      ICHECK(analyzer_->CanProve(batch->min + batch->extent <=
+                                 region->buffer->shape[0]))
+          << "Sunmmio Batch GEMM partial view exceeds buffer axis 0: min "
+          << batch->min << ", extent " << batch->extent << ", shape "
+          << region->buffer->shape;
+
+      std::string name = region->buffer->name + "_batch_" + kNames[i] +
+                         "_compact_" + std::to_string(scratch_index_++);
+      Buffer compact = MakeCompactBufferLike(region->buffer, region->region,
+                                             region->buffer.scope(), name);
+      Array<Range> compact_ranges = MakeCompactRegion(region->region);
+      block_scratch_.back().push_back(compact);
+      new_args.Set(i, MakeRegionExpr(compact, compact_ranges,
+                                     i == 2 ? /*rw=*/3 : /*read=*/1));
+
+      PrimExpr parent_read =
+          MakeRegionExpr(region->buffer, region->region, /*read=*/1);
+      PrimExpr compact_write =
+          MakeRegionExpr(compact, compact_ranges, /*write=*/2);
+      PrimExpr compact_read =
+          MakeRegionExpr(compact, compact_ranges, /*read=*/1);
+      PrimExpr parent_write =
+          MakeRegionExpr(region->buffer, region->region, /*write=*/2);
+
+      if (i < 2 || !is_one(call->args[9])) {
+        before.push_back(Evaluate(Call(DataType::Handle(), Copy::Get(),
+                                       {parent_read, compact_write}, {})));
+      }
+      if (i == 2) {
+        after.push_back(Evaluate(Call(DataType::Handle(), Copy::Get(),
+                                      {compact_read, parent_write}, {})));
+      }
+    }
+
+    Call compact_gemm(call->dtype, Downcast<Op>(call->op), new_args,
+                      call->annotations);
+    Array<Stmt> sequence;
+    for (const Stmt &stmt : before)
+      sequence.push_back(stmt);
+    sequence.push_back(Evaluate(compact_gemm));
+    for (const Stmt &stmt : after)
+      sequence.push_back(stmt);
+    return SeqStmt::Flatten(sequence);
+  }
+};
+
+} // namespace
+
 class InferSramScopePass : public arith::IRMutatorWithAnalyzer {
 public:
   /**
@@ -87,6 +215,9 @@ public:
 
     InferSramScopePass substituter(&analyzer, target.value());
     auto *fptr = f.CopyOnWrite();
+
+    // Phase 0: compact partial batch operands before scope inference.
+    fptr->body = CompactBatchViewRewriter(&analyzer)(fptr->body);
 
     // Phase 1 collects buffer usage info and initial scope decisions from the
     // original IR without rewriting it.

@@ -61,11 +61,10 @@ T.gemm + BufferRegion
 
 | 顺序 | pass / 部件 | 对 Batch GEMM 的影响 |
 |---|---|---|
-| 1 | [LegalizeSunmmioBatchGemmViews](../../src/transform/legalize_sunmmio_gemm.cc) | 将静态 partial batch（如 parent `[1:3]`）复制进零基 compact buffer，再以完整 `[0:2]` region 做 GEMM；输入 copy in，输出 copy back。`clear_accum=false` 时还要先复制 C 的原值。此时 buffer 尚未定 SRAM scope，才能选合法的搬运路径并分配真实 padding。 |
-| 2 | `InferSramScope`、`LegalizeSunmmioDataPath` | 分配 A/W/C 所需的 ASRAM/WSRAM/RSRAM，并安排必要的 RSRAM stage。 |
-| 3 | `SunmmioLayoutInference` | 推导最后两轴的 ZZ/ZN/MX 布局、batch 维的物理排列，以及足以覆盖硬件 tile 的 padded SRAM carrier。 |
-| 4 | `LegalizeSunmmioGemm` | 三维 A/W 写入二维 C 且 `clear_accum=true` 时，在 GEMM 前只清零一次 C，再用累加模式处理各批；BF16 A 的 ASRAM 双遍也在此阶段安排。 |
-| 5 | `LowerTileOp` | 分别降低 GEMM 与 Copy，得到 `tl.mma_sunmmio`、`tl.dma_copy` 等 TIR；算子测试的 `lowered.tir` 停在这里。 |
+| 1 | [InferSramScope](../../src/transform/infer_sram_scope.cc)、`LegalizeSunmmioDataPath` | 先将静态 partial batch（如 parent `[1:3]`）复制进零基 compact buffer，再推导 A/W/C 的 ASRAM/WSRAM/RSRAM scope 并安排数据路径；输入 copy in，输出 copy back。`clear_accum=false` 时还要先复制 C 的原值。真实分配的 compact buffer 供后续布局推导物理 padding。 |
+| 2 | `SunmmioLayoutInference` | 推导最后两轴的 ZZ/ZN/MX 布局、batch 维的物理排列，以及足以覆盖硬件 tile 的 padded SRAM carrier。 |
+| 3 | `LegalizeSunmmioGemm` | 三维 A/W 写入二维 C 且 `clear_accum=true` 时，在 GEMM 前只清零一次 C，再用累加模式处理各批；BF16 A 的 ASRAM 双遍也在此阶段安排。 |
+| 4 | `LowerTileOp` | 分别降低 GEMM 与 Copy，得到 `tl.mma_sunmmio`、`tl.dma_copy` 等 TIR；算子测试的 `lowered.tir` 停在这里。 |
 
 ### 2.3 GEMM 与 Copy 分开 lowering
 
