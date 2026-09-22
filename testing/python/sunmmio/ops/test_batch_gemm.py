@@ -59,6 +59,7 @@ def lower_batch_gemm(mod, ir_case=None):
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.LegalizeSunmmioBatchGemmViews()(mod)
         mod = tilelang.transform.InferSramScope()(mod)
         mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
         mod = tilelang.transform.LayoutReducer()(mod)
@@ -138,6 +139,27 @@ def test_partial_batch_uses_compact_regions():
         for region in mma.args[:3]:
             assert region_shape(region) == (2, 32, 32)
             assert "compact" in region.args[0].buffer.name
+
+
+def test_partial_batch_views_are_legalized_before_sram_inference():
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        full = tir.transform.BindTarget(target)(batch_gemm(batch=4))
+        assert tvm.ir.structural_equal(tilelang.transform.LegalizeSunmmioBatchGemmViews()(full), full)
+
+        mod = tir.transform.BindTarget(target)(batch_gemm(batch=4, partial=True))
+        views = tilelang.transform.LegalizeSunmmioBatchGemmViews()(mod)
+        view_ir = views.script()
+        assert "_batch_a_compact_" in view_ir
+        assert "_batch_b_compact_" in view_ir
+        assert "_batch_c_compact_" in view_ir
+        assert 'scope="shared.dyn"' in view_ir
+
+        scoped = tilelang.transform.InferSramScope()(views)
+        scoped_ir = scoped.script()
+        assert 'scope="shared.asram"' in scoped_ir
+        assert 'scope="shared.wsram"' in scoped_ir
+        assert 'scope="shared.rsram"' in scoped_ir
 
 
 @pytest.mark.parametrize("output_batched", [True, False])
