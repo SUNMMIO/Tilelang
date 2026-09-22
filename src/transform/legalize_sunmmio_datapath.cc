@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "../layout/cute_layout.h"
 #include "../op/comm.h"
 #include "../op/copy.h"
 #include "../op/utils.h"
@@ -106,8 +107,17 @@ private:
     const Buffer &dst = dst_br->buffer;
     CommunicationDirections communication_directions =
         CommunicationDirections::kNone;
-    if (is_copy && SupportsSunmmioDirectCopy(target_, src.scope(), src->dtype,
-                                             dst.scope(), dst->dtype)) {
+    // MX blocks in DRAM include scale prefixes, so a matrix plane is not
+    // necessarily a multiple of DRAM's 1024-byte access granularity. Stage
+    // through RSRAM before feeding WSRAM; the RSRAM route accepts the packed
+    // plane while preserving its physical MX layout.
+    bool requires_mx_dram_staging = is_copy && src.scope() == "global" &&
+                                    dst.scope() == kSunmmioScopeWSRAM &&
+                                    sunmmio::IsMXDType(src->dtype);
+    if (is_copy &&
+        SupportsSunmmioDirectCopy(target_, src.scope(), src->dtype, dst.scope(),
+                                  dst->dtype) &&
+        !requires_mx_dram_staging) {
       return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
 

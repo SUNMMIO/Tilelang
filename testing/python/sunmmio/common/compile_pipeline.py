@@ -291,6 +291,9 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.Simplify()(mod)
     pass_output_process(mod, "Simplify_lower_1", test_config)
 
+    mod = tilelang.transform.LegalizeSunmmioBatchGemmViews()(mod)
+    pass_output_process(mod, "LegalizeSunmmioBatchGemmViews", test_config)
+
     mod = tilelang.transform.InferSramScope()(mod)
     pass_output_process(mod, "InferSramScope", test_config)
 

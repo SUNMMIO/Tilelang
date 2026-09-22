@@ -2496,7 +2496,8 @@ const char *CodeGenTileLangSunMMIO::CallBucketName(CallBucket bucket) const {
 
 SunMMIOValue
 CodeGenTileLangSunMMIO::EmitRegionCall(const tvm::PrimExpr &region_expr,
-                                       int64_t byte_offset) {
+                                       int64_t byte_offset,
+                                       bool preserve_region_rank) {
   BufferRegion region = NormalizeRegionTracked(region_expr);
   const BufferBinding &binding = LookupBuffer(region->buffer);
   std::vector<SunMMIOValue> mins;
@@ -2517,7 +2518,8 @@ CodeGenTileLangSunMMIO::EmitRegionCall(const tvm::PrimExpr &region_expr,
   SunMMIOType ret_ty = MapType(region_expr.dtype());
   std::string result_name = region_expr.dtype().is_void() ? "" : NewValueName();
   return builder_->RegionCall(result_name, binding.handle, mins, extents,
-                              region_expr.dtype(), ret_ty, byte_offset);
+                              region_expr.dtype(), ret_ty, byte_offset,
+                              preserve_region_rank);
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
@@ -2777,9 +2779,12 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     MarkVisitedNodeType(acc_offset_imm->GetTypeKey());
 
     operands.reserve(4);
-    operands.push_back(EmitRegionCall(op->args[0]));
-    operands.push_back(EmitRegionCall(op->args[1]));
-    operands.push_back(EmitRegionCall(op->args[2], acc_offset_byte));
+    operands.push_back(EmitRegionCall(op->args[0], /*byte_offset=*/0,
+                                      /*preserve_region_rank=*/true));
+    operands.push_back(EmitRegionCall(op->args[1], /*byte_offset=*/0,
+                                      /*preserve_region_rank=*/true));
+    operands.push_back(EmitRegionCall(op->args[2], acc_offset_byte,
+                                      /*preserve_region_rank=*/true));
 
     MarkVisitedNodeType(op->args[5]->GetTypeKey());
     arith::Analyzer analyzer;

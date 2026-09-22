@@ -240,17 +240,6 @@ float CostModel::EstimateTensorCoreDelay(const tir::Stmt &stmt) {
   ICHECK(call->op.same_as(Op::Get("tl.mma_sunmmio")))
       << "TensorCore command must call tl.mma_sunmmio: " << stmt;
 
-  const auto *A = call->args[0].as<CallNode>();
-  const auto *B = call->args[1].as<CallNode>();
-  ICHECK(A) << "TensorCore lhs fragment must be a CallNode: " << stmt;
-  ICHECK(B) << "TensorCore rhs fragment must be a CallNode: " << stmt;
-  ICHECK(A->args[2].as<IntImmNode>())
-      << "TensorCore row size must be IntImm: " << stmt;
-  ICHECK(B->args[3].as<IntImmNode>())
-      << "TensorCore col size must be IntImm: " << stmt;
-  ICHECK(A->args[3].as<IntImmNode>())
-      << "TensorCore reduction size must be IntImm: " << stmt;
-
   BufferRegion a_region = NormalizeToBufferRegion(call->args[0]);
   BufferRegion b_region = NormalizeToBufferRegion(call->args[1]);
   BufferRegion c_region = NormalizeToBufferRegion(call->args[2]);
@@ -264,9 +253,36 @@ float CostModel::EstimateTensorCoreDelay(const tir::Stmt &stmt) {
   ICHECK(rhs_dtype == input_dtype)
       << "TensorCore input dtypes must match for current cost model: " << stmt;
 
-  auto row_size = A->args[2].as<IntImmNode>()->value;
-  auto col_size = B->args[3].as<IntImmNode>()->value;
-  auto acc_size = A->args[3].as<IntImmNode>()->value;
+  auto static_extent = [&](const BufferRegion &region, int axis,
+                           const char *operand) {
+    int rank = static_cast<int>(region->region.size());
+    ICHECK(rank == 2 || rank == 3) << "TensorCore " << operand
+                                   << " region must have rank 2 or 3: " << stmt;
+    int normalized_axis = axis < 0 ? rank + axis : axis;
+    const auto *extent =
+        region->region[normalized_axis]->extent.as<IntImmNode>();
+    ICHECK(extent) << "TensorCore " << operand
+                   << " region extent must be IntImm on axis "
+                   << normalized_axis << ": " << stmt;
+    return static_cast<int>(extent->value);
+  };
+
+  int row_size = static_extent(c_region, -2, "output");
+  int col_size = static_extent(c_region, -1, "output");
+  int acc_size = static_extent(a_region, -1, "activation");
+  int batch_size = 1;
+  for (const auto &[region, operand] :
+       {std::pair{a_region, "activation"}, std::pair{b_region, "weight"},
+        std::pair{c_region, "output"}}) {
+    if (region->region.size() != 3)
+      continue;
+    int extent = static_extent(region, 0, operand);
+    if (extent <= 1)
+      continue;
+    ICHECK(batch_size == 1 || batch_size == extent)
+        << "TensorCore batch extents must match: " << stmt;
+    batch_size = extent;
+  }
 
   /**
    * For bf16 TensorCore MMA, the effective inner-loop gap is bounded by both
@@ -295,7 +311,7 @@ float CostModel::EstimateTensorCoreDelay(const tir::Stmt &stmt) {
    */
   float delay = 11 + 5 + 5 + st_dtype_delay +
                 ceil_div(row_size, 16) * ceil_div(col_size, 32) * gap + 70;
-  return delay;
+  return batch_size * delay;
 }
 
 float CostModel::EstimateODMADelay(const tir::Stmt &stmt) {
