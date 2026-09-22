@@ -2469,7 +2469,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         SunMMIOValue cross = builder_->Compare(
             NewValueName(), CompareOp::kGT, CompareDomain::kSignedInt, tile_end,
             make_index_const(access.aligned_load_elems), tile_end.type);
-        builder_->BeginIf(cross, std::vector<int64_t>{});
+        builder_->BeginIf(cross, std::vector<SunMMIOValue>{});
         Aligned1DAddressInfo next_address =
             next_aligned_1d_address(access, address);
         SunMMIOValue second =

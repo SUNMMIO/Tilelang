@@ -10,7 +10,7 @@ namespace tvm {
 namespace tl {
 namespace {
 
-Target MakeA4ETarget() { return Target("sunmmio -mcpu=sunmmio-a4e"); }
+Target MakeA4ETarget() { return Target("llvm -mcpu=sunmmio-a4e"); }
 
 struct DirectTransferCase {
   SunmmioTransferMechanism mechanism;

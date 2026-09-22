@@ -110,9 +110,7 @@ def _make_nonzero_offset_aligned_store_stmt():
     )
 
 
-def _make_cross_carrier_rank1_func(
-    dtype="bfloat16", explicit_predicate=False, read_after_store=False
-):
+def _make_cross_carrier_rank1_func(dtype="bfloat16", explicit_predicate=False, read_after_store=False):
     elem_type = tvm.ir.PrimType(dtype)
     one = tvm.tir.IntImm("bool", 1)
 
@@ -136,9 +134,7 @@ def _make_cross_carrier_rank1_func(
     )
     interior_body = store
     if read_after_store:
-        interior_body = tvm.tir.SeqStmt(
-            [store, tvm.tir.BufferStore(out, tvm.tir.BufferLoad(dst, [index]), [index])]
-        )
+        interior_body = tvm.tir.SeqStmt([store, tvm.tir.BufferStore(out, tvm.tir.BufferLoad(dst, [index]), [index])])
 
     interior = tvm.tir.For(
         lane,
@@ -359,9 +355,7 @@ def test_sunmmio_codegen_aligned_1d_store_uses_nonzero_insert_slice_offset():
         ("float32", 16, 32, "f32"),
     ],
 )
-def test_cross_carrier_rank1_load_uses_runtime_carrier_window(
-    dtype, carrier, wide, mlir_dtype, tmp_path
-):
+def test_cross_carrier_rank1_load_uses_runtime_carrier_window(dtype, carrier, wide, mlir_dtype, tmp_path):
     src = _build_sunmmio_source_from_func(_make_cross_carrier_rank1_func(dtype=dtype))
     validate_suvm_mlir_with_npuir_opt(
         src,
@@ -374,10 +368,7 @@ def test_cross_carrier_rank1_load_uses_runtime_carrier_window(
     assert f"!suvm.tile_view<{wide}x{mlir_dtype}>" not in src
     assert "scf.if" in src
     assert any(
-        "suvm.tile.extract_slice" in line
-        and "[14]" in line
-        and f"!suvm.tile<{wide}x{mlir_dtype}>" in line
-        for line in src.splitlines()
+        "suvm.tile.extract_slice" in line and "[14]" in line and f"!suvm.tile<{wide}x{mlir_dtype}>" in line for line in src.splitlines()
     )
 
 
@@ -388,9 +379,7 @@ def test_cross_carrier_rank1_load_uses_runtime_carrier_window(
         ("float32", 32, "f32"),
     ],
 )
-def test_cross_carrier_rank1_store_uses_independent_runtime_branch(
-    dtype, wide, mlir_dtype, tmp_path
-):
+def test_cross_carrier_rank1_store_uses_independent_runtime_branch(dtype, wide, mlir_dtype, tmp_path):
     src = _build_sunmmio_source_from_func(_make_cross_carrier_rank1_func(dtype=dtype))
     validate_suvm_mlir_with_npuir_opt(
         src,
@@ -411,12 +400,8 @@ def test_cross_carrier_rank1_store_uses_independent_runtime_branch(
         ("float32", "f32"),
     ],
 )
-def test_cross_carrier_rank1_predicate_selects_logical_tile(
-    dtype, mlir_dtype, tmp_path
-):
-    src = _build_sunmmio_source_from_func(
-        _make_cross_carrier_rank1_func(dtype=dtype, explicit_predicate=True)
-    )
+def test_cross_carrier_rank1_predicate_selects_logical_tile(dtype, mlir_dtype, tmp_path):
+    src = _build_sunmmio_source_from_func(_make_cross_carrier_rank1_func(dtype=dtype, explicit_predicate=True))
     validate_suvm_mlir_with_npuir_opt(
         src,
         tmp_path,
@@ -429,9 +414,7 @@ def test_cross_carrier_rank1_predicate_selects_logical_tile(
 
 
 def test_cross_carrier_rank1_store_invalidates_destination_value_cache(tmp_path):
-    src = _build_sunmmio_source_from_func(
-        _make_cross_carrier_rank1_func(dtype="float32", read_after_store=True)
-    )
+    src = _build_sunmmio_source_from_func(_make_cross_carrier_rank1_func(dtype="float32", read_after_store=True))
     validate_suvm_mlir_with_npuir_opt(
         src,
         tmp_path,
@@ -450,11 +433,7 @@ def test_cross_carrier_rank1_store_invalidates_destination_value_cache(tmp_path)
         if "suvm.tile.store" in stripped and any(f", {view} " in stripped for view in destination_views):
             saw_destination_store = True
             continue
-        if (
-            saw_destination_store
-            and "suvm.tile.load" in stripped
-            and any(f" {view} " in stripped for view in destination_views)
-        ):
+        if saw_destination_store and "suvm.tile.load" in stripped and any(f" {view} " in stripped for view in destination_views):
             saw_destination_reload = True
             break
 

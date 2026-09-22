@@ -82,9 +82,7 @@ def test_tiles_shape_predicate_is_projected_to_access_axes(tmp_path, monkeypatch
 
     assert "A_shared.vload([i0 * 32 + ki, i1 * 32 + kj], predicate=i0 * 32 + ki < 50 and i1 * 32 + kj < 50)" in tir_src
     assert "B_shared.vload([i0 * 32 + ki], predicate=i0 * 32 + ki < 50)" in tir_src
-    assert (
-        "B_shared.vload([i0 * 32 + ki], predicate=i0 * 32 + ki < 50 and i1 * 32 + kj < 50)" not in tir_src
-    )
+    assert "B_shared.vload([i0 * 32 + ki], predicate=i0 * 32 + ki < 50 and i1 * 32 + kj < 50)" not in tir_src
 
     assert "B_shared.vload([i1 * 32 + kj], predicate=i1 * 32 + kj < 60)" in tir_src
 
