@@ -869,30 +869,35 @@ LayoutMap AllreduceOpNode::InferLayout(const LayoutInferArgs &T,
   };
 
   if (should_clear) {
-    infer_reduce(src, dst, dim, /*reduce_clear=*/true);
-
-    if (direction == 1 || direction == 2) {
-      infer_allgather(dst, col_allgather, /*gather_dir=*/1);
+    if (direction == 1) {
+      infer_allgather(src, col_allgather, /*gather_dir=*/1);
       infer_reduce(col_allgather, dst, IntImm(DataType::Int(32), 0),
                    /*reduce_clear=*/true);
-    }
-
-    if (direction == 0 || direction == 2) {
+    } else if (direction == 0) {
+      infer_allgather(src, row_allgather, /*gather_dir=*/0);
+      infer_reduce(row_allgather, dst, IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/true);
+    } else {
+      infer_allgather(src, col_allgather, /*gather_dir=*/1);
+      infer_reduce(col_allgather, dst, IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/true);
       infer_allgather(dst, row_allgather, /*gather_dir=*/0);
       infer_reduce(row_allgather, dst, IntImm(DataType::Int(32), 0),
                    /*reduce_clear=*/true);
     }
   } else {
-    infer_reduce(src, dst_copy, dim, /*reduce_clear=*/true);
-
-    if (direction == 1 || direction == 2) {
-      infer_allgather(dst_copy, col_allgather, /*gather_dir=*/1);
-      infer_reduce(col_allgather, direction == 1 ? dst : dst_copy,
-                   IntImm(DataType::Int(32), 0),
-                   /*reduce_clear=*/direction == 2);
-    }
-
-    if (direction == 0 || direction == 2) {
+    if (direction == 1) {
+      infer_allgather(src, col_allgather, /*gather_dir=*/1);
+      infer_reduce(col_allgather, dst, IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/false);
+    } else if (direction == 0) {
+      infer_allgather(src, row_allgather, /*gather_dir=*/0);
+      infer_reduce(row_allgather, dst, IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/false);
+    } else {
+      infer_allgather(src, col_allgather, /*gather_dir=*/1);
+      infer_reduce(col_allgather, dst_copy, IntImm(DataType::Int(32), 0),
+                   /*reduce_clear=*/true);
       infer_allgather(dst_copy, row_allgather, /*gather_dir=*/0);
       infer_reduce(row_allgather, dst, IntImm(DataType::Int(32), 0),
                    /*reduce_clear=*/false);
@@ -958,24 +963,21 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
   };
 
   if (should_clear) {
-    append_reduce(src, dst, dim, /*reduce_clear=*/true);
-
-    if (direction == 1 || direction == 2) {
-      append_col_stage(dst, dst, /*reduce_clear=*/true);
-    }
-
-    if (direction == 0 || direction == 2) {
+    if (direction == 1) {
+      append_col_stage(src, dst, /*reduce_clear=*/true);
+    } else if (direction == 0) {
+      append_row_stage(src, dst, /*reduce_clear=*/true);
+    } else {
+      append_col_stage(src, dst, /*reduce_clear=*/true);
       append_row_stage(dst, dst, /*reduce_clear=*/true);
     }
   } else {
-    append_reduce(src, dst_copy, dim, /*reduce_clear=*/true);
-
-    if (direction == 1 || direction == 2) {
-      append_col_stage(dst_copy, direction == 1 ? dst : dst_copy,
-                       /*reduce_clear=*/direction == 2);
-    }
-
-    if (direction == 0 || direction == 2) {
+    if (direction == 1) {
+      append_col_stage(src, dst, /*reduce_clear=*/false);
+    } else if (direction == 0) {
+      append_row_stage(src, dst, /*reduce_clear=*/false);
+    } else {
+      append_col_stage(src, dst_copy, /*reduce_clear=*/true);
       append_row_stage(dst_copy, dst, /*reduce_clear=*/false);
     }
   }
