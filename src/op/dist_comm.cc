@@ -30,12 +30,12 @@ using namespace tir;
                                  Integer(CallEffectKind::EffectKind))
 
 TIR_DEFINE_DIST_BUILTIN(dist_signal_decl, "tl.dist_signal_decl",
-                        "dist_signal_decl", 2, kPure);
-TIR_DEFINE_DIST_BUILTIN(dist_signal, "tl.dist_signal", "dist_signal", 2, kPure);
+                        "dist_signal_decl", 3, kPure);
+TIR_DEFINE_DIST_BUILTIN(dist_signal, "tl.dist_signal", "dist_signal", 3, kPure);
 TIR_DEFINE_DIST_BUILTIN(dist_signal_group_decl, "tl.dist_signal_group_decl",
-                        "dist_signal_group_decl", 3, kPure);
+                        "dist_signal_group_decl", 4, kPure);
 TIR_DEFINE_DIST_BUILTIN(dist_signal_group, "tl.dist_signal_group",
-                        "dist_signal_group", 3, kPure);
+                        "dist_signal_group", 4, kPure);
 TIR_DEFINE_DIST_BUILTIN(dist_signal_ref, "tl.dist_signal_ref",
                         "dist_signal_ref", 2, kPure);
 TIR_DEFINE_DIST_BUILTIN(dist_signal_route, "tl.dist_signal_route",
@@ -44,32 +44,44 @@ TIR_DEFINE_DIST_BUILTIN(dist_signal_group_route, "tl.dist_signal_group_route",
                         "dist_signal_group_route", 4, kPure);
 TIR_DEFINE_DIST_BUILTIN(dist_barrier, "tl.dist_barrier", "dist_barrier", 2,
                         kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_barrier_arrive, "tl.dist_barrier_arrive",
+                        "dist_barrier_arrive", 2, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_batch_begin, "tl.dist_batch_begin",
+                        "dist_batch_begin", 0, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_batch_begin_, "tl.dist_batch_begin_",
+                        "dist_batch_begin_", 0, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_submit, "tl.dist_submit", "dist_submit", 0,
+                        kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_submit_, "tl.dist_submit_", "dist_submit_", 0,
+                        kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_signal_put, "tl.dist_signal_put",
                         "dist_signal_put", 3, kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_signal_put_, "tl.dist_signal_put_",
                         "dist_signal_put_", 4, kOpaque);
-TIR_DEFINE_DIST_BUILTIN(dist_wait_barrier, "tl.dist_wait_barrier",
-                        "dist_wait_barrier", 1, kOpaque);
-TIR_DEFINE_DIST_BUILTIN(dist_wait_barrier_, "tl.dist_wait_barrier_",
-                        "dist_wait_barrier_", 3, kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_put_, "tl.dist_put_", "dist_put_", 6, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_wait_signal, "tl.dist_wait_signal",
+                        "dist_wait_signal", 1, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_wait_signal_delta, "tl.dist_wait_signal_delta",
+                        "dist_wait_signal_delta", 2, kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_wait_signal_, "tl.dist_wait_signal_",
-                        "dist_wait_signal_", 4, kOpaque);
+                        "dist_wait_signal_", 3, kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_completion, "tl.dist_completion",
-                        "dist_completion", 4, kOpaque);
+                        "dist_completion", -1, kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_completion_has_pending,
                         "tl.dist_completion_has_pending",
                         "dist_completion_has_pending", 1, kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_wait_any, "tl.dist_wait_any", "dist_wait_any", 1,
                         kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_wait_any_, "tl.dist_wait_any_", "dist_wait_any_",
-                        7, kOpaque);
+                        6, kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_wait_completion_all, "tl.dist_wait_completion_all",
                         "dist_wait_completion_all", 1, kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_completion_init_, "tl.dist_completion_init_",
-                        "dist_completion_init_", 7, kOpaque);
-TIR_DEFINE_DIST_BUILTIN(dist_wait_all, "tl.dist_wait_all", "dist_wait_all", -1,
+                        "dist_completion_init_", -1, kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_wait_all, "tl.dist_wait_all", "dist_wait_all", 1,
                         kOpaque);
+TIR_DEFINE_DIST_BUILTIN(dist_wait_signals, "tl.dist_wait_signals",
+                        "dist_wait_signals", 2, kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_wait_send, "tl.dist_wait_send", "dist_wait_send",
                         0, kOpaque);
 TIR_DEFINE_DIST_BUILTIN(dist_expect, "tl.dist_expect", "dist_expect", 2,
@@ -322,53 +334,10 @@ TIR_REGISTER_TL_TILE_OP(DistRoutedPeerPutOp, dist_routed_peer_put)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
-DistWaitSignalOp::DistWaitSignalOp(Array<PrimExpr> args,
-                                   Map<String, ObjectRef> annotations) {
-  (void)annotations;
-  ICHECK_EQ(args.size(), 2U) << "T.dist.wait_signal expects signal and dst";
-  ObjectPtr<DistWaitSignalOpNode> node =
-      tvm::ffi::make_object<DistWaitSignalOpNode>();
-  node->signal = args[0];
-  BufferRegion dst_region = NormalizeToBufferRegion(args[1]);
-  node->dst = dst_region->buffer;
-  node->dst_range = dst_region->region;
-  data_ = std::move(node);
-}
-
-TileOperator DistWaitSignalOpNode::Clone() const {
-  return DistWaitSignalOp(tvm::ffi::make_object<DistWaitSignalOpNode>(*this));
-}
-
-LayoutMap DistWaitSignalOpNode::InferLayout(const LayoutInferArgs &T,
-                                            InferLevel level) const {
-  (void)level;
-  ICHECK(TargetIsSunmmio(T.target))
-      << "T.dist.wait_signal is currently supported only on the Sunmmio target";
-  ValidateDistDestination(dst, "T.dist.wait_signal");
-  return {};
-}
-
-Stmt DistWaitSignalOpNode::Lower(const LowerArgs &T,
-                                 arith::Analyzer *analyzer) const {
-  (void)analyzer;
-  ICHECK(TargetIsSunmmio(T.target))
-      << "T.dist.wait_signal is currently supported only on the Sunmmio target";
-  ValidateDistDestination(dst, "T.dist.wait_signal");
-  return Evaluate(
-      Call(DataType::Handle(), dist_wait_signal_(),
-           {signal, MakeRegionExpr(dst, dst_range, /*access_mask=*/2)}));
-}
-
-TIR_REGISTER_TL_TILE_OP(DistWaitSignalOp, dist_wait_signal)
-    .set_num_inputs(2)
-    .set_attr<TCallEffectKind>("TCallEffectKind",
-                               Integer(CallEffectKind::kOpaque));
-
 TVM_FFI_STATIC_INIT_BLOCK() {
   DistPutOpNode::RegisterReflection();
   DistPeerPutOpNode::RegisterReflection();
   DistRoutedPeerPutOpNode::RegisterReflection();
-  DistWaitSignalOpNode::RegisterReflection();
 }
 
 } // namespace tl

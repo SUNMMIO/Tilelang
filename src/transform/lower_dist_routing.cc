@@ -8,7 +8,6 @@
 
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "../op/comm.h"
@@ -24,6 +23,91 @@ using namespace tir::transform;
 using namespace dist_transform;
 
 namespace {
+
+void ValidateConstantRegionOffsets(const PrimExpr &region_expr,
+                                   const char *op_name,
+                                   const char *operand_name) {
+  BufferRegion region = NormalizeToBufferRegion(region_expr);
+  arith::Analyzer analyzer;
+  for (const Range &range : region->region) {
+    PrimExpr offset = analyzer.Simplify(range->min);
+    ICHECK(offset.as<IntImmNode>())
+        << op_name << " " << operand_name
+        << " region offsets must be compile-time constants for cross-row "
+           "communication, got "
+        << range->min;
+  }
+}
+
+void ValidateCrossRowRegionOffsets(const PrimExpr &src, const PrimExpr &dst,
+                                   const char *op_name) {
+  ValidateConstantRegionOffsets(src, op_name, "source");
+  ValidateConstantRegionOffsets(dst, op_name, "destination");
+}
+
+bool HasCompilerGeneratedRegion(const Call &call) {
+  return call->annotations.count(kDistCompilerRegionAttr) != 0;
+}
+
+class DistRoutePredicateNormalizer : public StmtExprMutator {
+private:
+  Optional<Stmt> RewriteManualBranch(const Stmt &stmt,
+                                     const PrimExpr &predicate) {
+    if (const auto *evaluate = stmt.as<EvaluateNode>()) {
+      const auto *call = evaluate->value.as<CallNode>();
+      if (!call || !call->op.same_as(DistPutOp::Get())) {
+        return std::nullopt;
+      }
+      ICHECK_EQ(call->args.size(), 6U);
+      const auto *signal = call->args[4].as<CallNode>();
+      if (!signal || (!signal->op.same_as(dist_signal_route()) &&
+                      !signal->op.same_as(dist_signal_group_route()))) {
+        return std::nullopt;
+      }
+      size_t active_index = signal->op.same_as(dist_signal_route()) ? 1U : 3U;
+      Array<PrimExpr> signal_args = signal->args;
+      signal_args.Set(active_index, And(signal_args[active_index], predicate));
+      PrimExpr routed_signal = Call(signal->dtype, signal->op, signal_args,
+                                    signal->annotations, signal->span);
+      Array<PrimExpr> put_args = call->args;
+      put_args.Set(4U, routed_signal);
+      return Evaluate(
+          Call(call->dtype, call->op, put_args, call->annotations, call->span),
+          evaluate->span);
+    }
+    if (const auto *sequence = stmt.as<SeqStmtNode>()) {
+      Array<Stmt> statements;
+      statements.reserve(sequence->seq.size());
+      for (const Stmt &child : sequence->seq) {
+        Optional<Stmt> rewritten = RewriteManualBranch(child, predicate);
+        if (!rewritten) {
+          return std::nullopt;
+        }
+        statements.push_back(rewritten.value());
+      }
+      return SeqStmt::Flatten(statements);
+    }
+    if (const auto *conditional = stmt.as<IfThenElseNode>()) {
+      if (conditional->else_case) {
+        return std::nullopt;
+      }
+      return RewriteManualBranch(conditional->then_case,
+                                 And(predicate, conditional->condition));
+    }
+    return std::nullopt;
+  }
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    if (!op->else_case) {
+      Optional<Stmt> rewritten =
+          RewriteManualBranch(op->then_case, op->condition);
+      if (rewritten) {
+        return VisitStmt(rewritten.value());
+      }
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+};
 
 class DistRankRoutedPutNormalizer : public StmtExprMutator {
 public:
@@ -146,11 +230,14 @@ private:
         bool is_local = analyzer_->CanProve(resolved_rank == I32(src_rank));
         bool is_remote =
             analyzer_->CanProve(Not(resolved_rank == I32(src_rank)));
-        ICHECK(is_local || is_remote)
-            << op_name
-            << " cannot determine whether destination Rank is "
-               "local for source Rank "
-            << src_rank << ": " << resolved_rank;
+        if (!is_local && !is_remote) {
+          // A statically bounded loop destination can be local in one
+          // iteration and remote in another. Keep both paths and select at
+          // runtime; PlanDistSignals has already validated every iteration.
+          result.has_local = true;
+          result.has_remote = true;
+          continue;
+        }
         result.has_local |= is_local;
         result.has_remote |= is_remote;
       }
@@ -276,6 +363,10 @@ private:
       local = MakeLocalTransfer(call->args[0], call->args[1], current_core,
                                 current_core, current_core);
     } else {
+      if (!HasCompilerGeneratedRegion(call)) {
+        ValidateCrossRowRegionOffsets(call->args[0], call->args[1],
+                                      "T.dist.put");
+      }
       Array<Stmt> transfers;
       PrimExpr current_col = CurrentCol(current_core);
       for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
@@ -332,6 +423,17 @@ private:
       ICHECK_LT(route.origin_src_row, mesh_nrows_)
           << "T.dist.routed_put source row is outside [0, " << mesh_nrows_
           << "): " << route.origin_src_row;
+      bool peer_for_all_ranks = true;
+      for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
+        PrimExpr resolved_row = RewriteForSource(
+            route.dst_row, current_core, route.origin_src_row, src_rank);
+        peer_for_all_ranks &=
+            analyzer_->CanProve(resolved_row == I32(route.origin_src_row));
+      }
+      if (!peer_for_all_ranks) {
+        ValidateCrossRowRegionOffsets(call->args[0], call->args[1],
+                                      "T.dist.routed_put");
+      }
       for (size_t previous = 0; previous < index; ++previous) {
         ICHECK(!SameRoute(routes[previous], route, current_core))
             << "T.dist.routed_put contains a duplicate static route at entry "
@@ -398,6 +500,13 @@ public:
 
 private:
   Stmt VisitStmt_(const ForNode *op) final {
+    ++loop_depth_;
+    Stmt result = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
+    --loop_depth_;
+    return result;
+  }
+
+  Stmt VisitStmt_(const WhileNode *op) final {
     ++loop_depth_;
     Stmt result = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
     --loop_depth_;
@@ -486,6 +595,10 @@ private:
                          call->args[4], current_core);
     }
 
+    if (!HasCompilerGeneratedRegion(call)) {
+      ValidateCrossRowRegionOffsets(call->args[0], call->args[1], "T.dist.put");
+    }
+
     Array<PrimExpr> entries;
     for (const NormalRouteEntry &route : routes) {
       entries.push_back(
@@ -546,31 +659,31 @@ private:
                        "LowerDistRouting";
     }
     if (call && call->op.same_as(dist_signal_group())) {
-      ICHECK_EQ(call->args.size(), 3U);
-      const DistSignalKindInfo &group_kind =
-          RequireDistSignalKindInfo(call->args[0], "signal-group kind");
+      ICHECK_EQ(call->args.size(), 4U);
+      RequireDistSignalKindInfo(call->args[0], "signal-group kind");
       ICHECK_GE(RequireIntImm(call->args[1], "signal-group base index"), 0);
       ICHECK_GT(RequireIntImm(call->args[2], "signal-group count"), 0);
-      group_signal_kinds_.emplace(op->var.get(), &group_kind);
       Stmt body = VisitStmt(op->body);
-      group_signal_kinds_.erase(op->var.get());
       return LetStmt(op->var, op->value, body, op->span);
     }
     if (!call || !call->op.same_as(dist_signal())) {
       return arith::IRMutatorWithAnalyzer::VisitStmt_(op);
     }
-    const DistSignalKindInfo &kind =
-        RequireDistSignalKindInfo(call->args[0], "resolved signal kind");
-    signal_kinds_.emplace(op->var.get(), &kind);
-    signal_indices_.emplace(
-        op->var.get(), RequireIntImm(call->args[1], "resolved signal index"));
+    ICHECK_EQ(call->args.size(), 3U);
+    RequireDistSignalKindInfo(call->args[0], "resolved signal kind");
+    RequireIntImm(call->args[1], "resolved signal index");
     Stmt body = VisitStmt(op->body);
-    signal_kinds_.erase(op->var.get());
-    signal_indices_.erase(op->var.get());
     return LetStmt(op->var, op->value, body, op->span);
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
+    ++loop_depth_;
+    Stmt result = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
+    --loop_depth_;
+    return result;
+  }
+
+  Stmt VisitStmt_(const WhileNode *op) final {
     ++loop_depth_;
     Stmt result = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
     --loop_depth_;
@@ -702,10 +815,8 @@ private:
     ICHECK(IsRowInvariantPredicate(route_predicate_, current_core))
         << "T.dist.routed_put must be guarded by a condition that is uniform "
            "across rows. Move source-row selection into the route table";
-    const DistSignalKindInfo *signal_kind = LookupSignalKind(call->args[3]);
-    ICHECK(signal_kind->update_mode != DistSignalUpdateMode::kMemory)
-        << signal_kind->name
-        << " signal does not support cross-row T.dist.put yet";
+    // Forwarding only moves payload/active state. All six signal kinds are
+    // updated by the final peer put on the egress row, after the payload.
 
     if (const auto *signal_ref = call->args[3].as<CallNode>()) {
       if (signal_ref->op.same_as(dist_signal_route()) ||
@@ -767,31 +878,6 @@ private:
   int loop_depth_{0};
   PrimExpr route_predicate_{const_true()};
   std::vector<Array<Buffer>> alloc_buffer_stack_;
-  std::unordered_map<const VarNode *, const DistSignalKindInfo *> signal_kinds_;
-  std::unordered_map<const VarNode *, int64_t> signal_indices_;
-  std::unordered_map<const VarNode *, const DistSignalKindInfo *>
-      group_signal_kinds_;
-
-  const DistSignalKindInfo *LookupSignalKind(const PrimExpr &signal) {
-    if (const auto *var = signal.as<VarNode>()) {
-      auto it = signal_kinds_.find(var);
-      ICHECK(it != signal_kinds_.end());
-      return it->second;
-    }
-    const auto *ref = signal.as<CallNode>();
-    ICHECK(ref);
-    if (ref->op.same_as(dist_signal_route())) {
-      ICHECK_EQ(ref->args.size(), 2U);
-      return LookupSignalKind(ref->args[0]);
-    }
-    ICHECK(ref->op.same_as(dist_signal_ref()) ||
-           ref->op.same_as(dist_signal_group_route()));
-    const auto *group_var = ref->args[0].as<VarNode>();
-    ICHECK(group_var);
-    auto it = group_signal_kinds_.find(group_var);
-    ICHECK(it != group_signal_kinds_.end());
-    return it->second;
-  }
 };
 
 PrimFunc Run(PrimFunc func) {
@@ -801,6 +887,10 @@ PrimFunc Run(PrimFunc func) {
   DistOpDetector detector(/*high_level=*/true);
   if (!detector.Detect(func->body)) {
     return func;
+  }
+  Stmt normalized = DistRoutePredicateNormalizer()(func->body);
+  if (!normalized.same_as(func->body)) {
+    func.CopyOnWrite()->body = std::move(normalized);
   }
   func = DistRankRoutedPutNormalizer::Rewrite(std::move(func));
   func = DistLocalRouteLowerer::Rewrite(std::move(func));

@@ -39,7 +39,8 @@ private:
         call->op.same_as(DistAlltoallOp::Get()) ||
         call->op.same_as(DistAllreduceOp::Get()) ||
         call->op.same_as(DistAlltoallvOp::Get()) ||
-        call->op.same_as(dist_barrier())) {
+        call->op.same_as(dist_barrier()) ||
+        call->op.same_as(dist_barrier_arrive())) {
       found_ = true;
       return;
     }
@@ -47,6 +48,225 @@ private:
   }
 
   bool found_{false};
+};
+
+// One all-reduce call site owns one receive buffer. Even independent signals
+// cannot stop a faster Rank from overwriting it in the next loop iteration.
+class DistAllreduceLoopValidator : public StmtExprVisitor {
+public:
+  void Validate(const Stmt &body) { VisitStmt(body); }
+
+private:
+  void VisitStmt_(const ForNode *op) final {
+    ++loop_depth_;
+    StmtExprVisitor::VisitStmt_(op);
+    --loop_depth_;
+  }
+
+  void VisitStmt_(const WhileNode *op) final {
+    ++loop_depth_;
+    StmtExprVisitor::VisitStmt_(op);
+    --loop_depth_;
+  }
+
+  void VisitExpr_(const CallNode *call) final {
+    ICHECK(loop_depth_ == 0 || !call->op.same_as(DistAllreduceOp::Get()))
+        << "T.dist.all_reduce inside For/While is not supported: receive "
+           "staging may be overwritten before all receivers have consumed "
+           "it. Use independent static all_reduce call sites and signals";
+    StmtExprVisitor::VisitExpr_(call);
+  }
+
+  int loop_depth_{0};
+};
+
+// An aggregate collective owns one receiver signal for one invocation. Check
+// this before expansion: the many sends produced by one collective are not
+// resource reuse. Per-source SignalList collectives remain reusable, but must
+// not also write a member reserved by an aggregate collective.
+class DistCollectiveSignalValidator : public StmtExprVisitor {
+public:
+  void Validate(const Stmt &body) { VisitStmt(body); }
+
+private:
+  struct Resource {
+    bool is_group;
+    std::vector<bool> aggregate;
+    std::vector<bool> other_writes;
+  };
+
+  PrimExpr Resolve(const PrimExpr &expr) {
+    return analyzer_.Simplify(Substitute(expr, bindings_));
+  }
+
+  std::optional<PrimExpr> CollectiveSignal(const CallNode *call) const {
+    if (call->op.same_as(DistAllgatherOp::Get()) ||
+        call->op.same_as(DistAlltoallOp::Get()) ||
+        call->op.same_as(DistAllreduceOp::Get())) {
+      ICHECK_EQ(call->args.size(), 5U);
+      return call->args[3];
+    }
+    if (call->op.same_as(DistAlltoallvOp::Get())) {
+      ICHECK_EQ(call->args.size(), 7U);
+      return call->args[5];
+    }
+    return std::nullopt;
+  }
+
+  bool IsAggregate(const PrimExpr &signal) {
+    PrimExpr resolved = Resolve(signal);
+    if (const auto *var = resolved.as<VarNode>()) {
+      auto it = resources_.find(var);
+      ICHECK(it != resources_.end())
+          << "Cannot find collective signal " << signal;
+      return !it->second.is_group;
+    }
+    const auto *ref = resolved.as<CallNode>();
+    ICHECK(ref && ref->op.same_as(dist_signal_ref()));
+    return true;
+  }
+
+  bool HasAggregateCollective(const Stmt &body) {
+    bool found = false;
+    PostOrderVisit(body, [&](const ObjectRef &node) {
+      if (const auto *call = node.as<CallNode>()) {
+        auto signal = CollectiveSignal(call);
+        if (signal && IsAggregate(signal.value())) {
+          found = true;
+        }
+      }
+    });
+    return found;
+  }
+
+  void RegisterWrite(const PrimExpr &signal, bool aggregate) {
+    PrimExpr resolved = Resolve(signal);
+    const VarNode *owner = resolved.as<VarNode>();
+    std::optional<int64_t> member;
+    if (!owner) {
+      const auto *ref = resolved.as<CallNode>();
+      ICHECK(ref) << "Cannot resolve T.dist signal resource " << signal;
+      if (ref->op.same_as(dist_signal_route())) {
+        RegisterWrite(ref->args[0], aggregate);
+        return;
+      }
+      ICHECK(ref->op.same_as(dist_signal_ref()) ||
+             ref->op.same_as(dist_signal_group_route()));
+      owner = ref->args[0].as<VarNode>();
+      PrimExpr index = Resolve(ref->args[1]);
+      if (const auto *imm = index.as<IntImmNode>()) {
+        member = imm->value;
+      } else {
+        ICHECK(!aggregate)
+            << "Cannot prove exclusive collective signal member " << signal
+            << "; use statically distinct members for each invocation";
+        // Unknown P2P indices may overlap any aggregate-owned group member.
+      }
+    }
+    auto it = resources_.find(owner);
+    ICHECK(it != resources_.end()) << "Cannot find T.dist signal " << signal;
+    Resource &resource = it->second;
+    int64_t begin = member.value_or(0);
+    int64_t end = member ? begin + 1 : resource.aggregate.size();
+    ICHECK_GE(begin, 0);
+    ICHECK_LE(end, static_cast<int64_t>(resource.aggregate.size()));
+    for (int64_t index = begin; index < end; ++index) {
+      ICHECK(!resource.aggregate[index])
+          << "Collective aggregate signal " << signal
+          << " must be dedicated to one collective invocation; it is reused "
+             "by another collective or signal-writing operation";
+      if (aggregate) {
+        ICHECK(!resource.other_writes[index])
+            << "Collective aggregate signal " << signal
+            << " must be dedicated to one collective invocation; another "
+               "operation also writes this signal";
+        resource.aggregate[index] = true;
+      } else {
+        resource.other_writes[index] = true;
+      }
+    }
+  }
+
+  void VisitStmt_(const LetStmtNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    bool group = call && (call->op.same_as(dist_signal_group_decl()) ||
+                          call->op.same_as(dist_signal_group()));
+    bool single = call && (call->op.same_as(dist_signal_decl()) ||
+                           call->op.same_as(dist_signal()));
+    if (group || single) {
+      int64_t count =
+          group ? RequireIntImm(call->args[2], "signal-group count") : 1;
+      ICHECK_GT(count, 0);
+      resources_.emplace(op->var.get(),
+                         Resource{group, std::vector<bool>(count, false),
+                                  std::vector<bool>(count, false)});
+      resource_count_ += count;
+      VisitStmt(op->body);
+      resource_count_ -= count;
+      resources_.erase(op->var.get());
+      return;
+    }
+    VisitExpr(op->value);
+    Map<Var, PrimExpr> previous = bindings_;
+    bindings_.Set(op->var, Resolve(op->value));
+    VisitStmt(op->body);
+    bindings_ = std::move(previous);
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    if (!HasAggregateCollective(op->body)) {
+      // Ordinary writes need only a conservative member footprint, not a
+      // count. Unknown members are treated as possibly touching the group.
+      VisitStmt(op->body);
+      return;
+    }
+    PrimExpr min = Resolve(op->min);
+    PrimExpr extent = Resolve(op->extent);
+    const auto *start = min.as<IntImmNode>();
+    const auto *count = extent.as<IntImmNode>();
+    ICHECK(start && count && count->value >= 0 &&
+           count->value <= resource_count_)
+        << "Cannot prove exclusive collective signal use across loop "
+           "iterations; use statically bounded distinct members or the "
+           "supported per-source signals= interface";
+    Map<Var, PrimExpr> previous = bindings_;
+    for (int64_t offset = 0; offset < count->value; ++offset) {
+      bindings_.Set(op->loop_var,
+                    IntImm(op->loop_var.dtype(), start->value + offset));
+      VisitStmt(op->body);
+      bindings_ = previous;
+    }
+  }
+
+  void VisitStmt_(const WhileNode *op) final {
+    ICHECK(!HasAggregateCollective(op->body))
+        << "Cannot prove exclusive collective signal use across While "
+           "iterations; use the supported per-source signals= interface "
+           "or independent static collective invocations";
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const CallNode *call) final {
+    auto signal = CollectiveSignal(call);
+    if (signal) {
+      RegisterWrite(signal.value(), IsAggregate(signal.value()));
+    } else if (call->op.same_as(DistPutOp::Get()) ||
+               call->op.same_as(dist_rank_routed_put())) {
+      RegisterWrite(call->args[4], false);
+    } else if (call->op.same_as(dist_routed_put())) {
+      RegisterWrite(call->args[3], false);
+    } else if (call->op.same_as(dist_signal_put()) ||
+               call->op.same_as(dist_barrier()) ||
+               call->op.same_as(dist_barrier_arrive())) {
+      RegisterWrite(call->args[0], false);
+    }
+    StmtExprVisitor::VisitExpr_(call);
+  }
+
+  arith::Analyzer analyzer_;
+  Map<Var, PrimExpr> bindings_;
+  std::unordered_map<const VarNode *, Resource> resources_;
+  int64_t resource_count_{0};
 };
 
 class DistCollectiveLowerer : public StmtExprMutator {
@@ -59,6 +279,12 @@ public:
 private:
   PrimExpr I32(int64_t value) const { return IntImm(DataType::Int(32), value); }
 
+  Map<String, ObjectRef> CompilerRegionAnnotations() const {
+    Map<String, ObjectRef> annotations;
+    annotations.Set(kDistCompilerRegionAttr, Integer(1));
+    return annotations;
+  }
+
   int64_t RequireStaticExtent(const Range &range, const char *op_name,
                               const char *name) const {
     const auto *extent = range->extent.as<IntImmNode>();
@@ -68,6 +294,19 @@ private:
     ICHECK_GT(extent->value, 0)
         << op_name << " " << name << " extent must be positive";
     return extent->value;
+  }
+
+  void ValidateConstantOffsets(const Array<Range> &region, const char *op_name,
+                               const char *operand_name) const {
+    arith::Analyzer analyzer;
+    for (const Range &range : region) {
+      PrimExpr offset = analyzer.Simplify(range->min);
+      ICHECK(offset.as<IntImmNode>())
+          << op_name << " " << operand_name
+          << " region offsets must be compile-time constants; collective "
+             "endpoint slots are assigned by the compiler, got "
+          << range->min;
+    }
   }
 
   void ValidateSignal(const PrimExpr &signal, const char *op_name) const {
@@ -91,16 +330,15 @@ private:
       auto active = active_signal_group_kinds_.find(signal_var);
       ICHECK(active != active_signal_group_kinds_.end())
           << op_name << " cannot find the corresponding T.dist.signals";
-      int64_t index = RequireIntImm(ref->args[1], "signal-group index");
+      ICHECK(ref->args[1].dtype().is_int())
+          << op_name << " signal-group index must have integer dtype";
       auto size = active_signal_group_sizes_.find(signal_var);
       ICHECK(size != active_signal_group_sizes_.end());
-      ICHECK_GE(index, 0);
-      ICHECK_LT(index, size->second);
+      if (const auto *index = ref->args[1].as<IntImmNode>()) {
+        ICHECK_GE(index->value, 0);
+        ICHECK_LT(index->value, size->second);
+      }
       kind_ptr = &active->second;
-      ICHECK(*kind_ptr != kAutoSignalKind)
-          << op_name << " requires a single automatic signal or an explicitly "
-          << "INC SignalList; automatic SignalList planning selects VALUE or "
-          << "MEMORY";
     }
     const std::string &kind = *kind_ptr;
     if (kind != kAutoSignalKind) {
@@ -112,7 +350,7 @@ private:
     }
   }
 
-  void ValidateAllgather(const DistAllgatherOpNode *op) const {
+  bool ValidateAllgather(const DistAllgatherOpNode *op) const {
     ICHECK(op->src->dtype == op->dst->dtype)
         << "T.dist.all_gather source and destination dtypes must match";
     ICHECK(!op->src->data.same_as(op->dst->data))
@@ -120,6 +358,8 @@ private:
            "destination storage";
     ICHECK(op->current_core.dtype().is_int())
         << "T.dist.all_gather current_core must have integer dtype";
+    ValidateConstantOffsets(op->src_range, "T.dist.all_gather", "source");
+    ValidateConstantOffsets(op->dst_range, "T.dist.all_gather", "destination");
 
     size_t src_rank = op->src_range.size();
     size_t dst_rank = op->dst_range.size();
@@ -171,7 +411,20 @@ private:
       }
     }
 
-    ValidateSignal(op->signal, "T.dist.all_gather");
+    bool single_signal = IsSingleSignalResource(op->signal);
+    if (single_signal) {
+      ValidateSignal(op->signal, "T.dist.all_gather");
+      return true;
+    }
+    const auto *group_var = op->signal.as<VarNode>();
+    ICHECK(group_var)
+        << "T.dist.all_gather signals must reference T.dist.signals";
+    auto group = active_signal_group_sizes_.find(group_var);
+    ICHECK(group != active_signal_group_sizes_.end())
+        << "T.dist.all_gather cannot find its T.dist.signals declaration";
+    ICHECK_EQ(group->second, world_size_)
+        << "T.dist.all_gather requires one signal per source Rank";
+    return false;
   }
 
   bool IsRowDomain(const DistAlltoallOpNode *op) const {
@@ -189,6 +442,8 @@ private:
            "destination storage";
     ICHECK(op->current_core.dtype().is_int())
         << "T.dist.all_to_all current_core must have integer dtype";
+    ValidateConstantOffsets(op->src_range, "T.dist.all_to_all", "source");
+    ValidateConstantOffsets(op->dst_range, "T.dist.all_to_all", "destination");
 
     bool row_domain = IsRowDomain(op);
     size_t endpoint_dims = row_domain ? 2U : 1U;
@@ -235,6 +490,8 @@ private:
         << "T.dist.all_reduce source and destination ranks must match";
     ICHECK_GT(op->src_range.size(), 0U)
         << "T.dist.all_reduce does not support scalar buffers";
+    ValidateConstantOffsets(op->src_range, "T.dist.all_reduce", "source");
+    ValidateConstantOffsets(op->dst_range, "T.dist.all_reduce", "destination");
     for (size_t dim = 0; dim < op->src_range.size(); ++dim) {
       ICHECK_EQ(RequireStaticExtent(op->src_range[dim], "T.dist.all_reduce",
                                     "source"),
@@ -265,17 +522,17 @@ private:
   bool IsSingleSignalResource(const PrimExpr &resource) const {
     if (const auto *ref = resource.as<CallNode>()) {
       ICHECK(ref->op.same_as(dist_signal_ref()))
-          << "T.dist.all_to_allv signal resource must reference "
+          << "T.dist collective signal resource must reference "
              "T.dist.signal or T.dist.signals";
       return true;
     }
     const auto *var = resource.as<VarNode>();
-    ICHECK(var) << "T.dist.all_to_allv signal resource must be a handle";
+    ICHECK(var) << "T.dist collective signal resource must be a handle";
     if (active_signal_kinds_.count(var)) {
       return true;
     }
     ICHECK(active_signal_group_sizes_.count(var))
-        << "T.dist.all_to_allv cannot find its signal declaration";
+        << "T.dist collective cannot find its signal declaration";
     return false;
   }
 
@@ -294,6 +551,12 @@ private:
     ICHECK(op->recv_counts->dtype == op->send_counts->dtype)
         << "T.dist.all_to_allv send_counts and recv_counts must have the "
            "same dtype";
+    ValidateConstantOffsets(op->src_range, "T.dist.all_to_allv", "source");
+    ValidateConstantOffsets(op->dst_range, "T.dist.all_to_allv", "destination");
+    ValidateConstantOffsets(op->send_counts_range, "T.dist.all_to_allv",
+                            "send_counts");
+    ValidateConstantOffsets(op->recv_counts_range, "T.dist.all_to_allv",
+                            "recv_counts");
 
     bool row_domain = IsRowDomain(op);
     size_t endpoint_dims = row_domain ? 2U : 1U;
@@ -371,8 +634,13 @@ private:
     return ranges;
   }
 
-  Stmt LowerAllgather(const DistAllgatherOpNode *op) const {
-    ValidateAllgather(op);
+  struct AllgatherLowering {
+    Stmt schedule;
+    std::optional<PrimExpr> completion;
+  };
+
+  AllgatherLowering LowerAllgather(const DistAllgatherOpNode *op) const {
+    bool single_signal = ValidateAllgather(op);
     PrimExpr src = MakeRegionExpr(op->src, op->src_range, /*access_mask=*/1);
     PrimExpr dst_slot = MakeRegionExpr(op->dst, DestinationSlot(op, rank_id_),
                                        /*access_mask=*/2);
@@ -384,14 +652,24 @@ private:
     PrimExpr dst_row = floordiv(op->current_core, I32(mesh_ncols_));
     for (int64_t offset = 1; offset < world_size_; ++offset) {
       PrimExpr dst_rank = floormod(rank_id_ + I32(offset), I32(world_size_));
-      schedule.push_back(Evaluate(Call(
-          DataType::Handle(), DistPutOp::Get(),
-          {src, dst_slot, dst_rank, dst_row, op->signal, op->current_core})));
+      PrimExpr signal = op->signal;
+      if (!single_signal) {
+        PrimExpr generation_index = rank_id_ * I32(world_size_) + dst_rank;
+        signal = Call(DataType::Handle(), dist_signal_group_route(),
+                      {op->signal, rank_id_, generation_index, const_true()});
+      }
+      schedule.push_back(Evaluate(
+          Call(DataType::Handle(), DistPutOp::Get(),
+               {src, dst_slot, dst_rank, dst_row, signal, op->current_core},
+               CompilerRegionAnnotations())));
     }
 
-    schedule.push_back(
-        Evaluate(Call(DataType::Handle(), dist_wait_send(), {})));
-    return SeqStmt::Flatten(schedule);
+    if (single_signal) {
+      return {SeqStmt::Flatten(schedule), std::nullopt};
+    }
+    PrimExpr completion = Call(DataType::Handle(), dist_completion(),
+                               {op->signal, StringImm("all_gather")});
+    return {SeqStmt::Flatten(schedule), completion};
   }
 
   BufferRegion CreateAllreduceGather(const DistAllreduceOpNode *op) {
@@ -431,15 +709,15 @@ private:
       PrimExpr dst_rank = floormod(rank_id_ + I32(offset), I32(world_size_));
       schedule.push_back(Evaluate(Call(DataType::Handle(), DistPutOp::Get(),
                                        {src, gather_slot, dst_rank, current_row,
-                                        op->signal, op->current_core})));
+                                        op->signal, op->current_core},
+                                       CompilerRegionAnnotations())));
     }
 
     PrimExpr gather_region =
         MakeRegionExpr(gather->buffer, gather->region, /*access_mask=*/1);
-    schedule.push_back(Evaluate(
-        Call(DataType::Handle(), DistWaitSignalOp::Get(),
-             {op->signal, MakeRegionExpr(gather->buffer, gather->region,
-                                         /*access_mask=*/2)})));
+    schedule.push_back(Evaluate(Call(DataType::Handle(), dist_submit(), {})));
+    schedule.push_back(
+        Evaluate(Call(DataType::Handle(), dist_wait_signal(), {op->signal})));
     schedule.push_back(Evaluate(
         Call(DataType::Handle(), ReduceOp::Get(),
              {gather_region,
@@ -489,34 +767,36 @@ private:
             MakeRegionExpr(op->src, src_slot_range, /*access_mask=*/1);
         schedule.push_back(Evaluate(Call(
             DataType::Handle(), DistPutOp::Get(),
-            {src, dst_slot, dst_rank, dst_row, op->signal, op->current_core})));
+            {src, dst_slot, dst_rank, dst_row, op->signal, op->current_core},
+            CompilerRegionAnnotations())));
       }
     }
 
-    schedule.push_back(
-        Evaluate(Call(DataType::Handle(), dist_wait_send(), {})));
     return SeqStmt::Flatten(schedule);
   }
 
-  Stmt LowerBarrier(const CallNode *call) const {
+  Stmt LowerBarrierArrive(const CallNode *call, const char *op_name) const {
     ICHECK_EQ(call->args.size(), 2U);
-    ValidateSignal(call->args[0], "T.dist.barrier");
+    ValidateSignal(call->args[0], op_name);
     ICHECK(call->args[1].dtype().is_int())
-        << "T.dist.barrier current_core must have integer dtype";
+        << op_name << " current_core must have integer dtype";
 
-    Array<Stmt> schedule{
-        Evaluate(Call(DataType::Handle(), dist_wait_send(), {}))};
-    schedule.push_back(Evaluate(Call(DataType::Handle(), dist_expect(),
-                                     {call->args[0], I32(world_size_ - 1)})));
+    Array<Stmt> schedule;
     for (int64_t offset = 1; offset < world_size_; ++offset) {
       PrimExpr dst_rank = floormod(rank_id_ + I32(offset), I32(world_size_));
       schedule.push_back(
           Evaluate(Call(DataType::Handle(), dist_signal_put(),
                         {call->args[0], dst_rank, call->args[1]})));
     }
-    schedule.push_back(Evaluate(
-        Call(DataType::Handle(), dist_wait_barrier(), {call->args[0]})));
     return SeqStmt::Flatten(schedule);
+  }
+
+  Stmt LowerBarrier(const CallNode *call) const {
+    Stmt arrive = LowerBarrierArrive(call, "T.dist.barrier");
+    Stmt submit = Evaluate(Call(DataType::Handle(), dist_submit(), {}));
+    Stmt wait =
+        Evaluate(Call(DataType::Handle(), dist_wait_signal(), {call->args[0]}));
+    return SeqStmt::Flatten(Array<Stmt>{arrive, submit, wait});
   }
 
   PrimExpr EndpointIndex(const PrimExpr &rank, const PrimExpr &row,
@@ -581,8 +861,7 @@ private:
         PrimExpr destination_index =
             EndpointIndex(dst_rank, dst_row, row_domain);
         PrimExpr generation_index =
-            row_domain ? current_row * I32(endpoint_count) + destination_index
-                       : destination_index;
+            source_index * I32(endpoint_count) + destination_index;
         PrimExpr count = CountLoad(op->send_counts, op->send_counts_range,
                                    dst_rank, dst_row, row_domain);
         Array<Range> src_slot_range =
@@ -596,30 +875,35 @@ private:
                           : Call(DataType::Handle(), dist_signal_group_route(),
                                  {op->signal_resource, source_index,
                                   generation_index, active});
-        schedule.push_back(Evaluate(Call(
-            DataType::Handle(), DistPutOp::Get(),
-            {src, dst_slot, dst_rank, dst_row, signal, op->current_core})));
+        schedule.push_back(Evaluate(
+            Call(DataType::Handle(), DistPutOp::Get(),
+                 {src, dst_slot, dst_rank, dst_row, signal, op->current_core},
+                 CompilerRegionAnnotations())));
       }
     }
-    // Temporary source-lifetime barrier; a dedicated pass will insert sender
-    // waits.
-    schedule.push_back(
-        Evaluate(Call(DataType::Handle(), dist_wait_send(), {})));
-
     if (single_signal) {
       return {SeqStmt::Flatten(schedule), std::nullopt};
     }
     PrimExpr recv_counts = MakeRegionExpr(
         op->recv_counts, op->recv_counts_range, /*access_mask=*/1);
-    PrimExpr dst = MakeRegionExpr(op->dst, op->dst_range, /*access_mask=*/2);
     PrimExpr completion =
         Call(DataType::Handle(), dist_completion(),
-             {op->signal_resource, recv_counts, dst, StringImm(op->domain)});
+             {op->signal_resource, recv_counts, StringImm(op->domain)});
     return {SeqStmt::Flatten(schedule), completion};
   }
 
   Stmt VisitStmt_(const LetStmtNode *op) final {
     const auto *call = op->value.as<CallNode>();
+    if (call && call->op.same_as(DistAllgatherOp::Get())) {
+      DistAllgatherOp allgather(call->args, call->annotations);
+      AllgatherLowering lowered = LowerAllgather(allgather.operator->());
+      ICHECK(lowered.completion)
+          << "SignalList T.dist.all_gather must produce a completion";
+      Stmt body = VisitStmt(op->body);
+      Stmt completion =
+          LetStmt(op->var, lowered.completion.value(), body, op->span);
+      return SeqStmt::Flatten(Array<Stmt>{lowered.schedule, completion});
+    }
     if (call && call->op.same_as(DistAlltoallvOp::Get())) {
       DistAlltoallvOp alltoallv(call->args, call->annotations);
       AlltoallvLowering lowered = LowerAlltoallv(alltoallv.operator->());
@@ -631,7 +915,7 @@ private:
       return SeqStmt::Flatten(Array<Stmt>{lowered.schedule, completion});
     }
     if (call && call->op.same_as(dist_signal_group_decl())) {
-      ICHECK_EQ(call->args.size(), 3U);
+      ICHECK_EQ(call->args.size(), 4U);
       int64_t count = RequireIntImm(call->args[2], "signal-group count");
       ICHECK_GT(count, 0) << "T.dist.signals group cannot be empty";
       std::string kind = RequireStringImm(call->args[0], "signal-group kind");
@@ -648,7 +932,7 @@ private:
       return StmtExprMutator::VisitStmt_(op);
     }
 
-    ICHECK_EQ(call->args.size(), 2U);
+    ICHECK(call->args.size() == 2U || call->args.size() == 3U);
     std::string kind = RequireStringImm(call->args[0], "signal kind");
     active_signal_kinds_.emplace(op->var.get(), std::move(kind));
     Stmt body = VisitStmt(op->body);
@@ -692,10 +976,16 @@ private:
       if (call && call->op.same_as(dist_barrier())) {
         return LowerBarrier(call);
       }
+      if (call && call->op.same_as(dist_barrier_arrive())) {
+        return LowerBarrierArrive(call, "T.dist.barrier_arrive");
+      }
       return StmtExprMutator::VisitStmt_(op);
     }
     DistAllgatherOp allgather(call->args, call->annotations);
-    return LowerAllgather(allgather.operator->());
+    AllgatherLowering lowered = LowerAllgather(allgather.operator->());
+    ICHECK(!lowered.completion)
+        << "SignalList T.dist.all_gather must bind its completion result";
+    return lowered.schedule;
   }
 
   int64_t world_size_;
@@ -720,6 +1010,8 @@ PrimFunc Run(PrimFunc func) {
          "T.dist collectives require world_size > 1";
   auto context = GetDistPassContext(func);
   ICHECK(context);
+  DistAllreduceLoopValidator().Validate(func->body);
+  DistCollectiveSignalValidator().Validate(func->body);
   auto mesh = GetSunmmioMeshConfig(context.value().target);
   DistCollectiveLowerer lowerer(context.value().world_size,
                                 context.value().rank_id, mesh.nrow, mesh.ncol);

@@ -28,6 +28,8 @@ using namespace tir;
 
 inline constexpr const char *kDistWorldSizeAttr = "tl.dist.world_size";
 inline constexpr const char *kDistSignalCountsAttr = "tl.dist.signal_counts";
+inline constexpr const char *kDistCompilerRegionAttr =
+    "tl.dist.compiler_generated_region";
 inline constexpr const char *kAutoSignalKind = "auto";
 inline constexpr int kIncrementFlagregCount = 8;
 inline constexpr int kValueFlagregCount = 32;
@@ -117,12 +119,15 @@ inline bool IsHighDistOp(const CallNode *call) {
          call->op.same_as(dist_signal_route()) ||
          call->op.same_as(dist_signal_group_route()) ||
          call->op.same_as(dist_barrier()) ||
+         call->op.same_as(dist_barrier_arrive()) ||
+         call->op.same_as(dist_batch_begin()) ||
+         call->op.same_as(dist_submit()) ||
          call->op.same_as(dist_signal_put()) ||
-         call->op.same_as(dist_wait_barrier()) ||
+         call->op.same_as(dist_wait_signal()) ||
+         call->op.same_as(dist_wait_signal_delta()) ||
          call->op.same_as(DistPutOp::Get()) ||
          call->op.same_as(DistPeerPutOp::Get()) ||
          call->op.same_as(DistRoutedPeerPutOp::Get()) ||
-         call->op.same_as(DistWaitSignalOp::Get()) ||
          call->op.same_as(dist_wait_all()) ||
          call->op.same_as(dist_wait_send()) ||
          call->op.same_as(dist_completion()) ||
@@ -131,14 +136,16 @@ inline bool IsHighDistOp(const CallNode *call) {
          call->op.same_as(dist_wait_completion_all()) ||
          call->op.same_as(dist_expect()) ||
          call->op.same_as(dist_rank_routed_put()) ||
-         call->op.same_as(dist_routed_put());
+         call->op.same_as(dist_routed_put()) ||
+         call->op.same_as(dist_wait_signals());
 }
 
 inline bool IsLeafDistOp(const CallNode *call) {
   return call->op.same_as(dist_put_()) ||
          call->op.same_as(dist_signal_put_()) ||
+         call->op.same_as(dist_batch_begin_()) ||
+         call->op.same_as(dist_submit_()) ||
          call->op.same_as(dist_wait_signal_()) ||
-         call->op.same_as(dist_wait_barrier_()) ||
          call->op.same_as(dist_wait_any_()) ||
          call->op.same_as(dist_completion_init_()) ||
          call->op.same_as(dist_wait_send()) || call->op.same_as(dist_expect_());
