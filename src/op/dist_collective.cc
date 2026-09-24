@@ -115,7 +115,7 @@ DistAllreduceOp::DistAllreduceOp(Array<PrimExpr> args,
                                  Map<String, ObjectRef> annotations) {
   (void)annotations;
   ICHECK_EQ(args.size(), 5U)
-      << "T.dist.all_reduce expects src, dst, reduce_type, internal signal, "
+      << "T.dist.all_reduce expects src, dst, reduce_type, signal, "
          "and current_core";
   BufferRegion src_region = NormalizeToBufferRegion(args[0]);
   BufferRegion dst_region = NormalizeToBufferRegion(args[1]);
