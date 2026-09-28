@@ -630,6 +630,7 @@ def lower_and_legalize_sunmmio_pipeline_test(mod, target):
     mod = tl.transform.Simplify()(mod)
     mod = tl.transform.HoistNonRestrictParams()(mod)
     mod = tl.transform.HoistBlockAnnotationsToFuncAttrs()(mod)
+    mod = tl.transform.ResolveSunmmioUnit()(mod)
     return mod
 
 

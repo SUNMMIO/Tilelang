@@ -220,11 +220,16 @@ def pass_test(mod: IRModule, pass_name: str, test_config: dict[str, Any]) -> Non
             else:
                 raise ValueError(f"Invalid type for script_expected: {type(expect)}")
             script = mod.script(show_meta=True).strip()
+            script_without_odma_units = re.sub(
+                r',\s*T\.odma_unit\("odma[01]"\)',
+                "",
+                script,
+            )
             error_msg = f"The generated script of {pass_name} does not match the expected output."
             if "show_generated_script" in test_info and test_info["show_generated_script"]:
                 error_msg = error_msg + f"\nGenerated script:\n{script}"
             for lines in expect:
-                if lines not in script:
+                if lines not in script and lines not in script_without_odma_units:
                     warnings.warn(error_msg, stacklevel=2)
 
         if "formal_verify" in test_info:
@@ -336,6 +341,9 @@ def LowerAndLegalize_sunmmio_test(
 
     mod = tilelang.transform.HoistBlockAnnotationsToFuncAttrs()(mod)
     pass_output_process(mod, "HoistBlockAnnotationsToFuncAttrs", test_config)
+
+    mod = tilelang.transform.ResolveSunmmioUnit()(mod)
+    pass_output_process(mod, "ResolveSunmmioUnit", test_config)
 
     return mod
 

@@ -111,12 +111,24 @@ inline size_t DistSignalKindIndex(DistSignalKind kind) {
 inline bool IsHighDistOp(const CallNode *call) {
   return call->op.same_as(dist_signal_decl()) ||
          call->op.same_as(dist_signal()) ||
+         call->op.same_as(dist_signal_group_decl()) ||
+         call->op.same_as(dist_signal_group()) ||
+         call->op.same_as(dist_signal_ref()) ||
+         call->op.same_as(dist_signal_route()) ||
+         call->op.same_as(dist_signal_group_route()) ||
+         call->op.same_as(dist_barrier()) ||
+         call->op.same_as(dist_signal_put()) ||
+         call->op.same_as(dist_wait_barrier()) ||
          call->op.same_as(DistPutOp::Get()) ||
          call->op.same_as(DistPeerPutOp::Get()) ||
          call->op.same_as(DistRoutedPeerPutOp::Get()) ||
          call->op.same_as(DistWaitSignalOp::Get()) ||
          call->op.same_as(dist_wait_all()) ||
          call->op.same_as(dist_wait_send()) ||
+         call->op.same_as(dist_completion()) ||
+         call->op.same_as(dist_completion_has_pending()) ||
+         call->op.same_as(dist_wait_any()) ||
+         call->op.same_as(dist_wait_completion_all()) ||
          call->op.same_as(dist_expect()) ||
          call->op.same_as(dist_rank_routed_put()) ||
          call->op.same_as(dist_routed_put());
@@ -124,7 +136,11 @@ inline bool IsHighDistOp(const CallNode *call) {
 
 inline bool IsLeafDistOp(const CallNode *call) {
   return call->op.same_as(dist_put_()) ||
+         call->op.same_as(dist_signal_put_()) ||
          call->op.same_as(dist_wait_signal_()) ||
+         call->op.same_as(dist_wait_barrier_()) ||
+         call->op.same_as(dist_wait_any_()) ||
+         call->op.same_as(dist_completion_init_()) ||
          call->op.same_as(dist_wait_send()) || call->op.same_as(dist_expect_());
 }
 

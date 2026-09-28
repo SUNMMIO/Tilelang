@@ -30,13 +30,14 @@ using SunMMIOCallAttrValue =
 using SunMMIOCallAttrs = std::unordered_map<std::string, SunMMIOCallAttrValue>;
 
 namespace SunMMIOCallAttrKey {
-constexpr const char *kTokenId = "token_id";
+constexpr const char *kUnit = "unit";
 constexpr const char *kDirection = "direction";
 constexpr const char *kTransA = "trans_a";
 constexpr const char *kTransB = "trans_b";
 constexpr const char *kParticipantMask = "participant_mask";
 constexpr const char *kCandidateMasks = "candidate_masks";
 constexpr const char *kBarrierMaskKey = "barrier_mask_key";
+constexpr const char *kSyncUnits = "sync_units";
 } // namespace SunMMIOCallAttrKey
 
 enum class TileUnaryOp {
@@ -255,31 +256,15 @@ public:
   virtual void BeginFor(const std::string &iv, const SunMMIOValue &lb,
                         const SunMMIOValue &ub, const SunMMIOValue &step,
                         const ffi::Map<ffi::String, ffi::Any> &annotations,
-                        const std::vector<int64_t> &live_out_token_ids) = 0;
-  virtual void BeginFor(const std::string &iv, const SunMMIOValue &lb,
-                        const SunMMIOValue &ub, const SunMMIOValue &step,
-                        const ffi::Map<ffi::String, ffi::Any> &annotations,
-                        const std::vector<SunMMIOValue> &live_out_values) = 0;
-  virtual void BeginFor(const std::string &iv, const SunMMIOValue &lb,
-                        const SunMMIOValue &ub, const SunMMIOValue &step,
-                        const ffi::Map<ffi::String, ffi::Any> &annotations,
-                        const std::vector<int64_t> &live_out_token_ids,
                         const std::vector<SunMMIOValue> &live_out_values) = 0;
   virtual void EndFor() = 0;
 
   virtual void BeginIf(const SunMMIOValue &cond,
-                       const std::vector<int64_t> &live_out_token_ids) = 0;
-  virtual void BeginIf(const SunMMIOValue &cond,
-                       const std::vector<SunMMIOValue> &live_out_values) = 0;
-  virtual void BeginIf(const SunMMIOValue &cond,
-                       const std::vector<int64_t> &live_out_token_ids,
                        const std::vector<SunMMIOValue> &live_out_values) = 0;
   virtual void BeginElse() = 0;
   virtual void EndIf() = 0;
 
-  virtual void BeginWhile(const std::vector<int64_t> &live_out_token_ids) = 0;
-  virtual void BeginWhile(const std::vector<int64_t> &live_out_token_ids,
-                          const std::vector<SunMMIOValue> &live_out_values) = 0;
+  virtual void BeginWhile(const std::vector<SunMMIOValue> &live_out_values) = 0;
   virtual void BeginWhileBody(const SunMMIOValue &cond) = 0;
   virtual void EndWhile() = 0;
 
@@ -418,8 +403,8 @@ private:
   void MarkVisitedExprRoot(const tvm::PrimExpr &expr);
   void MarkVisitedExprTree(const tvm::PrimExpr &expr);
   tir::BufferRegion NormalizeRegionTracked(const tvm::PrimExpr &expr);
-  bool TryConsumeSyncTokenId(const tvm::PrimExpr &expr,
-                             SunMMIOCallAttrs *attrs);
+  bool TryConsumeSunmmioOdmaUnit(const tvm::PrimExpr &expr,
+                                 SunMMIOCallAttrs *attrs);
   void WriteCoverageReport() const;
   void CheckCoverageOrFail() const;
   SunMMIOValue EmitBinary(const char *op_name, const tvm::PrimExpr &lhs,

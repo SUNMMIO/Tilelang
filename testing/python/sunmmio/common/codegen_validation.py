@@ -175,6 +175,13 @@ def assert_source_contains(src: str, tokens: Sequence[str]) -> None:
     assert not missing, f"missing expected SUVM MLIR tokens: {missing}\n{src}"
 
 
+def find_async_op_lines(src: str, op_name: str) -> tuple[str, ...]:
+    lines = tuple(line.strip() for line in src.splitlines() if f"{op_name} " in line)
+    assert lines, f"missing async SUVM operation: {op_name}\n{src}"
+    assert "!suvm.token" not in src, f"{op_name} module must be tokenless:\n{src}"
+    return lines
+
+
 def lower_sunmmio_kernel_to_device_tir(
     kernel,
     *,

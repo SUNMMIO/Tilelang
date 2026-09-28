@@ -269,10 +269,10 @@ TVM_DLL const Op &tma_load();
  * \brief Perform a DMA copy operation preserving full buffer region semantics.
  *
  * This intrinsic encodes a high-level copy between two buffer regions as
- * tl.dma_copy(src_region, dst_region), where each argument is a
- * tl.tileop.region Call carrying the buffer, access mask, and per-axis
- * extents. It is emitted by the SUNMMIO lowering path of CopyNode and
- * consumed by later target-specific codegen passes.
+ * tl.dma_copy(src_region, dst_region, src_offset_byte[, odma_unit]).
+ * Each region is a tl.tileop.region Call carrying the buffer, access mask, and
+ * per-axis extents. ResolveSunmmioUnit adds the required odma_unit before
+ * pipeline planning and SUVM code generation.
  *
  * \param src_region  A tl.tileop.region PrimExpr describing the source.
  * \param dst_region  A tl.tileop.region PrimExpr describing the destination.
@@ -300,11 +300,11 @@ TVM_DLL const Op &mx_unpack();
  *
  * Emitted by the SUNMMIO copy lowering path when a DRAM<->RSRAM copy has
  * mismatched src/dst layouts. The mismatched copy is split into a plain
- * tl.dma_copy through an RSRAM staging buffer plus this transform, which
- * runs on the tile unit (asynchronous, like DMA) and re-blocks the data
- * between the staging buffer and the other RSRAM buffer.
+ * tl.dma_copy through an RSRAM staging buffer plus this transform, which runs
+ * asynchronously on ODMA1 and re-blocks the data between the staging buffer
+ * and the other RSRAM buffer.
  *
- * tl.sunmmio_layout_transform(src_region, dst_region)
+ * tl.sunmmio_layout_transform(src_region, dst_region[, odma_unit])
  *
  * Each region's buffer carries its layout in the layout_map /
  * global_layout_map block annotations, so codegen recovers the direction
@@ -319,7 +319,7 @@ TVM_DLL const Op &sunmmio_layout_transform();
 /*!
  * \brief Transpose a complete 2D RSRAM matrix through the Sunmmio ODMA.
  *
- * tl.sunmmio_transpose(src_region, dst_region)
+ * tl.sunmmio_transpose(src_region, dst_region[, odma_unit])
  */
 TVM_DLL const Op &sunmmio_transpose();
 
@@ -1013,38 +1013,25 @@ TVM_DLL const Op &barrier_init();
 TVM_DLL const Op &barrier_arrive_and_wait();
 
 /*!
- * \brief Associate a token ID with a synchronization point.
+ * \brief Synchronize one or more Sunmmio hardware units.
  *
- * This intrinsic is used to tag an asynchronous operation (like DMA copy, MMA,
- * or Broadcast) with a specific token ID. This token is later used by
- * wait_token to ensure completion.
- *
- * Args:
- *   token_id: The unique token identifier.
+ * Internal TIR marker inserted by InjectSunmmioSync. Its single integer
+ * argument is a TileLang-side SunmmioSyncUnits mask that SUVM codegen maps to
+ * the corresponding `suvm.sync` unit attribute.
  */
-TVM_DLL const Op &sync_token_id();
+TVM_DLL const Op &sunmmio_sync();
 
 /*!
- * \brief Declare a null token that is treated as already completed.
+ * \brief Record the sending ODMA unit selected for a Sunmmio async transfer.
  *
- * Waiting on this token is a no-op and will be skipped.
- *
- * Args:
- *   token_id: The unique token identifier.
- */
-TVM_DLL const Op &sync_null_token();
-
-/*!
- * \brief Wait for a token to be signaled.
- *
- * This intrinsic blocks execution until the operation associated with the given
- * token ID has completed. This is used to enforce Read-After-Write (RAW),
- * Write-After-Read (WAR), and Write-After-Write (WAW) dependencies.
+ * This is internal TIR metadata carried as a positional argument of
+ * tl.dma_copy, tl.sunmmio_layout_transform, tl.sunmmio_transpose, and
+ * tl.broadcast_. It is consumed by pipeline planning and SUVM codegen.
  *
  * Args:
- *   token_id: The token identifier to wait for.
+ *   unit: StringImm with value "odma0" or "odma1".
  */
-TVM_DLL const Op &wait_token();
+TVM_DLL const Op &odma_unit();
 
 } // namespace tl
 } // namespace tvm

@@ -227,6 +227,23 @@ private:
     return IfThenElse(analyzer_->Simplify(local_condition), local, remote);
   }
 
+  Stmt GuardDynamicSignal(const PrimExpr &signal, Stmt stmt) {
+    const auto *ref = signal.as<CallNode>();
+    if (!ref) {
+      return stmt;
+    }
+    if (ref->op.same_as(dist_signal_ref())) {
+      return stmt;
+    }
+    if (ref->op.same_as(dist_signal_route())) {
+      ICHECK_EQ(ref->args.size(), 2U);
+      return IfThenElse(ref->args[1], std::move(stmt));
+    }
+    ICHECK(ref->op.same_as(dist_signal_group_route()));
+    ICHECK_EQ(ref->args.size(), 4U);
+    return IfThenElse(ref->args[3], std::move(stmt));
+  }
+
   Stmt LowerPut(const Call &call) {
     ICHECK_EQ(call->args.size(), 6U);
     const auto *current_core_node = call->args[5].as<VarNode>();
@@ -273,8 +290,9 @@ private:
       }
       local = SeqStmt::Flatten(transfers);
     }
-    return SelectLocalOrRemote(locality, call->args[2] == rank_id_, local,
-                               Evaluate(call));
+    Stmt lowered = SelectLocalOrRemote(locality, call->args[2] == rank_id_,
+                                       local, Evaluate(call));
+    return GuardDynamicSignal(call->args[4], std::move(lowered));
   }
 
   bool SameRoute(const NormalRouteEntry &lhs, const NormalRouteEntry &rhs,
@@ -450,10 +468,16 @@ private:
     bool all_peer = false;
     std::vector<NormalRouteEntry> routes =
         BuildRoutes(call, current_core, &all_peer);
-    ICHECK(IsRowInvariantPredicate(route_predicate_, current_core))
-        << "T.dist.put is guarded by a row-dependent condition. Use "
-           "T.dist.routed_put to select source rows explicitly; only Rank- "
-           "or column-uniform outer conditions are supported";
+    const auto *signal_ref = call->args[4].as<CallNode>();
+    bool is_dynamic_route =
+        signal_ref && (signal_ref->op.same_as(dist_signal_route()) ||
+                       signal_ref->op.same_as(dist_signal_group_route()));
+    if (!all_peer || !is_dynamic_route) {
+      ICHECK(IsRowInvariantPredicate(route_predicate_, current_core))
+          << "Cross-row T.dist.put is guarded by a row-dependent condition. "
+             "Use T.dist.routed_put to select source rows explicitly; only "
+             "Rank- or column-uniform outer conditions are supported";
+    }
     ICHECK(all_peer || loop_depth_ == 0)
         << "Cross-row T.dist.put inside loops is not supported until routed "
            "staging lifetime waits are implemented";
@@ -516,9 +540,21 @@ private:
 
   Stmt VisitStmt_(const LetStmtNode *op) final {
     const auto *call = op->value.as<CallNode>();
-    if (call && call->op.same_as(dist_signal_decl())) {
-      ICHECK(false) << "tl.dist_signal_decl must be resolved before "
+    if (call && (call->op.same_as(dist_signal_decl()) ||
+                 call->op.same_as(dist_signal_group_decl()))) {
+      ICHECK(false) << "T.dist signal declarations must be resolved before "
                        "LowerDistRouting";
+    }
+    if (call && call->op.same_as(dist_signal_group())) {
+      ICHECK_EQ(call->args.size(), 3U);
+      const DistSignalKindInfo &group_kind =
+          RequireDistSignalKindInfo(call->args[0], "signal-group kind");
+      ICHECK_GE(RequireIntImm(call->args[1], "signal-group base index"), 0);
+      ICHECK_GT(RequireIntImm(call->args[2], "signal-group count"), 0);
+      group_signal_kinds_.emplace(op->var.get(), &group_kind);
+      Stmt body = VisitStmt(op->body);
+      group_signal_kinds_.erase(op->var.get());
+      return LetStmt(op->var, op->value, body, op->span);
     }
     if (!call || !call->op.same_as(dist_signal())) {
       return arith::IRMutatorWithAnalyzer::VisitStmt_(op);
@@ -526,8 +562,11 @@ private:
     const DistSignalKindInfo &kind =
         RequireDistSignalKindInfo(call->args[0], "resolved signal kind");
     signal_kinds_.emplace(op->var.get(), &kind);
+    signal_indices_.emplace(
+        op->var.get(), RequireIntImm(call->args[1], "resolved signal index"));
     Stmt body = VisitStmt(op->body);
     signal_kinds_.erase(op->var.get());
+    signal_indices_.erase(op->var.get());
     return LetStmt(op->var, op->value, body, op->span);
   }
 
@@ -564,6 +603,90 @@ private:
     return BufferRegion(stage, MakeCompactRegion(source->region));
   }
 
+  BufferRegion CreatePredicateStaging(int64_t src_row) {
+    ICHECK(!alloc_buffer_stack_.empty());
+    std::string name = "dist_route_active_" + std::to_string(route_counter_) +
+                       "_" + std::to_string(src_row);
+    Buffer stage =
+        decl_buffer({I32(1)}, DataType::UInt(8), name, kSunmmioScopeRSRAM);
+    alloc_buffer_stack_.back().push_back(stage);
+    return BufferRegion(stage, {Range::FromMinExtent(I32(0), I32(1))});
+  }
+
+  Stmt LowerDynamicRoutedPut(const Call &call, const Var &current_core,
+                             const CallNode *signal_ref) {
+    bool group_route = signal_ref->op.same_as(dist_signal_group_route());
+    ICHECK(group_route || signal_ref->op.same_as(dist_signal_route()));
+    ICHECK_EQ(signal_ref->args.size(), group_route ? 4U : 2U);
+    std::vector<NormalRouteEntry> routes = ParseNormalRouteTable(call->args[2]);
+    Array<Stmt> statements;
+    PrimExpr current_row = CurrentRow(current_core);
+    PrimExpr current_col = CurrentCol(current_core);
+    for (const NormalRouteEntry &route : routes) {
+      int64_t src_row = route.origin_src_row;
+      PrimExpr route_src =
+          RewriteForSource(call->args[0], current_core, src_row);
+      PrimExpr route_dst =
+          RewriteForSource(call->args[1], current_core, src_row);
+      PrimExpr peer_src = route_src;
+      PrimExpr active = group_route ? signal_ref->args[3] : signal_ref->args[1];
+      PrimExpr peer_active = RewriteForSource(active, current_core, src_row);
+      if (!analyzer_->CanProve(route.dst_row == I32(src_row))) {
+        ICHECK(analyzer_->CanProve(Not(route.dst_row == I32(src_row))))
+            << "A route must be statically peer or cross-row after source-row "
+               "substitution";
+        BufferRegion source = NormalizeToBufferRegion(route_src);
+        BufferRegion staging = CreateStaging(source, src_row);
+        PrimExpr stage_write = MakeRegionExpr(staging->buffer, staging->region,
+                                              /*access_mask=*/2);
+        peer_src = MakeRegionExpr(staging->buffer, staging->region,
+                                  /*access_mask=*/1);
+        PrimExpr src_core = I32(src_row * mesh_ncols_) + current_col;
+        PrimExpr egress_core = route.dst_row * I32(mesh_ncols_) + current_col;
+        statements.push_back(Evaluate(
+            Call(DataType::Handle(), PutOp::Get(),
+                 {route_src, stage_write, I32(-1), src_core, egress_core})));
+
+        BufferRegion active_stage = CreatePredicateStaging(src_row);
+        PrimExpr active_write = MakeRegionExpr(
+            active_stage->buffer, active_stage->region, /*access_mask=*/2);
+        PrimExpr active_read = MakeRegionExpr(
+            active_stage->buffer, active_stage->region, /*access_mask=*/1);
+        statements.push_back(IfThenElse(
+            current_row == I32(src_row),
+            BufferStore(active_stage->buffer,
+                        Cast(DataType::UInt(8), peer_active), {I32(0)})));
+        statements.push_back(Evaluate(
+            Call(DataType::Handle(), PutOp::Get(),
+                 {active_read, active_write, I32(-1), src_core, egress_core})));
+        peer_active = BufferLoad(active_stage->buffer, {I32(0)}) !=
+                      IntImm(DataType::UInt(8), 0);
+      }
+
+      PrimExpr signal;
+      if (group_route) {
+        signal =
+            Call(DataType::Handle(), dist_signal_group_route(),
+                 {signal_ref->args[0],
+                  RewriteForSource(signal_ref->args[1], current_core, src_row),
+                  RewriteForSource(signal_ref->args[2], current_core, src_row),
+                  peer_active});
+      } else {
+        signal = Call(DataType::Handle(), dist_signal_route(),
+                      {signal_ref->args[0], peer_active});
+      }
+      PrimExpr peer_entry = Call(DataType::Handle(), dist_peer_route(),
+                                 {route.dst_row, route.dst_rank});
+      PrimExpr peer_table =
+          Call(DataType::Handle(), dist_peer_route_table(), {peer_entry});
+      statements.push_back(Evaluate(
+          Call(DataType::Handle(), DistRoutedPeerPutOp::Get(),
+               {peer_table, signal, current_core, peer_src, route_dst})));
+    }
+    ++route_counter_;
+    return SeqStmt::Flatten(statements);
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *call = op->value.as<CallNode>();
     if (!call || !call->op.same_as(dist_routed_put())) {
@@ -579,13 +702,19 @@ private:
     ICHECK(IsRowInvariantPredicate(route_predicate_, current_core))
         << "T.dist.routed_put must be guarded by a condition that is uniform "
            "across rows. Move source-row selection into the route table";
-    const auto *signal_var = call->args[3].as<VarNode>();
-    ICHECK(signal_var);
-    auto signal_kind = signal_kinds_.find(signal_var);
-    ICHECK(signal_kind != signal_kinds_.end());
-    ICHECK(signal_kind->second->update_mode != DistSignalUpdateMode::kMemory)
-        << signal_kind->second->name
+    const DistSignalKindInfo *signal_kind = LookupSignalKind(call->args[3]);
+    ICHECK(signal_kind->update_mode != DistSignalUpdateMode::kMemory)
+        << signal_kind->name
         << " signal does not support cross-row T.dist.put yet";
+
+    if (const auto *signal_ref = call->args[3].as<CallNode>()) {
+      if (signal_ref->op.same_as(dist_signal_route()) ||
+          signal_ref->op.same_as(dist_signal_group_route())) {
+        return LowerDynamicRoutedPut(tvm::ffi::GetRef<Call>(call), current_core,
+                                     signal_ref);
+      }
+      ICHECK(signal_ref->op.same_as(dist_signal_ref()));
+    }
 
     std::vector<NormalRouteEntry> routes = ParseNormalRouteTable(call->args[2]);
     Array<Stmt> local_puts;
@@ -639,6 +768,30 @@ private:
   PrimExpr route_predicate_{const_true()};
   std::vector<Array<Buffer>> alloc_buffer_stack_;
   std::unordered_map<const VarNode *, const DistSignalKindInfo *> signal_kinds_;
+  std::unordered_map<const VarNode *, int64_t> signal_indices_;
+  std::unordered_map<const VarNode *, const DistSignalKindInfo *>
+      group_signal_kinds_;
+
+  const DistSignalKindInfo *LookupSignalKind(const PrimExpr &signal) {
+    if (const auto *var = signal.as<VarNode>()) {
+      auto it = signal_kinds_.find(var);
+      ICHECK(it != signal_kinds_.end());
+      return it->second;
+    }
+    const auto *ref = signal.as<CallNode>();
+    ICHECK(ref);
+    if (ref->op.same_as(dist_signal_route())) {
+      ICHECK_EQ(ref->args.size(), 2U);
+      return LookupSignalKind(ref->args[0]);
+    }
+    ICHECK(ref->op.same_as(dist_signal_ref()) ||
+           ref->op.same_as(dist_signal_group_route()));
+    const auto *group_var = ref->args[0].as<VarNode>();
+    ICHECK(group_var);
+    auto it = group_signal_kinds_.find(group_var);
+    ICHECK(it != group_signal_kinds_.end());
+    return it->second;
+  }
 };
 
 PrimFunc Run(PrimFunc func) {

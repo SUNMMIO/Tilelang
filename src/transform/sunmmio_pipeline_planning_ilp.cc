@@ -1618,12 +1618,17 @@ bool IsAllGatherBroadcast(const TemplateCommand &cmd) {
   if (!call) {
     return false;
   }
-  ICHECK(call->args.size() == static_cast<size_t>(kBroadcastArgCount) ||
-         call->args.size() == static_cast<size_t>(kBroadcastArgCount + 1))
+  size_t semantic_args = call->args.size();
+  ICHECK(semantic_args > 0 &&
+         ParseSunmmioOdmaUnitExpr(call->args[semantic_args - 1]))
+      << "tl.broadcast_ requires a resolved ODMA unit before pipeline planning";
+  --semantic_args;
+  ICHECK(semantic_args == static_cast<size_t>(kBroadcastArgCount) ||
+         semantic_args == static_cast<size_t>(kBroadcastArgCount + 1))
       << "tl.broadcast_ expects its fixed arguments and optional src_core";
-  // Before sync-token injection, a broadcast with only the fixed arguments is
+  // Before unit-sync injection, a broadcast with only the fixed arguments is
   // issued by every core and therefore implements an all-gather collective.
-  return call->args.size() == static_cast<size_t>(kBroadcastArgCount);
+  return semantic_args == static_cast<size_t>(kBroadcastArgCount);
 }
 
 bool IsCopyStage(const TemplateCommand &cmd) {

@@ -12,11 +12,61 @@
 #include <tvm/runtime/logging.h>
 #include <tvm/tir/op.h>
 
+#include "../op/builtin.h"
 #include "../op/comm.h"
 #include "utils.h"
 
 namespace tvm {
 namespace tl {
+
+const char *StringifySunmmioOdmaUnit(SunmmioOdmaUnit unit) {
+  switch (unit) {
+  case SunmmioOdmaUnit::kOdma0:
+    return "odma0";
+  case SunmmioOdmaUnit::kOdma1:
+    return "odma1";
+  }
+  LOG(FATAL) << "Unknown Sunmmio ODMA unit";
+  TVM_FFI_UNREACHABLE();
+}
+
+PrimExpr MakeSunmmioOdmaUnitExpr(SunmmioOdmaUnit unit) {
+  return tir::Call(DataType::Handle(), odma_unit(),
+                   {StringImm(StringifySunmmioOdmaUnit(unit))});
+}
+
+std::optional<SunmmioOdmaUnit> ParseSunmmioOdmaUnitExpr(const PrimExpr &expr) {
+  const auto *call = expr.as<tir::CallNode>();
+  if (!call || !call->op.same_as(odma_unit())) {
+    return std::nullopt;
+  }
+  ICHECK_EQ(call->args.size(), 1U)
+      << "tl.odma_unit expects exactly one argument";
+  const auto *unit = call->args[0].as<StringImmNode>();
+  ICHECK(unit) << "tl.odma_unit expects a StringImm argument";
+  if (unit->value == "odma0") {
+    return SunmmioOdmaUnit::kOdma0;
+  }
+  if (unit->value == "odma1") {
+    return SunmmioOdmaUnit::kOdma1;
+  }
+  LOG(FATAL) << "tl.odma_unit expects odma0 or odma1, but got " << unit->value;
+  TVM_FFI_UNREACHABLE();
+}
+
+std::optional<SunmmioOdmaUnit> GetSunmmioOdmaUnit(const tir::CallNode *call) {
+  std::optional<SunmmioOdmaUnit> result;
+  for (const PrimExpr &arg : call->args) {
+    std::optional<SunmmioOdmaUnit> unit = ParseSunmmioOdmaUnitExpr(arg);
+    if (!unit) {
+      continue;
+    }
+    ICHECK(!result.has_value())
+        << "Sunmmio transfer carries more than one tl.odma_unit argument";
+    result = unit;
+  }
+  return result;
+}
 
 namespace {
 

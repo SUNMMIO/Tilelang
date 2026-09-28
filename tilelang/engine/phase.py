@@ -162,6 +162,7 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
 def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tir.transform.BindTarget(target)(mod)
     mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
+    mod = tilelang.transform.LowerDistCollectives()(mod)
     if should_force_let_inline():
         mod = tilelang.transform.LetInline()(mod)
 
@@ -190,6 +191,7 @@ def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.HoistNonRestrictParams()(mod)
     mod = tilelang.transform.HoistBlockAnnotationsToFuncAttrs()(mod)
+    mod = tilelang.transform.ResolveSunmmioUnit()(mod)
     return mod
 
 

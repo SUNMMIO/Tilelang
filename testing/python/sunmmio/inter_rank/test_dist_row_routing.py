@@ -347,7 +347,8 @@ def test_row_shift_expands_local_forwarding_and_peer_puts():
     assert "signal_expect" in device_script
     assert "signal_generation" in device_script
     assert device_script.count("T.dist_put_(") == 4
-    assert device_script.count("T.wait_token(") >= 4
+    assert "T.wait_token(" not in device_script
+    assert "T.sync_token_id(" not in device_script
 
 
 def test_fixed_destination_row_keeps_peer_route_and_expands_other_rows():

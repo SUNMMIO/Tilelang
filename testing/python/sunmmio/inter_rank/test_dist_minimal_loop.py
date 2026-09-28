@@ -279,8 +279,8 @@ def test_minimal_dist_pipeline_lowers_to_device_leaf_ops():
     assert "signal_expect_1[0] = signal_expect_1[0] + T.uint8(1)" in script
     assert "signal_generation_1[0] = signal_generation_1[0] + T.uint8(1)" in script
     assert "uint8" in script
-    assert "T.wait_token(0)" in script
-    assert script.index("T.wait_token(0)") < script.index("T.dist_put_(")
+    assert "T.wait_token(" not in script
+    assert "T.sync_token_id(" not in script
 
 
 def test_explicit_memory_signal_reaches_stable_leaf_tir():

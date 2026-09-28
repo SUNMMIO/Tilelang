@@ -213,10 +213,15 @@ static bool IsAllGatherInstruction(const PipelineInstruction &instruction) {
   if (broadcast == nullptr) {
     return false;
   }
-  ICHECK(broadcast->args.size() == static_cast<size_t>(kBroadcastArgCount) ||
-         broadcast->args.size() == static_cast<size_t>(kBroadcastArgCount + 1))
+  size_t semantic_args = broadcast->args.size();
+  ICHECK(semantic_args > 0 &&
+         ParseSunmmioOdmaUnitExpr(broadcast->args[semantic_args - 1]))
+      << "tl.broadcast_ requires a resolved ODMA unit before pipeline planning";
+  --semantic_args;
+  ICHECK(semantic_args == static_cast<size_t>(kBroadcastArgCount) ||
+         semantic_args == static_cast<size_t>(kBroadcastArgCount + 1))
       << "tl.broadcast_ expects its fixed arguments and optional src_core";
-  return broadcast->args.size() == static_cast<size_t>(kBroadcastArgCount);
+  return semantic_args == static_cast<size_t>(kBroadcastArgCount);
 }
 
 enum class PhysicalSramBank : int {
