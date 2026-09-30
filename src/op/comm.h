@@ -14,6 +14,9 @@ namespace tl {
 
 TVM_DLL const Op &broadcast_();
 
+// Internal proof attached by ValidateDynamicCommPutRoutes before LowerTileOp.
+constexpr const char *kCommPutDirectionAttr = "tl.comm_put_direction";
+
 // Positional argument layout of the broadcast_() leaf intrinsic. Producers
 // (comm.cc, via AppendBroadcastArgs) and consumers (the broadcast-barrier
 // analysis in InjectSunmmioSync) must index it through these constants.
@@ -77,6 +80,7 @@ public:
   PrimExpr src_expr, dst_expr;
   PrimExpr src_core, dst_core;
   IntImm size;
+  int validated_direction = -1;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.comm_put", PutOpNode, TileOperatorNode);
 
@@ -89,7 +93,8 @@ public:
         .def_ro("dst_range", &PutOpNode::dst_range)
         .def_ro("src_core", &PutOpNode::src_core)
         .def_ro("dst_core", &PutOpNode::dst_core)
-        .def_ro("size", &PutOpNode::size);
+        .def_ro("size", &PutOpNode::size)
+        .def_ro("validated_direction", &PutOpNode::validated_direction);
   }
 
   TileOperator Clone() const override;
