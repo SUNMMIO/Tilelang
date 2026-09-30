@@ -297,6 +297,25 @@ def test_broadcast_with_src_core_keeps_sync_in_guarded_branch(tmp_path):
     assert barrier_indices[0] < if_index < mcast_index < sync_index < barrier_indices[1]
 
 
+def test_broadcast_with_current_core_skips_sender_guard(tmp_path):
+    src_data, dst_data, src_buf, dst_buf = _shared_buffers()
+    block = tvm.te.thread_axis("blockIdx.x")
+    body = tvm.tir.Evaluate(_broadcast(src_buf, dst_buf, src_core=block.var))
+    body = tvm.tir.AttrStmt(block, "thread_extent", tvm.tir.IntImm("int32", 16), body)
+    stmt = _with_decl_buffers(body, [src_buf, dst_buf])
+
+    src = _validate_stmt_codegen(
+        stmt,
+        tmp_path,
+        params=[src_data, dst_data],
+        mlir_filename="broadcast_current_core_suvm.mlir",
+        expected_fragments=("suvm.get_core_id", "suvm.mcast_tok", "suvm.sync"),
+        opt_args=MCAST_VERIFY_ARGS,
+    )
+    assert src.count("suvm.get_core_id") == 1
+    assert src.count("suvm.mcast_tok") == 1
+
+
 def test_explicit_unit_sync_consumes_pending_codegen_state():
     src_data, dst_data, src_buf, dst_buf = _shared_buffers()
     body = tvm.tir.SeqStmt(
