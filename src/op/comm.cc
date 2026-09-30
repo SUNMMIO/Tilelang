@@ -56,23 +56,6 @@ PrimExpr AsI64(PrimExpr value) {
   return Cast(DataType::Int(64), value);
 }
 
-Stmt AssertPutDistinctCores(PrimExpr src_core, PrimExpr dst_core, Stmt body,
-                            arith::Analyzer *analyzer) {
-  PrimExpr distinct = AsI32(src_core) != AsI32(dst_core);
-  if (analyzer) {
-    distinct = analyzer->Simplify(distinct);
-  }
-  if (const auto *imm = distinct.as<IntImmNode>()) {
-    ICHECK_NE(imm->value, 0)
-        << "T.comm.put requires src_core and dst_core to be different";
-    return body;
-  }
-  return AssertStmt(distinct,
-                    StringImm("T.comm.put requires src_core and dst_core to "
-                              "be different"),
-                    body);
-}
-
 PrimExpr MakeFullLocalMask(int axis_len) {
   ICHECK_GE(axis_len, 0);
   ICHECK_LE(axis_len, 64)
@@ -356,6 +339,10 @@ PutOp::PutOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   node->size = Downcast<IntImm>(args[2]);
   node->src_core = args[3];
   node->dst_core = args[4];
+  if (auto direction = annotations.Get(kCommPutDirectionAttr)) {
+    node->validated_direction = Downcast<IntImm>(direction.value())->value;
+    ICHECK(node->validated_direction == 0 || node->validated_direction == 1);
+  }
   data_ = std::move(node);
 }
 
@@ -440,47 +427,21 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     return Evaluate(Call(DataType::Handle(), broadcast_(), args));
   };
 
+  if (validated_direction >= 0) {
+    PrimExpr dst_local = validated_direction == 0
+                             ? floormod(AsI32(dst_core), I32Imm(mesh_ncol))
+                             : floordiv(AsI32(dst_core), I32Imm(mesh_ncol));
+    return make_put_broadcast(MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                              MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                              validated_direction,
+                              MakeLocalSingleBit(dst_local), src_core);
+  }
+
   const auto *src_core_imm = src_core.as<IntImmNode>();
   const auto *dst_core_imm = dst_core.as<IntImmNode>();
-  if (!src_core_imm || !dst_core_imm) {
-    PrimExpr src_core_i32 = AsI32(src_core);
-    PrimExpr dst_core_i32 = AsI32(dst_core);
-    PrimExpr mesh_ncol_expr = I32Imm(mesh_ncol);
-    PrimExpr src_core_row =
-        analyzer->Simplify(floordiv(src_core_i32, mesh_ncol_expr));
-    PrimExpr src_core_col =
-        analyzer->Simplify(floormod(src_core_i32, mesh_ncol_expr));
-    PrimExpr dst_core_row =
-        analyzer->Simplify(floordiv(dst_core_i32, mesh_ncol_expr));
-    PrimExpr dst_core_col =
-        analyzer->Simplify(floormod(dst_core_i32, mesh_ncol_expr));
-    PrimExpr intermediate_core =
-        analyzer->Simplify(dst_core_row * mesh_ncol_expr + src_core_col);
-
-    PrimExpr src_read = MakeRegionExpr(src, src_range, /*access_mask=*/1);
-    PrimExpr dst_write = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
-    PrimExpr dst_read = MakeRegionExpr(dst, dst_range, /*access_mask=*/1);
-
-    Stmt horizontal =
-        make_put_broadcast(src_read, dst_write, /*direction=*/0,
-                           MakeLocalSingleBit(dst_core_col), src_core_i32);
-    Stmt vertical =
-        make_put_broadcast(src_read, dst_write, /*direction=*/1,
-                           MakeLocalSingleBit(dst_core_row), src_core_i32);
-    Array<Stmt> diagonal_seq;
-    diagonal_seq.push_back(
-        make_put_broadcast(src_read, dst_write, /*direction=*/1,
-                           MakeLocalSingleBit(dst_core_row), src_core_i32));
-    diagonal_seq.push_back(make_put_broadcast(
-        dst_read, dst_write, /*direction=*/0, MakeLocalSingleBit(dst_core_col),
-        intermediate_core));
-    Stmt diagonal = SeqStmt::Flatten(diagonal_seq);
-
-    Stmt routed = IfThenElse(
-        src_core_row == dst_core_row, horizontal,
-        IfThenElse(src_core_col == dst_core_col, vertical, diagonal));
-    return AssertPutDistinctCores(src_core_i32, dst_core_i32, routed, analyzer);
-  }
+  ICHECK(src_core_imm && dst_core_imm)
+      << "Dynamic T.comm.put requires ValidateDynamicCommPutRoutes before "
+         "LowerTileOp";
 
   int src_core_val = src_core_imm->value;
   int dst_core_val = dst_core_imm->value;
