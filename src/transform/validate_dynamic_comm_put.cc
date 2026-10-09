@@ -87,6 +87,13 @@ private:
     return result;
   }
 
+  Stmt VisitStmt_(const WhileNode *op) final {
+    ++control_depth_;
+    Stmt result = StmtExprMutator::VisitStmt_(op);
+    --control_depth_;
+    return result;
+  }
+
   Stmt VisitStmt_(const LetStmtNode *op) final {
     PrimExpr value = VisitExpr(op->value);
     Map<Var, PrimExpr> replacements;
