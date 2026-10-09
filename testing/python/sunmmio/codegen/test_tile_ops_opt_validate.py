@@ -222,6 +222,47 @@ def fp32_select_then_bf16_cast_test(m=32, n=32):
     return main
 
 
+@target("Sunmmio")
+def tile_bitwise_ops_test(m=32, n=32):
+    dtype = T.int32
+    shard_policy = T.placement.replicated()
+    tensor_shape = (m, n)
+    tensor_layout = make_zz_layout(tensor_shape, [0, 1], tensor_shape)
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared(tensor_shape, dtype)
+            B_shared = T.alloc_shared(tensor_shape, dtype)
+            C_shared = T.alloc_shared(tensor_shape, dtype)
+            T.copy(A, A_shared)
+            T.copy(B, B_shared)
+            for i, j in T.Tiles(A_shared, parallel=True):
+                and_value = T.bitwise_and(A_shared[i, j], B_shared[i, j])
+                or_value = T.bitwise_or(and_value, A_shared[i, j])
+                C_shared[i, j] = T.bitwise_xor(or_value, B_shared[i, j])
+            T.copy(C_shared, C)
+
+    return main
+
+
+def test_tile_bitwise_ops_codegen_validates_with_npuir_opt(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        tile_bitwise_ops_test(),
+        tmp_path,
+        mlir_filename="tile_bitwise_ops_suvm.mlir",
+        expected_tokens=("suvm.tile.andi", "suvm.tile.ori", "suvm.tile.xori"),
+    )
+    assert_source_contains(
+        src,
+        ("suvm.tile.andi", "suvm.tile.ori", "suvm.tile.xori"),
+    )
+
+
 def test_tile_elementwise_ops_2d_codegen_validates_with_npuir_opt(tmp_path):
     src = validate_sunmmio_codegen_with_npuir_opt(
         tile_elementwise_ops_2d_test(),

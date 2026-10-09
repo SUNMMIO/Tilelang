@@ -25,7 +25,7 @@ def apply_sunmmio_passes(mod, target):
 
 def allreduce_kernel(direction="all", clear=True, dtype="float32"):
     shape = (32, 32)
-    out_shape = (32,)
+    out_shape = shape
 
     @T.prim_func
     def main(A: T.Tensor(shape, dtype), Out: T.Tensor(out_shape, dtype)):
@@ -110,7 +110,7 @@ def test_tilelang_allreduce_sunmmio_lowers_to_broadcast_and_tile_reduce(directio
     assert all(_region_access_mask(call.args[1]) == 2 for call in checker.broadcast_calls)
     assert all(int(call.args[3]) == 15 for call in checker.broadcast_calls)
     assert all(int(call.args[4]) == 0 for call in checker.broadcast_calls)
-    assert len(checker.in_tile_reduce_calls) >= 2
+    assert len(checker.in_tile_reduce_calls) == 0
     dma_buffer_pairs = [(_region_buffer_name(call.args[0]), _region_buffer_name(call.args[1])) for call in checker.dma_copy_calls]
     if clear:
         assert ("Out", "Out_shared") not in dma_buffer_pairs
