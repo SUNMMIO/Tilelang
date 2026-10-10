@@ -1100,6 +1100,7 @@ def all_reduce(
         "T.comm.all_reduce",
     )
     out_buffer = out_region.buffer
+    src_dtype = buffer_region.buffer.dtype
     out_dtype = out_buffer.dtype
     src_shape = buffer_region.extents
     out_shape = out_region.extents
@@ -1107,14 +1108,16 @@ def all_reduce(
     reduce_type = reduce_type.lower()
     assert reduce_type in REDUCE_TYPE_LIST, f"Reduction op must be one of {REDUCE_TYPE_LIST}, but got {reduce_type}."
 
-    assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
+    assert src_dtype == out_dtype, f"Source and destination buffer dtypes must match for all_reduce. Got {src_dtype} vs {out_dtype}."
+
+    direction = direction.lower()
+    assert direction in DIRECTION_MAP, f"Invalid direction string: {direction}"
     assert clear in [True, False], "clear must be a boolean value."
 
     mesh_shape = get_target_mesh_shape()
 
-    # Create temporary buffers for row and column allgather results.  Keep the
-    # temporaries in the output scope because the lowered Sunmmio path feeds
-    # them back into ReduceOp and broadcast_.
+    # Keep gather temporaries in the output scope because the lowered Sunmmio
+    # path feeds them back into ReduceOp and broadcast_.
     out_scope = out_buffer.scope()
 
     def alloc_tmp(shape):
@@ -1122,11 +1125,20 @@ def all_reduce(
             return T.alloc_shared(shape, out_dtype, scope=out_scope)
         return T.alloc_fragment(shape, out_dtype, scope=out_scope)
 
-    row_allgather = alloc_tmp([mesh_shape["ncol"]] + list(src_shape))
-    col_allgather = alloc_tmp([mesh_shape["nrow"]] + list(src_shape))
-
-    row_allgather_region = _prepare_allreduce_temporary(row_allgather, "rw")
-    col_allgather_region = _prepare_allreduce_temporary(col_allgather, "rw")
+    direction_id = DIRECTION_MAP[direction]
+    if direction_id == 0:
+        row_allgather = alloc_tmp([mesh_shape["ncol"]] + list(src_shape))
+        row_allgather_region = _prepare_allreduce_temporary(row_allgather, "rw")
+        col_allgather_region = row_allgather_region
+    elif direction_id == 1:
+        col_allgather = alloc_tmp([mesh_shape["nrow"]] + list(src_shape))
+        col_allgather_region = _prepare_allreduce_temporary(col_allgather, "rw")
+        row_allgather_region = col_allgather_region
+    else:
+        row_allgather = alloc_tmp([mesh_shape["ncol"]] + list(src_shape))
+        col_allgather = alloc_tmp([mesh_shape["nrow"]] + list(src_shape))
+        row_allgather_region = _prepare_allreduce_temporary(row_allgather, "rw")
+        col_allgather_region = _prepare_allreduce_temporary(col_allgather, "rw")
     cid = T.get_block_binding(0)
 
     args = (
@@ -1135,14 +1147,14 @@ def all_reduce(
         row_allgather_region,
         col_allgather_region,
         reduce_type,
-        DIRECTION_MAP[direction.lower()],
+        direction_id,
         dim,
         clear,
         cid,
     )
 
-    # If not clearing, allocate an output copy buffer to hold intermediate results
-    if not clear:
+    # direction="all" needs a copy buffer for the intermediate column result.
+    if not clear and direction_id == 2:
         out_copy = alloc_tmp(list(out_shape))
         out_copy_region = _prepare_allreduce_temporary(out_copy, "rw")
         args = (
@@ -1151,7 +1163,7 @@ def all_reduce(
             row_allgather_region,
             col_allgather_region,
             reduce_type,
-            DIRECTION_MAP[direction.lower()],
+            direction_id,
             dim,
             clear,
             out_copy_region,

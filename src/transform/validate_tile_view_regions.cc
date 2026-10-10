@@ -256,22 +256,26 @@ private:
     ValidateRegionCanFormTileView(src, "tl.tileop.comm_allreduce", "src");
     ValidateRegionCanFormTileView(dst, "tl.tileop.comm_allreduce", "dst");
 
-    BufferRegion gather_send = dst;
-    if (!should_clear) {
+    BufferRegion row_gather_send = src;
+    BufferRegion col_gather_send = src;
+    if (direction == 2 && should_clear) {
+      row_gather_send = dst;
+    } else if (direction == 2) {
       ICHECK_EQ(call->args.size(), 10U)
-          << "tl.tileop.comm_allreduce clear=false requires dst_copy";
+          << "tl.tileop.comm_allreduce clear=false direction=all requires "
+          << "dst_copy";
       BufferRegion dst_copy = NormalizeToBufferRegion(call->args[8]);
       ValidateRegionCanFormTileView(dst_copy, "tl.tileop.comm_allreduce",
                                     "dst_copy");
-      gather_send = dst_copy;
+      row_gather_send = dst_copy;
     }
 
     if (direction == 0 || direction == 2) {
-      ValidateAllgatherRegions(gather_send, row_allgather, /*direction=*/0,
+      ValidateAllgatherRegions(row_gather_send, row_allgather, /*direction=*/0,
                                /*axis=*/-1, "tl.tileop.comm_allreduce.row");
     }
     if (direction == 1 || direction == 2) {
-      ValidateAllgatherRegions(gather_send, col_allgather, /*direction=*/1,
+      ValidateAllgatherRegions(col_gather_send, col_allgather, /*direction=*/1,
                                /*axis=*/-1, "tl.tileop.comm_allreduce.col");
     }
   }

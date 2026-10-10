@@ -856,11 +856,11 @@ T.comm.all_reduce(buffer, out, reduce_type, direction, dim=-1, clear=True)
 - `out`: output buffer or region storing the reduce result.
 - `reduce_type`: reduce type. Supported values include `"sum"`, `"abssum"`, `"max"`, `"min"`, `"absmax"`, `"bitand"`, `"bitor"`, and `"bitxor"`.
 - `direction`: direction participating in reduce. Supported values are `"horizontal"` / `"h"`, `"vertical"` / `"v"`, and `"all"` / `"a"`.
-- `dim`: reduction dimension inside the local buffer. The default `-1` means the last dimension.
+- `dim`: retained for API compatibility and bounds validation. Cross-core `all_reduce` does not reduce a local buffer dimension.
 - `clear`: whether to clear `out` before reduce. The default is `True`.
 - Return value: a statement expressing all-reduce.
 
-The `out` shape must be equal to the shape after removing `dim`, or keep length 1 on `dim`.
+The `out` shape must match the input buffer or region shape. `all_reduce` reduces across cores only and preserves the complete local region.
 
 ### 3.7 GEMM
 

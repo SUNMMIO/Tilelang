@@ -81,15 +81,16 @@ def _expected_axis_last_all_lines(buffer):
     return lines
 
 
-def _allreduce_frontend_kernel(direction="all", clear=True, dtype="float32"):
+def _allreduce_frontend_kernel(direction="all", clear=True, dtype="float32", out_dtype=None):
     shape = (32, 32)
     out_shape = shape
+    out_dtype = dtype if out_dtype is None else out_dtype
 
     @T.prim_func
-    def main(A: T.Tensor(shape, dtype), Out: T.Tensor(out_shape, dtype)):
+    def main(A: T.Tensor(shape, dtype), Out: T.Tensor(out_shape, out_dtype)):
         with T.Kernel(1, threads=128) as (bx,):
             A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
-            Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+            Out_shared = T.alloc_shared(out_shape, out_dtype, scope="shared.rsram")
 
             T.copy(A, A_shared)
             if not clear:
@@ -148,6 +149,23 @@ def test_comm_allreduce_frontend_allocates_rsram_temporaries():
     ) in script
 
 
+@pytest.mark.parametrize(("direction", "direction_id"), [("h", 0), ("v", 1)])
+@pytest.mark.parametrize("clear", [True, False])
+def test_comm_allreduce_single_axis_allocates_one_gather_temporary(direction, direction_id, clear):
+    script = _allreduce_frontend_kernel(direction=direction, clear=clear).script()
+    clear_literal = "True" if clear else "False"
+
+    assert script.count('T.alloc_buffer((4, 32, 32), scope="shared.rsram")') == 1
+    assert 'buffer_2 = T.alloc_buffer((32, 32), scope="shared.rsram")' not in script
+    assert f'"sum", {direction_id}, 1, T.bool({clear_literal}), bx)' in script
+    assert f"T.bool({clear_literal}), buffer_2" not in script
+
+
+def test_comm_allreduce_rejects_mixed_dtype():
+    with pytest.raises(AssertionError, match="Source and destination buffer dtypes must match for all_reduce"):
+        _allreduce_frontend_kernel(direction="h", dtype="float32", out_dtype="int32")
+
+
 def test_comm_buffer_like_region_python_api():
     @T.prim_func
     def main(A: T.Tensor((128, 128), "float32")):
@@ -168,7 +186,7 @@ def test_comm_buffer_like_region_python_api():
     assert "T.comm_put(A_shared[0:64, 0:64], B_shared[32:96, 32:96], -1, 0, 1)" in script
     assert "T.comm_allgather(A_shared[8:72, 16:80], C_shared[0:4, 0:64, 0:64], 0, -1, -1, bx)" in script
     assert (
-        'T.comm_allreduce(A_shared[8:72, 16:80], Out_shared[32:96, 32:96], buffer[0:4, 0:64, 0:64], buffer_1[0:4, 0:64, 0:64], "sum", 0, 1, T.bool(True), bx)'
+        'T.comm_allreduce(A_shared[8:72, 16:80], Out_shared[32:96, 32:96], buffer[0:4, 0:64, 0:64], buffer[0:4, 0:64, 0:64], "sum", 0, 1, T.bool(True), bx)'
     ) in script
 
 

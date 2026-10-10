@@ -814,9 +814,14 @@ LayoutMap AllreduceOpNode::InferLayout(const LayoutInferArgs &T,
                                        InferLevel level) const {
   LayoutMap lm;
 
+  ICHECK(direction == 0 || direction == 1 || direction == 2)
+      << "Invalid allreduce direction " << direction
+      << ", must be 0 (row-wise) or 1 (column-wise) or 2 (all).";
+
   bool should_clear = clear.as<Bool>().value();
-  ICHECK(should_clear || dst_copy.defined())
-      << "Allreduce clear=false requires a dst_copy temporary buffer.";
+  ICHECK(should_clear || direction != 2 || dst_copy.defined())
+      << "Allreduce clear=false direction=all requires a dst_copy temporary "
+      << "buffer.";
   ICHECK(cid.defined())
       << "Allreduce dynamic allgather lowering requires current core id.";
 
@@ -917,8 +922,9 @@ Stmt AllreduceOpNode::Lower(const LowerArgs &T,
       << ", must be 0 (row-wise) or 1 (column-wise) or 2 (all).";
 
   bool should_clear = clear.as<Bool>().value();
-  ICHECK(should_clear || dst_copy.defined())
-      << "Allreduce clear=false requires a dst_copy temporary buffer.";
+  ICHECK(should_clear || direction != 2 || dst_copy.defined())
+      << "Allreduce clear=false direction=all requires a dst_copy temporary "
+      << "buffer.";
   ICHECK(cid.defined())
       << "Allreduce dynamic allgather lowering requires current core id.";
 
