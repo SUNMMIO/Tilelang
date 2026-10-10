@@ -81,15 +81,16 @@ def _expected_axis_last_all_lines(buffer):
     return lines
 
 
-def _allreduce_frontend_kernel(direction="all", clear=True, dtype="float32"):
+def _allreduce_frontend_kernel(direction="all", clear=True, dtype="float32", out_dtype=None):
     shape = (32, 32)
     out_shape = shape
+    out_dtype = dtype if out_dtype is None else out_dtype
 
     @T.prim_func
-    def main(A: T.Tensor(shape, dtype), Out: T.Tensor(out_shape, dtype)):
+    def main(A: T.Tensor(shape, dtype), Out: T.Tensor(out_shape, out_dtype)):
         with T.Kernel(1, threads=128) as (bx,):
             A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
-            Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+            Out_shared = T.alloc_shared(out_shape, out_dtype, scope="shared.rsram")
 
             T.copy(A, A_shared)
             if not clear:
@@ -165,11 +166,29 @@ def test_allreduce_allocates_only_active_carriers(direction, clear, mesh, monkey
 
     assert len(carriers) == (2 if direction == "all" else 1)
     assert call.args[2].buffer.same_as(call.args[3].buffer) == (direction != "all")
+    assert len(call.args) == (10 if not clear and direction == "all" else 9)
     assert all([int(extent) for extent in carrier.shape[1:]] == [32, 32] for carrier in carriers)
     if direction in ("h", "horizontal", "all"):
         assert int(call.args[2].buffer.shape[0]) == ncol
     if direction in ("v", "vertical", "all"):
         assert int(call.args[3].buffer.shape[0]) == nrow
+
+
+@pytest.mark.parametrize(("direction", "direction_id"), [("h", 0), ("v", 1)])
+@pytest.mark.parametrize("clear", [True, False])
+def test_comm_allreduce_single_axis_allocates_one_gather_temporary(direction, direction_id, clear):
+    script = _allreduce_frontend_kernel(direction=direction, clear=clear).script()
+    clear_literal = "True" if clear else "False"
+
+    assert script.count('T.alloc_buffer((4, 32, 32), scope="shared.rsram")') == 1
+    assert 'buffer_2 = T.alloc_buffer((32, 32), scope="shared.rsram")' not in script
+    assert f'"sum", {direction_id}, 1, T.bool({clear_literal}), bx)' in script
+    assert f"T.bool({clear_literal}), buffer_2" not in script
+
+
+def test_comm_allreduce_rejects_mixed_dtype():
+    with pytest.raises(AssertionError, match="Source and destination buffer dtypes must match for all_reduce"):
+        _allreduce_frontend_kernel(direction="h", dtype="float32", out_dtype="int32")
 
 
 def test_comm_buffer_like_region_python_api():
