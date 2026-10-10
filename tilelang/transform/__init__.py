@@ -119,6 +119,11 @@ def ValidateTileViewRegions():
     return _ffi_api.ValidateTileViewRegions()  # type: ignore
 
 
+def ValidateDynamicCommPutRoutes():
+    """Validate dynamic Sunmmio put routes and their participants."""
+    return _ffi_api.ValidateDynamicCommPutRoutes()  # type: ignore
+
+
 def LowerTileOp():
     """LowerTileOp
 

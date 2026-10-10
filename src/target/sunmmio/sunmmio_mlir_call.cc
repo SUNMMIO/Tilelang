@@ -53,6 +53,26 @@ void VerifyA4EMulticastOp(OpType op, const char *callee) {
       << callee << " violates A4E multicast data-path constraints";
 }
 
+bool IsCurrentCoreId(mlir::Value value) {
+  if (value.getDefiningOp<mlir::suvm::GetCoreIdOp>()) {
+    return true;
+  }
+  // Kernel block IDs are i32 views of the A4E core ID, then widened for the
+  // multicast source comparison. The A4E mesh fits in i32.
+  auto is_widened_core = [](mlir::Value input) {
+    auto trunc = input.getDefiningOp<mlir::arith::TruncIOp>();
+    return trunc && input.getType().isInteger(32) &&
+           trunc.getIn().getDefiningOp<mlir::suvm::GetCoreIdOp>();
+  };
+  if (auto extend = value.getDefiningOp<mlir::arith::ExtUIOp>()) {
+    return is_widened_core(extend.getIn());
+  }
+  if (auto extend = value.getDefiningOp<mlir::arith::ExtSIOp>()) {
+    return is_widened_core(extend.getIn());
+  }
+  return false;
+}
+
 SunmmioMlirContext::SyncUnitMask MapSyncUnits(int64_t mask) {
   constexpr tl::SunmmioSyncUnits kKnownUnits =
       tl::kSunmmioSyncOdma0 | tl::kSunmmioSyncOdma1 | tl::kSunmmioSyncTc |
@@ -617,6 +637,12 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         src_core = type.ResolveValue(operands[3], ctx_.builder.getI64Type());
       }
       src_core = ensure_i64(src_core, "tl.broadcast_ src_core");
+
+      if (IsCurrentCoreId(src_core)) {
+        create_mcast();
+        emit_link_sync();
+        return SunMMIOValue{ret_dtype, result_name, ret_type};
+      }
 
       mlir::Value core_id = mlir::suvm::GetCoreIdOp::create(
                                 ctx_.builder, type.MakeDebugLoc("get_core_id"))
