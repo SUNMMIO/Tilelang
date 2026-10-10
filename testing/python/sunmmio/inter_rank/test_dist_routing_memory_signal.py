@@ -79,11 +79,11 @@ def test_memory_cross_row_preserves_generation_and_receiver_kind(dram, kind, rou
             route=route,
             world_size=4,
         ),
-        capture_passes=("tl.LowerDistRouting", "tl.InjectDistSync"),
+        capture_passes=("tl.LowerDistRouting", "tl.LowerDistSync"),
     )
     routed = result.pass_snapshot("tl.LowerDistRouting").mod
     assert collect_calls(routed, "tl.tileop.comm_put")
-    injected = result.pass_snapshot("tl.InjectDistSync").mod
+    injected = result.pass_snapshot("tl.LowerDistSync").mod
     puts = collect_calls(injected, "tl.dist_put_")
     assert len(puts) == (1 if route == "explicit" else 4)
     for put in puts:

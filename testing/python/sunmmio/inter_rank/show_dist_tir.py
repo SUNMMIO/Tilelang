@@ -26,7 +26,7 @@ _TIR_LOG_DIR = Path(__file__).resolve().parent / "log"
 SIGNAL_PASSES = (
     "tl.PlanDistSignals",
     "tl.LowerDistCommunication",
-    "tl.InjectDistSync",
+    "tl.LowerDistSync",
 )
 
 ROUTING_PASSES = (
@@ -51,7 +51,7 @@ MANUAL_EXPECT_PASSES = (
     "tl.PlanDistSignals",
     "tl.LowerDistRouting",
     "tl.LowerDistCommunication",
-    "tl.InjectDistSync",
+    "tl.LowerDistSync",
 )
 
 COLLECTIVE_PASSES = (
@@ -59,7 +59,7 @@ COLLECTIVE_PASSES = (
     "tl.PlanDistSignals",
     "tl.LowerDistRouting",
     "tl.LowerDistCommunication",
-    "tl.InjectDistSync",
+    "tl.LowerDistSync",
 )
 
 
@@ -854,7 +854,7 @@ def show_collective_all_to_allv_completion_wait_all_passes():
     lower_names = collect_op_names(lower_comm)
     assert lower_names.count("tl.dist_completion_init_") == 1
     assert lower_names.count("tl.dist_wait_any_") == 1
-    injected_script = result.pass_snapshot("tl.InjectDistSync").mod.script()
+    injected_script = result.pass_snapshot("tl.LowerDistSync").mod.script()
     assert "while 0 <" in injected_script
     assert "pending_count" in injected_script
 

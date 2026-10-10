@@ -213,7 +213,7 @@ def test_signals_preserve_independent_expected_and_generation():
     result = lower_to_device_tir(
         func,
         capture_before_passes="tl.PlanDistSignals",
-        capture_passes=("tl.PlanDistSignals", "tl.InjectDistSync"),
+        capture_passes=("tl.PlanDistSignals", "tl.LowerDistSync"),
     )
 
     before_plan = result.pass_snapshot("tl.PlanDistSignals", when="before").mod.script()
@@ -276,7 +276,7 @@ def test_value_and_memory_signals_use_generation_per_destination(signal_kind):
     )
     result = lower_to_device_tir(
         func,
-        capture_passes=("tl.LowerDistCommunication", "tl.InjectDistSync"),
+        capture_passes=("tl.LowerDistCommunication", "tl.LowerDistSync"),
     )
     lowered = result.pass_snapshot("tl.LowerDistCommunication").mod
     allocations = []
@@ -296,7 +296,7 @@ def test_value_and_memory_signals_use_generation_per_destination(signal_kind):
             assert isinstance(generation, tvm.tir.BufferLoad)
             generation_indices.append(int(generation.indices[0]))
 
-    for candidate in result.pass_snapshot("tl.InjectDistSync").mod.functions.values():
+    for candidate in result.pass_snapshot("tl.LowerDistSync").mod.functions.values():
         if isinstance(candidate, tvm.tir.PrimFunc):
             tvm.tir.stmt_functor.post_order_visit(candidate.body, visit)
     assert generation_indices == [1, 2]

@@ -1,5 +1,5 @@
 /*!
- * \file tl/transform/inject_dist_sync.cc
+ * \file tl/transform/lower_dist_sync.cc
  * \brief Materialize Rank submit synchronization and signal-state updates.
  */
 
@@ -335,7 +335,7 @@ private:
     if (call->op.same_as(dist_put_())) {
       ICHECK_EQ(call->args.size(), 6U)
           << "tl.dist_put_ must have its stable peer signature before "
-             "InjectDistSync";
+             "LowerDistSync";
       const DistSignalKindInfo &kind =
           RequireDistSignalKindInfo(call->args[3], "signal kind");
       if (kind.update_mode == DistSignalUpdateMode::kIncrement) {
@@ -497,17 +497,17 @@ PrimFunc Run(PrimFunc func) {
 
 } // namespace
 
-tvm::transform::Pass InjectDistSync() {
+tvm::transform::Pass LowerDistSync() {
   auto pass_func = [](PrimFunc func, const IRModule &,
                       const tvm::transform::PassContext &) {
     return Run(std::move(func));
   };
-  return CreatePrimFuncPass(pass_func, 0, "tl.InjectDistSync", {});
+  return CreatePrimFuncPass(pass_func, 0, "tl.LowerDistSync", {});
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.InjectDistSync", InjectDistSync);
+  refl::GlobalDef().def("tl.transform.LowerDistSync", LowerDistSync);
 }
 
 } // namespace tl

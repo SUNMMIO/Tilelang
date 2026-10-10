@@ -325,7 +325,7 @@ def test_allgather_signal_list_returns_per_source_completion():
             "tl.LowerDistCollectives",
             "tl.PlanDistSignals",
             "tl.LowerDistCommunication",
-            "tl.InjectDistSync",
+            "tl.LowerDistSync",
         ),
     )
 
@@ -337,7 +337,7 @@ def test_allgather_signal_list_returns_per_source_completion():
     assert collect_op_names(lower_comm).count("tl.dist_wait_any_") == 1
     assert "tl.dist_completion_init_" in collect_op_names(lower_comm)
 
-    injected = result.pass_snapshot("tl.InjectDistSync").mod
+    injected = result.pass_snapshot("tl.LowerDistSync").mod
     injected_script = injected.script()
     assert "tl.dist_completion_init_" not in collect_op_names(injected)
     assert collect_op_names(injected).count("tl.dist_wait_any_") == 1

@@ -269,7 +269,7 @@ def test_manual_routed_put_only_advances_expected_at_explicit_wait(
             repeat=True,
             world_size=4,
         ),
-        capture_passes=("tl.LowerDistCommunication", "tl.InjectDistSync"),
+        capture_passes=("tl.LowerDistCommunication", "tl.LowerDistSync"),
     )
     lowered = result.pass_snapshot("tl.LowerDistCommunication").mod
     markers = collect_nodes(
@@ -282,7 +282,7 @@ def test_manual_routed_put_only_advances_expected_at_explicit_wait(
     script = lowered.script()
     assert script.rindex("T.dist_put_(") < script.index("T.dist_expect_(")
 
-    injected = result.pass_snapshot("tl.InjectDistSync").mod
+    injected = result.pass_snapshot("tl.LowerDistSync").mod
     waits = collect_nodes(
         injected,
         tvm.tir.Call,
@@ -350,7 +350,7 @@ def test_manual_sender_signals_lower_dynamic_if_and_expected_deltas():
             "tl.PlanDistSignals",
             "tl.LowerDistRouting",
             "tl.LowerDistCommunication",
-            "tl.InjectDistSync",
+            "tl.LowerDistSync",
         ),
     )
 
@@ -372,7 +372,7 @@ def test_manual_sender_signals_lower_dynamic_if_and_expected_deltas():
     first_wait = lowered_script.index("T.dist_wait_signal_")
     assert lowered_script.rindex("T.dist_expect_") < first_wait
 
-    injected = result.pass_snapshot("tl.InjectDistSync").mod
+    injected = result.pass_snapshot("tl.LowerDistSync").mod
     injected_names = collect_op_names(injected)
     injected_script = injected.script()
     assert "tl.dist_expect_" not in injected_names
@@ -552,7 +552,7 @@ def test_manual_dynamic_member_wait_lowers_to_one_physical_wait():
     func = manual_dynamic_member_wait_kernel_factory.get_tir(world_size=4)
     result = lower_to_device_tir(
         func,
-        capture_passes=("tl.LowerDistCommunication", "tl.InjectDistSync"),
+        capture_passes=("tl.LowerDistCommunication", "tl.LowerDistSync"),
     )
 
     lowered = result.pass_snapshot("tl.LowerDistCommunication").mod

@@ -513,7 +513,7 @@ def test_row_shift_expands_local_forwarding_and_peer_puts():
             "tl.LowerDistRouting",
             "tl.LowerDistCommunication",
             "tl.LowerTileOp",
-            "tl.InjectDistSync",
+            "tl.LowerDistSync",
         ),
     )
 
