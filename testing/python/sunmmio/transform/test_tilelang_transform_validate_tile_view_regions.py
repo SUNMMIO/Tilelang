@@ -590,8 +590,8 @@ def _make_comm_kernel(comm_case):
 
     elif comm_case == "allreduce_low_level_valid":
         send_shape = (32, 32)
-        out_shape = (32,)
-        gather_shape = (16, 32)
+        out_shape = (32, 32)
+        gather_shape = (4, 32, 32)
 
         @T.prim_func
         def kernel(A: T.Tensor(shape, DTYPE)):
@@ -613,9 +613,9 @@ def _make_comm_kernel(comm_case):
                         "handle",
                         tvm.tir.op.Op.get("tl.tileop.comm_allreduce"),
                         A_shared[0:32, 0:32],
-                        Out_shared[0:32],
-                        Row_gather[0:16, 0:32],
-                        Col_gather[0:16, 0:32],
+                        Out_shared[0:32, 0:32],
+                        Row_gather[0:4, 0:32, 0:32],
+                        Col_gather[0:4, 0:32, 0:32],
                         "sum",
                         2,
                         1,

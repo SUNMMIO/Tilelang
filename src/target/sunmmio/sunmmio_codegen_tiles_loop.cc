@@ -3705,6 +3705,21 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         return emit_binary(BinaryOp::kMod, call->args[0], call->args[1],
                            call->dtype);
       }
+      if (op_node && call->args.size() == 2 &&
+          op_node->name == "tir.bitwise_and") {
+        return emit_binary(BinaryOp::kAnd, call->args[0], call->args[1],
+                           call->dtype);
+      }
+      if (op_node && call->args.size() == 2 &&
+          op_node->name == "tir.bitwise_or") {
+        return emit_binary(BinaryOp::kOr, call->args[0], call->args[1],
+                           call->dtype);
+      }
+      if (op_node && call->args.size() == 2 &&
+          op_node->name == "tir.bitwise_xor") {
+        return emit_binary(BinaryOp::kXor, call->args[0], call->args[1],
+                           call->dtype);
+      }
       if (op_node && op_node->name == "tl.ieee_frcp") {
         ICHECK_EQ(call->args.size(), 2U)
             << "tl.ieee_frcp expects value and rounding mode";
@@ -3720,8 +3735,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     }
     UnsupportedExpr(expr.get(),
                     "Clean v4 tiles lowering currently supports only "
-                    "BufferLoad/add/sub/mul/div/mod/min/max/compare/select/"
-                    "cast/constants and selected unary math calls");
+                    "BufferLoad/add/sub/mul/div/mod/min/max/bitwise/compare/"
+                    "select/cast/constants and selected unary math calls");
   };
 
   lower_stmt = [&](const Stmt &stmt, TileBlockState *state) {

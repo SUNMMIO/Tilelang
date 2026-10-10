@@ -81,15 +81,16 @@ def _expected_axis_last_all_lines(buffer):
     return lines
 
 
-def _allreduce_frontend_kernel(direction="all", clear=True, dtype="float32"):
+def _allreduce_frontend_kernel(direction="all", clear=True, dtype="float32", out_dtype=None):
     shape = (32, 32)
-    out_shape = (32,)
+    out_shape = shape
+    out_dtype = dtype if out_dtype is None else out_dtype
 
     @T.prim_func
-    def main(A: T.Tensor(shape, dtype), Out: T.Tensor(out_shape, dtype)):
+    def main(A: T.Tensor(shape, dtype), Out: T.Tensor(out_shape, out_dtype)):
         with T.Kernel(1, threads=128) as (bx,):
             A_shared = T.alloc_shared(shape, dtype, scope="shared.rsram")
-            Out_shared = T.alloc_shared(out_shape, dtype, scope="shared.rsram")
+            Out_shared = T.alloc_shared(out_shape, out_dtype, scope="shared.rsram")
 
             T.copy(A, A_shared)
             if not clear:
@@ -138,14 +139,31 @@ def test_comm_python_api(M, N, block_M, block_N, dtype, accum_dtype):
 def test_comm_allreduce_frontend_allocates_rsram_temporaries():
     script = _allreduce_frontend_kernel(direction="all", clear=False).script()
 
-    assert 'buffer = T.alloc_buffer((4, 32), scope="shared.rsram")' in script
-    assert 'buffer_1 = T.alloc_buffer((4, 32), scope="shared.rsram")' in script
-    assert 'buffer_2 = T.alloc_buffer((32,), scope="shared.rsram")' in script
+    assert 'buffer = T.alloc_buffer((4, 32, 32), scope="shared.rsram")' in script
+    assert 'buffer_1 = T.alloc_buffer((4, 32, 32), scope="shared.rsram")' in script
+    assert 'buffer_2 = T.alloc_buffer((32, 32), scope="shared.rsram")' in script
     assert (
-        "T.comm_allreduce(A_shared[0:32, 0:32], Out_shared[0:32], "
-        'buffer[0:4, 0:32], buffer_1[0:4, 0:32], "sum", 2, 1, '
-        "T.bool(False), buffer_2[0:32], bx)"
+        "T.comm_allreduce(A_shared[0:32, 0:32], Out_shared[0:32, 0:32], "
+        'buffer[0:4, 0:32, 0:32], buffer_1[0:4, 0:32, 0:32], "sum", 2, 1, '
+        "T.bool(False), buffer_2[0:32, 0:32], bx)"
     ) in script
+
+
+@pytest.mark.parametrize(("direction", "direction_id"), [("h", 0), ("v", 1)])
+@pytest.mark.parametrize("clear", [True, False])
+def test_comm_allreduce_single_axis_allocates_one_gather_temporary(direction, direction_id, clear):
+    script = _allreduce_frontend_kernel(direction=direction, clear=clear).script()
+    clear_literal = "True" if clear else "False"
+
+    assert script.count('T.alloc_buffer((4, 32, 32), scope="shared.rsram")') == 1
+    assert 'buffer_2 = T.alloc_buffer((32, 32), scope="shared.rsram")' not in script
+    assert f'"sum", {direction_id}, 1, T.bool({clear_literal}), bx)' in script
+    assert f"T.bool({clear_literal}), buffer_2" not in script
+
+
+def test_comm_allreduce_rejects_mixed_dtype():
+    with pytest.raises(AssertionError, match="Source and destination buffer dtypes must match for all_reduce"):
+        _allreduce_frontend_kernel(direction="h", dtype="float32", out_dtype="int32")
 
 
 def test_comm_buffer_like_region_python_api():
@@ -155,20 +173,20 @@ def test_comm_buffer_like_region_python_api():
             A_shared = T.alloc_shared([128, 128], "float32", scope="shared.rsram")
             B_shared = T.alloc_shared([128, 128], "float32", scope="shared.rsram")
             C_shared = T.alloc_shared([4, 64, 64], "float32", scope="shared.rsram")
-            Out_shared = T.alloc_shared([128], "float32", scope="shared.rsram")
+            Out_shared = T.alloc_shared([128, 128], "float32", scope="shared.rsram")
             T.copy(A, A_shared)
 
             T.comm.broadcast(A_shared[8:72, 16:80], B_shared[24:88, 32:96], (0, 0), direction="h")
             T.comm.put(A_shared[0:64, 0:64], B_shared[32:96, 32:96], (0, 0), (0, 1))
             T.comm.all_gather(A_shared[8:72, 16:80], C_shared[0:4, 0:64, 0:64], direction="h")
-            T.comm.all_reduce(A_shared[8:72, 16:80], Out_shared[32:96], "sum", "h", dim=1)
+            T.comm.all_reduce(A_shared[8:72, 16:80], Out_shared[32:96, 32:96], "sum", "h", dim=1)
 
     script = main.script()
     assert "T.comm_broadcast(A_shared[8:72, 16:80], B_shared[24:88, 32:96], -1, 0, 0)" in script
     assert "T.comm_put(A_shared[0:64, 0:64], B_shared[32:96, 32:96], -1, 0, 1)" in script
     assert "T.comm_allgather(A_shared[8:72, 16:80], C_shared[0:4, 0:64, 0:64], 0, -1, -1, bx)" in script
     assert (
-        'T.comm_allreduce(A_shared[8:72, 16:80], Out_shared[32:96], buffer[0:4, 0:64], buffer_1[0:4, 0:64], "sum", 0, 1, T.bool(True), bx)'
+        'T.comm_allreduce(A_shared[8:72, 16:80], Out_shared[32:96, 32:96], buffer[0:4, 0:64, 0:64], buffer[0:4, 0:64, 0:64], "sum", 0, 1, T.bool(True), bx)'
     ) in script
 
 
@@ -205,7 +223,7 @@ def test_comm_compact_path_preserves_original_regions():
                 gather_send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
                 gather_recv = T.alloc_shared((4, 32, 32), "float32", scope="shared.rsram")
                 reduce_src = T.alloc_shared((32, 64), "float32", scope="shared.rsram")
-                reduce_out = T.alloc_shared((32,), "float32", scope="shared.rsram")
+                reduce_out = T.alloc_shared((32, 64), "float32", scope="shared.rsram")
 
                 T.comm.broadcast(src[0:1, 0:32, 0:32], broadcast_dst[0:4, 0:32, 0:32], (0, 0), direction="h")
                 T.comm.put(src[0:1, 0:32, 0:32], put_dst[0:4, 0:32, 0:32], (0, 0), (0, 1))
@@ -216,7 +234,7 @@ def test_comm_compact_path_preserves_original_regions():
         assert "T.comm_broadcast(src[0, 0:32, 0:32], broadcast_dst[0:4, 0:32, 0:32]" in script
         assert "T.comm_put(src[0, 0:32, 0:32], put_dst[0:4, 0:32, 0:32]" in script
         assert "T.comm_allgather(gather_send[0:32, 0:32], gather_recv[0:4, 0:32, 0:32]" in script
-        assert "T.comm_allreduce(reduce_src[0:32, 0:64], reduce_out[0:32]" in script
+        assert "T.comm_allreduce(reduce_src[0:32, 0:64], reduce_out[0:32, 0:64]" in script
     finally:
         _target_utils.set_sunmmio_region_validation(previous)
 
@@ -241,7 +259,7 @@ def test_comm_compact_path_keeps_original_dynamic_extent_behavior():
             T.comm.all_gather(src, gather_recv, direction="h")
 
         reduce_out = tvm.tir.decl_buffer((64,), "float32", name="reduce_out", scope="shared.rsram")
-        with pytest.raises(ValueError, match="Invalid reduce output shape"):
+        with pytest.raises(ValueError, match="Invalid all_reduce output shape"):
             T.comm.all_reduce(src, reduce_out, "sum", "h", dim=1)
     finally:
         _target_utils.set_sunmmio_region_validation(previous)
@@ -260,7 +278,7 @@ def test_comm_compact_path_accepts_unresolved_mesh_shape_without_warning():
                     send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
                     recv = T.alloc_shared((32, 32 * T.ncols()), "float32", scope="shared.rsram")
                     reduce_src = T.alloc_shared((32 * T.ncols(), 32), "float32", scope="shared.rsram")
-                    reduce_out = T.alloc_shared((128,), "float32", scope="shared.rsram")
+                    reduce_out = T.alloc_shared((32 * T.ncols(), 32), "float32", scope="shared.rsram")
                     T.comm.all_gather(send, recv, direction="h", axis=-1)
                     T.comm.all_reduce(reduce_src, reduce_out, "sum", "h", dim=1)
 
@@ -358,18 +376,18 @@ def test_comm_all_reduce_regions_follow_copy_normalization_rules(_strict_region_
     def main():
         with T.Kernel():
             src = T.alloc_shared((64, 64), "float32", scope="shared.rsram")
-            out_from_load = T.alloc_shared((32,), "float32", scope="shared.rsram")
-            out_load = T.alloc_shared((64,), "float32", scope="shared.rsram")
-            out_shrink = T.alloc_shared((64,), "float32", scope="shared.rsram")
+            out_from_load = T.alloc_shared((32, 64), "float32", scope="shared.rsram")
+            out_load = T.alloc_shared((64, 64), "float32", scope="shared.rsram")
+            out_shrink = T.alloc_shared((64, 64), "float32", scope="shared.rsram")
 
             T.comm.all_reduce(src[16, 0], out_from_load, "sum", "h", dim=1)
-            T.comm.all_reduce(src[0:32, 0:64], out_load[16], "sum", "h", dim=1)
+            T.comm.all_reduce(src[0:32, 0:64], out_load[16, 0], "sum", "h", dim=1)
             T.comm.all_reduce(src[0:32, 0:64], out_shrink, "sum", "h", dim=1)
 
     script = main.script()
-    assert "T.comm_allreduce(src[16:48, 0:64], out_from_load[0:32]" in script
-    assert "T.comm_allreduce(src[0:32, 0:64], out_load[16:48]" in script
-    assert "T.comm_allreduce(src[0:32, 0:64], out_shrink[0:32]" in script
+    assert "T.comm_allreduce(src[16:48, 0:64], out_from_load[0:32, 0:64]" in script
+    assert "T.comm_allreduce(src[0:32, 0:64], out_load[16:48, 0:64]" in script
+    assert "T.comm_allreduce(src[0:32, 0:64], out_shrink[0:32, 0:64]" in script
 
 
 def test_comm_all_reduce_full_buffer_extent_mismatch_is_rejected(_strict_region_validation):
@@ -379,7 +397,7 @@ def test_comm_all_reduce_full_buffer_extent_mismatch_is_rejected(_strict_region_
         def main():
             with T.Kernel():
                 src = T.alloc_shared((32, 64), "float32", scope="shared.rsram")
-                out = T.alloc_shared((64,), "float32", scope="shared.rsram")
+                out = T.alloc_shared((64, 64), "float32", scope="shared.rsram")
                 T.comm.all_reduce(src, out, "sum", "h", dim=1)
 
 
@@ -390,8 +408,8 @@ def test_comm_all_reduce_buffer_load_pair_is_rejected(_strict_region_validation)
         def main():
             with T.Kernel():
                 src = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
-                out = T.alloc_shared((32,), "float32", scope="shared.rsram")
-                T.comm.all_reduce(src[0, 0], out[0], "sum", "h", dim=1)
+                out = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                T.comm.all_reduce(src[0, 0], out[0, 0], "sum", "h", dim=1)
 
 
 def test_comm_dynamic_core_python_api():
