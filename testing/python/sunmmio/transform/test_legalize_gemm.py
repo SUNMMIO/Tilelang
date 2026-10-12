@@ -3,14 +3,15 @@
 The pass expands each bf16 ASRAM GEMM into the two-pass form required by
 the Sunmmio bf16 tensor core (TC reads only ASRAM north). For each
 matching GEMM, it:
-  1. Duplicates the direct A-operand writer (Copy or AllgatherOp) with
+  1. Stages supported Broadcast/guarded Put through Allgather + local Copy.
+     Duplicates the resulting A-operand writer (Copy or AllgatherOp) with
      annotation ``src_offset_byte`` set to the HW ASRAM bank stripe (1024 B
      on A4E).
   2. Duplicates the GEMM with the ``accOffsetByte`` direct field set to
      ``(block_h / 2) * block_w * sizeof(C_dtype)`` (2048 for fp32 acc,
      1024 for bf16 acc).
 
-These tests focus on bf16 GEMM scenarios per #133.
+These tests cover bf16 GEMM scenarios from #133 and #268.
 
 Note on K-loop trip counts: the kernels here all have single-iteration
 K-loops (sharded_K <= block_K). That is sufficient for transform-level
@@ -142,6 +143,231 @@ def test_legalize_sunmmio_gemm_on_allgather_writer():
         else:
             acc_offsets.append(0)
     assert sorted(acc_offsets) == [0, 2048], f"expected acc_offset values [0, 2048] (fp32 acc, block 32x32), got {sorted(acc_offsets)}"
+
+
+def bf16_gemm_with_broadcast(
+    broadcast_size=-1, use_put=False, cross_row=False, hoisted=False,
+    guarded_put=False, guard_core=1, put_target=(0, 1), outer_guard=False,
+    source_col=0, broadcast_b=False,
+):
+    """Broadcast one complete BF16 A tile along each core row before GEMM."""
+    from tilelang.layout import make_zz_layout
+
+    M = N = K = 128
+    block_M = block_N = block_K = 32
+    A_layout = make_zz_layout((M, K), [0, 1], (32, 32))
+    B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
+    C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((M, K), T.placement.full_shard(0, 1), "bfloat16", layout=A_layout),
+        B: T.MeshTensor((K, N), T.placement.full_shard(0, 1), "bfloat16", layout=B_layout),
+        C: T.MeshTensor((M, N), T.placement.full_shard(0, 1), "float32", layout=C_layout),
+    ):
+        with T.Kernel(T.mesh_ncores()) as cid:
+            _, sharded_K = A.local_shape
+            A_shared = T.alloc_shared((block_M, block_K), "bfloat16", scope="shared.rsram")
+            A_dist = T.alloc_shared((block_M, block_K), "bfloat16")
+            B_shared = T.alloc_shared((block_K, block_N), "bfloat16")
+            C_shared = T.alloc_shared((block_M, block_N), "float32")
+
+            if hoisted:
+                T.copy(A[0, 0], A_shared)
+                T.comm.broadcast(A_shared, A_dist, (cid // T.mesh_ncols(), source_col), direction="h")
+            T.clear(C_shared)
+            for k in T.Pipelined(T.ceildiv(sharded_K, block_K), num_stages=2):
+                if outer_guard:
+                    if cid != 0:
+                        T.copy(A[0, k * block_K], A_shared)
+                        T.copy(B[k * block_K, 0], B_shared)
+                        T.comm.put(A_shared, A_dist, (0, 0), (0, 1))
+                        if cid == 1:
+                            T.gemm(A_dist, B_shared, C_shared)
+                else:
+                    if not hoisted:
+                        T.copy(A[0, k * block_K], A_shared)
+                    if guarded_put:
+                        T.copy(B[k * block_K, 0], B_shared)
+                    if use_put:
+                        T.comm.put(A_shared, A_dist, (0, 0), put_target, size=broadcast_size)
+                    elif not hoisted:
+                        T.comm.broadcast(
+                            A_shared, A_dist, (0, 0) if cross_row else (cid // T.mesh_ncols(), source_col),
+                            direction="h", size=broadcast_size
+                        )
+                    if not guarded_put:
+                        if broadcast_b:
+                            T.comm.broadcast(
+                                B[k * block_K:k * block_K + block_K, 0:block_N], B_shared,
+                                (0, cid % T.mesh_ncols()), direction="v"
+                            )
+                        else:
+                            T.copy(B[k * block_K, 0], B_shared)
+                    if guarded_put:
+                        if cid == guard_core:
+                            T.gemm(A_dist, B_shared, C_shared)
+                    else:
+                        T.gemm(A_dist, B_shared, C_shared)
+            T.copy(C_shared, C[0, 0])
+
+    return main
+
+
+def test_legalize_sunmmio_gemm_on_broadcast_writer():
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": bf16_gemm_with_broadcast()}))
+    broadcasts = find_call_args(mod, "tl.tileop.comm_broadcast")
+    assert not broadcasts
+    assert count_call_op(mod, "tl.tileop.comm_allgather") == 1
+    copies = find_call_args(mod, "tl.tileop.copy")
+    assert sum(int(attrs.get("src_offset_byte", 0)) == 1024 for _, attrs in copies) == 1
+    gemms = find_call_args(mod, "tl.tileop.gemm_py")
+    assert sorted(int(args[19]) if len(args) > 19 else 0 for args, _ in gemms) == [0, 2048]
+
+    lowered = tl.transform.LowerTileOp()(mod)
+    assert [int(args[4]) for args, _ in find_call_args(lowered, "tl.broadcast_")] == [0]
+    assert sorted(int(args[6]) for args, _ in find_call_args(lowered, "tl.mma_sunmmio")) == [0, 2048]
+
+
+def test_legalize_sunmmio_gemm_hoisted_broadcast_restores_each_iteration():
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": bf16_gemm_with_broadcast(hoisted=True)}))
+    assert_hoisted_direct_structure(
+        mod, expected_acc_offset=2048, expected_pairs=1, writer_op="tl.tileop.copy"
+    )
+
+
+@pytest.mark.parametrize("source_col", [0, 2, 3])
+def test_broadcast_gather_selects_source_slot_and_initializes_senders(source_col):
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({
+        "main": bf16_gemm_with_broadcast(source_col=source_col)
+    }))
+    gather_args, _ = find_call_args(mod, "tl.tileop.comm_allgather")[0]
+    send = gather_args[0].args[0].buffer
+    receive = gather_args[1].args[0].buffer
+    assert send.scope() == receive.scope() == "shared.rsram"
+    assert [int(x) for x in receive.shape] == [128, 32]
+    selected = []
+    for args, attrs in find_call_args(mod, "tl.tileop.copy"):
+        region = args[0]
+        if isinstance(region, tvm.tir.Call) and region.args[0].buffer.same_as(receive):
+            selected.append((int(region.args[0].indices[0]), int(attrs.get("src_offset_byte", 0))))
+    assert selected == [(source_col * 32, 0), (source_col * 32, 1024)]
+    fills = find_call_args(mod, "tl.tileop.fill")
+    assert any(args[0].args[0].buffer.same_as(send) and args[1].value == 0 for args, _ in fills)
+
+
+def test_legalize_sunmmio_gemm_rejects_partial_broadcast_writer():
+    mod = tvm.IRModule({"main": bf16_gemm_with_broadcast(broadcast_size=512)})
+    with pytest.raises(Exception, match="broadcast writer must transfer its full source region"):
+        apply_pipeline_up_to_legalize_gemm(mod)
+
+
+def test_legalize_sunmmio_gemm_rejects_cross_row_broadcast_writer():
+    mod = tvm.IRModule({"main": bf16_gemm_with_broadcast(cross_row=True)})
+    with pytest.raises(Exception, match="horizontal broadcast source must be in the GEMM core's row"):
+        apply_pipeline_up_to_legalize_gemm(mod)
+
+
+def test_legalize_sunmmio_gemm_rejects_single_target_put():
+    mod = tvm.IRModule({"main": bf16_gemm_with_broadcast(use_put=True)})
+    with pytest.raises(Exception, match="put writer for bf16 ASRAM A is not supported"):
+        apply_pipeline_up_to_legalize_gemm(mod)
+
+
+def test_legalize_sunmmio_gemm_keeps_gather_outside_target_guard():
+    mod = tvm.IRModule({"main": bf16_gemm_with_broadcast(guarded_put=True)})
+    mod = apply_pipeline_up_to_legalize_gemm(mod)
+    loop = _find_k_loop_for(mod)
+    assert count_call_op(mod, "tl.tileop.comm_allgather") == 1
+    assert count_call_op(mod, "tl.tileop.gemm_py") == 2
+    guard = list(loop.body.seq)[-1]
+    assert isinstance(guard, tvm.tir.IfThenElse)
+    inner = tvm.IRModule({"main": mod["main"].with_body(guard.then_case)})
+    assert count_call_op(inner, "tl.tileop.comm_allgather") == 0
+
+
+@pytest.mark.parametrize("broadcast_b", [False, True])
+def test_broadcast_gemm_codegen_validates_with_npuir(tmp_path, broadcast_b):
+    from testing.python.sunmmio.common.codegen_validation import validate_sunmmio_codegen_with_npuir_opt
+
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        bf16_gemm_with_broadcast(broadcast_b=broadcast_b),
+        tmp_path,
+        mlir_filename="issue268_broadcast_gemm.mlir",
+        expected_tokens=("suvm.mcast_async", "suvm.tc.mma"),
+        opt_args=("--verify-each", "--suvm-to-llvm-pipeline"),
+    )
+    assert src.count("suvm.mcast_async") == 1 + int(broadcast_b)
+    assert "source_mask" not in src
+    assert "link.receive" not in src
+    assert src.count("suvm.tc.mma") == 2
+
+
+def test_legalize_sunmmio_gemm_on_guarded_put_writer():
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": bf16_gemm_with_broadcast(use_put=True, guarded_put=True)}))
+    assert count_call_op(mod, "tl.tileop.comm_put") == 0
+    broadcasts = find_call_args(mod, "tl.tileop.comm_broadcast")
+    assert not broadcasts
+    assert count_call_op(mod, "tl.tileop.comm_allgather") == 1
+    assert sorted(int(args[19]) if len(args) > 19 else 0 for args, _ in find_call_args(mod, "tl.tileop.gemm_py")) == [0, 2048]
+    loop = _find_k_loop_for(mod)
+    seq = list(loop.body.seq)
+    assert isinstance(seq[-1], tvm.tir.IfThenElse)
+    inner = list(seq[-1].then_case.seq)
+    copy_op = tvm.tir.op.Op.get("tl.tileop.copy")
+    assert [_is_call(stmt, copy_op) for stmt in inner] == [True, False, True, False]
+    assert sorted(int(attrs.get("src_offset_byte", 0)) for _, attrs in
+                  find_call_args(tvm.IRModule({"main": mod["main"].with_body(seq[-1])}), "tl.tileop.copy")) == [0, 1024]
+    lowered = tl.transform.LowerTileOp()(mod)
+    assert [int(args[4]) for args, _ in find_call_args(lowered, "tl.broadcast_")] == [0]
+    assert [int(args[3]) for args, _ in find_call_args(lowered, "tl.broadcast_")] == [15]
+    again = tl.transform.LegalizeSunmmioGemm()(mod)
+    tvm.ir.assert_structural_equal(again, mod)
+    assert count_call_op(again, "tl.tileop.gemm_py") == 2
+
+
+def test_legalize_sunmmio_gemm_rejects_put_guard_on_wrong_core():
+    mod = tvm.IRModule({"main": bf16_gemm_with_broadcast(use_put=True, guarded_put=True, guard_core=2)})
+    with pytest.raises(Exception, match="put writer for bf16 ASRAM A is not supported"):
+        apply_pipeline_up_to_legalize_gemm(mod)
+
+
+def test_legalize_sunmmio_gemm_rejects_partial_guarded_put():
+    mod = tvm.IRModule({"main": bf16_gemm_with_broadcast(use_put=True, guarded_put=True, broadcast_size=512)})
+    with pytest.raises(Exception, match="put writer for bf16 ASRAM A is not supported"):
+        apply_pipeline_up_to_legalize_gemm(mod)
+
+
+def test_legalize_sunmmio_gemm_rejects_put_when_outer_guard_skips_source():
+    mod = tvm.IRModule({"main": bf16_gemm_with_broadcast(outer_guard=True)})
+    with pytest.raises(Exception, match="put writer for bf16 ASRAM A is not supported"):
+        apply_pipeline_up_to_legalize_gemm(mod)
+
+
+def test_legalize_sunmmio_gemm_diagonal_put_still_requires_rsram_receive():
+    mod = tvm.IRModule(
+        {"main": bf16_gemm_with_broadcast(use_put=True, guarded_put=True, put_target=(1, 1), guard_core=5)}
+    )
+    with pytest.raises(Exception, match="Unsupported communication path from shared.rsram to shared.asram"):
+        apply_pipeline_up_to_legalize_gemm(mod)
+
+
+def test_guarded_put_gemm_codegen_validates_with_npuir(tmp_path):
+    from testing.python.sunmmio.common.codegen_validation import validate_sunmmio_codegen_with_npuir_opt
+
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        bf16_gemm_with_broadcast(use_put=True, guarded_put=True),
+        tmp_path,
+        mlir_filename="issue268_guarded_put_gemm.mlir",
+        expected_tokens=("suvm.mcast_async", "suvm.tc.mma"),
+        opt_args=("--verify-each",),
+    )
+    assert src.count("suvm.mcast_async") == 1
+    assert "source_mask" not in src
+    assert "link.receive" not in src
+    assert src.count("suvm.tc.mma") == 2
+
+
 
 
 def bf16_gemm_with_copy_to_asram(M=128, N=128, K=128, block_M=32, block_N=32, block_K=32, dtype="bfloat16", accum_dtype="float32"):
@@ -432,6 +658,44 @@ def test_legalize_sunmmio_gemm_hoisted_shadow_when_source_dirty():
     func = bf16_gemm_with_hoisted_writer_dirty_source()
     mod = tvm.IRModule({"main": func})
     mod = apply_pipeline_up_to_legalize_gemm(mod)
+    assert_hoisted_shadow_structure(mod, expected_acc_offset=2048, expected_pairs=1)
+
+
+def bf16_gemm_with_broadcast_dirtying_hoisted_source():
+    """A broadcast after a hoisted writer must invalidate its RSRAM source."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((128, 128), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((128, 128), T.placement.full_shard(0, 1), "bfloat16", layout=layout),
+        B: T.MeshTensor((128, 128), T.placement.full_shard(0, 1), "bfloat16", layout=layout),
+        C: T.MeshTensor((128, 128), T.placement.full_shard(0, 1), "float32", layout=layout),
+    ):
+        with T.Kernel(T.mesh_ncores()) as cid:
+            source = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            replacement = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            a_dist = T.alloc_shared((32, 32), "bfloat16")
+            b_shared = T.alloc_shared((32, 32), "bfloat16")
+            c_shared = T.alloc_shared((32, 32), "float32")
+            T.copy(A[0, 0], source)
+            T.copy(source, a_dist)
+            T.clear(c_shared)
+            for k in T.Pipelined(1, num_stages=2):
+                T.copy(A[0, 0], replacement)
+                T.comm.broadcast(replacement, source, (cid // T.mesh_ncols(), 0), direction="h")
+                T.copy(B[0, 0], b_shared)
+                T.gemm(a_dist, b_shared, c_shared)
+            T.copy(c_shared, C[0, 0])
+
+    return main
+
+
+def test_legalize_sunmmio_gemm_broadcast_marks_reissue_source_dirty():
+    mod = apply_pipeline_up_to_legalize_gemm(
+        tvm.IRModule({"main": bf16_gemm_with_broadcast_dirtying_hoisted_source()})
+    )
     assert_hoisted_shadow_structure(mod, expected_acc_offset=2048, expected_pairs=1)
 
 

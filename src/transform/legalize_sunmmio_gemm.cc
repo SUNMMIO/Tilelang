@@ -12,7 +12,12 @@
  * once on data re-staged so that what previously landed in south now lands
  * in north.
  *
- * ─── Pass architecture (4 phases) ──────────────────────────────────────────
+ * ─── Pass architecture ─────────────────────────────────────────────────────
+ * 0. Stage adjacent fixed-core Put + destination-guarded GEMM through a
+ *    private RSRAM receive buffer. Lower single-source BF16 broadcasts to
+ *    full-line Allgather and a source-slot Copy before GEMM legalization.
+ *
+ * The remaining bf16 ASRAM GEMMs follow four phases:
  * 1. Reaching definitions analysis (Bf16AsramOperandFlow):
  *    structured RD computation over SeqStmt / For / If / Block. Output:
  *    list of (gemm, reaching writer) records. Handles nested loops and
@@ -61,9 +66,9 @@
  *    removed writer to populate it.
  *
  * This pass runs between SunmmioLayoutInference and LowerTileOp so it can
- * see high-level ops (Copy, AllgatherOp, Gemm, GemmPy) directly and operate
- * on their annotations and direct fields before TileOp lowering converts
- * them to TIR intrinsics.
+ * see high-level ops (Copy, AllgatherOp, BroadcastOp, Gemm, GemmPy) directly
+ * and operate on their annotations and direct fields before TileOp lowering
+ * converts them to TIR intrinsics.
  */
 
 #include <tvm/ffi/reflection/registry.h>
@@ -79,6 +84,7 @@
 #include <utility>
 #include <vector>
 
+#include "../layout/cute_layout.h"
 #include "../op/comm.h"
 #include "../op/copy.h"
 #include "../op/fill.h"
@@ -87,6 +93,7 @@
 #include "../op/utils.h"
 #include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
+#include "common/attr.h"
 
 namespace tvm {
 namespace tl {
@@ -96,12 +103,13 @@ using namespace tir::transform;
 
 namespace {
 
-// Returns the destination Buffer for a Copy or AllgatherOp call, or
-// std::nullopt otherwise. Both ops carry the destination region as args[1].
+// Data-transfer ops carry the destination region as args[1]. Put is tracked
+// conservatively as a write but cannot serve as a full-mesh GEMM A writer.
 std::optional<Buffer> GetDstBuffer(const CallNode *call) {
   if (call == nullptr)
     return std::nullopt;
-  if (call->op.same_as(Copy::Get()) || call->op.same_as(AllgatherOp::Get())) {
+  if (call->op.same_as(Copy::Get()) || call->op.same_as(AllgatherOp::Get()) ||
+      call->op.same_as(BroadcastOp::Get()) || call->op.same_as(PutOp::Get())) {
     if (call->args.size() < 2)
       return std::nullopt;
     BufferRegion dst_br = NormalizeToBufferRegion(call->args[1]);
@@ -463,7 +471,23 @@ private:
 
 // ─── Phase 2: validate ─────────────────────────────────────────────────────
 
-void ValidateGemms(const std::vector<GemmReachingDef> &gemms) {
+std::optional<PrimExpr> FindKernelCoreId(const Stmt &body) {
+  std::optional<PrimExpr> core_id;
+  PostOrderVisit(body, [&](const ObjectRef &node) {
+    const auto *attr = node.as<AttrStmtNode>();
+    if (!attr || attr->attr_key != tir::attr::thread_extent)
+      return;
+    const auto *iter = attr->node.as<IterVarNode>();
+    if (iter && iter->thread_tag == "blockIdx.x")
+      core_id = iter->var;
+  });
+  return core_id;
+}
+
+void ValidateGemms(const std::vector<GemmReachingDef> &gemms, const Stmt &body,
+                   Target target) {
+  auto core_id = FindKernelCoreId(body);
+  int ncols = GetSunmmioMeshConfig(target).ncol;
   for (const auto &g : gemms) {
     if (g.writer_rd.kind == ReachingDef::Kind::NONE) {
       LOG(FATAL) << "LegalizeSunmmioGemm: bf16-ASRAM A operand '"
@@ -480,9 +504,44 @@ void ValidateGemms(const std::vector<GemmReachingDef> &gemms) {
                     "(e.g., divergent writers in if/else branches). "
                     "Per-branch legalization is not yet supported.";
     }
-    // The writer op type needs no validation here: Phase 1 discovers
-    // writers only through GetDstBuffer, which yields a buffer exclusively
-    // for Copy / AllgatherOp — so writer_rd.writer is always one of those.
+    const CallNode *writer = g.writer_rd.writer;
+    ICHECK(!writer->op.same_as(PutOp::Get()))
+        << "LegalizeSunmmioGemm: put writer for bf16 ASRAM A is not "
+           "supported: a single destination core does not cover every "
+           "GEMM core, and moving the reissued put into a guarded GEMM "
+           "can skip its source core. Broadcast or copy from a complete "
+           "RSRAM receive buffer instead";
+    if (!writer->op.same_as(BroadcastOp::Get()))
+      continue;
+
+    BroadcastOp broadcast(writer->args, writer->annotations);
+    BufferRegion src = NormalizeToBufferRegion(writer->args[0]);
+    BufferRegion dst = NormalizeToBufferRegion(writer->args[1]);
+    BufferRegion a = NormalizeToBufferRegion(g.gemm->args[0]);
+    ICHECK_EQ(broadcast->direction, 0)
+        << "LegalizeSunmmioGemm: broadcast writer for bf16 ASRAM A must be "
+           "horizontal; other directions are not supported";
+    arith::Analyzer analyzer;
+    PrimExpr cols = IntImm(DataType::Int(32), ncols);
+    ICHECK(core_id.has_value() &&
+           analyzer.CanProveEqual(floordiv(broadcast->src_core, cols),
+                                  floordiv(core_id.value(), cols)))
+        << "LegalizeSunmmioGemm: horizontal broadcast source must be "
+           "in the GEMM core's row";
+    ICHECK_EQ(broadcast->size->value, -1)
+        << "LegalizeSunmmioGemm: broadcast writer must transfer its full "
+           "source region";
+    ICHECK_EQ(src->region.size(), dst->region.size());
+    ICHECK_EQ(dst->region.size(), a->region.size());
+    for (size_t i = 0; i < dst->region.size(); ++i) {
+      ICHECK(analyzer.CanProveEqual(dst->region[i]->min, a->region[i]->min) &&
+             analyzer.CanProveEqual(dst->region[i]->extent,
+                                    a->region[i]->extent) &&
+             analyzer.CanProveEqual(src->region[i]->extent,
+                                    dst->region[i]->extent))
+          << "LegalizeSunmmioGemm: broadcast writer must cover the full "
+             "GEMM A region with an equally sized source";
+    }
   }
 }
 
@@ -641,6 +700,260 @@ const CallNode *AsEvaluatedCall(const Stmt &s) {
   const auto *eval = s.as<EvaluateNode>();
   return eval ? eval->value.as<CallNode>() : nullptr;
 }
+
+// Stage a guarded put in a private row-wide receive buffer. Only the target
+// copies into ASRAM; local copies can then use the regular two-pass rewrite.
+class GuardedPutGemmRewriter : public StmtExprMutator {
+public:
+  GuardedPutGemmRewriter(const Stmt &body, Target target,
+                         const SunmmioTileProcessorConfig &cfg)
+      : core_id_(FindKernelCoreId(body)), target_(target), cfg_(cfg) {
+    PostOrderVisit(body, [&](const ObjectRef &node) {
+      if (const auto *call = node.as<CallNode>()) {
+        if (auto info = GetBf16AsramGemmInfo(call, cfg_)) {
+          ++consumers_[info->a_dist.get()];
+          if (info->acc_offset_byte != 0)
+            already_legalized_.insert(info->a_dist.get());
+        }
+      }
+    });
+  }
+
+private:
+  std::optional<PrimExpr> core_id_;
+  Target target_;
+  const SunmmioTileProcessorConfig &cfg_;
+  std::unordered_map<const BufferNode *, int> consumers_;
+  std::unordered_set<const BufferNode *> already_legalized_;
+  std::unordered_map<const BufferNode *, Buffer> receive_buffers_;
+  int conditional_depth_ = 0;
+
+  Stmt VisitStmt_(const BlockNode *op) final {
+    Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
+    Array<Buffer> alloc_buffers = block->alloc_buffers;
+    for (const Buffer &buf : block->alloc_buffers) {
+      auto it = receive_buffers_.find(buf.get());
+      if (it != receive_buffers_.end())
+        alloc_buffers.push_back(it->second);
+    }
+    if (alloc_buffers.size() != block->alloc_buffers.size())
+      block.CopyOnWrite()->alloc_buffers = std::move(alloc_buffers);
+    return block;
+  }
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    ++conditional_depth_;
+    Stmt visited = StmtExprMutator::VisitStmt_(op);
+    --conditional_depth_;
+    return visited;
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
+    Stmt visited = StmtExprMutator::VisitStmt_(op);
+    const auto *seq = visited.as<SeqStmtNode>();
+    if (!seq)
+      return visited;
+    Array<Stmt> out;
+    for (size_t i = 0; i < seq->seq.size(); ++i) {
+      const CallNode *writer = AsEvaluatedCall(seq->seq[i]);
+      const auto *guard = i + 1 < seq->seq.size()
+                              ? seq->seq[i + 1].as<IfThenElseNode>()
+                              : nullptr;
+      if (conditional_depth_ != 0 || !writer ||
+          !writer->op.same_as(PutOp::Get()) || !guard ||
+          guard->else_case.defined()) {
+        out.push_back(seq->seq[i]);
+        continue;
+      }
+      const CallNode *gemm = AsEvaluatedCall(guard->then_case);
+      auto info = GetBf16AsramGemmInfo(gemm, cfg_);
+      if (!info || info->acc_offset_byte != 0 ||
+          already_legalized_.count(info->a_dist.get()) ||
+          consumers_[info->a_dist.get()] != 1 || IsBatchReductionGemm(gemm)) {
+        out.push_back(seq->seq[i]);
+        continue;
+      }
+      PutOp put(writer->args, writer->annotations);
+      const auto *src_id = put->src_core.as<IntImmNode>();
+      const auto *dst_id = put->dst_core.as<IntImmNode>();
+      const auto *eq = guard->condition.as<EQNode>();
+      arith::Analyzer analyzer;
+      bool guard_matches = eq && core_id_ && dst_id &&
+                           ((eq->a.same_as(core_id_.value()) &&
+                             analyzer.CanProveEqual(eq->b, put->dst_core)) ||
+                            (eq->b.same_as(core_id_.value()) &&
+                             analyzer.CanProveEqual(eq->a, put->dst_core)));
+      int ncols = GetSunmmioMeshConfig(target_).ncol;
+      if (!src_id || !dst_id || src_id->value == dst_id->value ||
+          (src_id && dst_id &&
+           src_id->value / ncols != dst_id->value / ncols) ||
+          !guard_matches || put->size->value != -1) {
+        out.push_back(seq->seq[i]);
+        continue;
+      }
+      BufferRegion src = NormalizeToBufferRegion(writer->args[0]);
+      BufferRegion dst = NormalizeToBufferRegion(writer->args[1]);
+      BufferRegion a = NormalizeToBufferRegion(gemm->args[0]);
+      bool full = dst->buffer.same_as(info->a_dist) &&
+                  src->region.size() == dst->region.size() &&
+                  dst->region.size() == a->region.size();
+      if (full) {
+        for (size_t dim = 0; dim < dst->region.size(); ++dim) {
+          full &= analyzer.CanProveEqual(dst->region[dim]->min,
+                                         a->region[dim]->min) &&
+                  analyzer.CanProveEqual(dst->region[dim]->extent,
+                                         a->region[dim]->extent) &&
+                  analyzer.CanProveEqual(src->region[dim]->extent,
+                                         dst->region[dim]->extent);
+        }
+      }
+      if (!full) {
+        out.push_back(seq->seq[i]);
+        continue;
+      }
+      Buffer receive =
+          MakeCompactBufferLike(src->buffer, src->region, kSunmmioScopeRSRAM,
+                                info->a_dist->name + "_put_receive");
+      receive_buffers_[info->a_dist.get()] = receive;
+      Array<Range> receive_range = MakeCompactRegion(src->region);
+      PrimExpr receive_write = MakeRegionExpr(receive, receive_range, 2);
+      PrimExpr receive_read = MakeRegionExpr(receive, receive_range, 1);
+      out.push_back(Evaluate(Call(writer->dtype, BroadcastOp::Get(),
+                                  {writer->args[0], receive_write, put->size,
+                                   put->src_core, IntImm(DataType::Int(32), 0)},
+                                  {})));
+      Stmt copy = Evaluate(Call(DataType::Handle(), Copy::Get(),
+                                {receive_read, writer->args[1]}, {}));
+      out.push_back(IfThenElse(
+          guard->condition, SeqStmt::Flatten(copy, guard->then_case), Stmt()));
+      ++i;
+    }
+    return SeqStmt::Flatten(out);
+  }
+};
+
+// Use the full-line multicast protocol for single-source BF16 transfers.
+// Each core contributes a private slot; only the requested source slot is
+// copied into the user's destination. All temporary data stays in RSRAM.
+class BroadcastGatherRewriter : public StmtExprMutator {
+public:
+  BroadcastGatherRewriter(const Stmt &body, Target target)
+      : core_id_(FindKernelCoreId(body)), target_(target) {}
+
+private:
+  std::optional<PrimExpr> core_id_;
+  Target target_;
+  std::vector<Array<Buffer>> allocations_;
+  int conditional_depth_ = 0;
+  int next_id_ = 0;
+
+  Stmt VisitStmt_(const BlockNode *op) final {
+    allocations_.emplace_back();
+    Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
+    Array<Buffer> buffers = block->alloc_buffers;
+    Map<Buffer, Layout> layouts;
+    if (auto existing = block->annotations.Get(attr::kLayoutMap))
+      layouts = Downcast<Map<Buffer, Layout>>(existing.value());
+    for (const Buffer &buffer : allocations_.back()) {
+      buffers.push_back(buffer);
+      // This rewrite runs after layout inference. Register the normal SRAM
+      // block layout explicitly so bank DMA can materialize each gathered slot.
+      layouts.Set(buffer, sunmmio::MakeZZ(
+                              buffer->shape, {Integer(0), Integer(1)},
+                              GetSunmmioLayoutBlockShape(target_, buffer->dtype)));
+    }
+    allocations_.pop_back();
+    block.CopyOnWrite()->alloc_buffers = std::move(buffers);
+    block.CopyOnWrite()->annotations.Set(attr::kLayoutMap, layouts);
+    return block;
+  }
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    ++conditional_depth_;
+    Stmt result = StmtExprMutator::VisitStmt_(op);
+    --conditional_depth_;
+    return result;
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    if (!call || !call->op.same_as(BroadcastOp::Get()))
+      return StmtExprMutator::VisitStmt_(op);
+    BroadcastOp broadcast(call->args, call->annotations);
+    if (!broadcast->src->dtype.is_bfloat16())
+      return StmtExprMutator::VisitStmt_(op);
+    ICHECK(core_id_ && !allocations_.empty());
+    ICHECK_EQ(conditional_depth_, 0)
+        << "BF16 broadcast allgather staging requires an unconditional "
+           "communication scope";
+    ICHECK(broadcast->direction == 0 || broadcast->direction == 1)
+        << "BF16 broadcast staging supports a single row or column";
+    ICHECK_EQ(broadcast->size->value, -1)
+        << "broadcast writer must transfer its full source region";
+    ICHECK_EQ(broadcast->srcOffsetByte_, 0);
+    BufferRegion src = NormalizeToBufferRegion(call->args[0]);
+    BufferRegion dst = NormalizeToBufferRegion(call->args[1]);
+    ICHECK_EQ(src->region.size(), 2u);
+    ICHECK_EQ(dst->region.size(), 2u);
+    arith::Analyzer analyzer;
+    for (size_t d = 0; d < 2; ++d)
+      ICHECK(analyzer.CanProveEqual(src->region[d]->extent,
+                                    dst->region[d]->extent))
+          << "BF16 broadcast staging requires equal source and destination "
+             "shapes";
+    ICHECK(src->buffer.scope() == kSunmmioScopeRSRAM ||
+           src->buffer.scope() == "global")
+        << "BF16 broadcast staging requires an RSRAM or global source";
+
+    auto mesh = GetSunmmioMeshConfig(target_);
+    int peers = broadcast->direction == 0 ? mesh.ncol : mesh.nrow;
+    Array<Range> compact = MakeCompactRegion(src->region);
+    Array<Range> gathered = compact;
+    gathered.Set(0, Range::FromMinExtent(0, compact[0]->extent * peers));
+    std::string name =
+        src->buffer->name + "_broadcast_" + std::to_string(next_id_++);
+    Buffer send = MakeCompactBufferLike(src->buffer, compact,
+                                        kSunmmioScopeRSRAM, name + "_send");
+    Buffer receive = MakeCompactBufferLike(
+        src->buffer, gathered, kSunmmioScopeRSRAM, name + "_gather");
+    allocations_.back().push_back(send);
+    allocations_.back().push_back(receive);
+    PrimExpr send_write = MakeRegionExpr(send, compact, 2);
+    PrimExpr send_read = MakeRegionExpr(send, compact, 1);
+    PrimExpr receive_write = MakeRegionExpr(receive, gathered, 2);
+    PrimExpr cols = IntImm(DataType::Int(32), mesh.ncol);
+    PrimExpr source = broadcast->src_core;
+    PrimExpr slot = broadcast->direction == 0 ? floormod(source, cols)
+                                              : floordiv(source, cols);
+    Array<Range> selected = compact;
+    selected.Set(
+        0, Range::FromMinExtent(analyzer.Simplify(slot * compact[0]->extent),
+                                compact[0]->extent));
+    Stmt clear = Evaluate(Call(DataType::Handle(), Fill::Get(),
+                               {send_write, make_zero(send->dtype)}, {}));
+    Stmt prepare = IfThenElse(core_id_.value() == source,
+                              Evaluate(Call(DataType::Handle(), Copy::Get(),
+                                            {call->args[0], send_write}, {})));
+    Stmt gather =
+        Evaluate(Call(DataType::Handle(), AllgatherOp::Get(),
+                      {send_read, receive_write,
+                       IntImm(DataType::Int(32), broadcast->direction),
+                       IntImm(DataType::Int(32), -1),
+                       IntImm(DataType::Int(32), 0), core_id_.value()},
+                      {}));
+    Stmt copy = Evaluate(
+        Call(DataType::Handle(), Copy::Get(),
+             {MakeRegionExpr(receive, selected, 1), call->args[1]}, {}));
+    PrimExpr source_line = broadcast->direction == 0 ? floordiv(source, cols)
+                                                     : floormod(source, cols);
+    PrimExpr current_line = broadcast->direction == 0
+                                ? floordiv(core_id_.value(), cols)
+                                : floormod(core_id_.value(), cols);
+    if (!analyzer.CanProveEqual(source_line, current_line))
+      copy = IfThenElse(source_line == current_line, copy);
+    return SeqStmt::Flatten(clear, prepare, gather, copy);
+  }
+};
 
 // If every gemm in `consumers` is a consecutive run of siblings within one
 // SeqStmt, return them in program order; otherwise std::nullopt.
@@ -953,11 +1266,29 @@ private:
     return block;
   }
 
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    Array<Stmt> out;
+    if (auto it = gemm_plans_.find(call); it != gemm_plans_.end()) {
+      ICHECK(it->second->kind != ActionKind::InPlaceGroup);
+      EmitGemmExpansion(*it->second, ffi::GetRef<Stmt>(op), &out);
+      return SeqStmt::Flatten(out);
+    }
+    if (auto it = writer_plans_.find(call); it != writer_plans_.end()) {
+      if (it->second->kind == ActionKind::ReissueFromShadow)
+        EmitSnapshotCopy(*it->second, &out);
+      return SeqStmt::Flatten(out);
+    }
+    return ffi::GetRef<Stmt>(op);
+  }
+
   Stmt VisitStmt_(const SeqStmtNode *op) final {
-    Stmt visited = StmtExprMutator::VisitStmt_(op);
-    if (!visited->IsInstance<SeqStmtNode>())
-      return visited;
-    SeqStmt seq = Downcast<SeqStmt>(visited);
+    // Handle direct Evaluate children here so adjacent GEMM groups stay intact;
+    // the Evaluate visitor handles lone statements in guards and loop bodies.
+    Array<Stmt> children;
+    for (const Stmt &stmt : op->seq)
+      children.push_back(stmt->IsInstance<EvaluateNode>() ? stmt : VisitStmt(stmt));
+    SeqStmt seq(children);
 
     Array<Stmt> rewritten;
     rewritten.reserve(seq->seq.size());
@@ -1082,8 +1413,7 @@ private:
   // Re-issue the writer with its source (args[0]) replaced by the
   // ReissueFromShadow stage buffer. Preserves the writer's op type and every
   // trailing arg — so a Copy writer becomes Copy(shadow → A_dist) and an
-  // AllgatherOp writer becomes Allgather(shadow → A_dist, direction, axis,
-  // ...), re-running the HLink broadcast from the snapshotted source.
+  // AllgatherOp re-runs communication from the snapshotted source.
   // offset==0 is the stripe-0 restore; offset>0 the stripe-1 restage.
   Call CloneWriterFromShadow(const Action &entry, int offset) const {
     Array<PrimExpr> args = entry.writer->args;
@@ -1115,20 +1445,27 @@ PrimFunc Run(PrimFunc f) {
   SunmmioTileProcessorConfig cfg =
       GetSunmmioTileProcessorConfig(target.value());
 
+  Stmt body = f->body;
+  if (!Bf16AsramOperandFlow::Analyze(body, cfg).empty()) {
+    body = GuardedPutGemmRewriter(body, target.value(), cfg)(body);
+    ValidateGemms(Bf16AsramOperandFlow::Analyze(body, cfg), body, target.value());
+    body = BroadcastGatherRewriter(body, target.value())(body);
+  }
+
   // NPU-IR accumulates an unbatched store across batched A/W and requires
   // constant-true acc. Normalize clear semantics before bf16 stripe expansion
   // so the logical accumulator is initialized at most once.
   PrimFuncNode *fp = f.CopyOnWrite();
-  fp->body = BatchReductionAccumulatorRewriter()(f->body);
+  fp->body = BatchReductionAccumulatorRewriter()(body);
 
   // Phase 1: structured reaching-defs analysis.
   std::vector<GemmReachingDef> gemms =
-      Bf16AsramOperandFlow::Analyze(f->body, cfg);
+      Bf16AsramOperandFlow::Analyze(fp->body, cfg);
   if (gemms.empty())
     return f;
 
   // Phase 2: validate. Rejects NONE / MULTIPLE / unsupported writer types.
-  ValidateGemms(gemms);
+  ValidateGemms(gemms, fp->body, target.value());
 
   // Collect scope paths for each writer and gemm we're acting on, so the
   // planner can classify by scope-path comparison rather than IR-shape walk.
@@ -1138,14 +1475,14 @@ PrimFunc Run(PrimFunc f) {
     interesting.insert(g.writer_rd.writer);
   }
   ScopePathCollector path_collector(interesting);
-  path_collector.Run(f->body);
+  path_collector.Run(fp->body);
 
   // Phase 3: per-gemm action plan.
-  std::vector<Action> plan = BuildPlan(f->body, gemms, path_collector);
+  std::vector<Action> plan = BuildPlan(fp->body, gemms, path_collector);
 
   // Phase 4: drive the rewrite from the plan.
   LegalizeSunmmioGemmRewriter rewriter(target.value(), cfg, plan);
-  fp->body = rewriter(f->body);
+  fp->body = rewriter(fp->body);
   return f;
 }
 
