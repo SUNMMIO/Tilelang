@@ -858,9 +858,10 @@ private:
       buffers.push_back(buffer);
       // This rewrite runs after layout inference. Register the normal SRAM
       // block layout explicitly so bank DMA can materialize each gathered slot.
-      layouts.Set(buffer, sunmmio::MakeZZ(
-                              buffer->shape, {Integer(0), Integer(1)},
-                              GetSunmmioLayoutBlockShape(target_, buffer->dtype)));
+      layouts.Set(
+          buffer,
+          sunmmio::MakeZZ(buffer->shape, {Integer(0), Integer(1)},
+                          GetSunmmioLayoutBlockShape(target_, buffer->dtype)));
     }
     allocations_.pop_back();
     block.CopyOnWrite()->alloc_buffers = std::move(buffers);
@@ -1287,7 +1288,8 @@ private:
     // the Evaluate visitor handles lone statements in guards and loop bodies.
     Array<Stmt> children;
     for (const Stmt &stmt : op->seq)
-      children.push_back(stmt->IsInstance<EvaluateNode>() ? stmt : VisitStmt(stmt));
+      children.push_back(stmt->IsInstance<EvaluateNode>() ? stmt
+                                                          : VisitStmt(stmt));
     SeqStmt seq(children);
 
     Array<Stmt> rewritten;
@@ -1448,7 +1450,8 @@ PrimFunc Run(PrimFunc f) {
   Stmt body = f->body;
   if (!Bf16AsramOperandFlow::Analyze(body, cfg).empty()) {
     body = GuardedPutGemmRewriter(body, target.value(), cfg)(body);
-    ValidateGemms(Bf16AsramOperandFlow::Analyze(body, cfg), body, target.value());
+    ValidateGemms(Bf16AsramOperandFlow::Analyze(body, cfg), body,
+                  target.value());
     body = BroadcastGatherRewriter(body, target.value())(body);
   }
 

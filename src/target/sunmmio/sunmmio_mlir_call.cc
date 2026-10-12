@@ -693,9 +693,9 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         << "tl.mma_sunmmio lowering to suvm.tc.mma does not support transA";
     bool trans_b =
         require_bool_attr(SunMMIOCallAttrKey::kTransB, "tl.mma_sunmmio transB");
-    auto mma_op = mlir::suvm::TcMmaOp::create(
-        ctx_.builder, type.MakeDebugLoc("mma_sunmmio"), c, a, w,
-        c, accumulate, trans_b);
+    auto mma_op = mlir::suvm::TcMmaOp::create(ctx_.builder,
+                                              type.MakeDebugLoc("mma_sunmmio"),
+                                              c, a, w, c, accumulate, trans_b);
     VerifyAsyncOp(mma_op, "tl.mma_sunmmio");
     ctx_.AddPendingSyncUnits(mlir::suvm::SyncUnits::tc);
 
