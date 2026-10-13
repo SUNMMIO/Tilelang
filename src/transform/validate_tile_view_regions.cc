@@ -257,7 +257,7 @@ private:
     ValidateRegionCanFormTileView(dst, "tl.tileop.comm_allreduce", "dst");
 
     BufferRegion row_gather_send = src;
-    BufferRegion col_gather_send = src;
+    const BufferRegion &col_gather_send = src;
     if (direction == 2 && should_clear) {
       row_gather_send = dst;
     } else if (direction == 2) {
