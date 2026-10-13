@@ -45,7 +45,8 @@ def _lower_and_legalize(mod, target):
     mod = tl.transform.LowerAccessPtr()(mod)
     mod = tl.transform.Simplify()(mod)
     mod = tl.transform.HoistNonRestrictParams()(mod)
-    return tl.transform.HoistBlockAnnotationsToFuncAttrs()(mod)
+    mod = tl.transform.HoistBlockAnnotationsToFuncAttrs()(mod)
+    return tl.transform.ResolveSunmmioUnit()(mod)
 
 
 @contextmanager

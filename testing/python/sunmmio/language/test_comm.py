@@ -166,6 +166,31 @@ def test_comm_allreduce_rejects_mixed_dtype():
         _allreduce_frontend_kernel(direction="h", dtype="float32", out_dtype="int32")
 
 
+@pytest.mark.parametrize("direction", ["h", "horizontal", "v", "vertical", "all"])
+@pytest.mark.parametrize("clear", [True, False])
+@pytest.mark.parametrize("mesh", [(4, 4), (2, 3)])
+def test_allreduce_allocates_only_active_carriers(direction, clear, mesh, monkeypatch):
+    nrow, ncol = mesh
+    monkeypatch.setattr(T.comm, "get_target_mesh_shape", lambda: {"nrow": nrow, "ncol": ncol})
+    func = _allreduce_frontend_kernel(direction=direction, clear=clear)
+    (call,) = _collect_calls(func, "tl.tileop.comm_allreduce")
+    carriers = []
+
+    for arg_index in (2, 3):
+        buffer = call.args[arg_index].buffer
+        if not any(buffer.same_as(carrier) for carrier in carriers):
+            carriers.append(buffer)
+
+    assert len(carriers) == (2 if direction == "all" else 1)
+    assert call.args[2].buffer.same_as(call.args[3].buffer) == (direction != "all")
+    assert len(call.args) == (10 if not clear and direction == "all" else 9)
+    assert all([int(extent) for extent in carrier.shape[1:]] == [32, 32] for carrier in carriers)
+    if direction in ("h", "horizontal", "all"):
+        assert int(call.args[2].buffer.shape[0]) == ncol
+    if direction in ("v", "vertical", "all"):
+        assert int(call.args[3].buffer.shape[0]) == nrow
+
+
 def test_comm_buffer_like_region_python_api():
     @T.prim_func
     def main(A: T.Tensor((128, 128), "float32")):

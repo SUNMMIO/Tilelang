@@ -115,6 +115,7 @@ def _lower_ffn():
             tl.transform.Simplify(),
             tl.transform.HoistNonRestrictParams(),
             tl.transform.HoistBlockAnnotationsToFuncAttrs(),
+            tl.transform.ResolveSunmmioUnit(),
         ):
             mod = pipeline_pass(mod)
     return tl.transform.IfStmtBinding()(mod)

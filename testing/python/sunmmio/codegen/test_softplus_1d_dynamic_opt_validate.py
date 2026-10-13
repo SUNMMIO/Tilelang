@@ -20,7 +20,7 @@ tilelang.env.disable_cache()
 
 LOG_ROOT = Path(__file__).resolve().parent / "logs"
 STRICT_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
-MODULE_NAME = "sunmmio_kernel.softplus.test_softplus_1d_dynamic_opt_validate"
+MODULE_NAME = "testing.python.sunmmio.codegen.test_softplus_1d_dynamic_opt_validate"
 
 
 @target("Sunmmio")

@@ -82,6 +82,8 @@ def test_ilp_models_layout_transform_destination_as_write(tmp_path):
     problem_path = tmp_path / "layout_transform_ilp_problem.json"
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     mod = tvm.IRModule.from_expr(_make_layout_transform_pipeline().with_attr("global_symbol", "main"))
+    mod = tir.transform.BindTarget(target)(mod)
+    mod = tl.transform.ResolveSunmmioUnit()(mod)
 
     with (
         tvm.target.Target(target),
