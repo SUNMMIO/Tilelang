@@ -370,8 +370,6 @@ def put(src, dst, dst_rank, *, dst_row=None, signal: Signal, submit: bool = Fals
     _check_signal(signal)
     _begin_submit_sugar(submit)
     manual_group_member = signal._expect_mode == ExpectMode.MANUAL and signal._group_member and signal._group_index is not None
-    if signal._expect_mode == ExpectMode.MANUAL and not manual_group_member:
-        raise ValueError("T.dist.put with expect='manual' requires a SignalList member")
     if signal._expect_mode is None and signal._group_member and isinstance(signal._group_index, tir.PrimExpr):
         raise ValueError(
             "A dynamic SignalList member passed to T.dist.put requires expect='manual'; expect=None is reserved for protocol inference"
@@ -499,8 +497,6 @@ def put_signal(signal: Signal, dst_rank, *, submit: bool = False):
 
     _check_signal(signal)
     _begin_submit_sugar(submit)
-    if signal._expect_mode == ExpectMode.MANUAL:
-        raise ValueError("T.dist.put_signal with expect='manual' is not supported yet; use a sender-indexed SignalList with T.dist.put")
     if isinstance(dst_rank, bool) or not isinstance(dst_rank, (int, tir.PrimExpr)):
         raise TypeError(f"dst_rank must be an integer or TIR PrimExpr, got {type(dst_rank).__name__}")
     dst_rank_int = int(dst_rank) if isinstance(dst_rank, (int, tir.IntImm)) else None
