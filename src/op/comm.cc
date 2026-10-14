@@ -122,6 +122,89 @@ Stmt MakeBroadcastLeaf(PrimExpr src_region, PrimExpr dst_region, int direction,
   return Evaluate(Call(DataType::Handle(), broadcast_(), args));
 }
 
+Array<Range> ReplaceRange(const Array<Range> &ranges, int dim,
+                          Range replacement) {
+  Array<Range> result;
+  for (int i = 0; i < static_cast<int>(ranges.size()); ++i) {
+    result.push_back(i == dim ? replacement : ranges[i]);
+  }
+  return result;
+}
+
+int64_t StaticPositiveExtent(const Range &range, int dim, const char *context,
+                             arith::Analyzer *analyzer) {
+  PrimExpr extent =
+      analyzer ? analyzer->Simplify(range->extent) : range->extent;
+  const auto *imm = extent.as<IntImmNode>();
+  ICHECK(imm) << context << " requires static extent at split dim " << dim
+              << ", got " << range->extent;
+  ICHECK_GT(imm->value, 0) << context
+                           << " requires positive extent at split dim " << dim
+                           << ", got " << imm->value;
+  return imm->value;
+}
+
+Range UnitSliceAt(const Range &range, int64_t offset,
+                  arith::Analyzer *analyzer) {
+  PrimExpr min = range->min;
+  if (offset != 0) {
+    min = min + make_const(min.dtype(), offset);
+    if (analyzer) {
+      min = analyzer->Simplify(min);
+    }
+  }
+  return Range::FromMinExtent(min, make_const(range->extent.dtype(), 1));
+}
+
+void EmitCanonicalRankBroadcastLeaves(
+    const Buffer &src_buffer, const Array<Range> &src_ranges,
+    const Buffer &dst_buffer, const Array<Range> &dst_ranges,
+    int dst_payload_offset, int direction, PrimExpr mask,
+    PrimExpr src_offset_byte, arith::Analyzer *analyzer, Array<Stmt> *out) {
+  int src_rank = static_cast<int>(src_ranges.size());
+  int dst_rank = static_cast<int>(dst_ranges.size());
+  ICHECK(dst_payload_offset == 0 || dst_payload_offset == 1)
+      << "Allgather split lowering supports only same-rank payloads or one "
+         "leading gather slot dim, got offset "
+      << dst_payload_offset;
+  ICHECK_LE(src_rank + dst_payload_offset, dst_rank)
+      << "Allgather destination rank " << dst_rank
+      << " is too small for source rank " << src_rank << " with payload offset "
+      << dst_payload_offset;
+
+  int split_dims = src_rank > 2 ? src_rank - 2 : 0;
+  auto emit = [&](auto &&self, int dim, Array<Range> cur_src,
+                  Array<Range> cur_dst) -> void {
+    if (dim == split_dims) {
+      out->push_back(MakeBroadcastLeaf(
+          MakeRegionExpr(src_buffer, cur_src, /*access_mask=*/1),
+          MakeRegionExpr(dst_buffer, cur_dst, /*access_mask=*/2), direction,
+          analyzer->Simplify(mask), src_offset_byte));
+      return;
+    }
+
+    int dst_dim = dim + dst_payload_offset;
+    ICHECK_LT(dst_dim, dst_rank);
+    int64_t src_extent = StaticPositiveExtent(
+        cur_src[dim], dim, "Allgather split lowering", analyzer);
+    int64_t dst_extent = StaticPositiveExtent(
+        cur_dst[dst_dim], dst_dim, "Allgather split lowering", analyzer);
+    ICHECK_EQ(src_extent, dst_extent)
+        << "Allgather split dim extent mismatch between src dim " << dim
+        << " and dst dim " << dst_dim << ": " << src_extent << " vs "
+        << dst_extent;
+
+    for (int64_t i = 0; i < src_extent; ++i) {
+      self(self, dim + 1,
+           ReplaceRange(cur_src, dim, UnitSliceAt(cur_src[dim], i, analyzer)),
+           ReplaceRange(cur_dst, dst_dim,
+                        UnitSliceAt(cur_dst[dst_dim], i, analyzer)));
+    }
+  };
+
+  emit(emit, 0, src_ranges, dst_ranges);
+}
+
 } // namespace
 
 /*!
@@ -726,18 +809,19 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
 
   auto emit_from_send = [&](Array<Range> dst_ranges, int bcast_dir,
                             PrimExpr mask) {
-    bcast_stmts.push_back(MakeBroadcastLeaf(
-        MakeRegionExpr(send_buffer, send_range, /*access_mask=*/1),
-        MakeRegionExpr(recv_buffer, dst_ranges, /*access_mask=*/2), bcast_dir,
-        analyzer->Simplify(mask), src_offset_imm));
+    int dst_payload_offset = static_cast<int>(dst_ranges.size()) -
+                             static_cast<int>(send_range.size());
+    EmitCanonicalRankBroadcastLeaves(
+        send_buffer, send_range, recv_buffer, dst_ranges, dst_payload_offset,
+        bcast_dir, mask, src_offset_imm, analyzer, &bcast_stmts);
   };
 
   auto emit_from_recv = [&](Array<Range> slab_ranges, int bcast_dir,
                             PrimExpr mask) {
-    bcast_stmts.push_back(MakeBroadcastLeaf(
-        MakeRegionExpr(recv_buffer, slab_ranges, /*access_mask=*/1),
-        MakeRegionExpr(recv_buffer, slab_ranges, /*access_mask=*/2), bcast_dir,
-        analyzer->Simplify(mask), src_offset_imm));
+    EmitCanonicalRankBroadcastLeaves(recv_buffer, slab_ranges, recv_buffer,
+                                     slab_ranges,
+                                     /*dst_payload_offset=*/0, bcast_dir, mask,
+                                     src_offset_imm, analyzer, &bcast_stmts);
   };
 
   if (direction == 0) { // horizontal

@@ -5,6 +5,9 @@
 
 #include "reduce.h"
 
+#include <cstdint>
+#include <limits>
+
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/op_attr_types.h>
@@ -31,6 +34,21 @@ namespace tvm {
 namespace tl {
 
 using namespace tir;
+
+namespace {
+
+PrimExpr MakeUnsignedAllOnes(DataType dtype) {
+  ICHECK(dtype.is_uint()) << "Expected unsigned integer dtype, got " << dtype;
+  int bits = dtype.bits();
+  ICHECK_GT(bits, 0) << "Unsigned integer dtype must have positive width.";
+  ICHECK_LE(bits, 64) << "Unsupported unsigned integer dtype width " << bits;
+
+  uint64_t value = bits == 64 ? std::numeric_limits<uint64_t>::max()
+                              : ((uint64_t{1} << bits) - uint64_t{1});
+  return make_const(dtype, value);
+}
+
+} // namespace
 
 // NormalizeToBufferRegion moved to src/op/utils.{h,cc}
 
@@ -82,7 +100,7 @@ PrimExpr ReduceOpNode::MakeInitValue() const {
     if (is_int) {
       return make_const(dst->dtype, (1 << (bits - 1)) - 1);
     } else if (is_uint) {
-      return make_const(dst->dtype, (1 << bits) - 1);
+      return MakeUnsignedAllOnes(dst->dtype);
     } else {
       return make_const(dst->dtype, INFINITY);
     }
@@ -92,7 +110,7 @@ PrimExpr ReduceOpNode::MakeInitValue() const {
     if (is_int) {
       return make_const(dst->dtype, -1);
     } else if (is_uint) {
-      return make_const(dst->dtype, (1 << bits) - 1);
+      return MakeUnsignedAllOnes(dst->dtype);
     } else {
       // Should not arrive here
       return make_const(dst->dtype, -INFINITY);

@@ -111,6 +111,32 @@ def comm_all_reduce_horizontal_kernel(M=32, N=128, dtype="float32"):
 
 
 @target("Sunmmio")
+def comm_all_reduce_horizontal_rank3_kernel(K=2, M=32, N=32, dtype="float32"):
+    @T.prim_func
+    def main(
+        A: T.Tensor((K, M, N), dtype),
+        B: T.Tensor((K, M, N), dtype),
+    ):
+        with T.Kernel():
+            reduce_src = T.alloc_shared((K, M, N), dtype, scope="shared.rsram")
+            reduced = T.alloc_shared((K, M, N), dtype, scope="shared.rsram")
+            for k in T.serial(K):
+                T.copy(A[k, :, :], reduce_src[k, :, :])
+            T.comm.all_reduce(
+                reduce_src,
+                reduced,
+                "sum",
+                "horizontal",
+                dim=0,
+                clear=True,
+            )
+            for k in T.serial(K):
+                T.copy(reduced[k, :, :], B[k, :, :])
+
+    return main
+
+
+@target("Sunmmio")
 def sync_simple_copy_kernel(M=128, N=128, block_M=32, block_N=32, dtype="bfloat16"):
     @T.prim_func
     def main(
@@ -295,6 +321,17 @@ def test_comm_all_reduce_horizontal_codegen_validates_with_npuir_opt(tmp_path):
     )
 
     assert src.count("suvm.mcast_tok") >= 1
+
+
+def test_comm_all_reduce_horizontal_rank3_codegen_validates_with_npuir_opt(tmp_path):
+    src = _validate_kernel(
+        comm_all_reduce_horizontal_rank3_kernel(),
+        tmp_path,
+        mlir_filename="comm_all_reduce_horizontal_rank3_kernel_suvm.mlir",
+        expected_tokens=("suvm.copy_async", "suvm.mcast_tok"),
+    )
+
+    assert src.count("suvm.mcast_tok") >= 2
 
 
 def test_sync_simple_copy_kernel_codegen_validates_with_npuir_opt(tmp_path):
