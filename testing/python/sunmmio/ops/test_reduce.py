@@ -180,6 +180,8 @@ def apply_reduce_op(reduce_op, buffer, out, reduce_axis, clear=True):
         T.reduce_max(buffer, out, dim=reduce_axis, clear=clear)
     elif reduce_op == "min":
         T.reduce_min(buffer, out, dim=reduce_axis, clear=clear)
+    elif reduce_op == "bitand":
+        T.reduce_bitand(buffer, out, dim=reduce_axis, clear=clear)
     else:
         raise ValueError(f"Unsupported reduce_op={reduce_op}")
 
@@ -609,6 +611,35 @@ def test_tilelang_reduce_sunmmio_tiled_axis_tail_uses_predicated_update(reduce_o
     assert not a_load_predicates
     assert not acc_store_predicates
     assert "< 250" in script or "<250" in script
+
+
+@pytest.mark.parametrize(
+    "reduce_op,reduce_axis",
+    [
+        ("bitand", 0),
+        ("min", 2),
+    ],
+)
+def test_tilelang_reduce_sunmmio_uint32_identity_uses_all_ones(reduce_op, reduce_axis):
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    mod = reduce_kernel_with_tileview_builder(
+        (8, 63, 250),
+        reduce_axis=reduce_axis,
+        dtype="uint32",
+        reduce_op=reduce_op,
+    )
+
+    with tvm.target.Target(target):
+        mod = apply_sunmmio_passes(mod, target)
+    assert_reduce_lowering_is_ssa(mod)
+
+    script = mod.script()
+    assert "T.uint32(4294967295)" in script
+    expected_op = "T.bitwise_and" if reduce_op == "bitand" else "T.min"
+    assert expected_op in script
+    if reduce_axis == 2:
+        assert "T.if_then_else" in script
+        assert "< 250" in script or "<250" in script
 
 
 UNALIGNED_REDUCE_CASES = [
