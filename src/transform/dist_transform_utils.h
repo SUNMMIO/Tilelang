@@ -30,6 +30,8 @@ inline constexpr const char *kDistWorldSizeAttr = "tl.dist.world_size";
 inline constexpr const char *kDistSignalCountsAttr = "tl.dist.signal_counts";
 inline constexpr const char *kDistCompilerRegionAttr =
     "tl.dist.compiler_generated_region";
+inline constexpr const char *kDistSignalIndexInBoundsAttr =
+    "tl.dist.signal_index_in_bounds";
 inline constexpr const char *kAutoSignalKind = "auto";
 inline constexpr int kIncrementFlagregCount = 8;
 inline constexpr int kValueFlagregCount = 32;

@@ -982,6 +982,37 @@ private:
     PrimExpr expected;
   };
 
+  struct SignalIndexGuard {
+    Var index;
+    PrimExpr value;
+    int64_t count;
+    bool needs_assert;
+  };
+
+  // Keep a guard with the statement that actually consumes the member. In
+  // particular, a delta wait must check before either updating or reading
+  // expected, and must use the very same index for its physical signal.
+  Stmt VisitStmt(const Stmt &stmt) final {
+    index_guards_.emplace_back();
+    Stmt result = StmtExprMutator::VisitStmt(stmt);
+    auto guards = std::move(index_guards_.back());
+    index_guards_.pop_back();
+    for (auto it = guards.rbegin(); it != guards.rend(); ++it) {
+      if (it->needs_assert) {
+        PrimExpr wide = Cast(DataType::Int(64), it->index);
+        PrimExpr valid = And(wide >= make_zero(DataType::Int(64)),
+                             wide < IntImm(DataType::Int(64), it->count));
+        result =
+            AssertStmt(valid,
+                       StringImm("T.dist SignalList index out of range [0, " +
+                                 std::to_string(it->count) + ")"),
+                       result);
+      }
+      result = LetStmt(it->index, it->value, result);
+    }
+    return result;
+  }
+
   Stmt VisitStmt_(const LetStmtNode *let_node) final {
     const auto *signal_call_node = let_node->value.as<CallNode>();
     if (signal_call_node &&
@@ -1573,7 +1604,22 @@ private:
     SignalGroupInfo &group = LookupSignalGroup(ref->args[0]);
     group.used = true;
     PrimExpr index = ref->args[1];
-    ICHECK(index.dtype().is_int());
+    ICHECK(index.dtype().is_int() && index.dtype().lanes() == 1);
+    if (const auto *constant = index.as<IntImmNode>()) {
+      ICHECK_GE(constant->value, 0);
+      ICHECK_LT(constant->value, group.count);
+    } else {
+      auto proof = ref->annotations.Get(kDistSignalIndexInBoundsAttr);
+      bool proven = proof && is_one(Downcast<PrimExpr>(proof.value()));
+      // A mutable index must be sampled once, even when its arithmetic range
+      // is known, so a state update cannot change which signal is waited on.
+      if (!proven || SideEffect(index) > CallEffectKind::kPure) {
+        ICHECK(!index_guards_.empty());
+        Var saved("dist_signal_index", index.dtype());
+        index_guards_.back().push_back({saved, index, group.count, !proven});
+        index = saved;
+      }
+    }
     return {group.kind, group.base_index + index,
             BufferLoad(group.expected, {index})};
   }
@@ -1656,6 +1702,7 @@ private:
   std::unordered_map<const VarNode *, SignalInfo> signal_info_;
   std::unordered_map<const VarNode *, SignalGroupInfo> signal_group_info_;
   std::unordered_map<const VarNode *, CompletionInfo> completion_info_;
+  std::vector<std::vector<SignalIndexGuard>> index_guards_;
   int64_t world_size_{1};
   int mesh_nrows_{1};
   int mesh_ncols_{1};

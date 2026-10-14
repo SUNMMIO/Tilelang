@@ -1353,6 +1353,208 @@ PrimFunc PlanSignalResources(PrimFunc func) {
   return func;
 }
 
+// Validate each logical member at its use site, where loop/branch facts are
+// available. Unknown wait indices are guarded when the state is materialized.
+class DistSignalIndexBoundsPlanner : public arith::IRMutatorWithAnalyzer {
+public:
+  static PrimFunc Rewrite(PrimFunc func) {
+    auto context = GetDistPassContext(func);
+    ICHECK(context);
+    arith::Analyzer analyzer;
+    DistSignalIndexBoundsPlanner planner(&analyzer);
+    Var rank = context.value().rank_id;
+    Range ranks = Range::FromMinExtent(
+        make_zero(rank.dtype()),
+        make_const(rank.dtype(), context.value().world_size));
+    analyzer.Bind(rank, ranks);
+    planner.domains_.push_back({rank, ranks});
+    Stmt body = planner.VisitStmt(func->body);
+    if (!body.same_as(func->body)) {
+      func.CopyOnWrite()->body = std::move(body);
+    }
+    return func;
+  }
+
+private:
+  explicit DistSignalIndexBoundsPlanner(arith::Analyzer *analyzer)
+      : arith::IRMutatorWithAnalyzer(analyzer) {}
+
+  struct Domain {
+    Var var;
+    Range range;
+  };
+
+  PrimExpr Resolve(const PrimExpr &expr) {
+    return analyzer_->Simplify(Substitute(expr, bindings_));
+  }
+
+  // Find a concrete invalid Rank/loop instance. An interval merely crossing
+  // the bound is not a counterexample; unknown runtime values need an assert.
+  bool HasInvalidInstance(const PrimExpr &index, const PrimExpr &valid) {
+    std::unordered_set<const VarNode *> needed;
+    auto collect = [&](const PrimExpr &expr) {
+      PostOrderVisit(expr, [&](const ObjectRef &node) {
+        if (const auto *var = node.as<VarNode>()) {
+          needed.insert(var);
+        }
+      });
+    };
+    collect(index);
+    collect(path_);
+    std::vector<Domain> relevant;
+    for (auto it = domains_.rbegin(); it != domains_.rend(); ++it) {
+      if (needed.count(it->var.get())) {
+        relevant.push_back(*it);
+        collect(it->range->min);
+        collect(it->range->extent);
+      }
+    }
+    std::reverse(relevant.begin(), relevant.end());
+    // Bound compile-time enumeration; exhausting it leaves a runtime check.
+    int budget = 4096;
+    Map<Var, PrimExpr> values;
+    auto enumerate = [&](auto &&self, size_t depth) -> bool {
+      if (--budget < 0) {
+        return false;
+      }
+      PrimExpr active = analyzer_->Simplify(Substitute(path_, values));
+      if (is_zero(active)) {
+        return false;
+      }
+      PrimExpr check = analyzer_->Simplify(Substitute(valid, values));
+      if (is_one(active) && is_zero(check)) {
+        return true;
+      }
+      if (is_one(check) || depth == relevant.size()) {
+        return false;
+      }
+      const Domain &domain = relevant[depth];
+      PrimExpr min = analyzer_->Simplify(Substitute(domain.range->min, values));
+      PrimExpr extent =
+          analyzer_->Simplify(Substitute(domain.range->extent, values));
+      const auto *start = min.as<IntImmNode>();
+      const auto *count = extent.as<IntImmNode>();
+      if (!start || !count) {
+        return self(self, depth + 1);
+      }
+      Map<Var, PrimExpr> previous = values;
+      for (int64_t offset = 0; offset < count->value && budget > 0; ++offset) {
+        values.Set(domain.var,
+                   make_const(domain.var.dtype(), start->value + offset));
+        if (self(self, depth + 1)) {
+          return true;
+        }
+      }
+      values = std::move(previous);
+      return false;
+    };
+    return enumerate(enumerate, 0);
+  }
+
+  Stmt VisitStmt_(const LetStmtNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    if (call && call->op.same_as(dist_signal_group())) {
+      groups_.emplace(op->var.get(),
+                      RequireIntImm(call->args[2], "signal-group count"));
+      Stmt body = VisitStmt(op->body);
+      groups_.erase(op->var.get());
+      return LetStmt(op->var, op->value, body, op->span);
+    }
+    Map<Var, PrimExpr> previous = bindings_;
+    if (SideEffect(op->value) <= CallEffectKind::kPure) {
+      bindings_.Set(op->var, Resolve(op->value));
+    }
+    Stmt result = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
+    bindings_ = std::move(previous);
+    return result;
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    PrimExpr min = Resolve(op->min);
+    PrimExpr extent = Resolve(op->extent);
+    if (analyzer_->CanProve(extent <= 0)) {
+      return tvm::ffi::GetRef<Stmt>(op);
+    }
+    domains_.push_back({op->loop_var, Range::FromMinExtent(min, extent)});
+    Stmt body = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
+    domains_.pop_back();
+    return body;
+  }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    const auto *thread = op->node.as<IterVarNode>();
+    bool extent = thread && op->attr_key == tir::attr::thread_extent;
+    if (extent) {
+      domains_.push_back(
+          {thread->var, Range::FromMinExtent(make_zero(thread->var.dtype()),
+                                             Resolve(op->value))});
+    }
+    Stmt result = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
+    if (extent) {
+      domains_.pop_back();
+    }
+    return result;
+  }
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    PrimExpr previous = path_;
+    PrimExpr condition = Resolve(op->condition);
+    Stmt then_case;
+    Optional<Stmt> else_case;
+    {
+      path_ = And(previous, condition);
+      With<arith::ConstraintContext> ctx(analyzer_, condition);
+      then_case = VisitStmt(op->then_case);
+    }
+    if (op->else_case) {
+      path_ = And(previous, Not(condition));
+      With<arith::ConstraintContext> ctx(analyzer_, Not(condition));
+      else_case = VisitStmt(op->else_case.value());
+    }
+    path_ = previous;
+    return IfThenElse(op->condition, then_case, else_case, op->span);
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    PrimExpr rewritten = arith::IRMutatorWithAnalyzer::VisitExpr_(op);
+    const auto *call = rewritten.as<CallNode>();
+    if (!call->op.same_as(dist_signal_ref())) {
+      return rewritten;
+    }
+    auto group = groups_.find(call->args[0].as<VarNode>());
+    ICHECK(group != groups_.end());
+    PrimExpr index = Substitute(call->args[1], bindings_);
+    ICHECK(index.dtype().is_int() && index.dtype().lanes() == 1)
+        << "T.dist SignalList index must be a scalar integer";
+    // Widen before comparing: count may not fit a narrow signed index dtype.
+    PrimExpr wide = Cast(DataType::Int(64), index);
+    PrimExpr valid = And(wide >= make_zero(DataType::Int(64)),
+                         wide < IntImm(DataType::Int(64), group->second));
+    bool proven = false;
+    if (SideEffect(index) > CallEffectKind::kPure) {
+      // A buffer tested by an outer branch may have been written since then.
+      // Use only context-free arithmetic facts (e.g. load % count) for it.
+      arith::Analyzer stable;
+      proven = stable.CanProve(valid);
+    } else if (!analyzer_->CanProve(Not(path_))) {
+      proven = analyzer_->CanProve(valid);
+      ICHECK(proven || (!analyzer_->CanProve(Not(valid)) &&
+                        !HasInvalidInstance(index, valid)))
+          << "T.dist SignalList index " << call->args[1]
+          << " is out of range [0, " << group->second
+          << ") for a reachable Rank/loop instance";
+    }
+    auto annotations = call->annotations;
+    annotations.Set(kDistSignalIndexInBoundsAttr, Bool(proven));
+    return Call(call->dtype, call->op, call->args, annotations, call->span);
+  }
+
+  Map<Var, PrimExpr> bindings_;
+  PrimExpr path_{const_true()};
+  std::vector<Domain> domains_;
+  std::unordered_map<const VarNode *, int64_t> groups_;
+};
+
 class DistCommunicationValidator : public StmtExprVisitor {
 public:
   void Validate(const PrimFunc &func) {
@@ -1737,6 +1939,7 @@ PrimFunc Run(PrimFunc func) {
       << "T.dist operations only support the SunMMIO target";
   func = PlanSignalResources(std::move(func));
   DistCommunicationValidator().Validate(func);
+  func = DistSignalIndexBoundsPlanner::Rewrite(std::move(func));
   DistCompletionReuseValidator().Validate(func);
   return func;
 }

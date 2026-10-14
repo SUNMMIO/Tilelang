@@ -197,6 +197,28 @@ def early_return_kernel_factory(control_flow="if", world_size: int = 1):
     return main
 
 
+@tilelang.jit(target="sunmmio")
+def loop_jump_kernel_factory(jump="break", submit_after_loop=False, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            src = T.alloc_shared((32,), T.bfloat16)
+            dst = T.alloc_shared((32,), T.bfloat16)
+            signal = T.dist.signal(expect="manual")
+            for _ in T.serial(2):
+                T.dist.put(src, dst, (rank_id + 1) % world_size, signal=signal)
+                if rank_id == 0:
+                    if jump == "break":
+                        break
+                    else:
+                        continue
+                T.dist.submit()
+            if submit_after_loop:
+                T.dist.submit()
+
+    return main
+
+
 def test_explicit_submit_batches_two_puts():
     result = lower_to_device_tir(
         explicit_batch_kernel_factory.get_tir(world_size=4),
@@ -434,3 +456,202 @@ def test_early_return_accounts_for_in_flight_loop_backedge(loop_kind):
         [stop],
     )
     assert _has_wait_before_return(func, 1)
+
+
+def _loop_jump(jump):
+    return tvm.tir.Evaluate(tvm.tir.call_intrin("int32", "tir." + jump + "_loop"))
+
+
+def _queue_loop(loop_kind, body):
+    if loop_kind == "for":
+        return tvm.tir.For(tvm.tir.Var("i", "int32"), 0, 2, tvm.tir.ForKind.SERIAL, body)
+    counter = tvm.tir.decl_buffer((1,), "int32", name="step", scope="local")
+    loop = tvm.tir.While(
+        counter[0] < 2,
+        tvm.tir.SeqStmt([tvm.tir.BufferStore(counter, counter[0] + 1, [0]), body]),
+    )
+    return tvm.tir.Allocate(
+        counter.data,
+        counter.dtype,
+        [1],
+        True,
+        tvm.tir.SeqStmt([tvm.tir.BufferStore(counter, 0, [0]), loop]),
+    )
+
+
+@pytest.mark.parametrize("jump", ["break", "continue"])
+@pytest.mark.parametrize("submit_after_loop", [False, True])
+def test_loop_jump_submission_through_device_tir(jump, submit_after_loop):
+    func = loop_jump_kernel_factory.get_tir(jump, submit_after_loop, world_size=4)
+    if not submit_after_loop:
+        with pytest.raises(tvm.error.InternalError, match="send queue is not submitted"):
+            lower_to_device_tir(func)
+        return
+    result = lower_to_device_tir(func, capture_passes="tl.LowerDistSync")
+    for mod in (result.pass_snapshot("tl.LowerDistSync").mod, result.device_mod):
+        names = collect_op_names(mod)
+        assert "tir." + jump + "_loop" in names
+        assert names.count("tl.dist_submit_") == 2
+        # Two pre-submit waits and one final drain; none at the jump itself.
+        assert names.count("tl.dist_wait_send") == 3
+
+
+@pytest.mark.parametrize("loop_kind", ["for", "while"])
+@pytest.mark.parametrize("jump", ["break", "continue"])
+@pytest.mark.parametrize("submit_after_loop", [False, True])
+def test_loop_jump_preserves_pending_queue(loop_kind, jump, submit_after_loop):
+    stop = tvm.tir.Var("stop", "int32")
+    body = _queue_loop(
+        loop_kind,
+        tvm.tir.SeqStmt(
+            [
+                _queued_signal_put(),
+                tvm.tir.IfThenElse(stop != 0, _loop_jump(jump), None),
+                _dist_leaf("dist_submit_"),
+            ]
+        ),
+    )
+    if not submit_after_loop:
+        with pytest.raises(tvm.error.InternalError, match="send queue is not submitted"):
+            _inject_queue_body(body, [stop])
+        return
+    func = _inject_queue_body(tvm.tir.SeqStmt([body, _dist_leaf("dist_submit_")]), [stop])
+    names = collect_op_names(func)
+    assert names.count("tl.dist_submit_") == 2
+    assert names.count("tl.dist_wait_send") == 3
+
+
+@pytest.mark.parametrize("loop_kind", ["for", "while"])
+@pytest.mark.parametrize("jump", ["break", "continue"])
+def test_loop_jump_skipping_wait_keeps_exit_drain(loop_kind, jump):
+    stop = tvm.tir.Var("stop", "int32")
+    body = _queue_loop(
+        loop_kind,
+        tvm.tir.SeqStmt(
+            [
+                _queued_signal_put(),
+                _dist_leaf("dist_submit_"),
+                tvm.tir.IfThenElse(stop != 0, _loop_jump(jump), None),
+                _dist_leaf("dist_wait_send"),
+            ]
+        ),
+    )
+    func = _inject_queue_body(body, [stop])
+    exit_waits = []
+
+    def visit(node):
+        if isinstance(node, tvm.tir.SeqStmt):
+            for previous, current in zip(node.seq, node.seq[1:]):
+                if isinstance(previous, (tvm.tir.For, tvm.tir.While)):
+                    exit_waits.append(
+                        isinstance(current, tvm.tir.Evaluate)
+                        and isinstance(current.value, tvm.tir.Call)
+                        and current.value.op.same_as(tvm.ir.Op.get("tl.dist_wait_send"))
+                    )
+
+    tvm.tir.stmt_functor.post_order_visit(func.body, visit)
+    assert exit_waits == [True]
+    # A reachable explicit wait after the loop already supplies the drain.
+    explicit = _inject_queue_body(tvm.tir.SeqStmt([body, _dist_leaf("dist_wait_send")]), [stop])
+    assert collect_op_names(explicit).count("tl.dist_wait_send") == 3
+
+
+@pytest.mark.parametrize("loop_kind", ["for", "while"])
+@pytest.mark.parametrize("jump", ["break", "continue"])
+def test_loop_jump_cannot_leave_strict_batch_open(loop_kind, jump):
+    body = _queue_loop(
+        loop_kind,
+        tvm.tir.SeqStmt(
+            [
+                _dist_leaf("dist_batch_begin_"),
+                _queued_signal_put(),
+                _loop_jump(jump),
+                _dist_leaf("dist_submit_"),
+            ]
+        ),
+    )
+    with pytest.raises(tvm.error.InternalError, match="submit boundary before " + jump):
+        _inject_queue_body(tvm.tir.SeqStmt([body, _dist_leaf("dist_submit_")]))
+
+
+@pytest.mark.parametrize("loop_kind", ["for", "while"])
+@pytest.mark.parametrize("jump", ["break", "continue"])
+def test_only_continue_propagates_pending_queue_to_loop_header(loop_kind, jump):
+    body = _queue_loop(
+        loop_kind,
+        tvm.tir.SeqStmt(
+            [
+                _dist_leaf("dist_batch_begin_"),
+                _queued_signal_put(),
+                _dist_leaf("dist_submit_"),
+                _queued_signal_put(),
+                _loop_jump(jump),
+            ]
+        ),
+    )
+    body = tvm.tir.SeqStmt([body, _dist_leaf("dist_submit_")])
+    if jump == "continue":
+        with pytest.raises(tvm.error.InternalError, match="requires an empty send queue"):
+            _inject_queue_body(body)
+    else:
+        assert collect_op_names(_inject_queue_body(body)).count("tl.dist_submit_") == 2
+
+
+@pytest.mark.parametrize("jump", ["break", "continue"])
+def test_nested_loop_jump_targets_innermost_loop(jump):
+    inner = _queue_loop("while", tvm.tir.SeqStmt([_queued_signal_put(), _loop_jump(jump)]))
+    outer = _queue_loop("for", tvm.tir.SeqStmt([inner, _dist_leaf("dist_submit_")]))
+    func = _inject_queue_body(outer)
+    assert collect_op_names(func).count("tl.dist_submit_") == 1
+    assert collect_op_names(func).count("tl.dist_wait_send") == 2
+
+
+@pytest.mark.parametrize("jump", ["break", "continue"])
+def test_loop_jump_unreachable_suffix_does_not_affect_queue(jump):
+    body = _queue_loop(
+        "for",
+        tvm.tir.SeqStmt(
+            [
+                _loop_jump(jump),
+                _queued_signal_put(),
+                tvm.tir.Evaluate(tvm.tir.ret(1)),
+            ]
+        ),
+    )
+    func = _inject_queue_body(body)
+    assert "tl.dist_wait_send" not in collect_op_names(func)
+
+
+def test_continue_retains_submit_needed_by_later_iterations():
+    body = _queue_loop(
+        "for",
+        tvm.tir.SeqStmt(
+            [
+                _dist_leaf("dist_submit_"),
+                _queued_signal_put(),
+                _loop_jump("continue"),
+            ]
+        ),
+    )
+    func = _inject_queue_body(tvm.tir.SeqStmt([body, _dist_leaf("dist_submit_")]))
+    assert collect_op_names(func).count("tl.dist_submit_") == 2
+
+
+@pytest.mark.parametrize("jump", ["break", "continue"])
+@pytest.mark.parametrize("submitted", [False, True])
+def test_loop_jump_preserves_state_at_return(jump, submitted):
+    statements = [_queued_signal_put()]
+    if submitted:
+        statements.append(_dist_leaf("dist_submit_"))
+    statements.extend([_loop_jump(jump), _dist_leaf("dist_wait_send")])
+    body = tvm.tir.SeqStmt(
+        [
+            _queue_loop("for", tvm.tir.SeqStmt(statements)),
+            tvm.tir.Evaluate(tvm.tir.ret(1)),
+        ]
+    )
+    if not submitted:
+        with pytest.raises(tvm.error.InternalError, match="send queue is not submitted before return"):
+            _inject_queue_body(body)
+    else:
+        assert _has_wait_before_return(_inject_queue_body(body), 1)
