@@ -7,8 +7,12 @@ import pytest
 import tilelang
 import tilelang.language as T
 from tilelang import tvm
-from tilelang.utils.target import determine_target
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
+from testing.python.sunmmio.inter_rank.tir_test_utils import (
+    collect_dist_put_kinds,
+    collect_op_names,
+    lower_collectives,
+)
 
 
 def _is_row_domain(domain):
@@ -35,8 +39,15 @@ def alltoall_kernel_factory(
             src = T.alloc_shared(shape, T.bfloat16)
             dst = T.alloc_shared(shape, T.bfloat16)
             signal = T.dist.signal(kind=signal_kind)
-            T.dist.all_to_all(src, dst, signal=signal, domain=domain, group=group)
-            T.dist.wait_signal(signal, dst=dst)
+            T.dist.all_to_all(
+                src,
+                dst,
+                signal=signal,
+                domain=domain,
+                group=group,
+                submit=True,
+            )
+            T.dist.wait_signal(signal)
 
     return main
 
@@ -49,7 +60,7 @@ def invalid_alltoall_rank_extent_kernel_factory(world_size: int = 1):
             src = T.alloc_shared((world_size + 1, 4, 8), T.bfloat16)
             dst = T.alloc_shared((world_size + 1, 4, 8), T.bfloat16)
             signal = T.dist.signal()
-            T.dist.all_to_all(src, dst, signal=signal)
+            T.dist.all_to_all(src, dst, signal=signal, submit=True)
 
     return main
 
@@ -62,7 +73,7 @@ def invalid_alltoall_row_extent_kernel_factory(world_size: int = 1):
             src = T.alloc_shared((world_size, 3, 4, 8), T.bfloat16)
             dst = T.alloc_shared((world_size, 3, 4, 8), T.bfloat16)
             signal = T.dist.signal()
-            T.dist.all_to_all(src, dst, signal=signal, domain="row")
+            T.dist.all_to_all(src, dst, signal=signal, domain="row", submit=True)
 
     return main
 
@@ -75,7 +86,7 @@ def mismatched_alltoall_shape_kernel_factory(world_size: int = 1):
             src = T.alloc_shared((world_size, 4, 8), T.bfloat16)
             dst = T.alloc_shared((world_size, 4, 7), T.bfloat16)
             signal = T.dist.signal()
-            T.dist.all_to_all(src, dst, signal=signal)
+            T.dist.all_to_all(src, dst, signal=signal, submit=True)
 
     return main
 
@@ -88,7 +99,7 @@ def mismatched_alltoall_dtype_kernel_factory(world_size: int = 1):
             src = T.alloc_shared((world_size, 4, 8), T.bfloat16)
             dst = T.alloc_shared((world_size, 4, 8), T.float32)
             signal = T.dist.signal()
-            T.dist.all_to_all(src, dst, signal=signal)
+            T.dist.all_to_all(src, dst, signal=signal, submit=True)
 
     return main
 
@@ -100,7 +111,7 @@ def overlapping_alltoall_kernel_factory(world_size: int = 1):
         with T.Kernel():
             storage = T.alloc_shared((world_size, 4, 8), T.bfloat16)
             signal = T.dist.signal()
-            T.dist.all_to_all(storage, storage, signal=signal)
+            T.dist.all_to_all(storage, storage, signal=signal, submit=True)
 
     return main
 
@@ -122,57 +133,20 @@ def alltoall_scope_combinations_kernel_factory(world_size: int = 1):
             signal1 = T.dist.signal()
             signal2 = T.dist.signal()
             signal3 = T.dist.signal()
-            T.dist.all_to_all(src, dst, signal=signal0)
-            T.dist.wait_signal(signal0, dst=dst)
-            T.dist.all_to_all(src, B, signal=signal1)
-            T.dist.wait_signal(signal1, dst=B)
-            T.dist.all_to_all(A, dst, signal=signal2)
-            T.dist.wait_signal(signal2, dst=dst)
-            T.dist.all_to_all(A, B, signal=signal3)
-            T.dist.wait_signal(signal3, dst=B)
+            T.dist.all_to_all(src, dst, signal=signal0, submit=True)
+            T.dist.wait_signal(signal0)
+            T.dist.all_to_all(src, B, signal=signal1, submit=True)
+            T.dist.wait_signal(signal1)
+            T.dist.all_to_all(A, dst, signal=signal2, submit=True)
+            T.dist.wait_signal(signal2)
+            T.dist.all_to_all(A, B, signal=signal3, submit=True)
+            T.dist.wait_signal(signal3)
 
     return main
 
 
-def _collect_op_names(func_or_mod):
-    names = []
-    funcs = func_or_mod.functions.values() if isinstance(func_or_mod, tvm.IRModule) else (func_or_mod,)
-
-    def visit(node):
-        if isinstance(node, tvm.tir.Call) and isinstance(node.op, tvm.ir.Op):
-            names.append(node.op.name)
-
-    for func in funcs:
-        if isinstance(func, tvm.tir.PrimFunc):
-            tvm.tir.stmt_functor.post_order_visit(func.body, visit)
-    return names
-
-
-def _collect_dist_put_kinds(mod):
-    kinds = []
-
-    def visit(node):
-        if isinstance(node, tvm.tir.Call) and isinstance(node.op, tvm.ir.Op) and node.op.name == "tl.dist_put_":
-            kinds.append(str(node.args[3].value))
-
-    for func in mod.functions.values():
-        if isinstance(func, tvm.tir.PrimFunc):
-            tvm.tir.stmt_functor.post_order_visit(func.body, visit)
-    return kinds
-
-
-def _base_mod(func):
-    target = tvm.target.Target(determine_target("sunmmio", return_object=True))
-    mod = tvm.IRModule({"main": func.with_attr("target", target)})
-    return tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
-
-
-def _lower_collectives(func):
-    return tilelang.transform.LowerDistCollectives()(_base_mod(func))
-
-
 def _lower_routing(func):
-    mod = _lower_collectives(func)
+    mod = lower_collectives(func)
     mod = tilelang.transform.InferSramScope()(mod)
     mod = tilelang.transform.PlanDistSignals()(mod)
     return tilelang.transform.LowerDistRouting()(mod)
@@ -189,7 +163,7 @@ def _lower_routing(func):
 )
 def test_alltoall_frontend_normalizes_domain(domain, expected):
     func = alltoall_kernel_factory.get_tir(domain=domain, world_size=4)
-    names = _collect_op_names(func)
+    names = collect_op_names(func)
 
     assert names.count("tl.tileop.dist_alltoall") == 1
     assert f'"{expected}"' in func.script()
@@ -205,26 +179,27 @@ def test_alltoall_frontend_normalizes_domain(domain, expected):
 )
 def test_lower_dist_collectives_expands_alltoall_endpoint_domain(domain, logical_puts):
     func = alltoall_kernel_factory.get_tir(domain=domain, world_size=4)
-    lowered = _lower_collectives(func)
-    names = _collect_op_names(lowered)
+    lowered = lower_collectives(func)
+    names = collect_op_names(lowered)
 
     assert "tl.tileop.dist_alltoall" not in names
     assert names.count("tl.tileop.dist_put") == logical_puts
-    assert names.count("tl.tileop.dist_wait_signal") == 1
-    assert names.count("tl.dist_wait_send") == 1
+    assert names.count("tl.dist_wait_signal") == 1
+    assert names.count("tl.dist_submit") == 1
+    assert "tl.dist_wait_send" not in names
 
 
 def test_alltoall_collective_does_not_insert_receiver_wait():
     func = alltoall_kernel_factory.get_tir(world_size=4)
-    before = _collect_op_names(func).count("tl.tileop.dist_wait_signal")
-    lowered = _lower_collectives(func)
-    assert _collect_op_names(lowered).count("tl.tileop.dist_wait_signal") == before
+    before = collect_op_names(func).count("tl.dist_wait_signal")
+    lowered = lower_collectives(func)
+    assert collect_op_names(lowered).count("tl.dist_wait_signal") == before
 
 
 def test_alltoall_rank_domain_lowers_local_and_peer_routes():
     func = alltoall_kernel_factory.get_tir(world_size=4)
     routed = _lower_routing(func)
-    names = _collect_op_names(routed)
+    names = collect_op_names(routed)
 
     assert "tl.tileop.dist_put" not in names
     assert names.count("tl.tileop.copy") == 1
@@ -235,13 +210,13 @@ def test_alltoall_rank_domain_lowers_local_and_peer_routes():
 
 def test_alltoall_row_domain_uses_local_and_remote_row_routes():
     func = alltoall_kernel_factory.get_tir(domain="row", world_size=2)
-    collective = _lower_collectives(func)
+    collective = lower_collectives(func)
     collective_script = collective.script()
     assert "src[(rank_id + 1) % 2, 3, 0, 0]" in collective_script
     assert "dst[rank_id, bx // 4, 0, 0]" in collective_script
 
     routed = _lower_routing(func)
-    names = _collect_op_names(routed)
+    names = collect_op_names(routed)
     assert "tl.tileop.dist_put" not in names
     assert names.count("tl.tileop.copy") == 4
     assert names.count("tl.tileop.comm_put") == 24
@@ -253,12 +228,13 @@ def test_alltoall_rank_world_size_two_reaches_device_tir():
     func = alltoall_kernel_factory.get_tir(world_size=2)
     result = lower_to_device_tir(func, capture_passes="tl.LowerDistCollectives")
 
-    collective_names = _collect_op_names(result.pass_snapshot("tl.LowerDistCollectives").mod)
-    device_names = _collect_op_names(result.device_mod)
+    collective_names = collect_op_names(result.pass_snapshot("tl.LowerDistCollectives").mod)
+    device_names = collect_op_names(result.device_mod)
     assert "tl.tileop.dist_alltoall" not in collective_names
     assert device_names.count("tl.dist_put_") == 1
     assert device_names.count("tl.dist_wait_signal_") == 1
-    assert device_names.count("tl.dist_wait_send") == 1
+    assert device_names.count("tl.dist_wait_send") == 2
+    assert device_names.count("tl.dist_submit_") == 1
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
@@ -270,11 +246,12 @@ def test_alltoall_row_reaches_device_tir(world_size):
     )
 
     layout_script = result.pass_snapshot("tl.SunmmioLayoutInference").mod.script()
-    device_names = _collect_op_names(result.device_mod)
+    device_names = collect_op_names(result.device_mod)
     assert "layout_map" in layout_script
     assert device_names.count("tl.dist_put_") == 16 * (world_size - 1)
     assert device_names.count("tl.dist_wait_signal_") == 1
-    assert device_names.count("tl.dist_wait_send") == 1
+    assert device_names.count("tl.dist_wait_send") == 2
+    assert device_names.count("tl.dist_submit_") == 1
 
 
 def test_alltoall_supports_all_p2p_scope_combinations():
@@ -284,7 +261,7 @@ def test_alltoall_supports_all_p2p_scope_combinations():
 
     assert int(planned.attrs["tl.dist.signal_counts"]["sram_flagreg_inc"]) == 2
     assert int(planned.attrs["tl.dist.signal_counts"]["dram_flagreg_inc"]) == 2
-    assert Counter(_collect_dist_put_kinds(result.device_mod)) == {
+    assert Counter(collect_dist_put_kinds(result.device_mod)) == {
         "sram_flagreg_inc": 2,
         "dram_flagreg_inc": 2,
     }
@@ -293,7 +270,7 @@ def test_alltoall_supports_all_p2p_scope_combinations():
 def test_alltoall_world_size_one_is_rejected_by_collective_pass():
     func = alltoall_kernel_factory.get_tir(world_size=1)
     with pytest.raises(tvm.error.InternalError, match="world_size > 1"):
-        _lower_collectives(func)
+        lower_collectives(func)
 
 
 def test_alltoall_rejects_invalid_domain():
