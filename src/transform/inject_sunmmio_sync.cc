@@ -752,13 +752,20 @@ private:
       return PrependSync(StmtMutator::VisitStmt_(op), completed_links);
     }
 
+    if (call && call->op.same_as(dist_wait_signal_())) {
+      ICHECK_EQ(call->args.size(), 3U);
+      // A signal wait acquires remote writes without naming a destination
+      // region. Complete all pending local accesses before the acquire.
+      SunmmioSyncUnits required = DrainPending();
+      return PrependSync(StmtMutator::VisitStmt_(op), required);
+    }
+
     // Dist leaf operations own a separate completion protocol. Until that
     // protocol is modeled in unit synchronization, leave their encoded buffer
     // regions untouched instead of treating their vector arguments as loads.
-    if (call && (call->op.same_as(dist_put_()) ||
-                 call->op.same_as(dist_wait_signal_()) ||
-                 call->op.same_as(dist_wait_send()) ||
-                 call->op.same_as(dist_expect_()))) {
+    if (call &&
+        (call->op.same_as(dist_put_()) || call->op.same_as(dist_wait_send()) ||
+         call->op.same_as(dist_expect_()))) {
       return StmtMutator::VisitStmt_(op);
     }
 

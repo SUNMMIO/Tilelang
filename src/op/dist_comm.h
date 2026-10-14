@@ -19,11 +19,16 @@ TVM_DLL const Op &dist_signal_ref();
 TVM_DLL const Op &dist_signal_route();
 TVM_DLL const Op &dist_signal_group_route();
 TVM_DLL const Op &dist_barrier();
+TVM_DLL const Op &dist_barrier_arrive();
+TVM_DLL const Op &dist_batch_begin();
+TVM_DLL const Op &dist_batch_begin_();
+TVM_DLL const Op &dist_submit();
+TVM_DLL const Op &dist_submit_();
 TVM_DLL const Op &dist_signal_put();
 TVM_DLL const Op &dist_signal_put_();
-TVM_DLL const Op &dist_wait_barrier();
-TVM_DLL const Op &dist_wait_barrier_();
 TVM_DLL const Op &dist_put_();
+TVM_DLL const Op &dist_wait_signal();
+TVM_DLL const Op &dist_wait_signal_delta();
 TVM_DLL const Op &dist_wait_signal_();
 TVM_DLL const Op &dist_completion();
 TVM_DLL const Op &dist_completion_has_pending();
@@ -32,6 +37,7 @@ TVM_DLL const Op &dist_wait_any_();
 TVM_DLL const Op &dist_wait_completion_all();
 TVM_DLL const Op &dist_completion_init_();
 TVM_DLL const Op &dist_wait_all();
+TVM_DLL const Op &dist_wait_signals();
 TVM_DLL const Op &dist_wait_send();
 TVM_DLL const Op &dist_expect();
 TVM_DLL const Op &dist_expect_();
@@ -148,38 +154,6 @@ public:
                                              DistPutOpNode);
   TVM_DLL DistPutOp(Array<PrimExpr> args,
                     Map<String, ObjectRef> annotations = {});
-  static const Op &Get();
-};
-
-class DistWaitSignalOpNode : public TileOperatorNode {
-public:
-  PrimExpr signal;
-  Buffer dst;
-  Array<Range> dst_range;
-
-  TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.DistWaitSignalOp", DistWaitSignalOpNode,
-                                    TileOperatorNode);
-
-  TileOperator Clone() const override;
-  LayoutMap InferLayout(const LayoutInferArgs &T,
-                        InferLevel level) const override;
-  Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
-
-  static void RegisterReflection() {
-    namespace refl = tvm::ffi::reflection;
-    refl::ObjectDef<DistWaitSignalOpNode>()
-        .def_ro("signal", &DistWaitSignalOpNode::signal)
-        .def_ro("dst", &DistWaitSignalOpNode::dst)
-        .def_ro("dst_range", &DistWaitSignalOpNode::dst_range);
-  }
-};
-
-class DistWaitSignalOp : public TileOperator {
-public:
-  TVM_FFI_DEFINE_OBJECT_REF_METHODS_NULLABLE(DistWaitSignalOp, TileOperator,
-                                             DistWaitSignalOpNode);
-  TVM_DLL DistWaitSignalOp(Array<PrimExpr> args,
-                           Map<String, ObjectRef> annotations = {});
   static const Op &Get();
 };
 

@@ -107,6 +107,24 @@ class SignalKind(str, Enum):
     DRAM_MEMORY = "dram_memory"
 
 
+class ExpectMode(str, Enum):
+    """Owner of receiver-side expected-value updates."""
+
+    AUTO = "auto"
+    MANUAL = "manual"
+
+
+def _normalize_expect_mode(expect: ExpectMode | str | None) -> ExpectMode | None:
+    if expect is None or isinstance(expect, ExpectMode):
+        return expect
+    if isinstance(expect, str):
+        try:
+            return ExpectMode(expect)
+        except ValueError:
+            pass
+    raise ValueError(f"expect must be None, 'auto', or 'manual', got {expect!r}")
+
+
 def _validate_rank_placement(value: RankPlacementSpec, tensor_rank: int) -> RankPlacementSpec:
     if not isinstance(value, RankPlacementSpec):
         raise TypeError(f"rank_placement must be a RankPlacementSpec constructed with T.dist.placement, got {type(value).__name__}")
@@ -136,6 +154,10 @@ class Signal:
     handle: tir.PrimExpr
     _builder: object
     _group_member: bool = False
+    _expect_mode: ExpectMode | None = None
+    _group_handle: tir.Var | None = None
+    _group_index: int | tir.PrimExpr | None = None
+    _group_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +169,7 @@ class SignalList:
     _count: int
     handle: tir.Var
     _builder: object
+    _expect_mode: ExpectMode | None = None
 
     def __len__(self) -> int:
         return self._count
@@ -154,18 +177,29 @@ class SignalList:
     def __iter__(self) -> Iterator[Signal]:
         return (self[index] for index in range(self._count))
 
-    def __getitem__(self, index: int) -> Signal:
-        if isinstance(index, bool) or not isinstance(index, int):
-            raise TypeError("T.dist.SignalList only supports compile-time integer indexing")
-        if index < 0:
-            index += self._count
-        if not 0 <= index < self._count:
-            raise IndexError("T.dist.SignalList index out of range")
+    def __getitem__(self, index: int | tir.PrimExpr) -> Signal:
+        if isinstance(index, bool):
+            raise TypeError("T.dist.SignalList index must be an integer")
+        if isinstance(index, int):
+            if index < 0:
+                index += self._count
+            if not 0 <= index < self._count:
+                raise IndexError("T.dist.SignalList index out of range")
+            normalized_index: int | tir.PrimExpr = index
+        elif isinstance(index, tir.PrimExpr):
+            _current_dist_builder()
+            if self._expect_mode == ExpectMode.AUTO:
+                raise TypeError("Dynamic SignalList indexing cannot use expect='auto'; use expect=None or expect='manual'")
+            if not str(index.dtype).startswith("int"):
+                raise TypeError("Dynamic SignalList index must have integer dtype")
+            normalized_index = index
+        else:
+            raise TypeError("T.dist.SignalList index must be an integer or TIR PrimExpr")
         member = tir.call_intrin(
             "handle",
             tir.op.Op.get("tl.dist_signal_ref"),
             self.handle,
-            tir.IntImm("int32", index),
+            tir.IntImm("int32", normalized_index) if isinstance(normalized_index, int) else normalized_index,
         )
         return Signal(
             self._requested_kind,
@@ -173,6 +207,10 @@ class SignalList:
             member,
             self._builder,
             _group_member=True,
+            _expect_mode=self._expect_mode,
+            _group_handle=self.handle,
+            _group_index=normalized_index,
+            _group_count=self._count,
         )
 
     def _as_group_handle(self) -> tir.Var:
@@ -219,11 +257,12 @@ def _check_signal(signal: Signal) -> None:
         raise ValueError("A T.dist Signal cannot be used across different PrimFuncs")
 
 
-def signal(*, kind: SignalKind | None = None) -> Signal:
+def signal(*, kind: SignalKind | None = None, expect: ExpectMode | str | None = None) -> Signal:
     """Declare one receiver signal for compiler resource planning."""
 
     if kind is not None and not isinstance(kind, SignalKind):
         raise TypeError(f"kind must be a T.dist.SignalKind, got {kind!r}")
+    expect_mode = _normalize_expect_mode(expect)
 
     from tilelang.language.kernel import KernelLaunchFrame
 
@@ -232,16 +271,18 @@ def signal(*, kind: SignalKind | None = None) -> Signal:
     builder = _current_dist_builder()
     logical_id = builder.allocate_dist_signal_decl()
     requested_kind = "auto" if kind is None else kind.value
+    requested_expect = "infer" if expect_mode is None else expect_mode.value
     signal_call = tir.call_intrin(
         "handle",
         tir.op.Op.get("tl.dist_signal_decl"),
         tir.StringImm(requested_kind),
         tir.IntImm("int32", logical_id),
+        tir.StringImm(requested_expect),
     )
     signal_frame = tir_builder.LetStmt(signal_call)
     signal_handle = signal_frame.var
     builder.enter_frame(signal_frame)
-    return Signal(kind, logical_id, signal_handle, builder)
+    return Signal(kind, logical_id, signal_handle, builder, _expect_mode=expect_mode)
 
 
 def _resolve_signal_count(count) -> int:
@@ -265,11 +306,17 @@ def _resolve_signal_count(count) -> int:
     raise ValueError(f"count must be a positive compile-time int, got {count!r}")
 
 
-def signals(count: int | tir.PrimExpr, *, kind: SignalKind | None = None) -> SignalList:
+def signals(
+    count: int | tir.PrimExpr,
+    *,
+    kind: SignalKind | None = None,
+    expect: ExpectMode | str | None = None,
+) -> SignalList:
     """Declare a compile-time-sized homogeneous receiver-signal group."""
 
     if kind is not None and not isinstance(kind, SignalKind):
         raise TypeError(f"kind must be a T.dist.SignalKind, got {kind!r}")
+    expect_mode = _normalize_expect_mode(expect)
     count = _resolve_signal_count(count)
     if count <= 0:
         raise ValueError(f"count must be a positive compile-time int, got {count!r}")
@@ -280,16 +327,18 @@ def signals(count: int | tir.PrimExpr, *, kind: SignalKind | None = None) -> Sig
     builder = _current_dist_builder()
     logical_id = builder.allocate_dist_signal_decl()
     requested_kind = "auto" if kind is None else kind.value
+    requested_expect = "infer" if expect_mode is None else expect_mode.value
     group_call = tir.call_intrin(
         "handle",
         tir.op.Op.get("tl.dist_signal_group_decl"),
         tir.StringImm(requested_kind),
         tir.IntImm("int32", logical_id),
         tir.IntImm("int32", count),
+        tir.StringImm(requested_expect),
     )
     group_frame = tir_builder.LetStmt(group_call)
     builder.enter_frame(group_frame)
-    return SignalList(kind, logical_id, count, group_frame.var, builder)
+    return SignalList(kind, logical_id, count, group_frame.var, builder, expect_mode)
 
 
 def _current_core_id() -> tir.PrimExpr:
@@ -301,10 +350,32 @@ def _current_core_id() -> tir.PrimExpr:
     return frame.get_block_binding(0)
 
 
-def put(src, dst, dst_rank, *, dst_row=None, signal: Signal):
-    """Asynchronously write one RSRAM region to another Rank."""
+def _begin_submit_sugar(submit: bool) -> None:
+    if not isinstance(submit, bool):
+        raise TypeError(f"submit must be a bool, got {submit!r}")
+    if submit:
+        _current_dist_builder().eval(tir.call_intrin("handle", tir.op.Op.get("tl.dist_batch_begin")))
+
+
+def _finish_enqueue(call: tir.PrimExpr, submit: bool):
+    if not submit:
+        return call
+    _current_dist_builder().eval(call)
+    return tir.call_intrin("handle", tir.op.Op.get("tl.dist_submit"))
+
+
+def put(src, dst, dst_rank, *, dst_row=None, signal: Signal, submit: bool = False):
+    """Enqueue one region write to another Rank."""
 
     _check_signal(signal)
+    _begin_submit_sugar(submit)
+    manual_group_member = signal._expect_mode == ExpectMode.MANUAL and signal._group_member and signal._group_index is not None
+    if signal._expect_mode == ExpectMode.MANUAL and not manual_group_member:
+        raise ValueError("T.dist.put with expect='manual' requires a SignalList member")
+    if signal._expect_mode is None and signal._group_member and isinstance(signal._group_index, tir.PrimExpr):
+        raise ValueError(
+            "A dynamic SignalList member passed to T.dist.put requires expect='manual'; expect=None is reserved for protocol inference"
+        )
     if isinstance(dst_rank, bool) or not isinstance(dst_rank, (int, tir.PrimExpr)):
         raise TypeError(f"dst_rank must be an integer or TIR PrimExpr, got {type(dst_rank).__name__}")
     dst_rank_int = int(dst_rank) if isinstance(dst_rank, (int, tir.IntImm)) else None
@@ -327,22 +398,45 @@ def put(src, dst, dst_rank, *, dst_row=None, signal: Signal):
     src_region, dst_region = _prepare_one_to_one_operands(src, dst, "T.dist.put")
     if src_region.buffer.dtype != dst_region.buffer.dtype:
         raise TypeError(f"T.dist.put source and destination dtypes must match, got {src_region.buffer.dtype} and {dst_region.buffer.dtype}")
-    return tir.call_intrin(
+    signal_handle = signal.handle
+    if manual_group_member:
+        member_index = signal._group_index
+        assert signal._group_handle is not None
+        generation_index = member_index * current_world_size + dst_rank
+        signal_handle = tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dist_signal_group_route"),
+            signal._group_handle,
+            member_index,
+            generation_index,
+            tir.IntImm("bool", 1),
+        )
+    call = tir.call_intrin(
         "handle",
         tir.op.Op.get("tl.tileop.dist_put"),
         src_region.region,
         dst_region.region,
         dst_rank,
         normalized_dst_row,
-        signal.handle,
+        signal_handle,
         current_core,
     )
+    return _finish_enqueue(call, submit)
 
 
-def routed_put(src, dst, routes, *, signal: Signal, src_rank=None):
-    """Execute a compile-time same-column row routing table."""
+def routed_put(
+    src,
+    dst,
+    routes,
+    *,
+    signal: Signal,
+    src_rank=None,
+    submit: bool = False,
+):
+    """Enqueue a compile-time same-column row routing table."""
 
     _check_signal(signal)
+    _begin_submit_sugar(submit)
     if not isinstance(routes, (list, tuple)) or not routes:
         raise TypeError("routes must be a non-empty list or tuple of route entries")
 
@@ -387,7 +481,7 @@ def routed_put(src, dst, routes, *, signal: Signal, src_rank=None):
         )
 
     route_table = tir.call_intrin("handle", tir.op.Op.get("tl.dist_route_table"), *route_entries)
-    return tir.call_intrin(
+    call = tir.call_intrin(
         "handle",
         tir.op.Op.get("tl.dist_rank_routed_put"),
         src_region.region,
@@ -397,45 +491,106 @@ def routed_put(src, dst, routes, *, signal: Signal, src_rank=None):
         signal.handle,
         _current_core_id(),
     )
+    return _finish_enqueue(call, submit)
 
 
-def wait_signal(signal: Signal, *, dst):
-    """Wait for the next receiver-signal generation and make ``dst`` visible."""
+def put_signal(signal: Signal, dst_rank, *, submit: bool = False):
+    """Enqueue a receiver-signal update for a peer Rank."""
 
     _check_signal(signal)
-    from tilelang.language.comm import _prepare_comm_region_compact
+    _begin_submit_sugar(submit)
+    if signal._expect_mode == ExpectMode.MANUAL:
+        raise ValueError("T.dist.put_signal with expect='manual' is not supported yet; use a sender-indexed SignalList with T.dist.put")
+    if isinstance(dst_rank, bool) or not isinstance(dst_rank, (int, tir.PrimExpr)):
+        raise TypeError(f"dst_rank must be an integer or TIR PrimExpr, got {type(dst_rank).__name__}")
+    dst_rank_int = int(dst_rank) if isinstance(dst_rank, (int, tir.IntImm)) else None
+    current_world_size = _current_world_size()
+    if dst_rank_int is not None and not 0 <= dst_rank_int < current_world_size:
+        raise ValueError(f"dst_rank {dst_rank_int} is outside [0, {current_world_size})")
+    call = tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.dist_signal_put"),
+        signal.handle,
+        dst_rank,
+        _current_core_id(),
+    )
+    return _finish_enqueue(call, submit)
 
-    dst_region = _prepare_comm_region_compact(dst, "w")
+
+def submit():
+    """Submit all descriptors in this core's current distributed-send queue."""
+
+    _current_dist_builder()
+    _current_core_id()
+    return tir.call_intrin("handle", tir.op.Op.get("tl.dist_submit"))
+
+
+def wait_signal(signal: Signal, *, expected_delta=None):
+    """Wait until a receiver signal reaches its current expected value."""
+
+    _check_signal(signal)
+    if expected_delta is not None:
+        if signal._expect_mode != ExpectMode.MANUAL:
+            raise ValueError("T.dist.wait_signal expected_delta requires expect='manual'")
+        if isinstance(expected_delta, bool) or not isinstance(expected_delta, (int, tir.PrimExpr)):
+            raise TypeError("expected_delta must be an integer or TIR PrimExpr")
+        if isinstance(expected_delta, int):
+            if expected_delta < 0:
+                raise ValueError("expected_delta must be non-negative")
+            expected_delta = tir.IntImm("int32", expected_delta)
+        elif not (str(expected_delta.dtype).startswith("int") or str(expected_delta.dtype).startswith("uint")):
+            raise TypeError("expected_delta must have integer dtype")
+        return tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.dist_wait_signal_delta"),
+            signal.handle,
+            expected_delta,
+        )
     return tir.call_intrin(
         "handle",
-        tir.op.Op.get("tl.tileop.dist_wait_signal"),
+        tir.op.Op.get("tl.dist_wait_signal"),
         signal.handle,
-        dst_region.region,
     )
 
 
-def wait_all(signal_list, *, dst=None):
+def wait_all(signal_list):
     """Wait for a static signal list or drain an all-to-allv completion."""
 
     if isinstance(signal_list, DistCompletion):
-        if dst is not None:
-            raise TypeError("T.dist.wait_all(completion) does not accept dst")
         return _wait_completion_all(signal_list)
 
     if not isinstance(signal_list, SignalList):
         raise TypeError(f"T.dist.wait_all expects a SignalList or DistCompletion, got {type(signal_list).__name__}")
-    if dst is None:
-        raise TypeError("T.dist.wait_all(signal_list) requires dst")
     group_handle = signal_list._as_group_handle()
-
-    from tilelang.language.comm import _prepare_comm_region_compact
-
-    dst_region = _prepare_comm_region_compact(dst, "w")
     return tir.call_intrin(
         "handle",
         tir.op.Op.get("tl.dist_wait_all"),
-        dst_region.region,
         group_handle,
+    )
+
+
+def wait_signals(signal_list: SignalList, *, expected_deltas):
+    """Advance per-member expected values and wait for every signal."""
+
+    if not isinstance(signal_list, SignalList):
+        raise TypeError(f"T.dist.wait_signals expects a SignalList, got {type(signal_list).__name__}")
+    if signal_list._expect_mode != ExpectMode.MANUAL:
+        raise ValueError("T.dist.wait_signals requires a SignalList declared with expect='manual'")
+    group_handle = signal_list._as_group_handle()
+
+    from .comm import _compact_shape_equal, _prepare_comm_region_compact
+
+    deltas = _prepare_comm_region_compact(expected_deltas, "r")
+    if str(deltas.buffer.dtype) not in ("int32", "uint32"):
+        raise TypeError("T.dist.wait_signals expected_deltas must use int32 or uint32")
+    expected_shape = [tir.IntImm("int32", len(signal_list))]
+    if not _compact_shape_equal(deltas.extents, expected_shape):
+        raise ValueError(f"T.dist.wait_signals expected_deltas must have shape ({len(signal_list)},), got {tuple(deltas.extents)}")
+    return tir.call_intrin(
+        "handle",
+        tir.op.Op.get("tl.dist_wait_signals"),
+        group_handle,
+        deltas.region,
     )
 
 
@@ -456,6 +611,8 @@ from .dist_collective import (  # noqa: E402
     all_to_all,
     all_to_allv,
     barrier,
+    barrier_arrive,
+    completion,
     has_pending,
     wait_any,
 )
@@ -467,6 +624,7 @@ __all__ = [
     "Signal",
     "SignalList",
     "SignalKind",
+    "ExpectMode",
     "CollectiveDomain",
     "DistCompletion",
     "all_gather",
@@ -474,15 +632,20 @@ __all__ = [
     "all_to_all",
     "all_to_allv",
     "barrier",
+    "barrier_arrive",
+    "completion",
     "placement",
     "put",
+    "put_signal",
     "routed_put",
     "signal",
     "signals",
+    "submit",
     "has_pending",
     "wait",
     "wait_all",
     "wait_any",
     "wait_signal",
+    "wait_signals",
     "world_size",
 ]

@@ -1,4 +1,4 @@
-"""基础 Rank/world 语法与 MeshTensor Rank placement 测试。"""
+"""Basic rank/world syntax and MeshTensor rank placement tests."""
 
 import pytest
 
