@@ -308,6 +308,37 @@ def loop_expect_kernel_factory(
 
 
 @tilelang.jit(target="sunmmio")
+def static_destination_loop_kernel_factory(group_member=False, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            src = T.alloc_shared((world_size, 32), T.bfloat16)
+            dst = T.alloc_shared((world_size, 32), T.bfloat16)
+            signal = T.dist.signal()
+            signals = T.dist.signals(1)
+            if group_member:
+                for distance in T.serial(1, world_size):
+                    T.dist.put(
+                        src[rank_id : rank_id + 1, 0:32],
+                        dst[rank_id : rank_id + 1, 0:32],
+                        dst_rank=(rank_id + distance) % world_size,
+                        signal=signals[0],
+                    )
+            else:
+                for distance in T.serial(1, world_size):
+                    T.dist.put(
+                        src[rank_id : rank_id + 1, 0:32],
+                        dst[rank_id : rank_id + 1, 0:32],
+                        dst_rank=(rank_id + distance) % world_size,
+                        signal=signal,
+                    )
+            T.dist.submit()
+            T.dist.wait_signal(signals[0] if group_member else signal)
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
 def collective_loop_kernel_factory(variable_counts=False, world_size: int = 1):
     @T.prim_func
     def main(rank_id: T.dist.RankId, rounds: T.int32):
@@ -539,6 +570,23 @@ def test_auto_keeps_proven_uniform_loops(form):
     lowered = result.pass_snapshot("tl.LowerDistCommunication").mod
     assert len(collect_calls(lowered, "tl.dist_expect_")) == 1
     assert "for " in lowered.script()
+
+
+@pytest.mark.parametrize("group_member", [False, True])
+def test_auto_supports_static_loop_destination_rank(group_member):
+    result = lower_to_device_tir(
+        static_destination_loop_kernel_factory.get_tir(
+            group_member=group_member,
+            world_size=4,
+        ),
+        capture_passes="tl.LowerDistCommunication",
+    )
+    lowered = result.pass_snapshot("tl.LowerDistCommunication").mod
+    markers = collect_calls(lowered, "tl.dist_expect_")
+    assert len(markers) == 1
+    assert "distance == 1" in str(markers[0].args[1])
+    assert "distance == 3" in str(markers[0].args[1])
+    assert "for distance in range(1, 4)" in lowered.script()
 
 
 @pytest.mark.parametrize(

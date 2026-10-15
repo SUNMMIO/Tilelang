@@ -301,7 +301,7 @@ def OptimizeForSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
 
     mod = tilelang.transform.MergeIfStmt()(mod)
-    mod = tilelang.transform.InjectDistSync()(mod)
+    mod = tilelang.transform.LowerDistSync()(mod)
     mod = tilelang.transform.InjectSunmmioSync()(mod)
 
     mod = tilelang.transform.MakePackedAPI()(mod)

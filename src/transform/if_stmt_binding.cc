@@ -38,30 +38,31 @@ private:
     ICHECK(then_case.defined()) << "then_case must be defined";
     ICHECK(!else_case.defined()) << "else_case must be undefined";
 
-    auto bind_if_stmt = [](const Optional<Stmt> &body,
-                           const PrimExpr &condition) -> Stmt {
-      if (body.defined()) {
-        auto stmt = body.value();
-        if (auto seq_stmt = stmt.as<SeqStmtNode>()) {
-          Array<Stmt> seq_;
-          for (auto s : seq_stmt->seq) {
-            seq_.push_back(IfThenElse(condition, s, Stmt()));
-          }
-          return SeqStmt(std::move(seq_));
-        } else {
-          return IfThenElse(condition, stmt, Stmt());
-        }
-      } else {
-        return Stmt();
-      }
-    };
-
-    Array<Stmt> new_seq;
-
-    if (then_case.defined()) {
-      new_seq.push_back(bind_if_stmt(then_case, condition));
+    const auto *seq_stmt = then_case.as<SeqStmtNode>();
+    if (!seq_stmt || seq_stmt->seq.size() <= 1) {
+      return IfThenElse(condition, then_case, Stmt(), op->span);
     }
-    return new_seq.size() == 1 ? new_seq[0] : SeqStmt(std::move(new_seq));
+
+    PrimExpr guard = condition;
+    Optional<Var> condition_snapshot;
+    // Repeated guards must preserve the original if's single evaluation.
+    // Only replay pure conditions: this TIR implementation does not have the
+    // upstream TIRX access analysis needed to prove read-only conditions
+    // stable.
+    if (SideEffect(condition) > CallEffectKind::kPure) {
+      condition_snapshot = Var("if_condition", condition.dtype());
+      guard = condition_snapshot.value();
+    }
+
+    Array<Stmt> guarded_stmts;
+    for (const Stmt &stmt : seq_stmt->seq) {
+      guarded_stmts.push_back(IfThenElse(guard, stmt, Stmt(), op->span));
+    }
+    Stmt body = SeqStmt(std::move(guarded_stmts), seq_stmt->span);
+    if (condition_snapshot.defined()) {
+      return LetStmt(condition_snapshot.value(), condition, body, op->span);
+    }
+    return body;
   }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {

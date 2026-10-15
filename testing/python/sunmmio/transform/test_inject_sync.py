@@ -302,6 +302,25 @@ def test_condition_load_is_synchronized_before_branch_async_write():
     assert if_index < sync_index < dma_index
 
 
+def test_if_condition_snapshot_waits_for_async_write_before_reading():
+    def body(src, dst):
+        condition = dst[0, 0] > tvm.tir.FloatImm("bfloat16", 0.0)
+        guarded = tvm.tir.IfThenElse(
+            condition,
+            tvm.tir.SeqStmt([_dma(src, dst, unit="odma0"), _dma(dst, src, unit="odma1")]),
+            None,
+        )
+        return [_dma(src, dst, unit="odma0"), guarded]
+
+    mod = tilelang.transform.IfStmtBinding()(_make_module(body))
+    mod = tilelang.transform.MergeIfStmt()(mod)
+    lines = _apply(mod).script().splitlines()
+    first_dma = next(i for i, line in enumerate(lines) if "T.dma_copy" in line)
+    snapshot = next(i for i, line in enumerate(lines) if line.strip().startswith("if_condition:"))
+    sync = next(i for i, line in enumerate(lines) if "T.sunmmio_sync(1)" in line)
+    assert first_dma < sync < snapshot
+
+
 def test_disjoint_dma_regions_do_not_insert_sync():
     def body(src, dst):
         return [

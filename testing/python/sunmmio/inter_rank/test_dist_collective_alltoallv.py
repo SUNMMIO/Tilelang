@@ -446,7 +446,7 @@ def test_alltoallv_single_signal_uses_inc_and_reaches_regular_wait_leaf():
             "tl.LowerDistCollectives",
             "tl.PlanDistSignals",
             "tl.LowerDistCommunication",
-            "tl.InjectDistSync",
+            "tl.LowerDistSync",
         ),
     )
 
@@ -464,7 +464,7 @@ def test_alltoallv_single_signal_uses_inc_and_reaches_regular_wait_leaf():
     assert "tl.dist_completion_init_" not in lower_names
     assert "tl.dist_wait_any_" not in lower_names
 
-    injected = result.pass_snapshot("tl.InjectDistSync").mod
+    injected = result.pass_snapshot("tl.LowerDistSync").mod
     injected_names = collect_op_names(injected)
     injected_script = injected.script()
     assert "tl.dist_expect_" not in injected_names
@@ -483,7 +483,7 @@ def test_alltoallv_single_signal_row_routes_active_and_reuses_wait_leaf():
             "tl.PlanDistSignals",
             "tl.LowerDistRouting",
             "tl.LowerDistCommunication",
-            "tl.InjectDistSync",
+            "tl.LowerDistSync",
         ),
     )
 
@@ -499,7 +499,7 @@ def test_alltoallv_single_signal_row_routes_active_and_reuses_wait_leaf():
     assert lower_names.count("tl.dist_put_") == 16
     assert lower_names.count("tl.dist_wait_signal_") == 1
     assert "tl.dist_wait_any_" not in lower_names
-    injected_script = result.pass_snapshot("tl.InjectDistSync").mod.script()
+    injected_script = result.pass_snapshot("tl.LowerDistSync").mod.script()
     assert "recv_counts[1, 3]" in injected_script
     assert "pending_count" not in injected_script
 
@@ -535,7 +535,7 @@ def test_alltoallv_rank_reaches_dynamic_completion_leaves():
             "tl.LowerDistCollectives",
             "tl.PlanDistSignals",
             "tl.LowerDistCommunication",
-            "tl.InjectDistSync",
+            "tl.LowerDistSync",
         ),
     )
 
@@ -547,7 +547,7 @@ def test_alltoallv_rank_reaches_dynamic_completion_leaves():
     assert collect_op_arg_counts(lower_comm, "tl.dist_wait_any_") == [6]
     assert "tl.dist_completion_has_pending" not in lower_names
 
-    injected = result.pass_snapshot("tl.InjectDistSync").mod
+    injected = result.pass_snapshot("tl.LowerDistSync").mod
     injected_names = collect_op_names(injected)
     injected_script = injected.script()
     assert "tl.dist_completion_init_" not in injected_names
@@ -562,8 +562,8 @@ def test_alltoallv_rank_reaches_dynamic_completion_leaves():
 
 def test_alltoallv_wait_all_drains_pending_completion():
     func = alltoallv_rank_kernel_factory.get_tir(wait_mode="all", world_size=4)
-    result = lower_to_device_tir(func, capture_passes="tl.InjectDistSync")
-    injected = result.pass_snapshot("tl.InjectDistSync").mod
+    result = lower_to_device_tir(func, capture_passes="tl.LowerDistSync")
+    injected = result.pass_snapshot("tl.LowerDistSync").mod
     names = collect_op_names(injected)
     script = injected.script()
 
@@ -577,11 +577,11 @@ def test_alltoallv_reuses_group_state_with_independent_completions():
     func = repeated_alltoallv_kernel_factory.get_tir(world_size=4)
     result = lower_to_device_tir(
         func,
-        capture_passes=("tl.LowerDistCommunication", "tl.InjectDistSync"),
+        capture_passes=("tl.LowerDistCommunication", "tl.LowerDistSync"),
     )
 
     lower_script = result.pass_snapshot("tl.LowerDistCommunication").mod.script()
-    injected = result.pass_snapshot("tl.InjectDistSync").mod
+    injected = result.pass_snapshot("tl.LowerDistSync").mod
     assert lower_script.count("_generation = T.allocate([16]") == 1
     assert "rank_id * 4" in lower_script
     assert collect_op_names(injected).count("tl.dist_wait_any_") == 2
@@ -630,7 +630,7 @@ def test_alltoallv_row_routes_active_state_and_reaches_completion_leaves():
             "tl.PlanDistSignals",
             "tl.LowerDistRouting",
             "tl.LowerDistCommunication",
-            "tl.InjectDistSync",
+            "tl.LowerDistSync",
         ),
     )
 
@@ -649,7 +649,7 @@ def test_alltoallv_row_routes_active_state_and_reaches_completion_leaves():
     assert lower_names.count("tl.dist_put_") == 16
     assert lower_names.count("tl.dist_wait_any_") == 1
 
-    injected_script = result.pass_snapshot("tl.InjectDistSync").mod.script()
+    injected_script = result.pass_snapshot("tl.LowerDistSync").mod.script()
     assert "rank_id * 4" in injected_script
     assert "recv_counts[1, 3]" in injected_script
     assert "pending_count" in injected_script

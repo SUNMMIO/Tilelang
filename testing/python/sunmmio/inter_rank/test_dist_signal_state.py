@@ -9,6 +9,8 @@ import tilelang.language as T
 from tilelang import tvm
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import (
+    collect_calls,
+    collect_nodes,
     collect_op_names,
     signal_counts,
     single_prim_func,
@@ -32,18 +34,25 @@ def explicit_memory_signal_kernel_factory(world_size: int = 1):
 
 
 @tilelang.jit(target="sunmmio")
-def reused_signal_kernel_factory(world_size: int = 1):
+def reused_signal_kernel_factory(
+    signal_kind=T.dist.SignalKind.SRAM_FLAGREG_VALUE,
+    expect_mode="auto",
+    world_size: int = 1,
+):
     @T.prim_func
     def main(rank_id: T.dist.RankId):
         with T.Kernel():
             src = T.alloc_shared((32, 32), T.bfloat16)
             dst = T.alloc_shared((32, 32), T.bfloat16)
-            signal = T.dist.signal(kind=T.dist.SignalKind.SRAM_FLAGREG_VALUE)
+            signal = T.dist.signal(kind=signal_kind, expect=expect_mode)
             peer_rank = (rank_id + 1) % world_size
             for _step in T.serial(2):
                 T.dist.put(src, dst, dst_rank=peer_rank, signal=signal)
                 T.dist.submit()
-                T.dist.wait_signal(signal)
+                if expect_mode == "manual":
+                    T.dist.wait_signal(signal, expected_delta=1)
+                else:
+                    T.dist.wait_signal(signal)
             T.dist.wait()
 
     return main
@@ -125,6 +134,45 @@ def multi_destination_value_kernel_factory(
     return main
 
 
+@tilelang.jit(target="sunmmio")
+def loop_destination_generation_kernel_factory(
+    signal_kind,
+    expect_mode,
+    group_member=False,
+    world_size: int = 3,
+):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            # Separate rounds cannot overwrite a send or an unconsumed receive.
+            src = T.alloc_shared((2, 32), T.bfloat16)
+            dst = T.alloc_shared((2, 32), T.bfloat16)
+            if group_member:
+                signals = T.dist.signals(1, kind=signal_kind, expect=expect_mode)
+            else:
+                signal = T.dist.signal(kind=signal_kind, expect=expect_mode)
+            for step in T.serial(2):
+                for peer in T.serial(1, world_size):
+                    if rank_id == 0:
+                        T.dist.put(
+                            src[step : step + 1, 0:32],
+                            dst[step : step + 1, 0:32],
+                            dst_rank=peer,
+                            signal=signals[0] if group_member else signal,
+                            submit=True,
+                        )
+                if expect_mode == "manual":
+                    T.dist.wait_signal(
+                        signals[0] if group_member else signal,
+                        expected_delta=T.if_then_else(rank_id == 0, 0, 1),
+                    )
+                else:
+                    T.dist.wait_signal(signals[0] if group_member else signal)
+            T.dist.wait()
+
+    return main
+
+
 def _collect_leaf_signals(func, op_name, kind_index_positions, expected_position):
     result = []
 
@@ -174,8 +222,10 @@ def test_explicit_memory_signal_reaches_stable_leaf_tir():
     assert 'T.dist_wait_signal_("sram_memory", 0, signal_expect_1[0]' in script
 
 
-def test_signal_generation_is_reused_across_serial_loop():
-    func = reused_signal_kernel_factory.get_tir(world_size=4)
+@pytest.mark.parametrize("signal_kind", [T.dist.SignalKind.SRAM_FLAGREG_VALUE, T.dist.SignalKind.SRAM_MEMORY])
+@pytest.mark.parametrize("expect_mode", ["auto", "manual"])
+def test_signal_generation_is_reused_across_serial_loop(signal_kind, expect_mode):
+    func = reused_signal_kernel_factory.get_tir(signal_kind=signal_kind, expect_mode=expect_mode, world_size=4)
     result = lower_to_device_tir(func)
     device_func = single_prim_func(result.device_mod)
     op_names = collect_op_names(device_func)
@@ -187,7 +237,11 @@ def test_signal_generation_is_reused_across_serial_loop():
     assert "for _step in range(2):" in script
     assert "signal_expect_1[0] = signal_expect_1[0] + T.uint32(1)" in script
     assert "signal_generation_1[0] = signal_generation_1[0] + T.uint32(1)" in script
-    assert 'T.dist_wait_signal_("sram_flagreg_value", 0, signal_expect_1[0]' in script
+    generation = collect_calls(device_func, "tl.dist_put_")[0].args[5]
+    assert isinstance(generation, tvm.tir.BufferLoad)
+    assert tuple(int(extent) for extent in generation.buffer.shape) == (1,)
+    assert int(generation.indices[0]) == 0
+    assert collect_calls(device_func, "tl.dist_wait_signal_")[0].args[0].value == signal_kind.value
 
 
 def test_put_advances_generation_and_wait_only_reads_it():
@@ -213,7 +267,7 @@ def test_signals_preserve_independent_expected_and_generation():
     result = lower_to_device_tir(
         func,
         capture_before_passes="tl.PlanDistSignals",
-        capture_passes=("tl.PlanDistSignals", "tl.InjectDistSync"),
+        capture_passes=("tl.PlanDistSignals", "tl.LowerDistSync"),
     )
 
     before_plan = result.pass_snapshot("tl.PlanDistSignals", when="before").mod.script()
@@ -276,7 +330,7 @@ def test_value_and_memory_signals_use_generation_per_destination(signal_kind):
     )
     result = lower_to_device_tir(
         func,
-        capture_passes=("tl.LowerDistCommunication", "tl.InjectDistSync"),
+        capture_passes=("tl.LowerDistCommunication", "tl.LowerDistSync"),
     )
     lowered = result.pass_snapshot("tl.LowerDistCommunication").mod
     allocations = []
@@ -296,7 +350,38 @@ def test_value_and_memory_signals_use_generation_per_destination(signal_kind):
             assert isinstance(generation, tvm.tir.BufferLoad)
             generation_indices.append(int(generation.indices[0]))
 
-    for candidate in result.pass_snapshot("tl.InjectDistSync").mod.functions.values():
+    for candidate in result.pass_snapshot("tl.LowerDistSync").mod.functions.values():
         if isinstance(candidate, tvm.tir.PrimFunc):
             tvm.tir.stmt_functor.post_order_visit(candidate.body, visit)
     assert generation_indices == [1, 2]
+
+
+@pytest.mark.parametrize("signal_kind", [T.dist.SignalKind.SRAM_FLAGREG_VALUE, T.dist.SignalKind.SRAM_MEMORY])
+@pytest.mark.parametrize("expect_mode", ["auto", "manual"])
+@pytest.mark.parametrize("group_member", [False, True])
+def test_loop_destinations_keep_independent_signal_generations(signal_kind, expect_mode, group_member):
+    world_size = 3
+    func = loop_destination_generation_kernel_factory.get_tir(
+        signal_kind=signal_kind,
+        expect_mode=expect_mode,
+        group_member=group_member,
+        world_size=world_size,
+    )
+    result = lower_to_device_tir(func, capture_passes="tl.LowerDistCommunication")
+    analyzer = tvm.arith.Analyzer()
+    for mod in (result.pass_snapshot("tl.LowerDistCommunication").mod, result.device_mod):
+        puts = collect_calls(mod, "tl.dist_put_")
+        assert len(puts) == 1  # The payload peer loop remains a loop.
+        put = puts[0]
+        generation = put.args[5]
+        assert isinstance(generation, tvm.tir.BufferLoad)
+        assert tuple(int(extent) for extent in generation.buffer.shape) == (world_size,)
+        assert analyzer.can_prove_equal(generation.indices[0], put.args[2])
+    advances = collect_nodes(
+        result.device_mod,
+        tvm.tir.BufferStore,
+        lambda store: store.buffer.data.same_as(generation.buffer.data) and not isinstance(store.value, tvm.tir.IntImm),
+    )
+    assert len(advances) == 1
+    assert analyzer.can_prove_equal(advances[0].indices[0], generation.indices[0])
+    assert analyzer.can_prove_equal(advances[0].value, generation + 1)

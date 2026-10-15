@@ -55,7 +55,7 @@ private:
     }
 
     // Then, merge consecutive IfThenElse (without else) that share the same
-    // condition.
+    // pure condition. State-reading conditions must be evaluated independently.
     Array<Stmt> new_seq;
     PrimExpr current_condition;
     Array<Stmt> current_if_bodies;
@@ -64,6 +64,7 @@ private:
       if (const auto *if_node = stmt.as<IfThenElseNode>()) {
         if (!if_node->else_case.defined()) {
           if (current_condition.defined() &&
+              SideEffect(current_condition) <= CallEffectKind::kPure &&
               ExprDeepEqual()(current_condition, if_node->condition)) {
             current_if_bodies.push_back(if_node->then_case);
             continue;
