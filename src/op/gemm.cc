@@ -22,6 +22,56 @@ namespace tl {
 
 using namespace tir;
 
+namespace {
+
+bool HasBatchedGemmSemantics(const BufferRegion &region, bool is_output) {
+  if (region->region.size() != 3)
+    return false;
+  return is_output || !is_one(region->region[0]->extent);
+}
+
+void ValidateSunmmioBatchRegion(const BufferRegion &region,
+                                const char *operand) {
+  if (region->region.size() != 3)
+    return;
+
+  const Range &batch = region->region[0];
+  const auto *extent = batch->extent.as<IntImmNode>();
+  ICHECK(extent && extent->value > 0)
+      << "Sunmmio Batch GEMM requires " << operand
+      << " batch extent to be a positive static IntImm, got " << batch->extent;
+
+  arith::Analyzer analyzer;
+  const auto *min = batch->min.as<IntImmNode>();
+  ICHECK(min && min->value >= 0)
+      << "Sunmmio Batch GEMM requires " << operand
+      << " batch min to be a non-negative static IntImm, got " << batch->min;
+  ICHECK(
+      !region->buffer->shape.empty() &&
+      analyzer.CanProve(batch->min + batch->extent <= region->buffer->shape[0]))
+      << "Sunmmio Batch GEMM requires " << operand
+      << " batch region to stay within buffer axis 0, got min " << batch->min
+      << ", extent " << batch->extent << " for buffer shape "
+      << region->buffer->shape;
+}
+
+void ValidateBatchGemmTarget(const Target &target, const BufferRegion &a,
+                             const BufferRegion &b, const BufferRegion &c) {
+  if (TargetIsSunmmio(target)) {
+    ValidateSunmmioBatchRegion(a, "A");
+    ValidateSunmmioBatchRegion(b, "B");
+    ValidateSunmmioBatchRegion(c, "C");
+    return;
+  }
+  ICHECK(!HasBatchedGemmSemantics(a, /*is_output=*/false) &&
+         !HasBatchedGemmSemantics(b, /*is_output=*/false) &&
+         !HasBatchedGemmSemantics(c, /*is_output=*/true))
+      << "T.gemm batch semantics are currently supported only on the "
+         "Sunmmio target";
+}
+
+} // namespace
+
 /**
  * @brief Construct a Gemm operator from serialized TL arguments and a buffer
  * map.
@@ -474,6 +524,7 @@ static void CheckSunmmioMXOperandBlockAligned(const Buffer &buffer, int axis,
  * @return Stmt A TIR statement representing the evaluated TL GEMM call.
  */
 Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
+  ValidateBatchGemmTarget(T.target, aRegion_, bRegion_, cRegion_);
   auto block_size = *as_const_int(T.thread_bounds->extent);
   GemmInst gemm_inst = getGemmInst(block_size, T.target);
 
@@ -662,6 +713,7 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
  */
 LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
                                 InferLevel level) const {
+  ValidateBatchGemmTarget(T.target, aRegion_, bRegion_, cRegion_);
   if (completed_)
     return {};
   LayoutMap results;

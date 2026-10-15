@@ -81,6 +81,7 @@
 
 #include "../op/comm.h"
 #include "../op/copy.h"
+#include "../op/fill.h"
 #include "../op/gemm.h"
 #include "../op/gemm_py.h"
 #include "../op/utils.h"
@@ -94,8 +95,6 @@ using namespace tir;
 using namespace tir::transform;
 
 namespace {
-
-// ─── Helpers shared across phases ──────────────────────────────────────────
 
 // Returns the destination Buffer for a Copy or AllgatherOp call, or
 // std::nullopt otherwise. Both ops carry the destination region as args[1].
@@ -218,6 +217,60 @@ Call CloneGemmCallWithAccOffset(const CallNode *call, int acc_offset_byte) {
   }
   return Call(call->dtype, Downcast<Op>(call->op), new_args, call->annotations);
 }
+
+bool IsHardwareBatchedRegion(const PrimExpr &region_expr) {
+  BufferRegion region = NormalizeToBufferRegion(region_expr);
+  if (region->region.size() != 3)
+    return false;
+  const auto *batch = region->region[0]->extent.as<IntImmNode>();
+  ICHECK(batch) << "Sunmmio batch GEMM requires a static batch extent, got "
+                << region->region[0]->extent;
+  return batch->value > 1;
+}
+
+bool IsBatchReductionGemm(const CallNode *call) {
+  if (!call ||
+      (!call->op.same_as(Gemm::Get()) && !call->op.same_as(GemmPy::Get())))
+    return false;
+  ICHECK_GE(call->args.size(), 10U)
+      << "Sunmmio GEMM call is missing clear_accum";
+  BufferRegion c_region = NormalizeToBufferRegion(call->args[2]);
+  return c_region->region.size() == 2 &&
+         (IsHardwareBatchedRegion(call->args[0]) ||
+          IsHardwareBatchedRegion(call->args[1]));
+}
+
+Call CloneGemmCallWithClearAccum(const CallNode *call, PrimExpr clear_accum) {
+  Array<PrimExpr> args = call->args;
+  args.Set(9, std::move(clear_accum));
+  return Call(call->dtype, Downcast<Op>(call->op), args, call->annotations);
+}
+
+class BatchReductionAccumulatorRewriter : public StmtExprMutator {
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    if (!IsBatchReductionGemm(call))
+      return StmtExprMutator::VisitStmt_(op);
+
+    PrimExpr clear_accum = call->args[9];
+    Call accumulating_gemm = CloneGemmCallWithClearAccum(call, const_false());
+    if (is_zero(clear_accum))
+      return Evaluate(accumulating_gemm);
+
+    BufferRegion c_region = NormalizeToBufferRegion(call->args[2]);
+    PrimExpr zero = make_zero(c_region->buffer->dtype);
+    Stmt clear = Evaluate(
+        Call(DataType::Handle(), Fill::Get(), {call->args[2], zero}, {}));
+    if (is_one(clear_accum))
+      return SeqStmt({clear, Evaluate(accumulating_gemm)});
+
+    ICHECK(clear_accum.dtype().is_bool())
+        << "Sunmmio GEMM clear_accum must have bool dtype, got "
+        << clear_accum.dtype();
+    return SeqStmt(
+        {IfThenElse(clear_accum, clear), Evaluate(accumulating_gemm)});
+  }
+};
 
 // ─── Phase 1: structured reaching-defs analysis ────────────────────────────
 
@@ -1062,6 +1115,12 @@ PrimFunc Run(PrimFunc f) {
   SunmmioTileProcessorConfig cfg =
       GetSunmmioTileProcessorConfig(target.value());
 
+  // NPU-IR accumulates an unbatched store across batched A/W and requires
+  // constant-true acc. Normalize clear semantics before bf16 stripe expansion
+  // so the logical accumulator is initialized at most once.
+  PrimFuncNode *fp = f.CopyOnWrite();
+  fp->body = BatchReductionAccumulatorRewriter()(f->body);
+
   // Phase 1: structured reaching-defs analysis.
   std::vector<GemmReachingDef> gemms =
       Bf16AsramOperandFlow::Analyze(f->body, cfg);
@@ -1086,7 +1145,6 @@ PrimFunc Run(PrimFunc f) {
 
   // Phase 4: drive the rewrite from the plan.
   LegalizeSunmmioGemmRewriter rewriter(target.value(), cfg, plan);
-  PrimFuncNode *fp = f.CopyOnWrite();
   fp->body = rewriter(f->body);
   return f;
 }

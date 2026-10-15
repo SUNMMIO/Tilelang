@@ -439,6 +439,19 @@ def test_alignment_mismatch_falls_back_to_existing_layout_transform_path(directi
     assert src.count("T.sunmmio_layout_transform") == 1
 
 
+@pytest.mark.parametrize("direction", ["load", "store"])
+def test_aligned_row_effective_rank3_uses_direct_dma(direction, tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        aligned_row_effective_rank3_kernel(direction=direction),
+        tmp_path,
+        mlir_filename=f"aligned_row_rank3_{direction}.mlir",
+        expected_tokens=("suvm.copy_async", "!suvm.tile_view<2x3x512xbf16>"),
+        opt_args=("--verify-each", "--suvm-to-llvm-pipeline"),
+    )
+    assert src.count("suvm.copy_async") == 1
+    assert "suvm.transform_layout_async" not in src
+
+
 @pytest.mark.parametrize(
     "factory,reason",
     [
@@ -459,18 +472,13 @@ def test_alignment_mismatch_falls_back_to_existing_layout_transform_path(directi
         ),
         pytest.param(
             aligned_row_middle_singleton_kernel,
-            "effective rank exceeds two",
+            "canonical logical shapes do not match",
             id="middle-singleton",
         ),
         pytest.param(
             aligned_row_partial_row_kernel,
             "partial-row byte size is not a multiple of 1024",
             id="partial-row",
-        ),
-        pytest.param(
-            aligned_row_effective_rank3_kernel,
-            "effective rank exceeds two",
-            id="effective-rank3",
         ),
     ],
 )
