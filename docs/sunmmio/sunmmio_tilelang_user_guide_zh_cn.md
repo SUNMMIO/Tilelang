@@ -856,11 +856,11 @@ T.comm.all_reduce(buffer, out, reduce_type, direction, dim=-1, clear=True)
 - `out`：保存 reduce 结果的输出 buffer 或 region。
 - `reduce_type`：reduce 类型，支持 `"sum"`、`"abssum"`、`"max"`、`"min"`、`"absmax"`、`"bitand"`、`"bitor"`、`"bitxor"`。
 - `direction`：参与 reduce 的方向，支持 `"horizontal"` / `"h"`、`"vertical"` / `"v"`、`"all"` / `"a"`。
-- `dim`：在本地 buffer 内 reduce 的维度，默认 `-1` 表示最后一维。
+- `dim`：保留用于 API 兼容和边界校验。跨 core `all_reduce` 不会沿本地 buffer 维度做 reduce。
 - `clear`：是否在 reduce 前清空 `out`，默认 `True`。
 - 返回值：表达 all-reduce 的语句。
 
-`out` shape 需要等于删除 `dim` 后的 shape，或在 `dim` 上保留长度 1。
+`out` shape 需要与输入 buffer 或 region 的 shape 一致。`all_reduce` 只做跨 core reduce，并保留完整本地 region。
 
 ### 3.7 GEMM
 
