@@ -297,9 +297,9 @@ def test_comm_dynamic_pair_put_codegen_has_no_sender_guard(tmp_path):
         comm_dynamic_pair_put_kernel(),
         tmp_path,
         mlir_filename="comm_dynamic_pair_put_suvm.mlir",
-        expected_tokens=("suvm.mcast_tok", "suvm.sync", "suvm.barrier.arrive_and_wait"),
+        expected_tokens=("suvm.mcast_async", "suvm.sync", "suvm.barrier.arrive_and_wait"),
     )
-    assert src.count("suvm.mcast_tok") == 1
+    assert src.count("suvm.mcast_async") == 1
     assert src.count("suvm.get_core_id") == 1
 
 
@@ -308,9 +308,9 @@ def test_comm_dynamic_column_pair_put_codegen_has_no_sender_guard(tmp_path):
         comm_dynamic_column_pair_put_kernel(),
         tmp_path,
         mlir_filename="comm_dynamic_column_pair_put_suvm.mlir",
-        expected_tokens=("suvm.mcast_tok", "suvm.sync", "suvm.barrier.arrive_and_wait"),
+        expected_tokens=("suvm.mcast_async", "suvm.sync", "suvm.barrier.arrive_and_wait"),
     )
-    mcast_lines = find_async_op_lines(src, "suvm.mcast_tok")
+    mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
     assert len(mcast_lines) == 1
     assert "col" in mcast_lines[0]
     assert src.count("suvm.get_core_id") == 1

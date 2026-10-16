@@ -309,11 +309,11 @@ def test_broadcast_with_current_core_skips_sender_guard(tmp_path):
         tmp_path,
         params=[src_data, dst_data],
         mlir_filename="broadcast_current_core_suvm.mlir",
-        expected_fragments=("suvm.get_core_id", "suvm.mcast_tok", "suvm.sync"),
+        expected_fragments=("suvm.get_core_id", "suvm.mcast_async", "suvm.sync"),
         opt_args=MCAST_VERIFY_ARGS,
     )
     assert src.count("suvm.get_core_id") == 1
-    assert src.count("suvm.mcast_tok") == 1
+    assert src.count("suvm.mcast_async") == 1
 
 
 def test_explicit_unit_sync_consumes_pending_codegen_state():
