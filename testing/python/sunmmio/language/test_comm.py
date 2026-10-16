@@ -511,7 +511,7 @@ def test_comm_dynamic_put_cannot_skip_route_validation():
             tilelang.transform.LowerTileOp()(mod)
 
 
-def test_comm_dynamic_row_ring_put_is_rejected():
+def test_comm_dynamic_row_ring_put_lowers_with_cycle_barrier():
     @T.prim_func
     def main():
         with T.Kernel(16, threads=128) as cid:
@@ -523,8 +523,113 @@ def test_comm_dynamic_row_ring_put_is_rejected():
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(tvm.IRModule({"main": main}))
-        with pytest.raises(Exception, match="barrier participants differ"):
+        mod = tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
+        put_calls = _collect_calls(mod["main"], "tl.tileop.comm_put")
+        assert len(put_calls) == 1
+        assert "tl.comm_barrier_mask" in put_calls[0].annotations
+        mod = tilelang.transform.LowerTileOp()(mod)
+
+    broadcast_calls = _collect_calls(mod["main"], "tl.broadcast_")
+    assert len(broadcast_calls) == 1
+    assert int(broadcast_calls[0].args[2].value) == 0
+    assert "tl.comm_barrier_mask" in broadcast_calls[0].annotations
+
+
+def test_comm_dynamic_column_ring_put_lowers_with_cycle_barrier():
+    @T.prim_func
+    def main():
+        with T.Kernel(16, threads=128) as cid:
+            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            row = cid // 4
+            col = cid % 4
+            peer = (row + 1) % 4 * 4 + col
+            T.comm.put(src, dst, cid, peer)
+
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        mod = tvm.tir.transform.BindTarget(target)(tvm.IRModule({"main": main}))
+        mod = tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
+        mod = tilelang.transform.LowerTileOp()(mod)
+
+    broadcast_calls = _collect_calls(mod["main"], "tl.broadcast_")
+    assert len(broadcast_calls) == 1
+    assert int(broadcast_calls[0].args[2].value) == 1
+    assert "tl.comm_barrier_mask" in broadcast_calls[0].annotations
+
+
+def test_comm_dynamic_put_rejects_non_bijective_routes():
+    @T.prim_func
+    def main():
+        with T.Kernel(16, threads=128) as cid:
+            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            row = cid // 4
+            col = cid % 4
+            peer = row * 4 + 1 - col % 2
+            T.comm.put(src, dst, cid, peer)
+
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        mod = tvm.tir.transform.BindTarget(target)(tvm.IRModule({"main": main}))
+        with pytest.raises(Exception, match="multiple senders for dst_core"):
             tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
+
+
+def test_comm_dynamic_put_rejects_nonuniform_group_predicate():
+    @T.prim_func
+    def main():
+        with T.Kernel(16, threads=128) as cid:
+            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            with T.block("conditional_put"):
+                T.where(cid % 2 == 0)
+                T.comm.put(src, dst, cid, (cid // 2) * 2 + 1 - cid % 2)
+
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        mod = tvm.tir.transform.BindTarget(target)(tvm.IRModule({"main": main}))
+        with pytest.raises(Exception, match="execution predicate differs within the synchronization group"):
+            tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
+
+
+def test_comm_dynamic_put_accepts_group_uniform_predicate():
+    @T.prim_func
+    def main():
+        with T.Kernel(16, threads=128) as cid:
+            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            with T.block("conditional_put"):
+                T.where(cid // 2 % 2 == 0)
+                T.comm.put(src, dst, cid, (cid // 2) * 2 + 1 - cid % 2)
+
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        mod = tvm.tir.transform.BindTarget(target)(tvm.IRModule({"main": main}))
+        mod = tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
+
+    put_calls = _collect_calls(mod["main"], "tl.tileop.comm_put")
+    assert len(put_calls) == 1
+    assert "tl.comm_barrier_mask" in put_calls[0].annotations
+
+
+def test_comm_dynamic_put_accepts_group_uniform_if():
+    @T.prim_func
+    def main():
+        with T.Kernel(16, threads=128) as cid:
+            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            if cid // 2 % 2 == 0:
+                T.comm.put(src, dst, cid, (cid // 2) * 2 + 1 - cid % 2)
+
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        mod = tvm.tir.transform.BindTarget(target)(tvm.IRModule({"main": main}))
+        mod = tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
+
+    put_calls = _collect_calls(mod["main"], "tl.tileop.comm_put")
+    assert len(put_calls) == 1
+    assert "tl.comm_barrier_mask" in put_calls[0].annotations
 
 
 def test_comm_dynamic_runtime_peer_is_rejected():

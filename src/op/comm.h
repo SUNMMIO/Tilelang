@@ -16,6 +16,7 @@ TVM_DLL const Op &broadcast_();
 
 // Internal proof attached by ValidateDynamicCommPutRoutes before LowerTileOp.
 constexpr const char *kCommPutDirectionAttr = "tl.comm_put_direction";
+constexpr const char *kCommBarrierMaskAttr = "tl.comm_barrier_mask";
 
 // Positional argument layout of the broadcast_() leaf intrinsic. Producers
 // (comm.cc, via AppendBroadcastArgs) and consumers (the broadcast-barrier
@@ -79,6 +80,7 @@ public:
   Array<Range> src_range, dst_range;
   PrimExpr src_expr, dst_expr;
   PrimExpr src_core, dst_core;
+  PrimExpr validated_barrier_mask;
   IntImm size;
   int validated_direction = -1;
 
@@ -93,6 +95,7 @@ public:
         .def_ro("dst_range", &PutOpNode::dst_range)
         .def_ro("src_core", &PutOpNode::src_core)
         .def_ro("dst_core", &PutOpNode::dst_core)
+        .def_ro("validated_barrier_mask", &PutOpNode::validated_barrier_mask)
         .def_ro("size", &PutOpNode::size)
         .def_ro("validated_direction", &PutOpNode::validated_direction);
   }

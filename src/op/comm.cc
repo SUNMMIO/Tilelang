@@ -343,6 +343,9 @@ PutOp::PutOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
     node->validated_direction = Downcast<IntImm>(direction.value())->value;
     ICHECK(node->validated_direction == 0 || node->validated_direction == 1);
   }
+  if (auto barrier_mask = annotations.Get(kCommBarrierMaskAttr)) {
+    node->validated_barrier_mask = Downcast<PrimExpr>(barrier_mask.value());
+  }
   data_ = std::move(node);
 }
 
@@ -424,7 +427,12 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     AppendBroadcastArgs(&args, src_region, dst_region, direction,
                         analyzer->Simplify(mask), I32Imm(0),
                         analyzer->Simplify(bcast_src_core));
-    return Evaluate(Call(DataType::Handle(), broadcast_(), args));
+    Map<String, ObjectRef> annotations;
+    if (validated_barrier_mask.defined()) {
+      annotations.Set(kCommBarrierMaskAttr,
+                      analyzer->Simplify(validated_barrier_mask));
+    }
+    return Evaluate(Call(DataType::Handle(), broadcast_(), args, annotations));
   };
 
   if (validated_direction >= 0) {

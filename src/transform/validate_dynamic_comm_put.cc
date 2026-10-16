@@ -54,6 +54,26 @@ private:
     int direction;
   };
 
+  Stmt VisitStmt_(const BlockRealizeNode *op) final {
+    Array<PrimExpr> iter_values;
+    iter_values.reserve(op->iter_values.size());
+    for (const PrimExpr &value : op->iter_values) {
+      iter_values.push_back(VisitExpr(value));
+    }
+    PrimExpr predicate = VisitExpr(op->predicate);
+    PrimExpr previous_predicate = execution_predicate_;
+    execution_predicate_ =
+        analyzer_.Simplify(And(previous_predicate, predicate));
+    Block block = Downcast<Block>(VisitStmt(op->block));
+    execution_predicate_ = previous_predicate;
+
+    if (iter_values.same_as(op->iter_values) &&
+        predicate.same_as(op->predicate) && block.same_as(op->block)) {
+      return tvm::ffi::GetRef<Stmt>(op);
+    }
+    return BlockRealize(iter_values, predicate, block, op->span);
+  }
+
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key != tir::attr::thread_extent) {
       return StmtExprMutator::VisitStmt_(op);
@@ -74,10 +94,28 @@ private:
   }
 
   Stmt VisitStmt_(const IfThenElseNode *op) final {
-    ++control_depth_;
-    Stmt result = StmtExprMutator::VisitStmt_(op);
-    --control_depth_;
-    return result;
+    PrimExpr condition = VisitExpr(op->condition);
+    PrimExpr previous_predicate = execution_predicate_;
+
+    execution_predicate_ =
+        analyzer_.Simplify(And(previous_predicate, condition));
+    Stmt then_case = VisitStmt(op->then_case);
+
+    Optional<Stmt> else_case;
+    if (op->else_case.defined()) {
+      execution_predicate_ =
+          analyzer_.Simplify(And(previous_predicate, Not(condition)));
+      else_case = VisitStmt(op->else_case.value());
+    }
+    execution_predicate_ = previous_predicate;
+
+    if (condition.same_as(op->condition) && then_case.same_as(op->then_case) &&
+        ((!else_case.defined() && !op->else_case.defined()) ||
+         (else_case.defined() && op->else_case.defined() &&
+          else_case.value().same_as(op->else_case.value())))) {
+      return tvm::ffi::GetRef<Stmt>(op);
+    }
+    return IfThenElse(condition, then_case, else_case, op->span);
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
@@ -159,38 +197,82 @@ private:
       routes.push_back({src, dst, route_direction});
     }
 
+    std::vector<bool> active;
+    active.reserve(core_extent_);
+    for (int64_t cid = 0; cid < core_extent_; ++cid) {
+      active.push_back(
+          Resolve(execution_predicate_, cid, "execution predicate") != 0);
+    }
+
+    // A no-guard put schedule is a one-hop permutation. Its disjoint cycles
+    // are the minimal groups whose members must execute the same barriers.
     std::vector<int64_t> sender_for_target(core_extent_, -1);
     for (int64_t cid = 0; cid < core_extent_; ++cid) {
       const Route &route = routes[cid];
-      if (route.src != cid && route.dst != cid) {
+      ICHECK_EQ(route.src, cid)
+          << "Dynamic T.comm.put without a sender guard requires src_core "
+             "to equal cid; got src_core="
+          << route.src << " at cid=" << cid;
+      ICHECK_EQ(sender_for_target[route.dst], -1)
+          << "Dynamic T.comm.put has multiple senders for dst_core="
+          << route.dst;
+      sender_for_target[route.dst] = cid;
+    }
+    for (int64_t target = 0; target < core_extent_; ++target) {
+      ICHECK_NE(sender_for_target[target], -1)
+          << "Dynamic T.comm.put has no sender for dst_core=" << target;
+    }
+
+    std::vector<bool> cycle_visited(core_extent_, false);
+    std::vector<int64_t> barrier_masks(core_extent_, 0);
+    for (int64_t start = 0; start < core_extent_; ++start) {
+      if (cycle_visited[start]) {
         continue;
       }
-      const Route &source_route = routes[route.src];
-      const Route &target_route = routes[route.dst];
-      auto same_group = [&](const Route &other) {
-        return std::min(other.src, other.dst) ==
-                   std::min(route.src, route.dst) &&
-               std::max(other.src, other.dst) == std::max(route.src, route.dst);
-      };
-      ICHECK(same_group(source_route) && same_group(target_route))
-          << "Dynamic T.comm.put barrier participants differ at cid=" << cid
-          << " for cores " << route.src << " and " << route.dst;
-      if (route.dst == cid) {
-        ICHECK(source_route.src == route.src && source_route.dst == cid)
-            << "Dynamic T.comm.put has no matching sender for cid=" << cid;
+      std::vector<int64_t> cycle;
+      int64_t cid = start;
+      while (!cycle_visited[cid]) {
+        cycle_visited[cid] = true;
+        cycle.push_back(cid);
+        cid = routes[cid].dst;
       }
-      if (route.src == cid) {
-        ICHECK_EQ(sender_for_target[route.dst], -1)
-            << "Dynamic T.comm.put has multiple senders for dst_core="
-            << route.dst;
-        sender_for_target[route.dst] = cid;
+      ICHECK_EQ(cid, start)
+          << "Dynamic T.comm.put destination mapping must decompose into "
+             "disjoint cycles";
+
+      int64_t mask = 0;
+      bool cycle_active = active[cycle.front()];
+      for (int64_t member : cycle) {
+        ICHECK_EQ(active[member], cycle_active)
+            << "Dynamic T.comm.put execution predicate differs within the "
+               "synchronization group containing cid="
+            << start;
+        mask = static_cast<int64_t>(static_cast<uint64_t>(mask) |
+                                    (uint64_t{1} << member));
+      }
+      for (int64_t member : cycle) {
+        barrier_masks[member] = mask;
       }
     }
 
     Map<String, ObjectRef> annotations = call->annotations;
     annotations.Set(kCommPutDirectionAttr,
                     IntImm(DataType::Int(32), direction));
+    annotations.Set(kCommBarrierMaskAttr, MakePerCoreValue(barrier_masks));
     return Call(call->dtype, call->op, call->args, annotations, call->span);
+  }
+
+  PrimExpr MakePerCoreValue(const std::vector<int64_t> &values) {
+    ICHECK(!values.empty());
+    // Keep the proof symbolic in cid; barrier lowering enumerates its finite
+    // candidate masks and allocates one reusable barrier for each cycle.
+    PrimExpr result = IntImm(DataType::Int(64), values.back());
+    for (int64_t cid = static_cast<int64_t>(values.size()) - 2; cid >= 0;
+         --cid) {
+      result = Select(current_core_ == IntImm(current_core_.dtype(), cid),
+                      IntImm(DataType::Int(64), values[cid]), result);
+    }
+    return analyzer_.Simplify(result);
   }
 
   int64_t Resolve(const PrimExpr &expr, int64_t cid, const char *name) {
@@ -215,6 +297,7 @@ private:
   int64_t mesh_nrows_ = 0;
   int64_t mesh_ncols_ = 0;
   int control_depth_ = 0;
+  PrimExpr execution_predicate_ = Bool(true);
   std::unordered_map<const VarNode *, PrimExpr> let_bindings_;
 };
 
