@@ -340,7 +340,6 @@ jobs:
             "${CLANG_TIDY_CMAKE_OPTIONS_ARRAY[@]}" \
             "${TILELANG_SUNMMIO_CMAKE_ARGS_ARRAY[@]}"
           if [[ "${TILELANG_SUNMMIO_CMAKE_ARGS}" == *"-DUSE_SUNMMIO=ON"* ]]; then
-            cmake --build "${CLANG_TIDY_BUILD_DIR}" --target tilelang_highs -j "$(nproc)"
             cmake --build "${CLANG_TIDY_BUILD_DIR}" --target mlir-headers llvm-headers -j "$(nproc)"
           fi
           flock -u 9
