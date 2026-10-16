@@ -629,6 +629,18 @@ public:
   }
 
 private:
+  PrimExpr CastSignalDelta(DataType dtype, PrimExpr delta) {
+    if (dtype == DataType::UInt(8) && delta.dtype().bits() > 8) {
+      // TVM's constant cast rejects uint8(256). Normalize before narrowing,
+      // including when a dynamic delta later becomes constant during lowering.
+      if (const auto *value = delta.as<IntImmNode>()) {
+        return make_const(dtype, value->value & 255);
+      }
+      delta = bitwise_and(delta, make_const(delta.dtype(), 255));
+    }
+    return Cast(dtype, delta);
+  }
+
   Stmt VisitStmt_(const EvaluateNode *evaluate_node) final {
     const auto *call = evaluate_node->value.as<CallNode>();
     if (!call) {
@@ -680,7 +692,9 @@ private:
     if (call->op.same_as(dist_expect_())) {
       ICHECK_EQ(call->args.size(), 2U);
       BufferLoad expected = RequireLocalState(call->args[0], "expected");
-      PrimExpr delta = Cast(expected->dtype, call->args[1]);
+      // Convert to the signal width before arithmetic: uint8 wraps modulo 256,
+      // while uint64 memory expectations retain accumulated high bits.
+      PrimExpr delta = CastSignalDelta(expected->dtype, call->args[1]);
       PrimExpr next = Cast(expected->dtype, expected + delta);
       return BufferStore(expected->buffer, next, expected->indices);
     }
@@ -751,6 +765,8 @@ private:
     for (int64_t index = 0; index < endpoint_count; ++index) {
       PrimExpr delta = call->args[5 + index];
       ICHECK(delta.dtype().is_int() || delta.dtype().is_uint());
+      // A positive delta may wrap to zero at the signal width (e.g. 256).
+      // Pending membership uses the original delta, not the narrowed value.
       PrimExpr active = delta > make_zero(delta.dtype());
       PrimExpr signal_index =
           signal_expect->region[0]->min + IntImm(DataType::Int(32), index);
@@ -759,10 +775,11 @@ private:
       PrimExpr pending_index =
           pending->region[0]->min + IntImm(DataType::Int(32), index);
       PrimExpr current = BufferLoad(signal_expect->buffer, {signal_index});
+      PrimExpr typed_delta =
+          CastSignalDelta(signal_expect->buffer->dtype, delta);
       PrimExpr next =
           Cast(signal_expect->buffer->dtype,
-               current + Select(advance_expected,
-                                Cast(signal_expect->buffer->dtype, delta),
+               current + Select(advance_expected, typed_delta,
                                 make_zero(signal_expect->buffer->dtype)));
       statements.push_back(
           BufferStore(completion_expect->buffer, next, {completion_index}));
@@ -783,8 +800,10 @@ private:
     ICHECK(load) << "T.dist " << name << " state must be a BufferLoad, got "
                  << expr;
     ICHECK((load->dtype.is_int() || load->dtype.is_uint()) &&
-           (load->dtype.bits() == 8 || load->dtype.bits() == 32))
-        << "T.dist " << name << " state must use an 8- or 32-bit integer dtype";
+           (load->dtype.bits() == 8 || load->dtype.bits() == 32 ||
+            load->dtype.bits() == 64))
+        << "T.dist " << name
+        << " state must use an 8-, 32-, or 64-bit integer dtype";
     return tvm::ffi::GetRef<BufferLoad>(load);
   }
 

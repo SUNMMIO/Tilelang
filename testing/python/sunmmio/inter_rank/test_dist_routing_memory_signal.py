@@ -91,7 +91,7 @@ def test_memory_cross_row_preserves_generation_and_receiver_kind(dram, kind, rou
         assert int(put.args[4]) == (1 if route in ("member", "active") else 0)
         generation = put.args[5]
         assert isinstance(generation, tvm.tir.BufferLoad)
-        assert str(generation.dtype) == "uint32"
+        assert str(generation.dtype) == "uint64"
         advances = collect_nodes(
             injected,
             tvm.tir.BufferStore,
@@ -107,7 +107,7 @@ def test_memory_cross_row_preserves_generation_and_receiver_kind(dram, kind, rou
         assert "dist_route_stage" in str(put.args[0])
     waits = collect_calls(result.device_mod, "tl.dist_wait_signal_")
     assert len(waits) == 1 and waits[0].args[0].value == kind.value
-    assert str(waits[0].args[2].dtype) == "uint32"
+    assert str(waits[0].args[2].dtype) == "uint64"
     assert not collect_calls(result.device_mod, "tl.tileop.dist_routed_peer_put")
     if route == "active":
         assert "dist_route_active" in injected.script()

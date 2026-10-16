@@ -65,6 +65,9 @@ DistSignalKindInfos() {
   static const std::array<DistSignalKindInfo,
                           static_cast<size_t>(DistSignalKind::kCount)>
       infos{{
+          // SUVM signal values: increment/assign are 8-bit, memory is 64-bit.
+          // Expected values and generation snapshots use the same unsigned
+          // type.
           {DistSignalKind::kSramFlagregInc, "sram_flagreg_inc",
            DistSignalScope::kSram, DistSignalUpdateMode::kIncrement,
            kIncrementFlagregCount, DataType::UInt(8), true},
@@ -73,14 +76,14 @@ DistSignalKindInfos() {
            kIncrementFlagregCount, DataType::UInt(8), true},
           {DistSignalKind::kSramFlagregValue, "sram_flagreg_value",
            DistSignalScope::kSram, DistSignalUpdateMode::kValue,
-           kValueFlagregCount, DataType::UInt(32), false},
+           kValueFlagregCount, DataType::UInt(8), false},
           {DistSignalKind::kDramFlagregValue, "dram_flagreg_value",
            DistSignalScope::kDram, DistSignalUpdateMode::kValue,
-           kValueFlagregCount, DataType::UInt(32), false},
+           kValueFlagregCount, DataType::UInt(8), false},
           {DistSignalKind::kSramMemory, "sram_memory", DistSignalScope::kSram,
-           DistSignalUpdateMode::kMemory, -1, DataType::UInt(32), false},
+           DistSignalUpdateMode::kMemory, -1, DataType::UInt(64), false},
           {DistSignalKind::kDramMemory, "dram_memory", DistSignalScope::kDram,
-           DistSignalUpdateMode::kMemory, -1, DataType::UInt(32), false},
+           DistSignalUpdateMode::kMemory, -1, DataType::UInt(64), false},
       }};
   return infos;
 }

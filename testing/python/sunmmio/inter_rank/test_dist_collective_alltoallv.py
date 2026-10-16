@@ -435,7 +435,7 @@ def test_alltoallv_auto_group_falls_back_to_memory():
     mod = tilelang.transform.LowerDistRouting()(mod)
     mod = tilelang.transform.LowerDistCommunication()(mod)
     assert collect_op_names(mod).count("tl.dist_put_") == 32
-    assert "uint32" in mod.script()
+    assert "uint64" in mod.script()
 
 
 def test_alltoallv_single_signal_uses_inc_and_reaches_regular_wait_leaf():
