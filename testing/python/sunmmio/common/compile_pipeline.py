@@ -309,6 +309,8 @@ def LowerAndLegalize_sunmmio_test(
         pass_output_process(mod, "ValidateTileViewRegions", test_config)
 
     LayoutVisual(mod)
+    mod = tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
+    pass_output_process(mod, "ValidateDynamicCommPutRoutes", test_config)
     mod = tilelang.transform.LowerTileOp()(mod)
     pass_output_process(mod, "LowerTileOp", test_config)
 
