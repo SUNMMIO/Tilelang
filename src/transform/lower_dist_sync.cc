@@ -1,5 +1,5 @@
 /*!
- * \file tl/transform/inject_dist_sync.cc
+ * \file tl/transform/lower_dist_sync.cc
  * \brief Materialize Rank submit synchronization and signal-state updates.
  */
 
@@ -8,6 +8,7 @@
 #include <tvm/tir/transform.h>
 
 #include <unordered_set>
+#include <vector>
 
 #include "../op/utils.h"
 #include "dist_transform_utils.h"
@@ -49,6 +50,11 @@ private:
     bool strict_batch_open;
     bool channel_in_flight;
     bool falls_through;
+  };
+
+  struct LoopExits {
+    State breaks{false, false, false, false};
+    State continues{false, false, false, false};
   };
 
   State GetState() const {
@@ -135,41 +141,36 @@ private:
     SetState(Join(then_state, else_state));
   }
 
-  void VisitStmt_(const ForNode *op) final {
-    VisitExpr(op->min);
-    VisitExpr(op->extent);
+  void VisitLoop(const Stmt &body) {
     State incoming = GetState();
-    ++loop_depth_;
     State entry = incoming;
+    loop_exits_.emplace_back();
     while (true) {
-      State body_state = VisitBranch(op->body, entry);
-      State next = Join(incoming, body_state);
+      loop_exits_.back() = LoopExits{};
+      State body_state = VisitBranch(body, entry);
+      // Continue reaches the next iteration; break only reaches the loop exit.
+      State backedge = Join(body_state, loop_exits_.back().continues);
+      State next = Join(incoming, backedge);
       if (next.queue_pending == entry.queue_pending &&
           next.channel_in_flight == entry.channel_in_flight) {
+        // Include zero iterations and exhaustion after a normal/continue path.
+        SetState(Join(next, loop_exits_.back().breaks));
         break;
       }
       entry = next;
     }
-    --loop_depth_;
-    SetState(entry);
+    loop_exits_.pop_back();
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    VisitExpr(op->min);
+    VisitExpr(op->extent);
+    VisitLoop(op->body);
   }
 
   void VisitStmt_(const WhileNode *op) final {
     VisitExpr(op->condition);
-    State incoming = GetState();
-    ++loop_depth_;
-    State entry = incoming;
-    while (true) {
-      State body_state = VisitBranch(op->body, entry);
-      State next = Join(incoming, body_state);
-      if (next.queue_pending == entry.queue_pending &&
-          next.channel_in_flight == entry.channel_in_flight) {
-        break;
-      }
-      entry = next;
-    }
-    --loop_depth_;
-    SetState(entry);
+    VisitLoop(op->body);
   }
 
   void VisitStmt_(const EvaluateNode *op) final {
@@ -190,6 +191,20 @@ private:
       falls_through_ = false;
       return;
     }
+    if (call->op.same_as(builtin::break_loop()) ||
+        call->op.same_as(builtin::continue_loop())) {
+      bool is_break = call->op.same_as(builtin::break_loop());
+      ICHECK(!loop_exits_.empty())
+          << "T.dist queue analysis: loop jump outside a loop";
+      ICHECK(!strict_batch_open_)
+          << "T.dist submit=True batch is missing its submit boundary before "
+          << (is_break ? "break" : "continue");
+      State &exit =
+          is_break ? loop_exits_.back().breaks : loop_exits_.back().continues;
+      exit = Join(exit, GetState());
+      falls_through_ = false;
+      return;
+    }
     if (call->op.same_as(dist_batch_begin_())) {
       ICHECK(!queue_pending_)
           << "T.dist operation with submit=True requires an empty send queue; "
@@ -204,7 +219,7 @@ private:
     }
     if (call->op.same_as(dist_submit_())) {
       bool nonempty = queue_pending_;
-      if (!nonempty && loop_depth_ == 0) {
+      if (!nonempty && loop_exits_.empty()) {
         empty_submits_.insert(op);
       }
       queue_pending_ = false;
@@ -223,15 +238,15 @@ private:
   bool strict_batch_open_{false};
   bool channel_in_flight_{false};
   bool falls_through_{true};
-  int loop_depth_{0};
+  std::vector<LoopExits> loop_exits_;
   int core_depth_{0};
   std::unordered_set<const EvaluateNode *> returns_needing_wait_;
   std::unordered_set<const AttrStmtNode *> core_exits_needing_wait_;
   std::unordered_set<const EvaluateNode *> empty_submits_;
 };
 
-// Temporary TIR cleanup. The final sender drain belongs in codegen's common
-// device epilogue; this analysis does not cover every break/continue exit path.
+// Temporary TIR cleanup. Loop jumps propagate state to their destinations;
+// sender drains are inserted only at returns and normal core exits.
 class InjectDistExitWait : public StmtExprMutator {
 public:
   static PrimFunc Run(PrimFunc func, const DistQueueValidator::Result &queue) {
@@ -335,7 +350,7 @@ private:
     if (call->op.same_as(dist_put_())) {
       ICHECK_EQ(call->args.size(), 6U)
           << "tl.dist_put_ must have its stable peer signature before "
-             "InjectDistSync";
+             "LowerDistSync";
       const DistSignalKindInfo &kind =
           RequireDistSignalKindInfo(call->args[3], "signal kind");
       if (kind.update_mode == DistSignalUpdateMode::kIncrement) {
@@ -497,17 +512,17 @@ PrimFunc Run(PrimFunc func) {
 
 } // namespace
 
-tvm::transform::Pass InjectDistSync() {
+tvm::transform::Pass LowerDistSync() {
   auto pass_func = [](PrimFunc func, const IRModule &,
                       const tvm::transform::PassContext &) {
     return Run(std::move(func));
   };
-  return CreatePrimFuncPass(pass_func, 0, "tl.InjectDistSync", {});
+  return CreatePrimFuncPass(pass_func, 0, "tl.LowerDistSync", {});
 }
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.InjectDistSync", InjectDistSync);
+  refl::GlobalDef().def("tl.transform.LowerDistSync", LowerDistSync);
 }
 
 } // namespace tl

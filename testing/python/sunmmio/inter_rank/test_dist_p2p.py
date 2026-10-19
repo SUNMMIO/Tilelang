@@ -139,7 +139,7 @@ def test_p2p_reaches_device_leaf_ops():
             "tl.LowerDistRouting",
             "tl.LowerDistCommunication",
             "tl.LowerTileOp",
-            "tl.InjectDistSync",
+            "tl.LowerDistSync",
         ),
     )
 
@@ -181,18 +181,18 @@ def test_p2p_reaches_device_leaf_ops():
     assert collect_op_arg_counts(result.pass_snapshot("tl.LowerTileOp").mod, "tl.dist_put_") == [6]
     assert collect_op_arg_counts(result.pass_snapshot("tl.LowerTileOp").mod, "tl.dist_wait_signal_") == [3]
 
-    injected_names = collect_op_names(result.pass_snapshot("tl.InjectDistSync").mod)
+    injected_names = collect_op_names(result.pass_snapshot("tl.LowerDistSync").mod)
     assert "tl.dist_put_" in injected_names
     assert "tl.dist_wait_signal_" in injected_names
     assert "tl.dist_wait_send" in injected_names
-    injected_script = result.pass_snapshot("tl.InjectDistSync").mod.script()
+    injected_script = result.pass_snapshot("tl.LowerDistSync").mod.script()
     assert "signal_expect" in injected_script
     assert "T.dist_signal_decl" not in injected_script
     assert "T.dist_signal(" not in injected_script
     assert "signal_expect_1[0] =" in injected_script
     assert "signal_generation_1[0] =" not in injected_script
-    assert collect_op_arg_counts(result.pass_snapshot("tl.InjectDistSync").mod, "tl.dist_put_") == [6]
-    assert collect_op_arg_counts(result.pass_snapshot("tl.InjectDistSync").mod, "tl.dist_wait_signal_") == [3]
+    assert collect_op_arg_counts(result.pass_snapshot("tl.LowerDistSync").mod, "tl.dist_put_") == [6]
+    assert collect_op_arg_counts(result.pass_snapshot("tl.LowerDistSync").mod, "tl.dist_wait_signal_") == [3]
 
     device_func = single_prim_func(result.device_mod)
     device_names = collect_op_names(device_func)
@@ -253,7 +253,7 @@ def test_existing_non_dist_kernel_is_unchanged_by_dist_passes():
         tilelang.transform.PlanDistSignals(),
         tilelang.transform.LowerDistRouting(),
         tilelang.transform.LowerDistCommunication(),
-        tilelang.transform.InjectDistSync(),
+        tilelang.transform.LowerDistSync(),
     ):
         after = transform(mod)
         assert tvm.ir.structural_equal(after, mod)

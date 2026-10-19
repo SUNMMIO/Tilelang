@@ -372,8 +372,8 @@ def test_signal_list_rejects_out_of_range_static_index():
 
 def test_increment_signal_allows_multiple_physical_senders():
     func = multiple_sender_one_signal_kernel_factory.get_tir(world_size=4)
-    result = lower_to_device_tir(func, capture_passes="tl.InjectDistSync")
-    script = result.pass_snapshot("tl.InjectDistSync").mod.script()
+    result = lower_to_device_tir(func, capture_passes="tl.LowerDistSync")
+    script = result.pass_snapshot("tl.LowerDistSync").mod.script()
     assert "signal_expect" in script
     assert "T.Select(rank_id == 0, 3, 0)" in script
 

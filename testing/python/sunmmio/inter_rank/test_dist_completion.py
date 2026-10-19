@@ -125,7 +125,7 @@ def test_manual_completion_wait_any_supports_every_signal_kind(signal_kind):
         capture_passes=(
             "tl.PlanDistSignals",
             "tl.LowerDistCommunication",
-            "tl.InjectDistSync",
+            "tl.LowerDistSync",
         ),
     )
 
@@ -134,7 +134,7 @@ def test_manual_completion_wait_any_supports_every_signal_kind(signal_kind):
     lowered = result.pass_snapshot("tl.LowerDistCommunication").mod
     assert collect_op_names(lowered).count("tl.dist_completion_init_") == 1
     assert collect_op_names(lowered).count("tl.dist_wait_any_") == 1
-    injected = result.pass_snapshot("tl.InjectDistSync").mod
+    injected = result.pass_snapshot("tl.LowerDistSync").mod
     assert "tl.dist_completion_init_" not in collect_op_names(injected)
     assert collect_op_names(result.device_mod).count("tl.dist_wait_any_") == 1
 
@@ -143,7 +143,7 @@ def test_auto_completion_captures_only_current_put_members():
     func = auto_completion_kernel_factory.get_tir(world_size=4)
     result = lower_to_device_tir(
         func,
-        capture_passes=("tl.LowerDistCommunication", "tl.InjectDistSync"),
+        capture_passes=("tl.LowerDistCommunication", "tl.LowerDistSync"),
     )
 
     lowered = result.pass_snapshot("tl.LowerDistCommunication").mod
@@ -152,7 +152,7 @@ def test_auto_completion_captures_only_current_put_members():
     assert "T.bool(False), v_completion_deltas_1[0], v_completion_deltas_1[1]" in lowered_script
     assert 'v_completion_deltas_1[0] = v_completion_deltas_1[0] + T.Cast("int32", 1)' in lowered_script
 
-    injected = result.pass_snapshot("tl.InjectDistSync").mod
+    injected = result.pass_snapshot("tl.LowerDistSync").mod
     injected_script = injected.script()
     assert "tl.dist_completion_init_" not in collect_op_names(injected)
     assert 'v_pending_1[0] = T.Cast("uint8", v_completion_deltas_1[0] > 0)' in injected_script
@@ -162,13 +162,13 @@ def test_auto_completion_captures_only_current_put_members():
 def test_auto_completion_after_loop_uses_runtime_delta_without_free_loop_var():
     result = lower_to_device_tir(
         auto_completion_after_loop_kernel_factory.get_tir(world_size=4),
-        capture_passes=("tl.LowerDistCommunication", "tl.InjectDistSync"),
+        capture_passes=("tl.LowerDistCommunication", "tl.LowerDistSync"),
     )
     lowered = result.pass_snapshot("tl.LowerDistCommunication").mod.script()
     assert "completion_deltas" in lowered
     assert "iteration == 0" in lowered
     assert "T.dist_completion_init_" in lowered
-    injected_mod = result.pass_snapshot("tl.InjectDistSync").mod
+    injected_mod = result.pass_snapshot("tl.LowerDistSync").mod
     injected = next(
         func for func in injected_mod.functions.values() if isinstance(func, tvm.tir.PrimFunc) and "completion_deltas" in func.script()
     )

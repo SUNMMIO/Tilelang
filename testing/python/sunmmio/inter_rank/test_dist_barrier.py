@@ -107,7 +107,7 @@ def test_barrier_reaches_stable_device_leaves():
             "tl.LowerDistCollectives",
             "tl.PlanDistSignals",
             "tl.LowerDistCommunication",
-            "tl.InjectDistSync",
+            "tl.LowerDistSync",
         ),
     )
 
@@ -123,7 +123,7 @@ def test_barrier_reaches_stable_device_leaves():
     assert "tl.dist_signal_put" not in lower_names
     assert "tl.dist_wait_signal" not in lower_names
 
-    injected = result.pass_snapshot("tl.InjectDistSync").mod
+    injected = result.pass_snapshot("tl.LowerDistSync").mod
     injected_names = collect_op_names(injected)
     injected_script = injected.script()
     assert "tl.dist_expect_" not in injected_names
@@ -152,8 +152,8 @@ def test_barrier_accepts_explicit_dram_increment_signal():
 
 def test_repeated_barrier_accumulates_expected():
     func = repeated_barrier_kernel_factory.get_tir(world_size=4)
-    result = lower_to_device_tir(func, capture_passes="tl.InjectDistSync")
-    injected = result.pass_snapshot("tl.InjectDistSync").mod
+    result = lower_to_device_tir(func, capture_passes="tl.LowerDistSync")
+    injected = result.pass_snapshot("tl.LowerDistSync").mod
     names = collect_op_names(injected)
 
     assert names.count("tl.dist_signal_put_") == 6
@@ -185,8 +185,8 @@ def test_barrier_arrive_is_split_from_wait_signal():
 )
 def test_public_put_signal_infers_ring_expected(signal_kind, expected_kind):
     func = put_signal_ring_kernel_factory.get_tir(signal_kind=signal_kind, world_size=4)
-    result = lower_to_device_tir(func, capture_passes="tl.InjectDistSync")
-    injected = result.pass_snapshot("tl.InjectDistSync").mod
+    result = lower_to_device_tir(func, capture_passes="tl.LowerDistSync")
+    injected = result.pass_snapshot("tl.LowerDistSync").mod
     names = collect_op_names(injected)
 
     assert names.count("tl.dist_signal_put_") == 1

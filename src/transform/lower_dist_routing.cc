@@ -51,6 +51,53 @@ bool HasCompilerGeneratedRegion(const Call &call) {
 
 class DistRoutePredicateNormalizer : public StmtExprMutator {
 private:
+  Optional<Stmt> RewriteManualConditional(const IfThenElseNode *op,
+                                          const PrimExpr &predicate) {
+    if (op->else_case) {
+      return std::nullopt;
+    }
+    bool guarded = !is_one(predicate);
+    bool snapshot =
+        guarded || SideEffect(op->condition) > CallEffectKind::kPure;
+    Optional<Var> saved;
+    PrimExpr condition = op->condition;
+    if (snapshot) {
+      saved =
+          Var("dist_condition_snapshot_" + std::to_string(snapshot_counter_++),
+              condition.dtype());
+      condition = saved.value();
+    }
+    Optional<Stmt> rewritten = RewriteManualBranch(op->then_case, condition);
+    if (!rewritten) {
+      return std::nullopt;
+    }
+    if (!snapshot) {
+      return rewritten;
+    }
+    if (!guarded) {
+      return LetStmt(saved.value(), op->condition, rewritten.value(), op->span);
+    }
+
+    // A nested condition is evaluated at its original position, and only if
+    // its parent branch was taken. Use real control flow: SunMMIO currently
+    // evaluates both values of a tir.if_then_else expression before selecting.
+    Buffer storage =
+        decl_buffer({Integer(1)}, condition.dtype(),
+                    saved.value()->name_hint + "_value", "local.var");
+    Array<PrimExpr> index{Integer(0)};
+    Stmt evaluate =
+        IfThenElse(predicate, BufferStore(storage, op->condition, index),
+                   BufferStore(storage, const_false(), index), op->span);
+    Stmt body = SeqStmt::Flatten(Array<Stmt>{
+        evaluate,
+        LetStmt(saved.value(), BufferLoad(storage, index), rewritten.value(),
+                op->span),
+    });
+    // local.var is scalar SSA state in SunMMIO codegen, not SRAM storage.
+    return Allocate(storage->data, storage->dtype, storage->shape, const_true(),
+                    DeclBuffer(storage, body), {}, op->span);
+  }
+
   Optional<Stmt> RewriteManualBranch(const Stmt &stmt,
                                      const PrimExpr &predicate) {
     if (const auto *evaluate = stmt.as<EvaluateNode>()) {
@@ -88,25 +135,20 @@ private:
       return SeqStmt::Flatten(statements);
     }
     if (const auto *conditional = stmt.as<IfThenElseNode>()) {
-      if (conditional->else_case) {
-        return std::nullopt;
-      }
-      return RewriteManualBranch(conditional->then_case,
-                                 And(predicate, conditional->condition));
+      return RewriteManualConditional(conditional, predicate);
     }
     return std::nullopt;
   }
 
   Stmt VisitStmt_(const IfThenElseNode *op) final {
-    if (!op->else_case) {
-      Optional<Stmt> rewritten =
-          RewriteManualBranch(op->then_case, op->condition);
-      if (rewritten) {
-        return VisitStmt(rewritten.value());
-      }
+    Optional<Stmt> rewritten = RewriteManualConditional(op, const_true());
+    if (rewritten) {
+      return VisitStmt(rewritten.value());
     }
     return StmtExprMutator::VisitStmt_(op);
   }
+
+  int snapshot_counter_{0};
 };
 
 class DistRankRoutedPutNormalizer : public StmtExprMutator {

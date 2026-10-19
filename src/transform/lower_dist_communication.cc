@@ -4,6 +4,7 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/tir/analysis.h>
 #include <tvm/tir/transform.h>
 
 #include <algorithm>
@@ -124,6 +125,63 @@ private:
   using SignalExpectationMap =
       std::unordered_map<SignalExpectationKey, SignalExpectation,
                          SignalExpectationKeyHash>;
+
+  struct StaticLoopBinding {
+    Var var;
+    int64_t min;
+    int64_t extent;
+  };
+
+  class LoopVarUseDetector : public ExprVisitor {
+  public:
+    explicit LoopVarUseDetector(const VarNode *target) : target_(target) {}
+
+    bool Detect(const PrimExpr &expr) {
+      VisitExpr(expr);
+      return found_;
+    }
+
+  private:
+    void VisitExpr_(const VarNode *op) final { found_ |= op == target_; }
+
+    const VarNode *target_;
+    bool found_{false};
+  };
+
+  template <typename F>
+  void ForEachStaticLoopInstance(const std::vector<StaticLoopBinding> &loops,
+                                 size_t depth,
+                                 const Map<Var, PrimExpr> &substitution,
+                                 PrimExpr predicate, F &func) {
+    if (depth == loops.size()) {
+      func(substitution, predicate);
+      return;
+    }
+    const StaticLoopBinding &loop = loops[depth];
+    for (int64_t offset = 0; offset < loop.extent; ++offset) {
+      int64_t value = loop.min + offset;
+      Map<Var, PrimExpr> next = substitution;
+      next.Set(loop.var, IntImm(loop.var.dtype(), value));
+      PrimExpr condition =
+          And(predicate, loop.var == IntImm(loop.var.dtype(), value));
+      ForEachStaticLoopInstance(loops, depth + 1, next, condition, func);
+    }
+  }
+
+  std::vector<StaticLoopBinding>
+  RelevantStaticLoops(std::initializer_list<PrimExpr> expressions) const {
+    std::vector<StaticLoopBinding> result;
+    for (const StaticLoopBinding &loop : static_loops_) {
+      LoopVarUseDetector detector(loop.var.get());
+      for (const PrimExpr &expression : expressions) {
+        if (detector.Detect(expression)) {
+          result.push_back(loop);
+          break;
+        }
+      }
+    }
+    return result;
+  }
 
   int64_t RequireResolvedInt(const PrimExpr &expr, const char *name) {
     PrimExpr simplified = analyzer_->Simplify(expr);
@@ -312,12 +370,19 @@ private:
         for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
           Map<Var, PrimExpr> substitution =
               MakeSourceSubstitution(current_core, src_row, src_rank);
-          int64_t dst_rank = RequireResolvedInt(
-              Substitute(call->args[2], substitution), "peer destination rank");
-          PrimExpr predicate =
-              analyzer_->Simplify(Substitute(source_predicate, substitution));
-          AddDelta(&expectation, dst_rank, src_row, src_rank, src_row,
-                   predicate);
+          auto visit_instance = [&](const Map<Var, PrimExpr> &instance,
+                                    const PrimExpr &loop_predicate) {
+            int64_t dst_rank = RequireResolvedInt(
+                Substitute(call->args[2], instance), "peer destination rank");
+            PrimExpr predicate = analyzer_->Simplify(
+                And(loop_predicate, Substitute(source_predicate, instance)));
+            AddDelta(&expectation, dst_rank, src_row, src_rank, src_row,
+                     predicate);
+          };
+          std::vector<StaticLoopBinding> loops =
+              RelevantStaticLoops({call->args[2]});
+          ForEachStaticLoopInstance(loops, 0, substitution, const_true(),
+                                    visit_instance);
         }
       }
       return;
@@ -674,9 +739,21 @@ private:
 
   Stmt VisitStmt_(const ForNode *op) final {
     // PlanDistSignals has already checked loop uniformity for auto sends.
+    PrimExpr min = analyzer_->Simplify(op->min);
+    PrimExpr extent = analyzer_->Simplify(op->extent);
+    const auto *min_imm = min.as<IntImmNode>();
+    const auto *extent_imm = extent.as<IntImmNode>();
+    bool static_loop = min_imm && extent_imm && extent_imm->value >= 0;
+    if (static_loop) {
+      static_loops_.push_back(
+          StaticLoopBinding{op->loop_var, min_imm->value, extent_imm->value});
+    }
     loop_vars_.insert(op->loop_var.get());
     Stmt stmt = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
     loop_vars_.erase(op->loop_var.get());
+    if (static_loop) {
+      static_loops_.pop_back();
+    }
     return stmt;
   }
 
@@ -699,6 +776,7 @@ private:
 
   bool suppress_injection_{false};
   std::unordered_set<const VarNode *> loop_vars_;
+  std::vector<StaticLoopBinding> static_loops_;
   std::unordered_map<const VarNode *, SignalPlan> signal_kinds_;
   std::unordered_map<const VarNode *, SignalPlan> signal_group_kinds_;
 };
@@ -780,6 +858,15 @@ private:
       has_compiler_index_ = true;
       return;
     }
+    dst_rank = analyzer_.Simplify(Substitute(dst_rank, let_bindings_));
+    dst_row = analyzer_.Simplify(Substitute(dst_row, let_bindings_));
+    auto uses_loop_var = [&](const VarNode *var) {
+      return loop_vars_.count(var) != 0;
+    };
+    // One put site can visit several endpoints as its enclosing loops advance.
+    bool varying_row = UsesVar(dst_row, uses_loop_var);
+    dense_ |= UsesVar(dst_rank, uses_loop_var) || varying_row;
+    row_domain_ |= varying_row;
     int64_t key = is_group_ ? member.index : -1;
     Endpoint endpoint{std::move(dst_rank), std::move(dst_row)};
     auto it = first_endpoint_.find(key);
@@ -789,6 +876,21 @@ private:
       dense_ = true;
       row_domain_ |= !structural_equal_(it->second.row, endpoint.row);
     }
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    loop_vars_.insert(op->loop_var.get());
+    StmtExprVisitor::VisitStmt_(op);
+    loop_vars_.erase(op->loop_var.get());
+  }
+
+  void VisitStmt_(const LetStmtNode *op) final {
+    VisitExpr(op->value);
+    Map<Var, PrimExpr> old_bindings = let_bindings_;
+    let_bindings_.Set(op->var,
+                      analyzer_.Simplify(Substitute(op->value, let_bindings_)));
+    VisitStmt(op->body);
+    let_bindings_ = std::move(old_bindings);
   }
 
   void VisitExpr_(const CallNode *call) final {
@@ -816,6 +918,9 @@ private:
   bool dense_{false};
   bool has_compiler_index_{false};
   bool row_domain_{false};
+  arith::Analyzer analyzer_;
+  Map<Var, PrimExpr> let_bindings_;
+  std::unordered_set<const VarNode *> loop_vars_;
   StructuralEqual structural_equal_;
   std::unordered_map<int64_t, Endpoint> first_endpoint_;
 };
@@ -876,6 +981,37 @@ private:
     PrimExpr index;
     PrimExpr expected;
   };
+
+  struct SignalIndexGuard {
+    Var index;
+    PrimExpr value;
+    int64_t count;
+    bool needs_assert;
+  };
+
+  // Keep a guard with the statement that actually consumes the member. In
+  // particular, a delta wait must check before either updating or reading
+  // expected, and must use the very same index for its physical signal.
+  Stmt VisitStmt(const Stmt &stmt) final {
+    index_guards_.emplace_back();
+    Stmt result = StmtExprMutator::VisitStmt(stmt);
+    auto guards = std::move(index_guards_.back());
+    index_guards_.pop_back();
+    for (auto it = guards.rbegin(); it != guards.rend(); ++it) {
+      if (it->needs_assert) {
+        PrimExpr wide = Cast(DataType::Int(64), it->index);
+        PrimExpr valid = And(wide >= make_zero(DataType::Int(64)),
+                             wide < IntImm(DataType::Int(64), it->count));
+        result =
+            AssertStmt(valid,
+                       StringImm("T.dist SignalList index out of range [0, " +
+                                 std::to_string(it->count) + ")"),
+                       result);
+      }
+      result = LetStmt(it->index, it->value, result);
+    }
+    return result;
+  }
 
   Stmt VisitStmt_(const LetStmtNode *let_node) final {
     const auto *signal_call_node = let_node->value.as<CallNode>();
@@ -1468,7 +1604,22 @@ private:
     SignalGroupInfo &group = LookupSignalGroup(ref->args[0]);
     group.used = true;
     PrimExpr index = ref->args[1];
-    ICHECK(index.dtype().is_int());
+    ICHECK(index.dtype().is_int() && index.dtype().lanes() == 1);
+    if (const auto *constant = index.as<IntImmNode>()) {
+      ICHECK_GE(constant->value, 0);
+      ICHECK_LT(constant->value, group.count);
+    } else {
+      auto proof = ref->annotations.Get(kDistSignalIndexInBoundsAttr);
+      bool proven = proof && is_one(Downcast<PrimExpr>(proof.value()));
+      // A mutable index must be sampled once, even when its arithmetic range
+      // is known, so a state update cannot change which signal is waited on.
+      if (!proven || SideEffect(index) > CallEffectKind::kPure) {
+        ICHECK(!index_guards_.empty());
+        Var saved("dist_signal_index", index.dtype());
+        index_guards_.back().push_back({saved, index, group.count, !proven});
+        index = saved;
+      }
+    }
     return {group.kind, group.base_index + index,
             BufferLoad(group.expected, {index})};
   }
@@ -1551,6 +1702,7 @@ private:
   std::unordered_map<const VarNode *, SignalInfo> signal_info_;
   std::unordered_map<const VarNode *, SignalGroupInfo> signal_group_info_;
   std::unordered_map<const VarNode *, CompletionInfo> completion_info_;
+  std::vector<std::vector<SignalIndexGuard>> index_guards_;
   int64_t world_size_{1};
   int mesh_nrows_{1};
   int mesh_ncols_{1};

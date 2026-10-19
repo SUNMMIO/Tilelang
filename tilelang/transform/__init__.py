@@ -634,9 +634,9 @@ def LowerDistCommunication():
     return _ffi_api.LowerDistCommunication()  # type: ignore
 
 
-def InjectDistSync():
-    """Process Rank communication synchronization and source lifetimes."""
-    return _ffi_api.InjectDistSync()  # type: ignore
+def LowerDistSync():
+    """Lower Rank synchronization state, validate send queues, and insert waits."""
+    return _ffi_api.LowerDistSync()  # type: ignore
 
 
 def StorageRewrite():
