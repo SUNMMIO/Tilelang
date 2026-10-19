@@ -684,19 +684,17 @@ Layout TryCanonicalizeToRowMajor(const Layout &layout) {
   Layout row_major = sunmmio::MakeRowMajor(logical_shape);
   const auto *row_major_cute = row_major.as<CuteLayoutNode>();
   ICHECK(row_major_cute);
-  Array<PrimExpr> canonical_row_major_strides =
-      row_major_cute->GetModeStride();
+  Array<PrimExpr> canonical_row_major_strides = row_major_cute->GetModeStride();
   for (size_t i = 0; i < row_major_cute->GetModeShape().size(); ++i) {
-    const auto *extent =
-        row_major_cute->GetModeShape()[i].as<IntImmNode>();
+    const auto *extent = row_major_cute->GetModeShape()[i].as<IntImmNode>();
     if (extent && extent->value == 1) {
       canonical_row_major_strides.Set(
           i, make_zero(canonical_row_major_strides[i].dtype()));
     }
   }
-  Layout canonical_row_major = CuteLayout(
-      logical_shape, row_major_cute->GetModeShape(),
-      canonical_row_major_strides, row_major_cute->GetDimLevels());
+  Layout canonical_row_major =
+      CuteLayout(logical_shape, row_major_cute->GetModeShape(),
+                 canonical_row_major_strides, row_major_cute->GetDimLevels());
   // Coalescing preserves the byte map but rewrites the mode structure that
   // DeriveLayoutLike reads as the layout kind, so a partial coalesce would
   // change how IsLayoutMatch shape-adapts the layout. Commit only when all

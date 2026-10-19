@@ -143,9 +143,9 @@ Optional<Layout> FindBufferLayout(const LayoutMap &layout_map,
   return Optional<Layout>();
 }
 
-std::optional<int64_t>
-GetStaticStorageBytes(const Layout &layout, DataType dtype,
-                      arith::Analyzer *analyzer) {
+std::optional<int64_t> GetStaticStorageBytes(const Layout &layout,
+                                             DataType dtype,
+                                             arith::Analyzer *analyzer) {
   const auto *cute = layout.as<CuteLayoutNode>();
   if (!cute) {
     return std::nullopt;
@@ -156,8 +156,7 @@ GetStaticStorageBytes(const Layout &layout, DataType dtype,
     return std::nullopt;
   }
 
-  int64_t element_bits =
-      static_cast<int64_t>(dtype.bits()) * dtype.lanes();
+  int64_t element_bits = static_cast<int64_t>(dtype.bits()) * dtype.lanes();
   if (element_bits <= 0 ||
       element_bits > std::numeric_limits<int64_t>::max() - 7) {
     return std::nullopt;
@@ -172,8 +171,7 @@ GetStaticStorageBytes(const Layout &layout, DataType dtype,
   return storage_size_imm->value * element_bytes;
 }
 
-void CheckAllgatherDirectCapacity(const LowerArgs &T,
-                                  const Buffer &send_buffer,
+void CheckAllgatherDirectCapacity(const LowerArgs &T, const Buffer &send_buffer,
                                   const Buffer &recv_buffer,
                                   arith::Analyzer *analyzer) {
   if (send_buffer.scope() != kSunmmioScopeRSRAM ||
@@ -187,10 +185,10 @@ void CheckAllgatherDirectCapacity(const LowerArgs &T,
     return;
   }
 
-  std::optional<int64_t> send_bytes = GetStaticStorageBytes(
-      send_layout.value(), send_buffer->dtype, analyzer);
-  std::optional<int64_t> recv_bytes = GetStaticStorageBytes(
-      recv_layout.value(), recv_buffer->dtype, analyzer);
+  std::optional<int64_t> send_bytes =
+      GetStaticStorageBytes(send_layout.value(), send_buffer->dtype, analyzer);
+  std::optional<int64_t> recv_bytes =
+      GetStaticStorageBytes(recv_layout.value(), recv_buffer->dtype, analyzer);
   if (!send_bytes.has_value() || !recv_bytes.has_value()) {
     return;
   }
@@ -205,13 +203,13 @@ void CheckAllgatherDirectCapacity(const LowerArgs &T,
     return;
   }
 
-  int64_t required =
-      send <= std::numeric_limits<int64_t>::max() - recv
-          ? send + recv
-          : std::numeric_limits<int64_t>::max();
+  int64_t required = send <= std::numeric_limits<int64_t>::max() - recv
+                         ? send + recv
+                         : std::numeric_limits<int64_t>::max();
   ICHECK(false) << "T.comm.all_gather direct multicast requires at least "
-                << required << " bytes of simultaneously live RSRAM (send="
-                << send << " bytes, recv=" << recv
+                << required
+                << " bytes of simultaneously live RSRAM (send=" << send
+                << " bytes, recv=" << recv
                 << " bytes), exceeding the target RSRAM capacity " << capacity
                 << " bytes. Reduce the communication region or use chunked "
                    "communication.";
@@ -225,20 +223,20 @@ std::vector<int> GetBroadcastSplitDims(const Array<Range> &ranges,
       non_unit_dims.push_back(dim);
     }
   }
-  int split_dim_count = non_unit_dims.size() > 2
-                            ? static_cast<int>(non_unit_dims.size()) - 2
-                            : 0;
+  int split_dim_count =
+      non_unit_dims.size() > 2 ? static_cast<int>(non_unit_dims.size()) - 2 : 0;
   non_unit_dims.resize(split_dim_count);
   return non_unit_dims;
 }
 
-Array<Range> MakeRepresentativeBroadcastLeaf(
-    const Array<Range> &ranges, const std::vector<int> &split_dims) {
+Array<Range>
+MakeRepresentativeBroadcastLeaf(const Array<Range> &ranges,
+                                const std::vector<int> &split_dims) {
   Array<Range> leaf = ranges;
   for (int dim : split_dims) {
-    leaf.Set(dim, Range::FromMinExtent(
-                      leaf[dim]->min,
-                      make_const(leaf[dim]->extent.dtype(), 1)));
+    leaf.Set(dim,
+             Range::FromMinExtent(leaf[dim]->min,
+                                  make_const(leaf[dim]->extent.dtype(), 1)));
   }
   return leaf;
 }
@@ -322,18 +320,18 @@ bool HasA4ELegalContiguousSegment(const LayoutMap &layout_map,
          contiguous_bytes % kMulticastGranularityBytes == 0;
 }
 
-bool NeedsAllgatherDenseLayout(
-    const LayoutMap &layout_map, const Buffer &send_buffer,
-    const Array<Range> &send_ranges, const Buffer &recv_buffer,
-    const Array<Range> &recv_ranges, int axis, int src_offset_byte,
-    arith::Analyzer *analyzer) {
+bool NeedsAllgatherDenseLayout(const LayoutMap &layout_map,
+                               const Buffer &send_buffer,
+                               const Array<Range> &send_ranges,
+                               const Buffer &recv_buffer,
+                               const Array<Range> &recv_ranges, int axis,
+                               int src_offset_byte, arith::Analyzer *analyzer) {
   // Last-axis gathers need an axis-aware receive layout because their logical
   // slot is strided across rows. Keep that established lowering here. The
   // leading-slot and axis-0 forms use leading slabs, so dense row-major
   // communication buffers make every payload slab physically contiguous.
   if (send_ranges.empty() || recv_ranges.empty() || axis > 0 ||
-      src_offset_byte != 0 ||
-      send_buffer.scope() != kSunmmioScopeRSRAM ||
+      src_offset_byte != 0 || send_buffer.scope() != kSunmmioScopeRSRAM ||
       recv_buffer.scope() != kSunmmioScopeRSRAM) {
     return false;
   }
@@ -349,15 +347,13 @@ bool NeedsAllgatherDenseLayout(
   Array<Range> recv_leaf = recv_ranges;
   if (dst_payload_offset == 1) {
     recv_leaf.Set(
-        0, Range::FromMinExtent(
-               recv_leaf[0]->min,
-               make_const(recv_leaf[0]->extent.dtype(), 1)));
+        0, Range::FromMinExtent(recv_leaf[0]->min,
+                                make_const(recv_leaf[0]->extent.dtype(), 1)));
   }
   for (size_t dim = 0; dim < send_leaf.size(); ++dim) {
     int dst_dim = static_cast<int>(dim) + dst_payload_offset;
-    recv_leaf.Set(dst_dim,
-                  Range::FromMinExtent(recv_leaf[dst_dim]->min,
-                                       send_leaf[dim]->extent));
+    recv_leaf.Set(dst_dim, Range::FromMinExtent(recv_leaf[dst_dim]->min,
+                                                send_leaf[dim]->extent));
   }
 
   return !HasA4ELegalContiguousSegment(layout_map, send_buffer, send_leaf,
@@ -402,8 +398,7 @@ void EmitCanonicalRankBroadcastLeaves(
            "extent at dim "
         << src_dim << ", got " << src_extent;
     ICHECK_LE(leaf_count, max_static_leaves / imm->value)
-        << "Allgather static split would emit more than "
-        << max_static_leaves
+        << "Allgather static split would emit more than " << max_static_leaves
         << " multicast leaves, the maximum permitted by the target RSRAM "
            "capacity and 1024-byte multicast granularity. Reduce the outer "
            "extents or use chunked communication.";
@@ -418,8 +413,8 @@ void EmitCanonicalRankBroadcastLeaves(
     if (split_index == split_dims.size()) {
       out->push_back(MakeBroadcastLeaf(
           MakeRegionExpr(src_buffer, current_src, /*access_mask=*/1),
-          MakeRegionExpr(dst_buffer, current_dst, /*access_mask=*/2),
-          direction, analyzer->Simplify(mask), src_offset_byte));
+          MakeRegionExpr(dst_buffer, current_dst, /*access_mask=*/2), direction,
+          analyzer->Simplify(mask), src_offset_byte));
       return;
     }
 
@@ -434,14 +429,14 @@ void EmitCanonicalRankBroadcastLeaves(
       PrimExpr dst_index = analyzer->Simplify(
           dst_ranges[dst_dim]->min +
           make_const(dst_ranges[dst_dim]->min.dtype(), index));
-      next_src.Set(src_dim,
-                   Range::FromMinExtent(
-                       src_index,
-                       make_const(src_ranges[src_dim]->extent.dtype(), 1)));
-      next_dst.Set(dst_dim,
-                   Range::FromMinExtent(
-                       dst_index,
-                       make_const(dst_ranges[dst_dim]->extent.dtype(), 1)));
+      next_src.Set(
+          src_dim,
+          Range::FromMinExtent(
+              src_index, make_const(src_ranges[src_dim]->extent.dtype(), 1)));
+      next_dst.Set(
+          dst_dim,
+          Range::FromMinExtent(
+              dst_index, make_const(dst_ranges[dst_dim]->extent.dtype(), 1)));
       emit_leaf(split_index + 1, next_src, next_dst);
     }
   };
@@ -458,8 +453,7 @@ bool IsMinMaxReduction(const StringImm &type) {
          type->value == "absmax";
 }
 
-void ValidateAllreduceReductionDType(const StringImm &type,
-                                     DataType src_dtype,
+void ValidateAllreduceReductionDType(const StringImm &type, DataType src_dtype,
                                      DataType dst_dtype) {
   if (IsBitwiseReduction(type)) {
     auto is_supported = [](DataType dtype) {
@@ -475,8 +469,7 @@ void ValidateAllreduceReductionDType(const StringImm &type,
   if (IsMinMaxReduction(type)) {
     auto is_supported = [](DataType dtype) {
       return dtype.lanes() == 1 &&
-             (dtype.is_bfloat16() ||
-              (dtype.is_float() && dtype.bits() == 32));
+             (dtype.is_bfloat16() || (dtype.is_float() && dtype.bits() == 32));
     };
     ICHECK(is_supported(src_dtype) && is_supported(dst_dtype))
         << "Sunmmio all_reduce min/max/absmax requires scalar bfloat16 or "
@@ -485,16 +478,16 @@ void ValidateAllreduceReductionDType(const StringImm &type,
   }
 }
 
-void ValidateAllreduceDTypeContract(
-    const Buffer &src, const Buffer &dst, const Buffer &row_allgather,
-    const Buffer &col_allgather, const Buffer &dst_copy,
-    const StringImm &type, int direction) {
+void ValidateAllreduceDTypeContract(const Buffer &src, const Buffer &dst,
+                                    const Buffer &row_allgather,
+                                    const Buffer &col_allgather,
+                                    const Buffer &dst_copy,
+                                    const StringImm &type, int direction) {
   auto validate_dtype = [](const Buffer &buffer, DataType expected,
                            const char *name, const char *expected_name) {
     ICHECK(buffer->dtype == expected)
         << "T.comm.all_reduce requires " << name << " dtype to match "
-        << expected_name << " dtype " << expected << ", got "
-        << buffer->dtype;
+        << expected_name << " dtype " << expected << ", got " << buffer->dtype;
   };
 
   ValidateAllreduceReductionDType(type, src->dtype, dst->dtype);
@@ -536,8 +529,8 @@ void ValidateAllreduceCarrierShape(const BufferRegion &carrier,
                                    arith::Analyzer *analyzer) {
   ICHECK_EQ(carrier->region.size(), payload->region.size() + 1)
       << "T.comm.all_reduce requires " << carrier_name
-      << " rank to equal src rank + 1, got " << carrier->region.size()
-      << " vs " << payload->region.size();
+      << " rank to equal src rank + 1, got " << carrier->region.size() << " vs "
+      << payload->region.size();
   ICHECK(analyzer->CanProveEqual(
       carrier->region[0]->extent,
       IntImm(carrier->region[0]->extent.dtype(), participant_count)))
@@ -554,11 +547,12 @@ void ValidateAllreduceCarrierShape(const BufferRegion &carrier,
   }
 }
 
-void CheckAllreduceRsramCapacity(
-    const LowerArgs &T, const PrimExpr &src_expr, const PrimExpr &dst_expr,
-    const PrimExpr &row_allgather_expr,
-    const PrimExpr &col_allgather_expr, const PrimExpr &dst_copy_expr,
-    arith::Analyzer *analyzer) {
+void CheckAllreduceRsramCapacity(const LowerArgs &T, const PrimExpr &src_expr,
+                                 const PrimExpr &dst_expr,
+                                 const PrimExpr &row_allgather_expr,
+                                 const PrimExpr &col_allgather_expr,
+                                 const PrimExpr &dst_copy_expr,
+                                 arith::Analyzer *analyzer) {
   int64_t capacity =
       GetSunmmioTileProcessorConfig(T.target).rsram_capacity_bytes;
   ICHECK_GT(capacity, 0) << "Sunmmio RSRAM capacity must be positive";
@@ -637,8 +631,7 @@ void ValidateAllreduceContract(
     dst_copy = NormalizeToBufferRegion(dst_copy_expr);
   }
   ValidateAllreduceDTypeContract(
-      src->buffer, dst->buffer, row_allgather->buffer,
-      col_allgather->buffer,
+      src->buffer, dst->buffer, row_allgather->buffer, col_allgather->buffer,
       dst_copy.defined() ? dst_copy->buffer : Buffer(), type, direction);
 
   ValidateMatchingRegionShape(dst, src, "dst", analyzer);
@@ -1143,9 +1136,9 @@ LayoutMap AllgatherOpNode::InferLayout(const LayoutInferArgs &T,
   Buffer src_buffer = send_region->buffer;
   Buffer recv_buffer = recv_region->buffer;
   if (level == InferLevel::kStrict &&
-      NeedsAllgatherDenseLayout(
-          T.layout_map, src_buffer, send_region->region, recv_buffer,
-          recv_region->region, axis, GetSrcOffsetByte(), T.analyzer)) {
+      NeedsAllgatherDenseLayout(T.layout_map, src_buffer, send_region->region,
+                                recv_buffer, recv_region->region, axis,
+                                GetSrcOffsetByte(), T.analyzer)) {
     LayoutMap result;
     if (src_buffer.scope() == kSunmmioScopeRSRAM) {
       result.Set(src_buffer, sunmmio::MakeRowMajor(src_buffer->shape));
@@ -1222,9 +1215,9 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
   Buffer send_buffer = send_region->buffer;
   Buffer recv_buffer = recv_region->buffer;
   int src_offset_byte = GetSrcOffsetByte();
-  if (NeedsAllgatherDenseLayout(
-          T.layout_map, send_buffer, send_range, recv_buffer, recv_range, axis,
-          src_offset_byte, analyzer)) {
+  if (NeedsAllgatherDenseLayout(T.layout_map, send_buffer, send_range,
+                                recv_buffer, recv_range, axis, src_offset_byte,
+                                analyzer)) {
     ICHECK(false)
         << "T.comm.all_gather region violates A4E multicast data-path "
            "constraints after layout inference. The physical contiguous "
@@ -1293,19 +1286,18 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
                             PrimExpr mask) {
     int dst_payload_offset = static_cast<int>(dst_ranges.size()) -
                              static_cast<int>(send_range.size());
-    EmitCanonicalRankBroadcastLeaves(
-        send_buffer, send_range, recv_buffer, dst_ranges, dst_payload_offset,
-        bcast_dir, mask, src_offset_imm, max_static_leaves, analyzer,
-        &bcast_stmts);
+    EmitCanonicalRankBroadcastLeaves(send_buffer, send_range, recv_buffer,
+                                     dst_ranges, dst_payload_offset, bcast_dir,
+                                     mask, src_offset_imm, max_static_leaves,
+                                     analyzer, &bcast_stmts);
   };
 
   auto emit_from_recv = [&](Array<Range> slab_ranges, int bcast_dir,
                             PrimExpr mask) {
-    EmitCanonicalRankBroadcastLeaves(recv_buffer, slab_ranges, recv_buffer,
-                                     slab_ranges,
-                                     /*dst_payload_offset=*/0, bcast_dir, mask,
-                                     src_offset_imm, max_static_leaves,
-                                     analyzer, &bcast_stmts);
+    EmitCanonicalRankBroadcastLeaves(
+        recv_buffer, slab_ranges, recv_buffer, slab_ranges,
+        /*dst_payload_offset=*/0, bcast_dir, mask, src_offset_imm,
+        max_static_leaves, analyzer, &bcast_stmts);
   };
 
   if (direction == 0) { // horizontal
@@ -1359,8 +1351,7 @@ AllreduceOp::AllreduceOp(Array<PrimExpr> args,
   if (args.size() == 9) {
     dst_copy_buffer = NormalizeToBufferRegion(args[7])->buffer;
   }
-  ValidateAllreduceDTypeContract(src_buffer, dst_buffer,
-                                 row_allgather_buffer,
+  ValidateAllreduceDTypeContract(src_buffer, dst_buffer, row_allgather_buffer,
                                  col_allgather_buffer, dst_copy_buffer, type,
                                  direction);
 
@@ -1418,13 +1409,11 @@ LayoutMap AllreduceOpNode::InferLayout(const LayoutInferArgs &T,
 
   auto get_layout_level = [&](const Buffer &buffer) {
     if (known_layout_levels.count(buffer)) {
-      return static_cast<InferLevel>(
-          known_layout_levels[buffer].IntValue());
+      return static_cast<InferLevel>(known_layout_levels[buffer].IntValue());
     }
     // Layout inference implementations without provenance predate the
     // Sunmmio kFree defaults. Treat their known layouts as established.
-    return known_layout.count(buffer) ? InferLevel::kCommon
-                                      : InferLevel::kFree;
+    return known_layout.count(buffer) ? InferLevel::kCommon : InferLevel::kFree;
   };
 
   auto merge_layout = [&](const LayoutMap &layout) {
@@ -1452,8 +1441,7 @@ LayoutMap AllreduceOpNode::InferLayout(const LayoutInferArgs &T,
       proposed_layout.Set(kv.first, kv.second);
       lm.Set(kv.first, kv.second);
       known_layout.Set(kv.first, kv.second);
-      known_layout_levels.Set(kv.first,
-                              Integer(static_cast<int>(level)));
+      known_layout_levels.Set(kv.first, Integer(static_cast<int>(level)));
     }
     local_T.layout_map = known_layout;
     local_T.layout_levels = known_layout_levels;

@@ -314,8 +314,7 @@ std::vector<AccessTileCandidate> EnumerateInferredCandidates(
   std::vector<AccessTileCandidate> candidates;
   for (const std::vector<int> &execution_dims :
        CollectExecutionDimChoices(bindings, exec_rank)) {
-    for (const TrailingTilePattern &pattern :
-         EnumerateInferredTilePatterns(
+    for (const TrailingTilePattern &pattern : EnumerateInferredTilePatterns(
              buffer, execution_dims, layout_map, config, analyzer,
              {TileExtentPolicy::kTilesExecutionLayoutBounded,
               alignment_mode})) {

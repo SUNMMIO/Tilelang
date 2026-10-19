@@ -29,11 +29,7 @@ def _collect_calls(func, op_name):
 def _region_buffer(expr):
     if isinstance(expr, tvm.tir.BufferLoad):
         return expr.buffer
-    if (
-        isinstance(expr, tvm.tir.Call)
-        and isinstance(expr.op, tvm.ir.Op)
-        and expr.op.name == "tl.tileop.region"
-    ):
+    if isinstance(expr, tvm.tir.Call) and isinstance(expr.op, tvm.ir.Op) and expr.op.name == "tl.tileop.region":
         return expr.args[0].buffer
     raise TypeError(f"Expected a buffer load or tl.tileop.region, got {expr}")
 
@@ -197,9 +193,7 @@ def test_allreduce_allocates_only_active_symbolic_carriers(direction, clear):
             carriers.append(buffer)
 
     assert len(carriers) == (2 if direction == "all" else 1)
-    assert _region_buffer(call.args[2]).same_as(_region_buffer(call.args[3])) == (
-        direction != "all"
-    )
+    assert _region_buffer(call.args[2]).same_as(_region_buffer(call.args[3])) == (direction != "all")
     assert len(call.args) == (9 if not clear and direction == "all" else 8)
     assert all([int(extent) for extent in carrier.shape[1:]] == [32, 32] for carrier in carriers)
     if direction in ("h", "horizontal", "all"):
@@ -217,9 +211,7 @@ def test_allreduce_allocates_only_active_symbolic_carriers(direction, clear):
         ("all", "ncol", "nrow"),
     ],
 )
-def test_allreduce_carriers_resolve_from_bound_target(
-    nrow, ncol, direction, expected_row_extent, expected_col_extent
-):
+def test_allreduce_carriers_resolve_from_bound_target(nrow, ncol, direction, expected_row_extent, expected_col_extent):
     target = determine_target(
         f"llvm -mcpu=sunmmio-a4e -mattr=device_mesh_nrow_{nrow},device_mesh_ncol_{ncol}",
         return_object=True,
@@ -339,9 +331,7 @@ def test_comm_allreduce_rejects_unsupported_bitwise_dtypes(reduce_type, dtype):
     "src_dtype,out_dtype",
     [("int32", "uint32"), ("uint32", "int32")],
 )
-def test_comm_allreduce_rejects_mixed_signedness_bitwise_dtypes(
-    src_dtype, out_dtype
-):
+def test_comm_allreduce_rejects_mixed_signedness_bitwise_dtypes(src_dtype, out_dtype):
     with pytest.raises(
         AssertionError,
         match="Sunmmio bitwise all_reduce requires input and output dtypes to be both int32 or both uint32",

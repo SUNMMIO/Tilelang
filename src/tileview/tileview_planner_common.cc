@@ -36,24 +36,23 @@ MakeTrailingTilePatternImpl(const Array<PrimExpr> &buffer_shape,
   return pattern;
 }
 
-TrailingTilePattern MakeMappedTilePatternImpl(
-    const std::vector<int> &mapped_dims,
-    const std::vector<int> &tile_shape) {
+TrailingTilePattern
+MakeMappedTilePatternImpl(const std::vector<int> &mapped_dims,
+                          const std::vector<int> &tile_shape) {
   ICHECK_EQ(mapped_dims.size(), tile_shape.size());
   return {mapped_dims, tile_shape};
 }
 
 void AppendRank1Pattern(std::vector<TrailingTilePattern> *patterns,
                         int width_dim, int tile_width) {
-  patterns->push_back(
-      MakeMappedTilePatternImpl({width_dim}, {tile_width}));
+  patterns->push_back(MakeMappedTilePatternImpl({width_dim}, {tile_width}));
 }
 
 void AppendRank2Pattern(std::vector<TrailingTilePattern> *patterns,
                         int height_dim, int width_dim, int tile_height,
                         int tile_width) {
-  patterns->push_back(MakeMappedTilePatternImpl(
-      {height_dim, width_dim}, {tile_height, tile_width}));
+  patterns->push_back(MakeMappedTilePatternImpl({height_dim, width_dim},
+                                                {tile_height, tile_width}));
 }
 
 bool TileChunkRsramAligned(const Buffer &buffer,
@@ -197,9 +196,9 @@ GetTilesExecutionEnvelope(const Buffer &buffer,
   std::vector<ContiguousStep> steps = ComputeContiguousTileSteps(layout);
 
   if (auto block = sunmmio::GetZZBlockShape(layout)) {
-    bool uses_canonical_trailing_dims = width_dim == buffer_rank - 1 &&
-                                        (exec_rank == 1 ||
-                                         height_dim == buffer_rank - 2);
+    bool uses_canonical_trailing_dims =
+        width_dim == buffer_rank - 1 &&
+        (exec_rank == 1 || height_dim == buffer_rank - 2);
     if (!uses_canonical_trailing_dims) {
       return std::nullopt;
     }
@@ -265,12 +264,10 @@ std::vector<int> EnumeratePositiveDivisors(int extent) {
   return divisors;
 }
 
-std::vector<TrailingTilePattern>
-EnumerateLayoutBoundedPatterns(const Buffer &buffer, int exec_rank,
-                               const std::vector<int> &execution_dims,
-                               const SunmmioTileProcessorConfig &config,
-                               const TrailingTileEnvelope &envelope,
-                               AlignmentMode alignment_mode) {
+std::vector<TrailingTilePattern> EnumerateLayoutBoundedPatterns(
+    const Buffer &buffer, int exec_rank, const std::vector<int> &execution_dims,
+    const SunmmioTileProcessorConfig &config,
+    const TrailingTileEnvelope &envelope, AlignmentMode alignment_mode) {
   std::vector<TrailingTilePattern> patterns;
   std::unordered_set<int> emitted_rank1;
   std::unordered_set<std::pair<int, int>, IntPairHash> emitted_rank2;
@@ -474,11 +471,11 @@ std::vector<TrailingTilePattern> EnumerateInferredTilePatterns(
 
   if (options.extent_policy == TileExtentPolicy::kTilesExecutionLayoutBounded ||
       options.extent_policy == TileExtentPolicy::kReductionLayoutBounded) {
-    if (auto envelope = GetTilesExecutionEnvelope(buffer, execution_dims,
-                                                  layout_map)) {
-      return EnumerateLayoutBoundedPatterns(
-          buffer, exec_rank, execution_dims, config, *envelope,
-          options.alignment_mode);
+    if (auto envelope =
+            GetTilesExecutionEnvelope(buffer, execution_dims, layout_map)) {
+      return EnumerateLayoutBoundedPatterns(buffer, exec_rank, execution_dims,
+                                            config, *envelope,
+                                            options.alignment_mode);
     }
   }
 

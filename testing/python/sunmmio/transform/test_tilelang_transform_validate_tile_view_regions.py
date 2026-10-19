@@ -652,9 +652,7 @@ def _make_comm_kernel(comm_case):
         mismatched_name = (
             None
             if comm_case == "allreduce_low_level_mixed_dtype_valid"
-            else comm_case.removeprefix("allreduce_low_level_").removesuffix(
-                "_dtype_mismatch"
-            )
+            else comm_case.removeprefix("allreduce_low_level_").removesuffix("_dtype_mismatch")
         )
         out_dtype = "float32"
         row_dtype = DTYPE if mismatched_name == "row_allgather" else out_dtype
@@ -724,26 +722,10 @@ def _make_comm_kernel(comm_case):
         "allreduce_low_level_integer_minmax",
     }:
         send_shape = (32, 32)
-        out_shape = (
-            (64, 16)
-            if comm_case == "allreduce_low_level_dst_shape_mismatch"
-            else send_shape
-        )
-        row_shape = (
-            (4, 16, 64)
-            if comm_case == "allreduce_low_level_row_allgather_shape_mismatch"
-            else (4, *send_shape)
-        )
-        col_shape = (
-            (4, 16, 64)
-            if comm_case == "allreduce_low_level_col_allgather_shape_mismatch"
-            else (4, *send_shape)
-        )
-        copy_shape = (
-            (64, 16)
-            if comm_case == "allreduce_low_level_dst_copy_shape_mismatch"
-            else send_shape
-        )
+        out_shape = (64, 16) if comm_case == "allreduce_low_level_dst_shape_mismatch" else send_shape
+        row_shape = (4, 16, 64) if comm_case == "allreduce_low_level_row_allgather_shape_mismatch" else (4, *send_shape)
+        col_shape = (4, 16, 64) if comm_case == "allreduce_low_level_col_allgather_shape_mismatch" else (4, *send_shape)
+        copy_shape = (64, 16) if comm_case == "allreduce_low_level_dst_copy_shape_mismatch" else send_shape
         if comm_case in {
             "allreduce_low_level_row_allgather_shape_mismatch",
             "allreduce_low_level_unexpected_dst_copy",
@@ -1047,9 +1029,7 @@ def test_sunmmio_validate_tile_view_regions_rejects_comm_regions(comm_case, erro
         ("dst_copy", "dst"),
     ],
 )
-def test_sunmmio_validate_tile_view_regions_rejects_allreduce_dtype_mismatch(
-    buffer_name, expected_buffer
-):
+def test_sunmmio_validate_tile_view_regions_rejects_allreduce_dtype_mismatch(buffer_name, expected_buffer):
     comm_case = f"allreduce_low_level_{buffer_name}_dtype_mismatch"
     error_msg = rf"requires {buffer_name} dtype to match {expected_buffer} dtype"
     with pytest.raises(tvm.error.InternalError, match=error_msg):
@@ -1064,9 +1044,7 @@ def test_sunmmio_validate_tile_view_regions_rejects_allreduce_dtype_mismatch(
         ("dst_copy", "dst"),
     ],
 )
-def test_sunmmio_lower_tile_op_rejects_allreduce_dtype_mismatch(
-    buffer_name, expected_buffer
-):
+def test_sunmmio_lower_tile_op_rejects_allreduce_dtype_mismatch(buffer_name, expected_buffer):
     comm_case = f"allreduce_low_level_{buffer_name}_dtype_mismatch"
     error_msg = rf"requires {buffer_name} dtype to match {expected_buffer} dtype"
     with pytest.raises(tvm.error.InternalError, match=error_msg):
@@ -1104,12 +1082,8 @@ def test_sunmmio_lower_tile_op_rejects_allreduce_dtype_mismatch(
         ),
     ],
 )
-@pytest.mark.parametrize(
-    "runner", [_run_comm_validate_tile_view_regions, _run_comm_lower_tile_op]
-)
-def test_sunmmio_rejects_invalid_low_level_allreduce_contract(
-    comm_case, error_msg, runner
-):
+@pytest.mark.parametrize("runner", [_run_comm_validate_tile_view_regions, _run_comm_lower_tile_op])
+def test_sunmmio_rejects_invalid_low_level_allreduce_contract(comm_case, error_msg, runner):
     with pytest.raises(tvm.error.InternalError, match=error_msg):
         runner(comm_case)
 

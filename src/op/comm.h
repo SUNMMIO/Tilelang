@@ -190,11 +190,13 @@ TVM_DLL CommunicationDirections
 GetCommunicationSourceDirections(const Call &call, Target target);
 
 /** Validate the cross-layer shape, dtype, and temporary-buffer contract. */
-TVM_DLL void ValidateAllreduceContract(
-    const PrimExpr &src, const PrimExpr &dst, const PrimExpr &row_allgather,
-    const PrimExpr &col_allgather, const PrimExpr &dst_copy,
-    const StringImm &type, int direction, bool should_clear, Target target,
-    arith::Analyzer *analyzer);
+TVM_DLL void ValidateAllreduceContract(const PrimExpr &src, const PrimExpr &dst,
+                                       const PrimExpr &row_allgather,
+                                       const PrimExpr &col_allgather,
+                                       const PrimExpr &dst_copy,
+                                       const StringImm &type, int direction,
+                                       bool should_clear, Target target,
+                                       arith::Analyzer *analyzer);
 
 class AllreduceOpNode : public TileOperatorNode {
 public:

@@ -136,9 +136,9 @@ std::optional<int> GetDomainAxisAnnotation(const ForNode *loop) {
   return static_cast<int>(Downcast<Integer>((*axis_it).second)->value);
 }
 
-std::vector<const ForNode *> SelectDomainLoops(
-    const std::vector<const ForNode *> &chain, size_t domain_rank,
-    bool *uses_explicit_axes) {
+std::vector<const ForNode *>
+SelectDomainLoops(const std::vector<const ForNode *> &chain, size_t domain_rank,
+                  bool *uses_explicit_axes) {
   ICHECK(uses_explicit_axes);
   // A fused scope can contain an annotated reduction deeper in an otherwise
   // positional T.Tiles chain. Only the scope root selects explicit mapping;
@@ -2656,8 +2656,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         << "Scalar tile region expects a non-empty memtensor shape";
 
     const DataType dtype = CanonicalizeSuvmDType(buffer->dtype);
-    const int64_t align_elems = static_cast<int64_t>(
-        tl::GetSunmmioRsramAlignmentElems(
+    const int64_t align_elems =
+        static_cast<int64_t>(tl::GetSunmmioRsramAlignmentElems(
             tile_processor_config.rsram_align_bytes, dtype));
     ICHECK_GT(align_elems, 0)
         << "Scalar RSRAM access expects a positive alignment extent";
@@ -2697,8 +2697,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
          ++dim) {
       int levels = dim_levels[static_cast<size_t>(dim)];
       ICHECK_GT(levels, 0);
-      ICHECK_LE(mode_offset + static_cast<size_t>(levels),
-                layout_shape.size());
+      ICHECK_LE(mode_offset + static_cast<size_t>(levels), layout_shape.size());
 
       int64_t covered_extent = 1;
       for (int level = 0; level < levels; ++level) {
@@ -2773,11 +2772,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     if (access.tile_shape.empty()) {
       ICHECK(!memtensor_shape.empty())
           << "Tile region lowering expects at least one memtensor dimension";
-      int64_t carrier_dim = IsRsramScope(binding.buffer_type.memory_scope)
-                                ? find_scalar_aligned_carrier_dim(
-                                      access.buffer, binding.buffer_type)
-                                : static_cast<int64_t>(memtensor_shape.size()) -
-                                      1;
+      int64_t carrier_dim =
+          IsRsramScope(binding.buffer_type.memory_scope)
+              ? find_scalar_aligned_carrier_dim(access.buffer,
+                                                binding.buffer_type)
+              : static_cast<int64_t>(memtensor_shape.size()) - 1;
       access.tiled_dims.push_back(carrier_dim);
       access.tile_shape.push_back(1);
       access.tile_axes.push_back(0);
@@ -3774,8 +3773,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     }
     auto emit_binary = [&](BinaryOp op, const PrimExpr &lhs_expr,
                            const PrimExpr &rhs_expr, DataType dtype) {
-      bool is_bitwise = op == BinaryOp::kAnd || op == BinaryOp::kOr ||
-                        op == BinaryOp::kXor;
+      bool is_bitwise =
+          op == BinaryOp::kAnd || op == BinaryOp::kOr || op == BinaryOp::kXor;
       bool supports_mixed_precision = supports_mixed_precision_binary(op);
       std::optional<DataType> integer_preferred =
           canonical_integer_preferred_dtype(preferred_dtype);
@@ -3809,9 +3808,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                  value_dtype.bits() == 32 && value_dtype.lanes() == 1;
         };
         if (result_dtype.is_bool()) {
-          bool has_mask_operands =
-              IsTileLike(lhs) && IsTileLike(rhs) && lhs.dtype.is_bool() &&
-              rhs.dtype.is_bool();
+          bool has_mask_operands = IsTileLike(lhs) && IsTileLike(rhs) &&
+                                   lhs.dtype.is_bool() && rhs.dtype.is_bool();
           if (!has_mask_operands) {
             UnsupportedExpr(
                 expr.get(),
@@ -3862,10 +3860,9 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         lhs = cast_value_to_dtype(lhs, result_dtype);
         rhs = cast_value_to_dtype(rhs, result_dtype);
       }
-      ArithmeticFlavor flavor =
-          is_bitwise && result_dtype.is_bool()
-              ? ArithmeticFlavor::kBool
-              : arithmetic_flavor_for_dtype(result_dtype);
+      ArithmeticFlavor flavor = is_bitwise && result_dtype.is_bool()
+                                    ? ArithmeticFlavor::kBool
+                                    : arithmetic_flavor_for_dtype(result_dtype);
       // A4E supports i1 mask combiners only in their unmasked form. Tail
       // predicates remain on the surrounding tile load/store operations.
       return builder_->Binary(NewValueName(), op, flavor, lhs, rhs, tile_type,

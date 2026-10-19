@@ -86,8 +86,7 @@ void ValidateSunmmioReduceDType(const ReduceType &type, DataType src_dtype,
   if (type->isMin() || type->isMax() || type->isAbsMax()) {
     auto is_supported = [](DataType dtype) {
       return dtype.lanes() == 1 &&
-             (dtype.is_bfloat16() ||
-              (dtype.is_float() && dtype.bits() == 32));
+             (dtype.is_bfloat16() || (dtype.is_float() && dtype.bits() == 32));
     };
     ICHECK(is_supported(src_dtype) && is_supported(dst_dtype))
         << "Sunmmio min/max/absmax reduction requires scalar bfloat16 or "
@@ -314,8 +313,8 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
 
   ReduceTileViewPlan plan = PlanReduceTileViews(
       this->srcRegion_, this->dstRegion_, this->dim,
-      {opt_tv_src, opt_tv_dst, allow_tiled_reduction},
-      T.layout_map, GetSunmmioTileProcessorConfig(T.target), analyzer);
+      {opt_tv_src, opt_tv_dst, allow_tiled_reduction}, T.layout_map,
+      GetSunmmioTileProcessorConfig(T.target), analyzer);
 
   TileView tv_src = plan.src_tileview;
   TileView tv_dst = plan.dst_tileview;

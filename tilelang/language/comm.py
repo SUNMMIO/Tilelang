@@ -1110,16 +1110,14 @@ def all_reduce(
             f"but got {src_dtype} and {out_dtype}."
         )
     if reduce_type in ("min", "max", "absmax"):
+
         def is_supported_float(dtype):
             return dtype.lanes == 1 and (
                 (dtype.type_code == DataTypeCode.BFLOAT and dtype.bits == 16)
                 or (dtype.type_code == DataTypeCode.FLOAT and dtype.bits == 32)
             )
 
-        assert (
-            is_supported_float(src_dtype)
-            and is_supported_float(out_dtype)
-        ), (
+        assert is_supported_float(src_dtype) and is_supported_float(out_dtype), (
             "Sunmmio all_reduce min/max/absmax requires scalar bfloat16 or float32 "
             f"input and output dtypes, but got {src_dtype} and {out_dtype}."
         )

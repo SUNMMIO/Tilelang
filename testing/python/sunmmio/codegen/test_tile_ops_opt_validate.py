@@ -275,9 +275,7 @@ def tile_mask_bitwise_ops_test(m=32, n=32, dtype="float32"):
                 both = T.bitwise_and(greater, nonzero)
                 either = T.bitwise_or(both, equal)
                 selected = T.bitwise_xor(either, greater)
-                C_shared[i, j] = T.if_then_else(
-                    selected, A_shared[i, j], B_shared[i, j]
-                )
+                C_shared[i, j] = T.if_then_else(selected, A_shared[i, j], B_shared[i, j])
             T.copy(C_shared, C)
 
     return main
@@ -319,9 +317,7 @@ def test_tile_mask_bitwise_ops_lower_as_unmasked_i1(tmp_path, m, case_name):
     )
 
     bitwise_lines = [
-        line.strip()
-        for line in src.splitlines()
-        if any(op in line for op in ("suvm.tile.andi", "suvm.tile.ori", "suvm.tile.xori"))
+        line.strip() for line in src.splitlines() if any(op in line for op in ("suvm.tile.andi", "suvm.tile.ori", "suvm.tile.xori"))
     ]
     assert len(bitwise_lines) == 3
     assert all("xi1>" in line for line in bitwise_lines)

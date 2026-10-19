@@ -592,9 +592,7 @@ def test_tilelang_reduce_sunmmio_tiled_axis_tail_uses_if_then_else_mask():
 )
 def test_tilelang_reduce_sunmmio_tiled_axis_tail_uses_predicated_update(reduce_op):
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    mod = reduce_kernel_with_tileview_builder(
-        (8, 63, 250), reduce_axis=2, dtype="float32", reduce_op=reduce_op
-    )
+    mod = reduce_kernel_with_tileview_builder((8, 63, 250), reduce_axis=2, dtype="float32", reduce_op=reduce_op)
 
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)

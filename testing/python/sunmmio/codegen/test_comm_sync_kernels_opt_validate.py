@@ -1,5 +1,4 @@
 import os
-import re
 
 import pytest
 import tilelang
@@ -207,9 +206,7 @@ def comm_all_reduce_shape_kernel(
             reduced = T.alloc_shared(shape, dtype, scope="shared.rsram")
             if not clear:
                 T.fill(reduced, 0)
-            T.comm.all_reduce(
-                reduce_src, reduced, reduce_type, direction, clear=clear
-            )
+            T.comm.all_reduce(reduce_src, reduced, reduce_type, direction, clear=clear)
 
     return main
 
@@ -335,37 +332,18 @@ def _assert_allreduce_link_sync_order(src, direction):
     cursor = -1
 
     for dma_unit, link_unit in phases:
-        mcast_indices = [
-            i
-            for i, line in enumerate(lines)
-            if "suvm.mcast_async" in line and f"<unit = {dma_unit}>" in line
-        ]
-        sync_indices = [
-            i
-            for i, line in enumerate(lines)
-            if "suvm.sync" in line and link_unit in line
-        ]
-        consumer_index = next(
-            i
-            for i, line in enumerate(lines)
-            if i > cursor and "suvm.tile.addf" in line
-        )
+        mcast_indices = [i for i, line in enumerate(lines) if "suvm.mcast_async" in line and f"<unit = {dma_unit}>" in line]
+        sync_indices = [i for i, line in enumerate(lines) if "suvm.sync" in line and link_unit in line]
+        consumer_index = next(i for i, line in enumerate(lines) if i > cursor and "suvm.tile.addf" in line)
         phase_mcasts = [i for i in mcast_indices if cursor < i < consumer_index]
         phase_syncs = [i for i in sync_indices if cursor < i < consumer_index]
         assert phase_mcasts
         assert phase_syncs
-        assert all(
-            any(mcast_index < sync_index < consumer_index for sync_index in phase_syncs)
-            for mcast_index in phase_mcasts
-        )
+        assert all(any(mcast_index < sync_index < consumer_index for sync_index in phase_syncs) for mcast_index in phase_mcasts)
         cursor = consumer_index
 
     expected_links = {link_unit for _, link_unit in phases}
-    link_sync_lines = [
-        line
-        for line in lines
-        if "suvm.sync" in line and any(link in line for link in ("hlink", "vlink"))
-    ]
+    link_sync_lines = [line for line in lines if "suvm.sync" in line and any(link in line for link in ("hlink", "vlink"))]
     assert len(link_sync_lines) >= len(phases)
     assert all(any(link in line for link in expected_links) for line in link_sync_lines)
 
@@ -634,9 +612,7 @@ def test_comm_all_reduce_bf16_to_fp32_codegen_validates_with_npuir_opt(
         pytest.param((1, 32, 1, 32), "4x32", id="multiple-unit"),
     ],
 )
-def test_comm_all_reduce_unit_dims_emit_one_legal_multicast(
-    shape, expected_reduce_tile, tmp_path
-):
+def test_comm_all_reduce_unit_dims_emit_one_legal_multicast(shape, expected_reduce_tile, tmp_path):
     src = _validate_kernel(
         comm_all_reduce_shape_kernel(shape),
         tmp_path,
@@ -662,16 +638,11 @@ def test_comm_all_reduce_unit_dims_emit_one_legal_multicast(
     ],
 )
 @pytest.mark.parametrize("clear", [True, False], ids=["clear", "accumulate"])
-def test_comm_all_reduce_all_direction_unit_dims_validate_with_npuir_opt(
-    shape, clear, tmp_path
-):
+def test_comm_all_reduce_all_direction_unit_dims_validate_with_npuir_opt(shape, clear, tmp_path):
     src = _validate_kernel(
         comm_all_reduce_shape_kernel(shape, direction="all", clear=clear),
         tmp_path,
-        mlir_filename=(
-            f"comm_all_reduce_all_unit_dims_{'_'.join(map(str, shape))}_"
-            f"clear_{clear}_suvm.mlir"
-        ),
+        mlir_filename=(f"comm_all_reduce_all_unit_dims_{'_'.join(map(str, shape))}_clear_{clear}_suvm.mlir"),
         expected_tokens=("suvm.mcast_async", "suvm.sync", "suvm.tile.addf"),
         opt_args=STRICT_OPT_ARGS,
     )
@@ -704,9 +675,7 @@ def test_comm_all_reduce_minimum_1024_byte_leaf_is_statically_expanded(tmp_path)
     ],
 )
 @pytest.mark.parametrize("dtype", ["int32", "uint32"])
-def test_comm_all_reduce_rank3_bitwise_codegen_validates_with_npuir_opt(
-    dtype, reduce_type, tile_op, tmp_path
-):
+def test_comm_all_reduce_rank3_bitwise_codegen_validates_with_npuir_opt(dtype, reduce_type, tile_op, tmp_path):
     src = _validate_kernel(
         comm_all_reduce_rank3_kernel(dtype=dtype, reduce_type=reduce_type),
         tmp_path,
@@ -728,13 +697,9 @@ def test_comm_all_reduce_rank3_bitwise_codegen_validates_with_npuir_opt(
     ],
 )
 @pytest.mark.parametrize("dtype", ["int32", "uint32"])
-def test_comm_all_reduce_rank1_bitwise_codegen_validates_with_npuir_opt(
-    dtype, reduce_type, tile_op, tmp_path
-):
+def test_comm_all_reduce_rank1_bitwise_codegen_validates_with_npuir_opt(dtype, reduce_type, tile_op, tmp_path):
     src = _validate_kernel(
-        comm_all_reduce_shape_kernel(
-            (256,), dtype=dtype, reduce_type=reduce_type
-        ),
+        comm_all_reduce_shape_kernel((256,), dtype=dtype, reduce_type=reduce_type),
         tmp_path,
         mlir_filename=f"comm_all_reduce_rank1_{dtype}_{reduce_type}_suvm.mlir",
         expected_tokens=("suvm.mcast_async", tile_op),

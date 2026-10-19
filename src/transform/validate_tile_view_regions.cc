@@ -260,8 +260,7 @@ private:
     ICHECK_EQ(call->args.size(), needs_dst_copy ? 9U : 8U)
         << "T.comm.all_reduce dst_copy must be provided only for direction=all "
            "with clear=false";
-    PrimExpr dst_copy =
-        call->args.size() == 9 ? call->args[7] : PrimExpr();
+    PrimExpr dst_copy = call->args.size() == 9 ? call->args[7] : PrimExpr();
     ValidateAllreduceContract(
         call->args[0], call->args[1], call->args[2], call->args[3], dst_copy,
         Downcast<StringImm>(call->args[4]), static_cast<int>(direction),

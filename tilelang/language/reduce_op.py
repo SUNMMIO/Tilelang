@@ -30,8 +30,7 @@ def _legalize_dim(buffer: BufferLikeType, dim: int):
 
 def _is_sunmmio_a4e_float_dtype(dtype) -> bool:
     return dtype.lanes == 1 and (
-        (dtype.type_code == DataTypeCode.BFLOAT and dtype.bits == 16)
-        or (dtype.type_code == DataTypeCode.FLOAT and dtype.bits == 32)
+        (dtype.type_code == DataTypeCode.BFLOAT and dtype.bits == 16) or (dtype.type_code == DataTypeCode.FLOAT and dtype.bits == 32)
     )
 
 
@@ -91,14 +90,13 @@ def reduce(buffer: BufferLikeType, out: BufferLikeType, reduce_type: ReduceKind,
         )
         is_sunmmio_target = target is not None and target_is_sunmmio(target)
         if is_sunmmio_target or is_sunmmio_scope:
-            if reduce_type in ("min", "max", "absmax"):
-                if not _is_sunmmio_a4e_float_dtype(
-                    src_dtype
-                ) or not _is_sunmmio_a4e_float_dtype(dst_dtype):
-                    raise TypeError(
-                        "Sunmmio min/max/absmax reduction requires scalar bfloat16 or float32 "
-                        f"input and output dtypes, but got {src_dtype} and {dst_dtype}."
-                    )
+            if reduce_type in ("min", "max", "absmax") and (
+                not _is_sunmmio_a4e_float_dtype(src_dtype) or not _is_sunmmio_a4e_float_dtype(dst_dtype)
+            ):
+                raise TypeError(
+                    "Sunmmio min/max/absmax reduction requires scalar bfloat16 or float32 "
+                    f"input and output dtypes, but got {src_dtype} and {dst_dtype}."
+                )
             if len(buffer_shape) == 2 and dim == 1 and len(out_shape) == 2:
                 warnings.warn(
                     "Sunmmio 2D reduction with a trailing unit-dimension output (N, 1) "

@@ -170,8 +170,7 @@ bool IsLegalProjectedDstTileView(const BufferRegion &dst_region,
   int dst_rank = static_cast<int>(dst_region->region.size());
   std::vector<int> execution_dims =
       GetEffectiveExecutionDims(dst_region, analyzer);
-  for (const TrailingTilePattern &pattern :
-       EnumerateInferredTilePatterns(
+  for (const TrailingTilePattern &pattern : EnumerateInferredTilePatterns(
            dst_region->buffer, execution_dims, layout_map, config, analyzer,
            {TileExtentPolicy::kReductionLayoutBounded,
             AlignmentMode::kRelaxed})) {
@@ -280,8 +279,7 @@ std::vector<ReduceTileCandidate> EnumerateInferredCandidates(
   TileExtentPolicy extent_policy = TileExtentPolicy::kReductionLayoutBounded;
   int src_capacity_elems = GetCapacityElems(src_region->buffer, config);
   int dst_capacity_elems = GetCapacityElems(dst_region->buffer, config);
-  for (const TrailingTilePattern &pattern :
-       EnumerateInferredTilePatterns(
+  for (const TrailingTilePattern &pattern : EnumerateInferredTilePatterns(
            src_region->buffer, execution_dims, layout_map, config, analyzer,
            {extent_policy, AlignmentMode::kStrict})) {
     bool aligned = true;
