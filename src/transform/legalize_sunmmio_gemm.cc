@@ -954,15 +954,10 @@ private:
   }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
-    Stmt visited = StmtExprMutator::VisitStmt_(op);
-    if (!visited->IsInstance<SeqStmtNode>())
-      return visited;
-    SeqStmt seq = Downcast<SeqStmt>(visited);
-
     Array<Stmt> rewritten;
-    rewritten.reserve(seq->seq.size());
-    for (size_t i = 0; i < seq->seq.size(); ++i) {
-      const Stmt &s = seq->seq[i];
+    rewritten.reserve(op->seq.size());
+    for (size_t i = 0; i < op->seq.size(); ++i) {
+      const Stmt &s = op->seq[i];
       const CallNode *call = AsEvaluatedCall(s);
 
       // Gemm site: replace the gemm with its two-pass expansion.
@@ -975,7 +970,7 @@ private:
             // group gemm; the other group gemms are consecutive and are
             // skipped (consumed into the block).
             if (call == entry.group_gemms.front()) {
-              EmitGroupExpansion(entry, seq->seq, i, &rewritten);
+              EmitGroupExpansion(entry, op->seq, i, &rewritten);
             }
           } else {
             EmitGemmExpansion(entry, s, &rewritten);
@@ -997,9 +992,37 @@ private:
         }
       }
 
-      rewritten.push_back(s);
+      rewritten.push_back(StmtExprMutator::VisitStmt(s));
     }
     return SeqStmt::Flatten(rewritten);
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    if (!call)
+      return StmtExprMutator::VisitStmt_(op);
+
+    auto gemm_it = gemm_plans_.find(call);
+    if (gemm_it != gemm_plans_.end()) {
+      const Action &entry = *gemm_it->second;
+      ICHECK(entry.kind != ActionKind::InPlaceGroup)
+          << "Grouped GEMMs must be direct children of a SeqStmt";
+      Array<Stmt> rewritten;
+      EmitGemmExpansion(entry, tvm::ffi::GetRef<Stmt>(op), &rewritten);
+      return SeqStmt::Flatten(rewritten);
+    }
+
+    auto writer_it = writer_plans_.find(call);
+    if (writer_it != writer_plans_.end()) {
+      if (writer_it->second->kind == ActionKind::ReissueFromShadow) {
+        Array<Stmt> rewritten;
+        EmitSnapshotCopy(*writer_it->second, &rewritten);
+        return SeqStmt::Flatten(rewritten);
+      }
+      return Evaluate(0);
+    }
+
+    return StmtExprMutator::VisitStmt_(op);
   }
 
   // Expand a planned gemm into the two-pass form the bf16 TC requires.

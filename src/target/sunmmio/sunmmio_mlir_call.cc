@@ -161,10 +161,15 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
 
   shape.reserve(extents.size());
   bool preserve_exact_rank = preserve_region_rank && extents.size() <= 3;
+  bool collapse_single_matrix_view = preserve_exact_rank &&
+                                     extents.size() == 3 && extents[0] == 1 &&
+                                     memtensor_ty.getShape()[0] != 1;
   for (int64_t i = 0; i < static_cast<int64_t>(extents.size()); ++i) {
-    if (preserve_exact_rank || extents[i] != 1) {
+    bool preserve_dim =
+        preserve_exact_rank && !(collapse_single_matrix_view && i == 0);
+    if (preserve_dim || extents[i] != 1) {
       int64_t view_extent = extents[i];
-      if (preserve_exact_rank && extents[i] == memtensor_ty.getShape()[i]) {
+      if (preserve_dim && extents[i] == memtensor_ty.getShape()[i]) {
         // tc.mma must cover every tiled layout dimension completely.  Keep
         // the logical memtensor shape for user-visible copies, but expose its
         // already-allocated padded carrier to MMA (for example M=16 in a

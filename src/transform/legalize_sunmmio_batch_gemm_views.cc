@@ -33,6 +33,12 @@ bool NeedsCompactBatchView(const BufferRegion &region,
   if (region->region.size() != 3)
     return false;
   const Range &batch = region->region[0];
+  bool is_single_matrix_view =
+      analyzer->CanProveEqual(batch->extent, 1) &&
+      (!analyzer->CanProveEqual(batch->min, make_zero(batch->min.dtype())) ||
+       !analyzer->CanProveEqual(batch->extent, region->buffer->shape[0]));
+  if (is_single_matrix_view)
+    return false;
   return !analyzer->CanProveEqual(batch->min, make_zero(batch->min.dtype())) ||
          !analyzer->CanProveEqual(batch->extent, region->buffer->shape[0]);
 }
