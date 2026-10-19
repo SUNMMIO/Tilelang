@@ -5,7 +5,12 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.layout import make_mxznz_layout, make_mxzz_layout, make_zz_layout
+from tilelang.layout import (
+    make_mxznz_layout,
+    make_mxzz_layout,
+    make_row_major,
+    make_zz_layout,
+)
 
 from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import (
@@ -77,6 +82,40 @@ def simple_dynamic_accumulate_gemm_kernel(
             for ko in T.serial(2):
                 T.gemm(A_shared, B_shared, C_shared, clear_accum=ko == 0)
             T.copy(C_shared, C[0, 0])
+
+    return main
+
+
+@target("Sunmmio")
+def dynamic_single_matrix_view_gemm_kernel():
+    batch = 4
+    shape = (batch, 32, 32)
+    placement = T.placement.replicated()
+    input_layout = make_zz_layout(shape, [1, 2], (32, 32))
+    output_layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(shape, placement, "bfloat16", layout=input_layout),  # type: ignore
+        B: T.MeshTensor(shape, placement, "bfloat16", layout=input_layout),  # type: ignore
+        C: T.MeshTensor(  # type: ignore
+            (32, 32), placement, "float32", layout=output_layout
+        ),
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared(shape, "bfloat16")
+            B_shared = T.alloc_shared(shape, "bfloat16")
+            C_shared = T.alloc_shared((32, 32), "float32")
+            T.copy(A, A_shared)
+            T.copy(B, B_shared)
+            for i in T.serial(batch):
+                T.gemm(
+                    A_shared[i, :, :],
+                    B_shared[i, :, :],
+                    C_shared,
+                    clear_accum=True,
+                )
+            T.copy(C_shared, C)
 
     return main
 
@@ -256,6 +295,70 @@ def partial_batch_gemm_kernel(
     return main
 
 
+@target("Sunmmio")
+def partial_row_major_to_zz_gemm_kernel():
+    parent_batch = 4
+    batch = 2
+    M = N = K = 64
+    A_shape = (parent_batch, M, K)
+    B_shape = (batch, K, N)
+    C_shape = (batch, M, N)
+    placement = T.placement.replicated()
+    A_layout = make_row_major(A_shape)
+    B_layout = make_zz_layout(B_shape, [1, 2], (32, 32))
+    C_layout = make_zz_layout(C_shape, [1, 2], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(A_shape, placement, "bfloat16", layout=A_layout),  # type: ignore
+        B: T.MeshTensor(B_shape, placement, "bfloat16", layout=B_layout),  # type: ignore
+        C: T.MeshTensor(C_shape, placement, "float32", layout=C_layout),  # type: ignore
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared((batch, M, K), "bfloat16")
+            B_shared = T.alloc_shared(B_shape, "bfloat16")
+            C_shared = T.alloc_shared(C_shape, "float32")
+            T.copy(A[1:3, :, :], A_shared)
+            T.copy(B[0, 0, 0], B_shared)
+            T.gemm(A_shared, B_shared, C_shared, clear_accum=True)
+            T.copy(C_shared, C[0, 0, 0])
+
+    return main
+
+
+@target("Sunmmio")
+def full_partial_reuse_gemm_kernel():
+    batch = 4
+    size = 32
+    shape = (batch, size, size)
+    placement = T.placement.replicated()
+    input_layout = make_zz_layout(shape, [1, 2], (32, 32))
+    output_layout = make_zz_layout(shape, [1, 2], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(shape, placement, "bfloat16", layout=input_layout),  # type: ignore
+        B: T.MeshTensor(shape, placement, "bfloat16", layout=input_layout),  # type: ignore
+        C: T.MeshTensor(shape, placement, "float32", layout=output_layout),  # type: ignore
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared(shape, "bfloat16")
+            B_shared = T.alloc_shared(shape, "bfloat16")
+            C_shared = T.alloc_shared(shape, "float32")
+            T.copy(A, A_shared)
+            T.copy(B, B_shared)
+            T.gemm(A_shared, B_shared, C_shared, clear_accum=True)
+            T.gemm(
+                A_shared[1:3, :, :],
+                B_shared[1:3, :, :],
+                C_shared[1:3, :, :],
+                clear_accum=True,
+            )
+            T.copy(C_shared, C)
+
+    return main
+
+
 def test_simple_global_copy_gemm_codegen_validates_with_npuir_opt(tmp_path):
     src = validate_sunmmio_codegen_with_npuir_opt(
         simple_global_copy_gemm_kernel(),
@@ -305,6 +408,36 @@ def test_simple_dynamic_accumulate_gemm_codegen_validates_with_npuir_opt(tmp_pat
 
     assert "arith.cmpi ne" in src
     assert src.count("acc = %") == src.count("suvm.tc.mma")
+
+
+def test_dynamic_single_matrix_views_compile_with_npuir(tmp_path):
+    mlir_path = tmp_path / "dynamic_single_matrix_views.mlir"
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        dynamic_single_matrix_view_gemm_kernel(),
+        tmp_path,
+        mlir_filename=mlir_path.name,
+        expected_tokens=("suvm.tc.mma",),
+        opt_args=LOOSE_OPT_ARGS,
+    )
+
+    assert "!suvm.tile_view<32x32xbf16>" in src
+    assert "!suvm.tile_view<1x32x32xbf16>" not in src
+    assert src.count("suvm.tc.mma") == 2
+    llvm_path = tmp_path / "dynamic_single_matrix_views.ll"
+    result = subprocess.run(
+        [
+            str(find_npuir_tool("npuir-compile")),
+            "--target=sunmmio-a4e",
+            "--emit=llvm-ir",
+            "-o",
+            str(llvm_path),
+            str(mlir_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("version", [1, 2])
@@ -602,6 +735,62 @@ def test_partial_batch_gemm_uses_compact_physical_allocation(tmp_path, version, 
     llvm_ir = llvm_path.read_text(encoding="utf-8")
     c_stride = 4096 if output_batched else 0
     assert f"call void @su_tc_bmm_init(i64 0, i64 2048, i64 2048, i64 {c_stride}, i64 {c_stride})" in llvm_ir
+
+
+def test_partial_row_major_copy_keeps_layout_transform(tmp_path):
+    mlir_path = tmp_path / "partial_row_major_to_zz.mlir"
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        partial_row_major_to_zz_gemm_kernel(),
+        tmp_path,
+        mlir_filename=mlir_path.name,
+        expected_tokens=("suvm.transform_layout_async", "suvm.tc.mma"),
+        opt_args=LOOSE_OPT_ARGS,
+    )
+
+    assert "suvm.transform_layout_async" in src
+    llvm_path = tmp_path / "partial_row_major_to_zz.ll"
+    result = subprocess.run(
+        [
+            str(find_npuir_tool("npuir-compile")),
+            "--target=sunmmio-a4e",
+            "--emit=llvm-ir",
+            "-o",
+            str(llvm_path),
+            str(mlir_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_full_partial_reuse_compiles_with_npuir(tmp_path):
+    mlir_path = tmp_path / "full_partial_reuse.mlir"
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        full_partial_reuse_gemm_kernel(),
+        tmp_path,
+        mlir_filename=mlir_path.name,
+        expected_tokens=("suvm.tc.mma",),
+        opt_args=LOOSE_OPT_ARGS,
+    )
+
+    assert src.count("suvm.tc.mma") == 4
+    llvm_path = tmp_path / "full_partial_reuse.ll"
+    result = subprocess.run(
+        [
+            str(find_npuir_tool("npuir-compile")),
+            "--target=sunmmio-a4e",
+            "--emit=llvm-ir",
+            "-o",
+            str(llvm_path),
+            str(mlir_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.parametrize("version", [1, 2])

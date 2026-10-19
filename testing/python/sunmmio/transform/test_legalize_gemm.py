@@ -315,7 +315,7 @@ def test_legalize_sunmmio_gemm_preserves_unsupported_b_broadcast():
     )
     broadcasts = find_call_args(mod, "tl.tileop.comm_broadcast")
     assert len(broadcasts) == 1
-    assert int(broadcasts[0][0][3]) == 512
+    assert int(broadcasts[0][0][2]) == 512
     assert count_call_op(mod, "tl.tileop.comm_allgather") == 1
     assert count_call_op(mod, "tl.tileop.gemm_py") == 2
     tl.transform.LowerTileOp()(mod)

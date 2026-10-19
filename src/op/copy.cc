@@ -928,37 +928,44 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   PrimExpr src_region = MakeRegionExpr(src, src_range, /*access_mask=*/1);
   PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
   PrimExpr src_offset = IntImm(DataType::Int(32), GetSrcOffsetByte());
-  auto dma = [&](PrimExpr a, PrimExpr b) {
+  auto emit_dma = [&](PrimExpr a, PrimExpr b) {
     return Evaluate(Call(DataType::Handle(), dma_copy(), {a, b, src_offset}));
   };
+  auto dma = [&](PrimExpr a, PrimExpr b) -> Stmt {
+    BufferRegion src_view = NormalizeToBufferRegion(a);
+    BufferRegion dst_view = NormalizeToBufferRegion(b);
 
-  // A rank-3 tile-view index is measured in units of that view's extent. A
-  // sub-batch [1:3] therefore cannot be represented as index=1, extent=2
-  // (that would address [2:4]). Split unaligned leading views into fixed
-  // matrix planes, for which extent=1 preserves the exact batch index.
-  if (src_range.size() == 3 && dst_range.size() == 3 &&
-      !analyzer->CanProveEqual(src_range[0]->extent, 1) &&
-      (!analyzer->CanProve(FloorMod(src_range[0]->min, src_range[0]->extent) ==
-                           0) ||
-       !analyzer->CanProve(FloorMod(dst_range[0]->min, dst_range[0]->extent) ==
-                           0))) {
-    const auto *src_batch = src_range[0]->extent.as<IntImmNode>();
-    const auto *dst_batch = dst_range[0]->extent.as<IntImmNode>();
-    ICHECK(src_batch && dst_batch && src_batch->value == dst_batch->value)
-        << "Sunmmio sub-batch copy requires equal static batch extents";
-    Array<Stmt> slices;
-    for (int64_t batch = 0; batch < src_batch->value; ++batch) {
-      Array<Range> src_slice = src_range;
-      Array<Range> dst_slice = dst_range;
-      src_slice.Set(0, Range::FromMinExtent(src_range[0]->min + Integer(batch),
-                                            Integer(1)));
-      dst_slice.Set(0, Range::FromMinExtent(dst_range[0]->min + Integer(batch),
-                                            Integer(1)));
-      slices.push_back(dma(MakeRegionExpr(src, src_slice, /*read=*/1),
-                           MakeRegionExpr(dst, dst_slice, /*write=*/2)));
+    // A rank-3 tile-view index is measured in units of that view's extent. A
+    // sub-batch [1:3] therefore cannot be represented as index=1, extent=2
+    // (that would address [2:4]). Split unaligned leading views into fixed
+    // matrix planes, for which extent=1 preserves the exact batch index.
+    if (src_view->region.size() == 3 && dst_view->region.size() == 3 &&
+        !analyzer->CanProveEqual(src_view->region[0]->extent, 1) &&
+        (!analyzer->CanProve(FloorMod(src_view->region[0]->min,
+                                      src_view->region[0]->extent) == 0) ||
+         !analyzer->CanProve(FloorMod(dst_view->region[0]->min,
+                                      dst_view->region[0]->extent) == 0))) {
+      const auto *src_batch = src_view->region[0]->extent.as<IntImmNode>();
+      const auto *dst_batch = dst_view->region[0]->extent.as<IntImmNode>();
+      ICHECK(src_batch && dst_batch && src_batch->value == dst_batch->value)
+          << "Sunmmio sub-batch copy requires equal static batch extents";
+      Array<Stmt> slices;
+      slices.reserve(src_batch->value);
+      for (int64_t batch = 0; batch < src_batch->value; ++batch) {
+        Array<Range> src_slice = src_view->region;
+        Array<Range> dst_slice = dst_view->region;
+        src_slice.Set(
+            0, Range::FromMinExtent(src_slice[0]->min + Integer(batch), 1));
+        dst_slice.Set(
+            0, Range::FromMinExtent(dst_slice[0]->min + Integer(batch), 1));
+        slices.push_back(
+            emit_dma(MakeRegionExpr(src_view->buffer, src_slice, /*read=*/1),
+                     MakeRegionExpr(dst_view->buffer, dst_slice, /*write=*/2)));
+      }
+      return SeqStmt::Flatten(slices);
     }
-    return SeqStmt::Flatten(slices);
-  }
+    return emit_dma(a, b);
+  };
   auto layout_of = [&](const Buffer &b) {
     const LayoutMap &m =
         b.scope() == "global" ? T.global_layout_map : T.layout_map;

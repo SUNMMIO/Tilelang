@@ -24,8 +24,19 @@ using namespace tir;
 
 namespace {
 
+bool IsPartialSingletonMatrixView(const BufferRegion &region) {
+  if (region->region.size() != 3 || !is_one(region->region[0]->extent))
+    return false;
+  arith::Analyzer analyzer;
+  const Range &batch = region->region[0];
+  return !analyzer.CanProveEqual(batch->min, make_zero(batch->min.dtype())) ||
+         !analyzer.CanProveEqual(batch->extent, region->buffer->shape[0]);
+}
+
 bool HasBatchedGemmSemantics(const BufferRegion &region, bool is_output) {
   if (region->region.size() != 3)
+    return false;
+  if (IsPartialSingletonMatrixView(region))
     return false;
   return is_output || !is_one(region->region[0]->extent);
 }
@@ -58,9 +69,12 @@ void ValidateSunmmioBatchRegion(const BufferRegion &region,
 void ValidateBatchGemmTarget(const Target &target, const BufferRegion &a,
                              const BufferRegion &b, const BufferRegion &c) {
   if (TargetIsSunmmio(target)) {
-    ValidateSunmmioBatchRegion(a, "A");
-    ValidateSunmmioBatchRegion(b, "B");
-    ValidateSunmmioBatchRegion(c, "C");
+    if (HasBatchedGemmSemantics(a, /*is_output=*/false))
+      ValidateSunmmioBatchRegion(a, "A");
+    if (HasBatchedGemmSemantics(b, /*is_output=*/false))
+      ValidateSunmmioBatchRegion(b, "B");
+    if (HasBatchedGemmSemantics(c, /*is_output=*/true))
+      ValidateSunmmioBatchRegion(c, "C");
     return;
   }
   ICHECK(!HasBatchedGemmSemantics(a, /*is_output=*/false) &&

@@ -128,14 +128,28 @@ class GemmPy(Node, Scriptable):
         return impl_class(self).lower(layout_map, target, thread_bounds, thread_var)
 
     def _validate_batch_target(self, target: Target) -> None:
+        analyzer = tvm.arith.Analyzer()
+
+        def has_batch_semantics(region, *, is_output: bool) -> bool:
+            if len(region.region) != 3:
+                return False
+            batch = region.region[0]
+            is_single_matrix_view = (
+                isinstance(batch.extent, tir.IntImm)
+                and int(batch.extent) == 1
+                and (not analyzer.can_prove(batch.min == 0) or not analyzer.can_prove(batch.extent == region.buffer.shape[0]))
+            )
+            if is_single_matrix_view:
+                return False
+            return is_output or not (isinstance(batch.extent, tir.IntImm) and int(batch.extent) == 1)
+
         if target_is_sunmmio(target):
-            analyzer = tvm.arith.Analyzer()
-            for operand, region in (
-                ("A", self.aRegion),
-                ("B", self.bRegion),
-                ("C", self.cRegion),
+            for operand, region, is_output in (
+                ("A", self.aRegion, False),
+                ("B", self.bRegion, False),
+                ("C", self.cRegion, True),
             ):
-                if len(region.region) != 3:
+                if not has_batch_semantics(region, is_output=is_output):
                     continue
                 batch = region.region[0]
                 extent = batch.extent
@@ -151,12 +165,6 @@ class GemmPy(Node, Scriptable):
                         f"for buffer shape {region.buffer.shape}"
                     )
             return
-
-        def has_batch_semantics(region, *, is_output: bool) -> bool:
-            if len(region.region) != 3:
-                return False
-            extent = region.region[0].extent
-            return is_output or not (isinstance(extent, tir.IntImm) and int(extent) == 1)
 
         if (
             has_batch_semantics(self.aRegion, is_output=False)

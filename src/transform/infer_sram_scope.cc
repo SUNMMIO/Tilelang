@@ -93,6 +93,7 @@ public:
     substituter.phase_ = Phase::kCollectInfo;
     fptr->body = substituter.VisitStmt(f->body);
 
+    substituter.PinCopySourcesToRsram();
     substituter.InferUnspecifiedBuffer();
 
     // Phase 2 inserts GEMM-local compact copies on the original IR. This must
@@ -131,6 +132,11 @@ private:
     }
 
   private:
+    void VisitStmt_(const BlockRealizeNode *) final {
+      // Nested blocks own their allocations. Their uses are collected when
+      // RewriteBlockBuffers processes that block directly.
+    }
+
     void VisitStmt_(const BufferStoreNode *op) final {
       used_buffer_vars_.insert(op->buffer->data.get());
       StmtExprVisitor::VisitStmt_(op);
@@ -581,6 +587,10 @@ private:
           buffer_source_map_[copy->dst] =
               BufferSourceInfo{copy->src, copy->src_range, copy->dst_range};
         }
+        if (copy->src.defined() && (copy->src.scope() == "shared" ||
+                                    copy->src.scope() == "shared.dyn")) {
+          copy_source_buffers_.insert(copy->src);
+        }
         return tvm::ffi::GetRef<Call>(op);
       }
     }
@@ -616,6 +626,21 @@ private:
                   buffer->offset_factor, buffer->buffer_type);
   }
 
+  void PinCopySourcesToRsram() {
+    for (const Buffer &buffer : copy_source_buffers_) {
+      const auto *ptr_type =
+          TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
+      Type new_type = PointerType(ptr_type->element_type, kSunmmioScopeRSRAM);
+      Var new_var(buffer->data->name_hint, new_type);
+      var_remap_.Set(buffer->data, new_var);
+      buffer_remap_.Set(buffer,
+                        Buffer(new_var, buffer->dtype, buffer->shape, {},
+                               buffer->elem_offset, buffer->name,
+                               buffer->data_alignment, buffer->offset_factor,
+                               buffer->buffer_type));
+    }
+  }
+
   void InferUnspecifiedBuffer() {
     for (const auto &buffer : buffers_to_infer) {
       if (!buffer_remap_.count(buffer)) {
@@ -629,6 +654,8 @@ private:
   Map<Var, Var> var_remap_;
   std::unordered_map<Buffer, BufferSourceInfo, ObjectPtrHash, ObjectPtrEqual>
       buffer_source_map_;
+  std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
+      copy_source_buffers_;
 
   std::set<Buffer> buffers_to_infer;
   std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>

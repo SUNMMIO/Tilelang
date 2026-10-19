@@ -51,6 +51,40 @@ def batch_gemm(
     return tvm.IRModule({"main": main})
 
 
+def dynamic_single_matrix_gemm(batch=4):
+    shape = (batch, 32, 32)
+
+    @T.prim_func
+    def main(A: T.Tensor(shape, "bfloat16"), W: T.Tensor(shape, "bfloat16")):
+        with T.Kernel():
+            a = T.alloc_shared(shape, "bfloat16")
+            w = T.alloc_shared(shape, "bfloat16")
+            c = T.alloc_shared((32, 32), "float32")
+            T.copy(A[0, 0, 0], a)
+            T.copy(W[0, 0, 0], w)
+            for i in T.serial(batch):
+                T.gemm(a[i, :, :], w[i, :, :], c, clear_accum=True)
+
+    return tvm.IRModule({"main": main})
+
+
+def full_then_partial_batch_gemm(batch=4):
+    shape = (batch, 32, 32)
+
+    @T.prim_func
+    def main(A: T.Tensor(shape, "bfloat16"), W: T.Tensor(shape, "bfloat16")):
+        with T.Kernel():
+            a = T.alloc_shared(shape, "bfloat16")
+            w = T.alloc_shared(shape, "bfloat16")
+            c = T.alloc_shared(shape, "float32")
+            T.copy(A[0, 0, 0], a)
+            T.copy(W[0, 0, 0], w)
+            T.gemm(a, w, c, clear_accum=True)
+            T.gemm(a[1:3, :, :], w[1:3, :, :], c[1:3, :, :], clear_accum=True)
+
+    return tvm.IRModule({"main": main})
+
+
 def lower_batch_gemm(mod, ir_case=None):
     if ir_case is not None:
         ir_dir = Path(__file__).resolve().parents[4] / "build" / "batch-gemm-ops-ir"
@@ -160,6 +194,32 @@ def test_partial_batch_views_are_legalized_before_sram_inference():
         assert 'scope="shared.asram"' in scoped_ir
         assert 'scope="shared.wsram"' in scoped_ir
         assert 'scope="shared.rsram"' in scoped_ir
+
+
+def test_dynamic_single_matrix_views_compile_without_compaction():
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        bound = tir.transform.BindTarget(target)(dynamic_single_matrix_gemm())
+        views = tilelang.transform.LegalizeSunmmioBatchGemmViews()(bound)
+        assert "_batch_a_compact_" not in views.script()
+        assert "_batch_b_compact_" not in views.script()
+
+    mod = lower_batch_gemm(dynamic_single_matrix_gemm(), ir_case="dynamic-single-matrix")
+    mmas = collect_calls(mod, "tl.mma_sunmmio")
+    assert len(mmas) == 2
+    assert all(region_shape(mma.args[0]) == (1, 32, 32) for mma in mmas)
+    assert all(region_shape(mma.args[1]) == (1, 32, 32) for mma in mmas)
+
+
+def test_full_then_partial_batch_reuse_uses_legal_copy_scopes():
+    mod = lower_batch_gemm(full_then_partial_batch_gemm(), ir_case="full-then-partial")
+    for copy in collect_calls(mod, "tl.dma_copy"):
+        src_scope = copy.args[0].args[0].buffer.scope()
+        dst_scope = copy.args[1].args[0].buffer.scope()
+        assert (src_scope, dst_scope) not in {
+            ("shared.asram", "shared.asram"),
+            ("shared.wsram", "shared.wsram"),
+        }
 
 
 @pytest.mark.parametrize("output_batched", [True, False])
