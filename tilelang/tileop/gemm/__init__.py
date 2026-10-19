@@ -137,10 +137,7 @@ class GemmPy(Node, Scriptable):
             is_single_matrix_view = (
                 isinstance(batch.extent, tir.IntImm)
                 and int(batch.extent) == 1
-                and (
-                    not analyzer.can_prove(batch.min == 0)
-                    or not analyzer.can_prove(batch.extent == region.buffer.shape[0])
-                )
+                and (not analyzer.can_prove(batch.min == 0) or not analyzer.can_prove(batch.extent == region.buffer.shape[0]))
             )
             if is_single_matrix_view:
                 return False

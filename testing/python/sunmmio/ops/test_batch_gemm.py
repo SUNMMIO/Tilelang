@@ -204,9 +204,7 @@ def test_dynamic_single_matrix_views_compile_without_compaction():
         assert "_batch_a_compact_" not in views.script()
         assert "_batch_b_compact_" not in views.script()
 
-    mod = lower_batch_gemm(
-        dynamic_single_matrix_gemm(), ir_case="dynamic-single-matrix"
-    )
+    mod = lower_batch_gemm(dynamic_single_matrix_gemm(), ir_case="dynamic-single-matrix")
     mmas = collect_calls(mod, "tl.mma_sunmmio")
     assert len(mmas) == 2
     assert all(region_shape(mma.args[0]) == (1, 32, 32) for mma in mmas)
@@ -214,9 +212,7 @@ def test_dynamic_single_matrix_views_compile_without_compaction():
 
 
 def test_full_then_partial_batch_reuse_uses_legal_copy_scopes():
-    mod = lower_batch_gemm(
-        full_then_partial_batch_gemm(), ir_case="full-then-partial"
-    )
+    mod = lower_batch_gemm(full_then_partial_batch_gemm(), ir_case="full-then-partial")
     for copy in collect_calls(mod, "tl.dma_copy"):
         src_scope = copy.args[0].args[0].buffer.scope()
         dst_scope = copy.args[1].args[0].buffer.scope()
