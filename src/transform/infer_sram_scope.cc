@@ -312,6 +312,7 @@ private:
   void CollectOperandScope(const BufferRegion &region,
                            const std::string &expected_scope) {
     Buffer buffer = region->buffer;
+    gemm_operand_vars_.insert(buffer->data);
     if ((buffer.scope() == "shared") || (buffer.scope() == "shared.dyn")) {
       if (!buffer_remap_.count(buffer)) {
         buffer_remap_.Set(buffer, RemapBufferScope(buffer, expected_scope));
@@ -628,9 +629,25 @@ private:
                   buffer->offset_factor, buffer->buffer_type);
   }
 
+  bool FeedsGemmOperand(const Buffer &buffer) const {
+    for (const auto &[dst, info] : buffer_source_map_) {
+      if (info.src_buffer->data.same_as(buffer->data) &&
+          gemm_operand_vars_.count(dst->data)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   void PinCopySourcesToRsram() {
     for (const Buffer &buffer : copy_source_buffers_) {
       if (buffer.scope() == kSunmmioScopeRSRAM)
+        continue;
+      bool inferred_scope =
+          buffer.scope() == "shared" || buffer.scope() == "shared.dyn";
+      bool gemm_related =
+          gemm_operand_vars_.count(buffer->data) || FeedsGemmOperand(buffer);
+      if (!inferred_scope && !gemm_related)
         continue;
       const auto *ptr_type =
           TVM_TYPE_AS(buffer->data->type_annotation, PointerTypeNode);
@@ -660,6 +677,7 @@ private:
       buffer_source_map_;
   std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
       copy_source_buffers_;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> gemm_operand_vars_;
 
   std::set<Buffer> buffers_to_infer;
   std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual>
