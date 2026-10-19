@@ -1,6 +1,7 @@
 import os
 import re
 
+import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
@@ -223,8 +224,7 @@ def fp32_select_then_bf16_cast_test(m=32, n=32):
 
 
 @target("Sunmmio")
-def tile_bitwise_ops_test(m=32, n=32):
-    dtype = T.int32
+def tile_bitwise_ops_test(m=32, n=32, dtype="int32"):
     shard_policy = T.placement.replicated()
     tensor_shape = (m, n)
     tensor_layout = make_zz_layout(tensor_shape, [0, 1], tensor_shape)
@@ -250,17 +250,98 @@ def tile_bitwise_ops_test(m=32, n=32):
     return main
 
 
-def test_tile_bitwise_ops_codegen_validates_with_npuir_opt(tmp_path):
+@target("Sunmmio")
+def tile_mask_bitwise_ops_test(m=32, n=32, dtype="float32"):
+    shard_policy = T.placement.replicated()
+    tensor_shape = (m, n)
+    tensor_layout = make_zz_layout(tensor_shape, [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        B: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+        C: T.MeshTensor(tensor_shape, shard_policy, dtype, layout=tensor_layout),  # type: ignore
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared(tensor_shape, dtype)
+            B_shared = T.alloc_shared(tensor_shape, dtype)
+            C_shared = T.alloc_shared(tensor_shape, dtype)
+            T.copy(A, A_shared)
+            T.copy(B, B_shared)
+            for i, j in T.Tiles(A_shared, parallel=True):
+                greater = A_shared[i, j] > B_shared[i, j]
+                nonzero = A_shared[i, j] != T.float32(0)
+                equal = A_shared[i, j] == B_shared[i, j]
+                both = T.bitwise_and(greater, nonzero)
+                either = T.bitwise_or(both, equal)
+                selected = T.bitwise_xor(either, greater)
+                C_shared[i, j] = T.if_then_else(
+                    selected, A_shared[i, j], B_shared[i, j]
+                )
+            T.copy(C_shared, C)
+
+    return main
+
+
+@pytest.mark.parametrize("dtype", ["int32", "uint32"])
+def test_tile_bitwise_ops_codegen_validates_with_npuir_opt(tmp_path, dtype):
     src = validate_sunmmio_codegen_with_npuir_opt(
-        tile_bitwise_ops_test(),
+        tile_bitwise_ops_test(dtype=dtype),
         tmp_path,
-        mlir_filename="tile_bitwise_ops_suvm.mlir",
+        mlir_filename=f"tile_bitwise_ops_{dtype}_suvm.mlir",
         expected_tokens=("suvm.tile.andi", "suvm.tile.ori", "suvm.tile.xori"),
     )
     assert_source_contains(
         src,
         ("suvm.tile.andi", "suvm.tile.ori", "suvm.tile.xori"),
     )
+
+
+@pytest.mark.parametrize(
+    "m,case_name",
+    [
+        pytest.param(32, "full", id="full-tile"),
+        pytest.param(40, "tail", id="1024-byte-tail"),
+    ],
+)
+def test_tile_mask_bitwise_ops_lower_as_unmasked_i1(tmp_path, m, case_name):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        tile_mask_bitwise_ops_test(m=m),
+        tmp_path,
+        mlir_filename=f"tile_mask_bitwise_ops_{case_name}_suvm.mlir",
+        expected_tokens=(
+            "suvm.tile.cmpf",
+            "suvm.tile.andi",
+            "suvm.tile.ori",
+            "suvm.tile.xori",
+        ),
+        opt_args=STRICT_OPT_ARGS,
+    )
+
+    bitwise_lines = [
+        line.strip()
+        for line in src.splitlines()
+        if any(op in line for op in ("suvm.tile.andi", "suvm.tile.ori", "suvm.tile.xori"))
+    ]
+    assert len(bitwise_lines) == 3
+    assert all("xi1>" in line for line in bitwise_lines)
+    assert all(line.split(":", 1)[0].count(",") == 1 for line in bitwise_lines)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    ["int8", "uint8", "int16", "uint16", "int64", "uint64"],
+)
+def test_tile_bitwise_ops_rejects_unsupported_dtype(tmp_path, dtype):
+    with pytest.raises(
+        Exception,
+        match=rf"SunMMIO tile bitwise operations require int32 or uint32 elements, got {dtype}",
+    ):
+        validate_sunmmio_codegen_with_npuir_opt(
+            tile_bitwise_ops_test(dtype=dtype),
+            tmp_path,
+            mlir_filename=f"tile_bitwise_ops_{dtype}_rejected_suvm.mlir",
+        )
 
 
 def test_tile_elementwise_ops_2d_codegen_validates_with_npuir_opt(tmp_path):

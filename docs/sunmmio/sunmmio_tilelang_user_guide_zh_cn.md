@@ -374,7 +374,7 @@ core 可以用线性 id，也可以用 `(row, col)` 坐标表示。一般来说�
 T.comm.broadcast(A_shared, B_shared, src_core=(0, 0), direction="horizontal")
 T.comm.put(A_shared, B_shared, src_core=(1, 2), dst_core=(2, 3))
 T.comm.all_gather(A_local, A_gathered, direction="horizontal", axis=-1)
-T.comm.all_reduce(A_shared, Out_shared, "sum", direction="all", dim=-1)
+T.comm.all_reduce(A_shared, Out_shared, "sum", direction="all")
 ```
 
 选择接口时可以按语义判断：
@@ -847,7 +847,7 @@ T.comm.all_gather(
 **`T.comm.all_reduce`**
 
 ```python
-T.comm.all_reduce(buffer, out, reduce_type, direction, dim=-1, clear=True)
+T.comm.all_reduce(buffer, out, reduce_type, direction, *, clear=True)
 ```
 
 `all_reduce` 表达跨 core reduce。
@@ -856,11 +856,21 @@ T.comm.all_reduce(buffer, out, reduce_type, direction, dim=-1, clear=True)
 - `out`：保存 reduce 结果的输出 buffer 或 region。
 - `reduce_type`：reduce 类型，支持 `"sum"`、`"abssum"`、`"max"`、`"min"`、`"absmax"`、`"bitand"`、`"bitor"`、`"bitxor"`。
 - `direction`：参与 reduce 的方向，支持 `"horizontal"` / `"h"`、`"vertical"` / `"v"`、`"all"` / `"a"`。
-- `dim`：保留用于 API 兼容和边界校验。跨 core `all_reduce` 不会沿本地 buffer 维度做 reduce。
 - `clear`：是否在 reduce 前清空 `out`，默认 `True`。
 - 返回值：表达 all-reduce 的语句。
 
+`clear` 只能通过关键字传入。`all_reduce` 没有本地归约维度，因为它只在各 core
+之间对相同位置的元素做归约，并保留完整的本地 region。
+
 `out` shape 需要与输入 buffer 或 region 的 shape 一致。`all_reduce` 只做跨 core reduce，并保留完整本地 region。
+
+在 SunMMIO/A4E 上，`"min"`、`"max"` 和 `"absmax"` 要求输入、输出 dtype
+均为标量 `bfloat16` 或标量 `float32`。`float16`、`float64` 和整数 dtype 会在
+TileLang 校验阶段被拒绝，因为 A4E 不提供所需的向量 lowering。
+
+在 SunMMIO/A4E 上，`"bitand"`、`"bitor"` 和 `"bitxor"` 要求输入、输出 dtype
+同为标量 `int32`，或同为标量 `uint32`。其他整数位宽及有符号/无符号混用会在
+TileLang 校验阶段被拒绝，因为目标后端不提供所需的 bitwise 或 cast lowering。
 
 ### 3.7 GEMM
 
@@ -915,6 +925,10 @@ T.reduce(buffer, out, reduce_type, dim, clear)
 - 返回值：表达 reduce 的语句。
 
 跨 core reduce 使用 `T.comm.all_reduce`。
+
+在 SunMMIO/A4E 上，`"min"`、`"max"` 和 `"absmax"` 要求输入、输出 dtype
+均为标量 `bfloat16` 或标量 `float32`。`float16`、`float64` 和整数 dtype 会在
+TileLang 校验阶段被拒绝，因为 A4E 不提供所需的向量 lowering。
 
 **`T.reduce_sum`** **/** **`T.reduce_max`** **/** **`T.reduce_min`**
 

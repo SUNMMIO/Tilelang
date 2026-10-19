@@ -36,25 +36,24 @@ MakeTrailingTilePatternImpl(const Array<PrimExpr> &buffer_shape,
   return pattern;
 }
 
-void AppendRank1Pattern(std::vector<TrailingTilePattern> *patterns,
-                        const Buffer &buffer, int tile_width) {
-  int buffer_rank = static_cast<int>(buffer->shape.size());
-  if (buffer_rank < 1) {
-    return;
-  }
+TrailingTilePattern MakeMappedTilePatternImpl(
+    const std::vector<int> &mapped_dims,
+    const std::vector<int> &tile_shape) {
+  ICHECK_EQ(mapped_dims.size(), tile_shape.size());
+  return {mapped_dims, tile_shape};
+}
 
-  patterns->push_back(MakeTrailingTilePatternImpl(buffer->shape, {tile_width}));
+void AppendRank1Pattern(std::vector<TrailingTilePattern> *patterns,
+                        int width_dim, int tile_width) {
+  patterns->push_back(
+      MakeMappedTilePatternImpl({width_dim}, {tile_width}));
 }
 
 void AppendRank2Pattern(std::vector<TrailingTilePattern> *patterns,
-                        const Buffer &buffer, int tile_height, int tile_width) {
-  int buffer_rank = static_cast<int>(buffer->shape.size());
-  if (buffer_rank < 2) {
-    return;
-  }
-
-  patterns->push_back(
-      MakeTrailingTilePatternImpl(buffer->shape, {tile_height, tile_width}));
+                        int height_dim, int width_dim, int tile_height,
+                        int tile_width) {
+  patterns->push_back(MakeMappedTilePatternImpl(
+      {height_dim, width_dim}, {tile_height, tile_width}));
 }
 
 bool TileChunkRsramAligned(const Buffer &buffer,
@@ -85,20 +84,16 @@ GetBufferContiguousSteps(const Buffer &buffer,
     if (!steps.empty())
       return steps;
   }
-  // Row-major fallback: trailing dim is contiguous, then second-to-last.
+  // Row-major fallback: walk dimensions from innermost to outermost. Consumers
+  // stop once they leave the execution dimensions they can represent.
   int buffer_rank = static_cast<int>(buffer->shape.size());
   std::vector<ContiguousStep> steps;
-  if (buffer_rank >= 1) {
-    int64_t w = GetStaticIntValue(buffer->shape[buffer_rank - 1]);
-    if (w > 0) {
-      steps.push_back({buffer_rank - 1, static_cast<int>(w)});
-      if (buffer_rank >= 2) {
-        int64_t h = GetStaticIntValue(buffer->shape[buffer_rank - 2]);
-        if (h > 0) {
-          steps.push_back({buffer_rank - 2, static_cast<int>(h)});
-        }
-      }
+  for (int dim = buffer_rank - 1; dim >= 0; --dim) {
+    int64_t extent = GetStaticIntValue(buffer->shape[dim]);
+    if (extent <= 0 || extent > std::numeric_limits<int>::max()) {
+      break;
     }
+    steps.push_back({dim, static_cast<int>(extent)});
   }
   return steps;
 }
@@ -179,7 +174,8 @@ bool ConsumeContiguousExtent(const std::vector<ContiguousStep> &steps,
 }
 
 std::optional<TrailingTileEnvelope>
-GetTilesExecutionEnvelope(const Buffer &buffer, int exec_rank,
+GetTilesExecutionEnvelope(const Buffer &buffer,
+                          const std::vector<int> &execution_dims,
                           const Map<Buffer, Layout> &layout_map) {
   if (!layout_map.count(buffer)) {
     return std::nullopt;
@@ -192,14 +188,21 @@ GetTilesExecutionEnvelope(const Buffer &buffer, int exec_rank,
   }
 
   int buffer_rank = static_cast<int>(buffer->shape.size());
-  if (buffer_rank < 1 || (exec_rank == 2 && buffer_rank < 2)) {
+  int exec_rank = static_cast<int>(execution_dims.size());
+  if (exec_rank < 1 || exec_rank > 2) {
     return std::nullopt;
   }
-  int width_dim = buffer_rank - 1;
-  int height_dim = buffer_rank - 2;
+  int width_dim = execution_dims.back();
+  int height_dim = exec_rank == 2 ? execution_dims.front() : -1;
   std::vector<ContiguousStep> steps = ComputeContiguousTileSteps(layout);
 
   if (auto block = sunmmio::GetZZBlockShape(layout)) {
+    bool uses_canonical_trailing_dims = width_dim == buffer_rank - 1 &&
+                                        (exec_rank == 1 ||
+                                         height_dim == buffer_rank - 2);
+    if (!uses_canonical_trailing_dims) {
+      return std::nullopt;
+    }
     size_t position = 0;
     if (!ConsumeContiguousExtent(steps, &position, width_dim, block->width)) {
       return std::nullopt;
@@ -264,6 +267,7 @@ std::vector<int> EnumeratePositiveDivisors(int extent) {
 
 std::vector<TrailingTilePattern>
 EnumerateLayoutBoundedPatterns(const Buffer &buffer, int exec_rank,
+                               const std::vector<int> &execution_dims,
                                const SunmmioTileProcessorConfig &config,
                                const TrailingTileEnvelope &envelope,
                                AlignmentMode alignment_mode) {
@@ -271,16 +275,18 @@ EnumerateLayoutBoundedPatterns(const Buffer &buffer, int exec_rank,
   std::unordered_set<int> emitted_rank1;
   std::unordered_set<std::pair<int, int>, IntPairHash> emitted_rank2;
   bool check_alignment = alignment_mode == AlignmentMode::kStrict;
+  int width_dim = execution_dims.back();
+  int height_dim = exec_rank == 2 ? execution_dims.front() : -1;
 
   for (int width : EnumeratePositiveDivisors(envelope.max_width)) {
     if (check_alignment && !TileChunkRsramAligned(buffer, config, 1, width)) {
       continue;
     }
     if (emitted_rank1.insert(width).second) {
-      AppendRank1Pattern(&patterns, buffer, width);
+      AppendRank1Pattern(&patterns, width_dim, width);
     }
     if (exec_rank == 2 && emitted_rank2.emplace(1, width).second) {
-      AppendRank2Pattern(&patterns, buffer, 1, width);
+      AppendRank2Pattern(&patterns, height_dim, width_dim, 1, width);
     }
   }
 
@@ -291,7 +297,8 @@ EnumerateLayoutBoundedPatterns(const Buffer &buffer, int exec_rank,
         continue;
       }
       if (emitted_rank2.emplace(height, envelope.max_width).second) {
-        AppendRank2Pattern(&patterns, buffer, height, envelope.max_width);
+        AppendRank2Pattern(&patterns, height_dim, width_dim, height,
+                           envelope.max_width);
       }
     }
   }
@@ -404,6 +411,23 @@ TileView MakeTrailingTileView(const Array<PrimExpr> &buffer_shape,
                             static_cast<int>(pattern.tile_shape.size())));
 }
 
+TileView MakeTileViewFromPattern(const Array<PrimExpr> &buffer_shape,
+                                 const TrailingTilePattern &pattern) {
+  int buffer_rank = static_cast<int>(buffer_shape.size());
+  ICHECK_EQ(pattern.mapped_dims.size(), pattern.tile_shape.size());
+
+  Array<PrimExpr> index_map;
+  index_map.reserve(pattern.mapped_dims.size());
+  for (int mapped_dim : pattern.mapped_dims) {
+    ICHECK(mapped_dim >= 0 && mapped_dim < buffer_rank)
+        << "TileView mapped dimension " << mapped_dim
+        << " is out of bounds for rank " << buffer_rank << ".";
+    index_map.push_back(Integer(mapped_dim - buffer_rank));
+  }
+  return makeTileView(buffer_shape, MakeTileShapeExpr(pattern.tile_shape),
+                      index_map);
+}
+
 std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
     const Buffer &buffer, int exec_rank, const Map<Buffer, Layout> &layout_map,
     const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
@@ -412,28 +436,57 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
       << "TileView planning expects execution rank 1 or 2, but got "
       << exec_rank << ".";
 
+  int buffer_rank = static_cast<int>(buffer->shape.size());
+  if (buffer_rank < exec_rank) {
+    return {};
+  }
+  std::vector<int> execution_dims;
+  execution_dims.reserve(exec_rank);
+  for (int dim = buffer_rank - exec_rank; dim < buffer_rank; ++dim) {
+    execution_dims.push_back(dim);
+  }
+  return EnumerateInferredTilePatterns(buffer, execution_dims, layout_map,
+                                       config, analyzer, options);
+}
+
+std::vector<TrailingTilePattern> EnumerateInferredTilePatterns(
+    const Buffer &buffer, const std::vector<int> &execution_dims,
+    const Map<Buffer, Layout> &layout_map,
+    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
+    TilePatternOptions options) {
+  int exec_rank = static_cast<int>(execution_dims.size());
+  ICHECK(exec_rank == 1 || exec_rank == 2)
+      << "TileView planning expects one or two execution dimensions, but got "
+      << exec_rank << ".";
+
   std::vector<TrailingTilePattern> patterns;
   int buffer_rank = static_cast<int>(buffer->shape.size());
   if (buffer_rank < 1) {
     return patterns;
   }
+  for (int axis = 0; axis < exec_rank; ++axis) {
+    ICHECK(execution_dims[axis] >= 0 && execution_dims[axis] < buffer_rank)
+        << "TileView execution dimension " << execution_dims[axis]
+        << " is out of bounds for rank " << buffer_rank << ".";
+    ICHECK(axis == 0 || execution_dims[axis - 1] < execution_dims[axis])
+        << "TileView execution dimensions must be strictly increasing.";
+  }
 
   if (options.extent_policy == TileExtentPolicy::kTilesExecutionLayoutBounded ||
       options.extent_policy == TileExtentPolicy::kReductionLayoutBounded) {
-    if (auto envelope =
-            GetTilesExecutionEnvelope(buffer, exec_rank, layout_map)) {
-      return EnumerateLayoutBoundedPatterns(buffer, exec_rank, config,
-                                            *envelope, options.alignment_mode);
+    if (auto envelope = GetTilesExecutionEnvelope(buffer, execution_dims,
+                                                  layout_map)) {
+      return EnumerateLayoutBoundedPatterns(
+          buffer, exec_rank, execution_dims, config, *envelope,
+          options.alignment_mode);
     }
   }
 
   int capacity_elems = GetCapacityElems(buffer, config);
   auto steps = GetBufferContiguousSteps(buffer, layout_map);
 
-  // Identify the trailing buffer dimensions (width = last, height =
-  // second-to-last).
-  int width_dim = buffer_rank - 1;
-  int height_dim = buffer_rank - 2;
+  int width_dim = execution_dims.back();
+  int height_dim = exec_rank == 2 ? execution_dims.front() : -1;
 
   // RSRAM access alignment: the contiguous tile chunk must be a multiple of
   // rsram_align_bytes (see TileChunkRsramAligned). Relaxed mode skips it.
@@ -467,6 +520,7 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
   int forced_h = 1;        // min height forced by fully consumed H steps
   bool rank1_done = false; // rank-1 only from leading W steps
   bool had_width_step = false;
+  bool blocked_by_non_unit_step = false;
 
   for (const auto &step : steps) {
     if (step.dim == width_dim) {
@@ -482,15 +536,15 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
         // Rank-1: only from leading width steps (before any non-width step).
         if (!rank1_done && h == 1 && !emitted_rank1.count(w)) {
           emitted_rank1.insert(w);
-          AppendRank1Pattern(&patterns, buffer, w);
+          AppendRank1Pattern(&patterns, width_dim, w);
         }
 
         // Rank-2.
-        if (exec_rank == 2 && buffer_rank >= 2) {
+        if (exec_rank == 2) {
           std::pair<int, int> key{h, w};
           if (!emitted_rank2.count(key)) {
             emitted_rank2.insert(key);
-            AppendRank2Pattern(&patterns, buffer, h, w);
+            AppendRank2Pattern(&patterns, height_dim, width_dim, h, w);
           }
         }
       }
@@ -505,18 +559,24 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
         if (check_alignment && !TileChunkRsramAligned(buffer, config, h, w))
           continue;
 
-        if (exec_rank == 2 && buffer_rank >= 2) {
+        if (exec_rank == 2) {
           std::pair<int, int> key{h, w};
           if (!emitted_rank2.count(key)) {
             emitted_rank2.insert(key);
-            AppendRank2Pattern(&patterns, buffer, h, w);
+            AppendRank2Pattern(&patterns, height_dim, width_dim, h, w);
           }
         }
       }
       forced_h *= step.extent;
+    } else if (GetStaticIntValue(buffer->shape[step.dim]) == 1 &&
+               step.extent == 1) {
+      // A dimension is transparent only when both its logical and physical
+      // extents are one. An aligned layout may pad a logical unit dimension.
+      continue;
     } else {
-      // Non-trailing dim step — cannot tile into this dimension,
-      // so subsequent steps are unreachable for trailing tiles.
+      // A non-execution dimension with storage extent greater than one creates
+      // a physical stride gap, so outer steps are unreachable.
+      blocked_by_non_unit_step = true;
       break;
     }
   }
@@ -524,21 +584,21 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
   // If no steps contributed to width (empty steps or no width-dim steps),
   // fall back to brute-force enumeration up to capacity (preserves behavior
   // for buffers with no CuteLayout and fully dynamic shapes).
-  if (!had_width_step) {
+  if (!had_width_step && !blocked_by_non_unit_step) {
     for (int w = 1; w <= capacity_elems; ++w) {
-      AppendRank1Pattern(&patterns, buffer, w);
+      AppendRank1Pattern(&patterns, width_dim, w);
     }
-    if (exec_rank == 2 && buffer_rank >= 2) {
+    if (exec_rank == 2) {
       int64_t row_width = GetStaticIntValue(buffer->shape[width_dim]);
       if (row_width > 0) {
         int max_w = std::min(capacity_elems, static_cast<int>(row_width));
         for (int w = 1; w <= max_w; ++w) {
-          AppendRank2Pattern(&patterns, buffer, 1, w);
+          AppendRank2Pattern(&patterns, height_dim, width_dim, 1, w);
         }
         if (row_width <= capacity_elems) {
           int max_h = capacity_elems / static_cast<int>(row_width);
           for (int h = 2; h <= max_h; ++h) {
-            AppendRank2Pattern(&patterns, buffer, h,
+            AppendRank2Pattern(&patterns, height_dim, width_dim, h,
                                static_cast<int>(row_width));
           }
         }
@@ -574,11 +634,16 @@ TrailingTilePattern ValidateManualTrailingTileView(
       << usage << " must target trailing " << tv_rank << " buffer dims for "
       << buffer->name << ".";
 
+  std::vector<int> execution_dims;
+  execution_dims.reserve(exec_rank);
+  for (int dim = buffer_rank - exec_rank; dim < buffer_rank; ++dim) {
+    execution_dims.push_back(dim);
+  }
   std::optional<TrailingTileEnvelope> execution_envelope;
   if (options.extent_policy == TileExtentPolicy::kTilesExecutionLayoutBounded ||
       options.extent_policy == TileExtentPolicy::kReductionLayoutBounded) {
     execution_envelope =
-        GetTilesExecutionEnvelope(buffer, exec_rank, layout_map);
+        GetTilesExecutionEnvelope(buffer, execution_dims, layout_map);
   }
   bool register_bounded = !execution_envelope.has_value();
   int capacity_elems = GetCapacityElems(buffer, config);
@@ -627,7 +692,7 @@ TrailingTilePattern ValidateManualTrailingTileView(
         << buffer->name << ".";
     if (execution_envelope.has_value()) {
       ICHECK(ContainsTileShape(EnumerateLayoutBoundedPatterns(
-                                   buffer, exec_rank, config,
+                                   buffer, exec_rank, execution_dims, config,
                                    *execution_envelope, options.alignment_mode),
                                {width}))
           << usage << " width " << width
@@ -655,8 +720,8 @@ TrailingTilePattern ValidateManualTrailingTileView(
 
   if (execution_envelope.has_value()) {
     ICHECK(ContainsTileShape(EnumerateLayoutBoundedPatterns(
-                                 buffer, exec_rank, config, *execution_envelope,
-                                 options.alignment_mode),
+                                 buffer, exec_rank, execution_dims, config,
+                                 *execution_envelope, options.alignment_mode),
                              {height, width}))
         << usage << " shape (" << height << ", " << width
         << ") is outside the layout-bounded execution envelope for buffer "

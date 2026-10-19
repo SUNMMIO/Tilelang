@@ -781,6 +781,16 @@ def test_reduce_rank3_keepdim_projects_raw_suvm_destination(tmp_path, reduce_axi
         rf"suvm\.tile\.reduce\s+sum, .*<axis = {expected_tile_axis}>",
         src,
     )
+    if reduce_axis == 2:
+        scalar_destination_views = [
+            line
+            for line in src.splitlines()
+            if "suvm.get_partitioned_tile_view" in line
+            and "!suvm.memtensor<4x64x1xf32" in line
+            and "-> !suvm.tile_view<16xf32>" in line
+        ]
+        assert len(scalar_destination_views) == 1, scalar_destination_views
+        assert "tiled_dims = [2]" in scalar_destination_views[0]
 
 
 def test_reduce_small_1d_result_uses_aligned_store_bridge(tmp_path):

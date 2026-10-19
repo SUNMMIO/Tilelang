@@ -211,6 +211,24 @@ def matched_copy_kernel():
     return tvm.IRModule({"main": main})
 
 
+def unit_dim_equivalent_copy_kernel(shape, axes):
+    """Single-block ZZ and tight row-major have the same byte map when all
+    dimensions outside the two active axes are statically one."""
+
+    @T.prim_func
+    def main(
+        A: _dram(shape, make_zz_layout(shape, axes, (32, 32))),
+        B: _dram(shape, make_zz_layout(shape, axes, (32, 32))),
+    ):
+        with T.Kernel(1, threads=128) as (bx,):
+            X = T.alloc_shared(shape, DTYPE, scope="shared.rsram")
+            T.annotate_layout({X: make_row_major(shape)})
+            T.copy(A, X)
+            T.copy(X, B)
+
+    return tvm.IRModule({"main": main})
+
+
 def zz_dram_reduce_kernel():
     """End-to-end: ZZ DRAM (3x256x256) -> RSRAM, axis-2 reduction -> row-major
     RSRAM (3x256), copied back to ZZ DRAM (3x256).
@@ -344,6 +362,28 @@ def test_matched_layout_stays_plain_dma_copy():
 
         names = collect_call_names(func)
         assert names.count("tl.dma_copy") == 1, names
+        assert "tl.sunmmio_layout_transform" not in names, names
+        assert staging_buffers(func) == [], [b.name for b in staging_buffers(func)]
+
+
+@pytest.mark.parametrize(
+    "shape, axes",
+    [
+        ((1, 32, 32), (1, 2)),
+        ((32, 1, 32), (0, 2)),
+        ((32, 32, 1), (0, 1)),
+        ((1, 32, 1, 32), (1, 3)),
+    ],
+)
+def test_unit_dim_equivalent_layout_stays_plain_dma_copy(shape, axes):
+    target = determine_target("Sunmmio", return_object=True)
+    mod = unit_dim_equivalent_copy_kernel(shape, axes)
+    with tvm.target.Target(target):
+        mod = apply_passes_through_lower_tile_op(mod, target)
+        func = list(mod.functions.values())[0]
+
+        names = collect_call_names(func)
+        assert names.count("tl.dma_copy") == 2, names
         assert "tl.sunmmio_layout_transform" not in names, names
         assert staging_buffers(func) == [], [b.name for b in staging_buffers(func)]
 

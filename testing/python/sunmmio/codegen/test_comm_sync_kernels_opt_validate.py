@@ -1,13 +1,16 @@
 import os
+import re
 
 import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
+from tilelang import tvm
 
 from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import (
     find_async_op_lines,
+    simplify_suvm_mlir,
     validate_sunmmio_codegen_with_npuir_opt,
 )
 
@@ -17,6 +20,7 @@ os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 LOOSE_OPT_ARGS = ("--verify-each",)
+STRICT_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
 
 
 @target("Sunmmio")
@@ -87,6 +91,20 @@ def comm_all_gather_kernel(
 
 
 @target("Sunmmio")
+def comm_all_gather_horizontal_shape_kernel(shape, dtype="float32"):
+    recv_shape = (4, *shape)
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            send = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            recv = T.alloc_shared(recv_shape, dtype, scope="shared.rsram")
+            T.comm.all_gather(send, recv, direction="horizontal")
+
+    return main
+
+
+@target("Sunmmio")
 def comm_all_reduce_horizontal_kernel(M=32, N=128, dtype="float32"):
     @T.prim_func
     def main(
@@ -95,15 +113,79 @@ def comm_all_reduce_horizontal_kernel(M=32, N=128, dtype="float32"):
     ):
         with T.Kernel():
             reduce_src = T.alloc_shared((1, M, N), dtype, scope="shared.rsram")
-            reduced = T.alloc_shared((M, N), dtype, scope="shared.rsram")
+            reduced = T.alloc_shared((1, M, N), dtype, scope="shared.rsram")
             T.copy(A, reduce_src[0, 0:M, 0:N])
             T.comm.all_reduce(
                 reduce_src,
                 reduced,
                 "sum",
                 "horizontal",
-                dim=0,
                 clear=True,
+            )
+            T.copy(reduced[0, 0:M, 0:N], B)
+
+    return main
+
+
+@target("Sunmmio")
+def comm_all_reduce_rank3_kernel(
+    K=2,
+    M=32,
+    N=32,
+    dtype="float32",
+    out_dtype=None,
+    reduce_type="sum",
+    direction="horizontal",
+    clear=True,
+):
+    out_dtype = dtype if out_dtype is None else out_dtype
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((K, M, N), dtype),
+        B: T.Tensor((K, M, N), out_dtype),
+    ):
+        with T.Kernel():
+            reduce_src = T.alloc_shared((K, M, N), dtype, scope="shared.rsram")
+            reduced = T.alloc_shared((K, M, N), out_dtype, scope="shared.rsram")
+            for k in T.serial(K):
+                T.copy(A[k, :, :], reduce_src[k, :, :])
+            if not clear:
+                T.fill(reduced, 0)
+            T.comm.all_reduce(
+                reduce_src,
+                reduced,
+                reduce_type,
+                direction,
+                clear=clear,
+            )
+            for k in T.serial(K):
+                T.copy(reduced[k, :, :], B[k, :, :])
+
+    return main
+
+
+@target("Sunmmio")
+def comm_all_reduce_mixed_dtype_kernel(direction="horizontal", clear=True):
+    shape = (1, 512)
+
+    @T.prim_func
+    def main(
+        A: T.Tensor(shape, "bfloat16"),
+        B: T.Tensor(shape, "float32"),
+    ):
+        with T.Kernel():
+            reduce_src = T.alloc_shared(shape, "bfloat16", scope="shared.rsram")
+            reduced = T.alloc_shared(shape, "float32", scope="shared.rsram")
+            T.copy(A, reduce_src)
+            if not clear:
+                T.fill(reduced, 0)
+            T.comm.all_reduce(
+                reduce_src,
+                reduced,
+                "sum",
+                direction,
+                clear=clear,
             )
             T.copy(reduced, B)
 
@@ -111,27 +193,23 @@ def comm_all_reduce_horizontal_kernel(M=32, N=128, dtype="float32"):
 
 
 @target("Sunmmio")
-def comm_all_reduce_horizontal_rank3_kernel(K=2, M=32, N=32, dtype="float32"):
+def comm_all_reduce_shape_kernel(
+    shape,
+    dtype="float32",
+    reduce_type="sum",
+    direction="horizontal",
+    clear=True,
+):
     @T.prim_func
-    def main(
-        A: T.Tensor((K, M, N), dtype),
-        B: T.Tensor((K, M, N), dtype),
-    ):
+    def main():
         with T.Kernel():
-            reduce_src = T.alloc_shared((K, M, N), dtype, scope="shared.rsram")
-            reduced = T.alloc_shared((K, M, N), dtype, scope="shared.rsram")
-            for k in T.serial(K):
-                T.copy(A[k, :, :], reduce_src[k, :, :])
+            reduce_src = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            reduced = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            if not clear:
+                T.fill(reduced, 0)
             T.comm.all_reduce(
-                reduce_src,
-                reduced,
-                "sum",
-                "horizontal",
-                dim=0,
-                clear=True,
+                reduce_src, reduced, reduce_type, direction, clear=clear
             )
-            for k in T.serial(K):
-                T.copy(reduced[k, :, :], B[k, :, :])
 
     return main
 
@@ -247,6 +325,51 @@ def _validate_kernel(kernel, tmp_path, *, mlir_filename, expected_tokens=(), opt
     return src
 
 
+def _assert_allreduce_link_sync_order(src, direction):
+    lines = src.splitlines()
+    phases = {
+        "horizontal": (("odma1", "hlink"),),
+        "vertical": (("odma0", "vlink"),),
+        "all": (("odma0", "vlink"), ("odma1", "hlink")),
+    }[direction]
+    cursor = -1
+
+    for dma_unit, link_unit in phases:
+        mcast_indices = [
+            i
+            for i, line in enumerate(lines)
+            if "suvm.mcast_async" in line and f"<unit = {dma_unit}>" in line
+        ]
+        sync_indices = [
+            i
+            for i, line in enumerate(lines)
+            if "suvm.sync" in line and link_unit in line
+        ]
+        consumer_index = next(
+            i
+            for i, line in enumerate(lines)
+            if i > cursor and "suvm.tile.addf" in line
+        )
+        phase_mcasts = [i for i in mcast_indices if cursor < i < consumer_index]
+        phase_syncs = [i for i in sync_indices if cursor < i < consumer_index]
+        assert phase_mcasts
+        assert phase_syncs
+        assert all(
+            any(mcast_index < sync_index < consumer_index for sync_index in phase_syncs)
+            for mcast_index in phase_mcasts
+        )
+        cursor = consumer_index
+
+    expected_links = {link_unit for _, link_unit in phases}
+    link_sync_lines = [
+        line
+        for line in lines
+        if "suvm.sync" in line and any(link in line for link in ("hlink", "vlink"))
+    ]
+    assert len(link_sync_lines) >= len(phases)
+    assert all(any(link in line for link in expected_links) for line in link_sync_lines)
+
+
 def test_comm_broadcast_kernel_codegen_validates_with_npuir_opt(tmp_path):
     src = _validate_kernel(
         comm_broadcast_kernel(),
@@ -312,6 +435,64 @@ def test_comm_all_gather_kernel_codegen_validates_with_npuir_opt(
         assert f"<unit = {expected_unit}>" in line
 
 
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((1, 32, 32), id="leading-unit"),
+        pytest.param((32, 1, 32), id="middle-unit"),
+        pytest.param((32, 32, 1), id="trailing-unit"),
+        pytest.param((1, 32, 1, 32), id="multiple-unit"),
+    ],
+)
+def test_comm_all_gather_unit_dims_emit_one_legal_multicast(shape, tmp_path):
+    src = _validate_kernel(
+        comm_all_gather_horizontal_shape_kernel(shape),
+        tmp_path,
+        mlir_filename=f"comm_all_gather_unit_dims_{'_'.join(map(str, shape))}_suvm.mlir",
+        expected_tokens=("suvm.mcast_async",),
+        opt_args=STRICT_OPT_ARGS,
+    )
+
+    assert len(find_async_op_lines(src, "suvm.mcast_async")) == 1
+
+
+@pytest.mark.parametrize(
+    "shape,expected_leaf_count",
+    [
+        pytest.param((2, 16, 16), 2, id="minimum-1024-byte-leaves"),
+        pytest.param((2, 32, 32), 2, id="rank3"),
+        pytest.param((1, 2, 32, 32), 2, id="rank4-leading-unit"),
+    ],
+)
+def test_comm_all_gather_splits_only_outer_non_unit_dims(
+    shape,
+    expected_leaf_count,
+    tmp_path,
+):
+    src = _validate_kernel(
+        comm_all_gather_horizontal_shape_kernel(shape),
+        tmp_path,
+        mlir_filename=f"comm_all_gather_split_{'_'.join(map(str, shape))}_suvm.mlir",
+        expected_tokens=("suvm.mcast_async",),
+        opt_args=STRICT_OPT_ARGS,
+    )
+
+    assert len(find_async_op_lines(src, "suvm.mcast_async")) == expected_leaf_count
+
+
+def test_comm_all_gather_rejects_sub_1024_byte_multicast_leaves(tmp_path):
+    with pytest.raises(
+        tvm.error.InternalError,
+        match="violates A4E multicast data-path constraints",
+    ):
+        _validate_kernel(
+            comm_all_gather_horizontal_shape_kernel((2, 8, 8)),
+            tmp_path,
+            mlir_filename="comm_all_gather_sub_1024_byte_leaves_suvm.mlir",
+            expected_tokens=("suvm.mcast_async",),
+        )
+
+
 def test_comm_all_reduce_horizontal_codegen_validates_with_npuir_opt(tmp_path):
     src = _validate_kernel(
         comm_all_reduce_horizontal_kernel(),
@@ -323,15 +504,244 @@ def test_comm_all_reduce_horizontal_codegen_validates_with_npuir_opt(tmp_path):
     assert src.count("suvm.mcast_async") >= 1
 
 
-def test_comm_all_reduce_horizontal_rank3_codegen_validates_with_npuir_opt(tmp_path):
+def test_comm_all_reduce_non_block_aligned_shape_validates_strictly(tmp_path):
     src = _validate_kernel(
-        comm_all_reduce_horizontal_rank3_kernel(),
+        comm_all_reduce_shape_kernel((97, 256)),
         tmp_path,
-        mlir_filename="comm_all_reduce_horizontal_rank3_kernel_suvm.mlir",
-        expected_tokens=("suvm.copy_async", "suvm.mcast_tok"),
+        mlir_filename="comm_all_reduce_non_block_aligned_suvm.mlir",
+        expected_tokens=("suvm.mcast_async",),
+        opt_args=STRICT_OPT_ARGS,
+    )
+    assert len(find_async_op_lines(src, "suvm.mcast_async")) == 1
+
+
+def test_comm_all_reduce_rejects_total_rsram_overflow(tmp_path):
+    with pytest.raises(
+        tvm.error.InternalError,
+        match=(
+            r"all_reduce requires at least 983040 bytes.*"
+            r"target RSRAM capacity 786432 bytes"
+        ),
+    ):
+        _validate_kernel(
+            comm_all_reduce_shape_kernel((160, 256)),
+            tmp_path,
+            mlir_filename="comm_all_reduce_direct_rsram_overflow_suvm.mlir",
+        )
+
+
+def test_comm_all_reduce_rejects_two_stage_total_rsram_overflow(tmp_path):
+    with pytest.raises(
+        tvm.error.InternalError,
+        match=(
+            r"all_reduce requires at least 1310720 bytes.*"
+            r"target RSRAM capacity 786432 bytes"
+        ),
+    ):
+        _validate_kernel(
+            comm_all_reduce_shape_kernel((2, 128, 128), direction="all"),
+            tmp_path,
+            mlir_filename="comm_all_reduce_two_stage_total_rsram_overflow_suvm.mlir",
+        )
+
+
+def test_comm_all_reduce_two_stage_rsram_boundary_validates_strictly(tmp_path):
+    src = _validate_kernel(
+        comm_all_reduce_shape_kernel((2, 96, 96), direction="all"),
+        tmp_path,
+        mlir_filename="comm_all_reduce_two_stage_rsram_boundary_suvm.mlir",
+        expected_tokens=("suvm.mcast_async",),
+        opt_args=STRICT_OPT_ARGS,
+    )
+    assert len(find_async_op_lines(src, "suvm.mcast_async")) == 4
+
+
+@pytest.mark.parametrize(
+    "direction,clear,expected_units",
+    [
+        pytest.param("horizontal", True, ("odma1",), id="horizontal-clear"),
+        pytest.param("horizontal", False, ("odma1",), id="horizontal-accumulate"),
+        pytest.param("vertical", True, ("odma0",), id="vertical-clear"),
+        pytest.param("vertical", False, ("odma0",), id="vertical-accumulate"),
+        pytest.param("all", True, ("odma0", "odma1"), id="all-clear"),
+        pytest.param("all", False, ("odma0", "odma1"), id="all-accumulate"),
+    ],
+)
+def test_comm_all_reduce_rank3_directions_codegen_validate_with_npuir_opt(
+    tmp_path,
+    direction,
+    clear,
+    expected_units,
+):
+    src = _validate_kernel(
+        comm_all_reduce_rank3_kernel(direction=direction, clear=clear),
+        tmp_path,
+        mlir_filename=f"comm_all_reduce_rank3_{direction}_clear_{clear}_suvm.mlir",
+        expected_tokens=("suvm.copy_async", "suvm.mcast_async", "suvm.sync", "suvm.tile.addf"),
+        opt_args=STRICT_OPT_ARGS,
     )
 
-    assert src.count("suvm.mcast_tok") >= 2
+    mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
+    assert len(mcast_lines) == 2 * len(expected_units)
+    for unit in expected_units:
+        assert any(f"<unit = {unit}>" in line for line in mcast_lines)
+    _assert_allreduce_link_sync_order(src, direction)
+
+
+@pytest.mark.parametrize(
+    "direction,clear,min_mcast_count,expected_units",
+    [
+        pytest.param("horizontal", True, 1, ("odma1",), id="horizontal-clear"),
+        pytest.param("horizontal", False, 1, ("odma1",), id="horizontal-accumulate"),
+        pytest.param("vertical", True, 1, ("odma0",), id="vertical-clear"),
+        pytest.param("vertical", False, 1, ("odma0",), id="vertical-accumulate"),
+        pytest.param("all", True, 2, ("odma0", "odma1"), id="all-clear"),
+        pytest.param("all", False, 2, ("odma0", "odma1"), id="all-accumulate"),
+    ],
+)
+def test_comm_all_reduce_bf16_to_fp32_codegen_validates_with_npuir_opt(
+    tmp_path,
+    direction,
+    clear,
+    min_mcast_count,
+    expected_units,
+):
+    src = _validate_kernel(
+        comm_all_reduce_mixed_dtype_kernel(direction=direction, clear=clear),
+        tmp_path,
+        mlir_filename=f"comm_all_reduce_bf16_to_fp32_{direction}_clear_{clear}_suvm.mlir",
+        expected_tokens=("suvm.mcast_async", "suvm.tile.cast", "xbf16>", "xf32>"),
+        opt_args=STRICT_OPT_ARGS,
+    )
+
+    mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
+    assert len(mcast_lines) >= min_mcast_count
+    for unit in expected_units:
+        assert any(f"<unit = {unit}>" in line for line in mcast_lines)
+    for line in mcast_lines:
+        if direction == "all" and "<unit = odma1>" in line:
+            assert "xf32>" in line
+        else:
+            assert "xbf16>" in line
+
+
+@pytest.mark.parametrize(
+    "shape,expected_reduce_tile",
+    [
+        pytest.param((1, 32, 32), "4x32", id="leading-unit"),
+        pytest.param((32, 1, 32), "4x32", id="middle-unit"),
+        pytest.param((32, 32, 1), "4x32", id="trailing-unit"),
+        pytest.param((1, 32, 1, 32), "4x32", id="multiple-unit"),
+    ],
+)
+def test_comm_all_reduce_unit_dims_emit_one_legal_multicast(
+    shape, expected_reduce_tile, tmp_path
+):
+    src = _validate_kernel(
+        comm_all_reduce_shape_kernel(shape),
+        tmp_path,
+        mlir_filename=f"comm_all_reduce_unit_dims_{'_'.join(map(str, shape))}_suvm.mlir",
+        expected_tokens=("suvm.mcast_async", "suvm.tile.load", "suvm.tile.store"),
+        opt_args=STRICT_OPT_ARGS,
+    )
+
+    assert len(find_async_op_lines(src, "suvm.mcast_async")) == 1
+    assert f"!suvm.tile<{expected_reduce_tile}xf32>" in src
+    lowered = simplify_suvm_mlir(src, opt_args=STRICT_OPT_ARGS)
+    for intrinsic in ("vload", "vfadd", "vstore"):
+        assert f"llvm.riscv.sunmmio.{intrinsic}" in lowered
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        pytest.param((1, 32, 32), id="leading-unit"),
+        pytest.param((32, 1, 32), id="middle-unit"),
+        pytest.param((32, 32, 1), id="trailing-unit"),
+        pytest.param((1, 32, 1, 32), id="multiple-unit"),
+    ],
+)
+@pytest.mark.parametrize("clear", [True, False], ids=["clear", "accumulate"])
+def test_comm_all_reduce_all_direction_unit_dims_validate_with_npuir_opt(
+    shape, clear, tmp_path
+):
+    src = _validate_kernel(
+        comm_all_reduce_shape_kernel(shape, direction="all", clear=clear),
+        tmp_path,
+        mlir_filename=(
+            f"comm_all_reduce_all_unit_dims_{'_'.join(map(str, shape))}_"
+            f"clear_{clear}_suvm.mlir"
+        ),
+        expected_tokens=("suvm.mcast_async", "suvm.sync", "suvm.tile.addf"),
+        opt_args=STRICT_OPT_ARGS,
+    )
+
+    mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
+    assert len(mcast_lines) == 2
+    assert any("<unit = odma0>" in line for line in mcast_lines)
+    assert any("<unit = odma1>" in line for line in mcast_lines)
+    _assert_allreduce_link_sync_order(src, "all")
+
+
+def test_comm_all_reduce_minimum_1024_byte_leaf_is_statically_expanded(tmp_path):
+    src = _validate_kernel(
+        comm_all_reduce_shape_kernel((2, 16, 16)),
+        tmp_path,
+        mlir_filename="comm_all_reduce_minimum_1024_byte_leaf_suvm.mlir",
+        expected_tokens=("suvm.mcast_async",),
+        opt_args=STRICT_OPT_ARGS,
+    )
+
+    assert len(find_async_op_lines(src, "suvm.mcast_async")) == 2
+
+
+@pytest.mark.parametrize(
+    ("reduce_type", "tile_op"),
+    [
+        ("bitand", "suvm.tile.andi"),
+        ("bitor", "suvm.tile.ori"),
+        ("bitxor", "suvm.tile.xori"),
+    ],
+)
+@pytest.mark.parametrize("dtype", ["int32", "uint32"])
+def test_comm_all_reduce_rank3_bitwise_codegen_validates_with_npuir_opt(
+    dtype, reduce_type, tile_op, tmp_path
+):
+    src = _validate_kernel(
+        comm_all_reduce_rank3_kernel(dtype=dtype, reduce_type=reduce_type),
+        tmp_path,
+        mlir_filename=f"comm_all_reduce_rank3_{dtype}_{reduce_type}_suvm.mlir",
+        expected_tokens=("suvm.mcast_async", tile_op),
+        opt_args=STRICT_OPT_ARGS,
+    )
+
+    assert len(find_async_op_lines(src, "suvm.mcast_async")) == 2
+    assert tile_op in src
+
+
+@pytest.mark.parametrize(
+    ("reduce_type", "tile_op"),
+    [
+        ("bitand", "suvm.tile.andi"),
+        ("bitor", "suvm.tile.ori"),
+        ("bitxor", "suvm.tile.xori"),
+    ],
+)
+@pytest.mark.parametrize("dtype", ["int32", "uint32"])
+def test_comm_all_reduce_rank1_bitwise_codegen_validates_with_npuir_opt(
+    dtype, reduce_type, tile_op, tmp_path
+):
+    src = _validate_kernel(
+        comm_all_reduce_shape_kernel(
+            (256,), dtype=dtype, reduce_type=reduce_type
+        ),
+        tmp_path,
+        mlir_filename=f"comm_all_reduce_rank1_{dtype}_{reduce_type}_suvm.mlir",
+        expected_tokens=("suvm.mcast_async", tile_op),
+    )
+
+    assert len(find_async_op_lines(src, "suvm.mcast_async")) == 1
+    assert tile_op in src
 
 
 def test_sync_simple_copy_kernel_codegen_validates_with_npuir_opt(tmp_path):

@@ -11,14 +11,14 @@ tilelang.env.disable_cache()
 
 def apply_sunmmio_passes(mod, target):
     mod = tvm.tir.transform.BindTarget(target)(mod)
-    mod = tilelang.transform.AddWrapperForSingleBufStore()(mod)
+    mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
     mod = tilelang.transform.LegalizeNegativeIndex()(mod)
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
     mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
-    mod = tilelang.transform.LayoutReducer()(mod)
     mod = tilelang.transform.SunmmioLayoutInference()(mod)
+    mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     return mod
 
@@ -36,7 +36,7 @@ def allreduce_kernel(direction="all", clear=True, dtype="float32"):
             T.copy(A, A_shared)
             if not clear:
                 T.copy(Out, Out_shared)
-            T.comm.all_reduce(A_shared, Out_shared, "sum", direction, dim=1, clear=clear)
+            T.comm.all_reduce(A_shared, Out_shared, "sum", direction, clear=clear)
             T.copy(Out_shared, Out)
 
     return tvm.IRModule({"main": main})

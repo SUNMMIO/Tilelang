@@ -27,8 +27,7 @@ using namespace tir;
  *
  * If the buffer has a CuteLayout in `layout_map`, delegates to
  * ComputeContiguousTileSteps.  Otherwise, synthesizes row-major steps
- * from the buffer's trailing dimensions (last dim contiguous, then
- * second-to-last dim).
+ * from the buffer's dimensions, walking from innermost to outermost.
  *
  * The returned steps describe the contiguous tile envelope that the
  * planner uses to enumerate legal tile shapes without layout-kind
@@ -203,6 +202,17 @@ TileView MakeTrailingTileView(const Array<PrimExpr> &buffer_shape,
                               const TrailingTilePattern &pattern);
 
 /*!
+ * \brief Materialize a TileView while preserving a pattern's buffer-dimension
+ * mapping.
+ *
+ * Unlike `MakeTrailingTileView`, this accepts non-adjacent original dimensions
+ * produced by unit-dimension elimination and records them in the index map.
+ * The buffer shape itself is never squeezed.
+ */
+TileView MakeTileViewFromPattern(const Array<PrimExpr> &buffer_shape,
+                                 const TrailingTilePattern &pattern);
+
+/*!
  * \brief Enumerate all inferred trailing tile patterns legal for a buffer.
  *
  * This is the main shared legality enumerator. It applies the modeled Sunmmio
@@ -212,6 +222,22 @@ TileView MakeTrailingTileView(const Array<PrimExpr> &buffer_shape,
  */
 std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
     const Buffer &buffer, int exec_rank, const Map<Buffer, Layout> &layout_map,
+    const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
+    TilePatternOptions options);
+
+/*!
+ * \brief Enumerate inferred tile patterns on explicit buffer dimensions.
+ *
+ * `execution_dims` contains one or two normalized buffer dimensions ordered
+ * from outermost to innermost. A non-execution dimension is transparent only
+ * when both its logical and physical step extents are one; padded or otherwise
+ * larger physical extents remain hard boundaries. Patterns retain their
+ * original buffer-dimension mapping even when transparent unit dimensions lie
+ * between the two execution dimensions.
+ */
+std::vector<TrailingTilePattern> EnumerateInferredTilePatterns(
+    const Buffer &buffer, const std::vector<int> &execution_dims,
+    const Map<Buffer, Layout> &layout_map,
     const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
     TilePatternOptions options);
 

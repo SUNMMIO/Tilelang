@@ -125,6 +125,55 @@ std::optional<int> GetExecutionAxisAnnotation(const ForNode *loop) {
   return static_cast<int>(Downcast<Integer>((*axis_it).second)->value);
 }
 
+std::optional<int> GetDomainAxisAnnotation(const ForNode *loop) {
+  if (loop == nullptr) {
+    return std::nullopt;
+  }
+  auto axis_it = loop->annotations.find(tl::attr::tile_domain_axis);
+  if (axis_it == loop->annotations.end()) {
+    return std::nullopt;
+  }
+  return static_cast<int>(Downcast<Integer>((*axis_it).second)->value);
+}
+
+std::vector<const ForNode *> SelectDomainLoops(
+    const std::vector<const ForNode *> &chain, size_t domain_rank,
+    bool *uses_explicit_axes) {
+  ICHECK(uses_explicit_axes);
+  // A fused scope can contain an annotated reduction deeper in an otherwise
+  // positional T.Tiles chain. Only the scope root selects explicit mapping;
+  // reduction lowering annotates every surviving domain loop, including the
+  // root, while legacy and hybrid scopes retain their positional contract.
+  *uses_explicit_axes =
+      !chain.empty() && GetDomainAxisAnnotation(chain.front()).has_value();
+
+  std::vector<const ForNode *> result;
+  if (!*uses_explicit_axes) {
+    const size_t prefix_depth = std::min(chain.size(), domain_rank);
+    result.insert(result.end(), chain.begin(), chain.begin() + prefix_depth);
+    return result;
+  }
+
+  std::vector<bool> seen_axes(domain_rank, false);
+  for (const ForNode *loop : chain) {
+    std::optional<int> axis = GetDomainAxisAnnotation(loop);
+    if (!axis.has_value()) {
+      continue;
+    }
+    ICHECK_GE(*axis, 0);
+    ICHECK_LT(static_cast<size_t>(*axis), domain_rank)
+        << "tile.domain_axis " << *axis << " is out of range for rank "
+        << domain_rank;
+    ICHECK(!seen_axes[static_cast<size_t>(*axis)])
+        << "Duplicate tile.domain_axis " << *axis << " in one Tiles scope";
+    seen_axes[static_cast<size_t>(*axis)] = true;
+    result.push_back(loop);
+  }
+  ICHECK(!result.empty())
+      << "Explicit tile.domain_axis metadata did not identify a domain loop";
+  return result;
+}
+
 std::vector<int64_t>
 ParseStaticIntArray(const ffi::Map<ffi::String, ffi::Any> &annotations,
                     const char *key) {
@@ -644,11 +693,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
   std::vector<const ForNode *> chain = CollectLinearForChain(op);
   ICHECK(!chain.empty()) << "Tiles scope root must be a loop";
   const size_t domain_rank = scope.domain_shape.size();
-  const size_t shared_prefix_depth = std::min(chain.size(), domain_rank);
-  const bool has_partial_execution_prefix = shared_prefix_depth < domain_rank;
-  for (size_t i = 0; i < shared_prefix_depth; ++i) {
-    scope.domain_loops.push_back(chain[i]);
-  }
+  bool uses_explicit_domain_axes = false;
+  scope.domain_loops =
+      SelectDomainLoops(chain, domain_rank, &uses_explicit_domain_axes);
+  const bool has_partial_execution_prefix =
+      scope.domain_loops.size() < domain_rank;
   scope.execution_loops.assign(scope.execution_domain_axes.size(), nullptr);
   for (const ForNode *loop : scope.domain_loops) {
     auto axis_it = loop->annotations.find(tl::attr::tile_execution_axis);
@@ -1516,7 +1565,7 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       return DataType::Int(16);
     }
     if ((dtype.is_float() && dtype.bits() == 32) ||
-        (dtype.is_int() && dtype.bits() == 32)) {
+        ((dtype.is_int() || dtype.is_uint()) && dtype.bits() == 32)) {
       return DataType::Int(32);
     }
     LOG(FATAL) << "Unsupported masked tile dtype for SunMMIO mask index "
@@ -1945,6 +1994,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     }
     size_t loop_axis =
         static_cast<size_t>(std::distance(scope.domain_loops.begin(), loop_it));
+    if (std::optional<int> explicit_axis = GetDomainAxisAnnotation(loop)) {
+      ICHECK_GE(*explicit_axis, 0);
+      loop_axis = static_cast<size_t>(*explicit_axis);
+    }
     ICHECK_LT(loop_axis, scope.domain_values.size());
     auto execution_axis = GetExecutionAxisAnnotation(loop);
     if (!execution_axis.has_value()) {
@@ -2596,6 +2649,87 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     return merged;
   };
 
+  auto find_scalar_aligned_carrier_dim =
+      [&](const Buffer &buffer, const SunMMIOType &memtensor_type) -> int64_t {
+    std::vector<int64_t> memtensor_shape = ExtractStaticShape(memtensor_type);
+    ICHECK(!memtensor_shape.empty())
+        << "Scalar tile region expects a non-empty memtensor shape";
+
+    const DataType dtype = CanonicalizeSuvmDType(buffer->dtype);
+    const int64_t align_elems = static_cast<int64_t>(
+        tl::GetSunmmioRsramAlignmentElems(
+            tile_processor_config.rsram_align_bytes, dtype));
+    ICHECK_GT(align_elems, 0)
+        << "Scalar RSRAM access expects a positive alignment extent";
+
+    std::vector<int64_t> layout_shape =
+        memtensor_type.layout_hshape.empty()
+            ? memtensor_shape
+            : ExtractStaticPrimExprs(memtensor_type.layout_hshape,
+                                     "scalar carrier layout shape");
+    std::vector<int64_t> strides =
+        memtensor_type.layout_hstride.empty()
+            ? std::vector<int64_t>{}
+            : ExtractStaticPrimExprs(memtensor_type.layout_hstride,
+                                     "scalar carrier layout stride");
+    if (strides.empty()) {
+      strides.assign(layout_shape.size(), 1);
+      for (int mode = static_cast<int>(layout_shape.size()) - 2; mode >= 0;
+           --mode) {
+        strides[static_cast<size_t>(mode)] =
+            strides[static_cast<size_t>(mode + 1)] *
+            layout_shape[static_cast<size_t>(mode + 1)];
+      }
+    }
+    ICHECK_EQ(strides.size(), layout_shape.size())
+        << "Scalar carrier layout shape/stride size mismatch";
+
+    std::vector<uint8_t> dim_levels = memtensor_type.layout_dim_levels;
+    if (dim_levels.empty()) {
+      dim_levels.assign(memtensor_shape.size(), 1);
+    }
+    ICHECK_EQ(dim_levels.size(), memtensor_shape.size())
+        << "Scalar carrier layout must provide one level count per logical "
+           "dimension";
+
+    size_t mode_offset = 0;
+    for (int64_t dim = 0; dim < static_cast<int64_t>(memtensor_shape.size());
+         ++dim) {
+      int levels = dim_levels[static_cast<size_t>(dim)];
+      ICHECK_GT(levels, 0);
+      ICHECK_LE(mode_offset + static_cast<size_t>(levels),
+                layout_shape.size());
+
+      int64_t covered_extent = 1;
+      for (int level = 0; level < levels; ++level) {
+        covered_extent *= layout_shape[mode_offset + level];
+      }
+      bool carrier_fits_innermost_mode =
+          layout_shape[mode_offset] >= align_elems &&
+          layout_shape[mode_offset] % align_elems == 0;
+      bool outer_modes_are_aligned = true;
+      for (size_t mode = 0; mode < strides.size(); ++mode) {
+        if (mode == mode_offset) {
+          continue;
+        }
+        outer_modes_are_aligned =
+            outer_modes_are_aligned && strides[mode] % align_elems == 0;
+      }
+      if (covered_extent >= align_elems && strides[mode_offset] == 1 &&
+          carrier_fits_innermost_mode && outer_modes_are_aligned) {
+        return dim;
+      }
+      mode_offset += static_cast<size_t>(levels);
+    }
+    ICHECK_EQ(mode_offset, layout_shape.size());
+    LOG(FATAL) << "Cannot find a " << align_elems
+               << "-element contiguous aligned carrier for scalar RSRAM "
+                  "access to buffer "
+               << buffer->name;
+    TVM_FFI_UNREACHABLE();
+    return -1;
+  };
+
   auto make_tile_access_from_region =
       [&](const BufferRegion &region,
           const std::optional<std::vector<int>> &tile_axes_override =
@@ -2639,7 +2773,12 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     if (access.tile_shape.empty()) {
       ICHECK(!memtensor_shape.empty())
           << "Tile region lowering expects at least one memtensor dimension";
-      access.tiled_dims.push_back(0);
+      int64_t carrier_dim = IsRsramScope(binding.buffer_type.memory_scope)
+                                ? find_scalar_aligned_carrier_dim(
+                                      access.buffer, binding.buffer_type)
+                                : static_cast<int64_t>(memtensor_shape.size()) -
+                                      1;
+      access.tiled_dims.push_back(carrier_dim);
       access.tile_shape.push_back(1);
       access.tile_axes.push_back(0);
       if (access.partition_indices.empty()) {
@@ -3635,6 +3774,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     }
     auto emit_binary = [&](BinaryOp op, const PrimExpr &lhs_expr,
                            const PrimExpr &rhs_expr, DataType dtype) {
+      bool is_bitwise = op == BinaryOp::kAnd || op == BinaryOp::kOr ||
+                        op == BinaryOp::kXor;
       bool supports_mixed_precision = supports_mixed_precision_binary(op);
       std::optional<DataType> integer_preferred =
           canonical_integer_preferred_dtype(preferred_dtype);
@@ -3661,6 +3802,41 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                                 arithmetic_flavor_for_dtype(result_dtype), lhs,
                                 rhs, result_type, result_dtype);
       }
+      if (is_bitwise) {
+        auto is_supported_integer_dtype = [](DataType value_dtype) {
+          value_dtype = CanonicalizeSuvmDType(value_dtype);
+          return (value_dtype.is_int() || value_dtype.is_uint()) &&
+                 value_dtype.bits() == 32 && value_dtype.lanes() == 1;
+        };
+        if (result_dtype.is_bool()) {
+          bool has_mask_operands =
+              IsTileLike(lhs) && IsTileLike(rhs) && lhs.dtype.is_bool() &&
+              rhs.dtype.is_bool();
+          if (!has_mask_operands) {
+            UnsupportedExpr(
+                expr.get(),
+                "SunMMIO i1 tile bitwise operations require two mask tile "
+                "operands");
+          }
+        } else {
+          std::optional<DataType> unsupported_dtype;
+          if (IsTileLike(lhs) && !is_supported_integer_dtype(lhs.dtype)) {
+            unsupported_dtype = lhs.dtype;
+          } else if (IsTileLike(rhs) &&
+                     !is_supported_integer_dtype(rhs.dtype)) {
+            unsupported_dtype = rhs.dtype;
+          } else if (!is_supported_integer_dtype(result_dtype)) {
+            unsupported_dtype = result_dtype;
+          }
+          if (unsupported_dtype.has_value()) {
+            std::ostringstream detail;
+            detail << "SunMMIO tile bitwise operations require int32 or "
+                      "uint32 elements, got "
+                   << unsupported_dtype.value();
+            UnsupportedExpr(expr.get(), detail.str());
+          }
+        }
+      }
       std::vector<int64_t> result_shape = tile_result_shape(lhs, rhs);
       lhs = orient_expr_tile_operand(lhs, lhs_expr, result_shape);
       rhs = orient_expr_tile_operand(rhs, rhs_expr, result_shape);
@@ -3686,9 +3862,14 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         lhs = cast_value_to_dtype(lhs, result_dtype);
         rhs = cast_value_to_dtype(rhs, result_dtype);
       }
-      return builder_->Binary(NewValueName(), op,
-                              arithmetic_flavor_for_dtype(result_dtype), lhs,
-                              rhs, tile_type, result_dtype);
+      ArithmeticFlavor flavor =
+          is_bitwise && result_dtype.is_bool()
+              ? ArithmeticFlavor::kBool
+              : arithmetic_flavor_for_dtype(result_dtype);
+      // A4E supports i1 mask combiners only in their unmasked form. Tail
+      // predicates remain on the surrounding tile load/store operations.
+      return builder_->Binary(NewValueName(), op, flavor, lhs, rhs, tile_type,
+                              result_dtype);
     };
     auto emit_compare_to_shape =
         [&](CompareOp op, const PrimExpr &lhs_expr, const PrimExpr &rhs_expr,
@@ -5026,11 +5207,12 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                  "mismatch";
 
           std::vector<const ForNode *> chain = CollectLinearForChain(loop);
-          ICHECK_GE(chain.size(), scope.domain_shape.size())
+          bool uses_explicit_domain_axes = false;
+          scope.domain_loops = SelectDomainLoops(
+              chain, scope.domain_shape.size(), &uses_explicit_domain_axes);
+          ICHECK(uses_explicit_domain_axes ||
+                 chain.size() >= scope.domain_shape.size())
               << "Nested Tiles scope loop chain shorter than tile.domain rank";
-          for (size_t i = 0; i < scope.domain_shape.size(); ++i) {
-            scope.domain_loops.push_back(chain[i]);
-          }
           scope.execution_loops.assign(scope.execution_domain_axes.size(),
                                        nullptr);
           for (const ForNode *domain_loop : scope.domain_loops) {

@@ -48,6 +48,54 @@ PrimExpr MakeUnsignedAllOnes(DataType dtype) {
   return make_const(dtype, value);
 }
 
+PrimExpr MakeSignedMinimum(DataType dtype) {
+  ICHECK(dtype.is_int()) << "Expected signed integer dtype, got " << dtype;
+  int bits = dtype.bits();
+  ICHECK_GT(bits, 0) << "Signed integer dtype must have positive width.";
+  ICHECK_LE(bits, 64) << "Unsupported signed integer dtype width " << bits;
+
+  int64_t value = bits == 64 ? std::numeric_limits<int64_t>::min()
+                             : -(int64_t{1} << (bits - 1));
+  return make_const(dtype, value);
+}
+
+PrimExpr MakeSignedMaximum(DataType dtype) {
+  ICHECK(dtype.is_int()) << "Expected signed integer dtype, got " << dtype;
+  int bits = dtype.bits();
+  ICHECK_GT(bits, 0) << "Signed integer dtype must have positive width.";
+  ICHECK_LE(bits, 64) << "Unsupported signed integer dtype width " << bits;
+
+  int64_t value = bits == 64 ? std::numeric_limits<int64_t>::max()
+                             : ((int64_t{1} << (bits - 1)) - int64_t{1});
+  return make_const(dtype, value);
+}
+
+void ValidateSunmmioReduceDType(const ReduceType &type, DataType src_dtype,
+                                DataType dst_dtype) {
+  if (type->isBitAnd() || type->isBitOr() || type->isBitXor()) {
+    auto is_supported = [](DataType dtype) {
+      return (dtype.is_int() || dtype.is_uint()) && dtype.bits() == 32 &&
+             dtype.lanes() == 1;
+    };
+    ICHECK(is_supported(src_dtype) && is_supported(dst_dtype) &&
+           src_dtype == dst_dtype)
+        << "Sunmmio bitwise reduction requires input and output dtypes to be "
+           "both int32 or both uint32, got "
+        << src_dtype << " and " << dst_dtype;
+  }
+  if (type->isMin() || type->isMax() || type->isAbsMax()) {
+    auto is_supported = [](DataType dtype) {
+      return dtype.lanes() == 1 &&
+             (dtype.is_bfloat16() ||
+              (dtype.is_float() && dtype.bits() == 32));
+    };
+    ICHECK(is_supported(src_dtype) && is_supported(dst_dtype))
+        << "Sunmmio min/max/absmax reduction requires scalar bfloat16 or "
+           "float32 input and output dtypes, got "
+        << src_dtype << " and " << dst_dtype;
+  }
+}
+
 } // namespace
 
 // NormalizeToBufferRegion moved to src/op/utils.{h,cc}
@@ -64,6 +112,15 @@ ReduceOp::ReduceOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   std::string reduce_type = args[2].as<StringImm>().value()->value;
   node->dim = args[3].as<IntImm>().value()->value;
   node->type = ReduceType(reduce_type);
+  if (node->type->isBitAnd() || node->type->isBitOr() ||
+      node->type->isBitXor()) {
+    auto is_integer = [](DataType dtype) {
+      return dtype.is_int() || dtype.is_uint();
+    };
+    ICHECK(is_integer(node->src->dtype) && is_integer(node->dst->dtype))
+        << "Bitwise reduction requires integer input and output dtypes, got "
+        << node->src->dtype << " and " << node->dst->dtype;
+  }
   node->clear = args[4].as<Bool>().value();
   data_ = std::move(node);
 }
@@ -82,7 +139,6 @@ PrimExpr ReduceOpNode::MakeInitValue() const {
   auto dst_dtype = dst->dtype;
   auto is_int = dst_dtype.is_int();
   bool is_uint = dst_dtype.is_uint();
-  auto bits = dst_dtype.bits();
 
   if (type->isSum()) {
     return make_zero(dst->dtype);
@@ -90,7 +146,7 @@ PrimExpr ReduceOpNode::MakeInitValue() const {
     return make_zero(dst->dtype);
   } else if (type->isMax()) {
     if (is_int) {
-      return make_const(dst->dtype, -(1 << (bits - 1)));
+      return MakeSignedMinimum(dst->dtype);
     } else if (is_uint) {
       return make_const(dst->dtype, 0);
     } else {
@@ -98,7 +154,7 @@ PrimExpr ReduceOpNode::MakeInitValue() const {
     }
   } else if (type->isMin()) {
     if (is_int) {
-      return make_const(dst->dtype, (1 << (bits - 1)) - 1);
+      return MakeSignedMaximum(dst->dtype);
     } else if (is_uint) {
       return MakeUnsignedAllOnes(dst->dtype);
     } else {
@@ -107,17 +163,19 @@ PrimExpr ReduceOpNode::MakeInitValue() const {
   } else if (type->isAbsMax()) {
     return make_const(dst->dtype, 0);
   } else if (type->isBitAnd()) {
+    ICHECK(is_int || is_uint)
+        << "Bitwise reduction requires an integer dtype, got " << dst_dtype;
     if (is_int) {
       return make_const(dst->dtype, -1);
-    } else if (is_uint) {
-      return MakeUnsignedAllOnes(dst->dtype);
-    } else {
-      // Should not arrive here
-      return make_const(dst->dtype, -INFINITY);
     }
+    return MakeUnsignedAllOnes(dst->dtype);
   } else if (type->isBitOr()) {
+    ICHECK(is_int || is_uint)
+        << "Bitwise reduction requires an integer dtype, got " << dst_dtype;
     return make_zero(dst->dtype);
   } else if (type->isBitXor()) {
+    ICHECK(is_int || is_uint)
+        << "Bitwise reduction requires an integer dtype, got " << dst_dtype;
     return make_zero(dst->dtype);
   } else {
     LOG(FATAL) << "Unsupported reduce type: " << type->type;
@@ -250,9 +308,13 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
 
   Optional<TileView> opt_tv_src = find_tileview(this->src);
   Optional<TileView> opt_tv_dst = find_tileview(this->dst);
+  bool allow_tiled_reduction =
+      !(this->type->isBitAnd() || this->type->isBitOr() ||
+        this->type->isBitXor());
 
   ReduceTileViewPlan plan = PlanReduceTileViews(
-      this->srcRegion_, this->dstRegion_, this->dim, {opt_tv_src, opt_tv_dst},
+      this->srcRegion_, this->dstRegion_, this->dim,
+      {opt_tv_src, opt_tv_dst, allow_tiled_reduction},
       T.layout_map, GetSunmmioTileProcessorConfig(T.target), analyzer);
 
   TileView tv_src = plan.src_tileview;
@@ -794,6 +856,7 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
   {
     int i = this->dim;
     Map<String, ObjectRef> loop_anno;
+    loop_anno.Set(attr::tile_domain_axis, Integer(i));
     if (src_dim_to_execution_axis.count(i)) {
       loop_anno.Set(attr::tile_execution_axis,
                     Integer(src_dim_to_execution_axis.at(i)));
@@ -810,6 +873,7 @@ Stmt ReduceOpNode::MakeSunmmioTileReduce(const LowerArgs &T,
     if (i == this->dim)
       continue;
     Map<String, ObjectRef> loop_anno;
+    loop_anno.Set(attr::tile_domain_axis, Integer(i));
     if (src_dim_to_execution_axis.count(i)) {
       loop_anno.Set(attr::tile_execution_axis,
                     Integer(src_dim_to_execution_axis.at(i)));
@@ -903,6 +967,7 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   auto dst_scope = this->dst.scope();
 
   if (TargetIsSunmmio(T.target)) {
+    ValidateSunmmioReduceDType(this->type, this->src->dtype, this->dst->dtype);
     return MakeSunmmioTileReduce(T, analyzer);
   }
 
@@ -1175,6 +1240,10 @@ LayoutMap ReduceOpNode::InferLayout(const LayoutInferArgs &T,
                                     InferLevel level) const {
   if (level >= InferLevel::kStrict)
     return {};
+
+  if (TargetIsSunmmio(T.target)) {
+    ValidateSunmmioReduceDType(this->type, this->src->dtype, this->dst->dtype);
+  }
 
   // Sunmmio RSRAM reduce: derive the dst layout from the src. A surviving
   // blocked (ZZ) structure is kept via DeriveLayoutLike; any row-major result

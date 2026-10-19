@@ -180,8 +180,6 @@ def apply_reduce_op(reduce_op, buffer, out, reduce_axis, clear=True):
         T.reduce_max(buffer, out, dim=reduce_axis, clear=clear)
     elif reduce_op == "min":
         T.reduce_min(buffer, out, dim=reduce_axis, clear=clear)
-    elif reduce_op == "bitand":
-        T.reduce_bitand(buffer, out, dim=reduce_axis, clear=clear)
     else:
         raise ValueError(f"Unsupported reduce_op={reduce_op}")
 
@@ -388,13 +386,13 @@ def _expected_tiled_reduce(shape, reduce_axis):
     return len(shape) == 1 or reduce_axis >= len(shape) - 2
 
 
-def _tail_identity_text(reduce_op):
+def _tail_identity_text(reduce_op, dtype="float16"):
     if reduce_op == "sum":
-        return "T.float16(0.0)"
+        return f"T.{dtype}(0.0)"
     if reduce_op == "max":
-        return 'T.float16("-inf")'
+        return f'T.{dtype}("-inf")'
     if reduce_op == "min":
-        return 'T.float16("inf")'
+        return f'T.{dtype}("inf")'
     raise ValueError(f"Unsupported reduce_op={reduce_op}")
 
 
@@ -526,11 +524,11 @@ def test_tilelang_reduce_sunmmio_uses_row_major_covered_source_tile():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
 
     @T.prim_func
-    def main(A: T.Tensor((1000,), "float16"), Out: T.Tensor((1,), "float16")):
+    def main(A: T.Tensor((1000,), "bfloat16"), Out: T.Tensor((1,), "bfloat16")):
         with T.Kernel(1, threads=128):
-            A_shared = T.alloc_shared((1000,), "float16", scope="shared.rsram")
-            Out_shared = T.alloc_shared((1,), "float16", scope="shared.rsram")
-            T.annotate_layout({A_shared: make_aligned_row_major((1000,), "float16", 64)})
+            A_shared = T.alloc_shared((1000,), "bfloat16", scope="shared.rsram")
+            Out_shared = T.alloc_shared((1,), "bfloat16", scope="shared.rsram")
+            T.annotate_layout({A_shared: make_aligned_row_major((1000,), "bfloat16", 64)})
             T.annotate_tileview({A_shared: make_tileview(A_shared, (1024,), (-1,))})
             T.copy(A, A_shared)
             T.reduce_max(A_shared, Out_shared, dim=0)
@@ -546,7 +544,7 @@ def test_tilelang_reduce_sunmmio_uses_row_major_covered_source_tile():
     assert checker.scope_root is not None
     assert [int(x) for x in checker.scope_root.annotations["tile.tile_size"]] == [1024]
     script = mod.script()
-    assert 'T.float16("-inf")' in script
+    assert 'T.bfloat16("-inf")' in script
     assert "< 1000" in script or "<1000" in script
 
 
@@ -594,7 +592,9 @@ def test_tilelang_reduce_sunmmio_tiled_axis_tail_uses_if_then_else_mask():
 )
 def test_tilelang_reduce_sunmmio_tiled_axis_tail_uses_predicated_update(reduce_op):
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    mod = reduce_kernel_with_tileview_builder((8, 63, 250), reduce_axis=2, reduce_op=reduce_op)
+    mod = reduce_kernel_with_tileview_builder(
+        (8, 63, 250), reduce_axis=2, dtype="float32", reduce_op=reduce_op
+    )
 
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
@@ -602,7 +602,7 @@ def test_tilelang_reduce_sunmmio_tiled_axis_tail_uses_predicated_update(reduce_o
 
     script = mod.script()
     assert "T.if_then_else" in script
-    expected_identity = 'T.float16("-inf")' if reduce_op == "max" else 'T.float16("inf")'
+    expected_identity = 'T.float32("-inf")' if reduce_op == "max" else 'T.float32("inf")'
     assert expected_identity in script
     a_load_predicates = [load.predicate for load in _collect_buffer_loads(mod["main"], "A_shared") if load.predicate is not None]
     acc_store_predicates = [
@@ -614,32 +614,38 @@ def test_tilelang_reduce_sunmmio_tiled_axis_tail_uses_predicated_update(reduce_o
 
 
 @pytest.mark.parametrize(
-    "reduce_op,reduce_axis",
+    "dtype,reduce_op",
     [
-        ("bitand", 0),
-        ("min", 2),
+        ("float16", "max"),
+        ("float16", "min"),
+        ("float16", "absmax"),
+        ("float64", "max"),
+        ("float64", "min"),
+        ("float64", "absmax"),
+        ("int32", "max"),
+        ("int32", "min"),
+        ("uint32", "max"),
+        ("uint32", "min"),
+        ("int32", "absmax"),
     ],
 )
-def test_tilelang_reduce_sunmmio_uint32_identity_uses_all_ones(reduce_op, reduce_axis):
-    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    mod = reduce_kernel_with_tileview_builder(
-        (8, 63, 250),
-        reduce_axis=reduce_axis,
-        dtype="uint32",
-        reduce_op=reduce_op,
-    )
+def test_tilelang_reduce_sunmmio_rejects_unsupported_minmax(reduce_op, dtype):
+    with pytest.raises(
+        TypeError,
+        match="Sunmmio min/max/absmax reduction requires scalar bfloat16 or float32 input and output dtypes",
+    ):
 
-    with tvm.target.Target(target):
-        mod = apply_sunmmio_passes(mod, target)
-    assert_reduce_lowering_is_ssa(mod)
-
-    script = mod.script()
-    assert "T.uint32(4294967295)" in script
-    expected_op = "T.bitwise_and" if reduce_op == "bitand" else "T.min"
-    assert expected_op in script
-    if reduce_axis == 2:
-        assert "T.if_then_else" in script
-        assert "< 250" in script or "<250" in script
+        @T.prim_func
+        def main():
+            with T.Kernel():
+                src = T.alloc_shared((32, 32), dtype, scope="shared.rsram")
+                dst = T.alloc_shared((32,), dtype, scope="shared.rsram")
+                if reduce_op == "max":
+                    T.reduce_max(src, dst, dim=1)
+                elif reduce_op == "min":
+                    T.reduce_min(src, dst, dim=1)
+                else:
+                    T.reduce_absmax(src, dst, dim=1)
 
 
 UNALIGNED_REDUCE_CASES = [
@@ -719,7 +725,14 @@ def test_tilelang_reduce_sunmmio_unaligned_cases_from_tir_dump(shape, reduce_axi
 @pytest.mark.parametrize("reduce_op", ["sum", "max", "min"])
 def test_tilelang_reduce_sunmmio_unaligned_tiled_axis_tail_identity(reduce_op):
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    mod = unaligned_reduce_kernel_builder((5, 43, 249), reduce_axis=2, clear=True, reduce_op=reduce_op)
+    dtype = "float16" if reduce_op == "sum" else "float32"
+    mod = unaligned_reduce_kernel_builder(
+        (5, 43, 249),
+        reduce_axis=2,
+        dtype=dtype,
+        clear=True,
+        reduce_op=reduce_op,
+    )
 
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
@@ -727,7 +740,7 @@ def test_tilelang_reduce_sunmmio_unaligned_tiled_axis_tail_identity(reduce_op):
 
     script = mod.script()
     assert "T.if_then_else" in script
-    assert _tail_identity_text(reduce_op) in script
+    assert _tail_identity_text(reduce_op, dtype) in script
     assert "i2 * 32 + kj < 249" in script
     assert "predicate=" not in script
 

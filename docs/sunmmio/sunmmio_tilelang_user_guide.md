@@ -374,7 +374,7 @@ Common APIs:
 T.comm.broadcast(A_shared, B_shared, src_core=(0, 0), direction="horizontal")
 T.comm.put(A_shared, B_shared, src_core=(1, 2), dst_core=(2, 3))
 T.comm.all_gather(A_local, A_gathered, direction="horizontal", axis=-1)
-T.comm.all_reduce(A_shared, Out_shared, "sum", direction="all", dim=-1)
+T.comm.all_reduce(A_shared, Out_shared, "sum", direction="all")
 ```
 
 Choose an API by its semantics:
@@ -847,7 +847,7 @@ The receive shape must match `direction` and `axis`. If the number of participat
 **`T.comm.all_reduce`**
 
 ```python
-T.comm.all_reduce(buffer, out, reduce_type, direction, dim=-1, clear=True)
+T.comm.all_reduce(buffer, out, reduce_type, direction, *, clear=True)
 ```
 
 `all_reduce` expresses cross-core reduction.
@@ -856,11 +856,23 @@ T.comm.all_reduce(buffer, out, reduce_type, direction, dim=-1, clear=True)
 - `out`: output buffer or region storing the reduce result.
 - `reduce_type`: reduce type. Supported values include `"sum"`, `"abssum"`, `"max"`, `"min"`, `"absmax"`, `"bitand"`, `"bitor"`, and `"bitxor"`.
 - `direction`: direction participating in reduce. Supported values are `"horizontal"` / `"h"`, `"vertical"` / `"v"`, and `"all"` / `"a"`.
-- `dim`: retained for API compatibility and bounds validation. Cross-core `all_reduce` does not reduce a local buffer dimension.
 - `clear`: whether to clear `out` before reduce. The default is `True`.
 - Return value: a statement expressing all-reduce.
 
+`clear` is keyword-only. `all_reduce` has no local reduction dimension because
+it reduces corresponding elements across cores and preserves the complete local region.
+
 The `out` shape must match the input buffer or region shape. `all_reduce` reduces across cores only and preserves the complete local region.
+
+On SunMMIO/A4E, `"min"`, `"max"`, and `"absmax"` require both the input and
+output dtypes to be scalar `bfloat16` or scalar `float32`. `float16`, `float64`,
+and integer dtypes are rejected during TileLang validation because A4E does not
+provide the required vector lowering.
+
+On SunMMIO/A4E, `"bitand"`, `"bitor"`, and `"bitxor"` require the input and
+output dtypes to be both scalar `int32` or both scalar `uint32`. Other integer
+widths and mixed signedness are rejected during TileLang validation because the
+target does not provide the required bitwise or cast lowering.
 
 ### 3.7 GEMM
 
@@ -915,6 +927,11 @@ T.reduce(buffer, out, reduce_type, dim, clear)
 - Return value: a statement expressing reduce.
 
 Use `T.comm.all_reduce` for cross-core reduce.
+
+On SunMMIO/A4E, `"min"`, `"max"`, and `"absmax"` require both the input and
+output dtypes to be scalar `bfloat16` or scalar `float32`. `float16`, `float64`,
+and integer dtypes are rejected during TileLang validation because A4E does not
+provide the required vector lowering.
 
 **`T.reduce_sum`** **/** **`T.reduce_max`** **/** **`T.reduce_min`**
 

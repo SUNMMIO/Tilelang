@@ -139,6 +139,47 @@ CollectNonTiledDomainAxes(const std::vector<IndexBinding> &bindings,
   return non_tiled_axes;
 }
 
+std::vector<int>
+CollectActiveBufferDims(const std::vector<IndexBinding> &bindings) {
+  std::vector<int> dims;
+  dims.reserve(bindings.size());
+  for (int dim = 0; dim < static_cast<int>(bindings.size()); ++dim) {
+    if (bindings[dim].uses_loop_var) {
+      dims.push_back(dim);
+    }
+  }
+  return dims;
+}
+
+std::vector<std::vector<int>>
+CollectExecutionDimChoices(const std::vector<IndexBinding> &bindings,
+                           int exec_rank) {
+  std::vector<int> active_dims = CollectActiveBufferDims(bindings);
+  std::vector<std::vector<int>> choices;
+  if (active_dims.empty()) {
+    return choices;
+  }
+  if (active_dims.size() <= static_cast<size_t>(exec_rank)) {
+    choices.push_back(std::move(active_dims));
+    return choices;
+  }
+
+  if (exec_rank == 1) {
+    for (int dim : active_dims) {
+      choices.push_back({dim});
+    }
+    return choices;
+  }
+  ICHECK_EQ(exec_rank, 2)
+      << "T.Tiles planning supports only one or two execution dimensions.";
+  for (size_t outer = 0; outer + 1 < active_dims.size(); ++outer) {
+    for (size_t inner = outer + 1; inner < active_dims.size(); ++inner) {
+      choices.push_back({active_dims[outer], active_dims[inner]});
+    }
+  }
+  return choices;
+}
+
 bool SameIntVector(const std::vector<int> &lhs, const std::vector<int> &rhs) {
   return lhs == rhs;
 }
@@ -233,7 +274,7 @@ void AddCandidateFromPattern(std::vector<AccessTileCandidate> *candidates,
                              const std::vector<IndexBinding> &bindings,
                              const TrailingTilePattern &pattern,
                              arith::Analyzer *analyzer, bool strict_checks) {
-  TileView tv = MakeTrailingTileView(buffer->shape, pattern);
+  TileView tv = MakeTileViewFromPattern(buffer->shape, pattern);
   if (pattern.tile_shape.size() == 1) {
     AddRank1Candidate(candidates, buffer, indices, bindings,
                       pattern.mapped_dims[0], pattern.tile_shape[0], analyzer,
@@ -242,7 +283,7 @@ void AddCandidateFromPattern(std::vector<AccessTileCandidate> *candidates,
   }
 
   ICHECK_EQ(pattern.tile_shape.size(), 2)
-      << "T.Tiles currently supports only 1D or 2D trailing TileView patterns.";
+      << "T.Tiles currently supports only 1D or 2D TileView patterns.";
   AddRank2Candidate(candidates, buffer, indices, bindings,
                     pattern.mapped_dims[0], pattern.mapped_dims[1],
                     pattern.tile_shape[0], pattern.tile_shape[1], analyzer,
@@ -271,12 +312,16 @@ std::vector<AccessTileCandidate> EnumerateInferredCandidates(
     const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer,
     AlignmentMode alignment_mode = AlignmentMode::kStrict) {
   std::vector<AccessTileCandidate> candidates;
-  for (const TrailingTilePattern &pattern :
-       EnumerateInferredTrailingTilePatterns(
-           buffer, exec_rank, layout_map, config, analyzer,
-           {TileExtentPolicy::kTilesExecutionLayoutBounded, alignment_mode})) {
-    AddCandidateFromPattern(&candidates, buffer, indices, bindings, pattern,
-                            analyzer, /*strict_checks=*/false);
+  for (const std::vector<int> &execution_dims :
+       CollectExecutionDimChoices(bindings, exec_rank)) {
+    for (const TrailingTilePattern &pattern :
+         EnumerateInferredTilePatterns(
+             buffer, execution_dims, layout_map, config, analyzer,
+             {TileExtentPolicy::kTilesExecutionLayoutBounded,
+              alignment_mode})) {
+      AddCandidateFromPattern(&candidates, buffer, indices, bindings, pattern,
+                              analyzer, /*strict_checks=*/false);
+    }
   }
   return candidates;
 }

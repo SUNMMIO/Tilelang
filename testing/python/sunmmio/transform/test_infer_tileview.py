@@ -926,6 +926,48 @@ def test_infer_tileview_keeps_scalar_fallback_when_no_axis_is_unit_stride():
     assert "for i, j in T.grid(4, 4)" in script
 
 
+def test_infer_tileview_skips_logical_and_physical_unit_dimension():
+    """A true unit dimension does not block a contiguous outer tile."""
+    M = 16
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            src = T.alloc_shared((M, 1), "float32")
+            dst = T.alloc_shared((M, 1), "float32")
+
+            for i in T.Tiles([M], parallel=True):
+                dst[i, 0] = src[i, 0] + src[i, 0]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+
+    assert_scope_plan(mod, expected_tile_size=[M], expected_execution_domain_axes=[0])
+
+
+def test_infer_tileview_does_not_skip_padded_unit_dimension():
+    """Physical padding on a logical unit dimension blocks outer contiguity."""
+    M = 16
+    layout = make_aligned_row_major((M, 1), "float32", align_bytes=64)
+
+    @T.prim_func
+    def main():
+        with T.Kernel(1, threads=128):
+            src = T.alloc_shared((M, 1), "float32")
+            dst = T.alloc_shared((M, 1), "float32")
+            T.annotate_layout({src: layout, dst: layout})
+
+            for i in T.Tiles([M], parallel=True):
+                dst[i, 0] = src[i, 0] + src[i, 0]
+
+    mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
+    mod = tl.transform.LowerTilesLoop()(mod)
+    scope_root, execution_axes = collect_tile_annotations(mod["main"])
+
+    assert scope_root is None
+    assert execution_axes == []
+
+
 def test_infer_tileview_keeps_scalar_fallback_when_index_mixes_tile_axes():
     """An index that mixes both tile axes cannot be represented by a TileView."""
     domain, shape = 4, 16

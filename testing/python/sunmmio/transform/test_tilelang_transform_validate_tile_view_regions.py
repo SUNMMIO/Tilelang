@@ -588,6 +588,23 @@ def _make_comm_kernel(comm_case):
                     axis=0,
                 )
 
+    elif comm_case == "allgather_high_rank_valid":
+        send_shape = (4, 4, 32, 32)
+        recv_shape = (4, *send_shape)
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel() as _bx:
+                A_shared = T.alloc_shared(send_shape, DTYPE)
+                R_shared = T.alloc_shared(recv_shape, DTYPE)
+                T.annotate_layout(
+                    {
+                        A_shared: make_row_major(send_shape),
+                        R_shared: make_row_major(recv_shape),
+                    }
+                )
+                T.comm.all_gather(A_shared, R_shared, direction="horizontal")
+
     elif comm_case == "allreduce_low_level_valid":
         send_shape = (32, 32)
         out_shape = (32, 32)
@@ -618,11 +635,208 @@ def _make_comm_kernel(comm_case):
                         Col_gather[0:4, 0:32, 0:32],
                         "sum",
                         2,
-                        1,
                         T.bool(True),
                         bx,
                     )
                 )
+
+    elif comm_case in {
+        "allreduce_low_level_mixed_dtype_valid",
+        "allreduce_low_level_row_allgather_dtype_mismatch",
+        "allreduce_low_level_col_allgather_dtype_mismatch",
+        "allreduce_low_level_dst_copy_dtype_mismatch",
+    }:
+        send_shape = (32, 32)
+        out_shape = (32, 32)
+        gather_shape = (4, 32, 32)
+        mismatched_name = (
+            None
+            if comm_case == "allreduce_low_level_mixed_dtype_valid"
+            else comm_case.removeprefix("allreduce_low_level_").removesuffix(
+                "_dtype_mismatch"
+            )
+        )
+        out_dtype = "float32"
+        row_dtype = DTYPE if mismatched_name == "row_allgather" else out_dtype
+        col_dtype = out_dtype if mismatched_name == "col_allgather" else DTYPE
+        copy_dtype = DTYPE if mismatched_name == "dst_copy" else out_dtype
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel() as bx:
+                A_shared = T.alloc_shared(send_shape, DTYPE)
+                Out_shared = T.alloc_shared(out_shape, out_dtype)
+                Row_gather = T.alloc_shared(gather_shape, row_dtype)
+                Col_gather = T.alloc_shared(gather_shape, col_dtype)
+                Dst_copy = T.alloc_shared(out_shape, copy_dtype)
+                T.annotate_layout(
+                    {
+                        A_shared: make_row_major(send_shape),
+                        Out_shared: make_row_major(out_shape),
+                        Row_gather: make_row_major(gather_shape),
+                        Col_gather: make_row_major(gather_shape),
+                        Dst_copy: make_row_major(out_shape),
+                    }
+                )
+                if mismatched_name == "dst_copy":
+                    T.evaluate(
+                        tvm.tir.call_intrin(
+                            "handle",
+                            tvm.tir.op.Op.get("tl.tileop.comm_allreduce"),
+                            A_shared[0:32, 0:32],
+                            Out_shared[0:32, 0:32],
+                            Row_gather[0:4, 0:32, 0:32],
+                            Col_gather[0:4, 0:32, 0:32],
+                            "sum",
+                            2,
+                            T.bool(False),
+                            Dst_copy[0:32, 0:32],
+                            bx,
+                        )
+                    )
+                else:
+                    T.evaluate(
+                        tvm.tir.call_intrin(
+                            "handle",
+                            tvm.tir.op.Op.get("tl.tileop.comm_allreduce"),
+                            A_shared[0:32, 0:32],
+                            Out_shared[0:32, 0:32],
+                            Row_gather[0:4, 0:32, 0:32],
+                            Col_gather[0:4, 0:32, 0:32],
+                            "sum",
+                            2,
+                            T.bool(True),
+                            bx,
+                        )
+                    )
+
+    elif comm_case in {
+        "allreduce_low_level_dst_shape_mismatch",
+        "allreduce_low_level_row_allgather_shape_mismatch",
+        "allreduce_low_level_col_allgather_shape_mismatch",
+        "allreduce_low_level_dst_copy_shape_mismatch",
+        "allreduce_low_level_missing_dst_copy",
+        "allreduce_low_level_unexpected_dst_copy",
+        "allreduce_low_level_bitwise_float",
+        "allreduce_low_level_bitwise_int16",
+        "allreduce_low_level_float16_minmax",
+        "allreduce_low_level_float64_minmax",
+        "allreduce_low_level_integer_minmax",
+    }:
+        send_shape = (32, 32)
+        out_shape = (
+            (64, 16)
+            if comm_case == "allreduce_low_level_dst_shape_mismatch"
+            else send_shape
+        )
+        row_shape = (
+            (4, 16, 64)
+            if comm_case == "allreduce_low_level_row_allgather_shape_mismatch"
+            else (4, *send_shape)
+        )
+        col_shape = (
+            (4, 16, 64)
+            if comm_case == "allreduce_low_level_col_allgather_shape_mismatch"
+            else (4, *send_shape)
+        )
+        copy_shape = (
+            (64, 16)
+            if comm_case == "allreduce_low_level_dst_copy_shape_mismatch"
+            else send_shape
+        )
+        if comm_case in {
+            "allreduce_low_level_row_allgather_shape_mismatch",
+            "allreduce_low_level_unexpected_dst_copy",
+            "allreduce_low_level_float16_minmax",
+            "allreduce_low_level_float64_minmax",
+            "allreduce_low_level_integer_minmax",
+        }:
+            direction = 0
+        elif comm_case == "allreduce_low_level_col_allgather_shape_mismatch":
+            direction = 1
+        else:
+            direction = 2
+        clear = comm_case not in {
+            "allreduce_low_level_dst_copy_shape_mismatch",
+            "allreduce_low_level_missing_dst_copy",
+            "allreduce_low_level_unexpected_dst_copy",
+        }
+        if comm_case in {
+            "allreduce_low_level_bitwise_float",
+            "allreduce_low_level_bitwise_int16",
+        }:
+            reduce_type = "bitand"
+        elif comm_case in {
+            "allreduce_low_level_float16_minmax",
+            "allreduce_low_level_float64_minmax",
+            "allreduce_low_level_integer_minmax",
+        }:
+            reduce_type = "min"
+        else:
+            reduce_type = "sum"
+        if comm_case == "allreduce_low_level_float16_minmax":
+            reduce_dtype = "float16"
+        elif comm_case == "allreduce_low_level_float64_minmax":
+            reduce_dtype = "float64"
+        elif comm_case == "allreduce_low_level_integer_minmax":
+            reduce_dtype = "int32"
+        elif comm_case == "allreduce_low_level_bitwise_int16":
+            reduce_dtype = "int16"
+        else:
+            reduce_dtype = DTYPE
+        include_dst_copy = comm_case in {
+            "allreduce_low_level_dst_copy_shape_mismatch",
+            "allreduce_low_level_unexpected_dst_copy",
+        }
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel() as bx:
+                A_shared = T.alloc_shared(send_shape, reduce_dtype)
+                Out_shared = T.alloc_shared(out_shape, reduce_dtype)
+                Row_gather = T.alloc_shared(row_shape, reduce_dtype)
+                Col_gather = T.alloc_shared(col_shape, reduce_dtype)
+                Dst_copy = T.alloc_shared(copy_shape, reduce_dtype)
+                T.annotate_layout(
+                    {
+                        A_shared: make_row_major(send_shape),
+                        Out_shared: make_row_major(out_shape),
+                        Row_gather: make_row_major(row_shape),
+                        Col_gather: make_row_major(col_shape),
+                        Dst_copy: make_row_major(copy_shape),
+                    }
+                )
+                if include_dst_copy:
+                    T.evaluate(
+                        tvm.tir.call_intrin(
+                            "handle",
+                            tvm.tir.op.Op.get("tl.tileop.comm_allreduce"),
+                            A_shared[0:32, 0:32],
+                            Out_shared[0 : out_shape[0], 0 : out_shape[1]],
+                            Row_gather[0 : row_shape[0], 0 : row_shape[1], 0 : row_shape[2]],
+                            Col_gather[0 : col_shape[0], 0 : col_shape[1], 0 : col_shape[2]],
+                            reduce_type,
+                            direction,
+                            T.bool(clear),
+                            Dst_copy[0 : copy_shape[0], 0 : copy_shape[1]],
+                            bx,
+                        )
+                    )
+                else:
+                    T.evaluate(
+                        tvm.tir.call_intrin(
+                            "handle",
+                            tvm.tir.op.Op.get("tl.tileop.comm_allreduce"),
+                            A_shared[0:32, 0:32],
+                            Out_shared[0 : out_shape[0], 0 : out_shape[1]],
+                            Row_gather[0 : row_shape[0], 0 : row_shape[1], 0 : row_shape[2]],
+                            Col_gather[0 : col_shape[0], 0 : col_shape[1], 0 : col_shape[2]],
+                            reduce_type,
+                            direction,
+                            T.bool(clear),
+                            bx,
+                        )
+                    )
 
     else:
         raise ValueError(f"unknown comm case: {comm_case}")
@@ -636,6 +850,35 @@ def _run_comm_validate_tile_view_regions(comm_case):
         mod = _make_comm_kernel(comm_case)
         mod = tvm.tir.transform.BindTarget(target)(mod)
         return tilelang.transform.ValidateTileViewRegions()(mod)
+
+
+def _run_comm_lower_tile_op(comm_case):
+    target = tvm.target.Target(SUNMMIO_TARGET_DESC)
+    with tvm.target.Target(target):
+        mod = _make_comm_kernel(comm_case)
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
+        mod = tilelang.transform.LegalizeNegativeIndex()(mod)
+        mod = tilelang.transform.InjectAssumes()(mod)
+        mod = tilelang.transform.Simplify()(mod)
+        mod = tilelang.transform.InferSramScope()(mod)
+        mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
+        mod = tilelang.transform.SunmmioLayoutInference()(mod)
+        mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
+        return tilelang.transform.LowerTileOp()(mod)
+
+
+def _count_calls(mod, op_name):
+    count = 0
+    op = tvm.tir.op.Op.get(op_name)
+
+    def visitor(node):
+        nonlocal count
+        if isinstance(node, tvm.tir.Call) and node.op.same_as(op):
+            count += 1
+
+    tvm.tir.stmt_functor.post_order_visit(mod["main"].body, visitor)
+    return count
 
 
 @pytest.mark.parametrize(
@@ -751,10 +994,31 @@ def test_sunmmio_validate_tile_view_regions_rejects_kernel_after_layout_inferenc
         "allgather_axis0_valid",
         "allgather_axis_last_valid",
         "allreduce_low_level_valid",
+        "allreduce_low_level_mixed_dtype_valid",
     ],
 )
 def test_sunmmio_validate_tile_view_regions_accepts_comm_regions(comm_case):
     _run_comm_validate_tile_view_regions(comm_case)
+
+
+def test_sunmmio_lower_tile_op_accepts_valid_allreduce_contract():
+    mod = _run_comm_lower_tile_op("allreduce_low_level_valid")
+
+    assert _count_calls(mod, "tl.tileop.comm_allreduce") == 0
+    assert _count_calls(mod, "tl.broadcast_") > 0
+
+
+def test_sunmmio_high_rank_allgather_uses_bounded_static_expansion():
+    mod = _run_comm_lower_tile_op("allgather_high_rank_valid")
+    split_loops = []
+
+    def visitor(node):
+        if isinstance(node, tvm.tir.For) and node.loop_var.name.startswith("allgather_split_"):
+            split_loops.append(node)
+
+    tvm.tir.stmt_functor.post_order_visit(mod["main"].body, visitor)
+    assert _count_calls(mod, "tl.broadcast_") == 16
+    assert not split_loops
 
 
 @pytest.mark.parametrize(
@@ -773,6 +1037,81 @@ def test_sunmmio_validate_tile_view_regions_accepts_comm_regions(comm_case):
 def test_sunmmio_validate_tile_view_regions_rejects_comm_regions(comm_case, error_msg):
     with pytest.raises(tvm.error.InternalError, match=error_msg):
         _run_comm_validate_tile_view_regions(comm_case)
+
+
+@pytest.mark.parametrize(
+    "buffer_name,expected_buffer",
+    [
+        ("row_allgather", "dst"),
+        ("col_allgather", "src"),
+        ("dst_copy", "dst"),
+    ],
+)
+def test_sunmmio_validate_tile_view_regions_rejects_allreduce_dtype_mismatch(
+    buffer_name, expected_buffer
+):
+    comm_case = f"allreduce_low_level_{buffer_name}_dtype_mismatch"
+    error_msg = rf"requires {buffer_name} dtype to match {expected_buffer} dtype"
+    with pytest.raises(tvm.error.InternalError, match=error_msg):
+        _run_comm_validate_tile_view_regions(comm_case)
+
+
+@pytest.mark.parametrize(
+    "buffer_name,expected_buffer",
+    [
+        ("row_allgather", "dst"),
+        ("col_allgather", "src"),
+        ("dst_copy", "dst"),
+    ],
+)
+def test_sunmmio_lower_tile_op_rejects_allreduce_dtype_mismatch(
+    buffer_name, expected_buffer
+):
+    comm_case = f"allreduce_low_level_{buffer_name}_dtype_mismatch"
+    error_msg = rf"requires {buffer_name} dtype to match {expected_buffer} dtype"
+    with pytest.raises(tvm.error.InternalError, match=error_msg):
+        _run_comm_lower_tile_op(comm_case)
+
+
+@pytest.mark.parametrize(
+    "comm_case,error_msg",
+    [
+        ("allreduce_low_level_dst_shape_mismatch", "requires dst extent"),
+        ("allreduce_low_level_row_allgather_shape_mismatch", "requires row_allgather payload extent"),
+        ("allreduce_low_level_col_allgather_shape_mismatch", "requires col_allgather payload extent"),
+        ("allreduce_low_level_dst_copy_shape_mismatch", "requires dst_copy extent"),
+        ("allreduce_low_level_missing_dst_copy", "dst_copy must be provided only"),
+        ("allreduce_low_level_unexpected_dst_copy", "dst_copy must be provided only"),
+        (
+            "allreduce_low_level_bitwise_float",
+            "Sunmmio bitwise all_reduce requires input and output dtypes to be both int32 or both uint32",
+        ),
+        (
+            "allreduce_low_level_bitwise_int16",
+            "Sunmmio bitwise all_reduce requires input and output dtypes to be both int32 or both uint32",
+        ),
+        (
+            "allreduce_low_level_float16_minmax",
+            "Sunmmio all_reduce min/max/absmax requires scalar bfloat16 or float32 input and output dtypes",
+        ),
+        (
+            "allreduce_low_level_float64_minmax",
+            "Sunmmio all_reduce min/max/absmax requires scalar bfloat16 or float32 input and output dtypes",
+        ),
+        (
+            "allreduce_low_level_integer_minmax",
+            "Sunmmio all_reduce min/max/absmax requires scalar bfloat16 or float32 input and output dtypes",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "runner", [_run_comm_validate_tile_view_regions, _run_comm_lower_tile_op]
+)
+def test_sunmmio_rejects_invalid_low_level_allreduce_contract(
+    comm_case, error_msg, runner
+):
+    with pytest.raises(tvm.error.InternalError, match=error_msg):
+        runner(comm_case)
 
 
 def test_sunmmio_comm_frontend_rejects_broadcast_source_oob(_strict_region_validation):

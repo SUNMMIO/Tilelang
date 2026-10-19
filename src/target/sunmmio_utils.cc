@@ -146,6 +146,7 @@ SunmmioTileProcessorConfig MakeSunmmioA4EConfig() {
           /*block_height=*/32,
           /*block_width=*/32,
           /*rsram_align_bytes=*/64,
+          /*rsram_capacity_bytes=*/768 * 1024,
           /*asram_bank_stripe_bytes=*/1024,
           /*bf16_gemm_single_pass_max_rows=*/16};
 }

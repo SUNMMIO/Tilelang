@@ -6,6 +6,7 @@ import warnings
 from typing import Literal
 from tilelang._typing import BufferLikeType
 from tvm import tir
+from tvm.runtime import DataTypeCode
 from tvm.target import Target
 from tilelang.language import copy, macro, alloc_shared, alloc_fragment
 from tilelang.utils.language import to_buffer_region, retrieve_shape, _get_buffer
@@ -25,6 +26,13 @@ def _legalize_dim_for_rank(rank: int, dim: int):
 
 def _legalize_dim(buffer: BufferLikeType, dim: int):
     return _legalize_dim_for_rank(len(retrieve_shape(buffer)), dim)
+
+
+def _is_sunmmio_a4e_float_dtype(dtype) -> bool:
+    return dtype.lanes == 1 and (
+        (dtype.type_code == DataTypeCode.BFLOAT and dtype.bits == 16)
+        or (dtype.type_code == DataTypeCode.FLOAT and dtype.bits == 32)
+    )
 
 
 def _shape_matches(actual, expected):
@@ -56,6 +64,8 @@ def reduce(buffer: BufferLikeType, out: BufferLikeType, reduce_type: ReduceKind,
     buffer_shape = list(retrieve_shape(buffer))
     out_shape = list(retrieve_shape(out))
     dim = _legalize_dim_for_rank(len(buffer_shape), dim)
+    src_dtype = _get_buffer(buffer).dtype
+    dst_dtype = _get_buffer(out).dtype
 
     # input shape: [X, d, Y], expected output shape: [X, Y] or [X, 1, Y]
     expected_shapes = [
@@ -81,6 +91,14 @@ def reduce(buffer: BufferLikeType, out: BufferLikeType, reduce_type: ReduceKind,
         )
         is_sunmmio_target = target is not None and target_is_sunmmio(target)
         if is_sunmmio_target or is_sunmmio_scope:
+            if reduce_type in ("min", "max", "absmax"):
+                if not _is_sunmmio_a4e_float_dtype(
+                    src_dtype
+                ) or not _is_sunmmio_a4e_float_dtype(dst_dtype):
+                    raise TypeError(
+                        "Sunmmio min/max/absmax reduction requires scalar bfloat16 or float32 "
+                        f"input and output dtypes, but got {src_dtype} and {dst_dtype}."
+                    )
             if len(buffer_shape) == 2 and dim == 1 and len(out_shape) == 2:
                 warnings.warn(
                     "Sunmmio 2D reduction with a trailing unit-dimension output (N, 1) "

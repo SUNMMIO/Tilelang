@@ -25,6 +25,11 @@ constexpr const char *tile_level_loop = "tile.loop_parallel";
 // Marks the outermost raw loop of a T.Tiles scope and stores the logical
 // iteration domain before legalization.
 constexpr const char *kTileDomain = "tile.domain";
+// Records the original logical domain axis carried by a loop. Reduction
+// lowering may move the reduction loop innermost, and later simplification may
+// erase static unit loops, so loop nesting order alone is not sufficient to
+// recover this mapping in codegen.
+constexpr const char *tile_domain_axis = "tile.domain_axis";
 constexpr const char *kTileLoopStage = "tile.loop_stage";
 
 // ---- these attrs will be added / normalized by legalize_tiles_loop pass ----

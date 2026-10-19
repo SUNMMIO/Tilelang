@@ -41,6 +41,25 @@ Array<PrimExpr> RegionExtents(const BufferRegion &region) {
   return extents;
 }
 
+std::vector<int> GetEffectiveExecutionDims(const BufferRegion &region,
+                                           arith::Analyzer *analyzer) {
+  int rank = static_cast<int>(region->region.size());
+  std::vector<int> dims;
+  for (int dim = 0; dim < rank; ++dim) {
+    if (!analyzer->CanProveEqual(region->region[dim]->extent, Integer(1))) {
+      dims.push_back(dim);
+    }
+  }
+
+  if (dims.empty()) {
+    ICHECK_GT(rank, 0) << "Sunmmio reduction does not support scalar buffers.";
+    dims.push_back(rank - 1);
+  } else if (dims.size() > 2) {
+    dims.erase(dims.begin(), dims.end() - 2);
+  }
+  return dims;
+}
+
 std::vector<int> BuildSrcDimToDstDim(int src_rank, int dst_rank,
                                      int reduce_dim) {
   std::vector<int> mapping(src_rank, -1);
@@ -149,35 +168,25 @@ bool IsLegalProjectedDstTileView(const BufferRegion &dst_region,
   }
 
   int dst_rank = static_cast<int>(dst_region->region.size());
-  int exec_rank = dst_rank == 1 ? 1 : 2;
+  std::vector<int> execution_dims =
+      GetEffectiveExecutionDims(dst_region, analyzer);
   for (const TrailingTilePattern &pattern :
-       EnumerateInferredTrailingTilePatterns(
-           dst_region->buffer, exec_rank, layout_map, config, analyzer,
+       EnumerateInferredTilePatterns(
+           dst_region->buffer, execution_dims, layout_map, config, analyzer,
            {TileExtentPolicy::kReductionLayoutBounded,
             AlignmentMode::kRelaxed})) {
-    std::vector<int> projected_pattern_dims;
-    std::vector<int> projected_pattern_shape;
-    for (size_t axis = 0; axis < pattern.tile_shape.size(); ++axis) {
-      int mapped_dim = pattern.mapped_dims[axis];
-      if (analyzer->CanProveEqual(dst_region->region[mapped_dim]->extent,
-                                  Integer(1))) {
-        continue;
-      }
-      projected_pattern_dims.push_back(mapped_dim);
-      projected_pattern_shape.push_back(pattern.tile_shape[axis]);
-    }
-    if (static_cast<int>(projected_pattern_shape.size()) != tile_rank) {
+    if (static_cast<int>(pattern.tile_shape.size()) != tile_rank) {
       continue;
     }
     bool matches = true;
     for (int axis = 0; axis < tile_rank; ++axis) {
       int mapped_dim =
           NormalizeMappedDim(dst_tileview->IndexMap()[axis], dst_rank);
-      if (projected_pattern_dims[axis] != mapped_dim ||
+      if (pattern.mapped_dims[axis] != mapped_dim ||
           !analyzer->CanProveEqual(dst_tileview->TileShape()[axis],
-                                   Integer(projected_pattern_shape[axis])) ||
+                                   Integer(pattern.tile_shape[axis])) ||
           !CanProveDivisible(analyzer, dst_region->region[mapped_dim]->min,
-                             projected_pattern_shape[axis])) {
+                             pattern.tile_shape[axis])) {
         matches = false;
         break;
       }
@@ -201,7 +210,7 @@ MakeCandidate(const Array<PrimExpr> &source_domain,
 
   ReduceTileCandidate candidate;
   candidate.execution_domain_axes = src_pattern.mapped_dims;
-  candidate.src_tileview = MakeTrailingTileView(source_domain, src_pattern);
+  candidate.src_tileview = MakeTileViewFromPattern(source_domain, src_pattern);
   candidate.src_tile_elems = TileElements(src_pattern.tile_shape);
   candidate.src_partitions =
       (candidate.src_tile_elems + src_capacity_elems - 1) / src_capacity_elems;
@@ -266,13 +275,14 @@ std::vector<ReduceTileCandidate> EnumerateInferredCandidates(
     const Map<Buffer, Layout> &layout_map,
     const SunmmioTileProcessorConfig &config, arith::Analyzer *analyzer) {
   std::vector<ReduceTileCandidate> candidates;
-  int exec_rank = static_cast<int>(source_domain.size()) == 1 ? 1 : 2;
+  std::vector<int> execution_dims =
+      GetEffectiveExecutionDims(src_region, analyzer);
   TileExtentPolicy extent_policy = TileExtentPolicy::kReductionLayoutBounded;
   int src_capacity_elems = GetCapacityElems(src_region->buffer, config);
   int dst_capacity_elems = GetCapacityElems(dst_region->buffer, config);
   for (const TrailingTilePattern &pattern :
-       EnumerateInferredTrailingTilePatterns(
-           src_region->buffer, exec_rank, layout_map, config, analyzer,
+       EnumerateInferredTilePatterns(
+           src_region->buffer, execution_dims, layout_map, config, analyzer,
            {extent_policy, AlignmentMode::kStrict})) {
     bool aligned = true;
     for (size_t axis = 0; axis < pattern.tile_shape.size(); ++axis) {
@@ -349,6 +359,9 @@ PlanReduceTileViews(const BufferRegion &src_region,
   std::vector<ReduceTileCandidate> compatible_candidates;
   compatible_candidates.reserve(candidates.size());
   for (const ReduceTileCandidate &candidate : candidates) {
+    if (!hints.allow_tiled_reduction && candidate.reduce_tile_axis >= 0) {
+      continue;
+    }
     if (IsLegalProjectedDstTileView(dst_region, candidate, layout_map,
                                     tile_processor_config, analyzer) &&
         IsCompatibleProjectedTileView(hints.dst_tileview,

@@ -54,6 +54,8 @@ struct SunmmioTileProcessorConfig {
   int block_width;
   // Minimum byte-alignment for RSRAM vector memory accesses.
   int rsram_align_bytes;
+  // Total RSRAM capacity available to one tile processor.
+  int64_t rsram_capacity_bytes;
   // ASRAM north/south bank stripe width in bytes. The bf16 tensor core can
   // only read from the north bank, so legalization of bf16 GEMM duplicates
   // the A-operand writer with a source-pointer offset of this many bytes so

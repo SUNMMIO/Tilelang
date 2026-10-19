@@ -590,6 +590,22 @@ class TestLayoutRelations:
         assert is_layout_match(tight, aligned)
         assert is_layout_match(aligned, tight)
 
+    @pytest.mark.parametrize(
+        "shape, axes",
+        [
+            ((1, 32, 32), (1, 2)),
+            ((32, 1, 32), (0, 2)),
+            ((32, 32, 1), (0, 1)),
+            ((1, 32, 1, 32), (1, 3)),
+        ],
+    )
+    def test_single_block_zz_with_unit_dims_matches_row_major(self, shape, axes):
+        shape = _imms(*shape)
+        zz = make_zz(shape, list(axes), _imms(32, 32))
+        row_major = make_row_major(shape)
+        assert is_layout_match(zz, row_major)
+        assert is_layout_match(row_major, zz)
+
 
 class TestCanonicalizeToRowMajor:
     def test_single_block_zz_canonicalizes_to_row_major(self):

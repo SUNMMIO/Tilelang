@@ -319,7 +319,7 @@ The frontend currently provides the following communication operations:
 - `T.comm.broadcast(src, dst, src_core, direction=...)`
 - `T.comm.put(src, dst, src_core, dst_core)`
 - `T.comm.all_gather(send_buffer, recv_buffer, direction=..., axis=...)`
-- `T.comm.all_reduce(buffer, out, reduce_type, direction=..., dim=..., clear=...)`
+- `T.comm.all_reduce(buffer, out, reduce_type, direction=..., clear=...)`
 
 Their purposes are:
 
