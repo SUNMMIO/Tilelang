@@ -140,6 +140,14 @@ class PassConfigKey(str, Enum):
     TL_SUNMMIO_PIPELINE_MODE = "tl.sunmmio_pipeline_mode"
     """Select Sunmmio pipeline implementation. Accepts: "greedy", "ilp". Default: "greedy"."""
 
+    TL_SUNMMIO_GEMM_TWO_COMMUNICATIONS = "tl.sunmmio_gemm_two_communications"
+    """Use two Allgather-style transfers directly to ASRAM for supported BF16
+    Broadcast/guarded Put GEMMs. Default: False (one transfer to RSRAM and two
+    local Copies). Requires one full-tile consumer; Broadcast writer and GEMM
+    must share an unconditional scope. Uses one ASRAM tile per row participant.
+    Does not change plain Copy/Allgather GEMMs or single-pass GEMMs.
+    """
+
     TL_SUNMMIO_FASTER = "tl.sunmmio_faster"
     """Tune Sunmmio pipeline-planner search. In greedy mode, limit the number
     of bank-coloring candidates; -1 searches all candidates. In ILP mode, use

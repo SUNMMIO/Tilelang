@@ -146,6 +146,26 @@ def mismatched_copy_kernel():
     return tvm.IRModule({"main": main})
 
 
+def unaligned_partial_rank3_copy_kernel(direction):
+    shape = (4, 64, 64)
+    compact_shape = (2, 64, 64)
+
+    @T.prim_func
+    def main(
+        A: _dram(shape, make_row_major(shape)),
+        B: _dram(shape, make_row_major(shape)),
+    ):
+        with T.Kernel() as _cid:
+            X = T.alloc_shared(compact_shape, DTYPE, scope="shared.rsram")
+            T.annotate_layout({X: make_zz_layout(compact_shape, [1, 2], (32, 32))})
+            if direction == "load":
+                T.copy(A[1:3, :, :], X)
+            else:
+                T.copy(X, B[1:3, :, :])
+
+    return tvm.IRModule({"main": main})
+
+
 def mxzz_dram_to_mx_row_major_rsram_kernel():
     @T.prim_func
     def main(
@@ -279,6 +299,19 @@ def test_mismatched_copy_splits_into_dma_and_transform():
         assert len(stages) == 2, [b.name for b in stages]
         for b in stages:
             assert b.scope() == "shared.rsram", b.scope()
+
+
+@pytest.mark.parametrize("direction", ["load", "store"])
+def test_unaligned_partial_rank3_copy_keeps_layout_transform(direction):
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        mod = apply_passes_through_lower_tile_op(unaligned_partial_rank3_copy_kernel(direction), target)
+        func = list(mod.functions.values())[0]
+
+    names = collect_call_names(func)
+    assert names.count("tl.dma_copy") == 2, names
+    assert names.count("tl.sunmmio_layout_transform") == 2, names
+    assert len(staging_buffers(func)) == 1
 
 
 def test_zz_dram_splits_with_zz_staging():

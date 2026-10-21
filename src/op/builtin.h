@@ -121,6 +121,9 @@ static constexpr const char *kDisableSunmmioPipeline =
 
 static constexpr const char *kSunmmioPipelineMode = "tl.sunmmio_pipeline_mode";
 
+static constexpr const char *kSunmmioGemmTwoCommunications =
+    "tl.sunmmio_gemm_two_communications";
+
 static constexpr const char *kSunmmioFaster = "tl.sunmmio_faster";
 
 static constexpr const char *kSunmmioILPStageShrink =
