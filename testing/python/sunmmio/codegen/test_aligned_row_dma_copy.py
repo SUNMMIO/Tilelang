@@ -368,7 +368,7 @@ def test_aligned_row_vector_copy_uses_1024_byte_carrier(direction, rsram_rank, t
             direction,
             20,
             500,
-            7,
+            10,
             5,
             T.bfloat16,
             "!suvm.tile_view<5x512xbf16>",
@@ -439,17 +439,28 @@ def test_alignment_mismatch_falls_back_to_existing_layout_transform_path(directi
     assert src.count("T.sunmmio_layout_transform") == 1
 
 
+@pytest.mark.parametrize("direction", ["load", "store"])
+def test_aligned_row_subset_rejects_truncated_start(direction, tmp_path):
+    # Seven is not a five-row partition boundary. It used to become row five
+    # when codegen floored the start index, despite passing NPU-IR verification.
+    with pytest.raises(tvm.error.InternalError, match="must be provably aligned to region extent 5"):
+        validate_sunmmio_codegen_with_npuir_opt(
+            aligned_row_matrix_copy_kernel(direction=direction, rows=20, cols=500, row_start=7, copy_rows=5),
+            tmp_path,
+        )
+
+
 @pytest.mark.parametrize(
     "factory,reason",
     [
         pytest.param(
             aligned_row_non_singleton_reshape_kernel,
-            "canonical logical shapes do not match",
+            "matching effective region shapes",
             id="non-singleton-reshape",
         ),
         pytest.param(
             aligned_row_byte_aligned_reshape_kernel,
-            "canonical logical shapes do not match",
+            "matching effective region shapes",
             id="byte-aligned-reshape",
         ),
         pytest.param(

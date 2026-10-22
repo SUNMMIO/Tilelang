@@ -174,9 +174,11 @@ def test_sunmmio_pipeline_ilp_inject_ffn_stage2():
     broadcasts = []
     tir.stmt_functor.post_order_visit(
         injected["main"].body,
-        lambda node: broadcasts.append(node)
-        if isinstance(node, tir.Call) and isinstance(node.op, tvm.ir.Op) and node.op.name == "tl.broadcast_"
-        else None,
+        lambda node: (
+            broadcasts.append(node)
+            if isinstance(node, tir.Call) and isinstance(node.op, tvm.ir.Op) and node.op.name == "tl.broadcast_"
+            else None
+        ),
     )
     assert len(broadcasts) >= 4
 
