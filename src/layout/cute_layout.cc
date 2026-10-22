@@ -712,6 +712,25 @@ bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
          bwd.defined() && IsSameLayout(bwd.value(), cl, analyzer);
 }
 
+bool IsLayoutMatchForDType(const Layout &lhs, const Layout &rhs, DataType dtype,
+                           arith::Analyzer *analyzer) {
+  if (!lhs.defined() || !rhs.defined())
+    return false;
+  if (!sunmmio::IsMXDType(dtype))
+    return IsLayoutMatch(lhs, rhs, analyzer);
+  if (IsSameLayout(lhs, rhs, analyzer))
+    return true;
+  // Generic stride reconstruction omits the MX scale/padding storage. Do not
+  // canonicalize MX blocks to ordinary row-major, even for a single block.
+  auto fwd =
+      sunmmio::DeriveMXLayoutLike(lhs, rhs->InputShape(), dtype, analyzer);
+  auto bwd =
+      sunmmio::DeriveMXLayoutLike(rhs, lhs->InputShape(), dtype, analyzer);
+  return fwd.defined() && bwd.defined() &&
+         IsSameLayout(fwd.value(), rhs, analyzer) &&
+         IsSameLayout(bwd.value(), lhs, analyzer);
+}
+
 // ---------------------------------------------------------------------------
 // ComputeContiguousTileSteps — stride-walk algorithm
 // ---------------------------------------------------------------------------
@@ -1568,7 +1587,8 @@ Optional<Layout> DeriveMXLayoutLike(const Layout &src,
 
   Array<PrimExpr> src_shape = src_cute->GetLogicalShape();
   int rank = static_cast<int>(src_shape.size());
-  if (rank < 2 || static_cast<int>(dst_shape.size()) != rank) {
+  int dst_rank = static_cast<int>(dst_shape.size());
+  if (rank < 2 || dst_rank < 2) {
     return Optional<Layout>();
   }
 
@@ -1596,28 +1616,51 @@ Optional<Layout> DeriveMXLayoutLike(const Layout &src,
     return axes;
   };
 
+  // A matrix tile may be copied to/from a peer or expert slot with additional
+  // leading batch axes. Preserve its two trailing matrix axes and MX storage
+  // recipe; this derives a fresh staging layout, not an alias/reshape of src.
+  // Non-trailing matrix axes need an explicit mapping when ranks differ.
+  auto destination_axes =
+      [&](const Array<Integer> &axes) -> std::optional<Array<Integer>> {
+    if (rank == dst_rank) {
+      return axes;
+    }
+    if (axes[0].IntValue() != rank - 2 || axes[1].IntValue() != rank - 1) {
+      return std::nullopt;
+    }
+    return Array<Integer>{Integer(dst_rank - 2), Integer(dst_rank - 1)};
+  };
+
   if (auto axes = find_axes_with_levels(/*expected_levels=*/2)) {
-    if (IsSameLayout(src, MakeMXZZ(src_shape, *axes, dtype), analyzer)) {
-      return Optional<Layout>(MakeMXZZ(dst_shape, *axes, dtype));
+    auto dst_axes = destination_axes(*axes);
+    if (dst_axes &&
+        IsSameLayout(src, MakeMXZZ(src_shape, *axes, dtype), analyzer)) {
+      return Optional<Layout>(MakeMXZZ(dst_shape, *dst_axes, dtype));
     }
   }
 
   if (auto axes = find_axes_with_levels(/*expected_levels=*/3)) {
+    auto dst_axes = destination_axes(*axes);
+    if (!dst_axes) {
+      return Optional<Layout>();
+    }
     int ax0 = (*axes)[0].IntValue();
     int ax1 = (*axes)[1].IntValue();
+    int dst_ax0 = (*dst_axes)[0].IntValue();
+    int dst_ax1 = (*dst_axes)[1].IntValue();
     int64_t pack_size = MXPackSize(dtype);
     bool can_build_src =
         StaticDivisibleOrSymbolic(src_shape[ax0], 32 * pack_size) &&
         StaticDivisibleOrSymbolic(src_shape[ax1], 32);
     bool can_build_dst =
-        StaticDivisibleOrSymbolic(dst_shape[ax0], 32 * pack_size) &&
-        StaticDivisibleOrSymbolic(dst_shape[ax1], 32);
+        StaticDivisibleOrSymbolic(dst_shape[dst_ax0], 32 * pack_size) &&
+        StaticDivisibleOrSymbolic(dst_shape[dst_ax1], 32);
     if (can_build_src && can_build_dst) {
       if (IsSameLayout(src, MakeMXZNN(src_shape, *axes, dtype), analyzer)) {
-        return Optional<Layout>(MakeMXZNN(dst_shape, *axes, dtype));
+        return Optional<Layout>(MakeMXZNN(dst_shape, *dst_axes, dtype));
       }
       if (IsSameLayout(src, MakeMXZNZ(src_shape, *axes, dtype), analyzer)) {
-        return Optional<Layout>(MakeMXZNZ(dst_shape, *axes, dtype));
+        return Optional<Layout>(MakeMXZNZ(dst_shape, *dst_axes, dtype));
       }
     }
   }
@@ -1686,6 +1729,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            })
       .def("tl.IsLayoutMatch",
            [](Layout lhs, Layout rhs) { return IsLayoutMatch(lhs, rhs); })
+      .def("tl.IsLayoutMatchForDType",
+           [](Layout lhs, Layout rhs, DataType dtype) {
+             return IsLayoutMatchForDType(lhs, rhs, dtype);
+           })
       .def("tl.TryCanonicalizeToRowMajor",
            [](Layout layout) { return TryCanonicalizeToRowMajor(layout); })
       .def("tl.sunmmio.make_row_major",

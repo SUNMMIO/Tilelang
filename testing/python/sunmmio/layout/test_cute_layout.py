@@ -40,6 +40,7 @@ same_layout = _get("tl.CuteLayout_same_layout")
 is_same_layout = _get("tl.IsSameLayout")
 derive_layout_like = _get("tl.DeriveLayoutLike")
 is_layout_match = _get("tl.IsLayoutMatch")
+is_layout_match_for_dtype = _get("tl.IsLayoutMatchForDType")
 canonicalize_to_row_major = _get("tl.TryCanonicalizeToRowMajor")
 
 ANA = tvm.arith.Analyzer()
@@ -347,6 +348,65 @@ class TestSunmmioConstructors:
 
         assert derived
         assert is_same_layout(derived, expected)
+
+    @pytest.mark.parametrize("dtype", ["custom[mxfp8]8", "custom[mxfp4]4"])
+    @pytest.mark.parametrize("factory", [make_mx_row_major, make_mxzz, make_mxznn, make_mxznz])
+    @pytest.mark.parametrize(
+        "src_shape,dst_shape",
+        [
+            ((4, 128, 128), (64, 128)),
+            ((64, 128), (1, 64, 128)),
+            ((2, 4, 128, 128), (1, 64, 128)),
+        ],
+    )
+    def test_derive_mx_layout_like_changes_only_batch_prefix(self, dtype, factory, src_shape, dst_shape):
+        def make(shape):
+            if factory is make_mx_row_major:
+                return factory(_imms(*shape), dtype)
+            return factory(_imms(*shape), [len(shape) - 2, len(shape) - 1], dtype)
+
+        derived = derive_mx_layout_like(make(src_shape), _imms(*dst_shape), dtype)
+        expected = make(dst_shape)
+        assert derived
+        assert is_same_layout(derived, expected)
+        assert int(ANA.simplify(get_storage_size(derived))) == int(ANA.simplify(get_storage_size(expected)))
+
+    @pytest.mark.parametrize("factory", [make_mxzz, make_mxznn, make_mxznz])
+    def test_derive_mx_rank_change_rejects_nontrailing_matrix_axes(self, factory):
+        src = factory(_imms(128, 4, 128), [0, 2], "custom[mxfp8]8")
+        assert not derive_mx_layout_like(src, _imms(64, 128), "custom[mxfp8]8")
+
+    @pytest.mark.parametrize("dtype,block_elems,bits", [("custom[mxfp8]8", 1280, 8), ("custom[mxfp4]4", 1536, 4)])
+    def test_mxzz_batch_stride_includes_scales_and_padding(self, dtype, block_elems, bits):
+        src = make_mxzz(_imms(64, 128), [0, 1], dtype)
+        derived = derive_mx_layout_like(src, _imms(2, 64, 128), dtype)
+        # Eight blocks per matrix; scale/reserved prefix is 256 bytes per block.
+        assert [int(x) for x in get_mode_stride(derived)] == [8 * block_elems, 32, 4 * block_elems, 1, block_elems]
+        assert _eval(derived, 1, 0, 0) * bits // 8 == 8 * (256 + 32 * 32 * bits // 8)
+        assert _eval(derived, 1, 32, 32) == 13 * block_elems
+
+    @pytest.mark.parametrize("dtype", ["custom[mxfp8]8", "custom[mxfp4]4"])
+    @pytest.mark.parametrize("factory", [make_mx_row_major, make_mxzz, make_mxznn, make_mxznz])
+    def test_mx_layout_match_preserves_storage_and_is_symmetric(self, dtype, factory):
+        def make(shape):
+            if factory is make_mx_row_major:
+                return factory(_imms(*shape), dtype)
+            return factory(_imms(*shape), [len(shape) - 2, len(shape) - 1], dtype)
+
+        for a, b in [(make((64, 128)), make((2, 128, 256))), (make((1, 64, 128)), make((2, 64, 128)))]:
+            assert is_layout_match_for_dtype(a, b, dtype)
+            assert is_layout_match_for_dtype(b, a, dtype)
+        mxzz = make_mxzz(_imms(64, 128), [0, 1], dtype)
+        row_major = make_mx_row_major(_imms(64, 128), dtype)
+        assert not is_layout_match_for_dtype(mxzz, row_major, dtype)
+        assert not is_layout_match_for_dtype(row_major, mxzz, dtype)
+
+    @pytest.mark.parametrize("dtype", ["custom[mxfp8]8", "custom[mxfp4]4"])
+    def test_mx_layout_match_rejects_nontrailing_rank_change(self, dtype):
+        a = make_mxzz(_imms(64, 2, 128), [0, 2], dtype)
+        b = make_mxzz(_imms(64, 128), [0, 1], dtype)
+        assert not is_layout_match_for_dtype(a, b, dtype)
+        assert not is_layout_match_for_dtype(b, a, dtype)
 
     @pytest.mark.parametrize(
         "layout_factory",

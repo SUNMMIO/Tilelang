@@ -2497,7 +2497,8 @@ const char *CodeGenTileLangSunMMIO::CallBucketName(CallBucket bucket) const {
 
 SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
     const tvm::PrimExpr &region_expr, int64_t byte_offset,
-    bool use_layout_covered_shape, bool preserve_unit_dims) {
+    const char *copy_operand, bool use_layout_covered_shape,
+    bool preserve_unit_dims) {
   BufferRegion region = NormalizeRegionTracked(region_expr);
   const BufferBinding &binding = LookupBuffer(region->buffer);
   std::vector<int64_t> effective_extents;
@@ -2535,6 +2536,19 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
     const Range &range = region->region[dim];
     const auto *extent_imm = range->extent.as<IntImmNode>();
     ICHECK(extent_imm) << "tl.tileop.region extent must be IntImm";
+    if (copy_operand) {
+      ICHECK_GT(extent_imm->value, 0)
+          << "Sunmmio copy " << copy_operand << " buffer "
+          << region->buffer->name << " has non-positive region extent at dim "
+          << extents.size();
+      // Partition indices count whole regions. Flooring an unaligned start
+      // silently changes the address, even when optional region checks are off.
+      ICHECK(analyzer.CanProveEqual(floormod(range->min, range->extent), 0))
+          << "Sunmmio copy " << copy_operand << " buffer "
+          << region->buffer->name << " region min at dim " << extents.size()
+          << " must be provably aligned to region extent " << range->extent
+          << ", but got min=" << range->min;
+    }
     MarkVisitedExprRoot(range->extent);
     int64_t extent = use_layout_covered_shape
                          ? effective_extents[dim]
@@ -2653,8 +2667,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     ICHECK(TryConsumeSunmmioOdmaUnit(op->args[3], &attrs))
         << "tl.dma_copy expects fourth argument to be tl.odma_unit";
 
-    operands.push_back(EmitRegionCall(op->args[0], src_offset_byte));
-    operands.push_back(EmitRegionCall(op->args[1]));
+    operands.push_back(EmitRegionCall(op->args[0], src_offset_byte, "source"));
+    operands.push_back(EmitRegionCall(op->args[1], 0, "destination"));
   } else if (callee == "tl.sunmmio_layout_transform") {
     ICHECK_EQ(op->args.size(), 3)
         << "tl.sunmmio_layout_transform expects src region, dst region, and "
@@ -2710,11 +2724,11 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
 
     operands.reserve(2);
     operands.push_back(
-        EmitRegionCall(op->args[0], /*byte_offset=*/0,
+        EmitRegionCall(op->args[0], /*byte_offset=*/0, "source",
                        /*use_layout_covered_shape=*/is_unit_axis_2d_transform,
                        /*preserve_unit_dims=*/is_unit_axis_2d_transform));
     operands.push_back(
-        EmitRegionCall(op->args[1], /*byte_offset=*/0,
+        EmitRegionCall(op->args[1], /*byte_offset=*/0, "destination",
                        /*use_layout_covered_shape=*/is_unit_axis_2d_transform,
                        /*preserve_unit_dims=*/is_unit_axis_2d_transform));
 
