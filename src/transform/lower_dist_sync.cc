@@ -10,6 +10,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../op/builtin.h"
+#include "../op/comm.h"
 #include "../op/utils.h"
 #include "dist_transform_utils.h"
 
@@ -22,12 +24,128 @@ using namespace dist_transform;
 
 namespace {
 
+using BufferRegions = std::vector<BufferRegion>;
+
+bool SameBufferRegion(const BufferRegion &lhs, const BufferRegion &rhs) {
+  return StructuralEqual()(lhs, rhs);
+}
+
+void AddUniqueRegion(BufferRegions *regions, const BufferRegion &region) {
+  for (const BufferRegion &existing : *regions) {
+    if (SameBufferRegion(existing, region)) {
+      return;
+    }
+  }
+  regions->push_back(region);
+}
+
+BufferRegions MergeRegions(const BufferRegions &lhs, const BufferRegions &rhs) {
+  BufferRegions merged = lhs;
+  for (const BufferRegion &region : rhs) {
+    AddUniqueRegion(&merged, region);
+  }
+  return merged;
+}
+
+bool SameRegionSet(const BufferRegions &lhs, const BufferRegions &rhs) {
+  if (lhs.size() != rhs.size()) {
+    return false;
+  }
+  for (const BufferRegion &region : lhs) {
+    bool found = false;
+    for (const BufferRegion &candidate : rhs) {
+      found |= SameBufferRegion(region, candidate);
+    }
+    if (!found) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool AnyRegionOverlaps(const BufferRegions &pending,
+                       const BufferRegions &accesses) {
+  for (const BufferRegion &lhs : pending) {
+    for (const BufferRegion &rhs : accesses) {
+      if (BufferRegionsMayOverlap(lhs->buffer, lhs->region, rhs->buffer,
+                                  rhs->region)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool AnyRegionUsesBuffer(const BufferRegions &regions, const Var &buffer_var) {
+  for (const BufferRegion &region : regions) {
+    if (region->buffer->data.same_as(buffer_var)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+BufferRegions CallWriteRegions(const CallNode *call) {
+  BufferRegions writes;
+  auto add = [&](size_t index) {
+    ICHECK_LT(index, call->args.size());
+    AddUniqueRegion(&writes, NormalizeToBufferRegion(call->args[index]));
+  };
+  if (call->op.same_as(dma_copy()) ||
+      call->op.same_as(sunmmio_layout_transform()) ||
+      call->op.same_as(sunmmio_transpose())) {
+    add(1);
+  } else if (call->op.same_as(mma_sunmmio())) {
+    add(2);
+  } else if (call->op.same_as(broadcast_())) {
+    add(kBroadcastArgDst);
+  } else if (call->op.same_as(mx_pack())) {
+    add(2);
+  } else if (call->op.same_as(mx_unpack())) {
+    add(1);
+    add(2);
+  }
+  return writes;
+}
+
+class WriteRegionCollector : public StmtExprVisitor {
+public:
+  BufferRegions Collect(const Stmt &stmt) {
+    VisitStmt(stmt);
+    return std::move(writes_);
+  }
+
+private:
+  void VisitStmt_(const BufferStoreNode *op) final {
+    Region region;
+    for (const PrimExpr &index : op->indices) {
+      region.push_back(Range::FromMinExtent(index, 1));
+    }
+    AddUniqueRegion(&writes_, BufferRegion(op->buffer, std::move(region)));
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    for (const BufferRegion &region : CallWriteRegions(op)) {
+      AddUniqueRegion(&writes_, region);
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  BufferRegions writes_;
+};
+
 // Track the implicit per-core send queue across structured control flow.
 class DistQueueValidator : public StmtVisitor {
 public:
   struct Result {
     std::unordered_set<const EvaluateNode *> returns_needing_wait;
     std::unordered_set<const AttrStmtNode *> core_exits_needing_wait;
+    std::unordered_set<const EvaluateNode *> evaluates_needing_wait;
+    std::unordered_set<const BufferStoreNode *> stores_needing_wait;
+    std::unordered_set<const AllocateNode *> allocations_needing_wait;
+    std::unordered_set<const ForNode *> for_loops_needing_wait;
+    std::unordered_set<const WhileNode *> while_loops_needing_wait;
     std::unordered_set<const EvaluateNode *> empty_submits;
   };
 
@@ -41,6 +159,11 @@ public:
     }
     return Result{std::move(validator.returns_needing_wait_),
                   std::move(validator.core_exits_needing_wait_),
+                  std::move(validator.evaluates_needing_wait_),
+                  std::move(validator.stores_needing_wait_),
+                  std::move(validator.allocations_needing_wait_),
+                  std::move(validator.for_loops_needing_wait_),
+                  std::move(validator.while_loops_needing_wait_),
                   std::move(validator.empty_submits_)};
   }
 
@@ -50,6 +173,8 @@ private:
     bool strict_batch_open;
     bool channel_in_flight;
     bool falls_through;
+    BufferRegions queued_sources;
+    BufferRegions inflight_sources;
   };
 
   struct LoopExits {
@@ -59,7 +184,7 @@ private:
 
   State GetState() const {
     return State{queue_pending_, strict_batch_open_, channel_in_flight_,
-                 falls_through_};
+                 falls_through_, queued_sources_,    inflight_sources_};
   }
 
   void SetState(const State &state) {
@@ -67,6 +192,8 @@ private:
     strict_batch_open_ = state.strict_batch_open;
     channel_in_flight_ = state.channel_in_flight;
     falls_through_ = state.falls_through;
+    queued_sources_ = state.queued_sources;
+    inflight_sources_ = state.inflight_sources;
   }
 
   static State Join(const State &lhs, const State &rhs) {
@@ -77,8 +204,19 @@ private:
       return lhs;
     }
     ICHECK_EQ(lhs.strict_batch_open, rhs.strict_batch_open);
-    return State{lhs.queue_pending || rhs.queue_pending, lhs.strict_batch_open,
-                 lhs.channel_in_flight || rhs.channel_in_flight, true};
+    return State{lhs.queue_pending || rhs.queue_pending,
+                 lhs.strict_batch_open,
+                 lhs.channel_in_flight || rhs.channel_in_flight,
+                 true,
+                 MergeRegions(lhs.queued_sources, rhs.queued_sources),
+                 MergeRegions(lhs.inflight_sources, rhs.inflight_sources)};
+  }
+
+  static bool SameLoopState(const State &lhs, const State &rhs) {
+    return lhs.queue_pending == rhs.queue_pending &&
+           lhs.channel_in_flight == rhs.channel_in_flight &&
+           SameRegionSet(lhs.queued_sources, rhs.queued_sources) &&
+           SameRegionSet(lhs.inflight_sources, rhs.inflight_sources);
   }
 
   void CheckSubmitted(bool before_return) const {
@@ -88,6 +226,35 @@ private:
     ICHECK(!queue_pending_) << "T.dist send queue is not submitted"
                             << (before_return ? " before return" : "")
                             << "; call T.dist.submit() or use submit=True";
+  }
+
+  bool HandleWrites(const BufferRegions &writes, const char *description) {
+    if (writes.empty()) {
+      return false;
+    }
+    ICHECK(!AnyRegionOverlaps(queued_sources_, writes))
+        << "T.dist source is modified before its queued batch is submitted ("
+        << description << ")";
+    if (!AnyRegionOverlaps(inflight_sources_, writes)) {
+      return false;
+    }
+    // dist_wait_send completes the whole local send channel, not just the
+    // conflicting region.
+    inflight_sources_.clear();
+    channel_in_flight_ = false;
+    return true;
+  }
+
+  bool UsesAllocationLeavingCurrentLoop(const BufferRegions &regions) const {
+    ICHECK(!loop_allocation_depths_.empty());
+    size_t first_exiting_allocation = loop_allocation_depths_.back();
+    for (size_t i = first_exiting_allocation; i < active_allocations_.size();
+         ++i) {
+      if (AnyRegionUsesBuffer(regions, active_allocations_[i])) {
+        return true;
+      }
+    }
+    return false;
   }
 
   State VisitBranch(const Stmt &stmt, const State &incoming) {
@@ -126,6 +293,7 @@ private:
         // The planned wait completes this core's outstanding sends before
         // control leaves its scope (including an outer function return).
         channel_in_flight_ = false;
+        inflight_sources_.clear();
       }
     }
   }
@@ -145,32 +313,78 @@ private:
     State incoming = GetState();
     State entry = incoming;
     loop_exits_.emplace_back();
+    loop_allocation_depths_.push_back(active_allocations_.size());
     while (true) {
       loop_exits_.back() = LoopExits{};
       State body_state = VisitBranch(body, entry);
       // Continue reaches the next iteration; break only reaches the loop exit.
       State backedge = Join(body_state, loop_exits_.back().continues);
       State next = Join(incoming, backedge);
-      if (next.queue_pending == entry.queue_pending &&
-          next.channel_in_flight == entry.channel_in_flight) {
+      if (SameLoopState(next, entry)) {
         // Include zero iterations and exhaustion after a normal/continue path.
         SetState(Join(next, loop_exits_.back().breaks));
         break;
       }
       entry = next;
     }
+    loop_allocation_depths_.pop_back();
     loop_exits_.pop_back();
   }
 
   void VisitStmt_(const ForNode *op) final {
+    BufferRegions writes = WriteRegionCollector().Collect(op->body);
+    if (AnyRegionOverlaps(inflight_sources_, writes)) {
+      for_loops_needing_wait_.insert(op);
+      inflight_sources_.clear();
+      channel_in_flight_ = false;
+    }
     VisitExpr(op->min);
     VisitExpr(op->extent);
     VisitLoop(op->body);
   }
 
   void VisitStmt_(const WhileNode *op) final {
+    BufferRegions writes = WriteRegionCollector().Collect(op->body);
+    if (AnyRegionOverlaps(inflight_sources_, writes)) {
+      while_loops_needing_wait_.insert(op);
+      inflight_sources_.clear();
+      channel_in_flight_ = false;
+    }
     VisitExpr(op->condition);
     VisitLoop(op->body);
+  }
+
+  void VisitStmt_(const AllocateNode *op) final {
+    for (const PrimExpr &extent : op->extents) {
+      VisitExpr(extent);
+    }
+    VisitExpr(op->condition);
+    active_allocations_.push_back(op->buffer_var);
+    VisitStmt(op->body);
+    active_allocations_.pop_back();
+    if (!falls_through_) {
+      return;
+    }
+    if (AnyRegionUsesBuffer(queued_sources_, op->buffer_var)) {
+      CheckSubmitted(/*before_return=*/false);
+    }
+    if (AnyRegionUsesBuffer(inflight_sources_, op->buffer_var)) {
+      allocations_needing_wait_.insert(op);
+      inflight_sources_.clear();
+      channel_in_flight_ = false;
+    }
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    Region region;
+    for (const PrimExpr &index : op->indices) {
+      region.push_back(Range::FromMinExtent(index, 1));
+    }
+    BufferRegions writes{BufferRegion(op->buffer, std::move(region))};
+    if (HandleWrites(writes, "buffer store")) {
+      stores_needing_wait_.insert(op);
+    }
+    StmtVisitor::VisitStmt_(op);
   }
 
   void VisitStmt_(const EvaluateNode *op) final {
@@ -199,6 +413,15 @@ private:
       ICHECK(!strict_batch_open_)
           << "T.dist submit=True batch is missing its submit boundary before "
           << (is_break ? "break" : "continue");
+      ICHECK(!UsesAllocationLeavingCurrentLoop(queued_sources_))
+          << "T.dist source is released by "
+          << (is_break ? "break" : "continue")
+          << " before its queued batch is submitted";
+      if (UsesAllocationLeavingCurrentLoop(inflight_sources_)) {
+        evaluates_needing_wait_.insert(op);
+        inflight_sources_.clear();
+        channel_in_flight_ = false;
+      }
       State &exit =
           is_break ? loop_exits_.back().breaks : loop_exits_.back().continues;
       exit = Join(exit, GetState());
@@ -213,7 +436,13 @@ private:
       strict_batch_open_ = true;
       return;
     }
-    if (call->op.same_as(dist_put_()) || call->op.same_as(dist_signal_put_())) {
+    if (call->op.same_as(dist_put_())) {
+      ICHECK_EQ(call->args.size(), 6U);
+      AddUniqueRegion(&queued_sources_, NormalizeToBufferRegion(call->args[0]));
+      queue_pending_ = true;
+      return;
+    }
+    if (call->op.same_as(dist_signal_put_())) {
       queue_pending_ = true;
       return;
     }
@@ -222,14 +451,25 @@ private:
       if (!nonempty && loop_exits_.empty()) {
         empty_submits_.insert(op);
       }
+      // Every retained submit receives a channel-idle wait during rewriting,
+      // so prior in-flight sources are complete before this batch starts.
+      inflight_sources_.clear();
+      if (nonempty) {
+        inflight_sources_ = queued_sources_;
+      }
+      queued_sources_.clear();
       queue_pending_ = false;
       strict_batch_open_ = false;
       channel_in_flight_ |= nonempty;
       return;
     }
     if (call->op.same_as(dist_wait_send())) {
+      inflight_sources_.clear();
       channel_in_flight_ = false;
       return;
+    }
+    if (HandleWrites(CallWriteRegions(call), "asynchronous destination")) {
+      evaluates_needing_wait_.insert(op);
     }
     StmtVisitor::VisitStmt_(op);
   }
@@ -238,26 +478,35 @@ private:
   bool strict_batch_open_{false};
   bool channel_in_flight_{false};
   bool falls_through_{true};
+  BufferRegions queued_sources_;
+  BufferRegions inflight_sources_;
   std::vector<LoopExits> loop_exits_;
+  std::vector<size_t> loop_allocation_depths_;
+  std::vector<Var> active_allocations_;
   int core_depth_{0};
   std::unordered_set<const EvaluateNode *> returns_needing_wait_;
   std::unordered_set<const AttrStmtNode *> core_exits_needing_wait_;
+  std::unordered_set<const EvaluateNode *> evaluates_needing_wait_;
+  std::unordered_set<const BufferStoreNode *> stores_needing_wait_;
+  std::unordered_set<const AllocateNode *> allocations_needing_wait_;
+  std::unordered_set<const ForNode *> for_loops_needing_wait_;
+  std::unordered_set<const WhileNode *> while_loops_needing_wait_;
   std::unordered_set<const EvaluateNode *> empty_submits_;
 };
 
-// Temporary TIR cleanup. Loop jumps propagate state to their destinations;
-// sender drains are inserted only at returns and normal core exits.
-class InjectDistExitWait : public StmtExprMutator {
+// Materialize the sender waits selected by the queue and source-lifetime
+// analysis before signal-state lowering rebuilds the tree.
+class InjectDistSenderWait : public StmtExprMutator {
 public:
   static PrimFunc Run(PrimFunc func, const DistQueueValidator::Result &queue) {
-    InjectDistExitWait injector(queue);
+    InjectDistSenderWait injector(queue);
     Stmt body = injector(func->body);
     func.CopyOnWrite()->body = std::move(body);
     return func;
   }
 
 private:
-  explicit InjectDistExitWait(const DistQueueValidator::Result &queue)
+  explicit InjectDistSenderWait(const DistQueueValidator::Result &queue)
       : queue_(queue) {}
 
   Stmt WaitSend() const {
@@ -291,21 +540,72 @@ private:
     return SeqStmt::Flatten(Array<Stmt>{stmt, WaitSend()});
   }
 
-  Stmt VisitStmt_(const AttrStmtNode *op) final {
-    if (!queue_.core_exits_needing_wait.count(op)) {
-      return StmtExprMutator::VisitStmt_(op);
+  Stmt VisitStmt_(const BlockRealizeNode *op) final {
+    Array<PrimExpr> iter_values;
+    iter_values.reserve(op->iter_values.size());
+    for (const PrimExpr &value : op->iter_values) {
+      iter_values.push_back(VisitExpr(value));
     }
+    PrimExpr predicate = VisitExpr(op->predicate);
+    Block block = op->block;
+    BlockNode *writer = block.CopyOnWrite();
+    if (writer->init.defined()) {
+      writer->init = VisitStmt(writer->init.value());
+    }
+    writer->body = VisitStmt(writer->body);
+    return BlockRealize(iter_values, predicate, block, op->span);
+  }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
     Stmt body = VisitStmt(op->body);
-    body = AppendCoreWait(body);
+    if (queue_.core_exits_needing_wait.count(op)) {
+      body = AppendCoreWait(body);
+    }
     return AttrStmt(op->node, op->attr_key, op->value, body, op->span);
   }
 
-  Stmt VisitStmt_(const EvaluateNode *op) final {
-    if (queue_.returns_needing_wait.count(op)) {
-      return SeqStmt::Flatten(
-          Array<Stmt>{WaitSend(), tvm::ffi::GetRef<Stmt>(op)});
+  Stmt VisitStmt_(const AllocateNode *op) final {
+    Stmt body = VisitStmt(op->body);
+    if (queue_.allocations_needing_wait.count(op)) {
+      body = AppendCoreWait(body);
     }
-    return StmtExprMutator::VisitStmt_(op);
+    return Allocate(op->buffer_var, op->dtype, op->extents, op->condition, body,
+                    op->annotations, op->span);
+  }
+
+  Stmt VisitStmt_(const BufferStoreNode *op) final {
+    Stmt store = StmtExprMutator::VisitStmt_(op);
+    if (!queue_.stores_needing_wait.count(op)) {
+      return store;
+    }
+    return SeqStmt::Flatten(Array<Stmt>{WaitSend(), std::move(store)});
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    Stmt loop = For(op->loop_var, VisitExpr(op->min), VisitExpr(op->extent),
+                    op->kind, VisitStmt(op->body), op->thread_binding,
+                    op->annotations, op->step, op->span);
+    if (!queue_.for_loops_needing_wait.count(op)) {
+      return loop;
+    }
+    return SeqStmt::Flatten(Array<Stmt>{WaitSend(), std::move(loop)});
+  }
+
+  Stmt VisitStmt_(const WhileNode *op) final {
+    Stmt loop = While(VisitExpr(op->condition), VisitStmt(op->body), op->span);
+    if (!queue_.while_loops_needing_wait.count(op)) {
+      return loop;
+    }
+    return SeqStmt::Flatten(Array<Stmt>{WaitSend(), std::move(loop)});
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    Stmt evaluate = StmtExprMutator::VisitStmt_(op);
+    if (queue_.returns_needing_wait.count(op) ||
+        queue_.evaluates_needing_wait.count(op)) {
+      return SeqStmt::Flatten(Array<Stmt>{WaitSend(), std::move(evaluate)});
+    }
+    return evaluate;
   }
 
   const DistQueueValidator::Result &queue_;
@@ -502,8 +802,13 @@ PrimFunc Run(PrimFunc func) {
   DistQueueValidator::Result queue = DistQueueValidator::Validate(func->body);
   // Inject at the recorded nodes before signal lowering rebuilds the tree.
   if (!queue.returns_needing_wait.empty() ||
-      !queue.core_exits_needing_wait.empty()) {
-    func = InjectDistExitWait::Run(std::move(func), queue);
+      !queue.core_exits_needing_wait.empty() ||
+      !queue.evaluates_needing_wait.empty() ||
+      !queue.stores_needing_wait.empty() ||
+      !queue.allocations_needing_wait.empty() ||
+      !queue.for_loops_needing_wait.empty() ||
+      !queue.while_loops_needing_wait.empty()) {
+    func = InjectDistSenderWait::Run(std::move(func), queue);
   }
   func = InjectDistSignalAdvance::Run(std::move(func),
                                       std::move(queue.empty_submits));

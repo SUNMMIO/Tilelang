@@ -6,6 +6,7 @@
 #ifndef TVM_TL_TRANSFORM_DIST_TRANSFORM_UTILS_H_
 #define TVM_TL_TRANSFORM_DIST_TRANSFORM_UTILS_H_
 
+#include <tvm/arith/int_set.h>
 #include <tvm/target/target.h>
 #include <tvm/tir/stmt_functor.h>
 
@@ -184,6 +185,37 @@ inline int64_t RequireIntImm(const PrimExpr &expr, const char *name) {
 
 inline bool IsDramScope(const ffi::String &scope) {
   return scope.empty() || scope == "global";
+}
+
+inline bool RegionsMayOverlap(const Region &lhs, const Region &rhs) {
+  if (lhs.size() != rhs.size()) {
+    return true;
+  }
+  for (size_t i = 0; i < lhs.size(); ++i) {
+    arith::IntSet lhs_set = arith::IntSet::FromRange(lhs[i]);
+    arith::IntSet rhs_set = arith::IntSet::FromRange(rhs[i]);
+    if (arith::Intersect({lhs_set, rhs_set}).IsNothing()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+inline bool BufferRegionsMayOverlap(const Buffer &lhs_buffer,
+                                    const Region &lhs_region,
+                                    const Buffer &rhs_buffer,
+                                    const Region &rhs_region) {
+  if (!lhs_buffer->data.same_as(rhs_buffer->data)) {
+    return false;
+  }
+  if (lhs_buffer.same_as(rhs_buffer) ||
+      StructuralEqual()(lhs_buffer, rhs_buffer)) {
+    return RegionsMayOverlap(lhs_region, rhs_region);
+  }
+  // Different views of the same storage may have unrelated shapes, strides,
+  // or element offsets. Keep the alias conservative until physical ranges can
+  // be proven disjoint.
+  return true;
 }
 
 inline bool IsMultiRank(const PrimFunc &func) {

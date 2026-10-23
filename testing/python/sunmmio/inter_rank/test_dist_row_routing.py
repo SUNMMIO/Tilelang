@@ -31,7 +31,6 @@ def row_shift_kernel_factory(world_size: int = 1):
             )
             T.dist.submit()
             T.dist.wait_signal(signal)
-            T.dist.wait()
 
     return main
 
@@ -192,7 +191,6 @@ def public_routed_put_kernel_factory(world_size: int = 1):
             )
             T.dist.submit()
             T.dist.wait_signal(signal)
-            T.dist.wait()
 
     return main
 
@@ -338,7 +336,6 @@ def dram_cross_row_kernel_factory(world_size: int = 1):
             )
             T.dist.submit()
             T.dist.wait_signal(signal)
-            T.dist.wait()
 
     return main
 
@@ -476,7 +473,6 @@ def multiple_routed_put_kernel_factory(world_size: int = 1):
             )
             T.dist.submit()
             T.dist.wait_all(signals)
-            T.dist.wait()
 
     return main
 

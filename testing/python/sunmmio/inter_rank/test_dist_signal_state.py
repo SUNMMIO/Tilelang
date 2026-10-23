@@ -53,7 +53,6 @@ def reused_signal_kernel_factory(
                     T.dist.wait_signal(signal, expected_delta=1)
                 else:
                     T.dist.wait_signal(signal)
-            T.dist.wait()
 
     return main
 
@@ -72,7 +71,6 @@ def two_puts_two_waits_kernel_factory(world_size: int = 1):
             T.dist.submit()
             T.dist.wait_signal(signal)
             T.dist.wait_signal(signal)
-            T.dist.wait()
 
     return main
 
@@ -109,7 +107,6 @@ def multi_signal_kernel_factory(M, N, world_size: int = 1):
             T.dist.wait_signal(s0)
             T.dist.wait_signal(d0)
             T.dist.wait_signal(m0)
-            T.dist.wait()
 
     return main
 
@@ -168,7 +165,6 @@ def loop_destination_generation_kernel_factory(
                     )
                 else:
                     T.dist.wait_signal(signals[0] if group_member else signal)
-            T.dist.wait()
 
     return main
 

@@ -46,6 +46,7 @@
 #include "../op/dist_comm.h"
 #include "../op/utils.h"
 #include "../target/sunmmio_utils.h"
+#include "dist_transform_utils.h"
 
 namespace tvm {
 namespace tl {
@@ -416,20 +417,6 @@ PrimExpr GetBroadcastSrcCore(const CallNode *call) {
   return call->args[index];
 }
 
-bool RegionIntersect(const Region &lhs, const Region &rhs) {
-  if (lhs.size() != rhs.size()) {
-    return true;
-  }
-  for (size_t i = 0; i < lhs.size(); ++i) {
-    arith::IntSet lhs_set = arith::IntSet::FromRange(lhs[i]);
-    arith::IntSet rhs_set = arith::IntSet::FromRange(rhs[i]);
-    if (arith::Intersect({lhs_set, rhs_set}).IsNothing()) {
-      return false;
-    }
-  }
-  return true;
-}
-
 bool IsRsramBuffer(const Buffer &buffer) {
   return buffer.scope() == kSunmmioScopeRSRAM || buffer.scope() == "local";
 }
@@ -465,17 +452,8 @@ struct UnitAccess {
 };
 
 bool AccessRegionsMayOverlap(const UnitAccess &lhs, const UnitAccess &rhs) {
-  if (!lhs.buffer->data.same_as(rhs.buffer->data)) {
-    return false;
-  }
-  if (lhs.buffer.same_as(rhs.buffer) ||
-      StructuralEqual()(lhs.buffer, rhs.buffer)) {
-    return RegionIntersect(lhs.region, rhs.region);
-  }
-  // Different views of the same storage may use unrelated shapes, strides, or
-  // element offsets. Treat them as aliases until their physical address ranges
-  // can be proven disjoint.
-  return true;
+  return dist_transform::BufferRegionsMayOverlap(lhs.buffer, lhs.region,
+                                                 rhs.buffer, rhs.region);
 }
 
 bool NeedsUnitSync(const UnitAccess &producer, const UnitAccess &consumer) {
@@ -760,12 +738,24 @@ private:
       return PrependSync(StmtMutator::VisitStmt_(op), required);
     }
 
+    if (call && call->op.same_as(dist_put_())) {
+      ICHECK_EQ(call->args.size(), 6U);
+      std::vector<UnitAccess> argument_loads;
+      CollectRegionArgumentLoads(call, {0, 1}, &argument_loads);
+      SunmmioSyncUnits required = SynchronizeBeforeLoads(argument_loads);
+      std::vector<UnitAccess> source_accesses{
+          MakeRegionAccess(NormalizeToBufferRegion(call->args[0]), false,
+                           AccessProducerKind::kAsync, kSunmmioSyncNone)};
+      required |= SynchronizeBeforeLoads(source_accesses);
+      RecordAccesses(argument_loads);
+      return PrependSync(StmtMutator::VisitStmt_(op), required);
+    }
+
     // Dist leaf operations own a separate completion protocol. Until that
     // protocol is modeled in unit synchronization, leave their encoded buffer
     // regions untouched instead of treating their vector arguments as loads.
-    if (call &&
-        (call->op.same_as(dist_put_()) || call->op.same_as(dist_wait_send()) ||
-         call->op.same_as(dist_expect_()))) {
+    if (call && (call->op.same_as(dist_wait_send()) ||
+                 call->op.same_as(dist_expect_()))) {
       return StmtMutator::VisitStmt_(op);
     }
 

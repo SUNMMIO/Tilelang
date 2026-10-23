@@ -102,7 +102,6 @@ def signal_list_wait_all_kernel_factory(world_size: int = 1):
             T.dist.submit()
             # wait_signals
             T.dist.wait_all(signals)
-            # T.dist.wait()
 
     return main
 
@@ -127,7 +126,6 @@ def dram_cross_row_kernel_factory(world_size: int = 1):
             )
             T.dist.submit()
             T.dist.wait_signal(signal)
-            T.dist.wait()
 
     return main
 
@@ -239,7 +237,6 @@ def rank_guarded_routed_put_kernel_factory(world_size: int = 1):
             )
             T.dist.submit()
             T.dist.wait_signal(signal)
-            T.dist.wait()
 
     return main
 
@@ -260,7 +257,7 @@ def signal_only_sync_kernel_factory(world_size: int = 1):
 
 
 @tilelang.jit(target="sunmmio")
-def manual_sender_wait_kernel_factory(world_size: int = 1):
+def manual_sender_signals_kernel_factory(world_size: int = 1):
     @T.prim_func
     def main(rank_id: T.dist.RankId):
         with T.Kernel():
@@ -294,7 +291,6 @@ def manual_sender_wait_kernel_factory(world_size: int = 1):
                 sender_signals,
                 expected_deltas=expected_deltas,
             )
-            T.dist.wait()
 
     return main
 
@@ -333,7 +329,6 @@ def manual_signal_wave_kernel_factory(world_size: int = 1):
                         0,
                     )
                 T.dist.wait_signals(signals, expected_deltas=expected_deltas)
-                T.dist.wait()
 
     return main
 
@@ -698,7 +693,7 @@ def show_signal_only_and_split_barrier_passes():
 def show_manual_sender_wait_passes():
     result = _lower_and_print_case(
         "Manual expected、sender signal与循环 destination Rank",
-        manual_sender_wait_kernel_factory,
+        manual_sender_signals_kernel_factory,
         MANUAL_EXPECT_PASSES,
     )
 

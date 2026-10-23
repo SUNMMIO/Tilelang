@@ -34,7 +34,6 @@ def minimal_put_kernel_factory(M, N, world_size: int = 1):
             T.dist.put(src, dst, dst_rank=peer_rank, signal=signal)
             T.dist.submit()
             T.dist.wait_signal(signal)
-            T.dist.wait()
             T.copy(dst, B)
 
     return main
@@ -87,7 +86,6 @@ def dram_to_dram_kernel_factory(world_size: int = 1):
             )
             T.dist.submit()
             T.dist.wait_signal(signal)
-            T.dist.wait()
 
     return main
 
@@ -122,7 +120,7 @@ def test_p2p_frontend_emits_high_level_ops_and_signal_metadata():
     assert op_names.count("tl.tileop.dist_put") == 1
     assert op_names.count("tl.dist_submit") == 1
     assert op_names.count("tl.dist_wait_signal") == 1
-    assert op_names.count("tl.dist_wait_send") == 1
+    assert "tl.dist_wait_send" not in op_names
     assert "tl.dist_put_" not in op_names
     frontend_script = func.script()
     assert 'T.dist_signal_decl("auto", 0, "infer")' in frontend_script
@@ -173,7 +171,7 @@ def test_p2p_reaches_device_leaf_ops():
     assert "tl.dist_signal" not in lowered_names
     assert "tl.dist_put_" in lowered_names
     assert "tl.dist_wait_signal_" in lowered_names
-    assert "tl.dist_wait_send" in lowered_names
+    assert "tl.dist_wait_send" not in lowered_names
     lowered_script = result.pass_snapshot("tl.LowerTileOp").mod.script()
     assert "signal_expect" in lowered_script
     assert "signal_generation" not in lowered_script

@@ -104,7 +104,6 @@ def signal_list_kernel_factory(signal_kind=None, world_size: int = 1):
             T.dist.put(src1, dst[32:64], dst_rank=peer_rank, signal=signal_list[1])
             T.dist.submit()
             T.dist.wait_all(signal_list)
-            T.dist.wait()
 
     return main
 
@@ -126,7 +125,6 @@ def mixed_scope_signal_list_kernel_factory(world_size: int = 1):
             T.dist.put(src, dst, dst_rank=peer_rank, signal=signal_list[0])
             T.dist.put(src, B, dst_rank=peer_rank, signal=signal_list[1])
             T.dist.submit()
-            T.dist.wait()
 
     return main
 
@@ -189,7 +187,6 @@ def invalid_payload_scope_kernel_factory(world_size: int = 1):
             T.dist.put(src, dst, dst_rank=peer_rank, signal=signal)
             T.dist.submit()
             T.dist.wait_signal(signal)
-            T.dist.wait()
 
     return main
 
