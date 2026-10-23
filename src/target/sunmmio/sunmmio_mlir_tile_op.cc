@@ -22,6 +22,7 @@ mlir::Type MapMlirType(SunmmioMlirContext &ctx, const SunMMIOType &type) {
 void BindRequiredResult(SunmmioMlirContext &ctx, const std::string &result_name,
                         mlir::Value value, llvm::StringRef op_name) {
   ICHECK(!result_name.empty()) << op_name.str() << " expects a named result";
+  ctx.CompleteConsumedTileLoads(value.getDefiningOp());
   ctx.BindMLIRValue(result_name, value);
 }
 
@@ -187,12 +188,14 @@ SunMMIOValue SunmmioMlirTileOp::TileLoad(
     maskedoff_value =
         ctx_.LookupValue(maskedoff.value(), "missing_tile_maskedoff");
   }
-  mlir::Value tile_value = mlir::suvm::TileLoadOp::create(
-                               ctx_.builder, MapMlirLoc(ctx_), result_type,
-                               base, mask_value, maskedoff_value)
-                               .getResult();
-  ctx_.AddPendingSyncUnits(mlir::suvm::SyncUnits::vector);
-  ctx_.AddPendingSyncUnits(mlir::suvm::SyncUnits::rsram);
+  auto load_op = mlir::suvm::TileLoadOp::create(ctx_.builder, MapMlirLoc(ctx_),
+                                                result_type, base, mask_value,
+                                                maskedoff_value);
+  mlir::Value tile_value = load_op.getResult();
+  ctx_.AddPendingSyncOperation(
+      load_op.getOperation(),
+      SunmmioMlirContext::ToSyncUnitMask(mlir::suvm::SyncUnits::vector) |
+          SunmmioMlirContext::ToSyncUnitMask(mlir::suvm::SyncUnits::rsram));
   BindRequiredResult(ctx_, result_name, tile_value, "suvm.tile.load");
   return SunMMIOValue{dtype, result_name, tile_type};
 }
@@ -826,10 +829,12 @@ void SunmmioMlirTileOp::TileStore(const SunMMIOValue &value,
   if (mask.has_value()) {
     mask_value = ctx_.LookupValue(mask.value(), "missing_tile_store_mask");
   }
-  (void)mlir::suvm::TileStoreOp::create(ctx_.builder, MapMlirLoc(ctx_), base,
-                                        data, mask_value);
-  ctx_.AddPendingSyncUnits(mlir::suvm::SyncUnits::vector);
-  ctx_.AddPendingSyncUnits(mlir::suvm::SyncUnits::rsram);
+  auto store_op = mlir::suvm::TileStoreOp::create(
+      ctx_.builder, MapMlirLoc(ctx_), base, data, mask_value);
+  ctx_.AddPendingSyncOperation(
+      store_op.getOperation(),
+      SunmmioMlirContext::ToSyncUnitMask(mlir::suvm::SyncUnits::vector) |
+          SunmmioMlirContext::ToSyncUnitMask(mlir::suvm::SyncUnits::rsram));
 }
 
 } // namespace codegen

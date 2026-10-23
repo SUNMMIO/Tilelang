@@ -482,6 +482,9 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     SunmmioMlirContext::SyncUnitMask units_mask = MapSyncUnits(mask);
     ICHECK_NE(units_mask, SunmmioMlirContext::kNoSyncUnits)
         << "tl.sunmmio_sync requires at least one hardware unit";
+    if (!ctx_.HasPendingSyncUnits(units_mask)) {
+      return SunMMIOValue{ret_dtype, result_name, ret_type};
+    }
     mlir::suvm::SyncUnits units = SunmmioMlirContext::ToSyncUnits(units_mask);
     mlir::suvm::SyncOp::create(
         ctx_.builder, type.MakeDebugLoc("sunmmio_sync"),
@@ -508,9 +511,11 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         ctx_.builder, type.MakeDebugLoc("dma_copy"), src, dst,
         require_odma_unit());
     VerifyAsyncOp(copy_op, "tl.dma_copy");
-    ctx_.AddPendingSyncUnits(copy_op.getUnit() == mlir::suvm::Unit::Odma0
-                                 ? mlir::suvm::SyncUnits::odma0
-                                 : mlir::suvm::SyncUnits::odma1);
+    ctx_.AddPendingSyncOperation(
+        copy_op.getOperation(), SunmmioMlirContext::ToSyncUnitMask(
+                                    copy_op.getUnit() == mlir::suvm::Unit::Odma0
+                                        ? mlir::suvm::SyncUnits::odma0
+                                        : mlir::suvm::SyncUnits::odma1));
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.sunmmio_layout_transform") {
@@ -537,7 +542,9 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         ctx_.builder, type.MakeDebugLoc("sunmmio_layout_transform"), src, dst,
         mlir::suvm::PadModeAttr{}, require_odma_unit());
     VerifyAsyncOp(transform_op, "tl.sunmmio_layout_transform");
-    ctx_.AddPendingSyncUnits(mlir::suvm::SyncUnits::odma1);
+    ctx_.AddPendingSyncOperation(
+        transform_op.getOperation(),
+        SunmmioMlirContext::ToSyncUnitMask(mlir::suvm::SyncUnits::odma1));
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.sunmmio_transpose") {
@@ -563,7 +570,9 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         ctx_.builder, type.MakeDebugLoc("sunmmio_transpose"), src, dst,
         require_odma_unit());
     VerifyAsyncOp(transpose_op, "tl.sunmmio_transpose");
-    ctx_.AddPendingSyncUnits(mlir::suvm::SyncUnits::odma1);
+    ctx_.AddPendingSyncOperation(
+        transpose_op.getOperation(),
+        SunmmioMlirContext::ToSyncUnitMask(mlir::suvm::SyncUnits::odma1));
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.broadcast_") {
@@ -602,6 +611,7 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
           ctx_.builder, type.MakeDebugLoc("broadcast"), src, dst, mask,
           direction, require_odma_unit());
       VerifyA4EMulticastOp(mcast_op, "tl.broadcast_");
+      return mcast_op;
     };
     auto emit_link_sync = [&]() {
       mlir::suvm::SyncUnits link = direction == mlir::suvm::McastDirection::row
@@ -633,15 +643,18 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
 
       mlir::Block &then_block = if_op.getThenRegion().front();
       ctx_.builder.setInsertionPointToStart(&then_block);
-      create_mcast();
+      (void)create_mcast();
       emit_link_sync();
 
       ctx_.builder.setInsertionPointAfter(if_op);
     } else {
-      create_mcast();
-      ctx_.AddPendingSyncUnits(direction == mlir::suvm::McastDirection::row
-                                   ? mlir::suvm::SyncUnits::hlink
-                                   : mlir::suvm::SyncUnits::vlink);
+      auto mcast_op = create_mcast();
+      ctx_.AddPendingSyncOperation(
+          mcast_op.getOperation(),
+          SunmmioMlirContext::ToSyncUnitMask(
+              direction == mlir::suvm::McastDirection::row
+                  ? mlir::suvm::SyncUnits::hlink
+                  : mlir::suvm::SyncUnits::vlink));
     }
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
@@ -687,7 +700,9 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         ctx_.builder, type.MakeDebugLoc("mma_sunmmio"), c, a, w, c, accumulate,
         trans_attr);
     VerifyAsyncOp(mma_op, "tl.mma_sunmmio");
-    ctx_.AddPendingSyncUnits(mlir::suvm::SyncUnits::tc);
+    ctx_.AddPendingSyncOperation(
+        mma_op.getOperation(),
+        SunmmioMlirContext::ToSyncUnitMask(mlir::suvm::SyncUnits::tc));
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tir.ret") {

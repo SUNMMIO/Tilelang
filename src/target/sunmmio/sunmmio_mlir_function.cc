@@ -74,8 +74,8 @@ void SunmmioMlirFunction::EmitReturn() {
       block->back().hasTrait<mlir::OpTrait::IsTerminator>()) {
     return;
   }
-  if (ctx_.pending_sync_units != SunmmioMlirContext::kNoSyncUnits) {
-    SunmmioMlirContext::SyncUnitMask units_mask = ctx_.pending_sync_units;
+  SunmmioMlirContext::SyncUnitMask units_mask = ctx_.PendingSyncUnits();
+  if (units_mask != SunmmioMlirContext::kNoSyncUnits) {
     mlir::suvm::SyncUnits units = SunmmioMlirContext::ToSyncUnits(units_mask);
     mlir::suvm::SyncOp::create(
         ctx_.builder, type_.MakeDebugLoc("function_exit_sync"),
@@ -113,7 +113,7 @@ void SunmmioMlirFunction::BeginFor(
   SunmmioMlirContext::ForFrame frame;
   frame.op = for_op;
   frame.annotations = annotations;
-  frame.entry_pending_sync_units = ctx_.pending_sync_units;
+  frame.entry_pending_sync_state = ctx_.pending_sync_state;
   frame.live_out_value_names.reserve(live_out_values.size());
   for (const SunMMIOValue &value : live_out_values) {
     frame.live_out_value_names.push_back(value.value);
@@ -150,8 +150,8 @@ void SunmmioMlirFunction::EndFor() {
 
   SunmmioMlirContext::ForFrame frame = std::move(ctx_.for_stack.back());
   ctx_.for_stack.pop_back();
-  SunmmioMlirContext::SyncUnitMask body_pending_sync_units =
-      ctx_.pending_sync_units;
+  SunmmioMlirContext::PendingSyncState body_pending_sync_state =
+      ctx_.pending_sync_state;
   mlir::SmallVector<mlir::Value, 8> yielded;
   yielded.reserve(frame.iter_values.size());
   for (int i = 0, e = static_cast<int>(frame.iter_values.size()); i < e; ++i) {
@@ -173,8 +173,8 @@ void SunmmioMlirFunction::EndFor() {
 
   ctx_.builder.setInsertionPointAfter(frame.op);
   ctx_.PopMLIRValueScope();
-  ctx_.pending_sync_units = SunmmioMlirContext::MergeSyncUnits(
-      frame.entry_pending_sync_units, body_pending_sync_units);
+  ctx_.pending_sync_state = SunmmioMlirContext::MergePendingSyncStates(
+      frame.entry_pending_sync_state, body_pending_sync_state);
   for (int i = 0, e = static_cast<int>(frame.live_out_value_names.size());
        i < e; ++i) {
     ctx_.BindMLIRValue(frame.live_out_value_names[i], frame.op.getResult(i));
@@ -205,7 +205,7 @@ void SunmmioMlirFunction::BeginWhile(
 
   SunmmioMlirContext::WhileFrame frame;
   frame.op = while_op;
-  frame.entry_pending_sync_units = ctx_.pending_sync_units;
+  frame.entry_pending_sync_state = ctx_.pending_sync_state;
   frame.live_out_value_names.reserve(live_out_values.size());
   for (const SunMMIOValue &value : live_out_values) {
     frame.live_out_value_names.push_back(value.value);
@@ -235,7 +235,7 @@ void SunmmioMlirFunction::BeginWhileBody(const SunMMIOValue &cond) {
       << "BeginWhileBody called without a matching BeginWhile";
   SunmmioMlirContext::WhileFrame &frame = ctx_.while_stack.back();
   frame.in_body = true;
-  frame.condition_pending_sync_units = ctx_.pending_sync_units;
+  frame.condition_pending_sync_state = ctx_.pending_sync_state;
   mlir::Value cond_v =
       type_.EnsureI1(type_.ResolveValue(cond, ctx_.builder.getI1Type()));
 
@@ -276,8 +276,8 @@ void SunmmioMlirFunction::EndWhile() {
 
   SunmmioMlirContext::WhileFrame frame = std::move(ctx_.while_stack.back());
   ctx_.while_stack.pop_back();
-  SunmmioMlirContext::SyncUnitMask body_pending_sync_units =
-      ctx_.pending_sync_units;
+  SunmmioMlirContext::PendingSyncState body_pending_sync_state =
+      ctx_.pending_sync_state;
   mlir::SmallVector<mlir::Value, 8> yielded;
   yielded.reserve(frame.iter_values.size());
   for (int i = 0, e = static_cast<int>(frame.iter_values.size()); i < e; ++i) {
@@ -299,8 +299,8 @@ void SunmmioMlirFunction::EndWhile() {
 
   ctx_.builder.setInsertionPointAfter(frame.op);
   ctx_.PopMLIRValueScope();
-  ctx_.pending_sync_units = SunmmioMlirContext::MergeSyncUnits(
-      frame.condition_pending_sync_units, body_pending_sync_units);
+  ctx_.pending_sync_state = SunmmioMlirContext::MergePendingSyncStates(
+      frame.condition_pending_sync_state, body_pending_sync_state);
   for (int i = 0, e = static_cast<int>(frame.live_out_value_names.size());
        i < e; ++i) {
     ctx_.BindMLIRValue(frame.live_out_value_names[i], frame.op.getResult(i));
@@ -328,7 +328,7 @@ void SunmmioMlirFunction::BeginIf(
                               /*withElseRegion=*/true);
   SunmmioMlirContext::IfFrame frame;
   frame.op = if_op;
-  frame.entry_pending_sync_units = ctx_.pending_sync_units;
+  frame.entry_pending_sync_state = ctx_.pending_sync_state;
   frame.live_out_value_names.reserve(live_out_values.size());
   for (const SunMMIOValue &value : live_out_values) {
     frame.live_out_value_names.push_back(value.value);
@@ -356,9 +356,9 @@ void SunmmioMlirFunction::BeginElse() {
   SunmmioMlirContext::IfFrame &frame = ctx_.if_stack.back();
   ICHECK(!frame.in_else) << "BeginElse called twice for the same scf.if";
   frame.then_yield_values = frame.produced_values;
-  frame.then_pending_sync_units = ctx_.pending_sync_units;
+  frame.then_pending_sync_state = ctx_.pending_sync_state;
   frame.in_else = true;
-  ctx_.pending_sync_units = frame.entry_pending_sync_units;
+  ctx_.pending_sync_state = frame.entry_pending_sync_state;
 
   ctx_.PopMLIRValueScope();
   ctx_.PushMLIRValueScope();
@@ -381,10 +381,10 @@ void SunmmioMlirFunction::EndIf() {
 
   SunmmioMlirContext::IfFrame frame = std::move(ctx_.if_stack.back());
   ctx_.if_stack.pop_back();
-  SunmmioMlirContext::SyncUnitMask then_pending_sync_units =
-      frame.in_else ? frame.then_pending_sync_units : ctx_.pending_sync_units;
-  SunmmioMlirContext::SyncUnitMask else_pending_sync_units =
-      frame.in_else ? ctx_.pending_sync_units : frame.entry_pending_sync_units;
+  SunmmioMlirContext::PendingSyncState then_pending_sync_state =
+      frame.in_else ? frame.then_pending_sync_state : ctx_.pending_sync_state;
+  SunmmioMlirContext::PendingSyncState else_pending_sync_state =
+      frame.in_else ? ctx_.pending_sync_state : frame.entry_pending_sync_state;
   mlir::SmallVector<mlir::Value, 8> then_yield;
   mlir::SmallVector<mlir::Value, 8> else_yield;
   if (frame.in_else) {
@@ -416,8 +416,8 @@ void SunmmioMlirFunction::EndIf() {
 
   ctx_.builder.setInsertionPointAfter(frame.op);
   ctx_.PopMLIRValueScope();
-  ctx_.pending_sync_units = SunmmioMlirContext::MergeSyncUnits(
-      then_pending_sync_units, else_pending_sync_units);
+  ctx_.pending_sync_state = SunmmioMlirContext::MergePendingSyncStates(
+      then_pending_sync_state, else_pending_sync_state);
   for (int i = 0, e = static_cast<int>(frame.live_out_value_names.size());
        i < e; ++i) {
     ctx_.BindMLIRValue(frame.live_out_value_names[i], frame.op.getResult(i));

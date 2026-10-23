@@ -2,6 +2,7 @@
 
 #include "../../layout/cute_layout.h"
 
+#include "npuir/Dialect/SUVM/IR/Ops.h"
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
 
@@ -11,6 +12,59 @@ namespace tvm {
 namespace codegen {
 
 SunmmioMlirContext::SunmmioMlirContext() : builder(&mlir_ctx) {}
+
+SunmmioMlirContext::PendingSyncState
+SunmmioMlirContext::MergePendingSyncStates(const PendingSyncState &lhs,
+                                           const PendingSyncState &rhs) {
+  PendingSyncState merged = lhs;
+  for (const auto &[op, units] : rhs.operations) {
+    merged.operations[op] |= units;
+  }
+  return merged;
+}
+
+void SunmmioMlirContext::AddPendingSyncOperation(mlir::Operation *op,
+                                                 SyncUnitMask units) {
+  ICHECK(op) << "Cannot record a null pending synchronization operation";
+  pending_sync_state.operations[op] |= units;
+}
+
+SunmmioMlirContext::SyncUnitMask SunmmioMlirContext::PendingSyncUnits() const {
+  SyncUnitMask units = kNoSyncUnits;
+  for (const auto &entry : pending_sync_state.operations) {
+    units |= entry.second;
+  }
+  return units;
+}
+
+bool SunmmioMlirContext::HasPendingSyncUnits(SyncUnitMask units) const {
+  return (PendingSyncUnits() & units) != kNoSyncUnits;
+}
+
+void SunmmioMlirContext::CompletePendingSyncUnits(SyncUnitMask units) {
+  for (auto it = pending_sync_state.operations.begin();
+       it != pending_sync_state.operations.end();) {
+    if ((units & it->second) == it->second) {
+      it = pending_sync_state.operations.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void SunmmioMlirContext::CompleteConsumedTileLoads(mlir::Operation *consumer) {
+  if (!consumer || !consumer->hasTrait<mlir::suvm::TileCompute>()) {
+    return;
+  }
+  // A direct TileCompute data dependency completes the corresponding tile load.
+  // Shape-only tile operations do not carry this trait and remain pending.
+  for (mlir::Value operand : consumer->getOperands()) {
+    auto load = operand.getDefiningOp<mlir::suvm::TileLoadOp>();
+    if (load && operand == load.getResult()) {
+      pending_sync_state.operations.erase(load.getOperation());
+    }
+  }
+}
 
 namespace {
 
