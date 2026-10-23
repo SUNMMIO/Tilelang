@@ -5,12 +5,133 @@ import pytest
 import tilelang
 import tilelang.language as T
 from tilelang import tvm
+from tilelang.layout import make_mxzz_layout, make_zz_layout
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import (
+    collect_calls,
+    collect_nodes,
     collect_op_arg_counts,
     collect_op_names,
     lower_collectives,
 )
+
+
+@tilelang.jit(target="sunmmio")
+def loop_offset_alltoallv_kernel_factory(
+    start=0,
+    dtype=T.bfloat16,
+    src_dram=False,
+    dst_dram=False,
+    wait_mode="all",
+    signal_kind=None,
+    bad_counts=False,
+    world_size: int = 1,
+):
+    shape = ((start + 4) * world_size, 32, 128)
+    layout = make_zz_layout(shape, axes=[1, 2]) if dtype == T.bfloat16 else make_mxzz_layout(shape, axes=[1, 2], dtype=dtype)
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(shape, T.placement.replicated(), dtype, layout=layout),
+        B: T.MeshTensor(shape, T.placement.replicated(), dtype, layout=layout),
+        rank_id: T.dist.RankId,
+    ):
+        with T.Kernel():
+            tx = T.alloc_shared(shape, dtype)
+            rx = T.alloc_shared(shape, dtype)
+            T.annotate_layout({tx: layout, rx: layout})
+            send_counts = T.alloc_shared((shape[0],), T.int32)
+            recv_counts = T.alloc_shared((shape[0],), T.int32)
+            ready = T.dist.signals(world_size, kind=signal_kind)
+            for e in T.serial(start, start + 3):
+                begin = e * world_size
+                count_begin = (e + (2 if bad_counts else 1)) * world_size
+                done = T.dist.all_to_allv(
+                    A[begin + world_size : begin + 2 * world_size, :, :]
+                    if src_dram
+                    else tx[begin + world_size : begin + 2 * world_size, :, :],
+                    B[begin : begin + world_size, :, :] if dst_dram else rx[begin : begin + world_size, :, :],
+                    send_counts=send_counts[count_begin : count_begin + world_size],
+                    recv_counts=recv_counts[begin : begin + world_size],
+                    signals=ready,
+                    submit=True,
+                )
+                if wait_mode == "all":
+                    T.dist.wait_all(done)
+                else:
+                    while T.dist.has_pending(done):
+                        T.dist.wait_any(done)
+                T.dist.wait()
+
+    return main
+
+
+@pytest.mark.parametrize("start", [0, 1])
+@pytest.mark.parametrize("wait_mode", ["all", "any"])
+def test_alltoallv_loop_offsets_preserve_payload_and_count_bases(start, wait_mode):
+    func = loop_offset_alltoallv_kernel_factory.get_tir(start=start, wait_mode=wait_mode, world_size=2)
+    result = lower_to_device_tir(func, capture_passes=("tl.LowerDistCollectives", "tl.LowerDistCommunication"))
+    expanded = result.pass_snapshot("tl.LowerDistCollectives").mod
+    # Simplify aliases while retaining the real collective expansion.
+    simplified = tilelang.transform.Simplify()(expanded)
+    loops = collect_nodes(simplified, tvm.tir.For)
+    loop = next(node for node in loops if int(node.extent) == 3)
+    rank = func.params[int(func.attrs["tl.dist.rank_id_param_index"])]
+    puts = collect_calls(simplified, "tl.tileop.dist_put")
+    assert len(puts) == 2
+    analyzer = tvm.arith.Analyzer()
+    for iteration in range(start, start + 3):
+        for source_rank in range(2):
+            values = {loop.loop_var: tvm.tir.IntImm("int32", iteration), rank: tvm.tir.IntImm("int32", source_rank)}
+            for put in puts:
+                dst_rank = int(analyzer.simplify(tvm.tir.stmt_functor.substitute(put.args[2], values)))
+                for operand, expected in [(0, (iteration + 1) * 2 + dst_rank), (1, iteration * 2 + source_rank)]:
+                    region = put.args[operand]
+                    assert [int(x) for x in region.args[2:]] == [1, 32, 128]
+                    assert int(analyzer.simplify(tvm.tir.stmt_functor.substitute(region.args[0].indices[0], values))) == expected
+                active = put.args[4].args[3]
+                counts = collect_nodes(tvm.tir.PrimFunc([], tvm.tir.Evaluate(active)), tvm.tir.BufferLoad)
+                assert len(counts) == 1
+                assert counts[0].buffer.name == "send_counts"
+                assert (
+                    int(analyzer.simplify(tvm.tir.stmt_functor.substitute(counts[0].indices[0], values))) == (iteration + 1) * 2 + dst_rank
+                )
+    lower_comm = result.pass_snapshot("tl.LowerDistCommunication").mod
+    init = collect_calls(lower_comm, "tl.dist_completion_init_")
+    assert len(init) == 1
+    for peer, delta in enumerate(init[0].args[5:]):
+        loads = collect_nodes(tvm.tir.PrimFunc([], tvm.tir.Evaluate(delta)), tvm.tir.BufferLoad)
+        assert len(loads) == 1 and loads[0].buffer.name == "recv_counts"
+        assert analyzer.can_prove_equal(loads[0].indices[0], loop.loop_var * 2 + peer)
+    assert collect_op_names(result.device_mod).count("tl.dist_wait_any_") == 1
+
+
+@pytest.mark.parametrize("src_dram,dst_dram", [(False, False), (False, True), (True, False), (True, True)])
+@pytest.mark.parametrize("dtype", [T.bfloat16, T.mxfp8, T.mxfp4])
+def test_alltoallv_loop_offsets_reach_device_tir_for_payload_scopes(dtype, src_dram, dst_dram):
+    func = loop_offset_alltoallv_kernel_factory.get_tir(dtype=dtype, src_dram=src_dram, dst_dram=dst_dram, world_size=2)
+    result = lower_to_device_tir(func)
+    puts = collect_calls(result.device_mod, "tl.dist_put_")
+    assert len(puts) == 1
+    for region in puts[0].args[:2]:
+        assert [int(x) for x in region.args[2:]] == [1, 32, 128]
+
+
+@pytest.mark.parametrize("signal_kind", [T.dist.SignalKind.SRAM_FLAGREG_VALUE, T.dist.SignalKind.SRAM_MEMORY])
+def test_alltoallv_loop_offsets_keep_persistent_generation(signal_kind):
+    result = lower_to_device_tir(
+        loop_offset_alltoallv_kernel_factory.get_tir(signal_kind=signal_kind, world_size=2), capture_passes="tl.LowerDistCommunication"
+    )
+    lowered = result.pass_snapshot("tl.LowerDistCommunication").mod
+    generation = collect_nodes(lowered, tvm.tir.Allocate, lambda node: "generation" in node.buffer_var.name)
+    assert [tuple(int(x) for x in node.extents) for node in generation] == [(4,)]
+    assert collect_op_names(lowered).count("tl.dist_completion_init_") == 1
+
+
+def test_alltoallv_loop_offsets_check_count_region_bounds():
+    func = loop_offset_alltoallv_kernel_factory.get_tir(bad_counts=True, world_size=2)
+    with pytest.raises(tvm.error.InternalError, match="send_counts region is in bounds"):
+        lower_collectives(func)
 
 
 @tilelang.jit(target="sunmmio")

@@ -277,7 +277,8 @@ private:
         RegisterProtocolExpect(call->args[0], "T.dist.all_to_allv");
       } else {
         ICHECK_EQ(call->args.size(), 2U);
-        ICHECK(mode == "auto" || mode == "all_gather")
+        ICHECK(mode == "auto" || mode == "all_gather" ||
+               mode == "all_to_all_rank" || mode == "all_to_all_row")
             << "Unsupported T.dist completion mode " << mode;
         RegisterAutoCompletion(call->args[0]);
       }
@@ -1654,6 +1655,7 @@ private:
       std::string mode =
           RequireStringImm(call->args.back(), "completion expect mode");
       ICHECK(mode == "auto" || mode == "manual" || mode == "all_gather" ||
+             mode == "all_to_all_rank" || mode == "all_to_all_row" ||
              mode == "rank" || mode == "row")
           << "Unsupported T.dist completion mode " << mode;
       if (call->args.size() == 3U) {

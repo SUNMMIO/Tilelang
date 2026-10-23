@@ -3,6 +3,7 @@
  * \brief Lower high-level Rank collectives to logical P2P operations.
  */
 
+#include <tvm/arith/pattern.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/tir/transform.h>
 
@@ -309,6 +310,214 @@ private:
     }
   }
 
+  struct OffsetLoop {
+    Var var;
+    PrimExpr extent;
+    bool supported;
+  };
+
+  PrimExpr ResolveOffset(const PrimExpr &expr) const {
+    return offset_analyzer_.Simplify(Substitute(expr, offset_bindings_));
+  }
+
+  bool IsUniformOffsetExpr(const PrimExpr &expr) const {
+    bool valid = true;
+    PostOrderVisit(expr, [&](const ObjectRef &node) {
+      if (const auto *var = node.as<VarNode>()) {
+        bool loop_var = false;
+        for (const auto &loop : offset_loops_)
+          loop_var |= loop.var.get() == var && loop.supported;
+        valid &= loop_var;
+      } else if (node.as<BufferLoadNode>() || node.as<CallNode>()) {
+        valid = false;
+      }
+    });
+    return valid;
+  }
+
+  // Only newly admitted symbolic offsets use these checks. Existing constant
+  // region behavior (including ROW collectives) remains unchanged.
+  void ValidateLoopRegions(const std::vector<BufferRegion> &regions,
+                           const PrimExpr &signal, bool row_domain,
+                           const char *op_name, int endpoint_dims,
+                           int gather_axis = -2) const {
+    bool symbolic = false;
+    for (const auto &region : regions)
+      for (const auto &range : region->region)
+        symbolic |= !ResolveOffset(range->min).as<IntImmNode>();
+    if (!symbolic)
+      return;
+
+    ICHECK(!row_domain) << op_name
+                        << " loop region offsets only support the RANK domain";
+    ICHECK(!offset_loops_.empty() && offset_while_depth_ == 0)
+        << op_name << " region offsets must be compile-time constants or "
+        << "affine expressions of statically bounded serial loops";
+    ICHECK(!IsSingleSignalResource(signal))
+        << op_name << " loop region offsets require per-source signals=";
+    Array<Var> variables;
+    for (const auto &loop : offset_loops_) {
+      ICHECK(loop.supported)
+          << op_name << " loop region offsets require statically bounded "
+          << "serial loops without early exits";
+      variables.push_back(loop.var);
+    }
+    for (const PrimExpr &condition : offset_conditions_) {
+      ICHECK(IsUniformOffsetExpr(condition))
+          << op_name << " loop region offsets require Rank/core-uniform "
+          << "control flow";
+    }
+
+    std::vector<Array<PrimExpr>> destination_coefficients;
+    for (size_t operand = 0; operand < regions.size(); ++operand) {
+      const BufferRegion &region = regions[operand];
+      const char *name = operand == 0   ? "source"
+                         : operand == 1 ? "destination"
+                         : operand == 2 ? "send_counts"
+                                        : "recv_counts";
+      ICHECK_EQ(region->region.size(), region->buffer->shape.size());
+      for (size_t dim = 0; dim < region->region.size(); ++dim) {
+        const Range &range = region->region[dim];
+        PrimExpr min = ResolveOffset(range->min);
+        int64_t extent = RequireStaticExtent(range, op_name, name);
+        ICHECK(IsUniformOffsetExpr(min))
+            << op_name << " " << name
+            << " region offsets must be compile-time constants or "
+               "Rank/core-uniform affine loop expressions, got "
+            << min;
+        Array<PrimExpr> coefficients =
+            arith::DetectLinearEquation(min, variables);
+        ICHECK_EQ(coefficients.size(), variables.size() + 1)
+            << op_name << " " << name << " loop region offset must be affine";
+        for (const PrimExpr &coefficient : coefficients) {
+          ICHECK(offset_analyzer_.Simplify(coefficient).as<IntImmNode>())
+              << op_name << " loop offset coefficients must be constants";
+        }
+        ICHECK(offset_analyzer_.CanProve(min >= 0) &&
+               offset_analyzer_.CanProve(min + range->extent <=
+                                         region->buffer->shape[dim]))
+            << op_name << " cannot prove " << name << " region is in bounds "
+            << "for buffer " << region->buffer->name << " at dimension " << dim
+            << ": min=" << min << ", extent=" << extent;
+
+        // Counts are scalar accesses. Payload checks use the actual per-peer
+        // tile extent, not the whole collective's endpoint/gather dimension.
+        if (operand < 2) {
+          int64_t tile_extent = extent;
+          if (gather_axis == -2) {
+            if (static_cast<int>(dim) < endpoint_dims)
+              tile_extent = 1;
+          } else if (operand == 1) {
+            if (gather_axis < 0 && dim == 0)
+              tile_extent = 1;
+            else if (static_cast<int>(dim) == gather_axis)
+              tile_extent /= world_size_;
+          }
+          ICHECK_GT(tile_extent, 0);
+          ICHECK(offset_analyzer_.CanProveEqual(floormod(min, tile_extent), 0))
+              << op_name << " " << name << " loop region min at dimension "
+              << dim << " must align to per-peer tile extent " << tile_extent;
+          ICHECK(offset_analyzer_.CanProveEqual(
+              floormod(region->buffer->shape[dim], tile_extent), 0))
+              << op_name << " per-peer tile extent must divide buffer shape "
+              << "at dimension " << dim;
+        }
+        if (operand == 1)
+          destination_coefficients.push_back(coefficients);
+      }
+    }
+
+    // Sufficient affine separation test: for the first differing loop index,
+    // at least one destination axis separates the complete inner-loop spans.
+    // This covers separate axes and flattened expert/block slots without
+    // unrolling the kernel or accepting ring-buffer reuse.
+    const auto &destination = regions[1];
+    for (size_t loop = 0; loop < offset_loops_.size(); ++loop) {
+      if (offset_analyzer_.CanProve(offset_loops_[loop].extent <= 1))
+        continue;
+      bool separated = false;
+      for (size_t dim = 0; dim < destination_coefficients.size(); ++dim) {
+        const auto &coefficients = destination_coefficients[dim];
+        PrimExpr inner_span = destination->region[dim]->extent;
+        for (size_t inner = loop + 1; inner < offset_loops_.size(); ++inner)
+          inner_span +=
+              abs(coefficients[inner]) * (offset_loops_[inner].extent - 1);
+        separated |=
+            offset_analyzer_.CanProve(abs(coefficients[loop]) >= inner_span);
+      }
+      ICHECK(separated)
+          << op_name << " cannot prove independent destination slots across "
+          << "loop " << offset_loops_[loop].var
+          << "; receive-buffer reuse requires a consumption protocol";
+    }
+  }
+
+  void ValidateLoopCompletion(const LetStmtNode *op) const {
+    const auto *call = op->value.as<CallNode>();
+    size_t operands = call->op.same_as(DistAlltoallvOp::Get()) ? 4 : 2;
+    bool symbolic = false;
+    for (size_t operand = 0; operand < operands; ++operand) {
+      BufferRegion region = NormalizeToBufferRegion(call->args[operand]);
+      for (const Range &range : region->region)
+        symbolic |= !ResolveOffset(range->min).as<IntImmNode>();
+    }
+    if (!symbolic)
+      return;
+
+    class IterationWaits : public StmtVisitor {
+    public:
+      explicit IterationWaits(Var completion)
+          : completion_(std::move(completion)) {}
+      bool received{false};
+      bool sent{false};
+
+    private:
+      void VisitStmt_(const EvaluateNode *op) final {
+        const auto *call = op->value.as<CallNode>();
+        if (!call)
+          return;
+        if (call->op.same_as(dist_wait_completion_all()) &&
+            call->args[0].same_as(completion_))
+          received = true;
+        sent |= call->op.same_as(dist_wait_send());
+      }
+      void VisitStmt_(const IfThenElseNode *) final {}
+      void VisitStmt_(const ForNode *) final {}
+      void VisitStmt_(const BlockRealizeNode *op) final {
+        if (is_one(op->predicate))
+          StmtVisitor::VisitStmt_(op);
+      }
+      void VisitStmt_(const WhileNode *op) final {
+        const auto *condition = op->condition.as<CallNode>();
+        if (!condition ||
+            !condition->op.same_as(dist_completion_has_pending()) ||
+            !condition->args[0].same_as(completion_))
+          return;
+        int waits = 0;
+        bool exits = false;
+        PostOrderVisit(op->body, [&](const ObjectRef &node) {
+          if (const auto *call = node.as<CallNode>()) {
+            waits += call->op.same_as(dist_wait_any()) &&
+                     call->args[0].same_as(completion_);
+            exits |= call->op.same_as(builtin::ret()) ||
+                     call->op.same_as(builtin::break_loop()) ||
+                     call->op.same_as(builtin::continue_loop());
+          }
+          exits |= node.as<IfThenElseNode>() || node.as<ForNode>() ||
+                   node.as<WhileNode>();
+          if (const auto *block = node.as<BlockRealizeNode>())
+            exits |= !is_one(block->predicate);
+        });
+        received |= waits == 1 && !exits;
+      }
+      Var completion_;
+    } waits(op->var);
+    waits(op->body);
+    ICHECK(waits.received && waits.sent)
+        << "Collective loop region offsets require the completion to be "
+           "fully drained and T.dist.wait() in the same iteration";
+  }
+
   void ValidateSignal(const PrimExpr &signal, const char *op_name) const {
     ICHECK(signal.dtype().is_handle())
         << op_name << " signal must be a signal handle";
@@ -358,8 +567,9 @@ private:
            "destination storage";
     ICHECK(op->current_core.dtype().is_int())
         << "T.dist.all_gather current_core must have integer dtype";
-    ValidateConstantOffsets(op->src_range, "T.dist.all_gather", "source");
-    ValidateConstantOffsets(op->dst_range, "T.dist.all_gather", "destination");
+    ValidateLoopRegions({BufferRegion(op->src, op->src_range),
+                         BufferRegion(op->dst, op->dst_range)},
+                        op->signal, false, "T.dist.all_gather", 0, op->axis);
 
     size_t src_rank = op->src_range.size();
     size_t dst_rank = op->dst_range.size();
@@ -434,7 +644,7 @@ private:
     return op->domain == "row";
   }
 
-  void ValidateAlltoall(const DistAlltoallOpNode *op) const {
+  bool ValidateAlltoall(const DistAlltoallOpNode *op) const {
     ICHECK(op->src->dtype == op->dst->dtype)
         << "T.dist.all_to_all source and destination dtypes must match";
     ICHECK(!op->src->data.same_as(op->dst->data))
@@ -442,8 +652,9 @@ private:
            "destination storage";
     ICHECK(op->current_core.dtype().is_int())
         << "T.dist.all_to_all current_core must have integer dtype";
-    ValidateConstantOffsets(op->src_range, "T.dist.all_to_all", "source");
-    ValidateConstantOffsets(op->dst_range, "T.dist.all_to_all", "destination");
+    ValidateLoopRegions({BufferRegion(op->src, op->src_range),
+                         BufferRegion(op->dst, op->dst_range)},
+                        op->signal, IsRowDomain(op), "T.dist.all_to_all", 1);
 
     bool row_domain = IsRowDomain(op);
     size_t endpoint_dims = row_domain ? 2U : 1U;
@@ -472,7 +683,21 @@ private:
           << "T.dist.all_to_all ROW domain leading row extent must equal "
              "mesh_nrows";
     }
-    ValidateSignal(op->signal, "T.dist.all_to_all");
+    bool single_signal = IsSingleSignalResource(op->signal);
+    if (single_signal) {
+      ValidateSignal(op->signal, "T.dist.all_to_all");
+      return true;
+    }
+    const auto *group_var = op->signal.as<VarNode>();
+    ICHECK(group_var)
+        << "T.dist.all_to_all signals must reference T.dist.signals";
+    auto group = active_signal_group_sizes_.find(group_var);
+    ICHECK(group != active_signal_group_sizes_.end())
+        << "T.dist.all_to_all cannot find its signal declaration";
+    int64_t endpoint_count = world_size_ * (row_domain ? mesh_nrows_ : 1);
+    ICHECK_EQ(group->second, endpoint_count)
+        << "T.dist.all_to_all requires one signal per source endpoint";
+    return false;
   }
 
   void ValidateAllreduce(const DistAllreduceOpNode *op) const {
@@ -551,12 +776,12 @@ private:
     ICHECK(op->recv_counts->dtype == op->send_counts->dtype)
         << "T.dist.all_to_allv send_counts and recv_counts must have the "
            "same dtype";
-    ValidateConstantOffsets(op->src_range, "T.dist.all_to_allv", "source");
-    ValidateConstantOffsets(op->dst_range, "T.dist.all_to_allv", "destination");
-    ValidateConstantOffsets(op->send_counts_range, "T.dist.all_to_allv",
-                            "send_counts");
-    ValidateConstantOffsets(op->recv_counts_range, "T.dist.all_to_allv",
-                            "recv_counts");
+    ValidateLoopRegions({BufferRegion(op->src, op->src_range),
+                         BufferRegion(op->dst, op->dst_range),
+                         BufferRegion(op->send_counts, op->send_counts_range),
+                         BufferRegion(op->recv_counts, op->recv_counts_range)},
+                        op->signal_resource, IsRowDomain(op),
+                        "T.dist.all_to_allv", 1);
 
     bool row_domain = IsRowDomain(op);
     size_t endpoint_dims = row_domain ? 2U : 1U;
@@ -745,10 +970,17 @@ private:
     return ranges;
   }
 
-  Stmt LowerAlltoall(const DistAlltoallOpNode *op) const {
-    ValidateAlltoall(op);
+  struct AlltoallLowering {
+    Stmt schedule;
+    std::optional<PrimExpr> completion;
+  };
+
+  AlltoallLowering LowerAlltoall(const DistAlltoallOpNode *op) const {
+    bool single_signal = ValidateAlltoall(op);
     bool row_domain = IsRowDomain(op);
     PrimExpr current_row = floordiv(op->current_core, I32(mesh_ncols_));
+    PrimExpr source_index = EndpointIndex(rank_id_, current_row, row_domain);
+    int64_t endpoint_count = world_size_ * (row_domain ? mesh_nrows_ : 1);
     Array<Range> dst_slot_range =
         EndpointSlot(op->dst_range, rank_id_, current_row, row_domain);
     PrimExpr dst_slot =
@@ -765,14 +997,30 @@ private:
             EndpointSlot(op->src_range, dst_rank, dst_row, row_domain);
         PrimExpr src =
             MakeRegionExpr(op->src, src_slot_range, /*access_mask=*/1);
-        schedule.push_back(Evaluate(Call(
-            DataType::Handle(), DistPutOp::Get(),
-            {src, dst_slot, dst_rank, dst_row, op->signal, op->current_core},
-            CompilerRegionAnnotations())));
+        PrimExpr signal = op->signal;
+        if (!single_signal) {
+          PrimExpr destination_index =
+              EndpointIndex(dst_rank, dst_row, row_domain);
+          PrimExpr generation_index =
+              source_index * I32(endpoint_count) + destination_index;
+          signal =
+              Call(DataType::Handle(), dist_signal_group_route(),
+                   {op->signal, source_index, generation_index, const_true()});
+        }
+        schedule.push_back(Evaluate(
+            Call(DataType::Handle(), DistPutOp::Get(),
+                 {src, dst_slot, dst_rank, dst_row, signal, op->current_core},
+                 CompilerRegionAnnotations())));
       }
     }
 
-    return SeqStmt::Flatten(schedule);
+    if (single_signal)
+      return {SeqStmt::Flatten(schedule), std::nullopt};
+    PrimExpr completion =
+        Call(DataType::Handle(), dist_completion(),
+             {op->signal,
+              StringImm(row_domain ? "all_to_all_row" : "all_to_all_rank")});
+    return {SeqStmt::Flatten(schedule), completion};
   }
 
   Stmt LowerBarrierArrive(const CallNode *call, const char *op_name) const {
@@ -894,11 +1142,23 @@ private:
 
   Stmt VisitStmt_(const LetStmtNode *op) final {
     const auto *call = op->value.as<CallNode>();
+    if (call && call->op.same_as(DistAlltoallOp::Get())) {
+      DistAlltoallOp alltoall(call->args, call->annotations);
+      AlltoallLowering lowered = LowerAlltoall(alltoall.operator->());
+      ICHECK(lowered.completion)
+          << "Single-signal T.dist.all_to_all must be used as a statement";
+      ValidateLoopCompletion(op);
+      Stmt body = VisitStmt(op->body);
+      Stmt completion =
+          LetStmt(op->var, lowered.completion.value(), body, op->span);
+      return SeqStmt::Flatten(Array<Stmt>{lowered.schedule, completion});
+    }
     if (call && call->op.same_as(DistAllgatherOp::Get())) {
       DistAllgatherOp allgather(call->args, call->annotations);
       AllgatherLowering lowered = LowerAllgather(allgather.operator->());
       ICHECK(lowered.completion)
           << "SignalList T.dist.all_gather must produce a completion";
+      ValidateLoopCompletion(op);
       Stmt body = VisitStmt(op->body);
       Stmt completion =
           LetStmt(op->var, lowered.completion.value(), body, op->span);
@@ -909,6 +1169,7 @@ private:
       AlltoallvLowering lowered = LowerAlltoallv(alltoallv.operator->());
       ICHECK(lowered.completion)
           << "Single-signal T.dist.all_to_allv must be used as a statement";
+      ValidateLoopCompletion(op);
       Stmt body = VisitStmt(op->body);
       Stmt completion =
           LetStmt(op->var, lowered.completion.value(), body, op->span);
@@ -929,7 +1190,12 @@ private:
     bool is_signal = call && (call->op.same_as(dist_signal_decl()) ||
                               call->op.same_as(dist_signal()));
     if (!is_signal) {
-      return StmtExprMutator::VisitStmt_(op);
+      Map<Var, PrimExpr> previous = offset_bindings_;
+      if (SideEffect(op->value) <= CallEffectKind::kPure)
+        offset_bindings_.Set(op->var, ResolveOffset(op->value));
+      Stmt result = StmtExprMutator::VisitStmt_(op);
+      offset_bindings_ = std::move(previous);
+      return result;
     }
 
     ICHECK(call->args.size() == 2U || call->args.size() == 3U);
@@ -955,12 +1221,58 @@ private:
     return block;
   }
 
+  Stmt VisitStmt_(const ForNode *op) final {
+    PrimExpr min = ResolveOffset(op->min);
+    PrimExpr extent = ResolveOffset(op->extent);
+    const auto *count = extent.as<IntImmNode>();
+    bool has_exit = false;
+    PostOrderVisit(op->body, [&](const ObjectRef &node) {
+      if (const auto *call = node.as<CallNode>())
+        has_exit |= call->op.same_as(builtin::ret()) ||
+                    call->op.same_as(builtin::break_loop()) ||
+                    call->op.same_as(builtin::continue_loop());
+    });
+    bool supported = op->kind == ForKind::kSerial && min.as<IntImmNode>() &&
+                     count && count->value >= 0 && !has_exit;
+    offset_loops_.push_back({op->loop_var, extent, supported});
+    if (supported && count->value > 0)
+      offset_analyzer_.Bind(op->loop_var, Range::FromMinExtent(min, extent));
+    Stmt result = StmtExprMutator::VisitStmt_(op);
+    offset_loops_.pop_back();
+    return result;
+  }
+
+  Stmt VisitStmt_(const WhileNode *op) final {
+    ++offset_while_depth_;
+    Stmt result = StmtExprMutator::VisitStmt_(op);
+    --offset_while_depth_;
+    return result;
+  }
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    PrimExpr condition = ResolveOffset(op->condition);
+    offset_conditions_.push_back(condition);
+    Stmt result = StmtExprMutator::VisitStmt_(op);
+    offset_conditions_.pop_back();
+    return result;
+  }
+
+  Stmt VisitStmt_(const BlockRealizeNode *op) final {
+    offset_conditions_.push_back(ResolveOffset(op->predicate));
+    Stmt result = StmtExprMutator::VisitStmt_(op);
+    offset_conditions_.pop_back();
+    return result;
+  }
+
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *call = op->value.as<CallNode>();
     if (!call || !call->op.same_as(DistAllgatherOp::Get())) {
       if (call && call->op.same_as(DistAlltoallOp::Get())) {
         DistAlltoallOp alltoall(call->args, call->annotations);
-        return LowerAlltoall(alltoall.operator->());
+        AlltoallLowering lowered = LowerAlltoall(alltoall.operator->());
+        ICHECK(!lowered.completion)
+            << "SignalList T.dist.all_to_all must bind its completion result";
+        return lowered.schedule;
       }
       if (call && call->op.same_as(DistAllreduceOp::Get())) {
         DistAllreduceOp allreduce(call->args, call->annotations);
@@ -997,6 +1309,11 @@ private:
   std::unordered_map<const VarNode *, std::string> active_signal_group_kinds_;
   std::vector<Array<Buffer>> alloc_buffer_stack_;
   int allreduce_counter_{0};
+  mutable arith::Analyzer offset_analyzer_;
+  Map<Var, PrimExpr> offset_bindings_;
+  std::vector<OffsetLoop> offset_loops_;
+  std::vector<PrimExpr> offset_conditions_;
+  int offset_while_depth_{0};
 };
 
 PrimFunc Run(PrimFunc func) {
