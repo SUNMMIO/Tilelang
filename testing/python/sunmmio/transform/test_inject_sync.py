@@ -92,6 +92,23 @@ def _dma_regions(src_region, dst_region, *, unit="odma0"):
     )
 
 
+def _dist_put(src, dst):
+    return tvm.tir.Evaluate(
+        tvm.tir.Call(
+            "handle",
+            tvm.ir.Op.get("tl.dist_put_"),
+            [
+                _region(src, 1),
+                _region(dst, 2),
+                tvm.tir.IntImm("int32", 1),
+                tvm.tir.StringImm("sram_flagreg_inc"),
+                tvm.tir.IntImm("int32", 0),
+                tvm.tir.IntImm("uint8", 0),
+            ],
+        )
+    )
+
+
 def _mx_compound(op_name, src, dst):
     if op_name == "tl.mx_pack":
         regions = [_region(src, 1), _region(src, 1), _region(dst, 2)]
@@ -282,6 +299,17 @@ def test_hidden_async_region_index_inserts_producer_sync():
     dma_indices = [i for i, line in enumerate(lines) if "T.dma_copy" in line]
     sync_index = next(i for i, line in enumerate(lines) if "T.sunmmio_sync(1)" in line)
     assert dma_indices[0] < sync_index < dma_indices[1]
+
+
+def test_dist_put_waits_for_local_source_producer():
+    def body(src, dst):
+        return [_dma(dst, src, unit="odma0"), _dist_put(src, dst)]
+
+    lines = _apply(_make_module(body)).script().splitlines()
+    dma_index = next(i for i, line in enumerate(lines) if "T.dma_copy" in line)
+    sync_index = next(i for i, line in enumerate(lines) if "T.sunmmio_sync(1)" in line)
+    put_index = next(i for i, line in enumerate(lines) if "T.dist_put_" in line)
+    assert dma_index < sync_index < put_index
 
 
 def test_condition_load_is_synchronized_before_branch_async_write():

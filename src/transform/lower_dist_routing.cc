@@ -581,6 +581,7 @@ private:
   std::vector<NormalRouteEntry>
   BuildRoutes(const Call &call, const Var &current_core, bool *all_peer) {
     std::vector<NormalRouteEntry> routes;
+    routes.reserve(static_cast<size_t>(mesh_nrows_));
     *all_peer = true;
     for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
       for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {

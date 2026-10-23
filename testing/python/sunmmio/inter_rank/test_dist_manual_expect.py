@@ -92,7 +92,6 @@ def manual_sender_signals_kernel_factory(
                 sender_signals,
                 expected_deltas=expected_deltas,
             )
-            T.dist.wait()
 
     return main
 
@@ -140,7 +139,6 @@ def manual_signal_wave_kernel_factory(
                     signals,
                     expected_deltas=expected_deltas,
                 )
-                T.dist.wait()
 
     return main
 
@@ -178,7 +176,6 @@ def manual_destination_loop_kernel_factory(world_size: int = 1):
                 sender_signals,
                 expected_deltas=expected_deltas,
             )
-            T.dist.wait()
 
     return main
 

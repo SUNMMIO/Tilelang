@@ -591,11 +591,9 @@ def wait_signals(signal_list: SignalList, *, expected_deltas):
 
 
 def wait():
-    """Wait for all previously submitted local Rank sends to complete."""
+    """Reject the removed manual sender-wait API."""
 
-    _current_dist_builder()
-    _current_core_id()
-    return tir.call_intrin("handle", tir.op.Op.get("tl.dist_wait_send"))
+    raise RuntimeError("T.dist.wait() is no longer supported; sender completion waits are inserted automatically")
 
 
 from .dist_collective import (  # noqa: E402
@@ -638,7 +636,6 @@ __all__ = [
     "signals",
     "submit",
     "has_pending",
-    "wait",
     "wait_all",
     "wait_any",
     "wait_signal",

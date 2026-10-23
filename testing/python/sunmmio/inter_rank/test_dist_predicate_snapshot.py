@@ -54,7 +54,6 @@ def predicate_kernel_factory(case="shared", cross_row=False, world_size: int = 1
                     if state[0] > 0:
                         T.dist.put(payload, destination, peer, dst_row=dst_row, signal=signals[1])
             T.dist.submit()
-            T.dist.wait()
 
     return main
 

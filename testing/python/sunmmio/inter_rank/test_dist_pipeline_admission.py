@@ -82,15 +82,12 @@ def pipeline_dist_kernel_factory(op="put", stages=2, nested="none", world_size: 
 
 
 @tilelang.jit(target="sunmmio")
-def pipeline_queue_only_kernel_factory(op="wait", stages=2, world_size: int = 1):
+def pipeline_queue_only_kernel_factory(stages=2, world_size: int = 1):
     @T.prim_func
     def main(rank_id: T.dist.RankId):
         with T.Kernel():
             for _ in T.Pipelined(4, num_stages=stages):
-                if op == "wait":
-                    T.dist.wait()
-                else:
-                    T.dist.submit()
+                T.dist.submit()
 
     return main
 
@@ -112,7 +109,6 @@ def local_pipeline_after_dist_kernel_factory(world_size: int = 1):
             for chunk in T.Pipelined(4, num_stages=2):
                 T.copy(dst, stage)
                 T.copy(stage, output[chunk * 32 : (chunk + 1) * 32])
-            T.dist.wait()
 
     return main
 
@@ -158,10 +154,9 @@ def test_nested_loops_cannot_escape_pipeline_guard(nested):
         _plan_signals(func)
 
 
-@pytest.mark.parametrize("op", ["wait", "submit"])
 @pytest.mark.parametrize("stages", [1, 2])
-def test_pipeline_queue_ops_are_rejected_without_signal_declarations(op, stages):
-    func = pipeline_queue_only_kernel_factory.get_tir(op=op, stages=stages, world_size=4)
+def test_pipeline_submit_is_rejected_without_signal_declarations(stages):
+    func = pipeline_queue_only_kernel_factory.get_tir(stages=stages, world_size=4)
     assert "dist_signal_decl" not in func.script()
     with pytest.raises(tvm.error.InternalError, match="T.Pipelined"):
         lower_to_device_tir(func)

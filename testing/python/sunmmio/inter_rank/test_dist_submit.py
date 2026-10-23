@@ -192,7 +192,28 @@ def early_return_kernel_factory(control_flow="if", world_size: int = 1):
             else:
                 if stop != 0:
                     T.evaluate(tvm.tir.ret(1))
-            T.dist.wait()
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
+def source_lifetime_kernel_factory(mode="submitted_overlap", world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            src = T.alloc_shared((64,), T.bfloat16)
+            dst = T.alloc_shared((32,), T.bfloat16)
+            signal = T.dist.signal()
+            T.dist.put(src[0:32], dst, (rank_id + 1) % world_size, signal=signal)
+            if mode == "queued_overlap":
+                src[0] = 0
+            T.dist.submit()
+            if mode == "submitted_overlap":
+                src[0] = 0
+            elif mode == "submitted_disjoint":
+                src[32] = 0
+            elif mode == "submitted_dma_overlap":
+                T.copy(dst, src[0:32])
 
     return main
 
@@ -348,7 +369,7 @@ def _has_wait_before_return(func_or_mod, return_value):
 
 
 @pytest.mark.parametrize("control_flow", ["if", "for", "while"])
-def test_early_return_waits_before_later_explicit_wait(control_flow):
+def test_early_return_waits_on_every_in_flight_exit(control_flow):
     result = lower_to_device_tir(
         early_return_kernel_factory.get_tir(control_flow, world_size=4),
         capture_passes="tl.LowerDistSync",
@@ -357,12 +378,89 @@ def test_early_return_waits_before_later_explicit_wait(control_flow):
     assert _has_wait_before_return(result.device_mod, 1)
 
 
+def test_manual_sender_wait_is_rejected():
+    with pytest.raises(RuntimeError, match="inserted automatically"):
+        T.dist.wait()
+
+
+def test_source_write_before_submit_is_rejected():
+    with pytest.raises(tvm.error.InternalError, match="modified before its queued batch is submitted"):
+        lower_to_device_tir(source_lifetime_kernel_factory.get_tir(mode="queued_overlap", world_size=4))
+
+
+def test_source_write_after_submit_gets_automatic_wait():
+    result = lower_to_device_tir(
+        source_lifetime_kernel_factory.get_tir(mode="submitted_overlap", world_size=4),
+        capture_passes="tl.LowerDistSync",
+    )
+    script = result.pass_snapshot("tl.LowerDistSync").mod.script()
+    submit = script.index("T.dist_submit_()")
+    wait = script.index("T.dist_wait_send()", submit)
+    store = script.index("src[0] =", submit)
+    assert submit < wait < store
+
+
+def test_disjoint_source_write_keeps_wait_at_scope_exit():
+    result = lower_to_device_tir(
+        source_lifetime_kernel_factory.get_tir(mode="submitted_disjoint", world_size=4),
+        capture_passes="tl.LowerDistSync",
+    )
+    script = result.pass_snapshot("tl.LowerDistSync").mod.script()
+    submit = script.index("T.dist_submit_()")
+    store = script.index("src[32] =", submit)
+    wait = script.index("T.dist_wait_send()", submit)
+    assert submit < store < wait
+
+
+def test_async_source_write_after_submit_gets_automatic_wait():
+    result = lower_to_device_tir(
+        source_lifetime_kernel_factory.get_tir(mode="submitted_dma_overlap", world_size=4),
+        capture_passes="tl.LowerDistSync",
+    )
+    script = result.pass_snapshot("tl.LowerDistSync").mod.script()
+    submit = script.index("T.dist_submit_()")
+    wait = script.index("T.dist_wait_send()", submit)
+    copy_loop = script.index("for i in", submit)
+    assert submit < wait < copy_loop
+    assert "T.dist_wait_send()" not in script[copy_loop:]
+
+
 def _dist_leaf(name, *args):
     return tvm.tir.Evaluate(tvm.tir.call_intrin("handle", tvm.ir.Op.get("tl." + name), *args))
 
 
 def _queued_signal_put():
     return _dist_leaf("dist_signal_put_", 1, "sram_flagreg_inc", 0, tvm.tir.const(0, "uint8"))
+
+
+def _encoded_region(buffer, access_mask):
+    return tvm.tir.Call(
+        "handle",
+        tvm.ir.Op.get("tl.tileop.region"),
+        [buffer[0], access_mask, buffer.shape[0]],
+    )
+
+
+def _local_source_loop(jump, submitted):
+    src = tvm.tir.decl_buffer((32,), "bfloat16", name="src", scope="shared.rsram")
+    dst = tvm.tir.decl_buffer((32,), "bfloat16", name="dst", scope="shared.rsram")
+    statements = [
+        _dist_leaf(
+            "dist_put_",
+            _encoded_region(src, 1),
+            _encoded_region(dst, 2),
+            1,
+            "sram_flagreg_inc",
+            0,
+            tvm.tir.const(0, "uint8"),
+        )
+    ]
+    if submitted:
+        statements.append(_dist_leaf("dist_submit_"))
+    statements.append(_loop_jump(jump))
+    body = tvm.tir.Allocate(src.data, src.dtype, src.shape, True, tvm.tir.SeqStmt(statements))
+    loop = tvm.tir.For(tvm.tir.Var("i", "int32"), 0, 2, tvm.tir.ForKind.SERIAL, body)
+    return tvm.tir.Allocate(dst.data, dst.dtype, dst.shape, True, loop)
 
 
 def _inject_queue_body(body, params=()):
@@ -494,6 +592,21 @@ def test_loop_jump_submission_through_device_tir(jump, submit_after_loop):
         assert names.count("tl.dist_submit_") == 2
         # Two pre-submit waits and one final drain; none at the jump itself.
         assert names.count("tl.dist_wait_send") == 3
+
+
+@pytest.mark.parametrize("jump", ["break", "continue"])
+def test_loop_jump_waits_before_releasing_local_source(jump):
+    script = _inject_queue_body(_local_source_loop(jump, submitted=True)).script()
+    jump_index = script.index("T." + jump + "_loop()")
+    wait_index = script.rfind("T.dist_wait_send()", 0, jump_index)
+    submit_index = script.rfind("T.dist_submit_()", 0, jump_index)
+    assert submit_index < wait_index < jump_index
+
+
+@pytest.mark.parametrize("jump", ["break", "continue"])
+def test_loop_jump_rejects_releasing_unsubmitted_local_source(jump):
+    with pytest.raises(tvm.error.InternalError, match="released by .* before its queued batch is submitted"):
+        _inject_queue_body(_local_source_loop(jump, submitted=False))
 
 
 @pytest.mark.parametrize("loop_kind", ["for", "while"])
