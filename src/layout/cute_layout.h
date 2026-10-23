@@ -255,6 +255,8 @@ Layout TryCanonicalizeToRowMajor(const Layout &layout);
  *
  * Operands are canonicalized first, so representations that describe the same
  * byte map (e.g. a single-block ZZ vs row-major) compare equal.
+ * Matching mode structures may differ in strides of proven size-one modes;
+ * all mode extents and active strides must still agree after shape adaptation.
  */
 bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
                    arith::Analyzer *analyzer = nullptr);

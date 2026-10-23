@@ -397,9 +397,8 @@ def _calls_named(mod, name):
 @pytest.mark.parametrize("route", ["rr", "gr", "rg"])
 @pytest.mark.parametrize("src_rank,dst_rank", [(2, 2), (2, 3), (3, 2), (3, 3), (4, 2), (2, 4)])
 def test_copy_matrix_slots_production_pipeline(tmp_path, dtype, route, src_rank, dst_rank):
-    # Use a nondegenerate block grid for the ordinary ZZ control: generic
-    # MeshTensor derivation currently changes a size-one mode's stride in the
-    # 3D single-block-height case. MX tests retain the original [32, 128] case.
+    # Retain multi-block-height BF16 coverage alongside the dedicated
+    # size-one block-grid regression below.
     matrix = (64, 128) if dtype == T.bfloat16 else (32, 128)
     artifact = _production_copy_artifact(
         mx_copy_slot_kernel(
@@ -435,6 +434,39 @@ def test_copy_matrix_slots_production_pipeline(tmp_path, dtype, route, src_rank,
         assert f"unit = {expected_unit}" in source
         assert f"suvm.sync {expected_unit}" in source
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-to-llvm-pipeline"))
+
+
+@pytest.mark.parametrize("route", ["gr", "rg", "rr"])
+@pytest.mark.parametrize("rank", [3, 4])
+@pytest.mark.parametrize("dynamic_slot", [False, True])
+def test_bf16_zz_slot_copy_ignores_unit_mode_strides(tmp_path, route, rank, dynamic_slot):
+    artifact = _production_copy_artifact(
+        mx_copy_slot_kernel(
+            dtype=T.bfloat16,
+            route=route,
+            src_rank=rank,
+            dst_rank=rank,
+            dynamic_slot=dynamic_slot,
+        )
+    )
+    assert not _calls_named(artifact.device_mod, "tl.sunmmio_layout_transform")
+    assert "_layout_stage" not in artifact.device_mod.script()
+    if route != "rr":
+        copies = _calls_named(artifact.device_mod, "tl.dma_copy")
+        assert len(copies) == 1
+        for region in copies[0].args[:2]:
+            indices = region.args[0].indices
+            assert [int(x) for x in region.args[2:]] == [1] * (rank - 2) + [32, 128]
+            assert [int(x) for x in indices[-2:]] == [0, 0]
+            for index in indices[:-2]:
+                if dynamic_slot:
+                    if isinstance(index, tvm.tir.Cast):
+                        index = index.value
+                    assert isinstance(index, tvm.tir.Var) and index.name == "slot"
+                else:
+                    assert int(index) == 1
+        assert "suvm.tile.load" not in artifact.kernel_source
+    validate_suvm_mlir_with_npuir_opt(artifact.kernel_source, tmp_path, opt_args=("--verify-each", "--suvm-to-llvm-pipeline"))
 
 
 @pytest.mark.parametrize("dtype", [T.bfloat16, T.mxfp8, T.mxfp4])

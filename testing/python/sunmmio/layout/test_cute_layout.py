@@ -632,6 +632,53 @@ class TestLayoutRelations:
         b = make_zz(_imms(256, 64), [0, 1], _imms(32, 32))
         assert is_layout_match(a, b)
 
+    @pytest.mark.parametrize("shape", [(2, 32, 128), (2, 2, 32, 128)])
+    def test_is_layout_match_derived_unit_mode_strides(self, shape):
+        original = make_zz(_imms(*shape), [len(shape) - 2, len(shape) - 1], _imms(32, 32))
+        derived = derive_layout_like(original, _imms(*shape), None)
+
+        # MeshTensor derivation changes a size-one block-grid stride, but
+        # every valid index still addresses the same element.
+        indices = [tir.Var(f"i{d}", "int32") for d in range(len(shape))]
+        analyzer = tvm.arith.Analyzer()
+        for index, extent in zip(indices, shape):
+            analyzer.bind(index, tvm.ir.Range(0, extent))
+        assert analyzer.can_prove(original.map_forward_index(indices)[0] == derived.map_forward_index(indices)[0])
+        assert not is_same_layout(original, derived)
+        assert is_layout_match(original, derived)
+        assert is_layout_match(derived, original)
+
+    @pytest.mark.parametrize("mode", [0, 1, 3, 4])
+    def test_is_layout_match_preserves_active_strides_with_unit_modes(self, mode):
+        original = make_zz(_imms(2, 32, 128), [1, 2], _imms(32, 32))
+        strides = [int(x) for x in get_mode_stride(original)]
+        strides[2] *= 2  # Irrelevant size-one block-grid stride.
+        strides[mode] *= 2  # A real address-mapping difference.
+        changed = make_cute(_imms(2, 32, 128), get_mode_shape(original), _imms(*strides), [1, 2, 2])
+
+        assert not is_layout_match(original, changed)
+        assert not is_layout_match(changed, original)
+
+    @pytest.mark.parametrize("blocks", [2, "symbolic"])
+    def test_is_layout_match_requires_proven_unit_mode(self, blocks):
+        blocks = tir.Var("blocks", "int32") if blocks == "symbolic" else _imm(blocks)
+        shape = [_imm(2), 32 * blocks, _imm(128)]
+        modes = [_imm(2), _imm(32), blocks, _imm(32), _imm(4)]
+        strides = [4096 * blocks, _imm(32), _imm(4096), _imm(1), _imm(1024)]
+        original = make_cute(shape, modes, strides, [1, 2, 2])
+        strides[2] = _imm(8192)
+        changed = make_cute(shape, modes, strides, [1, 2, 2])
+
+        assert not is_layout_match(original, changed)
+        assert not is_layout_match(changed, original)
+
+    def test_is_layout_match_preserves_block_padding_with_unit_modes(self):
+        original = make_zz(_imms(2, 32, 128), [1, 2], _imms(32, 32))
+        padded = make_cute(_imms(2, 32, 128), _imms(2, 32, 2, 32, 4), _imms(8192, 32, 4096, 1, 1024), [1, 2, 2])
+
+        assert not is_layout_match(original, padded)
+        assert not is_layout_match(padded, original)
+
     def test_is_layout_match_padded_vs_tight_row_major(self):
         # An alignment-padded row-major (logical [2,40], covered [2,64]) has a
         # different pitch from the tight row-major of the same shape, so they

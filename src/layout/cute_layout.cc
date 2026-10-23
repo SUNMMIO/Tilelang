@@ -691,15 +691,49 @@ Layout TryCanonicalizeToRowMajor(const Layout &layout) {
   return layout;
 }
 
+static bool SameLayoutIgnoringUnitModeStrides(const Layout &lhs,
+                                              const Layout &rhs,
+                                              arith::Analyzer *analyzer) {
+  if (IsSameLayout(lhs, rhs, analyzer))
+    return true;
+  const auto *lc = lhs.as<CuteLayoutNode>();
+  const auto *rc = rhs.as<CuteLayoutNode>();
+  if (!lc || !rc || lc->GetDimLevels().size() != rc->GetDimLevels().size())
+    return false;
+  for (size_t d = 0; d < lc->GetDimLevels().size(); ++d) {
+    if (lc->GetDimLevels()[d].IntValue() != rc->GetDimLevels()[d].IntValue())
+      return false;
+  }
+
+  auto ls = lc->GetModeShape(), rs = rc->GetModeShape();
+  auto lt = lc->GetModeStride(), rt = rc->GetModeStride();
+  if (ls.size() != rs.size())
+    return false;
+  arith::Analyzer local_analyzer;
+  arith::Analyzer *ana = analyzer ? analyzer : &local_analyzer;
+  for (size_t i = 0; i < ls.size(); ++i) {
+    if (!ana->CanProveEqual(ls[i], rs[i]))
+      return false;
+    // A size-one mode contributes zero to every valid physical offset.
+    // Retain its structure: removing it would change how DeriveLayoutLike
+    // interprets the layout when adapting to another shape.
+    if (ana->CanProveEqual(ls[i], 1) && ana->CanProveEqual(rs[i], 1))
+      continue;
+    if (!ana->CanProveEqual(lt[i], rt[i]))
+      return false;
+  }
+  return true;
+}
+
 bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
                    arith::Analyzer *analyzer) {
   // Compare on canonical forms so equivalent representations agree -- e.g. a
   // single-block ZZ canonicalizes to row-major and matches a row-major buffer.
   Layout cl = TryCanonicalizeToRowMajor(lhs),
          cr = TryCanonicalizeToRowMajor(rhs);
-  // Identical coalesced forms => identical byte map; padded and tight differ in
-  // coalesced mode_shape, so they don't match here.
-  if (IsSameLayout(cl, cr, analyzer))
+  // Ignore only inactive mode strides; padded and tight forms still differ
+  // in mode_shape or an active stride and do not match here.
+  if (SameLayoutIgnoringUnitModeStrides(cl, cr, analyzer))
     return true;
   // Different shapes, same kind: re-derive each onto the other's shape.
   // DeriveLayoutLike preserves padding on unchanged dims, so the
@@ -708,8 +742,10 @@ bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
                               analyzer);
   auto bwd = DeriveLayoutLike(cr, cl->InputShape(), Optional<Array<Integer>>(),
                               analyzer);
-  return fwd.defined() && IsSameLayout(fwd.value(), cr, analyzer) &&
-         bwd.defined() && IsSameLayout(bwd.value(), cl, analyzer);
+  return fwd.defined() &&
+         SameLayoutIgnoringUnitModeStrides(fwd.value(), cr, analyzer) &&
+         bwd.defined() &&
+         SameLayoutIgnoringUnitModeStrides(bwd.value(), cl, analyzer);
 }
 
 bool IsLayoutMatchForDType(const Layout &lhs, const Layout &rhs, DataType dtype,
