@@ -250,6 +250,7 @@ public:
    * Sunmmio strided DMA lowering.
    */
   bool CheckSunmmioRsramStridedDMACopy(Target target,
+                                       const LayoutMap &layout_map,
                                        arith::Analyzer *analyzer) const;
 
   /*!

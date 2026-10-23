@@ -5,7 +5,7 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.layout import make_row_major, make_zz_layout
+from tilelang.layout import CuteLayout, make_row_major, make_zz_layout
 
 from testing.python.sunmmio.common.codegen_validation import (
     lower_sunmmio_kernel_to_device_tir,
@@ -198,6 +198,29 @@ def singleton_axis_remap_copy_kernel():
 
 
 @target("Sunmmio")
+def incompatible_singleton_axis_remap_copy_kernel():
+    src_shape = (16, 32, 128)
+    dst_shape = (2, 8, 128)
+    src_layout = make_row_major(src_shape)
+    dst_layout = CuteLayout(
+        list(dst_shape),
+        list(dst_shape),
+        [1, dst_shape[0], dst_shape[0] * dst_shape[1]],
+        [1, 1, 1],
+    )._inner
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            src = T.alloc_shared(src_shape, DTYPE, scope="shared.rsram")
+            dst = T.alloc_shared(dst_shape, DTYPE, scope="shared.rsram")
+            T.annotate_layout({src: src_layout, dst: dst_layout})
+            T.copy(src[8:16, 3:4, 0:128], dst[1:2, 0:8, 0:128])
+
+    return main
+
+
+@target("Sunmmio")
 def summa_output_copy_kernel(
     M=128,
     N=128,
@@ -339,6 +362,11 @@ def test_singleton_axis_remap_copy_uses_strided_odma1(tmp_path):
     assert src.count("suvm.copy_async") == 1
     assert "suvm.tile.load" not in src
     assert "suvm.tile.store" not in src
+
+
+def test_incompatible_singleton_axis_remap_is_rejected_before_dma_lowering():
+    with pytest.raises(Exception, match="Unsupported RSRAM-to-RSRAM copy"):
+        lower_sunmmio_kernel_to_device_tir(incompatible_singleton_axis_remap_copy_kernel())
 
 
 @pytest.mark.parametrize("M,N,K", _SUMMA_COPY_SHAPES)

@@ -853,7 +853,8 @@ bool CopyNode::CheckTMemStore(Target target) const {
 }
 
 bool CopyNode::CheckSunmmioRsramStridedDMACopy(
-    Target target, arith::Analyzer *analyzer) const {
+    Target target, const LayoutMap &layout_map,
+    arith::Analyzer *analyzer) const {
   // Restrict the initial implementation to RSRAM-to-RSRAM transfers.
   if (src.scope() != kSunmmioScopeRSRAM || dst.scope() != kSunmmioScopeRSRAM) {
     return false;
@@ -866,28 +867,9 @@ bool CopyNode::CheckSunmmioRsramStridedDMACopy(
     return false;
   }
 
-  // MX storage includes scale and padding metadata and needs a separate plan.
-  if (src->dtype != dst->dtype || sunmmio::IsMXDType(src->dtype) ||
-      sunmmio::IsMXDType(dst->dtype)) {
-    return false;
-  }
-
-  auto src_dims = CollectStaticNonUnitDims(src_range, analyzer);
-  auto dst_dims = CollectStaticNonUnitDims(dst_range, analyzer);
-  if (!src_dims || !dst_dims || src_dims->size() != dst_dims->size() ||
-      src_dims->empty() || src_dims->size() > 2) {
-    return false;
-  }
-
-  bool axis_positions_differ = false;
-  for (size_t i = 0; i < src_dims->size(); ++i) {
-    if ((*src_dims)[i].second != (*dst_dims)[i].second) {
-      return false;
-    }
-    axis_positions_differ |= (*src_dims)[i].first != (*dst_dims)[i].first;
-  }
-
-  return axis_positions_differ;
+  return TryPlanRsramDmaCopy(src, src_range, dst, dst_range, layout_map,
+                             analyzer)
+      .has_value();
 }
 
 bool CopyNode::CheckSunmmioDMACopy(Target target) const {
@@ -965,7 +947,7 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
         src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeRSRAM;
 
     if (rsram_to_rsram) {
-      if (CheckSunmmioRsramStridedDMACopy(target, analyzer)) {
+      if (CheckSunmmioRsramStridedDMACopy(target, layout_map, analyzer)) {
         return CopyInst::kSunmmioDMACopy;
       }
       if (CheckSunmmioTileCopy(target)) {
