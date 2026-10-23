@@ -432,8 +432,8 @@ def test_copy_matrix_slots_production_pipeline(tmp_path, dtype, route, src_rank,
             assert "_layout_stage" not in artifact.device_mod.script()
         assert "suvm.tile.load" not in source
         expected_unit = "odma1" if route == "rr" else "odma0"
-        assert f"unit = #suvm.unit<{expected_unit}>" in source
-        assert f"suvm.sync  {expected_unit}" in source
+        assert f"unit = {expected_unit}" in source
+        assert f"suvm.sync {expected_unit}" in source
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-to-llvm-pipeline"))
 
 
@@ -595,9 +595,9 @@ def test_mx_copy_waits_before_other_unit_consumes_result(tmp_path, dtype):
     lines = artifact.kernel_source.splitlines()
     transfers = [i for i, line in enumerate(lines) if "suvm.copy_async" in line]
     assert len(transfers) == 3
-    assert "#suvm.unit<odma0>" in lines[transfers[0]]
-    assert "#suvm.unit<odma1>" in lines[transfers[1]]
-    assert "#suvm.unit<odma0>" in lines[transfers[2]]
+    assert "unit = odma0" in lines[transfers[0]]
+    assert "unit = odma1" in lines[transfers[1]]
+    assert "unit = odma0" in lines[transfers[2]]
     for begin, end, unit in [(transfers[0], transfers[1], "odma0"), (transfers[1], transfers[2], "odma1")]:
         assert any("suvm.sync" in line and unit in line for line in lines[begin + 1 : end])
     validate_suvm_mlir_with_npuir_opt(artifact.kernel_source, tmp_path, opt_args=("--verify-each", "--suvm-to-llvm-pipeline"))
