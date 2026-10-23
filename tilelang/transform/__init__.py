@@ -415,6 +415,11 @@ def LegalizeSunmmioGemm():
     return _ffi_api.LegalizeSunmmioGemm()  # type: ignore
 
 
+def LegalizeSunmmioBatchGemmViews():
+    """Materialize partial Batch GEMM views before SRAM scope inference."""
+    return _ffi_api.LegalizeSunmmioBatchGemmViews()  # type: ignore
+
+
 def LegalizeSafeMemoryAccess():
     """LegalizeLoopVectorize
 
