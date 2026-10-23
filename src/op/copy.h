@@ -246,6 +246,13 @@ public:
   bool CheckTMemStore(Target target) const;
 
   /*!
+   * \brief Check if a singleton-axis-remapped RSRAM copy is a candidate for
+   * Sunmmio strided DMA lowering.
+   */
+  bool CheckSunmmioRsramStridedDMACopy(Target target,
+                                       arith::Analyzer *analyzer) const;
+
+  /*!
    * \brief Check if Sunmmio dma copy is supported.
    */
   bool CheckSunmmioDMACopy(Target target) const;
