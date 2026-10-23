@@ -250,6 +250,7 @@ def _make_small_2d_zz_carrier_func(
     matrix_shape=(64, 64),
     matrix_layout_kind="zz",
     explicit_predicate=False,
+    interior_shape=(4, 4),
 ):
     elem_type = tvm.ir.PrimType(dtype)
     one = tvm.tir.IntImm("bool", 1)
@@ -262,15 +263,16 @@ def _make_small_2d_zz_carrier_func(
 
     tile_i = tvm.tir.Var("tile_i", "int32")
     tile_j = tvm.tir.Var("tile_j", "int32")
-    logical_domain = domain_shape or (tile_rows * 4, tile_cols * 4)
-    tile_rows = (logical_domain[0] + 3) // 4
-    tile_cols = (logical_domain[1] + 3) // 4
+    height, width = interior_shape
+    logical_domain = domain_shape or (tile_rows * height, tile_cols * width)
+    tile_rows = (logical_domain[0] + height - 1) // height
+    tile_cols = (logical_domain[1] + width - 1) // width
 
     def make_tile_body(suffix):
         ki = tvm.tir.Var(f"ki_{suffix}", "int32")
         kj = tvm.tir.Var(f"kj_{suffix}", "int32")
-        row = tile_i * 4 + ki
-        col = tile_j * 4 + kj
+        row = tile_i * height + ki
+        col = tile_j * width + kj
         predicate = tvm.tir.And(ki < 3, kj < 2) if explicit_predicate else None
         rhs = tvm.tir.BufferLoad(src, [row, col], predicate=predicate)
         rhs *= tvm.tir.BufferLoad(side, [row]) if with_side_tile else tvm.tir.FloatImm(dtype, 2.0)
@@ -278,7 +280,7 @@ def _make_small_2d_zz_carrier_func(
         inner = tvm.tir.For(
             kj,
             0,
-            4,
+            width,
             tvm.tir.ForKind.SERIAL,
             store,
             annotations={"tile.interior": 1, "tile.interior_axis": 1},
@@ -286,15 +288,15 @@ def _make_small_2d_zz_carrier_func(
         return tvm.tir.For(
             ki,
             0,
-            4,
+            height,
             tvm.tir.ForKind.SERIAL,
             inner,
             annotations={"tile.interior": 1, "tile.interior_axis": 0},
         )
 
     body = make_tile_body("full")
-    if domain_shape is not None and (logical_domain[0] % 4 != 0 or logical_domain[1] % 4 != 0):
-        full_tile = tvm.tir.And(tile_i * 4 + 4 <= logical_domain[0], tile_j * 4 + 4 <= logical_domain[1])
+    if domain_shape is not None and (logical_domain[0] % height != 0 or logical_domain[1] % width != 0):
+        full_tile = tvm.tir.And(tile_i * height + height <= logical_domain[0], tile_j * width + width <= logical_domain[1])
         body = tvm.tir.IfThenElse(full_tile, body, make_tile_body("tail"))
     body = tvm.tir.For(
         tile_j,
@@ -315,7 +317,7 @@ def _make_small_2d_zz_carrier_func(
             "tile.execution_axis": 0,
             "tile.execution_domain_axes": [0, 1],
             "tile.scope_entry": 1,
-            "tile.tile_size": [4, 4],
+            "tile.tile_size": list(interior_shape),
         },
     )
     allocated_body = tvm.tir.Allocate(dst_data, dtype, list(matrix_shape), one, body)
@@ -574,10 +576,7 @@ def test_sunmmio_codegen_row_major_small_2d_tile_uses_single_register_carrier(tm
 
 @pytest.mark.parametrize(
     "dtype,matrix_shape",
-    [
-        ("float32", (64, 64)),
-        ("bfloat16", (64, 128)),
-    ],
+    [("float32", (64, 64)), ("bfloat16", (64, 128))],
 )
 def test_sunmmio_codegen_rejects_row_major_small_2d_tile_crossing_carrier(dtype, matrix_shape):
     with pytest.raises(
@@ -587,6 +586,30 @@ def test_sunmmio_codegen_rejects_row_major_small_2d_tile_crossing_carrier(dtype,
         _build_sunmmio_source_from_func(
             _make_small_2d_zz_carrier_func(dtype=dtype, matrix_shape=matrix_shape, matrix_layout_kind="row_major")
         )
+
+
+@pytest.mark.parametrize(
+    "dtype,matrix_shape,interior_shape",
+    [("float32", (2, 32), (2, 32)), ("bfloat16", (2, 64), (2, 64)), ("bfloat16", (4, 32), (4, 32)), ("float32", (6, 32), (2, 32))],
+)
+def test_sunmmio_codegen_small_row_major_tile_without_carrier_reverts_to_baseline(tmp_path, dtype, matrix_shape, interior_shape):
+    src = _build_sunmmio_source_from_func(
+        _make_small_2d_zz_carrier_func(
+            dtype=dtype,
+            matrix_shape=matrix_shape,
+            matrix_layout_kind="row_major",
+            interior_shape=interior_shape,
+            domain_shape=matrix_shape,
+        )
+    )
+    assert "suvm.tile.extract_slice" not in src
+    assert "suvm.tile.insert_slice" not in src
+    validate_suvm_mlir_with_npuir_opt(
+        src,
+        tmp_path,
+        mlir_filename=f"small_row_major_{dtype}_{matrix_shape[0]}x{matrix_shape[1]}.mlir",
+        opt_args=("--verify-each", "--suvm-to-llvm-pipeline"),
+    )
 
 
 def test_sunmmio_codegen_small_2d_carrier_honors_explicit_load_store_predicates(tmp_path):
