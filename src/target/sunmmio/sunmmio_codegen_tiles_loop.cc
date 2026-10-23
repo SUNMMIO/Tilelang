@@ -803,6 +803,16 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                              memtensor_type.layout_dim_levels[1] == 1 &&
                              layout_shape.size() == 2 && strides.size() == 2 &&
                              strides[1] == 1 && strides[0] == layout_shape[1];
+    // A contiguous full-width tile only needs RSRAM transfer alignment,
+    // not a full vector register.  Preserve the direct load/store path for
+    // these tiles before considering wider read-modify-write carriers.
+    if (is_flat_row_major && access->tile_shape[1] == layout_shape[1] &&
+        layout_shape[0] % access->tile_shape[0] == 0 &&
+        (logical_elems * dtype.bits()) %
+                (tile_processor_config.rsram_align_bytes * 8) ==
+            0) {
+      return;
+    }
     if (is_flat_row_major && logical_elems < capacity_elems) {
       int64_t carrier_width = layout_shape[1];
       bool legal_carrier =
