@@ -5,6 +5,7 @@
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
+#include <tvm/tir/builtin.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
@@ -29,12 +30,61 @@ using BufferAccessVariant =
 using LoadStore2StateMap =
     std::unordered_map<BufferAccessVariant, std::vector<IndexSignState>>;
 
+namespace {
+
+template <typename FThen, typename FElse>
+void VisitReachableBranches(arith::Analyzer *analyzer,
+                            const PrimExpr &condition, FThen visit_then,
+                            FElse visit_else) {
+  PrimExpr predicate = condition;
+  if (const auto *call = predicate.as<CallNode>()) {
+    if (call->op.same_as(builtin::likely()))
+      predicate = call->args[0];
+  }
+  PrimExpr negated = analyzer->rewrite_simplify(Not(predicate));
+  // Prove reachability in the enclosing context. Adding an impossible branch
+  // constraint first can make IntSet's modulo analysis operate on infinity.
+  bool visit_true = !analyzer->CanProve(negated);
+  bool visit_false = !analyzer->CanProve(predicate);
+  if (visit_true) {
+    With<arith::ConstraintContext> context(analyzer, predicate);
+    visit_then();
+  }
+  if (visit_false) {
+    With<arith::ConstraintContext> context(analyzer, negated);
+    visit_else();
+  }
+}
+
+} // namespace
+
 class NegativeIndexAnalyzer : public IRVisitorWithAnalyzer {
 public:
   explicit NegativeIndexAnalyzer(LoadStore2StateMap *result)
       : result_(result) {}
 
 private:
+  void VisitStmt_(const IfThenElseNode *op) final {
+    VisitExpr(op->condition);
+    VisitReachableBranches(
+        &analyzer_, op->condition, [&] { VisitStmt(op->then_case); },
+        [&] {
+          if (op->else_case)
+            VisitStmt(op->else_case.value());
+        });
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (!op->op.same_as(builtin::if_then_else())) {
+      IRVisitorWithAnalyzer::VisitExpr_(op);
+      return;
+    }
+    VisitExpr(op->args[0]);
+    VisitReachableBranches(
+        &analyzer_, op->args[0], [&] { VisitExpr(op->args[1]); },
+        [&] { VisitExpr(op->args[2]); });
+  }
+
   std::vector<IndexSignState> ProcessIdx(const ffi::Array<PrimExpr> &indices,
                                          ffi::String buffer_name) {
     std::vector<IndexSignState> states;
@@ -162,6 +212,48 @@ private:
   NegativeIndexRewriter(arith::Analyzer *analyzer,
                         const LoadStore2StateMap &states)
       : arith::IRMutatorWithAnalyzer(analyzer), states_(states) {}
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    PrimExpr condition = VisitExpr(op->condition);
+    Stmt then_case = op->then_case;
+    ffi::Optional<Stmt> else_case = op->else_case;
+    VisitReachableBranches(
+        analyzer_, condition, [&] { then_case = VisitStmt(then_case); },
+        [&] {
+          if (else_case)
+            else_case = VisitStmt(else_case.value());
+        });
+    if (condition.same_as(op->condition) && then_case.same_as(op->then_case) &&
+        else_case.same_as(op->else_case))
+      return ffi::GetRef<Stmt>(op);
+    auto n = CopyOnWrite(op);
+    n->condition = std::move(condition);
+    n->then_case = std::move(then_case);
+    n->else_case = std::move(else_case);
+    return Stmt(n);
+  }
+
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    if (!op->op.same_as(builtin::if_then_else()))
+      return arith::IRMutatorWithAnalyzer::VisitExpr_(op);
+    PrimExpr condition = VisitExpr(op->args[0]);
+    PrimExpr true_value = op->args[1];
+    PrimExpr false_value = op->args[2];
+    VisitReachableBranches(
+        analyzer_, condition, [&] { true_value = VisitExpr(true_value); },
+        [&] { false_value = VisitExpr(false_value); });
+    if (condition.same_as(op->args[0]) && true_value.same_as(op->args[1]) &&
+        false_value.same_as(op->args[2]))
+      return ffi::GetRef<PrimExpr>(op);
+    return Call(op->dtype, op->op, {condition, true_value, false_value},
+                op->annotations, op->span);
+  }
+
+  PrimExpr VisitExpr_(const SelectNode *op) final {
+    // Select evaluates both values. Match the analysis traversal and avoid
+    // introducing mutually exclusive branch constraints during rewriting.
+    return StmtExprMutator::VisitExpr_(op);
+  }
 
   ffi::Array<PrimExpr> UpdateIdx(const ffi::Array<PrimExpr> &indices,
                                  const ffi::Array<PrimExpr> &buffer_shape,
