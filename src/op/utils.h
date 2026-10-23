@@ -49,7 +49,8 @@ TVM_DLL BufferRegion NormalizeToBufferRegion(
 // mask, and per-axis extents into a Call(RegionOp::Get(), ...) that can be
 // passed as an argument to builtins like dma_copy.
 TVM_DLL PrimExpr MakeRegionExpr(const Buffer &buffer,
-                                const Array<Range> &ranges, int access_mask);
+                                const Array<Range> &ranges, int access_mask,
+                                Map<String, ObjectRef> annotations = {});
 
 // Build a compact zero-based region with the same extents as `region`.
 TVM_DLL Array<Range> MakeCompactRegion(const Array<Range> &region);
