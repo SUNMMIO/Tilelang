@@ -69,6 +69,13 @@ SunMMIOValue SuvmSunmmioBuilder::Cast(const std::string &result_name,
   return expr_->Cast(result_name, v, dst_type, dst_dtype);
 }
 
+SunMMIOValue SuvmSunmmioBuilder::TileBitcast(const std::string &result_name,
+                                             const SunMMIOValue &value,
+                                             const SunMMIOType &result_type,
+                                             DataType dtype) {
+  return tile_->TileBitcast(result_name, value, result_type, dtype);
+}
+
 SunMMIOValue SuvmSunmmioBuilder::Binary(const std::string &result_name,
                                         BinaryOp op, ArithmeticFlavor flavor,
                                         const SunMMIOValue &a,

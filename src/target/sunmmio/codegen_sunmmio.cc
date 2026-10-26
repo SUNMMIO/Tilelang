@@ -2227,89 +2227,127 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
     SunMMIOValue tile = load_tile(src_view, dtype, shape);
     builder_->TileStore(tile, dst_view, std::nullopt);
   };
-  auto emit_scale_copy = [&](const SunMMIOValue &src, const SunMMIOValue &dst,
-                             tl::sunmmio::MXLayoutKind layout_kind) {
-    constexpr int64_t kScaleValidElems = 32;
-    constexpr int64_t kScaleAccessElems = 64;
-    ICHECK(layout_kind != tl::sunmmio::MXLayoutKind::kRowMajor)
-        << "tl.mx_pack/unpack row-major scale copy is not implemented yet; "
-           "waiting for stable suvm.unpack scale alias layout";
-    std::vector<int64_t> scale_shape = ExtractStaticShape(src.type);
-    std::vector<int64_t> dst_scale_shape = ExtractStaticShape(dst.type);
-    std::vector<int64_t> src_physical = ExtractPhysicalExtents(src.type);
-    std::vector<int64_t> dst_physical = ExtractPhysicalExtents(dst.type);
-    ICHECK(scale_shape == dst_scale_shape)
-        << "MX scale source/destination logical shapes must match";
-    ICHECK_EQ(scale_shape.size(), 2U)
-        << "MX scale alias/user buffer must be rank-2";
-    ICHECK_EQ(scale_shape[1], kScaleValidElems)
-        << "MX scale logical width must be 32, got " << scale_shape[1];
-    ICHECK_EQ(src_physical.size(), 2U)
-        << "MX scale source physical extent must be rank-2";
-    ICHECK_EQ(dst_physical.size(), 2U)
-        << "MX scale destination physical extent must be rank-2";
-    ICHECK_GE(src_physical[1], kScaleValidElems)
-        << "MX scale source physical width must cover 32 logical elements";
-    ICHECK_GE(dst_physical[1], kScaleValidElems)
-        << "MX scale destination physical width must cover 32 logical elements";
-
-    ICHECK(src_physical[1] >= kScaleAccessElems &&
-           dst_physical[1] >= kScaleAccessElems)
-        << "MX scale copy requires source and destination physical width to "
-           "cover a 64B fp8 tile access; got source width "
-        << src_physical[1] << " and destination width " << dst_physical[1];
-
-    std::string row_name = NewValueName();
-    begin_for(row_name, scale_shape[0]);
-    SunMMIOValue row = make_loop_index(row_name);
-    std::vector<SunMMIOValue> indices{row, EmitConstIndex(0)};
-    std::vector<int64_t> tiled_dims{0, 1};
-    std::vector<int64_t> valid_shape{1, kScaleValidElems};
-
-    std::vector<int64_t> access_shape{1, kScaleAccessElems};
-    std::vector<SunMMIOValue> offsets{EmitConstIndex(0), EmitConstIndex(0)};
-
-    SunMMIOValue src_view = get_tile_view(src, ExpectedMXScaleDType(), indices,
-                                          tiled_dims, access_shape);
-    SunMMIOValue src64 =
-        load_tile(src_view, ExpectedMXScaleDType(), access_shape);
-    SunMMIOValue src32 =
-        builder_->TileSlice(NewValueName(), src64, offsets,
-                            MakeTileType(ExpectedMXScaleDType(), valid_shape),
-                            ExpectedMXScaleDType());
-
-    SunMMIOValue dst_view = get_tile_view(dst, ExpectedMXScaleDType(), indices,
-                                          tiled_dims, access_shape);
-    SunMMIOValue dst64 =
-        load_tile(dst_view, ExpectedMXScaleDType(), access_shape);
-    SunMMIOValue merged = builder_->TileInsertSlice(
-        NewValueName(), dst64, src32, offsets,
-        MakeTileType(ExpectedMXScaleDType(), access_shape),
-        ExpectedMXScaleDType());
-    builder_->TileStore(merged, dst_view, std::nullopt);
-    builder_->EndFor();
-  };
-  auto emit_row_major_data_copy = [&](const SunMMIOValue &src,
-                                      const SunMMIOValue &dst, DataType dtype) {
+  const auto config = tl::GetSunmmioTileProcessorConfig(target_);
+  auto emit_row_field_copy = [&](const SunMMIOValue &src,
+                                 const SunMMIOValue &dst, DataType dtype) {
     std::vector<int64_t> shape = ExtractStaticShape(src.type);
-    std::vector<int64_t> physical = ExtractPhysicalExtents(src.type);
+    ICHECK(shape == ExtractStaticShape(dst.type))
+        << "MX field source/destination logical shapes must match";
     ICHECK_EQ(shape.size(), 2U);
-    ICHECK_EQ(physical.size(), 2U);
-    int64_t access_elems = 64 * 8 / dtype.bits();
-    ICHECK_GT(access_elems, 0);
-    ICHECK_EQ(physical[1] % access_elems, 0)
-        << "MX row-major data physical width must be aligned to 64B, got "
-        << physical[1] << " elements for dtype " << dtype;
-    int64_t col_tiles = physical[1] / access_elems;
+    ICHECK_GT(shape[0], 0);
+    ICHECK_GT(shape[1], 0);
+    int64_t access_elems =
+        tl::GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, dtype);
+    ICHECK_GT(config.rsram_align_bytes, 0);
+    int64_t full_tiles = shape[1] / access_elems;
+    int64_t tail_elems = shape[1] % access_elems;
+    int64_t covered_cols = (full_tiles + (tail_elems != 0)) * access_elems;
+    for (const SunMMIOValue *field : {&src, &dst}) {
+      auto physical = ExtractPhysicalExtents(field->type);
+      auto strides = ExtractStaticPrimExprs(field->type.layout_hstride,
+                                            "MX field layout strides");
+      ICHECK(field->type.layout_dim_levels == std::vector<uint8_t>({1, 1}) &&
+             physical.size() == 2 && strides.size() == 2)
+          << "MX field copy requires a flat rank-2 layout";
+      ICHECK_GE(physical[0], shape[0]);
+      ICHECK_GE(physical[1], covered_cols)
+          << "MX field physical width must cover its aligned accesses";
+      ICHECK_EQ(physical[1] % access_elems, 0);
+      ICHECK_EQ(strides[1], 1) << "MX fields must be contiguous within a row";
+      ICHECK_GE(strides[0], physical[1]);
+      ICHECK_EQ(strides[0] % access_elems, 0);
+      ICHECK_EQ(field->type.byte_offset % config.rsram_align_bytes, 0);
+    }
 
+    std::vector<int64_t> access_shape{1, access_elems};
+    std::vector<int64_t> tiled_dims{0, 1};
+    std::vector<SunMMIOValue> zero_offsets{EmitConstIndex(0),
+                                           EmitConstIndex(0)};
+    SunMMIOType access_type = MakeTileType(dtype, access_shape);
     std::string row_name = NewValueName();
     begin_for(row_name, shape[0]);
     SunMMIOValue row = make_loop_index(row_name);
-    std::string col_name = NewValueName();
-    begin_for(col_name, col_tiles);
-    SunMMIOValue col = make_loop_index(col_name);
-    copy_tile(src, dst, dtype, {row, col}, {0, 1}, {1, access_elems});
-    builder_->EndFor();
+    // Complete accesses never read the destination. Each field keeps its own
+    // physical row stride and byte offset through its memtensor type.
+    if (full_tiles > 0) {
+      std::string col_name = NewValueName();
+      begin_for(col_name, full_tiles);
+      copy_tile(src, dst, dtype, {row, make_loop_index(col_name)}, tiled_dims,
+                access_shape);
+      builder_->EndFor();
+    }
+    if (tail_elems != 0) {
+      std::vector<SunMMIOValue> indices{row, EmitConstIndex(full_tiles)};
+      SunMMIOValue src_view =
+          get_tile_view(src, dtype, indices, tiled_dims, access_shape);
+      SunMMIOValue dst_view =
+          get_tile_view(dst, dtype, indices, tiled_dims, access_shape);
+      SunMMIOValue source = load_tile(src_view, dtype, access_shape);
+      SunMMIOValue previous = load_tile(dst_view, dtype, access_shape);
+      SunMMIOValue merged;
+      int64_t valid_bits = tail_elems * dtype.bits();
+      if (valid_bits % 32 == 0) {
+        // This is also the existing blockwise scale path (32 valid FP8
+        // elements), and covers all payload tails when K is a multiple of 32.
+        SunMMIOValue slice =
+            builder_->TileSlice(NewValueName(), source, zero_offsets,
+                                MakeTileType(dtype, {1, tail_elems}), dtype);
+        merged = builder_->TileInsertSlice(NewValueName(), previous, slice,
+                                           zero_offsets, access_type, dtype);
+      } else {
+        // Low-bit slice lowering requires whole i32 lanes. Preserve the
+        // trailing padding bytes by merging the partial lane as raw bits.
+        ICHECK_EQ(config.rsram_align_bytes % 4, 0);
+        DataType word_dtype = DataType::Int(32);
+        SunMMIOType words_type =
+            MakeTileType(word_dtype, {1, config.rsram_align_bytes / 4});
+        SunMMIOType word_type = MakeTileType(word_dtype, {1, 1});
+        SunMMIOValue source_words = builder_->TileBitcast(
+            NewValueName(), source, words_type, word_dtype);
+        SunMMIOValue previous_words = builder_->TileBitcast(
+            NewValueName(), previous, words_type, word_dtype);
+        SunMMIOValue merged_words = previous_words;
+        int64_t full_words = valid_bits / 32;
+        if (full_words > 0) {
+          SunMMIOValue prefix = builder_->TileSlice(
+              NewValueName(), source_words, zero_offsets,
+              MakeTileType(word_dtype, {1, full_words}), word_dtype);
+          merged_words =
+              builder_->TileInsertSlice(NewValueName(), merged_words, prefix,
+                                        zero_offsets, words_type, word_dtype);
+        }
+        std::vector<SunMMIOValue> word_offsets{EmitConstIndex(0),
+                                               EmitConstIndex(full_words)};
+        SunMMIOValue source_word = builder_->TileSlice(
+            NewValueName(), source_words, word_offsets, word_type, word_dtype);
+        SunMMIOValue previous_word =
+            builder_->TileSlice(NewValueName(), previous_words, word_offsets,
+                                word_type, word_dtype);
+        uint32_t mask = (uint32_t{1} << (valid_bits % 32)) - 1;
+        SunMMIOType scalar_type{SunMMIOType::Kind::kScalar, word_dtype, 1, {}};
+        SunMMIOValue take_mask =
+            builder_->ConstantInt(NewValueName(), static_cast<int32_t>(mask),
+                                  scalar_type, word_dtype);
+        SunMMIOValue keep_mask =
+            builder_->ConstantInt(NewValueName(), static_cast<int32_t>(~mask),
+                                  scalar_type, word_dtype);
+        SunMMIOValue new_bits = builder_->Binary(
+            NewValueName(), BinaryOp::kAnd, ArithmeticFlavor::kSignedInt,
+            source_word, take_mask, word_type, word_dtype);
+        SunMMIOValue old_bits = builder_->Binary(
+            NewValueName(), BinaryOp::kAnd, ArithmeticFlavor::kSignedInt,
+            previous_word, keep_mask, word_type, word_dtype);
+        SunMMIOValue word = builder_->Binary(
+            NewValueName(), BinaryOp::kOr, ArithmeticFlavor::kSignedInt,
+            new_bits, old_bits, word_type, word_dtype);
+        merged_words =
+            builder_->TileInsertSlice(NewValueName(), merged_words, word,
+                                      word_offsets, words_type, word_dtype);
+        merged = builder_->TileBitcast(NewValueName(), merged_words,
+                                       access_type, dtype);
+      }
+      builder_->TileStore(merged, dst_view, std::nullopt);
+    }
     builder_->EndFor();
   };
   auto emit_blockwise_data_copy = [&](const SunMMIOValue &src,
@@ -2401,7 +2439,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
 
   switch (analysis->kind) {
   case tl::sunmmio::MXLayoutKind::kRowMajor:
-    emit_row_major_data_copy(data_src, data_dst, data_buffer->dtype);
+    emit_row_field_copy(data_src, data_dst, data_buffer->dtype);
     break;
   case tl::sunmmio::MXLayoutKind::kMXZZ:
   case tl::sunmmio::MXLayoutKind::kMXZNZ:
@@ -2413,7 +2451,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
                   "tl.mx_pack/unpack";
     break;
   }
-  emit_scale_copy(scale_src, scale_dst, analysis->kind);
+  emit_row_field_copy(scale_src, scale_dst, scale_buffer->dtype);
 
   return SunMMIOValue{op->dtype, "", MapType(op->dtype)};
 }

@@ -243,6 +243,19 @@ SunMMIOValue SunmmioMlirTileOp::Cast(const std::string &result_name,
   return SunMMIOValue{dst_dtype, result_name, dst_type};
 }
 
+SunMMIOValue SunmmioMlirTileOp::TileBitcast(const std::string &result_name,
+                                            const SunMMIOValue &value,
+                                            const SunMMIOType &result_type,
+                                            DataType dtype) {
+  mlir::Value input = ctx_.LookupValue(value, "missing_tile_bitcast_src");
+  mlir::Value result =
+      mlir::suvm::TileBitCastOp::create(ctx_.builder, MapMlirLoc(ctx_),
+                                        MapMlirType(ctx_, result_type), input)
+          .getResult();
+  BindRequiredResult(ctx_, result_name, result, "suvm.tile.bitcast");
+  return SunMMIOValue{dtype, result_name, result_type};
+}
+
 SunMMIOValue SunmmioMlirTileOp::Binary(const std::string &result_name,
                                        BinaryOp op, ArithmeticFlavor flavor,
                                        const SunMMIOValue &a,

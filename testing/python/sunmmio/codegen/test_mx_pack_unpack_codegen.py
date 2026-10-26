@@ -4,6 +4,7 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
+from tilelang.engine.lower import lower
 
 from tilelang.layout import (
     get_mx_scale_shape,
@@ -19,6 +20,7 @@ from testing.python.sunmmio.common.codegen_validation import (
     assert_source_contains,
     lower_sunmmio_kernel_to_device_tir,
     validate_sunmmio_codegen_with_npuir_opt,
+    validate_suvm_mlir_with_npuir_opt,
 )
 
 
@@ -32,18 +34,7 @@ MX_DTYPE_CASES = (
 )
 
 LAYOUT_KINDS = (
-    pytest.param(
-        "row_major",
-        marks=pytest.mark.xfail(
-            strict=True,
-            reason=(
-                "mx_row_major scale alias currently exposes logical width N/32 "
-                "without a padded 64B scale extent; row-major T.mx_pack/unpack "
-                "scale copy is deferred until suvm.unpack exposes that layout"
-            ),
-        ),
-        id="row-major",
-    ),
+    pytest.param("row_major", id="row-major"),
     pytest.param("mxzz", id="mxzz"),
     pytest.param("mxznz", id="mxznz"),
 )
@@ -53,7 +44,7 @@ PACK_UNPACK_CASES = (
     pytest.param("unpack", id="unpack"),
 )
 
-LOOSE_OPT_ARGS = ("--verify-each",)
+LLVM_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
 
 
 def _int_shape(shape):
@@ -106,8 +97,8 @@ def _assert_pack_unpack_mlir(src, mx_token, expect_scale_slice=True):
 
 
 @target("Sunmmio")
-def mx_physical_pack_kernel(mx_dtype, data_dtype, layout_kind):
-    shape = _shape_for_layout(layout_kind)
+def mx_physical_pack_kernel(mx_dtype, data_dtype, layout_kind, shape=None):
+    shape = _shape_for_layout(layout_kind) if shape is None else shape
     mx_layout = _mx_layout(layout_kind, shape, mx_dtype)
     scale_shape = _mx_scale_shape(layout_kind, shape, mx_dtype)
 
@@ -124,8 +115,8 @@ def mx_physical_pack_kernel(mx_dtype, data_dtype, layout_kind):
 
 
 @target("Sunmmio")
-def mx_physical_unpack_kernel(mx_dtype, data_dtype, layout_kind):
-    shape = _shape_for_layout(layout_kind)
+def mx_physical_unpack_kernel(mx_dtype, data_dtype, layout_kind, shape=None):
+    shape = _shape_for_layout(layout_kind) if shape is None else shape
     mx_layout = _mx_layout(layout_kind, shape, mx_dtype)
     scale_shape = _mx_scale_shape(layout_kind, shape, mx_dtype)
 
@@ -159,14 +150,9 @@ def test_mx_pack_unpack_lowering_codegen_and_supported_device_validation(
 
     mlir_filename = f"mx_{op_name}_{layout_kind}_{_mx_token_name(mx_token)}_suvm.mlir"
     expected_tokens = ("suvm.unpack", "suvm.tile.load", "suvm.tile.store")
-    opt_args = LOOSE_OPT_ARGS if layout_kind == "row_major" else ("-suvm-device-validate",)
-    src = validate_sunmmio_codegen_with_npuir_opt(
-        kernel,
-        tmp_path,
-        mlir_filename=mlir_filename,
-        expected_tokens=expected_tokens,
-        opt_args=opt_args,
-    )
+    src = lower(kernel, target="sunmmio").kernel_source
+    assert_source_contains(src, expected_tokens)
+    validate_suvm_mlir_with_npuir_opt(src, tmp_path, mlir_filename=mlir_filename, opt_args=LLVM_OPT_ARGS)
     _assert_pack_unpack_mlir(src, mx_token, expect_scale_slice=layout_kind != "row_major")
 
 
@@ -288,8 +274,7 @@ def test_mx_pack_result_rejects_unaligned_gemm_operand(mx_dtype, data_dtype, mx_
 
 
 @target("Sunmmio")
-def mx_manual_payload_roundtrip_kernel(mx_dtype, data_dtype):
-    shape = (32, 1024)
+def mx_manual_payload_roundtrip_kernel(mx_dtype, data_dtype, shape=(32, 1024)):
     mx_layout = make_mx_row_major_layout(shape, dtype=mx_dtype)
     scale_shape = _int_shape(get_mx_scale_shape(mx_layout, mx_dtype))
 
@@ -301,7 +286,7 @@ def mx_manual_payload_roundtrip_kernel(mx_dtype, data_dtype):
             mx = T.alloc_shared(shape, mx_dtype)
             data_after = T.alloc_shared(shape, data_dtype)
             scale_after = T.alloc_shared(scale_shape, T.float8_e8m0fnu)
-            data_layout = make_row_major(shape)
+            data_layout = make_aligned_row_major(shape, data_dtype, 64)
             scale_layout = make_aligned_row_major(scale_shape, T.float8_e8m0fnu, 64)
             T.annotate_layout(
                 {
@@ -320,26 +305,49 @@ def mx_manual_payload_roundtrip_kernel(mx_dtype, data_dtype):
 
 
 @pytest.mark.parametrize("mx_dtype,data_dtype,mx_token", MX_DTYPE_CASES)
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "mx_row_major scale alias currently exposes logical width N/32 without "
-        "a padded 64B scale extent; row-major T.mx_pack/unpack scale copy is "
-        "deferred until suvm.unpack exposes that layout"
-    ),
-)
 def test_user_kernel_can_write_and_read_data_scale_around_mx_pack_unpack_codegen(tmp_path, mx_dtype, data_dtype, mx_token):
     kernel = mx_manual_payload_roundtrip_kernel(mx_dtype, data_dtype)
-    src = validate_sunmmio_codegen_with_npuir_opt(
-        kernel,
-        tmp_path,
-        expected_tokens=(mx_token, "suvm.unpack", "suvm.tile.load", "suvm.tile.store"),
-        mlir_filename=f"mx_payload_roundtrip_{_mx_token_name(mx_token)}_suvm.mlir",
-        opt_args=LOOSE_OPT_ARGS,
-    )
+    src = lower(kernel, target="sunmmio").kernel_source
+    validate_suvm_mlir_with_npuir_opt(src, tmp_path, opt_args=LLVM_OPT_ARGS)
 
     assert "suvm.copy_async" not in src
     assert_source_contains(src, ("suvm.tile.load", "suvm.tile.store", "suvm.unpack"))
+
+
+@pytest.mark.parametrize("mx_dtype,data_dtype,mx_token", MX_DTYPE_CASES)
+@pytest.mark.parametrize("op_name", ["pack", "unpack", "roundtrip"])
+@pytest.mark.parametrize(
+    "rows,k",
+    [(3, k) for k in (32, 64, 96, 128, 160, 992, 1024, 1056, 2016, 2048, 2080, 2112, 2144, 4096, 4128)] + [(1, 64)],
+)
+def test_mx_row_major_fields_and_tails_production_pipeline(tmp_path, mx_dtype, data_dtype, mx_token, op_name, rows, k):
+    # Multiple rows expose different pitches; a single row also checks the
+    # degenerate axis and the allocation boundary immediately after the field.
+    shape = (rows, k)
+    if op_name == "roundtrip":
+        kernel = mx_manual_payload_roundtrip_kernel(mx_dtype, data_dtype, shape)
+    else:
+        factory = mx_physical_pack_kernel if op_name == "pack" else mx_physical_unpack_kernel
+        kernel = factory(mx_dtype, data_dtype, "row_major", shape)
+    src = lower(kernel, target="sunmmio").kernel_source
+    assert "suvm.copy_async" not in src
+    assert "suvm.tile.cast" not in src
+    assert ("suvm.tile.bitcast" in src) == ((k // 32) % 4 != 0)
+    if k % 128 == 0 and (k // 32) % 64 == 0:
+        # Whole fields need neither a destination load nor a merge.
+        assert "suvm.tile.insert_slice" not in src
+        assert "suvm.tile.extract_slice" not in src
+    validate_suvm_mlir_with_npuir_opt(src, tmp_path, opt_args=LLVM_OPT_ARGS)
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+@pytest.mark.parametrize("operation", ["pack", "unpack", "roundtrip"])
+@pytest.mark.parametrize("k", [64, 992, 1056, 2016, 4128])
+def test_mx_row_major_numeric_kernel_compiles_without_simulator(tmp_path, bits, operation, k):
+    from testing.python.sunmmio.codegen.test_mx_row_major_pack_unpack_numeric import mx_row_major_numeric_kernel
+
+    src = lower(mx_row_major_numeric_kernel(k, bits, operation), target="sunmmio").kernel_source
+    validate_suvm_mlir_with_npuir_opt(src, tmp_path, opt_args=LLVM_OPT_ARGS)
 
 
 # ---------------------------------------------------------------------------

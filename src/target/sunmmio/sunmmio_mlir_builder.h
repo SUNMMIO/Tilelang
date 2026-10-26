@@ -41,6 +41,11 @@ public:
   SunMMIOValue Cast(const std::string &result_name, const SunMMIOValue &v,
                     const SunMMIOType &dst_type, DataType dst_dtype) final;
 
+  SunMMIOValue TileBitcast(const std::string &result_name,
+                           const SunMMIOValue &value,
+                           const SunMMIOType &result_type,
+                           DataType dtype) final;
+
   SunMMIOValue Binary(const std::string &result_name, BinaryOp op,
                       ArithmeticFlavor flavor, const SunMMIOValue &a,
                       const SunMMIOValue &b, const SunMMIOType &result_type,
