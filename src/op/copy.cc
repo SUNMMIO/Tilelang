@@ -513,7 +513,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
   // assigned by other operators.
   //
   // Hard constraint: DRAM → ASRAM/WSRAM requires ZZ-like DRAM layout
-  // (ZZ, ZZZ, or NZZ).  DRAM layouts are user-specified and immutable,
+  // (ZZ, ZZZ, or ZZN).  DRAM layouts are user-specified and immutable,
   // so an incompatible layout is a hard error.
   if (copy_inst == CopyInst::kSunmmioDMACopy) {
     if (src.scope() == "global" && (dst.scope() == kSunmmioScopeASRAM ||
@@ -521,7 +521,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
       if (T.global_layout_map.count(src)) {
         auto dram_layout = T.global_layout_map[src];
         auto *cute = dram_layout.as<CuteLayoutNode>();
-        // Only validate user-specified blocked layouts (ZZ, ZN, ZZZ, NZZ).
+        // Only validate user-specified blocked layouts (ZZ, NZ, ZZZ, ZZN).
         // Row-major (default for unspecified DRAM) has no blocked dims and
         // is handled by the dma_copy / layout-transform split — skip the
         // check.
@@ -536,7 +536,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
           if (has_blocked) {
             ICHECK(sunmmio::IsZZLike(dram_layout))
                 << "DRAM → " << dst.scope()
-                << " copy requires ZZ-like DRAM layout (ZZ, ZZZ, or NZZ), "
+                << " copy requires ZZ-like DRAM layout (ZZ, ZZZ, or ZZN), "
                 << "but buffer \"" << src->name << "\" has incompatible layout";
           }
         }

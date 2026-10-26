@@ -974,19 +974,19 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
     ICHECK_GE(rank_b, 2)
         << "Sunmmio GEMM B layout inference requires rank >= 2.";
     Array<Integer> axes_b{Integer(rank_b - 2), Integer(rank_b - 1)};
-    // transB_ => TMM.MT mode => ZZ layout; !transB_ => TMM.MN mode => ZN layout
+    // transB_ => TMM.MT mode => ZZ layout; !transB_ => TMM.MN mode => NZ layout
     if (sunmmio::IsMXDType(b_->dtype)) {
       if (transB_) {
         CheckSunmmioMXOperandBlockAligned(b_, rank_b - 1, "B", "MXZZ");
         l = sunmmio::MakeMXZZ(b_->shape, axes_b, b_->dtype);
       } else {
-        CheckSunmmioMXOperandBlockAligned(b_, rank_b - 2, "B", "MXZNN");
-        l = sunmmio::MakeMXZNN(b_->shape, axes_b, b_->dtype);
+        CheckSunmmioMXOperandBlockAligned(b_, rank_b - 2, "B", "MXNNZ");
+        l = sunmmio::MakeMXNNZ(b_->shape, axes_b, b_->dtype);
       }
     } else {
       auto block_shape_b = GetSunmmioLayoutBlockShape(T.target, b_->dtype);
       l = transB_ ? sunmmio::MakeZZ(b_->shape, axes_b, block_shape_b)
-                  : sunmmio::MakeZN(b_->shape, axes_b, block_shape_b);
+                  : sunmmio::MakeNZ(b_->shape, axes_b, block_shape_b);
     }
     results.Set(b_, l);
 
