@@ -689,6 +689,8 @@ def mx_ocp_quantized_mma_mxznz_weight_kernel_for_debug(mx_dtype, data_dtype, dat
             b_mx_wsram = T.alloc_shared(b_shape, mx_dtype)
             c_rsram = T.alloc_shared(c_shape, T.bfloat16)
 
+            # Non-transposed weights require MXZNZ even for an N32 carrier.
+            T.annotate_layout({b_mx: b_mx_layout})
             T.copy(A, a_rsram)
             T.copy(B, b_rsram)
 

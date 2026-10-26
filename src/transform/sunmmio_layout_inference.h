@@ -42,10 +42,11 @@ struct SunmmioLayoutEntry {
  *   4. kStrict — seed hard constraints (Gemm overrides defaults)
  *   5. kCommon — BFS propagation (ops derive and override defaults)
  *  5A. Alias propagation
+ *  5B. Validate MX weight transfer constraints
  *   6. Apply — attach layout_map / global_layout_map annotations
  *
- * Validation is not a separate phase — each op validates hard constraints
- * inside its InferLayout when all operands have layouts.
+ * Operators seed hardware constraints first; MX weight transfers are checked
+ * after propagation so immutable input conflicts cannot be silently ignored.
  */
 class SunmmioLayoutInferencePass {
 public:
@@ -69,6 +70,8 @@ private:
 
   // Phase 5A: Alias propagation
   void PropagateAliases();
+
+  void ValidateMXWeightTransfers();
 
   // Phase 6: Apply to IR (attach layout_map, no IR rewriting)
   PrimFunc ApplyToIR(PrimFunc f);

@@ -453,15 +453,17 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
     return result_map;
   }
 
-  // Sunmmio DMA Copy: no layout inference here.  CopyNode::Lower bridges a
-  // DRAM<->RSRAM layout mismatch by splitting the copy into a dma_copy plus a
-  // sunmmio_layout_transform through an RSRAM staging buffer.  Layouts are
-  // assigned by other operators.
+  // Propagate non-transposed MX weight requirements through DMA staging.
+  // Other copies retain their existing layout-transform lowering policy.
   //
   // Hard constraint: DRAM → ASRAM/WSRAM requires ZZ-like DRAM layout
   // (ZZ, ZZZ, or NZZ).  DRAM layouts are user-specified and immutable,
   // so an incompatible layout is a hard error.
   if (copy_inst == CopyInst::kSunmmioDMACopy) {
+    auto weight_layouts =
+        InferSunmmioMXWeightTransferLayout(T, src, dst, level);
+    if (weight_layouts.has_value())
+      return *weight_layouts;
     if (src.scope() == "global" && (dst.scope() == kSunmmioScopeASRAM ||
                                     dst.scope() == kSunmmioScopeWSRAM)) {
       if (T.global_layout_map.count(src)) {

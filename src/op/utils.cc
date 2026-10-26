@@ -4,6 +4,8 @@
  */
 
 #include "utils.h"
+#include "../layout/cute_layout.h"
+#include "../target/sunmmio_utils.h"
 #include "tvm/tir/expr.h"
 
 #include <tvm/tir/builtin.h>
@@ -12,6 +14,126 @@ namespace tvm {
 namespace tl {
 
 using namespace tir;
+
+namespace {
+
+Layout LookupTransferLayout(const LayoutInferArgs &args, const Buffer &buffer) {
+  const LayoutMap &layouts =
+      IsGlobalBuffer(buffer) ? args.global_layout_map : args.layout_map;
+  return layouts.count(buffer) ? layouts[buffer] : Layout();
+}
+
+bool HasEstablishedTransferLayout(const LayoutInferArgs &args,
+                                  const Buffer &buffer) {
+  if (!LookupTransferLayout(args, buffer).defined())
+    return false;
+  return IsGlobalBuffer(buffer) || !args.layout_levels.count(buffer) ||
+         args.layout_levels[buffer].IntValue() >
+             static_cast<int>(InferLevel::kFree);
+}
+
+// Require the canonical three-level form, even when an N32 MXZZ carrier has
+// an equivalent byte map. Layout constructors enforce pack-size constraints.
+bool IsMXWeightLayout(const Layout &layout, const Buffer &buffer,
+                      bool transposed_block, arith::Analyzer *analyzer) {
+  const auto *cute = layout.as<CuteLayoutNode>();
+  int rank = buffer->shape.size();
+  if (!cute || !sunmmio::IsMXDType(buffer->dtype) || rank < 2)
+    return false;
+  auto levels = cute->GetDimLevels();
+  if (levels.size() != static_cast<size_t>(rank) ||
+      levels[rank - 2].IntValue() != 3 || levels[rank - 1].IntValue() != 3)
+    return false;
+  Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
+  Layout expected =
+      transposed_block ? sunmmio::MakeMXZNN(buffer->shape, axes, buffer->dtype)
+                       : sunmmio::MakeMXZNZ(buffer->shape, axes, buffer->dtype);
+  return IsSameLayout(layout, expected, analyzer);
+}
+
+bool IsMXWeightTransfer(const LayoutInferArgs &args, const Buffer &src,
+                        const Buffer &dst) {
+  if (!sunmmio::IsMXDType(src->dtype) || !sunmmio::IsMXDType(dst->dtype))
+    return false;
+  if (HasEstablishedTransferLayout(args, dst)) {
+    Layout layout = LookupTransferLayout(args, dst);
+    if (dst.scope() == kSunmmioScopeWSRAM &&
+        IsMXWeightLayout(layout, dst, true, args.analyzer))
+      return true;
+    if ((dst.scope() == kSunmmioScopeRSRAM || IsGlobalBuffer(dst)) &&
+        IsMXWeightLayout(layout, dst, false, args.analyzer))
+      return true;
+  }
+  return IsSunmmioSramScope(dst.scope()) &&
+         HasEstablishedTransferLayout(args, src) &&
+         IsMXWeightLayout(LookupTransferLayout(args, src), src, false,
+                          args.analyzer);
+}
+
+Layout MakeMXWeightSourceLayout(const Buffer &buffer) {
+  int rank = buffer->shape.size();
+  ICHECK_GE(rank, 2) << "MXZNZ weight staging requires matrix buffers";
+  return sunmmio::MakeMXZNZ(
+      buffer->shape, {Integer(rank - 2), Integer(rank - 1)}, buffer->dtype);
+}
+
+} // namespace
+
+std::optional<LayoutMap>
+InferSunmmioMXWeightTransferLayout(const LayoutInferArgs &args,
+                                   const Buffer &src, const Buffer &dst,
+                                   InferLevel level) {
+  if (level != InferLevel::kCommon || !IsMXWeightTransfer(args, src, dst))
+    return std::nullopt;
+  LayoutMap updates;
+  // Established and immutable layouts are checked after propagation. Only
+  // weak defaults may be replaced; never reinterpret an input or annotation.
+  for (const Buffer &buffer : {src, dst}) {
+    if (buffer.scope() == kSunmmioScopeRSRAM &&
+        !HasEstablishedTransferLayout(args, buffer))
+      updates.Set(buffer, MakeMXWeightSourceLayout(buffer));
+  }
+  return updates;
+}
+
+void ValidateSunmmioMXWeightTransferLayout(const LayoutInferArgs &args,
+                                           const BufferRegion &src,
+                                           const BufferRegion &dst,
+                                           const char *op_name) {
+  if (!IsMXWeightTransfer(args, src->buffer, dst->buffer))
+    return;
+  ICHECK_EQ(src->buffer->dtype, dst->buffer->dtype)
+      << op_name << " MX weight transfer requires matching MX dtypes";
+  ICHECK(dst->buffer.scope() != kSunmmioScopeASRAM)
+      << "Sunmmio MX weight layout conflict in " << op_name << " ("
+      << src->buffer->name << " -> " << dst->buffer->name
+      << "): MXZNZ weight storage cannot also satisfy the ASRAM MXZZ "
+         "activation requirement.";
+  for (const BufferRegion &region : {src, dst}) {
+    const Buffer &buffer = region->buffer;
+    bool is_wsram = buffer.scope() == kSunmmioScopeWSRAM;
+    const char *required = is_wsram ? "MXZNN" : "MXZNZ";
+    Layout actual = LookupTransferLayout(args, buffer);
+    ICHECK(IsMXWeightLayout(actual, buffer, is_wsram, args.analyzer))
+        << "Sunmmio MX weight layout conflict in " << op_name << " ("
+        << src->buffer->name << " -> " << dst->buffer->name << "): buffer \""
+        << buffer->name << "\" requires " << required
+        << " for the non-transposed weight path, but its actual layout is "
+        << (actual.defined() ? actual->DebugOutput() : "undefined")
+        << ". Declare MXZNZ input/staging layouts; implicit MXZZ <-> MXZNZ "
+           "conversion is not supported.";
+    int rank = region->region.size();
+    ICHECK_GE(rank, 2);
+    for (int dim = rank - 2; dim < rank; ++dim) {
+      const Range &range = region->region[dim];
+      ICHECK(args.analyzer->CanProveEqual(floormod(range->min, 32), 0) &&
+             args.analyzer->CanProveEqual(floormod(range->extent, 32), 0))
+          << op_name << " MX weight region for buffer \"" << buffer->name
+          << "\" requires whole aligned 32x32 blocks at dimension " << dim
+          << ", got " << range;
+    }
+  }
+}
 
 bool IsBufferLikeExpr(const PrimExpr &expr) {
   if (expr.as<BufferLoadNode>() || expr.as<BufferRegionNode>()) {

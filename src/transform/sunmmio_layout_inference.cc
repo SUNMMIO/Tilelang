@@ -24,8 +24,11 @@
 #include "../layout/cute_layout.h"
 #include "../layout/layout.h"
 #include "../op/builtin.h"
+#include "../op/comm.h"
+#include "../op/copy.h"
 #include "../op/operator.h"
 #include "../op/region.h"
+#include "../op/utils.h"
 #include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "common/global_layout_utils.h"
@@ -68,6 +71,9 @@ PrimFunc SunmmioLayoutInferencePass::Run(PrimFunc f) {
 
   // Phase 5A: Alias propagation
   pass.PropagateAliases();
+
+  // Validate final transfer constraints, including immutable input layouts.
+  pass.ValidateMXWeightTransfers();
 
   // Phase 6: Apply annotations to IR
   return pass.ApplyToIR(std::move(f));
@@ -430,9 +436,8 @@ void SunmmioLayoutInferencePass::PropagateBFS() {
 
     // Generic kCommon via operator InferLayout.
     // Each op returns layout assignments for its operands (or {} if it has
-    // nothing to propose).  Copy returns {} — it does not propagate layouts;
-    // a DRAM<->RSRAM mismatch is bridged later in CopyNode::Lower by
-    // splitting into a dma_copy plus a sunmmio_layout_transform.
+    // nothing to propose). MX weight requirements also propagate through
+    // copies; other copies retain their layout-transform lowering policy.
     auto args = BuildInferArgs();
     auto updates = op_list_[op_idx]->InferLayout(args, InferLevel::kCommon);
 
@@ -487,6 +492,34 @@ void SunmmioLayoutInferencePass::PropagateAliases() {
             << "SunmmioLayoutInference: Cannot derive layout for alias "
             << buf->name << " from representative layout.";
       }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5B: Validate final MX weight transfer layouts
+// ---------------------------------------------------------------------------
+
+void SunmmioLayoutInferencePass::ValidateMXWeightTransfers() {
+  auto args = BuildInferArgs();
+  for (const TileOperator &op : op_list_) {
+    if (const auto *copy = op.as<CopyNode>()) {
+      ValidateSunmmioMXWeightTransferLayout(
+          args, BufferRegion(copy->src, copy->src_range),
+          BufferRegion(copy->dst, copy->dst_range), "T.copy");
+    } else if (const auto *gather = op.as<AllgatherOpNode>()) {
+      ValidateSunmmioMXWeightTransferLayout(
+          args, NormalizeToBufferRegion(gather->send),
+          NormalizeToBufferRegion(gather->recv), "T.comm.all_gather");
+    } else if (const auto *broadcast = op.as<BroadcastOpNode>()) {
+      ValidateSunmmioMXWeightTransferLayout(
+          args, BufferRegion(broadcast->src, broadcast->src_range),
+          BufferRegion(broadcast->dst, broadcast->dst_range),
+          "T.comm.broadcast");
+    } else if (const auto *put = op.as<PutOpNode>()) {
+      ValidateSunmmioMXWeightTransferLayout(
+          args, BufferRegion(put->src, put->src_range),
+          BufferRegion(put->dst, put->dst_range), "T.comm.put");
     }
   }
 }

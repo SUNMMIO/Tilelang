@@ -15,7 +15,8 @@ from tilelang.utils.target import determine_target
 import tilelang as tl
 import tilelang.language as T
 import tilelang.env as env
-from tilelang.layout import make_zz_layout, make_zn_layout
+from tilelang.layout import is_same_layout, make_mxznz_layout, make_mxzz_layout, make_zz_layout, make_zn_layout
+from testing.python.sunmmio.common.compile_pipeline import target as sunmmio_target
 
 tilelang.env.disable_cache()
 
@@ -32,6 +33,169 @@ _mode_stride = tvm_ffi.get_global_func("tl.CuteLayout_mode_stride")
 
 # Populated by LayoutVisual; run_sunmmio_layout_inference returns a fresh copy.
 collected_result = {}
+
+
+@sunmmio_target("sunmmio")
+def mx_weight_staging_kernel(
+    n=64,
+    dtype=T.mxfp8,
+    stages=1,
+    communication="copy",
+    input_kind="mxznz",
+    stage_kind=None,
+    transpose_b=False,
+    k=512,
+    activation_conflict=False,
+):
+    m = 32
+    weight_shape = (n, k) if transpose_b else (k, n)
+    input_shape = (k // 4, n) if communication == "gather" else weight_shape
+    input_layout = (make_mxznz_layout if input_kind == "mxznz" else make_mxzz_layout)(input_shape, dtype=dtype)
+    stage_layout = (
+        None if stage_kind is None else (make_mxznz_layout if stage_kind == "mxznz" else make_mxzz_layout)(weight_shape, dtype=dtype)
+    )
+    send_layout = (
+        None if stage_kind is None else (make_mxznz_layout if stage_kind == "mxznz" else make_mxzz_layout)(input_shape, dtype=dtype)
+    )
+    replicated = T.placement.replicated()
+
+    def transfer(source, dest):
+        if communication == "gather":
+            return T.comm.all_gather(source, dest, direction="v", axis=0)
+        if communication == "broadcast":
+            return T.comm.broadcast(source, dest, 0, direction="v")
+        if communication == "put":
+            return T.comm.put(source, dest, 0, 4)
+        return T.copy(source, dest)
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((m, k), replicated, dtype, layout=make_mxzz_layout((m, k), dtype=dtype)),
+        W: T.MeshTensor(input_shape, replicated, dtype, layout=input_layout),
+        C: T.MeshTensor((m, n), replicated, T.float32, layout=make_zz_layout((m, n))),
+    ):
+        with T.Kernel():
+            a_stage = T.alloc_shared((m, k), dtype, scope="shared.rsram")
+            a = T.alloc_shared((m, k), dtype)
+            w = T.alloc_shared(weight_shape, dtype)
+            c = T.alloc_shared((m, n), T.float32)
+            T.copy(A, a_stage)
+            T.copy(a_stage, a)
+            if communication != "copy":
+                w_send = T.alloc_shared(input_shape, dtype, scope="shared.rsram")
+                if stage_kind is not None:
+                    T.annotate_layout({w_send: send_layout})
+                T.copy(W, w_send)
+            if stages > 0:
+                w_stage = T.alloc_shared(weight_shape, dtype, scope="shared.rsram")
+                if stage_kind is not None:
+                    T.annotate_layout({w_stage: stage_layout})
+                if communication == "copy":
+                    T.copy(W, w_stage)
+                else:
+                    transfer(w_send, w_stage)
+                if stages > 1:
+                    w_stage2 = T.alloc_shared(weight_shape, dtype, scope="shared.rsram")
+                    if stage_kind is not None:
+                        T.annotate_layout({w_stage2: stage_layout})
+                    T.copy(w_stage, w_stage2)
+                    T.copy(w_stage2, w)
+                else:
+                    T.copy(w_stage, w)
+            elif communication == "copy":
+                T.copy(W, w)
+            else:
+                transfer(w_send, w)
+            T.gemm(a, w, c, transpose_B=transpose_b, clear_accum=True)
+            if activation_conflict:
+                other_a = T.alloc_shared(weight_shape, dtype)
+                other_w = T.alloc_shared((n, 64), dtype)
+                other_c = T.alloc_shared((k, 64), T.float32)
+                T.copy(w_stage, other_a)
+                T.gemm(other_a, other_w, other_c, clear_accum=True)
+            T.copy(c, C)
+
+    return main
+
+
+@pytest.mark.parametrize("dtype", [T.mxfp8, T.mxfp4])
+@pytest.mark.parametrize("n", [32, 64, 512])
+@pytest.mark.parametrize("stages", [0, 1, 2])
+@pytest.mark.parametrize("communication", ["copy", "gather"])
+def test_mx_weight_requirement_propagates_through_staging(dtype, n, stages, communication):
+    kernel = mx_weight_staging_kernel(n, dtype, stages, communication)
+    layouts = run_sunmmio_layout_inference(tvm.IRModule({"main": kernel}), determine_target("sunmmio", return_object=True))
+    weight_shape = (512, n)
+    expected_weight = tvm_ffi.get_global_func("tl.sunmmio.make_mxznn")(list(weight_shape), [0, 1], dtype)
+    assert is_same_layout(layouts["w"], expected_weight)
+    for name in ("w_stage", "w_stage2", "w_send"):
+        if name in layouts:
+            shape = (128, n) if name == "w_send" else weight_shape
+            assert is_same_layout(layouts[name], make_mxznz_layout(shape, dtype=dtype))
+    input_shape = (128, n) if communication == "gather" else weight_shape
+    assert is_same_layout(layouts["W"], make_mxznz_layout(input_shape, dtype=dtype))
+    assert is_same_layout(layouts["a_stage"], make_mxzz_layout((32, 512), dtype=dtype))
+    assert is_same_layout(layouts["a"], make_mxzz_layout((32, 512), dtype=dtype))
+
+
+@pytest.mark.parametrize("communication", ["copy", "gather", "broadcast", "put"])
+@pytest.mark.parametrize("n", [32, 64, 512])
+@pytest.mark.parametrize("stages", [0, 2])
+def test_mx_weight_rejects_wrong_input_during_inference(communication, n, stages):
+    kernel = mx_weight_staging_kernel(n=n, stages=stages, communication=communication, input_kind="mxzz")
+    with pytest.raises(Exception, match="MX weight layout conflict.*requires MXZNZ"):
+        run_sunmmio_layout_inference(tvm.IRModule({"main": kernel}), determine_target("sunmmio", return_object=True))
+
+
+@pytest.mark.parametrize("communication", ["copy", "gather", "broadcast", "put"])
+def test_mx_weight_rejects_immutable_staging_conflict(communication):
+    kernel = mx_weight_staging_kernel(stages=2, communication=communication, stage_kind="mxzz")
+    with pytest.raises(Exception, match="MX weight layout conflict.*requires MXZNZ"):
+        run_sunmmio_layout_inference(tvm.IRModule({"main": kernel}), determine_target("sunmmio", return_object=True))
+
+
+@pytest.mark.parametrize("communication", ["copy", "gather", "broadcast", "put"])
+def test_mx_weight_accepts_explicit_staging(communication):
+    kernel = mx_weight_staging_kernel(stages=2, communication=communication, stage_kind="mxznz")
+    layouts = run_sunmmio_layout_inference(tvm.IRModule({"main": kernel}), determine_target("sunmmio", return_object=True))
+    for name in ("w_stage", "w_stage2"):
+        assert is_same_layout(layouts[name], make_mxznz_layout((512, 64), dtype=T.mxfp8))
+
+
+def test_mx_weight_rejects_conflicting_activation_consumer():
+    kernel = mx_weight_staging_kernel(activation_conflict=True)
+    with pytest.raises(Exception, match="MX weight layout conflict.*ASRAM MXZZ"):
+        run_sunmmio_layout_inference(tvm.IRModule({"main": kernel}), determine_target("sunmmio", return_object=True))
+
+
+@sunmmio_target("sunmmio")
+def mx_weight_slot_region_kernel(column=64, dtype=T.mxfp8):
+    replicated = T.placement.replicated()
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((32, 512), replicated, dtype, layout=make_mxzz_layout((32, 512), dtype=dtype)),
+        W: T.MeshTensor((2, 512, 128), replicated, dtype, layout=make_mxznz_layout((2, 512, 128), dtype=dtype)),
+        C: T.MeshTensor((32, 64), replicated, T.float32, layout=make_zz_layout((32, 64))),
+    ):
+        with T.Kernel():
+            a = T.alloc_shared((32, 512), dtype)
+            w_stage = T.alloc_shared((512, 64), dtype, scope="shared.rsram")
+            w = T.alloc_shared((512, 64), dtype)
+            c = T.alloc_shared((32, 64), T.float32)
+            T.copy(A, a)
+            T.copy(W[1:2, :, column : column + 64], w_stage)
+            T.copy(w_stage, w)
+            T.gemm(a, w, c, clear_accum=True)
+            T.copy(c, C)
+
+    return main
+
+
+def test_mx_weight_rejects_unaligned_region_during_inference():
+    kernel = mx_weight_slot_region_kernel(column=1)
+    with pytest.raises(Exception, match="MX weight region.*whole aligned 32x32 blocks"):
+        run_sunmmio_layout_inference(tvm.IRModule({"main": kernel}), determine_target("sunmmio", return_object=True))
 
 
 @tir.functor.visitor
