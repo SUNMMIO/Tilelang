@@ -5,6 +5,7 @@ import tilelang.transform as tl_transform
 from tilelang import tvm
 from tilelang.engine.phase import LowerAndLegalize
 from tilelang.utils.target import determine_target
+from tvm.script import tir as TVM_T
 
 
 def _bind(func, target):
@@ -47,6 +48,19 @@ def constant_true_where():
     return main
 
 
+def unmarked_tvm_where():
+    @T.prim_func
+    def main():
+        with T.Kernel(T.mesh_ncores()) as cid:
+            send = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            recv = T.alloc_shared((32, 32), "bfloat16")
+            with T.block("sender_only"):
+                TVM_T.where(cid == 0)
+                T.comm.put(send, recv, (0, 0), (0, 1))
+
+    return main
+
+
 def block_without_where():
     @T.prim_func
     def main():
@@ -72,6 +86,7 @@ def explicit_if():
         (explicit_block_where, "conditional"),
         (root_block_where, "tilelang_root"),
         (constant_true_where, "conditional"),
+        (unmarked_tvm_where, "sender_only"),
     ],
 )
 def test_sunmmio_rejects_explicit_where(factory, block_name):
@@ -87,15 +102,17 @@ def test_sunmmio_accepts_supported_control_flow(factory):
     _validate(factory())
 
 
-def test_non_sunmmio_target_keeps_explicit_where():
+@pytest.mark.parametrize("factory", [explicit_block_where, unmarked_tvm_where])
+def test_non_sunmmio_target_keeps_where(factory):
     target = tvm.target.Target("llvm")
-    func = explicit_block_where()
+    func = factory()
     tl_transform.ValidateSunmmioFrontendSyntax()(_bind(func, target))
 
 
-def test_sunmmio_lowering_rejects_explicit_where_before_legalization():
+@pytest.mark.parametrize("factory", [explicit_block_where, unmarked_tvm_where])
+def test_sunmmio_lowering_rejects_where_before_legalization(factory):
     target = determine_target("Sunmmio", return_object=True)
-    mod = tvm.IRModule({"main": explicit_block_where()})
+    mod = tvm.IRModule({"main": factory()})
     with (
         tvm.target.Target(target),
         pytest.raises(

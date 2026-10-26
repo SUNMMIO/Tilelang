@@ -3,8 +3,10 @@
  * \brief Reject unsupported user-facing syntax before Sunmmio lowering.
  */
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/target/target.h>
+#include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
@@ -36,13 +38,18 @@ public:
 
 private:
   void VisitStmt_(const BlockRealizeNode *op) final {
-    if (op->block->annotations.count(attr::kExplicitWhere)) {
-      LOG(FATAL) << "Sunmmio frontend does not support T.where; use an "
-                    "explicit if statement instead. Block '"
-                 << op->block->name_hint << "' has predicate " << op->predicate;
+    PrimExpr predicate = analyzer_.Simplify(op->predicate);
+    if (op->block->annotations.count(attr::kExplicitWhere) ||
+        !is_one(predicate)) {
+      LOG(FATAL) << "Sunmmio frontend does not support T.where or non-trivial "
+                    "block predicates; use an explicit if statement instead. "
+                    "Block '"
+                 << op->block->name_hint << "' has predicate " << predicate;
     }
     StmtVisitor::VisitStmt_(op);
   }
+
+  arith::Analyzer analyzer_;
 };
 
 } // namespace
