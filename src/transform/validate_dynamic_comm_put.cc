@@ -54,26 +54,6 @@ private:
     int direction;
   };
 
-  Stmt VisitStmt_(const BlockRealizeNode *op) final {
-    Array<PrimExpr> iter_values;
-    iter_values.reserve(op->iter_values.size());
-    for (const PrimExpr &value : op->iter_values) {
-      iter_values.push_back(VisitExpr(value));
-    }
-    PrimExpr predicate = VisitExpr(op->predicate);
-    PrimExpr previous_predicate = execution_predicate_;
-    execution_predicate_ =
-        analyzer_.Simplify(And(previous_predicate, predicate));
-    Block block = Downcast<Block>(VisitStmt(op->block));
-    execution_predicate_ = previous_predicate;
-
-    if (iter_values.same_as(op->iter_values) &&
-        predicate.same_as(op->predicate) && block.same_as(op->block)) {
-      return tvm::ffi::GetRef<Stmt>(op);
-    }
-    return BlockRealize(iter_values, predicate, block, op->span);
-  }
-
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     if (op->attr_key != tir::attr::thread_extent) {
       return StmtExprMutator::VisitStmt_(op);

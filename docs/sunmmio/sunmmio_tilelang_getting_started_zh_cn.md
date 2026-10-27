@@ -328,6 +328,10 @@ T.gemm(A_shared_dist, B_shared_dist, C_shared)
 - `all_gather`：多个 Core 的局部数据收集到一个更大的接收 buffer
 - `all_reduce`：对多个 Core 上相同位置的元素做归约，并把结果写到本地 shape 相同的输出 buffer；它不会归约本地 buffer 内的某个维度
 
+在 Sunmmio 上，动态 `put` 必须构成 row 或 column 内的单跳置换：`src_core` 必须是当前 `cid`，
+`dst_core(cid)` 必须能在编译期求值，并且在活动 Core 上构成双射。条件执行请使用 cycle 内一致的
+显式 `if`。当前不支持循环中的动态 `put`，也不支持 `T.where` block predicate。
+
 在 A4E 上，`all_reduce` payload 的 rank 必须为 1 到 3，并满足用户指南中说明的 multicast tile 与 1024 字节 link 连续段约束。整数 bitwise reduce 要求输入和输出均为 `int32` 或均为 `uint32`；`max`、`min` 和 `absmax` 要求 BF16 或 FP32。
 
 ## Layout

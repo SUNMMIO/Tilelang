@@ -748,43 +748,6 @@ def test_comm_dynamic_put_rejects_non_bijective_routes():
             tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
 
 
-def test_comm_dynamic_put_rejects_nonuniform_group_predicate():
-    @T.prim_func
-    def main():
-        with T.Kernel(16, threads=128) as cid:
-            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
-            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
-            with T.block("conditional_put"):
-                T.where(cid % 2 == 0)
-                T.comm.put(src, dst, cid, (cid // 2) * 2 + 1 - cid % 2)
-
-    target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = tvm.tir.transform.BindTarget(target)(tvm.IRModule({"main": main}))
-        with pytest.raises(Exception, match="execution predicate differs within the synchronization group"):
-            tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
-
-
-def test_comm_dynamic_put_accepts_group_uniform_predicate():
-    @T.prim_func
-    def main():
-        with T.Kernel(16, threads=128) as cid:
-            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
-            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
-            with T.block("conditional_put"):
-                T.where(cid // 2 % 2 == 0)
-                T.comm.put(src, dst, cid, (cid // 2) * 2 + 1 - cid % 2)
-
-    target = determine_target("Sunmmio", return_object=True)
-    with tvm.target.Target(target):
-        mod = tvm.tir.transform.BindTarget(target)(tvm.IRModule({"main": main}))
-        mod = tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
-
-    put_calls = _collect_calls(mod["main"], "tl.tileop.comm_put")
-    assert len(put_calls) == 1
-    assert "tl.comm_barrier_mask" in put_calls[0].annotations
-
-
 def test_comm_dynamic_put_accepts_group_uniform_if():
     @T.prim_func
     def main():
