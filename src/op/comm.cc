@@ -6,6 +6,7 @@
 #include "comm.h"
 
 #include <cstdint>
+#include <numeric>
 #include <tvm/tir/op.h>
 #include <utility>
 
@@ -800,18 +801,81 @@ bool IsBitwiseReduction(const StringImm &type) {
 
 void ValidateAllreduceReductionDType(const StringImm &type, DataType src_dtype,
                                      DataType dst_dtype) {
-  if (!IsBitwiseReduction(type)) {
+  if (IsBitwiseReduction(type)) {
+    auto is_supported = [](DataType dtype) {
+      return (dtype.is_int() || dtype.is_uint()) && dtype.bits() == 32 &&
+             dtype.lanes() == 1;
+    };
+    ICHECK(is_supported(src_dtype) && is_supported(dst_dtype) &&
+           src_dtype == dst_dtype)
+        << "Sunmmio bitwise all_reduce requires input and output dtypes to be "
+           "both int32 or both uint32, got "
+        << src_dtype << " and " << dst_dtype;
     return;
   }
-  auto is_supported = [](DataType dtype) {
-    return (dtype.is_int() || dtype.is_uint()) && dtype.bits() == 32 &&
-           dtype.lanes() == 1;
-  };
-  ICHECK(is_supported(src_dtype) && is_supported(dst_dtype) &&
-         src_dtype == dst_dtype)
-      << "Sunmmio bitwise all_reduce requires input and output dtypes to be "
-         "both int32 or both uint32, got "
-      << src_dtype << " and " << dst_dtype;
+
+  if (type->value == "max" || type->value == "min" || type->value == "absmax") {
+    auto is_supported = [](DataType dtype) {
+      return dtype.lanes() == 1 &&
+             (dtype.is_bfloat16() || (dtype.is_float() && dtype.bits() == 32));
+    };
+    ICHECK(is_supported(src_dtype) && is_supported(dst_dtype))
+        << "Sunmmio max/min/absmax all_reduce requires BF16 or FP32 input and "
+           "output dtypes, got "
+        << src_dtype << " and " << dst_dtype;
+  }
+}
+
+void ValidateAllreduceMulticastPayload(const BufferRegion &payload,
+                                       const char *payload_name, Target target,
+                                       arith::Analyzer *analyzer) {
+  constexpr int64_t kA4ELinkSegmentBytes = 1024;
+  int rank = static_cast<int>(payload->region.size());
+  ICHECK_GE(rank, 1)
+      << "T.comm.all_reduce input must have at least one dimension";
+  ICHECK_LE(rank, 3) << "Sunmmio A4E all_reduce supports " << payload_name
+                     << " payload rank 1 to 3, but got rank " << rank;
+
+  std::vector<int64_t> extents;
+  extents.reserve(payload->region.size());
+  for (const Range &range : payload->region) {
+    PrimExpr extent = analyzer->Simplify(range->extent);
+    const auto *imm = extent.as<IntImmNode>();
+    if (!imm) {
+      return;
+    }
+    extents.push_back(imm->value);
+  }
+
+  DataType dtype = payload->buffer->dtype;
+  ICHECK_EQ(dtype.lanes(), 1)
+      << "Sunmmio A4E all_reduce requires scalar element dtypes, but got "
+      << dtype;
+
+  int64_t segment_bytes = 0;
+  if (rank == 1) {
+    segment_bytes = extents[0] * dtype.bytes();
+  } else {
+    int block_width = GetSunmmioTileProcessorConfig(target).block_width;
+    ICHECK_EQ(extents[rank - 1] % block_width, 0)
+        << "Sunmmio A4E all_reduce requires the " << payload_name
+        << " innermost extent to be divisible by " << block_width
+        << " for multicast, but got extent " << extents[rank - 1];
+    segment_bytes =
+        std::gcd(extents[rank - 2], static_cast<int64_t>(block_width)) *
+        block_width * dtype.bytes();
+  }
+
+  ICHECK_GE(segment_bytes, kA4ELinkSegmentBytes)
+      << "Sunmmio A4E all_reduce requires the " << payload_name
+      << " worst-case contiguous multicast segment to be a positive multiple "
+         "of 1024 bytes, but got "
+      << segment_bytes << " bytes";
+  ICHECK_EQ(segment_bytes % kA4ELinkSegmentBytes, 0)
+      << "Sunmmio A4E all_reduce requires the " << payload_name
+      << " worst-case contiguous multicast segment to be a positive multiple "
+         "of 1024 bytes, but got "
+      << segment_bytes << " bytes";
 }
 
 void ValidateAllreduceTemporaryDTypes(const Buffer &src, const Buffer &dst,
@@ -913,6 +977,10 @@ void ValidateAllreduceContract(
       src->buffer, dst->buffer, row_allgather->buffer, col_allgather->buffer,
       dst_copy.defined() ? dst_copy->buffer : Buffer(), type, direction);
   ValidateMatchingAllreduceShape(dst, src, "dst", analyzer);
+  ValidateAllreduceMulticastPayload(src, "input", target, analyzer);
+  if (direction == 2 && src->buffer->dtype != dst->buffer->dtype) {
+    ValidateAllreduceMulticastPayload(dst, "output", target, analyzer);
+  }
 
   auto mesh = GetSunmmioMeshConfig(target);
   if (direction == 0 || direction == 2) {

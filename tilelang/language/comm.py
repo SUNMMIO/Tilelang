@@ -6,6 +6,7 @@ emit TIR intrinsics for inter-core communication on a target mesh.
 
 from __future__ import annotations
 
+import math
 import warnings
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -863,6 +864,38 @@ def _prepare_allreduce_operands(
     return buffer_region, out_region
 
 
+def _validate_allreduce_payload_shape(extents, dtype, operand_name: str) -> None:
+    rank = len(extents)
+    if rank < 1 or rank > 3:
+        raise ValueError(f"Sunmmio A4E all_reduce supports {operand_name} payload rank 1 to 3, but got rank {rank}.")
+
+    static_extents = [_const_int(extent) for extent in extents]
+    if any(extent is None for extent in static_extents):
+        return
+
+    if dtype.lanes != 1:
+        raise ValueError(f"Sunmmio A4E all_reduce requires scalar element dtypes, but got {dtype}.")
+
+    element_bytes = (dtype.bits + 7) // 8
+    if rank == 1:
+        segment_bytes = static_extents[0] * element_bytes
+    else:
+        inner_extent = static_extents[-1]
+        if inner_extent % 32 != 0:
+            raise ValueError(
+                f"Sunmmio A4E all_reduce requires the {operand_name} innermost extent "
+                f"to be divisible by 32 for multicast, but got shape {static_extents}."
+            )
+        segment_bytes = math.gcd(static_extents[-2], 32) * 32 * element_bytes
+
+    if segment_bytes < 1024 or segment_bytes % 1024 != 0:
+        raise ValueError(
+            f"Sunmmio A4E all_reduce requires the {operand_name} worst-case contiguous "
+            f"multicast segment to be a positive multiple of 1024 bytes, but shape "
+            f"{static_extents} with dtype {dtype} provides {segment_bytes} bytes."
+        )
+
+
 def _prepare_allreduce_temporary(buffer: tir.Buffer, access_type: str) -> tir.PrimExpr | tir.BufferRegion:
     if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION:
         return _encode_full_buffer_region(buffer, access_type, "T.comm.all_reduce")
@@ -1095,6 +1128,14 @@ def all_reduce(
     reduce_type = reduce_type.lower()
     assert reduce_type in REDUCE_TYPE_LIST, f"Reduction op must be one of {REDUCE_TYPE_LIST}, but got {reduce_type}."
 
+    direction = direction.lower()
+    assert direction in DIRECTION_MAP, f"Invalid direction string: {direction}"
+    direction_id = DIRECTION_MAP[direction]
+
+    _validate_allreduce_payload_shape(src_shape, src_dtype, "input")
+    if direction_id == 2 and out_dtype != src_dtype:
+        _validate_allreduce_payload_shape(out_shape, out_dtype, "output")
+
     if reduce_type in ("bitand", "bitor", "bitxor"):
         integer_type_codes = (DataTypeCode.INT, DataTypeCode.UINT)
         assert (
@@ -1110,8 +1151,21 @@ def all_reduce(
             f"but got {src_dtype} and {out_dtype}."
         )
 
-    direction = direction.lower()
-    assert direction in DIRECTION_MAP, f"Invalid direction string: {direction}"
+    if reduce_type in ("max", "min", "absmax"):
+
+        def is_supported_minmax_dtype(dtype):
+            return dtype.lanes == 1 and (
+                (dtype.type_code == DataTypeCode.BFLOAT and dtype.bits == 16)
+                or (dtype.type_code == DataTypeCode.FLOAT and dtype.bits == 32)
+            )
+
+        supported_src = is_supported_minmax_dtype(src_dtype)
+        supported_out = is_supported_minmax_dtype(out_dtype)
+        if not (supported_src and supported_out):
+            raise ValueError(
+                f"Sunmmio max/min/absmax all_reduce requires BF16 or FP32 input and output dtypes, but got {src_dtype} and {out_dtype}."
+            )
+
     assert clear in [True, False], "clear must be a boolean value."
 
     mesh_nrows = T.mesh_nrows()
@@ -1127,7 +1181,6 @@ def all_reduce(
             return T.alloc_shared(shape, dtype, scope=out_scope)
         return T.alloc_fragment(shape, dtype, scope=out_scope)
 
-    direction_id = DIRECTION_MAP[direction]
     if direction_id == 0:
         row_allgather = alloc_tmp([mesh_ncols] + list(src_shape), src_dtype)
         row_allgather_region = _prepare_allreduce_temporary(row_allgather, "rw")

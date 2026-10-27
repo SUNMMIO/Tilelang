@@ -115,6 +115,25 @@ def _allreduce_frontend_kernel(
     return main
 
 
+def _allreduce_payload_kernel(
+    shape,
+    dtype="float32",
+    out_dtype=None,
+    reduce_type="sum",
+    direction="h",
+):
+    out_dtype = dtype if out_dtype is None else out_dtype
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            src = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            out = T.alloc_shared(shape, out_dtype, scope="shared.rsram")
+            T.comm.all_reduce(src, out, reduce_type, direction)
+
+    return main
+
+
 @pytest.mark.parametrize(
     "M, N, block_M, block_N, dtype, accum_dtype",
     [
@@ -264,6 +283,64 @@ def test_comm_allreduce_mixed_dtype_uses_stage_dtypes():
 
     assert str(_region_buffer(call.args[2]).dtype) == "float32"
     assert str(_region_buffer(call.args[3]).dtype) == "bfloat16"
+
+
+@pytest.mark.parametrize(
+    "shape,dtype,error_msg",
+    [
+        ((32,), "float32", "worst-case contiguous multicast segment"),
+        ((256,), "bfloat16", "worst-case contiguous multicast segment"),
+        ((1, 32), "float32", "worst-case contiguous multicast segment"),
+        ((32, 1), "float32", "innermost extent"),
+        ((32, 1, 32), "float32", "worst-case contiguous multicast segment"),
+        ((32, 32, 1), "float32", "innermost extent"),
+        ((2, 2, 32, 32), "float32", "payload rank 1 to 3"),
+    ],
+)
+def test_comm_allreduce_rejects_unsupported_a4e_payload_shapes(shape, dtype, error_msg):
+    with pytest.raises(ValueError, match=error_msg):
+        _allreduce_payload_kernel(shape, dtype=dtype)
+
+
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [
+        ((256,), "float32"),
+        ((512,), "bfloat16"),
+        ((8, 32), "float32"),
+        ((16, 32), "bfloat16"),
+        ((1, 8, 32), "float32"),
+        ((1, 16, 32), "bfloat16"),
+        ((2, 32, 32), "float32"),
+    ],
+)
+def test_comm_allreduce_accepts_a4e_payload_shape_boundaries(shape, dtype):
+    (call,) = _collect_calls(
+        _allreduce_payload_kernel(shape, dtype=dtype),
+        "tl.tileop.comm_allreduce",
+    )
+    assert [int(extent) for extent in _region_buffer(call.args[0]).shape] == list(shape)
+
+
+def test_comm_allreduce_validates_second_stage_mixed_dtype_payload():
+    with pytest.raises(ValueError, match="output worst-case contiguous multicast segment"):
+        _allreduce_payload_kernel(
+            (8, 32),
+            dtype="float32",
+            out_dtype="bfloat16",
+            direction="all",
+        )
+
+
+@pytest.mark.parametrize("reduce_type", ["max", "min", "absmax"])
+@pytest.mark.parametrize("dtype", ["int32", "uint32", "float16"])
+def test_comm_allreduce_rejects_unsupported_minmax_dtypes(reduce_type, dtype):
+    with pytest.raises(ValueError, match="requires BF16 or FP32 input and output dtypes"):
+        _allreduce_payload_kernel(
+            (32, 32),
+            dtype=dtype,
+            reduce_type=reduce_type,
+        )
 
 
 def test_comm_buffer_like_region_python_api():

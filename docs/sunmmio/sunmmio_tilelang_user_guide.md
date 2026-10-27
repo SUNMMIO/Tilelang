@@ -865,6 +865,13 @@ T.comm.all_reduce(buffer, out, reduce_type, direction, clear=True)
 
 The input and output regions must have the same rank and extents. Use `T.reduce` when a dimension inside the local buffer must also be reduced.
 
+The current A4E lowering accepts payload rank 1 to 3 and requires every multicast tile to provide a link-legal contiguous segment. For static shapes:
+
+- Rank 1 requires `extent * element_bytes` to be a positive multiple of 1024 bytes.
+- Rank 2 or 3 requires the innermost extent to be divisible by 32 and `gcd(penultimate_extent, 32) * 32 * element_bytes` to be a positive multiple of 1024 bytes.
+
+`"max"`, `"min"`, and `"absmax"` require BF16 or FP32 input and output. `"bitand"`, `"bitor"`, and `"bitxor"` require matching `int32` or matching `uint32` input and output.
+
 ### 3.7 GEMM
 
 **`T.gemm`**

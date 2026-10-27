@@ -328,6 +328,8 @@ Their purposes are:
 - `all_gather`: Collect local data from multiple Cores into a larger receive buffer.
 - `all_reduce`: Reduce corresponding elements across multiple Cores and write the result to an output buffer with the same local shape. It does not reduce a dimension inside the local buffer.
 
+On A4E, `all_reduce` payloads must have rank 1 to 3 and satisfy the multicast tile and 1024-byte link-segment constraints described in the user guide. Integer bitwise reductions require matching `int32` or `uint32`; `max`, `min`, and `absmax` require BF16 or FP32.
+
 ## Layout
 
 ### 1. What Is a Layout?

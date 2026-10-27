@@ -670,6 +670,56 @@ def _make_comm_kernel(comm_case):
                     )
                 )
 
+    elif comm_case in {
+        "allreduce_low_level_small_payload",
+        "allreduce_low_level_trailing_unit",
+        "allreduce_low_level_rank4",
+        "allreduce_low_level_integer_max",
+    }:
+        if comm_case == "allreduce_low_level_small_payload":
+            send_shape = (32,)
+        elif comm_case == "allreduce_low_level_trailing_unit":
+            send_shape = (32, 1)
+        elif comm_case == "allreduce_low_level_rank4":
+            send_shape = (2, 2, 32, 32)
+        else:
+            send_shape = (32, 32)
+        gather_shape = (4, *send_shape)
+        reduce_dtype = "int32" if comm_case == "allreduce_low_level_integer_max" else "float32"
+        reduce_type = "max" if comm_case == "allreduce_low_level_integer_max" else "sum"
+        send_zero = tuple(0 for _ in send_shape)
+        gather_zero = tuple(0 for _ in gather_shape)
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel() as bx:
+                A_shared = T.alloc_shared(send_shape, reduce_dtype)
+                Out_shared = T.alloc_shared(send_shape, reduce_dtype)
+                Row_gather = T.alloc_shared(gather_shape, reduce_dtype)
+                Col_gather = T.alloc_shared(gather_shape, reduce_dtype)
+                T.annotate_layout(
+                    {
+                        A_shared: make_row_major(send_shape),
+                        Out_shared: make_row_major(send_shape),
+                        Row_gather: make_row_major(gather_shape),
+                        Col_gather: make_row_major(gather_shape),
+                    }
+                )
+                T.evaluate(
+                    tvm.tir.call_intrin(
+                        "handle",
+                        tvm.tir.op.Op.get("tl.tileop.comm_allreduce"),
+                        _tile_region(A_shared[send_zero], "r", *send_shape),
+                        _tile_region(Out_shared[send_zero], "w", *send_shape),
+                        _tile_region(Row_gather[gather_zero], "rw", *gather_shape),
+                        _tile_region(Col_gather[gather_zero], "rw", *gather_shape),
+                        reduce_type,
+                        0,
+                        T.bool(True),
+                        bx,
+                    )
+                )
+
     else:
         raise ValueError(f"unknown comm case: {comm_case}")
 
@@ -831,6 +881,10 @@ def test_sunmmio_validate_tile_view_regions_rejects_comm_regions(comm_case, erro
             "Sunmmio bitwise all_reduce requires input and output dtypes to be both int32 or both uint32",
         ),
         ("allreduce_low_level_missing_dst_copy", "dst_copy must be provided only"),
+        ("allreduce_low_level_small_payload", "contiguous multicast segment"),
+        ("allreduce_low_level_trailing_unit", "innermost extent"),
+        ("allreduce_low_level_rank4", "payload rank 1 to 3"),
+        ("allreduce_low_level_integer_max", "requires BF16 or FP32 input and output dtypes"),
     ],
 )
 def test_sunmmio_validate_tile_view_regions_rejects_invalid_allreduce_contract(comm_case, error_msg):

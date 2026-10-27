@@ -122,6 +122,18 @@ def comm_all_reduce_horizontal_kernel(
 
 
 @target("Sunmmio")
+def comm_all_reduce_payload_kernel(shape, dtype="float32"):
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            reduce_src = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            reduced = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            T.comm.all_reduce(reduce_src, reduced, "sum", "horizontal")
+
+    return main
+
+
+@target("Sunmmio")
 def sync_simple_copy_kernel(M=128, N=128, block_M=32, block_N=32, dtype="bfloat16"):
     @T.prim_func
     def main(
@@ -310,6 +322,32 @@ def test_comm_all_reduce_horizontal_codegen_validates_with_npuir_opt(tmp_path):
     mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
     assert len(mcast_lines) == 1
     assert mcast_lines[0].count("!suvm.tile_view<2x32x32xf32>") == 2
+
+
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [
+        ((256,), "float32"),
+        ((512,), "bfloat16"),
+        ((8, 32), "float32"),
+        ((16, 32), "bfloat16"),
+        ((1, 8, 32), "float32"),
+        ((1, 16, 32), "bfloat16"),
+    ],
+)
+def test_comm_all_reduce_payload_boundary_codegen_validates_with_npuir_opt(
+    shape,
+    dtype,
+    tmp_path,
+):
+    src = _validate_kernel(
+        comm_all_reduce_payload_kernel(shape, dtype),
+        tmp_path,
+        mlir_filename=f"comm_all_reduce_{dtype}_{'x'.join(map(str, shape))}_suvm.mlir",
+        expected_tokens=("suvm.mcast_async",),
+        opt_args=STRICT_OPT_ARGS,
+    )
+    assert len(find_async_op_lines(src, "suvm.mcast_async")) == 1
 
 
 @pytest.mark.parametrize(

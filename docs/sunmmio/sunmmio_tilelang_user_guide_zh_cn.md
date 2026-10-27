@@ -865,6 +865,13 @@ T.comm.all_reduce(buffer, out, reduce_type, direction, clear=True)
 
 输入和输出 region 必须具有相同的 rank 和各维 extent。若还需要归约本地 buffer 内的某个维度，应使用 `T.reduce`。
 
+当前 A4E lowering 支持 rank 1 到 3 的 payload，并要求每个 multicast tile 都具有满足 link 约束的连续数据段。对于静态 shape：
+
+- rank 1 要求 `extent * element_bytes` 是 1024 字节的正整数倍；
+- rank 2 或 rank 3 要求最内层 extent 能被 32 整除，并且 `gcd(倒数第二维 extent, 32) * 32 * element_bytes` 是 1024 字节的正整数倍。
+
+`"max"`、`"min"` 和 `"absmax"` 要求输入与输出为 BF16 或 FP32；`"bitand"`、`"bitor"` 和 `"bitxor"` 要求输入与输出均为 `int32` 或均为 `uint32`。
+
 ### 3.7 GEMM
 
 **`T.gemm`**
