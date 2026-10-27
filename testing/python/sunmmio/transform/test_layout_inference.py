@@ -15,7 +15,7 @@ from tilelang.utils.target import determine_target
 import tilelang as tl
 import tilelang.language as T
 import tilelang.env as env
-from tilelang.layout import make_zz_layout, make_zn_layout
+from tilelang.layout import make_zz_layout, make_nz_layout
 
 tilelang.env.disable_cache()
 
@@ -136,7 +136,7 @@ def _per_dim_modes(layout):
 
 
 def layout_kind(layout):
-    """Classify a CuteLayout as RowMajor, ZZ (any ZZ-like: ZZ/ZZZ/NZZ), or ZN.
+    """Classify a CuteLayout as RowMajor, ZZ (any ZZ-like: ZZ/ZZZ/ZZN), or NZ.
     Mirrors C++ ``sunmmio::IsZZLike``: among the last two blocked dims, ZZ-like
     means the higher-indexed dim's innermost stride is smaller."""
     dims = _per_dim_modes(layout)
@@ -147,8 +147,8 @@ def layout_kind(layout):
     s0 = dims[ax0]["stride"][0]
     s1 = dims[ax1]["stride"][0]
     if isinstance(s0, int) and isinstance(s1, int):
-        return "ZZ" if s1 < s0 else "ZN"
-    return "ZZ" if s1 == 1 else "ZN"  # fallback: inner stride 1 is ZZ-like
+        return "ZZ" if s1 < s0 else "NZ"
+    return "ZZ" if s1 == 1 else "NZ"  # fallback: inner stride 1 is ZZ-like
 
 
 def block_shape(layout):
@@ -174,7 +174,7 @@ def assert_layout(layouts, name, kind, block=(32, 32)):
 
 
 # ---------------------------------------------------------------------------
-# Test: GEMM layout values — ZZ for A/C, ZZ/ZN for B based on transB
+# Test: GEMM layout values — ZZ for A/C, ZZ/NZ for B based on transB
 # ---------------------------------------------------------------------------
 
 M, N, K = 128, 128, 64
@@ -234,7 +234,7 @@ def gemm_kernel_transB():
 
 
 def test_gemm_layout_inference():
-    """Verify Gemm assigns ZZ to A(ASRAM), ZN to B(WSRAM, transB=False), ZZ to C(RSRAM)."""
+    """Verify Gemm assigns ZZ to A(ASRAM), NZ to B(WSRAM, transB=False), ZZ to C(RSRAM)."""
     target = determine_target("Sunmmio", return_object=True)
     layouts = run_sunmmio_layout_inference(gemm_kernel_notransB(), target)
 
@@ -242,14 +242,14 @@ def test_gemm_layout_inference():
     for name in ("A", "B", "C"):
         assert name in layouts, f"{name} (DRAM) not in layouts, got {sorted(layouts)}"
 
-    # A (ASRAM): ZZ, B (WSRAM): ZN (transB=False, TMM.MN), C (RSRAM): ZZ — fp16 block (32,32)
+    # A (ASRAM): ZZ, B (WSRAM): NZ (transB=False, TMM.MN), C (RSRAM): ZZ — fp16 block (32,32)
     assert_layout(layouts, "A_shared", "ZZ", block=(32, 32))
-    assert_layout(layouts, "B_shared", "ZN", block=(32, 32))
+    assert_layout(layouts, "B_shared", "NZ", block=(32, 32))
     assert_layout(layouts, "C_shared", "ZZ", block=(32, 32))
 
 
 def test_gemm_transB_layout_inference():
-    """Verify Gemm with transB=True assigns ZZ (not ZN) to B(WSRAM)."""
+    """Verify Gemm with transB=True assigns ZZ (not NZ) to B(WSRAM)."""
     target = determine_target("Sunmmio", return_object=True)
     layouts = run_sunmmio_layout_inference(gemm_kernel_transB(), target)
 
@@ -479,17 +479,17 @@ def test_reduce_3d_zz_blocked_axis_gives_row_major():
 
 
 # ---------------------------------------------------------------------------
-# Test: 3D ZN, reduce along outer axis → preserves 2D ZN
+# Test: 3D NZ, reduce along outer axis → preserves 2D NZ
 # ---------------------------------------------------------------------------
 
 
-def reduce_3d_zn_outer_axis_kernel():
-    """3D ZN on dims [1,2], reduce along dim 0 (outer axis)."""
+def reduce_3d_nz_outer_axis_kernel():
+    """3D NZ on dims [1,2], reduce along dim 0 (outer axis)."""
     batch = 8
     block_M, block_N = 64, 64
     dtype = T.float16
 
-    zn_3d = make_zn_layout((batch, block_M, block_N), axes=[1, 2], block_shape=[32, 32])
+    nz_3d = make_nz_layout((batch, block_M, block_N), axes=[1, 2], block_shape=[32, 32])
 
     @T.prim_func
     def main(
@@ -500,7 +500,7 @@ def reduce_3d_zn_outer_axis_kernel():
             A_shared = T.alloc_shared((batch, block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
 
-            T.annotate_layout({A_shared: zn_3d})
+            T.annotate_layout({A_shared: nz_3d})
             T.copy(A[0, 0, 0], A_shared)
             T.reduce_sum(A_shared, B_shared, dim=0)
             T.copy(B_shared, B[0, 0])
@@ -508,13 +508,13 @@ def reduce_3d_zn_outer_axis_kernel():
     return tvm.IRModule({"main": main})
 
 
-def test_reduce_3d_zn_outer_axis_preserves_zn():
-    """3D ZN, reduce along outer axis (dim=0) → dst should preserve 2D ZN."""
+def test_reduce_3d_nz_outer_axis_preserves_nz():
+    """3D NZ, reduce along outer axis (dim=0) → dst should preserve 2D NZ."""
     target = determine_target("Sunmmio", return_object=True)
-    layouts = run_sunmmio_layout_inference(reduce_3d_zn_outer_axis_kernel(), target)
+    layouts = run_sunmmio_layout_inference(reduce_3d_nz_outer_axis_kernel(), target)
 
-    # Reducing the outer axis of a 3D ZN preserves ZN on the 2D result.
-    assert_layout(layouts, "dst_buffer", "ZN", block=(32, 32))
+    # Reducing the outer axis of a 3D NZ preserves NZ on the 2D result.
+    assert_layout(layouts, "dst_buffer", "NZ", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -646,16 +646,16 @@ def test_broadcast_propagates_zz():
 
 
 # ---------------------------------------------------------------------------
-# Test: Broadcast propagates annotated ZN layout
+# Test: Broadcast propagates annotated NZ layout
 # ---------------------------------------------------------------------------
 
 
-def broadcast_zn_kernel():
-    """Annotate src with ZN, broadcast to dst — dst should get ZN."""
+def broadcast_nz_kernel():
+    """Annotate src with NZ, broadcast to dst — dst should get NZ."""
     block_M, block_N = 64, 64
     dtype = T.float16
 
-    zn_layout = make_zn_layout((block_M, block_N), axes=[0, 1], block_shape=[32, 32])
+    nz_layout = make_nz_layout((block_M, block_N), axes=[0, 1], block_shape=[32, 32])
 
     @T.prim_func
     def main(
@@ -666,7 +666,7 @@ def broadcast_zn_kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
 
-            T.annotate_layout({A_shared: zn_layout})
+            T.annotate_layout({A_shared: nz_layout})
             T.copy(A[0, 0], A_shared)
             T.comm.broadcast(A_shared, B_shared, (1, 2), direction="all")
             T.copy(B_shared, B[0, 0])
@@ -674,13 +674,13 @@ def broadcast_zn_kernel():
     return tvm.IRModule({"main": main})
 
 
-def test_broadcast_propagates_zn():
-    """Broadcast: src annotated ZN → dst should also get ZN (not ZZ)."""
+def test_broadcast_propagates_nz():
+    """Broadcast: src annotated NZ → dst should also get NZ (not ZZ)."""
     target = determine_target("Sunmmio", return_object=True)
-    layouts = run_sunmmio_layout_inference(broadcast_zn_kernel(), target)
+    layouts = run_sunmmio_layout_inference(broadcast_nz_kernel(), target)
 
-    # Annotated ZN src → dst also gets ZN.
-    assert_layout(layouts, "B_shared", "ZN", block=(32, 32))
+    # Annotated NZ src → dst also gets NZ.
+    assert_layout(layouts, "B_shared", "NZ", block=(32, 32))
 
 
 def broadcast_from_global_to_rsram_kernel():
@@ -857,14 +857,14 @@ def test_allgather_propagates_row_major():
 
 
 def gemm_annotate_conflict_asram_kernel():
-    """Annotate ASRAM buffer with ZN, but Gemm.A requires ZZ → conflict."""
+    """Annotate ASRAM buffer with NZ, but Gemm.A requires ZZ → conflict."""
     block_M, block_K = 64, 32
     block_N = 64
     dtype = T.float16
     accum_dtype = T.float32
 
-    # ZN layout — incompatible with Gemm.A's ZZ requirement
-    wrong_layout = make_zn_layout((block_M, block_K), axes=[0, 1], block_shape=[32, 32])
+    # NZ layout — incompatible with Gemm.A's ZZ requirement
+    wrong_layout = make_nz_layout((block_M, block_K), axes=[0, 1], block_shape=[32, 32])
 
     @T.prim_func
     def main(
@@ -888,7 +888,7 @@ def gemm_annotate_conflict_asram_kernel():
 
 
 def test_immutable_conflict_annotate_vs_gemm():
-    """T.annotate_layout(ZN) on ASRAM buffer conflicts with Gemm's ZZ → hard error."""
+    """T.annotate_layout(NZ) on ASRAM buffer conflicts with Gemm's ZZ → hard error."""
     target = determine_target("Sunmmio", return_object=True)
     mod = gemm_annotate_conflict_asram_kernel()
     with pytest.raises(Exception, match="immutable layout"):
@@ -896,13 +896,13 @@ def test_immutable_conflict_annotate_vs_gemm():
 
 
 def gemm_annotate_conflict_wsram_kernel():
-    """Annotate WSRAM buffer with ZZ, but Gemm.B (transB=False) requires ZN → conflict."""
+    """Annotate WSRAM buffer with ZZ, but Gemm.B (transB=False) requires NZ → conflict."""
     block_M, block_K = 64, 32
     block_N = 64
     dtype = T.float16
     accum_dtype = T.float32
 
-    # ZZ layout — incompatible with Gemm.B's ZN requirement when transB=False
+    # ZZ layout — incompatible with Gemm.B's NZ requirement when transB=False
     wrong_layout = make_zz_layout((block_K, block_N), axes=[0, 1], block_shape=[32, 32])
 
     @T.prim_func
@@ -927,7 +927,7 @@ def gemm_annotate_conflict_wsram_kernel():
 
 
 def test_immutable_conflict_wsram_annotate_vs_gemm():
-    """T.annotate_layout(ZZ) on WSRAM buffer conflicts with Gemm.B(transB=False)'s ZN → hard error."""
+    """T.annotate_layout(ZZ) on WSRAM buffer conflicts with Gemm.B(transB=False)'s NZ → hard error."""
     target = determine_target("Sunmmio", return_object=True)
     mod = gemm_annotate_conflict_wsram_kernel()
     with pytest.raises(Exception, match="immutable layout"):
@@ -935,14 +935,14 @@ def test_immutable_conflict_wsram_annotate_vs_gemm():
 
 
 def gemm_annotate_conflict_rsram_kernel():
-    """Annotate RSRAM buffer with ZN, but Gemm.C requires ZZ → conflict."""
+    """Annotate RSRAM buffer with NZ, but Gemm.C requires ZZ → conflict."""
     block_M, block_N = 64, 64
     block_K = 32
     dtype = T.float16
     accum_dtype = T.float32
 
-    # ZN layout — incompatible with Gemm.C's ZZ requirement
-    wrong_layout = make_zn_layout((block_M, block_N), axes=[0, 1], block_shape=[32, 32])
+    # NZ layout — incompatible with Gemm.C's ZZ requirement
+    wrong_layout = make_nz_layout((block_M, block_N), axes=[0, 1], block_shape=[32, 32])
 
     @T.prim_func
     def main(
@@ -966,7 +966,7 @@ def gemm_annotate_conflict_rsram_kernel():
 
 
 def test_immutable_conflict_rsram_annotate_vs_gemm():
-    """T.annotate_layout(ZN) on RSRAM buffer conflicts with Gemm.C's ZZ → hard error."""
+    """T.annotate_layout(NZ) on RSRAM buffer conflicts with Gemm.C's ZZ → hard error."""
     target = determine_target("Sunmmio", return_object=True)
     mod = gemm_annotate_conflict_rsram_kernel()
     with pytest.raises(Exception, match="immutable layout"):
@@ -974,12 +974,12 @@ def test_immutable_conflict_rsram_annotate_vs_gemm():
 
 
 # ---------------------------------------------------------------------------
-# Test: DRAM ZN layout → Copy to ASRAM should fail IsZZLike validation
+# Test: DRAM NZ layout → Copy to ASRAM should fail IsZZLike validation
 # ---------------------------------------------------------------------------
 
 
-def dram_zn_to_asram_kernel():
-    """DRAM buffer with ZN layout (via MeshTensor) copied to ASRAM → IsZZLike check should fail."""
+def dram_nz_to_asram_kernel():
+    """DRAM buffer with NZ layout (via MeshTensor) copied to ASRAM → IsZZLike check should fail."""
 
     M, K, N = 64, 32, 64
     block_M, block_K, block_N = 64, 32, 64
@@ -988,10 +988,10 @@ def dram_zn_to_asram_kernel():
 
     policy = T.placement.full_shard(0, 1)
 
-    # ZN layout on DRAM — incompatible with ASRAM (Gemm.A requires ZZ-like)
-    zn_dram = make_zn_layout((M, K), axes=[0, 1], block_shape=[32, 32])
+    # NZ layout on DRAM — incompatible with ASRAM (Gemm.A requires ZZ-like)
+    nz_dram = make_nz_layout((M, K), axes=[0, 1], block_shape=[32, 32])
 
-    A_tensor = T.MeshTensor((M, K), policy, dtype=dtype, layout=zn_dram)
+    A_tensor = T.MeshTensor((M, K), policy, dtype=dtype, layout=nz_dram)
     B_tensor = T.MeshTensor((K, N), policy, dtype=dtype)
     C_tensor = T.MeshTensor((M, N), policy, dtype=accum_dtype)
 
@@ -1011,28 +1011,28 @@ def dram_zn_to_asram_kernel():
     return tvm.IRModule({"main": kernel})
 
 
-def test_dram_zn_to_asram_succeeds_via_staged_rsram():
-    """DRAM with ZN layout → Copy to ASRAM succeeds via LegalizeSunmmioDataPath staging through RSRAM.
+def test_dram_nz_to_asram_succeeds_via_staged_rsram():
+    """DRAM with NZ layout → Copy to ASRAM succeeds via LegalizeSunmmioDataPath staging through RSRAM.
 
     LegalizeSunmmioDataPath rewrites global→asram into global→rsram + rsram→asram,
     so layout inference assigns a ZZ layout to the ASRAM buffer regardless of the
     DRAM layout.
     """
     target = determine_target("Sunmmio", return_object=True)
-    layouts = run_sunmmio_layout_inference(dram_zn_to_asram_kernel(), target)
+    layouts = run_sunmmio_layout_inference(dram_nz_to_asram_kernel(), target)
 
     # LegalizeSunmmioDataPath stages global→asram through RSRAM, so the ASRAM
-    # buffer still gets an inferred layout despite the DRAM ZN source.
+    # buffer still gets an inferred layout despite the DRAM NZ source.
     assert "A_shared" in layouts, f"A_shared should have an inferred layout. Got: {sorted(layouts)}"
 
 
 # ---------------------------------------------------------------------------
-# Test: DRAM ZN layout → Copy to WSRAM should also fail IsZZLike validation
+# Test: DRAM NZ layout → Copy to WSRAM should also fail IsZZLike validation
 # ---------------------------------------------------------------------------
 
 
-def dram_zn_to_wsram_kernel():
-    """DRAM buffer with ZN layout (via MeshTensor) copied to WSRAM → IsZZLike check should fail."""
+def dram_nz_to_wsram_kernel():
+    """DRAM buffer with NZ layout (via MeshTensor) copied to WSRAM → IsZZLike check should fail."""
 
     M, K, N = 64, 32, 64
     block_M, block_K, block_N = 64, 32, 64
@@ -1041,11 +1041,11 @@ def dram_zn_to_wsram_kernel():
 
     policy = T.placement.full_shard(0, 1)
 
-    # ZN layout on DRAM B — incompatible with WSRAM DMA (requires ZZ-like)
-    zn_dram = make_zn_layout((K, N), axes=[0, 1], block_shape=[32, 32])
+    # NZ layout on DRAM B — incompatible with WSRAM DMA (requires ZZ-like)
+    nz_dram = make_nz_layout((K, N), axes=[0, 1], block_shape=[32, 32])
 
     A_tensor = T.MeshTensor((M, K), policy, dtype=dtype)
-    B_tensor = T.MeshTensor((K, N), policy, dtype=dtype, layout=zn_dram)
+    B_tensor = T.MeshTensor((K, N), policy, dtype=dtype, layout=nz_dram)
     C_tensor = T.MeshTensor((M, N), policy, dtype=accum_dtype)
 
     @T.prim_func
@@ -1064,10 +1064,10 @@ def dram_zn_to_wsram_kernel():
     return tvm.IRModule({"main": kernel})
 
 
-def test_dram_zn_to_wsram_fails():
-    """DRAM with ZN layout → Copy to WSRAM should fail (IsZZLike rejects ZN)."""
+def test_dram_nz_to_wsram_fails():
+    """DRAM with NZ layout → Copy to WSRAM should fail (IsZZLike rejects NZ)."""
     target = determine_target("Sunmmio", return_object=True)
-    mod = dram_zn_to_wsram_kernel()
+    mod = dram_nz_to_wsram_kernel()
     with pytest.raises(Exception, match="ZZ-like DRAM layout"):
         run_sunmmio_layout_inference(mod, target)
 
@@ -1081,7 +1081,7 @@ def gemm_correct_annotate_kernel():
     """Annotate all three Gemm buffers with the correct hardware-mandated layouts.
 
     A (ASRAM): ZZ(32,32) for fp16
-    B (WSRAM): ZN(32,32) for transB=False
+    B (WSRAM): NZ(32,32) for transB=False
     C (RSRAM): ZZ(32,32) for fp32
     """
     block_M, block_K = 64, 32
@@ -1090,7 +1090,7 @@ def gemm_correct_annotate_kernel():
     accum_dtype = T.float32
 
     correct_a = make_zz_layout((block_M, block_K), axes=[0, 1], block_shape=[32, 32])
-    correct_b = make_zn_layout((block_K, block_N), axes=[0, 1], block_shape=[32, 32])
+    correct_b = make_nz_layout((block_K, block_N), axes=[0, 1], block_shape=[32, 32])
     correct_c = make_zz_layout((block_M, block_N), axes=[0, 1], block_shape=[32, 32])
 
     @T.prim_func
@@ -1128,7 +1128,7 @@ def test_correct_annotate_accepted():
 
     # The annotated layouts are preserved.
     assert_layout(layouts, "A_shared", "ZZ", block=(32, 32))
-    assert_layout(layouts, "B_shared", "ZN", block=(32, 32))
+    assert_layout(layouts, "B_shared", "NZ", block=(32, 32))
     assert_layout(layouts, "C_shared", "ZZ", block=(32, 32))
 
 
@@ -1201,12 +1201,12 @@ def test_copy_reduce_copy_layout_derivation():
 
 
 def broadcast_mismatched_layouts_kernel():
-    """Annotate src with ZZ and dst with ZN — both immutable, broadcast derives conflict."""
+    """Annotate src with ZZ and dst with NZ — both immutable, broadcast derives conflict."""
     block_M, block_N = 64, 64
     dtype = T.float16
 
     zz_layout = make_zz_layout((block_M, block_N), axes=[0, 1], block_shape=[32, 32])
-    zn_layout = make_zn_layout((block_M, block_N), axes=[0, 1], block_shape=[32, 32])
+    nz_layout = make_nz_layout((block_M, block_N), axes=[0, 1], block_shape=[32, 32])
 
     @T.prim_func
     def main(
@@ -1217,7 +1217,7 @@ def broadcast_mismatched_layouts_kernel():
             A_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
             B_shared = T.alloc_shared((block_M, block_N), dtype, scope="shared.rsram")
 
-            T.annotate_layout({A_shared: zz_layout, B_shared: zn_layout})
+            T.annotate_layout({A_shared: zz_layout, B_shared: nz_layout})
             T.copy(A[0, 0], A_shared)
             T.comm.broadcast(A_shared, B_shared, (1, 2), direction="all")
             T.copy(B_shared, B[0, 0])
@@ -1239,7 +1239,7 @@ def test_broadcast_mismatched_immutable_preserves_annotations():
     layouts = run_sunmmio_layout_inference(broadcast_mismatched_layouts_kernel(), target)
 
     assert_layout(layouts, "A_shared", "ZZ", block=(32, 32))
-    assert_layout(layouts, "B_shared", "ZN", block=(32, 32))
+    assert_layout(layouts, "B_shared", "NZ", block=(32, 32))
 
 
 # ---------------------------------------------------------------------------
@@ -1314,9 +1314,9 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, versio
         mod = matmul(M, N, K, block_M, block_N, block_K, version)
     layouts = run_sunmmio_layout_inference(mod, target)
 
-    # A (ASRAM): ZZ, B (WSRAM): ZN (transB=False), C (RSRAM): ZZ — block (32,32) for fp16
+    # A (ASRAM): ZZ, B (WSRAM): NZ (transB=False), C (RSRAM): ZZ — block (32,32) for fp16
     assert_layout(layouts, "A_shared", "ZZ", block=(32, 32))
-    assert_layout(layouts, "B_shared", "ZN", block=(32, 32))
+    assert_layout(layouts, "B_shared", "NZ", block=(32, 32))
     assert_layout(layouts, "C_shared", "ZZ", block=(32, 32))
 
 
@@ -1372,11 +1372,11 @@ def test_tilelang_sunmmio_persistent_gemm():
 
     # gemm(A_shared_dist, B_shared_dist, C_shared) operand layouts:
     assert_layout(layouts, "A_shared_dist", "ZZ", block=(32, 32))  # ASRAM, left operand
-    assert_layout(layouts, "B_shared_dist", "ZN", block=(32, 32))  # WSRAM, right operand (transB=False)
+    assert_layout(layouts, "B_shared_dist", "NZ", block=(32, 32))  # WSRAM, right operand (transB=False)
     assert_layout(layouts, "C_shared", "ZZ", block=(32, 32))  # RSRAM, accumulator
 
-    # The all_gather staging src into the ZN WSRAM operand stays ZZ — a ZN
-    # WSRAM dst legally accepts a ZZ src, so comm must not force it to ZN.
+    # The all_gather staging src into the NZ WSRAM operand stays ZZ — a NZ
+    # WSRAM dst legally accepts a ZZ src, so comm must not force it to NZ.
     assert_layout(layouts, "B_shared", "ZZ", block=(32, 32))
 
 

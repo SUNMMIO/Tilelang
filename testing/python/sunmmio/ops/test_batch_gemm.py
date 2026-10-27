@@ -24,6 +24,7 @@ def batch_gemm(
     output_batched=True,
     partial=False,
     w_batch=None,
+    explicit_scopes=False,
 ):
     a_shape = (batch, 32, 32) if a_batched else (32, 32)
     w_shape = (w_batch if w_batch is not None else batch, 32, 32) if w_batched else (32, 32)
@@ -32,9 +33,21 @@ def batch_gemm(
     @T.prim_func
     def main(A: T.Tensor(a_shape, "bfloat16"), W: T.Tensor(w_shape, "bfloat16")):
         with T.Kernel():
-            a = T.alloc_shared(a_shape, "bfloat16")
-            w = T.alloc_shared(w_shape, "bfloat16")
-            c = T.alloc_shared(c_shape, "float32")
+            a = T.alloc_shared(
+                a_shape,
+                "bfloat16",
+                scope="shared.asram" if explicit_scopes else "shared.dyn",
+            )
+            w = T.alloc_shared(
+                w_shape,
+                "bfloat16",
+                scope="shared.wsram" if explicit_scopes else "shared.dyn",
+            )
+            c = T.alloc_shared(
+                c_shape,
+                "float32",
+                scope="shared.rsram" if explicit_scopes else "shared.dyn",
+            )
             if a_batched:
                 T.copy(A[0, 0, 0], a)
             else:
@@ -220,6 +233,15 @@ def test_full_then_partial_batch_reuse_uses_legal_copy_scopes():
             ("shared.asram", "shared.asram"),
             ("shared.wsram", "shared.wsram"),
         }
+
+
+def test_partial_batch_with_explicit_scopes_uses_legal_copy_scopes():
+    mod = lower_batch_gemm(batch_gemm(batch=4, partial=True, explicit_scopes=True))
+    copies = {(copy.args[0].args[0].buffer.scope(), copy.args[1].args[0].buffer.scope()) for copy in collect_calls(mod, "tl.dma_copy")}
+    assert ("shared.rsram", "shared.asram") in copies
+    assert ("shared.rsram", "shared.wsram") in copies
+    assert ("shared.asram", "shared.asram") not in copies
+    assert ("shared.wsram", "shared.wsram") not in copies
 
 
 @pytest.mark.parametrize("output_batched", [True, False])

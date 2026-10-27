@@ -12,7 +12,7 @@ from testing.python.sunmmio.common.codegen_validation import (
     validate_sunmmio_codegen_with_npuir_opt,
 )
 from tilelang import tvm
-from tilelang.layout import make_zn_layout, make_zz_layout
+from tilelang.layout import make_nz_layout, make_zz_layout
 
 
 tilelang.env.disable_cache()
@@ -20,7 +20,7 @@ tilelang.env.disable_cache()
 
 TRANSPOSE_CONFIGS = [
     pytest.param(64, 64, "bfloat16", "zz", id="bfloat16-zz-64x64"),
-    pytest.param(64, 128, "bfloat16", "zn", id="bfloat16-zn-64x128"),
+    pytest.param(64, 128, "bfloat16", "nz", id="bfloat16-nz-64x128"),
     pytest.param(64, 128, "float32", "zz", id="float32-zz-64x128"),
 ]
 
@@ -46,8 +46,8 @@ def mesh_transpose_kernel(
 ):
     """Build a replicated transpose with matching DRAM and RSRAM layouts."""
     placement = T.placement.replicated()
-    src_layout = make_zz_layout((m, n)) if layout_family == "zz" else make_zn_layout((m, n), [0, 1], (32, 32))
-    transposed_layout = make_zz_layout((n, m)) if layout_family == "zz" else make_zn_layout((n, m), [0, 1], (32, 32))
+    src_layout = make_zz_layout((m, n)) if layout_family == "zz" else make_nz_layout((m, n), [0, 1], (32, 32))
+    transposed_layout = make_zz_layout((n, m)) if layout_family == "zz" else make_nz_layout((n, m), [0, 1], (32, 32))
     output_shape = (n, m) if expect_transposed else (m, n)
     output_layout = transposed_layout if expect_transposed else src_layout
 
@@ -59,8 +59,8 @@ def mesh_transpose_kernel(
         with T.Kernel():
             src = T.alloc_shared((m, n), dtype, scope="shared.rsram")
             dst = T.alloc_shared((n, m), dtype, scope="shared.rsram")
-            if layout_family == "zn":
-                T.annotate_layout({src: make_zn_layout((m, n), [0, 1], (32, 32))})
+            if layout_family == "nz":
+                T.annotate_layout({src: make_nz_layout((m, n), [0, 1], (32, 32))})
             T.copy(a, src)
 
             if control_flow == "loop":
@@ -88,26 +88,26 @@ def mesh_transpose_order_kernel(source_constraint_first):
     size = 64
     dtype = "bfloat16"
     placement = T.placement.replicated()
-    zn_layout = make_zn_layout((size, size), [0, 1], (32, 32))
+    nz_layout = make_nz_layout((size, size), [0, 1], (32, 32))
 
     @T.prim_func
     def main(
-        a: T.MeshTensor((size, size), placement, dtype, layout=zn_layout),
-        b: T.MeshTensor((size, size), placement, dtype, layout=zn_layout),
+        a: T.MeshTensor((size, size), placement, dtype, layout=nz_layout),
+        b: T.MeshTensor((size, size), placement, dtype, layout=nz_layout),
     ):
         with T.Kernel():
-            zn_src = T.alloc_shared((size, size), dtype, scope="shared.rsram")
+            nz_src = T.alloc_shared((size, size), dtype, scope="shared.rsram")
             src = T.alloc_shared((size, size), dtype, scope="shared.rsram")
             dst = T.alloc_shared((size, size), dtype, scope="shared.rsram")
-            T.annotate_layout({zn_src: zn_layout})
-            T.copy(a, zn_src)
+            T.annotate_layout({nz_src: nz_layout})
+            T.copy(a, nz_src)
 
             if source_constraint_first:
-                T.transpose(zn_src, src)
+                T.transpose(nz_src, src)
                 T.transpose(src, dst)
             else:
                 T.transpose(src, dst)
-                T.transpose(zn_src, src)
+                T.transpose(nz_src, src)
 
             T.copy(dst, b)
 
@@ -181,7 +181,7 @@ def test_transpose_loop_codegen(
             64,
             128,
             "float32",
-            "zn",
+            "nz",
             control_flow="loop",
             expect_transposed=False,
         ),

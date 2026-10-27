@@ -513,7 +513,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
   // assigned by other operators.
   //
   // Hard constraint: DRAM → ASRAM/WSRAM requires ZZ-like DRAM layout
-  // (ZZ, ZZZ, or NZZ).  DRAM layouts are user-specified and immutable,
+  // (ZZ, ZZZ, or ZZN).  DRAM layouts are user-specified and immutable,
   // so an incompatible layout is a hard error.
   if (copy_inst == CopyInst::kSunmmioDMACopy) {
     if (src.scope() == "global" && (dst.scope() == kSunmmioScopeASRAM ||
@@ -521,7 +521,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
       if (T.global_layout_map.count(src)) {
         auto dram_layout = T.global_layout_map[src];
         auto *cute = dram_layout.as<CuteLayoutNode>();
-        // Only validate user-specified blocked layouts (ZZ, ZN, ZZZ, NZZ).
+        // Only validate user-specified blocked layouts (ZZ, NZ, ZZZ, ZZN).
         // Row-major (default for unspecified DRAM) has no blocked dims and
         // is handled by the dma_copy / layout-transform split — skip the
         // check.
@@ -536,7 +536,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
           if (has_blocked) {
             ICHECK(sunmmio::IsZZLike(dram_layout))
                 << "DRAM → " << dst.scope()
-                << " copy requires ZZ-like DRAM layout (ZZ, ZZZ, or NZZ), "
+                << " copy requires ZZ-like DRAM layout (ZZ, ZZZ, or ZZN), "
                 << "but buffer \"" << src->name << "\" has incompatible layout";
           }
         }
@@ -1234,10 +1234,53 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
                        dst_carrier.canonical_carrier_shape)) {
       return reject_carrier("canonical carrier shapes do not match");
     }
-    return dma(MakeRegionExpr(src, src_carrier.physical_ranges,
-                              /*access_mask=*/1),
-               MakeRegionExpr(dst, dst_carrier.physical_ranges,
-                              /*access_mask=*/2));
+    // Region codegen divides each minimum by its tile extent.  Use a
+    // common smaller partition when the requested start is not divisible by
+    // that extent, or when it does not partition the parent covered shape.
+    // Outer axes can be traversed row by row; the innermost DMA block must
+    // retain the 1024-byte alignment checked above.
+    Array<Range> src_ranges = src_carrier.physical_ranges;
+    Array<Range> dst_ranges = dst_carrier.physical_ranges;
+    Array<Var> chunk_vars;
+    Array<PrimExpr> chunk_counts;
+    int rank = src_carrier.canonical_carrier_shape.size();
+    int src_leading = src_ranges.size() - rank;
+    int dst_leading = dst_ranges.size() - rank;
+    for (int axis = 0; axis < rank; ++axis) {
+      int src_dim = src_leading + axis;
+      int dst_dim = dst_leading + axis;
+      PrimExpr extent = src_ranges[src_dim]->extent;
+      auto divisible = [&](PrimExpr value) {
+        return analyzer->CanProveEqual(indexmod(value, extent), 0);
+      };
+      if (divisible(src_ranges[src_dim]->min) &&
+          divisible(dst_ranges[dst_dim]->min) &&
+          divisible(src_carrier.covered_shape[src_dim]) &&
+          divisible(dst_carrier.covered_shape[dst_dim])) {
+        continue;
+      }
+      PrimExpr chunk = make_const(
+          extent.dtype(), axis == rank - 1
+                              ? kDramRowAlignBytes * 8 /
+                                    (src->dtype.bits() * src->dtype.lanes())
+                              : 1);
+      Var index("dma_chunk_" + std::to_string(axis), extent.dtype());
+      chunk_vars.push_back(index);
+      chunk_counts.push_back(analyzer->Simplify(indexdiv(extent, chunk)));
+      src_ranges.Set(src_dim,
+                     Range::FromMinExtent(
+                         src_ranges[src_dim]->min + index * chunk, chunk));
+      dst_ranges.Set(dst_dim,
+                     Range::FromMinExtent(
+                         dst_ranges[dst_dim]->min + index * chunk, chunk));
+    }
+    Stmt body = dma(MakeRegionExpr(src, src_ranges, /*access_mask=*/1),
+                    MakeRegionExpr(dst, dst_ranges, /*access_mask=*/2));
+    for (int i = static_cast<int>(chunk_vars.size()) - 1; i >= 0; --i) {
+      body = For(chunk_vars[i], make_zero(chunk_vars[i].dtype()),
+                 chunk_counts[i], ForKind::kSerial, body);
+    }
+    return body;
   }
 
   if (IsLayoutMatch(src_layout, dst_layout, analyzer) ||

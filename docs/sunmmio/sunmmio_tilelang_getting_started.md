@@ -319,14 +319,16 @@ The frontend currently provides the following communication operations:
 - `T.comm.broadcast(src, dst, src_core, direction=...)`
 - `T.comm.put(src, dst, src_core, dst_core)`
 - `T.comm.all_gather(send_buffer, recv_buffer, direction=..., axis=...)`
-- `T.comm.all_reduce(buffer, out, reduce_type, direction=..., dim=..., clear=...)`
+- `T.comm.all_reduce(buffer, out, reduce_type, direction=..., clear=...)`
 
 Their purposes are:
 
 - `broadcast`: Broadcast data from one source Core to a row, column, or the entire mesh.
 - `put`: Send data from one source Core to one destination Core.
 - `all_gather`: Collect local data from multiple Cores into a larger receive buffer.
-- `all_reduce`: Reduce data across multiple Cores and write the result to an output buffer.
+- `all_reduce`: Reduce corresponding elements across multiple Cores and write the result to an output buffer with the same local shape. It does not reduce a dimension inside the local buffer.
+
+On A4E, `all_reduce` payloads must have rank 1 to 3 and satisfy the multicast tile and 1024-byte link-segment constraints described in the user guide. Integer bitwise reductions require matching `int32` or `uint32`; `max`, `min`, and `absmax` require BF16 or FP32.
 
 ## Layout
 
@@ -345,18 +347,22 @@ The frontend currently provides the following SunMMIO layout constructors:
 - `make_row_major`
 - `make_aligned_row_major`
 - `make_zz_layout`
-- `make_zn_layout`
+- `make_nz_layout`
 - `make_zzz_layout`
-- `make_nzz_layout`
+- `make_zzn_layout`
 
 Their meanings are:
 
 - `make_row_major` creates a standard row-major layout.
 - `make_aligned_row_major` creates a row-major layout with alignment constraints.
 - `make_zz_layout` creates a blockwise row-major layout.
-- `make_zn_layout` creates a blockwise column-major layout.
+- `make_nz_layout` creates a blockwise column-major layout.
 - `make_zzz_layout` creates a clustered row-major layout.
-- `make_nzz_layout` creates a clustered column-major layout.
+- `make_zzn_layout` creates a clustered column-major layout.
+
+Layout form letters are read from the innermost block level outward, matching
+NPU-IR terminology. The former `make_zn_layout` and `make_nzz_layout` names
+remain as deprecated aliases for `make_nz_layout` and `make_zzn_layout`.
 
 ### 2. When to Specify a Layout Explicitly
 

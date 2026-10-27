@@ -245,6 +245,7 @@ def partial_batch_gemm_kernel(
     batch_extent=2,
     output_batched=True,
     clear_accum=True,
+    explicit_scopes=False,
 ):
     M = N = K = 32
     A_shape = (batch_parent, M, K)
@@ -262,9 +263,21 @@ def partial_batch_gemm_kernel(
         C: T.MeshTensor(C_shape, placement, "float32", layout=C_layout),  # type: ignore
     ):
         with T.Kernel():
-            A_shared = T.alloc_shared(A_shape, "bfloat16")
-            B_shared = T.alloc_shared(B_shape, "bfloat16")
-            C_shared = T.alloc_shared(C_shape, "float32")
+            A_shared = T.alloc_shared(
+                A_shape,
+                "bfloat16",
+                scope="shared.asram" if explicit_scopes else "shared.dyn",
+            )
+            B_shared = T.alloc_shared(
+                B_shape,
+                "bfloat16",
+                scope="shared.wsram" if explicit_scopes else "shared.dyn",
+            )
+            C_shared = T.alloc_shared(
+                C_shape,
+                "float32",
+                scope="shared.rsram" if explicit_scopes else "shared.dyn",
+            )
             T.copy(A[0, 0, 0], A_shared)
             T.copy(B[0, 0, 0], B_shared)
             if not clear_accum:
@@ -763,6 +776,19 @@ def test_partial_row_major_copy_keeps_layout_transform(tmp_path):
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_partial_batch_gemm_with_explicit_scopes_validates(tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        partial_batch_gemm_kernel(explicit_scopes=True),
+        tmp_path,
+        mlir_filename="partial_batch_explicit_scopes.mlir",
+        expected_tokens=("suvm.copy_async", "suvm.tc.mma"),
+        opt_args=LOOSE_OPT_ARGS,
+    )
+
+    assert src.count("suvm.tc.mma") == 2
+    assert "!suvm.tile_view<2x32x32xbf16>" in src
 
 
 def test_full_partial_reuse_compiles_with_npuir(tmp_path):

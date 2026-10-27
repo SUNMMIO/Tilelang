@@ -4,7 +4,7 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm
-from tilelang.layout import make_row_major, make_zn_layout, make_zz_layout
+from tilelang.layout import make_row_major, make_nz_layout, make_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 
 
@@ -70,10 +70,10 @@ def _make_copy_kernel(copy_case):
     elif copy_case == "zz_block_non_major_dim_multi_block":
         shape = (128, 128)
         layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
-    elif copy_case.startswith("zz_") or copy_case.startswith("zn_"):
+    elif copy_case.startswith("zz_") or copy_case.startswith("nz_"):
         shape = (96, 96)
-        if copy_case.startswith("zn_"):
-            layout = make_zn_layout(shape, axes=[0, 1], block_shape=(32, 32))
+        if copy_case.startswith("nz_"):
+            layout = make_nz_layout(shape, axes=[0, 1], block_shape=(32, 32))
         else:
             layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
     else:
@@ -276,7 +276,7 @@ def _make_copy_kernel(copy_case):
                 T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[0:32, 0:64], A_shared[32:64, 0:64])
 
-    elif copy_case == "zn_block_non_major_dim_split":
+    elif copy_case == "nz_block_non_major_dim_split":
 
         @T.prim_func
         def kernel(A: T.Tensor(shape, DTYPE)):
@@ -590,8 +590,8 @@ def _make_comm_kernel(comm_case):
 
     elif comm_case == "allreduce_low_level_valid":
         send_shape = (32, 32)
-        out_shape = (32,)
-        gather_shape = (16, 32)
+        out_shape = send_shape
+        gather_shape = (4, *send_shape)
 
         @T.prim_func
         def kernel(A: T.Tensor(shape, DTYPE)):
@@ -613,12 +613,108 @@ def _make_comm_kernel(comm_case):
                         "handle",
                         tvm.tir.op.Op.get("tl.tileop.comm_allreduce"),
                         A_shared[0:32, 0:32],
-                        Out_shared[0:32],
-                        Row_gather[0:16, 0:32],
-                        Col_gather[0:16, 0:32],
+                        Out_shared[0:32, 0:32],
+                        Row_gather[0:4, 0:32, 0:32],
+                        Col_gather[0:4, 0:32, 0:32],
                         "sum",
                         2,
-                        1,
+                        T.bool(True),
+                        bx,
+                    )
+                )
+
+    elif comm_case in {
+        "allreduce_low_level_bitwise",
+        "allreduce_low_level_bitwise_int32",
+        "allreduce_low_level_bitwise_uint32",
+        "allreduce_low_level_missing_dst_copy",
+    }:
+        send_shape = (32, 32)
+        gather_shape = (4, *send_shape)
+        reduce_type = "bitand" if "bitwise" in comm_case else "sum"
+        if comm_case == "allreduce_low_level_bitwise_int32":
+            reduce_dtype = "int32"
+        elif comm_case == "allreduce_low_level_bitwise_uint32":
+            reduce_dtype = "uint32"
+        else:
+            reduce_dtype = DTYPE
+        clear = comm_case != "allreduce_low_level_missing_dst_copy"
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel() as bx:
+                A_shared = T.alloc_shared(send_shape, reduce_dtype)
+                Out_shared = T.alloc_shared(send_shape, reduce_dtype)
+                Row_gather = T.alloc_shared(gather_shape, reduce_dtype)
+                Col_gather = T.alloc_shared(gather_shape, reduce_dtype)
+                T.annotate_layout(
+                    {
+                        A_shared: make_row_major(send_shape),
+                        Out_shared: make_row_major(send_shape),
+                        Row_gather: make_row_major(gather_shape),
+                        Col_gather: make_row_major(gather_shape),
+                    }
+                )
+                T.evaluate(
+                    tvm.tir.call_intrin(
+                        "handle",
+                        tvm.tir.op.Op.get("tl.tileop.comm_allreduce"),
+                        A_shared[0:32, 0:32],
+                        Out_shared[0:32, 0:32],
+                        Row_gather[0:4, 0:32, 0:32],
+                        Col_gather[0:4, 0:32, 0:32],
+                        reduce_type,
+                        2,
+                        T.bool(clear),
+                        bx,
+                    )
+                )
+
+    elif comm_case in {
+        "allreduce_low_level_small_payload",
+        "allreduce_low_level_trailing_unit",
+        "allreduce_low_level_rank4",
+        "allreduce_low_level_integer_max",
+    }:
+        if comm_case == "allreduce_low_level_small_payload":
+            send_shape = (32,)
+        elif comm_case == "allreduce_low_level_trailing_unit":
+            send_shape = (32, 1)
+        elif comm_case == "allreduce_low_level_rank4":
+            send_shape = (2, 2, 32, 32)
+        else:
+            send_shape = (32, 32)
+        gather_shape = (4, *send_shape)
+        reduce_dtype = "int32" if comm_case == "allreduce_low_level_integer_max" else "float32"
+        reduce_type = "max" if comm_case == "allreduce_low_level_integer_max" else "sum"
+        send_zero = tuple(0 for _ in send_shape)
+        gather_zero = tuple(0 for _ in gather_shape)
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel() as bx:
+                A_shared = T.alloc_shared(send_shape, reduce_dtype)
+                Out_shared = T.alloc_shared(send_shape, reduce_dtype)
+                Row_gather = T.alloc_shared(gather_shape, reduce_dtype)
+                Col_gather = T.alloc_shared(gather_shape, reduce_dtype)
+                T.annotate_layout(
+                    {
+                        A_shared: make_row_major(send_shape),
+                        Out_shared: make_row_major(send_shape),
+                        Row_gather: make_row_major(gather_shape),
+                        Col_gather: make_row_major(gather_shape),
+                    }
+                )
+                T.evaluate(
+                    tvm.tir.call_intrin(
+                        "handle",
+                        tvm.tir.op.Op.get("tl.tileop.comm_allreduce"),
+                        _tile_region(A_shared[send_zero], "r", *send_shape),
+                        _tile_region(Out_shared[send_zero], "w", *send_shape),
+                        _tile_region(Row_gather[gather_zero], "rw", *gather_shape),
+                        _tile_region(Col_gather[gather_zero], "rw", *gather_shape),
+                        reduce_type,
+                        0,
                         T.bool(True),
                         bx,
                     )
@@ -698,7 +794,7 @@ def test_sunmmio_validate_tile_view_regions_accepts_legal_regions(copy_case):
             "must not split the non-major dimension",
         ),
         (
-            "zn_block_non_major_dim_split",
+            "nz_block_non_major_dim_split",
             "must not split the non-major dimension",
         ),
         (
@@ -751,6 +847,8 @@ def test_sunmmio_validate_tile_view_regions_rejects_kernel_after_layout_inferenc
         "allgather_axis0_valid",
         "allgather_axis_last_valid",
         "allreduce_low_level_valid",
+        "allreduce_low_level_bitwise_int32",
+        "allreduce_low_level_bitwise_uint32",
     ],
 )
 def test_sunmmio_validate_tile_view_regions_accepts_comm_regions(comm_case):
@@ -771,6 +869,25 @@ def test_sunmmio_validate_tile_view_regions_accepts_comm_regions(comm_case):
     ],
 )
 def test_sunmmio_validate_tile_view_regions_rejects_comm_regions(comm_case, error_msg):
+    with pytest.raises(tvm.error.InternalError, match=error_msg):
+        _run_comm_validate_tile_view_regions(comm_case)
+
+
+@pytest.mark.parametrize(
+    "comm_case,error_msg",
+    [
+        (
+            "allreduce_low_level_bitwise",
+            "Sunmmio bitwise all_reduce requires input and output dtypes to be both int32 or both uint32",
+        ),
+        ("allreduce_low_level_missing_dst_copy", "dst_copy must be provided only"),
+        ("allreduce_low_level_small_payload", "contiguous multicast segment"),
+        ("allreduce_low_level_trailing_unit", "innermost extent"),
+        ("allreduce_low_level_rank4", "payload rank 1 to 3"),
+        ("allreduce_low_level_integer_max", "requires BF16 or FP32 input and output dtypes"),
+    ],
+)
+def test_sunmmio_validate_tile_view_regions_rejects_invalid_allreduce_contract(comm_case, error_msg):
     with pytest.raises(tvm.error.InternalError, match=error_msg):
         _run_comm_validate_tile_view_regions(comm_case)
 

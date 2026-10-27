@@ -1,3 +1,5 @@
+import re
+
 import pytest
 import tilelang
 import tilelang.language as T
@@ -6,6 +8,8 @@ from tilelang.layout import make_aligned_row_major
 
 from testing.python.sunmmio.common.codegen_validation import (
     lower_sunmmio_kernel_to_device_tir,
+    codegen_sunmmio_suvm_mlir,
+    validate_suvm_mlir_with_npuir_opt,
     validate_sunmmio_codegen_with_npuir_opt,
 )
 from testing.python.sunmmio.common.compile_pipeline import target
@@ -242,8 +246,10 @@ def aligned_row_partial_row_kernel(direction="load", dtype=T.bfloat16):
 
 
 @target("Sunmmio")
-def aligned_row_byte_aligned_partial_row_kernel(direction="load", dtype=T.bfloat16):
-    dram_shape, rsram_shape = (3, 1024), (512,)
+def aligned_row_byte_aligned_partial_row_kernel(
+    direction="load", dtype=T.bfloat16, cols=1024, start=512, length=512, rsram_start=0, rsram_cols=None
+):
+    dram_shape, rsram_shape = (3, cols), (rsram_cols or length,)
     dram_layout = make_aligned_row_major(dram_shape, dtype, align_bytes=1024)
     rsram_layout = make_aligned_row_major(rsram_shape, dtype, align_bytes=1024)
 
@@ -256,7 +262,7 @@ def aligned_row_byte_aligned_partial_row_kernel(direction="load", dtype=T.bfloat
             with T.Kernel():
                 dst = T.alloc_shared(rsram_shape, dtype, scope="shared.rsram")
                 T.annotate_layout({dst: rsram_layout})
-                T.copy(src[1, 512:1024], dst)
+                T.copy(src[1, start : start + length], dst[rsram_start : rsram_start + length])
 
         return main
 
@@ -267,7 +273,7 @@ def aligned_row_byte_aligned_partial_row_kernel(direction="load", dtype=T.bfloat
         with T.Kernel():
             src = T.alloc_shared(rsram_shape, dtype, scope="shared.rsram")
             T.annotate_layout({src: rsram_layout})
-            T.copy(src, dst[1, 512:1024])
+            T.copy(src[rsram_start : rsram_start + length], dst[1, start : start + length])
 
     return main
 
@@ -371,7 +377,7 @@ def test_aligned_row_vector_copy_uses_1024_byte_carrier(direction, rsram_rank, t
             7,
             5,
             T.bfloat16,
-            "!suvm.tile_view<5x512xbf16>",
+            "!suvm.tile_view<512xbf16>",
             id=f"row-subset-bf16-{direction}",
         )
         for direction in ("load", "store")
@@ -504,6 +510,57 @@ def test_aligned_row_byte_aligned_partial_row_uses_exact_segment(direction, tmp_
     )
     assert src.count("suvm.copy_async") == 1
     assert "suvm.transform_layout_async" not in src
+
+
+def _lower_dma_to_llvm_with_constant_addresses(kernel, tmp_path):
+    mod = lower_sunmmio_kernel_to_device_tir(kernel)
+    # Unroll small constant loops only in this test to expose every byte GEP.
+    with tvm.transform.PassContext(config={"tir.UnrollLoop": {"auto_max_step": 128}}):
+        mod = tvm.tir.transform.UnrollLoop()(mod)
+        mod = tvm.tir.transform.Simplify()(mod)
+    src = codegen_sunmmio_suvm_mlir(mod)
+    result = validate_suvm_mlir_with_npuir_opt(src, tmp_path, opt_args=("--verify-each", "--suvm-to-llvm-pipeline", "--canonicalize"))
+    return result.stdout
+
+
+@pytest.mark.parametrize("direction", ["load", "store"])
+@pytest.mark.parametrize(
+    "dtype,cols,start,length,expected_offsets",
+    [
+        (T.bfloat16, 2048, 512, 1024, [5120, 6144]),
+        (T.bfloat16, 1536, 0, 1024, [3072, 4096]),
+        (T.float32, 1024, 256, 512, [5120, 6144]),
+        (T.float32, 768, 0, 512, [3072, 4096]),
+        (T.bfloat16, 1024, 512, 512, [3072]),
+        (T.bfloat16, 1600, 512, 1024, [5120, 6144]),
+    ],
+)
+def test_aligned_row_segment_preserves_byte_addresses(direction, dtype, cols, start, length, expected_offsets, tmp_path):
+    llvm = _lower_dma_to_llvm_with_constant_addresses(
+        aligned_row_byte_aligned_partial_row_kernel(direction, dtype, cols, start, length), tmp_path
+    )
+    offsets = [int(x) for x in re.findall(r"llvm.getelementptr %arg0\[(\d+)\].*, i8", llvm)]
+    assert offsets == expected_offsets, llvm
+
+
+@pytest.mark.parametrize("direction", ["load", "store"])
+def test_aligned_row_subset_preserves_outer_byte_addresses(direction, tmp_path):
+    llvm = _lower_dma_to_llvm_with_constant_addresses(
+        aligned_row_matrix_copy_kernel(direction, rows=20, cols=500, row_start=7, copy_rows=5), tmp_path
+    )
+    offsets = [int(x) for x in re.findall(r"llvm.getelementptr %arg0\[(\d+)\].*, i8", llvm)]
+    # Batch 2, rows 7..11, each row physically padded to 1024 bytes.
+    assert offsets == [48128, 49152, 50176, 51200, 52224], llvm
+
+
+@pytest.mark.parametrize("direction", ["load", "store"])
+def test_aligned_row_segment_preserves_rsram_byte_addresses(direction, tmp_path):
+    llvm = _lower_dma_to_llvm_with_constant_addresses(
+        aligned_row_byte_aligned_partial_row_kernel(direction, T.bfloat16, 2048, 0, 1024, rsram_start=512, rsram_cols=2048), tmp_path
+    )
+    rsram = re.search(r"(%\w+) = llvm.mlir.addressof @sunmmio_rsram_buf", llvm).group(1)
+    offsets = [int(x) for x in re.findall(rf"llvm.getelementptr {rsram}\[(\d+)\].*, i8", llvm)]
+    assert offsets == [1024, 2048], llvm
 
 
 if __name__ == "__main__":

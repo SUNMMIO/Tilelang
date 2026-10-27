@@ -200,7 +200,7 @@ bool IsSameLayout(const Layout &lhs, const Layout &rhs,
  *
  * **Pass 2 — stride ordering.**  The physical stride order of the src
  * layout (recovered via RecoverPhysicalOrder) is projected onto the new
- * modes, so the layout *kind* (row-major, col-major, ZZ, ZN, …) is
+ * modes, so the layout *kind* (row-major, col-major, ZZ, NZ, …) is
  * faithfully preserved without explicit kind detection.
  *
  * Rank-changing is handled by back-aligning single-level src dims to
@@ -227,7 +227,7 @@ DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
  *        physical storage semantics.
  *
  * For SUVM MX dtypes this dispatches to sunmmio::DeriveMXLayoutLike so MX
- * row-major, MXZZ, MXZNN, and MXZNZ keep their data/scale/padding storage
+ * row-major, MXZZ, MXNNZ, and MXZNZ keep their data/scale/padding storage
  * strides.
  * Other dtypes use the generic DeriveLayoutLike path.
  */
@@ -265,13 +265,13 @@ namespace sunmmio {
 
 /*!
  * \brief Check if a layout is "ZZ-like": has blocked dims with row-major
- * inner ordering.  Covers ZZ, ZZZ, and NZZ layouts.
+ * inner ordering.  Covers ZZ, ZZZ, and ZZN layouts.
  *
  * Structural invariant: at least 2 blocked dims (nlevels > 1), and among
  * the last two blocked dims, the higher-indexed dim's innermost mode has
  * a smaller stride (row-major ordering at the innermost level).
  *
- * Returns false for ZN (col-major inner), row-major (no blocked dims),
+ * Returns false for NZ (col-major inner), row-major (no blocked dims),
  * or non-CuteLayout.
  */
 bool IsZZLike(const Layout &layout);
@@ -292,7 +292,7 @@ struct ZZBlockShape {
  * \brief Extract the block shape from a ZZ-like CuteLayout.
  *
  * For a ZZ layout built with block_shape = {bh, bw}, this returns
- * {bh, bw}.  Works for ZZ, ZZZ, and NZZ layouts — the innermost
+ * {bh, bw}.  Works for ZZ, ZZZ, and ZZN layouts — the innermost
  * mode shape of each blocked dimension is the block extent regardless
  * of the number of tiling levels.
  *
@@ -320,18 +320,18 @@ Layout MakeAlignedRowMajor(Array<PrimExpr> shape, DataType dtype,
 Layout MakeZZ(Array<PrimExpr> shape, Array<Integer> axes,
               Array<PrimExpr> block_shape);
 
-Layout MakeZN(Array<PrimExpr> shape, Array<Integer> axes,
+Layout MakeNZ(Array<PrimExpr> shape, Array<Integer> axes,
               Array<PrimExpr> block_shape);
 
 Layout MakeZZZ(Array<PrimExpr> shape, Array<Integer> axes,
                Array<PrimExpr> block_shape, Array<PrimExpr> cluster_shape);
 
-Layout MakeNZZ(Array<PrimExpr> shape, Array<Integer> axes,
+Layout MakeZZN(Array<PrimExpr> shape, Array<Integer> axes,
                Array<PrimExpr> block_shape, Array<PrimExpr> cluster_shape);
 
 Layout MakeMXZZ(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype);
 
-Layout MakeMXZNN(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype);
+Layout MakeMXNNZ(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype);
 
 Layout MakeMXZNZ(Array<PrimExpr> shape, Array<Integer> axes, DataType dtype);
 
@@ -340,7 +340,7 @@ Layout MakeMXRowMajor(Array<PrimExpr> shape, DataType dtype);
 enum class MXLayoutKind {
   kRowMajor,
   kMXZZ,
-  kMXZNN,
+  kMXNNZ,
   kMXZNZ,
 };
 

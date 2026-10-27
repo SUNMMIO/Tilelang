@@ -151,19 +151,25 @@ def _broadcast_stmt(*, direction=0, mask=None, src_core=None):
 
 def test_unit_sync_marker_codegen_validates_with_original_npuir(tmp_path):
     # TileLang's mask is independent from NPU-IR's enum values: bit 0 is
-    # ODMA0 and bit 2 is TC.
-    stmt = tvm.tir.Evaluate(
-        tvm.tir.Call(
-            "handle",
-            tvm.ir.Op.get("tl.sunmmio_sync"),
-            [tvm.tir.IntImm("int32", 0b101)],
-        )
+    # ODMA0 and bit 2 is TC. One pending unit keeps the original full mask.
+    elem_ty = tvm.ir.PrimType("bfloat16")
+    src_data = tvm.tir.Var("src_data", tvm.ir.PointerType(elem_ty, "global"))
+    dst_data = tvm.tir.Var("dst_data", tvm.ir.PointerType(elem_ty, "shared.rsram"))
+    src_buf = tvm.tir.decl_buffer((32, 32), "bfloat16", name="Src", data=src_data, scope="global")
+    dst_buf = tvm.tir.decl_buffer((32, 32), "bfloat16", name="Dst", data=dst_data, scope="shared.rsram")
+    body = tvm.tir.SeqStmt(
+        [
+            tvm.tir.Evaluate(_dma(src_buf, dst_buf)),
+            tvm.tir.Evaluate(_unit_sync(0b101)),
+        ]
     )
+    stmt = _with_decl_buffers(body, [src_buf, dst_buf])
     src = _validate_stmt_codegen(
         stmt,
         tmp_path,
+        params=[src_data, dst_data],
         mlir_filename="unit_sync_suvm.mlir",
-        expected_fragments=("suvm.sync",),
+        expected_fragments=("suvm.copy_async", "suvm.sync"),
         opt_args=("--verify-each", "--suvm-to-llvm-pipeline"),
     )
     sync_line = next(line for line in src.splitlines() if "suvm.sync" in line)
@@ -314,6 +320,19 @@ def test_explicit_unit_sync_consumes_pending_codegen_state():
     assert src.count("suvm.sync") == 1
 
 
+def test_explicit_unit_sync_without_pending_work_is_elided():
+    src_data, dst_data, src_buf, dst_buf = _shared_buffers()
+    stmt = _with_decl_buffers(
+        tvm.tir.Evaluate(_unit_sync(0b1100000)),
+        [src_buf, dst_buf],
+    )
+    _, src = _build_sunmmio_source_from_stmt(
+        stmt,
+        params=[src_data, dst_data],
+    )
+    assert "suvm.sync" not in src
+
+
 def test_one_branch_sync_preserves_pending_state_on_other_branch():
     src_data, dst_data, src_buf, dst_buf = _shared_buffers()
     cond = tvm.tir.Var("cond", "bool")
@@ -361,7 +380,7 @@ def test_zero_trip_loop_preserves_entry_pending_state():
     assert src.count("suvm.sync") == 2
 
 
-def test_while_condition_pending_state_survives_initial_false_path():
+def test_while_condition_tile_load_consumed_by_compare_needs_no_sync():
     elem_ty = tvm.ir.PrimType("int32")
     state_data = tvm.tir.Var(
         "state_data",
@@ -385,6 +404,29 @@ def test_while_condition_pending_state_survives_initial_false_path():
     return_index = next(i for i, line in enumerate(lines) if line.strip() == "return")
     assert "scf.while" in src
     assert "suvm.tile.load" in src
+    assert not sync_indices
+    assert return_index > 0
+
+
+def test_while_initial_false_preserves_entry_pending_state():
+    src_data, dst_data, src_buf, dst_buf = _shared_buffers()
+    cond = tvm.tir.Var("cond", "bool")
+    body = tvm.tir.SeqStmt(
+        [
+            tvm.tir.Evaluate(_dma(src_buf, dst_buf)),
+            tvm.tir.While(cond, tvm.tir.Evaluate(_unit_sync(0b11))),
+        ]
+    )
+    stmt = _with_decl_buffers(body, [src_buf, dst_buf])
+
+    _, src = _build_sunmmio_source_from_stmt(
+        stmt,
+        params=[src_data, dst_data, cond],
+    )
+    lines = src.splitlines()
+    sync_indices = [i for i, line in enumerate(lines) if "suvm.sync" in line]
+    return_index = next(i for i, line in enumerate(lines) if line.strip() == "return")
+    assert "scf.while" in src
     assert len(sync_indices) == 2
     assert sync_indices[0] < sync_indices[1] < return_index
 
