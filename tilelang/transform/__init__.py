@@ -97,6 +97,11 @@ def ResolveSunmmioMeshSymbols():
     return _ffi_api.ResolveSunmmioMeshSymbols()  # type: ignore
 
 
+def ValidateSunmmioFrontendSyntax():
+    """Reject user-facing syntax that is unsupported by the Sunmmio backend."""
+    return _ffi_api.ValidateSunmmioFrontendSyntax()  # type: ignore
+
+
 def ResolveSunmmioUnit():
     """Attach the selected sending ODMA unit to Sunmmio transfer calls.
 
@@ -418,6 +423,11 @@ def LegalizeSunmmioGemm():
         The result pass
     """
     return _ffi_api.LegalizeSunmmioGemm()  # type: ignore
+
+
+def LegalizeSunmmioBatchGemmViews():
+    """Materialize partial Batch GEMM views before SRAM scope inference."""
+    return _ffi_api.LegalizeSunmmioBatchGemmViews()  # type: ignore
 
 
 def LegalizeSafeMemoryAccess():

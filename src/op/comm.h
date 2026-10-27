@@ -17,6 +17,8 @@ TVM_DLL const Op &broadcast_();
 // Internal proof attached by ValidateDynamicCommPutRoutes before LowerTileOp.
 constexpr const char *kCommPutDirectionAttr = "tl.comm_put_direction";
 constexpr const char *kCommBarrierMaskAttr = "tl.comm_barrier_mask";
+constexpr const char *kAttrAllowRank3Multicast =
+    "tl.allow_rank3_allreduce_multicast";
 
 // Positional argument layout of the broadcast_() leaf intrinsic. Producers
 // (comm.cc, via AppendBroadcastArgs) and consumers (the broadcast-barrier
@@ -197,6 +199,15 @@ TVM_DLL bool IsCommunicationOp(const Call &call);
 TVM_DLL CommunicationDirections
 GetCommunicationSourceDirections(const Call &call, Target target);
 
+/** Validate the cross-core all-reduce shape, dtype, and temporary contract. */
+TVM_DLL void ValidateAllreduceContract(const PrimExpr &src, const PrimExpr &dst,
+                                       const PrimExpr &row_allgather,
+                                       const PrimExpr &col_allgather,
+                                       const PrimExpr &dst_copy,
+                                       const StringImm &type, int direction,
+                                       bool should_clear, Target target,
+                                       arith::Analyzer *analyzer);
+
 class AllreduceOpNode : public TileOperatorNode {
 public:
   PrimExpr src, dst;
@@ -204,7 +215,6 @@ public:
   PrimExpr dst_copy;
   StringImm type;
   int direction;
-  IntImm dim;
   IntImm clear;
   PrimExpr cid;
 
@@ -219,7 +229,6 @@ public:
         .def_ro("row_allgather", &AllreduceOpNode::row_allgather)
         .def_ro("col_allgather", &AllreduceOpNode::col_allgather)
         .def_ro("type", &AllreduceOpNode::type)
-        .def_ro("dim", &AllreduceOpNode::dim)
         .def_ro("clear", &AllreduceOpNode::clear)
         .def_ro("direction", &AllreduceOpNode::direction)
         .def_ro("dst_copy", &AllreduceOpNode::dst_copy)
@@ -228,7 +237,7 @@ public:
 
   TileOperator Clone() const override;
   LayoutMap ComputeLayout(const LayoutInferArgs &T, InferLevel level,
-                          Buffer src, Buffer dst, int dim) const;
+                          Buffer src, Buffer dst) const;
   LayoutMap InferLayout(const LayoutInferArgs &T,
                         InferLevel level) const override;
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;

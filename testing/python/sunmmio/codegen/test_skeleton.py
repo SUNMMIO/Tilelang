@@ -9,7 +9,10 @@ from tilelang import tvm as tvm
 from tilelang.utils.target import determine_target
 
 from testing.python.sunmmio.common.compile_pipeline import target
-from testing.python.sunmmio.common.codegen_validation import print_sunmmio_codegen_debug
+from testing.python.sunmmio.common.codegen_validation import (
+    print_sunmmio_codegen_debug,
+    validate_suvm_mlir_with_npuir_opt,
+)
 
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
@@ -458,6 +461,18 @@ def test_sunmmio_codegen_lowers_dynamic_barrier_mask():
     assert " : i64 -> !suvm.barrier" in src
     assert src.count("suvm.barrier.init") == 1
     assert src.count("suvm.barrier.arrive_and_wait") == 1
+
+
+def test_sunmmio_dynamic_barrier_mask_emits_i64_kernel_abi(tmp_path):
+    src = build_sunmmio_source_without_compile(make_dynamic_barrier_kernel())
+    result = validate_suvm_mlir_with_npuir_opt(
+        src,
+        tmp_path,
+        mlir_filename="dynamic_barrier_i64_abi.mlir",
+        opt_args=("--verify-each", "--suvm-emit-kernel-abi"),
+    )
+
+    assert 'suvm.kernel_arg_meta<type = "long long"' in result.stdout
 
 
 def test_sunmmio_codegen_lowers_dynamic_barrier_candidates():

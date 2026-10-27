@@ -138,7 +138,7 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
     const std::string &result_name, const std::string &buffer_handle,
     const std::vector<SunMMIOValue> &mins, const std::vector<int64_t> &extents,
     DataType ret_dtype, const SunMMIOType &ret_type, int64_t byte_offset,
-    bool preserve_unit_dims) {
+    bool preserve_region_rank, bool allow_rank3) {
   SunmmioMlirType type(ctx_);
 
   mlir::Value source = ctx_.LookupMLIRValue(buffer_handle);
@@ -180,9 +180,26 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
   mlir::SmallVector<int64_t, 4> tiled_dims;
 
   shape.reserve(extents.size());
+  bool preserve_exact_rank = preserve_region_rank && extents.size() <= 3;
+  bool collapse_single_matrix_view = preserve_exact_rank &&
+                                     extents.size() == 3 && extents[0] == 1 &&
+                                     memtensor_ty.getShape()[0] != 1;
   for (int64_t i = 0; i < static_cast<int64_t>(extents.size()); ++i) {
-    if (preserve_unit_dims || extents[i] != 1) {
-      shape.push_back(extents[i]);
+    bool preserve_dim =
+        preserve_exact_rank && !(collapse_single_matrix_view && i == 0);
+    if (preserve_dim || extents[i] != 1) {
+      int64_t view_extent = extents[i];
+      if (preserve_dim && extents[i] == memtensor_ty.getShape()[i]) {
+        // tc.mma must cover every tiled layout dimension completely.  Keep
+        // the logical memtensor shape for user-visible copies, but expose its
+        // already-allocated padded carrier to MMA (for example M=16 in a
+        // 32-row ZZ block).
+        view_extent = memtensor_ty.getLayout().getDimSize(i);
+        ICHECK_GE(view_extent, extents[i])
+            << "tl.mma_sunmmio layout extent cannot be smaller than its "
+               "logical buffer extent";
+      }
+      shape.push_back(view_extent);
       tiled_dims.push_back(i);
     }
   }
@@ -192,9 +209,10 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
     shape.push_back(1);
     tiled_dims.push_back(0);
   }
-  ICHECK(shape.size() == 1 || shape.size() == 2)
-      << "tl.tileop.region expects one or two tiled dims with extent != 1, "
-         "but got "
+  ICHECK(shape.size() == 1 || shape.size() == 2 ||
+         (allow_rank3 && shape.size() == 3))
+      << "tl.tileop.region expects one or two tiled dimensions, or three for "
+         "operations that support rank-3 views, but got "
       << shape.size();
 
   mlir::Type elem_ty = memtensor_ty.getElementType();
@@ -502,6 +520,9 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     SunmmioMlirContext::SyncUnitMask units_mask = MapSyncUnits(mask);
     ICHECK_NE(units_mask, SunmmioMlirContext::kNoSyncUnits)
         << "tl.sunmmio_sync requires at least one hardware unit";
+    if (!ctx_.HasPendingSyncUnits(units_mask)) {
+      return SunMMIOValue{ret_dtype, result_name, ret_type};
+    }
     mlir::suvm::SyncUnits units = SunmmioMlirContext::ToSyncUnits(units_mask);
     mlir::suvm::SyncOp::create(
         ctx_.builder, type.MakeDebugLoc("sunmmio_sync"),
@@ -528,9 +549,11 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         ctx_.builder, type.MakeDebugLoc("dma_copy"), src, dst,
         require_odma_unit());
     VerifyAsyncOp(copy_op, "tl.dma_copy");
-    ctx_.AddPendingSyncUnits(copy_op.getUnit() == mlir::suvm::Unit::Odma0
-                                 ? mlir::suvm::SyncUnits::odma0
-                                 : mlir::suvm::SyncUnits::odma1);
+    ctx_.AddPendingSyncOperation(
+        copy_op.getOperation(), SunmmioMlirContext::ToSyncUnitMask(
+                                    copy_op.getUnit() == mlir::suvm::Unit::Odma0
+                                        ? mlir::suvm::SyncUnits::odma0
+                                        : mlir::suvm::SyncUnits::odma1));
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.sunmmio_layout_transform") {
@@ -557,7 +580,9 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         ctx_.builder, type.MakeDebugLoc("sunmmio_layout_transform"), src, dst,
         mlir::suvm::PadModeAttr{}, require_odma_unit());
     VerifyAsyncOp(transform_op, "tl.sunmmio_layout_transform");
-    ctx_.AddPendingSyncUnits(mlir::suvm::SyncUnits::odma1);
+    ctx_.AddPendingSyncOperation(
+        transform_op.getOperation(),
+        SunmmioMlirContext::ToSyncUnitMask(mlir::suvm::SyncUnits::odma1));
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.sunmmio_transpose") {
@@ -583,7 +608,9 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         ctx_.builder, type.MakeDebugLoc("sunmmio_transpose"), src, dst,
         require_odma_unit());
     VerifyAsyncOp(transpose_op, "tl.sunmmio_transpose");
-    ctx_.AddPendingSyncUnits(mlir::suvm::SyncUnits::odma1);
+    ctx_.AddPendingSyncOperation(
+        transpose_op.getOperation(),
+        SunmmioMlirContext::ToSyncUnitMask(mlir::suvm::SyncUnits::odma1));
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.broadcast_") {
@@ -622,6 +649,7 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
           ctx_.builder, type.MakeDebugLoc("broadcast"), src, dst, mask,
           direction, require_odma_unit());
       VerifyA4EMulticastOp(mcast_op, "tl.broadcast_");
+      return mcast_op;
     };
     auto emit_link_sync = [&]() {
       mlir::suvm::SyncUnits link = direction == mlir::suvm::McastDirection::row
@@ -659,15 +687,18 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
 
       mlir::Block &then_block = if_op.getThenRegion().front();
       ctx_.builder.setInsertionPointToStart(&then_block);
-      create_mcast();
+      (void)create_mcast();
       emit_link_sync();
 
       ctx_.builder.setInsertionPointAfter(if_op);
     } else {
-      create_mcast();
-      ctx_.AddPendingSyncUnits(direction == mlir::suvm::McastDirection::row
-                                   ? mlir::suvm::SyncUnits::hlink
-                                   : mlir::suvm::SyncUnits::vlink);
+      auto mcast_op = create_mcast();
+      ctx_.AddPendingSyncOperation(
+          mcast_op.getOperation(),
+          SunmmioMlirContext::ToSyncUnitMask(
+              direction == mlir::suvm::McastDirection::row
+                  ? mlir::suvm::SyncUnits::hlink
+                  : mlir::suvm::SyncUnits::vlink));
     }
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
@@ -708,12 +739,13 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         require_bool_attr(SunMMIOCallAttrKey::kTransB, "tl.mma_sunmmio transB");
     mlir::UnitAttr trans_attr =
         trans_b ? ctx_.builder.getUnitAttr() : mlir::UnitAttr();
-
     auto mma_op = mlir::suvm::TcMmaOp::create(
         ctx_.builder, type.MakeDebugLoc("mma_sunmmio"), c, a, w, c, accumulate,
         trans_attr);
     VerifyAsyncOp(mma_op, "tl.mma_sunmmio");
-    ctx_.AddPendingSyncUnits(mlir::suvm::SyncUnits::tc);
+    ctx_.AddPendingSyncOperation(
+        mma_op.getOperation(),
+        SunmmioMlirContext::ToSyncUnitMask(mlir::suvm::SyncUnits::tc));
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tir.ret") {

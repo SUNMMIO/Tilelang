@@ -7,19 +7,20 @@ failure names exactly which pass is responsible.
 
 Passes run in order (mirroring phase.py LowerAndLegalize):
     01  BindTarget
-    02  ResolveSunmmioMeshSymbols
-    03  AddWrapperForSingleBufStore
-    04  LegalizeNegativeIndex
-    05  InjectAssumes
-    06  Simplify
-    07  InferSramScope
-    08  LayoutReducer
-    09  SunmmioLayoutInference
-    10  LowerTileOp
-    11  LowerL2Persistent
-    12  LegalizeVectorizedLoop
-    13  LegalizeSafeMemoryAccess
-    14  Simplify (2nd)
+    02  ValidateSunmmioFrontendSyntax
+    03  ResolveSunmmioMeshSymbols
+    04  AddWrapperForSingleBufStore
+    05  LegalizeNegativeIndex
+    06  InjectAssumes
+    07  Simplify
+    08  InferSramScope
+    09  LayoutReducer
+    10  SunmmioLayoutInference
+    11  LowerTileOp
+    12  LowerL2Persistent
+    13  LegalizeVectorizedLoop
+    14  LegalizeSafeMemoryAccess
+    15  Simplify (2nd)
 
 Kernel variants covered:
     1. Simple element-wise copy    — no shared memory, no T.Parallel
@@ -169,6 +170,9 @@ def run_lower_and_legalize_cascade(mod, target):
     mod = tir.transform.BindTarget(target)(mod)
     assert_threadless_invariants(mod, "BindTarget")
 
+    mod = tl_transform.ValidateSunmmioFrontendSyntax()(mod)
+    assert_threadless_invariants(mod, "ValidateSunmmioFrontendSyntax")
+
     mod = tl_transform.ResolveSunmmioMeshSymbols()(mod)
     assert_threadless_invariants(mod, "ResolveSunmmioMeshSymbols")
 
@@ -183,6 +187,9 @@ def run_lower_and_legalize_cascade(mod, target):
 
     mod = tl_transform.Simplify()(mod)
     assert_threadless_invariants(mod, "Simplify[1]")
+
+    mod = tl_transform.LegalizeSunmmioBatchGemmViews()(mod)
+    assert_threadless_invariants(mod, "LegalizeSunmmioBatchGemmViews")
 
     mod = tl_transform.InferSramScope()(mod)
     assert_threadless_invariants(mod, "InferSramScope")
