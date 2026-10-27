@@ -22,6 +22,7 @@ SUNMMIO_CLANG_CFLAGS = (
     "--target=riscv64-sunmmio-elf",
     "-mno-relax",
     "-O2",
+    "-flto=full",
 )
 SUNMMIO_LDFLAGS = (
     "-fuse-ld=lld",

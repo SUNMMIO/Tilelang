@@ -728,11 +728,13 @@ def test_sunmmio_sudeck_compile_emits_kernel_elf_without_thunk(tmp_path, monkeyp
     assert len(commands) == 4
     assert commands[0][:2] == [str(fake_toolchain.clangxx), "-c"]
     assert "--target=riscv64-sunmmio-elf" in commands[0]
+    assert "-flto=full" in commands[0]
     assert all(not flag.startswith("--sysroot=") for command in commands for flag in command)
     assert str(tmp_path / "kernel.ll") in commands[0]
     assert str(tmp_path / "kernel.o") in commands[0]
     assert commands[1][0] == str(fake_toolchain.clangxx)
     assert "-c" not in commands[1]
+    assert "-flto=full" in commands[1]
     assert str(tmp_path / "kernel.o") in commands[1]
     assert str(tmp_path / "kernel.elf") in commands[1]
     assert "-nostartfiles" in commands[1]
@@ -1276,6 +1278,7 @@ define void @elem_add_kernel(ptr addrspace(4) %0) #0 !sunmmio.kernel_meta !1 {
     assert "static inline void pwln_init()" in thunk
     assert len(commands) == 3
     assert all("--target=riscv64-sunmmio-elf" in command for command in commands)
+    assert all("-flto=full" in command for command in commands)
     assert all(not flag.startswith("--sysroot=") for command in commands for flag in command)
 
 
