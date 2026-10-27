@@ -320,12 +320,12 @@ SunMMIOValue SuvmSunmmioBuilder::RegionCall(
     const std::string &result_name, const std::string &buffer_handle,
     const std::vector<SunMMIOValue> &mins, const std::vector<int64_t> &extents,
     DataType ret_dtype, const SunMMIOType &ret_type, int64_t byte_offset,
-    bool preserve_region_rank,
+    bool preserve_region_rank, bool allow_rank3,
     const std::optional<std::vector<int64_t>> &planned_tiled_dims,
     const std::optional<std::vector<int64_t>> &planned_view_shape) {
   return call_->RegionCall(result_name, buffer_handle, mins, extents, ret_dtype,
                            ret_type, byte_offset, preserve_region_rank,
-                           planned_tiled_dims, planned_view_shape);
+                           allow_rank3, planned_tiled_dims, planned_view_shape);
 }
 
 std::pair<SunMMIOValue, SunMMIOValue> SuvmSunmmioBuilder::MXUnpack(

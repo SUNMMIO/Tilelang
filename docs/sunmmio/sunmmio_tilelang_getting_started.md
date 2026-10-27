@@ -319,14 +319,16 @@ The frontend currently provides the following communication operations:
 - `T.comm.broadcast(src, dst, src_core, direction=...)`
 - `T.comm.put(src, dst, src_core, dst_core)`
 - `T.comm.all_gather(send_buffer, recv_buffer, direction=..., axis=...)`
-- `T.comm.all_reduce(buffer, out, reduce_type, direction=..., dim=..., clear=...)`
+- `T.comm.all_reduce(buffer, out, reduce_type, direction=..., clear=...)`
 
 Their purposes are:
 
 - `broadcast`: Broadcast data from one source Core to a row, column, or the entire mesh.
 - `put`: Send data from one source Core to one destination Core.
 - `all_gather`: Collect local data from multiple Cores into a larger receive buffer.
-- `all_reduce`: Reduce data across multiple Cores and write the result to an output buffer.
+- `all_reduce`: Reduce corresponding elements across multiple Cores and write the result to an output buffer with the same local shape. It does not reduce a dimension inside the local buffer.
+
+On A4E, `all_reduce` payloads must have rank 1 to 3 and satisfy the multicast tile and 1024-byte link-segment constraints described in the user guide. Integer bitwise reductions require matching `int32` or `uint32`; `max`, `min`, and `absmax` require BF16 or FP32.
 
 ## Layout
 
