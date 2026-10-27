@@ -106,6 +106,7 @@ jobs:
       NPUIR_CACHE_ROOT: /ci-cache/npuir
       CLANG_TIDY_VENV: /tmp/tilelang-clang-tidy-venv
       TEST_VENV: /tmp/tilelang-test-venv
+      PYTEST_XDIST_WORKERS: "3"
       CLANG_TIDY_BUILD_DIR: /tmp/tilelang-clang-tidy-build
       RUN_CLANG_TIDY_SCRIPT: /tmp/run-clang-tidy.py
     defaults:
@@ -366,7 +367,9 @@ jobs:
             --python "${TEST_VENV}/bin/python" \
             --index-url https://download.pytorch.org/whl/cpu \
             torch
-          uv pip install --python "${TEST_VENV}/bin/python" -v "pytest>=6.2.4"
+          uv pip install --python "${TEST_VENV}/bin/python" -v \
+            "pytest>=6.2.4" \
+            "pytest-xdist>=2.2.1"
 
       - name: Install project (wheel form)
         run: |
@@ -381,7 +384,8 @@ jobs:
           . "${TEST_VENV}/bin/activate"
           PYTEST=(
             uv run --no-project -m --
-            pytest --verbose --color=yes --durations=0 --showlocals --cache-clear
+            pytest --verbose --color=yes --durations=0 --showlocals --cache-clear \
+              -n "${PYTEST_XDIST_WORKERS}" --dist=loadfile
           )
           "${PYTEST[@]}" \
             -c testing/pytest.ini \
