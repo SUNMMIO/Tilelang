@@ -257,9 +257,9 @@ Layout constructors available for advanced scenarios include:
 from tilelang.layout import (
     make_row_major,
     make_zz_layout,
-    make_zn_layout,
+    make_nz_layout,
     make_zzz_layout,
-    make_nzz_layout,
+    make_zzn_layout,
 )
 ```
 
@@ -571,15 +571,15 @@ B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
 C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 ```
 
-**`make_zn_layout`**
+**`make_nz_layout`**
 
 ```python
-from tilelang.layout import make_zn_layout
+from tilelang.layout import make_nz_layout
 
-layout = make_zn_layout(shape, axes, block_shape)
+layout = make_nz_layout(shape, axes, block_shape)
 ```
 
-`make_zn_layout` constructs a ZN layout.
+`make_nz_layout` constructs an NZ layout.
 
 - `shape`: logical tensor shape.
 - `axes`: dimensions participating in the layout transform.
@@ -603,21 +603,25 @@ layout = make_zzz_layout(shape, axes, block_shape, cluster_shape)
 - `cluster_shape`: cluster-level organization shape.
 - Return value: a layout object.
 
-**`make_nzz_layout`**
+**`make_zzn_layout`**
 
 ```python
-from tilelang.layout import make_nzz_layout
+from tilelang.layout import make_zzn_layout
 
-layout = make_nzz_layout(shape, axes, block_shape, cluster_shape)
+layout = make_zzn_layout(shape, axes, block_shape, cluster_shape)
 ```
 
-`make_nzz_layout` constructs an NZZ layout with cluster organization.
+`make_zzn_layout` constructs a ZZN layout with cluster organization.
 
 - `shape`: logical tensor shape.
 - `axes`: dimensions participating in the layout transform.
 - `block_shape`: shape of each block.
 - `cluster_shape`: cluster-level organization shape.
 - Return value: a layout object.
+
+Layout form letters are read from the innermost block level outward, matching
+NPU-IR terminology. `make_zn_layout` and `make_nzz_layout` remain available as
+deprecated aliases for `make_nz_layout` and `make_zzn_layout`, respectively.
 
 **`T.annotate_layout`**
 
@@ -755,7 +759,7 @@ T.transpose(src, dst)
 - `src`: a complete rank-2 RSRAM buffer with shape `[M, N]`.
 - `dst`: a complete rank-2 RSRAM buffer with shape `[N, M]`. It must not alias `src`.
 - The source and destination must have the same dtype. The supported dtypes are `bfloat16` and `float32`.
-- Shapes must be static, with every dimension a multiple of 32. Both buffers must use the same two-level 32x32 blockwise layout family, either ZZ or ZN.
+- Shapes must be static, with every dimension a multiple of 32. Both buffers must use the same two-level 32x32 blockwise layout family, either ZZ or NZ.
 - Return value: a statement expressing the transpose operation.
 
 ODMA transpose is asynchronous. The compiler inserts synchronization before a dependent access. Slices, partial regions, and buffers outside RSRAM are not supported.

@@ -345,18 +345,22 @@ layout 描述的是逻辑排布到物理排布的映射。逻辑排布指用户�
 - `make_row_major`
 - `make_aligned_row_major`
 - `make_zz_layout`
-- `make_zn_layout`
+- `make_nz_layout`
 - `make_zzz_layout`
-- `make_nzz_layout`
+- `make_zzn_layout`
 
 其中：
 
 - `make_row_major` 是普通 row major
 - `make_aligned_row_major` 是带对齐约束的 row major
 - `make_zz_layout` 是 blockwise row-major
-- `make_zn_layout` 是 blockwise col-major
+- `make_nz_layout` 是 blockwise col-major
 - `make_zzz_layout` 是 clustered row-major
-- `make_nzz_layout` 是 clustered col-major
+- `make_zzn_layout` 是 clustered col-major
+
+Layout 形式名称按照从最内层 block 向外层读取，与 NPU-IR 的术语保持一致。
+原有的 `make_zn_layout` 和 `make_nzz_layout` 仍作为 `make_nz_layout` 和
+`make_zzn_layout` 的弃用兼容别名保留。
 
 ### 2. 什么时候需要显式 layout
 

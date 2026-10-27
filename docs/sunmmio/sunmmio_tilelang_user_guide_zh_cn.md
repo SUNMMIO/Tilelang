@@ -257,9 +257,9 @@ Layout 描述 tensor 或 buffer 在内存中的组织方式。它和 sharding �
 from tilelang.layout import (
     make_row_major,
     make_zz_layout,
-    make_zn_layout,
+    make_nz_layout,
     make_zzz_layout,
-    make_nzz_layout,
+    make_zzn_layout,
 )
 ```
 
@@ -571,15 +571,15 @@ B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
 C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 ```
 
-**`make_zn_layout`**
+**`make_nz_layout`**
 
 ```python
-from tilelang.layout import make_zn_layout
+from tilelang.layout import make_nz_layout
 
-layout = make_zn_layout(shape, axes, block_shape)
+layout = make_nz_layout(shape, axes, block_shape)
 ```
 
-`make_zn_layout` 构造 ZN layout。
+`make_nz_layout` 构造 NZ layout。
 
 - `shape`：tensor 的逻辑 shape。
 - `axes`：参与布局变换的维度。
@@ -603,21 +603,25 @@ layout = make_zzz_layout(shape, axes, block_shape, cluster_shape)
 - `cluster_shape`：cluster 级组织形状。
 - 返回值：layout 对象。
 
-**`make_nzz_layout`**
+**`make_zzn_layout`**
 
 ```python
-from tilelang.layout import make_nzz_layout
+from tilelang.layout import make_zzn_layout
 
-layout = make_nzz_layout(shape, axes, block_shape, cluster_shape)
+layout = make_zzn_layout(shape, axes, block_shape, cluster_shape)
 ```
 
-`make_nzz_layout` 构造带 cluster 组织的 NZZ layout。
+`make_zzn_layout` 构造带 cluster 组织的 ZZN layout。
 
 - `shape`：tensor 的逻辑 shape。
 - `axes`：参与布局变换的维度。
 - `block_shape`：每个 block 的形状。
 - `cluster_shape`：cluster 级组织形状。
 - 返回值：layout 对象。
+
+Layout 形式名称按照从最内层 block 向外层读取，与 NPU-IR 术语保持一致。
+`make_zn_layout` 和 `make_nzz_layout` 仍作为 `make_nz_layout` 和
+`make_zzn_layout` 的弃用兼容别名保留。
 
 **`T.annotate_layout`**
 
@@ -755,7 +759,7 @@ T.transpose(src, dst)
 - `src`：shape 为 `[M, N]` 的完整 rank-2 RSRAM buffer。
 - `dst`：shape 为 `[N, M]` 的完整 rank-2 RSRAM buffer，不能与 `src` 指向同一 buffer。
 - 源和目标的 dtype 必须一致，当前支持 `bfloat16` 和 `float32`。
-- shape 必须是静态值，且每一维都是 32 的倍数。两个 buffer 必须使用同一种两级 32x32 blockwise layout，即 ZZ 或 ZN。
+- shape 必须是静态值，且每一维都是 32 的倍数。两个 buffer 必须使用同一种两级 32x32 blockwise layout，即 ZZ 或 NZ。
 - 返回值：表达转置操作的语句。
 
 ODMA 转置是异步操作，编译器会在后续依赖访问之前插入同步。当前不支持 slice、局部 region 或 RSRAM 之外的 buffer。

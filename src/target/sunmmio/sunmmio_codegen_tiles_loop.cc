@@ -803,6 +803,16 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
                              memtensor_type.layout_dim_levels[1] == 1 &&
                              layout_shape.size() == 2 && strides.size() == 2 &&
                              strides[1] == 1 && strides[0] == layout_shape[1];
+    // A contiguous full-width tile only needs RSRAM transfer alignment,
+    // not a full vector register.  Preserve the direct load/store path for
+    // these tiles before considering wider read-modify-write carriers.
+    if (is_flat_row_major && access->tile_shape[1] == layout_shape[1] &&
+        layout_shape[0] % access->tile_shape[0] == 0 &&
+        (logical_elems * dtype.bits()) %
+                (tile_processor_config.rsram_align_bytes * 8) ==
+            0) {
+      return;
+    }
     if (is_flat_row_major && logical_elems < capacity_elems) {
       int64_t carrier_width = layout_shape[1];
       bool legal_carrier =
@@ -1943,15 +1953,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
     if (loop_it == scope.domain_loops.end()) {
       return std::nullopt;
     }
-    size_t loop_axis =
-        static_cast<size_t>(std::distance(scope.domain_loops.begin(), loop_it));
-    ICHECK_LT(loop_axis, scope.domain_values.size());
     auto execution_axis = GetExecutionAxisAnnotation(loop);
     if (!execution_axis.has_value()) {
-      // Tiles lowering replaces the complete source extent with the
-      // materialized domain value instead of recursively lowering it.
-      MarkVisitedExprTree(loop->extent);
-      return scope.domain_values[loop_axis];
+      // Reduction lowering can reorder non-tiled axes. Lexical loop position
+      // therefore does not identify the corresponding logical domain axis.
+      return EnsureIndex(EvalExpr(loop->extent));
     }
     ICHECK_GE(execution_axis.value(), 0);
     ICHECK_LT(static_cast<size_t>(execution_axis.value()),

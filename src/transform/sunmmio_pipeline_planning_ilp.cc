@@ -1726,15 +1726,39 @@ std::string SummarizeStmtForName(const Stmt &stmt) {
     if (const auto *eval = block->block->body.as<EvaluateNode>()) {
       if (const auto *call = eval->value.as<CallNode>()) {
         if (call->op.same_as(Op::Get("tl.mma_sunmmio"))) {
-          auto A = call->args[0].as<CallNode>();
-          auto B = call->args[1].as<CallNode>();
-          if (A && B && A->args.size() >= 4 && B->args.size() >= 4) {
-            return "mma_sunmmio(" +
-                   std::to_string(A->args[2].as<IntImmNode>()->value) + "x" +
-                   std::to_string(B->args[3].as<IntImmNode>()->value) + "x" +
-                   std::to_string(A->args[3].as<IntImmNode>()->value) + ")";
+          BufferRegion a = NormalizeToBufferRegion(call->args[0]);
+          BufferRegion b = NormalizeToBufferRegion(call->args[1]);
+          BufferRegion c = NormalizeToBufferRegion(call->args[2]);
+          auto static_extent = [](const BufferRegion &region,
+                                  int axis) -> std::optional<int64_t> {
+            int rank = static_cast<int>(region->region.size());
+            int normalized_axis = axis < 0 ? rank + axis : axis;
+            if (normalized_axis < 0 || normalized_axis >= rank)
+              return std::nullopt;
+            const auto *extent =
+                region->region[normalized_axis]->extent.as<IntImmNode>();
+            return extent ? std::optional<int64_t>(extent->value)
+                          : std::nullopt;
+          };
+          auto m = static_extent(c, -2);
+          auto n = static_extent(c, -1);
+          auto k = static_extent(a, -1);
+          if (!m || !n || !k)
+            return "mma_sunmmio";
+          int64_t batch = 1;
+          for (const BufferRegion &region : {a, b, c}) {
+            auto extent = static_extent(region, 0);
+            if (region->region.size() == 3 && extent && *extent > 1)
+              batch = *extent;
           }
-          return "mma_sunmmio";
+          std::string matrix = std::to_string(*m) + "x" + std::to_string(*n) +
+                               "x" + std::to_string(*k);
+          if (c->region.size() == 3)
+            return "mma_sunmmio(" + std::to_string(batch) + "x" + matrix + ")";
+          if (batch > 1)
+            return "mma_sunmmio(" + std::to_string(batch) + "x" + matrix +
+                   "->" + std::to_string(*m) + "x" + std::to_string(*n) + ")";
+          return "mma_sunmmio(" + matrix + ")";
         }
       }
     }

@@ -74,6 +74,25 @@ def _valid_extent(tile_index, block, total):
 
 
 @target("Sunmmio")
+def redundant_sync_reduce_kernel_builder(reduce_op):
+    @T.prim_func
+    def main(B: T.Tensor((16,), T.float32), value: T.float32):
+        with T.Kernel():
+            score = T.alloc_shared((16, 64), T.float32, scope="shared.rsram")
+            result = T.alloc_shared((16,), T.float32, scope="shared.rsram")
+            T.annotate_layout({score: make_zz_layout((16, 64), block_shape=(16, 32))})
+            for i, j in T.Tiles((16, 64)):
+                score[i, j] = value
+            if reduce_op == "max":
+                T.reduce_max(score, result, dim=1, clear=True)
+            else:
+                T.reduce_sum(score, result, dim=1, clear=True)
+            T.copy(result, B)
+
+    return main
+
+
+@target("Sunmmio")
 def reduce_kernel_builder(
     shape,
     reduce_axis,
@@ -113,6 +132,29 @@ def reduce_kernel_builder(
             T.copy(Out_shared, Out)
 
     return main
+
+
+@pytest.mark.parametrize(
+    "reduce_op,combine_op",
+    [("max", "suvm.tile.maxf"), ("sum", "suvm.tile.addf")],
+)
+def test_reduce_elides_only_empty_syncs(tmp_path, reduce_op, combine_op):
+    src = validate_sunmmio_codegen_loose(
+        redundant_sync_reduce_kernel_builder(reduce_op),
+        tmp_path,
+        mlir_filename=f"reduce_{reduce_op}_without_empty_syncs.mlir",
+        expected_tokens=(combine_op, "suvm.tile.reduce"),
+    )
+
+    sync_lines = [line for line in src.splitlines() if "suvm.sync" in line]
+    assert len(sync_lines) == 3
+    assert sum("vector,rsram" in line.replace(" ", "") for line in sync_lines) == 2
+    assert sum("odma0" in line for line in sync_lines) == 1
+    assert not re.search(r"suvm\.tile\.fill[^\n]*\n\s*suvm\.sync", src)
+    assert not re.search(
+        rf"suvm\.tile\.load[^\n]*\n[^\n]*{re.escape(combine_op)}[^\n]*\n\s*suvm\.sync",
+        src,
+    )
 
 
 @target("Sunmmio")

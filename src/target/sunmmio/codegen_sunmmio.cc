@@ -2314,7 +2314,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
   };
   auto emit_blockwise_data_copy = [&](const SunMMIOValue &src,
                                       const SunMMIOValue &dst, DataType dtype,
-                                      bool zn_order) {
+                                      bool nz_order) {
     std::vector<int64_t> physical = ExtractPhysicalExtents(src.type);
     ICHECK_EQ(physical.size(), 2U);
     ICHECK_EQ(physical[0] % 32, 0);
@@ -2322,7 +2322,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
     int64_t block_m = physical[0] / 32;
     int64_t block_n = physical[1] / 32;
     std::vector<int64_t> tiled_dims =
-        zn_order ? std::vector<int64_t>{1, 0} : std::vector<int64_t>{0, 1};
+        nz_order ? std::vector<int64_t>{1, 0} : std::vector<int64_t>{0, 1};
 
     std::string bm_name = NewValueName();
     begin_for(bm_name, block_m);
@@ -2376,9 +2376,9 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
                                                mx_buffer->dtype, &analyzer);
   ICHECK(analysis.has_value())
       << "tl.mx_pack/unpack supports only MX row-major, MXZZ, and MXZNZ";
-  ICHECK(analysis->kind != tl::sunmmio::MXLayoutKind::kMXZNN)
-      << "tl.mx_pack/unpack does not accept MXZNN as a user mx buffer layout; "
-         "use MXZNZ for RSRAM data staged before WSRAM MXZNN";
+  ICHECK(analysis->kind != tl::sunmmio::MXLayoutKind::kMXNNZ)
+      << "tl.mx_pack/unpack does not accept MXNNZ as a user mx buffer layout; "
+         "use MXZNZ for RSRAM data staged before WSRAM MXNNZ";
 
   const BufferBinding &data_binding = LookupBuffer(data_buffer);
   const BufferBinding &scale_binding = LookupBuffer(scale_buffer);
@@ -2406,10 +2406,10 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
   case tl::sunmmio::MXLayoutKind::kMXZZ:
   case tl::sunmmio::MXLayoutKind::kMXZNZ:
     emit_blockwise_data_copy(data_src, data_dst, data_buffer->dtype,
-                             /*zn_order=*/false);
+                             /*nz_order=*/false);
     break;
-  case tl::sunmmio::MXLayoutKind::kMXZNN:
-    LOG(FATAL) << "MXZNN is an internal WSRAM layout and is not accepted by "
+  case tl::sunmmio::MXLayoutKind::kMXNNZ:
+    LOG(FATAL) << "MXNNZ is an internal WSRAM layout and is not accepted by "
                   "tl.mx_pack/unpack";
     break;
   }
@@ -2497,7 +2497,8 @@ const char *CodeGenTileLangSunMMIO::CallBucketName(CallBucket bucket) const {
 
 SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
     const tvm::PrimExpr &region_expr, int64_t byte_offset,
-    bool use_layout_covered_shape, bool preserve_unit_dims, bool allow_rank3) {
+    bool use_layout_covered_shape, bool preserve_region_rank,
+    bool allow_rank3) {
   BufferRegion region = NormalizeRegionTracked(region_expr);
   const BufferBinding &binding = LookupBuffer(region->buffer);
   std::vector<int64_t> effective_extents;
@@ -2549,7 +2550,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
   std::string result_name = region_expr.dtype().is_void() ? "" : NewValueName();
   return builder_->RegionCall(result_name, binding.handle, mins, extents,
                               region_expr.dtype(), ret_ty, byte_offset,
-                              preserve_unit_dims, allow_rank3);
+                              preserve_region_rank, allow_rank3);
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
@@ -2712,11 +2713,11 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     operands.push_back(
         EmitRegionCall(op->args[0], /*byte_offset=*/0,
                        /*use_layout_covered_shape=*/is_unit_axis_2d_transform,
-                       /*preserve_unit_dims=*/is_unit_axis_2d_transform));
+                       /*preserve_region_rank=*/is_unit_axis_2d_transform));
     operands.push_back(
         EmitRegionCall(op->args[1], /*byte_offset=*/0,
                        /*use_layout_covered_shape=*/is_unit_axis_2d_transform,
-                       /*preserve_unit_dims=*/is_unit_axis_2d_transform));
+                       /*preserve_region_rank=*/is_unit_axis_2d_transform));
 
     ICHECK(TryConsumeSunmmioOdmaUnit(op->args[2], &attrs))
         << "tl.sunmmio_layout_transform expects third argument to be "
@@ -2807,11 +2808,11 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     operands.push_back(
         EmitRegionCall(op->args[tl::kBroadcastArgSrc], src_offset_byte,
                        /*use_layout_covered_shape=*/false,
-                       /*preserve_unit_dims=*/false, allow_rank3));
+                       /*preserve_region_rank=*/false, allow_rank3));
     operands.push_back(
         EmitRegionCall(op->args[tl::kBroadcastArgDst], /*byte_offset=*/0,
                        /*use_layout_covered_shape=*/false,
-                       /*preserve_unit_dims=*/false, allow_rank3));
+                       /*preserve_region_rank=*/false, allow_rank3));
     operands.push_back(EvalExpr(op->args[tl::kBroadcastArgMask]));
     if (fixed_and_source_args ==
         static_cast<size_t>(tl::kBroadcastArgCount + 1)) {
@@ -2841,9 +2842,15 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     MarkVisitedNodeType(acc_offset_imm->GetTypeKey());
 
     operands.reserve(4);
-    operands.push_back(EmitRegionCall(op->args[0]));
-    operands.push_back(EmitRegionCall(op->args[1]));
-    operands.push_back(EmitRegionCall(op->args[2], acc_offset_byte));
+    operands.push_back(EmitRegionCall(op->args[0], /*byte_offset=*/0,
+                                      /*use_layout_covered_shape=*/false,
+                                      /*preserve_region_rank=*/true));
+    operands.push_back(EmitRegionCall(op->args[1], /*byte_offset=*/0,
+                                      /*use_layout_covered_shape=*/false,
+                                      /*preserve_region_rank=*/true));
+    operands.push_back(EmitRegionCall(op->args[2], acc_offset_byte,
+                                      /*use_layout_covered_shape=*/false,
+                                      /*preserve_region_rank=*/true));
 
     MarkVisitedNodeType(op->args[5]->GetTypeKey());
     arith::Analyzer analyzer;

@@ -345,18 +345,22 @@ The frontend currently provides the following SunMMIO layout constructors:
 - `make_row_major`
 - `make_aligned_row_major`
 - `make_zz_layout`
-- `make_zn_layout`
+- `make_nz_layout`
 - `make_zzz_layout`
-- `make_nzz_layout`
+- `make_zzn_layout`
 
 Their meanings are:
 
 - `make_row_major` creates a standard row-major layout.
 - `make_aligned_row_major` creates a row-major layout with alignment constraints.
 - `make_zz_layout` creates a blockwise row-major layout.
-- `make_zn_layout` creates a blockwise column-major layout.
+- `make_nz_layout` creates a blockwise column-major layout.
 - `make_zzz_layout` creates a clustered row-major layout.
-- `make_nzz_layout` creates a clustered column-major layout.
+- `make_zzn_layout` creates a clustered column-major layout.
+
+Layout form letters are read from the innermost block level outward, matching
+NPU-IR terminology. The former `make_zn_layout` and `make_nzz_layout` names
+remain as deprecated aliases for `make_nz_layout` and `make_zzn_layout`.
 
 ### 2. When to Specify a Layout Explicitly
 
