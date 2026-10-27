@@ -740,7 +740,8 @@ def test_sunmmio_sudeck_compile_emits_kernel_elf_without_thunk(tmp_path, monkeyp
     assert "-nostartfiles" in commands[1]
     assert "-lnosys" in commands[1]
     assert commands[2][:5] == ["cmake", "-S", str(tmp_path), "-B", str(tmp_path / "sudeck_launcher_cmake")]
-    assert f"-DCMAKE_PREFIX_PATH={sudeck_root.resolve()}" in commands[2]
+    prefix_arg = next(arg for arg in commands[2] if arg.startswith("-DCMAKE_PREFIX_PATH="))
+    assert str(sudeck_root.resolve()) in prefix_arg.removeprefix("-DCMAKE_PREFIX_PATH=").split(";")
     assert commands[3] == [
         "cmake",
         "--build",
@@ -1247,6 +1248,9 @@ define void @elem_add_kernel(ptr addrspace(4) %0) #0 !sunmmio.kernel_meta !1 {
     def fake_mlir_to_llvm_ir(mlir_path, llvm_path):
         Path(llvm_path).write_text(llvm_source, encoding="utf-8")
 
+    device_ld = tmp_path / "sysroot" / "riscv64-unknown-elf" / "lib" / "sunmmio" / "sunmmio-a4e" / "device.ld"
+    device_ld.parent.mkdir(parents=True)
+    device_ld.write_text("SECTIONS {}\n", encoding="utf-8")
     fake_toolchain = SunmmioToolchain(root=tmp_path, clangxx=tmp_path / "clang++")
     commands = []
 
@@ -1271,8 +1275,10 @@ define void @elem_add_kernel(ptr addrspace(4) %0) #0 !sunmmio.kernel_meta !1 {
     thunk = (tmp_path / "main_thunk.cpp").read_text(encoding="utf-8")
 
     assert generator.runtime_kernel_name == "elem_add_kernel"
-    assert "void elem_add_kernel(void *args);" in thunk
-    assert "elem_add_kernel(const_cast<unsigned char *>(_kernel_arg_start));" in thunk
+    assert "__device void elem_add_kernel(void *args);" in thunk
+    assert "__device int main(void)" in thunk
+    assert "extern unsigned char _su_kernarg_addr[];" in thunk
+    assert "elem_add_kernel(_su_kernarg_addr);" in thunk
     assert '#include "pwln_setup.h"' not in thunk
     assert 'section(".r.sram.common")' in thunk
     assert "static inline void pwln_init()" in thunk
@@ -1280,6 +1286,10 @@ define void @elem_add_kernel(ptr addrspace(4) %0) #0 !sunmmio.kernel_meta !1 {
     assert all("--target=riscv64-sunmmio-elf" in command for command in commands)
     assert all("-flto=full" in command for command in commands)
     assert all(not flag.startswith("--sysroot=") for command in commands for flag in command)
+    assert "-Wl,--defsym=_su_kernarg_addr=DTCM_KERNARGS_START" in commands[2]
+    assert f"-Wl,-T,{device_ld}" in commands[2]
+    assert f"-Wl,-T,{tmp_path / 'pwln.ld'}" in commands[2]
+    assert ".r.sram.common RSRAM_BASE" in (tmp_path / "pwln.ld").read_text(encoding="utf-8")
 
 
 @tilelang.jit(target="sunmmio")
