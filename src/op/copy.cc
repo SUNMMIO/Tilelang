@@ -202,8 +202,61 @@ MakeRegionPlanAnnotations(const std::vector<int64_t> &tiled_dims,
   return annotations;
 }
 
-} // namespace
+static bool SameLayoutIgnoringSingletonModes(const Layout &lhs,
+                                             const Layout &rhs,
+                                             arith::Analyzer *analyzer) {
+  const auto *lhs_cute = lhs.as<CuteLayoutNode>();
+  const auto *rhs_cute = rhs.as<CuteLayoutNode>();
+  if (!lhs_cute || !rhs_cute ||
+      lhs->InputShape().size() != rhs->InputShape().size()) {
+    return false;
+  }
+  for (size_t dim = 0; dim < lhs->InputShape().size(); ++dim) {
+    if (!analyzer->CanProveEqual(lhs->InputShape()[dim],
+                                 rhs->InputShape()[dim])) {
+      return false;
+    }
+  }
 
+  Array<Integer> lhs_levels = lhs_cute->GetDimLevels();
+  Array<Integer> rhs_levels = rhs_cute->GetDimLevels();
+  if (lhs_levels.size() != rhs_levels.size())
+    return false;
+  Array<PrimExpr> lhs_shapes = lhs_cute->GetModeShape();
+  Array<PrimExpr> rhs_shapes = rhs_cute->GetModeShape();
+  Array<PrimExpr> lhs_strides = lhs_cute->GetModeStride();
+  Array<PrimExpr> rhs_strides = rhs_cute->GetModeStride();
+  size_t lhs_offset = 0, rhs_offset = 0;
+  for (size_t dim = 0; dim < lhs_levels.size(); ++dim) {
+    std::vector<std::pair<PrimExpr, PrimExpr>> lhs_modes;
+    std::vector<std::pair<PrimExpr, PrimExpr>> rhs_modes;
+    for (int level = 0; level < lhs_levels[dim].IntValue(); ++level) {
+      if (!analyzer->CanProveEqual(lhs_shapes[lhs_offset + level], 1))
+        lhs_modes.emplace_back(lhs_shapes[lhs_offset + level],
+                               lhs_strides[lhs_offset + level]);
+    }
+    for (int level = 0; level < rhs_levels[dim].IntValue(); ++level) {
+      if (!analyzer->CanProveEqual(rhs_shapes[rhs_offset + level], 1))
+        rhs_modes.emplace_back(rhs_shapes[rhs_offset + level],
+                               rhs_strides[rhs_offset + level]);
+    }
+    lhs_offset += lhs_levels[dim].IntValue();
+    rhs_offset += rhs_levels[dim].IntValue();
+    if (lhs_modes.size() != rhs_modes.size())
+      return false;
+    for (size_t mode = 0; mode < lhs_modes.size(); ++mode) {
+      if (!analyzer->CanProveEqual(lhs_modes[mode].first,
+                                   rhs_modes[mode].first) ||
+          !analyzer->CanProveEqual(lhs_modes[mode].second,
+                                   rhs_modes[mode].second)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+} // namespace
 // Constructs a Copy operator node from call arguments and annotations.
 // args[0]: source region, args[1]: destination region
 // annotations: Map containing coalesced_width, disable_tma, eviction_policy,
@@ -633,7 +686,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
   // assigned by other operators.
   //
   // Hard constraint: DRAM → ASRAM/WSRAM requires ZZ-like DRAM layout
-  // (ZZ, ZZZ, or NZZ).  DRAM layouts are user-specified and immutable,
+  // (ZZ, ZZZ, or ZZN).  DRAM layouts are user-specified and immutable,
   // so an incompatible layout is a hard error.
   if (copy_inst == CopyInst::kSunmmioDMACopy) {
     if (src.scope() == "global" && (dst.scope() == kSunmmioScopeASRAM ||
@@ -641,7 +694,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
       if (T.global_layout_map.count(src)) {
         auto dram_layout = T.global_layout_map[src];
         auto *cute = dram_layout.as<CuteLayoutNode>();
-        // Only validate user-specified blocked layouts (ZZ, ZN, ZZZ, NZZ).
+        // Only validate user-specified blocked layouts (ZZ, NZ, ZZZ, ZZN).
         // Row-major (default for unspecified DRAM) has no blocked dims and
         // is handled by the dma_copy / layout-transform split — skip the
         // check.
@@ -656,7 +709,7 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
           if (has_blocked) {
             ICHECK(sunmmio::IsZZLike(dram_layout))
                 << "DRAM → " << dst.scope()
-                << " copy requires ZZ-like DRAM layout (ZZ, ZZZ, or NZZ), "
+                << " copy requires ZZ-like DRAM layout (ZZ, ZZZ, or ZZN), "
                 << "but buffer \"" << src->name << "\" has incompatible layout";
           }
         }
@@ -1039,10 +1092,64 @@ Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
   }
 
   if (dst.scope() == kSunmmioScopeWSRAM || dst.scope() == kSunmmioScopeASRAM) {
-    return Evaluate(Call(DataType::Handle(), dma_copy(),
-                         {MakeRegionExpr(src, src_range, /*access_mask=*/1),
-                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-                          IntImm(DataType::Int(32), GetSrcOffsetByte())}));
+    auto emit_dma = [&](const Array<Range> &src_view,
+                        const Array<Range> &dst_view) {
+      return Evaluate(Call(DataType::Handle(), dma_copy(),
+                           {MakeRegionExpr(src, src_view, /*access_mask=*/1),
+                            MakeRegionExpr(dst, dst_view, /*access_mask=*/2),
+                            IntImm(DataType::Int(32), GetSrcOffsetByte())}));
+    };
+
+    // Preserve NPU-IR's native rank-3 DMA when both layouts have the same
+    // physical mapping. If the bank layout changes the matrix mapping, issue
+    // one rank-2 DMA per static batch because that transform cannot be encoded
+    // together with a batch stride.
+    if (src_range.size() == 3 && dst_range.size() == 3 &&
+        !analyzer->CanProveEqual(src_range[0]->extent, 1)) {
+      auto layout_of = [&](const Buffer &buffer) {
+        const LayoutMap &layouts =
+            buffer.scope() == "global" ? T.global_layout_map : T.layout_map;
+        return layouts.count(buffer) ? layouts[buffer] : Layout();
+      };
+      Layout src_layout = layout_of(src);
+      Layout dst_layout = layout_of(dst);
+      bool leading_indices_are_tile_aligned =
+          analyzer->CanProve(
+              FloorMod(src_range[0]->min, src_range[0]->extent) == 0) &&
+          analyzer->CanProve(
+              FloorMod(dst_range[0]->min, dst_range[0]->extent) == 0);
+      if (leading_indices_are_tile_aligned && src_layout.defined() &&
+          dst_layout.defined() &&
+          (IsLayoutMatch(src_layout, dst_layout, analyzer) ||
+           SameLayoutIgnoringSingletonModes(src_layout, dst_layout,
+                                            analyzer))) {
+        return emit_dma(src_range, dst_range);
+      }
+
+      const auto *src_batch = src_range[0]->extent.as<IntImmNode>();
+      const auto *dst_batch = dst_range[0]->extent.as<IntImmNode>();
+      ICHECK(src_batch && dst_batch)
+          << "Sunmmio bank copy requires a static batch extent";
+      ICHECK_EQ(src_batch->value, dst_batch->value)
+          << "Sunmmio bank copy source and destination batch extents must "
+             "match";
+
+      Array<Stmt> slices;
+      slices.reserve(src_batch->value);
+      for (int64_t batch = 0; batch < src_batch->value; ++batch) {
+        Array<Range> src_slice = src_range;
+        Array<Range> dst_slice = dst_range;
+        PrimExpr src_offset = make_const(src_slice[0]->min.dtype(), batch);
+        PrimExpr dst_offset = make_const(dst_slice[0]->min.dtype(), batch);
+        src_slice.Set(0, Range::FromMinExtent(src_slice[0]->min + src_offset,
+                                              Integer(1)));
+        dst_slice.Set(0, Range::FromMinExtent(dst_slice[0]->min + dst_offset,
+                                              Integer(1)));
+        slices.push_back(emit_dma(src_slice, dst_slice));
+      }
+      return SeqStmt::Flatten(slices);
+    }
+    return emit_dma(src_range, dst_range);
   }
   return LowerSunmmioDramRsramCopy(T, analyzer);
 }
@@ -1052,8 +1159,43 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   PrimExpr src_region = MakeRegionExpr(src, src_range, /*access_mask=*/1);
   PrimExpr dst_region = MakeRegionExpr(dst, dst_range, /*access_mask=*/2);
   PrimExpr src_offset = IntImm(DataType::Int(32), GetSrcOffsetByte());
-  auto dma = [&](PrimExpr a, PrimExpr b) {
+  auto emit_dma = [&](PrimExpr a, PrimExpr b) {
     return Evaluate(Call(DataType::Handle(), dma_copy(), {a, b, src_offset}));
+  };
+  auto dma = [&](PrimExpr a, PrimExpr b) -> Stmt {
+    BufferRegion src_view = NormalizeToBufferRegion(a);
+    BufferRegion dst_view = NormalizeToBufferRegion(b);
+
+    // A rank-3 tile-view index is measured in units of that view's extent. A
+    // sub-batch [1:3] therefore cannot be represented as index=1, extent=2
+    // (that would address [2:4]). Split unaligned leading views into fixed
+    // matrix planes, for which extent=1 preserves the exact batch index.
+    if (src_view->region.size() == 3 && dst_view->region.size() == 3 &&
+        !analyzer->CanProveEqual(src_view->region[0]->extent, 1) &&
+        (!analyzer->CanProve(FloorMod(src_view->region[0]->min,
+                                      src_view->region[0]->extent) == 0) ||
+         !analyzer->CanProve(FloorMod(dst_view->region[0]->min,
+                                      dst_view->region[0]->extent) == 0))) {
+      const auto *src_batch = src_view->region[0]->extent.as<IntImmNode>();
+      const auto *dst_batch = dst_view->region[0]->extent.as<IntImmNode>();
+      ICHECK(src_batch && dst_batch && src_batch->value == dst_batch->value)
+          << "Sunmmio sub-batch copy requires equal static batch extents";
+      Array<Stmt> slices;
+      slices.reserve(src_batch->value);
+      for (int64_t batch = 0; batch < src_batch->value; ++batch) {
+        Array<Range> src_slice = src_view->region;
+        Array<Range> dst_slice = dst_view->region;
+        src_slice.Set(
+            0, Range::FromMinExtent(src_slice[0]->min + Integer(batch), 1));
+        dst_slice.Set(
+            0, Range::FromMinExtent(dst_slice[0]->min + Integer(batch), 1));
+        slices.push_back(
+            emit_dma(MakeRegionExpr(src_view->buffer, src_slice, /*read=*/1),
+                     MakeRegionExpr(dst_view->buffer, dst_slice, /*write=*/2)));
+      }
+      return SeqStmt::Flatten(slices);
+    }
+    return emit_dma(a, b);
   };
   auto layout_of = [&](const Buffer &b) {
     const LayoutMap &m =
@@ -1265,12 +1407,12 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
     carrier.canonical_carrier_shape = remove_leading_singletons(physical_shape);
     if (carrier.canonical_logical_shape.empty() ||
         carrier.canonical_carrier_shape.empty()) {
-      carrier.reason = "effective rank must be one or two";
+      carrier.reason = "effective rank must be between one and three";
       return carrier;
     }
-    if (carrier.canonical_logical_shape.size() > 2 ||
-        carrier.canonical_carrier_shape.size() > 2) {
-      carrier.reason = "effective rank exceeds two";
+    if (carrier.canonical_logical_shape.size() > 3 ||
+        carrier.canonical_carrier_shape.size() > 3) {
+      carrier.reason = "effective rank exceeds three";
       return carrier;
     }
     carrier.valid = true;
@@ -1302,8 +1444,9 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
                << dst_carrier.aligned_1024 << "\n"
                << "  reason: " << reason << "\n"
                << "  required: matching 1024-byte aligned row-major full-row "
-                  "regions, or exact single-row segments whose byte offset "
-                  "and size are multiples of 1024";
+                  "regions with one to three effective dimensions, or exact "
+                  "single-row segments whose byte offset and size are "
+                  "multiples of 1024";
     return Stmt();
   };
 
@@ -1371,7 +1514,8 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
     return body;
   }
 
-  if (IsLayoutMatch(src_layout, dst_layout, analyzer)) {
+  if (IsLayoutMatch(src_layout, dst_layout, analyzer) ||
+      SameLayoutIgnoringSingletonModes(src_layout, dst_layout, analyzer)) {
     return dma(src_region, dst_region);
   }
 
@@ -1406,7 +1550,9 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   // block-aligned slice of that buffer has the very layout the RSRAM side
   // wants. When the region layouts agree the transform leg would be an
   // identity, so emit a plain DMA and skip the staging buffer entirely.
-  if (IsLayoutMatch(stage_layout.value(), rsram_layout, analyzer))
+  if (IsLayoutMatch(stage_layout.value(), rsram_layout, analyzer) ||
+      SameLayoutIgnoringSingletonModes(stage_layout.value(), rsram_layout,
+                                       analyzer))
     return dma(src_region, dst_region);
 
   auto is_mx_row_major_layout = [&](const Layout &layout,
@@ -1523,15 +1669,98 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   // independently visible to the software pipeliner.
   PrimExpr stage_w = MakeRegionExpr(stage, stage_range, /*access_mask=*/2);
   PrimExpr stage_r = MakeRegionExpr(stage, stage_range, /*access_mask=*/1);
-  auto xform = [&](PrimExpr a, PrimExpr b) {
-    return Evaluate(
-        Call(DataType::Handle(), sunmmio_layout_transform(), {a, b}));
+  auto xform = [&](PrimExpr a, PrimExpr b) -> Stmt {
+    auto emit = [&](PrimExpr src_view, PrimExpr dst_view) {
+      return Evaluate(Call(DataType::Handle(), sunmmio_layout_transform(),
+                           {src_view, dst_view}));
+    };
+    BufferRegion src_view = NormalizeToBufferRegion(a);
+    BufferRegion dst_view = NormalizeToBufferRegion(b);
+    auto tiled_rank = [&](const BufferRegion &region) {
+      int rank = 0;
+      for (const Range &range : region->region) {
+        if (!analyzer->CanProveEqual(range->extent, 1))
+          ++rank;
+      }
+      return rank;
+    };
+    // Row-major pad/unpad and higher-rank copies use the generic transform.
+    if (both_row_major || src_view->region.size() != 3 ||
+        dst_view->region.size() != 3 ||
+        (tiled_rank(src_view) <= 2 && tiled_rank(dst_view) <= 2))
+      return emit(a, b);
+
+    ICHECK_EQ(src_view->region.size(), 3U)
+        << "Sunmmio rank-3 layout transform expects a rank-3 source region";
+    ICHECK_EQ(dst_view->region.size(), 3U)
+        << "Sunmmio rank-3 layout transform expects a rank-3 destination "
+           "region";
+    const auto *src_batch = src_view->region[0]->extent.as<IntImmNode>();
+    const auto *dst_batch = dst_view->region[0]->extent.as<IntImmNode>();
+    ICHECK(src_batch && dst_batch)
+        << "Sunmmio rank-3 layout transform requires a static batch extent";
+    ICHECK_EQ(src_batch->value, dst_batch->value)
+        << "Sunmmio rank-3 layout transform source and destination batch "
+           "extents must match";
+
+    // transform_layout_async requires every tiled dimension to cover its
+    // complete physical layout extent.  A logical matrix dimension can be
+    // smaller than that extent (for example, M=16 in a 32-row ZZ block), while
+    // the DMA leg must still copy only the logical tensor region.
+    auto physical_ranges = [&](const BufferRegion &region) {
+      Layout layout = region->buffer.same_as(stage) ? stage_layout.value()
+                                                    : layout_of(region->buffer);
+      const auto *cute = layout.as<CuteLayoutNode>();
+      ICHECK(cute) << "Sunmmio rank-3 layout transform requires a CuteLayout "
+                   << "for buffer " << region->buffer->name;
+      Array<PrimExpr> covered_shape = cute->GetCoveredShape();
+      ICHECK_EQ(covered_shape.size(), region->region.size())
+          << "Sunmmio rank-3 layout transform covered shape rank mismatch for "
+          << region->buffer->name;
+
+      Array<Range> ranges = region->region;
+      for (size_t i = 1; i < ranges.size(); ++i) {
+        ICHECK(analyzer->CanProveEqual(ranges[i]->min,
+                                       make_zero(ranges[i]->min.dtype())) &&
+               analyzer->CanProveEqual(ranges[i]->extent,
+                                       region->buffer->shape[i]))
+            << "Sunmmio rank-3 layout transform requires a full logical "
+               "matrix region before expanding to its physical carrier for "
+            << region->buffer->name;
+        ranges.Set(i, Range::FromMinExtent(ranges[i]->min, covered_shape[i]));
+      }
+      return ranges;
+    };
+    Array<Range> src_physical = physical_ranges(src_view);
+    Array<Range> dst_physical = physical_ranges(dst_view);
+    for (size_t i = 1; i < src_physical.size(); ++i) {
+      // The generic transform handles padding between different carriers.
+      if (!analyzer->CanProveEqual(src_physical[i]->extent,
+                                   dst_physical[i]->extent))
+        return emit(a, b);
+    }
+
+    auto batch_slice = [](Array<Range> ranges, int64_t batch) {
+      PrimExpr offset = make_const(ranges[0]->min.dtype(), batch);
+      ranges.Set(0, Range::FromMinExtent(ranges[0]->min + offset, 1));
+      return ranges;
+    };
+    Array<Stmt> slices;
+    slices.reserve(src_batch->value);
+    for (int64_t batch = 0; batch < src_batch->value; ++batch) {
+      PrimExpr src_slice =
+          MakeRegionExpr(src_view->buffer, batch_slice(src_physical, batch), 1);
+      PrimExpr dst_slice =
+          MakeRegionExpr(dst_view->buffer, batch_slice(dst_physical, batch), 2);
+      slices.push_back(emit(src_slice, dst_slice));
+    }
+    return SeqStmt::Flatten(slices);
   };
   Stmt leg_a =
       src_is_dram ? dma(src_region, stage_w) : xform(src_region, stage_w);
   Stmt leg_b =
       src_is_dram ? xform(stage_r, dst_region) : dma(stage_r, dst_region);
-  return SeqStmt({leg_a, leg_b});
+  return SeqStmt::Flatten(Array<Stmt>{leg_a, leg_b});
 }
 
 Stmt CopyNode::LowerSunmmioTileCopy(const LowerArgs &T,

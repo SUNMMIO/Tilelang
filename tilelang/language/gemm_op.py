@@ -11,6 +11,7 @@ from tilelang.utils.language import (
     retrieve_shape,
     retrieve_stride,
     retrieve_offset,
+    prim_expr_equal,
     prim_expr_equal_or_mesh_symbolic,
 )
 from tilelang.language.utils import (
@@ -47,7 +48,7 @@ def _gemm_impl(
             Union[tir.Buffer, tir.Var]: The legalized argument
         """
         if isinstance(arg, tir.Var) and T.has_let_value(arg):
-            return T.get_let_value(arg).buffer
+            return T.get_let_value(arg)
         return arg
 
     A = legalize_arguments(A)
@@ -67,32 +68,47 @@ def _gemm_impl(
     A_stride = retrieve_stride(A_region)
     B_stride = retrieve_stride(B_region)
 
-    assert len(C_shape) == 2, "current only support C as a 2D tensor"
-    assert len(A_shape) >= 2, "current only support A as a 2D or higher-order tensor"
-    assert len(B_shape) >= 2, "current only support B as a 2D or higher-order tensor"
-    if len(A_shape) > 2:
-        for i in range(len(A_shape) - 2):
-            assert A_shape[i] == 1, (
-                "current only support A as a 2D or higher-order tensor with the last two dimensions being the matrix dimensions"
-            )
-    if len(B_shape) > 2:
-        for i in range(len(B_shape) - 2):
-            assert B_shape[i] == 1, (
-                "current only support B as a 2D or higher-order tensor with the last two dimensions being the matrix dimensions"
+    if len(C_shape) not in (2, 3):
+        raise ValueError(f"T.gemm C must have rank 2 or 3, got rank {len(C_shape)} with shape {C_shape}")
+    for operand, shape in (("A", A_shape), ("B", B_shape)):
+        legacy_singleton = len(C_shape) == 2 and len(shape) > 3 and all(prim_expr_equal(extent, 1) for extent in shape[:-2])
+        if len(shape) not in (2, 3) and not legacy_singleton:
+            raise ValueError(
+                f"T.gemm {operand} must have rank 2 or 3, or only singleton "
+                f"leading dimensions for a rank-2 C; got rank {len(shape)} "
+                f"with shape {shape}"
             )
 
-    M, N = C_shape
+    M, N = C_shape[-2:]
+    A_M = A_shape[-1] if transpose_A else A_shape[-2]
     K = A_shape[-2] if transpose_A else A_shape[-1]
     K_B = B_shape[-1] if transpose_B else B_shape[-2]
-    assert prim_expr_equal_or_mesh_symbolic(K, K_B), f"T.gemm K shape check failed: K_A = {K}, K_B = {K_B}"
+    B_N = B_shape[-2] if transpose_B else B_shape[-1]
+
+    def require_equal(lhs, rhs, message: str) -> None:
+        if not prim_expr_equal_or_mesh_symbolic(lhs, rhs):
+            raise ValueError(f"{message}: {lhs} != {rhs}")
+
+    require_equal(A_M, M, "T.gemm A matrix row extent must match C")
+    require_equal(B_N, N, "T.gemm B matrix column extent must match C")
+    require_equal(K, K_B, "T.gemm reduction extents must match")
+
+    if len(C_shape) == 3:
+        C_batch = C_shape[0]
+        if len(A_shape) == 3:
+            require_equal(A_shape[0], C_batch, "T.gemm A batch extent must match C")
+        if len(B_shape) == 3:
+            require_equal(B_shape[0], C_batch, "T.gemm B batch extent must match C")
+    elif len(A_shape) == 3 and len(B_shape) == 3:
+        require_equal(A_shape[0], B_shape[0], "T.gemm A and B batch extents must match")
 
     stride_a = A_stride[-2]
     stride_b = B_stride[-2]
 
     A_offset = retrieve_offset(A_region)
     B_offset = retrieve_offset(B_region)
-    assert A_offset[-2] == 0, "The offset of the first dimension of A must be 0"
-    assert B_offset[-2] == 0, "The offset of the first dimension of B must be 0"
+    assert A_offset[-2] == 0, "The offset of the first matrix dimension of A must be 0"
+    assert B_offset[-2] == 0, "The offset of the first matrix dimension of B must be 0"
     offset_a = A_offset[-1]
     offset_b = B_offset[-1]
 
@@ -130,8 +146,8 @@ def _gemm_impl(
         k_pack,
         wg_wait,
         mbar_arg,
-        C_coords[0],
-        C_coords[1],
+        C_coords[-2],
+        C_coords[-1],
     )
 
 

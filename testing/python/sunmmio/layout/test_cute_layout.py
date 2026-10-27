@@ -22,12 +22,15 @@ make_cute = _get("tl.make_cute_layout")
 make_row_major = _get("tl.sunmmio.make_row_major")
 make_aligned_row_major = _get("tl.sunmmio.make_aligned_row_major")
 make_zz = _get("tl.sunmmio.make_zz")
-make_zn = _get("tl.sunmmio.make_zn")
+make_nz = _get("tl.sunmmio.make_nz")
+make_zn_legacy = _get("tl.sunmmio.make_zn")
 make_zzz = _get("tl.sunmmio.make_zzz")
-make_nzz = _get("tl.sunmmio.make_nzz")
+make_zzn = _get("tl.sunmmio.make_zzn")
+make_nzz_legacy = _get("tl.sunmmio.make_nzz")
 make_mx_row_major = _get("tl.sunmmio.make_mx_row_major")
 make_mxzz = _get("tl.sunmmio.make_mxzz")
-make_mxznn = _get("tl.sunmmio.make_mxznn")
+make_mxnnz = _get("tl.sunmmio.make_mxnnz")
+make_mxznn_legacy = _get("tl.sunmmio.make_mxznn")
 make_mxznz = _get("tl.sunmmio.make_mxznz")
 derive_mx_layout_like = _get("tl.sunmmio.derive_mx_layout_like")
 get_mode_shape = _get("tl.CuteLayout_mode_shape")
@@ -180,11 +183,11 @@ class TestSunmmioConstructors:
         ms = [int(x) for x in get_mode_shape(layout)]
         assert ms == [32, 4, 32, 4]
 
-    def test_zn_basic(self):
-        layout = make_zn(_imms(128, 128), [0, 1], _imms(32, 32))
+    def test_nz_basic(self):
+        layout = make_nz(_imms(128, 128), [0, 1], _imms(32, 32))
         dl = [int(x) for x in get_dim_levels(layout)]
         assert dl == [2, 2]
-        # ZN: stride(BM) = 1, stride(BN) = BM = 32
+        # NZ: stride(BM) = 1, stride(BN) = BM = 32
         mstr = [int(x) for x in get_mode_stride(layout)]
         assert mstr[0] == 1  # stride_bm
         assert mstr[2] == 32  # stride_bn
@@ -195,10 +198,24 @@ class TestSunmmioConstructors:
         dl = [int(x) for x in get_dim_levels(layout)]
         assert dl == [3, 3]
 
-    def test_nzz_basic(self):
-        layout = make_nzz(_imms(128, 128), [0, 1], _imms(16, 16), _imms(4, 4))
+    def test_zzn_basic(self):
+        layout = make_zzn(_imms(128, 128), [0, 1], _imms(16, 16), _imms(4, 4))
         dl = [int(x) for x in get_dim_levels(layout)]
         assert dl == [3, 3]
+
+    def test_legacy_constructor_names_preserve_layouts(self):
+        shape = _imms(128, 128)
+        axes = [0, 1]
+
+        assert same_layout(make_zn_legacy(shape, axes, _imms(32, 32)), make_nz(shape, axes, _imms(32, 32)))
+        assert same_layout(
+            make_nzz_legacy(shape, axes, _imms(16, 16), _imms(4, 4)),
+            make_zzn(shape, axes, _imms(16, 16), _imms(4, 4)),
+        )
+        assert same_layout(
+            make_mxznn_legacy(_imms(64, 32), axes, "custom[mxfp8]8"),
+            make_mxnnz(_imms(64, 32), axes, "custom[mxfp8]8"),
+        )
 
     @pytest.mark.parametrize(
         "shape,dtype,row_elems",
@@ -259,8 +276,8 @@ class TestSunmmioConstructors:
             "custom[mxfp4]4",
         ],
     )
-    def test_mxznn_uses_canonical_pack_group_layout(self, shape, expected_pack_size, expected_group_m, expected_group_n, dtype):
-        layout = make_mxznn(_imms(*shape), [0, 1], dtype)
+    def test_mxnnz_uses_canonical_pack_group_layout(self, shape, expected_pack_size, expected_group_m, expected_group_n, dtype):
+        layout = make_mxnnz(_imms(*shape), [0, 1], dtype)
 
         assert [int(x) for x in get_logical_shape(layout)] == list(shape)
         assert [int(x) for x in get_mode_shape(layout)] == [
@@ -314,7 +331,7 @@ class TestSunmmioConstructors:
         [
             make_mx_row_major,
             lambda shape, dtype: make_mxzz(shape, [0, 1], dtype),
-            lambda shape, dtype: make_mxznn(shape, [0, 1], dtype),
+            lambda shape, dtype: make_mxnnz(shape, [0, 1], dtype),
             lambda shape, dtype: make_mxznz(shape, [0, 1], dtype),
         ],
     )
@@ -332,7 +349,7 @@ class TestSunmmioConstructors:
         "layout_factory",
         [
             make_mxzz,
-            make_mxznn,
+            make_mxnnz,
             make_mxznz,
         ],
     )
@@ -340,7 +357,7 @@ class TestSunmmioConstructors:
         dtype = "custom[mxfp8]8"
         axes = [0, 2]
         src = layout_factory(_imms(128, 4, 128), axes, dtype)
-        dst_shape = _imms(64, 4, 128) if layout_factory in (make_mxznn, make_mxznz) else _imms(32, 4, 128)
+        dst_shape = _imms(64, 4, 128) if layout_factory in (make_mxnnz, make_mxznz) else _imms(32, 4, 128)
         expected = layout_factory(dst_shape, axes, dtype)
 
         derived = derive_mx_layout_like(src, dst_shape, dtype)
@@ -352,7 +369,7 @@ class TestSunmmioConstructors:
         "layout_factory",
         [
             make_mxzz,
-            make_mxznn,
+            make_mxnnz,
             make_mxznz,
         ],
     )
@@ -366,7 +383,7 @@ class TestSunmmioConstructors:
     def test_derive_layout_like_for_dtype_preserves_mx_storage_stride(self, layout_factory, dtype):
         derive_layout_like_for_dtype = _get("tl.DeriveLayoutLikeForDType")
         src = layout_factory(_imms(128, 128), [0, 1], dtype)
-        dst_shape = _imms(64, 128) if layout_factory in (make_mxznn, make_mxznz) else _imms(32, 128)
+        dst_shape = _imms(64, 128) if layout_factory in (make_mxnnz, make_mxznz) else _imms(32, 128)
         expected = layout_factory(dst_shape, [0, 1], dtype)
 
         derived = derive_layout_like_for_dtype(src, dst_shape, dtype, None)
@@ -414,16 +431,16 @@ class TestSunmmioConstructors:
             (100, 200, 32, 64),
         ],
     )
-    def test_zn_non_divisible(self, M, N, BM, BN):
-        """ZN with non-divisible shapes."""
-        layout = make_zn(_imms(M, N), [0, 1], _imms(BM, BN))
+    def test_nz_non_divisible(self, M, N, BM, BN):
+        """NZ with non-divisible shapes."""
+        layout = make_nz(_imms(M, N), [0, 1], _imms(BM, BN))
         QM = (M + BM - 1) // BM
         QN = (N + BN - 1) // BN
 
         ms = [int(x) for x in get_mode_shape(layout)]
         assert ms == [BM, QM, BN, QN]
 
-        # ZN inner-block strides: stride(BM)=1, stride(BN)=BM
+        # NZ inner-block strides: stride(BM)=1, stride(BN)=BM
         mst = [int(x) for x in get_mode_stride(layout)]
         assert mst[0] == 1  # stride_bm
         assert mst[2] == BM  # stride_bn
@@ -458,13 +475,13 @@ class TestSunmmioConstructors:
         ss = int(ANA.simplify(get_storage_size(layout)))
         assert _eval(layout, 1, 127, 3, 63) == ss - 1
 
-    def test_zn_4d_attention(self):
-        """ZN on (seq_len, d_head) axes of a 4D attention buffer."""
-        layout = make_zn(_imms(2, 128, 4, 64), [1, 3], _imms(32, 32))
+    def test_nz_4d_attention(self):
+        """NZ on (seq_len, d_head) axes of a 4D attention buffer."""
+        layout = make_nz(_imms(2, 128, 4, 64), [1, 3], _imms(32, 32))
         dl = [int(x) for x in get_dim_levels(layout)]
         assert dl == [1, 2, 1, 2]
 
-        # ZN: inner-block is column-major
+        # NZ: inner-block is column-major
         assert _eval(layout, 0, 0, 0, 1) == 32  # BN stride = BM = 32
         assert _eval(layout, 0, 1, 0, 0) == 1  # BM stride = 1
 
@@ -559,7 +576,7 @@ class TestLayoutRelations:
 
     def test_is_same_layout_false(self):
         a = make_zz(_imms(128, 128), [0, 1], _imms(32, 32))
-        b = make_zn(_imms(128, 128), [0, 1], _imms(32, 32))
+        b = make_nz(_imms(128, 128), [0, 1], _imms(32, 32))
         assert not is_same_layout(a, b)
 
     def test_is_layout_match_same_shape(self):
@@ -645,9 +662,9 @@ class TestDeriveLayoutLike:
         assert _eval(dst, 1, 0) == 32
         assert _eval(dst, 0, 1) == 1
 
-    def test_derive_zn_to_different_shape(self):
-        """DeriveLayoutLike preserves ZN stride pattern (col-major inner block)."""
-        src = make_zn(_imms(128, 128), [0, 1], _imms(32, 32))
+    def test_derive_nz_to_different_shape(self):
+        """DeriveLayoutLike preserves NZ stride pattern (col-major inner block)."""
+        src = make_nz(_imms(128, 128), [0, 1], _imms(32, 32))
         dst = derive_layout_like(src, _imms(256, 64), None)
         assert dst is not None
         dl = [int(x) for x in get_dim_levels(dst)]
@@ -657,7 +674,7 @@ class TestDeriveLayoutLike:
         assert ms[2] == 32  # BN preserved
         assert ms[1] == 8  # QM = 256/32
         assert ms[3] == 2  # QN = 64/32
-        # ZN inner-block: stride(BM)=1, stride(BN)=BM=32
+        # NZ inner-block: stride(BM)=1, stride(BN)=BM=32
         mst = [int(x) for x in get_mode_stride(dst)]
         assert mst[0] == 1  # stride_bm
         assert mst[2] == 32  # stride_bn
@@ -690,9 +707,9 @@ class TestDeriveLayoutLike:
         assert ms[4] == 4  # CN preserved (cluster)
         assert ms[5] == 1  # GN derived
 
-    def test_derive_nzz_to_different_shape(self):
-        """DeriveLayoutLike works for NZZ layouts."""
-        src = make_nzz(_imms(128, 128), [0, 1], _imms(16, 16), _imms(4, 4))
+    def test_derive_zzn_to_different_shape(self):
+        """DeriveLayoutLike works for ZZN layouts."""
+        src = make_zzn(_imms(128, 128), [0, 1], _imms(16, 16), _imms(4, 4))
         dst = derive_layout_like(src, _imms(64, 256), None)
         assert dst is not None
         dl = [int(x) for x in get_dim_levels(dst)]
@@ -760,11 +777,11 @@ class TestDeriveLayoutLike:
         direct = make_zz(_imms(256, 64), [0, 1], _imms(32, 32))
         assert is_same_layout(derived, direct)
 
-    def test_derive_zn_matches_constructor(self):
-        """Derived ZN layout matches direct constructor for same shape."""
-        src = make_zn(_imms(128, 128), [0, 1], _imms(32, 32))
+    def test_derive_nz_matches_constructor(self):
+        """Derived NZ layout matches direct constructor for same shape."""
+        src = make_nz(_imms(128, 128), [0, 1], _imms(32, 32))
         derived = derive_layout_like(src, _imms(256, 64), None)
-        direct = make_zn(_imms(256, 64), [0, 1], _imms(32, 32))
+        direct = make_nz(_imms(256, 64), [0, 1], _imms(32, 32))
         assert is_same_layout(derived, direct)
 
     def test_derive_zzz_matches_constructor(self):
@@ -774,11 +791,11 @@ class TestDeriveLayoutLike:
         direct = make_zzz(_imms(256, 64), [0, 1], _imms(16, 16), _imms(4, 4))
         assert is_same_layout(derived, direct)
 
-    def test_derive_nzz_matches_constructor(self):
-        """Derived NZZ layout matches direct constructor for same shape."""
-        src = make_nzz(_imms(128, 128), [0, 1], _imms(16, 16), _imms(4, 4))
+    def test_derive_zzn_matches_constructor(self):
+        """Derived ZZN layout matches direct constructor for same shape."""
+        src = make_zzn(_imms(128, 128), [0, 1], _imms(16, 16), _imms(4, 4))
         derived = derive_layout_like(src, _imms(64, 256), None)
-        direct = make_nzz(_imms(64, 256), [0, 1], _imms(16, 16), _imms(4, 4))
+        direct = make_zzn(_imms(64, 256), [0, 1], _imms(16, 16), _imms(4, 4))
         assert is_same_layout(derived, direct)
 
     def test_derive_from_dynamic_2d_source(self):
@@ -825,12 +842,12 @@ class TestDeriveLayoutLikeRankChanging:
         direct = make_zz(_imms(128, 64), [0, 1], _imms(32, 32))
         assert is_same_layout(dst, direct)
 
-    def test_3d_zn_reduce_to_2d(self):
-        """Reduce: 3D ZN → 2D. Col-major inner block preserved."""
-        src = make_zn(_imms(4, 64, 128), [1, 2], _imms(32, 32))
+    def test_3d_nz_reduce_to_2d(self):
+        """Reduce: 3D NZ → 2D. Col-major inner block preserved."""
+        src = make_nz(_imms(4, 64, 128), [1, 2], _imms(32, 32))
         dst = derive_layout_like(src, _imms(64, 128), None)
         assert dst is not None
-        direct = make_zn(_imms(64, 128), [0, 1], _imms(32, 32))
+        direct = make_nz(_imms(64, 128), [0, 1], _imms(32, 32))
         assert is_same_layout(dst, direct)
 
     def test_3d_row_major_reduce_to_2d(self):
@@ -1117,11 +1134,11 @@ class TestComputeContiguousTileSteps:
         # Block: W:64, H:32; Outer: W:4, H:4
         assert steps == [(1, 64), (0, 32), (1, 4), (0, 4)]
 
-    def test_zn_32x64(self):
-        """ZN(128, 256) with block (32, 64): fully contiguous, col-major inner."""
-        layout = make_zn(_imms(128, 256), [0, 1], _imms(32, 64))
+    def test_nz_32x64(self):
+        """NZ(128, 256) with block (32, 64): fully contiguous, col-major inner."""
+        layout = make_nz(_imms(128, 256), [0, 1], _imms(32, 64))
         steps = _steps_to_list(compute_contiguous_steps(layout))
-        # ZN: col-major inner block (H:32 first, then W coalesces across boundary).
+        # NZ: col-major inner block (H:32 first, then W coalesces across boundary).
         # Dim 0 modes: (32, stride=1), (4, stride=8192)
         # Dim 1 modes: (64, stride=32), (4, stride=2048) — coalesces to (256, stride=32)
         # Walk: (0, 32), (1, 256), (0, 4)
@@ -1135,11 +1152,11 @@ class TestComputeContiguousTileSteps:
         # Block: W:64, H:32; Cluster: W:4, H:2; Grid: W:4, H:4
         assert steps == [(1, 64), (0, 32), (1, 4), (0, 2), (1, 4), (0, 4)]
 
-    def test_nzz_block_and_cluster(self):
-        """NZZ with block (32, 64) and cluster (2, 4): col-major at group level."""
-        layout = make_nzz(_imms(256, 1024), [0, 1], _imms(32, 64), _imms(2, 4))
+    def test_zzn_block_and_cluster(self):
+        """ZZN with block (32, 64) and cluster (2, 4): col-major at group level."""
+        layout = make_zzn(_imms(256, 1024), [0, 1], _imms(32, 64), _imms(2, 4))
         steps = _steps_to_list(compute_contiguous_steps(layout))
-        # NZZ = {false, false, true}: block=row, tile=row, group=col
+        # ZZN = {false, false, true}: block=row, tile=row, group=col
         # Col-major group level causes dim-0 modes CM(2) and GM(4) to coalesce.
         # Block: W:64, H:32; Tile: W:4; then coalesced H:8; then Grid W:4
         assert steps == [(1, 64), (0, 32), (1, 4), (0, 8), (1, 4)]

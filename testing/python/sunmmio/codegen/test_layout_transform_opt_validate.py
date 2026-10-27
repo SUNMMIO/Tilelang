@@ -1,5 +1,6 @@
 import os
 
+import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
@@ -43,6 +44,30 @@ def layout_transform_roundtrip_kernel(
     return main
 
 
+@target("Sunmmio")
+def unaligned_partial_rank3_layout_transform_kernel(direction="load"):
+    shape = (4, 64, 64)
+    compact_shape = (2, 64, 64)
+    placement = T.placement.replicated()
+    dram_layout = make_row_major(shape)
+    compact_layout = make_zz_layout(compact_shape, axes=[1, 2], block_shape=(32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(shape, placement, T.bfloat16, layout=dram_layout),  # type: ignore
+        B: T.MeshTensor(shape, placement, T.bfloat16, layout=dram_layout),  # type: ignore
+    ):
+        with T.Kernel() as _cid:
+            X = T.alloc_shared(compact_shape, T.bfloat16, scope="shared.rsram")
+            T.annotate_layout({X: compact_layout})
+            if direction == "load":
+                T.copy(A[1:3, :, :], X)
+            else:
+                T.copy(X, B[1:3, :, :])
+
+    return main
+
+
 def test_layout_transform_codegen_validates_with_npuir_opt(tmp_path):
     src = validate_sunmmio_codegen_with_npuir_opt(
         layout_transform_roundtrip_kernel(),
@@ -61,6 +86,19 @@ def test_layout_transform_codegen_validates_with_npuir_opt(tmp_path):
     assert len(transform_lines) >= 2
     assert all("<unit = odma1>" in line for line in transform_lines)
     assert "sunmmio.fake" not in src
+
+
+@pytest.mark.parametrize("direction", ["load", "store"])
+def test_unaligned_partial_rank3_layout_transform_validates(direction, tmp_path):
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        unaligned_partial_rank3_layout_transform_kernel(direction),
+        tmp_path,
+        mlir_filename=f"unaligned_partial_rank3_{direction}.mlir",
+        expected_tokens=("suvm.copy_async", "suvm.transform_layout_async"),
+        opt_args=("--verify-each", "--suvm-to-llvm-pipeline"),
+    )
+    assert src.count("suvm.copy_async") == 2
+    assert src.count("suvm.transform_layout_async") == 2
 
 
 if __name__ == "__main__":

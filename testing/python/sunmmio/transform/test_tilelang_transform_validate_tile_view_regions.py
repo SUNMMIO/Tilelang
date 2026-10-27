@@ -4,7 +4,7 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm
-from tilelang.layout import make_row_major, make_zn_layout, make_zz_layout
+from tilelang.layout import make_row_major, make_nz_layout, make_zz_layout
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 
 
@@ -70,10 +70,10 @@ def _make_copy_kernel(copy_case):
     elif copy_case == "zz_block_non_major_dim_multi_block":
         shape = (128, 128)
         layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
-    elif copy_case.startswith("zz_") or copy_case.startswith("zn_"):
+    elif copy_case.startswith("zz_") or copy_case.startswith("nz_"):
         shape = (96, 96)
-        if copy_case.startswith("zn_"):
-            layout = make_zn_layout(shape, axes=[0, 1], block_shape=(32, 32))
+        if copy_case.startswith("nz_"):
+            layout = make_nz_layout(shape, axes=[0, 1], block_shape=(32, 32))
         else:
             layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
     else:
@@ -276,7 +276,7 @@ def _make_copy_kernel(copy_case):
                 T.annotate_layout({A: layout, A_shared: layout})
                 T.copy(A[0:32, 0:64], A_shared[32:64, 0:64])
 
-    elif copy_case == "zn_block_non_major_dim_split":
+    elif copy_case == "nz_block_non_major_dim_split":
 
         @T.prim_func
         def kernel(A: T.Tensor(shape, DTYPE)):
@@ -698,7 +698,7 @@ def test_sunmmio_validate_tile_view_regions_accepts_legal_regions(copy_case):
             "must not split the non-major dimension",
         ),
         (
-            "zn_block_non_major_dim_split",
+            "nz_block_non_major_dim_split",
             "must not split the non-major dimension",
         ),
         (

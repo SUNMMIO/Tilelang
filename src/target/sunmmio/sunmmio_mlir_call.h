@@ -21,7 +21,7 @@ public:
              const std::vector<SunMMIOValue> &mins,
              const std::vector<int64_t> &extents, DataType ret_dtype,
              const SunMMIOType &ret_type, int64_t byte_offset = 0,
-             bool preserve_unit_dims = false,
+             bool preserve_region_rank = false,
              const std::optional<std::vector<int64_t>> &planned_tiled_dims =
                  std::nullopt,
              const std::optional<std::vector<int64_t>> &planned_view_shape =

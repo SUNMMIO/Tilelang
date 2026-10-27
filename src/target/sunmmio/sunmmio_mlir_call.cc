@@ -118,7 +118,7 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
     const std::string &result_name, const std::string &buffer_handle,
     const std::vector<SunMMIOValue> &mins, const std::vector<int64_t> &extents,
     DataType ret_dtype, const SunMMIOType &ret_type, int64_t byte_offset,
-    bool preserve_unit_dims,
+    bool preserve_region_rank,
     const std::optional<std::vector<int64_t>> &planned_tiled_dims,
     const std::optional<std::vector<int64_t>> &planned_view_shape) {
   SunmmioMlirType type(ctx_);
@@ -188,9 +188,24 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
   } else {
     ICHECK(!planned_view_shape.has_value());
     shape.reserve(extents.size());
+    bool preserve_exact_rank = preserve_region_rank && extents.size() <= 3;
+    bool collapse_single_matrix_view = preserve_exact_rank &&
+                                       extents.size() == 3 && extents[0] == 1 &&
+                                       memtensor_ty.getShape()[0] != 1;
     for (int64_t i = 0; i < static_cast<int64_t>(extents.size()); ++i) {
-      if (preserve_unit_dims || extents[i] != 1) {
-        shape.push_back(extents[i]);
+      bool preserve_dim =
+          preserve_exact_rank && !(collapse_single_matrix_view && i == 0);
+      if (preserve_dim || extents[i] != 1) {
+        int64_t view_extent = extents[i];
+        if (preserve_dim && extents[i] == memtensor_ty.getShape()[i]) {
+          // MMA must cover each tiled layout dimension completely, including
+          // any padded carrier allocated for the logical buffer shape.
+          view_extent = memtensor_ty.getLayout().getDimSize(i);
+          ICHECK_GE(view_extent, extents[i])
+              << "tl.mma_sunmmio layout extent cannot be smaller than its "
+                 "logical buffer extent";
+        }
+        shape.push_back(view_extent);
         tiled_dims.push_back(i);
       }
     }
@@ -201,9 +216,10 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
       tiled_dims.push_back(0);
     }
   }
-  ICHECK(shape.size() == 1 || shape.size() == 2)
-      << "tl.tileop.region expects one or two tiled dims with extent != 1, "
-         "but got "
+  ICHECK_GE(shape.size(), 1U)
+      << "tl.tileop.region expects at least one tiled dimension";
+  ICHECK_LE(shape.size(), 3U)
+      << "tl.tileop.region expects at most three tiled dimensions, but got "
       << shape.size();
 
   mlir::Type elem_ty = memtensor_ty.getElementType();
@@ -724,7 +740,6 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         require_bool_attr(SunMMIOCallAttrKey::kTransB, "tl.mma_sunmmio transB");
     mlir::UnitAttr trans_attr =
         trans_b ? ctx_.builder.getUnitAttr() : mlir::UnitAttr();
-
     auto mma_op = mlir::suvm::TcMmaOp::create(
         ctx_.builder, type.MakeDebugLoc("mma_sunmmio"), c, a, w, c, accumulate,
         trans_attr);

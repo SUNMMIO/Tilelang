@@ -12,6 +12,9 @@ constexpr const char *tilelang_is_cpu_kernel_frame =
     "tilelang.is_cpu_kernel_frame";
 
 namespace attr {
+// Marks a block whose predicate came from an explicit user-facing T.where.
+constexpr const char *kExplicitWhere = "tilelang.explicit_where";
+
 // Attributes to mark CUDA sync calls
 constexpr const char *kHasTriggerLaunch = "has_cuda_pdl_trigger";
 constexpr const char *kHasGridSync = "has_cuda_pdl_sync";
