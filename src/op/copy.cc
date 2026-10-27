@@ -150,16 +150,21 @@ TryPlanRsramDmaCopy(const Buffer &src, const Array<Range> &src_ranges,
     int64_t dst_stride;
   };
   std::vector<AxisPair> axes;
+  auto is_tile_aligned = [&](const Array<Range> &ranges, int64_t dim) {
+    const Range &range = ranges[dim];
+    return analyzer->CanProveEqual(FloorMod(range->min, range->extent), 0);
+  };
   for (size_t i = 0; i < src_dims->size(); ++i) {
-    auto src_stride =
-        GetInnermostStaticStride(src_cute, (*src_dims)[i].first, analyzer);
-    auto dst_stride =
-        GetInnermostStaticStride(dst_cute, (*dst_dims)[i].first, analyzer);
-    if (!src_stride || !dst_stride) {
+    int64_t src_dim = (*src_dims)[i].first;
+    int64_t dst_dim = (*dst_dims)[i].first;
+    auto src_stride = GetInnermostStaticStride(src_cute, src_dim, analyzer);
+    auto dst_stride = GetInnermostStaticStride(dst_cute, dst_dim, analyzer);
+    if (!src_stride || !dst_stride || !is_tile_aligned(src_ranges, src_dim) ||
+        !is_tile_aligned(dst_ranges, dst_dim)) {
       return std::nullopt;
     }
-    axes.push_back({(*src_dims)[i].first, (*dst_dims)[i].first,
-                    (*src_dims)[i].second, *src_stride, *dst_stride});
+    axes.push_back(
+        {src_dim, dst_dim, (*src_dims)[i].second, *src_stride, *dst_stride});
   }
 
   // Tile-view axes are ordered from the most contiguous physical dimension to

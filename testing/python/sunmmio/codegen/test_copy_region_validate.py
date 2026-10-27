@@ -6,6 +6,7 @@ import tilelang
 import tilelang.language as T
 import tilelang.testing
 from tilelang.layout import CuteLayout, make_row_major, make_zz_layout
+from tilelang.utils import target as target_utils
 
 from testing.python.sunmmio.common.codegen_validation import (
     lower_sunmmio_kernel_to_device_tir,
@@ -221,6 +222,34 @@ def incompatible_singleton_axis_remap_copy_kernel():
 
 
 @target("Sunmmio")
+def misaligned_singleton_axis_remap_copy_kernel(misaligned_operand):
+    if misaligned_operand not in ("source", "destination"):
+        raise ValueError(f"Unsupported operand: {misaligned_operand}")
+
+    src_shape = (16, 32, 128)
+    dst_shape = (2, 16, 128)
+    src_layout = make_row_major(src_shape)
+    dst_layout = make_row_major(dst_shape)
+    src_start = 1 if misaligned_operand == "source" else 8
+    dst_start = 1 if misaligned_operand == "destination" else 0
+    src_stop = src_start + 8
+    dst_stop = dst_start + 8
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            src = T.alloc_shared(src_shape, DTYPE, scope="shared.rsram")
+            dst = T.alloc_shared(dst_shape, DTYPE, scope="shared.rsram")
+            T.annotate_layout({src: src_layout, dst: dst_layout})
+            T.copy(
+                src[src_start:src_stop, 3:4, 0:128],
+                dst[1:2, dst_start:dst_stop, 0:128],
+            )
+
+    return main
+
+
+@target("Sunmmio")
 def summa_output_copy_kernel(
     M=128,
     N=128,
@@ -367,6 +396,17 @@ def test_singleton_axis_remap_copy_uses_strided_odma1(tmp_path):
 def test_incompatible_singleton_axis_remap_is_rejected_before_dma_lowering():
     with pytest.raises(Exception, match="Unsupported RSRAM-to-RSRAM copy"):
         lower_sunmmio_kernel_to_device_tir(incompatible_singleton_axis_remap_copy_kernel())
+
+
+@pytest.mark.parametrize("misaligned_operand", ("source", "destination"))
+def test_misaligned_singleton_axis_remap_is_rejected_before_dma_lowering(misaligned_operand):
+    previous = target_utils.ENABLE_SUNMMIO_REGION_VALIDATION
+    target_utils.set_sunmmio_region_validation(False)
+    try:
+        with pytest.raises(Exception, match="Unsupported RSRAM-to-RSRAM copy"):
+            lower_sunmmio_kernel_to_device_tir(misaligned_singleton_axis_remap_copy_kernel(misaligned_operand))
+    finally:
+        target_utils.set_sunmmio_region_validation(previous)
 
 
 @pytest.mark.parametrize("M,N,K", _SUMMA_COPY_SHAPES)
