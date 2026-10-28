@@ -3,7 +3,7 @@
  * \brief Standalone layout inference pass for the Sunmmio target.
  *
  * Assigns CuteLayout to every buffer and validates layout consistency.
- * Does NOT rewrite IR — attaches layout_map / global_layout_map as
+ * Resolves MX field shapes and attaches layout_map / global_layout_map as
  * block annotations for downstream consumption by LowerTileOp.
  */
 
@@ -16,6 +16,7 @@
 
 #include "../layout/cute_layout.h"
 #include "../op/operator.h"
+#include "common/mx_view.h"
 
 namespace tvm {
 namespace tl {
@@ -73,7 +74,7 @@ private:
 
   void ValidateMXWeightTransfers();
 
-  // Phase 6: Apply to IR (attach layout_map, no IR rewriting)
+  // Phase 6: Attach inferred layouts to IR.
   PrimFunc ApplyToIR(PrimFunc f);
 
   // --- Helpers ---
@@ -113,6 +114,10 @@ private:
 
   // LetStmt bindings for resolving buffer access through let vars
   Map<Var, PrimExpr> let_var_to_expr_;
+  MXViewMap mx_views_;
+  bool unresolved_fields_{false};
+  std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> deferred_buffers_;
+  std::unordered_set<int> deferred_ops_;
 };
 
 tvm::transform::Pass SunmmioLayoutInference();

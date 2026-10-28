@@ -19,6 +19,7 @@
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
 #include "../target/sunmmio_utils.h"
+#include "common/mx_view.h"
 #include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
 #include "sunmmio_pipeline_planning/resource_types_for_ilp.h"
 #include "sunmmio_pipeline_planning/stmt_read_write_collector.h"
@@ -2216,6 +2217,7 @@ public:
 tvm::transform::Pass SunmmioPipelinePlanning(bool debug = false) {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
+    CheckMXViewPipeline(f);
     PrimFuncNode *fptr = f.CopyOnWrite();
     fptr->body = SunmmioPipelinePlanner::Substitute(f, debug);
     return f;

@@ -466,3 +466,24 @@ def test_lower_and_optimize_symbolic_mesh_gqa_kernel():
     assert "tl.mesh_" not in script
     assert "mesh_nrows" not in script
     assert "mesh_ncols" not in script
+
+
+@pytest.mark.parametrize("mesh", [(4, 4), (2, 2), (2, 4)])
+def test_thread_domain_metadata_resolves_mesh_symbols(mesh):
+    nrows = tir.SizeVar("mesh_nrows", "int32")
+    ncols = tir.SizeVar("mesh_ncols", "int32")
+    axis = tir.IterVar(tvm.ir.Range(0, nrows * ncols), tir.Var("cid", "int32"), tir.IterVar.ThreadIndex, "blockIdx.x")
+    body = tir.AttrStmt(axis, "thread_extent", nrows * ncols, tir.Evaluate(axis.var))
+    func = tir.PrimFunc([], body).with_attr(_MESH_NROWS_ATTR, nrows).with_attr(_MESH_NCOLS_ATTR, ncols)
+    result = _bind_and_resolve(tvm.IRModule({"main": func}), _sunmmio_target(*mesh))["main"]
+    assert int(result.body.value) == mesh[0] * mesh[1]
+    assert int(result.body.node.dom.extent) == mesh[0] * mesh[1]
+    assert tir.analysis.verify_well_formed(result)
+
+
+def test_mesh_symbols_only_in_thread_metadata_require_binding():
+    nrows = tir.SizeVar("mesh_nrows", "int32")
+    axis = tir.IterVar(tvm.ir.Range(0, nrows), tir.Var("cid", "int32"), tir.IterVar.ThreadIndex, "blockIdx.x")
+    func = tir.PrimFunc([], tir.AttrStmt(axis, "thread_extent", 4, tir.Evaluate(axis.var)))
+    with pytest.raises(tvm.error.InternalError, match="missing PrimFunc attributes"):
+        _bind_and_resolve(tvm.IRModule({"main": func}), _sunmmio_target())

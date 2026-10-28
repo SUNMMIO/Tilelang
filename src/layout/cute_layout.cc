@@ -1565,44 +1565,46 @@ std::optional<MXLayoutAnalysis> AnalyzeMXLayout(const Layout &layout,
     return std::nullopt;
   }
 
+  Array<PrimExpr> covered_shape = cute->GetCoveredShape();
+
   auto make_result = [&](MXLayoutKind kind,
                          Array<PrimExpr> scale_shape) -> MXLayoutAnalysis {
     return MXLayoutAnalysis{kind, logical_shape, cute->GetCoveredShape(),
                             scale_shape};
   };
 
-  if (IsSameLayout(layout, MakeMXRowMajor(logical_shape, dtype), ana)) {
-    PrimExpr n = logical_shape[1];
+  if (IsSameLayout(layout, MakeMXRowMajor(covered_shape, dtype), ana)) {
+    PrimExpr n = covered_shape[1];
     PrimExpr rem = ana->Simplify(FloorMod(n, makeInt(32)));
     ICHECK(ana->CanProveEqual(rem, makeInt(0)))
         << "MX row-major layout requires N to be divisible by 32, got N=" << n;
     return make_result(MXLayoutKind::kRowMajor,
-                       Array<PrimExpr>{logical_shape[0], n / makeInt(32)});
+                       Array<PrimExpr>{covered_shape[0], n / makeInt(32)});
   }
 
   Array<Integer> axes{Integer(0), Integer(1)};
-  if (IsSameLayout(layout, MakeMXZZ(logical_shape, axes, dtype), ana)) {
-    PrimExpr blocks_m = ceildiv(logical_shape[0], makeInt(32));
-    PrimExpr blocks_n = ceildiv(logical_shape[1], makeInt(32));
+  if (IsSameLayout(layout, MakeMXZZ(covered_shape, axes, dtype), ana)) {
+    PrimExpr blocks_m = ceildiv(covered_shape[0], makeInt(32));
+    PrimExpr blocks_n = ceildiv(covered_shape[1], makeInt(32));
     return make_result(MXLayoutKind::kMXZZ,
                        Array<PrimExpr>{blocks_m * blocks_n, makeInt(32)});
   }
 
   int64_t pack_size = MXPackSize(dtype);
   bool can_build_mxzn_layout =
-      StaticDivisibleOrSymbolic(logical_shape[0], 32 * pack_size) &&
-      StaticDivisibleOrSymbolic(logical_shape[1], 32);
+      StaticDivisibleOrSymbolic(covered_shape[0], 32 * pack_size) &&
+      StaticDivisibleOrSymbolic(covered_shape[1], 32);
   if (can_build_mxzn_layout) {
-    if (IsSameLayout(layout, MakeMXZNN(logical_shape, axes, dtype), ana)) {
-      PrimExpr blocks_m = logical_shape[0] / makeInt(32);
-      PrimExpr blocks_n = logical_shape[1] / makeInt(32);
+    if (IsSameLayout(layout, MakeMXZNN(covered_shape, axes, dtype), ana)) {
+      PrimExpr blocks_m = covered_shape[0] / makeInt(32);
+      PrimExpr blocks_n = covered_shape[1] / makeInt(32);
       return make_result(MXLayoutKind::kMXZNN,
                          Array<PrimExpr>{blocks_m * blocks_n, makeInt(32)});
     }
 
-    if (IsSameLayout(layout, MakeMXZNZ(logical_shape, axes, dtype), ana)) {
-      PrimExpr blocks_m = logical_shape[0] / makeInt(32);
-      PrimExpr blocks_n = logical_shape[1] / makeInt(32);
+    if (IsSameLayout(layout, MakeMXZNZ(covered_shape, axes, dtype), ana)) {
+      PrimExpr blocks_m = covered_shape[0] / makeInt(32);
+      PrimExpr blocks_n = covered_shape[1] / makeInt(32);
       return make_result(MXLayoutKind::kMXZNZ,
                          Array<PrimExpr>{blocks_m * blocks_n, makeInt(32)});
     }

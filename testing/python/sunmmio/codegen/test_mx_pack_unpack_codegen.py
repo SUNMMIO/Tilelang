@@ -344,7 +344,7 @@ def test_mx_row_major_fields_and_tails_production_pipeline(tmp_path, mx_dtype, d
 @pytest.mark.parametrize("operation", ["pack", "unpack", "roundtrip"])
 @pytest.mark.parametrize("k", [64, 992, 1056, 2016, 4128])
 def test_mx_row_major_numeric_kernel_compiles_without_simulator(tmp_path, bits, operation, k):
-    from testing.python.sunmmio.codegen.test_mx_row_major_pack_unpack_numeric import mx_row_major_numeric_kernel
+    from testing.python.sunmmio.common.mx_view_kernels import mx_row_major_numeric_kernel
 
     src = lower(mx_row_major_numeric_kernel(k, bits, operation), target="sunmmio").kernel_source
     validate_suvm_mlir_with_npuir_opt(src, tmp_path, opt_args=LLVM_OPT_ARGS)

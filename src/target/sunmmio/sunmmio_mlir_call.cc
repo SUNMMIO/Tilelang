@@ -1,6 +1,8 @@
 #include "sunmmio_mlir_call.h"
 
+#include "../../layout/cute_layout.h"
 #include "../sunmmio_utils.h"
+#include "sunmmio_mlir_function.h"
 #include "sunmmio_mlir_type.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -12,6 +14,7 @@
 #include "npuir/Dialect/SUVM/IR/Ops.h"
 #include "npuir/Dialect/SUVM/IR/Types.h"
 
+#include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
 
 #include <algorithm>
@@ -734,6 +737,72 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
                << ")";
     TVM_FFI_UNREACHABLE();
   }
+}
+
+TVM_FFI_STATIC_INIT_BLOCK() {
+  namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def(
+      "tl.sunmmio.InferMXFieldDescriptors",
+      [](Target target, tir::Buffer parent, tl::Layout layout) {
+        // Query the dialect's type inference in an isolated, non-executable
+        // module.
+        (void)tl::GetSunmmioTileProcessorConfig(target);
+        SunmmioMlirContext ctx;
+        SunmmioMlirFunction function(ctx);
+        function.BeginModule();
+        SunMMIOType type;
+        type.kind = SunMMIOType::Kind::kMemTensor;
+        type.dtype = parent->dtype;
+        type.shape.assign(parent->shape.begin(), parent->shape.end());
+        type.memory_scope = "shared.rsram";
+        const auto *cute = layout.as<tl::CuteLayoutNode>();
+        ICHECK(cute) << "MX view requires a concrete CuteLayout";
+        auto hs = cute->GetModeShape();
+        auto st = cute->GetModeStride();
+        arith::Analyzer analyzer;
+        for (const auto &values : {hs, st}) {
+          for (const PrimExpr &value : values) {
+            ICHECK(analyzer.Simplify(value).as<IntImmNode>())
+                << "MX view requires a fully static parent layout";
+          }
+        }
+        type.layout_hshape.assign(hs.begin(), hs.end());
+        type.layout_hstride.assign(st.begin(), st.end());
+        for (auto level : cute->GetDimLevels())
+          type.layout_dim_levels.push_back(level.IntValue());
+        SunmmioMlirType types(ctx);
+        mlir::OperationState state(types.Loc(), "suvm.alloc");
+        state.addTypes(types.MapType(type));
+        mlir::Value source = ctx.builder.create(state)->getResult(0);
+        mlir::SmallVector<mlir::Type, 2> results;
+        ICHECK(mlir::succeeded(mlir::suvm::UnpackOp::inferReturnTypes(
+            &ctx.mlir_ctx, types.Loc(), mlir::ValueRange{source},
+            mlir::DictionaryAttr(), mlir::PropertyRef(), mlir::RegionRange(),
+            results)))
+            << "Cannot infer MX view fields from the parent layout";
+        ffi::Array<ffi::Map<ffi::String, ObjectRef>> descriptors;
+        for (int index : {1, 0}) {
+          auto field = mlir::cast<mlir::suvm::MemTensorType>(results[index]);
+          auto ints = [](llvm::ArrayRef<int64_t> values) {
+            ffi::Array<PrimExpr> out;
+            for (int64_t v : values)
+              out.push_back(IntImm(DataType::Int(32), v));
+            return out;
+          };
+          auto shape = ints(field.getShape());
+          auto fl = field.getLayout();
+          ffi::Array<Integer> levels;
+          for (auto level : fl.getDimLevels())
+            levels.push_back(Integer(level));
+          tl::CuteLayout field_layout(shape, ints(fl.getFlattenedHShape()),
+                                      ints(fl.getFlattenedHStride()), levels);
+          descriptors.push_back(
+              {{"shape", shape},
+               {"layout", field_layout},
+               {"byte_offset", Integer(field.getByteOffset())}});
+        }
+        return descriptors;
+      });
 }
 
 } // namespace codegen

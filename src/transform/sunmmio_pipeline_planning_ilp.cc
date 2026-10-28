@@ -7,6 +7,7 @@
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
 #include "common/ast_traverser.h"
+#include "common/mx_view.h"
 #include "common/sunmmio_pipeline_utils.h"
 #include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
 #include "sunmmio_pipeline_planning/resource_types_for_ilp.h"
@@ -4321,6 +4322,7 @@ private:
 tvm::transform::Pass SunmmioPipelinePlanningILP(bool debug = false) {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
+    CheckMXViewPipeline(f);
     PrimFuncNode *fptr = f.CopyOnWrite();
     fptr->body = SunmmioPipelinePlannerILP::Substitute(f, debug);
     return f;

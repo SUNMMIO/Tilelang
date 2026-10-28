@@ -1385,14 +1385,49 @@ Stmt CopyNode::LowerSunmmioTileCopy(const LowerArgs &T,
         << dst_range[i]->extent << ".";
   }
 
-  Array<IterVar> loop_vars = MakeIterVars();
+  bool keep_unit_axes =
+      (src->dtype.is_float8_e8m0fnu() || src->dtype.is_float8_e4m3fn() ||
+       src->dtype.is_float4_e2m1fn()) &&
+      std::any_of(src_range.begin(), src_range.end(),
+                  [](const Range &r) { return is_one(r->extent); });
+  Array<IterVar> loop_vars;
+  if (keep_unit_axes) {
+    // A unit column still needs a padded tile carrier for quantized fields.
+    for (size_t i = 0; i < src_range.size(); ++i) {
+      Var var("copy_axis" + std::to_string(i), src_range[i]->extent.dtype());
+      loop_vars.push_back(IterVar(Range::FromMinExtent(0, src_range[i]->extent),
+                                  var, kDataPar));
+    }
+  } else {
+    loop_vars = MakeIterVars();
+  }
   for (const IterVar &iv : loop_vars) {
     analyzer->Bind(iv->var, iv->dom);
   }
-  Array<PrimExpr> src_indices = MakeIndices(loop_vars, 0);
-  Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
-  PrimExpr src_predicate = MakePredicate(analyzer, loop_vars, src->shape, 0);
-  PrimExpr dst_predicate = MakePredicate(analyzer, loop_vars, dst->shape, 1);
+  Array<PrimExpr> src_indices, dst_indices;
+  PrimExpr src_predicate, dst_predicate;
+  if (keep_unit_axes) {
+    for (size_t i = 0; i < loop_vars.size(); ++i) {
+      src_indices.push_back(src_range[i]->min + loop_vars[i]->var);
+      dst_indices.push_back(dst_range[i]->min + loop_vars[i]->var);
+    }
+    auto predicate = [&](const Buffer &buffer, const Array<PrimExpr> &indices) {
+      PrimExpr result = const_true();
+      for (size_t i = 0; i < indices.size(); ++i) {
+        PrimExpr valid = (indices[i] >= 0) && (indices[i] < buffer->shape[i]);
+        if (!analyzer->CanProve(valid))
+          result = result && valid;
+      }
+      return is_one(result) ? PrimExpr() : result;
+    };
+    src_predicate = predicate(src, src_indices);
+    dst_predicate = predicate(dst, dst_indices);
+  } else {
+    src_indices = MakeIndices(loop_vars, 0);
+    dst_indices = MakeIndices(loop_vars, 1);
+    src_predicate = MakePredicate(analyzer, loop_vars, src->shape, 0);
+    dst_predicate = MakePredicate(analyzer, loop_vars, dst->shape, 1);
+  }
 
   PrimExpr value = BufferLoad(src, src_indices);
   if (src->dtype != dst->dtype) {

@@ -11,6 +11,7 @@
 #include <tvm/tir/transform.h>
 
 #include "../op/builtin.h"
+#include "common/mx_view.h"
 
 namespace tvm {
 namespace tl {
@@ -21,14 +22,20 @@ class IfStmtBindingRewriter : public StmtExprMutator {
 public:
   static PrimFunc Substitute(PrimFunc &f) {
     auto rewriter = IfStmtBindingRewriter();
+    rewriter.views_ = CollectMXViews(f->body);
+    rewriter.lets_ = CollectMXViewLets(f->body);
     f.CopyOnWrite()->body = rewriter(f->body);
     return f;
   }
 
 private:
   IfStmtBindingRewriter() = default;
+  MXViewMap views_;
+  Map<Var, PrimExpr> lets_;
 
   Stmt VisitStmt_(const IfThenElseNode *op) final {
+    if (ReadsMXField(op->condition, views_, lets_))
+      return StmtExprMutator::VisitStmt_(op);
     auto condition = op->condition;
     auto then_case = VisitStmt(op->then_case);
     Optional<Stmt> else_case = op->else_case;

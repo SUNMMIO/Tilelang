@@ -483,6 +483,9 @@ private:
   int ssa_counter_{0};
 
   std::unordered_map<const tir::VarNode *, SunMMIOValue> var_table_;
+  std::unordered_map<const tir::VarNode *,
+                     std::pair<SunMMIOValue, SunMMIOValue>>
+      mx_fields_;
   std::unordered_map<const tir::VarNode *, SunMMIOValue> local_var_table_;
   std::unordered_map<const tir::BufferNode *, BufferBinding> buffer_registry_;
   std::unordered_map<const tir::VarNode *, tir::Buffer> buffer_data_to_buffer_;

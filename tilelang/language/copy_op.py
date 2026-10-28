@@ -17,6 +17,53 @@ from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
 from tilelang.utils.target import target_is_sunmmio
 from tvm import arith, ir, tir
 from tvm.target import Target
+import tvm_ffi
+
+
+def _has_mx_shape(value):
+    """Recognize only compiler-owned MX shape expressions."""
+    found = False
+
+    def visit(node):
+        nonlocal found
+        if isinstance(node, tir.Call) and isinstance(node.op, ir.Op) and node.op.name == "tl.mx_scale_extent":
+            found = True
+
+    spec = _extract_copy_region_spec(value)
+    for expr in [*spec.buffer.shape, *spec.mins, *(spec.extents or [])]:
+        tir.stmt_functor.post_order_visit(resolve_let_bound_expr(expr), visit)
+    return found
+
+
+@tvm_ffi.register_global_func("tl.mx.ResolveDeferredCopy")
+def _resolve_mx_copy(src, dst, strict, annotations):
+    src, dst = _decode_mx_copy_operand(src), _decode_mx_copy_operand(dst)
+    if _has_mx_shape(src) or _has_mx_shape(dst):
+        raise ValueError("Unresolved MX field shape in deferred copy")
+    if int(strict):
+        args = _prepare_copy_regions_strict(src, dst)
+    else:
+        args = _prepare_copy_regions_compact(src, dst, get_extent(src), get_extent(dst))
+    return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.copy"), *args, annotations=annotations)
+
+
+def _encode_mx_copy_operand(value):
+    spec = _extract_copy_region_spec(value)
+    kind = {"buffer": 0, "region": 1, "load": 2}[spec.kind]
+    # Keep endpoints so negative slice bounds can be normalized together once
+    # the parent layout determines the field shape.
+    ends = [] if spec.kind != "region" else [lo + size for lo, size in zip(spec.mins, spec.extents)]
+    return tir.call_intrin("handle", tir.op.Op.get("tl.mx_copy_operand"), kind, tir.BufferLoad(spec.buffer, spec.mins), *ends)
+
+
+def _decode_mx_copy_operand(value):
+    kind, load, *ends = value.args
+    if int(kind) == 0:
+        return load.buffer
+    if int(kind) == 2:
+        return load
+    analyzer = arith.Analyzer()
+    return tir.BufferRegion(load.buffer, [ir.Range.from_min_extent(lo, analyzer.simplify(end - lo)) for lo, end in zip(load.indices, ends)])
 
 
 _OperandKind = Literal["buffer", "region", "load"]
@@ -433,12 +480,6 @@ def copy(
         # In this case, lower it to a simple BufferStore: buffer_b[i] = buffer_a[i]
         return tir.BufferStore(dst.buffer, src, dst.indices)
 
-    target = Target.current(allow_none=True)
-    if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION and target and target_is_sunmmio(target):
-        src, dst = _prepare_copy_regions_strict(src, dst)
-    else:
-        src, dst = _prepare_copy_regions_compact(src, dst, src_extent, dst_extent)
-
     # Build annotations dict
     ann = annotations.copy() if annotations else {}
 
@@ -454,6 +495,21 @@ def copy(
     # Parallel loop layout hint (Fragment). Mirrors T.Parallel(loop_layout=...)
     if loop_layout is not None and "parallel_loop_layout" not in ann:
         ann["parallel_loop_layout"] = loop_layout
+
+    target = Target.current(allow_none=True)
+    if target and target_is_sunmmio(target) and (_has_mx_shape(src) or _has_mx_shape(dst)):
+        return tir.call_intrin(
+            "handle",
+            tir.op.Op.get("tl.mx_deferred_copy"),
+            _encode_mx_copy_operand(src),
+            _encode_mx_copy_operand(dst),
+            tir.IntImm("int32", int(_target_utils.ENABLE_SUNMMIO_REGION_VALIDATION)),
+            annotations=ann,
+        )
+    if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION and target and target_is_sunmmio(target):
+        src, dst = _prepare_copy_regions_strict(src, dst)
+    else:
+        src, dst = _prepare_copy_regions_compact(src, dst, src_extent, dst_extent)
 
     return tir.call_intrin("handle", tir.op.Op.get("tl.tileop.copy"), src, dst, annotations=ann if ann else None)
 

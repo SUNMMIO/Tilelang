@@ -162,6 +162,7 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
 def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tir.transform.BindTarget(target)(mod)
     mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
+    mod = tilelang.transform.NormalizeMXViews(validate=True)(mod)
     if should_force_let_inline():
         mod = tilelang.transform.LetInline()(mod)
 
@@ -170,8 +171,10 @@ def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.Simplify()(mod)
 
     mod = tilelang.transform.InferSramScope()(mod)
+    mod = tilelang.transform.NormalizeMXViews()(mod)
     mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
     mod = tilelang.transform.SunmmioLayoutInference()(mod)
+    mod = tilelang.transform.NormalizeMXViews(validate=True)(mod)
     mod = tilelang.transform.LegalizeSunmmioGemm()(mod)
     if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION:
         mod = tilelang.transform.ValidateTileViewRegions()(mod)
@@ -268,6 +271,7 @@ def OptimizeForSunmmio(mod: IRModule, target: Target) -> IRModule:
     pass_ctx = tilelang.transform.get_pass_context()
     mod = tilelang.transform.IfStmtBinding()(mod)
     if should_enable_sunmmio_pipeline(pass_ctx):
+        mod = tilelang.transform.CheckMXViewPipeline()(mod)
         pipeline_mode = get_sunmmio_pipeline_mode(pass_ctx)
         if pipeline_mode == "ilp":
             mod = tilelang.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
@@ -284,6 +288,7 @@ def OptimizeForSunmmio(mod: IRModule, target: Target) -> IRModule:
 
     mod = tilelang.transform.LoopUnswitching()(mod)
     mod = tir.transform.UnrollLoop()(mod)
+    mod = tilelang.transform.NormalizeMXViews()(mod)
     mod = tir.transform.RenormalizeSplitPattern()(mod)
     mod = tir.transform.Simplify()(mod)
     mod = tir.transform.RemoveNoOp()(mod)
@@ -294,6 +299,7 @@ def OptimizeForSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tir.transform.AnnotateEntryFunc()(mod)
     mod = tilelang.transform.AnnotateDeviceRegions()(mod)
     mod = tilelang.transform.SplitHostDevice()(mod)
+    mod = tilelang.transform.NormalizeMXViews()(mod)
     mod = tilelang.transform.AnnotateReadOnlyParams()(mod)
 
     mod = tilelang.transform.MergeIfStmt()(mod)

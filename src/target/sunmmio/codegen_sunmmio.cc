@@ -1,4 +1,5 @@
 #include "codegen_sunmmio.h"
+#include "../../transform/common/mx_view.h"
 #include "sunmmio_mlir_builder.h"
 
 #include "../../layout/cute_layout.h"
@@ -40,15 +41,21 @@ using namespace tir;
 
 namespace {
 
-class DeclBufferCollector final : public tir::StmtVisitor {
+class DeclBufferCollector final : public tir::StmtExprVisitor {
 public:
   std::unordered_map<const tir::VarNode *, tir::Buffer> buffer_data_to_buffer;
   std::unordered_map<const tir::VarNode *, int> reduce_register_temp_roles;
 
 private:
+  void VisitExpr_(const tir::CallNode *op) final {
+    if (op->op.same_as(tl::mx_field_handle()))
+      Record(Downcast<tir::Buffer>(op->annotations.at(tl::kMXParent)));
+    tir::StmtExprVisitor::VisitExpr_(op);
+  }
+
   void VisitStmt_(const tir::DeclBufferNode *op) final {
     Record(op->buffer);
-    tir::StmtVisitor::VisitStmt_(op);
+    tir::StmtExprVisitor::VisitStmt_(op);
   }
 
   void VisitStmt_(const tir::AllocateNode *op) final {
@@ -66,7 +73,7 @@ private:
       reduce_register_temp_roles[op->buffer_var.get()] =
           static_cast<int>(role->value);
     }
-    tir::StmtVisitor::VisitStmt_(op);
+    tir::StmtExprVisitor::VisitStmt_(op);
   }
 
   void Record(const tir::Buffer &buffer) {
@@ -78,7 +85,7 @@ private:
     if (it == buffer_data_to_buffer.end()) {
       buffer_data_to_buffer.emplace(data, buffer);
       // return;
-    } else {
+    } else if (!it->second.same_as(buffer)) {
       LOG(WARNING) << "Found duplicate DeclBuffer for data var " << data;
     }
   }
@@ -586,6 +593,7 @@ void CodeGenTileLangSunMMIO::Clear() {
   builder_.reset();
   ssa_counter_ = 0;
   var_table_.clear();
+  mx_fields_.clear();
   local_var_table_.clear();
   buffer_registry_.clear();
   buffer_data_to_buffer_.clear();
@@ -898,6 +906,16 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
   if (auto opt = f->GetAttr<SunMMIOBuilder::TirLayoutMap>(
           tl::attr::kGlobalLayoutMap)) {
     global_layout_map = opt.value();
+  }
+  for (const auto &[handle, info] : tl::CollectMXViews(f->body)) {
+    layout_map.Set(info.parent,
+                   Downcast<tl::Layout>(
+                       info.binding->annotations.at(tl::kMXParentLayout)));
+    auto it = buffer_data_to_buffer_.find(handle);
+    if (it != buffer_data_to_buffer_.end())
+      layout_map.Set(it->second,
+                     Downcast<tl::Layout>(
+                         info.binding->annotations.at(tl::kMXFieldLayout)));
   }
   builder_->PushLayoutScope(layout_map, global_layout_map);
 
@@ -1428,6 +1446,55 @@ void CodeGenTileLangSunMMIO::EmitWhile(const tir::WhileNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::LetStmtNode *op) {
+  if (tl::IsMXFieldHandle(op->value)) {
+    MarkVisitedExprTree(op->value);
+    auto call = Downcast<tir::Call>(op->value);
+    auto parent = Downcast<tir::Buffer>(call->annotations.at(tl::kMXParent));
+    auto key = parent->data.get();
+    bool created = !mx_fields_.count(key);
+    if (created) {
+      DataType data_dtype = parent->dtype.bits() == 8
+                                ? DataType::Float8E4M3FN()
+                                : DataType::Float4E2M1FN();
+      mx_fields_[key] =
+          builder_->MXUnpack(NewValueName(), NewValueName(), LookupVar(key),
+                             DataType::Float8E8M0FNU(), data_dtype);
+    }
+    int field = Downcast<IntImm>(call->args[1])->value;
+    SunMMIOValue value =
+        field == 0 ? mx_fields_.at(key).second : mx_fields_.at(key).first;
+    ICHECK_EQ(
+        value.type.byte_offset,
+        Downcast<Integer>(call->annotations.at(tl::kMXFieldOffset)).IntValue())
+        << "MX field byte offset disagrees with SUVM unpack";
+    auto it = buffer_data_to_buffer_.find(op->var.get());
+    if (it != buffer_data_to_buffer_.end()) {
+      SunMMIOType expected = MapBufferType(it->second);
+      ICHECK(expected.dtype == value.type.dtype &&
+             expected.layout_dim_levels == value.type.layout_dim_levels);
+      auto equal = [](const std::vector<PrimExpr> &a,
+                      const std::vector<PrimExpr> &b) {
+        if (a.size() != b.size())
+          return false;
+        arith::Analyzer analyzer;
+        for (size_t i = 0; i < a.size(); ++i)
+          if (!analyzer.CanProveEqual(a[i], b[i]))
+            return false;
+        return true;
+      };
+      ICHECK(equal(expected.shape, value.type.shape) &&
+             equal(expected.layout_hshape, value.type.layout_hshape) &&
+             equal(expected.layout_hstride, value.type.layout_hstride))
+          << "MX field descriptor disagrees with SUVM unpack";
+    }
+    EnterScope();
+    BindVar(op->var, value);
+    VisitStmtTracked(op->body);
+    ExitScope();
+    if (created)
+      mx_fields_.erase(key);
+    return;
+  }
   SunMMIOValue value = EvalExpr(op->value);
   EnterScope();
   BindVar(op->var, value);

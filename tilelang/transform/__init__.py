@@ -16,6 +16,36 @@ def get_pass_context():
     return PassContext.current()
 
 
+def NormalizeMXViews(validate=False):
+    """Maintain MX field bindings after buffer or SSA remapping."""
+    normalize = _ffi_api.NormalizeMXViews(validate)
+    if not validate:
+        return normalize
+
+    @tvm.tir.transform.prim_func_pass(opt_level=0)
+    def CheckMXViewSimplifyConfig(func, mod, ctx):
+        unsafe = any(
+            getattr(ctx.config.get(key), option, False)
+            for key in ("tir.Simplify", "tl.Simplify")
+            for option in ("propagate_knowns_to_prove_conditional", "propagate_knowns_to_simplify_expressions")
+        )
+        if unsafe:
+
+            def check(node):
+                if isinstance(node, tvm.tir.Call) and isinstance(node.op, tvm.ir.Op) and node.op.name == "tl.mx_field_handle":
+                    raise ValueError("MX views do not support optional buffer value propagation")
+
+            tvm.tir.stmt_functor.post_order_visit(func.body, check)
+        return func
+
+    return tvm.transform.Sequential([CheckMXViewSimplifyConfig, normalize])
+
+
+def CheckMXViewPipeline():
+    """Reject automatic pipelining of MX view storage."""
+    return _ffi_api.CheckMXViewPipeline()
+
+
 def ClusterPlanning():
     """ClusterPlanning
 

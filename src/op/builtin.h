@@ -21,6 +21,10 @@ namespace tvm {
  */
 namespace tl {
 
+TVM_DLL const Op &mx_field_handle();
+TVM_DLL const Op &mx_scale_extent();
+TVM_DLL const Op &mx_copy_operand();
+
 namespace attr {
 static constexpr const char *kSafeValueMap = "safe_value_map";
 static constexpr const char *kWarpSpecializationScope =

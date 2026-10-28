@@ -978,8 +978,8 @@ def test_infer_tileview_keeps_scalar_fallback_for_incompatible_axis_order():
         pytest.param(T.mxfp8, id="mxfp8"),
     ],
 )
-def test_subbyte_and_mx_dtypes_skip_aligned_1d_bridge(dtype, capfd):
-    """Unverified 1D dtype paths must remain on the conservative fallback."""
+def test_aligned_1d_bridge_distinguishes_payload_from_mx(dtype, capfd):
+    """FP4 payloads support word-aligned tiles; composite MX stays excluded."""
     width = 32
 
     @T.prim_func
@@ -996,6 +996,10 @@ def test_subbyte_and_mx_dtypes_skip_aligned_1d_bridge(dtype, capfd):
     captured = capfd.readouterr()
     script = mod["main"].script()
 
+    if dtype == T.float4_e2m1fn:
+        assert "Skipping aligned 1D bridge candidates" not in captured.err
+        assert "tile.scope_entry" in script
+        return
     assert "Skipping aligned 1D bridge candidates" in captured.err
     assert "tile.domain" not in script
     assert "tile.scope_entry" not in script

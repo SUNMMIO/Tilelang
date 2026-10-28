@@ -165,6 +165,9 @@ SunMMIOValue SunmmioMlirExpr::ConstantInt(const std::string &result_name,
       << "MLIR module must be initialized before lowering Sunmmio expressions";
 
   mlir::Type value_type = MapMlirType(ctx_, type);
+  if (mlir::isa<mlir::FloatType>(value_type)) {
+    return ConstantFloat(result_name, std::to_string(v), type, dtype);
+  }
   mlir::TypedAttr value_attr;
   if (value_type.isIndex()) {
     value_attr = ctx_.builder.getIndexAttr(v);
