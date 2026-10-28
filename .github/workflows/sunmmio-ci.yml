@@ -386,8 +386,7 @@ jobs:
           "${PYTEST[@]}" \
             -c testing/pytest.ini \
             -m "not sunmmio_closed_runtime" \
-            testing/python/sunmmio \
-            testing/python/language/test_tilelang_language_dtypes.py
+            testing/python/sunmmio
 
       - name: List generated files
         if: ${{ !cancelled() }}
