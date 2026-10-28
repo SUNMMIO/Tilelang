@@ -391,6 +391,19 @@ class TestSunmmioConstructors:
         assert derived
         assert is_same_layout(derived, expected)
 
+    @pytest.mark.parametrize("layout_factory", [make_mxzz, make_mxnnz, make_mxznz])
+    @pytest.mark.parametrize("dtype", ["custom[mxfp8]8", "custom[mxfp4]4"])
+    def test_derive_layout_like_for_dtype_prepends_mx_pipeline_stage(self, layout_factory, dtype):
+        derive_layout_like_for_dtype = _get("tl.DeriveLayoutLikeForDType")
+        src = layout_factory(_imms(128, 128), [0, 1], dtype)
+        dst_shape = _imms(2, 128, 128)
+        expected = layout_factory(dst_shape, [1, 2], dtype)
+
+        derived = derive_layout_like_for_dtype(src, dst_shape, dtype, None)
+
+        assert derived
+        assert is_same_layout(derived, expected)
+
     # --- Non-divisible (padded) shapes ---
 
     @pytest.mark.parametrize(

@@ -56,6 +56,30 @@ struct VectorCoreCost {
   };
 };
 
+constexpr int kMXFP8CustomTypeCode = DataType::kCustomBegin;
+constexpr int kMXFP4CustomTypeCode = DataType::kCustomBegin + 1;
+
+bool IsMXFP8DType(DataType dtype) {
+  return dtype.code() == kMXFP8CustomTypeCode && dtype.bits() == 8 &&
+         dtype.lanes() == 1;
+}
+
+bool IsMXFP4DType(DataType dtype) {
+  return dtype.code() == kMXFP4CustomTypeCode && dtype.bits() == 4 &&
+         dtype.lanes() == 1;
+}
+
+bool IsMXDType(DataType dtype) {
+  return IsMXFP8DType(dtype) || IsMXFP4DType(dtype);
+}
+
+bool IsSupportedA4ETensorCorePair(DataType activation, DataType weight) {
+  if (activation.is_bfloat16()) {
+    return weight.is_bfloat16() || IsMXDType(weight);
+  }
+  return IsMXDType(activation) && IsMXDType(weight);
+}
+
 static bool ContainsExpr(const tvm::ffi::Array<PrimExpr> &exprs,
                          const PrimExpr &expr) {
   for (const PrimExpr &it : exprs) {
@@ -247,11 +271,9 @@ float CostModel::EstimateTensorCoreDelay(const tir::Stmt &stmt) {
   DataType rhs_dtype = b_region->buffer->dtype;
   DataType output_dtype = c_region->buffer->dtype;
 
-  ICHECK(input_dtype.is_bfloat16())
-      << "Only bf16 TensorCore input is supported in current cost model: "
-      << stmt;
-  ICHECK(rhs_dtype == input_dtype)
-      << "TensorCore input dtypes must match for current cost model: " << stmt;
+  ICHECK(IsSupportedA4ETensorCorePair(input_dtype, rhs_dtype))
+      << "Unsupported TensorCore input dtypes in current cost model: "
+      << input_dtype << " x " << rhs_dtype << "; " << stmt;
 
   auto static_extent = [&](const BufferRegion &region, int axis,
                            const char *operand) {
@@ -285,13 +307,15 @@ float CostModel::EstimateTensorCoreDelay(const tir::Stmt &stmt) {
   }
 
   /**
-   * For bf16 TensorCore MMA, the effective inner-loop gap is bounded by both
-   * the reduction depth and a minimum block count implied by the tile shape.
-   * The accumulator dtype contributes a small fixed latency difference between
+   * The effective inner-loop gap is bounded by the activation path's reduction
+   * throughput and a minimum block count implied by the tile shape. The
+   * accumulator dtype contributes a small fixed latency difference between
    * bf16 accumulation and fp32 accumulation.
    */
   int min_blk_num = (row_size <= 16 && col_size <= 32) ? 1 : 4;
-  int gap = std::max(ceil_div(acc_size, 32), min_blk_num);
+  int reduction_elems_per_cycle = IsMXDType(input_dtype) ? 128 : 32;
+  int gap =
+      std::max(ceil_div(acc_size, reduction_elems_per_cycle), min_blk_num);
   int st_dtype_delay = 0;
   if (output_dtype.is_bfloat16()) {
     st_dtype_delay = 8;
