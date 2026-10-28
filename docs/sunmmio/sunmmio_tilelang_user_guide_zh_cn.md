@@ -819,6 +819,15 @@ T.comm.put(src, dst, src_core, dst_core, size=-1)
 
 `put` 适合一对一数据交付。若同一份数据要发给一行、一列或整个 mesh，通常使用 `broadcast`。
 
+对于 Sunmmio 动态路由，`src_core` 必须是当前 `cid`；`dst_core(cid)` 必须能针对每个活动 core
+在编译期求值，并构成一个双射置换。每次传输必须是同一 row 或同一 column 内的单跳，且同一个
+调用产生的所有传输必须使用同一方向。编译器会将置换分解为若干 cycle，并为每个 cycle 使用一个
+participant barrier。
+
+动态 `put` 只有在显式 `if` 条件仅依赖 `cid` 和编译期常量、并且同一 cycle 的所有成员取值一致时
+才能被条件执行。当前会拒绝位于 `for` 或 `while` 循环中的动态 `put`。Sunmmio 不支持 `T.where`
+或其他非平凡 block predicate；请改用 cycle 内一致的显式 `if`。
+
 **`T.comm.all_gather`**
 
 ```python

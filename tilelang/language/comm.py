@@ -973,11 +973,12 @@ def put(
         Destination buffer to receive the data.
     src_core : int | tir.PrimExpr | tuple[int | tir.PrimExpr, int | tir.PrimExpr]
         Linear source core id, or (row, col) coordinates of the source core on
-        the target mesh. Dynamic TIR expressions such as the block id returned
-        by ``T.Kernel`` are allowed.
+        the target mesh. For a dynamic route, this must be the block id returned
+        by ``T.Kernel``.
     dst_core : int | tir.PrimExpr | tuple[int | tir.PrimExpr, int | tir.PrimExpr]
         Linear destination core id, or (row, col) coordinates of the destination
-        core on the target mesh. Dynamic TIR expressions are allowed.
+        core on the target mesh. A dynamic destination must be statically
+        resolvable for every core and form a one-hop row or column permutation.
     size : int
         Number of elements to put. If -1, the entire source buffer is used.
     Returns
@@ -987,7 +988,17 @@ def put(
     Examples
     --------
     >>> put(A, B, (1, 2), (2, 3))
-    >>> put(A, B, cid, (cid + 1) % 16)
+    >>> put(A, B, cid, cid // 4 * 4 + (cid % 4 + 1) % 4)
+
+    Notes
+    -----
+    On Sunmmio, dynamic routes require ``src_core == cid`` and a bijective
+    destination mapping over the active cores. Every route must be a single
+    row or column hop, and all routes in one call must use the same direction.
+    An explicit ``if`` is supported only when its condition depends on ``cid``
+    and compile-time constants and is uniform within each permutation cycle.
+    Dynamic puts inside ``for`` or ``while`` loops are rejected. ``T.where``
+    and non-trivial block predicates are unsupported by the Sunmmio frontend.
     """
     src_region, dst_region = _prepare_one_to_one_operands(src, dst, "T.comm.put")
     src_dtype = src_region.buffer.dtype

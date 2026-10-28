@@ -1025,6 +1025,26 @@ private:
         << "tl.broadcast_ barrier mask expansion only supports row or column "
            "broadcasts";
     int direction = static_cast<int>(direction_imm->value);
+    if (auto validated_mask = call->annotations.Get(kCommBarrierMaskAttr)) {
+      BarrierMaskInfo info;
+      info.expr = AsI64(Downcast<PrimExpr>(validated_mask.value()));
+      if (analyzer_) {
+        info.expr = analyzer_->Simplify(info.expr);
+      }
+      if (const auto *imm = info.expr.as<IntImmNode>()) {
+        ICHECK(MaskAlignedWithDirection(UnsignedMask(imm->value), direction,
+                                        mesh_nrow_, mesh_ncol_))
+            << "Validated tl.broadcast_ barrier mask is incompatible with "
+               "its communication direction";
+      } else {
+        info.candidates = EnumerateMaskCandidates(
+            info.expr, direction, mesh_nrow_, mesh_ncol_, analyzer_);
+        ICHECK(!info.candidates.empty())
+            << "Could not derive static candidate masks for validated "
+               "tl.broadcast_ barrier mask";
+      }
+      return info;
+    }
     PrimExpr src_core = GetBroadcastBarrierSrcCore(call);
     PrimExpr write_mask = ExpandBroadcastLocalMask(
         call->args[kBroadcastArgMask], direction, src_core);

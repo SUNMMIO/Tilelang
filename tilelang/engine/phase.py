@@ -179,6 +179,7 @@ def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.ValidateTileViewRegions()(mod)
 
     LayoutVisual(mod)
+    mod = tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     mod = tilelang.transform.LegalizeTilesLoop()(mod)
     mod = tilelang.transform.TilesLoop()(mod)

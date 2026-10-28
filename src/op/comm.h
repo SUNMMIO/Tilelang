@@ -14,6 +14,9 @@ namespace tl {
 
 TVM_DLL const Op &broadcast_();
 
+// Internal proof attached by ValidateDynamicCommPutRoutes before LowerTileOp.
+constexpr const char *kCommPutDirectionAttr = "tl.comm_put_direction";
+constexpr const char *kCommBarrierMaskAttr = "tl.comm_barrier_mask";
 constexpr const char *kAttrAllowRank3Multicast =
     "tl.allow_rank3_allreduce_multicast";
 
@@ -79,7 +82,9 @@ public:
   Array<Range> src_range, dst_range;
   PrimExpr src_expr, dst_expr;
   PrimExpr src_core, dst_core;
+  PrimExpr validated_barrier_mask;
   IntImm size;
+  int validated_direction = -1;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.comm_put", PutOpNode, TileOperatorNode);
 
@@ -92,7 +97,9 @@ public:
         .def_ro("dst_range", &PutOpNode::dst_range)
         .def_ro("src_core", &PutOpNode::src_core)
         .def_ro("dst_core", &PutOpNode::dst_core)
-        .def_ro("size", &PutOpNode::size);
+        .def_ro("validated_barrier_mask", &PutOpNode::validated_barrier_mask)
+        .def_ro("size", &PutOpNode::size)
+        .def_ro("validated_direction", &PutOpNode::validated_direction);
   }
 
   TileOperator Clone() const override;

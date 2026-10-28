@@ -819,6 +819,19 @@ T.comm.put(src, dst, src_core, dst_core, size=-1)
 
 `put` is suitable for one-to-one data delivery. If the same data needs to be sent to a row, a column, or the whole mesh, `broadcast` is usually used.
 
+For a dynamic Sunmmio route, `src_core` must be the current `cid`, while
+`dst_core(cid)` must be statically resolvable for every active core and form a
+bijective permutation. Every transfer must be a single hop within one row or
+one column, and all transfers from the same call must use the same direction.
+The compiler decomposes the permutation into cycles and uses one participant
+barrier per cycle.
+
+Dynamic `put` may be guarded by an explicit `if` only when the condition depends
+on `cid` and compile-time constants and has the same value for every member of a
+cycle. Dynamic `put` inside `for` or `while` loops is currently rejected.
+Sunmmio does not support `T.where` or other non-trivial block predicates; use an
+explicit cycle-uniform `if` instead.
+
 **`T.comm.all_gather`**
 
 ```python

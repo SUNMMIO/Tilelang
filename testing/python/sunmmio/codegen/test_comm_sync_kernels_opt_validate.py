@@ -55,6 +55,61 @@ def comm_put_kernel(M=128, N=128, block_M=32, block_N=32, dtype="bfloat16"):
 
 
 @target("Sunmmio")
+def comm_dynamic_pair_put_kernel():
+    @T.prim_func
+    def main(
+        A: T.Tensor((16, 32, 32), "bfloat16"),
+        B: T.Tensor((16, 32, 32), "bfloat16"),
+    ):
+        with T.Kernel() as cid:
+            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            T.copy(A[cid, 0, 0], src)
+            T.comm.put(src, dst, cid, (cid // 2) * 2 + 1 - cid % 2)
+            T.copy(dst, B[cid, 0, 0])
+
+    return main
+
+
+@target("Sunmmio")
+def comm_dynamic_column_pair_put_kernel():
+    @T.prim_func
+    def main(
+        A: T.Tensor((16, 32, 32), "bfloat16"),
+        B: T.Tensor((16, 32, 32), "bfloat16"),
+    ):
+        with T.Kernel() as cid:
+            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            T.copy(A[cid, 0, 0], src)
+            row = cid // 4
+            peer = (row // 2 * 2 + 1 - row % 2) * 4 + cid % 4
+            T.comm.put(src, dst, cid, peer)
+            T.copy(dst, B[cid, 0, 0])
+
+    return main
+
+
+@target("Sunmmio")
+def comm_dynamic_row_ring_put_kernel():
+    @T.prim_func
+    def main(
+        A: T.Tensor((16, 32, 32), "bfloat16"),
+        B: T.Tensor((16, 32, 32), "bfloat16"),
+    ):
+        with T.Kernel() as cid:
+            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            T.copy(A[cid, 0, 0], src)
+            row = cid // 4
+            next_cid = row * 4 + (cid % 4 + 1) % 4
+            T.comm.put(src, dst, cid, next_cid)
+            T.copy(dst, B[cid, 0, 0])
+
+    return main
+
+
+@target("Sunmmio")
 def comm_all_gather_kernel(
     *,
     M=128,
@@ -277,6 +332,45 @@ def test_comm_put_kernel_codegen_validates_with_npuir_opt(tmp_path):
     )
 
     assert src.count("suvm.mcast_async") >= 2
+
+
+def test_comm_dynamic_pair_put_codegen_has_no_sender_guard(tmp_path):
+    src = _validate_kernel(
+        comm_dynamic_pair_put_kernel(),
+        tmp_path,
+        mlir_filename="comm_dynamic_pair_put_suvm.mlir",
+        expected_tokens=("suvm.mcast_async", "suvm.sync", "suvm.barrier.arrive_and_wait"),
+    )
+    assert src.count("suvm.mcast_async") == 1
+    assert src.count("suvm.get_core_id") == 1
+
+
+def test_comm_dynamic_column_pair_put_codegen_has_no_sender_guard(tmp_path):
+    src = _validate_kernel(
+        comm_dynamic_column_pair_put_kernel(),
+        tmp_path,
+        mlir_filename="comm_dynamic_column_pair_put_suvm.mlir",
+        expected_tokens=("suvm.mcast_async", "suvm.sync", "suvm.barrier.arrive_and_wait"),
+    )
+    mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
+    assert len(mcast_lines) == 1
+    assert "col" in mcast_lines[0]
+    assert src.count("suvm.get_core_id") == 1
+
+
+def test_comm_dynamic_row_ring_put_codegen_uses_cycle_barriers(tmp_path):
+    src = _validate_kernel(
+        comm_dynamic_row_ring_put_kernel(),
+        tmp_path,
+        mlir_filename="comm_dynamic_row_ring_put_suvm.mlir",
+        expected_tokens=("suvm.mcast_async", "suvm.sync", "suvm.barrier.arrive_and_wait"),
+    )
+    mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
+    assert len(mcast_lines) == 1
+    assert "row" in mcast_lines[0]
+    assert src.count("suvm.get_core_id") == 1
+    for mask in (15, 240, 3840, 61440):
+        assert f"suvm.barrier.init mask = {mask}" in src
 
 
 @pytest.mark.parametrize(
