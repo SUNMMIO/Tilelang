@@ -9,6 +9,7 @@
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt.h>
+#include <tvm/tir/stmt_functor.h>
 
 namespace tvm {
 namespace tl {
@@ -30,6 +31,24 @@ enum class DeviceType : int {
  */
 class HardwareMapper {
 public:
+  static bool HasNestedHardwareCommands(const Stmt &stmt) {
+    if (!stmt.as<ForNode>()) {
+      return false;
+    }
+    // A nested hardware loop cannot be scheduled as one VectorCore command.
+    bool found = false;
+    PostOrderVisit(stmt, [&](const ObjectRef &node) {
+      if (const auto *eval = node.as<EvaluateNode>()) {
+        const auto *call = eval->value.as<CallNode>();
+        if (!call ||
+            !call->op.same_as(Op::Get("tl.vector_core_in_tile_reduce"))) {
+          found = true;
+        }
+      }
+    });
+    return found;
+  }
+
   static DeviceType Map(const Stmt &stmt) {
     if (const auto *block = stmt.as<BlockRealizeNode>()) {
       // Check for TensorCore (mma_sunmmio)
