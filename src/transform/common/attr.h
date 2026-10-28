@@ -63,6 +63,9 @@ constexpr const char *tile_interior_axis = "tile.interior_axis";
 constexpr const char *kSunmmioReduceRegisterTemp =
     "tile.sunmmio_reduce_register_temp";
 
+// Planned SUVM tile_view metadata carried by tl.tileop.region.
+constexpr const char *kSunmmioRegionTiledDims = "sunmmio.region_tiled_dims";
+constexpr const char *kSunmmioRegionViewShape = "sunmmio.region_view_shape";
 } // namespace attr
 
 enum class TileLoopStage : int {

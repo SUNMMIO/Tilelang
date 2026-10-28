@@ -25,10 +25,187 @@
 #include <tvm/tir/op_attr_types.h>
 #include <tvm/tir/transform.h>
 
+#include <algorithm>
+#include <optional>
+#include <utility>
+#include <vector>
+
 namespace tvm {
 namespace tl {
 
 using namespace tir;
+
+namespace {
+
+struct RsramDmaCopyPlan {
+  std::vector<int64_t> src_tiled_dims;
+  std::vector<int64_t> dst_tiled_dims;
+  std::vector<int64_t> view_shape;
+};
+
+using StaticDim = std::pair<int64_t, int64_t>;
+
+std::optional<std::vector<StaticDim>>
+CollectStaticNonUnitDims(const Array<Range> &ranges,
+                         arith::Analyzer *analyzer) {
+  std::vector<StaticDim> result;
+  for (int64_t dim = 0; dim < static_cast<int64_t>(ranges.size()); ++dim) {
+    PrimExpr extent = analyzer->Simplify(ranges[dim]->extent);
+    const auto *imm = extent.as<IntImmNode>();
+    if (!imm || imm->value <= 0) {
+      return std::nullopt;
+    }
+    if (imm->value != 1) {
+      result.emplace_back(dim, imm->value);
+    }
+  }
+  return result;
+}
+
+std::optional<int64_t> GetInnermostStaticStride(const CuteLayoutNode *layout,
+                                                int64_t dim,
+                                                arith::Analyzer *analyzer) {
+  Array<PrimExpr> mode_shapes = layout->GetModeShapeOfDim(dim);
+  Array<PrimExpr> mode_strides = layout->GetModeStrideOfDim(dim);
+  ICHECK_EQ(mode_shapes.size(), mode_strides.size());
+
+  std::optional<int64_t> result;
+  for (size_t i = 0; i < mode_shapes.size(); ++i) {
+    PrimExpr shape = analyzer->Simplify(mode_shapes[i]);
+    const auto *shape_imm = shape.as<IntImmNode>();
+    if (!shape_imm || shape_imm->value <= 0) {
+      return std::nullopt;
+    }
+    if (shape_imm->value == 1) {
+      continue;
+    }
+
+    PrimExpr stride = analyzer->Simplify(mode_strides[i]);
+    const auto *stride_imm = stride.as<IntImmNode>();
+    if (!stride_imm || stride_imm->value <= 0) {
+      return std::nullopt;
+    }
+    result = result.has_value() ? std::min(*result, stride_imm->value)
+                                : stride_imm->value;
+  }
+  return result;
+}
+
+std::optional<Layout> LookupCopyLayout(const LayoutMap &layout_map,
+                                       const Buffer &buffer) {
+  if (layout_map.count(buffer)) {
+    return layout_map[buffer];
+  }
+  for (const auto &[candidate, layout] : layout_map) {
+    if (candidate->data.same_as(buffer->data)) {
+      return layout;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<RsramDmaCopyPlan>
+TryPlanRsramDmaCopy(const Buffer &src, const Array<Range> &src_ranges,
+                    const Buffer &dst, const Array<Range> &dst_ranges,
+                    const LayoutMap &layout_map, arith::Analyzer *analyzer) {
+  if (src.scope() != kSunmmioScopeRSRAM || dst.scope() != kSunmmioScopeRSRAM ||
+      src->dtype != dst->dtype || sunmmio::IsMXDType(src->dtype)) {
+    return std::nullopt;
+  }
+
+  auto src_dims = CollectStaticNonUnitDims(src_ranges, analyzer);
+  auto dst_dims = CollectStaticNonUnitDims(dst_ranges, analyzer);
+  if (!src_dims || !dst_dims || src_dims->empty() ||
+      src_dims->size() != dst_dims->size() || src_dims->size() > 2) {
+    return std::nullopt;
+  }
+
+  bool axis_positions_differ = false;
+  for (size_t i = 0; i < src_dims->size(); ++i) {
+    if ((*src_dims)[i].second != (*dst_dims)[i].second) {
+      return std::nullopt;
+    }
+    axis_positions_differ |= (*src_dims)[i].first != (*dst_dims)[i].first;
+  }
+  if (!axis_positions_differ) {
+    return std::nullopt;
+  }
+
+  std::optional<Layout> src_layout = LookupCopyLayout(layout_map, src);
+  std::optional<Layout> dst_layout = LookupCopyLayout(layout_map, dst);
+  if (!src_layout || !dst_layout) {
+    return std::nullopt;
+  }
+  const auto *src_cute = src_layout->as<CuteLayoutNode>();
+  const auto *dst_cute = dst_layout->as<CuteLayoutNode>();
+  if (!src_cute || !dst_cute) {
+    return std::nullopt;
+  }
+
+  struct AxisPair {
+    int64_t src_dim;
+    int64_t dst_dim;
+    int64_t extent;
+    int64_t src_stride;
+    int64_t dst_stride;
+  };
+  std::vector<AxisPair> axes;
+  auto is_tile_aligned = [&](const Array<Range> &ranges, int64_t dim) {
+    const Range &range = ranges[dim];
+    return analyzer->CanProveEqual(FloorMod(range->min, range->extent), 0);
+  };
+  for (size_t i = 0; i < src_dims->size(); ++i) {
+    int64_t src_dim = (*src_dims)[i].first;
+    int64_t dst_dim = (*dst_dims)[i].first;
+    auto src_stride = GetInnermostStaticStride(src_cute, src_dim, analyzer);
+    auto dst_stride = GetInnermostStaticStride(dst_cute, dst_dim, analyzer);
+    if (!src_stride || !dst_stride || !is_tile_aligned(src_ranges, src_dim) ||
+        !is_tile_aligned(dst_ranges, dst_dim)) {
+      return std::nullopt;
+    }
+    axes.push_back(
+        {src_dim, dst_dim, (*src_dims)[i].second, *src_stride, *dst_stride});
+  }
+
+  // Tile-view axes are ordered from the most contiguous physical dimension to
+  // the least contiguous one. The destination must preserve that ordering so
+  // corresponding tile coordinates describe the same transfer runs.
+  std::sort(axes.begin(), axes.end(),
+            [](const AxisPair &lhs, const AxisPair &rhs) {
+              return lhs.src_stride < rhs.src_stride;
+            });
+  for (size_t i = 1; i < axes.size(); ++i) {
+    if (axes[i - 1].src_stride == axes[i].src_stride ||
+        axes[i - 1].dst_stride >= axes[i].dst_stride) {
+      return std::nullopt;
+    }
+  }
+
+  RsramDmaCopyPlan plan;
+  for (const AxisPair &axis : axes) {
+    plan.src_tiled_dims.push_back(axis.src_dim);
+    plan.dst_tiled_dims.push_back(axis.dst_dim);
+    plan.view_shape.push_back(axis.extent);
+  }
+  return plan;
+}
+
+Array<Integer> ToIntegerArray(const std::vector<int64_t> &values) {
+  Array<Integer> result;
+  for (int64_t value : values) {
+    result.push_back(Integer(value));
+  }
+  return result;
+}
+
+Map<String, ObjectRef>
+MakeRegionPlanAnnotations(const std::vector<int64_t> &tiled_dims,
+                          const std::vector<int64_t> &view_shape) {
+  Map<String, ObjectRef> annotations;
+  annotations.Set(attr::kSunmmioRegionTiledDims, ToIntegerArray(tiled_dims));
+  annotations.Set(attr::kSunmmioRegionViewShape, ToIntegerArray(view_shape));
+  return annotations;
+}
 
 static bool SameLayoutIgnoringSingletonModes(const Layout &lhs,
                                              const Layout &rhs,
@@ -84,6 +261,7 @@ static bool SameLayoutIgnoringSingletonModes(const Layout &lhs,
   return true;
 }
 
+} // namespace
 // Constructs a Copy operator node from call arguments and annotations.
 // args[0]: source region, args[1]: destination region
 // annotations: Map containing coalesced_width, disable_tma, eviction_policy,
@@ -732,6 +910,26 @@ bool CopyNode::CheckTMemStore(Target target) const {
          dst.scope() == "shared.tmem";
 }
 
+bool CopyNode::CheckSunmmioRsramStridedDMACopy(
+    Target target, const LayoutMap &layout_map,
+    arith::Analyzer *analyzer) const {
+  // Restrict the initial implementation to RSRAM-to-RSRAM transfers.
+  if (src.scope() != kSunmmioScopeRSRAM || dst.scope() != kSunmmioScopeRSRAM) {
+    return false;
+  }
+
+  // Check the coarse target, scope, and dtype capability first.
+  if (!SupportsSunmmioDirectTransfer(
+          target, SunmmioTransferMechanism::kLocalDma, src.scope(), src->dtype,
+          dst.scope(), dst->dtype)) {
+    return false;
+  }
+
+  return TryPlanRsramDmaCopy(src, src_range, dst, dst_range, layout_map,
+                             analyzer)
+      .has_value();
+}
+
 bool CopyNode::CheckSunmmioDMACopy(Target target) const {
   return SupportsSunmmioDirectTransfer(
       target, SunmmioTransferMechanism::kLocalDma, src.scope(), src->dtype,
@@ -800,16 +998,30 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
   } else if (CheckTMemStore(target)) {
     return CopyInst::kTMemStore;
   } else if (TargetIsSunmmio(target)) {
-    // Prefer tile loops for RSRAM -> RSRAM. Local DMA may also support a
-    // same-dtype transfer, but tile lowering preserves the existing cast and
-    // region-view behavior.
-    if (CheckSunmmioTileCopy(target)) {
-      return CopyInst::kSunmmioTileCopy;
-    } else if (CheckSunmmioDMACopy(target)) {
+    // Prefer ODMA for the explicitly planned singleton-axis-remap pattern.
+    // Keep ordinary RSRAM-to-RSRAM copies on tile loops so existing cast and
+    // region-view behavior remains unchanged.
+    bool rsram_to_rsram =
+        src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeRSRAM;
+
+    if (rsram_to_rsram) {
+      if (CheckSunmmioRsramStridedDMACopy(target, layout_map, analyzer)) {
+        return CopyInst::kSunmmioDMACopy;
+      }
+      if (CheckSunmmioTileCopy(target)) {
+        return CopyInst::kSunmmioTileCopy;
+      }
+
+      LOG(FATAL) << "Unsupported RSRAM-to-RSRAM copy from " << src->name
+                 << " to " << dst->name;
+    }
+
+    if (CheckSunmmioDMACopy(target)) {
       return CopyInst::kSunmmioDMACopy;
     }
-    ICHECK(0) << "Unsupported copy from " << src.scope() << " to "
-              << dst.scope() << " of Sunmmio target.";
+
+    LOG(FATAL) << "Unsupported copy from " << src.scope() << " to "
+               << dst.scope() << " of Sunmmio target.";
   } else {
     return CopyInst::kNormal;
   }
@@ -860,6 +1072,30 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
 Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
                                    arith::Analyzer *analyzer) const {
+  if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeRSRAM) {
+    auto plan = TryPlanRsramDmaCopy(src, src_range, dst, dst_range,
+                                    T.layout_map, analyzer);
+
+    ICHECK(plan.has_value())
+        << "RSRAM-to-RSRAM copy was selected for DMA but no legal "
+           "tile-view plan could be constructed";
+
+    PrimExpr src_region = MakeRegionExpr(
+        src, src_range, /*access_mask=*/1,
+        MakeRegionPlanAnnotations(plan->src_tiled_dims, plan->view_shape));
+
+    PrimExpr dst_region = MakeRegionExpr(
+        dst, dst_range, /*access_mask=*/2,
+        MakeRegionPlanAnnotations(plan->dst_tiled_dims, plan->view_shape));
+
+    return Evaluate(Call(DataType::Handle(), dma_copy(),
+                         {
+                             src_region,
+                             dst_region,
+                             IntImm(DataType::Int(32), GetSrcOffsetByte()),
+                         }));
+  }
+
   if (dst.scope() == kSunmmioScopeWSRAM || dst.scope() == kSunmmioScopeASRAM) {
     auto emit_dma = [&](const Array<Range> &src_view,
                         const Array<Range> &dst_view) {

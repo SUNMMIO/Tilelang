@@ -2502,6 +2502,30 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
   BufferRegion region = NormalizeRegionTracked(region_expr);
   const BufferBinding &binding = LookupBuffer(region->buffer);
   std::vector<int64_t> effective_extents;
+  auto read_int_array =
+      [&](const char *key) -> std::optional<std::vector<int64_t>> {
+    const auto *call = region_expr.as<CallNode>();
+    if (!call) {
+      return std::nullopt;
+    }
+
+    auto value = call->annotations.Get(key);
+    if (!value.has_value()) {
+      return std::nullopt;
+    }
+
+    Array<Integer> array = Downcast<Array<Integer>>(value.value());
+    std::vector<int64_t> result;
+    for (const Integer &item : array) {
+      result.push_back(item.IntValue());
+    }
+    return result;
+  };
+
+  auto planned_dims = read_int_array(tl::attr::kSunmmioRegionTiledDims);
+  auto planned_shape = read_int_array(tl::attr::kSunmmioRegionViewShape);
+
+  ICHECK_EQ(planned_dims.has_value(), planned_shape.has_value());
   if (use_layout_covered_shape) {
     std::vector<int64_t> logical_shape =
         ExtractStaticShape(binding.buffer_type);
@@ -2550,7 +2574,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
   std::string result_name = region_expr.dtype().is_void() ? "" : NewValueName();
   return builder_->RegionCall(result_name, binding.handle, mins, extents,
                               region_expr.dtype(), ret_ty, byte_offset,
-                              preserve_region_rank, allow_rank3);
+                              preserve_region_rank, allow_rank3, planned_dims,
+                              planned_shape);
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
