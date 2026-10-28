@@ -98,6 +98,31 @@ def _tiles_unroll_kernel(unroll=None):
     return main
 
 
+@target("Sunmmio")
+def _fused_tiles_unroll_kernel(first_unroll, second_unroll):
+    shape = (64, 64)
+    layout = make_zz_layout(shape, [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(shape, T.placement.replicated(), T.float32, layout=layout),  # type: ignore
+        B: T.MeshTensor(shape, T.placement.replicated(), T.float32, layout=layout),  # type: ignore
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared(shape, T.float32)
+            intermediate = T.alloc_shared(shape, T.float32)
+            B_shared = T.alloc_shared(shape, T.float32)
+
+            T.copy(A, A_shared)
+            for i, j in T.Tiles(shape, parallel=True, unroll=first_unroll):
+                intermediate[i, j] = A_shared[i, j] + T.float32(1)
+            for i, j in T.Tiles(shape, parallel=True, unroll=second_unroll):
+                B_shared[i, j] = intermediate[i, j] * T.float32(2)
+            T.copy(B_shared, B)
+
+    return main
+
+
 @pytest.mark.parametrize("factor", SUPPORTED_UNROLL_FACTORS)
 def test_tiles_unroll_reaches_sunmmio_scf_loop(factor, tmp_path, monkeypatch):
     monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT", "1")
@@ -125,6 +150,20 @@ def test_tiles_unroll_omission_preserves_unannotated_codegen(tmp_path, monkeypat
     )
 
     assert "llvm.loop_annotation" not in src
+
+
+def test_fused_tiles_unroll_uses_smallest_explicit_factor(tmp_path, monkeypatch):
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT", "1")
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        _fused_tiles_unroll_kernel(4, 2),
+        tmp_path,
+        mlir_filename="fused_tiles_unroll.mlir",
+        opt_args=SUVM_PIPELINE_OPT_ARGS,
+    )
+
+    assert src.count("#loop_unroll = #llvm.loop_unroll<count = 2 : i32>") == 1
+    assert "#llvm.loop_unroll<count = 4 : i32>" not in src
+    assert src.count("llvm.loop_annotation = #loop_annotation") == 1
 
 
 if __name__ == "__main__":
