@@ -118,7 +118,9 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
     const std::string &result_name, const std::string &buffer_handle,
     const std::vector<SunMMIOValue> &mins, const std::vector<int64_t> &extents,
     DataType ret_dtype, const SunMMIOType &ret_type, int64_t byte_offset,
-    bool preserve_region_rank, bool allow_rank3) {
+    bool preserve_region_rank, bool allow_rank3,
+    const std::optional<std::vector<int64_t>> &planned_tiled_dims,
+    const std::optional<std::vector<int64_t>> &planned_view_shape) {
   SunmmioMlirType type(ctx_);
 
   mlir::Value source = ctx_.LookupMLIRValue(buffer_handle);
@@ -159,35 +161,60 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
   mlir::SmallVector<int64_t, 4> shape;
   mlir::SmallVector<int64_t, 4> tiled_dims;
 
-  shape.reserve(extents.size());
-  bool preserve_exact_rank = preserve_region_rank && extents.size() <= 3;
-  bool collapse_single_matrix_view = preserve_exact_rank &&
-                                     extents.size() == 3 && extents[0] == 1 &&
-                                     memtensor_ty.getShape()[0] != 1;
-  for (int64_t i = 0; i < static_cast<int64_t>(extents.size()); ++i) {
-    bool preserve_dim =
-        preserve_exact_rank && !(collapse_single_matrix_view && i == 0);
-    if (preserve_dim || extents[i] != 1) {
-      int64_t view_extent = extents[i];
-      if (preserve_dim && extents[i] == memtensor_ty.getShape()[i]) {
-        // tc.mma must cover every tiled layout dimension completely.  Keep
-        // the logical memtensor shape for user-visible copies, but expose its
-        // already-allocated padded carrier to MMA (for example M=16 in a
-        // 32-row ZZ block).
-        view_extent = memtensor_ty.getLayout().getDimSize(i);
-        ICHECK_GE(view_extent, extents[i])
-            << "tl.mma_sunmmio layout extent cannot be smaller than its "
-               "logical buffer extent";
-      }
-      shape.push_back(view_extent);
-      tiled_dims.push_back(i);
+  if (planned_tiled_dims.has_value()) {
+    ICHECK(planned_view_shape.has_value());
+    ICHECK_EQ(planned_tiled_dims->size(), planned_view_shape->size());
+    ICHECK(!planned_tiled_dims->empty() && planned_tiled_dims->size() <= 2)
+        << "Planned tl.tileop.region expects one or two tiled dimensions";
+
+    std::vector<int64_t> seen_dims;
+    for (size_t i = 0; i < planned_tiled_dims->size(); ++i) {
+      int64_t dim = (*planned_tiled_dims)[i];
+      int64_t extent = (*planned_view_shape)[i];
+      ICHECK_GE(dim, 0);
+      ICHECK_LT(dim, static_cast<int64_t>(extents.size()));
+      ICHECK_GT(extent, 0);
+      ICHECK(std::find(seen_dims.begin(), seen_dims.end(), dim) ==
+             seen_dims.end())
+          << "Planned tl.tileop.region contains duplicate tiled dim " << dim;
+      seen_dims.push_back(dim);
+      ICHECK_EQ(extents[dim], extent)
+          << "Planned tl.tileop.region view extent " << extent
+          << " does not match region extent " << extents[dim] << " at dim "
+          << dim;
+      shape.push_back(extent);
+      tiled_dims.push_back(dim);
     }
-  }
-  if (shape.empty()) {
-    ICHECK(!extents.empty())
-        << "tl.tileop.region expects at least one region dimension";
-    shape.push_back(1);
-    tiled_dims.push_back(0);
+  } else {
+    ICHECK(!planned_view_shape.has_value());
+    shape.reserve(extents.size());
+    bool preserve_exact_rank = preserve_region_rank && extents.size() <= 3;
+    bool collapse_single_matrix_view = preserve_exact_rank &&
+                                       extents.size() == 3 && extents[0] == 1 &&
+                                       memtensor_ty.getShape()[0] != 1;
+    for (int64_t i = 0; i < static_cast<int64_t>(extents.size()); ++i) {
+      bool preserve_dim =
+          preserve_exact_rank && !(collapse_single_matrix_view && i == 0);
+      if (preserve_dim || extents[i] != 1) {
+        int64_t view_extent = extents[i];
+        if (preserve_dim && extents[i] == memtensor_ty.getShape()[i]) {
+          // MMA must cover each tiled layout dimension completely, including
+          // any padded carrier allocated for the logical buffer shape.
+          view_extent = memtensor_ty.getLayout().getDimSize(i);
+          ICHECK_GE(view_extent, extents[i])
+              << "tl.mma_sunmmio layout extent cannot be smaller than its "
+                 "logical buffer extent";
+        }
+        shape.push_back(view_extent);
+        tiled_dims.push_back(i);
+      }
+    }
+    if (shape.empty()) {
+      ICHECK(!extents.empty())
+          << "tl.tileop.region expects at least one region dimension";
+      shape.push_back(1);
+      tiled_dims.push_back(0);
+    }
   }
   ICHECK(shape.size() == 1 || shape.size() == 2 ||
          (allow_rank3 && shape.size() == 3))
