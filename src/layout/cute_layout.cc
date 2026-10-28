@@ -1572,12 +1572,15 @@ Optional<Layout> DeriveMXLayoutLike(const Layout &src,
   }
 
   Array<PrimExpr> src_shape = src_cute->GetLogicalShape();
-  int rank = static_cast<int>(src_shape.size());
-  if (rank < 2 || static_cast<int>(dst_shape.size()) != rank) {
+  int src_rank = static_cast<int>(src_shape.size());
+  int dst_rank = static_cast<int>(dst_shape.size());
+  if (src_rank < 2 || dst_rank < src_rank) {
     return Optional<Layout>();
   }
+  int rank_delta = dst_rank - src_rank;
 
-  if (IsSameLayout(src, MakeMXRowMajor(src_shape, dtype), analyzer)) {
+  if (rank_delta == 0 &&
+      IsSameLayout(src, MakeMXRowMajor(src_shape, dtype), analyzer)) {
     return Optional<Layout>(MakeMXRowMajor(dst_shape, dtype));
   }
 
@@ -1585,7 +1588,7 @@ Optional<Layout> DeriveMXLayoutLike(const Layout &src,
       [&](int expected_levels) -> std::optional<Array<Integer>> {
     Array<Integer> axes;
     Array<Integer> dim_levels = src_cute->GetDimLevels();
-    for (int d = 0; d < rank; ++d) {
+    for (int d = 0; d < src_rank; ++d) {
       int levels = dim_levels[d].IntValue();
       if (levels == 1) {
         continue;
@@ -1603,7 +1606,9 @@ Optional<Layout> DeriveMXLayoutLike(const Layout &src,
 
   if (auto axes = find_axes_with_levels(/*expected_levels=*/2)) {
     if (IsSameLayout(src, MakeMXZZ(src_shape, *axes, dtype), analyzer)) {
-      return Optional<Layout>(MakeMXZZ(dst_shape, *axes, dtype));
+      Array<Integer> dst_axes{Integer((*axes)[0].IntValue() + rank_delta),
+                              Integer((*axes)[1].IntValue() + rank_delta)};
+      return Optional<Layout>(MakeMXZZ(dst_shape, dst_axes, dtype));
     }
   }
 
@@ -1615,14 +1620,17 @@ Optional<Layout> DeriveMXLayoutLike(const Layout &src,
         StaticDivisibleOrSymbolic(src_shape[ax0], 32 * pack_size) &&
         StaticDivisibleOrSymbolic(src_shape[ax1], 32);
     bool can_build_dst =
-        StaticDivisibleOrSymbolic(dst_shape[ax0], 32 * pack_size) &&
-        StaticDivisibleOrSymbolic(dst_shape[ax1], 32);
+        StaticDivisibleOrSymbolic(dst_shape[ax0 + rank_delta],
+                                  32 * pack_size) &&
+        StaticDivisibleOrSymbolic(dst_shape[ax1 + rank_delta], 32);
     if (can_build_src && can_build_dst) {
+      Array<Integer> dst_axes{Integer(ax0 + rank_delta),
+                              Integer(ax1 + rank_delta)};
       if (IsSameLayout(src, MakeMXNNZ(src_shape, *axes, dtype), analyzer)) {
-        return Optional<Layout>(MakeMXNNZ(dst_shape, *axes, dtype));
+        return Optional<Layout>(MakeMXNNZ(dst_shape, dst_axes, dtype));
       }
       if (IsSameLayout(src, MakeMXZNZ(src_shape, *axes, dtype), analyzer)) {
-        return Optional<Layout>(MakeMXZNZ(dst_shape, *axes, dtype));
+        return Optional<Layout>(MakeMXZNZ(dst_shape, dst_axes, dtype));
       }
     }
   }

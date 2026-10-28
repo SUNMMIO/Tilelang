@@ -374,7 +374,7 @@ core 可以用线性 id，也可以用 `(row, col)` 坐标表示。一般来说�
 T.comm.broadcast(A_shared, B_shared, src_core=(0, 0), direction="horizontal")
 T.comm.put(A_shared, B_shared, src_core=(1, 2), dst_core=(2, 3))
 T.comm.all_gather(A_local, A_gathered, direction="horizontal", axis=-1)
-T.comm.all_reduce(A_shared, Out_shared, "sum", direction="all", dim=-1)
+T.comm.all_reduce(A_shared, Out_shared, "sum", direction="all")
 ```
 
 选择接口时可以按语义判断：
@@ -382,7 +382,7 @@ T.comm.all_reduce(A_shared, Out_shared, "sum", direction="all", dim=-1)
 - `broadcast`：一个源 core 向某个方向上的多个 core 发送相同数据。
 - `put`：一个源 core 向一个目标 core 发送数据。
 - `all_gather`：多个 core 各自贡献一段数据，并在接收 buffer 中拼接。
-- `all_reduce`：多个 core 的数据做 reduce，并得到 reduce 结果。
+- `all_reduce`：对多个 core 上相同位置的元素做 reduce。它保留完整的本地 shape，不会归约本地 tensor 的某个维度。
 
 `all_gather` 的 recv shape 需要与 direction 和 axis 匹配：
 
@@ -819,6 +819,15 @@ T.comm.put(src, dst, src_core, dst_core, size=-1)
 
 `put` 适合一对一数据交付。若同一份数据要发给一行、一列或整个 mesh，通常使用 `broadcast`。
 
+对于 Sunmmio 动态路由，`src_core` 必须是当前 `cid`；`dst_core(cid)` 必须能针对每个活动 core
+在编译期求值，并构成一个双射置换。每次传输必须是同一 row 或同一 column 内的单跳，且同一个
+调用产生的所有传输必须使用同一方向。编译器会将置换分解为若干 cycle，并为每个 cycle 使用一个
+participant barrier。
+
+动态 `put` 只有在显式 `if` 条件仅依赖 `cid` 和编译期常量、并且同一 cycle 的所有成员取值一致时
+才能被条件执行。当前会拒绝位于 `for` 或 `while` 循环中的动态 `put`。Sunmmio 不支持 `T.where`
+或其他非平凡 block predicate；请改用 cycle 内一致的显式 `if`。
+
 **`T.comm.all_gather`**
 
 ```python
@@ -851,20 +860,26 @@ T.comm.all_gather(
 **`T.comm.all_reduce`**
 
 ```python
-T.comm.all_reduce(buffer, out, reduce_type, direction, dim=-1, clear=True)
+T.comm.all_reduce(buffer, out, reduce_type, direction, clear=True)
 ```
 
-`all_reduce` 表达跨 core reduce。
+`all_reduce` 只表达跨 core reduce：对 `direction` 选中的各个 core 上相同位置的元素做归约，不会沿本地 buffer 的某个维度做归约。
 
 - `buffer`：参与 reduce 的输入 buffer 或 region。
 - `out`：保存 reduce 结果的输出 buffer 或 region。
 - `reduce_type`：reduce 类型，支持 `"sum"`、`"abssum"`、`"max"`、`"min"`、`"absmax"`、`"bitand"`、`"bitor"`、`"bitxor"`。
 - `direction`：参与 reduce 的方向，支持 `"horizontal"` / `"h"`、`"vertical"` / `"v"`、`"all"` / `"a"`。
-- `dim`：在本地 buffer 内 reduce 的维度，默认 `-1` 表示最后一维。
-- `clear`：是否在 reduce 前清空 `out`，默认 `True`。
+- `clear`：仅限关键字传入，用于控制是否以 reducer 的中性值初始化 `out`；为 `False` 时，跨 core 归约结果会与 `out` 的原值继续归约。默认值为 `True`。
 - 返回值：表达 all-reduce 的语句。
 
-`out` shape 需要等于删除 `dim` 后的 shape，或在 `dim` 上保留长度 1。
+输入和输出 region 必须具有相同的 rank 和各维 extent。若还需要归约本地 buffer 内的某个维度，应使用 `T.reduce`。
+
+当前 A4E lowering 支持 rank 1 到 3 的 payload，并要求每个 multicast tile 都具有满足 link 约束的连续数据段。对于静态 shape：
+
+- rank 1 要求 `extent * element_bytes` 是 1024 字节的正整数倍；
+- rank 2 或 rank 3 要求最内层 extent 能被 32 整除，并且 `gcd(倒数第二维 extent, 32) * 32 * element_bytes` 是 1024 字节的正整数倍。
+
+`"max"`、`"min"` 和 `"absmax"` 要求输入与输出为 BF16 或 FP32；`"bitand"`、`"bitor"` 和 `"bitxor"` 要求输入与输出均为 `int32` 或均为 `uint32`。
 
 ### 3.7 GEMM
 

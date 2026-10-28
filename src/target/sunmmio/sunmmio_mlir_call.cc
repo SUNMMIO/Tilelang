@@ -53,6 +53,26 @@ void VerifyA4EMulticastOp(OpType op, const char *callee) {
       << callee << " violates A4E multicast data-path constraints";
 }
 
+bool IsCurrentCoreId(mlir::Value value) {
+  if (value.getDefiningOp<mlir::suvm::GetCoreIdOp>()) {
+    return true;
+  }
+  // Kernel block IDs are i32 views of the A4E core ID, then widened for the
+  // multicast source comparison. The A4E mesh fits in i32.
+  auto is_widened_core = [](mlir::Value input) {
+    auto trunc = input.getDefiningOp<mlir::arith::TruncIOp>();
+    return trunc && input.getType().isInteger(32) &&
+           trunc.getIn().getDefiningOp<mlir::suvm::GetCoreIdOp>();
+  };
+  if (auto extend = value.getDefiningOp<mlir::arith::ExtUIOp>()) {
+    return is_widened_core(extend.getIn());
+  }
+  if (auto extend = value.getDefiningOp<mlir::arith::ExtSIOp>()) {
+    return is_widened_core(extend.getIn());
+  }
+  return false;
+}
+
 SunmmioMlirContext::SyncUnitMask MapSyncUnits(int64_t mask) {
   constexpr tl::SunmmioSyncUnits kKnownUnits =
       tl::kSunmmioSyncOdma0 | tl::kSunmmioSyncOdma1 | tl::kSunmmioSyncTc |
@@ -118,7 +138,9 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
     const std::string &result_name, const std::string &buffer_handle,
     const std::vector<SunMMIOValue> &mins, const std::vector<int64_t> &extents,
     DataType ret_dtype, const SunMMIOType &ret_type, int64_t byte_offset,
-    bool preserve_region_rank) {
+    bool preserve_region_rank, bool allow_rank3,
+    const std::optional<std::vector<int64_t>> &planned_tiled_dims,
+    const std::optional<std::vector<int64_t>> &planned_view_shape) {
   SunmmioMlirType type(ctx_);
 
   mlir::Value source = ctx_.LookupMLIRValue(buffer_handle);
@@ -159,40 +181,65 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
   mlir::SmallVector<int64_t, 4> shape;
   mlir::SmallVector<int64_t, 4> tiled_dims;
 
-  shape.reserve(extents.size());
-  bool preserve_exact_rank = preserve_region_rank && extents.size() <= 3;
-  bool collapse_single_matrix_view = preserve_exact_rank &&
-                                     extents.size() == 3 && extents[0] == 1 &&
-                                     memtensor_ty.getShape()[0] != 1;
-  for (int64_t i = 0; i < static_cast<int64_t>(extents.size()); ++i) {
-    bool preserve_dim =
-        preserve_exact_rank && !(collapse_single_matrix_view && i == 0);
-    if (preserve_dim || extents[i] != 1) {
-      int64_t view_extent = extents[i];
-      if (preserve_dim && extents[i] == memtensor_ty.getShape()[i]) {
-        // tc.mma must cover every tiled layout dimension completely.  Keep
-        // the logical memtensor shape for user-visible copies, but expose its
-        // already-allocated padded carrier to MMA (for example M=16 in a
-        // 32-row ZZ block).
-        view_extent = memtensor_ty.getLayout().getDimSize(i);
-        ICHECK_GE(view_extent, extents[i])
-            << "tl.mma_sunmmio layout extent cannot be smaller than its "
-               "logical buffer extent";
+  if (planned_tiled_dims.has_value()) {
+    ICHECK(planned_view_shape.has_value());
+    ICHECK_EQ(planned_tiled_dims->size(), planned_view_shape->size());
+    ICHECK(!planned_tiled_dims->empty() && planned_tiled_dims->size() <= 2)
+        << "Planned tl.tileop.region expects one or two tiled dimensions";
+
+    std::vector<int64_t> seen_dims;
+    for (size_t i = 0; i < planned_tiled_dims->size(); ++i) {
+      int64_t dim = (*planned_tiled_dims)[i];
+      int64_t extent = (*planned_view_shape)[i];
+      ICHECK_GE(dim, 0);
+      ICHECK_LT(dim, static_cast<int64_t>(extents.size()));
+      ICHECK_GT(extent, 0);
+      ICHECK(std::find(seen_dims.begin(), seen_dims.end(), dim) ==
+             seen_dims.end())
+          << "Planned tl.tileop.region contains duplicate tiled dim " << dim;
+      seen_dims.push_back(dim);
+      ICHECK_EQ(extents[dim], extent)
+          << "Planned tl.tileop.region view extent " << extent
+          << " does not match region extent " << extents[dim] << " at dim "
+          << dim;
+      shape.push_back(extent);
+      tiled_dims.push_back(dim);
+    }
+  } else {
+    ICHECK(!planned_view_shape.has_value());
+    shape.reserve(extents.size());
+    bool preserve_exact_rank = preserve_region_rank && extents.size() <= 3;
+    bool collapse_single_matrix_view = preserve_exact_rank &&
+                                       extents.size() == 3 && extents[0] == 1 &&
+                                       memtensor_ty.getShape()[0] != 1;
+    for (int64_t i = 0; i < static_cast<int64_t>(extents.size()); ++i) {
+      bool preserve_dim =
+          preserve_exact_rank && !(collapse_single_matrix_view && i == 0);
+      if (preserve_dim || extents[i] != 1) {
+        int64_t view_extent = extents[i];
+        if (preserve_dim && extents[i] == memtensor_ty.getShape()[i]) {
+          // MMA must cover each tiled layout dimension completely, including
+          // any padded carrier allocated for the logical buffer shape.
+          view_extent = memtensor_ty.getLayout().getDimSize(i);
+          ICHECK_GE(view_extent, extents[i])
+              << "tl.mma_sunmmio layout extent cannot be smaller than its "
+                 "logical buffer extent";
+        }
+        shape.push_back(view_extent);
+        tiled_dims.push_back(i);
       }
-      shape.push_back(view_extent);
-      tiled_dims.push_back(i);
+    }
+    if (shape.empty()) {
+      ICHECK(!extents.empty())
+          << "tl.tileop.region expects at least one region dimension";
+      shape.push_back(1);
+      tiled_dims.push_back(0);
     }
   }
-  if (shape.empty()) {
-    ICHECK(!extents.empty())
-        << "tl.tileop.region expects at least one region dimension";
-    shape.push_back(1);
-    tiled_dims.push_back(0);
-  }
-  ICHECK_GE(shape.size(), 1U)
-      << "tl.tileop.region expects at least one tiled dimension";
-  ICHECK_LE(shape.size(), 3U)
-      << "tl.tileop.region expects at most three tiled dimensions, but got "
+  ICHECK(shape.size() == 1 || shape.size() == 2 ||
+         (allow_rank3 && shape.size() == 3))
+      << "tl.tileop.region expects one or two tiled dimensions, or three for "
+         "operations that support rank-3 views, but got "
       << shape.size();
 
   mlir::Type elem_ty = memtensor_ty.getElementType();
@@ -646,6 +693,12 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         src_core = type.ResolveValue(operands[3], ctx_.builder.getI64Type());
       }
       src_core = ensure_i64(src_core, "tl.broadcast_ src_core");
+
+      if (IsCurrentCoreId(src_core)) {
+        create_mcast();
+        emit_link_sync();
+        return SunMMIOValue{ret_dtype, result_name, ret_type};
+      }
 
       mlir::Value core_id = mlir::suvm::GetCoreIdOp::create(
                                 ctx_.builder, type.MakeDebugLoc("get_core_id"))

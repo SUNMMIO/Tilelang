@@ -4,6 +4,7 @@ import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
+from tilelang import tvm
 from tilelang.layout import (
     make_mx_row_major_layout,
     make_mxznz_layout,
@@ -15,6 +16,7 @@ from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import (
     assert_source_contains,
     validate_sunmmio_codegen_with_npuir_opt,
+    validate_suvm_mlir_with_npuir_opt,
 )
 
 
@@ -25,6 +27,16 @@ os.environ.setdefault("SUNMMIO_TEST_LOG_IR", "0")
 MX_DTYPE_CASES = (
     pytest.param(T.mxfp8, "!suvm.mxfp8", 256, 64, id="mxfp8"),
     pytest.param(T.mxfp4, "!suvm.mxfp4", 128, 32, id="mxfp4"),
+)
+
+TC_INPUT_TYPE_PAIRS = (
+    pytest.param(T.bfloat16, T.bfloat16, 128, 32, id="bf16-bf16"),
+    pytest.param(T.bfloat16, T.mxfp8, 256, 64, id="bf16-mxfp8"),
+    pytest.param(T.bfloat16, T.mxfp4, 128, 32, id="bf16-mxfp4"),
+    pytest.param(T.mxfp8, T.mxfp8, 256, 64, id="mxfp8-mxfp8"),
+    pytest.param(T.mxfp8, T.mxfp4, 128, 32, id="mxfp8-mxfp4"),
+    pytest.param(T.mxfp4, T.mxfp8, 256, 64, id="mxfp4-mxfp8"),
+    pytest.param(T.mxfp4, T.mxfp4, 128, 32, id="mxfp4-mxfp4"),
 )
 
 
@@ -49,6 +61,7 @@ def matmul_mx_operand_kernel(
     a_layout_kind="default",
     b_layout_kind="default",
     accum_dtype=T.bfloat16,
+    num_stages=0,
 ):
     shard_policy = T.placement.full_shard(0, 1)
     if _is_mx_dtype(a_dtype):
@@ -86,7 +99,7 @@ def matmul_mx_operand_kernel(
             for bx in T.serial(T.ceildiv(sharded_M, block_M)):
                 for by in T.serial(T.ceildiv(sharded_N, block_N)):
                     T.clear(C_shared)
-                    for k in T.serial(T.ceildiv(sharded_K, block_K)):
+                    for k in T.Pipelined(T.ceildiv(sharded_K, block_K), num_stages=num_stages):
                         T.comm.all_gather(
                             A[
                                 bx * block_M : (bx + 1) * block_M,
@@ -194,6 +207,61 @@ def test_mx_gemm_both_a_b_codegen_validates(tmp_path, mx_dtype, mx_token, n, blo
 
     assert "sunmmio.fake" not in src
     assert_source_contains(src, (mx_token, "suvm.mcast_async", "suvm.tc.mma", "suvm.sync"))
+
+
+@pytest.mark.parametrize("pipeline_mode", ("greedy", "ilp"))
+@pytest.mark.parametrize("a_dtype,b_dtype,n,block_n", TC_INPUT_TYPE_PAIRS)
+def test_a4e_tensorcore_type_pairs_pipeline_codegen_validates(tmp_path, pipeline_mode, a_dtype, b_dtype, n, block_n):
+    with tilelang.transform.PassContext(config={tilelang.PassConfigKey.TL_SUNMMIO_PIPELINE_MODE: pipeline_mode}):
+        artifact = tilelang.lower(
+            matmul_mx_operand_kernel(
+                K=2048,
+                N=n,
+                block_N=block_n,
+                block_K=128,
+                a_dtype=a_dtype,
+                b_dtype=b_dtype,
+                a_layout_kind="mxzz" if _is_mx_dtype(a_dtype) else "default",
+                b_layout_kind="mxznz" if _is_mx_dtype(b_dtype) else "default",
+                num_stages=2,
+            ),
+            target="sunmmio",
+            enable_host_codegen=False,
+            enable_device_compile=False,
+        )
+    src = artifact.kernel_source
+    validate_suvm_mlir_with_npuir_opt(
+        src,
+        tmp_path,
+        mlir_filename=(f"pipeline_{pipeline_mode}_{_dtype_filename(a_dtype)}_{_dtype_filename(b_dtype)}.mlir"),
+        opt_args=("--verify-each",),
+    )
+
+    assert "sunmmio.fake" not in src
+    assert "suvm.tc.mma" in src
+    assert "suvm.ping_pong" in src
+
+
+def test_a4e_pipeline_cost_model_rejects_mx_activation_with_bf16_weight():
+    with (
+        tilelang.transform.PassContext(config={tilelang.PassConfigKey.TL_SUNMMIO_PIPELINE_MODE: "ilp"}),
+        pytest.raises(tvm.TVMError, match="Unsupported TensorCore input dtypes"),
+    ):
+        tilelang.lower(
+            matmul_mx_operand_kernel(
+                K=2048,
+                N=128,
+                block_N=32,
+                block_K=128,
+                a_dtype=T.mxfp4,
+                b_dtype=T.bfloat16,
+                a_layout_kind="mxzz",
+                num_stages=2,
+            ),
+            target="sunmmio",
+            enable_host_codegen=False,
+            enable_device_compile=False,
+        )
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
 # os.environ["SUNMMIO_TEST_LOG_IR"] = "1"
 
 LOOSE_OPT_ARGS = ("--verify-each",)
+STRICT_OPT_ARGS = ("--verify-each", "--suvm-to-llvm-pipeline")
 
 
 @target("Sunmmio")
@@ -49,6 +50,61 @@ def comm_put_kernel(M=128, N=128, block_M=32, block_N=32, dtype="bfloat16"):
             for bx in T.serial(T.ceildiv(N, block_N)):
                 T.copy(A[0, bx * block_N], A_shared)
                 T.comm.put(A_shared, B_shared, (1, 2), (2, 3))
+
+    return main
+
+
+@target("Sunmmio")
+def comm_dynamic_pair_put_kernel():
+    @T.prim_func
+    def main(
+        A: T.Tensor((16, 32, 32), "bfloat16"),
+        B: T.Tensor((16, 32, 32), "bfloat16"),
+    ):
+        with T.Kernel() as cid:
+            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            T.copy(A[cid, 0, 0], src)
+            T.comm.put(src, dst, cid, (cid // 2) * 2 + 1 - cid % 2)
+            T.copy(dst, B[cid, 0, 0])
+
+    return main
+
+
+@target("Sunmmio")
+def comm_dynamic_column_pair_put_kernel():
+    @T.prim_func
+    def main(
+        A: T.Tensor((16, 32, 32), "bfloat16"),
+        B: T.Tensor((16, 32, 32), "bfloat16"),
+    ):
+        with T.Kernel() as cid:
+            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            T.copy(A[cid, 0, 0], src)
+            row = cid // 4
+            peer = (row // 2 * 2 + 1 - row % 2) * 4 + cid % 4
+            T.comm.put(src, dst, cid, peer)
+            T.copy(dst, B[cid, 0, 0])
+
+    return main
+
+
+@target("Sunmmio")
+def comm_dynamic_row_ring_put_kernel():
+    @T.prim_func
+    def main(
+        A: T.Tensor((16, 32, 32), "bfloat16"),
+        B: T.Tensor((16, 32, 32), "bfloat16"),
+    ):
+        with T.Kernel() as cid:
+            src = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            dst = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            T.copy(A[cid, 0, 0], src)
+            row = cid // 4
+            next_cid = row * 4 + (cid % 4 + 1) % 4
+            T.comm.put(src, dst, cid, next_cid)
+            T.copy(dst, B[cid, 0, 0])
 
     return main
 
@@ -87,25 +143,47 @@ def comm_all_gather_kernel(
 
 
 @target("Sunmmio")
-def comm_all_reduce_horizontal_kernel(M=32, N=128, dtype="float32"):
+def comm_all_reduce_horizontal_kernel(
+    K=2,
+    M=32,
+    N=32,
+    dtype="float32",
+    reduce_type="sum",
+    clear=True,
+):
     @T.prim_func
     def main(
-        A: T.Tensor((M, N), dtype),
-        B: T.Tensor((M, N), dtype),
+        A: T.Tensor((K, M, N), dtype),
+        B: T.Tensor((K, M, N), dtype),
     ):
         with T.Kernel():
-            reduce_src = T.alloc_shared((1, M, N), dtype, scope="shared.rsram")
-            reduced = T.alloc_shared((M, N), dtype, scope="shared.rsram")
-            T.copy(A, reduce_src[0, 0:M, 0:N])
+            reduce_src = T.alloc_shared((K, M, N), dtype, scope="shared.rsram")
+            reduced = T.alloc_shared((K, M, N), dtype, scope="shared.rsram")
+            for k in T.serial(K):
+                T.copy(A[k, :, :], reduce_src[k, :, :])
+            if not clear:
+                T.fill(reduced, 1)
             T.comm.all_reduce(
                 reduce_src,
                 reduced,
-                "sum",
+                reduce_type,
                 "horizontal",
-                dim=0,
-                clear=True,
+                clear=clear,
             )
-            T.copy(reduced, B)
+            for k in T.serial(K):
+                T.copy(reduced[k, :, :], B[k, :, :])
+
+    return main
+
+
+@target("Sunmmio")
+def comm_all_reduce_payload_kernel(shape, dtype="float32"):
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            reduce_src = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            reduced = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            T.comm.all_reduce(reduce_src, reduced, "sum", "horizontal")
 
     return main
 
@@ -256,6 +334,45 @@ def test_comm_put_kernel_codegen_validates_with_npuir_opt(tmp_path):
     assert src.count("suvm.mcast_async") >= 2
 
 
+def test_comm_dynamic_pair_put_codegen_has_no_sender_guard(tmp_path):
+    src = _validate_kernel(
+        comm_dynamic_pair_put_kernel(),
+        tmp_path,
+        mlir_filename="comm_dynamic_pair_put_suvm.mlir",
+        expected_tokens=("suvm.mcast_async", "suvm.sync", "suvm.barrier.arrive_and_wait"),
+    )
+    assert src.count("suvm.mcast_async") == 1
+    assert src.count("suvm.get_core_id") == 1
+
+
+def test_comm_dynamic_column_pair_put_codegen_has_no_sender_guard(tmp_path):
+    src = _validate_kernel(
+        comm_dynamic_column_pair_put_kernel(),
+        tmp_path,
+        mlir_filename="comm_dynamic_column_pair_put_suvm.mlir",
+        expected_tokens=("suvm.mcast_async", "suvm.sync", "suvm.barrier.arrive_and_wait"),
+    )
+    mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
+    assert len(mcast_lines) == 1
+    assert "col" in mcast_lines[0]
+    assert src.count("suvm.get_core_id") == 1
+
+
+def test_comm_dynamic_row_ring_put_codegen_uses_cycle_barriers(tmp_path):
+    src = _validate_kernel(
+        comm_dynamic_row_ring_put_kernel(),
+        tmp_path,
+        mlir_filename="comm_dynamic_row_ring_put_suvm.mlir",
+        expected_tokens=("suvm.mcast_async", "suvm.sync", "suvm.barrier.arrive_and_wait"),
+    )
+    mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
+    assert len(mcast_lines) == 1
+    assert "row" in mcast_lines[0]
+    assert src.count("suvm.get_core_id") == 1
+    for mask in (15, 240, 3840, 61440):
+        assert f"suvm.barrier.init mask = {mask}" in src
+
+
 @pytest.mark.parametrize(
     "case_name,direction,axis,min_mcast_count",
     [
@@ -292,9 +409,74 @@ def test_comm_all_reduce_horizontal_codegen_validates_with_npuir_opt(tmp_path):
         tmp_path,
         mlir_filename="comm_all_reduce_horizontal_kernel_suvm.mlir",
         expected_tokens=("suvm.copy_async", "suvm.mcast_async"),
+        opt_args=STRICT_OPT_ARGS,
     )
 
-    assert src.count("suvm.mcast_async") >= 1
+    # The local payload must stay one direct rank-3 multicast leaf.
+    mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
+    assert len(mcast_lines) == 1
+    assert mcast_lines[0].count("!suvm.tile_view<2x32x32xf32>") == 2
+
+
+@pytest.mark.parametrize(
+    "shape,dtype",
+    [
+        ((256,), "float32"),
+        ((512,), "bfloat16"),
+        ((8, 32), "float32"),
+        ((16, 32), "bfloat16"),
+        ((1, 8, 32), "float32"),
+        ((1, 16, 32), "bfloat16"),
+    ],
+)
+def test_comm_all_reduce_payload_boundary_codegen_validates_with_npuir_opt(
+    shape,
+    dtype,
+    tmp_path,
+):
+    src = _validate_kernel(
+        comm_all_reduce_payload_kernel(shape, dtype),
+        tmp_path,
+        mlir_filename=f"comm_all_reduce_{dtype}_{'x'.join(map(str, shape))}_suvm.mlir",
+        expected_tokens=("suvm.mcast_async",),
+        opt_args=STRICT_OPT_ARGS,
+    )
+    assert len(find_async_op_lines(src, "suvm.mcast_async")) == 1
+
+
+@pytest.mark.parametrize(
+    ("reduce_type", "tile_op"),
+    [
+        ("bitand", "suvm.tile.andi"),
+        ("bitor", "suvm.tile.ori"),
+        ("bitxor", "suvm.tile.xori"),
+    ],
+)
+@pytest.mark.parametrize("dtype", ["int32", "uint32"])
+@pytest.mark.parametrize("clear", [True, False], ids=["clear", "accumulate"])
+def test_comm_all_reduce_rank3_bitwise_uses_hardware_tile(
+    clear,
+    dtype,
+    reduce_type,
+    tile_op,
+    tmp_path,
+):
+    src = _validate_kernel(
+        comm_all_reduce_horizontal_kernel(
+            dtype=dtype,
+            reduce_type=reduce_type,
+            clear=clear,
+        ),
+        tmp_path,
+        mlir_filename=f"comm_all_reduce_rank3_{dtype}_{reduce_type}_clear_{clear}_suvm.mlir",
+        expected_tokens=("suvm.mcast_async", tile_op),
+        opt_args=STRICT_OPT_ARGS,
+    )
+
+    mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
+    assert len(mcast_lines) == 1
+    assert mcast_lines[0].count("!suvm.tile_view<2x32x32x") == 2
+    assert tile_op in src
 
 
 def test_sync_simple_copy_kernel_codegen_validates_with_npuir_opt(tmp_path):

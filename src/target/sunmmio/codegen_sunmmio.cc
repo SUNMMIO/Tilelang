@@ -2497,10 +2497,35 @@ const char *CodeGenTileLangSunMMIO::CallBucketName(CallBucket bucket) const {
 
 SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
     const tvm::PrimExpr &region_expr, int64_t byte_offset,
-    bool use_layout_covered_shape, bool preserve_region_rank) {
+    bool use_layout_covered_shape, bool preserve_region_rank,
+    bool allow_rank3) {
   BufferRegion region = NormalizeRegionTracked(region_expr);
   const BufferBinding &binding = LookupBuffer(region->buffer);
   std::vector<int64_t> effective_extents;
+  auto read_int_array =
+      [&](const char *key) -> std::optional<std::vector<int64_t>> {
+    const auto *call = region_expr.as<CallNode>();
+    if (!call) {
+      return std::nullopt;
+    }
+
+    auto value = call->annotations.Get(key);
+    if (!value.has_value()) {
+      return std::nullopt;
+    }
+
+    Array<Integer> array = Downcast<Array<Integer>>(value.value());
+    std::vector<int64_t> result;
+    for (const Integer &item : array) {
+      result.push_back(item.IntValue());
+    }
+    return result;
+  };
+
+  auto planned_dims = read_int_array(tl::attr::kSunmmioRegionTiledDims);
+  auto planned_shape = read_int_array(tl::attr::kSunmmioRegionViewShape);
+
+  ICHECK_EQ(planned_dims.has_value(), planned_shape.has_value());
   if (use_layout_covered_shape) {
     std::vector<int64_t> logical_shape =
         ExtractStaticShape(binding.buffer_type);
@@ -2549,7 +2574,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
   std::string result_name = region_expr.dtype().is_void() ? "" : NewValueName();
   return builder_->RegionCall(result_name, binding.handle, mins, extents,
                               region_expr.dtype(), ret_ty, byte_offset,
-                              preserve_region_rank);
+                              preserve_region_rank, allow_rank3, planned_dims,
+                              planned_shape);
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
@@ -2795,10 +2821,23 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
         << "tl.broadcast_ src_offset_byte must be non-negative";
     MarkVisitedNodeType(src_offset_imm->GetTypeKey());
 
+    bool allow_rank3 = false;
+    if (auto value = op->annotations.Get(tl::kAttrAllowRank3Multicast)) {
+      const auto *allow_rank3_imm = value->as<IntImmNode>();
+      ICHECK(allow_rank3_imm)
+          << tl::kAttrAllowRank3Multicast << " must be an IntImm";
+      allow_rank3 = allow_rank3_imm->value != 0;
+    }
+
     operands.reserve(4);
     operands.push_back(
-        EmitRegionCall(op->args[tl::kBroadcastArgSrc], src_offset_byte));
-    operands.push_back(EmitRegionCall(op->args[tl::kBroadcastArgDst]));
+        EmitRegionCall(op->args[tl::kBroadcastArgSrc], src_offset_byte,
+                       /*use_layout_covered_shape=*/false,
+                       /*preserve_region_rank=*/false, allow_rank3));
+    operands.push_back(
+        EmitRegionCall(op->args[tl::kBroadcastArgDst], /*byte_offset=*/0,
+                       /*use_layout_covered_shape=*/false,
+                       /*preserve_region_rank=*/false, allow_rank3));
     operands.push_back(EvalExpr(op->args[tl::kBroadcastArgMask]));
     if (fixed_and_source_args ==
         static_cast<size_t>(tl::kBroadcastArgCount + 1)) {

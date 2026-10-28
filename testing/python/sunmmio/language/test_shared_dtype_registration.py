@@ -1,3 +1,5 @@
+"""Shared dtype-registry tests retained for SunMMIO MXFP4/MXFP8 support."""
+
 import pytest
 
 from tilelang.language import dtypes
