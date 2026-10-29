@@ -5,6 +5,7 @@ import tilelang.language as T
 import tilelang.testing
 from tilelang import tvm
 from tilelang.layout import make_zz_layout
+from tilelang.layout import make_aligned_row_major
 
 from testing.python.sunmmio.common.codegen_validation import (
     validate_sunmmio_codegen_with_npuir_opt,
@@ -123,6 +124,26 @@ def _fused_tiles_unroll_kernel(first_unroll, second_unroll):
     return main
 
 
+@target("Sunmmio")
+def _scalar_fallback_unroll_kernel():
+    shape = (16, 16)
+    layout = make_aligned_row_major(shape, T.float32, align_bytes=64)
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            src = T.alloc_shared(shape, T.float32)
+            dst = T.alloc_shared(shape, T.float32)
+            T.annotate_layout({src: layout, dst: layout})
+
+            T.fill(src, 1)
+            T.fill(dst, 0)
+            for i, j in T.Tiles((4, 4), parallel=True, unroll=4):
+                dst[i, j] = src[i, 2 * j]
+
+    return main
+
+
 @pytest.mark.parametrize("factor", SUPPORTED_UNROLL_FACTORS)
 def test_tiles_unroll_reaches_sunmmio_scf_loop(factor, tmp_path, monkeypatch):
     monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT", "1")
@@ -146,6 +167,19 @@ def test_tiles_unroll_omission_preserves_unannotated_codegen(tmp_path, monkeypat
         tmp_path,
         mlir_filename="tiles_unroll_omitted.mlir",
         expected_tokens=("suvm.tile.cmpi",),
+        opt_args=SUVM_PIPELINE_OPT_ARGS,
+    )
+
+    assert "llvm.loop_annotation" not in src
+
+
+def test_tiles_unroll_is_dropped_on_scalar_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("TL_SUNMMIO_CODEGEN_COVERAGE_STRICT", "1")
+    src = validate_sunmmio_codegen_with_npuir_opt(
+        _scalar_fallback_unroll_kernel(),
+        tmp_path,
+        mlir_filename="tiles_unroll_scalar_fallback.mlir",
+        expected_tokens=("suvm.tile.pick", "suvm.tile.set"),
         opt_args=SUVM_PIPELINE_OPT_ARGS,
     )
 
