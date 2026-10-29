@@ -44,6 +44,7 @@
 #include "planner.h"
 #include "utils.h"
 
+#include "../common/attr.h"
 #include "../common/substitute_with_buffer_predicates.h"
 
 #include <tvm/ffi/reflection/registry.h>
@@ -172,6 +173,45 @@ CollectLeafRegionIndices(const SunmmioTileLoopFusionPlannerTreeNode &node) {
     indices.insert(indices.end(), child_indices.begin(), child_indices.end());
   }
   return indices;
+}
+
+ffi::Map<ffi::String, ffi::Any>
+MergeSharedLoopAnnotations(const SunmmioTileLoopFusionPlannerTreeNode &node,
+                           int loop_depth,
+                           const TileScopeRegion &representative,
+                           const std::vector<TileScopeRegion> &regions) {
+  ICHECK_LT(loop_depth,
+            static_cast<int>(representative.execution_loops.size()));
+  ffi::Map<ffi::String, ffi::Any> annotations =
+      representative.execution_loops[loop_depth]->annotations;
+
+  bool has_unroll = false;
+  int64_t merged_unroll = 0;
+  for (int region_index : CollectLeafRegionIndices(node)) {
+    ICHECK_GE(region_index, 0);
+    ICHECK_LT(region_index, static_cast<int>(regions.size()));
+    const TileScopeRegion &region = regions[region_index];
+    ICHECK_LT(loop_depth, static_cast<int>(region.execution_loops.size()));
+    const auto &loop_annotations =
+        region.execution_loops[loop_depth]->annotations;
+    auto unroll_it = loop_annotations.find(attr::kTileLoopUnroll);
+    if (unroll_it == loop_annotations.end()) {
+      continue;
+    }
+    const auto *factor = (*unroll_it).second.as<IntImmNode>();
+    ICHECK(factor) << "`" << attr::kTileLoopUnroll
+                   << "` must be an integer annotation";
+    merged_unroll =
+        has_unroll ? std::min(merged_unroll, factor->value) : factor->value;
+    has_unroll = true;
+  }
+
+  if (has_unroll) {
+    annotations.Set(attr::kTileLoopUnroll, Integer(merged_unroll));
+  } else {
+    annotations.erase(attr::kTileLoopUnroll);
+  }
+  return annotations;
 }
 
 std::vector<AttrStmt> CollectCommonHoistableAttrPrefix(
@@ -305,10 +345,12 @@ Stmt BuildScopeNode(const SunmmioTileLoopFusionPlannerTreeNode &node,
         next_shared_loop_vars.begin(), next_shared_loop_vars.begin() + depth);
     Map<Var, PrimExpr> outer_subst =
         BuildSharedLoopVarSubst(representative, outer_shared_loop_vars);
+    ffi::Map<ffi::String, ffi::Any> annotations =
+        MergeSharedLoopAnnotations(node, depth, representative, regions);
     body = For(next_shared_loop_vars[depth],
                SubstituteWithBufferPredicates(loop->min, outer_subst),
                SubstituteWithBufferPredicates(loop->extent, outer_subst),
-               loop->kind, body, loop->thread_binding, loop->annotations);
+               loop->kind, body, loop->thread_binding, annotations);
   }
   return ReapplyAttrPrefix(common_attrs, body);
 }

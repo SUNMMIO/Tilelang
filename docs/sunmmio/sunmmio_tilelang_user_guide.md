@@ -769,7 +769,7 @@ ODMA transpose is asynchronous. The compiler inserts synchronization before a de
 **`T.Tiles`**
 
 ```python
-for i, j in T.Tiles(domain, parallel=False):
+for i, j in T.Tiles(domain, parallel=False, unroll=None):
     ...
 ```
 
@@ -777,9 +777,11 @@ for i, j in T.Tiles(domain, parallel=False):
 
 - `domain`: logical loop domain. The recommended form is an explicit shape, such as `[block_M, block_N]`. A buffer can also be passed, meaning `buffer.shape` is used.
 - `parallel`: whether to declare that there is no cross-iteration dependency between different tile iterations. The default is `False`.
+- `unroll`: optional best-effort loop-unroll tuning hint. Supported values are `1`, `2`, `4`, `8`, and `16`; the default `None` emits no hint. It is forwarded only when `T.Tiles` is legalized to a native tile loop. If TileView planning falls back to scalar loops, the compiler drops the hint and emits a diagnostic. When tile-loop fusion combines multiple scopes, unset hints are ignored and the smallest explicit factor is retained.
 - Return value: tile loop iteration variables. The number of variables is determined by the rank of `domain`.
 
 When the loop body contains accumulation, reduction, or cross-iteration dependencies, do not set `parallel` to `True`.
+`unroll` does not request fast math and does not guarantee that the final backend will unroll the loop. Downstream optimization may preserve, change, or ignore the hint, so the optimized LLVM IR and final ELF can remain unchanged. Treat it as a kernel tuning parameter and validate correctness, code size, register/stack use, and cycles for the selected workload.
 
 ### 3.6 Inter-Core Communication
 
