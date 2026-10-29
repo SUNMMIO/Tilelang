@@ -32,21 +32,36 @@ enum class DeviceType : int {
 class HardwareMapper {
 public:
   static bool HasNestedHardwareCommands(const Stmt &stmt) {
-    if (!stmt.as<ForNode>()) {
-      return false;
-    }
-    // A nested hardware loop cannot be scheduled as one VectorCore command.
-    bool found = false;
-    PostOrderVisit(stmt, [&](const ObjectRef &node) {
-      if (const auto *eval = node.as<EvaluateNode>()) {
-        const auto *call = eval->value.as<CallNode>();
+    class NestedHardwareCommandFinder : public StmtVisitor {
+    public:
+      bool found{false};
+
+    private:
+      int loop_depth_{0};
+
+      void VisitStmt_(const ForNode *op) final {
+        ++loop_depth_;
+        StmtVisitor::VisitStmt_(op);
+        --loop_depth_;
+      }
+
+      void VisitStmt_(const EvaluateNode *op) final {
+        if (loop_depth_ == 0)
+          return;
+        const auto *call = op->value.as<CallNode>();
         if (!call ||
             !call->op.same_as(Op::Get("tl.vector_core_in_tile_reduce"))) {
           found = true;
         }
       }
-    });
-    return found;
+    };
+
+    // A loop containing a hardware intrinsic cannot be scheduled as one
+    // VectorCore command. Walk through Block/BlockRealize wrappers because
+    // lowering may preserve a named T.block around that loop.
+    NestedHardwareCommandFinder finder;
+    finder(stmt);
+    return finder.found;
   }
 
   static DeviceType Map(const Stmt &stmt) {

@@ -28,6 +28,25 @@ def _nested_copy_kernel():
     return main
 
 
+def _block_wrapped_nested_copy_kernel():
+    placement = T.placement.full_shard(0, 1)
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((128, 1024), placement, T.float32, layout=make_zz_layout((128, 1024))),
+        C: T.MeshTensor((128, 512), placement, T.float32, layout=make_zz_layout((128, 512))),
+    ):
+        with T.Kernel(T.mesh_ncores()):
+            tile = T.alloc_shared((32, 32), T.float32, scope="shared.rsram")
+            for ni in T.Pipelined(4, num_stages=2):
+                with T.block("nested_dma"):
+                    for ki in T.serial(2):
+                        T.copy(A[0:32, (ni * 2 + ki) * 32 : (ni * 2 + ki + 1) * 32], tile)
+                T.copy(tile, C[0:32, ni * 32 : (ni + 1) * 32])
+
+    return main
+
+
 def _vector_loop_kernel():
     placement = T.placement.full_shard(0, 1)
 
@@ -87,6 +106,17 @@ def _planner(mode):
 @pytest.mark.parametrize("mode", ["greedy", "ilp"])
 def test_nested_dma_loop_falls_back_without_vector_costing(mode):
     planned = _planner(mode)(_lower_before_planning(_nested_copy_kernel()))
+    script = planned.script()
+
+    assert '"tl.sunmmio.pipeline.applied": T.bool(False)' in script
+    assert '"tl.sunmmio.pipeline.fallback_reason": "unsupported_nested_hardware_loop"' in script
+    assert "T.dma_copy" in script
+    assert "for ki in range(2)" in script
+
+
+@pytest.mark.parametrize("mode", ["greedy", "ilp"])
+def test_block_wrapped_nested_dma_loop_falls_back_without_vector_costing(mode):
+    planned = _planner(mode)(_lower_before_planning(_block_wrapped_nested_copy_kernel()))
     script = planned.script()
 
     assert '"tl.sunmmio.pipeline.applied": T.bool(False)' in script
