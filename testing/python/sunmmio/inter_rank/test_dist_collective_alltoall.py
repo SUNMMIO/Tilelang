@@ -363,7 +363,6 @@ def alltoall_signals_kernel_factory(
                     T.dist.wait_all(ready)
                 else:
                     T.dist.wait_all(done)
-                T.dist.wait()
 
     return main
 
@@ -494,7 +493,6 @@ def repeated_alltoall_signals_kernel_factory(wait_mode="all", world_size: int = 
                 T.dist.wait_all(ready)
             else:
                 T.dist.wait_all(second)
-            T.dist.wait()
 
     return main
 
@@ -533,7 +531,6 @@ def alltoall_signals_offset_kernel_factory(world_size: int = 1):
                     submit=True,
                 )
                 T.dist.wait_all(done)
-                T.dist.wait()
 
     return main
 
@@ -581,7 +578,6 @@ def nested_offset_alltoall_kernel_factory(error=None, world_size: int = 1):
                             submit=True,
                         )
                         T.dist.wait_all(done)
-                        T.dist.wait()
                     if error == "early_exit":
                         break
 
@@ -636,7 +632,6 @@ def row_offset_alltoall_kernel_factory(world_size: int = 1):
                     submit=True,
                 )
                 T.dist.wait_all(done)
-                T.dist.wait()
 
     return main
 

@@ -469,7 +469,6 @@ private:
       explicit IterationWaits(Var completion)
           : completion_(std::move(completion)) {}
       bool received{false};
-      bool sent{false};
 
     private:
       void VisitStmt_(const EvaluateNode *op) final {
@@ -479,7 +478,6 @@ private:
         if (call->op.same_as(dist_wait_completion_all()) &&
             call->args[0].same_as(completion_))
           received = true;
-        sent |= call->op.same_as(dist_wait_send());
       }
       void VisitStmt_(const IfThenElseNode *) final {}
       void VisitStmt_(const ForNode *) final {}
@@ -513,9 +511,10 @@ private:
       Var completion_;
     } waits(op->var);
     waits(op->body);
-    ICHECK(waits.received && waits.sent)
+    // LowerDistSync inserts sender waits after collective expansion.
+    ICHECK(waits.received)
         << "Collective loop region offsets require the completion to be "
-           "fully drained and T.dist.wait() in the same iteration";
+           "fully drained in the same iteration";
   }
 
   void ValidateSignal(const PrimExpr &signal, const char *op_name) const {

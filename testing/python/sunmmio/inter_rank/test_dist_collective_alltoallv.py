@@ -61,7 +61,6 @@ def loop_offset_alltoallv_kernel_factory(
                 else:
                     while T.dist.has_pending(done):
                         T.dist.wait_any(done)
-                T.dist.wait()
 
     return main
 

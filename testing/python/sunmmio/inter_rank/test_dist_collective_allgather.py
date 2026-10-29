@@ -494,7 +494,7 @@ def loop_offset_allgather_kernel_factory(axis=None, error=None, wait_mode="all",
                     done = T.dist.all_gather(
                         source[begin : begin + block, :], destination[dst_begin : dst_begin + block, :], axis=-1, signals=ready, submit=True
                     )
-                if wait_mode in ("all", "no_send_wait"):
+                if wait_mode == "all":
                     T.dist.wait_all(done)
                 elif wait_mode == "any":
                     while T.dist.has_pending(done):
@@ -502,8 +502,6 @@ def loop_offset_allgather_kernel_factory(axis=None, error=None, wait_mode="all",
                 elif wait_mode == "conditional":  # noqa: SIM102 - retain a runtime TIR branch
                     if runtime > 0:
                         T.dist.wait_all(done)
-                if wait_mode != "no_send_wait":
-                    T.dist.wait()
 
     return main
 
@@ -513,6 +511,8 @@ def loop_offset_allgather_kernel_factory(axis=None, error=None, wait_mode="all",
 def test_allgather_loop_offsets_preserve_source_and_destination_slots(axis, wait_mode):
     func = loop_offset_allgather_kernel_factory.get_tir(axis=axis, wait_mode=wait_mode, world_size=2)
     result = lower_to_device_tir(func, capture_passes="tl.LowerDistCollectives")
+    # Sender completion is now inserted automatically by LowerDistSync.
+    assert "tl.dist_wait_send" in collect_op_names(result.device_mod)
     expanded = result.pass_snapshot("tl.LowerDistCollectives").mod
     puts = collect_calls(expanded, "tl.tileop.dist_put")
     assert len(puts) == 1
@@ -559,7 +559,7 @@ def test_allgather_loop_offsets_reject_unsupported_addresses(error, message):
         lower_collectives(func)
 
 
-@pytest.mark.parametrize("wait_mode", ["no_wait", "conditional", "no_send_wait"])
+@pytest.mark.parametrize("wait_mode", ["no_wait", "conditional"])
 def test_allgather_loop_offsets_require_iteration_completion(wait_mode):
     func = loop_offset_allgather_kernel_factory.get_tir(wait_mode=wait_mode, world_size=2)
     with pytest.raises(tvm.error.InternalError, match="same iteration"):
