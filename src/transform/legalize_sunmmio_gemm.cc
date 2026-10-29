@@ -61,8 +61,9 @@
  *    emit BOTH the stripe-0 restore and the stripe-1 restage per gemm:
  *    omitting the restore would let iteration k+1 read the stripe-1 data
  *    left by iteration k. ReissueFromSource re-reads the source directly;
- *    ReissueFromShadow reads a snapshot captured at the writer site and
- *    retains the original writer for readers not expanded by this pass.
+ *    ReissueFromShadow reads a snapshot captured at the writer site. The
+ *    original writer and a final stripe-0 restore are retained when any
+ *    reader not expanded by this pass can observe the A buffer.
  *
  * This pass runs between SunmmioLayoutInference and LowerTileOp so it can
  * see high-level ops (Copy, AllgatherOp, BroadcastOp, Gemm, GemmPy) directly
@@ -597,9 +598,10 @@ struct Action {
   const CallNode *gemm; // primary gemm; for InPlaceGroup == group_gemms[0]
   Buffer a_dist;
   DataType c_dtype;
-  // A single-pass GEMM shares this writer. Preserve its initial definition;
-  // restore_after is set separately when that reader can execute after this
-  // particular two-pass action (including through a loop backedge).
+  // A reader not expanded by this pass shares this writer. Preserve its
+  // initial definition; restore_after is set separately when such a reader can
+  // observe this particular two-pass action (including through a loop
+  // backedge).
   bool preserve_writer = false;
   bool restore_after = false;
   const ForNode *restore_after_loop = nullptr;
@@ -631,15 +633,21 @@ public:
 
   std::unordered_map<const CallNode *, Path> paths;
   std::unordered_set<const CallNode *> conditional_calls;
+  std::unordered_map<const VarNode *, std::unordered_set<const ForNode *>>
+      binding_loops;
 
 private:
   const std::unordered_set<const CallNode *> &interesting_;
   Path current_path_;
+  std::vector<const ForNode *> loop_stack_;
   int conditional_depth_ = 0;
 
   void VisitStmt_(const ForNode *op) final {
     current_path_.push_back(op);
+    loop_stack_.push_back(op);
+    RecordBinding(op->loop_var);
     VisitStmt(op->body);
+    loop_stack_.pop_back();
     current_path_.pop_back();
   }
 
@@ -656,8 +664,25 @@ private:
     --conditional_depth_;
   }
 
-  void VisitStmt_(const BlockNode *op) final { VisitStmt(op->body); }
+  void VisitStmt_(const BlockNode *op) final {
+    for (const Buffer &buffer : op->alloc_buffers)
+      RecordBinding(buffer->data);
+    for (const IterVar &iter : op->iter_vars)
+      RecordBinding(iter->var);
+    VisitStmt(op->body);
+  }
   void VisitStmt_(const BlockRealizeNode *op) final { VisitStmt(op->block); }
+
+  void VisitStmt_(const LetStmtNode *op) final {
+    VisitExpr(op->value);
+    RecordBinding(op->var);
+    VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const AllocateNode *op) final {
+    RecordBinding(op->buffer_var);
+    StmtVisitor::VisitStmt_(op);
+  }
 
   void VisitStmt_(const EvaluateNode *op) final {
     const auto *call = op->value.as<CallNode>();
@@ -666,6 +691,11 @@ private:
       if (conditional_depth_ != 0)
         conditional_calls.insert(call);
     }
+  }
+
+  void RecordBinding(const Var &var) {
+    auto &loops = binding_loops[var.get()];
+    loops.insert(loop_stack_.begin(), loop_stack_.end());
   }
 };
 
@@ -816,6 +846,124 @@ private:
   bool past_writer_ = false;
   bool clean_ = true;
   bool reached_consumer_ = false;
+};
+
+class StorageUseFinder : public ExprVisitor {
+public:
+  explicit StorageUseFinder(const BufferNode *buffer) : buffer_(buffer) {}
+
+  bool found() const { return found_; }
+
+private:
+  void VisitExpr_(const BufferLoadNode *op) final {
+    if (op->buffer.get() == buffer_ || op->buffer->data.same_as(buffer_->data))
+      found_ = true;
+    if (!found_)
+      ExprVisitor::VisitExpr_(op);
+  }
+
+  const BufferNode *buffer_;
+  bool found_ = false;
+};
+
+bool ExprUsesStorage(const PrimExpr &expr, const BufferNode *buffer) {
+  StorageUseFinder finder(buffer);
+  finder(expr);
+  return finder.found();
+}
+
+bool CallReadsStorage(const CallNode *call, const BufferNode *buffer,
+                      bool ignore_gemm_a) {
+  auto arg_reads = [&](size_t index) {
+    if (index >= call->args.size())
+      return false;
+    const PrimExpr &arg = call->args[index];
+    if (IsBufferLikeExpr(arg)) {
+      Buffer arg_buffer = NormalizeToBufferRegion(arg)->buffer;
+      return arg_buffer.get() == buffer ||
+             arg_buffer->data.same_as(buffer->data);
+    }
+    return ExprUsesStorage(arg, buffer);
+  };
+  auto trailing_args_read = [&](size_t start) {
+    for (size_t i = start; i < call->args.size(); ++i) {
+      if (arg_reads(i))
+        return true;
+    }
+    return false;
+  };
+
+  if (call->op.same_as(Copy::Get()) || call->op.same_as(AllgatherOp::Get()) ||
+      call->op.same_as(BroadcastOp::Get()) || call->op.same_as(PutOp::Get())) {
+    // args[1] is the destination region; masks/coordinates in later args are
+    // still ordinary expressions and may read the same storage.
+    return arg_reads(0) || trailing_args_read(2);
+  }
+  if (call->op.same_as(Fill::Get())) {
+    // args[0] is the destination region.
+    return trailing_args_read(1);
+  }
+  if (call->op.same_as(Gemm::Get()) || call->op.same_as(GemmPy::Get())) {
+    if ((!ignore_gemm_a && arg_reads(0)) || arg_reads(1))
+      return true;
+    // An accumulating GEMM observes C before updating it. clear_accum lives at
+    // args[9] for both frontends; a dynamic value is conservatively a read.
+    if (arg_reads(2) && (call->args.size() <= 9 || !is_one(call->args[9])))
+      return true;
+    return trailing_args_read(3);
+  }
+
+  // Unknown or less common tile operations are conservative: any reference to
+  // the storage may be an observable read. This can add a redundant restore,
+  // but cannot expose stripe-1 data silently.
+  return trailing_args_read(0);
+}
+
+class ExternalADistReadCollector : public StmtExprVisitor {
+public:
+  static std::unordered_set<const BufferNode *>
+  Collect(const Stmt &body,
+          const std::unordered_set<const BufferNode *> &target_storage,
+          const std::unordered_set<const CallNode *> &gemm_a_readers) {
+    ExternalADistReadCollector collector(target_storage, gemm_a_readers);
+    collector.VisitStmt(body);
+    return std::move(collector.externally_read_);
+  }
+
+private:
+  ExternalADistReadCollector(
+      const std::unordered_set<const BufferNode *> &target_storage,
+      const std::unordered_set<const CallNode *> &gemm_a_readers)
+      : target_storage_(target_storage), gemm_a_readers_(gemm_a_readers) {}
+
+  void VisitStmt_(const EvaluateNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    if (!call) {
+      StmtExprVisitor::VisitStmt_(op);
+      return;
+    }
+    bool ignore_gemm_a = gemm_a_readers_.count(call) != 0;
+    for (const BufferNode *buffer : target_storage_) {
+      if (CallReadsStorage(call, buffer, ignore_gemm_a))
+        externally_read_.insert(buffer);
+    }
+    // CallReadsStorage has classified every call argument. Do not recurse into
+    // destination region BufferLoads and misclassify writes as reads.
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    for (const BufferNode *buffer : target_storage_) {
+      if (op->buffer.get() == buffer ||
+          op->buffer->data.same_as(buffer->data)) {
+        externally_read_.insert(buffer);
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  const std::unordered_set<const BufferNode *> &target_storage_;
+  const std::unordered_set<const CallNode *> &gemm_a_readers_;
+  std::unordered_set<const BufferNode *> externally_read_;
 };
 
 // The CallNode wrapped by an Evaluate(Call) statement, or nullptr.
@@ -1471,7 +1619,8 @@ FindOutermostExclusiveLoop(const ScopePathCollector::Path &gemm_path,
 
 bool RestoreCanMoveAfterLoop(const CallNode *writer,
                              const ScopePathCollector::Path &gemm_path,
-                             size_t loop_depth) {
+                             size_t loop_depth,
+                             const ScopePathCollector &scopes) {
   // Hoisting places the restore immediately after gemm_path[loop_depth]. Any
   // conditional scope nested inside that loop would be lost at the new site.
   // Keep such restores inline so each branch restores its own reaching writer.
@@ -1480,16 +1629,13 @@ bool RestoreCanMoveAfterLoop(const CallNode *writer,
       return false;
   }
 
-  std::unordered_set<const VarNode *> escaped_loop_vars;
-  for (size_t i = loop_depth; i < gemm_path.size(); ++i) {
-    if (gemm_path[i]->IsInstance<ForNode>()) {
-      escaped_loop_vars.insert(
-          static_cast<const ForNode *>(gemm_path[i])->loop_var.get());
-    }
-  }
+  const auto *escaped_loop =
+      static_cast<const ForNode *>(gemm_path[loop_depth]);
   for (const PrimExpr &arg : writer->args) {
     if (UsesVar(arg, [&](const VarNode *var) {
-          return escaped_loop_vars.count(var) != 0;
+          auto it = scopes.binding_loops.find(var);
+          return it != scopes.binding_loops.end() &&
+                 it->second.count(escaped_loop) != 0;
         })) {
       return false;
     }
@@ -1510,10 +1656,11 @@ void ValidateCollectiveReissueScope(const CallNode *writer,
   }
 }
 
-std::vector<Action>
-BuildPlan(const Stmt &body, const std::vector<GemmReachingDef> &gemms,
-          const std::vector<GemmReachingDef> &all_gemm_readers,
-          const ScopePathCollector &paths) {
+std::vector<Action> BuildPlan(
+    const Stmt &body, const std::vector<GemmReachingDef> &gemms,
+    const std::vector<GemmReachingDef> &all_gemm_readers,
+    const ScopePathCollector &paths,
+    const std::unordered_set<const BufferNode *> &externally_read_storage) {
   // Dedup: the two-pass For traversal records loop gemms twice. Keep the
   // last (pass-2 = converged) reaching def per distinct gemm, in first-seen
   // (program) order.
@@ -1570,9 +1717,15 @@ BuildPlan(const Stmt &body, const std::vector<GemmReachingDef> &gemms,
     const CallNode *writer = g.writer_rd.writer;
     const auto &consumer_set = consumers[writer];
     const auto &single_pass_readers = unexpanded_readers[writer];
-    bool preserve_writer = !single_pass_readers.empty();
+    bool has_external_reader =
+        externally_read_storage.count(g.a_dist.get()) != 0;
+    bool preserve_writer = has_external_reader || !single_pass_readers.empty();
     auto restore_placement = [&](const CallNode *last_gemm) {
-      bool inline_restore = false;
+      // General reads do not participate in the GEMM reaching-def analysis.
+      // Restore immediately rather than trying to move across their unknown
+      // control/data dependencies. GEMM-A-only readers retain the optimized
+      // loop-exit placement below.
+      bool inline_restore = has_external_reader;
       const ForNode *after_loop = nullptr;
       size_t chosen_depth = 0;
       for (const CallNode *reader : single_pass_readers) {
@@ -1586,7 +1739,7 @@ BuildPlan(const Stmt &body, const std::vector<GemmReachingDef> &gemms,
             FindOutermostExclusiveLoop(gemm_path, reader_path);
         if (exclusive_loop == nullptr) {
           inline_restore = true;
-        } else if (!RestoreCanMoveAfterLoop(writer, gemm_path, depth)) {
+        } else if (!RestoreCanMoveAfterLoop(writer, gemm_path, depth, paths)) {
           inline_restore = true;
         } else if (after_loop == nullptr || depth > chosen_depth) {
           after_loop = exclusive_loop;
@@ -1708,7 +1861,8 @@ public:
         gemm_plans_[e.gemm] = &e;
       }
       // Reissue actions replace the writer with a source snapshot when needed.
-      // The original writer is retained only for single-pass GEMM readers.
+      // Retain the original writer when any unexpanded reader needs its
+      // logical stripe-0 definition.
       if (e.kind == ActionKind::ReissueFromSource ||
           e.kind == ActionKind::ReissueFromShadow) {
         writer_plans_[e.writer] = &e;
@@ -1734,8 +1888,8 @@ private:
   Target target_;
   SunmmioTileProcessorConfig cfg_;
   std::unordered_map<const CallNode *, const Action *> gemm_plans_;
-  // Writers requiring per-consumer restaging and optional preservation for a
-  // single-pass GEMM that shares their ASRAM definition.
+  // Writers requiring per-consumer restaging and optional preservation for an
+  // unexpanded reader that shares their ASRAM definition.
   std::unordered_map<const CallNode *, const Action *> writer_plans_;
   // A_dist → one snapshot per reaching writer with a contested source.
   // All snapshots belong to the Block that owns the reused A_dist.
@@ -1830,7 +1984,7 @@ private:
       }
 
       // Shadow paths capture the source. Keep the original definition only
-      // when a single-pass GEMM shares this reaching writer.
+      // when an unexpanded reader shares this reaching writer.
       if (call) {
         auto wit = writer_plans_.find(call);
         if (wit != writer_plans_.end()) {
@@ -2012,6 +2166,16 @@ PrimFunc Run(PrimFunc f, bool twice) {
       Bf16AsramOperandFlow::Analyze(fp->body, cfg,
                                     /*include_single_pass=*/true);
 
+  std::unordered_set<const BufferNode *> planned_a_storage;
+  for (const auto &g : gemms)
+    planned_a_storage.insert(g.a_dist.get());
+  std::unordered_set<const CallNode *> gemm_a_reader_calls;
+  for (const auto &reader : all_gemm_readers)
+    gemm_a_reader_calls.insert(reader.gemm);
+  std::unordered_set<const BufferNode *> externally_read_storage =
+      ExternalADistReadCollector::Collect(fp->body, planned_a_storage,
+                                          gemm_a_reader_calls);
+
   // Phase 2: validate. Rejects NONE / MULTIPLE / unsupported writer types.
   ValidateGemms(gemms, fp->body, target.value());
 
@@ -2029,8 +2193,8 @@ PrimFunc Run(PrimFunc f, bool twice) {
   path_collector.Run(fp->body);
 
   // Phase 3: per-gemm action plan.
-  std::vector<Action> plan =
-      BuildPlan(fp->body, gemms, all_gemm_readers, path_collector);
+  std::vector<Action> plan = BuildPlan(fp->body, gemms, all_gemm_readers,
+                                       path_collector, externally_read_storage);
 
   // Phase 4: drive the rewrite from the plan.
   LegalizeSunmmioGemmRewriter rewriter(target.value(), cfg, plan);
