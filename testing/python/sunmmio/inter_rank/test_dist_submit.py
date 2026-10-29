@@ -7,6 +7,7 @@ import tilelang.language as T
 from tilelang import tvm
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import (
+    collect_nodes,
     collect_op_names,
 )
 
@@ -197,7 +198,7 @@ def early_return_kernel_factory(control_flow="if", world_size: int = 1):
 
 
 @tilelang.jit(target="sunmmio")
-def source_lifetime_kernel_factory(mode="submitted_overlap", world_size: int = 1):
+def source_lifetime_kernel_factory(mode="submitted_overlap", redundant_submit=False, world_size: int = 1):
     @T.prim_func
     def main(rank_id: T.dist.RankId):
         with T.Kernel():
@@ -208,12 +209,59 @@ def source_lifetime_kernel_factory(mode="submitted_overlap", world_size: int = 1
             if mode == "queued_overlap":
                 src[0] = 0
             T.dist.submit()
+            if redundant_submit:
+                T.dist.submit()
             if mode == "submitted_overlap":
                 src[0] = 0
             elif mode == "submitted_disjoint":
                 src[32] = 0
             elif mode == "submitted_dma_overlap":
                 T.copy(dst, src[0:32])
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
+def loop_source_lifetime_kernel_factory(loop_kind="serial", submit_each=True, world_size: int = 1):
+    step = 2 if loop_kind == "step" else 1
+    inner_count = 2 if loop_kind == "nested" else 1
+
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            src = T.alloc_shared((512,), T.bfloat16)
+            dst = T.alloc_shared((512,), T.bfloat16)
+            signal = T.dist.signal(expect="manual")
+            if loop_kind == "while":
+                position = T.alloc_var(T.int32, init=1)
+                while position < 4:
+                    src[(position - 1) * 32] = 0
+                    T.dist.put(
+                        src[position * 32 : (position + 1) * 32],
+                        dst[position * 32 : (position + 1) * 32],
+                        (rank_id + 1) % world_size,
+                        signal=signal,
+                    )
+                    if submit_each:
+                        T.dist.submit()
+                    position += 1
+            else:
+                for outer in T.serial(step, 4 * step, step=step):
+                    for inner in T.serial(inner_count):
+                        offset = (outer * inner_count + inner) * 32
+                        src[offset - step * 32] = 0
+                        T.dist.put(
+                            src[offset : offset + 32],
+                            dst[offset : offset + 32],
+                            (rank_id + 1) % world_size,
+                            signal=signal,
+                        )
+                        if submit_each:
+                            T.dist.submit()
+                        if loop_kind == "continue":
+                            continue
+            if not submit_each:
+                T.dist.submit()
 
     return main
 
@@ -388,21 +436,25 @@ def test_source_write_before_submit_is_rejected():
         lower_to_device_tir(source_lifetime_kernel_factory.get_tir(mode="queued_overlap", world_size=4))
 
 
-def test_source_write_after_submit_gets_automatic_wait():
+@pytest.mark.parametrize("redundant_submit", [False, True])
+def test_source_write_after_submit_gets_automatic_wait(redundant_submit):
     result = lower_to_device_tir(
-        source_lifetime_kernel_factory.get_tir(mode="submitted_overlap", world_size=4),
+        source_lifetime_kernel_factory.get_tir(mode="submitted_overlap", redundant_submit=redundant_submit, world_size=4),
         capture_passes="tl.LowerDistSync",
     )
-    script = result.pass_snapshot("tl.LowerDistSync").mod.script()
-    submit = script.index("T.dist_submit_()")
-    wait = script.index("T.dist_wait_send()", submit)
-    store = script.index("src[0] =", submit)
-    assert submit < wait < store
+    for mod in (result.pass_snapshot("tl.LowerDistSync").mod, result.device_mod):
+        script = mod.script()
+        assert collect_op_names(mod).count("tl.dist_submit_") == 1
+        submit = script.index("T.dist_submit_()")
+        wait = script.index("T.dist_wait_send()", submit)
+        store = script.index("src[0] =", submit)
+        assert submit < wait < store
 
 
-def test_disjoint_source_write_keeps_wait_at_scope_exit():
+@pytest.mark.parametrize("redundant_submit", [False, True])
+def test_disjoint_source_write_keeps_wait_at_scope_exit(redundant_submit):
     result = lower_to_device_tir(
-        source_lifetime_kernel_factory.get_tir(mode="submitted_disjoint", world_size=4),
+        source_lifetime_kernel_factory.get_tir(mode="submitted_disjoint", redundant_submit=redundant_submit, world_size=4),
         capture_passes="tl.LowerDistSync",
     )
     script = result.pass_snapshot("tl.LowerDistSync").mod.script()
@@ -423,6 +475,33 @@ def test_async_source_write_after_submit_gets_automatic_wait():
     copy_loop = script.index("for i in", submit)
     assert submit < wait < copy_loop
     assert "T.dist_wait_send()" not in script[copy_loop:]
+
+
+@pytest.mark.parametrize("loop_kind", ["serial", "step", "nested", "continue", "while"])
+def test_loop_carried_source_overwrite_waits_for_previous_iteration(loop_kind):
+    result = lower_to_device_tir(
+        loop_source_lifetime_kernel_factory.get_tir(loop_kind=loop_kind, world_size=4),
+        capture_passes="tl.LowerDistSync",
+    )
+    for mod in (result.pass_snapshot("tl.LowerDistSync").mod, result.device_mod):
+        protected_stores = []
+        for seq in collect_nodes(mod, tvm.tir.SeqStmt):
+            for index, stmt in enumerate(seq.seq):
+                if not isinstance(stmt, tvm.tir.BufferStore) or stmt.buffer.name != "src":
+                    continue
+                previous = seq.seq[index - 1] if index else None
+                protected_stores.append(
+                    isinstance(previous, tvm.tir.Evaluate)
+                    and isinstance(previous.value, tvm.tir.Call)
+                    and previous.value.op.same_as(tvm.ir.Op.get("tl.dist_wait_send"))
+                )
+        assert protected_stores and all(protected_stores)
+
+
+@pytest.mark.parametrize("loop_kind", ["serial", "step", "nested", "continue", "while"])
+def test_loop_carried_source_overwrite_before_submit_is_rejected(loop_kind):
+    with pytest.raises(tvm.error.InternalError, match="modified before its queued batch is submitted"):
+        lower_to_device_tir(loop_source_lifetime_kernel_factory.get_tir(loop_kind=loop_kind, submit_each=False, world_size=4))
 
 
 def _dist_leaf(name, *args):
@@ -474,6 +553,63 @@ def _inject_queue_body(body, params=()):
     func = tvm.tir.PrimFunc(params, body).with_attr("tl.dist.world_size", 4)
     mod = tilelang.transform.LowerDistSync()(tvm.IRModule({"main": func}))
     return mod["main"]
+
+
+def test_loop_carried_source_preserves_invariant_disjoint_dimensions():
+    src = tvm.tir.decl_buffer((2, 128), "bfloat16", name="src", scope="shared.rsram")
+    dst = tvm.tir.decl_buffer((2, 128), "bfloat16", name="dst", scope="shared.rsram")
+    i = tvm.tir.Var("i", "int32")
+
+    def region(buffer, access):
+        return tvm.tir.Call("handle", tvm.ir.Op.get("tl.tileop.region"), [buffer[0, i * 32], access, 1, 32])
+
+    loop = tvm.tir.For(
+        i,
+        1,
+        3,
+        tvm.tir.ForKind.SERIAL,
+        tvm.tir.SeqStmt(
+            [
+                tvm.tir.BufferStore(src, tvm.tir.const(0, "bfloat16"), [1, (i - 1) * 32]),
+                _dist_leaf("dist_put_", region(src, 1), region(dst, 2), 1, "sram_flagreg_inc", 0, tvm.tir.const(0, "uint8")),
+                _dist_leaf("dist_submit_"),
+            ]
+        ),
+    )
+    func = _inject_queue_body(loop, [src.data, dst.data])
+    # Only the existing pre-submit wait and final drain are needed: row 1 is
+    # disjoint from every previous send, even as the column changes each round.
+    assert collect_op_names(func).count("tl.dist_wait_send") == 2
+
+
+def test_loop_local_let_address_is_not_reused_as_previous_iteration_value():
+    src = tvm.tir.decl_buffer((128,), "bfloat16", name="src", scope="shared.rsram")
+    dst = tvm.tir.decl_buffer((128,), "bfloat16", name="dst", scope="shared.rsram")
+    i = tvm.tir.Var("i", "int32")
+    offset = tvm.tir.Var("offset", "int32")
+
+    def region(buffer, access):
+        return tvm.tir.Call("handle", tvm.ir.Op.get("tl.tileop.region"), [buffer[offset], access, 32])
+
+    store = tvm.tir.BufferStore(src, tvm.tir.const(0, "bfloat16"), [offset - 32])
+    body = tvm.tir.LetStmt(
+        offset,
+        i * 32,
+        tvm.tir.SeqStmt(
+            [
+                store,
+                _dist_leaf("dist_put_", region(src, 1), region(dst, 2), 1, "sram_flagreg_inc", 0, tvm.tir.const(0, "uint8")),
+                _dist_leaf("dist_submit_"),
+            ]
+        ),
+    )
+    func = _inject_queue_body(tvm.tir.For(i, 1, 3, tvm.tir.ForKind.SERIAL, body), [src.data, dst.data])
+    loops = collect_nodes(func, tvm.tir.For)
+    assert len(loops) == 1
+    assert isinstance(loops[0].body, tvm.tir.LetStmt)
+    statements = loops[0].body.body.seq
+    assert statements[0].value.op.same_as(tvm.ir.Op.get("tl.dist_wait_send"))
+    assert tvm.ir.structural_equal(statements[1], store)
 
 
 @pytest.mark.parametrize("strict_batch", [False, True])

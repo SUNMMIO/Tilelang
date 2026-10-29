@@ -47,6 +47,37 @@ BufferRegions MergeRegions(const BufferRegions &lhs, const BufferRegions &rhs) {
   return merged;
 }
 
+BufferRegions WidenLoopSourceRegions(
+    const BufferRegions &regions,
+    const std::unordered_set<const VarNode *> &loop_local_vars) {
+  BufferRegions widened;
+  for (const BufferRegion &region : regions) {
+    Region bounds;
+    for (size_t dim = 0; dim < region->region.size(); ++dim) {
+      const Range &range = region->region[dim];
+      bool changes = false;
+      auto check = [&](const ObjectRef &node) {
+        if (const auto *var = node.as<VarNode>()) {
+          changes |= loop_local_vars.count(var) != 0;
+        }
+        changes |= node.as<BufferLoadNode>() != nullptr;
+      };
+      PostOrderVisit(range->min, check);
+      PostOrderVisit(range->extent, check);
+      // An address captured by an earlier send must not be compared using the
+      // next iteration's values. Retain invariant dimensions, but
+      // conservatively cover a varying dimension until cross-iteration bounds
+      // are available.
+      bounds.push_back(changes
+                           ? Range::FromMinExtent(make_zero(range->min.dtype()),
+                                                  region->buffer->shape[dim])
+                           : range);
+    }
+    AddUniqueRegion(&widened, BufferRegion(region->buffer, std::move(bounds)));
+  }
+  return widened;
+}
+
 bool SameRegionSet(const BufferRegions &lhs, const BufferRegions &rhs) {
   if (lhs.size() != rhs.size()) {
     return false;
@@ -309,7 +340,27 @@ private:
     SetState(Join(then_state, else_state));
   }
 
-  void VisitLoop(const Stmt &body) {
+  void VisitLoop(const Stmt &body, const Var &loop_var = Var()) {
+    std::unordered_set<const VarNode *> loop_local_vars;
+    if (loop_var.defined()) {
+      loop_local_vars.insert(loop_var.get());
+    }
+    PostOrderVisit(body, [&](const ObjectRef &node) {
+      if (const auto *loop = node.as<ForNode>()) {
+        loop_local_vars.insert(loop->loop_var.get());
+      } else if (const auto *let = node.as<LetStmtNode>()) {
+        loop_local_vars.insert(let->var.get());
+      } else if (const auto *let = node.as<LetNode>()) {
+        loop_local_vars.insert(let->var.get());
+      }
+    });
+    auto widen = [&](State state) {
+      state.queued_sources =
+          WidenLoopSourceRegions(state.queued_sources, loop_local_vars);
+      state.inflight_sources =
+          WidenLoopSourceRegions(state.inflight_sources, loop_local_vars);
+      return state;
+    };
     State incoming = GetState();
     State entry = incoming;
     loop_exits_.emplace_back();
@@ -319,10 +370,10 @@ private:
       State body_state = VisitBranch(body, entry);
       // Continue reaches the next iteration; break only reaches the loop exit.
       State backedge = Join(body_state, loop_exits_.back().continues);
-      State next = Join(incoming, backedge);
+      State next = Join(incoming, widen(std::move(backedge)));
       if (SameLoopState(next, entry)) {
         // Include zero iterations and exhaustion after a normal/continue path.
-        SetState(Join(next, loop_exits_.back().breaks));
+        SetState(Join(next, widen(loop_exits_.back().breaks)));
         break;
       }
       entry = next;
@@ -340,7 +391,7 @@ private:
     }
     VisitExpr(op->min);
     VisitExpr(op->extent);
-    VisitLoop(op->body);
+    VisitLoop(op->body, op->loop_var);
   }
 
   void VisitStmt_(const WhileNode *op) final {
@@ -450,6 +501,10 @@ private:
       bool nonempty = queue_pending_;
       if (!nonempty && loop_exits_.empty()) {
         empty_submits_.insert(op);
+        // Removing an empty submit also removes its channel-idle wait. Keep
+        // earlier in-flight sources protected until a real wait completes them.
+        strict_batch_open_ = false;
+        return;
       }
       // Every retained submit receives a channel-idle wait during rewriting,
       // so prior in-flight sources are complete before this batch starts.
