@@ -1469,9 +1469,17 @@ FindOutermostExclusiveLoop(const ScopePathCollector::Path &gemm_path,
   return {nullptr, 0};
 }
 
-bool WriterArgsAreInvariantOutsideLoop(
-    const CallNode *writer, const ScopePathCollector::Path &gemm_path,
-    size_t loop_depth) {
+bool RestoreCanMoveAfterLoop(const CallNode *writer,
+                             const ScopePathCollector::Path &gemm_path,
+                             size_t loop_depth) {
+  // Hoisting places the restore immediately after gemm_path[loop_depth]. Any
+  // conditional scope nested inside that loop would be lost at the new site.
+  // Keep such restores inline so each branch restores its own reaching writer.
+  for (size_t i = loop_depth + 1; i < gemm_path.size(); ++i) {
+    if (!gemm_path[i]->IsInstance<ForNode>())
+      return false;
+  }
+
   std::unordered_set<const VarNode *> escaped_loop_vars;
   for (size_t i = loop_depth; i < gemm_path.size(); ++i) {
     if (gemm_path[i]->IsInstance<ForNode>()) {
@@ -1578,8 +1586,7 @@ BuildPlan(const Stmt &body, const std::vector<GemmReachingDef> &gemms,
             FindOutermostExclusiveLoop(gemm_path, reader_path);
         if (exclusive_loop == nullptr) {
           inline_restore = true;
-        } else if (!WriterArgsAreInvariantOutsideLoop(writer, gemm_path,
-                                                      depth)) {
+        } else if (!RestoreCanMoveAfterLoop(writer, gemm_path, depth)) {
           inline_restore = true;
         } else if (after_loop == nullptr || depth > chosen_depth) {
           after_loop = exclusive_loop;

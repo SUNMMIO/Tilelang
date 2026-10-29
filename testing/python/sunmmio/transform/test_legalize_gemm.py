@@ -2257,6 +2257,64 @@ def test_legalize_sunmmio_gemm_keeps_loop_variant_restore_inside_loop():
     tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
 
 
+def test_legalize_sunmmio_gemm_keeps_branch_dependent_restore_inside_loop():
+    """A restore cannot leave a branch nested inside the loop it exits."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        B: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        C: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+    ):
+        with T.Kernel(T.mesh_ncores()) as cid:
+            first = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            second = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            large_out = T.alloc_shared((32, 32), "bfloat16")
+            small_out = T.alloc_shared((16, 32), "bfloat16")
+            T.copy(A, first)
+            T.copy(B, second)
+            T.copy(B, weight)
+            for _ in T.serial(3):
+                if cid == 0:
+                    T.copy(first, activation)
+                    T.gemm(activation, weight, large_out, clear_accum=True)
+                else:
+                    T.copy(second, activation)
+                    T.gemm(activation, weight, large_out, clear_accum=True)
+            T.gemm(activation[0:16, :], weight, small_out, clear_accum=True)
+            T.copy(small_out, C[0:16, :])
+            T.copy(large_out[16:32, :], C[16:32, :])
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    outer = list(_kernel_body_seq(mod).seq)
+    loop_index = next(i for i, stmt in enumerate(outer) if isinstance(stmt, tvm.tir.For))
+    unconditional_restores = [
+        _copy_buf(stmt.value, 0).name
+        for stmt in outer[loop_index + 1 :]
+        if isinstance(stmt, tvm.tir.Evaluate)
+        and isinstance(stmt.value, tvm.tir.Call)
+        and stmt.value.op.name == "tl.tileop.copy"
+        and _copy_buf(stmt.value, 1).name == "activation"
+    ]
+    assert not unconditional_restores
+
+    branches = []
+    tvm.tir.stmt_functor.post_order_visit(
+        outer[loop_index], lambda node: branches.append(node) if isinstance(node, tvm.tir.IfThenElse) else None
+    )
+    assert len(branches) == 1
+    for source, branch in zip(("first", "second"), (branches[0].then_case, branches[0].else_case)):
+        activation_copies = [call for _, call in _iter_calls_in_stmt(branch, "tl.tileop.copy") if _copy_buf(call, 1).name == "activation"]
+        assert _copy_buf(activation_copies[-1], 0).name == source
+        assert "src_offset_byte" not in activation_copies[-1].annotations
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
 @pytest.mark.parametrize("group_size", [1, 2])
 def test_legalize_sunmmio_gemm_restores_stripe_zero_for_later_small_reader(group_size):
     """A small GEMM after a legalized consumer must not observe stripe-1 data."""
