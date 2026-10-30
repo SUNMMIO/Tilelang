@@ -1,3 +1,4 @@
+import pytest
 import tilelang
 from tilelang import tvm
 from tilelang.utils.target import determine_target
@@ -495,6 +496,250 @@ def test_loop_preserves_explicit_step():
     assert len(steps) == 1
     assert isinstance(steps[0], tvm.tir.IntImm)
     assert int(steps[0]) == 2
+
+
+def _nodes(node, node_type):
+    nodes = []
+    roots = [func.body for func in node.functions.values()] if isinstance(node, tvm.IRModule) else [node]
+    for root in roots:
+        tvm.tir.stmt_functor.post_order_visit(root, lambda item: nodes.append(item) if isinstance(item, node_type) else None)
+    return nodes
+
+
+def _sync_masks(node):
+    return [
+        int(call.args[0]) for call in _nodes(node, tvm.tir.Call) if isinstance(call.op, tvm.ir.Op) and call.op.name == "tl.sunmmio_sync"
+    ]
+
+
+def _jump(name):
+    return tvm.tir.Evaluate(tvm.tir.call_intrin("int32", "tir." + name + "_loop"))
+
+
+@pytest.mark.parametrize("step", [1, 2])
+def test_independent_loop_copies_wait_only_before_external_consumer(step):
+    def body(src, dst):
+        i = tvm.tir.Var("i", "int32")
+        copy = _dma_regions(
+            _region_at(src, 1, 0, 0, 16, 32),
+            _region_at(dst, 2, i * (16 // step), 0, 16, 32),
+        )
+        loop = tvm.tir.For(i, 0, 2 * step, tvm.tir.ForKind.SERIAL, copy, step=tvm.tir.const(step, "int32"))
+        return [loop, _dist_put(dst, src)]
+
+    mod = _apply(_make_module(body))
+    assert _sync_masks(_nodes(mod, tvm.tir.For)[0].body) == []
+    assert _sync_masks(mod) == [1]
+    script = mod.script()
+    assert script.index("T.dma_copy") < script.index("T.sunmmio_sync(1)") < script.index("T.dist_put_")
+
+
+def test_loop_invariant_producer_is_waited_once_before_loop():
+    def body(src, dst):
+        loop = tvm.tir.For(tvm.tir.Var("i", "int32"), 0, 3, tvm.tir.ForKind.SERIAL, _dist_put(dst, src))
+        return [_dma(src, dst), loop]
+
+    mod = _apply(_make_module(body))
+    assert _sync_masks(_nodes(mod, tvm.tir.For)[0].body) == []
+    assert _sync_masks(mod) == [1]
+    assert mod.script().index("T.sunmmio_sync(1)") < mod.script().index("for i")
+
+
+def test_unknown_loop_step_keeps_conservative_backedge_sync():
+    step = tvm.tir.Var("step", "int32")
+
+    def body(src, dst):
+        i = tvm.tir.Var("i", "int32")
+        copy = _dma_regions(_region_at(src, 1, 0, 0, 16, 32), _region_at(dst, 2, i * 16, 0, 16, 32))
+        return tvm.tir.For(i, 0, 2, tvm.tir.ForKind.SERIAL, copy, step=step)
+
+    mod = _make_module(body)
+    func = mod["main"]
+    mod = tvm.IRModule({"main": tvm.tir.PrimFunc([*func.params, step], func.body, attrs=func.attrs)})
+    mod = _apply(mod)
+    loop = _nodes(mod, tvm.tir.For)[0]
+    assert loop.step.same_as(step)
+    assert _sync_masks(loop.body) == [1]
+
+
+@pytest.mark.parametrize("control", ["loop", "if"])
+def test_unrelated_control_flow_keeps_wait_at_actual_consumer(control):
+    def body(src, dst):
+        if control == "loop":
+            middle = tvm.tir.For(tvm.tir.Var("i", "int32"), 0, 3, tvm.tir.ForKind.SERIAL, tvm.tir.Evaluate(0))
+        else:
+            middle = tvm.tir.IfThenElse(src[0, 0] > tvm.tir.const(0, "bfloat16"), tvm.tir.Evaluate(0), None)
+        return [_dma(src, dst), middle, _dist_put(dst, src)]
+
+    mod = _apply(_make_module(body))
+    script = mod.script()
+    assert _sync_masks(mod) == [1]
+    control_index = script.index("for i" if control == "loop" else "if ")
+    assert control_index < script.index("T.sunmmio_sync(1)") < script.index("T.dist_put_")
+
+
+def test_dependency_two_iterations_later_is_not_missed():
+    output = tvm.tir.decl_buffer((32, 32), "bfloat16", name="output", scope="shared.rsram")
+
+    def body(src, dst):
+        i = tvm.tir.Var("i", "int32")
+        loop = tvm.tir.For(
+            i,
+            0,
+            4,
+            tvm.tir.ForKind.SERIAL,
+            tvm.tir.SeqStmt(
+                [
+                    _dma_regions(_region_at(src, 1, 0, 0, 4, 32), _region_at(dst, 2, (i + 2) * 4, 0, 4, 32)),
+                    _dma_regions(_region_at(dst, 1, i * 4, 0, 4, 32), _region_at(output, 2, i * 4, 0, 4, 32), unit="odma1"),
+                ]
+            ),
+        )
+        return tvm.tir.DeclBuffer(output, tvm.tir.SeqStmt([loop, _dist_put(output, src)]))
+
+    mod = _make_module(body)
+    func = mod["main"]
+    mod = tvm.IRModule({"main": tvm.tir.PrimFunc([*func.params, output.data], func.body, attrs=func.attrs)})
+    mod = _apply(mod)
+    loop = _nodes(mod, tvm.tir.For)[0]
+    # Iteration i writes a slot read at i + 2. Adjacent iterations alone are
+    # insufficient to prove independence. The two DMAs within one round do not
+    # conflict, so ODMA0 is waited at the backedge and ODMA1 at the final read.
+    assert _sync_masks(loop.body) == [1]
+    assert loop.body.seq[-1].value.op.name == "tl.sunmmio_sync"
+    assert _sync_masks(mod) == [1, 2]
+
+
+def test_same_iteration_producer_wait_stays_before_consumer():
+    mod = _apply(
+        _make_module(
+            lambda src, dst: tvm.tir.For(
+                tvm.tir.Var("i", "int32"),
+                0,
+                3,
+                tvm.tir.ForKind.SERIAL,
+                tvm.tir.SeqStmt([_dma(src, dst), _dist_put(dst, src)]),
+            )
+        )
+    )
+    loop = _nodes(mod, tvm.tir.For)[0]
+    assert _sync_masks(loop.body) == [1]
+    script = loop.script()
+    assert script.index("T.dma_copy") < script.index("T.sunmmio_sync(1)") < script.index("T.dist_put_")
+    assert _sync_masks(mod) == [1]
+
+
+@pytest.mark.parametrize("jump", ["break", "continue"])
+def test_loop_jump_preserves_producer_completion(jump):
+    def body(src, dst):
+        loop = tvm.tir.For(
+            tvm.tir.Var("i", "int32"),
+            0,
+            3,
+            tvm.tir.ForKind.SERIAL,
+            tvm.tir.SeqStmt([_dma(src, dst), _jump(jump)]),
+        )
+        return [loop, _dist_put(dst, src)]
+
+    mod = _apply(_make_module(body))
+    loop = _nodes(mod, tvm.tir.For)[0]
+    assert _sync_masks(mod) == [1]
+    if jump == "continue":
+        assert _sync_masks(loop.body) == [1]
+        assert loop.script().index("T.sunmmio_sync(1)") < loop.script().index("T.continue_loop")
+    else:
+        assert _sync_masks(loop.body) == []
+        script = mod.script()
+        assert script.index("T.break_loop") < script.index("T.sunmmio_sync(1)") < script.index("T.dist_put_")
+
+
+def test_conditional_break_propagates_pending_to_external_consumer():
+    def body(src, dst):
+        condition = src[0, 0] > tvm.tir.const(0, "bfloat16")
+        branch = tvm.tir.IfThenElse(condition, tvm.tir.SeqStmt([_dma(src, dst), _jump("break")]), None)
+        loop = tvm.tir.For(tvm.tir.Var("i", "int32"), 0, 3, tvm.tir.ForKind.SERIAL, branch)
+        return [loop, _dist_put(dst, src)]
+
+    mod = _apply(_make_module(body))
+    assert _sync_masks(_nodes(mod, tvm.tir.For)[0].body) == []
+    assert _sync_masks(mod) == [1]
+
+
+def test_nested_break_only_exits_inner_loop():
+    def body(src, dst):
+        inner = tvm.tir.For(
+            tvm.tir.Var("j", "int32"),
+            0,
+            2,
+            tvm.tir.ForKind.SERIAL,
+            tvm.tir.SeqStmt([_dma(src, dst), _jump("break")]),
+        )
+        return tvm.tir.For(
+            tvm.tir.Var("i", "int32"),
+            0,
+            3,
+            tvm.tir.ForKind.SERIAL,
+            tvm.tir.SeqStmt([inner, _dist_put(dst, src)]),
+        )
+
+    mod = _apply(_make_module(body))
+    loops = _nodes(mod, tvm.tir.For)
+    assert _sync_masks(loops[0].body) == []
+    assert _sync_masks(loops[1].body) == [1]
+    statements = loops[1].body.seq
+    assert isinstance(statements[0], tvm.tir.For)
+    assert statements[1].value.op.name == "tl.sunmmio_sync"
+    assert statements[2].value.op.name == "tl.dist_put_"
+
+
+def test_while_condition_dependency_is_waited_before_continue():
+    def body(src, dst):
+        return tvm.tir.While(
+            dst[0, 0] > tvm.tir.const(0, "bfloat16"),
+            tvm.tir.SeqStmt([_dma(src, dst), _jump("continue")]),
+        )
+
+    mod = _apply(_make_module(body))
+    loop = _nodes(mod, tvm.tir.While)[0]
+    assert _sync_masks(loop.body) == [96, 1]
+    assert loop.script().index("T.sunmmio_sync(1)") < loop.script().index("T.continue_loop")
+
+
+@pytest.mark.parametrize("extent", [0, 1])
+def test_zero_or_single_iteration_has_no_backedge_wait(extent):
+    def body(src, dst):
+        loop = tvm.tir.For(tvm.tir.Var("i", "int32"), 0, extent, tvm.tir.ForKind.SERIAL, _dma(src, dst))
+        return [loop, _dist_put(dst, src)]
+
+    mod = _apply(_make_module(body))
+    assert _sync_masks(_nodes(mod, tvm.tir.For)[0].body) == []
+    assert _sync_masks(mod) == ([1] if extent else [])
+
+
+def test_return_wait_is_reachable_and_dead_suffix_does_not_change_state():
+    mod = _apply(_make_module(lambda src, dst: [_dma(src, dst), tvm.tir.Evaluate(tvm.tir.ret(0)), _dma(dst, src)]))
+    script = mod.script()
+    assert _sync_masks(mod) == [1]
+    assert script.index("T.sunmmio_sync(1)") < script.index("return 0")
+
+
+@pytest.mark.parametrize("jump", ["break", "continue"])
+def test_loop_jump_waits_before_local_allocation_is_released(jump):
+    def body(src, dst):
+        allocation = tvm.tir.Allocate(
+            dst.data,
+            dst.dtype,
+            dst.shape,
+            True,
+            tvm.tir.SeqStmt([_dma(src, dst), _jump(jump)]),
+        )
+        return tvm.tir.For(tvm.tir.Var("i", "int32"), 0, 3, tvm.tir.ForKind.SERIAL, allocation)
+
+    mod = _apply(_make_module(body))
+    allocation = _nodes(mod, tvm.tir.Allocate)[0]
+    assert _sync_masks(allocation.body) == [1]
+    script = allocation.body.script()
+    assert script.index("T.sunmmio_sync(1)") < script.index("T." + jump + "_loop")
 
 
 def test_source_guarded_broadcast_has_pre_and_post_barriers():

@@ -128,6 +128,19 @@ def sync_simple_copy_kernel(M=128, N=128, block_M=32, block_N=32, dtype="bfloat1
 
 
 @target("Sunmmio")
+def sync_invariant_copy_kernel():
+    @T.prim_func
+    def main(A: T.Tensor((32, 32), T.bfloat16), B: T.Tensor((32, 64), T.bfloat16)):
+        with T.Kernel():
+            shared = T.alloc_shared((32, 32), T.bfloat16)
+            T.copy(A, shared)
+            for block in T.serial(2):
+                T.copy(shared, B[0:32, block * 32 : (block + 1) * 32])
+
+    return main
+
+
+@target("Sunmmio")
 def sync_mma_kernel(
     M=128,
     N=128,
@@ -312,6 +325,22 @@ def test_sync_simple_copy_kernel_codegen_validates_with_npuir_opt(tmp_path):
     final_sync = next(line.strip() for line in reversed(src.splitlines()) if "suvm.sync" in line)
     assert "odma0" in final_sync
     assert all(unit not in final_sync for unit in ("odma1", "tc", "vector", "rsram"))
+
+
+def test_loop_invariant_sync_remains_outside_loop_in_codegen(tmp_path):
+    src = _validate_kernel(
+        sync_invariant_copy_kernel(),
+        tmp_path,
+        mlir_filename="sync_invariant_copy.mlir",
+        expected_tokens=("suvm.copy_async", "scf.for", "suvm.sync"),
+    )
+    lines = src.splitlines()
+    loop_index = next(i for i, line in enumerate(lines) if "scf.for" in line)
+    indent = len(lines[loop_index]) - len(lines[loop_index].lstrip())
+    end = next(i for i in range(loop_index + 1, len(lines)) if lines[i].startswith(" " * indent + "}"))
+    assert any("suvm.sync" in line for line in lines[:loop_index])
+    assert all("suvm.sync" not in line for line in lines[loop_index:end])
+    assert any("suvm.sync" in line for line in lines[end:])
 
 
 def test_sync_mma_kernel_codegen_validates_with_npuir_opt(tmp_path):

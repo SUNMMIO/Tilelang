@@ -26,6 +26,7 @@
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/target/target.h>
+#include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
@@ -38,6 +39,8 @@
 #include <initializer_list>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -457,6 +460,9 @@ bool AccessRegionsMayOverlap(const UnitAccess &lhs, const UnitAccess &rhs) {
 }
 
 bool NeedsUnitSync(const UnitAccess &producer, const UnitAccess &consumer) {
+  if (!producer.write && !consumer.write) {
+    return false;
+  }
   if (producer.producer_kind == AccessProducerKind::kAsync) {
     return true;
   }
@@ -480,6 +486,206 @@ public:
   }
 
 private:
+  using Accesses = std::vector<UnitAccess>;
+
+  struct FlowState {
+    Accesses pending;
+    bool reachable{true};
+  };
+
+  struct LoopFrame {
+    FlowState breaks{{}, false};
+    std::vector<std::pair<const EvaluateNode *, FlowState>> continues;
+    size_t allocation_depth;
+  };
+
+  struct LoopInfo {
+    Var var{ffi::ObjectPtr<VarNode>()};
+    Range domain;
+    PrimExpr step;
+    std::unordered_set<const VarNode *> local_vars;
+    Map<Var, PrimExpr> let_values;
+  };
+
+  static void MergeAccesses(Accesses *dst, const Accesses &src) {
+    for (const UnitAccess &access : src) {
+      bool found = false;
+      for (const UnitAccess &existing : *dst) {
+        found |= existing.buffer.same_as(access.buffer) &&
+                 StructuralEqual()(existing.region, access.region) &&
+                 existing.write == access.write &&
+                 existing.producer_kind == access.producer_kind &&
+                 existing.units == access.units;
+      }
+      if (!found) {
+        dst->push_back(access);
+      }
+    }
+  }
+
+  static FlowState Join(FlowState lhs, const FlowState &rhs) {
+    if (!lhs.reachable) {
+      return rhs;
+    }
+    if (rhs.reachable) {
+      MergeAccesses(&lhs.pending, rhs.pending);
+    }
+    return lhs;
+  }
+
+  FlowState GetState() const { return {pending_, reachable_}; }
+
+  void SetState(const FlowState &state) {
+    pending_ = state.pending;
+    reachable_ = state.reachable;
+  }
+
+  static PrimExpr ResolveLoopLets(const PrimExpr &expr, const LoopInfo &info) {
+    class Resolver : public ExprMutator {
+    public:
+      explicit Resolver(const Map<Var, PrimExpr> &values) : values_(values) {}
+
+    private:
+      PrimExpr VisitExpr_(const VarNode *op) final {
+        Var var = ffi::GetRef<Var>(op);
+        auto value = values_.Get(var);
+        return value ? VisitExpr(value.value()) : var;
+      }
+      const Map<Var, PrimExpr> &values_;
+    } resolver(info.let_values);
+    return resolver(expr);
+  }
+
+  static bool HasUnknownLoopIndex(const PrimExpr &expr, const LoopInfo &info) {
+    bool unknown = false;
+    PostOrderVisit(expr, [&](const ObjectRef &node) {
+      if (const auto *var = node.as<VarNode>()) {
+        unknown |= info.local_vars.count(var) && var != info.var.get();
+      }
+      unknown |= node.as<BufferLoadNode>() != nullptr;
+      if (const auto *call = node.as<CallNode>()) {
+        unknown |=
+            SideEffect(ffi::GetRef<PrimExpr>(call)) > CallEffectKind::kPure;
+      }
+    });
+    return unknown;
+  }
+
+  static LoopInfo MakeLoopInfo(const Stmt &body, const ForNode *loop) {
+    LoopInfo info;
+    if (loop) {
+      info.var = loop->loop_var;
+      info.domain = Range::FromMinExtent(loop->min, loop->extent);
+      info.step = loop->step.value_or(make_const(loop->loop_var.dtype(), 1));
+      info.local_vars.insert(loop->loop_var.get());
+    }
+    PostOrderVisit(body, [&](const ObjectRef &node) {
+      if (const auto *nested = node.as<ForNode>()) {
+        info.local_vars.insert(nested->loop_var.get());
+      } else if (const auto *let = node.as<LetStmtNode>()) {
+        info.local_vars.insert(let->var.get());
+        if (!dist_transform::RouteExprBufferLoadDetector().Detect(let->value) &&
+            tir::SideEffect(let->value) <= tir::CallEffectKind::kPure) {
+          info.let_values.Set(let->var, let->value);
+        }
+      } else if (const auto *let = node.as<LetNode>()) {
+        info.local_vars.insert(let->var.get());
+        if (!dist_transform::RouteExprBufferLoadDetector().Detect(let->value) &&
+            SideEffect(let->value) <= CallEffectKind::kPure) {
+          info.let_values.Set(let->var, let->value);
+        }
+      }
+    });
+    return info;
+  }
+
+  static UnitAccess CoverLoopAccess(UnitAccess access, const LoopInfo &info) {
+    Region region;
+    std::unordered_map<const VarNode *, arith::IntSet> domains;
+    if (info.var.defined()) {
+      const auto *step = info.step.as<IntImmNode>();
+      bool unknown_domain = HasUnknownLoopIndex(info.domain->min, info) ||
+                            HasUnknownLoopIndex(info.domain->extent, info) ||
+                            !step || step->value <= 0;
+      domains.emplace(info.var.get(),
+                      unknown_domain ? arith::IntSet::Everything()
+                                     : arith::IntSet::FromRange(info.domain));
+    }
+    for (size_t dim = 0; dim < access.region.size(); ++dim) {
+      PrimExpr min = ResolveLoopLets(access.region[dim]->min, info);
+      PrimExpr extent = ResolveLoopLets(access.region[dim]->extent, info);
+      Range full =
+          Range::FromMinExtent(make_zero(access.buffer->shape[dim].dtype()),
+                               access.buffer->shape[dim]);
+      region.push_back(
+          HasUnknownLoopIndex(min, info) || HasUnknownLoopIndex(extent, info)
+              ? full
+              : arith::EvalSet(Range::FromMinExtent(min, extent), domains)
+                    .CoverRange(full));
+    }
+    access.region = std::move(region);
+    return access;
+  }
+
+  static FlowState CoverLoopState(FlowState state, const LoopInfo &info) {
+    Accesses covered;
+    for (const UnitAccess &access : state.pending) {
+      MergeAccesses(&covered, {CoverLoopAccess(access, info)});
+    }
+    state.pending = std::move(covered);
+    return state;
+  }
+
+  static bool OverlapAcrossIterations(const UnitAccess &producer,
+                                      const UnitAccess &consumer,
+                                      const LoopInfo &info) {
+    if (!producer.buffer->data.same_as(consumer.buffer->data)) {
+      return false;
+    }
+    if (!producer.buffer.same_as(consumer.buffer) &&
+        !StructuralEqual()(producer.buffer, consumer.buffer)) {
+      return true;
+    }
+    if (producer.region.size() != consumer.region.size()) {
+      return true;
+    }
+    arith::Analyzer analyzer;
+    Map<Var, PrimExpr> later_iteration;
+    if (info.var.defined()) {
+      const auto *step = info.step.as<IntImmNode>();
+      if (step && step->value > 0) {
+        Var distance("sync_iteration_distance", info.var.dtype());
+        analyzer.Bind(info.var, info.domain);
+        analyzer.Bind(distance,
+                      Range::FromMinExtent(make_const(distance.dtype(), 1),
+                                           info.domain->extent));
+        later_iteration.Set(info.var, info.var + info.step * distance);
+      }
+    }
+    for (size_t dim = 0; dim < producer.region.size(); ++dim) {
+      PrimExpr pmin = ResolveLoopLets(producer.region[dim]->min, info);
+      PrimExpr pextent = ResolveLoopLets(producer.region[dim]->extent, info);
+      PrimExpr cmin = ResolveLoopLets(consumer.region[dim]->min, info);
+      PrimExpr cextent = ResolveLoopLets(consumer.region[dim]->extent, info);
+      if (HasUnknownLoopIndex(pmin, info) ||
+          HasUnknownLoopIndex(pextent, info) ||
+          HasUnknownLoopIndex(cmin, info) ||
+          HasUnknownLoopIndex(cextent, info)) {
+        continue;
+      }
+      if (info.var.defined() && later_iteration.empty()) {
+        continue;
+      }
+      cmin = Substitute(cmin, later_iteration);
+      cextent = Substitute(cextent, later_iteration);
+      if (analyzer.CanProve(pmin + pextent <= cmin) ||
+          analyzer.CanProve(cmin + cextent <= pmin)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   static constexpr SunmmioSyncUnits kTileMemoryUnits =
       kSunmmioSyncVector | kSunmmioSyncRsram;
   static constexpr SunmmioSyncUnits kLinkUnits =
@@ -641,6 +847,141 @@ private:
     }
   }
 
+  static Accesses CollectLoopAccesses(const Stmt &body) {
+    class Collector : public StmtExprVisitor {
+    public:
+      Accesses accesses;
+
+    private:
+      void VisitStmt_(const SeqStmtNode *op) final {
+        for (const Stmt &stmt : op->seq) {
+          VisitStmt(stmt);
+          const auto *evaluate = stmt.as<EvaluateNode>();
+          const auto *call =
+              evaluate ? evaluate->value.as<CallNode>() : nullptr;
+          if (call && (call->op.same_as(builtin::break_loop()) ||
+                       call->op.same_as(builtin::continue_loop()) ||
+                       call->op.same_as(builtin::ret()))) {
+            break;
+          }
+        }
+      }
+
+      void VisitStmt_(const BufferStoreNode *op) final {
+        if (IsRsramBuffer(op->buffer)) {
+          Region region;
+          for (const PrimExpr &index : op->indices) {
+            region.push_back(Range::FromMinExtent(index, 1));
+          }
+          accesses.push_back({op->buffer, std::move(region), true,
+                              AccessProducerKind::kTileStore,
+                              kTileMemoryUnits});
+        }
+        StmtExprVisitor::VisitStmt_(op);
+      }
+
+      void VisitExpr_(const BufferLoadNode *op) final {
+        if (IsRsramBuffer(op->buffer)) {
+          Region region;
+          for (const PrimExpr &index : op->indices) {
+            region.push_back(Range::FromMinExtent(index, 1));
+          }
+          accesses.push_back({op->buffer, std::move(region), false,
+                              AccessProducerKind::kTileLoad, kTileMemoryUnits});
+        }
+        StmtExprVisitor::VisitExpr_(op);
+      }
+
+      void VisitExpr_(const CallNode *op) final {
+        Accesses args;
+        bool completed_inline = false;
+        if (GetAsyncAccesses(op, &accesses, &args, &completed_inline) ||
+            GetTileCompoundAccesses(op, &accesses, &args)) {
+          MergeAccesses(&accesses, args);
+          return;
+        }
+        if (op->op.same_as(dist_put_())) {
+          CollectRegionArgumentLoads(op, {0, 1}, &accesses);
+          accesses.push_back(
+              MakeRegionAccess(NormalizeToBufferRegion(op->args[0]), false,
+                               AccessProducerKind::kAsync, kSunmmioSyncNone));
+          return;
+        }
+        StmtExprVisitor::VisitExpr_(op);
+      }
+    } collector;
+    collector(body);
+    return std::move(collector.accesses);
+  }
+
+  SunmmioSyncUnits CompleteAllocationAccesses(size_t first) {
+    SunmmioSyncUnits units = kSunmmioSyncNone;
+    for (const UnitAccess &access : pending_) {
+      for (size_t index = first; index < active_allocations_.size(); ++index) {
+        if (access.buffer->data.same_as(active_allocations_[index])) {
+          units |= access.units;
+        }
+      }
+    }
+    CompleteUnits(units);
+    return units;
+  }
+
+  static void CompleteStateUnits(FlowState *state, SunmmioSyncUnits units) {
+    auto &pending = state->pending;
+    pending.erase(std::remove_if(pending.begin(), pending.end(),
+                                 [&](const UnitAccess &access) {
+                                   return (units & access.units) ==
+                                          access.units;
+                                 }),
+                  pending.end());
+  }
+
+  static SunmmioSyncUnits CarriedSync(const FlowState &state,
+                                      const Accesses &consumers,
+                                      const LoopInfo &info) {
+    SunmmioSyncUnits units = kSunmmioSyncNone;
+    if (info.var.defined()) {
+      arith::Analyzer analyzer;
+      if (analyzer.CanProve(info.step > 0) &&
+          analyzer.CanProve(info.domain->extent <= info.step)) {
+        return units;
+      }
+    }
+    if (state.reachable) {
+      for (const UnitAccess &producer : state.pending) {
+        for (const UnitAccess &consumer : consumers) {
+          if (NeedsUnitSync(producer, consumer) &&
+              OverlapAcrossIterations(producer, consumer, info)) {
+            units |= producer.units;
+          }
+        }
+      }
+    }
+    return units;
+  }
+
+  static Stmt AddContinueSyncs(
+      Stmt body,
+      const std::unordered_map<const EvaluateNode *, SunmmioSyncUnits> &waits) {
+    class Rewriter : public StmtMutator {
+    public:
+      explicit Rewriter(const std::unordered_map<const EvaluateNode *,
+                                                 SunmmioSyncUnits> &waits)
+          : waits_(waits) {}
+
+    private:
+      Stmt VisitStmt_(const EvaluateNode *op) final {
+        auto found = waits_.find(op);
+        return found == waits_.end()
+                   ? ffi::GetRef<Stmt>(op)
+                   : PrependSync(ffi::GetRef<Stmt>(op), found->second);
+      }
+      const std::unordered_map<const EvaluateNode *, SunmmioSyncUnits> &waits_;
+    } rewriter(waits);
+    return rewriter(std::move(body));
+  }
+
   SunmmioSyncUnits RequiredSync(const std::vector<UnitAccess> &accesses) const {
     SunmmioSyncUnits required = kSunmmioSyncNone;
     for (const UnitAccess &consumer : accesses) {
@@ -702,7 +1043,7 @@ private:
   Stmt VisitStmt_(const SeqStmtNode *op) final {
     Array<Stmt> sequence;
     for (const Stmt &stmt : op->seq) {
-      Stmt rewritten = VisitStmt(stmt);
+      Stmt rewritten = reachable_ ? VisitStmt(stmt) : stmt;
       if (const auto *nested = rewritten.as<SeqStmtNode>()) {
         for (const Stmt &child : nested->seq) {
           sequence.push_back(child);
@@ -716,6 +1057,25 @@ private:
 
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *call = op->value.as<CallNode>();
+    if (call && call->op.same_as(builtin::ret())) {
+      SunmmioSyncUnits units = DrainPending();
+      reachable_ = false;
+      return PrependSync(ffi::GetRef<Stmt>(op), units);
+    }
+    if (call && (call->op.same_as(builtin::break_loop()) ||
+                 call->op.same_as(builtin::continue_loop()))) {
+      ICHECK(!loop_stack_.empty()) << "Unit sync: loop jump outside a loop";
+      SunmmioSyncUnits units =
+          CompleteAllocationAccesses(loop_stack_.back().allocation_depth);
+      if (call->op.same_as(builtin::break_loop())) {
+        loop_stack_.back().breaks =
+            Join(std::move(loop_stack_.back().breaks), GetState());
+      } else {
+        loop_stack_.back().continues.emplace_back(op, GetState());
+      }
+      reachable_ = false;
+      return PrependSync(ffi::GetRef<Stmt>(op), units);
+    }
     if (call && call->op.same_as(sunmmio_sync())) {
       ICHECK_EQ(call->args.size(), 1U);
       const auto *units = call->args[0].as<IntImmNode>();
@@ -810,7 +1170,15 @@ private:
     std::vector<UnitAccess> accesses;
     CollectTileLoads(op->value, &accesses);
     SunmmioSyncUnits required = ProcessAccesses(accesses);
-    return PrependSync(StmtMutator::VisitStmt_(op), required);
+    Stmt body = VisitStmt(op->body);
+    LoopInfo scope;
+    scope.local_vars.insert(op->var.get());
+    if (!dist_transform::RouteExprBufferLoadDetector().Detect(op->value) &&
+        SideEffect(op->value) <= CallEffectKind::kPure) {
+      scope.let_values.Set(op->var, op->value);
+    }
+    SetState(CoverLoopState(GetState(), scope));
+    return PrependSync(LetStmt(op->var, op->value, body, op->span), required);
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
@@ -834,7 +1202,16 @@ private:
     }
     CollectTileLoads(op->condition, &accesses);
     SunmmioSyncUnits required = ProcessAccesses(accesses);
-    return PrependSync(StmtMutator::VisitStmt_(op), required);
+    active_allocations_.push_back(op->buffer_var);
+    Stmt body = VisitStmt(op->body);
+    if (reachable_) {
+      body = AppendSync(std::move(body), CompleteAllocationAccesses(
+                                             active_allocations_.size() - 1));
+    }
+    active_allocations_.pop_back();
+    return PrependSync(Allocate(op->buffer_var, op->dtype, op->extents,
+                                op->condition, body, op->annotations, op->span),
+                       required);
   }
 
   Stmt VisitStmt_(const BufferRealizeNode *op) final {
@@ -856,76 +1233,99 @@ private:
   }
 
   Stmt VisitStmt_(const IfThenElseNode *op) final {
-    // A unit sync is safe on a path that did not submit work. Draining at
-    // structured-control-flow boundaries avoids recreating token SSA while
-    // preserving correctness for path-dependent pending work.
-    SunmmioSyncUnits prefix = DrainPending();
-
-    pending_.clear();
     std::vector<UnitAccess> condition_loads;
     CollectTileLoads(op->condition, &condition_loads);
-    RecordAccesses(condition_loads);
-    std::vector<UnitAccess> branch_entry = pending_;
-
+    SunmmioSyncUnits prefix = ProcessAccesses(condition_loads);
+    FlowState entry = GetState();
     Stmt then_case = VisitStmt(op->then_case);
-    then_case = AppendSync(std::move(then_case), DrainPending());
-
+    FlowState then_state = GetState();
+    SetState(entry);
     Stmt else_case;
     if (op->else_case.defined()) {
-      pending_ = branch_entry;
       else_case = VisitStmt(op->else_case.value());
-      else_case = AppendSync(std::move(else_case), DrainPending());
-    } else {
-      pending_ = branch_entry;
-      SunmmioSyncUnits false_path_units = DrainPending();
-      if (false_path_units != kSunmmioSyncNone) {
-        else_case = MakeSync(false_path_units);
-      }
     }
-    pending_.clear();
+    SetState(Join(std::move(then_state), GetState()));
     Stmt rewritten = IfThenElse(op->condition, then_case, else_case, op->span);
     return PrependSync(std::move(rewritten), prefix);
   }
 
-  Stmt VisitStmt_(const ForNode *op) final {
-    // Conservatively drain at entry and at each backedge. Straight-line code
-    // remains dependency-driven; loop overlap can be recovered later with a
-    // dedicated unit-aware loop-carried analysis.
-    SunmmioSyncUnits prefix = DrainPending();
-    pending_.clear();
-    std::vector<UnitAccess> header_loads;
-    CollectTileLoads(op->min, &header_loads);
-    CollectTileLoads(op->extent, &header_loads);
-    if (op->step.has_value()) {
-      CollectTileLoads(op->step.value(), &header_loads);
+  Stmt RewriteLoop(const Stmt &original_body, const ForNode *for_loop,
+                   const WhileNode *while_loop) {
+    LoopInfo info = MakeLoopInfo(original_body, for_loop);
+    Accesses consumers = CollectLoopAccesses(original_body);
+    Accesses header_loads;
+    if (for_loop) {
+      CollectTileLoads(for_loop->min, &header_loads);
+      CollectTileLoads(for_loop->extent, &header_loads);
+      if (for_loop->step.has_value()) {
+        CollectTileLoads(for_loop->step.value(), &header_loads);
+      }
+    } else {
+      CollectTileLoads(while_loop->condition, &header_loads);
+      MergeAccesses(&consumers, header_loads);
     }
+
+    Accesses covered_consumers;
+    for (const UnitAccess &access : consumers) {
+      covered_consumers.push_back(CoverLoopAccess(access, info));
+    }
+    // Only work launched before the loop can be waited here. Header loads are
+    // recorded afterwards because their evaluation still belongs to the loop.
+    SunmmioSyncUnits prefix = SynchronizeBeforeLoads(header_loads);
+    prefix |= SynchronizeBeforeLoads(covered_consumers);
     RecordAccesses(header_loads);
-    SunmmioSyncUnits header_units = PendingUnits();
-    Stmt body = VisitStmt(op->body);
-    body = AppendSync(std::move(body), DrainPending());
-    pending_.clear();
-    Stmt loop = For(op->loop_var, op->min, op->extent, op->kind, body,
-                    op->thread_binding, op->annotations, op->step, op->span);
-    loop = AppendSync(std::move(loop), header_units);
+    FlowState entry = GetState();
+    loop_stack_.push_back({{{}, false}, {}, active_allocations_.size()});
+    Stmt body = VisitStmt(original_body);
+    FlowState normal = GetState();
+    LoopFrame exits = std::move(loop_stack_.back());
+    loop_stack_.pop_back();
+
+    SunmmioSyncUnits normal_units = CarriedSync(normal, consumers, info);
+    if (normal.reachable) {
+      body = AppendSync(std::move(body), normal_units);
+      CompleteStateUnits(&normal, normal_units);
+    }
+    FlowState outgoing = Join(entry, CoverLoopState(normal, info));
+    outgoing = Join(std::move(outgoing), CoverLoopState(exits.breaks, info));
+    std::unordered_map<const EvaluateNode *, SunmmioSyncUnits> continue_waits;
+    for (auto &[jump, state] : exits.continues) {
+      SunmmioSyncUnits units = CarriedSync(state, consumers, info);
+      continue_waits.emplace(jump, units);
+      CompleteStateUnits(&state, units);
+      outgoing = Join(std::move(outgoing), CoverLoopState(state, info));
+    }
+    body = AddContinueSyncs(std::move(body), continue_waits);
+    SetState(outgoing);
+    Stmt loop =
+        for_loop
+            ? Stmt(For(for_loop->loop_var, for_loop->min, for_loop->extent,
+                       for_loop->kind, body, for_loop->thread_binding,
+                       for_loop->annotations, for_loop->step, for_loop->span))
+            : Stmt(While(while_loop->condition, body, while_loop->span));
     return PrependSync(std::move(loop), prefix);
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    if (is_zero(op->extent)) {
+      Accesses header_loads;
+      CollectTileLoads(op->min, &header_loads);
+      if (op->step.has_value()) {
+        CollectTileLoads(op->step.value(), &header_loads);
+      }
+      return PrependSync(ffi::GetRef<Stmt>(op), ProcessAccesses(header_loads));
+    }
+    return RewriteLoop(op->body, op, nullptr);
   }
 
   Stmt VisitStmt_(const WhileNode *op) final {
-    SunmmioSyncUnits prefix = DrainPending();
-    pending_.clear();
-    std::vector<UnitAccess> condition_loads;
-    CollectTileLoads(op->condition, &condition_loads);
-    RecordAccesses(condition_loads);
-    SunmmioSyncUnits condition_units = PendingUnits();
-    Stmt body = VisitStmt(op->body);
-    body = AppendSync(std::move(body), DrainPending());
-    pending_.clear();
-    Stmt loop = While(op->condition, body, op->span);
-    loop = AppendSync(std::move(loop), condition_units);
-    return PrependSync(std::move(loop), prefix);
+    return RewriteLoop(op->body, nullptr, op);
   }
 
   std::vector<UnitAccess> pending_;
+  bool reachable_{true};
+  std::vector<LoopFrame> loop_stack_;
+  std::vector<Var> active_allocations_;
 };
 
 class InjectBroadcastBarriersRewriter : public StmtMutator {
