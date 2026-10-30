@@ -5,8 +5,10 @@ import pytest
 import tilelang
 import tilelang.language as T
 from tilelang import tvm
+from tilelang.language.utils import region
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import (
+    collect_calls,
     collect_op_names,
 )
 
@@ -132,11 +134,97 @@ def test_manual_completion_wait_any_supports_every_signal_kind(signal_kind):
     planned = result.pass_snapshot("tl.PlanDistSignals").mod["main"]
     assert int(planned.attrs["tl.dist.signal_counts"][signal_kind.value]) == 2
     lowered = result.pass_snapshot("tl.LowerDistCommunication").mod
-    assert collect_op_names(lowered).count("tl.dist_completion_init_") == 1
+    initializers = collect_calls(lowered, "tl.dist_completion_init_")
+    assert len(initializers) == 1
+    initializer = initializers[0]
+    state_dtype = "uint64" if signal_kind.value.endswith("memory") else "uint8"
+    # The group target and this completion's snapshot follow the physical
+    # counter width; pending bookkeeping is independent of that width.
+    for state_region in initializer.args[:2]:
+        assert state_region.args[0].buffer.dtype == state_dtype
+    assert initializer.args[2].args[0].buffer.dtype == "uint8"
+    assert initializer.args[3].buffer.dtype == "int32"
     assert collect_op_names(lowered).count("tl.dist_wait_any_") == 1
     injected = result.pass_snapshot("tl.LowerDistSync").mod
     assert "tl.dist_completion_init_" not in collect_op_names(injected)
     assert collect_op_names(result.device_mod).count("tl.dist_wait_any_") == 1
+
+
+@pytest.mark.parametrize("constant_deltas", [False, True], ids=["runtime-delta", "constant-delta"])
+@pytest.mark.parametrize(
+    "state_dtype, initial, deltas, expected",
+    [
+        pytest.param("uint8", [250, 17], [256, 0], [250, 17], id="byte-full-wrap-stays-pending"),
+        pytest.param("uint8", [255, 17], [1, 0], [0, 17], id="byte-boundary-wrap"),
+        pytest.param("uint64", [2**32 - 1, 2**32 + 17], [2, 0], [2**32 + 1, 2**32 + 17], id="memory-crosses-u32"),
+    ],
+)
+def test_completion_initialization_preserves_counter_width_and_pending(state_dtype, initial, deltas, expected, constant_deltas):
+    """Evaluate the real expanded stores with boundary inputs, without a NIC."""
+    group_expect = tvm.tir.decl_buffer((2,), state_dtype, name="group_expect", scope="local")
+    snapshot = tvm.tir.decl_buffer((2,), state_dtype, name="snapshot", scope="local")
+    pending = tvm.tir.decl_buffer((2,), "uint8", name="pending", scope="local")
+    pending_count = tvm.tir.decl_buffer((1,), "int32", name="pending_count", scope="local.var")
+    delta_buffer = tvm.tir.decl_buffer((2,), "uint32", name="deltas", scope="local")
+    delta_values = [tvm.tir.const(value, "uint32") if constant_deltas else delta_buffer[i] for i, value in enumerate(deltas)]
+    initializer = tvm.tir.call_intrin(
+        "handle",
+        tvm.ir.Op.get("tl.dist_completion_init_"),
+        region(group_expect[0], "rw", 2),
+        region(snapshot[0], "w", 2),
+        region(pending[0], "w", 2),
+        pending_count[0],
+        tvm.tir.const(True, "bool"),
+        *delta_values,
+    )
+    buffers = (group_expect, snapshot, pending, pending_count, delta_buffer)
+    func = tvm.tir.PrimFunc(
+        [buffer.data for buffer in buffers],
+        tvm.tir.Evaluate(initializer),
+        buffer_map={buffer.data: buffer for buffer in buffers},
+    ).with_attr("tl.dist.world_size", 4)
+    lowered = tilelang.transform.LowerDistSync()(tvm.IRModule({"main": func}))
+    assert "tl.dist_completion_init_" not in collect_op_names(lowered)
+    # Exercise the production simplifier before substituting runtime inputs:
+    # a literal delta of 256 must not leave an invalid uint8(256) cast.
+    if constant_deltas:
+        lowered = tilelang.transform.Simplify()(lowered)
+    statements = lowered["main"].body.seq
+    assert all(isinstance(stmt, tvm.tir.BufferStore) for stmt in statements)
+
+    memory = {
+        group_expect.data: list(initial),
+        snapshot.data: [0, 0],
+        pending.data: [0, 0],
+        pending_count.data: [0],
+        delta_buffer.data: list(deltas),
+    }
+    analyzer = tvm.arith.Analyzer()
+
+    def evaluate_constants(node):
+        if isinstance(node, tvm.tir.BufferLoad):
+            index = int(analyzer.simplify(node.indices[0]))
+            return tvm.tir.const(memory[node.buffer.data][index], node.dtype)
+        if isinstance(node, tvm.tir.Call) and node.op.name == "tir.bitwise_and":
+            # Analyzer does not fold unsigned bitwise operations. Evaluate the
+            # mask emitted by the pass; casts themselves must simplify normally.
+            lhs, rhs = [analyzer.simplify(arg) for arg in node.args]
+            if isinstance(lhs, tvm.tir.IntImm) and isinstance(rhs, tvm.tir.IntImm):
+                return tvm.tir.const(int(lhs) & int(rhs), node.dtype)
+        return None
+
+    for store in statements:
+        value = tvm.tir.stmt_functor.ir_transform(
+            tvm.tir.Evaluate(store.value), None, evaluate_constants, ["tir.BufferLoad", "tir.Call"]
+        ).value
+        value = analyzer.simplify(value)
+        assert isinstance(value, tvm.tir.IntImm)
+        memory[store.buffer.data][int(store.indices[0])] = int(value)
+
+    assert memory[group_expect.data] == expected
+    assert memory[snapshot.data] == expected
+    assert memory[pending.data] == [1, 0]
+    assert memory[pending_count.data] == [1]
 
 
 def test_auto_completion_captures_only_current_put_members():

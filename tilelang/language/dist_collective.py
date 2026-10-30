@@ -187,17 +187,35 @@ def all_to_all(
     src,
     dst,
     *,
-    signal: Signal,
+    signal: Signal | None = None,
+    signals: SignalList | None = None,
     domain: CollectiveDomain | str = CollectiveDomain.RANK,
     group=None,
     submit: bool = False,
 ):
-    """Enqueue an equal-size exchange among Rank or Rank-row endpoints."""
+    """Enqueue an equal-size exchange among Rank or Rank-row endpoints.
+
+    Pass exactly one of ``signal`` or ``signals``. SignalList mode returns a
+    DistCompletion with one member per source endpoint (Rank-major for ROW).
+    Local-Rank slots are handled by local transfers and have no pending remote
+    notification. Use ``wait_all(completion)`` or ``wait_any(completion)`` for
+    receiver completion, and ``wait()`` for sender completion before reuse.
+    """
 
     if group is not None:
         raise NotImplementedError("T.dist.all_to_all group is reserved for future subgroup support")
     normalized_domain = _normalize_collective_domain(domain)
-    _check_collective_signal(signal, "T.dist.all_to_all")
+    if (signal is None) == (signals is None):
+        raise TypeError("T.dist.all_to_all requires exactly one of signal or signals")
+    if signal is not None:
+        _check_collective_signal(signal, "T.dist.all_to_all")
+        signal_resource = signal.handle
+    else:
+        if not isinstance(signals, SignalList):
+            raise TypeError(f"signals must be created by T.dist.signals, got {type(signals).__name__}")
+        if signals._expect_mode == ExpectMode.MANUAL:
+            raise ValueError("T.dist.all_to_all manages expected values internally and cannot use expect='manual'")
+        signal_resource = signals._as_group_handle()
     _begin_submit_sugar(submit)
 
     from .comm import _compact_shape_equal, _const_int, _prepare_comm_region_compact, get_target_mesh_shape
@@ -220,6 +238,11 @@ def all_to_all(
     prefix_extents = [world_size]
     if normalized_domain == CollectiveDomain.ROW:
         prefix_extents.append(get_target_mesh_shape()["nrow"])
+    endpoint_count = 1
+    for extent in prefix_extents:
+        endpoint_count *= extent
+    if signals is not None and len(signals) != endpoint_count:
+        raise ValueError(f"T.dist.all_to_all domain={normalized_domain.value!r} requires {endpoint_count} signals, got {len(signals)}")
     if len(src_region.extents) < len(prefix_extents):
         raise ValueError(f"T.dist.all_to_all domain={normalized_domain.value!r} requires {len(prefix_extents)} leading endpoint dimensions")
     for dim, expected in enumerate(prefix_extents):
@@ -235,10 +258,17 @@ def all_to_all(
         src_region.region,
         dst_region.region,
         tir.StringImm(normalized_domain.value),
-        signal.handle,
+        signal_resource,
         _current_core_id(),
     )
-    return _finish_enqueue(call, submit)
+    if signal is not None:
+        return _finish_enqueue(call, submit)
+    completion_frame = tir_builder.LetStmt(call)
+    builder = _current_dist_builder()
+    builder.enter_frame(completion_frame)
+    if submit:
+        builder.eval(tir.call_intrin("handle", tir.op.Op.get("tl.dist_submit")))
+    return DistCompletion(completion_frame.var, signals, builder)
 
 
 def all_reduce(src, dst, reduce_type: str = "sum", *, signal: Signal, group=None):

@@ -1,6 +1,6 @@
 import os
 
-
+import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
@@ -11,6 +11,8 @@ from tilelang.utils.target import determine_target
 from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import (
     assert_source_contains,
+    codegen_sunmmio_suvm_mlir,
+    lower_sunmmio_kernel_to_device_tir,
     validate_suvm_mlir_with_npuir_opt,
     validate_sunmmio_codegen_with_npuir_opt,
 )
@@ -89,6 +91,7 @@ def allocate_dma_copy_kernel_plus(
     block_N=32,
     block_K=32,
     dtype=T.bfloat16,
+    unaligned_axis=None,
 ):
     shard_policy = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, K))
@@ -104,6 +107,7 @@ def allocate_dma_copy_kernel_plus(
             _, sharded_N = C.local_shape
             grid_m = T.ceildiv(sharded_M, block_M)
             grid_k = T.ceildiv(sharded_K, block_K)
+            grid_n = T.ceildiv(sharded_N, block_N)
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
             C_shared = T.alloc_shared((block_M, block_N), dtype)
@@ -111,10 +115,17 @@ def allocate_dma_copy_kernel_plus(
             for bx in T.serial(T.ceildiv(sharded_N, block_N)):
                 # Index exprs: add/mul/rem/min/max on DMA copy paths.
                 ko = (bx + bx) % grid_k
-                m_tile = (bx % grid_m) * block_M
+                m_index = bx % grid_m
+                m_tile = m_index * block_M
                 n_tile = bx * block_N
-                m_offset = m_tile + T.min(T.min(bx, 1), T.max(sharded_M - m_tile - block_M, 0))
-                n_offset = n_tile + T.min(T.max(bx - 1, 0), T.max(sharded_N - n_tile - block_N, 0))
+                if unaligned_axis == "m":
+                    m_offset = m_tile + T.min(T.min(bx, 1), T.max(sharded_M - m_tile - block_M, 0))
+                else:
+                    m_offset = (m_index + T.min(T.min(bx, 1), T.max(grid_m - m_index - 1, 0))) * block_M
+                if unaligned_axis == "n":
+                    n_offset = n_tile + T.min(T.max(bx - 1, 0), T.max(sharded_N - n_tile - block_N, 0))
+                else:
+                    n_offset = (bx + T.min(T.max(bx - 1, 0), T.max(grid_n - bx - 1, 0))) * block_N
 
                 T.copy(A[m_offset, ko * block_K], A_shared)
                 T.copy(A[ko * block_K, n_offset], B_shared)
@@ -190,7 +201,10 @@ def offset_region_copy_kernel_plus(
     tile_M=32,
     tile_N=32,
     dtype=T.bfloat16,
+    unaligned_operand=None,
 ):
+    assert block_M >= tile_M > 0 and block_M % tile_M == 0
+    assert block_N >= tile_N > 0 and block_N % tile_N == 0
     shard_policy = T.placement.full_shard(0, 1)
     A_layout = make_zz_layout((M, N))
     B_layout = make_zz_layout((M, N))
@@ -236,10 +250,22 @@ def offset_region_copy_kernel_plus(
                         T.max((sum_idx * 5) % 11, 0),
                         T.min(by + 3, 7),
                     )
-                    src_row = by * block_M + 8 + row_delta
-                    src_col = bx * block_N + 8 + col_delta
-                    rsram_row = 8 + T.min(row_delta, 7)
-                    rsram_col = 8 + T.min(col_delta, 7)
+                    # Select whole tiles inside each block, preserving the
+                    # expression coverage without truncating an element offset.
+                    row_slot = row_delta % (block_M // tile_M)
+                    col_slot = col_delta % (block_N // tile_N)
+                    if unaligned_operand == "source":
+                        src_row = by * block_M + 8 + row_delta
+                        src_col = bx * block_N + 8 + col_delta
+                    else:
+                        src_row = by * block_M + row_slot * tile_M
+                        src_col = bx * block_N + col_slot * tile_N
+                    if unaligned_operand == "destination":
+                        rsram_row = 8 + T.min(row_delta, 7)
+                        rsram_col = 8 + T.min(col_delta, 7)
+                    else:
+                        rsram_row = row_slot * tile_M
+                        rsram_col = col_slot * tile_N
 
                     T.copy(
                         A[src_row : src_row + tile_M, src_col : src_col + tile_N],
@@ -354,6 +380,16 @@ def test_allocate_dma_copy_codegen_validates_with_npuir_opt(tmp_path):
     )
 
 
+@pytest.mark.parametrize("axis,dimension", [("m", 0), ("n", 1)])
+def test_allocate_dma_copy_rejects_unaligned_element_offsets(monkeypatch, axis, dimension):
+    import tilelang.utils.target as target_utils
+
+    monkeypatch.setattr(target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", False)
+    mod = lower_sunmmio_kernel_to_device_tir(allocate_dma_copy_kernel_plus(unaligned_axis=axis))
+    with pytest.raises(tvm.error.InternalError, match=rf"copy source buffer A region min at dim {dimension} must be provably aligned"):
+        codegen_sunmmio_suvm_mlir(mod)
+
+
 def test_pipelined_allocate_copy_mma_codegen_propagates_ping_pong(tmp_path):
     validate_sunmmio_codegen_with_npuir_opt(
         pipelined_allocate_copy_mma_kernel(),
@@ -400,6 +436,16 @@ def test_offset_region_copy_codegen_validates_with_npuir_opt(tmp_path):
             "arith.maxsi",
         ),
     )
+
+
+@pytest.mark.parametrize("operand", ["source", "destination"])
+def test_offset_region_copy_rejects_unaligned_element_offsets(monkeypatch, operand):
+    import tilelang.utils.target as target_utils
+
+    monkeypatch.setattr(target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", False)
+    mod = lower_sunmmio_kernel_to_device_tir(offset_region_copy_kernel_plus(unaligned_operand=operand))
+    with pytest.raises(tvm.error.InternalError, match=rf"copy {operand} buffer .* must be provably aligned to region extent 32"):
+        codegen_sunmmio_suvm_mlir(mod)
 
 
 def test_non_tile_expr_codegen_validates_with_npuir_opt(tmp_path):

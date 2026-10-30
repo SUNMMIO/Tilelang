@@ -16,6 +16,7 @@
 #include <utility>
 #include <vector>
 
+#include "../layout/cute_layout.h"
 #include "../op/comm.h"
 #include "../op/copy.h"
 #include "../op/utils.h"
@@ -104,6 +105,13 @@ private:
 
     const Buffer &src = src_br->buffer;
     const Buffer &dst = dst_br->buffer;
+    if (is_copy &&
+        (sunmmio::IsMXDType(src->dtype) || sunmmio::IsMXDType(dst->dtype))) {
+      ICHECK(src->dtype == dst->dtype)
+          << "Sunmmio T.copy does not support implicit MX dtype conversion: "
+          << src->name << " (" << src->dtype << ") -> " << dst->name << " ("
+          << dst->dtype << "). Use explicit MX quantization/dequantization.";
+    }
     CommunicationDirections communication_directions =
         CommunicationDirections::kNone;
     if (is_copy && SupportsSunmmioDirectCopy(target_, src.scope(), src->dtype,

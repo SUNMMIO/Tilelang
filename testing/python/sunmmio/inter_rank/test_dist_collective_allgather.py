@@ -9,7 +9,9 @@ import tilelang.language as T
 from tilelang import tvm
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import (
+    collect_calls,
     collect_dist_put_kinds,
+    collect_nodes,
     collect_op_names,
     lower_collectives,
 )
@@ -441,3 +443,139 @@ def test_allgather_accepts_constant_nonzero_region_offsets():
     func = constant_offset_allgather_kernel_factory.get_tir(world_size=4)
     lowered = lower_collectives(func)
     assert collect_op_names(lowered).count("tl.tileop.dist_put") == 3
+
+
+@tilelang.jit(target="sunmmio")
+def loop_offset_allgather_kernel_factory(axis=None, error=None, wait_mode="all", world_size: int = 1):
+    rounds, block, width = 3, 32, 128
+    source_shape = ((rounds + (1 if error == "unaligned" else 0)) * block, width)
+    if axis is None:
+        destination_shape = (world_size, rounds * block, width)
+    elif axis == 0:
+        destination_shape = (world_size * rounds * block, width)
+    else:
+        destination_shape = (rounds * block, world_size * width)
+
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, runtime: T.int32):
+        with T.Kernel() as core:
+            source = T.alloc_shared(source_shape, T.bfloat16)
+            destination = T.alloc_shared(destination_shape, T.bfloat16)
+            offsets = T.alloc_shared((rounds,), T.int32)
+            ready = T.dist.signals(world_size)
+            for b in T.serial(runtime if error == "dynamic_loop" else rounds):
+                begin = b * block
+                if error == "rank":
+                    begin = b * block + rank_id * block
+                elif error == "core":
+                    begin = b * block + core * block
+                elif error == "data":
+                    begin = offsets[b]
+                elif error == "nonaffine":
+                    begin = b * b * block
+                elif error == "unaligned":
+                    begin = b * block + 1
+                elif error == "bounds":
+                    begin = (b + 1) * block
+                dst_begin = 0 if error == "reuse" else b * block
+                if axis is None:
+                    done = T.dist.all_gather(
+                        source[begin : begin + block, :], destination[:, dst_begin : dst_begin + block, :], signals=ready, submit=True
+                    )
+                elif axis == 0:
+                    done = T.dist.all_gather(
+                        source[begin : begin + block, :],
+                        destination[dst_begin * world_size : (dst_begin + block) * world_size, :],
+                        axis=0,
+                        signals=ready,
+                        submit=True,
+                    )
+                else:
+                    done = T.dist.all_gather(
+                        source[begin : begin + block, :], destination[dst_begin : dst_begin + block, :], axis=-1, signals=ready, submit=True
+                    )
+                if wait_mode == "all":
+                    T.dist.wait_all(done)
+                elif wait_mode == "any":
+                    while T.dist.has_pending(done):
+                        T.dist.wait_any(done)
+                elif wait_mode == "conditional":  # noqa: SIM102 - retain a runtime TIR branch
+                    if runtime > 0:
+                        T.dist.wait_all(done)
+
+    return main
+
+
+@pytest.mark.parametrize("axis", [None, 0, -1])
+@pytest.mark.parametrize("wait_mode", ["all", "any"])
+def test_allgather_loop_offsets_preserve_source_and_destination_slots(axis, wait_mode):
+    func = loop_offset_allgather_kernel_factory.get_tir(axis=axis, wait_mode=wait_mode, world_size=2)
+    result = lower_to_device_tir(func, capture_passes="tl.LowerDistCollectives")
+    # Sender completion is now inserted automatically by LowerDistSync.
+    assert "tl.dist_wait_send" in collect_op_names(result.device_mod)
+    expanded = result.pass_snapshot("tl.LowerDistCollectives").mod
+    puts = collect_calls(expanded, "tl.tileop.dist_put")
+    assert len(puts) == 1
+    loop = collect_nodes(expanded, tvm.tir.For)[0]
+    rank = func.params[int(func.attrs["tl.dist.rank_id_param_index"])]
+    # Resolve frontend Let aliases before checking the generated addresses.
+    bindings = {node.var: node.value for node in collect_nodes(expanded, tvm.tir.LetStmt) if str(node.var.dtype) == "int32"}
+    analyzer = tvm.arith.Analyzer()
+    for iteration in range(3):
+        for source_rank in range(2):
+            values = {loop.loop_var: tvm.tir.IntImm("int32", iteration), rank: tvm.tir.IntImm("int32", source_rank)}
+            for var, value in bindings.items():
+                values[var] = analyzer.simplify(tvm.tir.stmt_functor.substitute(value, values))
+            src = [int(analyzer.simplify(tvm.tir.stmt_functor.substitute(x, values))) for x in puts[0].args[0].args[0].indices]
+            dst = [int(analyzer.simplify(tvm.tir.stmt_functor.substitute(x, values))) for x in puts[0].args[1].args[0].indices]
+            assert src == [iteration * 32, 0]
+            expected = (
+                [source_rank, iteration * 32, 0]
+                if axis is None
+                else [iteration * 64 + source_rank * 32, 0]
+                if axis == 0
+                else [iteration * 32, source_rank * 128]
+            )
+            assert dst == expected
+    assert collect_op_names(result.device_mod).count("tl.dist_wait_any_") == 1
+
+
+@pytest.mark.parametrize(
+    "error,message",
+    [
+        ("rank", "Rank/core-uniform"),
+        ("core", "Rank/core-uniform"),
+        ("data", "Rank/core-uniform"),
+        ("nonaffine", "must be affine"),
+        ("unaligned", "align to per-peer"),
+        ("bounds", "in bounds"),
+        ("reuse", "independent destination slots"),
+        ("dynamic_loop", "statically bounded serial loops"),
+    ],
+)
+def test_allgather_loop_offsets_reject_unsupported_addresses(error, message):
+    func = loop_offset_allgather_kernel_factory.get_tir(error=error, world_size=2)
+    with pytest.raises(tvm.error.InternalError, match=message):
+        lower_collectives(func)
+
+
+@pytest.mark.parametrize("wait_mode", ["no_wait", "conditional"])
+def test_allgather_loop_offsets_require_iteration_completion(wait_mode):
+    func = loop_offset_allgather_kernel_factory.get_tir(wait_mode=wait_mode, world_size=2)
+    with pytest.raises(tvm.error.InternalError, match="same iteration"):
+        lower_collectives(func)
+
+
+def test_allgather_loop_offsets_reject_conditional_block_wait():
+    func = loop_offset_allgather_kernel_factory.get_tir(world_size=2)
+    rank = func.params[int(func.attrs["tl.dist.rank_id_param_index"])]
+
+    def guard_wait(node):
+        call = node.value
+        if isinstance(call, tvm.tir.Call) and call.op.name == "tl.dist_wait_completion_all":
+            return tvm.tir.BlockRealize([], rank == 0, tvm.tir.Block([], [], [], "guard_wait", node))
+        return None
+
+    body = tvm.tir.stmt_functor.ir_transform(func.body, None, guard_wait, ["tir.Evaluate"])
+    with pytest.raises(tvm.error.InternalError, match="same iteration"):
+        lower_collectives(func.with_body(body))

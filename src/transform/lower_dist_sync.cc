@@ -47,6 +47,37 @@ BufferRegions MergeRegions(const BufferRegions &lhs, const BufferRegions &rhs) {
   return merged;
 }
 
+BufferRegions WidenLoopSourceRegions(
+    const BufferRegions &regions,
+    const std::unordered_set<const VarNode *> &loop_local_vars) {
+  BufferRegions widened;
+  for (const BufferRegion &region : regions) {
+    Region bounds;
+    for (size_t dim = 0; dim < region->region.size(); ++dim) {
+      const Range &range = region->region[dim];
+      bool changes = false;
+      auto check = [&](const ObjectRef &node) {
+        if (const auto *var = node.as<VarNode>()) {
+          changes |= loop_local_vars.count(var) != 0;
+        }
+        changes |= node.as<BufferLoadNode>() != nullptr;
+      };
+      PostOrderVisit(range->min, check);
+      PostOrderVisit(range->extent, check);
+      // An address captured by an earlier send must not be compared using the
+      // next iteration's values. Retain invariant dimensions, but
+      // conservatively cover a varying dimension until cross-iteration bounds
+      // are available.
+      bounds.push_back(changes
+                           ? Range::FromMinExtent(make_zero(range->min.dtype()),
+                                                  region->buffer->shape[dim])
+                           : range);
+    }
+    AddUniqueRegion(&widened, BufferRegion(region->buffer, std::move(bounds)));
+  }
+  return widened;
+}
+
 bool SameRegionSet(const BufferRegions &lhs, const BufferRegions &rhs) {
   if (lhs.size() != rhs.size()) {
     return false;
@@ -235,14 +266,21 @@ private:
     ICHECK(!AnyRegionOverlaps(queued_sources_, writes))
         << "T.dist source is modified before its queued batch is submitted ("
         << description << ")";
-    if (!AnyRegionOverlaps(inflight_sources_, writes)) {
-      return false;
+    bool needs_wait = AnyRegionOverlaps(inflight_sources_, writes);
+    if (needs_wait) {
+      // dist_wait_send completes the whole local send channel, not just the
+      // conflicting region.
+      inflight_sources_.clear();
+      channel_in_flight_ = false;
     }
-    // dist_wait_send completes the whole local send channel, not just the
-    // conflicting region.
-    inflight_sources_.clear();
-    channel_in_flight_ = false;
-    return true;
+    for (BufferRegions *sources : {&queued_sources_, &inflight_sources_}) {
+      for (BufferRegion &source : *sources) {
+        source = BufferRegion(
+            source->buffer,
+            WidenRegionForIndexWrites(source->buffer, source->region, writes));
+      }
+    }
+    return needs_wait;
   }
 
   bool UsesAllocationLeavingCurrentLoop(const BufferRegions &regions) const {
@@ -309,7 +347,27 @@ private:
     SetState(Join(then_state, else_state));
   }
 
-  void VisitLoop(const Stmt &body) {
+  void VisitLoop(const Stmt &body, const Var &loop_var = Var()) {
+    std::unordered_set<const VarNode *> loop_local_vars;
+    if (loop_var.defined()) {
+      loop_local_vars.insert(loop_var.get());
+    }
+    PostOrderVisit(body, [&](const ObjectRef &node) {
+      if (const auto *loop = node.as<ForNode>()) {
+        loop_local_vars.insert(loop->loop_var.get());
+      } else if (const auto *let = node.as<LetStmtNode>()) {
+        loop_local_vars.insert(let->var.get());
+      } else if (const auto *let = node.as<LetNode>()) {
+        loop_local_vars.insert(let->var.get());
+      }
+    });
+    auto widen = [&](State state) {
+      state.queued_sources =
+          WidenLoopSourceRegions(state.queued_sources, loop_local_vars);
+      state.inflight_sources =
+          WidenLoopSourceRegions(state.inflight_sources, loop_local_vars);
+      return state;
+    };
     State incoming = GetState();
     State entry = incoming;
     loop_exits_.emplace_back();
@@ -319,10 +377,10 @@ private:
       State body_state = VisitBranch(body, entry);
       // Continue reaches the next iteration; break only reaches the loop exit.
       State backedge = Join(body_state, loop_exits_.back().continues);
-      State next = Join(incoming, backedge);
+      State next = Join(incoming, widen(std::move(backedge)));
       if (SameLoopState(next, entry)) {
         // Include zero iterations and exhaustion after a normal/continue path.
-        SetState(Join(next, loop_exits_.back().breaks));
+        SetState(Join(next, widen(loop_exits_.back().breaks)));
         break;
       }
       entry = next;
@@ -340,7 +398,7 @@ private:
     }
     VisitExpr(op->min);
     VisitExpr(op->extent);
-    VisitLoop(op->body);
+    VisitLoop(op->body, op->loop_var);
   }
 
   void VisitStmt_(const WhileNode *op) final {
@@ -450,6 +508,10 @@ private:
       bool nonempty = queue_pending_;
       if (!nonempty && loop_exits_.empty()) {
         empty_submits_.insert(op);
+        // Removing an empty submit also removes its channel-idle wait. Keep
+        // earlier in-flight sources protected until a real wait completes them.
+        strict_batch_open_ = false;
+        return;
       }
       // Every retained submit receives a channel-idle wait during rewriting,
       // so prior in-flight sources are complete before this batch starts.
@@ -629,6 +691,18 @@ public:
   }
 
 private:
+  PrimExpr CastSignalDelta(DataType dtype, PrimExpr delta) {
+    if (dtype == DataType::UInt(8) && delta.dtype().bits() > 8) {
+      // TVM's constant cast rejects uint8(256). Normalize before narrowing,
+      // including when a dynamic delta later becomes constant during lowering.
+      if (const auto *value = delta.as<IntImmNode>()) {
+        return make_const(dtype, value->value & 255);
+      }
+      delta = bitwise_and(delta, make_const(delta.dtype(), 255));
+    }
+    return Cast(dtype, delta);
+  }
+
   Stmt VisitStmt_(const EvaluateNode *evaluate_node) final {
     const auto *call = evaluate_node->value.as<CallNode>();
     if (!call) {
@@ -680,7 +754,9 @@ private:
     if (call->op.same_as(dist_expect_())) {
       ICHECK_EQ(call->args.size(), 2U);
       BufferLoad expected = RequireLocalState(call->args[0], "expected");
-      PrimExpr delta = Cast(expected->dtype, call->args[1]);
+      // Convert to the signal width before arithmetic: uint8 wraps modulo 256,
+      // while uint64 memory expectations retain accumulated high bits.
+      PrimExpr delta = CastSignalDelta(expected->dtype, call->args[1]);
       PrimExpr next = Cast(expected->dtype, expected + delta);
       return BufferStore(expected->buffer, next, expected->indices);
     }
@@ -751,6 +827,8 @@ private:
     for (int64_t index = 0; index < endpoint_count; ++index) {
       PrimExpr delta = call->args[5 + index];
       ICHECK(delta.dtype().is_int() || delta.dtype().is_uint());
+      // A positive delta may wrap to zero at the signal width (e.g. 256).
+      // Pending membership uses the original delta, not the narrowed value.
       PrimExpr active = delta > make_zero(delta.dtype());
       PrimExpr signal_index =
           signal_expect->region[0]->min + IntImm(DataType::Int(32), index);
@@ -759,10 +837,11 @@ private:
       PrimExpr pending_index =
           pending->region[0]->min + IntImm(DataType::Int(32), index);
       PrimExpr current = BufferLoad(signal_expect->buffer, {signal_index});
+      PrimExpr typed_delta =
+          CastSignalDelta(signal_expect->buffer->dtype, delta);
       PrimExpr next =
           Cast(signal_expect->buffer->dtype,
-               current + Select(advance_expected,
-                                Cast(signal_expect->buffer->dtype, delta),
+               current + Select(advance_expected, typed_delta,
                                 make_zero(signal_expect->buffer->dtype)));
       statements.push_back(
           BufferStore(completion_expect->buffer, next, {completion_index}));
@@ -783,8 +862,10 @@ private:
     ICHECK(load) << "T.dist " << name << " state must be a BufferLoad, got "
                  << expr;
     ICHECK((load->dtype.is_int() || load->dtype.is_uint()) &&
-           (load->dtype.bits() == 8 || load->dtype.bits() == 32))
-        << "T.dist " << name << " state must use an 8- or 32-bit integer dtype";
+           (load->dtype.bits() == 8 || load->dtype.bits() == 32 ||
+            load->dtype.bits() == 64))
+        << "T.dist " << name
+        << " state must use an 8-, 32-, or 64-bit integer dtype";
     return tvm::ffi::GetRef<BufferLoad>(load);
   }
 

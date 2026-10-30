@@ -1044,7 +1044,7 @@ private:
               call->args[0].as<VarNode>() == group_) {
             std::string mode =
                 RequireStringImm(call->args.back(), "completion mode");
-            uses_row_domain |= mode == "row";
+            uses_row_domain |= mode == "row" || mode == "all_to_all_row";
             uses_auto_completion |= mode == "auto";
           }
           StmtExprVisitor::VisitExpr_(call);
@@ -1639,13 +1639,18 @@ private:
       }
       return deltas;
     }
-    if (mode == "all_gather") {
+    if (mode == "all_gather" || mode == "all_to_all_rank" ||
+        mode == "all_to_all_row") {
       ICHECK_EQ(call->args.size(), 2U);
       ICHECK_EQ(group.expect_mode, "auto");
-      ICHECK_EQ(group.count, world_size_);
+      int64_t row_count = mode == "all_to_all_row" ? mesh_nrows_ : 1;
+      ICHECK_EQ(group.count, world_size_ * row_count);
       for (int64_t index = 0; index < group.count; ++index) {
-        deltas.push_back(Cast(DataType::Int(32),
-                              rank_id_ != IntImm(rank_id_.dtype(), index)));
+        // Each remote source endpoint contributes once. Local-Rank transfers
+        // (including other rows) complete through the existing local path.
+        deltas.push_back(
+            Cast(DataType::Int(32),
+                 rank_id_ != IntImm(rank_id_.dtype(), index / row_count)));
       }
       return deltas;
     }
