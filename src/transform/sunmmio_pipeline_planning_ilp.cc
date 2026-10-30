@@ -4072,6 +4072,20 @@ private:
                                     "unsupported_statement");
       }
     }
+    for (const Stmt &stmt : pipeline_body_seq->seq) {
+      if (HardwareMapper::HasNestedHardwareCommands(stmt)) {
+        For sequential = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+        Map<String, Any> annotations;
+        for (const auto &kv : sequential->annotations) {
+          if (kv.first != "num_stages") {
+            annotations.Set(kv.first, kv.second);
+          }
+        }
+        sequential.CopyOnWrite()->annotations = annotations;
+        return MakePipelineFallback(sequential, "ilp", "planning",
+                                    "unsupported_nested_hardware_loop");
+      }
+    }
     int threads = GetEnvInt("HIGHS_THREADS", 20);
     IlpLoopAnalysis analysis;
     SolveResult sol;

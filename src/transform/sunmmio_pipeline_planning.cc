@@ -1855,6 +1855,11 @@ public:
         return MakePipelineFallback(fallback, "greedy", "planning",
                                     "unsupported_statement");
       }
+      if (HardwareMapper::HasNestedHardwareCommands(stmt)) {
+        For fallback = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+        return MakePipelineFallback(fallback, "greedy", "planning",
+                                    "unsupported_nested_hardware_loop");
+      }
       PipelineInstruction instruction(static_cast<int>(i), 0, stmt);
       instruction.device_type = HardwareMapper::Map(instruction.stmt);
       instruction.ExtractRegions(stmt_rw_collector_);

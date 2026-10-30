@@ -1,10 +1,13 @@
+import textwrap
+
+import pytest
+
 import tilelang as tl
 import tilelang.language as T
 from tilelang import tvm as tvm
 from tilelang.layout import make_zz_layout
 from tilelang.tileview import make_tileview
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
-import textwrap
 
 IRModule = tvm.IRModule
 
@@ -62,7 +65,14 @@ def single_tile_scope_kernel(block_m=32, block_n=32, tile_size=(8, 32), dtype="f
     return main
 
 
-def two_consecutive_tile_scopes_kernel(block_m=32, block_n=32, tile_size=(8, 32), dtype="float16"):
+def two_consecutive_tile_scopes_kernel(
+    block_m=32,
+    block_n=32,
+    tile_size=(8, 32),
+    dtype="float16",
+    first_unroll=None,
+    second_unroll=None,
+):
     @T.prim_func
     def main(A: T.Tensor((block_m, block_n), dtype), B: T.Tensor((block_m, block_n), dtype)):
         with T.Kernel(1, threads=128) as (bx,):
@@ -86,9 +96,9 @@ def two_consecutive_tile_scopes_kernel(block_m=32, block_n=32, tile_size=(8, 32)
             )
 
             T.copy(A[0:block_m, 0:block_n], A_shared)
-            for i, j in T.Tiles([block_m, block_n], parallel=True):
+            for i, j in T.Tiles([block_m, block_n], parallel=True, unroll=first_unroll):
                 Tmp_shared[i, j] = A_shared[i, j]
-            for i, j in T.Tiles([block_m, block_n], parallel=True):
+            for i, j in T.Tiles([block_m, block_n], parallel=True, unroll=second_unroll):
                 B_shared[i, j] = Tmp_shared[i, j]
             T.copy(B_shared, B[0:block_m, 0:block_n])
 
@@ -917,6 +927,37 @@ def test_sunmmio_tile_loop_fusion_rewrites_consecutive_tile_scopes():
     )
 
     assert _semantic_tags(_expect_loop_body_seq(fused_loop)) == ["Tmp_shared", "B_shared"]
+
+
+@pytest.mark.parametrize(
+    ("first_unroll", "second_unroll", "expected_unroll"),
+    (
+        (None, None, None),
+        (None, 4, 4),
+        (4, None, 4),
+        (4, 2, 2),
+        (2, 4, 2),
+        (8, 16, 8),
+    ),
+)
+def test_sunmmio_tile_loop_fusion_merges_unroll_hints(first_unroll, second_unroll, expected_unroll):
+    kernel = two_consecutive_tile_scopes_kernel(
+        first_unroll=first_unroll,
+        second_unroll=second_unroll,
+    )
+    mod = IRModule.from_expr(kernel.with_attr("global_symbol", "main"))
+    mod = apply_sunmmio_tile_loop_fusion(mod)
+
+    fused_loop = _expect_single_match(
+        _find_scope_entry_loops(_tilelang_root_seq(mod), tile_size=[8, 32], extent=4),
+        lambda loop: _semantic_tags(_expect_loop_body_seq(loop)) == ["Tmp_shared", "B_shared"],
+        "fused tile shell with merged unroll hint",
+    )
+    annotations = _for_annotations(fused_loop)
+    if expected_unroll is None:
+        assert "tile.loop_unroll" not in annotations
+    else:
+        assert int(annotations["tile.loop_unroll"]) == expected_unroll
 
 
 def test_sunmmio_tile_loop_fusion_rewrites_buffer_access_predicates():

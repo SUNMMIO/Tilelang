@@ -73,7 +73,11 @@ def Parallel(
     return _ffi_api.Parallel(extents, annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 
-def Tiles(domain: tir.Buffer | Iterable[int | tir.PrimExpr], parallel: bool = False):
+def Tiles(
+    domain: tir.Buffer | Iterable[int | tir.PrimExpr],
+    parallel: bool = False,
+    unroll: int | None = None,
+):
     """Construct a tiled loop over an explicit logical domain.
 
     The preferred form is ``T.Tiles([m, n], parallel=True)`` where the
@@ -83,7 +87,18 @@ def Tiles(domain: tir.Buffer | Iterable[int | tir.PrimExpr], parallel: bool = Fa
     parallel:
         True  -> no loop-carried dependency
         False -> loop carries dependency (e.g. reduction)
+
+    unroll:
+        Optional backend loop-unroll tuning factor. Supported values are
+        1, 2, 4, 8, and 16.
     """
+    supported_unroll_factors = (1, 2, 4, 8, 16)
+    if unroll is not None:
+        if type(unroll) is not int:
+            raise TypeError("T.Tiles unroll must be a static Python integer")
+        if unroll not in supported_unroll_factors:
+            raise ValueError(f"T.Tiles unroll must be one of {supported_unroll_factors}, but got {unroll}")
+
     if isinstance(domain, tir.Buffer):
         extents = tuple(domain.shape)
     else:
@@ -97,6 +112,8 @@ def Tiles(domain: tir.Buffer | Iterable[int | tir.PrimExpr], parallel: bool = Fa
         # and after passing through the `Tilesloop` pass, it set to 2.
         "tile.loop_stage": tir.IntImm("int32", 0),
     }
+    if unroll is not None:
+        annotations["tile.loop_unroll"] = tir.IntImm("int32", unroll)
     return _ffi_api.Tiles(extents, annotations)  # type: ignore[attr-defined] # pylint: disable=no-member
 
 

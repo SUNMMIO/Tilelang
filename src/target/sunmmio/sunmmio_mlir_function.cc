@@ -1,8 +1,12 @@
 #include "sunmmio_mlir_function.h"
 
+#include "../../transform/common/attr.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/Verifier.h"
@@ -22,6 +26,7 @@ void SunmmioMlirFunction::BeginModule() {
   ctx_.mlir_ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
   ctx_.mlir_ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
   ctx_.mlir_ctx.getOrLoadDialect<mlir::cf::ControlFlowDialect>();
+  ctx_.mlir_ctx.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
 
   ctx_.module = mlir::ModuleOp::create(ctx_.builder.getUnknownLoc());
   ctx_.module->getOperation()->setAttr(
@@ -109,6 +114,20 @@ void SunmmioMlirFunction::BeginFor(
 
   mlir::scf::ForOp for_op = mlir::scf::ForOp::create(
       ctx_.builder, type_.Loc(), lb_v, ub_v, step_v, init_args);
+  auto unroll_it = annotations.find(tl::attr::kTileLoopUnroll);
+  if (unroll_it != annotations.end()) {
+    const auto *factor = (*unroll_it).second.as<tir::IntImmNode>();
+    ICHECK(factor) << "`" << tl::attr::kTileLoopUnroll
+                   << "` must be an integer annotation";
+    mlir::IntegerAttr count =
+        ctx_.builder.getI32IntegerAttr(static_cast<int32_t>(factor->value));
+    mlir::LLVM::LoopUnrollAttr unroll = mlir::LLVM::LoopUnrollAttr::get(
+        &ctx_.mlir_ctx, {}, count, {}, {}, {}, {}, {});
+    mlir::LLVM::LoopAnnotationAttr loop = mlir::LLVM::LoopAnnotationAttr::get(
+        &ctx_.mlir_ctx, {}, {}, {}, unroll, {}, {}, {}, {}, {}, {}, {}, {}, {},
+        {}, {});
+    for_op->setDiscardableAttr(mlir::LLVM::getLoopAnnotationAttrName(), loop);
+  }
 
   SunmmioMlirContext::ForFrame frame;
   frame.op = for_op;

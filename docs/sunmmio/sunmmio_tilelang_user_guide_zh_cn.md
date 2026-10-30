@@ -769,7 +769,7 @@ ODMA 转置是异步操作，编译器会在后续依赖访问之前插入同步
 **`T.Tiles`**
 
 ```python
-for i, j in T.Tiles(domain, parallel=False):
+for i, j in T.Tiles(domain, parallel=False, unroll=None):
     ...
 ```
 
@@ -777,9 +777,11 @@ for i, j in T.Tiles(domain, parallel=False):
 
 - `domain`：循环逻辑域。推荐写显式 shape，例如 `[block_M, block_N]`；也可以传 buffer，表示使用 `buffer.shape`。
 - `parallel`：是否声明不同 tile 迭代之间无跨迭代依赖，默认 `False`。
+- `unroll`：可选的 best-effort 循环展开调优提示，支持 `1`、`2`、`4`、`8`、`16`，默认 `None` 表示不发出提示。只有 `T.Tiles` 成功合法化为原生 tile loop 时才会向后传递；若 TileView 规划回退为标量循环，编译器会删除该提示并输出诊断。多个 tile scope 融合时，未设置的提示被忽略，多个显式值取最小值。
 - 返回值：tile loop 迭代变量，变量个数由 `domain` rank 决定。
 
 当循环体中存在累加、归约或跨迭代依赖时，不要把 `parallel` 设为 `True`。
+`unroll` 不会启用 fast-math，也不保证最终后端一定展开循环。后续优化可以保留、修改或忽略该提示，因此优化后的 LLVM IR 和最终 ELF 可能完全不变。应把它作为 kernel 调优参数，并针对目标 workload 检查正确性、代码尺寸、寄存器/栈使用量和 cycle 数。
 
 ### 3.6 核间通讯
 
