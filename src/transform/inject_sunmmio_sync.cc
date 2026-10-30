@@ -1009,6 +1009,23 @@ private:
     pending_.insert(pending_.end(), accesses.begin(), accesses.end());
   }
 
+  void InvalidatePendingIndices(const std::vector<BufferRegion> &writes) {
+    for (UnitAccess &access : pending_) {
+      access.region = dist_transform::WidenRegionForIndexWrites(
+          access.buffer, access.region, writes);
+    }
+  }
+
+  void InvalidatePendingIndices(const Accesses &accesses) {
+    std::vector<BufferRegion> writes;
+    for (const UnitAccess &access : accesses) {
+      if (access.write) {
+        writes.emplace_back(access.buffer, access.region);
+      }
+    }
+    InvalidatePendingIndices(writes);
+  }
+
   SunmmioSyncUnits ProcessAccesses(const std::vector<UnitAccess> &accesses,
                                    bool completed_inline = false) {
     SunmmioSyncUnits required = RequiredSync(accesses);
@@ -1130,6 +1147,7 @@ private:
       // their memory accesses pending for later statements without introducing
       // a same-statement dependency that could only be synchronized too early.
       RecordAccesses(argument_loads);
+      InvalidatePendingIndices(accesses);
       return PrependSync(StmtMutator::VisitStmt_(op), required);
     }
 
@@ -1137,6 +1155,7 @@ private:
       SunmmioSyncUnits required = SynchronizeBeforeLoads(argument_loads);
       required |= ProcessAccesses(accesses);
       RecordAccesses(argument_loads);
+      InvalidatePendingIndices(accesses);
       return PrependSync(StmtMutator::VisitStmt_(op), required);
     }
 
@@ -1154,15 +1173,19 @@ private:
     if (op->predicate.defined()) {
       CollectTileLoads(op->predicate.value(), &accesses);
     }
+    Region region;
+    for (const PrimExpr &index : op->indices) {
+      region.push_back(Range::FromMinExtent(index, 1));
+    }
     if (IsRsramBuffer(op->buffer)) {
-      Region region;
-      for (const PrimExpr &index : op->indices) {
-        region.push_back(Range::FromMinExtent(index, 1));
-      }
-      accesses.push_back({op->buffer, std::move(region), true,
+      accesses.push_back({op->buffer, region, true,
                           AccessProducerKind::kTileStore, kTileMemoryUnits});
     }
     SunmmioSyncUnits required = ProcessAccesses(accesses);
+    // local.var stores do not issue unit work, but can change the addresses of
+    // earlier pending operations just like writes to an index tensor can.
+    InvalidatePendingIndices(
+        std::vector<BufferRegion>{BufferRegion(op->buffer, std::move(region))});
     return PrependSync(StmtMutator::VisitStmt_(op), required);
   }
 

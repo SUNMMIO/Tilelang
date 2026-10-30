@@ -58,6 +58,50 @@ def test_local_producer_wait_survives_loop_jump_before_dist_send(jump):
 
 
 @tilelang.jit(target="sunmmio")
+def producer_mutable_index_kernel_factory(branch=True, world_size: int = 1):
+    placement = T.placement.replicated()
+
+    @T.prim_func
+    def main(A: T.MeshTensor((32,), placement, T.bfloat16), initial: T.int32, enabled: T.int32, rank_id: T.dist.RankId):
+        with T.Kernel():
+            src = T.alloc_shared((128,), T.bfloat16)
+            dst = T.alloc_shared((32,), T.bfloat16)
+            position = T.alloc_var(T.int32, init=initial)
+            signal = T.dist.signal(expect="manual")
+            T.copy(A, src[position * 32 : (position + 1) * 32])
+            if branch:
+                if enabled > 0:
+                    position += 1
+                    T.dist.put(
+                        src[(position - 1) * 32 : position * 32],
+                        dst,
+                        (rank_id + 1) % world_size,
+                        signal=signal,
+                        submit=True,
+                    )
+            else:
+                position += 1
+                T.dist.put(
+                    src[(position - 1) * 32 : position * 32],
+                    dst,
+                    (rank_id + 1) % world_size,
+                    signal=signal,
+                    submit=True,
+                )
+
+    return main
+
+
+@pytest.mark.parametrize("branch", [False, True])
+def test_mutable_index_update_preserves_local_producer_wait(branch):
+    result = lower_to_device_tir(producer_mutable_index_kernel_factory.get_tir(branch=branch, world_size=2))
+    script = result.device_mod.script()
+    producer = script.index("T.sunmmio_layout_transform(")
+    put = script.index("T.dist_put_(")
+    assert "T.sunmmio_sync(2)" in script[producer:put]
+
+
+@tilelang.jit(target="sunmmio")
 def minimal_put_kernel_factory(M, N, world_size: int = 1):
     placement = T.placement.full_shard(0, 1)
 

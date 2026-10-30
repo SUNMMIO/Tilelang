@@ -266,14 +266,21 @@ private:
     ICHECK(!AnyRegionOverlaps(queued_sources_, writes))
         << "T.dist source is modified before its queued batch is submitted ("
         << description << ")";
-    if (!AnyRegionOverlaps(inflight_sources_, writes)) {
-      return false;
+    bool needs_wait = AnyRegionOverlaps(inflight_sources_, writes);
+    if (needs_wait) {
+      // dist_wait_send completes the whole local send channel, not just the
+      // conflicting region.
+      inflight_sources_.clear();
+      channel_in_flight_ = false;
     }
-    // dist_wait_send completes the whole local send channel, not just the
-    // conflicting region.
-    inflight_sources_.clear();
-    channel_in_flight_ = false;
-    return true;
+    for (BufferRegions *sources : {&queued_sources_, &inflight_sources_}) {
+      for (BufferRegion &source : *sources) {
+        source = BufferRegion(
+            source->buffer,
+            WidenRegionForIndexWrites(source->buffer, source->region, writes));
+      }
+    }
+    return needs_wait;
   }
 
   bool UsesAllocationLeavingCurrentLoop(const BufferRegions &regions) const {

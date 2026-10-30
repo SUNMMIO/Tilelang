@@ -222,6 +222,66 @@ def source_lifetime_kernel_factory(mode="submitted_overlap", redundant_submit=Fa
 
 
 @tilelang.jit(target="sunmmio")
+def mutable_source_index_kernel_factory(submitted=True, mutate=True, world_size: int = 1):
+    @T.prim_func
+    def main(initial: T.int32, rank_id: T.dist.RankId):
+        with T.Kernel():
+            src = T.alloc_shared((128,), T.bfloat16)
+            dst = T.alloc_shared((32,), T.bfloat16)
+            position = T.alloc_var(T.int32, init=initial)
+            signal = T.dist.signal(expect="manual")
+            T.dist.put(
+                src[position * 32 : (position + 1) * 32],
+                dst,
+                (rank_id + 1) % world_size,
+                signal=signal,
+            )
+            if submitted:
+                T.dist.submit()
+            if mutate:
+                position += 1
+                src[(position - 1) * 32] = 0
+            else:
+                src[(position + 1) * 32] = 0
+            if not submitted:
+                T.dist.submit()
+
+    return main
+
+
+@pytest.mark.parametrize("submitted", [False, True])
+def test_mutable_source_index_update_preserves_source_protection(submitted):
+    func = mutable_source_index_kernel_factory.get_tir(submitted=submitted, world_size=2)
+    if not submitted:
+        with pytest.raises(tvm.error.InternalError, match="modified before its queued batch is submitted"):
+            lower_to_device_tir(func)
+        return
+    result = lower_to_device_tir(func, capture_passes="tl.LowerDistSync")
+    for mod in (result.pass_snapshot("tl.LowerDistSync").mod, result.device_mod):
+        events = _source_write_events(mod)
+        assert "tl.dist_wait_send" in events[events.index("tl.dist_submit_") + 1 : events.index("source_write")]
+
+
+def _source_write_events(mod):
+    events = []
+    for node in collect_nodes(mod, (tvm.tir.Evaluate, tvm.tir.BufferStore)):
+        if isinstance(node, tvm.tir.BufferStore):
+            if node.buffer.name == "src":
+                events.append("source_write")
+        elif isinstance(node.value, tvm.tir.Call) and isinstance(node.value.op, tvm.ir.Op):
+            events.append(node.value.op.name)
+    return events
+
+
+@pytest.mark.parametrize("submitted", [False, True])
+def test_unchanged_source_index_keeps_disjoint_access_legal(submitted):
+    result = lower_to_device_tir(mutable_source_index_kernel_factory.get_tir(submitted=submitted, mutate=False, world_size=2))
+    events = _source_write_events(result.device_mod)
+    # At most the existing pre-submit wait may precede the disjoint store.
+    assert events[: events.index("source_write")].count("tl.dist_wait_send") == int(submitted)
+
+
+@tilelang.jit(target="sunmmio")
 def loop_source_lifetime_kernel_factory(loop_kind="serial", submit_each=True, world_size: int = 1):
     step = 2 if loop_kind == "step" else 1
     inner_count = 2 if loop_kind == "nested" else 1
@@ -553,6 +613,58 @@ def _inject_queue_body(body, params=()):
     func = tvm.tir.PrimFunc(params, body).with_attr("tl.dist.world_size", 4)
     mod = tilelang.transform.LowerDistSync()(tvm.IRModule({"main": func}))
     return mod["main"]
+
+
+@pytest.mark.parametrize("submitted", [False, True])
+@pytest.mark.parametrize("index_write", ["alias", "async"])
+@pytest.mark.parametrize("payload_write", ["store", "async"])
+def test_index_storage_writes_preserve_queued_and_inflight_sources(submitted, index_write, payload_write):
+    src = tvm.tir.decl_buffer((128,), "bfloat16", name="src", scope="shared.rsram")
+    dst = tvm.tir.decl_buffer((32,), "bfloat16", name="dst", scope="shared.rsram")
+    index_scope = "shared.rsram" if index_write == "async" else "local.var"
+    index = tvm.tir.decl_buffer((32,), "int32", name="index", scope=index_scope)
+    alias = tvm.tir.decl_buffer(index.shape, index.dtype, name="alias", scope=index_scope, data=index.data)
+    seed = tvm.tir.decl_buffer((32,), "int32", name="seed", scope="global")
+
+    def region(buffer, access, start=0):
+        return tvm.tir.Call("handle", tvm.ir.Op.get("tl.tileop.region"), [buffer[start], access, 32])
+
+    def copy(source, destination):
+        unit = tvm.tir.Call("handle", tvm.ir.Op.get("tl.odma_unit"), [tvm.tir.StringImm("odma0")])
+        return _dist_leaf("dma_copy", source, destination, 0, unit)
+
+    statements = [
+        _dist_leaf(
+            "dist_put_",
+            region(src, 1, index[0] * 32),
+            region(dst, 2),
+            1,
+            "sram_flagreg_inc",
+            0,
+            tvm.tir.const(0, "uint8"),
+        )
+    ]
+    if submitted:
+        statements.append(_dist_leaf("dist_submit_"))
+    statements.append(copy(region(seed, 1), region(index, 2)) if index_write == "async" else tvm.tir.BufferStore(alias, alias[0] + 1, [0]))
+    position = (index[0] - 1) * 32
+    statements.append(
+        copy(region(dst, 1), region(src, 2, position))
+        if payload_write == "async"
+        else tvm.tir.BufferStore(src, tvm.tir.const(0, "bfloat16"), [position])
+    )
+    if not submitted:
+        statements.append(_dist_leaf("dist_submit_"))
+    body = tvm.tir.SeqStmt(statements)
+    params = [src.data, dst.data, index.data, seed.data]
+    if not submitted:
+        with pytest.raises(tvm.error.InternalError, match="modified before its queued batch is submitted"):
+            _inject_queue_body(body, params)
+        return
+    func = _inject_queue_body(body, params)
+    events = _source_write_events(func)
+    overwrite = events.index("source_write") if payload_write == "store" else len(events) - 1 - events[::-1].index("tl.dma_copy")
+    assert "tl.dist_wait_send" in events[events.index("tl.dist_submit_") + 1 : overwrite]
 
 
 def test_loop_carried_source_preserves_invariant_disjoint_dimensions():

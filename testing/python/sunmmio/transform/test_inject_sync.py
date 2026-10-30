@@ -313,6 +313,68 @@ def test_dist_put_waits_for_local_source_producer():
     assert dma_index < sync_index < put_index
 
 
+def _index_update_module(case):
+    scope = "shared.rsram" if case == "async" else "local.var"
+    index = tvm.tir.decl_buffer((1, 32), "int32", name="index", scope=scope)
+    alias = tvm.tir.decl_buffer(index.shape, index.dtype, name="index_alias", scope=scope, data=index.data)
+    seed = tvm.tir.decl_buffer(index.shape, index.dtype, name="seed", scope="global")
+    saved = tvm.tir.Var("saved", "int32")
+
+    def body(src, dst):
+        original = saved if case == "saved" else index[0, 0]
+        producer = _dma_regions(_region_at(src, 1, 0, 0, 16, 16), _region_at(dst, 2, 0, original * 16, 16, 16), unit="odma1")
+        if case == "async":
+            update = _dma_regions(_region_at(seed, 1, 0, 0, 1, 32), _region_at(index, 2, 0, 0, 1, 32))
+        else:
+            target = alias if case == "alias" else index
+            slot = 1 if case == "other_slot" else 0
+            update = tvm.tir.BufferStore(target, target[0, slot] + 1, [0, slot])
+        row = 16 if case == "other_row" else 0
+        col = (original + 1) * 16 if case in ("saved", "other_slot") else (index[0, 0] - 1) * 16
+        consumer = tvm.tir.Evaluate(
+            tvm.tir.Call(
+                "handle",
+                tvm.ir.Op.get("tl.dist_put_"),
+                [
+                    _region_at(dst, 1, row, col, 16, 16),
+                    _region_at(src, 2, 0, 0, 16, 16),
+                    1,
+                    tvm.tir.StringImm("sram_flagreg_inc"),
+                    0,
+                    tvm.tir.const(0, "uint8"),
+                ],
+            )
+        )
+        statements = tvm.tir.SeqStmt([producer, update, consumer])
+        if case == "saved":
+            statements = tvm.tir.LetStmt(saved, index[0, 0], statements)
+        for buffer in (alias, index, seed):
+            statements = tvm.tir.DeclBuffer(buffer, statements)
+        return statements
+
+    mod = _make_module(body)
+    func = mod["main"]
+    return tvm.IRModule({"main": tvm.tir.PrimFunc([*func.params, index.data, seed.data], func.body, attrs=func.attrs)})
+
+
+@pytest.mark.parametrize("case", ["store", "alias", "async"])
+def test_index_writes_invalidate_pending_producer_addresses(case):
+    mod = _apply(_index_update_module(case))
+    script = mod.script()
+    put = script.index("T.dist_put_")
+    assert any(mask & 2 for mask in _sync_masks(mod))
+    # The ODMA1 producer is complete before its previously selected tile is sent.
+    assert "T.sunmmio_sync" in script[script.index("T.dma_copy") : put]
+
+
+@pytest.mark.parametrize("case", ["other_slot", "other_row", "saved"])
+def test_index_invalidation_preserves_proven_disjoint_accesses(case):
+    mod = _apply(_index_update_module(case))
+    # Neither an unrelated index slot, an invariant row nor an immutable let
+    # should turn the disjoint consumer into a dependency on ODMA1.
+    assert not any(mask & 2 for mask in _sync_masks(mod))
+
+
 def test_condition_load_is_synchronized_before_branch_async_write():
     zero = tvm.tir.IntImm("int32", 0)
 

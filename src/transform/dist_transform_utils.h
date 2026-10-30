@@ -221,6 +221,47 @@ inline bool BufferRegionsMayOverlap(const Buffer &lhs_buffer,
   return true;
 }
 
+// Regions describe addresses evaluated when an operation was issued. Once a
+// write changes memory used by an index, its old BufferLoad expression cannot
+// be interpreted using the new value. Forget only the affected dimensions;
+// immutable indices and disjoint index-storage writes retain their precision.
+inline Region
+WidenRegionForIndexWrites(const Buffer &buffer, const Region &region,
+                          const std::vector<BufferRegion> &writes) {
+  if (writes.empty()) {
+    return region;
+  }
+  Region widened;
+  for (size_t dim = 0; dim < region.size(); ++dim) {
+    const Range &range = region[dim];
+    bool changed = false;
+    auto check = [&](const ObjectRef &node) {
+      const auto *load = node.as<BufferLoadNode>();
+      if (!load || changed) {
+        return;
+      }
+      Region read;
+      for (const PrimExpr &index : load->indices) {
+        read.push_back(Range::FromMinExtent(index, 1));
+      }
+      for (const BufferRegion &write : writes) {
+        if (BufferRegionsMayOverlap(load->buffer, read, write->buffer,
+                                    write->region)) {
+          changed = true;
+          break;
+        }
+      }
+    };
+    PostOrderVisit(range->min, check);
+    PostOrderVisit(range->extent, check);
+    widened.push_back(changed
+                          ? Range::FromMinExtent(make_zero(range->min.dtype()),
+                                                 buffer->shape[dim])
+                          : range);
+  }
+  return widened;
+}
+
 inline bool IsMultiRank(const PrimFunc &func) {
   auto world_size = func->GetAttr<Integer>(kDistWorldSizeAttr);
   return world_size && world_size.value()->value > 1;
