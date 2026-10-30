@@ -7,6 +7,7 @@
 
 #include "../../op/utils.h"
 #include "../../target/sunmmio/hardware_types.h"
+#include "../../target/sunmmio/sunmmio_async_op_info.h"
 #include "../../target/sunmmio_utils.h"
 
 #include <algorithm>
@@ -23,6 +24,8 @@ enum class IlpResourceType : int {
   kVectorCore = 1,
   kODMA0 = 2,
   kODMA1 = 3,
+  kVLink = 4,
+  kHLink = 5,
   kWsramIn = 6,
   kWsramOut = 7,
   kAsramIn = 8,
@@ -69,35 +72,29 @@ BuildIlpResources(const Stmt &stmt, DeviceType type,
 
   if (const auto *eval = stmt.as<EvaluateNode>()) {
     if (const auto *call = eval->value.as<CallNode>()) {
-      if (call->op.same_as(Op::Get("tl.dma_copy")) ||
-          call->op.same_as(Op::Get("tl.broadcast_")) ||
-          call->op.same_as(Op::Get("tl.sunmmio_layout_transform")) ||
-          call->op.same_as(Op::Get("tl.sunmmio_transpose"))) {
-        BufferRegion src_region = NormalizeToBufferRegion(call->args[0]);
-        // broadcast_ argument layout is:
-        //   args[0] = src region
-        //   args[1] = dst region
-        //   args[2] = direction
-        // Resource typing only needs the source/destination buffers, so always
-        // read the destination from args[1]. Using args[2] treats the integer
-        // direction enum as a BufferRegion and crashes ILP planning.
-        BufferRegion dst_region = NormalizeToBufferRegion(call->args[1]);
+      SunmmioAsyncOpInfo info;
+      if (TryParseSunmmioAsyncODMAOp(call, &info)) {
         std::optional<SunmmioOdmaUnit> unit = GetSunmmioOdmaUnit(call);
         ICHECK(unit.has_value())
             << "Sunmmio pipeline planning requires resolved ODMA units";
         add_resource(static_cast<int>(*unit == SunmmioOdmaUnit::kOdma0
                                           ? IlpResourceType::kODMA0
                                           : IlpResourceType::kODMA1));
-        if (dst_region->buffer.scope() == "shared.wsram") {
+        if (info.path_kind == SunmmioODMAPathKind::kVLink) {
+          add_resource(static_cast<int>(IlpResourceType::kVLink));
+        } else if (info.path_kind == SunmmioODMAPathKind::kHLink) {
+          add_resource(static_cast<int>(IlpResourceType::kHLink));
+        }
+        if (info.dst->buffer.scope() == "shared.wsram") {
           add_resource(static_cast<int>(IlpResourceType::kWsramIn));
         }
-        if (dst_region->buffer.scope() == "shared.asram") {
+        if (info.dst->buffer.scope() == "shared.asram") {
           add_resource(static_cast<int>(IlpResourceType::kAsramIn));
         }
-        if (src_region->buffer.scope() == "shared.wsram") {
+        if (info.src->buffer.scope() == "shared.wsram") {
           add_resource(static_cast<int>(IlpResourceType::kWsramOut));
         }
-        if (src_region->buffer.scope() == "shared.asram") {
+        if (info.src->buffer.scope() == "shared.asram") {
           add_resource(static_cast<int>(IlpResourceType::kAsramOut));
         }
         return resources;
