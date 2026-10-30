@@ -5,6 +5,7 @@
 #ifndef TVM_TL_TRANSFORM_SUNMMIO_PIPELINE_PLANNING_HARDWARE_TYPES_H_
 #define TVM_TL_TRANSFORM_SUNMMIO_PIPELINE_PLANNING_HARDWARE_TYPES_H_
 
+#include "sunmmio_async_op_info.h"
 #include "tvm/runtime/logging.h"
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
@@ -45,12 +46,8 @@ public:
       }
       return DeviceType::VectorCore; // Default to VectorCore if not recognized
     } else if (const auto *eval = stmt.as<EvaluateNode>()) {
-      // Check for ODMA (dma_copy, broadcast_, etc.)
       if (const auto *call = eval->value.as<CallNode>()) {
-        if (call->op.same_as(Op::Get("tl.dma_copy")) ||
-            call->op.same_as(Op::Get("tl.broadcast_")) ||
-            call->op.same_as(Op::Get("tl.sunmmio_layout_transform")) ||
-            call->op.same_as(Op::Get("tl.sunmmio_transpose"))) {
+        if (IsSunmmioAsyncODMAOp(call)) {
           return DeviceType::ODMA;
         }
       }

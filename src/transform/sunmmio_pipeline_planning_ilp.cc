@@ -6,6 +6,7 @@
 #include "../op/utils.h"
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
+#include "../target/sunmmio/sunmmio_async_op_info.h"
 #include "common/ast_traverser.h"
 #include "common/sunmmio_pipeline_utils.h"
 #include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
@@ -120,6 +121,18 @@ struct Problem {
   std::vector<int> R;
   std::unordered_map<int, int> cap;
   std::vector<CommandSpec> P;
+  std::vector<CostEstimate> cost_estimates;
+  std::string cost_model_profile{"heuristic"};
+  bool strict_calibration{false};
+  int64_t solver_scale_factor{1};
+  bool solver_scaled{false};
+  int faster{1};
+  int latency_gcd{1};
+  bool disable_gcd_scaling{false};
+  bool gcd_scaling_enabled{true};
+  bool auto_faster_selected{false};
+  bool planner_fallback{false};
+  bool fallback_used{false};
   std::vector<std::pair<int, int>> dep_edges;
   std::unordered_map<long long, int> delta;
   std::vector<FlowSpec> flows;
@@ -498,6 +511,94 @@ void WriteJsonString(std::ostream &os, const std::string &value) {
   os << "\"" << JsonEscape(value) << "\"";
 }
 
+void WriteCostEstimateJson(std::ostream &out, const CostEstimate &estimate) {
+  out << "{";
+  out << "\"status\": ";
+  WriteJsonString(out, CostModel::StatusName(estimate.status));
+  out << ", \"profile\": ";
+  WriteJsonString(out, std::string(estimate.profile));
+  out << ", \"model_version\": ";
+  WriteJsonString(out, std::string(estimate.model_version));
+  out << ", \"latency_source\": ";
+  WriteJsonString(out, std::string(estimate.latency_source));
+  out << ", \"fallback_reason\": ";
+  WriteJsonString(out, std::string(estimate.fallback_reason));
+  out << ", \"op_kind\": ";
+  WriteJsonString(out, std::string(estimate.op_kind));
+  out << ", \"transfer_path\": ";
+  WriteJsonString(out, std::string(estimate.transfer_path));
+  out << ", \"src_scope\": ";
+  WriteJsonString(out, std::string(estimate.src_scope));
+  out << ", \"dst_scope\": ";
+  WriteJsonString(out, std::string(estimate.dst_scope));
+  out << ", \"input_dtype\": ";
+  WriteJsonString(out, std::string(estimate.input_dtype));
+  out << ", \"weight_dtype\": ";
+  WriteJsonString(out, std::string(estimate.weight_dtype));
+  out << ", \"output_dtype\": ";
+  WriteJsonString(out, std::string(estimate.output_dtype));
+  out << ", \"timing_origin\": ";
+  WriteJsonString(out, std::string(estimate.timing_origin));
+  out << ", \"timing_end\": ";
+  WriteJsonString(out, std::string(estimate.timing_end));
+  out << ", \"latency_cycles\": " << estimate.latency_cycles;
+  out << ", \"issue_start_cycles\": " << estimate.issue_start_cycles;
+  out << ", \"issue_finish_cycles\": " << estimate.issue_finish_cycles;
+  out << ", \"bytes\": " << estimate.bytes;
+  out << ", \"packet_count\": " << estimate.packet_count;
+  out << ", \"descriptor_count\": " << estimate.descriptor_count;
+  out << ", \"descriptor_fetch_cycles\": " << estimate.descriptor_fetch_cycles;
+  out << ", \"command_frontend_cycles\": " << estimate.command_frontend_cycles;
+  out << ", \"path_start_delay\": " << estimate.path_start_delay;
+  out << ", \"endpoint_completion_cycles\": "
+      << estimate.endpoint_completion_cycles;
+  out << ", \"link_completion_cycles\": " << estimate.link_completion_cycles;
+  out << ", \"issue_interval_cycles\": " << estimate.issue_interval_cycles;
+  out << ", \"odma_channel\": " << estimate.odma_channel;
+  out << ", \"odma_channel_mask\": " << estimate.odma_channel_mask;
+  out << ", \"row_size\": " << estimate.row_size;
+  out << ", \"col_size\": " << estimate.col_size;
+  out << ", \"reduction_size\": " << estimate.reduction_size;
+  out << ", \"vector_chunks\": " << estimate.vector_chunks;
+  out << ", \"load_ops\": " << estimate.load_ops;
+  out << ", \"store_ops\": " << estimate.store_ops;
+  out << ", \"arithmetic_ops\": " << estimate.arithmetic_ops;
+  out << ", \"compare_convert_ops\": " << estimate.compare_convert_ops;
+  out << ", \"nonlinear_ops\": " << estimate.nonlinear_ops;
+  out << ", \"reduce_ops\": " << estimate.reduce_ops;
+  out << ", \"galu_ops\": " << estimate.galu_ops;
+  out << ", \"exact_static_submodel\": " << estimate.exact_static_submodel;
+  out << ", \"used_fallback\": " << estimate.used_fallback;
+  out << ", \"solver_scale_factor\": " << estimate.solver_scale_factor;
+  out << ", \"solver_latency_cycles\": " << estimate.solver_latency_cycles;
+  out << ", \"solver_scaled\": " << estimate.solver_scaled;
+  out << ", \"endpoint_timing_modeled\": " << estimate.endpoint_timing_modeled;
+  out << ", \"resource_overlap_modeled\": "
+      << estimate.resource_overlap_modeled;
+  out << ", \"command_frontend_modeled\": "
+      << estimate.command_frontend_modeled;
+  out << ", \"descriptor_plan_modeled\": " << estimate.descriptor_plan_modeled;
+  out << ", \"link_completion_modeled\": " << estimate.link_completion_modeled;
+  out << "}";
+}
+
+void WriteCostModelJson(std::ostream &out, const Problem &prob) {
+  out << "{";
+  out << "\"profile\": ";
+  WriteJsonString(out, prob.cost_model_profile);
+  out << ", \"strict_calibration\": " << prob.strict_calibration;
+  out << ", \"solver_scale_factor\": " << prob.solver_scale_factor;
+  out << ", \"solver_scaled\": " << prob.solver_scaled;
+  out << ", \"faster\": " << prob.faster;
+  out << ", \"latency_gcd\": " << prob.latency_gcd;
+  out << ", \"disable_gcd_scaling\": " << prob.disable_gcd_scaling;
+  out << ", \"gcd_scaling_enabled\": " << prob.gcd_scaling_enabled;
+  out << ", \"auto_faster_selected\": " << prob.auto_faster_selected;
+  out << ", \"planner_fallback\": " << prob.planner_fallback;
+  out << ", \"fallback_used\": " << prob.fallback_used;
+  out << "}";
+}
+
 void WriteProblemJson(const Problem &prob, const std::string &path) {
   std::ofstream out(path);
   ICHECK(out.is_open()) << "Failed to open ILP problem json path: " << path;
@@ -505,6 +606,9 @@ void WriteProblemJson(const Problem &prob, const std::string &path) {
   out << "{\n";
   out << "  \"N\": " << prob.N << ",\n";
   out << "  \"Tmax\": " << prob.Tmax << ",\n";
+  out << "  \"cost_model\": ";
+  WriteCostModelJson(out, prob);
+  out << ",\n";
 
   out << "  \"R\": [";
   for (size_t i = 0; i < prob.R.size(); ++i) {
@@ -541,6 +645,12 @@ void WriteProblemJson(const Problem &prob, const std::string &path) {
     }
     out << "], \"name\": ";
     WriteJsonString(out, prob.P[i].name);
+    out << ", \"cost_estimate\": ";
+    if (i < static_cast<int>(prob.cost_estimates.size())) {
+      WriteCostEstimateJson(out, prob.cost_estimates[i]);
+    } else {
+      out << "null";
+    }
     out << "}";
     out << (i + 1 == prob.N ? "\n" : ",\n");
   }
@@ -694,6 +804,10 @@ std::string ResourceName(int r) {
     return "odma0";
   case static_cast<int>(IlpResourceType::kODMA1):
     return "odma1";
+  case static_cast<int>(IlpResourceType::kVLink):
+    return "vlink";
+  case static_cast<int>(IlpResourceType::kHLink):
+    return "hlink";
   case static_cast<int>(IlpResourceType::kWsramIn):
     return "wsram.in";
   case static_cast<int>(IlpResourceType::kWsramOut):
@@ -979,6 +1093,9 @@ void WriteSolutionJson(
   out << "{\n";
   out << "  \"ii\": " << sol.II << ",\n";
   out << "  \"makespan\": " << sol.makespan << ",\n";
+  out << "  \"cost_model\": ";
+  WriteCostModelJson(out, prob);
+  out << ",\n";
   out << "  \"wsram_flip\": " << sol.bank_flip_mode.wsram_flip << ",\n";
   out << "  \"asram_flip\": " << sol.bank_flip_mode.asram_flip << ",\n";
   out << "  \"vc_blocking_issue_modeled\": " << sol.vc_blocking_issue_modeled
@@ -1199,14 +1316,10 @@ private:
 
   void VisitStmt_(const EvaluateNode *op) final {
     if (const auto *call = op->value.as<CallNode>()) {
-      if (call->op.same_as(dma_copy())) {
-        AddAccess(NormalizeToBufferRegion(call->args[0]), false);
-        AddAccess(NormalizeToBufferRegion(call->args[1]), true);
-        return;
-      }
-      if (call->op.same_as(sunmmio_layout_transform())) {
-        AddAccess(NormalizeToBufferRegion(call->args[0]), false);
-        AddAccess(NormalizeToBufferRegion(call->args[1]), true);
+      SunmmioAsyncOpInfo async_info;
+      if (TryParseSunmmioAsyncODMAOp(call, &async_info)) {
+        AddAccess(async_info.src, false);
+        AddAccess(async_info.dst, true);
         return;
       }
       if (call->op.same_as(mma_sunmmio())) {
@@ -1215,11 +1328,6 @@ private:
         BufferRegion c_region = NormalizeToBufferRegion(call->args[2]);
         AddAccess(c_region, false);
         AddAccess(c_region, true);
-        return;
-      }
-      if (call->op.same_as(Op::Get("tl.broadcast_"))) {
-        AddAccess(NormalizeToBufferRegion(call->args[0]), false);
-        AddAccess(NormalizeToBufferRegion(call->args[1]), true);
         return;
       }
       if (call->op.same_as(Op::Get("tl.vector_core_in_tile_reduce"))) {
@@ -1595,6 +1703,7 @@ public:
   DeviceType type{DeviceType::Unspecified};
   std::vector<AccessInfo> accesses;
   CommandSpec spec;
+  CostEstimate cost_estimate;
 
   TemplateCommand(int id, const Stmt &stmt)
       : id(id), name("cmd_" + std::to_string(id)), stmt(stmt) {}
@@ -3605,6 +3714,9 @@ private:
     ASTTraverser traverser(func_);
     SunmmioRoleMarker role_marker(traverser, func_);
     SunmmioStmtAccessAnalyzer access_analyzer(func_);
+    CostModelContext cost_context = CostModel::BuildContext(func_);
+    const bool gem5_profile =
+        cost_context.options.profile == CostModelProfile::kGem5A4E2026;
     result.commands.reserve(pipeline_body_seq->seq.size());
 
     std::set<int> resource_set;
@@ -3616,8 +3728,11 @@ private:
       traverser.traverse_stmt(stmt);
       cmd.type = HardwareMapper::Map(stmt);
       cmd.accesses = access_analyzer.Collect(stmt, loop->loop_var);
-      cmd.spec.latency =
-          static_cast<int>(std::ceil(CostModel::EstimateDelay(cmd.type, stmt)));
+      cmd.cost_estimate = CostModel::Estimate(cmd.type, stmt, cost_context);
+      ICHECK_LE(cmd.cost_estimate.latency_cycles,
+                static_cast<int64_t>(std::numeric_limits<int>::max()))
+          << "ILP command latency exceeds int range";
+      cmd.spec.latency = static_cast<int>(cmd.cost_estimate.latency_cycles);
       cmd.spec.latency = std::max(cmd.spec.latency, 1);
       cmd.spec.resources = BuildIlpResources(stmt, cmd.type, cmd.accesses);
       cmd.spec.name = cmd.name + ": " + SummarizeStmtForName(stmt);
@@ -3644,6 +3759,7 @@ private:
     }
 
     int faster = 0;
+    bool auto_faster_selected = false;
     std::vector<int> bump_indices;
     {
       auto pass_ctx = tvm::transform::PassContext::Current();
@@ -3655,14 +3771,17 @@ private:
     if (faster <= 0) {
       faster = GetEnvInt("TL_SUNMMIO_FASTER", 0);
     }
-    if (faster <= 0) {
+    if (faster <= 0 && !gem5_profile) {
       auto auto_selected = AutoSelectSunmmioILPFaster(result.prob.P);
+      auto_faster_selected = true;
       faster = auto_selected.first;
       bump_indices = std::move(auto_selected.second);
     }
     if (faster <= 0) {
       faster = 1;
     }
+    ICHECK(!cost_context.options.strict_calibration || faster == 1)
+        << "Strict Gem5 calibration requires solver scale 1, got " << faster;
 
     std::unordered_set<int> bump_index_set(bump_indices.begin(),
                                            bump_indices.end());
@@ -3678,18 +3797,55 @@ private:
                         : GcdInt(latency_gcd, result.commands[i].spec.latency);
     }
 
-    if (latency_gcd <= 0) {
+    const bool disable_gcd_scaling =
+        GetEnvBool("TL_SUNMMIO_DISABLE_GCD_SCALING", false);
+    const bool gcd_scaling_enabled =
+        !disable_gcd_scaling && !cost_context.options.strict_calibration;
+    if (latency_gcd <= 0 || !gcd_scaling_enabled) {
       latency_gcd = 1;
     }
+    const int64_t solver_scale_factor =
+        static_cast<int64_t>(faster) * latency_gcd;
     for (TemplateCommand &cmd : result.commands) {
-      cmd.spec.latency /= latency_gcd;
-      if (faster > 1) {
-        cmd.spec.latency = CeilDiv(cmd.spec.latency, faster);
-      }
+      // Preserve raw hardware cycles in cost_estimate. The solver consumes
+      // ceil(raw / (faster * gcd)); use int64_t to avoid rounding overflow.
+      const int64_t solver_input_cycles = cmd.spec.latency;
+      cmd.spec.latency = static_cast<int>(
+          solver_input_cycles / solver_scale_factor +
+          (solver_input_cycles % solver_scale_factor != 0));
+      cmd.cost_estimate.solver_scale_factor = solver_scale_factor;
+      cmd.cost_estimate.solver_latency_cycles = cmd.spec.latency;
+      cmd.cost_estimate.solver_scaled = solver_scale_factor > 1;
     }
-    total_latency /= latency_gcd;
-    if (faster > 1) {
-      total_latency = CeilDiv(total_latency, faster);
+    result.prob.cost_model_profile =
+        CostModel::ProfileName(cost_context.options.profile);
+    result.prob.strict_calibration = cost_context.options.strict_calibration;
+    result.prob.solver_scale_factor = solver_scale_factor;
+    result.prob.solver_scaled = solver_scale_factor > 1;
+    result.prob.faster = faster;
+    result.prob.latency_gcd = latency_gcd;
+    result.prob.disable_gcd_scaling = disable_gcd_scaling;
+    result.prob.gcd_scaling_enabled = gcd_scaling_enabled;
+    result.prob.auto_faster_selected = auto_faster_selected;
+    result.prob.planner_fallback = false;
+    result.prob.fallback_used = false;
+    result.prob.cost_estimates.clear();
+    result.prob.cost_estimates.reserve(result.commands.size());
+    for (const TemplateCommand &cmd : result.commands) {
+      result.prob.cost_estimates.push_back(cmd.cost_estimate);
+      result.prob.fallback_used =
+          result.prob.fallback_used || cmd.cost_estimate.used_fallback;
+    }
+    if (gem5_profile) {
+      total_latency = 0;
+      for (const TemplateCommand &cmd : result.commands) {
+        total_latency += cmd.spec.latency;
+      }
+    } else {
+      total_latency /= latency_gcd;
+      if (faster > 1) {
+        total_latency = CeilDiv(total_latency, faster);
+      }
     }
 
     result.prob.Tmax = total_latency + 10;
@@ -4080,6 +4236,7 @@ private:
           SolveWithStageShrink(loop, pipeline_body_seq, threads);
       analysis = std::move(shrink_result.analysis);
       sol = std::move(shrink_result.sol);
+      MaybeExportProblemJson(analysis.prob, debug_);
     } else {
       StageShrinkResult mode_result =
           FindMinimalIIAcrossFlipModes(loop, pipeline_body_seq, threads);
