@@ -71,6 +71,7 @@
  * converts them to TIR intrinsics.
  */
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/node/cast.h>
 #include <tvm/tir/analysis.h>
@@ -617,13 +618,26 @@ struct Action {
 };
 
 // Walks the body and records the enclosing IR ancestor path for each
-// "interesting" call (writer or gemm). Path elements are pointers to scope-
-// introducing IR nodes: ForNode and the then/else child of IfThenElseNode.
+// "interesting" call (writer or gemm). Path elements distinguish loops and
+// then/else branches explicitly, even when a branch body is itself a ForNode.
 // SeqStmt and Block are transparent (no path entry). Two calls share the same
 // path iff they're in the same innermost scope on the same control-flow path.
 class ScopePathCollector : public StmtVisitor {
 public:
-  using Path = std::vector<const Object *>;
+  struct Scope {
+    enum class Kind { kLoop, kThen, kElse };
+    const Object *node;
+    Kind kind;
+
+    const ForNode *AsLoop() const {
+      return kind == Kind::kLoop ? static_cast<const ForNode *>(node) : nullptr;
+    }
+    bool operator==(const Scope &other) const {
+      return node == other.node && kind == other.kind;
+    }
+    bool operator!=(const Scope &other) const { return !(*this == other); }
+  };
+  using Path = std::vector<Scope>;
 
   explicit ScopePathCollector(
       const std::unordered_set<const CallNode *> &interesting)
@@ -643,7 +657,7 @@ private:
   int conditional_depth_ = 0;
 
   void VisitStmt_(const ForNode *op) final {
-    current_path_.push_back(op);
+    current_path_.push_back({op, Scope::Kind::kLoop});
     loop_stack_.push_back(op);
     RecordBinding(op->loop_var);
     VisitStmt(op->body);
@@ -653,11 +667,11 @@ private:
 
   void VisitStmt_(const IfThenElseNode *op) final {
     ++conditional_depth_;
-    current_path_.push_back(op->then_case.get());
+    current_path_.push_back({op, Scope::Kind::kThen});
     VisitStmt(op->then_case);
     current_path_.pop_back();
     if (op->else_case.defined()) {
-      current_path_.push_back(op->else_case.value().get());
+      current_path_.push_back({op, Scope::Kind::kElse});
       VisitStmt(op->else_case.value());
       current_path_.pop_back();
     }
@@ -1594,8 +1608,8 @@ bool StmtCallPrecedes(const Stmt &body, const CallNode *first,
 
 bool SharesEnclosingLoop(const ScopePathCollector::Path &a,
                          const ScopePathCollector::Path &b) {
-  for (const Object *scope : a) {
-    if (!scope->IsInstance<ForNode>())
+  for (const auto &scope : a) {
+    if (!scope.AsLoop())
       continue;
     if (std::find(b.begin(), b.end(), scope) != b.end())
       return true;
@@ -1607,11 +1621,11 @@ std::pair<const ForNode *, size_t>
 FindOutermostExclusiveLoop(const ScopePathCollector::Path &gemm_path,
                            const ScopePathCollector::Path &reader_path) {
   for (size_t i = 0; i < gemm_path.size(); ++i) {
-    const Object *scope = gemm_path[i];
-    if (scope->IsInstance<ForNode>() &&
-        std::find(reader_path.begin(), reader_path.end(), scope) ==
-            reader_path.end()) {
-      return {static_cast<const ForNode *>(scope), i};
+    const auto &scope = gemm_path[i];
+    if (const ForNode *loop = scope.AsLoop();
+        loop && std::find(reader_path.begin(), reader_path.end(), scope) ==
+                    reader_path.end()) {
+      return {loop, i};
     }
   }
   return {nullptr, 0};
@@ -1624,13 +1638,17 @@ bool RestoreCanMoveAfterLoop(const CallNode *writer,
   // Hoisting places the restore immediately after gemm_path[loop_depth]. Any
   // conditional scope nested inside that loop would be lost at the new site.
   // Keep such restores inline so each branch restores its own reaching writer.
-  for (size_t i = loop_depth + 1; i < gemm_path.size(); ++i) {
-    if (!gemm_path[i]->IsInstance<ForNode>())
+  // Every crossed loop must execute: otherwise an unconditional restore could
+  // overwrite a live pre-loop value with a writer that never ran (or read an
+  // uninitialized shadow). This includes inner loops when exiting an outer one.
+  arith::Analyzer analyzer;
+  for (size_t i = loop_depth; i < gemm_path.size(); ++i) {
+    const ForNode *loop = gemm_path[i].AsLoop();
+    if (!loop || !analyzer.CanProve(loop->extent > 0))
       return false;
   }
 
-  const auto *escaped_loop =
-      static_cast<const ForNode *>(gemm_path[loop_depth]);
+  const auto *escaped_loop = gemm_path[loop_depth].AsLoop();
   for (const PrimExpr &arg : writer->args) {
     if (UsesVar(arg, [&](const VarNode *var) {
           auto it = scopes.binding_loops.find(var);

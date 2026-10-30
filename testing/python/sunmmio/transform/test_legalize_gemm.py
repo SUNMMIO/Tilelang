@@ -2257,7 +2257,8 @@ def test_legalize_sunmmio_gemm_keeps_loop_variant_restore_inside_loop():
     tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
 
 
-def test_legalize_sunmmio_gemm_keeps_branch_dependent_restore_inside_loop():
+@pytest.mark.parametrize("nested_loop", [False, True])
+def test_legalize_sunmmio_gemm_keeps_branch_dependent_restore_inside_loop(nested_loop):
     """A restore cannot leave a branch nested inside the loop it exits."""
     from tilelang.layout import make_zz_layout
 
@@ -2281,11 +2282,21 @@ def test_legalize_sunmmio_gemm_keeps_branch_dependent_restore_inside_loop():
             T.copy(B, weight)
             for _ in T.serial(3):
                 if cid == 0:
-                    T.copy(first, activation)
-                    T.gemm(activation, weight, large_out, clear_accum=True)
+                    if nested_loop:
+                        for _ in T.serial(2):
+                            T.copy(first, activation)
+                            T.gemm(activation, weight, large_out, clear_accum=True)
+                    else:
+                        T.copy(first, activation)
+                        T.gemm(activation, weight, large_out, clear_accum=True)
                 else:
-                    T.copy(second, activation)
-                    T.gemm(activation, weight, large_out, clear_accum=True)
+                    if nested_loop:
+                        for _ in T.serial(2):
+                            T.copy(second, activation)
+                            T.gemm(activation, weight, large_out, clear_accum=True)
+                    else:
+                        T.copy(second, activation)
+                        T.gemm(activation, weight, large_out, clear_accum=True)
             T.gemm(activation[0:16, :], weight, small_out, clear_accum=True)
             T.copy(small_out, C[0:16, :])
             T.copy(large_out[16:32, :], C[16:32, :])
@@ -2309,10 +2320,85 @@ def test_legalize_sunmmio_gemm_keeps_branch_dependent_restore_inside_loop():
     )
     assert len(branches) == 1
     for source, branch in zip(("first", "second"), (branches[0].then_case, branches[0].else_case)):
-        activation_copies = [call for _, call in _iter_calls_in_stmt(branch, "tl.tileop.copy") if _copy_buf(call, 1).name == "activation"]
+        activation_copies = []
+        tvm.tir.stmt_functor.post_order_visit(
+            branch,
+            lambda node, copies=activation_copies: copies.append(node.value)
+            if isinstance(node, tvm.tir.Evaluate)
+            and isinstance(node.value, tvm.tir.Call)
+            and node.value.op.name == "tl.tileop.copy"
+            and _copy_buf(node.value, 1).name == "activation"
+            else None,
+        )
+        assert activation_copies
         assert _copy_buf(activation_copies[-1], 0).name == source
         assert "src_offset_byte" not in activation_copies[-1].annotations
     tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
+@pytest.mark.parametrize("nested_loop", [False, True])
+def test_legalize_sunmmio_gemm_preserves_activation_when_loop_skipped(nested_loop):
+    """A zero-trip loop must preserve the activation initialized before it."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        B: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        C: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        n: T.int32,
+    ):
+        with T.Kernel():
+            first = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            second = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            large_out = T.alloc_shared((32, 32), "bfloat16")
+            small_out = T.alloc_shared((16, 32), "bfloat16")
+            T.copy(A, first)
+            T.copy(B, second)
+            T.copy(B, weight)
+            T.copy(first, activation)
+            if nested_loop:
+                for _ in T.serial(2):
+                    for _ in T.serial(n):
+                        T.copy(second, activation)
+                        T.gemm(activation, weight, large_out, clear_accum=True)
+            else:
+                for _ in T.serial(n):
+                    T.copy(second, activation)
+                    T.gemm(activation, weight, large_out, clear_accum=True)
+            T.gemm(activation[0:16, :], weight, small_out, clear_accum=True)
+            T.copy(small_out, C[0:16, :])
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    assert tvm.tir.analysis.verify_well_formed(mod)
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+    for trip_count, expected_source in ((0, "first"), (1, "second")):
+        # Specialize only after legalization so the pass must handle n == 0.
+        specialized = mod["main"].specialize({mod["main"].params[-1]: trip_count})
+        specialized_mod = tl.transform.Simplify()(tvm.IRModule({"main": specialized}))
+        current_source = None
+        current_stripe = None
+        observed_reader = False
+
+        def check(node, expected_source=expected_source):
+            nonlocal current_source, current_stripe, observed_reader
+            if not isinstance(node, tvm.tir.Evaluate) or not isinstance(node.value, tvm.tir.Call):
+                return
+            node = node.value
+            if node.op.name == "tl.tileop.copy" and _copy_buf(node, 1).name == "activation":
+                current_source = _copy_buf(node, 0).name
+                current_stripe = 1 if "src_offset_byte" in node.annotations else 0
+            elif node.op.name == "tl.tileop.gemm_py" and int(node.args[5]) == 16:
+                assert (current_source, current_stripe) == (expected_source, 0)
+                observed_reader = True
+
+        tvm.tir.stmt_functor.post_order_visit(specialized_mod["main"].body, check)
+        assert observed_reader
 
 
 def test_legalize_sunmmio_gemm_keeps_block_local_source_restore_in_scope():
