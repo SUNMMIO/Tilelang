@@ -3810,9 +3810,9 @@ private:
       // Preserve raw hardware cycles in cost_estimate. The solver consumes
       // ceil(raw / (faster * gcd)); use int64_t to avoid rounding overflow.
       const int64_t solver_input_cycles = cmd.spec.latency;
-      cmd.spec.latency = static_cast<int>(
-          solver_input_cycles / solver_scale_factor +
-          (solver_input_cycles % solver_scale_factor != 0));
+      cmd.spec.latency =
+          static_cast<int>(solver_input_cycles / solver_scale_factor +
+                           (solver_input_cycles % solver_scale_factor != 0));
       cmd.cost_estimate.solver_scale_factor = solver_scale_factor;
       cmd.cost_estimate.solver_latency_cycles = cmd.spec.latency;
       cmd.cost_estimate.solver_scaled = solver_scale_factor > 1;

@@ -614,7 +614,8 @@ float CostModel::EstimateVectorCoreDelayHeuristic(const tir::Stmt &stmt) {
   return ceil_div(flops_cost, VectorCoreCost::kFlopsPerCycle);
 }
 
-float CostModel::EstimateDelayHeuristic(DeviceType device_type, const tir::Stmt &stmt) {
+float CostModel::EstimateDelayHeuristic(DeviceType device_type,
+                                        const tir::Stmt &stmt) {
   if (device_type == DeviceType::TensorCore) {
     return EstimateTensorCoreDelayHeuristic(stmt);
   } else if (device_type == DeviceType::ODMA) {
