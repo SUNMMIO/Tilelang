@@ -1,3 +1,4 @@
+import pytest
 import tilelang
 from tilelang import tvm
 from tilelang.utils.target import determine_target
@@ -92,6 +93,24 @@ def _dma_regions(src_region, dst_region, *, unit="odma0"):
     )
 
 
+def _mma_regions(a_region, b_region, c_region, *, acc_offset_byte=0):
+    return tvm.tir.Evaluate(
+        tvm.tir.Call(
+            "handle",
+            tvm.ir.Op.get("tl.mma_sunmmio"),
+            [
+                a_region,
+                b_region,
+                c_region,
+                tvm.tir.IntImm("bool", 0),
+                tvm.tir.IntImm("bool", 1),
+                tvm.tir.IntImm("bool", 0),
+                tvm.tir.IntImm("int32", acc_offset_byte),
+            ],
+        )
+    )
+
+
 def _mx_compound(op_name, src, dst):
     if op_name == "tl.mx_pack":
         regions = [_region(src, 1), _region(src, 1), _region(dst, 2)]
@@ -101,7 +120,14 @@ def _mx_compound(op_name, src, dst):
     return tvm.tir.Evaluate(tvm.tir.Call("handle", tvm.ir.Op.get(op_name), regions))
 
 
-def _make_module(statements, *, with_thread_extent=True, is_global=True):
+def _make_module(
+    statements,
+    *,
+    with_thread_extent=True,
+    is_global=True,
+    hierarchical_ilp_verified=False,
+    workitem_flattened=False,
+):
     src_data = _pointer_var("src")
     dst_data = _pointer_var("dst")
     src = tvm.tir.decl_buffer((32, 32), "bfloat16", name="src", data=src_data, scope="shared.rsram")
@@ -117,6 +143,14 @@ def _make_module(statements, *, with_thread_extent=True, is_global=True):
     func = tvm.tir.PrimFunc([src_data, dst_data], body).with_attr("global_symbol", "main")
     if is_global:
         func = func.with_attr("tir.is_global_func", True)
+    if hierarchical_ilp_verified:
+        func = func.with_attr(
+            "tl.sunmmio.hierarchical_ilp.coverage_verified", True
+        )
+    if workitem_flattened:
+        func = func.with_attr(
+            "tl.sunmmio.multidim.workitem_flatten.applied", True
+        )
     mod = tvm.IRModule({"main": func})
     return tvm.tir.transform.BindTarget(_target())(mod)
 
@@ -214,6 +248,50 @@ def test_distinct_buffer_views_of_same_storage_insert_sync():
 
     mod = _apply(_make_module(body))
     assert _call_lines(mod, "T.sunmmio_sync") == ["T.sunmmio_sync(1)"]
+
+
+def test_mma_shifted_accumulator_alias_inserts_odma_sync():
+    def body(src, dst):
+        return [
+            _dma_regions(
+                _region_slice(src, 1, 0, 16),
+                _region_slice(dst, 2, 0, 16),
+                unit="odma0",
+            ),
+            _mma_regions(
+                _region_slice(src, 1, 16, 16),
+                _region_slice(src, 1, 16, 16),
+                _region_slice(dst, 3, 16, 16),
+                acc_offset_byte=2048,
+            ),
+        ]
+
+    mod = _apply(_make_module(body))
+    lines = mod.script().splitlines()
+    assert _call_lines(mod, "T.sunmmio_sync") == ["T.sunmmio_sync(1)"]
+    dma_index = next(i for i, line in enumerate(lines) if "T.dma_copy" in line)
+    sync_index = next(i for i, line in enumerate(lines) if "T.sunmmio_sync(1)" in line)
+    mma_index = next(i for i, line in enumerate(lines) if "T.mma_sunmmio" in line)
+    assert dma_index < sync_index < mma_index
+
+
+def test_mma_unshifted_disjoint_region_keeps_odma_pending():
+    def body(src, dst):
+        return [
+            _dma_regions(
+                _region_slice(src, 1, 0, 16),
+                _region_slice(dst, 2, 0, 16),
+                unit="odma0",
+            ),
+            _mma_regions(
+                _region_slice(src, 1, 16, 16),
+                _region_slice(src, 1, 16, 16),
+                _region_slice(dst, 3, 16, 16),
+            ),
+        ]
+
+    mod = _apply(_make_module(body))
+    assert _call_lines(mod, "T.sunmmio_sync") == []
 
 
 def test_equivalent_alias_views_preserve_disjoint_region_overlap():
@@ -320,6 +398,30 @@ def test_disjoint_dma_regions_do_not_insert_sync():
     assert "T.sunmmio_sync" not in _apply(_make_module(body)).script()
 
 
+@pytest.mark.parametrize("pipeline_mode", ["ilp", "multidim_ilp"])
+def test_multidim_disjoint_rsram_views_use_conservative_odma_sync(pipeline_mode):
+    def body(src, dst):
+        return [
+            _dma_regions(
+                _region_slice(src, 1, 0, 16),
+                _region_slice(dst, 2, 0, 16),
+                unit="odma0",
+            ),
+            _dma_regions(
+                _region_slice(src, 1, 16, 16),
+                _region_slice(dst, 2, 16, 16),
+                unit="odma1",
+            ),
+        ]
+
+    with tvm.transform.PassContext(
+        config={"tl.sunmmio_pipeline_mode": pipeline_mode}
+    ):
+        result = _apply(_make_module(body))
+
+    assert _call_lines(result, "T.sunmmio_sync") == ["T.sunmmio_sync(1)"]
+
+
 def test_unit_sync_clears_all_pending_accesses_on_that_unit():
     def body(src, dst):
         return [
@@ -424,6 +526,79 @@ def test_loop_drains_pending_units_at_iteration_boundary():
     assert "wait_token" not in script
 
 
+
+def test_complete_tile_loop_nest_defers_vector_sync_until_async_consumer():
+    def body(src, dst):
+        row = tvm.tir.Var("row", "int32")
+        column = tvm.tir.Var("column", "int32")
+        ki = tvm.tir.Var("ki", "int32")
+        kj = tvm.tir.Var("kj", "int32")
+        tile_store = tvm.tir.BufferStore(
+            dst,
+            tvm.tir.BufferLoad(src, [row, kj]),
+            [row, kj],
+        )
+        interior_column = tvm.tir.For(
+            kj,
+            0,
+            32,
+            tvm.tir.ForKind.VECTORIZED,
+            tile_store,
+            annotations={"tile.interior": 1, "tile.interior_axis": 1},
+        )
+        interior_row = tvm.tir.For(
+            ki,
+            0,
+            1,
+            tvm.tir.ForKind.SERIAL,
+            interior_column,
+            annotations={"tile.interior": 1, "tile.interior_axis": 0},
+        )
+        inner = tvm.tir.For(
+            column,
+            0,
+            1,
+            tvm.tir.ForKind.SERIAL,
+            interior_row,
+            annotations={"tile.execution_axis": 1},
+        )
+        outer = tvm.tir.For(
+            row,
+            0,
+            32,
+            tvm.tir.ForKind.SERIAL,
+            inner,
+            annotations={"tile.execution_axis": 0, "tile.scope_entry": 1},
+        )
+        return [outer, _dma(dst, src, unit="odma0")]
+
+    result = _apply(_make_module(body))
+    lines = result.script().splitlines()
+    sync_indices = [
+        i for i, line in enumerate(lines) if "T.sunmmio_sync(96)" in line
+    ]
+    outer_index = next(i for i, line in enumerate(lines) if "for row in" in line)
+    dma_index = next(i for i, line in enumerate(lines) if "T.dma_copy" in line)
+    assert len(sync_indices) == 1
+    assert outer_index < sync_indices[0] < dma_index
+
+
+def test_unannotated_tile_loop_keeps_backedge_sync():
+    def body(src, dst):
+        row = tvm.tir.Var("row", "int32")
+        zero = tvm.tir.IntImm("int32", 0)
+        store = tvm.tir.BufferStore(
+            dst,
+            tvm.tir.BufferLoad(src, [row, zero]),
+            [row, zero],
+        )
+        return tvm.tir.For(row, 0, 32, tvm.tir.ForKind.SERIAL, store)
+
+    script = _apply(_make_module(body)).script()
+    loop_index = script.index("for row in")
+    sync_index = script.index("T.sunmmio_sync(96)")
+    assert loop_index < sync_index
+
 def test_loop_preserves_explicit_step():
     i = tvm.tir.Var("i", "int32")
     mod = _apply(
@@ -460,6 +635,79 @@ def test_source_guarded_broadcast_has_pre_and_post_barriers():
     assert barrier_indices[0] < broadcast_index < barrier_indices[1]
     assert "T.sunmmio_sync" not in "\n".join(lines)
     assert "token" not in "\n".join(lines)
+
+
+def test_verified_hierarchical_ilp_defers_collective_wait_to_dependency():
+    mod = _apply(
+        _make_module(
+            lambda src, dst: [
+                _dma(src, dst, unit="odma0"),
+                _broadcast(dst, src, direction=0),
+                _dma(src, dst, unit="odma1"),
+            ],
+            hierarchical_ilp_verified=True,
+            workitem_flattened=True,
+        )
+    )
+    lines = mod.script().splitlines()
+    dma_indices = [i for i, line in enumerate(lines) if "T.dma_copy" in line]
+    producer_sync = next(
+        i for i, line in enumerate(lines) if "T.sunmmio_sync(1)" in line
+    )
+    barrier_index = next(
+        i for i, line in enumerate(lines) if "T.barrier_arrive_and_wait" in line
+    )
+    broadcast_index = next(
+        i for i, line in enumerate(lines) if "T.broadcast_" in line
+    )
+    consumer_sync = next(
+        i for i, line in enumerate(lines) if "T.sunmmio_sync(8)" in line
+    )
+    assert len(_call_lines(mod, "T.barrier_arrive_and_wait")) == 1
+    assert dma_indices[0] < producer_sync < barrier_index < broadcast_index
+    assert broadcast_index < consumer_sync < dma_indices[1]
+
+
+def test_verified_hierarchical_ilp_syncs_before_same_link_reissue():
+    mod = _apply(
+        _make_module(
+            lambda src, dst: [
+                _broadcast_regions(
+                    _region_slice(src, 1, 0, 16),
+                    _region_slice(dst, 2, 0, 16),
+                    direction=1,
+                ),
+                _broadcast_regions(
+                    _region_slice(src, 1, 16, 16),
+                    _region_slice(dst, 2, 16, 16),
+                    direction=1,
+                ),
+            ],
+            hierarchical_ilp_verified=True,
+            workitem_flattened=True,
+        )
+    )
+    lines = mod.script().splitlines()
+    broadcast_indices = [
+        i for i, line in enumerate(lines) if "T.broadcast_" in line
+    ]
+    sync_indices = [
+        i for i, line in enumerate(lines) if "T.sunmmio_sync(16)" in line
+    ]
+    assert len(broadcast_indices) == 2
+    assert len(sync_indices) == 2
+    assert broadcast_indices[0] < sync_indices[0] < broadcast_indices[1]
+    assert broadcast_indices[1] < sync_indices[1]
+
+
+def test_verified_hierarchical_without_flatten_keeps_post_barrier():
+    mod = _apply(
+        _make_module(
+            lambda src, dst: _broadcast(src, dst),
+            hierarchical_ilp_verified=True,
+        )
+    )
+    assert len(_call_lines(mod, "T.barrier_arrive_and_wait")) == 2
 
 
 def test_unguarded_broadcast_completes_link_before_post_barrier():
