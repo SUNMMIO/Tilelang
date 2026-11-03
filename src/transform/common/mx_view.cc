@@ -710,6 +710,12 @@ TVM_FFI_STATIC_INIT_BLOCK() {
         // DeclBuffers. Check them before rewriting or dropping metadata.
         // Compiler-derived layout maps use Buffer keys and remain valid.
         auto check_annotation = [&](const String &key, const ffi::Any &value) {
+          if (key == "safe_value_map" && !handles.empty()) {
+            TVM_FFI_THROW(ValueError)
+                << "T.annotate_safe_value is not supported in functions "
+                   "using T.mx_view, including annotations on ordinary "
+                   "buffers. Remove the annotation from this function.";
+          }
           if (key != "layout_map" && key != "tileview_map")
             return;
           if (auto map = value.as<Map<ffi::Any, ffi::Any>>()) {

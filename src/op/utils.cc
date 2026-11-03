@@ -112,7 +112,7 @@ void ValidateSunmmioMXWeightTransferLayout(const LayoutInferArgs &args,
   for (const BufferRegion &region : {src, dst}) {
     const Buffer &buffer = region->buffer;
     bool is_wsram = buffer.scope() == kSunmmioScopeWSRAM;
-    const char *required = is_wsram ? "MXZNN" : "MXZNZ";
+    const char *required = is_wsram ? "MXNNZ" : "MXZNZ";
     Layout actual = LookupTransferLayout(args, buffer);
     ICHECK(IsMXWeightLayout(actual, buffer, is_wsram, args.analyzer))
         << "Sunmmio MX weight layout conflict in " << op_name << " ("

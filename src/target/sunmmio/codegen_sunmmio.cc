@@ -11,6 +11,7 @@
 #include "../../tileview/tileview_planner_common.h"
 #include "../../transform/common/attr.h"
 #include "../sunmmio_utils.h"
+#include "arith/ir_visitor_with_analyzer.h"
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/type.h>
@@ -40,6 +41,86 @@ namespace codegen {
 using namespace tir;
 
 namespace {
+
+class CopyRegionAlignmentVerifier final : public arith::IRVisitorWithAnalyzer {
+private:
+  // Memory reads can change within a scope; only pure facts remain valid.
+  bool IsPure(const PrimExpr &expr) const {
+    return SideEffect(expr) <= CallEffectKind::kPure;
+  }
+
+  void VisitStmt_(const LetStmtNode *op) final {
+    if (op->var.dtype().is_handle() || !IsPure(op->value))
+      return StmtExprVisitor::VisitStmt_(op);
+    IRVisitorWithAnalyzer::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    if (!IsPure(op->min) || !IsPure(op->extent))
+      return StmtExprVisitor::VisitStmt_(op);
+    if (!analyzer_.CanProve(op->extent <= 0))
+      IRVisitorWithAnalyzer::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) final {
+    if (!IsPure(op->condition))
+      return StmtExprVisitor::VisitStmt_(op);
+    VisitExpr(op->condition);
+    PrimExpr condition = ExtractRealCondition(op->condition);
+    PrimExpr negated = analyzer_.rewrite_simplify(Not(condition));
+    if (!analyzer_.CanProve(negated)) {
+      With<arith::ConstraintContext> context(&analyzer_, condition);
+      VisitStmt(op->then_case);
+    }
+    if (op->else_case.defined() && !analyzer_.CanProve(condition)) {
+      With<arith::ConstraintContext> context(&analyzer_, negated);
+      VisitStmt(op->else_case.value());
+    }
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tir::attr::tilelang_assume &&
+        !IsPure(Downcast<PrimExpr>(op->node)))
+      return StmtExprVisitor::VisitStmt_(op);
+    if ((op->attr_key == tir::attr::thread_extent ||
+         op->attr_key == tir::attr::virtual_thread) &&
+        !IsPure(op->value))
+      return StmtExprVisitor::VisitStmt_(op);
+    IRVisitorWithAnalyzer::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const AssertStmtNode *op) final {
+    if (!IsPure(op->condition))
+      return StmtExprVisitor::VisitStmt_(op);
+    IRVisitorWithAnalyzer::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    // Codegen evaluates expression operands eagerly, including Select operands.
+    StmtExprVisitor::VisitExpr_(op);
+    if (!op->op.same_as(tl::dma_copy()) &&
+        !op->op.same_as(tl::sunmmio_layout_transform()))
+      return;
+    ICHECK_GE(op->args.size(), 2U);
+    for (int side : {0, 1}) {
+      BufferRegion region = tl::NormalizeToBufferRegion(op->args[side]);
+      const char *operand = side == 0 ? "source" : "destination";
+      for (size_t dim = 0; dim < region->region.size(); ++dim) {
+        const Range &range = region->region[dim];
+        const auto *extent = range->extent.as<IntImmNode>();
+        ICHECK(extent) << "tl.tileop.region extent must be IntImm";
+        ICHECK_GT(extent->value, 0)
+            << "Sunmmio copy " << operand << " buffer " << region->buffer->name
+            << " has non-positive region extent at dim " << dim;
+        ICHECK(analyzer_.CanProveEqual(floormod(range->min, range->extent), 0))
+            << "Sunmmio copy " << operand << " buffer " << region->buffer->name
+            << " region min at dim " << dim
+            << " must be provably aligned to region extent " << range->extent
+            << ", but got min=" << range->min;
+      }
+    }
+  }
+};
 
 class DeclBufferCollector final : public tir::StmtExprVisitor {
 public:
@@ -894,6 +975,7 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
     Init();
   }
   ICHECK(builder_) << "CodeGenTileLangSunMMIO builder is not initialized";
+  CopyRegionAlignmentVerifier()(f->body);
   CollectExpectedCoverage(f);
   CollectDeclBuffers(f->body);
 
@@ -2602,8 +2684,8 @@ const char *CodeGenTileLangSunMMIO::CallBucketName(CallBucket bucket) const {
 
 SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
     const tvm::PrimExpr &region_expr, int64_t byte_offset,
-    const char *copy_operand, bool use_layout_covered_shape,
-    bool preserve_region_rank, bool allow_rank3) {
+    bool use_layout_covered_shape, bool preserve_region_rank,
+    bool allow_rank3) {
   BufferRegion region = NormalizeRegionTracked(region_expr);
   const BufferBinding &binding = LookupBuffer(region->buffer);
   std::vector<int64_t> effective_extents;
@@ -2665,19 +2747,6 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
     const Range &range = region->region[dim];
     const auto *extent_imm = range->extent.as<IntImmNode>();
     ICHECK(extent_imm) << "tl.tileop.region extent must be IntImm";
-    if (copy_operand) {
-      ICHECK_GT(extent_imm->value, 0)
-          << "Sunmmio copy " << copy_operand << " buffer "
-          << region->buffer->name << " has non-positive region extent at dim "
-          << extents.size();
-      // Partition indices count whole regions. Flooring an unaligned start
-      // silently changes the address, even when optional region checks are off.
-      ICHECK(analyzer.CanProveEqual(floormod(range->min, range->extent), 0))
-          << "Sunmmio copy " << copy_operand << " buffer "
-          << region->buffer->name << " region min at dim " << extents.size()
-          << " must be provably aligned to region extent " << range->extent
-          << ", but got min=" << range->min;
-    }
     MarkVisitedExprRoot(range->extent);
     int64_t extent = use_layout_covered_shape
                          ? effective_extents[dim]
@@ -2797,8 +2866,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     ICHECK(TryConsumeSunmmioOdmaUnit(op->args[3], &attrs))
         << "tl.dma_copy expects fourth argument to be tl.odma_unit";
 
-    operands.push_back(EmitRegionCall(op->args[0], src_offset_byte, "source"));
-    operands.push_back(EmitRegionCall(op->args[1], 0, "destination"));
+    operands.push_back(EmitRegionCall(op->args[0], src_offset_byte));
+    operands.push_back(EmitRegionCall(op->args[1]));
   } else if (callee == "tl.sunmmio_layout_transform") {
     ICHECK_EQ(op->args.size(), 3)
         << "tl.sunmmio_layout_transform expects src region, dst region, and "
@@ -2854,11 +2923,11 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
 
     operands.reserve(2);
     operands.push_back(
-        EmitRegionCall(op->args[0], /*byte_offset=*/0, "source",
+        EmitRegionCall(op->args[0], /*byte_offset=*/0,
                        /*use_layout_covered_shape=*/is_unit_axis_2d_transform,
                        /*preserve_region_rank=*/is_unit_axis_2d_transform));
     operands.push_back(
-        EmitRegionCall(op->args[1], /*byte_offset=*/0, "destination",
+        EmitRegionCall(op->args[1], /*byte_offset=*/0,
                        /*use_layout_covered_shape=*/is_unit_axis_2d_transform,
                        /*preserve_region_rank=*/is_unit_axis_2d_transform));
 
@@ -2950,12 +3019,10 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     operands.reserve(4);
     operands.push_back(
         EmitRegionCall(op->args[tl::kBroadcastArgSrc], src_offset_byte,
-                       /*copy_operand=*/nullptr,
                        /*use_layout_covered_shape=*/false,
                        /*preserve_region_rank=*/false, allow_rank3));
     operands.push_back(
         EmitRegionCall(op->args[tl::kBroadcastArgDst], /*byte_offset=*/0,
-                       /*copy_operand=*/nullptr,
                        /*use_layout_covered_shape=*/false,
                        /*preserve_region_rank=*/false, allow_rank3));
     operands.push_back(EvalExpr(op->args[tl::kBroadcastArgMask]));
@@ -2988,15 +3055,12 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
 
     operands.reserve(4);
     operands.push_back(EmitRegionCall(op->args[0], /*byte_offset=*/0,
-                                      /*copy_operand=*/nullptr,
                                       /*use_layout_covered_shape=*/false,
                                       /*preserve_region_rank=*/true));
     operands.push_back(EmitRegionCall(op->args[1], /*byte_offset=*/0,
-                                      /*copy_operand=*/nullptr,
                                       /*use_layout_covered_shape=*/false,
                                       /*preserve_region_rank=*/true));
     operands.push_back(EmitRegionCall(op->args[2], acc_offset_byte,
-                                      /*copy_operand=*/nullptr,
                                       /*use_layout_covered_shape=*/false,
                                       /*preserve_region_rank=*/true));
 

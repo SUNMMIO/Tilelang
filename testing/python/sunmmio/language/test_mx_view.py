@@ -129,6 +129,8 @@ def field_annotation_kernel(bits, role, annotation, used=True, nested=False):
     def annotate(buffer):
         if annotation == "layout":
             return T.annotate_layout({buffer: layout})
+        if annotation == "safe_value":
+            return T.annotate_safe_value({buffer: 0})
         return T.annotate_tileview({buffer: ([1, 64] if role == "scale" else [32, 32], [-2, -1])})
 
     @T.prim_func
@@ -170,3 +172,27 @@ def test_mx_field_annotations_rejected_before_normalization(bits, role, annotati
 def test_mx_parent_peer_and_data_tileview_annotations_remain_supported(bits, role, annotation):
     artifact = lower(field_annotation_kernel(bits, role, annotation), target="sunmmio")
     assert "suvm.unpack" in artifact.kernel_source
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+@pytest.mark.parametrize("role", ["data", "scale", "peer"])
+@pytest.mark.parametrize("used,nested", [(True, False), (False, False), (True, True)])
+def test_safe_value_rejected_in_mx_view_functions(bits, role, used, nested):
+    with pytest.raises(ValueError, match=r"T\.annotate_safe_value.*T\.mx_view"):
+        lower(field_annotation_kernel(bits, role, "safe_value", used, nested), target="sunmmio")
+
+
+def test_safe_value_remains_supported_without_mx_view():
+    @target("sunmmio")
+    def kernel():
+        @T.prim_func
+        def main():
+            with T.Kernel():
+                data = T.alloc_shared((64, 64), T.float8_e4m3fn, scope="shared.rsram")
+                peer = T.alloc_shared((64, 64), T.float8_e4m3fn, scope="shared.rsram")
+                T.annotate_safe_value({peer: 0})
+                T.copy(data, peer)
+
+        return main
+
+    lower(kernel(), target="sunmmio")

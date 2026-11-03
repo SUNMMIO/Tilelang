@@ -1077,6 +1077,7 @@ for block, row in T.Tiles(scale.shape):
 - 不支持 Tiles 外的字段独立标量读写。copy 参数中仅用于描述 region 的索引仍可使用，实际访存须满足布局、对齐和有效范围约束。
 - 每个父 allocation 只允许一处 view 声明，字段可反复使用。不支持字段再派生存储别名、独立改变布局/scope、裸指针导出、直接全局 DMA 或 collective。
 - 涉及父 MX 或字段的自动 pipeline 会报错；不涉及这些存储的流水线可正常使用。
+- 含 `T.mx_view` 的函数当前不支持 `T.annotate_safe_value`，包括对同一函数内普通 Buffer 的该项注解。
 
 `T.mx_pack` 和 `T.mx_unpack` 保持原有复制语义。用户仍需保证读前初始化，并在消费完整 MX 前准备好对应 payload 和 scale。
 

@@ -1081,6 +1081,7 @@ for block, row in T.Tiles(scale.shape):
 - Standalone scalar field access outside Tiles is unsupported. Indices used only to describe copy regions remain valid; actual accesses must satisfy layout, alignment, and bounds constraints.
 - Declare views once per parent allocation and reuse the returned buffers. Derived storage aliases, independent field layout/scope changes, raw pointer export, direct global DMA, and collectives are unsupported.
 - Automatic pipelining involving the parent or its fields is rejected. Unrelated pipelines remain available.
+- `T.annotate_safe_value` is currently unsupported in functions using `T.mx_view`, including annotations on ordinary buffers in the same function.
 
 `T.mx_pack` and `T.mx_unpack` retain their copying semantics. Initialize values before reading them and prepare the corresponding payload and scales before consuming the complete MX buffer.
 

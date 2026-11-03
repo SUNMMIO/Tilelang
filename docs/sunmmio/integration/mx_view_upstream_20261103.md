@@ -68,3 +68,12 @@
 全部冲突已解决，没有未决的功能语义选择。整合工作保存在独立分支和 worktree，原分支及其 build 保持可用；未推送远端。
 
 本次证据索引为整合工作区旁的 `integration-final-regression.log/xml`、`integration-fixes.log/xml`、`loaded-compiler.json` 和联合构建日志；设备验证目录包含 `numeric-v029.xml`、`row-major-v029.xml`、`upstream-v029.xml`、`visibility-context-v029.xml`、`jit-v029.xml`，以及对应逐核输出、编译产物、源码/二进制指纹和 `runtime-environment.json`。具体本地目录由交付消息给出。
+
+## 提交前补充修复
+
+以下为合并提交 `9be8bf7a` 之后的局部修复，前文整合及数值结果对应该合并提交。
+
+- DMA 对齐证明在 codegen 入口遍历最终 TIR，复用已有上下文分析，覆盖分支、循环、Let 和 assume；删除 region 发射阶段无上下文的重复检查及其多余参数。实际地址计算保持原样，DMA 和 layout-transform 均沿用原有对齐要求。
+- 可变内存读取不作为贯穿作用域的证明，防止索引被改写后误放行；分支约束在离开分支时撤销。
+- 含 `T.mx_view` 的函数提前拒绝 `T.annotate_safe_value`，包括普通 peer 上的注解；普通无 view 函数继续支持。错误消息中的 WSRAM 布局名同步为 `MXNNZ`。
+- 本轮构建通过；13 项定向用例与 119 项直接相关 copy/layout-transform/MX 应用编译回归全部通过。正向用例比较等价显式对齐写法的完整 SUVM，并通过 LLVM lowering；反向用例验证未对齐、约束泄漏和可变索引仍被拒绝。未重复全量回归或 Gem5。
