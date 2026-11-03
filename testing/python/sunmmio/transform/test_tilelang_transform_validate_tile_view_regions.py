@@ -538,6 +538,23 @@ def _make_comm_kernel(comm_case):
                 )
                 T.comm.all_gather(A_shared, R_shared, direction="all", axis=0)
 
+    elif comm_case == "allgather_axis_middle_valid":
+        send_shape = (1, 32, 32)
+        recv_shape = (1, 512, 32)
+
+        @T.prim_func
+        def kernel(A: T.Tensor(shape, DTYPE)):
+            with T.Kernel() as _bx:
+                A_shared = T.alloc_shared(send_shape, DTYPE)
+                R_shared = T.alloc_shared(recv_shape, DTYPE)
+                T.annotate_layout(
+                    {
+                        A_shared: make_row_major(send_shape),
+                        R_shared: make_row_major(recv_shape),
+                    }
+                )
+                T.comm.all_gather(A_shared, R_shared, direction="all", axis=1)
+
     elif comm_case == "allgather_axis0_slot_extent_mismatch":
         send_shape = (32, 32)
         recv_shape = (544, 32)
@@ -845,6 +862,7 @@ def test_sunmmio_validate_tile_view_regions_rejects_kernel_after_layout_inferenc
         "put_valid",
         "allgather_legacy_valid",
         "allgather_axis0_valid",
+        "allgather_axis_middle_valid",
         "allgather_axis_last_valid",
         "allreduce_low_level_valid",
         "allreduce_low_level_bitwise_int32",

@@ -2847,9 +2847,9 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     attrs[SunMMIOCallAttrKey::kDirection] =
         std::string(direction == 0 ? "row" : "col");
   } else if (callee == "tl.mma_sunmmio") {
-    ICHECK_EQ(op->args.size(), 7) << "tl.mma_sunmmio expects A/B/C regions, "
-                                     "three flag operands, and "
-                                     "acc_offset_byte";
+    ICHECK(op->args.size() == 7 || op->args.size() == 9)
+        << "tl.mma_sunmmio expects A/B/C regions, three flag operands, "
+           "acc_offset_byte, and optional D/store_output operands";
     auto parse_bool_arg = [&](const PrimExpr &arg,
                               const char *arg_name) -> bool {
       const auto *imm = arg.as<IntImmNode>();
@@ -2866,16 +2866,35 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
         << "tl.mma_sunmmio acc_offset_byte must be non-negative";
     MarkVisitedNodeType(acc_offset_imm->GetTypeKey());
 
-    operands.reserve(4);
+    operands.reserve(5);
     operands.push_back(EmitRegionCall(op->args[0], /*byte_offset=*/0,
                                       /*use_layout_covered_shape=*/false,
                                       /*preserve_region_rank=*/true));
     operands.push_back(EmitRegionCall(op->args[1], /*byte_offset=*/0,
                                       /*use_layout_covered_shape=*/false,
                                       /*preserve_region_rank=*/true));
-    operands.push_back(EmitRegionCall(op->args[2], acc_offset_byte,
-                                      /*use_layout_covered_shape=*/false,
-                                      /*preserve_region_rank=*/true));
+    SunMMIOValue accumulator =
+        EmitRegionCall(op->args[2], acc_offset_byte,
+                       /*use_layout_covered_shape=*/false,
+                       /*preserve_region_rank=*/true);
+    SunMMIOValue output = accumulator;
+    if (op->args.size() == 9) {
+      arith::Analyzer store_analyzer;
+      PrimExpr store_output = store_analyzer.Simplify(op->args[8]);
+      const auto *store_imm = store_output.as<IntImmNode>();
+      ICHECK(store_imm)
+          << "tl.mma_sunmmio store_output must become static after pipeline "
+             "injection, got "
+          << store_output;
+      MarkVisitedNodeType(store_imm->GetTypeKey());
+      if (store_imm->value != 0) {
+        output = EmitRegionCall(op->args[7], /*byte_offset=*/0,
+                                /*use_layout_covered_shape=*/false,
+                                /*preserve_region_rank=*/true);
+      }
+    }
+    operands.push_back(output);
+    operands.push_back(accumulator);
 
     MarkVisitedNodeType(op->args[5]->GetTypeKey());
     arith::Analyzer analyzer;

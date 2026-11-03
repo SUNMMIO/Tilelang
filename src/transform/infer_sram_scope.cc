@@ -412,7 +412,10 @@ private:
       return Evaluate(tvm::ffi::GetRef<Call>(call));
     }
 
-    ICHECK_EQ(call->args.size(), 19U) << "GEMM should have 19 parameters.";
+    ICHECK(call->args.size() == 19U || call->args.size() == 20U ||
+           call->args.size() == 22U)
+        << "GEMM should have 19 base parameters, optional acc_offset_byte, "
+           "and optional D/store_output operands.";
     Array<PrimExpr> new_gemm_args;
     new_gemm_args.push_back(new_args.count("A") ? new_args.at("A")
                                                 : call->args[0]);

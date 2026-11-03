@@ -93,11 +93,18 @@ class GemmSunmmio(GemmBase):
             # C (RSRAM): ZZ with block shape from GetSunmmioLayoutBlockShape
             c_block = _sunmmio_block_shape(self.C.dtype)
             c_layout = make_zz_layout(self.C, block_shape=c_block)
-            return {
+            layouts = {
                 self.A: a_layout,
                 self.B: b_layout,
                 self.C: c_layout,
             }
+            if self.D is not None:
+                # SUVM tc.mma requires accumulator-load C and store-output D
+                # to use the same logical layout even when C is FP32 and D is
+                # BF16. A later copy/layout transform converts the blockwise D
+                # tile to the destination layout.
+                layouts[self.D] = make_zz_layout(self.D, block_shape=c_block)
+            return layouts
         else:
             raise ValueError(f"Unsupported gemm combination of Sunmmio, A: {self.A.scope()}, B: {self.B.scope()}, C: {self.C.scope()}")
 
@@ -111,6 +118,10 @@ class GemmSunmmio(GemmBase):
             C_arg = buffer_region_to_tile_region(self.CRegion, "rw", [r for r in C_shape])
 
             args = [A_arg, B_arg, C_arg, self.trans_A, self.trans_B, self.clear_accum, self.acc_offset_byte]
+            if self.DRegion is not None:
+                D_shape = retrieve_shape(self.DRegion)
+                D_arg = buffer_region_to_tile_region(self.DRegion, "w", [r for r in D_shape])
+                args.extend([D_arg, self.store_output])
 
             @T.prim_func
             def _gemm_sss() -> None:
@@ -129,4 +140,5 @@ class GemmSunmmio(GemmBase):
         a_check = self.A.scope() == "shared.asram"
         b_check = self.B.scope() == "shared.wsram"
         c_check = self.C.scope() == "shared.rsram"
-        return a_check and b_check and c_check
+        d_check = self.D is None or self.D.scope() == "shared.rsram"
+        return a_check and b_check and c_check and d_check

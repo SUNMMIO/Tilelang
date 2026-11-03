@@ -5,7 +5,7 @@ from __future__ import annotations
 from tilelang._typing import BufferLikeType, BarrierType
 from tilelang.tileop.base import GemmWarpPolicy
 import tilelang.language as T
-from tvm import tir
+from tvm import tir, arith
 from tilelang.utils.language import (
     to_buffer_region,
     retrieve_shape,
@@ -32,6 +32,9 @@ def _gemm_impl(
     k_pack: int = 1,
     wg_wait: int = 0,
     mbar: BarrierType | None = None,
+    acc_offset_byte: int = 0,
+    output: BufferLikeType | None = None,
+    store_output: bool | tir.PrimExpr = True,
 ) -> tir.PrimExpr:
     """Shared GEMM implementation.
 
@@ -54,24 +57,34 @@ def _gemm_impl(
     A = legalize_arguments(A)
     B = legalize_arguments(B)
     C = legalize_arguments(C)
+    output = legalize_arguments(output) if output is not None else None
     mbar = legalize_arguments(mbar) if mbar is not None else None
 
     # Normalize A/B/C to BufferRegion for shape/stride/offset analysis
     A_region = to_buffer_region(A)
     B_region = to_buffer_region(B)
     C_region = to_buffer_region(C)
+    output_region = to_buffer_region(output) if output is not None else None
 
     A_shape = retrieve_shape(A_region)
     B_shape = retrieve_shape(B_region)
     C_shape = retrieve_shape(C_region)
+    output_shape = retrieve_shape(output_region) if output_region is not None else None
 
     A_stride = retrieve_stride(A_region)
     B_stride = retrieve_stride(B_region)
 
+    shape_analyzer = arith.Analyzer()
+
+    def is_static_one(extent) -> bool:
+        if isinstance(extent, int):
+            return extent == 1
+        return bool(shape_analyzer.can_prove(extent == 1))
+
     if len(C_shape) not in (2, 3):
         raise ValueError(f"T.gemm C must have rank 2 or 3, got rank {len(C_shape)} with shape {C_shape}")
     for operand, shape in (("A", A_shape), ("B", B_shape)):
-        legacy_singleton = len(C_shape) == 2 and len(shape) > 3 and all(prim_expr_equal(extent, 1) for extent in shape[:-2])
+        legacy_singleton = len(shape) > 3 and all(is_static_one(extent) for extent in shape[:-2])
         if len(shape) not in (2, 3) and not legacy_singleton:
             raise ValueError(
                 f"T.gemm {operand} must have rank 2 or 3, or only singleton "
@@ -80,6 +93,13 @@ def _gemm_impl(
             )
 
     M, N = C_shape[-2:]
+    if output_shape is not None:
+        if len(output_shape) < 2:
+            raise ValueError("SunMMIO GEMM output must have rank >= 2")
+        if not prim_expr_equal_or_mesh_symbolic(M, output_shape[-2]):
+            raise ValueError(f"T.gemm output row extent must match C: {output_shape[-2]} != {M}")
+        if not prim_expr_equal_or_mesh_symbolic(N, output_shape[-1]):
+            raise ValueError(f"T.gemm output column extent must match C: {output_shape[-1]} != {N}")
     A_M = A_shape[-1] if transpose_A else A_shape[-2]
     K = A_shape[-2] if transpose_A else A_shape[-1]
     K_B = B_shape[-1] if transpose_B else B_shape[-2]
@@ -126,9 +146,7 @@ def _gemm_impl(
     # The C++ side checks if arg 16 is a BufferLoadNode before using it,
     # so a non-BufferLoad value will be correctly ignored.
     mbar_arg = mbar if mbar is not None else tir.const(0, dtype="int32")
-    return tir.call_intrin(
-        "handle",
-        tir.op.Op.get(op_key),
+    args = [
         A_arg,
         B_arg,
         C_arg,
@@ -148,7 +166,12 @@ def _gemm_impl(
         mbar_arg,
         C_coords[-2],
         C_coords[-1],
-    )
+        acc_offset_byte,
+    ]
+    if output_region is not None:
+        args.append(buffer_region_to_tile_region(output_region, "w", [r for r in output_shape]))
+        args.append(store_output)
+    return tir.call_intrin("handle", tir.op.Op.get(op_key), *args)
 
 
 # Public wrappers
@@ -163,6 +186,9 @@ def gemm_v1(
     k_pack: int = 1,
     wg_wait: int = 0,
     mbar: BarrierType | None = None,
+    acc_offset_byte: int = 0,
+    output: BufferLikeType | None = None,
+    store_output: bool | tir.PrimExpr = True,
 ) -> tir.PrimExpr:
     """GEMM v1: use op tl.gemm."""
     return _gemm_impl(
@@ -177,6 +203,9 @@ def gemm_v1(
         k_pack,
         wg_wait,
         mbar,
+        acc_offset_byte,
+        output,
+        store_output,
     )
 
 
@@ -192,6 +221,9 @@ def gemm_v2(
     k_pack: int = 1,
     wg_wait: int = 0,
     mbar: BarrierType | None = None,
+    acc_offset_byte: int = 0,
+    output: BufferLikeType | None = None,
+    store_output: bool | tir.PrimExpr = True,
 ) -> tir.PrimExpr:
     """GEMM v2: use op tl.gemm_py."""
     return _gemm_impl(
@@ -206,6 +238,9 @@ def gemm_v2(
         k_pack,
         wg_wait,
         mbar,
+        acc_offset_byte,
+        output,
+        store_output,
     )
 
 
@@ -224,6 +259,9 @@ def gemm(
     k_pack: int = 1,
     wg_wait: int = 0,
     mbar: BarrierType | None = None,
+    acc_offset_byte: int = 0,
+    output: BufferLikeType | None = None,
+    store_output: bool | tir.PrimExpr = True,
 ) -> tir.PrimExpr:
     """TileLang GEMM operator.
 
@@ -238,10 +276,16 @@ def gemm(
         k_pack (int): Numbers of packed matrix cores, for ROCm only. Defaults to 1.
         wg_wait (int): Int identifier of the warpgroup MMA batch to wait on.. Defaults to 0.
         mbar (BarrierType, i.e. Buffer | BufferLoad, or Var, optional): Mbarrier in Blackwell. Defaults to None.
+        acc_offset_byte (int): SunMMIO byte offset from the output tile to its accumulator.
+        output (BufferLikeType, optional): SunMMIO TensorCore store buffer D.
+        store_output (bool or PrimExpr): Select D instead of accumulator C for this issue.
 
     Returns:
         tir.Call: A handle to the GEMM operation.
     """
 
     impl = gemm_v1 if _env.use_gemm_v1() else gemm_v2
-    return impl(A, B, C, transpose_A, transpose_B, policy, clear_accum, k_pack, wg_wait, mbar)
+    return impl(
+        A, B, C, transpose_A, transpose_B, policy, clear_accum, k_pack,
+        wg_wait, mbar, acc_offset_byte, output, store_output,
+    )

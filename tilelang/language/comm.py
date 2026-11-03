@@ -491,12 +491,7 @@ def _normalize_allgather_axis(axis: int | None, send_rank: int) -> int:
     assert isinstance(axis, int) and -send_rank <= axis < send_rank, (
         f"axis {axis} out of range for send buffer with {send_rank} dimensions."
     )
-    normalized_axis = axis if axis >= 0 else axis + send_rank
-    assert normalized_axis == 0 or normalized_axis == send_rank - 1, (
-        f"Only axis=0 or axis=-1 (last dim) are currently supported, got axis={axis} "
-        f"(normalized to {normalized_axis}) for {send_rank}-D send buffer."
-    )
-    return normalized_axis
+    return axis if axis >= 0 else axis + send_rank
 
 
 def _allgather_gather_dim(axis: int) -> int:
@@ -1040,8 +1035,8 @@ def all_gather(
         shape ``[K, *send_buffer.shape]`` where ``K`` is the number of contributing
         cores. When ``axis`` is an integer, gathered data is concatenated along
         that existing axis: ``recv_buffer.shape[axis] == K * send_buffer.shape[axis]``
-        and all other dimensions match ``send_buffer``. Only ``axis=0`` and
-        ``axis=-1`` (the last dim) are currently supported.
+        and all other dimensions match ``send_buffer``. Any in-range static
+        axis is supported, including negative indexing.
     src_offset_byte : int
         Byte offset added to the source pointer at codegen. Default 0. Set by the
         Sunmmio bf16 GEMM legalization pass to re-stage south-bound A data into a

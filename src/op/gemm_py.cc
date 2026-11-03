@@ -92,6 +92,13 @@ GemmPy::GemmPy(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   if (args.size() > 19) {
     node->accOffsetByte_ = args[19].as<IntImm>().value()->value;
   }
+  if (args.size() > 20) {
+    node->dRegion_ = NormalizeToBufferRegion(args[20]);
+    node->d_ = node->dRegion_->buffer;
+  }
+  if (args.size() > 21) {
+    node->storeOutput_ = args[21].as<PrimExpr>().value();
+  }
   data_ = std::move(node);
 }
 

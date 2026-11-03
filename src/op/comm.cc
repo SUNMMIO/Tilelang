@@ -640,23 +640,22 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
   // in an equal-size slot along a single axis of recv ("slice_axis"). Slot
   // offset is encoded in the region's `min`, not in a separate offset arg.
   //
-  //   axis == -1 (sentinel, "no axis") or axis == 0 -> slice_axis = 0
-  //     legacy recv [K, d0, ...]:        slot_extent = 1
-  //     axis=0 recv [K*d0, d1, ...]:     slot_extent = d0
-  //   axis > 0 (last dim of send)        -> slice_axis = recv_rank - 1
-  //     axis=-1 recv [d0, ..., K*dn-1]:  slot_extent = dn-1
+  //   axis == -1 (sentinel, "no axis") -> slice_axis = 0
+  //     legacy recv [K, d0, ...]: slot_extent = 1
+  //   axis >= 0 -> slice_axis = axis
+  //     recv [..., K*d_axis, ...]: slot_extent = d_axis
   Buffer send_buffer = send_region->buffer;
   Buffer recv_buffer = recv_region->buffer;
   int recv_rank = static_cast<int>(recv_range.size());
   ICHECK_GT(recv_rank, 0) << "Allgather recv must have at least one dim.";
-  if (axis > 0) {
-    ICHECK_EQ(axis, static_cast<int>(send_range.size()) - 1)
-        << "Only axis = last dim of send is supported; got axis=" << axis
-        << " for send rank=" << send_range.size();
+  if (axis >= 0) {
+    ICHECK_LT(axis, static_cast<int>(send_range.size()))
+        << "Allgather axis " << axis << " is out of range for send rank="
+        << send_range.size();
     ICHECK_EQ(recv_range.size(), send_range.size())
         << "In axis mode, recv and send must have the same rank.";
   }
-  int slice_axis = (axis > 0) ? (recv_rank - 1) : 0;
+  int slice_axis = (axis >= 0) ? axis : 0;
   ICHECK(analyzer->CanProve(FloorMod(recv_range[slice_axis]->extent,
                                      IntImm(DataType::Int(32), recv_num)) == 0))
       << "Recv extent along slice axis " << slice_axis << " ("

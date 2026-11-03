@@ -92,3 +92,45 @@ def test_tilelang_gemm_sunmmio_layout(M, N, K, block_M, block_N, block_K, versio
         assert len(texts) == len(lower_stmt), f"Expected {len(lower_stmt)} sunmmio_mma statements, got {len(texts)}"
         for i in range(len(texts)):
             assert texts[i] == lower_stmt[i], f"Line {i} mismatch:\n  actual:   {texts[i]}\n  expected: {lower_stmt[i]}"
+
+
+def fused_output_matmul(version: int):
+    @T.prim_func
+    def main(
+        A: T.Tensor((32, 32), T.float16),
+        B: T.Tensor((32, 32), T.float16),
+    ):
+        with T.Kernel():
+            A_shared = T.alloc_shared((32, 32), T.float16)
+            B_shared = T.alloc_shared((32, 32), T.float16)
+            accumulator = T.alloc_shared((32, 32), T.float32)
+            output = T.alloc_shared((32, 32), T.bfloat16)
+            if version == 1:
+                T.gemm_v1(
+                    A_shared, B_shared, accumulator,
+                    output=output, store_output=True,
+                )
+            else:
+                T.gemm_v2(
+                    A_shared, B_shared, accumulator,
+                    output=output, store_output=True,
+                )
+
+    return tvm.IRModule({"main": main})
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_tilelang_gemm_sunmmio_optional_output(version):
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        mod = fused_output_matmul(version)
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.InferSramScope()(mod)
+        mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
+        mod = tl.transform.LayoutReducer()(mod)
+        mod = tl.transform.SunmmioLayoutInference()(mod)
+        mod = tl.transform.LowerTileOp()(mod)
+        lines = extract_sunmmio_mma_lines(mod)
+        assert len(lines) == 1
+        assert "output" in lines[0]
+        assert lines[0].endswith("T.bool(True))")

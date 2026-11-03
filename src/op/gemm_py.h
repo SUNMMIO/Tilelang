@@ -21,14 +21,15 @@ public:
   bool checkWgmma() const;
   bool allowTcgen5Mma(Target target) const;
   bool allowWgmma(int block_size, Target target) const;
-  tir::Buffer a_, b_, c_;
-  // BufferRegion for A, B and C
-  BufferRegion aRegion_, bRegion_, cRegion_;
+  tir::Buffer a_, b_, c_, d_;
+  // BufferRegion for A, B, accumulator C, and optional store output D.
+  BufferRegion aRegion_, bRegion_, cRegion_, dRegion_;
   bool transA_, transB_;
   int m_, n_, k_;
   int strideA_, strideB_;
   int offsetA_, offsetB_;
   PrimExpr clearAccum_ = const_false();
+  PrimExpr storeOutput_ = const_false();
   tir::BufferLoad mbar_; // mbar is optional, only used for TCGEN5MMA
   Array<PrimExpr> cCoords_;
   // k_pack please ref to bitblas/tl/mfma_macro_generator.py::k_pack
@@ -48,9 +49,11 @@ public:
         .def_ro("a", &GemmPyNode::a_)
         .def_ro("b", &GemmPyNode::b_)
         .def_ro("c", &GemmPyNode::c_)
+        .def_ro("d", &GemmPyNode::d_)
         .def_ro("aRegion", &GemmPyNode::aRegion_)
         .def_ro("bRegion", &GemmPyNode::bRegion_)
         .def_ro("cRegion", &GemmPyNode::cRegion_)
+        .def_ro("dRegion", &GemmPyNode::dRegion_)
         .def_ro("transA", &GemmPyNode::transA_)
         .def_ro("transB", &GemmPyNode::transB_)
         .def_ro("m", &GemmPyNode::m_)
@@ -61,6 +64,7 @@ public:
         .def_ro("offsetA", &GemmPyNode::offsetA_)
         .def_ro("offsetB", &GemmPyNode::offsetB_)
         .def_ro("clearAccum", &GemmPyNode::clearAccum_)
+        .def_ro("storeOutput", &GemmPyNode::storeOutput_)
         .def_ro("mbar", &GemmPyNode::mbar_)
         .def_ro("cCoords", &GemmPyNode::cCoords_)
         .def_ro("kPack", &GemmPyNode::kPack_)

@@ -315,15 +315,7 @@ private:
           << "allgather axis " << axis << " is out of range for send rank "
           << send->region.size() << ".";
     }
-    if (axis > 0) {
-      ICHECK_EQ(axis, static_cast<int64_t>(send->region.size()) - 1)
-          << "Only axis = 0 or last dim of send is supported; got axis=" << axis
-          << " for send rank=" << send->region.size();
-      ICHECK_EQ(recv->region.size(), send->region.size())
-          << "In axis mode, recv and send must have the same rank.";
-    }
-
-    int slice_axis = (axis > 0) ? (recv_rank - 1) : 0;
+    int slice_axis = (axis >= 0) ? static_cast<int>(axis) : 0;
     PrimExpr recv_num_expr = IntImm(DataType::Int(32), recv_num);
     ICHECK(CanProveDivisible(recv->region[slice_axis]->extent, recv_num_expr))
         << op_name << " recv extent along slice axis " << slice_axis << " ("

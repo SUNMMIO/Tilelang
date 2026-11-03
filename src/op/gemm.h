@@ -121,14 +121,15 @@ public:
 class GemmNode : public TileOperatorNode {
 public:
   bool checkWgmma() const;
-  tir::Buffer a_, b_, c_;
-  // BufferRegion for A, B and C
-  BufferRegion aRegion_, bRegion_, cRegion_;
+  tir::Buffer a_, b_, c_, d_;
+  // BufferRegion for A, B, accumulator C, and optional store output D.
+  BufferRegion aRegion_, bRegion_, cRegion_, dRegion_;
   bool transA_, transB_;
   int m_, n_, k_;
   int strideA_, strideB_;
   int offsetA_, offsetB_;
   PrimExpr clearAccum_ = const_false();
+  PrimExpr storeOutput_ = const_false();
   // k_pack please ref to bitblas/tl/mfma_macro_generator.py::k_pack
   // only will be enabled under cdna mfma instructions
   int kPack_ = 1;
@@ -148,9 +149,11 @@ public:
         .def_ro("a", &GemmNode::a_)
         .def_ro("b", &GemmNode::b_)
         .def_ro("c", &GemmNode::c_)
+        .def_ro("d", &GemmNode::d_)
         .def_ro("aRegion", &GemmNode::aRegion_)
         .def_ro("bRegion", &GemmNode::bRegion_)
         .def_ro("cRegion", &GemmNode::cRegion_)
+        .def_ro("dRegion", &GemmNode::dRegion_)
         .def_ro("transA", &GemmNode::transA_)
         .def_ro("transB", &GemmNode::transB_)
         .def_ro("m", &GemmNode::m_)
@@ -161,6 +164,7 @@ public:
         .def_ro("offsetA", &GemmNode::offsetA_)
         .def_ro("offsetB", &GemmNode::offsetB_)
         .def_ro("clearAccum", &GemmNode::clearAccum_)
+        .def_ro("storeOutput", &GemmNode::storeOutput_)
         .def_ro("kPack", &GemmNode::kPack_)
         .def_ro("wgWait", &GemmNode::wgWait_)
         .def_ro("mbar", &GemmNode::mbar_)

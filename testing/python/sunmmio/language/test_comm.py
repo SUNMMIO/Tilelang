@@ -67,6 +67,18 @@ def _expected_axis0_all_lines(buffer):
     return lines
 
 
+def _expected_axis_middle_horizontal_lines(buffer):
+    src = "T.region(A_shared[0, 0, 0], 1, 1, 128, 128)"
+    return [
+        _broadcast_line_no_core(
+            src,
+            f"T.region({buffer}[0, tx % 4 * 128, 0], 2, 1, 128, 128)",
+            0,
+            _ROW_MASK_BX,
+        )
+    ]
+
+
 def _expected_axis_last_horizontal_lines(buffer):
     src = "T.region(A_shared[0, 0], 1, 128, 128)"
     return [
@@ -513,17 +525,21 @@ def test_comm_all_gather_regions_follow_copy_normalization_rules(_strict_region_
             recv_load = T.alloc_shared((4, 64, 64), "float32", scope="shared.rsram")
             recv_shrink = T.alloc_shared((4, 64, 64), "float32", scope="shared.rsram")
             recv_axis_shrink = T.alloc_shared((130, 64), "float32", scope="shared.rsram")
+            send_middle = T.alloc_shared((1, 32, 32), "float32", scope="shared.rsram")
+            recv_middle = T.alloc_shared((1, 128, 32), "float32", scope="shared.rsram")
 
             T.comm.all_gather(send[16, 16], recv_from_load, direction="h")
             T.comm.all_gather(send[0:32, 0:32], recv_load[0, 0, 0], direction="h")
             T.comm.all_gather(send[0:32, 0:32], recv_shrink, direction="h")
             T.comm.all_gather(send[0:32, 0:32], recv_axis_shrink, direction="h", axis=0)
+            T.comm.all_gather(send_middle, recv_middle, direction="h", axis=1)
 
     script = main.script()
     assert "T.comm_allgather(send[16:48, 16:48], recv_from_load[0:4, 0:32, 0:32], 0, -1, -1," in script
     assert "T.comm_allgather(send[0:32, 0:32], recv_load[0:4, 0:32, 0:32], 0, -1, -1," in script
     assert "T.comm_allgather(send[0:32, 0:32], recv_shrink[0:4, 0:32, 0:32], 0, -1, -1," in script
     assert "T.comm_allgather(send[0:32, 0:32], recv_axis_shrink[0:128, 0:32], 0, -1, 0," in script
+    assert "T.comm_allgather(send_middle[0, 0:32, 0:32], recv_middle[0, 0:128, 0:32], 0, -1, 1," in script
 
 
 def test_comm_all_gather_buffer_load_pair_is_rejected(_strict_region_validation):
@@ -948,6 +964,24 @@ def test_comm_all_gather_axis0_all_lower(M, N, block_M, block_N, dtype):
             T.copy(A[by * block_M, bx * block_N], A_shared)
 
             T.comm.all_gather(A_shared, R_shared, direction="all", axis=0)
+
+    mod = tvm.IRModule({"main": main})
+    target = determine_target("Sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.LowerTileOp()(mod)
+        assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
+
+
+def test_comm_all_gather_axis_middle_horizontal_lower():
+    expected = _expected_axis_middle_horizontal_lines("R_shared")
+
+    @T.prim_func
+    def main():
+        with T.Kernel(threads=128) as bx:
+            A_shared = T.alloc_shared([1, 128, 128], "float16", scope="shared.rsram")
+            R_shared = T.alloc_shared([1, 4 * 128, 128], "float16", scope="shared.rsram")
+            T.comm.all_gather(A_shared, R_shared, direction="horizontal", axis=1)
 
     mod = tvm.IRModule({"main": main})
     target = determine_target("Sunmmio", return_object=True)

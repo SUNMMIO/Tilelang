@@ -730,8 +730,8 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.mma_sunmmio") {
-    ICHECK_EQ(operands.size(), 4)
-        << "tl.mma_sunmmio expects A/B/C tile views and an accumulate "
+    ICHECK_EQ(operands.size(), 5)
+        << "tl.mma_sunmmio expects A/B/D/C tile views and an accumulate "
            "condition as operands";
 
     mlir::Value a = ctx_.LookupMLIRValue(operands[0].value);
@@ -746,16 +746,22 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     auto w_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(w.getType());
     ICHECK(w_ty) << "tl.mma_sunmmio expects weight to be a suvm.tile_view";
 
-    mlir::Value c = ctx_.LookupMLIRValue(operands[2].value);
-    ICHECK(c) << "Missing MLIR accumulator tile view for tl.mma_sunmmio `"
+    mlir::Value d = ctx_.LookupMLIRValue(operands[2].value);
+    ICHECK(d) << "Missing MLIR output tile view for tl.mma_sunmmio `"
               << operands[2].value << "`";
+    auto d_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(d.getType());
+    ICHECK(d_ty) << "tl.mma_sunmmio expects output to be a suvm.tile_view";
+
+    mlir::Value c = ctx_.LookupMLIRValue(operands[3].value);
+    ICHECK(c) << "Missing MLIR accumulator tile view for tl.mma_sunmmio `"
+              << operands[3].value << "`";
     auto c_ty = mlir::dyn_cast<mlir::suvm::TileViewType>(c.getType());
     ICHECK(c_ty) << "tl.mma_sunmmio expects accumulator to be a suvm.tile_view";
 
-    mlir::Value accumulate = ctx_.LookupMLIRValue(operands[3].value);
+    mlir::Value accumulate = ctx_.LookupMLIRValue(operands[4].value);
     ICHECK(accumulate)
         << "Missing MLIR accumulate condition for tl.mma_sunmmio `"
-        << operands[3].value << "`";
+        << operands[4].value << "`";
     accumulate = type.EnsureI1(accumulate);
 
     bool trans_a =
@@ -767,7 +773,7 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     mlir::UnitAttr trans_attr =
         trans_b ? ctx_.builder.getUnitAttr() : mlir::UnitAttr();
     auto mma_op = mlir::suvm::TcMmaOp::create(
-        ctx_.builder, type.MakeDebugLoc("mma_sunmmio"), c, a, w, c, accumulate,
+        ctx_.builder, type.MakeDebugLoc("mma_sunmmio"), d, a, w, c, accumulate,
         trans_attr);
     VerifyAsyncOp(mma_op, "tl.mma_sunmmio");
     ctx_.AddPendingSyncOperation(

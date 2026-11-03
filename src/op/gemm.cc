@@ -158,6 +158,13 @@ Gemm::Gemm(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   if (args.size() > 19) {
     node->accOffsetByte_ = args[19].as<IntImm>().value()->value;
   }
+  if (args.size() > 20) {
+    node->dRegion_ = NormalizeToBufferRegion(args[20]);
+    node->d_ = node->dRegion_->buffer;
+  }
+  if (args.size() > 21) {
+    node->storeOutput_ = args[21].as<PrimExpr>().value();
+  }
   data_ = std::move(node);
 }
 
@@ -549,6 +556,10 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         << "Invalid scope of buffer " << b_ << " in SunmmioMMA.";
     ICHECK(c_.scope() == kSunmmioScopeRSRAM)
         << "Invalid scope of buffer " << c_ << " in SunmmioMMA.";
+    if (d_.defined()) {
+      ICHECK(d_.scope() == kSunmmioScopeRSRAM)
+          << "Invalid scope of output buffer " << d_ << " in SunmmioMMA.";
+    }
 
     PrimExpr A_region =
         MakeRegionExpr(aRegion_->buffer, aRegion_->region, /*access_mask=*/1);
@@ -567,6 +578,11 @@ Stmt GemmNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
                             Bool(transB_),
                             clearAccum_,
                             IntImm(DataType::Int(32), accOffsetByte_)};
+    if (dRegion_.defined()) {
+      args.push_back(MakeRegionExpr(dRegion_->buffer, dRegion_->region,
+                                    /*access_mask=*/2));
+      args.push_back(storeOutput_);
+    }
 
     const auto &op = mma_sunmmio();
     return Evaluate(Call(DataType::Handle(), op, args));
@@ -997,6 +1013,15 @@ LayoutMap GemmNode::InferLayout(const LayoutInferArgs &T,
     l = sunmmio::MakeZZ(c_->shape, axes_c,
                         GetSunmmioLayoutBlockShape(T.target, c_->dtype));
     results.Set(c_, l);
+    if (d_.defined()) {
+      const int rank_d = static_cast<int>(d_->shape.size());
+      ICHECK_GE(rank_d, 2)
+          << "Sunmmio GEMM D layout inference requires rank >= 2.";
+      Array<Integer> axes_d{Integer(rank_d - 2), Integer(rank_d - 1)};
+      l = sunmmio::MakeZZ(d_->shape, axes_d,
+                          GetSunmmioLayoutBlockShape(T.target, c_->dtype));
+      results.Set(d_, l);
+    }
   } else {
     ICHECK(0) << "Not supported " << T.target->str();
   }

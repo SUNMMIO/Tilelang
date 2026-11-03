@@ -85,6 +85,10 @@ class GemmBase:
         return getattr(self.gemm_node, "c", None)
 
     @property
+    def D(self) -> tir.Buffer | None:
+        return getattr(self.gemm_node, "d", None)
+
+    @property
     def ARegion(self):
         return getattr(self.gemm_node, "aRegion", None)
 
@@ -95,6 +99,10 @@ class GemmBase:
     @property
     def CRegion(self):
         return getattr(self.gemm_node, "cRegion", None)
+
+    @property
+    def DRegion(self):
+        return getattr(self.gemm_node, "dRegion", None)
 
     @property
     def stride_A(self) -> int:
@@ -115,6 +123,10 @@ class GemmBase:
     @property
     def clear_accum(self) -> PrimExpr:
         return getattr(self.gemm_node, "clearAccum", None)
+
+    @property
+    def store_output(self) -> PrimExpr:
+        return getattr(self.gemm_node, "storeOutput", tvm.tir.const(False, "bool"))
 
     @property
     def k_pack(self) -> int:
