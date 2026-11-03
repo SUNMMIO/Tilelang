@@ -138,7 +138,22 @@ class PassConfigKey(str, Enum):
     """Disable Sunmmio pipeline planning and injection. Default: False"""
 
     TL_SUNMMIO_PIPELINE_MODE = "tl.sunmmio_pipeline_mode"
-    """Select Sunmmio pipeline implementation. Accepts: "greedy", "ilp". Default: "greedy"."""
+    """Select Sunmmio pipeline implementation.
+
+    Accepts: "greedy", "ilp", "multidim_ilp". Default: "greedy".
+    """
+
+    TL_SUNMMIO_MULTIDIM_POLICY = "tl.sunmmio_multidim_policy"
+    """Select multidim ILP behavior. Accepts: "forced", "auto". Default: "auto"."""
+
+    TL_SUNMMIO_CROSS_OUTER_POLICY = "tl.sunmmio_cross_outer_policy"
+    """Select cross-outer behavior. "forced" rejects unsupported nests; "auto" falls back."""
+
+    TL_SUNMMIO_REGION_CROSS_OUTER_POLICY = "tl.sunmmio_region_cross_outer_policy"
+    """Select region-aware cross-outer behavior. Default: "auto"."""
+
+    TL_SUNMMIO_REGION_CROSS_OUTER_STRATEGY = "tl.sunmmio_region_cross_outer_strategy"
+    """Select region-aware scheduling strategy. Default: "continuous"."""
 
     TL_SUNMMIO_GEMM_TWO_COMMUNICATIONS = "tl.sunmmio_gemm_two_communications"
     """Use two Allgather-style transfers directly to ASRAM for supported BF16
@@ -154,8 +169,21 @@ class PassConfigKey(str, Enum):
     the positive value to scale command-latency estimates. A non-positive or
     unset ILP value selects the scaling factor automatically. Default: -1."""
 
+    TL_SUNMMIO_ILP_ENABLE_LATENCY_GCD = "tl.sunmmio_ilp_enable_latency_gcd"
+    """Enable auditable latency-GCD normalization before ILP faster scaling.
+
+    Multidim ILP enables this by default. One-dimensional ILP keeps it disabled
+    unless this option or TL_SUNMMIO_ILP_ENABLE_LATENCY_GCD is true.
+    """
+
     TL_SUNMMIO_ILP_STAGE_SHRINK = "tl.sunmmio_ilp_stage_shrink"
     """Enable Sunmmio ILP stage shrink: solve at original num_stages, then try smaller stages at fixed II and reoptimize on the minimum feasible stage. Default: False."""
+
+    TL_SUNMMIO_ILP_NESTED_PIPELINE = "tl.sunmmio_ilp_nested_pipeline"
+    """Enable recursive planning for nested Sunmmio ILP pipeline loops. Default: False."""
+
+    TL_SUNMMIO_ILP_NESTED_SUMMARY_V2 = "tl.sunmmio_ilp_nested_summary_v2"
+    """Use nested resource-window and buffer-frontier summaries. Default: False."""
 
     TL_SUNMMIO_ILP_MULTIVERSION_LIFETIME_PRUNING = "tl.sunmmio_ilp_multiversion_lifetime_pruning"
     """Prune unnecessary Sunmmio ILP runtime buffer versions using scheduled lifetimes. Disable to conservatively retain every theoretical version. Default: True."""

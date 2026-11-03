@@ -95,12 +95,16 @@
 #include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "common/attr.h"
+#include "sunmmio_mma_clear_fusion.h"
 
 namespace tvm {
 namespace tl {
 
 using namespace tir;
 using namespace tir::transform;
+
+// Use the JIT pass-config/cache-key path instead of a bare environment switch.
+TVM_REGISTER_PASS_CONFIG_OPTION("tl.sunmmio_mma_clear_fusion", Bool);
 
 namespace {
 
@@ -1660,15 +1664,8 @@ private:
 
 // ─── Pass driver ───────────────────────────────────────────────────────────
 
-PrimFunc Run(PrimFunc f, bool twice) {
-  auto target = f->GetAttr<Target>(tvm::attr::kTarget);
-  if (!target.defined() || !TargetIsSunmmio(target.value())) {
-    return f;
-  }
-
-  SunmmioTileProcessorConfig cfg =
-      GetSunmmioTileProcessorConfig(target.value());
-
+PrimFunc LegalizeBf16(PrimFunc f, Target target,
+                      const SunmmioTileProcessorConfig &cfg, bool twice) {
   Stmt body = f->body;
   auto original_gemms = Bf16AsramOperandFlow::Analyze(body, cfg);
   if (!original_gemms.empty()) {
@@ -1685,10 +1682,10 @@ PrimFunc Run(PrimFunc f, bool twice) {
           g.b_writer_rd.writer->op.same_as(BroadcastOp::Get()))
         b_broadcasts.insert(g.b_writer_rd.writer);
     }
-    body = GuardedPutGemmRewriter(body, target.value(), cfg, twice)(body);
+    body = GuardedPutGemmRewriter(body, target, cfg, twice)(body);
     ValidateGemms(Bf16AsramOperandFlow::Analyze(body, cfg), body,
-                  target.value());
-    body = BroadcastGatherRewriter(body, target.value(), cfg, twice,
+                  target);
+    body = BroadcastGatherRewriter(body, target, cfg, twice,
                                    std::move(a_broadcasts),
                                    std::move(b_broadcasts))(body);
   }
@@ -1706,7 +1703,7 @@ PrimFunc Run(PrimFunc f, bool twice) {
     return f;
 
   // Phase 2: validate. Rejects NONE / MULTIPLE / unsupported writer types.
-  ValidateGemms(gemms, fp->body, target.value());
+  ValidateGemms(gemms, fp->body, target);
 
   // Collect scope paths for each writer and gemm we're acting on, so the
   // planner can classify by scope-path comparison rather than IR-shape walk.
@@ -1722,9 +1719,35 @@ PrimFunc Run(PrimFunc f, bool twice) {
   std::vector<Action> plan = BuildPlan(fp->body, gemms, path_collector);
 
   // Phase 4: drive the rewrite from the plan.
-  LegalizeSunmmioGemmRewriter rewriter(target.value(), cfg, plan);
+  LegalizeSunmmioGemmRewriter rewriter(target, cfg, plan);
   fp->body = rewriter(fp->body);
   return f;
+}
+
+PrimFunc Run(PrimFunc f, bool twice, bool fuse_clear) {
+  auto target = f->GetAttr<Target>(tvm::attr::kTarget);
+  if (!target.defined() || !TargetIsSunmmio(target.value()))
+    return f;
+  SunmmioTileProcessorConfig cfg =
+      GetSunmmioTileProcessorConfig(target.value());
+  if (!fuse_clear || !VerifySSA(f))
+    return LegalizeBf16(std::move(f), target.value(), cfg, twice);
+
+  // Fail closed: if optional fusion cannot be verified, preserve ordinary
+  // BF16 legalization and discard only the fusion attempt.
+  PrimFunc original = f;
+  sunmmio_mma_clear_fusion::Rewriter fusion(f, target.value(), cfg);
+  Stmt body = fusion(f->body);
+  if (fusion.plans.empty())
+    return LegalizeBf16(std::move(f), target.value(), cfg, twice);
+  f.CopyOnWrite()->body = body;
+  if (!VerifySSA(f))
+    return LegalizeBf16(std::move(original), target.value(), cfg, twice);
+  PrimFunc legalized =
+      LegalizeBf16(std::move(f), target.value(), cfg, twice);
+  if (!sunmmio_mma_clear_fusion::VerifyLegalized(legalized, fusion.plans))
+    return LegalizeBf16(std::move(original), target.value(), cfg, twice);
+  return legalized;
 }
 
 } // namespace
@@ -1734,7 +1757,9 @@ Pass LegalizeSunmmioGemm() {
     bool twice =
         ctx->GetConfig<Bool>(kSunmmioGemmTwoCommunications, Bool(false))
             .value();
-    return Run(std::move(f), twice);
+    bool fuse_clear =
+        ctx->GetConfig<Bool>("tl.sunmmio_mma_clear_fusion", Bool(true)).value();
+    return Run(std::move(f), twice, fuse_clear);
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.LegalizeSunmmioGemm", {});
 }

@@ -316,6 +316,7 @@ file(GLOB TILE_LANG_SRCS
 # of backend-disabled builds so a regular TileLang build does not require HiGHS.
 set(TILELANG_SUNMMIO_ILP_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/transform/inject_sunmmio_pipeline_ilp.cc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/transform/sunmmio_multidim_pipeline.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/transform/sunmmio_pipeline_planning_ilp.cc"
 )
 list(REMOVE_ITEM TILE_LANG_SRCS ${TILELANG_SUNMMIO_ILP_SRCS})

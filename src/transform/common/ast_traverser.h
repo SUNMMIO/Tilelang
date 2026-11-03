@@ -247,6 +247,9 @@ public:
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
 
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
+      if (call->args.size() == 9U) {
+        write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[7]));
+      }
     } else {
       auto [read_regions, write_regions] = buffer_region_collector(op->value);
       for (auto it : read_regions) {

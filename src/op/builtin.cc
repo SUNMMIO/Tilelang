@@ -39,8 +39,18 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kLayoutVisualizationEnable, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kLayoutVisualizationFormats, String);
 TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioPipelineMode, String);
 TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioGemmTwoCommunications, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioMultidimPolicy, String);
+TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioCrossOuterPolicy, String);
+TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioRegionCrossOuterPolicy, String);
+TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioRegionCrossOuterStrategy, String);
 TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioFaster, Integer);
+TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioILPEnableLatencyGCD, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioCostModel, String);
+TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioCostModelFallback, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioCostModelPreserveCycles, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioILPStageShrink, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioILPNestedPipeline, Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioILPNestedSummaryV2, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioILPMultiversionLifetimePruning, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioILPModelVCBlockingIssue, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kDeviceCompileFlags, ffi::Array<ffi::String>);
@@ -549,6 +559,10 @@ TIR_DEFINE_TL_BUILTIN(barrier_init)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 TIR_DEFINE_TL_BUILTIN(barrier_arrive_and_wait)
+    .set_num_inputs(1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+TIR_DEFINE_TL_BUILTIN(sync_token_id)
     .set_num_inputs(1)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));

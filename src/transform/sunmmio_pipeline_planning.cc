@@ -18,20 +18,28 @@
 #include "../op/utils.h"
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
+#include "../target/sunmmio/sunmmio_async_op_info.h"
 #include "../target/sunmmio_utils.h"
 #include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
 #include "sunmmio_pipeline_planning/resource_types_for_ilp.h"
 #include "sunmmio_pipeline_planning/stmt_read_write_collector.h"
+#include "sunmmio_pipeline_planning/sunmmio_pipeline_utils.h"
+#include "sunmmio_pipeline_planning/tile_residency_analysis.h"
+#include "sunmmio_pipeline_planning/grouping_snapshot.h"
+#include <tvm/ffi/extra/structural_hash.h>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -131,6 +139,7 @@ public:
 
   // Pre-calculated delay (to be injected by CostModel)
   float delay{0.0f};
+  CostEstimate cost_estimate;
 
   PipelineInstruction(int id, int iter, Stmt stmt)
       : id(id), iter(iter), stmt(stmt),
@@ -710,7 +719,8 @@ ValidateLocalDDG(const std::vector<PipelineInstruction> &instructions,
 
 static void MaybeWriteGreedyGraphJson(
     const std::vector<PipelineInstruction> &instructions, const LocalDDG &ddg,
-    const std::unordered_set<const BufferNode *> &versioned_buffers) {
+    const std::unordered_set<const BufferNode *> &versioned_buffers,
+    const CostModelContext &cost_context) {
   const char *path = std::getenv("TL_SUNMMIO_PIPELINE_GRAPH_JSON");
   if (path == nullptr || path[0] == '\0') {
     return;
@@ -720,24 +730,127 @@ static void MaybeWriteGreedyGraphJson(
     LOG(WARNING) << "Cannot write pipeline graph JSON to " << path;
     return;
   }
-  out << "{\n  \"mode\": \"greedy\",\n  \"commands\": [\n";
+  bool fallback_used = false;
+  bool solver_scaled = false;
+  int64_t solver_scale_factor = 1;
+  for (const PipelineInstruction &instruction : instructions) {
+    fallback_used = fallback_used || instruction.cost_estimate.used_fallback;
+    solver_scaled = solver_scaled || instruction.cost_estimate.solver_scaled;
+    solver_scale_factor = std::max(
+        solver_scale_factor, instruction.cost_estimate.solver_scale_factor);
+  }
+  auto write_json_string = [&](const std::string &value) {
+    out << '"';
+    for (char c : value) {
+      switch (c) {
+      case '\\':
+        out << "\\\\";
+        break;
+      case '"':
+        out << "\\\"";
+        break;
+      case '\n':
+        out << "\\n";
+        break;
+      case '\r':
+        out << "\\r";
+        break;
+      case '\t':
+        out << "\\t";
+        break;
+      default:
+        out << c;
+        break;
+      }
+    }
+    out << '"';
+  };
+  auto write_cost_estimate = [&](const CostEstimate &estimate) {
+    out << "{";
+    out << "\"profile\": ";
+    write_json_string(std::string(estimate.profile));
+    out << ", \"model_version\": ";
+    write_json_string(std::string(estimate.model_version));
+    out << ", \"latency_source\": ";
+    write_json_string(std::string(estimate.latency_source));
+    out << ", \"fallback_reason\": ";
+    write_json_string(std::string(estimate.fallback_reason));
+    out << ", \"op_kind\": ";
+    write_json_string(std::string(estimate.op_kind));
+    out << ", \"transfer_path\": ";
+    write_json_string(std::string(estimate.transfer_path));
+    out << ", \"src_scope\": ";
+    write_json_string(std::string(estimate.src_scope));
+    out << ", \"dst_scope\": ";
+    write_json_string(std::string(estimate.dst_scope));
+    out << ", \"input_dtype\": ";
+    write_json_string(std::string(estimate.input_dtype));
+    out << ", \"output_dtype\": ";
+    write_json_string(std::string(estimate.output_dtype));
+    out << ", \"latency_cycles\": " << estimate.latency_cycles;
+    out << ", \"issue_start_cycles\": " << estimate.issue_start_cycles;
+    out << ", \"issue_finish_cycles\": " << estimate.issue_finish_cycles;
+    out << ", \"bytes\": " << estimate.bytes;
+    out << ", \"packet_count\": " << estimate.packet_count;
+    out << ", \"path_start_delay\": " << estimate.path_start_delay;
+    out << ", \"row_size\": " << estimate.row_size;
+    out << ", \"col_size\": " << estimate.col_size;
+    out << ", \"reduction_size\": " << estimate.reduction_size;
+    out << ", \"vector_chunks\": " << estimate.vector_chunks;
+    out << ", \"load_ops\": " << estimate.load_ops;
+    out << ", \"store_ops\": " << estimate.store_ops;
+    out << ", \"arithmetic_ops\": " << estimate.arithmetic_ops;
+    out << ", \"compare_convert_ops\": " << estimate.compare_convert_ops;
+    out << ", \"nonlinear_ops\": " << estimate.nonlinear_ops;
+    out << ", \"reduce_ops\": " << estimate.reduce_ops;
+    out << ", \"galu_ops\": " << estimate.galu_ops;
+    out << ", \"exact_static_submodel\": " << estimate.exact_static_submodel;
+    out << ", \"used_fallback\": " << estimate.used_fallback;
+    out << ", \"solver_scale_factor\": " << estimate.solver_scale_factor;
+    out << ", \"solver_latency_cycles\": " << estimate.solver_latency_cycles;
+    out << ", \"solver_scaled\": " << estimate.solver_scaled;
+    out << ", \"endpoint_timing_modeled\": "
+        << estimate.endpoint_timing_modeled;
+    out << ", \"resource_overlap_modeled\": "
+        << estimate.resource_overlap_modeled;
+    out << "}";
+  };
+
+  out << std::boolalpha;
+  out << "{\n  \"mode\": \"greedy\",\n";
+  out << "  \"cost_model\": {\"profile\": ";
+  write_json_string(CostModel::ProfileName(cost_context.options.profile));
+  out << ", \"preserve_absolute_cycles\": "
+      << cost_context.options.preserve_absolute_cycles;
+  out << ", \"solver_scale_factor\": " << solver_scale_factor;
+  out << ", \"solver_scaled\": " << solver_scaled;
+  out << ", \"latency_gcd\": 1";
+  out << ", \"auto_faster_selected\": false";
+  out << ", \"planner_fallback\": false";
+  out << ", \"fallback_used\": " << fallback_used;
+  out << "},\n  \"commands\": [\n";
   for (size_t i = 0; i < instructions.size(); ++i) {
     const PipelineInstruction &instruction = instructions[i];
     out << "    {\"id\": " << instruction.id
         << ", \"iteration_offset\": 0, \"hardware\": "
         << static_cast<int>(instruction.device_type)
         << ", \"resource\": " << instruction.execution_resource
-        << ", \"reads\": [";
+        << ", \"static_model_cycles\": "
+        << instruction.cost_estimate.latency_cycles
+        << ", \"planned_duration_cycles\": "
+        << instruction.cost_estimate.latency_cycles << ", \"cost_estimate\": ";
+    write_cost_estimate(instruction.cost_estimate);
+    out << ", \"reads\": [";
     for (size_t j = 0; j < instruction.reads.size(); ++j) {
       if (j != 0)
         out << ", ";
-      out << "\"" << instruction.reads[j]->buffer->name << "\"";
+      write_json_string(instruction.reads[j]->buffer->name);
     }
     out << "], \"writes\": [";
     for (size_t j = 0; j < instruction.writes.size(); ++j) {
       if (j != 0)
         out << ", ";
-      out << "\"" << instruction.writes[j]->buffer->name << "\"";
+      write_json_string(instruction.writes[j]->buffer->name);
     }
     out << "]}" << (i + 1 == instructions.size() ? "\n" : ",\n");
   }
@@ -1023,12 +1136,7 @@ private:
 
   static bool IsPrefetchEvaluate(const EvaluateNode &evaluate) {
     auto call = evaluate.value.as<CallNode>();
-    if (!call) {
-      return false;
-    }
-    return call->op.same_as(Op::Get("tl.dma_copy")) ||
-           call->op.same_as(Op::Get("tl.broadcast_")) ||
-           call->op.same_as(Op::Get("tl.sunmmio_layout_transform"));
+    return IsSunmmioAsyncODMAOp(call);
   }
 
   static bool WasBufferReadBeforeInstruction(const LocalDDG &local_ddg,
@@ -1792,9 +1900,11 @@ public:
   }
 
   SunmmioPipelinePlanner(const PrimFunc &f, bool debug)
-      : stmt_rw_collector_(f), debug_(debug) {}
+      : stmt_rw_collector_(f), cost_context_(CostModel::BuildContext(f)),
+        debug_(debug) {}
 
   StmtReadWriteCollector stmt_rw_collector_;
+  CostModelContext cost_context_;
   bool debug_ = false;
 
   Stmt VisitStmt_(const ForNode *op) final {
@@ -1859,8 +1969,10 @@ public:
       instruction.device_type = HardwareMapper::Map(instruction.stmt);
       instruction.ExtractRegions(stmt_rw_collector_);
       instruction.execution_resource = GetGreedyExecutionResource(instruction);
+      instruction.cost_estimate = CostModel::Estimate(
+          instruction.device_type, instruction.stmt, cost_context_);
       instruction.delay =
-          CostModel::EstimateDelay(instruction.device_type, instruction.stmt);
+          static_cast<float>(instruction.cost_estimate.latency_cycles);
       single_iteration_instructions.push_back(instruction);
     }
 
@@ -1938,7 +2050,7 @@ public:
         MultiversioningIdentifier::Identify(single_iteration_instructions,
                                             local_ddg);
     MaybeWriteGreedyGraphJson(single_iteration_instructions, local_ddg,
-                              versioned_buffers);
+                              versioned_buffers, cost_context_);
 
     if (debug_) {
       std::cout << "[Pipeline Planner] Identified " << versioned_buffers.size()
@@ -2213,6 +2325,1813 @@ public:
   }
 };
 
+struct CrossOuterCollectiveDescriptor {
+  int command_id{-1};
+  int direction{-1};
+  int64_t participant_mask{0};
+  Buffer source;
+  Buffer destination;
+};
+
+struct CrossOuterCollectiveAnalysis {
+  bool valid{true};
+  std::string reason;
+  std::string detail;
+  std::vector<CrossOuterCollectiveDescriptor> descriptors;
+};
+
+static bool ContainsBroadcast(const Stmt &stmt) {
+  bool found = false;
+  PostOrderVisit(stmt, [&](const ObjectRef &obj) {
+    const auto *call = obj.as<CallNode>();
+    if (call && call->op.same_as(Op::Get("tl.broadcast_"))) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+static CrossOuterCollectiveAnalysis
+AnalyzeCrossOuterCollectives(const SeqStmtNode *body) {
+  CrossOuterCollectiveAnalysis result;
+  for (size_t command_id = 0; command_id < body->seq.size(); ++command_id) {
+    int command_collective_count = 0;
+    PostOrderVisit(body->seq[command_id], [&](const ObjectRef &obj) {
+      if (!result.valid) {
+        return;
+      }
+      if (const auto *conditional = obj.as<IfThenElseNode>()) {
+        if (ContainsBroadcast(tvm::ffi::GetRef<Stmt>(conditional))) {
+          result.valid = false;
+          result.reason = "conditional_collective";
+          result.detail =
+              "all-gather inside conditional control flow is unsupported";
+        }
+        return;
+      }
+      const auto *call = obj.as<CallNode>();
+      if (!call || !call->op.same_as(Op::Get("tl.broadcast_"))) {
+        return;
+      }
+      ++command_collective_count;
+      if (command_collective_count > 1) {
+        result.valid = false;
+        result.reason = "multiple_collectives_per_command";
+        result.detail = "each Core command may contain at most one all-gather";
+        return;
+      }
+      size_t semantic_args = call->args.size();
+      if (semantic_args == 0 ||
+          !ParseSunmmioOdmaUnitExpr(call->args[semantic_args - 1])) {
+        result.valid = false;
+        result.reason = "missing_resolved_odma_unit";
+        result.detail = "all-gather requires a resolved ODMA unit";
+        return;
+      }
+      --semantic_args;
+      if (semantic_args != static_cast<size_t>(kBroadcastArgCount)) {
+        result.valid = false;
+        result.reason = "unsupported_broadcast";
+        result.detail =
+            "only all-gather broadcast without explicit src_core is supported";
+        return;
+      }
+      const auto *direction =
+          call->args[kBroadcastArgDirection].as<IntImmNode>();
+      const auto *participant_mask =
+          call->args[kBroadcastArgMask].as<IntImmNode>();
+      if (direction == nullptr ||
+          (direction->value != 0 && direction->value != 1)) {
+        result.valid = false;
+        result.reason = "dynamic_collective_direction";
+        result.detail =
+            "all-gather direction must be static horizontal or vertical";
+        return;
+      }
+      if (participant_mask == nullptr || participant_mask->value <= 0) {
+        result.valid = false;
+        result.reason = "dynamic_collective_mask";
+        result.detail =
+            "all-gather participant mask must be a positive static value";
+        return;
+      }
+      CrossOuterCollectiveDescriptor descriptor;
+      descriptor.command_id = static_cast<int>(command_id);
+      descriptor.direction = static_cast<int>(direction->value);
+      descriptor.participant_mask = participant_mask->value;
+      descriptor.source =
+          NormalizeToBufferRegion(call->args[kBroadcastArgSrc])->buffer;
+      descriptor.destination =
+          NormalizeToBufferRegion(call->args[kBroadcastArgDst])->buffer;
+      result.descriptors.push_back(std::move(descriptor));
+    });
+    if (!result.valid) {
+      return result;
+    }
+  }
+  return result;
+}
+
+static bool ValidateCrossOuterCollectiveEpochOrder(
+    const CrossOuterCollectiveAnalysis &analysis, int64_t ii,
+    const Array<Integer> &command_start_times,
+    const Array<Integer> &command_emit_priorities, std::string *detail) {
+  if (analysis.descriptors.empty()) {
+    return true;
+  }
+  ICHECK_EQ(command_start_times.size(), command_emit_priorities.size());
+  auto event_key = [&](const CrossOuterCollectiveDescriptor &descriptor,
+                       int64_t epoch_offset = 0) {
+    ICHECK_GE(descriptor.command_id, 0);
+    ICHECK_LT(descriptor.command_id,
+              static_cast<int>(command_start_times.size()));
+    return std::make_tuple(
+        epoch_offset + command_start_times[descriptor.command_id]->value,
+        command_emit_priorities[descriptor.command_id]->value,
+        descriptor.command_id);
+  };
+  for (size_t i = 1; i < analysis.descriptors.size(); ++i) {
+    if (!(event_key(analysis.descriptors[i - 1]) <
+          event_key(analysis.descriptors[i]))) {
+      *detail =
+          "all-gather order inside one logical bk iteration is not strict";
+      return false;
+    }
+  }
+  if (!(event_key(analysis.descriptors.back()) <
+        event_key(analysis.descriptors.front(), ii))) {
+    *detail = "last all-gather overlaps the next logical collective epoch";
+    return false;
+  }
+  return true;
+}
+
+static std::string
+FindCrossOuterForbiddenOperation(const Stmt &body,
+                                 bool allow_safe_all_gather = false) {
+  std::string forbidden;
+  auto inspect_name = [&forbidden](std::string name) {
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    static const std::array<const char *, 7> tokens = {
+        "barrier",    "broadcast", "all_gather", "allgather",
+        "all_reduce", "allreduce", "collective"};
+    for (const char *token : tokens) {
+      if (name.find(token) != std::string::npos) {
+        forbidden = std::move(name);
+        return;
+      }
+    }
+  };
+  PostOrderVisit(body, [&](const ObjectRef &obj) {
+    if (!forbidden.empty()) {
+      return;
+    }
+    const auto *call = obj.as<CallNode>();
+    if (!call) {
+      return;
+    }
+    if (allow_safe_all_gather && call->op.same_as(Op::Get("tl.broadcast_"))) {
+      return;
+    }
+    if (const auto *op = call->op.as<OpNode>()) {
+      inspect_name(op->name);
+    }
+    for (const PrimExpr &arg : call->args) {
+      if (const auto *text = arg.as<StringImmNode>()) {
+        inspect_name(text->value);
+      }
+    }
+  });
+  return forbidden;
+}
+
+class SunmmioCrossOuterPipelinePlanner : public StmtExprMutator {
+public:
+  SunmmioCrossOuterPipelinePlanner(const PrimFunc &func, bool debug,
+                                   bool forced)
+      : func_(func), debug_(debug), forced_(forced) {}
+
+  static Stmt Substitute(const PrimFunc &func, bool debug, bool forced,
+                         int *applied_count) {
+    SunmmioCrossOuterPipelinePlanner planner(func, debug, forced);
+    Stmt result = planner(func->body);
+    *applied_count = planner.applied_count_;
+    return result;
+  }
+
+private:
+
+  Stmt Reject(const ForNode *outer, const std::string &reason,
+              const std::string &detail) {
+    if (forced_) {
+      LOG(FATAL) << "[SunmmioPipeline][cross_outer][ForcedReject] reason="
+                 << reason << " detail=" << detail;
+    }
+    For fallback = tvm::ffi::GetRef<For>(outer);
+    Map<String, Any> annotations = fallback->annotations;
+    SetCrossOuterFallbackAnnotations(&annotations, "planning", reason, detail);
+    fallback.CopyOnWrite()->annotations = annotations;
+    return fallback;
+  }
+
+  Stmt VisitStmt_(const ForNode *outer) final {
+    const auto *inner = outer->body.as<ForNode>();
+    if (inner == nullptr ||
+        inner->annotations.find("num_stages") == inner->annotations.end()) {
+      return StmtExprMutator::VisitStmt_(outer);
+    }
+
+    if (outer->kind != ForKind::kSerial || inner->kind != ForKind::kSerial) {
+      return Reject(outer, "non_serial_loop",
+                    "both outer and inner loops must be serial");
+    }
+    if (inner->body.as<SeqStmtNode>() == nullptr) {
+      return Reject(outer, "non_direct_sequence_body",
+                    "the inner loop body must be a direct SeqStmt");
+    }
+
+    arith::Analyzer analyzer;
+    PrimExpr simplified_outer_min = analyzer.Simplify(outer->min);
+    PrimExpr simplified_outer_extent = analyzer.Simplify(outer->extent);
+    PrimExpr simplified_inner_min = analyzer.Simplify(inner->min);
+    PrimExpr simplified_inner_extent = analyzer.Simplify(inner->extent);
+    const auto *outer_min = simplified_outer_min.as<IntImmNode>();
+    const auto *outer_extent = simplified_outer_extent.as<IntImmNode>();
+    const auto *inner_min = simplified_inner_min.as<IntImmNode>();
+    const auto *inner_extent = simplified_inner_extent.as<IntImmNode>();
+    if (outer_min == nullptr || outer_extent == nullptr ||
+        inner_min == nullptr || inner_extent == nullptr) {
+      return Reject(
+          outer, "dynamic_range_unsupported",
+          "both loop minima and extents must be compile-time integers");
+    }
+    if (outer_extent->value <= 1 || inner_extent->value <= 0) {
+      return Reject(
+          outer, "invalid_extent",
+          "outer extent must exceed one and inner extent must be positive");
+    }
+
+    auto stages_anno = inner->annotations.Get("num_stages");
+    const auto *stages_imm =
+        stages_anno ? stages_anno.value().as<IntImmNode>() : nullptr;
+    if (stages_imm == nullptr || stages_imm->value <= 0) {
+      return Reject(outer, "invalid_stage_count",
+                    "num_stages must be a positive compile-time integer");
+    }
+    int64_t stages = stages_imm->value;
+    if (inner_extent->value < stages || inner_extent->value % stages != 0) {
+      return Reject(
+          outer, "inner_extent_not_stage_aligned",
+          "inner extent must be at least num_stages and divisible by it");
+    }
+
+    std::string forbidden = FindCrossOuterForbiddenOperation(inner->body);
+    if (!forbidden.empty()) {
+      return Reject(outer, "forbidden_operation", forbidden);
+    }
+
+    if (outer_extent->value >
+        std::numeric_limits<int64_t>::max() / inner_extent->value) {
+      return Reject(outer, "extent_overflow",
+                    "outer_extent * inner_extent exceeds int64");
+    }
+    int64_t total_extent = outer_extent->value * inner_extent->value;
+
+    Var logical(std::string(outer->loop_var->name_hint) +
+                    "_cross_outer_logical",
+                outer->loop_var.dtype());
+    Map<Var, PrimExpr> substitutions;
+    substitutions.Set(outer->loop_var,
+                      outer->min +
+                          floordiv(logical, Integer(inner_extent->value)));
+    substitutions.Set(inner->loop_var,
+                      inner->min +
+                          floormod(logical, Integer(inner_extent->value)));
+    Stmt synthetic_body = tir::Substitute(inner->body, substitutions);
+    For synthetic_loop(logical, Integer(0), Integer(total_extent),
+                       ForKind::kSerial, synthetic_body, inner->thread_binding,
+                       inner->annotations);
+    PrimFunc synthetic_func = func_;
+    synthetic_func.CopyOnWrite()->body = synthetic_loop;
+    Stmt planned_stmt =
+        SunmmioPipelinePlanner::Substitute(synthetic_func, debug_);
+    const auto *planned = planned_stmt.as<ForNode>();
+    ICHECK(planned != nullptr)
+        << "cross_outer synthetic planner must return a For";
+    if (!planned->annotations.count("prologue_orders") ||
+        !planned->annotations.count("body_orders")) {
+      std::string reason = "synthetic_planning_failed";
+      std::string detail;
+      if (auto ann = planned->annotations.Get(kPipelineFallbackReason)) {
+        reason = std::string(Downcast<String>(ann.value()));
+      }
+      if (auto ann = planned->annotations.Get(kPipelineFallbackDetail)) {
+        detail = std::string(Downcast<String>(ann.value()));
+      }
+      return Reject(outer, reason, detail);
+    }
+
+    Map<String, Any> annotations = outer->annotations;
+    for (const auto &[key, value] : planned->annotations) {
+      if (key != "num_stages") {
+        annotations.Set(key, value);
+      }
+    }
+    SetPipelineAppliedAnnotations(&annotations, "cross_outer");
+    annotations.Set(kCrossOuterMarker, Bool(true));
+    annotations.Set(kCrossOuterRequested, Bool(true));
+    annotations.Set(kCrossOuterOuterExtent, Integer(outer_extent->value));
+    annotations.Set(kCrossOuterInnerExtent, Integer(inner_extent->value));
+    annotations.erase(kCrossOuterFallbackStage);
+    annotations.erase(kCrossOuterFallbackReason);
+    annotations.erase(kCrossOuterFallbackDetail);
+    ++applied_count_;
+
+    return For(outer->loop_var, outer->min, outer->extent, outer->kind,
+               outer->body, outer->thread_binding, annotations);
+  }
+
+  PrimFunc func_;
+  bool debug_{false};
+  bool forced_{false};
+  int applied_count_{0};
+};
+
+class CrossOuterUnmatchedLoopAnnotator : public StmtMutator {
+private:
+  Stmt VisitStmt_(const ForNode *op) final {
+    For loop = Downcast<For>(StmtMutator::VisitStmt_(op));
+    if (!op->annotations.count("num_stages")) {
+      return loop;
+    }
+    Map<String, Any> annotations = loop->annotations;
+    SetCrossOuterFallbackAnnotations(
+        &annotations, "planning", "no_direct_outer_inner_nest",
+        "the pipelined loop is not the direct body of a serial outer loop");
+    loop.CopyOnWrite()->annotations = annotations;
+    return loop;
+  }
+};
+
+struct RegionCrossOuterCandidate {
+  Array<Stmt> prefix;
+  For core;
+  Array<Stmt> suffix;
+  int core_index{-1};
+};
+
+struct RegionCrossOuterAccessSummary {
+  std::vector<BufferRegion> reads;
+  std::vector<BufferRegion> writes;
+};
+
+struct RegionCrossOuterEventAnalysis {
+  bool valid{false};
+  bool boundary_overlap{false};
+  std::string detail;
+};
+
+static bool IsSupportedRegionStatement(const Stmt &stmt) {
+  return stmt.as<ForNode>() || stmt.as<EvaluateNode>() ||
+         stmt.as<BufferStoreNode>() || stmt.as<BlockRealizeNode>() ||
+         stmt.as<AttrStmtNode>() || stmt.as<LetStmtNode>() ||
+         stmt.as<IfThenElseNode>();
+}
+
+static RegionCrossOuterAccessSummary
+CollectRegionAccesses(const PrimFunc &func, const Array<Stmt> &statements) {
+  RegionCrossOuterAccessSummary result;
+  StmtReadWriteCollector collector(func);
+  for (const Stmt &stmt : statements) {
+    collector.traverse_stmt(stmt);
+    result.reads.insert(result.reads.end(),
+                        collector.read_buffer_regions_.begin(),
+                        collector.read_buffer_regions_.end());
+    result.writes.insert(result.writes.end(),
+                         collector.write_buffer_regions_.begin(),
+                         collector.write_buffer_regions_.end());
+  }
+  return result;
+}
+
+static bool RegionsDisjointForAdjacentOuter(const BufferRegion &source,
+                                            const BufferRegion &target,
+                                            const Var &outer_var,
+                                            const PrimExpr &outer_min) {
+  if (!source->buffer.same_as(target->buffer) ||
+      source->region.size() != target->region.size()) {
+    return false;
+  }
+  Map<Var, PrimExpr> source_substitution;
+  source_substitution.Set(outer_var, outer_min);
+  Map<Var, PrimExpr> target_substitution;
+  target_substitution.Set(outer_var, outer_min + Integer(1));
+  arith::Analyzer analyzer;
+  for (size_t axis = 0; axis < source->region.size(); ++axis) {
+    const Range &source_range = source->region[axis];
+    const Range &target_range = target->region[axis];
+    PrimExpr source_begin = analyzer.Simplify(
+        tir::Substitute(source_range->min, source_substitution));
+    PrimExpr source_end =
+        analyzer.Simplify(source_begin + tir::Substitute(source_range->extent,
+                                                         source_substitution));
+    PrimExpr target_begin = analyzer.Simplify(
+        tir::Substitute(target_range->min, target_substitution));
+    PrimExpr target_end =
+        analyzer.Simplify(target_begin + tir::Substitute(target_range->extent,
+                                                         target_substitution));
+    if (analyzer.CanProve(
+            Or(LE(source_end, target_begin), LE(target_end, source_begin)))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static RegionCrossOuterEventAnalysis AnalyzeRegionCrossOuterEvents(
+    int64_t outer_extent, int64_t inner_extent, int iterations,
+    int command_count, const Array<String> &prologue_orders,
+    const Array<String> &body_orders, const Array<String> &epilogue_orders) {
+  RegionCrossOuterEventAnalysis result;
+  if (outer_extent <= 1 || inner_extent <= 0 || iterations <= 0 ||
+      command_count <= 0) {
+    result.detail = "invalid event dimensions";
+    return result;
+  }
+  int64_t total_extent = outer_extent * inner_extent;
+  if (total_extent % iterations != 0) {
+    result.detail = "total extent is not stage aligned";
+    return result;
+  }
+  constexpr uint64_t kMaxRegionEvents = 16384;
+  uint64_t expected = static_cast<uint64_t>(total_extent) *
+                      static_cast<uint64_t>(command_count);
+  if (expected > kMaxRegionEvents) {
+    result.detail = "event_stream_too_large";
+    return result;
+  }
+
+  std::vector<int64_t> first(outer_extent, -1);
+  std::vector<int64_t> last(outer_extent, -1);
+  std::unordered_set<uint64_t> covered;
+  int64_t position = 0;
+  auto record = [&](const String &order, int64_t base) {
+    int iter = name2iter(order);
+    int id = name2id(order);
+    int64_t logical = base + iter;
+    if (id < 0 || id >= command_count || logical < 0 ||
+        logical >= total_extent) {
+      std::ostringstream os;
+      os << "out-of-range event " << order << " at logical " << logical;
+      result.detail = os.str();
+      return false;
+    }
+    uint64_t key =
+        static_cast<uint64_t>(logical) * static_cast<uint64_t>(command_count) +
+        static_cast<uint64_t>(id);
+    if (!covered.insert(key).second) {
+      result.detail = "duplicate core event";
+      return false;
+    }
+    int64_t outer = logical / inner_extent;
+    if (first[outer] < 0) {
+      first[outer] = position;
+    }
+    last[outer] = position++;
+    return true;
+  };
+
+  for (const String &order : prologue_orders) {
+    if (!record(order, 0)) {
+      return result;
+    }
+  }
+  int64_t total_chunks = total_extent / iterations;
+  for (int64_t chunk = 0; chunk + 1 < total_chunks; ++chunk) {
+    for (const String &order : body_orders) {
+      if (!record(order, chunk * iterations)) {
+        return result;
+      }
+    }
+  }
+  for (const String &order : epilogue_orders) {
+    if (!record(order, (total_chunks - 1) * iterations)) {
+      return result;
+    }
+  }
+  if (covered.size() != expected) {
+    std::ostringstream os;
+    os << "core coverage=" << covered.size() << " expected=" << expected;
+    result.detail = os.str();
+    return result;
+  }
+  for (int64_t outer = 0; outer < outer_extent; ++outer) {
+    if (first[outer] < 0 || last[outer] < first[outer]) {
+      result.detail = "outer iteration has no complete core interval";
+      return result;
+    }
+    if (outer + 1 < outer_extent && first[outer + 1] < last[outer]) {
+      result.boundary_overlap = true;
+    }
+  }
+  result.valid = true;
+  return result;
+}
+
+static RegionCrossOuterEventAnalysis
+AnalyzeHierarchicalILPEvents(int64_t outer_extent, int64_t inner_extent,
+                             int command_count, int64_t ii,
+                             const Array<Integer> &command_start_times,
+                             const Array<Integer> &command_emit_priorities) {
+  RegionCrossOuterEventAnalysis result;
+  if (outer_extent <= 1 || inner_extent <= 0 || command_count <= 0 || ii <= 0 ||
+      command_start_times.size() != static_cast<size_t>(command_count) ||
+      command_emit_priorities.size() != static_cast<size_t>(command_count)) {
+    result.detail = "invalid hierarchical event dimensions";
+    return result;
+  }
+  if (inner_extent > std::numeric_limits<int64_t>::max() / ii ||
+      outer_extent >
+          std::numeric_limits<int64_t>::max() / (inner_extent * ii)) {
+    result.detail = "hierarchical event time overflow";
+    return result;
+  }
+  constexpr uint64_t kMaxRegionEvents = 16384;
+  uint64_t expected = static_cast<uint64_t>(outer_extent) *
+                      static_cast<uint64_t>(inner_extent) *
+                      static_cast<uint64_t>(command_count);
+  if (expected > kMaxRegionEvents) {
+    result.detail = "event_stream_too_large";
+    return result;
+  }
+
+  struct EventKey {
+    int64_t time;
+    int priority;
+    int id;
+    int64_t logical;
+    int64_t outer;
+  };
+  std::vector<EventKey> events;
+  events.reserve(expected);
+  int64_t outer_stride = inner_extent * ii;
+  for (int64_t outer = 0; outer < outer_extent; ++outer) {
+    for (int64_t inner = 0; inner < inner_extent; ++inner) {
+      int64_t logical = outer * inner_extent + inner;
+      for (int id = 0; id < command_count; ++id) {
+        int64_t start = command_start_times[id]->value;
+        int priority = command_emit_priorities[id]->value;
+        events.push_back(EventKey{outer * outer_stride + inner * ii + start,
+                                  priority, id, logical, outer});
+      }
+    }
+  }
+  std::sort(events.begin(), events.end(),
+            [](const EventKey &lhs, const EventKey &rhs) {
+              return std::tie(lhs.time, lhs.priority, lhs.id, lhs.logical) <
+                     std::tie(rhs.time, rhs.priority, rhs.id, rhs.logical);
+            });
+
+  std::vector<int64_t> first(outer_extent, -1);
+  std::vector<int64_t> last(outer_extent, -1);
+  for (size_t position = 0; position < events.size(); ++position) {
+    int64_t outer = events[position].outer;
+    if (first[outer] < 0) {
+      first[outer] = static_cast<int64_t>(position);
+    }
+    last[outer] = static_cast<int64_t>(position);
+  }
+  for (int64_t outer = 0; outer < outer_extent; ++outer) {
+    if (first[outer] < 0 || last[outer] < first[outer]) {
+      result.detail = "outer iteration has no complete core interval";
+      return result;
+    }
+    if (outer + 1 < outer_extent && first[outer + 1] < last[outer]) {
+      result.boundary_overlap = true;
+    }
+  }
+  result.valid = true;
+  return result;
+}
+
+class SunmmioRegionCrossOuterPipelinePlanner : public StmtExprMutator {
+public:
+  SunmmioRegionCrossOuterPipelinePlanner(const PrimFunc &func, bool debug,
+                                         bool forced, std::string strategy)
+      : func_(func), debug_(debug), forced_(forced),
+        strategy_(strategy == "multidim_boundary" ? "hierarchical_ilp" : strategy),
+        only_proved_boundary_(strategy == "multidim_boundary") {
+    PostOrderVisit(func_->body, [&](const ObjectRef &obj) {
+      if (const auto *block = obj.as<BlockNode>()) {
+        for (const Buffer &buffer : block->alloc_buffers) {
+          local_buffers_.insert(buffer.get());
+        }
+      }
+    });
+  }
+
+  static Stmt Substitute(const PrimFunc &func, bool debug, bool forced,
+                         std::string strategy, int *applied_count) {
+    SunmmioRegionCrossOuterPipelinePlanner planner(func, debug, forced,
+                                                   std::move(strategy));
+    Stmt result = planner(func->body);
+    *applied_count = planner.applied_count_;
+    return result;
+  }
+
+private:
+  Stmt Reject(const ForNode *outer, const std::string &reason,
+              const std::string &detail) {
+    if (forced_) {
+      LOG(FATAL)
+          << "[SunmmioPipeline][region_cross_outer][ForcedReject] reason="
+          << reason << " detail=" << detail;
+    }
+    For fallback = tvm::ffi::GetRef<For>(outer);
+    Map<String, Any> annotations = fallback->annotations;
+    SetRegionCrossOuterFallbackAnnotations(&annotations, "planning", reason,
+                                           detail);
+    if (only_proved_boundary_) {
+      // A legal region is only a candidate. If it has no useful/supported
+      // schedule, preserve the solved inner 1D pipeline and report that fact.
+      annotations.Set("tl.sunmmio.multidim.selected_mode", String("ilp"));
+      annotations.Set("tl.sunmmio.multidim.fallback_stage", String("boundary_overlap"));
+      annotations.Set("tl.sunmmio.multidim.fallback_reason", String(reason));
+    }
+    fallback.CopyOnWrite()->annotations = annotations;
+    return fallback;
+  }
+
+  static bool ExtractCandidate(const SeqStmtNode *seq, bool accept_planned_ilp,
+                               RegionCrossOuterCandidate *candidate,
+                               int *core_count) {
+    *core_count = 0;
+    for (size_t index = 0; index < seq->seq.size(); ++index) {
+      const auto *loop = seq->seq[index].as<ForNode>();
+      if (loop == nullptr) {
+        continue;
+      }
+      bool is_core =
+          loop->annotations.count("num_stages") ||
+          (accept_planned_ilp &&
+           loop->annotations.count("tl.sunmmio.pipeline.command_start_times"));
+      if (!is_core) {
+        continue;
+      }
+      ++*core_count;
+      candidate->core = tvm::ffi::GetRef<For>(loop);
+      candidate->core_index = static_cast<int>(index);
+    }
+    if (*core_count != 1) {
+      return false;
+    }
+    for (int index = 0; index < candidate->core_index; ++index) {
+      candidate->prefix.push_back(seq->seq[index]);
+    }
+    for (size_t index = candidate->core_index + 1; index < seq->seq.size();
+         ++index) {
+      candidate->suffix.push_back(seq->seq[index]);
+    }
+    return true;
+  }
+
+  bool AnalyzeHazards(const ForNode *outer,
+                      const RegionCrossOuterCandidate &candidate,
+                      Array<Buffer> *region_versioned_buffers,
+                      std::string *detail) {
+    Array<Stmt> core_statements;
+    core_statements.push_back(candidate.core->body);
+    RegionCrossOuterAccessSummary prefix =
+        CollectRegionAccesses(func_, candidate.prefix);
+    RegionCrossOuterAccessSummary core =
+        CollectRegionAccesses(func_, core_statements);
+    RegionCrossOuterAccessSummary suffix =
+        CollectRegionAccesses(func_, candidate.suffix);
+
+    // A top-level conditional suffix may write a global buffer only on every
+    // Nth logical WorkItem (for example, one full-width spill after the last
+    // N tile). If the guard cannot be true in two adjacent outer iterations,
+    // the apparent Suffix(o)->Suffix(o+1) WAW is unreachable. Keep this
+    // deliberately narrow: exactly one suffix statement must write the
+    // buffer, the statement must be an if-without-else, and Z3 must prove the
+    // two adjacent guards mutually exclusive.
+    std::unordered_map<const BufferNode *, int> suffix_write_stmt_count;
+    std::unordered_map<const BufferNode *, bool>
+        suffix_write_stmt_is_adjacent_exclusive;
+    std::unordered_set<const BufferNode *> suffix_written_buffers;
+    std::unordered_set<const BufferNode *> conditional_suffix_read_buffers;
+    std::unordered_set<const BufferNode *> nonconditional_suffix_read_buffers;
+    for (const Stmt &stmt : candidate.suffix) {
+      bool conditional_no_else = false;
+      bool adjacent_exclusive = false;
+      if (const auto *conditional = stmt.as<IfThenElseNode>()) {
+        conditional_no_else = !conditional->else_case.defined();
+        if (conditional_no_else) {
+          Map<Var, PrimExpr> next_iteration;
+          next_iteration.Set(outer->loop_var, outer->loop_var + Integer(1));
+          PrimExpr next_condition =
+              tir::Substitute(conditional->condition, next_iteration);
+          PrimExpr adjacent_conflict =
+              tir::And(conditional->condition, next_condition);
+          arith::Analyzer guard_analyzer;
+          adjacent_exclusive = guard_analyzer.z3_prover.CanProve(
+              tir::Not(adjacent_conflict));
+        }
+      }
+      Array<Stmt> singleton{stmt};
+      RegionCrossOuterAccessSummary stmt_accesses =
+          CollectRegionAccesses(func_, singleton);
+      for (const BufferRegion &read : stmt_accesses.reads) {
+        if (conditional_no_else) {
+          conditional_suffix_read_buffers.insert(read->buffer.get());
+        } else {
+          nonconditional_suffix_read_buffers.insert(read->buffer.get());
+        }
+      }
+      std::unordered_set<const BufferNode *> unique_writes;
+      for (const BufferRegion &write : stmt_accesses.writes) {
+        unique_writes.insert(write->buffer.get());
+        suffix_written_buffers.insert(write->buffer.get());
+      }
+      for (const BufferNode *buffer : unique_writes) {
+        int &count = suffix_write_stmt_count[buffer];
+        ++count;
+        if (count == 1) {
+          suffix_write_stmt_is_adjacent_exclusive[buffer] =
+              adjacent_exclusive;
+        } else {
+          suffix_write_stmt_is_adjacent_exclusive[buffer] = false;
+        }
+      }
+    }
+    std::unordered_set<const BufferNode *> adjacent_exclusive_suffix_writes;
+    for (const auto &[buffer, count] : suffix_write_stmt_count) {
+      if (count == 1 && suffix_write_stmt_is_adjacent_exclusive[buffer]) {
+        adjacent_exclusive_suffix_writes.insert(buffer);
+      }
+    }
+
+    // A local suffix-only buffer may intentionally accumulate disjoint pieces
+    // across WorkItems and be consumed by the guarded final spill. Versioning
+    // such a buffer separates those pieces and is semantically wrong. Keep it
+    // single-versioned; suffixes are emitted in logical order and InjectSync
+    // still protects asynchronous producer/consumer reuse.
+    //找到可能最后用来汇总的buffer的可能候选
+    std::unordered_set<const BufferNode *> suffix_carried_buffers;
+    for (const BufferNode *buffer : conditional_suffix_read_buffers) {
+      if (suffix_written_buffers.count(buffer) &&
+          !nonconditional_suffix_read_buffers.count(buffer)) {
+        suffix_carried_buffers.insert(buffer); //表示这个buffer不能被拆成双buffer
+      }
+    }
+
+    std::unordered_set<const BufferNode *> versioned;
+    auto check = [&](const std::vector<BufferRegion> &source,
+                     const std::vector<BufferRegion> &target,
+                     const char *hazard,
+                     bool allow_adjacent_exclusive_suffix_waw = false,
+                     bool preserve_suffix_carried = false) {
+      for (const BufferRegion &lhs : source) { //对source中的每个buffer
+        for (const BufferRegion &rhs : target) { //target中的每个buffer
+          if (!lhs->buffer.same_as(rhs->buffer) || //访问的不是同一个buffer
+              RegionsDisjointForAdjacentOuter(lhs, rhs, outer->loop_var,
+                                              outer->min)) { //是同一个buffer，但是访问区域不重叠
+            continue;
+          }
+          const BufferNode *buffer = lhs->buffer.get();//拿到发生冲突的buffer，进行到这里就意味着发生了冲突
+          if (allow_adjacent_exclusive_suffix_waw && //如果允许相邻条件互斥的Suffix WAW
+              adjacent_exclusive_suffix_writes.count(buffer)) { // 这个buffer已经被证明相邻写不会同时发生
+            continue; //放行
+          }
+          if (local_buffers_.count(buffer)) {// 判读当前buffer是不是local buffer（primfun内分配的buffer）
+            if (preserve_suffix_carried &&
+                suffix_carried_buffers.count(buffer)) { //跨WorkItem累加的buffer，保持单buffer
+              continue;
+            }
+            if (versioned.insert(buffer).second) { //是否为第一次插入多版本容器
+              region_versioned_buffers->push_back(lhs->buffer); //插入多版本容器
+            }
+            continue;
+          }
+
+          //执行到这里，意味着无法证明相邻WorkItem的buffer不重叠，拒绝跨外层优化
+          std::ostringstream os;
+          os << hazard << " on global buffer " << lhs->buffer->name
+             << " is not provably disjoint";
+          *detail = os.str();
+          return false;
+        }
+      }
+      return true;
+    };
+    auto check_all = [&](const RegionCrossOuterAccessSummary &source,
+                         const RegionCrossOuterAccessSummary &target,
+                         const char *edge,
+                         bool allow_adjacent_exclusive_suffix_waw = false,
+                         bool preserve_suffix_carried = false) {
+      std::string raw = std::string(edge) + ":RAW";
+      std::string war = std::string(edge) + ":WAR";
+      std::string waw = std::string(edge) + ":WAW";
+      return check(source.writes, target.reads, raw.c_str(), false,
+                   preserve_suffix_carried) &&
+             check(source.reads, target.writes, war.c_str(), false,
+                   preserve_suffix_carried) &&
+             check(source.writes, target.writes, waw.c_str(),
+                   allow_adjacent_exclusive_suffix_waw,
+                   preserve_suffix_carried);
+    };
+    return check_all(core, prefix, "Core(o)->Prefix(o+1)") &&
+           check_all(suffix, prefix, "Suffix(o)->Prefix(o+1)") &&
+           check_all(suffix, core, "Suffix(o)->Core(o+1)") &&
+           check_all(suffix, suffix, "Suffix(o)->Suffix(o+1)", true,
+                     true);
+  }
+
+  Stmt VisitStmt_(const ForNode *outer) final {
+    if (only_proved_boundary_) {
+      auto eligible = outer->annotations.Get("tl.sunmmio.boundary_overlap.eligible");
+      auto version = outer->annotations.Get("tl.sunmmio.boundary_overlap.proof_version");
+      const auto *eligible_value = eligible ? eligible.value().as<IntImmNode>() : nullptr;
+      const auto *version_value = version ? version.value().as<IntImmNode>() : nullptr;
+      if (!eligible_value || !eligible_value->value || !version_value ||
+          version_value->value != 1) {
+        return StmtExprMutator::VisitStmt_(outer);
+      }
+    }
+    const auto *direct_inner = outer->body.as<ForNode>();
+    bool hierarchical_ilp = strategy_ == "hierarchical_ilp";
+    if (direct_inner && (direct_inner->annotations.count("num_stages") ||
+                         (hierarchical_ilp &&
+                          direct_inner->annotations.count(
+                              "tl.sunmmio.pipeline.command_start_times")))) {
+      return Reject(outer, "outer_body_not_seq",
+                    "region mode requires a SeqStmt around the pipeline core");
+    }
+
+    const auto *seq = outer->body.as<SeqStmtNode>();
+    if (seq == nullptr) {
+      return StmtExprMutator::VisitStmt_(outer);
+    }
+    RegionCrossOuterCandidate candidate;
+    int core_count = 0;
+    if (!ExtractCandidate(seq, hierarchical_ilp, &candidate, &core_count)) {
+      if (core_count > 1) {
+        return Reject(outer, "no_unique_pipeline_core",
+                      "outer region contains multiple direct pipelined loops");
+      }
+      return StmtExprMutator::VisitStmt_(outer);
+    }
+    const ForNode *inner = candidate.core.get();
+
+    if (outer->kind != ForKind::kSerial || inner->kind != ForKind::kSerial) {
+      return Reject(outer, "non_serial_loop",
+                    "both outer and core loops must be serial");
+    }
+    if (inner->body.as<SeqStmtNode>() == nullptr) {
+      return Reject(outer, "inner_body_not_seq",
+                    "the pipeline core body must be a direct SeqStmt");
+    }
+    for (const Stmt &stmt : candidate.prefix) {
+      if (!IsSupportedRegionStatement(stmt)) {
+        return Reject(outer, "unsupported_region_statement",
+                      "unsupported direct Prefix statement");
+      }
+    }
+    for (const Stmt &stmt : candidate.suffix) {
+      if (!IsSupportedRegionStatement(stmt)) {
+        return Reject(outer, "unsupported_region_statement",
+                      "unsupported direct Suffix statement");
+      }
+    }
+
+    arith::Analyzer analyzer;
+    PrimExpr simplified_outer_min = analyzer.Simplify(outer->min);
+    PrimExpr simplified_outer_extent = analyzer.Simplify(outer->extent);
+    PrimExpr simplified_inner_min = analyzer.Simplify(inner->min);
+    PrimExpr simplified_inner_extent = analyzer.Simplify(inner->extent);
+    const auto *outer_min = simplified_outer_min.as<IntImmNode>();
+    const auto *outer_extent = simplified_outer_extent.as<IntImmNode>();
+    const auto *inner_min = simplified_inner_min.as<IntImmNode>();
+    const auto *inner_extent = simplified_inner_extent.as<IntImmNode>();
+    if (outer_min == nullptr || outer_extent == nullptr) {
+      return Reject(outer, "dynamic_outer_range",
+                    "outer minimum and extent must be compile-time integers");
+    }
+    if (inner_min == nullptr || inner_extent == nullptr) {
+      return Reject(outer, "dynamic_inner_range",
+                    "core minimum and extent must be compile-time integers");
+    }
+    if (outer_extent->value <= 1 || inner_extent->value <= 0) {
+      return Reject(
+          outer, "invalid_extent",
+          "outer extent must exceed one and core extent must be positive");
+    }
+
+    if (!hierarchical_ilp) {
+      auto stages_anno = inner->annotations.Get("num_stages");
+      const auto *stages_imm =
+          stages_anno ? stages_anno.value().as<IntImmNode>() : nullptr;
+      if (stages_imm == nullptr || stages_imm->value <= 0) {
+        return Reject(outer, "invalid_stage_count",
+                      "num_stages must be a positive compile-time integer");
+      }
+      int64_t stages = stages_imm->value;
+      if (inner_extent->value < stages || inner_extent->value % stages != 0) {
+        return Reject(
+            outer, "inner_extent_not_stage_aligned",
+            "core extent must be at least num_stages and divisible by it");
+      }
+    }
+    CrossOuterCollectiveAnalysis collective_analysis;
+    if (hierarchical_ilp) {
+      collective_analysis =
+          AnalyzeCrossOuterCollectives(inner->body.as<SeqStmtNode>());
+      if (!collective_analysis.valid) {
+        return Reject(outer, collective_analysis.reason,
+                      collective_analysis.detail);
+      }
+    }
+    std::string forbidden =
+        FindCrossOuterForbiddenOperation(outer->body, hierarchical_ilp);
+    if (!forbidden.empty()) {
+      return Reject(outer, "forbidden_operation", forbidden);
+    }
+
+    if (strategy_ == "conservative") {
+      PrimFunc inner_func = func_;
+      inner_func.CopyOnWrite()->body = candidate.core;
+      Stmt planned_stmt =
+          SunmmioPipelinePlanner::Substitute(inner_func, debug_);
+      const auto *planned = planned_stmt.as<ForNode>();
+      if (planned == nullptr ||
+          !planned->annotations.count("prologue_orders") ||
+          !planned->annotations.count("body_orders")) {
+        return Reject(outer, "core_planning_failed",
+                      "greedy planning did not produce a core schedule");
+      }
+      Array<Stmt> body = seq->seq;
+      body.Set(candidate.core_index, tvm::ffi::GetRef<For>(planned));
+      Map<String, Any> annotations = outer->annotations;
+      SetPipelineAppliedAnnotations(&annotations, "region_cross_outer");
+      annotations.Set(kRegionCrossOuterMarker, Bool(true));
+      annotations.Set(kRegionCrossOuterRequested, Bool(true));
+      annotations.Set(kRegionCrossOuterStrategy, String(strategy_));
+      annotations.Set(kRegionCrossOuterOuterExtent,
+                      Integer(outer_extent->value));
+      annotations.Set(kRegionCrossOuterInnerExtent,
+                      Integer(inner_extent->value));
+      annotations.Set(kRegionCrossOuterCoreIndex,
+                      Integer(candidate.core_index));
+      annotations.Set(kRegionCrossOuterPrefixCount,
+                      Integer(candidate.prefix.size()));
+      annotations.Set(kRegionCrossOuterSuffixCount,
+                      Integer(candidate.suffix.size()));
+      annotations.Set(kRegionCrossOuterBoundaryOverlap, Bool(false));
+      annotations.erase(kRegionCrossOuterFallbackStage);
+      annotations.erase(kRegionCrossOuterFallbackReason);
+      annotations.erase(kRegionCrossOuterFallbackDetail);
+      ++applied_count_;
+      return For(outer->loop_var, outer->min, outer->extent, outer->kind,
+                 SeqStmt::Flatten(body), outer->thread_binding, annotations);
+    }
+
+    Array<Buffer> region_versioned_buffers;
+    std::string dependence_detail;
+    if (!AnalyzeHazards(outer, candidate, &region_versioned_buffers,
+                        &dependence_detail)) {
+      return Reject(outer, "cross_iteration_dependency", dependence_detail);
+    }
+
+    if (hierarchical_ilp) {
+      const Map<String, Any> &inner_annotations = inner->annotations;
+      auto starts_anno =
+          inner_annotations.Get("tl.sunmmio.pipeline.command_start_times");
+      auto priorities_anno =
+          inner_annotations.Get("tl.sunmmio.pipeline.command_emit_priorities");
+      auto ii_anno = inner_annotations.Get("ii");
+      auto versioned_anno = inner_annotations.Get("versioned_buffers");
+      auto used_anno = inner_annotations.Get("used_buffers");
+      if (!starts_anno || !priorities_anno || !ii_anno || !versioned_anno ||
+          !used_anno) {
+        return Reject(outer, "inner_ilp_schedule_missing",
+                      "the Core must carry a complete solved 1D ILP schedule");
+      }
+      Array<Integer> command_start_times =
+          Downcast<Array<Integer>>(starts_anno.value());
+      Array<Integer> command_emit_priorities =
+          Downcast<Array<Integer>>(priorities_anno.value());
+      int64_t ii = Downcast<IntImm>(ii_anno.value())->value;
+      std::string collective_order_detail;
+      if (!ValidateCrossOuterCollectiveEpochOrder(
+              collective_analysis, ii, command_start_times,
+              command_emit_priorities, &collective_order_detail)) {
+        return Reject(outer, "collective_epoch_order", collective_order_detail);
+      }
+      int command_count =
+          static_cast<int>(inner->body.as<SeqStmtNode>()->seq.size());
+      RegionCrossOuterEventAnalysis event_analysis =
+          AnalyzeHierarchicalILPEvents(outer_extent->value, inner_extent->value,
+                                       command_count, ii, command_start_times,
+                                       command_emit_priorities);
+      if (!event_analysis.valid) {
+        std::string reason = event_analysis.detail == "event_stream_too_large"
+                                 ? "event_stream_too_large"
+                                 : "schedule_coverage_failed";
+        return Reject(outer, reason, event_analysis.detail);
+      }
+      if (!event_analysis.boundary_overlap) {
+        return Reject(outer, "no_boundary_overlap",
+                      "the solved 1D Core has no drain/startup overlap");
+      }
+
+      Array<Buffer> core_versioned_buffers =
+          Downcast<Array<Buffer>>(versioned_anno.value());
+      std::unordered_set<const BufferNode *> core_versioned;
+      for (const Buffer &buffer : core_versioned_buffers) {
+        core_versioned.insert(buffer.get());
+      }
+      for (const Buffer &buffer : region_versioned_buffers) {
+        if (core_versioned.count(buffer.get())) {
+          return Reject(outer, "nested_versioning_unsupported",
+                        std::string(buffer->name));
+        }
+      }
+      Array<Buffer> merged_versioned_buffers = core_versioned_buffers;
+      for (const Buffer &buffer : region_versioned_buffers) {
+        merged_versioned_buffers.push_back(buffer);
+      }
+      Array<Buffer> runtime_buffers;
+      if (auto runtime_anno =
+              inner_annotations.Get("runtime_multiversion_buffers")) {
+        runtime_buffers = Downcast<Array<Buffer>>(runtime_anno.value());
+      } else {
+        runtime_buffers = core_versioned_buffers;
+      }
+      Array<Buffer> merged_used_buffers =
+          Downcast<Array<Buffer>>(used_anno.value());
+      auto append_unique = [](Array<Buffer> *buffers, const Buffer &buffer) {
+        if (std::find(buffers->begin(), buffers->end(), buffer) ==
+            buffers->end()) {
+          buffers->push_back(buffer);
+        }
+      };
+      for (const Buffer &buffer : region_versioned_buffers) {
+        append_unique(&runtime_buffers, buffer);
+        append_unique(&merged_used_buffers, buffer);
+      }
+
+      Map<String, Any> annotations = outer->annotations;
+      for (const auto &[key, value] : inner_annotations) {
+        if (key != "num_stages" && key != "versioned_buffers" &&
+            key != "runtime_multiversion_buffers" && key != "used_buffers") {
+          annotations.Set(key, value);
+        }
+      }
+      annotations.Set("versioned_buffers", merged_versioned_buffers);
+      annotations.Set("runtime_multiversion_buffers", runtime_buffers);
+      annotations.Set("used_buffers", merged_used_buffers);
+      annotations.Set(kRegionCrossOuterCoreVersionedBuffers,
+                      core_versioned_buffers);
+      annotations.Set(kRegionCrossOuterRegionVersionedBuffers,
+                      region_versioned_buffers);
+      SetPipelineAppliedAnnotations(&annotations, "hierarchical_ilp");
+      annotations.Set(kRegionCrossOuterMarker, Bool(true));
+      annotations.Set(kRegionCrossOuterRequested, Bool(true));
+      annotations.Set(kRegionCrossOuterStrategy, String(strategy_));
+      annotations.Set(kRegionCrossOuterOuterExtent,
+                      Integer(outer_extent->value));
+      annotations.Set(kRegionCrossOuterInnerExtent,
+                      Integer(inner_extent->value));
+      annotations.Set(kRegionCrossOuterCoreIndex,
+                      Integer(candidate.core_index));
+      annotations.Set(kRegionCrossOuterPrefixCount,
+                      Integer(candidate.prefix.size()));
+      annotations.Set(kRegionCrossOuterSuffixCount,
+                      Integer(candidate.suffix.size()));
+      annotations.Set(kRegionCrossOuterBoundaryOverlap, Bool(true));
+      if (!collective_analysis.descriptors.empty()) {
+        Array<Integer> command_ids;
+        Array<Integer> directions;
+        Array<Integer> participant_masks;
+        Array<String> source_buffers;
+        Array<String> destination_buffers;
+        for (const CrossOuterCollectiveDescriptor &descriptor :
+             collective_analysis.descriptors) {
+          command_ids.push_back(Integer(descriptor.command_id));
+          directions.push_back(Integer(descriptor.direction));
+          participant_masks.push_back(Integer(descriptor.participant_mask));
+          source_buffers.push_back(descriptor.source->name);
+          destination_buffers.push_back(descriptor.destination->name);
+        }
+        annotations.Set("tl.sunmmio.region_cross_outer.collective_count",
+                        Integer(collective_analysis.descriptors.size()));
+        annotations.Set("tl.sunmmio.region_cross_outer.collective_command_ids",
+                        command_ids);
+        annotations.Set("tl.sunmmio.region_cross_outer.collective_directions",
+                        directions);
+        annotations.Set("tl.sunmmio.region_cross_outer.collective_masks",
+                        participant_masks);
+        annotations.Set("tl.sunmmio.region_cross_outer.collective_sources",
+                        source_buffers);
+        annotations.Set("tl.sunmmio.region_cross_outer.collective_destinations",
+                        destination_buffers);
+        annotations.Set(
+            "tl.sunmmio.region_cross_outer.collective_epoch_order_verified",
+            Bool(true));
+      }
+      ++applied_count_;
+      return For(outer->loop_var, outer->min, outer->extent, outer->kind,
+                 outer->body, outer->thread_binding, annotations);
+    }
+
+    if (outer_extent->value >
+        std::numeric_limits<int64_t>::max() / inner_extent->value) {
+      return Reject(outer, "extent_overflow",
+                    "outer_extent * inner_extent exceeds int64");
+    }
+    int64_t total_extent = outer_extent->value * inner_extent->value;
+    Var logical(std::string(outer->loop_var->name_hint) +
+                    "_region_cross_outer_logical",
+                outer->loop_var.dtype());
+    Map<Var, PrimExpr> substitutions;
+    substitutions.Set(outer->loop_var,
+                      outer->min +
+                          floordiv(logical, Integer(inner_extent->value)));
+    substitutions.Set(inner->loop_var,
+                      inner->min +
+                          floormod(logical, Integer(inner_extent->value)));
+    Stmt synthetic_body = tir::Substitute(inner->body, substitutions);
+    For synthetic_loop(logical, Integer(0), Integer(total_extent),
+                       ForKind::kSerial, synthetic_body, inner->thread_binding,
+                       inner->annotations);
+    PrimFunc synthetic_func = func_;
+    synthetic_func.CopyOnWrite()->body = synthetic_loop;
+    Stmt planned_stmt =
+        SunmmioPipelinePlanner::Substitute(synthetic_func, debug_);
+    const auto *planned = planned_stmt.as<ForNode>();
+    if (planned == nullptr || !planned->annotations.count("prologue_orders") ||
+        !planned->annotations.count("body_orders") ||
+        !planned->annotations.count("epilogue_orders")) {
+      std::string reason = "core_planning_failed";
+      std::string detail;
+      if (planned != nullptr) {
+        if (auto ann = planned->annotations.Get(kPipelineFallbackReason)) {
+          reason = std::string(Downcast<String>(ann.value()));
+        }
+        if (auto ann = planned->annotations.Get(kPipelineFallbackDetail)) {
+          detail = std::string(Downcast<String>(ann.value()));
+        }
+      }
+      return Reject(outer, reason, detail);
+    }
+
+    int iterations =
+        Downcast<IntImm>(planned->annotations.at("iterations"))->value;
+    Array<String> prologue_orders =
+        Downcast<Array<String>>(planned->annotations.at("prologue_orders"));
+    Array<String> body_orders =
+        Downcast<Array<String>>(planned->annotations.at("body_orders"));
+    Array<String> epilogue_orders =
+        Downcast<Array<String>>(planned->annotations.at("epilogue_orders"));
+    RegionCrossOuterEventAnalysis event_analysis =
+        AnalyzeRegionCrossOuterEvents(
+            outer_extent->value, inner_extent->value, iterations,
+            static_cast<int>(inner->body.as<SeqStmtNode>()->seq.size()),
+            prologue_orders, body_orders, epilogue_orders);
+    if (!event_analysis.valid) {
+      std::string reason = event_analysis.detail == "event_stream_too_large"
+                               ? "event_stream_too_large"
+                               : "schedule_coverage_failed";
+      return Reject(outer, reason, event_analysis.detail);
+    }
+    if (!event_analysis.boundary_overlap) {
+      return Reject(outer, "no_boundary_overlap",
+                    "the planned Core schedule does not interleave adjacent "
+                    "outer iterations");
+    }
+
+    Array<Buffer> core_versioned_buffers =
+        Downcast<Array<Buffer>>(planned->annotations.at("versioned_buffers"));
+    std::unordered_set<const BufferNode *> core_versioned;
+    for (const Buffer &buffer : core_versioned_buffers) {
+      core_versioned.insert(buffer.get());
+    }
+    for (const Buffer &buffer : region_versioned_buffers) {
+      if (core_versioned.count(buffer.get())) {
+        return Reject(outer, "nested_versioning_unsupported",
+                      std::string(buffer->name));
+      }
+    }
+    Array<Buffer> merged_versioned_buffers = core_versioned_buffers;
+    for (const Buffer &buffer : region_versioned_buffers) {
+      merged_versioned_buffers.push_back(buffer);
+    }
+
+    Map<String, Any> annotations = outer->annotations;
+    for (const auto &[key, value] : planned->annotations) {
+      if (key != "num_stages" && key != "versioned_buffers") {
+        annotations.Set(key, value);
+      }
+    }
+    annotations.Set("versioned_buffers", merged_versioned_buffers);
+    annotations.Set(kRegionCrossOuterCoreVersionedBuffers,
+                    core_versioned_buffers);
+    annotations.Set(kRegionCrossOuterRegionVersionedBuffers,
+                    region_versioned_buffers);
+    SetPipelineAppliedAnnotations(&annotations, "region_cross_outer");
+    annotations.Set(kRegionCrossOuterMarker, Bool(true));
+    annotations.Set(kRegionCrossOuterRequested, Bool(true));
+    annotations.Set(kRegionCrossOuterStrategy, String(strategy_));
+    annotations.Set(kRegionCrossOuterOuterExtent, Integer(outer_extent->value));
+    annotations.Set(kRegionCrossOuterInnerExtent, Integer(inner_extent->value));
+    annotations.Set(kRegionCrossOuterCoreIndex, Integer(candidate.core_index));
+    annotations.Set(kRegionCrossOuterPrefixCount,
+                    Integer(candidate.prefix.size()));
+    annotations.Set(kRegionCrossOuterSuffixCount,
+                    Integer(candidate.suffix.size()));
+    annotations.Set(kRegionCrossOuterBoundaryOverlap, Bool(true));
+    annotations.erase(kRegionCrossOuterFallbackStage);
+    annotations.erase(kRegionCrossOuterFallbackReason);
+    annotations.erase(kRegionCrossOuterFallbackDetail);
+    ++applied_count_;
+    return For(outer->loop_var, outer->min, outer->extent, outer->kind,
+               outer->body, outer->thread_binding, annotations);
+  }
+
+  PrimFunc func_;
+  bool debug_{false};
+  bool forced_{false};
+  std::string strategy_;
+  bool only_proved_boundary_{false};
+  int applied_count_{0};
+  std::unordered_set<const BufferNode *> local_buffers_;
+};
+
+
+struct ResidencyEvent {
+  residency::Proof proof;
+  std::string selected{"analysis_only"};
+  std::string fingerprint;
+};
+
+static std::string ResidencyJsonEscape(const std::string &value) {
+  std::ostringstream result;
+  for (char ch : value) {
+    if (ch == '"' || ch == '\\') result << '\\' << ch;
+    else if (ch == '\n') result << "\\n";
+    else if (ch == '\r') result << "\\r";
+    else if (ch == '\t') result << "\\t";
+    else result << ch;
+  }
+  return result.str();
+}
+
+static void WriteResidencyEvents(const std::string &policy,
+                                const std::vector<ResidencyEvent> &events) {
+  const char *path = std::getenv("TL_SUNMMIO_RESIDENCY_REPORT");
+  if (!path || !*path) return;
+  std::ofstream out(path);
+  ICHECK(out.is_open()) << "cannot write residency report: " << path;
+  out << "{\n  \"schema_version\": 2,\n  \"policy\": \""
+      << policy << "\",\n  \"fingerprint_scope\": \"pre_sync_tir_structure\","
+      << "\n  \"cost_gate\": \"transfer_savings_prefilter_backend_schedule_required\","
+      << "\n  \"candidates\": [";
+  for (size_t i = 0; i < events.size(); ++i) {
+    if (i) out << ",";
+    const auto &event = events[i];
+    const auto &proof = event.proof;
+    out << "\n    {\"accepted\": " << (proof.accepted ? "true" : "false")
+        << ", \"reason\": \"" << ResidencyJsonEscape(proof.reason)
+        << "\", \"reuse_loop\": \"" << ResidencyJsonEscape(proof.reuse_loop)
+        << "\", \"reuse_extent\": " << proof.reuse_extent
+        << ", \"group_width\": " << proof.group_width
+        << ", \"shared_prefix_count\": " << proof.shared_prefix_count
+        << ", \"consumer_count\": " << proof.consumer_count
+        << ", \"added_bytes\": " << proof.added_bytes
+        << ", \"saved_transfer_bytes\": " << proof.saved_transfer_bytes
+        << ", \"resource_check\": \"" << proof.resource_check
+        << "\", \"selected_strategy\": \"" << event.selected
+        << "\", \"schedule_fingerprint\": \"" << event.fingerprint << "\"}";
+  }
+  out << "\n  ]\n}\n";
+}
+
+class SunmmioResidencyAnalysisAnnotator : public StmtMutator {
+public:
+  SunmmioResidencyAnalysisAnnotator(const PrimFunc &func, std::string policy)
+      : func_(func), policy_(std::move(policy)) {}
+
+  std::vector<ResidencyEvent> events;
+  int grouped_core_count{0};
+private:
+  Stmt VisitStmt_(const ForNode *op) final {
+    if (op->annotations.count("num_stages"))
+      return ffi::GetRef<For>(op);
+    bool candidate = false;
+    for (const Stmt &stmt : residency::Statements(op->body)) {
+      const auto *loop = stmt.as<ForNode>();
+      candidate = candidate || (loop && loop->annotations.count("num_stages"));
+    }
+    if (!candidate) return StmtMutator::VisitStmt_(op);
+    For loop = ffi::GetRef<For>(op);
+    bool slotted = op->annotations.count("tl.sunmmio.multidim.workitem_inner");
+    residency::Proof proof = residency::Analyze(func_, loop, slotted, true);
+    if (proof.accepted && policy_ == "auto_strict" &&
+        !residency::HasMinimumReuseAmortization(proof)) {
+      proof.accepted = false;
+      proof.reason = "insufficient_reuse_amortization";
+    }
+    if (proof.accepted && proof.group_width &&
+        !residency::CanSnapshotGroupingFunction(func_)) {
+      proof.accepted = false;
+      proof.reason = "grouping_snapshot_layout_unsupported";
+    }
+    events.push_back({proof, proof.accepted ? "proved_candidate" : "original",
+                      std::to_string(ffi::StructuralHash::Hash(loop, true))});
+    if (!proof.accepted) {
+      ICHECK_NE(policy_, "forced")
+          << "generic tile residency rejected: " << proof.reason;
+      if (policy_ != "shadow") {
+        Map<String, Any> annotations = loop->annotations;
+        annotations.Set(residency::kReason, String(proof.reason));
+        annotations.erase(residency::kEligible);
+        loop.CopyOnWrite()->annotations = annotations;
+      }
+      return loop;
+    }
+    if (policy_ == "shadow") return loop;
+    Map<String, Any> annotations = loop->annotations;
+    annotations.erase(residency::kReason);
+    annotations.Set(residency::kEligible, Bool(true));
+    annotations.Set(residency::kStateBuffers, proof.state_buffers);
+    annotations.Set(residency::kPrefixCount, Integer(proof.shared_prefix_count));
+    if (proof.group_width) {
+      annotations.Set(residency::kGroupWidth, Integer(proof.group_width));
+      grouped_core_count += 1 + (proof.reuse_extent % proof.group_width != 0);
+    }
+    loop.CopyOnWrite()->annotations = annotations;
+    return loop;
+  }
+  PrimFunc func_;
+  std::string policy_;
+};
+
+class ResidencyDiagnosticStripper : public StmtMutator {
+private:
+  Stmt VisitStmt_(const ForNode *op) final {
+    For loop = Downcast<For>(StmtMutator::VisitStmt_(op));
+    Map<String, Any> annotations;
+    for (const auto &[key, value] : loop->annotations) {
+      if (std::string(key).rfind("tl.sunmmio.residency.", 0) != 0)
+        annotations.Set(key, value);
+    }
+    loop.CopyOnWrite()->annotations = annotations;
+    return loop;
+  }
+};
+
+static String ResidencyScheduleFingerprint(PrimFunc f) {
+  f.CopyOnWrite()->body = ResidencyDiagnosticStripper()(f->body);
+  return String(std::to_string(ffi::StructuralHash::Hash(f, true)));
+}
+
+static tvm::transform::Pass
+AnalyzeSunmmioTileResidency(String policy = "auto_strict") {
+  std::string value = policy;
+  ICHECK(value == "off" || value == "shadow" || value == "auto_strict" ||
+         value == "forced") << "invalid tile residency policy: " << value;
+  auto pass_func = [=](PrimFunc f, const IRModule &, tvm::transform::PassContext) {
+    if (value == "off") {
+      WriteResidencyEvents(value, {});
+      return f;
+    }
+    SunmmioResidencyAnalysisAnnotator analysis(f, value);
+    Stmt body = analysis(f->body);
+    if (value == "forced")
+      ICHECK(!analysis.events.empty()) << "generic tile residency: no candidate";
+    WriteResidencyEvents(value, analysis.events);
+    if (value != "shadow") {
+      PrimFunc original = f;
+      f.CopyOnWrite()->body = body;
+      if (analysis.grouped_core_count) {
+        f = WithAttr(std::move(f), residency::kGroupingOriginal,
+                     residency::SnapshotGroupingFunction(original));
+        f = WithAttr(std::move(f), residency::kGroupingCoreCount,
+                     Integer(analysis.grouped_core_count));
+      }
+    }
+    return f;
+  };
+  return tir::transform::CreatePrimFuncPass(
+      pass_func, 0, "tl.AnalyzeSunmmioTileResidency", {});
+}
+
+class SunmmioStaticWorkItemFlattener : public StmtMutator {
+public:
+  explicit SunmmioStaticWorkItemFlattener(const PrimFunc &func, bool forced)
+      : func_(func), forced_(forced), residency_policy_(residency::Policy()) {}
+
+  static Stmt Substitute(const PrimFunc &func, bool forced,
+                         int *requested_count, int *applied_count,
+                         int *a_residency_count, int *auto_discovered_count) {
+    SunmmioStaticWorkItemFlattener flattener(func, forced);
+    Stmt result = flattener(func->body);
+    *requested_count = flattener.requested_count_;
+    *applied_count = flattener.applied_count_;
+    *a_residency_count = flattener.a_residency_count_;
+    *auto_discovered_count = flattener.auto_discovered_count_;
+    WriteResidencyEvents(flattener.residency_policy_, flattener.events_);
+    return result;
+  }
+
+private:
+  static constexpr const char *kOuterMarker =
+      "tl.sunmmio.multidim.workitem_outer";
+  static constexpr const char *kInnerMarker =
+      "tl.sunmmio.multidim.workitem_inner";
+  static constexpr const char *kRequested =
+      "tl.sunmmio.multidim.workitem.requested";
+  static constexpr const char *kApplied =
+      "tl.sunmmio.multidim.workitem.applied";
+  static constexpr const char *kOuterExtent =
+      "tl.sunmmio.multidim.workitem.outer_extent";
+  static constexpr const char *kInnerExtent =
+      "tl.sunmmio.multidim.workitem.inner_extent";
+  static constexpr const char *kTotalExtent =
+      "tl.sunmmio.multidim.workitem.total_extent";
+  static constexpr const char *kFallbackReason =
+      "tl.sunmmio.multidim.workitem.fallback_reason";
+  static constexpr const char *kFallbackDetail =
+      "tl.sunmmio.multidim.workitem.fallback_detail";
+  static constexpr const char *kAResidencyApplied =
+      "tl.sunmmio.multidim.a_residency.applied";
+  static constexpr const char *kAutoDiscovered =
+      "tl.sunmmio.multidim.workitem.auto_discovered";
+
+  Stmt BuildProvedResidency(const ForNode *outer, const ForNode *inner,
+                            int64_t outer_extent, int64_t inner_extent,
+                            const residency::Proof &proof,
+                            bool auto_discovered = false) {
+    Array<Stmt> new_core_body;
+    for (int i = 0; i < proof.shared_prefix_count; ++i)
+      new_core_body.push_back(proof.core_statements[i]);
+    auto instance = [&](const Stmt &stmt, int64_t coordinate) {
+      Map<Var, PrimExpr> substitution;
+      substitution.Set(inner->loop_var, inner->min + Integer(coordinate));
+      return tir::Substitute(stmt, substitution);
+    };
+    for (int64_t i = 0; i < inner_extent; ++i)
+      for (size_t j = proof.shared_prefix_count;
+           j < proof.core_statements.size(); ++j)
+        new_core_body.push_back(instance(proof.core_statements[j], i));
+    const For &core = proof.core;
+    For new_core(core->loop_var, core->min, core->extent, core->kind,
+                 SeqStmt::Flatten(new_core_body), core->thread_binding,
+                 core->annotations, core->step, core->span);
+    Array<Stmt> new_outer_body;
+    for (int64_t i = 0; i < inner_extent; ++i)
+      for (const Stmt &stmt : proof.before)
+        new_outer_body.push_back(instance(stmt, i));
+    new_outer_body.push_back(new_core);
+
+    // Preserve accumulator liveness through the whole K-major core.  This is
+    // also part of the frozen C-style schedule's allocation behavior.
+    Array<BufferRegion> accumulators;
+    for (const Stmt &stmt : proof.core_statements) {
+      residency::Operation operation;
+      ICHECK(residency::ParseOperation(stmt, &operation));
+      if (operation.transfer)
+        continue;
+      BufferRegion accumulator =
+          NormalizeToBufferRegion(operation.call->args[2]);
+      bool seen = false;
+      for (const BufferRegion &old : accumulators)
+        seen = seen || residency::SameRegion(old, accumulator);
+      if (!seen)
+        accumulators.push_back(accumulator);
+    }
+    for (int64_t i = 0; i < inner_extent; ++i) {
+      for (const BufferRegion &accumulator : accumulators) {
+        Array<PrimExpr> indices;
+        for (const Range &range : accumulator->region)
+          indices.push_back(range->min);
+        new_outer_body.push_back(
+            instance(Evaluate(BufferLoad(accumulator->buffer, indices)), i));
+      }
+    }
+    for (int64_t i = 0; i < inner_extent; ++i)
+      for (const Stmt &stmt : proof.after)
+        new_outer_body.push_back(instance(stmt, i));
+    Map<String, Any> annotations = outer->annotations;
+    annotations.erase(kOuterMarker);
+    annotations.Set(kRequested, Bool(true));
+    annotations.Set(kApplied, Bool(true));
+    annotations.Set(kOuterExtent, Integer(outer_extent));
+    annotations.Set(kInnerExtent, Integer(inner_extent));
+    annotations.Set(kTotalExtent, Integer(outer_extent));
+    annotations.Set(kAResidencyApplied, Bool(true));
+    if (auto_discovered)
+      annotations.Set(kAutoDiscovered, Bool(true));
+    else
+      annotations.erase(kAutoDiscovered);
+    annotations.erase(kFallbackReason);
+    annotations.erase(kFallbackDetail);
+    return For(outer->loop_var, outer->min, outer->extent, outer->kind,
+               SeqStmt::Flatten(new_outer_body), outer->thread_binding,
+               annotations, outer->step, outer->span);
+  }
+
+  std::optional<Stmt> TryAutoDiscover(const ForNode *outer) {
+    // Explicit annotations remain authoritative. Forced mode preserves its
+    // historical contract: it requires a user-marked candidate.
+    if (forced_ || outer->annotations.count(kOuterMarker) ||
+        outer->annotations.count(kInnerMarker) ||
+        outer->annotations.count("num_stages"))
+      return std::nullopt;
+
+    const auto *inner = outer->body.as<ForNode>();
+    if (inner == nullptr || inner->annotations.count(kOuterMarker) ||
+        inner->annotations.count(kInnerMarker) ||
+        inner->annotations.count("num_stages"))
+      return std::nullopt;
+    if (outer->kind != ForKind::kSerial || inner->kind != ForKind::kSerial ||
+        outer->thread_binding.defined() || inner->thread_binding.defined() ||
+        outer->loop_var.dtype() != inner->loop_var.dtype())
+      return std::nullopt;
+
+    arith::Analyzer analyzer;
+    auto outer_min = residency::StaticInt(analyzer.Simplify(outer->min));
+    auto outer_extent = residency::StaticInt(analyzer.Simplify(outer->extent));
+    auto inner_min = residency::StaticInt(analyzer.Simplify(inner->min));
+    auto inner_extent = residency::StaticInt(analyzer.Simplify(inner->extent));
+    if (!outer_min || !outer_extent || !inner_min || !inner_extent ||
+        *outer_extent <= 1 || *inner_extent <= 0)
+      return std::nullopt;
+
+    int pipeline_core_count = 0;
+    PostOrderVisit(inner->body, [&](const ObjectRef &obj) {
+      if (const auto *loop = obj.as<ForNode>())
+        pipeline_core_count += loop->annotations.count("num_stages") ? 1 : 0;
+    });
+    if (pipeline_core_count != 1)
+      return std::nullopt;
+
+    residency::Proof proof =
+        residency::Analyze(func_, ffi::GetRef<For>(inner), true);
+    // Static WorkItems reuse already allocated slots.  Judge their benefit
+    // across the full outer grid instead of applying the Ordinary-residency
+    // expansion heuristic, which counts only consumers inside one reuse loop.
+    bool amortized_static_reuse = proof.saved_transfer_bytes > 0 &&
+                                  proof.shared_prefix_count > 0 &&
+                                  proof.consumer_count > 0 &&
+                                  proof.reuse_extent >= 2 && *outer_extent >= 2;
+    if (proof.accepted && !amortized_static_reuse) {
+      proof.accepted = false;
+      proof.reason = "insufficient_static_workitem_amortization";
+    }
+    if (!proof.accepted) {
+      events_.push_back({proof, "auto_workitem_rejected",
+                         std::to_string(ffi::StructuralHash::Hash(
+                             ffi::GetRef<For>(outer), true))});
+      return std::nullopt;
+    }
+
+    ++requested_count_;
+    Stmt generic = BuildProvedResidency(outer, inner, *outer_extent,
+                                        *inner_extent, proof, true);
+    ResidencyEvent event{proof};
+    event.fingerprint =
+        std::to_string(ffi::StructuralHash::Hash(generic, true));
+    event.selected = "generic_residency_auto_workitem";
+    events_.push_back(event);
+    ++applied_count_;
+    ++a_residency_count_;
+    ++auto_discovered_count_;
+    return generic;
+  }
+
+  Stmt Reject(const ForNode *outer, const std::string &reason,
+              const std::string &detail) {
+    if (forced_) {
+      LOG(FATAL) << "[SunmmioPipeline][workitem_flatten][ForcedReject] reason="
+                 << reason << " detail=" << detail;
+    }
+    For fallback = tvm::ffi::GetRef<For>(outer);
+    Map<String, Any> annotations = fallback->annotations;
+    annotations.Set(kRequested, Bool(true));
+    annotations.Set(kApplied, Bool(false));
+    annotations.Set(kFallbackReason, String(reason));
+    annotations.Set(kFallbackDetail, String(detail));
+    fallback.CopyOnWrite()->annotations = annotations;
+    return fallback;
+  }
+
+  Stmt VisitStmt_(const ForNode *outer) final {
+    if (!outer->annotations.count(kOuterMarker)) {
+      if (auto discovered = TryAutoDiscover(outer))
+        return discovered.value();
+      return StmtMutator::VisitStmt_(outer);
+    }
+    ++requested_count_;
+
+    const auto *inner = outer->body.as<ForNode>();
+    if (inner == nullptr || !inner->annotations.count(kInnerMarker)) {
+      return Reject(outer, "missing_direct_inner_loop",
+                    "marked outer loop must directly contain the marked "
+                    "inner WorkItem loop");
+    }
+    if (outer->kind != ForKind::kSerial || inner->kind != ForKind::kSerial) {
+      return Reject(outer, "non_serial_workitem_loop",
+                    "both WorkItem loops must be serial");
+    }
+    if (outer->thread_binding.defined() || inner->thread_binding.defined()) {
+      return Reject(outer, "thread_bound_workitem_loop",
+                    "WorkItem loops must not carry thread bindings");
+    }
+    if (outer->loop_var.dtype() != inner->loop_var.dtype()) {
+      return Reject(outer, "loop_dtype_mismatch",
+                    "outer and inner WorkItem coordinates must share a dtype");
+    }
+
+    arith::Analyzer analyzer;
+    PrimExpr simplified_outer_min = analyzer.Simplify(outer->min);
+    PrimExpr simplified_outer_extent = analyzer.Simplify(outer->extent);
+    PrimExpr simplified_inner_min = analyzer.Simplify(inner->min);
+    PrimExpr simplified_inner_extent = analyzer.Simplify(inner->extent);
+    const auto *outer_min = simplified_outer_min.as<IntImmNode>();
+    const auto *outer_extent = simplified_outer_extent.as<IntImmNode>();
+    const auto *inner_min = simplified_inner_min.as<IntImmNode>();
+    const auto *inner_extent = simplified_inner_extent.as<IntImmNode>();
+    if (outer_min == nullptr || outer_extent == nullptr ||
+        inner_min == nullptr || inner_extent == nullptr) {
+      return Reject(outer, "dynamic_workitem_range",
+                    "both WorkItem minima and extents must be compile-time "
+                    "integers");
+    }
+    if (outer_extent->value <= 0 || inner_extent->value <= 0) {
+      return Reject(outer, "non_positive_workitem_extent",
+                    "both WorkItem extents must be positive");
+    }
+    if (outer_extent->value >
+        std::numeric_limits<int64_t>::max() / inner_extent->value) {
+      return Reject(outer, "workitem_extent_overflow",
+                    "outer_extent * inner_extent exceeds int64");
+    }
+
+    int pipeline_core_count = 0;
+    PostOrderVisit(inner->body, [&](const ObjectRef &obj) {
+      if (const auto *loop = obj.as<ForNode>()) {
+        pipeline_core_count += loop->annotations.count("num_stages") ? 1 : 0;
+      }
+    });
+    if (pipeline_core_count != 1) {
+      return Reject(outer, "non_unique_pipeline_core",
+                    "the marked WorkItem nest must contain exactly one "
+                    "num_stages loop");
+    }
+
+    if (residency_policy_ != "off") {
+      residency::Proof proof = residency::Analyze(
+          func_, ffi::GetRef<For>(inner), true);
+      // A single outer WorkItem cannot amortize a cross-WorkItem residency
+      // transform, even if an internal loop exposes reuse.
+      if (outer_extent->value <= 1) {
+        proof.accepted = false;
+        proof.reason = "outer_extent_too_short";
+      }
+      ResidencyEvent event{proof};
+      if (residency_policy_ == "shadow") {
+        event.selected = "analysis_only";
+        events_.push_back(event);
+      } else if (proof.accepted) {
+        Stmt generic = BuildProvedResidency(
+            outer, inner, outer_extent->value, inner_extent->value, proof);
+        event.fingerprint = std::to_string(ffi::StructuralHash::Hash(generic, true));
+        For chosen = Downcast<For>(generic);
+        Map<String, Any> annotations = chosen->annotations;
+        annotations.Set(residency::kApplied, Bool(true));
+        chosen.CopyOnWrite()->annotations = annotations;
+        event.selected = "generic_residency";
+        events_.push_back(event);
+        ++applied_count_;
+        ++a_residency_count_;
+        return chosen;
+      } else {
+        event.selected = "original_order_flatten";
+        events_.push_back(event);
+        ICHECK(residency_policy_ != "forced" ||
+               outer_extent->value <= 1)
+            << "generic tile residency rejected: " << proof.reason;
+        // A rejected proof falls through to the ordinary safe flattening path.
+      }
+    }
+
+    int64_t total_extent = outer_extent->value * inner_extent->value;
+    Var logical(std::string(outer->loop_var->name_hint) +
+                    "_multidim_workitem",
+                outer->loop_var.dtype());
+    Map<Var, PrimExpr> substitutions;
+    substitutions.Set(
+        outer->loop_var,
+        outer->min + floordiv(logical, Integer(inner_extent->value)));
+    substitutions.Set(
+        inner->loop_var,
+        inner->min + floormod(logical, Integer(inner_extent->value)));
+    Stmt flattened_body = tir::Substitute(inner->body, substitutions);
+
+    Map<String, Any> annotations = outer->annotations;
+    annotations.erase(kOuterMarker);
+    annotations.Set(kRequested, Bool(true));
+    annotations.Set(kApplied, Bool(true));
+    annotations.Set(kOuterExtent, Integer(outer_extent->value));
+    annotations.Set(kInnerExtent, Integer(inner_extent->value));
+    annotations.Set(kTotalExtent, Integer(total_extent));
+    annotations.erase(kFallbackReason);
+    annotations.erase(kFallbackDetail);
+    ++applied_count_;
+
+    return For(logical, Integer(0), Integer(total_extent), ForKind::kSerial,
+               flattened_body, outer->thread_binding, annotations);
+  }
+
+  PrimFunc func_;
+  bool forced_{false};
+  std::string residency_policy_;
+  std::vector<ResidencyEvent> events_;
+  int requested_count_{0};
+  int applied_count_{0};
+  int a_residency_count_{0};
+  int auto_discovered_count_{0};
+};
+
+class RegionCrossOuterUnmatchedLoopAnnotator : public StmtMutator {
+private:
+  Stmt VisitStmt_(const ForNode *op) final {
+    For loop = Downcast<For>(StmtMutator::VisitStmt_(op));
+    if (!op->annotations.count("num_stages")) {
+      return loop;
+    }
+    Map<String, Any> annotations = loop->annotations;
+    SetRegionCrossOuterFallbackAnnotations(
+        &annotations, "planning", "no_unique_pipeline_core",
+        "the pipelined loop is not the unique direct Core of an outer SeqStmt");
+    loop.CopyOnWrite()->annotations = annotations;
+    return loop;
+  }
+};
+
+static tvm::transform::Pass
+FlattenSunmmioStaticWorkItems(String policy = "auto") {
+  using namespace tir::transform;
+  std::string policy_value = policy;
+  ICHECK(policy_value == "auto" || policy_value == "forced")
+      << "static WorkItem flatten policy must be 'auto' or 'forced', got "
+      << policy_value;
+  bool forced = policy_value == "forced";
+  auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
+    int requested_count = 0;
+    int applied_count = 0;
+    int a_residency_count = 0;
+    int auto_discovered_count = 0;
+    PrimFuncNode *fptr = f.CopyOnWrite();
+    fptr->body = SunmmioStaticWorkItemFlattener::Substitute(
+        f, forced, &requested_count, &applied_count, &a_residency_count,
+        &auto_discovered_count);
+    if (forced && requested_count == 0) {
+      LOG(FATAL) << "[SunmmioPipeline][workitem_flatten][ForcedReject] "
+                    "reason=no_marked_workitem_nest";
+    }
+    ICHECK_LE(applied_count, requested_count);
+    auto propagate_applied_key = [&](const String &applied_key) {
+      f = WithAttr(std::move(f), applied_key, Bool(true));
+      Array<String> device_attr_keys;
+      if (auto existing =
+              f->GetAttr<Array<String>>(attr::kDeviceFuncAttrKeys)) {
+        device_attr_keys = existing.value();
+      }
+      if (std::find(device_attr_keys.begin(), device_attr_keys.end(),
+                    applied_key) == device_attr_keys.end()) {
+        device_attr_keys.push_back(applied_key);
+      }
+      f = WithAttr(std::move(f), attr::kDeviceFuncAttrKeys, device_attr_keys);
+    };
+    if (applied_count > a_residency_count) {
+      propagate_applied_key("tl.sunmmio.multidim.workitem_flatten.applied");
+    }
+    if (a_residency_count > 0) {
+      propagate_applied_key("tl.sunmmio.multidim.a_residency.applied");
+    }
+    if (auto_discovered_count > 0) {
+      f = WithAttr(std::move(f), "tl.sunmmio.multidim.workitem.auto_discovered",
+                   Integer(auto_discovered_count));
+    }
+    return f;
+  };
+  return CreatePrimFuncPass(pass_func, 0, "tl.FlattenSunmmioStaticWorkItems",
+                            {});
+}
+
 tvm::transform::Pass SunmmioPipelinePlanning(bool debug = false) {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
@@ -2223,10 +4142,126 @@ tvm::transform::Pass SunmmioPipelinePlanning(bool debug = false) {
   return CreatePrimFuncPass(pass_func, 0, "tl.SunmmioPipelinePlanning", {});
 }
 
+static tvm::transform::Pass
+SunmmioCrossOuterPipelinePlanning(bool debug = false, String policy = "auto") {
+  using namespace tir::transform;
+  std::string policy_value = policy;
+  ICHECK(policy_value == "auto" || policy_value == "forced")
+      << "cross_outer policy must be 'auto' or 'forced', got " << policy_value;
+  bool forced = policy_value == "forced";
+  auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
+    bool has_requested_loop = false;
+    PostOrderVisit(f->body, [&](const ObjectRef &obj) {
+      if (const auto *loop = obj.as<ForNode>()) {
+        has_requested_loop =
+            has_requested_loop || loop->annotations.count("num_stages");
+      }
+    });
+    int applied_count = 0;
+    PrimFuncNode *fptr = f.CopyOnWrite();
+    fptr->body = SunmmioCrossOuterPipelinePlanner::Substitute(f, debug, forced,
+                                                              &applied_count);
+    bool has_cross_outer_fallback = false;
+    PostOrderVisit(fptr->body, [&](const ObjectRef &obj) {
+      if (const auto *loop = obj.as<ForNode>()) {
+        has_cross_outer_fallback =
+            has_cross_outer_fallback ||
+            loop->annotations.count(kCrossOuterFallbackReason);
+      }
+    });
+    if (!forced && has_requested_loop && applied_count == 0 &&
+        !has_cross_outer_fallback) {
+      CrossOuterUnmatchedLoopAnnotator annotator;
+      fptr->body = annotator(fptr->body);
+    }
+    if (forced && has_requested_loop && applied_count == 0) {
+      LOG(FATAL) << "[SunmmioPipeline][cross_outer][ForcedReject] "
+                    "reason=no_supported_outer_inner_nest";
+    }
+    return f;
+  };
+  return CreatePrimFuncPass(pass_func, 0,
+                            "tl.SunmmioCrossOuterPipelinePlanning", {});
+}
+
+static tvm::transform::Pass
+SunmmioRegionCrossOuterPipelinePlanning(bool debug = false,
+                                        String policy = "auto",
+                                        String strategy = "continuous") {
+  using namespace tir::transform;
+  std::string policy_value = policy;
+  std::string strategy_value = strategy;
+  ICHECK(policy_value == "auto" || policy_value == "forced")
+      << "region_cross_outer policy must be 'auto' or 'forced', got "
+      << policy_value;
+  ICHECK(strategy_value == "conservative" || strategy_value == "continuous" ||
+         strategy_value == "hierarchical_ilp" || strategy_value == "multidim_boundary")
+      << "region_cross_outer strategy must be 'conservative', 'continuous', "
+         "'hierarchical_ilp', or 'multidim_boundary', got "
+      << strategy_value;
+  bool forced = policy_value == "forced";
+  auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
+    bool has_requested_loop = false;
+    PostOrderVisit(f->body, [&](const ObjectRef &obj) {
+      if (const auto *loop = obj.as<ForNode>()) {
+        if (strategy_value == "multidim_boundary") {
+          auto eligible = loop->annotations.Get("tl.sunmmio.boundary_overlap.eligible");
+          const auto *value = eligible ? eligible.value().as<IntImmNode>() : nullptr;
+          has_requested_loop = has_requested_loop || (value && value->value);
+          return;
+        }
+        has_requested_loop = has_requested_loop ||
+                             loop->annotations.count("num_stages") ||
+                             (strategy_value == "hierarchical_ilp" &&
+                              loop->annotations.count(
+                                  "tl.sunmmio.pipeline.command_start_times"));
+      }
+    });
+    int applied_count = 0;
+    PrimFuncNode *fptr = f.CopyOnWrite();
+    fptr->body = SunmmioRegionCrossOuterPipelinePlanner::Substitute(
+        f, debug, forced, strategy_value, &applied_count);
+    if (strategy_value == "multidim_boundary" && applied_count > 0) {
+      f = WithAttr(std::move(f), "tl.sunmmio.boundary_overlap.planned", Bool(true));
+      fptr = f.CopyOnWrite();
+    }
+    bool has_region_fallback = false;
+    PostOrderVisit(fptr->body, [&](const ObjectRef &obj) {
+      if (const auto *loop = obj.as<ForNode>()) {
+        has_region_fallback =
+            has_region_fallback ||
+            loop->annotations.count(kRegionCrossOuterFallbackReason);
+      }
+    });
+    if (strategy_value != "multidim_boundary" && !forced && has_requested_loop && applied_count == 0 &&
+        !has_region_fallback) {
+      RegionCrossOuterUnmatchedLoopAnnotator annotator;
+      fptr->body = annotator(fptr->body);
+    }
+    if (forced && has_requested_loop && applied_count == 0) {
+      LOG(FATAL) << "[SunmmioPipeline][region_cross_outer][ForcedReject] "
+                    "reason=no_supported_region";
+    }
+    return f;
+  };
+  return CreatePrimFuncPass(pass_func, 0,
+                            "tl.SunmmioRegionCrossOuterPipelinePlanning", {});
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.transform.AnalyzeSunmmioTileResidency",
+                        AnalyzeSunmmioTileResidency);
+  refl::GlobalDef().def("tl.transform.SunmmioResidencyScheduleFingerprint",
+                        ResidencyScheduleFingerprint);
+  refl::GlobalDef().def("tl.transform.FlattenSunmmioStaticWorkItems",
+                        FlattenSunmmioStaticWorkItems);
   refl::GlobalDef().def("tl.transform.SunmmioPipelinePlanning",
                         SunmmioPipelinePlanning);
+  refl::GlobalDef().def("tl.transform.SunmmioCrossOuterPipelinePlanning",
+                        SunmmioCrossOuterPipelinePlanning);
+  refl::GlobalDef().def("tl.transform.SunmmioRegionCrossOuterPipelinePlanning",
+                        SunmmioRegionCrossOuterPipelinePlanning);
 }
 } // namespace tl
 } // namespace tvm

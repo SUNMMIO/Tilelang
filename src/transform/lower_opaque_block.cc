@@ -167,21 +167,24 @@ private:
     return body;
   }
 
-  // Treat annotations as empty if they are truly empty or contain only
-  // the unroll hint `pragma_unroll_explicit`. This allows unit-length
-  // loops produced by unroll pragmas to be simplified away.
+  // Analysis diagnostics do not define an execution boundary.  In particular,
+  // a rejected Multidim candidate must not keep a unit-length loop alive and
+  // force the sync pass to drain unrelated DMA at that artificial boundary.
+  // Keep this an exact allowlist: tile, pipeline, bank, collective and unknown
+  // annotations may carry semantics and must retain the original loop.
   bool
   IsEffectivelyEmptyAnnotation(const Map<String, ffi::Any> &annotations) const {
-    if (annotations.empty()) {
-      return true;
-    }
-    if (annotations.size() == 1) {
-      auto it = annotations.find(tir::attr::pragma_unroll_explicit);
-      if (it != annotations.end()) {
-        return true;
+    for (const auto &kv : annotations) {
+      const String &key = kv.first;
+      if (key != tir::attr::pragma_unroll_explicit &&
+          key != "tl.sunmmio.multidim.selected_mode" &&
+          key != "tl.sunmmio.multidim.fallback_stage" &&
+          key != "tl.sunmmio.multidim.fallback_reason" &&
+          key != "tl.sunmmio.residency.reject_reason") {
+        return false;
       }
     }
-    return false;
+    return true;
   }
 
   PrimExpr VisitExpr_(const VarNode *op) final {

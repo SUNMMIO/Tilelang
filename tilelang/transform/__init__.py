@@ -9,6 +9,7 @@ from tvm.ir.transform import PassContext  # noqa: F401
 from .add_bufstore_wrapper import AddWrapperForSingleBufStore  # noqa: F401
 from .hoist_broadcast_values import HoistBroadcastValues  # noqa: F401
 from .decouple_type_cast import DecoupleTypeCast  # noqa: F401
+import os
 
 
 def get_pass_context():
@@ -739,6 +740,27 @@ def LowerLDGSTG():
     return _ffi_api.LowerLDGSTG()  # type: ignore
 
 
+def FlattenSunmmioStaticWorkItems(policy: str = "auto"):
+    """Discover or transform a static outer/inner WorkItem nest.
+
+    In ``"auto"`` mode, an unmarked serial perfect nest is discovered when its
+    ranges are static, it contains one pipeline core, and the generic residency
+    proof establishes invariant transfers and independent reduction slots.
+    Explicit ``workitem_outer/workitem_inner`` annotations remain supported.
+    Annotated candidates may safely fall back to order-preserving flattening;
+    unmarked candidates that cannot be proved are left unchanged for Ordinary
+    Multidim or 1D fallback.
+
+    Parameters
+    ----------
+    policy : str
+        ``"auto"`` discovers eligible unmarked nests and records fallback on
+        unsupported marked nests. ``"forced"`` requires explicit annotations
+        and rejects unsupported marked candidates.
+    """
+    return _ffi_api.FlattenSunmmioStaticWorkItems(policy)  # type: ignore
+
+
 def SunmmioPipelinePlanning(debug: bool = False):
     """SunmmioPipelinePlanning
 
@@ -759,6 +781,47 @@ def InjectSunmmioPipeline():
         The result pass
     """
     return _ffi_api.InjectSunmmioPipeline()  # type: ignore
+
+
+def SunmmioCrossOuterPipelinePlanning(debug: bool = False, policy: str = "auto"):
+    """Plan a continuous pipeline across a static two-level loop nest.
+
+    policy="forced" rejects unsupported nests. policy="auto" leaves
+    the original inner pipeline available for the greedy fallback.
+    """
+    return _ffi_api.SunmmioCrossOuterPipelinePlanning(debug, policy)  # type: ignore
+
+
+def InjectSunmmioCrossOuterPipeline(policy: str = "auto"):
+    """Inject a planned continuous pipeline across an outer-loop boundary.
+
+    Parameters
+    ----------
+    policy : str
+        "forced" or "auto".
+    """
+    return _ffi_api.InjectSunmmioCrossOuterPipeline(policy)  # type: ignore
+
+
+def SunmmioRegionCrossOuterPipelinePlanning(
+    debug: bool = False,
+    policy: str = "auto",
+    strategy: str = "continuous",
+):
+    """Plan a Prefix/Core/Suffix region across static outer-loop boundaries."""
+    return _ffi_api.SunmmioRegionCrossOuterPipelinePlanning(  # type: ignore
+        debug, policy, strategy
+    )
+
+
+def InjectSunmmioRegionCrossOuterPipeline(
+    policy: str = "auto",
+    strategy: str = "continuous",
+):
+    """Inject a planned region-aware cross-outer pipeline."""
+    return _ffi_api.InjectSunmmioRegionCrossOuterPipeline(  # type: ignore
+        policy, strategy
+    )
 
 
 def RemoveUnusedSunmmioAllocations():
@@ -792,6 +855,110 @@ def InjectSunmmioPipelineILP():
         The result pass
     """
     return _ffi_api.InjectSunmmioPipelineILP()  # type: ignore
+
+
+def AnalyzeSunmmioTileResidency(policy: str = "auto_strict"):
+    """Prove bounded tile reuse without requiring kernel scheduling markers.
+
+    off/shadow preserve IR. auto_strict annotates proved candidates only.
+    forced rejects an unsupported candidate. Backend resource/numeric checks
+    remain required; this pass does not promise measured cycles.
+    """
+    return _ffi_api.AnalyzeSunmmioTileResidency(policy)
+
+
+def SunmmioResidencyScheduleFingerprint(func):
+    """Alpha-stable pre-sync TIR structural hash, not a correctness proof."""
+    return _ffi_api.SunmmioResidencyScheduleFingerprint(func)
+
+
+def AnalyzeSunmmioBoundaryOverlap(policy: str = "auto"):
+    """Independently prove an original-order cross-WorkItem candidate."""
+    return _ffi_api.AnalyzeSunmmioBoundaryOverlap(policy)
+
+
+def SunmmioMultidimRegion(policy: str = "auto"):
+    """Discover and normalize a static two-dimensional SunMMIO pipeline region."""
+    return _ffi_api.SunmmioMultidimRegion(policy)  # type: ignore
+def PrepareSunmmioMultidimInterchangeBuffers():
+    """Compatibility no-op; Apply creates independent accumulator buffers."""
+    return _ffi_api.PrepareSunmmioMultidimInterchangeBuffers()  # type: ignore
+
+
+def ApplySunmmioMultidimInterchange(policy: str = "auto"):
+    """Interchange a static small outer loop with its pipelined inner loop."""
+    return _ffi_api.ApplySunmmioMultidimInterchange(policy)  # type: ignore
+
+
+
+
+def BuildSunmmioHierarchicalSummary(policy: str = "auto"):
+    """Build an outer-Tile summary from the planned inner 1D pipeline."""
+    return _ffi_api.BuildSunmmioHierarchicalSummary(policy)  # type: ignore
+
+
+def BuildSunmmioHierarchicalOuterPipeline(policy: str = "auto"):
+    """Build Prefetch/InnerPipeline/Store stages after inner injection."""
+    return _ffi_api.BuildSunmmioHierarchicalOuterPipeline(policy)  # type: ignore
+
+
+def ValidateSunmmioMultidimPipeline(policy: str = "auto", stage: str = "planning"):
+    """Validate forced/auto multidim diagnostics and remove private metadata."""
+    return _ffi_api.ValidateSunmmioMultidimPipeline(policy, stage)  # type: ignore
+
+def SelectSunmmioMultidimPipeline(policy: str = "auto"):
+    """Choose the lower predicted-time legal candidate in auto mode."""
+    return _ffi_api.SelectSunmmioMultidimPipeline(policy)  # type: ignore
+
+
+
+def SunmmioMultidimPipelinePlanningILP(debug: bool = False, policy: str = "auto"):
+    """Plan a multidimensional SunMMIO pipeline.
+
+    The region pass expands only the bounded inner Tile axis while preserving
+    explicit two-dimensional command identity. The existing ILP engine then
+    schedules that Tile-stage graph across outer-loop iterations.
+    """
+    passes = [
+            SunmmioMultidimRegion(policy),
+            PrepareSunmmioMultidimInterchangeBuffers(),
+            ApplySunmmioMultidimInterchange(policy),
+            SunmmioPipelinePlanningILP(debug),
+            BuildSunmmioHierarchicalSummary(policy),
+            ValidateSunmmioMultidimPipeline(policy, "planning"),
+            # Auto mode plans the restored 1D loop as a competing candidate.
+            SunmmioPipelinePlanningILP(debug),
+            SelectSunmmioMultidimPipeline(policy),
+        ]
+    if os.environ.get("TL_SUNMMIO_MULTIDIM_BOUNDARY_OVERLAP", "1") == "1":
+        passes.insert(0, AnalyzeSunmmioBoundaryOverlap(policy))
+        passes.append(SunmmioRegionCrossOuterPipelinePlanning(
+            debug=debug, policy="auto", strategy="multidim_boundary"))
+    return tvm.transform.Sequential(
+        passes,
+        name="tl.SunmmioMultidimPipelinePlanningILP",
+    )
+
+
+def InjectSunmmioMultidimPipelineILP(policy: str = "auto"):
+    """Inject a planned multidimensional SunMMIO pipeline."""
+    return tvm.transform.Sequential(
+        [
+            # First inject the preserved inner 1D modulo pipeline.  Its
+            # prologue and steady/epilogue are emitted as explicit phase
+            # markers for the outer builder.
+            InjectSunmmioPipelineILP(),
+            BuildSunmmioHierarchicalOuterPipeline(policy),
+            # Then inject the outer Prefetch/InnerPipeline/Store schedule.
+            InjectSunmmioPipelineILP(),
+            ValidateSunmmioMultidimPipeline(policy, "inject"),
+            # A late multidimensional injection failure is recoverable in
+            # auto mode by planning and injecting the restored 1D pipeline.
+            SunmmioPipelinePlanningILP(False),
+            InjectSunmmioPipelineILP(),
+        ],
+        name="tl.InjectSunmmioMultidimPipelineILP",
+    )
 
 
 def MergeSharedMemoryAllocationsSunmmio(

@@ -130,6 +130,16 @@ public:
     found_ = found_ || IsMeshSymbolVar(op);
   }
 
+  void VisitStmt_(const AttrStmtNode *op) final {
+    StmtVisitor::VisitStmt_(op);
+    if (const auto *iter = op->node.as<IterVarNode>()) {
+      if (iter->dom.defined()) {
+        found_ = found_ || ExprContainsMeshSymbol(iter->dom->min) ||
+                 ExprContainsMeshSymbol(iter->dom->extent);
+      }
+    }
+  }
+
   void VisitStmt_(const ForNode *op) final {
     StmtVisitor::VisitStmt_(op);
     found_ = found_ || AnnotationsContainMeshSymbol(op->annotations);
@@ -355,6 +365,34 @@ public:
       : vmap_(std::move(vmap)), analyzer_(analyzer) {}
 
   Stmt Substitute(const Stmt &stmt) { return VisitStmt(stmt); }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    AttrStmt attr = Downcast<AttrStmt>(StmtExprMutator::VisitStmt_(op));
+    const auto *iter_node = attr->node.as<IterVarNode>();
+    if (iter_node == nullptr || !iter_node->dom.defined()) {
+      return attr;
+    }
+
+    // Specialize visits AttrStmt.value/body, but not an IterVar node's domain.
+    // Substitute only the actual mesh attribute Vars, never names or binders.
+    const Range &dom = iter_node->dom;
+    PrimExpr min = tir::Substitute(dom->min, vmap_);
+    PrimExpr extent = tir::Substitute(dom->extent, vmap_);
+    if (min.same_as(dom->min) && extent.same_as(dom->extent)) {
+      return attr;
+    }
+    if (!min.same_as(dom->min)) {
+      min = analyzer_->Simplify(min);
+    }
+    if (!extent.same_as(dom->extent)) {
+      extent = analyzer_->Simplify(extent);
+    }
+    IterVar iter = Downcast<IterVar>(attr->node);
+    // Copy-on-write preserves var identity, iter_type, thread_tag and span.
+    iter.CopyOnWrite()->dom = Range::FromMinExtent(min, extent, dom->span);
+    attr.CopyOnWrite()->node = iter;
+    return attr;
+  }
 
   Stmt VisitStmt_(const ForNode *op) final {
     For loop = Downcast<For>(StmtExprMutator::VisitStmt_(op));

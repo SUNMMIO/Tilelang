@@ -32,10 +32,15 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <cstdint>
 #include <exception>
+#include <limits>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace tvm {
 namespace tl {
@@ -267,6 +272,22 @@ private:
           }
         }
         loop.CopyOnWrite()->annotations.Set("used_buffers", new_used_buffers);
+        auto remap_buffer_array_annotation = [&](const char *name) {
+          auto annotation = op->annotations.Get(name);
+          if (!annotation) {
+            return;
+          }
+          Array<Buffer> buffers = Downcast<Array<Buffer>>(annotation.value());
+          Array<Buffer> remapped;
+          for (const Buffer &buffer : buffers) {
+            auto it = buffer_remap_.find(buffer);
+            remapped.push_back(it == buffer_remap_.end() ? buffer
+                                                         : (*it).second);
+          }
+          loop.CopyOnWrite()->annotations.Set(name, remapped);
+        };
+        remap_buffer_array_annotation(kRegionCrossOuterCoreVersionedBuffers);
+        remap_buffer_array_annotation(kRegionCrossOuterRegionVersionedBuffers);
         auto remap_phase_annotation = [&](const Optional<Any> &annotation,
                                           const char *name) {
           if (!annotation)
@@ -512,7 +533,13 @@ public:
   void set_current_version(int v) { current_version_ = v; }
   void set_current_command(int id) { current_command_id_ = id; }
 
-  void set_loop_var_replacement(PrimExpr p) { replaced_loop_var_ = p; }
+  void set_loop_var_replacement(PrimExpr p) {
+    set_var_replacement(pipeline_loop_->loop_var, std::move(p));
+  }
+
+  void set_var_replacement(const Var &var, PrimExpr replacement) {
+    loop_var_replacements_.Set(var, std::move(replacement));
+  }
 
 private:
   PrimExpr RewriteBufferAccess(const Call &call,
@@ -641,8 +668,8 @@ private:
 
   PrimExpr VisitExpr_(const VarNode *op) final {
     Var var = Downcast<Var>(StmtExprMutator::VisitExpr_(op));
-    if (ExprDeepEqual()(var, pipeline_loop_->loop_var)) {
-      return replaced_loop_var_;
+    if (auto replacement = loop_var_replacements_.Get(var)) {
+      return replacement.value();
     }
     return var;
   }
@@ -719,7 +746,7 @@ private:
       writer_phases_;
   std::unordered_map<const BufferNode *, std::unordered_map<int, int>>
       reader_phases_;
-  PrimExpr replaced_loop_var_;
+  Map<Var, PrimExpr> loop_var_replacements_;
 };
 
 class SunmmioPipelineInjector : public StmtExprMutator {
@@ -1040,6 +1067,542 @@ private:
   StmtReadWriteCollector stmt_rw_collector;
 };
 
+static bool VerifyCrossOuterCoverage(int64_t total_extent, int iterations,
+                                     int command_count,
+                                     const Array<String> &prologue_orders,
+                                     const Array<String> &body_orders,
+                                     const Array<String> &epilogue_orders,
+                                     std::string *detail) {
+  if (total_extent <= 0 || iterations <= 0 || command_count <= 0 ||
+      total_extent % iterations != 0) {
+    *detail = "invalid verifier dimensions";
+    return false;
+  }
+  if (static_cast<uint64_t>(total_extent) >
+      std::numeric_limits<uint64_t>::max() /
+          static_cast<uint64_t>(command_count)) {
+    *detail = "coverage key space overflows uint64";
+    return false;
+  }
+
+  std::unordered_set<uint64_t> covered;
+  auto record = [&](const String &order, int64_t base) {
+    int iter = name2iter(order);
+    int id = name2id(order);
+    int64_t logical = base + iter;
+    if (iter < 0 || id < 0 || id >= command_count || logical < 0 ||
+        logical >= total_extent) {
+      std::ostringstream os;
+      os << "out-of-range order=" << order << " logical=" << logical;
+      *detail = os.str();
+      return false;
+    }
+    int version = iter % iterations;
+    if (version < 0) {
+      version += iterations;
+    }
+    if (version < 0 || version >= iterations) {
+      *detail = "version slot out of range";
+      return false;
+    }
+    uint64_t key =
+        static_cast<uint64_t>(logical) * static_cast<uint64_t>(command_count) +
+        static_cast<uint64_t>(id);
+    if (!covered.insert(key).second) {
+      std::ostringstream os;
+      os << "duplicate order=" << order << " logical=" << logical;
+      *detail = os.str();
+      return false;
+    }
+    return true;
+  };
+
+  for (const String &order : prologue_orders) {
+    if (!record(order, 0)) {
+      return false;
+    }
+  }
+  int64_t total_chunks = total_extent / iterations;
+  for (int64_t chunk = 0; chunk + 1 < total_chunks; ++chunk) {
+    for (const String &order : body_orders) {
+      if (!record(order, chunk * iterations)) {
+        return false;
+      }
+    }
+  }
+  for (const String &order : epilogue_orders) {
+    if (!record(order, (total_chunks - 1) * iterations)) {
+      return false;
+    }
+  }
+
+  uint64_t expected = static_cast<uint64_t>(total_extent) *
+                      static_cast<uint64_t>(command_count);
+  if (covered.size() != expected) {
+    std::ostringstream os;
+    os << "coverage size=" << covered.size() << " expected=" << expected;
+    *detail = os.str();
+    return false;
+  }
+  return true;
+}
+
+class CrossOuterPlanningCleanup : public StmtMutator {
+public:
+  CrossOuterPlanningCleanup(std::string reason, std::string detail)
+      : reason_(std::move(reason)), detail_(std::move(detail)) {}
+
+private:
+  Stmt VisitStmt_(const ForNode *op) final {
+    For loop = Downcast<For>(StmtMutator::VisitStmt_(op));
+    if (!op->annotations.count(kCrossOuterMarker)) {
+      return loop;
+    }
+    Map<String, Any> annotations;
+    for (const auto &[key, value] : loop->annotations) {
+      if (!IsPipelineScheduleAnnotation(key) && key != kPipelineRequested &&
+          key != kPipelineApplied && key != kPipelineMode &&
+          key != kPipelineFallbackStage && key != kPipelineFallbackReason &&
+          key != kPipelineFallbackDetail) {
+        annotations.Set(key, value);
+      }
+    }
+    SetCrossOuterFallbackAnnotations(&annotations, "inject", reason_, detail_);
+    loop.CopyOnWrite()->annotations = annotations;
+    return loop;
+  }
+
+  std::string reason_;
+  std::string detail_;
+};
+
+static PrimFunc MakeCrossOuterFunctionFallback(const PrimFunc &original,
+                                               const std::string &reason,
+                                               const std::string &detail) {
+  PrimFunc fallback = original;
+  CrossOuterPlanningCleanup cleanup(reason, detail);
+  fallback.CopyOnWrite()->body = cleanup(original->body);
+  return fallback;
+}
+
+class SunmmioCrossOuterPipelineInjector : public StmtExprMutator {
+public:
+  static Stmt Inject(const PrimFunc &func, int *injected_count) {
+    SunmmioCrossOuterPipelineInjector injector;
+    Stmt result = injector(func->body);
+    *injected_count = injector.injected_count_;
+    return result;
+  }
+
+private:
+  Stmt VisitStmt_(const ForNode *outer) final {
+    if (!outer->annotations.count(kCrossOuterMarker)) {
+      return StmtExprMutator::VisitStmt_(outer);
+    }
+
+    const auto *inner = outer->body.as<ForNode>();
+    ICHECK(inner != nullptr)
+        << "cross_outer planned loop must directly contain the inner loop";
+    const auto *pipeline_body = inner->body.as<SeqStmtNode>();
+    ICHECK(pipeline_body != nullptr)
+        << "cross_outer inner body must remain a direct SeqStmt";
+
+    auto get_int_annotation = [&](const char *key) {
+      auto value = outer->annotations.Get(key);
+      ICHECK(value.has_value()) << "missing cross_outer annotation " << key;
+      return Downcast<IntImm>(value.value())->value;
+    };
+    int iterations = static_cast<int>(get_int_annotation("iterations"));
+    int64_t outer_extent = get_int_annotation(kCrossOuterOuterExtent);
+    int64_t inner_extent = get_int_annotation(kCrossOuterInnerExtent);
+    arith::Analyzer extent_analyzer;
+    auto get_static_extent = [&](const PrimExpr &extent,
+                                 const char *loop_name) {
+      PrimExpr simplified = extent_analyzer.Simplify(extent);
+      const auto *value = simplified.as<IntImmNode>();
+      ICHECK(value != nullptr)
+          << "cross_outer " << loop_name
+          << " extent must simplify to a compile-time integer";
+      return value->value;
+    };
+    ICHECK_GT(iterations, 0);
+    ICHECK_EQ(outer_extent, get_static_extent(outer->extent, "outer"));
+    ICHECK_EQ(inner_extent, get_static_extent(inner->extent, "inner"));
+    ICHECK_EQ(inner_extent % iterations, 0);
+    int64_t total_extent = outer_extent * inner_extent;
+
+    Array<String> prologue_orders =
+        Downcast<Array<String>>(outer->annotations.at("prologue_orders"));
+    Array<String> body_orders =
+        Downcast<Array<String>>(outer->annotations.at("body_orders"));
+    Array<String> epilogue_orders =
+        Downcast<Array<String>>(outer->annotations.at("epilogue_orders"));
+    std::string coverage_detail;
+    ICHECK(VerifyCrossOuterCoverage(
+        total_extent, iterations, static_cast<int>(pipeline_body->seq.size()),
+        prologue_orders, body_orders, epilogue_orders, &coverage_detail))
+        << "cross_outer_schedule_coverage_failed: " << coverage_detail;
+
+    Array<Buffer> versioned_buffers =
+        Downcast<Array<Buffer>>(outer->annotations.at("versioned_buffers"));
+    Map<Buffer, Buffer> bank_peer_buffers;
+    if (auto ann = outer->annotations.Get("bank_peer_buffers")) {
+      bank_peer_buffers = Downcast<Map<Buffer, Buffer>>(ann.value());
+    }
+    Array<Buffer> version_axis_buffers;
+    if (auto ann = outer->annotations.Get("version_axis_buffers")) {
+      version_axis_buffers = Downcast<Array<Buffer>>(ann.value());
+    }
+    Map<Buffer, Map<Integer, PrimExpr>> writer_phases;
+    if (auto ann = outer->annotations.Get("runtime_bank_writer_phases")) {
+      writer_phases =
+          Downcast<Map<Buffer, Map<Integer, PrimExpr>>>(ann.value());
+    }
+    Map<Buffer, Map<Integer, PrimExpr>> reader_phases;
+    if (auto ann = outer->annotations.Get("runtime_bank_reader_phases")) {
+      reader_phases =
+          Downcast<Map<Buffer, Map<Integer, PrimExpr>>>(ann.value());
+    }
+
+    For outer_ref = tvm::ffi::GetRef<For>(outer);
+    auto rewriter = PipelineBodyRewriter(versioned_buffers, bank_peer_buffers,
+                                         version_axis_buffers, writer_phases,
+                                         reader_phases, outer_ref);
+    auto version_slot = [iterations](int iter) {
+      int slot = iter % iterations;
+      return slot < 0 ? slot + iterations : slot;
+    };
+    auto rewrite_command = [&](const String &order, const PrimExpr &logical) {
+      int iter = name2iter(order);
+      int id = name2id(order);
+      ICHECK_GE(id, 0);
+      ICHECK_LT(id, static_cast<int>(pipeline_body->seq.size()));
+      rewriter.set_current_command(id);
+      rewriter.set_current_version(version_slot(iter));
+      rewriter.set_var_replacement(
+          outer->loop_var,
+          outer->min + floordiv(logical, Integer(inner_extent)));
+      rewriter.set_var_replacement(
+          inner->loop_var,
+          inner->min + floormod(logical, Integer(inner_extent)));
+      return rewriter(pipeline_body->seq[id]);
+    };
+
+    Array<Stmt> result;
+    for (const String &order : prologue_orders) {
+      result.push_back(rewrite_command(order, Integer(name2iter(order))));
+    }
+
+    Var outer_chunk(std::string(outer->loop_var->name_hint) + "_cross_outer",
+                    outer->loop_var.dtype());
+    Var inner_chunk(std::string(inner->loop_var->name_hint) + "_cross_chunk",
+                    inner->loop_var.dtype());
+    int64_t chunks_per_outer = inner_extent / iterations;
+    int64_t total_chunks = total_extent / iterations;
+    PrimExpr global_chunk =
+        outer_chunk * Integer(chunks_per_outer) + inner_chunk;
+    Array<Stmt> steady_commands;
+    for (const String &order : body_orders) {
+      PrimExpr logical =
+          global_chunk * Integer(iterations) + Integer(name2iter(order));
+      steady_commands.push_back(rewrite_command(order, logical));
+    }
+    Stmt steady_body = SeqStmt::Flatten(steady_commands);
+    steady_body =
+        IfThenElse(LT(global_chunk, Integer(total_chunks - 1)), steady_body);
+    For steady_inner(inner_chunk, Integer(0), Integer(chunks_per_outer),
+                     ForKind::kSerial, steady_body);
+    Map<String, Any> steady_annotations;
+    SetPipelineAppliedAnnotations(&steady_annotations, "cross_outer");
+    steady_annotations.Set(kCrossOuterSteady, Bool(true));
+    For steady_outer(outer_chunk, Integer(0), Integer(outer_extent),
+                     ForKind::kSerial, steady_inner, outer->thread_binding,
+                     steady_annotations);
+    result.push_back(steady_outer);
+
+    PrimExpr epilogue_base = Integer((total_chunks - 1) * iterations);
+    for (const String &order : epilogue_orders) {
+      result.push_back(
+          rewrite_command(order, epilogue_base + Integer(name2iter(order))));
+    }
+    ++injected_count_;
+    return SeqStmt::Flatten(result);
+  }
+
+  int injected_count_{0};
+};
+
+struct RegionCrossOuterEvent {
+  String order;
+  int64_t logical{0};
+  int64_t outer{0};
+};
+
+static bool BuildRegionCrossOuterEvents(
+    int64_t outer_extent, int64_t inner_extent, int iterations,
+    int command_count, const Array<String> &prologue_orders,
+    const Array<String> &body_orders, const Array<String> &epilogue_orders,
+    std::vector<RegionCrossOuterEvent> *events, std::vector<int64_t> *first,
+    std::vector<int64_t> *last, bool *boundary_overlap, std::string *detail) {
+  int64_t total_extent = outer_extent * inner_extent;
+  if (!VerifyCrossOuterCoverage(total_extent, iterations, command_count,
+                                prologue_orders, body_orders, epilogue_orders,
+                                detail)) {
+    return false;
+  }
+  first->assign(outer_extent, -1);
+  last->assign(outer_extent, -1);
+  auto append = [&](const String &order, int64_t base) {
+    int64_t logical = base + name2iter(order);
+    int64_t outer = logical / inner_extent;
+    int64_t position = static_cast<int64_t>(events->size());
+    events->push_back(RegionCrossOuterEvent{order, logical, outer});
+    if ((*first)[outer] < 0) {
+      (*first)[outer] = position;
+    }
+    (*last)[outer] = position;
+  };
+  for (const String &order : prologue_orders) {
+    append(order, 0);
+  }
+  int64_t total_chunks = total_extent / iterations;
+  for (int64_t chunk = 0; chunk + 1 < total_chunks; ++chunk) {
+    for (const String &order : body_orders) {
+      append(order, chunk * iterations);
+    }
+  }
+  for (const String &order : epilogue_orders) {
+    append(order, (total_chunks - 1) * iterations);
+  }
+  *boundary_overlap = false;
+  for (int64_t outer = 0; outer < outer_extent; ++outer) {
+    if ((*first)[outer] < 0 || (*last)[outer] < (*first)[outer]) {
+      *detail = "outer iteration has no complete Core interval";
+      return false;
+    }
+    if (outer + 1 < outer_extent && (*first)[outer + 1] < (*last)[outer]) {
+      *boundary_overlap = true;
+    }
+  }
+  return true;
+}
+
+class RegionCrossOuterPlanningCleanup : public StmtMutator {
+public:
+  RegionCrossOuterPlanningCleanup(std::string reason, std::string detail)
+      : reason_(std::move(reason)), detail_(std::move(detail)) {}
+
+private:
+  Stmt VisitStmt_(const ForNode *op) final {
+    For loop = Downcast<For>(StmtMutator::VisitStmt_(op));
+    if (!op->annotations.count(kRegionCrossOuterMarker)) {
+      return loop;
+    }
+    Map<String, Any> annotations;
+    for (const auto &[key, value] : loop->annotations) {
+      if (!IsPipelineScheduleAnnotation(key) && key != kPipelineRequested &&
+          key != kPipelineApplied && key != kPipelineMode &&
+          key != kPipelineFallbackStage && key != kPipelineFallbackReason &&
+          key != kPipelineFallbackDetail && key != kRegionCrossOuterRequested &&
+          key != kRegionCrossOuterFallbackStage &&
+          key != kRegionCrossOuterFallbackReason &&
+          key != kRegionCrossOuterFallbackDetail) {
+        annotations.Set(key, value);
+      }
+    }
+    SetRegionCrossOuterFallbackAnnotations(&annotations, "inject", reason_,
+                                           detail_);
+    loop.CopyOnWrite()->annotations = annotations;
+    return loop;
+  }
+
+  std::string reason_;
+  std::string detail_;
+};
+
+static PrimFunc
+MakeRegionCrossOuterFunctionFallback(const PrimFunc &original,
+                                     const std::string &reason,
+                                     const std::string &detail) {
+  PrimFunc fallback = original;
+  RegionCrossOuterPlanningCleanup cleanup(reason, detail);
+  fallback.CopyOnWrite()->body = cleanup(original->body);
+  return fallback;
+}
+
+class SunmmioRegionCrossOuterPipelineInjector : public StmtExprMutator {
+public:
+  static Stmt Inject(const PrimFunc &func, int *injected_count,
+                     bool *boundary_overlap) {
+    SunmmioRegionCrossOuterPipelineInjector injector;
+    Stmt result = injector(func->body);
+    *injected_count = injector.injected_count_;
+    *boundary_overlap = injector.boundary_overlap_;
+    return result;
+  }
+
+private:
+  Stmt VisitStmt_(const ForNode *outer) final {
+    if (!outer->annotations.count(kRegionCrossOuterMarker)) {
+      return StmtExprMutator::VisitStmt_(outer);
+    }
+    String strategy =
+        Downcast<String>(outer->annotations.at(kRegionCrossOuterStrategy));
+    if (strategy != "continuous") {
+      return StmtExprMutator::VisitStmt_(outer);
+    }
+    const auto *region_body = outer->body.as<SeqStmtNode>();
+    ICHECK(region_body != nullptr)
+        << "region_cross_outer planned body must remain a SeqStmt";
+    int core_index = static_cast<int>(
+        Downcast<IntImm>(outer->annotations.at(kRegionCrossOuterCoreIndex))
+            ->value);
+    int prefix_count = static_cast<int>(
+        Downcast<IntImm>(outer->annotations.at(kRegionCrossOuterPrefixCount))
+            ->value);
+    int suffix_count = static_cast<int>(
+        Downcast<IntImm>(outer->annotations.at(kRegionCrossOuterSuffixCount))
+            ->value);
+    ICHECK_EQ(core_index, prefix_count);
+    ICHECK_EQ(static_cast<int>(region_body->seq.size()),
+              prefix_count + 1 + suffix_count);
+    const auto *inner = region_body->seq[core_index].as<ForNode>();
+    ICHECK(inner != nullptr) << "region_cross_outer Core must remain a For";
+    const auto *pipeline_body = inner->body.as<SeqStmtNode>();
+    ICHECK(pipeline_body != nullptr)
+        << "region_cross_outer Core body must remain a SeqStmt";
+
+    auto get_int_annotation = [&](const char *key) {
+      return Downcast<IntImm>(outer->annotations.at(key))->value;
+    };
+    int iterations = static_cast<int>(get_int_annotation("iterations"));
+    int64_t outer_extent = get_int_annotation(kRegionCrossOuterOuterExtent);
+    int64_t inner_extent = get_int_annotation(kRegionCrossOuterInnerExtent);
+    arith::Analyzer analyzer;
+    auto static_extent = [&](const PrimExpr &extent) {
+      PrimExpr simplified = analyzer.Simplify(extent);
+      const auto *value = simplified.as<IntImmNode>();
+      ICHECK(value != nullptr)
+          << "region_cross_outer extent changed after planning";
+      return value->value;
+    };
+    ICHECK_EQ(outer_extent, static_extent(outer->extent));
+    ICHECK_EQ(inner_extent, static_extent(inner->extent));
+
+    Array<String> prologue_orders =
+        Downcast<Array<String>>(outer->annotations.at("prologue_orders"));
+    Array<String> body_orders =
+        Downcast<Array<String>>(outer->annotations.at("body_orders"));
+    Array<String> epilogue_orders =
+        Downcast<Array<String>>(outer->annotations.at("epilogue_orders"));
+    std::vector<RegionCrossOuterEvent> events;
+    std::vector<int64_t> first;
+    std::vector<int64_t> last;
+    bool boundary_overlap = false;
+    std::string coverage_detail;
+    ICHECK(BuildRegionCrossOuterEvents(
+        outer_extent, inner_extent, iterations,
+        static_cast<int>(pipeline_body->seq.size()), prologue_orders,
+        body_orders, epilogue_orders, &events, &first, &last, &boundary_overlap,
+        &coverage_detail))
+        << "region_cross_outer_schedule_coverage_failed: " << coverage_detail;
+    ICHECK(boundary_overlap)
+        << "region_cross_outer continuous schedule has no boundary overlap";
+
+    Array<Buffer> core_versioned_buffers = Downcast<Array<Buffer>>(
+        outer->annotations.at(kRegionCrossOuterCoreVersionedBuffers));
+    Array<Buffer> region_versioned_buffers = Downcast<Array<Buffer>>(
+        outer->annotations.at(kRegionCrossOuterRegionVersionedBuffers));
+    Map<Buffer, Buffer> bank_peer_buffers;
+    if (auto ann = outer->annotations.Get("bank_peer_buffers")) {
+      bank_peer_buffers = Downcast<Map<Buffer, Buffer>>(ann.value());
+    }
+    Array<Buffer> version_axis_buffers;
+    if (auto ann = outer->annotations.Get("version_axis_buffers")) {
+      version_axis_buffers = Downcast<Array<Buffer>>(ann.value());
+    }
+    Map<Buffer, Map<Integer, PrimExpr>> writer_phases;
+    if (auto ann = outer->annotations.Get("runtime_bank_writer_phases")) {
+      writer_phases =
+          Downcast<Map<Buffer, Map<Integer, PrimExpr>>>(ann.value());
+    }
+    Map<Buffer, Map<Integer, PrimExpr>> reader_phases;
+    if (auto ann = outer->annotations.Get("runtime_bank_reader_phases")) {
+      reader_phases =
+          Downcast<Map<Buffer, Map<Integer, PrimExpr>>>(ann.value());
+    }
+    Map<Buffer, Map<Integer, PrimExpr>> empty_phases;
+    For outer_ref = tvm::ffi::GetRef<For>(outer);
+    PipelineBodyRewriter core_rewriter(core_versioned_buffers,
+                                       bank_peer_buffers, version_axis_buffers,
+                                       writer_phases, reader_phases, outer_ref);
+    PipelineBodyRewriter region_rewriter(
+        region_versioned_buffers, bank_peer_buffers, version_axis_buffers,
+        empty_phases, empty_phases, outer_ref);
+    auto positive_mod = [iterations](int64_t value) {
+      int slot = static_cast<int>(value % iterations);
+      return slot < 0 ? slot + iterations : slot;
+    };
+    auto prepare_region_rewriter = [&](int64_t outer_index) {
+      region_rewriter.set_current_command(-1);
+      region_rewriter.set_current_version(positive_mod(outer_index));
+      region_rewriter.set_var_replacement(outer->loop_var,
+                                          outer->min + Integer(outer_index));
+    };
+    auto rewrite_region_statement = [&](const Stmt &stmt, int64_t outer_index) {
+      prepare_region_rewriter(outer_index);
+      return region_rewriter(stmt);
+    };
+    auto rewrite_core_event = [&](const RegionCrossOuterEvent &event) {
+      int iter = name2iter(event.order);
+      int id = name2id(event.order);
+      core_rewriter.set_current_command(id);
+      core_rewriter.set_current_version(positive_mod(iter));
+      core_rewriter.set_var_replacement(outer->loop_var,
+                                        outer->min + Integer(event.outer));
+      core_rewriter.set_var_replacement(
+          inner->loop_var, inner->min + Integer(event.logical % inner_extent));
+      Stmt stmt = core_rewriter(pipeline_body->seq[id]);
+      prepare_region_rewriter(event.outer);
+      return region_rewriter(stmt);
+    };
+
+    std::vector<int> prefix_coverage(outer_extent, 0);
+    std::vector<int> suffix_coverage(outer_extent, 0);
+    Array<Stmt> result;
+    for (size_t position = 0; position < events.size(); ++position) {
+      const RegionCrossOuterEvent &event = events[position];
+      if (static_cast<int64_t>(position) == first[event.outer]) {
+        for (int index = 0; index < prefix_count; ++index) {
+          result.push_back(
+              rewrite_region_statement(region_body->seq[index], event.outer));
+        }
+        ++prefix_coverage[event.outer];
+      }
+      result.push_back(rewrite_core_event(event));
+      if (static_cast<int64_t>(position) == last[event.outer]) {
+        for (int index = 0; index < suffix_count; ++index) {
+          result.push_back(rewrite_region_statement(
+              region_body->seq[core_index + 1 + index], event.outer));
+        }
+        ++suffix_coverage[event.outer];
+      }
+    }
+    for (int64_t outer_index = 0; outer_index < outer_extent; ++outer_index) {
+      ICHECK_EQ(prefix_coverage[outer_index], 1)
+          << "Prefix coverage failed for outer " << outer_index;
+      ICHECK_EQ(suffix_coverage[outer_index], 1)
+          << "Suffix coverage failed for outer " << outer_index;
+    }
+    ++injected_count_;
+    boundary_overlap_ = true;
+    return SeqStmt::Flatten(result);
+  }
+
+  int injected_count_{0};
+  bool boundary_overlap_{false};
+};
+
 tvm::transform::Pass InjectSunmmioPipeline() {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
@@ -1074,10 +1637,135 @@ tvm::transform::Pass InjectSunmmioPipeline() {
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectSunmmioPipeline", {});
 }
 
+static tvm::transform::Pass
+InjectSunmmioCrossOuterPipeline(String policy = "auto") {
+  using namespace tir::transform;
+  std::string policy_value = policy;
+  ICHECK(policy_value == "auto" || policy_value == "forced")
+      << "cross_outer policy must be 'auto' or 'forced', got " << policy_value;
+  bool forced = policy_value == "forced";
+  auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
+    const PrimFunc &original = f;
+    try {
+      PrimFunc candidate = f;
+      PrimFuncNode *fptr = candidate.CopyOnWrite();
+      fptr->body = SunmmioMultiVersionBufferRewriter::Substitute(candidate);
+      int injected_count = 0;
+      fptr->body =
+          SunmmioCrossOuterPipelineInjector::Inject(candidate, &injected_count);
+      if (injected_count == 0) {
+        return original;
+      }
+      fptr->body = ConvertSSA(std::move(fptr->body));
+      return candidate;
+    } catch (const std::exception &error) {
+      if (forced) {
+        LOG(FATAL) << "[SunmmioPipeline][cross_outer][ForcedReject] "
+                      "reason=candidate_rewrite_failed detail="
+                   << error.what();
+      }
+      return MakeCrossOuterFunctionFallback(
+          original, "candidate_rewrite_failed", error.what());
+    } catch (...) {
+      if (forced) {
+        LOG(FATAL)
+            << "[SunmmioPipeline][cross_outer][ForcedReject] "
+               "reason=candidate_rewrite_failed detail=unknown_exception";
+      }
+      return MakeCrossOuterFunctionFallback(
+          original, "candidate_rewrite_failed", "unknown exception");
+    }
+  };
+  return CreatePrimFuncPass(pass_func, 0, "tl.InjectSunmmioCrossOuterPipeline",
+                            {});
+}
+
+static tvm::transform::Pass
+InjectSunmmioRegionCrossOuterPipeline(String policy = "auto",
+                                      String strategy = "continuous") {
+  using namespace tir::transform;
+  std::string policy_value = policy;
+  std::string strategy_value = strategy;
+  ICHECK(policy_value == "auto" || policy_value == "forced")
+      << "region_cross_outer policy must be 'auto' or 'forced', got "
+      << policy_value;
+  ICHECK(strategy_value == "conservative" || strategy_value == "continuous")
+      << "region_cross_outer strategy must be 'conservative' or "
+         "'continuous', got "
+      << strategy_value;
+  bool forced = policy_value == "forced";
+  auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
+    const PrimFunc &original = f;
+    bool planned = false;
+    PostOrderVisit(f->body, [&](const ObjectRef &obj) {
+      if (const auto *loop = obj.as<ForNode>()) {
+        planned = planned || loop->annotations.count(kRegionCrossOuterMarker);
+      }
+    });
+    if (!planned) {
+      return original;
+    }
+    try {
+      PrimFunc candidate = f;
+      PrimFuncNode *fptr = candidate.CopyOnWrite();
+      fptr->body = SunmmioMultiVersionBufferRewriter::Substitute(candidate);
+      bool boundary_overlap = false;
+      if (strategy_value == "conservative") {
+        fptr->body = SunmmioPipelineInjector::Inject(candidate);
+      } else {
+        int injected_count = 0;
+        fptr->body = SunmmioRegionCrossOuterPipelineInjector::Inject(
+            candidate, &injected_count, &boundary_overlap);
+        ICHECK_GT(injected_count, 0)
+            << "region_cross_outer marker was not injected";
+      }
+      fptr->body = ConvertSSA(std::move(fptr->body));
+      Optional<String> disallowed =
+          PipelineFallbackValidator::FindDisallowed(fptr->body);
+      if (disallowed) {
+        throw std::runtime_error("candidate_fallback: " +
+                                 std::string(disallowed.value()));
+      }
+      candidate = WithAttr(std::move(candidate),
+                           "tl.sunmmio.region_cross_outer.strategy",
+                           String(strategy_value));
+      candidate = WithAttr(std::move(candidate),
+                           "tl.sunmmio.region_cross_outer.coverage_verified",
+                           Bool(true));
+      candidate = WithAttr(std::move(candidate),
+                           "tl.sunmmio.region_cross_outer.boundary_overlap",
+                           Bool(boundary_overlap));
+      return candidate;
+    } catch (const std::exception &error) {
+      if (forced) {
+        LOG(FATAL) << "[SunmmioPipeline][region_cross_outer][ForcedReject] "
+                      "reason=candidate_rewrite_failed detail="
+                   << error.what();
+      }
+      return MakeRegionCrossOuterFunctionFallback(
+          original, "candidate_rewrite_failed", error.what());
+    } catch (...) {
+      if (forced) {
+        LOG(FATAL)
+            << "[SunmmioPipeline][region_cross_outer][ForcedReject] "
+               "reason=candidate_rewrite_failed detail=unknown_exception";
+      }
+      return MakeRegionCrossOuterFunctionFallback(
+          original, "candidate_rewrite_failed", "unknown exception");
+    }
+  };
+  return CreatePrimFuncPass(pass_func, 0,
+                            "tl.InjectSunmmioRegionCrossOuterPipeline", {});
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.transform.InjectSunmmioPipeline",
                         InjectSunmmioPipeline);
+  refl::GlobalDef().def("tl.transform.InjectSunmmioCrossOuterPipeline",
+                        InjectSunmmioCrossOuterPipeline);
+  refl::GlobalDef().def("tl.transform.InjectSunmmioRegionCrossOuterPipeline",
+                        InjectSunmmioRegionCrossOuterPipeline);
 }
 
 } // namespace tl

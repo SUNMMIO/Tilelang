@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <initializer_list>
 #include <optional>
 #include <string>
@@ -45,6 +46,7 @@
 #include "../op/comm.h"
 #include "../op/utils.h"
 #include "../target/sunmmio_utils.h"
+#include "common/attr.h"
 
 namespace tvm {
 namespace tl {
@@ -461,11 +463,18 @@ struct UnitAccess {
   bool write{false};
   AccessProducerKind producer_kind{AccessProducerKind::kAsync};
   SunmmioSyncUnits units{kSunmmioSyncNone};
+  // Some hardware operands address storage through a byte-shifted view that
+  // is not represented by the logical BufferRegion. Keep the base allocation
+  // identity, but conservatively alias every view of that allocation.
+  bool force_storage_alias{false};
 };
 
 bool AccessRegionsMayOverlap(const UnitAccess &lhs, const UnitAccess &rhs) {
   if (!lhs.buffer->data.same_as(rhs.buffer->data)) {
     return false;
+  }
+  if (lhs.force_storage_alias || rhs.force_storage_alias) {
+    return true;
   }
   if (lhs.buffer.same_as(rhs.buffer) ||
       StructuralEqual()(lhs.buffer, rhs.buffer)) {
@@ -491,8 +500,116 @@ bool NeedsUnitSync(const UnitAccess &producer, const UnitAccess &consumer) {
          consumer.write;
 }
 
+// A whole-loop, whole-storage proof. This deliberately does not reason about
+// disjoint symbolic indices: an alias of either DMA endpoint keeps the wait.
+// Unknown statements/calls and pointer escape invalidate the entire proof.
+class PureTileLoopStorageUse : public StmtExprVisitor {
+public:
+  bool valid{true};
+  std::vector<Var> storage;
+
+  void VisitStmt(const Stmt &stmt) final {
+    if (!valid) return;
+    if (!stmt.as<ForNode>() && !stmt.as<SeqStmtNode>() &&
+        !stmt.as<BufferStoreNode>() && !stmt.as<EvaluateNode>()) {
+      valid = false;
+      return;
+    }
+    StmtExprVisitor::VisitStmt(stmt);
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    if ((op->annotations.count(attr::tile_execution_axis) == 0 &&
+         op->annotations.count(attr::tile_interior) == 0) ||
+        (op->kind != ForKind::kSerial && op->kind != ForKind::kVectorized) ||
+        op->thread_binding.defined()) {
+      valid = false;
+      return;
+    }
+    bool old_header = in_header_;
+    in_header_ = true;
+    VisitExpr(op->min);
+    VisitExpr(op->extent);
+    if (op->step.has_value()) VisitExpr(op->step.value());
+    in_header_ = old_header;
+    VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    if (!IsRsramBuffer(op->buffer)) {
+      valid = false;
+      return;
+    }
+    storage.push_back(op->buffer->data);
+    InspectBufferMetadata(op->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+    // The vendored TVM visitor does not traverse BufferStore predicates.
+    if (op->predicate.defined()) VisitExpr(op->predicate.value());
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    if (in_header_ || !IsRsramBuffer(op->buffer)) {
+      valid = false;
+      return;
+    }
+    storage.push_back(op->buffer->data);
+    InspectBufferMetadata(op->buffer);
+    StmtExprVisitor::VisitExpr_(op);
+    // BufferLoad predicates are omitted by the default visitor as well.
+    if (op->predicate.defined()) VisitExpr(op->predicate.value());
+  }
+
+  void VisitExpr_(const ProducerLoadNode *op) final { valid = false; }
+
+  void VisitExpr_(const VarNode *op) final {
+    if (op->dtype.is_handle()) valid = false;
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    static auto effects = Op::GetAttrMap<TCallEffectKind>("TCallEffectKind");
+    auto builtin = op->op.as<Op>();
+    if (!builtin.has_value() || !effects.count(builtin.value()) ||
+        op->dtype.is_handle()) {
+      valid = false;
+      return;
+    }
+    int64_t effect = effects[builtin.value()]->value;
+    if (effect != static_cast<int>(CallEffectKind::kPure) &&
+        effect != static_cast<int>(CallEffectKind::kExprAnnotation)) {
+      valid = false;
+      return;
+    }
+    for (const PrimExpr &arg : op->args) {
+      if (arg.dtype().is_handle()) {
+        valid = false;
+        return;
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+private:
+  void InspectBufferMetadata(const Buffer &buffer) {
+    bool old_header = in_header_;
+    in_header_ = true;
+    VisitExpr(buffer->elem_offset);
+    for (const PrimExpr &extent : buffer->shape) VisitExpr(extent);
+    for (const PrimExpr &stride : buffer->strides) VisitExpr(stride);
+    in_header_ = old_header;
+  }
+
+  bool in_header_{false};
+};
+
 class InjectUnitSyncRewriter : public StmtMutator {
 public:
+  explicit InjectUnitSyncRewriter(bool serialize_odma_reissue = false,
+                                 bool independent_storage = false)
+      : serialize_odma_reissue_(serialize_odma_reissue) {
+    const char *setting = std::getenv("TL_SUNMMIO_SYNC_TILE_ENTRY_OVERLAP");
+    const bool enabled = setting == nullptr || std::string(setting) == "1";
+    carry_independent_odma_ = independent_storage && enabled;
+  }
   Stmt operator()(Stmt body) {
     Stmt rewritten = VisitStmt(body);
     SunmmioSyncUnits pending_links = PendingUnits() & kLinkUnits;
@@ -503,6 +620,8 @@ public:
 private:
   static constexpr SunmmioSyncUnits kTileMemoryUnits =
       kSunmmioSyncVector | kSunmmioSyncRsram;
+  static constexpr SunmmioSyncUnits kOdmaUnits =
+      kSunmmioSyncOdma0 | kSunmmioSyncOdma1;
   static constexpr SunmmioSyncUnits kLinkUnits =
       kSunmmioSyncHlink | kSunmmioSyncVlink;
 
@@ -528,8 +647,10 @@ private:
 
   static UnitAccess MakeRegionAccess(const BufferRegion &region, bool write,
                                      AccessProducerKind kind,
-                                     SunmmioSyncUnits units) {
-    return {region->buffer, region->region, write, kind, units};
+                                     SunmmioSyncUnits units,
+                                     bool force_storage_alias = false) {
+    return {region->buffer, region->region, write, kind, units,
+            force_storage_alias};
   }
 
   static SunmmioSyncUnits OdmaUnits(const CallNode *call) {
@@ -563,16 +684,43 @@ private:
       return true;
     }
     if (call->op.same_as(mma_sunmmio())) {
-      ICHECK_GE(call->args.size(), 3U);
-      CollectRegionArgumentLoads(call, {0, 1, 2}, argument_loads);
-      for (int index : {0, 1, 2}) {
+      ICHECK(call->args.size() == 7U || call->args.size() == 9U);
+      CollectRegionArgumentLoads(call, call->args.size() == 9U
+                                           ? std::initializer_list<size_t>{0, 1, 2, 7}
+                                           : std::initializer_list<size_t>{0, 1, 2},
+                                 argument_loads);
+      for (int index : {0, 1}) {
         accesses->push_back(
             MakeRegionAccess(NormalizeToBufferRegion(call->args[index]), false,
                              AccessProducerKind::kAsync, kSunmmioSyncTc));
       }
+      BufferRegion c_region = NormalizeToBufferRegion(call->args[2]);
+      accesses->push_back(MakeRegionAccess(
+          c_region, false, AccessProducerKind::kAsync, kSunmmioSyncTc));
       accesses->push_back(
-          MakeRegionAccess(NormalizeToBufferRegion(call->args[2]), true,
+          MakeRegionAccess(c_region, true,
                            AccessProducerKind::kAsync, kSunmmioSyncTc));
+      if (call->args.size() == 9U) {
+        accesses->push_back(MakeRegionAccess(
+            NormalizeToBufferRegion(call->args[7]), true,
+            AccessProducerKind::kAsync, kSunmmioSyncTc));
+      }
+      const auto *acc_offset = call->args[6].as<IntImmNode>();
+      ICHECK(acc_offset)
+          << "tl.mma_sunmmio acc_offset_byte must be a constant IntImm";
+      if (acc_offset->value != 0) {
+        // The TensorCore reads and writes an FP32 accumulator through a hidden
+        // byte-shifted view of C. Its exact physical region is unavailable at
+        // this TIR level, so make the shifted accesses alias all views backed
+        // by the same allocation. This lets the pass emit the ODMA/TC syncs
+        // required by the SUVM verifier.
+        accesses->push_back(MakeRegionAccess(
+            c_region, false, AccessProducerKind::kAsync, kSunmmioSyncTc,
+            /*force_storage_alias=*/true));
+        accesses->push_back(MakeRegionAccess(
+            c_region, true, AccessProducerKind::kAsync, kSunmmioSyncTc,
+            /*force_storage_alias=*/true));
+      }
       return true;
     }
     if (call->op.same_as(broadcast_())) {
@@ -666,7 +814,17 @@ private:
     SunmmioSyncUnits required = kSunmmioSyncNone;
     for (const UnitAccess &consumer : accesses) {
       for (const UnitAccess &producer : pending_) {
-        if (!AccessRegionsMayOverlap(producer, consumer) ||
+        bool conservative_odma_alias =
+            serialize_odma_reissue_ &&
+            producer.producer_kind == AccessProducerKind::kAsync &&
+            consumer.producer_kind == AccessProducerKind::kAsync &&
+            (producer.units & kOdmaUnits) != kSunmmioSyncNone &&
+            (consumer.units & kOdmaUnits) != kSunmmioSyncNone &&
+            producer.buffer->data.same_as(consumer.buffer->data) &&
+            (IsRsramBuffer(producer.buffer) || IsRsramBuffer(consumer.buffer)) &&
+            (producer.write || consumer.write);
+        if ((!AccessRegionsMayOverlap(producer, consumer) &&
+             !conservative_odma_alias) ||
             !NeedsUnitSync(producer, consumer)) {
           continue;
         }
@@ -692,6 +850,19 @@ private:
   SunmmioSyncUnits ProcessAccesses(const std::vector<UnitAccess> &accesses,
                                    bool completed_inline = false) {
     SunmmioSyncUnits required = RequiredSync(accesses);
+    // SUVM permits only one in-flight multicast per physical link.  This is
+    // a resource dependency even when consecutive multicasts touch disjoint
+    // buffers, so drain the matching link before issuing it again.
+    SunmmioSyncUnits pending_units = PendingUnits();
+    SunmmioSyncUnits serialized_units = kLinkUnits;
+    if (serialize_odma_reissue_) {
+      serialized_units |= kOdmaUnits;
+    }
+    for (const UnitAccess &access : accesses) {
+      if (access.producer_kind == AccessProducerKind::kAsync) {
+        required |= pending_units & access.units & serialized_units;
+      }
+    }
     CompleteUnits(required);
     if (!completed_inline) {
       RecordAccesses(accesses);
@@ -718,6 +889,35 @@ private:
       units |= access.units;
     }
     return units;
+  }
+
+  std::vector<UnitAccess> ExtractIndependentOdma(const ForNode *op) {
+    if (!carry_independent_odma_ || pending_.empty()) return {};
+    PureTileLoopStorageUse use;
+    use(ffi::GetRef<For>(op));
+    if (!use.valid) return {};
+
+    SunmmioSyncUnits independent = PendingUnits() & kOdmaUnits;
+    for (const UnitAccess &access : pending_) {
+      for (const Var &storage : use.storage) {
+        if (access.buffer->data.same_as(storage)) {
+          independent &= ~access.units;
+          break;
+        }
+      }
+    }
+    std::vector<UnitAccess> carried;
+    pending_.erase(
+        std::remove_if(pending_.begin(), pending_.end(),
+                       [&](const UnitAccess &access) {
+          bool can_carry = access.producer_kind == AccessProducerKind::kAsync &&
+                           access.units != kSunmmioSyncNone &&
+                           (access.units & independent) == access.units;
+          if (can_carry) carried.push_back(access);
+          return can_carry;
+        }),
+        pending_.end());
+    return carried;
   }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
@@ -880,9 +1080,16 @@ private:
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
-    // Conservatively drain at entry and at each backedge. Straight-line code
-    // remains dependency-driven; loop overlap can be recovered later with a
-    // dedicated unit-aware loop-carried analysis.
+    // Temporarily exclude only units proved independent of the COMPLETE loop
+    // nest. The proof forbids async submissions/control inside, so neither a
+    // hidden consumer nor a same-unit reissue can be missed while visiting it.
+    std::vector<UnitAccess> carried_odma = ExtractIndependentOdma(op);
+    // Conservatively drain at entry. Ordinary loops also drain at each
+    // backedge. Lowered T.Tiles loops are different: their BufferLoad/
+    // BufferStore operations are submissions to the same ordered vector
+    // engine, so draining vector/RSRAM after every tiny tile only serializes
+    // the queue. Carry those tile accesses across the annotated execution
+    // loops and let the first dependent async consumer insert one sync.
     SunmmioSyncUnits prefix = DrainPending();
     pending_.clear();
     std::vector<UnitAccess> header_loads;
@@ -894,11 +1101,25 @@ private:
     RecordAccesses(header_loads);
     SunmmioSyncUnits header_units = PendingUnits();
     Stmt body = VisitStmt(op->body);
-    body = AppendSync(std::move(body), DrainPending());
-    pending_.clear();
+    bool is_tile_managed_loop =
+        op->annotations.count(attr::tile_execution_axis) != 0 ||
+        op->annotations.count(attr::tile_interior) != 0;
+    SunmmioSyncUnits body_units = PendingUnits();
+    bool carries_only_tile_accesses =
+        (body_units & ~kTileMemoryUnits) == kSunmmioSyncNone;
+    bool carry_tile_accesses = is_tile_managed_loop &&
+                               header_loads.empty() &&
+                               carries_only_tile_accesses;
+    if (!carry_tile_accesses) {
+      body = AppendSync(std::move(body), DrainPending());
+      pending_.clear();
+    }
     Stmt loop = For(op->loop_var, op->min, op->extent, op->kind, body,
                     op->thread_binding, op->annotations, op->step, op->span);
-    loop = AppendSync(std::move(loop), header_units);
+    if (!carry_tile_accesses) {
+      loop = AppendSync(std::move(loop), header_units);
+    }
+    RecordAccesses(carried_odma);
     return PrependSync(std::move(loop), prefix);
   }
 
@@ -917,14 +1138,17 @@ private:
     return PrependSync(std::move(loop), prefix);
   }
 
+  bool serialize_odma_reissue_{false};
+  bool carry_independent_odma_{false};
   std::vector<UnitAccess> pending_;
 };
 
 class InjectBroadcastBarriersRewriter : public StmtMutator {
 public:
   InjectBroadcastBarriersRewriter(const Target &target,
-                                  arith::Analyzer *analyzer)
-      : analyzer_(analyzer) {
+                                  arith::Analyzer *analyzer,
+                                  bool insert_post_barrier = true)
+      : analyzer_(analyzer), insert_post_barrier_(insert_post_barrier) {
     SunmmioMeshConfig mesh = GetSunmmioMeshConfig(target);
     mesh_nrow_ = mesh.nrow;
     mesh_ncol_ = mesh.ncol;
@@ -1074,8 +1298,10 @@ private:
     stmts.push_back(Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
                                   MakeBarrierArgs(participant_mask))));
     stmts.push_back(StmtMutator::VisitStmt_(op));
-    stmts.push_back(Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
-                                  MakeBarrierArgs(participant_mask))));
+    if (insert_post_barrier_) {
+      stmts.push_back(Evaluate(Call(DataType::Handle(), barrier_arrive_and_wait(),
+                                    MakeBarrierArgs(participant_mask))));
+    }
     return SeqStmt::Flatten(stmts);
   }
 
@@ -1095,6 +1321,7 @@ private:
   int mesh_nrow_{0};
   int mesh_ncol_{0};
   arith::Analyzer *analyzer_;
+  bool insert_post_barrier_{true};
   PrimExpr current_kernel_core_id_;
 };
 
@@ -1224,12 +1451,50 @@ private:
   std::vector<Var> scoped_vars_;
 };
 
-PrimFunc RewriteSunmmioSync(PrimFunc func, arith::Analyzer *analyzer) {
+PrimFunc RewriteSunmmioSync(PrimFunc func, arith::Analyzer *analyzer,
+                            bool ilp_mode) {
   Target target = func->GetAttr<Target>(tvm::attr::kTarget).value();
-  InjectBroadcastBarriersRewriter inject_barriers(target, analyzer);
-  func.CopyOnWrite()->body = inject_barriers(func->body);
-  InjectUnitSyncRewriter inject_unit_sync;
-  func.CopyOnWrite()->body = inject_unit_sync(func->body);
+  // Logical pipeline versions are not a proof that the lowered physical
+  // RSRAM views are disjoint. The same guard is required by 1D and multidim
+  // ILP; selecting an optimization mode must not select hardware safety.
+  bool physical_odma_guard =
+      ilp_mode || func->HasNonzeroAttr("tl.sunmmio.multidim.applied");
+  bool dependency_driven_collectives = func->HasNonzeroAttr(
+      "tl.sunmmio.hierarchical_ilp.coverage_verified") &&
+      (func->HasNonzeroAttr("tl.sunmmio.multidim.workitem_flatten.applied") ||
+       func->HasNonzeroAttr("tl.sunmmio.multidim.a_residency.applied") ||
+       func->HasNonzeroAttr("tl.sunmmio.boundary_overlap.applied"));
+  // Parameter noalias does not prove internal pointer bindings independent.
+  // Fail closed for handle-valued lets and match_buffer aliases anywhere in
+  // the function, including aliases defined outside a candidate tile loop.
+  bool independent_storage = func->HasNonzeroAttr("tir.noalias");
+  auto nonrestrict = func->GetAttr<Array<Var>>("tl.non_restrict_params");
+  independent_storage &= !nonrestrict.has_value() || nonrestrict.value().empty();
+  PostOrderVisit(func->body, [&](const ObjectRef &node) {
+    if (const auto *let = node.as<LetStmtNode>()) {
+      if (let->var.dtype().is_handle() || let->value.dtype().is_handle())
+        independent_storage = false;
+    } else if (const auto *let = node.as<LetNode>()) {
+      if (let->var.dtype().is_handle() || let->value.dtype().is_handle())
+        independent_storage = false;
+    } else if (const auto *block = node.as<BlockNode>()) {
+      if (!block->match_buffers.empty()) independent_storage = false;
+    }
+  });
+  if (dependency_driven_collectives) {
+    // Place producer waits before the collective-entry barrier, then keep
+    // link completion pending until its statically proven dependency.
+    InjectUnitSyncRewriter inject_unit_sync(physical_odma_guard, independent_storage);
+    func.CopyOnWrite()->body = inject_unit_sync(func->body);
+    InjectBroadcastBarriersRewriter inject_barriers(
+        target, analyzer, /*insert_post_barrier=*/false);
+    func.CopyOnWrite()->body = inject_barriers(func->body);
+  } else {
+    InjectBroadcastBarriersRewriter inject_barriers(target, analyzer);
+    func.CopyOnWrite()->body = inject_barriers(func->body);
+    InjectUnitSyncRewriter inject_unit_sync(physical_odma_guard, independent_storage);
+    func.CopyOnWrite()->body = inject_unit_sync(func->body);
+  }
   InitReusableBarriersRewriter init_barriers;
   func.CopyOnWrite()->body = init_barriers(func->body);
   return func;
@@ -1239,12 +1504,16 @@ PrimFunc RewriteSunmmioSync(PrimFunc func, arith::Analyzer *analyzer) {
 
 tvm::transform::Pass InjectSunmmioSync() {
   auto pass_func = [](PrimFunc func, const IRModule &,
-                      const PassContext &) -> PrimFunc {
+                      const PassContext &ctx) -> PrimFunc {
     if (!func->HasNonzeroAttr(tir::attr::kIsGlobalFunc)) {
       return func;
     }
     arith::Analyzer analyzer;
-    return RewriteSunmmioSync(std::move(func), &analyzer);
+    auto mode = ctx->GetConfig<String>(kSunmmioPipelineMode);
+    bool ilp_mode = mode.has_value() &&
+                    (std::string(mode.value()) == "ilp" ||
+                     std::string(mode.value()) == "multidim_ilp");
+    return RewriteSunmmioSync(std::move(func), &analyzer, ilp_mode);
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.InjectSunmmioSync", {});
 }

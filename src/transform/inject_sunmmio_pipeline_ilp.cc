@@ -5,6 +5,7 @@
 #include "../op/parallel.h"
 #include "../op/region.h"
 #include "../op/utils.h"
+#include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "../tileview/tileview.h"
 #include "common/ast_traverser.h"
@@ -31,12 +32,41 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <algorithm>
 #include <exception>
+#include <limits>
+#include <tuple>
+#include <vector>
 
 namespace tvm {
 namespace tl {
 
 using namespace tir;
+
+namespace {
+
+constexpr const char *kMultidimInnerCoordinate =
+    "tl.sunmmio.multidim.inner_coordinate";
+
+} // namespace
+
+// The inner-coordinate marker is analysis-only.  After ILP injection the sync
+// pass must see the enclosed waits and submissions as ordinary statements.
+class MultidimPlannerMarkerCleanupRewriter : public StmtMutator {
+public:
+  static Stmt Strip(Stmt body) {
+    return MultidimPlannerMarkerCleanupRewriter()(std::move(body));
+  }
+
+private:
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    Stmt body = VisitStmt(op->body);
+    if (op->attr_key == kMultidimInnerCoordinate) {
+      return body;
+    }
+    return AttrStmt(op->node, op->attr_key, op->value, body, op->span);
+  }
+};
 
 struct LetWrapper {
   Var var;
@@ -454,6 +484,23 @@ private:
           }
         }
         loop.CopyOnWrite()->annotations.Set("used_buffers", new_used_buffers);
+        auto remap_buffer_array_annotation = [&](const char *name) {
+          auto annotation = op->annotations.Get(name);
+          if (!annotation) {
+            return;
+          }
+          Array<Buffer> buffers = Downcast<Array<Buffer>>(annotation.value());
+          Array<Buffer> remapped;
+          for (const Buffer &buffer : buffers) {
+            auto it = buffer_remap_.find(buffer);
+            remapped.push_back(it == buffer_remap_.end() ? buffer
+                                                         : (*it).second);
+          }
+          loop.CopyOnWrite()->annotations.Set(name, remapped);
+        };
+        remap_buffer_array_annotation(kRegionCrossOuterCoreVersionedBuffers);
+        remap_buffer_array_annotation(
+            kRegionCrossOuterRegionVersionedBuffers);
       }
     }
     return loop;
@@ -699,7 +746,13 @@ public:
 
   void set_current_stmt_id(int stmt_id) { current_stmt_id_ = stmt_id; }
 
-  void set_loop_var_replacement(PrimExpr p) { replaced_loop_var_ = p; }
+  void set_loop_var_replacement(PrimExpr p) {
+    replaced_loop_var_ = p;
+    loop_var_replacements_.Set(pipeline_loop_->loop_var, std::move(p));
+  }
+  void set_var_replacement(const Var &var, PrimExpr replacement) {
+    loop_var_replacements_.Set(var, std::move(replacement));
+  }
   void set_logical_iter_parity_override(int parity) {
     logical_iter_parity_override_ = parity;
   }
@@ -715,6 +768,12 @@ public:
   void clear_parity_overrides() {
     clear_logical_iter_parity_override();
     clear_pipeline_loop_parity_override();
+  }
+  void set_version_expr_override(const Buffer &buffer, PrimExpr version) {
+    buffer_version_expr_overrides_[buffer.get()] = std::move(version);
+  }
+  void clear_version_expr_overrides() {
+    buffer_version_expr_overrides_.clear();
   }
 
   void clear_current_stmt_id() { current_stmt_id_ = -1; }
@@ -732,6 +791,10 @@ private:
                                 int access_iter_offset = 0) const {
     if (!version_axis_buffers_.count(buffer.get())) {
       return Integer(0);
+    }
+    auto override_it = buffer_version_expr_overrides_.find(buffer.get());
+    if (override_it != buffer_version_expr_overrides_.end()) {
+      return override_it->second;
     }
     PrimExpr logical_iter = LogicalIterExpr() + access_iter_offset;
     if (banked_buffers_.count(buffer.get())) {
@@ -1007,8 +1070,8 @@ private:
 
   PrimExpr VisitExpr_(const VarNode *op) final {
     Var var = Downcast<Var>(StmtExprMutator::VisitExpr_(op));
-    if (var.same_as(pipeline_loop_->loop_var)) {
-      return replaced_loop_var_;
+    if (auto replacement = loop_var_replacements_.Get(var)) {
+      return replacement.value();
     }
     return var;
   }
@@ -1024,26 +1087,109 @@ private:
       buffer_writer_phase_;
   std::unordered_map<const BufferNode *, std::unordered_map<int, int>>
       buffer_reader_phase_;
+  std::unordered_map<const BufferNode *, PrimExpr>
+      buffer_version_expr_overrides_;
   Map<Var, Buffer> buffer_data_to_buffer_;
   For pipeline_loop_;
   int iterations_ = 1;
   PrimExpr replaced_loop_var_;
+  Map<Var, PrimExpr> loop_var_replacements_;
   int logical_iter_parity_override_ = -1;
   int pipeline_loop_parity_override_ = -1;
   int current_stmt_id_ = -1;
   int logical_stmt_cursor_ = 0;
 };
 
+struct HierarchicalILPEvent {
+  int id{0};
+  int priority{0};
+  int64_t time{0};
+  int64_t logical{0};
+  int64_t outer{0};
+};
+
+static bool BuildHierarchicalILPEvents(
+    int64_t outer_extent, int64_t inner_extent, int command_count, int64_t ii,
+    const Array<Integer> &command_start_times,
+    const Array<Integer> &command_emit_priorities,
+    std::vector<HierarchicalILPEvent> *events, std::vector<int64_t> *first,
+    std::vector<int64_t> *last, bool *boundary_overlap, std::string *detail) {
+  if (outer_extent <= 1 || inner_extent <= 0 || command_count <= 0 || ii <= 0 ||
+      command_start_times.size() != static_cast<size_t>(command_count) ||
+      command_emit_priorities.size() != static_cast<size_t>(command_count)) {
+    *detail = "invalid hierarchical event dimensions";
+    return false;
+  }
+  if (inner_extent > std::numeric_limits<int64_t>::max() / ii ||
+      outer_extent >
+          std::numeric_limits<int64_t>::max() / (inner_extent * ii)) {
+    *detail = "hierarchical event time overflow";
+    return false;
+  }
+  constexpr uint64_t kMaxHierarchicalEvents = 16384;
+  uint64_t expected = static_cast<uint64_t>(outer_extent) *
+                      static_cast<uint64_t>(inner_extent) *
+                      static_cast<uint64_t>(command_count);
+  if (expected > kMaxHierarchicalEvents) {
+    *detail = "event_stream_too_large";
+    return false;
+  }
+  int64_t outer_stride = inner_extent * ii;
+  events->reserve(expected);
+  for (int64_t outer = 0; outer < outer_extent; ++outer) {
+    for (int64_t inner = 0; inner < inner_extent; ++inner) {
+      int64_t logical = outer * inner_extent + inner;
+      for (int id = 0; id < command_count; ++id) {
+        events->push_back(HierarchicalILPEvent{
+            id, static_cast<int>(command_emit_priorities[id]->value),
+            outer * outer_stride + inner * ii + command_start_times[id]->value,
+            logical, outer});
+      }
+    }
+  }
+  std::sort(
+      events->begin(), events->end(),
+      [](const HierarchicalILPEvent &lhs, const HierarchicalILPEvent &rhs) {
+        return std::tie(lhs.time, lhs.priority, lhs.id, lhs.logical) <
+               std::tie(rhs.time, rhs.priority, rhs.id, rhs.logical);
+      });
+  first->assign(outer_extent, -1);
+  last->assign(outer_extent, -1);
+  for (size_t position = 0; position < events->size(); ++position) {
+    int64_t outer = (*events)[position].outer;
+    if ((*first)[outer] < 0) {
+      (*first)[outer] = static_cast<int64_t>(position);
+    }
+    (*last)[outer] = static_cast<int64_t>(position);
+  }
+  *boundary_overlap = false;
+  for (int64_t outer = 0; outer < outer_extent; ++outer) {
+    if ((*first)[outer] < 0 || (*last)[outer] < (*first)[outer]) {
+      *detail = "outer iteration has no complete Core interval";
+      return false;
+    }
+    if (outer + 1 < outer_extent && (*first)[outer + 1] < (*last)[outer]) {
+      *boundary_overlap = true;
+    }
+  }
+  return *boundary_overlap;
+}
+
 class SunmmioILPPipelineInjector : public StmtExprMutator {
 public:
-  static Stmt Inject(const PrimFunc &func) {
+  static Stmt Inject(const PrimFunc &func,
+                     int *hierarchical_injected_count = nullptr) {
     auto global_symbol = func->GetAttr<String>(tvm::attr::kGlobalSymbol);
     SunmmioILPPipelineInjector injector(global_symbol, func);
     for (const auto &kv : func->buffer_map) {
       const Buffer &buffer = kv.second;
       injector.buffer_data_to_buffer_.Set(buffer->data, buffer);
     }
-    return injector(func->body);
+    Stmt result = injector(func->body);
+    if (hierarchical_injected_count != nullptr) {
+      *hierarchical_injected_count = injector.hierarchical_injected_count_;
+    }
+    return result;
   }
 
 private:
@@ -1054,8 +1200,13 @@ private:
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
-    // Step 1: Recursively rewrite the children first.
-    For for_node = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+    if (op->annotations.count(kRegionCrossOuterMarker)) {
+      String strategy =
+          Downcast<String>(op->annotations.at(kRegionCrossOuterStrategy));
+      if (strategy == "hierarchical_ilp") {
+        return InjectHierarchicalOuter(op);
+      }
+    }
 
     auto iterations_anno = op->annotations.Get("iterations");
     auto ii_anno = op->annotations.Get("ii");
@@ -1084,8 +1235,28 @@ private:
 
     if (!iterations_anno || !used_buffers_anno || !versioned_buffers_anno ||
         !prologue_orders_anno || !body_orders_anno || !epilogue_orders_anno) {
-      return for_node;
+      return StmtExprMutator::VisitStmt_(op);
     }
+
+    // A nested parent was planned with each child pipeline represented as one
+    // atomic command. Preserve that shape while expanding the parent. After
+    // the parent loop disappears, recursively inject every copied child loop.
+    // Visiting children first would replace the atomic child statement with
+    // its expanded body and invalidate the parent's command IDs.
+    bool defer_child_injection = false;
+    auto nested_depth_anno =
+        op->annotations.Get("tl.sunmmio.pipeline.nested_depth");
+    if (nested_depth_anno) {
+      const auto *nested_depth = nested_depth_anno.value().as<IntImmNode>();
+      defer_child_injection =
+          nested_depth != nullptr && nested_depth->value > 1;
+    }
+    For for_node = defer_child_injection
+                       ? ffi::GetRef<For>(op)
+                       : Downcast<For>(StmtExprMutator::VisitStmt_(op));
+    auto inject_deferred_children = [&](Stmt stmt) -> Stmt {
+      return defer_child_injection ? StmtExprMutator::VisitStmt(stmt) : stmt;
+    };
 
     arith::Analyzer extent_analyzer;
     PrimExpr simplified_extent = extent_analyzer.Simplify(for_node->extent);
@@ -1125,7 +1296,8 @@ private:
       pipeline_body_root = for_node->body;
     }
 
-    const SeqStmtNode *pipeline_body_seq = nullptr;
+    Array<Stmt> pipeline_body_statements;
+    bool pipeline_body_found = false;
     std::vector<std::function<Stmt(Stmt)>> rewrap_fns;
     std::vector<LetWrapper> loop_var_let_wrappers;
     auto append_attr_wrapper = [&rewrap_fns](const AttrStmtNode *attr) {
@@ -1143,7 +1315,8 @@ private:
       Stmt current = pipeline_body_root;
       while (true) {
         if (const auto *seq_stmt = current.as<SeqStmtNode>()) {
-          pipeline_body_seq = seq_stmt;
+          pipeline_body_statements = seq_stmt->seq;
+          pipeline_body_found = true;
           break;
         }
         if (const auto *if_then_else = current.as<IfThenElseNode>()) {
@@ -1187,11 +1360,18 @@ private:
           current = attr->body;
           continue;
         }
+        if (current.as<BlockRealizeNode>() || current.as<EvaluateNode>() ||
+            current.as<ForNode>()) {
+          pipeline_body_statements = Array<Stmt>{current};
+          pipeline_body_found = true;
+          break;
+        }
         LOG(FATAL) << "ValueError: The body of the software pipeline should be "
-                   << "SeqStmt, got " << current->GetTypeKey();
+                   << "a supported statement list, got "
+                   << current->GetTypeKey();
       }
     }
-    ICHECK(pipeline_body_seq != nullptr);
+    ICHECK(pipeline_body_found);
 
     // Step 3: Rewrite the body of loop.
     int iterations = Downcast<IntImm>(iterations_anno.value())->value;
@@ -1215,7 +1395,8 @@ private:
     }
     if (static_extent != nullptr &&
         static_extent->value <= max_logical_iter_offset) {
-      return make_sequential_fallback("short_extent_unsupported");
+      return inject_deferred_children(
+          make_sequential_fallback("short_extent_unsupported"));
     }
     Array<Buffer> versioned_buffers =
         Downcast<Array<Buffer>>(versioned_buffers_anno.value());
@@ -1339,7 +1520,7 @@ private:
         int iter_offset = name2iter(order_str);
         int id = name2id(order_str);
         PrimExpr replaced_loop_var = base + iter_offset + for_node->min;
-        Stmt stmt = pipeline_body_seq->seq[id];
+        Stmt stmt = pipeline_body_statements[id];
         int logical_iter_parity = (base_parity + iter_offset) % 2;
         if (logical_iter_parity < 0) {
           logical_iter_parity += 2;
@@ -1364,7 +1545,7 @@ private:
         int id = name2id(order_str);
         PrimExpr replaced_loop_var = iter + for_node->min;
         variant.push_back(
-            rewrite_stmt(pipeline_body_seq->seq[id], id, replaced_loop_var));
+            rewrite_stmt(pipeline_body_statements[id], id, replaced_loop_var));
       }
 
       if (!requires_parity_specialization) {
@@ -1374,8 +1555,8 @@ private:
           int id = name2id(order_str);
           PrimExpr replaced_loop_var =
               for_node->loop_var + iter_offset + for_node->min;
-          steady_body.push_back(
-              rewrite_stmt(pipeline_body_seq->seq[id], id, replaced_loop_var));
+          steady_body.push_back(rewrite_stmt(pipeline_body_statements[id], id,
+                                             replaced_loop_var));
         }
         variant.push_back(For(for_node->loop_var, PrimExpr(0), steady_count,
                               ForKind::kSerial, SeqStmt::Flatten(steady_body),
@@ -1387,8 +1568,8 @@ private:
           int id = name2id(order_str);
           PrimExpr replaced_loop_var =
               epilogue_base + iter_offset + for_node->min;
-          variant.push_back(
-              rewrite_stmt(pipeline_body_seq->seq[id], id, replaced_loop_var));
+          variant.push_back(rewrite_stmt(pipeline_body_statements[id], id,
+                                         replaced_loop_var));
         }
         return SeqStmt::Flatten(variant);
       }
@@ -1427,7 +1608,7 @@ private:
           logical_iter_parity += 2;
         }
         variant.push_back(rewrite_stmt_with_logical_iter_parity(
-            pipeline_body_seq->seq[id], id, replaced_loop_var,
+            pipeline_body_statements[id], id, replaced_loop_var,
             logical_iter_parity));
       }
       return SeqStmt::Flatten(variant);
@@ -1437,14 +1618,16 @@ private:
       int steady_count_value =
           static_extent->value - steady_state_max_iter_offset;
       ICHECK_GT(steady_count_value, 0);
-      return build_pipeline_variant((steady_count_value % 2) != 0);
+      return inject_deferred_children(
+          build_pipeline_variant((steady_count_value % 2) != 0));
     }
 
     if (!requires_parity_specialization) {
       Stmt injected = build_pipeline_variant(false);
       Stmt sequential = make_sequential_fallback("runtime_short_extent", false);
-      return IfThenElse(GT(for_node->extent, Integer(max_logical_iter_offset)),
-                        injected, sequential);
+      return inject_deferred_children(
+          IfThenElse(GT(for_node->extent, Integer(max_logical_iter_offset)),
+                     injected, sequential));
     }
 
     // Specialize the complete pipeline, including its producers, by the
@@ -1457,13 +1640,284 @@ private:
     Stmt injected =
         IfThenElse(has_even_steady_count, even_variant, odd_variant);
     Stmt sequential = make_sequential_fallback("runtime_short_extent", false);
-    return IfThenElse(GT(for_node->extent, Integer(max_logical_iter_offset)),
-                      injected, sequential);
+    return inject_deferred_children(
+        IfThenElse(GT(for_node->extent, Integer(max_logical_iter_offset)),
+                   injected, sequential));
+  }
+
+  Stmt InjectHierarchicalOuter(const ForNode *outer) {
+    ++hierarchical_injected_count_;
+    const auto *region_body = outer->body.as<SeqStmtNode>();
+    ICHECK(region_body != nullptr)
+        << "hierarchical_ilp outer body must remain a SeqStmt";
+    auto get_int_annotation = [&](const char *key) {
+      return Downcast<IntImm>(outer->annotations.at(key))->value;
+    };
+    int core_index =
+        static_cast<int>(get_int_annotation(kRegionCrossOuterCoreIndex));
+    int prefix_count =
+        static_cast<int>(get_int_annotation(kRegionCrossOuterPrefixCount));
+    int suffix_count =
+        static_cast<int>(get_int_annotation(kRegionCrossOuterSuffixCount));
+    ICHECK_EQ(core_index, prefix_count);
+    ICHECK_EQ(static_cast<int>(region_body->seq.size()),
+              prefix_count + 1 + suffix_count);
+    const auto *inner = region_body->seq[core_index].as<ForNode>();
+    ICHECK(inner != nullptr) << "hierarchical_ilp Core must remain a For";
+    const auto *pipeline_body = inner->body.as<SeqStmtNode>();
+    ICHECK(pipeline_body != nullptr)
+        << "hierarchical_ilp Core body must remain a SeqStmt";
+
+    int iterations = static_cast<int>(get_int_annotation("iterations"));
+    int64_t ii = get_int_annotation("ii");
+    int64_t outer_extent = get_int_annotation(kRegionCrossOuterOuterExtent);
+    int64_t inner_extent = get_int_annotation(kRegionCrossOuterInnerExtent);
+    Array<Integer> command_start_times = Downcast<Array<Integer>>(
+        outer->annotations.at("tl.sunmmio.pipeline.command_start_times"));
+    Array<Integer> command_emit_priorities = Downcast<Array<Integer>>(
+        outer->annotations.at("tl.sunmmio.pipeline.command_emit_priorities"));
+    std::vector<HierarchicalILPEvent> events;
+    std::vector<int64_t> first;
+    std::vector<int64_t> last;
+    bool boundary_overlap = false;
+    std::string detail;
+    ICHECK(BuildHierarchicalILPEvents(
+        outer_extent, inner_extent, static_cast<int>(pipeline_body->seq.size()),
+        ii, command_start_times, command_emit_priorities, &events, &first,
+        &last, &boundary_overlap, &detail))
+        << "hierarchical_ilp_schedule_coverage_failed: " << detail;
+
+    // A region suffix is ready after the last Core event of its outer
+    // iteration.  When the next outer iteration begins with collectives,
+    // delay the suffix until those collectives have been issued.  The planner
+    // has already proved Suffix(o)->Core(o+1) hazards safe (or versioned the
+    // local buffer), so this changes command emission order without changing
+    // collective epoch order.
+    std::unordered_set<int> collective_command_ids;
+    if (auto ann = outer->annotations.Get(
+            "tl.sunmmio.region_cross_outer.collective_command_ids")) {
+      for (const Integer &command_id :
+           Downcast<Array<Integer>>(ann.value())) {
+        collective_command_ids.insert(command_id->value);
+      }
+    }
+    std::vector<int64_t> suffix_emit_after = last;
+    if (!collective_command_ids.empty()) {
+      for (int64_t outer_index = 0; outer_index + 1 < outer_extent;
+           ++outer_index) {
+        int64_t next_first_logical = (outer_index + 1) * inner_extent;
+        std::unordered_set<int> covered_collectives;
+        for (size_t position = 0; position < events.size(); ++position) {
+          const HierarchicalILPEvent &event = events[position];
+          if (event.logical != next_first_logical ||
+              !collective_command_ids.count(event.id)) {
+            continue;
+          }
+          covered_collectives.insert(event.id);
+          suffix_emit_after[outer_index] = std::max(
+              suffix_emit_after[outer_index], static_cast<int64_t>(position));
+        }
+        ICHECK_EQ(covered_collectives.size(), collective_command_ids.size())
+            << "hierarchical_ilp_collective_suffix_deferral_coverage_failed";
+      }
+    }
+
+    // A layout-conversion suffix can overlap the TensorCore work of the next
+    // logical tile. Complete the previous TC generation immediately before
+    // issuing the next tile's first TC command, but defer the previous tile's
+    // layout transform and spill until the second TC command when the inner
+    // loop has at least two iterations. This lets the next tile submit more of
+    // its latency-critical input/TC stream before synchronous vector helper
+    // code occupies the scalar issue thread. The explicit generation boundary
+    // stays before the first TC command so dependency-driven sync insertion
+    // does not wait for any newly issued TC command. Restrict this to the
+    // recognizable transform+DMA suffix so unrelated region suffixes keep
+    // their schedule.
+    auto contains_op = [](const Stmt &stmt, const Op &target) {
+      bool found = false;
+      PostOrderVisit(stmt, [&](const ObjectRef &node) {
+        const auto *call = node.as<CallNode>();
+        if (call != nullptr && call->op.same_as(target)) {
+          found = true;
+        }
+      });
+      return found;
+    };
+    bool pipeline_layout_suffix =
+        suffix_count >= 2 &&
+        contains_op(region_body->seq[core_index + 1],
+                    sunmmio_layout_transform()) &&
+        contains_op(region_body->seq[core_index + 2], dma_copy());
+    std::unordered_set<size_t> pre_tc_sync_positions;
+    if (pipeline_layout_suffix && outer_extent > 1) {
+      int tc_command = -1;
+      for (int command_id = 0;
+           command_id < static_cast<int>(pipeline_body->seq.size());
+           ++command_id) {
+        if (contains_op(pipeline_body->seq[command_id], mma_sunmmio())) {
+          tc_command = command_id;
+          break;
+        }
+      }
+      ICHECK_GE(tc_command, 0)
+          << "hierarchical_layout_suffix_requires_tensor_command";
+      for (int64_t outer_index = 0; outer_index + 1 < outer_extent;
+           ++outer_index) {
+        int64_t next_first_logical = (outer_index + 1) * inner_extent;
+        int64_t suffix_overlap_logical =
+            next_first_logical + (inner_extent > 1 ? 1 : 0);
+        bool found_generation_boundary = false;
+        bool found_suffix_overlap_tc = false;
+        for (size_t position = 0; position < events.size(); ++position) {
+          const HierarchicalILPEvent &event = events[position];
+          if (event.id != tc_command) {
+            continue;
+          }
+          if (!found_generation_boundary &&
+              event.logical == next_first_logical) {
+            pre_tc_sync_positions.insert(position);
+            found_generation_boundary = true;
+          }
+          if (!found_suffix_overlap_tc &&
+              event.logical == suffix_overlap_logical) {
+            suffix_emit_after[outer_index] = std::max(
+                suffix_emit_after[outer_index],
+                static_cast<int64_t>(position));
+            found_suffix_overlap_tc = true;
+          }
+          if (found_generation_boundary && found_suffix_overlap_tc) {
+            break;
+          }
+        }
+        ICHECK(found_generation_boundary && found_suffix_overlap_tc)
+            << "hierarchical_layout_suffix_next_first_tc_coverage_failed";
+      }
+    }
+
+    auto runtime_buffers_anno =
+        outer->annotations.Get("runtime_multiversion_buffers");
+    auto versioned_buffers_anno = outer->annotations.Get("versioned_buffers");
+    auto banked_buffers_anno = outer->annotations.Get("runtime_banked_buffers");
+    Array<Buffer> banked_buffers;
+    if (banked_buffers_anno) {
+      banked_buffers = Downcast<Array<Buffer>>(banked_buffers_anno.value());
+    }
+    Array<Buffer> runtime_buffers = DeriveRuntimeMultiversionBuffers(
+        runtime_buffers_anno, versioned_buffers_anno, banked_buffers,
+        iterations);
+    Array<Buffer> region_versioned_buffers;
+    if (auto ann = outer->annotations.Get(
+            kRegionCrossOuterRegionVersionedBuffers)) {
+      region_versioned_buffers = Downcast<Array<Buffer>>(ann.value());
+    }
+    Array<Buffer> rewritten_buffers = runtime_buffers;
+    for (const Buffer &buffer : banked_buffers) {
+      AppendUniqueBuffer(&rewritten_buffers, buffer);
+    }
+    Map<Buffer, PrimExpr> bank_start_phases;
+    Map<Buffer, PrimExpr> bank_read_delta_parities;
+    Map<Buffer, Map<Integer, PrimExpr>> bank_writer_phases;
+    Map<Buffer, Map<Integer, PrimExpr>> bank_reader_phases;
+    Map<Buffer, PrimExpr> bank_flip_modes;
+    Map<Buffer, Buffer> bank_peer_buffers;
+    if (auto ann = outer->annotations.Get("runtime_bank_start_phases")) {
+      bank_start_phases = Downcast<Map<Buffer, PrimExpr>>(ann.value());
+    }
+    if (auto ann = outer->annotations.Get("runtime_bank_read_delta_parities")) {
+      bank_read_delta_parities = Downcast<Map<Buffer, PrimExpr>>(ann.value());
+    }
+    if (auto ann = outer->annotations.Get("runtime_bank_writer_phases")) {
+      bank_writer_phases =
+          Downcast<Map<Buffer, Map<Integer, PrimExpr>>>(ann.value());
+    }
+    if (auto ann = outer->annotations.Get("runtime_bank_reader_phases")) {
+      bank_reader_phases =
+          Downcast<Map<Buffer, Map<Integer, PrimExpr>>>(ann.value());
+    }
+    if (auto ann = outer->annotations.Get("runtime_bank_flip_modes")) {
+      bank_flip_modes = Downcast<Map<Buffer, PrimExpr>>(ann.value());
+    }
+    if (auto ann = outer->annotations.Get("runtime_bank_peer_buffers")) {
+      bank_peer_buffers = Downcast<Map<Buffer, Buffer>>(ann.value());
+    }
+    For inner_ref = tvm::ffi::GetRef<For>(inner);
+    SunmmioILPPipelineBodyRewriter rewriter(
+        rewritten_buffers, runtime_buffers, banked_buffers, bank_peer_buffers,
+        bank_start_phases, bank_read_delta_parities, bank_writer_phases,
+        bank_reader_phases, bank_flip_modes, inner_ref, iterations);
+
+    auto rewrite_region = [&](const Stmt &stmt, int64_t outer_index) {
+      rewriter.clear_version_expr_overrides();
+      rewriter.clear_current_stmt_id();
+      rewriter.set_loop_var_replacement(inner->min + Integer(outer_index));
+      rewriter.set_var_replacement(outer->loop_var,
+                                   outer->min + Integer(outer_index));
+      rewriter.clear_parity_overrides();
+      return rewriter(stmt);
+    };
+    auto rewrite_core = [&](const HierarchicalILPEvent &event) {
+      rewriter.set_current_stmt_id(event.id);
+      // Version slots continue across outer boundaries, while the source
+      // expression still observes the original inner-loop index.
+      rewriter.set_loop_var_replacement(inner->min + Integer(event.logical));
+      rewriter.set_var_replacement(
+          inner->loop_var, inner->min + Integer(event.logical % inner_extent));
+      rewriter.set_var_replacement(outer->loop_var,
+                                   outer->min + Integer(event.outer));
+      rewriter.clear_version_expr_overrides();
+      for (const Buffer &buffer : region_versioned_buffers) {
+        rewriter.set_version_expr_override(
+            buffer, Integer(event.outer % iterations));
+      }
+      rewriter.clear_parity_overrides();
+      Stmt stmt = rewriter(pipeline_body->seq[event.id]);
+      rewriter.clear_current_stmt_id();
+      rewriter.clear_version_expr_overrides();
+      return stmt;
+    };
+
+    std::vector<int> prefix_coverage(outer_extent, 0);
+    std::vector<int> suffix_coverage(outer_extent, 0);
+    Array<Stmt> result;
+    for (size_t position = 0; position < events.size(); ++position) {
+      const HierarchicalILPEvent &event = events[position];
+      if (static_cast<int64_t>(position) == first[event.outer]) {
+        for (int index = 0; index < prefix_count; ++index) {
+          result.push_back(
+              rewrite_region(region_body->seq[index], event.outer));
+        }
+        ++prefix_coverage[event.outer];
+      }
+      if (pre_tc_sync_positions.count(position)) {
+        result.push_back(Evaluate(Call(
+            DataType::Handle(), sunmmio_sync(),
+            {IntImm(DataType::Int(32),
+                    static_cast<int64_t>(kSunmmioSyncTc))})));
+      }
+      result.push_back(rewrite_core(event));
+      for (int64_t outer_index = 0; outer_index < outer_extent;
+           ++outer_index) {
+        if (static_cast<int64_t>(position) ==
+            suffix_emit_after[outer_index]) {
+          for (int index = 0; index < suffix_count; ++index) {
+            result.push_back(rewrite_region(
+                region_body->seq[core_index + 1 + index], outer_index));
+          }
+          ++suffix_coverage[outer_index];
+        }
+      }
+    }
+    for (int64_t outer_index = 0; outer_index < outer_extent; ++outer_index) {
+      ICHECK_EQ(prefix_coverage[outer_index], 1);
+      ICHECK_EQ(suffix_coverage[outer_index], 1);
+    }
+    return SeqStmt::Flatten(result);
   }
 
   Map<Var, Buffer> buffer_data_to_buffer_;
   Optional<String> global_symbol_;
   ASTTraverser traverser_;
+  int hierarchical_injected_count_{0};
 };
 
 class ResidentPingPongInitializer : public StmtMutator {
@@ -1541,35 +1995,100 @@ private:
   Map<Buffer, Buffer> peer_remap_;
 };
 
+tvm::transform::Pass PrepareSunmmioMultidimInterchangeBuffers() {
+  using namespace tir::transform;
+  // ApplySunmmioMultidimInterchange now creates independent accumulators.
+  // Keep this pass as a compatibility no-op for existing Python pipelines.
+  auto pass_func = [=](PrimFunc f, const IRModule &, PassContext) { return f; };
+  return CreatePrimFuncPass(pass_func, 0,
+                            "tl.PrepareSunmmioMultidimInterchangeBuffers", {});
+}
+
 tvm::transform::Pass InjectSunmmioPipelineILP() {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, const IRModule &m, PassContext ctx) {
     const PrimFunc &original = f;
+    std::string pipeline_mode = "ilp";
+    PostOrderVisit(f->body, [&](const ObjectRef &obj) {
+      if (const auto *loop = obj.as<ForNode>()) {
+        if (loop->annotations.find("tl.sunmmio.multidim.region") !=
+            loop->annotations.end()) {
+          pipeline_mode = "multidim_ilp";
+        }
+      }
+    });
     try {
       PrimFunc candidate = f;
       auto *fptr = candidate.CopyOnWrite();
       fptr->body = SunmmioILPMultiVersionBufferRewriter::Substitute(candidate);
       fptr->body = ResidentPingPongInitializer::Substitute(fptr->body);
-      fptr->body = SunmmioILPPipelineInjector::Inject(candidate);
+      int hierarchical_injected_count = 0;
+      fptr->body = SunmmioILPPipelineInjector::Inject(
+          candidate, &hierarchical_injected_count);
       fptr->body = ConvertSSA(std::move(fptr->body));
+      fptr->body = MultidimPlannerMarkerCleanupRewriter::Strip(
+          std::move(fptr->body));
       Optional<String> disallowed =
           PipelineFallbackValidator::FindDisallowed(fptr->body);
       if (disallowed) {
         return MakePipelineFunctionFallback(
-            original, PipelineDiagnostic{false, "ilp", "inject_validation",
+            original, PipelineDiagnostic{false, pipeline_mode, "inject_validation",
                                          "candidate_fallback",
                                          std::string(disallowed.value())});
+      }
+      if (hierarchical_injected_count > 0) {
+        candidate = WithAttr(std::move(candidate),
+                             "tl.sunmmio.hierarchical_ilp.coverage_verified",
+                             Bool(true));
+        candidate = WithAttr(std::move(candidate),
+                             "tl.sunmmio.hierarchical_ilp.boundary_overlap",
+                             Bool(true));
+        Array<String> device_attr_keys;
+        if (auto existing = candidate->GetAttr<Array<String>>(
+                attr::kDeviceFuncAttrKeys)) {
+          device_attr_keys = existing.value();
+        }
+        auto append_unique = [&](const String &key) {
+          if (std::find(device_attr_keys.begin(), device_attr_keys.end(), key) ==
+              device_attr_keys.end()) {
+            device_attr_keys.push_back(key);
+          }
+        };
+        append_unique("tl.sunmmio.hierarchical_ilp.coverage_verified");
+        append_unique("tl.sunmmio.hierarchical_ilp.boundary_overlap");
+        if (candidate->HasNonzeroAttr("tl.sunmmio.boundary_overlap.planned")) {
+          candidate = WithAttr(std::move(candidate),
+                               "tl.sunmmio.boundary_overlap.applied", Bool(true));
+          append_unique("tl.sunmmio.boundary_overlap.applied");
+        }
+        candidate = WithAttr(std::move(candidate), attr::kDeviceFuncAttrKeys,
+                             device_attr_keys);
+      }
+      if (pipeline_mode == "multidim_ilp") {
+        const String multidim_key = "tl.sunmmio.multidim.applied";
+        candidate = WithAttr(std::move(candidate), multidim_key, Bool(true));
+        Array<String> device_attr_keys;
+        if (auto existing = candidate->GetAttr<Array<String>>(
+                attr::kDeviceFuncAttrKeys)) {
+          device_attr_keys = existing.value();
+        }
+        if (std::find(device_attr_keys.begin(), device_attr_keys.end(),
+                      multidim_key) == device_attr_keys.end()) {
+          device_attr_keys.push_back(multidim_key);
+        }
+        candidate = WithAttr(std::move(candidate), attr::kDeviceFuncAttrKeys,
+                             device_attr_keys);
       }
       return candidate;
     } catch (const std::exception &error) {
       return MakePipelineFunctionFallback(
           original,
-          PipelineDiagnostic{false, "ilp", "inject_exception",
+          PipelineDiagnostic{false, pipeline_mode, "inject_exception",
                              "candidate_rewrite_failed", error.what()});
     } catch (...) {
       return MakePipelineFunctionFallback(
           original,
-          PipelineDiagnostic{false, "ilp", "inject_exception",
+          PipelineDiagnostic{false, pipeline_mode, "inject_exception",
                              "candidate_rewrite_failed", "unknown exception"});
     }
   };
@@ -1578,8 +2097,10 @@ tvm::transform::Pass InjectSunmmioPipelineILP() {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.InjectSunmmioPipelineILP",
-                        InjectSunmmioPipelineILP);
+  refl::GlobalDef()
+      .def("tl.transform.PrepareSunmmioMultidimInterchangeBuffers",
+           PrepareSunmmioMultidimInterchangeBuffers)
+      .def("tl.transform.InjectSunmmioPipelineILP", InjectSunmmioPipelineILP);
 }
 
 } // namespace tl

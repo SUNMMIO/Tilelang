@@ -7,7 +7,7 @@
 
 #include "../../op/utils.h"
 #include "../../target/sunmmio/hardware_types.h"
-#include "../../target/sunmmio_utils.h"
+#include "../../target/sunmmio/sunmmio_async_op_info.h"
 
 #include <algorithm>
 #include <tvm/runtime/logging.h>
@@ -69,25 +69,18 @@ BuildIlpResources(const Stmt &stmt, DeviceType type,
 
   if (const auto *eval = stmt.as<EvaluateNode>()) {
     if (const auto *call = eval->value.as<CallNode>()) {
-      if (call->op.same_as(Op::Get("tl.dma_copy")) ||
-          call->op.same_as(Op::Get("tl.broadcast_")) ||
-          call->op.same_as(Op::Get("tl.sunmmio_layout_transform")) ||
-          call->op.same_as(Op::Get("tl.sunmmio_transpose"))) {
-        BufferRegion src_region = NormalizeToBufferRegion(call->args[0]);
-        // broadcast_ argument layout is:
-        //   args[0] = src region
-        //   args[1] = dst region
-        //   args[2] = direction
-        // Resource typing only needs the source/destination buffers, so always
-        // read the destination from args[1]. Using args[2] treats the integer
-        // direction enum as a BufferRegion and crashes ILP planning.
-        BufferRegion dst_region = NormalizeToBufferRegion(call->args[1]);
-        std::optional<SunmmioOdmaUnit> unit = GetSunmmioOdmaUnit(call);
-        ICHECK(unit.has_value())
-            << "Sunmmio pipeline planning requires resolved ODMA units";
-        add_resource(static_cast<int>(*unit == SunmmioOdmaUnit::kOdma0
-                                          ? IlpResourceType::kODMA0
-                                          : IlpResourceType::kODMA1));
+      SunmmioAsyncOpInfo async_info;
+      if (TryParseSunmmioAsyncODMAOp(call, &async_info)) {
+        if (async_info.odma_channel_hint == 1) {
+          add_resource(static_cast<int>(IlpResourceType::kODMA1));
+        } else {
+          // RSRAM destinations intentionally remain conservatively mapped to
+          // ODMA0 until the ILP grows an "either channel" resource.
+          add_resource(static_cast<int>(IlpResourceType::kODMA0));
+        }
+
+        const BufferRegion &src_region = async_info.src;
+        const BufferRegion &dst_region = async_info.dst;
         if (dst_region->buffer.scope() == "shared.wsram") {
           add_resource(static_cast<int>(IlpResourceType::kWsramIn));
         }

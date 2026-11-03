@@ -50,6 +50,9 @@ constexpr const char *tile_tile_size = "tile.tile_size";
 //   uses domain axis 0 (j).
 constexpr const char *tile_execution_domain_axes = "tile.execution_domain_axes";
 constexpr const char *tile_execution_axis = "tile.execution_axis";
+// Preserves a loop's logical tile.domain axis when an operator reorders its
+// loop nest, for example to make a reduction loop innermost.
+constexpr const char *tile_domain_axis = "tile.domain_axis";
 
 // ---- these attrs are added by the tiles_loop pass ----
 // Marks the outermost tile.execution loop — codegen entry point for a tile

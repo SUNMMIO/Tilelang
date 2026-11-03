@@ -6,6 +6,7 @@
 #include <utility>
 
 #include <tvm/ffi/container/map.h>
+#include <tvm/ffi/optional.h>
 #include <tvm/ffi/string.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tir/expr.h>
@@ -16,6 +17,10 @@ namespace tvm {
 namespace tl {
 
 using namespace tir;
+using ffi::Any;
+using ffi::Map;
+using ffi::Optional;
+using ffi::String;
 
 constexpr const char *kPipelineRequested = "tl.sunmmio.pipeline.requested";
 constexpr const char *kPipelineApplied = "tl.sunmmio.pipeline.applied";
@@ -26,6 +31,47 @@ constexpr const char *kPipelineFallbackReason =
     "tl.sunmmio.pipeline.fallback_reason";
 constexpr const char *kPipelineFallbackDetail =
     "tl.sunmmio.pipeline.fallback_detail";
+constexpr const char *kCrossOuterMarker = "tl.sunmmio.cross_outer.planned";
+constexpr const char *kCrossOuterSteady = "tl.sunmmio.cross_outer.steady";
+constexpr const char *kCrossOuterOuterExtent =
+    "tl.sunmmio.cross_outer.outer_extent";
+constexpr const char *kCrossOuterInnerExtent =
+    "tl.sunmmio.cross_outer.inner_extent";
+constexpr const char *kCrossOuterRequested = "tl.sunmmio.cross_outer.requested";
+constexpr const char *kCrossOuterFallbackStage =
+    "tl.sunmmio.cross_outer.fallback_stage";
+constexpr const char *kCrossOuterFallbackReason =
+    "tl.sunmmio.cross_outer.fallback_reason";
+constexpr const char *kCrossOuterFallbackDetail =
+    "tl.sunmmio.cross_outer.fallback_detail";
+constexpr const char *kRegionCrossOuterMarker =
+    "tl.sunmmio.region_cross_outer.planned";
+constexpr const char *kRegionCrossOuterStrategy =
+    "tl.sunmmio.region_cross_outer.strategy";
+constexpr const char *kRegionCrossOuterOuterExtent =
+    "tl.sunmmio.region_cross_outer.outer_extent";
+constexpr const char *kRegionCrossOuterInnerExtent =
+    "tl.sunmmio.region_cross_outer.inner_extent";
+constexpr const char *kRegionCrossOuterCoreIndex =
+    "tl.sunmmio.region_cross_outer.core_index";
+constexpr const char *kRegionCrossOuterPrefixCount =
+    "tl.sunmmio.region_cross_outer.prefix_count";
+constexpr const char *kRegionCrossOuterSuffixCount =
+    "tl.sunmmio.region_cross_outer.suffix_count";
+constexpr const char *kRegionCrossOuterCoreVersionedBuffers =
+    "tl.sunmmio.region_cross_outer.core_versioned_buffers";
+constexpr const char *kRegionCrossOuterRegionVersionedBuffers =
+    "tl.sunmmio.region_cross_outer.region_versioned_buffers";
+constexpr const char *kRegionCrossOuterBoundaryOverlap =
+    "tl.sunmmio.region_cross_outer.boundary_overlap";
+constexpr const char *kRegionCrossOuterRequested =
+    "tl.sunmmio.region_cross_outer.requested";
+constexpr const char *kRegionCrossOuterFallbackStage =
+    "tl.sunmmio.region_cross_outer.fallback_stage";
+constexpr const char *kRegionCrossOuterFallbackReason =
+    "tl.sunmmio.region_cross_outer.fallback_reason";
+constexpr const char *kRegionCrossOuterFallbackDetail =
+    "tl.sunmmio.region_cross_outer.fallback_detail";
 
 struct PipelineDiagnostic {
   bool applied{false};
@@ -77,6 +123,37 @@ inline For MakePipelineFallback(const For &loop, const std::string &mode,
       loop, PipelineDiagnostic{false, mode, stage, reason, ""}, emit_warning);
 }
 
+inline void SetCrossOuterFallbackAnnotations(Map<String, Any> *annotations,
+                                             const std::string &stage,
+                                             const std::string &reason,
+                                             const std::string &detail = "") {
+  annotations->Set(kCrossOuterRequested, Bool(true));
+  annotations->Set(kCrossOuterFallbackStage, String(stage));
+  annotations->Set(kCrossOuterFallbackReason, String(reason));
+  if (detail.empty()) {
+    annotations->erase(kCrossOuterFallbackDetail);
+  } else {
+    annotations->Set(kCrossOuterFallbackDetail, String(detail));
+  }
+  LOG(WARNING) << "[SunmmioPipeline][cross_outer][Fallback] stage=" << stage
+               << " reason=" << reason << " detail=" << detail;
+}
+
+inline void SetRegionCrossOuterFallbackAnnotations(
+    Map<String, Any> *annotations, const std::string &stage,
+    const std::string &reason, const std::string &detail = "") {
+  annotations->Set(kRegionCrossOuterRequested, Bool(true));
+  annotations->Set(kRegionCrossOuterFallbackStage, String(stage));
+  annotations->Set(kRegionCrossOuterFallbackReason, String(reason));
+  if (detail.empty()) {
+    annotations->erase(kRegionCrossOuterFallbackDetail);
+  } else {
+    annotations->Set(kRegionCrossOuterFallbackDetail, String(detail));
+  }
+  LOG(WARNING) << "[SunmmioPipeline][region_cross_outer][Fallback] stage="
+               << stage << " reason=" << reason << " detail=" << detail;
+}
+
 inline bool IsPipelineScheduleAnnotation(const String &key) {
   static const std::unordered_set<std::string> keys = {
       "num_stages",
@@ -85,6 +162,8 @@ inline bool IsPipelineScheduleAnnotation(const String &key) {
       "makespan",
       "stage_count",
       "steady_state_max_iter_offset",
+      "coloring_total_candidates",
+      "coloring_evaluated_candidates",
       "prologue_orders",
       "body_orders",
       "epilogue_orders",
@@ -102,6 +181,19 @@ inline bool IsPipelineScheduleAnnotation(const String &key) {
       "runtime_bank_writer_phases",
       "runtime_bank_reader_phases",
       "runtime_bank_flip_modes",
+      kCrossOuterMarker,
+      kCrossOuterOuterExtent,
+      kCrossOuterInnerExtent,
+      kRegionCrossOuterMarker,
+      kRegionCrossOuterStrategy,
+      kRegionCrossOuterOuterExtent,
+      kRegionCrossOuterInnerExtent,
+      kRegionCrossOuterCoreIndex,
+      kRegionCrossOuterPrefixCount,
+      kRegionCrossOuterSuffixCount,
+      kRegionCrossOuterCoreVersionedBuffers,
+      kRegionCrossOuterRegionVersionedBuffers,
+      kRegionCrossOuterBoundaryOverlap,
   };
   return keys.count(std::string(key)) != 0;
 }

@@ -6,6 +6,7 @@
 #include "../op/utils.h"
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
+#include "../target/sunmmio/sunmmio_async_op_info.h"
 #include "common/ast_traverser.h"
 #include "common/sunmmio_pipeline_utils.h"
 #include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
@@ -32,7 +33,9 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -64,6 +67,8 @@ struct AccessInfo {
   BufferRegion region;
   bool is_write{false};
   int iter_offset{0};
+  int first_offset{-1};
+  int last_offset{-1};
 
   const Buffer &buffer() const { return region->buffer; }
 };
@@ -71,6 +76,7 @@ struct AccessInfo {
 struct CommandSpec {
   int latency{0};
   std::vector<int> resources;
+  std::map<int, std::vector<std::pair<int, int>>> resource_windows;
   std::string name;
 };
 
@@ -102,6 +108,15 @@ struct FlowSpec {
   int read_resource{-1};
 };
 
+struct DependencySpec {
+  int src{-1};
+  int dst{-1};
+  int delta{0};
+  int lag{0};
+  std::string hazard;
+  std::string buffer_name;
+};
+
 using SameWriteFlowKey = std::tuple<int, int>;
 
 SameWriteFlowKey MakeSameWriteFlowKey(const FlowSpec &flow) {
@@ -120,8 +135,21 @@ struct Problem {
   std::vector<int> R;
   std::unordered_map<int, int> cap;
   std::vector<CommandSpec> P;
+  std::vector<CostEstimate> cost_estimates;
+  std::string cost_model_profile{"heuristic"};
+  bool preserve_absolute_cycles{false};
+  int solver_scale_factor{1};
+  bool solver_scaled{false};
+  bool latency_gcd_enabled{false};
+  int latency_gcd{1};
+  bool auto_faster_selected{false};
+  bool multidim{false};
+  std::vector<int> command_inner_coordinates;
+  bool planner_fallback{false};
+  bool fallback_used{false};
   std::vector<std::pair<int, int>> dep_edges;
   std::unordered_map<long long, int> delta;
+  std::vector<DependencySpec> dependencies;
   std::vector<FlowSpec> flows;
   std::vector<std::string> versioned_buffer_names;
 };
@@ -134,13 +162,15 @@ struct ModelVars {
   std::vector<HighsInt> col_start_parity;
   std::vector<HighsInt> col_m;
   std::vector<std::vector<HighsInt>> col_x;
-  std::vector<std::vector<HighsInt>> col_a;
+  std::map<std::pair<int, int>, std::vector<HighsInt>> col_resource_a;
   std::vector<int> internal_flow_ids;
   std::vector<HighsInt> col_z;
 };
 
 struct SolveResult {
   bool ok{false};
+  bool objective_optimized{false};
+  bool fast_verified_schedule{false};
   int II{0};
   int makespan{0};
   int bank_slot_period{0};
@@ -161,6 +191,11 @@ struct SolutionVerifyResult {
   bool resource_slot_ok{true};
   bool bank_slot_ok{true};
   bool bank_port_ok{true};
+  bool multidim_identity_ok{true};
+  bool raw_cycle_ok{true};
+  int64_t raw_lift_unit{1};
+  int64_t raw_ii{0};
+  int64_t raw_makespan{0};
   std::vector<std::string> errors;
   std::map<int, std::map<int, int>> resource_slot_load;
   std::array<std::array<std::map<int, int>, 2>, 2> bank_slot_load;
@@ -234,13 +269,89 @@ int GcdInt(int a, int b) {
   return a;
 }
 
+std::vector<std::pair<int, int>>
+NormalizeResourceWindows(std::vector<std::pair<int, int>> windows) {
+  std::sort(windows.begin(), windows.end());
+  std::vector<std::pair<int, int>> merged;
+  for (const auto &window : windows) {
+    ICHECK_GE(window.first, 0);
+    ICHECK_GT(window.second, window.first);
+    if (merged.empty() || window.first > merged.back().second) {
+      merged.push_back(window);
+    } else {
+      merged.back().second = std::max(merged.back().second, window.second);
+    }
+  }
+  return merged;
+}
+
+void ScaleResourceWindows(CommandSpec *spec, int64_t scale) {
+  ICHECK_GT(scale, 0);
+  if (spec->resource_windows.empty()) {
+    return;
+  }
+  std::map<int, std::vector<std::pair<int, int>>> scaled;
+  for (const auto &resource_entry : spec->resource_windows) {
+    std::vector<std::pair<int, int>> windows;
+    for (const auto &window : resource_entry.second) {
+      int64_t scaled_start = static_cast<int64_t>(window.first) / scale;
+      int64_t scaled_end =
+          (static_cast<int64_t>(window.second) + scale - 1) / scale;
+      scaled_end = std::min<int64_t>(scaled_end, spec->latency);
+      ICHECK_LT(scaled_start, scaled_end);
+      ICHECK_LE(scaled_end, spec->latency);
+      windows.push_back(
+          {static_cast<int>(scaled_start), static_cast<int>(scaled_end)});
+    }
+    scaled[resource_entry.first] = NormalizeResourceWindows(std::move(windows));
+  }
+  spec->resource_windows = std::move(scaled);
+}
+
+void ScaleAccessFrontiers(std::vector<AccessInfo> *accesses, int64_t scale,
+                          int scaled_latency) {
+  ICHECK_GT(scale, 0);
+  for (AccessInfo &access : *accesses) {
+    ICHECK_GE(access.first_offset, 0);
+    ICHECK_GE(access.last_offset, access.first_offset);
+    int64_t first = access.first_offset;
+    int64_t last = access.last_offset;
+    if (!access.is_write) {
+      first /= scale;
+    } else {
+      first = (first + scale - 1) / scale;
+    }
+    last = (last + scale - 1) / scale;
+    first = std::min<int64_t>(first, scaled_latency);
+    last = std::min<int64_t>(last, scaled_latency);
+    ICHECK_LE(first, last);
+    access.first_offset = static_cast<int>(first);
+    access.last_offset = static_cast<int>(last);
+  }
+}
+
+int ResourceUsageDuration(const CommandSpec &spec, int resource) {
+  auto it = spec.resource_windows.find(resource);
+  if (it == spec.resource_windows.end()) {
+    return std::max(1, spec.latency);
+  }
+  int duration = 0;
+  for (const auto &window : it->second) {
+    ICHECK_GE(window.first, 0);
+    ICHECK_GT(window.second, window.first);
+    ICHECK_LE(window.second, spec.latency);
+    duration += window.second - window.first;
+  }
+  return duration;
+}
+
 std::map<int, std::vector<std::pair<int, int>>>
 BuildResourceUsage(const std::vector<CommandSpec> &specs) {
   std::map<int, std::vector<std::pair<int, int>>> usage;
   for (int idx = 0; idx < static_cast<int>(specs.size()); ++idx) {
-    int latency = std::max(1, specs[idx].latency);
     for (int resource : specs[idx].resources) {
-      usage[resource].push_back({idx, latency});
+      usage[resource].push_back(
+          {idx, ResourceUsageDuration(specs[idx], resource)});
     }
   }
   return usage;
@@ -309,8 +420,11 @@ int ScaledTotalForResource(const std::vector<CommandSpec> &specs, int resource,
                   resource) == specs[idx].resources.end()) {
       continue;
     }
-    int latency = specs[idx].latency + (bump_indices.count(idx) ? 1 : 0);
-    total += CeilDiv(std::max(1, latency), faster);
+    int duration = ResourceUsageDuration(specs[idx], resource);
+    if (specs[idx].resource_windows.empty() && bump_indices.count(idx)) {
+      duration += 1;
+    }
+    total += CeilDiv(std::max(1, duration), faster);
   }
   return total;
 }
@@ -498,6 +612,78 @@ void WriteJsonString(std::ostream &os, const std::string &value) {
   os << "\"" << JsonEscape(value) << "\"";
 }
 
+void WriteCostEstimateJson(std::ostream &out, const CostEstimate &estimate) {
+  out << "{";
+  out << "\"profile\": ";
+  WriteJsonString(out, std::string(estimate.profile));
+  out << ", \"model_version\": ";
+  WriteJsonString(out, std::string(estimate.model_version));
+  out << ", \"latency_source\": ";
+  WriteJsonString(out, std::string(estimate.latency_source));
+  out << ", \"fallback_reason\": ";
+  WriteJsonString(out, std::string(estimate.fallback_reason));
+  out << ", \"op_kind\": ";
+  WriteJsonString(out, std::string(estimate.op_kind));
+  out << ", \"transfer_path\": ";
+  WriteJsonString(out, std::string(estimate.transfer_path));
+  out << ", \"src_scope\": ";
+  WriteJsonString(out, std::string(estimate.src_scope));
+  out << ", \"dst_scope\": ";
+  WriteJsonString(out, std::string(estimate.dst_scope));
+  out << ", \"input_dtype\": ";
+  WriteJsonString(out, std::string(estimate.input_dtype));
+  out << ", \"output_dtype\": ";
+  WriteJsonString(out, std::string(estimate.output_dtype));
+  out << ", \"latency_cycles\": " << estimate.latency_cycles;
+  out << ", \"issue_start_cycles\": " << estimate.issue_start_cycles;
+  out << ", \"issue_finish_cycles\": " << estimate.issue_finish_cycles;
+  out << ", \"bytes\": " << estimate.bytes;
+  out << ", \"packet_count\": " << estimate.packet_count;
+  out << ", \"path_start_delay\": " << estimate.path_start_delay;
+  out << ", \"row_size\": " << estimate.row_size;
+  out << ", \"col_size\": " << estimate.col_size;
+  out << ", \"reduction_size\": " << estimate.reduction_size;
+  out << ", \"vector_chunks\": " << estimate.vector_chunks;
+  out << ", \"load_ops\": " << estimate.load_ops;
+  out << ", \"store_ops\": " << estimate.store_ops;
+  out << ", \"arithmetic_ops\": " << estimate.arithmetic_ops;
+  out << ", \"compare_convert_ops\": " << estimate.compare_convert_ops;
+  out << ", \"nonlinear_ops\": " << estimate.nonlinear_ops;
+  out << ", \"reduce_ops\": " << estimate.reduce_ops;
+  out << ", \"galu_ops\": " << estimate.galu_ops;
+  out << ", \"exact_static_submodel\": " << estimate.exact_static_submodel;
+  out << ", \"used_fallback\": " << estimate.used_fallback;
+  out << ", \"solver_scale_factor\": " << estimate.solver_scale_factor;
+  out << ", \"solver_latency_cycles\": " << estimate.solver_latency_cycles;
+  out << ", \"solver_scaled\": " << estimate.solver_scaled;
+  out << ", \"endpoint_timing_modeled\": " << estimate.endpoint_timing_modeled;
+  out << ", \"resource_overlap_modeled\": "
+      << estimate.resource_overlap_modeled;
+  out << "}";
+}
+
+void WriteResourceWindowsJson(std::ostream &out, const CommandSpec &spec) {
+  out << "{";
+  bool first_resource = true;
+  for (const auto &resource_entry : spec.resource_windows) {
+    if (!first_resource) {
+      out << ", ";
+    }
+    first_resource = false;
+    WriteJsonString(out, std::to_string(resource_entry.first));
+    out << ": [";
+    for (size_t i = 0; i < resource_entry.second.size(); ++i) {
+      if (i != 0) {
+        out << ", ";
+      }
+      out << "[" << resource_entry.second[i].first << ", "
+          << resource_entry.second[i].second << "]";
+    }
+    out << "]";
+  }
+  out << "}";
+}
+
 void WriteProblemJson(const Problem &prob, const std::string &path) {
   std::ofstream out(path);
   ICHECK(out.is_open()) << "Failed to open ILP problem json path: " << path;
@@ -505,6 +691,19 @@ void WriteProblemJson(const Problem &prob, const std::string &path) {
   out << "{\n";
   out << "  \"N\": " << prob.N << ",\n";
   out << "  \"Tmax\": " << prob.Tmax << ",\n";
+  out << "  \"cost_model\": {";
+  out << "\"profile\": ";
+  WriteJsonString(out, prob.cost_model_profile);
+  out << ", \"preserve_absolute_cycles\": " << prob.preserve_absolute_cycles;
+  out << ", \"solver_scale_factor\": " << prob.solver_scale_factor;
+  out << ", \"solver_scaled\": " << prob.solver_scaled;
+  out << ", \"latency_gcd_enabled\": " << prob.latency_gcd_enabled;
+  out << ", \"latency_gcd\": " << prob.latency_gcd;
+  out << ", \"auto_faster_selected\": " << prob.auto_faster_selected;
+  out << ", \"multidim\": " << prob.multidim;
+  out << ", \"planner_fallback\": " << prob.planner_fallback;
+  out << ", \"fallback_used\": " << prob.fallback_used;
+  out << "},\n";
 
   out << "  \"R\": [";
   for (size_t i = 0; i < prob.R.size(); ++i) {
@@ -539,8 +738,21 @@ void WriteProblemJson(const Problem &prob, const std::string &path) {
       }
       out << prob.P[i].resources[j];
     }
-    out << "], \"name\": ";
+    out << "], \"resource_windows\": ";
+    WriteResourceWindowsJson(out, prob.P[i]);
+    out << ", \"name\": ";
     WriteJsonString(out, prob.P[i].name);
+    out << ", \"coordinate\": [0, ";
+    out << (i < static_cast<int>(prob.command_inner_coordinates.size())
+                ? prob.command_inner_coordinates[i]
+                : -1);
+    out << "]";
+    out << ", \"cost_estimate\": ";
+    if (i < static_cast<int>(prob.cost_estimates.size())) {
+      WriteCostEstimateJson(out, prob.cost_estimates[i]);
+    } else {
+      out << "null";
+    }
     out << "}";
     out << (i + 1 == prob.N ? "\n" : ",\n");
   }
@@ -557,7 +769,9 @@ void WriteProblemJson(const Problem &prob, const std::string &path) {
       }
       out << prob.P[i].resources[j];
     }
-    out << "]}";
+    out << "], \"resource_windows\": ";
+    WriteResourceWindowsJson(out, prob.P[i]);
+    out << "}";
     out << (i + 1 == prob.N ? "\n" : ",\n");
   }
   out << "  },\n";
@@ -591,6 +805,46 @@ void WriteProblemJson(const Problem &prob, const std::string &path) {
     out << ": " << kv.second;
   }
   out << "},\n";
+  out << "  \"multidim_delta\": {";
+  bool first_multidim_delta = true;
+  for (const auto &kv : sorted_delta) {
+    if (!first_multidim_delta) {
+      out << ", ";
+    }
+    first_multidim_delta = false;
+    WriteJsonString(out, std::to_string(kv.first.first) + "," +
+                             std::to_string(kv.first.second));
+    int inner_delta = 0;
+    if (kv.first.first <
+            static_cast<int>(prob.command_inner_coordinates.size()) &&
+        kv.first.second <
+            static_cast<int>(prob.command_inner_coordinates.size())) {
+      inner_delta = prob.command_inner_coordinates[kv.first.second] -
+                    prob.command_inner_coordinates[kv.first.first];
+    }
+    out << ": [" << kv.second << ", " << inner_delta << "]";
+  }
+  out << "},\n";
+
+
+  out << "  \"dependency_constraints\": [";
+  for (size_t i = 0; i < prob.dependencies.size(); ++i) {
+    const DependencySpec &dependency = prob.dependencies[i];
+    if (i != 0) {
+      out << ", ";
+    }
+    out << "{";
+    out << "\"src\": " << dependency.src;
+    out << ", \"dst\": " << dependency.dst;
+    out << ", \"delta\": " << dependency.delta;
+    out << ", \"lag\": " << dependency.lag;
+    out << ", \"hazard\": ";
+    WriteJsonString(out, dependency.hazard);
+    out << ", \"buffer_name\": ";
+    WriteJsonString(out, dependency.buffer_name);
+    out << "}";
+  }
+  out << "],\n";
 
   std::vector<FlowSpec> sorted_flows = prob.flows;
   std::sort(
@@ -816,6 +1070,20 @@ int ComputeFoldedOccupancy(int start_time, int duration, int II, int slot) {
   return CeilDiv(duration - rel, II);
 }
 
+int ComputeFoldedResourceOccupancy(const CommandSpec &spec, int resource,
+                                   int start_time, int II, int slot) {
+  auto it = spec.resource_windows.find(resource);
+  if (it == spec.resource_windows.end()) {
+    return ComputeFoldedOccupancy(start_time, spec.latency, II, slot);
+  }
+  int occupancy = 0;
+  for (const auto &window : it->second) {
+    occupancy += ComputeFoldedOccupancy(start_time + window.first,
+                                        window.second - window.first, II, slot);
+  }
+  return occupancy;
+}
+
 SolutionVerifyResult VerifySolution(const Problem &prob,
                                     const SolveResult &sol) {
   SolutionVerifyResult result;
@@ -881,17 +1149,18 @@ SolutionVerifyResult VerifySolution(const Problem &prob,
     }
   }
 
-  for (const auto &e : prob.dep_edges) {
-    int src = e.first;
-    int dst = e.second;
-    int delta = prob.delta.at(EdgeKey(src, dst));
+  for (const DependencySpec &dependency : prob.dependencies) {
+    int src = dependency.src;
+    int dst = dependency.dst;
     int lhs = sol.t[dst] - sol.t[src];
-    int rhs = prob.P[src].latency - delta * sol.II;
+    int rhs = dependency.lag - dependency.delta * sol.II;
     if (lhs < rhs) {
       fail(&result.dependency_ok,
            "dependency violated " + std::to_string(src) + "->" +
-               std::to_string(dst) + ": lhs=" + std::to_string(lhs) + " rhs=" +
-               std::to_string(rhs) + " delta=" + std::to_string(delta));
+               std::to_string(dst) + ": lhs=" + std::to_string(lhs) +
+               " rhs=" + std::to_string(rhs) +
+               " delta=" + std::to_string(dependency.delta) +
+               " lag=" + std::to_string(dependency.lag));
     }
   }
 
@@ -899,7 +1168,7 @@ SolutionVerifyResult VerifySolution(const Problem &prob,
     for (int r : prob.P[i].resources) {
       for (int s = 0; s < sol.II; ++s) {
         result.resource_slot_load[r][s] +=
-            ComputeFoldedOccupancy(sol.t[i], prob.P[i].latency, sol.II, s);
+            ComputeFoldedResourceOccupancy(prob.P[i], r, sol.t[i], sol.II, s);
       }
     }
   }
@@ -957,6 +1226,87 @@ SolutionVerifyResult VerifySolution(const Problem &prob,
     }
   }
 
+  if (prob.multidim) {
+    if (static_cast<int>(prob.command_inner_coordinates.size()) != prob.N) {
+      fail(&result.multidim_identity_ok,
+           "multidim command identity count does not match N");
+    } else {
+      for (int i = 0; i < prob.N; ++i) {
+        if (prob.command_inner_coordinates[i] < 0) {
+          fail(&result.multidim_identity_ok,
+               "command " + std::to_string(i) +
+                   " has no inner-coordinate identity");
+        }
+      }
+    }
+
+    // Lift the scaled solution back to raw cost-model cycles and re-check the
+    // original command latencies and dependencies.
+    int64_t gcd = std::max<int64_t>(1, prob.latency_gcd);
+    int64_t faster = std::max<int64_t>(1, prob.solver_scale_factor);
+    if (gcd > std::numeric_limits<int64_t>::max() / faster) {
+      fail(&result.raw_cycle_ok, "raw-cycle lift unit overflow");
+    } else {
+      result.raw_lift_unit = gcd * faster;
+      if (sol.II > std::numeric_limits<int64_t>::max() /
+                       result.raw_lift_unit) {
+        fail(&result.raw_cycle_ok, "raw-cycle II overflow");
+      } else {
+        result.raw_ii =
+            static_cast<int64_t>(sol.II) * result.raw_lift_unit;
+      }
+      std::vector<int64_t> raw_start(prob.N, 0);
+      for (int i = 0; i < prob.N; ++i) {
+        if (sol.t[i] > std::numeric_limits<int64_t>::max() /
+                           result.raw_lift_unit) {
+          fail(&result.raw_cycle_ok,
+               "raw-cycle start overflow for command " + std::to_string(i));
+          continue;
+        }
+        raw_start[i] =
+            static_cast<int64_t>(sol.t[i]) * result.raw_lift_unit;
+        int64_t raw_latency =
+            i < static_cast<int>(prob.cost_estimates.size())
+                ? std::max<int64_t>(1, prob.cost_estimates[i].latency_cycles)
+                : static_cast<int64_t>(prob.P[i].latency) *
+                      result.raw_lift_unit;
+        int64_t covered_latency =
+            static_cast<int64_t>(prob.P[i].latency) * result.raw_lift_unit;
+        if (raw_latency > covered_latency) {
+          fail(&result.raw_cycle_ok,
+               "scaled duration does not cover raw latency for command " +
+                   std::to_string(i));
+        }
+        result.raw_makespan =
+            std::max(result.raw_makespan, raw_start[i] + raw_latency);
+        if (raw_start[i] !=
+            static_cast<int64_t>(sol.y[i]) * result.raw_ii +
+                static_cast<int64_t>(sol.m[i]) * result.raw_lift_unit) {
+          fail(&result.raw_cycle_ok,
+               "raw-cycle t=y*II+m lift failed for command " +
+                   std::to_string(i));
+        }
+      }
+      for (const auto &edge : prob.dep_edges) {
+        int src = edge.first;
+        int dst = edge.second;
+        int delta = prob.delta.at(EdgeKey(src, dst));
+        int64_t raw_latency =
+            src < static_cast<int>(prob.cost_estimates.size())
+                ? std::max<int64_t>(
+                      1, prob.cost_estimates[src].latency_cycles)
+                : static_cast<int64_t>(prob.P[src].latency) *
+                      result.raw_lift_unit;
+        if (raw_start[dst] - raw_start[src] <
+            raw_latency - static_cast<int64_t>(delta) * result.raw_ii) {
+          fail(&result.raw_cycle_ok,
+               "raw-cycle dependency violated " + std::to_string(src) +
+                   "->" + std::to_string(dst));
+        }
+      }
+    }
+  }
+
   return result;
 }
 
@@ -979,6 +1329,8 @@ void WriteSolutionJson(
   out << "{\n";
   out << "  \"ii\": " << sol.II << ",\n";
   out << "  \"makespan\": " << sol.makespan << ",\n";
+  out << "  \"fast_verified_schedule\": " << sol.fast_verified_schedule
+      << ",\n";
   out << "  \"wsram_flip\": " << sol.bank_flip_mode.wsram_flip << ",\n";
   out << "  \"asram_flip\": " << sol.bank_flip_mode.asram_flip << ",\n";
   out << "  \"vc_blocking_issue_modeled\": " << sol.vc_blocking_issue_modeled
@@ -993,25 +1345,63 @@ void WriteSolutionJson(
     out << "    ";
     WriteJsonString(out, std::to_string(i));
     out << ": {\"start\": " << sol.t[i] << ", \"slot\": " << sol.m[i]
-        << ", \"iteration\": " << sol.y[i] << ", \"phases\": [";
-    for (size_t p = 0; p < prob.P[i].resources.size(); ++p) {
-      if (p != 0) {
-        out << ", ";
+        << ", \"iteration\": " << sol.y[i];
+    out << ", \"coordinate\": [" << sol.y[i] << ", ";
+    out << (i < static_cast<int>(prob.command_inner_coordinates.size())
+                ? prob.command_inner_coordinates[i]
+                : -1);
+    out << "], \"phases\": [";
+    int phase_id = 0;
+    bool first_phase = true;
+    for (int resource : prob.P[i].resources) {
+      std::vector<std::pair<int, int>> windows{{0, prob.P[i].latency}};
+      auto windows_it = prob.P[i].resource_windows.find(resource);
+      if (windows_it != prob.P[i].resource_windows.end()) {
+        windows = windows_it->second;
       }
-      int resource = prob.P[i].resources[p];
-      out << "{";
-      out << "\"phase_id\": " << p;
-      out << ", \"resource_name\": ";
-      WriteJsonString(out, ResourceName(resource));
-      out << ", \"start\": " << sol.t[i];
-      out << ", \"end\": " << (sol.t[i] + prob.P[i].latency);
-      out << ", \"duration\": " << prob.P[i].latency;
-      out << "}";
+      for (const auto &window : windows) {
+        if (!first_phase) {
+          out << ", ";
+        }
+        first_phase = false;
+        out << "{";
+        out << "\"phase_id\": " << phase_id++;
+        out << ", \"resource_name\": ";
+        WriteJsonString(out, ResourceName(resource));
+        out << ", \"start\": " << (sol.t[i] + window.first);
+        out << ", \"end\": " << (sol.t[i] + window.second);
+        out << ", \"duration\": " << (window.second - window.first);
+        out << "}";
+      }
     }
     out << "]}";
     out << (i + 1 == prob.N ? "\n" : ",\n");
   }
   out << "  },\n";
+
+  out << "  \"dependencies\": [";
+  for (size_t i = 0; i < prob.dependencies.size(); ++i) {
+    const DependencySpec &dependency = prob.dependencies[i];
+    if (i != 0) {
+      out << ", ";
+    }
+    int lhs = sol.t[dependency.dst] - sol.t[dependency.src];
+    int rhs = dependency.lag - dependency.delta * sol.II;
+    out << "{";
+    out << "\"src\": " << dependency.src;
+    out << ", \"dst\": " << dependency.dst;
+    out << ", \"delta\": " << dependency.delta;
+    out << ", \"lag\": " << dependency.lag;
+    out << ", \"lhs\": " << lhs;
+    out << ", \"rhs\": " << rhs;
+    out << ", \"slack\": " << (lhs - rhs);
+    out << ", \"hazard\": ";
+    WriteJsonString(out, dependency.hazard);
+    out << ", \"buffer_name\": ";
+    WriteJsonString(out, dependency.buffer_name);
+    out << "}";
+  }
+  out << "],\n";
 
   out << "  \"flows\": [";
   bool first_flow = true;
@@ -1125,6 +1515,14 @@ void WriteSolutionJson(
   out << ", \"dependency_ok\": " << verify.dependency_ok;
   out << ", \"resource_slot_ok\": " << verify.resource_slot_ok;
   out << ", \"bank_slot_ok\": " << verify.bank_slot_ok;
+  out << ", \"multidim_identity_ok\": " << verify.multidim_identity_ok;
+  out << ", \"raw_cycle_ok\": " << verify.raw_cycle_ok;
+  out << ", \"raw_lift_unit\": " << verify.raw_lift_unit;
+  out << ", \"raw_ii\": " << verify.raw_ii;
+  out << ", \"raw_makespan\": " << verify.raw_makespan;
+  out << ", \"latency_gcd_enabled\": " << prob.latency_gcd_enabled;
+  out << ", \"latency_gcd\": " << prob.latency_gcd;
+  out << ", \"solver_scale_factor\": " << prob.solver_scale_factor;
   out << ", \"bank_port_ok\": " << verify.bank_port_ok;
   out << ", \"errors\": [";
   for (size_t i = 0; i < verify.errors.size(); ++i) {
@@ -1199,14 +1597,10 @@ private:
 
   void VisitStmt_(const EvaluateNode *op) final {
     if (const auto *call = op->value.as<CallNode>()) {
-      if (call->op.same_as(dma_copy())) {
-        AddAccess(NormalizeToBufferRegion(call->args[0]), false);
-        AddAccess(NormalizeToBufferRegion(call->args[1]), true);
-        return;
-      }
-      if (call->op.same_as(sunmmio_layout_transform())) {
-        AddAccess(NormalizeToBufferRegion(call->args[0]), false);
-        AddAccess(NormalizeToBufferRegion(call->args[1]), true);
+      SunmmioAsyncOpInfo async_info;
+      if (TryParseSunmmioAsyncODMAOp(call, &async_info)) {
+        AddAccess(async_info.src, false);
+        AddAccess(async_info.dst, true);
         return;
       }
       if (call->op.same_as(mma_sunmmio())) {
@@ -1215,11 +1609,9 @@ private:
         BufferRegion c_region = NormalizeToBufferRegion(call->args[2]);
         AddAccess(c_region, false);
         AddAccess(c_region, true);
-        return;
-      }
-      if (call->op.same_as(Op::Get("tl.broadcast_"))) {
-        AddAccess(NormalizeToBufferRegion(call->args[0]), false);
-        AddAccess(NormalizeToBufferRegion(call->args[1]), true);
+        if (call->args.size() == 9U) {
+          AddAccess(NormalizeToBufferRegion(call->args[7]), true);
+        }
         return;
       }
       if (call->op.same_as(Op::Get("tl.vector_core_in_tile_reduce"))) {
@@ -1594,7 +1986,9 @@ public:
   Role role{Role::kUndefined};
   DeviceType type{DeviceType::Unspecified};
   std::vector<AccessInfo> accesses;
+  int inner_coordinate{-1};
   CommandSpec spec;
+  CostEstimate cost_estimate;
 
   TemplateCommand(int id, const Stmt &stmt)
       : id(id), name("cmd_" + std::to_string(id)), stmt(stmt) {}
@@ -1614,21 +2008,21 @@ const CallNode *GetSingleBroadcastCall(const Stmt &stmt) {
 }
 
 bool IsAllGatherBroadcast(const TemplateCommand &cmd) {
+  if (cmd.cost_estimate.op_kind == "nested_pipeline") {
+    return false;
+  }
   const CallNode *call = GetSingleBroadcastCall(cmd.stmt);
   if (!call) {
     return false;
   }
-  size_t semantic_args = call->args.size();
-  ICHECK(semantic_args > 0 &&
-         ParseSunmmioOdmaUnitExpr(call->args[semantic_args - 1]))
-      << "tl.broadcast_ requires a resolved ODMA unit before pipeline planning";
-  --semantic_args;
-  ICHECK(semantic_args == static_cast<size_t>(kBroadcastArgCount) ||
-         semantic_args == static_cast<size_t>(kBroadcastArgCount + 1))
-      << "tl.broadcast_ expects its fixed arguments and optional src_core";
-  // Before unit-sync injection, a broadcast with only the fixed arguments is
-  // issued by every core and therefore implements an all-gather collective.
-  return semantic_args == static_cast<size_t>(kBroadcastArgCount);
+  SunmmioAsyncOpInfo info;
+  ICHECK(TryParseSunmmioAsyncODMAOp(call, &info))
+      << "tl.broadcast_ expects its fixed arguments, optional src_core, "
+         "and optional ODMA metadata";
+  // ODMA metadata is not a source-core argument. Use the shared semantic
+  // parser so resolved and unresolved broadcasts have identical ordering
+  // constraints. A rooted broadcast must still remain non-collective.
+  return !info.src_core.defined();
 }
 
 bool IsCopyStage(const TemplateCommand &cmd) {
@@ -2438,6 +2832,7 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
   problem->flows.clear();
   problem->dep_edges.clear();
   problem->delta.clear();
+  problem->dependencies.clear();
 
   struct ExpandedCommand {
     int template_id{-1};
@@ -2453,6 +2848,8 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
   };
 
   std::map<std::pair<int, int>, int> best_delta;
+  std::map<std::tuple<int, int, int, std::string, std::string>, DependencySpec>
+      dependency_constraints;
   std::map<std::tuple<int, int, const BufferNode *, int, int>, int>
       flow_key_to_index;
   using ConsumerAccessKey = std::tuple<int, int, const BufferNode *, int>;
@@ -2579,9 +2976,19 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
     return iter_mod;
   };
 
-  auto maybe_record_edge = [&](int src_id, int dst_id, int delta) {
+  auto maybe_record_edge = [&](int src_id, int dst_id, int delta, int lag,
+                               const std::string &hazard,
+                               const std::string &buffer_name) {
     if (delta < 0) {
       return;
+    }
+    auto dependency_key =
+        std::make_tuple(src_id, dst_id, delta, hazard, buffer_name);
+    auto dependency_it = dependency_constraints.find(dependency_key);
+    if (dependency_it == dependency_constraints.end() ||
+        lag > dependency_it->second.lag) {
+      dependency_constraints[dependency_key] =
+          DependencySpec{src_id, dst_id, delta, lag, hazard, buffer_name};
     }
     std::pair<int, int> key{src_id, dst_id};
     auto it = best_delta.find(key);
@@ -2731,7 +3138,9 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
           continue;
         }
         maybe_record_edge(src_cmd.template_id, curr_cmd.template_id,
-                          curr_cmd.iter - src_cmd.iter);
+                          curr_cmd.iter - src_cmd.iter,
+                          src_access.last_offset - dst_access.first_offset,
+                          "RAW", dst_access.buffer()->name);
         int mem = GetPingPongMemoryKind(dst_access.buffer());
         bool has_concrete_flow =
             maybe_record_flow(src_cmd.template_id, curr_cmd.template_id,
@@ -2771,7 +3180,9 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
           continue;
         }
         maybe_record_edge(src_cmd.template_id, curr_cmd.template_id,
-                          curr_cmd.iter - src_cmd.iter);
+                          curr_cmd.iter - src_cmd.iter, src_access.last_offset,
+                          it->type == AccessType::kWrite ? "WAW" : "WAR",
+                          dst_access.buffer()->name);
         if (it->type == AccessType::kWrite) {
           break;
         }
@@ -2801,10 +3212,18 @@ void BuildTemplateDependencyGraph(const std::vector<TemplateCommand> &commands,
     }
   }
   for (size_t i = 1; i < all_gather_ids.size(); ++i) {
-    maybe_record_edge(all_gather_ids[i - 1], all_gather_ids[i], 0);
+    int src = all_gather_ids[i - 1];
+    maybe_record_edge(src, all_gather_ids[i], 0, problem->P[src].latency,
+                      "collective_order", "");
   }
   if (all_gather_ids.size() > 1) {
-    maybe_record_edge(all_gather_ids.back(), all_gather_ids.front(), 1);
+    int src = all_gather_ids.back();
+    maybe_record_edge(src, all_gather_ids.front(), 1, problem->P[src].latency,
+                      "collective_order", "");
+  }
+
+  for (const auto &kv : dependency_constraints) {
+    problem->dependencies.push_back(kv.second);
   }
 
   for (const auto &kv : best_delta) {
@@ -2856,7 +3275,9 @@ bool ValidateProblemGraph(const std::vector<TemplateCommand> &commands,
       return false;
     }
     for (const AccessInfo &access : commands[id].accesses) {
-      if (!access.region.defined() || !access.buffer().defined()) {
+      if (!access.region.defined() || !access.buffer().defined() ||
+          access.first_offset < 0 || access.last_offset < access.first_offset ||
+          access.last_offset > problem.P[id].latency) {
         return false;
       }
     }
@@ -2868,6 +3289,13 @@ bool ValidateProblemGraph(const std::vector<TemplateCommand> &commands,
     }
     auto delta_it = problem.delta.find(EdgeKey(edge.first, edge.second));
     if (delta_it == problem.delta.end() || delta_it->second < 0) {
+      return false;
+    }
+  }
+  for (const DependencySpec &dependency : problem.dependencies) {
+    if (dependency.src < 0 || dependency.src >= problem.N ||
+        dependency.dst < 0 || dependency.dst >= problem.N ||
+        dependency.delta < 0 || dependency.hazard.empty()) {
       return false;
     }
   }
@@ -2896,12 +3324,467 @@ int ResourceLowerBound(const Problem &prob) {
     for (int i = 0; i < prob.N; ++i) {
       if (std::find(prob.P[i].resources.begin(), prob.P[i].resources.end(),
                     r) != prob.P[i].resources.end()) {
-        total += prob.P[i].latency;
+        total += ResourceUsageDuration(prob.P[i], r);
       }
     }
     lb = std::max(lb, std::max(1, int((total + cap - 1) / cap)));
   }
   return lb;
+}
+
+struct FastParityDsu {
+  std::vector<int> parent;
+  std::vector<int> parity_to_parent;
+
+  explicit FastParityDsu(int n) : parent(n), parity_to_parent(n, 0) {
+    for (int i = 0; i < n; ++i) {
+      parent[i] = i;
+    }
+  }
+
+  std::pair<int, int> Find(int value) {
+    if (parent[value] == value) {
+      return {value, 0};
+    }
+    auto root = Find(parent[value]);
+    parity_to_parent[value] ^= root.second;
+    parent[value] = root.first;
+    return {parent[value], parity_to_parent[value]};
+  }
+
+  bool Unite(int lhs, int rhs, int parity) {
+    auto l = Find(lhs);
+    auto r = Find(rhs);
+    if (l.first == r.first) {
+      return (l.second ^ r.second) == parity;
+    }
+    parent[l.first] = r.first;
+    parity_to_parent[l.first] = l.second ^ r.second ^ parity;
+    return true;
+  }
+
+  std::vector<int> Values() {
+    std::vector<int> result(parent.size(), 0);
+    for (int i = 0; i < static_cast<int>(parent.size()); ++i) {
+      result[i] = Find(i).second & 1;
+    }
+    return result;
+  }
+};
+
+int FastScheduleTimeUpperBound(const Problem &prob, int II) {
+  int max_delta = 0;
+  int max_latency = 0;
+  for (const DependencySpec &dependency : prob.dependencies) {
+    max_delta = std::max(max_delta, dependency.delta);
+  }
+  for (const CommandSpec &spec : prob.P) {
+    max_latency = std::max(max_latency, spec.latency);
+  }
+  return prob.Tmax + max_delta * II + max_latency;
+}
+
+bool FastCommandUsesResource(const CommandSpec &spec, int resource) {
+  return std::find(spec.resources.begin(), spec.resources.end(), resource) !=
+         spec.resources.end();
+}
+
+bool FastDependenciesAllowCandidate(const Problem &prob,
+                                    const std::vector<int> &starts, int cmd,
+                                    int start, int II) {
+  for (const DependencySpec &dependency : prob.dependencies) {
+    int src = dependency.src;
+    int dst = dependency.dst;
+    if (src == cmd && dst == cmd) {
+      if (dependency.lag > dependency.delta * II) {
+        return false;
+      }
+      continue;
+    }
+    if (src == cmd && starts[dst] >= 0) {
+      if (start + dependency.lag > starts[dst] + dependency.delta * II) {
+        return false;
+      }
+    } else if (dst == cmd && starts[src] >= 0) {
+      if (starts[src] + dependency.lag > start + dependency.delta * II) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool FastResourcesAllowCandidate(const Problem &prob,
+                                 const std::vector<int> &starts, int cmd,
+                                 int start, int II) {
+  for (int resource : prob.P[cmd].resources) {
+    int cap = 1;
+    auto cap_it = prob.cap.find(resource);
+    if (cap_it != prob.cap.end()) {
+      cap = cap_it->second;
+    }
+    for (int slot = 0; slot < II; ++slot) {
+      int use = ComputeFoldedResourceOccupancy(prob.P[cmd], resource, start, II,
+                                               slot);
+      if (use == 0) {
+        continue;
+      }
+      for (int other = 0; other < prob.N; ++other) {
+        if (starts[other] < 0) {
+          continue;
+        }
+        if (!FastCommandUsesResource(prob.P[other], resource)) {
+          continue;
+        }
+        use += ComputeFoldedResourceOccupancy(prob.P[other], resource,
+                                              starts[other], II, slot);
+      }
+      if (use > cap) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool FastZeroDeltaPredecessorsAssigned(const Problem &prob,
+                                       const std::vector<int> &starts,
+                                       int cmd) {
+  for (const DependencySpec &dependency : prob.dependencies) {
+    int src = dependency.src;
+    int dst = dependency.dst;
+    if (src == dst || dst != cmd) {
+      continue;
+    }
+    if (dependency.delta == 0 && starts[src] < 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool FastEarliestStart(const Problem &prob, const std::vector<int> &starts,
+                       int cmd, int II, int time_ub, int *out_start) {
+  int lower = 0;
+  int upper = time_ub;
+  for (const DependencySpec &dependency : prob.dependencies) {
+    int src = dependency.src;
+    int dst = dependency.dst;
+    if (dst == cmd && starts[src] >= 0) {
+      lower =
+          std::max(lower, starts[src] + dependency.lag - dependency.delta * II);
+    } else if (src == cmd && starts[dst] >= 0) {
+      upper =
+          std::min(upper, starts[dst] + dependency.delta * II - dependency.lag);
+    }
+  }
+  if (upper < lower) {
+    return false;
+  }
+  for (int start = std::max(0, lower); start <= upper; ++start) {
+    if (!FastDependenciesAllowCandidate(prob, starts, cmd, start, II)) {
+      continue;
+    }
+    if (!FastResourcesAllowCandidate(prob, starts, cmd, start, II)) {
+      continue;
+    }
+    *out_start = start;
+    return true;
+  }
+  return false;
+}
+
+bool FastAssignBankPhases(const Problem &prob, const std::vector<int> &starts,
+                          int II, const BankFlipMode &mode,
+                          std::vector<int> *z_bank) {
+  FastParityDsu dsu(static_cast<int>(prob.flows.size()));
+  std::map<SameWriteFlowKey, std::vector<int>> same_write_groups;
+  for (int idx = 0; idx < static_cast<int>(prob.flows.size()); ++idx) {
+    const FlowSpec &flow = prob.flows[idx];
+    if (flow.write_resource < 0 || flow.prod < 0) {
+      continue;
+    }
+    same_write_groups[MakeSameWriteFlowKey(flow)].push_back(idx);
+  }
+  for (const auto &kv : same_write_groups) {
+    const std::vector<int> &flows = kv.second;
+    for (size_t i = 1; i < flows.size(); ++i) {
+      if (!dsu.Unite(flows[0], flows[i], 0)) {
+        return false;
+      }
+    }
+  }
+
+  for (int a = 0; a < static_cast<int>(prob.flows.size()); ++a) {
+    const FlowSpec &write_flow = prob.flows[a];
+    if (write_flow.write_resource < 0 || write_flow.prod < 0) {
+      continue;
+    }
+    int write_start_time = starts[write_flow.prod];
+    for (int b = 0; b < static_cast<int>(prob.flows.size()); ++b) {
+      if (a == b) {
+        continue;
+      }
+      const FlowSpec &read_flow = prob.flows[b];
+      if (read_flow.cons < 0) {
+        continue;
+      }
+      int read_start_time = starts[read_flow.cons] + read_flow.delta * II;
+      ConflictType conflict = AnalyzeFlowConflict(
+          write_flow, write_start_time, read_flow, read_start_time, II, mode);
+      if (conflict == ConflictType::kImpossible) {
+        return false;
+      }
+      if (conflict == ConflictType::kNeedDifferent) {
+        if (!dsu.Unite(a, b, 1)) {
+          return false;
+        }
+      } else if (conflict == ConflictType::kNeedSame) {
+        if (!dsu.Unite(a, b, 0)) {
+          return false;
+        }
+      }
+    }
+  }
+
+  *z_bank = dsu.Values();
+  return true;
+}
+
+SolveResult TryFastVerifiedScheduleForMode(const Problem &prob, int II,
+                                           const BankFlipMode &mode) {
+  SolveResult result;
+  if (prob.N <= 0 || II <= 0) {
+    return result;
+  }
+  int time_ub = FastScheduleTimeUpperBound(prob, II);
+  std::vector<int> starts(prob.N, -1);
+  std::vector<bool> scheduled(prob.N, false);
+
+  for (int placed = 0; placed < prob.N; ++placed) {
+    int best_cmd = -1;
+    int best_start = 0;
+    bool found_ready = false;
+    for (int cmd = 0; cmd < prob.N; ++cmd) {
+      if (scheduled[cmd]) {
+        continue;
+      }
+      bool ready = FastZeroDeltaPredecessorsAssigned(prob, starts, cmd);
+      if (found_ready && !ready) {
+        continue;
+      }
+      int candidate_start = 0;
+      if (!FastEarliestStart(prob, starts, cmd, II, time_ub,
+                             &candidate_start)) {
+        continue;
+      }
+      if (!found_ready && ready) {
+        found_ready = true;
+        best_cmd = -1;
+      }
+      if (ready == found_ready &&
+          (best_cmd < 0 || candidate_start < best_start ||
+           (candidate_start == best_start && cmd < best_cmd))) {
+        best_cmd = cmd;
+        best_start = candidate_start;
+      }
+    }
+    if (best_cmd < 0) {
+      return {};
+    }
+    starts[best_cmd] = best_start;
+    scheduled[best_cmd] = true;
+  }
+
+  std::vector<int> z_bank;
+  if (!FastAssignBankPhases(prob, starts, II, mode, &z_bank)) {
+    return {};
+  }
+
+  result.ok = true;
+  result.objective_optimized = false;
+  result.fast_verified_schedule = true;
+  result.II = II;
+  result.bank_slot_period = 2 * II;
+  result.bank_flip_mode = mode;
+  result.vc_blocking_issue_modeled = true;
+  result.vc_blocking_issue_constraints = 0;
+  result.t = starts;
+  result.m.resize(prob.N, 0);
+  result.y.resize(prob.N, 0);
+  result.makespan = 0;
+  for (int i = 0; i < prob.N; ++i) {
+    result.m[i] = PositiveMod(result.t[i], II);
+    result.y[i] = result.t[i] / II;
+    result.makespan =
+        std::max(result.makespan, result.t[i] + prob.P[i].latency);
+  }
+  result.internal_flow_ids.resize(prob.flows.size());
+  for (int i = 0; i < static_cast<int>(prob.flows.size()); ++i) {
+    result.internal_flow_ids[i] = i;
+  }
+  result.z_bank = std::move(z_bank);
+
+  SolutionVerifyResult verify = VerifySolution(prob, result);
+  if (!verify.ok) {
+    return {};
+  }
+  return result;
+}
+
+int64_t FiniteHorizonScheduleCost(const SolveResult &sol,
+                                  int64_t logical_extent) {
+  ICHECK(sol.ok);
+  ICHECK_GT(logical_extent, 0);
+  return static_cast<int64_t>(sol.makespan) +
+         (logical_extent - 1) * static_cast<int64_t>(sol.II);
+}
+
+SolveResult RefineV2FiniteHorizonSchedule(const Problem &prob,
+                                          const SolveResult &seed,
+                                          int64_t logical_extent) {
+  if (!seed.ok || logical_extent <= 1 ||
+      !GetEnvBool("TL_SUNMMIO_ILP_FAST_VERIFIED_SCHEDULER", true)) {
+    return seed;
+  }
+  if (CeilDiv(seed.makespan, std::max(1, seed.II)) <= 2) {
+    return seed;
+  }
+  int slack = GetEnvInt("TL_SUNMMIO_ILP_V2_FINITE_HORIZON_SLACK", 4);
+  if (slack <= 0) {
+    return seed;
+  }
+
+  SolveResult best = seed;
+  int64_t best_cost = FiniteHorizonScheduleCost(best, logical_extent);
+  for (int II = seed.II + 1; II <= seed.II + slack; ++II) {
+    SolveResult candidate =
+        TryFastVerifiedScheduleForMode(prob, II, seed.bank_flip_mode);
+    if (!candidate.ok) {
+      continue;
+    }
+    int64_t candidate_cost =
+        FiniteHorizonScheduleCost(candidate, logical_extent);
+    if (candidate_cost < best_cost ||
+        (candidate_cost == best_cost && candidate.II < best.II)) {
+      best = std::move(candidate);
+      best_cost = candidate_cost;
+    }
+  }
+  if (best.II != seed.II || best.makespan != seed.makespan) {
+    LOG(INFO) << "[ILP] v2 finite-horizon refinement extent=" << logical_extent
+              << " seed_ii=" << seed.II << " seed_makespan=" << seed.makespan
+              << " selected_ii=" << best.II
+              << " selected_makespan=" << best.makespan
+              << " selected_cost=" << best_cost;
+  }
+  return best;
+}
+
+SolveResult TryFastVerifiedSchedule(const Problem &prob,
+                                    const BankFlipMode &mode, int max_ii = -1) {
+  if (!GetEnvBool("TL_SUNMMIO_ILP_FAST_VERIFIED_SCHEDULER", true)) {
+    return {};
+  }
+  int lb = std::max(1, ResourceLowerBound(prob));
+  int upper = std::max(lb, prob.Tmax);
+  if (max_ii > 0) {
+    upper = std::min(upper, max_ii);
+  }
+  int extra = GetEnvInt("TL_SUNMMIO_ILP_FAST_MAX_EXTRA_II", 80);
+  if (extra >= 0) {
+    upper = std::min(upper, lb + extra);
+  }
+  for (int II = lb; II <= upper; ++II) {
+    SolveResult fast = TryFastVerifiedScheduleForMode(prob, II, mode);
+    if (fast.ok) {
+      LOG(INFO) << "[ILP] fast verified scheduler found II=" << II
+                << " mode=" << mode.Id() << " makespan=" << fast.makespan;
+      return fast;
+    }
+  }
+  LOG(INFO) << "[ILP] fast verified scheduler found no solution in [" << lb
+            << ", " << upper << "] for mode=" << mode.Id();
+  return {};
+}
+
+std::string MakeSolveCacheKey(const Problem &prob, int II, bool optimize_t,
+                              const BankFlipMode &mode,
+                              bool model_vc_blocking_issue) {
+  // Include every field that can affect BuildModel or the VC issue
+  // constraints.  The cache is only an exact memoization of an identical
+  // mathematical model; solver settings that merely select a search strategy
+  // (for example, thread count) intentionally do not enter the key.
+  std::ostringstream os;
+  os << "N=" << prob.N << ";Tmax=" << prob.Tmax << ";II=" << II
+     << ";opt=" << optimize_t << ";mode=" << mode.Id()
+     << ";vc=" << model_vc_blocking_issue;
+  os << ";R=";
+  for (int resource : prob.R) {
+    auto cap_it = prob.cap.find(resource);
+    int capacity = cap_it == prob.cap.end() ? 1 : cap_it->second;
+    os << resource << ":" << capacity << ",";
+  }
+  os << ";P=";
+  for (const CommandSpec &spec : prob.P) {
+    os << spec.latency << "[";
+    for (int resource : spec.resources) {
+      os << resource << ",";
+    }
+    os << "]{";
+    for (const auto &resource_entry : spec.resource_windows) {
+      os << resource_entry.first << ":";
+      for (const auto &window : resource_entry.second) {
+        os << window.first << "-" << window.second << ",";
+      }
+      os << ";";
+    }
+    os << "};";
+  }
+  os << ";E=";
+  for (const DependencySpec &dependency : prob.dependencies) {
+    os << dependency.src << ">" << dependency.dst << ":" << dependency.delta
+       << ":" << dependency.lag << ":" << dependency.hazard.size() << ":"
+       << dependency.hazard << ":" << dependency.buffer_name.size() << ":"
+       << dependency.buffer_name << ",";
+  }
+  os << ";F=";
+  for (const FlowSpec &flow : prob.flows) {
+    os << flow.resident << "," << flow.prod << "," << flow.cons << ","
+       << flow.delta << "," << flow.mem << "," << flow.buffer_name.size() << ":"
+       << flow.buffer_name << "," << flow.fixed_bank << "," << flow.precolor
+       << "," << flow.fp << "," << flow.initial_time << "," << flow.w_off << ","
+       << flow.w_dur << "," << flow.r_off << "," << flow.r_dur << ","
+       << flow.write_resource << "," << flow.read_resource << ";";
+  }
+  return os.str();
+}
+
+struct ExactSolveCache {
+  std::mutex mutex;
+  std::map<std::string, SolveResult> entries;
+};
+
+ExactSolveCache &GetExactSolveCache() {
+  static ExactSolveCache cache;
+  return cache;
+}
+
+bool LookupExactSolveCache(const std::string &key, SolveResult *result) {
+  ExactSolveCache &cache = GetExactSolveCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  auto it = cache.entries.find(key);
+  if (it == cache.entries.end()) {
+    return false;
+  }
+  *result = it->second;
+  return true;
+}
+
+void StoreExactSolveCache(const std::string &key, const SolveResult &result) {
+  ExactSolveCache &cache = GetExactSolveCache();
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  cache.entries[key] = result;
 }
 
 HighsInt AddCol(Highs &highs, double lower, double upper, double cost,
@@ -3036,8 +3919,8 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
 
   int max_delta = 0;
   int max_latency = 0;
-  for (const auto &kv : prob.delta) {
-    max_delta = std::max(max_delta, kv.second);
+  for (const DependencySpec &dependency : prob.dependencies) {
+    max_delta = std::max(max_delta, dependency.delta);
   }
   for (const auto &spec : prob.P) {
     max_latency = std::max(max_latency, spec.latency);
@@ -3051,18 +3934,20 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
   vars.col_start_parity.resize(prob.N);
   vars.col_m.resize(prob.N);
   vars.col_x.assign(prob.N, std::vector<HighsInt>(II, -1));
-  vars.col_a.assign(prob.N, std::vector<HighsInt>(II, -1));
 
   for (int v = 0; v < static_cast<int>(prob.flows.size()); ++v) {
     vars.internal_flow_ids.push_back(v);
   }
 
+  // t, y, m are exact affine images of the integer y_half/parity/x
+  // decisions below.  Keeping these derived columns continuous preserves the
+  // same integer schedules while removing redundant branch-and-bound columns.
   for (int i = 0; i < prob.N; ++i) {
-    vars.col_t[i] = AddCol(highs, 0, time_ub, 0, true);
-    vars.col_y[i] = AddCol(highs, 0, time_ub, 0, true);
+    vars.col_t[i] = AddCol(highs, 0, time_ub, 0, false);
+    vars.col_y[i] = AddCol(highs, 0, time_ub, 0, false);
     vars.col_y_half[i] = AddCol(highs, 0, CeilDiv(time_ub, 2), 0, true);
     vars.col_start_parity[i] = AddCol(highs, 0, 1, 0, true);
-    vars.col_m[i] = AddCol(highs, 0, II - 1, 0, true);
+    vars.col_m[i] = AddCol(highs, 0, II - 1, 0, false);
   }
   for (int i = 0; i < prob.N; ++i) {
     for (int s = 0; s < II; ++s) {
@@ -3070,12 +3955,24 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
     }
   }
   for (int i = 0; i < prob.N; ++i) {
-    int ub = CeilDiv(prob.P[i].latency, II);
-    for (int s = 0; s < II; ++s) {
-      vars.col_a[i][s] = AddCol(highs, 0, ub, 0, true);
+    for (int resource : prob.P[i].resources) {
+      int ub = 0;
+      for (int s = 0; s < II; ++s) {
+        ub = std::max(
+            ub, ComputeFoldedResourceOccupancy(prob.P[i], resource, 0, II, s));
+      }
+      auto &columns = vars.col_resource_a[{i, resource}];
+      columns.resize(II, -1);
+      for (int s = 0; s < II; ++s) {
+        // Resource occupancy is fixed by an equality to an
+        // integer-weighted sum of the binary x[i,*] columns.
+        columns[s] = AddCol(highs, 0, ub, 0, false);
+      }
     }
   }
-  vars.col_T = AddCol(highs, 0, time_ub, optimize_t ? 1.0 : 0.0, true);
+  // T is bounded below by integer completion times.  A continuous T has the
+  // same exact optimum and avoids another redundant integer column.
+  vars.col_T = AddCol(highs, 0, time_ub, optimize_t ? 1.0 : 0.0, false);
 
   // Choose exactly one modulo start slot and link all representations of the
   // same start time.  t = II*y + m linearizes modulo arithmetic; splitting y
@@ -3108,52 +4005,43 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
           {1.0, -2.0, -1.0}, 0.0);
   }
 
-  // Fold a command's [start, start + latency) interval onto the cyclic II-slot
-  // calendar.  a[i][s] can exceed one when latency > II, representing several
-  // overlapped iterations of the same command in physical slot s.
-  //   a[i,s] = sum_st x[i,st] * max(0, ceil((d_i-rel(s,st))/II))
-  // where rel(s,st) = (s-st) mod II.
+  // Fold every command/resource occupancy window onto the cyclic II-slot
+  // calendar.  Normal commands use [0, latency); a nested summary can provide
+  // several narrower windows for each physical resource.
   for (int i = 0; i < prob.N; ++i) {
-    int dur = prob.P[i].latency;
-    for (int s = 0; s < II; ++s) {
-      std::vector<HighsInt> idx{vars.col_a[i][s]};
-      std::vector<double> val{1.0};
-      for (int st = 0; st < II; ++st) {
-        int rel = (s - st) % II;
-        if (rel < 0) {
-          rel += II;
+    for (int resource : prob.P[i].resources) {
+      const auto &columns = vars.col_resource_a.at({i, resource});
+      for (int s = 0; s < II; ++s) {
+        std::vector<HighsInt> idx{columns[s]};
+        std::vector<double> val{1.0};
+        for (int st = 0; st < II; ++st) {
+          int count =
+              ComputeFoldedResourceOccupancy(prob.P[i], resource, st, II, s);
+          if (count != 0) {
+            idx.push_back(vars.col_x[i][st]);
+            val.push_back(-double(count));
+          }
         }
-        int cnt = 0;
-        if (rel < dur) {
-          cnt = CeilDiv(dur - rel, II);
-        }
-        if (cnt != 0) {
-          idx.push_back(vars.col_x[i][st]);
-          val.push_back(-double(cnt));
-        }
+        AddEq(highs, idx, val, 0.0);
       }
-      AddEq(highs, idx, val, 0.0);
     }
   }
 
   // For dependency i -> j at iteration distance delta, require
-  // t[i] + latency[i] <= t[j] + delta*II.  A self-edge cannot be shifted by
-  // start times, so it is immediately infeasible when its latency exceeds the
-  // available delta initiation intervals.
-  //   t[i] + d_i <= t[j] + delta(i,j)*II
-  for (const auto &e : prob.dep_edges) {
-    int i = e.first;
-    int j = e.second;
-    int d = prob.P[i].latency;
-    int delta = prob.delta.at(EdgeKey(i, j));
+  // t[i] + lag <= t[j] + delta*II.  Ordinary commands use lag=latency[i];
+  // nested summaries can use producer-ready and consumer-need offsets.
+  for (const DependencySpec &dependency : prob.dependencies) {
+    int i = dependency.src;
+    int j = dependency.dst;
+    int lag = dependency.lag;
     if (i == j) {
-      if (d > delta * II) {
+      if (lag > dependency.delta * II) {
         AddRow(highs, 1.0, 0.0, {}, {});
       }
       continue;
     }
     AddLeq(highs, {vars.col_t[i], vars.col_t[j]}, {1.0, -1.0},
-           double(delta * II - d));
+           double(dependency.delta * II - lag));
   }
 
   // T bounds every command completion, making minimization of T equivalent to
@@ -3176,7 +4064,7 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
       for (int i = 0; i < prob.N; ++i) {
         if (std::find(prob.P[i].resources.begin(), prob.P[i].resources.end(),
                       r) != prob.P[i].resources.end()) {
-          idx.push_back(vars.col_a[i][s]);
+          idx.push_back(vars.col_resource_a.at({i, r})[s]);
           val.push_back(1.0);
         }
       }
@@ -3190,6 +4078,13 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
   vars.col_z.resize(internal_count);
   for (int vv = 0; vv < internal_count; ++vv) {
     vars.col_z[vv] = AddCol(highs, 0, 1, 0, true);
+  }
+  if (internal_count > 0) {
+    // Every bank constraint depends only on equality/XOR relations between
+    // flow phases.  Complementing every z therefore produces the same
+    // physical schedule with ping/pong labels exchanged.  Select one
+    // representative of this exact two-way symmetry.
+    AddEq(highs, {vars.col_z[0]}, {1.0}, 0.0);
   }
 
   {
@@ -3348,18 +4243,90 @@ ModelVars BuildModel(Highs &highs, const Problem &prob, int II, bool optimize_t,
   return vars;
 }
 
+void ApplyMipStart(Highs &highs, const Problem &prob, int II,
+                   const BankFlipMode &mode, const ModelVars &vars,
+                   const SolveResult *mip_start) {
+  if (mip_start == nullptr || !mip_start->ok || mip_start->II != II ||
+      mip_start->bank_flip_mode.Id() != mode.Id() ||
+      static_cast<int>(mip_start->t.size()) != prob.N ||
+      static_cast<int>(mip_start->z_bank.size()) !=
+          static_cast<int>(vars.internal_flow_ids.size())) {
+    return;
+  }
+
+  std::vector<HighsInt> index;
+  std::vector<double> value;
+  auto add = [&](HighsInt col, double val) {
+    if (col >= 0) {
+      index.push_back(col);
+      value.push_back(val);
+    }
+  };
+
+  int makespan = 0;
+  for (int i = 0; i < prob.N; ++i) {
+    int start = mip_start->t[i];
+    if (start < 0) {
+      return;
+    }
+    int slot = PositiveMod(start, II);
+    int iteration = start / II;
+    add(vars.col_t[i], start);
+    add(vars.col_y[i], iteration);
+    add(vars.col_y_half[i], iteration / 2);
+    add(vars.col_start_parity[i], iteration & 1);
+    add(vars.col_m[i], slot);
+    for (int s = 0; s < II; ++s) {
+      add(vars.col_x[i][s], s == slot ? 1.0 : 0.0);
+      for (int resource : prob.P[i].resources) {
+        add(vars.col_resource_a.at({i, resource})[s],
+            ComputeFoldedResourceOccupancy(prob.P[i], resource, start, II, s));
+      }
+    }
+    makespan = std::max(makespan, start + prob.P[i].latency);
+  }
+  add(vars.col_T, makespan);
+  int bank_complement =
+      mip_start->z_bank.empty() ? 0 : (mip_start->z_bank[0] & 1);
+  for (int vv = 0; vv < static_cast<int>(vars.col_z.size()); ++vv) {
+    add(vars.col_z[vv], (mip_start->z_bank[vv] & 1) ^ bank_complement);
+  }
+
+  HighsStatus status =
+      highs.setSolution(HighsInt(index.size()), index.data(), value.data());
+  if (status == HighsStatus::kOk) {
+    LOG(INFO) << "[ILP] applied exact feasible MIP start for II=" << II
+              << " entries=" << index.size();
+  } else {
+    // A rejected start only disables the performance hint; the exact model
+    // and its optimality proof are unchanged.
+    LOG(WARNING) << "[ILP] HiGHS rejected MIP start for II=" << II;
+  }
+}
+
 SolveResult SolveFixedII(const Problem &prob, int II, bool optimize_t,
-                         int threads, const BankFlipMode &mode) {
-  auto solve_begin = std::chrono::steady_clock::now();
-  LOG(INFO) << "[ILP] start solve II=" << II << " optimize_t=" << optimize_t
-            << " N=" << prob.N << " edges=" << prob.dep_edges.size()
-            << " flows=" << prob.flows.size();
-  Highs highs;
-  ModelVars vars = BuildModel(highs, prob, II, optimize_t, threads, mode);
+                         int threads, const BankFlipMode &mode,
+                         const SolveResult *mip_start = nullptr) {
   bool model_vc_blocking_issue =
       tvm::transform::PassContext::Current()
           ->GetConfig<Bool>(tl::kSunmmioILPModelVCBlockingIssue, Bool(true))
           .value();
+  std::string cache_key =
+      MakeSolveCacheKey(prob, II, optimize_t, mode, model_vc_blocking_issue);
+  SolveResult cached;
+  if (LookupExactSolveCache(cache_key, &cached)) {
+    LOG(INFO) << "[ILP] exact cache hit II=" << II
+              << " optimize_t=" << optimize_t << " mode=" << mode.Id()
+              << " feasible=" << cached.ok;
+    return cached;
+  }
+
+  auto solve_begin = std::chrono::steady_clock::now();
+  LOG(INFO) << "[ILP] start solve II=" << II << " optimize_t=" << optimize_t
+            << " N=" << prob.N << " edges=" << prob.dependencies.size()
+            << " flows=" << prob.flows.size();
+  Highs highs;
+  ModelVars vars = BuildModel(highs, prob, II, optimize_t, threads, mode);
   int vc_issue_constraint_count = 0;
   if (model_vc_blocking_issue) {
     std::vector<int> vc_commands;
@@ -3380,7 +4347,8 @@ SolveResult SolveFixedII(const Problem &prob, int II, bool optimize_t,
           val.push_back(vc_set.count(cmd) ? 1.0 - double(prob.N) : 1.0);
         }
         for (int vc : vc_commands) {
-          idx.push_back(vars.col_a[vc][slot]);
+          idx.push_back(vars.col_resource_a.at(
+              {vc, static_cast<int>(IlpResourceType::kVectorCore)})[slot]);
           val.push_back(double(prob.N));
         }
         AddLeq(highs, idx, val, double(prob.N));
@@ -3390,6 +4358,7 @@ SolveResult SolveFixedII(const Problem &prob, int II, bool optimize_t,
   }
   LOG(INFO) << "[II=" << II
             << "] VC blocking-issue constraints=" << vc_issue_constraint_count;
+  ApplyMipStart(highs, prob, II, mode, vars, mip_start);
   highs.run();
   if (highs.getModelStatus() != HighsModelStatus::kOptimal) {
     auto solve_end = std::chrono::steady_clock::now();
@@ -3397,42 +4366,46 @@ SolveResult SolveFixedII(const Problem &prob, int II, bool optimize_t,
         std::chrono::duration<double>(solve_end - solve_begin).count();
     LOG(INFO) << "[II=" << II << "] infeasible/failed, elapsed=" << elapsed
               << "s, status=" << int(highs.getModelStatus());
+    if (highs.getModelStatus() == HighsModelStatus::kInfeasible) {
+      StoreExactSolveCache(cache_key, {});
+    }
     return {};
   }
 
   const HighsSolution &sol = highs.getSolution();
   SolveResult res;
   res.ok = true;
+  res.objective_optimized = optimize_t;
   res.II = II;
   res.bank_slot_period = 2 * II;
   res.bank_flip_mode = mode;
   res.vc_blocking_issue_modeled = model_vc_blocking_issue;
   res.vc_blocking_issue_constraints = vc_issue_constraint_count;
-  if (!optimize_t) {
-    auto solve_end = std::chrono::steady_clock::now();
-    double elapsed =
-        std::chrono::duration<double>(solve_end - solve_begin).count();
-    LOG(INFO) << "[II=" << II << "] feasible_only_elapsed=" << elapsed << "s";
-    return res;
-  }
   res.t.resize(prob.N);
   res.m.resize(prob.N);
   res.y.resize(prob.N);
+  int computed_makespan = 0;
   for (int i = 0; i < prob.N; ++i) {
     res.t[i] = int(std::llround(sol.col_value[vars.col_t[i]]));
     res.m[i] = int(std::llround(sol.col_value[vars.col_m[i]]));
     res.y[i] = int(std::llround(sol.col_value[vars.col_y[i]]));
+    computed_makespan =
+        std::max(computed_makespan, res.t[i] + prob.P[i].latency);
   }
-  res.makespan = int(std::llround(sol.col_value[vars.col_T]));
+  res.makespan = optimize_t ? int(std::llround(sol.col_value[vars.col_T]))
+                            : computed_makespan;
   res.internal_flow_ids = vars.internal_flow_ids;
   res.z_bank.resize(vars.internal_flow_ids.size(), 0);
   for (int vv = 0; vv < static_cast<int>(vars.internal_flow_ids.size()); ++vv) {
     res.z_bank[vv] = int(std::llround(sol.col_value[vars.col_z[vv]]));
   }
+  StoreExactSolveCache(cache_key, res);
   auto solve_end = std::chrono::steady_clock::now();
   double elapsed =
       std::chrono::duration<double>(solve_end - solve_begin).count();
-  LOG(INFO) << "[II=" << II << "] solve_elapsed=" << elapsed << "s";
+  LOG(INFO) << "[II=" << II << "] "
+            << (optimize_t ? "solve_elapsed=" : "feasible_only_elapsed=")
+            << elapsed << "s";
   return res;
 }
 
@@ -3447,8 +4420,27 @@ SolveResult FindMinimalIIForMode(const Problem &prob, int threads,
   if (search_end < search_begin) {
     return {};
   }
+  if (GetEnvBool("TL_SUNMMIO_ILP_TRY_RESOURCE_LB_FIRST", false)) {
+    LOG(INFO) << "[ILP] try exact optimized resource lower bound II="
+              << search_begin;
+    SolveResult lower_bound =
+        SolveFixedII(prob, search_begin, true, threads, mode);
+    if (lower_bound.ok) {
+      LOG(INFO) << "[ILP] resource lower bound is feasible and globally "
+                   "minimal II="
+                << search_begin;
+      return lower_bound;
+    }
+    // This exact solve proved the lower bound infeasible.  Do not ask a
+    // feasibility-only model to prove the same fact again.
+    ++search_begin;
+    if (search_begin > search_end) {
+      return {};
+    }
+  }
   constexpr int kInitialWindowSpan = 10;
   int best_ii = -1;
+  SolveResult best_feasible;
   LOG(INFO) << "[ILP] search start=" << search_begin << " end=" << search_end
             << " lb=" << lb << " initial_window_span=" << kInitialWindowSpan;
 
@@ -3465,6 +4457,7 @@ SolveResult FindMinimalIIForMode(const Problem &prob, int threads,
       SolveResult feas = SolveFixedII(prob, mid, false, threads, mode);
       if (feas.ok) {
         window_best = mid;
+        best_feasible = std::move(feas);
         LOG(INFO) << "[ILP] feasible II=" << mid;
         r = mid - 1;
       } else {
@@ -3482,7 +4475,8 @@ SolveResult FindMinimalIIForMode(const Problem &prob, int threads,
     return {};
   }
   LOG(INFO) << "[ILP] best feasible II=" << best_ii << " mode=" << mode.Id();
-  return SolveFixedII(prob, best_ii, false, threads, mode);
+  ICHECK(best_feasible.ok && best_feasible.II == best_ii);
+  return best_feasible;
 }
 
 BankFlipMode GuessBankFlipMode(const Problem &prob) {
@@ -3496,11 +4490,11 @@ BankFlipMode GuessBankFlipMode(const Problem &prob) {
     for (const CommandSpec &spec : prob.P) {
       if (CommandUsesResource(spec, write_resource)) {
         ++write_count;
-        write_time += spec.latency;
+        write_time += ResourceUsageDuration(spec, write_resource);
       }
       if (CommandUsesResource(spec, read_resource)) {
         ++read_count;
-        read_time += spec.latency;
+        read_time += ResourceUsageDuration(spec, read_resource);
       }
     }
     // Bank rotation normally follows the input-side command parity.  Only let
@@ -3512,6 +4506,92 @@ BankFlipMode GuessBankFlipMode(const Problem &prob) {
   };
   return {guess_for_mem(/*mem=*/0), guess_for_mem(/*mem=*/1)};
 }
+
+// The analysis set is an identity-membership set, not a stable serialization
+// order: ObjectRef::operator< compares heap addresses.  Export only the required
+// identities in deterministic function/AST order, without changing that set or
+// the solver.  In particular, do not merge different views sharing one data Var.
+class StableUsedBufferExporter : public StmtExprVisitor {
+public:
+  static Optional<Array<Buffer>> Export(const PrimFunc &func,
+                                       const std::set<Buffer> &required) {
+    StableUsedBufferExporter exporter(required);
+    // buffer_map is a Map; its iteration order is not part of this proof.
+    for (const Var &param : func->params) {
+      auto it = func->buffer_map.find(param);
+      if (it != func->buffer_map.end()) {
+        exporter.Record((*it).second);
+      }
+    }
+    exporter.VisitStmt(func->body);
+    if (exporter.seen_.size() != required.size()) {
+      return {};  // Never recover unknown provenance using heap order.
+    }
+    return exporter.ordered_;
+  }
+
+private:
+  explicit StableUsedBufferExporter(const std::set<Buffer> &required)
+      : required_(required) {}
+
+  void Record(const Buffer &buffer) {
+    if (required_.count(buffer) && seen_.insert(buffer.get()).second) {
+      ordered_.push_back(buffer);
+    }
+  }
+
+  void VisitStmt_(const BlockNode *op) final {
+    // These are ordered semantic fields, not the unordered annotations Map.
+    for (const Buffer &buffer : op->alloc_buffers) {
+      Record(buffer);
+    }
+    for (const MatchBufferRegion &match : op->match_buffers) {
+      Record(match->buffer);
+      Record(match->source->buffer);
+    }
+    for (const BufferRegion &region : op->reads) {
+      Record(region->buffer);
+    }
+    for (const BufferRegion &region : op->writes) {
+      Record(region->buffer);
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const DeclBufferNode *op) final {
+    Record(op->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const BufferRealizeNode *op) final {
+    Record(op->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    Record(op->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+    // This branch's default visitor does not traverse access predicates.
+    if (op->predicate.defined()) {
+      VisitExpr(op->predicate.value());
+    }
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    Record(op->buffer);
+    StmtExprVisitor::VisitExpr_(op);
+    if (op->predicate.defined()) {
+      VisitExpr(op->predicate.value());
+    }
+  }
+
+  // The ordinary visitor traverses Call args and statement/loop expressions in
+  // program order, but not Call/For/Block annotations or AttrStmt.node.  A Buffer
+  // reachable only through such metadata intentionally remains unproven.
+  const std::set<Buffer> &required_;
+  std::unordered_set<const BufferNode *> seen_;
+  Array<Buffer> ordered_;
+};
 
 // Converts each annotated SunMMIO pipeline loop in a PrimFunc into a periodic
 // scheduling Problem, solves it with HiGHS, and returns the same TIR loop with
@@ -3544,17 +4624,21 @@ private:
     return result;
   }
 
-  const SeqStmtNode *GetPipelineBodySeq(const For &loop) {
+  bool GetPipelineBodyStatements(const For &loop,
+                                 Array<Stmt> *statements) const {
     Stmt current = loop->body;
     if (const auto *realize = current.as<BlockRealizeNode>()) {
       current = realize->block->body;
     }
     while (true) {
       if (const auto *seq = current.as<SeqStmtNode>()) {
-        return seq;
+        *statements = seq->seq;
+        return true;
       }
       if (const auto *if_node = current.as<IfThenElseNode>()) {
-        ICHECK(!if_node->else_case.defined());
+        if (if_node->else_case.defined()) {
+          return false;
+        }
         current = if_node->then_case;
         continue;
       }
@@ -3562,9 +4646,65 @@ private:
         current = let_node->body;
         continue;
       }
-      return nullptr;
+      *statements = Array<Stmt>{current};
+      return true;
     }
   }
+
+  class PipelineNestInspector : public StmtVisitor {
+  public:
+    void Inspect(const Stmt &stmt) { VisitStmt(stmt); }
+
+    int max_depth{0};
+    bool dynamic_extent{false};
+    bool unsupported_kind{false};
+    bool indirect_nesting{false};
+
+  private:
+    void VisitStmt_(const ForNode *op) final {
+      const bool pipeline = op->annotations.count("num_stages");
+      if (pipeline) {
+        if (pipeline_depth_ > 0 && barrier_depth_ > 0) {
+          indirect_nesting = true;
+        }
+        ++pipeline_depth_;
+        max_depth = std::max(max_depth, pipeline_depth_);
+        arith::Analyzer analyzer;
+        PrimExpr extent = analyzer.Simplify(op->extent);
+        if (!extent.as<IntImmNode>()) {
+          dynamic_extent = true;
+        }
+        if (op->kind != ForKind::kSerial && op->kind != ForKind::kUnrolled) {
+          unsupported_kind = true;
+        }
+        StmtVisitor::VisitStmt_(op);
+        --pipeline_depth_;
+        return;
+      }
+      const bool separates_pipeline_loops = pipeline_depth_ > 0;
+      if (separates_pipeline_loops) {
+        ++barrier_depth_;
+      }
+      StmtVisitor::VisitStmt_(op);
+      if (separates_pipeline_loops) {
+        --barrier_depth_;
+      }
+    }
+
+    void VisitStmt_(const IfThenElseNode *op) final {
+      const bool separates_pipeline_loops = pipeline_depth_ > 0;
+      if (separates_pipeline_loops) {
+        ++barrier_depth_;
+      }
+      StmtVisitor::VisitStmt_(op);
+      if (separates_pipeline_loops) {
+        --barrier_depth_;
+      }
+    }
+
+    int pipeline_depth_{0};
+    int barrier_depth_{0};
+  };
 
   struct IlpLoopAnalysis {
     Problem prob;
@@ -3581,10 +4721,167 @@ private:
     std::map<std::string, int> runtime_bank_flip_modes;
     int iterations{0};
     bool graph_valid{false};
+    bool summary_v2_applied{false};
+    bool summary_data_frontiers_applied{false};
   };
 
-  IlpLoopAnalysis AnalyzeLoop(const For &loop,
-                              const SeqStmtNode *pipeline_body_seq,
+  bool ShouldEnableNestedPipeline() const {
+    auto pass_ctx = tvm::transform::PassContext::Current();
+    auto cfg =
+        pass_ctx->GetConfig<Bool>(tl::kSunmmioILPNestedPipeline, Bool(false));
+    return cfg.value()->value;
+  }
+
+  bool ShouldEnableNestedSummaryV2() const {
+    auto pass_ctx = tvm::transform::PassContext::Current();
+    auto cfg =
+        pass_ctx->GetConfig<Bool>(tl::kSunmmioILPNestedSummaryV2, Bool(false));
+    return cfg.value()->value;
+  }
+
+  For StripNumStages(const For &loop) const {
+    Map<String, Any> annotations = loop->annotations;
+    annotations.erase("num_stages");
+    For result = loop;
+    result.CopyOnWrite()->annotations = annotations;
+    return result;
+  }
+
+  Optional<String> FindNestedChildFailure(const Stmt &body) const {
+    Optional<String> failure;
+    PostOrderVisit(body, [&](const ObjectRef &obj) {
+      if (failure) {
+        return;
+      }
+      const auto *child = obj.as<ForNode>();
+      if (child == nullptr || !child->annotations.count(kPipelineRequested)) {
+        return;
+      }
+      auto applied = child->annotations.Get(kPipelineApplied);
+      if (!applied || !Downcast<Bool>(applied.value())->value) {
+        auto reason = child->annotations.Get(kPipelineFallbackReason);
+        failure = reason ? Downcast<String>(reason.value())
+                         : String("child_not_applied");
+        return;
+      }
+      if (!child->annotations.count(
+              "tl.sunmmio.pipeline.summary_raw_makespan")) {
+        failure = String("missing_child_summary");
+      }
+    });
+    return failure;
+  }
+
+  Optional<String>
+  ValidateNestedSummaryV2Inputs(const Array<Stmt> &pipeline_body) const {
+    if (!ShouldEnableNestedSummaryV2()) {
+      return {};
+    }
+    for (const Stmt &stmt : pipeline_body) {
+      const auto *child = stmt.as<ForNode>();
+      if (child == nullptr || !child->annotations.count(
+                                  "tl.sunmmio.pipeline.summary_raw_makespan")) {
+        continue;
+      }
+      auto observed =
+          child->annotations.Get("tl.sunmmio.pipeline.summary_v2_observed");
+      if (!observed || !Downcast<Bool>(observed.value())->value) {
+        return String("nested_summary_v2_not_observed");
+      }
+      if (!child->annotations.count(
+              "tl.sunmmio.pipeline.summary_resource_windows_raw")) {
+        return String("nested_summary_v2_missing_resource_windows");
+      }
+      if (!child->annotations.count(
+              "tl.sunmmio.pipeline.summary_buffer_frontiers_raw")) {
+        return String("nested_summary_v2_missing_buffer_frontiers");
+      }
+    }
+    return {};
+  }
+
+  Optional<String>
+  FindNestedSharedBuffers(const For &loop,
+                          std::vector<Buffer> *parent_owned_buffers) const {
+    Array<Stmt> body;
+    if (!GetPipelineBodyStatements(loop, &body)) {
+      return {};
+    }
+
+    std::set<Buffer> child_buffers;
+    std::set<Buffer> child_owned_buffers;
+    std::set<Buffer> outside_buffers;
+    std::set<Buffer> shared_buffers;
+    SunmmioStmtAccessAnalyzer access_analyzer(func_);
+    for (const Stmt &stmt : body) {
+      const auto *child = stmt.as<ForNode>();
+      const bool is_nested_child =
+          child != nullptr &&
+          child->annotations.count("tl.sunmmio.pipeline.summary_raw_makespan");
+      if (is_nested_child) {
+        auto used_buffers = child->annotations.Get("used_buffers");
+        if (!used_buffers) {
+          continue;
+        }
+        for (const Buffer &buffer :
+             Downcast<Array<Buffer>>(used_buffers.value())) {
+          if (child_buffers.count(buffer)) {
+            shared_buffers.insert(buffer);
+          }
+          child_buffers.insert(buffer);
+        }
+        for (const char *key :
+             {"versioned_buffers", "runtime_multiversion_buffers",
+              "runtime_banked_buffers"}) {
+          auto owned_buffers = child->annotations.Get(key);
+          if (!owned_buffers) {
+            continue;
+          }
+          for (const Buffer &buffer :
+               Downcast<Array<Buffer>>(owned_buffers.value())) {
+            child_owned_buffers.insert(buffer);
+          }
+        }
+        continue;
+      }
+
+      for (const AccessInfo &access :
+           access_analyzer.Collect(stmt, loop->loop_var)) {
+        Buffer buffer = access.buffer();
+        if (!IsGlobalBuffer(buffer)) {
+          outside_buffers.insert(buffer);
+        }
+      }
+    }
+
+    for (const Buffer &buffer : child_buffers) {
+      if (outside_buffers.count(buffer) &&
+          child_owned_buffers.count(buffer) == 0) {
+        if (std::find(parent_owned_buffers->begin(),
+                      parent_owned_buffers->end(),
+                      buffer) == parent_owned_buffers->end()) {
+          parent_owned_buffers->push_back(buffer);
+        }
+      } else if (outside_buffers.count(buffer)) {
+        shared_buffers.insert(buffer);
+      }
+    }
+    if (shared_buffers.empty()) {
+      return {};
+    }
+
+    std::set<std::string> names;
+    for (const Buffer &buffer : shared_buffers) {
+      names.insert(buffer->name);
+    }
+    std::string detail;
+    for (const std::string &name : names) {
+      detail += detail.empty() ? name : "," + name;
+    }
+    return String(detail);
+  }
+
+  IlpLoopAnalysis AnalyzeLoop(const For &loop, const Array<Stmt> &pipeline_body,
                               int forced_iterations = -1,
                               const BankFlipMode &mode = BankFlipMode{}) {
     IlpLoopAnalysis result;
@@ -3605,45 +4902,229 @@ private:
     ASTTraverser traverser(func_);
     SunmmioRoleMarker role_marker(traverser, func_);
     SunmmioStmtAccessAnalyzer access_analyzer(func_);
-    result.commands.reserve(pipeline_body_seq->seq.size());
+    CostModelContext cost_context = CostModel::BuildContext(func_);
+    const bool gem5_profile =
+        cost_context.options.profile == CostModelProfile::kGem5A4E2026;
+    result.commands.reserve(pipeline_body.size());
+
+    const bool multidim =
+        loop->annotations.find("tl.sunmmio.multidim.region") !=
+        loop->annotations.end();
+    int multidim_inner_min = 0;
+    int multidim_inner_extent = 0;
+    if (multidim) {
+      auto min = loop->annotations.Get("tl.sunmmio.multidim.inner_min");
+      auto extent = loop->annotations.Get("tl.sunmmio.multidim.inner_extent");
+      ICHECK(min.has_value() && extent.has_value());
+      IntImm min_imm = Downcast<IntImm>(min.value());
+      IntImm extent_imm = Downcast<IntImm>(extent.value());
+      multidim_inner_min = static_cast<int>(min_imm->value);
+      multidim_inner_extent = static_cast<int>(extent_imm->value);
+    }
+
+    Array<Buffer> parent_owned_buffers;
+    std::unordered_set<const BufferNode *> parent_owned;
+    auto parent_owned_buffers_anno =
+        loop->annotations.Get("tl.sunmmio.pipeline.parent_owned_buffers");
+    if (parent_owned_buffers_anno) {
+      parent_owned_buffers =
+          Downcast<Array<Buffer>>(parent_owned_buffers_anno.value());
+      for (const Buffer &buffer : parent_owned_buffers) {
+        parent_owned.insert(buffer.get());
+      }
+    }
 
     std::set<int> resource_set;
-    for (int i = 0; i < static_cast<int>(pipeline_body_seq->seq.size()); ++i) {
-      const Stmt &stmt = pipeline_body_seq->seq[i];
+    for (int i = 0; i < static_cast<int>(pipeline_body.size()); ++i) {
+      const Stmt &pipeline_stmt = pipeline_body[i];
+      Stmt stmt = pipeline_stmt;
+      int inner_coordinate = -1;
+      if (const auto *attr = pipeline_stmt.as<AttrStmtNode>()) {
+        if (attr->attr_key == "tl.sunmmio.multidim.inner_coordinate") {
+          const auto *coordinate = attr->value.as<IntImmNode>();
+          ICHECK(coordinate != nullptr);
+          inner_coordinate = static_cast<int>(coordinate->value);
+          stmt = attr->body;
+        }
+      }
+      Optional<Any> nested_raw_makespan;
+      Optional<Any> nested_resources;
+      Optional<Any> nested_resource_windows;
+      Optional<Any> nested_buffer_frontiers;
+      if (const auto *nested_loop = stmt.as<ForNode>()) {
+        nested_raw_makespan = nested_loop->annotations.Get(
+            "tl.sunmmio.pipeline.summary_raw_makespan");
+        nested_resources = nested_loop->annotations.Get(
+            "tl.sunmmio.pipeline.summary_resources");
+        nested_resource_windows = nested_loop->annotations.Get(
+            "tl.sunmmio.pipeline.summary_resource_windows_raw");
+        nested_buffer_frontiers = nested_loop->annotations.Get(
+            "tl.sunmmio.pipeline.summary_buffer_frontiers_raw");
+      }
       TemplateCommand cmd(i, stmt);
       role_marker(stmt);
       cmd.role = role_marker.GetRole(stmt);
       traverser.traverse_stmt(stmt);
-      cmd.type = HardwareMapper::Map(stmt);
       cmd.accesses = access_analyzer.Collect(stmt, loop->loop_var);
-      cmd.spec.latency =
-          static_cast<int>(std::ceil(CostModel::EstimateDelay(cmd.type, stmt)));
+      const bool is_nested_command = nested_raw_makespan && nested_resources;
+      cmd.inner_coordinate = inner_coordinate;
+      if (is_nested_command) {
+        // The child remains responsible for buffers used only inside its
+        // pipeline. The parent keeps only accesses that connect the atomic
+        // child command to sibling statements, such as clear/compute/writeback
+        // through a parent-owned accumulator.
+        cmd.accesses.erase(
+            std::remove_if(cmd.accesses.begin(), cmd.accesses.end(),
+                           [&](const AccessInfo &access) {
+                             return parent_owned.count(access.buffer().get()) ==
+                                    0;
+                           }),
+            cmd.accesses.end());
+        cmd.type = DeviceType::Unspecified;
+        cmd.cost_estimate.latency_cycles =
+            Downcast<IntImm>(nested_raw_makespan.value())->value;
+        cmd.cost_estimate.issue_finish_cycles =
+            cmd.cost_estimate.latency_cycles;
+        cmd.cost_estimate.profile =
+            CostModel::ProfileName(cost_context.options.profile);
+        cmd.cost_estimate.model_version = "nested_pipeline_summary_v1";
+        cmd.cost_estimate.latency_source =
+            "nested_pipeline_conservative_makespan";
+        cmd.cost_estimate.op_kind = "nested_pipeline";
+        cmd.cost_estimate.resource_overlap_modeled = true;
+        for (const Integer &resource :
+             Downcast<Array<Integer>>(nested_resources.value())) {
+          cmd.spec.resources.push_back(static_cast<int>(resource->value));
+        }
+        if (ShouldEnableNestedSummaryV2()) {
+          ICHECK(nested_resource_windows)
+              << "summary v2 resource windows must be validated before "
+                 "analysis";
+          std::set<int> window_resources;
+          const int raw_makespan = cmd.cost_estimate.latency_cycles;
+          for (const Array<Integer> &window : Downcast<Array<Array<Integer>>>(
+                   nested_resource_windows.value())) {
+            ICHECK_EQ(window.size(), 3U);
+            int resource = static_cast<int>(window[0]->value);
+            int start = static_cast<int>(window[1]->value);
+            int end = static_cast<int>(window[2]->value);
+            ICHECK_GE(start, 0);
+            ICHECK_GT(end, start);
+            ICHECK_LE(end, raw_makespan);
+            cmd.spec.resource_windows[resource].push_back({start, end});
+            window_resources.insert(resource);
+          }
+          for (int resource : cmd.spec.resources) {
+            ICHECK(window_resources.count(resource))
+                << "summary v2 lacks a window for resource " << resource;
+            cmd.spec.resource_windows[resource] = NormalizeResourceWindows(
+                std::move(cmd.spec.resource_windows[resource]));
+          }
+          ICHECK_EQ(window_resources.size(), cmd.spec.resources.size());
+          ICHECK(nested_buffer_frontiers)
+              << "summary v2 buffer frontiers must be validated before "
+                 "analysis";
+          Map<Buffer, Array<Integer>> buffer_frontiers =
+              Downcast<Map<Buffer, Array<Integer>>>(
+                  nested_buffer_frontiers.value());
+          std::map<std::string, Array<Integer>> buffer_frontiers_by_name;
+          for (const auto &entry : buffer_frontiers) {
+            buffer_frontiers_by_name[entry.first->name] = entry.second;
+          }
+          for (AccessInfo &access : cmd.accesses) {
+            auto frontier =
+                buffer_frontiers_by_name.find(access.buffer()->name);
+            ICHECK(frontier != buffer_frontiers_by_name.end())
+                << "summary v2 lacks buffer frontier for "
+                << access.buffer()->name;
+            ICHECK_EQ(frontier->second.size(), 4U);
+            int first = static_cast<int>(
+                frontier->second[access.is_write ? 2 : 0]->value);
+            int last = static_cast<int>(
+                frontier->second[access.is_write ? 3 : 1]->value);
+            ICHECK_GE(first, 0);
+            ICHECK_GE(last, first);
+            ICHECK_LE(last, raw_makespan);
+            access.first_offset = first;
+            access.last_offset = last;
+          }
+          cmd.cost_estimate.model_version =
+              "nested_pipeline_summary_v2_resource_windows_data_frontiers";
+          cmd.cost_estimate.latency_source =
+              "nested_pipeline_resource_windows_data_frontiers";
+          result.summary_v2_applied = true;
+          result.summary_data_frontiers_applied =
+              result.summary_data_frontiers_applied || !cmd.accesses.empty();
+        }
+      } else {
+        cmd.type = HardwareMapper::Map(stmt);
+        cmd.cost_estimate = CostModel::Estimate(cmd.type, stmt, cost_context);
+        cmd.spec.resources = BuildIlpResources(stmt, cmd.type, cmd.accesses);
+      }
+      ICHECK_LE(cmd.cost_estimate.latency_cycles,
+                static_cast<int64_t>(std::numeric_limits<int>::max()))
+          << "ILP command latency exceeds int range";
+      cmd.spec.latency = static_cast<int>(cmd.cost_estimate.latency_cycles);
       cmd.spec.latency = std::max(cmd.spec.latency, 1);
-      cmd.spec.resources = BuildIlpResources(stmt, cmd.type, cmd.accesses);
       cmd.spec.name = cmd.name + ": " + SummarizeStmtForName(stmt);
       for (int resource : cmd.spec.resources) {
         resource_set.insert(resource);
       }
-      for (const BufferRegion &read : traverser.read_buffer_regions_) {
-        if (!IsGlobalBuffer(read->buffer)) {
-          result.used_buffers.insert(read->buffer);
+      if (is_nested_command) {
+        for (const AccessInfo &access : cmd.accesses) {
+          if (!IsGlobalBuffer(access.buffer())) {
+            result.used_buffers.insert(access.buffer());
+          }
         }
-      }
-      for (const BufferRegion &write : traverser.write_buffer_regions_) {
-        if (!IsGlobalBuffer(write->buffer)) {
-          result.used_buffers.insert(write->buffer);
+      } else {
+        for (const BufferRegion &read : traverser.read_buffer_regions_) {
+          if (!IsGlobalBuffer(read->buffer)) {
+            result.used_buffers.insert(read->buffer);
+          }
+        }
+        for (const BufferRegion &write : traverser.write_buffer_regions_) {
+          if (!IsGlobalBuffer(write->buffer)) {
+            result.used_buffers.insert(write->buffer);
+          }
         }
       }
       result.commands.push_back(cmd);
     }
 
+    if (multidim) {
+      int first_marked = -1;
+      int last_marked = -1;
+      for (int i = 0; i < static_cast<int>(result.commands.size()); ++i) {
+        if (result.commands[i].inner_coordinate >= 0) {
+          if (first_marked < 0) {
+            first_marked = i;
+          }
+          last_marked = i;
+        }
+      }
+      ICHECK_GE(first_marked, 0);
+      int current = multidim_inner_min;
+      for (int i = 0; i < static_cast<int>(result.commands.size()); ++i) {
+        if (result.commands[i].inner_coordinate >= 0) {
+          current = result.commands[i].inner_coordinate;
+        } else if (i > last_marked) {
+          current = multidim_inner_min + multidim_inner_extent - 1;
+        }
+        result.commands[i].inner_coordinate = current;
+      }
+    }
+
     result.prob.N = static_cast<int>(result.commands.size());
     result.prob.P.resize(result.prob.N);
+    result.prob.multidim = multidim;
+    result.prob.command_inner_coordinates.reserve(result.prob.N);
     for (const TemplateCommand &cmd : result.commands) {
       result.prob.P[cmd.id] = cmd.spec;
+      result.prob.command_inner_coordinates.push_back(cmd.inner_coordinate);
     }
 
     int faster = 0;
+    bool auto_faster_selected = false;
     std::vector<int> bump_indices;
     {
       auto pass_ctx = tvm::transform::PassContext::Current();
@@ -3655,8 +5136,9 @@ private:
     if (faster <= 0) {
       faster = GetEnvInt("TL_SUNMMIO_FASTER", 0);
     }
-    if (faster <= 0) {
+    if (faster <= 0 && !gem5_profile) {
       auto auto_selected = AutoSelectSunmmioILPFaster(result.prob.P);
+      auto_faster_selected = true;
       faster = auto_selected.first;
       bump_indices = std::move(auto_selected.second);
     }
@@ -3672,13 +5154,33 @@ private:
       if (bump_index_set.count(i)) {
         result.commands[i].spec.latency += 1;
       }
+      for (AccessInfo &access : result.commands[i].accesses) {
+        if (access.first_offset < 0) {
+          access.first_offset =
+              access.is_write ? result.commands[i].spec.latency : 0;
+        }
+        if (access.last_offset < 0) {
+          access.last_offset = result.commands[i].spec.latency;
+        }
+      }
       total_latency += result.commands[i].spec.latency;
       latency_gcd = latency_gcd == 0
                         ? result.commands[i].spec.latency
                         : GcdInt(latency_gcd, result.commands[i].spec.latency);
     }
 
-    if (latency_gcd <= 0) {
+    bool enable_latency_gcd = !gem5_profile || multidim;
+    {
+      auto pass_ctx = tvm::transform::PassContext::Current();
+      auto cfg = pass_ctx->GetConfig<Bool>(tl::kSunmmioILPEnableLatencyGCD);
+      if (cfg.defined()) {
+        enable_latency_gcd = cfg.value()->value;
+      } else if (std::getenv("TL_SUNMMIO_ILP_ENABLE_LATENCY_GCD") != nullptr) {
+        enable_latency_gcd = GetEnvBool(
+            "TL_SUNMMIO_ILP_ENABLE_LATENCY_GCD", enable_latency_gcd);
+      }
+    }
+    if (latency_gcd <= 0 || !enable_latency_gcd) {
       latency_gcd = 1;
     }
     for (TemplateCommand &cmd : result.commands) {
@@ -3686,10 +5188,45 @@ private:
       if (faster > 1) {
         cmd.spec.latency = CeilDiv(cmd.spec.latency, faster);
       }
+      ScaleResourceWindows(&cmd.spec,
+                           static_cast<int64_t>(std::max(1, latency_gcd)) *
+                               static_cast<int64_t>(std::max(1, faster)));
+      ScaleAccessFrontiers(&cmd.accesses,
+                           static_cast<int64_t>(std::max(1, latency_gcd)) *
+                               static_cast<int64_t>(std::max(1, faster)),
+                           cmd.spec.latency);
+      cmd.cost_estimate.solver_scale_factor = faster;
+      cmd.cost_estimate.solver_latency_cycles = cmd.spec.latency;
+      cmd.cost_estimate.solver_scaled = faster > 1;
     }
-    total_latency /= latency_gcd;
-    if (faster > 1) {
-      total_latency = CeilDiv(total_latency, faster);
+    result.prob.cost_model_profile =
+        CostModel::ProfileName(cost_context.options.profile);
+    result.prob.preserve_absolute_cycles =
+        cost_context.options.preserve_absolute_cycles;
+    result.prob.solver_scale_factor = faster;
+    result.prob.solver_scaled = faster > 1;
+    result.prob.latency_gcd_enabled = enable_latency_gcd;
+    result.prob.latency_gcd = latency_gcd;
+    result.prob.auto_faster_selected = auto_faster_selected;
+    result.prob.planner_fallback = false;
+    result.prob.fallback_used = false;
+    result.prob.cost_estimates.clear();
+    result.prob.cost_estimates.reserve(result.commands.size());
+    for (const TemplateCommand &cmd : result.commands) {
+      result.prob.cost_estimates.push_back(cmd.cost_estimate);
+      result.prob.fallback_used =
+          result.prob.fallback_used || cmd.cost_estimate.used_fallback;
+    }
+    if (gem5_profile) {
+      total_latency = 0;
+      for (const TemplateCommand &cmd : result.commands) {
+        total_latency += cmd.spec.latency;
+      }
+    } else {
+      total_latency /= latency_gcd;
+      if (faster > 1) {
+        total_latency = CeilDiv(total_latency, faster);
+      }
     }
 
     result.prob.Tmax = total_latency + 10;
@@ -3701,6 +5238,13 @@ private:
       result.prob.P[cmd.id] = cmd.spec;
     }
     result.versioned_buffers = DetectVersionedBuffers(result.commands);
+    for (const Buffer &buffer : parent_owned_buffers) {
+      if (std::find(result.versioned_buffers.begin(),
+                    result.versioned_buffers.end(),
+                    buffer) == result.versioned_buffers.end()) {
+        result.versioned_buffers.push_back(buffer);
+      }
+    }
     std::sort(
         result.versioned_buffers.begin(), result.versioned_buffers.end(),
         [](const Buffer &a, const Buffer &b) { return a->name < b->name; });
@@ -3730,10 +5274,9 @@ private:
 
   StageShrinkResult
   FindMinimalIIAcrossFlipModes(const For &loop,
-                               const SeqStmtNode *pipeline_body_seq,
-                               int threads, int forced_iterations = -1) {
-    IlpLoopAnalysis seed =
-        AnalyzeLoop(loop, pipeline_body_seq, forced_iterations);
+                               const Array<Stmt> &pipeline_body, int threads,
+                               int forced_iterations = -1) {
+    IlpLoopAnalysis seed = AnalyzeLoop(loop, pipeline_body, forced_iterations);
     // Try every physical-bank rotation policy.  Both modes allocate
     // ceil(iterations / 2) versions per bank.  Flip advances the version every
     // two iterations while rotating banks; non-flip advances the version on
@@ -3754,29 +5297,41 @@ private:
       modes = {BankFlipMode{(forced_mode & 2) != 0, (forced_mode & 1) != 0}};
     }
 
+    const int global_resource_lb = ResourceLowerBound(seed.prob);
     StageShrinkResult best;
     for (size_t index = 0; index < modes.size(); ++index) {
       const BankFlipMode &mode = modes[index];
       IlpLoopAnalysis candidate_analysis =
-          AnalyzeLoop(loop, pipeline_body_seq, forced_iterations, mode);
+          AnalyzeLoop(loop, pipeline_body, forced_iterations, mode);
       if (!candidate_analysis.graph_valid) {
         continue;
       }
-      SolveResult candidate;
-      if (!best.sol.ok || index == 0) {
-        candidate =
-            FindMinimalIIForMode(candidate_analysis.prob, threads, mode);
-      } else if (best.sol.II > 1) {
-        SolveResult probe = SolveFixedII(candidate_analysis.prob,
-                                         best.sol.II - 1, false, threads, mode);
-        if (probe.ok) {
-          candidate = FindMinimalIIForMode(candidate_analysis.prob, threads,
-                                           mode, best.sol.II - 1);
+      SolveResult candidate = TryFastVerifiedSchedule(
+          candidate_analysis.prob, mode, best.sol.ok ? best.sol.II - 1 : -1);
+      if (!candidate.ok && !best.sol.fast_verified_schedule) {
+        if (!best.sol.ok || index == 0) {
+          candidate =
+              FindMinimalIIForMode(candidate_analysis.prob, threads, mode);
+        } else if (best.sol.II > 1) {
+          SolveResult probe = SolveFixedII(
+              candidate_analysis.prob, best.sol.II - 1, false, threads, mode);
+          if (probe.ok) {
+            candidate = FindMinimalIIForMode(candidate_analysis.prob, threads,
+                                             mode, best.sol.II - 1);
+          }
         }
       }
       if (candidate.ok && (!best.sol.ok || candidate.II < best.sol.II)) {
         best.analysis = std::move(candidate_analysis);
         best.sol = std::move(candidate);
+      }
+      if (best.sol.ok && best.sol.II == global_resource_lb) {
+        // ResourceLowerBound is independent of bank flip policy.  No
+        // remaining mode can improve a solution that already attains it.
+        LOG(INFO) << "[ILP] stop flip-mode search at global resource lower "
+                     "bound II="
+                  << global_resource_lb;
+        break;
       }
     }
     if (!best.sol.ok) {
@@ -3822,10 +5377,10 @@ private:
   }
 
   StageShrinkResult SolveWithStageShrink(const For &loop,
-                                         const SeqStmtNode *pipeline_body_seq,
+                                         const Array<Stmt> &pipeline_body,
                                          int threads) {
     StageShrinkResult mode_result =
-        FindMinimalIIAcrossFlipModes(loop, pipeline_body_seq, threads);
+        FindMinimalIIAcrossFlipModes(loop, pipeline_body, threads);
     IlpLoopAnalysis base_analysis = std::move(mode_result.analysis);
     SolveResult base_sol = std::move(mode_result.sol);
     MaybeExportProblemJsonForStage(base_analysis.prob, debug_,
@@ -3838,8 +5393,8 @@ private:
     BankFlipMode fixed_mode = base_sol.bank_flip_mode;
     for (int candidate_iterations = base_analysis.iterations - 1;
          candidate_iterations >= 1; --candidate_iterations) {
-      IlpLoopAnalysis candidate_analysis = AnalyzeLoop(
-          loop, pipeline_body_seq, candidate_iterations, fixed_mode);
+      IlpLoopAnalysis candidate_analysis =
+          AnalyzeLoop(loop, pipeline_body, candidate_iterations, fixed_mode);
       MaybeExportProblemJsonForStage(candidate_analysis.prob, debug_,
                                      candidate_iterations);
       SolveResult feas = SolveFixedII(candidate_analysis.prob, base_sol.II,
@@ -3851,7 +5406,7 @@ private:
     }
 
     IlpLoopAnalysis final_analysis =
-        AnalyzeLoop(loop, pipeline_body_seq, best_iterations, fixed_mode);
+        AnalyzeLoop(loop, pipeline_body, best_iterations, fixed_mode);
     MaybeExportProblemJsonForStage(final_analysis.prob, debug_,
                                    final_analysis.iterations);
     SolveResult final_sol = SolveFixedII(final_analysis.prob, base_sol.II, true,
@@ -3993,13 +5548,13 @@ private:
           if (!uses_write && !uses_read) {
             continue;
           }
-          int occ =
-              ComputeFoldedOccupancy(sol.t[i], spec.latency, sol.II, slot);
           if (uses_write) {
-            write_use += occ;
+            write_use += ComputeFoldedResourceOccupancy(spec, write_resource,
+                                                        sol.t[i], sol.II, slot);
           }
           if (uses_read) {
-            read_use += occ;
+            read_use += ComputeFoldedResourceOccupancy(spec, read_resource,
+                                                       sol.t[i], sol.II, slot);
           }
         }
         if (write_use > 0 && read_use > 0) {
@@ -4035,6 +5590,75 @@ private:
       return StmtExprMutator::VisitStmt_(op);
     }
 
+    const std::string pipeline_mode =
+        op->annotations.find("tl.sunmmio.multidim.region") !=
+                op->annotations.end() ? "multidim_ilp" : "ilp";
+
+    const bool nested_enabled = ShouldEnableNestedPipeline();
+    PipelineNestInspector nest;
+    nest.Inspect(loop);
+    const bool has_nested_pipeline = nest.max_depth > 1;
+    bool planned_children_first = false;
+    if (!nested_enabled && has_nested_pipeline) {
+      Stmt body = this->VisitStmt(op->body);
+      loop.CopyOnWrite()->body = body;
+      For sequential = StripNumStages(loop);
+      return MakePipelineFallback(sequential, pipeline_mode, "nested_validation",
+                                  "nested_feature_disabled");
+    }
+
+    if (nested_enabled && has_nested_pipeline) {
+      std::string fallback_reason;
+      if (nest.max_depth > 3) {
+        fallback_reason = "nested_depth_unsupported";
+      } else if (nest.dynamic_extent) {
+        fallback_reason = "nested_dynamic_extent_unsupported";
+      } else if (nest.unsupported_kind) {
+        fallback_reason = "nested_loop_kind_unsupported";
+      } else if (nest.indirect_nesting) {
+        fallback_reason = "nested_control_flow_unsupported";
+      }
+      if (!fallback_reason.empty()) {
+        For sequential = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+        sequential = StripNumStages(sequential);
+        return MakePipelineFallback(sequential, pipeline_mode, "nested_validation",
+                                    fallback_reason);
+      }
+
+      // ASC-NEST phase 1: plan descendants before building the parent
+      // problem. A planned child is represented in the parent as one
+      // conservative command that occupies every resource used by the child
+      // for the child's complete makespan.
+      Stmt body = this->VisitStmt(op->body);
+      loop.CopyOnWrite()->body = body;
+      Optional<String> child_failure = FindNestedChildFailure(body);
+      if (child_failure) {
+        For sequential = StripNumStages(loop);
+        return MakePipelineFallback(
+            sequential, PipelineDiagnostic{false, pipeline_mode, "nested_validation",
+                                           "nested_child_fallback",
+                                           std::string(child_failure.value())});
+      }
+      std::vector<Buffer> parent_owned_buffers;
+      Optional<String> shared_buffers =
+          FindNestedSharedBuffers(loop, &parent_owned_buffers);
+      if (!parent_owned_buffers.empty()) {
+        Array<Buffer> annotation(parent_owned_buffers.begin(),
+                                 parent_owned_buffers.end());
+        loop.CopyOnWrite()->annotations.Set(
+            "tl.sunmmio.pipeline.parent_owned_buffers", annotation);
+      }
+      if (shared_buffers) {
+        For sequential = StripNumStages(loop);
+        return MakePipelineFallback(
+            sequential,
+            PipelineDiagnostic{false, pipeline_mode, "nested_validation",
+                               "nested_shared_buffer_unsupported",
+                               std::string(shared_buffers.value())});
+      }
+      planned_children_first = true;
+    }
+
     // A single logical iteration has no cross-iteration overlap to schedule.
     // Leaving it in the ILP window model can manufacture an out-of-range
     // prologue/epilogue iteration when the solved makespan spans two IIs.
@@ -4050,16 +5674,18 @@ private:
         }
       }
       sequential.CopyOnWrite()->annotations = annotations;
-      return MakePipelineFallback(sequential, "ilp", "planning",
+      return MakePipelineFallback(sequential, pipeline_mode, "planning",
                                   "short_extent_unsupported");
     }
 
-    const SeqStmtNode *pipeline_body_seq = GetPipelineBodySeq(loop);
-    ICHECK(pipeline_body_seq != nullptr)
-        << "Pipeline body must normalize to SeqStmt.";
-    for (const Stmt &stmt : pipeline_body_seq->seq) {
+    Array<Stmt> pipeline_body;
+    if (!GetPipelineBodyStatements(loop, &pipeline_body)) {
+      return MakePipelineFallback(loop, pipeline_mode, "planning",
+                                  "unsupported_statement");
+    }
+    for (const Stmt &stmt : pipeline_body) {
       if (!stmt.as<BlockRealizeNode>() && !stmt.as<EvaluateNode>() &&
-          !stmt.as<ForNode>()) {
+          !stmt.as<ForNode>() && !stmt.as<AttrStmtNode>()) {
         For sequential = Downcast<For>(StmtExprMutator::VisitStmt_(op));
         Map<String, Any> annotations;
         for (const auto &kv : sequential->annotations) {
@@ -4068,38 +5694,56 @@ private:
           }
         }
         sequential.CopyOnWrite()->annotations = annotations;
-        return MakePipelineFallback(sequential, "ilp", "planning",
+        return MakePipelineFallback(sequential, pipeline_mode, "planning",
                                     "unsupported_statement");
       }
+    }
+    Optional<String> invalid_summary_v2 =
+        ValidateNestedSummaryV2Inputs(pipeline_body);
+    if (invalid_summary_v2) {
+      For sequential = StripNumStages(loop);
+      return MakePipelineFallback(
+          sequential,
+          PipelineDiagnostic{false, pipeline_mode, "nested_validation",
+                             "nested_summary_v2_unavailable",
+                             std::string(invalid_summary_v2.value())});
     }
     int threads = GetEnvInt("HIGHS_THREADS", 20);
     IlpLoopAnalysis analysis;
     SolveResult sol;
     if (ShouldEnableStageShrink()) {
       StageShrinkResult shrink_result =
-          SolveWithStageShrink(loop, pipeline_body_seq, threads);
+          SolveWithStageShrink(loop, pipeline_body, threads);
       analysis = std::move(shrink_result.analysis);
       sol = std::move(shrink_result.sol);
     } else {
       StageShrinkResult mode_result =
-          FindMinimalIIAcrossFlipModes(loop, pipeline_body_seq, threads);
+          FindMinimalIIAcrossFlipModes(loop, pipeline_body, threads);
       analysis = std::move(mode_result.analysis);
       SolveResult min_ii = std::move(mode_result.sol);
+      if (min_ii.ok && analysis.summary_v2_applied && extent != nullptr) {
+        min_ii = RefineV2FiniteHorizonSchedule(
+            analysis.prob, min_ii, static_cast<int64_t>(extent->value));
+      }
       MaybeExportProblemJson(analysis.prob, debug_);
       if (min_ii.ok) {
-        sol = SolveFixedII(analysis.prob, min_ii.II, true, threads,
-                           min_ii.bank_flip_mode);
+        if (min_ii.objective_optimized || min_ii.fast_verified_schedule) {
+          sol = std::move(min_ii);
+        } else {
+          sol = SolveFixedII(analysis.prob, min_ii.II, true, threads,
+                             min_ii.bank_flip_mode, &min_ii);
+        }
       }
     }
     if (!analysis.graph_valid) {
-      return MakePipelineFallback(loop, "ilp", "graph_validation",
+      return MakePipelineFallback(loop, pipeline_mode, "graph_validation",
                                   "incomplete_access_info");
     }
     if (GetEnvBool("TL_SUNMMIO_ILP_EXPORT_ONLY", false)) {
       return loop;
     }
     if (!sol.ok) {
-      return MakePipelineFallback(loop, "ilp", "planning", "ilp_infeasible");
+      return MakePipelineFallback(loop, pipeline_mode, "planning", "ilp_infeasible");
     }
     PopulateRuntimeBankMetadata(&analysis, sol);
     std::unordered_set<std::string> resident_buffer_names;
@@ -4132,7 +5776,7 @@ private:
     // PruneUnnecessaryRuntimeBanking(&analysis, sol);
     SolutionVerifyResult verify = VerifySolution(analysis.prob, sol);
     if (!verify.ok) {
-      return MakePipelineFallback(loop, "ilp", "planning",
+      return MakePipelineFallback(loop, pipeline_mode, "planning",
                                   "schedule_verification_failed");
     }
     std::string solution_json_path =
@@ -4148,20 +5792,20 @@ private:
     }
     if (debug_) {
       LOG(INFO) << "ILP problem N=" << analysis.prob.N
-                << " dep_edges=" << analysis.prob.dep_edges.size()
+                << " dependencies=" << analysis.prob.dependencies.size()
                 << " flows=" << analysis.prob.flows.size()
                 << " solved=" << sol.ok << " ii=" << sol.II;
     }
 
     Map<String, Any> annotations;
-    for (const auto &kv : op->annotations) {
+    for (const auto &kv : loop->annotations) {
       if (kv.first != "num_stages" && kv.first != "versioned_buffers") {
         annotations.Set(kv.first, kv.second);
       }
     }
 
     int stage_count = CeilDiv(sol.makespan, std::max(1, sol.II));
-    SetPipelineAppliedAnnotations(&annotations, "ilp");
+    SetPipelineAppliedAnnotations(&annotations, pipeline_mode);
     auto pass_ctx = tvm::transform::PassContext::Current();
     bool enable_lifetime_pruning =
         pass_ctx
@@ -4258,10 +5902,166 @@ private:
     annotations.Set("prologue_orders", prologue_orders);
     annotations.Set("body_orders", body_orders);
     annotations.Set("epilogue_orders", epilogue_orders);
+    Array<Integer> command_start_times;
+    Array<Integer> command_emit_priorities;
+    for (int id = 0; id < analysis.prob.N; ++id) {
+      command_start_times.push_back(Integer(sol.t[id]));
+      command_emit_priorities.push_back(Integer(command_priority(id)));
+    }
+    // Phase 4 composes already-solved 1D schedules across an outer boundary.
+    // Keep the inner solver result explicit so composition never re-solves a
+    // flattened multi-dimensional problem.
+    annotations.Set("tl.sunmmio.pipeline.command_start_times",
+                    command_start_times);
+    annotations.Set("tl.sunmmio.pipeline.command_emit_priorities",
+                    command_emit_priorities);
 
-    Array<Buffer> used_buffers_array(analysis.used_buffers.begin(),
-                                     analysis.used_buffers.end());
-    annotations.Set("used_buffers", used_buffers_array);
+    if (nested_enabled) {
+      const int64_t raw_scale =
+          static_cast<int64_t>(std::max(1, analysis.prob.latency_gcd)) *
+          static_cast<int64_t>(std::max(1, analysis.prob.solver_scale_factor));
+      const int64_t raw_makespan =
+          static_cast<int64_t>(sol.makespan) * raw_scale;
+      const int64_t raw_ii = static_cast<int64_t>(sol.II) * raw_scale;
+      ICHECK_LE(raw_makespan,
+                static_cast<int64_t>(std::numeric_limits<int>::max()));
+      ICHECK_LE(raw_ii, static_cast<int64_t>(std::numeric_limits<int>::max()));
+      Array<Integer> summary_resources;
+      for (int resource : analysis.prob.R) {
+        summary_resources.push_back(Integer(resource));
+      }
+      annotations.Set("tl.sunmmio.pipeline.region_id",
+                      String("asc_nest_" + std::to_string(next_region_id_++)));
+      annotations.Set("tl.sunmmio.pipeline.nested_depth",
+                      Integer(nest.max_depth));
+      annotations.Set("tl.sunmmio.pipeline.summary_raw_makespan",
+                      Integer(raw_makespan));
+      annotations.Set("tl.sunmmio.pipeline.summary_raw_ii", Integer(raw_ii));
+      annotations.Set("tl.sunmmio.pipeline.summary_resources",
+                      summary_resources);
+      annotations.Set("tl.sunmmio.pipeline.summary_solver_scale",
+                      Integer(analysis.prob.solver_scale_factor));
+      annotations.Set("tl.sunmmio.pipeline.summary_latency_gcd",
+                      Integer(analysis.prob.latency_gcd));
+
+      if (ShouldEnableNestedSummaryV2()) {
+        std::map<int, std::vector<std::pair<int64_t, int64_t>>>
+            resource_windows;
+        for (const TemplateCommand &cmd : analysis.commands) {
+          for (int resource : analysis.prob.P[cmd.id].resources) {
+            auto windows =
+                analysis.prob.P[cmd.id].resource_windows.find(resource);
+            if (windows == analysis.prob.P[cmd.id].resource_windows.end()) {
+              const int64_t start =
+                  static_cast<int64_t>(sol.t[cmd.id]) * raw_scale;
+              const int64_t end =
+                  static_cast<int64_t>(sol.t[cmd.id] +
+                                       analysis.prob.P[cmd.id].latency) *
+                  raw_scale;
+              resource_windows[resource].push_back({start, end});
+              continue;
+            }
+            for (const auto &window : windows->second) {
+              const int64_t start =
+                  static_cast<int64_t>(sol.t[cmd.id] + window.first) *
+                  raw_scale;
+              const int64_t end =
+                  static_cast<int64_t>(sol.t[cmd.id] + window.second) *
+                  raw_scale;
+              resource_windows[resource].push_back({start, end});
+            }
+          }
+        }
+
+        Array<Array<Integer>> summary_resource_windows;
+        for (auto &resource_entry : resource_windows) {
+          auto &windows = resource_entry.second;
+          std::sort(windows.begin(), windows.end());
+          std::vector<std::pair<int64_t, int64_t>> merged;
+          for (const auto &window : windows) {
+            if (merged.empty() || window.first > merged.back().second) {
+              merged.push_back(window);
+            } else {
+              merged.back().second =
+                  std::max(merged.back().second, window.second);
+            }
+          }
+          for (const auto &window : merged) {
+            summary_resource_windows.push_back({Integer(resource_entry.first),
+                                                Integer(window.first),
+                                                Integer(window.second)});
+          }
+        }
+
+        struct BufferFrontier {
+          Buffer buffer;
+          int64_t first_read{-1};
+          int64_t last_read_end{-1};
+          int64_t first_write_ready{-1};
+          int64_t last_write_ready{-1};
+        };
+        std::map<std::string, BufferFrontier> buffer_frontiers;
+        for (const TemplateCommand &cmd : analysis.commands) {
+          for (const AccessInfo &access : cmd.accesses) {
+            if (IsGlobalBuffer(access.buffer())) {
+              continue;
+            }
+            const int64_t first =
+                static_cast<int64_t>(sol.t[cmd.id] + access.first_offset) *
+                raw_scale;
+            const int64_t last =
+                static_cast<int64_t>(sol.t[cmd.id] + access.last_offset) *
+                raw_scale;
+            BufferFrontier &frontier = buffer_frontiers[access.buffer()->name];
+            frontier.buffer = access.buffer();
+            if (access.is_write) {
+              frontier.first_write_ready =
+                  frontier.first_write_ready < 0
+                      ? first
+                      : std::min(frontier.first_write_ready, first);
+              frontier.last_write_ready =
+                  std::max(frontier.last_write_ready, last);
+            } else {
+              frontier.first_read = frontier.first_read < 0
+                                        ? first
+                                        : std::min(frontier.first_read, first);
+              frontier.last_read_end = std::max(frontier.last_read_end, last);
+            }
+          }
+        }
+
+        Map<Buffer, Array<Integer>> summary_buffer_frontiers;
+        for (const auto &entry : buffer_frontiers) {
+          const BufferFrontier &frontier = entry.second;
+          summary_buffer_frontiers.Set(frontier.buffer,
+                                       {Integer(frontier.first_read),
+                                        Integer(frontier.last_read_end),
+                                        Integer(frontier.first_write_ready),
+                                        Integer(frontier.last_write_ready)});
+        }
+
+        annotations.Set("tl.sunmmio.pipeline.summary_v2_requested", Bool(true));
+        annotations.Set("tl.sunmmio.pipeline.summary_v2_observed", Bool(true));
+        annotations.Set("tl.sunmmio.pipeline.summary_v2_applied",
+                        Bool(analysis.summary_v2_applied));
+        annotations.Set("tl.sunmmio.pipeline.summary_data_frontiers_applied",
+                        Bool(analysis.summary_data_frontiers_applied));
+        annotations.Set("tl.sunmmio.pipeline.summary_model_version",
+                        String("v2_resource_windows_data_frontiers"));
+        annotations.Set("tl.sunmmio.pipeline.summary_resource_windows_raw",
+                        summary_resource_windows);
+        annotations.Set("tl.sunmmio.pipeline.summary_buffer_frontiers_raw",
+                        summary_buffer_frontiers);
+      }
+    }
+
+    Optional<Array<Buffer>> used_buffers_array =
+        StableUsedBufferExporter::Export(func_, analysis.used_buffers);
+    if (!used_buffers_array.defined()) {
+      return MakePipelineFallback(StripNumStages(loop), pipeline_mode,
+                                  "planning", "used_buffer_order_unproven");
+    }
+    annotations.Set("used_buffers", used_buffers_array.value());
     Array<Buffer> versioned_buffers_array(analysis.versioned_buffers.begin(),
                                           analysis.versioned_buffers.end());
     annotations.Set("versioned_buffers", versioned_buffers_array);
@@ -4329,7 +6129,7 @@ private:
     }
     annotations.Set("runtime_bank_flip_modes", runtime_bank_flip_modes);
 
-    Stmt body = this->VisitStmt(op->body);
+    Stmt body = planned_children_first ? loop->body : this->VisitStmt(op->body);
     For new_loop = loop;
     ForNode *loop_ptr = new_loop.CopyOnWrite();
     loop_ptr->body = body;
@@ -4340,6 +6140,7 @@ private:
   PrimFunc func_;
   ASTTraverser traverser_;
   bool debug_{false};
+  int next_region_id_{0};
 };
 
 tvm::transform::Pass SunmmioPipelinePlanningILP(bool debug = false) {
@@ -4361,7 +6162,15 @@ tvm::transform::Pass SunmmioPipelinePlanningILP(bool debug = false) {
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.transform.SunmmioPipelinePlanningILP",
-                        SunmmioPipelinePlanningILP);
+                        SunmmioPipelinePlanningILP)
+      // Internal read-only test hook: exactly the production exporter, without
+      // running a solver, modifying IR, or adding an alternate pipeline path.
+      .def("tl.testing.SunmmioILPStableUsedBuffers",
+           [](tir::PrimFunc func, Array<tir::Buffer> buffers) {
+             std::set<tir::Buffer> required(buffers.begin(), buffers.end());
+             return bank_ilp_internal::StableUsedBufferExporter::Export(
+                 func, required);
+           });
 }
 
 } // namespace tl

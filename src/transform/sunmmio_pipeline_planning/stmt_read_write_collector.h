@@ -3,6 +3,7 @@
 
 #include "../../op/builtin.h"
 #include "../../op/utils.h"
+#include "../../target/sunmmio/sunmmio_async_op_info.h"
 #include "tvm/ir/expr.h"
 #include "tvm/runtime/logging.h"
 #include "tvm/tir/buffer.h"
@@ -229,22 +230,19 @@ public:
 
   void VisitStmt_(const EvaluateNode *op) {
     const CallNode *call = op->value.as<CallNode>();
-    if (call && call->op.same_as(dma_copy())) {
-      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
-      write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
-    } else if (call && (call->op.same_as(sunmmio_layout_transform()) ||
-                        call->op.same_as(sunmmio_transpose()))) {
-      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
-      write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
+    SunmmioAsyncOpInfo async_info;
+    if (TryParseSunmmioAsyncODMAOp(call, &async_info)) {
+      read_buffer_regions_.insert(async_info.src);
+      write_buffer_regions_.insert(async_info.dst);
     } else if (call && call->op.same_as(mma_sunmmio())) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
 
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[2]));
-    } else if (call && call->op.same_as(Op::Get("tl.broadcast_"))) {
-      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
-      write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
+      if (call->args.size() == 9U) {
+        write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[7]));
+      }
     } else if (call &&
                call->op.same_as(Op::Get("tl.vector_core_in_tile_reduce"))) {
       ICHECK_GE(call->args.size(), 3U);

@@ -123,11 +123,39 @@ static constexpr const char *kSunmmioPipelineMode = "tl.sunmmio_pipeline_mode";
 
 static constexpr const char *kSunmmioGemmTwoCommunications =
     "tl.sunmmio_gemm_two_communications";
+static constexpr const char *kSunmmioCrossOuterPolicy =
+    "tl.sunmmio_cross_outer_policy";
+static constexpr const char *kSunmmioMultidimPolicy =
+    "tl.sunmmio_multidim_policy";
+
+
+static constexpr const char *kSunmmioRegionCrossOuterPolicy =
+    "tl.sunmmio_region_cross_outer_policy";
+
+static constexpr const char *kSunmmioRegionCrossOuterStrategy =
+    "tl.sunmmio_region_cross_outer_strategy";
 
 static constexpr const char *kSunmmioFaster = "tl.sunmmio_faster";
 
+static constexpr const char *kSunmmioCostModel = "tl.sunmmio_cost_model";
+
+static constexpr const char *kSunmmioILPEnableLatencyGCD =
+    "tl.sunmmio_ilp_enable_latency_gcd";
+
+static constexpr const char *kSunmmioCostModelFallback =
+    "tl.sunmmio_cost_model_fallback";
+
+static constexpr const char *kSunmmioCostModelPreserveCycles =
+    "tl.sunmmio_cost_model_preserve_cycles";
+
 static constexpr const char *kSunmmioILPStageShrink =
     "tl.sunmmio_ilp_stage_shrink";
+
+static constexpr const char *kSunmmioILPNestedPipeline =
+    "tl.sunmmio_ilp_nested_pipeline";
+
+static constexpr const char *kSunmmioILPNestedSummaryV2 =
+    "tl.sunmmio_ilp_nested_summary_v2";
 
 static constexpr const char *kSunmmioILPMultiversionLifetimePruning =
     "tl.sunmmio_ilp_multiversion_lifetime_pruning";
@@ -1022,6 +1050,13 @@ TVM_DLL const Op &barrier_arrive_and_wait();
  * argument is a TileLang-side SunmmioSyncUnits mask that SUVM codegen maps to
  * the corresponding `suvm.sync` unit attribute.
  */
+/*
+ * Compatibility marker accepted by the cost-model parser for legacy
+ * token-annotated async calls. Unified Multidim runtime synchronization stays
+ * tokenless and uses sunmmio_sync.
+ */
+TVM_DLL const Op &sync_token_id();
+
 TVM_DLL const Op &sunmmio_sync();
 
 /*!
