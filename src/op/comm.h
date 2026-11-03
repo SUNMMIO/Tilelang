@@ -14,6 +14,12 @@ namespace tl {
 
 TVM_DLL const Op &broadcast_();
 
+// Internal proof attached by ValidateDynamicCommPutRoutes before LowerTileOp.
+constexpr const char *kCommPutDirectionAttr = "tl.comm_put_direction";
+constexpr const char *kCommBarrierMaskAttr = "tl.comm_barrier_mask";
+constexpr const char *kAttrAllowRank3Multicast =
+    "tl.allow_rank3_allreduce_multicast";
+
 // Positional argument layout of the broadcast_() leaf intrinsic. Producers
 // (comm.cc, via AppendBroadcastArgs) and consumers (the broadcast-barrier
 // analysis in InjectSunmmioSync) must index it through these constants.
@@ -76,7 +82,9 @@ public:
   Array<Range> src_range, dst_range;
   PrimExpr src_expr, dst_expr;
   PrimExpr src_core, dst_core;
+  PrimExpr validated_barrier_mask;
   IntImm size;
+  int validated_direction = -1;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.comm_put", PutOpNode, TileOperatorNode);
 
@@ -89,7 +97,9 @@ public:
         .def_ro("dst_range", &PutOpNode::dst_range)
         .def_ro("src_core", &PutOpNode::src_core)
         .def_ro("dst_core", &PutOpNode::dst_core)
-        .def_ro("size", &PutOpNode::size);
+        .def_ro("validated_barrier_mask", &PutOpNode::validated_barrier_mask)
+        .def_ro("size", &PutOpNode::size)
+        .def_ro("validated_direction", &PutOpNode::validated_direction);
   }
 
   TileOperator Clone() const override;
@@ -189,6 +199,15 @@ TVM_DLL bool IsCommunicationOp(const Call &call);
 TVM_DLL CommunicationDirections
 GetCommunicationSourceDirections(const Call &call, Target target);
 
+/** Validate the cross-core all-reduce shape, dtype, and temporary contract. */
+TVM_DLL void ValidateAllreduceContract(const PrimExpr &src, const PrimExpr &dst,
+                                       const PrimExpr &row_allgather,
+                                       const PrimExpr &col_allgather,
+                                       const PrimExpr &dst_copy,
+                                       const StringImm &type, int direction,
+                                       bool should_clear, Target target,
+                                       arith::Analyzer *analyzer);
+
 class AllreduceOpNode : public TileOperatorNode {
 public:
   PrimExpr src, dst;
@@ -196,7 +215,6 @@ public:
   PrimExpr dst_copy;
   StringImm type;
   int direction;
-  IntImm dim;
   IntImm clear;
   PrimExpr cid;
 
@@ -211,7 +229,6 @@ public:
         .def_ro("row_allgather", &AllreduceOpNode::row_allgather)
         .def_ro("col_allgather", &AllreduceOpNode::col_allgather)
         .def_ro("type", &AllreduceOpNode::type)
-        .def_ro("dim", &AllreduceOpNode::dim)
         .def_ro("clear", &AllreduceOpNode::clear)
         .def_ro("direction", &AllreduceOpNode::direction)
         .def_ro("dst_copy", &AllreduceOpNode::dst_copy)
@@ -220,7 +237,7 @@ public:
 
   TileOperator Clone() const override;
   LayoutMap ComputeLayout(const LayoutInferArgs &T, InferLevel level,
-                          Buffer src, Buffer dst, int dim) const;
+                          Buffer src, Buffer dst) const;
   LayoutMap InferLayout(const LayoutInferArgs &T,
                         InferLevel level) const override;
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;

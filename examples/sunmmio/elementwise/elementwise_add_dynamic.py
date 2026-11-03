@@ -63,7 +63,7 @@ def main(M=1024, N=1024):
     )
 
     placement = [sunsim.S(0), sunsim.S(1)]
-    layout = sunsim.Layout.zz(block_dims=(0, 1))
+    layout = sunsim.layout.blockwise(dims=(0, 1))
     c = sunsim.Output((M, N), np.float32, placement=placement, layout=layout)
     result = kernel(
         sunsim.Input(a, placement=placement, layout=layout),

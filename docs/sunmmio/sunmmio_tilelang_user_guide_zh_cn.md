@@ -257,9 +257,9 @@ Layout 描述 tensor 或 buffer 在内存中的组织方式。它和 sharding �
 from tilelang.layout import (
     make_row_major,
     make_zz_layout,
-    make_zn_layout,
+    make_nz_layout,
     make_zzz_layout,
-    make_nzz_layout,
+    make_zzn_layout,
 )
 ```
 
@@ -374,7 +374,7 @@ core 可以用线性 id，也可以用 `(row, col)` 坐标表示。一般来说�
 T.comm.broadcast(A_shared, B_shared, src_core=(0, 0), direction="horizontal")
 T.comm.put(A_shared, B_shared, src_core=(1, 2), dst_core=(2, 3))
 T.comm.all_gather(A_local, A_gathered, direction="horizontal", axis=-1)
-T.comm.all_reduce(A_shared, Out_shared, "sum", direction="all", dim=-1)
+T.comm.all_reduce(A_shared, Out_shared, "sum", direction="all")
 ```
 
 选择接口时可以按语义判断：
@@ -382,7 +382,7 @@ T.comm.all_reduce(A_shared, Out_shared, "sum", direction="all", dim=-1)
 - `broadcast`：一个源 core 向某个方向上的多个 core 发送相同数据。
 - `put`：一个源 core 向一个目标 core 发送数据。
 - `all_gather`：多个 core 各自贡献一段数据，并在接收 buffer 中拼接。
-- `all_reduce`：多个 core 的数据做 reduce，并得到 reduce 结果。
+- `all_reduce`：对多个 core 上相同位置的元素做 reduce。它保留完整的本地 shape，不会归约本地 tensor 的某个维度。
 
 `all_gather` 的 recv shape 需要与 direction 和 axis 匹配：
 
@@ -571,15 +571,15 @@ B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
 C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 ```
 
-**`make_zn_layout`**
+**`make_nz_layout`**
 
 ```python
-from tilelang.layout import make_zn_layout
+from tilelang.layout import make_nz_layout
 
-layout = make_zn_layout(shape, axes, block_shape)
+layout = make_nz_layout(shape, axes, block_shape)
 ```
 
-`make_zn_layout` 构造 ZN layout。
+`make_nz_layout` 构造 NZ layout。
 
 - `shape`：tensor 的逻辑 shape。
 - `axes`：参与布局变换的维度。
@@ -603,21 +603,25 @@ layout = make_zzz_layout(shape, axes, block_shape, cluster_shape)
 - `cluster_shape`：cluster 级组织形状。
 - 返回值：layout 对象。
 
-**`make_nzz_layout`**
+**`make_zzn_layout`**
 
 ```python
-from tilelang.layout import make_nzz_layout
+from tilelang.layout import make_zzn_layout
 
-layout = make_nzz_layout(shape, axes, block_shape, cluster_shape)
+layout = make_zzn_layout(shape, axes, block_shape, cluster_shape)
 ```
 
-`make_nzz_layout` 构造带 cluster 组织的 NZZ layout。
+`make_zzn_layout` 构造带 cluster 组织的 ZZN layout。
 
 - `shape`：tensor 的逻辑 shape。
 - `axes`：参与布局变换的维度。
 - `block_shape`：每个 block 的形状。
 - `cluster_shape`：cluster 级组织形状。
 - 返回值：layout 对象。
+
+Layout 形式名称按照从最内层 block 向外层读取，与 NPU-IR 术语保持一致。
+`make_zn_layout` 和 `make_nzz_layout` 仍作为 `make_nz_layout` 和
+`make_zzn_layout` 的弃用兼容别名保留。
 
 **`T.annotate_layout`**
 
@@ -755,7 +759,7 @@ T.transpose(src, dst)
 - `src`：shape 为 `[M, N]` 的完整 rank-2 RSRAM buffer。
 - `dst`：shape 为 `[N, M]` 的完整 rank-2 RSRAM buffer，不能与 `src` 指向同一 buffer。
 - 源和目标的 dtype 必须一致，当前支持 `bfloat16` 和 `float32`。
-- shape 必须是静态值，且每一维都是 32 的倍数。两个 buffer 必须使用同一种两级 32x32 blockwise layout，即 ZZ 或 ZN。
+- shape 必须是静态值，且每一维都是 32 的倍数。两个 buffer 必须使用同一种两级 32x32 blockwise layout，即 ZZ 或 NZ。
 - 返回值：表达转置操作的语句。
 
 ODMA 转置是异步操作，编译器会在后续依赖访问之前插入同步。当前不支持 slice、局部 region 或 RSRAM 之外的 buffer。
@@ -765,7 +769,7 @@ ODMA 转置是异步操作，编译器会在后续依赖访问之前插入同步
 **`T.Tiles`**
 
 ```python
-for i, j in T.Tiles(domain, parallel=False):
+for i, j in T.Tiles(domain, parallel=False, unroll=None):
     ...
 ```
 
@@ -773,9 +777,11 @@ for i, j in T.Tiles(domain, parallel=False):
 
 - `domain`：循环逻辑域。推荐写显式 shape，例如 `[block_M, block_N]`；也可以传 buffer，表示使用 `buffer.shape`。
 - `parallel`：是否声明不同 tile 迭代之间无跨迭代依赖，默认 `False`。
+- `unroll`：可选的 best-effort 循环展开调优提示，支持 `1`、`2`、`4`、`8`、`16`，默认 `None` 表示不发出提示。只有 `T.Tiles` 成功合法化为原生 tile loop 时才会向后传递；若 TileView 规划回退为标量循环，编译器会删除该提示并输出诊断。多个 tile scope 融合时，未设置的提示被忽略，多个显式值取最小值。
 - 返回值：tile loop 迭代变量，变量个数由 `domain` rank 决定。
 
 当循环体中存在累加、归约或跨迭代依赖时，不要把 `parallel` 设为 `True`。
+`unroll` 不会启用 fast-math，也不保证最终后端一定展开循环。后续优化可以保留、修改或忽略该提示，因此优化后的 LLVM IR 和最终 ELF 可能完全不变。应把它作为 kernel 调优参数，并针对目标 workload 检查正确性、代码尺寸、寄存器/栈使用量和 cycle 数。
 
 ### 3.6 核间通讯
 
@@ -815,6 +821,15 @@ T.comm.put(src, dst, src_core, dst_core, size=-1)
 
 `put` 适合一对一数据交付。若同一份数据要发给一行、一列或整个 mesh，通常使用 `broadcast`。
 
+对于 Sunmmio 动态路由，`src_core` 必须是当前 `cid`；`dst_core(cid)` 必须能针对每个活动 core
+在编译期求值，并构成一个双射置换。每次传输必须是同一 row 或同一 column 内的单跳，且同一个
+调用产生的所有传输必须使用同一方向。编译器会将置换分解为若干 cycle，并为每个 cycle 使用一个
+participant barrier。
+
+动态 `put` 只有在显式 `if` 条件仅依赖 `cid` 和编译期常量、并且同一 cycle 的所有成员取值一致时
+才能被条件执行。当前会拒绝位于 `for` 或 `while` 循环中的动态 `put`。Sunmmio 不支持 `T.where`
+或其他非平凡 block predicate；请改用 cycle 内一致的显式 `if`。
+
 **`T.comm.all_gather`**
 
 ```python
@@ -847,20 +862,26 @@ T.comm.all_gather(
 **`T.comm.all_reduce`**
 
 ```python
-T.comm.all_reduce(buffer, out, reduce_type, direction, dim=-1, clear=True)
+T.comm.all_reduce(buffer, out, reduce_type, direction, clear=True)
 ```
 
-`all_reduce` 表达跨 core reduce。
+`all_reduce` 只表达跨 core reduce：对 `direction` 选中的各个 core 上相同位置的元素做归约，不会沿本地 buffer 的某个维度做归约。
 
 - `buffer`：参与 reduce 的输入 buffer 或 region。
 - `out`：保存 reduce 结果的输出 buffer 或 region。
 - `reduce_type`：reduce 类型，支持 `"sum"`、`"abssum"`、`"max"`、`"min"`、`"absmax"`、`"bitand"`、`"bitor"`、`"bitxor"`。
 - `direction`：参与 reduce 的方向，支持 `"horizontal"` / `"h"`、`"vertical"` / `"v"`、`"all"` / `"a"`。
-- `dim`：在本地 buffer 内 reduce 的维度，默认 `-1` 表示最后一维。
-- `clear`：是否在 reduce 前清空 `out`，默认 `True`。
+- `clear`：仅限关键字传入，用于控制是否以 reducer 的中性值初始化 `out`；为 `False` 时，跨 core 归约结果会与 `out` 的原值继续归约。默认值为 `True`。
 - 返回值：表达 all-reduce 的语句。
 
-`out` shape 需要等于删除 `dim` 后的 shape，或在 `dim` 上保留长度 1。
+输入和输出 region 必须具有相同的 rank 和各维 extent。若还需要归约本地 buffer 内的某个维度，应使用 `T.reduce`。
+
+当前 A4E lowering 支持 rank 1 到 3 的 payload，并要求每个 multicast tile 都具有满足 link 约束的连续数据段。对于静态 shape：
+
+- rank 1 要求 `extent * element_bytes` 是 1024 字节的正整数倍；
+- rank 2 或 rank 3 要求最内层 extent 能被 32 整除，并且 `gcd(倒数第二维 extent, 32) * 32 * element_bytes` 是 1024 字节的正整数倍。
+
+`"max"`、`"min"` 和 `"absmax"` 要求输入与输出为 BF16 或 FP32；`"bitand"`、`"bitor"` 和 `"bitxor"` 要求输入与输出均为 `int32` 或均为 `uint32`。
 
 ### 3.7 GEMM
 

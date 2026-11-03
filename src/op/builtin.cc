@@ -38,6 +38,7 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kASTPrintEnable, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kLayoutVisualizationEnable, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kLayoutVisualizationFormats, String);
 TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioPipelineMode, String);
+TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioGemmTwoCommunications, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioFaster, Integer);
 TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioILPStageShrink, Bool);
 TVM_REGISTER_PASS_CONFIG_OPTION(kSunmmioILPMultiversionLifetimePruning, Bool);

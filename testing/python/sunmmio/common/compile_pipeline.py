@@ -272,6 +272,9 @@ def LowerAndLegalize_sunmmio_test(
     mod = tir.transform.BindTarget(target)(mod)
     pass_output_process(mod, "BindTarget", test_config)
 
+    mod = tilelang.transform.ValidateSunmmioFrontendSyntax()(mod)
+    pass_output_process(mod, "ValidateSunmmioFrontendSyntax", test_config)
+
     mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
     pass_output_process(mod, "ResolveSunmmioMeshSymbols", test_config)
 
@@ -291,6 +294,9 @@ def LowerAndLegalize_sunmmio_test(
     mod = tilelang.transform.Simplify()(mod)
     pass_output_process(mod, "Simplify_lower_1", test_config)
 
+    mod = tilelang.transform.LegalizeSunmmioBatchGemmViews()(mod)
+    pass_output_process(mod, "LegalizeSunmmioBatchGemmViews", test_config)
+
     mod = tilelang.transform.InferSramScope()(mod)
     pass_output_process(mod, "InferSramScope", test_config)
 
@@ -309,6 +315,8 @@ def LowerAndLegalize_sunmmio_test(
         pass_output_process(mod, "ValidateTileViewRegions", test_config)
 
     LayoutVisual(mod)
+    mod = tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
+    pass_output_process(mod, "ValidateDynamicCommPutRoutes", test_config)
     mod = tilelang.transform.LowerTileOp()(mod)
     pass_output_process(mod, "LowerTileOp", test_config)
 

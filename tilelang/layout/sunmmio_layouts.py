@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import tvm_ffi
 import tvm.tir as tir
 from tvm.tir import Buffer, BufferLoad, BufferRegion
@@ -11,11 +13,11 @@ from .swizzle import _get_buffer_info
 _make_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_row_major")
 _make_aligned_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_aligned_row_major")
 _make_zz = tvm_ffi.get_global_func("tl.sunmmio.make_zz")
-_make_zn = tvm_ffi.get_global_func("tl.sunmmio.make_zn")
+_make_nz = tvm_ffi.get_global_func("tl.sunmmio.make_nz")
 _make_zzz = tvm_ffi.get_global_func("tl.sunmmio.make_zzz")
-_make_nzz = tvm_ffi.get_global_func("tl.sunmmio.make_nzz")
+_make_zzn = tvm_ffi.get_global_func("tl.sunmmio.make_zzn")
 _make_mxzz = tvm_ffi.get_global_func("tl.sunmmio.make_mxzz")
-_make_mxznn = tvm_ffi.get_global_func("tl.sunmmio.make_mxznn")
+_make_mxnnz = tvm_ffi.get_global_func("tl.sunmmio.make_mxnnz")
 _make_mxznz = tvm_ffi.get_global_func("tl.sunmmio.make_mxznz")
 _make_mx_row_major = tvm_ffi.get_global_func("tl.sunmmio.make_mx_row_major")
 _get_mx_scale_shape = tvm_ffi.get_global_func("tl.sunmmio.get_mx_scale_shape")
@@ -79,9 +81,19 @@ def make_zz_layout(shape_or_buffer, axes=None, block_shape=(32, 32)):
     return _make_zz(shape, axes, block_shape)
 
 
+def make_nz_layout(shape, axes, block_shape):
+    """Create an NZ (blockwise column-major) CuteLayout."""
+    return _make_nz(shape, axes, block_shape)
+
+
 def make_zn_layout(shape, axes, block_shape):
-    """Create a ZN (blockwise column-major) CuteLayout."""
-    return _make_zn(shape, axes, block_shape)
+    """Deprecated alias for :func:`make_nz_layout`."""
+    warnings.warn(
+        "make_zn_layout is deprecated; use make_nz_layout. Layout names now read from the block interior outward.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return make_nz_layout(shape, axes, block_shape)
 
 
 def make_zzz_layout(shape, axes, block_shape, cluster_shape):
@@ -89,10 +101,19 @@ def make_zzz_layout(shape, axes, block_shape, cluster_shape):
     return _make_zzz(shape, axes, block_shape, cluster_shape)
 
 
-# 临时改名zzn，原来 nzz
+def make_zzn_layout(shape, axes, block_shape, cluster_shape):
+    """Create a ZZN (clustered column-major) CuteLayout."""
+    return _make_zzn(shape, axes, block_shape, cluster_shape)
+
+
 def make_nzz_layout(shape, axes, block_shape, cluster_shape):
-    """Create a NZZ (clustered column-major) CuteLayout."""
-    return _make_nzz(shape, axes, block_shape, cluster_shape)
+    """Deprecated alias for :func:`make_zzn_layout`."""
+    warnings.warn(
+        "make_nzz_layout is deprecated; use make_zzn_layout. Layout names now read from the innermost level outward.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return make_zzn_layout(shape, axes, block_shape, cluster_shape)
 
 
 def make_mxzz_layout(shape_or_buffer, axes=None, dtype=None):
@@ -104,17 +125,27 @@ def make_mxzz_layout(shape_or_buffer, axes=None, dtype=None):
     return _make_mxzz(shape, axes, dtype)
 
 
-def _make_mxznn_layout(shape_or_buffer, axes=None, dtype=None):
-    """Create the internal WSRAM MXZNN CuteLayout used by GEMM inference."""
+def _make_mxnnz_layout(shape_or_buffer, axes=None, dtype=None):
+    """Create the internal WSRAM MXNNZ CuteLayout used by GEMM inference."""
     shape, dtype = _normalize_shape_and_dtype(shape_or_buffer, dtype)
-    axes = _normalize_axes(axes, len(shape), "_make_mxznn_layout")
+    axes = _normalize_axes(axes, len(shape), "_make_mxnnz_layout")
     if dtype is None:
-        raise ValueError("_make_mxznn_layout requires dtype when shape_or_buffer is not a buffer-like object")
-    return _make_mxznn(shape, axes, dtype)
+        raise ValueError("_make_mxnnz_layout requires dtype when shape_or_buffer is not a buffer-like object")
+    return _make_mxnnz(shape, axes, dtype)
+
+
+def _make_mxznn_layout(shape_or_buffer, axes=None, dtype=None):
+    """Deprecated alias for :func:`_make_mxnnz_layout`."""
+    warnings.warn(
+        "_make_mxznn_layout is deprecated; use _make_mxnnz_layout. Layout names now read from the block interior outward.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return _make_mxnnz_layout(shape_or_buffer, axes, dtype)
 
 
 def make_mxznz_layout(shape_or_buffer, axes=None, dtype=None):
-    """Create an MXZNZ blockwise CuteLayout for MX data staged before MXZNN."""
+    """Create an MXZNZ blockwise CuteLayout for MX data staged before MXNNZ."""
     shape, dtype = _normalize_shape_and_dtype(shape_or_buffer, dtype)
     axes = _normalize_axes(axes, len(shape), "make_mxznz_layout")
     if dtype is None:

@@ -69,9 +69,9 @@ Optional<Layout> CanonicalTransposeLayout(const Layout &src_layout,
   if (IsSameLayout(src_layout, src_zz, analyzer))
     return sunmmio::MakeZZ(dst->shape, axes, block_shape);
 
-  Layout src_zn = sunmmio::MakeZN(src->shape, axes, block_shape);
-  if (IsSameLayout(src_layout, src_zn, analyzer))
-    return sunmmio::MakeZN(dst->shape, axes, block_shape);
+  Layout src_nz = sunmmio::MakeNZ(src->shape, axes, block_shape);
+  if (IsSameLayout(src_layout, src_nz, analyzer))
+    return sunmmio::MakeNZ(dst->shape, axes, block_shape);
 
   return std::nullopt;
 }
@@ -122,7 +122,7 @@ LayoutMap TransposeNode::InferLayout(const LayoutInferArgs &T,
       << "Sunmmio T.transpose destination must use shared.rsram, got "
       << dst.scope();
 
-  // Transpose supports both ZZ and ZN, so it imposes no hard layout choice.
+  // Transpose supports both ZZ and NZ, so it imposes no hard layout choice.
   if (level >= InferLevel::kStrict)
     return {};
 
@@ -153,7 +153,7 @@ LayoutMap TransposeNode::InferLayout(const LayoutInferArgs &T,
         T.layout_map[src], src, dst, T.target, T.analyzer);
     ICHECK(expected_dst.defined())
         << "Sunmmio T.transpose source layout must be a two-level 32x32 ZZ or "
-           "ZN layout";
+           "NZ layout";
     if (dst_established) {
       ICHECK(IsSameLayout(T.layout_map[dst], expected_dst.value(), T.analyzer))
           << "Sunmmio T.transpose operands require the same layout family";
@@ -167,7 +167,7 @@ LayoutMap TransposeNode::InferLayout(const LayoutInferArgs &T,
       T.layout_map[dst], dst, src, T.target, T.analyzer);
   ICHECK(expected_src.defined())
       << "Sunmmio T.transpose destination layout must be a two-level 32x32 ZZ "
-         "or ZN layout";
+         "or NZ layout";
   updates.Set(src, expected_src.value());
   return updates;
 }
@@ -193,7 +193,7 @@ Stmt TransposeNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       CanonicalTransposeLayout(T.layout_map[src], src, dst, T.target, analyzer);
   ICHECK(expected.defined())
       << "Sunmmio T.transpose source layout must be a two-level 32x32 ZZ or "
-         "ZN layout";
+         "NZ layout";
   ICHECK(IsSameLayout(T.layout_map[dst], expected.value(), analyzer))
       << "Sunmmio T.transpose destination layout is not the canonical "
          "transpose of the source layout";

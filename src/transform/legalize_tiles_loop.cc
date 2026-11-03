@@ -369,6 +369,7 @@ private:
         n->annotations.erase(attr::tile_level_loop);
         n->annotations.erase(attr::kTileDomain);
         n->annotations.erase(attr::kTileLoopStage);
+        n->annotations.erase(attr::kTileLoopUnroll);
         n->annotations.erase(attr::tile_tile_size);
         n->annotations.erase(attr::tile_execution_domain_axes);
         n->annotations.erase(attr::tile_execution_axis);
@@ -490,10 +491,15 @@ private:
                                                 tileviews_, layout_map_,
                                                 tile_processor_config_);
       if (!plan.has_value()) {
+        bool drops_unroll = loop->annotations.count(attr::kTileLoopUnroll) != 0;
         LOG(WARNING) << "T.Tiles domain " << domain
                      << " cannot infer a legal TileView and is falling back "
                         "to scalar serial loops using tile.pick/tile.set. This "
-                        "may severely degrade performance.";
+                        "may severely degrade performance."
+                     << (drops_unroll
+                             ? " The unroll hint was not applied because it "
+                               "only targets legalized tile loops."
+                             : "");
         return StripTileLoopAnnotations(loop);
       }
       active_tileview_plan_ = plan.value();

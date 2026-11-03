@@ -161,6 +161,7 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
 
 def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tir.transform.BindTarget(target)(mod)
+    mod = tilelang.transform.ValidateSunmmioFrontendSyntax()(mod)
     mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
     mod = tilelang.transform.NormalizeMXViews(validate=True)(mod)
     if should_force_let_inline():
@@ -170,6 +171,7 @@ def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
     mod = tilelang.transform.InjectAssumes()(mod)
     mod = tilelang.transform.Simplify()(mod)
 
+    mod = tilelang.transform.LegalizeSunmmioBatchGemmViews()(mod)
     mod = tilelang.transform.InferSramScope()(mod)
     mod = tilelang.transform.NormalizeMXViews()(mod)
     mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
@@ -180,6 +182,7 @@ def LowerAndLegalizeSunmmio(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.ValidateTileViewRegions()(mod)
 
     LayoutVisual(mod)
+    mod = tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
     mod = tilelang.transform.LowerTileOp()(mod)
     mod = tilelang.transform.LegalizeTilesLoop()(mod)
     mod = tilelang.transform.TilesLoop()(mod)

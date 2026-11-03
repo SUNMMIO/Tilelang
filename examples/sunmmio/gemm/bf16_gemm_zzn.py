@@ -3,7 +3,7 @@ import argparse
 import tilelang
 import tilelang.language as T
 from tilelang.carver.arch import driver
-from tilelang.layout import make_nzz_layout, make_zz_layout
+from tilelang.layout import make_zzn_layout, make_zz_layout
 
 
 def ref_program(a, b):
@@ -36,7 +36,7 @@ def matmul_persistent_zzn(M, N, K, block_M, block_N, block_K, dtype=T.bfloat16, 
     _validate_config(M, N, K, block_M, block_N, block_K)
 
     A_layout = make_zz_layout((M, K))
-    B_layout = make_nzz_layout(
+    B_layout = make_zzn_layout(
         (K, N),
         axes=(0, 1),
         block_shape=(32, 32),

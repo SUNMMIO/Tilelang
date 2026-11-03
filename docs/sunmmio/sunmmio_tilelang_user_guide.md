@@ -257,9 +257,9 @@ Layout constructors available for advanced scenarios include:
 from tilelang.layout import (
     make_row_major,
     make_zz_layout,
-    make_zn_layout,
+    make_nz_layout,
     make_zzz_layout,
-    make_nzz_layout,
+    make_zzn_layout,
 )
 ```
 
@@ -374,7 +374,7 @@ Common APIs:
 T.comm.broadcast(A_shared, B_shared, src_core=(0, 0), direction="horizontal")
 T.comm.put(A_shared, B_shared, src_core=(1, 2), dst_core=(2, 3))
 T.comm.all_gather(A_local, A_gathered, direction="horizontal", axis=-1)
-T.comm.all_reduce(A_shared, Out_shared, "sum", direction="all", dim=-1)
+T.comm.all_reduce(A_shared, Out_shared, "sum", direction="all")
 ```
 
 Choose an API by its semantics:
@@ -382,7 +382,7 @@ Choose an API by its semantics:
 - `broadcast`: one source core sends the same data to multiple cores along a direction.
 - `put`: one source core sends data to one destination core.
 - `all_gather`: multiple cores each contribute a data segment, and the receive buffer concatenates the segments.
-- `all_reduce`: data from multiple cores is reduced, producing a reduction result.
+- `all_reduce`: corresponding elements from multiple cores are reduced. It preserves the complete local shape and does not reduce a local tensor dimension.
 
 The receive shape of `all_gather` must match `direction` and `axis`:
 
@@ -571,15 +571,15 @@ B_layout = make_zz_layout((K, N), [0, 1], (32, 32))
 C_layout = make_zz_layout((M, N), [0, 1], (32, 32))
 ```
 
-**`make_zn_layout`**
+**`make_nz_layout`**
 
 ```python
-from tilelang.layout import make_zn_layout
+from tilelang.layout import make_nz_layout
 
-layout = make_zn_layout(shape, axes, block_shape)
+layout = make_nz_layout(shape, axes, block_shape)
 ```
 
-`make_zn_layout` constructs a ZN layout.
+`make_nz_layout` constructs an NZ layout.
 
 - `shape`: logical tensor shape.
 - `axes`: dimensions participating in the layout transform.
@@ -603,21 +603,25 @@ layout = make_zzz_layout(shape, axes, block_shape, cluster_shape)
 - `cluster_shape`: cluster-level organization shape.
 - Return value: a layout object.
 
-**`make_nzz_layout`**
+**`make_zzn_layout`**
 
 ```python
-from tilelang.layout import make_nzz_layout
+from tilelang.layout import make_zzn_layout
 
-layout = make_nzz_layout(shape, axes, block_shape, cluster_shape)
+layout = make_zzn_layout(shape, axes, block_shape, cluster_shape)
 ```
 
-`make_nzz_layout` constructs an NZZ layout with cluster organization.
+`make_zzn_layout` constructs a ZZN layout with cluster organization.
 
 - `shape`: logical tensor shape.
 - `axes`: dimensions participating in the layout transform.
 - `block_shape`: shape of each block.
 - `cluster_shape`: cluster-level organization shape.
 - Return value: a layout object.
+
+Layout form letters are read from the innermost block level outward, matching
+NPU-IR terminology. `make_zn_layout` and `make_nzz_layout` remain available as
+deprecated aliases for `make_nz_layout` and `make_zzn_layout`, respectively.
 
 **`T.annotate_layout`**
 
@@ -755,7 +759,7 @@ T.transpose(src, dst)
 - `src`: a complete rank-2 RSRAM buffer with shape `[M, N]`.
 - `dst`: a complete rank-2 RSRAM buffer with shape `[N, M]`. It must not alias `src`.
 - The source and destination must have the same dtype. The supported dtypes are `bfloat16` and `float32`.
-- Shapes must be static, with every dimension a multiple of 32. Both buffers must use the same two-level 32x32 blockwise layout family, either ZZ or ZN.
+- Shapes must be static, with every dimension a multiple of 32. Both buffers must use the same two-level 32x32 blockwise layout family, either ZZ or NZ.
 - Return value: a statement expressing the transpose operation.
 
 ODMA transpose is asynchronous. The compiler inserts synchronization before a dependent access. Slices, partial regions, and buffers outside RSRAM are not supported.
@@ -765,7 +769,7 @@ ODMA transpose is asynchronous. The compiler inserts synchronization before a de
 **`T.Tiles`**
 
 ```python
-for i, j in T.Tiles(domain, parallel=False):
+for i, j in T.Tiles(domain, parallel=False, unroll=None):
     ...
 ```
 
@@ -773,9 +777,11 @@ for i, j in T.Tiles(domain, parallel=False):
 
 - `domain`: logical loop domain. The recommended form is an explicit shape, such as `[block_M, block_N]`. A buffer can also be passed, meaning `buffer.shape` is used.
 - `parallel`: whether to declare that there is no cross-iteration dependency between different tile iterations. The default is `False`.
+- `unroll`: optional best-effort loop-unroll tuning hint. Supported values are `1`, `2`, `4`, `8`, and `16`; the default `None` emits no hint. It is forwarded only when `T.Tiles` is legalized to a native tile loop. If TileView planning falls back to scalar loops, the compiler drops the hint and emits a diagnostic. When tile-loop fusion combines multiple scopes, unset hints are ignored and the smallest explicit factor is retained.
 - Return value: tile loop iteration variables. The number of variables is determined by the rank of `domain`.
 
 When the loop body contains accumulation, reduction, or cross-iteration dependencies, do not set `parallel` to `True`.
+`unroll` does not request fast math and does not guarantee that the final backend will unroll the loop. Downstream optimization may preserve, change, or ignore the hint, so the optimized LLVM IR and final ELF can remain unchanged. Treat it as a kernel tuning parameter and validate correctness, code size, register/stack use, and cycles for the selected workload.
 
 ### 3.6 Inter-Core Communication
 
@@ -815,6 +821,19 @@ T.comm.put(src, dst, src_core, dst_core, size=-1)
 
 `put` is suitable for one-to-one data delivery. If the same data needs to be sent to a row, a column, or the whole mesh, `broadcast` is usually used.
 
+For a dynamic Sunmmio route, `src_core` must be the current `cid`, while
+`dst_core(cid)` must be statically resolvable for every active core and form a
+bijective permutation. Every transfer must be a single hop within one row or
+one column, and all transfers from the same call must use the same direction.
+The compiler decomposes the permutation into cycles and uses one participant
+barrier per cycle.
+
+Dynamic `put` may be guarded by an explicit `if` only when the condition depends
+on `cid` and compile-time constants and has the same value for every member of a
+cycle. Dynamic `put` inside `for` or `while` loops is currently rejected.
+Sunmmio does not support `T.where` or other non-trivial block predicates; use an
+explicit cycle-uniform `if` instead.
+
 **`T.comm.all_gather`**
 
 ```python
@@ -847,20 +866,26 @@ The receive shape must match `direction` and `axis`. If the number of participat
 **`T.comm.all_reduce`**
 
 ```python
-T.comm.all_reduce(buffer, out, reduce_type, direction, dim=-1, clear=True)
+T.comm.all_reduce(buffer, out, reduce_type, direction, clear=True)
 ```
 
-`all_reduce` expresses cross-core reduction.
+`all_reduce` expresses cross-core-only reduction. For every local element, it reduces the corresponding values from the cores selected by `direction`; it does not perform a reduction along a local buffer dimension.
 
 - `buffer`: input buffer or region participating in reduce.
 - `out`: output buffer or region storing the reduce result.
 - `reduce_type`: reduce type. Supported values include `"sum"`, `"abssum"`, `"max"`, `"min"`, `"absmax"`, `"bitand"`, `"bitor"`, and `"bitxor"`.
 - `direction`: direction participating in reduce. Supported values are `"horizontal"` / `"h"`, `"vertical"` / `"v"`, and `"all"` / `"a"`.
-- `dim`: reduction dimension inside the local buffer. The default `-1` means the last dimension.
-- `clear`: whether to clear `out` before reduce. The default is `True`.
+- `clear`: keyword-only argument controlling whether `out` is initialized with the reducer's neutral value. If `False`, the cross-core result is combined with the existing `out` value. The default is `True`.
 - Return value: a statement expressing all-reduce.
 
-The `out` shape must be equal to the shape after removing `dim`, or keep length 1 on `dim`.
+The input and output regions must have the same rank and extents. Use `T.reduce` when a dimension inside the local buffer must also be reduced.
+
+The current A4E lowering accepts payload rank 1 to 3 and requires every multicast tile to provide a link-legal contiguous segment. For static shapes:
+
+- Rank 1 requires `extent * element_bytes` to be a positive multiple of 1024 bytes.
+- Rank 2 or 3 requires the innermost extent to be divisible by 32 and `gcd(penultimate_extent, 32) * 32 * element_bytes` to be a positive multiple of 1024 bytes.
+
+`"max"`, `"min"`, and `"absmax"` require BF16 or FP32 input and output. `"bitand"`, `"bitor"`, and `"bitxor"` require matching `int32` or matching `uint32` input and output.
 
 ### 3.7 GEMM
 

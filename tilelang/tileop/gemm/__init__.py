@@ -14,7 +14,7 @@ from .gemm_mfma import GemmMFMA
 from .gemm_cutedsl import GemmCuTeDSL
 from .gemm_sunmmio import GemmSunmmio
 from tilelang import _ffi_api
-from tilelang.utils.target import target_is_volta
+from tilelang.utils.target import target_is_sunmmio, target_is_volta
 from tilelang.jit.adapter.utils import is_cutedsl_target
 
 
@@ -114,16 +114,64 @@ class GemmPy(Node, Scriptable):
 
     def infer_layout(self, target: Target, thread_nums: int):
         """Infer the layout for the GEMM operation based on target architecture."""
+        self._validate_batch_target(target)
         gemm_inst = self._select_gemm_instruction(thread_nums, target)
         impl_class = self._get_implementation_class(gemm_inst, target)
         return impl_class(self).infer_layout(target, thread_nums)
 
     def lower(self, layout_map: dict, target: Target, thread_bounds: Range, thread_var: tir.Var):
         """Lower the GEMM operation to TIR statements based on target architecture."""
+        self._validate_batch_target(target)
         thread_nums = thread_bounds.extent
         gemm_inst = self._select_gemm_instruction(thread_nums, target)
         impl_class = self._get_implementation_class(gemm_inst, target)
         return impl_class(self).lower(layout_map, target, thread_bounds, thread_var)
+
+    def _validate_batch_target(self, target: Target) -> None:
+        analyzer = tvm.arith.Analyzer()
+
+        def has_batch_semantics(region, *, is_output: bool) -> bool:
+            if len(region.region) != 3:
+                return False
+            batch = region.region[0]
+            is_single_matrix_view = (
+                isinstance(batch.extent, tir.IntImm)
+                and int(batch.extent) == 1
+                and (not analyzer.can_prove(batch.min == 0) or not analyzer.can_prove(batch.extent == region.buffer.shape[0]))
+            )
+            if is_single_matrix_view:
+                return False
+            return is_output or not (isinstance(batch.extent, tir.IntImm) and int(batch.extent) == 1)
+
+        if target_is_sunmmio(target):
+            for operand, region, is_output in (
+                ("A", self.aRegion, False),
+                ("B", self.bRegion, False),
+                ("C", self.cRegion, True),
+            ):
+                if not has_batch_semantics(region, is_output=is_output):
+                    continue
+                batch = region.region[0]
+                extent = batch.extent
+                if not isinstance(extent, tir.IntImm) or int(extent) <= 0:
+                    raise ValueError(f"Sunmmio Batch GEMM requires {operand} batch extent to be a positive static IntImm, got {extent}")
+                if not isinstance(batch.min, tir.IntImm) or int(batch.min) < 0:
+                    raise ValueError(f"Sunmmio Batch GEMM requires {operand} batch min to be a non-negative static IntImm, got {batch.min}")
+                if not analyzer.can_prove(batch.min + extent <= region.buffer.shape[0]):
+                    raise ValueError(
+                        f"Sunmmio Batch GEMM requires {operand} batch region "
+                        "to stay within buffer axis 0, "
+                        f"got min {batch.min}, extent {extent} "
+                        f"for buffer shape {region.buffer.shape}"
+                    )
+            return
+
+        if (
+            has_batch_semantics(self.aRegion, is_output=False)
+            or has_batch_semantics(self.bRegion, is_output=False)
+            or has_batch_semantics(self.cRegion, is_output=True)
+        ):
+            raise ValueError("T.gemm batch semantics are currently supported only on the Sunmmio target")
 
     def _select_gemm_instruction(self, thread_nums: int, target: Target) -> GemmInst:
         """Select the appropriate GEMM instruction based on target and thread configuration.

@@ -46,7 +46,7 @@ bool IsMXWeightLayout(const Layout &layout, const Buffer &buffer,
     return false;
   Array<Integer> axes{Integer(rank - 2), Integer(rank - 1)};
   Layout expected =
-      transposed_block ? sunmmio::MakeMXZNN(buffer->shape, axes, buffer->dtype)
+      transposed_block ? sunmmio::MakeMXNNZ(buffer->shape, axes, buffer->dtype)
                        : sunmmio::MakeMXZNZ(buffer->shape, axes, buffer->dtype);
   return IsSameLayout(layout, expected, analyzer);
 }
@@ -241,7 +241,7 @@ NormalizeToBufferRegion(const PrimExpr &arg,
  * \return A Call(tl.tileop.region, ...) expression.
  */
 PrimExpr MakeRegionExpr(const Buffer &buffer, const Array<Range> &ranges,
-                        int access_mask) {
+                        int access_mask, Map<String, ObjectRef> annotations) {
   // Build BufferLoad with indices = per-axis minima
   Array<PrimExpr> indices;
   for (const auto &r : ranges) {
@@ -256,7 +256,7 @@ PrimExpr MakeRegionExpr(const Buffer &buffer, const Array<Range> &ranges,
   for (const auto &r : ranges) {
     args.push_back(r->extent);
   }
-  return Call(DataType::Handle(), RegionOp::Get(), args);
+  return Call(DataType::Handle(), RegionOp::Get(), args, annotations);
 }
 
 Array<Range> MakeCompactRegion(const Array<Range> &region) {

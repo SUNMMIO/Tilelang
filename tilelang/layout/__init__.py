@@ -27,8 +27,10 @@ from .sunmmio_layouts import (
     make_row_major,  # noqa: F401
     make_aligned_row_major,  # noqa: F401
     make_zz_layout,  # noqa: F401
+    make_nz_layout,  # noqa: F401
     make_zn_layout,  # noqa: F401
     make_zzz_layout,  # noqa: F401
+    make_zzn_layout,  # noqa: F401
     make_nzz_layout,  # noqa: F401
     make_mxzz_layout,  # noqa: F401
     make_mxznz_layout,  # noqa: F401

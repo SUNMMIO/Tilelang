@@ -56,6 +56,30 @@ struct VectorCoreCost {
   };
 };
 
+constexpr int kMXFP8CustomTypeCode = DataType::kCustomBegin;
+constexpr int kMXFP4CustomTypeCode = DataType::kCustomBegin + 1;
+
+bool IsMXFP8DType(DataType dtype) {
+  return dtype.code() == kMXFP8CustomTypeCode && dtype.bits() == 8 &&
+         dtype.lanes() == 1;
+}
+
+bool IsMXFP4DType(DataType dtype) {
+  return dtype.code() == kMXFP4CustomTypeCode && dtype.bits() == 4 &&
+         dtype.lanes() == 1;
+}
+
+bool IsMXDType(DataType dtype) {
+  return IsMXFP8DType(dtype) || IsMXFP4DType(dtype);
+}
+
+bool IsSupportedA4ETensorCorePair(DataType activation, DataType weight) {
+  if (activation.is_bfloat16()) {
+    return weight.is_bfloat16() || IsMXDType(weight);
+  }
+  return IsMXDType(activation) && IsMXDType(weight);
+}
+
 static bool ContainsExpr(const tvm::ffi::Array<PrimExpr> &exprs,
                          const PrimExpr &expr) {
   for (const PrimExpr &it : exprs) {
@@ -240,17 +264,6 @@ float CostModel::EstimateTensorCoreDelay(const tir::Stmt &stmt) {
   ICHECK(call->op.same_as(Op::Get("tl.mma_sunmmio")))
       << "TensorCore command must call tl.mma_sunmmio: " << stmt;
 
-  const auto *A = call->args[0].as<CallNode>();
-  const auto *B = call->args[1].as<CallNode>();
-  ICHECK(A) << "TensorCore lhs fragment must be a CallNode: " << stmt;
-  ICHECK(B) << "TensorCore rhs fragment must be a CallNode: " << stmt;
-  ICHECK(A->args[2].as<IntImmNode>())
-      << "TensorCore row size must be IntImm: " << stmt;
-  ICHECK(B->args[3].as<IntImmNode>())
-      << "TensorCore col size must be IntImm: " << stmt;
-  ICHECK(A->args[3].as<IntImmNode>())
-      << "TensorCore reduction size must be IntImm: " << stmt;
-
   BufferRegion a_region = NormalizeToBufferRegion(call->args[0]);
   BufferRegion b_region = NormalizeToBufferRegion(call->args[1]);
   BufferRegion c_region = NormalizeToBufferRegion(call->args[2]);
@@ -258,24 +271,51 @@ float CostModel::EstimateTensorCoreDelay(const tir::Stmt &stmt) {
   DataType rhs_dtype = b_region->buffer->dtype;
   DataType output_dtype = c_region->buffer->dtype;
 
-  ICHECK(input_dtype.is_bfloat16())
-      << "Only bf16 TensorCore input is supported in current cost model: "
-      << stmt;
-  ICHECK(rhs_dtype == input_dtype)
-      << "TensorCore input dtypes must match for current cost model: " << stmt;
+  ICHECK(IsSupportedA4ETensorCorePair(input_dtype, rhs_dtype))
+      << "Unsupported TensorCore input dtypes in current cost model: "
+      << input_dtype << " x " << rhs_dtype << "; " << stmt;
 
-  auto row_size = A->args[2].as<IntImmNode>()->value;
-  auto col_size = B->args[3].as<IntImmNode>()->value;
-  auto acc_size = A->args[3].as<IntImmNode>()->value;
+  auto static_extent = [&](const BufferRegion &region, int axis,
+                           const char *operand) {
+    int rank = static_cast<int>(region->region.size());
+    ICHECK(rank == 2 || rank == 3) << "TensorCore " << operand
+                                   << " region must have rank 2 or 3: " << stmt;
+    int normalized_axis = axis < 0 ? rank + axis : axis;
+    const auto *extent =
+        region->region[normalized_axis]->extent.as<IntImmNode>();
+    ICHECK(extent) << "TensorCore " << operand
+                   << " region extent must be IntImm on axis "
+                   << normalized_axis << ": " << stmt;
+    return static_cast<int>(extent->value);
+  };
+
+  int row_size = static_extent(c_region, -2, "output");
+  int col_size = static_extent(c_region, -1, "output");
+  int acc_size = static_extent(a_region, -1, "activation");
+  int batch_size = 1;
+  for (const auto &[region, operand] :
+       {std::pair{a_region, "activation"}, std::pair{b_region, "weight"},
+        std::pair{c_region, "output"}}) {
+    if (region->region.size() != 3)
+      continue;
+    int extent = static_extent(region, 0, operand);
+    if (extent <= 1)
+      continue;
+    ICHECK(batch_size == 1 || batch_size == extent)
+        << "TensorCore batch extents must match: " << stmt;
+    batch_size = extent;
+  }
 
   /**
-   * For bf16 TensorCore MMA, the effective inner-loop gap is bounded by both
-   * the reduction depth and a minimum block count implied by the tile shape.
-   * The accumulator dtype contributes a small fixed latency difference between
+   * The effective inner-loop gap is bounded by the activation path's reduction
+   * throughput and a minimum block count implied by the tile shape. The
+   * accumulator dtype contributes a small fixed latency difference between
    * bf16 accumulation and fp32 accumulation.
    */
   int min_blk_num = (row_size <= 16 && col_size <= 32) ? 1 : 4;
-  int gap = std::max(ceil_div(acc_size, 32), min_blk_num);
+  int reduction_elems_per_cycle = IsMXDType(input_dtype) ? 128 : 32;
+  int gap =
+      std::max(ceil_div(acc_size, reduction_elems_per_cycle), min_blk_num);
   int st_dtype_delay = 0;
   if (output_dtype.is_bfloat16()) {
     st_dtype_delay = 8;
@@ -295,7 +335,7 @@ float CostModel::EstimateTensorCoreDelay(const tir::Stmt &stmt) {
    */
   float delay = 11 + 5 + 5 + st_dtype_delay +
                 ceil_div(row_size, 16) * ceil_div(col_size, 32) * gap + 70;
-  return delay;
+  return batch_size * delay;
 }
 
 float CostModel::EstimateODMADelay(const tir::Stmt &stmt) {

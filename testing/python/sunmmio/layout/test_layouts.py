@@ -10,7 +10,11 @@ from tilelang import tvm as tvm
 from tilelang.layout import (
     get_mx_scale_shape,
     is_same_layout,
+    make_nz_layout,
+    make_nzz_layout,
     make_zz_layout,
+    make_zn_layout,
+    make_zzn_layout,
     make_mx_row_major_layout,
     make_mxznz_layout,
     make_mxzz_layout,
@@ -135,6 +139,16 @@ def test_make_zz_layout_uses_tensor_dim_order_for_reversed_axes():
 def test_make_zz_layout_rejects_rank_one_default_axes():
     with pytest.raises(ValueError, match="make_zz_layout requires rank >= 2"):
         make_zz_layout((128,))
+
+
+def test_deprecated_layout_names_preserve_physical_layouts():
+    with pytest.warns(DeprecationWarning, match="make_zn_layout is deprecated"):
+        legacy_nz = make_zn_layout((128, 128), [0, 1], (32, 32))
+    with pytest.warns(DeprecationWarning, match="make_nzz_layout is deprecated"):
+        legacy_zzn = make_nzz_layout((128, 128), [0, 1], (16, 16), (4, 4))
+
+    assert is_same_layout(legacy_nz, make_nz_layout((128, 128), [0, 1], (32, 32)))
+    assert is_same_layout(legacy_zzn, make_zzn_layout((128, 128), [0, 1], (16, 16), (4, 4)))
 
 
 def test_make_mx_layouts_reject_rank_one_default_axes_with_callsite_name():

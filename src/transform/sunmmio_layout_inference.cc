@@ -91,7 +91,7 @@ PrimFunc SunmmioLayoutInferencePass::Run(PrimFunc f) {
       Layout layout = pass.layout_entries_.at(parent).layout;
       auto analysis =
           sunmmio::AnalyzeMXLayout(layout, parent->dtype, &pass.analyzer_);
-      ICHECK(analysis && analysis->kind != sunmmio::MXLayoutKind::kMXZNN)
+      ICHECK(analysis && analysis->kind != sunmmio::MXLayoutKind::kMXNNZ)
           << "T.mx_view supports MXZZ, MXZNZ and MX row-major layouts";
       if (!descriptors.count(parent->data.get())) {
         descriptors[parent->data.get()] =

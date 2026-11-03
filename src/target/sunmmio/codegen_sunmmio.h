@@ -240,7 +240,11 @@ public:
              const std::vector<SunMMIOValue> &mins,
              const std::vector<int64_t> &extents, DataType ret_dtype,
              const SunMMIOType &ret_type, int64_t byte_offset = 0,
-             bool preserve_unit_dims = false) = 0;
+             bool preserve_region_rank = false, bool allow_rank3 = true,
+             const std::optional<std::vector<int64_t>> &planned_tiled_dims =
+                 std::nullopt,
+             const std::optional<std::vector<int64_t>> &planned_view_shape =
+                 std::nullopt) = 0;
 
   virtual std::pair<SunMMIOValue, SunMMIOValue>
   MXUnpack(const std::string &scale_name, const std::string &data_name,
@@ -424,7 +428,8 @@ private:
                               int64_t byte_offset = 0,
                               const char *copy_operand = nullptr,
                               bool use_layout_covered_shape = false,
-                              bool preserve_unit_dims = false);
+                              bool preserve_region_rank = false,
+                              bool allow_rank3 = true);
   SunMMIOValue EmitLoad(const tir::Buffer &buffer,
                         const ffi::Array<PrimExpr> &indices);
   void EmitStore(const tir::Buffer &buffer, const ffi::Array<PrimExpr> &indices,

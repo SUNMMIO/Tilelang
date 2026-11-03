@@ -607,6 +607,7 @@ Rewrite therefore treats wrappers carefully:
 - Common leading `AttrStmt` wrappers that are compatible with the shared loop prefix can be hoisted once around the fused subtree. Two `AttrStmt` frames are considered "the same" when they agree on `attr_key`, `node`, and `value` (checked by structural equality). Only the longest common prefix across all leaf regions is hoisted. `AttrStmt` wrappers that reference execution-loop variables are never hoisted.
 - Local `LetStmt` wrappers stay attached to the leaf that originally owned them, because they may bind values specific to that region.
 - `AttrStmt` hoisting is cumulative through scope nesting: each scope node additionally hoists any common `AttrStmt` prefix shared by its children, beyond what the parent scope already hoisted.
+- `tile.loop_unroll` is a low-priority tuning hint and does not affect fusion legality. A rebuilt shared loop keeps the smallest explicit factor from its descendant regions; regions without a factor do not override an explicit value. If no descendant specifies a factor, the shared loop remains unannotated.
 
 This is why rewrite can both simplify the outer structure and still preserve region-local bindings and annotations.
 
@@ -717,6 +718,7 @@ Those tests are useful references because they show the pass operating on realis
 - It may build nested shared loop prefixes instead of only a single outer shared loop prefix.
 - It may reorder regions inside one planning group when the dependence graph allows it and the planner score improves.
 - It may hoist a common leading `AttrStmt` prefix around the fused loop prefix.
+- It may merge `tile.loop_unroll` hints on a shared loop by selecting the smallest explicit factor.
 - It may leave some regions as standalone leaves at the root if sharing them is not legal or not profitable.
 
 ## What The Pass Does Not Do

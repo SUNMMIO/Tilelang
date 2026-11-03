@@ -127,9 +127,9 @@ ValidateCommon(const Buffer &data, const Array<Range> &data_range,
   ICHECK(analysis.has_value())
       << "T.mx_pack/T.mx_unpack support only MX row-major, MXZZ, and MXZNZ "
          "layouts for the mx buffer";
-  ICHECK(analysis->kind != sunmmio::MXLayoutKind::kMXZNN)
-      << "T.mx_pack/T.mx_unpack do not accept MXZNN as a user mx buffer "
-         "layout; use MXZNZ for RSRAM data staged before WSRAM MXZNN";
+  ICHECK(analysis->kind != sunmmio::MXLayoutKind::kMXNNZ)
+      << "T.mx_pack/T.mx_unpack do not accept MXNNZ as a user mx buffer "
+         "layout; use MXZNZ for RSRAM data staged before WSRAM MXNNZ";
   CheckSameShape(scale->shape, analysis->scale_shape, "scale",
                  "required MX scale", analyzer);
   return *analysis;
@@ -147,8 +147,8 @@ Layout ExpectedDataLayout(const Buffer &data,
     return sunmmio::MakeZZ(data->shape, axes,
                            Array<PrimExpr>{IntImm(DataType::Int(32), 32),
                                            IntImm(DataType::Int(32), 32)});
-  case sunmmio::MXLayoutKind::kMXZNN:
-    LOG(FATAL) << "MXZNN is an internal WSRAM layout and is not accepted by "
+  case sunmmio::MXLayoutKind::kMXNNZ:
+    LOG(FATAL) << "MXNNZ is an internal WSRAM layout and is not accepted by "
                   "T.mx_pack/T.mx_unpack";
   }
   LOG(FATAL) << "Unsupported MX layout kind";

@@ -214,7 +214,7 @@ GetTilesExecutionEnvelope(const Buffer &buffer, int exec_rank,
   }
 
   // Only single-level CuteLayouts are admitted as row-major. This excludes
-  // ZN and other blocked layouts even if they expose a short contiguous
+  // NZ and other blocked layouts even if they expose a short contiguous
   // prefix that happens to begin on a trailing dimension.
   for (const Integer &levels : cute->GetDimLevels()) {
     if (levels.IntValue() != 1) {
@@ -456,7 +456,7 @@ std::vector<TrailingTilePattern> EnumerateInferredTrailingTilePatterns(
   // This model correctly handles:
   //   - Row-major: single W step of full row width → all sub-widths valid
   //   - ZZ block: W then H step → inner-block (h,w) combos, then outer steps
-  //   - ZN: H-first ordering → only narrow width tiles
+  //   - NZ: H-first ordering → only narrow width tiles
   //
   // Dedup sets avoid emitting the same (h,w) at multiple step boundaries.
 

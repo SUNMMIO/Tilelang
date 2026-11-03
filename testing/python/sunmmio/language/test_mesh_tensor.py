@@ -4,7 +4,7 @@ import pytest
 import tilelang.language as T
 from tilelang.language.mesh_symbols import mesh_ncols, mesh_nrows
 from tilelang.language.mesh_tensor import MeshTensorProxy, MeshShardingPolicy, MeshReplicationType
-from tilelang.layout import make_zz_layout, make_zn_layout
+from tilelang.layout import make_zz_layout, make_nz_layout
 from tvm import tir
 
 
@@ -288,14 +288,14 @@ class TestLayoutParam:
         assert int(sharded_ms[2]) == 32  # block dim1
         assert int(sharded_ms[3]) == 2  # grid dim1
 
-    def test_zn_layout(self):
-        """ZN layout is stored and sharded correctly."""
+    def test_nz_layout(self):
+        """NZ layout is stored and sharded correctly."""
         proxy = MeshTensorProxy()
         shape = (128, 128)
         policy = MeshShardingPolicy(y=0, x=1, replicate=MeshReplicationType.NONE)
         device_mesh = (2, 2)
 
-        layout = make_zn_layout(shape, [0, 1], (32, 32))
+        layout = make_nz_layout(shape, [0, 1], (32, 32))
         tensor = proxy(shape, policy, device_mesh, layout=layout)
 
         import tvm_ffi
@@ -307,7 +307,7 @@ class TestLayoutParam:
         global_dl = _dim_levels(meta["global_layout"])
         assert tuple(int(v) for v in global_dl) == (2, 2)
 
-        # ZN has column-major inner block — stride pattern differs from ZZ
+        # NZ has column-major inner block — stride pattern differs from ZZ
         global_strides = _mode_stride(meta["global_layout"])
         sharded_strides = _mode_stride(meta["sharded_layout"])
 

@@ -434,7 +434,7 @@ def copy_region_tiled_parallel_2d_misaligned(tile_size=(8, 32), index_map=(-2, -
     return main
 
 
-def conflicting_binding_tiled_parallel_2d(dtype="float16"):
+def conflicting_binding_tiled_parallel_2d(dtype="float16", unroll=None):
     @T.prim_func
     def main(
         A: T.Tensor((32, 32), dtype),
@@ -449,7 +449,7 @@ def conflicting_binding_tiled_parallel_2d(dtype="float16"):
             T.copy(A[0:32, 0:32], A_shared)
             T.copy(B[0:32, 0:32], B_shared)
 
-            for j, i in T.Tiles([32, 32], parallel=True):
+            for j, i in T.Tiles([32, 32], parallel=True, unroll=unroll):
                 C_shared[i, j] = A_shared[i, j] + B_shared[j, i]
 
             T.copy(C_shared, C[0:32, 0:32])
@@ -1004,13 +1004,15 @@ def test_lower_tiles_loop_region_offset_rejects_misaligned_offset():
         apply_tiles_lowering(mod)
 
 
-def test_lower_tiles_loop_conflicting_binding_falls_back_to_scalar():
-    mod = IRModule.from_expr(conflicting_binding_tiled_parallel_2d().with_attr("global_symbol", "main"))
+def test_lower_tiles_loop_conflicting_binding_falls_back_to_scalar(capfd):
+    mod = IRModule.from_expr(conflicting_binding_tiled_parallel_2d(unroll=4).with_attr("global_symbol", "main"))
 
     mod = apply_tiles_lowering(mod)
     script = mod["main"].script()
     assert "tile.domain" not in script
     assert "tile.scope_entry" not in script
+    assert "tile.loop_unroll" not in script
+    assert "unroll hint was not applied" in capfd.readouterr().err
 
 
 def test_lower_tiles_loop_nested_scopes_rejected():

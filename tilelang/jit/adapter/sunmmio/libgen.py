@@ -22,9 +22,11 @@ SUNMMIO_CLANG_CFLAGS = (
     "--target=riscv64-sunmmio-elf",
     "-mno-relax",
     "-O2",
+    "-flto=full",
 )
 SUNMMIO_LDFLAGS = (
     "-fuse-ld=lld",
+    "-Wl,--defsym=_su_kernarg_addr=DTCM_KERNARGS_START",
     "-Wl,--no-warn-mismatch,--gc-sections",
     "-lnosys",
 )
@@ -444,6 +446,29 @@ __device static inline void pwln_init() {{
 """
 
 
+def _write_sunsim_pwln_linker_script(out_path: Path) -> Path:
+    out_path.write_text(
+        """\
+MEMORY
+{
+    PWLN_COEFFICIENTS (r) : ORIGIN = RSRAM_BASE,
+                          LENGTH = R_SRAM_STACK_START - RSRAM_BASE
+}
+
+SECTIONS
+{
+    .r.sram.common RSRAM_BASE :
+    {
+        KEEP(*(.r.sram.common))
+    } > PWLN_COEFFICIENTS
+}
+INSERT BEFORE .r.sram.stack;
+""",
+        encoding="utf-8",
+    )
+    return out_path
+
+
 def _render_sunsim_main_thunk(kernel_name: str) -> str:
     if not _C_IDENTIFIER_RE.match(kernel_name):
         raise ValueError(f"Sunmmio kernel name must be a C identifier for sunsim main thunk generation: {kernel_name!r}")
@@ -458,14 +483,13 @@ def _render_sunsim_main_thunk(kernel_name: str) -> str:
 
 extern "C" {{
 
-__attribute__((used, section(".kernargs"), aligned(8))) volatile unsigned char _kernel_arg_start[4096] = {{1}};
-__attribute__((used, section(".descriptors"), aligned(8))) volatile unsigned char _descriptor_start[4096] = {{1}};
+extern unsigned char _su_kernarg_addr[];
 
-void {kernel_name}(void *args);
+__device void {kernel_name}(void *args);
 
-int main(void) {{
+__device int main(void) {{
   pwln_init();
-  {kernel_name}(const_cast<unsigned char *>(_kernel_arg_start));
+  {kernel_name}(_su_kernarg_addr);
   return 0;
 }}
 
@@ -770,8 +794,20 @@ class SunmmioSunsimLibraryGenerator(SunmmioLibraryGenerator):
         timeout: float | None,
     ) -> Path:
         elf_path = build_dir / SUNMMIO_KERNEL_ELF_FILE
+        device_linker_script = toolchain.resolve_device_ld(_target_mcpu(self.target))
+        pwln_linker_script = _write_sunsim_pwln_linker_script(build_dir / "pwln.ld")
         _run_command(
-            [toolchain.clangxx, *self._compile_flags(toolchain), kernel_obj, thunk_obj, *SUNMMIO_LDFLAGS, "-o", elf_path],
+            [
+                toolchain.clangxx,
+                *self._compile_flags(toolchain),
+                kernel_obj,
+                thunk_obj,
+                *SUNMMIO_LDFLAGS,
+                f"-Wl,-T,{device_linker_script}",
+                f"-Wl,-T,{pwln_linker_script}",
+                "-o",
+                elf_path,
+            ],
             description="Sunmmio sunsim ELF link",
             timeout=timeout,
         )

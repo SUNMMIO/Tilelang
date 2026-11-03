@@ -6,6 +6,12 @@ import tilelang.language.tir.op as _tir_op
 import functools
 
 
+def where(predicate) -> None:
+    """Set a block predicate and record that it came from user-facing T.where."""
+    _ir.block_attr({"tilelang.explicit_where": True})
+    _ir.where(predicate)
+
+
 def serial(start: PrimExpr, stop: PrimExpr = None, *, annotations: dict[str, Any] = None) -> frame.ForFrame:
     """The serial For statement.
 

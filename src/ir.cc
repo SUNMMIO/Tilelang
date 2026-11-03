@@ -118,6 +118,7 @@ ForFrame TilesFor(const Array<PrimExpr> &extents,
     ICHECK_EQ(vars.size(), doms.size());
     int n = vars.size();
     String tile_domain_key(attr::kTileDomain);
+    String tile_unroll_key(attr::kTileLoopUnroll);
     for (int i = n - 1; i >= 0; --i) {
       Range dom = doms[i];
       Var var = vars[i];
@@ -125,7 +126,8 @@ ForFrame TilesFor(const Array<PrimExpr> &extents,
           i < steps.size() ? steps[i] : Optional<PrimExpr>(std::nullopt);
       Map<String, ObjectRef> loop_annotations;
       for (const auto &kv : annotations) {
-        if (i != 0 && kv.first == tile_domain_key) {
+        if (i != 0 &&
+            (kv.first == tile_domain_key || kv.first == tile_unroll_key)) {
           continue;
         }
         loop_annotations.Set(kv.first, kv.second);

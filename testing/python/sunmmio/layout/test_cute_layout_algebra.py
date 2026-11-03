@@ -161,7 +161,7 @@ class TestLogicalDivide:
 
 class TestAlgebraConstructorEquivalence:
     """Verify that logicalDivide produces the same mode shapes as the
-    MakeZZ/MakeZN constructors."""
+    MakeZZ/MakeNZ constructors."""
 
     def _get_constructor_mode_shapes(self, constructor, shape, axes, block_shape):
         make_fn = _get(f"tl.sunmmio.make_{constructor}")
@@ -190,9 +190,9 @@ class TestAlgebraConstructorEquivalence:
         ctor_shapes = self._get_constructor_mode_shapes("zz", (128, 128), (0, 1), (32, 32))
         assert ctor_shapes == [32, 4, 32, 4]
 
-    def test_zn_shapes_from_divide(self):
-        """ZN has same shapes as ZZ, just different strides."""
-        ctor_shapes = self._get_constructor_mode_shapes("zn", (128, 128), (0, 1), (32, 32))
+    def test_nz_shapes_from_divide(self):
+        """NZ has same shapes as ZZ, just different strides."""
+        ctor_shapes = self._get_constructor_mode_shapes("nz", (128, 128), (0, 1), (32, 32))
         # Same shapes as ZZ
         assert ctor_shapes == [32, 4, 32, 4]
 

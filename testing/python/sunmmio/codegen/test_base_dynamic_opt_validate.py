@@ -5,8 +5,8 @@ import tilelang.language as T
 import tilelang.testing
 import tvm_ffi
 from tilelang.layout import (
-    make_nzz_layout,
-    make_zn_layout,
+    make_zzn_layout,
+    make_nz_layout,
     make_zz_layout,
     make_zzz_layout,
 )
@@ -179,9 +179,9 @@ def test_dynamic_named_layout_constructors_accept_symbolic_shapes():
 
     layouts = {
         "zz": make_zz_layout((M, K)),
-        "zn": make_zn_layout((M, K), [0, 1], (32, 32)),
+        "nz": make_nz_layout((M, K), [0, 1], (32, 32)),
         "zzz": make_zzz_layout((M, N), [0, 1], (32, 32), (2, 2)),
-        "nzz": make_nzz_layout((K, N), [0, 1], (32, 32), (2, 2)),
+        "zzn": make_zzn_layout((K, N), [0, 1], (32, 32), (2, 2)),
     }
     for name, layout in layouts.items():
         print_layout_info(name, layout)

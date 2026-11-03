@@ -1,6 +1,6 @@
 from .gemm_base import GemmBase
-from tilelang.layout import make_zz_layout, make_zn_layout, make_mxzz_layout
-from tilelang.layout.sunmmio_layouts import _make_mxznn_layout
+from tilelang.layout import make_zz_layout, make_nz_layout, make_mxzz_layout
+from tilelang.layout.sunmmio_layouts import _make_mxnnz_layout
 from tilelang import tvm as tvm
 import tvm_ffi
 from tvm.target import Target
@@ -74,7 +74,7 @@ class GemmSunmmio(GemmBase):
             else:
                 a_block = _sunmmio_block_shape(self.A.dtype)
                 a_layout = make_zz_layout(self.A, block_shape=a_block)
-            # B (WSRAM): MX uses MXZZ/MXZNN; non-MX keeps ZZ/ZN.
+            # B (WSRAM): MX uses MXZZ/MXNNZ; non-MX keeps ZZ/NZ.
             rank_b = len(self.B.shape)
             axes_b = [rank_b - 2, rank_b - 1]
             if _is_mx_dtype(self.B.dtype):
@@ -82,14 +82,14 @@ class GemmSunmmio(GemmBase):
                     _check_mx_operand_block_aligned(self.B, rank_b - 1, "B", "MXZZ")
                     b_layout = make_mxzz_layout(self.B, dtype=_canonical_mx_dtype(self.B.dtype))
                 else:
-                    _check_mx_operand_block_aligned(self.B, rank_b - 2, "B", "MXZNN")
-                    b_layout = _make_mxznn_layout(self.B, axes_b, dtype=_canonical_mx_dtype(self.B.dtype))
+                    _check_mx_operand_block_aligned(self.B, rank_b - 2, "B", "MXNNZ")
+                    b_layout = _make_mxnnz_layout(self.B, axes_b, dtype=_canonical_mx_dtype(self.B.dtype))
             else:
                 b_block = _sunmmio_block_shape(self.B.dtype)
                 if self.trans_B:
                     b_layout = make_zz_layout(self.B, block_shape=b_block)
                 else:
-                    b_layout = make_zn_layout(self.B.shape, axes_b, b_block)
+                    b_layout = make_nz_layout(self.B.shape, axes_b, b_block)
             # C (RSRAM): ZZ with block shape from GetSunmmioLayoutBlockShape
             c_block = _sunmmio_block_shape(self.C.dtype)
             c_layout = make_zz_layout(self.C, block_shape=c_block)

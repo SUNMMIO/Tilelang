@@ -12,6 +12,9 @@ constexpr const char *tilelang_is_cpu_kernel_frame =
     "tilelang.is_cpu_kernel_frame";
 
 namespace attr {
+// Marks a block whose predicate came from an explicit user-facing T.where.
+constexpr const char *kExplicitWhere = "tilelang.explicit_where";
+
 // Attributes to mark CUDA sync calls
 constexpr const char *kHasTriggerLaunch = "has_cuda_pdl_trigger";
 constexpr const char *kHasGridSync = "has_cuda_pdl_sync";
@@ -26,6 +29,9 @@ constexpr const char *tile_level_loop = "tile.loop_parallel";
 // iteration domain before legalization.
 constexpr const char *kTileDomain = "tile.domain";
 constexpr const char *kTileLoopStage = "tile.loop_stage";
+// Requests a backend unroll count for the outermost materialized loop of a
+// T.Tiles scope. The frontend restricts the supported tuning factors.
+constexpr const char *kTileLoopUnroll = "tile.loop_unroll";
 
 // ---- these attrs will be added / normalized by legalize_tiles_loop pass ----
 // tile.tile_size stores the chosen execution tile shape on the scope root.
@@ -60,6 +66,9 @@ constexpr const char *tile_interior_axis = "tile.interior_axis";
 constexpr const char *kSunmmioReduceRegisterTemp =
     "tile.sunmmio_reduce_register_temp";
 
+// Planned SUVM tile_view metadata carried by tl.tileop.region.
+constexpr const char *kSunmmioRegionTiledDims = "sunmmio.region_tiled_dims";
+constexpr const char *kSunmmioRegionViewShape = "sunmmio.region_view_shape";
 } // namespace attr
 
 enum class TileLoopStage : int {
