@@ -63,18 +63,15 @@ def _make_module(
     state_shape = (8, 32, 32) if slot_state else (32, 32)
     if fault == "insufficient_slots":
         state_shape = (1, 32, 32)
-    accumulators = [
-        _buffer(name_prefix + "_acc" + str(i), state_shape, "shared.rsram")
-        for i in range(consumers)
-    ]
-    outputs = [
-        _buffer(name_prefix + "_out" + str(i), state_shape, "shared.rsram")
-        for i in range(consumers)
-    ]
+    accumulators = [_buffer(name_prefix + "_acc" + str(i), state_shape, "shared.rsram") for i in range(consumers)]
+    outputs = [_buffer(name_prefix + "_out" + str(i), state_shape, "shared.rsram") for i in range(consumers)]
     if fault == "aliased_state_views":
         outputs[0] = tir.decl_buffer(
-            state_shape, "bfloat16", name="state_alias",
-            data=accumulators[0].data, scope="shared.rsram",
+            state_shape,
+            "bfloat16",
+            name="state_alias",
+            data=accumulators[0].data,
+            scope="shared.rsram",
         )
     state_indices = [column, 0, 0] if slot_state else [0, 0]
     state_extents = [1, 32, 32] if slot_state else [32, 32]
@@ -124,10 +121,7 @@ def _make_module(
     if fault == "unknown_core_effect":
         core_stmts.insert(2, tir.Evaluate(tir.call_extern("int32", "unknown_effect")))
     if fault == "resident_overwritten":
-        core_stmts.append(
-            _op("tl.dma_copy", _region(weight, 1, [0, 0], [32, 32]),
-                _region(resident, 2, [0, 0], [32, 32]), 0)
-        )
+        core_stmts.append(_op("tl.dma_copy", _region(weight, 1, [0, 0], [32, 32]), _region(resident, 2, [0, 0], [32, 32]), 0))
     if fault == "conditional_mma":
         core_stmts[-1] = tir.IfThenElse(column < 2, computes[-1], computes[-1])
     if fault == "conditional_collective":
@@ -138,27 +132,38 @@ def _make_module(
         core_stmts = [tir.SeqStmt(core_stmts[:2]), tir.SeqStmt(core_stmts[2:])]
     core_extent = column + 1 if fault == "dependent_core_extent" else 2
     core = tir.For(
-        reduction, 0, core_extent, tir.ForKind.SERIAL, tir.SeqStmt(core_stmts),
+        reduction,
+        0,
+        core_extent,
+        tir.ForKind.SERIAL,
+        tir.SeqStmt(core_stmts),
         annotations={"num_stages": 2},
         step=2 if fault == "nonunit_core_step" else 1,
     )
     prefix = []
     if not slot_state:
-        prefix = [
-            tir.BufferStore(acc, tir.const(0, "bfloat16"), state_indices)
-            for acc in accumulators
-        ]
+        prefix = [tir.BufferStore(acc, tir.const(0, "bfloat16"), state_indices) for acc in accumulators]
     if fault == "full_float_clear":
         prefix = []
         for index, acc in enumerate(accumulators):
             row = tir.Var("clear_row_" + str(index), "int32")
             col = tir.Var("clear_col_" + str(index), "int32")
-            prefix.append(tir.For(row, 0, 32, tir.ForKind.SERIAL,
-                                 tir.For(col, 0, 32, tir.ForKind.SERIAL,
-                                         tir.BufferStore(acc, tir.FloatImm("bfloat16", 0.0), [row, col]))))
+            prefix.append(
+                tir.For(
+                    row,
+                    0,
+                    32,
+                    tir.ForKind.SERIAL,
+                    tir.For(col, 0, 32, tir.ForKind.SERIAL, tir.BufferStore(acc, tir.FloatImm("bfloat16", 0.0), [row, col])),
+                )
+            )
     suffix = [
-        _op("tl.dma_copy", _region(output, 1, state_indices, state_extents),
-            _region(dst, 2, [expert, column, i, 0, 0], [1, 1, 1, 32, 32]), 0)
+        _op(
+            "tl.dma_copy",
+            _region(output, 1, state_indices, state_extents),
+            _region(dst, 2, [expert, column, i, 0, 0], [1, 1, 1, 32, 32]),
+            0,
+        )
         for i, output in enumerate(outputs)
     ]
     if extra_readback:
@@ -189,13 +194,20 @@ def _make_module(
     if grouped:
         inner_body = tir.SeqStmt([tir.SeqStmt([*prefix, core]), *suffix])
     inner = tir.For(
-        column, 0, reuse_extent, tir.ForKind.SERIAL,
+        column,
+        0,
+        reuse_extent,
+        tir.ForKind.SERIAL,
         inner_body,
         annotations={INNER: 1} if marked else {},
         step=2 if fault == "nonunit_reuse_step" else 1,
     )
     outer = tir.For(
-        expert, 0, 2, tir.ForKind.SERIAL, inner,
+        expert,
+        0,
+        2,
+        tir.ForKind.SERIAL,
+        inner,
         annotations={OUTER: 1} if marked else {},
     )
     if batch_wrapper:
@@ -210,19 +222,27 @@ def _make_module(
     params = [a.data, b.data, dst.data, index_buffer.data]
     if isinstance(reuse_extent, tir.Var):
         params.append(reuse_extent)
-    func = tir.PrimFunc(
-        params, tir.BlockRealize([], tir.const(True, "bool"), root),
-        buffer_map={a.data: a, b.data: b, dst.data: dst, index_buffer.data: index_buffer},
-    ).with_attr("global_symbol", "main").with_attr("tir.noalias", True)
+    func = (
+        tir.PrimFunc(
+            params,
+            tir.BlockRealize([], tir.const(True, "bool"), root),
+            buffer_map={a.data: a, b.data: b, dst.data: dst, index_buffer.data: index_buffer},
+        )
+        .with_attr("global_symbol", "main")
+        .with_attr("tir.noalias", True)
+    )
     return tvm.IRModule.from_expr(func)
 
 
 @pytest.fixture(autouse=True)
 def _clean_residency_env(monkeypatch):
     for key in (
-        "TL_SUNMMIO_RESIDENCY_POLICY", "TL_SUNMMIO_RESIDENCY_REPORT",
-        "TL_SUNMMIO_RESIDENCY_MAX_ADDED_BYTES", "TL_SUNMMIO_RESIDENCY_MAX_REUSE_EXTENT",
-        "TL_SUNMMIO_MULTIDIM_INTERCHANGE", "TL_SUNMMIO_ILP_ENABLE_LATENCY_GCD",
+        "TL_SUNMMIO_RESIDENCY_POLICY",
+        "TL_SUNMMIO_RESIDENCY_REPORT",
+        "TL_SUNMMIO_RESIDENCY_MAX_ADDED_BYTES",
+        "TL_SUNMMIO_RESIDENCY_MAX_REUSE_EXTENT",
+        "TL_SUNMMIO_MULTIDIM_INTERCHANGE",
+        "TL_SUNMMIO_ILP_ENABLE_LATENCY_GCD",
         "FINAL_ILP_ENABLE_LATENCY_GCD",
     ):
         monkeypatch.delenv(key, raising=False)
@@ -248,8 +268,7 @@ def _marked(mod, key):
     found = []
     tir.stmt_functor.post_order_visit(
         mod["main"].body,
-        lambda node: found.append(node)
-        if isinstance(node, tir.For) and bool(node.annotations.get(key, False)) else None,
+        lambda node: found.append(node) if isinstance(node, tir.For) and bool(node.annotations.get(key, False)) else None,
     )
     return found
 
@@ -259,12 +278,12 @@ def _without_diagnostic_annotations(mod):
         if not isinstance(node, tir.For):
             return None
         annotations = {
-            str(key): value for key, value in node.annotations.items()
-            if not str(key).startswith("tl.sunmmio.residency.")
-            and not str(key).startswith("tl.sunmmio.multidim.")
+            str(key): value
+            for key, value in node.annotations.items()
+            if not str(key).startswith("tl.sunmmio.residency.") and not str(key).startswith("tl.sunmmio.multidim.")
         }
-        return tir.For(node.loop_var, node.min, node.extent, node.kind, node.body,
-                       node.thread_binding, annotations, node.step)
+        return tir.For(node.loop_var, node.min, node.extent, node.kind, node.body, node.thread_binding, annotations, node.step)
+
     body = tir.stmt_functor.ir_transform(mod["main"].body, None, rewrite, ["tir.For"])
     return tvm.IRModule.from_expr(mod["main"].with_body(body))
 
@@ -272,7 +291,8 @@ def _without_diagnostic_annotations(mod):
 def _same_statements(before, after):
     return tvm.ir.structural_equal(
         _without_diagnostic_annotations(before),
-        _without_diagnostic_annotations(after), map_free_vars=True,
+        _without_diagnostic_annotations(after),
+        map_free_vars=True,
     )
 
 
@@ -296,30 +316,21 @@ def test_marker_free_natural_nest_discovers_resident_tile(tmp_path, monkeypatch,
     assert not _marked(after, APPLIED), "analysis is not evidence of an executed rewrite"
 
 
-def test_auto_rejects_residency_when_reuse_cannot_amortize_shared_prefix(
-    tmp_path, monkeypatch
-):
+def test_auto_rejects_residency_when_reuse_cannot_amortize_shared_prefix(tmp_path, monkeypatch):
     before = _make_module(reuse_extent=2)
     after, report = _analyze(before, tmp_path, monkeypatch)
     assert not _accepted(report)
-    assert any(
-        item["reason"] == "insufficient_reuse_amortization"
-        for item in report["candidates"]
-    )
+    assert any(item["reason"] == "insufficient_reuse_amortization" for item in report["candidates"])
     assert _same_statements(before, after)
 
 
 def test_forced_can_profile_low_amortization_candidate(tmp_path, monkeypatch):
-    _, report = _analyze(
-        _make_module(reuse_extent=2), tmp_path, monkeypatch, "forced"
-    )
+    _, report = _analyze(_make_module(reuse_extent=2), tmp_path, monkeypatch, "forced")
     assert _accepted(report)
 
 
 def test_multiple_consumers_amortize_short_reuse(tmp_path, monkeypatch):
-    _, report = _analyze(
-        _make_module(reuse_extent=2, consumers=2), tmp_path, monkeypatch
-    )
+    _, report = _analyze(_make_module(reuse_extent=2, consumers=2), tmp_path, monkeypatch)
     assert _accepted(report)
 
 
@@ -327,9 +338,7 @@ def test_renaming_buffers_and_coordinates_does_not_change_acceptance(tmp_path, m
     _, first = _analyze(_make_module(name_prefix="first"), tmp_path, monkeypatch)
     _, second = _analyze(_make_module(name_prefix="completely_different"), tmp_path, monkeypatch)
     fields = ("reuse_extent", "shared_prefix_count", "consumer_count", "added_bytes")
-    assert [[item[key] for key in fields] for item in _accepted(first)] == [
-        [item[key] for key in fields] for item in _accepted(second)
-    ]
+    assert [[item[key] for key in fields] for item in _accepted(first)] == [[item[key] for key in fields] for item in _accepted(second)]
     assert _accepted(first)
 
 
@@ -348,12 +357,25 @@ def test_multiple_consumers_are_not_a_four_statement_template(tmp_path, monkeypa
 @pytest.mark.parametrize(
     "fault",
     [
-        "source_depends_on_reuse", "suffix_writes_source", "suffix_alias_writes_source",
-        "source_modified_in_core", "unknown_core_effect", "nested_core_effect",
-        "unknown_suffix_effect", "prefix_writes_source", "conditional_mma",
-        "conditional_collective", "dependent_core_extent", "aliased_state_views",
-        "nonunit_core_step", "nonunit_reuse_step", "state_escapes", "hidden_index_read_modified",
-        "partial_collective", "nonfinal_suffix_writes_source", "nonfinal_prefix_writes_source",
+        "source_depends_on_reuse",
+        "suffix_writes_source",
+        "suffix_alias_writes_source",
+        "source_modified_in_core",
+        "unknown_core_effect",
+        "nested_core_effect",
+        "unknown_suffix_effect",
+        "prefix_writes_source",
+        "conditional_mma",
+        "conditional_collective",
+        "dependent_core_extent",
+        "aliased_state_views",
+        "nonunit_core_step",
+        "nonunit_reuse_step",
+        "state_escapes",
+        "hidden_index_read_modified",
+        "partial_collective",
+        "nonfinal_suffix_writes_source",
+        "nonfinal_prefix_writes_source",
         "partial_float_clear",
     ],
 )
@@ -408,16 +430,16 @@ def test_reduction_order_and_output_predicates_survive_analysis(tmp_path, monkey
     tir.stmt_functor.post_order_visit(
         after["main"].body,
         lambda node: calls.append(node)
-        if isinstance(node, tir.Call) and isinstance(node.op, tvm.ir.Op)
-        and node.op.name == "tl.mma_sunmmio" else None,
+        if isinstance(node, tir.Call) and isinstance(node.op, tvm.ir.Op) and node.op.name == "tl.mma_sunmmio"
+        else None,
     )
     assert len(calls) == 1
     original_calls = []
     tir.stmt_functor.post_order_visit(
         before["main"].body,
         lambda node: original_calls.append(node)
-        if isinstance(node, tir.Call) and isinstance(node.op, tvm.ir.Op)
-        and node.op.name == "tl.mma_sunmmio" else None,
+        if isinstance(node, tir.Call) and isinstance(node.op, tvm.ir.Op) and node.op.name == "tl.mma_sunmmio"
+        else None,
     )
     assert tvm.ir.structural_equal(calls[0], original_calls[0], map_free_vars=True)
     reduction = None
@@ -461,8 +483,7 @@ def test_pure_boundary_if_else_is_preserved_and_supported(tmp_path, monkeypatch)
 
 @pytest.mark.parametrize("fault", ["suffix_writes_source", "unknown_core_effect", "missing_noalias"])
 def test_rejected_analysis_cannot_force_residency_interchange(tmp_path, monkeypatch, fault):
-    before = _make_module(fault=None if fault == "missing_noalias" else fault,
-                          extra_readback=True)
+    before = _make_module(fault=None if fault == "missing_noalias" else fault, extra_readback=True)
     if fault == "missing_noalias":
         before = tvm.IRModule.from_expr(before["main"].without_attr("tir.noalias"))
     monkeypatch.setenv("TL_SUNMMIO_MULTIDIM_INTERCHANGE", "1")
@@ -490,8 +511,8 @@ def test_natural_candidate_really_versions_state_and_rewrites_in_auto(tmp_path, 
     tir.stmt_functor.post_order_visit(
         core.body,
         lambda node: calls.append(node)
-        if isinstance(node, tir.Call) and isinstance(node.op, tvm.ir.Op)
-        and node.op.name == "tl.mma_sunmmio" else None,
+        if isinstance(node, tir.Call) and isinstance(node.op, tvm.ir.Op) and node.op.name == "tl.mma_sunmmio"
+        else None,
     )
     assert len(calls) == 3
     accumulator_data = [call.args[2].args[0].buffer.data for call in calls]
@@ -510,13 +531,10 @@ def test_slotted_candidate_uses_only_generic_residency(tmp_path, monkeypatch):
     path = tmp_path / "selection.json"
     monkeypatch.setenv("TL_SUNMMIO_RESIDENCY_REPORT", str(path))
     monkeypatch.setenv("TL_SUNMMIO_RESIDENCY_POLICY", "auto_strict")
-    after = tl.transform.FlattenSunmmioStaticWorkItems("auto")(
-        _make_module(marked=True, slot_state=True)
-    )
+    after = tl.transform.FlattenSunmmioStaticWorkItems("auto")(_make_module(marked=True, slot_state=True))
     report = json.loads(path.read_text(encoding="utf-8"))
     assert _marked(after, APPLIED)
-    assert any(item["selected_strategy"] == "generic_residency"
-               for item in report["candidates"])
+    assert any(item["selected_strategy"] == "generic_residency" for item in report["candidates"])
     assert all("legacy_equivalent" not in item for item in report["candidates"])
 
 
@@ -531,18 +549,15 @@ def test_nonunit_or_symbolic_initialization_step_cannot_prove_full_tile(tmp_path
 
     def rewrite(node):
         if isinstance(node, tir.For) and node.loop_var.name.startswith("clear_row_"):
-            return tir.For(node.loop_var, node.min, node.extent, node.kind, node.body,
-                           node.thread_binding, node.annotations, step)
+            return tir.For(node.loop_var, node.min, node.extent, node.kind, node.body, node.thread_binding, node.annotations, step)
         return None
 
     body = tir.stmt_functor.ir_transform(original["main"].body, None, rewrite, ["tir.For"])
     func = original["main"].with_body(body)
     if isinstance(step, tir.Var):
-        func = tir.PrimFunc([*func.params, step], func.body, func.ret_type,
-                           func.buffer_map, func.attrs, func.span)
+        func = tir.PrimFunc([*func.params, step], func.body, func.ret_type, func.buffer_map, func.attrs, func.span)
     before = tvm.IRModule.from_expr(func)
     after, report = _analyze(before, tmp_path, monkeypatch)
     assert not _accepted(report), "a strided clear does not initialize every accumulator element"
-    assert any(item["reason"] == "accumulator_not_fully_initialized"
-               for item in report["candidates"])
+    assert any(item["reason"] == "accumulator_not_fully_initialized" for item in report["candidates"])
     assert _same_statements(before, after)

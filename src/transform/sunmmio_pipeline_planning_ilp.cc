@@ -826,7 +826,6 @@ void WriteProblemJson(const Problem &prob, const std::string &path) {
   }
   out << "},\n";
 
-
   out << "  \"dependency_constraints\": [";
   for (size_t i = 0; i < prob.dependencies.size(); ++i) {
     const DependencySpec &dependency = prob.dependencies[i];
@@ -1248,23 +1247,20 @@ SolutionVerifyResult VerifySolution(const Problem &prob,
       fail(&result.raw_cycle_ok, "raw-cycle lift unit overflow");
     } else {
       result.raw_lift_unit = gcd * faster;
-      if (sol.II > std::numeric_limits<int64_t>::max() /
-                       result.raw_lift_unit) {
+      if (sol.II > std::numeric_limits<int64_t>::max() / result.raw_lift_unit) {
         fail(&result.raw_cycle_ok, "raw-cycle II overflow");
       } else {
-        result.raw_ii =
-            static_cast<int64_t>(sol.II) * result.raw_lift_unit;
+        result.raw_ii = static_cast<int64_t>(sol.II) * result.raw_lift_unit;
       }
       std::vector<int64_t> raw_start(prob.N, 0);
       for (int i = 0; i < prob.N; ++i) {
-        if (sol.t[i] > std::numeric_limits<int64_t>::max() /
-                           result.raw_lift_unit) {
+        if (sol.t[i] >
+            std::numeric_limits<int64_t>::max() / result.raw_lift_unit) {
           fail(&result.raw_cycle_ok,
                "raw-cycle start overflow for command " + std::to_string(i));
           continue;
         }
-        raw_start[i] =
-            static_cast<int64_t>(sol.t[i]) * result.raw_lift_unit;
+        raw_start[i] = static_cast<int64_t>(sol.t[i]) * result.raw_lift_unit;
         int64_t raw_latency =
             i < static_cast<int>(prob.cost_estimates.size())
                 ? std::max<int64_t>(1, prob.cost_estimates[i].latency_cycles)
@@ -1293,15 +1289,14 @@ SolutionVerifyResult VerifySolution(const Problem &prob,
         int delta = prob.delta.at(EdgeKey(src, dst));
         int64_t raw_latency =
             src < static_cast<int>(prob.cost_estimates.size())
-                ? std::max<int64_t>(
-                      1, prob.cost_estimates[src].latency_cycles)
+                ? std::max<int64_t>(1, prob.cost_estimates[src].latency_cycles)
                 : static_cast<int64_t>(prob.P[src].latency) *
                       result.raw_lift_unit;
         if (raw_start[dst] - raw_start[src] <
             raw_latency - static_cast<int64_t>(delta) * result.raw_ii) {
-          fail(&result.raw_cycle_ok,
-               "raw-cycle dependency violated " + std::to_string(src) +
-                   "->" + std::to_string(dst));
+          fail(&result.raw_cycle_ok, "raw-cycle dependency violated " +
+                                         std::to_string(src) + "->" +
+                                         std::to_string(dst));
         }
       }
     }
@@ -4508,13 +4503,14 @@ BankFlipMode GuessBankFlipMode(const Problem &prob) {
 }
 
 // The analysis set is an identity-membership set, not a stable serialization
-// order: ObjectRef::operator< compares heap addresses.  Export only the required
-// identities in deterministic function/AST order, without changing that set or
-// the solver.  In particular, do not merge different views sharing one data Var.
+// order: ObjectRef::operator< compares heap addresses.  Export only the
+// required identities in deterministic function/AST order, without changing
+// that set or the solver.  In particular, do not merge different views sharing
+// one data Var.
 class StableUsedBufferExporter : public StmtExprVisitor {
 public:
   static Optional<Array<Buffer>> Export(const PrimFunc &func,
-                                       const std::set<Buffer> &required) {
+                                        const std::set<Buffer> &required) {
     StableUsedBufferExporter exporter(required);
     // buffer_map is a Map; its iteration order is not part of this proof.
     for (const Var &param : func->params) {
@@ -4525,7 +4521,7 @@ public:
     }
     exporter.VisitStmt(func->body);
     if (exporter.seen_.size() != required.size()) {
-      return {};  // Never recover unknown provenance using heap order.
+      return {}; // Never recover unknown provenance using heap order.
     }
     return exporter.ordered_;
   }
@@ -4586,8 +4582,8 @@ private:
   }
 
   // The ordinary visitor traverses Call args and statement/loop expressions in
-  // program order, but not Call/For/Block annotations or AttrStmt.node.  A Buffer
-  // reachable only through such metadata intentionally remains unproven.
+  // program order, but not Call/For/Block annotations or AttrStmt.node.  A
+  // Buffer reachable only through such metadata intentionally remains unproven.
   const std::set<Buffer> &required_;
   std::unordered_set<const BufferNode *> seen_;
   Array<Buffer> ordered_;
@@ -5176,8 +5172,8 @@ private:
       if (cfg.defined()) {
         enable_latency_gcd = cfg.value()->value;
       } else if (std::getenv("TL_SUNMMIO_ILP_ENABLE_LATENCY_GCD") != nullptr) {
-        enable_latency_gcd = GetEnvBool(
-            "TL_SUNMMIO_ILP_ENABLE_LATENCY_GCD", enable_latency_gcd);
+        enable_latency_gcd =
+            GetEnvBool("TL_SUNMMIO_ILP_ENABLE_LATENCY_GCD", enable_latency_gcd);
       }
     }
     if (latency_gcd <= 0 || !enable_latency_gcd) {
@@ -5592,7 +5588,9 @@ private:
 
     const std::string pipeline_mode =
         op->annotations.find("tl.sunmmio.multidim.region") !=
-                op->annotations.end() ? "multidim_ilp" : "ilp";
+                op->annotations.end()
+            ? "multidim_ilp"
+            : "ilp";
 
     const bool nested_enabled = ShouldEnableNestedPipeline();
     PipelineNestInspector nest;
@@ -5603,7 +5601,8 @@ private:
       Stmt body = this->VisitStmt(op->body);
       loop.CopyOnWrite()->body = body;
       For sequential = StripNumStages(loop);
-      return MakePipelineFallback(sequential, pipeline_mode, "nested_validation",
+      return MakePipelineFallback(sequential, pipeline_mode,
+                                  "nested_validation",
                                   "nested_feature_disabled");
     }
 
@@ -5621,8 +5620,8 @@ private:
       if (!fallback_reason.empty()) {
         For sequential = Downcast<For>(StmtExprMutator::VisitStmt_(op));
         sequential = StripNumStages(sequential);
-        return MakePipelineFallback(sequential, pipeline_mode, "nested_validation",
-                                    fallback_reason);
+        return MakePipelineFallback(sequential, pipeline_mode,
+                                    "nested_validation", fallback_reason);
       }
 
       // ASC-NEST phase 1: plan descendants before building the parent
@@ -5635,9 +5634,10 @@ private:
       if (child_failure) {
         For sequential = StripNumStages(loop);
         return MakePipelineFallback(
-            sequential, PipelineDiagnostic{false, pipeline_mode, "nested_validation",
-                                           "nested_child_fallback",
-                                           std::string(child_failure.value())});
+            sequential,
+            PipelineDiagnostic{false, pipeline_mode, "nested_validation",
+                               "nested_child_fallback",
+                               std::string(child_failure.value())});
       }
       std::vector<Buffer> parent_owned_buffers;
       Optional<String> shared_buffers =
@@ -5743,7 +5743,8 @@ private:
       return loop;
     }
     if (!sol.ok) {
-      return MakePipelineFallback(loop, pipeline_mode, "planning", "ilp_infeasible");
+      return MakePipelineFallback(loop, pipeline_mode, "planning",
+                                  "ilp_infeasible");
     }
     PopulateRuntimeBankMetadata(&analysis, sol);
     std::unordered_set<std::string> resident_buffer_names;
@@ -6161,8 +6162,9 @@ tvm::transform::Pass SunmmioPipelinePlanningILP(bool debug = false) {
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.transform.SunmmioPipelinePlanningILP",
-                        SunmmioPipelinePlanningILP)
+  refl::GlobalDef()
+      .def("tl.transform.SunmmioPipelinePlanningILP",
+           SunmmioPipelinePlanningILP)
       // Internal read-only test hook: exactly the production exporter, without
       // running a solver, modifying IR, or adding an alternate pipeline path.
       .def("tl.testing.SunmmioILPStableUsedBuffers",

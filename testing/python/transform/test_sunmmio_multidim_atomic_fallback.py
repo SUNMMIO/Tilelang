@@ -13,6 +13,7 @@ from tilelang.engine.sunmmio_candidate_selection import compare_pipeline_candida
 def _append_pass(stage):
     return lambda mod: mod + (stage,)
 
+
 @pytest.fixture(autouse=True)
 def _clean_multidim_env(monkeypatch):
     monkeypatch.setenv("TL_SUNMMIO_STATIC_WORKITEM_POLICY", "off")
@@ -95,9 +96,7 @@ def test_static_and_regular_candidates_compete_and_ordinary_can_win(monkeypatch)
     monkeypatch.setattr(
         phase.tilelang.transform,
         "SunmmioRegionCrossOuterPipelinePlanning",
-        lambda debug, policy, strategy: _append_pass(
-            f"outer_plan:{policy}:{strategy}"
-        ),
+        lambda debug, policy, strategy: _append_pass(f"outer_plan:{policy}:{strategy}"),
     )
     monkeypatch.setattr(
         phase.tilelang.transform,
@@ -146,9 +145,7 @@ def test_static_candidate_survives_ordinary_candidate_failure(monkeypatch):
     def fail_ordinary(original, policy):
         raise RuntimeError("ordinary candidate failure")
 
-    monkeypatch.setattr(
-        phase, "_apply_sunmmio_ordinary_multidim_candidate", fail_ordinary
-    )
+    monkeypatch.setattr(phase, "_apply_sunmmio_ordinary_multidim_candidate", fail_ordinary)
 
     result = phase._apply_sunmmio_multidim_atomic(("original",), "auto")
 
@@ -198,9 +195,7 @@ def test_static_candidate_auto_failure_keeps_regular_multidim(monkeypatch):
     monkeypatch.setattr(
         phase.tilelang.transform,
         "FlattenSunmmioStaticWorkItems",
-        lambda policy: lambda mod: (_ for _ in ()).throw(
-            RuntimeError("candidate failure")
-        ),
+        lambda policy: lambda mod: (_ for _ in ()).throw(RuntimeError("candidate failure")),
     )
     monkeypatch.setattr(
         phase.tilelang.transform,
@@ -285,9 +280,7 @@ def _make_planned_module(
         "state",
         tvm.ir.PointerType(tvm.ir.PrimType("float32"), "shared.rsram"),
     )
-    buffer = tir.decl_buffer(
-        (4,), "float32", name="state", data=data, scope="shared.rsram"
-    )
+    buffer = tir.decl_buffer((4,), "float32", name="state", data=data, scope="shared.rsram")
     loop_var = tir.Var("k", "int32")
     body = tir.BufferStore(
         buffer,
@@ -306,9 +299,7 @@ def _make_planned_module(
             "ii": ii,
             "makespan": makespan,
             "iterations": 2,
-            "tl.sunmmio.pipeline.command_start_times": list(
-                range(command_slots)
-            ),
+            "tl.sunmmio.pipeline.command_start_times": list(range(command_slots)),
             "versioned_buffers": [buffer] * versions,
             "used_buffers": [buffer],
         },
@@ -342,9 +333,7 @@ def _make_planned_module(
 
 
 def test_compare_pipeline_candidate_work_uses_normalized_total_work():
-    static = _make_planned_module(
-        10, 16, 3, 4, 1, outer_extent=4
-    )
+    static = _make_planned_module(10, 16, 3, 4, 1, outer_extent=4)
     ordinary = _make_planned_module(17, 23, 3, 6, 2)
 
     assert compare_pipeline_candidate_work(static, ordinary) == 1
@@ -372,10 +361,7 @@ def test_work_normalization_does_not_double_count_nested_pipeline():
         outer_pipeline=(7, 11),
     )
 
-    assert compare_pipeline_candidate_work(
-        nested, same_outer_with_different_inner
-    ) == 0
-
+    assert compare_pipeline_candidate_work(nested, same_outer_with_different_inner) == 0
 
 
 def test_shadow_scope_redirects_diagnostics_and_restores(monkeypatch, tmp_path):

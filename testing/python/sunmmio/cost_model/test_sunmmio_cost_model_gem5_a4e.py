@@ -1,6 +1,5 @@
 import pytest
 
-import tilelang
 from tilelang import tvm
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 from tvm import tir
@@ -118,9 +117,7 @@ def test_tensor_formula_vectors(stmt, expected):
         ),
     ],
 )
-def test_tensor_csr_shape_vectors(
-    stmt, expected, expected_row, expected_col, expected_acc
-):
+def test_tensor_csr_shape_vectors(stmt, expected, expected_row, expected_col, expected_acc):
     result = _estimate(TENSOR_CORE, stmt)
     assert _integer(result, "latency_cycles") == expected
     assert _integer(result, "row_size") == expected_row
@@ -272,9 +269,7 @@ def _make_vector_stmt(value_builder, extent=128):
     [
         (_make_vector_stmt(lambda value: value + tir.FloatImm("float32", 1.0)), 18),
         (
-            _make_vector_stmt(
-                lambda value: tir.Call("float32", tvm.ir.Op.get("tir.exp2"), [value])
-            ),
+            _make_vector_stmt(lambda value: tir.Call("float32", tvm.ir.Op.get("tir.exp2"), [value])),
             25,
         ),
     ],

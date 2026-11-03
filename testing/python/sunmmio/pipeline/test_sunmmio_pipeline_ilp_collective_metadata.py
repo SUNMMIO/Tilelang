@@ -28,16 +28,14 @@ def _broadcast(src, dst, source_core, with_unit):
 
 def _make_pipeline(source_cores, with_unit):
     sources = [tir.decl_buffer((32, 32), "bfloat16", name=f"source_{i}") for i in range(len(source_cores))]
-    destinations = [
-        tir.decl_buffer((32, 32), "bfloat16", name=f"destination_{i}", scope="shared.asram")
-        for i in range(len(source_cores))
-    ]
-    body = tir.SeqStmt([
-        _broadcast(src, dst, source_core, with_unit)
-        for src, dst, source_core in zip(sources, destinations, source_cores)
-    ])
+    destinations = [tir.decl_buffer((32, 32), "bfloat16", name=f"destination_{i}", scope="shared.asram") for i in range(len(source_cores))]
+    body = tir.SeqStmt([_broadcast(src, dst, source_core, with_unit) for src, dst, source_core in zip(sources, destinations, source_cores)])
     loop = tir.For(
-        tir.Var("k", "int32"), 0, 4, tir.ForKind.SERIAL, body,
+        tir.Var("k", "int32"),
+        0,
+        4,
+        tir.ForKind.SERIAL,
+        body,
         annotations={"num_stages": tir.IntImm("int32", 2)},
     )
     root = tir.Block([], [], [], "root", loop, alloc_buffers=destinations)

@@ -37,7 +37,9 @@ def _clean_grouping_env(monkeypatch):
 def _make_module(extent, *, minimum=0, fault=None, consumers=1):
     """Resize the existing natural fixture so large columns stay in bounds."""
     mod = _helpers._make_module(
-        reuse_extent=extent, fault=fault, consumers=consumers,
+        reuse_extent=extent,
+        fault=fault,
+        consumers=consumers,
     )
     func = mod["main"]
     resized = {}
@@ -51,9 +53,14 @@ def _make_module(extent, *, minimum=0, fault=None, consumers=1):
             shape[axis] = max(int(shape[axis]), minimum + extent)
             # Preserve distinct alias views: key by Buffer, not data Var.
             resized[buffer] = tir.decl_buffer(
-                shape, buffer.dtype, name=buffer.name, data=buffer.data,
-                strides=buffer.strides, elem_offset=buffer.elem_offset,
-                scope=buffer.scope(), data_alignment=buffer.data_alignment,
+                shape,
+                buffer.dtype,
+                name=buffer.name,
+                data=buffer.data,
+                strides=buffer.strides,
+                elem_offset=buffer.elem_offset,
+                scope=buffer.scope(),
+                data_alignment=buffer.data_alignment,
                 offset_factor=buffer.offset_factor,
                 buffer_type="auto_broadcast" if int(buffer.buffer_type) == 2 else "",
                 axis_separators=buffer.axis_separators,
@@ -65,12 +72,21 @@ def _make_module(extent, *, minimum=0, fault=None, consumers=1):
             return tir.BufferLoad(resize(node.buffer), node.indices, node.predicate)
         if isinstance(node, tir.BufferStore):
             return tir.BufferStore(
-                resize(node.buffer), node.value, node.indices, node.predicate,
+                resize(node.buffer),
+                node.value,
+                node.indices,
+                node.predicate,
             )
         if isinstance(node, tir.For) and node.loop_var.name == "natural_column":
             return tir.For(
-                node.loop_var, minimum, node.extent, node.kind, node.body,
-                node.thread_binding, node.annotations, node.step,
+                node.loop_var,
+                minimum,
+                node.extent,
+                node.kind,
+                node.body,
+                node.thread_binding,
+                node.annotations,
+                node.step,
             )
         return None
 
@@ -90,9 +106,7 @@ def _calls(stmt, name):
     calls = []
     tir.stmt_functor.post_order_visit(
         stmt,
-        lambda node: calls.append(node)
-        if isinstance(node, tir.Call) and isinstance(node.op, tvm.ir.Op)
-        and node.op.name == name else None,
+        lambda node: calls.append(node) if isinstance(node, tir.Call) and isinstance(node.op, tvm.ir.Op) and node.op.name == name else None,
     )
     return calls
 
@@ -140,15 +154,13 @@ def _assert_coordinate_and_state_trace(mod, extent, minimum=0, consumers=1):
         if name in {"tl.dma_copy", "tl.broadcast_"}:
             source, destination = call.args[0].args[0], call.args[1].args[0]
             if source.buffer.name == "natural_right":
-                weights[destination.buffer.data] = tuple(
-                    _constant(index, bindings) for index in source.indices[:3]
-                )
+                weights[destination.buffer.data] = tuple(_constant(index, bindings) for index in source.indices[:3])
             if destination.buffer.name == "natural_result":
-                row, column, consumer = (
-                    _constant(index, bindings) for index in destination.indices[:3]
-                )
+                row, column, consumer = (_constant(index, bindings) for index in destination.indices[:3])
                 assert outputs[source.buffer.data] == (row, column), (
-                    "tail or group reused an output before its own store", row, column,
+                    "tail or group reused an output before its own store",
+                    row,
+                    column,
                 )
                 stores[row, column, consumer] += 1
         elif name == "tl.mma_sunmmio":
@@ -166,12 +178,7 @@ def _assert_coordinate_and_state_trace(mod, extent, minimum=0, consumers=1):
             if final:
                 outputs[output] = (row, column)
 
-    expected = {
-        (row, column, consumer)
-        for row in range(2)
-        for column in range(minimum, minimum + extent)
-        for consumer in range(consumers)
-    }
+    expected = {(row, column, consumer) for row in range(2) for column in range(minimum, minimum + extent) for consumer in range(consumers)}
     assert set(stores) == expected
     assert set(stores.values()) == {1}, "every output tile must be stored exactly once"
     assert len(reductions) == 2 * extent * consumers
@@ -190,8 +197,7 @@ def _assert_bounded_versions_and_bindings(mod, group_width, consumers=1):
     cores = []
     tir.stmt_functor.post_order_visit(
         func.body,
-        lambda node: cores.append(node)
-        if isinstance(node, tir.For) and "num_stages" in node.annotations else None,
+        lambda node: cores.append(node) if isinstance(node, tir.For) and "num_stages" in node.annotations else None,
     )
     assert 1 <= len(cores) <= 2, "IR size must not grow with the number of groups"
     for core in cores:
@@ -204,8 +210,7 @@ def _assert_bounded_versions_and_bindings(mod, group_width, consumers=1):
         func.body,
         lambda node: buffers.extend(node.alloc_buffers) if isinstance(node, tir.Block) else None,
     )
-    states = [buffer for buffer in buffers
-              if buffer.name.startswith(("natural_acc", "natural_out"))]
+    states = [buffer for buffer in buffers if buffer.name.startswith(("natural_acc", "natural_out"))]
     assert len(states) == 2 * consumers * group_width
     assert len({buffer.data for buffer in states}) == len(states)
 
@@ -261,22 +266,40 @@ def test_non_mutating_policies_preserve_large_loop_ir(tmp_path, monkeypatch, pol
         assert _accepted(report), report
 
 
-@pytest.mark.parametrize("fault", [
-    "source_depends_on_reuse", "suffix_writes_source", "suffix_alias_writes_source",
-    "source_modified_in_core", "unknown_core_effect", "nested_core_effect",
-    "unknown_suffix_effect", "prefix_writes_source", "conditional_mma",
-    "conditional_collective", "dependent_core_extent", "aliased_state_views",
-    "nonunit_core_step", "nonunit_reuse_step", "state_escapes", "hidden_index_read_modified",
-    "partial_collective", "nonfinal_suffix_writes_source", "nonfinal_prefix_writes_source",
-    "partial_float_clear",
-])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "source_depends_on_reuse",
+        "suffix_writes_source",
+        "suffix_alias_writes_source",
+        "source_modified_in_core",
+        "unknown_core_effect",
+        "nested_core_effect",
+        "unknown_suffix_effect",
+        "prefix_writes_source",
+        "conditional_mma",
+        "conditional_collective",
+        "dependent_core_extent",
+        "aliased_state_views",
+        "nonunit_core_step",
+        "nonunit_reuse_step",
+        "state_escapes",
+        "hidden_index_read_modified",
+        "partial_collective",
+        "nonfinal_suffix_writes_source",
+        "nonfinal_prefix_writes_source",
+        "partial_float_clear",
+    ],
+)
 def test_grouping_does_not_bypass_complete_region_proof(tmp_path, monkeypatch, fault):
     before = _make_module(10, fault=fault)
     analyzed, report = _analyze(before, tmp_path, monkeypatch)
     assert not _accepted(report), (fault, report)
     assert report["candidates"]
     assert all(item["reason"] != "expansion_budget" for item in report["candidates"]), (
-        "the semantic proof must inspect oversized candidates", fault, report,
+        "the semantic proof must inspect oversized candidates",
+        fault,
+        report,
     )
     after = _apply(analyzed)
     assert not _marked(after, _helpers.APPLIED)
@@ -314,13 +337,16 @@ def _transaction_fixture(tmp_path, monkeypatch):
     plain = _make_module(11)
     func = plain["main"]
     root = func.body.block
-    layouts = {
-        buffer: CuteLayout(buffer.shape, buffer.shape, [buffer.shape[1], 1], [1, 1])._inner
-        for buffer in root.alloc_buffers
-    }
+    layouts = {buffer: CuteLayout(buffer.shape, buffer.shape, [buffer.shape[1], 1], [1, 1])._inner for buffer in root.alloc_buffers}
     root_with_layouts = tir.Block(
-        root.iter_vars, root.reads, root.writes, root.name_hint, root.body,
-        root.init, root.alloc_buffers, root.match_buffers,
+        root.iter_vars,
+        root.reads,
+        root.writes,
+        root.name_hint,
+        root.body,
+        root.init,
+        root.alloc_buffers,
+        root.match_buffers,
         {**dict(root.annotations), "layout_map": layouts},
     )
     func = func.with_body(tir.BlockRealize([], func.body.predicate, root_with_layouts))
@@ -345,8 +371,7 @@ def _rewrite_group_cores(mod, change):
         annotations = dict(node.annotations)
         change(index, annotations)
         index += 1
-        return tir.For(node.loop_var, node.min, node.extent, node.kind, node.body,
-                       node.thread_binding, annotations, node.step)
+        return tir.For(node.loop_var, node.min, node.extent, node.kind, node.body, node.thread_binding, annotations, node.step)
 
     body = tir.stmt_functor.ir_transform(mod["main"].body, None, rewrite, ["tir.For"])
     assert index == 2
@@ -355,13 +380,15 @@ def _rewrite_group_cores(mod, change):
 
 def _fake_successful_plan(mod):
     def mark_success(_index, annotations):
-        annotations.update({
-            "tl.sunmmio.pipeline.requested": True,
-            PIPELINE_APPLIED: True,
-            "tl.sunmmio.pipeline.mode": "multidim_ilp",
-            "stage_count": 2,
-            "steady_state_max_iter_offset": 1,
-        })
+        annotations.update(
+            {
+                "tl.sunmmio.pipeline.requested": True,
+                PIPELINE_APPLIED: True,
+                "tl.sunmmio.pipeline.mode": "multidim_ilp",
+                "stage_count": 2,
+                "steady_state_max_iter_offset": 1,
+            }
+        )
 
     return _rewrite_group_cores(mod, mark_success)
 
@@ -406,9 +433,7 @@ def test_incomplete_group_plan_restores_entire_function(tmp_path, monkeypatch, f
 @pytest.mark.parametrize("fault", ["pipeline_fallback", "missing_function_applied"])
 def test_injection_failure_restores_entire_function(tmp_path, monkeypatch, fault):
     before, _, applied = _transaction_fixture(tmp_path, monkeypatch)
-    planned = tl.transform.ValidateSunmmioMultidimPipeline("auto", "planning")(
-        _fake_successful_plan(applied)
-    )
+    planned = tl.transform.ValidateSunmmioMultidimPipeline("auto", "planning")(_fake_successful_plan(applied))
     func = planned["main"]
     if fault == "pipeline_fallback":
         func = func.with_attr("tl.sunmmio.multidim.applied", True)
@@ -423,16 +448,13 @@ def test_injection_failure_restores_entire_function(tmp_path, monkeypatch, fault
             inserted = True
             annotations = dict(node.annotations)
             annotations["tl.sunmmio.pipeline.fallback_reason"] = "test_injection_failure"
-            return tir.For(node.loop_var, node.min, node.extent, node.kind, node.body,
-                           node.thread_binding, annotations, node.step)
+            return tir.For(node.loop_var, node.min, node.extent, node.kind, node.body, node.thread_binding, annotations, node.step)
 
         func = func.with_body(tir.stmt_functor.ir_transform(func.body, None, add_fallback, ["tir.For"]))
         assert inserted
     else:
         func = func.without_attr("tl.sunmmio.multidim.applied")
-    restored = tl.transform.ValidateSunmmioMultidimPipeline("auto", "inject")(
-        tvm.IRModule.from_expr(func)
-    )
+    restored = tl.transform.ValidateSunmmioMultidimPipeline("auto", "inject")(tvm.IRModule.from_expr(func))
     _assert_complete_original_restored(before, restored)
 
 
@@ -445,9 +467,7 @@ def test_forced_group_validation_raises_instead_of_atomic_fallback(tmp_path, mon
 
 def test_backup_lives_through_planning_and_clears_only_after_injection_success(tmp_path, monkeypatch):
     before, _, applied = _transaction_fixture(tmp_path, monkeypatch)
-    planned = tl.transform.ValidateSunmmioMultidimPipeline("auto", "planning")(
-        _fake_successful_plan(applied)
-    )
+    planned = tl.transform.ValidateSunmmioMultidimPipeline("auto", "planning")(_fake_successful_plan(applied))
     assert ORIGINAL in planned["main"].attrs and CORE_COUNT in planned["main"].attrs
     assert str(planned["main"].attrs[ORIGINAL]) == str(applied["main"].attrs[ORIGINAL])
     _check_snapshot_envelope(planned["main"])
@@ -469,8 +489,7 @@ def test_construction_exception_is_atomic_or_explicit(tmp_path, monkeypatch, pol
             return None
         annotations = dict(node.annotations)
         annotations["runtime_multiversion_buffers"] = []
-        return tir.For(node.loop_var, node.min, node.extent, node.kind, node.body,
-                       node.thread_binding, annotations, node.step)
+        return tir.For(node.loop_var, node.min, node.extent, node.kind, node.body, node.thread_binding, annotations, node.step)
 
     body = tir.stmt_functor.ir_transform(normalized["main"].body, None, corrupt, ["tir.For"])
     damaged = tvm.IRModule.from_expr(normalized["main"].with_body(body))
@@ -513,31 +532,38 @@ def _assert_complete_function_with_bound_layout_maps(expected, actual):
     follows boundary_artifacts.exact_injected_equal's allocation-position
     approach without making repository tests depend on an external run tree.
     """
+
     def without_layout_maps(func):
         root = func.body.block
-        annotations = {key: value for key, value in root.annotations.items()
-                       if str(key) != "layout_map"}
-        block = tir.Block(root.iter_vars, root.reads, root.writes, root.name_hint,
-                          root.body, root.init, root.alloc_buffers,
-                          root.match_buffers, annotations)
+        annotations = {key: value for key, value in root.annotations.items() if str(key) != "layout_map"}
+        block = tir.Block(
+            root.iter_vars,
+            root.reads,
+            root.writes,
+            root.name_hint,
+            root.body,
+            root.init,
+            root.alloc_buffers,
+            root.match_buffers,
+            annotations,
+        )
         body = tir.BlockRealize(func.body.iter_values, func.body.predicate, block)
         return func.with_body(body).without_attr("layout_map")
 
     tvm.ir.assert_structural_equal(
-        without_layout_maps(expected), without_layout_maps(actual), map_free_vars=True,
+        without_layout_maps(expected),
+        without_layout_maps(actual),
+        map_free_vars=True,
     )
 
     def maps_by_binding(func):
-        declared = [(('parameter', index), func.buffer_map[param])
-                    for index, param in enumerate(func.params) if param in func.buffer_map]
-        declared.extend((('allocation', index), buffer)
-                        for index, buffer in enumerate(func.body.block.alloc_buffers))
+        declared = [(("parameter", index), func.buffer_map[param]) for index, param in enumerate(func.params) if param in func.buffer_map]
+        declared.extend((("allocation", index), buffer) for index, buffer in enumerate(func.body.block.alloc_buffers))
         maps = []
         for source in (func.attrs["layout_map"], func.body.block.annotations["layout_map"]):
             mapped = {}
             for buffer, layout in source.items():
-                positions = [position for position, declared_buffer in declared
-                             if declared_buffer.same_as(buffer)]
+                positions = [position for position, declared_buffer in declared if declared_buffer.same_as(buffer)]
                 assert len(positions) == 1, "layout key must identify an actual declared Buffer"
                 assert positions[0] not in mapped
                 mapped[positions[0]] = (buffer, layout)
@@ -565,9 +591,7 @@ def _assert_complete_function_with_bound_layout_maps(expected, actual):
 
 def test_snapshot_backup_prints_and_validation_restores_executable_layouts(tmp_path, monkeypatch):
     before, analyzed, applied = _transaction_fixture(tmp_path, monkeypatch)
-    planned = tl.transform.ValidateSunmmioMultidimPipeline("auto", "planning")(
-        _fake_successful_plan(applied)
-    )
+    planned = tl.transform.ValidateSunmmioMultidimPipeline("auto", "planning")(_fake_successful_plan(applied))
     backup_json = str(analyzed["main"].attrs[ORIGINAL])
     for index, mod in enumerate((analyzed, applied, planned)):
         func = mod["main"]
@@ -576,9 +600,11 @@ def test_snapshot_backup_prints_and_validation_restores_executable_layouts(tmp_p
         _check_snapshot_envelope(func)
         candidate = mod
         if index == 2:
+
             def remove_marker(core_index, annotations):
                 if core_index == 1:
                     annotations.pop(GROUPED_CORE)
+
             candidate = _rewrite_group_cores(mod, remove_marker)
         # Only the production restoration path canonicalizes placeholders and
         # rebuilds layouts.  Raw JSON deserialization is not an executable backup.
@@ -602,9 +628,11 @@ def test_artifact_validation_rejects_incomplete_planning(tmp_path, monkeypatch, 
     before, _, applied = _transaction_fixture(tmp_path, monkeypatch)
     candidate = applied
     if fault == "missing_marker":
+
         def remove_marker(index, annotations):
             if index == 1:
                 annotations.pop(GROUPED_CORE)
+
         candidate = _rewrite_group_cores(_fake_successful_plan(applied), remove_marker)
     restored = tl.transform.ValidateSunmmioMultidimPipeline("auto", "artifact")(candidate)
     _assert_complete_original_restored(before, restored)
@@ -616,13 +644,12 @@ def _constant_layout_forward(layout, coordinates=(1, 2)):
     variables = tvm.get_global_func("tl.Layout_forward_vars")(layout)
     expressions = tvm.get_global_func("tl.Layout_index")(layout)
     assert len(variables) == len(coordinates)
-    substitution = {var: tir.const(value, var.dtype)
-                    for var, value in zip(variables, coordinates)}
+    substitution = {var: tir.const(value, var.dtype) for var, value in zip(variables, coordinates)}
     analyzer = arith.Analyzer()
-    values = [analyzer.simplify(tir.stmt_functor.substitute(expr, substitution))
-              for expr in expressions]
+    values = [analyzer.simplify(tir.stmt_functor.substitute(expr, substitution)) for expr in expressions]
     assert all(isinstance(value, tir.IntImm) for value in values), (
-        "restored layout Forward left detached input placeholders", values,
+        "restored layout Forward left detached input placeholders",
+        values,
     )
     return [int(value) for value in values]
 
@@ -707,8 +734,7 @@ def test_region_report_matches_actual_group_graphs_and_group_base(tmp_path, monk
     for region in regions:
         assert region["source_outer_extent"] == extent
         lane_count = region["outer_extent"]
-        matching = [core for core in cores
-                    if int(core.annotations["tl.sunmmio.multidim.outer_extent"]) == lane_count]
+        matching = [core for core in cores if int(core.annotations["tl.sunmmio.multidim.outer_extent"]) == lane_count]
         assert len(matching) == 1
         core = matching[0]
         assert int(core.annotations["tl.sunmmio.multidim.inner_extent"]) == lane_count

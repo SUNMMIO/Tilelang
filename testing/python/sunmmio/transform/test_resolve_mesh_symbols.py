@@ -309,9 +309,11 @@ def test_resolve_replaces_mesh_intrinsics_in_body_and_kernel_extent():
     # The frontend T.Kernel domain must agree with its specialized attribute
     # value; checking AttrStmt.value alone missed the real FFN regression.
     domains = []
+
     def visit_domain(node):
         if isinstance(node, tir.AttrStmt) and node.attr_key == "thread_extent":
             domains.append(node.node.dom)
+
     post_order_visit(func.body, visit_domain)
     assert len(domains) == 1
     assert int(domains[0].min) == 0 and int(domains[0].extent) == 16
@@ -478,9 +480,7 @@ def test_lower_and_optimize_symbolic_mesh_gqa_kernel():
 
 
 def _iter_domain_func(body, rows, cols, params=()):
-    return (tir.PrimFunc(list(params), body)
-            .with_attr(_MESH_NROWS_ATTR, rows)
-            .with_attr(_MESH_NCOLS_ATTR, cols))
+    return tir.PrimFunc(list(params), body).with_attr(_MESH_NROWS_ATTR, rows).with_attr(_MESH_NCOLS_ATTR, cols)
 
 
 @pytest.mark.parametrize("mesh", [(4, 4), (2, 8)])
@@ -515,8 +515,7 @@ def test_resolve_iter_attr_domain_min_extent_by_attribute_identity(mesh, names):
     assert span_fields[0].getter(result.body).same_as(span)
     assert _MESH_NROWS_ATTR not in result.attrs and _MESH_NCOLS_ATTR not in result.attrs
     assert len(result.params) == 0
-    assert _mesh_var_hits_in_exprs([rewritten.dom.min, rewritten.dom.extent],
-                                   {"rows": rows, "cols": cols}) == []
+    assert _mesh_var_hits_in_exprs([rewritten.dom.min, rewritten.dom.extent], {"rows": rows, "cols": cols}) == []
     again = tl_transform.ResolveSunmmioMeshSymbols()(tvm.IRModule({"main": result}))["main"]
     assert again.body.same_as(result.body)
     # No in-place mutation of the input IterVar/domain through shared objects.
@@ -530,15 +529,12 @@ def test_resolve_iter_attr_domain_min_extent_by_attribute_identity(mesh, names):
 def test_resolve_nested_iter_attr_domains_and_non_thread_attribute():
     rows, cols = tir.SizeVar("mesh_nrows", "int32"), tir.SizeVar("mesh_ncols", "int32")
     outer_var, inner_var = tir.Var("outer", "int32"), tir.Var("inner", "int32")
-    outer = tir.IterVar(tvm.ir.Range.from_min_extent(rows, cols), outer_var,
-                        tir.IterVar.ThreadIndex, "blockIdx.x")
-    inner = tir.IterVar(tvm.ir.Range.from_min_extent(cols, rows * cols), inner_var,
-                        tir.IterVar.DataPar, "")
-    body = tir.AttrStmt(outer, "thread_extent", rows * cols,
-                       tir.AttrStmt(inner, "test.iter_domain", cols,
-                                    tir.Evaluate(outer_var + inner_var)))
-    result = _bind_and_resolve(tvm.IRModule({"main": _iter_domain_func(body, rows, cols)}),
-                               _sunmmio_target(2, 8))["main"].body
+    outer = tir.IterVar(tvm.ir.Range.from_min_extent(rows, cols), outer_var, tir.IterVar.ThreadIndex, "blockIdx.x")
+    inner = tir.IterVar(tvm.ir.Range.from_min_extent(cols, rows * cols), inner_var, tir.IterVar.DataPar, "")
+    body = tir.AttrStmt(
+        outer, "thread_extent", rows * cols, tir.AttrStmt(inner, "test.iter_domain", cols, tir.Evaluate(outer_var + inner_var))
+    )
+    result = _bind_and_resolve(tvm.IRModule({"main": _iter_domain_func(body, rows, cols)}), _sunmmio_target(2, 8))["main"].body
     assert (int(result.node.dom.min), int(result.node.dom.extent)) == (2, 8)
     assert (int(result.body.node.dom.min), int(result.body.node.dom.extent)) == (8, 16)
     assert result.node.var.same_as(outer_var)
@@ -552,16 +548,16 @@ def test_resolve_iter_domain_does_not_replace_same_name_foreign_vars():
     rows, cols = tir.SizeVar("mesh_nrows", "int32"), tir.SizeVar("mesh_ncols", "int32")
     foreign_rows, foreign_cols = tir.Var("mesh_nrows", "int32"), tir.Var("mesh_ncols", "int32")
     axis = tir.Var("blockIdx.x", "int32")
-    iterator = tir.IterVar(tvm.ir.Range.from_min_extent(rows + foreign_rows, cols + foreign_cols),
-                           axis, tir.IterVar.ThreadIndex, "blockIdx.x")
+    iterator = tir.IterVar(
+        tvm.ir.Range.from_min_extent(rows + foreign_rows, cols + foreign_cols), axis, tir.IterVar.ThreadIndex, "blockIdx.x"
+    )
     body = tir.AttrStmt(iterator, "thread_extent", rows * cols, tir.Evaluate(axis))
     func = _iter_domain_func(body, rows, cols, [foreign_rows, foreign_cols])
     result = _bind_and_resolve(tvm.IRModule({"main": func}), _sunmmio_target(2, 8))["main"]
     assert result.params[0].same_as(foreign_rows) and result.params[1].same_as(foreign_cols)
     assert tvm.ir.structural_equal(result.body.node.dom.min, foreign_rows + 2, map_free_vars=False)
     assert tvm.ir.structural_equal(result.body.node.dom.extent, foreign_cols + 8, map_free_vars=False)
-    assert _mesh_var_hits_in_exprs([result.body.node.dom.min, result.body.node.dom.extent],
-                                   {"rows": rows, "cols": cols}) == []
+    assert _mesh_var_hits_in_exprs([result.body.node.dom.min, result.body.node.dom.extent], {"rows": rows, "cols": cols}) == []
 
 
 @pytest.mark.parametrize("defined", [False, True])
@@ -571,8 +567,7 @@ def test_resolve_static_or_absent_iter_domain_preserves_iterator_identity(define
     dom = tvm.ir.Range.from_min_extent(3, 7) if defined else None
     iterator = tir.IterVar(dom, axis, tir.IterVar.ThreadIndex, "blockIdx.x")
     body = tir.AttrStmt(iterator, "thread_extent", rows * cols, tir.Evaluate(axis))
-    result = _bind_and_resolve(tvm.IRModule({"main": _iter_domain_func(body, rows, cols)}),
-                               _sunmmio_target())["main"].body
+    result = _bind_and_resolve(tvm.IRModule({"main": _iter_domain_func(body, rows, cols)}), _sunmmio_target())["main"].body
     assert result.node.same_as(iterator)
     assert int(result.value) == 16
     assert result.node.var.same_as(axis)
@@ -598,10 +593,8 @@ def test_resolve_unknown_attr_node_is_not_recursively_rewritten():
 @pytest.mark.parametrize("field", ["min", "extent"])
 def test_resolve_reports_iter_domain_mesh_symbol_without_attributes(field):
     rows = tir.SizeVar("mesh_nrows", "int32")
-    dom = tvm.ir.Range.from_min_extent(rows if field == "min" else 0,
-                                      rows if field == "extent" else 16)
-    iterator = tir.IterVar(dom, tir.Var("blockIdx.x", "int32"),
-                           tir.IterVar.ThreadIndex, "blockIdx.x")
+    dom = tvm.ir.Range.from_min_extent(rows if field == "min" else 0, rows if field == "extent" else 16)
+    iterator = tir.IterVar(dom, tir.Var("blockIdx.x", "int32"), tir.IterVar.ThreadIndex, "blockIdx.x")
     body = tir.AttrStmt(iterator, "thread_extent", 16, tir.Evaluate(0))
     func = tir.PrimFunc([], body).with_attr("target", _sunmmio_target())
     with pytest.raises(tvm.TVMError, match="missing PrimFunc attributes"):

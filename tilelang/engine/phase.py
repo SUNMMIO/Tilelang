@@ -35,16 +35,11 @@ def sunmmio_shadow_planning_active() -> bool:
 def _sunmmio_shadow_planning_scope():
     """Keep shadow passes out of official planner artifacts and observers."""
     global _sunmmio_shadow_planning_depth
-    previous = {
-        name: os.environ.get(name)
-        for name in _SUNMMIO_SHADOW_DIAGNOSTIC_ENVS
-    }
+    previous = {name: os.environ.get(name) for name in _SUNMMIO_SHADOW_DIAGNOSTIC_ENVS}
     with TemporaryDirectory(prefix="tilelang_sunmmio_shadow_") as directory:
         for name, value in previous.items():
             if value is not None:
-                os.environ[name] = str(
-                    Path(directory) / (name.lower() + ".json")
-                )
+                os.environ[name] = str(Path(directory) / (name.lower() + ".json"))
         _sunmmio_shadow_planning_depth += 1
         try:
             yield
@@ -154,9 +149,7 @@ def get_sunmmio_multidim_policy(pass_ctx: PassContext | None = None) -> str:
     policy = pass_ctx.config.get(tilelang.PassConfigKey.TL_SUNMMIO_MULTIDIM_POLICY, "auto")
     policy = str(policy).strip().lower()
     if policy not in {"forced", "auto"}:
-        raise ValueError(
-            f"Invalid Sunmmio multidim policy: {policy}. Expected one of: 'forced', 'auto'."
-        )
+        raise ValueError(f"Invalid Sunmmio multidim policy: {policy}. Expected one of: 'forced', 'auto'.")
     return policy
 
 
@@ -173,15 +166,10 @@ def get_sunmmio_cross_outer_policy(pass_ctx: PassContext | None = None) -> str:
 def get_sunmmio_region_cross_outer_policy(pass_ctx: PassContext | None = None) -> str:
     if pass_ctx is None:
         pass_ctx = tilelang.transform.get_pass_context()
-    policy = pass_ctx.config.get(
-        tilelang.PassConfigKey.TL_SUNMMIO_REGION_CROSS_OUTER_POLICY, "auto"
-    )
+    policy = pass_ctx.config.get(tilelang.PassConfigKey.TL_SUNMMIO_REGION_CROSS_OUTER_POLICY, "auto")
     policy = str(policy).strip().lower()
     if policy not in {"forced", "auto"}:
-        raise ValueError(
-            "Invalid Sunmmio region cross-outer policy: "
-            f"{policy}. Expected one of: 'forced', 'auto'."
-        )
+        raise ValueError(f"Invalid Sunmmio region cross-outer policy: {policy}. Expected one of: 'forced', 'auto'.")
     return policy
 
 
@@ -197,9 +185,7 @@ def get_sunmmio_region_cross_outer_strategy(
     strategy = str(strategy).strip().lower()
     if strategy not in {"conservative", "continuous", "hierarchical_ilp"}:
         raise ValueError(
-            "Invalid Sunmmio region cross-outer strategy: "
-            f"{strategy}. Expected one of: 'conservative', 'continuous', "
-            "'hierarchical_ilp'."
+            f"Invalid Sunmmio region cross-outer strategy: {strategy}. Expected one of: 'conservative', 'continuous', 'hierarchical_ilp'."
         )
     return strategy
 
@@ -455,9 +441,7 @@ def _infer_sunmmio_noalias(mod: IRModule) -> IRModule:
     def pass_fn(func: tir.PrimFunc, _mod: IRModule, _ctx):
         return _infer_sunmmio_noalias_prim_func(func)
 
-    return tir.transform.prim_func_pass(
-        pass_fn, opt_level=0, name="tl.InferSunmmioNoAlias"
-    )(mod)
+    return tir.transform.prim_func_pass(pass_fn, opt_level=0, name="tl.InferSunmmioNoAlias")(mod)
 
 
 def _record_sunmmio_multidim_atomic_fallback(stage: str, error: Exception) -> None:
@@ -508,16 +492,11 @@ def _module_has_static_workitem_transform(mod: IRModule) -> bool:
 def _get_static_workitem_candidate_policy() -> str:
     policy = os.environ.get(_STATIC_WORKITEM_POLICY_ENV, "auto")
     if policy not in {"off", "auto", "forced"}:
-        raise ValueError(
-            f"{_STATIC_WORKITEM_POLICY_ENV} must be 'off', 'auto', or "
-            f"'forced', got {policy!r}"
-        )
+        raise ValueError(f"{_STATIC_WORKITEM_POLICY_ENV} must be 'off', 'auto', or 'forced', got {policy!r}")
     return policy
 
 
-def _apply_sunmmio_static_workitem_candidate(
-    original: IRModule, policy: str
-) -> tuple[IRModule, IRModule] | None:
+def _apply_sunmmio_static_workitem_candidate(original: IRModule, policy: str) -> tuple[IRModule, IRModule] | None:
     """Build the generic static-WorkItem Hierarchical ILP candidate.
 
     This route has no kernel, shape, or buffer-name checks. The existing
@@ -526,14 +505,10 @@ def _apply_sunmmio_static_workitem_candidate(
     """
     pass_policy = "forced" if policy == "forced" else "auto"
     candidate = original
-    candidate = tilelang.transform.FlattenSunmmioStaticWorkItems(
-        policy=pass_policy
-    )(candidate)
+    candidate = tilelang.transform.FlattenSunmmioStaticWorkItems(policy=pass_policy)(candidate)
     if not _module_has_static_workitem_transform(candidate):
         return None
-    planned = tilelang.transform.SunmmioPipelinePlanningILP(
-        debug=False
-    )(candidate)
+    planned = tilelang.transform.SunmmioPipelinePlanningILP(debug=False)(candidate)
     planned = tilelang.transform.SunmmioRegionCrossOuterPipelinePlanning(
         debug=False,
         policy=pass_policy,
@@ -543,22 +518,15 @@ def _apply_sunmmio_static_workitem_candidate(
     return planned, selected
 
 
-def _apply_sunmmio_ordinary_multidim_candidate(
-    original: IRModule, policy: str
-) -> tuple[IRModule, IRModule]:
+def _apply_sunmmio_ordinary_multidim_candidate(original: IRModule, policy: str) -> tuple[IRModule, IRModule]:
     """Build the ordinary residency/boundary Multidim candidate."""
     candidate = original
-    candidate = tilelang.transform.AnalyzeSunmmioTileResidency(
-        policy=os.environ.get("TL_SUNMMIO_RESIDENCY_POLICY", "auto_strict")
-    )(candidate)
-    planned = tilelang.transform.SunmmioMultidimPipelinePlanningILP(
-        debug=False, policy=policy
-    )(candidate)
-    selected = tilelang.transform.InjectSunmmioMultidimPipelineILP(
-        policy=policy
-    )(planned)
+    candidate = tilelang.transform.AnalyzeSunmmioTileResidency(policy=os.environ.get("TL_SUNMMIO_RESIDENCY_POLICY", "auto_strict"))(
+        candidate
+    )
+    planned = tilelang.transform.SunmmioMultidimPipelinePlanningILP(debug=False, policy=policy)(candidate)
+    selected = tilelang.transform.InjectSunmmioMultidimPipelineILP(policy=policy)(planned)
     return planned, selected
-
 
 
 def _apply_sunmmio_multidim_atomic(mod: IRModule, policy: str) -> IRModule:
@@ -568,19 +536,14 @@ def _apply_sunmmio_multidim_atomic(mod: IRModule, policy: str) -> IRModule:
     static_candidate = None
     if static_workitem_policy != "off":
         try:
-            static_candidate = _apply_sunmmio_static_workitem_candidate(
-                original, static_workitem_policy
-            )
-            if static_candidate is not None and (
-                policy != "auto" or static_workitem_policy == "forced"
-            ):
+            static_candidate = _apply_sunmmio_static_workitem_candidate(original, static_workitem_policy)
+            if static_candidate is not None and (policy != "auto" or static_workitem_policy == "forced"):
                 return static_candidate[1]
         except Exception as error:
             if static_workitem_policy == "forced":
                 raise
             _LOGGER.warning(
-                "Sunmmio static WorkItem candidate rejected without "
-                "changing ordinary Multidim selection: %s",
+                "Sunmmio static WorkItem candidate rejected without changing ordinary Multidim selection: %s",
                 error,
             )
 
@@ -588,21 +551,15 @@ def _apply_sunmmio_multidim_atomic(mod: IRModule, policy: str) -> IRModule:
         # A non-selected planner must not overwrite official diagnostic files.
         if static_candidate is not None:
             with _sunmmio_shadow_planning_scope():
-                ordinary_candidate = _apply_sunmmio_ordinary_multidim_candidate(
-                    original, policy
-                )
+                ordinary_candidate = _apply_sunmmio_ordinary_multidim_candidate(original, policy)
         else:
-            ordinary_candidate = _apply_sunmmio_ordinary_multidim_candidate(
-                original, policy
-            )
+            ordinary_candidate = _apply_sunmmio_ordinary_multidim_candidate(original, policy)
         ordinary_planned, ordinary_selected = ordinary_candidate
         if static_candidate is None:
             return ordinary_selected
 
         static_planned, static_selected = static_candidate
-        comparison = compare_pipeline_candidate_work(
-            static_planned, ordinary_planned
-        )
+        comparison = compare_pipeline_candidate_work(static_planned, ordinary_planned)
         if comparison != 1:
             # Equal or incomparable candidates preserve the established static
             # WorkItem priority and its measured CK_MOE behavior.
@@ -610,18 +567,14 @@ def _apply_sunmmio_multidim_atomic(mod: IRModule, policy: str) -> IRModule:
 
         # Rebuild the winner outside the shadow scope so official diagnostics
         # describe the selected candidate.
-        _, ordinary_selected = _apply_sunmmio_ordinary_multidim_candidate(
-            original, policy
-        )
+        _, ordinary_selected = _apply_sunmmio_ordinary_multidim_candidate(original, policy)
         return ordinary_selected
     except Exception as error:
         if policy != "auto":
             raise
         if static_candidate is not None:
             return static_candidate[1]
-        _record_sunmmio_multidim_atomic_fallback(
-            "analysis_planning_or_injection", error
-        )
+        _record_sunmmio_multidim_atomic_fallback("analysis_planning_or_injection", error)
         return _apply_sunmmio_one_dimensional_ilp(original)
 
 
@@ -677,9 +630,7 @@ def OptimizeForSunmmio(mod: IRModule, target: Target) -> IRModule:
         elif pipeline_mode in {"hierarchical_ilp", "c_style_pipeline"}:
             region_policy = get_sunmmio_region_cross_outer_policy(pass_ctx)
             if pipeline_mode == "c_style_pipeline":
-                mod = tilelang.transform.FlattenSunmmioStaticWorkItems(
-                    policy=region_policy
-                )(mod)
+                mod = tilelang.transform.FlattenSunmmioStaticWorkItems(policy=region_policy)(mod)
             mod = tilelang.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
             mod = tilelang.transform.SunmmioRegionCrossOuterPipelinePlanning(
                 debug=False,
@@ -689,9 +640,7 @@ def OptimizeForSunmmio(mod: IRModule, target: Target) -> IRModule:
             mod = tilelang.transform.InjectSunmmioPipelineILP()(mod)
         elif pipeline_mode == "cross_outer":
             cross_outer_policy = get_sunmmio_cross_outer_policy(pass_ctx)
-            mod = tilelang.transform.SunmmioCrossOuterPipelinePlanning(
-                debug=False, policy=cross_outer_policy
-            )(mod)
+            mod = tilelang.transform.SunmmioCrossOuterPipelinePlanning(debug=False, policy=cross_outer_policy)(mod)
             mod = tilelang.transform.InjectSunmmioCrossOuterPipeline(policy=cross_outer_policy)(mod)
             if cross_outer_policy == "auto":
                 mod = tilelang.transform.SunmmioPipelinePlanning(debug=False)(mod)

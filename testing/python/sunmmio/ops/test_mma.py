@@ -107,13 +107,19 @@ def fused_output_matmul(version: int):
             output = T.alloc_shared((32, 32), T.bfloat16)
             if version == 1:
                 T.gemm_v1(
-                    A_shared, B_shared, accumulator,
-                    output=output, store_output=True,
+                    A_shared,
+                    B_shared,
+                    accumulator,
+                    output=output,
+                    store_output=True,
                 )
             else:
                 T.gemm_v2(
-                    A_shared, B_shared, accumulator,
-                    output=output, store_output=True,
+                    A_shared,
+                    B_shared,
+                    accumulator,
+                    output=output,
+                    store_output=True,
                 )
 
     return tvm.IRModule({"main": main})

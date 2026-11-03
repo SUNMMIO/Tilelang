@@ -16,10 +16,10 @@
 #include "../layout/cute_layout.h"
 #include "../layout/utils.h"
 #include "../op/region.h"
-#include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
-#include "sunmmio_pipeline_planning/tile_residency_analysis.h"
 #include "sunmmio_pipeline_planning/boundary_overlap_analysis.h"
 #include "sunmmio_pipeline_planning/grouping_snapshot.h"
+#include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
+#include "sunmmio_pipeline_planning/tile_residency_analysis.h"
 #include "tir/transforms/ir_utils.h"
 
 #include <algorithm>
@@ -64,8 +64,7 @@ constexpr const char *kMultidimFallbackReason =
 // referenced from an enclosing loop that injection may later remove/rename.
 constexpr const char *kMultidimCoreDecisionId =
     "tl.sunmmio.multidim.core_decision_id";
-constexpr const char *kMultidimCandidateId =
-    "tl.sunmmio.multidim.candidate_id";
+constexpr const char *kMultidimCandidateId = "tl.sunmmio.multidim.candidate_id";
 constexpr const char *kMultidimCandidateLoop =
     "tl.sunmmio.multidim.candidate_loop";
 constexpr const char *kPipelineSuppressArtifacts =
@@ -231,9 +230,8 @@ bool UsesVar(const Stmt &stmt, const Var &var) {
   return found;
 }
 
-bool TouchesAnyBuffer(
-    const Stmt &stmt,
-    const std::unordered_set<const BufferNode *> &buffers) {
+bool TouchesAnyBuffer(const Stmt &stmt,
+                      const std::unordered_set<const BufferNode *> &buffers) {
   InterchangeBufferTouches touches = CollectInterchangeBufferTouches(stmt);
   for (const auto &entry : touches.local_buffers) {
     if (buffers.count(entry.first) != 0) {
@@ -321,7 +319,6 @@ private:
   }
 };
 
-
 class ReplaceLoop : public StmtMutator {
 public:
   ReplaceLoop(const ForNode *target, Stmt replacement)
@@ -354,27 +351,30 @@ struct RegionEvent {
   int64_t candidate_id{-1};
   int64_t core_decision_id{-1};
   std::string fallback_stage;
-  std::string outer_min_expr, outer_extent_expr, inner_min_expr, inner_extent_expr;
+  std::string outer_min_expr, outer_extent_expr, inner_min_expr,
+      inner_extent_expr;
 };
 
 // This proof is separate from tile residency. An accepted candidate retains
 // the original outer/core order and still needs the RegionCrossOuter planner's
 // hazard, collective-epoch and event-coverage checks after 1D planning.
 class BoundaryOverlapAnnotator : public StmtMutator {
- public:
+public:
   BoundaryOverlapAnnotator(const PrimFunc &func, std::string policy)
       : func_(func), policy_(std::move(policy)) {}
 
- private:
+private:
   Stmt VisitStmt_(const ForNode *op) final {
-    if (HasNumStages(op)) return ffi::GetRef<For>(op);
+    if (HasNumStages(op))
+      return ffi::GetRef<For>(op);
     auto reason = op->annotations.Get(residency::kReason);
-    if (!reason.has_value() || Downcast<String>(reason.value()) !=
-                                  "no_invariant_transfer_prefix")
+    if (!reason.has_value() ||
+        Downcast<String>(reason.value()) != "no_invariant_transfer_prefix")
       return StmtMutator::VisitStmt_(op);
     For loop = ffi::GetRef<For>(op);
     boundary_overlap::Proof proof = boundary_overlap::Analyze(func_, loop);
-    if (policy_ == "shadow") return loop;
+    if (policy_ == "shadow")
+      return loop;
     Map<String, Any> annotations = loop->annotations;
     annotations.erase(boundary_overlap::kEligible);
     annotations.erase(boundary_overlap::kProofVersion);
@@ -383,10 +383,12 @@ class BoundaryOverlapAnnotator : public StmtMutator {
     if (proof.accepted) {
       annotations.Set(boundary_overlap::kEligible, Bool(true));
       annotations.Set(boundary_overlap::kProofVersion, Integer(1));
-      annotations.Set(boundary_overlap::kReadOnlyBuffers, proof.read_only_buffers);
+      annotations.Set(boundary_overlap::kReadOnlyBuffers,
+                      proof.read_only_buffers);
       annotations.Set(boundary_overlap::kStateBuffers, proof.state_buffers);
       annotations.erase(boundary_overlap::kReason);
-      loop.CopyOnWrite()->body = SeqStmt::Flatten(residency::Statements(op->body));
+      loop.CopyOnWrite()->body =
+          SeqStmt::Flatten(residency::Statements(op->body));
     } else {
       ICHECK_NE(policy_, "forced")
           << "boundary overlap rejected: " << proof.reason;
@@ -419,10 +421,12 @@ private:
   };
 
   For MarkCore(const For &core, const CoreDecision &decision) {
-    For result = MarkOneDimensionalFallback(core, decision.stage, decision.reason);
+    For result =
+        MarkOneDimensionalFallback(core, decision.stage, decision.reason);
     auto annotations = result->annotations;
     annotations.Set(kMultidimCandidateId, Integer(decision.candidate_id));
-    annotations.Set(kMultidimCoreDecisionId, Integer(decision.core_decision_id));
+    annotations.Set(kMultidimCoreDecisionId,
+                    Integer(decision.core_decision_id));
     result.CopyOnWrite()->annotations = annotations;
     return result;
   }
@@ -431,11 +435,13 @@ private:
                    const std::string &stage, const std::string &reason) {
     ICHECK(!cores.empty());
     // A failed generic residency proof is an authoritative 1D boundary even
-    // under forced policy.  Only region discovery has the forced-error contract.
+    // under forced policy.  Only region discovery has the forced-error
+    // contract.
     if (stage == "region_discovery") {
       ICHECK_NE(policy_, "forced")
           << "multidim_ilp forced region rejected: " << reason
-          << " outer=" << outer->loop_var << " inner=" << cores.front()->loop_var;
+          << " outer=" << outer->loop_var
+          << " inner=" << cores.front()->loop_var;
     }
 
     const int64_t candidate_id = next_candidate_id_++;
@@ -447,7 +453,8 @@ private:
     for (const For &core : cores) {
       ICHECK(!claimed_cores_.count(core->loop_var.get()))
           << "one source pipeline core cannot own multiple rejection decisions";
-      CoreDecision decision{candidate_id, next_core_decision_id_++, stage, reason};
+      CoreDecision decision{candidate_id, next_core_decision_id_++, stage,
+                            reason};
       claimed_cores_.emplace(core->loop_var.get(), decision);
       RegionEvent event;
       event.outer = outer->loop_var->name_hint;
@@ -477,7 +484,8 @@ private:
     // Protect only the exact cores already covered by this rejected candidate.
     // Other nearest-loop subtrees still need their own independent decisions.
     Stmt body = VisitStmt(outer->body);
-    for (const For &core : cores) claimed_cores_.erase(core->loop_var.get());
+    for (const For &core : cores)
+      claimed_cores_.erase(core->loop_var.get());
 
     For fallback = outer;
     fallback.CopyOnWrite()->body = body;
@@ -485,7 +493,8 @@ private:
     if (stage == "region_discovery") {
       annotations.Set(kMultidimRank, Integer(2));
       annotations.Set(kMultidimOuterVar, String(outer->loop_var->name_hint));
-      annotations.Set(kMultidimInnerVar, String(cores.front()->loop_var->name_hint));
+      annotations.Set(kMultidimInnerVar,
+                      String(cores.front()->loop_var->name_hint));
     }
     // Keep the rejected candidate as diagnostics; a selection belongs to each
     // concrete core, not to every descendant of this enclosing loop.
@@ -503,7 +512,7 @@ private:
   }
 
   std::optional<Array<Stmt>> InnerStatements(const For &inner,
-                                              std::string *reason) const {
+                                             std::string *reason) const {
     Stmt body = inner->body;
     if (const auto *realize = body.as<BlockRealizeNode>()) {
       if (!realize->block->alloc_buffers.empty() ||
@@ -514,7 +523,8 @@ private:
       }
       body = realize->block->body;
     }
-    if (const auto *seq = body.as<SeqStmtNode>()) return seq->seq;
+    if (const auto *seq = body.as<SeqStmtNode>())
+      return seq->seq;
     return Array<Stmt>{body};
   }
 
@@ -547,14 +557,9 @@ private:
                     Integer(num_stages));
     node->annotations = annotations;
 
-    events_.push_back(RegionEvent{true,
-                                  outer->loop_var->name_hint,
-                                  inner->loop_var->name_hint,
-                                  outer_min,
-                                  outer_extent,
-                                  inner_min,
-                                  inner_extent,
-                                  ""});
+    events_.push_back(RegionEvent{true, outer->loop_var->name_hint,
+                                  inner->loop_var->name_hint, outer_min,
+                                  outer_extent, inner_min, inner_extent, ""});
     return normalized;
   }
 
@@ -578,8 +583,9 @@ private:
       return Reject(outer, inner, "interchange_control_flow_unsupported");
     }
 
-    Stmt canonical_body = generic
-        ? SeqStmt::Flatten(residency::Statements(outer->body)) : outer->body;
+    Stmt canonical_body =
+        generic ? SeqStmt::Flatten(residency::Statements(outer->body))
+                : outer->body;
     const auto *body = canonical_body.as<SeqStmtNode>();
     if (body == nullptr) {
       return Reject(outer, inner, "interchange_outer_body_not_sequence");
@@ -594,7 +600,7 @@ private:
     }
     if (inner_index < 0 ||
         (!generic && (inner_index == 0 ||
-         inner_index + 1 >= static_cast<int>(body->seq.size())))) {
+                      inner_index + 1 >= static_cast<int>(body->seq.size())))) {
       return Reject(outer, inner, "interchange_prefix_or_suffix_missing");
     }
 
@@ -603,8 +609,7 @@ private:
     for (int i = 0; i < inner_index; ++i) {
       prefix.push_back(body->seq[i]);
     }
-    for (int i = inner_index + 1;
-         i < static_cast<int>(body->seq.size()); ++i) {
+    for (int i = inner_index + 1; i < static_cast<int>(body->seq.size()); ++i) {
       suffix.push_back(body->seq[i]);
     }
 
@@ -629,7 +634,8 @@ private:
       accumulator_candidates.clear();
       Array<Buffer> states = Downcast<Array<Buffer>>(
           outer->annotations.Get(residency::kStateBuffers).value());
-      for (const Buffer &state : states) accumulator_candidates.push_back(state);
+      for (const Buffer &state : states)
+        accumulator_candidates.push_back(state);
     }
     std::sort(accumulator_candidates.begin(), accumulator_candidates.end(),
               [](const Buffer &lhs, const Buffer &rhs) {
@@ -645,7 +651,8 @@ private:
     }
 
     For normalized = outer;
-    if (generic) normalized.CopyOnWrite()->body = canonical_body;
+    if (generic)
+      normalized.CopyOnWrite()->body = canonical_body;
     Map<String, Any> annotations = normalized->annotations;
     annotations.Set(kMultidimRegion, Bool(true));
     annotations.Set(kMultidimStrategy, String(kInterchangeStrategy));
@@ -661,15 +668,22 @@ private:
     annotations.Set(kMultidimOriginalLoop, outer);
     annotations.Set("tl.sunmmio.multidim.requested_stages",
                     Integer(num_stages));
-    annotations.Set("iterations", Integer(grouped ? group_width : outer_extent));
+    annotations.Set("iterations",
+                    Integer(grouped ? group_width : outer_extent));
     annotations.Set("used_buffers", accumulators);
     annotations.Set("versioned_buffers", accumulators);
     annotations.Set("runtime_multiversion_buffers", accumulators);
     normalized.CopyOnWrite()->annotations = annotations;
 
     auto record_group = [&](int64_t lanes, int64_t count, bool tail) {
-      RegionEvent event{true, outer->loop_var->name_hint,
-                        inner->loop_var->name_hint, outer_min, lanes, 0, lanes, ""};
+      RegionEvent event{true,
+                        outer->loop_var->name_hint,
+                        inner->loop_var->name_hint,
+                        outer_min,
+                        lanes,
+                        0,
+                        lanes,
+                        ""};
       if (grouped) {
         event.source_outer_extent = outer_extent;
         event.group_count = count;
@@ -688,15 +702,15 @@ private:
   }
 
   Stmt Normalize(const For &outer, const For &inner, int64_t outer_min,
-                 int64_t outer_extent, int64_t inner_min,
-                 int64_t inner_extent, int64_t num_stages) {
-    if (InterchangeEnabled() || outer->annotations.count(residency::kEligible)) {
+                 int64_t outer_extent, int64_t inner_min, int64_t inner_extent,
+                 int64_t num_stages) {
+    if (InterchangeEnabled() ||
+        outer->annotations.count(residency::kEligible)) {
       return NormalizeInterchange(outer, inner, outer_min, outer_extent,
                                   inner_min, inner_extent, num_stages);
     }
 
-    if (const char *raw =
-            std::getenv("TL_SUNMMIO_MULTIDIM_HIERARCHICAL")) {
+    if (const char *raw = std::getenv("TL_SUNMMIO_MULTIDIM_HIERARCHICAL")) {
       if (std::atoi(raw) != 0) {
         return NormalizeHierarchical(outer, inner, outer_min, outer_extent,
                                      inner_min, inner_extent, num_stages);
@@ -711,8 +725,8 @@ private:
 
     Array<Stmt> expanded;
     for (int64_t offset = 0; offset < inner_extent; ++offset) {
-      PrimExpr coordinate = make_const(inner->loop_var.dtype(),
-                                       inner_min + offset);
+      PrimExpr coordinate =
+          make_const(inner->loop_var.dtype(), inner_min + offset);
       Map<Var, PrimExpr> substitution;
       substitution.Set(inner->loop_var, coordinate);
       for (const Stmt &stmt : inner_statements.value()) {
@@ -743,14 +757,9 @@ private:
     annotations.Set(kMultidimOriginalLoop, outer);
     node->annotations = annotations;
 
-    events_.push_back(RegionEvent{true,
-                                  outer->loop_var->name_hint,
-                                  inner->loop_var->name_hint,
-                                  outer_min,
-                                  outer_extent,
-                                  inner_min,
-                                  inner_extent,
-                                  ""});
+    events_.push_back(RegionEvent{true, outer->loop_var->name_hint,
+                                  inner->loop_var->name_hint, outer_min,
+                                  outer_extent, inner_min, inner_extent, ""});
     return normalized;
   }
 
@@ -778,15 +787,16 @@ private:
         cores.push_back(outer);
       } else {
         for (const For &nested : DirectNestedLoopCollector::Collect(op->body))
-          if (HasNumStages(nested.get())) cores.push_back(nested);
+          if (HasNumStages(nested.get()))
+            cores.push_back(nested);
       }
       if (!cores.empty())
         return RejectCores(outer, cores, "generic_residency",
                            Downcast<String>(rejected.value()));
       // Unknown ownership remains an opaque fallback boundary.  Do not infer
       // a core binding by name or broadcast this decision to descendants.
-      return MarkOneDimensionalFallback(
-          outer, "generic_residency", Downcast<String>(rejected.value()));
+      return MarkOneDimensionalFallback(outer, "generic_residency",
+                                        Downcast<String>(rejected.value()));
     }
 
     if (HasNumStages(op)) {
@@ -856,11 +866,9 @@ private:
 
 std::optional<int64_t> AnnotationInt(const For &loop, const char *key);
 
-
 class InterchangeVersionAccessRewriter : public StmtExprMutator {
 public:
-  using VersionMap =
-      std::unordered_map<const BufferNode *, Array<Buffer>>;
+  using VersionMap = std::unordered_map<const BufferNode *, Array<Buffer>>;
 
   InterchangeVersionAccessRewriter(const VersionMap &versions, int version)
       : versions_(versions), version_(version) {}
@@ -896,8 +904,7 @@ private:
   }
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
-    BufferStore store =
-        Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
+    BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
     if (!IsVersioned(store->buffer)) {
       return store;
     }
@@ -906,8 +913,7 @@ private:
   }
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
-    BufferLoad load =
-        Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
+    BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
     if (!IsVersioned(load->buffer)) {
       return load;
     }
@@ -978,8 +984,10 @@ private:
       }
       body = realize->block->body;
     }
-    if (generic) return residency::Statements(body);
-    if (const auto *seq = body.as<SeqStmtNode>()) return seq->seq;
+    if (generic)
+      return residency::Statements(body);
+    if (const auto *seq = body.as<SeqStmtNode>())
+      return seq->seq;
     return Array<Stmt>{body};
   }
 
@@ -1135,11 +1143,12 @@ private:
     bool generic = loop->annotations.count(residency::kEligible);
     if (inner_index < 0 ||
         (!generic && (inner_index == 0 ||
-         inner_index + 1 >= static_cast<int>(body->seq.size())))) {
+                      inner_index + 1 >= static_cast<int>(body->seq.size())))) {
       return Fail("interchange_prefix_or_suffix_missing_after_prepare");
     }
 
-    std::optional<Array<Stmt>> inner_statements = GetInnerStatements(inner, generic);
+    std::optional<Array<Stmt>> inner_statements =
+        GetInnerStatements(inner, generic);
     if (!inner_statements.has_value()) {
       return Fail("interchange_inner_block_state_unsupported");
     }
@@ -1162,8 +1171,10 @@ private:
       ++shared_prefix_count;
     }
     if (generic) {
-      int proved_count = Downcast<IntImm>(
-          loop->annotations.Get(residency::kPrefixCount).value())->value;
+      int proved_count =
+          Downcast<IntImm>(
+              loop->annotations.Get(residency::kPrefixCount).value())
+              ->value;
       ICHECK_EQ(proved_count, shared_prefix_count)
           << "residency proof/prefix builder disagreement";
     }
@@ -1174,88 +1185,94 @@ private:
     }
 
     auto build_group = [&](PrimExpr group_base, int64_t lanes) -> Stmt {
-    Array<Stmt> new_inner_body;
-    for (int i = 0; i < shared_prefix_count; ++i) {
-      new_inner_body.push_back(
-          MarkCoordinate(inner->loop_var, 0, inner_statements.value()[i]));
-    }
-    for (int version = 0; version < lanes; ++version) {
-      PrimExpr coordinate = group_base + make_const(loop->loop_var.dtype(), version);
-      for (int i = shared_prefix_count;
-           i < static_cast<int>(inner_statements.value().size()); ++i) {
-        Stmt instance = MakeInstance(inner_statements.value()[i],
-                                     loop->loop_var, coordinate, version);
+      Array<Stmt> new_inner_body;
+      for (int i = 0; i < shared_prefix_count; ++i) {
         new_inner_body.push_back(
-            MarkCoordinate(inner->loop_var, version, instance));
+            MarkCoordinate(inner->loop_var, 0, inner_statements.value()[i]));
       }
-    }
-
-    auto k_min = AsStaticInt(inner->min);
-    auto k_extent = AsStaticInt(inner->extent);
-    ICHECK(k_min && k_extent) << "interchange K loop must remain static";
-    Map<String, Any> inner_annotations = inner->annotations;
-    inner_annotations.Set(kMultidimRegion, Bool(true));
-    inner_annotations.Set(kMultidimStrategy, String(kInterchangeStrategy));
-    inner_annotations.Set(kMultidimRank, Integer(2));
-    inner_annotations.Set(kMultidimOuterVar, String(loop->loop_var->name_hint));
-    inner_annotations.Set(kMultidimInnerVar,
-                          String(inner->loop_var->name_hint));
-    inner_annotations.Set(kMultidimOuterMin, Integer(*outer_min));
-    inner_annotations.Set(kMultidimOuterExtent, Integer(lanes));
-    // The planner's command coordinate is the statically unrolled outer Tile.
-    inner_annotations.Set(kMultidimInnerMin, Integer(0));
-    inner_annotations.Set(kMultidimInnerExtent, Integer(lanes));
-    inner_annotations.Set(kInterchangeKMin, Integer(*k_min));
-    inner_annotations.Set(kInterchangeKExtent, Integer(*k_extent));
-    inner_annotations.Set(kInterchangeApplied, Bool(true));
-    if (generic) inner_annotations.Set(residency::kApplied, Bool(true));
-    inner_annotations.Set(kInterchangeSharedPrefixCount,
-                          Integer(shared_prefix_count));
-    inner_annotations.Set(kInterchangeOuterVersions, Integer(lanes));
-    if (grouped_width) {
-      inner_annotations.Set(residency::kGroupedCore, Bool(true));
-      inner_annotations.Set(residency::kGroupWidth, Integer(pool_width));
-      inner_annotations.Set("tl.sunmmio.residency.group_base", group_base);
-      inner_annotations.Set("tl.sunmmio.residency.source_outer_extent",
-                            Integer(*outer_extent));
-    }
-    Array<Buffer> independent_accumulators;
-    for (const Buffer &buffer : accumulators) {
-      const auto &versions = accumulator_versions_.at(buffer.get());
       for (int version = 0; version < lanes; ++version) {
-        independent_accumulators.push_back(versions[version]);
+        PrimExpr coordinate =
+            group_base + make_const(loop->loop_var.dtype(), version);
+        for (int i = shared_prefix_count;
+             i < static_cast<int>(inner_statements.value().size()); ++i) {
+          Stmt instance = MakeInstance(inner_statements.value()[i],
+                                       loop->loop_var, coordinate, version);
+          new_inner_body.push_back(
+              MarkCoordinate(inner->loop_var, version, instance));
+        }
       }
-    }
-    inner_annotations.Set(kInterchangeAccumulatorVersions,
-                          independent_accumulators);
-    inner_annotations.Set(kMultidimSelectedMode, String("multidim_ilp"));
 
-    For interchanged = inner;
-    interchanged.CopyOnWrite()->body = SeqStmt::Flatten(new_inner_body);
-    interchanged.CopyOnWrite()->annotations = inner_annotations;
+      auto k_min = AsStaticInt(inner->min);
+      auto k_extent = AsStaticInt(inner->extent);
+      ICHECK(k_min && k_extent) << "interchange K loop must remain static";
+      Map<String, Any> inner_annotations = inner->annotations;
+      inner_annotations.Set(kMultidimRegion, Bool(true));
+      inner_annotations.Set(kMultidimStrategy, String(kInterchangeStrategy));
+      inner_annotations.Set(kMultidimRank, Integer(2));
+      inner_annotations.Set(kMultidimOuterVar,
+                            String(loop->loop_var->name_hint));
+      inner_annotations.Set(kMultidimInnerVar,
+                            String(inner->loop_var->name_hint));
+      inner_annotations.Set(kMultidimOuterMin, Integer(*outer_min));
+      inner_annotations.Set(kMultidimOuterExtent, Integer(lanes));
+      // The planner's command coordinate is the statically unrolled outer Tile.
+      inner_annotations.Set(kMultidimInnerMin, Integer(0));
+      inner_annotations.Set(kMultidimInnerExtent, Integer(lanes));
+      inner_annotations.Set(kInterchangeKMin, Integer(*k_min));
+      inner_annotations.Set(kInterchangeKExtent, Integer(*k_extent));
+      inner_annotations.Set(kInterchangeApplied, Bool(true));
+      if (generic)
+        inner_annotations.Set(residency::kApplied, Bool(true));
+      inner_annotations.Set(kInterchangeSharedPrefixCount,
+                            Integer(shared_prefix_count));
+      inner_annotations.Set(kInterchangeOuterVersions, Integer(lanes));
+      if (grouped_width) {
+        inner_annotations.Set(residency::kGroupedCore, Bool(true));
+        inner_annotations.Set(residency::kGroupWidth, Integer(pool_width));
+        inner_annotations.Set("tl.sunmmio.residency.group_base", group_base);
+        inner_annotations.Set("tl.sunmmio.residency.source_outer_extent",
+                              Integer(*outer_extent));
+      }
+      Array<Buffer> independent_accumulators;
+      for (const Buffer &buffer : accumulators) {
+        const auto &versions = accumulator_versions_.at(buffer.get());
+        for (int version = 0; version < lanes; ++version) {
+          independent_accumulators.push_back(versions[version]);
+        }
+      }
+      inner_annotations.Set(kInterchangeAccumulatorVersions,
+                            independent_accumulators);
+      inner_annotations.Set(kMultidimSelectedMode, String("multidim_ilp"));
 
-    Array<Stmt> result;
-    for (int version = 0; version < lanes; ++version) {
-      PrimExpr coordinate = group_base + make_const(loop->loop_var.dtype(), version);
-      for (int i = 0; i < inner_index; ++i) {
-        result.push_back(
-            MakeInstance(body->seq[i], loop->loop_var, coordinate, version));
+      For interchanged = inner;
+      interchanged.CopyOnWrite()->body = SeqStmt::Flatten(new_inner_body);
+      interchanged.CopyOnWrite()->annotations = inner_annotations;
+
+      Array<Stmt> result;
+      for (int version = 0; version < lanes; ++version) {
+        PrimExpr coordinate =
+            group_base + make_const(loop->loop_var.dtype(), version);
+        for (int i = 0; i < inner_index; ++i) {
+          result.push_back(
+              MakeInstance(body->seq[i], loop->loop_var, coordinate, version));
+        }
       }
-    }
-    result.push_back(interchanged);
-    for (int version = 0; version < lanes; ++version) {
-      PrimExpr coordinate = group_base + make_const(loop->loop_var.dtype(), version);
-      for (int i = inner_index + 1; i < static_cast<int>(body->seq.size());
-           ++i) {
-        result.push_back(
-            MakeInstance(body->seq[i], loop->loop_var, coordinate, version));
+      result.push_back(interchanged);
+      for (int version = 0; version < lanes; ++version) {
+        PrimExpr coordinate =
+            group_base + make_const(loop->loop_var.dtype(), version);
+        for (int i = inner_index + 1; i < static_cast<int>(body->seq.size());
+             ++i) {
+          result.push_back(
+              MakeInstance(body->seq[i], loop->loop_var, coordinate, version));
+        }
       }
-    }
-    return SeqStmt::Flatten(result);
+      return SeqStmt::Flatten(result);
     };
 
     PrimExpr minimum = make_const(loop->loop_var.dtype(), *outer_min);
-    if (!grouped_width) return build_group(minimum, *outer_extent);
+    if (!grouped_width)
+      return build_group(minimum, *outer_extent);
     int64_t full_groups = *outer_extent / pool_width;
     int64_t tail_lanes = *outer_extent % pool_width;
     Var group(std::string(loop->loop_var->name_hint) + "_group",
@@ -1263,11 +1280,12 @@ private:
     PrimExpr base = minimum + group * make_const(group.dtype(), pool_width);
     Array<Stmt> groups;
     groups.push_back(For(group, make_zero(group.dtype()),
-                        make_const(group.dtype(), full_groups), ForKind::kSerial,
-                        build_group(base, pool_width)));
+                         make_const(group.dtype(), full_groups),
+                         ForKind::kSerial, build_group(base, pool_width)));
     if (tail_lanes) {
       groups.push_back(build_group(
-          minimum + make_const(group.dtype(), full_groups * pool_width), tail_lanes));
+          minimum + make_const(group.dtype(), full_groups * pool_width),
+          tail_lanes));
     }
     // Both syntactic cores must have distinct binder identities even though
     // their accumulator pool is intentionally shared sequentially.
@@ -1292,14 +1310,19 @@ void WriteRegionEvents(const std::vector<RegionEvent> &events) {
     std::ostringstream stream;
     stream << '"';
     for (unsigned char ch : value) {
-      if (ch == '"' || ch == '\\') stream << '\\' << ch;
-      else if (ch == '\n') stream << "\\n";
-      else if (ch == '\r') stream << "\\r";
-      else if (ch == '\t') stream << "\\t";
+      if (ch == '"' || ch == '\\')
+        stream << '\\' << ch;
+      else if (ch == '\n')
+        stream << "\\n";
+      else if (ch == '\r')
+        stream << "\\r";
+      else if (ch == '\t')
+        stream << "\\t";
       else if (ch < 0x20) {
         const char *digits = "0123456789abcdef";
         stream << "\\u00" << digits[ch >> 4] << digits[ch & 15];
-      } else stream << ch;
+      } else
+        stream << ch;
     }
     stream << '"';
     return stream.str();
@@ -1358,8 +1381,7 @@ private:
       bool has_cross_outer_overlap = true;
       if (stage_ == "planning" && is_applied) {
         auto strategy = loop->annotations.Get(kMultidimStrategy);
-        auto summary_valid =
-            loop->annotations.Get(kHierarchicalSummaryValid);
+        auto summary_valid = loop->annotations.Get(kHierarchicalSummaryValid);
         bool hierarchical_summary =
             strategy.has_value() &&
             Downcast<String>(strategy.value()) == kHierarchicalStrategy &&
@@ -1374,8 +1396,8 @@ private:
             IntImm stage_count_imm = Downcast<IntImm>(stage_count.value());
             IntImm max_iter_offset_imm =
                 Downcast<IntImm>(max_iter_offset.value());
-            has_cross_outer_overlap = stage_count_imm->value >= 2 &&
-                                      max_iter_offset_imm->value > 0;
+            has_cross_outer_overlap =
+                stage_count_imm->value >= 2 && max_iter_offset_imm->value > 0;
           }
         }
       }
@@ -1413,8 +1435,7 @@ private:
 
     Map<String, Any> annotations;
     for (const auto &kv : loop->annotations) {
-      const bool keep_original_for_inject =
-          stage_ == "planning" && is_applied;
+      const bool keep_original_for_inject = stage_ == "planning" && is_applied;
       if (kv.first != kMultidimOriginalLoop || keep_original_for_inject) {
         annotations.Set(kv.first, kv.second);
       }
@@ -1759,8 +1780,7 @@ private:
         *inner_makespan + std::max<int64_t>(0, *inner_extent - 1) * *inner_ii;
 
     int outer_versions = 2;
-    if (const char *raw =
-            std::getenv("TL_SUNMMIO_MULTIDIM_OUTER_VERSIONS")) {
+    if (const char *raw = std::getenv("TL_SUNMMIO_MULTIDIM_OUTER_VERSIONS")) {
       int parsed = std::atoi(raw);
       ICHECK_GE(parsed, 2)
           << "TL_SUNMMIO_MULTIDIM_OUTER_VERSIONS must be at least 2";
@@ -1813,8 +1833,7 @@ private:
                         int min_gain_percent,
                         const std::string &fallback_reason =
                             "predicted_not_better_than_1d") const {
-    For selected =
-        Downcast<For>(StripCandidatePrivateAnnotations()(input));
+    For selected = Downcast<For>(StripCandidatePrivateAnnotations()(input));
     Map<String, Any> annotations = selected->annotations;
     annotations.Set(kMultidimSelectedMode, String(selected_mode));
     annotations.Set(kMultidimPredictedScore, Integer(multidim_score));
@@ -1839,8 +1858,7 @@ private:
     }
     ICHECK_EQ(policy_, "auto");
     For multidim = Downcast<For>(candidate_value.value());
-    std::optional<For> one_dim =
-        FindAppliedOneDimensionalLoop(loop->body);
+    std::optional<For> one_dim = FindAppliedOneDimensionalLoop(loop->body);
     if (!one_dim.has_value()) {
       return AnnotateSelection(loop, "ilp", -1, -1, 2,
                                "one_dim_cost_unavailable");
@@ -1859,8 +1877,7 @@ private:
     }
 
     int min_gain_percent = 2;
-    if (const char *raw =
-            std::getenv("TL_SUNMMIO_MULTIDIM_MIN_GAIN_PERCENT")) {
+    if (const char *raw = std::getenv("TL_SUNMMIO_MULTIDIM_MIN_GAIN_PERCENT")) {
       min_gain_percent = std::clamp(std::atoi(raw), 0, 99);
     }
     auto checked_score = [](int64_t makespan, int64_t extent,
@@ -1905,20 +1922,22 @@ private:
 
 } // namespace
 
-
 tvm::transform::Pass AnalyzeSunmmioBoundaryOverlap(String policy) {
   using namespace tir::transform;
   std::string value = policy;
   ICHECK(value == "off" || value == "shadow" || value == "auto" ||
-         value == "forced") << "invalid boundary overlap policy: " << value;
+         value == "forced")
+      << "invalid boundary overlap policy: " << value;
   auto pass_func = [=](PrimFunc f, const IRModule &, PassContext) {
-    if (value == "off" || !boundary_overlap::Enabled()) return f;
+    if (value == "off" || !boundary_overlap::Enabled())
+      return f;
     BoundaryOverlapAnnotator annotator(f, value);
     PrimFunc result = f;
     result.CopyOnWrite()->body = annotator(f->body);
     return result;
   };
-  return CreatePrimFuncPass(pass_func, 0, "tl.AnalyzeSunmmioBoundaryOverlap", {});
+  return CreatePrimFuncPass(pass_func, 0, "tl.AnalyzeSunmmioBoundaryOverlap",
+                            {});
 }
 
 tvm::transform::Pass SunmmioMultidimRegion(String policy) {
@@ -1939,8 +1958,8 @@ tvm::transform::Pass ApplySunmmioMultidimInterchange(String policy) {
     bool proved_generic = false;
     PostOrderVisit(f->body, [&](const ObjectRef &node) {
       if (const auto *loop = node.as<ForNode>())
-        proved_generic = proved_generic ||
-                         loop->annotations.count(residency::kEligible);
+        proved_generic =
+            proved_generic || loop->annotations.count(residency::kEligible);
     });
     if ((!InterchangeEnabled() || std::string(policy) != "forced") &&
         !proved_generic) {
@@ -1954,7 +1973,8 @@ tvm::transform::Pass ApplySunmmioMultidimInterchange(String policy) {
       return result;
     } catch (const std::exception &error) {
       auto original = f->GetAttr<String>(residency::kGroupingOriginal);
-      if (std::string(policy) != "auto" || !original) throw;
+      if (std::string(policy) != "auto" || !original)
+        throw;
       LOG(WARNING) << "[SunmmioResidency][AtomicFallback] interchange: "
                    << error.what();
       return WithAttr(residency::RestoreGroupingFunction(original.value()),
@@ -1999,49 +2019,57 @@ tvm::transform::Pass ValidateSunmmioMultidimPipeline(String policy,
     PrimFunc result = f;
     result.CopyOnWrite()->body = validator(f->body);
     ICHECK(!(std::string(policy) == "forced" && validator.failed()))
-        << "multidim_ilp forced validation failed at " << stage
-        << ": " << validator.reason();
+        << "multidim_ilp forced validation failed at " << stage << ": "
+        << validator.reason();
     if (auto original = f->GetAttr<String>(residency::kGroupingOriginal)) {
       bool failed = validator.failed();
       std::string reason = validator.reason();
-      if (std::string(stage) == "planning" || std::string(stage) == "artifact") {
+      if (std::string(stage) == "planning" ||
+          std::string(stage) == "artifact") {
         int cores = 0;
         PostOrderVisit(result->body, [&](const ObjectRef &node) {
           if (const auto *loop = node.as<ForNode>()) {
-            if (!loop->annotations.count(residency::kGroupedCore)) return;
+            if (!loop->annotations.count(residency::kGroupedCore))
+              return;
             ++cores;
             auto applied = loop->annotations.Get(kPipelineApplied);
-            failed = failed || !applied || !Downcast<Bool>(applied.value())->value;
+            failed =
+                failed || !applied || !Downcast<Bool>(applied.value())->value;
           }
         });
         auto expected = f->GetAttr<Integer>(residency::kGroupingCoreCount);
         failed = failed || !expected || cores != expected.value()->value;
-        if (reason.empty()) reason = "grouped_core_not_planned";
+        if (reason.empty())
+          reason = "grouped_core_not_planned";
       } else {
         auto fallback = PipelineFallbackValidator::FindDisallowed(result->body);
         failed = failed || fallback.has_value() ||
                  !result->HasNonzeroAttr("tl.sunmmio.multidim.applied");
-        if (reason.empty()) reason = "grouped_injection_failed";
+        if (reason.empty())
+          reason = "grouped_injection_failed";
       }
       if (failed) {
         ICHECK_NE(std::string(policy), "forced")
             << "grouped residency validation failed: " << reason;
-        LOG(WARNING) << "[SunmmioResidency][AtomicFallback] " << stage
-                     << ": " << reason;
+        LOG(WARNING) << "[SunmmioResidency][AtomicFallback] " << stage << ": "
+                     << reason;
         // Restore the complete function, including buffer allocations and
         // layout maps, not just the core loop. The caller replans ordinary1D.
         return WithAttr(residency::RestoreGroupingFunction(original.value()),
-                        "tl.sunmmio.residency.grouping_fallback", String(reason));
+                        "tl.sunmmio.residency.grouping_fallback",
+                        String(reason));
       }
       if (std::string(stage) == "inject") {
-        result = WithoutAttr(std::move(result), String(residency::kGroupingOriginal));
-        result = WithoutAttr(std::move(result), String(residency::kGroupingCoreCount));
+        result = WithoutAttr(std::move(result),
+                             String(residency::kGroupingOriginal));
+        result = WithoutAttr(std::move(result),
+                             String(residency::kGroupingCoreCount));
       }
     }
     return result;
   };
-  return CreatePrimFuncPass(pass_func, 0,
-                            "tl.ValidateSunmmioMultidimPipeline", {});
+  return CreatePrimFuncPass(pass_func, 0, "tl.ValidateSunmmioMultidimPipeline",
+                            {});
 }
 tvm::transform::Pass SelectSunmmioMultidimPipeline(String policy) {
   using namespace tir::transform;
@@ -2051,10 +2079,9 @@ tvm::transform::Pass SelectSunmmioMultidimPipeline(String policy) {
     result.CopyOnWrite()->body = selector(f->body);
     return result;
   };
-  return CreatePrimFuncPass(pass_func, 0,
-                            "tl.SelectSunmmioMultidimPipeline", {});
+  return CreatePrimFuncPass(pass_func, 0, "tl.SelectSunmmioMultidimPipeline",
+                            {});
 }
-
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;

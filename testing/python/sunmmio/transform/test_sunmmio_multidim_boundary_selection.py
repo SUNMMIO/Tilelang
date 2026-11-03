@@ -1,4 +1,5 @@
 """A proved boundary without a solved candidate must not claim Multidim."""
+
 import importlib.util
 from pathlib import Path
 
@@ -7,7 +8,8 @@ from tilelang import tvm
 from tilelang.utils.target import SUNMMIO_TARGET_DESC
 
 _spec = importlib.util.spec_from_file_location(
-    "boundary_proof_helpers", Path(__file__).with_name("test_sunmmio_multidim_boundary_overlap.py"))
+    "boundary_proof_helpers", Path(__file__).with_name("test_sunmmio_multidim_boundary_overlap.py")
+)
 _helpers = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_helpers)
 
@@ -30,8 +32,7 @@ def test_boundary_planning_rejection_records_retained_inner_pipeline(monkeypatch
     before = _helpers._outer(mod)
     # Deliberately omit the core planning pass. A legality proof is not a
     # solved schedule, and rejection must not masquerade as Multidim success.
-    result = tl.transform.SunmmioRegionCrossOuterPipelinePlanning(
-        policy="auto", strategy="multidim_boundary")(mod)
+    result = tl.transform.SunmmioRegionCrossOuterPipelinePlanning(policy="auto", strategy="multidim_boundary")(mod)
     after = _helpers._outer(result)
     assert str(after.annotations["tl.sunmmio.region_cross_outer.fallback_reason"]) == "inner_ilp_schedule_missing"
     assert str(after.annotations["tl.sunmmio.multidim.selected_mode"]) == "ilp"

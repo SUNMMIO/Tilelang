@@ -880,6 +880,8 @@ def AnalyzeSunmmioBoundaryOverlap(policy: str = "auto"):
 def SunmmioMultidimRegion(policy: str = "auto"):
     """Discover and normalize a static two-dimensional SunMMIO pipeline region."""
     return _ffi_api.SunmmioMultidimRegion(policy)  # type: ignore
+
+
 def PrepareSunmmioMultidimInterchangeBuffers():
     """Compatibility no-op; Apply creates independent accumulator buffers."""
     return _ffi_api.PrepareSunmmioMultidimInterchangeBuffers()  # type: ignore
@@ -888,8 +890,6 @@ def PrepareSunmmioMultidimInterchangeBuffers():
 def ApplySunmmioMultidimInterchange(policy: str = "auto"):
     """Interchange a static small outer loop with its pipelined inner loop."""
     return _ffi_api.ApplySunmmioMultidimInterchange(policy)  # type: ignore
-
-
 
 
 def BuildSunmmioHierarchicalSummary(policy: str = "auto"):
@@ -906,10 +906,10 @@ def ValidateSunmmioMultidimPipeline(policy: str = "auto", stage: str = "planning
     """Validate forced/auto multidim diagnostics and remove private metadata."""
     return _ffi_api.ValidateSunmmioMultidimPipeline(policy, stage)  # type: ignore
 
+
 def SelectSunmmioMultidimPipeline(policy: str = "auto"):
     """Choose the lower predicted-time legal candidate in auto mode."""
     return _ffi_api.SelectSunmmioMultidimPipeline(policy)  # type: ignore
-
 
 
 def SunmmioMultidimPipelinePlanningILP(debug: bool = False, policy: str = "auto"):
@@ -920,20 +920,19 @@ def SunmmioMultidimPipelinePlanningILP(debug: bool = False, policy: str = "auto"
     schedules that Tile-stage graph across outer-loop iterations.
     """
     passes = [
-            SunmmioMultidimRegion(policy),
-            PrepareSunmmioMultidimInterchangeBuffers(),
-            ApplySunmmioMultidimInterchange(policy),
-            SunmmioPipelinePlanningILP(debug),
-            BuildSunmmioHierarchicalSummary(policy),
-            ValidateSunmmioMultidimPipeline(policy, "planning"),
-            # Auto mode plans the restored 1D loop as a competing candidate.
-            SunmmioPipelinePlanningILP(debug),
-            SelectSunmmioMultidimPipeline(policy),
-        ]
+        SunmmioMultidimRegion(policy),
+        PrepareSunmmioMultidimInterchangeBuffers(),
+        ApplySunmmioMultidimInterchange(policy),
+        SunmmioPipelinePlanningILP(debug),
+        BuildSunmmioHierarchicalSummary(policy),
+        ValidateSunmmioMultidimPipeline(policy, "planning"),
+        # Auto mode plans the restored 1D loop as a competing candidate.
+        SunmmioPipelinePlanningILP(debug),
+        SelectSunmmioMultidimPipeline(policy),
+    ]
     if os.environ.get("TL_SUNMMIO_MULTIDIM_BOUNDARY_OVERLAP", "1") == "1":
         passes.insert(0, AnalyzeSunmmioBoundaryOverlap(policy))
-        passes.append(SunmmioRegionCrossOuterPipelinePlanning(
-            debug=debug, policy="auto", strategy="multidim_boundary"))
+        passes.append(SunmmioRegionCrossOuterPipelinePlanning(debug=debug, policy="auto", strategy="multidim_boundary"))
     return tvm.transform.Sequential(
         passes,
         name="tl.SunmmioMultidimPipelinePlanningILP",

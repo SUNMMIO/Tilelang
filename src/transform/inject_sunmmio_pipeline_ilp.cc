@@ -499,8 +499,7 @@ private:
           loop.CopyOnWrite()->annotations.Set(name, remapped);
         };
         remap_buffer_array_annotation(kRegionCrossOuterCoreVersionedBuffers);
-        remap_buffer_array_annotation(
-            kRegionCrossOuterRegionVersionedBuffers);
+        remap_buffer_array_annotation(kRegionCrossOuterRegionVersionedBuffers);
       }
     }
     return loop;
@@ -1696,8 +1695,7 @@ private:
     std::unordered_set<int> collective_command_ids;
     if (auto ann = outer->annotations.Get(
             "tl.sunmmio.region_cross_outer.collective_command_ids")) {
-      for (const Integer &command_id :
-           Downcast<Array<Integer>>(ann.value())) {
+      for (const Integer &command_id : Downcast<Array<Integer>>(ann.value())) {
         collective_command_ids.insert(command_id->value);
       }
     }
@@ -1781,8 +1779,7 @@ private:
           if (!found_suffix_overlap_tc &&
               event.logical == suffix_overlap_logical) {
             suffix_emit_after[outer_index] = std::max(
-                suffix_emit_after[outer_index],
-                static_cast<int64_t>(position));
+                suffix_emit_after[outer_index], static_cast<int64_t>(position));
             found_suffix_overlap_tc = true;
           }
           if (found_generation_boundary && found_suffix_overlap_tc) {
@@ -1806,8 +1803,8 @@ private:
         runtime_buffers_anno, versioned_buffers_anno, banked_buffers,
         iterations);
     Array<Buffer> region_versioned_buffers;
-    if (auto ann = outer->annotations.Get(
-            kRegionCrossOuterRegionVersionedBuffers)) {
+    if (auto ann =
+            outer->annotations.Get(kRegionCrossOuterRegionVersionedBuffers)) {
       region_versioned_buffers = Downcast<Array<Buffer>>(ann.value());
     }
     Array<Buffer> rewritten_buffers = runtime_buffers;
@@ -1866,8 +1863,8 @@ private:
                                    outer->min + Integer(event.outer));
       rewriter.clear_version_expr_overrides();
       for (const Buffer &buffer : region_versioned_buffers) {
-        rewriter.set_version_expr_override(
-            buffer, Integer(event.outer % iterations));
+        rewriter.set_version_expr_override(buffer,
+                                           Integer(event.outer % iterations));
       }
       rewriter.clear_parity_overrides();
       Stmt stmt = rewriter(pipeline_body->seq[event.id]);
@@ -1889,16 +1886,14 @@ private:
         ++prefix_coverage[event.outer];
       }
       if (pre_tc_sync_positions.count(position)) {
-        result.push_back(Evaluate(Call(
-            DataType::Handle(), sunmmio_sync(),
-            {IntImm(DataType::Int(32),
-                    static_cast<int64_t>(kSunmmioSyncTc))})));
+        result.push_back(
+            Evaluate(Call(DataType::Handle(), sunmmio_sync(),
+                          {IntImm(DataType::Int(32),
+                                  static_cast<int64_t>(kSunmmioSyncTc))})));
       }
       result.push_back(rewrite_core(event));
-      for (int64_t outer_index = 0; outer_index < outer_extent;
-           ++outer_index) {
-        if (static_cast<int64_t>(position) ==
-            suffix_emit_after[outer_index]) {
+      for (int64_t outer_index = 0; outer_index < outer_extent; ++outer_index) {
+        if (static_cast<int64_t>(position) == suffix_emit_after[outer_index]) {
           for (int index = 0; index < suffix_count; ++index) {
             result.push_back(rewrite_region(
                 region_body->seq[core_index + 1 + index], outer_index));
@@ -2026,15 +2021,16 @@ tvm::transform::Pass InjectSunmmioPipelineILP() {
       fptr->body = SunmmioILPPipelineInjector::Inject(
           candidate, &hierarchical_injected_count);
       fptr->body = ConvertSSA(std::move(fptr->body));
-      fptr->body = MultidimPlannerMarkerCleanupRewriter::Strip(
-          std::move(fptr->body));
+      fptr->body =
+          MultidimPlannerMarkerCleanupRewriter::Strip(std::move(fptr->body));
       Optional<String> disallowed =
           PipelineFallbackValidator::FindDisallowed(fptr->body);
       if (disallowed) {
         return MakePipelineFunctionFallback(
-            original, PipelineDiagnostic{false, pipeline_mode, "inject_validation",
-                                         "candidate_fallback",
-                                         std::string(disallowed.value())});
+            original,
+            PipelineDiagnostic{false, pipeline_mode, "inject_validation",
+                               "candidate_fallback",
+                               std::string(disallowed.value())});
       }
       if (hierarchical_injected_count > 0) {
         candidate = WithAttr(std::move(candidate),
@@ -2044,21 +2040,22 @@ tvm::transform::Pass InjectSunmmioPipelineILP() {
                              "tl.sunmmio.hierarchical_ilp.boundary_overlap",
                              Bool(true));
         Array<String> device_attr_keys;
-        if (auto existing = candidate->GetAttr<Array<String>>(
-                attr::kDeviceFuncAttrKeys)) {
+        if (auto existing =
+                candidate->GetAttr<Array<String>>(attr::kDeviceFuncAttrKeys)) {
           device_attr_keys = existing.value();
         }
         auto append_unique = [&](const String &key) {
-          if (std::find(device_attr_keys.begin(), device_attr_keys.end(), key) ==
-              device_attr_keys.end()) {
+          if (std::find(device_attr_keys.begin(), device_attr_keys.end(),
+                        key) == device_attr_keys.end()) {
             device_attr_keys.push_back(key);
           }
         };
         append_unique("tl.sunmmio.hierarchical_ilp.coverage_verified");
         append_unique("tl.sunmmio.hierarchical_ilp.boundary_overlap");
         if (candidate->HasNonzeroAttr("tl.sunmmio.boundary_overlap.planned")) {
-          candidate = WithAttr(std::move(candidate),
-                               "tl.sunmmio.boundary_overlap.applied", Bool(true));
+          candidate =
+              WithAttr(std::move(candidate),
+                       "tl.sunmmio.boundary_overlap.applied", Bool(true));
           append_unique("tl.sunmmio.boundary_overlap.applied");
         }
         candidate = WithAttr(std::move(candidate), attr::kDeviceFuncAttrKeys,
@@ -2068,8 +2065,8 @@ tvm::transform::Pass InjectSunmmioPipelineILP() {
         const String multidim_key = "tl.sunmmio.multidim.applied";
         candidate = WithAttr(std::move(candidate), multidim_key, Bool(true));
         Array<String> device_attr_keys;
-        if (auto existing = candidate->GetAttr<Array<String>>(
-                attr::kDeviceFuncAttrKeys)) {
+        if (auto existing =
+                candidate->GetAttr<Array<String>>(attr::kDeviceFuncAttrKeys)) {
           device_attr_keys = existing.value();
         }
         if (std::find(device_attr_keys.begin(), device_attr_keys.end(),

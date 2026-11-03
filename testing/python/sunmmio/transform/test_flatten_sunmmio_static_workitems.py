@@ -38,9 +38,7 @@ def _make_workitem_module(outer_extent=2, inner_extent=3):
         inner,
         annotations={OUTER: tir.IntImm("int32", 1)},
     )
-    func = tir.PrimFunc(
-        [output.data], outer, buffer_map={output.data: output}
-    ).with_attr("global_symbol", "main")
+    func = tir.PrimFunc([output.data], outer, buffer_map={output.data: output}).with_attr("global_symbol", "main")
     return tvm.IRModule.from_expr(func)
 
 
@@ -160,18 +158,20 @@ def _make_a_residency_module(a_depends_on_bn=False, marked=True):
     # The independent input/output allocations are part of this legal fixture.
     # Generic loop interchange must not infer non-aliasing from variable names.
     buffers = [a, b, a_stage, a_shared, b_shared, accumulator, output, projection]
-    func = tir.PrimFunc(
-        [item.data for item in buffers],
-        outer,
-        buffer_map={item.data: item for item in buffers},
-    ).with_attr("global_symbol", "main").with_attr("tir.noalias", True)
+    func = (
+        tir.PrimFunc(
+            [item.data for item in buffers],
+            outer,
+            buffer_map={item.data: item for item in buffers},
+        )
+        .with_attr("global_symbol", "main")
+        .with_attr("tir.noalias", True)
+    )
     return tvm.IRModule.from_expr(func)
 
 
 def test_static_workitems_flatten_and_preserve_coordinates():
-    result = tl.transform.FlattenSunmmioStaticWorkItems("forced")(
-        _make_workitem_module()
-    )["main"]
+    result = tl.transform.FlattenSunmmioStaticWorkItems("forced")(_make_workitem_module())["main"]
     assert bool(result.attrs["tl.sunmmio.multidim.workitem_flatten.applied"])
     device_keys = {str(key) for key in result.attrs["tl.device_func_attr_keys"]}
     assert "tl.sunmmio.multidim.workitem_flatten.applied" in device_keys
@@ -202,9 +202,7 @@ def test_static_workitems_flatten_and_preserve_coordinates():
 
 def test_dynamic_workitem_range_records_auto_fallback():
     extent = tir.Var("experts", "int32")
-    result = tl.transform.FlattenSunmmioStaticWorkItems("auto")(
-        _make_workitem_module(outer_extent=extent)
-    )["main"]
+    result = tl.transform.FlattenSunmmioStaticWorkItems("auto")(_make_workitem_module(outer_extent=extent))["main"]
     outer = result.body
     assert isinstance(outer, tir.For)
     assert not bool(outer.annotations["tl.sunmmio.multidim.workitem.applied"])
@@ -230,9 +228,7 @@ def test_unmarked_loop_is_unchanged_in_auto_mode():
 
 
 def test_a_residency_interchanges_static_bn_and_pipeline_core():
-    result = tl.transform.FlattenSunmmioStaticWorkItems("auto")(
-        _make_a_residency_module()
-    )["main"]
+    result = tl.transform.FlattenSunmmioStaticWorkItems("auto")(_make_a_residency_module())["main"]
     assert bool(result.attrs["tl.sunmmio.multidim.a_residency.applied"])
     assert "tl.sunmmio.multidim.workitem_flatten.applied" not in result.attrs
     device_keys = {str(key) for key in result.attrs["tl.device_func_attr_keys"]}
@@ -248,17 +244,13 @@ def test_a_residency_interchanges_static_bn_and_pipeline_core():
     broadcasts = []
     tir.stmt_functor.post_order_visit(
         core.body,
-        lambda node: broadcasts.append(node)
-        if isinstance(node, tir.Call) and node.op.same_as(tvm.ir.Op.get("tl.broadcast_"))
-        else None,
+        lambda node: broadcasts.append(node) if isinstance(node, tir.Call) and node.op.same_as(tvm.ir.Op.get("tl.broadcast_")) else None,
     )
     assert len(broadcasts) == 3
 
 
 def test_a_residency_rejects_a_region_that_depends_on_bn():
-    result = tl.transform.FlattenSunmmioStaticWorkItems("auto")(
-        _make_a_residency_module(a_depends_on_bn=True)
-    )["main"]
+    result = tl.transform.FlattenSunmmioStaticWorkItems("auto")(_make_a_residency_module(a_depends_on_bn=True))["main"]
     assert "tl.sunmmio.multidim.a_residency.applied" not in result.attrs
     assert bool(result.attrs["tl.sunmmio.multidim.workitem_flatten.applied"])
     assert isinstance(result.body, tir.For)
@@ -266,9 +258,7 @@ def test_a_residency_rejects_a_region_that_depends_on_bn():
 
 
 def test_auto_discovers_unmarked_static_workitems():
-    result = tl.transform.FlattenSunmmioStaticWorkItems("auto")(
-        _make_a_residency_module(marked=False)
-    )["main"]
+    result = tl.transform.FlattenSunmmioStaticWorkItems("auto")(_make_a_residency_module(marked=False))["main"]
     assert bool(result.attrs["tl.sunmmio.multidim.a_residency.applied"])
     assert int(result.attrs["tl.sunmmio.multidim.workitem.auto_discovered"]) == 1
     outer = result.body
@@ -279,9 +269,7 @@ def test_auto_discovers_unmarked_static_workitems():
     broadcasts = []
     tir.stmt_functor.post_order_visit(
         core.body,
-        lambda node: broadcasts.append(node)
-        if isinstance(node, tir.Call) and node.op.same_as(tvm.ir.Op.get("tl.broadcast_"))
-        else None,
+        lambda node: broadcasts.append(node) if isinstance(node, tir.Call) and node.op.same_as(tvm.ir.Op.get("tl.broadcast_")) else None,
     )
     assert len(broadcasts) == 3
 
@@ -294,9 +282,7 @@ def test_auto_discovery_rejects_variant_shared_transfer():
 
 def test_forced_mode_still_requires_explicit_workitem_annotations():
     try:
-        tl.transform.FlattenSunmmioStaticWorkItems("forced")(
-            _make_a_residency_module(marked=False)
-        )
+        tl.transform.FlattenSunmmioStaticWorkItems("forced")(_make_a_residency_module(marked=False))
     except tvm.TVMError as error:
         assert "no_marked_workitem_nest" in str(error)
     else:

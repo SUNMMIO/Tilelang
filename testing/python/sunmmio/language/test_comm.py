@@ -978,7 +978,7 @@ def test_comm_all_gather_axis_middle_horizontal_lower():
 
     @T.prim_func
     def main():
-        with T.Kernel(threads=128) as bx:
+        with T.Kernel(threads=128):
             A_shared = T.alloc_shared([1, 128, 128], "float16", scope="shared.rsram")
             R_shared = T.alloc_shared([1, 4 * 128, 128], "float16", scope="shared.rsram")
             T.comm.all_gather(A_shared, R_shared, direction="horizontal", axis=1)

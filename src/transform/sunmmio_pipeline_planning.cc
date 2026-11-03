@@ -20,12 +20,12 @@
 #include "../target/sunmmio/hardware_types.h"
 #include "../target/sunmmio/sunmmio_async_op_info.h"
 #include "../target/sunmmio_utils.h"
+#include "sunmmio_pipeline_planning/grouping_snapshot.h"
 #include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
 #include "sunmmio_pipeline_planning/resource_types_for_ilp.h"
 #include "sunmmio_pipeline_planning/stmt_read_write_collector.h"
 #include "sunmmio_pipeline_planning/sunmmio_pipeline_utils.h"
 #include "sunmmio_pipeline_planning/tile_residency_analysis.h"
-#include "sunmmio_pipeline_planning/grouping_snapshot.h"
 #include <tvm/ffi/extra/structural_hash.h>
 
 #include <algorithm>
@@ -2521,7 +2521,6 @@ public:
   }
 
 private:
-
   Stmt Reject(const ForNode *outer, const std::string &reason,
               const std::string &detail) {
     if (forced_) {
@@ -2920,7 +2919,8 @@ public:
   SunmmioRegionCrossOuterPipelinePlanner(const PrimFunc &func, bool debug,
                                          bool forced, std::string strategy)
       : func_(func), debug_(debug), forced_(forced),
-        strategy_(strategy == "multidim_boundary" ? "hierarchical_ilp" : strategy),
+        strategy_(strategy == "multidim_boundary" ? "hierarchical_ilp"
+                                                  : strategy),
         only_proved_boundary_(strategy == "multidim_boundary") {
     PostOrderVisit(func_->body, [&](const ObjectRef &obj) {
       if (const auto *block = obj.as<BlockNode>()) {
@@ -2956,7 +2956,8 @@ private:
       // A legal region is only a candidate. If it has no useful/supported
       // schedule, preserve the solved inner 1D pipeline and report that fact.
       annotations.Set("tl.sunmmio.multidim.selected_mode", String("ilp"));
-      annotations.Set("tl.sunmmio.multidim.fallback_stage", String("boundary_overlap"));
+      annotations.Set("tl.sunmmio.multidim.fallback_stage",
+                      String("boundary_overlap"));
       annotations.Set("tl.sunmmio.multidim.fallback_reason", String(reason));
     }
     fallback.CopyOnWrite()->annotations = annotations;
@@ -3035,8 +3036,8 @@ private:
           PrimExpr adjacent_conflict =
               tir::And(conditional->condition, next_condition);
           arith::Analyzer guard_analyzer;
-          adjacent_exclusive = guard_analyzer.z3_prover.CanProve(
-              tir::Not(adjacent_conflict));
+          adjacent_exclusive =
+              guard_analyzer.z3_prover.CanProve(tir::Not(adjacent_conflict));
         }
       }
       Array<Stmt> singleton{stmt};
@@ -3058,8 +3059,7 @@ private:
         int &count = suffix_write_stmt_count[buffer];
         ++count;
         if (count == 1) {
-          suffix_write_stmt_is_adjacent_exclusive[buffer] =
-              adjacent_exclusive;
+          suffix_write_stmt_is_adjacent_exclusive[buffer] = adjacent_exclusive;
         } else {
           suffix_write_stmt_is_adjacent_exclusive[buffer] = false;
         }
@@ -3077,12 +3077,13 @@ private:
     // such a buffer separates those pieces and is semantically wrong. Keep it
     // single-versioned; suffixes are emitted in logical order and InjectSync
     // still protects asynchronous producer/consumer reuse.
-    //找到可能最后用来汇总的buffer的可能候选
+    // 找到可能最后用来汇总的buffer的可能候选
     std::unordered_set<const BufferNode *> suffix_carried_buffers;
     for (const BufferNode *buffer : conditional_suffix_read_buffers) {
       if (suffix_written_buffers.count(buffer) &&
           !nonconditional_suffix_read_buffers.count(buffer)) {
-        suffix_carried_buffers.insert(buffer); //表示这个buffer不能被拆成双buffer
+        suffix_carried_buffers.insert(
+            buffer); // 表示这个buffer不能被拆成双buffer
       }
     }
 
@@ -3092,30 +3093,38 @@ private:
                      const char *hazard,
                      bool allow_adjacent_exclusive_suffix_waw = false,
                      bool preserve_suffix_carried = false) {
-      for (const BufferRegion &lhs : source) { //对source中的每个buffer
-        for (const BufferRegion &rhs : target) { //target中的每个buffer
-          if (!lhs->buffer.same_as(rhs->buffer) || //访问的不是同一个buffer
-              RegionsDisjointForAdjacentOuter(lhs, rhs, outer->loop_var,
-                                              outer->min)) { //是同一个buffer，但是访问区域不重叠
+      for (const BufferRegion &lhs : source) {     // 对source中的每个buffer
+        for (const BufferRegion &rhs : target) {   // target中的每个buffer
+          if (!lhs->buffer.same_as(rhs->buffer) || // 访问的不是同一个buffer
+              RegionsDisjointForAdjacentOuter(
+                  lhs, rhs, outer->loop_var,
+                  outer->min)) { // 是同一个buffer，但是访问区域不重叠
             continue;
           }
-          const BufferNode *buffer = lhs->buffer.get();//拿到发生冲突的buffer，进行到这里就意味着发生了冲突
-          if (allow_adjacent_exclusive_suffix_waw && //如果允许相邻条件互斥的Suffix WAW
-              adjacent_exclusive_suffix_writes.count(buffer)) { // 这个buffer已经被证明相邻写不会同时发生
-            continue; //放行
+          const BufferNode *buffer =
+              lhs->buffer
+                  .get(); // 拿到发生冲突的buffer，进行到这里就意味着发生了冲突
+          if (allow_adjacent_exclusive_suffix_waw && // 如果允许相邻条件互斥的Suffix
+                                                     // WAW
+              adjacent_exclusive_suffix_writes.count(
+                  buffer)) { // 这个buffer已经被证明相邻写不会同时发生
+            continue;        // 放行
           }
-          if (local_buffers_.count(buffer)) {// 判读当前buffer是不是local buffer（primfun内分配的buffer）
+          if (local_buffers_.count(buffer)) { // 判读当前buffer是不是local
+                                              // buffer（primfun内分配的buffer）
             if (preserve_suffix_carried &&
-                suffix_carried_buffers.count(buffer)) { //跨WorkItem累加的buffer，保持单buffer
+                suffix_carried_buffers.count(
+                    buffer)) { // 跨WorkItem累加的buffer，保持单buffer
               continue;
             }
-            if (versioned.insert(buffer).second) { //是否为第一次插入多版本容器
-              region_versioned_buffers->push_back(lhs->buffer); //插入多版本容器
+            if (versioned.insert(buffer).second) { // 是否为第一次插入多版本容器
+              region_versioned_buffers->push_back(
+                  lhs->buffer); // 插入多版本容器
             }
             continue;
           }
 
-          //执行到这里，意味着无法证明相邻WorkItem的buffer不重叠，拒绝跨外层优化
+          // 执行到这里，意味着无法证明相邻WorkItem的buffer不重叠，拒绝跨外层优化
           std::ostringstream os;
           os << hazard << " on global buffer " << lhs->buffer->name
              << " is not provably disjoint";
@@ -3144,16 +3153,19 @@ private:
     return check_all(core, prefix, "Core(o)->Prefix(o+1)") &&
            check_all(suffix, prefix, "Suffix(o)->Prefix(o+1)") &&
            check_all(suffix, core, "Suffix(o)->Core(o+1)") &&
-           check_all(suffix, suffix, "Suffix(o)->Suffix(o+1)", true,
-                     true);
+           check_all(suffix, suffix, "Suffix(o)->Suffix(o+1)", true, true);
   }
 
   Stmt VisitStmt_(const ForNode *outer) final {
     if (only_proved_boundary_) {
-      auto eligible = outer->annotations.Get("tl.sunmmio.boundary_overlap.eligible");
-      auto version = outer->annotations.Get("tl.sunmmio.boundary_overlap.proof_version");
-      const auto *eligible_value = eligible ? eligible.value().as<IntImmNode>() : nullptr;
-      const auto *version_value = version ? version.value().as<IntImmNode>() : nullptr;
+      auto eligible =
+          outer->annotations.Get("tl.sunmmio.boundary_overlap.eligible");
+      auto version =
+          outer->annotations.Get("tl.sunmmio.boundary_overlap.proof_version");
+      const auto *eligible_value =
+          eligible ? eligible.value().as<IntImmNode>() : nullptr;
+      const auto *version_value =
+          version ? version.value().as<IntImmNode>() : nullptr;
       if (!eligible_value || !eligible_value->value || !version_value ||
           version_value->value != 1) {
         return StmtExprMutator::VisitStmt_(outer);
@@ -3568,7 +3580,6 @@ private:
   std::unordered_set<const BufferNode *> local_buffers_;
 };
 
-
 struct ResidencyEvent {
   residency::Proof proof;
   std::string selected{"analysis_only"};
@@ -3578,27 +3589,35 @@ struct ResidencyEvent {
 static std::string ResidencyJsonEscape(const std::string &value) {
   std::ostringstream result;
   for (char ch : value) {
-    if (ch == '"' || ch == '\\') result << '\\' << ch;
-    else if (ch == '\n') result << "\\n";
-    else if (ch == '\r') result << "\\r";
-    else if (ch == '\t') result << "\\t";
-    else result << ch;
+    if (ch == '"' || ch == '\\')
+      result << '\\' << ch;
+    else if (ch == '\n')
+      result << "\\n";
+    else if (ch == '\r')
+      result << "\\r";
+    else if (ch == '\t')
+      result << "\\t";
+    else
+      result << ch;
   }
   return result.str();
 }
 
 static void WriteResidencyEvents(const std::string &policy,
-                                const std::vector<ResidencyEvent> &events) {
+                                 const std::vector<ResidencyEvent> &events) {
   const char *path = std::getenv("TL_SUNMMIO_RESIDENCY_REPORT");
-  if (!path || !*path) return;
+  if (!path || !*path)
+    return;
   std::ofstream out(path);
   ICHECK(out.is_open()) << "cannot write residency report: " << path;
-  out << "{\n  \"schema_version\": 2,\n  \"policy\": \""
-      << policy << "\",\n  \"fingerprint_scope\": \"pre_sync_tir_structure\","
-      << "\n  \"cost_gate\": \"transfer_savings_prefilter_backend_schedule_required\","
+  out << "{\n  \"schema_version\": 2,\n  \"policy\": \"" << policy
+      << "\",\n  \"fingerprint_scope\": \"pre_sync_tir_structure\","
+      << "\n  \"cost_gate\": "
+         "\"transfer_savings_prefilter_backend_schedule_required\","
       << "\n  \"candidates\": [";
   for (size_t i = 0; i < events.size(); ++i) {
-    if (i) out << ",";
+    if (i)
+      out << ",";
     const auto &event = events[i];
     const auto &proof = event.proof;
     out << "\n    {\"accepted\": " << (proof.accepted ? "true" : "false")
@@ -3624,6 +3643,7 @@ public:
 
   std::vector<ResidencyEvent> events;
   int grouped_core_count{0};
+
 private:
   Stmt VisitStmt_(const ForNode *op) final {
     if (op->annotations.count("num_stages"))
@@ -3633,7 +3653,8 @@ private:
       const auto *loop = stmt.as<ForNode>();
       candidate = candidate || (loop && loop->annotations.count("num_stages"));
     }
-    if (!candidate) return StmtMutator::VisitStmt_(op);
+    if (!candidate)
+      return StmtMutator::VisitStmt_(op);
     For loop = ffi::GetRef<For>(op);
     bool slotted = op->annotations.count("tl.sunmmio.multidim.workitem_inner");
     residency::Proof proof = residency::Analyze(func_, loop, slotted, true);
@@ -3660,12 +3681,14 @@ private:
       }
       return loop;
     }
-    if (policy_ == "shadow") return loop;
+    if (policy_ == "shadow")
+      return loop;
     Map<String, Any> annotations = loop->annotations;
     annotations.erase(residency::kReason);
     annotations.Set(residency::kEligible, Bool(true));
     annotations.Set(residency::kStateBuffers, proof.state_buffers);
-    annotations.Set(residency::kPrefixCount, Integer(proof.shared_prefix_count));
+    annotations.Set(residency::kPrefixCount,
+                    Integer(proof.shared_prefix_count));
     if (proof.group_width) {
       annotations.Set(residency::kGroupWidth, Integer(proof.group_width));
       grouped_core_count += 1 + (proof.reuse_extent % proof.group_width != 0);
@@ -3700,8 +3723,10 @@ static tvm::transform::Pass
 AnalyzeSunmmioTileResidency(String policy = "auto_strict") {
   std::string value = policy;
   ICHECK(value == "off" || value == "shadow" || value == "auto_strict" ||
-         value == "forced") << "invalid tile residency policy: " << value;
-  auto pass_func = [=](PrimFunc f, const IRModule &, tvm::transform::PassContext) {
+         value == "forced")
+      << "invalid tile residency policy: " << value;
+  auto pass_func = [=](PrimFunc f, const IRModule &,
+                       tvm::transform::PassContext) {
     if (value == "off") {
       WriteResidencyEvents(value, {});
       return f;
@@ -3709,7 +3734,8 @@ AnalyzeSunmmioTileResidency(String policy = "auto_strict") {
     SunmmioResidencyAnalysisAnnotator analysis(f, value);
     Stmt body = analysis(f->body);
     if (value == "forced")
-      ICHECK(!analysis.events.empty()) << "generic tile residency: no candidate";
+      ICHECK(!analysis.events.empty())
+          << "generic tile residency: no candidate";
     WriteResidencyEvents(value, analysis.events);
     if (value != "shadow") {
       PrimFunc original = f;
@@ -3992,8 +4018,8 @@ private:
     }
 
     if (residency_policy_ != "off") {
-      residency::Proof proof = residency::Analyze(
-          func_, ffi::GetRef<For>(inner), true);
+      residency::Proof proof =
+          residency::Analyze(func_, ffi::GetRef<For>(inner), true);
       // A single outer WorkItem cannot amortize a cross-WorkItem residency
       // transform, even if an internal loop exposes reuse.
       if (outer_extent->value <= 1) {
@@ -4005,9 +4031,10 @@ private:
         event.selected = "analysis_only";
         events_.push_back(event);
       } else if (proof.accepted) {
-        Stmt generic = BuildProvedResidency(
-            outer, inner, outer_extent->value, inner_extent->value, proof);
-        event.fingerprint = std::to_string(ffi::StructuralHash::Hash(generic, true));
+        Stmt generic = BuildProvedResidency(outer, inner, outer_extent->value,
+                                            inner_extent->value, proof);
+        event.fingerprint =
+            std::to_string(ffi::StructuralHash::Hash(generic, true));
         For chosen = Downcast<For>(generic);
         Map<String, Any> annotations = chosen->annotations;
         annotations.Set(residency::kApplied, Bool(true));
@@ -4020,24 +4047,22 @@ private:
       } else {
         event.selected = "original_order_flatten";
         events_.push_back(event);
-        ICHECK(residency_policy_ != "forced" ||
-               outer_extent->value <= 1)
+        ICHECK(residency_policy_ != "forced" || outer_extent->value <= 1)
             << "generic tile residency rejected: " << proof.reason;
         // A rejected proof falls through to the ordinary safe flattening path.
       }
     }
 
     int64_t total_extent = outer_extent->value * inner_extent->value;
-    Var logical(std::string(outer->loop_var->name_hint) +
-                    "_multidim_workitem",
+    Var logical(std::string(outer->loop_var->name_hint) + "_multidim_workitem",
                 outer->loop_var.dtype());
     Map<Var, PrimExpr> substitutions;
-    substitutions.Set(
-        outer->loop_var,
-        outer->min + floordiv(logical, Integer(inner_extent->value)));
-    substitutions.Set(
-        inner->loop_var,
-        inner->min + floormod(logical, Integer(inner_extent->value)));
+    substitutions.Set(outer->loop_var,
+                      outer->min +
+                          floordiv(logical, Integer(inner_extent->value)));
+    substitutions.Set(inner->loop_var,
+                      inner->min +
+                          floormod(logical, Integer(inner_extent->value)));
     Stmt flattened_body = tir::Substitute(inner->body, substitutions);
 
     Map<String, Any> annotations = outer->annotations;
@@ -4195,7 +4220,8 @@ SunmmioRegionCrossOuterPipelinePlanning(bool debug = false,
       << "region_cross_outer policy must be 'auto' or 'forced', got "
       << policy_value;
   ICHECK(strategy_value == "conservative" || strategy_value == "continuous" ||
-         strategy_value == "hierarchical_ilp" || strategy_value == "multidim_boundary")
+         strategy_value == "hierarchical_ilp" ||
+         strategy_value == "multidim_boundary")
       << "region_cross_outer strategy must be 'conservative', 'continuous', "
          "'hierarchical_ilp', or 'multidim_boundary', got "
       << strategy_value;
@@ -4205,8 +4231,10 @@ SunmmioRegionCrossOuterPipelinePlanning(bool debug = false,
     PostOrderVisit(f->body, [&](const ObjectRef &obj) {
       if (const auto *loop = obj.as<ForNode>()) {
         if (strategy_value == "multidim_boundary") {
-          auto eligible = loop->annotations.Get("tl.sunmmio.boundary_overlap.eligible");
-          const auto *value = eligible ? eligible.value().as<IntImmNode>() : nullptr;
+          auto eligible =
+              loop->annotations.Get("tl.sunmmio.boundary_overlap.eligible");
+          const auto *value =
+              eligible ? eligible.value().as<IntImmNode>() : nullptr;
           has_requested_loop = has_requested_loop || (value && value->value);
           return;
         }
@@ -4222,7 +4250,8 @@ SunmmioRegionCrossOuterPipelinePlanning(bool debug = false,
     fptr->body = SunmmioRegionCrossOuterPipelinePlanner::Substitute(
         f, debug, forced, strategy_value, &applied_count);
     if (strategy_value == "multidim_boundary" && applied_count > 0) {
-      f = WithAttr(std::move(f), "tl.sunmmio.boundary_overlap.planned", Bool(true));
+      f = WithAttr(std::move(f), "tl.sunmmio.boundary_overlap.planned",
+                   Bool(true));
       fptr = f.CopyOnWrite();
     }
     bool has_region_fallback = false;
@@ -4233,8 +4262,8 @@ SunmmioRegionCrossOuterPipelinePlanning(bool debug = false,
             loop->annotations.count(kRegionCrossOuterFallbackReason);
       }
     });
-    if (strategy_value != "multidim_boundary" && !forced && has_requested_loop && applied_count == 0 &&
-        !has_region_fallback) {
+    if (strategy_value != "multidim_boundary" && !forced &&
+        has_requested_loop && applied_count == 0 && !has_region_fallback) {
       RegionCrossOuterUnmatchedLoopAnnotator annotator;
       fptr->body = annotator(fptr->body);
     }

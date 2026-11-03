@@ -95,7 +95,8 @@ public:
   // 估算cost，但是返回cycle数
   static float EstimateDelay(DeviceType device_type, const tir::Stmt &stmt,
                              const CostModelContext &context);
-  //根据profile和设备类型调用不同硬件的cost model，返回包含cost信息的CostEstimate结构
+  // 根据profile和设备类型调用不同硬件的cost
+  // model，返回包含cost信息的CostEstimate结构
   static CostEstimate Estimate(DeviceType device_type, const tir::Stmt &stmt,
                                const CostModelContext &context);
   static CostModelContext BuildContext(const tir::PrimFunc &func);

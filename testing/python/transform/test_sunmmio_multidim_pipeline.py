@@ -1,6 +1,5 @@
 """Focused region-discovery tests for the SunMMIO multidimensional ILP mode."""
 
-
 import pytest
 import tilelang as tl
 from tilelang import tvm
@@ -49,8 +48,6 @@ def _tile_region(buffer, access, indices, extents):
     )
 
 
-
-
 def _normalized_outer(mod):
     loop = mod["main"].body
     assert isinstance(loop, tir.For)
@@ -85,12 +82,8 @@ def _with_outer_annotations(mod, updates):
     return tvm.IRModule.from_expr(mod["main"].with_body(replacement))
 
 
-def _make_selector_input(
-    *, multidim_ii, multidim_makespan, one_dim_ii, one_dim_makespan
-):
-    normalized = tl.transform.SunmmioMultidimRegion("auto")(
-        _make_nested_pipeline(outer_extent=4, inner_extent=8)
-    )
+def _make_selector_input(*, multidim_ii, multidim_makespan, one_dim_ii, one_dim_makespan):
+    normalized = tl.transform.SunmmioMultidimRegion("auto")(_make_nested_pipeline(outer_extent=4, inner_extent=8))
     multidim = _normalized_outer(normalized)
     multidim_annotations = dict(multidim.annotations)
     multidim_annotations.update(
@@ -115,9 +108,7 @@ def _make_selector_input(
         multidim.step,
     )
 
-    original = _normalized_outer(normalized).annotations[
-        "tl.sunmmio.multidim.original_loop"
-    ]
+    original = _normalized_outer(normalized).annotations["tl.sunmmio.multidim.original_loop"]
     inner = original.body
     inner_annotations = dict(inner.annotations)
     inner_annotations.update(
@@ -207,12 +198,8 @@ def _make_selector_input_without_one_dim_cost():
         (7, 1, [7]),
     ],
 )
-def test_multidim_region_expands_inner_axis_and_preserves_coordinates(
-    inner_min, inner_extent, expected
-):
-    normalized = tl.transform.SunmmioMultidimRegion("forced")(
-        _make_nested_pipeline(inner_min=inner_min, inner_extent=inner_extent)
-    )
+def test_multidim_region_expands_inner_axis_and_preserves_coordinates(inner_min, inner_extent, expected):
+    normalized = tl.transform.SunmmioMultidimRegion("forced")(_make_nested_pipeline(inner_min=inner_min, inner_extent=inner_extent))
     outer = _normalized_outer(normalized)
 
     assert bool(outer.annotations["tl.sunmmio.multidim.region"])
@@ -221,10 +208,7 @@ def test_multidim_region_expands_inner_axis_and_preserves_coordinates(
     assert int(outer.annotations["tl.sunmmio.multidim.inner_extent"]) == inner_extent
     assert int(outer.annotations["num_stages"]) == 2
     assert _inner_coordinates(outer.body) == expected
-    assert not any(
-        isinstance(node, tir.For) and "num_stages" in (node.annotations or {})
-        for node in _post_order_nodes(outer.body)
-    )
+    assert not any(isinstance(node, tir.For) and "num_stages" in (node.annotations or {}) for node in _post_order_nodes(outer.body))
 
 
 def _post_order_nodes(stmt):
@@ -235,9 +219,7 @@ def _post_order_nodes(stmt):
 
 def test_multidim_region_auto_records_dynamic_extent_fallback():
     extent = tir.Var("extent", "int32")
-    normalized = tl.transform.SunmmioMultidimRegion("auto")(
-        _make_nested_pipeline(outer_extent=extent)
-    )
+    normalized = tl.transform.SunmmioMultidimRegion("auto")(_make_nested_pipeline(outer_extent=extent))
     outer = _normalized_outer(normalized)
 
     # The candidate owns the diagnostic, while its concrete core owns selection.
@@ -253,9 +235,7 @@ def test_multidim_region_auto_records_dynamic_extent_fallback():
 def test_multidim_region_forced_rejects_dynamic_extent():
     extent = tir.Var("extent", "int32")
     with pytest.raises(tvm.TVMError, match="dynamic_or_non_affine_extent"):
-        tl.transform.SunmmioMultidimRegion("forced")(
-            _make_nested_pipeline(outer_extent=extent)
-        )
+        tl.transform.SunmmioMultidimRegion("forced")(_make_nested_pipeline(outer_extent=extent))
 
 
 def test_multidim_region_rejects_barrier():
@@ -266,9 +246,7 @@ def test_multidim_region_rejects_barrier():
             [tir.IntImm("int64", 1)],
         )
     )
-    normalized = tl.transform.SunmmioMultidimRegion("auto")(
-        _make_nested_pipeline(inner_extra=barrier)
-    )
+    normalized = tl.transform.SunmmioMultidimRegion("auto")(_make_nested_pipeline(inner_extra=barrier))
     outer = _normalized_outer(normalized)
     assert str(outer.annotations["tl.sunmmio.multidim.fallback_reason"]) == "barrier_region_boundary"
     assert int(outer.body.annotations["num_stages"]) == 2
@@ -295,29 +273,21 @@ def test_multidim_region_rejects_multiple_inner_pipelines():
         tir.ForKind.SERIAL,
         tir.SeqStmt([make_inner("inner_a"), make_inner("inner_b")]),
     )
-    mod = tvm.IRModule.from_expr(
-        tir.PrimFunc([], body).with_attr("global_symbol", "main")
-    )
+    mod = tvm.IRModule.from_expr(tir.PrimFunc([], body).with_attr("global_symbol", "main"))
     normalized = tl.transform.SunmmioMultidimRegion("auto")(mod)
     loop = _normalized_outer(normalized)
     assert str(loop.annotations["tl.sunmmio.multidim.fallback_reason"]) == "multiple_inner_pipeline_loops"
 
 
 def test_multidim_region_rejects_single_outer_iteration():
-    normalized = tl.transform.SunmmioMultidimRegion("auto")(
-        _make_nested_pipeline(outer_extent=1)
-    )
+    normalized = tl.transform.SunmmioMultidimRegion("auto")(_make_nested_pipeline(outer_extent=1))
     outer = _normalized_outer(normalized)
     assert str(outer.annotations["tl.sunmmio.multidim.fallback_reason"]) == "outer_extent_too_short"
     assert int(outer.body.annotations["num_stages"]) == 2
 
 
-
-
 def test_multidim_auto_restores_original_loop_after_late_failure():
-    normalized = tl.transform.SunmmioMultidimRegion("auto")(
-        _make_nested_pipeline()
-    )
+    normalized = tl.transform.SunmmioMultidimRegion("auto")(_make_nested_pipeline())
     planned_like = _with_outer_annotations(
         normalized,
         {
@@ -336,14 +306,10 @@ def test_multidim_auto_restores_original_loop_after_late_failure():
             "tl.sunmmio.pipeline.fallback_reason": "injected_test_failure",
         },
     )
-    restored = tl.transform.ValidateSunmmioMultidimPipeline("auto", "inject")(
-        failed_like
-    )
+    restored = tl.transform.ValidateSunmmioMultidimPipeline("auto", "inject")(failed_like)
     outer = _normalized_outer(restored)
     assert str(outer.annotations["tl.sunmmio.multidim.selected_mode"]) == "ilp"
-    assert str(outer.annotations["tl.sunmmio.multidim.fallback_reason"]) == (
-        "injected_test_failure"
-    )
+    assert str(outer.annotations["tl.sunmmio.multidim.fallback_reason"]) == ("injected_test_failure")
     assert "tl.sunmmio.multidim.original_loop" not in outer.annotations
     assert _inner_coordinates(outer.body) == []
     assert isinstance(outer.body, tir.For)
@@ -366,32 +332,24 @@ def test_multidim_auto_selects_1d_when_full_loop_prediction_is_slower():
     assert int(outer.annotations["tl.sunmmio.multidim.predicted_score"]) == 98
     assert int(outer.annotations["tl.sunmmio.multidim.one_dim_predicted_score"]) == 72
     assert int(outer.annotations["tl.sunmmio.multidim.min_gain_percent"]) == 2
-    assert str(outer.annotations["tl.sunmmio.multidim.fallback_reason"]) == (
-        "predicted_not_better_than_1d"
-    )
+    assert str(outer.annotations["tl.sunmmio.multidim.fallback_reason"]) == ("predicted_not_better_than_1d")
     assert "tl.sunmmio.multidim.candidate_loop" not in outer.annotations
     assert "tl.sunmmio.pipeline.suppress_artifacts" not in inner.annotations
     assert str(inner.annotations["tl.sunmmio.pipeline.mode"]) == "ilp"
 
 
-
-
 def test_multidim_auto_preserves_1d_when_cost_is_unavailable():
-    selected = tl.transform.SelectSunmmioMultidimPipeline("auto")(
-        _make_selector_input_without_one_dim_cost()
-    )
+    selected = tl.transform.SelectSunmmioMultidimPipeline("auto")(_make_selector_input_without_one_dim_cost())
     outer = _normalized_outer(selected)
 
     assert str(outer.annotations["tl.sunmmio.multidim.selected_mode"]) == "ilp"
     assert int(outer.annotations["tl.sunmmio.multidim.predicted_score"]) == -1
-    assert int(
-        outer.annotations["tl.sunmmio.multidim.one_dim_predicted_score"]
-    ) == -1
-    assert str(outer.annotations["tl.sunmmio.multidim.fallback_reason"]) == (
-        "one_dim_cost_unavailable"
-    )
+    assert int(outer.annotations["tl.sunmmio.multidim.one_dim_predicted_score"]) == -1
+    assert str(outer.annotations["tl.sunmmio.multidim.fallback_reason"]) == ("one_dim_cost_unavailable")
     assert "tl.sunmmio.multidim.candidate_loop" not in outer.annotations
     assert "tl.sunmmio.pipeline.applied" not in outer.body.annotations
+
+
 def test_multidim_auto_selects_multidim_when_prediction_clears_threshold():
     selected = tl.transform.SelectSunmmioMultidimPipeline("auto")(
         _make_selector_input(
@@ -403,9 +361,7 @@ def test_multidim_auto_selects_multidim_when_prediction_clears_threshold():
     )
     outer = _normalized_outer(selected)
 
-    assert str(outer.annotations["tl.sunmmio.multidim.selected_mode"]) == (
-        "multidim_ilp"
-    )
+    assert str(outer.annotations["tl.sunmmio.multidim.selected_mode"]) == ("multidim_ilp")
     assert int(outer.annotations["tl.sunmmio.multidim.predicted_score"]) == 25
     assert int(outer.annotations["tl.sunmmio.multidim.one_dim_predicted_score"]) == 72
     assert "tl.sunmmio.multidim.fallback_reason" not in outer.annotations
@@ -426,18 +382,12 @@ def test_multidim_auto_falls_back_when_candidate_score_overflows():
 
     assert str(outer.annotations["tl.sunmmio.multidim.selected_mode"]) == "ilp"
     assert int(outer.annotations["tl.sunmmio.multidim.predicted_score"]) == -1
-    assert int(
-        outer.annotations["tl.sunmmio.multidim.one_dim_predicted_score"]
-    ) == -1
-    assert str(outer.annotations["tl.sunmmio.multidim.fallback_reason"]) == (
-        "candidate_cost_overflow"
-    )
+    assert int(outer.annotations["tl.sunmmio.multidim.one_dim_predicted_score"]) == -1
+    assert str(outer.annotations["tl.sunmmio.multidim.fallback_reason"]) == ("candidate_cost_overflow")
 
 
 def test_multidim_auto_falls_back_to_1d_without_cross_outer_overlap():
-    normalized = tl.transform.SunmmioMultidimRegion("auto")(
-        _make_nested_pipeline()
-    )
+    normalized = tl.transform.SunmmioMultidimRegion("auto")(_make_nested_pipeline())
     planned_like = _with_outer_annotations(
         normalized,
         {
@@ -449,22 +399,16 @@ def test_multidim_auto_falls_back_to_1d_without_cross_outer_overlap():
         },
     )
 
-    restored = tl.transform.ValidateSunmmioMultidimPipeline(
-        "auto", "planning"
-    )(planned_like)
+    restored = tl.transform.ValidateSunmmioMultidimPipeline("auto", "planning")(planned_like)
     outer = _normalized_outer(restored)
     assert str(outer.annotations["tl.sunmmio.multidim.selected_mode"]) == "ilp"
-    assert str(outer.annotations["tl.sunmmio.multidim.fallback_reason"]) == (
-        "no_cross_outer_overlap"
-    )
+    assert str(outer.annotations["tl.sunmmio.multidim.fallback_reason"]) == ("no_cross_outer_overlap")
     assert isinstance(outer.body, tir.For)
     assert int(outer.body.annotations["num_stages"]) == 2
 
 
 def test_multidim_forced_rejects_schedule_without_cross_outer_overlap():
-    normalized = tl.transform.SunmmioMultidimRegion("forced")(
-        _make_nested_pipeline()
-    )
+    normalized = tl.transform.SunmmioMultidimRegion("forced")(_make_nested_pipeline())
     planned_like = _with_outer_annotations(
         normalized,
         {
@@ -477,15 +421,12 @@ def test_multidim_forced_rejects_schedule_without_cross_outer_overlap():
     )
 
     with pytest.raises(tvm.TVMError, match="no_cross_outer_overlap"):
-        tl.transform.ValidateSunmmioMultidimPipeline("forced", "planning")(
-            planned_like
-        )
+        tl.transform.ValidateSunmmioMultidimPipeline("forced", "planning")(planned_like)
+
 
 def test_hierarchical_region_preserves_inner_pipeline(monkeypatch):
     monkeypatch.setenv("TL_SUNMMIO_MULTIDIM_HIERARCHICAL", "1")
-    normalized = tl.transform.SunmmioMultidimRegion("forced")(
-        _make_nested_pipeline(outer_extent=4, inner_extent=8)
-    )
+    normalized = tl.transform.SunmmioMultidimRegion("forced")(_make_nested_pipeline(outer_extent=4, inner_extent=8))
     outer = _normalized_outer(normalized)
     inner = outer.body
 
@@ -499,9 +440,7 @@ def test_hierarchical_region_preserves_inner_pipeline(monkeypatch):
 
 def test_hierarchical_summary_records_inner_1d_schedule(monkeypatch):
     monkeypatch.setenv("TL_SUNMMIO_MULTIDIM_HIERARCHICAL", "1")
-    normalized = tl.transform.SunmmioMultidimRegion("forced")(
-        _make_nested_pipeline(outer_extent=4, inner_extent=8)
-    )
+    normalized = tl.transform.SunmmioMultidimRegion("forced")(_make_nested_pipeline(outer_extent=4, inner_extent=8))
     outer = _normalized_outer(normalized)
     inner = outer.body
     inner_annotations = dict(inner.annotations)
@@ -549,14 +488,10 @@ def test_hierarchical_summary_records_inner_1d_schedule(monkeypatch):
 
 
 @pytest.mark.parametrize("outer_versions", [None, 3])
-def test_hierarchical_outer_builder_constructs_three_stages(
-    monkeypatch, outer_versions
-):
+def test_hierarchical_outer_builder_constructs_three_stages(monkeypatch, outer_versions):
     monkeypatch.setenv("TL_SUNMMIO_MULTIDIM_PREFETCH_BEFORE_PREFIX", "1")
     if outer_versions is not None:
-        monkeypatch.setenv(
-            "TL_SUNMMIO_MULTIDIM_OUTER_VERSIONS", str(outer_versions)
-        )
+        monkeypatch.setenv("TL_SUNMMIO_MULTIDIM_OUTER_VERSIONS", str(outer_versions))
     outer_var = tir.Var("tile", "int32")
     scratch = tir.decl_buffer((2,), "float32", name="scratch", scope="shared.rsram")
     prefix = tir.BufferStore(scratch, tir.FloatImm("float32", 0.0), [0])
@@ -596,22 +531,16 @@ def test_hierarchical_outer_builder_constructs_three_stages(
         tir.SeqStmt([prefix, inner_prefetch, inner_compute, suffix]),
         annotations=annotations,
     )
-    mod = tvm.IRModule.from_expr(
-        tir.PrimFunc([], outer).with_attr("global_symbol", "main")
-    )
+    mod = tvm.IRModule.from_expr(tir.PrimFunc([], outer).with_attr("global_symbol", "main"))
 
     built = tl.transform.BuildSunmmioHierarchicalOuterPipeline("forced")(mod)
     result = _normalized_outer(built)
 
     assert bool(result.annotations["tl.sunmmio.multidim.outer_pipeline_built"])
-    assert not bool(
-        result.annotations["tl.sunmmio.multidim.prefetch_before_prefix"]
-    )
+    assert not bool(result.annotations["tl.sunmmio.multidim.prefetch_before_prefix"])
     expected_versions = 2 if outer_versions is None else outer_versions
     assert int(result.annotations["iterations"]) == expected_versions
-    assert int(
-        result.annotations["tl.sunmmio.multidim.outer_versions"]
-    ) == expected_versions
+    assert int(result.annotations["tl.sunmmio.multidim.outer_versions"]) == expected_versions
     assert list(map(str, result.annotations["prologue_orders"])) == ["0-0"]
     assert list(map(str, result.annotations["body_orders"])) == [
         "1-0",
@@ -624,11 +553,7 @@ def test_hierarchical_outer_builder_constructs_three_stages(
     ]
     assert len(result.annotations["runtime_multiversion_buffers"]) == 1
     assert isinstance(result.body, tir.SeqStmt)
-    assert [
-        int(stage.value)
-        for stage in result.body.seq
-        if isinstance(stage, tir.AttrStmt)
-    ] == [0, 1, 2]
+    assert [int(stage.value) for stage in result.body.seq if isinstance(stage, tir.AttrStmt)] == [0, 1, 2]
 
 
 def test_hierarchical_outer_builder_moves_disjoint_prefetch_before_prefix(
@@ -636,15 +561,9 @@ def test_hierarchical_outer_builder_moves_disjoint_prefetch_before_prefix(
 ):
     monkeypatch.setenv("TL_SUNMMIO_MULTIDIM_PREFETCH_BEFORE_PREFIX", "1")
     outer_var = tir.Var("tile", "int32")
-    accumulator = tir.decl_buffer(
-        (2,), "float32", name="accumulator", scope="shared.rsram"
-    )
-    staging = tir.decl_buffer(
-        (1,), "float32", name="staging", scope="shared.asram"
-    )
-    prefix = tir.BufferStore(
-        accumulator, tir.FloatImm("float32", 0.0), [0]
-    )
+    accumulator = tir.decl_buffer((2,), "float32", name="accumulator", scope="shared.rsram")
+    staging = tir.decl_buffer((1,), "float32", name="staging", scope="shared.asram")
+    prefix = tir.BufferStore(accumulator, tir.FloatImm("float32", 0.0), [0])
     inner_prefetch = tir.AttrStmt(
         outer_var,
         "tl.sunmmio.multidim.inner_phase",
@@ -677,16 +596,12 @@ def test_hierarchical_outer_builder_moves_disjoint_prefetch_before_prefix(
         tir.SeqStmt([prefix, inner_prefetch, inner_compute, suffix]),
         annotations=annotations,
     )
-    mod = tvm.IRModule.from_expr(
-        tir.PrimFunc([], outer).with_attr("global_symbol", "main")
-    )
+    mod = tvm.IRModule.from_expr(tir.PrimFunc([], outer).with_attr("global_symbol", "main"))
 
     built = tl.transform.BuildSunmmioHierarchicalOuterPipeline("forced")(mod)
     result = _normalized_outer(built)
 
-    assert bool(
-        result.annotations["tl.sunmmio.multidim.prefetch_before_prefix"]
-    )
+    assert bool(result.annotations["tl.sunmmio.multidim.prefetch_before_prefix"])
     phase_zero = result.body.seq[0]
     assert isinstance(phase_zero, tir.AttrStmt)
     assert isinstance(phase_zero.body, tir.SeqStmt)
@@ -720,12 +635,8 @@ def test_hierarchical_outer_builder_keeps_prefetch_after_same_storage_prefix(
         data=shared_data,
         scope="shared.rsram",
     )
-    output = tir.decl_buffer(
-        (1,), "float32", name="output", scope="shared.asram"
-    )
-    prefix = tir.BufferStore(
-        prefix_view, tir.FloatImm("float32", 0.0), [0]
-    )
+    output = tir.decl_buffer((1,), "float32", name="output", scope="shared.asram")
+    prefix = tir.BufferStore(prefix_view, tir.FloatImm("float32", 0.0), [0])
     inner_prefetch = tir.AttrStmt(
         outer_var,
         "tl.sunmmio.multidim.inner_phase",
@@ -758,16 +669,12 @@ def test_hierarchical_outer_builder_keeps_prefetch_after_same_storage_prefix(
         tir.SeqStmt([prefix, inner_prefetch, inner_compute, suffix]),
         annotations=annotations,
     )
-    mod = tvm.IRModule.from_expr(
-        tir.PrimFunc([], outer).with_attr("global_symbol", "main")
-    )
+    mod = tvm.IRModule.from_expr(tir.PrimFunc([], outer).with_attr("global_symbol", "main"))
 
     built = tl.transform.BuildSunmmioHierarchicalOuterPipeline("forced")(mod)
     result = _normalized_outer(built)
 
-    assert not bool(
-        result.annotations["tl.sunmmio.multidim.prefetch_before_prefix"]
-    )
+    assert not bool(result.annotations["tl.sunmmio.multidim.prefetch_before_prefix"])
     phase_zero = result.body.seq[0]
     assert isinstance(phase_zero, tir.AttrStmt)
     assert isinstance(phase_zero.body, tir.SeqStmt)
@@ -781,40 +688,24 @@ def test_hierarchical_outer_builder_keeps_prefetch_after_same_storage_prefix(
 def _make_interchange_candidate():
     outer = tir.Var("outer", "int32")
     inner = tir.Var("inner", "int32")
-    accumulator = tir.decl_buffer(
-        (1,), "float32", name="accumulator", scope="shared.rsram"
-    )
-    staging = tir.decl_buffer(
-        (1,), "float32", name="staging", scope="shared.rsram"
-    )
-    banked = tir.decl_buffer(
-        (1,), "float32", name="banked", scope="shared.asram"
-    )
+    accumulator = tir.decl_buffer((1,), "float32", name="accumulator", scope="shared.rsram")
+    staging = tir.decl_buffer((1,), "float32", name="staging", scope="shared.rsram")
+    banked = tir.decl_buffer((1,), "float32", name="banked", scope="shared.asram")
     prefix = tir.BufferStore(accumulator, tir.FloatImm("float32", 0.0), [0])
-    shared_prefix = tir.BufferStore(
-        staging, tir.Cast("float32", inner), [0]
-    )
-    banked_prefix = tir.BufferStore(
-        banked, tir.BufferLoad(staging, [0]), [0]
-    )
+    shared_prefix = tir.BufferStore(staging, tir.Cast("float32", inner), [0])
+    banked_prefix = tir.BufferStore(banked, tir.BufferLoad(staging, [0]), [0])
     outer_dependent = tir.BufferStore(
         accumulator,
-        tir.BufferLoad(accumulator, [0])
-        + tir.BufferLoad(banked, [0])
-        + tir.Cast("float32", outer),
+        tir.BufferLoad(accumulator, [0]) + tir.BufferLoad(banked, [0]) + tir.Cast("float32", outer),
         [0],
     )
-    banked_rewrite = tir.BufferStore(
-        banked, tir.BufferLoad(staging, [0]) + tir.FloatImm("float32", 1.0), [0]
-    )
+    banked_rewrite = tir.BufferStore(banked, tir.BufferLoad(staging, [0]) + tir.FloatImm("float32", 1.0), [0])
     inner_loop = tir.For(
         inner,
         0,
         8,
         tir.ForKind.SERIAL,
-        tir.SeqStmt(
-            [shared_prefix, banked_prefix, outer_dependent, banked_rewrite]
-        ),
+        tir.SeqStmt([shared_prefix, banked_prefix, outer_dependent, banked_rewrite]),
         annotations={"num_stages": 2},
     )
     suffix = tir.Evaluate(tir.BufferLoad(accumulator, [0]))
@@ -833,37 +724,23 @@ def _make_interchange_candidate():
         outer_loop,
         alloc_buffers=[accumulator, staging, banked],
     )
-    func = tir.PrimFunc(
-        [], tir.BlockRealize([], tir.const(True, "bool"), root)
-    ).with_attr("global_symbol", "main")
+    func = tir.PrimFunc([], tir.BlockRealize([], tir.const(True, "bool"), root)).with_attr("global_symbol", "main")
     return tvm.IRModule.from_expr(func)
 
 
 def test_interchange_versions_accumulator_and_reuses_shared_prefix(monkeypatch):
     monkeypatch.setenv("TL_SUNMMIO_MULTIDIM_INTERCHANGE", "1")
-    normalized = tl.transform.SunmmioMultidimRegion("forced")(
-        _make_interchange_candidate()
-    )
+    normalized = tl.transform.SunmmioMultidimRegion("forced")(_make_interchange_candidate())
     outer = normalized["main"].body.block.body
     assert isinstance(outer, tir.For)
-    assert str(outer.annotations["tl.sunmmio.multidim.strategy"]) == (
-        "interchange_reuse_v1"
-    )
+    assert str(outer.annotations["tl.sunmmio.multidim.strategy"]) == ("interchange_reuse_v1")
 
-    prepared = tl.transform.PrepareSunmmioMultidimInterchangeBuffers()(
-        normalized
-    )
+    prepared = tl.transform.PrepareSunmmioMultidimInterchangeBuffers()(normalized)
     assert tvm.ir.structural_equal(normalized, prepared)
 
-    applied = tl.transform.ApplySunmmioMultidimInterchange("forced")(
-        prepared
-    )
+    applied = tl.transform.ApplySunmmioMultidimInterchange("forced")(prepared)
     root = applied["main"].body.block
-    versions = [
-        buffer
-        for buffer in root.alloc_buffers
-        if str(buffer.name).startswith("accumulator_v")
-    ]
+    versions = [buffer for buffer in root.alloc_buffers if str(buffer.name).startswith("accumulator_v")]
     assert [str(buffer.name) for buffer in versions] == [
         "accumulator_v0",
         "accumulator_v1",
@@ -874,39 +751,24 @@ def test_interchange_versions_accumulator_and_reuses_shared_prefix(monkeypatch):
 
     body = root.body
     assert isinstance(body, tir.SeqStmt)
-    pipeline_loops = [
-        stmt
-        for stmt in body.seq
-        if isinstance(stmt, tir.For) and "num_stages" in stmt.annotations
-    ]
+    pipeline_loops = [stmt for stmt in body.seq if isinstance(stmt, tir.For) and "num_stages" in stmt.annotations]
     assert len(pipeline_loops) == 1
     pipeline = pipeline_loops[0]
-    annotated_versions = pipeline.annotations[
-        "tl.sunmmio.multidim.interchange.accumulator_versions"
-    ]
+    annotated_versions = pipeline.annotations["tl.sunmmio.multidim.interchange.accumulator_versions"]
     assert [str(buffer.name) for buffer in annotated_versions] == [
         "accumulator_v0",
         "accumulator_v1",
         "accumulator_v2",
         "accumulator_v3",
     ]
-    assert bool(
-        pipeline.annotations["tl.sunmmio.multidim.interchange.applied"]
-    )
-    assert int(
-        pipeline.annotations[
-            "tl.sunmmio.multidim.interchange.shared_prefix_count"
-        ]
-    ) == 1
-    assert int(
-        pipeline.annotations["tl.sunmmio.multidim.interchange.outer_versions"]
-    ) == 4
+    assert bool(pipeline.annotations["tl.sunmmio.multidim.interchange.applied"])
+    assert int(pipeline.annotations["tl.sunmmio.multidim.interchange.shared_prefix_count"]) == 1
+    assert int(pipeline.annotations["tl.sunmmio.multidim.interchange.outer_versions"]) == 4
 
     coordinates = [
         int(stmt.value)
         for stmt in pipeline.body.seq
-        if isinstance(stmt, tir.AttrStmt)
-        and stmt.attr_key == "tl.sunmmio.multidim.inner_coordinate"
+        if isinstance(stmt, tir.AttrStmt) and stmt.attr_key == "tl.sunmmio.multidim.inner_coordinate"
     ]
     # Only the stable staging write is shared. The ASRAM write is repeated
     # for every outer coordinate because the same buffer is written again
@@ -916,12 +778,8 @@ def test_interchange_versions_accumulator_and_reuses_shared_prefix(monkeypatch):
 
 def test_ilp_injector_consumes_interchange_inner_coordinate_markers(monkeypatch):
     monkeypatch.setenv("TL_SUNMMIO_MULTIDIM_INTERCHANGE", "1")
-    normalized = tl.transform.SunmmioMultidimRegion("forced")(
-        _make_interchange_candidate()
-    )
-    applied = tl.transform.ApplySunmmioMultidimInterchange("forced")(
-        normalized
-    )
+    normalized = tl.transform.SunmmioMultidimRegion("forced")(_make_interchange_candidate())
+    applied = tl.transform.ApplySunmmioMultidimInterchange("forced")(normalized)
 
     assert _inner_coordinates(applied["main"].body)
     injected = tl.transform.InjectSunmmioPipelineILP()(applied)
@@ -933,7 +791,6 @@ def test_interchange_is_noop_for_auto_policy(monkeypatch):
     before = _make_interchange_candidate()
     after = tl.transform.ApplySunmmioMultidimInterchange("auto")(before)
     assert tvm.ir.structural_equal(before, after)
-
 
 
 if __name__ == "__main__":

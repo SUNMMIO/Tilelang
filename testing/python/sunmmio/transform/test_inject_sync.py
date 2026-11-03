@@ -144,13 +144,9 @@ def _make_module(
     if is_global:
         func = func.with_attr("tir.is_global_func", True)
     if hierarchical_ilp_verified:
-        func = func.with_attr(
-            "tl.sunmmio.hierarchical_ilp.coverage_verified", True
-        )
+        func = func.with_attr("tl.sunmmio.hierarchical_ilp.coverage_verified", True)
     if workitem_flattened:
-        func = func.with_attr(
-            "tl.sunmmio.multidim.workitem_flatten.applied", True
-        )
+        func = func.with_attr("tl.sunmmio.multidim.workitem_flatten.applied", True)
     mod = tvm.IRModule({"main": func})
     return tvm.tir.transform.BindTarget(_target())(mod)
 
@@ -414,9 +410,7 @@ def test_multidim_disjoint_rsram_views_use_conservative_odma_sync(pipeline_mode)
             ),
         ]
 
-    with tvm.transform.PassContext(
-        config={"tl.sunmmio_pipeline_mode": pipeline_mode}
-    ):
+    with tvm.transform.PassContext(config={"tl.sunmmio_pipeline_mode": pipeline_mode}):
         result = _apply(_make_module(body))
 
     assert _call_lines(result, "T.sunmmio_sync") == ["T.sunmmio_sync(1)"]
@@ -526,7 +520,6 @@ def test_loop_drains_pending_units_at_iteration_boundary():
     assert "wait_token" not in script
 
 
-
 def test_complete_tile_loop_nest_defers_vector_sync_until_async_consumer():
     def body(src, dst):
         row = tvm.tir.Var("row", "int32")
@@ -574,9 +567,7 @@ def test_complete_tile_loop_nest_defers_vector_sync_until_async_consumer():
 
     result = _apply(_make_module(body))
     lines = result.script().splitlines()
-    sync_indices = [
-        i for i, line in enumerate(lines) if "T.sunmmio_sync(96)" in line
-    ]
+    sync_indices = [i for i, line in enumerate(lines) if "T.sunmmio_sync(96)" in line]
     outer_index = next(i for i, line in enumerate(lines) if "for row in" in line)
     dma_index = next(i for i, line in enumerate(lines) if "T.dma_copy" in line)
     assert len(sync_indices) == 1
@@ -598,6 +589,7 @@ def test_unannotated_tile_loop_keeps_backedge_sync():
     loop_index = script.index("for row in")
     sync_index = script.index("T.sunmmio_sync(96)")
     assert loop_index < sync_index
+
 
 def test_loop_preserves_explicit_step():
     i = tvm.tir.Var("i", "int32")
@@ -651,18 +643,10 @@ def test_verified_hierarchical_ilp_defers_collective_wait_to_dependency():
     )
     lines = mod.script().splitlines()
     dma_indices = [i for i, line in enumerate(lines) if "T.dma_copy" in line]
-    producer_sync = next(
-        i for i, line in enumerate(lines) if "T.sunmmio_sync(1)" in line
-    )
-    barrier_index = next(
-        i for i, line in enumerate(lines) if "T.barrier_arrive_and_wait" in line
-    )
-    broadcast_index = next(
-        i for i, line in enumerate(lines) if "T.broadcast_" in line
-    )
-    consumer_sync = next(
-        i for i, line in enumerate(lines) if "T.sunmmio_sync(8)" in line
-    )
+    producer_sync = next(i for i, line in enumerate(lines) if "T.sunmmio_sync(1)" in line)
+    barrier_index = next(i for i, line in enumerate(lines) if "T.barrier_arrive_and_wait" in line)
+    broadcast_index = next(i for i, line in enumerate(lines) if "T.broadcast_" in line)
+    consumer_sync = next(i for i, line in enumerate(lines) if "T.sunmmio_sync(8)" in line)
     assert len(_call_lines(mod, "T.barrier_arrive_and_wait")) == 1
     assert dma_indices[0] < producer_sync < barrier_index < broadcast_index
     assert broadcast_index < consumer_sync < dma_indices[1]
@@ -688,12 +672,8 @@ def test_verified_hierarchical_ilp_syncs_before_same_link_reissue():
         )
     )
     lines = mod.script().splitlines()
-    broadcast_indices = [
-        i for i, line in enumerate(lines) if "T.broadcast_" in line
-    ]
-    sync_indices = [
-        i for i, line in enumerate(lines) if "T.sunmmio_sync(16)" in line
-    ]
+    broadcast_indices = [i for i, line in enumerate(lines) if "T.broadcast_" in line]
+    sync_indices = [i for i, line in enumerate(lines) if "T.sunmmio_sync(16)" in line]
     assert len(broadcast_indices) == 2
     assert len(sync_indices) == 2
     assert broadcast_indices[0] < sync_indices[0] < broadcast_indices[1]

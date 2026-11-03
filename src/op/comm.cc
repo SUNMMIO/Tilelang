@@ -650,8 +650,8 @@ Stmt AllgatherOpNode::Lower(const LowerArgs &T,
   ICHECK_GT(recv_rank, 0) << "Allgather recv must have at least one dim.";
   if (axis >= 0) {
     ICHECK_LT(axis, static_cast<int>(send_range.size()))
-        << "Allgather axis " << axis << " is out of range for send rank="
-        << send_range.size();
+        << "Allgather axis " << axis
+        << " is out of range for send rank=" << send_range.size();
     ICHECK_EQ(recv_range.size(), send_range.size())
         << "In axis mode, recv and send must have the same rank.";
   }

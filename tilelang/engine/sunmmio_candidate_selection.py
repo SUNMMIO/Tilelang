@@ -38,6 +38,17 @@ def _contains_loop(root, target: tir.For) -> bool:
     return found
 
 
+def _collect_loops(root) -> list[tir.For]:
+    loops: list[tir.For] = []
+
+    def collect_loop(node) -> None:
+        if isinstance(node, tir.For):
+            loops.append(node)
+
+    tir.stmt_functor.post_order_visit(root, collect_loop)
+    return loops
+
+
 def _normalized_pipeline_work(
     mod: IRModule,
 ) -> dict[tuple[str, tuple[str, ...]], int] | None:
@@ -53,11 +64,7 @@ def _normalized_pipeline_work(
         if not isinstance(base_func, tir.PrimFunc):
             continue
 
-        loops: list[tir.For] = []
-        tir.stmt_functor.post_order_visit(
-            base_func.body,
-            lambda node: loops.append(node) if isinstance(node, tir.For) else None,
-        )
+        loops = _collect_loops(base_func.body)
         function_name = str(global_var.name_hint)
 
         for pipeline_loop in loops:
@@ -82,9 +89,7 @@ def _normalized_pipeline_work(
             static_outer_factor = 1
             dynamic_outer_extents: list[str] = []
             for outer in loops:
-                if outer.same_as(pipeline_loop) or not _contains_loop(
-                    outer.body, pipeline_loop
-                ):
+                if outer.same_as(pipeline_loop) or not _contains_loop(outer.body, pipeline_loop):
                     continue
                 if outer.kind not in {tir.ForKind.SERIAL, tir.ForKind.UNROLLED}:
                     continue

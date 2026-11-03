@@ -15,14 +15,12 @@ RESIDENCY = "tl.sunmmio.residency.reject_reason"
 
 
 def _core(var, minimum, extent):
-    return tir.For(var, minimum, extent, tir.ForKind.SERIAL,
-                   tir.Evaluate(var + minimum), annotations={"num_stages": 2})
+    return tir.For(var, minimum, extent, tir.ForKind.SERIAL, tir.Evaluate(var + minimum), annotations={"num_stages": 2})
 
 
 def _loops(stmt):
     found = []
-    tir.stmt_functor.pre_order_visit(stmt, lambda n: (found.append(n)
-        if isinstance(n, tir.For) else None) is None)
+    tir.stmt_functor.pre_order_visit(stmt, lambda n: (found.append(n) if isinstance(n, tir.For) else None) is None)
     return found
 
 
@@ -42,10 +40,8 @@ def test_outer_rejection_does_not_hide_nested_same_named_core(tmp_path, monkeypa
     main_var, tail_var = tir.Var("k", "int32"), tir.Var("k", "int32")
     main = _core(main_var, 0, bx + 1)
     tail = _core(tail_var, 0, tir.IntImm("int32", 4))
-    nested = tir.For(bx, 0, 3, tir.ForKind.SERIAL, main,
-                     annotations={RESIDENCY: "dynamic_core_range"})
-    original_body = tir.For(by, 0, 1, tir.ForKind.SERIAL,
-                            tir.SeqStmt([tail, nested] if tail_first else [nested, tail]))
+    nested = tir.For(bx, 0, 3, tir.ForKind.SERIAL, main, annotations={RESIDENCY: "dynamic_core_range"})
+    original_body = tir.For(by, 0, 1, tir.ForKind.SERIAL, tir.SeqStmt([tail, nested] if tail_first else [nested, tail]))
     _, transformed, regions = _normalize(original_body, tmp_path, monkeypatch)
     loops = _loops(transformed["main"].body)
     selected = [loop for loop in loops if PREFIX + "selected_mode" in loop.annotations]
@@ -95,7 +91,11 @@ def test_rejected_nonzero_ranges_are_not_reported_as_zero(tmp_path, monkeypatch)
     _, _, regions = _normalize(tir.For(outer, 7, 1, tir.ForKind.SERIAL, _core(inner, 5, 4)), tmp_path, monkeypatch)
     assert len(regions) == 1
     assert {name: regions[0][name] for name in ("outer_min", "outer_extent", "inner_min", "inner_extent")} == {
-        "outer_min": 7, "outer_extent": 1, "inner_min": 5, "inner_extent": 4}
+        "outer_min": 7,
+        "outer_extent": 1,
+        "inner_min": 5,
+        "inner_extent": 4,
+    }
 
 
 def test_top_level_core_gets_one_self_decision(tmp_path, monkeypatch):
@@ -109,8 +109,14 @@ def test_top_level_core_gets_one_self_decision(tmp_path, monkeypatch):
 
 def test_boundary_eligibility_priority_is_unchanged(tmp_path, monkeypatch):
     outer, inner = tir.Var("outer", "int32"), tir.Var("inner", "int32")
-    body = tir.For(outer, 0, 1, tir.ForKind.SERIAL, _core(inner, 0, 4), annotations={
-        "tl.sunmmio.boundary_overlap.eligible": 1, RESIDENCY: "no_invariant_transfer_prefix"})
+    body = tir.For(
+        outer,
+        0,
+        1,
+        tir.ForKind.SERIAL,
+        _core(inner, 0, 4),
+        annotations={"tl.sunmmio.boundary_overlap.eligible": 1, RESIDENCY: "no_invariant_transfer_prefix"},
+    )
     original, transformed, regions = _normalize(body, tmp_path, monkeypatch)
     assert regions == [] and tvm.ir.structural_equal(original, transformed)
 
@@ -125,8 +131,7 @@ def test_forced_rejection_still_raises(tmp_path, monkeypatch):
 def test_generic_proof_rejection_is_authoritative_in_every_policy(tmp_path, monkeypatch, policy):
     outer, inner = tir.Var("outer", "int32"), tir.Var("k", "int32")
     core = _core(inner, 0, outer + 1)
-    body = tir.For(outer, 0, 3, tir.ForKind.SERIAL, core,
-                   annotations={RESIDENCY: "dynamic_core_range"})
+    body = tir.For(outer, 0, 3, tir.ForKind.SERIAL, core, annotations={RESIDENCY: "dynamic_core_range"})
     _, transformed, regions = _normalize(body, tmp_path, monkeypatch, policy)
     result = transformed["main"].body
     assert len(regions) == 1

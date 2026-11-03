@@ -19,22 +19,31 @@ DIAGNOSTICS = {
 def lower(annotations, *, extent=1, minimum=0, thread=False):
     buf = tvm.tir.decl_buffer((16,), "int32", name="output")
     index = tvm.tir.Var("index", "int32")
-    binding = tvm.tir.IterVar(tvm.ir.Range(0, 1), index,
-                            tvm.tir.IterVar.ThreadIndex, "threadIdx.x") if thread else None
-    loop = tvm.tir.For(index, minimum, extent,
-                      tvm.tir.ForKind.THREAD_BINDING if thread else tvm.tir.ForKind.SERIAL,
-                      tvm.tir.BufferStore(buf, index + 1, [index]),
-                      thread_binding=binding, annotations=annotations)
+    binding = tvm.tir.IterVar(tvm.ir.Range(0, 1), index, tvm.tir.IterVar.ThreadIndex, "threadIdx.x") if thread else None
+    loop = tvm.tir.For(
+        index,
+        minimum,
+        extent,
+        tvm.tir.ForKind.THREAD_BINDING if thread else tvm.tir.ForKind.SERIAL,
+        tvm.tir.BufferStore(buf, index + 1, [index]),
+        thread_binding=binding,
+        annotations=annotations,
+    )
     params = [buf.data] + ([extent] if isinstance(extent, tvm.tir.Var) else [])
     func = tvm.tir.PrimFunc(params, loop, buffer_map={buf.data: buf})
     return tilelang.transform.LowerOpaqueBlock()(tvm.IRModule({"main": func}))["main"]
 
 
-@pytest.mark.parametrize("annotations", [
-    {}, {"pragma_unroll_explicit": 1}, DIAGNOSTICS,
-    {**DIAGNOSTICS, "pragma_unroll_explicit": 1},
-    *[{key: value} for key, value in DIAGNOSTICS.items()],
-])
+@pytest.mark.parametrize(
+    "annotations",
+    [
+        {},
+        {"pragma_unroll_explicit": 1},
+        DIAGNOSTICS,
+        {**DIAGNOSTICS, "pragma_unroll_explicit": 1},
+        *[{key: value} for key, value in DIAGNOSTICS.items()],
+    ],
+)
 @pytest.mark.parametrize("minimum", [0, 3])
 def test_diagnostic_unit_loop_is_erased(annotations, minimum):
     func = lower(annotations, minimum=minimum)
@@ -44,13 +53,21 @@ def test_diagnostic_unit_loop_is_erased(annotations, minimum):
     assert tvm.ir.structural_equal(func, lower({}, minimum=minimum), map_free_vars=True)
 
 
-@pytest.mark.parametrize("key,value", [
-    ("tile.execution_axis", 0), ("tile.interior", 1), ("num_stages", 2),
-    ("software_pipeline_stage", [0]), ("tl.sunmmio.multidim.region", 1),
-    ("tl.sunmmio.multidim.inner_stage_count", 2),
-    ("tl.sunmmio.collective_order", 1), ("tl.sunmmio.bank", 1),
-    ("tl.sunmmio.multidim.unknown_semantics", 1), ("unknown_attribute", 1),
-])
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("tile.execution_axis", 0),
+        ("tile.interior", 1),
+        ("num_stages", 2),
+        ("software_pipeline_stage", [0]),
+        ("tl.sunmmio.multidim.region", 1),
+        ("tl.sunmmio.multidim.inner_stage_count", 2),
+        ("tl.sunmmio.collective_order", 1),
+        ("tl.sunmmio.bank", 1),
+        ("tl.sunmmio.multidim.unknown_semantics", 1),
+        ("unknown_attribute", 1),
+    ],
+)
 def test_real_or_unknown_annotation_preserves_loop(key, value):
     func = lower({**DIAGNOSTICS, key: value})
     assert isinstance(func.body, tvm.tir.For)
@@ -77,16 +94,13 @@ def test_thread_launch_is_not_erased():
 
 
 def test_fallback_wrapper_does_not_prevent_safe_odma_carry(monkeypatch):
-    spec = importlib.util.spec_from_file_location(
-        "fallback_tile_helpers", Path(__file__).with_name("test_sunmmio_tile_entry_overlap.py"))
+    spec = importlib.util.spec_from_file_location("fallback_tile_helpers", Path(__file__).with_name("test_sunmmio_tile_entry_overlap.py"))
     helpers = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helpers)
     monkeypatch.setenv(helpers.SETTING, "1")
     baseline = helpers._module()
     index = tvm.tir.Var("diagnostic_only", "int32")
-    wrapped = baseline["main"].with_body(tvm.tir.For(
-        index, 0, 1, tvm.tir.ForKind.SERIAL, baseline["main"].body,
-        annotations=DIAGNOSTICS))
+    wrapped = baseline["main"].with_body(tvm.tir.For(index, 0, 1, tvm.tir.ForKind.SERIAL, baseline["main"].body, annotations=DIAGNOSTICS))
     lowered = tilelang.transform.LowerOpaqueBlock()(tvm.IRModule({"main": wrapped}))
     actual = helpers._apply(lowered)
     expected = helpers._apply(tilelang.transform.LowerOpaqueBlock()(baseline))

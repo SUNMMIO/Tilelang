@@ -11,7 +11,6 @@ from tilelang.utils.language import (
     retrieve_shape,
     retrieve_stride,
     retrieve_offset,
-    prim_expr_equal,
     prim_expr_equal_or_mesh_symbolic,
 )
 from tilelang.language.utils import (
@@ -286,6 +285,17 @@ def gemm(
 
     impl = gemm_v1 if _env.use_gemm_v1() else gemm_v2
     return impl(
-        A, B, C, transpose_A, transpose_B, policy, clear_accum, k_pack,
-        wg_wait, mbar, acc_offset_byte, output, store_output,
+        A,
+        B,
+        C,
+        transpose_A,
+        transpose_B,
+        policy,
+        clear_accum,
+        k_pack,
+        wg_wait,
+        mbar,
+        acc_offset_byte,
+        output,
+        store_output,
     )

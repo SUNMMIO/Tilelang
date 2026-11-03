@@ -12,9 +12,7 @@ def _buffer_param(name):
         name,
         tvm.ir.PointerType(tvm.ir.PrimType("float32"), "global"),
     )
-    buffer = tir.decl_buffer(
-        (16,), "float32", name=name, data=data, scope="global"
-    )
+    buffer = tir.decl_buffer((16,), "float32", name=name, data=data, scope="global")
     return handle, buffer
 
 
@@ -32,9 +30,7 @@ def _make_module(*, target=SUNMMIO_TARGET_DESC, non_restrict=False):
 
 
 def _main(mod):
-    return next(
-        func for func in mod.functions.values() if isinstance(func, tir.PrimFunc)
-    )
+    return next(func for func in mod.functions.values() if isinstance(func, tir.PrimFunc))
 
 
 def test_distinct_sunmmio_parameter_roots_prove_noalias():
@@ -43,15 +39,11 @@ def test_distinct_sunmmio_parameter_roots_prove_noalias():
 
     assert bool(func.attrs["tir.noalias"])
     assert bool(func.attrs[phase._SUNMMIO_ALIAS_PROOF_ATTR])
-    assert str(func.attrs[phase._SUNMMIO_ALIAS_PROOF_REASON_ATTR]) == (
-        "sunmmio_device_abi_distinct_parameter_roots"
-    )
+    assert str(func.attrs[phase._SUNMMIO_ALIAS_PROOF_REASON_ATTR]) == ("sunmmio_device_abi_distinct_parameter_roots")
 
 
 def test_non_restrict_parameter_fails_closed():
-    after = phase._infer_sunmmio_noalias(
-        _make_module(non_restrict=True)
-    )
+    after = phase._infer_sunmmio_noalias(_make_module(non_restrict=True))
     assert "tir.noalias" not in _main(after).attrs
 
 
@@ -79,9 +71,7 @@ def test_hoisted_block_non_restrict_parameter_fails_closed():
 
 def test_opaque_handle_parameter_fails_closed():
     opaque = tir.Var("opaque", "handle")
-    func = tir.PrimFunc([opaque], tir.Evaluate(0)).with_attr(
-        "target", tvm.target.Target(SUNMMIO_TARGET_DESC)
-    )
+    func = tir.PrimFunc([opaque], tir.Evaluate(0)).with_attr("target", tvm.target.Target(SUNMMIO_TARGET_DESC))
 
     after = phase._infer_sunmmio_noalias(tvm.IRModule.from_expr(func))
     assert "tir.noalias" not in _main(after).attrs
@@ -90,9 +80,7 @@ def test_opaque_handle_parameter_fails_closed():
 def test_shared_parameter_root_fails_closed():
     a_handle, a = _buffer_param("a")
     b_handle = tir.Var("b_handle", "handle")
-    b = tir.decl_buffer(
-        (8,), "float32", name="b", data=a.data, scope="global"
-    )
+    b = tir.decl_buffer((8,), "float32", name="b", data=a.data, scope="global")
     func = tir.PrimFunc(
         [a_handle, b_handle],
         tir.Evaluate(0),

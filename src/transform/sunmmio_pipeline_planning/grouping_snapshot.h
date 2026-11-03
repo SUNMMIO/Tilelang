@@ -39,12 +39,12 @@ public:
   void CheckValue(const ffi::Any &value, bool map_key = false) {
     if (auto layout = value.as<Layout>()) {
       supported = supported && !map_key && SupportedLayout(layout.value());
-      input_dimensions =
-          std::max(input_dimensions, layout.value()->InputDim());
+      input_dimensions = std::max(input_dimensions, layout.value()->InputDim());
     } else if (auto attrs = value.as<DictAttrs>()) {
       CheckValue(attrs.value()->dict, map_key);
     } else if (auto array = value.as<ffi::Array<ffi::Any>>()) {
-      for (const ffi::Any &item : array.value()) CheckValue(item, map_key);
+      for (const ffi::Any &item : array.value())
+        CheckValue(item, map_key);
     } else if (auto map = value.as<ffi::Map<ffi::Any, ffi::Any>>()) {
       for (const auto &[key, item] : map.value()) {
         // Buffer/Var keys belong to the restored graph and remain untouched.
@@ -56,7 +56,8 @@ public:
   }
 
   void CheckFunction(const tir::PrimFunc &func) {
-    if (func->attrs.defined()) CheckValue(func->attrs);
+    if (func->attrs.defined())
+      CheckValue(func->attrs);
     operator()(func->body);
   }
 
@@ -86,7 +87,8 @@ public:
   }
 
   ffi::Any RestoreValue(const ffi::Any &value) {
-    if (auto layout = value.as<Layout>()) return RestoreLayout(layout.value());
+    if (auto layout = value.as<Layout>())
+      return RestoreLayout(layout.value());
     if (auto attrs = value.as<DictAttrs>()) {
       return DictAttrs(RestoreAnnotations(attrs.value()->dict));
     }
@@ -108,8 +110,8 @@ public:
     return value;
   }
 
-  ffi::Map<ffi::String, ffi::Any> RestoreAnnotations(
-      const ffi::Map<ffi::String, ffi::Any> &annotations) {
+  ffi::Map<ffi::String, ffi::Any>
+  RestoreAnnotations(const ffi::Map<ffi::String, ffi::Any> &annotations) {
     ffi::Map<ffi::String, ffi::Any> result;
     for (const auto &[key, value] : annotations) {
       result.Set(key, RestoreValue(value));
@@ -120,7 +122,8 @@ public:
 private:
   Layout RestoreLayout(const Layout &layout) {
     auto found = layouts_.find(layout.get());
-    if (found != layouts_.end()) return found->second;
+    if (found != layouts_.end())
+      return found->second;
     ICHECK(SupportedLayout(layout)) << "unsupported grouping snapshot layout";
 
     Layout restored;
@@ -131,8 +134,9 @@ private:
       restored = CuteLayout(cute->GetLogicalShape(), cute->GetModeShape(),
                             cute->GetModeStride(), cute->GetDimLevels());
     } else {
-      auto forward = layout->GetForwardIndex().Map(
-          [&](const PrimExpr &expr) { return tir::Substitute(expr, placeholders_); });
+      auto forward = layout->GetForwardIndex().Map([&](const PrimExpr &expr) {
+        return tir::Substitute(expr, placeholders_);
+      });
       restored = Layout(layout->InputShape(), forward);
     }
     layouts_.emplace(layout.get(), restored);
@@ -140,8 +144,7 @@ private:
   }
 
   tir::Stmt VisitStmt_(const tir::BlockNode *op) final {
-    tir::Block block =
-        Downcast<tir::Block>(tir::StmtMutator::VisitStmt_(op));
+    tir::Block block = Downcast<tir::Block>(tir::StmtMutator::VisitStmt_(op));
     block.CopyOnWrite()->annotations = RestoreAnnotations(block->annotations);
     return block;
   }
@@ -172,7 +175,8 @@ inline bool CanSnapshotGroupingFunction(const tir::PrimFunc &func) {
   return check.supported;
 }
 
-/*! \brief Save the function and canonical placeholder witnesses in one graph. */
+/*! \brief Save the function and canonical placeholder witnesses in one graph.
+ */
 inline String SnapshotGroupingFunction(const tir::PrimFunc &func) {
   grouping_snapshot_detail::MetadataCheck check;
   check.CheckFunction(func);

@@ -1683,8 +1683,7 @@ PrimFunc LegalizeBf16(PrimFunc f, Target target,
         b_broadcasts.insert(g.b_writer_rd.writer);
     }
     body = GuardedPutGemmRewriter(body, target, cfg, twice)(body);
-    ValidateGemms(Bf16AsramOperandFlow::Analyze(body, cfg), body,
-                  target);
+    ValidateGemms(Bf16AsramOperandFlow::Analyze(body, cfg), body, target);
     body = BroadcastGatherRewriter(body, target, cfg, twice,
                                    std::move(a_broadcasts),
                                    std::move(b_broadcasts))(body);
@@ -1743,8 +1742,7 @@ PrimFunc Run(PrimFunc f, bool twice, bool fuse_clear) {
   f.CopyOnWrite()->body = body;
   if (!VerifySSA(f))
     return LegalizeBf16(std::move(original), target.value(), cfg, twice);
-  PrimFunc legalized =
-      LegalizeBf16(std::move(f), target.value(), cfg, twice);
+  PrimFunc legalized = LegalizeBf16(std::move(f), target.value(), cfg, twice);
   if (!sunmmio_mma_clear_fusion::VerifyLegalized(legalized, fusion.plans))
     return LegalizeBf16(std::move(original), target.value(), cfg, twice);
   return legalized;

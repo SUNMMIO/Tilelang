@@ -280,8 +280,8 @@ float CostModel::EstimateTensorCoreDelayHeuristic(const tir::Stmt &stmt) {
   BufferRegion a_region = NormalizeToBufferRegion(call->args[0]);
   BufferRegion b_region = NormalizeToBufferRegion(call->args[1]);
   BufferRegion c_region = NormalizeToBufferRegion(call->args[2]);
-  BufferRegion d_region =
-      call->args.size() == 9U ? NormalizeToBufferRegion(call->args[7])
+  BufferRegion d_region = call->args.size() == 9U
+                              ? NormalizeToBufferRegion(call->args[7])
                               : c_region;
   DataType input_dtype = a_region->buffer->dtype;
   DataType rhs_dtype = b_region->buffer->dtype;
@@ -846,8 +846,8 @@ CostModel::EstimateTensorCoreDelayGem5A4E(const tir::Stmt &stmt,
   BufferRegion a_region = NormalizeToBufferRegion(call->args[0]);
   BufferRegion b_region = NormalizeToBufferRegion(call->args[1]);
   BufferRegion c_region = NormalizeToBufferRegion(call->args[2]);
-  BufferRegion d_region =
-      call->args.size() == 9U ? NormalizeToBufferRegion(call->args[7])
+  BufferRegion d_region = call->args.size() == 9U
+                              ? NormalizeToBufferRegion(call->args[7])
                               : c_region;
   DataType act_type = a_region->buffer->dtype;
   DataType rhs_type = b_region->buffer->dtype;
@@ -1059,8 +1059,7 @@ CostModel::EstimateODMADelayGem5A4E(const tir::Stmt &stmt,
       return UnsupportedGem5("dma_copy", "unsupported_local_copy_path");
     }
     latency = start + tail;
-    estimate.latency_source =
-        "ODMA copy issue stream + endpoint completion";
+    estimate.latency_source = "ODMA copy issue stream + endpoint completion";
   } else if (info.kind == SunmmioAsyncOpKind::kBroadcast) {
     estimate.op_kind = "broadcast";
     endpoint_completion = kGem5ODMALinkCompletionDelay;

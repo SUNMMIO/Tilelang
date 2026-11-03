@@ -35,9 +35,15 @@ def _region(buffer, *, extents=None, starts=None, access=3, predicate=None):
 
 
 def _copy(source, destination):
-    return tir.Evaluate(_call(COPY, [
-        _region(source, access=1), _region(destination, access=2),
-    ]))
+    return tir.Evaluate(
+        _call(
+            COPY,
+            [
+                _region(source, access=1),
+                _region(destination, access=2),
+            ],
+        )
+    )
 
 
 def _nodes(statement, node_type):
@@ -55,12 +61,10 @@ def _nodes(statement, node_type):
 def _calls(statement, names):
     if isinstance(names, str):
         names = (names,)
-    return [node for node in _nodes(statement, tir.Call)
-            if isinstance(node.op, tvm.ir.Op) and node.op.name in names]
+    return [node for node in _nodes(statement, tir.Call) if isinstance(node.op, tvm.ir.Op) and node.op.name in names]
 
 
-def _fixture(case="valid", *, dtype="bfloat16", weight_dtype=None, op=GEMMS[0], minimum=0,
-             extent=3, explicit_offset=True, ramp_fill=False):
+def _fixture(case="valid", *, dtype="bfloat16", weight_dtype=None, op=GEMMS[0], minimum=0, extent=3, explicit_offset=True, ramp_fill=False):
     """Build post-layout IR, with one locally owned full FP32 accumulator."""
     n = tir.Var("n", "int32")
     a_shape = (2, 32, 32) if case == "rank3_input" else (32, 32)
@@ -71,18 +75,34 @@ def _fixture(case="valid", *, dtype="bfloat16", weight_dtype=None, op=GEMMS[0], 
     weight_dtype = dtype if weight_dtype is None else weight_dtype
     weight = tir.decl_buffer((32, 32), weight_dtype, name="B_source", scope="shared.rsram")
     a = tir.decl_buffer(a_shape, dtype, name="A", scope="shared.asram")
-    b = tir.decl_buffer((32, 32), weight_dtype, name="B", scope="shared.wsram",
-                       strides=[n, 1] if case == "dynamic_operand_stride" else None,
-                       elem_offset=n if case == "dynamic_operand_offset" else 0)
-    c = tir.decl_buffer(c_shape, "float32", name="C", scope="shared.rsram",
-                       strides=[32, 1] if case == "explicit_accumulator_strides" else None,
-                       elem_offset=1 if case == "accumulator_offset" else 0)
+    b = tir.decl_buffer(
+        (32, 32),
+        weight_dtype,
+        name="B",
+        scope="shared.wsram",
+        strides=[n, 1] if case == "dynamic_operand_stride" else None,
+        elem_offset=n if case == "dynamic_operand_offset" else 0,
+    )
+    c = tir.decl_buffer(
+        c_shape,
+        "float32",
+        name="C",
+        scope="shared.rsram",
+        strides=[32, 1] if case == "explicit_accumulator_strides" else None,
+        elem_offset=1 if case == "accumulator_offset" else 0,
+    )
     output = tir.decl_buffer(c_shape, "float32", name="output")
     local_buffers = [a, b, c]
     params = [source.data, weight.data, output.data]
     buffer_map = {source.data: source, weight.data: weight, output.data: output}
-    if case in ("dynamic_extent", "dynamic_minimum", "dynamic_shape", "dynamic_ramp_stride",
-                "dynamic_operand_stride", "dynamic_operand_offset"):
+    if case in (
+        "dynamic_extent",
+        "dynamic_minimum",
+        "dynamic_shape",
+        "dynamic_ramp_stride",
+        "dynamic_operand_stride",
+        "dynamic_operand_offset",
+    ):
         params.append(n)
 
     fill_region = _region(c, access=2)
@@ -91,8 +111,7 @@ def _fixture(case="valid", *, dtype="bfloat16", weight_dtype=None, op=GEMMS[0], 
     elif case == "partial_start":
         fill_region = _region(c, starts=[1, 0], extents=[31, 32], access=2)
     elif case in ("ramp_stride_zero", "ramp_stride_two", "dynamic_ramp_stride"):
-        stride = {"ramp_stride_zero": 0, "ramp_stride_two": 2,
-                  "dynamic_ramp_stride": n}[case]
+        stride = {"ramp_stride_zero": 0, "ramp_stride_two": 2, "dynamic_ramp_stride": n}[case]
         fill_region = tir.BufferLoad(c, [tir.Ramp(0, stride, 32), tir.Ramp(0, 1, 32)])
     elif case == "scalable_ramp_lanes":
         # A last-dimension scalable Ramp is legal TIR but is not a static
@@ -105,8 +124,7 @@ def _fixture(case="valid", *, dtype="bfloat16", weight_dtype=None, op=GEMMS[0], 
     zero = tir.FloatImm("float32", -0.0 if case == "negative_zero" else 0.0)
     fill = tir.Evaluate(_call(FILL, [fill_region, zero]))
 
-    args = [_region(a, access=1), _region(b, access=1), _region(c),
-            False, True, 32, 32, 32, 0, False, 32, 32, 0, 0, 1, 0, 0, 0, 0]
+    args = [_region(a, access=1), _region(b, access=1), _region(c), False, True, 32, 32, 32, 0, False, 32, 32, 0, 0, 1, 0, 0, 0, 0]
     if explicit_offset or case in ("offset", "optional_d"):
         args.append(2048 if case == "offset" else 0)
     if case == "optional_d":
@@ -116,8 +134,7 @@ def _fixture(case="valid", *, dtype="bfloat16", weight_dtype=None, op=GEMMS[0], 
     elif case == "nonzero_c_coordinates":
         args[17] = 1
     elif case == "alias_view":
-        view = tir.decl_buffer(c_shape, "float32", name="C_view", data=c.data,
-                               scope="shared.rsram")
+        view = tir.decl_buffer(c_shape, "float32", name="C_view", data=c.data, scope="shared.rsram")
         args[2] = _region(view)
     elif case == "hidden_c":
         # mbar is a PrimExpr/BufferLoad slot.  Using policy/stride instead
@@ -139,8 +156,7 @@ def _fixture(case="valid", *, dtype="bfloat16", weight_dtype=None, op=GEMMS[0], 
     elif case == "unknown_pure":
         loop_body.insert(0, tir.Evaluate(tir.call_pure_extern("int32", "unknown_pure")))
     elif case == "store_predicate":
-        loop_body.insert(0, tir.BufferStore(c, tir.FloatImm("float32", 1), [0, 0],
-                                          predicate=tir.IntImm("bool", True)))
+        loop_body.insert(0, tir.BufferStore(c, tir.FloatImm("float32", 1), [0, 0], predicate=tir.IntImm("bool", True)))
 
     if case == "zero_extent":
         extent = 0
@@ -150,26 +166,43 @@ def _fixture(case="valid", *, dtype="bfloat16", weight_dtype=None, op=GEMMS[0], 
         minimum = n
     k = tir.Var("k", "int32")
     loop_span = tvm.ir.Span(tvm.ir.SourceName("mma_clear_fixture"), 10, 14, 1, 1)
-    loop = tir.For(k, minimum, extent, tir.ForKind.SERIAL, tir.SeqStmt(loop_body),
-                   annotations={"num_stages": 2, "clear_test.k_metadata": 7},
-                   step=2 if case == "step2" else 1, span=loop_span)
+    loop = tir.For(
+        k,
+        minimum,
+        extent,
+        tir.ForKind.SERIAL,
+        tir.SeqStmt(loop_body),
+        annotations={"num_stages": 2, "clear_test.k_metadata": 7},
+        step=2 if case == "step2" else 1,
+        span=loop_span,
+    )
     tile_sequence = [fill, loop, _copy(c, output)]
     if case == "same_c_gemm_outside_candidate":
         # Its own writer avoids unrelated diverging-scope BF16 diagnostics.
         tile_sequence.extend([_copy(source, a), tir.Evaluate(_call(op, list(args)))])
     elif case == "two_same_c_candidates":
         k2 = tir.Var("k2", "int32")
-        second = tir.For(k2, 4, 2, tir.ForKind.SERIAL,
-                         tir.SeqStmt([_copy(source, a), _copy(weight, b),
-                                      tir.Evaluate(_call(op, list(args)))]),
-                         annotations={"num_stages": 2})
-        tile_sequence.extend([tir.Evaluate(_call(FILL, [_region(c, access=2), zero])),
-                              second, _copy(c, output)])
+        second = tir.For(
+            k2,
+            4,
+            2,
+            tir.ForKind.SERIAL,
+            tir.SeqStmt([_copy(source, a), _copy(weight, b), tir.Evaluate(_call(op, list(args)))]),
+            annotations={"num_stages": 2},
+        )
+        tile_sequence.extend([tir.Evaluate(_call(FILL, [_region(c, access=2), zero])), second, _copy(c, output)])
 
     outer = tir.Var("outer", "int32")
-    body = tir.For(outer, 2, 4, tir.ForKind.SERIAL, tir.SeqStmt(tile_sequence),
-                   annotations={"clear_test.outer_metadata": 11}, step=1,
-                   span=tvm.ir.Span(tvm.ir.SourceName("mma_clear_fixture"), 8, 18, 1, 1))
+    body = tir.For(
+        outer,
+        2,
+        4,
+        tir.ForKind.SERIAL,
+        tir.SeqStmt(tile_sequence),
+        annotations={"clear_test.outer_metadata": 11},
+        step=1,
+        span=tvm.ir.Span(tvm.ir.SourceName("mma_clear_fixture"), 8, 18, 1, 1),
+    )
     if case == "outer_handle_alias":
         body = tir.LetStmt(tir.Var("alias", "handle"), c.data, body)
     elif case == "pointer_escape":
@@ -180,18 +213,16 @@ def _fixture(case="valid", *, dtype="bfloat16", weight_dtype=None, op=GEMMS[0], 
         load = tir.BufferLoad(weight, [0, 0], predicate=tir.IntImm("bool", True))
         body = tir.SeqStmt([tir.Evaluate(load), body])
     elif case == "outer_store_predicate":
-        store = tir.BufferStore(c, tir.FloatImm("float32", 1), [0, 0],
-                                predicate=tir.IntImm("bool", True))
+        store = tir.BufferStore(c, tir.FloatImm("float32", 1), [0, 0], predicate=tir.IntImm("bool", True))
         body = tir.SeqStmt([store, body])
 
     matches = []
     if case == "match_buffer":
         view = tir.decl_buffer(c_shape, "float32", name="matched_C", scope="shared.rsram")
-        matches = [tir.MatchBufferRegion(view, tir.BufferRegion(c, [
-            tvm.ir.Range.from_min_extent(0, size) for size in c_shape
-        ]))]
-    root = tir.Block([], [], [], "root", body, alloc_buffers=local_buffers,
-                     match_buffers=matches, annotations={"clear_test.root_metadata": 13})
+        matches = [tir.MatchBufferRegion(view, tir.BufferRegion(c, [tvm.ir.Range.from_min_extent(0, size) for size in c_shape]))]
+    root = tir.Block(
+        [], [], [], "root", body, alloc_buffers=local_buffers, match_buffers=matches, annotations={"clear_test.root_metadata": 13}
+    )
     func = tir.PrimFunc(params, tir.BlockRealize([], True, root), buffer_map=buffer_map)
     func = func.with_attr("global_symbol", "main")
     if case != "missing_noalias":
@@ -293,18 +324,49 @@ def test_unit_stride_full_ramp_fill_is_eligible():
 
 
 REJECTED_CASES = [
-    "negative_zero", "partial_extent", "partial_start", "offset", "optional_d",
-    "already_clear", "nonzero_c_coordinates", "rank3_input", "rank3_accumulator",
-    "alias_view", "hidden_c", "c_read_between_updates", "two_gemms_one_loop",
-    "same_c_gemm_outside_candidate", "two_same_c_candidates", "zero_extent",
-    "dynamic_extent", "dynamic_minimum", "dynamic_shape", "step2",
-    "explicit_accumulator_strides", "accumulator_offset",
-    "dynamic_operand_stride", "dynamic_operand_offset",
-    "ramp_stride_zero", "ramp_stride_two", "dynamic_ramp_stride", "scalable_ramp_lanes",
-    "load_predicate", "store_predicate", "outer_load_predicate", "outer_store_predicate",
-    "outer_handle_alias", "match_buffer", "missing_noalias", "false_noalias", "nonrestrict",
-    "pointer_escape", "unknown_external", "unknown_pure", "outer_unknown_pure",
-    "call_annotations", "annotation_hidden_c",
+    "negative_zero",
+    "partial_extent",
+    "partial_start",
+    "offset",
+    "optional_d",
+    "already_clear",
+    "nonzero_c_coordinates",
+    "rank3_input",
+    "rank3_accumulator",
+    "alias_view",
+    "hidden_c",
+    "c_read_between_updates",
+    "two_gemms_one_loop",
+    "same_c_gemm_outside_candidate",
+    "two_same_c_candidates",
+    "zero_extent",
+    "dynamic_extent",
+    "dynamic_minimum",
+    "dynamic_shape",
+    "step2",
+    "explicit_accumulator_strides",
+    "accumulator_offset",
+    "dynamic_operand_stride",
+    "dynamic_operand_offset",
+    "ramp_stride_zero",
+    "ramp_stride_two",
+    "dynamic_ramp_stride",
+    "scalable_ramp_lanes",
+    "load_predicate",
+    "store_predicate",
+    "outer_load_predicate",
+    "outer_store_predicate",
+    "outer_handle_alias",
+    "match_buffer",
+    "missing_noalias",
+    "false_noalias",
+    "nonrestrict",
+    "pointer_escape",
+    "unknown_external",
+    "unknown_pure",
+    "outer_unknown_pure",
+    "call_annotations",
+    "annotation_hidden_c",
 ]
 
 
@@ -320,10 +382,15 @@ def test_unsafe_candidate_keeps_disabled_legalizer_result(case):
     assert len(_calls(enabled.body, FILL)) == (2 if case == "two_same_c_candidates" else 1)
 
 
-@pytest.mark.parametrize("dtype,weight_dtype", [
-    ("float32", "float32"), ("float16", "float16"),
-    ("bfloat16", "float32"), ("float32", "bfloat16"),
-])
+@pytest.mark.parametrize(
+    "dtype,weight_dtype",
+    [
+        ("float32", "float32"),
+        ("float16", "float16"),
+        ("bfloat16", "float32"),
+        ("float32", "bfloat16"),
+    ],
+)
 def test_non_bf16_and_mixed_inputs_keep_existing_path(dtype, weight_dtype):
     func = _fixture(dtype=dtype, weight_dtype=weight_dtype)
     disabled, enabled = _legalize(func, False), _legalize(func, True)
@@ -332,8 +399,7 @@ def test_non_bf16_and_mixed_inputs_keep_existing_path(dtype, weight_dtype):
     assert all(int(call.args[9]) == 0 for call in _calls(enabled.body, GEMMS))
 
 
-@pytest.mark.parametrize("case", ["two_gemms_one_loop", "same_c_gemm_outside_candidate",
-                                 "two_same_c_candidates"])
+@pytest.mark.parametrize("case", ["two_gemms_one_loop", "same_c_gemm_outside_candidate", "two_same_c_candidates"])
 def test_same_accumulator_ambiguity_also_preserves_bf16_legalization(case):
     func = _fixture(case)
     disabled, enabled = _legalize(func, False), _legalize(func, True)

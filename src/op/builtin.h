@@ -128,7 +128,6 @@ static constexpr const char *kSunmmioCrossOuterPolicy =
 static constexpr const char *kSunmmioMultidimPolicy =
     "tl.sunmmio_multidim_policy";
 
-
 static constexpr const char *kSunmmioRegionCrossOuterPolicy =
     "tl.sunmmio_region_cross_outer_policy";
 

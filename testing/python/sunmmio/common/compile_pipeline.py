@@ -276,6 +276,7 @@ def LowerAndLegalize_sunmmio_test(
     pass_output_process(mod, "ValidateSunmmioFrontendSyntax", test_config)
     mod = tilelang.transform.HoistNonRestrictParams()(mod)
     from tilelang.engine import phase as engine_phase
+
     mod = engine_phase._infer_sunmmio_noalias(mod)
     pass_output_process(mod, "InferSunmmioNoAlias", test_config)
 
