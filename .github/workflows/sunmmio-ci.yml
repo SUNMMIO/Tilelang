@@ -104,6 +104,8 @@ jobs:
       UV_CACHE_DIR: /ci-cache/uv
       PRE_COMMIT_HOME: /ci-cache/pre-commit
       NPUIR_CACHE_ROOT: /ci-cache/npuir
+      LLVM_SDK_COMPILE_JOBS: "8"
+      LLVM_SDK_LINK_JOBS: "2"
       CLANG_TIDY_VENV: /tmp/tilelang-clang-tidy-venv
       TEST_VENV: /tmp/tilelang-test-venv
       CLANG_TIDY_BUILD_DIR: /tmp/tilelang-clang-tidy-build
@@ -127,7 +129,7 @@ jobs:
             build-essential pkg-config libprotobuf-dev \
             protobuf-compiler libgflags-dev libsqlite3-dev \
             zlib1g-dev libedit-dev libtinfo-dev libxml2-dev libzstd-dev \
-            iproute2 iptables curl dnsutils openssh-client util-linux
+            iproute2 iptables curl dnsutils openssh-client procps util-linux
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
 
       - name: Fix container networking
@@ -353,6 +355,10 @@ jobs:
             echo "Reusing cached LLVM/MLIR SDK at ${NPUIR_LLVM_INSTALL_DIR}"
           else
             echo "Building LLVM/MLIR SDK at ${NPUIR_LLVM_COMMIT}"
+            echo "Build limits: compile=${LLVM_SDK_COMPILE_JOBS}, link=${LLVM_SDK_LINK_JOBS}"
+            echo "=== Resources before LLVM SDK build ==="
+            free -h
+            df -h /ci-cache
             rm -rf "${NPUIR_LLVM_BUILD_DIR}" "${NPUIR_LLVM_INSTALL_DIR}"
             cmake -G Ninja \
               -S "${NPUIR_LLVM_SOURCE_DIR}/llvm" \
@@ -369,10 +375,16 @@ jobs:
               -DLLVM_BUILD_EXAMPLES=OFF \
               -DLLVM_ENABLE_ASSERTIONS=OFF \
               -DLLVM_INSTALL_UTILS=ON \
+              -DLLVM_PARALLEL_COMPILE_JOBS="${LLVM_SDK_COMPILE_JOBS}" \
+              -DLLVM_PARALLEL_LINK_JOBS="${LLVM_SDK_LINK_JOBS}" \
               -DMLIR_INCLUDE_TESTS=OFF \
               -DMLIR_ENABLE_BINDINGS_PYTHON=OFF \
               -DMLIR_ENABLE_EXECUTION_ENGINE=OFF
-            cmake --build "${NPUIR_LLVM_BUILD_DIR}" --target install -j "$(nproc)"
+            cmake --build "${NPUIR_LLVM_BUILD_DIR}" \
+              --target install --parallel "${LLVM_SDK_COMPILE_JOBS}"
+            echo "=== Resources after LLVM SDK build ==="
+            free -h
+            df -h /ci-cache
 
             for relative_path in "${required_sdk_files[@]}"; do
               if [[ ! -f "${NPUIR_LLVM_INSTALL_DIR}/${relative_path}" ]]; then
