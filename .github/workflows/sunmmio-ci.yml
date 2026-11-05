@@ -90,7 +90,7 @@ jobs:
       github.actor != 'dependabot[bot]'
     needs: [lint]
     runs-on: [self-hosted, Linux, CUDA-rtx3080]
-    timeout-minutes: 120
+    timeout-minutes: 180
     container:
       image: ubuntu:24.04
       options: --ipc=host --cap-add NET_ADMIN --sysctl net.ipv4.tcp_mtu_probing=2
@@ -104,6 +104,8 @@ jobs:
       UV_CACHE_DIR: /ci-cache/uv
       PRE_COMMIT_HOME: /ci-cache/pre-commit
       NPUIR_CACHE_ROOT: /ci-cache/npuir
+      LLVM_SDK_COMPILE_JOBS: "8"
+      LLVM_SDK_LINK_JOBS: "2"
       CLANG_TIDY_VENV: /tmp/tilelang-clang-tidy-venv
       TEST_VENV: /tmp/tilelang-test-venv
       CLANG_TIDY_BUILD_DIR: /tmp/tilelang-clang-tidy-build
@@ -126,7 +128,8 @@ jobs:
             clang-tidy cmake ninja-build git curl ca-certificates file \
             build-essential pkg-config libprotobuf-dev \
             protobuf-compiler libgflags-dev libsqlite3-dev \
-            iproute2 iptables curl dnsutils openssh-client util-linux
+            zlib1g-dev libedit-dev libtinfo-dev libxml2-dev libzstd-dev \
+            iproute2 iptables curl dnsutils openssh-client procps util-linux
           ln -sf /usr/bin/python3.12 /usr/local/bin/python
 
       - name: Fix container networking
@@ -246,20 +249,23 @@ jobs:
           echo "NPUIR_LLVM_COMMIT=${NPUIR_LLVM_COMMIT}" >> "${GITHUB_ENV}"
           echo "Using NPU-IR LLVM pin ${NPUIR_LLVM_COMMIT}"
 
-      - name: Prepare cached LLVM checkout for NPU-IR
+      - name: Prepare cached LLVM SDK for NPU-IR
         run: |
           set -euo pipefail
 
           NPUIR_CACHE_DIR="${NPUIR_CACHE_ROOT}/${NPUIR_LLVM_COMMIT}"
           NPUIR_LLVM_SOURCE_DIR="${NPUIR_CACHE_DIR}/llvm-project"
           NPUIR_LLVM_BUILD_DIR="${NPUIR_CACHE_DIR}/llvm-project-build"
+          NPUIR_LLVM_INSTALL_DIR="${NPUIR_CACHE_DIR}/llvm-install"
           NPUIR_LLVM_MARKER_FILE="${NPUIR_CACHE_DIR}/llvm-project.commit"
+          NPUIR_LLVM_INSTALL_MARKER_FILE="${NPUIR_CACHE_DIR}/llvm-install.commit"
 
           {
             echo "NPUIR_CACHE_DIR=${NPUIR_CACHE_DIR}"
             echo "NPUIR_LLVM_SOURCE_DIR=${NPUIR_LLVM_SOURCE_DIR}"
             echo "NPUIR_LLVM_BUILD_DIR=${NPUIR_LLVM_BUILD_DIR}"
-            echo "TILELANG_SUNMMIO_CMAKE_ARGS=-DUSE_SUNMMIO=ON -DTILELANG_NPUIR_BINARY_DIR=${NPUIR_CACHE_DIR}"
+            echo "NPUIR_LLVM_INSTALL_DIR=${NPUIR_LLVM_INSTALL_DIR}"
+            echo "TILELANG_SUNMMIO_CMAKE_ARGS=-DUSE_SUNMMIO=ON -DNPUIR_USE_LLVM_INSTALL_DIR=${NPUIR_LLVM_INSTALL_DIR}"
           } >> "${GITHUB_ENV}"
 
           lock_file="${NPUIR_CACHE_ROOT}/llvm-project.lock"
@@ -299,12 +305,104 @@ jobs:
             fi
 
             mv "${extracted_dir}" "${source_tmp}"
-            rm -rf "${NPUIR_LLVM_SOURCE_DIR}" "${NPUIR_LLVM_BUILD_DIR}"
+            rm -rf \
+              "${NPUIR_LLVM_SOURCE_DIR}" \
+              "${NPUIR_LLVM_BUILD_DIR}" \
+              "${NPUIR_LLVM_INSTALL_DIR}"
+            rm -f "${NPUIR_LLVM_INSTALL_MARKER_FILE}"
             mv "${source_tmp}" "${NPUIR_LLVM_SOURCE_DIR}"
             printf '%s\n' "${NPUIR_LLVM_COMMIT}" > "${NPUIR_LLVM_SOURCE_DIR}/.tilelang-source-commit"
             printf '%s\n' "${NPUIR_LLVM_COMMIT}" > "${NPUIR_LLVM_MARKER_FILE}"
             rm -f "${archive_file}"
             rm -rf "${extract_root}"
+          fi
+
+          sdk_ready=1
+          if [[ -f "${NPUIR_LLVM_INSTALL_MARKER_FILE}" ]]; then
+            installed_rev="$(<"${NPUIR_LLVM_INSTALL_MARKER_FILE}")"
+          else
+            installed_rev=""
+          fi
+          if [[ "${installed_rev}" != "${NPUIR_LLVM_COMMIT}" ]]; then
+            sdk_ready=0
+          fi
+
+          required_sdk_files=(
+            "lib/cmake/llvm/LLVMConfig.cmake"
+            "lib/cmake/mlir/MLIRConfig.cmake"
+            "include/llvm/Support/VCSRevision.h"
+          )
+          for relative_path in "${required_sdk_files[@]}"; do
+            if [[ ! -f "${NPUIR_LLVM_INSTALL_DIR}/${relative_path}" ]]; then
+              sdk_ready=0
+            fi
+          done
+
+          required_sdk_tools=(llvm-tblgen mlir-tblgen FileCheck not)
+          for tool in "${required_sdk_tools[@]}"; do
+            if [[ ! -x "${NPUIR_LLVM_INSTALL_DIR}/bin/${tool}" ]]; then
+              sdk_ready=0
+            fi
+          done
+
+          revision_header="${NPUIR_LLVM_INSTALL_DIR}/include/llvm/Support/VCSRevision.h"
+          if [[ "${sdk_ready}" == 1 ]] && \
+             ! grep -Fq "${NPUIR_LLVM_COMMIT}" "${revision_header}"; then
+            sdk_ready=0
+          fi
+
+          if [[ "${sdk_ready}" == 1 ]]; then
+            echo "Reusing cached LLVM/MLIR SDK at ${NPUIR_LLVM_INSTALL_DIR}"
+          else
+            echo "Building LLVM/MLIR SDK at ${NPUIR_LLVM_COMMIT}"
+            echo "Build limits: compile=${LLVM_SDK_COMPILE_JOBS}, link=${LLVM_SDK_LINK_JOBS}"
+            echo "=== Resources before LLVM SDK build ==="
+            free -h
+            df -h /ci-cache
+            rm -rf "${NPUIR_LLVM_BUILD_DIR}" "${NPUIR_LLVM_INSTALL_DIR}"
+            cmake -G Ninja \
+              -S "${NPUIR_LLVM_SOURCE_DIR}/llvm" \
+              -B "${NPUIR_LLVM_BUILD_DIR}" \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_INSTALL_PREFIX="${NPUIR_LLVM_INSTALL_DIR}" \
+              -DLLVM_ENABLE_PROJECTS=mlir \
+              -DLLVM_TARGETS_TO_BUILD= \
+              -DLLVM_FORCE_VC_REVISION="${NPUIR_LLVM_COMMIT}" \
+              -DLLVM_FORCE_VC_REPOSITORY=https://github.com/llvm/llvm-project.git \
+              -DLLVM_INCLUDE_TESTS=OFF \
+              -DLLVM_INCLUDE_EXAMPLES=OFF \
+              -DLLVM_INCLUDE_BENCHMARKS=OFF \
+              -DLLVM_BUILD_EXAMPLES=OFF \
+              -DLLVM_ENABLE_ASSERTIONS=OFF \
+              -DLLVM_INSTALL_UTILS=ON \
+              -DLLVM_PARALLEL_COMPILE_JOBS="${LLVM_SDK_COMPILE_JOBS}" \
+              -DLLVM_PARALLEL_LINK_JOBS="${LLVM_SDK_LINK_JOBS}" \
+              -DMLIR_INCLUDE_TESTS=OFF \
+              -DMLIR_ENABLE_BINDINGS_PYTHON=OFF \
+              -DMLIR_ENABLE_EXECUTION_ENGINE=OFF
+            cmake --build "${NPUIR_LLVM_BUILD_DIR}" \
+              --target install --parallel "${LLVM_SDK_COMPILE_JOBS}"
+            echo "=== Resources after LLVM SDK build ==="
+            free -h
+            df -h /ci-cache
+
+            for relative_path in "${required_sdk_files[@]}"; do
+              if [[ ! -f "${NPUIR_LLVM_INSTALL_DIR}/${relative_path}" ]]; then
+                echo "::error::LLVM SDK is missing ${relative_path}"
+                exit 1
+              fi
+            done
+            for tool in "${required_sdk_tools[@]}"; do
+              if [[ ! -x "${NPUIR_LLVM_INSTALL_DIR}/bin/${tool}" ]]; then
+                echo "::error::LLVM SDK is missing executable bin/${tool}"
+                exit 1
+              fi
+            done
+            if ! grep -Fq "${NPUIR_LLVM_COMMIT}" "${revision_header}"; then
+              echo "::error::Installed LLVM SDK does not match ${NPUIR_LLVM_COMMIT}"
+              exit 1
+            fi
+            printf '%s\n' "${NPUIR_LLVM_COMMIT}" > "${NPUIR_LLVM_INSTALL_MARKER_FILE}"
           fi
 
           du -sh "${NPUIR_CACHE_DIR}" 2>/dev/null || true
@@ -340,8 +438,8 @@ jobs:
             "${CLANG_TIDY_CMAKE_OPTIONS_ARRAY[@]}" \
             "${TILELANG_SUNMMIO_CMAKE_ARGS_ARRAY[@]}"
           if [[ "${TILELANG_SUNMMIO_CMAKE_ARGS}" == *"-DUSE_SUNMMIO=ON"* ]]; then
-            cmake --build "${CLANG_TIDY_BUILD_DIR}" --target tilelang_highs -j "$(nproc)"
-            cmake --build "${CLANG_TIDY_BUILD_DIR}" --target mlir-headers llvm-headers -j "$(nproc)"
+            cmake --build "${CLANG_TIDY_BUILD_DIR}" \
+              --target tilelang_highs SUVMIncGen -j "$(nproc)"
           fi
           flock -u 9
 

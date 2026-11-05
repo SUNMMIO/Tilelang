@@ -58,12 +58,12 @@
  *    writer runs every iteration right before the gemm — so it only
  *    appends (restage, gemm-clone). InPlaceGroup likewise keeps the writer
  *    and emits one shared restage for the whole run. The Reissue actions
- *    run their original writer only once, so the rewriter removes it and
- *    emits BOTH the stripe-0 restore and the stripe-1 restage per gemm:
+ *    emit BOTH the stripe-0 restore and the stripe-1 restage per gemm:
  *    omitting the restore would let iteration k+1 read the stripe-1 data
  *    left by iteration k. ReissueFromSource re-reads the source directly;
- *    ReissueFromShadow reads the shadow, and a snapshot copy replaces the
- *    removed writer to populate it.
+ *    ReissueFromShadow reads a snapshot captured at the writer site. The
+ *    original writer and a final stripe-0 restore are retained when any
+ *    reader not expanded by this pass can observe the A buffer.
  *
  * This pass runs between SunmmioLayoutInference and LowerTileOp so it can
  * see high-level ops (Copy, AllgatherOp, BroadcastOp, Gemm, GemmPy) directly
@@ -71,13 +71,16 @@
  * converts them to TIR intrinsics.
  */
 
+#include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/node/cast.h>
+#include <tvm/tir/analysis.h>
 #include <tvm/tir/buffer.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <algorithm>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -85,12 +88,19 @@
 #include <vector>
 
 #include "../layout/cute_layout.h"
+#include "../op/atomic_add.h"
 #include "../op/builtin.h"
 #include "../op/comm.h"
 #include "../op/copy.h"
 #include "../op/fill.h"
+#include "../op/finalize_reducer.h"
 #include "../op/gemm.h"
 #include "../op/gemm_py.h"
+#include "../op/gemm_sp.h"
+#include "../op/gemm_sp_py.h"
+#include "../op/mx.h"
+#include "../op/reduce.h"
+#include "../op/transpose.h"
 #include "../op/utils.h"
 #include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
@@ -142,14 +152,20 @@ std::optional<Buffer> GetSrcBuffer(const CallNode *call) {
 // not exceed that fits entirely in the north bank in one pass, so it needs
 // no duplication. Works for both Gemm and GemmPy node types (they share the
 // same a_ / m_ field convention).
-template <typename NodeT>
-bool ShouldLegalizeGemmNode(const NodeT *node,
-                            const SunmmioTileProcessorConfig &cfg) {
+template <typename NodeT> bool IsBf16AsramGemmNode(const NodeT *node) {
   if (node == nullptr)
     return false;
   if (node->a_.scope() != kSunmmioScopeASRAM)
     return false;
   if (node->a_->dtype != DataType::BFloat(16))
+    return false;
+  return true;
+}
+
+template <typename NodeT>
+bool ShouldLegalizeGemmNode(const NodeT *node,
+                            const SunmmioTileProcessorConfig &cfg) {
+  if (!IsBf16AsramGemmNode(node))
     return false;
   return node->m_ > cfg.bf16_gemm_single_pass_max_rows;
 }
@@ -166,18 +182,21 @@ struct Bf16AsramGemmInfo {
 
 std::optional<Bf16AsramGemmInfo>
 GetBf16AsramGemmInfo(const CallNode *call,
-                     const SunmmioTileProcessorConfig &cfg) {
+                     const SunmmioTileProcessorConfig &cfg,
+                     bool include_single_pass = false) {
   if (call == nullptr)
     return std::nullopt;
   if (call->op.same_as(Gemm::Get())) {
     Gemm op(call->args, call->annotations);
-    if (!ShouldLegalizeGemmNode(op.get(), cfg))
+    if (!IsBf16AsramGemmNode(op.get()) ||
+        (!include_single_pass && !ShouldLegalizeGemmNode(op.get(), cfg)))
       return std::nullopt;
     return Bf16AsramGemmInfo{op->a_, op->c_->dtype, op->accOffsetByte_};
   }
   if (call->op.same_as(GemmPy::Get())) {
     GemmPy op(call->args, call->annotations);
-    if (!ShouldLegalizeGemmNode(op.get(), cfg))
+    if (!IsBf16AsramGemmNode(op.get()) ||
+        (!include_single_pass && !ShouldLegalizeGemmNode(op.get(), cfg)))
       return std::nullopt;
     return Bf16AsramGemmInfo{op->a_, op->c_->dtype, op->accOffsetByte_};
   }
@@ -362,18 +381,21 @@ CollectLegalizedADists(const Stmt &body,
 class Bf16AsramOperandFlow : public StmtVisitor {
 public:
   static std::vector<GemmReachingDef>
-  Analyze(const Stmt &body, const SunmmioTileProcessorConfig &cfg) {
-    Bf16AsramOperandFlow v(cfg);
+  Analyze(const Stmt &body, const SunmmioTileProcessorConfig &cfg,
+          bool include_single_pass = false) {
+    Bf16AsramOperandFlow v(cfg, include_single_pass);
     v.legalized_a_dists_ = CollectLegalizedADists(body, cfg);
     v.VisitStmt(body);
     return std::move(v.gemms_);
   }
 
 private:
-  explicit Bf16AsramOperandFlow(const SunmmioTileProcessorConfig &cfg)
-      : cfg_(cfg) {}
+  explicit Bf16AsramOperandFlow(const SunmmioTileProcessorConfig &cfg,
+                                bool include_single_pass)
+      : cfg_(cfg), include_single_pass_(include_single_pass) {}
 
   const SunmmioTileProcessorConfig &cfg_;
+  bool include_single_pass_;
   ReachingDefMap state_;
   std::vector<GemmReachingDef> gemms_;
   // A_dist buffers already legalized (see CollectLegalizedADists). Gemms
@@ -440,7 +462,7 @@ private:
     //   - acc_offset_byte == 0 but a_dist is in legalized_a_dists_ → this
     //     is the pass-1 gemm of an already-legalized pair (prior run, or a
     //     hand-written two-pass kernel), skip to avoid double-legalization.
-    if (auto info = GetBf16AsramGemmInfo(call, cfg_)) {
+    if (auto info = GetBf16AsramGemmInfo(call, cfg_, include_single_pass_)) {
       if (info->acc_offset_byte == 0 &&
           !legalized_a_dists_.count(info->a_dist.get())) {
         auto it = state_.find(info->a_dist.get());
@@ -577,6 +599,13 @@ struct Action {
   const CallNode *gemm; // primary gemm; for InPlaceGroup == group_gemms[0]
   Buffer a_dist;
   DataType c_dtype;
+  // A reader not expanded by this pass shares this writer. Preserve its
+  // initial definition; restore_after is set separately when such a reader can
+  // observe this particular two-pass action (including through a loop
+  // backedge).
+  bool preserve_writer = false;
+  bool restore_after = false;
+  const ForNode *restore_after_loop = nullptr;
 
   // Set only when kind == InPlaceGroup: every consumer gemm of a_dist, in
   // program order. Empty for the other kinds (use `gemm`).
@@ -589,13 +618,26 @@ struct Action {
 };
 
 // Walks the body and records the enclosing IR ancestor path for each
-// "interesting" call (writer or gemm). Path elements are pointers to scope-
-// introducing IR nodes: ForNode and the then/else child of IfThenElseNode.
+// "interesting" call (writer or gemm). Path elements distinguish loops and
+// then/else branches explicitly, even when a branch body is itself a ForNode.
 // SeqStmt and Block are transparent (no path entry). Two calls share the same
 // path iff they're in the same innermost scope on the same control-flow path.
 class ScopePathCollector : public StmtVisitor {
 public:
-  using Path = std::vector<const Object *>;
+  struct Scope {
+    enum class Kind { kLoop, kThen, kElse };
+    const Object *node;
+    Kind kind;
+
+    const ForNode *AsLoop() const {
+      return kind == Kind::kLoop ? static_cast<const ForNode *>(node) : nullptr;
+    }
+    bool operator==(const Scope &other) const {
+      return node == other.node && kind == other.kind;
+    }
+    bool operator!=(const Scope &other) const { return !(*this == other); }
+  };
+  using Path = std::vector<Scope>;
 
   explicit ScopePathCollector(
       const std::unordered_set<const CallNode *> &interesting)
@@ -605,33 +647,56 @@ public:
 
   std::unordered_map<const CallNode *, Path> paths;
   std::unordered_set<const CallNode *> conditional_calls;
+  std::unordered_map<const VarNode *, std::unordered_set<const ForNode *>>
+      binding_loops;
 
 private:
   const std::unordered_set<const CallNode *> &interesting_;
   Path current_path_;
+  std::vector<const ForNode *> loop_stack_;
   int conditional_depth_ = 0;
 
   void VisitStmt_(const ForNode *op) final {
-    current_path_.push_back(op);
+    current_path_.push_back({op, Scope::Kind::kLoop});
+    loop_stack_.push_back(op);
+    RecordBinding(op->loop_var);
     VisitStmt(op->body);
+    loop_stack_.pop_back();
     current_path_.pop_back();
   }
 
   void VisitStmt_(const IfThenElseNode *op) final {
     ++conditional_depth_;
-    current_path_.push_back(op->then_case.get());
+    current_path_.push_back({op, Scope::Kind::kThen});
     VisitStmt(op->then_case);
     current_path_.pop_back();
     if (op->else_case.defined()) {
-      current_path_.push_back(op->else_case.value().get());
+      current_path_.push_back({op, Scope::Kind::kElse});
       VisitStmt(op->else_case.value());
       current_path_.pop_back();
     }
     --conditional_depth_;
   }
 
-  void VisitStmt_(const BlockNode *op) final { VisitStmt(op->body); }
+  void VisitStmt_(const BlockNode *op) final {
+    for (const Buffer &buffer : op->alloc_buffers)
+      RecordBinding(buffer->data);
+    for (const IterVar &iter : op->iter_vars)
+      RecordBinding(iter->var);
+    VisitStmt(op->body);
+  }
   void VisitStmt_(const BlockRealizeNode *op) final { VisitStmt(op->block); }
+
+  void VisitStmt_(const LetStmtNode *op) final {
+    VisitExpr(op->value);
+    RecordBinding(op->var);
+    VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const AllocateNode *op) final {
+    RecordBinding(op->buffer_var);
+    StmtVisitor::VisitStmt_(op);
+  }
 
   void VisitStmt_(const EvaluateNode *op) final {
     const auto *call = op->value.as<CallNode>();
@@ -640,6 +705,11 @@ private:
       if (conditional_depth_ != 0)
         conditional_calls.insert(call);
     }
+  }
+
+  void RecordBinding(const Var &var) {
+    auto &loops = binding_loops[var.get()];
+    loops.insert(loop_stack_.begin(), loop_stack_.end());
   }
 };
 
@@ -655,33 +725,102 @@ bool IsPathPrefix(const ScopePathCollector::Path &a,
   return true;
 }
 
+// Keep source effects separate from GetDstBuffer: only Copy/Allgather are
+// supported replayable activation writers, but many other ops can overwrite
+// their sources. Compare storage identity so an aliased view is not missed.
+bool CallMayWriteSource(const CallNode *call, const BufferNode *source) {
+  auto writes = [&](const Buffer &buffer) {
+    return buffer.defined() && buffer->data.same_as(source->data);
+  };
+  auto writes_region = [&](const PrimExpr &expr) {
+    return expr.defined() && (!IsBufferLikeExpr(expr) ||
+                              writes(NormalizeToBufferRegion(expr)->buffer));
+  };
+  auto op = call->op.as<Op>();
+  if (!op)
+    return true;
+  TileOperator tile_op = ParseOperator(tvm::ffi::GetRef<Call>(call));
+  if (const auto *node = tile_op.as<CopyNode>())
+    return writes(node->dst);
+  if (const auto *node = tile_op.as<FillNode>())
+    return writes(node->dst);
+  if (const auto *node = tile_op.as<GemmNode>())
+    return writes(node->c_) ||
+           (node->mbar_.defined() && writes(node->mbar_->buffer));
+  if (const auto *node = tile_op.as<GemmPyNode>())
+    return writes(node->c_) ||
+           (node->mbar_.defined() && writes(node->mbar_->buffer));
+  if (const auto *node = tile_op.as<GemmSPNode>())
+    return writes(node->c_);
+  if (const auto *node = tile_op.as<GemmSPPyNode>())
+    return writes(node->cRegion_->buffer);
+  if (const auto *node = tile_op.as<ReduceOpNode>())
+    return writes(node->dst);
+  if (const auto *node = tile_op.as<CumSumOpNode>())
+    return writes(node->dst);
+  if (const auto *node = tile_op.as<FinalizeReducerOpNode>())
+    return writes(node->reducer);
+  if (const auto *node = tile_op.as<TransposeNode>())
+    return writes(node->dst);
+  if (const auto *node = tile_op.as<Conv2DIm2ColOpNode>())
+    return writes(node->dst_);
+  if (const auto *node = tile_op.as<AtomicAddNode>())
+    return writes(node->dst);
+  if (const auto *node = tile_op.as<AtomicMaxNode>())
+    return writes(node->dst);
+  if (const auto *node = tile_op.as<AtomicMinNode>())
+    return writes(node->dst);
+  if (const auto *node = tile_op.as<BroadcastOpNode>())
+    return writes(node->dst);
+  if (const auto *node = tile_op.as<PutOpNode>())
+    return writes(node->dst);
+  if (const auto *node = tile_op.as<AllgatherOpNode>())
+    return writes_region(node->recv);
+  if (const auto *node = tile_op.as<AllreduceOpNode>())
+    return writes_region(node->dst) || writes_region(node->row_allgather) ||
+           writes_region(node->col_allgather) || writes_region(node->dst_copy);
+  if (const auto *node = tile_op.as<MXPackNode>())
+    return writes(node->mx);
+  if (const auto *node = tile_op.as<MXUnpackNode>())
+    return writes(node->data) || writes(node->scale);
+
+  // Scalar math, reads and region descriptors do not mutate storage. Unknown
+  // operations, external/global calls and opaque effects cannot prove it clean.
+  static auto effects = Op::GetAttrMap<TCallEffectKind>("TCallEffectKind");
+  return !effects.count(op.value()) ||
+         effects[op.value()]->value >
+             static_cast<int>(CallEffectKind::kReadState);
+}
+
 // Returns true iff no statement encountered AFTER `writer` (in pre-order
-// traversal of `body`) writes to `source`. Writes via tile-op data-transfer
-// calls are detected via GetDstBuffer; raw BufferStore is also handled.
+// traversal of `body`) may write to `source`. Check calls in expressions too;
+// an opaque call inside a let value or unrelated store is still a side effect.
 //
 // Used by Phase 3 to choose between ReissueFromSource (source clean — no shadow
 // needed, re-emit reads from the source directly) and ReissueFromShadow (source
 // dirty — must materialize a private RSRAM snapshot).
 //
-// v1 rule: any downstream write at all marks the source dirty. This is
-// conservative (e.g., a kernel-scope write after the gemm's enclosing loop
-// is technically safe), but it's the simplest sound rule and catches the
-// flash-attention pattern cleanly.
-class SourceBufferCleanliness : public StmtVisitor {
+// Reissue uses the conservative default: any downstream write marks the
+// source dirty. InPlace supplies its final consumer to check only intervening
+// writes, including the final consumer: a GEMM can itself overwrite its source
+// before stripe-1 restaging. Later writes cannot affect a completed restage.
+class SourceBufferCleanliness : public StmtExprVisitor {
 public:
   static bool Check(const Stmt &body, const CallNode *writer,
-                    const Buffer &source) {
-    SourceBufferCleanliness v(writer, source.get());
+                    const Buffer &source,
+                    const CallNode *last_consumer = nullptr) {
+    SourceBufferCleanliness v(writer, source.get(), last_consumer);
     v.VisitStmt(body);
     return v.clean_;
   }
 
 private:
-  SourceBufferCleanliness(const CallNode *writer, const BufferNode *source)
-      : writer_(writer), source_(source) {}
+  SourceBufferCleanliness(const CallNode *writer, const BufferNode *source,
+                          const CallNode *last_consumer)
+      : writer_(writer), source_(source), last_consumer_(last_consumer) {}
 
   void VisitStmt_(const EvaluateNode *op) final {
-    if (!clean_)
+    if (!clean_ || reached_consumer_)
       return;
     const auto *call = op->value.as<CallNode>();
     if (call == writer_) {
@@ -690,23 +829,155 @@ private:
     }
     if (!past_writer_)
       return;
-    if (auto dst = GetDstBuffer(call)) {
-      if (dst.value().get() == source_)
-        clean_ = false;
+    VisitExpr(op->value);
+    if (call != nullptr && call == last_consumer_)
+      reached_consumer_ = true;
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (!clean_ || !past_writer_ || reached_consumer_)
+      return;
+    if (CallMayWriteSource(op, source_)) {
+      clean_ = false;
+      return;
     }
+    StmtExprVisitor::VisitExpr_(op);
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    if (!clean_ || !past_writer_)
+    if (!clean_ || !past_writer_ || reached_consumer_)
       return;
-    if (op->buffer.get() == source_)
+    if (op->buffer->data.same_as(source_->data)) {
       clean_ = false;
+      return;
+    }
+    StmtExprVisitor::VisitStmt_(op);
   }
 
   const CallNode *writer_;
   const BufferNode *source_;
+  const CallNode *last_consumer_;
   bool past_writer_ = false;
   bool clean_ = true;
+  bool reached_consumer_ = false;
+};
+
+class StorageUseFinder : public ExprVisitor {
+public:
+  explicit StorageUseFinder(const BufferNode *buffer) : buffer_(buffer) {}
+
+  bool found() const { return found_; }
+
+private:
+  void VisitExpr_(const BufferLoadNode *op) final {
+    if (op->buffer.get() == buffer_ || op->buffer->data.same_as(buffer_->data))
+      found_ = true;
+    if (!found_)
+      ExprVisitor::VisitExpr_(op);
+  }
+
+  const BufferNode *buffer_;
+  bool found_ = false;
+};
+
+bool ExprUsesStorage(const PrimExpr &expr, const BufferNode *buffer) {
+  StorageUseFinder finder(buffer);
+  finder(expr);
+  return finder.found();
+}
+
+bool CallReadsStorage(const CallNode *call, const BufferNode *buffer,
+                      bool ignore_gemm_a) {
+  auto arg_reads = [&](size_t index) {
+    if (index >= call->args.size())
+      return false;
+    const PrimExpr &arg = call->args[index];
+    if (IsBufferLikeExpr(arg)) {
+      Buffer arg_buffer = NormalizeToBufferRegion(arg)->buffer;
+      return arg_buffer.get() == buffer ||
+             arg_buffer->data.same_as(buffer->data);
+    }
+    return ExprUsesStorage(arg, buffer);
+  };
+  auto trailing_args_read = [&](size_t start) {
+    for (size_t i = start; i < call->args.size(); ++i) {
+      if (arg_reads(i))
+        return true;
+    }
+    return false;
+  };
+
+  if (call->op.same_as(Copy::Get()) || call->op.same_as(AllgatherOp::Get()) ||
+      call->op.same_as(BroadcastOp::Get()) || call->op.same_as(PutOp::Get())) {
+    // args[1] is the destination region; masks/coordinates in later args are
+    // still ordinary expressions and may read the same storage.
+    return arg_reads(0) || trailing_args_read(2);
+  }
+  if (call->op.same_as(Fill::Get())) {
+    // args[0] is the destination region.
+    return trailing_args_read(1);
+  }
+  if (call->op.same_as(Gemm::Get()) || call->op.same_as(GemmPy::Get())) {
+    if ((!ignore_gemm_a && arg_reads(0)) || arg_reads(1))
+      return true;
+    // An accumulating GEMM observes C before updating it. clear_accum lives at
+    // args[9] for both frontends; a dynamic value is conservatively a read.
+    if (arg_reads(2) && (call->args.size() <= 9 || !is_one(call->args[9])))
+      return true;
+    return trailing_args_read(3);
+  }
+
+  // Unknown or less common tile operations are conservative: any reference to
+  // the storage may be an observable read. This can add a redundant restore,
+  // but cannot expose stripe-1 data silently.
+  return trailing_args_read(0);
+}
+
+class ExternalADistReadCollector : public StmtExprVisitor {
+public:
+  static std::unordered_set<const BufferNode *>
+  Collect(const Stmt &body,
+          const std::unordered_set<const BufferNode *> &target_storage,
+          const std::unordered_set<const CallNode *> &gemm_a_readers) {
+    ExternalADistReadCollector collector(target_storage, gemm_a_readers);
+    collector.VisitStmt(body);
+    return std::move(collector.externally_read_);
+  }
+
+private:
+  ExternalADistReadCollector(
+      const std::unordered_set<const BufferNode *> &target_storage,
+      const std::unordered_set<const CallNode *> &gemm_a_readers)
+      : target_storage_(target_storage), gemm_a_readers_(gemm_a_readers) {}
+
+  void VisitStmt_(const EvaluateNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    if (!call) {
+      StmtExprVisitor::VisitStmt_(op);
+      return;
+    }
+    bool ignore_gemm_a = gemm_a_readers_.count(call) != 0;
+    for (const BufferNode *buffer : target_storage_) {
+      if (CallReadsStorage(call, buffer, ignore_gemm_a))
+        externally_read_.insert(buffer);
+    }
+    // CallReadsStorage has classified every call argument. Do not recurse into
+    // destination region BufferLoads and misclassify writes as reads.
+  }
+
+  void VisitExpr_(const BufferLoadNode *op) final {
+    for (const BufferNode *buffer : target_storage_) {
+      if (op->buffer.get() == buffer ||
+          op->buffer->data.same_as(buffer->data)) {
+        externally_read_.insert(buffer);
+      }
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  const std::unordered_set<const BufferNode *> &target_storage_;
+  const std::unordered_set<const CallNode *> &gemm_a_readers_;
+  std::unordered_set<const BufferNode *> externally_read_;
 };
 
 // The CallNode wrapped by an Evaluate(Call) statement, or nullptr.
@@ -1257,35 +1528,47 @@ ReissueSource AnalyzeReissueSource(const Stmt &body, const CallNode *writer,
 // constructs every Action through one of these.
 
 // InPlace: co-scoped writer, single consumer. Writer kept.
-Action MakeInPlaceAction(const GemmReachingDef &g, const CallNode *writer) {
+Action MakeInPlaceAction(const GemmReachingDef &g, const CallNode *writer,
+                         bool preserve_writer, bool restore_after,
+                         const ForNode *restore_after_loop) {
   Action entry;
   entry.kind = ActionKind::InPlace;
   entry.writer = writer;
   entry.gemm = g.gemm;
   entry.a_dist = g.a_dist;
   entry.c_dtype = g.c_dtype;
+  entry.preserve_writer = preserve_writer;
+  entry.restore_after = restore_after;
+  entry.restore_after_loop = restore_after_loop;
   return entry;
 }
 
 // InPlaceGroup: co-scoped writer, a consecutive run of consumers. Writer
 // kept; `group_gemms` are the consumers in program order.
 Action MakeInPlaceGroupAction(const GemmReachingDef &g, const CallNode *writer,
-                              std::vector<const CallNode *> group_gemms) {
+                              std::vector<const CallNode *> group_gemms,
+                              bool preserve_writer, bool restore_after,
+                              const ForNode *restore_after_loop) {
   Action entry;
   entry.kind = ActionKind::InPlaceGroup;
   entry.writer = writer;
   entry.gemm = group_gemms.front();
   entry.a_dist = g.a_dist;
   entry.c_dtype = g.c_dtype;
+  entry.preserve_writer = preserve_writer;
+  entry.restore_after = restore_after;
+  entry.restore_after_loop = restore_after_loop;
   entry.group_gemms = std::move(group_gemms);
   return entry;
 }
 
-// Reissue: the writer is removed and re-issued per gemm (restore + restage).
-// ReissueFromSource when the source is clean, ReissueFromShadow otherwise —
-// `src` carries the (possibly shared) snapshot buffer.
+// Reissue: restore + restage per gemm, retaining shadow writers for other
+// reads. ReissueFromSource when the source is clean, ReissueFromShadow
+// otherwise — `src` carries the (possibly shared) snapshot buffer.
 Action MakeReissueAction(const GemmReachingDef &g, const CallNode *writer,
-                         const ReissueSource &src) {
+                         const ReissueSource &src, bool preserve_writer,
+                         bool restore_after,
+                         const ForNode *restore_after_loop) {
   Action entry;
   entry.kind =
       src.clean ? ActionKind::ReissueFromSource : ActionKind::ReissueFromShadow;
@@ -1293,6 +1576,9 @@ Action MakeReissueAction(const GemmReachingDef &g, const CallNode *writer,
   entry.gemm = g.gemm;
   entry.a_dist = g.a_dist;
   entry.c_dtype = g.c_dtype;
+  entry.preserve_writer = preserve_writer;
+  entry.restore_after = restore_after;
+  entry.restore_after_loop = restore_after_loop;
   entry.shadow_buffer = src.shadow;
   entry.shadow_range = src.shadow_range;
   return entry;
@@ -1320,9 +1606,79 @@ bool StmtCallPrecedes(const Stmt &body, const CallNode *first,
   return first_at < second_at;
 }
 
-std::vector<Action> BuildPlan(const Stmt &body,
-                              const std::vector<GemmReachingDef> &gemms,
-                              const ScopePathCollector &paths) {
+bool SharesEnclosingLoop(const ScopePathCollector::Path &a,
+                         const ScopePathCollector::Path &b) {
+  for (const auto &scope : a) {
+    if (!scope.AsLoop())
+      continue;
+    if (std::find(b.begin(), b.end(), scope) != b.end())
+      return true;
+  }
+  return false;
+}
+
+std::pair<const ForNode *, size_t>
+FindOutermostExclusiveLoop(const ScopePathCollector::Path &gemm_path,
+                           const ScopePathCollector::Path &reader_path) {
+  for (size_t i = 0; i < gemm_path.size(); ++i) {
+    const auto &scope = gemm_path[i];
+    if (const ForNode *loop = scope.AsLoop();
+        loop && std::find(reader_path.begin(), reader_path.end(), scope) ==
+                    reader_path.end()) {
+      return {loop, i};
+    }
+  }
+  return {nullptr, 0};
+}
+
+bool RestoreCanMoveAfterLoop(const CallNode *writer,
+                             const ScopePathCollector::Path &gemm_path,
+                             size_t loop_depth,
+                             const ScopePathCollector &scopes) {
+  // Hoisting places the restore immediately after gemm_path[loop_depth]. Any
+  // conditional scope nested inside that loop would be lost at the new site.
+  // Keep such restores inline so each branch restores its own reaching writer.
+  // Every crossed loop must execute: otherwise an unconditional restore could
+  // overwrite a live pre-loop value with a writer that never ran (or read an
+  // uninitialized shadow). This includes inner loops when exiting an outer one.
+  arith::Analyzer analyzer;
+  for (size_t i = loop_depth; i < gemm_path.size(); ++i) {
+    const ForNode *loop = gemm_path[i].AsLoop();
+    if (!loop || !analyzer.CanProve(loop->extent > 0))
+      return false;
+  }
+
+  const auto *escaped_loop = gemm_path[loop_depth].AsLoop();
+  for (const PrimExpr &arg : writer->args) {
+    if (UsesVar(arg, [&](const VarNode *var) {
+          auto it = scopes.binding_loops.find(var);
+          return it != scopes.binding_loops.end() &&
+                 it->second.count(escaped_loop) != 0;
+        })) {
+      return false;
+    }
+  }
+  return true;
+}
+
+void ValidateCollectiveReissueScope(const CallNode *writer,
+                                    const CallNode *gemm,
+                                    const ScopePathCollector &paths) {
+  bool collective = writer->op.same_as(AllgatherOp::Get()) ||
+                    writer->op.same_as(BroadcastOp::Get());
+  if (collective && paths.conditional_calls.count(gemm) &&
+      paths.paths.at(writer) != paths.paths.at(gemm)) {
+    LOG(FATAL) << "LegalizeSunmmioGemm cannot replay collective writer inside "
+                  "a conditional GEMM scope because every mesh participant "
+                  "must execute the collective";
+  }
+}
+
+std::vector<Action> BuildPlan(
+    const Stmt &body, const std::vector<GemmReachingDef> &gemms,
+    const std::vector<GemmReachingDef> &all_gemm_readers,
+    const ScopePathCollector &paths,
+    const std::unordered_set<const BufferNode *> &externally_read_storage) {
   // Dedup: the two-pass For traversal records loop gemms twice. Keep the
   // last (pass-2 = converged) reaching def per distinct gemm, in first-seen
   // (program) order.
@@ -1334,22 +1690,84 @@ std::vector<Action> BuildPlan(const Stmt &body,
     rd_of[g.gemm] = g;
   }
 
-  // Consumer set per A_dist.
-  std::unordered_map<const BufferNode *, std::unordered_set<const CallNode *>>
+  // A buffer may be overwritten between GEMMs, e.g. Q and P sharing ASRAM.
+  // Only consumers of the same reaching writer can share a restage/snapshot.
+  // Each writer has a single destination, so its identity also identifies
+  // A_dist.
+  std::unordered_map<const CallNode *, std::unordered_set<const CallNode *>>
       consumers;
   for (const CallNode *gp : order) {
-    consumers[rd_of[gp].a_dist.get()].insert(gp);
+    consumers[rd_of[gp].writer_rd.writer].insert(gp);
+  }
+
+  // A single-pass BF16 GEMM is not itself rewritten, but it still observes
+  // the same ASRAM state. Associate it with its unique writer, or with every
+  // planned writer for the same A buffer after a divergent control-flow join.
+  std::unordered_set<const CallNode *> legalized_gemms(order.begin(),
+                                                       order.end());
+  std::unordered_map<const BufferNode *, std::unordered_set<const CallNode *>>
+      writers_by_a_dist;
+  for (const CallNode *gp : order) {
+    writers_by_a_dist[rd_of[gp].a_dist.get()].insert(
+        rd_of[gp].writer_rd.writer);
+  }
+  std::unordered_map<const CallNode *, std::unordered_set<const CallNode *>>
+      unexpanded_readers;
+  for (const auto &reader : all_gemm_readers) {
+    if (legalized_gemms.count(reader.gemm))
+      continue;
+    if (reader.writer_rd.kind == ReachingDef::Kind::UNIQUE) {
+      unexpanded_readers[reader.writer_rd.writer].insert(reader.gemm);
+    } else if (reader.writer_rd.kind == ReachingDef::Kind::MULTIPLE) {
+      for (const CallNode *writer : writers_by_a_dist[reader.a_dist.get()]) {
+        unexpanded_readers[writer].insert(reader.gemm);
+      }
+    }
   }
 
   std::vector<Action> plan;
-  std::unordered_set<const BufferNode *> a_dist_done;
+  std::unordered_set<const CallNode *> writers_done;
 
   for (const CallNode *gp : order) {
     const GemmReachingDef &g = rd_of[gp];
     ICHECK_EQ(static_cast<int>(g.writer_rd.kind),
               static_cast<int>(ReachingDef::Kind::UNIQUE));
     const CallNode *writer = g.writer_rd.writer;
-    const auto &consumer_set = consumers[g.a_dist.get()];
+    const auto &consumer_set = consumers[writer];
+    const auto &single_pass_readers = unexpanded_readers[writer];
+    bool has_external_reader =
+        externally_read_storage.count(g.a_dist.get()) != 0;
+    bool preserve_writer = has_external_reader || !single_pass_readers.empty();
+    auto restore_placement = [&](const CallNode *last_gemm) {
+      // General reads do not participate in the GEMM reaching-def analysis.
+      // Restore immediately rather than trying to move across their unknown
+      // control/data dependencies. GEMM-A-only readers retain the optimized
+      // loop-exit placement below.
+      bool inline_restore = has_external_reader;
+      const ForNode *after_loop = nullptr;
+      size_t chosen_depth = 0;
+      for (const CallNode *reader : single_pass_readers) {
+        const auto &gemm_path = paths.paths.at(last_gemm);
+        const auto &reader_path = paths.paths.at(reader);
+        if (!StmtCallPrecedes(body, last_gemm, reader) &&
+            !SharesEnclosingLoop(gemm_path, reader_path)) {
+          continue;
+        }
+        auto [exclusive_loop, depth] =
+            FindOutermostExclusiveLoop(gemm_path, reader_path);
+        if (exclusive_loop == nullptr) {
+          inline_restore = true;
+        } else if (!RestoreCanMoveAfterLoop(writer, gemm_path, depth, paths)) {
+          inline_restore = true;
+        } else if (after_loop == nullptr || depth > chosen_depth) {
+          after_loop = exclusive_loop;
+          chosen_depth = depth;
+        }
+      }
+      if (inline_restore)
+        after_loop = nullptr;
+      return std::make_pair(inline_restore, after_loop);
+    };
 
     auto wit = paths.paths.find(writer);
     ICHECK(wit != paths.paths.end());
@@ -1366,14 +1784,21 @@ std::vector<Action> BuildPlan(const Stmt &body,
       // pass too, where its reaching def is still NONE (or MULTIPLE with a
       // pre-loop writer), and ValidateGemms rejects on that. This explicit
       // program-order check makes the InPlace precondition local and
-      // robust rather than an emergent cross-phase property — and if it
-      // ever does fail, Reissue (which emits its own restore) is the
-      // correct fallback.
-      if (co_scoped && StmtCallPrecedes(body, writer, g.gemm)) {
-        plan.push_back(MakeInPlaceAction(g, writer));
+      // robust rather than an emergent cross-phase property. The writer's
+      // source must also survive until the consumer, since stripe-1 restaging
+      // reads it again. Reissue snapshots a source overwritten in between.
+      Buffer source = NormalizeToBufferRegion(writer->args[0])->buffer;
+      bool source_clean = SourceBufferCleanliness::Check(
+          body, writer, source, preserve_writer ? nullptr : g.gemm);
+      auto [inline_restore, restore_after_loop] = restore_placement(g.gemm);
+      if (co_scoped && StmtCallPrecedes(body, writer, g.gemm) && source_clean) {
+        plan.push_back(MakeInPlaceAction(g, writer, preserve_writer,
+                                         inline_restore, restore_after_loop));
       } else if (co_scoped || IsPathPrefix(wit->second, git->second)) {
+        ValidateCollectiveReissueScope(writer, g.gemm, paths);
         ReissueSource src = AnalyzeReissueSource(body, writer, g.a_dist->name);
-        plan.push_back(MakeReissueAction(g, writer, src));
+        plan.push_back(MakeReissueAction(g, writer, src, preserve_writer,
+                                         inline_restore, restore_after_loop));
       } else {
         // Diverging paths — should have been caught upstream by
         // NONE/MULTIPLE, but defensive.
@@ -1384,10 +1809,10 @@ std::vector<Action> BuildPlan(const Stmt &body,
       continue;
     }
 
-    // ── multi-consumer: plan the whole A_dist on first encounter ───────
-    if (a_dist_done.count(g.a_dist.get()))
+    // ── multi-consumer: plan this reaching writer on first encounter ───
+    if (writers_done.count(writer))
       continue;
-    a_dist_done.insert(g.a_dist.get());
+    writers_done.insert(writer);
 
     auto run = FindGroupableRun(body, consumer_set);
     // InPlaceGroup keeps the writer, so the writer must be co-scoped with
@@ -1397,10 +1822,19 @@ std::vector<Action> BuildPlan(const Stmt &body,
     bool writer_co_scoped = run.has_value() &&
                             paths.paths.at(run->front()) == wit->second &&
                             StmtCallPrecedes(body, writer, run->front());
+    if (writer_co_scoped) {
+      Buffer source = NormalizeToBufferRegion(writer->args[0])->buffer;
+      writer_co_scoped = SourceBufferCleanliness::Check(
+          body, writer, source, preserve_writer ? nullptr : run->back());
+    }
 
     if (run.has_value() && writer_co_scoped) {
       // Groupable: one [G1..Gn, W', G1'..Gn'] block, writer kept.
-      plan.push_back(MakeInPlaceGroupAction(g, writer, *run));
+      auto [inline_restore, restore_after_loop] =
+          restore_placement(run->back());
+      plan.push_back(MakeInPlaceGroupAction(g, writer, *run, preserve_writer,
+                                            inline_restore,
+                                            restore_after_loop));
     } else {
       // Not groupable (non-adjacent, or hoisted multi-consumer). Each
       // consumer becomes a self-restoring Reissue — always correct, but it
@@ -1415,7 +1849,11 @@ std::vector<Action> BuildPlan(const Stmt &body,
       // Block gets exactly one shadow allocation.
       ReissueSource src = AnalyzeReissueSource(body, writer, g.a_dist->name);
       for (const CallNode *cgp : consumer_set) {
-        plan.push_back(MakeReissueAction(rd_of[cgp], writer, src));
+        ValidateCollectiveReissueScope(writer, cgp, paths);
+        auto [inline_restore, restore_after_loop] = restore_placement(cgp);
+        plan.push_back(MakeReissueAction(rd_of[cgp], writer, src,
+                                         preserve_writer, inline_restore,
+                                         restore_after_loop));
       }
     }
   }
@@ -1430,6 +1868,7 @@ public:
                               const SunmmioTileProcessorConfig &cfg,
                               const std::vector<Action> &plan)
       : target_(target), cfg_(cfg) {
+    std::unordered_set<const BufferNode *> added_shadows;
     for (const auto &e : plan) {
       if (e.kind == ActionKind::InPlaceGroup) {
         // Every group gemm maps to the shared entry; the SeqStmt rewriter
@@ -1439,15 +1878,26 @@ public:
       } else {
         gemm_plans_[e.gemm] = &e;
       }
-      // Reissue writers are removed from their original site (re-issued
-      // inside the gemm's loop). ReissueFromShadow leaves a snapshot copy in
-      // the writer's place to populate the shadow buffer.
+      // Reissue actions replace the writer with a source snapshot when needed.
+      // Retain the original writer when any unexpanded reader needs its
+      // logical stripe-0 definition.
       if (e.kind == ActionKind::ReissueFromSource ||
           e.kind == ActionKind::ReissueFromShadow) {
         writer_plans_[e.writer] = &e;
       }
-      if (e.kind == ActionKind::ReissueFromShadow) {
-        shadows_by_a_dist_[e.a_dist.get()] = e.shadow_buffer;
+      if (e.kind == ActionKind::ReissueFromShadow &&
+          added_shadows.insert(e.shadow_buffer.get()).second) {
+        shadows_by_a_dist_[e.a_dist.get()].push_back(e.shadow_buffer);
+      }
+      if (e.restore_after_loop != nullptr) {
+        auto &restores = loop_restores_[e.restore_after_loop];
+        auto existing = std::find_if(
+            restores.begin(), restores.end(),
+            [&](const Action *r) { return r->writer == e.writer; });
+        if (existing == restores.end())
+          restores.push_back(&e);
+        else
+          *existing = &e;
       }
     }
   }
@@ -1456,13 +1906,14 @@ private:
   Target target_;
   SunmmioTileProcessorConfig cfg_;
   std::unordered_map<const CallNode *, const Action *> gemm_plans_;
-  // Hoisted writers, removed from their outer site (re-issued inside the
-  // gemm's loop). ReissueFromShadow additionally leaves a snapshot copy in the
-  // writer's place to populate the shadow buffer.
+  // Writers requiring per-consumer restaging and optional preservation for an
+  // unexpanded reader that shares their ASRAM definition.
   std::unordered_map<const CallNode *, const Action *> writer_plans_;
-  // A_dist → its shadow Buffer. Drives the alloc_buffers append in the Block
-  // that owns A_dist.
-  std::unordered_map<const BufferNode *, Buffer> shadows_by_a_dist_;
+  // A_dist → one snapshot per reaching writer with a contested source.
+  // All snapshots belong to the Block that owns the reused A_dist.
+  std::unordered_map<const BufferNode *, Array<Buffer>> shadows_by_a_dist_;
+  std::unordered_map<const ForNode *, std::vector<const Action *>>
+      loop_restores_;
 
   // Co-locate the shadow buffer with its A_dist by appending to the same
   // Block's alloc_buffers. The shadow then inherits A_dist's liveness so
@@ -1473,7 +1924,8 @@ private:
     for (const Buffer &buf : block->alloc_buffers) {
       auto it = shadows_by_a_dist_.find(buf.get());
       if (it != shadows_by_a_dist_.end()) {
-        to_add.push_back(it->second);
+        for (const Buffer &shadow : it->second)
+          to_add.push_back(shadow);
       }
     }
     if (to_add.empty())
@@ -1483,6 +1935,44 @@ private:
       alloc_buffers.push_back(b);
     block.CopyOnWrite()->alloc_buffers = std::move(alloc_buffers);
     return block;
+  }
+
+  Stmt VisitStmt_(const ForNode *op) final {
+    Stmt loop = StmtExprMutator::VisitStmt_(op);
+    auto it = loop_restores_.find(op);
+    if (it == loop_restores_.end())
+      return loop;
+    Array<Stmt> rewritten{loop};
+    for (const Action *entry : it->second)
+      EmitStripeZeroRestore(*entry, &rewritten);
+    return SeqStmt::Flatten(rewritten);
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    Stmt stmt = tvm::ffi::GetRef<Stmt>(op);
+    const CallNode *call = AsEvaluatedCall(stmt);
+    auto wit = writer_plans_.find(call);
+    if (wit != writer_plans_.end()) {
+      Array<Stmt> rewritten;
+      if (wit->second->kind == ActionKind::ReissueFromShadow) {
+        // A transparent Block may contain a singleton writer without a SeqStmt.
+        EmitSnapshotCopy(*wit->second, &rewritten);
+      }
+      if (wit->second->preserve_writer) {
+        rewritten.push_back(stmt);
+      }
+      if (!rewritten.empty()) {
+        return SeqStmt::Flatten(rewritten);
+      }
+      return Evaluate(0);
+    }
+    auto git = gemm_plans_.find(call);
+    if (git == gemm_plans_.end())
+      return StmtExprMutator::VisitStmt_(op);
+    ICHECK(git->second->kind != ActionKind::InPlaceGroup);
+    Array<Stmt> rewritten;
+    EmitGemmExpansion(*git->second, stmt, &rewritten);
+    return SeqStmt::Flatten(rewritten);
   }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
@@ -1511,50 +2001,24 @@ private:
         }
       }
 
-      // Writer site (Reissue only): the writer is re-issued inside the
-      // gemm's loop, so drop it here. ReissueFromShadow leaves a snapshot copy
-      // in its place to populate the shadow buffer.
+      // Shadow paths capture the source. Keep the original definition only
+      // when an unexpanded reader shares this reaching writer.
       if (call) {
         auto wit = writer_plans_.find(call);
         if (wit != writer_plans_.end()) {
           if (wit->second->kind == ActionKind::ReissueFromShadow) {
             EmitSnapshotCopy(*wit->second, &rewritten);
           }
+          if (wit->second->preserve_writer) {
+            rewritten.push_back(s);
+          }
           continue;
         }
       }
 
-      rewritten.push_back(StmtExprMutator::VisitStmt(s));
+      rewritten.push_back(VisitStmt(s));
     }
     return SeqStmt::Flatten(rewritten);
-  }
-
-  Stmt VisitStmt_(const EvaluateNode *op) final {
-    const auto *call = op->value.as<CallNode>();
-    if (!call)
-      return StmtExprMutator::VisitStmt_(op);
-
-    auto gemm_it = gemm_plans_.find(call);
-    if (gemm_it != gemm_plans_.end()) {
-      const Action &entry = *gemm_it->second;
-      ICHECK(entry.kind != ActionKind::InPlaceGroup)
-          << "Grouped GEMMs must be direct children of a SeqStmt";
-      Array<Stmt> rewritten;
-      EmitGemmExpansion(entry, tvm::ffi::GetRef<Stmt>(op), &rewritten);
-      return SeqStmt::Flatten(rewritten);
-    }
-
-    auto writer_it = writer_plans_.find(call);
-    if (writer_it != writer_plans_.end()) {
-      if (writer_it->second->kind == ActionKind::ReissueFromShadow) {
-        Array<Stmt> rewritten;
-        EmitSnapshotCopy(*writer_it->second, &rewritten);
-        return SeqStmt::Flatten(rewritten);
-      }
-      return Evaluate(0);
-    }
-
-    return StmtExprMutator::VisitStmt_(op);
   }
 
   // Expand a planned gemm into the two-pass form the bf16 TC requires.
@@ -1591,6 +2055,10 @@ private:
     // pass-2: cloned gemm carrying accOffsetByte.
     int acc_off = ComputeAccOffsetBytes(target_, entry.c_dtype);
     out->push_back(Evaluate(CloneGemmCallWithAccOffset(entry.gemm, acc_off)));
+
+    if (entry.restore_after) {
+      EmitStripeZeroRestore(entry, out);
+    }
   }
 
   // Expand an InPlaceGroup of consumers G1..Gn (a consecutive run starting
@@ -1622,6 +2090,16 @@ private:
       int acc_off = ComputeAccOffsetBytes(target_, info->c_dtype);
       out->push_back(Evaluate(CloneGemmCallWithAccOffset(g, acc_off)));
     }
+    if (entry.restore_after) {
+      EmitStripeZeroRestore(entry, out);
+    }
+  }
+
+  void EmitStripeZeroRestore(const Action &entry, Array<Stmt> *out) const {
+    Call restore = entry.kind == ActionKind::ReissueFromShadow
+                       ? CloneWriterFromShadow(entry, /*offset=*/0)
+                       : CloneWriter(entry.writer, /*offset=*/0);
+    out->push_back(Evaluate(restore));
   }
 
   // A clone of the original writer call reading its original source.
@@ -1645,9 +2123,7 @@ private:
     return ReissueWriter(entry.writer, args, offset);
   }
 
-  // ReissueFromShadow writer-site replacement: snapshot the writer's source
-  // region into the private RSRAM shadow buffer. Runs once, outside the
-  // loop, in the place the original writer occupied.
+  // Snapshot the source alongside its original writer, in the same scope.
   void EmitSnapshotCopy(const Action &entry, Array<Stmt> *out) const {
     BufferRegion src_br = NormalizeToBufferRegion(entry.writer->args[0]);
     PrimExpr src_region = MakeRegionExpr(src_br->buffer, src_br->region, 1);
@@ -1704,6 +2180,19 @@ PrimFunc Run(PrimFunc f, bool twice) {
       Bf16AsramOperandFlow::Analyze(fp->body, cfg);
   if (gemms.empty())
     return f;
+  std::vector<GemmReachingDef> all_gemm_readers =
+      Bf16AsramOperandFlow::Analyze(fp->body, cfg,
+                                    /*include_single_pass=*/true);
+
+  std::unordered_set<const BufferNode *> planned_a_storage;
+  for (const auto &g : gemms)
+    planned_a_storage.insert(g.a_dist.get());
+  std::unordered_set<const CallNode *> gemm_a_reader_calls;
+  for (const auto &reader : all_gemm_readers)
+    gemm_a_reader_calls.insert(reader.gemm);
+  std::unordered_set<const BufferNode *> externally_read_storage =
+      ExternalADistReadCollector::Collect(fp->body, planned_a_storage,
+                                          gemm_a_reader_calls);
 
   // Phase 2: validate. Rejects NONE / MULTIPLE / unsupported writer types.
   ValidateGemms(gemms, fp->body, target.value());
@@ -1715,11 +2204,15 @@ PrimFunc Run(PrimFunc f, bool twice) {
     interesting.insert(g.gemm);
     interesting.insert(g.writer_rd.writer);
   }
+  for (const auto &reader : all_gemm_readers) {
+    interesting.insert(reader.gemm);
+  }
   ScopePathCollector path_collector(interesting);
   path_collector.Run(fp->body);
 
   // Phase 3: per-gemm action plan.
-  std::vector<Action> plan = BuildPlan(fp->body, gemms, path_collector);
+  std::vector<Action> plan = BuildPlan(fp->body, gemms, all_gemm_readers,
+                                       path_collector, externally_read_storage);
 
   // Phase 4: drive the rewrite from the plan.
   LegalizeSunmmioGemmRewriter rewriter(target.value(), cfg, plan);

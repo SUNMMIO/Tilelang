@@ -1328,8 +1328,8 @@ def assert_hoisted_shadow_structure(mod, *, expected_acc_offset, expected_pairs,
       * one shadow buffer per pair, shared.rsram, co-located in the same
         Block as its A_dist;
       * one snapshot copy per pair at outer scope (dst = shadow, no
-        src_offset_byte) — it replaces the removed original writer. The
-        snapshot is always a plain Copy (it just freezes the source),
+        src_offset_byte), alongside the original writer for unexpanded readers.
+        The snapshot is always a plain Copy (it just freezes the source),
         even when the writer itself is an Allgather;
       * the 4-statement loop body, restore/restage being `writer_op` calls
         that read the shadow.
@@ -1554,6 +1554,49 @@ def test_legalize_sunmmio_gemm_multi_consumer_non_groupable():
     copy_calls = find_call_args(mod, "tl.tileop.copy")
     src_annotated = [c for c in copy_calls if "src_offset_byte" in c[1]]
     assert len(src_annotated) == 2, f"non-groupable multi-consumer should emit one restage per consumer (2 total), got {len(src_annotated)}"
+
+
+def test_legalize_sunmmio_gemm_singleton_branch_consumers():
+    """Both singleton branches must restore A and execute both BF16 stripes."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((128, 128), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((128, 128), T.placement.full_shard(0, 1), "bfloat16", layout=layout),
+        B: T.MeshTensor((128, 128), T.placement.full_shard(0, 1), "bfloat16", layout=layout),
+        C: T.MeshTensor((128, 128), T.placement.full_shard(0, 1), "float32", layout=layout),
+    ):
+        with T.Kernel(T.mesh_ncores()) as cid:
+            A_shared = T.alloc_shared((32, 32), "bfloat16")
+            B_shared = T.alloc_shared((32, 32), "bfloat16")
+            C_shared = T.alloc_shared((32, 32), "float32")
+            T.copy(A[0:32, 0:32], A_shared)
+            T.copy(B[0:32, 0:32], B_shared)
+            if cid > 0:
+                T.gemm(A_shared, B_shared, C_shared, clear_accum=True)
+            else:
+                T.gemm(A_shared, B_shared, C_shared)
+            T.copy(C_shared, C[0:32, 0:32])
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    assert count_call_op(mod, "tl.tileop.gemm_py") == 4
+    branches = []
+    tvm.tir.stmt_functor.post_order_visit(
+        mod["main"].body, lambda node: branches.append(node) if isinstance(node, tvm.tir.IfThenElse) else None
+    )
+    assert len(branches) == 1
+    for branch in (branches[0].then_case, branches[0].else_case):
+        assert isinstance(branch, tvm.tir.SeqStmt)
+        calls = [stmt.value for stmt in branch.seq]
+        assert [call.op.name for call in calls] == ["tl.tileop.copy", "tl.tileop.gemm_py", "tl.tileop.copy", "tl.tileop.gemm_py"]
+        assert _copy_buf(calls[0], 1).same_as(_copy_buf(calls[1], 0))
+        assert _copy_buf(calls[2], 1).same_as(_copy_buf(calls[3], 0))
+        assert int(calls[2].annotations["src_offset_byte"]) == 1024
+        assert (int(calls[1].args[19]) if len(calls[1].args) > 19 else 0) == 0
+        assert int(calls[3].args[19]) == 2048
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
 
 
 def bf16_flash_attention_shaped(M=128, N=128, K=128, block_M=32, block_N=32, block_K=32, dtype="bfloat16", accum_dtype="float32"):
@@ -1815,6 +1858,845 @@ def test_legalize_sunmmio_gemm_rejects_diverging_scopes():
     mod = tvm.IRModule({"main": func})
     with pytest.raises(Exception, match="writer and gemm are in diverging scope paths"):
         apply_pipeline_up_to_legalize_gemm(mod)
+
+
+@pytest.mark.parametrize("branch_pv", [False, True])
+def test_legalize_sunmmio_gemm_reused_activation_uses_reaching_writer(branch_pv):
+    """Reusing Q's ASRAM for P must restage probabilities for both PV stripes."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        Q: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        K: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        O: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+    ):
+        with T.Kernel() as _cid:
+            q_stage = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            scores = T.alloc_shared((32, 32), "bfloat16")
+            out = T.alloc_shared((32, 32), "bfloat16")
+            T.copy(Q, q_stage)
+            T.copy(K, weight)
+            for k in T.serial(2):
+                T.copy(q_stage, activation)
+                T.gemm(activation, weight, scores, clear_accum=True)
+                T.copy(scores, activation)
+                if branch_pv:
+                    if k == 0:
+                        T.gemm(activation, weight, out, clear_accum=True)
+                    else:
+                        T.gemm(activation, weight, out)
+                else:
+                    T.gemm(activation, weight, out, clear_accum=True)
+            T.copy(out, O)
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    current_source = {}
+    observed = []
+
+    def check(node):
+        if not isinstance(node, tvm.tir.Call):
+            return
+        if node.op.name == "tl.tileop.copy" and _copy_buf(node, 1).name == "activation":
+            current_source["activation"] = _copy_buf(node, 0).name
+        elif node.op.name == "tl.tileop.gemm_py":
+            expected = "q_stage" if _copy_buf(node, 2).name == "scores" else "scores"
+            actual = current_source.get("activation")
+            assert actual == expected, f"{_copy_buf(node, 2).name} consumes {actual}; expected {expected}"
+            observed.append(actual)
+
+    tvm.tir.stmt_functor.post_order_visit(mod["main"].body, check)
+    assert observed.count("q_stage") == 2
+    assert observed.count("scores") == (4 if branch_pv else 2)
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
+@pytest.mark.parametrize("consumer_kind", ["single", "group", "branch"])
+def test_legalize_sunmmio_gemm_reused_activation_keeps_each_writer_shadow(consumer_kind):
+    """Two dirty reaching sources sharing ASRAM need two separately owned snapshots."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        B: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        C: T.MeshTensor((32, 32), T.placement.replicated(), "float32", layout=layout),
+    ):
+        with T.Kernel(T.mesh_ncores()) as cid:
+            first = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            second = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            out = T.alloc_shared((32, 32), "float32")
+            T.copy(A, first)
+            T.copy(B, second)
+            T.copy(B, weight)
+            T.copy(first, activation)
+            T.copy(B, first)
+            if consumer_kind == "branch":
+                if cid == 0:
+                    T.gemm(activation, weight, out, clear_accum=True)
+                else:
+                    T.gemm(activation, weight, out)
+            else:
+                T.gemm(activation, weight, out, clear_accum=True)
+                if consumer_kind == "group":
+                    T.gemm(activation, weight, out)
+            T.copy(second, activation)
+            T.copy(A, second)
+            if consumer_kind == "branch":
+                if cid == 0:
+                    T.gemm(activation, weight, out, clear_accum=True)
+                else:
+                    T.gemm(activation, weight, out)
+            else:
+                T.gemm(activation, weight, out, clear_accum=True)
+                if consumer_kind == "group":
+                    T.gemm(activation, weight, out)
+            T.copy(out, C)
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    shadows = _collect_legalize_stage_shadows(mod)
+    assert len(shadows) == 2, "each reaching writer needs its own retained source snapshot"
+    assert not shadows[0][0].same_as(shadows[1][0])
+    assert shadows[0][1].same_as(shadows[1][1])
+    copy_calls = find_call_args(mod, "tl.tileop.copy")
+    snapshots = {}
+    for args, _ in copy_calls:
+        source, destination = args[0].args[0].buffer, args[1].args[0].buffer
+        if any(destination.same_as(shadow) for shadow, _ in shadows):
+            snapshots[source.name] = destination
+    assert set(snapshots) == {"first", "second"}
+    restored = []
+    for args, annotations in copy_calls:
+        if "src_offset_byte" in annotations:
+            source = args[0].args[0].buffer
+            restored.append(next(name for name, shadow in snapshots.items() if source.same_as(shadow)))
+    repeats = 1 if consumer_kind == "single" else 2
+    assert restored == ["first"] * repeats + ["second"] * repeats
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
+@pytest.mark.parametrize("mutation", ["fill", "gemm", "final_gemm", "opaque", "opaque_expr"])
+def test_legalize_sunmmio_gemm_snapshots_all_source_mutations(mutation):
+    """Both activation stripes retain the value copied before a source mutation."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        Q: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        K: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        O: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+    ):
+        with T.Kernel():
+            first = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            second = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            other_activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            out = T.alloc_shared((32, 32), "bfloat16")
+            T.copy(Q, first)
+            T.copy(K, second)
+            T.copy(K, weight)
+            T.copy(first, activation)
+            if mutation == "fill":
+                T.clear(first)
+            elif mutation == "gemm":
+                T.copy(second, other_activation)
+                T.gemm(other_activation, weight, first, clear_accum=True)
+            elif mutation == "opaque":
+                T.call_extern("int32", "may_mutate_source")
+            elif mutation == "opaque_expr":
+                out[0, 0] = T.call_extern("bfloat16", "may_mutate_source")
+            if mutation == "final_gemm":
+                T.gemm(activation, weight, first, clear_accum=True)
+                T.copy(first, O)
+            else:
+                T.gemm(activation, weight, out, clear_accum=True)
+                T.copy(out, O)
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    shadows = [(s, a) for s, a in _collect_legalize_stage_shadows(mod) if a.name == "activation"]
+    assert len(shadows) == 1, f"{mutation} can overwrite the copied source before restaging"
+    shadow, _ = shadows[0]
+    current_source = None
+    target_stripes = 0
+
+    def check(node):
+        nonlocal current_source, target_stripes
+        if not isinstance(node, tvm.tir.Call):
+            return
+        if node.op.name == "tl.tileop.copy" and _copy_buf(node, 1).name == "activation":
+            current_source = _copy_buf(node, 0)
+        elif node.op.name == "tl.tileop.gemm_py" and _copy_buf(node, 0).name == "activation":
+            assert current_source is not None and current_source.same_as(shadow)
+            target_stripes += 1
+
+    tvm.tir.stmt_functor.post_order_visit(mod["main"].body, check)
+    assert target_stripes == 2
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
+@pytest.mark.parametrize("writer_block", [False, True])
+def test_legalize_sunmmio_gemm_shadow_keeps_writer_for_small_reader(writer_block):
+    """Snapshot insertion must not remove the definition used by an unexpanded GEMM."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        Q: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        K: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        O: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+    ):
+        with T.Kernel():
+            first = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            small_out = T.alloc_shared((16, 32), "bfloat16")
+            out = T.alloc_shared((32, 32), "bfloat16")
+            T.copy(Q, first)
+            T.copy(K, weight)
+            if writer_block:
+                with T.block("writer_block"):
+                    T.copy(first, activation)
+            else:
+                T.copy(first, activation)
+            T.gemm(activation[0:16, :], weight, small_out, clear_accum=True)
+            T.copy(K, first)
+            T.gemm(activation, weight, out, clear_accum=True)
+            T.copy(small_out, O[0:16, :])
+            T.copy(out[16:32, :], O[16:32, :])
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    current_source = None
+    initialized_shadows = set()
+    small_readers = 0
+
+    def check(node):
+        nonlocal current_source, small_readers
+        if not isinstance(node, tvm.tir.Call):
+            return
+        if node.op.name == "tl.tileop.copy":
+            destination = _copy_buf(node, 1).name
+            if destination.endswith("_legalize_stage"):
+                initialized_shadows.add(destination)
+            elif destination == "activation":
+                current_source = _copy_buf(node, 0).name
+        elif node.op.name == "tl.tileop.gemm_py" and int(node.args[5]) == 16:
+            assert current_source == "first", "snapshot insertion removed the small GEMM's activation definition"
+            small_readers += 1
+        elif node.op.name == "tl.tileop.gemm_py":
+            assert current_source in initialized_shadows, "large GEMM reads an uninitialized source snapshot"
+
+    tvm.tir.stmt_functor.post_order_visit(mod["main"].body, check)
+    assert small_readers == 1
+    assert count_call_op(mod, "tl.tileop.gemm_py") == 3
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
+@pytest.mark.parametrize("small_inside_loop", [False, True])
+def test_legalize_sunmmio_gemm_direct_reissue_keeps_writer_for_small_reader(small_inside_loop):
+    """A clean hoisted writer must still initialize a small GEMM before the restore."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        Q: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        K: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        O: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+    ):
+        with T.Kernel():
+            first = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            small_out = T.alloc_shared((16, 32), "bfloat16")
+            out = T.alloc_shared((32, 32), "bfloat16")
+            T.copy(Q, first)
+            T.copy(K, weight)
+            T.copy(first, activation)
+            if not small_inside_loop:
+                T.gemm(activation[0:16, :], weight, small_out, clear_accum=True)
+            for _ in T.serial(2):
+                if small_inside_loop:
+                    T.gemm(activation[0:16, :], weight, small_out, clear_accum=True)
+                T.gemm(activation, weight, out, clear_accum=True)
+            T.copy(small_out, O[0:16, :])
+            T.copy(out[16:32, :], O[16:32, :])
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    outer = _kernel_body_seq(mod)
+    outer_writes = [_copy_buf(call, 1).name for _, call in _iter_calls_in_stmt(outer, "tl.tileop.copy")]
+    assert "activation" in outer_writes, "the clean hoisted writer was removed before the small GEMM"
+    loops = []
+    tvm.tir.stmt_functor.post_order_visit(mod["main"].body, lambda node: loops.append(node) if isinstance(node, tvm.tir.For) else None)
+    assert len(loops) == 1
+    seq = list(loops[0].body.seq)
+    current_stripe = 0
+    small_readers = 0
+    activation_copy_offsets = []
+    for stmt in seq:
+        if not isinstance(stmt, tvm.tir.Evaluate) or not isinstance(stmt.value, tvm.tir.Call):
+            continue
+        call = stmt.value
+        if call.op.name == "tl.tileop.copy" and _copy_buf(call, 1).name == "activation":
+            current_stripe = 1 if "src_offset_byte" in call.annotations else 0
+            activation_copy_offsets.append(current_stripe)
+        elif call.op.name == "tl.tileop.gemm_py" and int(call.args[5]) == 16:
+            assert current_stripe == 0
+            small_readers += 1
+
+    assert small_readers == int(small_inside_loop)
+    assert activation_copy_offsets == ([0, 1, 0] if small_inside_loop else [0, 1])
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
+def test_legalize_sunmmio_gemm_hoists_restore_out_of_nested_large_gemm_loop():
+    """An outer-loop reader needs one restore after the inner loop, not per inner iteration."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        Q: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        K: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        O: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+    ):
+        with T.Kernel():
+            first = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            small_out = T.alloc_shared((16, 32), "bfloat16")
+            out = T.alloc_shared((32, 32), "bfloat16")
+            T.copy(Q, first)
+            T.copy(K, weight)
+            T.copy(first, activation)
+            for _ in T.serial(2):
+                T.gemm(activation[0:16, :], weight, small_out, clear_accum=True)
+                for _ in T.serial(3):
+                    T.gemm(activation, weight, out, clear_accum=True)
+            T.copy(small_out, O[0:16, :])
+            T.copy(out[16:32, :], O[16:32, :])
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    loops = []
+    tvm.tir.stmt_functor.post_order_visit(mod["main"].body, lambda node: loops.append(node) if isinstance(node, tvm.tir.For) else None)
+    assert len(loops) == 2
+    inner = next(loop for loop in loops if int(loop.extent) == 3)
+    outer = next(loop for loop in loops if int(loop.extent) == 2)
+
+    inner_offsets = [
+        1 if "src_offset_byte" in call.annotations else 0
+        for _, call in _iter_calls_in_stmt(inner.body, "tl.tileop.copy")
+        if _copy_buf(call, 1).name == "activation"
+    ]
+    assert inner_offsets == [0, 1]
+    outer_seq = list(outer.body.seq)
+    inner_index = next(i for i, stmt in enumerate(outer_seq) if isinstance(stmt, tvm.tir.For))
+    restore = outer_seq[inner_index + 1]
+    assert isinstance(restore, tvm.tir.Evaluate) and isinstance(restore.value, tvm.tir.Call)
+    assert restore.value.op.name == "tl.tileop.copy"
+    assert _copy_buf(restore.value, 1).name == "activation"
+    assert "src_offset_byte" not in restore.value.annotations
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
+def test_legalize_sunmmio_gemm_keeps_loop_variant_restore_inside_loop():
+    """A writer indexed by the inner loop cannot be cloned after that loop."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        K: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        O: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+    ):
+        with T.Kernel():
+            source = T.alloc_shared((96, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            small_out = T.alloc_shared((16, 32), "bfloat16")
+            out = T.alloc_shared((32, 32), "bfloat16")
+            T.clear(source)
+            T.copy(K, weight)
+            for _ in T.serial(2):
+                for j in T.serial(3):
+                    T.copy(source[j * 32 : (j + 1) * 32, :], activation)
+                    T.gemm(activation, weight, out, clear_accum=True)
+                T.gemm(activation[0:16, :], weight, small_out, clear_accum=True)
+            T.copy(small_out, O[0:16, :])
+            T.copy(out[16:32, :], O[16:32, :])
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    loops = []
+    tvm.tir.stmt_functor.post_order_visit(mod["main"].body, lambda node: loops.append(node) if isinstance(node, tvm.tir.For) else None)
+    inner = next(loop for loop in loops if int(loop.extent) == 3)
+    outer = next(loop for loop in loops if int(loop.extent) == 2)
+    inner_offsets = [
+        1 if "src_offset_byte" in call.annotations else 0
+        for _, call in _iter_calls_in_stmt(inner.body, "tl.tileop.copy")
+        if _copy_buf(call, 1).name == "activation"
+    ]
+    assert inner_offsets == [0, 1, 0]
+    outer_seq = list(outer.body.seq)
+    inner_index = next(i for i, stmt in enumerate(outer_seq) if isinstance(stmt, tvm.tir.For))
+    assert not _is_call(outer_seq[inner_index + 1], tvm.tir.op.Op.get("tl.tileop.copy"))
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
+@pytest.mark.parametrize("nested_loop", [False, True])
+def test_legalize_sunmmio_gemm_keeps_branch_dependent_restore_inside_loop(nested_loop):
+    """A restore cannot leave a branch nested inside the loop it exits."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        B: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        C: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+    ):
+        with T.Kernel(T.mesh_ncores()) as cid:
+            first = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            second = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            large_out = T.alloc_shared((32, 32), "bfloat16")
+            small_out = T.alloc_shared((16, 32), "bfloat16")
+            T.copy(A, first)
+            T.copy(B, second)
+            T.copy(B, weight)
+            for _ in T.serial(3):
+                if cid == 0:
+                    if nested_loop:
+                        for _ in T.serial(2):
+                            T.copy(first, activation)
+                            T.gemm(activation, weight, large_out, clear_accum=True)
+                    else:
+                        T.copy(first, activation)
+                        T.gemm(activation, weight, large_out, clear_accum=True)
+                else:
+                    if nested_loop:
+                        for _ in T.serial(2):
+                            T.copy(second, activation)
+                            T.gemm(activation, weight, large_out, clear_accum=True)
+                    else:
+                        T.copy(second, activation)
+                        T.gemm(activation, weight, large_out, clear_accum=True)
+            T.gemm(activation[0:16, :], weight, small_out, clear_accum=True)
+            T.copy(small_out, C[0:16, :])
+            T.copy(large_out[16:32, :], C[16:32, :])
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    outer = list(_kernel_body_seq(mod).seq)
+    loop_index = next(i for i, stmt in enumerate(outer) if isinstance(stmt, tvm.tir.For))
+    unconditional_restores = [
+        _copy_buf(stmt.value, 0).name
+        for stmt in outer[loop_index + 1 :]
+        if isinstance(stmt, tvm.tir.Evaluate)
+        and isinstance(stmt.value, tvm.tir.Call)
+        and stmt.value.op.name == "tl.tileop.copy"
+        and _copy_buf(stmt.value, 1).name == "activation"
+    ]
+    assert not unconditional_restores
+
+    branches = []
+    tvm.tir.stmt_functor.post_order_visit(
+        outer[loop_index], lambda node: branches.append(node) if isinstance(node, tvm.tir.IfThenElse) else None
+    )
+    assert len(branches) == 1
+    for source, branch in zip(("first", "second"), (branches[0].then_case, branches[0].else_case)):
+        activation_copies = []
+        tvm.tir.stmt_functor.post_order_visit(
+            branch,
+            lambda node, copies=activation_copies: copies.append(node.value)
+            if isinstance(node, tvm.tir.Evaluate)
+            and isinstance(node.value, tvm.tir.Call)
+            and node.value.op.name == "tl.tileop.copy"
+            and _copy_buf(node.value, 1).name == "activation"
+            else None,
+        )
+        assert activation_copies
+        assert _copy_buf(activation_copies[-1], 0).name == source
+        assert "src_offset_byte" not in activation_copies[-1].annotations
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
+@pytest.mark.parametrize("nested_loop", [False, True])
+def test_legalize_sunmmio_gemm_preserves_activation_when_loop_skipped(nested_loop):
+    """A zero-trip loop must preserve the activation initialized before it."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        B: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        C: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        n: T.int32,
+    ):
+        with T.Kernel():
+            first = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            second = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            large_out = T.alloc_shared((32, 32), "bfloat16")
+            small_out = T.alloc_shared((16, 32), "bfloat16")
+            T.copy(A, first)
+            T.copy(B, second)
+            T.copy(B, weight)
+            T.copy(first, activation)
+            if nested_loop:
+                for _ in T.serial(2):
+                    for _ in T.serial(n):
+                        T.copy(second, activation)
+                        T.gemm(activation, weight, large_out, clear_accum=True)
+            else:
+                for _ in T.serial(n):
+                    T.copy(second, activation)
+                    T.gemm(activation, weight, large_out, clear_accum=True)
+            T.gemm(activation[0:16, :], weight, small_out, clear_accum=True)
+            T.copy(small_out, C[0:16, :])
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    assert tvm.tir.analysis.verify_well_formed(mod)
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+    for trip_count, expected_source in ((0, "first"), (1, "second")):
+        # Specialize only after legalization so the pass must handle n == 0.
+        specialized = mod["main"].specialize({mod["main"].params[-1]: trip_count})
+        specialized_mod = tl.transform.Simplify()(tvm.IRModule({"main": specialized}))
+        current_source = None
+        current_stripe = None
+        observed_reader = False
+
+        def check(node, expected_source=expected_source):
+            nonlocal current_source, current_stripe, observed_reader
+            if not isinstance(node, tvm.tir.Evaluate) or not isinstance(node.value, tvm.tir.Call):
+                return
+            node = node.value
+            if node.op.name == "tl.tileop.copy" and _copy_buf(node, 1).name == "activation":
+                current_source = _copy_buf(node, 0).name
+                current_stripe = 1 if "src_offset_byte" in node.annotations else 0
+            elif node.op.name == "tl.tileop.gemm_py" and int(node.args[5]) == 16:
+                assert (current_source, current_stripe) == (expected_source, 0)
+                observed_reader = True
+
+        tvm.tir.stmt_functor.post_order_visit(specialized_mod["main"].body, check)
+        assert observed_reader
+
+
+def test_legalize_sunmmio_gemm_keeps_block_local_source_restore_in_scope():
+    """A restore using a Block allocation cannot move after its enclosing loop."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        B: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        C: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+    ):
+        with T.Kernel():
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            large_out = T.alloc_shared((32, 32), "bfloat16")
+            small_out = T.alloc_shared((16, 32), "bfloat16")
+            T.copy(B, weight)
+            for _ in T.serial(2):
+                with T.block("source_scope"):
+                    source = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+                    T.copy(A, source)
+                    T.copy(source, activation)
+                    T.gemm(activation, weight, large_out, clear_accum=True)
+            T.gemm(activation[0:16, :], weight, small_out, clear_accum=True)
+            T.copy(small_out, C[0:16, :])
+            T.copy(large_out[16:32, :], C[16:32, :])
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    assert tvm.tir.analysis.verify_well_formed(mod)
+
+    loops = []
+    tvm.tir.stmt_functor.post_order_visit(mod["main"].body, lambda node: loops.append(node) if isinstance(node, tvm.tir.For) else None)
+    assert len(loops) == 1
+    source_blocks = []
+    tvm.tir.stmt_functor.post_order_visit(
+        loops[0].body,
+        lambda node: source_blocks.append(node) if isinstance(node, tvm.tir.Block) and node.name_hint == "source_scope" else None,
+    )
+    assert len(source_blocks) == 1
+    activation_offsets = [
+        1 if "src_offset_byte" in call.annotations else 0
+        for _, call in _iter_calls_in_stmt(source_blocks[0].body, "tl.tileop.copy")
+        if _copy_buf(call, 1).name == "activation"
+    ]
+    assert activation_offsets == [0, 1, 0]
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
+@pytest.mark.parametrize("reader_kind", ["copy", "gemm_b", "buffer_load"])
+def test_legalize_sunmmio_gemm_restores_before_external_reader(reader_kind):
+    """Every observable A-buffer read after pass-2 must see logical stripe zero."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        B: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        C: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+    ):
+        with T.Kernel():
+            source = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            large_out = T.alloc_shared((32, 32), "bfloat16")
+            saved = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            reader_a = T.alloc_shared((16, 32), "bfloat16")
+            reader_out = T.alloc_shared((16, 32), "bfloat16")
+            T.copy(A, source)
+            T.copy(B, weight)
+            T.copy(A[0:16, :], reader_a)
+            T.copy(source, activation)
+            T.gemm(activation, weight, large_out, clear_accum=True)
+            if reader_kind in ("copy", "buffer_load"):
+                T.copy(activation, saved)
+                T.copy(saved, C)
+            else:
+                T.gemm(reader_a, weight, reader_out, clear_accum=True)
+                T.copy(reader_out, C[0:16, :])
+                T.copy(large_out[16:32, :], C[16:32, :])
+
+    prepared = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}), legalize=False)
+    large_gemms = []
+    tvm.tir.stmt_functor.post_order_visit(
+        prepared["main"].body,
+        lambda node: large_gemms.append(node)
+        if isinstance(node, tvm.tir.Call) and node.op.name == "tl.tileop.gemm_py" and int(node.args[5]) == 32
+        else None,
+    )
+    assert len(large_gemms) == 1
+    a_region = large_gemms[0].args[0]
+    a_buffer = _copy_buf(large_gemms[0], 0)
+
+    replaced = False
+
+    if reader_kind == "buffer_load":
+
+        def use_gemm_a_for_buffer_load(node):
+            nonlocal replaced
+            if replaced or not isinstance(node, tvm.tir.Evaluate) or not isinstance(node.value, tvm.tir.Call):
+                return None
+            call = node.value
+            if call.op.name != "tl.tileop.copy" or _copy_buf(call, 1).name != "saved":
+                return None
+            saved_buffer = _copy_buf(call, 1)
+            replaced = True
+            return tvm.tir.BufferStore(
+                saved_buffer,
+                tvm.tir.BufferLoad(a_buffer, [0, 0]),
+                [0, 0],
+            )
+
+        body = tvm.tir.stmt_functor.ir_transform(prepared["main"].body, None, use_gemm_a_for_buffer_load, ["tir.Evaluate"])
+    else:
+
+        def use_gemm_a_for_external_call(node):
+            nonlocal replaced
+            if replaced or not isinstance(node, tvm.tir.Call):
+                return None
+            if reader_kind == "copy":
+                if node.op.name != "tl.tileop.copy" or _copy_buf(node, 1).name != "saved":
+                    return None
+                arg_index = 0
+            else:
+                if node.op.name != "tl.tileop.gemm_py" or int(node.args[5]) != 16:
+                    return None
+                arg_index = 1
+            args = list(node.args)
+            args[arg_index] = a_region
+            replaced = True
+            return tvm.tir.Call(node.dtype, node.op, args, dict(node.annotations), node.span)
+
+        body = tvm.tir.stmt_functor.ir_transform(prepared["main"].body, None, use_gemm_a_for_external_call, ["tir.Call"])
+    assert replaced
+    prepared = tvm.IRModule({"main": prepared["main"].with_body(body)})
+    mod = _run_legalize_gemm_again(prepared)
+    assert tvm.tir.analysis.verify_well_formed(mod)
+    seq = list(_kernel_body_seq(mod).seq)
+    current_stripe = None
+    observed_reader = False
+    for stmt in seq:
+        if isinstance(stmt, tvm.tir.Evaluate) and isinstance(stmt.value, tvm.tir.Call):
+            call = stmt.value
+            if call.op.name == "tl.tileop.copy" and _copy_buf(call, 1).same_as(a_buffer):
+                current_stripe = 1 if "src_offset_byte" in call.annotations else 0
+            elif (
+                reader_kind == "copy"
+                and (call.op.name == "tl.tileop.copy" and _copy_buf(call, 0).same_as(a_buffer) and _copy_buf(call, 1).name == "saved")
+                or (
+                    reader_kind == "gemm_b"
+                    and call.op.name == "tl.tileop.gemm_py"
+                    and int(call.args[5]) == 16
+                    and _copy_buf(call, 1).same_as(a_buffer)
+                )
+            ):
+                assert current_stripe == 0
+                observed_reader = True
+        elif (
+            reader_kind == "buffer_load"
+            and isinstance(stmt, tvm.tir.BufferStore)
+            and isinstance(stmt.value, tvm.tir.BufferLoad)
+            and stmt.value.buffer.same_as(a_buffer)
+        ):
+            assert current_stripe == 0
+            observed_reader = True
+
+    assert observed_reader
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
+@pytest.mark.parametrize("group_size", [1, 2])
+def test_legalize_sunmmio_gemm_restores_stripe_zero_for_later_small_reader(group_size):
+    """A small GEMM after a legalized consumer must not observe stripe-1 data."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        Q: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        K: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        O: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+    ):
+        with T.Kernel():
+            first = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            small_out = T.alloc_shared((16, 32), "bfloat16")
+            out = T.alloc_shared((32, 32), "bfloat16")
+            other_out = T.alloc_shared((32, 32), "bfloat16")
+            T.copy(Q, first)
+            T.copy(K, weight)
+            T.copy(first, activation)
+            T.gemm(activation, weight, out, clear_accum=True)
+            if group_size == 2:
+                T.gemm(activation, weight, other_out, clear_accum=True)
+            T.gemm(activation[0:16, :], weight, small_out, clear_accum=True)
+            T.copy(small_out, O[0:16, :])
+            T.copy(out[16:32, :], O[16:32, :])
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    seq = list(_kernel_body_seq(mod).seq)
+    current_stripe = None
+    small_readers = 0
+    for stmt in seq:
+        if not isinstance(stmt, tvm.tir.Evaluate) or not isinstance(stmt.value, tvm.tir.Call):
+            continue
+        call = stmt.value
+        if call.op.name == "tl.tileop.copy" and _copy_buf(call, 1).name == "activation":
+            current_stripe = 1 if "src_offset_byte" in call.annotations else 0
+        elif call.op.name == "tl.tileop.gemm_py" and int(call.args[5]) == 16:
+            assert current_stripe == 0, "the small GEMM observed the legalized consumer's stripe-1 staging"
+            small_readers += 1
+
+    assert small_readers == 1
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
+def test_legalize_sunmmio_gemm_restores_after_divergent_writers_for_joined_small_reader():
+    """A post-join small GEMM must get stripe-0 from either branch writer."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((32, 32), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        B: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+        C: T.MeshTensor((32, 32), T.placement.replicated(), "bfloat16", layout=layout),
+    ):
+        with T.Kernel(T.mesh_ncores()) as cid:
+            first = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            second = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32), "bfloat16")
+            weight = T.alloc_shared((32, 32), "bfloat16")
+            large_out = T.alloc_shared((32, 32), "bfloat16")
+            small_out = T.alloc_shared((16, 32), "bfloat16")
+            T.copy(A, first)
+            T.copy(B, second)
+            T.copy(B, weight)
+            if cid == 0:
+                T.copy(first, activation)
+                T.gemm(activation, weight, large_out, clear_accum=True)
+            else:
+                T.copy(second, activation)
+                T.gemm(activation, weight, large_out, clear_accum=True)
+            T.gemm(activation[0:16, :], weight, small_out, clear_accum=True)
+            T.copy(small_out, C[0:16, :])
+            T.copy(large_out[16:32, :], C[16:32, :])
+
+    mod = apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
+    branches = []
+    tvm.tir.stmt_functor.post_order_visit(
+        mod["main"].body, lambda node: branches.append(node) if isinstance(node, tvm.tir.IfThenElse) else None
+    )
+    assert len(branches) == 1
+    for branch in (branches[0].then_case, branches[0].else_case):
+        seq = list(branch.seq)
+        last = seq[-1]
+        assert isinstance(last, tvm.tir.Evaluate) and isinstance(last.value, tvm.tir.Call)
+        assert last.value.op.name == "tl.tileop.copy"
+        assert _copy_buf(last.value, 1).name == "activation"
+        assert "src_offset_byte" not in last.value.annotations
+    tvm.ir.assert_structural_equal(mod, _run_legalize_gemm_again(mod))
+
+
+def test_legalize_sunmmio_gemm_rejects_hoisted_collective_in_one_sided_branch():
+    """The pass must not move a mesh collective under a core-dependent branch."""
+    from tilelang.layout import make_zz_layout
+
+    layout = make_zz_layout((128, 128), [0, 1], (32, 32))
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((128, 128), T.placement.full_shard(0, 1), "bfloat16", layout=layout),
+        B: T.MeshTensor((128, 128), T.placement.full_shard(0, 1), "bfloat16", layout=layout),
+        C: T.MeshTensor((128, 128), T.placement.full_shard(0, 1), "float32", layout=layout),
+    ):
+        with T.Kernel(T.mesh_ncores()) as cid:
+            send = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            activation = T.alloc_shared((32, 32 * T.mesh_ncols()), "bfloat16")
+            weight_send = T.alloc_shared((32, 32), "bfloat16", scope="shared.rsram")
+            weight = T.alloc_shared((32 * T.mesh_nrows(), 32), "bfloat16")
+            out = T.alloc_shared((32, 32), "float32")
+            T.copy(A[0:32, 0:32], send)
+            T.comm.all_gather(send, activation, direction="h", axis=-1)
+            T.copy(B[0:32, 0:32], weight_send)
+            T.comm.all_gather(weight_send, weight, direction="v", axis=0)
+            if cid == 0:
+                T.gemm(activation, weight, out, clear_accum=True)
+            T.copy(out, C[0:32, 0:32])
+
+    with pytest.raises(Exception, match="cannot replay collective writer inside a conditional GEMM scope"):
+        apply_pipeline_up_to_legalize_gemm(tvm.IRModule({"main": main}))
 
 
 if __name__ == "__main__":
