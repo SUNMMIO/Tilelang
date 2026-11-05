@@ -20,8 +20,6 @@ from tilelang._typing import BufferLikeType
 from tilelang.language.mesh_tensor import _unwrap_mesh_tensor
 from tilelang.utils.language import prim_expr_contains_mesh_symbol, prim_expr_equal, to_buffer_region
 
-from tilelang.carver.arch.driver import get_sunmmio_device_mesh_config
-
 # Mirror of kAttrSrcOffsetByte in src/target/sunmmio_utils.h. Resolved at
 # import time via FFI so the single source of truth stays in C++.
 ATTR_SRC_OFFSET_BYTE = str(tvm_ffi.get_global_func("tl.target.GetAttrSrcOffsetByte")())
@@ -70,18 +68,20 @@ class _PreparedCommRegion:
     region: tir.PrimExpr | tir.BufferRegion
 
 
-def get_target_mesh_shape() -> dict[str, int]:
-    """Get the target mesh shape as a dictionary with 'nrow' and 'ncol' keys."""
-    nrow, ncol = get_sunmmio_device_mesh_config()
-    return {"nrow": nrow, "ncol": ncol}
+def get_target_mesh_shape() -> dict[str, tir.PrimExpr]:
+    """Return symbolic mesh dimensions resolved from the bound target later."""
+    return {"nrow": T.nrows(), "ncol": T.ncols()}
 
 
-def _check_core_coord(coord: CoreCoord, limit: int, name: str):
+def _check_core_coord(coord: CoreCoord, limit: tir.PrimExpr, name: str):
     if isinstance(coord, bool):
         raise TypeError(f"{name} must be an integer or TIR PrimExpr, got bool.")
     coord_int = _const_int(coord)
     if coord_int is not None:
-        assert 0 <= coord_int < limit, f"{name} {coord_int} out of bounds for limit {limit}."
+        assert coord_int >= 0, f"{name} {coord_int} must be non-negative."
+        limit_int = _const_int(limit)
+        if limit_int is not None:
+            assert coord_int < limit_int, f"{name} {coord_int} out of bounds for limit {limit_int}."
     elif not isinstance(coord, tir.PrimExpr):
         raise TypeError(f"{name} must be an integer or TIR PrimExpr, got {type(coord)}.")
 
@@ -475,13 +475,24 @@ def _normalize_known_region(spec: _CommRegionSpec, op_name: str) -> _NormalizedC
     return _clip_region_to_shape(spec, spec.mins, list(spec.extents), op_name)
 
 
-def _allgather_recv_num(direction: str) -> int:
+def _allgather_recv_num(direction: str) -> tir.PrimExpr:
     mesh_shape = get_target_mesh_shape()
     if direction in ("horizontal", "h"):
         return mesh_shape["ncol"]
     if direction in ("vertical", "v"):
         return mesh_shape["nrow"]
     return mesh_shape["nrow"] * mesh_shape["ncol"]
+
+
+def _allgather_validation_recv_num(direction: str) -> tir.IntImm:
+    nrow, ncol = _target_utils.get_sunmmio_target_mesh_config()
+    if direction in ("horizontal", "h"):
+        recv_num = ncol
+    elif direction in ("vertical", "v"):
+        recv_num = nrow
+    else:
+        recv_num = nrow * ncol
+    return tir.IntImm("int32", recv_num)
 
 
 def _normalize_allgather_axis(axis: int | None, send_rank: int) -> int:
@@ -505,27 +516,28 @@ def _allgather_gather_dim(axis: int) -> int:
 
 def _divide_allgather_extent(
     extent: tir.PrimExpr,
-    divisor: int,
+    divisor: tir.PrimExpr,
     op_name: str,
     dim: int,
     *,
     require_divisible: bool,
 ) -> tir.PrimExpr:
     extent_int = _const_int(extent)
-    if extent_int is not None:
-        if require_divisible and extent_int % divisor != 0:
+    divisor_int = _const_int(divisor)
+    if extent_int is not None and divisor_int is not None:
+        if require_divisible and extent_int % divisor_int != 0:
             raise ValueError(
                 f"{op_name} recv extent at gather dim {dim} must be divisible by "
-                f"the number of receiving cores ({divisor}), but got {extent}."
+                f"the number of receiving cores ({divisor_int}), but got {extent}."
             )
         dtype = extent.dtype if hasattr(extent, "dtype") else "int32"
-        return tir.IntImm(dtype, extent_int // divisor)
+        return tir.IntImm(dtype, extent_int // divisor_int)
     return tir.floordiv(extent, divisor)
 
 
 def _allgather_slot_region(
     recv: _NormalizedCommRegion,
-    recv_num: int,
+    recv_num: tir.PrimExpr,
     axis: int,
     op_name: str,
     *,
@@ -545,7 +557,7 @@ def _allgather_slot_region(
     return _NormalizedCommRegion(recv.spec, recv.mins, slot_extents)
 
 
-def _allgather_recv_extents(slot_extents: list[tir.PrimExpr], recv_num: int, axis: int) -> list[tir.PrimExpr]:
+def _allgather_recv_extents(slot_extents: list[tir.PrimExpr], recv_num: tir.PrimExpr, axis: int) -> list[tir.PrimExpr]:
     assert axis >= 0
     gather_dim = _allgather_gather_dim(axis)
     recv_extents = list(slot_extents)
@@ -555,32 +567,33 @@ def _allgather_recv_extents(slot_extents: list[tir.PrimExpr], recv_num: int, axi
 
 def _normalize_allgather_leading_extent(
     recv: _NormalizedCommRegion,
-    recv_num: int,
+    recv_num: tir.PrimExpr,
     op_name: str,
     *,
     require_exact_match: bool,
 ) -> _NormalizedCommRegion:
     extent = recv.extents[0]
     extent_int = _const_int(extent)
-    if extent_int is None:
+    recv_num_int = _const_int(recv_num)
+    if extent_int is None or recv_num_int is None:
         return recv
-    if extent_int < recv_num:
-        raise ValueError(f"{op_name} recv leading extent is too small for {recv_num} receiving cores: got {extent}.")
-    if require_exact_match and extent_int != recv_num:
+    if extent_int < recv_num_int:
+        raise ValueError(f"{op_name} recv leading extent is too small for {recv_num_int} receiving cores: got {extent}.")
+    if require_exact_match and extent_int != recv_num_int:
         raise ValueError(
-            f"{op_name} recv leading extent must equal the number of receiving cores ({recv_num}) "
+            f"{op_name} recv leading extent must equal the number of receiving cores ({recv_num_int}) "
             f"for Buffer-to-Buffer operation, but got {extent}."
         )
-    if extent_int == recv_num:
+    if extent_int == recv_num_int:
         return recv
     recv_extents = list(recv.extents)
-    recv_extents[0] = tir.IntImm(extent.dtype if hasattr(extent, "dtype") else "int32", recv_num)
+    recv_extents[0] = tir.IntImm(extent.dtype if hasattr(extent, "dtype") else "int32", recv_num_int)
     return _NormalizedCommRegion(recv.spec, recv.mins, recv_extents)
 
 
-def _expected_allgather_recv_extents(send_extents: list[tir.PrimExpr], recv_num: int, axis: int) -> list[tir.PrimExpr]:
+def _expected_allgather_recv_extents(send_extents: list[tir.PrimExpr], recv_num: tir.PrimExpr, axis: int) -> list[tir.PrimExpr]:
     if axis < 0:
-        return [tir.IntImm("int32", recv_num), *send_extents]
+        return [recv_num, *send_extents]
     recv_extents = list(send_extents)
     recv_extents[axis] = recv_extents[axis] * recv_num
     return recv_extents
@@ -589,7 +602,7 @@ def _expected_allgather_recv_extents(send_extents: list[tir.PrimExpr], recv_num:
 def _normalize_allgather_regions(
     send_buffer: BufferLikeType,
     recv_buffer: BufferLikeType,
-    recv_num: int,
+    recv_num: tir.PrimExpr,
     axis: int,
     op_name: str,
 ) -> tuple[_NormalizedCommRegion, _NormalizedCommRegion]:
@@ -800,7 +813,7 @@ def _prepare_one_to_one_operands(
 def _prepare_allgather_operands(
     send_buffer: BufferLikeType,
     recv_buffer: BufferLikeType,
-    recv_num: int,
+    recv_num: tir.PrimExpr,
     axis: int | None,
     op_name: str,
 ) -> tuple[_PreparedCommRegion, _PreparedCommRegion, int]:
@@ -1061,7 +1074,9 @@ def all_gather(
     assert direction.lower() in DIRECTION_MAP, f"Invalid direction string: {direction}"
 
     direction = direction.lower()
-    recv_num = _allgather_recv_num(direction)
+    recv_num = (
+        _allgather_validation_recv_num(direction) if _target_utils.ENABLE_SUNMMIO_REGION_VALIDATION else _allgather_recv_num(direction)
+    )
     send_region, recv_region, axis_arg = _prepare_allgather_operands(
         send_buffer,
         recv_buffer,

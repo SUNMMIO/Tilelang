@@ -464,21 +464,21 @@ def kernel_factory(*args, **kwargs):
 - `target`：目标后端。SunMMIO kernel 建议显式写 `target="sunmmio"`。
 - 被装饰的函数：通常返回一个 `@T.prim_func` 或内部 `main` 函数。
 
-**`driver.get_sunmmio_device_mesh_config`**
+**`get_sunmmio_target_mesh_config`**
 
 ```python
-from tilelang.carver.arch import driver
+from tilelang.utils.target import get_sunmmio_target_mesh_config
 
-nrows, ncols = driver.get_sunmmio_device_mesh_config()
+nrows, ncols = get_sunmmio_target_mesh_config("sunmmio")
 ```
 
-`get_sunmmio_device_mesh_config()` 当前返回具体的默认 device mesh 形状 `(4, 4)`。
+`get_sunmmio_target_mesh_config()` 返回指定编译 target 中编码的具体 mesh 形状。简写 target `"sunmmio"` 当前解析为默认的 `(4, 4)`。
 
-- 参数：无。
+- `target`：可选 target 字符串或 `tvm.target.Target`。省略时优先读取当前 target context；如果没有当前 target，则使用默认 SunMMIO target。
 - 返回值：`(nrows, ncols)`。
 - `nrows`：mesh 的行数，对应纵向 core 数。
 - `ncols`：mesh 的列数，对应横向 core 数。
-- 常见用途：host 侧检查和诊断。kernel 类型、启动 extent 和 buffer shape 通常应使用 `T.mesh_nrows()`、`T.mesh_ncols()`、`T.mesh_ncores()`，由编译 target 负责解析。
+- 常见用途：为 sunsim 等 host 侧调用提供具体整数。kernel 类型、启动 extent 和 buffer shape 应使用 `T.mesh_nrows()`、`T.mesh_ncols()`、`T.mesh_ncores()`，它们由同一个编译 target 负责解析。
 
 **`driver.get_sunmmio_device_properties`**
 
@@ -486,10 +486,10 @@ nrows, ncols = driver.get_sunmmio_device_mesh_config()
 props = driver.get_sunmmio_device_properties()
 ```
 
-`get_sunmmio_device_properties()` 返回仓库当前静态定义的 A4E device 描述，尚不会查询 runtime device。
+`get_sunmmio_device_properties()` 返回仓库当前静态定义的 A4E 每 core 存储描述，尚不会查询 runtime device。mesh 不属于这个对象；mesh 统一由编译 target 描述。
 
 - `device_id`：可选 device 索引，当前未使用，默认值为 `0`。
-- 返回值：`SunmmioDeviceProperties`，包含 `mesh_config`、`RsramPerCore`、`WSRAMperCore` 和 `ASRAMPerCore` 字段。
+- 返回值：`SunmmioDeviceProperties`，包含 `RsramPerCore`、`WSRAMperCore` 和 `ASRAMPerCore` 字段。
 - 常见用途：host 侧检查；不要把这些值当作 runtime capability query。
 
 ### 3.2 MeshTensor、Placement 与 Layout
