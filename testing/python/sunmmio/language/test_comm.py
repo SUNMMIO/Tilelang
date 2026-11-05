@@ -142,8 +142,8 @@ def _allreduce_payload_kernel(
 )
 def test_comm_python_api(M, N, block_M, block_N, dtype, accum_dtype):
     func_str = """
-        T.comm_broadcast(A_shared[0:128, 0:128], B_shared[0:128, 0:128], -1, 6, 2)
-        T.comm_put(A_shared[0:128, 0:128], B_shared[0:128, 0:128], -1, 6, 11)
+        T.comm_broadcast(A_shared[0:128, 0:128], B_shared[0:128, 0:128], -1, mesh_ncols + 2, 2)
+        T.comm_put(A_shared[0:128, 0:128], B_shared[0:128, 0:128], -1, mesh_ncols + 2, 2 * mesh_ncols + 3)
         T.comm_allgather(A_shared[0:128, 0:128], C_shared[0:16, 0:128, 0:128], 2, -1, -1, bx)
         T.comm_allgather(A_shared[0:128, 0:128], R0_shared[0:2048, 0:128], 2, -1, 0, bx)
         T.comm_allgather(A_shared[0:128, 0:128], R1_shared[0:128, 0:2048], 2, -1, 1, bx)""".strip()
@@ -167,6 +167,67 @@ def test_comm_python_api(M, N, block_M, block_N, dtype, accum_dtype):
             T.comm.all_gather(A_shared, R1_shared, direction="all", axis=-1)
 
     assert main.script()[-len(func_str) :] == func_str, "The generated script does not match the expected output."
+
+
+@pytest.mark.parametrize(
+    "nrow,ncol,expected_core,expected_mask",
+    [(3, 4, 6, 15), (4, 3, 5, 7)],
+)
+def test_comm_tuple_core_uses_bound_target_mesh(nrow, ncol, expected_core, expected_mask):
+    frontend_target = determine_target("sunmmio", return_object=True)
+    with frontend_target:
+
+        @T.prim_func
+        def main():
+            with T.Kernel():
+                src = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                dst = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                T.comm.broadcast(src, dst, (1, 2), direction="h")
+
+    assert "mesh_ncols" in main.script()
+
+    target = determine_target(
+        f"llvm -mcpu=sunmmio-a4e -mattr=device_mesh_nrow_{nrow},device_mesh_ncol_{ncol}",
+        return_object=True,
+    )
+    mod = tvm.tir.transform.BindTarget(target)(tvm.IRModule({"main": main}))
+    mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
+    mod = tilelang.transform.LowerTileOp()(mod)
+
+    (line,) = _broadcast_lines(mod.script())
+    assert f", T.int64({expected_mask}), 0, {expected_core})" in line
+
+
+@pytest.mark.parametrize("nrow,ncol", [(3, 4), (4, 3)])
+def test_comm_allgather_shape_uses_bound_target_mesh(nrow, ncol):
+    frontend_target = determine_target("sunmmio", return_object=True)
+    with frontend_target:
+
+        @T.prim_func
+        def main():
+            with T.Kernel():
+                send = T.alloc_shared((32, 32), "float32", scope="shared.rsram")
+                recv_h = T.alloc_shared((32, 32 * T.ncols()), "float32", scope="shared.rsram")
+                recv_v = T.alloc_shared((32 * T.nrows(), 32), "float32", scope="shared.rsram")
+                T.comm.all_gather(send, recv_h, direction="h", axis=-1)
+                T.comm.all_gather(send, recv_v, direction="v", axis=0)
+
+    target = determine_target(
+        f"llvm -mcpu=sunmmio-a4e -mattr=device_mesh_nrow_{nrow},device_mesh_ncol_{ncol}",
+        return_object=True,
+    )
+    mod = tvm.tir.transform.BindTarget(target)(tvm.IRModule({"main": main}))
+    mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
+    alloc_shapes = {}
+
+    def collect_allocations(node):
+        if isinstance(node, tvm.tir.Block):
+            for buffer in node.alloc_buffers:
+                alloc_shapes[buffer.name] = tuple(int(extent) for extent in buffer.shape)
+
+    tvm.tir.stmt_functor.post_order_visit(mod["main"].body, collect_allocations)
+    assert alloc_shapes["recv_h"] == (32, 32 * ncol)
+    assert alloc_shapes["recv_v"] == (32 * nrow, 32)
 
 
 def test_comm_allreduce_frontend_allocates_rsram_temporaries():
@@ -812,6 +873,7 @@ def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
         assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 
@@ -854,6 +916,7 @@ def test_comm_broadcast_lower_custom_mesh(M, N, block_M, block_N, dtype):
     target = determine_target("llvm -mcpu=sunmmio-a4e -mattr=device_mesh_nrow_2,device_mesh_ncol_3", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
         assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 
@@ -885,6 +948,7 @@ def test_comm_put_lower(M, N, block_M, block_N, dtype, accum_dtype):
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
         assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 
@@ -924,6 +988,7 @@ def test_comm_all_gather_lower(M, N, block_M, block_N, dtype, accum_dtype):
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
         assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 
@@ -953,6 +1018,7 @@ def test_comm_all_gather_axis0_all_lower(M, N, block_M, block_N, dtype):
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
         assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 
@@ -982,6 +1048,7 @@ def test_comm_all_gather_axis_last_horizontal_lower(M, N, block_M, block_N, dtyp
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
         assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 
@@ -1011,6 +1078,7 @@ def test_comm_all_gather_axis_last_all_lower(M, N, block_M, block_N, dtype):
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
         assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
 

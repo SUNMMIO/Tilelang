@@ -2,8 +2,8 @@ import argparse
 
 import tilelang
 import tilelang.language as T
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zzn_layout, make_zz_layout
+from tilelang.utils.target import get_sunmmio_target_mesh_config
 
 
 def ref_program(a, b):
@@ -11,7 +11,7 @@ def ref_program(a, b):
 
 
 def _validate_config(M, N, K, block_M, block_N, block_K):
-    mesh_rows, mesh_cols = driver.get_sunmmio_device_mesh_config()
+    mesh_rows, mesh_cols = get_sunmmio_target_mesh_config("sunmmio")
     asram_bytes = block_M * (mesh_cols * block_K) * 2
     wsram_bytes = (mesh_rows * block_K) * block_N * 2
 
@@ -123,7 +123,7 @@ def main(M=256, N=256, K=256, block_M=32, block_N=64, block_K=64, timeout=720.0)
         sunsim.Input(a, placement=placement, layout=zz_layout),
         sunsim.Input(b, placement=placement, layout=zzn_layout),
         c,
-        mesh=driver.get_sunmmio_device_mesh_config(),
+        mesh=get_sunmmio_target_mesh_config("sunmmio"),
         timeout=timeout,
     )
 

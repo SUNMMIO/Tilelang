@@ -464,21 +464,21 @@ def kernel_factory(*args, **kwargs):
 - `target`: the target backend. SunMMIO kernels should explicitly use `target="sunmmio"`.
 - The decorated function: usually returns a `@T.prim_func` or an inner `main` function.
 
-**`driver.get_sunmmio_device_mesh_config`**
+**`get_sunmmio_target_mesh_config`**
 
 ```python
-from tilelang.carver.arch import driver
+from tilelang.utils.target import get_sunmmio_target_mesh_config
 
-nrows, ncols = driver.get_sunmmio_device_mesh_config()
+nrows, ncols = get_sunmmio_target_mesh_config("sunmmio")
 ```
 
-`get_sunmmio_device_mesh_config()` currently returns the concrete default device mesh shape `(4, 4)`.
+`get_sunmmio_target_mesh_config()` returns the concrete mesh shape encoded by the requested compilation target. The `"sunmmio"` shorthand currently resolves to the default `(4, 4)` target.
 
-- Parameters: none.
+- `target`: optional target string or `tvm.target.Target`. When omitted, the current target context is used first, followed by the default SunMMIO target.
 - Return value: `(nrows, ncols)`.
 - `nrows`: number of rows in the mesh, corresponding to the number of cores in the vertical direction.
 - `ncols`: number of columns in the mesh, corresponding to the number of cores in the horizontal direction.
-- Common usage: host-side inspection and diagnostics. Kernel types, launch extents, and buffer shapes should normally use `T.mesh_nrows()`, `T.mesh_ncols()`, and `T.mesh_ncores()` so they resolve from the compilation target.
+- Common usage: provide concrete integers to host-side callers such as sunsim. Kernel types, launch extents, and buffer shapes should use `T.mesh_nrows()`, `T.mesh_ncols()`, and `T.mesh_ncores()` so both paths resolve from the same compilation target.
 
 **`driver.get_sunmmio_device_properties`**
 
@@ -486,10 +486,10 @@ nrows, ncols = driver.get_sunmmio_device_mesh_config()
 props = driver.get_sunmmio_device_properties()
 ```
 
-`get_sunmmio_device_properties()` returns the repository's current static A4E device description; it does not query a runtime device yet.
+`get_sunmmio_device_properties()` returns the repository's current static per-core A4E memory description; it does not query a runtime device yet. Mesh topology is not part of this object and is defined only by the compilation target.
 
 - `device_id`: optional device index, currently unused; the default is `0`.
-- Return value: `SunmmioDeviceProperties`, with `mesh_config`, `RsramPerCore`, `WSRAMperCore`, and `ASRAMPerCore` fields.
+- Return value: `SunmmioDeviceProperties`, with `RsramPerCore`, `WSRAMperCore`, and `ASRAMPerCore` fields.
 - Common usage: host-side inspection. Do not treat these values as a runtime capability query.
 
 ### 3.2 MeshTensor, Placement, and Layout

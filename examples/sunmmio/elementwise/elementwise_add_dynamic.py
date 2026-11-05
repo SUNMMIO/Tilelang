@@ -2,8 +2,8 @@ import argparse
 
 import tilelang
 import tilelang.language as T
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
+from tilelang.utils.target import get_sunmmio_target_mesh_config
 
 
 def ref_program(x, y):
@@ -69,7 +69,7 @@ def main(M=1024, N=1024):
         sunsim.Input(a, placement=placement, layout=layout),
         sunsim.Input(b, placement=placement, layout=layout),
         c,
-        mesh=driver.get_sunmmio_device_mesh_config(),
+        mesh=get_sunmmio_target_mesh_config("sunmmio"),
         timeout=240.0,
     )
 
