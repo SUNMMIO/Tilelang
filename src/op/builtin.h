@@ -125,6 +125,11 @@ static constexpr const char *kSunmmioGemmTwoCommunications =
     "tl.sunmmio_gemm_two_communications";
 
 static constexpr const char *kSunmmioFaster = "tl.sunmmio_faster";
+static constexpr const char *kSunmmioCostModel = "tl.sunmmio_cost_model";
+static constexpr const char *kSunmmioCostModelFallback =
+    "tl.sunmmio_cost_model_fallback";
+static constexpr const char *kSunmmioCostModelStrict =
+    "tl.sunmmio_cost_model_strict";
 
 static constexpr const char *kSunmmioILPStageShrink =
     "tl.sunmmio_ilp_stage_shrink";

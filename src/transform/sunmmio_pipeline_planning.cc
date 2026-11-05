@@ -18,6 +18,7 @@
 #include "../op/utils.h"
 #include "../target/sunmmio/cost_model.h"
 #include "../target/sunmmio/hardware_types.h"
+#include "../target/sunmmio/sunmmio_async_op_info.h"
 #include "../target/sunmmio_utils.h"
 #include "sunmmio_pipeline_planning/pipeline_diagnostic.h"
 #include "sunmmio_pipeline_planning/resource_types_for_ilp.h"
@@ -131,6 +132,7 @@ public:
 
   // Pre-calculated delay (to be injected by CostModel)
   float delay{0.0f};
+  CostEstimate cost_estimate;
 
   PipelineInstruction(int id, int iter, Stmt stmt)
       : id(id), iter(iter), stmt(stmt),
@@ -708,36 +710,162 @@ ValidateLocalDDG(const std::vector<PipelineInstruction> &instructions,
   return true;
 }
 
-static void MaybeWriteGreedyGraphJson(
+static void WriteGreedyGraphJson(
+    const std::string &path,
     const std::vector<PipelineInstruction> &instructions, const LocalDDG &ddg,
-    const std::unordered_set<const BufferNode *> &versioned_buffers) {
-  const char *path = std::getenv("TL_SUNMMIO_PIPELINE_GRAPH_JSON");
-  if (path == nullptr || path[0] == '\0') {
-    return;
-  }
+    const std::unordered_set<const BufferNode *> &versioned_buffers,
+    const CostModelContext &cost_context) {
   std::ofstream out(path);
   if (!out.is_open()) {
     LOG(WARNING) << "Cannot write pipeline graph JSON to " << path;
     return;
   }
-  out << "{\n  \"mode\": \"greedy\",\n  \"commands\": [\n";
+  bool fallback_used = false;
+  bool solver_scaled = false;
+  int64_t solver_scale_factor = 1;
+  for (const PipelineInstruction &instruction : instructions) {
+    fallback_used = fallback_used || instruction.cost_estimate.used_fallback;
+    solver_scaled = solver_scaled || instruction.cost_estimate.solver_scaled;
+    solver_scale_factor = std::max(
+        solver_scale_factor, instruction.cost_estimate.solver_scale_factor);
+  }
+  auto write_json_string = [&](const std::string &value) {
+    out << '"';
+    for (char c : value) {
+      switch (c) {
+      case '\\':
+        out << "\\\\";
+        break;
+      case '"':
+        out << "\\\"";
+        break;
+      case '\n':
+        out << "\\n";
+        break;
+      case '\r':
+        out << "\\r";
+        break;
+      case '\t':
+        out << "\\t";
+        break;
+      default:
+        out << c;
+        break;
+      }
+    }
+    out << '"';
+  };
+  auto write_cost_estimate = [&](const CostEstimate &estimate) {
+    out << "{";
+    out << "\"status\": ";
+    write_json_string(CostModel::StatusName(estimate.status));
+    out << ", \"profile\": ";
+    write_json_string(std::string(estimate.profile));
+    out << ", \"model_version\": ";
+    write_json_string(std::string(estimate.model_version));
+    out << ", \"latency_source\": ";
+    write_json_string(std::string(estimate.latency_source));
+    out << ", \"fallback_reason\": ";
+    write_json_string(std::string(estimate.fallback_reason));
+    out << ", \"op_kind\": ";
+    write_json_string(std::string(estimate.op_kind));
+    out << ", \"transfer_path\": ";
+    write_json_string(std::string(estimate.transfer_path));
+    out << ", \"src_scope\": ";
+    write_json_string(std::string(estimate.src_scope));
+    out << ", \"dst_scope\": ";
+    write_json_string(std::string(estimate.dst_scope));
+    out << ", \"input_dtype\": ";
+    write_json_string(std::string(estimate.input_dtype));
+    out << ", \"weight_dtype\": ";
+    write_json_string(std::string(estimate.weight_dtype));
+    out << ", \"output_dtype\": ";
+    write_json_string(std::string(estimate.output_dtype));
+    out << ", \"timing_origin\": ";
+    write_json_string(std::string(estimate.timing_origin));
+    out << ", \"timing_end\": ";
+    write_json_string(std::string(estimate.timing_end));
+    out << ", \"latency_cycles\": " << estimate.latency_cycles;
+    out << ", \"issue_start_cycles\": " << estimate.issue_start_cycles;
+    out << ", \"issue_finish_cycles\": " << estimate.issue_finish_cycles;
+    out << ", \"bytes\": " << estimate.bytes;
+    out << ", \"packet_count\": " << estimate.packet_count;
+    out << ", \"descriptor_count\": " << estimate.descriptor_count;
+    out << ", \"descriptor_fetch_cycles\": "
+        << estimate.descriptor_fetch_cycles;
+    out << ", \"command_frontend_cycles\": "
+        << estimate.command_frontend_cycles;
+    out << ", \"path_start_delay\": " << estimate.path_start_delay;
+    out << ", \"endpoint_completion_cycles\": "
+        << estimate.endpoint_completion_cycles;
+    out << ", \"link_completion_cycles\": " << estimate.link_completion_cycles;
+    out << ", \"issue_interval_cycles\": " << estimate.issue_interval_cycles;
+    out << ", \"odma_channel\": " << estimate.odma_channel;
+    out << ", \"odma_channel_mask\": " << estimate.odma_channel_mask;
+    out << ", \"row_size\": " << estimate.row_size;
+    out << ", \"col_size\": " << estimate.col_size;
+    out << ", \"reduction_size\": " << estimate.reduction_size;
+    out << ", \"vector_chunks\": " << estimate.vector_chunks;
+    out << ", \"load_ops\": " << estimate.load_ops;
+    out << ", \"store_ops\": " << estimate.store_ops;
+    out << ", \"arithmetic_ops\": " << estimate.arithmetic_ops;
+    out << ", \"compare_convert_ops\": " << estimate.compare_convert_ops;
+    out << ", \"nonlinear_ops\": " << estimate.nonlinear_ops;
+    out << ", \"reduce_ops\": " << estimate.reduce_ops;
+    out << ", \"galu_ops\": " << estimate.galu_ops;
+    out << ", \"exact_static_submodel\": " << estimate.exact_static_submodel;
+    out << ", \"used_fallback\": " << estimate.used_fallback;
+    out << ", \"solver_scale_factor\": " << estimate.solver_scale_factor;
+    out << ", \"solver_latency_cycles\": " << estimate.solver_latency_cycles;
+    out << ", \"solver_scaled\": " << estimate.solver_scaled;
+    out << ", \"endpoint_timing_modeled\": "
+        << estimate.endpoint_timing_modeled;
+    out << ", \"resource_overlap_modeled\": "
+        << estimate.resource_overlap_modeled;
+    out << ", \"command_frontend_modeled\": "
+        << estimate.command_frontend_modeled;
+    out << ", \"descriptor_plan_modeled\": "
+        << estimate.descriptor_plan_modeled;
+    out << ", \"link_completion_modeled\": "
+        << estimate.link_completion_modeled;
+    out << "}";
+  };
+
+  out << std::boolalpha;
+  out << "{\n  \"mode\": \"greedy\",\n";
+  out << "  \"cost_model\": {\"profile\": ";
+  write_json_string(CostModel::ProfileName(cost_context.options.profile));
+  out << ", \"strict_calibration\": "
+      << cost_context.options.strict_calibration;
+  out << ", \"solver_scale_factor\": " << solver_scale_factor;
+  out << ", \"solver_scaled\": " << solver_scaled;
+  out << ", \"latency_gcd\": 1";
+  out << ", \"auto_faster_selected\": false";
+  out << ", \"planner_fallback\": false";
+  out << ", \"fallback_used\": " << fallback_used;
+  out << "},\n  \"commands\": [\n";
   for (size_t i = 0; i < instructions.size(); ++i) {
     const PipelineInstruction &instruction = instructions[i];
     out << "    {\"id\": " << instruction.id
         << ", \"iteration_offset\": 0, \"hardware\": "
         << static_cast<int>(instruction.device_type)
         << ", \"resource\": " << instruction.execution_resource
-        << ", \"reads\": [";
+        << ", \"static_model_cycles\": "
+        << instruction.cost_estimate.latency_cycles
+        << ", \"planned_duration_cycles\": "
+        << instruction.cost_estimate.latency_cycles << ", \"cost_estimate\": ";
+    write_cost_estimate(instruction.cost_estimate);
+    out << ", \"reads\": [";
     for (size_t j = 0; j < instruction.reads.size(); ++j) {
       if (j != 0)
         out << ", ";
-      out << "\"" << instruction.reads[j]->buffer->name << "\"";
+      write_json_string(instruction.reads[j]->buffer->name);
     }
     out << "], \"writes\": [";
     for (size_t j = 0; j < instruction.writes.size(); ++j) {
       if (j != 0)
         out << ", ";
-      out << "\"" << instruction.writes[j]->buffer->name << "\"";
+      write_json_string(instruction.writes[j]->buffer->name);
     }
     out << "]}" << (i + 1 == instructions.size() ? "\n" : ",\n");
   }
@@ -778,6 +906,18 @@ static void MaybeWriteGreedyGraphJson(
         << "\"}" << (i + 1 == ddg.buffer_order.size() ? "\n" : ",\n");
   }
   out << "  ]\n}\n";
+}
+
+static void MaybeWriteGreedyGraphJson(
+    const std::vector<PipelineInstruction> &instructions, const LocalDDG &ddg,
+    const std::unordered_set<const BufferNode *> &versioned_buffers,
+    const CostModelContext &cost_context) {
+  const char *path = std::getenv("TL_SUNMMIO_PIPELINE_GRAPH_JSON");
+  if (path == nullptr || path[0] == '\0') {
+    return;
+  }
+  WriteGreedyGraphJson(path, instructions, ddg, versioned_buffers,
+                       cost_context);
 }
 
 static bool
@@ -1023,12 +1163,7 @@ private:
 
   static bool IsPrefetchEvaluate(const EvaluateNode &evaluate) {
     auto call = evaluate.value.as<CallNode>();
-    if (!call) {
-      return false;
-    }
-    return call->op.same_as(Op::Get("tl.dma_copy")) ||
-           call->op.same_as(Op::Get("tl.broadcast_")) ||
-           call->op.same_as(Op::Get("tl.sunmmio_layout_transform"));
+    return IsSunmmioAsyncODMAOp(call);
   }
 
   static bool WasBufferReadBeforeInstruction(const LocalDDG &local_ddg,
@@ -1792,9 +1927,11 @@ public:
   }
 
   SunmmioPipelinePlanner(const PrimFunc &f, bool debug)
-      : stmt_rw_collector_(f), debug_(debug) {}
+      : stmt_rw_collector_(f), cost_context_(CostModel::BuildContext(f)),
+        debug_(debug) {}
 
   StmtReadWriteCollector stmt_rw_collector_;
+  CostModelContext cost_context_;
   bool debug_ = false;
 
   Stmt VisitStmt_(const ForNode *op) final {
@@ -1864,8 +2001,10 @@ public:
       instruction.device_type = HardwareMapper::Map(instruction.stmt);
       instruction.ExtractRegions(stmt_rw_collector_);
       instruction.execution_resource = GetGreedyExecutionResource(instruction);
+      instruction.cost_estimate = CostModel::Estimate(
+          instruction.device_type, instruction.stmt, cost_context_);
       instruction.delay =
-          CostModel::EstimateDelay(instruction.device_type, instruction.stmt);
+          static_cast<float>(instruction.cost_estimate.latency_cycles);
       single_iteration_instructions.push_back(instruction);
     }
 
@@ -1943,7 +2082,7 @@ public:
         MultiversioningIdentifier::Identify(single_iteration_instructions,
                                             local_ddg);
     MaybeWriteGreedyGraphJson(single_iteration_instructions, local_ddg,
-                              versioned_buffers);
+                              versioned_buffers, cost_context_);
 
     if (debug_) {
       std::cout << "[Pipeline Planner] Identified " << versioned_buffers.size()
