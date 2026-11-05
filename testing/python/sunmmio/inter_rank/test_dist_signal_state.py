@@ -58,6 +58,29 @@ def reused_signal_kernel_factory(
 
 
 @tilelang.jit(target="sunmmio")
+def signal_only_dtype_kernel_factory(signal_kind, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            signal = T.dist.signal(kind=signal_kind)
+            T.dist.put_signal(signal, (rank_id + 1) % world_size, submit=True)
+            T.dist.wait_signal(signal)
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
+def manual_delta_dtype_kernel_factory(signal_kind, fixed_delta=None, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, delta: T.uint32):
+        with T.Kernel():
+            signal = T.dist.signal(kind=signal_kind, expect="manual")
+            T.dist.wait_signal(signal, expected_delta=delta if fixed_delta is None else fixed_delta)
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
 def two_puts_two_waits_kernel_factory(world_size: int = 1):
     @T.prim_func
     def main(rank_id: T.dist.RankId):
@@ -231,13 +254,18 @@ def test_signal_generation_is_reused_across_serial_loop(signal_kind, expect_mode
     assert op_names.count("tl.dist_wait_signal_") == 1
     assert op_names.count("tl.dist_wait_send") == 2
     assert "for _step in range(2):" in script
-    assert "signal_expect_1[0] = signal_expect_1[0] + T.uint32(1)" in script
-    assert "signal_generation_1[0] = signal_generation_1[0] + T.uint32(1)" in script
+    state_dtype = "uint64" if signal_kind.value.endswith("memory") else "uint8"
+    assert f"signal_expect_1[0] = signal_expect_1[0] + T.{state_dtype}(1)" in script
+    assert f"signal_generation_1[0] = signal_generation_1[0] + T.{state_dtype}(1)" in script
     generation = collect_calls(device_func, "tl.dist_put_")[0].args[5]
     assert isinstance(generation, tvm.tir.BufferLoad)
     assert tuple(int(extent) for extent in generation.buffer.shape) == (1,)
     assert int(generation.indices[0]) == 0
     assert collect_calls(device_func, "tl.dist_wait_signal_")[0].args[0].value == signal_kind.value
+    initial, expected = (2**32 - 1, 2**32) if state_dtype == "uint64" else (255, 0)
+    receiver_state = collect_calls(device_func, "tl.dist_wait_signal_")[0].args[2]
+    for state in (generation, receiver_state):
+        assert _evaluate_state_update(device_func, state, initial) == expected
 
 
 def test_put_advances_generation_and_wait_only_reads_it():
@@ -245,8 +273,8 @@ def test_put_advances_generation_and_wait_only_reads_it():
     device_func = single_prim_func(lower_to_device_tir(func).device_mod)
     script = device_func.script()
 
-    assert script.count("signal_expect_1[0] = signal_expect_1[0] + T.uint32(1)") == 2
-    assert script.count("signal_generation_1[0] = signal_generation_1[0] + T.uint32(1)") == 2
+    assert script.count("signal_expect_1[0] = signal_expect_1[0] + T.uint8(1)") == 2
+    assert script.count("signal_generation_1[0] = signal_generation_1[0] + T.uint8(1)") == 2
     assert script.count("T.dist_put_(") == 2
     assert script.count('T.dist_wait_signal_("sram_flagreg_value", 0, signal_expect_1[0]') == 2
 
@@ -381,3 +409,76 @@ def test_loop_destinations_keep_independent_signal_generations(signal_kind, expe
     assert len(advances) == 1
     assert analyzer.can_prove_equal(advances[0].indices[0], generation.indices[0])
     assert analyzer.can_prove_equal(advances[0].value, generation + 1)
+
+
+def _evaluate_state_update(mod, state, initial, bindings=None):
+    """Evaluate the actual pass-generated state update at a numeric boundary."""
+    stores = collect_nodes(
+        mod,
+        tvm.tir.BufferStore,
+        lambda store: store.buffer.data.same_as(state.buffer.data) and not isinstance(store.value, tvm.tir.IntImm),
+    )
+    assert len(stores) == 1
+
+    def evaluate_constants(node):
+        if isinstance(node, tvm.tir.BufferLoad) and node.buffer.data.same_as(state.buffer.data):
+            return tvm.tir.IntImm(node.dtype, initial)
+        if (
+            isinstance(node, tvm.tir.Call)
+            and node.op.same_as(tvm.ir.Op.get("tir.bitwise_and"))
+            and all(isinstance(arg, tvm.tir.IntImm) for arg in node.args)
+        ):
+            return tvm.tir.IntImm(node.dtype, int(node.args[0]) & int(node.args[1]))
+
+    value = tvm.tir.stmt_functor.substitute(stores[0].value, bindings or {})
+    statement = tvm.tir.stmt_functor.ir_transform(tvm.tir.Evaluate(value), None, evaluate_constants, ["tir.BufferLoad", "tir.Call"])
+    return int(tvm.arith.Analyzer().simplify(statement.value))
+
+
+@pytest.mark.parametrize("signal_kind", list(T.dist.SignalKind))
+def test_signal_only_state_uses_suvm_width_and_preserves_boundary_increment(signal_kind):
+    result = lower_to_device_tir(signal_only_dtype_kernel_factory.get_tir(signal_kind=signal_kind, world_size=2))
+    put = collect_calls(result.device_mod, "tl.dist_signal_put_")[0]
+    wait = collect_calls(result.device_mod, "tl.dist_wait_signal_")[0]
+    state_dtype = "uint64" if signal_kind.value.endswith("memory") else "uint8"
+    assert put.args[3].dtype == wait.args[2].dtype == state_dtype
+    initial, expected = (2**32 - 1, 2**32) if state_dtype == "uint64" else (255, 0)
+    assert _evaluate_state_update(result.device_mod, wait.args[2], initial) == expected
+    if signal_kind.value.endswith("inc"):
+        assert isinstance(put.args[3], tvm.tir.IntImm) and int(put.args[3]) == 0
+        assert not collect_nodes(result.device_mod, tvm.tir.Allocate, lambda node: "generation" in node.buffer_var.name)
+    else:
+        assert _evaluate_state_update(result.device_mod, put.args[3], initial) == expected
+
+
+@pytest.mark.parametrize("signal_kind", list(T.dist.SignalKind))
+def test_manual_delta_uses_signal_width_without_truncating_memory_state(signal_kind):
+    result = lower_to_device_tir(manual_delta_dtype_kernel_factory.get_tir(signal_kind=signal_kind, world_size=2))
+    device = single_prim_func(result.device_mod)
+    state = collect_calls(device, "tl.dist_wait_signal_")[0].args[2]
+    delta = next(param for param in device.params if param.name == "delta")
+    state_dtype = "uint64" if signal_kind.value.endswith("memory") else "uint8"
+    assert state.dtype == state_dtype
+    cases = [(255, 1), (250, 10), (9, 256), (9, 0), (2**32 - 1, 2**32 - 1)]
+    modulus = 2**64 if state_dtype == "uint64" else 256
+    for initial, increment in cases:
+        initial %= modulus
+        assert (
+            _evaluate_state_update(device, state, initial, {delta: tvm.tir.IntImm("uint32", increment)}) == (initial + increment) % modulus
+        )
+
+
+@pytest.mark.parametrize("signal_kind", list(T.dist.SignalKind))
+@pytest.mark.parametrize("increment", [256, 257])
+def test_constant_manual_delta_reaches_device_tir(signal_kind, increment):
+    # Arithmetic coverage only, not a proof of a hardware wait's safe window.
+    result = lower_to_device_tir(
+        manual_delta_dtype_kernel_factory.get_tir(signal_kind=signal_kind, fixed_delta=increment, world_size=2),
+        capture_passes="tl.LowerDistSync",
+    )
+    wait = collect_calls(result.device_mod, "tl.dist_wait_signal_")[0]
+    state_dtype = "uint64" if signal_kind.value.endswith("memory") else "uint8"
+    assert wait.args[2].dtype == state_dtype
+    lowered = result.pass_snapshot("tl.LowerDistSync").mod
+    state = collect_calls(lowered, "tl.dist_wait_signal_")[0].args[2]
+    assert _evaluate_state_update(lowered, state, 0) == (increment if state_dtype == "uint64" else increment % 256)

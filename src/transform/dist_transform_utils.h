@@ -65,6 +65,9 @@ DistSignalKindInfos() {
   static const std::array<DistSignalKindInfo,
                           static_cast<size_t>(DistSignalKind::kCount)>
       infos{{
+          // SUVM signal values: increment/assign are 8-bit, memory is 64-bit.
+          // Expected values and generation snapshots use the same unsigned
+          // type.
           {DistSignalKind::kSramFlagregInc, "sram_flagreg_inc",
            DistSignalScope::kSram, DistSignalUpdateMode::kIncrement,
            kIncrementFlagregCount, DataType::UInt(8), true},
@@ -73,14 +76,14 @@ DistSignalKindInfos() {
            kIncrementFlagregCount, DataType::UInt(8), true},
           {DistSignalKind::kSramFlagregValue, "sram_flagreg_value",
            DistSignalScope::kSram, DistSignalUpdateMode::kValue,
-           kValueFlagregCount, DataType::UInt(32), false},
+           kValueFlagregCount, DataType::UInt(8), false},
           {DistSignalKind::kDramFlagregValue, "dram_flagreg_value",
            DistSignalScope::kDram, DistSignalUpdateMode::kValue,
-           kValueFlagregCount, DataType::UInt(32), false},
+           kValueFlagregCount, DataType::UInt(8), false},
           {DistSignalKind::kSramMemory, "sram_memory", DistSignalScope::kSram,
-           DistSignalUpdateMode::kMemory, -1, DataType::UInt(32), false},
+           DistSignalUpdateMode::kMemory, -1, DataType::UInt(64), false},
           {DistSignalKind::kDramMemory, "dram_memory", DistSignalScope::kDram,
-           DistSignalUpdateMode::kMemory, -1, DataType::UInt(32), false},
+           DistSignalUpdateMode::kMemory, -1, DataType::UInt(64), false},
       }};
   return infos;
 }
@@ -216,6 +219,47 @@ inline bool BufferRegionsMayOverlap(const Buffer &lhs_buffer,
   // or element offsets. Keep the alias conservative until physical ranges can
   // be proven disjoint.
   return true;
+}
+
+// Regions describe addresses evaluated when an operation was issued. Once a
+// write changes memory used by an index, its old BufferLoad expression cannot
+// be interpreted using the new value. Forget only the affected dimensions;
+// immutable indices and disjoint index-storage writes retain their precision.
+inline Region
+WidenRegionForIndexWrites(const Buffer &buffer, const Region &region,
+                          const std::vector<BufferRegion> &writes) {
+  if (writes.empty()) {
+    return region;
+  }
+  Region widened;
+  for (size_t dim = 0; dim < region.size(); ++dim) {
+    const Range &range = region[dim];
+    bool changed = false;
+    auto check = [&](const ObjectRef &node) {
+      const auto *load = node.as<BufferLoadNode>();
+      if (!load || changed) {
+        return;
+      }
+      Region read;
+      for (const PrimExpr &index : load->indices) {
+        read.push_back(Range::FromMinExtent(index, 1));
+      }
+      for (const BufferRegion &write : writes) {
+        if (BufferRegionsMayOverlap(load->buffer, read, write->buffer,
+                                    write->region)) {
+          changed = true;
+          break;
+        }
+      }
+    };
+    PostOrderVisit(range->min, check);
+    PostOrderVisit(range->extent, check);
+    widened.push_back(changed
+                          ? Range::FromMinExtent(make_zero(range->min.dtype()),
+                                                 buffer->shape[dim])
+                          : range);
+  }
+  return widened;
 }
 
 inline bool IsMultiRank(const PrimFunc &func) {

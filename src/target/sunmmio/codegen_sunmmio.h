@@ -417,6 +417,7 @@ private:
   SunMMIOValue EmitMXPackOrUnpack(const tir::CallNode *op, bool is_pack);
   SunMMIOValue EmitRegionCall(const tvm::PrimExpr &region_expr,
                               int64_t byte_offset = 0,
+                              const char *copy_operand = nullptr,
                               bool use_layout_covered_shape = false,
                               bool preserve_unit_dims = false);
   SunMMIOValue EmitLoad(const tir::Buffer &buffer,

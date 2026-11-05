@@ -806,6 +806,73 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
 Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
                                    arith::Analyzer *analyzer) const {
+  // A slot axis is fixed, not reshaped into a matrix dimension. Match the
+  // effective regions, retaining their original buffer indices for codegen.
+  auto effective_shape = [&](const Array<Range> &ranges) {
+    Array<PrimExpr> shape;
+    for (const Range &range : ranges) {
+      if (!analyzer->CanProveEqual(range->extent, 1))
+        shape.push_back(range->extent);
+    }
+    return shape;
+  };
+  auto src_shape = effective_shape(src_range);
+  auto dst_shape = effective_shape(dst_range);
+  ICHECK_EQ(src_shape.size(), dst_shape.size())
+      << "Sunmmio DMA copy requires matching effective region shapes: "
+      << src->name << " " << src_shape << " -> " << dst->name << " "
+      << dst_shape;
+  for (size_t i = 0; i < src_shape.size(); ++i) {
+    ICHECK(analyzer->CanProveEqual(src_shape[i], dst_shape[i]))
+        << "Sunmmio DMA copy requires matching effective region shapes: "
+        << src->name << " " << src_shape << " -> " << dst->name << " "
+        << dst_shape;
+  }
+
+  auto validate_mx = [&](const Buffer &buffer, const Array<Range> &ranges) {
+    if (!sunmmio::IsMXDType(buffer->dtype))
+      return;
+    const LayoutMap &map =
+        buffer.scope() == "global" ? T.global_layout_map : T.layout_map;
+    ICHECK(map.count(buffer))
+        << "Sunmmio MX copy requires a layout for buffer " << buffer->name;
+    Layout layout = map[buffer];
+    const auto *cute = layout.as<CuteLayoutNode>();
+    ICHECK(cute && ranges.size() >= 2)
+        << "Sunmmio MX copy requires a canonical matrix layout for buffer "
+        << buffer->name;
+    auto shape = cute->GetLogicalShape();
+    if (IsSameLayout(layout, sunmmio::MakeMXRowMajor(shape, buffer->dtype),
+                     analyzer)) {
+      ICHECK(analyzer->CanProveEqual(ranges.back()->extent, shape.back()))
+          << "Sunmmio MX row-major copy must cover the full row of buffer "
+          << buffer->name;
+      return;
+    }
+    auto levels = cute->GetDimLevels();
+    const size_t rank = ranges.size();
+    ICHECK(sunmmio::DeriveMXLayoutLike(layout, shape, buffer->dtype, analyzer)
+               .defined() &&
+           levels[rank - 2].IntValue() > 1 && levels[rank - 1].IntValue() > 1)
+        << "Sunmmio MX blockwise copy requires trailing matrix axes for buffer "
+        << buffer->name;
+    for (size_t i = 0; i + 2 < rank; ++i) {
+      ICHECK(analyzer->CanProveEqual(ranges[i]->extent, 1))
+          << "Sunmmio MX copy requires a single matrix slot in buffer "
+          << buffer->name << " at batch dimension " << i;
+    }
+    const auto config = GetSunmmioTileProcessorConfig(T.target);
+    for (size_t i = rank - 2; i < rank; ++i) {
+      int block = i == rank - 2 ? config.block_height : config.block_width;
+      ICHECK(analyzer->CanProveEqual(floormod(ranges[i]->extent, block), 0))
+          << "Sunmmio MX blockwise copy requires whole blocks: buffer "
+          << buffer->name << ", dimension " << i << ", extent "
+          << ranges[i]->extent << " must be a multiple of " << block;
+    }
+  };
+  validate_mx(src, src_range);
+  validate_mx(dst, dst_range);
+
   if (dst.scope() == kSunmmioScopeWSRAM || dst.scope() == kSunmmioScopeASRAM)
     return Evaluate(Call(DataType::Handle(), dma_copy(),
                          {MakeRegionExpr(src, src_range, /*access_mask=*/1),
@@ -1095,7 +1162,7 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
                               /*access_mask=*/2));
   }
 
-  if (IsLayoutMatch(src_layout, dst_layout, analyzer)) {
+  if (IsLayoutMatchForDType(src_layout, dst_layout, src->dtype, analyzer)) {
     return dma(src_region, dst_region);
   }
 
@@ -1130,7 +1197,8 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   // block-aligned slice of that buffer has the very layout the RSRAM side
   // wants. When the region layouts agree the transform leg would be an
   // identity, so emit a plain DMA and skip the staging buffer entirely.
-  if (IsLayoutMatch(stage_layout.value(), rsram_layout, analyzer))
+  if (IsLayoutMatchForDType(stage_layout.value(), rsram_layout, dram->dtype,
+                            analyzer))
     return dma(src_region, dst_region);
 
   auto is_mx_row_major_layout = [&](const Layout &layout,

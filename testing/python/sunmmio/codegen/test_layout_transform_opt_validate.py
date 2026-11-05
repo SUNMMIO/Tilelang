@@ -1,9 +1,11 @@
 import os
 
+import pytest
+
 import tilelang
 import tilelang.language as T
 import tilelang.testing
-from tilelang.layout import make_row_major, make_zz_layout
+from tilelang.layout import make_mx_row_major_layout, make_mxzz_layout, make_row_major, make_zz_layout
 
 from testing.python.sunmmio.common.compile_pipeline import target
 from testing.python.sunmmio.common.codegen_validation import (
@@ -25,8 +27,12 @@ def layout_transform_roundtrip_kernel(
     dtype=T.bfloat16,
 ):
     shard_policy = T.placement.replicated()
-    dram_layout = make_zz_layout((m, n), axes=[0, 1], block_shape=(32, 32))
-    rsram_layout = make_row_major((m, n))
+    if dtype in (T.mxfp8, T.mxfp4):
+        dram_layout = make_mxzz_layout((m, n), dtype=dtype)
+        rsram_layout = make_mx_row_major_layout((m, n), dtype=dtype)
+    else:
+        dram_layout = make_zz_layout((m, n), axes=[0, 1], block_shape=(32, 32))
+        rsram_layout = make_row_major((m, n))
 
     @T.prim_func
     def main(
@@ -43,9 +49,10 @@ def layout_transform_roundtrip_kernel(
     return main
 
 
-def test_layout_transform_codegen_validates_with_npuir_opt(tmp_path):
+@pytest.mark.parametrize("dtype", [T.bfloat16, T.mxfp8, T.mxfp4])
+def test_layout_transform_codegen_validates_with_npuir_opt(tmp_path, dtype):
     src = validate_sunmmio_codegen_with_npuir_opt(
-        layout_transform_roundtrip_kernel(),
+        layout_transform_roundtrip_kernel(dtype=dtype),
         tmp_path,
         mlir_filename="layout_transform_roundtrip_suvm.mlir",
         expected_tokens=(

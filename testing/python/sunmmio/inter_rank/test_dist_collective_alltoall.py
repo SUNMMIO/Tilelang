@@ -9,7 +9,9 @@ import tilelang.language as T
 from tilelang import tvm
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import (
+    collect_calls,
     collect_dist_put_kinds,
+    collect_nodes,
     collect_op_names,
     lower_collectives,
 )
@@ -314,3 +316,326 @@ def test_alltoall_rejects_mismatched_dtype():
 def test_alltoall_rejects_overlapping_storage():
     with pytest.raises(ValueError, match="overlapping source and destination"):
         overlapping_alltoall_kernel_factory.get_tir(world_size=4)
+
+
+@tilelang.jit(target="sunmmio")
+def alltoall_signals_kernel_factory(
+    domain="rank",
+    wait_mode="all",
+    signal_kind=None,
+    expect=None,
+    count=None,
+    form="group",
+    src_dram=False,
+    dst_dram=False,
+    submit=True,
+    world_size: int = 1,
+):
+    shape = _alltoall_shape(world_size, domain)
+    endpoint_count = world_size * (4 if _is_row_domain(domain) else 1)
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor(shape, T.placement.replicated(), T.bfloat16),
+        B: T.MeshTensor(shape, T.placement.replicated(), T.bfloat16),
+        rank_id: T.dist.RankId,
+    ):
+        with T.Kernel():
+            src = T.alloc_shared(shape, T.bfloat16)
+            dst = T.alloc_shared(shape, T.bfloat16)
+            ready = T.dist.signals(endpoint_count if count is None else count, kind=signal_kind, expect=expect)
+            single = T.dist.signal()
+            if form == "both":
+                T.dist.all_to_all(src, dst, signal=single, signals=ready, domain=domain)
+            elif form == "neither":
+                T.dist.all_to_all(src, dst, domain=domain)
+            elif form == "wrong_type":
+                T.dist.all_to_all(src, dst, signals=single, domain=domain)
+            else:
+                done = T.dist.all_to_all(A if src_dram else src, B if dst_dram else dst, signals=ready, domain=domain, submit=submit)
+                if not submit:
+                    T.dist.submit()
+                if wait_mode == "any":
+                    while T.dist.has_pending(done):
+                        source = T.dist.wait_any(done)
+                        T.evaluate(source)
+                elif wait_mode == "group":
+                    T.dist.wait_all(ready)
+                else:
+                    T.dist.wait_all(done)
+
+    return main
+
+
+@pytest.mark.parametrize("domain,world_size", [("rank", 2), ("rank", 4), ("row", 2)])
+def test_alltoall_signals_route_members_and_completion_deltas(domain, world_size):
+    func = alltoall_signals_kernel_factory.get_tir(domain=domain, world_size=world_size)
+    result = lower_to_device_tir(func, capture_passes=("tl.LowerDistCollectives", "tl.LowerDistCommunication"))
+    collective = result.pass_snapshot("tl.LowerDistCollectives").mod
+    calls = collect_calls(collective, "tl.tileop.dist_put")
+    rows = 4 if domain == "row" else 1
+    endpoints = world_size * rows
+    assert len(calls) == endpoints
+    assert collect_op_names(collective).count("tl.dist_completion") == 1
+    assert str(collect_calls(collective, "tl.dist_completion")[0].args[-1].value) == f"all_to_all_{domain}"
+    rank_var = func.params[int(func.attrs["tl.dist.rank_id_param_index"])]
+    analyzer = tvm.arith.Analyzer()
+    for call in calls:
+        route = call.args[4]
+        assert route.op.name == "tl.dist_signal_group_route"
+        for rank in range(world_size):
+            for row in range(4):
+                values = {rank_var: tvm.tir.IntImm("int32", rank), call.args[5]: tvm.tir.IntImm("int32", row * 4 + 1)}
+
+                def evaluate(expr, substitution=values):
+                    return int(analyzer.simplify(tvm.tir.stmt_functor.substitute(expr, substitution)))
+
+                source = rank * rows + (row if domain == "row" else 0)
+                destination = evaluate(call.args[2]) * rows + (evaluate(call.args[3]) if domain == "row" else 0)
+                assert evaluate(route.args[1]) == source
+                assert evaluate(route.args[2]) == source * endpoints + destination
+                assert evaluate(route.args[3]) == 1
+
+    lowered = result.pass_snapshot("tl.LowerDistCommunication").mod
+    init = collect_calls(lowered, "tl.dist_completion_init_")
+    assert len(init) == 1
+    assert len(init[0].args[5:]) == endpoints
+    for rank in range(world_size):
+        deltas = [
+            int(analyzer.simplify(tvm.tir.stmt_functor.substitute(delta, {rank_var: tvm.tir.IntImm("int32", rank)})))
+            for delta in init[0].args[5:]
+        ]
+        assert deltas == [int(index // rows != rank) for index in range(endpoints)]
+    names = collect_op_names(result.device_mod)
+    assert "tl.tileop.dist_alltoall" not in names
+    assert "tl.dist_completion_init_" not in names
+    assert names.count("tl.dist_wait_any_") == 1
+    assert names.count("tl.dist_submit_") == 1
+
+
+@pytest.mark.parametrize("domain", ["rank", "row"])
+@pytest.mark.parametrize("kind_name", ["FLAGREG_INC", "FLAGREG_VALUE", "MEMORY"])
+@pytest.mark.parametrize("dst_dram", [False, True])
+def test_alltoall_signals_support_kinds_and_generation_layout(domain, kind_name, dst_dram):
+    kind = getattr(T.dist.SignalKind, ("DRAM_" if dst_dram else "SRAM_") + kind_name)
+    func = alltoall_signals_kernel_factory.get_tir(
+        domain=domain,
+        signal_kind=kind,
+        dst_dram=dst_dram,
+        wait_mode="any",
+        world_size=2,
+    )
+    result = lower_to_device_tir(func, capture_passes=("tl.PlanDistSignals", "tl.LowerDistCommunication"))
+    planned = next(iter(result.pass_snapshot("tl.PlanDistSignals").mod.functions.values()))
+    endpoints = 8 if domain == "row" else 2
+    assert int(planned.attrs["tl.dist.signal_counts"][kind.value]) == endpoints
+    lower_comm = result.pass_snapshot("tl.LowerDistCommunication").mod
+    allocations = collect_nodes(lower_comm, tvm.tir.Allocate, lambda node: "generation" in node.buffer_var.name)
+    if kind_name == "FLAGREG_INC":
+        assert not allocations
+    else:
+        assert [tuple(int(extent) for extent in node.extents) for node in allocations] == [(endpoints * endpoints,)]
+    assert collect_op_names(result.device_mod).count("tl.dist_wait_any_") == 1
+
+
+@pytest.mark.parametrize("src_dram,dst_dram", [(False, False), (False, True), (True, False), (True, True)])
+def test_alltoall_signals_scope_combinations_and_explicit_submit(src_dram, dst_dram):
+    result = lower_to_device_tir(
+        alltoall_signals_kernel_factory.get_tir(
+            src_dram=src_dram,
+            dst_dram=dst_dram,
+            submit=False,
+            expect="auto",
+            world_size=2,
+        )
+    )
+    names = collect_op_names(result.device_mod)
+    assert names.count("tl.dist_submit_") == 1
+    assert names.count("tl.dist_wait_any_") == 1
+
+
+@pytest.mark.parametrize("domain,count", [("rank", 3), ("row", 2)])
+def test_alltoall_signals_require_one_member_per_source_endpoint(domain, count):
+    with pytest.raises(ValueError, match="requires .* signals"):
+        alltoall_signals_kernel_factory.get_tir(domain=domain, count=count, world_size=2)
+
+
+@pytest.mark.parametrize("form", ["both", "neither", "wrong_type"])
+def test_alltoall_signals_reject_invalid_signal_forms(form):
+    with pytest.raises(TypeError, match="exactly one of signal or signals|signals must be created"):
+        alltoall_signals_kernel_factory.get_tir(form=form, world_size=2)
+
+
+def test_alltoall_signals_reject_manual_expect():
+    with pytest.raises(ValueError, match="cannot use expect='manual'"):
+        alltoall_signals_kernel_factory.get_tir(expect="manual", world_size=2)
+
+
+@tilelang.jit(target="sunmmio")
+def repeated_alltoall_signals_kernel_factory(wait_mode="all", world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            src = T.alloc_shared((world_size, 4, 8), T.bfloat16)
+            dst0 = T.alloc_shared((world_size, 4, 8), T.bfloat16)
+            dst1 = T.alloc_shared((world_size, 4, 8), T.bfloat16)
+            ready = T.dist.signals(world_size, kind=T.dist.SignalKind.SRAM_FLAGREG_VALUE)
+            first = T.dist.all_to_all(src, dst0, signals=ready, submit=True)
+            if wait_mode == "all":
+                T.dist.wait_all(first)
+            elif wait_mode == "any":
+                while T.dist.has_pending(first):
+                    T.dist.wait_any(first)
+            elif wait_mode == "partial":
+                T.dist.wait_any(first)
+            second = T.dist.all_to_all(src, dst1, signals=ready, submit=True)
+            if wait_mode == "group":
+                T.dist.wait_all(ready)
+            else:
+                T.dist.wait_all(second)
+
+    return main
+
+
+@pytest.mark.parametrize("wait_mode", ["all", "any", "group"])
+def test_alltoall_signals_reuse_with_independent_payload_slots(wait_mode):
+    result = lower_to_device_tir(
+        repeated_alltoall_signals_kernel_factory.get_tir(wait_mode=wait_mode, world_size=2), capture_passes="tl.LowerDistCommunication"
+    )
+    lowered = result.pass_snapshot("tl.LowerDistCommunication").mod
+    allocations = collect_nodes(lowered, tvm.tir.Allocate, lambda node: "generation" in node.buffer_var.name)
+    assert [tuple(int(extent) for extent in node.extents) for node in allocations] == [(4,)]
+    names = collect_op_names(result.device_mod)
+    assert names.count("tl.dist_put_") == 2
+    assert names.count("tl.dist_wait_any_") == (0 if wait_mode == "group" else 2)
+
+
+def test_alltoall_signals_reject_reuse_after_partial_progress():
+    with pytest.raises(tvm.error.InternalError, match="previous completion must be drained"):
+        lower_to_device_tir(repeated_alltoall_signals_kernel_factory.get_tir(wait_mode="partial", world_size=2))
+
+
+@tilelang.jit(target="sunmmio")
+def alltoall_signals_offset_kernel_factory(world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            src = T.alloc_shared((2 * world_size, 4, 8), T.bfloat16)
+            dst = T.alloc_shared((2 * world_size, 4, 8), T.bfloat16)
+            ready = T.dist.signals(world_size)
+            for e in T.serial(2):
+                done = T.dist.all_to_all(
+                    src[e * world_size : (e + 1) * world_size, :, :],
+                    dst[e * world_size : (e + 1) * world_size, :, :],
+                    signals=ready,
+                    submit=True,
+                )
+                T.dist.wait_all(done)
+
+    return main
+
+
+def test_alltoall_signals_support_independent_loop_slots():
+    func = alltoall_signals_offset_kernel_factory.get_tir(world_size=2)
+    result = lower_to_device_tir(func, capture_passes="tl.LowerDistCollectives")
+    expanded = result.pass_snapshot("tl.LowerDistCollectives").mod
+    puts = collect_calls(expanded, "tl.tileop.dist_put")
+    assert len(puts) == 2
+    loop = collect_nodes(expanded, tvm.tir.For)[0]
+    rank = func.params[int(func.attrs["tl.dist.rank_id_param_index"])]
+    analyzer = tvm.arith.Analyzer()
+    for iteration in range(2):
+        for source_rank in range(2):
+            values = {loop.loop_var: tvm.tir.IntImm("int32", iteration), rank: tvm.tir.IntImm("int32", source_rank)}
+            for put in puts:
+                target_rank = int(analyzer.simplify(tvm.tir.stmt_functor.substitute(put.args[2], values)))
+                for operand, peer in [(0, target_rank), (1, source_rank)]:
+                    region = put.args[operand]
+                    index = region.args[0].indices[0]
+                    assert int(analyzer.simplify(tvm.tir.stmt_functor.substitute(index, values))) == iteration * 2 + peer
+                    assert [int(x) for x in region.args[2:]] == [1, 4, 8]
+    assert collect_op_names(result.device_mod).count("tl.dist_put_") == 1
+    assert collect_op_names(result.device_mod).count("tl.dist_wait_any_") == 1
+
+
+@tilelang.jit(target="sunmmio")
+def nested_offset_alltoall_kernel_factory(error=None, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            src = T.alloc_shared((4 * world_size, 32, 128), T.bfloat16)
+            dst = T.alloc_shared((4 * world_size, 32, 128), T.bfloat16)
+            ready = T.dist.signals(world_size)
+            for expert in T.serial(2):
+                for block in T.serial(2):
+                    begin = (expert * 2 + block) * world_size
+                    output_begin = block * world_size if error == "reuse" else begin
+                    if error != "rank_condition" or rank_id == 0:
+                        done = T.dist.all_to_all(
+                            src[begin : begin + world_size, :, :],
+                            dst[output_begin : output_begin + world_size, :, :],
+                            signals=ready,
+                            submit=True,
+                        )
+                        T.dist.wait_all(done)
+                    if error == "early_exit":
+                        break
+
+    return main
+
+
+def test_alltoall_loop_offsets_support_flattened_nested_slots():
+    result = lower_to_device_tir(nested_offset_alltoall_kernel_factory.get_tir(world_size=2), capture_passes="tl.LowerDistCollectives")
+    expanded = result.pass_snapshot("tl.LowerDistCollectives").mod
+    assert len(collect_nodes(expanded, tvm.tir.For)) == 2
+    assert len(collect_calls(expanded, "tl.tileop.dist_put")) == 2
+    assert collect_op_names(result.device_mod).count("tl.dist_wait_any_") == 1
+
+
+@pytest.mark.parametrize(
+    "error,message",
+    [
+        ("reuse", "independent destination slots"),
+        ("rank_condition", "Rank/core-uniform control flow"),
+        ("early_exit", "without early exits"),
+    ],
+)
+def test_alltoall_loop_offsets_reject_unsafe_loop_context(error, message):
+    func = nested_offset_alltoall_kernel_factory.get_tir(error=error, world_size=2)
+    with pytest.raises(tvm.error.InternalError, match=message):
+        lower_collectives(func)
+
+
+def test_alltoall_loop_offsets_reject_rank_dependent_block_predicate():
+    func = nested_offset_alltoall_kernel_factory.get_tir(world_size=2)
+    rank = func.params[int(func.attrs["tl.dist.rank_id_param_index"])]
+    guarded = tvm.tir.BlockRealize([], rank == 0, tvm.tir.Block([], [], [], "guard", func.body))
+    with pytest.raises(tvm.error.InternalError, match="Rank/core-uniform control flow"):
+        lower_collectives(func.with_body(guarded))
+
+
+@tilelang.jit(target="sunmmio")
+def row_offset_alltoall_kernel_factory(world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            rows = T.mesh_nrows()
+            src = T.alloc_shared((2 * world_size, rows, 32, 128), T.bfloat16)
+            dst = T.alloc_shared((2 * world_size, rows, 32, 128), T.bfloat16)
+            ready = T.dist.signals(world_size * rows)
+            for e in T.serial(2):
+                done = T.dist.all_to_all(
+                    src[e * world_size : (e + 1) * world_size, :, :, :],
+                    dst[e * world_size : (e + 1) * world_size, :, :, :],
+                    signals=ready,
+                    domain="row",
+                    submit=True,
+                )
+                T.dist.wait_all(done)
+
+    return main
+
+
+def test_alltoall_loop_offsets_do_not_enable_cross_row_routing():
+    with pytest.raises(tvm.error.InternalError, match="only support the RANK domain"):
+        lower_collectives(row_offset_alltoall_kernel_factory.get_tir(world_size=2))

@@ -12,6 +12,7 @@
 #include <tvm/runtime/logging.h>
 #include <tvm/tir/op.h>
 
+#include "../layout/cute_layout.h"
 #include "../op/builtin.h"
 #include "../op/comm.h"
 #include "utils.h"
@@ -312,6 +313,13 @@ bool SupportsSunmmioDirectTransfer(Target target,
 
   auto mcpu = target->GetAttr<ffi::String>("mcpu");
   if (mcpu.has_value() && mcpu.value() != "sunmmio-a4e") {
+    return false;
+  }
+
+  // MX is a data+scale storage container, not a vector register element type.
+  // Moving an MX container uses DMA; quantization is an explicit operation.
+  if (mechanism == SunmmioTransferMechanism::kTile &&
+      (sunmmio::IsMXDType(src_dtype) || sunmmio::IsMXDType(dst_dtype))) {
     return false;
   }
 

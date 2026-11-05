@@ -147,9 +147,13 @@ def test_reduce_elides_only_empty_syncs(tmp_path, reduce_op, combine_op):
     )
 
     sync_lines = [line for line in src.splitlines() if "suvm.sync" in line]
-    assert len(sync_lines) == 3
-    assert sum("vector,rsram" in line.replace(" ", "") for line in sync_lines) == 2
+    # Pure tile operations across the initialization branch need no extra
+    # branch-entry drain. Preserve the completion before the async output copy.
+    assert len(sync_lines) == 2
+    assert sum("vector,rsram" in line.replace(" ", "") for line in sync_lines) == 1
     assert sum("odma0" in line for line in sync_lines) == 1
+    assert src.rindex("suvm.tile.store") < src.index(sync_lines[0].strip()) < src.index("suvm.copy_async")
+    assert src.index("suvm.copy_async") < src.index(sync_lines[1].strip())
     assert not re.search(r"suvm\.tile\.fill[^\n]*\n\s*suvm\.sync", src)
     assert not re.search(
         rf"suvm\.tile\.load[^\n]*\n[^\n]*{re.escape(combine_op)}[^\n]*\n\s*suvm\.sync",
