@@ -82,6 +82,11 @@ public:
                             const SunMMIOValue &v, const SunMMIOType &dst_type,
                             DataType dst_dtype) = 0;
 
+  virtual SunMMIOValue TileBitcast(const std::string &result_name,
+                                   const SunMMIOValue &value,
+                                   const SunMMIOType &result_type,
+                                   DataType dtype) = 0;
+
   virtual SunMMIOValue Binary(const std::string &result_name, BinaryOp op,
                               ArithmeticFlavor flavor, const SunMMIOValue &a,
                               const SunMMIOValue &b,
@@ -482,6 +487,9 @@ private:
   int ssa_counter_{0};
 
   std::unordered_map<const tir::VarNode *, SunMMIOValue> var_table_;
+  std::unordered_map<const tir::VarNode *,
+                     std::pair<SunMMIOValue, SunMMIOValue>>
+      mx_fields_;
   std::unordered_map<const tir::VarNode *, SunMMIOValue> local_var_table_;
   std::unordered_map<const tir::BufferNode *, BufferBinding> buffer_registry_;
   std::unordered_map<const tir::VarNode *, tir::Buffer> buffer_data_to_buffer_;

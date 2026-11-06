@@ -23,11 +23,15 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/tir/analysis.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
+#include <unordered_set>
 
+#include "../op/builtin.h"
 #include "arith/ir_mutator_with_analyzer.h"
+#include "common/mx_view.h"
 
 namespace tvm {
 namespace tl {
@@ -66,7 +70,26 @@ private:
     }
   }
 
+  PrimExpr VisitExpr_(const CallNode *node) final {
+    PrimExpr expr = arith::IRMutatorWithAnalyzer::VisitExpr_(node);
+    if (auto call = expr.as<Call>())
+      return RewriteMXCopyAnnotations(
+          call.value(), [&](const PrimExpr &x) { return VisitExpr(x); });
+    return expr;
+  }
+
   Stmt VisitStmt_(const LetStmtNode *node) final {
+    if (HasMXShapePlaceholder(node->value) ||
+        UsesVar(node->value, [&](const VarNode *var) {
+          return mx_shape_vars_.count(var);
+        })) {
+      mx_shape_vars_.insert(node->var.get());
+      return StmtExprMutator::VisitStmt_(node);
+    }
+    if (const auto *call = node->value.as<CallNode>();
+        call && call->op.same_as(mx_field_handle())) {
+      return StmtExprMutator::VisitStmt_(node);
+    }
     let_bindings_[node->var.get()] = node->value;
     return arith::IRMutatorWithAnalyzer::VisitStmt(node->body);
   }
@@ -78,6 +101,7 @@ private:
 
   int parallel_for_scope_ = 0;
   std::unordered_map<const VarNode *, PrimExpr> let_bindings_;
+  std::unordered_set<const VarNode *> mx_shape_vars_;
 };
 
 using namespace tir::transform;

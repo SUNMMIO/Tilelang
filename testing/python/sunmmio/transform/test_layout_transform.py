@@ -360,10 +360,10 @@ def test_mxzz_dram_splits_with_mxzz_staging():
 
 
 def test_mxznz_dram_to_mx_row_major_rsram_is_rejected():
-    """SUVM transform_layout currently supports only MXZZ <-> MX row-major."""
+    """MXZNZ staging conflicts are diagnosed before layout-transform lowering."""
     target = determine_target("Sunmmio", return_object=True)
     mod = mxznz_dram_to_mx_row_major_rsram_kernel()
-    with tvm.target.Target(target), pytest.raises(Exception, match="MX row-major <-> MXZZ"):
+    with tvm.target.Target(target), pytest.raises(Exception, match="MX weight layout conflict.*requires MXZNZ"):
         apply_passes_through_lower_tile_op(mod, target)
 
 

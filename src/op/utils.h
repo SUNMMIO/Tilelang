@@ -14,6 +14,7 @@
 #include <tvm/tir/op.h>
 
 #include <functional>
+#include <optional>
 
 namespace tvm {
 namespace tl {
@@ -36,6 +37,20 @@ TVM_DLL bool IsBufferLikeExpr(const PrimExpr &expr);
 // to BufferRegion so ops can uniformly consume regions.
 // Note: tvm_access_ptr is no longer supported here.
 TVM_DLL BufferRegion NormalizeToBufferRegion(const PrimExpr &arg);
+
+// Propagate the MXZNZ requirement of a non-transposed MX weight transfer.
+// Nullopt means this is not a weight-layout edge; an empty map means the
+// edge is handled but no replaceable defaults remain.
+std::optional<LayoutMap>
+InferSunmmioMXWeightTransferLayout(const LayoutInferArgs &args,
+                                   const Buffer &src, const Buffer &dst,
+                                   InferLevel level);
+
+// Validate weight-layout edges after inference has reached its final layouts.
+void ValidateSunmmioMXWeightTransferLayout(const LayoutInferArgs &args,
+                                           const BufferRegion &src,
+                                           const BufferRegion &dst,
+                                           const char *op_name);
 
 // Report each PrimExpr root directly inspected while normalizing. Nested
 // expressions that are forwarded as Range minima are left for the downstream

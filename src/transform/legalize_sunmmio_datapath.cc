@@ -105,6 +105,13 @@ private:
 
     const Buffer &src = src_br->buffer;
     const Buffer &dst = dst_br->buffer;
+    if (is_copy &&
+        (sunmmio::IsMXDType(src->dtype) || sunmmio::IsMXDType(dst->dtype))) {
+      ICHECK(src->dtype == dst->dtype)
+          << "Sunmmio T.copy does not support implicit MX dtype conversion: "
+          << src->name << " (" << src->dtype << ") -> " << dst->name << " ("
+          << dst->dtype << "). Use explicit MX quantization/dequantization.";
+    }
     CommunicationDirections communication_directions =
         CommunicationDirections::kNone;
     // MX blocks in DRAM include scale prefixes, so a matrix plane is not

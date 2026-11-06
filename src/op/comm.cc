@@ -169,15 +169,12 @@ Stmt MakeBroadcastLeaf(PrimExpr src_region, PrimExpr dst_region, int direction,
 /*!
  * \brief Sunmmio SRAM layout inference for symmetric comm ops.
  *
- * Propagates layout between src and dst via DeriveLayoutLike.
- * Always proposes — TryAssign handles priority and conflict detection.
+ * Propagates layout between src and dst via dtype-aware derivation.
+ * MX weights share the copy constraint rule and do not propagate defaults.
  *
- * No validation here: the level-based priority system in TryAssign
- * determines whether proposals are accepted or rejected.  When a buffer
- * is immutable (T.annotate_layout / DRAM metadata), TryAssign catches
- * any kStrict conflict.  kCommon proposals against immutable entries
- * are silently rejected — they arise from BFS noise (e.g., derived from
- * kFree defaults) and are not real constraints.
+ * TryAssign handles priority and conflict detection. MX weight edges are
+ * also validated after propagation, including conflicts with immutable
+ * annotations and DRAM metadata that kCommon proposals cannot overwrite.
  */
 static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
                                         const Buffer &src, const Buffer &dst,
@@ -186,9 +183,24 @@ static LayoutMap SunmmioCommInferLayout(const LayoutInferArgs &T,
   if (level >= InferLevel::kStrict)
     return {};
 
+  auto weight_layouts = InferSunmmioMXWeightTransferLayout(T, src, dst, level);
+  if (weight_layouts.has_value())
+    return *weight_layouts;
+
   LayoutMap result;
   bool src_has = T.layout_map.count(src);
   bool dst_has = T.layout_map.count(dst);
+  if (sunmmio::IsMXDType(src->dtype) || sunmmio::IsMXDType(dst->dtype)) {
+    // A default is not a requirement. Promoting it to kCommon would block
+    // a later MXZNZ requirement arriving through a neighboring copy.
+    auto established = [&](const Buffer &buffer) {
+      return !T.layout_levels.count(buffer) ||
+             T.layout_levels[buffer].IntValue() >
+                 static_cast<int>(InferLevel::kFree);
+    };
+    src_has = src_has && established(src);
+    dst_has = dst_has && established(dst);
+  }
 
   // NZ/MXNNZ WSRAM dst: its src is staged as ZZ/MXZNZ (the transfer does
   // ZZ->NZ or MXZNZ->MXNNZ), so infer the matching source layout. dst is

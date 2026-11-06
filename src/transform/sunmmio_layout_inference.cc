@@ -24,8 +24,11 @@
 #include "../layout/cute_layout.h"
 #include "../layout/layout.h"
 #include "../op/builtin.h"
+#include "../op/comm.h"
+#include "../op/copy.h"
 #include "../op/operator.h"
 #include "../op/region.h"
+#include "../op/utils.h"
 #include "../target/sunmmio_utils.h"
 #include "../target/utils.h"
 #include "common/global_layout_utils.h"
@@ -41,6 +44,10 @@ using namespace tir;
 
 PrimFunc SunmmioLayoutInferencePass::Run(PrimFunc f) {
   SunmmioLayoutInferencePass pass;
+  f = NormalizeMXViewBindings(std::move(f));
+  pass.mx_views_ = CollectMXViews(f->body);
+  for (const auto &[_, info] : pass.mx_views_)
+    pass.unresolved_fields_ |= !info.binding->annotations.count(kMXFieldLayout);
 
   // Extract target
   auto target_opt = f->GetAttr<Target>(tvm::attr::kTarget);
@@ -69,8 +76,48 @@ PrimFunc SunmmioLayoutInferencePass::Run(PrimFunc f) {
   // Phase 5A: Alias propagation
   pass.PropagateAliases();
 
+  if (pass.unresolved_fields_) {
+    Map<Var, Array<PrimExpr>> shapes;
+    Map<Var, Layout> layouts;
+    Map<Var, Integer> offsets;
+    auto infer =
+        ffi::Function::GetGlobalRequired("tl.sunmmio.InferMXFieldDescriptors");
+    std::unordered_map<const VarNode *, Array<Map<String, ObjectRef>>>
+        descriptors;
+    for (const auto &[handle, info] : pass.mx_views_) {
+      const Buffer &parent = info.parent;
+      ICHECK(parent.scope() == kSunmmioScopeRSRAM)
+          << "T.mx_view requires its parent allocation in shared.rsram";
+      Layout layout = pass.layout_entries_.at(parent).layout;
+      auto analysis =
+          sunmmio::AnalyzeMXLayout(layout, parent->dtype, &pass.analyzer_);
+      ICHECK(analysis && analysis->kind != sunmmio::MXLayoutKind::kMXNNZ)
+          << "T.mx_view supports MXZZ, MXZNZ and MX row-major layouts";
+      if (!descriptors.count(parent->data.get())) {
+        descriptors[parent->data.get()] =
+            infer(pass.target_, parent, layout)
+                .cast<Array<Map<String, ObjectRef>>>();
+      }
+      const auto &fields = descriptors.at(parent->data.get());
+      shapes.Set(parent->data,
+                 Downcast<Array<PrimExpr>>(fields[1].at("shape")));
+      Var var = ffi::GetRef<Var>(handle);
+      layouts.Set(parent->data, layout);
+      layouts.Set(var, Downcast<Layout>(fields[info.field].at("layout")));
+      offsets.Set(var, Downcast<Integer>(fields[info.field].at("byte_offset")));
+    }
+    f = ResolveMXViewShapes(std::move(f), shapes, layouts, offsets);
+    return Run(std::move(f));
+  }
+
+  // Validate final transfer constraints, including immutable input layouts.
+  pass.ValidateMXWeightTransfers();
+
   // Phase 6: Apply annotations to IR
-  return pass.ApplyToIR(std::move(f));
+  f = pass.ApplyToIR(std::move(f));
+  if (!pass.mx_views_.empty())
+    CheckMXViewResolved(f);
+  return f;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +243,13 @@ public:
     }
   }
 
+  void CollectBuffer(const Buffer &buffer) { RegisterBuffer(buffer); }
+
+  void VisitStmt_(const DeclBufferNode *op) final {
+    RegisterBuffer(op->buffer);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
 private:
   /*!
    * \brief Extract a Buffer from a TileOp call argument.
@@ -296,6 +350,21 @@ void SunmmioLayoutInferencePass::Collect(const PrimFunc &f) {
                                &let_var_to_expr_);
   collector.CollectFuncBuffers(f);
   collector(f->body);
+  for (const auto &[_, info] : mx_views_)
+    collector.CollectBuffer(info.parent);
+  if (unresolved_fields_) {
+    for (const Buffer &buffer : sram_buffers_) {
+      bool pending = mx_views_.count(buffer->data.get());
+      for (const PrimExpr &extent : buffer->shape)
+        pending |= HasMXShapePlaceholder(extent);
+      if (!pending)
+        continue;
+      deferred_buffers_.insert(buffer);
+      for (int i : buffer_to_ops_[buffer])
+        if (i >= 0)
+          deferred_ops_.insert(i);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +372,20 @@ void SunmmioLayoutInferencePass::Collect(const PrimFunc &f) {
 // ---------------------------------------------------------------------------
 
 void SunmmioLayoutInferencePass::SeedImmutableLayouts(const PrimFunc &f) {
+  if (!unresolved_fields_) {
+    for (const auto &[handle, info] : mx_views_) {
+      TryAssign(info.parent,
+                Downcast<Layout>(info.binding->annotations.at(kMXParentLayout)),
+                InferLevel::kStrict, -1, true);
+      Var var = ffi::GetRef<Var>(handle);
+      if (buffer_data_to_buffers_.count(var))
+        for (const Buffer &field : buffer_data_to_buffers_[var])
+          TryAssign(
+              field,
+              Downcast<Layout>(info.binding->annotations.at(kMXFieldLayout)),
+              InferLevel::kStrict, -1, true);
+    }
+  }
   // 2a: DRAM layouts from tensor_meta
   PopulateGlobalBufferLayouts(f, target_, &global_layout_map_);
 
@@ -322,7 +405,37 @@ void SunmmioLayoutInferencePass::SeedImmutableLayouts(const PrimFunc &f) {
 
   // 2b: User-annotated layouts from T.annotate_layout
   for (const auto &[buf, layout] : annotated_layout_map_) {
+    ICHECK(!mx_views_.count(buf->data.get()))
+        << "MX field layouts are derived from the parent and cannot be "
+           "annotated";
     TryAssign(buf, layout, InferLevel::kStrict, -1, /*immutable=*/true);
+  }
+  if (!unresolved_fields_) {
+    for (const TileOperator &op : op_list_) {
+      const auto *copy = op.as<CopyNode>();
+      if (!copy)
+        continue;
+      for (const auto &[field, peer] : {std::make_pair(copy->src, copy->dst),
+                                        std::make_pair(copy->dst, copy->src)}) {
+        auto view = mx_views_.find(field->data.get());
+        if (view == mx_views_.end() || mx_views_.count(peer->data.get()) ||
+            layout_entries_.count(peer) || peer.scope() != kSunmmioScopeRSRAM)
+          continue;
+        Layout parent_layout = Downcast<Layout>(
+            view->second.binding->annotations.at(kMXParentLayout));
+        auto parent = sunmmio::AnalyzeMXLayout(
+            parent_layout, view->second.parent->dtype, &analyzer_);
+        if (view->second.field == 1 ||
+            parent->kind == sunmmio::MXLayoutKind::kRowMajor) {
+          TryAssign(
+              peer,
+              sunmmio::MakeAlignedRowMajor(
+                  peer->shape, peer->dtype,
+                  GetSunmmioTileProcessorConfig(target_).rsram_align_bytes),
+              InferLevel::kCommon, -1);
+        }
+      }
+    }
   }
 }
 
@@ -335,6 +448,8 @@ void SunmmioLayoutInferencePass::AssignDefaults() {
   // buffer that doesn't already have a layout (from Phase 2 immutables).
   // These can be overridden by kStrict (Phase 4) or kCommon (Phase 5).
   for (const auto &buf : sram_buffers_) {
+    if (deferred_buffers_.count(buf))
+      continue;
     if (layout_entries_.count(buf))
       continue;
 
@@ -368,6 +483,8 @@ void SunmmioLayoutInferencePass::AssignDefaults() {
 
   // Final check: every SRAM buffer must have a layout
   for (const auto &buf : sram_buffers_) {
+    if (deferred_buffers_.count(buf))
+      continue;
     ICHECK(layout_entries_.count(buf))
         << "SunmmioLayoutInference: Buffer " << buf->name
         << " (scope=" << buf.scope() << ") has no layout after inference.";
@@ -380,6 +497,8 @@ void SunmmioLayoutInferencePass::AssignDefaults() {
 
 void SunmmioLayoutInferencePass::SeedStrictLayouts() {
   for (int i = 0; i < static_cast<int>(op_list_.size()); ++i) {
+    if (deferred_ops_.count(i))
+      continue;
     auto args = BuildInferArgs();
     auto updates = op_list_[i]->InferLayout(args, InferLevel::kStrict);
     for (const auto &[buf, layout] : updates) {
@@ -427,12 +546,13 @@ void SunmmioLayoutInferencePass::PropagateBFS() {
     int op_idx = queue.front();
     queue.pop_front();
     in_queue[op_idx] = false;
+    if (deferred_ops_.count(op_idx))
+      continue;
 
     // Generic kCommon via operator InferLayout.
     // Each op returns layout assignments for its operands (or {} if it has
-    // nothing to propose).  Copy returns {} — it does not propagate layouts;
-    // a DRAM<->RSRAM mismatch is bridged later in CopyNode::Lower by
-    // splitting into a dma_copy plus a sunmmio_layout_transform.
+    // nothing to propose). MX weight requirements also propagate through
+    // copies; other copies retain their layout-transform lowering policy.
     auto args = BuildInferArgs();
     auto updates = op_list_[op_idx]->InferLayout(args, InferLevel::kCommon);
 
@@ -487,6 +607,34 @@ void SunmmioLayoutInferencePass::PropagateAliases() {
             << "SunmmioLayoutInference: Cannot derive layout for alias "
             << buf->name << " from representative layout.";
       }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5B: Validate final MX weight transfer layouts
+// ---------------------------------------------------------------------------
+
+void SunmmioLayoutInferencePass::ValidateMXWeightTransfers() {
+  auto args = BuildInferArgs();
+  for (const TileOperator &op : op_list_) {
+    if (const auto *copy = op.as<CopyNode>()) {
+      ValidateSunmmioMXWeightTransferLayout(
+          args, BufferRegion(copy->src, copy->src_range),
+          BufferRegion(copy->dst, copy->dst_range), "T.copy");
+    } else if (const auto *gather = op.as<AllgatherOpNode>()) {
+      ValidateSunmmioMXWeightTransferLayout(
+          args, NormalizeToBufferRegion(gather->send),
+          NormalizeToBufferRegion(gather->recv), "T.comm.all_gather");
+    } else if (const auto *broadcast = op.as<BroadcastOpNode>()) {
+      ValidateSunmmioMXWeightTransferLayout(
+          args, BufferRegion(broadcast->src, broadcast->src_range),
+          BufferRegion(broadcast->dst, broadcast->dst_range),
+          "T.comm.broadcast");
+    } else if (const auto *put = op.as<PutOpNode>()) {
+      ValidateSunmmioMXWeightTransferLayout(
+          args, BufferRegion(put->src, put->src_range),
+          BufferRegion(put->dst, put->dst_range), "T.comm.put");
     }
   }
 }

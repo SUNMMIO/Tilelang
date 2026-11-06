@@ -463,12 +463,12 @@ def test_aligned_row_effective_rank3_uses_direct_dma(direction, tmp_path):
     [
         pytest.param(
             aligned_row_non_singleton_reshape_kernel,
-            "canonical logical shapes do not match",
+            "matching effective region shapes",
             id="non-singleton-reshape",
         ),
         pytest.param(
             aligned_row_byte_aligned_reshape_kernel,
-            "canonical logical shapes do not match",
+            "matching effective region shapes",
             id="byte-aligned-reshape",
         ),
         pytest.param(

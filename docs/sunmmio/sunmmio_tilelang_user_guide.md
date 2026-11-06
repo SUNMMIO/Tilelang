@@ -1059,6 +1059,32 @@ for k in T.Pipelined(loop_extent, num_stages=3):
 
 The loop body usually contains copy, inter-core communication, and compute. Users need to keep data dependencies clear, for example making sure the related inputs have already been moved or communicated before using a tile for computation.
 
+### 3.10 MX Field Views
+
+`data, scale = T.mx_view(mx)` returns writable Buffer aliases for the MX payload and scale fields. The parent MX owns their storage. Creating views does not allocate, copy, initialize, quantize, or dequantize data. Field writes update the parent, and existing views observe subsequent legal transfers into the parent.
+
+This fragment initializes the fields directly, without a subsequent `mx_pack`:
+
+```python
+mx = T.alloc_shared((64, 64), T.mxfp8, scope="shared.rsram")
+data, scale = T.mx_view(mx)
+for i, j in T.Tiles(data.shape):
+    data[i, j] = T.Cast(T.float8_e4m3fn, T.bfloat16(1))
+for block, row in T.Tiles(scale.shape):
+    scale[block, row] = T.Cast(T.float8_e8m0fnu, T.bfloat16(1))
+```
+
+- The parent must be a complete, independently allocated, static rank-2 RSRAM MXFP4/MXFP8 buffer with a valid MXZZ, MXZNZ, or MX row-major layout. Valid padded layouts are supported.
+- The payload uses FP4 E2M1FN or FP8 E4M3FN; scales use E8M0. Scale shape and coordinates follow the parent's physical coverage and block order. Scale coordinates are not interchangeable between layouts.
+- The compiler may infer the parent layout. Scale shape is resolved during layout inference and can be used in TIR loops, Tiles, allocations, and slices, but not in early Python `int()` or `range()` evaluation.
+- Fields support legal Tiles accesses and copies with RSRAM buffers of the same dtype, including fields of another MX allocation. Cast quantized fields to BF16/F32 for ordinary arithmetic; conversions between F32 and quantized types go through BF16.
+- Standalone scalar field access outside Tiles is unsupported. Indices used only to describe copy regions remain valid; actual accesses must satisfy layout, alignment, and bounds constraints.
+- Declare views once per parent allocation and reuse the returned buffers. Derived storage aliases, independent field layout/scope changes, raw pointer export, direct global DMA, and collectives are unsupported.
+- Automatic pipelining involving the parent or its fields is rejected. Unrelated pipelines remain available.
+- `T.annotate_safe_value` is currently unsupported in functions using `T.mx_view`, including annotations on ordinary buffers in the same function.
+
+`T.mx_pack` and `T.mx_unpack` retain their copying semantics. Initialize values before reading them and prepare the corresponding payload and scales before consuming the complete MX buffer.
+
 ## 4. Examples
 
 This section gives 3 complete kernel examples. To keep the main structure clear, the examples assume that the problem size is divisible by block size and mesh partitioning. Real engineering code needs additional boundary handling.

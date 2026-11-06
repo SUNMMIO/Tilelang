@@ -21,6 +21,7 @@
 #include <tvm/tir/transform.h>
 
 #include "../op/builtin.h"
+#include "common/mx_view.h"
 
 #include <unordered_map>
 #include <unordered_set>
@@ -469,6 +470,8 @@ public:
  */
 class HoistableIfFinder : public StmtVisitor {
 public:
+  MXViewMap views;
+  Map<Var, PrimExpr> mx_lets;
   const IfThenElseNode *found = nullptr;
   const Var &loop_var;
   const std::unordered_set<const VarNode *> &written_vars;
@@ -498,6 +501,10 @@ public:
   void VisitStmt_(const IfThenElseNode *op) final {
     if (found)
       return;
+    if (ReadsMXField(op->condition, views, mx_lets)) {
+      StmtVisitor::VisitStmt_(op);
+      return;
+    }
     if (IsLoopInvariant(op->condition, loop_var, written_vars, &let_bindings_,
                         disallowed_vars)) {
       found = op;
@@ -520,6 +527,8 @@ public:
  */
 class LoopUnswitcher : public StmtExprMutator {
 public:
+  MXViewMap views;
+  Map<Var, PrimExpr> mx_lets;
   explicit LoopUnswitcher(bool allow_non_trivial_else)
       : allow_non_trivial_else_(allow_non_trivial_else) {}
 
@@ -546,6 +555,8 @@ public:
     // Find hoistable if
     HoistableIfFinder finder(op->loop_var, collector.written,
                              &thread_idx_vars_in_scope_);
+    finder.views = views;
+    finder.mx_lets = mx_lets;
     finder(body);
 
     Stmt result;
@@ -635,7 +646,10 @@ private:
 // --- Public API ---
 
 Stmt ApplyLoopUnswitching(Stmt stmt, bool allow_non_trivial_else) {
-  return LoopUnswitcher(allow_non_trivial_else)(std::move(stmt));
+  LoopUnswitcher rewriter(allow_non_trivial_else);
+  rewriter.views = CollectMXViews(stmt);
+  rewriter.mx_lets = CollectMXViewLets(stmt);
+  return rewriter(std::move(stmt));
 }
 
 using namespace tir::transform;

@@ -10,7 +10,10 @@ namespace tvm {
 namespace tl {
 namespace {
 
-Target MakeA4ETarget() { return Target("llvm -mcpu=sunmmio-a4e"); }
+Target MakeA4ETarget() {
+  return Target("llvm -mcpu=sunmmio-a4e "
+                "-mattr=device_mesh_nrow_4,device_mesh_ncol_4");
+}
 
 struct DirectTransferCase {
   SunmmioTransferMechanism mechanism;
@@ -93,6 +96,30 @@ TEST(SunmmioDirectTransferTest, A4EDirectCopyUsesSupportedMechanism) {
   EXPECT_FALSE(
       SupportsSunmmioDirectCopy(target, kSunmmioScopeASRAM, DataType::Float(16),
                                 kSunmmioScopeRSRAM, DataType::Float(16)));
+}
+
+TEST(SunmmioDirectTransferTest, MXContainersUseDmaAndCannotImplicitlyCast) {
+  Target target = MakeA4ETarget();
+  const DataType mx_types[] = {DataType(DataType::kCustomBegin, 8, 1),
+                               DataType(DataType::kCustomBegin + 1, 4, 1)};
+  for (DataType mx : mx_types) {
+    EXPECT_FALSE(SupportsSunmmioDirectTransfer(
+        target, SunmmioTransferMechanism::kTile, kSunmmioScopeRSRAM, mx,
+        kSunmmioScopeRSRAM, mx));
+    EXPECT_TRUE(SupportsSunmmioDirectTransfer(
+        target, SunmmioTransferMechanism::kLocalDma, kSunmmioScopeRSRAM, mx,
+        kSunmmioScopeRSRAM, mx));
+    EXPECT_TRUE(SupportsSunmmioDirectCopy(target, kSunmmioScopeRSRAM, mx,
+                                          kSunmmioScopeRSRAM, mx));
+    for (DataType other : {DataType::Float(16), mx_types[0], mx_types[1]}) {
+      if (other == mx)
+        continue;
+      EXPECT_FALSE(SupportsSunmmioDirectCopy(target, kSunmmioScopeRSRAM, mx,
+                                             kSunmmioScopeRSRAM, other));
+      EXPECT_FALSE(SupportsSunmmioDirectCopy(target, kSunmmioScopeRSRAM, other,
+                                             kSunmmioScopeRSRAM, mx));
+    }
+  }
 }
 
 TEST(SunmmioDirectTransferTest, A4EMapsCommunicationDirectionsToLinks) {

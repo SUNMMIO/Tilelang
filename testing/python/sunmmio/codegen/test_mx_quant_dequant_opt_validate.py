@@ -78,7 +78,7 @@ MX_OCP_QUANT_CASES = (
 
 
 @target("Sunmmio")
-def mx_ocp_quant_dequant_full_chain_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name, data_max):
+def mx_ocp_quant_dequant_full_chain_kernel_for_debug(mx_dtype, data_dtype, data_dtype_name, data_max, use_view=False):
     shape = (32, 32)
     shard_policy = T.placement.replicated()
     tensor_layout = make_zz_layout(shape, axes=[0, 1], block_shape=(32, 32))
@@ -94,11 +94,16 @@ def mx_ocp_quant_dequant_full_chain_kernel_for_debug(mx_dtype, data_dtype, data_
         with T.Kernel():
             a = T.alloc_shared(shape, T.bfloat16)
             amax = T.alloc_shared((shape[0],), T.float32)
-            data = T.alloc_shared(shape, data_dtype)
-            scale = T.alloc_shared(scale_shape, T.float8_e8m0fnu)
             mx = T.alloc_shared(shape, mx_dtype)
-            unpacked_data = T.alloc_shared(shape, data_dtype)
-            unpacked_scale = T.alloc_shared(scale_shape, T.float8_e8m0fnu)
+            if use_view:
+                data, scale = T.mx_view(mx)
+                unpacked_data = data
+                unpacked_scale = scale
+            else:
+                data = T.alloc_shared(shape, data_dtype)
+                scale = T.alloc_shared(scale_shape, T.float8_e8m0fnu)
+                unpacked_data = T.alloc_shared(shape, data_dtype)
+                unpacked_scale = T.alloc_shared(scale_shape, T.float8_e8m0fnu)
             y = T.alloc_shared(shape, T.bfloat16)
 
             T.copy(A, a)
@@ -116,14 +121,15 @@ def mx_ocp_quant_dequant_full_chain_kernel_for_debug(mx_dtype, data_dtype, data_
                 value = T.Cast("float32", a[row, col]) / scale_fp32
                 data[row, col] = T.Cast(
                     data_dtype_name,
-                    T.clamp(value, T.float32(-data_max), T.float32(data_max)),
+                    T.Cast("bfloat16", T.clamp(value, T.float32(-data_max), T.float32(data_max))),
                 )
 
-            T.mx_pack(data, scale, mx)
-            T.mx_unpack(mx, unpacked_data, unpacked_scale)
+            if not use_view:
+                T.mx_pack(data, scale, mx)
+                T.mx_unpack(mx, unpacked_data, unpacked_scale)
 
             for row, col in T.Tiles(y):
-                value = T.Cast("float32", unpacked_data[row, col])
+                value = T.Cast("float32", T.Cast("bfloat16", unpacked_data[row, col]))
                 scale_fp32 = _e8m0_scale_to_fp32(unpacked_scale[0, row])
                 y[row, col] = T.Cast("bfloat16", value * scale_fp32)
 
@@ -689,6 +695,8 @@ def mx_ocp_quantized_mma_mxznz_weight_kernel_for_debug(mx_dtype, data_dtype, dat
             b_mx_wsram = T.alloc_shared(b_shape, mx_dtype)
             c_rsram = T.alloc_shared(c_shape, T.bfloat16)
 
+            # Non-transposed weights require MXZNZ even for an N32 carrier.
+            T.annotate_layout({b_mx: b_mx_layout})
             T.copy(A, a_rsram)
             T.copy(B, b_rsram)
 

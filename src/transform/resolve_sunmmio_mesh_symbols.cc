@@ -68,6 +68,10 @@ bool LayoutContainsMeshSymbol(const Layout &layout) {
 }
 
 bool ObjectContainsMeshSymbol(const ObjectRef &obj) {
+  if (auto iv = obj.as<IterVar>(); iv && iv.value()->dom.defined()) {
+    return ExprContainsMeshSymbol(iv.value()->dom->min) ||
+           ExprContainsMeshSymbol(iv.value()->dom->extent);
+  }
   if (auto expr = obj.as<PrimExpr>()) {
     return ExprContainsMeshSymbol(expr.value());
   }
@@ -128,6 +132,12 @@ public:
 
   void VisitExpr_(const VarNode *op) final {
     found_ = found_ || IsMeshSymbolVar(op);
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (auto node = op->node.as<ObjectRef>())
+      found_ = found_ || ObjectContainsMeshSymbol(node.value());
+    StmtVisitor::VisitStmt_(op);
   }
 
   void VisitStmt_(const ForNode *op) final {
@@ -269,6 +279,13 @@ Layout SubstituteLayout(const Layout &layout,
 ObjectRef SubstituteObject(const ObjectRef &obj,
                            const ffi::Map<Var, PrimExpr> &vmap,
                            arith::Analyzer *analyzer) {
+  if (auto iv = obj.as<IterVar>(); iv && iv.value()->dom.defined()) {
+    auto domain = Range::FromMinExtent(
+        SubstituteAndSimplify(iv.value()->dom->min, vmap, analyzer),
+        SubstituteAndSimplify(iv.value()->dom->extent, vmap, analyzer));
+    return IterVar(domain, iv.value()->var, iv.value()->iter_type,
+                   iv.value()->thread_tag, iv.value()->span);
+  }
   if (auto expr = obj.as<PrimExpr>()) {
     return SubstituteAndSimplify(expr.value(), vmap, analyzer);
   }
@@ -355,6 +372,14 @@ public:
       : vmap_(std::move(vmap)), analyzer_(analyzer) {}
 
   Stmt Substitute(const Stmt &stmt) { return VisitStmt(stmt); }
+
+  Stmt VisitStmt_(const AttrStmtNode *op) final {
+    AttrStmt attr = Downcast<AttrStmt>(StmtExprMutator::VisitStmt_(op));
+    if (auto node = attr->node.as<ObjectRef>())
+      attr.CopyOnWrite()->node =
+          SubstituteObject(node.value(), vmap_, analyzer_);
+    return attr;
+  }
 
   Stmt VisitStmt_(const ForNode *op) final {
     For loop = Downcast<For>(StmtExprMutator::VisitStmt_(op));

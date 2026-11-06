@@ -111,10 +111,12 @@ def allocate_dma_copy_kernel_plus(
             for bx in T.serial(T.ceildiv(sharded_N, block_N)):
                 # Index exprs: add/mul/rem/min/max on DMA copy paths.
                 ko = (bx + bx) % grid_k
-                m_tile = (bx % grid_m) * block_M
-                n_tile = bx * block_N
-                m_offset = m_tile + T.min(T.min(bx, 1), T.max(sharded_M - m_tile - block_M, 0))
-                n_offset = n_tile + T.min(T.max(bx - 1, 0), T.max(sharded_N - n_tile - block_N, 0))
+                # Compute offsets in whole tiles so partition indices preserve
+                # the requested addresses, including at shard boundaries.
+                m_tile = bx % grid_m
+                n_tile = bx
+                m_offset = (m_tile + T.min(T.min(bx, 1), T.max(grid_m - m_tile - 1, 0))) * block_M
+                n_offset = (n_tile + T.min(T.max(bx - 1, 0), T.max(T.ceildiv(sharded_N, block_N) - n_tile - 1, 0))) * block_N
 
                 T.copy(A[m_offset, ko * block_K], A_shared)
                 T.copy(A[ko * block_K, n_offset], B_shared)
@@ -236,10 +238,14 @@ def offset_region_copy_kernel_plus(
                         T.max((sum_idx * 5) % 11, 0),
                         T.min(by + 3, 7),
                     )
-                    src_row = by * block_M + 8 + row_delta
-                    src_col = bx * block_N + 8 + col_delta
-                    rsram_row = 8 + T.min(row_delta, 7)
-                    rsram_col = 8 + T.min(col_delta, 7)
+                    # Select a complete tile inside each block on both sides
+                    # of the DMA; element-level offsets are not partitions.
+                    row_slot = T.min(row_delta, block_M // tile_M - 1)
+                    col_slot = T.min(col_delta, block_N // tile_N - 1)
+                    src_row = by * block_M + row_slot * tile_M
+                    src_col = bx * block_N + col_slot * tile_N
+                    rsram_row = row_slot * tile_M
+                    rsram_col = col_slot * tile_N
 
                     T.copy(
                         A[src_row : src_row + tile_M, src_col : src_col + tile_N],

@@ -13,6 +13,7 @@
 #include <tvm/tir/transform.h>
 
 #include "../op/builtin.h"
+#include "common/mx_view.h"
 
 namespace tvm {
 namespace tl {
@@ -28,11 +29,15 @@ public:
 
   static Stmt Apply(Stmt stmt) {
     auto rewriter = MergeIfStmtRewriter();
+    rewriter.views_ = CollectMXViews(stmt);
+    rewriter.lets_ = CollectMXViewLets(stmt);
     return rewriter(stmt);
   }
 
 private:
   MergeIfStmtRewriter() = default;
+  MXViewMap views_;
+  Map<Var, PrimExpr> lets_;
 
   void FlattenAppend(const Stmt &s, Array<Stmt> *out) {
     if (const auto *seq = s.as<SeqStmtNode>()) {
@@ -62,7 +67,8 @@ private:
 
     for (const Stmt &stmt : flat_seq) {
       if (const auto *if_node = stmt.as<IfThenElseNode>()) {
-        if (!if_node->else_case.defined()) {
+        if (!if_node->else_case.defined() &&
+            !ReadsMXField(if_node->condition, views_, lets_)) {
           if (current_condition.defined() &&
               ExprDeepEqual()(current_condition, if_node->condition)) {
             current_if_bodies.push_back(if_node->then_case);
