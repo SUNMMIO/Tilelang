@@ -57,6 +57,7 @@ struct LowerArgs {
   Target target;
   Range thread_bounds;
   Var thread_var;
+  Var block_var;
   AddWorkspaceCallback AddWorkspace;
   LayoutMap layout_map;
   Map<Buffer, Buffer> buffer_remap;

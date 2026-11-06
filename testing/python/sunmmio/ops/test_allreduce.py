@@ -105,11 +105,14 @@ def test_tilelang_allreduce_sunmmio_lowers_to_broadcast_and_tile_reduce(directio
 
     assert len(checker.broadcast_calls) == len(expected_directions)
     assert [int(call.args[2]) for call in checker.broadcast_calls] == expected_directions
-    assert all(len(call.args) == 5 for call in checker.broadcast_calls)
+    assert all(len(call.args) == 8 for call in checker.broadcast_calls)
     assert all(_region_access_mask(call.args[0]) == 1 for call in checker.broadcast_calls)
     assert all(_region_access_mask(call.args[1]) == 2 for call in checker.broadcast_calls)
     assert all(int(call.args[3]) == 15 for call in checker.broadcast_calls)
-    assert all(int(call.args[4]) == 0 for call in checker.broadcast_calls)
+    assert all(int(call.args[4]) == 15 for call in checker.broadcast_calls)
+    assert all(int(call.args[5]) == -1 for call in checker.broadcast_calls)
+    assert all(int(call.args[6]) == 15 for call in checker.broadcast_calls)
+    assert all(int(call.args[7]) == 0 for call in checker.broadcast_calls)
     assert all(int(call.annotations["tl.allow_rank3_allreduce_multicast"]) == 1 for call in checker.broadcast_calls)
     # Cross-core-only all_reduce lowers each carrier reduction along its
     # leading participant axis; it must not insert a local payload reduction.

@@ -314,6 +314,7 @@ def test_comm_broadcast_kernel_codegen_validates_with_npuir_opt(tmp_path):
 
     mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
     assert all("<unit = odma1>" in line for line in mcast_lines)
+    assert all("send_mask =" in line and "recv_mask =" in line and "lane_mask =" in line for line in mcast_lines)
     lines = src.splitlines()
     barrier_indices = [i for i, line in enumerate(lines) if "suvm.barrier.arrive_and_wait" in line]
     mcast_index = next(i for i, line in enumerate(lines) if "suvm.mcast_async" in line)
@@ -331,7 +332,9 @@ def test_comm_put_kernel_codegen_validates_with_npuir_opt(tmp_path):
         expected_tokens=("suvm.copy_async", "suvm.mcast_async", "suvm.sync", "suvm.barrier.arrive_and_wait"),
     )
 
-    assert src.count("suvm.mcast_async") >= 2
+    mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
+    assert len(mcast_lines) >= 2
+    assert all("send_mask =" in line and "recv_mask =" in line and "lane_mask =" in line for line in mcast_lines)
 
 
 def test_comm_dynamic_pair_put_codegen_has_no_sender_guard(tmp_path):
@@ -343,6 +346,7 @@ def test_comm_dynamic_pair_put_codegen_has_no_sender_guard(tmp_path):
     )
     assert src.count("suvm.mcast_async") == 1
     assert src.count("suvm.get_core_id") == 1
+    assert "lane_mask =" not in find_async_op_lines(src, "suvm.mcast_async")[0]
 
 
 def test_comm_dynamic_column_pair_put_codegen_has_no_sender_guard(tmp_path):
@@ -355,6 +359,7 @@ def test_comm_dynamic_column_pair_put_codegen_has_no_sender_guard(tmp_path):
     mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
     assert len(mcast_lines) == 1
     assert "col" in mcast_lines[0]
+    assert "lane_mask =" not in mcast_lines[0]
     assert src.count("suvm.get_core_id") == 1
 
 
@@ -368,6 +373,7 @@ def test_comm_dynamic_row_ring_put_codegen_uses_cycle_barriers(tmp_path):
     mcast_lines = find_async_op_lines(src, "suvm.mcast_async")
     assert len(mcast_lines) == 1
     assert "row" in mcast_lines[0]
+    assert "lane_mask =" not in mcast_lines[0]
     assert src.count("suvm.get_core_id") == 1
     for mask in (15, 240, 3840, 61440):
         assert f"suvm.barrier.init mask = {mask}" in src
@@ -401,6 +407,8 @@ def test_comm_all_gather_kernel_codegen_validates_with_npuir_opt(
         direction = line.split("direction =", 1)[1].lstrip()
         expected_unit = "odma1" if direction.startswith("row") else "odma0"
         assert f"<unit = {expected_unit}>" in line
+        assert "send_mask =" in line and "recv_mask =" in line
+        assert "lane_mask =" not in line
 
 
 def test_comm_all_reduce_horizontal_codegen_validates_with_npuir_opt(tmp_path):

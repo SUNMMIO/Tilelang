@@ -99,6 +99,9 @@ def _broadcast(src_buf, dst_buf, *, direction=0, mask=None, src_core=None, exten
         _region(dst_buf, 2, extents=extents),
         tvm.tir.IntImm("int32", direction),
         mask if mask is not None else tvm.tir.IntImm("int64", 15),
+        mask if mask is not None else tvm.tir.IntImm("int64", 15),
+        tvm.tir.IntImm("int64", -1),
+        mask if mask is not None else tvm.tir.IntImm("int64", 15),
         tvm.tir.IntImm("int32", 0),
     ]
     if src_core is not None:
@@ -284,23 +287,23 @@ def test_broadcast_a4e_alignment_fails_during_codegen():
         _build_sunmmio_source_from_stmt(stmt, params=[src_data, dst_data])
 
 
-def test_broadcast_with_src_core_keeps_sync_in_guarded_branch(tmp_path):
+def test_broadcast_with_src_core_uses_uniform_mcast_control(tmp_path):
     stmt, params = _broadcast_stmt(src_core=tvm.tir.IntImm("int32", 0))
     src = _validate_stmt_codegen(
         stmt,
         tmp_path,
         params=params,
-        mlir_filename="broadcast_src_core_guard_suvm.mlir",
-        expected_fragments=("suvm.get_core_id", "arith.cmpi eq", "scf.if", "suvm.mcast_async", "suvm.sync"),
+        mlir_filename="broadcast_src_core_uniform_suvm.mlir",
+        expected_fragments=("suvm.get_core_id", "send_mask", "recv_mask", "suvm.mcast_async", "suvm.sync"),
         opt_args=MCAST_VERIFY_ARGS,
     )
     lines = src.splitlines()
     barrier_indices = [i for i, line in enumerate(lines) if "suvm.barrier.arrive_and_wait" in line]
-    if_index = next(i for i, line in enumerate(lines) if "scf.if" in line)
     mcast_index = next(i for i, line in enumerate(lines) if "suvm.mcast_async" in line)
     sync_index = next(i for i, line in enumerate(lines) if "suvm.sync" in line)
     assert len(barrier_indices) == 2
-    assert barrier_indices[0] < if_index < mcast_index < sync_index < barrier_indices[1]
+    assert "scf.if" not in src
+    assert barrier_indices[0] < mcast_index < sync_index < barrier_indices[1]
 
 
 def test_broadcast_with_current_core_skips_sender_guard(tmp_path):

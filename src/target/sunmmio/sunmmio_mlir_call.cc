@@ -53,26 +53,6 @@ void VerifyA4EMulticastOp(OpType op, const char *callee) {
       << callee << " violates A4E multicast data-path constraints";
 }
 
-bool IsCurrentCoreId(mlir::Value value) {
-  if (value.getDefiningOp<mlir::suvm::GetCoreIdOp>()) {
-    return true;
-  }
-  // Kernel block IDs are i32 views of the A4E core ID, then widened for the
-  // multicast source comparison. The A4E mesh fits in i32.
-  auto is_widened_core = [](mlir::Value input) {
-    auto trunc = input.getDefiningOp<mlir::arith::TruncIOp>();
-    return trunc && input.getType().isInteger(32) &&
-           trunc.getIn().getDefiningOp<mlir::suvm::GetCoreIdOp>();
-  };
-  if (auto extend = value.getDefiningOp<mlir::arith::ExtUIOp>()) {
-    return is_widened_core(extend.getIn());
-  }
-  if (auto extend = value.getDefiningOp<mlir::arith::ExtSIOp>()) {
-    return is_widened_core(extend.getIn());
-  }
-  return false;
-}
-
 SunmmioMlirContext::SyncUnitMask MapSyncUnits(int64_t mask) {
   constexpr tl::SunmmioSyncUnits kKnownUnits =
       tl::kSunmmioSyncOdma0 | tl::kSunmmioSyncOdma1 | tl::kSunmmioSyncTc |
@@ -641,9 +621,9 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.broadcast_") {
-    ICHECK(operands.size() == 3 || operands.size() == 4)
-        << "tl.broadcast_ expects src, dst, mask, and optional src_core "
-           "operands";
+    ICHECK(operands.size() == 4 || operands.size() == 5)
+        << "tl.broadcast_ expects src, dst, send_mask, recv_mask, and an "
+           "optional lane_mask";
 
     mlir::Value src = ctx_.LookupMLIRValue(operands[0].value);
     ICHECK(src) << "Missing MLIR source tile view for tl.broadcast_ `"
@@ -658,11 +638,26 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     ICHECK(dst_ty)
         << "tl.broadcast_ expects destination to be a suvm.tile_view";
 
-    mlir::Value mask = ctx_.LookupMLIRValue(operands[2].value);
-    if (!mask) {
-      mask = type.ResolveValue(operands[2], ctx_.builder.getI64Type());
+    mlir::Value send_mask = ctx_.LookupMLIRValue(operands[2].value);
+    if (!send_mask) {
+      send_mask = type.ResolveValue(operands[2], ctx_.builder.getI64Type());
     }
-    mask = ensure_i64(mask, "tl.broadcast_ mask");
+    send_mask = ensure_i64(send_mask, "tl.broadcast_ send_mask");
+
+    mlir::Value recv_mask = ctx_.LookupMLIRValue(operands[3].value);
+    if (!recv_mask) {
+      recv_mask = type.ResolveValue(operands[3], ctx_.builder.getI64Type());
+    }
+    recv_mask = ensure_i64(recv_mask, "tl.broadcast_ recv_mask");
+
+    mlir::Value lane_mask;
+    if (operands.size() == 5) {
+      lane_mask = ctx_.LookupMLIRValue(operands[4].value);
+      if (!lane_mask) {
+        lane_mask = type.ResolveValue(operands[4], ctx_.builder.getI64Type());
+      }
+      lane_mask = ensure_i64(lane_mask, "tl.broadcast_ lane_mask");
+    }
 
     std::string direction_name =
         get_string_attr(SunMMIOCallAttrKey::kDirection).value_or("");
@@ -671,62 +666,16 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     auto direction = direction_name == "row" ? mlir::suvm::McastDirection::row
                                              : mlir::suvm::McastDirection::col;
 
-    auto create_mcast = [&]() {
-      auto mcast_op = mlir::suvm::MulticastAsyncOp::create(
-          ctx_.builder, type.MakeDebugLoc("broadcast"), src, dst, mask,
-          direction, require_odma_unit());
-      VerifyA4EMulticastOp(mcast_op, "tl.broadcast_");
-      return mcast_op;
-    };
-    auto emit_link_sync = [&]() {
-      mlir::suvm::SyncUnits link = direction == mlir::suvm::McastDirection::row
-                                       ? mlir::suvm::SyncUnits::hlink
-                                       : mlir::suvm::SyncUnits::vlink;
-      mlir::suvm::SyncOp::create(
-          ctx_.builder, type.MakeDebugLoc("broadcast_sync"),
-          mlir::suvm::SyncUnitsAttr::get(&ctx_.mlir_ctx, link));
-    };
-
-    if (operands.size() == 4) {
-      mlir::Value src_core = ctx_.LookupMLIRValue(operands[3].value);
-      if (!src_core) {
-        src_core = type.ResolveValue(operands[3], ctx_.builder.getI64Type());
-      }
-      src_core = ensure_i64(src_core, "tl.broadcast_ src_core");
-
-      if (IsCurrentCoreId(src_core)) {
-        create_mcast();
-        emit_link_sync();
-        return SunMMIOValue{ret_dtype, result_name, ret_type};
-      }
-
-      mlir::Value core_id = mlir::suvm::GetCoreIdOp::create(
-                                ctx_.builder, type.MakeDebugLoc("get_core_id"))
-                                .getResult();
-      core_id = ensure_i64(core_id, "suvm.get_core_id result");
-      mlir::Value is_src = mlir::arith::CmpIOp::create(
-          ctx_.builder, type.Loc(), mlir::arith::CmpIPredicate::eq, core_id,
-          src_core);
-
-      auto if_op = mlir::scf::IfOp::create(ctx_.builder, type.Loc(),
-                                           mlir::TypeRange{}, is_src,
-                                           /*withElseRegion=*/false);
-
-      mlir::Block &then_block = if_op.getThenRegion().front();
-      ctx_.builder.setInsertionPointToStart(&then_block);
-      (void)create_mcast();
-      emit_link_sync();
-
-      ctx_.builder.setInsertionPointAfter(if_op);
-    } else {
-      auto mcast_op = create_mcast();
-      ctx_.AddPendingSyncOperation(
-          mcast_op.getOperation(),
-          SunmmioMlirContext::ToSyncUnitMask(
-              direction == mlir::suvm::McastDirection::row
-                  ? mlir::suvm::SyncUnits::hlink
-                  : mlir::suvm::SyncUnits::vlink));
-    }
+    auto mcast_op = mlir::suvm::MulticastAsyncOp::create(
+        ctx_.builder, type.MakeDebugLoc("broadcast"), src, dst, send_mask,
+        recv_mask, lane_mask, direction, require_odma_unit());
+    VerifyA4EMulticastOp(mcast_op, "tl.broadcast_");
+    mlir::suvm::SyncUnits link = direction == mlir::suvm::McastDirection::row
+                                     ? mlir::suvm::SyncUnits::hlink
+                                     : mlir::suvm::SyncUnits::vlink;
+    mlir::suvm::SyncOp::create(
+        ctx_.builder, type.MakeDebugLoc("broadcast_sync"),
+        mlir::suvm::SyncUnitsAttr::get(&ctx_.mlir_ctx, link));
 
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.mma_sunmmio") {
