@@ -1,7 +1,13 @@
 import tilelang.language as T
 from tilelang import tvm as tvm
+from tilelang.carver.arch import driver
 from tilelang.engine.lower import canon_target_host
-from tilelang.utils.target import determine_target, target_context, target_is_sunmmio
+from tilelang.utils.target import (
+    determine_target,
+    get_sunmmio_target_mesh_config,
+    target_context,
+    target_is_sunmmio,
+)
 
 
 def test_sunmmio_target():
@@ -17,6 +23,28 @@ def test_sunmmio_target():
 
     print(target)
     print(target.attrs)
+
+
+def test_sunmmio_mesh_config_comes_from_target():
+    assert get_sunmmio_target_mesh_config("sunmmio") == (4, 4)
+
+    for nrows, ncols in ((3, 4), (4, 3)):
+        target = determine_target(
+            f"llvm -mcpu=sunmmio-a4e -mattr=device_mesh_nrow_{nrows},device_mesh_ncol_{ncols}",
+            return_object=True,
+        )
+        assert get_sunmmio_target_mesh_config(target) == (nrows, ncols)
+        with target:
+            assert get_sunmmio_target_mesh_config() == (nrows, ncols)
+
+
+def test_sunmmio_device_properties_do_not_duplicate_mesh_config():
+    properties = driver.get_sunmmio_device_properties()
+
+    assert not hasattr(properties, "mesh_config")
+    assert properties.RsramPerCore == 1536000
+    assert properties.WSRAMperCore == 2097152
+    assert properties.ASRAMPerCore == 1048576
 
 
 def test_target_context_decorator():

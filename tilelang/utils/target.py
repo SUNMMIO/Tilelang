@@ -2,6 +2,7 @@ from __future__ import annotations
 
 
 import torch
+import tvm_ffi
 
 from functools import wraps
 from platform import mac_ver
@@ -242,6 +243,20 @@ def determine_target(target: str | Target | Literal["auto"] = "auto", return_obj
             return return_var
         return Target(return_var)
     return return_var
+
+
+def get_sunmmio_target_mesh_config(target: str | Target | None = None) -> tuple[int, int]:
+    """Return the concrete ``(nrows, ncols)`` encoded by a Sunmmio target."""
+    if target is None:
+        target = tvm.target.Target.current(allow_none=True)
+    if target is None:
+        target = determine_target("sunmmio", return_object=True)
+    elif isinstance(target, str):
+        target = determine_target(target, return_object=True)
+
+    get_mesh_config = tvm_ffi.get_global_func("tl.target.GetSunmmioMeshConfig")
+    nrows, ncols = get_mesh_config(target)
+    return int(nrows), int(ncols)
 
 
 def target_is_cuda(target: Target) -> bool:

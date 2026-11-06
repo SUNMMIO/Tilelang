@@ -370,6 +370,11 @@ bool SupportsSunmmioDirectCommunication(
 
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
+  refl::GlobalDef().def("tl.target.GetSunmmioMeshConfig", [](Target target) {
+    SunmmioMeshConfig mesh = GetSunmmioMeshConfig(target);
+    return ffi::Array<PrimExpr>{tir::make_const(DataType::Int(32), mesh.nrow),
+                                tir::make_const(DataType::Int(32), mesh.ncol)};
+  });
   refl::GlobalDef().def("tl.target.GetSunmmioLayoutBlockShape",
                         static_cast<ffi::Array<PrimExpr> (*)(Target, DataType)>(
                             GetSunmmioLayoutBlockShape));

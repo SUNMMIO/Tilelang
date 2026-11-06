@@ -3,8 +3,8 @@ from typing import Callable
 
 import tilelang
 import tilelang.language as T
-from tilelang.carver.arch import driver
 from tilelang.layout import make_zz_layout
+from tilelang.utils.target import get_sunmmio_target_mesh_config
 
 
 def ref_program(x):
@@ -100,7 +100,7 @@ def main(M, N) -> None:
     result = kernel(
         sunsim.Input(x, placement=placement, layout=layout),
         y,
-        mesh=driver.get_sunmmio_device_mesh_config(),
+        mesh=get_sunmmio_target_mesh_config("sunmmio"),
         timeout=1200.0,
     )
 

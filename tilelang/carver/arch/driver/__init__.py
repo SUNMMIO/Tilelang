@@ -10,5 +10,4 @@ from .cuda_driver import (
 )
 from .sunmmio_driver import (
     get_sunmmio_device_properties,  # noqa: F401
-    get_device_mesh_config as get_sunmmio_device_mesh_config,  # noqa: F401
 )
