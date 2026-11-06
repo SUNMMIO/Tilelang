@@ -61,6 +61,9 @@ def _broadcast_regions(src_region, dst_region, *, direction=0, mask=15, src_core
         dst_region,
         tvm.tir.IntImm("int32", direction),
         mask if isinstance(mask, tvm.tir.PrimExpr) else tvm.tir.IntImm("int64", mask),
+        mask if isinstance(mask, tvm.tir.PrimExpr) else tvm.tir.IntImm("int64", mask),
+        tvm.tir.IntImm("int64", -1),
+        mask if isinstance(mask, tvm.tir.PrimExpr) else tvm.tir.IntImm("int64", mask),
         tvm.tir.IntImm("int32", 0),
     ]
     if src_core is not None:

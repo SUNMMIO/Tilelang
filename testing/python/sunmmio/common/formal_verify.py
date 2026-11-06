@@ -1,4 +1,3 @@
-import re
 from tvm import tir, IRModule, arith, ir
 
 
@@ -244,53 +243,21 @@ def verify_comm_lower(func: tir.PrimFunc):
             return fixed_args
 
         for core, direction, mask, has_src_core in expected_broadcasts:
-            if mask is None:
-                mask_pattern = r".*?"
-            else:
-                mask_pattern = rf"(?:T\.int64\({mask}\)|{mask})"
-            if has_src_core:
-                if not core.lstrip("-").isdigit():
-                    # Lowering may inline let-bound dynamic coordinates and
-                    # rename the kernel thread variable. Verify the lowered
-                    # broadcast ABI here; per-test checks own its exact route.
-                    message = f"Expected broadcast_ with a dynamic source core, direction={direction}, mask={mask} not found in IRModule"
-                    found = False
-                    for args in broadcast_arg_lists:
-                        fixed_args = strip_broadcast_metadata(args)
-                        if len(fixed_args) != 6:
-                            continue
-                        if fixed_args[2] != str(direction):
-                            continue
-                        if mask is not None and fixed_args[3] not in {f"T.int64({mask})", str(mask)}:
-                            continue
-                        found = True
-                        break
-                    assert found, message
+            message = f"Expected broadcast_ with core={core}, direction={direction}, mask={mask} not found in IRModule"
+            found = False
+            for args in broadcast_arg_lists:
+                fixed_args = strip_broadcast_metadata(args)
+                if len(fixed_args) != (9 if has_src_core else 8):
                     continue
-
-                # Match T.broadcast_(..., direction, mask, src_offset_byte, src_core, ...)
-                escaped_core = re.escape(core).replace(r"\ ", r"\s*")
-                pattern = rf"T\.broadcast_\(.*?,\s*.*?,\s*{direction},\s*{mask_pattern},\s*.*?,\s*{escaped_core}(?:,|\))"
-                message = f"Expected broadcast_ with core={core}, direction={direction}, mask={mask} not found in IRModule"
-            else:
-                # Match the dynamic allgather form without src_core:
-                # T.broadcast_(src_region, dst_region, direction, mask,
-                #              src_offset_byte[, odma_unit])
-                message = f"Expected broadcast_ without src_core, direction={direction}, mask={mask} not found in IRModule"
-                found = False
-                for args in broadcast_arg_lists:
-                    fixed_args = strip_broadcast_metadata(args)
-                    if len(fixed_args) != 5:
-                        continue
-                    if fixed_args[2] != str(direction):
-                        continue
-                    if mask is not None and fixed_args[3] not in {f"T.int64({mask})", str(mask)}:
-                        continue
-                    found = True
-                    break
-                assert found, message
-                continue
-            assert re.search(pattern, script), message
+                if fixed_args[2] != str(direction):
+                    continue
+                if mask is not None and fixed_args[6] not in {f"T.int64({mask})", str(mask)}:
+                    continue
+                if has_src_core and core.lstrip("-").isdigit() and fixed_args[8] != core:
+                    continue
+                found = True
+                break
+            assert found, message
 
     return check
 

@@ -17,6 +17,7 @@ TVM_DLL const Op &broadcast_();
 // Internal proof attached by ValidateDynamicCommPutRoutes before LowerTileOp.
 constexpr const char *kCommPutDirectionAttr = "tl.comm_put_direction";
 constexpr const char *kCommBarrierMaskAttr = "tl.comm_barrier_mask";
+constexpr const char *kCommPutRecvMaskAttr = "tl.comm_put_recv_mask";
 constexpr const char *kAttrAllowRank3Multicast =
     "tl.allow_rank3_allreduce_multicast";
 
@@ -24,13 +25,16 @@ constexpr const char *kAttrAllowRank3Multicast =
 // (comm.cc, via AppendBroadcastArgs) and consumers (the broadcast-barrier
 // analysis in InjectSunmmioSync) must index it through these constants.
 enum BroadcastArg : int {
-  kBroadcastArgSrc = 0,           // source region
-  kBroadcastArgDst = 1,           // destination region
-  kBroadcastArgDirection = 2,     // 0 = horizontal/row, 1 = vertical/col
-  kBroadcastArgMask = 3,          // i64 direction-local receiver bitmask
-  kBroadcastArgSrcOffsetByte = 4, // source-pointer byte offset
-  kBroadcastArgCount = 5,   // fixed args before optional src_core/metadata
-  kBroadcastArgSrcCore = 5, // optional; before odma_unit
+  kBroadcastArgSrc = 0,             // source region
+  kBroadcastArgDst = 1,             // destination region
+  kBroadcastArgDirection = 2,       // 0 = horizontal/row, 1 = vertical/col
+  kBroadcastArgSendMask = 3,        // i64 direction-local destinations
+  kBroadcastArgRecvMask = 4,        // i64 direction-local sources
+  kBroadcastArgLaneMask = 5,        // i64 physical lines; -1 means all
+  kBroadcastArgBarrierPeerMask = 6, // receiver set used by barrier planning
+  kBroadcastArgSrcOffsetByte = 7,   // source-pointer byte offset
+  kBroadcastArgCount = 8,   // fixed args before optional src_core/metadata
+  kBroadcastArgSrcCore = 8, // optional; barrier-planning provenance
 };
 
 using namespace tir;
@@ -83,6 +87,7 @@ public:
   PrimExpr src_expr, dst_expr;
   PrimExpr src_core, dst_core;
   PrimExpr validated_barrier_mask;
+  PrimExpr validated_recv_mask;
   IntImm size;
   int validated_direction = -1;
 
@@ -98,6 +103,7 @@ public:
         .def_ro("src_core", &PutOpNode::src_core)
         .def_ro("dst_core", &PutOpNode::dst_core)
         .def_ro("validated_barrier_mask", &PutOpNode::validated_barrier_mask)
+        .def_ro("validated_recv_mask", &PutOpNode::validated_recv_mask)
         .def_ro("size", &PutOpNode::size)
         .def_ro("validated_direction", &PutOpNode::validated_direction);
   }

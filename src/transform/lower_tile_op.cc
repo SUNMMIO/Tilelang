@@ -958,8 +958,8 @@ private:
     }
 
     auto lowered = tile_op->Lower(
-        LowerArgs{target_, thread_bounds, thread_var_->var, callback,
-                  layout_map_, buffer_remap_, let_var_to_expr,
+        LowerArgs{target_, thread_bounds, thread_var_->var, block_var_,
+                  callback, layout_map_, buffer_remap_, let_var_to_expr,
                   global_layout_map_, tileview_map_, register_scratch},
         analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
@@ -974,6 +974,8 @@ private:
         has_thread_binding_ = true;
         ICHECK(iv->dom->extent.as<IntImmNode>());
         thread_block_size_ = iv->dom->extent.as<IntImmNode>()->value;
+      } else if (iv->thread_tag == "blockIdx.x") {
+        block_var_ = iv->var;
       }
     }
     return arith::IRMutatorWithAnalyzer::VisitStmt_(op);
@@ -1169,6 +1171,7 @@ private:
   // we need to define a thread_var for the serial loop.
   IterVar thread_var_ = IterVar(Range::FromMinExtent(0, 1), Var("v_thread"),
                                 IterVarType::kDataPar);
+  Var block_var_;
   // True only when a real threadIdx.x AttrStmt has been visited. Used to guard
   // thread partitioning: if no threadIdx.x exists (e.g. threadless kernels),
   // calling PartitionLoop with the dummy v_thread would embed a free variable.

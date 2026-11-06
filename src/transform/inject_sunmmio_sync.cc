@@ -1047,7 +1047,7 @@ private:
     }
     PrimExpr src_core = GetBroadcastBarrierSrcCore(call);
     PrimExpr write_mask = ExpandBroadcastLocalMask(
-        call->args[kBroadcastArgMask], direction, src_core);
+        call->args[kBroadcastArgBarrierPeerMask], direction, src_core);
 
     BarrierMaskInfo info;
     info.expr = AsI64(CoreBitMask(src_core)) | AsI64(write_mask);

@@ -72,8 +72,8 @@ def test_sync(is_log=False):
         'bx = T.launch_thread("blockIdx.x", 16)',
         "for bx_1, _by in T.grid(4, 4):",
         "T.mma_sunmmio(T.region(A_shared[0, 0], 1, 1024, 1024), T.region(B_shared[0, 0], 1, 1024, 1024), T.region(C_shared[0, 0], 3, 1024, 1024), T.bool(False), T.bool(False), T.bool(False), 0)",
-        "T.broadcast_(T.region(D_shared[0, 0], 1, 1024, 1024), T.region(E_shared[0, 0], 2, 1024, 1024), 0, T.int64(15), 0, 0)",
-        "T.broadcast_(T.region(E_shared[0, 0], 1, 1024, 1024), T.region(D_shared[0, 0], 2, 1024, 1024), 0, T.int64(15), 0, 0)",
+        "T.broadcast_(T.region(D_shared[0, 0], 1, 1024, 1024), T.region(E_shared[0, 0], 2, 1024, 1024), 0,",
+        "T.broadcast_(T.region(E_shared[0, 0], 1, 1024, 1024), T.region(D_shared[0, 0], 2, 1024, 1024), 0,",
     ]
 
     script_InjectSunmmioSync = [
