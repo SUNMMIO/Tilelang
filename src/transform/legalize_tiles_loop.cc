@@ -2,6 +2,7 @@
 #include <unordered_map>
 
 #include <tvm/arith/analyzer.h>
+#include <tvm/arith/iter_affine_map.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tir/stmt_functor.h>
@@ -93,6 +94,36 @@ public:
   }
 
 private:
+  // Cancel shared address offsets before proving equality. This also exposes
+  // i == i' to the ordinary analyzer when both indices contain a serial offset.
+  PrimExpr IndexEquality(const PrimExpr &lhs, const PrimExpr &rhs,
+                         arith::Analyzer *analyzer) const {
+    return analyzer->Simplify(lhs - rhs) == 0;
+  }
+
+  bool HasInjectiveDestination(const BufferStoreNode *op,
+                               arith::Analyzer *analyzer) const {
+    Map<Var, Range> ranges;
+    for (const Var &var : parallel_tile_loop_vars_) {
+      for (const auto &constr : constr_stack_) {
+        if (constr.kind == Constr::kBindRange && constr.var.same_as(var)) {
+          ranges.Set(var, constr.range);
+          break;
+        }
+      }
+    }
+    ICHECK_EQ(ranges.size(), parallel_tile_loop_vars_.size());
+    Array<PrimExpr> indices;
+    for (const PrimExpr &index : op->indices)
+      indices.push_back(analyzer->Simplify(index));
+    // A bijective iter map proves uniqueness even for packed indices such as
+    // base + i * H + j, where boolean rewriting alone may be insufficient.
+    // Prove it over the full iteration domain, without restricting predicates.
+    return arith::DetectIterMap(indices, ranges, Bool(true),
+                                arith::IterMapLevel::Bijective, analyzer)
+        ->errors.empty();
+  }
+
   bool CanProveExprEqual(const PrimExpr &lhs, const PrimExpr &rhs,
                          arith::Analyzer *analyzer) const {
     PrimExpr lhs_simpl = analyzer->Simplify(lhs);
@@ -120,7 +151,8 @@ private:
         return false;
       }
       for (size_t i = 0; i < lhs_load->indices.size(); ++i) {
-        if (!analyzer->CanProve(lhs_load->indices[i] == rhs_load->indices[i])) {
+        if (!analyzer->CanProve(IndexEquality(
+                lhs_load->indices[i], rhs_load->indices[i], analyzer))) {
           return false;
         }
       }
@@ -277,12 +309,37 @@ private:
 
     ConstrSet cset{constr_stack_};
     ffi::Map<Var, PrimExpr> subs = MakeIterationSubstitution();
-    cset.Extend(cset.Substitute(subs));
+    // Preserve Bind information for the second execution. Turning all bindings
+    // into generic equalities loses substitutions in the non-Z3 analyzer.
+    for (const auto &constr : constr_stack_) {
+      if (constr.kind != Constr::kConstr && subs.count(constr.var)) {
+        Var other_var = Downcast<Var>(subs.at(constr.var));
+        if (constr.kind == Constr::kBindValue) {
+          cset.AddConstr(other_var, tir::Substitute(constr.value, subs));
+        } else {
+          cset.AddConstr(other_var,
+                         Range::FromMinExtent(
+                             tir::Substitute(constr.range->min, subs),
+                             tir::Substitute(constr.range->extent, subs)));
+        }
+      } else {
+        PrimExpr original = constr.ToGenericConstr();
+        PrimExpr other = tir::Substitute(original, subs);
+        if (!other.same_as(original))
+          cset.AddConstr(other, constr.is_assume);
+      }
+    }
+
+    arith::Analyzer guard_analyzer;
+    guard_analyzer.rewrite_simplify.SetEnabledExtensions(
+        arith::RewriteSimplifier::kApplyConstraintsToBooleanBranches);
+    cset.Populate(guard_analyzer);
 
     PrimExpr same_destination = Bool(true);
     for (const auto &idx : op->indices) {
-      same_destination =
-          tir::And(same_destination, idx == tir::Substitute(idx, subs));
+      same_destination = tir::And(
+          same_destination,
+          IndexEquality(idx, tir::Substitute(idx, subs), &guard_analyzer));
     }
 
     PrimExpr distinct_iteration = Bool(false);
@@ -300,22 +357,24 @@ private:
                  tir::And(first_predicate, second_predicate));
     PrimExpr other_value = tir::Substitute(op->value, subs);
 
-    arith::Analyzer guard_analyzer;
-    cset.Populate(guard_analyzer);
-
-    arith::Analyzer equal_analyzer;
-    cset.Populate(equal_analyzer);
-    equal_analyzer.EnterConstraint(conflict_guard);
-
-    if (!guard_analyzer.z3_prover.CanProve(tir::Not(conflict_guard)) &&
-        !CanProveExprEqual(op->value, other_value, &equal_analyzer)) {
-      LOG(FATAL)
-          << "Implicit reduction in T.Tiles is not supported. Distinct "
-             "parallel tile iterations can write different values to the same "
-             "destination element in BufferStore to '"
-          << op->buffer->name
-          << "'. Please use explicit T.atomic_add or dedicated reduction "
-             "loops.";
+    // Use ordinary simplification first, with Z3 as an optional fallback.
+    if (!guard_analyzer.CanProve(tir::Not(conflict_guard)) &&
+        !HasInjectiveDestination(op, &guard_analyzer)) {
+      arith::Analyzer equal_analyzer;
+      equal_analyzer.rewrite_simplify.SetEnabledExtensions(
+          arith::RewriteSimplifier::kApplyConstraintsToBooleanBranches);
+      cset.Populate(equal_analyzer);
+      With<arith::ConstraintContext> context(&equal_analyzer, conflict_guard);
+      if (!CanProveExprEqual(op->value, other_value, &equal_analyzer)) {
+        LOG(FATAL)
+            << "Implicit reduction in T.Tiles is not supported. Distinct "
+               "parallel tile iterations can write different values to the "
+               "same "
+               "destination element in BufferStore to '"
+            << op->buffer->name
+            << "'. Please use explicit T.atomic_add or dedicated reduction "
+               "loops.";
+      }
     }
 
     StmtExprVisitor::VisitStmt_(op);
@@ -326,15 +385,18 @@ private:
     for (const auto &var : parallel_tile_loop_vars_) {
       subs.Set(var, Var(var->name_hint + "<OTHER>", var.dtype()));
     }
+    // Lexical order makes a single pass sufficient for transitive Let
+    // dependencies. Serial/thread ranges and invariant context stay shared.
     for (const auto &constr : constr_stack_) {
-      if (!constr.var.defined()) {
+      if (constr.kind != Constr::kBindValue || subs.count(constr.var)) {
         continue;
       }
-      if (subs.count(constr.var)) {
-        continue;
+      if (tir::UsesVar(constr.value, [&](const VarNode *var) {
+            return subs.count(ffi::GetRef<Var>(var));
+          })) {
+        subs.Set(constr.var,
+                 Var(constr.var->name_hint + "<OTHER>", constr.var.dtype()));
       }
-      subs.Set(constr.var,
-               Var(constr.var->name_hint + "<OTHER>", constr.var.dtype()));
     }
     return subs;
   }

@@ -11,7 +11,6 @@
 #include "../../tileview/tileview_planner_common.h"
 #include "../../transform/common/attr.h"
 #include "../sunmmio_utils.h"
-#include "arith/ir_visitor_with_analyzer.h"
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/ir/type.h>
@@ -42,57 +41,167 @@ using namespace tir;
 
 namespace {
 
-class CopyRegionAlignmentVerifier final : public arith::IRVisitorWithAnalyzer {
+class CopyRegionAlignmentVerifier final : public StmtExprVisitor {
 private:
+  // Analyzer simplification also persists bindings inside Let expressions.
+  // Freshen their local definitions for proofs only, leaving codegen TIR
+  // intact.
+  class ProofExprRenamer final : public ExprMutator {
+    std::unordered_map<const VarNode *, Var> vars_;
+
+    PrimExpr VisitExpr_(const VarNode *op) final {
+      auto it = vars_.find(op);
+      return it == vars_.end() ? ffi::GetRef<Var>(op) : it->second;
+    }
+
+    PrimExpr VisitExpr_(const LetNode *op) final {
+      PrimExpr value = VisitExpr(op->value);
+      ffi::Optional<Var> previous;
+      if (auto it = vars_.find(op->var.get()); it != vars_.end())
+        previous = it->second;
+      Var var = op->var.copy_with_suffix("_alignment");
+      vars_[op->var.get()] = var;
+      PrimExpr body = VisitExpr(op->body);
+      if (previous.defined())
+        vars_[op->var.get()] = previous.value();
+      else
+        vars_.erase(op->var.get());
+      return Let(var, value, body);
+    }
+  };
+
+  // A defined var records a value/range binding; otherwise this is a condition.
+  struct Fact {
+    ffi::Optional<Var> var;
+    PrimExpr value;
+    Range range;
+    bool is_assume{false};
+  };
+  std::vector<Fact> facts_;
+
+  struct FactScope {
+    explicit FactScope(std::vector<Fact> &facts)
+        : facts(facts), depth(facts.size()) {}
+    ~FactScope() { facts.resize(depth); }
+    std::vector<Fact> &facts;
+    size_t depth;
+  };
+
   // Memory reads can change within a scope; only pure facts remain valid.
   bool IsPure(const PrimExpr &expr) const {
     return SideEffect(expr) <= CallEffectKind::kPure;
   }
 
+  void PushBinding(const Var &var, const PrimExpr &value) {
+    if (!var.dtype().is_handle() && IsPure(value))
+      facts_.push_back({var, ProofExprRenamer()(value), Range()});
+  }
+
+  void PushRange(const Var &var, const Range &range) {
+    if (range.defined() && IsPure(range->min) && IsPure(range->extent))
+      facts_.push_back(
+          {var, PrimExpr(),
+           Range::FromMinExtent(ProofExprRenamer()(range->min),
+                                ProofExprRenamer()(range->extent))});
+  }
+
+  void PushCondition(const PrimExpr &condition, bool is_assume = false) {
+    if (IsPure(condition))
+      facts_.push_back({ffi::Optional<Var>(), ProofExprRenamer()(condition),
+                        Range(), is_assume});
+  }
+
   void VisitStmt_(const LetStmtNode *op) final {
-    if (op->var.dtype().is_handle() || !IsPure(op->value))
-      return StmtExprVisitor::VisitStmt_(op);
-    IRVisitorWithAnalyzer::VisitStmt_(op);
+    VisitExpr(op->value);
+    FactScope scope(facts_);
+    PushBinding(op->var, op->value);
+    VisitStmt(op->body);
+  }
+
+  void VisitExpr_(const LetNode *op) final {
+    VisitExpr(op->value);
+    FactScope scope(facts_);
+    PushBinding(op->var, op->value);
+    VisitExpr(op->body);
   }
 
   void VisitStmt_(const ForNode *op) final {
-    if (!IsPure(op->min) || !IsPure(op->extent))
-      return StmtExprVisitor::VisitStmt_(op);
-    if (!analyzer_.CanProve(op->extent <= 0))
-      IRVisitorWithAnalyzer::VisitStmt_(op);
+    VisitExpr(op->min);
+    VisitExpr(op->extent);
+    if (op->step.has_value())
+      VisitExpr(op->step.value());
+    FactScope scope(facts_);
+    PushRange(op->loop_var, Range::FromMinExtent(op->min, op->extent));
+    VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const BlockNode *op) final {
+    for (const IterVar &iv : op->iter_vars) {
+      if (iv->dom.defined()) {
+        VisitExpr(iv->dom->min);
+        VisitExpr(iv->dom->extent);
+      }
+    }
+    FactScope scope(facts_);
+    for (const IterVar &iv : op->iter_vars)
+      PushRange(iv->var, iv->dom);
+    auto visit_region = [this](const BufferRegion &region) {
+      for (const Range &range : region->region) {
+        VisitExpr(range->min);
+        VisitExpr(range->extent);
+      }
+    };
+    for (const BufferRegion &region : op->reads)
+      visit_region(region);
+    for (const BufferRegion &region : op->writes)
+      visit_region(region);
+    for (const MatchBufferRegion &match : op->match_buffers)
+      visit_region(match->source);
+    if (op->init.defined())
+      VisitStmt(op->init.value());
+    VisitStmt(op->body);
   }
 
   void VisitStmt_(const IfThenElseNode *op) final {
-    if (!IsPure(op->condition))
-      return StmtExprVisitor::VisitStmt_(op);
     VisitExpr(op->condition);
-    PrimExpr condition = ExtractRealCondition(op->condition);
-    PrimExpr negated = analyzer_.rewrite_simplify(Not(condition));
-    if (!analyzer_.CanProve(negated)) {
-      With<arith::ConstraintContext> context(&analyzer_, condition);
+    PrimExpr condition = op->condition;
+    if (const auto *call = condition.as<CallNode>();
+        call && call->op.same_as(builtin::likely()))
+      condition = call->args[0];
+    {
+      FactScope scope(facts_);
+      PushCondition(condition);
       VisitStmt(op->then_case);
     }
-    if (op->else_case.defined() && !analyzer_.CanProve(condition)) {
-      With<arith::ConstraintContext> context(&analyzer_, negated);
+    if (op->else_case.defined()) {
+      FactScope scope(facts_);
+      PushCondition(Not(condition));
       VisitStmt(op->else_case.value());
     }
   }
 
   void VisitStmt_(const AttrStmtNode *op) final {
-    if (op->attr_key == tir::attr::tilelang_assume &&
-        !IsPure(Downcast<PrimExpr>(op->node)))
-      return StmtExprVisitor::VisitStmt_(op);
-    if ((op->attr_key == tir::attr::thread_extent ||
-         op->attr_key == tir::attr::virtual_thread) &&
-        !IsPure(op->value))
-      return StmtExprVisitor::VisitStmt_(op);
-    IRVisitorWithAnalyzer::VisitStmt_(op);
+    VisitExpr(op->value);
+    FactScope scope(facts_);
+    if (op->attr_key == tir::attr::tilelang_assume) {
+      PrimExpr condition = Downcast<PrimExpr>(op->node);
+      VisitExpr(condition);
+      PushCondition(condition, /*is_assume=*/true);
+    } else if (op->attr_key == tir::attr::thread_extent ||
+               op->attr_key == tir::attr::virtual_thread) {
+      IterVar iv = Downcast<IterVar>(op->node);
+      PushRange(iv->var,
+                Range::FromMinExtent(make_zero(op->value.dtype()), op->value));
+    }
+    VisitStmt(op->body);
   }
 
   void VisitStmt_(const AssertStmtNode *op) final {
-    if (!IsPure(op->condition))
-      return StmtExprVisitor::VisitStmt_(op);
-    IRVisitorWithAnalyzer::VisitStmt_(op);
+    VisitExpr(op->condition);
+    VisitExpr(op->message);
+    FactScope scope(facts_);
+    PushCondition(op->condition);
+    VisitStmt(op->body);
   }
 
   void VisitExpr_(const CallNode *op) final {
@@ -101,6 +210,40 @@ private:
     if (!op->op.same_as(tl::dma_copy()) &&
         !op->op.same_as(tl::sunmmio_layout_transform()))
       return;
+    // Analyzer::Bind is persistent. Replay only this copy's lexical path into
+    // a fresh analyzer, so sibling scopes and copies cannot retain bindings.
+    // Functions without these calls never create an analyzer or bind variables.
+    arith::Analyzer analyzer;
+    VerifyInContext(op, &analyzer, 0);
+  }
+
+  void VerifyInContext(const CallNode *op, arith::Analyzer *analyzer,
+                       size_t index) const {
+    if (index == facts_.size()) {
+      VerifyRegions(op, analyzer);
+      return;
+    }
+    const Fact &fact = facts_[index];
+    if (fact.var.defined()) {
+      if (fact.range.defined()) {
+        if (analyzer->CanProve(fact.range->extent <= 0))
+          return;
+        analyzer->Bind(fact.var.value(), fact.range);
+      } else {
+        analyzer->Bind(fact.var.value(), fact.value);
+      }
+      VerifyInContext(op, analyzer, index + 1);
+    } else {
+      PrimExpr condition = analyzer->rewrite_simplify(fact.value);
+      if (analyzer->CanProve(Not(condition)))
+        return;
+      With<arith::ConstraintContext> context(analyzer, condition,
+                                             fact.is_assume);
+      VerifyInContext(op, analyzer, index + 1);
+    }
+  }
+
+  void VerifyRegions(const CallNode *op, arith::Analyzer *analyzer) const {
     ICHECK_GE(op->args.size(), 2U);
     for (int side : {0, 1}) {
       BufferRegion region = tl::NormalizeToBufferRegion(op->args[side]);
@@ -112,7 +255,8 @@ private:
         ICHECK_GT(extent->value, 0)
             << "Sunmmio copy " << operand << " buffer " << region->buffer->name
             << " has non-positive region extent at dim " << dim;
-        ICHECK(analyzer_.CanProveEqual(floormod(range->min, range->extent), 0))
+        PrimExpr min = ProofExprRenamer()(range->min);
+        ICHECK(analyzer->CanProveEqual(floormod(min, range->extent), 0))
             << "Sunmmio copy " << operand << " buffer " << region->buffer->name
             << " region min at dim " << dim
             << " must be provably aligned to region extent " << range->extent

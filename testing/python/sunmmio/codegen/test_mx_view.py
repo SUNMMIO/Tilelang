@@ -101,6 +101,62 @@ def test_mx_view_inferred_rsram_scope(tmp_path):
     compile_and_validate(field_copy_kernel(scope="shared.dyn", annotate=False), tmp_path)
 
 
+@target("sunmmio")
+def parent_descriptor_kernel(bits, kind, strides):
+    dtype = T.mxfp8 if bits == 8 else T.mxfp4
+    layout = mx_layout(kind, (64, 64), dtype)
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            owner = T.alloc_shared((64, 64), dtype, scope="shared.rsram")
+            T.annotate_layout({owner: layout})
+            rebuilt = T.decl_buffer((64, 64), dtype, data=owner.data, strides=strides, scope="shared.rsram")
+            data, scale = T.mx_view(rebuilt)
+            peer = T.alloc_shared((1, scale.shape[1]), T.float8_e8m0fnu, scope="shared.rsram")
+            T.copy(scale[0, 0], peer)
+
+    return main
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+@pytest.mark.parametrize("kind", ["mxzz", "mxznz", "row_major"])
+def test_mx_view_transposed_parent_rejected_before_layout_inference(bits, kind):
+    completed = []
+
+    @tilelang.tvm.instrument.pass_instrument
+    class Capture:
+        def run_after_pass(self, mod, info):
+            completed.append(info.name)
+
+    with (
+        tilelang.transform.PassContext(instruments=[Capture()]),
+        pytest.raises(tilelang.tvm.error.InternalError, match="T.mx_view.*strides"),
+    ):
+        lower(parent_descriptor_kernel(bits, kind, (1, 64)), target="sunmmio")
+    assert "tl.NormalizeMXViews" not in completed
+    assert "tl.SunmmioLayoutInference" not in completed
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+@pytest.mark.parametrize("kind", ["mxzz", "mxznz", "row_major"])
+def test_mx_view_equivalent_compact_parent_preserves_codegen(bits, kind, tmp_path):
+    source = compile_and_validate(parent_descriptor_kernel(bits, kind, ()), tmp_path)
+    rebuilt = lower(parent_descriptor_kernel(bits, kind, (64, 1)), target="sunmmio")
+    assert source == rebuilt.kernel_source
+    assert_mx_view_resolved(rebuilt.device_mod)
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+@pytest.mark.parametrize("kind", ["mxzz", "mxznz", "row_major"])
+@pytest.mark.parametrize("scope", ["shared", "shared.dyn"])
+def test_mx_view_parent_scope_rebinding_preserves_codegen(bits, kind, scope, tmp_path):
+    source = compile_and_validate(field_copy_kernel(bits, kind), tmp_path)
+    inferred = lower(field_copy_kernel(bits, kind, scope=scope), target="sunmmio")
+    assert source == inferred.kernel_source
+    assert_mx_view_resolved(inferred.device_mod)
+
+
 @pytest.mark.parametrize("bits", [8, 4])
 @pytest.mark.parametrize("kind", ["mxzz", "mxznz", "row_major"])
 def test_mx_view_direct_computation(bits, kind, tmp_path):
@@ -383,6 +439,66 @@ def sliced_fields_kernel(bits, kind):
 @pytest.mark.parametrize("kind", ["mxzz", "mxznz", "row_major"])
 def test_mx_view_aligned_slices_with_dynamic_offsets(bits, kind, tmp_path):
     compile_and_validate(sliced_fields_kernel(bits, kind), tmp_path)
+
+
+@target("sunmmio")
+def serial_field_slice_kernel(bits, kind, field, reverse, negative):
+    mx_dtype = T.mxfp8 if bits == 8 else T.mxfp4
+    dtype = T.float8_e8m0fnu if field == "scale" else (T.float8_e4m3fn if bits == 8 else T.float4_e2m1fn)
+    layout = mx_layout(kind, (64, 128), mx_dtype)
+    field_shape = tuple(int(x) for x in get_mx_scale_shape(layout, mx_dtype)) if field == "scale" else (64, 128)
+    rows = 1 if field == "scale" else 32
+    cols = field_shape[1] if field == "scale" else 32
+
+    @T.prim_func
+    def main():
+        with T.Kernel():
+            mx = T.alloc_shared((64, 128), mx_dtype, scope="shared.rsram")
+            T.annotate_layout({mx: layout})
+            data, scale = T.mx_view(mx)
+            peer = T.alloc_shared((rows, cols), dtype, scope="shared.rsram")
+            for block in T.serial(field_shape[0] // rows):
+                start = block * rows - field_shape[0] if negative else block * rows
+                end = (block + 1) * rows
+                if field == "scale":
+                    if negative and reverse:
+                        T.copy(peer, scale[start, 0])
+                    elif negative:
+                        T.copy(scale[start, 0], peer)
+                    elif reverse:
+                        T.copy(peer, scale[start:end, :])
+                    else:
+                        T.copy(scale[start:end, :], peer)
+                else:
+                    if negative and reverse:
+                        T.copy(peer, data[start, 32])
+                    elif negative:
+                        T.copy(data[start, 32], peer)
+                    elif reverse:
+                        T.copy(peer, data[start:end, 32:64])
+                    else:
+                        T.copy(data[start:end, 32:64], peer)
+
+    return main
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+@pytest.mark.parametrize("kind", ["mxzz", "mxznz", "row_major"])
+@pytest.mark.parametrize("field", ["data", "scale"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mx_view_serial_field_slices_match_positive_ir(bits, kind, field, reverse, tmp_path):
+    from testing.python.sunmmio.common.compile_pipeline import compile_test
+
+    def save_lower_tile_op(mod):
+        (tmp_path / "lower_tile_op.tir").write_text(mod.script(show_meta=True))
+        (tmp_path / "lower_tile_op.json").write_text(tilelang.tvm.ir.save_json(mod))
+
+    positive = serial_field_slice_kernel(bits, kind, field, reverse, negative=False)
+    compile_test(positive, target="sunmmio", test_config={"LowerTileOp": {"formal_verify": save_lower_tile_op}})
+    source = compile_and_validate(positive, tmp_path)
+    negative = lower(serial_field_slice_kernel(bits, kind, field, reverse, negative=True), target="sunmmio")
+    assert_mx_view_resolved(negative.device_mod)
+    assert source == negative.kernel_source
 
 
 @target("sunmmio")

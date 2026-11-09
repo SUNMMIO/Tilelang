@@ -114,6 +114,71 @@ Call RewriteMXCopyAnnotations(
 
 namespace {
 
+// Compare storage semantics, not Buffer object identity or debugging names.
+// A stale data Var is permitted only for SSA cloning or SRAM scope inference.
+void CheckMXParentDescriptor(const Buffer &parent, const Buffer &owner,
+                             bool has_owner_descriptor) {
+  arith::Analyzer analyzer;
+  auto require = [&](bool valid, const char *attribute) {
+    ICHECK(valid)
+        << "T.mx_view requires a complete independently allocated MX parent; "
+           "unsupported parent alias or descriptor mismatch: "
+        << attribute
+        << ". Reshaped, transposed, offset and reinterpreted parent aliases "
+           "are not supported.";
+  };
+  auto equal = [&](const Array<PrimExpr> &lhs, const Array<PrimExpr> &rhs) {
+    if (lhs.size() != rhs.size())
+      return false;
+    for (size_t i = 0; i < lhs.size(); ++i)
+      if (!analyzer.CanProveEqual(lhs[i], rhs[i]))
+        return false;
+    return true;
+  };
+  require(sunmmio::IsMXDType(parent->dtype) && parent->dtype == owner->dtype,
+          "dtype");
+  require(parent->shape.size() == 2 && equal(parent->shape, owner->shape),
+          "shape");
+  for (const PrimExpr &extent : parent->shape) {
+    PrimExpr simplified = analyzer.Simplify(extent);
+    const auto *imm = simplified.as<IntImmNode>();
+    require(imm && imm->value > 0, "static positive shape");
+  }
+  require(analyzer.CanProveEqual(parent->elem_offset, 0) &&
+              analyzer.CanProveEqual(owner->elem_offset, 0),
+          "zero offset");
+  require(parent->axis_separators.empty() && owner->axis_separators.empty(),
+          "axis_separators");
+  require(parent->buffer_type == kDefault && owner->buffer_type == kDefault,
+          "buffer_type");
+  Buffer compact = owner;
+  compact.CopyOnWrite()->strides = {};
+  Array<PrimExpr> expected = compact.MakeStrideView()->strides;
+  require(equal(parent.MakeStrideView()->strides, expected) &&
+              equal(owner.MakeStrideView()->strides, expected),
+          "strides");
+  auto local_scope = [](const String &scope) {
+    return scope == "shared" || scope == "shared.dyn" ||
+           scope == "shared.rsram";
+  };
+  require(local_scope(owner.scope()) && local_scope(parent.scope()),
+          "storage scope");
+  require(parent.scope() == owner.scope() ||
+              (!parent->data.same_as(owner->data) &&
+               (parent.scope() == "shared" || parent.scope() == "shared.dyn") &&
+               owner.scope() == "shared.rsram"),
+          "storage scope remap");
+  for (const Buffer &buffer : {parent, owner}) {
+    const auto *ptr = buffer->data->type_annotation.as<PointerTypeNode>();
+    const auto *element = ptr ? ptr->element_type.as<PrimTypeNode>() : nullptr;
+    require(element && element->dtype == buffer->dtype, "pointer element type");
+  }
+  if (has_owner_descriptor) {
+    require(parent->data_alignment == owner->data_alignment, "data_alignment");
+    require(parent->offset_factor == owner->offset_factor, "offset_factor");
+  }
+}
+
 class MXBindingRewriter : public StmtExprMutator {
 public:
   Map<Var, Array<PrimExpr>> scale_shapes;
@@ -234,20 +299,24 @@ public:
     if (call->op.same_as(mx_field_handle())) {
       Buffer parent = Downcast<Buffer>(annotations.at(kMXParent));
       Var actual = Downcast<Var>(call->args[0]);
-      ICHECK(is_zero(parent->elem_offset))
-          << "T.mx_view requires a complete MX allocation with zero offset";
-      if (buffers.count(actual)) {
-        arith::Analyzer analyzer;
-        bool same_shape = parent->shape.size() == buffers[actual]->shape.size();
-        for (size_t i = 0; same_shape && i < parent->shape.size(); ++i)
-          same_shape = analyzer.CanProveEqual(parent->shape[i],
-                                              buffers[actual]->shape[i]);
-        ICHECK(same_shape && parent->dtype == buffers[actual]->dtype)
-            << "T.mx_view cannot unpack a reshaped parent alias";
-        parent = RemapBuffer(buffers[actual]);
-      } else if (!parent->data.same_as(actual)) {
+      ICHECK(active_allocations_.count(actual))
+          << "T.mx_view expects an independently allocated local MX parent "
+             "visible at its declaration";
+      ICHECK(parent->data.same_as(actual) ||
+             !active_allocations_.count(parent->data))
+          << "T.mx_view parent metadata refers to a different live allocation";
+      bool has_descriptor = active_descriptors_.count(actual);
+      Buffer owner = RemapBuffer(has_descriptor ? active_descriptors_[actual]
+                                                : active_allocations_[actual]);
+      CheckMXParentDescriptor(parent, owner, has_descriptor);
+      if (has_descriptor) {
+        parent = owner;
+      } else {
+        // Allocate has no alignment/offset-factor metadata. Preserve the
+        // validated descriptor, including that contract, when rebinding it.
         parent.CopyOnWrite()->data = actual;
       }
+      active_descriptors_.Set(actual, parent);
       buffers.Set(actual, parent);
       annotations.Set(kMXParent, parent);
     }
@@ -307,9 +376,36 @@ public:
   }
 
   Stmt VisitStmt_(const DeclBufferNode *op) final {
+    ParentScope scope(this);
+    if (parent_handles_.count(op->buffer->data.get()) &&
+        active_allocations_.count(op->buffer->data)) {
+      Var data = op->buffer->data;
+      bool has_descriptor = active_descriptors_.count(data);
+      Buffer owner = RemapBuffer(has_descriptor ? active_descriptors_[data]
+                                                : active_allocations_[data]);
+      Buffer descriptor = RemapBuffer(op->buffer);
+      CheckMXParentDescriptor(descriptor, owner, has_descriptor);
+      if (!has_descriptor)
+        active_descriptors_.Set(data, descriptor);
+    }
     DeclBuffer decl = Downcast<DeclBuffer>(StmtExprMutator::VisitStmt_(op));
     decl.CopyOnWrite()->buffer = RemapBuffer(decl->buffer);
     return decl;
+  }
+
+  Stmt VisitStmt_(const AllocateNode *op) final {
+    ParentScope scope(this);
+    Buffer allocation;
+    if (parent_handles_.count(op->buffer_var.get())) {
+      allocation =
+          Buffer(op->buffer_var, op->dtype, op->extents, {}, PrimExpr(),
+                 op->buffer_var->name_hint, 0, 0, kDefault);
+    }
+    // Unrelated allocations only need a liveness marker. In particular, do
+    // not impose Buffer's typed-pointer requirement on ordinary TIR Allocate.
+    active_allocations_.Set(op->buffer_var, allocation);
+    active_descriptors_.erase(op->buffer_var);
+    return StmtExprMutator::VisitStmt_(op);
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
@@ -344,6 +440,11 @@ public:
   }
 
   Stmt VisitStmt_(const BlockNode *op) final {
+    ParentScope scope(this);
+    for (const Buffer &buffer : op->alloc_buffers) {
+      active_allocations_.Set(buffer->data, buffer);
+      active_descriptors_.Set(buffer->data, buffer);
+    }
     Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
     auto *n = block.CopyOnWrite();
     n->alloc_buffers =
@@ -383,6 +484,7 @@ public:
           call && call->op.same_as(mx_field_handle())) {
         Buffer parent = Downcast<Buffer>(call->annotations.at(kMXParent));
         Var actual = Downcast<Var>(call->args[0]);
+        parent_handles_.insert(actual.get());
         if (!parent->data.same_as(actual))
           shape_parents.Set(parent->data, actual);
       }
@@ -455,6 +557,23 @@ public:
   }
 
 private:
+  // Parent ownership is lexical. The global buffer table above is still used
+  // for field/shape rewriting, but must not choose an owner by traversal order.
+  struct ParentScope {
+    explicit ParentScope(MXBindingRewriter *rewriter)
+        : rewriter(rewriter), allocations(rewriter->active_allocations_),
+          descriptors(rewriter->active_descriptors_) {}
+    ~ParentScope() {
+      rewriter->active_allocations_ = allocations;
+      rewriter->active_descriptors_ = descriptors;
+    }
+    MXBindingRewriter *rewriter;
+    Map<Var, Buffer> allocations;
+    Map<Var, Buffer> descriptors;
+  };
+  Map<Var, Buffer> active_allocations_;
+  Map<Var, Buffer> active_descriptors_;
+  std::unordered_set<const VarNode *> parent_handles_;
   std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual> remapped_;
   Map<Var, PrimExpr> resolved_shape_vars_;
   std::unordered_set<const VarNode *> field_handles_;
