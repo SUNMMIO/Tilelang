@@ -206,6 +206,30 @@ private:
           << "Dynamic T.comm.put has no sender for dst_core=" << target;
     }
 
+    int64_t line_count = direction == 0 ? mesh_nrows_ : mesh_ncols_;
+    int64_t line_size = direction == 0 ? mesh_ncols_ : mesh_nrows_;
+    for (int64_t line = 0; line < line_count; ++line) {
+      auto core_at = [&](int64_t position) {
+        return direction == 0 ? line * mesh_ncols_ + position
+                              : position * mesh_ncols_ + line;
+      };
+      bool line_active = active[core_at(0)];
+      for (int64_t position = 1; position < line_size; ++position) {
+        ICHECK_EQ(active[core_at(position)], line_active)
+            << "Dynamic T.comm.put execution predicate must be uniform across "
+               "each communication line; mismatch on "
+            << (direction == 0 ? "row " : "column ") << line;
+      }
+    }
+
+    std::vector<int64_t> recv_masks(core_extent_, 0);
+    for (int64_t target = 0; target < core_extent_; ++target) {
+      int64_t sender = sender_for_target[target];
+      int64_t sender_local =
+          direction == 0 ? sender % mesh_ncols_ : sender / mesh_ncols_;
+      recv_masks[target] = static_cast<int64_t>(uint64_t{1} << sender_local);
+    }
+
     std::vector<bool> cycle_visited(core_extent_, false);
     std::vector<int64_t> barrier_masks(core_extent_, 0);
     for (int64_t start = 0; start < core_extent_; ++start) {
@@ -242,6 +266,7 @@ private:
     annotations.Set(kCommPutDirectionAttr,
                     IntImm(DataType::Int(32), direction));
     annotations.Set(kCommBarrierMaskAttr, MakePerCoreValue(barrier_masks));
+    annotations.Set(kCommPutRecvMaskAttr, MakePerCoreValue(recv_masks));
     return Call(call->dtype, call->op, call->args, annotations, call->span);
   }
 

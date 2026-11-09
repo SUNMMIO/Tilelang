@@ -32,7 +32,7 @@ TIR_DEFINE_TL_BUILTIN(broadcast_)
                                Integer(CallEffectKind::kOpaque));
 // src_region, dst_region,
 // direction(0: horizontal/row, 1: vertical/col),
-// mask(i64 direction-local bitmask of receiving cores),
+// send_mask, recv_mask, lane_mask, barrier_peer_mask,
 // src_offset_byte,
 // optional src_core
 
@@ -85,13 +85,65 @@ PrimExpr MakeVerticalMask(int mesh_nrow) {
   return MakeFullLocalMask(mesh_nrow);
 }
 
+struct MulticastMasks {
+  PrimExpr send;
+  PrimExpr recv;
+  PrimExpr lane;
+};
+
+PrimExpr LocalCoreIndex(PrimExpr core, int direction, int mesh_ncol) {
+  core = AsI64(core);
+  return direction == 0 ? floormod(core, I64Imm(mesh_ncol))
+                        : floordiv(core, I64Imm(mesh_ncol));
+}
+
+PrimExpr PhysicalLaneIndex(PrimExpr core, int direction, int mesh_ncol) {
+  core = AsI64(core);
+  return direction == 0 ? floordiv(core, I64Imm(mesh_ncol))
+                        : floormod(core, I64Imm(mesh_ncol));
+}
+
+PrimExpr LocalMaskBitSet(PrimExpr mask, PrimExpr local_index) {
+  return ((AsI64(mask) >> AsI64(local_index)) & I64Imm(1)) != I64Imm(0);
+}
+
+MulticastMasks MakeOneToManyMasks(PrimExpr current_core, PrimExpr src_core,
+                                  PrimExpr receiver_mask, int direction,
+                                  int mesh_ncol, arith::Analyzer *analyzer) {
+  current_core = AsI64(current_core);
+  src_core = AsI64(src_core);
+  receiver_mask = AsI64(receiver_mask);
+
+  if (analyzer->CanProve(current_core == src_core)) {
+    return {receiver_mask, receiver_mask, I64Imm(-1)};
+  }
+
+  PrimExpr current_local = LocalCoreIndex(current_core, direction, mesh_ncol);
+  PrimExpr source_local = LocalCoreIndex(src_core, direction, mesh_ncol);
+  PrimExpr current_lane = PhysicalLaneIndex(current_core, direction, mesh_ncol);
+  PrimExpr source_lane = PhysicalLaneIndex(src_core, direction, mesh_ncol);
+  PrimExpr zero = I64Imm(0);
+  PrimExpr send = Select(current_core == src_core, receiver_mask, zero);
+  PrimExpr is_receiver = And(current_lane == source_lane,
+                             LocalMaskBitSet(receiver_mask, current_local));
+  PrimExpr recv = Select(is_receiver, MakeLocalSingleBit(source_local), zero);
+  PrimExpr lane = MakeLocalSingleBit(source_lane);
+  return {analyzer->Simplify(send), analyzer->Simplify(recv),
+          analyzer->Simplify(lane)};
+}
+
 void AppendBroadcastArgs(Array<PrimExpr> *args, PrimExpr src_region,
-                         PrimExpr dst_region, int direction, PrimExpr mask,
-                         PrimExpr src_offset_byte, PrimExpr src_core) {
+                         PrimExpr dst_region, int direction,
+                         const MulticastMasks &masks,
+                         PrimExpr barrier_peer_mask, PrimExpr src_offset_byte,
+                         PrimExpr src_core) {
   args->push_back(src_region);
   args->push_back(dst_region);
   args->push_back(I32Imm(direction));
-  args->push_back(mask);
+  args->push_back(masks.send);
+  args->push_back(masks.recv);
+  args->push_back(masks.lane);
+  args->push_back(barrier_peer_mask);
   args->push_back(src_offset_byte);
   args->push_back(src_core);
 }
@@ -103,6 +155,9 @@ Stmt MakeBroadcastLeaf(PrimExpr src_region, PrimExpr dst_region, int direction,
   args.push_back(src_region);
   args.push_back(dst_region);
   args.push_back(I32Imm(direction));
+  args.push_back(mask);
+  args.push_back(mask);
+  args.push_back(I64Imm(-1));
   args.push_back(mask);
   args.push_back(src_offset_byte);
   return Evaluate(
@@ -290,16 +345,26 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
                << ", must be 0 (horizontal) or 1 (vertical) or 2 (all).";
   }
 
-  PrimExpr src_offset_imm = IntImm(DataType::Int(32), srcOffsetByte_);
+  ICHECK(T.block_var.defined())
+      << "T.comm.broadcast requires an enclosing blockIdx.x binding";
+  auto append_broadcast = [&](Array<PrimExpr> *args, PrimExpr src_region,
+                              PrimExpr dst_region, int bcast_direction,
+                              PrimExpr peer_mask, PrimExpr bcast_src_core) {
+    MulticastMasks masks =
+        MakeOneToManyMasks(T.block_var, bcast_src_core, peer_mask,
+                           bcast_direction, mesh_ncol, analyzer);
+    AppendBroadcastArgs(args, src_region, dst_region, bcast_direction, masks,
+                        peer_mask, I32Imm(srcOffsetByte_), bcast_src_core);
+  };
+
   if (direction == 0 or direction == 1) {
     // 1D broadcast
     Array<PrimExpr> args;
     PrimExpr mask = direction == 0 ? MakeHorizontalMask(mesh_ncol)
                                    : MakeVerticalMask(mesh_nrow);
-    AppendBroadcastArgs(&args,
-                        MakeRegionExpr(src, src_range, /*access_mask=*/1),
-                        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-                        direction, mask, src_offset_imm, src_core);
+    append_broadcast(&args, MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                     MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                     direction, mask, src_core);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     return broadcast;
   } else {
@@ -311,10 +376,9 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
     Array<Stmt> seq;
     // vertical broadcast
     Array<PrimExpr> args;
-    AppendBroadcastArgs(
-        &args, MakeRegionExpr(src, src_range, /*access_mask=*/1),
-        MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-        /*direction=*/1, MakeVerticalMask(mesh_nrow), src_offset_imm, src_core);
+    append_broadcast(&args, MakeRegionExpr(src, src_range, /*access_mask=*/1),
+                     MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                     /*direction=*/1, MakeVerticalMask(mesh_nrow), src_core);
     Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
     seq.push_back(broadcast);
     // horizontal broadcast
@@ -322,11 +386,10 @@ Stmt BroadcastOpNode::Lower(const LowerArgs &T,
       Array<PrimExpr> args;
       PrimExpr row_src_core =
           analyzer->Simplify(I32Imm(i * mesh_ncol) + src_core_col);
-      AppendBroadcastArgs(&args,
-                          MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
-                          MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
-                          /*direction=*/0, MakeHorizontalMask(mesh_ncol),
-                          src_offset_imm, row_src_core);
+      append_broadcast(&args, MakeRegionExpr(dst, dst_range, /*access_mask=*/1),
+                       MakeRegionExpr(dst, dst_range, /*access_mask=*/2),
+                       /*direction=*/0, MakeHorizontalMask(mesh_ncol),
+                       row_src_core);
       Stmt broadcast = Evaluate(Call(DataType::Handle(), broadcast_(), args));
       seq.push_back(broadcast);
     }
@@ -362,6 +425,9 @@ PutOp::PutOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   if (auto barrier_mask = annotations.Get(kCommBarrierMaskAttr)) {
     node->validated_barrier_mask = Downcast<PrimExpr>(barrier_mask.value());
   }
+  if (auto recv_mask = annotations.Get(kCommPutRecvMaskAttr)) {
+    node->validated_recv_mask = Downcast<PrimExpr>(recv_mask.value());
+  }
   data_ = std::move(node);
 }
 
@@ -382,6 +448,8 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   auto mesh = GetSunmmioMeshConfig(target);
   int mesh_nrow = mesh.nrow;
   int mesh_ncol = mesh.ncol;
+  ICHECK(T.block_var.defined())
+      << "T.comm.put requires an enclosing blockIdx.x binding";
 
   // check for valid core id
   if (src_core.as<IntImmNode>()) {
@@ -437,11 +505,21 @@ Stmt PutOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       << Downcast<IntImm>(dst_elements)->value;
 
   auto make_put_broadcast = [&](PrimExpr src_region, PrimExpr dst_region,
-                                int direction, PrimExpr mask,
+                                int direction, PrimExpr peer_mask,
                                 PrimExpr bcast_src_core) {
+    MulticastMasks masks;
+    if (validated_recv_mask.defined()) {
+      PrimExpr send = Select(AsI64(T.block_var) == AsI64(bcast_src_core),
+                             AsI64(peer_mask), I64Imm(0));
+      masks = {analyzer->Simplify(send),
+               analyzer->Simplify(AsI64(validated_recv_mask)), I64Imm(-1)};
+    } else {
+      masks = MakeOneToManyMasks(T.block_var, bcast_src_core, peer_mask,
+                                 direction, mesh_ncol, analyzer);
+    }
     Array<PrimExpr> args;
-    AppendBroadcastArgs(&args, src_region, dst_region, direction,
-                        analyzer->Simplify(mask), I32Imm(0),
+    AppendBroadcastArgs(&args, src_region, dst_region, direction, masks,
+                        analyzer->Simplify(peer_mask), I32Imm(0),
                         analyzer->Simplify(bcast_src_core));
     Map<String, ObjectRef> annotations;
     if (validated_barrier_mask.defined()) {

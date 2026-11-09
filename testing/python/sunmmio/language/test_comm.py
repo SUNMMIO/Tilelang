@@ -26,6 +26,25 @@ def _collect_calls(func, op_name):
     return calls
 
 
+def _eval_per_core_i64(expr, core_count=16):
+    variables = []
+
+    def collect(node):
+        if isinstance(node, tvm.tir.Var) and all(not node.same_as(var) for var in variables):
+            variables.append(node)
+
+    tvm.tir.stmt_functor.post_order_visit(expr, collect)
+    assert len(variables) == 1
+    analyzer = tvm.arith.Analyzer()
+    values = []
+    for core_id in range(core_count):
+        value = tvm.tir.stmt_functor.substitute(expr, {variables[0]: tvm.tir.IntImm(variables[0].dtype, core_id)})
+        value = analyzer.simplify(value)
+        assert isinstance(value, tvm.tir.IntImm)
+        values.append(int(value))
+    return values
+
+
 def _region_buffer(expr):
     if isinstance(expr, tvm.tir.BufferLoad):
         return expr.buffer
@@ -39,7 +58,7 @@ def _broadcast_line(src, dst, direction, mask, core, src_offset=0):
 
 
 def _broadcast_line_no_core(src, dst, direction, mask, src_offset=0):
-    return f"T.broadcast_({src}, {dst}, {direction}, {mask}, {src_offset})"
+    return f"T.broadcast_({src}, {dst}, {direction}, {mask}, {mask}, T.int64(-1), {mask}, {src_offset})"
 
 
 @pytest.fixture
@@ -706,6 +725,7 @@ def test_comm_dynamic_pair_put_lowers_to_one_broadcast():
     broadcast_calls = _collect_calls(mod["main"], "tl.broadcast_")
     assert len(broadcast_calls) == 1
     assert int(broadcast_calls[0].args[2].value) == 0
+    assert _eval_per_core_i64(broadcast_calls[0].args[4]) == [2, 1, 8, 4] * 4
 
 
 def test_comm_dynamic_column_pair_put_lowers_to_one_broadcast():
@@ -727,6 +747,7 @@ def test_comm_dynamic_column_pair_put_lowers_to_one_broadcast():
     broadcast_calls = _collect_calls(mod["main"], "tl.broadcast_")
     assert len(broadcast_calls) == 1
     assert int(broadcast_calls[0].args[2].value) == 1
+    assert _eval_per_core_i64(broadcast_calls[0].args[4]) == [2] * 4 + [1] * 4 + [8] * 4 + [4] * 4
 
 
 def test_comm_dynamic_put_cannot_skip_route_validation():
@@ -765,6 +786,7 @@ def test_comm_dynamic_row_ring_put_lowers_with_cycle_barrier():
     broadcast_calls = _collect_calls(mod["main"], "tl.broadcast_")
     assert len(broadcast_calls) == 1
     assert int(broadcast_calls[0].args[2].value) == 0
+    assert _eval_per_core_i64(broadcast_calls[0].args[4]) == [8, 1, 2, 4] * 4
     assert "tl.comm_barrier_mask" in broadcast_calls[0].annotations
 
 
@@ -788,6 +810,7 @@ def test_comm_dynamic_column_ring_put_lowers_with_cycle_barrier():
     broadcast_calls = _collect_calls(mod["main"], "tl.broadcast_")
     assert len(broadcast_calls) == 1
     assert int(broadcast_calls[0].args[2].value) == 1
+    assert _eval_per_core_i64(broadcast_calls[0].args[4]) == [8] * 4 + [1] * 4 + [2] * 4 + [4] * 4
     assert "tl.comm_barrier_mask" in broadcast_calls[0].annotations
 
 
@@ -809,7 +832,7 @@ def test_comm_dynamic_put_rejects_non_bijective_routes():
             tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
 
 
-def test_comm_dynamic_put_accepts_group_uniform_if():
+def test_comm_dynamic_put_rejects_non_line_uniform_if():
     @T.prim_func
     def main():
         with T.Kernel(16, threads=128) as cid:
@@ -821,11 +844,8 @@ def test_comm_dynamic_put_accepts_group_uniform_if():
     target = determine_target("Sunmmio", return_object=True)
     with tvm.target.Target(target):
         mod = tvm.tir.transform.BindTarget(target)(tvm.IRModule({"main": main}))
-        mod = tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
-
-    put_calls = _collect_calls(mod["main"], "tl.tileop.comm_put")
-    assert len(put_calls) == 1
-    assert "tl.comm_barrier_mask" in put_calls[0].annotations
+        with pytest.raises(Exception, match="must be uniform across each communication line"):
+            tilelang.transform.ValidateDynamicCommPutRoutes()(mod)
 
 
 def test_comm_dynamic_runtime_peer_is_rejected():
@@ -850,14 +870,6 @@ def test_comm_dynamic_runtime_peer_is_rejected():
     ],
 )
 def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
-    expected = [
-        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(15), 0, 6)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(15), 0, 2)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(15), 0, 6)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(15), 0, 10)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(15), 0, 14)",
-    ]
-
     @T.prim_func
     def main(
         A: T.Tensor((M, N), dtype),
@@ -875,7 +887,12 @@ def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
-        assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
+    calls = _collect_calls(mod["main"], "tl.broadcast_")
+    assert len(calls) == 5
+    assert [int(call.args[2]) for call in calls] == [1, 0, 0, 0, 0]
+    assert [int(call.args[5]) for call in calls] == [4, 1, 2, 4, 8]
+    assert [int(call.args[6]) for call in calls] == [15, 15, 15, 15, 15]
+    assert [int(call.args[8]) for call in calls] == [6, 2, 6, 10, 14]
 
 
 @pytest.mark.parametrize(
@@ -885,12 +902,6 @@ def test_comm_broadcast_lower(M, N, block_M, block_N, dtype, accum_dtype):
     ],
 )
 def test_comm_broadcast_lower_custom_mesh(M, N, block_M, block_N, dtype):
-    expected = [
-        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(3), 0, 5)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(7), 0, 2)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(7), 0, 5)",
-    ]
-
     @T.prim_func
     def main(
         A: T.Tensor((M, N), dtype),
@@ -918,7 +929,12 @@ def test_comm_broadcast_lower_custom_mesh(M, N, block_M, block_N, dtype):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
-        assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
+    calls = _collect_calls(mod["main"], "tl.broadcast_")
+    assert len(calls) == 3
+    assert [int(call.args[2]) for call in calls] == [1, 0, 0]
+    assert [int(call.args[5]) for call in calls] == [4, 1, 2]
+    assert [int(call.args[6]) for call in calls] == [3, 7, 7]
+    assert [int(call.args[8]) for call in calls] == [5, 2, 5]
 
 
 @pytest.mark.parametrize(
@@ -928,11 +944,6 @@ def test_comm_broadcast_lower_custom_mesh(M, N, block_M, block_N, dtype):
     ],
 )
 def test_comm_put_lower(M, N, block_M, block_N, dtype, accum_dtype):
-    expected = [
-        "T.broadcast_(T.region(A_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 1, T.int64(4), 0, 6)",
-        "T.broadcast_(T.region(B_shared[0, 0], 1, 128, 128), T.region(B_shared[0, 0], 2, 128, 128), 0, T.int64(8), 0, 10)",
-    ]
-
     @T.prim_func
     def main(
         A: T.Tensor((M, N), dtype),
@@ -950,7 +961,12 @@ def test_comm_put_lower(M, N, block_M, block_N, dtype, accum_dtype):
         mod = tvm.tir.transform.BindTarget(target)(mod)
         mod = tilelang.transform.ResolveSunmmioMeshSymbols()(mod)
         mod = tilelang.transform.LowerTileOp()(mod)
-        assert _broadcast_lines(mod.script()) == expected, "The generated script does not match the expected output."
+    calls = _collect_calls(mod["main"], "tl.broadcast_")
+    assert len(calls) == 2
+    assert [int(call.args[2]) for call in calls] == [1, 0]
+    assert [int(call.args[5]) for call in calls] == [4, 4]
+    assert [int(call.args[6]) for call in calls] == [4, 8]
+    assert [int(call.args[8]) for call in calls] == [6, 10]
 
 
 @pytest.mark.parametrize(

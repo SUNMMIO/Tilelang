@@ -3129,8 +3129,9 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
                static_cast<size_t>(tl::kBroadcastArgCount) ||
            fixed_and_source_args ==
                static_cast<size_t>(tl::kBroadcastArgCount + 1))
-        << "tl.broadcast_ expects src region, dst region, direction, mask, "
-           "src_offset_byte, optional src_core, and odma_unit";
+        << "tl.broadcast_ expects src region, dst region, direction, "
+           "send/recv/lane masks, barrier peer mask, src_offset_byte, "
+           "optional src_core, and odma_unit";
 
     const auto *direction_imm =
         op->args[tl::kBroadcastArgDirection].as<IntImmNode>();
@@ -3160,7 +3161,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
       allow_rank3 = allow_rank3_imm->value != 0;
     }
 
-    operands.reserve(4);
+    operands.reserve(5);
     operands.push_back(
         EmitRegionCall(op->args[tl::kBroadcastArgSrc], src_offset_byte,
                        /*use_layout_covered_shape=*/false,
@@ -3169,10 +3170,12 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
         EmitRegionCall(op->args[tl::kBroadcastArgDst], /*byte_offset=*/0,
                        /*use_layout_covered_shape=*/false,
                        /*preserve_region_rank=*/false, allow_rank3));
-    operands.push_back(EvalExpr(op->args[tl::kBroadcastArgMask]));
-    if (fixed_and_source_args ==
-        static_cast<size_t>(tl::kBroadcastArgCount + 1)) {
-      operands.push_back(EvalExpr(op->args[tl::kBroadcastArgSrcCore]));
+    operands.push_back(EvalExpr(op->args[tl::kBroadcastArgSendMask]));
+    operands.push_back(EvalExpr(op->args[tl::kBroadcastArgRecvMask]));
+    const PrimExpr &lane_mask = op->args[tl::kBroadcastArgLaneMask];
+    const auto *lane_mask_imm = lane_mask.as<IntImmNode>();
+    if (!lane_mask_imm || lane_mask_imm->value != -1) {
+      operands.push_back(EvalExpr(lane_mask));
     }
 
     attrs[SunMMIOCallAttrKey::kDirection] =
