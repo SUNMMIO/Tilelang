@@ -10,6 +10,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/Verifier.h"
 #include "npuir/Dialect/SUVM/IR/Attributes.h"
 #include "npuir/Dialect/SUVM/IR/Ops.h"
 #include "npuir/Dialect/SUVM/IR/Types.h"
@@ -538,6 +539,18 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
         ctx_.builder, type.MakeDebugLoc("sunmmio_sync"),
         mlir::suvm::SyncUnitsAttr::get(&ctx_.mlir_ctx, units));
     ctx_.CompletePendingSyncUnits(units_mask);
+    return SunMMIOValue{ret_dtype, result_name, ret_type};
+  } else if (callee.rfind("tl.device_lib.", 0) == 0) {
+    mlir::OperationState state(type.MakeDebugLoc("device_lib"),
+                               "suvm.device_lib." + callee.substr(14));
+    for (const auto &operand : operands)
+      state.addOperands(ctx_.LookupMLIRValue(operand.value));
+    auto *operation = ctx_.builder.create(state);
+    ICHECK(mlir::succeeded(mlir::verify(operation)))
+        << "Invalid device library call: " << callee;
+    ctx_.AddPendingSyncOperation(operation, SunmmioMlirContext::ToSyncUnitMask(
+                                                mlir::suvm::SyncUnits::vector |
+                                                mlir::suvm::SyncUnits::rsram));
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee == "tl.dma_copy") {
     ICHECK_GE(operands.size(), 2)

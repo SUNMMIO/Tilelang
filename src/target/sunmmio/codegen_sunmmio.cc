@@ -2934,6 +2934,18 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     return builder_->Select(NewValueName(), cond, tv, fv, tv.type, dtype);
   } else if (callee == "tl.tileop.region") {
     return EmitRegionCall(tvm::ffi::GetRef<PrimExpr>(op));
+  } else if (callee == "tl.device_lib") {
+    const auto *name = op->args[0].as<StringImmNode>();
+    ICHECK(name);
+    MarkVisitedNodeType(name->GetTypeKey());
+    callee = "tl.device_lib." + std::string(name->value);
+    size_t region_end = name->value == "topk" ? 4 : 3;
+    for (size_t i = 1; i < region_end; ++i) {
+      operands.push_back(EmitRegionCall(op->args[i], 0, false, true));
+    }
+    if (name->value == "topk") {
+      operands.push_back(EvalExpr(op->args[4]));
+    }
   } else if (callee == "tl.mx_pack") {
     return EmitMXPackOrUnpack(op, /*is_pack=*/true);
   } else if (callee == "tl.mx_unpack") {

@@ -1081,6 +1081,41 @@ for block, row in T.Tiles(scale.shape):
 
 `T.mx_pack` 和 `T.mx_unpack` 保持原有复制语义。用户仍需保证读前初始化，并在消费完整 MX 前准备好对应 payload 和 scale。
 
+### 3.11 设备库操作
+
+NPU-IR 0.1.5 的设备库通过以下直接 `T.*` API 暴露：
+
+| TileLang API | SUVM 操作 | 数据类型 |
+| --- | --- | --- |
+| `T.topk(input, values, indices, k)` | `suvm.device_lib.topk` | FP32/BF16 数值，int32 索引 |
+| `T.exp_refined(input, output)` | `suvm.device_lib.exp_fast` | FP32 |
+| `T.log_refined(input, output)` | `suvm.device_lib.ln_fast` | FP32 |
+| `T.reciprocal_refined(input, output)` | `suvm.device_lib.recip_fast` | FP32 |
+| `T.rsqrt_refined(input, output)` | `suvm.device_lib.rsqrt_fast` | FP32 |
+
+所有操作数均为二维 RSRAM buffer 或 region。编译器推导局部布局并插入同步，
+无需在内核中添加布局标注。
+
+`topk` 对每个局部行选择最大的 `k` 个元素，按降序输出；相同数值优先选择较小列号。
+索引相对于输入 region。选中的输入元素被改写为负无穷，因此保留原始分数时应使用独立工作副本。
+输入、数值输出和索引输出不得共享存储。输入支持 row-major 和 ZZ；输出为稠密 row-major，
+行数与输入相同，物理列宽至少容纳 `k` 个元素并满足对齐要求。
+未使用的输出列填充负无穷 / -1。输入 padding 应初始化为负无穷，
+每行必须至少有 `k` 个大于负无穷的候选。支持动态 `k`，其运行时范围由调用方保证。
+该操作不会自动合并不同 core 上的候选。
+
+例如 decode 的一行含 64,000 个有效分数、选择 2,048 个时，工作 buffer 需要容纳整行及布局 padding，
+另外分别准备容纳 2,048 个结果的数值和 int32 索引 buffer。
+分布式或流式选择还需要后续归并，并将局部索引转换为全局索引。
+
+四个一元函数要求输入与输出 region 形状相同、布局同为 row-major 或同为 ZZ。
+允许完全原地操作，不允许部分重叠。BF16 调用方需显式转换为 FP32。
+`refined` 表示在硬件近似结果上增加精度修正，不承诺提速或正确舍入。
+执行环境必须初始化默认 PWL 系数表。已有数学 API 的语义保持不变。
+
+编译器契约截至生成合法 SUVM；后续集成负责 lowering、链接 NPU-IR 设备函数实现及运行时初始化。
+编译覆盖位于 `testing/python/sunmmio/codegen/test_device_lib.py`，数值集成测试放在 samples 仓库。
+
 ## 4. 示例
 
 本节给出 3 个完整 kernel 示例。为了突出主体结构，示例假设 problem size 能被 block size 和 mesh 切分整除；实际工程代码需要补充边界处理。

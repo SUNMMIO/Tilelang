@@ -1085,6 +1085,50 @@ for block, row in T.Tiles(scale.shape):
 
 `T.mx_pack` and `T.mx_unpack` retain their copying semantics. Initialize values before reading them and prepare the corresponding payload and scales before consuming the complete MX buffer.
 
+### 3.11 Device Library Operations
+
+NPU-IR 0.1.5 provides the following operations through direct `T.*` APIs:
+
+| TileLang API | SUVM operation | Data type |
+| --- | --- | --- |
+| `T.topk(input, values, indices, k)` | `suvm.device_lib.topk` | FP32/BF16 values, int32 indices |
+| `T.exp_refined(input, output)` | `suvm.device_lib.exp_fast` | FP32 |
+| `T.log_refined(input, output)` | `suvm.device_lib.ln_fast` | FP32 |
+| `T.reciprocal_refined(input, output)` | `suvm.device_lib.recip_fast` | FP32 |
+| `T.rsqrt_refined(input, output)` | `suvm.device_lib.rsqrt_fast` | FP32 |
+
+All operands are rank-two RSRAM buffers or regions. The compiler infers local
+layouts and inserts synchronization; no local layout annotation is needed.
+
+`topk` selects the largest `k` elements in each local row, in descending order,
+with smaller column indices winning ties. Indices are relative to the input
+region. Selected input elements become negative infinity: use a separate work
+copy if the original scores must survive. Input, values, and indices must not
+share storage. Input supports row-major and ZZ layouts; outputs are dense
+row-major with matching row counts and aligned physical widths of at least `k`.
+Unused output columns contain negative infinity / -1. Initialize input padding
+to negative infinity; each row must have at least `k` candidates greater than
+negative infinity. A dynamic `k` is allowed, but its runtime bounds remain the
+caller's responsibility. This operation does not merge candidates across cores.
+
+For example, a decode row with 64,000 valid scores and `k=2048` needs a work
+buffer holding that row (including any layout padding), plus separate values and
+int32 indices buffers with room for 2,048 selections. Distributed or streamed
+selection requires a subsequent merge and conversion to global indices.
+
+The four unary operations require equal input/output region shapes and matching
+row-major or ZZ layouts. Exact in-place use is supported; partial overlap is
+not. BF16 callers must explicitly convert to FP32. `refined` names the additional
+accuracy correction over the hardware approximation, without promising a speedup
+or correctly rounded results. The default PWL coefficient tables must be
+initialized by the execution environment. Existing math APIs retain their semantics.
+
+The compiler contract ends at valid SUVM code generation. Downstream integration
+must lower this IR, link the NPU-IR device implementations, and initialize the
+runtime before execution. Compiler coverage is in
+`testing/python/sunmmio/codegen/test_device_lib.py`; numerical integration tests
+belong to the samples repository.
+
 ## 4. Examples
 
 This section gives 3 complete kernel examples. To keep the main structure clear, the examples assume that the problem size is divisible by block size and mesh partitioning. Real engineering code needs additional boundary handling.

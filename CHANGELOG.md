@@ -5,6 +5,17 @@ All notable user-facing changes to TileLang-Mesh are documented in this file.
 The project follows [Semantic Versioning](https://semver.org/) for public releases. Because this is
 beta software, minor releases may still contain explicitly documented compatibility changes.
 
+## Unreleased
+
+### Added
+
+- SunMMIO frontend and SUVM code generation for NPU-IR 0.1.5 device library
+  operations: `T.topk`, `T.exp_refined`, `T.log_refined`,
+  `T.reciprocal_refined`, and `T.rsqrt_refined`.
+- Layout inference, memory effects, synchronization, and pipeline scheduling
+  support for these operations. Device library linking and execution belong to
+  the downstream integration; this change does not add runtime library packaging.
+
 ## [0.1.0] - 2026-09-04
 
 ### Highlights

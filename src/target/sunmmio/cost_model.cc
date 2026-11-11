@@ -518,6 +518,32 @@ private:
   static float AnalyzeEvaluate(const EvaluateNode &eval) {
     const auto *call = eval.value.as<CallNode>();
     ICHECK(call) << "VectorCore Evaluate must wrap a CallNode.";
+    if (call->op.same_as(Op::Get("tl.device_lib"))) {
+      auto input = NormalizeToBufferRegion(call->args[1]);
+      float elements = 1;
+      for (const auto &range : input->region) {
+        const auto *extent = range->extent.as<IntImmNode>();
+        ICHECK(extent) << "Device library cost requires static region extents";
+        elements *= extent->value;
+      }
+      if (call->args[0].as<StringImmNode>()->value == "topk") {
+        const auto *k = call->args[4].as<IntImmNode>();
+        // Conservative scan-per-selection estimate; the library can reuse
+        // chunk summaries. Dynamic k uses the output capacity as an upper
+        // bound.
+        auto output = NormalizeToBufferRegion(call->args[2]);
+        float rounds =
+            k ? k->value
+              : output->region.back()->extent.as<IntImmNode>()->value;
+        return elements * rounds * VectorCoreCost::kReduceMinMaxFlops;
+      }
+      // A scheduling weight for a PWL refinement, not a measured latency.
+      return elements *
+             (2 * VectorCoreCost::kExp2Flops + 4 * VectorCoreCost::kMulFlops +
+              VectorCoreCost::kAddSubFlops + VectorCoreCost::kCompareFlops +
+              VectorCoreCost::kFirstLoadFlops +
+              VectorCoreCost::kBufferStoreBaseFlops);
+    }
     ICHECK(call->op == Op::Get("tl.vector_core_in_tile_reduce"))
         << "An intrinsic on VectorCore should be "
            "tl.vector_core_in_tile_reduce.";

@@ -1210,6 +1210,15 @@ private:
         AddAccess(NormalizeToBufferRegion(call->args[1]), true);
         return;
       }
+      if (call->op.same_as(device_lib())) {
+        bool topk = call->args[0].as<StringImmNode>()->value == "topk";
+        AddAccess(NormalizeToBufferRegion(call->args[1]), false);
+        if (topk)
+          AddAccess(NormalizeToBufferRegion(call->args[1]), true);
+        for (size_t i = 2; i < (topk ? 4U : 3U); ++i)
+          AddAccess(NormalizeToBufferRegion(call->args[i]), true);
+        return;
+      }
       if (call->op.same_as(mma_sunmmio())) {
         AddAccess(NormalizeToBufferRegion(call->args[0]), false);
         AddAccess(NormalizeToBufferRegion(call->args[1]), false);
