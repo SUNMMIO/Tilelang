@@ -89,19 +89,23 @@ CMAKE_ARGS="-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE
 
 This path requires GitHub access to the SSH-based NPU-IR submodule:
 
+The SunMMIO backend requires Z3 and must be built with `USE_Z3=ON`.
+Python builds install `z3-solver` by default. To use a system Z3 installation,
+keep `USE_Z3=ON` and set `USE_PYPI_Z3=OFF`.
+
 ```bash
 git clone --recursive https://github.com/SUNMMIO/Tilelang.git
 cd Tilelang
 git submodule update --init --recursive
 python -m pip uninstall -y tilelang
-CMAKE_ARGS="-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON" \
+CMAKE_ARGS="-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON -DUSE_Z3=ON" \
   python -m pip install . -v
 ```
 
 To reuse an existing LLVM source checkout for NPU-IR:
 
 ```bash
-CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON -DNPUIR_USE_LLVM_SOURCE_DIR=/path/to/llvm-project" \
+CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON -DUSE_Z3=ON -DNPUIR_USE_LLVM_SOURCE_DIR=/path/to/llvm-project" \
   python -m pip install . -v
 ```
 
@@ -110,7 +114,7 @@ CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON -DNPU
 Editable development build:
 
 ```bash
-CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON" \
+CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON -DUSE_Z3=ON" \
   python -m pip install -e . -v
 ```
 
@@ -118,7 +122,7 @@ For frequent C++ development, configure once and rebuild with Ninja:
 
 ```bash
 cmake -S . -B build -G Ninja \
-  -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON
+  -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON -DUSE_Z3=ON
 ninja -C build
 ```
 

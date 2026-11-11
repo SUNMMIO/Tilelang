@@ -338,7 +338,8 @@ bool RequiresAligned1DBridgeCandidate(
 }
 
 bool SupportsAligned1DBridgeDType(DataType dtype) {
-  return dtype.bits() >= 8 && !sunmmio::IsMXDType(dtype);
+  return (dtype.bits() >= 8 || dtype.is_float4_e2m1fn()) &&
+         !sunmmio::IsMXDType(dtype);
 }
 
 bool SupportsCrossCarrierAligned1DBridgeDType(DataType dtype) {
@@ -433,6 +434,10 @@ bool SupportsAligned1DBridgeCandidate(
     return false;
   }
   if (!SupportsAligned1DBridgeDType(buffer->dtype)) {
+    return false;
+  }
+  if (buffer->dtype.is_float4_e2m1fn() &&
+      (tile_extent * buffer->dtype.bits()) % 32 != 0) {
     return false;
   }
 
@@ -678,11 +683,41 @@ std::optional<std::vector<AccessInfo>> AnalyzeAccessesForExecutionAxes(
     std::vector<AccessTileCandidate> candidates = EnumerateAccessTileCandidates(
         access, bindings, exec_rank, manual_tileviews, layout_map, config,
         analyzer);
+    auto limit_scale_padding = [&](std::vector<AccessTileCandidate> *choices) {
+      if (!access.buffer->dtype.is_float8_e8m0fnu() ||
+          manual_it != manual_tileviews.end())
+        return;
+      int alignment = GetSunmmioRsramAlignmentElems(config.rsram_align_bytes,
+                                                    access.buffer->dtype);
+      choices->erase(
+          std::remove_if(
+              choices->begin(), choices->end(),
+              [&](const AccessTileCandidate &candidate) {
+                auto axes = candidate.tileview->IndexMap();
+                for (size_t axis = 0; axis < candidate.tile_shape.size();
+                     ++axis) {
+                  int dim = NormalizeMappedDim(axes[axis],
+                                               access.buffer->shape.size());
+                  const auto *extent =
+                      access.buffer->shape[dim].as<IntImmNode>();
+                  if (extent && extent->value > 0 &&
+                      candidate.tile_shape[axis] >
+                          ((extent->value + alignment - 1) / alignment) *
+                              alignment)
+                    return true;
+                }
+                return false;
+              }),
+          choices->end());
+    };
+    // MX scale prefixes contain padding beyond the aligned logical row.
+    limit_scale_padding(&candidates);
     std::vector<AccessTileCandidate> relaxed_candidates = candidates;
     if (IsEligibleForAligned1DBridgeSearch(access, bindings, exec_rank)) {
       relaxed_candidates = EnumerateAccessTileCandidates(
           access, bindings, exec_rank, manual_tileviews, layout_map, config,
           analyzer, AlignmentMode::kRelaxed);
+      limit_scale_padding(&relaxed_candidates);
       if (cross_carrier_domain_extent.has_value() &&
           manual_it == manual_tileviews.end()) {
         int mapped_dim = -1;
@@ -725,12 +760,12 @@ std::optional<std::vector<AccessInfo>> AnalyzeAccessesForExecutionAxes(
       if (has_unsupported_bridge &&
           warned_unsupported_bridge_buffers->insert(access.buffer.get())
               .second) {
-        LOG(WARNING)
-            << "Skipping aligned 1D bridge candidates for buffer "
-            << access.buffer->name << " with dtype " << access.buffer->dtype
-            << ". Sub-byte and MX dtypes are currently supported only by "
-               "their blockwise paths; T.Tiles will try a strict plan or "
-               "scalar fallback.";
+        LOG(WARNING) << "Skipping aligned 1D bridge candidates for buffer "
+                     << access.buffer->name << " with dtype "
+                     << access.buffer->dtype
+                     << ". This dtype requires its blockwise path; T.Tiles "
+                        "will try a strict plan or "
+                        "scalar fallback.";
       }
       relaxed_candidates.erase(
           std::remove_if(

@@ -113,6 +113,9 @@ private:
   }
 
   Stmt VisitStmt_(const LetStmtNode *op) final {
+    // Route proofs substitute scalar values, not buffer data handles.
+    if (op->var.dtype().is_handle())
+      return StmtExprMutator::VisitStmt_(op);
     PrimExpr value = VisitExpr(op->value);
     Map<Var, PrimExpr> replacements;
     for (const auto &[var, bound] : let_bindings_) {

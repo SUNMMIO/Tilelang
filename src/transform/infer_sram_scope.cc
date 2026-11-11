@@ -30,6 +30,7 @@
 #include "arith/ir_visitor_with_analyzer.h"
 #include "common/attr.h"
 #include "common/loop_fusion_utils.h"
+#include "common/mx_view.h"
 #include "common/remap_buffer_rewriter.h"
 #include "common/union_find.h"
 #include "layout_reducer.h"
@@ -113,6 +114,15 @@ public:
   }
 
 private:
+  Stmt VisitStmt_(const LetStmtNode *op) final {
+    if (IsMXFieldHandle(op->value) || HasMXShapePlaceholder(op->value)) {
+      // Scope inference revisits the body while replacing allocation handles.
+      // Address bindings are not arithmetic facts for its persistent analyzer.
+      return StmtExprMutator::VisitStmt_(op);
+    }
+    return IRMutatorWithAnalyzer::VisitStmt_(op);
+  }
+
   InferSramScopePass(arith::Analyzer *analyzer, Target target)
       : arith::IRMutatorWithAnalyzer(analyzer), target_(std::move(target)) {}
 
@@ -597,8 +607,9 @@ private:
         return tvm::ffi::GetRef<Call>(op);
       }
     }
-    auto expr = StmtExprMutator::VisitExpr_(op);
-    return expr;
+    auto call = Downcast<Call>(StmtExprMutator::VisitExpr_(op));
+    return RewriteMXCopyAnnotations(
+        call, [&](const PrimExpr &x) { return VisitExpr(x); });
   }
 
   PrimExpr VisitExpr_(const VarNode *op) final {

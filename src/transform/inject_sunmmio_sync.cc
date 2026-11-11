@@ -45,6 +45,7 @@
 #include "../op/comm.h"
 #include "../op/utils.h"
 #include "../target/sunmmio_utils.h"
+#include "common/mx_view.h"
 
 namespace tvm {
 namespace tl {
@@ -463,7 +464,20 @@ struct UnitAccess {
   SunmmioSyncUnits units{kSunmmioSyncNone};
 };
 
-bool AccessRegionsMayOverlap(const UnitAccess &lhs, const UnitAccess &rhs) {
+bool AccessRegionsMayOverlap(const UnitAccess &lhs, const UnitAccess &rhs,
+                             const MXViewMap &views) {
+  auto left = views.find(lhs.buffer->data.get());
+  auto right = views.find(rhs.buffer->data.get());
+  if (left != views.end() || right != views.end()) {
+    if (!MXStorageRoot(lhs.buffer, views)
+             .same_as(MXStorageRoot(rhs.buffer, views)))
+      return false;
+    if (left == views.end() || right == views.end())
+      return true;
+    if (left->second.field != right->second.field)
+      return false;
+    return RegionIntersect(lhs.region, rhs.region);
+  }
   if (!lhs.buffer->data.same_as(rhs.buffer->data)) {
     return false;
   }
@@ -494,6 +508,7 @@ bool NeedsUnitSync(const UnitAccess &producer, const UnitAccess &consumer) {
 class InjectUnitSyncRewriter : public StmtMutator {
 public:
   Stmt operator()(Stmt body) {
+    views_ = CollectMXViews(body);
     Stmt rewritten = VisitStmt(body);
     SunmmioSyncUnits pending_links = PendingUnits() & kLinkUnits;
     CompleteUnits(pending_links);
@@ -501,6 +516,7 @@ public:
   }
 
 private:
+  MXViewMap views_;
   static constexpr SunmmioSyncUnits kTileMemoryUnits =
       kSunmmioSyncVector | kSunmmioSyncRsram;
   static constexpr SunmmioSyncUnits kLinkUnits =
@@ -666,7 +682,7 @@ private:
     SunmmioSyncUnits required = kSunmmioSyncNone;
     for (const UnitAccess &consumer : accesses) {
       for (const UnitAccess &producer : pending_) {
-        if (!AccessRegionsMayOverlap(producer, consumer) ||
+        if (!AccessRegionsMayOverlap(producer, consumer, views_) ||
             !NeedsUnitSync(producer, consumer)) {
           continue;
         }

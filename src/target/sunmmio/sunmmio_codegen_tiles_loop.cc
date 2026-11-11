@@ -1529,6 +1529,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         ((dtype.is_int() || dtype.is_uint()) && dtype.bits() == 32)) {
       return DataType::Int(32);
     }
+    if (dtype.is_float8_e4m3fn() || dtype.is_float8_e8m0fnu() ||
+        dtype.is_float4_e2m1fn()) {
+      return DataType::Int(32);
+    }
     LOG(FATAL) << "Unsupported masked tile dtype for SunMMIO mask index "
                   "lowering: "
                << dtype;
@@ -2093,6 +2097,23 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       if (outer_strides_are_aligned) {
         SunMMIOValue tile_partition = EnsureIndex(
             access.partition_indices[static_cast<size_t>(tiled_dim)]);
+        int64_t storage_word_elems = 32 / access.buffer->dtype.bits();
+        if (access.buffer->dtype.bits() < 16 &&
+            access.tile_shape[0] % storage_word_elems == 0 &&
+            access.aligned_load_elems % storage_word_elems == 0) {
+          // Keep word alignment explicit for low-bit slice lowering.
+          auto word_base =
+              mul_index(tile_partition, make_index_const(access.tile_shape[0] /
+                                                         storage_word_elems));
+          auto carrier_words =
+              make_index_const(access.aligned_load_elems / storage_word_elems);
+          auto indices = access.partition_indices;
+          indices[static_cast<size_t>(tiled_dim)] =
+              div_index(word_base, carrier_words);
+          auto offset = mul_index(mod_index(word_base, carrier_words),
+                                  make_index_const(storage_word_elems));
+          return Aligned1DAddressInfo{offset, indices};
+        }
         SunMMIOValue tile_base_elem =
             mul_index(tile_partition, make_index_const(access.tile_shape[0]));
         SunMMIOValue aligned_elems =
@@ -2124,15 +2145,14 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       linear_elem = add_index(linear_elem, dim_offset);
     }
 
-    int64_t dtype_bytes = static_cast<int64_t>(
-        CanonicalizeSuvmDType(access.buffer->dtype).bytes());
-    SunMMIOValue elem_size = make_index_const(dtype_bytes);
-    SunMMIOValue aligned_bytes = make_index_const(access.aligned_load_bytes);
+    int64_t dtype_bits = CanonicalizeSuvmDType(access.buffer->dtype).bits();
+    SunMMIOValue elem_size = make_index_const(dtype_bits);
+    SunMMIOValue aligned_bits = make_index_const(access.aligned_load_bytes * 8);
     SunMMIOValue aligned_elems = make_index_const(access.aligned_load_elems);
-    SunMMIOValue base_bytes = mul_index(linear_elem, elem_size);
-    SunMMIOValue region_index = div_index(base_bytes, aligned_bytes);
-    SunMMIOValue offset_bytes = mod_index(base_bytes, aligned_bytes);
-    SunMMIOValue offset_elems = div_index(offset_bytes, elem_size);
+    SunMMIOValue base_bits = mul_index(linear_elem, elem_size);
+    SunMMIOValue region_index = div_index(base_bits, aligned_bits);
+    SunMMIOValue offset_bits = mod_index(base_bits, aligned_bits);
+    SunMMIOValue offset_elems = div_index(offset_bits, elem_size);
 
     std::vector<SunMMIOValue> aligned_partition_indices(memtensor_shape.size(),
                                                         make_index_const(0));
@@ -4161,17 +4181,17 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
               tile_type,
               CanonicalizeSuvmDType(load->buffer->dtype).with_lanes(1));
         }
-        if (access.tile_rank == 1 && scope.tile_shape.size() == 2) {
-          std::vector<int64_t> unit_shape =
-              access.unsqueeze_axis == 1
-                  ? std::vector<int64_t>{access.tile_shape[0], 1}
-                  : std::vector<int64_t>{1, access.tile_shape[0]};
-          tile = checked_tile_unsqueeze(
-              tile, MakeTileType(load->buffer->dtype, unit_shape),
-              access.unsqueeze_axis,
-              CanonicalizeSuvmDType(load->buffer->dtype).with_lanes(1),
-              "rank-1 tile load orientation");
-        }
+      }
+      if (access.tile_rank == 1 && scope.tile_shape.size() == 2) {
+        std::vector<int64_t> unit_shape =
+            access.unsqueeze_axis == 1
+                ? std::vector<int64_t>{access.tile_shape[0], 1}
+                : std::vector<int64_t>{1, access.tile_shape[0]};
+        tile = checked_tile_unsqueeze(
+            tile, MakeTileType(load->buffer->dtype, unit_shape),
+            access.unsqueeze_axis,
+            CanonicalizeSuvmDType(load->buffer->dtype).with_lanes(1),
+            "rank-1 tile load orientation");
       }
       if (!access.promoted_unit_tile_view && !access.requires_aligned_1d_load &&
           !access.requires_aligned_2d_carrier) {

@@ -229,6 +229,8 @@ DeriveLayoutLike(const Layout &src, Array<PrimExpr> dst_shape,
  * For SUVM MX dtypes this dispatches to sunmmio::DeriveMXLayoutLike so MX
  * row-major, MXZZ, MXNNZ, and MXZNZ keep their data/scale/padding storage
  * strides.
+ * Leading batch axes may be added or removed when the MX matrix axes are the
+ * trailing two axes; this constructs a new layout rather than a storage alias.
  * Other dtypes use the generic DeriveLayoutLike path.
  */
 Optional<Layout> DeriveLayoutLikeForDType(
@@ -253,9 +255,19 @@ Layout TryCanonicalizeToRowMajor(const Layout &layout);
  *
  * Operands are canonicalized first, so representations that describe the same
  * byte map (e.g. a single-block ZZ vs row-major) compare equal.
+ * Matching mode structures may differ in strides of proven size-one modes;
+ * all mode extents and active strides must still agree after shape adaptation.
  */
 bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
                    arith::Analyzer *analyzer = nullptr);
+
+/*! \brief Compare layout kinds while preserving dtype-specific storage rules.
+ * MX layouts are shape-adapted through their canonical constructors, including
+ * scale/padding strides. This does not validate copy regions or storage
+ * aliases.
+ */
+bool IsLayoutMatchForDType(const Layout &lhs, const Layout &rhs, DataType dtype,
+                           arith::Analyzer *analyzer = nullptr);
 
 // ---------------------------------------------------------------------------
 // Sunmmio named layout constructors

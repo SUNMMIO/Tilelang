@@ -16,6 +16,8 @@
 #include <utility>
 
 #include "arith/ir_mutator_with_analyzer.h"
+#include "common/attr.h"
+#include "common/mx_view.h"
 #include "tir/analysis/control_flow_graph.h"
 #include "tir/analysis/var_use_def_analysis.h"
 
@@ -235,6 +237,13 @@ public:
     std::optional<ControlFlowGraph> touch_pattern = std::nullopt;
     if (config->propagate_knowns_to_prove_conditional ||
         config->propagate_knowns_to_simplify_expressions) {
+      bool has_views = false;
+      PostOrderVisit(func->body, [&](const ObjectRef &obj) {
+        if (const auto *let = obj.as<LetStmtNode>())
+          has_views |= IsMXFieldHandle(let->value);
+      });
+      ICHECK(!has_views)
+          << "MX views do not support optional buffer value propagation";
       touch_pattern = ControlFlowGraph(func->body);
     }
 
@@ -242,6 +251,10 @@ public:
         CollectVarsUsedInBufferDefinition(func->body);
     StmtSimplifier simplifier(analyzer, config, std::move(touch_pattern),
                               std::move(used_in_buffer_def));
+    PostOrderVisit(func->body, [&](const ObjectRef &obj) {
+      if (const auto *let = obj.as<LetStmtNode>())
+        simplifier.preserve_tile_unit_axes_ |= IsMXFieldHandle(let->value);
+    });
     simplifier.MarkBufferMapShapes(func);
     func.CopyOnWrite()->body = simplifier(func->body);
 
@@ -302,7 +315,11 @@ private:
       return touch_pattern_->SimplifyInContext(expr, current_stmt_.value(),
                                                analyzer_);
     } else {
-      return analyzer_->Simplify(expr);
+      PrimExpr result = analyzer_->Simplify(expr);
+      if (auto call = result.as<Call>())
+        return RewriteMXCopyAnnotations(
+            call.value(), [&](const PrimExpr &x) { return VisitExpr(x); });
+      return result;
     }
   }
 
@@ -317,6 +334,16 @@ private:
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
+    if (preserve_tile_unit_axes_ && is_one(op->extent)) {
+      if (auto stage = op->annotations.Get(attr::kTileLoopStage)) {
+        if (auto value = stage.value().as<IntImm>();
+            value && value.value()->value == 0) {
+          // Preserve the logical axis until the tile planner selects a padded
+          // carrier; low-bit fields cannot fall back to scalar pick/set.
+          return StmtExprMutator::VisitStmt_(op);
+        }
+      }
+    }
     if (analyzer_->CanProve(op->extent <= 0)) {
       // Remove loops with non-positive extent
       return Evaluate(0);
@@ -393,7 +420,13 @@ private:
       return body;
     }
 
-    bool can_inline = CanInlineLetStmt(op);
+    bool shape_value =
+        HasMXShapePlaceholder(value) || UsesVar(value, [&](const VarNode *var) {
+          return mx_shape_vars_.count(var);
+        });
+    if (shape_value)
+      mx_shape_vars_.insert(op->var.get());
+    bool can_inline = !shape_value && CanInlineLetStmt(op);
     if (can_inline) {
       analyzer_->Bind(op->var, value);
     } else if (SideEffect(op->value) <= CallEffectKind::kPure) {
@@ -526,6 +559,8 @@ private:
   }
 
   SimplifyConfig config_;
+  bool preserve_tile_unit_axes_{false};
+  std::unordered_set<const VarNode *> mx_shape_vars_;
   std::optional<ControlFlowGraph> touch_pattern_;
 
   Map<Var, PrimExpr> non_inlined_bindings_;

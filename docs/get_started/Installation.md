@@ -124,15 +124,19 @@ git submodule status 3rdparty/NPU-IR
 
 Build the SunMMIO-only configuration:
 
+The SunMMIO backend requires Z3 and must be built with `USE_Z3=ON`.
+Python builds install `z3-solver` by default. To use a system Z3 installation,
+keep `USE_Z3=ON` and set `USE_PYPI_Z3=OFF`.
+
 ```bash
-CMAKE_ARGS="-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON" \
+CMAKE_ARGS="-DTILELANG_UPDATE_SUBMODULES=OFF -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON -DUSE_Z3=ON" \
   python -m pip install . -v
 ```
 
 Reuse an existing LLVM source checkout for NPU-IR:
 
 ```bash
-CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON -DNPUIR_USE_LLVM_SOURCE_DIR=/path/to/llvm-project" \
+CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON -DUSE_Z3=ON -DNPUIR_USE_LLVM_SOURCE_DIR=/path/to/llvm-project" \
   python -m pip install . -v
 ```
 
@@ -150,7 +154,7 @@ python -m pip install --upgrade pip setuptools wheel "build[uv]"
 python -m pip install -r requirements-dev.txt
 
 # Authorized SUNMMIO development build
-CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON" \
+CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON -DUSE_Z3=ON" \
   python -m pip install --no-build-isolation --editable . -v
 ```
 
@@ -158,7 +162,7 @@ For frequent C++ changes, build with CMake and Ninja directly:
 
 ```bash
 cmake -S . -B build -G Ninja \
-  -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON
+  -DUSE_CUDA=OFF -DUSE_ROCM=OFF -DUSE_METAL=OFF -DUSE_SUNMMIO=ON -DUSE_Z3=ON
 ninja -C build
 ```
 

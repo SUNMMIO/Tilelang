@@ -685,15 +685,17 @@ LayoutMap CopyNode::InferLayout(const LayoutInferArgs &T,
     return result_map;
   }
 
-  // Sunmmio DMA Copy: no layout inference here.  CopyNode::Lower bridges a
-  // DRAM<->RSRAM layout mismatch by splitting the copy into a dma_copy plus a
-  // sunmmio_layout_transform through an RSRAM staging buffer.  Layouts are
-  // assigned by other operators.
+  // Propagate non-transposed MX weight requirements through DMA staging.
+  // Other copies retain their existing layout-transform lowering policy.
   //
   // Hard constraint: DRAM → ASRAM/WSRAM requires ZZ-like DRAM layout
   // (ZZ, ZZZ, or ZZN).  DRAM layouts are user-specified and immutable,
   // so an incompatible layout is a hard error.
   if (copy_inst == CopyInst::kSunmmioDMACopy) {
+    auto weight_layouts =
+        InferSunmmioMXWeightTransferLayout(T, src, dst, level);
+    if (weight_layouts.has_value())
+      return *weight_layouts;
     if (src.scope() == "global" && (dst.scope() == kSunmmioScopeASRAM ||
                                     dst.scope() == kSunmmioScopeWSRAM)) {
       if (T.global_layout_map.count(src)) {
@@ -1005,6 +1007,8 @@ CopyInst CopyNode::GetCopyInst(Target target, bool disable_tma_lower,
         src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeRSRAM;
 
     if (rsram_to_rsram) {
+      if (sunmmio::IsMXDType(src->dtype) && CheckSunmmioDMACopy(target))
+        return CopyInst::kSunmmioDMACopy;
       if (CheckSunmmioRsramStridedDMACopy(target, layout_map, analyzer)) {
         return CopyInst::kSunmmioDMACopy;
       }
@@ -1072,7 +1076,76 @@ Stmt CopyNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
 Stmt CopyNode::LowerSunmmioDmaCopy(const LowerArgs &T,
                                    arith::Analyzer *analyzer) const {
-  if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeRSRAM) {
+  // A slot axis is fixed, not reshaped into a matrix dimension. Match the
+  // effective regions, retaining their original buffer indices for codegen.
+  auto effective_shape = [&](const Array<Range> &ranges) {
+    Array<PrimExpr> shape;
+    for (const Range &range : ranges) {
+      if (!analyzer->CanProveEqual(range->extent, 1))
+        shape.push_back(range->extent);
+    }
+    return shape;
+  };
+  auto src_shape = effective_shape(src_range);
+  auto dst_shape = effective_shape(dst_range);
+  ICHECK_EQ(src_shape.size(), dst_shape.size())
+      << "Sunmmio DMA copy requires matching effective region shapes: "
+      << src->name << " " << src_shape << " -> " << dst->name << " "
+      << dst_shape;
+  for (size_t i = 0; i < src_shape.size(); ++i) {
+    ICHECK(analyzer->CanProveEqual(src_shape[i], dst_shape[i]))
+        << "Sunmmio DMA copy requires matching effective region shapes: "
+        << src->name << " " << src_shape << " -> " << dst->name << " "
+        << dst_shape;
+  }
+
+  auto validate_mx = [&](const Buffer &buffer, const Array<Range> &ranges) {
+    if (!sunmmio::IsMXDType(buffer->dtype))
+      return;
+    const LayoutMap &map =
+        buffer.scope() == "global" ? T.global_layout_map : T.layout_map;
+    ICHECK(map.count(buffer))
+        << "Sunmmio MX copy requires a layout for buffer " << buffer->name;
+    Layout layout = map[buffer];
+    const auto *cute = layout.as<CuteLayoutNode>();
+    ICHECK(cute && ranges.size() >= 2)
+        << "Sunmmio MX copy requires a canonical matrix layout for buffer "
+        << buffer->name;
+    auto shape = cute->GetLogicalShape();
+    if (IsSameLayout(layout, sunmmio::MakeMXRowMajor(shape, buffer->dtype),
+                     analyzer)) {
+      ICHECK(analyzer->CanProveEqual(ranges.back()->extent, shape.back()))
+          << "Sunmmio MX row-major copy must cover the full row of buffer "
+          << buffer->name;
+      return;
+    }
+    auto levels = cute->GetDimLevels();
+    const size_t rank = ranges.size();
+    ICHECK(sunmmio::DeriveMXLayoutLike(layout, shape, buffer->dtype, analyzer)
+               .defined() &&
+           levels[rank - 2].IntValue() > 1 && levels[rank - 1].IntValue() > 1)
+        << "Sunmmio MX blockwise copy requires trailing matrix axes for buffer "
+        << buffer->name;
+    bool paired_rank3 = src_range.size() == 3 && dst_range.size() == 3;
+    for (size_t i = 0; i + 2 < rank; ++i) {
+      ICHECK(paired_rank3 || analyzer->CanProveEqual(ranges[i]->extent, 1))
+          << "Sunmmio MX copy requires a single matrix slot in buffer "
+          << buffer->name << " at batch dimension " << i;
+    }
+    const auto config = GetSunmmioTileProcessorConfig(T.target);
+    for (size_t i = rank - 2; i < rank; ++i) {
+      int block = i == rank - 2 ? config.block_height : config.block_width;
+      ICHECK(analyzer->CanProveEqual(floormod(ranges[i]->extent, block), 0))
+          << "Sunmmio MX blockwise copy requires whole blocks: buffer "
+          << buffer->name << ", dimension " << i << ", extent "
+          << ranges[i]->extent << " must be a multiple of " << block;
+    }
+  };
+  validate_mx(src, src_range);
+  validate_mx(dst, dst_range);
+
+  if (src.scope() == kSunmmioScopeRSRAM && dst.scope() == kSunmmioScopeRSRAM &&
+      !sunmmio::IsMXDType(src->dtype)) {
     auto plan = TryPlanRsramDmaCopy(src, src_range, dst, dst_range,
                                     T.layout_map, analyzer);
 
@@ -1519,8 +1592,9 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
     return body;
   }
 
-  if (IsLayoutMatch(src_layout, dst_layout, analyzer) ||
-      SameLayoutIgnoringSingletonModes(src_layout, dst_layout, analyzer)) {
+  if (IsLayoutMatchForDType(src_layout, dst_layout, src->dtype, analyzer) ||
+      (!sunmmio::IsMXDType(src->dtype) &&
+       SameLayoutIgnoringSingletonModes(src_layout, dst_layout, analyzer))) {
     return dma(src_region, dst_region);
   }
 
@@ -1555,9 +1629,11 @@ Stmt CopyNode::LowerSunmmioDramRsramCopy(const LowerArgs &T,
   // block-aligned slice of that buffer has the very layout the RSRAM side
   // wants. When the region layouts agree the transform leg would be an
   // identity, so emit a plain DMA and skip the staging buffer entirely.
-  if (IsLayoutMatch(stage_layout.value(), rsram_layout, analyzer) ||
-      SameLayoutIgnoringSingletonModes(stage_layout.value(), rsram_layout,
-                                       analyzer))
+  if (IsLayoutMatchForDType(stage_layout.value(), rsram_layout, dram->dtype,
+                            analyzer) ||
+      (!sunmmio::IsMXDType(dram->dtype) &&
+       SameLayoutIgnoringSingletonModes(stage_layout.value(), rsram_layout,
+                                        analyzer)))
     return dma(src_region, dst_region);
 
   auto is_mx_row_major_layout = [&](const Layout &layout,
@@ -1782,14 +1858,49 @@ Stmt CopyNode::LowerSunmmioTileCopy(const LowerArgs &T,
         << dst_range[i]->extent << ".";
   }
 
-  Array<IterVar> loop_vars = MakeIterVars();
+  bool keep_unit_axes =
+      (src->dtype.is_float8_e8m0fnu() || src->dtype.is_float8_e4m3fn() ||
+       src->dtype.is_float4_e2m1fn()) &&
+      std::any_of(src_range.begin(), src_range.end(),
+                  [](const Range &r) { return is_one(r->extent); });
+  Array<IterVar> loop_vars;
+  if (keep_unit_axes) {
+    // A unit column still needs a padded tile carrier for quantized fields.
+    for (size_t i = 0; i < src_range.size(); ++i) {
+      Var var("copy_axis" + std::to_string(i), src_range[i]->extent.dtype());
+      loop_vars.push_back(IterVar(Range::FromMinExtent(0, src_range[i]->extent),
+                                  var, kDataPar));
+    }
+  } else {
+    loop_vars = MakeIterVars();
+  }
   for (const IterVar &iv : loop_vars) {
     analyzer->Bind(iv->var, iv->dom);
   }
-  Array<PrimExpr> src_indices = MakeIndices(loop_vars, 0);
-  Array<PrimExpr> dst_indices = MakeIndices(loop_vars, 1);
-  PrimExpr src_predicate = MakePredicate(analyzer, loop_vars, src->shape, 0);
-  PrimExpr dst_predicate = MakePredicate(analyzer, loop_vars, dst->shape, 1);
+  Array<PrimExpr> src_indices, dst_indices;
+  PrimExpr src_predicate, dst_predicate;
+  if (keep_unit_axes) {
+    for (size_t i = 0; i < loop_vars.size(); ++i) {
+      src_indices.push_back(src_range[i]->min + loop_vars[i]->var);
+      dst_indices.push_back(dst_range[i]->min + loop_vars[i]->var);
+    }
+    auto predicate = [&](const Buffer &buffer, const Array<PrimExpr> &indices) {
+      PrimExpr result = const_true();
+      for (size_t i = 0; i < indices.size(); ++i) {
+        PrimExpr valid = (indices[i] >= 0) && (indices[i] < buffer->shape[i]);
+        if (!analyzer->CanProve(valid))
+          result = result && valid;
+      }
+      return is_one(result) ? PrimExpr() : result;
+    };
+    src_predicate = predicate(src, src_indices);
+    dst_predicate = predicate(dst, dst_indices);
+  } else {
+    src_indices = MakeIndices(loop_vars, 0);
+    dst_indices = MakeIndices(loop_vars, 1);
+    src_predicate = MakePredicate(analyzer, loop_vars, src->shape, 0);
+    dst_predicate = MakePredicate(analyzer, loop_vars, dst->shape, 1);
+  }
 
   PrimExpr value = BufferLoad(src, src_indices);
   if (src->dtype != dst->dtype) {

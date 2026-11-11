@@ -696,15 +696,49 @@ Layout TryCanonicalizeToRowMajor(const Layout &layout) {
   return layout;
 }
 
+static bool SameLayoutIgnoringUnitModeStrides(const Layout &lhs,
+                                              const Layout &rhs,
+                                              arith::Analyzer *analyzer) {
+  if (IsSameLayout(lhs, rhs, analyzer))
+    return true;
+  const auto *lc = lhs.as<CuteLayoutNode>();
+  const auto *rc = rhs.as<CuteLayoutNode>();
+  if (!lc || !rc || lc->GetDimLevels().size() != rc->GetDimLevels().size())
+    return false;
+  for (size_t d = 0; d < lc->GetDimLevels().size(); ++d) {
+    if (lc->GetDimLevels()[d].IntValue() != rc->GetDimLevels()[d].IntValue())
+      return false;
+  }
+
+  auto ls = lc->GetModeShape(), rs = rc->GetModeShape();
+  auto lt = lc->GetModeStride(), rt = rc->GetModeStride();
+  if (ls.size() != rs.size())
+    return false;
+  arith::Analyzer local_analyzer;
+  arith::Analyzer *ana = analyzer ? analyzer : &local_analyzer;
+  for (size_t i = 0; i < ls.size(); ++i) {
+    if (!ana->CanProveEqual(ls[i], rs[i]))
+      return false;
+    // A size-one mode contributes zero to every valid physical offset.
+    // Retain its structure: removing it would change how DeriveLayoutLike
+    // interprets the layout when adapting to another shape.
+    if (ana->CanProveEqual(ls[i], 1) && ana->CanProveEqual(rs[i], 1))
+      continue;
+    if (!ana->CanProveEqual(lt[i], rt[i]))
+      return false;
+  }
+  return true;
+}
+
 bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
                    arith::Analyzer *analyzer) {
   // Compare on canonical forms so equivalent representations agree -- e.g. a
   // single-block ZZ canonicalizes to row-major and matches a row-major buffer.
   Layout cl = TryCanonicalizeToRowMajor(lhs),
          cr = TryCanonicalizeToRowMajor(rhs);
-  // Identical coalesced forms => identical byte map; padded and tight differ in
-  // coalesced mode_shape, so they don't match here.
-  if (IsSameLayout(cl, cr, analyzer))
+  // Ignore only inactive mode strides; padded and tight forms still differ
+  // in mode_shape or an active stride and do not match here.
+  if (SameLayoutIgnoringUnitModeStrides(cl, cr, analyzer))
     return true;
   // Different shapes, same kind: re-derive each onto the other's shape.
   // DeriveLayoutLike preserves padding on unchanged dims, so the
@@ -713,8 +747,29 @@ bool IsLayoutMatch(const Layout &lhs, const Layout &rhs,
                               analyzer);
   auto bwd = DeriveLayoutLike(cr, cl->InputShape(), Optional<Array<Integer>>(),
                               analyzer);
-  return fwd.defined() && IsSameLayout(fwd.value(), cr, analyzer) &&
-         bwd.defined() && IsSameLayout(bwd.value(), cl, analyzer);
+  return fwd.defined() &&
+         SameLayoutIgnoringUnitModeStrides(fwd.value(), cr, analyzer) &&
+         bwd.defined() &&
+         SameLayoutIgnoringUnitModeStrides(bwd.value(), cl, analyzer);
+}
+
+bool IsLayoutMatchForDType(const Layout &lhs, const Layout &rhs, DataType dtype,
+                           arith::Analyzer *analyzer) {
+  if (!lhs.defined() || !rhs.defined())
+    return false;
+  if (!sunmmio::IsMXDType(dtype))
+    return IsLayoutMatch(lhs, rhs, analyzer);
+  if (IsSameLayout(lhs, rhs, analyzer))
+    return true;
+  // Generic stride reconstruction omits the MX scale/padding storage. Do not
+  // canonicalize MX blocks to ordinary row-major, even for a single block.
+  auto fwd =
+      sunmmio::DeriveMXLayoutLike(lhs, rhs->InputShape(), dtype, analyzer);
+  auto bwd =
+      sunmmio::DeriveMXLayoutLike(rhs, lhs->InputShape(), dtype, analyzer);
+  return fwd.defined() && bwd.defined() &&
+         IsSameLayout(fwd.value(), rhs, analyzer) &&
+         IsSameLayout(bwd.value(), lhs, analyzer);
 }
 
 // ---------------------------------------------------------------------------
@@ -1515,44 +1570,46 @@ std::optional<MXLayoutAnalysis> AnalyzeMXLayout(const Layout &layout,
     return std::nullopt;
   }
 
+  Array<PrimExpr> covered_shape = cute->GetCoveredShape();
+
   auto make_result = [&](MXLayoutKind kind,
                          Array<PrimExpr> scale_shape) -> MXLayoutAnalysis {
     return MXLayoutAnalysis{kind, logical_shape, cute->GetCoveredShape(),
                             scale_shape};
   };
 
-  if (IsSameLayout(layout, MakeMXRowMajor(logical_shape, dtype), ana)) {
-    PrimExpr n = logical_shape[1];
+  if (IsSameLayout(layout, MakeMXRowMajor(covered_shape, dtype), ana)) {
+    PrimExpr n = covered_shape[1];
     PrimExpr rem = ana->Simplify(FloorMod(n, makeInt(32)));
     ICHECK(ana->CanProveEqual(rem, makeInt(0)))
         << "MX row-major layout requires N to be divisible by 32, got N=" << n;
     return make_result(MXLayoutKind::kRowMajor,
-                       Array<PrimExpr>{logical_shape[0], n / makeInt(32)});
+                       Array<PrimExpr>{covered_shape[0], n / makeInt(32)});
   }
 
   Array<Integer> axes{Integer(0), Integer(1)};
-  if (IsSameLayout(layout, MakeMXZZ(logical_shape, axes, dtype), ana)) {
-    PrimExpr blocks_m = ceildiv(logical_shape[0], makeInt(32));
-    PrimExpr blocks_n = ceildiv(logical_shape[1], makeInt(32));
+  if (IsSameLayout(layout, MakeMXZZ(covered_shape, axes, dtype), ana)) {
+    PrimExpr blocks_m = ceildiv(covered_shape[0], makeInt(32));
+    PrimExpr blocks_n = ceildiv(covered_shape[1], makeInt(32));
     return make_result(MXLayoutKind::kMXZZ,
                        Array<PrimExpr>{blocks_m * blocks_n, makeInt(32)});
   }
 
   int64_t pack_size = MXPackSize(dtype);
   bool can_build_mx_blockwise_layout =
-      StaticDivisibleOrSymbolic(logical_shape[0], 32 * pack_size) &&
-      StaticDivisibleOrSymbolic(logical_shape[1], 32);
+      StaticDivisibleOrSymbolic(covered_shape[0], 32 * pack_size) &&
+      StaticDivisibleOrSymbolic(covered_shape[1], 32);
   if (can_build_mx_blockwise_layout) {
-    if (IsSameLayout(layout, MakeMXNNZ(logical_shape, axes, dtype), ana)) {
-      PrimExpr blocks_m = logical_shape[0] / makeInt(32);
-      PrimExpr blocks_n = logical_shape[1] / makeInt(32);
+    if (IsSameLayout(layout, MakeMXNNZ(covered_shape, axes, dtype), ana)) {
+      PrimExpr blocks_m = covered_shape[0] / makeInt(32);
+      PrimExpr blocks_n = covered_shape[1] / makeInt(32);
       return make_result(MXLayoutKind::kMXNNZ,
                          Array<PrimExpr>{blocks_m * blocks_n, makeInt(32)});
     }
 
-    if (IsSameLayout(layout, MakeMXZNZ(logical_shape, axes, dtype), ana)) {
-      PrimExpr blocks_m = logical_shape[0] / makeInt(32);
-      PrimExpr blocks_n = logical_shape[1] / makeInt(32);
+    if (IsSameLayout(layout, MakeMXZNZ(covered_shape, axes, dtype), ana)) {
+      PrimExpr blocks_m = covered_shape[0] / makeInt(32);
+      PrimExpr blocks_n = covered_shape[1] / makeInt(32);
       return make_result(MXLayoutKind::kMXZNZ,
                          Array<PrimExpr>{blocks_m * blocks_n, makeInt(32)});
     }
@@ -1572,15 +1629,13 @@ Optional<Layout> DeriveMXLayoutLike(const Layout &src,
   }
 
   Array<PrimExpr> src_shape = src_cute->GetLogicalShape();
-  int src_rank = static_cast<int>(src_shape.size());
+  int rank = static_cast<int>(src_shape.size());
   int dst_rank = static_cast<int>(dst_shape.size());
-  if (src_rank < 2 || dst_rank < src_rank) {
+  if (rank < 2 || dst_rank < 2) {
     return Optional<Layout>();
   }
-  int rank_delta = dst_rank - src_rank;
 
-  if (rank_delta == 0 &&
-      IsSameLayout(src, MakeMXRowMajor(src_shape, dtype), analyzer)) {
+  if (IsSameLayout(src, MakeMXRowMajor(src_shape, dtype), analyzer)) {
     return Optional<Layout>(MakeMXRowMajor(dst_shape, dtype));
   }
 
@@ -1588,7 +1643,7 @@ Optional<Layout> DeriveMXLayoutLike(const Layout &src,
       [&](int expected_levels) -> std::optional<Array<Integer>> {
     Array<Integer> axes;
     Array<Integer> dim_levels = src_cute->GetDimLevels();
-    for (int d = 0; d < src_rank; ++d) {
+    for (int d = 0; d < rank; ++d) {
       int levels = dim_levels[d].IntValue();
       if (levels == 1) {
         continue;
@@ -1604,33 +1659,53 @@ Optional<Layout> DeriveMXLayoutLike(const Layout &src,
     return axes;
   };
 
+  // A matrix tile may be copied to/from a peer or expert slot with additional
+  // leading batch axes. Preserve its two trailing matrix axes and MX storage
+  // recipe; this derives a fresh staging layout, not an alias/reshape of src.
+  // Non-trailing matrix axes need an explicit mapping when ranks differ.
+  auto destination_axes =
+      [&](const Array<Integer> &axes) -> std::optional<Array<Integer>> {
+    if (dst_rank >= rank) {
+      int rank_delta = dst_rank - rank;
+      return Array<Integer>{Integer(axes[0].IntValue() + rank_delta),
+                            Integer(axes[1].IntValue() + rank_delta)};
+    }
+    if (axes[0].IntValue() != rank - 2 || axes[1].IntValue() != rank - 1) {
+      return std::nullopt;
+    }
+    return Array<Integer>{Integer(dst_rank - 2), Integer(dst_rank - 1)};
+  };
+
   if (auto axes = find_axes_with_levels(/*expected_levels=*/2)) {
-    if (IsSameLayout(src, MakeMXZZ(src_shape, *axes, dtype), analyzer)) {
-      Array<Integer> dst_axes{Integer((*axes)[0].IntValue() + rank_delta),
-                              Integer((*axes)[1].IntValue() + rank_delta)};
-      return Optional<Layout>(MakeMXZZ(dst_shape, dst_axes, dtype));
+    auto dst_axes = destination_axes(*axes);
+    if (dst_axes &&
+        IsSameLayout(src, MakeMXZZ(src_shape, *axes, dtype), analyzer)) {
+      return Optional<Layout>(MakeMXZZ(dst_shape, *dst_axes, dtype));
     }
   }
 
   if (auto axes = find_axes_with_levels(/*expected_levels=*/3)) {
+    auto dst_axes = destination_axes(*axes);
+    if (!dst_axes) {
+      return Optional<Layout>();
+    }
     int ax0 = (*axes)[0].IntValue();
     int ax1 = (*axes)[1].IntValue();
+    int dst_ax0 = (*dst_axes)[0].IntValue();
+    int dst_ax1 = (*dst_axes)[1].IntValue();
     int64_t pack_size = MXPackSize(dtype);
     bool can_build_src =
         StaticDivisibleOrSymbolic(src_shape[ax0], 32 * pack_size) &&
         StaticDivisibleOrSymbolic(src_shape[ax1], 32);
     bool can_build_dst =
-        StaticDivisibleOrSymbolic(dst_shape[ax0 + rank_delta],
-                                  32 * pack_size) &&
-        StaticDivisibleOrSymbolic(dst_shape[ax1 + rank_delta], 32);
+        StaticDivisibleOrSymbolic(dst_shape[dst_ax0], 32 * pack_size) &&
+        StaticDivisibleOrSymbolic(dst_shape[dst_ax1], 32);
     if (can_build_src && can_build_dst) {
-      Array<Integer> dst_axes{Integer(ax0 + rank_delta),
-                              Integer(ax1 + rank_delta)};
       if (IsSameLayout(src, MakeMXNNZ(src_shape, *axes, dtype), analyzer)) {
-        return Optional<Layout>(MakeMXNNZ(dst_shape, dst_axes, dtype));
+        return Optional<Layout>(MakeMXNNZ(dst_shape, *dst_axes, dtype));
       }
       if (IsSameLayout(src, MakeMXZNZ(src_shape, *axes, dtype), analyzer)) {
-        return Optional<Layout>(MakeMXZNZ(dst_shape, dst_axes, dtype));
+        return Optional<Layout>(MakeMXZNZ(dst_shape, *dst_axes, dtype));
       }
     }
   }
@@ -1699,6 +1774,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
            })
       .def("tl.IsLayoutMatch",
            [](Layout lhs, Layout rhs) { return IsLayoutMatch(lhs, rhs); })
+      .def("tl.IsLayoutMatchForDType",
+           [](Layout lhs, Layout rhs, DataType dtype) {
+             return IsLayoutMatchForDType(lhs, rhs, dtype);
+           })
       .def("tl.TryCanonicalizeToRowMajor",
            [](Layout layout) { return TryCanonicalizeToRowMajor(layout); })
       .def("tl.sunmmio.make_row_major",

@@ -258,3 +258,13 @@ def test_tilelang_rsram_narrow_cast_copy_rank2(shape, dst_dtype):
 @pytest.mark.parametrize("dst_dtype", [T.float8_e4m3fn, T.float4_e2m1fn])
 def test_tilelang_rsram_narrow_cast_copy_rank3(shape, dst_dtype):
     check_rsram_narrow_cast_copy(dst_dtype, shape)
+
+
+@pytest.mark.parametrize("src_dtype,dst_dtype", [(T.mxfp8, T.mxfp4), (T.mxfp8, T.bfloat16), (T.bfloat16, T.mxfp4)])
+def test_rsram_copy_rejects_implicit_mx_conversion(src_dtype, dst_dtype):
+    target = determine_target("sunmmio", return_object=True)
+    with tvm.target.Target(target):
+        mod = rsram_copy(dtype=src_dtype, dst_dtype=dst_dtype)
+        mod = tvm.tir.transform.BindTarget(target)(mod)
+        with pytest.raises(tvm.error.InternalError, match="does not support implicit MX dtype conversion"):
+            tl.transform.LegalizeSunmmioDataPath()(mod)

@@ -18,6 +18,8 @@ from testing.python.sunmmio.common.codegen_validation import (
     validate_sunmmio_codegen_with_npuir_opt,
     validate_suvm_mlir_with_npuir_opt,
 )
+from testing.python.sunmmio.transform.test_layout_inference import mx_weight_slot_region_kernel, mx_weight_staging_kernel
+from tilelang.engine.lower import lower
 
 
 tilelang.env.disable_cache()
@@ -207,6 +209,43 @@ def test_mx_gemm_both_a_b_codegen_validates(tmp_path, mx_dtype, mx_token, n, blo
 
     assert "sunmmio.fake" not in src
     assert_source_contains(src, (mx_token, "suvm.mcast_async", "suvm.tc.mma", "suvm.sync"))
+
+
+@pytest.mark.parametrize("dtype", [T.mxfp8, T.mxfp4])
+@pytest.mark.parametrize("n", [32, 64, 512])
+@pytest.mark.parametrize("stages", [0, 1, 2])
+@pytest.mark.parametrize("communication", ["copy", "gather"])
+def test_mx_weight_staging_compiles_to_llvm(tmp_path, dtype, n, stages, communication):
+    # Two full-width temporaries plus gather scratch must fit in RSRAM.
+    k = 256 if stages == 2 and n == 512 else 512
+    artifact = lower(mx_weight_staging_kernel(n, dtype, stages, communication, k=k), target="sunmmio")
+    src = artifact.kernel_source
+    assert "suvm.tc.mma" in src
+    assert "suvm.transform_layout_async" not in src
+    assert "suvm.tile.load" not in src
+    validate_suvm_mlir_with_npuir_opt(src, tmp_path, opt_args=("--verify-each", "--suvm-to-llvm-pipeline"))
+
+
+@pytest.mark.parametrize("communication", ["broadcast", "put"])
+def test_mx_weight_communication_staging_compiles_to_llvm(tmp_path, communication):
+    artifact = lower(mx_weight_staging_kernel(stages=2, communication=communication), target="sunmmio")
+    assert "suvm.transform_layout_async" not in artifact.kernel_source
+    validate_suvm_mlir_with_npuir_opt(artifact.kernel_source, tmp_path, opt_args=("--verify-each", "--suvm-to-llvm-pipeline"))
+
+
+@pytest.mark.parametrize("dtype", [T.mxfp8, T.mxfp4])
+@pytest.mark.parametrize("n", [32, 64, 512])
+def test_transposed_mx_weight_staging_keeps_mxzz(tmp_path, dtype, n):
+    artifact = lower(mx_weight_staging_kernel(n, dtype, stages=2, input_kind="mxzz", transpose_b=True), target="sunmmio")
+    assert "suvm.transform_layout_async" not in artifact.kernel_source
+    validate_suvm_mlir_with_npuir_opt(artifact.kernel_source, tmp_path, opt_args=("--verify-each", "--suvm-to-llvm-pipeline"))
+
+
+@pytest.mark.parametrize("dtype", [T.mxfp8, T.mxfp4])
+def test_mx_weight_slot_region_compiles_to_llvm(tmp_path, dtype):
+    artifact = lower(mx_weight_slot_region_kernel(dtype=dtype), target="sunmmio")
+    assert "suvm.transform_layout_async" not in artifact.kernel_source
+    validate_suvm_mlir_with_npuir_opt(artifact.kernel_source, tmp_path, opt_args=("--verify-each", "--suvm-to-llvm-pipeline"))
 
 
 @pytest.mark.parametrize("pipeline_mode", ("greedy", "ilp"))

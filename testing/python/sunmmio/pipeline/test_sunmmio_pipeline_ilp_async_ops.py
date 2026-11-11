@@ -94,6 +94,8 @@ def test_ilp_models_layout_transform_destination_as_write(tmp_path):
             }
         ),
     ):
+        mod = tir.transform.BindTarget(target)(mod)
+        mod = tl.transform.ResolveSunmmioUnit()(mod)
         tl.transform.SunmmioPipelinePlanningILP(debug=False)(mod)
 
     problem = json.loads(problem_path.read_text(encoding="utf-8"))

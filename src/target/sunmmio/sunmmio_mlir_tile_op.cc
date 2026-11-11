@@ -1,4 +1,7 @@
 #include "sunmmio_mlir_tile_op.h"
+#include "npuir/Dialect/SUVM/IR/DeviceArchProperties.h"
+#include "npuir/Dialect/SUVM/IR/Dialect.h"
+#include "sunmmio_mlir_expr.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinTypeInterfaces.h"
@@ -241,6 +244,19 @@ SunMMIOValue SunmmioMlirTileOp::Cast(const std::string &result_name,
   mlir::Value cast_value = GetTileCastOp(ctx_, src_value, dst_type);
   BindRequiredResult(ctx_, result_name, cast_value, "suvm.tile.cast");
   return SunMMIOValue{dst_dtype, result_name, dst_type};
+}
+
+SunMMIOValue SunmmioMlirTileOp::TileBitcast(const std::string &result_name,
+                                            const SunMMIOValue &value,
+                                            const SunMMIOType &result_type,
+                                            DataType dtype) {
+  mlir::Value input = ctx_.LookupValue(value, "missing_tile_bitcast_src");
+  mlir::Value result =
+      mlir::suvm::TileBitCastOp::create(ctx_.builder, MapMlirLoc(ctx_),
+                                        MapMlirType(ctx_, result_type), input)
+          .getResult();
+  BindRequiredResult(ctx_, result_name, result, "suvm.tile.bitcast");
+  return SunMMIOValue{dtype, result_name, result_type};
 }
 
 SunMMIOValue SunmmioMlirTileOp::Binary(const std::string &result_name,
@@ -713,6 +729,113 @@ SunMMIOValue SunmmioMlirTileOp::TileSelect(const std::string &result_name,
                                            const SunMMIOValue &false_value,
                                            const SunMMIOType &result_type,
                                            DataType dtype) {
+  if (dtype.is_float8_e4m3fn() || dtype.is_float8_e8m0fnu() ||
+      dtype.is_float4_e2m1fn()) {
+    // Pack integer lane masks into storage-word masks without converting
+    // payloads.
+    SunmmioMlirExpr expr(ctx_);
+    int serial = 0;
+    auto name = [&]() {
+      return result_name + "_bits_" + std::to_string(serial++);
+    };
+    auto scalar = [&](int64_t value, bool index = false) {
+      SunMMIOType type{index ? SunMMIOType::Kind::kIndex
+                             : SunMMIOType::Kind::kScalar,
+                       DataType::Int(32),
+                       1,
+                       {}};
+      return expr.ConstantInt(name(), value, type, DataType::Int(32));
+    };
+    auto reshape = [&](const SunMMIOValue &value, const SunMMIOType &type,
+                       const std::string &output) {
+      mlir::OperationState st(MapMlirLoc(ctx_), "suvm.tile.reshape");
+      st.addOperands(ctx_.LookupValue(value, "quantized_select_reshape"));
+      st.addTypes(MapMlirType(ctx_, type));
+      auto result = ctx_.builder.create(st)->getResult(0);
+      BindRequiredResult(ctx_, output, result, "quantized select reshape");
+      return SunMMIOValue{type.dtype, output, type};
+    };
+    auto integer_type = result_type;
+    integer_type.dtype = DataType::Int(32);
+    auto ones = TileFill(name(), scalar((1 << dtype.bits()) - 1), integer_type,
+                         DataType::Int(32));
+    auto zeros = TileFill(name(), scalar(0), integer_type, DataType::Int(32));
+    auto flags =
+        TileSelect(name(), mask, ones, zeros, integer_type, DataType::Int(32));
+    int64_t count = 1;
+    for (int64_t extent : StaticShapeVector(result_type, "quantized select"))
+      count *= extent;
+    int64_t elements_per_word = 32 / dtype.bits();
+    ICHECK_EQ(count % elements_per_word, 0)
+        << "Quantized tile select requires complete i32 storage words";
+    integer_type.shape = {IntImm(DataType::Int(32), count)};
+    flags = reshape(flags, integer_type, name());
+    auto word_type = integer_type;
+    word_type.shape = {IntImm(DataType::Int(32), count / elements_per_word)};
+    auto packed = TileFill(name(), scalar(0), word_type, DataType::Int(32));
+    auto arch = mlir::suvm::SUVMDialect::tryGetModuleDeviceArch(*ctx_.module);
+    ICHECK(arch.has_value());
+    // Keep unsigned narrowing within a native half-register so splitting never
+    // needs to synthesize an unsigned scalar padding constant.
+    int64_t chunk_elements = mlir::suvm::getVectorRegBits(*arch) / (2 * 32);
+    for (int64_t start = 0; start < count; start += chunk_elements) {
+      auto chunk_type = integer_type;
+      chunk_type.shape = {
+          IntImm(DataType::Int(32), std::min(chunk_elements, count - start))};
+      auto chunk = TileSlice(name(), flags, {scalar(start, true)}, chunk_type,
+                             DataType::Int(32));
+      for (int valid_bits = dtype.bits(); valid_bits < 32; valid_bits *= 2) {
+        auto narrow_type = chunk_type;
+        narrow_type.dtype = DataType::UInt(16);
+        auto narrow_name = name();
+        auto unsigned_element = mlir::IntegerType::get(
+            &ctx_.mlir_ctx, 16, mlir::IntegerType::Unsigned);
+        auto unsigned_tile = mlir::suvm::TileType::get(
+            &ctx_.mlir_ctx, StaticShapeVector(narrow_type, "quantized mask"),
+            unsigned_element);
+        auto narrow_value = mlir::suvm::TileCastOp::create(
+                                ctx_.builder, MapMlirLoc(ctx_), unsigned_tile,
+                                ctx_.LookupValue(chunk, "quantized_mask"))
+                                .getResult();
+        BindRequiredResult(ctx_, narrow_name, narrow_value,
+                           "quantized mask narrowing");
+        SunMMIOValue narrow{DataType::UInt(16), narrow_name, narrow_type};
+        auto extent = Downcast<IntImm>(chunk_type.shape.back())->value;
+        ICHECK_EQ(extent % 2, 0);
+        chunk_type.shape.back() = IntImm(DataType::Int(32), extent / 2);
+        chunk = TileBitcast(name(), narrow, chunk_type, DataType::Int(32));
+        if (valid_bits < 16) {
+          auto shifted = Binary(
+              name(), BinaryOp::kShr, ArithmeticFlavor::kUnsignedInt, chunk,
+              scalar(16 - valid_bits), chunk_type, DataType::Int(32));
+          chunk = Binary(name(), BinaryOp::kOr, ArithmeticFlavor::kSignedInt,
+                         chunk, shifted, chunk_type, DataType::Int(32));
+          chunk = Binary(name(), BinaryOp::kAnd, ArithmeticFlavor::kSignedInt,
+                         chunk, scalar((1 << (valid_bits * 2)) - 1), chunk_type,
+                         DataType::Int(32));
+        }
+      }
+      packed = TileInsertSlice(name(), packed, chunk,
+                               {scalar(start / elements_per_word, true)},
+                               word_type, DataType::Int(32));
+    }
+    auto flat_type = result_type;
+    flat_type.shape = {IntImm(DataType::Int(32), count)};
+    auto take = TileBitcast(name(), reshape(true_value, flat_type, name()),
+                            word_type, DataType::Int(32));
+    auto keep = TileBitcast(name(), reshape(false_value, flat_type, name()),
+                            word_type, DataType::Int(32));
+    take = Binary(name(), BinaryOp::kAnd, ArithmeticFlavor::kSignedInt, take,
+                  packed, word_type, DataType::Int(32));
+    auto inverse = Binary(name(), BinaryOp::kXor, ArithmeticFlavor::kSignedInt,
+                          packed, scalar(-1), word_type, DataType::Int(32));
+    keep = Binary(name(), BinaryOp::kAnd, ArithmeticFlavor::kSignedInt, keep,
+                  inverse, word_type, DataType::Int(32));
+    auto merged = Binary(name(), BinaryOp::kOr, ArithmeticFlavor::kSignedInt,
+                         take, keep, word_type, DataType::Int(32));
+    auto value = TileBitcast(name(), merged, flat_type, dtype);
+    return reshape(value, result_type, result_name);
+  }
   mlir::Type result_mlir_type = MapMlirType(ctx_, result_type);
   mlir::Value mask_value = ctx_.LookupValue(mask, "missing_tile_select_mask");
   mlir::Value true_mlir_value =

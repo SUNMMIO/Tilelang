@@ -217,7 +217,9 @@ def _is_invariant_let_value(expr: PrimExpr) -> bool:
 
     def visit(node):
         nonlocal invariant
-        if isinstance(node, (BufferLoad, ProducerLoad, Call)):
+        if isinstance(node, (BufferLoad, ProducerLoad)) or (
+            isinstance(node, Call) and getattr(node.op, "name", None) != "tl.mx_scale_extent"
+        ):
             invariant = False
 
     post_order_visit(expr, visit)

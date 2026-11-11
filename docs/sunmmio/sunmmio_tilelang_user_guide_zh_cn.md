@@ -1055,6 +1055,32 @@ for k in T.Pipelined(loop_extent, num_stages=3):
 
 循环体中通常包含 copy、核间通讯和 compute。用户需要保证数据依赖清晰，例如在使用某个 tile 计算前，相关输入已经搬运或核间通讯完成。
 
+### 3.10 MX 字段视图
+
+`data, scale = T.mx_view(mx)` 返回 MX payload 和 scale 的可读写 Buffer 视图。两个字段共享父 MX 的存储，创建视图不分配、不复制、不初始化，也不执行量化或反量化。写入字段会直接修改父 MX；通过合法搬运更新父 MX 后，已有视图读取更新后的内容。
+
+以下片段直接初始化 MX 字段，无需再调用 `mx_pack`：
+
+```python
+mx = T.alloc_shared((64, 64), T.mxfp8, scope="shared.rsram")
+data, scale = T.mx_view(mx)
+for i, j in T.Tiles(data.shape):
+    data[i, j] = T.Cast(T.float8_e4m3fn, T.bfloat16(1))
+for block, row in T.Tiles(scale.shape):
+    scale[block, row] = T.Cast(T.float8_e8m0fnu, T.bfloat16(1))
+```
+
+- 父 Buffer 必须是独立分配的完整静态二维 RSRAM MXFP4/MXFP8，采用合法的 MXZZ、MXZNZ 或 MX row-major 布局；允许合法的 padded layout。
+- payload 类型分别为 FP4 E2M1FN 或 FP8 E4M3FN；scale 类型为 E8M0。scale 的 shape 和坐标取决于父布局的物理覆盖及块顺序，不能把不同布局的 scale 坐标互换。
+- 父布局可由编译器推导。scale shape 在布局阶段解析，可用于 TIR 循环、Tiles、分配和切片，不能提前用于 Python `int()` 或 `range()`。
+- 支持合法的 Tiles 读写和同 dtype 的 RSRAM region copy，包括跨 MX 字段 copy。量化字段参与普通算术前须显式转换到 BF16/F32；F32 与量化类型之间使用 BF16 中转。
+- 不支持 Tiles 外的字段独立标量读写。copy 参数中仅用于描述 region 的索引仍可使用，实际访存须满足布局、对齐和有效范围约束。
+- 每个父 allocation 只允许一处 view 声明，字段可反复使用。不支持字段再派生存储别名、独立改变布局/scope、裸指针导出、直接全局 DMA 或 collective。
+- 涉及父 MX 或字段的自动 pipeline 会报错；不涉及这些存储的流水线可正常使用。
+- 含 `T.mx_view` 的函数当前不支持 `T.annotate_safe_value`，包括对同一函数内普通 Buffer 的该项注解。
+
+`T.mx_pack` 和 `T.mx_unpack` 保持原有复制语义。用户仍需保证读前初始化，并在消费完整 MX 前准备好对应 payload 和 scale。
+
 ## 4. 示例
 
 本节给出 3 个完整 kernel 示例。为了突出主体结构，示例假设 problem size 能被 block size 和 mesh 切分整除；实际工程代码需要补充边界处理。

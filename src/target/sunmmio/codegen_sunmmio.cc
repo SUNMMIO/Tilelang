@@ -1,4 +1,5 @@
 #include "codegen_sunmmio.h"
+#include "../../transform/common/mx_view.h"
 #include "sunmmio_mlir_builder.h"
 
 #include "../../layout/cute_layout.h"
@@ -40,15 +41,246 @@ using namespace tir;
 
 namespace {
 
-class DeclBufferCollector final : public tir::StmtVisitor {
+class CopyRegionAlignmentVerifier final : public StmtExprVisitor {
+private:
+  // Analyzer simplification also persists bindings inside Let expressions.
+  // Freshen their local definitions for proofs only, leaving codegen TIR
+  // intact.
+  class ProofExprRenamer final : public ExprMutator {
+    std::unordered_map<const VarNode *, Var> vars_;
+
+    PrimExpr VisitExpr_(const VarNode *op) final {
+      auto it = vars_.find(op);
+      return it == vars_.end() ? ffi::GetRef<Var>(op) : it->second;
+    }
+
+    PrimExpr VisitExpr_(const LetNode *op) final {
+      PrimExpr value = VisitExpr(op->value);
+      ffi::Optional<Var> previous;
+      if (auto it = vars_.find(op->var.get()); it != vars_.end())
+        previous = it->second;
+      Var var = op->var.copy_with_suffix("_alignment");
+      vars_[op->var.get()] = var;
+      PrimExpr body = VisitExpr(op->body);
+      if (previous.defined())
+        vars_[op->var.get()] = previous.value();
+      else
+        vars_.erase(op->var.get());
+      return Let(var, value, body);
+    }
+  };
+
+  // A defined var records a value/range binding; otherwise this is a condition.
+  struct Fact {
+    ffi::Optional<Var> var;
+    PrimExpr value;
+    Range range;
+    bool is_assume{false};
+  };
+  std::vector<Fact> facts_;
+
+  struct FactScope {
+    explicit FactScope(std::vector<Fact> &facts)
+        : facts(facts), depth(facts.size()) {}
+    ~FactScope() { facts.resize(depth); }
+    std::vector<Fact> &facts;
+    size_t depth;
+  };
+
+  // Memory reads can change within a scope; only pure facts remain valid.
+  bool IsPure(const PrimExpr &expr) const {
+    return SideEffect(expr) <= CallEffectKind::kPure;
+  }
+
+  void PushBinding(const Var &var, const PrimExpr &value) {
+    if (!var.dtype().is_handle() && IsPure(value))
+      facts_.push_back({var, ProofExprRenamer()(value), Range()});
+  }
+
+  void PushRange(const Var &var, const Range &range) {
+    if (range.defined() && IsPure(range->min) && IsPure(range->extent))
+      facts_.push_back(
+          {var, PrimExpr(),
+           Range::FromMinExtent(ProofExprRenamer()(range->min),
+                                ProofExprRenamer()(range->extent))});
+  }
+
+  void PushCondition(const PrimExpr &condition, bool is_assume = false) {
+    if (IsPure(condition))
+      facts_.push_back({ffi::Optional<Var>(), ProofExprRenamer()(condition),
+                        Range(), is_assume});
+  }
+
+  void VisitStmt_(const LetStmtNode *op) final {
+    VisitExpr(op->value);
+    FactScope scope(facts_);
+    PushBinding(op->var, op->value);
+    VisitStmt(op->body);
+  }
+
+  void VisitExpr_(const LetNode *op) final {
+    VisitExpr(op->value);
+    FactScope scope(facts_);
+    PushBinding(op->var, op->value);
+    VisitExpr(op->body);
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    VisitExpr(op->min);
+    VisitExpr(op->extent);
+    if (op->step.has_value())
+      VisitExpr(op->step.value());
+    FactScope scope(facts_);
+    PushRange(op->loop_var, Range::FromMinExtent(op->min, op->extent));
+    VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const BlockNode *op) final {
+    for (const IterVar &iv : op->iter_vars) {
+      if (iv->dom.defined()) {
+        VisitExpr(iv->dom->min);
+        VisitExpr(iv->dom->extent);
+      }
+    }
+    FactScope scope(facts_);
+    for (const IterVar &iv : op->iter_vars)
+      PushRange(iv->var, iv->dom);
+    auto visit_region = [this](const BufferRegion &region) {
+      for (const Range &range : region->region) {
+        VisitExpr(range->min);
+        VisitExpr(range->extent);
+      }
+    };
+    for (const BufferRegion &region : op->reads)
+      visit_region(region);
+    for (const BufferRegion &region : op->writes)
+      visit_region(region);
+    for (const MatchBufferRegion &match : op->match_buffers)
+      visit_region(match->source);
+    if (op->init.defined())
+      VisitStmt(op->init.value());
+    VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) final {
+    VisitExpr(op->condition);
+    PrimExpr condition = op->condition;
+    if (const auto *call = condition.as<CallNode>();
+        call && call->op.same_as(builtin::likely()))
+      condition = call->args[0];
+    {
+      FactScope scope(facts_);
+      PushCondition(condition);
+      VisitStmt(op->then_case);
+    }
+    if (op->else_case.defined()) {
+      FactScope scope(facts_);
+      PushCondition(Not(condition));
+      VisitStmt(op->else_case.value());
+    }
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    VisitExpr(op->value);
+    FactScope scope(facts_);
+    if (op->attr_key == tir::attr::tilelang_assume) {
+      PrimExpr condition = Downcast<PrimExpr>(op->node);
+      VisitExpr(condition);
+      PushCondition(condition, /*is_assume=*/true);
+    } else if (op->attr_key == tir::attr::thread_extent ||
+               op->attr_key == tir::attr::virtual_thread) {
+      IterVar iv = Downcast<IterVar>(op->node);
+      PushRange(iv->var,
+                Range::FromMinExtent(make_zero(op->value.dtype()), op->value));
+    }
+    VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const AssertStmtNode *op) final {
+    VisitExpr(op->condition);
+    VisitExpr(op->message);
+    FactScope scope(facts_);
+    PushCondition(op->condition);
+    VisitStmt(op->body);
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    // Codegen evaluates expression operands eagerly, including Select operands.
+    StmtExprVisitor::VisitExpr_(op);
+    if (!op->op.same_as(tl::dma_copy()) &&
+        !op->op.same_as(tl::sunmmio_layout_transform()))
+      return;
+    // Analyzer::Bind is persistent. Replay only this copy's lexical path into
+    // a fresh analyzer, so sibling scopes and copies cannot retain bindings.
+    // Functions without these calls never create an analyzer or bind variables.
+    arith::Analyzer analyzer;
+    VerifyInContext(op, &analyzer, 0);
+  }
+
+  void VerifyInContext(const CallNode *op, arith::Analyzer *analyzer,
+                       size_t index) const {
+    if (index == facts_.size()) {
+      VerifyRegions(op, analyzer);
+      return;
+    }
+    const Fact &fact = facts_[index];
+    if (fact.var.defined()) {
+      if (fact.range.defined()) {
+        if (analyzer->CanProve(fact.range->extent <= 0))
+          return;
+        analyzer->Bind(fact.var.value(), fact.range);
+      } else {
+        analyzer->Bind(fact.var.value(), fact.value);
+      }
+      VerifyInContext(op, analyzer, index + 1);
+    } else {
+      PrimExpr condition = analyzer->rewrite_simplify(fact.value);
+      if (analyzer->CanProve(Not(condition)))
+        return;
+      With<arith::ConstraintContext> context(analyzer, condition,
+                                             fact.is_assume);
+      VerifyInContext(op, analyzer, index + 1);
+    }
+  }
+
+  void VerifyRegions(const CallNode *op, arith::Analyzer *analyzer) const {
+    ICHECK_GE(op->args.size(), 2U);
+    for (int side : {0, 1}) {
+      BufferRegion region = tl::NormalizeToBufferRegion(op->args[side]);
+      const char *operand = side == 0 ? "source" : "destination";
+      for (size_t dim = 0; dim < region->region.size(); ++dim) {
+        const Range &range = region->region[dim];
+        const auto *extent = range->extent.as<IntImmNode>();
+        ICHECK(extent) << "tl.tileop.region extent must be IntImm";
+        ICHECK_GT(extent->value, 0)
+            << "Sunmmio copy " << operand << " buffer " << region->buffer->name
+            << " has non-positive region extent at dim " << dim;
+        PrimExpr min = ProofExprRenamer()(range->min);
+        ICHECK(analyzer->CanProveEqual(floormod(min, range->extent), 0))
+            << "Sunmmio copy " << operand << " buffer " << region->buffer->name
+            << " region min at dim " << dim
+            << " must be provably aligned to region extent " << range->extent
+            << ", but got min=" << range->min;
+      }
+    }
+  }
+};
+
+class DeclBufferCollector final : public tir::StmtExprVisitor {
 public:
   std::unordered_map<const tir::VarNode *, tir::Buffer> buffer_data_to_buffer;
   std::unordered_map<const tir::VarNode *, int> reduce_register_temp_roles;
 
 private:
+  void VisitExpr_(const tir::CallNode *op) final {
+    if (op->op.same_as(tl::mx_field_handle()))
+      Record(Downcast<tir::Buffer>(op->annotations.at(tl::kMXParent)));
+    tir::StmtExprVisitor::VisitExpr_(op);
+  }
+
   void VisitStmt_(const tir::DeclBufferNode *op) final {
     Record(op->buffer);
-    tir::StmtVisitor::VisitStmt_(op);
+    tir::StmtExprVisitor::VisitStmt_(op);
   }
 
   void VisitStmt_(const tir::AllocateNode *op) final {
@@ -66,7 +298,7 @@ private:
       reduce_register_temp_roles[op->buffer_var.get()] =
           static_cast<int>(role->value);
     }
-    tir::StmtVisitor::VisitStmt_(op);
+    tir::StmtExprVisitor::VisitStmt_(op);
   }
 
   void Record(const tir::Buffer &buffer) {
@@ -78,7 +310,7 @@ private:
     if (it == buffer_data_to_buffer.end()) {
       buffer_data_to_buffer.emplace(data, buffer);
       // return;
-    } else {
+    } else if (!it->second.same_as(buffer)) {
       LOG(WARNING) << "Found duplicate DeclBuffer for data var " << data;
     }
   }
@@ -586,6 +818,7 @@ void CodeGenTileLangSunMMIO::Clear() {
   builder_.reset();
   ssa_counter_ = 0;
   var_table_.clear();
+  mx_fields_.clear();
   local_var_table_.clear();
   buffer_registry_.clear();
   buffer_data_to_buffer_.clear();
@@ -886,6 +1119,7 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
     Init();
   }
   ICHECK(builder_) << "CodeGenTileLangSunMMIO builder is not initialized";
+  CopyRegionAlignmentVerifier()(f->body);
   CollectExpectedCoverage(f);
   CollectDeclBuffers(f->body);
 
@@ -898,6 +1132,16 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
   if (auto opt = f->GetAttr<SunMMIOBuilder::TirLayoutMap>(
           tl::attr::kGlobalLayoutMap)) {
     global_layout_map = opt.value();
+  }
+  for (const auto &[handle, info] : tl::CollectMXViews(f->body)) {
+    layout_map.Set(info.parent,
+                   Downcast<tl::Layout>(
+                       info.binding->annotations.at(tl::kMXParentLayout)));
+    auto it = buffer_data_to_buffer_.find(handle);
+    if (it != buffer_data_to_buffer_.end())
+      layout_map.Set(it->second,
+                     Downcast<tl::Layout>(
+                         info.binding->annotations.at(tl::kMXFieldLayout)));
   }
   builder_->PushLayoutScope(layout_map, global_layout_map);
 
@@ -1428,6 +1672,55 @@ void CodeGenTileLangSunMMIO::EmitWhile(const tir::WhileNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::LetStmtNode *op) {
+  if (tl::IsMXFieldHandle(op->value)) {
+    MarkVisitedExprTree(op->value);
+    auto call = Downcast<tir::Call>(op->value);
+    auto parent = Downcast<tir::Buffer>(call->annotations.at(tl::kMXParent));
+    auto key = parent->data.get();
+    bool created = !mx_fields_.count(key);
+    if (created) {
+      DataType data_dtype = parent->dtype.bits() == 8
+                                ? DataType::Float8E4M3FN()
+                                : DataType::Float4E2M1FN();
+      mx_fields_[key] =
+          builder_->MXUnpack(NewValueName(), NewValueName(), LookupVar(key),
+                             DataType::Float8E8M0FNU(), data_dtype);
+    }
+    int field = Downcast<IntImm>(call->args[1])->value;
+    SunMMIOValue value =
+        field == 0 ? mx_fields_.at(key).second : mx_fields_.at(key).first;
+    ICHECK_EQ(
+        value.type.byte_offset,
+        Downcast<Integer>(call->annotations.at(tl::kMXFieldOffset)).IntValue())
+        << "MX field byte offset disagrees with SUVM unpack";
+    auto it = buffer_data_to_buffer_.find(op->var.get());
+    if (it != buffer_data_to_buffer_.end()) {
+      SunMMIOType expected = MapBufferType(it->second);
+      ICHECK(expected.dtype == value.type.dtype &&
+             expected.layout_dim_levels == value.type.layout_dim_levels);
+      auto equal = [](const std::vector<PrimExpr> &a,
+                      const std::vector<PrimExpr> &b) {
+        if (a.size() != b.size())
+          return false;
+        arith::Analyzer analyzer;
+        for (size_t i = 0; i < a.size(); ++i)
+          if (!analyzer.CanProveEqual(a[i], b[i]))
+            return false;
+        return true;
+      };
+      ICHECK(equal(expected.shape, value.type.shape) &&
+             equal(expected.layout_hshape, value.type.layout_hshape) &&
+             equal(expected.layout_hstride, value.type.layout_hstride))
+          << "MX field descriptor disagrees with SUVM unpack";
+    }
+    EnterScope();
+    BindVar(op->var, value);
+    VisitStmtTracked(op->body);
+    ExitScope();
+    if (created)
+      mx_fields_.erase(key);
+    return;
+  }
   SunMMIOValue value = EvalExpr(op->value);
   EnterScope();
   BindVar(op->var, value);
@@ -2227,89 +2520,127 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
     SunMMIOValue tile = load_tile(src_view, dtype, shape);
     builder_->TileStore(tile, dst_view, std::nullopt);
   };
-  auto emit_scale_copy = [&](const SunMMIOValue &src, const SunMMIOValue &dst,
-                             tl::sunmmio::MXLayoutKind layout_kind) {
-    constexpr int64_t kScaleValidElems = 32;
-    constexpr int64_t kScaleAccessElems = 64;
-    ICHECK(layout_kind != tl::sunmmio::MXLayoutKind::kRowMajor)
-        << "tl.mx_pack/unpack row-major scale copy is not implemented yet; "
-           "waiting for stable suvm.unpack scale alias layout";
-    std::vector<int64_t> scale_shape = ExtractStaticShape(src.type);
-    std::vector<int64_t> dst_scale_shape = ExtractStaticShape(dst.type);
-    std::vector<int64_t> src_physical = ExtractPhysicalExtents(src.type);
-    std::vector<int64_t> dst_physical = ExtractPhysicalExtents(dst.type);
-    ICHECK(scale_shape == dst_scale_shape)
-        << "MX scale source/destination logical shapes must match";
-    ICHECK_EQ(scale_shape.size(), 2U)
-        << "MX scale alias/user buffer must be rank-2";
-    ICHECK_EQ(scale_shape[1], kScaleValidElems)
-        << "MX scale logical width must be 32, got " << scale_shape[1];
-    ICHECK_EQ(src_physical.size(), 2U)
-        << "MX scale source physical extent must be rank-2";
-    ICHECK_EQ(dst_physical.size(), 2U)
-        << "MX scale destination physical extent must be rank-2";
-    ICHECK_GE(src_physical[1], kScaleValidElems)
-        << "MX scale source physical width must cover 32 logical elements";
-    ICHECK_GE(dst_physical[1], kScaleValidElems)
-        << "MX scale destination physical width must cover 32 logical elements";
-
-    ICHECK(src_physical[1] >= kScaleAccessElems &&
-           dst_physical[1] >= kScaleAccessElems)
-        << "MX scale copy requires source and destination physical width to "
-           "cover a 64B fp8 tile access; got source width "
-        << src_physical[1] << " and destination width " << dst_physical[1];
-
-    std::string row_name = NewValueName();
-    begin_for(row_name, scale_shape[0]);
-    SunMMIOValue row = make_loop_index(row_name);
-    std::vector<SunMMIOValue> indices{row, EmitConstIndex(0)};
-    std::vector<int64_t> tiled_dims{0, 1};
-    std::vector<int64_t> valid_shape{1, kScaleValidElems};
-
-    std::vector<int64_t> access_shape{1, kScaleAccessElems};
-    std::vector<SunMMIOValue> offsets{EmitConstIndex(0), EmitConstIndex(0)};
-
-    SunMMIOValue src_view = get_tile_view(src, ExpectedMXScaleDType(), indices,
-                                          tiled_dims, access_shape);
-    SunMMIOValue src64 =
-        load_tile(src_view, ExpectedMXScaleDType(), access_shape);
-    SunMMIOValue src32 =
-        builder_->TileSlice(NewValueName(), src64, offsets,
-                            MakeTileType(ExpectedMXScaleDType(), valid_shape),
-                            ExpectedMXScaleDType());
-
-    SunMMIOValue dst_view = get_tile_view(dst, ExpectedMXScaleDType(), indices,
-                                          tiled_dims, access_shape);
-    SunMMIOValue dst64 =
-        load_tile(dst_view, ExpectedMXScaleDType(), access_shape);
-    SunMMIOValue merged = builder_->TileInsertSlice(
-        NewValueName(), dst64, src32, offsets,
-        MakeTileType(ExpectedMXScaleDType(), access_shape),
-        ExpectedMXScaleDType());
-    builder_->TileStore(merged, dst_view, std::nullopt);
-    builder_->EndFor();
-  };
-  auto emit_row_major_data_copy = [&](const SunMMIOValue &src,
-                                      const SunMMIOValue &dst, DataType dtype) {
+  const auto config = tl::GetSunmmioTileProcessorConfig(target_);
+  auto emit_row_field_copy = [&](const SunMMIOValue &src,
+                                 const SunMMIOValue &dst, DataType dtype) {
     std::vector<int64_t> shape = ExtractStaticShape(src.type);
-    std::vector<int64_t> physical = ExtractPhysicalExtents(src.type);
+    ICHECK(shape == ExtractStaticShape(dst.type))
+        << "MX field source/destination logical shapes must match";
     ICHECK_EQ(shape.size(), 2U);
-    ICHECK_EQ(physical.size(), 2U);
-    int64_t access_elems = 64 * 8 / dtype.bits();
-    ICHECK_GT(access_elems, 0);
-    ICHECK_EQ(physical[1] % access_elems, 0)
-        << "MX row-major data physical width must be aligned to 64B, got "
-        << physical[1] << " elements for dtype " << dtype;
-    int64_t col_tiles = physical[1] / access_elems;
+    ICHECK_GT(shape[0], 0);
+    ICHECK_GT(shape[1], 0);
+    int64_t access_elems =
+        tl::GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, dtype);
+    ICHECK_GT(config.rsram_align_bytes, 0);
+    int64_t full_tiles = shape[1] / access_elems;
+    int64_t tail_elems = shape[1] % access_elems;
+    int64_t covered_cols = (full_tiles + (tail_elems != 0)) * access_elems;
+    for (const SunMMIOValue *field : {&src, &dst}) {
+      auto physical = ExtractPhysicalExtents(field->type);
+      auto strides = ExtractStaticPrimExprs(field->type.layout_hstride,
+                                            "MX field layout strides");
+      ICHECK(field->type.layout_dim_levels == std::vector<uint8_t>({1, 1}) &&
+             physical.size() == 2 && strides.size() == 2)
+          << "MX field copy requires a flat rank-2 layout";
+      ICHECK_GE(physical[0], shape[0]);
+      ICHECK_GE(physical[1], covered_cols)
+          << "MX field physical width must cover its aligned accesses";
+      ICHECK_EQ(physical[1] % access_elems, 0);
+      ICHECK_EQ(strides[1], 1) << "MX fields must be contiguous within a row";
+      ICHECK_GE(strides[0], physical[1]);
+      ICHECK_EQ(strides[0] % access_elems, 0);
+      ICHECK_EQ(field->type.byte_offset % config.rsram_align_bytes, 0);
+    }
 
+    std::vector<int64_t> access_shape{1, access_elems};
+    std::vector<int64_t> tiled_dims{0, 1};
+    std::vector<SunMMIOValue> zero_offsets{EmitConstIndex(0),
+                                           EmitConstIndex(0)};
+    SunMMIOType access_type = MakeTileType(dtype, access_shape);
     std::string row_name = NewValueName();
     begin_for(row_name, shape[0]);
     SunMMIOValue row = make_loop_index(row_name);
-    std::string col_name = NewValueName();
-    begin_for(col_name, col_tiles);
-    SunMMIOValue col = make_loop_index(col_name);
-    copy_tile(src, dst, dtype, {row, col}, {0, 1}, {1, access_elems});
-    builder_->EndFor();
+    // Complete accesses never read the destination. Each field keeps its own
+    // physical row stride and byte offset through its memtensor type.
+    if (full_tiles > 0) {
+      std::string col_name = NewValueName();
+      begin_for(col_name, full_tiles);
+      copy_tile(src, dst, dtype, {row, make_loop_index(col_name)}, tiled_dims,
+                access_shape);
+      builder_->EndFor();
+    }
+    if (tail_elems != 0) {
+      std::vector<SunMMIOValue> indices{row, EmitConstIndex(full_tiles)};
+      SunMMIOValue src_view =
+          get_tile_view(src, dtype, indices, tiled_dims, access_shape);
+      SunMMIOValue dst_view =
+          get_tile_view(dst, dtype, indices, tiled_dims, access_shape);
+      SunMMIOValue source = load_tile(src_view, dtype, access_shape);
+      SunMMIOValue previous = load_tile(dst_view, dtype, access_shape);
+      SunMMIOValue merged;
+      int64_t valid_bits = tail_elems * dtype.bits();
+      if (valid_bits % 32 == 0) {
+        // This is also the existing blockwise scale path (32 valid FP8
+        // elements), and covers all payload tails when K is a multiple of 32.
+        SunMMIOValue slice =
+            builder_->TileSlice(NewValueName(), source, zero_offsets,
+                                MakeTileType(dtype, {1, tail_elems}), dtype);
+        merged = builder_->TileInsertSlice(NewValueName(), previous, slice,
+                                           zero_offsets, access_type, dtype);
+      } else {
+        // Low-bit slice lowering requires whole i32 lanes. Preserve the
+        // trailing padding bytes by merging the partial lane as raw bits.
+        ICHECK_EQ(config.rsram_align_bytes % 4, 0);
+        DataType word_dtype = DataType::Int(32);
+        SunMMIOType words_type =
+            MakeTileType(word_dtype, {1, config.rsram_align_bytes / 4});
+        SunMMIOType word_type = MakeTileType(word_dtype, {1, 1});
+        SunMMIOValue source_words = builder_->TileBitcast(
+            NewValueName(), source, words_type, word_dtype);
+        SunMMIOValue previous_words = builder_->TileBitcast(
+            NewValueName(), previous, words_type, word_dtype);
+        SunMMIOValue merged_words = previous_words;
+        int64_t full_words = valid_bits / 32;
+        if (full_words > 0) {
+          SunMMIOValue prefix = builder_->TileSlice(
+              NewValueName(), source_words, zero_offsets,
+              MakeTileType(word_dtype, {1, full_words}), word_dtype);
+          merged_words =
+              builder_->TileInsertSlice(NewValueName(), merged_words, prefix,
+                                        zero_offsets, words_type, word_dtype);
+        }
+        std::vector<SunMMIOValue> word_offsets{EmitConstIndex(0),
+                                               EmitConstIndex(full_words)};
+        SunMMIOValue source_word = builder_->TileSlice(
+            NewValueName(), source_words, word_offsets, word_type, word_dtype);
+        SunMMIOValue previous_word =
+            builder_->TileSlice(NewValueName(), previous_words, word_offsets,
+                                word_type, word_dtype);
+        uint32_t mask = (uint32_t{1} << (valid_bits % 32)) - 1;
+        SunMMIOType scalar_type{SunMMIOType::Kind::kScalar, word_dtype, 1, {}};
+        SunMMIOValue take_mask =
+            builder_->ConstantInt(NewValueName(), static_cast<int32_t>(mask),
+                                  scalar_type, word_dtype);
+        SunMMIOValue keep_mask =
+            builder_->ConstantInt(NewValueName(), static_cast<int32_t>(~mask),
+                                  scalar_type, word_dtype);
+        SunMMIOValue new_bits = builder_->Binary(
+            NewValueName(), BinaryOp::kAnd, ArithmeticFlavor::kSignedInt,
+            source_word, take_mask, word_type, word_dtype);
+        SunMMIOValue old_bits = builder_->Binary(
+            NewValueName(), BinaryOp::kAnd, ArithmeticFlavor::kSignedInt,
+            previous_word, keep_mask, word_type, word_dtype);
+        SunMMIOValue word = builder_->Binary(
+            NewValueName(), BinaryOp::kOr, ArithmeticFlavor::kSignedInt,
+            new_bits, old_bits, word_type, word_dtype);
+        merged_words =
+            builder_->TileInsertSlice(NewValueName(), merged_words, word,
+                                      word_offsets, words_type, word_dtype);
+        merged = builder_->TileBitcast(NewValueName(), merged_words,
+                                       access_type, dtype);
+      }
+      builder_->TileStore(merged, dst_view, std::nullopt);
+    }
     builder_->EndFor();
   };
   auto emit_blockwise_data_copy = [&](const SunMMIOValue &src,
@@ -2401,7 +2732,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
 
   switch (analysis->kind) {
   case tl::sunmmio::MXLayoutKind::kRowMajor:
-    emit_row_major_data_copy(data_src, data_dst, data_buffer->dtype);
+    emit_row_field_copy(data_src, data_dst, data_buffer->dtype);
     break;
   case tl::sunmmio::MXLayoutKind::kMXZZ:
   case tl::sunmmio::MXLayoutKind::kMXZNZ:
@@ -2413,7 +2744,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitMXPackOrUnpack(const tir::CallNode *op,
                   "tl.mx_pack/unpack";
     break;
   }
-  emit_scale_copy(scale_src, scale_dst, analysis->kind);
+  emit_row_field_copy(scale_src, scale_dst, scale_buffer->dtype);
 
   return SunMMIOValue{op->dtype, "", MapType(op->dtype)};
 }

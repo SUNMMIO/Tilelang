@@ -554,6 +554,12 @@ endif()
 set(USE_Z3      ON CACHE STRING "Use Z3 SMT solver for TileLang optimizations")
 set(USE_PYPI_Z3 ON CACHE BOOL   "Use Z3 provided by PyPI z3-solver package")
 
+if(USE_SUNMMIO AND NOT USE_Z3)
+  message(FATAL_ERROR
+    "USE_SUNMMIO=ON requires USE_Z3=ON. "
+    "The SunMMIO compiler relies on Z3-backed symbolic proofs.")
+endif()
+
 if(USE_Z3 AND USE_PYPI_Z3)
   # Insert at the beginning to ensure pypi-z3's FindZ3.cmake is used over LLVM's
   list(INSERT CMAKE_MODULE_PATH 0 "${CMAKE_CURRENT_LIST_DIR}/cmake/pypi-z3")

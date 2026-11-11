@@ -1055,3 +1055,88 @@ def test_lower_tiles_loop_allows_explicit_atomic_add():
     mod = IRModule.from_expr(explicit_atomic_add_tiled_parallel_2d().with_attr("global_symbol", "main"))
 
     apply_tiles_lowering(mod)
+
+
+def parallel_write_scope_module(context, conflicting=False, injective=False):
+    """Keep lexical bindings intact at the parallel-write checker's entry."""
+    i, j, serial, offset, alias, dependent = [tir.Var(name, "int32") for name in ("i", "j", "serial", "offset", "alias", "dependent")]
+    if context == "load_let":
+        dependent = tir.Var("loaded", "float32")
+    src = tir.decl_buffer((64, 32), "float32", name="Src", scope="shared.rsram")
+    dst = tir.decl_buffer((32, 32), "float32", name="Scratch", scope="shared.rsram")
+    col = j if conflicting or injective else tir.IntImm("int32", 0)
+    row = serial * 32 + i
+    if context in ("invariant_let", "dependent_let", "transitive_let", "load_let"):
+        row = offset + i
+    if context in ("dependent_let", "transitive_let"):
+        col = dependent
+    value = tir.BufferLoad(src, [row, col])
+    if context == "load_let":
+        value = dependent
+    predicate = None
+    if context == "predicate":
+        # Only one j can write; its dependency must also be substituted.
+        predicate = dependent == 0
+    body = tir.BufferStore(dst, value, [i, j if injective else 0], predicate=predicate)
+    if context == "load_let":
+        body = tir.LetStmt(dependent, tir.BufferLoad(src, [row, col]), body)
+    if context in ("dependent_let", "transitive_let", "predicate"):
+        source_col = j if conflicting or injective or context == "predicate" else i
+        body = tir.LetStmt(dependent, alias if context == "transitive_let" else source_col, body)
+        if context == "transitive_let":
+            body = tir.LetStmt(alias, source_col, body)
+    if context in ("invariant_let", "dependent_let", "transitive_let", "load_let"):
+        body = tir.LetStmt(offset, serial * 32, body)
+    if context == "thread":
+        iv = tir.IterVar(tvm.ir.Range.from_min_extent(0, 2), serial, tir.IterVar.ThreadIndex, "blockIdx.x")
+        body = tir.AttrStmt(iv, "thread_extent", 2, body)
+    elif context != "outer_serial":
+        body = tir.For(serial, 0, 2, tir.ForKind.SERIAL, body)
+    body = tir.For(j, 0, 32, tir.ForKind.SERIAL, body, annotations={"tile.loop_parallel": 1, "tile.loop_stage": 0})
+    body = tir.For(i, 0, 32, tir.ForKind.SERIAL, body, annotations={"tile.loop_parallel": 1, "tile.loop_stage": 0, "tile.domain": [32, 32]})
+    if context == "outer_serial":
+        body = tir.For(serial, 0, 2, tir.ForKind.SERIAL, body)
+    return IRModule.from_expr(tir.PrimFunc([src.data, dst.data], body).with_attr("global_symbol", "main"))
+
+
+@pytest.mark.parametrize(
+    "context", ["outer_serial", "inner_serial", "invariant_let", "dependent_let", "transitive_let", "load_let", "thread"]
+)
+@pytest.mark.parametrize("injective", [False, True])
+def test_parallel_write_checker_accepts_serial_scratch_reuse(context, injective, tmp_path):
+    mod = parallel_write_scope_module(context, injective=injective)
+    (tmp_path / "before_legalize_tiles.tir").write_text(mod.script())
+    legalized = tl.transform.LegalizeTilesLoop()(mod)
+    (tmp_path / "after_legalize_tiles.tir").write_text(legalized.script())
+
+
+@pytest.mark.parametrize(
+    "context", ["outer_serial", "inner_serial", "invariant_let", "dependent_let", "transitive_let", "load_let", "thread"]
+)
+def test_parallel_write_checker_rejects_conflicting_values_in_serial_scope(context):
+    mod = parallel_write_scope_module(context, conflicting=True)
+    with pytest.raises(tvm.error.InternalError, match="Implicit reduction in T.Tiles is not supported"):
+        tl.transform.LegalizeTilesLoop()(mod)
+
+
+def test_parallel_write_checker_substitutes_dependent_predicate():
+    # Without substituting dependent = j in the second predicate, j' may be
+    # nonzero and a safe single-writer store would be rejected.
+    tl.transform.LegalizeTilesLoop()(parallel_write_scope_module("predicate", conflicting=True))
+
+
+@pytest.mark.parametrize("stride", [3, 4])
+def test_parallel_write_checker_distinguishes_packed_and_overlapping_stores(stride):
+    i, j, serial = [tir.Var(name, "int32") for name in ("i", "j", "serial")]
+    src = tir.decl_buffer((8, 4), "float32", name="Src", scope="shared.rsram")
+    dst = tir.decl_buffer((32,), "float32", name="Scratch", scope="shared.rsram")
+    body = tir.BufferStore(dst, tir.BufferLoad(src, [serial * 4 + i, j]), [8 + i * stride + j])
+    body = tir.For(serial, 0, 2, tir.ForKind.SERIAL, body)
+    body = tir.For(j, 0, 4, tir.ForKind.SERIAL, body, annotations={"tile.loop_parallel": 1, "tile.loop_stage": 0})
+    body = tir.For(i, 0, 4, tir.ForKind.SERIAL, body, annotations={"tile.loop_parallel": 1, "tile.loop_stage": 0, "tile.domain": [4, 4]})
+    mod = IRModule.from_expr(tir.PrimFunc([src.data, dst.data], body).with_attr("global_symbol", "main"))
+    if stride == 4:
+        tl.transform.LegalizeTilesLoop()(mod)
+    else:
+        with pytest.raises(tvm.error.InternalError, match="Implicit reduction in T.Tiles is not supported"):
+            tl.transform.LegalizeTilesLoop()(mod)
