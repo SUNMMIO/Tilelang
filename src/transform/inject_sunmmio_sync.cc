@@ -578,6 +578,20 @@ private:
                            AccessProducerKind::kAsync, units));
       return true;
     }
+    if (call->op.same_as(device_lib())) {
+      bool topk = call->args[0].as<StringImmNode>()->value == "topk";
+      for (size_t i = 1; i < (topk ? 4U : 3U); ++i) {
+        CollectRegionArgumentLoads(call, {i}, argument_loads);
+        auto region = NormalizeToBufferRegion(call->args[i]);
+        if (i == 1)
+          accesses->push_back(MakeRegionAccess(
+              region, false, AccessProducerKind::kAsync, kTileMemoryUnits));
+        if (i > 1 || topk)
+          accesses->push_back(MakeRegionAccess(
+              region, true, AccessProducerKind::kAsync, kTileMemoryUnits));
+      }
+      return true;
+    }
     if (call->op.same_as(mma_sunmmio())) {
       ICHECK_GE(call->args.size(), 3U);
       CollectRegionArgumentLoads(call, {0, 1, 2}, argument_loads);
@@ -773,6 +787,13 @@ private:
     if (call &&
         GetAsyncAccesses(call, &accesses, &argument_loads, &completed_inline)) {
       SunmmioSyncUnits required = SynchronizeBeforeLoads(argument_loads);
+      if (call->op.same_as(device_lib())) {
+        // The library owns the vector unit for this call, including accesses
+        // to caller buffers that do not overlap its operands.
+        SunmmioSyncUnits units = PendingUnits() & kTileMemoryUnits;
+        required |= units;
+        CompleteUnits(units);
+      }
       required |= ProcessAccesses(accesses, completed_inline);
       // Argument expressions are evaluated before the async submission. Keep
       // their memory accesses pending for later statements without introducing

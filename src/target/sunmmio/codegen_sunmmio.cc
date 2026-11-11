@@ -2828,8 +2828,8 @@ const char *CodeGenTileLangSunMMIO::CallBucketName(CallBucket bucket) const {
 
 SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
     const tvm::PrimExpr &region_expr, int64_t byte_offset,
-    bool use_layout_covered_shape, bool preserve_region_rank,
-    bool allow_rank3) {
+    bool use_layout_covered_shape, bool preserve_region_rank, bool allow_rank3,
+    bool exact_device_lib_region) {
   BufferRegion region = NormalizeRegionTracked(region_expr);
   const BufferBinding &binding = LookupBuffer(region->buffer);
   std::vector<int64_t> effective_extents;
@@ -2857,6 +2857,35 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
   auto planned_shape = read_int_array(tl::attr::kSunmmioRegionViewShape);
 
   ICHECK_EQ(planned_dims.has_value(), planned_shape.has_value());
+  if (exact_device_lib_region) {
+    // Device libraries access every element of the view. Unlike MMA/DMA,
+    // they must not silently widen a logical region to its padded layout.
+    ICHECK_GE(region->region.size(), 2U);
+    planned_dims = std::vector<int64_t>{};
+    planned_shape = std::vector<int64_t>{};
+    for (size_t dim = 0; dim < region->region.size(); ++dim) {
+      const auto *extent = region->region[dim]->extent.as<IntImmNode>();
+      ICHECK(extent) << "Device library regions require static extents";
+      if (dim + 2 < region->region.size()) {
+        ICHECK_EQ(extent->value, 1)
+            << "Device library regions require rank-two matrix views";
+      } else {
+        planned_dims->push_back(dim);
+        planned_shape->push_back(extent->value);
+      }
+    }
+    auto layout = builder_->LookupLayout(region->buffer);
+    if (layout.defined()) {
+      if (auto block = tl::sunmmio::GetZZBlockShape(layout.value())) {
+        ICHECK((*planned_shape)[0] % block->height == 0 &&
+               (*planned_shape)[1] % block->width == 0)
+            << "Device library ZZ tile must be whole " << block->height << "x"
+            << block->width
+            << " blocks; explicitly pad the operand regions instead of "
+               "relying on implicit layout padding";
+      }
+    }
+  }
   if (use_layout_covered_shape) {
     std::vector<int64_t> logical_shape =
         ExtractStaticShape(binding.buffer_type);
@@ -2895,6 +2924,14 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
     int64_t extent = use_layout_covered_shape
                          ? effective_extents[dim]
                          : static_cast<int64_t>(extent_imm->value);
+    if (exact_device_lib_region) {
+      ICHECK_GT(extent, 0);
+      ICHECK(analyzer.CanProve(floormod(range->min, Integer(extent)) == 0))
+          << "Device library region offset must be a multiple of its extent "
+          << "at dimension " << dim << ": offset=" << range->min
+          << ", extent=" << extent
+          << "; this slice cannot be represented exactly by a partitioned view";
+    }
     extents.push_back(extent);
     PrimExpr min = floordiv(range->min, Integer(extent));
     min = analyzer.Simplify(min);
@@ -2934,6 +2971,36 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     return builder_->Select(NewValueName(), cond, tv, fv, tv.type, dtype);
   } else if (callee == "tl.tileop.region") {
     return EmitRegionCall(tvm::ffi::GetRef<PrimExpr>(op));
+  } else if (callee == "tl.device_lib") {
+    const auto *name = op->args[0].as<StringImmNode>();
+    ICHECK(name);
+    MarkVisitedNodeType(name->GetTypeKey());
+    callee = "tl.device_lib." + std::string(name->value);
+    size_t region_end = name->value == "topk" ? 4 : 3;
+    for (size_t i = 1; i < region_end; ++i) {
+      if (name->value == "topk") {
+        auto region = NormalizeRegionTracked(op->args[i]);
+        auto layout = builder_->LookupLayout(region->buffer);
+        bool zz = layout.defined() &&
+                  tl::sunmmio::GetZZBlockShape(layout.value()).has_value();
+        if (!zz) {
+          int lanes = tl::GetSunmmioTileProcessorConfig(target_).register_bits /
+                      region->buffer->dtype.bits();
+          const auto *cols = region->region.back()->extent.as<IntImmNode>();
+          ICHECK(cols && cols->value % lanes == 0)
+              << "T.topk row-major region width must be vector aligned ("
+              << lanes << " elements)";
+        }
+      }
+      operands.push_back(EmitRegionCall(op->args[i], /*byte_offset=*/0,
+                                        /*use_layout_covered_shape=*/false,
+                                        /*preserve_region_rank=*/true,
+                                        /*allow_rank3=*/false,
+                                        /*exact_device_lib_region=*/true));
+    }
+    if (name->value == "topk") {
+      operands.push_back(EvalExpr(op->args[4]));
+    }
   } else if (callee == "tl.mx_pack") {
     return EmitMXPackOrUnpack(op, /*is_pack=*/true);
   } else if (callee == "tl.mx_unpack") {

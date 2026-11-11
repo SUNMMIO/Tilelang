@@ -241,6 +241,13 @@ public:
         call->op.same_as(Op::Get("tl.broadcast_"))) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
+    } else if (call->op.same_as(device_lib())) {
+      bool topk = call->args[0].as<StringImmNode>()->value == "topk";
+      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
+      if (topk)
+        write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
+      for (size_t i = 2; i < (topk ? 4U : 3U); ++i)
+        write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[i]));
     } else if (call->op.same_as(mma_sunmmio())) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
