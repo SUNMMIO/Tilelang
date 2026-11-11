@@ -456,7 +456,7 @@ def test_tilelang_reduce_sunmmio(shape, reduce_axis, expected_in_tile):
 
 
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
-def test_tilelang_reduce_sunmmio_uses_layout_bounded_zz_source_tile(dtype):
+def test_tilelang_reduce_sunmmio_uses_register_bounded_zz_source_tile(dtype):
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     mod = reduce_kernel_with_blockwise_layout_builder((128, 128), 1, dtype=dtype)
 
@@ -473,11 +473,11 @@ def test_tilelang_reduce_sunmmio_uses_layout_bounded_zz_source_tile(dtype):
     execution_domain_axes = [int(x) for x in root_ann["tile.execution_domain_axes"]]
 
     assert checker.has_in_tile_reduce, "Expected vector_core_in_tile_reduce intrinsic but not found"
-    assert tile_size == [32, 32]
+    assert tile_size == [8 if dtype == "float16" else 4, 32]
     assert execution_domain_axes == [0, 1]
 
 
-def test_tilelang_reduce_sunmmio_bounds_source_tile_by_destination_layout():
+def test_tilelang_reduce_sunmmio_bounds_source_tile_by_register_capacity():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     mod = reduce_kernel_with_blockwise_layout_builder((4, 32), 1, dtype="float32")
 
@@ -487,20 +487,15 @@ def test_tilelang_reduce_sunmmio_bounds_source_tile_by_destination_layout():
     checker = ReduceIRChecker()
     checker.visit_stmt(mod["main"].body)
     assert checker.scope_root is not None
-    assert [int(x) for x in checker.scope_root.annotations["tile.tile_size"]] == [16, 32]
+    assert [int(x) for x in checker.scope_root.annotations["tile.tile_size"]] == [4, 32]
 
 
-def test_tilelang_reduce_sunmmio_manual_full_zz_block_source_tile():
+def test_tilelang_reduce_sunmmio_rejects_manual_tile_exceeding_register_capacity():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     mod = reduce_kernel_with_tileview_builder((128, 128), reduce_axis=1, tile_size=(32, 32))
 
-    with tvm.target.Target(target):
-        mod = apply_sunmmio_passes(mod, target)
-
-    checker = ReduceIRChecker()
-    checker.visit_stmt(mod["main"].body)
-    assert checker.scope_root is not None
-    assert [int(x) for x in checker.scope_root.annotations["tile.tile_size"]] == [32, 32]
+    with tvm.target.Target(target), pytest.raises(tvm.error.InternalError, match="register capacity"):
+        apply_sunmmio_passes(mod, target)
 
 
 def test_tilelang_reduce_sunmmio_rejects_incompatible_manual_destination_tileview():
@@ -526,7 +521,7 @@ def test_tilelang_reduce_sunmmio_rejects_incompatible_manual_destination_tilevie
         apply_sunmmio_passes(tvm.IRModule({"main": main}), target)
 
 
-def test_tilelang_reduce_sunmmio_uses_row_major_covered_source_tile():
+def test_tilelang_reduce_sunmmio_uses_register_bounded_row_major_source_tile():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
 
     @T.prim_func
@@ -535,7 +530,7 @@ def test_tilelang_reduce_sunmmio_uses_row_major_covered_source_tile():
             A_shared = T.alloc_shared((1000,), "float16", scope="shared.rsram")
             Out_shared = T.alloc_shared((1,), "float16", scope="shared.rsram")
             T.annotate_layout({A_shared: make_aligned_row_major((1000,), "float16", 64)})
-            T.annotate_tileview({A_shared: make_tileview(A_shared, (1024,), (-1,))})
+            T.annotate_tileview({A_shared: make_tileview(A_shared, (256,), (-1,))})
             T.copy(A, A_shared)
             T.reduce_max(A_shared, Out_shared, dim=0)
             T.copy(Out_shared, Out)
@@ -548,7 +543,7 @@ def test_tilelang_reduce_sunmmio_uses_row_major_covered_source_tile():
     checker = ReduceIRChecker()
     checker.visit_stmt(mod["main"].body)
     assert checker.scope_root is not None
-    assert [int(x) for x in checker.scope_root.annotations["tile.tile_size"]] == [1024]
+    assert [int(x) for x in checker.scope_root.annotations["tile.tile_size"]] == [256]
     script = mod.script()
     assert 'T.float16("-inf")' in script
     assert "< 1000" in script or "<1000" in script
@@ -730,7 +725,7 @@ def test_tilelang_reduce_sunmmio_uint32_bitand_uses_all_ones_identity_and_extern
     mod = reduce_kernel_with_tileview_builder(
         (4, 32, 32),
         reduce_axis=0,
-        tile_size=(32, 32),
+        tile_size=(4, 32),
         dtype="uint32",
         reduce_op="bitand",
     )

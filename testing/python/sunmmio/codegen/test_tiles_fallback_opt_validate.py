@@ -308,19 +308,19 @@ def test_packed_2d_to_1d_falls_back_to_rank1_carriers(tmp_path):
     )
 
 
-def test_mixed_rank_unit_side_load_broadcasts_rank1_tile(tmp_path):
+def test_mixed_rank_unit_side_load_uses_carrier_pick(tmp_path):
     src = validate_sunmmio_codegen_with_npuir_opt(
         mixed_rank_unit_side_load_kernel(),
         tmp_path,
         mlir_filename="mixed_rank_unit_side_load_suvm.mlir",
-        expected_tokens=("!suvm.tile<64x128xf32>", "!suvm.tile_view<64xf32>", "suvm.tile.unsqueeze"),
-        opt_args=RAW_MLIR_OPT_ARGS,
+        expected_tokens=("!suvm.tile<1x128xf32>", "!suvm.tile_view<16xf32>", "suvm.tile.pick"),
+        opt_args=STRICT_MLIR_OPT_ARGS,
     )
     assert "suvm.tile.extract_slice" not in src
-    assert "suvm.tile.pick" not in src
+    assert "suvm.tile.unsqueeze" not in src
 
 
-def test_exact_small_2d_fallback_uses_register_carrier(tmp_path):
+def test_small_2d_domain_uses_masked_register_tile(tmp_path):
     src = validate_sunmmio_codegen_with_npuir_opt(
         exact_small_2d_fallback_baseline_kernel(),
         tmp_path,
@@ -330,7 +330,8 @@ def test_exact_small_2d_fallback_uses_register_carrier(tmp_path):
     )
     assert "suvm.tile.pick" not in src
     assert "suvm.tile.set" not in src
-    assert "suvm.tile.insert_slice" in src
+    assert "suvm.tile.select" in src
+    assert "!suvm.tile<4x32xf32>" in src
 
 
 @pytest.mark.parametrize(
@@ -340,21 +341,22 @@ def test_exact_small_2d_fallback_uses_register_carrier(tmp_path):
         (T.float32, 16, 32, "f32"),
     ],
 )
-def test_cross_carrier_rank1_full_pipeline(dtype, carrier, wide, mlir_dtype, tmp_path):
+def test_nondivisor_rank1_uses_single_carrier_full_pipeline(dtype, carrier, wide, mlir_dtype, tmp_path):
     src = validate_sunmmio_codegen_with_npuir_opt(
         cross_carrier_rank1_kernel(dtype),
         tmp_path,
         mlir_filename=f"rank1_cross_pipeline_{mlir_dtype}.mlir",
         expected_tokens=(
             f"!suvm.tile_view<{carrier}x{mlir_dtype}>",
-            f"!suvm.tile<{wide}x{mlir_dtype}>",
-            "scf.if",
+            f"!suvm.tile<2x{mlir_dtype}>",
+            "suvm.tile.extract_slice",
+            "suvm.tile.insert_slice",
         ),
         opt_args=STRICT_MLIR_OPT_ARGS,
     )
     assert f"!suvm.tile_view<{wide}x{mlir_dtype}>" not in src
-    assert src.count("scf.if") >= 2
-    assert src.count("suvm.tile.store") >= 3
+    assert "scf.if" not in src
+    assert src.count("suvm.tile.store") == 1
 
 
 @pytest.mark.parametrize(

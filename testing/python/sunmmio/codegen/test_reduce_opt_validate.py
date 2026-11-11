@@ -284,7 +284,7 @@ def reduce_manual_tileview_kernel_builder(src_tile_size=None, dst_tile_size=None
 def reduce_row_major_covered_tail_kernel_builder(
     reduce_op,
     logical_extent=1000,
-    tile_extent=1024,
+    tile_extent=256,
     initialize_with_fill=False,
     clear=True,
 ):
@@ -567,22 +567,22 @@ def test_reduce_tiled_in_tile_codegen_generates_expected_ops(tmp_path, reduce_ax
         assert_source_contains(
             src,
             (
-                "!suvm.tile<32x32xbf16>",
+                "!suvm.tile<8x32xbf16>",
                 "suvm.tile.squeeze",
                 "suvm.tile.unsqueeze",
-                "!suvm.tile<1x32xbf16>",
+                "!suvm.tile<8x1xbf16>",
             ),
         )
 
 
-def test_reduce_layout_bounded_zz_block_reaches_raw_suvm(tmp_path):
+def test_reduce_register_bounded_zz_tile_reaches_raw_suvm(tmp_path):
     src = validate_sunmmio_codegen_loose(
         reduce_kernel_builder((512, 128), 1, dtype="bfloat16", clear=True),
         tmp_path,
-        mlir_filename="reduce_layout_bounded_zz_block_suvm.mlir",
-        expected_tokens=("suvm.tile.reduce", "!suvm.tile<32x32xbf16>"),
+        mlir_filename="reduce_register_bounded_zz_tile_suvm.mlir",
+        expected_tokens=("suvm.tile.reduce", "!suvm.tile<8x32xbf16>"),
     )
-    assert_source_contains(src, ("suvm.tile.reduce", "!suvm.tile<32x32xbf16>"))
+    assert_source_contains(src, ("suvm.tile.reduce", "!suvm.tile<8x32xbf16>"))
 
 
 def test_reduce_register_aliases_distinguish_same_named_mixed_dtype_temps(tmp_path):
@@ -590,7 +590,7 @@ def test_reduce_register_aliases_distinguish_same_named_mixed_dtype_temps(tmp_pa
         mixed_dtype_reduce_pipeline_builder(),
         tmp_path,
         mlir_filename="reduce_mixed_dtype_register_alias_suvm.mlir",
-        expected_tokens=("!suvm.tile<32x32xbf16>", "!suvm.tile<32x32xf32>"),
+        expected_tokens=("!suvm.tile<8x32xbf16>", "!suvm.tile<4x32xf32>"),
     )
     assert src.count("suvm.tile.reduce") == 2
 
@@ -673,20 +673,20 @@ def test_reduce_dynamic_k_is_preserved_in_raw_suvm(tmp_path):
 
 def test_reduce_manual_destination_tileview_is_reflected_in_raw_suvm(tmp_path):
     src = validate_sunmmio_codegen_loose(
-        reduce_manual_dst_tileview_kernel_builder(16),
+        reduce_manual_dst_tileview_kernel_builder(4),
         tmp_path,
-        mlir_filename="reduce_manual_dst_tile_16_suvm.mlir",
-        expected_tokens=("suvm.tile.reduce", "!suvm.tile<16x1xf32>"),
+        mlir_filename="reduce_manual_dst_tile_4_suvm.mlir",
+        expected_tokens=("suvm.tile.reduce", "!suvm.tile<4x1xf32>"),
     )
-    assert_source_contains(src, ("!suvm.tile<16x32xf32>", "!suvm.tile<16x1xf32>"))
+    assert_source_contains(src, ("!suvm.tile<4x32xf32>", "!suvm.tile<4x1xf32>"))
 
 
 @pytest.mark.parametrize(
     "src_tile_size,dst_tile_size",
     [
-        ((16, 32), None),
-        (None, 16),
-        ((16, 32), 16),
+        ((4, 32), None),
+        (None, 4),
+        ((4, 32), 4),
     ],
 )
 def test_reduce_manual_tileview_combinations_reach_raw_suvm(tmp_path, src_tile_size, dst_tile_size):
@@ -695,9 +695,9 @@ def test_reduce_manual_tileview_combinations_reach_raw_suvm(tmp_path, src_tile_s
         reduce_manual_tileview_kernel_builder(src_tile_size, dst_tile_size),
         tmp_path,
         mlir_filename=f"reduce_manual_{label}_suvm.mlir",
-        expected_tokens=("suvm.tile.reduce", "!suvm.tile<16x32xf32>"),
+        expected_tokens=("suvm.tile.reduce", "!suvm.tile<4x32xf32>"),
     )
-    assert_source_contains(src, ("!suvm.tile<16x32xf32>", "!suvm.tile<16x1xf32>"))
+    assert_source_contains(src, ("!suvm.tile<4x32xf32>", "!suvm.tile<4x1xf32>"))
 
 
 @pytest.mark.parametrize(
@@ -715,11 +715,11 @@ def test_reduce_row_major_covered_tail_identity_precedes_raw_suvm_reduce(tmp_pat
         mlir_filename=f"reduce_row_major_covered_tail_{reduce_op}_suvm.mlir",
         expected_tokens=("suvm.tile.select", f"suvm.tile.reduce {reduce_op}"),
     )
-    assert_source_contains(src, ("!suvm.tile<1024xbf16>", identity))
+    assert_source_contains(src, ("!suvm.tile<256xbf16>", identity))
     assert_source_contains(
         src,
         (
-            "!suvm.tile<1x1024xbf16>",
+            "!suvm.tile<1x256xbf16>",
             "!suvm.tile<1x1xbf16>",
             "suvm.tile.pick",
             "suvm.tile.set",

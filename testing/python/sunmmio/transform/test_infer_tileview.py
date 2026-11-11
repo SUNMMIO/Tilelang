@@ -169,7 +169,7 @@ def test_infer_tileview_2d_no_annotation():
 
 
 def test_infer_tileview_2d_with_layout_annotation():
-    """Blockwise 2D pointwise access should use one full ZZ block."""
+    """Blockwise 2D pointwise access should choose the densest h x 32 tile."""
     M, N = 256, 128
 
     @T.prim_func
@@ -204,12 +204,12 @@ def test_infer_tileview_2d_with_layout_annotation():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[32, 32], expected_execution_domain_axes=[0, 1])
+    assert_scope_plan(mod, expected_tile_size=[8, 32], expected_execution_domain_axes=[0, 1])
 
 
 @pytest.mark.parametrize("dtype", ["float16", "float32"])
-def test_infer_tileview_layout_bounded_zz_uses_full_inner_block(dtype):
-    """Execution TileView uses one full ZZ block regardless of dtype."""
+def test_infer_tileview_register_bounded_zz_uses_dtype_capacity(dtype):
+    """Execution TileView fits one 4096-bit register for each dtype."""
     M, N = 128, 128
 
     @T.prim_func
@@ -237,11 +237,11 @@ def test_infer_tileview_layout_bounded_zz_uses_full_inner_block(dtype):
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[32, 32], expected_execution_domain_axes=[0, 1])
+    assert_scope_plan(mod, expected_tile_size=[8 if dtype == "float16" else 4, 32], expected_execution_domain_axes=[0, 1])
 
 
-def test_infer_tileview_layout_bounded_rank1_uses_covered_extent_and_predicate():
-    """A padded row-major buffer tiles its covered extent and masks logical padding."""
+def test_infer_tileview_register_bounded_rank1_preserves_tail_predicate():
+    """A padded row-major buffer uses register-sized tiles and masks the tail."""
     N = 1000
 
     @T.prim_func
@@ -270,16 +270,16 @@ def test_infer_tileview_layout_bounded_rank1_uses_covered_extent_and_predicate()
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
 
-    assert_scope_plan(mod, expected_tile_size=[1024], expected_execution_domain_axes=[0])
+    assert_scope_plan(mod, expected_tile_size=[256], expected_execution_domain_axes=[0])
     stores = collect_stores(mod["main"], "B_shared")
     assert stores, "Expected lowered B_shared stores"
-    assert all(store.predicate is not None for store in stores)
-    assert all("< 1000" in str(store.predicate) or "<1000" in str(store.predicate) for store in stores)
-    assert not collect_if_conditions(mod["main"]), "Every lane scope is a partial tile"
+    assert any(store.predicate is not None for store in stores)
+    assert any("< 1000" in str(store.predicate) or "<1000" in str(store.predicate) for store in stores)
+    assert collect_if_conditions(mod["main"]), "Separate full tiles from the partial tail"
 
 
-def test_infer_tileview_layout_bounded_rowmajor_uses_full_2d_region():
-    """A dense aligned row-major execution region is one semantic tile."""
+def test_infer_tileview_register_bounded_rowmajor_splits_2d_region():
+    """A dense aligned row-major region is split at register capacity."""
     M, N = 8, 128
 
     @T.prim_func
@@ -307,11 +307,11 @@ def test_infer_tileview_layout_bounded_rowmajor_uses_full_2d_region():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[8, 128], expected_execution_domain_axes=[0, 1])
+    assert_scope_plan(mod, expected_tile_size=[2, 128], expected_execution_domain_axes=[0, 1])
 
 
-def test_infer_tileview_layout_bounded_rowmajor_uses_padded_2d_region():
-    """A 2D row-major TileView spans covered padding and masks logical width."""
+def test_infer_tileview_register_bounded_rowmajor_masks_padded_width():
+    """A register-sized row-major TileView masks the logical width."""
     M, N = 8, 128
 
     @T.prim_func
@@ -340,7 +340,7 @@ def test_infer_tileview_layout_bounded_rowmajor_uses_padded_2d_region():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
 
-    assert_scope_plan(mod, expected_tile_size=[8, 512], expected_execution_domain_axes=[0, 1])
+    assert_scope_plan(mod, expected_tile_size=[1, 256], expected_execution_domain_axes=[0, 1])
     stores = collect_stores(mod["main"], "B_shared")
     assert stores, "Expected lowered B_shared stores"
     assert all(store.predicate is not None for store in stores)
@@ -380,7 +380,7 @@ def test_infer_tileview_non_rowmajor_single_level_layout_stays_register_bounded(
 # Test 2: 1D T.Tiles without annotate_tileview
 # ---------------------------------------------------------
 def test_infer_tileview_1d_no_annotation():
-    """Layout-inferred 1D row-major buffers use the full covered extent."""
+    """1D row-major fp32 buffers should fill the 4096-bit register."""
     N = 1024
 
     @T.prim_func
@@ -403,7 +403,7 @@ def test_infer_tileview_1d_no_annotation():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[1024], expected_execution_domain_axes=[0])
+    assert_scope_plan(mod, expected_tile_size=[128], expected_execution_domain_axes=[0])
 
 
 def test_infer_rank1_tileview_from_2d_buffer_access():
@@ -462,8 +462,8 @@ def test_infer_rank1_tileview_from_2d_buffer_access_with_outer_loop_var():
 
 
 @pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
-def test_infer_complete_rank1_nondivisor_domain(dtype):
-    """Original rank-1 scopes may keep a complete non-divisor domain tile."""
+def test_nondivisor_rank1_uses_legacy_aligned_bridge(dtype):
+    """Non-divisor domains use the pre-395 single-carrier bridge search."""
     storage_width = 64
 
     @T.prim_func
@@ -483,7 +483,7 @@ def test_infer_complete_rank1_nondivisor_domain(dtype):
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
 
-    assert_scope_plan(mod, expected_tile_size=[14], expected_execution_domain_axes=[0])
+    assert_scope_plan(mod, expected_tile_size=[2], expected_execution_domain_axes=[0])
 
 
 def test_fp16_nondivisor_rank1_keeps_legacy_plan():
@@ -565,13 +565,13 @@ def test_rank2_domain_does_not_enable_nondivisor_side_bridge():
 @pytest.mark.parametrize(
     "dtype,expected_tile_size",
     [
-        ("float16", [32, 32]),
-        ("bfloat16", [4, 4]),
-        ("float32", [4, 4]),
+        ("float16", [8, 32]),
+        ("bfloat16", [8, 32]),
+        ("float32", [4, 32]),
     ],
 )
-def test_exact_small_2d_fallback_uses_domain_sized_carrier_plan(dtype, expected_tile_size):
-    """The motivating 4x4 domain avoids oversubscribing to the full ZZ block."""
+def test_small_2d_domain_keeps_register_bounded_plan(dtype, expected_tile_size):
+    """The legacy planner masks a register-sized tile for the 4x4 domain."""
     matrix_shape = (64, 64)
     vector_shape = (500,)
 
@@ -601,14 +601,14 @@ def test_exact_small_2d_fallback_uses_domain_sized_carrier_plan(dtype, expected_
 @pytest.mark.parametrize(
     "dtype,matrix_shape,expected_tile_size",
     [
-        ("float32", (64, 32), [4, 4]),
-        ("float32", (64, 64), [64, 64]),
-        ("float16", (64, 64), [64, 64]),
-        ("bfloat16", (64, 64), [4, 4]),
-        ("bfloat16", (64, 128), [64, 128]),
+        ("float32", (64, 32), [4, 32]),
+        ("float32", (64, 64), [2, 64]),
+        ("float16", (64, 64), [4, 64]),
+        ("bfloat16", (64, 64), [4, 64]),
+        ("bfloat16", (64, 128), [2, 128]),
     ],
 )
-def test_row_major_small_2d_fallback_requires_one_complete_carrier(dtype, matrix_shape, expected_tile_size):
+def test_row_major_small_2d_domain_uses_register_capacity(dtype, matrix_shape, expected_tile_size):
     @T.prim_func
     def main():
         with T.Kernel(1, threads=128):
@@ -628,7 +628,7 @@ def test_row_major_small_2d_fallback_requires_one_complete_carrier(dtype, matrix
     assert_scope_plan(mod, expected_tile_size=expected_tile_size, expected_execution_domain_axes=[0, 1])
 
 
-def test_small_2d_fallback_does_not_override_manual_tileview():
+def test_small_2d_domain_rejects_oversized_manual_tileview():
     from tilelang.tileview import make_tileview
 
     shape = (64, 64)
@@ -647,10 +647,8 @@ def test_small_2d_fallback_does_not_override_manual_tileview():
 
     mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    with tvm.target.Target(target):
-        mod = apply_sunmmio_passes(mod, target)
-
-    assert_scope_plan(mod, expected_tile_size=[32, 32], expected_execution_domain_axes=[0, 1])
+    with tvm.target.Target(target), pytest.raises(tvm.error.InternalError, match="register capacity"):
+        apply_sunmmio_passes(mod, target)
 
 
 def test_dynamic_domain_does_not_select_static_small_2d_plan():
@@ -672,15 +670,15 @@ def test_dynamic_domain_does_not_select_static_small_2d_plan():
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
 
-    assert_scope_plan(mod, expected_tile_size=[32, 32], expected_execution_domain_axes=[0, 1])
+    assert_scope_plan(mod, expected_tile_size=[4, 32], expected_execution_domain_axes=[0, 1])
 
 
 @pytest.mark.parametrize(
     ("dtype", "expected_tile_size"),
     [
-        ("float32", [32, 32]),
-        ("float16", [32, 32]),
-        ("bfloat16", [32, 32]),
+        ("float32", [4, 32]),
+        ("float16", [8, 32]),
+        ("bfloat16", [8, 32]),
     ],
 )
 def test_infer_tileview_mixed_rank_load(dtype, expected_tile_size):
@@ -688,9 +686,9 @@ def test_infer_tileview_mixed_rank_load(dtype, expected_tile_size):
 
     B_shared is 1D and tiled along the height axis. Strict TileView search
     rejects tile width 1 because 64-byte RSRAM alignment requires multiple
-    elements, then the fallback search allows the side load. The side load does
-    not cap the execution TileView; its register-bounded carrier repair remains
-    deferred to Sunmmio codegen.
+    elements, then the fallback search allows the side load. The eventual
+    hardware unaligned load repair is deferred to Sunmmio codegen so mid-level
+    analysis can still see a normal BufferLoad.
     """
     M, N = 128, 64
 
@@ -724,9 +722,9 @@ def test_infer_tileview_mixed_rank_load(dtype, expected_tile_size):
 @pytest.mark.parametrize(
     ("dtype", "expected_tile_size"),
     [
-        ("float32", [32, 32]),
-        ("float16", [32, 32]),
-        ("bfloat16", [32, 32]),
+        ("float32", [4, 32]),
+        ("float16", [8, 32]),
+        ("bfloat16", [8, 32]),
     ],
 )
 def test_infer_tileview_mixed_rank_load_inside_exp2(dtype, expected_tile_size):
@@ -1116,7 +1114,7 @@ def test_infer_tileview_swapped_domain_binding():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[32, 32], expected_execution_domain_axes=[1, 0])
+    assert_scope_plan(mod, expected_tile_size=[8, 32], expected_execution_domain_axes=[1, 0])
 
 
 # ---------------------------------------------------------
@@ -1125,7 +1123,7 @@ def test_infer_tileview_swapped_domain_binding():
 def test_manual_annotation_overrides_inference():
     """When T.annotate_tileview is provided, it overrides inference.
 
-    Without annotation, blockwise inference would produce tile_size=(32, 32).
+    Without annotation, blockwise inference would produce tile_size=(8, 32).
     With annotation specifying a smaller but legal blockwise tile, we should
     preserve that override.
     """
@@ -1170,8 +1168,8 @@ def test_manual_annotation_overrides_inference():
     assert_scope_plan(mod, expected_tile_size=[4, 32], expected_execution_domain_axes=[0, 1])
 
 
-def test_manual_layout_bounded_zz_accepts_full_inner_block():
-    """A manual execution TileView may use one full ZZ block."""
+def test_manual_zz_rejects_tile_exceeding_register_capacity():
+    """A manual ZZ TileView must fit one register."""
     from tilelang.tileview import make_tileview
 
     M, N = 128, 128
@@ -1205,13 +1203,12 @@ def test_manual_layout_bounded_zz_accepts_full_inner_block():
 
     mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    with tvm.target.Target(target):
-        mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[32, 32], expected_execution_domain_axes=[0, 1])
+    with tvm.target.Target(target), pytest.raises(tvm.error.InternalError, match="register capacity"):
+        apply_sunmmio_passes(mod, target)
 
 
-def test_manual_layout_bounded_rowmajor_accepts_covered_shape():
-    """A manual execution TileView may use the padded row-major envelope."""
+def test_manual_rowmajor_rejects_tile_exceeding_register_capacity():
+    """A manual row-major TileView must fit one register."""
     from tilelang.tileview import make_tileview
 
     M, N = 8, 128
@@ -1235,9 +1232,8 @@ def test_manual_layout_bounded_rowmajor_accepts_covered_shape():
 
     mod = IRModule.from_expr(main.with_attr("global_symbol", "main"))
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
-    with tvm.target.Target(target):
-        mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[8, 512], expected_execution_domain_axes=[0, 1])
+    with tvm.target.Target(target), pytest.raises(tvm.error.InternalError, match="register capacity"):
+        apply_sunmmio_passes(mod, target)
 
 
 def test_manual_layout_bounded_rowmajor_rejects_shape_beyond_covered_shape():
@@ -1269,7 +1265,7 @@ def test_manual_layout_bounded_rowmajor_rejects_shape_beyond_covered_shape():
         tvm.target.Target(target),
         pytest.raises(
             tvm.error.InternalError,
-            match="outside the layout-bounded execution envelope",
+            match="register capacity",
         ),
     ):
         apply_sunmmio_passes(mod, target)
@@ -1357,7 +1353,7 @@ def test_infer_tileview_2d_rowmajor_fp32():
 
 
 def test_infer_tileview_2d_blockwise_fp32():
-    """Blockwise fp32 buffers should use one full ZZ block."""
+    """Blockwise fp32 buffers should use the densest legal h x 32 tile."""
     M, N = 256, 128
 
     @T.prim_func
@@ -1391,7 +1387,7 @@ def test_infer_tileview_2d_blockwise_fp32():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[32, 32], expected_execution_domain_axes=[0, 1])
+    assert_scope_plan(mod, expected_tile_size=[4, 32], expected_execution_domain_axes=[0, 1])
 
 
 def test_infer_tileview_blockwise_small_height():
@@ -1429,12 +1425,12 @@ def test_infer_tileview_blockwise_small_height():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[32, 32], expected_execution_domain_axes=[0, 1])
+    assert_scope_plan(mod, expected_tile_size=[8, 32], expected_execution_domain_axes=[0, 1])
 
     stores = collect_stores(mod["main"], "C_shared")
     assert stores, "Expected lowered C_shared stores"
     assert all(store.predicate is not None for store in stores)
-    assert any("* 32" in str(store.indices[0]) or "*32" in str(store.indices[0]) for store in stores)
+    assert any("* 8" in str(store.indices[0]) or "*8" in str(store.indices[0]) for store in stores)
     assert all("< 4" in str(store.predicate) or "<4" in str(store.predicate) for store in stores)
     assert all("< 128" not in str(store.predicate) and "<128" not in str(store.predicate) for store in stores)
     assert not collect_if_conditions(mod["main"]), "Expected no full/tail branch when every tile is partial"
@@ -1520,7 +1516,7 @@ def test_infer_tileview_rowmajor_region_width_offset():
 
 
 def test_infer_tileview_blockwise_region_height_and_width_offset():
-    """A half-block row offset selects the largest aligned block factor."""
+    """Aligned blockwise regions should keep the densest h x 32 tile."""
     src_M, src_N = 64, 64
     dst_M, dst_N = 32, 32
 
@@ -1551,7 +1547,7 @@ def test_infer_tileview_blockwise_region_height_and_width_offset():
     target = tvm.target.Target(SUNMMIO_TARGET_DESC)
     with tvm.target.Target(target):
         mod = apply_sunmmio_passes(mod, target)
-    assert_scope_plan(mod, expected_tile_size=[16, 32], expected_execution_domain_axes=[0, 1])
+    assert_scope_plan(mod, expected_tile_size=[8, 32], expected_execution_domain_axes=[0, 1])
 
 
 def test_infer_tileview_blockwise_region_misaligned_width_offset_falls_back():

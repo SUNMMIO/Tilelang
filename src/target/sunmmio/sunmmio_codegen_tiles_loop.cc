@@ -4182,7 +4182,10 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
               CanonicalizeSuvmDType(load->buffer->dtype).with_lanes(1));
         }
       }
-      if (access.tile_rank == 1 && scope.tile_shape.size() == 2) {
+      // A unit-width legacy bridge returns a scalar TilePick result. Binary
+      // operations broadcast it directly; only tile values need orientation.
+      if (access.tile_rank == 1 && scope.tile_shape.size() == 2 &&
+          IsTileLike(tile)) {
         std::vector<int64_t> unit_shape =
             access.unsqueeze_axis == 1
                 ? std::vector<int64_t>{access.tile_shape[0], 1}

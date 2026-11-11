@@ -24,6 +24,8 @@ def test_mixed_precision_tiles_preserve_multiply_and_cast_dtypes(tmp_path, a_dty
     product_dtype = "bf16" if a_dtype == b_dtype == "bfloat16" else "f32"
     output_dtype = "bf16" if out_dtype == "bfloat16" else "f32"
     (multiply,) = [line for line in src.splitlines() if "suvm.tile.mulf" in line]
-    assert multiply.strip().endswith(f"-> !suvm.tile<32x32x{product_dtype}>")
+    assert multiply.strip().endswith(f"-> !suvm.tile<4x32x{product_dtype}>")
     (store,) = [line for line in src.splitlines() if "suvm.tile.store" in line]
-    assert f"!suvm.tile<32x32x{output_dtype}>" in store
+    # BF16 output uses an 8x32 read/modify/write carrier for the 4x32 result.
+    store_height = 8 if out_dtype == "bfloat16" else 4
+    assert f"!suvm.tile<{store_height}x32x{output_dtype}>" in store
