@@ -310,7 +310,7 @@ private:
     ConstrSet cset{constr_stack_};
     ffi::Map<Var, PrimExpr> subs = MakeIterationSubstitution();
     // Preserve Bind information for the second execution. Turning all bindings
-    // into generic equalities loses substitutions in the non-Z3 analyzer.
+    // into generic equalities loses substitutions in the ordinary analyzer.
     for (const auto &constr : constr_stack_) {
       if (constr.kind != Constr::kConstr && subs.count(constr.var)) {
         Var other_var = Downcast<Var>(subs.at(constr.var));
@@ -357,7 +357,7 @@ private:
                  tir::And(first_predicate, second_predicate));
     PrimExpr other_value = tir::Substitute(op->value, subs);
 
-    // Use ordinary simplification first, with Z3 as an optional fallback.
+    // Use ordinary simplification first, then fall back to Z3.
     if (!guard_analyzer.CanProve(tir::Not(conflict_guard)) &&
         !HasInjectiveDestination(op, &guard_analyzer)) {
       arith::Analyzer equal_analyzer;
