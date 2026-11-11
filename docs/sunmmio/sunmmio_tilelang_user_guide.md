@@ -1116,6 +1116,18 @@ buffer holding that row (including any layout padding), plus separate values and
 int32 indices buffers with room for 2,048 selections. Distributed or streamed
 selection requires a subsequent merge and conversion to global indices.
 
+Device library views preserve the explicitly requested extents. ZZ regions
+must contain whole hardware blocks (32x32 on A4E): a GEMM result with a logical
+shape of `(16, 512)` is rejected even if its allocation covers 32 rows. Using
+an explicit `(32, 512)` region also requires outputs for all 32 rows and valid
+candidates in every processed row. Row-major topk column counts must explicitly
+be vector aligned; allocation padding does not enlarge the requested region.
+
+Region starts must be multiples of their extents so partitioned views address
+them exactly. For example, `x[2:4, :]` is supported for a two-row region, while
+`x[1:3, :]` is rejected rather than silently reading rows 0 and 1. This applies
+to input and output regions of all five operations.
+
 The four unary operations require equal input/output region shapes and matching
 row-major or ZZ layouts. Exact in-place use is supported; partial overlap is
 not. BF16 callers must explicitly convert to FP32. `refined` names the additional

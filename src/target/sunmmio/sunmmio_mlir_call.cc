@@ -541,6 +541,20 @@ SunMMIOValue SunmmioMlirCall::Call(const std::string &result_name,
     ctx_.CompletePendingSyncUnits(units_mask);
     return SunMMIOValue{ret_dtype, result_name, ret_type};
   } else if (callee.rfind("tl.device_lib.", 0) == 0) {
+    // Check the actual emitted view shapes, after layout/rank adaptation.
+    // topk's implementation loops over input rows and ignores output rows.
+    auto input_type = mlir::cast<mlir::suvm::TileViewType>(
+        ctx_.LookupMLIRValue(operands[0].value).getType());
+    bool topk = callee == "tl.device_lib.topk";
+    for (size_t i = 1; i < (topk ? 3U : 2U); ++i) {
+      auto output_type = mlir::cast<mlir::suvm::TileViewType>(
+          ctx_.LookupMLIRValue(operands[i].value).getType());
+      ICHECK_EQ(input_type.getShape()[0], output_type.getShape()[0])
+          << "Device library input/output view row counts must match";
+      if (!topk)
+        ICHECK(input_type.getShape() == output_type.getShape())
+            << "Device library unary input/output view shapes must match";
+    }
     mlir::OperationState state(type.MakeDebugLoc("device_lib"),
                                "suvm.device_lib." + callee.substr(14));
     for (const auto &operand : operands)

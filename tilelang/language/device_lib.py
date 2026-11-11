@@ -32,10 +32,13 @@ def topk(input: BufferLikeType, values: BufferLikeType, indices: BufferLikeType,
     input region. Equal values select the smaller column first. All operands
     are rank-two RSRAM regions with equal row counts and non-overlapping
     storage. Input may be ZZ or row-major; outputs are dense row-major.
+    ZZ regions must contain whole hardware blocks (32x32 on A4E). Region
+    starts must be multiples of their extents; unsupported slices are rejected.
+    Views retain the requested extents rather than including layout padding.
 
     Selected input elements become -inf. Padding must contain -inf, and each
     row must have at least k elements greater than -inf. Output widths must
-    hold k elements and satisfy vector alignment; unused values/indices are
+    hold k elements and have vector-aligned explicit widths; unused values/indices are
     filled with -inf/-1. This is a local operation, with no cross-core merge.
     """
     return _device_lib(
@@ -58,6 +61,8 @@ def exp_refined(input: BufferLikeType, output: BufferLikeType):
     layouts. Exact in-place operation is allowed; partial overlap is not.
     Results are approximate, not correctly rounded; subnormals may flush early.
     The vector PWL coefficient tables must have their default contents.
+    ZZ regions require whole hardware blocks. Region starts must be multiples
+    of their extents; implicit padding and rounded-down slice starts are not used.
     """
     return _unary("exp_fast", input, output)
 

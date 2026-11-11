@@ -1,5 +1,7 @@
 """Device library lowering, layout and synchronization regression coverage."""
 
+import re
+
 import pytest
 import tilelang.language as T
 from tilelang.layout import make_aligned_row_major, make_zz_layout
@@ -27,7 +29,7 @@ def topk_kernel(rows=1, cols=512, dtype="float32", zz=False, dynamic=False, sele
             x = T.alloc_shared(shape, dtype, scope="shared.rsram")
             values = T.alloc_shared(output_shape, dtype, scope="shared.rsram")
             indices = T.alloc_shared(output_shape, "int32", scope="shared.rsram")
-            for _iteration in T.Pipelined(2 if stages else 1, num_stages=stages):
+            for _iteration in T.Pipelined(4 if stages else 1, num_stages=stages):
                 T.copy(A, x)
                 T.topk(x, values, indices, k if dynamic else selection_k)
                 T.copy(values, V)
@@ -37,7 +39,7 @@ def topk_kernel(rows=1, cols=512, dtype="float32", zz=False, dynamic=False, sele
 
 
 @target("sunmmio")
-def unary_kernel(name="exp_refined", rows=1, inplace=False, zz=False, dtype="float32"):
+def unary_kernel(name="exp_refined", rows=1, inplace=False, zz=False, dtype="float32", stages=0):
     shape = (rows, 512)
     placement = T.placement.replicated()
     layout = make_zz_layout(shape) if zz else make_aligned_row_major(shape, dtype, align_bytes=1024)
@@ -47,12 +49,9 @@ def unary_kernel(name="exp_refined", rows=1, inplace=False, zz=False, dtype="flo
     def main(A: T.MeshTensor(shape, placement, dtype, layout=layout), B: T.MeshTensor(shape, placement, dtype, layout=layout)):
         with T.Kernel():
             x = T.alloc_shared(shape, dtype, scope="shared.rsram")
-            T.copy(A, x)
-            if inplace:
-                operation(x, x)
-                T.copy(x, B)
-            else:
-                y = T.alloc_shared(shape, dtype, scope="shared.rsram")
+            y = x if inplace else T.alloc_shared(shape, dtype, scope="shared.rsram")
+            for _iteration in T.Pipelined(4 if stages else 1, num_stages=stages):
+                T.copy(A, x)
                 operation(x, y)
                 T.copy(y, B)
 
@@ -101,13 +100,36 @@ def test_topk_invalid_contract(tmp_path, dtype, k, message):
         validate_sunmmio_codegen_with_npuir_opt(topk_kernel(dtype=dtype, selection_k=k), tmp_path)
 
 
-def test_topk_pipeline(tmp_path):
-    validate_sunmmio_codegen_with_npuir_opt(
-        topk_kernel(stages=2),
+@pytest.mark.parametrize("operation", ["topk", "exp_refined", "inplace"])
+def test_device_lib_pipeline(tmp_path, operation):
+    kernel = topk_kernel(stages=2) if operation == "topk" else unary_kernel(stages=2, inplace=operation == "inplace")
+    op = "suvm.device_lib.topk" if operation == "topk" else "suvm.device_lib.exp_fast"
+    source = validate_sunmmio_codegen_with_npuir_opt(
+        kernel,
         tmp_path,
-        expected_tokens=("suvm.device_lib.topk", "suvm.sync"),
+        expected_tokens=(op, "suvm.sync"),
         opt_args=("--verify-each", "--suvm-device-validate"),
     )
+    # Resolve copy destinations to their global parameters. No output may be
+    # copied before the first producer, including the pipeline prologue.
+    views = dict(re.findall(r"(%[\w]+) = suvm.get_partitioned_tile_view (%[\w]+)", source))
+    produced = 0
+    consumed = {"%arg1": 0, "%arg2": 0} if operation == "topk" else {"%arg1": 0}
+    for line in source.splitlines():
+        if op in line:
+            produced += 1
+        copy = re.search(r"suvm.copy_async (%[\w]+), (%[\w]+)", line)
+        if copy and views.get(copy[2]) in consumed:
+            output = views[copy[2]]
+            consumed[output] += 1
+            assert consumed[output] <= produced, "pipeline consumes a result before its producer"
+    assert produced > 0
+    assert all(count == produced for count in consumed.values())
+
+
+def test_topk_rejects_unaligned_output_width(tmp_path):
+    with pytest.raises(Exception, match="T.topk row-major region width must be vector aligned"):
+        validate_sunmmio_codegen_with_npuir_opt(topk_kernel(output_cols=129), tmp_path)
 
 
 def test_decode_topk_64000_to_2048(tmp_path):
@@ -176,7 +198,7 @@ def test_device_lib_sync_effects(read_modified_input):
 
 
 @target("sunmmio")
-def unary_region_kernel():
+def unary_region_kernel(start=2):
     placement = T.placement.replicated()
     input_layout = make_aligned_row_major((4, 512), "float32", align_bytes=1024)
     output_layout = make_aligned_row_major((2, 512), "float32", align_bytes=1024)
@@ -190,19 +212,73 @@ def unary_region_kernel():
             x = T.alloc_shared((4, 512), "float32", scope="shared.rsram")
             y = T.alloc_shared((2, 512), "float32", scope="shared.rsram")
             T.copy(A, x)
-            T.exp_refined(x[1:3, :], y)
+            T.exp_refined(x[start : start + 2, :], y)
             T.copy(y, B)
 
     return main
 
 
 def test_unary_region_with_different_parent_shapes(tmp_path):
-    validate_sunmmio_codegen_with_npuir_opt(
+    source = validate_sunmmio_codegen_with_npuir_opt(
         unary_region_kernel(),
         tmp_path,
         expected_tokens=("suvm.device_lib.exp_fast",),
         opt_args=("--verify-each", "--suvm-device-validate"),
     )
+
+    # Canonicalize only to expose the constant partition index. It must select
+    # rows 2:4 (partition 1 of height 2), not rows 0:2.
+    from testing.python.sunmmio.common.codegen_validation import simplify_suvm_mlir
+
+    source = simplify_suvm_mlir(source)
+    input_view = re.search(r"suvm.device_lib.exp_fast (%[\w]+),", source)[1]
+    view = next(line for line in source.splitlines() if f"{input_view} = suvm.get_partitioned_tile_view" in line)
+    row_index = re.search(r"indices = \[(%[\w]+),", view)[1]
+    assert re.search(rf"{re.escape(row_index)} = arith.constant 1 : index", source)
+    assert "-> !suvm.tile_view<2x512xf32>" in view
+
+
+def test_unaligned_region_offset_is_rejected(tmp_path):
+    with pytest.raises(Exception, match="Device library region offset must be a multiple of its extent"):
+        validate_sunmmio_codegen_with_npuir_opt(unary_region_kernel(start=1), tmp_path)
+
+
+@target("sunmmio")
+def gemm_topk_kernel(rows=16):
+    placement = T.placement.replicated()
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((rows, 128), placement, "bfloat16", layout=make_zz_layout((rows, 128))),
+        B: T.MeshTensor((128, 512), placement, "bfloat16", layout=make_zz_layout((128, 512))),
+        V: T.MeshTensor((rows, 512), placement, "float32", layout=make_aligned_row_major((rows, 512), "float32", align_bytes=1024)),
+        I: T.MeshTensor((rows, 512), placement, "int32", layout=make_aligned_row_major((rows, 512), "int32", align_bytes=1024)),
+    ):
+        with T.Kernel():
+            a = T.alloc_shared((rows, 128), "bfloat16")
+            b = T.alloc_shared((128, 512), "bfloat16")
+            scores = T.alloc_shared((rows, 512), "float32", scope="shared.rsram")
+            values = T.alloc_shared((rows, 512), "float32", scope="shared.rsram")
+            indices = T.alloc_shared((rows, 512), "int32", scope="shared.rsram")
+            T.copy(A, a)
+            T.copy(B, b)
+            T.gemm(a, b, scores, clear_accum=True)
+            T.topk(scores, values, indices, 8)
+            T.copy(values, V)
+            T.copy(indices, I)
+
+    return main
+
+
+def test_gemm_topk_rejects_partial_zz_block(tmp_path):
+    with pytest.raises(Exception, match="tile must be whole 32x32 blocks"):
+        validate_sunmmio_codegen_with_npuir_opt(gemm_topk_kernel(16), tmp_path)
+
+
+def test_gemm_topk_physical_row_counts(tmp_path):
+    source = validate_sunmmio_codegen_with_npuir_opt(gemm_topk_kernel(32), tmp_path)
+    call = next(line for line in source.splitlines() if "suvm.device_lib.topk" in line)
+    assert re.findall(r"!suvm.tile_view<(\d+)x512x(?:f32|i32)>", call) == ["32", "32", "32"]
 
 
 def test_topk_tir_script_roundtrip():
