@@ -27,6 +27,50 @@ using namespace dist_transform;
 
 namespace {
 
+// Temporary admission boundary for the structured SunMMIO backend. Keep
+// this independent of collective detection and the downstream exit analyses.
+class SunmmioExplicitJumpValidator : public StmtExprVisitor {
+public:
+  static void Check(const PrimFunc &func) {
+    auto target = func->GetAttr<Target>(tvm::attr::kTarget);
+    if (target && TargetIsSunmmio(target.value())) {
+      SunmmioExplicitJumpValidator()(func->body);
+    }
+  }
+
+private:
+  void VisitStmt_(const BlockNode *op) final {
+    bool previous = in_kernel_;
+    if (auto marker = op->annotations.Get("tilelang.is_sunmmio_kernel_frame")) {
+      in_kernel_ |= is_one(Downcast<PrimExpr>(marker.value()));
+    }
+    StmtExprVisitor::VisitStmt_(op);
+    in_kernel_ = previous;
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    bool previous = in_kernel_;
+    if (op->attr_key == tir::attr::thread_extent) {
+      const auto *thread = op->node.as<IterVarNode>();
+      in_kernel_ |= thread && thread->thread_tag == "blockIdx.x";
+    }
+    StmtExprVisitor::VisitStmt_(op);
+    in_kernel_ = previous;
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    ICHECK(!in_kernel_ || (!op->op.same_as(builtin::ret()) &&
+                           !op->op.same_as(builtin::break_loop()) &&
+                           !op->op.same_as(builtin::continue_loop())))
+        << "SunMMIO device kernel explicit return/break/continue is not "
+           "supported yet: "
+        << op->op;
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  bool in_kernel_{false};
+};
+
 class DistCollectiveDetector : public StmtExprVisitor {
 public:
   bool Detect(const Stmt &stmt) {
@@ -761,6 +805,18 @@ private:
   }
 
   bool ValidateAlltoallv(const DistAlltoallvOpNode *op) const {
+    // Collective expansion precedes SRAM inference. Ordinary shared buffers
+    // are resolved by that pass; explicitly unsupported spaces fail here.
+    auto validate_counts_scope = [](const Buffer &buffer, const char *operand) {
+      const auto scope = buffer.scope();
+      ICHECK(scope == kSunmmioScopeRSRAM || scope == "shared" ||
+             scope == "shared.dyn")
+          << "T.dist.all_to_allv " << operand << " must use shared.rsram, got "
+          << scope
+          << "; use T.copy to move the array to RSRAM before passing it";
+    };
+    validate_counts_scope(op->send_counts, "send_counts");
+    validate_counts_scope(op->recv_counts, "recv_counts");
     ICHECK(op->src->dtype == op->dst->dtype)
         << "T.dist.all_to_allv source and destination dtypes must match";
     ICHECK(!op->src->data.same_as(op->dst->data))
@@ -1316,6 +1372,7 @@ private:
 };
 
 PrimFunc Run(PrimFunc func) {
+  SunmmioExplicitJumpValidator::Check(func);
   if (!DistCollectiveDetector().Detect(func->body)) {
     return func;
   }

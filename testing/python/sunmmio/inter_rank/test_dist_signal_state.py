@@ -9,11 +9,13 @@ import tilelang.language as T
 from tilelang import tvm
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import (
+    base_mod,
     collect_calls,
     collect_nodes,
     collect_op_names,
     signal_counts,
     single_prim_func,
+    strip_casts,
 )
 
 
@@ -200,7 +202,7 @@ def _collect_leaf_signals(func, op_name, kind_index_positions, expected_position
             return
         if node.op.name != op_name:
             return
-        expected = node.args[expected_position]
+        expected = strip_casts(node.args[expected_position])
         if isinstance(expected, tvm.tir.BufferLoad):
             state_name = expected.buffer.name
         else:
@@ -234,11 +236,11 @@ def _collect_generation_advances(func):
 def test_explicit_memory_signal_reaches_stable_leaf_tir():
     func = explicit_memory_signal_kernel_factory.get_tir(world_size=4)
     device_func = single_prim_func(lower_to_device_tir(func).device_mod)
-    script = device_func.script()
-
-    assert "T.dist_put_(" in script
-    assert ', "sram_memory", 0, signal_generation_1[0])' in script
-    assert 'T.dist_wait_signal_("sram_memory", 0, signal_expect_1[0]' in script
+    put = collect_calls(device_func, "tl.dist_put_")[0]
+    wait = collect_calls(device_func, "tl.dist_wait_signal_")[0]
+    assert put.args[3].value == wait.args[0].value == "sram_memory"
+    assert put.args[5].dtype == wait.args[2].dtype == "uint64"
+    assert strip_casts(put.args[5]).buffer.dtype == strip_casts(wait.args[2]).buffer.dtype == "uint32"
 
 
 @pytest.mark.parametrize("signal_kind", [T.dist.SignalKind.SRAM_FLAGREG_VALUE, T.dist.SignalKind.SRAM_MEMORY])
@@ -254,15 +256,15 @@ def test_signal_generation_is_reused_across_serial_loop(signal_kind, expect_mode
     assert op_names.count("tl.dist_wait_signal_") == 1
     assert op_names.count("tl.dist_wait_send") == 2
     assert "for _step in range(2):" in script
-    state_dtype = "uint64" if signal_kind.value.endswith("memory") else "uint8"
+    state_dtype = "uint32" if signal_kind.value.endswith("memory") else "uint8"
     assert f"signal_expect_1[0] = signal_expect_1[0] + T.{state_dtype}(1)" in script
     assert f"signal_generation_1[0] = signal_generation_1[0] + T.{state_dtype}(1)" in script
-    generation = collect_calls(device_func, "tl.dist_put_")[0].args[5]
+    generation = strip_casts(collect_calls(device_func, "tl.dist_put_")[0].args[5])
     assert isinstance(generation, tvm.tir.BufferLoad)
     assert tuple(int(extent) for extent in generation.buffer.shape) == (1,)
     assert int(generation.indices[0]) == 0
     assert collect_calls(device_func, "tl.dist_wait_signal_")[0].args[0].value == signal_kind.value
-    initial, expected = (2**32 - 1, 2**32) if state_dtype == "uint64" else (255, 0)
+    initial, expected = (2**32 - 2, 2**32 - 1) if state_dtype == "uint32" else (254, 255)
     receiver_state = collect_calls(device_func, "tl.dist_wait_signal_")[0].args[2]
     for state in (generation, receiver_state):
         assert _evaluate_state_update(device_func, state, initial) == expected
@@ -371,6 +373,9 @@ def test_value_and_memory_signals_use_generation_per_destination(signal_kind):
     def visit(node):
         if isinstance(node, tvm.tir.Call) and isinstance(node.op, tvm.ir.Op) and node.op.name == "tl.dist_put_":
             generation = node.args[5]
+            if isinstance(generation, tvm.tir.Cast):
+                assert generation.dtype == ("uint64" if signal_kind.value.endswith("memory") else "uint8")
+                generation = generation.value
             assert isinstance(generation, tvm.tir.BufferLoad)
             generation_indices.append(int(generation.indices[0]))
 
@@ -398,6 +403,9 @@ def test_loop_destinations_keep_independent_signal_generations(signal_kind, expe
         assert len(puts) == 1  # The payload peer loop remains a loop.
         put = puts[0]
         generation = put.args[5]
+        if isinstance(generation, tvm.tir.Cast):
+            assert generation.dtype == ("uint64" if signal_kind.value.endswith("memory") else "uint8")
+            generation = generation.value
         assert isinstance(generation, tvm.tir.BufferLoad)
         assert tuple(int(extent) for extent in generation.buffer.shape) == (world_size,)
         assert analyzer.can_prove_equal(generation.indices[0], put.args[2])
@@ -413,6 +421,7 @@ def test_loop_destinations_keep_independent_signal_generations(signal_kind, expe
 
 def _evaluate_state_update(mod, state, initial, bindings=None):
     """Evaluate the actual pass-generated state update at a numeric boundary."""
+    state = strip_casts(state)
     stores = collect_nodes(
         mod,
         tvm.tir.BufferStore,
@@ -423,15 +432,9 @@ def _evaluate_state_update(mod, state, initial, bindings=None):
     def evaluate_constants(node):
         if isinstance(node, tvm.tir.BufferLoad) and node.buffer.data.same_as(state.buffer.data):
             return tvm.tir.IntImm(node.dtype, initial)
-        if (
-            isinstance(node, tvm.tir.Call)
-            and node.op.same_as(tvm.ir.Op.get("tir.bitwise_and"))
-            and all(isinstance(arg, tvm.tir.IntImm) for arg in node.args)
-        ):
-            return tvm.tir.IntImm(node.dtype, int(node.args[0]) & int(node.args[1]))
 
     value = tvm.tir.stmt_functor.substitute(stores[0].value, bindings or {})
-    statement = tvm.tir.stmt_functor.ir_transform(tvm.tir.Evaluate(value), None, evaluate_constants, ["tir.BufferLoad", "tir.Call"])
+    statement = tvm.tir.stmt_functor.ir_transform(tvm.tir.Evaluate(value), None, evaluate_constants, ["tir.BufferLoad"])
     return int(tvm.arith.Analyzer().simplify(statement.value))
 
 
@@ -442,7 +445,7 @@ def test_signal_only_state_uses_suvm_width_and_preserves_boundary_increment(sign
     wait = collect_calls(result.device_mod, "tl.dist_wait_signal_")[0]
     state_dtype = "uint64" if signal_kind.value.endswith("memory") else "uint8"
     assert put.args[3].dtype == wait.args[2].dtype == state_dtype
-    initial, expected = (2**32 - 1, 2**32) if state_dtype == "uint64" else (255, 0)
+    initial, expected = (2**32 - 2, 2**32 - 1) if state_dtype == "uint64" else (254, 255)
     assert _evaluate_state_update(result.device_mod, wait.args[2], initial) == expected
     if signal_kind.value.endswith("inc"):
         assert isinstance(put.args[3], tvm.tir.IntImm) and int(put.args[3]) == 0
@@ -453,25 +456,27 @@ def test_signal_only_state_uses_suvm_width_and_preserves_boundary_increment(sign
 
 @pytest.mark.parametrize("signal_kind", list(T.dist.SignalKind))
 def test_manual_delta_uses_signal_width_without_truncating_memory_state(signal_kind):
+    memory_kind = signal_kind.value.endswith("memory")
+    if not memory_kind:
+        with pytest.raises(tvm.error.InternalError, match="cumulative expected"):
+            lower_to_device_tir(manual_delta_dtype_kernel_factory.get_tir(signal_kind=signal_kind, world_size=2))
+        return
     result = lower_to_device_tir(manual_delta_dtype_kernel_factory.get_tir(signal_kind=signal_kind, world_size=2))
     device = single_prim_func(result.device_mod)
     state = collect_calls(device, "tl.dist_wait_signal_")[0].args[2]
     delta = next(param for param in device.params if param.name == "delta")
-    state_dtype = "uint64" if signal_kind.value.endswith("memory") else "uint8"
-    assert state.dtype == state_dtype
-    cases = [(255, 1), (250, 10), (9, 256), (9, 0), (2**32 - 1, 2**32 - 1)]
-    modulus = 2**64 if state_dtype == "uint64" else 256
-    for initial, increment in cases:
-        initial %= modulus
-        assert (
-            _evaluate_state_update(device, state, initial, {delta: tvm.tir.IntImm("uint32", increment)}) == (initial + increment) % modulus
-        )
+    assert state.dtype == "uint64"
+    for increment in (0, 255, 256, 2**32 - 1):
+        assert _evaluate_state_update(device, state, 0, {delta: tvm.tir.IntImm("uint32", increment)}) == increment
 
 
 @pytest.mark.parametrize("signal_kind", list(T.dist.SignalKind))
 @pytest.mark.parametrize("increment", [256, 257])
 def test_constant_manual_delta_reaches_device_tir(signal_kind, increment):
-    # Arithmetic coverage only, not a proof of a hardware wait's safe window.
+    if not signal_kind.value.endswith("memory"):
+        with pytest.raises(tvm.error.InternalError, match="cumulative expected"):
+            lower_to_device_tir(manual_delta_dtype_kernel_factory.get_tir(signal_kind=signal_kind, fixed_delta=increment, world_size=2))
+        return
     result = lower_to_device_tir(
         manual_delta_dtype_kernel_factory.get_tir(signal_kind=signal_kind, fixed_delta=increment, world_size=2),
         capture_passes="tl.LowerDistSync",
@@ -482,3 +487,277 @@ def test_constant_manual_delta_reaches_device_tir(signal_kind, increment):
     lowered = result.pass_snapshot("tl.LowerDistSync").mod
     state = collect_calls(lowered, "tl.dist_wait_signal_")[0].args[2]
     assert _evaluate_state_update(lowered, state, 0) == (increment if state_dtype == "uint64" else increment % 256)
+
+
+@tilelang.jit(target="sunmmio")
+def expected_range_kernel_factory(kind, delta=1, rounds=1, group=False, world_size: int = 1):
+    delta_expr = tvm.tir.const(delta, "uint64" if delta >= 0 else "int64")
+
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            if group:
+                signals = T.dist.signals(2, kind=kind, expect="manual")
+            else:
+                signal = T.dist.signal(kind=kind, expect="manual")
+            for _ in T.serial(rounds):
+                T.dist.wait_signal(signals[0] if group else signal, expected_delta=delta_expr)
+            if group:
+                T.dist.wait_signal(signals[1], expected_delta=delta_expr)
+            T.dist.submit()
+            T.dist.wait_signal(signals[0] if group else signal, expected_delta=0)
+
+    return main
+
+
+@pytest.mark.parametrize("kind", list(T.dist.SignalKind))
+@pytest.mark.parametrize("delta,rounds", [(0, 3), (255, 1), (1, 255), (200, 1)])
+def test_expected_range_accepts_safe_cumulative_values(kind, delta, rounds):
+    result = lower_to_device_tir(expected_range_kernel_factory.get_tir(kind, delta, rounds, group=True, world_size=2))
+    assert collect_calls(result.device_mod, "tl.dist_wait_signal_")
+
+
+@pytest.mark.parametrize("kind", [kind for kind in T.dist.SignalKind if not kind.value.endswith("memory")])
+@pytest.mark.parametrize("delta,rounds", [(256, 1), (128, 2), (1, 256), (-1, 1)])
+def test_expected_range_rejects_flag_overflow_and_negative_delta(kind, delta, rounds):
+    with pytest.raises(tvm.error.InternalError, match="T.dist .*expected"):
+        lower_to_device_tir(expected_range_kernel_factory.get_tir(kind, delta, rounds, world_size=2))
+
+
+@pytest.mark.parametrize("kind", [T.dist.SignalKind.SRAM_MEMORY, T.dist.SignalKind.DRAM_MEMORY])
+@pytest.mark.parametrize("delta,rounds", [(256, 2), (2**32 - 1, 1), (2**31 - 1, 2)])
+def test_expected_range_preserves_wide_memory_values(kind, delta, rounds):
+    result = lower_to_device_tir(expected_range_kernel_factory.get_tir(kind, delta, rounds, world_size=2))
+    assert collect_calls(result.device_mod, "tl.dist_wait_signal_")[0].args[2].dtype == "uint64"
+
+
+@tilelang.jit(target="sunmmio")
+def guarded_expected_range_kernel_factory(mode="branch", world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, delta: T.int32):
+        with T.Kernel():
+            signal = T.dist.signal(expect="manual")
+            if mode == "branch":
+                if delta > 0:
+                    T.dist.wait_signal(signal, expected_delta=200)
+                else:
+                    T.dist.wait_signal(signal, expected_delta=100)
+                T.dist.wait_signal(signal, expected_delta=55)
+            elif mode == "guard":
+                if delta >= 0 and delta <= 5:
+                    T.dist.wait_signal(signal, expected_delta=250)
+                    T.dist.wait_signal(signal, expected_delta=delta)
+            elif mode == "bounded_loop":
+                for _ in T.serial(T.min(T.max(delta, 0), 5)):
+                    T.dist.wait_signal(signal, expected_delta=50)
+            else:
+                T.dist.wait_signal(signal, expected_delta=delta)
+
+    return main
+
+
+@pytest.mark.parametrize("mode", ["branch", "guard", "bounded_loop"])
+def test_expected_range_accepts_bounded_dynamic_updates(mode):
+    lower_to_device_tir(guarded_expected_range_kernel_factory.get_tir(mode, world_size=2))
+
+
+def test_expected_range_rejects_unknown_manual_delta():
+    with pytest.raises(tvm.error.InternalError, match="cannot prove.*expected"):
+        lower_to_device_tir(guarded_expected_range_kernel_factory.get_tir("unknown", world_size=2))
+
+
+@tilelang.jit(target="sunmmio")
+def expected_sequence_kernel_factory(first=250, second=5, memory=False, world_size: int = 1):
+    first_value = tvm.tir.const(first, "uint64")
+    second_value = tvm.tir.const(second, "uint64")
+
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            signal = T.dist.signal(
+                kind=T.dist.SignalKind.SRAM_MEMORY if memory else T.dist.SignalKind.SRAM_FLAGREG_INC,
+                expect="manual",
+            )
+            T.dist.wait_signal(signal, expected_delta=first_value)
+            T.dist.submit()
+            T.dist.wait_signal(signal, expected_delta=0)
+            T.dist.wait_signal(signal, expected_delta=second_value)
+
+    return main
+
+
+@pytest.mark.parametrize(
+    "first,second,memory,valid",
+    [
+        (250, 5, False, True),
+        (250, 10, False, False),
+        (2**31, 1, True, True),
+        (2**32 - 1, 0, True, True),
+        (2**32 - 1, 1, True, False),
+        (2**32, 0, True, False),
+        (2**64 - 1, 0, True, False),
+    ],
+)
+def test_expected_range_checks_original_cumulative_value(first, second, memory, valid):
+    func = expected_sequence_kernel_factory.get_tir(first, second, memory, world_size=2)
+    if valid:
+        lower_to_device_tir(func)
+    else:
+        with pytest.raises(tvm.error.InternalError, match="cumulative expected"):
+            lower_to_device_tir(func)
+
+
+@tilelang.jit(target="sunmmio")
+def expected_array_range_kernel_factory(mode="safe", world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, delta: T.int32):
+        with T.Kernel():
+            deltas = T.alloc_shared((2,), T.int32)
+            signals = T.dist.signals(2, expect="manual")
+            T.fill(deltas, 200)
+            T.dist.wait_signals(signals, expected_deltas=deltas)
+            deltas[0] = -1 if mode == "negative" else 55
+            deltas[1] = 56 if mode == "overflow" else 55
+            if mode == "unknown_write":
+                deltas[1] = delta
+            T.dist.wait_signals(signals, expected_deltas=deltas)
+
+    return main
+
+
+@pytest.mark.parametrize("mode", ["safe", "negative", "overflow", "unknown_write"])
+def test_expected_range_tracks_delta_array_updates(mode):
+    func = expected_array_range_kernel_factory.get_tir(mode, world_size=2)
+    if mode == "safe":
+        lower_to_device_tir(func)
+    else:
+        with pytest.raises(tvm.error.InternalError, match="T.dist .*expected"):
+            lower_to_device_tir(func)
+
+
+@pytest.mark.parametrize("rounds", [5000, 2**30])
+def test_expected_range_summarizes_long_invariant_memory_loop(rounds):
+    # Keep this range-check test independent of the downstream loop unroller.
+    mod = base_mod(expected_range_kernel_factory.get_tir(T.dist.SignalKind.SRAM_MEMORY, 1, rounds, world_size=2))
+    for transform in (
+        tilelang.transform.InferSramScope(),
+        tilelang.transform.PlanDistSignals(),
+        tilelang.transform.LowerDistRouting(),
+        tilelang.transform.LowerDistCommunication(),
+    ):
+        mod = transform(mod)
+    assert any(int(loop.extent) == rounds for loop in collect_nodes(mod, tvm.tir.For))
+    assert collect_calls(mod, "tl.dist_expect_")
+
+
+@tilelang.jit(target="sunmmio")
+def expected_overwritten_delta_kernel_factory(world_size: int = 1):
+    @T.prim_func
+    def main(inputs: T.MeshTensor((32,), T.placement.replicated(), T.int32), rank_id: T.dist.RankId):
+        with T.Kernel():
+            deltas = T.alloc_shared((32,), T.int32)
+            signal = T.dist.signal(expect="manual")
+            T.fill(deltas, 1)
+            T.copy(inputs, deltas)
+            T.dist.wait_signal(signal, expected_delta=deltas[0])
+
+    return main
+
+
+def test_expected_range_invalidates_delta_after_copy():
+    with pytest.raises(tvm.error.InternalError, match="cannot prove.*expected"):
+        lower_to_device_tir(expected_overwritten_delta_kernel_factory.get_tir(world_size=2))
+
+
+@tilelang.jit(target="sunmmio")
+def memory_dynamic_delta_kernel_factory(repeat=False, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, delta: T.uint64):
+        with T.Kernel():
+            signal = T.dist.signal(kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
+            T.dist.wait_signal(signal, expected_delta=delta)
+            if repeat:
+                T.dist.wait_signal(signal, expected_delta=delta)
+
+    return main
+
+
+@pytest.mark.parametrize("repeat", [False, True])
+def test_memory_expected_range_checks_full_width_dynamic_accumulation(repeat):
+    func = memory_dynamic_delta_kernel_factory.get_tir(repeat, world_size=2)
+    with pytest.raises(tvm.error.InternalError, match="cumulative expected"):
+        lower_to_device_tir(func)
+
+
+@tilelang.jit(target="sunmmio")
+def dynamic_member_expected_range_kernel_factory(kind, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, member: T.int32):
+        with T.Kernel():
+            signals = T.dist.signals(2, kind=kind, expect="manual")
+            T.dist.wait_signal(signals[member], expected_delta=1)
+            T.dist.wait_signal(signals[member], expected_delta=1)
+
+    return main
+
+
+@pytest.mark.parametrize("kind", list(T.dist.SignalKind))
+def test_expected_range_preserves_repeated_dynamic_member_updates(kind):
+    lower_to_device_tir(dynamic_member_expected_range_kernel_factory.get_tir(kind, world_size=2))
+
+
+@tilelang.jit(target="sunmmio")
+def refilled_delta_kernel_factory(replacement=256, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, member: T.int32):
+        with T.Kernel():
+            deltas = T.alloc_shared((2,), T.int32)
+            signal = T.dist.signal(expect="manual")
+            T.fill(deltas, 1)
+            T.dist.wait_signal(signal, expected_delta=deltas[member % 2])
+            T.fill(deltas, replacement)
+            T.dist.wait_signal(signal, expected_delta=deltas[member % 2])
+
+    return main
+
+
+@pytest.mark.parametrize("replacement", [254, 255, 256])
+def test_expected_range_uses_refilled_dynamic_delta(replacement):
+    func = refilled_delta_kernel_factory.get_tir(replacement, world_size=2)
+    if replacement == 254:
+        lower_to_device_tir(func)
+    else:
+        with pytest.raises(tvm.error.InternalError, match="cumulative expected"):
+            lower_to_device_tir(func)
+
+
+@tilelang.jit(target="sunmmio")
+def alias_fill_delta_kernel_factory(view="partial", world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            backing = T.alloc_shared((64,), T.int32)
+            deltas = T.decl_buffer((32,), T.int32, data=backing.data, scope="shared.rsram")
+            alias = T.decl_buffer(
+                (16 if view == "partial" else 32,),
+                T.int32,
+                data=backing.data,
+                elem_offset=0 if view == "equivalent" else 16,
+                scope="shared.rsram",
+            )
+            signal = T.dist.signal(expect="manual")
+            T.fill(backing, 256)
+            T.fill(alias, 1)
+            T.dist.wait_signal(signal, expected_delta=deltas[0])
+
+    return main
+
+
+@pytest.mark.parametrize("view", ["partial", "offset", "equivalent"])
+def test_expected_range_fill_requires_equivalent_tracked_buffer(view):
+    func = alias_fill_delta_kernel_factory.get_tir(view, world_size=2)
+    if view == "equivalent":
+        lower_to_device_tir(func)
+    else:
+        with pytest.raises(tvm.error.InternalError, match="T.dist cannot prove.*expected"):
+            lower_to_device_tir(func)

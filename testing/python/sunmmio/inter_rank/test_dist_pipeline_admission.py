@@ -56,6 +56,7 @@ def pipeline_dist_kernel_factory(op="put", stages=2, nested="none", world_size: 
             exchange_dst = T.alloc_shared((world_size, 32), T.bfloat16)
             counts = T.alloc_shared((world_size,), T.int32)
             deltas = T.alloc_shared((world_size,), T.uint32)
+            T.fill(deltas, 1)
             signal = T.dist.signal()
             signals = T.dist.signals(
                 world_size,

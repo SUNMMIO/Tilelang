@@ -55,9 +55,15 @@ struct DistSignalKindInfo {
   DistSignalScope scope;
   DistSignalUpdateMode update_mode;
   int capacity;
+  // Signal interface type; software storage can use a narrower type.
   DataType state_dtype;
   bool allow_multi_sender;
 };
+
+inline DataType DistSoftwareStateDType(const DistSignalKindInfo &kind) {
+  return kind.update_mode == DistSignalUpdateMode::kMemory ? DataType::UInt(32)
+                                                           : kind.state_dtype;
+}
 
 inline const std::array<DistSignalKindInfo,
                         static_cast<size_t>(DistSignalKind::kCount)> &
@@ -66,8 +72,6 @@ DistSignalKindInfos() {
                           static_cast<size_t>(DistSignalKind::kCount)>
       infos{{
           // SUVM signal values: increment/assign are 8-bit, memory is 64-bit.
-          // Expected values and generation snapshots use the same unsigned
-          // type.
           {DistSignalKind::kSramFlagregInc, "sram_flagreg_inc",
            DistSignalScope::kSram, DistSignalUpdateMode::kIncrement,
            kIncrementFlagregCount, DataType::UInt(8), true},

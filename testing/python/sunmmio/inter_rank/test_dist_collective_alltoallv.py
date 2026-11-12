@@ -13,6 +13,7 @@ from testing.python.sunmmio.inter_rank.tir_test_utils import (
     collect_op_arg_counts,
     collect_op_names,
     lower_collectives,
+    strip_casts,
 )
 
 
@@ -553,9 +554,13 @@ def test_alltoallv_auto_group_falls_back_to_memory():
     assert int(planned.attrs["tl.dist.signal_counts"]["sram_flagreg_value"]) == 0
     assert int(planned.attrs["tl.dist.signal_counts"]["sram_memory"]) == 33
     mod = tilelang.transform.LowerDistRouting()(mod)
+    mod = tilelang.transform.LegalizeSunmmioDataPath()(mod)
+    mod = tilelang.transform.SunmmioLayoutInference()(mod)
     mod = tilelang.transform.LowerDistCommunication()(mod)
     assert collect_op_names(mod).count("tl.dist_put_") == 32
-    assert "uint64" in mod.script()
+    for put in collect_calls(mod, "tl.dist_put_"):
+        assert put.args[5].dtype == "uint32"
+        assert put.args[5].buffer.scope() == "shared.rsram"
 
 
 def test_alltoallv_single_signal_uses_inc_and_reaches_regular_wait_leaf():
@@ -677,7 +682,18 @@ def test_alltoallv_rank_reaches_dynamic_completion_leaves():
     assert "pending_count" in injected_script
     assert "sram_flagreg_inc" in injected_script
     assert '"sram_flagreg_inc", rank_id' in injected_script
-    assert "v_pending_1[source]" in injected_script
+    selection = collect_nodes(
+        injected,
+        tvm.tir.LetStmt,
+        lambda node: isinstance(node.value, tvm.tir.Call) and node.value.op.same_as(tvm.ir.Op.get("tl.dist_wait_any_")),
+    )[0]
+    pending = selection.value.args[4].args[0].buffer
+    consumed = collect_nodes(
+        injected,
+        tvm.tir.BufferStore,
+        lambda node: node.buffer.data.same_as(pending.data) and node.indices[0].same_as(selection.var),
+    )
+    assert len(consumed) == 1 and int(consumed[0].value) == 0
 
 
 def test_alltoallv_wait_all_drains_pending_completion():
@@ -700,12 +716,20 @@ def test_alltoallv_reuses_group_state_with_independent_completions():
         capture_passes=("tl.LowerDistCommunication", "tl.LowerDistSync"),
     )
 
-    lower_script = result.pass_snapshot("tl.LowerDistCommunication").mod.script()
+    lowered = result.pass_snapshot("tl.LowerDistCommunication").mod
     injected = result.pass_snapshot("tl.LowerDistSync").mod
-    assert lower_script.count("_generation = T.allocate([16]") == 1
-    assert "rank_id * 4" in lower_script
+    puts = collect_calls(lowered, "tl.dist_put_")
+    generation = strip_casts(puts[0].args[5]).buffer
+    assert all(strip_casts(put.args[5]).buffer.data.same_as(generation.data) for put in puts)
+    allocations = collect_nodes(lowered, tvm.tir.Allocate, lambda node: node.buffer_var.same_as(generation.data))
+    assert len(allocations) == 1 and [int(dim) for dim in allocations[0].extents] == [16]
+    rank = lowered["main"].params[int(lowered["main"].attrs["tl.dist.rank_id_param_index"])]
+    analyzer = tvm.arith.Analyzer()
+    assert all(analyzer.can_prove_equal(strip_casts(put.args[5]).indices[0], rank * 4 + put.args[2]) for put in puts)
     assert collect_op_names(injected).count("tl.dist_wait_any_") == 2
-    assert injected.script().count("pending_count") >= 2
+    completions = collect_calls(injected, "tl.dist_wait_any_")
+    assert not completions[0].args[5].buffer.data.same_as(completions[1].args[5].buffer.data)
+    assert not completions[0].args[3].args[0].buffer.data.same_as(completions[1].args[3].args[0].buffer.data)
 
 
 def test_alltoallv_reuses_group_after_wait_any_drains_every_member():

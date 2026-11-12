@@ -9,6 +9,7 @@ from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import (
     collect_nodes,
     collect_op_names,
+    strip_casts,
 )
 
 
@@ -70,6 +71,7 @@ def manual_sender_signals_kernel_factory(
             dst = T.alloc_shared((32,), T.bfloat16)
             send_counts = T.alloc_shared((world_size,), T.int32)
             expected_deltas = T.alloc_shared((world_size,), T.uint32)
+            T.fill(expected_deltas, 1)
             sender_signals = T.dist.signals(
                 world_size,
                 kind=T.dist.SignalKind.SRAM_FLAGREG_VALUE,
@@ -108,6 +110,7 @@ def manual_signal_wave_kernel_factory(
             src = T.alloc_shared((32,), T.bfloat16)
             dst = T.alloc_shared((32,), T.bfloat16)
             expected_deltas = T.alloc_shared((total_signals,), T.uint32)
+            T.fill(expected_deltas, 1)
             signals = T.dist.signals(
                 total_signals,
                 kind=T.dist.SignalKind.SRAM_FLAGREG_VALUE,
@@ -151,6 +154,7 @@ def manual_destination_loop_kernel_factory(world_size: int = 1):
             src = T.alloc_shared((32,), T.bfloat16)
             dst = T.alloc_shared((32,), T.bfloat16)
             expected_deltas = T.alloc_shared((world_size,), T.uint32)
+            T.fill(expected_deltas, 1)
             sender_signals = T.dist.signals(
                 world_size,
                 kind=T.dist.SignalKind.SRAM_FLAGREG_VALUE,
@@ -188,6 +192,7 @@ def manual_dynamic_member_wait_kernel_factory(world_size: int = 1):
             src = T.alloc_shared((32,), T.bfloat16)
             dst = T.alloc_shared((32,), T.bfloat16)
             expected_deltas = T.alloc_shared((7,), T.uint32)
+            T.fill(expected_deltas, 1)
             signals = T.dist.signals(
                 7,
                 kind=T.dist.SignalKind.SRAM_FLAGREG_VALUE,
@@ -308,7 +313,7 @@ def test_manual_routed_put_only_advances_expected_at_explicit_wait(
         lambda call: isinstance(call.op, tvm.ir.Op) and call.op.name == "tl.dist_wait_signal_",
     )
     assert len(waits) == 1
-    expected = waits[0].args[2]
+    expected = strip_casts(waits[0].args[2])
     stores = collect_nodes(
         injected,
         tvm.tir.BufferStore,
@@ -322,8 +327,8 @@ def test_manual_routed_put_only_advances_expected_at_explicit_wait(
             lambda call: isinstance(call.op, tvm.ir.Op) and call.op.name == "tl.dist_put_",
         )
         assert len(puts) == 2
-        assert all(isinstance(call.args[5], tvm.tir.BufferLoad) for call in puts)
-        generation = puts[0].args[5].buffer.data
+        assert all(isinstance(strip_casts(call.args[5]), tvm.tir.BufferLoad) for call in puts)
+        generation = strip_casts(puts[0].args[5]).buffer.data
         increments = collect_nodes(
             injected,
             tvm.tir.BufferStore,

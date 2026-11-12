@@ -597,7 +597,7 @@ def test_alltoall_loop_offsets_support_flattened_nested_slots():
     [
         ("reuse", "independent destination slots"),
         ("rank_condition", "Rank/core-uniform control flow"),
-        ("early_exit", "without early exits"),
+        ("early_exit", "explicit return/break/continue"),
     ],
 )
 def test_alltoall_loop_offsets_reject_unsafe_loop_context(error, message):

@@ -8,6 +8,7 @@
 #include <tvm/tir/transform.h>
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -15,7 +16,10 @@
 #include <utility>
 #include <vector>
 
+#include "../layout/cute_layout.h"
 #include "../op/builtin.h"
+#include "../op/fill.h"
+#include "../op/region.h"
 #include "../op/utils.h"
 #include "dist_transform_utils.h"
 
@@ -928,11 +932,31 @@ private:
 class LowerDistPrimitiveMutator : public StmtExprMutator {
 public:
   LowerDistPrimitiveMutator(int64_t world_size, int mesh_nrows, int mesh_ncols,
-                            Var rank_id)
+                            Var rank_id, Target target)
       : world_size_(world_size), mesh_nrows_(mesh_nrows),
-        mesh_ncols_(mesh_ncols), rank_id_(std::move(rank_id)) {}
+        mesh_ncols_(mesh_ncols), rank_id_(std::move(rank_id)),
+        target_(std::move(target)) {}
+
+  const std::unordered_map<const VarNode *, const DistSignalKindInfo *> &
+  ExpectedKinds() const {
+    return expected_kinds_;
+  }
+
+  const LayoutMap &StateLayouts() const { return state_layouts_; }
 
 private:
+  Buffer MakeStateArray(PrimExpr count, DataType dtype,
+                        const std::string &name) {
+    Buffer buffer = decl_buffer(
+        {count}, dtype == DataType::UInt(8) ? DataType::Int(32) : dtype, name,
+        kSunmmioScopeRSRAM);
+    auto config = GetSunmmioTileProcessorConfig(target_);
+    state_layouts_.Set(
+        buffer, sunmmio::MakeAlignedRowMajor(buffer->shape, buffer->dtype,
+                                             config.rsram_align_bytes));
+    return buffer;
+  }
+
   struct SignalInfo {
     PrimExpr kind;
     PrimExpr index;
@@ -1065,8 +1089,10 @@ private:
                                        : generation_layout.row_domain;
       PrimExpr count_imm = IntImm(DataType::Int(32), count);
       std::string base_name = let_node->var->name_hint;
-      Buffer expected = decl_buffer({count_imm}, kind_info->state_dtype,
-                                    base_name + "_expect", "local");
+      DataType software_dtype = DistSoftwareStateDType(*kind_info);
+      Buffer expected =
+          MakeStateArray(count_imm, software_dtype, base_name + "_expect");
+      expected_kinds_[expected->data.get()] = kind_info;
       int64_t generation_factor = 1;
       if (generation_layout.dense) {
         generation_factor =
@@ -1076,16 +1102,15 @@ private:
           IntImm(DataType::Int(32), count * generation_factor);
       Buffer generation;
       if (needs_generation) {
-        generation = decl_buffer({generation_count}, kind_info->state_dtype,
-                                 base_name + "_generation", "local");
+        generation = MakeStateArray(generation_count, software_dtype,
+                                    base_name + "_generation");
       }
       std::string expect_mode =
           RequireStringImm(signal_call_node->args[3], "signal-group expect");
       Buffer auto_completion_deltas;
       if (completion_domain.uses_auto_completion) {
-        auto_completion_deltas =
-            decl_buffer({count_imm}, DataType::Int(32),
-                        base_name + "_completion_deltas", "local");
+        auto_completion_deltas = MakeStateArray(
+            count_imm, expected->dtype, base_name + "_completion_deltas");
       }
       signal_group_info_.emplace(
           let_node->var.get(),
@@ -1107,7 +1132,7 @@ private:
       Stmt initialize_expect =
           For(expect_init_index, IntImm(DataType::Int(32), 0), count_imm,
               ForKind::kSerial,
-              BufferStore(expected, make_zero(kind_info->state_dtype),
+              BufferStore(expected, make_zero(expected->dtype),
                           {expect_init_index}));
       Array<Stmt> statements{initialize_expect};
       if (auto_completion_deltas.defined()) {
@@ -1117,13 +1142,14 @@ private:
             For(delta_index, IntImm(DataType::Int(32), 0), count_imm,
                 ForKind::kSerial,
                 BufferStore(auto_completion_deltas,
-                            IntImm(DataType::Int(32), 0), {delta_index})));
+                            make_zero(auto_completion_deltas->dtype),
+                            {delta_index})));
       }
       if (generation.defined()) {
         statements.push_back(
             For(generation_init_index, IntImm(DataType::Int(32), 0),
                 generation_count, ForKind::kSerial,
-                BufferStore(generation, make_zero(kind_info->state_dtype),
+                BufferStore(generation, make_zero(generation->dtype),
                             {generation_init_index})));
       }
       statements.push_back(body);
@@ -1162,10 +1188,11 @@ private:
       bool advance_expected = mode != "auto";
       PrimExpr count_imm = IntImm(DataType::Int(32), group.count);
       std::string base_name = let_node->var->name_hint;
-      Buffer expect = decl_buffer({count_imm}, group.kind_info->state_dtype,
-                                  base_name + "_expect", "local");
-      Buffer pending = decl_buffer({count_imm}, DataType::UInt(8),
-                                   base_name + "_pending", "local");
+      Buffer expect =
+          MakeStateArray(count_imm, DistSoftwareStateDType(*group.kind_info),
+                         base_name + "_expect");
+      Buffer pending =
+          MakeStateArray(count_imm, DataType::Int(32), base_name + "_pending");
       Buffer pending_count =
           decl_buffer({IntImm(DataType::Int(32), 1)}, DataType::Int(32),
                       base_name + "_pending_count", "local.var");
@@ -1189,9 +1216,10 @@ private:
       Array<Stmt> statements{initialize};
       if (mode == "auto") {
         for (int64_t index = 0; index < group.count; ++index) {
-          statements.push_back(BufferStore(group.auto_completion_deltas,
-                                           IntImm(DataType::Int(32), 0),
-                                           {IntImm(DataType::Int(32), index)}));
+          statements.push_back(
+              BufferStore(group.auto_completion_deltas,
+                          make_zero(group.auto_completion_deltas->dtype),
+                          {IntImm(DataType::Int(32), index)}));
         }
       }
       statements.push_back(body);
@@ -1225,18 +1253,23 @@ private:
         kind_info.update_mode != DistSignalUpdateMode::kIncrement;
     std::string expect_name = let_node->var->name_hint + "_expect";
     std::string generation_name = let_node->var->name_hint + "_generation";
-    Buffer expected =
-        decl_buffer({IntImm(DataType::Int(32), 1)}, kind_info.state_dtype,
-                    expect_name, "local.var");
+    Buffer expected = decl_buffer({IntImm(DataType::Int(32), 1)},
+                                  DistSoftwareStateDType(kind_info),
+                                  expect_name, "local.var");
+    expected_kinds_[expected->data.get()] = &kind_info;
     int64_t generation_extent =
         generation_layout.dense
             ? world_size_ * (generation_layout.row_domain ? mesh_nrows_ : 1)
             : 1;
     Buffer generation;
     if (needs_generation) {
-      generation = decl_buffer({IntImm(DataType::Int(32), generation_extent)},
-                               kind_info.state_dtype, generation_name,
-                               generation_layout.dense ? "local" : "local.var");
+      generation = generation_layout.dense
+                       ? MakeStateArray(
+                             IntImm(DataType::Int(32), generation_extent),
+                             DistSoftwareStateDType(kind_info), generation_name)
+                       : decl_buffer({IntImm(DataType::Int(32), 1)},
+                                     DistSoftwareStateDType(kind_info),
+                                     generation_name, "local.var");
     }
     SignalInfo info{signal_call_node->args[0],
                     signal_call_node->args[1],
@@ -1255,7 +1288,7 @@ private:
 
     Stmt scoped = DeclBuffer(expected, std::move(body));
     Map<String, ffi::Any> annotations;
-    annotations.Set(tl::attr::kLocalVarInit, make_zero(kind_info.state_dtype));
+    annotations.Set(tl::attr::kLocalVarInit, make_zero(expected->dtype));
     scoped = Allocate(expected->data, expected->dtype, expected->shape,
                       const_true(), std::move(scoped), annotations);
     if (!generation.defined()) {
@@ -1270,7 +1303,7 @@ private:
     Stmt initialize_generation =
         For(generation_init_index, IntImm(DataType::Int(32), 0),
             IntImm(DataType::Int(32), generation_extent), ForKind::kSerial,
-            BufferStore(generation, make_zero(kind_info.state_dtype),
+            BufferStore(generation, make_zero(generation->dtype),
                         {generation_init_index}));
     scoped = SeqStmt::Flatten(Array<Stmt>{initialize_generation, scoped});
     scoped = DeclBuffer(generation, std::move(scoped));
@@ -1350,7 +1383,7 @@ private:
       PrimExpr accumulated = BufferLoad(group.auto_completion_deltas, {offset});
       Stmt update = BufferStore(
           group.auto_completion_deltas,
-          accumulated + Cast(DataType::Int(32), call->args[1]), {offset});
+          accumulated + Cast(accumulated.dtype(), call->args[1]), {offset});
       return SeqStmt::Flatten(Array<Stmt>{Evaluate(lowered), update});
     }
     if (call && call->op.same_as(dist_batch_begin())) {
@@ -1712,6 +1745,844 @@ private:
   int mesh_nrows_{1};
   int mesh_ncols_{1};
   Var rank_id_;
+  LayoutMap state_layouts_;
+  Target target_;
+  std::unordered_map<const VarNode *, const DistSignalKindInfo *>
+      expected_kinds_;
+};
+
+// Check the existing receiver updates; sender traffic is part of the user's
+// protocol in manual mode and is not counted again here.
+class DistExpectedRangeChecker : public StmtVisitor {
+public:
+  static void
+  Check(const PrimFunc &func,
+        const std::unordered_map<const VarNode *, const DistSignalKindInfo *>
+            &kinds) {
+    auto context = GetDistPassContext(func);
+    ICHECK(context);
+    DistExpectedRangeChecker checker;
+    checker.expected_kinds_ = kinds;
+    checker.analyzer_.Bind(
+        context.value().rank_id,
+        Range::FromMinExtent(
+            0, IntImm(DataType::Int(32), context.value().world_size)));
+    auto collect = [&](const PrimExpr &expr) {
+      PostOrderVisit(expr, [&](const ObjectRef &node) {
+        if (const auto *load = node.as<BufferLoadNode>()) {
+          checker.AddBuffer(load->buffer);
+        }
+      });
+    };
+    PostOrderVisit(func->body, [&](const ObjectRef &node) {
+      if (const auto *call = node.as<CallNode>()) {
+        if (call->op.same_as(dist_put_())) {
+          checker.remote_inputs_.insert(
+              NormalizeToBufferRegion(call->args[1])->buffer->data.get());
+        }
+        if (call->op.same_as(dist_expect_())) {
+          collect(call->args[0]);
+          checker.expected_buffers_.insert(
+              Downcast<BufferLoad>(call->args[0])->buffer->data.get());
+          collect(call->args[1]);
+        } else if (call->op.same_as(dist_completion_init_())) {
+          collect(call->args[0]);
+          checker.expected_buffers_.insert(
+              NormalizeToBufferRegion(call->args[0])->buffer->data.get());
+          for (size_t i = 5; i < call->args.size(); ++i)
+            collect(call->args[i]);
+        }
+      } else if (const auto *branch = node.as<IfThenElseNode>()) {
+        collect(branch->condition);
+      } else if (const auto *loop = node.as<WhileNode>()) {
+        collect(loop->condition);
+      } else if (const auto *loop = node.as<ForNode>()) {
+        collect(loop->min);
+        collect(loop->extent);
+      } else if (const auto *let = node.as<LetStmtNode>()) {
+        if (let->value.dtype().is_int() || let->value.dtype().is_uint()) {
+          collect(let->value);
+        }
+      }
+    });
+    // Follow only integer writes feeding the expected inputs. Payload and
+    // sender generation arrays do not need to be evaluated by this check.
+    size_t previous_size;
+    do {
+      previous_size = checker.memory_.size();
+      PostOrderVisit(func->body, [&](const ObjectRef &node) {
+        if (const auto *store = node.as<BufferStoreNode>();
+            store && checker.memory_.count(store->buffer->data.get())) {
+          collect(store->value);
+          for (const PrimExpr &index : store->indices)
+            collect(index);
+        }
+      });
+    } while (checker.memory_.size() != previous_size);
+    checker(func->body);
+  }
+
+private:
+  // Bounds on compile-time tracking, not on runtime communication. Larger
+  // invariant loops use the arithmetic summary; other unknown ranges fail.
+  static constexpr int64_t kMaxTrackedElements = 4096;
+  static constexpr int64_t kMaxLoopIterations = 4096;
+  static constexpr int64_t kMaxAnalysisSteps = 65536;
+
+  struct Memory {
+    Buffer buffer;
+    std::vector<PrimExpr> values;
+    std::vector<std::pair<PrimExpr, PrimExpr>> dynamic_reads;
+  };
+  using State = std::unordered_map<const VarNode *, Memory>;
+  struct LoopExits {
+    std::optional<State> breaks;
+    std::optional<State> continues;
+  };
+
+  void AddBuffer(const Buffer &buffer) {
+    if ((!buffer->dtype.is_int() && !buffer->dtype.is_uint()) ||
+        buffer->dtype.lanes() != 1 || memory_.count(buffer->data.get())) {
+      return;
+    }
+    int64_t count = 1;
+    for (const PrimExpr &dim : buffer->shape) {
+      const auto *imm = dim.as<IntImmNode>();
+      if (!imm || imm->value <= 0 || imm->value > kMaxTrackedElements / count) {
+        return;
+      }
+      count *= imm->value;
+    }
+    Memory entry{buffer, {}};
+    for (int64_t i = 0; i < count; ++i) {
+      entry.values.push_back(Var("dist_input", buffer->dtype));
+    }
+    memory_.emplace(buffer->data.get(), std::move(entry));
+  }
+
+  PrimExpr FlatIndex(const Buffer &buffer, const Array<PrimExpr> &indices) {
+    PrimExpr index = IntImm(DataType::Int(64), 0);
+    if (!buffer->strides.empty() || !is_zero(buffer->elem_offset)) {
+      return Var("dist_unknown_index", DataType::Int(64));
+    }
+    for (size_t i = 0; i < indices.size(); ++i) {
+      index = index * Cast(DataType::Int(64), buffer->shape[i]) +
+              Cast(DataType::Int(64), indices[i]);
+    }
+    return analyzer_.Simplify(index);
+  }
+
+  PrimExpr Read(const Buffer &buffer, const Array<PrimExpr> &indices) {
+    auto found = memory_.find(buffer->data.get());
+    if (remote_inputs_.count(buffer->data.get()) || found == memory_.end() ||
+        !StructuralEqual()(found->second.buffer->shape, buffer->shape) ||
+        found->second.buffer->dtype != buffer->dtype) {
+      return Var("dist_input", buffer->dtype);
+    }
+    const auto &values = found->second.values;
+    PrimExpr index = FlatIndex(buffer, indices);
+    if (const auto *imm = index.as<IntImmNode>()) {
+      if (imm->value >= 0 && static_cast<size_t>(imm->value) < values.size()) {
+        return analyzer_.Simplify(values[imm->value]);
+      }
+      return Var("dist_input", buffer->dtype);
+    }
+    // A dynamic read joins the member ranges rather than expanding a select
+    // tree over every input element. Cache the snapshot until a write so a
+    // surrounding guard constrains the same value at its use.
+    auto &reads = found->second.dynamic_reads;
+    for (const auto &[saved_index, value] : reads) {
+      if (StructuralEqual()(saved_index, index))
+        return value;
+    }
+    int64_t lower = arith::ConstIntBound::kPosInf;
+    int64_t upper = arith::ConstIntBound::kNegInf;
+    for (const PrimExpr &value : values) {
+      auto bound = analyzer_.const_int_bound(analyzer_.Simplify(value));
+      lower = std::min(lower, bound->min_value);
+      upper = std::max(upper, bound->max_value);
+    }
+    Var value("dist_member", buffer->dtype);
+    analyzer_.const_int_bound.Update(value, arith::ConstIntBound(lower, upper));
+    if (expected_buffers_.count(buffer->data.get()) &&
+        buffer->dtype == DataType::UInt(64)) {
+      uint64_t wide_upper = 0;
+      for (const PrimExpr &cell : values) {
+        wide_upper =
+            std::max(wide_upper, Upper(analyzer_.Simplify(cell), buffer));
+      }
+      wide_bounds_[value] = wide_upper;
+    }
+    reads.emplace_back(index, value);
+    return value;
+  }
+
+  class Resolver : public ExprMutator {
+  public:
+    explicit Resolver(DistExpectedRangeChecker *owner) : owner_(owner) {}
+    PrimExpr VisitExpr_(const VarNode *op) final {
+      auto value = owner_->bindings_.Get(ffi::GetRef<Var>(op));
+      return value ? value.value() : ffi::GetRef<PrimExpr>(op);
+    }
+    PrimExpr VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(builtin::if_then_else())) {
+        PrimExpr condition = owner_->analyzer_.Simplify(VisitExpr(op->args[0]));
+        if (is_one(condition))
+          return VisitExpr(op->args[1]);
+        if (is_zero(condition))
+          return VisitExpr(op->args[2]);
+        return Select(condition, VisitExpr(op->args[1]),
+                      VisitExpr(op->args[2]));
+      }
+      return ExprMutator::VisitExpr_(op);
+    }
+    PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+      Array<PrimExpr> indices;
+      for (const PrimExpr &index : op->indices) {
+        indices.push_back(VisitExpr(index));
+      }
+      return owner_->Read(op->buffer, indices);
+    }
+
+  private:
+    DistExpectedRangeChecker *owner_;
+  };
+
+  PrimExpr Resolve(const PrimExpr &expr) {
+    return analyzer_.Simplify(Resolver(this)(expr));
+  }
+
+  std::optional<uint64_t> UnsignedConstant(const PrimExpr &expr) {
+    if (const auto *imm = expr.as<IntImmNode>(); imm && imm->value >= 0) {
+      return static_cast<uint64_t>(imm->value);
+    }
+    if (const auto *call = expr.as<CallNode>();
+        call && call->op.same_as(builtin::large_uint_imm())) {
+      return static_cast<uint64_t>(Downcast<IntImm>(call->args[0])->value) |
+             (static_cast<uint64_t>(Downcast<IntImm>(call->args[1])->value)
+              << 32);
+    }
+    return std::nullopt;
+  }
+
+  // ConstIntBound uses INT64_MAX as infinity. Handle the full u64 constant
+  // domain explicitly, and keep bounds of checked additions separately.
+  uint64_t Upper(const PrimExpr &expr, const Buffer &state) {
+    auto known = wide_bounds_.find(expr);
+    if (known != wide_bounds_.end()) {
+      return known->second;
+    }
+    if (const auto *imm = expr.as<IntImmNode>()) {
+      ICHECK_GE(imm->value, 0)
+          << "T.dist expected delta must be non-negative for " << state->name;
+      return static_cast<uint64_t>(imm->value);
+    }
+    if (auto constant = UnsignedConstant(expr))
+      return constant.value();
+    if (const auto *select = expr.as<SelectNode>()) {
+      return std::max(Upper(select->true_value, state),
+                      Upper(select->false_value, state));
+    }
+    if (const auto *maximum = expr.as<MaxNode>()) {
+      return std::max(Upper(maximum->a, state), Upper(maximum->b, state));
+    }
+    auto bound = analyzer_.const_int_bound(expr);
+    ICHECK_GE(bound->min_value, 0)
+        << "T.dist cannot prove expected delta is non-negative for "
+        << state->name << ": " << expr;
+    if (bound->max_value != arith::ConstIntBound::kPosInf) {
+      return static_cast<uint64_t>(bound->max_value);
+    }
+    if (expr.dtype().is_uint() && expr.dtype().bits() == 64) {
+      return std::numeric_limits<uint64_t>::max();
+    }
+    LOG(FATAL) << "T.dist cannot prove expected range for " << state->name
+               << ": " << expr;
+    return 0;
+  }
+
+  PrimExpr AdvanceValue(const Buffer &buffer, PrimExpr current,
+                        PrimExpr delta) {
+    uint64_t limit = ExpectedLimit(buffer);
+    uint64_t increment = Upper(delta, buffer);
+    uint64_t previous = Upper(current, buffer);
+    ICHECK(increment <= limit && previous <= limit - increment)
+        << "T.dist cannot prove cumulative expected is in [0, " << limit
+        << "] for " << buffer->name << ": previous upper bound " << previous
+        << ", delta upper bound " << increment;
+    uint64_t upper = previous + increment;
+    auto current_constant = UnsignedConstant(current);
+    auto delta_constant = UnsignedConstant(delta);
+    PrimExpr next =
+        current_constant && delta_constant
+            ? make_const(buffer->dtype,
+                         current_constant.value() + delta_constant.value())
+            : analyzer_.Simplify(current + Cast(buffer->dtype, delta));
+    if (buffer->dtype == DataType::UInt(64) &&
+        !(current_constant && delta_constant)) {
+      // The proven bound belongs to this state snapshot, not to a user
+      // expression whose range may be narrower only in the current branch.
+      Var snapshot("dist_expected", buffer->dtype);
+      if (upper < static_cast<uint64_t>(arith::ConstIntBound::kPosInf)) {
+        analyzer_.const_int_bound.Update(
+            snapshot, arith::ConstIntBound(0, static_cast<int64_t>(upper)));
+      }
+      next = snapshot;
+      wide_bounds_[next] = upper;
+    }
+    return next;
+  }
+
+  void Store(const Buffer &buffer, const Array<PrimExpr> &indices,
+             const PrimExpr &value) {
+    auto found = memory_.find(buffer->data.get());
+    if (found == memory_.end())
+      return;
+    if (!StructuralEqual()(found->second.buffer->shape, buffer->shape) ||
+        found->second.buffer->dtype != buffer->dtype) {
+      Invalidate(buffer->data.get());
+      return;
+    }
+    PrimExpr index = FlatIndex(buffer, indices);
+    auto &values = found->second.values;
+    found->second.dynamic_reads.clear();
+    if (const auto *imm = index.as<IntImmNode>()) {
+      if (imm->value >= 0 && static_cast<size_t>(imm->value) < values.size()) {
+        values[imm->value] = value;
+      }
+      return;
+    }
+    for (size_t i = 0; i < values.size(); ++i) {
+      PrimExpr matches = analyzer_.Simplify(
+          index == make_const(index.dtype(), static_cast<int64_t>(i)));
+      if (!is_zero(matches)) {
+        values[i] = is_one(matches)
+                        ? value
+                        : analyzer_.Simplify(Select(matches, value, values[i]));
+      }
+    }
+  }
+
+  void Advance(const BufferLoad &expected, const PrimExpr &raw_delta) {
+    Array<PrimExpr> indices;
+    for (const PrimExpr &index : expected->indices) {
+      indices.push_back(Resolve(index));
+    }
+    PrimExpr delta = Resolve(raw_delta);
+    PrimExpr current = Read(expected->buffer, indices);
+    Store(expected->buffer, indices,
+          AdvanceValue(expected->buffer, current, delta));
+  }
+
+  State Join(const State &lhs, const State &rhs,
+             const PrimExpr &condition = PrimExpr()) {
+    State result = lhs;
+    PrimExpr selector = condition.defined()
+                            ? condition
+                            : Var("dist_exit_path", DataType::Bool());
+    for (auto &[key, entry] : result) {
+      entry.dynamic_reads.clear();
+      const auto &other = rhs.at(key).values;
+      for (size_t i = 0; i < entry.values.size(); ++i) {
+        PrimExpr a = entry.values[i], b = other[i];
+        entry.values[i] = analyzer_.Simplify(Select(selector, a, b));
+      }
+    }
+    return result;
+  }
+
+  void AddExit(std::optional<State> *exit) {
+    *exit = exit->has_value() ? Join(exit->value(), memory_) : memory_;
+  }
+
+  void Branch(const PrimExpr &condition, const Stmt &then_case,
+              const Optional<Stmt> &else_case = std::nullopt) {
+    PrimExpr cond = analyzer_.Simplify(condition);
+    if (is_one(cond)) {
+      VisitStmt(then_case);
+      return;
+    }
+    if (is_zero(cond)) {
+      if (else_case)
+        VisitStmt(else_case.value());
+      return;
+    }
+    State incoming = memory_;
+    {
+      With<arith::ConstraintContext> constraint(&analyzer_, cond);
+      VisitStmt(then_case);
+    }
+    State then_state = memory_;
+    bool then_reachable = reachable_;
+    memory_ = incoming;
+    reachable_ = true;
+    if (else_case) {
+      With<arith::ConstraintContext> constraint(&analyzer_, Not(cond));
+      VisitStmt(else_case.value());
+    }
+    if (then_reachable && reachable_) {
+      memory_ = Join(then_state, memory_, cond);
+    } else if (then_reachable) {
+      memory_ = std::move(then_state);
+      reachable_ = true;
+    }
+  }
+
+  void VisitStmt_(const SeqStmtNode *op) final {
+    for (const Stmt &stmt : op->seq) {
+      if (!reachable_)
+        break;
+      VisitStmt(stmt);
+    }
+  }
+
+  void VisitStmt_(const IfThenElseNode *op) final {
+    Branch(Resolve(op->condition), op->then_case, op->else_case);
+  }
+
+  void VisitStmt_(const LetStmtNode *op) final {
+    Map<Var, PrimExpr> saved = bindings_;
+    if (op->value.dtype().is_int() || op->value.dtype().is_uint()) {
+      bindings_.Set(op->var, Resolve(op->value));
+    }
+    if (const auto *call = op->value.as<CallNode>())
+      InvalidateCall(call);
+    VisitStmt(op->body);
+    bindings_ = std::move(saved);
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    if (op->attr_key == tir::attr::thread_extent) {
+      auto iv = Downcast<IterVar>(op->node);
+      analyzer_.Bind(iv->var, Range::FromMinExtent(0, Resolve(op->value)),
+                     true);
+    }
+    VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const AssertStmtNode *op) final {
+    // Existing member assertions do not supply a new count-range contract.
+    VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const BlockRealizeNode *op) final {
+    Map<Var, PrimExpr> saved = bindings_;
+    for (size_t i = 0; i < op->iter_values.size(); ++i) {
+      bindings_.Set(op->block->iter_vars[i]->var, Resolve(op->iter_values[i]));
+    }
+    Branch(Resolve(op->predicate), op->block);
+    bindings_ = std::move(saved);
+  }
+
+  void VisitStmt_(const BlockNode *op) final {
+    for (const Buffer &buffer : op->alloc_buffers)
+      Invalidate(buffer->data.get());
+    if (auto annotation = op->annotations.Get(tl::attr::kLocalVarInit)) {
+      auto initializers = Downcast<Map<Var, PrimExpr>>(annotation.value());
+      for (const auto &[data, init] : initializers) {
+        auto found = memory_.find(data.get());
+        if (found != memory_.end()) {
+          PrimExpr value = Resolve(init);
+          for (PrimExpr &cell : found->second.values)
+            cell = value;
+        }
+      }
+    }
+    if (op->init)
+      VisitStmt(op->init.value());
+    VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const AllocateNode *op) final {
+    auto found = memory_.find(op->buffer_var.get());
+    if (found != memory_.end()) {
+      auto init = op->annotations.Get(tl::attr::kLocalVarInit);
+      found->second.dynamic_reads.clear();
+      for (PrimExpr &value : found->second.values) {
+        value = init ? Resolve(Downcast<PrimExpr>(init.value()))
+                     : Var("dist_input", found->second.buffer->dtype);
+      }
+    }
+    VisitStmt(op->body);
+  }
+
+  void VisitStmt_(const BufferStoreNode *op) final {
+    if (!memory_.count(op->buffer->data.get()))
+      return;
+    Array<PrimExpr> indices;
+    for (const PrimExpr &index : op->indices)
+      indices.push_back(Resolve(index));
+    PrimExpr value = Resolve(op->value);
+    if (op->predicate) {
+      PrimExpr predicate = Resolve(op->predicate.value());
+      if (is_zero(predicate))
+        return;
+      value = analyzer_.Simplify(
+          Select(predicate, value, Read(op->buffer, indices)));
+    }
+    Store(op->buffer, indices, value);
+  }
+
+  bool HasAdvance(const Stmt &body) {
+    bool found = false;
+    PostOrderVisit(body, [&](const ObjectRef &node) {
+      const auto *call = node.as<CallNode>();
+      if (!call)
+        return;
+      found |= call->op.same_as(dist_expect_()) && !is_zero(call->args[1]);
+      found |=
+          call->op.same_as(dist_completion_init_()) && !is_zero(call->args[4]);
+    });
+    return found;
+  }
+
+  void InvalidateWrites(const Stmt &body) {
+    PostOrderVisit(body, [&](const ObjectRef &node) {
+      if (const auto *store = node.as<BufferStoreNode>()) {
+        Invalidate(store->buffer->data.get());
+      } else if (const auto *call = node.as<CallNode>()) {
+        InvalidateCall(call);
+      }
+    });
+  }
+
+  void Invalidate(const VarNode *data) {
+    auto found = memory_.find(data);
+    if (found == memory_.end())
+      return;
+    found->second.dynamic_reads.clear();
+    for (PrimExpr &value : found->second.values) {
+      value = Var("dist_input", found->second.buffer->dtype);
+    }
+  }
+
+  void InvalidateCall(const CallNode *call) {
+    // Region access masks already describe local writes. Dist puts name the
+    // receiver's storage and do not write the local source or software state.
+    if (call->op.same_as(dist_put_()) || call->op.same_as(dist_signal_put_()) ||
+        call->op.same_as(dist_wait_any_()) ||
+        call->op.same_as(dist_expect_()) ||
+        call->op.same_as(dist_completion_init_()))
+      return;
+    for (const PrimExpr &arg : call->args) {
+      if (const auto *region = arg.as<CallNode>();
+          region && region->op.same_as(RegionOp::Get())) {
+        RegionOp view(region->args);
+        if (view->GetAccessMask() & 2)
+          Invalidate(view->GetBuffer()->data.get());
+      } else if (const auto *data = arg.as<VarNode>();
+                 data && data->dtype.is_handle()) {
+        if (SideEffect(ffi::GetRef<PrimExpr>(call)) >
+            CallEffectKind::kReadState) {
+          Invalidate(data);
+        }
+      }
+    }
+  }
+
+  bool SummarizeRepeatedUpdates(const ForNode *op, int64_t count) {
+    bool invariant = true;
+    PostOrderVisit(op->body, [&](const ObjectRef &node) {
+      if (node.get() == op->loop_var.get())
+        invariant = false;
+      if (const auto *store = node.as<BufferStoreNode>()) {
+        invariant &= memory_.count(store->buffer->data.get()) == 0;
+      } else if (const auto *call = node.as<CallNode>()) {
+        if (call->op.same_as(builtin::ret()) ||
+            call->op.same_as(builtin::break_loop()) ||
+            call->op.same_as(builtin::continue_loop()))
+          invariant = false;
+        if (!IsLeafDistOp(call) && !call->op.same_as(RegionOp::Get()) &&
+            SideEffect(ffi::GetRef<PrimExpr>(call)) >
+                CallEffectKind::kReadState) {
+          invariant = false;
+        }
+        if (call->op.same_as(RegionOp::Get())) {
+          RegionOp region(call->args);
+          if (region->GetAccessMask() & 2) {
+            invariant &= memory_.count(region->GetBuffer()->data.get()) == 0;
+          }
+        }
+      }
+    });
+    if (!invariant)
+      return false;
+    State incoming = memory_;
+    // With invariant inputs the body's zero-based result bounds one
+    // iteration's increment. Multiplication avoids enumerating long loops.
+    for (const VarNode *data : expected_buffers_) {
+      auto found = memory_.find(data);
+      if (found != memory_.end()) {
+        for (PrimExpr &value : found->second.values)
+          value = make_zero(value.dtype());
+      }
+    }
+    VisitStmt(op->body);
+    State increments = std::move(memory_);
+    memory_ = std::move(incoming);
+    for (const VarNode *data : expected_buffers_) {
+      auto found = memory_.find(data);
+      if (found == memory_.end())
+        continue;
+      auto &entry = found->second;
+      uint64_t limit = ExpectedLimit(entry.buffer);
+      for (size_t i = 0; i < entry.values.size(); ++i) {
+        uint64_t delta = Upper(increments.at(data).values[i], entry.buffer);
+        ICHECK(delta <= limit / static_cast<uint64_t>(count))
+            << "T.dist cannot prove cumulative expected for repeated delta "
+            << delta << " over " << count << " iterations";
+        entry.values[i] =
+            AdvanceValue(entry.buffer, entry.values[i],
+                         make_const(DataType::UInt(64),
+                                    delta * static_cast<uint64_t>(count)));
+      }
+      entry.dynamic_reads.clear();
+    }
+    return true;
+  }
+
+  void VisitStmt_(const ForNode *op) final {
+    PrimExpr min = Resolve(op->min), extent = Resolve(op->extent);
+    PrimExpr step = Resolve(op->step.value_or(make_const(min.dtype(), 1)));
+    auto step_bound = analyzer_.const_int_bound(step);
+    auto bound = analyzer_.const_int_bound(extent);
+    int64_t count = bound->max_value;
+    if (step_bound->min_value > 0 && count > 0 &&
+        count != arith::ConstIntBound::kPosInf) {
+      count =
+          count / step_bound->min_value + (count % step_bound->min_value != 0);
+    } else if (step_bound->min_value <= 0) {
+      count = arith::ConstIntBound::kPosInf;
+    }
+    if (count <= 0)
+      return;
+    bool advances = HasAdvance(op->body);
+    if (advances && count > 255 && count != arith::ConstIntBound::kPosInf &&
+        SummarizeRepeatedUpdates(op, count))
+      return;
+    if (count > kMaxLoopIterations || loop_work_ >= kMaxAnalysisSteps) {
+      ICHECK(!advances)
+          << "T.dist cannot prove cumulative expected for loop extent "
+          << extent;
+      InvalidateWrites(op->body);
+      return;
+    }
+    Map<Var, PrimExpr> saved = bindings_;
+    loops_.push_back({});
+    for (int64_t i = 0; i < count && reachable_; ++i) {
+      if (++loop_work_ > kMaxAnalysisSteps) {
+        ICHECK(!advances) << "T.dist cannot prove cumulative expected within "
+                             "loop analysis budget";
+        InvalidateWrites(op->body);
+        break;
+      }
+      bindings_.Set(op->loop_var, analyzer_.Simplify(
+                                      min + make_const(min.dtype(), i) * step));
+      Branch(make_const(extent.dtype(), i) * step < extent, op->body);
+      auto continues = std::move(loops_.back().continues);
+      loops_.back().continues.reset();
+      if (continues) {
+        memory_ = reachable_ ? Join(memory_, *continues) : *continues;
+        reachable_ = true;
+      }
+    }
+    auto breaks = std::move(loops_.back().breaks);
+    loops_.pop_back();
+    if (breaks) {
+      memory_ = reachable_ ? Join(memory_, *breaks) : *breaks;
+      reachable_ = true;
+    }
+    bindings_ = std::move(saved);
+  }
+
+  void VisitStmt_(const WhileNode *op) final {
+    if (!HasAdvance(op->body)) {
+      InvalidateWrites(op->body);
+      return;
+    }
+    loops_.push_back({});
+    int iterations = 0;
+    while (reachable_) {
+      PrimExpr condition = Resolve(op->condition);
+      if (is_zero(condition))
+        break;
+      ICHECK(is_one(condition) && iterations++ < kMaxLoopIterations &&
+             ++loop_work_ <= kMaxAnalysisSteps)
+          << "T.dist cannot prove cumulative expected for while condition "
+          << condition;
+      VisitStmt(op->body);
+      auto continues = std::move(loops_.back().continues);
+      loops_.back().continues.reset();
+      if (continues) {
+        memory_ = reachable_ ? Join(memory_, *continues) : *continues;
+        reachable_ = true;
+      }
+    }
+    auto breaks = std::move(loops_.back().breaks);
+    loops_.pop_back();
+    if (breaks) {
+      memory_ = reachable_ ? Join(memory_, *breaks) : *breaks;
+      reachable_ = true;
+    }
+  }
+
+  void VisitStmt_(const EvaluateNode *op) final {
+    const auto *call = op->value.as<CallNode>();
+    if (!call)
+      return;
+    if (call->op.same_as(dist_expect_())) {
+      Advance(Downcast<BufferLoad>(call->args[0]), call->args[1]);
+    } else if (call->op.same_as(dist_completion_init_())) {
+      BufferRegion expected = NormalizeToBufferRegion(call->args[0]);
+      if (is_one(call->args[4])) {
+        for (size_t i = 5; i < call->args.size(); ++i) {
+          Advance(BufferLoad(
+                      expected->buffer,
+                      {expected->region[0]->min +
+                       IntImm(DataType::Int(32), static_cast<int64_t>(i - 5))}),
+                  call->args[i]);
+        }
+      }
+    } else if (call->op.same_as(Fill::Get())) {
+      Fill fill(call->args, call->annotations);
+      if (!memory_.count(fill->dst->data.get()))
+        return;
+      PrimExpr value = Resolve(fill->value);
+      const Buffer &tracked = memory_.at(fill->dst->data.get()).buffer;
+      // Filling an entire alias need not cover the tracked storage view.
+      bool full =
+          fill->dst->dtype == tracked->dtype &&
+          StructuralEqual()(fill->dst->shape, tracked->shape) &&
+          StructuralEqual()(fill->dst->elem_offset, tracked->elem_offset) &&
+          StructuralEqual()(fill->dst->strides, tracked->strides);
+      for (size_t i = 0; i < fill->region.size(); ++i) {
+        full &= analyzer_.CanProveEqual(fill->region[i]->min, 0) &&
+                analyzer_.CanProveEqual(fill->region[i]->extent,
+                                        fill->dst->shape[i]);
+      }
+      if (full) {
+        auto &memory = memory_.at(fill->dst->data.get());
+        memory.dynamic_reads.clear();
+        for (PrimExpr &cell : memory.values)
+          cell = value;
+      } else {
+        Invalidate(fill->dst->data.get());
+      }
+    } else if (call->op.same_as(builtin::ret())) {
+      reachable_ = false;
+    } else if (call->op.same_as(builtin::break_loop()) ||
+               call->op.same_as(builtin::continue_loop())) {
+      if (!loops_.empty()) {
+        AddExit(call->op.same_as(builtin::break_loop())
+                    ? &loops_.back().breaks
+                    : &loops_.back().continues);
+      }
+      reachable_ = false;
+    } else {
+      InvalidateCall(call);
+    }
+  }
+
+  arith::Analyzer analyzer_;
+  uint64_t ExpectedLimit(const Buffer &buffer) const {
+    auto kind = expected_kinds_.find(buffer->data.get());
+    ICHECK(kind != expected_kinds_.end());
+    return kind->second->update_mode == DistSignalUpdateMode::kMemory
+               ? std::numeric_limits<uint32_t>::max()
+               : 255;
+  }
+  std::unordered_map<const VarNode *, const DistSignalKindInfo *>
+      expected_kinds_;
+  Map<Var, PrimExpr> bindings_;
+  State memory_;
+  std::unordered_set<const VarNode *> expected_buffers_;
+  std::unordered_set<const VarNode *> remote_inputs_;
+  std::unordered_map<PrimExpr, uint64_t, ObjectPtrHash, ObjectPtrEqual>
+      wide_bounds_;
+  std::vector<LoopExits> loops_;
+  bool reachable_{true};
+  int loop_work_{0};
+};
+
+// Match the region builder's non-unit tiled axes (all-unit views use axis 0).
+// Physical storage-unit and MX byte accounting remain in the SUVM verifier.
+class DistFullTileValidator : public StmtExprVisitor {
+public:
+  static void Check(const PrimFunc &func) {
+    DistFullTileValidator validator;
+    for (const char *key : {tl::attr::kLayoutMap, tl::attr::kGlobalLayoutMap}) {
+      if (auto map = func->GetAttr<LayoutMap>(key)) {
+        for (const auto &[buffer, layout] : map.value()) {
+          validator.layouts_.Set(buffer, layout);
+        }
+      }
+    }
+    validator(func->body);
+  }
+
+private:
+  void VisitStmt_(const BlockNode *op) final {
+    LayoutMap saved = layouts_;
+    for (const char *key : {tl::attr::kLayoutMap, tl::attr::kGlobalLayoutMap}) {
+      if (auto map = op->annotations.Get(key)) {
+        for (const auto &[buffer, layout] : Downcast<LayoutMap>(map.value())) {
+          layouts_.Set(buffer, layout);
+        }
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+    layouts_ = std::move(saved);
+  }
+
+  void Validate(const PrimExpr &expr, const char *operand) {
+    BufferRegion region = NormalizeToBufferRegion(expr);
+    Optional<Layout> layout;
+    for (const auto &[buffer, candidate] : layouts_) {
+      if (buffer.same_as(region->buffer) ||
+          buffer->data.same_as(region->buffer->data)) {
+        layout = candidate;
+        if (buffer.same_as(region->buffer))
+          break;
+      }
+    }
+    ICHECK(layout) << "T.dist.put " << operand << " buffer "
+                   << region->buffer->name << " requires layout metadata";
+    const auto *cute = layout.value().as<CuteLayoutNode>();
+    ICHECK(cute) << "T.dist.put " << operand << " buffer "
+                 << region->buffer->name << " requires a Sunmmio CuteLayout";
+    auto covered = cute->GetCoveredShape();
+    bool has_nonunit = false;
+    for (const Range &range : region->region) {
+      has_nonunit |= !analyzer_.CanProveEqual(range->extent, 1);
+    }
+    for (size_t dim = 0; dim < region->region.size(); ++dim) {
+      const PrimExpr &tile = region->region[dim]->extent;
+      if (analyzer_.CanProveEqual(tile, 1) && (has_nonunit || dim != 0))
+        continue;
+      PrimExpr extent = analyzer_.Simplify(covered[dim]);
+      PrimExpr size = analyzer_.Simplify(tile);
+      const auto *l = extent.as<IntImmNode>();
+      const auto *t = size.as<IntImmNode>();
+      if (!l || !t)
+        continue;
+      ICHECK(t->value > 0 && l->value % t->value == 0)
+          << "T.dist.put " << operand << " tile extent " << size
+          << " at dimension " << dim << " of buffer " << region->buffer->name
+          << " must divide layout covered extent " << extent
+          << "; dist does not support a partial last tile";
+    }
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(dist_put_())) {
+      Validate(op->args[0], "src");
+      Validate(op->args[1], "dst");
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  LayoutMap layouts_;
+  arith::Analyzer analyzer_;
 };
 
 PrimFunc Run(PrimFunc func) {
@@ -1728,12 +2599,34 @@ PrimFunc Run(PrimFunc func) {
   auto target = func->GetAttr<Target>(tvm::attr::kTarget);
   ICHECK(target && TargetIsSunmmio(target.value()));
   auto mesh = GetSunmmioMeshConfig(target.value());
-  Stmt body =
-      LowerDistPrimitiveMutator(context.value().world_size, mesh.nrow,
-                                mesh.ncol, context.value().rank_id)(func->body);
+  LowerDistPrimitiveMutator lowerer(context.value().world_size, mesh.nrow,
+                                    mesh.ncol, context.value().rank_id,
+                                    target.value());
+  Stmt body = lowerer(func->body);
+  // These compiler-created buffers are introduced after layout inference.
+  // Add them to every block so nested layout scopes see the same identities.
+  auto attach_layouts = [&](const Stmt &stmt) -> Stmt {
+    const auto *block = stmt.as<BlockNode>();
+    if (!block || lowerer.StateLayouts().empty())
+      return stmt;
+    Block result = ffi::GetRef<Block>(block);
+    LayoutMap layouts;
+    if (auto existing = block->annotations.Get(tl::attr::kLayoutMap)) {
+      layouts = Downcast<LayoutMap>(existing.value());
+    }
+    for (const auto &[buffer, layout] : lowerer.StateLayouts()) {
+      layouts.Set(buffer, layout);
+    }
+    result.CopyOnWrite()->annotations.Set(tl::attr::kLayoutMap, layouts);
+    return result;
+  };
+  body = IRTransform(body, nullptr, ffi::Function::FromTyped(attach_layouts),
+                     Array<String>{"tir.Block"});
   if (!body.same_as(func->body)) {
     func.CopyOnWrite()->body = std::move(body);
   }
+  DistExpectedRangeChecker::Check(func, lowerer.ExpectedKinds());
+  DistFullTileValidator::Check(func);
   return func;
 }
 

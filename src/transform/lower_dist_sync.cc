@@ -691,18 +691,6 @@ public:
   }
 
 private:
-  PrimExpr CastSignalDelta(DataType dtype, PrimExpr delta) {
-    if (dtype == DataType::UInt(8) && delta.dtype().bits() > 8) {
-      // TVM's constant cast rejects uint8(256). Normalize before narrowing,
-      // including when a dynamic delta later becomes constant during lowering.
-      if (const auto *value = delta.as<IntImmNode>()) {
-        return make_const(dtype, value->value & 255);
-      }
-      delta = bitwise_and(delta, make_const(delta.dtype(), 255));
-    }
-    return Cast(dtype, delta);
-  }
-
   Stmt VisitStmt_(const EvaluateNode *evaluate_node) final {
     const auto *call = evaluate_node->value.as<CallNode>();
     if (!call) {
@@ -734,8 +722,13 @@ private:
       PrimExpr next = Cast(generation->dtype,
                            generation + make_const(generation->dtype, 1));
       Stmt advance = BufferStore(generation->buffer, next, generation->indices);
-      return SeqStmt::Flatten(
-          Array<Stmt>{advance, tvm::ffi::GetRef<Stmt>(evaluate_node)});
+      Array<PrimExpr> args = call->args;
+      if (generation.dtype() != kind.state_dtype) {
+        args.Set(5, Cast(kind.state_dtype, generation));
+      }
+      Stmt send = Evaluate(
+          Call(call->dtype, call->op, args, call->annotations, call->span));
+      return SeqStmt::Flatten(Array<Stmt>{advance, send});
     }
     if (call->op.same_as(dist_signal_put_())) {
       ICHECK_EQ(call->args.size(), 4U);
@@ -748,15 +741,30 @@ private:
       PrimExpr next = Cast(generation->dtype,
                            generation + make_const(generation->dtype, 1));
       Stmt advance = BufferStore(generation->buffer, next, generation->indices);
-      return SeqStmt::Flatten(
-          Array<Stmt>{advance, tvm::ffi::GetRef<Stmt>(evaluate_node)});
+      Array<PrimExpr> args = call->args;
+      if (generation.dtype() != kind.state_dtype) {
+        args.Set(3, Cast(kind.state_dtype, generation));
+      }
+      Stmt send = Evaluate(
+          Call(call->dtype, call->op, args, call->annotations, call->span));
+      return SeqStmt::Flatten(Array<Stmt>{advance, send});
+    }
+    if (call->op.same_as(dist_wait_signal_())) {
+      const auto &kind =
+          RequireDistSignalKindInfo(call->args[0], "signal kind");
+      Array<PrimExpr> args = call->args;
+      if (args[2].dtype() != kind.state_dtype) {
+        args.Set(2, Cast(kind.state_dtype, args[2]));
+      }
+      return Evaluate(
+          Call(call->dtype, call->op, args, call->annotations, call->span));
     }
     if (call->op.same_as(dist_expect_())) {
       ICHECK_EQ(call->args.size(), 2U);
       BufferLoad expected = RequireLocalState(call->args[0], "expected");
-      // Convert to the signal width before arithmetic: uint8 wraps modulo 256,
-      // while uint64 memory expectations retain accumulated high bits.
-      PrimExpr delta = CastSignalDelta(expected->dtype, call->args[1]);
+      // LowerDistCommunication checked the original delta and cumulative
+      // expected before narrowing to the signal's logical width.
+      PrimExpr delta = Cast(expected->dtype, call->args[1]);
       PrimExpr next = Cast(expected->dtype, expected + delta);
       return BufferStore(expected->buffer, next, expected->indices);
     }
@@ -827,8 +835,8 @@ private:
     for (int64_t index = 0; index < endpoint_count; ++index) {
       PrimExpr delta = call->args[5 + index];
       ICHECK(delta.dtype().is_int() || delta.dtype().is_uint());
-      // A positive delta may wrap to zero at the signal width (e.g. 256).
-      // Pending membership uses the original delta, not the narrowed value.
+      // Pending membership is based on the logical delta, independently of
+      // the signal storage representation.
       PrimExpr active = delta > make_zero(delta.dtype());
       PrimExpr signal_index =
           signal_expect->region[0]->min + IntImm(DataType::Int(32), index);
@@ -837,8 +845,7 @@ private:
       PrimExpr pending_index =
           pending->region[0]->min + IntImm(DataType::Int(32), index);
       PrimExpr current = BufferLoad(signal_expect->buffer, {signal_index});
-      PrimExpr typed_delta =
-          CastSignalDelta(signal_expect->buffer->dtype, delta);
+      PrimExpr typed_delta = Cast(signal_expect->buffer->dtype, delta);
       PrimExpr next =
           Cast(signal_expect->buffer->dtype,
                current + Select(advance_expected, typed_delta,

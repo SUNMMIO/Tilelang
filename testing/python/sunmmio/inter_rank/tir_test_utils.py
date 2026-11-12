@@ -46,6 +46,13 @@ def collect_op_arg_counts(func_or_mod, op_name):
     return [len(call.args) for call in collect_calls(func_or_mod, op_name)]
 
 
+def strip_casts(expr):
+    """Recover a stored value's buffer/index beneath signal-boundary casts."""
+    while isinstance(expr, tvm.tir.Cast):
+        expr = expr.value
+    return expr
+
+
 def collect_dist_put_kinds(func_or_mod):
     return [str(call.args[3].value) for call in collect_calls(func_or_mod, "tl.dist_put_")]
 

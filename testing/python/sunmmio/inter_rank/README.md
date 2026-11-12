@@ -11,6 +11,11 @@
 | `test_dist_p2p.py` | 基础 put/wait、SRAM/DRAM payload、完整 lowering 与单卡边界 |
 | `test_dist_signal_planning.py` | signal/SignalList 声明、kind/scope、容量分配与 sender 约束 |
 | `test_dist_signal_state.py` | expected/generation 状态推进、多目的端、重复 wait 与循环复用 |
+| `test_dist_state_storage.py` | 普通软件状态的 RSRAM/i32 存储、padding、布局传递及信号边界转换 |
+| `test_dist_memory_state.py` | MEMORY uint32 软件存储、UINT32_MAX 边界和 i64 接口零扩展 |
+| `test_dist_auxiliary_scope.py` | 通信辅助数组的 RSRAM 准入、显式 copy、非零 region 和标量 delta 边界 |
+| `test_dist_region_validation.py` | dist 通用 region 检查接入、完整尾 tile、covered extent 与检查开关边界 |
+| `test_dist_control_flow_admission.py` | SunMMIO 显式 return/break/continue 的前置临时准入及 scope/target 边界 |
 | `test_dist_expect_control_flow.py` | 分支和 For/While 中的 expected 推导、auto/manual 合法性与通信阶段顺序 |
 | `test_dist_manual_expect.py` | 用户指定 expected 增量、动态 member 索引和协议 manual 接入 |
 | `test_dist_completion.py` | Completion 快照、pending、wait_any/wait_all 与复用限制 |

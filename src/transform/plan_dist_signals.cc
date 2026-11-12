@@ -81,10 +81,13 @@ void ValidateStaticRegion(const BufferRegion &region, const char *op_name,
                           const char *operand_name, bool allow_dram) {
   bool valid_scope = region->buffer.scope() == kSunmmioScopeRSRAM ||
                      (allow_dram && IsDramScope(region->buffer.scope()));
-  ICHECK(valid_scope) << op_name << " " << operand_name
-                      << " must use shared.rsram"
-                      << (allow_dram ? " or global/DRAM" : "") << ", got "
-                      << region->buffer.scope();
+  ICHECK(valid_scope)
+      << op_name << " " << operand_name << " must use shared.rsram"
+      << (allow_dram ? " or global/DRAM" : "") << ", got "
+      << region->buffer.scope()
+      << (allow_dram
+              ? ""
+              : "; use T.copy to move the array to RSRAM before passing it");
   for (const Range &range : region->region) {
     ICHECK(range->extent.as<IntImmNode>())
         << op_name << " " << operand_name
@@ -1646,7 +1649,7 @@ private:
       ICHECK(call->args[0].dtype().is_handle());
       ValidateStaticRegion(NormalizeToBufferRegion(call->args[1]),
                            "T.dist.wait_signals", "expected_deltas",
-                           /*allow_dram=*/true);
+                           /*allow_dram=*/false);
     } else if (call->op.same_as(dist_wait_send())) {
       ICHECK_EQ(call->args.size(), 0);
     } else if (call->op.same_as(dist_completion())) {
@@ -1662,7 +1665,7 @@ private:
         ValidateStaticRegion(
             NormalizeToBufferRegion(call->args[1]), "T.dist.completion",
             mode == "manual" ? "expected_deltas" : "recv_counts",
-            /*allow_dram=*/true);
+            /*allow_dram=*/false);
       }
     } else if (call->op.same_as(dist_completion_has_pending()) ||
                call->op.same_as(dist_wait_any()) ||
