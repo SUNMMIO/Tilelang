@@ -773,11 +773,10 @@ SunMMIOValue SunmmioMlirTileOp::TileSelect(const std::string &result_name,
     auto word_type = integer_type;
     word_type.shape = {IntImm(DataType::Int(32), count / elements_per_word)};
     auto packed = TileFill(name(), scalar(0), word_type, DataType::Int(32));
-    auto arch = mlir::suvm::SUVMDialect::tryGetModuleDeviceArch(*ctx_.module);
-    ICHECK(arch.has_value());
+    auto arch = mlir::suvm::SUVMDialect::getModuleDeviceArch(*ctx_.module);
     // Keep unsigned narrowing within a native half-register so splitting never
     // needs to synthesize an unsigned scalar padding constant.
-    int64_t chunk_elements = mlir::suvm::getVectorRegBits(*arch) / (2 * 32);
+    int64_t chunk_elements = mlir::suvm::getVectorRegBits(arch) / (2 * 32);
     for (int64_t start = 0; start < count; start += chunk_elements) {
       auto chunk_type = integer_type;
       chunk_type.shape = {

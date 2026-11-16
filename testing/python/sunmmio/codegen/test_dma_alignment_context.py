@@ -194,6 +194,14 @@ def test_copy_alignment_uses_only_active_bindings(scope, kind, tmp_path):
     def make_body(copy, slot):
         return scoped_copy_body(scope, copy, slot)
 
+    if scope == "assert":
+        with pytest.raises(
+            tvm.error.InternalError,
+            match="NPU-IR SUVM kernel input does not support runtime assertions",
+        ):
+            scope_copy_source(make_body, kind)
+        return
+
     src = scope_copy_source(make_body, kind)
     validate_suvm_mlir_with_npuir_opt(src, tmp_path, opt_args=("--verify-each", "--suvm-to-llvm-pipeline"))
 
@@ -247,6 +255,14 @@ def test_copy_alignment_rejects_expired_constraints(scope, kind, destination, tm
             return tvm.tir.IfThenElse(index % 32 == 0, copy(index, destination), None)
 
         return make_body(guarded_copy, slot)
+
+    if scope == "assert":
+        with pytest.raises(
+            tvm.error.InternalError,
+            match="NPU-IR SUVM kernel input does not support runtime assertions",
+        ):
+            scope_copy_source(guarded_body, kind)
+        return
 
     src = scope_copy_source(guarded_body, kind)
     validate_suvm_mlir_with_npuir_opt(src, tmp_path, opt_args=("--verify-each", "--suvm-to-llvm-pipeline"))

@@ -3,7 +3,6 @@
 #include "../../transform/common/attr.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMAttrs.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -25,7 +24,6 @@ void SunmmioMlirFunction::BeginModule() {
   ctx_.mlir_ctx.getOrLoadDialect<mlir::func::FuncDialect>();
   ctx_.mlir_ctx.getOrLoadDialect<mlir::scf::SCFDialect>();
   ctx_.mlir_ctx.getOrLoadDialect<mlir::arith::ArithDialect>();
-  ctx_.mlir_ctx.getOrLoadDialect<mlir::cf::ControlFlowDialect>();
   ctx_.mlir_ctx.getOrLoadDialect<mlir::LLVM::LLVMDialect>();
 
   ctx_.module = mlir::ModuleOp::create(ctx_.builder.getUnknownLoc());
@@ -441,14 +439,6 @@ void SunmmioMlirFunction::EndIf() {
        i < e; ++i) {
     ctx_.BindMLIRValue(frame.live_out_value_names[i], frame.op.getResult(i));
   }
-}
-
-void SunmmioMlirFunction::EmitAssert(const SunMMIOValue &cond,
-                                     const std::string &msg_text) {
-  mlir::Value cond_v =
-      type_.EnsureI1(type_.ResolveValue(cond, ctx_.builder.getI1Type()));
-  mlir::cf::AssertOp::create(ctx_.builder, type_.Loc(), cond_v,
-                             ctx_.builder.getStringAttr(msg_text));
 }
 
 } // namespace codegen
