@@ -392,11 +392,6 @@ void SuvmSunmmioBuilder::BeginWhileBody(const SunMMIOValue &cond) {
 
 void SuvmSunmmioBuilder::EndWhile() { function_->EndWhile(); }
 
-void SuvmSunmmioBuilder::EmitAssert(const SunMMIOValue &cond,
-                                    const std::string &msg_text) {
-  function_->EmitAssert(cond, msg_text);
-}
-
 SunMMIOValue SuvmSunmmioBuilder::GetCoreId(const std::string &result_name,
                                            DataType dtype) {
   SunMMIOType i64_type{SunMMIOType::Kind::kScalar, DataType::Int(64), 1, {}};

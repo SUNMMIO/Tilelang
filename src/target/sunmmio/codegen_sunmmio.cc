@@ -1823,14 +1823,8 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::BufferRealizeNode *op) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AssertStmtNode *op) {
-  SunMMIOValue cond = EnsureType(
-      EvalExpr(op->condition),
-      SunMMIOType{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}},
-      DataType::Bool());
-  SunMMIOValue msg = EvalExpr(op->message);
-  std::string text = msg.value.empty() ? "\"assertion failed\"" : msg.value;
-  builder_->EmitAssert(cond, text);
-  VisitStmtTracked(op->body);
+  UnsupportedStmt(
+      op, "NPU-IR SUVM kernel input does not support runtime assertions");
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::EvaluateNode *op) {

@@ -37,8 +37,6 @@ public:
   void BeginWhileBody(const SunMMIOValue &cond);
   void EndWhile();
 
-  void EmitAssert(const SunMMIOValue &cond, const std::string &msg_text);
-
 private:
   SunmmioMlirContext &ctx_;
   SunmmioMlirType type_;

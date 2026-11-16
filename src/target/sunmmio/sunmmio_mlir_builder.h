@@ -223,7 +223,6 @@ public:
   void BeginWhileBody(const SunMMIOValue &cond) final;
   void EndWhile() final;
 
-  void EmitAssert(const SunMMIOValue &cond, const std::string &msg_text) final;
   SunMMIOValue GetCoreId(const std::string &result_name, DataType dtype) final;
 
   void PushLayoutScope(const TirLayoutMap &layout_map,
