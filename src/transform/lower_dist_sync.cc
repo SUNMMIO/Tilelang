@@ -7,6 +7,9 @@
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/transform.h>
 
+#include <algorithm>
+#include <functional>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -141,6 +144,9 @@ BufferRegions CallWriteRegions(const CallNode *call) {
 
 class WriteRegionCollector : public StmtExprVisitor {
 public:
+  WriteRegionCollector(const Map<Buffer, Layout> &layouts,
+                       const SunmmioTileProcessorConfig &config)
+      : layouts_(layouts), config_(config) {}
   BufferRegions Collect(const Stmt &stmt) {
     VisitStmt(stmt);
     return std::move(writes_);
@@ -148,10 +154,8 @@ public:
 
 private:
   void VisitStmt_(const BufferStoreNode *op) final {
-    Region region;
-    for (const PrimExpr &index : op->indices) {
-      region.push_back(Range::FromMinExtent(index, 1));
-    }
+    Region region = GetSunmmioScalarTileAccessRegion(op->buffer, op->indices,
+                                                     layouts_, config_);
     AddUniqueRegion(&writes_, BufferRegion(op->buffer, std::move(region)));
     StmtExprVisitor::VisitStmt_(op);
   }
@@ -164,6 +168,8 @@ private:
   }
 
   BufferRegions writes_;
+  const Map<Buffer, Layout> &layouts_;
+  const SunmmioTileProcessorConfig &config_;
 };
 
 // Track the implicit per-core send queue across structured control flow.
@@ -180,9 +186,9 @@ public:
     std::unordered_set<const EvaluateNode *> empty_submits;
   };
 
-  static Result Validate(const Stmt &body) {
-    DistQueueValidator validator;
-    validator(body);
+  static Result Validate(const PrimFunc &func) {
+    DistQueueValidator validator(func);
+    validator(func->body);
     if (validator.falls_through_) {
       validator.CheckSubmitted(/*before_return=*/false);
       ICHECK(!validator.channel_in_flight_)
@@ -199,6 +205,14 @@ public:
   }
 
 private:
+  explicit DistQueueValidator(const PrimFunc &func)
+      : layouts_(func->GetAttr<Map<Buffer, Layout>>(attr::kLayoutMap)
+                     .value_or(Map<Buffer, Layout>())),
+        config_(GetSunmmioTileProcessorConfig(
+            func->GetAttr<Target>(tvm::attr::kTarget))) {}
+
+  Map<Buffer, Layout> layouts_;
+  SunmmioTileProcessorConfig config_;
   struct State {
     bool queue_pending;
     bool strict_batch_open;
@@ -390,7 +404,8 @@ private:
   }
 
   void VisitStmt_(const ForNode *op) final {
-    BufferRegions writes = WriteRegionCollector().Collect(op->body);
+    BufferRegions writes =
+        WriteRegionCollector(layouts_, config_).Collect(op->body);
     if (AnyRegionOverlaps(inflight_sources_, writes)) {
       for_loops_needing_wait_.insert(op);
       inflight_sources_.clear();
@@ -402,7 +417,8 @@ private:
   }
 
   void VisitStmt_(const WhileNode *op) final {
-    BufferRegions writes = WriteRegionCollector().Collect(op->body);
+    BufferRegions writes =
+        WriteRegionCollector(layouts_, config_).Collect(op->body);
     if (AnyRegionOverlaps(inflight_sources_, writes)) {
       while_loops_needing_wait_.insert(op);
       inflight_sources_.clear();
@@ -434,10 +450,8 @@ private:
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    Region region;
-    for (const PrimExpr &index : op->indices) {
-      region.push_back(Range::FromMinExtent(index, 1));
-    }
+    Region region = GetSunmmioScalarTileAccessRegion(op->buffer, op->indices,
+                                                     layouts_, config_);
     BufferRegions writes{BufferRegion(op->buffer, std::move(region))};
     if (HandleWrites(writes, "buffer store")) {
       stores_needing_wait_.insert(op);
@@ -673,17 +687,681 @@ private:
   const DistQueueValidator::Result &queue_;
 };
 
+// The emitting visitor registers the original growth sites. Only their integer
+// dependencies are summarized; payload code is never symbolically executed.
+// State contains numeric intervals/snapshots, not accumulated TIR expressions.
+class ExpectedFinalBounds {
+public:
+  explicit ExpectedFinalBounds(const PrimFunc &func)
+      : source_(func->body),
+        enabled_(func->attrs.defined() &&
+                 func->attrs->dict.count(kDistSignalCountsAttr)) {
+    if (auto index = func->GetAttr<Integer>("tl.dist.rank_id_param_index")) {
+      auto world = func->GetAttr<Integer>(kDistWorldSizeAttr);
+      if (world)
+        analyzer_.Bind(func->params[index.value()->value],
+                       Range::FromMinExtent(0, world.value()));
+    }
+  }
+
+  void Register(const CallNode *call, const BufferLoad &target,
+                const PrimExpr &delta) {
+    if (!enabled_)
+      return; // Isolated internal materialization tests have no signal plan.
+    auto annotation = call->annotations.Get(kDistExpectedSignalKindAttr);
+    ICHECK(annotation) << "Missing expected signal kind in LowerDistSync";
+    const auto &kind = RequireDistSignalKindInfo(
+        Downcast<PrimExpr>(annotation.value()), "expected signal kind");
+    bool flag = kind.update_mode != DistSignalUpdateMode::kMemory;
+    if (is_zero(delta))
+      return;
+    if (!flag &&
+        (delta.dtype().is_uint() ||
+         (SideEffect(delta) == CallEffectKind::kPure && Eval(delta).lo >= 0)))
+      return; // No MEMORY cumulative bound; unsigned deltas are non-negative.
+    updates_[call].push_back({target, delta, flag});
+    Collect(delta);
+    if (flag) {
+      Add(target->buffer);
+      counters_.insert(target->buffer->data.get());
+      for (const PrimExpr &index : target->indices)
+        Collect(index);
+    }
+  }
+
+  void Check() {
+    if (updates_.empty())
+      return;
+    // Build a dependency slice once. Conditions are included only when they
+    // control a relevant write/update, unlike a scan of all integer payload.
+    PostOrderVisit(source_, [&](const ObjectRef &node) {
+      if (const auto *let = node.as<LetStmtNode>())
+        lets_.emplace(let->var.get(), let->value);
+      if (const auto *call = node.as<CallNode>();
+          call && call->op.same_as(dist_put_()))
+        remote_.insert(
+            NormalizeToBufferRegion(call->args[1])->buffer->data.get());
+    });
+    size_t old_size;
+    do {
+      old_size = memory_.size() + needed_vars_.size();
+      for (const auto &[var, expr] : lets_)
+        if (needed_vars_.count(var))
+          Collect(expr);
+      PostOrderVisit(source_, [&](const ObjectRef &node) {
+        if (const auto *store = node.as<BufferStoreNode>();
+            store && memory_.count(store->buffer->data.get())) {
+          Collect(store->value);
+          for (const PrimExpr &index : store->indices)
+            Collect(index);
+        }
+      });
+      relevant_.clear();
+      Mark(source_);
+    } while (old_size != memory_.size() + needed_vars_.size());
+    // Build once; loops apply this small effect summary using numeric facts.
+    // The ordinary emitter has already produced the runtime code once.
+    Build(source_)();
+    ICHECK(nonnegative_)
+        << "T.dist cannot prove expected delta is non-negative";
+    for (const auto &[data, upper] : peaks_)
+      ICHECK(upper <= 255)
+          << "T.dist cannot prove cumulative expected is in [0, 255] for "
+          << memory_.at(data).buffer->name << ": final upper bound " << upper;
+  }
+
+private:
+  static constexpr int64_t kInf = arith::ConstIntBound::kPosInf;
+  static constexpr int64_t kNegInf = arith::ConstIntBound::kNegInf;
+  static constexpr size_t kWorkLimit = 1 << 20;
+  struct Bounds {
+    int64_t lo, hi;
+  };
+  struct Cell {
+    Bounds range;
+    PrimExpr snapshot;
+  };
+  struct Memory {
+    Buffer buffer;
+    std::vector<Cell> cells;
+    std::vector<std::pair<PrimExpr, PrimExpr>> reads;
+  };
+  struct Update {
+    BufferLoad target;
+    PrimExpr delta;
+    bool flag;
+  };
+  using State = std::unordered_map<const VarNode *, Memory>;
+  using Effect = std::function<void()>;
+
+  void Work(size_t count = 1) {
+    work_ += count;
+    ICHECK(work_ <= kWorkLimit) << "T.dist cannot prove cumulative expected "
+                                   "within final-bound analysis budget";
+  }
+  Cell Snapshot(Bounds range, DataType dtype) {
+    if (range.lo == range.hi && range.lo != kInf && range.lo != kNegInf)
+      return {range, make_const(dtype, range.lo)};
+    Var value("dist_bound", dtype);
+    analyzer_.const_int_bound.Update(value,
+                                     arith::ConstIntBound(range.lo, range.hi));
+    return {range, value};
+  }
+  Cell Unknown(DataType dtype) {
+    Var value("dist_unknown", dtype);
+    auto b = analyzer_.const_int_bound(value);
+    return {{b->min_value, b->max_value}, value};
+  }
+  void Add(const Buffer &buffer) {
+    if (memory_.count(buffer->data.get()) ||
+        !(buffer->dtype.is_int() || buffer->dtype.is_uint()))
+      return;
+    int64_t count = 1;
+    for (const PrimExpr &dim : buffer->shape) {
+      const auto *value = dim.as<IntImmNode>();
+      if (!value || value->value <= 0 || value->value > 4096 / count)
+        return;
+      count *= value->value;
+    }
+    Memory entry{buffer, {}, {}};
+    for (int64_t i = 0; i < count; ++i)
+      entry.cells.push_back(Unknown(buffer->dtype));
+    memory_.emplace(buffer->data.get(), std::move(entry));
+  }
+  void Collect(const PrimExpr &expr) {
+    PostOrderVisit(expr, [&](const ObjectRef &node) {
+      if (const auto *load = node.as<BufferLoadNode>())
+        Add(load->buffer);
+      if (const auto *var = node.as<VarNode>())
+        needed_vars_.insert(var);
+    });
+  }
+  std::vector<const VarNode *> LocalWrites(const CallNode *call) {
+    std::vector<const VarNode *> result;
+    auto add = [&](const VarNode *data) {
+      if (memory_.count(data) && !counters_.count(data))
+        result.push_back(data);
+    };
+    if (call->op.same_as(dist_completion_init_())) {
+      add(NormalizeToBufferRegion(call->args[1])->buffer->data.get());
+      add(NormalizeToBufferRegion(call->args[2])->buffer->data.get());
+      add(Downcast<BufferLoad>(call->args[3])->buffer->data.get());
+    } else if (call->op.same_as(dist_wait_any_())) {
+      add(NormalizeToBufferRegion(call->args[4])->buffer->data.get());
+      add(Downcast<BufferLoad>(call->args[5])->buffer->data.get());
+    } else if (!IsLeafDistOp(call)) {
+      for (const PrimExpr &arg : call->args) {
+        if (const auto *region = arg.as<CallNode>();
+            region && region->op.same_as(RegionOp::Get())) {
+          RegionOp view(region->args);
+          if (view->GetAccessMask() & 2)
+            add(view->GetBuffer()->data.get());
+        } else if (const auto *var = arg.as<VarNode>();
+                   var && var->dtype.is_handle() &&
+                   SideEffect(ffi::GetRef<PrimExpr>(call)) >
+                       CallEffectKind::kReadState)
+          add(var);
+      }
+    }
+    return result;
+  }
+  bool Writes(const CallNode *call) { return !LocalWrites(call).empty(); }
+  void Invalidate(const CallNode *call) {
+    for (const auto *data : LocalWrites(call))
+      Reset(data);
+    // Public Completion progress maintains a non-negative logical count.
+    if (call->op.same_as(dist_completion_init_())) {
+      auto buffer = Downcast<BufferLoad>(call->args[3])->buffer;
+      auto count = NormalizeToBufferRegion(call->args[0])->region[0]->extent;
+      Reset(buffer->data.get(),
+            Bounds{0, RequireIntImm(count, "completion count")});
+    } else if (call->op.same_as(dist_wait_any_())) {
+      auto buffer = Downcast<BufferLoad>(call->args[5])->buffer;
+      Reset(buffer->data.get(),
+            Bounds{0, RequireIntImm(call->args[2], "completion count")});
+    }
+  }
+  bool Mark(const Stmt &stmt) {
+    bool found = false;
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const Stmt &s : seq->seq)
+        found |= Mark(s);
+    } else if (const auto *op = stmt.as<IfThenElseNode>()) {
+      found = Mark(op->then_case);
+      if (op->else_case)
+        found |= Mark(op->else_case.value());
+      if (found)
+        Collect(op->condition);
+    } else if (const auto *op = stmt.as<ForNode>()) {
+      found = Mark(op->body);
+      if (found) {
+        Collect(op->min);
+        Collect(op->extent);
+      }
+    } else if (const auto *op = stmt.as<WhileNode>()) {
+      found = Mark(op->body);
+      if (found)
+        Collect(op->condition);
+    } else if (const auto *op = stmt.as<LetStmtNode>()) {
+      found = Mark(op->body) || needed_vars_.count(op->var.get());
+      if (needed_vars_.count(op->var.get()))
+        Collect(op->value);
+    } else if (const auto *op = stmt.as<AttrStmtNode>())
+      found = Mark(op->body);
+    else if (const auto *op = stmt.as<AllocateNode>())
+      found = Mark(op->body);
+    else if (const auto *op = stmt.as<DeclBufferNode>())
+      found = Mark(op->body);
+    else if (const auto *op = stmt.as<AssertStmtNode>())
+      found = Mark(op->body);
+    else if (const auto *op = stmt.as<BlockRealizeNode>())
+      found = Mark(op->block);
+    else if (const auto *op = stmt.as<BlockNode>()) {
+      found = Mark(op->body);
+      if (op->init)
+        found |= Mark(op->init.value());
+    } else if (const auto *op = stmt.as<BufferStoreNode>())
+      found = memory_.count(op->buffer->data.get());
+    else if (const auto *op = stmt.as<EvaluateNode>()) {
+      if (const auto *call = op->value.as<CallNode>())
+        found = updates_.count(call) || Writes(call);
+    }
+    if (found)
+      relevant_.insert(stmt.get());
+    return found;
+  }
+  class Resolver : public ExprMutator {
+  public:
+    explicit Resolver(ExpectedFinalBounds *owner) : owner_(owner) {}
+    PrimExpr VisitExpr(const PrimExpr &expr) final {
+      owner_->Work();
+      return ExprMutator::VisitExpr(expr);
+    }
+    PrimExpr VisitExpr_(const VarNode *op) final {
+      auto it = owner_->bindings_.find(op);
+      return it == owner_->bindings_.end() ? ffi::GetRef<PrimExpr>(op)
+                                           : it->second;
+    }
+    PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+      Array<PrimExpr> indices;
+      for (const PrimExpr &index : op->indices)
+        indices.push_back(VisitExpr(index));
+      return owner_->Read(op->buffer, indices);
+    }
+    PrimExpr VisitExpr_(const CallNode *op) final {
+      if (op->op.same_as(builtin::if_then_else())) {
+        PrimExpr condition = owner_->analyzer_.Simplify(VisitExpr(op->args[0]));
+        if (is_one(condition))
+          return VisitExpr(op->args[1]);
+        if (is_zero(condition))
+          return VisitExpr(op->args[2]);
+        return Select(condition, VisitExpr(op->args[1]),
+                      VisitExpr(op->args[2]));
+      }
+      return ExprMutator::VisitExpr_(op);
+    }
+
+  private:
+    ExpectedFinalBounds *owner_;
+  };
+  PrimExpr Resolve(const PrimExpr &expr) {
+    Work();
+    return Resolver(this)(expr);
+  }
+  Bounds Eval(const PrimExpr &expr) {
+    if (expr.dtype().is_uint() && expr.dtype().bits() == 64) {
+      if (const auto *imm = expr.as<IntImmNode>(); imm && imm->value >= 0)
+        return {imm->value, imm->value};
+      if (const auto *call = expr.as<CallNode>();
+          call && call->op.same_as(builtin::large_uint_imm()))
+        return {0, kInf};
+    }
+    auto bound = analyzer_.const_int_bound(Resolve(expr));
+    return {bound->min_value, bound->max_value};
+  }
+  PrimExpr Index(const Buffer &buffer, const Array<PrimExpr> &indices) {
+    if (!buffer->strides.empty() || !is_zero(buffer->elem_offset))
+      return Var("dist_index", DataType::Int(64));
+    PrimExpr value = make_zero(DataType::Int(64));
+    for (size_t i = 0; i < indices.size(); ++i)
+      value = value * Cast(DataType::Int(64), buffer->shape[i]) +
+              Cast(DataType::Int(64), indices[i]);
+    return analyzer_.Simplify(Resolve(value));
+  }
+  bool SameView(const Memory &entry, const Buffer &buffer) {
+    return entry.buffer->dtype == buffer->dtype &&
+           StructuralEqual()(entry.buffer->shape, buffer->shape) &&
+           StructuralEqual()(entry.buffer->strides, buffer->strides) &&
+           StructuralEqual()(entry.buffer->elem_offset, buffer->elem_offset);
+  }
+  PrimExpr Read(const Buffer &buffer, const Array<PrimExpr> &indices) {
+    auto found = memory_.find(buffer->data.get());
+    if (found == memory_.end() || remote_.count(buffer->data.get()) ||
+        !SameView(found->second, buffer))
+      return Unknown(buffer->dtype).snapshot;
+    auto &entry = found->second;
+    PrimExpr index = Index(buffer, indices);
+    if (const auto *i = index.as<IntImmNode>()) {
+      if (i->value >= 0 && static_cast<size_t>(i->value) < entry.cells.size())
+        return entry.cells[i->value].snapshot;
+      return Unknown(buffer->dtype).snapshot;
+    }
+    for (const auto &[saved, value] : entry.reads)
+      if (StructuralEqual()(saved, index))
+        return value;
+    Bounds range{kInf, kNegInf};
+    for (const Cell &cell : entry.cells) {
+      range.lo = std::min(range.lo, cell.range.lo);
+      range.hi = std::max(range.hi, cell.range.hi);
+    }
+    PrimExpr value = Snapshot(range, buffer->dtype).snapshot;
+    entry.reads.emplace_back(index, value);
+    return value;
+  }
+  void Reset(const VarNode *data, const std::optional<Bounds> &range = {}) {
+    auto found = memory_.find(data);
+    if (found == memory_.end())
+      return;
+    auto &entry = found->second;
+    entry.reads.clear();
+    for (Cell &cell : entry.cells)
+      cell = range ? Snapshot(*range, entry.buffer->dtype)
+                   : Unknown(entry.buffer->dtype);
+  }
+  void Write(const Buffer &buffer, const Array<PrimExpr> &indices,
+             Bounds value) {
+    auto found = memory_.find(buffer->data.get());
+    if (found == memory_.end())
+      return;
+    if (!SameView(found->second, buffer)) {
+      Reset(buffer->data.get());
+      return;
+    }
+    auto &entry = found->second;
+    entry.reads.clear();
+    PrimExpr index = Index(buffer, indices);
+    if (const auto *i = index.as<IntImmNode>()) {
+      if (i->value >= 0 && static_cast<size_t>(i->value) < entry.cells.size())
+        entry.cells[i->value] = Snapshot(value, buffer->dtype);
+    } else {
+      Work(entry.cells.size());
+      for (Cell &cell : entry.cells)
+        cell = Snapshot({std::min(cell.range.lo, value.lo),
+                         std::max(cell.range.hi, value.hi)},
+                        buffer->dtype);
+    }
+  }
+  void Grow(const Update &update) {
+    Bounds delta = Eval(update.delta);
+    nonnegative_ &= delta.lo >= 0;
+    if (!update.flag)
+      return;
+    auto &entry = memory_.at(update.target->buffer->data.get());
+    PrimExpr index = Index(update.target->buffer, update.target->indices);
+    auto grow = [&](Cell &cell) {
+      int64_t upper = cell.range.hi;
+      upper = upper > 255 || delta.hi > 255 || delta.hi < 0
+                  ? 256
+                  : std::min<int64_t>(256, upper + delta.hi);
+      // Only mathematical counter bounds are saturated; runtime storage/casts
+      // and auxiliary integer values are unchanged.
+      cell = Snapshot({0, upper}, entry.buffer->dtype);
+      auto data = update.target->buffer->data.get();
+      peaks_[data] = std::max(peaks_[data], upper);
+    };
+    entry.reads.clear();
+    if (const auto *i = index.as<IntImmNode>()) {
+      if (i->value >= 0 && static_cast<size_t>(i->value) < entry.cells.size())
+        grow(entry.cells[i->value]);
+    } else
+      for (Cell &cell : entry.cells)
+        grow(cell);
+  }
+  void Join(const State &other) {
+    for (auto &[data, entry] : memory_) {
+      entry.reads.clear();
+      const auto &cells = other.at(data).cells;
+      Work(cells.size());
+      for (size_t i = 0; i < cells.size(); ++i) {
+        if (entry.cells[i].snapshot.same_as(cells[i].snapshot) &&
+            entry.cells[i].range.hi == cells[i].range.hi)
+          continue;
+        Bounds range{std::min(entry.cells[i].range.lo, cells[i].range.lo),
+                     std::max(entry.cells[i].range.hi, cells[i].range.hi)};
+        entry.cells[i] = Snapshot(range, entry.buffer->dtype);
+      }
+    }
+  }
+  void Branch(const PrimExpr &expr, const Effect &yes, const Effect &no) {
+    PrimExpr condition = analyzer_.Simplify(Resolve(expr));
+    if (is_one(condition)) {
+      yes();
+      return;
+    }
+    if (is_zero(condition)) {
+      no();
+      return;
+    }
+    State incoming = memory_;
+    {
+      With<arith::ConstraintContext> constraint(&analyzer_, condition);
+      yes();
+    }
+    State left = std::move(memory_);
+    memory_ = std::move(incoming);
+    {
+      With<arith::ConstraintContext> constraint(&analyzer_, Not(condition));
+      no();
+    }
+    Join(left);
+  }
+  bool InvariantGrowth(const ForNode *loop) {
+    bool invariant = true;
+    auto inspect = [&](const PrimExpr &expr) {
+      PostOrderVisit(expr, [&](const ObjectRef &node) {
+        if (node.get() == loop->loop_var.get())
+          invariant = false;
+        if (const auto *load = node.as<BufferLoadNode>();
+            load && counters_.count(load->buffer->data.get()))
+          invariant = false;
+      });
+    };
+    PostOrderVisit(loop->body, [&](const ObjectRef &node) {
+      if (const auto *store = node.as<BufferStoreNode>();
+          store && memory_.count(store->buffer->data.get()))
+        invariant = false;
+      else if (const auto *call = node.as<CallNode>()) {
+        if (Writes(call))
+          invariant = false;
+        auto it = updates_.find(call);
+        if (it != updates_.end())
+          for (const Update &u : it->second) {
+            inspect(u.delta);
+            for (const PrimExpr &index : u.target->indices)
+              inspect(index);
+          }
+      } else if (const auto *branch = node.as<IfThenElseNode>();
+                 branch && relevant_.count(branch))
+        inspect(branch->condition);
+      else if (const auto *nested = node.as<ForNode>();
+               nested && relevant_.count(nested)) {
+        inspect(nested->min);
+        inspect(nested->extent);
+        if (nested->step)
+          inspect(nested->step.value());
+      } else if (const auto *nested = node.as<WhileNode>();
+                 nested && relevant_.count(nested))
+        inspect(nested->condition);
+      else if (const auto *let = node.as<LetStmtNode>();
+               let && needed_vars_.count(let->var.get()))
+        inspect(let->value);
+    });
+    return invariant;
+  }
+  Effect Build(const Stmt &stmt) {
+    if (!relevant_.count(stmt.get()))
+      return [] {};
+    if (const auto *op = stmt.as<SeqStmtNode>()) {
+      std::vector<Effect> effects;
+      for (const Stmt &s : op->seq)
+        if (relevant_.count(s.get()))
+          effects.push_back(Build(s));
+      return [this, effects] {
+        for (const auto &f : effects) {
+          Work();
+          f();
+        }
+      };
+    }
+    if (const auto *op = stmt.as<IfThenElseNode>()) {
+      auto yes = Build(op->then_case),
+           no = op->else_case ? Build(op->else_case.value()) : Effect([] {});
+      return [this, op, yes, no] {
+        Work();
+        Branch(op->condition, yes, no);
+      };
+    }
+    if (const auto *op = stmt.as<ForNode>()) {
+      auto body = Build(op->body);
+      return [this, op, body] {
+        Bounds min = Eval(op->min), extent = Eval(op->extent);
+        Bounds step = Eval(op->step.value_or(make_const(op->min.dtype(), 1)));
+        ICHECK(step.lo == step.hi && step.lo > 0 && extent.hi != kInf)
+            << "T.dist cannot prove cumulative expected for loop bounds";
+        int64_t count = extent.hi > 0 ? (extent.hi - 1) / step.lo + 1 : 0;
+        if (count > 4096 && InvariantGrowth(op)) {
+          State incoming = memory_;
+          auto peaks = peaks_;
+          for (const auto *data : counters_)
+            for (Cell &cell : memory_.at(data).cells)
+              cell = Snapshot({0, 0}, memory_.at(data).buffer->dtype);
+          body();
+          State increments = std::move(memory_);
+          memory_ = std::move(incoming);
+          peaks_ = std::move(peaks);
+          for (const auto *data : counters_) {
+            auto &cells = memory_.at(data).cells;
+            for (size_t i = 0; i < cells.size(); ++i) {
+              auto amount = increments.at(data).cells[i].range.hi;
+              auto previous = cells[i].range.hi;
+              int64_t upper =
+                  previous > 255 || amount > 255 ||
+                          (amount > 0 && count > (255 - previous) / amount)
+                      ? 256
+                      : previous + count * amount;
+              cells[i] = Snapshot({0, upper}, memory_.at(data).buffer->dtype);
+              peaks_[data] = std::max(peaks_[data], upper);
+            }
+          }
+          return;
+        }
+        ICHECK(count <= 4096)
+            << "T.dist cannot prove cumulative expected for loop extent "
+            << op->extent;
+        auto saved = bindings_;
+        for (int64_t i = 0; i < count; ++i) {
+          Work();
+          bindings_[op->loop_var.get()] =
+              Snapshot({min.lo == kNegInf ? kNegInf : min.lo + i * step.lo,
+                        min.hi == kInf ? kInf : min.hi + i * step.lo},
+                       op->loop_var.dtype())
+                  .snapshot;
+          Branch(make_const(op->extent.dtype(), i * step.lo) < op->extent, body,
+                 [] {});
+        }
+        bindings_ = std::move(saved);
+      };
+    }
+    if (const auto *op = stmt.as<WhileNode>()) {
+      bool grows = false;
+      std::unordered_set<const VarNode *> writes;
+      PostOrderVisit(op->body, [&](const ObjectRef &node) {
+        if (const auto *call = node.as<CallNode>()) {
+          grows |= updates_.count(call) != 0;
+          for (const auto *data : LocalWrites(call))
+            writes.insert(data);
+        }
+        if (const auto *store = node.as<BufferStoreNode>())
+          writes.insert(store->buffer->data.get());
+      });
+      if (grows) {
+        auto body = Build(op->body);
+        return [this, op, body] {
+          // A scalar induction variable may make every condition decidable.
+          // Reuse the numeric body summary, with a fixed iteration budget.
+          for (size_t count = 0;; ++count) {
+            Work();
+            PrimExpr condition = analyzer_.Simplify(Resolve(op->condition));
+            if (is_zero(condition))
+              return;
+            ICHECK(is_one(condition) && count < 4096)
+                << "T.dist cannot prove cumulative expected for a "
+                   "data-dependent while";
+            body();
+          }
+        };
+      }
+      // A completion consumer does not increase expected. Unknown iterations
+      // invalidate its auxiliary writes instead of simulating pending progress.
+      return [this, writes] {
+        for (const auto *data : writes)
+          Reset(data);
+      };
+    }
+    if (const auto *op = stmt.as<LetStmtNode>()) {
+      auto body = Build(op->body);
+      return [this, op, body] {
+        auto saved = bindings_;
+        if (needed_vars_.count(op->var.get()))
+          bindings_[op->var.get()] =
+              Snapshot(Eval(op->value), op->var.dtype()).snapshot;
+        body();
+        bindings_ = std::move(saved);
+      };
+    }
+    if (const auto *op = stmt.as<BufferStoreNode>())
+      return [this, op] {
+        Work();
+        Write(op->buffer, op->indices, Eval(op->value));
+      };
+    if (const auto *op = stmt.as<AllocateNode>()) {
+      auto body = Build(op->body);
+      return [this, op, body] {
+        auto init = op->annotations.Get(tl::attr::kLocalVarInit);
+        Reset(
+            op->buffer_var.get(),
+            init ? std::optional<Bounds>(Eval(Downcast<PrimExpr>(init.value())))
+                 : std::nullopt);
+        body();
+      };
+    }
+    if (const auto *op = stmt.as<AttrStmtNode>()) {
+      auto body = Build(op->body);
+      return [this, op, body] {
+        if (op->attr_key == tir::attr::thread_extent) {
+          auto iv = Downcast<IterVar>(op->node);
+          analyzer_.Bind(iv->var, Range::FromMinExtent(0, op->value), true);
+        }
+        body();
+      };
+    }
+    if (const auto *op = stmt.as<DeclBufferNode>())
+      return Build(op->body);
+    if (const auto *op = stmt.as<AssertStmtNode>())
+      return Build(op->body);
+    if (const auto *op = stmt.as<BlockRealizeNode>())
+      return Build(op->block);
+    if (const auto *op = stmt.as<BlockNode>()) {
+      auto body = Build(op->body);
+      return [this, op, body] {
+        if (auto init = op->annotations.Get(tl::attr::kLocalVarInit)) {
+          for (const auto &[data, value] :
+               Downcast<Map<Var, PrimExpr>>(init.value()))
+            Reset(data.get(), Eval(value));
+        }
+        body();
+      };
+    }
+    const auto *eval = stmt.as<EvaluateNode>();
+    ICHECK(eval) << "Unsupported expected growth summary statement "
+                 << stmt->GetTypeKey();
+    const auto *call = eval->value.as<CallNode>();
+    ICHECK(call);
+    return [this, call] {
+      Work();
+      auto it = updates_.find(call);
+      if (it != updates_.end())
+        for (const Update &u : it->second)
+          Grow(u);
+      Invalidate(call);
+    };
+  }
+
+  Stmt source_;
+  bool enabled_, nonnegative_{true};
+  size_t work_{0};
+  arith::Analyzer analyzer_;
+  State memory_;
+  std::unordered_map<const CallNode *, std::vector<Update>> updates_;
+  std::unordered_map<const VarNode *, PrimExpr> lets_, bindings_;
+  std::unordered_set<const VarNode *> needed_vars_, counters_, remote_;
+  std::unordered_set<const StmtNode *> relevant_;
+  std::unordered_map<const VarNode *, int64_t> peaks_;
+};
+
 class InjectDistSignalAdvance : public StmtExprMutator {
 public:
   explicit InjectDistSignalAdvance(
+      const PrimFunc &func,
       std::unordered_set<const EvaluateNode *> empty_submits)
-      : empty_submits_(std::move(empty_submits)) {}
+      : empty_submits_(std::move(empty_submits)), bounds_(func) {}
 
   static PrimFunc
   Run(PrimFunc func,
       std::unordered_set<const EvaluateNode *> empty_submits = {}) {
-    InjectDistSignalAdvance injector(std::move(empty_submits));
+    InjectDistSignalAdvance injector(func, std::move(empty_submits));
     Stmt body = injector(func->body);
+    injector.bounds_.Check();
     if (!body.same_as(func->body)) {
       func.CopyOnWrite()->body = std::move(body);
     }
@@ -691,6 +1369,24 @@ public:
   }
 
 private:
+  PrimExpr StorageDelta(DataType dtype, const PrimExpr &delta) {
+    // Fold constant integer narrowing with its ordinary modulo semantics.
+    // Some generic simplifier paths cannot construct an out-of-range u32
+    // literal when a u64 constant is narrowed. Validation uses the raw delta.
+    std::optional<uint64_t> constant;
+    if (const auto *imm = delta.as<IntImmNode>())
+      constant = static_cast<uint64_t>(imm->value);
+    else if (const auto *call = delta.as<CallNode>();
+             call && call->op.same_as(builtin::large_uint_imm()))
+      constant =
+          static_cast<uint64_t>(Downcast<IntImm>(call->args[0])->value) |
+          (static_cast<uint64_t>(Downcast<IntImm>(call->args[1])->value) << 32);
+    if (constant && dtype.is_uint() && dtype.bits() < 64)
+      return make_const(dtype,
+                        constant.value() & ((uint64_t{1} << dtype.bits()) - 1));
+    return Cast(dtype, delta);
+  }
+
   Stmt VisitStmt_(const EvaluateNode *evaluate_node) final {
     const auto *call = evaluate_node->value.as<CallNode>();
     if (!call) {
@@ -762,9 +1458,10 @@ private:
     if (call->op.same_as(dist_expect_())) {
       ICHECK_EQ(call->args.size(), 2U);
       BufferLoad expected = RequireLocalState(call->args[0], "expected");
-      // LowerDistCommunication checked the original delta and cumulative
-      // expected before narrowing to the signal's logical width.
-      PrimExpr delta = Cast(expected->dtype, call->args[1]);
+      // Preserve the original growth site before runtime storage casts. The
+      // function's final mathematical flag bounds are checked after emission.
+      bounds_.Register(call, expected, call->args[1]);
+      PrimExpr delta = StorageDelta(expected->dtype, call->args[1]);
       PrimExpr next = Cast(expected->dtype, expected + delta);
       return BufferStore(expected->buffer, next, expected->indices);
     }
@@ -845,7 +1542,11 @@ private:
       PrimExpr pending_index =
           pending->region[0]->min + IntImm(DataType::Int(32), index);
       PrimExpr current = BufferLoad(signal_expect->buffer, {signal_index});
-      PrimExpr typed_delta = Cast(signal_expect->buffer->dtype, delta);
+      if (!is_zero(advance_expected))
+        bounds_.Register(
+            call, Downcast<BufferLoad>(current),
+            Select(advance_expected, delta, make_zero(delta.dtype())));
+      PrimExpr typed_delta = StorageDelta(signal_expect->buffer->dtype, delta);
       PrimExpr next =
           Cast(signal_expect->buffer->dtype,
                current + Select(advance_expected, typed_delta,
@@ -877,6 +1578,7 @@ private:
   }
 
   std::unordered_set<const EvaluateNode *> empty_submits_;
+  ExpectedFinalBounds bounds_;
 };
 
 PrimFunc Run(PrimFunc func) {
@@ -887,7 +1589,7 @@ PrimFunc Run(PrimFunc func) {
   if (!detector.Detect(func->body)) {
     return func;
   }
-  DistQueueValidator::Result queue = DistQueueValidator::Validate(func->body);
+  DistQueueValidator::Result queue = DistQueueValidator::Validate(func);
   // Inject at the recorded nodes before signal lowering rebuilds the tree.
   if (!queue.returns_needing_wait.empty() ||
       !queue.core_exits_needing_wait.empty() ||

@@ -763,10 +763,16 @@ private:
     ICHECK(!alloc_buffer_stack_.empty());
     std::string name = "dist_route_active_" + std::to_string(route_counter_) +
                        "_" + std::to_string(src_row);
+    // The predicate uses scalar tile access, and its local multicast must
+    // cover a complete RSRAM transfer unit. Only element zero is semantic.
+    const DataType dtype = DataType::Int(32);
+    int elements = GetSunmmioRsramAlignmentElems(
+        GetSunmmioTileProcessorConfig(target_).rsram_mcast_transfer_bytes,
+        dtype);
     Buffer stage =
-        decl_buffer({I32(1)}, DataType::UInt(8), name, kSunmmioScopeRSRAM);
+        decl_buffer({I32(elements)}, dtype, name, kSunmmioScopeRSRAM);
     alloc_buffer_stack_.back().push_back(stage);
-    return BufferRegion(stage, {Range::FromMinExtent(I32(0), I32(1))});
+    return BufferRegion(stage, {Range::FromMinExtent(I32(0), I32(elements))});
   }
 
   Stmt LowerDynamicRoutedPut(const Call &call, const Var &current_core,
@@ -811,12 +817,12 @@ private:
         statements.push_back(IfThenElse(
             current_row == I32(src_row),
             BufferStore(active_stage->buffer,
-                        Cast(DataType::UInt(8), peer_active), {I32(0)})));
+                        Cast(DataType::Int(32), peer_active), {I32(0)})));
         statements.push_back(Evaluate(
             Call(DataType::Handle(), PutOp::Get(),
                  {active_read, active_write, I32(-1), src_core, egress_core})));
         peer_active = BufferLoad(active_stage->buffer, {I32(0)}) !=
-                      IntImm(DataType::UInt(8), 0);
+                      IntImm(DataType::Int(32), 0);
       }
 
       PrimExpr signal;

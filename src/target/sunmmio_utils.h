@@ -16,7 +16,10 @@
 #include <tvm/runtime/data_type.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/target/target.h>
+#include <tvm/tir/buffer.h>
 #include <tvm/tir/expr.h>
+
+#include "../layout/layout.h"
 
 namespace tvm {
 namespace tl {
@@ -64,12 +67,33 @@ struct SunmmioTileProcessorConfig {
   // does not exceed this fits entirely in the north bank and needs no
   // two-pass legalization.
   int bf16_gemm_single_pass_max_rows;
+  // Minimum full transfer size for HLink/VLink writes to RSRAM.
+  int rsram_mcast_transfer_bytes;
 };
 
 struct SunmmioMeshConfig {
   int nrow;
   int ncol;
 };
+
+struct SunmmioScalarTileAccessPlan {
+  std::vector<int64_t> tile_shape;
+  std::vector<int64_t> tiled_dims;
+  std::vector<PrimExpr> partition_indices;
+  std::vector<PrimExpr> local_indices;
+};
+
+std::optional<SunmmioScalarTileAccessPlan> PlanSunmmioScalarTileAccess(
+    const tir::Buffer &buffer, const ffi::Array<PrimExpr> &indices,
+    DataType dtype, const ffi::Optional<Layout> &layout,
+    const SunmmioTileProcessorConfig &config, std::string *failure_reason);
+
+// Physical read/modify/write footprint of the scalar RSRAM tile path.
+tir::Region
+GetSunmmioScalarTileAccessRegion(const tir::Buffer &buffer,
+                                 const ffi::Array<PrimExpr> &indices,
+                                 const ffi::Map<tir::Buffer, Layout> &layouts,
+                                 const SunmmioTileProcessorConfig &config);
 
 // Physical mechanism used by a direct Sunmmio data transfer.
 enum class SunmmioTransferMechanism {

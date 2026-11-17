@@ -268,7 +268,8 @@ mlir::Type SunmmioMlirType::MapType(const SunMMIOType &type) const {
     mlir::suvm::MemorySpaceAttr memory_scope =
         MapMemorySpaceAttr(&ctx_.mlir_ctx, canonical_type.memory_scope);
     mlir::suvm::MemTensorType memtensor = mlir::suvm::MemTensorType::get(
-        shape, elem, layout, memory_scope, canonical_type.byte_offset);
+        shape, elem, layout, memory_scope, canonical_type.byte_offset,
+        canonical_type.peer_writable);
     return mlir::Type::getFromOpaquePointer(memtensor.getAsOpaquePointer());
   }
   case SunMMIOType::Kind::kTileView: {
@@ -284,6 +285,17 @@ mlir::Type SunmmioMlirType::MapType(const SunMMIOType &type) const {
     mlir::suvm::TileType tile = mlir::suvm::TileType::get(shape, elem);
     return mlir::Type::getFromOpaquePointer(tile.getAsOpaquePointer());
   }
+  case SunMMIOType::Kind::kDistSignal: {
+    auto kind = mlir::suvm::symbolizeSignalKind(canonical_type.signal_kind);
+    ICHECK(kind) << "Unknown SUVM signal kind: " << canonical_type.signal_kind;
+    return mlir::suvm::DistSignalType::get(
+        &ctx_.mlir_ctx, *kind,
+        MapMemorySpaceAttr(&ctx_.mlir_ctx, canonical_type.memory_scope)
+            .getValue(),
+        canonical_type.signal_count);
+  }
+  case SunMMIOType::Kind::kDistBatch:
+    return mlir::suvm::DistBatchType::get(&ctx_.mlir_ctx);
   case SunMMIOType::Kind::kUnknown:
     LOG(FATAL) << "Cannot map unknown SunMMIO type with dtype "
                << DTypeToString(canonical_type.dtype);

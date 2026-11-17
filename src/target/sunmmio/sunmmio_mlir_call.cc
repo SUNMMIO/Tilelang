@@ -9,6 +9,7 @@
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/Operation.h"
 #include "npuir/Dialect/SUVM/IR/Attributes.h"
+#include "npuir/Dialect/SUVM/IR/Dialect.h"
 #include "npuir/Dialect/SUVM/IR/Ops.h"
 #include "npuir/Dialect/SUVM/IR/Types.h"
 
@@ -107,6 +108,7 @@ SunMMIOType ConvertMemTensorType(mlir::suvm::MemTensorType memtensor_type,
   type.memory_scope =
       MapMemoryScopeName(memtensor_type.getMemorySpace().getValue());
   type.byte_offset = memtensor_type.getByteOffset();
+  type.peer_writable = memtensor_type.getPeerWritable();
   return type;
 }
 
@@ -137,8 +139,8 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
     int64_t shifted_offset = memtensor_ty.getByteOffset() + byte_offset;
     auto shifted_ty = mlir::suvm::MemTensorType::get(
         memtensor_ty.getShape(), memtensor_ty.getElementType(),
-        memtensor_ty.getLayout(), memtensor_ty.getMemorySpace(),
-        shifted_offset);
+        memtensor_ty.getLayout(), memtensor_ty.getMemorySpace(), shifted_offset,
+        memtensor_ty.getPeerWritable());
     auto shift_op = mlir::suvm::ShiftMemTensorOp::create(
         ctx_.builder, type.MakeDebugLoc("shift_memtensor"), shifted_ty, source,
         static_cast<uint64_t>(byte_offset));
@@ -172,9 +174,8 @@ SunMMIOValue SunmmioMlirCall::RegionCall(
     shape.push_back(1);
     tiled_dims.push_back(0);
   }
-  ICHECK(shape.size() == 1 || shape.size() == 2)
-      << "tl.tileop.region expects one or two tiled dims with extent != 1, "
-         "but got "
+  ICHECK(mlir::suvm::SUVMDialect::isSupportedTileViewRank(shape.size()))
+      << "tl.tileop.region exceeds the SUVM tile_view rank limit, got "
       << shape.size();
 
   mlir::Type elem_ty = memtensor_ty.getElementType();

@@ -112,7 +112,8 @@ def test_generated_state_access_validates_without_dist_handlers(tmp_path, kind):
 
     func = single_prim_func(result.device_mod)
     body = tvm.tir.stmt_functor.ir_transform(func.body, None, remove_dist, ["tir.Call"])
-    mod = tvm.IRModule({"state_access": func.with_body(body)})
+    # The isolated storage program has no physical signal resources.
+    mod = tvm.IRModule({"state_access": func.with_body(body).without_attr("tl.dist.signal_counts")})
     source = codegen_sunmmio_suvm_mlir(mod, log_ir=False)
     assert "suvm.tile.pick" in source and "suvm.tile.set" in source
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate", "--suvm-to-llvm-pipeline"))

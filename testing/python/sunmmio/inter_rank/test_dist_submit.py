@@ -202,7 +202,7 @@ def source_lifetime_kernel_factory(mode="submitted_overlap", redundant_submit=Fa
     @T.prim_func
     def main(rank_id: T.dist.RankId):
         with T.Kernel():
-            src = T.alloc_shared((64,), T.bfloat16)
+            src = T.alloc_shared((512,), T.bfloat16)
             dst = T.alloc_shared((32,), T.bfloat16)
             signal = T.dist.signal()
             T.dist.put(src[0:32], dst, (rank_id + 1) % world_size, signal=signal)
@@ -214,7 +214,7 @@ def source_lifetime_kernel_factory(mode="submitted_overlap", redundant_submit=Fa
             if mode == "submitted_overlap":
                 src[0] = 0
             elif mode == "submitted_disjoint":
-                src[32] = 0
+                src[256] = 0
             elif mode == "submitted_dma_overlap":
                 T.copy(dst, src[0:32])
 
@@ -226,12 +226,12 @@ def mutable_source_index_kernel_factory(submitted=True, mutate=True, world_size:
     @T.prim_func
     def main(initial: T.int32, rank_id: T.dist.RankId):
         with T.Kernel():
-            src = T.alloc_shared((128,), T.bfloat16)
+            src = T.alloc_shared((1024,), T.bfloat16)
             dst = T.alloc_shared((32,), T.bfloat16)
             position = T.alloc_var(T.int32, init=initial)
             signal = T.dist.signal(expect="manual")
             T.dist.put(
-                src[position * 32 : (position + 1) * 32],
+                src[position * 256 : position * 256 + 32],
                 dst,
                 (rank_id + 1) % world_size,
                 signal=signal,
@@ -240,9 +240,9 @@ def mutable_source_index_kernel_factory(submitted=True, mutate=True, world_size:
                 T.dist.submit()
             if mutate:
                 position += 1
-                src[(position - 1) * 32] = 0
+                src[(position - 1) * 256] = 0
             else:
-                src[(position + 1) * 32] = 0
+                src[(position + 1) * 256] = 0
             if not submitted:
                 T.dist.submit()
 
@@ -515,7 +515,7 @@ def test_disjoint_source_write_keeps_wait_at_scope_exit(redundant_submit):
     )
     script = result.pass_snapshot("tl.LowerDistSync").mod.script()
     submit = script.index("T.dist_submit_()")
-    store = script.index("src[32] =", submit)
+    store = script.index("src[256] =", submit)
     wait = script.index("T.dist_wait_send()", submit)
     assert submit < store < wait
 
@@ -704,8 +704,8 @@ def test_index_storage_writes_preserve_queued_and_inflight_sources(submitted, in
 
 
 def test_loop_carried_source_preserves_invariant_disjoint_dimensions():
-    src = tvm.tir.decl_buffer((2, 128), "bfloat16", name="src", scope="shared.rsram")
-    dst = tvm.tir.decl_buffer((2, 128), "bfloat16", name="dst", scope="shared.rsram")
+    src = tvm.tir.decl_buffer((16, 128), "bfloat16", name="src", scope="shared.rsram")
+    dst = tvm.tir.decl_buffer((16, 128), "bfloat16", name="dst", scope="shared.rsram")
     i = tvm.tir.Var("i", "int32")
 
     def region(buffer, access):
@@ -718,15 +718,15 @@ def test_loop_carried_source_preserves_invariant_disjoint_dimensions():
         tvm.tir.ForKind.SERIAL,
         tvm.tir.SeqStmt(
             [
-                tvm.tir.BufferStore(src, tvm.tir.const(0, "bfloat16"), [1, (i - 1) * 32]),
+                tvm.tir.BufferStore(src, tvm.tir.const(0, "bfloat16"), [8, (i - 1) * 32]),
                 _dist_leaf("dist_put_", region(src, 1), region(dst, 2), 1, "sram_flagreg_inc", 0, tvm.tir.const(0, "uint8")),
                 _dist_leaf("dist_submit_"),
             ]
         ),
     )
     func = _inject_queue_body(loop, [src.data, dst.data])
-    # Only the existing pre-submit wait and final drain are needed: row 1 is
-    # disjoint from every previous send, even as the column changes each round.
+    # Only the existing pre-submit wait and final drain are needed: row 8 is
+    # in a different physical tile from every previous send, even as the column changes each round.
     assert collect_op_names(func).count("tl.dist_wait_send") == 2
 
 

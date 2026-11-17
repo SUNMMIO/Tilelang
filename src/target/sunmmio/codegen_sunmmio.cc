@@ -150,35 +150,6 @@ std::string PrimExprArrayToString(const ffi::Array<PrimExpr> &exprs) {
   return os.str();
 }
 
-std::string IntVectorToString(const std::vector<int64_t> &values) {
-  std::ostringstream os;
-  os << "[";
-  for (size_t i = 0; i < values.size(); ++i) {
-    if (i != 0) {
-      os << ", ";
-    }
-    os << values[i];
-  }
-  os << "]";
-  return os.str();
-}
-
-int64_t StaticIntOrNegative(const PrimExpr &expr, arith::Analyzer *analyzer) {
-  PrimExpr simplified = analyzer->Simplify(expr);
-  const auto *imm = simplified.as<IntImmNode>();
-  if (!imm || imm->value <= 0) {
-    return -1;
-  }
-  return imm->value;
-}
-
-struct ScalarTileAccessPlan {
-  std::vector<int64_t> tile_shape;
-  std::vector<int64_t> tiled_dims;
-  std::vector<PrimExpr> partition_indices;
-  std::vector<PrimExpr> local_indices;
-};
-
 std::string DescribeScalarTileAccess(const tir::Buffer &buffer,
                                      const ffi::Array<PrimExpr> &indices,
                                      DataType dtype,
@@ -194,279 +165,6 @@ std::string DescribeScalarTileAccess(const tir::Buffer &buffer,
     os << ", layout=<plain row-major fallback>";
   }
   return os.str();
-}
-
-std::vector<int64_t> GetScalarAccessLayoutExtents(
-    const tir::Buffer &buffer, const ffi::Optional<tl::Layout> &layout,
-    arith::Analyzer *analyzer, std::string *failure_reason) {
-  ffi::Array<PrimExpr> extents;
-  if (layout.defined()) {
-    const auto *cute = layout.value().as<tl::CuteLayoutNode>();
-    if (!cute) {
-      if (failure_reason != nullptr) {
-        *failure_reason = "Sunmmio scalar tile access planning expects a "
-                          "CuteLayout when a layout annotation is present.";
-      }
-      return {};
-    }
-    extents = cute->GetCoveredShape();
-  } else {
-    extents = buffer->shape;
-  }
-
-  std::vector<int64_t> static_extents;
-  static_extents.reserve(extents.size());
-  for (const PrimExpr &extent : extents) {
-    static_extents.push_back(StaticIntOrNegative(extent, analyzer));
-  }
-  return static_extents;
-}
-
-int64_t TileElementCount(const std::vector<int64_t> &shape) {
-  int64_t elems = 1;
-  for (int64_t extent : shape) {
-    elems *= extent;
-  }
-  return elems;
-}
-
-bool TileTransferSizeIsLegal(const tir::Buffer &buffer, DataType dtype,
-                             const std::vector<int64_t> &tile_shape,
-                             const tl::SunmmioTileProcessorConfig &config) {
-  if (!IsSunmmioRsramScope(buffer.scope())) {
-    return true;
-  }
-  if (config.rsram_align_bytes <= 0) {
-    return true;
-  }
-  int64_t tile_bits =
-      TileElementCount(tile_shape) * static_cast<int64_t>(dtype.bits());
-  if (tile_bits % 8 != 0) {
-    return false;
-  }
-  int64_t tile_bytes = tile_bits / 8;
-  return tile_bytes >= config.rsram_align_bytes &&
-         tile_bytes % config.rsram_align_bytes == 0;
-}
-
-bool CandidateExtentsAreLegal(const tl::TrailingTilePattern &pattern,
-                              const std::vector<int64_t> &layout_extents,
-                              std::string *failure_reason) {
-  for (size_t i = 0; i < pattern.mapped_dims.size(); ++i) {
-    int dim = pattern.mapped_dims[i];
-    int64_t extent = layout_extents[dim];
-    int64_t tile_extent = pattern.tile_shape[i];
-    if (extent < 0) {
-      continue;
-    }
-    if (tile_extent > extent) {
-      if (failure_reason != nullptr) {
-        std::ostringstream os;
-        os << "tile extent " << tile_extent << " exceeds layout extent "
-           << extent << " at buffer dim " << dim << ".";
-        *failure_reason = os.str();
-      }
-      return false;
-    }
-    if (extent % tile_extent != 0) {
-      if (failure_reason != nullptr) {
-        std::ostringstream os;
-        os << "layout extent " << extent << " is not divisible by tile extent "
-           << tile_extent << " at buffer dim " << dim << ".";
-        *failure_reason = os.str();
-      }
-      return false;
-    }
-  }
-  return true;
-}
-
-bool HasTrailingRowMajorContiguousOrder(
-    const tir::Buffer &buffer,
-    const ffi::Map<tir::Buffer, tl::Layout> &layout_map,
-    std::string *failure_reason) {
-  std::vector<tl::ContiguousStep> steps =
-      tl::GetBufferContiguousSteps(buffer, layout_map);
-  if (steps.empty()) {
-    if (failure_reason != nullptr) {
-      *failure_reason = "cannot recover a contiguous trailing layout step.";
-    }
-    return false;
-  }
-  int width_dim = static_cast<int>(buffer->shape.size()) - 1;
-  if (steps.front().dim != width_dim) {
-    if (failure_reason != nullptr) {
-      std::ostringstream os;
-      os << "the innermost contiguous layout step is dim " << steps.front().dim
-         << ", not the trailing width dim " << width_dim
-         << "; suvm.tile.load/store require row-major tile views.";
-      *failure_reason = os.str();
-    }
-    return false;
-  }
-  return true;
-}
-
-std::optional<tl::TrailingTilePattern>
-SelectScalarTilePattern(const tir::Buffer &buffer, int tile_rank,
-                        DataType dtype,
-                        const ffi::Map<tir::Buffer, tl::Layout> &layout_map,
-                        const std::vector<int64_t> &layout_extents,
-                        const tl::SunmmioTileProcessorConfig &config,
-                        arith::Analyzer *analyzer, std::string *last_reason) {
-  std::vector<tl::TrailingTilePattern> legal_patterns;
-  for (const tl::TrailingTilePattern &pattern :
-       tl::EnumerateInferredTrailingTilePatterns(
-           buffer, tile_rank, layout_map, config, analyzer,
-           {tl::TileExtentPolicy::kRegisterBounded,
-            tl::AlignmentMode::kStrict})) {
-    if (static_cast<int>(pattern.tile_shape.size()) != tile_rank) {
-      continue;
-    }
-    std::vector<int64_t> tile_shape(pattern.tile_shape.begin(),
-                                    pattern.tile_shape.end());
-    if (!TileTransferSizeIsLegal(buffer, dtype, tile_shape, config)) {
-      if (last_reason != nullptr) {
-        std::ostringstream os;
-        os << "tile shape " << IntVectorToString(tile_shape)
-           << " does not satisfy the " << config.rsram_align_bytes
-           << "-byte RSRAM vector-transfer size/alignment constraint.";
-        *last_reason = os.str();
-      }
-      continue;
-    }
-    if (!CandidateExtentsAreLegal(pattern, layout_extents, last_reason)) {
-      continue;
-    }
-    legal_patterns.push_back(pattern);
-  }
-
-  if (legal_patterns.empty()) {
-    return std::nullopt;
-  }
-
-  std::sort(legal_patterns.begin(), legal_patterns.end(),
-            [](const tl::TrailingTilePattern &lhs,
-               const tl::TrailingTilePattern &rhs) {
-              int64_t lhs_elems = tl::TileElements(lhs.tile_shape);
-              int64_t rhs_elems = tl::TileElements(rhs.tile_shape);
-              if (lhs_elems != rhs_elems) {
-                return lhs_elems > rhs_elems;
-              }
-              return lhs.tile_shape > rhs.tile_shape;
-            });
-  return legal_patterns.front();
-}
-
-std::optional<ScalarTileAccessPlan> PlanScalarTileAccess(
-    const tir::Buffer &buffer, const ffi::Array<PrimExpr> &indices,
-    DataType dtype, const ffi::Optional<tl::Layout> &layout,
-    const tl::SunmmioTileProcessorConfig &config, std::string *failure_reason) {
-  int buffer_rank = static_cast<int>(buffer->shape.size());
-  if (buffer_rank < 1) {
-    if (failure_reason != nullptr) {
-      *failure_reason = "scalar tile access requires a rank >= 1 buffer.";
-    }
-    return std::nullopt;
-  }
-  if (static_cast<int>(indices.size()) != buffer_rank) {
-    if (failure_reason != nullptr) {
-      std::ostringstream os;
-      os << "indices rank " << indices.size()
-         << " does not match source buffer rank " << buffer_rank << ".";
-      *failure_reason = os.str();
-    }
-    return std::nullopt;
-  }
-
-  arith::Analyzer analyzer;
-  ffi::Map<tir::Buffer, tl::Layout> layout_map;
-  if (layout.defined()) {
-    layout_map.Set(buffer, layout.value());
-  }
-
-  std::string local_reason;
-  std::vector<int64_t> layout_extents =
-      GetScalarAccessLayoutExtents(buffer, layout, &analyzer, &local_reason);
-  if (layout_extents.empty()) {
-    if (failure_reason != nullptr) {
-      *failure_reason = local_reason;
-    }
-    return std::nullopt;
-  }
-  if (static_cast<int>(layout_extents.size()) != buffer_rank) {
-    if (failure_reason != nullptr) {
-      std::ostringstream os;
-      os << "layout covered rank " << layout_extents.size()
-         << " does not match buffer rank " << buffer_rank << ".";
-      *failure_reason = os.str();
-    }
-    return std::nullopt;
-  }
-
-  if (!HasTrailingRowMajorContiguousOrder(buffer, layout_map, &local_reason)) {
-    if (failure_reason != nullptr) {
-      *failure_reason = local_reason;
-    }
-    return std::nullopt;
-  }
-
-  std::vector<int> ranks_to_try;
-  if (buffer_rank >= 2) {
-    ranks_to_try.push_back(2);
-  }
-  ranks_to_try.push_back(1);
-
-  std::optional<tl::TrailingTilePattern> selected;
-  for (int tile_rank : ranks_to_try) {
-    selected = SelectScalarTilePattern(buffer, tile_rank, dtype, layout_map,
-                                       layout_extents, config, &analyzer,
-                                       &local_reason);
-    if (selected.has_value()) {
-      break;
-    }
-  }
-
-  if (!selected.has_value()) {
-    if (failure_reason != nullptr) {
-      std::ostringstream os;
-      os << "cannot infer a legal trailing rank-1/rank-2 tile_view";
-      if (!local_reason.empty()) {
-        os << ": " << local_reason;
-      }
-      os << ". Use an aligned-row-major staging layout when logical extents "
-            "are "
-            "not compatible with 64B RSRAM vector transfers.";
-      *failure_reason = os.str();
-    }
-    return std::nullopt;
-  }
-
-  ScalarTileAccessPlan plan;
-  plan.tile_shape.assign(selected->tile_shape.begin(),
-                         selected->tile_shape.end());
-  plan.tiled_dims.assign(selected->mapped_dims.begin(),
-                         selected->mapped_dims.end());
-  plan.partition_indices.reserve(buffer_rank);
-  std::unordered_map<int, int64_t> tiled_dim_to_extent;
-  for (size_t i = 0; i < selected->mapped_dims.size(); ++i) {
-    tiled_dim_to_extent[selected->mapped_dims[i]] = selected->tile_shape[i];
-  }
-
-  for (int dim = 0; dim < buffer_rank; ++dim) {
-    auto it = tiled_dim_to_extent.find(dim);
-    if (it == tiled_dim_to_extent.end()) {
-      plan.partition_indices.push_back(indices[dim]);
-      continue;
-    }
-    PrimExpr tile_extent = IntImm(indices[dim].dtype(), it->second);
-    plan.partition_indices.push_back(
-        analyzer.Simplify(floordiv(indices[dim], tile_extent)));
-    plan.local_indices.push_back(
-        analyzer.Simplify(floormod(indices[dim], tile_extent)));
-  }
-
-  return plan;
 }
 
 bool SameTypeShape(const SunMMIOType &lhs, const SunMMIOType &rhs) {
@@ -609,6 +307,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EvalExpr(const tvm::PrimExpr &expr) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmtTracked(const tir::Stmt &stmt) {
+  EmitDistBatchBegins(stmt.get());
+  PrepareDistRebuilds(stmt.get());
   // ForNode selects its coverage domain in VisitStmt_(ForNode*) before it is
   // marked.  All other statements inherit the domain of their lowering path.
   if (stmt.defined() && !stmt.as<tir::ForNode>()) {
@@ -888,6 +588,7 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
   ICHECK(builder_) << "CodeGenTileLangSunMMIO builder is not initialized";
   CollectExpectedCoverage(f);
   CollectDeclBuffers(f->body);
+  AnalyzeDistFunction(f);
 
   SunMMIOBuilder::TirLayoutMap layout_map;
   SunMMIOBuilder::TirLayoutMap global_layout_map;
@@ -923,6 +624,8 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
   }
 
   builder_->BeginFunction(gvar->name_hint, args);
+  BindDistResources(f);
+  BindDistCaptures();
   for (const PendingExternalBuffer &pending : pending_external_buffers) {
     BindExternalBufferLayout(pending);
   }
@@ -931,6 +634,7 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
   builder_->EndFunction();
   ExitScope();
   builder_->PopLayoutScope();
+  ClearDistFunctionState();
 }
 
 std::string CodeGenTileLangSunMMIO::Finish() {
@@ -988,6 +692,7 @@ CodeGenTileLangSunMMIO::MapBufferType(const tir::Buffer &buffer) const {
   type.shape = std::move(shape);
   type.memory_scope = buffer.scope();
   type.byte_offset = 0;
+  type.peer_writable = dist_destinations_.count(buffer->data.get()) != 0;
   if (builder_) {
     builder_->ApplyLayoutToType(buffer, &type);
   }
@@ -1363,6 +1068,8 @@ void CodeGenTileLangSunMMIO::EmitFor(const tir::ForNode *op) {
       SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
       DataType::Int(32));
   std::string iv = "%" + op->loop_var->name_hint;
+  AppendDistCaptureLiveOut(op, &local_live_out_values);
+  PrepareDistFor(op, &local_live_out_values);
   builder_->BeginFor(iv, min, upper, step, op->annotations,
                      local_live_out_values);
   EnterScope();
@@ -1373,7 +1080,9 @@ void CodeGenTileLangSunMMIO::EmitFor(const tir::ForNode *op) {
           SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}}});
   VisitStmtTracked(op->body);
   ExitScope();
+  YieldDistFor(op);
   builder_->EndFor();
+  FinishDistFor(op);
 }
 
 void CodeGenTileLangSunMMIO::EmitIf(const tir::IfThenElseNode *op) {
@@ -1389,6 +1098,7 @@ void CodeGenTileLangSunMMIO::EmitIf(const tir::IfThenElseNode *op) {
     AppendUniqueLocalVarLiveOutValues(&local_live_out_values,
                                       else_live_out_values);
   }
+  AppendDistCaptureLiveOut(op, &local_live_out_values);
   builder_->BeginIf(cond, local_live_out_values);
   VisitStmtTracked(op->then_case);
   if (op->else_case.defined()) {
@@ -1415,6 +1125,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::ForNode *op) {
 void CodeGenTileLangSunMMIO::EmitWhile(const tir::WhileNode *op) {
   std::vector<SunMMIOValue> local_live_out_values =
       CollectLocalVarLiveOutValues(op->body);
+  AppendDistCaptureLiveOut(op, &local_live_out_values);
   builder_->BeginWhile(local_live_out_values);
   SunMMIOValue cond = EnsureType(
       EvalExpr(op->condition),
@@ -1846,8 +1557,9 @@ CodeGenTileLangSunMMIO::EmitScalarTilePick(const tir::BufferLoadNode *op) {
   const tl::SunmmioTileProcessorConfig tile_processor_config =
       tl::GetSunmmioTileProcessorConfig(target_);
   std::string plan_failure;
-  std::optional<ScalarTileAccessPlan> plan = PlanScalarTileAccess(
-      buffer, indices, dtype, layout, tile_processor_config, &plan_failure);
+  std::optional<tl::SunmmioScalarTileAccessPlan> plan =
+      tl::PlanSunmmioScalarTileAccess(buffer, indices, dtype, layout,
+                                      tile_processor_config, &plan_failure);
   if (!plan.has_value()) {
     UnsupportedExpr(op, "Sunmmio scalar BufferLoad cannot infer a legal "
                         "tile.pick view: " +
@@ -1920,8 +1632,9 @@ void CodeGenTileLangSunMMIO::EmitScalarTileSet(const tir::BufferStoreNode *op) {
   const tl::SunmmioTileProcessorConfig tile_processor_config =
       tl::GetSunmmioTileProcessorConfig(target_);
   std::string plan_failure;
-  std::optional<ScalarTileAccessPlan> plan = PlanScalarTileAccess(
-      buffer, indices, dtype, layout, tile_processor_config, &plan_failure);
+  std::optional<tl::SunmmioScalarTileAccessPlan> plan =
+      tl::PlanSunmmioScalarTileAccess(buffer, indices, dtype, layout,
+                                      tile_processor_config, &plan_failure);
   if (!plan.has_value()) {
     UnsupportedStmt(op, "Sunmmio scalar BufferStore cannot infer a legal "
                         "tile.set view: " +
@@ -2579,7 +2292,9 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
   }
   std::vector<SunMMIOValue> operands;
   SunMMIOCallAttrs attrs;
-  if (callee == "tir.if_then_else") {
+  if (callee.rfind("tl.dist_", 0) == 0) {
+    return EmitDistCall(op);
+  } else if (callee == "tir.if_then_else") {
     ICHECK_EQ(op->args.size(), 3U) << "tir.if_then_else expects 3 arguments";
     SunMMIOType bool_ty{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
     SunMMIOValue cond =

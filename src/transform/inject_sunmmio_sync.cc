@@ -49,6 +49,7 @@
 #include "../op/dist_comm.h"
 #include "../op/utils.h"
 #include "../target/sunmmio_utils.h"
+#include "common/attr.h"
 #include "dist_transform_utils.h"
 
 namespace tvm {
@@ -478,6 +479,11 @@ bool NeedsUnitSync(const UnitAccess &producer, const UnitAccess &consumer) {
 
 class InjectUnitSyncRewriter : public StmtMutator {
 public:
+  explicit InjectUnitSyncRewriter(const PrimFunc &func)
+      : layouts_(func->GetAttr<Map<Buffer, Layout>>(attr::kLayoutMap)
+                     .value_or(Map<Buffer, Layout>())),
+        config_(GetSunmmioTileProcessorConfig(
+            func->GetAttr<Target>(tvm::attr::kTarget))) {}
   Stmt operator()(Stmt body) {
     Stmt rewritten = VisitStmt(body);
     SunmmioSyncUnits pending_links = PendingUnits() & kLinkUnits;
@@ -811,6 +817,29 @@ private:
     return true;
   }
 
+  static void CollectWaitAnyLoads(const CallNode *call,
+                                  std::vector<UnitAccess> *accesses,
+                                  const Map<Buffer, Layout> &layouts,
+                                  const SunmmioTileProcessorConfig &config) {
+    CollectRegionArgumentLoads(call, {3, 4}, accesses);
+    for (size_t position : {size_t{3}, size_t{4}}) {
+      BufferRegion region = NormalizeToBufferRegion(call->args[position]);
+      ICHECK_EQ(region->region.size(), 1U);
+      const Range &logical = region->region[0];
+      Region first = GetSunmmioScalarTileAccessRegion(
+          region->buffer, {logical->min}, layouts, config);
+      Region last = GetSunmmioScalarTileAccessRegion(
+          region->buffer, {logical->min + logical->extent - 1}, layouts,
+          config);
+      arith::Analyzer analyzer;
+      Region physical{Range::FromMinExtent(
+          first[0]->min,
+          analyzer.Simplify(last[0]->min + last[0]->extent - first[0]->min))};
+      accesses->push_back({region->buffer, std::move(physical), false,
+                           AccessProducerKind::kTileLoad, kTileMemoryUnits});
+    }
+  }
+
   static void CollectTileLoads(const PrimExpr &expr,
                                std::vector<UnitAccess> *accesses) {
     BufferLoadCollector collector;
@@ -847,9 +876,12 @@ private:
     }
   }
 
-  static Accesses CollectLoopAccesses(const Stmt &body) {
+  Accesses CollectLoopAccesses(const Stmt &body) const {
     class Collector : public StmtExprVisitor {
     public:
+      Collector(const Map<Buffer, Layout> &layouts,
+                const SunmmioTileProcessorConfig &config)
+          : layouts_(layouts), config_(config) {}
       Accesses accesses;
 
     private:
@@ -869,10 +901,8 @@ private:
 
       void VisitStmt_(const BufferStoreNode *op) final {
         if (IsRsramBuffer(op->buffer)) {
-          Region region;
-          for (const PrimExpr &index : op->indices) {
-            region.push_back(Range::FromMinExtent(index, 1));
-          }
+          Region region = GetSunmmioScalarTileAccessRegion(
+              op->buffer, op->indices, layouts_, config_);
           accesses.push_back({op->buffer, std::move(region), true,
                               AccessProducerKind::kTileStore,
                               kTileMemoryUnits});
@@ -893,6 +923,10 @@ private:
       }
 
       void VisitExpr_(const CallNode *op) final {
+        if (op->op.same_as(dist_wait_any_())) {
+          CollectWaitAnyLoads(op, &accesses, layouts_, config_);
+          return;
+        }
         Accesses args;
         bool completed_inline = false;
         if (GetAsyncAccesses(op, &accesses, &args, &completed_inline) ||
@@ -909,7 +943,9 @@ private:
         }
         StmtExprVisitor::VisitExpr_(op);
       }
-    } collector;
+      const Map<Buffer, Layout> &layouts_;
+      const SunmmioTileProcessorConfig &config_;
+    } collector(layouts_, config_);
     collector(body);
     return std::move(collector.accesses);
   }
@@ -1107,6 +1143,12 @@ private:
       return PrependSync(StmtMutator::VisitStmt_(op), completed_links);
     }
 
+    if (call && call->op.same_as(dist_wait_any_())) {
+      Accesses reads;
+      CollectWaitAnyLoads(call, &reads, layouts_, config_);
+      SunmmioSyncUnits required = ProcessAccesses(reads);
+      return PrependSync(StmtMutator::VisitStmt_(op), required);
+    }
     if (call && call->op.same_as(dist_wait_signal_())) {
       ICHECK_EQ(call->args.size(), 3U);
       // A signal wait acquires remote writes without naming a destination
@@ -1173,10 +1215,8 @@ private:
     if (op->predicate.defined()) {
       CollectTileLoads(op->predicate.value(), &accesses);
     }
-    Region region;
-    for (const PrimExpr &index : op->indices) {
-      region.push_back(Range::FromMinExtent(index, 1));
-    }
+    Region region = GetSunmmioScalarTileAccessRegion(op->buffer, op->indices,
+                                                     layouts_, config_);
     if (IsRsramBuffer(op->buffer)) {
       accesses.push_back({op->buffer, region, true,
                           AccessProducerKind::kTileStore, kTileMemoryUnits});
@@ -1191,7 +1231,12 @@ private:
 
   Stmt VisitStmt_(const LetStmtNode *op) final {
     std::vector<UnitAccess> accesses;
-    CollectTileLoads(op->value, &accesses);
+    const auto *call = op->value.as<CallNode>();
+    if (call && call->op.same_as(dist_wait_any_())) {
+      CollectWaitAnyLoads(call, &accesses, layouts_, config_);
+    } else {
+      CollectTileLoads(op->value, &accesses);
+    }
     SunmmioSyncUnits required = ProcessAccesses(accesses);
     Stmt body = VisitStmt(op->body);
     LoopInfo scope;
@@ -1345,6 +1390,8 @@ private:
     return RewriteLoop(op->body, nullptr, op);
   }
 
+  Map<Buffer, Layout> layouts_;
+  SunmmioTileProcessorConfig config_;
   std::vector<UnitAccess> pending_;
   bool reachable_{true};
   std::vector<LoopFrame> loop_stack_;
@@ -1639,7 +1686,7 @@ PrimFunc RewriteSunmmioSync(PrimFunc func, arith::Analyzer *analyzer) {
   Target target = func->GetAttr<Target>(tvm::attr::kTarget).value();
   InjectBroadcastBarriersRewriter inject_barriers(target, analyzer);
   func.CopyOnWrite()->body = inject_barriers(func->body);
-  InjectUnitSyncRewriter inject_unit_sync;
+  InjectUnitSyncRewriter inject_unit_sync(func);
   func.CopyOnWrite()->body = inject_unit_sync(func->body);
   InitReusableBarriersRewriter init_barriers;
   func.CopyOnWrite()->body = init_barriers(func->body);

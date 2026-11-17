@@ -5,8 +5,11 @@
 
 #include "sunmmio_utils.h"
 
+#include <algorithm>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
@@ -15,10 +18,363 @@
 #include "../layout/cute_layout.h"
 #include "../op/builtin.h"
 #include "../op/comm.h"
+#include "../tileview/tileview_planner_common.h"
 #include "utils.h"
 
 namespace tvm {
 namespace tl {
+
+using namespace tir;
+
+namespace {
+
+std::string IntVectorToString(const std::vector<int64_t> &values) {
+  std::ostringstream os;
+  os << "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i != 0) {
+      os << ", ";
+    }
+    os << values[i];
+  }
+  os << "]";
+  return os.str();
+}
+
+int64_t StaticIntOrNegative(const PrimExpr &expr, arith::Analyzer *analyzer) {
+  PrimExpr simplified = analyzer->Simplify(expr);
+  const auto *imm = simplified.as<IntImmNode>();
+  if (!imm || imm->value <= 0) {
+    return -1;
+  }
+  return imm->value;
+}
+
+std::vector<int64_t> GetScalarAccessLayoutExtents(
+    const tir::Buffer &buffer, const ffi::Optional<tl::Layout> &layout,
+    arith::Analyzer *analyzer, std::string *failure_reason) {
+  ffi::Array<PrimExpr> extents;
+  if (layout.defined()) {
+    const auto *cute = layout.value().as<tl::CuteLayoutNode>();
+    if (!cute) {
+      if (failure_reason != nullptr) {
+        *failure_reason = "Sunmmio scalar tile access planning expects a "
+                          "CuteLayout when a layout annotation is present.";
+      }
+      return {};
+    }
+    extents = cute->GetCoveredShape();
+  } else {
+    extents = buffer->shape;
+  }
+
+  std::vector<int64_t> static_extents;
+  static_extents.reserve(extents.size());
+  for (const PrimExpr &extent : extents) {
+    static_extents.push_back(StaticIntOrNegative(extent, analyzer));
+  }
+  return static_extents;
+}
+
+int64_t TileElementCount(const std::vector<int64_t> &shape) {
+  int64_t elems = 1;
+  for (int64_t extent : shape) {
+    elems *= extent;
+  }
+  return elems;
+}
+
+bool TileTransferSizeIsLegal(const tir::Buffer &buffer, DataType dtype,
+                             const std::vector<int64_t> &tile_shape,
+                             const tl::SunmmioTileProcessorConfig &config) {
+  if (buffer.scope() != kSunmmioScopeRSRAM && buffer.scope() != "rsram") {
+    return true;
+  }
+  if (config.rsram_align_bytes <= 0) {
+    return true;
+  }
+  int64_t tile_bits =
+      TileElementCount(tile_shape) * static_cast<int64_t>(dtype.bits());
+  if (tile_bits % 8 != 0) {
+    return false;
+  }
+  int64_t tile_bytes = tile_bits / 8;
+  return tile_bytes >= config.rsram_align_bytes &&
+         tile_bytes % config.rsram_align_bytes == 0;
+}
+
+bool CandidateExtentsAreLegal(const tl::TrailingTilePattern &pattern,
+                              const std::vector<int64_t> &layout_extents,
+                              std::string *failure_reason) {
+  for (size_t i = 0; i < pattern.mapped_dims.size(); ++i) {
+    int dim = pattern.mapped_dims[i];
+    int64_t extent = layout_extents[dim];
+    int64_t tile_extent = pattern.tile_shape[i];
+    if (extent < 0) {
+      continue;
+    }
+    if (tile_extent > extent) {
+      if (failure_reason != nullptr) {
+        std::ostringstream os;
+        os << "tile extent " << tile_extent << " exceeds layout extent "
+           << extent << " at buffer dim " << dim << ".";
+        *failure_reason = os.str();
+      }
+      return false;
+    }
+    if (extent % tile_extent != 0) {
+      if (failure_reason != nullptr) {
+        std::ostringstream os;
+        os << "layout extent " << extent << " is not divisible by tile extent "
+           << tile_extent << " at buffer dim " << dim << ".";
+        *failure_reason = os.str();
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+bool HasTrailingRowMajorContiguousOrder(
+    const tir::Buffer &buffer,
+    const ffi::Map<tir::Buffer, tl::Layout> &layout_map,
+    std::string *failure_reason) {
+  std::vector<tl::ContiguousStep> steps =
+      tl::GetBufferContiguousSteps(buffer, layout_map);
+  if (steps.empty()) {
+    if (failure_reason != nullptr) {
+      *failure_reason = "cannot recover a contiguous trailing layout step.";
+    }
+    return false;
+  }
+  int width_dim = static_cast<int>(buffer->shape.size()) - 1;
+  if (steps.front().dim != width_dim) {
+    if (failure_reason != nullptr) {
+      std::ostringstream os;
+      os << "the innermost contiguous layout step is dim " << steps.front().dim
+         << ", not the trailing width dim " << width_dim
+         << "; suvm.tile.load/store require row-major tile views.";
+      *failure_reason = os.str();
+    }
+    return false;
+  }
+  return true;
+}
+
+std::optional<tl::TrailingTilePattern>
+SelectScalarTilePattern(const tir::Buffer &buffer, int tile_rank,
+                        DataType dtype,
+                        const ffi::Map<tir::Buffer, tl::Layout> &layout_map,
+                        const std::vector<int64_t> &layout_extents,
+                        const tl::SunmmioTileProcessorConfig &config,
+                        arith::Analyzer *analyzer, std::string *last_reason) {
+  std::vector<tl::TrailingTilePattern> legal_patterns;
+  for (const tl::TrailingTilePattern &pattern :
+       tl::EnumerateInferredTrailingTilePatterns(
+           buffer, tile_rank, layout_map, config, analyzer,
+           {tl::TileExtentPolicy::kRegisterBounded,
+            tl::AlignmentMode::kStrict})) {
+    if (static_cast<int>(pattern.tile_shape.size()) != tile_rank) {
+      continue;
+    }
+    std::vector<int64_t> tile_shape(pattern.tile_shape.begin(),
+                                    pattern.tile_shape.end());
+    if (!TileTransferSizeIsLegal(buffer, dtype, tile_shape, config)) {
+      if (last_reason != nullptr) {
+        std::ostringstream os;
+        os << "tile shape " << IntVectorToString(tile_shape)
+           << " does not satisfy the " << config.rsram_align_bytes
+           << "-byte RSRAM vector-transfer size/alignment constraint.";
+        *last_reason = os.str();
+      }
+      continue;
+    }
+    if (!CandidateExtentsAreLegal(pattern, layout_extents, last_reason)) {
+      continue;
+    }
+    legal_patterns.push_back(pattern);
+  }
+
+  if (legal_patterns.empty()) {
+    return std::nullopt;
+  }
+
+  std::sort(legal_patterns.begin(), legal_patterns.end(),
+            [](const tl::TrailingTilePattern &lhs,
+               const tl::TrailingTilePattern &rhs) {
+              int64_t lhs_elems = tl::TileElements(lhs.tile_shape);
+              int64_t rhs_elems = tl::TileElements(rhs.tile_shape);
+              if (lhs_elems != rhs_elems) {
+                return lhs_elems > rhs_elems;
+              }
+              return lhs.tile_shape > rhs.tile_shape;
+            });
+  return legal_patterns.front();
+}
+
+} // namespace
+
+std::optional<SunmmioScalarTileAccessPlan> PlanSunmmioScalarTileAccess(
+    const tir::Buffer &buffer, const ffi::Array<PrimExpr> &indices,
+    DataType dtype, const ffi::Optional<tl::Layout> &layout,
+    const tl::SunmmioTileProcessorConfig &config, std::string *failure_reason) {
+  int buffer_rank = static_cast<int>(buffer->shape.size());
+  if (buffer_rank < 1) {
+    if (failure_reason != nullptr) {
+      *failure_reason = "scalar tile access requires a rank >= 1 buffer.";
+    }
+    return std::nullopt;
+  }
+  if (static_cast<int>(indices.size()) != buffer_rank) {
+    if (failure_reason != nullptr) {
+      std::ostringstream os;
+      os << "indices rank " << indices.size()
+         << " does not match source buffer rank " << buffer_rank << ".";
+      *failure_reason = os.str();
+    }
+    return std::nullopt;
+  }
+
+  arith::Analyzer analyzer;
+  ffi::Map<tir::Buffer, tl::Layout> layout_map;
+  if (layout.defined()) {
+    layout_map.Set(buffer, layout.value());
+  }
+
+  std::string local_reason;
+  std::vector<int64_t> layout_extents =
+      GetScalarAccessLayoutExtents(buffer, layout, &analyzer, &local_reason);
+  if (layout_extents.empty()) {
+    if (failure_reason != nullptr) {
+      *failure_reason = local_reason;
+    }
+    return std::nullopt;
+  }
+  if (static_cast<int>(layout_extents.size()) != buffer_rank) {
+    if (failure_reason != nullptr) {
+      std::ostringstream os;
+      os << "layout covered rank " << layout_extents.size()
+         << " does not match buffer rank " << buffer_rank << ".";
+      *failure_reason = os.str();
+    }
+    return std::nullopt;
+  }
+
+  if (!HasTrailingRowMajorContiguousOrder(buffer, layout_map, &local_reason)) {
+    if (failure_reason != nullptr) {
+      *failure_reason = local_reason;
+    }
+    return std::nullopt;
+  }
+
+  std::vector<int> ranks_to_try;
+  if (buffer_rank >= 2) {
+    ranks_to_try.push_back(2);
+  }
+  ranks_to_try.push_back(1);
+
+  std::optional<tl::TrailingTilePattern> selected;
+  for (int tile_rank : ranks_to_try) {
+    selected = SelectScalarTilePattern(buffer, tile_rank, dtype, layout_map,
+                                       layout_extents, config, &analyzer,
+                                       &local_reason);
+    if (selected.has_value()) {
+      break;
+    }
+  }
+
+  if (!selected.has_value()) {
+    if (failure_reason != nullptr) {
+      std::ostringstream os;
+      os << "cannot infer a legal trailing rank-1/rank-2 tile_view";
+      if (!local_reason.empty()) {
+        os << ": " << local_reason;
+      }
+      os << ". Use an aligned-row-major staging layout when logical extents "
+            "are "
+            "not compatible with 64B RSRAM vector transfers.";
+      *failure_reason = os.str();
+    }
+    return std::nullopt;
+  }
+
+  SunmmioScalarTileAccessPlan plan;
+  plan.tile_shape.assign(selected->tile_shape.begin(),
+                         selected->tile_shape.end());
+  plan.tiled_dims.assign(selected->mapped_dims.begin(),
+                         selected->mapped_dims.end());
+  plan.partition_indices.reserve(buffer_rank);
+  std::unordered_map<int, int64_t> tiled_dim_to_extent;
+  for (size_t i = 0; i < selected->mapped_dims.size(); ++i) {
+    tiled_dim_to_extent[selected->mapped_dims[i]] = selected->tile_shape[i];
+  }
+
+  for (int dim = 0; dim < buffer_rank; ++dim) {
+    auto it = tiled_dim_to_extent.find(dim);
+    if (it == tiled_dim_to_extent.end()) {
+      plan.partition_indices.push_back(indices[dim]);
+      continue;
+    }
+    PrimExpr tile_extent = IntImm(indices[dim].dtype(), it->second);
+    plan.partition_indices.push_back(
+        analyzer.Simplify(floordiv(indices[dim], tile_extent)));
+    plan.local_indices.push_back(
+        analyzer.Simplify(floormod(indices[dim], tile_extent)));
+  }
+
+  return plan;
+}
+
+tir::Region
+GetSunmmioScalarTileAccessRegion(const tir::Buffer &buffer,
+                                 const ffi::Array<PrimExpr> &indices,
+                                 const ffi::Map<tir::Buffer, Layout> &layouts,
+                                 const SunmmioTileProcessorConfig &config) {
+  tir::Region region;
+  for (const PrimExpr &index : indices) {
+    region.push_back(Range::FromMinExtent(index, 1));
+  }
+  if (buffer.scope() != kSunmmioScopeRSRAM ||
+      std::any_of(indices.begin(), indices.end(), [](const PrimExpr &index) {
+        return index.dtype().lanes() != 1;
+      })) {
+    return region;
+  }
+  ffi::Optional<Layout> layout;
+  for (const auto &entry : layouts) {
+    if (entry.first->data.same_as(buffer->data)) {
+      layout = entry.second;
+      break;
+    }
+  }
+  std::string reason;
+  auto plan = PlanSunmmioScalarTileAccess(buffer, indices, buffer->dtype,
+                                          layout, config, &reason);
+  if (!plan) {
+    // Without a legal scalar access plan, retain a conservative storage bound.
+    auto shape = buffer->shape;
+    if (layout.defined()) {
+      if (const auto *cute = layout.value().as<CuteLayoutNode>()) {
+        shape = cute->GetCoveredShape();
+      }
+    }
+    for (size_t dim = 0; dim < region.size(); ++dim) {
+      region.Set(dim, Range::FromMinExtent(0, shape[dim]));
+    }
+    return region;
+  }
+  arith::Analyzer analyzer;
+  for (size_t i = 0; i < plan->tiled_dims.size(); ++i) {
+    int dim = plan->tiled_dims[i];
+    int64_t extent = plan->tile_shape[i];
+    region.Set(dim,
+               Range::FromMinExtent(
+                   analyzer.Simplify(floordiv(indices[dim], Integer(extent)) *
+                                     Integer(extent)),
+                   Integer(extent)));
+  }
+  return region;
+}
 
 const char *StringifySunmmioOdmaUnit(SunmmioOdmaUnit unit) {
   switch (unit) {
@@ -148,7 +504,9 @@ SunmmioTileProcessorConfig MakeSunmmioA4EConfig() {
           /*block_width=*/32,
           /*rsram_align_bytes=*/64,
           /*asram_bank_stripe_bytes=*/1024,
-          /*bf16_gemm_single_pass_max_rows=*/16};
+          /*bf16_gemm_single_pass_max_rows=*/16,
+          // NPU-IR DeviceArchitecture.td: A4E_Hlink/VlinkWriteRsram.
+          /*rsram_mcast_transfer_bytes=*/1024};
 }
 
 ffi::Array<PrimExpr> MakeSunmmioA4EBlockShape(DataType dtype) {

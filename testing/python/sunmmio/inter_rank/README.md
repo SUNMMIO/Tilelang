@@ -1,6 +1,8 @@
 # Inter-rank 测试
 
-本目录验证 DSL 到最终 device TIR，不执行 codegen、设备运行或数值正确性测试。
+本目录顶层功能测试验证 DSL 到最终 device TIR，不执行 codegen、设备运行或数值正确性测试。
+本地 `kernel/` 中的应用示例另含六类 codegen/SUVM/A4E 验证，按需独立运行；
+运行及 TIR/MLIR 日志方法见本地 `kernel/README.md`。
 正式测试按功能归档；新增回归用例放回对应功能文件，不再按开发阶段或审查批次新建文件。
 
 ## 功能分工
@@ -12,7 +14,8 @@
 | `test_dist_signal_planning.py` | signal/SignalList 声明、kind/scope、容量分配与 sender 约束 |
 | `test_dist_signal_state.py` | expected/generation 状态推进、多目的端、重复 wait 与循环复用 |
 | `test_dist_state_storage.py` | 普通软件状态的 RSRAM/i32 存储、padding、布局传递及信号边界转换 |
-| `test_dist_memory_state.py` | MEMORY uint32 软件存储、UINT32_MAX 边界和 i64 接口零扩展 |
+| `test_dist_memory_state.py` | MEMORY uint32 软件存储、不检查累计上界及 i64 接口零扩展 |
+| `test_dist_expected*.py` | 逻辑 u8 expected 最终峰值、分支合并和数值摘要的边界回归 |
 | `test_dist_auxiliary_scope.py` | 通信辅助数组的 RSRAM 准入、显式 copy、非零 region 和标量 delta 边界 |
 | `test_dist_region_validation.py` | dist 通用 region 检查接入、完整尾 tile、covered extent 与检查开关边界 |
 | `test_dist_control_flow_admission.py` | SunMMIO 显式 return/break/continue 的前置临时准入及 scope/target 边界 |

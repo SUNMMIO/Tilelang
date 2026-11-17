@@ -33,6 +33,8 @@ inline constexpr const char *kDistCompilerRegionAttr =
     "tl.dist.compiler_generated_region";
 inline constexpr const char *kDistSignalIndexInBoundsAttr =
     "tl.dist.signal_index_in_bounds";
+inline constexpr const char *kDistExpectedSignalKindAttr =
+    "tl.dist.expected_signal_kind";
 inline constexpr const char *kAutoSignalKind = "auto";
 inline constexpr int kIncrementFlagregCount = 8;
 inline constexpr int kValueFlagregCount = 32;

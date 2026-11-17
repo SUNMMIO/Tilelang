@@ -593,9 +593,9 @@ def expected_sequence_kernel_factory(first=250, second=5, memory=False, world_si
         (250, 10, False, False),
         (2**31, 1, True, True),
         (2**32 - 1, 0, True, True),
-        (2**32 - 1, 1, True, False),
-        (2**32, 0, True, False),
-        (2**64 - 1, 0, True, False),
+        (2**32 - 1, 1, True, True),
+        (2**32, 0, True, True),
+        (2**64 - 1, 0, True, True),
     ],
 )
 def test_expected_range_checks_original_cumulative_value(first, second, memory, valid):
@@ -637,7 +637,7 @@ def test_expected_range_tracks_delta_array_updates(mode):
 
 @pytest.mark.parametrize("rounds", [5000, 2**30])
 def test_expected_range_summarizes_long_invariant_memory_loop(rounds):
-    # Keep this range-check test independent of the downstream loop unroller.
+    # MEMORY has no cumulative limit; preserve large loops without enumerating.
     mod = base_mod(expected_range_kernel_factory.get_tir(T.dist.SignalKind.SRAM_MEMORY, 1, rounds, world_size=2))
     for transform in (
         tilelang.transform.InferSramScope(),
@@ -683,10 +683,10 @@ def memory_dynamic_delta_kernel_factory(repeat=False, world_size: int = 1):
 
 
 @pytest.mark.parametrize("repeat", [False, True])
-def test_memory_expected_range_checks_full_width_dynamic_accumulation(repeat):
+def test_memory_dynamic_delta_has_no_cumulative_limit(repeat):
     func = memory_dynamic_delta_kernel_factory.get_tir(repeat, world_size=2)
-    with pytest.raises(tvm.error.InternalError, match="cumulative expected"):
-        lower_to_device_tir(func)
+    result = lower_to_device_tir(func)
+    assert collect_calls(result.device_mod, "tl.dist_wait_signal_")
 
 
 @tilelang.jit(target="sunmmio")

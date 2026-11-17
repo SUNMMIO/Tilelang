@@ -28,15 +28,9 @@ def memory_wait_kernel(value=1, extra=0, group=False, world_size: int = 1):
 
 
 @pytest.mark.parametrize("group", [False, True])
-@pytest.mark.parametrize(
-    "value,extra,valid", [(2**31 + 1, 0, True), (2**32 - 1, 0, True), (2**32 - 2, 1, True), (2**32 - 1, 1, False), (2**32, 0, False)]
-)
-def test_memory_software_range_precedes_u32_narrowing(group, value, extra, valid):
+@pytest.mark.parametrize("value,extra", [(2**31 + 1, 0), (2**32 - 1, 0), (2**32 - 2, 1), (2**32 - 1, 1), (2**32, 0)])
+def test_memory_software_representation_has_no_cumulative_limit(group, value, extra):
     func = memory_wait_kernel.get_tir(value, extra, group, world_size=2)
-    if not valid:
-        with pytest.raises(tvm.error.InternalError, match="cumulative expected"):
-            lower_to_device_tir(func)
-        return
     result = lower_to_device_tir(func)
     waits = collect_calls(result.device_mod, "tl.dist_wait_signal_")
     assert all(wait.args[2].dtype == "uint64" for wait in waits)
@@ -56,9 +50,11 @@ def test_memory_unsigned_extension_generates_extui(group, tmp_path):
             return node.args[2]
 
     # Retain and consume the actual interface operand while isolating the
-    # scalar/storage backend from the unimplemented communication handlers.
+    # scalar/storage backend from communication.
     body = tvm.tir.stmt_functor.ir_transform(func.body, None, consume_wait, ["tir.Call"])
-    source = codegen_sunmmio_suvm_mlir(tvm.IRModule({"memory_state": func.with_body(body)}), log_ir=False)
+    # Remove the physical-resource request together with the communication.
+    isolated = func.with_body(body).without_attr("tl.dist.signal_counts")
+    source = codegen_sunmmio_suvm_mlir(tvm.IRModule({"memory_state": isolated}), log_ir=False)
     assert "arith.extui" in source and "i32 to i64" in source
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate", "--suvm-to-llvm-pipeline"))
 
