@@ -89,8 +89,8 @@ def Tiles(
         False -> loop carries dependency (e.g. reduction)
 
     unroll:
-        Optional backend loop-unroll tuning factor for every materialized
-        domain loop. Supported values are 1, 2, 4, 8, and 16.
+        Optional backend loop-unroll tuning factor. Supported values are
+        1, 2, 4, 8, and 16.
     """
     supported_unroll_factors = (1, 2, 4, 8, 16)
     if unroll is not None:

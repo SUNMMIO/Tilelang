@@ -29,9 +29,8 @@ constexpr const char *tile_level_loop = "tile.loop_parallel";
 // iteration domain before legalization.
 constexpr const char *kTileDomain = "tile.domain";
 constexpr const char *kTileLoopStage = "tile.loop_stage";
-// Requests a backend unroll count for every materialized domain loop of a
-// T.Tiles scope. The frontend stores it on the root; legalization propagates
-// it to the domain loop nest. The frontend restricts the tuning factors.
+// Requests a backend unroll count for the outermost materialized loop of a
+// T.Tiles scope. The frontend restricts the supported tuning factors.
 constexpr const char *kTileLoopUnroll = "tile.loop_unroll";
 
 // ---- these attrs will be added / normalized by legalize_tiles_loop pass ----
