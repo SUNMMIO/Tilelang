@@ -1,9 +1,11 @@
 """Inter-rank resources, sequential batches, regions, and source completion."""
 
+import os
 import re
 
 import pytest
 import tilelang
+import tilelang.testing
 import tilelang.language as T
 from tilelang import tvm
 from tilelang.layout import make_mx_row_major_layout
@@ -12,9 +14,14 @@ from tilelang.utils import target as target_utils
 from testing.python.sunmmio.common.codegen_validation import (
     codegen_sunmmio_suvm_mlir,
     validate_suvm_mlir_with_npuir_opt,
+    write_sunmmio_codegen_logs,
 )
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import collect_calls
+
+tilelang.env.disable_cache()
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
+os.environ.setdefault("SUNMMIO_TEST_LOG_IR", "0")
 
 
 @tilelang.jit(target="sunmmio")
@@ -143,8 +150,12 @@ def dynamic_layout_kernel(world_size: int = 1):
 
 
 def generate(factory, tmp_path, **kwargs):
-    result = lower_to_device_tir(factory.get_tir(world_size=4, **kwargs))
-    source = codegen_sunmmio_suvm_mlir(result.device_mod, log_ir=False)
+    case_name = tmp_path.name
+    kernel = factory.get_tir(world_size=4, **kwargs)
+    write_sunmmio_codegen_logs(case_name=case_name, kernel=kernel)
+    result = lower_to_device_tir(kernel)
+    write_sunmmio_codegen_logs(case_name=case_name, tir_mod=result.device_mod)
+    source = codegen_sunmmio_suvm_mlir(result.device_mod, log_case_name=case_name)
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
     return result, source
 
@@ -177,9 +188,8 @@ def test_payload_scopes_and_destination_identity(tmp_path, src_global, dst_globa
 @pytest.mark.parametrize("kind", list(T.dist.SignalKind))
 def test_signal_resources_and_widths(tmp_path, kind):
     if kind == T.dist.SignalKind.DRAM_MEMORY:
-        result = lower_to_device_tir(notification_kernel.get_tir(kind=kind, world_size=4))
         with pytest.raises(tvm.error.InternalError, match="DRAM MEMORY.*ABI"):
-            codegen_sunmmio_suvm_mlir(result.device_mod, log_ir=False)
+            generate(notification_kernel, tmp_path, kind=kind)
         return
     _, source = generate(notification_kernel, tmp_path, kind=kind)
     assert source.count("= suvm.dist.signal :") == 1
@@ -247,14 +257,15 @@ def test_nonzero_payload_offsets_are_preserved(tmp_path):
 
 def test_unaligned_region_is_rejected_even_with_optional_checks_off(tmp_path, monkeypatch):
     monkeypatch.setattr(target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", False)
-    result = lower_to_device_tir(payload_kernel.get_tir(offset=1, world_size=4))
     with pytest.raises(tvm.error.InternalError, match="dist region start.*aligned"):
-        codegen_sunmmio_suvm_mlir(result.device_mod, log_ir=False)
+        generate(payload_kernel, tmp_path, offset=1)
 
 
-def test_queued_source_rejects_scalar_write_to_same_physical_tile():
+def test_queued_source_rejects_scalar_write_to_same_physical_tile(tmp_path):
+    kernel = source_scalar_write_kernel.get_tir(submitted=False, world_size=4)
+    write_sunmmio_codegen_logs(case_name=tmp_path.name, kernel=kernel)
     with pytest.raises(tvm.error.InternalError, match="before.*submit|unsubmitted"):
-        lower_to_device_tir(source_scalar_write_kernel.get_tir(submitted=False, world_size=4))
+        lower_to_device_tir(kernel)
 
 
 def test_inflight_source_flushes_before_scalar_tile_write(tmp_path):
@@ -297,12 +308,15 @@ def test_mx_whole_storage_payload_validates(tmp_path):
 
 
 def test_a4e_verifier_rejects_different_physical_storage_sizes(tmp_path):
-    result = lower_to_device_tir(mx_storage_kernel.get_tir(row_source=True, world_size=4))
     with pytest.raises(tvm.error.InternalError, match="A4E constraints"):
-        codegen_sunmmio_suvm_mlir(result.device_mod, log_ir=False)
+        generate(mx_storage_kernel, tmp_path, row_source=True)
 
 
 def test_dynamic_destination_layout_keeps_peer_writable(tmp_path):
     _, source = generate(dynamic_layout_kernel, tmp_path)
     bindings = [line for line in source.splitlines() if "suvm.bind_layout" in line]
     assert bindings and any("peer_writable" in line for line in bindings)
+
+
+if __name__ == "__main__":
+    tilelang.testing.main()

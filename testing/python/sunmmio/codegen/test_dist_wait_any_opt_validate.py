@@ -1,19 +1,29 @@
 """Completion scanning and scalar signal observation through real SUVM codegen."""
 
 import json
+import os
 
 import pytest
 import tilelang
+import tilelang.testing
 import tilelang.language as T
 from tilelang import tvm
 from tilelang.layout import make_aligned_row_major
 from tilelang.utils.target import determine_target
 
-from testing.python.sunmmio.common.codegen_validation import codegen_sunmmio_suvm_mlir, validate_suvm_mlir_with_npuir_opt
+from testing.python.sunmmio.common.codegen_validation import (
+    codegen_sunmmio_suvm_mlir,
+    validate_suvm_mlir_with_npuir_opt,
+    write_sunmmio_codegen_logs,
+)
 from testing.python.sunmmio.common.suvm_trace import trace_suvm_control_flow
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import collect_calls, single_prim_func
 from tilelang.language.utils import region
+
+tilelang.env.disable_cache()
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
+os.environ.setdefault("SUNMMIO_TEST_LOG_IR", "0")
 
 
 @tilelang.jit(target="sunmmio")
@@ -121,8 +131,12 @@ def producer_before_wait_any(*, placement="before", read="snapshot", evaluate=Fa
 
 
 def generate(factory, tmp_path, **kwargs):
-    result = lower_to_device_tir(factory.get_tir(world_size=4, **kwargs))
-    source = codegen_sunmmio_suvm_mlir(result.device_mod, log_ir=False)
+    case_name = tmp_path.name
+    kernel = factory.get_tir(world_size=4, **kwargs)
+    write_sunmmio_codegen_logs(case_name=case_name, kernel=kernel)
+    result = lower_to_device_tir(kernel)
+    write_sunmmio_codegen_logs(case_name=case_name, tir_mod=result.device_mod)
+    source = codegen_sunmmio_suvm_mlir(result.device_mod, log_case_name=case_name)
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
     return result, source
 
@@ -141,7 +155,8 @@ def trace_leaf(
     size=None,
 ):
     mod, physical = leaf_module(kind, len(expected), base, snapshot_origin, pending_origin, selected, size)
-    source = codegen_sunmmio_suvm_mlir(mod, log_ir=False)
+    write_sunmmio_codegen_logs(case_name=tmp_path.name, tir_mod=mod)
+    source = codegen_sunmmio_suvm_mlir(mod, log_case_name=tmp_path.name)
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
     snapshots = [0] * physical
     snapshots[snapshot_origin : snapshot_origin + len(expected)] = expected
@@ -164,9 +179,8 @@ def trace_leaf(
 @pytest.mark.parametrize("kind", list(T.dist.SignalKind))
 def test_completion_uses_each_supported_signal_interface(tmp_path, kind):
     if kind == T.dist.SignalKind.DRAM_MEMORY:
-        result = lower_to_device_tir(completion_kernel.get_tir(kind=kind, world_size=4))
         with pytest.raises(tvm.error.InternalError, match="DRAM MEMORY.*ABI"):
-            codegen_sunmmio_suvm_mlir(result.device_mod, log_ir=False)
+            generate(completion_kernel, tmp_path, kind=kind)
         return
     result, source = generate(completion_kernel, tmp_path, kind=kind)
     _, events = trace_suvm_control_flow(result, source, signal_values={0: 1, 1: 1, 2: 1}, rank_id=0)
@@ -254,7 +268,8 @@ def test_wait_any_reads_wait_for_overlapping_physical_tile_producer(tmp_path, re
     mod = tilelang.transform.InjectSunmmioSync()(producer_before_wait_any(read=read, evaluate=evaluate))
     syncs = collect_calls(mod, "tl.sunmmio_sync")
     assert any(int(call.args[0]) & 1 for call in syncs)
-    source = codegen_sunmmio_suvm_mlir(mod, log_ir=False)
+    write_sunmmio_codegen_logs(case_name=tmp_path.name, tir_mod=mod)
+    source = codegen_sunmmio_suvm_mlir(mod, log_case_name=tmp_path.name)
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
     assert source.index("suvm.sync odma0") < source.index("suvm.dist.signal_fetch")
 
@@ -266,7 +281,8 @@ def test_loop_backedge_completes_producer_before_next_scan(tmp_path, read):
     calls = collect_calls(func)
     write = next(i for i, call in enumerate(calls) if call.op.name == "tl.dma_copy")
     assert any(call.op.name == "tl.sunmmio_sync" and int(call.args[0]) & 1 for call in calls[write + 1 :])
-    source = codegen_sunmmio_suvm_mlir(mod, log_ir=False)
+    write_sunmmio_codegen_logs(case_name=tmp_path.name, tir_mod=mod)
+    source = codegen_sunmmio_suvm_mlir(mod, log_case_name=tmp_path.name)
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
 
 
@@ -288,7 +304,8 @@ def test_real_completion_keeps_flag_boundary_unsigned(tmp_path):
 def test_disjoint_producer_is_not_drained_before_scan(tmp_path, read):
     mod = tilelang.transform.InjectSunmmioSync()(producer_before_wait_any(read=read, disjoint=True))
     assert not any(int(call.args[0]) & 1 for call in collect_calls(mod, "tl.sunmmio_sync"))
-    source = codegen_sunmmio_suvm_mlir(mod, log_ir=False)
+    write_sunmmio_codegen_logs(case_name=tmp_path.name, tir_mod=mod)
+    source = codegen_sunmmio_suvm_mlir(mod, log_case_name=tmp_path.name)
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
     assert source.index("suvm.sync odma0") > source.index("suvm.dist.signal_fetch")
 
@@ -301,3 +318,7 @@ def test_wait_any_tracks_all_original_input_nodes(tmp_path, monkeypatch):
     report = json.loads(report_path.read_text())
     assert report["main"]["missing_node_types"] == []
     assert report["main"]["missing_call_ops"] == []
+
+
+if __name__ == "__main__":
+    tilelang.testing.main()

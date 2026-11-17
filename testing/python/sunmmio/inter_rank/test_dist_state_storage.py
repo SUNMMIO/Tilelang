@@ -1,16 +1,24 @@
 """Physical storage and signal-boundary types for compiler state arrays."""
 
+import os
+
 import pytest
 import tilelang
+import tilelang.testing
 import tilelang.language as T
 from tilelang import tvm
 
 from testing.python.sunmmio.common.codegen_validation import (
     codegen_sunmmio_suvm_mlir,
     validate_suvm_mlir_with_npuir_opt,
+    write_sunmmio_codegen_logs,
 )
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import collect_calls, collect_nodes, single_prim_func
+
+tilelang.env.disable_cache()
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
+os.environ.setdefault("SUNMMIO_TEST_LOG_IR", "0")
 
 
 @tilelang.jit(target="sunmmio")
@@ -102,7 +110,9 @@ def test_rsram_expected_retains_flag_range(delta):
 
 @pytest.mark.parametrize("kind", [T.dist.SignalKind.SRAM_FLAGREG_VALUE, T.dist.SignalKind.SRAM_MEMORY])
 def test_generated_state_access_validates_without_dist_handlers(tmp_path, kind):
-    result = lower_to_device_tir(state_array_kernel.get_tir(kind=kind, world_size=2))
+    kernel = state_array_kernel.get_tir(kind=kind, world_size=2)
+    write_sunmmio_codegen_logs(case_name=tmp_path.name, kernel=kernel)
+    result = lower_to_device_tir(kernel)
 
     # Exercise actual compiler-created state accesses. Replacing communication
     # only isolates the existing scalar/tile backend; it does not test dist.
@@ -114,7 +124,8 @@ def test_generated_state_access_validates_without_dist_handlers(tmp_path, kind):
     body = tvm.tir.stmt_functor.ir_transform(func.body, None, remove_dist, ["tir.Call"])
     # The isolated storage program has no physical signal resources.
     mod = tvm.IRModule({"state_access": func.with_body(body).without_attr("tl.dist.signal_counts")})
-    source = codegen_sunmmio_suvm_mlir(mod, log_ir=False)
+    write_sunmmio_codegen_logs(case_name=tmp_path.name, tir_mod=mod)
+    source = codegen_sunmmio_suvm_mlir(mod, log_case_name=tmp_path.name)
     assert "suvm.tile.pick" in source and "suvm.tile.set" in source
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate", "--suvm-to-llvm-pipeline"))
 
@@ -147,3 +158,7 @@ def test_auto_completion_delta_array_uses_existing_rsram_storage(kind):
     snapshot = collect_calls(device, "tl.dist_wait_any_")[0].args[3].args[0].buffer
     expected = collect_calls(mod, "tl.dist_expect_")[0].args[0].buffer
     assert not snapshot.data.same_as(expected.data)
+
+
+if __name__ == "__main__":
+    tilelang.testing.main()

@@ -1,16 +1,26 @@
 """Direct batch scopes, loop-carried handles, and staged diagnostics."""
 
+import os
 import re
 
 import pytest
 import tilelang
+import tilelang.testing
 import tilelang.language as T
 from tilelang import tvm
 
-from testing.python.sunmmio.common.codegen_validation import codegen_sunmmio_suvm_mlir, validate_suvm_mlir_with_npuir_opt
+from testing.python.sunmmio.common.codegen_validation import (
+    codegen_sunmmio_suvm_mlir,
+    validate_suvm_mlir_with_npuir_opt,
+    write_sunmmio_codegen_logs,
+)
 from testing.python.sunmmio.common.suvm_trace import trace_suvm_control_flow as _trace_reconstructed_source
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import collect_calls, collect_nodes, single_prim_func
+
+tilelang.env.disable_cache()
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
+os.environ.setdefault("SUNMMIO_TEST_LOG_IR", "0")
 
 
 @tilelang.jit(target="sunmmio")
@@ -297,8 +307,12 @@ def unavailable_capture_root_kernel(world_size: int = 1):
 
 
 def generate(factory, tmp_path, **kwargs):
-    result = lower_to_device_tir(factory.get_tir(world_size=4, **kwargs))
-    source = codegen_sunmmio_suvm_mlir(result.device_mod, log_ir=False)
+    case_name = tmp_path.name
+    kernel = factory.get_tir(world_size=4, **kwargs)
+    write_sunmmio_codegen_logs(case_name=case_name, kernel=kernel)
+    result = lower_to_device_tir(kernel)
+    write_sunmmio_codegen_logs(case_name=case_name, tir_mod=result.device_mod)
+    source = codegen_sunmmio_suvm_mlir(result.device_mod, log_case_name=case_name)
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
     return result, source
 
@@ -497,10 +511,9 @@ def test_reconstruction_is_finite_with_iteration_local_drain(tmp_path, loop, ear
 
 
 @pytest.mark.parametrize("loop", ["for", "while"])
-def test_accumulating_instances_reject_dynamic_send_history(loop):
-    result = lower_to_device_tir(reconstruction_loop_kernel.get_tir(loop=loop, history=True, world_size=4))
+def test_accumulating_instances_reject_dynamic_send_history(tmp_path, loop):
     with pytest.raises(tvm.error.InternalError, match="dynamic send history"):
-        codegen_sunmmio_suvm_mlir(result.device_mod, log_ir=False)
+        generate(reconstruction_loop_kernel, tmp_path, loop=loop, history=True)
 
 
 @pytest.mark.parametrize("early", [0, 1])
@@ -517,8 +530,10 @@ def test_capture_uses_actual_tir_root_allocation_scope(tmp_path):
     assert all("!suvm.tile_view" not in line for line in source.splitlines() if "scf.if" in line)
 
 
-def test_capture_does_not_extend_root_allocation_lifetime():
-    result = lower_to_device_tir(unavailable_capture_root_kernel.get_tir(world_size=4))
+def test_capture_does_not_extend_root_allocation_lifetime(tmp_path):
+    kernel = unavailable_capture_root_kernel.get_tir(world_size=4)
+    write_sunmmio_codegen_logs(case_name=tmp_path.name, kernel=kernel)
+    result = lower_to_device_tir(kernel)
     func = single_prim_func(result.device_mod)
     destination = next(node.buffer for node in collect_nodes(func, tvm.tir.DeclBuffer) if node.buffer.name == "dst")
 
@@ -536,8 +551,9 @@ def test_capture_does_not_extend_root_allocation_lifetime():
     # frontend deliberately hoists this allocation to a longer-lived scope.
     body = tvm.tir.stmt_functor.ir_transform(func.body, None, restrict_lifetime, ["tir.Allocate", "tir.DeclBuffer", "tir.IfThenElse"])
     mod = tvm.IRModule({"restricted_root": func.with_body(body)})
+    write_sunmmio_codegen_logs(case_name=tmp_path.name, tir_mod=mod)
     with pytest.raises(tvm.error.InternalError, match="root storage is unavailable at submit"):
-        codegen_sunmmio_suvm_mlir(mod, log_ir=False)
+        codegen_sunmmio_suvm_mlir(mod, log_case_name=tmp_path.name)
 
 
 @pytest.mark.parametrize("kind,dst_shared", [(T.dist.SignalKind.DRAM_FLAGREG_INC, False), (T.dist.SignalKind.SRAM_MEMORY, True)])
@@ -591,3 +607,7 @@ def test_both_submit_branches_consume_saved_entry_once(tmp_path, early):
     assert [item[3] for item in batches[0] if item[0] == "signal"] == [1]
     assert sum(event[0] == "submit" for event in events) == 1
     assert source.count("suvm.dist.batch_submit") == 2
+
+
+if __name__ == "__main__":
+    tilelang.testing.main()

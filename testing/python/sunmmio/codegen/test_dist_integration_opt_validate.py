@@ -1,15 +1,26 @@
 """Production collective/routing and computation integration for dist codegen."""
 
+import os
+
 import pytest
 import tilelang
+import tilelang.testing
 import tilelang.language as T
 from tilelang import tvm
 from tilelang.layout import make_aligned_row_major
 from tilelang.utils import target as target_utils
 
-from testing.python.sunmmio.common.codegen_validation import codegen_sunmmio_suvm_mlir, validate_suvm_mlir_with_npuir_opt
+from testing.python.sunmmio.common.codegen_validation import (
+    codegen_sunmmio_suvm_mlir,
+    validate_suvm_mlir_with_npuir_opt,
+    write_sunmmio_codegen_logs,
+)
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import collect_calls, single_prim_func
+
+tilelang.env.disable_cache()
+os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
+os.environ.setdefault("SUNMMIO_TEST_LOG_IR", "0")
 
 
 @tilelang.jit(target="sunmmio")
@@ -206,8 +217,12 @@ def mx_collective_kernel(dtype=T.mxfp8, capacity=1, loop=False, direct=False, wo
 
 
 def generate(factory, tmp_path, **kwargs):
-    result = lower_to_device_tir(factory.get_tir(world_size=4, **kwargs))
-    source = codegen_sunmmio_suvm_mlir(result.device_mod, log_ir=False)
+    case_name = tmp_path.name
+    kernel = factory.get_tir(world_size=4, **kwargs)
+    write_sunmmio_codegen_logs(case_name=case_name, kernel=kernel)
+    result = lower_to_device_tir(kernel)
+    write_sunmmio_codegen_logs(case_name=case_name, tir_mod=result.device_mod)
+    source = codegen_sunmmio_suvm_mlir(result.device_mod, log_case_name=case_name)
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
     return result, source
 
@@ -370,9 +385,13 @@ def test_multiple_functions_do_not_share_resources_or_capture_state(tmp_path):
     modes = ["capture", "receive", "send", "plain"]
     functions = {}
     for mode in modes:
-        func = single_prim_func(lower_to_device_tir(isolation_kernel.get_tir(mode=mode, world_size=4)).device_mod)
+        kernel = isolation_kernel.get_tir(mode=mode, world_size=4)
+        write_sunmmio_codegen_logs(case_name=f"{tmp_path.name}_{mode}", kernel=kernel)
+        func = single_prim_func(lower_to_device_tir(kernel).device_mod)
         functions["isolation_" + mode] = func.with_attr("global_symbol", "isolation_" + mode)
-    source = codegen_sunmmio_suvm_mlir(tvm.IRModule(functions), log_ir=False)
+    mod = tvm.IRModule(functions)
+    write_sunmmio_codegen_logs(case_name=tmp_path.name, tir_mod=mod)
+    source = codegen_sunmmio_suvm_mlir(mod, log_case_name=tmp_path.name)
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
     sections = source.split("func.func @")[1:]
     for section in sections:
@@ -420,3 +439,7 @@ def test_collective_loop_offsets_keep_payload_and_count_bases(tmp_path, monkeypa
     _, source = generate(mx_collective_kernel, tmp_path, dtype=dtype, loop=True)
     assert "scf.for" in source and "suvm.dist.signal_fetch" in source
     assert "suvm.dist.batch_put" in source and "suvm.get_partitioned_tile_view" in source
+
+
+if __name__ == "__main__":
+    tilelang.testing.main()
