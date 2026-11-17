@@ -777,7 +777,7 @@ for i, j in T.Tiles(domain, parallel=False, unroll=None):
 
 - `domain`：循环逻辑域。推荐写显式 shape，例如 `[block_M, block_N]`；也可以传 buffer，表示使用 `buffer.shape`。
 - `parallel`：是否声明不同 tile 迭代之间无跨迭代依赖，默认 `False`。
-- `unroll`：可选的 best-effort 循环展开调优提示，支持 `1`、`2`、`4`、`8`、`16`，默认 `None` 表示不发出提示。只有 `T.Tiles` 成功合法化为原生 tile loop 时才会向后传递；若 TileView 规划回退为标量循环，编译器会删除该提示并输出诊断。多个 tile scope 融合时，未设置的提示被忽略，多个显式值取最小值。
+- `unroll`：可选的 best-effort 循环展开调优提示，支持 `1`、`2`、`4`、`8`、`16`，默认 `None` 表示不发出提示。只有 `T.Tiles` 成功合法化为原生 tile loop 时才会向后传递，并作用于实际生成的每层 domain 循环，包括串行外层轴；不会作用于外围循环或被 tile 操作消化的 tile 内部循环。若 TileView 规划回退为标量循环，编译器会删除该提示并输出诊断。多个 tile scope 融合时，未设置的提示被忽略，每层共享循环的多个显式值取最小值。
 - 返回值：tile loop 迭代变量，变量个数由 `domain` rank 决定。
 
 当循环体中存在累加、归约或跨迭代依赖时，不要把 `parallel` 设为 `True`。
