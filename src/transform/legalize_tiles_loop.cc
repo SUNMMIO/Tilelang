@@ -587,6 +587,10 @@ private:
                         "This may degrade performance.";
       }
       active_scope_depth_ = 0;
+      auto unroll_it = loop->annotations.find(attr::kTileLoopUnroll);
+      active_loop_unroll_ = unroll_it != loop->annotations.end()
+                                ? Downcast<Integer>((*unroll_it).second)
+                                : Optional<Integer>();
       in_active_scope_ = true;
     }
 
@@ -612,6 +616,10 @@ private:
     n->body = new_body;
 
     // Attach normalized loop annotations
+    // Apply the scope hint to every domain loop, including serial outer axes.
+    if (active_loop_unroll_.defined()) {
+      n->annotations.Set(attr::kTileLoopUnroll, active_loop_unroll_.value());
+    }
     n->annotations.Set(attr::tile_tile_size, tv->TileShape());
     n->annotations.Set(attr::kTileLoopStage,
                        Integer(static_cast<int>(TileLoopStage::kLegalized)));
@@ -644,6 +652,7 @@ private:
     if (starts_scope) {
       in_active_scope_ = false;
       active_tileview_plan_ = TileViewPlan();
+      active_loop_unroll_ = Optional<Integer>();
       active_scope_depth_ = 0;
     }
     return new_for;
@@ -656,6 +665,7 @@ private:
       GetSunmmioTileProcessorConfig(ffi::Optional<Target>())};
   bool in_active_scope_{false};
   TileViewPlan active_tileview_plan_;
+  Optional<Integer> active_loop_unroll_;
   int active_scope_depth_{0};
 };
 
