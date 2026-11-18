@@ -43,6 +43,7 @@ private:
     }
     auto load_region = BufferRegion(load_buffer, region);
     reads_.push_back(load_region);
+    ExprVisitor::VisitExpr_(op);
   }
 
   void VisitExpr_(const CallNode *op) final {
@@ -241,8 +242,14 @@ public:
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
       if (topk)
         write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
-      for (size_t i = 2; i < (topk ? 4U : 3U); ++i)
+      const size_t region_end = topk ? 4 : 3;
+      for (size_t i = 2; i < region_end; ++i)
         write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[i]));
+      for (size_t i = region_end; i < call->args.size(); ++i) {
+        auto [reads, writes] = buffer_region_collector(call->args[i]);
+        read_buffer_regions_.insert(reads.begin(), reads.end());
+        write_buffer_regions_.insert(writes.begin(), writes.end());
+      }
     } else if (call && call->op.same_as(mma_sunmmio())) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));

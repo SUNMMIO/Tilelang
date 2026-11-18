@@ -1,16 +1,18 @@
 """Device library lowering, layout and synchronization regression coverage."""
 
+import json
 import re
 
 import pytest
+import tilelang
 import tilelang.language as T
 from tilelang.layout import make_aligned_row_major, make_zz_layout
 from testing.python.sunmmio.common.compile_pipeline import target
-from testing.python.sunmmio.common.codegen_validation import validate_sunmmio_codegen_with_npuir_opt
+from testing.python.sunmmio.common.codegen_validation import validate_sunmmio_codegen_with_npuir_opt, validate_suvm_mlir_with_npuir_opt
 
 
 @target("sunmmio")
-def topk_kernel(rows=1, cols=512, dtype="float32", zz=False, dynamic=False, selection_k=8, stages=0, output_cols=512):
+def topk_kernel(rows=1, cols=512, dtype="float32", zz=False, dynamic=False, selection_k=8, stages=0, output_cols=512, k_from_rsram=False):
     placement = T.placement.replicated()
     shape = (rows, cols)
     output_shape = (rows, output_cols)
@@ -29,9 +31,16 @@ def topk_kernel(rows=1, cols=512, dtype="float32", zz=False, dynamic=False, sele
             x = T.alloc_shared(shape, dtype, scope="shared.rsram")
             values = T.alloc_shared(output_shape, dtype, scope="shared.rsram")
             indices = T.alloc_shared(output_shape, "int32", scope="shared.rsram")
-            for _iteration in T.Pipelined(4 if stages else 1, num_stages=stages):
+            if k_from_rsram:
+                selection = T.alloc_shared((16,), T.int32, scope="shared.rsram")
+            for iteration in T.Pipelined(4 if stages else 1, num_stages=stages):
                 T.copy(A, x)
-                T.topk(x, values, indices, k if dynamic else selection_k)
+                if k_from_rsram:
+                    for j in T.Tiles((16,)):
+                        selection[j] = 8 + iteration % 2
+                    T.topk(x, values, indices, selection[0])
+                else:
+                    T.topk(x, values, indices, k if dynamic else selection_k)
                 T.copy(values, V)
                 T.copy(indices, I)
 
@@ -127,6 +136,51 @@ def test_device_lib_pipeline(tmp_path, operation):
     assert all(count == produced for count in consumed.values())
 
 
+@pytest.mark.parametrize("mode", ["greedy", "ilp"])
+def test_topk_pipeline_tracks_rsram_k(tmp_path, monkeypatch, mode):
+    graph_path = tmp_path / "dynamic_k.json"
+    monkeypatch.setenv("TL_SUNMMIO_FASTER", "1024")
+    monkeypatch.setenv("TL_SUNMMIO_PIPELINE_GRAPH_JSON" if mode == "greedy" else "TL_SUNMMIO_ILP_PROBLEM_JSON", str(graph_path))
+    with tilelang.transform.PassContext(config={tilelang.PassConfigKey.TL_SUNMMIO_PIPELINE_MODE: mode}):
+        source = tilelang.lower(topk_kernel(stages=2, k_from_rsram=True), target="sunmmio").kernel_source
+    validate_suvm_mlir_with_npuir_opt(
+        source, tmp_path, mlir_filename="dynamic_k.mlir", opt_args=("--verify-each", "--suvm-device-validate")
+    )
+    # The only tile stores write selection, once per emitted Top-K. Require
+    # multiple call sites so serial fallback cannot satisfy the ordering check.
+    events = re.findall(r"suvm\.(tile\.store|device_lib\.topk)\b", source)
+    calls = events.count("device_lib.topk")
+    assert calls >= 2
+    assert events == ["tile.store", "device_lib.topk"] * calls
+
+    graph = json.loads(graph_path.read_text())
+    if mode == "greedy":
+        assert any(
+            edge["source"] == 1 and edge["target"] == 2 and edge["distance"] == 0 and edge["buffer"] == "selection"
+            for edge in graph["edges"]
+        )
+    else:
+        assert [1, 2] in graph["dep_edges"]
+        assert graph["delta"]["1,2"] == 0
+
+
+def test_topk_ilp_cost_across_int_max(tmp_path, monkeypatch):
+    # Fix the scale so differences in automatic normalization cannot mask a
+    # discontinuity in the underlying cost model. The planner also reduces
+    # durations by their common divisor before applying this scale.
+    monkeypatch.setenv("TL_SUNMMIO_FASTER", "4194304")
+    monkeypatch.setenv("TL_SUNMMIO_ILP_EXPORT_ONLY", "1")
+    costs = []
+    for rows in (16, 17):
+        graph_path = tmp_path / f"topk_{rows}.json"
+        monkeypatch.setenv("TL_SUNMMIO_ILP_PROBLEM_JSON", str(graph_path))
+        with tilelang.transform.PassContext(config={tilelang.PassConfigKey.TL_SUNMMIO_PIPELINE_MODE: "ilp"}):
+            tilelang.lower(topk_kernel(rows=rows, cols=64000, selection_k=2048, stages=2, output_cols=2048), target="sunmmio")
+        graph = json.loads(graph_path.read_text())
+        costs.append(next(command["latency"] for command in graph["commands"].values() if command["name"].endswith(": evaluate")))
+    assert costs == [1, 2]
+
+
 def test_topk_rejects_unaligned_output_width(tmp_path):
     with pytest.raises(Exception, match="T.topk row-major region width must be vector aligned"):
         validate_sunmmio_codegen_with_npuir_opt(topk_kernel(output_cols=129), tmp_path)
@@ -149,7 +203,6 @@ def test_refined_rejects_bfloat16(tmp_path, capfd):
 
 @pytest.mark.parametrize("read_modified_input", [False, True])
 def test_device_lib_sync_effects(read_modified_input):
-    import tilelang
     from tilelang import tvm
     from tilelang.language.device_lib import _region
     from tilelang.utils.target import determine_target

@@ -16,12 +16,12 @@ namespace tl {
 // A minimal interface for CostModel
 class CostModel {
 public:
-  static float EstimateDelay(DeviceType device_type, const tir::Stmt &stmt);
+  static double EstimateDelay(DeviceType device_type, const tir::Stmt &stmt);
 
 private:
   static float EstimateTensorCoreDelay(const tir::Stmt &stmt);
   static float EstimateODMADelay(const tir::Stmt &stmt);
-  static float EstimateVectorCoreDelay(const tir::Stmt &stmt);
+  static double EstimateVectorCoreDelay(const tir::Stmt &stmt);
 };
 
 } // namespace tl

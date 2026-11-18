@@ -214,7 +214,7 @@ long long EdgeKey(int i, int j) {
 
 int CeilDiv(int a, int b) {
   ICHECK_GT(b, 0);
-  return (a + b - 1) / b;
+  return a / b + (a % b > 0);
 }
 
 int FloorDiv(int a, int b) {
@@ -1215,8 +1215,11 @@ private:
         AddAccess(NormalizeToBufferRegion(call->args[1]), false);
         if (topk)
           AddAccess(NormalizeToBufferRegion(call->args[1]), true);
-        for (size_t i = 2; i < (topk ? 4U : 3U); ++i)
+        const size_t region_end = topk ? 4 : 3;
+        for (size_t i = 2; i < region_end; ++i)
           AddAccess(NormalizeToBufferRegion(call->args[i]), true);
+        for (size_t i = region_end; i < call->args.size(); ++i)
+          VisitExpr(call->args[i]);
         return;
       }
       if (call->op.same_as(mma_sunmmio())) {
@@ -1252,6 +1255,7 @@ private:
       }
     }
     AddAccess(BufferRegion(op->buffer, region), false);
+    StmtExprVisitor::VisitExpr_(op);
   }
 
   void VisitExpr_(const CallNode *op) final {
@@ -3617,6 +3621,12 @@ private:
     SunmmioStmtAccessAnalyzer access_analyzer(func_);
     result.commands.reserve(pipeline_body_seq->seq.size());
 
+    // Leave room for latency bumps, the loop total and the solver horizon.
+    const int max_command_latency = std::max<int64_t>(
+        1, (std::numeric_limits<int>::max() - 10) /
+                   (static_cast<int64_t>(num_stages) + 3) /
+                   static_cast<int64_t>(pipeline_body_seq->seq.size()) -
+               1);
     std::set<int> resource_set;
     for (int i = 0; i < static_cast<int>(pipeline_body_seq->seq.size()); ++i) {
       const Stmt &stmt = pipeline_body_seq->seq[i];
@@ -3626,9 +3636,10 @@ private:
       traverser.traverse_stmt(stmt);
       cmd.type = HardwareMapper::Map(stmt);
       cmd.accesses = access_analyzer.Collect(stmt, loop->loop_var);
-      cmd.spec.latency =
-          static_cast<int>(std::ceil(CostModel::EstimateDelay(cmd.type, stmt)));
-      cmd.spec.latency = std::max(cmd.spec.latency, 1);
+      const double latency =
+          std::ceil(CostModel::EstimateDelay(cmd.type, stmt));
+      cmd.spec.latency = static_cast<int>(
+          std::clamp(latency, 1.0, static_cast<double>(max_command_latency)));
       cmd.spec.resources = BuildIlpResources(stmt, cmd.type, cmd.accesses);
       cmd.spec.name = cmd.name + ": " + SummarizeStmtForName(stmt);
       for (int resource : cmd.spec.resources) {
