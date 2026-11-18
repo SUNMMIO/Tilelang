@@ -18,6 +18,7 @@ from testing.python.sunmmio.common.codegen_validation import (
 )
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import collect_calls
+from testing.python.sunmmio.common.suvm_trace import trace_suvm_control_flow
 
 tilelang.env.disable_cache()
 os.environ.setdefault("SUNMMIO_TEST_PRINT", "0")
@@ -149,6 +150,42 @@ def dynamic_layout_kernel(world_size: int = 1):
     return main
 
 
+@tilelang.jit(target="sunmmio")
+def alignment_snapshot_kernel(mode="difference", destination=False, world_size: int = 1):
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((128,), T.placement.replicated(), T.float32),
+        B: T.MeshTensor((128,), T.placement.replicated(), T.float32),
+        rank_id: T.dist.RankId,
+        probe_index: T.int32,
+    ):
+        with T.Kernel():
+            table = T.alloc_shared((16,), T.int32)
+            ready = T.dist.signal(kind=T.dist.SignalKind.DRAM_FLAGREG_VALUE, expect="manual")
+            index = probe_index % 16
+            table[index] = 0
+            before = table[index]
+            table[index] = before + 1
+            after = table[index]
+            if mode == "difference":
+                begin = after - before
+            elif mode == "scaled_difference":
+                begin = (after - before) * 32
+            else:
+                begin = table[index] * 32
+                table[index] = 2
+            T.dist.put(
+                A[0:32] if destination else A[begin : begin + 32],
+                B[begin : begin + 32] if destination else B[0:32],
+                (rank_id + 1) % world_size,
+                signal=ready,
+            )
+            T.dist.submit()
+            T.dist.wait_signal(ready, expected_delta=0)
+
+    return main
+
+
 def generate(factory, tmp_path, **kwargs):
     case_name = tmp_path.name
     kernel = factory.get_tir(world_size=4, **kwargs)
@@ -259,6 +296,24 @@ def test_unaligned_region_is_rejected_even_with_optional_checks_off(tmp_path, mo
     monkeypatch.setattr(target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", False)
     with pytest.raises(tvm.error.InternalError, match="dist region start.*aligned"):
         generate(payload_kernel, tmp_path, offset=1)
+
+
+@pytest.mark.parametrize("validation_enabled", [False, True])
+@pytest.mark.parametrize("destination", [False, True])
+def test_alignment_does_not_equate_loads_across_a_write(tmp_path, monkeypatch, validation_enabled, destination):
+    monkeypatch.setattr(target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", validation_enabled)
+    with pytest.raises(tvm.error.InternalError, match="dist region start.*aligned"):
+        generate(alignment_snapshot_kernel, tmp_path, destination=destination)
+
+
+@pytest.mark.parametrize("mode", ["scaled_difference", "scaled_load"])
+@pytest.mark.parametrize("destination", [False, True])
+def test_alignment_preserves_arithmetic_around_read_snapshots(tmp_path, mode, destination):
+    result, source = generate(alignment_snapshot_kernel, tmp_path, mode=mode, destination=destination)
+    batches, _ = trace_suvm_control_flow(result, source, rank_id=0, probe_index=3)
+    data = [item for batch in batches for item in batch if item[0] == "data"]
+    assert len(data) == 1
+    assert (data[0][3], data[0][5]) == ((0, 32) if destination else (32, 0))
 
 
 def test_queued_source_rejects_scalar_write_to_same_physical_tile(tmp_path):

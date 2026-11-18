@@ -8,7 +8,7 @@ from tilelang import tvm
 from tilelang.utils.target import determine_target
 
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
-from testing.python.sunmmio.inter_rank.tir_test_utils import base_mod, collect_calls
+from testing.python.sunmmio.inter_rank.tir_test_utils import base_mod, collect_calls, collect_nodes
 
 
 @tilelang.jit(target="sunmmio")
@@ -63,6 +63,31 @@ def final_bound_kernel(mode="sequence", amount=255, group=False, loop_delta=1, w
                     T.dist.put(source, destination, (rank_id + 1) % world_size, signal=ready[0], submit=True)
                     done = T.dist.completion(ready)
                     T.dist.wait_all(done)
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
+def for_bound_snapshot_kernel(entry=2, first=200, second=200, group=False, maybe_zero=False, mode="shrink", world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, choice: T.int32):
+        with T.Kernel():
+            if group:
+                ready = T.dist.signals(2, kind=T.dist.SignalKind.SRAM_FLAGREG_INC, expect="manual")
+            else:
+                ready = T.dist.signal(kind=T.dist.SignalKind.SRAM_FLAGREG_INC, expect="manual")
+            limit = T.alloc_var(T.int32, init=entry)
+            if maybe_zero and choice > 0:
+                limit = 0
+            if mode == "unknown":
+                limit = choice
+            for index in T.serial(limit):
+                if mode == "correlated":
+                    delta = T.if_then_else(limit == 0, 256, first)
+                else:
+                    delta = T.if_then_else(index == 0, first, second)
+                T.dist.wait_signal(ready[0] if group else ready, expected_delta=delta)
+                limit = 0
 
     return main
 
@@ -184,3 +209,33 @@ def test_planned_updates_must_keep_their_signal_kind():
     body = tvm.tir.stmt_functor.ir_transform(func.body, None, remove_kind, ["tir.Call"])
     with pytest.raises(tvm.error.InternalError, match="Missing expected signal kind"):
         tilelang.transform.LowerDistSync()(tvm.IRModule({"main": func.with_body(body)}))
+
+
+@pytest.mark.parametrize("group", [False, True])
+@pytest.mark.parametrize("maybe_zero", [False, True])
+@pytest.mark.parametrize(
+    "entry,first,second,valid", [(0, 200, 200, True), (1, 200, 200, True), (2, 127, 128, True), (2, 128, 128, False), (2, 200, 200, False)]
+)
+def test_for_expected_peak_uses_entry_bound_snapshot(group, maybe_zero, entry, first, second, valid):
+    func = for_bound_snapshot_kernel.get_tir(entry=entry, first=first, second=second, group=group, maybe_zero=maybe_zero, world_size=2)
+    if not valid:
+        with pytest.raises(tvm.error.InternalError, match="cumulative expected"):
+            lower_to_device_tir(func)
+    else:
+        result = lower_to_device_tir(func, capture_passes="tl.LowerDistCommunication")
+        if entry:
+            loops = collect_nodes(result.pass_snapshot("tl.LowerDistCommunication").mod, tvm.tir.For)
+            assert any(isinstance(loop.extent, tvm.tir.BufferLoad) for loop in loops)
+
+
+@pytest.mark.parametrize("group", [False, True])
+def test_for_entry_snapshot_keeps_zero_iteration_constraints(group):
+    lower_to_device_tir(
+        for_bound_snapshot_kernel.get_tir(entry=1, first=200, group=group, maybe_zero=True, mode="correlated", world_size=2)
+    )
+
+
+@pytest.mark.parametrize("group", [False, True])
+def test_for_unproven_entry_bound_is_rejected(group):
+    with pytest.raises(tvm.error.InternalError, match="cumulative expected.*loop"):
+        lower_to_device_tir(for_bound_snapshot_kernel.get_tir(group=group, mode="unknown", world_size=2))

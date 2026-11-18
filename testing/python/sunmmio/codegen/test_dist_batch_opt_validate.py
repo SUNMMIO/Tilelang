@@ -8,6 +8,7 @@ import tilelang
 import tilelang.testing
 import tilelang.language as T
 from tilelang import tvm
+from tilelang.utils import target as target_utils
 
 from testing.python.sunmmio.common.codegen_validation import (
     codegen_sunmmio_suvm_mlir,
@@ -302,6 +303,45 @@ def unavailable_capture_root_kernel(world_size: int = 1):
             if early > 0:
                 T.dist.submit()
             T.dist.submit()
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
+def reconstruction_alignment_kernel(mode="difference", destination=False, world_size: int = 1):
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((128,), T.placement.replicated(), T.float32),
+        B: T.MeshTensor((128,), T.placement.replicated(), T.float32),
+        rank_id: T.dist.RankId,
+        probe_index: T.int32,
+        early: T.int32,
+    ):
+        with T.Kernel():
+            table = T.alloc_shared((16,), T.int32)
+            ready = T.dist.signal(kind=T.dist.SignalKind.DRAM_FLAGREG_VALUE, expect="manual")
+            index = probe_index % 16
+            table[index] = 0
+            before = table[index]
+            table[index] = before + 1
+            after = table[index]
+            if mode == "difference":
+                begin = after - before
+            elif mode == "scaled_difference":
+                begin = (after - before) * 32
+            else:
+                begin = table[index] * 32
+                table[index] = 2
+            T.dist.put(
+                A[0:32] if destination else A[begin : begin + 32],
+                B[begin : begin + 32] if destination else B[0:32],
+                (rank_id + 1) % world_size,
+                signal=ready,
+            )
+            if early > 0:
+                T.dist.submit()
+            T.dist.submit()
+            T.dist.wait_signal(ready, expected_delta=0)
 
     return main
 
@@ -606,6 +646,26 @@ def test_both_submit_branches_consume_saved_entry_once(tmp_path, early):
     assert [item[3] for item in batches[0] if item[0] == "data"] == [0]
     assert [item[3] for item in batches[0] if item[0] == "signal"] == [1]
     assert sum(event[0] == "submit" for event in events) == 1
+    assert source.count("suvm.dist.batch_submit") == 2
+
+
+@pytest.mark.parametrize("validation_enabled", [False, True])
+@pytest.mark.parametrize("destination", [False, True])
+def test_reconstruction_alignment_does_not_equate_loads_across_a_write(tmp_path, monkeypatch, validation_enabled, destination):
+    monkeypatch.setattr(target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", validation_enabled)
+    with pytest.raises(tvm.error.InternalError, match="dist region start.*aligned"):
+        generate(reconstruction_alignment_kernel, tmp_path, destination=destination)
+
+
+@pytest.mark.parametrize("mode", ["scaled_difference", "scaled_load"])
+@pytest.mark.parametrize("destination", [False, True])
+@pytest.mark.parametrize("early", [0, 1])
+def test_reconstruction_alignment_preserves_read_snapshot_arithmetic(tmp_path, mode, destination, early):
+    result, source = generate(reconstruction_alignment_kernel, tmp_path, mode=mode, destination=destination)
+    batches, _ = _trace_reconstructed_source(result, source, rank_id=0, probe_index=3, early=early)
+    data = [item for batch in batches for item in batch if item[0] == "data"]
+    assert len(data) == 1
+    assert (data[0][3], data[0][5]) == ((0, 32) if destination else (32, 0))
     assert source.count("suvm.dist.batch_submit") == 2
 
 

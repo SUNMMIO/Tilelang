@@ -1184,8 +1184,14 @@ private:
     if (const auto *op = stmt.as<ForNode>()) {
       auto body = Build(op->body);
       return [this, op, body] {
-        Bounds min = Eval(op->min), extent = Eval(op->extent);
-        Bounds step = Eval(op->step.value_or(make_const(op->min.dtype(), 1)));
+        // scf.for evaluates its bounds once on entry. Keep the resolved
+        // expression and its constraints when the body changes that storage.
+        PrimExpr entry_min = Resolve(op->min);
+        PrimExpr entry_extent = Resolve(op->extent);
+        PrimExpr entry_step =
+            Resolve(op->step.value_or(make_const(op->min.dtype(), 1)));
+        Bounds min = Eval(entry_min), extent = Eval(entry_extent);
+        Bounds step = Eval(entry_step);
         ICHECK(step.lo == step.hi && step.lo > 0 && extent.hi != kInf)
             << "T.dist cannot prove cumulative expected for loop bounds";
         int64_t count = extent.hi > 0 ? (extent.hi - 1) / step.lo + 1 : 0;
@@ -1226,8 +1232,8 @@ private:
                         min.hi == kInf ? kInf : min.hi + i * step.lo},
                        op->loop_var.dtype())
                   .snapshot;
-          Branch(make_const(op->extent.dtype(), i * step.lo) < op->extent, body,
-                 [] {});
+          Branch(make_const(entry_extent.dtype(), i * step.lo) < entry_extent,
+                 body, [] {});
         }
         bindings_ = std::move(saved);
       };

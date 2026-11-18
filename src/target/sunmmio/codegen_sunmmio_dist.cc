@@ -6,6 +6,7 @@
 #include "../../transform/dist_transform_utils.h"
 
 #include <tvm/arith/analyzer.h>
+#include <tvm/tir/analysis.h>
 
 #include <algorithm>
 #include <queue>
@@ -20,6 +21,24 @@ struct DistBatchScopeFailure {
   const CallNode *evidence;
   const StmtNode *where;
   const char *reason;
+};
+
+// A Let captures a read at its own evaluation point. Retain the arithmetic
+// around that snapshot without equating it to another read of the same address.
+class DistAlignmentReadSnapshots final : public ExprMutator {
+private:
+  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    return Var("dist_read_snapshot", op->dtype);
+  }
+  PrimExpr VisitExpr_(const ProducerLoadNode *op) final {
+    return Var("dist_read_snapshot", op->dtype);
+  }
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    PrimExpr call = ExprMutator::VisitExpr_(op);
+    if (SideEffect(call) != CallEffectKind::kPure)
+      return Var("dist_call_snapshot", call.dtype());
+    return call;
+  }
 };
 } // namespace
 
@@ -799,10 +818,12 @@ void CodeGenTileLangSunMMIO::BindDistResources(const PrimFunc &func) {
 void CodeGenTileLangSunMMIO::CheckDistRegionAlignment(
     const BufferRegion &region) const {
   arith::Analyzer analyzer;
+  DistAlignmentReadSnapshots snapshots;
   for (const auto &[var, value] : dist_let_bindings_)
-    analyzer.Bind(var, value);
+    analyzer.Bind(var, snapshots(value));
   for (const Range &range : region->region) {
-    ICHECK(analyzer.CanProveEqual(floormod(range->min, range->extent), 0))
+    ICHECK(analyzer.CanProveEqual(
+        floormod(snapshots(range->min), range->extent), 0))
         << "SunMMIO dist region start must be provably aligned to its extent "
            "for exact partition addressing: "
         << region;
