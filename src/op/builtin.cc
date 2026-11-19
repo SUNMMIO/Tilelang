@@ -150,6 +150,16 @@ TIR_DEFINE_TL_BUILTIN(create_list_of_mbarrier)
 TIR_DEFINE_TL_BUILTIN(dma_copy).set_num_inputs(-1).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 
+const Op &device_lib() {
+  static const Op &op = Op::Get("tl.device_lib");
+  return op;
+}
+TVM_REGISTER_OP("tl.device_lib")
+    .set_attr<TScriptPrinterName>("TScriptPrinterName", "_device_lib_call")
+    .set_num_inputs(-1)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(mx_pack).set_num_inputs(3).set_attr<TCallEffectKind>(
     "TCallEffectKind", Integer(CallEffectKind::kOpaque));
 

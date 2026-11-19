@@ -9,6 +9,7 @@
 #include "../../op/utils.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <tvm/ffi/container/array.h>
 #include <tvm/runtime/logging.h>
@@ -435,8 +436,8 @@ float CostModel::EstimateODMADelay(const tir::Stmt &stmt) {
 }
 
 struct VectorStmtFlopCost {
-  float repeated{0.0f};
-  float once{0.0f};
+  double repeated{0.0f};
+  double once{0.0f};
 };
 
 /**
@@ -451,7 +452,7 @@ struct VectorStmtFlopCost {
  */
 class VectorCoreFlopAnalyzer {
 public:
-  float Analyze(const Stmt &stmt) {
+  double Analyze(const Stmt &stmt) {
     VectorStmtFlopCost cost = AnalyzeStmt(stmt);
     return cost.once + cost.repeated;
   }
@@ -516,7 +517,7 @@ private:
     return cost;
   }
 
-  static float AnalyzeEvaluate(const EvaluateNode &eval) {
+  static double AnalyzeEvaluate(const EvaluateNode &eval) {
     const auto *call = eval.value.as<CallNode>();
     ICHECK(call) << "VectorCore Evaluate must wrap a CallNode.";
     if (call->op.same_as(sunmmio_cumsum())) {
@@ -527,6 +528,32 @@ private:
       return length * (8 * VectorCoreCost::kAddSubFlops +
                        VectorCoreCost::kFirstLoadFlops +
                        VectorCoreCost::kBufferStoreBaseFlops);
+    }
+    if (call->op.same_as(Op::Get("tl.device_lib"))) {
+      auto input = NormalizeToBufferRegion(call->args[1]);
+      double elements = 1;
+      for (const auto &range : input->region) {
+        const auto *extent = range->extent.as<IntImmNode>();
+        ICHECK(extent) << "Device library cost requires static region extents";
+        elements *= extent->value;
+      }
+      if (call->args[0].as<StringImmNode>()->value == "topk") {
+        const auto *k = call->args[4].as<IntImmNode>();
+        // Conservative scan-per-selection estimate; the library can reuse
+        // chunk summaries. Dynamic k uses the output capacity as an upper
+        // bound.
+        auto output = NormalizeToBufferRegion(call->args[2]);
+        double rounds =
+            k ? k->value
+              : output->region.back()->extent.as<IntImmNode>()->value;
+        return elements * rounds * VectorCoreCost::kReduceMinMaxFlops;
+      }
+      // A scheduling weight for a PWL refinement, not a measured latency.
+      return elements *
+             (2 * VectorCoreCost::kExp2Flops + 4 * VectorCoreCost::kMulFlops +
+              VectorCoreCost::kAddSubFlops + VectorCoreCost::kCompareFlops +
+              VectorCoreCost::kFirstLoadFlops +
+              VectorCoreCost::kBufferStoreBaseFlops);
     }
     ICHECK(call->op == Op::Get("tl.vector_core_in_tile_reduce"))
         << "Unsupported VectorCore intrinsic in cost model: " << call->op;
@@ -571,7 +598,7 @@ private:
       // branch together with the condition.
       VectorStmtFlopCost cond_cost = AnalyzeExpr(if_stmt->condition);
       VectorStmtFlopCost then_cost = AnalyzeStmt(if_stmt->then_case);
-      float branch_cost = then_cost.once + then_cost.repeated;
+      double branch_cost = then_cost.once + then_cost.repeated;
       if (if_stmt->else_case.defined()) {
         VectorStmtFlopCost else_cost = AnalyzeStmt(if_stmt->else_case.value());
         branch_cost =
@@ -592,8 +619,7 @@ private:
   tvm::ffi::Array<PrimExpr> materialized_constants_;
 };
 
-float CostModel::EstimateVectorCoreDelay(const tir::Stmt &stmt) {
-  auto ceil_div = [](int a, int b) { return (a + b - 1) / b; };
+double CostModel::EstimateVectorCoreDelay(const tir::Stmt &stmt) {
   /**
    * VectorCore delay is modeled from flop workload only. The recursive
    * analyzer walks both plain BufferStore loops and reduce blocks, and applies
@@ -604,11 +630,11 @@ float CostModel::EstimateVectorCoreDelay(const tir::Stmt &stmt) {
    * - generic cross-stmt expression reuse is intentionally not modeled yet
    */
   VectorCoreFlopAnalyzer analyzer;
-  float flops_cost = analyzer.Analyze(stmt);
-  return ceil_div(flops_cost, VectorCoreCost::kFlopsPerCycle);
+  return std::ceil(analyzer.Analyze(stmt) /
+                   static_cast<int>(VectorCoreCost::kFlopsPerCycle));
 }
 
-float CostModel::EstimateDelay(DeviceType device_type, const tir::Stmt &stmt) {
+double CostModel::EstimateDelay(DeviceType device_type, const tir::Stmt &stmt) {
   if (device_type == DeviceType::TensorCore) {
     return EstimateTensorCoreDelay(stmt);
   } else if (device_type == DeviceType::ODMA) {
