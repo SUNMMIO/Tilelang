@@ -108,6 +108,26 @@ public:
         return Choose(op->args[0], op->args[1], op->args[2]);
       if (op->op.same_as(builtin::likely()))
         return Analyze(op->args[0]);
+      if (op->op.same_as(builtin::bitwise_and()) && op->args.size() == 2) {
+        Value a = Analyze(op->args[0]), b = Analyze(op->args[1]);
+        bool valid = a.valid && b.valid;
+        if (a.range.lo == a.range.hi && b.range.lo == b.range.hi)
+          return Constant(a.range.lo & b.range.lo, op->dtype, valid);
+        // A nonnegative constant mask clears the sign bit as well as every
+        // bit above the mask. No assumptions about the other operand are
+        // needed.
+        const Value *mask = nullptr;
+        if (a.range.lo == a.range.hi && a.range.lo >= 0)
+          mask = &a;
+        else if (b.range.lo == b.range.hi && b.range.lo >= 0)
+          mask = &b;
+        if (mask) {
+          if (mask->range.lo == 0)
+            return Constant(0, op->dtype, valid);
+          return Opaque(op->dtype, {0, mask->range.lo}, 1, 0, valid);
+        }
+        return Unknown(op->dtype, valid);
+      }
       // Read/state calls have an independent value at each evaluation point.
       return Unknown(op->dtype);
     }

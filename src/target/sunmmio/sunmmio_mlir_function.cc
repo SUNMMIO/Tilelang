@@ -317,9 +317,7 @@ void SunmmioMlirFunction::BeginIf(
   for (const SunMMIOValue &value : live_out_values) {
     result_types.push_back(type_.MapType(value.type));
     mlir::Value base = ctx_.LookupMLIRValue(value.value);
-    if (!base) {
-      base = type_.ResolveValue(value, type_.MapType(value.type));
-    }
+    // Expression results have no incoming value. Each branch supplies one.
     base_values.push_back(base);
   }
 
@@ -345,8 +343,10 @@ void SunmmioMlirFunction::BeginIf(
   SunmmioMlirContext::IfFrame &active_frame = ctx_.if_stack.back();
   for (int i = 0, e = static_cast<int>(active_frame.base_values.size()); i < e;
        ++i) {
-    ctx_.BindMLIRValue(active_frame.live_out_value_names[i],
-                       active_frame.base_values[i]);
+    if (active_frame.base_values[i]) {
+      ctx_.BindMLIRValue(active_frame.live_out_value_names[i],
+                         active_frame.base_values[i]);
+    }
   }
 }
 
@@ -365,7 +365,9 @@ void SunmmioMlirFunction::BeginElse() {
   ctx_.builder.setInsertionPointToStart(&frame.op.getElseRegion().front());
   frame.produced_values = frame.base_values;
   for (int i = 0, e = static_cast<int>(frame.base_values.size()); i < e; ++i) {
-    ctx_.BindMLIRValue(frame.live_out_value_names[i], frame.base_values[i]);
+    if (frame.base_values[i]) {
+      ctx_.BindMLIRValue(frame.live_out_value_names[i], frame.base_values[i]);
+    }
   }
 }
 
@@ -400,6 +402,9 @@ void SunmmioMlirFunction::EndIf() {
 
   auto set_yield = [&](mlir::Region &region,
                        const mlir::SmallVector<mlir::Value, 8> &values) {
+    for (mlir::Value value : values) {
+      ICHECK(value) << "scf.if result must be assigned in both branches";
+    }
     mlir::Block &body = region.front();
     mlir::scf::YieldOp yield_op =
         !body.empty() ? mlir::dyn_cast<mlir::scf::YieldOp>(body.back())

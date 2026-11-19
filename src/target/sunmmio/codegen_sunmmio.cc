@@ -716,8 +716,14 @@ SunMMIOValue CodeGenTileLangSunMMIO::EnsureIndex(const SunMMIOValue &v) {
   if (v.type.kind == SunMMIOType::Kind::kIndex) {
     return v;
   }
+  // index_cast sign-extends narrow integers. Preserve unsigned values before
+  // converting to the target's 64-bit index type.
+  SunMMIOValue source = v;
+  if ((v.dtype.is_uint() || v.dtype.is_bool()) && v.dtype.bits() < 64) {
+    source = EmitCast(v, DataType::UInt(64));
+  }
   return builder_->Cast(
-      NewValueName(), v,
+      NewValueName(), source,
       SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
       DataType::Int(32));
 }
@@ -1073,11 +1079,12 @@ void CodeGenTileLangSunMMIO::EmitFor(const tir::ForNode *op) {
   builder_->BeginFor(iv, min, upper, step, op->annotations,
                      local_live_out_values);
   EnterScope();
-  BindVar(
-      op->loop_var,
-      SunMMIOValue{
-          op->loop_var.dtype(), iv,
-          SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}}});
+  // The scf.for IV is an index; expressions in the body use the TIR dtype.
+  SunMMIOValue index_iv{
+      DataType::Int(64), iv,
+      SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(64), 1, {}}};
+  BindVar(op->loop_var, EnsureType(index_iv, MapType(op->loop_var.dtype()),
+                                   op->loop_var.dtype()));
   VisitStmtTracked(op->body);
   ExitScope();
   YieldDistFor(op);
@@ -2336,11 +2343,17 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     SunMMIOType bool_ty{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
     SunMMIOValue cond =
         EnsureType(EvalExpr(op->args[0]), bool_ty, DataType::Bool());
-    SunMMIOValue tv = EvalExpr(op->args[1]);
-    SunMMIOValue fv = EvalExpr(op->args[2]);
-    fv = EnsureType(fv, tv.type, tv.dtype);
     DataType dtype = CanonicalizeSuvmDType(op->dtype);
-    return builder_->Select(NewValueName(), cond, tv, fv, tv.type, dtype);
+    SunMMIOValue result{dtype, NewValueName(), MapType(dtype)};
+    // Unlike Select, if_then_else must not evaluate the unselected operand.
+    builder_->BeginIf(cond, {result});
+    builder_->BindValueAlias(
+        result.value, EnsureType(EvalExpr(op->args[1]), result.type, dtype));
+    builder_->BeginElse();
+    builder_->BindValueAlias(
+        result.value, EnsureType(EvalExpr(op->args[2]), result.type, dtype));
+    builder_->EndIf();
+    return result;
   } else if (callee == "tl.tileop.region") {
     return EmitRegionCall(tvm::ffi::GetRef<PrimExpr>(op));
   } else if (callee == "tl.mx_pack") {

@@ -1397,7 +1397,11 @@ private:
     for (const auto &[var, value] : values)
       definitions[var.get()] = value;
     FiniteWidthInteger integers(analyzer_, 1, &definitions);
-    return analyzer_->Simplify(integers.Normalize(expr));
+    auto value = integers.Analyze(expr);
+    // Failure to model a condition is not a proof that the program is invalid.
+    // Keep both paths possible without changing the original TIR expression.
+    return value.valid ? analyzer_->Simplify(value.expr)
+                       : Var("dist_unknown", expr.dtype());
   }
 
   // Find a concrete invalid Rank/loop instance. An interval merely crossing
@@ -1610,7 +1614,8 @@ private:
       // Use only context-free arithmetic facts (e.g. load % count) for it.
       arith::Analyzer stable;
       FiniteWidthInteger integers(&stable);
-      proven = stable.CanProve(integers.Normalize(raw_valid));
+      auto value = integers.Analyze(raw_valid);
+      proven = value.valid && stable.CanProve(value.expr);
     } else if (!analyzer_->CanProve(Not(Resolve(path_)))) {
       proven = analyzer_->CanProve(valid);
       ICHECK(proven || (!analyzer_->CanProve(Not(valid)) &&

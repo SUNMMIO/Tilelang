@@ -282,6 +282,7 @@ public:
                         const std::vector<SunMMIOValue> &live_out_values) = 0;
   virtual void EndFor() = 0;
 
+  // An unbound result slot must be assigned in both branches before EndIf.
   virtual void BeginIf(const SunMMIOValue &cond,
                        const std::vector<SunMMIOValue> &live_out_values) = 0;
   virtual void BeginElse() = 0;
