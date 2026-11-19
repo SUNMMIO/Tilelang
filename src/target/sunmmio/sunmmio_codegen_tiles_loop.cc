@@ -3667,8 +3667,11 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       std::optional<DataType> integer_preferred =
           canonical_integer_preferred_dtype(preferred_dtype);
       DataType expr_result_dtype = CanonicalizeSuvmDType(dtype).with_lanes(1);
+      // Narrowing a uniform numerator or divisor before division can change
+      // the quotient even when the consumer only needs a narrow result.
       bool use_integer_preferred =
-          integer_preferred.has_value() && expr_result_dtype.is_int();
+          integer_preferred.has_value() && expr_result_dtype.is_int() &&
+          op != BinaryOp::kFloorDiv && op != BinaryOp::kFloorMod;
       std::optional<DataType> operand_preferred_dtype =
           (supports_mixed_precision || use_integer_preferred) ? preferred_dtype
                                                               : std::nullopt;
@@ -4217,13 +4220,17 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       return emit_binary(BinaryOp::kDiv, div->a, div->b, div->dtype);
     }
     if (const auto *div = expr.as<FloorDivNode>()) {
-      return emit_binary(BinaryOp::kDiv, div->a, div->b, div->dtype);
+      return emit_binary(div->dtype.is_int() ? BinaryOp::kFloorDiv
+                                             : BinaryOp::kDiv,
+                         div->a, div->b, div->dtype);
     }
     if (const auto *mod = expr.as<ModNode>()) {
       return emit_binary(BinaryOp::kMod, mod->a, mod->b, mod->dtype);
     }
     if (const auto *mod = expr.as<FloorModNode>()) {
-      return emit_binary(BinaryOp::kMod, mod->a, mod->b, mod->dtype);
+      return emit_binary(mod->dtype.is_int() ? BinaryOp::kFloorMod
+                                             : BinaryOp::kMod,
+                         mod->a, mod->b, mod->dtype);
     }
     if (const auto *min = expr.as<MinNode>()) {
       return emit_binary(BinaryOp::kMin, min->a, min->b, min->dtype);

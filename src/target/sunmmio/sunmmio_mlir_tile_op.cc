@@ -304,6 +304,7 @@ SunMMIOValue SunmmioMlirTileOp::Binary(const std::string &result_name,
             .getResult();
     break;
   case BinaryOp::kDiv:
+  case BinaryOp::kFloorDiv:
     ICHECK(flavor == ArithmeticFlavor::kFloat)
         << "SUVM tile integer division is not currently available";
     binary_value =
@@ -311,6 +312,7 @@ SunMMIOValue SunmmioMlirTileOp::Binary(const std::string &result_name,
             .getResult();
     break;
   case BinaryOp::kMod:
+  case BinaryOp::kFloorMod:
     ICHECK(flavor == ArithmeticFlavor::kFloat)
         << "SUVM tile remainder is only available for floating-point tiles";
     binary_value =
