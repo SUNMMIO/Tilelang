@@ -3672,8 +3672,22 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       std::optional<DataType> operand_preferred_dtype =
           (supports_mixed_precision || use_integer_preferred) ? preferred_dtype
                                                               : std::nullopt;
-      SunMMIOValue lhs = lower_expr(lhs_expr, state, operand_preferred_dtype);
-      SunMMIOValue rhs = lower_expr(rhs_expr, state, operand_preferred_dtype);
+      auto lower_operand = [&](const PrimExpr &operand) {
+        // TIR promotes BF16 inputs to the common FP32 multiply dtype. The
+        // hardware accepts BF16 directly. Evaluate the original operand at
+        // its own dtype so any earlier BF16 rounding still takes place.
+        if (op == BinaryOp::kMul && dtype == DataType::Float(32)) {
+          const auto *cast = operand.as<CastNode>();
+          if (cast && cast->dtype == dtype &&
+              cast->value.dtype() == DataType::BFloat(16)) {
+            MarkVisitedExprRoot(operand);
+            return lower_expr(cast->value, state, std::nullopt);
+          }
+        }
+        return lower_expr(operand, state, operand_preferred_dtype);
+      };
+      SunMMIOValue lhs = lower_operand(lhs_expr);
+      SunMMIOValue rhs = lower_operand(rhs_expr);
       DataType result_dtype =
           use_integer_preferred
               ? integer_preferred.value()
