@@ -11,6 +11,7 @@ from testing.python.sunmmio.common.codegen_validation import validate_sunmmio_co
         ("float32", "float32", "bfloat16"),
         ("bfloat16", "float32", "bfloat16"),
         ("bfloat16", "float32", "float32"),
+        ("float32", "bfloat16", "float32"),
     ],
 )
 def test_mixed_precision_tiles_preserve_multiply_and_cast_dtypes(tmp_path, a_dtype, b_dtype, out_dtype):
@@ -25,5 +26,9 @@ def test_mixed_precision_tiles_preserve_multiply_and_cast_dtypes(tmp_path, a_dty
     output_dtype = "bf16" if out_dtype == "bfloat16" else "f32"
     (multiply,) = [line for line in src.splitlines() if "suvm.tile.mulf" in line]
     assert multiply.strip().endswith(f"-> !suvm.tile<32x32x{product_dtype}>")
+    # Check actual operand types, not only the product/store dtype.
+    lhs_type = "bf16" if a_dtype == "bfloat16" else "f32"
+    rhs_type = "bf16" if b_dtype == "bfloat16" else "f32"
+    assert f": !suvm.tile<32x32x{lhs_type}>, !suvm.tile<32x32x{rhs_type}> ->" in multiply
     (store,) = [line for line in src.splitlines() if "suvm.tile.store" in line]
     assert f"!suvm.tile<32x32x{output_dtype}>" in store
