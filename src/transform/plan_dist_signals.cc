@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "../op/utils.h"
+#include "../support/finite_width_integer.h"
 #include "dist_transform_utils.h"
 
 namespace tvm {
@@ -1388,29 +1389,39 @@ private:
     Range range;
   };
 
-  PrimExpr Resolve(const PrimExpr &expr) {
-    return analyzer_->Simplify(Substitute(expr, bindings_));
+  PrimExpr Resolve(const PrimExpr &expr,
+                   const Map<Var, PrimExpr> &values = {}) {
+    FiniteWidthInteger::Definitions definitions;
+    for (const auto &[var, value] : bindings_)
+      definitions.emplace(var.get(), value);
+    for (const auto &[var, value] : values)
+      definitions[var.get()] = value;
+    FiniteWidthInteger integers(analyzer_, 1, &definitions);
+    return analyzer_->Simplify(integers.Normalize(expr));
   }
 
   // Find a concrete invalid Rank/loop instance. An interval merely crossing
   // the bound is not a counterexample; unknown runtime values need an assert.
   bool HasInvalidInstance(const PrimExpr &index, const PrimExpr &valid) {
     std::unordered_set<const VarNode *> needed;
-    auto collect = [&](const PrimExpr &expr) {
+    auto collect = [&](auto &&self, const PrimExpr &expr) -> void {
       PostOrderVisit(expr, [&](const ObjectRef &node) {
         if (const auto *var = node.as<VarNode>()) {
-          needed.insert(var);
+          if (needed.insert(var).second) {
+            if (auto value = bindings_.Get(ffi::GetRef<Var>(var)))
+              self(self, value.value());
+          }
         }
       });
     };
-    collect(index);
-    collect(path_);
+    collect(collect, index);
+    collect(collect, path_);
     std::vector<Domain> relevant;
     for (auto it = domains_.rbegin(); it != domains_.rend(); ++it) {
       if (needed.count(it->var.get())) {
         relevant.push_back(*it);
-        collect(it->range->min);
-        collect(it->range->extent);
+        collect(collect, it->range->min);
+        collect(collect, it->range->extent);
       }
     }
     std::reverse(relevant.begin(), relevant.end());
@@ -1421,11 +1432,11 @@ private:
       if (--budget < 0) {
         return false;
       }
-      PrimExpr active = analyzer_->Simplify(Substitute(path_, values));
+      PrimExpr active = Resolve(path_, values);
       if (is_zero(active)) {
         return false;
       }
-      PrimExpr check = analyzer_->Simplify(Substitute(valid, values));
+      PrimExpr check = Resolve(valid, values);
       if (is_one(active) && is_zero(check)) {
         return true;
       }
@@ -1433,9 +1444,8 @@ private:
         return false;
       }
       const Domain &domain = relevant[depth];
-      PrimExpr min = analyzer_->Simplify(Substitute(domain.range->min, values));
-      PrimExpr extent =
-          analyzer_->Simplify(Substitute(domain.range->extent, values));
+      PrimExpr min = Resolve(domain.range->min, values);
+      PrimExpr extent = Resolve(domain.range->extent, values);
       const auto *start = min.as<IntImmNode>();
       const auto *count = extent.as<IntImmNode>();
       if (!start || !count) {
@@ -1464,13 +1474,35 @@ private:
       groups_.erase(op->var.get());
       return LetStmt(op->var, op->value, body, op->span);
     }
+    PrimExpr value = VisitExpr(op->value);
     Map<Var, PrimExpr> previous = bindings_;
-    if (SideEffect(op->value) <= CallEffectKind::kPure) {
-      bindings_.Set(op->var, Resolve(op->value));
+    if ((op->var.dtype().is_int() || op->var.dtype().is_uint() ||
+         op->var.dtype().is_bool()) &&
+        SideEffect(value) <= CallEffectKind::kPure) {
+      // Preserve the real expression for concrete Rank/loop enumeration.
+      // Bind only its finite-width model to the mathematical analyzer.
+      PrimExpr model = Resolve(value);
+      bindings_.Set(op->var, value);
+      analyzer_->Bind(op->var, model);
     }
-    Stmt result = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
+    Stmt body = VisitStmt(op->body);
     bindings_ = std::move(previous);
-    return result;
+    return LetStmt(op->var, value, body, op->span);
+  }
+
+  PrimExpr VisitExpr_(const LetNode *op) final {
+    PrimExpr value = VisitExpr(op->value);
+    Map<Var, PrimExpr> previous = bindings_;
+    if ((op->var.dtype().is_int() || op->var.dtype().is_uint() ||
+         op->var.dtype().is_bool()) &&
+        SideEffect(value) <= CallEffectKind::kPure) {
+      PrimExpr model = Resolve(value);
+      bindings_.Set(op->var, value);
+      analyzer_->Bind(op->var, model);
+    }
+    PrimExpr body = VisitExpr(op->body);
+    bindings_ = std::move(previous);
+    return Let(op->var, value, body, op->span);
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
@@ -1479,14 +1511,23 @@ private:
     if (analyzer_->CanProve(extent <= 0)) {
       return tvm::ffi::GetRef<Stmt>(op);
     }
-    domains_.push_back({op->loop_var, Range::FromMinExtent(min, extent)});
-    Stmt body = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
+    Range domain = Range::FromMinExtent(min, extent);
+    domains_.push_back(
+        {op->loop_var, Range::FromMinExtent(op->min, op->extent)});
+    analyzer_->Bind(op->loop_var, domain);
+    With<arith::ConstraintContext> context(analyzer_, extent > 0);
+    Stmt body = StmtExprMutator::VisitStmt_(op);
     domains_.pop_back();
     return body;
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     const auto *thread = op->node.as<IterVarNode>();
+    if (op->attr_key == tir::attr::tilelang_assume) {
+      With<arith::ConstraintContext> context(
+          analyzer_, Resolve(Downcast<PrimExpr>(op->node)), true);
+      return StmtExprMutator::VisitStmt_(op);
+    }
     bool extent = thread && op->attr_key == tir::attr::thread_extent;
     if (extent) {
       domains_.push_back(
@@ -1500,18 +1541,28 @@ private:
     return result;
   }
 
+  Stmt VisitStmt_(const AssertStmtNode *op) final {
+    With<arith::ConstraintContext> context(analyzer_, Resolve(op->condition));
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  PrimExpr VisitExpr_(const SelectNode *op) final {
+    // Select evaluates both values; neither can use the other branch's facts.
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
   Stmt VisitStmt_(const IfThenElseNode *op) final {
     PrimExpr previous = path_;
     PrimExpr condition = Resolve(op->condition);
     Stmt then_case;
     Optional<Stmt> else_case;
     {
-      path_ = And(previous, condition);
+      path_ = And(previous, op->condition);
       With<arith::ConstraintContext> ctx(analyzer_, condition);
       then_case = VisitStmt(op->then_case);
     }
     if (op->else_case) {
-      path_ = And(previous, Not(condition));
+      path_ = And(previous, Not(op->condition));
       With<arith::ConstraintContext> ctx(analyzer_, Not(condition));
       else_case = VisitStmt(op->else_case.value());
     }
@@ -1520,6 +1571,24 @@ private:
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(builtin::if_then_else())) {
+      PrimExpr condition = VisitExpr(op->args[0]);
+      PrimExpr model = Resolve(condition);
+      PrimExpr previous = path_, yes, no;
+      {
+        path_ = And(previous, condition);
+        With<arith::ConstraintContext> context(analyzer_, model);
+        yes = VisitExpr(op->args[1]);
+      }
+      {
+        path_ = And(previous, Not(condition));
+        With<arith::ConstraintContext> context(analyzer_, Not(model));
+        no = VisitExpr(op->args[2]);
+      }
+      path_ = previous;
+      return Call(op->dtype, op->op, {condition, yes, no}, op->annotations,
+                  op->span);
+    }
     PrimExpr rewritten = arith::IRMutatorWithAnalyzer::VisitExpr_(op);
     const auto *call = rewritten.as<CallNode>();
     if (!call->op.same_as(dist_signal_ref())) {
@@ -1527,23 +1596,25 @@ private:
     }
     auto group = groups_.find(call->args[0].as<VarNode>());
     ICHECK(group != groups_.end());
-    PrimExpr index = Substitute(call->args[1], bindings_);
+    PrimExpr index = call->args[1];
     ICHECK(index.dtype().is_int() && index.dtype().lanes() == 1)
         << "T.dist SignalList index must be a scalar integer";
     // Widen before comparing: count may not fit a narrow signed index dtype.
     PrimExpr wide = Cast(DataType::Int(64), index);
-    PrimExpr valid = And(wide >= make_zero(DataType::Int(64)),
-                         wide < IntImm(DataType::Int(64), group->second));
+    PrimExpr raw_valid = And(wide >= make_zero(DataType::Int(64)),
+                             wide < IntImm(DataType::Int(64), group->second));
+    PrimExpr valid = Resolve(raw_valid);
     bool proven = false;
     if (SideEffect(index) > CallEffectKind::kPure) {
       // A buffer tested by an outer branch may have been written since then.
       // Use only context-free arithmetic facts (e.g. load % count) for it.
       arith::Analyzer stable;
-      proven = stable.CanProve(valid);
-    } else if (!analyzer_->CanProve(Not(path_))) {
+      FiniteWidthInteger integers(&stable);
+      proven = stable.CanProve(integers.Normalize(raw_valid));
+    } else if (!analyzer_->CanProve(Not(Resolve(path_)))) {
       proven = analyzer_->CanProve(valid);
       ICHECK(proven || (!analyzer_->CanProve(Not(valid)) &&
-                        !HasInvalidInstance(index, valid)))
+                        !HasInvalidInstance(index, raw_valid)))
           << "T.dist SignalList index " << call->args[1]
           << " is out of range [0, " << group->second
           << ") for a reachable Rank/loop instance";

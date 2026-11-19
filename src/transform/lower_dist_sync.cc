@@ -16,6 +16,7 @@
 #include "../op/builtin.h"
 #include "../op/comm.h"
 #include "../op/utils.h"
+#include "../support/finite_width_integer.h"
 #include "dist_transform_utils.h"
 
 namespace tvm {
@@ -932,10 +933,15 @@ private:
   }
   class Resolver : public ExprMutator {
   public:
-    explicit Resolver(ExpectedFinalBounds *owner) : owner_(owner) {}
+    explicit Resolver(ExpectedFinalBounds *owner)
+        : owner_(owner), integers_(&owner->analyzer_) {}
     PrimExpr VisitExpr(const PrimExpr &expr) final {
       owner_->Work();
-      return ExprMutator::VisitExpr(expr);
+      PrimExpr value = ExprMutator::VisitExpr(expr);
+      if (!(value.dtype().is_int() || value.dtype().is_uint() ||
+            value.dtype().is_bool()))
+        return value;
+      return integers_.Normalize(value);
     }
     PrimExpr VisitExpr_(const VarNode *op) final {
       auto it = owner_->bindings_.find(op);
@@ -963,6 +969,7 @@ private:
 
   private:
     ExpectedFinalBounds *owner_;
+    FiniteWidthInteger integers_;
   };
   PrimExpr Resolve(const PrimExpr &expr) {
     Work();

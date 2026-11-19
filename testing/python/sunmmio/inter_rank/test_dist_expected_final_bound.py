@@ -92,6 +92,39 @@ def for_bound_snapshot_kernel(entry=2, first=200, second=200, group=False, maybe
     return main
 
 
+@tilelang.jit(target="sunmmio")
+def integer_delta_kernel(mode="cast", group=False, through_array=False, tail=0, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            if group:
+                ready = T.dist.signals(2, kind=T.dist.SignalKind.SRAM_FLAGREG_INC, expect="manual")
+            else:
+                ready = T.dist.signal(kind=T.dist.SignalKind.SRAM_FLAGREG_INC, expect="manual")
+            if mode == "loop":
+                limit = T.Cast("int32", T.Cast("uint8", rank_id - 1))
+                for _ in T.serial(limit):
+                    T.dist.wait_signal(ready[0] if group else ready, expected_delta=1)
+            else:
+                if mode == "cast":
+                    delta = T.Cast("uint8", rank_id - 1)
+                elif mode == "add":
+                    delta = T.Cast("uint8", rank_id) + T.uint8(255)
+                elif mode == "sub":
+                    delta = T.uint8(0) - T.Cast("uint8", rank_id)
+                else:
+                    delta = T.if_then_else(T.Cast("uint8", rank_id - 1) == 0, 0, 255)
+                if through_array:
+                    deltas = T.alloc_shared((16,), T.int32)
+                    deltas[0] = T.Cast("int32", delta)
+                    T.dist.wait_signal(ready[0] if group else ready, expected_delta=deltas[0])
+                else:
+                    T.dist.wait_signal(ready[0] if group else ready, expected_delta=delta)
+            T.dist.wait_signal(ready[0] if group else ready, expected_delta=tail)
+
+    return main
+
+
 def planned_expected_module(mode="reset"):
     """Internal fixture with logical kind and the ordinary signal-plan attrs."""
     rank = tvm.tir.Var("rank", "int32")
@@ -239,3 +272,27 @@ def test_for_entry_snapshot_keeps_zero_iteration_constraints(group):
 def test_for_unproven_entry_bound_is_rejected(group):
     with pytest.raises(tvm.error.InternalError, match="cumulative expected.*loop"):
         lower_to_device_tir(for_bound_snapshot_kernel.get_tir(group=group, mode="unknown", world_size=2))
+
+
+@pytest.mark.parametrize("mode", ["cast", "add", "sub", "select"])
+@pytest.mark.parametrize("group", [False, True])
+@pytest.mark.parametrize("through_array", [False, True])
+@pytest.mark.parametrize("tail", [0, 1])
+def test_flag_bounds_cover_integer_casts_and_wrapping_arithmetic(mode, group, through_array, tail):
+    func = integer_delta_kernel.get_tir(mode=mode, group=group, through_array=through_array, tail=tail, world_size=2)
+    if tail:
+        with pytest.raises(tvm.error.InternalError, match="cumulative expected"):
+            lower_to_device_tir(func)
+    else:
+        lower_to_device_tir(func)
+
+
+@pytest.mark.parametrize("group", [False, True])
+@pytest.mark.parametrize("tail", [0, 1])
+def test_for_entry_bound_cast_cannot_hide_flag_overflow(group, tail):
+    func = integer_delta_kernel.get_tir(mode="loop", group=group, tail=tail, world_size=2)
+    if tail:
+        with pytest.raises(tvm.error.InternalError, match="cumulative expected"):
+            lower_to_device_tir(func)
+    else:
+        lower_to_device_tir(func)

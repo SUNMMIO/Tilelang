@@ -454,6 +454,8 @@ private:
   SunMMIOValue EmitDistCall(const tir::CallNode *op);
   SunMMIOValue EmitDistWaitAny(const tir::CallNode *op);
   void CheckDistRegionAlignment(const tir::BufferRegion &region) const;
+  bool CanProveRegionAlignment(const PrimExpr &min, int64_t extent) const;
+  SunMMIOValue EmitRegionPartitionIndex(const PrimExpr &min, int64_t extent);
   SunMMIOValue EmitDistRegion(const PrimExpr &region);
 
   struct DistForPlan {
@@ -474,7 +476,8 @@ private:
     std::vector<SunMMIOValue> dst_indices;
   };
   std::vector<const tir::CallNode *> dist_capture_order_;
-  std::vector<std::pair<tir::Var, PrimExpr>> dist_let_bindings_;
+  std::unordered_map<const tir::VarNode *, PrimExpr> dist_let_bindings_;
+  std::optional<std::pair<tir::Var, int64_t>> dist_rank_domain_;
   std::unordered_map<const tir::CallNode *, DistCapture> dist_captures_;
   std::unordered_map<const tir::CallNode *, std::vector<const tir::CallNode *>>
       dist_rebuild_submits_;

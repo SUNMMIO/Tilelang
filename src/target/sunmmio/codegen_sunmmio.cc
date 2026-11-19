@@ -1793,6 +1793,47 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitBinary(const char *op_name,
   b = EnsureType(b, result_type, dtype);
   std::string out = NewValueName();
   const std::string op(op_name);
+  ICHECK((op != "floordiv" && op != "floormod") || dtype.is_int() ||
+         dtype.is_uint())
+      << "SunMMIO floor arithmetic requires integer operands";
+  if ((op == "floordiv" || op == "floormod") && dtype.is_int()) {
+    ICHECK(result_type.kind == SunMMIOType::Kind::kScalar)
+        << "SunMMIO signed floor arithmetic requires scalar integers";
+    auto zero = builder_->ConstantInt(NewValueName(), 0, result_type, dtype);
+    auto remainder = builder_->Binary(NewValueName(), BinaryOp::kMod,
+                                      ArithmeticFlavor::kSignedInt, a, b,
+                                      result_type, dtype);
+    auto nonzero = builder_->Compare(NewValueName(), CompareOp::kNE,
+                                     CompareDomain::kSignedInt, remainder, zero,
+                                     result_type);
+    auto negative_remainder = builder_->Compare(NewValueName(), CompareOp::kLT,
+                                                CompareDomain::kSignedInt,
+                                                remainder, zero, result_type);
+    auto negative_divisor =
+        builder_->Compare(NewValueName(), CompareOp::kLT,
+                          CompareDomain::kSignedInt, b, zero, result_type);
+    auto boolean = MapType(DataType::Bool());
+    auto different_sign = builder_->Binary(
+        NewValueName(), BinaryOp::kXor, ArithmeticFlavor::kBool,
+        negative_remainder, negative_divisor, boolean, DataType::Bool());
+    auto adjust = builder_->Binary(NewValueName(), BinaryOp::kAnd,
+                                   ArithmeticFlavor::kBool, nonzero,
+                                   different_sign, boolean, DataType::Bool());
+    if (op == "floormod") {
+      auto correction =
+          builder_->Select(NewValueName(), adjust, b, zero, result_type, dtype);
+      return builder_->Binary(out, BinaryOp::kAdd, ArithmeticFlavor::kSignedInt,
+                              remainder, correction, result_type, dtype);
+    }
+    auto quotient = builder_->Binary(NewValueName(), BinaryOp::kDiv,
+                                     ArithmeticFlavor::kSignedInt, a, b,
+                                     result_type, dtype);
+    auto one = builder_->ConstantInt(NewValueName(), 1, result_type, dtype);
+    auto correction =
+        builder_->Select(NewValueName(), adjust, one, zero, result_type, dtype);
+    return builder_->Binary(out, BinaryOp::kSub, ArithmeticFlavor::kSignedInt,
+                            quotient, correction, result_type, dtype);
+  }
   BinaryOp bin_op;
   if (op == "add")
     bin_op = BinaryOp::kAdd;
@@ -2244,33 +2285,29 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
   std::vector<int64_t> extents;
   mins.reserve(region->region.size());
   extents.reserve(region->region.size());
-  arith::Analyzer analyzer;
   for (size_t dim = 0; dim < region->region.size(); ++dim) {
     const Range &range = region->region[dim];
     const auto *extent_imm = range->extent.as<IntImmNode>();
     ICHECK(extent_imm) << "tl.tileop.region extent must be IntImm";
-    if (copy_operand) {
-      ICHECK_GT(extent_imm->value, 0)
-          << "Sunmmio copy " << copy_operand << " buffer "
-          << region->buffer->name << " has non-positive region extent at dim "
-          << extents.size();
-      // Partition indices count whole regions. Flooring an unaligned start
-      // silently changes the address, even when optional region checks are off.
-      ICHECK(analyzer.CanProveEqual(floormod(range->min, range->extent), 0))
-          << "Sunmmio copy " << copy_operand << " buffer "
-          << region->buffer->name << " region min at dim " << extents.size()
-          << " must be provably aligned to region extent " << range->extent
-          << ", but got min=" << range->min;
-    }
-    MarkVisitedExprRoot(range->extent);
     int64_t extent = use_layout_covered_shape
                          ? effective_extents[dim]
                          : static_cast<int64_t>(extent_imm->value);
+    if (copy_operand) {
+      ICHECK_GT(extent, 0) << "Sunmmio copy " << copy_operand << " buffer "
+                           << region->buffer->name
+                           << " has non-positive region extent at dim "
+                           << extents.size();
+      // Partition indices count whole regions. Flooring an unaligned start
+      // silently changes the address, even when optional region checks are off.
+      ICHECK(CanProveRegionAlignment(range->min, extent))
+          << "Sunmmio copy " << copy_operand << " buffer "
+          << region->buffer->name << " region min at dim " << extents.size()
+          << " must be provably aligned to region extent " << extent
+          << ", but got min=" << range->min;
+    }
+    MarkVisitedExprRoot(range->extent);
     extents.push_back(extent);
-    PrimExpr min = floordiv(range->min, Integer(extent));
-    min = analyzer.Simplify(min);
-    MarkVisitedExprTree(range->min);
-    mins.push_back(EvalExpr(min));
+    mins.push_back(EmitRegionPartitionIndex(range->min, extent));
   }
   SunMMIOType ret_ty = MapType(region_expr.dtype());
   std::string result_name = region_expr.dtype().is_void() ? "" : NewValueName();

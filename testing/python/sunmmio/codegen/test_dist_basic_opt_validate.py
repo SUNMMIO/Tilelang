@@ -186,6 +186,71 @@ def alignment_snapshot_kernel(mode="difference", destination=False, world_size: 
     return main
 
 
+@tilelang.jit(target="sunmmio")
+def integer_address_kernel(mode="narrow", extent=96, width=32, destination=False, keep_let=False, world_size: int = 1):
+    dtype = T.int32 if mode in ("floor", "floor_mod") else {8: T.uint8, 16: T.uint16, 32: T.uint32, 64: T.uint64}[width]
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((768,), T.placement.replicated(), T.float32),
+        B: T.MeshTensor((768,), T.placement.replicated(), T.float32),
+        rank_id: T.dist.RankId,
+        pos: dtype,
+    ):
+        with T.Kernel():
+            ready = T.dist.signal(expect="manual")
+            if mode == "narrow":
+                off = T.Cast("int32", T.Cast("uint8", pos * T.Cast(dtype, extent)))
+            elif mode == "mul":
+                off = T.Cast("int64", pos * T.Cast(dtype, extent))
+            elif mode == "add":
+                off = T.Cast("int32", T.Cast("uint8", pos) * T.uint8(extent) + T.uint8(extent))
+            elif mode == "sub":
+                off = T.Cast("int32", T.Cast("uint8", pos) * T.uint8(extent) - T.uint8(extent))
+            elif mode == "bounded":
+                off = T.Cast("int32", T.Cast("uint8", (pos % T.Cast(dtype, 3)) * T.Cast(dtype, extent)))
+            elif mode == "widen":
+                off = T.Cast("int64", pos) * T.int64(extent)
+            elif mode == "signed":
+                off = T.Cast("int32", T.Cast("int8", pos * T.Cast(dtype, extent))) + 256
+            elif mode == "bool":
+                off = T.Cast("int32", T.Cast("bool", pos)) * extent
+            elif mode == "floor":
+                off = ((pos - 3) // 2 + 2) * extent
+            else:
+                off = ((pos - 3) % 2) * extent
+            if keep_let:
+                scratch = T.alloc_shared((16,), T.int32)
+                scratch[0] = T.Cast("int32", off)
+            T.dist.put(
+                A[0:extent] if destination else A[off : off + extent],
+                B[off : off + extent] if destination else B[0:extent],
+                (rank_id + 1) % world_size,
+                signal=ready,
+            )
+            T.dist.submit()
+            T.dist.wait_signal(ready, expected_delta=1)
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
+def integer_wait_index_kernel(mode="valid", world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, pos: T.uint32):
+        with T.Kernel():
+            ready = T.dist.signals(2, kind=T.dist.SignalKind.SRAM_FLAGREG_INC, expect="manual")
+            if mode == "valid":
+                index = T.Cast("int32", T.Cast("uint8", rank_id % 2))
+            elif mode == "invalid":
+                index = T.Cast("int32", T.Cast("uint8", rank_id - 1))
+            else:
+                index = T.Cast("int32", T.Cast("uint8", pos))
+            T.dist.wait_signal(ready[index], expected_delta=0)
+
+    return main
+
+
 def generate(factory, tmp_path, **kwargs):
     case_name = tmp_path.name
     kernel = factory.get_tir(world_size=4, **kwargs)
@@ -371,6 +436,78 @@ def test_dynamic_destination_layout_keeps_peer_writable(tmp_path):
     _, source = generate(dynamic_layout_kernel, tmp_path)
     bindings = [line for line in source.splitlines() if "suvm.bind_layout" in line]
     assert bindings and any("peer_writable" in line for line in bindings)
+
+
+@pytest.mark.parametrize("mode", ["narrow", "mul", "add", "sub"])
+@pytest.mark.parametrize("destination", [False, True])
+@pytest.mark.parametrize("validation_enabled", [False, True])
+@pytest.mark.parametrize("keep_let", [False, True])
+def test_direct_rejects_lost_alignment_after_integer_wrap(tmp_path, monkeypatch, mode, destination, validation_enabled, keep_let):
+    monkeypatch.setattr(target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", validation_enabled)
+    with pytest.raises(tvm.error.InternalError, match="region start.*aligned"):
+        generate(integer_address_kernel, tmp_path, mode=mode, destination=destination, keep_let=keep_let)
+
+
+@pytest.mark.parametrize(
+    "mode,extent,positions",
+    [
+        ("narrow", 32, [2, 3, 134217729, 2**32 - 1]),
+        ("bounded", 96, [0, 1, 2, 3, 2**32 - 1]),
+        ("widen", 96, [0, 2, 3, 7]),
+        ("signed", 32, [0, 4, 7, 255]),
+        ("bool", 32, [0, 1, 2, 255]),
+        ("floor", 32, [-1, 0, 2, 3]),
+        ("floor_mod", 32, [-4, -3, 0, 2]),
+    ],
+)
+@pytest.mark.parametrize("destination", [False, True])
+@pytest.mark.parametrize("keep_let", [False, True])
+def test_direct_preserves_finite_width_descriptor_values(tmp_path, mode, extent, positions, destination, keep_let):
+    result, source = generate(integer_address_kernel, tmp_path, mode=mode, extent=extent, destination=destination, keep_let=keep_let)
+    for pos in positions:
+        reference = {
+            "narrow": (pos * extent) & 255,
+            "bounded": (pos % 3) * extent,
+            "widen": pos * extent,
+            "signed": (((pos * extent) & 255) ^ 128) - 128 + 256,
+            "bool": int(pos != 0) * extent,
+            "floor": ((pos - 3) // 2 + 2) * extent,
+            "floor_mod": ((pos - 3) % 2) * extent,
+        }[mode]
+        batches, _ = trace_suvm_control_flow(result, source, rank_id=0, pos=pos)
+        data = [item for batch in batches for item in batch if item[0] == "data"]
+        assert len(data) == 1
+        assert (data[0][3], data[0][5]) == ((0, reference) if destination else (reference, 0))
+
+
+@pytest.mark.parametrize("width", [8, 16, 32, 64])
+def test_direct_byte_narrowing_keeps_32_alignment_at_width_boundaries(tmp_path, width):
+    result, source = generate(integer_address_kernel, tmp_path, extent=32, width=width)
+    positions = range(256) if width == 8 else [0, 1, 7, 8, (1 << (width - 1)) - 1, 1 << (width - 1), (1 << width) - 1]
+    for pos in positions:
+        batches, _ = trace_suvm_control_flow(result, source, rank_id=0, pos=pos)
+        data = [item for batch in batches for item in batch if item[0] == "data"]
+        assert len(data) == 1 and data[0][3] == (pos * 32) & 255
+
+
+def test_integer_wait_index_keeps_known_rank_bounds(tmp_path):
+    result, source = generate(integer_wait_index_kernel, tmp_path)
+    for rank in range(4):
+        _, events = trace_suvm_control_flow(result, source, rank_id=rank, pos=0)
+        assert [e[1] for e in events if e[0] == "wait"] == [0]
+
+
+def test_integer_wait_index_rejects_concrete_wrapped_rank():
+    with pytest.raises(tvm.error.InternalError, match="out of range"):
+        lower_to_device_tir(integer_wait_index_kernel.get_tir(mode="invalid", world_size=4))
+
+
+def test_integer_wait_index_keeps_runtime_guard_when_unknown(tmp_path):
+    result, source = generate(integer_wait_index_kernel, tmp_path, mode="runtime")
+    _, events = trace_suvm_control_flow(result, source, rank_id=0, pos=256)
+    assert [e[1] for e in events if e[0] == "wait"] == [0]
+    with pytest.raises(AssertionError):
+        trace_suvm_control_flow(result, source, rank_id=0, pos=255)
 
 
 if __name__ == "__main__":

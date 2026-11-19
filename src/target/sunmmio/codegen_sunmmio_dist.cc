@@ -3,6 +3,7 @@
 #include "../../op/builtin.h"
 #include "../../op/dist_comm.h"
 #include "../../op/utils.h"
+#include "../../support/finite_width_integer.h"
 #include "../../transform/dist_transform_utils.h"
 
 #include <tvm/arith/analyzer.h>
@@ -23,23 +24,6 @@ struct DistBatchScopeFailure {
   const char *reason;
 };
 
-// A Let captures a read at its own evaluation point. Retain the arithmetic
-// around that snapshot without equating it to another read of the same address.
-class DistAlignmentReadSnapshots final : public ExprMutator {
-private:
-  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
-    return Var("dist_read_snapshot", op->dtype);
-  }
-  PrimExpr VisitExpr_(const ProducerLoadNode *op) final {
-    return Var("dist_read_snapshot", op->dtype);
-  }
-  PrimExpr VisitExpr_(const CallNode *op) final {
-    PrimExpr call = ExprMutator::VisitExpr_(op);
-    if (SideEffect(call) != CallEffectKind::kPure)
-      return Var("dist_call_snapshot", call.dtype());
-    return call;
-  }
-};
 } // namespace
 
 void CodeGenTileLangSunMMIO::ClearDistFunctionState() {
@@ -51,6 +35,7 @@ void CodeGenTileLangSunMMIO::ClearDistFunctionState() {
   dist_signals_.clear();
   dist_capture_order_.clear();
   dist_let_bindings_.clear();
+  dist_rank_domain_.reset();
   dist_captures_.clear();
   dist_rebuild_submits_.clear();
   dist_rebuild_before_.clear();
@@ -60,6 +45,14 @@ void CodeGenTileLangSunMMIO::ClearDistFunctionState() {
 
 void CodeGenTileLangSunMMIO::AnalyzeDistFunction(const PrimFunc &func) {
   ClearDistFunctionState();
+  if (auto index = func->GetAttr<Integer>("tl.dist.rank_id_param_index")) {
+    if (auto world = func->GetAttr<Integer>(kDistWorldSizeAttr)) {
+      ICHECK_GE(index.value()->value, 0);
+      ICHECK_LT(index.value()->value, func->params.size());
+      dist_rank_domain_ = std::make_pair(func->params[index.value()->value],
+                                         world.value()->value);
+    }
+  }
 
   class Analyzer final : public StmtExprVisitor {
   public:
@@ -220,13 +213,13 @@ void CodeGenTileLangSunMMIO::AnalyzeDistFunction(const PrimFunc &func) {
     }
     void VisitStmt_(const LetStmtNode *op) final {
       if (op->var.dtype().is_int() || op->var.dtype().is_uint()) {
-        codegen_->dist_let_bindings_.emplace_back(op->var, op->value);
+        codegen_->dist_let_bindings_.emplace(op->var.get(), op->value);
       }
       StmtExprVisitor::VisitStmt_(op);
     }
     void VisitExpr_(const LetNode *op) final {
       if (op->var.dtype().is_int() || op->var.dtype().is_uint()) {
-        codegen_->dist_let_bindings_.emplace_back(op->var, op->value);
+        codegen_->dist_let_bindings_.emplace(op->var.get(), op->value);
       }
       StmtExprVisitor::VisitExpr_(op);
     }
@@ -684,13 +677,12 @@ void CodeGenTileLangSunMMIO::EmitDistCapture(const CallNode *op) {
       CheckDistRegionAlignment(view);
       // Let bindings prove alignment; evaluating their expanded expressions
       // would repeat memory reads instead of using the original SSA snapshot.
-      arith::Analyzer index_analyzer;
       for (size_t dim = 0; dim < view->region.size(); ++dim) {
         const Range &range = view->region[dim];
-        MarkVisitedExprTree(range->min);
         MarkVisitedExprRoot(range->extent);
-        save(slots[dim], EnsureIndex(EvalExpr(index_analyzer.Simplify(
-                             floordiv(range->min, range->extent)))));
+        save(slots[dim],
+             EmitRegionPartitionIndex(range->min,
+                                      Downcast<IntImm>(range->extent)->value));
       }
     };
     region(op->args[0], capture.src_indices);
@@ -817,17 +809,71 @@ void CodeGenTileLangSunMMIO::BindDistResources(const PrimFunc &func) {
 
 void CodeGenTileLangSunMMIO::CheckDistRegionAlignment(
     const BufferRegion &region) const {
-  arith::Analyzer analyzer;
-  DistAlignmentReadSnapshots snapshots;
-  for (const auto &[var, value] : dist_let_bindings_)
-    analyzer.Bind(var, snapshots(value));
   for (const Range &range : region->region) {
-    ICHECK(analyzer.CanProveEqual(
-        floormod(snapshots(range->min), range->extent), 0))
+    const auto *extent = range->extent.as<IntImmNode>();
+    ICHECK(extent && extent->value > 0)
+        << "SunMMIO dist region extent must be a positive constant";
+    ICHECK(CanProveRegionAlignment(range->min, extent->value))
         << "SunMMIO dist region start must be provably aligned to its extent "
            "for exact partition addressing: "
         << region;
   }
+}
+
+bool CodeGenTileLangSunMMIO::CanProveRegionAlignment(const PrimExpr &min,
+                                                     int64_t extent) const {
+  if (extent <= 0)
+    return false;
+  arith::Analyzer analyzer;
+  if (dist_rank_domain_)
+    analyzer.Bind(
+        dist_rank_domain_->first,
+        Range::FromMinExtent(make_zero(dist_rank_domain_->first.dtype()),
+                             make_const(dist_rank_domain_->first.dtype(),
+                                        dist_rank_domain_->second)));
+  tl::FiniteWidthInteger facts(&analyzer, extent, &dist_let_bindings_);
+  return facts.ProvesMultiple(min);
+}
+
+SunMMIOValue
+CodeGenTileLangSunMMIO::EmitRegionPartitionIndex(const PrimExpr &min,
+                                                 int64_t extent) {
+  ICHECK_GT(extent, 0);
+  ICHECK(CanProveRegionAlignment(min, extent))
+      << "SunMMIO dist region start must be provably aligned to region extent "
+      << extent << " for exact partition addressing: " << min;
+  arith::Analyzer analyzer;
+  if (dist_rank_domain_)
+    analyzer.Bind(
+        dist_rank_domain_->first,
+        Range::FromMinExtent(make_zero(dist_rank_domain_->first.dtype()),
+                             make_const(dist_rank_domain_->first.dtype(),
+                                        dist_rank_domain_->second)));
+  tl::FiniteWidthInteger facts(&analyzer, 1, &dist_let_bindings_);
+  auto value = facts.Analyze(min);
+  ICHECK(value.valid &&
+         value.range.hi / extent <= (tl::FiniteWidthInteger::Wide(1) << 63) - 1)
+      << "SunMMIO region index cannot be represented without loss";
+  if (min.as<IntImmNode>()) {
+    MarkVisitedExprTree(min);
+    return EmitConstIndex(static_cast<int64_t>(value.range.lo / extent));
+  }
+  // Evaluate the original value once, before any address quantization. The
+  // abstract expression is proof-only and must never be emitted or reloaded.
+  MarkVisitedExprTree(min);
+  SunMMIOValue start = EvalExpr(min);
+  DataType dtype =
+      min.dtype().is_uint() ? DataType::UInt(64) : DataType::Int(64);
+  start = EmitCast(start, dtype);
+  SunMMIOType type = MapType(dtype);
+  SunMMIOValue divisor =
+      builder_->ConstantInt(NewValueName(), extent, type, dtype);
+  SunMMIOValue quotient =
+      builder_->Binary(NewValueName(), BinaryOp::kDiv,
+                       dtype.is_uint() ? ArithmeticFlavor::kUnsignedInt
+                                       : ArithmeticFlavor::kSignedInt,
+                       start, divisor, type, dtype);
+  return EnsureIndex(quotient);
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::EmitDistRegion(const PrimExpr &expr) {

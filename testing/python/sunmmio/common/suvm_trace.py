@@ -49,6 +49,15 @@ def trace_suvm_control_flow(result, source, *, signal_values=None, max_loop_iter
     fetch_counts = {}
     value_pattern = r"%[\w-]+(?:#\d+)?"
 
+    def signed(value, width):
+        value &= (1 << width) - 1
+        return value - (1 << width) if value & (1 << (width - 1)) else value
+
+    def quotient(a, b):
+        assert b != 0, "trace division by zero"
+        value = abs(a) // abs(b)
+        return -value if (a < 0) != (b < 0) else value
+
     def execute(block, values):
         for line, body, other in block:
             lhs, op = line.split(" = ", 1) if " = " in line and line.startswith("%") else (None, line)
@@ -116,9 +125,7 @@ def trace_suvm_control_flow(result, source, *, signal_values=None, max_loop_iter
                 pred = op.split()[1].rstrip(",")
                 integer_type = re.search(r": i(\d+)\b", op)
                 width = int(integer_type[1]) if integer_type else 64
-                operands = [value & ((1 << width) - 1) for value in args]
-                if pred.startswith("s"):
-                    operands = [value - (1 << width) if value & (1 << (width - 1)) else value for value in operands]
+                operands = [signed(value, width) if pred.startswith("s") else value & ((1 << width) - 1) for value in args]
                 comparison = pred[1:] if pred.startswith(("s", "u")) else pred
                 output = {
                     "eq": lambda a, b: a == b,
@@ -132,16 +139,30 @@ def trace_suvm_control_flow(result, source, *, signal_values=None, max_loop_iter
                 output = args[1] if args[0] else args[2]
             elif op.startswith("arith."):
                 operator = op.split()[0].split(".")[1]
+                integer_type = re.search(r": i(\d+)\s*$", op)
+                width = int(integer_type[1]) if integer_type else 64
+                if operator in ("divsi", "remsi", "floordivsi"):
+                    args = [signed(value, width) for value in args]
+                    assert args[1] != 0, "trace division by zero"
+                    assert operator == "remsi" or not (args[0] == -(1 << (width - 1)) and args[1] == -1), "trace signed division overflow"
+                elif operator in ("divui", "remui"):
+                    args = [value & ((1 << width) - 1) for value in args]
+                    assert args[1] != 0, "trace division by zero"
                 output = {
                     "addi": lambda a, b: a + b,
                     "subi": lambda a, b: a - b,
                     "muli": lambda a, b: a * b,
-                    "remsi": lambda a, b: a % b,
+                    "remsi": lambda a, b: a - quotient(a, b) * b,
                     "remui": lambda a, b: a % b,
-                    "divsi": lambda a, b: int(a / b),
+                    "divsi": quotient,
+                    "divui": lambda a, b: a // b,
                     "floordivsi": lambda a, b: a // b,
                     "andi": lambda a, b: a & b,
                     "ori": lambda a, b: a | b,
+                    "xori": lambda a, b: a ^ b,
+                    "shli": lambda a, b: a << b,
+                    "shrsi": lambda a, b, width=width: signed(a, width) >> b,
+                    "shrui": lambda a, b, width=width: (a & ((1 << width) - 1)) >> b,
                 }[operator](*args)
             elif op.startswith("suvm.get_core_id"):
                 output = 0
@@ -208,6 +229,7 @@ def trace_suvm_control_flow(result, source, *, signal_values=None, max_loop_iter
                 continue
             elif op.startswith("suvm.dist.signal_wait"):
                 output = args[-1]
+                events.append(("wait", output))
             elif op.startswith("suvm.sync"):
                 continue
             elif op.startswith("cf.assert"):

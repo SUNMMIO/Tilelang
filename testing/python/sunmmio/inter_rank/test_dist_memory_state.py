@@ -14,6 +14,7 @@ from testing.python.sunmmio.common.codegen_validation import (
     write_sunmmio_codegen_logs,
 )
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
+from testing.python.sunmmio.common.suvm_trace import trace_suvm_control_flow
 from testing.python.sunmmio.inter_rank.tir_test_utils import collect_calls, collect_nodes, single_prim_func, strip_casts
 
 tilelang.env.disable_cache()
@@ -34,6 +35,33 @@ def memory_wait_kernel(value=1, extra=0, group=False, world_size: int = 1):
                 signal = T.dist.signal(kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
             T.dist.wait_signal(signals[0] if group else signal, expected_delta=value_expr)
             T.dist.wait_signal(signals[0] if group else signal, expected_delta=extra_expr)
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
+def memory_integer_delta_kernel(base=127, mode="cast", group=False, through_array=False, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            if group:
+                ready = T.dist.signals(2, kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
+            else:
+                ready = T.dist.signal(kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
+            if mode == "cast":
+                delta = T.Cast("int8", rank_id + base)
+            elif mode == "add":
+                delta = T.Cast("int8", rank_id) + T.int8(base)
+            elif mode == "mul":
+                delta = T.Cast("int8", rank_id + 1) * T.int8(base)
+            else:
+                delta = T.if_then_else(T.Cast("int8", rank_id + base) > 0, 1, T.Cast("int8", rank_id + base))
+            if through_array:
+                deltas = T.alloc_shared((16,), T.int32)
+                deltas[0] = T.Cast("int32", delta)
+                T.dist.wait_signal(ready[0] if group else ready, expected_delta=deltas[0])
+            else:
+                T.dist.wait_signal(ready[0] if group else ready, expected_delta=delta)
 
     return main
 
@@ -101,6 +129,36 @@ def test_memory_completion_snapshot_and_update_use_unsigned_u32():
     snapshot = wait_any.args[3].args[0].buffer
     stores = collect_nodes(result.device_mod, tvm.tir.BufferStore, lambda node: node.buffer.data.same_as(snapshot.data))
     assert stores and all(node.value.dtype == "uint32" for node in stores)
+
+
+@pytest.mark.parametrize(
+    "mode,base,valid",
+    [
+        ("cast", 126, True),
+        ("cast", 127, False),
+        ("add", 126, True),
+        ("add", 127, False),
+        ("mul", 63, True),
+        ("mul", 64, False),
+        ("select", 126, True),
+        ("select", 127, False),
+    ],
+)
+@pytest.mark.parametrize("group", [False, True])
+@pytest.mark.parametrize("through_array", [False, True])
+def test_memory_delta_nonnegative_proof_observes_integer_width(tmp_path, mode, base, valid, group, through_array):
+    func = memory_integer_delta_kernel.get_tir(base=base, mode=mode, group=group, through_array=through_array, world_size=2)
+    if not valid:
+        with pytest.raises(tvm.error.InternalError, match="non-negative"):
+            lower_to_device_tir(func)
+        return
+    result = lower_to_device_tir(func)
+    source = codegen_sunmmio_suvm_mlir(result.device_mod, log_ir=False)
+    validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
+    for rank in (0, 1):
+        _, events = trace_suvm_control_flow(result, source, rank_id=rank)
+        expected = (rank + 1) * base if mode == "mul" else 1 if mode == "select" else rank + base
+        assert [e[1] for e in events if e[0] == "wait"] == [expected]
 
 
 if __name__ == "__main__":
