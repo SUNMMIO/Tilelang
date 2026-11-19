@@ -297,6 +297,22 @@ SunMMIOValue SunmmioMlirExpr::Binary(const std::string &result_name,
                          .getResult();
     }
     break;
+  case BinaryOp::kFloorDiv:
+  case BinaryOp::kFloorMod: {
+    // Layout simplification can introduce negative residuals even for valid
+    // nonnegative addresses. Preserve floor semantics for signed operands.
+    mlir::Value quotient = mlir::arith::FloorDivSIOp::create(
+        ctx_.builder, loc, result_mlir_type, lhs, rhs);
+    if (op == BinaryOp::kFloorDiv) {
+      binary_value = quotient;
+    } else {
+      mlir::Value product = mlir::arith::MulIOp::create(
+          ctx_.builder, loc, result_mlir_type, quotient, rhs);
+      binary_value = mlir::arith::SubIOp::create(
+          ctx_.builder, loc, result_mlir_type, lhs, product);
+    }
+    break;
+  }
   case BinaryOp::kMod:
     if (flavor == ArithmeticFlavor::kFloat) {
       binary_value = mlir::arith::RemFOp::create(ctx_.builder, loc,

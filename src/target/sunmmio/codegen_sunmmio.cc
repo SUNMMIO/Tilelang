@@ -2374,6 +2374,10 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitBinary(const char *op_name,
     bin_op = BinaryOp::kSub;
   else if (op == "mul")
     bin_op = BinaryOp::kMul;
+  else if (op == "floordiv" && dtype.is_int())
+    bin_op = BinaryOp::kFloorDiv;
+  else if (op == "floormod" && dtype.is_int())
+    bin_op = BinaryOp::kFloorMod;
   else if (op == "div" || op == "floordiv")
     bin_op = BinaryOp::kDiv;
   else if (op == "mod" || op == "floormod")
