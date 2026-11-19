@@ -294,6 +294,9 @@ TVM_DLL const Op &dma_copy();
  */
 TVM_DLL const Op &mx_pack();
 
+/// Call a Sunmmio device library operation on RSRAM regions.
+TVM_DLL const Op &device_lib();
+
 /*!
  * \brief Physically copy data/scale buffers out of an MX packed buffer.
  *

@@ -137,6 +137,8 @@ from .pdl import (
     pdl_sync,  # noqa: F401
 )
 
+from .device_lib import _device_lib, _device_lib_call, topk, exp_refined, log_refined, reciprocal_refined, rsqrt_refined  # noqa: F401
+
 from tvm.script.ir_builder.tir import match_buffer as _tvm_match_buffer
 from . import dtypes as _dtypes
 
