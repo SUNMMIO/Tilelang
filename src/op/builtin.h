@@ -333,6 +333,10 @@ TVM_DLL const Op &sunmmio_layout_transform();
  */
 TVM_DLL const Op &sunmmio_transpose();
 
+// Forward FP32 scan of complete contiguous rank-1 RSRAM buffers.
+// Kept opaque until codegen so scan stages remain tile SSA values.
+TVM_DLL const Op &sunmmio_cumsum();
+
 /*!
  * \brief tvm intrinsic for mma operation of Sunmmio target.
  *

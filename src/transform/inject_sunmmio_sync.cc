@@ -635,6 +635,24 @@ private:
   static bool GetTileCompoundAccesses(const CallNode *call,
                                       std::vector<UnitAccess> *accesses,
                                       std::vector<UnitAccess> *argument_loads) {
+    if (call->op.same_as(sunmmio_cumsum())) {
+      ICHECK_EQ(call->args.size(), 2U);
+      CollectRegionArgumentLoads(call, {0, 1}, argument_loads);
+      for (size_t i = 0; i < 2; ++i) {
+        BufferRegion region = NormalizeToBufferRegion(call->args[i]);
+        // SUVM cannot prove disjointness of dynamic slots such as i % 2 and
+        // (i + 1) % 2. Track their common allocation for completion waits.
+        if (region->region.size() == 2 && !as_const_int(region->region[0]->min))
+          region = BufferRegion::FullRegion(region->buffer);
+        bool write = i == 1;
+        accesses->push_back(
+            MakeRegionAccess(region, write,
+                             write ? AccessProducerKind::kTileStore
+                                   : AccessProducerKind::kTileLoad,
+                             kTileMemoryUnits));
+      }
+      return true;
+    }
     bool is_pack = call->op.same_as(mx_pack());
     bool is_unpack = call->op.same_as(mx_unpack());
     if (!is_pack && !is_unpack) {

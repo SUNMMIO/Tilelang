@@ -196,6 +196,11 @@ TIR_DEFINE_TL_BUILTIN(sunmmio_transpose)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
 
+TIR_DEFINE_TL_BUILTIN(sunmmio_cumsum)
+    .set_num_inputs(2)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
+
 TIR_DEFINE_TL_BUILTIN(mma_sunmmio)
     .set_num_inputs(-1)
     .set_attr<TCallEffectKind>("TCallEffectKind",

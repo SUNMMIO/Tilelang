@@ -1346,6 +1346,45 @@ CumSumOp::CumSumOp(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
 }
 
 Stmt CumSumOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
+  if (TargetIsSunmmio(T.target)) {
+    ICHECK_EQ(dim, 0) << "Sunmmio cumsum supports only rank-1 dim=0";
+    ICHECK(!reverse) << "Sunmmio cumsum does not yet support reverse scan";
+    for (const auto &region : {srcRegion_, dstRegion_}) {
+      const Buffer &buffer = region->buffer;
+      ICHECK_EQ(buffer.scope(), kSunmmioScopeRSRAM)
+          << "Sunmmio cumsum requires shared.rsram buffers";
+      ICHECK_EQ(buffer->dtype, DataType::Float(32))
+          << "Sunmmio cumsum currently supports FP32 only";
+      ICHECK_EQ(buffer->shape.size(), 1U)
+          << "Sunmmio cumsum supports only rank-1 buffers";
+      const auto *extent = buffer->shape[0].as<IntImmNode>();
+      ICHECK(extent && extent->value > 0 && extent->value % 128 == 0 &&
+             extent->value <= 4096)
+          << "Sunmmio cumsum requires a static length in [128,4096], "
+             "divisible by 128";
+      ICHECK(
+          analyzer->CanProveEqual(region->region[0]->min, 0) &&
+          analyzer->CanProveEqual(region->region[0]->extent, buffer->shape[0]))
+          << "Sunmmio cumsum requires complete buffer regions";
+      ICHECK(buffer->strides.empty() && is_zero(buffer->elem_offset))
+          << "Sunmmio cumsum does not support strided or offset buffers";
+      ICHECK(T.layout_map.count(buffer))
+          << "Sunmmio cumsum requires inferred contiguous layout";
+      auto *layout = T.layout_map[buffer].as<CuteLayoutNode>();
+      ICHECK(layout && layout->GetModeStride().size() == 1 &&
+             analyzer->CanProveEqual(layout->GetModeStride()[0], 1))
+          << "Sunmmio cumsum requires contiguous rank-1 layout";
+    }
+    ICHECK(analyzer->CanProveEqual(src->shape[0], dst->shape[0]))
+        << "Sunmmio cumsum input/output lengths must match";
+    // Distinct views of one allocation may overlap partially. Exact in-place
+    // operation is supported; alias views require a separate range proof.
+    ICHECK(!src->data.same_as(dst->data) || src.same_as(dst))
+        << "Sunmmio cumsum rejects distinct alias views";
+    return Evaluate(Call(DataType::Handle(), sunmmio_cumsum(),
+                         {MakeRegionExpr(src, srcRegion_->region, 1),
+                          MakeRegionExpr(dst, dstRegion_->region, 2)}));
+  }
   if (IsFragmentBuffer(this->src) && IsFragmentBuffer(this->dst)) {
     LOG(FATAL) << "CumSum for fragment not implemented, please raise an issue "
                   "if you need this feature.";
@@ -1393,6 +1432,21 @@ Stmt CumSumOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
 LayoutMap CumSumOpNode::InferLayout(const LayoutInferArgs &T,
                                     InferLevel level) const {
+  if (TargetIsSunmmio(T.target)) {
+    LayoutMap result;
+    if (level >= InferLevel::kStrict)
+      return result;
+    for (const Buffer &buffer : {src, dst}) {
+      if (buffer.scope() == kSunmmioScopeRSRAM && buffer->shape.size() == 1) {
+        result.Set(
+            buffer,
+            sunmmio::MakeAlignedRowMajor(
+                buffer->shape, buffer->dtype,
+                GetSunmmioTileProcessorConfig(T.target).rsram_align_bytes));
+      }
+    }
+    return result;
+  }
   // Only infer layout in strict mode
   if (level != InferLevel::kStrict) {
     return {};

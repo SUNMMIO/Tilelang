@@ -1200,12 +1200,9 @@ private:
 
   void VisitStmt_(const EvaluateNode *op) final {
     if (const auto *call = op->value.as<CallNode>()) {
-      if (call->op.same_as(dma_copy())) {
-        AddAccess(NormalizeToBufferRegion(call->args[0]), false);
-        AddAccess(NormalizeToBufferRegion(call->args[1]), true);
-        return;
-      }
-      if (call->op.same_as(sunmmio_layout_transform())) {
+      if (call->op.same_as(dma_copy()) ||
+          call->op.same_as(sunmmio_layout_transform()) ||
+          call->op.same_as(sunmmio_cumsum())) {
         AddAccess(NormalizeToBufferRegion(call->args[0]), false);
         AddAccess(NormalizeToBufferRegion(call->args[1]), true);
         return;
@@ -4076,8 +4073,12 @@ private:
     }
 
     const SeqStmtNode *pipeline_body_seq = GetPipelineBodySeq(loop);
-    ICHECK(pipeline_body_seq != nullptr)
-        << "Pipeline body must normalize to SeqStmt.";
+    if (!pipeline_body_seq) {
+      For sequential = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+      sequential.CopyOnWrite()->annotations.erase("num_stages");
+      return MakePipelineFallback(sequential, "ilp", "planning",
+                                  "non_sequence_body");
+    }
     for (const Stmt &stmt : pipeline_body_seq->seq) {
       if (!stmt.as<BlockRealizeNode>() && !stmt.as<EvaluateNode>() &&
           !stmt.as<ForNode>()) {
