@@ -933,15 +933,20 @@ private:
   }
   class Resolver : public ExprMutator {
   public:
-    explicit Resolver(ExpectedFinalBounds *owner)
-        : owner_(owner), integers_(&owner->analyzer_) {}
+    explicit Resolver(ExpectedFinalBounds *owner, bool condition = false)
+        : owner_(owner), integers_(&owner->analyzer_), condition_(condition) {}
     PrimExpr VisitExpr(const PrimExpr &expr) final {
       owner_->Work();
       PrimExpr value = ExprMutator::VisitExpr(expr);
       if (!(value.dtype().is_int() || value.dtype().is_uint() ||
             value.dtype().is_bool()))
         return value;
-      return integers_.Normalize(value);
+      if (!condition_)
+        return integers_.Normalize(value);
+      auto model = integers_.Analyze(value);
+      // An unmodeled condition leaves both branches reachable. Delta and loop
+      // bound resolution remain strict; only branch facts are optional.
+      return model.valid ? model.expr : Var("dist_condition", value.dtype());
     }
     PrimExpr VisitExpr_(const VarNode *op) final {
       auto it = owner_->bindings_.find(op);
@@ -970,6 +975,7 @@ private:
   private:
     ExpectedFinalBounds *owner_;
     FiniteWidthInteger integers_;
+    bool condition_;
   };
   PrimExpr Resolve(const PrimExpr &expr) {
     Work();
@@ -1100,7 +1106,7 @@ private:
     }
   }
   void Branch(const PrimExpr &expr, const Effect &yes, const Effect &no) {
-    PrimExpr condition = analyzer_.Simplify(Resolve(expr));
+    PrimExpr condition = analyzer_.Simplify(Resolver(this, true)(expr));
     if (is_one(condition)) {
       yes();
       return;

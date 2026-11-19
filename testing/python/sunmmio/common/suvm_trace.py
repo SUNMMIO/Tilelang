@@ -81,11 +81,15 @@ def trace_suvm_control_flow(result, source, *, signal_values=None, max_loop_iter
                 )
                 bounds = re.search(r"scf.for (%[\w-]+) = (%[\w-]+) to (%[\w-]+) step (%[\w-]+)", op)
                 carried = tuple(values[initial] for _, initial in bindings)
-                for iv in range(values[bounds[2]], values[bounds[3]], values[bounds[4]]):
+                assert "unsigned" not in op, "unsupported trace unsigned scf.for"
+                lower, upper, step = (signed(values[bounds[i]], 64) for i in (2, 3, 4))
+                assert step > 0, "trace scf.for requires a positive step"
+                for iv in range(lower, upper, step):
                     local = values.copy()
                     local[bounds[1]] = iv
                     local.update((name, value) for (name, _), value in zip(bindings, carried))
                     carried = execute(body, local)
+                    assert iv + step <= (1 << 63) - 1, "trace scf.for index increment overflow"
                 output = carried
             elif op.startswith("scf.while"):
                 bindings = re.findall(r"(%[\w-]+) = (%[\w-]+(?:#\d+)?)", op.split(" : ", 1)[0])
@@ -117,7 +121,8 @@ def trace_suvm_control_flow(result, source, *, signal_values=None, max_loop_iter
                 value = args[0] & ((1 << source_width) - 1)
                 if not op.startswith("arith.extui") and value & (1 << (source_width - 1)):
                     value -= 1 << source_width
-                output = value if target_type == "index" else value & ((1 << int(target_type[1:])) - 1)
+                target_width = 64 if target_type == "index" else int(target_type[1:])
+                output = value & ((1 << target_width) - 1)
             elif op.startswith("arith.trunci"):
                 width = int(re.search(r"to i(\d+)", op)[1])
                 output = args[0] & ((1 << width) - 1)
@@ -148,10 +153,13 @@ def trace_suvm_control_flow(result, source, *, signal_values=None, max_loop_iter
                 elif operator in ("divui", "remui"):
                     args = [value & ((1 << width) - 1) for value in args]
                     assert args[1] != 0, "trace division by zero"
+                elif operator == "maxsi":
+                    args = [signed(value, width) for value in args]
                 output = {
                     "addi": lambda a, b: a + b,
                     "subi": lambda a, b: a - b,
                     "muli": lambda a, b: a * b,
+                    "maxsi": max,
                     "remsi": lambda a, b: a - quotient(a, b) * b,
                     "remui": lambda a, b: a % b,
                     "divsi": quotient,
@@ -238,9 +246,10 @@ def trace_suvm_control_flow(result, source, *, signal_values=None, max_loop_iter
             else:
                 raise AssertionError(f"Unsupported trace operation: {op}")
             if op.startswith("arith.") and not op.startswith("arith.cmpi"):
-                result_type = re.search(r": i(\d+)\s*$", op)
+                result_type = re.search(r": (i\d+|index)\s*$", op)
                 if result_type and isinstance(output, int):
-                    output &= (1 << int(result_type[1])) - 1
+                    width = 64 if result_type[1] == "index" else int(result_type[1][1:])
+                    output &= (1 << width) - 1
             if lhs:
                 name, sep, count = lhs.partition(":")
                 if sep:

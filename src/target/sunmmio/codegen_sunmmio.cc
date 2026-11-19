@@ -7,6 +7,7 @@
 #include "../../op/comm.h"
 #include "../../op/region.h"
 #include "../../op/utils.h"
+#include "../../support/finite_width_integer.h"
 #include "../../tileview/tileview_planner_common.h"
 #include "../../transform/common/attr.h"
 #include "../sunmmio_utils.h"
@@ -1064,15 +1065,69 @@ void CodeGenTileLangSunMMIO::EmitFor(const tir::ForNode *op) {
   std::vector<SunMMIOValue> local_live_out_values =
       CollectLocalVarLiveOutValues(op->body);
 
-  SunMMIOValue min = EnsureIndex(EvalExpr(op->min));
-  SunMMIOValue extent = EnsureIndex(EvalExpr(op->extent));
-  SunMMIOValue step = op->step.has_value()
-                          ? EnsureIndex(EvalExpr(op->step.value()))
-                          : EmitConstIndex(1);
-  SunMMIOValue upper = builder_->Binary(
-      NewValueName(), BinaryOp::kAdd, ArithmeticFlavor::kIndex, min, extent,
-      SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
-      DataType::Int(32));
+  DataType dtype = op->loop_var.dtype();
+  SunMMIOValue min, upper, step, entry_min, entry_step;
+  bool count_from_zero = dtype.bits() == 64;
+  if (count_from_zero) {
+    PrimExpr raw_step = op->step.value_or(make_const(dtype, 1));
+    arith::Analyzer analyzer;
+    if (dist_rank_domain_) {
+      analyzer.Bind(
+          dist_rank_domain_->first,
+          Range::FromMinExtent(make_zero(dist_rank_domain_->first.dtype()),
+                               make_const(dist_rank_domain_->first.dtype(),
+                                          dist_rank_domain_->second)));
+    }
+    tl::FiniteWidthInteger facts(&analyzer, 1, &dist_let_bindings_);
+    auto extent_bound = facts.Analyze(op->extent);
+    auto step_bound = facts.Analyze(raw_step);
+    ICHECK(step_bound.valid && step_bound.range.lo > 0)
+        << "SunMMIO 64-bit For requires a provably positive step";
+    using Wide = tl::FiniteWidthInteger::Wide;
+    Wide maximum_extent = std::max(Wide(0), extent_bound.range.hi);
+    Wide maximum_count = maximum_extent / step_bound.range.lo +
+                         (maximum_extent % step_bound.range.lo != 0);
+    ICHECK(extent_bound.valid && maximum_count <= (Wide(1) << 63) - 1)
+        << "SunMMIO 64-bit For trip count must fit a signed 64-bit index";
+
+    // Capture entry values before BeginFor rebinds mutable locals to iter_args.
+    entry_min = builder_->BindValueAlias(
+        NewValueName(), EnsureType(EvalExpr(op->min), MapType(dtype), dtype));
+    SunMMIOValue extent =
+        EnsureType(EvalExpr(op->extent), MapType(dtype), dtype);
+    entry_step = builder_->BindValueAlias(
+        NewValueName(), EnsureType(EvalExpr(raw_step), MapType(dtype), dtype));
+    auto zero = builder_->ConstantInt(NewValueName(), 0, MapType(dtype), dtype);
+    auto flavor = GetArithmeticFlavor(dtype);
+    if (dtype.is_int()) {
+      extent = builder_->Binary(NewValueName(), BinaryOp::kMax, flavor, extent,
+                                zero, MapType(dtype), dtype);
+    }
+    // ceil(extent / step), without overflowing extent + step - 1.
+    auto quotient = builder_->Binary(NewValueName(), BinaryOp::kDiv, flavor,
+                                     extent, entry_step, MapType(dtype), dtype);
+    auto remainder =
+        builder_->Binary(NewValueName(), BinaryOp::kMod, flavor, extent,
+                         entry_step, MapType(dtype), dtype);
+    auto extra = builder_->Compare(NewValueName(), CompareOp::kNE,
+                                   GetCompareDomain(dtype), remainder, zero,
+                                   MapType(dtype));
+    auto count =
+        builder_->Binary(NewValueName(), BinaryOp::kAdd, flavor, quotient,
+                         EmitCast(extra, dtype), MapType(dtype), dtype);
+    min = EmitConstIndex(0);
+    upper = EnsureIndex(count);
+    step = EmitConstIndex(1);
+  } else {
+    min = EnsureIndex(EvalExpr(op->min));
+    SunMMIOValue extent = EnsureIndex(EvalExpr(op->extent));
+    step = op->step.has_value() ? EnsureIndex(EvalExpr(op->step.value()))
+                                : EmitConstIndex(1);
+    upper = builder_->Binary(
+        NewValueName(), BinaryOp::kAdd, ArithmeticFlavor::kIndex, min, extent,
+        SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
+        DataType::Int(32));
+  }
   std::string iv = "%" + op->loop_var->name_hint;
   AppendDistCaptureLiveOut(op, &local_live_out_values);
   PrepareDistFor(op, &local_live_out_values);
@@ -1083,8 +1138,16 @@ void CodeGenTileLangSunMMIO::EmitFor(const tir::ForNode *op) {
   SunMMIOValue index_iv{
       DataType::Int(64), iv,
       SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(64), 1, {}}};
-  BindVar(op->loop_var, EnsureType(index_iv, MapType(op->loop_var.dtype()),
-                                   op->loop_var.dtype()));
+  SunMMIOValue logical_iv = EnsureType(index_iv, MapType(dtype), dtype);
+  if (count_from_zero) {
+    auto offset = builder_->Binary(NewValueName(), BinaryOp::kMul,
+                                   GetArithmeticFlavor(dtype), logical_iv,
+                                   entry_step, MapType(dtype), dtype);
+    logical_iv = builder_->Binary(NewValueName(), BinaryOp::kAdd,
+                                  GetArithmeticFlavor(dtype), entry_min, offset,
+                                  MapType(dtype), dtype);
+  }
+  BindVar(op->loop_var, logical_iv);
   VisitStmtTracked(op->body);
   ExitScope();
   YieldDistFor(op);
