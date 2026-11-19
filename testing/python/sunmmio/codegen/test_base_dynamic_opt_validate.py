@@ -221,7 +221,7 @@ def test_dynamic_zz_allocate_copy_mma_codegen_validates_with_npuir_opt(tmp_path)
         mlir_filename="dynamic_zz_allocate_copy_mma_suvm.mlir",
         expected_tokens=(
             "arith.addi",
-            "arith.divsi",
+            "arith.floordivsi",
             "suvm.bind_layout",
             "dynamic_shapes =",
             "dynamic_strides =",
