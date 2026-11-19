@@ -621,6 +621,17 @@ private:
   static bool GetTileCompoundAccesses(const CallNode *call,
                                       std::vector<UnitAccess> *accesses,
                                       std::vector<UnitAccess> *argument_loads) {
+    if (call->op.same_as(sunmmio_cumsum())) {
+      ICHECK_EQ(call->args.size(), 2U);
+      CollectRegionArgumentLoads(call, {0, 1}, argument_loads);
+      accesses->push_back(
+          MakeRegionAccess(NormalizeToBufferRegion(call->args[0]), false,
+                           AccessProducerKind::kTileLoad, kTileMemoryUnits));
+      accesses->push_back(
+          MakeRegionAccess(NormalizeToBufferRegion(call->args[1]), true,
+                           AccessProducerKind::kTileStore, kTileMemoryUnits));
+      return true;
+    }
     bool is_pack = call->op.same_as(mx_pack());
     bool is_unpack = call->op.same_as(mx_unpack());
     if (!is_pack && !is_unpack) {

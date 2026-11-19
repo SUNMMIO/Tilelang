@@ -984,6 +984,28 @@ T.reduce_bitxor(buffer, out, dim=-1, clear=True)
 - `clear`：是否在 reduce 前清空输出，默认 `True`。
 - 返回值：表达 reduce 的语句。
 
+#### 一维 FP32 前缀和：`T.cumsum`
+
+Sunmmio 路径支持完整、连续的一维 `shared.rsram` FP32 buffer 的正向
+inclusive scan。`dim=0`（或等价的 `-1`），静态长度须在 `[128, 4096]`
+且是 128 的倍数。省略 `dst` 可原地计算；独立输出须具有相同 shape/dtype。
+布局由编译器推导，不需要显式 layout annotation。
+
+```python
+# local 已从 DRAM 搬入；shape=[512]，FP32，连续 RSRAM。
+# 每核独立计算自己持有的一行，不包含核间扫描。
+T.cumsum(local, dim=0)  # local[i] = sum(input_local[0:i+1])
+```
+
+该路径通过现有 SUVM tile 切片、插入和加法生成 128 元素分段扫描；段间
+carry 保留 FP32，中间扫描阶段不写回 SRAM。同步 pass 处理输入搬运和
+输出写回的依赖。累加采用树形重结合，不保证与从左到右 FP32 累加逐位一致。
+需按应用的数值容差校验，尤其是高动态范围和抵消输入。
+
+暂不支持反向、BF16、多维 buffer、部分 region、显式 stride、非零
+`elem_offset`、不同的别名视图及非整段尾部；这些情况会报错。4096 是当前
+静态展开的实现限制，不是硬件容量限制。
+
 ### 3.9 Kernel 与循环
 
 **`T.Kernel`**

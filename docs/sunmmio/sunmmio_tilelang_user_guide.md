@@ -988,6 +988,30 @@ These functions are for local bitwise reductions in integer or bit-mask scenario
 - `clear`: whether to clear the output before reduce. The default is `True`.
 - Return value: a statement expressing reduce.
 
+#### One-dimensional FP32 prefix sum: `T.cumsum`
+
+The Sunmmio path supports forward inclusive scans of complete, contiguous,
+rank-one `shared.rsram` FP32 buffers. Use `dim=0` (or equivalent `-1`) with a
+static length in `[128, 4096]` divisible by 128. Omit `dst` for in-place execution,
+or supply a separate destination with matching shape and dtype. Layout is
+inferred; no explicit layout annotation is needed.
+
+```python
+# local is already loaded from DRAM: shape=[512], FP32, contiguous RSRAM.
+# Each core scans its own row; this is not a cross-core scan.
+T.cumsum(local, dim=0)  # local[i] = sum(input_local[0:i+1])
+```
+
+Codegen uses existing SUVM tile slice, insert and add operations for 128-element
+segments, with FP32 carry between segments and no SRAM intermediate per scan
+stage. The sync pass tracks input-transfer and output-store dependencies.
+Tree reassociation is not bitwise-equivalent to sequential FP32 accumulation;
+validate application tolerances, especially for cancellation and large ranges.
+
+Reverse scans, BF16, multidimensional buffers, partial regions, explicit strides,
+nonzero `elem_offset`, distinct alias views and partial segments are currently
+rejected. The 4096 limit bounds static code expansion, not hardware capacity.
+
 ### 3.9 Kernel and Loops
 
 **`T.Kernel`**
