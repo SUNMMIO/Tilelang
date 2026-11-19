@@ -158,12 +158,18 @@ void SunmmioMlirContext::ApplyLayoutToType(const tir::Buffer &buffer,
     return;
   }
 
-  const tl::Layout &layout = layout_opt.value();
+  tl::Layout layout = layout_opt.value();
+  arith::Analyzer analyzer;
+  // A surviving DeclBuffer may resolve through its backing data variable.
+  if (IsGlobalScope(buffer) && layout->InputDim() != buffer->shape.size()) {
+    if (auto view =
+            tl::sunmmio::TryDenseReshapeLayout(layout, buffer, analyzer))
+      layout = *view;
+  }
   const auto *cute = layout.as<tl::CuteLayoutNode>();
   ICHECK(cute) << "SunMMIO SUVM codegen expects CuteLayout for buffer "
                << buffer->name << ", got " << layout->DebugOutput();
 
-  arith::Analyzer analyzer;
   type->layout_hshape.clear();
   type->layout_hstride.clear();
   type->layout_dim_levels.clear();

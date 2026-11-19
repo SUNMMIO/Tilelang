@@ -317,6 +317,10 @@ bool IsMXDType(DataType dtype);
 
 Layout MakeRowMajor(Array<PrimExpr> shape);
 
+// Derive a zero-copy layout for a compact, full-storage alias at offset zero.
+Optional<Layout> TryDenseReshapeLayout(const Layout &source, const Buffer &view,
+                                       arith::Analyzer &analyzer);
+
 /*!
  * \brief Row-major CuteLayout with the innermost extent padded for alignment.
  *
