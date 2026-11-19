@@ -73,6 +73,41 @@ bool IsGlobalScope(const tir::Buffer &buffer) {
   return buffer.scope().empty() || buffer.scope() == "global";
 }
 
+// A declared buffer and its backing buffer share a data variable. Adapt the
+// inherited layout only for a full, contiguous alias at the same origin.
+tl::Layout LayoutForDataAlias(const tir::Buffer &source,
+                              const tl::Layout &layout,
+                              const tir::Buffer &view) {
+  if (!IsGlobalScope(view) || source->dtype != view->dtype ||
+      layout->InputDim() == view->shape.size() || view->shape.empty())
+    return layout;
+
+  arith::Analyzer analyzer;
+  const auto source_shape = layout->InputShape();
+  if (source_shape.empty() ||
+      !tl::IsSameLayout(layout, tl::sunmmio::MakeRowMajor(source_shape),
+                        &analyzer) ||
+      !analyzer.CanProveEqual(source->elem_offset, 0) ||
+      !analyzer.CanProveEqual(view->elem_offset, 0))
+    return layout;
+
+  const DataType i64 = DataType::Int(64);
+  PrimExpr view_size = tir::make_const(i64, 1);
+  for (size_t i = view->shape.size(); i > 0; --i) {
+    if (!view->strides.empty() &&
+        !analyzer.CanProveEqual(tir::Cast(i64, view->strides[i - 1]),
+                                view_size))
+      return layout;
+    view_size = view_size * tir::Cast(i64, view->shape[i - 1]);
+  }
+  PrimExpr source_size = tir::make_const(i64, 1);
+  for (const PrimExpr &extent : source_shape)
+    source_size = source_size * tir::Cast(i64, extent);
+  if (analyzer.CanProveEqual(source_size, view_size))
+    return tl::sunmmio::MakeRowMajor(view->shape);
+  return layout;
+}
+
 ffi::Optional<tl::Layout>
 LookupLayoutInMap(const SunmmioMlirContext::TirLayoutMap &layout_map,
                   const tir::Buffer &buffer) {
@@ -82,7 +117,7 @@ LookupLayoutInMap(const SunmmioMlirContext::TirLayoutMap &layout_map,
   for (const auto &kv : layout_map) {
     const tir::Buffer &candidate = kv.first;
     if (candidate->data.same_as(buffer->data)) {
-      return kv.second;
+      return LayoutForDataAlias(candidate, kv.second, buffer);
     }
   }
   ffi::Optional<tl::Layout> name_match;
@@ -158,18 +193,12 @@ void SunmmioMlirContext::ApplyLayoutToType(const tir::Buffer &buffer,
     return;
   }
 
-  tl::Layout layout = layout_opt.value();
-  arith::Analyzer analyzer;
-  // A surviving DeclBuffer may resolve through its backing data variable.
-  if (IsGlobalScope(buffer) && layout->InputDim() != buffer->shape.size()) {
-    if (auto view =
-            tl::sunmmio::TryDenseReshapeLayout(layout, buffer, analyzer))
-      layout = *view;
-  }
+  const tl::Layout &layout = layout_opt.value();
   const auto *cute = layout.as<tl::CuteLayoutNode>();
   ICHECK(cute) << "SunMMIO SUVM codegen expects CuteLayout for buffer "
                << buffer->name << ", got " << layout->DebugOutput();
 
+  arith::Analyzer analyzer;
   type->layout_hshape.clear();
   type->layout_hstride.clear();
   type->layout_dim_levels.clear();

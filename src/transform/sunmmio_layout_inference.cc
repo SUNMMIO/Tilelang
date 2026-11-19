@@ -389,26 +389,6 @@ void SunmmioLayoutInferencePass::SeedImmutableLayouts(const PrimFunc &f) {
   // 2a: DRAM layouts from tensor_meta
   PopulateGlobalBufferLayouts(f, target_, &global_layout_map_);
 
-  // A reshape may introduce a different Buffer for a MeshTensor parameter.
-  // Validate it against the ABI layout before the metadata-free ND fallback.
-  for (const auto &[_, source] : f->buffer_map) {
-    auto layout = global_layout_map_.Get(source);
-    if (!layout || !buffer_data_to_buffers_.count(source->data))
-      continue;
-    for (const Buffer &view : buffer_data_to_buffers_[source->data]) {
-      if (view->shape.size() == source->shape.size())
-        continue;
-      auto view_layout =
-          sunmmio::TryDenseReshapeLayout(*layout, view, analyzer_);
-      ICHECK(source->dtype == view->dtype &&
-             analyzer_.CanProveEqual(source->elem_offset, 0) && view_layout)
-          << "Rank-changing view of " << source->name
-          << " requires compact row-major storage of the same dtype and "
-             "element count; materialize the data for a layout change.";
-      global_layout_map_.Set(view, *view_layout);
-    }
-  }
-
   for (const auto &buf : dram_buffers_) {
     if (global_layout_map_.count(buf)) {
       TryAssign(buf, global_layout_map_[buf], InferLevel::kStrict, -1,

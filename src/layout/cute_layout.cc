@@ -1022,31 +1022,6 @@ Layout MakeRowMajor(Array<PrimExpr> shape) {
   return CuteLayout(shape, mode_shape, mode_stride, dim_levels);
 }
 
-Optional<Layout> TryDenseReshapeLayout(const Layout &source, const Buffer &view,
-                                       arith::Analyzer &analyzer) {
-  auto source_shape = source->InputShape();
-  if (source_shape.empty() || view->shape.empty() ||
-      !IsSameLayout(source, MakeRowMajor(source_shape), &analyzer) ||
-      !analyzer.CanProveEqual(view->elem_offset, 0))
-    return std::nullopt;
-
-  auto i64 = DataType::Int(64);
-  PrimExpr view_elements = tir::make_const(i64, 1);
-  for (size_t i = view->shape.size(); i > 0; --i) {
-    if (!view->strides.empty() &&
-        !analyzer.CanProveEqual(tir::Cast(i64, view->strides[i - 1]),
-                                view_elements))
-      return std::nullopt;
-    view_elements = view_elements * tir::Cast(i64, view->shape[i - 1]);
-  }
-  PrimExpr source_elements = tir::make_const(i64, 1);
-  for (const PrimExpr &extent : source_shape)
-    source_elements = source_elements * tir::Cast(i64, extent);
-  if (!analyzer.CanProveEqual(source_elements, view_elements))
-    return std::nullopt;
-  return MakeRowMajor(view->shape);
-}
-
 Layout MakeAlignedRowMajor(Array<PrimExpr> shape, DataType dtype,
                            int align_bytes) {
   int rank = shape.size();
