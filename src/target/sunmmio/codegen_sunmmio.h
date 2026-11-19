@@ -23,6 +23,9 @@
 #include <vector>
 
 namespace tvm {
+namespace arith {
+class Analyzer;
+}
 namespace codegen {
 
 using SunMMIOCallAttrValue =
@@ -475,7 +478,8 @@ private:
     std::vector<SunMMIOValue> src_indices;
     std::vector<SunMMIOValue> dst_indices;
   };
-  std::vector<PrimExpr> dist_constraints_;
+  void BindIntegerContext(arith::Analyzer *analyzer) const;
+  std::vector<PrimExpr> integer_constraints_;
   std::vector<const tir::CallNode *> dist_capture_order_;
   std::unordered_map<const tir::VarNode *, PrimExpr> dist_let_bindings_;
   std::optional<std::pair<tir::Var, int64_t>> dist_rank_domain_;

@@ -415,30 +415,12 @@ class Builder(BaseBuilder):
         self.check_continue_break()
         it = unwrap_expr(it)
         if isinstance(it, (SerialForWithStep, UnrollForWithStep)):
-            # Validate and compute the trip count before constructing the frame
-            if isinstance(it.step, (int, IntImm)):
-                step_value = it.step if isinstance(it.step, int) else it.step.value
-                if step_value == 0:
-                    raise ValueError("Invalid stepped serial: step must be non-zero")
-                if step_value > 0:
-                    real_stop = tir.ceildiv(it.stop - it.start, step_value)
-                else:
-                    real_stop = tir.ceildiv(it.start - it.stop, -step_value)
-            else:
-                logger.warning(f"Using a non-constant step `{it.step}` in stepped serial may lead to undefined behavior in tilelang")
-                real_stop = tir.ceildiv(it.stop - it.start, it.step)
-            if isinstance(it, UnrollForWithStep):
-                real_frame = tir.unroll(real_stop, annotations=it.annotations)
-            elif isinstance(it, SerialForWithStep):
-                real_frame = tir.serial(real_stop, annotations=it.annotations)
-            else:
-                raise TypeError(
-                    f"Invalid for loop, got {it}({type(it)}), expect one of the following: "
-                    "range, T.serial, T.unroll, T.grid, T.parallel, T.vectorized, T.thread_binding"
-                )
-            with self.with_frame(real_frame) as v:
+            from tilelang.language.loop import _normalized_for
+
+            frame = _normalized_for(it.start, it.stop, it.step, isinstance(it, UnrollForWithStep), True, it.annotations)
+            with self.with_frame(frame) as v:
                 IRBuilder.name("_tmp", v)
-                yield it.start + v * it.step
+                yield v
         else:
             if not isinstance(it, tir.frame.ForFrame):
                 raise TypeError(

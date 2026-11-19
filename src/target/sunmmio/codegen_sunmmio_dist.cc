@@ -27,7 +27,7 @@ struct DistBatchScopeFailure {
 } // namespace
 
 void CodeGenTileLangSunMMIO::ClearDistFunctionState() {
-  dist_constraints_.clear();
+  integer_constraints_.clear();
   dist_destinations_.clear();
   dist_batch_for_call_.clear();
   dist_begins_.clear();
@@ -810,17 +810,23 @@ void CodeGenTileLangSunMMIO::BindDistResources(const PrimFunc &func) {
 namespace {
 // Only immutable scalar comparisons enter the range proof. The unsigned
 // quotient-zero equivalence supplies the one derived fact needed here.
-void BindDistConstraint(arith::Analyzer *analyzer, PrimExpr condition,
-                        bool negate = false) {
+void BindIntegerConstraint(arith::Analyzer *analyzer, PrimExpr condition,
+                           bool negate = false) {
   if (SideEffect(condition) > CallEffectKind::kPure)
     return;
   if (const auto *op = condition.as<NotNode>()) {
-    BindDistConstraint(analyzer, op->a, !negate);
+    BindIntegerConstraint(analyzer, op->a, !negate);
     return;
   }
   if (const auto *op = condition.as<AndNode>(); op && !negate) {
-    BindDistConstraint(analyzer, op->a);
-    BindDistConstraint(analyzer, op->b);
+    BindIntegerConstraint(analyzer, op->a);
+    BindIntegerConstraint(analyzer, op->b);
+    return;
+  }
+  // For unsigned integers, nonzero supplies a positive lower bound.
+  if (const auto *ne = condition.as<NENode>();
+      ne && !negate && ne->a.dtype().is_uint() && is_zero(ne->b)) {
+    BindIntegerConstraint(analyzer, ne->a > ne->b);
     return;
   }
   if (const auto *eq = condition.as<EQNode>()) {
@@ -831,7 +837,7 @@ void BindDistConstraint(arith::Analyzer *analyzer, PrimExpr condition,
           is_zero(pair.second)) {
         auto divisor = tl::FiniteWidthInteger::Literal(div->b);
         if (divisor && *divisor > 0) {
-          BindDistConstraint(
+          BindIntegerConstraint(
               analyzer,
               div->a <
                   make_const(div->a.dtype(), static_cast<uint64_t>(*divisor)),
@@ -894,18 +900,23 @@ void BindDistConstraint(arith::Analyzer *analyzer, PrimExpr condition,
 }
 } // namespace
 
-SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionPartitionIndex(
-    const PrimExpr &min, int64_t extent, const std::string &context) {
-  ICHECK_GT(extent, 0);
-  arith::Analyzer analyzer;
+void CodeGenTileLangSunMMIO::BindIntegerContext(
+    arith::Analyzer *analyzer) const {
   if (dist_rank_domain_)
-    analyzer.Bind(
+    analyzer->Bind(
         dist_rank_domain_->first,
         Range::FromMinExtent(make_zero(dist_rank_domain_->first.dtype()),
                              make_const(dist_rank_domain_->first.dtype(),
                                         dist_rank_domain_->second)));
-  for (const auto &condition : dist_constraints_)
-    BindDistConstraint(&analyzer, condition);
+  for (const auto &condition : integer_constraints_)
+    BindIntegerConstraint(analyzer, condition);
+}
+
+SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionPartitionIndex(
+    const PrimExpr &min, int64_t extent, const std::string &context) {
+  ICHECK_GT(extent, 0);
+  arith::Analyzer analyzer;
+  BindIntegerContext(&analyzer);
   tl::FiniteWidthInteger facts(&analyzer, extent, &dist_let_bindings_);
   auto value = facts.Analyze(min);
   ICHECK(facts.ProvesMultiple(value))

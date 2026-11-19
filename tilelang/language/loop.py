@@ -6,9 +6,18 @@ from collections.abc import Iterable
 from tvm import tir
 from tvm.tir import IntImm
 import tvm.script.ir_builder.tir as tb_tir
-from .eager.builder import SerialForWithStep, UnrollForWithStep
+from .eager.builder import SerialForWithStep, UnrollForWithStep, unwrap_expr
 from tilelang import _ffi_api
 from tvm.script.ir_builder.tir import frame
+
+
+def _normalized_for(start, stop, step, unroll, stepped, annotations):
+    start, stop, step = unwrap_expr(start), unwrap_expr(stop), unwrap_expr(step)
+    if isinstance(step, (int, IntImm)) and (step if isinstance(step, int) else step.value) == 0:
+        raise ValueError("Invalid stepped serial: step must be non-zero")
+    if isinstance(step, int) and step >= 1 << 63:
+        step = tir.const(step, "uint64")
+    return _ffi_api.NormalizedFor(start, stop, step, unroll, stepped, annotations or {})
 
 
 def Parallel(
@@ -195,7 +204,10 @@ def serial(
     step_is_one |= isinstance(step, int) and step == 1
     step_is_one |= isinstance(step, IntImm) and step.value == 1
     if step is None or step_is_one:
-        return tb_tir.serial(start, stop, annotations=annotations)
+        if stop is None:
+            stop = start
+            start = IntImm(start.dtype, 0) if hasattr(start, "dtype") else 0
+        return _normalized_for(start, stop, 1, False, False, annotations)
     else:
         if stop is None:
             stop = start
@@ -240,7 +252,6 @@ def unroll(
         The ForFrame.
     """
 
-    step_is_one = False
     if stop is None:
         stop = start
         if hasattr(start, "dtype"):
@@ -262,8 +273,8 @@ def unroll(
             raise ValueError("pragma_unroll_explicit must be True when unroll_factor is not None")
         annotations.update({"pragma_unroll_factor": unroll_factor})
 
-    if step is None or step_is_one:
-        return tb_tir.unroll(start, stop, annotations=annotations)
+    if step is None:
+        return _normalized_for(start, stop, 1, True, False, annotations)
     else:
         return UnrollForWithStep(start, stop, step, annotations=annotations)
 

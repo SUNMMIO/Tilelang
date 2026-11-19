@@ -2,7 +2,6 @@
 
 import pytest
 import re
-from dataclasses import replace
 
 import tilelang
 import tilelang.language as T
@@ -129,13 +128,14 @@ def masked_delta_kernel(mask=1, tail=1, group=False, reverse=False, world_size: 
 def wide_window_kernel(signed=False, span=2, stride=1, mode="notify", mutate=False, world_size: int = 1):
     dtype = T.int64 if signed else T.uint64
     stride_value = tvm.tir.const(stride, "int64" if signed else "uint64")
+    span_value = tvm.tir.const(span, "int64" if signed else "uint64")
 
     @T.prim_func
     def main(rank_id: T.dist.RankId, n: dtype):
         with T.Kernel():
             ready = T.dist.signal(kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
             base = T.alloc_var(dtype, init=n)
-            for i in T.serial(base if mutate else n, (base if mutate else n) + T.Cast(dtype, span), stride_value):
+            for i in T.serial(base if mutate else n, (base if mutate else n) + span_value, stride_value):
                 if mode == "notify":
                     T.dist.put_signal(ready, (rank_id + 1) % world_size, submit=True)
                 else:
@@ -162,6 +162,35 @@ def guarded_flag_kernel(group=False, memory=False, positive=False, amount=1, raw
             if n > 0 if positive else n != 0:  # noqa: SIM102 - protect the division
                 if T.truncdiv(96, n) > 1:
                     T.dist.wait_signal(ready[0] if group else ready, expected_delta=T.truncdiv(96, n) if raw_delta else amount)
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
+def aliased_unsigned_bound_kernel(unroll=False, world_size: int = 1):
+    loop = T.unroll if unroll else T.serial
+
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            ready = T.dist.signal(kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
+            end = T.uint64(3)
+            for _ in loop(T.uint64(0), end, T.uint64(7)):
+                T.dist.put_signal(ready, (rank_id + 1) % world_size, submit=True)
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
+def public_count_kernel(count=None, step=1, world_size: int = 1):
+    stop_value = tvm.tir.const(count, "uint64") if count is not None else None
+
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, n: T.uint64):
+        with T.Kernel():
+            ready = T.dist.signal(kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
+            for _ in T.serial(T.uint64(0), n if count is None else stop_value, step):
+                T.dist.put_signal(ready, (rank_id + 1) % world_size, submit=True)
 
     return main
 
@@ -264,14 +293,30 @@ def test_constant_mask_does_not_hide_flag_peak_overflow(group, reverse):
         lower_to_device_tir(kernel)
 
 
-@pytest.mark.parametrize("span,stride", [(2, 1), (5, 2), (3, 3)])
+@pytest.mark.parametrize("span,stride", [(2, 1), (5, 2), (3, 3), (3, (1 << 63) - 1)])
 def test_uint64_window_counts_from_zero_and_preserves_submissions(tmp_path, span, stride):
     result, source = generate(wide_window_kernel, tmp_path, span=span, stride=stride)
     count = (span + stride - 1) // stride
-    for n in (0, (1 << 63) - 1, 1 << 63, (1 << 64) - span):
+    for n in (0, (1 << 63) - 1, 1 << 63, (1 << 64) - 1 - span, (1 << 64) - span):
         batches, _ = trace_suvm_control_flow(result, source, rank_id=0, n=n)
-        assert len(batches) == count
+        stop = (n + span) & ((1 << 64) - 1)
+        assert len(batches) == (count if stop > n else 0)
         assert all(len(batch) == 1 and batch[0][0] == "signal" for batch in batches)
+
+
+def test_public_uint64_large_step_preserves_iv(tmp_path):
+    result, source = generate(wide_window_kernel, tmp_path, span=3, stride=(1 << 63) - 1, mode="high")
+    for n in (0, (1 << 63) - 1, 1 << 63, (1 << 64) - 3):
+        _, events = trace_suvm_control_flow(result, source, rank_id=0, n=n)
+        expected = [n >> 32] if n + 3 < 1 << 64 else []
+        assert [e[1] for e in events if e[0] == "wait"] == expected
+
+
+@pytest.mark.parametrize("unroll", [False, True])
+def test_unsigned_bound_alias_retains_static_trip_count(tmp_path, unroll):
+    result, source = generate(aliased_unsigned_bound_kernel, tmp_path, unroll=unroll)
+    batches, _ = trace_suvm_control_flow(result, source, rank_id=0)
+    assert len(batches) == 1
 
 
 def test_uint64_boundary_window_keeps_a_two_iteration_cf_loop(tmp_path):
@@ -294,9 +339,18 @@ def test_uint64_boundary_window_keeps_a_two_iteration_cf_loop(tmp_path):
     assert "suvm.dist.batch_submit" in cf
 
 
+@pytest.mark.parametrize("stride", [1, 2])
+def test_signed_window_checks_endpoint_before_using_known_count(tmp_path, stride):
+    result, source = generate(wide_window_kernel, tmp_path, signed=True, span=5, stride=stride)
+    maximum = (1 << 63) - 1
+    for n in (5, maximum - 5, maximum - 4, maximum):
+        batches, _ = trace_suvm_control_flow(result, source, rank_id=0, n=n)
+        assert len(batches) == (len(range(0, 5, stride)) if n <= maximum - 5 else 0)
+
+
 def test_uint64_window_restores_full_width_iv(tmp_path):
     result, source = generate(wide_window_kernel, tmp_path, span=5, stride=2, mode="high")
-    for n in (0, (1 << 63) - 1, 1 << 63, (1 << 64) - 5):
+    for n in (0, (1 << 63) - 1, 1 << 63, (1 << 64) - 6):
         _, events = trace_suvm_control_flow(result, source, rank_id=0, n=n)
         total, expected = 0, []
         for offset in (0, 2, 4):
@@ -305,27 +359,16 @@ def test_uint64_window_restores_full_width_iv(tmp_path):
         assert [e[1] for e in events if e[0] == "wait"] == expected
 
 
-@pytest.mark.parametrize("stride", [2, 1 << 63])
-def test_native_uint64_for_step_is_applied_to_logical_iv(tmp_path, stride):
-    # Public stepped serial is normalized by the frontend. Exercise For.step
-    # directly on device TIR so this tests the backend's own trip-count formula.
-    result = lower_to_device_tir(wide_window_kernel.get_tir(span=5, mode="offset", world_size=2))
-    func = next(iter(result.device_mod.functions.values()))
-    step = tvm.tir.Cast("uint64", tvm.tir.IntImm("int64", stride - (1 << 64))) if stride >= 1 << 63 else tvm.tir.const(stride, "uint64")
-
-    def rewrite(node):
-        if isinstance(node, tvm.tir.For):
-            return tvm.tir.For(node.loop_var, node.min, node.extent, node.kind, node.body, node.thread_binding, node.annotations, step=step)
-
-    body = tvm.tir.stmt_functor.ir_transform(func.body, None, rewrite, ["tir.For"])
-    result = replace(result, device_mod=tvm.IRModule({"main": func.with_body(body)}))
-    source = codegen_sunmmio_suvm_mlir(result.device_mod, log_case_name=tmp_path.name)
-    validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
-    for n in (0, (1 << 63) - 1, (1 << 64) - 5):
+@pytest.mark.parametrize("stride,span,mode", [(2, 5, "offset"), (1 << 63, (1 << 63) + 1, "high")])
+def test_public_uint64_for_step_is_applied_to_logical_iv(tmp_path, stride, span, mode):
+    result, source = generate(wide_window_kernel, tmp_path, span=span, stride=stride, mode=mode)
+    positions = (0, (1 << 63) - 2) if mode == "high" else (0, (1 << 63) - 1, (1 << 64) - 6)
+    for n in positions:
         _, events = trace_suvm_control_flow(result, source, rank_id=0, n=n)
-        expected, total = [], 0
-        for offset in range(0, 5, stride):
-            total += offset
+        total, expected = 0, []
+        for offset in range(0, span, stride):
+            delta = (n + offset) >> 32 if mode == "high" else offset
+            total = (total + delta) & 0xFFFFFFFF
             expected.append(total)
         assert [e[1] for e in events if e[0] == "wait"] == expected
 
@@ -333,14 +376,14 @@ def test_native_uint64_for_step_is_applied_to_logical_iv(tmp_path, stride):
 @pytest.mark.parametrize("signed", [False, True])
 def test_wide_loop_uses_entry_min_after_a_local_write(tmp_path, signed):
     result, source = generate(wide_window_kernel, tmp_path, signed=signed, mode="offset", mutate=True)
-    for n in (-2, 5, (1 << 63) - 2) if signed else (5, (1 << 63) - 1):
+    for n in (-2, 5, (1 << 63) - 3) if signed else (5, (1 << 63) - 1):
         _, events = trace_suvm_control_flow(result, source, rank_id=0, n=n)
         assert [e[1] for e in events if e[0] == "wait"] == [0, 1]
 
 
-def test_int64_window_keeps_negative_start_and_last_representable_iv(tmp_path):
+def test_int64_window_keeps_negative_and_high_representable_endpoints(tmp_path):
     result, source = generate(wide_window_kernel, tmp_path, signed=True, mode="offset")
-    for n in (-2, (1 << 63) - 2):
+    for n in (-2, (1 << 63) - 3):
         _, events = trace_suvm_control_flow(result, source, rank_id=0, n=n)
         assert [e[1] for e in events if e[0] == "wait"] == [0, 1]
 
@@ -348,62 +391,31 @@ def test_int64_window_keeps_negative_start_and_last_representable_iv(tmp_path):
 @pytest.mark.parametrize("span", [0, -1])
 def test_int64_nonpositive_extent_has_no_iterations(tmp_path, span):
     result, source = generate(wide_window_kernel, tmp_path, signed=True, span=span)
-    batches, _ = trace_suvm_control_flow(result, source, rank_id=0, n=-(1 << 63))
+    batches, _ = trace_suvm_control_flow(result, source, rank_id=0, n=-2)
     assert not batches
 
 
-@pytest.mark.parametrize("mode", ["count", "step", "zero_step"])
-def test_uint64_unproven_control_bounds_are_rejected(mode):
-    func = wide_window_kernel.get_tir(world_size=2)
-    result = lower_to_device_tir(func)
-    device_func = next(iter(result.device_mod.functions.values()))
-    n = next(p for p in device_func.params if p.name == "n")
+def test_public_uint64_unbounded_trip_count_is_rejected():
+    kernel = public_count_kernel.get_tir(world_size=2)
+    result = lower_to_device_tir(kernel)
+    with pytest.raises(tvm.error.InternalError, match="trip count must fit"):
+        codegen_sunmmio_suvm_mlir(result.device_mod)
 
-    def rewrite(node):
-        if isinstance(node, tvm.tir.For):
-            return tvm.tir.For(
-                node.loop_var,
-                node.min,
-                n if mode == "count" else node.extent,
-                node.kind,
-                node.body,
-                node.thread_binding,
-                node.annotations,
-                step=n if mode == "step" else tvm.tir.const(0, "uint64") if mode == "zero_step" else node.step,
-            )
 
-    body = tvm.tir.stmt_functor.ir_transform(device_func.body, None, rewrite, ["tir.For"])
-    mod = tvm.IRModule({"main": device_func.with_body(body)})
-    with pytest.raises(tvm.error.InternalError, match="trip count must fit|provably positive step"):
-        codegen_sunmmio_suvm_mlir(mod)
+def test_public_zero_step_is_rejected_at_construction():
+    with pytest.raises(ValueError, match="step must be non-zero"):
+        public_count_kernel.get_tir(count=2, step=0, world_size=2)
 
 
 @pytest.mark.parametrize("count,valid", [((1 << 63) - 1, True), (1 << 63, False)])
-def test_uint64_trip_count_checks_the_signed_index_limit(tmp_path, count, valid):
-    result = lower_to_device_tir(wide_window_kernel.get_tir(world_size=2))
-    func = next(iter(result.device_mod.functions.values()))
-
-    def rewrite(node):
-        if isinstance(node, tvm.tir.For):
-            return tvm.tir.For(
-                node.loop_var,
-                node.min,
-                tvm.tir.const(count, "uint64"),
-                node.kind,
-                node.body,
-                node.thread_binding,
-                node.annotations,
-                step=node.step,
-            )
-
-    body = tvm.tir.stmt_functor.ir_transform(func.body, None, rewrite, ["tir.For"])
-    mod = tvm.IRModule({"main": func.with_body(body)})
+def test_public_uint64_trip_count_checks_signed_index_limit(tmp_path, count, valid):
     if valid:
-        source = codegen_sunmmio_suvm_mlir(mod)
-        validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
+        generate(public_count_kernel, tmp_path, count=count)
     else:
+        kernel = public_count_kernel.get_tir(count=count, world_size=2)
+        result = lower_to_device_tir(kernel)
         with pytest.raises(tvm.error.InternalError, match="trip count must fit"):
-            codegen_sunmmio_suvm_mlir(mod)
+            codegen_sunmmio_suvm_mlir(result.device_mod)
 
 
 @pytest.mark.parametrize("group", [False, True])
