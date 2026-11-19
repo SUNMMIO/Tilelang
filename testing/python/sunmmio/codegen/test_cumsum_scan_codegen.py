@@ -1,9 +1,10 @@
 """Bounded FP32 scan: preserve tile SSA and real DMA dependencies."""
 
 import pytest
+import tilelang
 import tilelang.language as T
 from tilelang.layout import make_aligned_row_major
-from testing.python.sunmmio.common.codegen_validation import validate_sunmmio_codegen_with_npuir_opt
+from testing.python.sunmmio.common.codegen_validation import validate_sunmmio_codegen_with_npuir_opt, validate_suvm_mlir_with_npuir_opt
 
 
 def kernel(n=512, inplace=True, dtype="float32", reverse=False, sliced=False, rank2=False):
@@ -73,6 +74,58 @@ def test_minimum_segment_with_full_dram_carrier(tmp_path):
     assert src.count("suvm.tile.extract_slice") == 7
     assert src.count("suvm.tile.insert_slice") == 7
     assert "suvm.transform_layout_async" not in src
+
+
+@pytest.mark.parametrize("mode", ["greedy", "ilp"])
+@pytest.mark.parametrize("inplace", [True, False])
+def test_pipelined_row_scan(tmp_path, mode, inplace):
+    placement = T.placement.replicated()
+    layout = make_aligned_row_major((6, 256), T.float32, 1024)
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((6, 256), placement, T.float32, layout=layout), B: T.MeshTensor((6, 256), placement, T.float32, layout=layout)
+    ):
+        with T.Kernel(T.mesh_ncores()):
+            src = T.alloc_shared((256,), T.float32, scope="shared.rsram")
+            if inplace:
+                dst = src
+            else:
+                dst = T.alloc_shared((256,), T.float32, scope="shared.rsram")
+            for i in T.Pipelined(6, num_stages=2):
+                T.copy(A[i, 0], src)
+                T.cumsum(src, dst)
+                T.copy(dst, B[i, 0])
+
+    with tilelang.transform.PassContext(config={tilelang.PassConfigKey.TL_SUNMMIO_PIPELINE_MODE: mode}):
+        ir = tilelang.lower(main, target="sunmmio").kernel_source
+    assert "suvm.tile.extract_slice" in ir
+    if not inplace:
+        # At least one scan operand uses a pipeline version slot on axis zero.
+        assert any(
+            "tiled_dims = [1]" in line and "#suvm.memory_space<rsram>> -> !suvm.tile_view<128xf32>" in line for line in ir.splitlines()
+        )
+    validate_suvm_mlir_with_npuir_opt(ir, tmp_path, opt_args=("--verify-each", "--suvm-to-llvm-pipeline"))
+
+
+@pytest.mark.parametrize("mode", ["greedy", "ilp"])
+def test_scan_only_pipeline_preserves_loop_carried_row(tmp_path, mode):
+    placement = T.placement.replicated()
+
+    @T.prim_func
+    def main(A: T.MeshTensor((256,), placement, T.float32), B: T.MeshTensor((256,), placement, T.float32)):
+        with T.Kernel(T.mesh_ncores()):
+            row = T.alloc_shared((256,), T.float32, scope="shared.rsram")
+            T.copy(A, row)
+            for _ in T.Pipelined(6, num_stages=2):
+                T.cumsum(row)
+            T.copy(row, B)
+
+    with tilelang.transform.PassContext(config={tilelang.PassConfigKey.TL_SUNMMIO_PIPELINE_MODE: mode}):
+        ir = tilelang.lower(main, target="sunmmio").kernel_source
+    assert "scf.for" in ir
+    assert ir.count("suvm.tile.extract_slice") == 14
+    validate_suvm_mlir_with_npuir_opt(ir, tmp_path, opt_args=("--verify-each", "--suvm-to-llvm-pipeline"))
 
 
 @pytest.mark.parametrize(

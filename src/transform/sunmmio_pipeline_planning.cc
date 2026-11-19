@@ -1840,7 +1840,12 @@ public:
     }
 
     const SeqStmtNode *pipeline_body_seq = inner_stmt.as<SeqStmtNode>();
-    ICHECK(pipeline_body_seq) << "Pipeline body must be a SeqStmt";
+    if (!pipeline_body_seq) {
+      For sequential = Downcast<For>(StmtExprMutator::VisitStmt_(op));
+      sequential.CopyOnWrite()->annotations.erase("num_stages");
+      return MakePipelineFallback(sequential, "greedy", "planning",
+                                  "non_sequence_body");
+    }
     ICHECK(op->kind == ForKind::kSerial) << "Pipeline loop must be serial";
     // 3. Stage 1: Build the PipelineInstruction containers
     std::vector<PipelineInstruction> single_iteration_instructions;

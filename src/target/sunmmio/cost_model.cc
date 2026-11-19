@@ -4,6 +4,7 @@
  */
 
 #include "cost_model.h"
+#include "../../op/builtin.h"
 #include "../../op/comm.h"
 #include "../../op/utils.h"
 
@@ -518,9 +519,17 @@ private:
   static float AnalyzeEvaluate(const EvaluateNode &eval) {
     const auto *call = eval.value.as<CallNode>();
     ICHECK(call) << "VectorCore Evaluate must wrap a CallNode.";
+    if (call->op.same_as(sunmmio_cumsum())) {
+      auto source = NormalizeToBufferRegion(call->args[0]);
+      // Each element is loaded and stored once. Each 128-lane segment
+      // executes seven scan adds and one carry add.
+      int64_t length = Downcast<IntImm>(source->region.back()->extent)->value;
+      return length * (8 * VectorCoreCost::kAddSubFlops +
+                       VectorCoreCost::kFirstLoadFlops +
+                       VectorCoreCost::kBufferStoreBaseFlops);
+    }
     ICHECK(call->op == Op::Get("tl.vector_core_in_tile_reduce"))
-        << "An intrinsic on VectorCore should be "
-           "tl.vector_core_in_tile_reduce.";
+        << "Unsupported VectorCore intrinsic in cost model: " << call->op;
     const auto *reduce_kind = call->args[0].as<StringImmNode>();
     ICHECK(reduce_kind)
         << "VectorCore Evaluate call must carry a StringImm reduce kind.";

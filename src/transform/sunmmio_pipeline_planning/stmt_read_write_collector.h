@@ -229,11 +229,10 @@ public:
 
   void VisitStmt_(const EvaluateNode *op) {
     const CallNode *call = op->value.as<CallNode>();
-    if (call && call->op.same_as(dma_copy())) {
-      read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
-      write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
-    } else if (call && (call->op.same_as(sunmmio_layout_transform()) ||
-                        call->op.same_as(sunmmio_transpose()))) {
+    if (call && (call->op.same_as(dma_copy()) ||
+                 call->op.same_as(sunmmio_layout_transform()) ||
+                 call->op.same_as(sunmmio_transpose()) ||
+                 call->op.same_as(sunmmio_cumsum()))) {
       read_buffer_regions_.insert(NormalizeToBufferRegion(call->args[0]));
       write_buffer_regions_.insert(NormalizeToBufferRegion(call->args[1]));
     } else if (call && call->op.same_as(mma_sunmmio())) {

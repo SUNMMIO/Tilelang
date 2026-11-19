@@ -2937,21 +2937,29 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
       const Buffer &buffer = region->buffer;
       ICHECK_EQ(buffer.scope(), "shared.rsram");
       ICHECK_EQ(buffer->dtype, DataType::Float(32));
-      ICHECK_EQ(buffer->shape.size(), 1U);
-      ICHECK_EQ(region->region.size(), 1U);
-      const auto *length = buffer->shape[0].as<IntImmNode>();
+      // Pipeline injection can prepend a version slot to the original row.
+      size_t rank = buffer->shape.size();
+      ICHECK(rank == 1 || rank == 2);
+      ICHECK_EQ(region->region.size(), rank);
+      if (rank == 2) {
+        ICHECK(analyzer.CanProveEqual(region->region[0]->extent, 1));
+        MarkVisitedExprTree(region->region[0]->extent);
+        MarkVisitedExprTree(buffer->shape[0]);
+      }
+      const auto &row = region->region.back();
+      const auto *length = buffer->shape.back().as<IntImmNode>();
       ICHECK(length && length->value > 0 && length->value <= 4096 &&
              length->value % 128 == 0);
-      ICHECK(
-          analyzer.CanProveEqual(region->region[0]->min, 0) &&
-          analyzer.CanProveEqual(region->region[0]->extent, buffer->shape[0]));
+      ICHECK(analyzer.CanProveEqual(row->min, 0) &&
+             analyzer.CanProveEqual(row->extent, buffer->shape.back()));
       ICHECK(buffer->strides.empty() && is_zero(buffer->elem_offset));
-      MarkVisitedExprTree(region->region[0]->min);
-      MarkVisitedExprTree(region->region[0]->extent);
-      MarkVisitedExprTree(buffer->shape[0]);
+      MarkVisitedExprTree(row->min);
+      MarkVisitedExprTree(row->extent);
+      MarkVisitedExprTree(buffer->shape.back());
       const BufferBinding &binding = LookupBuffer(buffer);
-      ICHECK_EQ(binding.buffer_type.layout_hstride.size(), 1U);
-      ICHECK(analyzer.CanProveEqual(binding.buffer_type.layout_hstride[0], 1));
+      ICHECK_EQ(binding.buffer_type.layout_hstride.size(), rank);
+      ICHECK(
+          analyzer.CanProveEqual(binding.buffer_type.layout_hstride.back(), 1));
       return length->value;
     };
     int64_t length = validate(source);
@@ -2961,12 +2969,16 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     const DataType dtype = DataType::Float(32);
     const SunMMIOType tile_type = MakeTileType(dtype, {128});
     const SunMMIOType view_type = MakeTileViewType(dtype, {128});
-    auto view = [&](const Buffer &buffer, int64_t segment) {
-      const BufferBinding &binding = LookupBuffer(buffer);
+    auto view = [&](const BufferRegion &region, int64_t segment) {
+      const BufferBinding &binding = LookupBuffer(region->buffer);
       SunMMIOValue mem{dtype, binding.handle, binding.buffer_type};
-      return builder_->GetPartitionedTileView(NewValueName(), mem,
-                                              {EmitConstIndex(segment)}, {0},
-                                              view_type, dtype);
+      std::vector<SunMMIOValue> indices;
+      if (region->region.size() == 2)
+        indices.push_back(EvalExpr(region->region[0]->min));
+      int64_t row_axis = indices.size();
+      indices.push_back(EmitConstIndex(segment));
+      return builder_->GetPartitionedTileView(NewValueName(), mem, indices,
+                                              {row_axis}, view_type, dtype);
     };
     SunMMIOValue carry = EvalExpr(make_const(dtype, 0.0f));
     SunMMIOValue zero =
@@ -2974,7 +2986,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
     // Bounded static scan. Each segment is loaded once and stored once; all
     // seven stages remain tile SSA. Carry is FP32 and never round-trips SRAM.
     for (int64_t segment = 0; segment < length / 128; ++segment) {
-      SunMMIOValue input_view = view(source->buffer, segment);
+      SunMMIOValue input_view = view(source, segment);
       SunMMIOValue x = builder_->TileLoad(NewValueName(), input_view, tile_type,
                                           std::nullopt, std::nullopt, dtype);
       for (int64_t distance : {1, 2, 4, 8, 16, 32, 64}) {
@@ -2995,8 +3007,7 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
                                           broadcast, tile_type, dtype);
       carry = builder_->TilePick(NewValueName(), out, {EmitConstIndex(127)},
                                  MapType(dtype), dtype);
-      builder_->TileStore(out, view(destination->buffer, segment),
-                          std::nullopt);
+      builder_->TileStore(out, view(destination, segment), std::nullopt);
     }
     return SunMMIOValue{op->dtype, "", MapType(op->dtype)};
   } else if (callee == "tl.mx_pack") {
