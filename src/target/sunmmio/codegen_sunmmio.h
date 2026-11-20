@@ -515,6 +515,10 @@ private:
                          const SunMMIOValue &value);
   SunMMIOValue EmitScalarTilePick(const tir::BufferLoadNode *op);
   void EmitScalarTileSet(const tir::BufferStoreNode *op);
+  std::pair<std::vector<SunMMIOValue>, std::vector<SunMMIOValue>>
+  EmitScalarTileIndices(const ffi::Array<PrimExpr> &indices,
+                        const std::vector<int64_t> &dims,
+                        const std::vector<int64_t> &shape);
   std::vector<SunMMIOValue>
   CollectLocalVarLiveOutValues(const tir::Stmt &stmt) const;
   bool TryLowerTilesScope(const tir::ForNode *op);

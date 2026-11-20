@@ -538,12 +538,11 @@ GetSmall2DCarrierShape(const Buffer &buffer,
     return std::nullopt;
   }
 
-  if (logical_shape[0] > carrier_height || logical_shape[1] > carrier_width ||
-      carrier_height % logical_shape[0] != 0 ||
-      carrier_width % logical_shape[1] != 0) {
+  auto fitted = FitSunmmio2DCarrier(carrier_height, carrier_width,
+                                    {logical_shape[0], logical_shape[1]});
+  if (!fitted)
     return std::nullopt;
-  }
-  return std::vector<int>{carrier_height, carrier_width};
+  return std::vector<int>(fitted->begin(), fitted->end());
 }
 
 std::optional<TileViewPlan> TryPlanDomainSizedSmall2D(

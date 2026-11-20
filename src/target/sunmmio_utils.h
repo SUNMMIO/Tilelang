@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 #include <tvm/ffi/container/array.h>
@@ -22,6 +23,9 @@
 #include "../layout/layout.h"
 
 namespace tvm {
+namespace arith {
+class Analyzer;
+}
 namespace tl {
 
 enum class CommunicationDirections;
@@ -79,8 +83,6 @@ struct SunmmioMeshConfig {
 struct SunmmioScalarTileAccessPlan {
   std::vector<int64_t> tile_shape;
   std::vector<int64_t> tiled_dims;
-  std::vector<PrimExpr> partition_indices;
-  std::vector<PrimExpr> local_indices;
 };
 
 std::optional<SunmmioScalarTileAccessPlan> PlanSunmmioScalarTileAccess(
@@ -88,12 +90,33 @@ std::optional<SunmmioScalarTileAccessPlan> PlanSunmmioScalarTileAccess(
     DataType dtype, const ffi::Optional<Layout> &layout,
     const SunmmioTileProcessorConfig &config, std::string *failure_reason);
 
-// Physical read/modify/write footprint of the scalar RSRAM tile path.
-tir::Region
-GetSunmmioScalarTileAccessRegion(const tir::Buffer &buffer,
-                                 const ffi::Array<PrimExpr> &indices,
-                                 const ffi::Map<tir::Buffer, Layout> &layouts,
-                                 const SunmmioTileProcessorConfig &config);
+// Largest 2-D register carrier with the supplied row width, if it can
+// contain an integral number of the logical tiles.
+std::optional<std::vector<int64_t>>
+FitSunmmio2DCarrier(int64_t height, int64_t width,
+                    const std::vector<int64_t> &logical);
+// Shape actually written by a tile store in RSRAM, in tiled-axis order.
+// A null result denotes an unsupported carrier. Unit-axis promotion uses
+// the logical shape directly.
+std::optional<std::vector<int64_t>>
+GetSunmmioStoreCarrier(const std::vector<int64_t> &logical, DataType dtype,
+                       const SunmmioTileProcessorConfig &config,
+                       const std::vector<uint8_t> &levels,
+                       const std::vector<int64_t> &shape,
+                       const std::vector<int64_t> &strides);
+
+// Empty interior_shape selects scalar access. Otherwise each nonzero entry
+// names a tiled dimension and its logical size. same_iteration optionally
+// receives the finite-width scalar footprint at this program point.
+tir::Region GetSunmmioScalarTileAccessRegion(
+    const tir::Buffer &buffer, const ffi::Array<PrimExpr> &indices,
+    const ffi::Map<tir::Buffer, Layout> &layouts,
+    const SunmmioTileProcessorConfig &config,
+    arith::Analyzer *analyzer = nullptr,
+    const std::unordered_map<const tir::VarNode *, PrimExpr> *definitions =
+        nullptr,
+    const std::vector<int64_t> &interior_shape = {},
+    tir::Region *same_iteration = nullptr);
 
 // Physical mechanism used by a direct Sunmmio data transfer.
 enum class SunmmioTransferMechanism {

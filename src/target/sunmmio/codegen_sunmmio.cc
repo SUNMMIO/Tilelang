@@ -1586,6 +1586,61 @@ CodeGenTileLangSunMMIO::EmitLoad(const tir::Buffer &buffer,
                         binding.buffer_type, dtype, MapType(dtype));
 }
 
+std::pair<std::vector<SunMMIOValue>, std::vector<SunMMIOValue>>
+CodeGenTileLangSunMMIO::EmitScalarTileIndices(
+    const ffi::Array<PrimExpr> &indices, const std::vector<int64_t> &dims,
+    const std::vector<int64_t> &shape) {
+  std::vector<SunMMIOValue> partitions, lanes(dims.size());
+  for (size_t dim = 0; dim < indices.size(); ++dim) {
+    // Evaluate the original index before widening; a narrowing cast is part of
+    // its runtime value. Partition and lane consume this same SSA value.
+    auto value = EvalExpr(indices[dim]);
+    auto found = std::find(dims.begin(), dims.end(), dim);
+    if (found == dims.end()) {
+      partitions.push_back(EnsureIndex(value));
+      continue;
+    }
+    size_t axis = found - dims.begin();
+    if (auto literal = tl::FiniteWidthInteger::Literal(indices[dim]);
+        literal && *literal >= 0 && *literal <= INT64_MAX) {
+      partitions.push_back(
+          EmitConstIndex(static_cast<int64_t>(*literal / shape[axis])));
+      lanes[axis] =
+          EmitConstIndex(static_cast<int64_t>(*literal % shape[axis]));
+      continue;
+    }
+    auto dtype = value.dtype.is_uint() ? DataType::UInt(64) : DataType::Int(64);
+    value = EmitCast(value, dtype);
+    auto width = builder_->ConstantInt(NewValueName(), shape[axis],
+                                       MapType(dtype), dtype);
+    auto flavor = GetArithmeticFlavor(dtype);
+    auto q = builder_->Binary(NewValueName(), BinaryOp::kDiv, flavor, value,
+                              width, MapType(dtype), dtype);
+    auto r = builder_->Binary(NewValueName(), BinaryOp::kMod, flavor, value,
+                              width, MapType(dtype), dtype);
+    if (dtype.is_int()) {
+      auto zero =
+          builder_->ConstantInt(NewValueName(), 0, MapType(dtype), dtype);
+      auto negative =
+          builder_->Compare(NewValueName(), CompareOp::kLT,
+                            CompareDomain::kSignedInt, r, zero, MapType(dtype));
+      auto one =
+          builder_->ConstantInt(NewValueName(), 1, MapType(dtype), dtype);
+      auto adjust = builder_->Select(NewValueName(), negative, one, zero,
+                                     MapType(dtype), dtype);
+      q = builder_->Binary(NewValueName(), BinaryOp::kSub, flavor, q, adjust,
+                           MapType(dtype), dtype);
+      auto correction = builder_->Select(NewValueName(), negative, width, zero,
+                                         MapType(dtype), dtype);
+      r = builder_->Binary(NewValueName(), BinaryOp::kAdd, flavor, r,
+                           correction, MapType(dtype), dtype);
+    }
+    partitions.push_back(EnsureIndex(q));
+    lanes[axis] = EnsureIndex(r);
+  }
+  return {partitions, lanes};
+}
+
 SunMMIOValue
 CodeGenTileLangSunMMIO::EmitScalarTilePick(const tir::BufferLoadNode *op) {
   const tir::Buffer &buffer = op->buffer;
@@ -1644,16 +1699,8 @@ CodeGenTileLangSunMMIO::EmitScalarTilePick(const tir::BufferLoadNode *op) {
     MarkVisitedExprTree(indices[dim]);
   }
 
-  std::vector<SunMMIOValue> partition_indices;
-  partition_indices.reserve(plan->partition_indices.size());
-  for (const PrimExpr &idx : plan->partition_indices) {
-    partition_indices.push_back(EnsureIndex(EvalExpr(idx)));
-  }
-  std::vector<SunMMIOValue> local_indices;
-  local_indices.reserve(plan->local_indices.size());
-  for (const PrimExpr &idx : plan->local_indices) {
-    local_indices.push_back(EnsureIndex(EvalExpr(idx)));
-  }
+  auto [partition_indices, local_indices] =
+      EmitScalarTileIndices(indices, plan->tiled_dims, plan->tile_shape);
 
   SunMMIOValue memtensor{dtype, binding.handle, binding.buffer_type};
   SunMMIOType tile_view_type = MakeTileTypeForShape(
@@ -1719,16 +1766,8 @@ void CodeGenTileLangSunMMIO::EmitScalarTileSet(const tir::BufferStoreNode *op) {
     MarkVisitedExprTree(indices[dim]);
   }
 
-  std::vector<SunMMIOValue> partition_indices;
-  partition_indices.reserve(plan->partition_indices.size());
-  for (const PrimExpr &idx : plan->partition_indices) {
-    partition_indices.push_back(EnsureIndex(EvalExpr(idx)));
-  }
-  std::vector<SunMMIOValue> local_indices;
-  local_indices.reserve(plan->local_indices.size());
-  for (const PrimExpr &idx : plan->local_indices) {
-    local_indices.push_back(EnsureIndex(EvalExpr(idx)));
-  }
+  auto [partition_indices, local_indices] =
+      EmitScalarTileIndices(indices, plan->tiled_dims, plan->tile_shape);
 
   SunMMIOValue memtensor{dtype, binding.handle, binding.buffer_type};
   SunMMIOType tile_view_type = MakeTileTypeForShape(

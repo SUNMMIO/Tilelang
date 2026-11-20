@@ -4,6 +4,7 @@
  */
 
 #include <tvm/ffi/reflection/registry.h>
+#include <tvm/node/structural_hash.h>
 #include <tvm/tir/builtin.h>
 #include <tvm/tir/transform.h>
 
@@ -13,10 +14,13 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../layout/cute_layout.h"
 #include "../op/builtin.h"
 #include "../op/comm.h"
 #include "../op/utils.h"
 #include "../support/finite_width_integer.h"
+#include "../tileview/tileview_planner_common.h"
+#include "common/attr.h"
 #include "dist_transform_utils.h"
 
 namespace tvm {
@@ -43,83 +47,6 @@ void AddUniqueRegion(BufferRegions *regions, const BufferRegion &region) {
   regions->push_back(region);
 }
 
-BufferRegions MergeRegions(const BufferRegions &lhs, const BufferRegions &rhs) {
-  BufferRegions merged = lhs;
-  for (const BufferRegion &region : rhs) {
-    AddUniqueRegion(&merged, region);
-  }
-  return merged;
-}
-
-BufferRegions WidenLoopSourceRegions(
-    const BufferRegions &regions,
-    const std::unordered_set<const VarNode *> &loop_local_vars) {
-  BufferRegions widened;
-  for (const BufferRegion &region : regions) {
-    Region bounds;
-    for (size_t dim = 0; dim < region->region.size(); ++dim) {
-      const Range &range = region->region[dim];
-      bool changes = false;
-      auto check = [&](const ObjectRef &node) {
-        if (const auto *var = node.as<VarNode>()) {
-          changes |= loop_local_vars.count(var) != 0;
-        }
-        changes |= node.as<BufferLoadNode>() != nullptr;
-      };
-      PostOrderVisit(range->min, check);
-      PostOrderVisit(range->extent, check);
-      // An address captured by an earlier send must not be compared using the
-      // next iteration's values. Retain invariant dimensions, but
-      // conservatively cover a varying dimension until cross-iteration bounds
-      // are available.
-      bounds.push_back(changes
-                           ? Range::FromMinExtent(make_zero(range->min.dtype()),
-                                                  region->buffer->shape[dim])
-                           : range);
-    }
-    AddUniqueRegion(&widened, BufferRegion(region->buffer, std::move(bounds)));
-  }
-  return widened;
-}
-
-bool SameRegionSet(const BufferRegions &lhs, const BufferRegions &rhs) {
-  if (lhs.size() != rhs.size()) {
-    return false;
-  }
-  for (const BufferRegion &region : lhs) {
-    bool found = false;
-    for (const BufferRegion &candidate : rhs) {
-      found |= SameBufferRegion(region, candidate);
-    }
-    if (!found) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool AnyRegionOverlaps(const BufferRegions &pending,
-                       const BufferRegions &accesses) {
-  for (const BufferRegion &lhs : pending) {
-    for (const BufferRegion &rhs : accesses) {
-      if (BufferRegionsMayOverlap(lhs->buffer, lhs->region, rhs->buffer,
-                                  rhs->region)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-bool AnyRegionUsesBuffer(const BufferRegions &regions, const Var &buffer_var) {
-  for (const BufferRegion &region : regions) {
-    if (region->buffer->data.same_as(buffer_var)) {
-      return true;
-    }
-  }
-  return false;
-}
-
 BufferRegions CallWriteRegions(const CallNode *call) {
   BufferRegions writes;
   auto add = [&](size_t index) {
@@ -143,34 +70,262 @@ BufferRegions CallWriteRegions(const CallNode *call) {
   return writes;
 }
 
-class WriteRegionCollector : public StmtExprVisitor {
+// Each descriptor records its source at enqueue. A backedge forgets the
+// same-iteration relation, but keeps the conservative numeric envelope.
+using Sources = std::unordered_map<const CallNode *, bool>;
+
+Sources JoinSources(Sources lhs, const Sources &rhs) {
+  for (auto [call, current] : rhs) {
+    auto [it, fresh] = lhs.emplace(call, current);
+    if (!fresh)
+      it->second &= current;
+  }
+  return lhs;
+}
+
+class PhysicalWrites : public StmtExprVisitor {
 public:
-  WriteRegionCollector(const Map<Buffer, Layout> &layouts,
-                       const SunmmioTileProcessorConfig &config)
-      : layouts_(layouts), config_(config) {}
-  BufferRegions Collect(const Stmt &stmt) {
-    VisitStmt(stmt);
-    return std::move(writes_);
+  PhysicalWrites(const PrimFunc &func, const Map<Buffer, Layout> &layouts,
+                 const SunmmioTileProcessorConfig &config)
+      : layouts_(layouts), config_(config) {
+    PostOrderVisit(func->body, [&](const ObjectRef &node) {
+      if (const auto *c = node.as<CallNode>(); c && c->op.same_as(dist_put_()))
+        payload_.insert(
+            NormalizeToBufferRegion(c->args[0])->buffer->data.get());
+    });
+    if (payload_.empty())
+      return;
+    for (const auto &param : func->params)
+      escaped_.insert(param.get());
+    // Only substitute a private, non-escaping scalar with a single store.
+    // Its initialization must also dominate the use (see VisitStmt below).
+    PostOrderVisit(func->body, [&](const ObjectRef &node) {
+      if (const auto *s = node.as<BufferStoreNode>())
+        ++store_count_[s->buffer->data.get()];
+      if (const auto *v = node.as<VarNode>(); v && v->dtype.is_handle())
+        escaped_.insert(v);
+      if (const auto *c = node.as<CallNode>()) {
+        for (const auto &w : CallWriteRegions(c))
+          escaped_.insert(w->buffer->data.get());
+        if (c->op.same_as(dist_put_()))
+          escaped_.insert(
+              NormalizeToBufferRegion(c->args[1])->buffer->data.get());
+        if (!c->op.same_as(builtin::address_of()))
+          return;
+        if (const auto *l = c->args[0].as<BufferLoadNode>())
+          escaped_.insert(l->buffer->data.get());
+      }
+    });
+    VisitStmt(func->body);
+  }
+
+  const BufferRegions &Leaf(const StmtNode *node) const {
+    static const BufferRegions empty;
+    auto it = leaves_.find(node);
+    return it == leaves_.end() ? empty : it->second;
+  }
+  const BufferRegions &Loop(const Stmt &body) {
+    auto [it, fresh] = loops_.try_emplace(body.get());
+    if (fresh) {
+      std::unordered_set<BufferRegion, StructuralHash, StructuralEqual> seen;
+      PostOrderVisit(body, [&](const ObjectRef &node) {
+        if (const auto *s = node.as<StmtNode>())
+          for (const auto &region : Leaf(s))
+            if (seen.insert(region).second)
+              it->second.push_back(region);
+      });
+    }
+    return it->second;
+  }
+  bool Uses(const Sources &sources, const Var &data) const {
+    for (auto [call, current] : sources)
+      if (reads_.at(call)->buffer->data.same_as(data))
+        return true;
+    return false;
+  }
+  bool Overlaps(const Sources &sources, const BufferRegions &writes,
+                const BufferStoreNode *store = nullptr) const {
+    for (auto [call, current] : sources) {
+      const auto &src = reads_.at(call);
+      for (const auto &w : writes) {
+        if (!BufferRegionsMayOverlap(src->buffer, src->region, w->buffer,
+                                     w->region))
+          continue;
+        if (current && store && exact_reads_.count(call) &&
+            exact_stores_.count(store) &&
+            !BufferRegionsMayOverlap(src->buffer, exact_reads_.at(call),
+                                     w->buffer, exact_stores_.at(store)))
+          continue;
+        return true;
+      }
+    }
+    return false;
   }
 
 private:
-  void VisitStmt_(const BufferStoreNode *op) final {
-    Region region = GetSunmmioScalarTileAccessRegion(op->buffer, op->indices,
-                                                     layouts_, config_);
-    AddUniqueRegion(&writes_, BufferRegion(op->buffer, std::move(region)));
-    StmtExprVisitor::VisitStmt_(op);
-  }
-
-  void VisitExpr_(const CallNode *op) final {
-    for (const BufferRegion &region : CallWriteRegions(op)) {
-      AddUniqueRegion(&writes_, region);
+  class IndexSnapshots : public ExprMutator {
+  public:
+    std::unordered_map<const VarNode *, Var> values;
+    PrimExpr VisitExpr_(const BufferLoadNode *load) final {
+      auto it = values.find(load->buffer->data.get());
+      if (it != values.end() && load->buffer.scope() == "local.var" &&
+          load->indices.size() == 1 && is_zero(load->indices[0]) &&
+          it->second.dtype() == load->dtype)
+        return it->second;
+      return ExprMutator::VisitExpr_(load);
     }
-    StmtExprVisitor::VisitExpr_(op);
+  } snapshots_;
+  BufferRegion Envelope(const BufferRegion &r, Region *current = nullptr) {
+    Region bounds;
+    auto shape = r->buffer->shape;
+    for (auto &kv : layouts_)
+      if (kv.first.same_as(r->buffer) ||
+          (!layouts_.count(r->buffer) &&
+           kv.first->data.same_as(r->buffer->data))) {
+        if (auto *layout = kv.second.as<CuteLayoutNode>())
+          shape = layout->GetCoveredShape();
+        break;
+      }
+    FiniteWidthInteger facts(&analyzer_, 1, &defs_);
+    for (size_t i = 0; i < r->region.size(); ++i) {
+      auto start = facts.Analyze(snapshots_(r->region[i]->min));
+      auto extent = facts.Analyze(r->region[i]->extent);
+      auto end = start.range.hi + extent.range.hi;
+      auto size = FiniteWidthInteger::Literal(shape[i]);
+      if (start.valid && extent.valid && size && start.range.lo >= 0 &&
+          extent.range.lo >= 0 && end <= *size && end < INT64_MAX)
+        bounds.push_back(Range::FromMinExtent(
+            IntImm(DataType::Int(64), static_cast<int64_t>(start.range.lo)),
+            IntImm(DataType::Int(64),
+                   static_cast<int64_t>(end - start.range.lo))));
+      else
+        bounds.push_back(Range::FromMinExtent(0, shape[i]));
+      if (current && r->region.size() == 1 && start.valid &&
+          start.range.lo > INT64_MIN / 4 && end < INT64_MAX / 4 &&
+          extent.valid && extent.range.lo > 0 &&
+          extent.range.lo == extent.range.hi)
+        current->push_back(Range::FromMinExtent(
+            cast(DataType::Int(64), start.expr),
+            IntImm(DataType::Int(64), static_cast<int64_t>(extent.range.lo))));
+    }
+    return BufferRegion(r->buffer, bounds);
   }
-
-  BufferRegions writes_;
+  void VisitStmt_(const EvaluateNode *op) final {
+    if (const auto *call = op->value.as<CallNode>()) {
+      if (call->op.same_as(dist_put_())) {
+        Region exact;
+        reads_.emplace(
+            call, Envelope(NormalizeToBufferRegion(call->args[0]), &exact));
+        if (!exact.empty())
+          exact_reads_.emplace(call, exact);
+      }
+      for (const auto &region : CallWriteRegions(call))
+        if (payload_.count(region->buffer->data.get()))
+          leaves_[op].push_back(Envelope(region));
+    }
+  }
+  void VisitStmt_(const LetStmtNode *op) final {
+    if (SideEffect(op->value) <= CallEffectKind::kPure)
+      defs_[op->var.get()] = op->value;
+    VisitStmt(op->body);
+    defs_.erase(op->var.get());
+  }
+  void VisitStmt_(const ForNode *op) final {
+    FiniteWidthInteger facts(&analyzer_, 1, &defs_);
+    auto lo = facts.Analyze(op->min), count = facts.Analyze(op->extent),
+         type = facts.Analyze(op->loop_var);
+    auto hi = lo.range.hi + count.range.hi - 1;
+    if (lo.valid && count.valid && count.range.hi > 0 &&
+        lo.range.lo >= type.range.lo && hi <= type.range.hi &&
+        lo.range.lo > INT64_MIN && hi < INT64_MAX)
+      analyzer_.const_int_bound.Update(
+          op->loop_var, arith::ConstIntBound(static_cast<int64_t>(lo.range.lo),
+                                             static_cast<int64_t>(hi)));
+    bool scope = op->annotations.count(attr::kTileDomain);
+    tile_depth_ += scope;
+    bool interior =
+        tile_depth_ && op->annotations.count(attr::tile_interior_axis);
+    if (interior)
+      interiors_[op->loop_var.get()] = GetStaticIntValue(op->extent);
+    VisitNested(op->body);
+    interiors_.erase(op->loop_var.get());
+    tile_depth_ -= scope;
+  }
+  void VisitNested(const Stmt &body) {
+    ++depth_;
+    VisitStmt(body);
+    --depth_;
+  }
+  void VisitStmt_(const IfThenElseNode *op) final {
+    VisitNested(op->then_case);
+    if (op->else_case)
+      VisitNested(op->else_case.value());
+  }
+  void VisitStmt_(const WhileNode *op) final { VisitNested(op->body); }
+  void VisitStmt_(const BufferStoreNode *op) final {
+    auto data = op->buffer->data.get();
+    if (!depth_ && op->buffer.scope() == "local.var" &&
+        store_count_[data] == 1 && !escaped_.count(data) &&
+        op->indices.size() == 1 && is_zero(op->indices[0]))
+      snapshots_.values.emplace(data, Var("local_snapshot", op->buffer->dtype));
+    if (!payload_.count(data))
+      return;
+    std::vector<int64_t> logical;
+    if (tile_depth_) {
+      for (const auto &index : op->indices) {
+        // Only narrow a store whose interior coordinate is a unit-stride
+        // term. Ambiguous expressions conservatively cover the whole buffer.
+        const VarNode *axis = nullptr;
+        bool ambiguous = false;
+        PostOrderVisit(index, [&](const ObjectRef &n) {
+          if (auto *v = n.as<VarNode>(); v && interiors_.count(v)) {
+            ambiguous |= axis != nullptr;
+            axis = v;
+          }
+        });
+        int64_t extent = 0;
+        if (axis) {
+          const auto *add = index.as<AddNode>();
+          bool direct = index.get() == axis ||
+                        (add && (add->a.get() == axis || add->b.get() == axis));
+          if (add && direct) {
+            const PrimExpr &offset = add->a.get() == axis ? add->b : add->a;
+            PostOrderVisit(offset, [&](const ObjectRef &n) {
+              ambiguous |= n.get() == axis;
+            });
+          }
+          extent = (direct && !ambiguous) ? interiors_.at(axis) : -1;
+        }
+        logical.push_back(extent);
+      }
+      if (std::none_of(logical.begin(), logical.end(),
+                       [](int64_t n) { return n != 0; }))
+        logical.assign(op->indices.size(),
+                       -1); // Unknown tile-to-buffer mapping.
+    }
+    Region exact;
+    Array<PrimExpr> indices;
+    for (const auto &index : op->indices)
+      indices.push_back(snapshots_(index));
+    auto region =
+        GetSunmmioScalarTileAccessRegion(op->buffer, indices, layouts_, config_,
+                                         &analyzer_, &defs_, logical, &exact);
+    leaves_[op].push_back(BufferRegion(op->buffer, region));
+    if (!exact.empty())
+      exact_stores_.emplace(op, exact);
+  }
   const Map<Buffer, Layout> &layouts_;
   const SunmmioTileProcessorConfig &config_;
+  int depth_{0}, tile_depth_{0};
+  arith::Analyzer analyzer_;
+  FiniteWidthInteger::Definitions defs_;
+  std::unordered_set<const VarNode *> payload_, escaped_;
+  std::unordered_map<const VarNode *, int> store_count_;
+  std::unordered_map<const VarNode *, int64_t> interiors_;
+  std::unordered_map<const StmtNode *, BufferRegions> leaves_, loops_;
+  std::unordered_map<const CallNode *, BufferRegion> reads_;
+  std::unordered_map<const CallNode *, Region> exact_reads_;
+  std::unordered_map<const BufferStoreNode *, Region> exact_stores_;
 };
 
 // Track the implicit per-core send queue across structured control flow.
@@ -210,17 +365,19 @@ private:
       : layouts_(func->GetAttr<Map<Buffer, Layout>>(attr::kLayoutMap)
                      .value_or(Map<Buffer, Layout>())),
         config_(GetSunmmioTileProcessorConfig(
-            func->GetAttr<Target>(tvm::attr::kTarget))) {}
+            func->GetAttr<Target>(tvm::attr::kTarget))),
+        writes_(func, layouts_, config_) {}
 
   Map<Buffer, Layout> layouts_;
   SunmmioTileProcessorConfig config_;
+  PhysicalWrites writes_;
   struct State {
     bool queue_pending;
     bool strict_batch_open;
     bool channel_in_flight;
     bool falls_through;
-    BufferRegions queued_sources;
-    BufferRegions inflight_sources;
+    Sources queued_sources;
+    Sources inflight_sources;
   };
 
   struct LoopExits {
@@ -254,15 +411,15 @@ private:
                  lhs.strict_batch_open,
                  lhs.channel_in_flight || rhs.channel_in_flight,
                  true,
-                 MergeRegions(lhs.queued_sources, rhs.queued_sources),
-                 MergeRegions(lhs.inflight_sources, rhs.inflight_sources)};
+                 JoinSources(lhs.queued_sources, rhs.queued_sources),
+                 JoinSources(lhs.inflight_sources, rhs.inflight_sources)};
   }
 
   static bool SameLoopState(const State &lhs, const State &rhs) {
     return lhs.queue_pending == rhs.queue_pending &&
            lhs.channel_in_flight == rhs.channel_in_flight &&
-           SameRegionSet(lhs.queued_sources, rhs.queued_sources) &&
-           SameRegionSet(lhs.inflight_sources, rhs.inflight_sources);
+           lhs.queued_sources == rhs.queued_sources &&
+           lhs.inflight_sources == rhs.inflight_sources;
   }
 
   void CheckSubmitted(bool before_return) const {
@@ -274,36 +431,30 @@ private:
                             << "; call T.dist.submit() or use submit=True";
   }
 
-  bool HandleWrites(const BufferRegions &writes, const char *description) {
+  bool HandleWrites(const BufferRegions &writes, const char *description,
+                    const BufferStoreNode *store = nullptr) {
     if (writes.empty()) {
       return false;
     }
-    ICHECK(!AnyRegionOverlaps(queued_sources_, writes))
+    ICHECK(!writes_.Overlaps(queued_sources_, writes, store))
         << "T.dist source is modified before its queued batch is submitted ("
         << description << ")";
-    bool needs_wait = AnyRegionOverlaps(inflight_sources_, writes);
+    bool needs_wait = writes_.Overlaps(inflight_sources_, writes, store);
     if (needs_wait) {
       // dist_wait_send completes the whole local send channel, not just the
       // conflicting region.
       inflight_sources_.clear();
       channel_in_flight_ = false;
     }
-    for (BufferRegions *sources : {&queued_sources_, &inflight_sources_}) {
-      for (BufferRegion &source : *sources) {
-        source = BufferRegion(
-            source->buffer,
-            WidenRegionForIndexWrites(source->buffer, source->region, writes));
-      }
-    }
     return needs_wait;
   }
 
-  bool UsesAllocationLeavingCurrentLoop(const BufferRegions &regions) const {
+  bool UsesAllocationLeavingCurrentLoop(const Sources &regions) const {
     ICHECK(!loop_allocation_depths_.empty());
     size_t first_exiting_allocation = loop_allocation_depths_.back();
     for (size_t i = first_exiting_allocation; i < active_allocations_.size();
          ++i) {
-      if (AnyRegionUsesBuffer(regions, active_allocations_[i])) {
+      if (writes_.Uses(regions, active_allocations_[i])) {
         return true;
       }
     }
@@ -362,25 +513,12 @@ private:
     SetState(Join(then_state, else_state));
   }
 
-  void VisitLoop(const Stmt &body, const Var &loop_var = Var()) {
-    std::unordered_set<const VarNode *> loop_local_vars;
-    if (loop_var.defined()) {
-      loop_local_vars.insert(loop_var.get());
-    }
-    PostOrderVisit(body, [&](const ObjectRef &node) {
-      if (const auto *loop = node.as<ForNode>()) {
-        loop_local_vars.insert(loop->loop_var.get());
-      } else if (const auto *let = node.as<LetStmtNode>()) {
-        loop_local_vars.insert(let->var.get());
-      } else if (const auto *let = node.as<LetNode>()) {
-        loop_local_vars.insert(let->var.get());
-      }
-    });
-    auto widen = [&](State state) {
-      state.queued_sources =
-          WidenLoopSourceRegions(state.queued_sources, loop_local_vars);
-      state.inflight_sources =
-          WidenLoopSourceRegions(state.inflight_sources, loop_local_vars);
+  void VisitLoop(const Stmt &body) {
+    auto widen = [](State state) {
+      for (auto &[call, current] : state.queued_sources)
+        current = false;
+      for (auto &[call, current] : state.inflight_sources)
+        current = false;
       return state;
     };
     State incoming = GetState();
@@ -405,22 +543,20 @@ private:
   }
 
   void VisitStmt_(const ForNode *op) final {
-    BufferRegions writes =
-        WriteRegionCollector(layouts_, config_).Collect(op->body);
-    if (AnyRegionOverlaps(inflight_sources_, writes)) {
+    if (!inflight_sources_.empty() &&
+        writes_.Overlaps(inflight_sources_, writes_.Loop(op->body))) {
       for_loops_needing_wait_.insert(op);
       inflight_sources_.clear();
       channel_in_flight_ = false;
     }
     VisitExpr(op->min);
     VisitExpr(op->extent);
-    VisitLoop(op->body, op->loop_var);
+    VisitLoop(op->body);
   }
 
   void VisitStmt_(const WhileNode *op) final {
-    BufferRegions writes =
-        WriteRegionCollector(layouts_, config_).Collect(op->body);
-    if (AnyRegionOverlaps(inflight_sources_, writes)) {
+    if (!inflight_sources_.empty() &&
+        writes_.Overlaps(inflight_sources_, writes_.Loop(op->body))) {
       while_loops_needing_wait_.insert(op);
       inflight_sources_.clear();
       channel_in_flight_ = false;
@@ -440,10 +576,10 @@ private:
     if (!falls_through_) {
       return;
     }
-    if (AnyRegionUsesBuffer(queued_sources_, op->buffer_var)) {
+    if (writes_.Uses(queued_sources_, op->buffer_var)) {
       CheckSubmitted(/*before_return=*/false);
     }
-    if (AnyRegionUsesBuffer(inflight_sources_, op->buffer_var)) {
+    if (writes_.Uses(inflight_sources_, op->buffer_var)) {
       allocations_needing_wait_.insert(op);
       inflight_sources_.clear();
       channel_in_flight_ = false;
@@ -451,10 +587,7 @@ private:
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    Region region = GetSunmmioScalarTileAccessRegion(op->buffer, op->indices,
-                                                     layouts_, config_);
-    BufferRegions writes{BufferRegion(op->buffer, std::move(region))};
-    if (HandleWrites(writes, "buffer store")) {
+    if (HandleWrites(writes_.Leaf(op), "buffer store", op)) {
       stores_needing_wait_.insert(op);
     }
     StmtVisitor::VisitStmt_(op);
@@ -511,7 +644,7 @@ private:
     }
     if (call->op.same_as(dist_put_())) {
       ICHECK_EQ(call->args.size(), 6U);
-      AddUniqueRegion(&queued_sources_, NormalizeToBufferRegion(call->args[0]));
+      queued_sources_.emplace(call, true);
       queue_pending_ = true;
       return;
     }
@@ -545,7 +678,7 @@ private:
       channel_in_flight_ = false;
       return;
     }
-    if (HandleWrites(CallWriteRegions(call), "asynchronous destination")) {
+    if (HandleWrites(writes_.Leaf(op), "asynchronous destination")) {
       evaluates_needing_wait_.insert(op);
     }
     StmtVisitor::VisitStmt_(op);
@@ -555,8 +688,8 @@ private:
   bool strict_batch_open_{false};
   bool channel_in_flight_{false};
   bool falls_through_{true};
-  BufferRegions queued_sources_;
-  BufferRegions inflight_sources_;
+  Sources queued_sources_;
+  Sources inflight_sources_;
   std::vector<LoopExits> loop_exits_;
   std::vector<size_t> loop_allocation_depths_;
   std::vector<Var> active_allocations_;

@@ -7,7 +7,7 @@ completion, DMA execution, and device timing are outside this test helper.
 import re
 
 
-def trace_suvm_control_flow(result, source, *, signal_values=None, max_loop_iterations=100, **arguments):
+def trace_suvm_control_flow(result, source, *, signal_values=None, max_loop_iterations=100, trace_memory=False, **arguments):
     """Trace SSA/control flow and descriptor values, without simulating completion.
 
     Memory views in these fixtures are one-dimensional row-major. Unknown ops
@@ -153,13 +153,14 @@ def trace_suvm_control_flow(result, source, *, signal_values=None, max_loop_iter
                 elif operator in ("divui", "remui"):
                     args = [value & ((1 << width) - 1) for value in args]
                     assert args[1] != 0, "trace division by zero"
-                elif operator == "maxsi":
+                elif operator in ("maxsi", "minsi"):
                     args = [signed(value, width) for value in args]
                 output = {
                     "addi": lambda a, b: a + b,
                     "subi": lambda a, b: a - b,
                     "muli": lambda a, b: a * b,
                     "maxsi": max,
+                    "minsi": min,
                     "remsi": lambda a, b: a - quotient(a, b) * b,
                     "remui": lambda a, b: a % b,
                     "divsi": quotient,
@@ -206,14 +207,22 @@ def trace_suvm_control_flow(result, source, *, signal_values=None, max_loop_iter
                 width = int(re.search(r"-> !suvm.tile<(\d+)x", op)[1])
                 output = [args[0]] * width
             elif op.startswith("suvm.tile.pick"):
-                output = args[0][args[1]]
+                lane = args[1] if len(args) == 2 else int(re.search(r"\[(-?\d+)\]", op)[1])
+                assert 0 <= lane < len(args[0]), "unexpected tile lane"
+                output = args[0][lane]
                 events.append(("pick", output))
             elif op.startswith("suvm.tile.set"):
                 output = args[1].copy()
-                output[args[2]] = args[0]
+                lane = args[2] if len(args) == 3 else int(re.search(r"\[(-?\d+)\]", op)[1])
+                assert 0 <= lane < len(output), "unexpected tile lane"
+                output[lane] = args[0]
+                if trace_memory:
+                    events.append(("set", lane, args[0]))
             elif op.startswith("suvm.tile.store"):
                 memory, begin, width = args[1]
                 memory["data"][begin : begin + width] = args[0]
+                if trace_memory:
+                    events.append(("store", memory["name"], begin, width))
                 continue
             elif op.startswith("suvm.dist.batch_put"):
                 batch, peer, src, dst = args

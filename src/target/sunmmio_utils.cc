@@ -18,6 +18,7 @@
 #include "../layout/cute_layout.h"
 #include "../op/builtin.h"
 #include "../op/comm.h"
+#include "../support/finite_width_integer.h"
 #include "../tileview/tileview_planner_common.h"
 #include "utils.h"
 
@@ -303,75 +304,184 @@ std::optional<SunmmioScalarTileAccessPlan> PlanSunmmioScalarTileAccess(
                          selected->tile_shape.end());
   plan.tiled_dims.assign(selected->mapped_dims.begin(),
                          selected->mapped_dims.end());
-  plan.partition_indices.reserve(buffer_rank);
-  std::unordered_map<int, int64_t> tiled_dim_to_extent;
-  for (size_t i = 0; i < selected->mapped_dims.size(); ++i) {
-    tiled_dim_to_extent[selected->mapped_dims[i]] = selected->tile_shape[i];
-  }
-
-  for (int dim = 0; dim < buffer_rank; ++dim) {
-    auto it = tiled_dim_to_extent.find(dim);
-    if (it == tiled_dim_to_extent.end()) {
-      plan.partition_indices.push_back(indices[dim]);
-      continue;
-    }
-    PrimExpr tile_extent = IntImm(indices[dim].dtype(), it->second);
-    plan.partition_indices.push_back(
-        analyzer.Simplify(floordiv(indices[dim], tile_extent)));
-    plan.local_indices.push_back(
-        analyzer.Simplify(floormod(indices[dim], tile_extent)));
-  }
-
   return plan;
 }
 
-tir::Region
-GetSunmmioScalarTileAccessRegion(const tir::Buffer &buffer,
-                                 const ffi::Array<PrimExpr> &indices,
-                                 const ffi::Map<tir::Buffer, Layout> &layouts,
-                                 const SunmmioTileProcessorConfig &config) {
-  tir::Region region;
-  for (const PrimExpr &index : indices) {
-    region.push_back(Range::FromMinExtent(index, 1));
+std::optional<std::vector<int64_t>>
+FitSunmmio2DCarrier(int64_t height, int64_t width,
+                    const std::vector<int64_t> &logical) {
+  if (height < logical[0] || width < logical[1] || height % logical[0] ||
+      width % logical[1])
+    return std::nullopt;
+  return std::vector<int64_t>{height, width};
+}
+
+std::optional<std::vector<int64_t>>
+GetSunmmioStoreCarrier(const std::vector<int64_t> &logical, DataType dtype,
+                       const SunmmioTileProcessorConfig &config,
+                       const std::vector<uint8_t> &levels,
+                       const std::vector<int64_t> &shape,
+                       const std::vector<int64_t> &strides) {
+  if (logical.size() == 1) {
+    return std::vector<int64_t>{std::max<int64_t>(
+        logical[0],
+        GetSunmmioRsramAlignmentElems(config.rsram_align_bytes, dtype))};
   }
-  if (buffer.scope() != kSunmmioScopeRSRAM ||
+  if (logical.size() != 2 || logical[0] <= 1 || logical[1] <= 1 ||
+      levels.size() != 2 ||
+      (!dtype.is_bfloat16() && !(dtype.is_float() && dtype.bits() == 32)))
+    return logical;
+  int64_t capacity = config.register_bits / dtype.bits();
+  if (shape.size() != strides.size() || shape.size() < 2)
+    return logical;
+  bool flat = levels[0] == 1 && levels[1] == 1 && shape.size() == 2 &&
+              strides[1] == 1 && strides[0] == shape[1];
+  int64_t height, width;
+  if (flat && logical[0] * logical[1] < capacity) {
+    width = shape[1];
+    if (width <= 0 || capacity % width)
+      return std::nullopt;
+    height = capacity / width;
+    if (height > shape[0])
+      return std::nullopt;
+    return FitSunmmio2DCarrier(height, width, logical);
+  }
+  if (levels[0] >= 2 && levels[1] >= 2 && levels[0] < shape.size() &&
+      strides[levels[0]] == 1 && strides[0] == shape[levels[0]]) {
+    width = shape[levels[0]];
+    if (width > 0) {
+      height = std::min(shape[0], capacity / width);
+      return FitSunmmio2DCarrier(height, width, logical).value_or(logical);
+    }
+  }
+  return logical;
+}
+
+tir::Region GetSunmmioScalarTileAccessRegion(
+    const tir::Buffer &buffer, const ffi::Array<PrimExpr> &indices,
+    const ffi::Map<tir::Buffer, Layout> &layouts,
+    const SunmmioTileProcessorConfig &config, arith::Analyzer *context,
+    const FiniteWidthInteger::Definitions *definitions,
+    const std::vector<int64_t> &interior_shape, tir::Region *same_iteration) {
+  if (same_iteration)
+    *same_iteration = {};
+  tir::Region region;
+  ffi::Optional<Layout> layout;
+  if (layouts.count(buffer))
+    layout = layouts[buffer];
+  else
+    for (const auto &entry : layouts)
+      if (entry.first->data.same_as(buffer->data)) {
+        layout = entry.second;
+        break;
+      }
+  auto shape = buffer->shape;
+  if (layout.defined())
+    if (const auto *cute = layout.value().as<CuteLayoutNode>())
+      shape = cute->GetCoveredShape();
+  for (const auto &extent : shape)
+    region.push_back(Range::FromMinExtent(0, extent));
+  if (indices.size() != shape.size() ||
       std::any_of(indices.begin(), indices.end(), [](const PrimExpr &index) {
         return index.dtype().lanes() != 1;
-      })) {
+      }))
     return region;
+  std::optional<SunmmioScalarTileAccessPlan> plan;
+  if (interior_shape.empty() && buffer.scope() == kSunmmioScopeRSRAM) {
+    std::string reason;
+    plan = PlanSunmmioScalarTileAccess(buffer, indices, buffer->dtype, layout,
+                                       config, &reason);
+    if (!plan)
+      return region;
   }
-  ffi::Optional<Layout> layout;
-  for (const auto &entry : layouts) {
-    if (entry.first->data.same_as(buffer->data)) {
-      layout = entry.second;
-      break;
+  arith::Analyzer local;
+  std::vector<int64_t> widths(indices.size(), 1);
+  if (plan) {
+    for (size_t i = 0; i < plan->tiled_dims.size(); ++i)
+      widths[plan->tiled_dims[i]] = plan->tile_shape[i];
+  } else if (!interior_shape.empty() && buffer.scope() == kSunmmioScopeRSRAM) {
+    if (interior_shape.size() != indices.size() || !layout.defined())
+      return region;
+    const auto *cute = layout.value().as<CuteLayoutNode>();
+    if (!cute)
+      return region;
+    std::vector<int64_t> logical, modes, strides;
+    std::vector<uint8_t> levels;
+    for (auto n : interior_shape) {
+      if (n < 0)
+        return region;
+      if (n)
+        logical.push_back(n);
     }
-  }
-  std::string reason;
-  auto plan = PlanSunmmioScalarTileAccess(buffer, indices, buffer->dtype,
-                                          layout, config, &reason);
-  if (!plan) {
-    // Without a legal scalar access plan, retain a conservative storage bound.
-    auto shape = buffer->shape;
-    if (layout.defined()) {
-      if (const auto *cute = layout.value().as<CuteLayoutNode>()) {
-        shape = cute->GetCoveredShape();
+    for (auto n : cute->GetDimLevels())
+      levels.push_back(n.IntValue());
+    for (auto n : cute->GetModeShape())
+      modes.push_back(GetStaticIntValue(n));
+    for (auto n : cute->GetModeStride())
+      strides.push_back(GetStaticIntValue(n));
+    if (std::find(modes.begin(), modes.end(), -1) != modes.end() ||
+        std::find(strides.begin(), strides.end(), -1) != strides.end())
+      return region;
+    auto carrier = GetSunmmioStoreCarrier(logical, buffer->dtype, config,
+                                          levels, modes, strides);
+    if (!carrier || carrier->empty() || carrier->size() > 2)
+      return region;
+    size_t axis = 0;
+    for (size_t d = 0; d < widths.size(); ++d)
+      if (interior_shape[d])
+        widths[d] = (*carrier)[axis++];
+    // Non-flat and padded layouts may place adjacent physical lanes in
+    // different logical dimensions. Only round coordinates when the layout
+    // preserves those boundaries.
+    if (*carrier != logical) {
+      if (std::any_of(levels.begin(), levels.end(),
+                      [](uint8_t n) { return n != 1; }))
+        return region;
+      if (logical.size() == 1) {
+        auto tiled = std::find_if(interior_shape.begin(), interior_shape.end(),
+                                  [](int64_t n) { return n > 0; }) -
+                     interior_shape.begin();
+        if (strides[tiled] != 1 || modes[tiled] % widths[tiled])
+          return region;
+        for (size_t d = 0; d < widths.size(); ++d)
+          if (d != size_t(tiled) && strides[d] % widths[tiled])
+            return region;
       }
     }
-    for (size_t dim = 0; dim < region.size(); ++dim) {
-      region.Set(dim, Range::FromMinExtent(0, shape[dim]));
-    }
-    return region;
   }
-  arith::Analyzer analyzer;
-  for (size_t i = 0; i < plan->tiled_dims.size(); ++i) {
-    int dim = plan->tiled_dims[i];
-    int64_t extent = plan->tile_shape[i];
-    region.Set(dim,
-               Range::FromMinExtent(
-                   analyzer.Simplify(floordiv(indices[dim], Integer(extent)) *
-                                     Integer(extent)),
-                   Integer(extent)));
+  FiniteWidthInteger facts(context ? context : &local, 1, definitions);
+  for (size_t dim = 0; dim < indices.size(); ++dim) {
+    auto value = facts.Analyze(indices[dim]);
+    auto size = FiniteWidthInteger::Literal(shape[dim]);
+    int64_t tile = widths[dim];
+    // Keep the expression only after its finite-width operations have been
+    // modeled, with room for the range endpoints and their difference.
+    if (same_iteration && interior_shape.empty() && value.valid &&
+        value.range.lo > INT64_MIN / 4 && value.range.hi < INT64_MAX / 4 &&
+        indices.size() == 1) {
+      PrimExpr start = cast(DataType::Int(64), value.expr);
+      same_iteration->push_back(Range::FromMinExtent(
+          floordiv(start, IntImm(DataType::Int(64), tile)) *
+              IntImm(DataType::Int(64), tile),
+          IntImm(DataType::Int(64), tile)));
+    }
+    // Return only safe numeric envelopes. Passing the original cast expression
+    // to IntSet would reintroduce the mathematical-integer simplification bug.
+    if (!value.valid || !size || value.range.lo < 0 ||
+        value.range.hi >= *size) {
+      region.Set(dim, Range::FromMinExtent(0, shape[dim]));
+      continue;
+    }
+    auto begin = value.range.lo / tile * tile;
+    auto end = (value.range.hi / tile + 1) * tile;
+    if (end > INT64_MAX) {
+      region.Set(dim, Range::FromMinExtent(0, shape[dim]));
+      continue;
+    }
+    region.Set(
+        dim, Range::FromMinExtent(
+                 IntImm(DataType::Int(64), static_cast<int64_t>(begin)),
+                 IntImm(DataType::Int(64), static_cast<int64_t>(end - begin))));
   }
   return region;
 }
