@@ -97,6 +97,9 @@ class ExitedMacroFrame(Frame): ...
 class BoolOpFrame(Frame): ...
 
 
+class LazyOperandFrame(Frame): ...
+
+
 class ContinueFrame(Frame): ...
 
 
@@ -685,6 +688,15 @@ class Builder(BaseBuilder):
             raise RuntimeError(f"Unsupported boolean operator: {op}")
         else:
             return super().boolop(op, left, right)
+
+    def lazy_operand(self, operand, callee=None):
+        if callee is not None:
+            from tilelang.language.tir.ir import if_then_else
+
+            if callee is not if_then_else:
+                return operand()
+        with self.with_frame(LazyOperandFrame()):
+            return operand()
 
     def ifexp(self, cond, then, otherwise):
         cond = unwrap_cond(cond)

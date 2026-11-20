@@ -71,8 +71,81 @@ private:
   bool in_kernel_{false};
 };
 
+// Keep the consuming call at its statement. LowerDistSync consumes pending
+// state for a Let/Evaluate root, never for a speculative subexpression.
+class NormalizeWaitAny : public StmtExprMutator {
+  using Bindings = std::vector<std::pair<Var, PrimExpr>>;
+  Bindings pending_;
+  bool lazy_{false};
+  bool preceding_read_{false};
+
+  Stmt VisitStmt(const Stmt &stmt) final {
+    bool saved_read = preceding_read_;
+    preceding_read_ = false;
+    Bindings parent;
+    parent.swap(pending_);
+    Stmt result = StmtExprMutator::VisitStmt(stmt);
+    for (auto it = pending_.rbegin(); it != pending_.rend(); ++it)
+      result = LetStmt(it->first, it->second, result);
+    pending_ = std::move(parent);
+    preceding_read_ = saved_read;
+    return result;
+  }
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(dist_wait_any())) {
+      ICHECK(!lazy_ && !preceding_read_)
+          << "T.dist.wait_any must be consumed in a statement "
+             "branch; use if/else";
+      Var member("dist_member", op->dtype);
+      pending_.emplace_back(member, ffi::GetRef<PrimExpr>(op));
+      return member;
+    }
+    if (op->op.same_as(builtin::if_then_else())) {
+      bool saved = lazy_;
+      lazy_ = true;
+      auto result = StmtExprMutator::VisitExpr_(op);
+      lazy_ = saved;
+      return result;
+    }
+    auto result = StmtExprMutator::VisitExpr_(op);
+    preceding_read_ |= SideEffect(result) > CallEffectKind::kPure;
+    return result;
+  }
+  PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+    auto value = StmtExprMutator::VisitExpr_(op);
+    preceding_read_ = true;
+    return value;
+  }
+  PrimExpr VisitExpr_(const LetNode *op) final {
+    // Moving a wait outside an expression Let would escape its binding.
+    bool saved = lazy_;
+    lazy_ = true;
+    auto value = StmtExprMutator::VisitExpr_(op);
+    lazy_ = saved;
+    return value;
+  }
+  Stmt VisitStmt_(const WhileNode *op) final {
+    bool saved = lazy_;
+    lazy_ = true;
+    auto cond = VisitExpr(op->condition);
+    lazy_ = saved;
+    return While(cond, VisitStmt(op->body), op->span);
+  }
+  Stmt VisitStmt_(const LetStmtNode *op) final {
+    if (auto *c = op->value.as<CallNode>(); c && c->op.same_as(dist_wait_any()))
+      return LetStmt(op->var, op->value, VisitStmt(op->body), op->span);
+    return StmtExprMutator::VisitStmt_(op);
+  }
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    if (auto *c = op->value.as<CallNode>(); c && c->op.same_as(dist_wait_any()))
+      return ffi::GetRef<Stmt>(op);
+    return StmtExprMutator::VisitStmt_(op);
+  }
+};
+
 class DistCollectiveDetector : public StmtExprVisitor {
 public:
+  bool has_wait_any = false;
   bool Detect(const Stmt &stmt) {
     VisitStmt(stmt);
     return found_;
@@ -80,6 +153,7 @@ public:
 
 private:
   void VisitExpr_(const CallNode *call) final {
+    has_wait_any |= call->op.same_as(dist_wait_any());
     if (call->op.same_as(DistAllgatherOp::Get()) ||
         call->op.same_as(DistAlltoallOp::Get()) ||
         call->op.same_as(DistAllreduceOp::Get()) ||
@@ -1373,7 +1447,11 @@ private:
 
 PrimFunc Run(PrimFunc func) {
   SunmmioExplicitJumpValidator::Check(func);
-  if (!DistCollectiveDetector().Detect(func->body)) {
+  DistCollectiveDetector detector;
+  bool collectives = detector.Detect(func->body);
+  if (detector.has_wait_any)
+    func.CopyOnWrite()->body = NormalizeWaitAny()(func->body);
+  if (!collectives) {
     return func;
   }
 

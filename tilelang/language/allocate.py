@@ -26,7 +26,8 @@ from tvm.tir.expr import FloatImm, IntImm
 
 from . import dtypes as _dtypes
 from .dtypes import dtype as tl_dtype
-from .eager.builder import OutTensor
+from .eager.builder import Builder, OutTensor
+from tvm.script.ir_builder.tir import frame as tir_frame
 from .frame import find_let_bound_vars, resolve_let_bound_expr
 from .proxy import Tensor
 
@@ -154,7 +155,18 @@ def alloc_var(dtype: DType, *args, scope: str = "local.var", init: PrimExpr | in
 
     buffer = T.alloc_buffer([1], dtype, scope=parsed_scope)
     if parsed_init is not None:
-        if isinstance(parsed_init, (int, float, IntImm, FloatImm)):
+        # The init attribute executes when the owning block allocates storage.
+        # A declaration in a nested loop/branch must reset on each entry.
+        builder = Builder.current()
+        nested = False
+        if builder is not None:
+            for frame in reversed(builder.frames):
+                if isinstance(frame, (tir_frame.ForFrame, tir_frame.IfFrame, tir_frame.WhileFrame)):
+                    nested = True
+                    break
+                if isinstance(frame, (tir_frame.BlockFrame, tir_frame.PrimFuncFrame)):
+                    break
+        if not nested and isinstance(parsed_init, (int, float, IntImm, FloatImm)):
             block_attr({"tl.local_var_init": {buffer.data: tl_dtype(dtype)(parsed_init)}})
         else:
             T.buffer_store(buffer, parsed_init, 0)

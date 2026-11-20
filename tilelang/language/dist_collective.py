@@ -469,15 +469,12 @@ def wait_any(completion: DistCompletion):
     """Wait for and consume one pending source, returning its logical index."""
 
     _check_completion(completion)
+    from tilelang.language.eager.builder import BoolOpFrame, LazyOperandFrame
+
     builder = _current_dist_builder()
-    wait_call = tir.call_intrin(
-        "int32",
-        tir.op.Op.get("tl.dist_wait_any"),
-        completion.handle,
-    )
-    wait_frame = tir_builder.LetStmt(wait_call)
-    builder.enter_frame(wait_frame)
-    return wait_frame.var
+    if builder.find_frame_idx((BoolOpFrame, LazyOperandFrame)) is not None:
+        raise ValueError("T.dist.wait_any must be consumed in a statement branch; use if/else")
+    return tir.call_intrin("int32", tir.op.Op.get("tl.dist_wait_any"), completion.handle)
 
 
 def _wait_completion_all(completion: DistCompletion):

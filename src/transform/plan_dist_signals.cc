@@ -1877,8 +1877,12 @@ private:
 
     void VisitStmt_(const EvaluateNode *op) final {
       if (const auto *call = op->value.as<CallNode>()) {
-        has_control_flow_ |= call->op.same_as(dist_wait_any()) ||
-                             call->op.same_as(dist_wait_completion_all()) ||
+        if (call->op.same_as(dist_wait_any())) {
+          ++wait_count_;
+          has_control_flow_ |= call->args.size() != 1 ||
+                               call->args[0].as<VarNode>() != completion_;
+        }
+        has_control_flow_ |= call->op.same_as(dist_wait_completion_all()) ||
                              call->op.same_as(tir::builtin::break_loop()) ||
                              call->op.same_as(tir::builtin::continue_loop()) ||
                              call->op.same_as(tir::builtin::ret());

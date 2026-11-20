@@ -219,6 +219,9 @@ class BaseBuilder:
     def aug_assign_slice(self, op: Operator, target: Any, sl: slice, aug_value: Any):
         eval_aug_assign(op, target, sl, aug_value)
 
+    def lazy_operand(self, operand, callee=None):
+        return operand()
+
     def boolop(self, op: BoolOp, left: Any, right: Callable[[], Any] | None = None) -> Any:
         if op == "And":
             return left and right()
@@ -541,6 +544,42 @@ class DSLMutator(ast.NodeTransformer):
             if isinstance(eval_res, (TensorProxy, StridedTensorProxy)) or eval_res is ptr:
                 self.extra_type_hints[name] = ptr
                 return
+
+    def visit_Call(self, node: ast.Call):
+        # A macro can emit statements while its Python arguments are being
+        # built. Mark lazy operands before evaluating calls inside them.
+        from types import ModuleType
+
+        from tilelang.language.tir.ir import if_then_else
+
+        attrs = []
+        root = node.func
+        while isinstance(root, ast.Attribute):
+            attrs.append(root.attr)
+            root = root.value
+        callee = self.nonlocals.get(root.id, self.globals.get(root.id)) if isinstance(root, ast.Name) else None
+        for attr in reversed(attrs):
+            if not isinstance(callee, ModuleType):
+                break
+            callee = vars(callee).get(attr)
+        # Simple names may be function arguments or locally bound aliases.
+        dynamic_alias = (
+            isinstance(node.func, ast.Name) and callee is None and (len(node.args) >= 3 or any(k.arg in ("t", "f") for k in node.keywords))
+        )
+        lazy = callee is if_then_else
+        node = self.generic_visit(node)
+        if lazy or dynamic_alias:
+
+            def wrap(arg):
+                if dynamic_alias:
+                    return quote_expr("__tb.lazy_operand(lambda: operand, callee)", operand=arg, callee=node.func, span=node)
+                return quote_expr("__tb.lazy_operand(lambda: operand)", operand=arg, span=node)
+
+            node.args[1:3] = [wrap(arg) for arg in node.args[1:3]]
+            for kw in node.keywords:
+                if kw.arg in ("t", "f", "true_value", "false_value"):
+                    kw.value = wrap(kw.value)
+        return node
 
     def visit_BoolOp(self, node: ast.BoolOp):
         node = self.generic_visit(node)
