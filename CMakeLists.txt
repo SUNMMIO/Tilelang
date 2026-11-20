@@ -292,7 +292,7 @@ endforeach()
 list(INSERT TILE_LANG_INCLUDES 0 ${TVM_INCLUDES})
 
 # Collect source files
-file(GLOB TILE_LANG_SRCS
+file(GLOB TILE_LANG_SRCS CONFIGURE_DEPENDS
   src/*.cc
   src/analysis/*.cc
   src/layout/*.cc

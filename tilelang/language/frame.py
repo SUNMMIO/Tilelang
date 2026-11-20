@@ -239,7 +239,7 @@ def find_let_bound_vars(expr: PrimExpr | int) -> set[Var]:
     return let_vars
 
 
-def resolve_let_bound_expr(expr: PrimExpr | int) -> PrimExpr | int:
+def resolve_let_bound_expr(expr: PrimExpr | int, *, allocation_shape: bool = False) -> PrimExpr | int:
     """Recursively expand active let bindings whose values are invariant."""
     if not isinstance(expr, PrimExpr):
         return expr
@@ -282,4 +282,15 @@ def resolve_let_bound_expr(expr: PrimExpr | int) -> PrimExpr | int:
             return value
         return substitute(value, substitutions)
 
-    return Analyzer().simplify(resolve_expr(expr))
+    resolved = resolve_expr(expr)
+    from tilelang.language.eager.builder import Builder
+    from tilelang.utils.target import target_is_sunmmio
+    from tvm.target import Target
+
+    builder = Builder.current()
+    target = Target.current(allow_none=True)
+    if builder and (builder._dist_world_size or 1) > 1 and target and target_is_sunmmio(target):
+        from tilelang.transform import _ffi_api
+
+        return _ffi_api.SimplifySunmmioFrontendInteger(resolved, builder._dist_rank_id_var, builder._dist_world_size, allocation_shape)
+    return Analyzer().simplify(resolved)

@@ -33,7 +33,7 @@ from .proxy import Tensor
 
 
 def _resolve_allocation_extent(extent: PrimExpr | int) -> PrimExpr | int:
-    resolved_extent = resolve_let_bound_expr(extent)
+    resolved_extent = resolve_let_bound_expr(extent, allocation_shape=True)
     unresolved_vars = find_let_bound_vars(resolved_extent)
     if unresolved_vars:
         names = ", ".join(sorted(var.name for var in unresolved_vars))

@@ -62,6 +62,9 @@ struct DistSignalKindInfo {
   bool allow_multi_sender;
 };
 
+// Convert a validated logical delta to its finite-width software storage type.
+PrimExpr CastDistStorage(DataType dtype, const PrimExpr &value);
+
 inline DataType DistSoftwareStateDType(const DistSignalKindInfo &kind) {
   return kind.update_mode == DistSignalUpdateMode::kMemory ? DataType::UInt(32)
                                                            : kind.state_dtype;

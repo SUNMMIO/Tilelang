@@ -1538,24 +1538,6 @@ public:
   }
 
 private:
-  PrimExpr StorageDelta(DataType dtype, const PrimExpr &delta) {
-    // Fold constant integer narrowing with its ordinary modulo semantics.
-    // Some generic simplifier paths cannot construct an out-of-range u32
-    // literal when a u64 constant is narrowed. Validation uses the raw delta.
-    std::optional<uint64_t> constant;
-    if (const auto *imm = delta.as<IntImmNode>())
-      constant = static_cast<uint64_t>(imm->value);
-    else if (const auto *call = delta.as<CallNode>();
-             call && call->op.same_as(builtin::large_uint_imm()))
-      constant =
-          static_cast<uint64_t>(Downcast<IntImm>(call->args[0])->value) |
-          (static_cast<uint64_t>(Downcast<IntImm>(call->args[1])->value) << 32);
-    if (constant && dtype.is_uint() && dtype.bits() < 64)
-      return make_const(dtype,
-                        constant.value() & ((uint64_t{1} << dtype.bits()) - 1));
-    return Cast(dtype, delta);
-  }
-
   Stmt VisitStmt_(const EvaluateNode *evaluate_node) final {
     const auto *call = evaluate_node->value.as<CallNode>();
     if (!call) {
@@ -1630,7 +1612,7 @@ private:
       // Preserve the original growth site before runtime storage casts. The
       // function's final mathematical flag bounds are checked after emission.
       bounds_.Register(call, expected, call->args[1]);
-      PrimExpr delta = StorageDelta(expected->dtype, call->args[1]);
+      PrimExpr delta = CastDistStorage(expected->dtype, call->args[1]);
       PrimExpr next = Cast(expected->dtype, expected + delta);
       return BufferStore(expected->buffer, next, expected->indices);
     }
@@ -1715,7 +1697,8 @@ private:
         bounds_.Register(
             call, Downcast<BufferLoad>(current),
             Select(advance_expected, delta, make_zero(delta.dtype())));
-      PrimExpr typed_delta = StorageDelta(signal_expect->buffer->dtype, delta);
+      PrimExpr typed_delta =
+          CastDistStorage(signal_expect->buffer->dtype, delta);
       PrimExpr next =
           Cast(signal_expect->buffer->dtype,
                current + Select(advance_expected, typed_delta,

@@ -34,6 +34,11 @@
 `lowering.py` 提供真实编译流水线和 pass 快照；`tir_test_utils.py` 提供公共 TIR 查询与单阶段 lowering。
 kernel factory 留在所属功能文件中，测试文件之间不相互导入。
 
+多 rank kernel 的整数转换在绑定 SunMMIO target 后、首次化简前处理。可证明保值的整数转换沿用原表达式。
+标量窄化显式保留目标宽度的低位。8、16、32、64 位的同宽符号转换保留位模式，扩宽同时改变符号时先按源类型扩展。
+需要回绕的动态向量窄化或 buffer 形状中的转换会在入口报错。信号写入软件存储时复用相同规则，FLAGREG 的峰值检查使用原始 delta。
+[整数转换 codegen 测试](../codegen/test_dist_integer_cast_policy_opt_validate.py)
+
 ## 日常验证
 
 使用 `my-tilelang` 环境，在仓库根目录按文件或用例运行，例如：

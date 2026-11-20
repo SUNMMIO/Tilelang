@@ -57,6 +57,17 @@ public:
     return std::nullopt;
   }
 
+  // Sign changes on SunMMIO scalar integers preserve the same bits.
+  static bool IsIntegerSignReinterpret(const tir::CallNode *op) {
+    if (!op->op.same_as(tir::builtin::reinterpret()) || op->args.size() != 1)
+      return false;
+    DataType src = op->args[0].dtype(), dst = op->dtype;
+    return src.is_scalar() && dst.is_scalar() && src.bits() == dst.bits() &&
+           (src.bits() == 8 || src.bits() == 16 || src.bits() == 32 ||
+            src.bits() == 64) &&
+           ((src.is_int() && dst.is_uint()) || (src.is_uint() && dst.is_int()));
+  }
+
   explicit FiniteWidthInteger(arith::Analyzer *analyzer, int64_t divisor = 1,
                               const Definitions *definitions = nullptr)
       : analyzer_(analyzer), divisor_(divisor), definitions_(definitions) {
@@ -138,6 +149,11 @@ public:
       return {Not(a.expr), {0, 1}, 1, 0, a.valid};
     }
     if (const auto *op = expr.as<CallNode>()) {
+      if (IsIntegerSignReinterpret(op)) {
+        Value v = Analyze(op->args[0]);
+        return Finish(op->dtype, v.range, v.modulus, v.residue, v.valid,
+                      [&] { return Cast(op->dtype, v.expr); });
+      }
       if (op->op.same_as(builtin::large_uint_imm())) {
         auto value = Literal(expr);
         return value ? Constant(*value, op->dtype) : Unknown(op->dtype, false);
@@ -194,6 +210,13 @@ public:
     TL_FINITE_BINARY(Or, "or");
 #undef TL_FINITE_BINARY
     return Unknown(expr.dtype());
+  }
+
+  bool FitsIn(const PrimExpr &expr, DataType dtype) {
+    Value value = Analyze(expr);
+    Range target = TypeRange(dtype);
+    return value.valid && value.range.lo >= target.lo &&
+           value.range.hi <= target.hi;
   }
 
   PrimExpr Normalize(const PrimExpr &expr) {
@@ -408,6 +431,12 @@ private:
                        : op == "mod"       ? truncmod(a.expr, b.expr)
                        : op == "floor_div" ? floordiv(a.expr, b.expr)
                                            : floormod(a.expr, b.expr);
+      if (op == "floor_mod" && b.range.lo == b.range.hi && b.range.lo > 0) {
+        // Taking a remainder subtracts a multiple of b. Preserve precisely
+        // the factor shared with the original congruence.
+        int64_t factor = std::gcd(a.modulus, Mod(b.range.lo, a.modulus));
+        return {model, range, factor, Mod(a.residue, factor), valid};
+      }
       return {model, range, 1, 0, valid};
     }
     PrimExpr model;

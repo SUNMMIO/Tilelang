@@ -1370,7 +1370,8 @@ private:
       PrimExpr accumulated = BufferLoad(group.auto_completion_deltas, {offset});
       Stmt update = BufferStore(
           group.auto_completion_deltas,
-          accumulated + Cast(accumulated.dtype(), call->args[1]), {offset});
+          accumulated + CastDistStorage(accumulated.dtype(), call->args[1]),
+          {offset});
       return SeqStmt::Flatten(Array<Stmt>{Evaluate(lowered), update});
     }
     if (call && call->op.same_as(dist_batch_begin())) {

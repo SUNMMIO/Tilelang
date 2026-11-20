@@ -2455,6 +2455,9 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
   }
   std::vector<SunMMIOValue> operands;
   SunMMIOCallAttrs attrs;
+  if (tl::FiniteWidthInteger::IsIntegerSignReinterpret(op)) {
+    return EmitCast(EvalExpr(op->args[0]), op->dtype);
+  }
   if (callee == "tir.large_uint_imm") {
     auto value =
         tl::FiniteWidthInteger::Literal(tvm::ffi::GetRef<PrimExpr>(op));
