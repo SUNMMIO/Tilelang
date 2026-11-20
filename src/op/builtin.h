@@ -170,6 +170,10 @@ DataType cuTensorMapType();
  */
 TVM_DLL const Op &access_ptr();
 
+// A finite-width conversion in a T.Tiles value. The backend selects the
+// scalar or tile instruction after the actual operand shape is known.
+TVM_DLL const Op &sunmmio_tile_integer_cast();
+
 // fast math related op
 // __exp(x) - fast exponential
 TVM_DLL const Op &__exp();

@@ -1,5 +1,6 @@
 #include "codegen_sunmmio.h"
 
+#include "../../op/builtin.h"
 #include "../../op/utils.h"
 #include "../../transform/common/attr.h"
 #include "../sunmmio_utils.h"
@@ -26,6 +27,15 @@ namespace codegen {
 namespace {
 
 using namespace tir;
+
+Optional<PrimExpr> TileCastOperand(const PrimExpr &expr) {
+  if (const auto *cast = expr.as<CastNode>())
+    return cast->value;
+  if (const auto *call = expr.as<CallNode>();
+      call && call->op.same_as(tl::sunmmio_tile_integer_cast()))
+    return call->args[0];
+  return std::nullopt;
+}
 
 bool IsSunmmioLocalVarBuffer(const tir::Buffer &buffer) {
   if (!buffer.defined()) {
@@ -3271,8 +3281,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       }
       return std::nullopt;
     }
-    if (const auto *cast = expr.as<CastNode>()) {
-      return infer_tile_expr_shape(cast->value, state);
+    if (auto operand = TileCastOperand(expr)) {
+      return infer_tile_expr_shape(*operand, state);
     }
     if (const auto *add = expr.as<AddNode>()) {
       return infer_binary_shape(add->a, add->b);
@@ -4152,25 +4162,34 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       return emit_select(select->condition, select->true_value,
                          select->false_value, select->dtype);
     }
-    if (const auto *cast = expr.as<CastNode>()) {
+    if (auto operand = TileCastOperand(expr)) {
       // An explicit cast applies after its operand has been evaluated.
-      SunMMIOValue value = lower_expr(cast->value, state, std::nullopt);
+      SunMMIOValue value = lower_expr(*operand, state, std::nullopt);
       if (IsTileLike(value)) {
-        DataType dst_dtype = CanonicalizeSuvmDType(cast->dtype).with_lanes(1);
+        DataType dst_dtype = CanonicalizeSuvmDType(expr.dtype()).with_lanes(1);
+        if (expr.as<CallNode>()) {
+          int src_bits = value.dtype.bits();
+          ICHECK((src_bits == 16 || src_bits == 32) &&
+                 (dst_dtype.bits() == src_bits ||
+                  (src_bits == 32 && dst_dtype.bits() == 16)))
+              << "SunMMIO cannot preserve tile integer Cast from "
+              << value.dtype << " to " << dst_dtype;
+        }
         if (value.dtype == dst_dtype) {
           return value;
         }
-        SunMMIOType dst_type = MakeTileType(CanonicalizeSuvmDType(cast->dtype),
+        SunMMIOType dst_type = MakeTileType(CanonicalizeSuvmDType(expr.dtype()),
                                             ExtractStaticShape(value.type));
-        return builder_->Cast(NewValueName(), value, dst_type,
-                              CanonicalizeSuvmDType(cast->dtype).with_lanes(1));
+        return builder_->Cast(
+            NewValueName(), value, dst_type,
+            CanonicalizeSuvmDType(expr.dtype()).with_lanes(1));
       }
       SunMMIOType scalar_type{SunMMIOType::Kind::kScalar,
-                              CanonicalizeSuvmDType(cast->dtype),
+                              CanonicalizeSuvmDType(expr.dtype()),
                               1,
                               {}};
       return builder_->Cast(NewValueName(), value, scalar_type,
-                            CanonicalizeSuvmDType(cast->dtype).with_lanes(1));
+                            CanonicalizeSuvmDType(expr.dtype()).with_lanes(1));
     }
     if (const auto *call = expr.as<CallNode>()) {
       const auto *op_node = call->op.as<OpNode>();

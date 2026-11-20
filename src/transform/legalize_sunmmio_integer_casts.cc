@@ -8,7 +8,9 @@
 #include <unordered_set>
 
 #include "../layout/cute_layout.h"
+#include "../op/builtin.h"
 #include "../support/finite_width_integer.h"
+#include "common/attr.h"
 #include "dist_transform_utils.h"
 
 namespace tvm {
@@ -20,7 +22,8 @@ bool IsInteger(DataType t) { return t.is_int() || t.is_uint() || t.is_bool(); }
 
 // The generic analyzer may intersect an unconverted source range with the
 // destination type. Leave a numeric Cast only when it preserves its operand.
-PrimExpr ProtectCast(const Cast &op, FiniteWidthInteger *facts = nullptr) {
+PrimExpr ProtectCast(const Cast &op, FiniteWidthInteger *facts = nullptr,
+                     bool tile_operand = false) {
   const PrimExpr &value = op->value;
   DataType src = value.dtype(), dst = op->dtype;
   if (!IsInteger(src) || !IsInteger(dst) || src == dst)
@@ -45,6 +48,11 @@ PrimExpr ProtectCast(const Cast &op, FiniteWidthInteger *facts = nullptr) {
       << "SunMMIO inter-rank cannot preserve integer Cast from " << src
       << " to " << dst << " for " << value
       << "; use a supported scalar integer conversion";
+
+  // A Tiles payload still looks scalar here. Keep the conversion intact
+  // through generic analysis until the backend knows its operand shape.
+  if (tile_operand)
+    return Call(dst, sunmmio_tile_integer_cast(), {value}, {}, op->span);
 
   if (src.bits() <= dst.bits()) {
     // The remaining equal-width or widening conversion changes signedness.
@@ -101,12 +109,19 @@ public:
   }
 
 private:
+  PrimExpr VisitOperand(const PrimExpr &value, bool tile_operand) {
+    bool previous = std::exchange(tile_operand_, tile_operand);
+    auto result = VisitExpr(value);
+    tile_operand_ = previous;
+    return result;
+  }
+
   // Shapes, explicit layouts and attributes are shared as object identities.
   // If they require a wrapping conversion, fail before any pass uses them for
   // address arithmetic. Normal dynamic local initializers are BufferStores.
   void CheckMetadata(const ffi::Any &object) {
     if (auto expr = object.as<PrimExpr>()) {
-      ICHECK(VisitExpr(*expr).same_as(*expr))
+      ICHECK(VisitOperand(*expr, false).same_as(*expr))
           << "SunMMIO inter-rank integer Cast in buffer or annotation metadata "
              "requires a value-preserving conversion: "
           << *expr;
@@ -173,7 +188,13 @@ private:
         (!op->step || is_one(*op->step))) {
       analyzer_.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent));
     }
-    return StmtExprMutator::VisitStmt_(op);
+    bool tile_loop = op->annotations.count(attr::tile_level_loop);
+    if (tile_loop)
+      tile_axes_.insert(op->loop_var.get());
+    auto loop = StmtExprMutator::VisitStmt_(op);
+    if (tile_loop)
+      tile_axes_.erase(op->loop_var.get());
+    return loop;
   }
   Stmt VisitStmt_(const DeclBufferNode *op) final {
     CheckMetadata(op->buffer);
@@ -181,39 +202,53 @@ private:
   }
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
     CheckMetadata(op->buffer);
-    auto load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
-    if (op->predicate) {
-      auto predicate = VisitExpr(*op->predicate);
-      if (!predicate.same_as(*op->predicate))
-        load.CopyOnWrite()->predicate = predicate;
-    }
-    return load;
+    auto indices = op->indices.Map(
+        [&](const PrimExpr &i) { return VisitOperand(i, false); });
+    Optional<PrimExpr> pred = op->predicate;
+    if (pred)
+      pred = VisitOperand(*pred, false);
+    if (indices.same_as(op->indices) && pred.same_as(op->predicate))
+      return ffi::GetRef<BufferLoad>(op);
+    return BufferLoad(op->buffer, indices, pred, op->span);
   }
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     CheckMetadata(op->buffer);
-    auto store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
-    if (op->predicate) {
-      auto predicate = VisitExpr(*op->predicate);
-      if (!predicate.same_as(*op->predicate))
-        store.CopyOnWrite()->predicate = predicate;
-    }
-    return store;
+    auto value = VisitOperand(op->value, !tile_axes_.empty());
+    auto indices = op->indices.Map(
+        [&](const PrimExpr &i) { return VisitOperand(i, false); });
+    Optional<PrimExpr> pred = op->predicate;
+    if (pred)
+      pred = VisitOperand(*pred, false);
+    if (value.same_as(op->value) && indices.same_as(op->indices) &&
+        pred.same_as(op->predicate))
+      return ffi::GetRef<BufferStore>(op);
+    return BufferStore(op->buffer, value, indices, pred, op->span);
   }
   PrimExpr VisitExpr_(const CastNode *op) final {
     auto cast = Downcast<Cast>(StmtExprMutator::VisitExpr_(op));
     FiniteWidthInteger facts(&analyzer_, 1, &defs_);
-    return ProtectCast(cast, &facts);
+    return ProtectCast(cast, &facts, tile_operand_);
   }
   Stmt VisitStmt_(const LetStmtNode *op) final {
-    auto value = VisitExpr(op->value);
+    bool tile_value =
+        !tile_axes_.empty() && UsesVar(op->value, [&](const VarNode *v) {
+          return tile_axes_.count(v) || tile_lets_.count(v);
+        });
+    auto value = VisitOperand(op->value, tile_value);
+    if (tile_value)
+      tile_lets_.insert(op->var.get());
     defs_.emplace(op->var.get(), value);
     auto body = VisitStmt(op->body);
     defs_.erase(op->var.get());
+    if (tile_value)
+      tile_lets_.erase(op->var.get());
     return value.same_as(op->value) && body.same_as(op->body)
                ? ffi::GetRef<Stmt>(op)
                : LetStmt(op->var, value, body, op->span);
   }
   std::unordered_set<const BufferNode *> checked_buffers_;
+  bool tile_operand_{false};
+  std::unordered_set<const VarNode *> tile_axes_, tile_lets_;
   arith::Analyzer analyzer_;
   FiniteWidthInteger::Definitions defs_;
 };

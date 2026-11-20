@@ -128,11 +128,50 @@ def frontend_cast_kernel(mode, strict=False, world_size: int = 1):
     return main
 
 
+@tilelang.jit(target="sunmmio")
+def tile_cast_kernel(source_type, dest_type, notify=True, indexed=False, world_size: int = 1):
+    src_dtype, dst_dtype = getattr(T, source_type), getattr(T, dest_type)
+
+    rows = 64 if indexed else 32
+
+    @T.prim_func
+    def main(
+        A: T.MeshTensor((rows, 64), T.placement.replicated(), src_dtype),
+        Z: T.MeshTensor((32, 64), T.placement.replicated(), dst_dtype),
+        rank_id: T.dist.RankId,
+        n: T.int32,
+    ):
+        with T.Kernel():
+            src = T.alloc_shared((rows, 64), src_dtype)
+            dst = T.alloc_shared((32, 64), dst_dtype)
+            T.copy(A, src)
+            for i, j in T.Tiles([32, 64]):
+                base = T.truncdiv(T.Cast("int32", T.Cast("uint8", n % 2 - 1)), 128) * 32 if indexed else 0
+                value = T.Cast(dest_type, src[base + i, j])
+                dst[i, j] = value
+            T.copy(dst, Z)
+            if notify:
+                signal = T.dist.signal(expect="manual")
+                T.dist.put_signal(signal, (rank_id + 1) % world_size, submit=True)
+
+    return main
+
+
 def generate(kernel, tmp_path, **kwargs):
     result = lower_to_device_tir(kernel.get_tir(world_size=2, **kwargs))
     source = codegen_sunmmio_suvm_mlir(result.device_mod)
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
     return result, source
+
+
+def specialize_n(result, source, n):
+    func = single_prim_func(result.device_mod)
+    n_arg = next(i for i, var in enumerate(func.params) if var.name == "n")
+    head, sep, body = source.partition(") {")
+    body = re.sub(rf"%arg{n_arg}\b", "%fixed_n", body)
+    return simplify_suvm_mlir(
+        f"{head}{sep}\n    %fixed_n = arith.constant {n} : i32\n{body}", opt_args=("--canonicalize", "--cse", "--sccp", "--canonicalize")
+    )
 
 
 @pytest.mark.parametrize("dtype,bias", [("uint8", -1), ("uint8", 0), ("uint16", -1), ("int8", 0)])
@@ -252,15 +291,8 @@ def test_frontend_cast_copy_dma_source(tmp_path, monkeypatch, strict):
 
     monkeypatch.setattr(target_utils, "ENABLE_SUNMMIO_REGION_VALIDATION", strict)
     result, source = generate(frontend_cast_kernel, tmp_path, mode="copy", strict=strict)
-    func = single_prim_func(result.device_mod)
-    n_arg = next(i for i, var in enumerate(func.params) if var.name == "n")
     for n, partition in ((0, 1), (1, 0)):
-        head, sep, body = source.partition(") {")
-        body = re.sub(rf"%arg{n_arg}\b", "%fixed_n", body)
-        fixed = simplify_suvm_mlir(
-            f"{head}{sep}\n    %fixed_n = arith.constant {n} : i32\n{body}",
-            opt_args=("--canonicalize", "--cse", "--sccp", "--canonicalize"),
-        )
+        fixed = specialize_n(result, source, n)
         dma_src = re.search(r"suvm.copy_async (%[\w-]+),", fixed)[1]
         index = re.search(rf"{dma_src} = suvm.get_partitioned_tile_view %arg\d+ indices = \[(%[\w-]+)\]", fixed)[1]
         assert re.search(rf"{index} = arith.constant {partition} : index", fixed)
@@ -270,3 +302,29 @@ def test_frontend_cast_copy_dma_source(tmp_path, monkeypatch, strict):
 def test_frontend_cast_metadata_is_not_a_static_constant(mode):
     with pytest.raises((ValueError, tvm.error.InternalError), match="buffer or annotation metadata|positive compile-time int"):
         frontend_cast_kernel.get_tir(mode=mode, world_size=2)
+
+
+@pytest.mark.parametrize("source_type,dest_type,bits", [("int32", "int16", 16), ("int32", "uint16", 16), ("uint32", "int32", 32)])
+def test_tile_payload_cast_uses_native_conversion(tmp_path, source_type, dest_type, bits):
+    _, source = generate(tile_cast_kernel, tmp_path, source_type=source_type, dest_type=dest_type)
+    assert re.search(rf"suvm.tile.cast [^:]+: !suvm.tile<32x32xi32> -> !suvm.tile<32x32xi{bits}>", source)
+    assert "suvm.dist.batch_signal" in source
+    _, isolated = generate(tile_cast_kernel, tmp_path, source_type=source_type, dest_type=dest_type, notify=False)
+    llvm = validate_suvm_mlir_with_npuir_opt(isolated, tmp_path, opt_args=("--suvm-to-llvm-pipeline",)).stdout
+    # This A4E intrinsic preserves the low 16 bits for either source sign.
+    assert ("vcvt.uint16.uint32" in llvm) == (bits == 16)
+
+
+def test_unavailable_tile_integer_narrowing_is_diagnosed(tmp_path):
+    with pytest.raises(tvm.error.InternalError, match="cannot preserve tile integer Cast"):
+        generate(tile_cast_kernel, tmp_path, source_type="int32", dest_type="int8")
+
+
+def test_tile_payload_and_address_casts_keep_their_own_width(tmp_path):
+    result, source = generate(tile_cast_kernel, tmp_path, source_type="int32", dest_type="int16", indexed=True)
+    for n, partition in ((0, 1), (1, 0)):
+        fixed = specialize_n(result, source, n)
+        view = re.search(r"suvm.tile.load (%[\w-]+) : !suvm.tile_view<32x32xi32>", fixed)[1]
+        index = re.search(rf"{view} = suvm.get_partitioned_tile_view %[^ ]+ indices = \[(%[\w-]+),", fixed)[1]
+        assert re.search(rf"{index} = arith.constant {partition} : index", fixed)
+        assert "suvm.tile.cast" in fixed
