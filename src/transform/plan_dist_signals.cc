@@ -642,8 +642,46 @@ private:
   Map<Var, PrimExpr> let_bindings_;
 };
 
+// Same-row puts need just two locality bits. For a potential cross-row
+// transfer, group identical row tables under rank/IV guards. Payloads and
+// sender-local dynamic predicates stay at their original evaluation sites.
+struct OrdinaryPutPlan {
+  using Row = std::tuple<int64_t, int64_t, bool>; // origin, destination, local
+  using Table = std::vector<Row>;
+  int locality{0};
+  bool crosses_rows{false};
+  std::map<Table, std::vector<PrimExpr>> cases;
+
+  Call Annotate(const Call &call) const {
+    auto attrs = call->annotations;
+    attrs.Set(kDistPutLocality, Integer(locality));
+    if (crosses_rows) {
+      Array<Array<ObjectRef>> encoded;
+      for (const auto &[rows, guards] : cases) {
+        if (rows.empty())
+          continue;
+        PrimExpr guard = const_true();
+        if (cases.size() > 1) {
+          guard = const_false();
+          for (const auto &instance : guards)
+            guard = Or(guard, instance);
+        }
+        Array<Array<Integer>> entries;
+        for (const auto &[src, dst, local] : rows) {
+          entries.push_back({Integer(src), Integer(dst), Integer(local)});
+        }
+        encoded.push_back({guard, entries});
+      }
+      attrs.Set(kDistPutRowCases, encoded);
+    }
+    return Call(call->dtype, call->op, call->args, attrs, call->span);
+  }
+};
+
 class DistSignalTopologyAnalyzer : public DistRouteMutatorBase {
 public:
+  std::unordered_map<const CallNode *, OrdinaryPutPlan> put_plans;
+
   DistSignalTopologyAnalyzer(arith::Analyzer *analyzer, Target target,
                              int64_t world_size, Var rank_id,
                              const std::vector<DistSignalRecord> &records,
@@ -802,7 +840,8 @@ private:
                   const PrimExpr &dst_row_expr, const Var &current_core,
                   int64_t src_rank, int64_t src_row,
                   const PrimExpr &extra_predicate = const_true(),
-                  bool signal_only = false) {
+                  bool signal_only = false, OrdinaryPutPlan *plan = nullptr,
+                  OrdinaryPutPlan::Table *rows = nullptr) {
     Map<Var, PrimExpr> substitution =
         MakeSourceSubstitution(current_core, src_row, src_rank);
     PrimExpr source_predicate = Substitute(predicate_, let_bindings_);
@@ -822,6 +861,13 @@ private:
     ValidateResolvedEndpoint(dst_rank, dst_row, "T.dist signal topology");
     int64_t dst_rank_value = RequireIntImm(dst_rank, "signal dst_rank");
     int64_t dst_row_value = RequireIntImm(dst_row, "signal dst_row");
+    if (plan) {
+      bool local = dst_rank_value == src_rank;
+      plan->locality |= local ? kPutLocal : kPutRemote;
+      plan->crosses_rows |= dst_row_value != src_row;
+      if (rows)
+        rows->emplace_back(src_row, dst_row_value, local);
+    }
     if (dst_rank_value == src_rank) {
       ICHECK(!signal_only)
           << "T.dist.put_signal only supports a remote peer Rank; source Rank "
@@ -888,11 +934,19 @@ private:
   void AnalyzePut(const CallNode *call) {
     ICHECK_EQ(call->args.size(), 6U);
     Var current_core = Downcast<Var>(call->args[5]);
+    auto &plan = put_plans[call];
+    bool needs_table =
+        !StructuralEqual()(call->args[3], CurrentRow(current_core));
     for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
+      OrdinaryPutPlan::Table rows;
       for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
         RecordSend(call->args[4], call->args[2], call->args[3], current_core,
-                   src_rank, src_row);
+                   src_rank, src_row, const_true(), false, &plan,
+                   needs_table ? &rows : nullptr);
       }
+      if (needs_table)
+        plan.cases[rows].push_back(
+            And(rank_id_ == I32(src_rank), instance_guard_));
     }
   }
 
@@ -973,12 +1027,16 @@ private:
           RequireIntImm(extent_expr, "dynamic signal-index loop extent");
       ICHECK_GE(extent, 0);
       Map<Var, PrimExpr> old_bindings = let_bindings_;
+      PrimExpr outer_guard = instance_guard_;
       for (int64_t offset = 0; offset < extent; ++offset) {
         let_bindings_.Set(op->loop_var,
                           IntImm(op->loop_var.dtype(), min + offset));
+        instance_guard_ =
+            And(outer_guard, op->loop_var == let_bindings_.at(op->loop_var));
         VisitStmt(op->body);
         let_bindings_ = old_bindings;
       }
+      instance_guard_ = outer_guard;
     }
     uniform_loop_vars_.erase(op->loop_var.get());
     unproven_loop_depth_ -= !uniform;
@@ -1027,6 +1085,7 @@ private:
   std::unordered_map<SignalTopologyKey, SignalTopologyInfo,
                      SignalTopologyKeyHash>
       topology_;
+  PrimExpr instance_guard_{const_true()};
   PrimExpr predicate_{const_true()};
   Map<Var, PrimExpr> let_bindings_;
 
@@ -1042,10 +1101,22 @@ public:
   explicit DistSignalPlanRewriter(
       const std::unordered_map<const VarNode *, DistSignalRecord> &plans,
       const std::unordered_map<const VarNode *, DistSignalGroupRecord>
-          &group_plans)
-      : plans_(plans), group_plans_(group_plans) {}
+          &group_plans,
+      const std::unordered_map<const CallNode *, OrdinaryPutPlan> &put_plans)
+      : plans_(plans), group_plans_(group_plans), put_plans_(put_plans) {}
 
 private:
+  const std::unordered_map<const CallNode *, OrdinaryPutPlan> &put_plans_;
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    if (!op->op.same_as(DistPutOp::Get()))
+      return StmtExprMutator::VisitExpr_(op);
+    auto plan = put_plans_.find(op);
+    // A statically empty loop may contain a site never visited by topology.
+    const OrdinaryPutPlan empty;
+    return (plan == put_plans_.end() ? empty : plan->second)
+        .Annotate(ffi::GetRef<Call>(op));
+  }
+
   Stmt VisitStmt_(const LetStmtNode *let_node) final {
     const auto *call = let_node->value.as<CallNode>();
     if (call && call->op.same_as(dist_signal_group_decl())) {
@@ -1416,7 +1487,8 @@ PrimFunc PlanSignalResources(PrimFunc func) {
   for (const DistSignalGroupRecord &group : groups) {
     group_plans.emplace(group.var.get(), group);
   }
-  Stmt body = DistSignalPlanRewriter(plans, group_plans)(func->body);
+  Stmt body = DistSignalPlanRewriter(plans, group_plans,
+                                     topology.put_plans)(func->body);
   if (!body.same_as(func->body)) {
     func.CopyOnWrite()->body = std::move(body);
   }

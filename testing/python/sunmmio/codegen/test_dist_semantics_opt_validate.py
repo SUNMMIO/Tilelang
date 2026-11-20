@@ -89,6 +89,33 @@ def lazy_read_kernel(world_size: int = 1):
 
 
 @tilelang.jit(target="sunmmio")
+def ordinary_route_kernel(mode, manual, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel() as core:
+            src = T.alloc_shared((256,), T.int32)
+            dst = T.alloc_shared((256,), T.int32)
+            signal = T.dist.signal(kind=T.dist.SignalKind.SRAM_FLAGREG_INC, expect="manual" if manual else "auto")
+            T.fill(src, 1)
+            if mode == "ordinary_local":
+                if core // T.mesh_ncols() == 0:
+                    T.dist.put(src, dst, rank_id, dst_row=0, signal=signal)
+            elif mode == "ordinary_cross":
+                T.dist.put(src, dst, rank_id, dst_row=1 - (core // T.mesh_ncols()) % 2, signal=signal)
+            elif mode == "ordinary_iv":
+                for i in T.serial(1, world_size):
+                    if rank_id == i:
+                        T.dist.put(src, dst, rank_id - i, signal=signal)
+            T.dist.submit()
+            if manual:
+                T.dist.wait_signal(signal, expected_delta=0)
+            else:
+                T.dist.wait_signal(signal)
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
 def nested_init_kernel(mode="literal", world_size: int = 1):
     @T.prim_func
     def main(rank_id: T.dist.RankId, m: T.int32, z: T.int32, rounds: T.int32):
@@ -294,3 +321,45 @@ def test_read_macro_remains_in_lazy_operand(tmp_path):
     for index, expected in ((-1, 0), (0, 7)):
         _, events = trace_suvm_control_flow(result, source, rank_id=0, i=index)
         assert [event[1] for event in events if event[0] == "wait"] == [expected]
+
+
+@pytest.mark.parametrize("manual", [True, False])
+def test_ordinary_local_put_uses_only_participating_sources(tmp_path, manual):
+    _, source = generate(ordinary_route_kernel, tmp_path, mode="ordinary_local", manual=manual)
+    assert "suvm.barrier.arrive_and_wait" not in source
+    assert "suvm.dist.batch_put" not in source
+    for row in range(4):
+        fixed = simplify_suvm_mlir(
+            source.replace("suvm.get_core_id : i64", f"arith.constant {4 * row} : i64"),
+            opt_args=("--canonicalize", "--cse", "--sccp", "--canonicalize"),
+        )
+        assert ("suvm.tile.load" in fixed) == (row == 0)
+
+
+@pytest.mark.parametrize("manual", [True, False])
+def test_ordinary_put_validates_only_active_rank_loop_pairs(tmp_path, manual):
+    result, source = generate(ordinary_route_kernel, tmp_path, world_size=3, mode="ordinary_iv", manual=manual)
+    for rank in range(3):
+        batches, events = trace_suvm_control_flow(result, source, rank_id=rank)
+        assert [x[1] for batch in batches for x in batch if x[0] == "data"] == ([0] if rank else [])
+        assert [e[1] for e in events if e[0] == "wait"] == [0 if manual or rank else 2]
+
+
+def test_ordinary_cross_row_put_keeps_matching_participants(tmp_path):
+    _, source = generate(ordinary_route_kernel, tmp_path, mode="ordinary_cross", manual=True)
+    for col in range(4):
+        expected_arrivals = {}
+        for row in range(4):
+            dst_row = 1 - row % 2
+            mask = (1 << (4 * row + col)) | (1 << (4 * dst_row + col))
+            expected_arrivals[mask] = expected_arrivals.get(mask, 0) + 2
+        for row in range(4):
+            core = 4 * row + col
+            fixed = simplify_suvm_mlir(
+                source.replace("suvm.get_core_id : i64", f"arith.constant {core} : i64"),
+                opt_args=("--canonicalize", "--cse", "--sccp", "--canonicalize"),
+            )
+            for mask, count in expected_arrivals.items():
+                if mask & (1 << core):
+                    barriers = re.findall(rf"(%[\w-]+) = suvm.barrier.init mask = {mask} :", fixed)
+                    assert sum(fixed.count(f"suvm.barrier.arrive_and_wait {b} :") for b in barriers) == count

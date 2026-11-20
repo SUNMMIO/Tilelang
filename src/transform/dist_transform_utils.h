@@ -27,6 +27,13 @@ namespace dist_transform {
 
 using namespace tir;
 
+// PlanDistSignals owns endpoint admission. Ordinary puts carry its locality
+// and, only when forwarding between rows, the participating source routes.
+inline constexpr const char *kDistPutLocality = "tl.dist.put_locality";
+inline constexpr const char *kDistPutRowCases = "tl.dist.put_row_cases";
+inline constexpr const char *kDistRemoteRows = "tl.dist.remote_rows";
+enum PutLocality { kPutLocal = 1, kPutRemote = 2 };
+
 inline constexpr const char *kDistWorldSizeAttr = "tl.dist.world_size";
 inline constexpr const char *kDistSignalCountsAttr = "tl.dist.signal_counts";
 inline constexpr const char *kDistCompilerRegionAttr =

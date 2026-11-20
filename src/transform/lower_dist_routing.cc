@@ -432,52 +432,61 @@ private:
     Var current_core = tvm::ffi::GetRef<Var>(current_core_node);
     ValidateRouteExpression(call->args[2], "dst_rank");
     ValidateRouteExpression(call->args[3], "dst_row");
-    Locality locality = ValidateAndClassify(
-        call->args[2], call->args[3], current_core, std::nullopt, "T.dist.put");
-    if (!locality.has_local) {
-      return Evaluate(call);
-    }
-    bool all_local_routes_are_peer = true;
-    for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
-      for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
-        PrimExpr resolved_rank =
-            RewriteForSource(call->args[2], current_core, src_row, src_rank);
-        if (!analyzer_->CanProve(resolved_rank == I32(src_rank))) {
-          continue;
-        }
-        PrimExpr resolved_row =
-            RewriteForSource(call->args[3], current_core, src_row, src_rank);
-        all_local_routes_are_peer &=
-            analyzer_->CanProve(resolved_row == I32(src_row));
-      }
+    int locality =
+        Downcast<Integer>(call->annotations.at(kDistPutLocality))->value;
+    if (!locality)
+      return Evaluate(0);
+    auto cases = call->annotations.Get(kDistPutRowCases);
+    if (!cases) {
+      if (!(locality & kPutLocal))
+        return Evaluate(call);
+      Stmt copy = MakeLocalTransfer(call->args[0], call->args[1], current_core,
+                                    current_core, current_core);
+      Stmt transfer =
+          SelectLocalOrRemote({true, bool(locality & kPutRemote)},
+                              call->args[2] == rank_id_, copy, Evaluate(call));
+      return GuardDynamicSignal(call->args[4], transfer);
     }
 
-    Stmt local;
-    if (all_local_routes_are_peer) {
-      local = MakeLocalTransfer(call->args[0], call->args[1], current_core,
-                                current_core, current_core);
-    } else {
-      if (!HasCompilerGeneratedRegion(call)) {
-        ValidateCrossRowRegionOffsets(call->args[0], call->args[1],
-                                      "T.dist.put");
-      }
+    Array<Stmt> branches;
+    for (const auto &entry : Downcast<Array<Array<ObjectRef>>>(*cases)) {
+      PrimExpr guard = analyzer_->Simplify(Downcast<PrimExpr>(entry[0]));
+      if (is_zero(guard))
+        continue;
       Array<Stmt> transfers;
-      PrimExpr current_col = CurrentCol(current_core);
-      for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
-        PrimExpr src = RewriteForSource(call->args[0], current_core, src_row);
-        PrimExpr dst = RewriteForSource(call->args[1], current_core, src_row);
-        PrimExpr dst_row =
-            RewriteForSource(call->args[3], current_core, src_row);
-        PrimExpr src_core = I32(src_row * mesh_ncols_) + current_col;
-        PrimExpr dst_core = dst_row * I32(mesh_ncols_) + current_col;
-        transfers.push_back(
-            MakeLocalTransfer(src, dst, current_core, src_core, dst_core));
+      Array<Array<Integer>> remote;
+      for (const auto &row : Downcast<Array<Array<Integer>>>(entry[1])) {
+        int64_t src_row = row[0]->value, dst_row = row[1]->value;
+        if (!row[2]->value) {
+          remote.push_back(row);
+          continue;
+        }
+        if (src_row != dst_row && !HasCompilerGeneratedRegion(call))
+          ValidateCrossRowRegionOffsets(call->args[0], call->args[1],
+                                        "T.dist.put");
+        PrimExpr col = CurrentCol(current_core);
+        Stmt local = MakeLocalTransfer(
+            RewriteForSource(call->args[0], current_core, src_row),
+            RewriteForSource(call->args[1], current_core, src_row),
+            current_core, I32(src_row * mesh_ncols_) + col,
+            I32(dst_row * mesh_ncols_) + col);
+        transfers.push_back(local);
       }
-      local = SeqStmt::Flatten(transfers);
+      if (!transfers.empty()) {
+        Stmt local =
+            GuardDynamicSignal(call->args[4], SeqStmt::Flatten(transfers));
+        transfers = {local};
+      }
+      if (!remote.empty()) {
+        auto attrs = call->annotations;
+        attrs.Set(kDistRemoteRows, remote);
+        transfers.push_back(Evaluate(
+            Call(call->dtype, call->op, call->args, attrs, call->span)));
+      }
+      Stmt body = SeqStmt::Flatten(transfers);
+      branches.push_back(is_one(guard) ? body : IfThenElse(guard, body));
     }
-    Stmt lowered = SelectLocalOrRemote(locality, call->args[2] == rank_id_,
-                                       local, Evaluate(call));
-    return GuardDynamicSignal(call->args[4], std::move(lowered));
+    return SeqStmt::Flatten(branches);
   }
 
   bool SameRoute(const NormalRouteEntry &lhs, const NormalRouteEntry &rhs,
@@ -659,20 +668,14 @@ private:
     std::vector<NormalRouteEntry> routes;
     routes.reserve(static_cast<size_t>(mesh_nrows_));
     *all_peer = true;
-    for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
-      for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
-        PrimExpr dst_rank =
-            RewriteForSource(call->args[2], current_core, src_row, src_rank);
-        PrimExpr dst_row =
-            RewriteForSource(call->args[3], current_core, src_row, src_rank);
-        ValidateResolvedEndpoint(dst_rank, dst_row);
-        *all_peer &= analyzer_->CanProve(dst_row == I32(src_row));
+    if (auto table = call->annotations.Get(kDistRemoteRows)) {
+      for (const auto &row : Downcast<Array<Array<Integer>>>(*table)) {
+        int64_t src = row[0]->value, dst = row[1]->value;
+        *all_peer &= src == dst;
+        routes.push_back({src,
+                          RewriteForSource(call->args[2], current_core, src),
+                          I32(dst)});
       }
-    }
-    for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
-      routes.push_back(NormalRouteEntry{
-          src_row, RewriteForSource(call->args[2], current_core, src_row),
-          RewriteForSource(call->args[3], current_core, src_row)});
     }
     return routes;
   }
@@ -710,8 +713,16 @@ private:
         << "Cross-row T.dist.put inside loops is not supported until routed "
            "staging lifetime waits are implemented";
     if (all_peer) {
-      return MakePeerPut(call->args[0], call->args[1], call->args[2],
-                         call->args[4], current_core);
+      Stmt peer = MakePeerPut(call->args[0], call->args[1], call->args[2],
+                              call->args[4], current_core);
+      if (!routes.empty() && routes.size() < static_cast<size_t>(mesh_nrows_)) {
+        PrimExpr active = const_false();
+        for (const auto &route : routes)
+          active =
+              Or(active, CurrentRow(current_core) == I32(route.origin_src_row));
+        return IfThenElse(analyzer_->Simplify(active), peer);
+      }
+      return peer;
     }
 
     if (!HasCompilerGeneratedRegion(call)) {
