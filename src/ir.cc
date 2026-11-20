@@ -89,6 +89,44 @@ LoopLiteral(const PrimExpr &expr) {
   return FiniteWidthInteger::Literal(ResolveLoopAlias(expr));
 }
 
+// Native TVM For frames describe the logical IV with one domain and step
+// per variable. Normalized counter frames leave steps empty because their
+// parsing domain may describe range_index rather than the user's IV.
+static void BindEnclosingUnitRanges(arith::Analyzer *analyzer,
+                                    const PrimExpr &lower,
+                                    const PrimExpr &upper) {
+  using namespace tir;
+  using tvm::script::ir_builder::IRBuilder;
+  if (!IRBuilder::IsInScope())
+    return;
+  for (const auto &frame : IRBuilder::Current()->frames) {
+    const auto *loop = frame.as<ForFrameNode>();
+    if (!loop || loop->steps.size() != loop->vars.size())
+      continue;
+    for (size_t i = 0; i < loop->vars.size(); ++i) {
+      const Var &iv = loop->vars[i];
+      if (!iv.dtype().is_scalar() || !iv.dtype().is_int() ||
+          iv.dtype().bits() > 64 ||
+          (loop->steps[i] && !is_one(*loop->steps[i])))
+        continue;
+      auto matches = [&](const VarNode *v) { return v == iv.get(); };
+      if (!UsesVar(lower, matches) && !UsesVar(upper, matches))
+        continue;
+      Range dom = loop->doms[i];
+      auto start = LoopLiteral(dom->min), count = LoopLiteral(dom->extent);
+      if (!start || !count || *count <= 0)
+        continue;
+      using Wide = FiniteWidthInteger::Wide;
+      Wide high = *start + *count - 1;
+      Wide sign = Wide(1) << (iv.dtype().bits() - 1);
+      if (*start >= -sign && high < sign)
+        analyzer->const_int_bound.Update(
+            iv, arith::ConstIntBound(static_cast<int64_t>(*start),
+                                     static_cast<int64_t>(high)));
+    }
+  }
+}
+
 // The block axis introduced by axis.remap initially matches the DSL IV.
 // Give that axis the full logical range if a narrow IV cannot represent
 // its extent. Uses in the block retain their original integer semantics.
@@ -273,8 +311,12 @@ ForFrame NormalizedFor(PrimExpr start, PrimExpr stop, PrimExpr step,
       // number of iterations is known to fit a signed index.
       arith::Analyzer analyzer;
       FiniteWidthInteger facts(&analyzer);
-      auto lower = facts.Analyze(ResolveLoopAlias(reverse ? stop : start));
-      auto upper = facts.Analyze(ResolveLoopAlias(reverse ? start : stop));
+      auto lo = ResolveLoopAlias(reverse ? stop : start);
+      auto hi = ResolveLoopAlias(reverse ? start : stop);
+      if (bounds_type.bits() == 64)
+        BindEnclosingUnitRanges(&analyzer, lo, hi);
+      auto lower = facts.Analyze(lo);
+      auto upper = facts.Analyze(hi);
       if (lower.valid && upper.valid) {
         Wide max_distance = std::max(Wide(0), upper.range.hi - lower.range.lo);
         // Dynamic steps execute under the positive-entry assertion below.
@@ -333,6 +375,9 @@ ForFrame NormalizedFor(PrimExpr start, PrimExpr stop, PrimExpr step,
       native_unit || signed_unit
           ? logical_domain
           : Range::FromMinExtent(counter_zero, counter_count));
+  if (native_unit)
+    frame->steps.push_back(
+        std::nullopt); // doms[0] describes the actual For IV.
   frame->f_make_for_loop = [=](const Array<Var> &vars, const Array<Range> &doms,
                                const Array<Optional<PrimExpr>> &, Stmt body) {
     PrimExpr offset = cast(work_type, counter) * positive_step;

@@ -344,6 +344,24 @@ def runtime_stride_kernel(world_size: int = 1):
     return main
 
 
+@tilelang.jit(target="sunmmio")
+def nested_wide_range_kernel(negative=False, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, n: T.int64, start: T.int64):
+        with T.Kernel():
+            s = T.dist.signal(kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
+            if negative:
+                for j in T.serial(start, start + T.int64(3), 2):
+                    for _ in T.serial(j, n):
+                        T.dist.put_signal(s, (rank_id + 1) % world_size, submit=True)
+            else:
+                for j in T.serial(3):
+                    for _ in T.serial(T.int64(j), n):
+                        T.dist.put_signal(s, (rank_id + 1) % world_size, submit=True)
+
+    return main
+
+
 def generate(factory, tmp_path, **kwargs):
     kernel = factory.get_tir(world_size=2, **kwargs)
     result = lower_to_device_tir(kernel, capture_passes=("tl.LowerDistSync",))
@@ -617,3 +635,15 @@ def test_copy_overwriting_previous_iterations_source(tmp_path, submitted):
     events = source_events(result)
     assert events[events.index("copy") - 1] == "flush"
     assert source.index("suvm.dist.flush") < source.index("suvm.copy_async") < source.index("suvm.dist.batch_submit")
+
+
+def test_nested_signed_range_uses_logical_outer_iv(tmp_path):
+    result, source = generate(nested_wide_range_kernel, tmp_path)
+    for n in (-(1 << 63), -1, 0, 1, 2, 5):
+        batches, _ = trace_suvm_control_flow(result, source, n=n, rank_id=0)
+        assert len(batches) == sum(max(0, n - j) for j in range(3))
+
+
+def test_normalized_counter_is_not_the_signed_outer_iv(tmp_path):
+    with pytest.raises(tvm.error.InternalError, match="trip count must fit a signed 64-bit index"):
+        generate(nested_wide_range_kernel, tmp_path, negative=True)

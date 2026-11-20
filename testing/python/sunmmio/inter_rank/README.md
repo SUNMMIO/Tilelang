@@ -34,10 +34,14 @@
 `lowering.py` 提供真实编译流水线和 pass 快照；`tir_test_utils.py` 提供公共 TIR 查询与单阶段 lowering。
 kernel factory 留在所属功能文件中，测试文件之间不相互导入。
 
-多 rank kernel 的整数转换在绑定 SunMMIO target 后、首次化简前处理。可证明保值的整数转换沿用原表达式。
+多 rank kernel 在 DSL 检查 copy 区域、分配形状和 signal 数量时，以及在绑定 SunMMIO target 后的首次 TIR 化简前，使用同一套定宽规则。可证明保值的整数转换沿用原表达式。
 标量窄化显式保留目标宽度的低位。8、16、32、64 位的同宽符号转换保留位模式，扩宽同时改变符号时先按源类型扩展。
-需要回绕的动态向量窄化或 buffer 形状中的转换会在入口报错。信号写入软件存储时复用相同规则，FLAGREG 的峰值检查使用原始 delta。
+需要回绕的动态向量窄化或无法证明为静态分配大小的回绕形状会在编译时诊断。
+在 `T.Tiles` 内，局部值按实际标量或 tile 操作数转换，地址仍按标量索引处理。信号写入软件存储时复用相同规则，FLAGREG 的峰值检查使用原始 delta。
 [整数转换 codegen 测试](../codegen/test_dist_integer_cast_policy_opt_validate.py)
+
+普通 `put` 的本地 copy、跨 row 搬运和远端发送共用拓扑规划确认的源。嵌套 signed 64 位循环的次数证明使用可验证的外层逻辑 IV 范围。
+[路由与惰性宏测试](../codegen/test_dist_semantics_opt_validate.py) · [循环边界测试](../codegen/test_dist_audit_kernel_opt_validate.py)
 
 ## 日常验证
 
