@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <numeric>
+#include <optional>
 #include <unordered_map>
 
 namespace tvm {
@@ -31,6 +32,31 @@ public:
     bool valid{true};
   };
 
+  // Decode literal encodings only. This does not run range analysis or fold
+  // expressions containing variables or memory reads.
+  static std::optional<Wide> Literal(const PrimExpr &expr) {
+    using namespace tir;
+    if (const auto *imm = expr.as<IntImmNode>())
+      return Wide(imm->value);
+    if (const auto *cast = expr.as<CastNode>(); cast && Integer(cast->dtype)) {
+      auto value = Literal(cast->value);
+      if (value)
+        return cast->dtype.is_bool() ? Wide(*value != 0)
+                                     : Wrap(*value, cast->dtype);
+    }
+    if (const auto *call = expr.as<CallNode>();
+        call && call->op.same_as(builtin::large_uint_imm()) &&
+        call->args.size() == 2) {
+      const auto *lo = call->args[0].as<IntImmNode>();
+      const auto *hi = call->args[1].as<IntImmNode>();
+      if (lo && hi && lo->value >= 0 && hi->value >= 0 &&
+          Wide(lo->value) < (Wide(1) << 32) &&
+          Wide(hi->value) < (Wide(1) << 32))
+        return Wide(lo->value) + (Wide(hi->value) << 32);
+    }
+    return std::nullopt;
+  }
+
   explicit FiniteWidthInteger(arith::Analyzer *analyzer, int64_t divisor = 1,
                               const Definitions *definitions = nullptr)
       : analyzer_(analyzer), divisor_(divisor), definitions_(definitions) {
@@ -53,6 +79,24 @@ public:
           // Also bound malformed cyclic definitions without recursive growth.
           variables_.emplace(op, Unknown(expr.dtype()));
           Value value = Analyze(definition->second);
+          // Conditions constrain this immutable SSA value, not future reads
+          // from the address used to define it. Keep definition congruences,
+          // but intersect a scoped value range using an independent snapshot.
+          Range narrowed = value.range;
+          auto bound = analyzer_->const_int_bound(expr);
+          if (bound->min_value != arith::ConstIntBound::kNegInf &&
+              bound->min_value != arith::ConstIntBound::kPosInf)
+            narrowed.lo = std::max(narrowed.lo, Wide(bound->min_value));
+          if (bound->max_value != arith::ConstIntBound::kPosInf)
+            narrowed.hi = std::min(narrowed.hi, Wide(bound->max_value));
+          if (narrowed.lo > narrowed.hi)
+            value = Unknown(expr.dtype(), false);
+          else if (narrowed.lo != value.range.lo ||
+                   narrowed.hi != value.range.hi)
+            value = narrowed.lo == narrowed.hi
+                        ? Constant(narrowed.lo, expr.dtype(), value.valid)
+                        : Opaque(expr.dtype(), narrowed, value.modulus,
+                                 value.residue, value.valid);
           variables_[op] = value;
           return value;
         }
@@ -95,14 +139,8 @@ public:
     }
     if (const auto *op = expr.as<CallNode>()) {
       if (op->op.same_as(builtin::large_uint_imm())) {
-        if (op->args.size() != 2 || !op->args[0].as<IntImmNode>() ||
-            !op->args[1].as<IntImmNode>())
-          return Unknown(op->dtype, false);
-        Wide lo = Downcast<IntImm>(op->args[0])->value;
-        Wide hi = Downcast<IntImm>(op->args[1])->value;
-        if (lo < 0 || hi < 0 || lo >= (Wide(1) << 32) || hi >= (Wide(1) << 32))
-          return Unknown(op->dtype, false);
-        return Constant(lo + (hi << 32), op->dtype);
+        auto value = Literal(expr);
+        return value ? Constant(*value, op->dtype) : Unknown(op->dtype, false);
       }
       if (op->op.same_as(builtin::if_then_else()))
         return Choose(op->args[0], op->args[1], op->args[2]);
@@ -167,7 +205,10 @@ public:
   }
 
   bool ProvesMultiple(const PrimExpr &expr) {
-    Value value = Analyze(expr);
+    return ProvesMultiple(Analyze(expr));
+  }
+
+  bool ProvesMultiple(const Value &value) {
     if (!value.valid)
       return false;
     if (value.modulus == divisor_ && value.residue == 0)

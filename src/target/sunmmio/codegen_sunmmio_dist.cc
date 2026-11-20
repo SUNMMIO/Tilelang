@@ -27,6 +27,7 @@ struct DistBatchScopeFailure {
 } // namespace
 
 void CodeGenTileLangSunMMIO::ClearDistFunctionState() {
+  dist_constraints_.clear();
   dist_destinations_.clear();
   dist_batch_for_call_.clear();
   dist_begins_.clear();
@@ -674,7 +675,6 @@ void CodeGenTileLangSunMMIO::EmitDistCapture(const CallNode *op) {
     auto region = [&](const PrimExpr &expr,
                       const std::vector<SunMMIOValue> &slots) {
       BufferRegion view = NormalizeRegionTracked(expr);
-      CheckDistRegionAlignment(view);
       // Let bindings prove alignment; evaluating their expanded expressions
       // would repeat memory reads instead of using the original SSA snapshot.
       for (size_t dim = 0; dim < view->region.size(); ++dim) {
@@ -807,41 +807,96 @@ void CodeGenTileLangSunMMIO::BindDistResources(const PrimFunc &func) {
   }
 }
 
-void CodeGenTileLangSunMMIO::CheckDistRegionAlignment(
-    const BufferRegion &region) const {
-  for (const Range &range : region->region) {
-    const auto *extent = range->extent.as<IntImmNode>();
-    ICHECK(extent && extent->value > 0)
-        << "SunMMIO dist region extent must be a positive constant";
-    ICHECK(CanProveRegionAlignment(range->min, extent->value))
-        << "SunMMIO dist region start must be provably aligned to its extent "
-           "for exact partition addressing: "
-        << region;
+namespace {
+// Only immutable scalar comparisons enter the range proof. The unsigned
+// quotient-zero equivalence supplies the one derived fact needed here.
+void BindDistConstraint(arith::Analyzer *analyzer, PrimExpr condition,
+                        bool negate = false) {
+  if (SideEffect(condition) > CallEffectKind::kPure)
+    return;
+  if (const auto *op = condition.as<NotNode>()) {
+    BindDistConstraint(analyzer, op->a, !negate);
+    return;
   }
+  if (const auto *op = condition.as<AndNode>(); op && !negate) {
+    BindDistConstraint(analyzer, op->a);
+    BindDistConstraint(analyzer, op->b);
+    return;
+  }
+  if (const auto *eq = condition.as<EQNode>()) {
+    for (auto pair :
+         {std::make_pair(eq->a, eq->b), std::make_pair(eq->b, eq->a)}) {
+      const auto *div = pair.first.as<DivNode>();
+      if (div && div->a.as<VarNode>() && div->a.dtype().is_uint() &&
+          is_zero(pair.second)) {
+        auto divisor = tl::FiniteWidthInteger::Literal(div->b);
+        if (divisor && *divisor > 0) {
+          BindDistConstraint(
+              analyzer,
+              div->a <
+                  make_const(div->a.dtype(), static_cast<uint64_t>(*divisor)),
+              negate);
+          return;
+        }
+      }
+    }
+  }
+  PrimExpr a, b;
+  enum { LT, LE, GT, GE, EQ, OTHER } relation = OTHER;
+#define TL_DIST_CONSTRAINT(Prefix, Kind)                                       \
+  if (const auto *op = condition.as<Prefix##Node>()) {                         \
+    a = op->a;                                                                 \
+    b = op->b;                                                                 \
+    relation = Kind;                                                           \
+  }
+  TL_DIST_CONSTRAINT(LT, LT)
+  TL_DIST_CONSTRAINT(LE, LE)
+  TL_DIST_CONSTRAINT(GT, GT)
+  TL_DIST_CONSTRAINT(GE, GE)
+  TL_DIST_CONSTRAINT(EQ, EQ)
+#undef TL_DIST_CONSTRAINT
+  if (relation == OTHER)
+    return;
+  if (!a.as<VarNode>() && b.as<VarNode>()) {
+    std::swap(a, b);
+    relation = relation == LT   ? GT
+               : relation == LE ? GE
+               : relation == GT ? LT
+               : relation == GE ? LE
+                                : EQ;
+  }
+  const auto *var = a.as<VarNode>();
+  auto literal = tl::FiniteWidthInteger::Literal(b);
+  if (!var || !literal || (negate && relation == EQ))
+    return;
+  if (negate)
+    relation = relation == LT   ? GE
+               : relation == LE ? GT
+               : relation == GT ? LE
+                                : LT;
+  tl::FiniteWidthInteger facts(analyzer);
+  auto bounds = facts.Analyze(a).range;
+  auto value = *literal;
+  if (relation == LT || relation == LE || relation == EQ)
+    bounds.hi = std::min(bounds.hi, value - (relation == LT));
+  if (relation == GT || relation == GE || relation == EQ)
+    bounds.lo = std::max(bounds.lo, value + (relation == GT));
+  if (bounds.lo > bounds.hi || bounds.lo > INT64_MAX || bounds.hi < INT64_MIN)
+    return;
+  analyzer->const_int_bound.Update(
+      tvm::ffi::GetRef<Var>(var),
+      arith::ConstIntBound(
+          static_cast<int64_t>(
+              std::max(bounds.lo, tl::FiniteWidthInteger::Wide(INT64_MIN))),
+          static_cast<int64_t>(
+              std::min(bounds.hi, tl::FiniteWidthInteger::Wide(INT64_MAX)))),
+      /*allow_override=*/true);
 }
+} // namespace
 
-bool CodeGenTileLangSunMMIO::CanProveRegionAlignment(const PrimExpr &min,
-                                                     int64_t extent) const {
-  if (extent <= 0)
-    return false;
-  arith::Analyzer analyzer;
-  if (dist_rank_domain_)
-    analyzer.Bind(
-        dist_rank_domain_->first,
-        Range::FromMinExtent(make_zero(dist_rank_domain_->first.dtype()),
-                             make_const(dist_rank_domain_->first.dtype(),
-                                        dist_rank_domain_->second)));
-  tl::FiniteWidthInteger facts(&analyzer, extent, &dist_let_bindings_);
-  return facts.ProvesMultiple(min);
-}
-
-SunMMIOValue
-CodeGenTileLangSunMMIO::EmitRegionPartitionIndex(const PrimExpr &min,
-                                                 int64_t extent) {
+SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionPartitionIndex(
+    const PrimExpr &min, int64_t extent, const std::string &context) {
   ICHECK_GT(extent, 0);
-  ICHECK(CanProveRegionAlignment(min, extent))
-      << "SunMMIO dist region start must be provably aligned to region extent "
-      << extent << " for exact partition addressing: " << min;
   arith::Analyzer analyzer;
   if (dist_rank_domain_)
     analyzer.Bind(
@@ -849,8 +904,14 @@ CodeGenTileLangSunMMIO::EmitRegionPartitionIndex(const PrimExpr &min,
         Range::FromMinExtent(make_zero(dist_rank_domain_->first.dtype()),
                              make_const(dist_rank_domain_->first.dtype(),
                                         dist_rank_domain_->second)));
-  tl::FiniteWidthInteger facts(&analyzer, 1, &dist_let_bindings_);
+  for (const auto &condition : dist_constraints_)
+    BindDistConstraint(&analyzer, condition);
+  tl::FiniteWidthInteger facts(&analyzer, extent, &dist_let_bindings_);
   auto value = facts.Analyze(min);
+  ICHECK(facts.ProvesMultiple(value))
+      << (context.empty() ? "SunMMIO dist region start" : context)
+      << " must be provably aligned to region extent " << extent
+      << " for exact partition addressing: " << min;
   ICHECK(value.valid &&
          value.range.hi / extent <= (tl::FiniteWidthInteger::Wide(1) << 63) - 1)
       << "SunMMIO region index cannot be represented without loss";
@@ -877,7 +938,6 @@ CodeGenTileLangSunMMIO::EmitRegionPartitionIndex(const PrimExpr &min,
 }
 
 SunMMIOValue CodeGenTileLangSunMMIO::EmitDistRegion(const PrimExpr &expr) {
-  CheckDistRegionAlignment(tl::NormalizeToBufferRegion(expr));
   return EmitRegionCall(expr);
 }
 

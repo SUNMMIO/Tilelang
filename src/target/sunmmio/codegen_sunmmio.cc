@@ -1170,10 +1170,15 @@ void CodeGenTileLangSunMMIO::EmitIf(const tir::IfThenElseNode *op) {
   }
   AppendDistCaptureLiveOut(op, &local_live_out_values);
   builder_->BeginIf(cond, local_live_out_values);
+  size_t mark = dist_constraints_.size();
+  dist_constraints_.push_back(op->condition);
   VisitStmtTracked(op->then_case);
+  dist_constraints_.resize(mark);
   if (op->else_case.defined()) {
     builder_->BeginElse();
+    dist_constraints_.push_back(Not(op->condition));
     VisitStmtTracked(op->else_case.value());
+    dist_constraints_.resize(mark);
   }
   builder_->EndIf();
 }
@@ -2367,17 +2372,15 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
                            << region->buffer->name
                            << " has non-positive region extent at dim "
                            << extents.size();
-      // Partition indices count whole regions. Flooring an unaligned start
-      // silently changes the address, even when optional region checks are off.
-      ICHECK(CanProveRegionAlignment(range->min, extent))
-          << "Sunmmio copy " << copy_operand << " buffer "
-          << region->buffer->name << " region min at dim " << extents.size()
-          << " must be provably aligned to region extent " << extent
-          << ", but got min=" << range->min;
     }
     MarkVisitedExprRoot(range->extent);
     extents.push_back(extent);
-    mins.push_back(EmitRegionPartitionIndex(range->min, extent));
+    std::string context;
+    if (copy_operand)
+      context = "Sunmmio copy " + std::string(copy_operand) + " buffer " +
+                std::string(region->buffer->name) + " region min at dim " +
+                std::to_string(extents.size() - 1);
+    mins.push_back(EmitRegionPartitionIndex(range->min, extent, context));
   }
   SunMMIOType ret_ty = MapType(region_expr.dtype());
   std::string result_name = region_expr.dtype().is_void() ? "" : NewValueName();
