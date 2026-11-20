@@ -22,7 +22,7 @@ def guarded_partition_kernel(use="then", world_size: int = 1):
             dst = T.alloc_shared((1, 32), T.int32)
             s = T.dist.signal(kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
             T.fill(src, 1)
-            if T.truncdiv(n, T.uint64(4)) == 0 or use == "else":
+            if T.truncdiv(n, T.uint64(4)) == 0 or use == "unguarded":
                 T.dist.put(src[n : n + 1, :], dst, (rank_id + 1) % world_size, signal=s, submit=True)
             if use == "after":
                 T.dist.put(src[n : n + 1, :], dst, (rank_id + 1) % world_size, signal=s, submit=True)
@@ -396,7 +396,7 @@ def test_partition_intersects_existing_bound(tmp_path, nested):
     generate(rank_partition_kernel, tmp_path, nested=nested)
 
 
-@pytest.mark.parametrize("use", ["else", "after"])
+@pytest.mark.parametrize("use", ["unguarded", "after"])
 def test_branch_bound_does_not_escape(tmp_path, use):
     with pytest.raises(tvm.error.InternalError, match="cannot be represented without loss"):
         generate(guarded_partition_kernel, tmp_path, use=use)

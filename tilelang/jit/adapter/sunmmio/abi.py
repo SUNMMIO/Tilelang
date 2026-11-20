@@ -51,6 +51,10 @@ class SunmmioKernelABI:
     device_param_dtypes: tuple[str, ...]
     runtime_scalars: tuple[SunmmioRuntimeScalar, ...]
 
+    # Legacy caches have no public type metadata and require all public slots.
+    public_param_dtypes: tuple[str, ...] = ()
+    rank_id_index: int | None = None
+
     def __post_init__(self) -> None:
         if len(self.public_param_names) != self.public_arg_count:
             raise ValueError(
@@ -64,7 +68,19 @@ class SunmmioKernelABI:
         if overlap:
             raise ValueError(f"Sunmmio ABI public and scalar names collide: {sorted(overlap)}.")
         known = set(self.public_param_names) | set(scalar_names)
-        if len(self.device_param_names) != self.full_arg_count or set(self.device_param_names) != known:
+        required = set(known)
+        if self.public_param_dtypes:
+            if len(self.public_param_dtypes) != self.public_arg_count:
+                raise ValueError("Sunmmio ABI public dtype count does not match public signature")
+            required = set(scalar_names) | {
+                name for name, dtype in zip(self.public_param_names, self.public_param_dtypes) if dtype == "handle"
+            }
+        if self.rank_id_index is not None:
+            if not 0 <= self.rank_id_index < self.public_arg_count:
+                raise ValueError("Invalid Sunmmio RankId parameter index")
+            required.add(self.public_param_names[self.rank_id_index])
+        device = set(self.device_param_names)
+        if len(device) != len(self.device_param_names) or not required <= device <= known:
             raise ValueError(
                 f"Sunmmio device param names {self.device_param_names} are not a permutation of "
                 f"public + scalar names {tuple(sorted(known))}."
@@ -73,6 +89,21 @@ class SunmmioKernelABI:
             raise ValueError(
                 f"Sunmmio ABI has {len(self.device_param_dtypes)} device param dtypes but {len(self.device_param_names)} device params."
             )
+
+        types = dict(zip(self.public_param_names, self.public_param_dtypes))
+        for name, dtype in zip(self.device_param_names, self.device_param_dtypes):
+            if name in types and types[name] != dtype:
+                raise ValueError(f"Sunmmio device dtype for {name} differs from its public dtype")
+            if name in scalar_names and dtype == "handle":
+                raise ValueError(f"Sunmmio hidden scalar {name} cannot be a handle")
+        for scalar in self.runtime_scalars:
+            if scalar.is_bound and (
+                not 0 <= scalar.source_param_index < self.public_arg_count
+                or scalar.source_dim < 0
+                or scalar.source_kind not in ("shape", "stride")
+                or (self.public_param_dtypes and self.public_param_dtypes[scalar.source_param_index] != "handle")
+            ):
+                raise ValueError(f"Invalid public tensor binding for Sunmmio hidden scalar {scalar.name}")
 
     @classmethod
     def from_modules(
@@ -95,11 +126,28 @@ class SunmmioKernelABI:
         public_signature = _read_public_signature(prim_func, params)
         device_signature = _read_device_signature(device_mod)
 
+        rank_index = (
+            int(prim_func.attrs["tl.dist.rank_id_param_index"])
+            if prim_func.attrs and "tl.dist.rank_id_param_index" in prim_func.attrs
+            else None
+        )
+        if rank_index is not None:
+            device_rank = device_signature.rank_id_index
+            if (
+                not 0 <= rank_index < public_signature.arg_count
+                or device_rank is None
+                or not 0 <= device_rank < len(device_signature.param_names)
+                or public_signature.param_names[rank_index] != device_signature.param_names[device_rank]
+            ):
+                raise ValueError("Sunmmio RankId differs between public and device signatures")
         public_name_set = set(public_signature.param_names)
         runtime_scalar_names = tuple(name for name in device_signature.param_names if name not in public_name_set)
         host_launch = None
         if runtime_scalar_names:
             host_launch = _read_host_launch(host_mod, device_signature.kernel_name, len(device_signature.param_names))
+            for i, name in enumerate(device_signature.param_names):
+                if name in runtime_scalar_names and str(host_launch.arg_exprs[i].dtype) != device_signature.param_dtypes[i]:
+                    raise ValueError(f"Sunmmio hidden scalar {name} differs in host and device dtype")
 
         symbol_sources = _read_symbol_sources(prim_func, public_signature.param_names, public_signature.arg_count)
         runtime_scalars = _build_runtime_scalars(runtime_scalar_names, device_signature.param_names, host_launch, symbol_sources)
@@ -108,6 +156,8 @@ class SunmmioKernelABI:
             kernel_name=device_signature.kernel_name,
             public_arg_count=public_signature.arg_count,
             public_param_names=public_signature.param_names,
+            public_param_dtypes=tuple(str(param.dtype) for param in prim_func.params[: public_signature.arg_count]),
+            rank_id_index=rank_index,
             device_param_names=device_signature.param_names,
             runtime_scalars=tuple(runtime_scalars),
             device_param_dtypes=device_signature.param_dtypes,
@@ -140,6 +190,8 @@ class SunmmioKernelABI:
             kernel_name=str(data["kernel_name"]),
             public_arg_count=int(data["public_arg_count"]),
             public_param_names=tuple(str(name) for name in data["public_param_names"]),
+            public_param_dtypes=tuple(str(t) for t in data.get("public_param_dtypes", ())),
+            rank_id_index=data.get("rank_id_index"),
             device_param_names=tuple(str(name) for name in data["device_param_names"]),
             runtime_scalars=runtime_scalars,
             device_param_dtypes=tuple(str(dtype) for dtype in data["device_param_dtypes"]),
@@ -150,6 +202,8 @@ class SunmmioKernelABI:
             "kernel_name": self.kernel_name,
             "public_arg_count": self.public_arg_count,
             "public_param_names": list(self.public_param_names),
+            "public_param_dtypes": list(self.public_param_dtypes),
+            "rank_id_index": self.rank_id_index,
             "device_param_names": list(self.device_param_names),
             "device_param_dtypes": list(self.device_param_dtypes),
             "runtime_scalars": [
@@ -237,6 +291,7 @@ class _DeviceSignature:
     kernel_name: str
     param_names: tuple[str, ...]
     param_dtypes: tuple[str, ...]
+    rank_id_index: int | None
 
 
 @dataclass(frozen=True)
@@ -294,7 +349,12 @@ def _read_device_signature(mod: tvm.IRModule | None) -> _DeviceSignature:
             raise ValueError(f"Unsupported Sunmmio device ABI param at index {index}: {param!r}.")
         param_names.append(param.name)
         param_dtypes.append(str(param.dtype))
-    return _DeviceSignature(kernel_name=kernel_name, param_names=tuple(param_names), param_dtypes=tuple(param_dtypes))
+    return _DeviceSignature(
+        kernel_name=kernel_name,
+        param_names=tuple(param_names),
+        param_dtypes=tuple(param_dtypes),
+        rank_id_index=int(device_func.attrs["tl.dist.rank_id_param_index"]) if "tl.dist.rank_id_param_index" in device_func.attrs else None,
+    )
 
 
 def _read_host_launch(host_mod: tvm.IRModule | None, kernel_name: str, expected_arg_count: int) -> _HostLaunch:

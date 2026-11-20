@@ -192,6 +192,7 @@ ForFrame NormalizedFor(PrimExpr start, PrimExpr stop, PrimExpr step,
   PrimExpr count;
   Optional<PrimExpr> unroll_guard;
   std::optional<Wide> maximum_count;
+  bool use_signed_counter = false;
   if (a_value && b_value && step_value) {
     Wide distance = reverse ? *a_value - *b_value : *b_value - *a_value;
     Wide trips =
@@ -207,8 +208,16 @@ ForFrame NormalizedFor(PrimExpr start, PrimExpr stop, PrimExpr step,
       auto mask = make_const(
           signed_type,
           static_cast<int64_t>(-(Wide(1) << (bounds_type.bits() - 1))));
-      compare_a = bitwise_xor(cast(signed_type, a), mask);
-      compare_b = bitwise_xor(cast(signed_type, b), mask);
+      auto ordered_bits = [&](PrimExpr operand, std::optional<Wide> literal) {
+        if (literal)
+          return make_const(
+              signed_type,
+              static_cast<int64_t>(*literal -
+                                   (Wide(1) << (bounds_type.bits() - 1))));
+        return bitwise_xor(cast(signed_type, operand), mask);
+      };
+      compare_a = ordered_bits(a, a_value);
+      compare_b = ordered_bits(b, b_value);
     }
     PrimExpr ordered = reverse ? compare_a > compare_b : compare_a < compare_b;
     auto stable = [](const PrimExpr &expr) {
@@ -259,6 +268,30 @@ ForFrame NormalizedFor(PrimExpr start, PrimExpr stop, PrimExpr step,
         }
       }
     } else {
+      // Prove the trip bound on the original typed endpoints. The runtime
+      // difference may require unsigned 64-bit arithmetic even when the
+      // number of iterations is known to fit a signed index.
+      arith::Analyzer analyzer;
+      FiniteWidthInteger facts(&analyzer);
+      auto lower = facts.Analyze(ResolveLoopAlias(reverse ? stop : start));
+      auto upper = facts.Analyze(ResolveLoopAlias(reverse ? start : stop));
+      if (lower.valid && upper.valid) {
+        Wide max_distance = std::max(Wide(0), upper.range.hi - lower.range.lo);
+        // Dynamic steps execute under the positive-entry assertion below.
+        Wide min_step = magnitude;
+        if (!step_value) {
+          auto stride = facts.Analyze(ResolveLoopAlias(step));
+          min_step =
+              stride.valid ? std::max(Wide(1), stride.range.lo) : Wide(1);
+        }
+        maximum_count =
+            max_distance / min_step + (max_distance % min_step != 0);
+        // A generic uint64 distance loses the relation between its two
+        // endpoints in the backend analyzer. Carry this proof through the
+        // counter dtype rather than asking the backend to rediscover it.
+        use_signed_counter =
+            bounds_type == DataType::UInt(64) && *maximum_count <= INT64_MAX;
+      }
       // Clamp the endpoint before subtraction. Select only consumes immutable
       // entry snapshots, so evaluating its operands eagerly is safe.
       PrimExpr high = reverse ? cast(work_type, a) : cast(work_type, b);
@@ -274,9 +307,10 @@ ForFrame NormalizedFor(PrimExpr start, PrimExpr stop, PrimExpr step,
     }
   }
   // Use the source IV directly only when the already ordered count fits.
-  bool native_unit = (!stepped && bounds_type.is_uint()) ||
-                     (signed_unit && maximum_count &&
-                      *maximum_count < (Wide(1) << (iv_type.bits() - 1)));
+  bool native_unit =
+      (!stepped && bounds_type.is_uint() && !use_signed_counter) ||
+      (signed_unit && maximum_count &&
+       *maximum_count < (Wide(1) << (iv_type.bits() - 1)));
   PrimExpr native_min = a;
   PrimExpr native_extent = cast(iv_type, count);
   if (native_unit && a_value && *a_value == 0) {

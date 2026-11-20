@@ -823,25 +823,34 @@ void BindIntegerConstraint(arith::Analyzer *analyzer, PrimExpr condition,
     BindIntegerConstraint(analyzer, op->b);
     return;
   }
-  // For unsigned integers, nonzero supplies a positive lower bound.
-  if (const auto *ne = condition.as<NENode>();
-      ne && !negate && ne->a.dtype().is_uint() && is_zero(ne->b)) {
-    BindIntegerConstraint(analyzer, ne->a > ne->b);
+  if (const auto *ne = condition.as<NENode>()) {
+    // Reuse exactly the same fact for the false branch of != as the
+    // true branch of == (and vice versa).
+    BindIntegerConstraint(analyzer, EQ(ne->a, ne->b), !negate);
     return;
   }
   if (const auto *eq = condition.as<EQNode>()) {
     for (auto pair :
          {std::make_pair(eq->a, eq->b), std::make_pair(eq->b, eq->a)}) {
-      const auto *div = pair.first.as<DivNode>();
-      if (div && div->a.as<VarNode>() && div->a.dtype().is_uint() &&
-          is_zero(pair.second)) {
-        auto divisor = tl::FiniteWidthInteger::Literal(div->b);
+      if (!is_zero(pair.second) || !pair.first.dtype().is_uint())
+        continue;
+      if (negate && pair.first.as<VarNode>()) {
+        BindIntegerConstraint(analyzer, pair.first > pair.second);
+        return;
+      }
+      PrimExpr numerator, denominator;
+      if (const auto *d = pair.first.as<DivNode>()) {
+        numerator = d->a;
+        denominator = d->b;
+      } else if (const auto *d = pair.first.as<FloorDivNode>()) {
+        numerator = d->a;
+        denominator = d->b;
+      } else
+        continue;
+      if (numerator.as<VarNode>()) {
+        auto divisor = tl::FiniteWidthInteger::Literal(denominator);
         if (divisor && *divisor > 0) {
-          BindIntegerConstraint(
-              analyzer,
-              div->a <
-                  make_const(div->a.dtype(), static_cast<uint64_t>(*divisor)),
-              negate);
+          BindIntegerConstraint(analyzer, numerator < denominator, negate);
           return;
         }
       }
