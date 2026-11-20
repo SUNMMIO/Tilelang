@@ -231,9 +231,11 @@ inline bool BufferRegionsMayOverlap(const Buffer &lhs_buffer,
 // write changes memory used by an index, its old BufferLoad expression cannot
 // be interpreted using the new value. Forget only the affected dimensions;
 // immutable indices and disjoint index-storage writes retain their precision.
-inline Region
-WidenRegionForIndexWrites(const Buffer &buffer, const Region &region,
-                          const std::vector<BufferRegion> &writes) {
+template <typename Overlaps>
+inline Region WidenRegionForIndexWrites(const Buffer &buffer,
+                                        const Region &region,
+                                        const std::vector<BufferRegion> &writes,
+                                        Overlaps overlaps) {
   if (writes.empty()) {
     return region;
   }
@@ -251,8 +253,7 @@ WidenRegionForIndexWrites(const Buffer &buffer, const Region &region,
         read.push_back(Range::FromMinExtent(index, 1));
       }
       for (const BufferRegion &write : writes) {
-        if (BufferRegionsMayOverlap(load->buffer, read, write->buffer,
-                                    write->region)) {
+        if (overlaps(load->buffer, read, write->buffer, write->region)) {
           changed = true;
           break;
         }

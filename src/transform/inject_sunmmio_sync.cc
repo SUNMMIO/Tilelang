@@ -48,8 +48,8 @@
 #include "../op/comm.h"
 #include "../op/dist_comm.h"
 #include "../op/utils.h"
+#include "../target/sunmmio_access_range.h"
 #include "../target/sunmmio_utils.h"
-#include "common/attr.h"
 #include "dist_transform_utils.h"
 
 namespace tvm {
@@ -455,9 +455,90 @@ struct UnitAccess {
   SunmmioSyncUnits units{kSunmmioSyncNone};
 };
 
+// For small integer indices, constant translations stay disjoint modulo
+// 2^bits even when neither endpoint has a useful absolute interval.
+// Pending local.var reads are widened when their index storage is written.
+static bool DisjointTranslatedSlots(const Range &lhs, const Range &rhs) {
+  auto dtype = lhs->min.dtype();
+  auto a = FiniteWidthInteger::Literal(lhs->extent),
+       b = FiniteWidthInteger::Literal(rhs->extent);
+  if (dtype != rhs->min.dtype() || !dtype.is_scalar() || dtype.bits() > 32 ||
+      !a || !b || *a <= 0 || *b <= 0)
+    return false;
+  uint64_t period = uint64_t{1} << dtype.bits();
+  struct Slot {
+    PrimExpr base;
+    uint64_t scale, offset;
+  };
+  auto slot = [&](PrimExpr expr) {
+    uint64_t scale = 1, offset = 0;
+    while (expr.dtype() == dtype) {
+      if (auto *add = expr.as<AddNode>()) {
+        if (auto n = FiniteWidthInteger::Literal(add->b)) {
+          offset += scale * static_cast<uint64_t>(*n);
+          expr = add->a;
+          continue;
+        }
+        if (auto n = FiniteWidthInteger::Literal(add->a)) {
+          offset += scale * static_cast<uint64_t>(*n);
+          expr = add->b;
+          continue;
+        }
+      }
+      if (auto *sub = expr.as<SubNode>())
+        if (auto n = FiniteWidthInteger::Literal(sub->b)) {
+          offset -= scale * static_cast<uint64_t>(*n);
+          expr = sub->a;
+          continue;
+        }
+      if (auto *mul = expr.as<MulNode>())
+        if (auto n = FiniteWidthInteger::Literal(mul->b)) {
+          scale *= static_cast<uint64_t>(*n);
+          expr = mul->a;
+          continue;
+        }
+      break;
+    }
+    return Slot{expr, scale % period, offset % period};
+  };
+  auto x = slot(lhs->min), y = slot(rhs->min);
+  const auto *load = x.base.as<BufferLoadNode>();
+  if (!(x.base.as<VarNode>() ||
+        (load && load->buffer.scope() == "local.var" &&
+         std::all_of(
+             load->indices.begin(), load->indices.end(),
+             [](const PrimExpr &e) { return e.as<IntImmNode>() != nullptr; }))))
+    return false;
+  if (x.scale != y.scale || !StructuralEqual()(x.base, y.base))
+    return false;
+  uint64_t delta = (y.offset - x.offset) % period;
+  return delta >= *a && period - delta >= *b;
+}
+
 bool AccessRegionsMayOverlap(const UnitAccess &lhs, const UnitAccess &rhs) {
-  return dist_transform::BufferRegionsMayOverlap(lhs.buffer, lhs.region,
-                                                 rhs.buffer, rhs.region);
+  if (!lhs.buffer->data.same_as(rhs.buffer->data))
+    return false;
+  if (!lhs.buffer.same_as(rhs.buffer) &&
+      !StructuralEqual()(lhs.buffer, rhs.buffer))
+    return true;
+  if (lhs.region.size() != rhs.region.size())
+    return true;
+  arith::Analyzer analyzer;
+  FiniteWidthInteger facts(&analyzer);
+  for (size_t i = 0; i < lhs.region.size(); ++i) {
+    if (DisjointTranslatedSlots(lhs.region[i], rhs.region[i]))
+      return false;
+    auto a =
+        AnalyzeSunmmioAccessRange(&facts, lhs.region[i]->min,
+                                  lhs.region[i]->extent, lhs.buffer->shape[i]);
+    auto b =
+        AnalyzeSunmmioAccessRange(&facts, rhs.region[i]->min,
+                                  rhs.region[i]->extent, rhs.buffer->shape[i]);
+    if (!dist_transform::RegionsMayOverlap({a.envelope}, {b.envelope}) ||
+        !dist_transform::RegionsMayOverlap({a.current}, {b.current}))
+      return false;
+  }
+  return true;
 }
 
 bool NeedsUnitSync(const UnitAccess &producer, const UnitAccess &consumer) {
@@ -483,7 +564,35 @@ public:
       : layouts_(func->GetAttr<Map<Buffer, Layout>>(attr::kLayoutMap)
                      .value_or(Map<Buffer, Layout>())),
         config_(GetSunmmioTileProcessorConfig(
-            func->GetAttr<Target>(tvm::attr::kTarget))) {}
+            func->GetAttr<Target>(tvm::attr::kTarget))) {
+    class Footprints : public StmtVisitor {
+    public:
+      explicit Footprints(InjectUnitSyncRewriter *owner) : owner_(owner) {}
+
+    private:
+      void VisitStmt_(const ForNode *op) final {
+        ctx_.Enter(op);
+        VisitStmt(op->body);
+        ctx_.Leave(op);
+      }
+      void VisitStmt_(const LetStmtNode *op) final {
+        if (SideEffect(op->value) <= CallEffectKind::kPure)
+          ctx_.definitions[op->var.get()] = op->value;
+        VisitStmt(op->body);
+        ctx_.definitions.erase(op->var.get());
+      }
+      void VisitStmt_(const BufferStoreNode *op) final {
+        owner_->store_regions_.emplace(
+            op, GetSunmmioScalarTileAccessRegion(
+                    op->buffer, op->indices, owner_->layouts_, owner_->config_,
+                    &ctx_.analyzer, &ctx_.definitions,
+                    ctx_.LogicalShape(op->indices)));
+      }
+      SunmmioAccessContext ctx_;
+      InjectUnitSyncRewriter *owner_;
+    } footprints(this);
+    footprints(func->body);
+  }
   Stmt operator()(Stmt body) {
     Stmt rewritten = VisitStmt(body);
     SunmmioSyncUnits pending_links = PendingUnits() & kLinkUnits;
@@ -605,18 +714,38 @@ private:
     return info;
   }
 
+  static Optional<Range> SafeLoopDomain(const LoopInfo &info) {
+    if (!info.var.defined() || HasUnknownLoopIndex(info.domain->min, info) ||
+        HasUnknownLoopIndex(info.domain->extent, info))
+      return std::nullopt;
+    arith::Analyzer analyzer;
+    FiniteWidthInteger facts(&analyzer);
+    auto start = facts.Analyze(info.domain->min),
+         extent = facts.Analyze(info.domain->extent);
+    auto type = facts.Analyze(info.var);
+    auto hi = start.range.hi + extent.range.hi - 1;
+    auto span = hi - start.range.lo + 1;
+    if (!start.valid || !extent.valid || extent.range.hi <= 0 ||
+        start.range.lo < type.range.lo || hi > type.range.hi ||
+        start.range.lo <= INT64_MIN || hi >= INT64_MAX || span > INT64_MAX)
+      return std::nullopt;
+    return Range::FromMinExtent(I64Imm(static_cast<int64_t>(start.range.lo)),
+                                I64Imm(static_cast<int64_t>(span)));
+  }
+
   static UnitAccess CoverLoopAccess(UnitAccess access, const LoopInfo &info) {
     Region region;
     std::unordered_map<const VarNode *, arith::IntSet> domains;
+    auto domain = SafeLoopDomain(info);
+    arith::Analyzer analyzer;
     if (info.var.defined()) {
-      const auto *step = info.step.as<IntImmNode>();
-      bool unknown_domain = HasUnknownLoopIndex(info.domain->min, info) ||
-                            HasUnknownLoopIndex(info.domain->extent, info) ||
-                            !step || step->value <= 0;
       domains.emplace(info.var.get(),
-                      unknown_domain ? arith::IntSet::Everything()
-                                     : arith::IntSet::FromRange(info.domain));
+                      domain ? arith::IntSet::FromRange(domain.value())
+                             : arith::IntSet::Everything());
+      if (domain)
+        analyzer.Bind(info.var, domain.value());
     }
+    FiniteWidthInteger facts(&analyzer);
     for (size_t dim = 0; dim < access.region.size(); ++dim) {
       PrimExpr min = ResolveLoopLets(access.region[dim]->min, info);
       PrimExpr extent = ResolveLoopLets(access.region[dim]->extent, info);
@@ -626,7 +755,11 @@ private:
       region.push_back(
           HasUnknownLoopIndex(min, info) || HasUnknownLoopIndex(extent, info)
               ? full
-              : arith::EvalSet(Range::FromMinExtent(min, extent), domains)
+              : arith::EvalSet(
+                    AnalyzeSunmmioAccessRange(&facts, min, extent,
+                                              access.buffer->shape[dim])
+                        .current,
+                    domains)
                     .CoverRange(full));
     }
     access.region = std::move(region);
@@ -659,12 +792,13 @@ private:
     Map<Var, PrimExpr> later_iteration;
     if (info.var.defined()) {
       const auto *step = info.step.as<IntImmNode>();
-      if (step && step->value > 0) {
+      auto domain = SafeLoopDomain(info);
+      if (domain && step && step->value > 0) {
         Var distance("sync_iteration_distance", info.var.dtype());
-        analyzer.Bind(info.var, info.domain);
+        analyzer.Bind(info.var, domain.value());
         analyzer.Bind(distance,
                       Range::FromMinExtent(make_const(distance.dtype(), 1),
-                                           info.domain->extent));
+                                           domain.value()->extent));
         later_iteration.Set(info.var, info.var + info.step * distance);
       }
     }
@@ -684,8 +818,15 @@ private:
       }
       cmin = Substitute(cmin, later_iteration);
       cextent = Substitute(cextent, later_iteration);
-      if (analyzer.CanProve(pmin + pextent <= cmin) ||
-          analyzer.CanProve(cmin + cextent <= pmin)) {
+      FiniteWidthInteger facts(&analyzer);
+      auto p = AnalyzeSunmmioAccessRange(&facts, pmin, pextent,
+                                         producer.buffer->shape[dim])
+                   .current;
+      auto c = AnalyzeSunmmioAccessRange(&facts, cmin, cextent,
+                                         consumer.buffer->shape[dim])
+                   .current;
+      if (analyzer.CanProve(p->min + p->extent <= c->min) ||
+          analyzer.CanProve(c->min + c->extent <= p->min)) {
         return false;
       }
     }
@@ -879,9 +1020,11 @@ private:
   Accesses CollectLoopAccesses(const Stmt &body) const {
     class Collector : public StmtExprVisitor {
     public:
-      Collector(const Map<Buffer, Layout> &layouts,
-                const SunmmioTileProcessorConfig &config)
-          : layouts_(layouts), config_(config) {}
+      Collector(
+          const Map<Buffer, Layout> &layouts,
+          const SunmmioTileProcessorConfig &config,
+          const std::unordered_map<const BufferStoreNode *, Region> &regions)
+          : layouts_(layouts), config_(config), regions_(regions) {}
       Accesses accesses;
 
     private:
@@ -901,8 +1044,7 @@ private:
 
       void VisitStmt_(const BufferStoreNode *op) final {
         if (IsRsramBuffer(op->buffer)) {
-          Region region = GetSunmmioScalarTileAccessRegion(
-              op->buffer, op->indices, layouts_, config_);
+          Region region = regions_.at(op);
           accesses.push_back({op->buffer, std::move(region), true,
                               AccessProducerKind::kTileStore,
                               kTileMemoryUnits});
@@ -945,7 +1087,8 @@ private:
       }
       const Map<Buffer, Layout> &layouts_;
       const SunmmioTileProcessorConfig &config_;
-    } collector(layouts_, config_);
+      const std::unordered_map<const BufferStoreNode *, Region> &regions_;
+    } collector(layouts_, config_, store_regions_);
     collector(body);
     return std::move(collector.accesses);
   }
@@ -979,8 +1122,11 @@ private:
     SunmmioSyncUnits units = kSunmmioSyncNone;
     if (info.var.defined()) {
       arith::Analyzer analyzer;
-      if (analyzer.CanProve(info.step > 0) &&
-          analyzer.CanProve(info.domain->extent <= info.step)) {
+      FiniteWidthInteger facts(&analyzer);
+      auto step = facts.Analyze(info.step),
+           extent = facts.Analyze(info.domain->extent);
+      if (step.valid && extent.valid && step.range.lo > 0 &&
+          extent.range.hi <= step.range.lo) {
         return units;
       }
     }
@@ -1022,8 +1168,8 @@ private:
     SunmmioSyncUnits required = kSunmmioSyncNone;
     for (const UnitAccess &consumer : accesses) {
       for (const UnitAccess &producer : pending_) {
-        if (!AccessRegionsMayOverlap(producer, consumer) ||
-            !NeedsUnitSync(producer, consumer)) {
+        if (!NeedsUnitSync(producer, consumer) ||
+            !AccessRegionsMayOverlap(producer, consumer)) {
           continue;
         }
         required |= producer.units;
@@ -1048,7 +1194,11 @@ private:
   void InvalidatePendingIndices(const std::vector<BufferRegion> &writes) {
     for (UnitAccess &access : pending_) {
       access.region = dist_transform::WidenRegionForIndexWrites(
-          access.buffer, access.region, writes);
+          access.buffer, access.region, writes,
+          [](const Buffer &a, const Region &ar, const Buffer &b,
+             const Region &br) {
+            return AccessRegionsMayOverlap({a, ar}, {b, br});
+          });
     }
   }
 
@@ -1215,8 +1365,7 @@ private:
     if (op->predicate.defined()) {
       CollectTileLoads(op->predicate.value(), &accesses);
     }
-    Region region = GetSunmmioScalarTileAccessRegion(op->buffer, op->indices,
-                                                     layouts_, config_);
+    Region region = store_regions_.at(op);
     if (IsRsramBuffer(op->buffer)) {
       accesses.push_back({op->buffer, region, true,
                           AccessProducerKind::kTileStore, kTileMemoryUnits});
@@ -1390,6 +1539,7 @@ private:
     return RewriteLoop(op->body, nullptr, op);
   }
 
+  std::unordered_map<const BufferStoreNode *, Region> store_regions_;
   Map<Buffer, Layout> layouts_;
   SunmmioTileProcessorConfig config_;
   std::vector<UnitAccess> pending_;

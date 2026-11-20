@@ -458,12 +458,15 @@ tir::Region GetSunmmioScalarTileAccessRegion(
     // modeled, with room for the range endpoints and their difference.
     if (same_iteration && interior_shape.empty() && value.valid &&
         value.range.lo > INT64_MIN / 4 && value.range.hi < INT64_MAX / 4 &&
-        indices.size() == 1) {
+        indices.size() <= 64) {
       PrimExpr start = cast(DataType::Int(64), value.expr);
       same_iteration->push_back(Range::FromMinExtent(
           floordiv(start, IntImm(DataType::Int(64), tile)) *
               IntImm(DataType::Int(64), tile),
           IntImm(DataType::Int(64), tile)));
+    } else if (same_iteration && interior_shape.empty() &&
+               indices.size() <= 64) {
+      same_iteration->push_back(region[dim]);
     }
     // Return only safe numeric envelopes. Passing the original cast expression
     // to IntSet would reintroduce the mathematical-integer simplification bug.

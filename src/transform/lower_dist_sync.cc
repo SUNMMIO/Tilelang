@@ -18,9 +18,8 @@
 #include "../op/builtin.h"
 #include "../op/comm.h"
 #include "../op/utils.h"
-#include "../support/finite_width_integer.h"
+#include "../target/sunmmio_access_range.h"
 #include "../tileview/tileview_planner_common.h"
-#include "common/attr.h"
 #include "dist_transform_utils.h"
 
 namespace tvm {
@@ -72,7 +71,7 @@ BufferRegions CallWriteRegions(const CallNode *call) {
 
 // The flag says whether the source captured by this enqueue still has its
 // recorded symbolic address. The numeric envelope is valid across iterations.
-using Sources = std::unordered_map<const CallNode *, bool>;
+using Sources = std::unordered_map<const CallNode *, uint64_t>;
 
 Sources JoinSources(Sources lhs, const Sources &rhs) {
   for (auto [call, current] : rhs) {
@@ -129,12 +128,23 @@ public:
   const BufferRegions &Loop(const Stmt &body) {
     auto [it, fresh] = loops_.try_emplace(body.get());
     if (fresh) {
+      // Preserve dimensions invariant throughout this loop; a leaf that
+      // indexes by this loop (or a nested loop) uses its numeric envelope.
       std::unordered_set<BufferRegion, StructuralHash, StructuralEqual> seen;
       PostOrderVisit(body, [&](const ObjectRef &node) {
-        if (const auto *s = node.as<StmtNode>())
-          for (const auto &region : Leaf(s))
-            if (seen.insert(region).second)
-              it->second.push_back(region);
+        if (auto *stmt = node.as<StmtNode>())
+          for (const auto &w : Leaf(stmt)) {
+            Region region = w->region;
+            auto exact = exact_writes_.find(w.get());
+            if (exact != exact_writes_.end()) {
+              for (size_t i = 0; i < region.size(); ++i)
+                if (!VariesIn(body.get(), exact->second[i]))
+                  region.Set(i, exact->second[i]);
+            }
+            BufferRegion summary(w->buffer, region);
+            if (seen.insert(summary).second)
+              it->second.push_back(summary);
+          }
       });
     }
     return it->second;
@@ -146,12 +156,14 @@ public:
     return false;
   }
   void CrossBackedge(const StmtNode *loop, Sources *sources) const {
-    auto found = varying_sources_.find(loop);
-    if (found == varying_sources_.end())
-      return;
-    for (auto &[call, current] : *sources)
-      if (found->second.count(call))
-        current = false;
+    for (auto &[call, mask] : *sources) {
+      auto found = exact_reads_.find(call);
+      if (found == exact_reads_.end())
+        continue;
+      for (size_t i = 0; i < found->second.size(); ++i)
+        if (VariesIn(loop, found->second[i]))
+          mask &= ~(uint64_t{1} << i);
+    }
   }
   bool Overlaps(const Sources &sources, const BufferRegions &writes,
                 bool at_leaf = false) const {
@@ -161,11 +173,17 @@ public:
         if (!BufferRegionsMayOverlap(src->buffer, src->region, w->buffer,
                                      w->region))
           continue;
-        if (current && at_leaf && exact_reads_.count(call) &&
-            exact_writes_.count(w.get()) &&
-            !BufferRegionsMayOverlap(src->buffer, exact_reads_.at(call),
-                                     w->buffer, exact_writes_.at(w.get())))
-          continue;
+        if (current && exact_reads_.count(call)) {
+          Region read = src->region;
+          for (size_t i = 0; i < read.size(); ++i)
+            if (current & (uint64_t{1} << i))
+              read.Set(i, exact_reads_.at(call)[i]);
+          const Region &write = at_leaf && exact_writes_.count(w.get())
+                                    ? exact_writes_.at(w.get())
+                                    : w->region;
+          if (!BufferRegionsMayOverlap(src->buffer, read, w->buffer, write))
+            continue;
+        }
         return true;
       }
     }
@@ -196,53 +214,45 @@ private:
           shape = layout->GetCoveredShape();
         break;
       }
-    FiniteWidthInteger facts(&analyzer_, 1, &defs_);
+    FiniteWidthInteger facts(&context_.analyzer, 1, &context_.definitions);
     for (size_t i = 0; i < r->region.size(); ++i) {
-      auto start = facts.Analyze(snapshots_(r->region[i]->min));
-      auto extent = facts.Analyze(r->region[i]->extent);
-      auto end = start.range.hi + extent.range.hi;
-      auto size = FiniteWidthInteger::Literal(shape[i]);
-      if (start.valid && extent.valid && size && start.range.lo >= 0 &&
-          extent.range.lo >= 0 && end <= *size && end < INT64_MAX)
-        bounds.push_back(Range::FromMinExtent(
-            IntImm(DataType::Int(64), static_cast<int64_t>(start.range.lo)),
-            IntImm(DataType::Int(64),
-                   static_cast<int64_t>(end - start.range.lo))));
-      else
-        bounds.push_back(Range::FromMinExtent(0, shape[i]));
-      if (current && r->region.size() == 1 && start.valid &&
-          start.range.lo > INT64_MIN / 4 && end < INT64_MAX / 4 &&
-          extent.valid && extent.range.lo > 0 &&
-          extent.range.lo == extent.range.hi)
-        current->push_back(Range::FromMinExtent(
-            cast(DataType::Int(64), start.expr),
-            IntImm(DataType::Int(64), static_cast<int64_t>(extent.range.lo))));
+      auto range =
+          AnalyzeSunmmioAccessRange(&facts, snapshots_(r->region[i]->min),
+                                    r->region[i]->extent, shape[i]);
+      bounds.push_back(range.envelope);
+      if (current && r->region.size() <= 64)
+        current->push_back(range.current);
     }
     return BufferRegion(r->buffer, bounds);
   }
   // Envelope has already expanded pure Let bindings and modeled mutable
   // reads. A loop can change this exact range only if it can rebind one of
   // its symbols. Treat unrecognized (opaque) symbols conservatively.
-  void RecordSource(const CallNode *call, const Region &exact) {
-    if (exact.empty())
-      return;
-    size_t depth = 0;
-    PostOrderVisit(exact[0]->min, [&](const ObjectRef &node) {
-      if (const auto *v = node.as<VarNode>()) {
-        auto it = binding_depth_.find(v);
-        depth = std::max(depth, it == binding_depth_.end() ? loop_stack_.size()
-                                                           : it->second);
-      }
-    });
-    // Exact extents are literals. Ancestors of the binding loop can also
-    // re-enter it, including via continue.
-    for (size_t i = 0; i < depth; ++i)
-      varying_sources_[loop_stack_[i]].insert(call);
-    exact_reads_.emplace(call, exact);
+  bool VariesIn(const StmtNode *body, const Range &range) const {
+    auto it = varying_.find(body);
+    return it != varying_.end() && it->second.count(range.get());
+  }
+  void TrackDependencies(const Region &exact) {
+    for (const Range &range : exact) {
+      size_t depth = 0;
+      auto visit = [&](const ObjectRef &node) {
+        if (auto *v = node.as<VarNode>()) {
+          auto it = binding_depth_.find(v);
+          depth =
+              std::max(depth, it == binding_depth_.end() ? loop_stack_.size()
+                                                         : it->second);
+        }
+      };
+      PostOrderVisit(range->min, visit);
+      PostOrderVisit(range->extent, visit);
+      for (size_t i = 0; i < depth; ++i)
+        varying_[loop_stack_[i]].insert(range.get());
+    }
   }
   void RecordWrite(const StmtNode *stmt, const BufferRegion &region,
                    const Region &exact) {
     leaves_[stmt].push_back(region);
+    TrackDependencies(exact);
     if (!exact.empty())
       exact_writes_.emplace(region.get(), exact);
   }
@@ -252,7 +262,9 @@ private:
         Region exact;
         reads_.emplace(
             call, Envelope(NormalizeToBufferRegion(call->args[0]), &exact));
-        RecordSource(call, exact);
+        TrackDependencies(exact);
+        if (!exact.empty())
+          exact_reads_.emplace(call, exact);
       }
       for (const auto &region : CallWriteRegions(call)) {
         if (!payload_.count(region->buffer->data.get()))
@@ -269,35 +281,19 @@ private:
   void VisitStmt_(const LetStmtNode *op) final {
     binding_depth_[op->var.get()] = loop_stack_.size();
     if (SideEffect(op->value) <= CallEffectKind::kPure)
-      defs_[op->var.get()] = op->value;
+      context_.definitions[op->var.get()] = op->value;
     VisitStmt(op->body);
-    defs_.erase(op->var.get());
+    context_.definitions.erase(op->var.get());
     binding_depth_.erase(op->var.get());
   }
   void VisitStmt_(const ForNode *op) final {
-    FiniteWidthInteger facts(&analyzer_, 1, &defs_);
-    auto lo = facts.Analyze(op->min), count = facts.Analyze(op->extent),
-         type = facts.Analyze(op->loop_var);
-    auto hi = lo.range.hi + count.range.hi - 1;
-    if (lo.valid && count.valid && count.range.hi > 0 &&
-        lo.range.lo >= type.range.lo && hi <= type.range.hi &&
-        lo.range.lo > INT64_MIN && hi < INT64_MAX)
-      analyzer_.const_int_bound.Update(
-          op->loop_var, arith::ConstIntBound(static_cast<int64_t>(lo.range.lo),
-                                             static_cast<int64_t>(hi)));
-    bool scope = op->annotations.count(attr::kTileDomain);
-    tile_depth_ += scope;
-    bool interior =
-        tile_depth_ && op->annotations.count(attr::tile_interior_axis);
-    if (interior)
-      interiors_[op->loop_var.get()] = GetStaticIntValue(op->extent);
-    loop_stack_.push_back(op);
+    context_.Enter(op);
+    loop_stack_.push_back(op->body.get());
     binding_depth_[op->loop_var.get()] = loop_stack_.size();
     VisitNested(op->body);
     binding_depth_.erase(op->loop_var.get());
     loop_stack_.pop_back();
-    interiors_.erase(op->loop_var.get());
-    tile_depth_ -= scope;
+    context_.Leave(op);
   }
   void VisitNested(const Stmt &body) {
     ++depth_;
@@ -310,7 +306,7 @@ private:
       VisitNested(op->else_case.value());
   }
   void VisitStmt_(const WhileNode *op) final {
-    loop_stack_.push_back(op);
+    loop_stack_.push_back(op->body.get());
     VisitNested(op->body);
     loop_stack_.pop_back();
   }
@@ -325,64 +321,30 @@ private:
     }
     if (!payload_.count(data))
       return;
-    std::vector<int64_t> logical;
-    if (tile_depth_) {
-      for (const auto &index : op->indices) {
-        // Only narrow a store whose interior coordinate is a unit-stride
-        // term. Ambiguous expressions conservatively cover the whole buffer.
-        const VarNode *axis = nullptr;
-        bool ambiguous = false;
-        PostOrderVisit(index, [&](const ObjectRef &n) {
-          if (auto *v = n.as<VarNode>(); v && interiors_.count(v)) {
-            ambiguous |= axis != nullptr;
-            axis = v;
-          }
-        });
-        int64_t extent = 0;
-        if (axis) {
-          const auto *add = index.as<AddNode>();
-          bool direct = index.get() == axis ||
-                        (add && (add->a.get() == axis || add->b.get() == axis));
-          if (add && direct) {
-            const PrimExpr &offset = add->a.get() == axis ? add->b : add->a;
-            PostOrderVisit(offset, [&](const ObjectRef &n) {
-              ambiguous |= n.get() == axis;
-            });
-          }
-          extent = (direct && !ambiguous) ? interiors_.at(axis) : -1;
-        }
-        logical.push_back(extent);
-      }
-      if (std::none_of(logical.begin(), logical.end(),
-                       [](int64_t n) { return n != 0; }))
-        logical.assign(op->indices.size(),
-                       -1); // Unknown tile-to-buffer mapping.
-    }
+    auto logical = context_.LogicalShape(op->indices);
     Region exact;
     Array<PrimExpr> indices;
     for (const auto &index : op->indices)
       indices.push_back(snapshots_(index));
-    auto region =
-        GetSunmmioScalarTileAccessRegion(op->buffer, indices, layouts_, config_,
-                                         &analyzer_, &defs_, logical, &exact);
+    auto region = GetSunmmioScalarTileAccessRegion(
+        op->buffer, indices, layouts_, config_, &context_.analyzer,
+        &context_.definitions, logical, &exact);
     RecordWrite(op, BufferRegion(op->buffer, region), exact);
   }
   const Map<Buffer, Layout> &layouts_;
   const SunmmioTileProcessorConfig &config_;
-  int depth_{0}, tile_depth_{0};
-  arith::Analyzer analyzer_;
-  FiniteWidthInteger::Definitions defs_;
+  int depth_{0};
+  SunmmioAccessContext context_;
   std::unordered_set<const VarNode *> payload_, escaped_;
   std::unordered_map<const VarNode *, int> store_count_;
-  std::unordered_map<const VarNode *, int64_t> interiors_;
   std::unordered_map<const StmtNode *, BufferRegions> leaves_, loops_;
   std::unordered_map<const CallNode *, BufferRegion> reads_;
   std::unordered_map<const CallNode *, Region> exact_reads_;
   std::unordered_map<const BufferRegionNode *, Region> exact_writes_;
   std::vector<const StmtNode *> loop_stack_;
   std::unordered_map<const VarNode *, size_t> binding_depth_;
-  std::unordered_map<const StmtNode *, std::unordered_set<const CallNode *>>
-      varying_sources_;
+  std::unordered_map<const StmtNode *, std::unordered_set<const RangeNode *>>
+      varying_;
 };
 
 // Track the implicit per-core send queue across structured control flow.
@@ -570,10 +532,10 @@ private:
     SetState(Join(then_state, else_state));
   }
 
-  void VisitLoop(const StmtNode *loop, const Stmt &body) {
+  void VisitLoop(const Stmt &body) {
     auto widen = [&](State state) {
-      writes_.CrossBackedge(loop, &state.queued_sources);
-      writes_.CrossBackedge(loop, &state.inflight_sources);
+      writes_.CrossBackedge(body.get(), &state.queued_sources);
+      writes_.CrossBackedge(body.get(), &state.inflight_sources);
       return state;
     };
     State incoming = GetState();
@@ -606,7 +568,7 @@ private:
     }
     VisitExpr(op->min);
     VisitExpr(op->extent);
-    VisitLoop(op, op->body);
+    VisitLoop(op->body);
   }
 
   void VisitStmt_(const WhileNode *op) final {
@@ -617,7 +579,7 @@ private:
       channel_in_flight_ = false;
     }
     VisitExpr(op->condition);
-    VisitLoop(op, op->body);
+    VisitLoop(op->body);
   }
 
   void VisitStmt_(const AllocateNode *op) final {
@@ -699,7 +661,7 @@ private:
     }
     if (call->op.same_as(dist_put_())) {
       ICHECK_EQ(call->args.size(), 6U);
-      queued_sources_.emplace(call, true);
+      queued_sources_.emplace(call, UINT64_MAX);
       queue_pending_ = true;
       return;
     }
