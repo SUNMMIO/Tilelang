@@ -123,6 +123,29 @@ def topology_kernel(mode, manual=False, kind=T.dist.SignalKind.SRAM_MEMORY, worl
     return main
 
 
+@T.macro
+def count_in_scope(m):
+    j = T.alloc_var(T.int32, init=0)
+    while j < m:
+        j += 1
+    return T.Cast("int32", j)
+
+
+@tilelang.jit(target="sunmmio")
+def scoped_macro_kernel(world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, rounds: T.int32, m: T.int32, skip: T.int32):
+        with T.Kernel():
+            signal = T.dist.signal(kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
+            total = T.alloc_var(T.int32, init=0)
+            for i in T.serial(rounds):
+                if i != skip:
+                    total += count_in_scope(m)
+                T.dist.wait_signal(signal, expected_delta=T.Cast("uint32", total))
+
+    return main
+
+
 def generate(kernel, tmp_path, world_size=2, **kwargs):
     result = lower_to_device_tir(kernel.get_tir(world_size=world_size, **kwargs))
     source = codegen_sunmmio_suvm_mlir(result.device_mod)
@@ -220,3 +243,18 @@ def test_static_source_filters_drive_expected_and_uniqueness(tmp_path, manual, m
                 assert peers == ([0] if rank in (1, 2) else [])
                 target = 2 if rank == 0 else 0
             assert [x[1] for x in events if x[0] == "wait"] == [0 if manual else target]
+
+
+def test_macro_local_reset_and_outer_lifetime(tmp_path):
+    result, src = generate(scoped_macro_kernel, tmp_path)
+    for rounds in (0, 1, 3):
+        for skip in (0, 1, 3):
+            _, events = trace_suvm_control_flow(result, src, rank_id=0, rounds=rounds, m=2, skip=skip)
+            total = target = 0
+            expected = []
+            for i in range(rounds):
+                if i != skip:
+                    total += 2
+                target += total
+                expected.append(target)
+            assert [e[1] for e in events if e[0] == "wait"] == expected
