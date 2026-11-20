@@ -70,8 +70,8 @@ BufferRegions CallWriteRegions(const CallNode *call) {
   return writes;
 }
 
-// Each descriptor records its source at enqueue. A backedge forgets the
-// same-iteration relation, but keeps the conservative numeric envelope.
+// The flag says whether the source captured by this enqueue still has its
+// recorded symbolic address. The numeric envelope is valid across iterations.
 using Sources = std::unordered_map<const CallNode *, bool>;
 
 Sources JoinSources(Sources lhs, const Sources &rhs) {
@@ -95,8 +95,10 @@ public:
     });
     if (payload_.empty())
       return;
-    for (const auto &param : func->params)
+    for (const auto &param : func->params) {
       escaped_.insert(param.get());
+      binding_depth_[param.get()] = 0;
+    }
     // Only substitute a private, non-escaping scalar with a single store.
     // Its initialization must also dominate the use (see VisitStmt below).
     PostOrderVisit(func->body, [&](const ObjectRef &node) {
@@ -143,18 +145,26 @@ public:
         return true;
     return false;
   }
+  void CrossBackedge(const StmtNode *loop, Sources *sources) const {
+    auto found = varying_sources_.find(loop);
+    if (found == varying_sources_.end())
+      return;
+    for (auto &[call, current] : *sources)
+      if (found->second.count(call))
+        current = false;
+  }
   bool Overlaps(const Sources &sources, const BufferRegions &writes,
-                const BufferStoreNode *store = nullptr) const {
+                bool at_leaf = false) const {
     for (auto [call, current] : sources) {
       const auto &src = reads_.at(call);
       for (const auto &w : writes) {
         if (!BufferRegionsMayOverlap(src->buffer, src->region, w->buffer,
                                      w->region))
           continue;
-        if (current && store && exact_reads_.count(call) &&
-            exact_stores_.count(store) &&
+        if (current && at_leaf && exact_reads_.count(call) &&
+            exact_writes_.count(w.get()) &&
             !BufferRegionsMayOverlap(src->buffer, exact_reads_.at(call),
-                                     w->buffer, exact_stores_.at(store)))
+                                     w->buffer, exact_writes_.at(w.get())))
           continue;
         return true;
       }
@@ -210,25 +220,59 @@ private:
     }
     return BufferRegion(r->buffer, bounds);
   }
+  // Envelope has already expanded pure Let bindings and modeled mutable
+  // reads. A loop can change this exact range only if it can rebind one of
+  // its symbols. Treat unrecognized (opaque) symbols conservatively.
+  void RecordSource(const CallNode *call, const Region &exact) {
+    if (exact.empty())
+      return;
+    size_t depth = 0;
+    PostOrderVisit(exact[0]->min, [&](const ObjectRef &node) {
+      if (const auto *v = node.as<VarNode>()) {
+        auto it = binding_depth_.find(v);
+        depth = std::max(depth, it == binding_depth_.end() ? loop_stack_.size()
+                                                           : it->second);
+      }
+    });
+    // Exact extents are literals. Ancestors of the binding loop can also
+    // re-enter it, including via continue.
+    for (size_t i = 0; i < depth; ++i)
+      varying_sources_[loop_stack_[i]].insert(call);
+    exact_reads_.emplace(call, exact);
+  }
+  void RecordWrite(const StmtNode *stmt, const BufferRegion &region,
+                   const Region &exact) {
+    leaves_[stmt].push_back(region);
+    if (!exact.empty())
+      exact_writes_.emplace(region.get(), exact);
+  }
   void VisitStmt_(const EvaluateNode *op) final {
     if (const auto *call = op->value.as<CallNode>()) {
       if (call->op.same_as(dist_put_())) {
         Region exact;
         reads_.emplace(
             call, Envelope(NormalizeToBufferRegion(call->args[0]), &exact));
-        if (!exact.empty())
-          exact_reads_.emplace(call, exact);
+        RecordSource(call, exact);
       }
-      for (const auto &region : CallWriteRegions(call))
-        if (payload_.count(region->buffer->data.get()))
-          leaves_[op].push_back(Envelope(region));
+      for (const auto &region : CallWriteRegions(call)) {
+        if (!payload_.count(region->buffer->data.get()))
+          continue;
+        Region exact;
+        // dma_copy writes the destination view in its descriptor. Other
+        // intrinsics retain their conservative destination envelope.
+        auto envelope =
+            Envelope(region, call->op.same_as(dma_copy()) ? &exact : nullptr);
+        RecordWrite(op, envelope, exact);
+      }
     }
   }
   void VisitStmt_(const LetStmtNode *op) final {
+    binding_depth_[op->var.get()] = loop_stack_.size();
     if (SideEffect(op->value) <= CallEffectKind::kPure)
       defs_[op->var.get()] = op->value;
     VisitStmt(op->body);
     defs_.erase(op->var.get());
+    binding_depth_.erase(op->var.get());
   }
   void VisitStmt_(const ForNode *op) final {
     FiniteWidthInteger facts(&analyzer_, 1, &defs_);
@@ -247,7 +291,11 @@ private:
         tile_depth_ && op->annotations.count(attr::tile_interior_axis);
     if (interior)
       interiors_[op->loop_var.get()] = GetStaticIntValue(op->extent);
+    loop_stack_.push_back(op);
+    binding_depth_[op->loop_var.get()] = loop_stack_.size();
     VisitNested(op->body);
+    binding_depth_.erase(op->loop_var.get());
+    loop_stack_.pop_back();
     interiors_.erase(op->loop_var.get());
     tile_depth_ -= scope;
   }
@@ -261,13 +309,20 @@ private:
     if (op->else_case)
       VisitNested(op->else_case.value());
   }
-  void VisitStmt_(const WhileNode *op) final { VisitNested(op->body); }
+  void VisitStmt_(const WhileNode *op) final {
+    loop_stack_.push_back(op);
+    VisitNested(op->body);
+    loop_stack_.pop_back();
+  }
   void VisitStmt_(const BufferStoreNode *op) final {
     auto data = op->buffer->data.get();
     if (!depth_ && op->buffer.scope() == "local.var" &&
         store_count_[data] == 1 && !escaped_.count(data) &&
-        op->indices.size() == 1 && is_zero(op->indices[0]))
-      snapshots_.values.emplace(data, Var("local_snapshot", op->buffer->dtype));
+        op->indices.size() == 1 && is_zero(op->indices[0])) {
+      Var snapshot("local_snapshot", op->buffer->dtype);
+      snapshots_.values.emplace(data, snapshot);
+      binding_depth_[snapshot.get()] = 0;
+    }
     if (!payload_.count(data))
       return;
     std::vector<int64_t> logical;
@@ -310,9 +365,7 @@ private:
     auto region =
         GetSunmmioScalarTileAccessRegion(op->buffer, indices, layouts_, config_,
                                          &analyzer_, &defs_, logical, &exact);
-    leaves_[op].push_back(BufferRegion(op->buffer, region));
-    if (!exact.empty())
-      exact_stores_.emplace(op, exact);
+    RecordWrite(op, BufferRegion(op->buffer, region), exact);
   }
   const Map<Buffer, Layout> &layouts_;
   const SunmmioTileProcessorConfig &config_;
@@ -325,7 +378,11 @@ private:
   std::unordered_map<const StmtNode *, BufferRegions> leaves_, loops_;
   std::unordered_map<const CallNode *, BufferRegion> reads_;
   std::unordered_map<const CallNode *, Region> exact_reads_;
-  std::unordered_map<const BufferStoreNode *, Region> exact_stores_;
+  std::unordered_map<const BufferRegionNode *, Region> exact_writes_;
+  std::vector<const StmtNode *> loop_stack_;
+  std::unordered_map<const VarNode *, size_t> binding_depth_;
+  std::unordered_map<const StmtNode *, std::unordered_set<const CallNode *>>
+      varying_sources_;
 };
 
 // Track the implicit per-core send queue across structured control flow.
@@ -431,15 +488,15 @@ private:
                             << "; call T.dist.submit() or use submit=True";
   }
 
-  bool HandleWrites(const BufferRegions &writes, const char *description,
-                    const BufferStoreNode *store = nullptr) {
+  bool HandleWrites(const BufferRegions &writes, const char *description) {
     if (writes.empty()) {
       return false;
     }
-    ICHECK(!writes_.Overlaps(queued_sources_, writes, store))
+    ICHECK(!writes_.Overlaps(queued_sources_, writes, /*at_leaf=*/true))
         << "T.dist source is modified before its queued batch is submitted ("
         << description << ")";
-    bool needs_wait = writes_.Overlaps(inflight_sources_, writes, store);
+    bool needs_wait =
+        writes_.Overlaps(inflight_sources_, writes, /*at_leaf=*/true);
     if (needs_wait) {
       // dist_wait_send completes the whole local send channel, not just the
       // conflicting region.
@@ -513,12 +570,10 @@ private:
     SetState(Join(then_state, else_state));
   }
 
-  void VisitLoop(const Stmt &body) {
-    auto widen = [](State state) {
-      for (auto &[call, current] : state.queued_sources)
-        current = false;
-      for (auto &[call, current] : state.inflight_sources)
-        current = false;
+  void VisitLoop(const StmtNode *loop, const Stmt &body) {
+    auto widen = [&](State state) {
+      writes_.CrossBackedge(loop, &state.queued_sources);
+      writes_.CrossBackedge(loop, &state.inflight_sources);
       return state;
     };
     State incoming = GetState();
@@ -551,7 +606,7 @@ private:
     }
     VisitExpr(op->min);
     VisitExpr(op->extent);
-    VisitLoop(op->body);
+    VisitLoop(op, op->body);
   }
 
   void VisitStmt_(const WhileNode *op) final {
@@ -562,7 +617,7 @@ private:
       channel_in_flight_ = false;
     }
     VisitExpr(op->condition);
-    VisitLoop(op->body);
+    VisitLoop(op, op->body);
   }
 
   void VisitStmt_(const AllocateNode *op) final {
@@ -587,7 +642,7 @@ private:
   }
 
   void VisitStmt_(const BufferStoreNode *op) final {
-    if (HandleWrites(writes_.Leaf(op), "buffer store", op)) {
+    if (HandleWrites(writes_.Leaf(op), "buffer store")) {
       stores_needing_wait_.insert(op);
     }
     StmtVisitor::VisitStmt_(op);

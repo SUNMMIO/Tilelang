@@ -187,7 +187,7 @@ def small_tile_kernel(submitted=True, world_size: int = 1):
 
 
 @tilelang.jit(target="sunmmio")
-def next_tile_kernel(submitted=False, world_size: int = 1):
+def next_tile_kernel(submitted=False, wait_inner=False, overlap=False, world_size: int = 1):
     @T.prim_func
     def main(rank_id: T.dist.RankId):
         with T.Kernel():
@@ -199,10 +199,39 @@ def next_tile_kernel(submitted=False, world_size: int = 1):
                 T.dist.put(src[i * 128 : i * 128 + 32], dst, (rank_id + 1) % world_size, signal=s)
                 if submitted:
                     T.dist.submit()
-                src[(i + 1) * 128] = 2
+                if wait_inner:
+                    for _ in T.serial(3):
+                        T.dist.wait_signal(s, expected_delta=0)
+                src[(i + (0 if overlap else 1)) * 128] = 2
                 if not submitted:
                     T.dist.submit()
                 T.dist.wait_signal(s, expected_delta=1)
+
+    return main
+
+
+@tilelang.jit(target="sunmmio")
+def copy_tile_kernel(submitted=False, overlap=False, previous=False, world_size: int = 1):
+    @T.prim_func
+    def main(A: T.MeshTensor((256,), T.placement.replicated(), T.int32), rank_id: T.dist.RankId):
+        with T.Kernel():
+            src = T.alloc_shared((1280,), T.int32)
+            dst = T.alloc_shared((256,), T.int32)
+            s = T.dist.signal(expect="manual")
+            T.fill(src, 1)
+            for i in T.serial(1 if previous else 0, 4):
+                if previous:
+                    T.copy(A, src[(i - 1) * 256 : i * 256])
+                T.dist.put(src[i * 256 : (i + 1) * 256], dst, (rank_id + 1) % world_size, signal=s)
+                if submitted:
+                    T.dist.submit()
+                if not previous:
+                    dest = (i + (0 if overlap else 1)) * 256
+                    T.copy(A, src[dest : dest + 256])
+                    if not submitted:
+                        T.dist.submit()
+            if previous and not submitted:
+                T.dist.submit()
 
     return main
 
@@ -337,6 +366,10 @@ def source_events(result):
             name = node.value.op.name
             if name == "tl.dist_submit_":
                 events.append("submit")
+            elif name == "tl.dma_copy":
+                events.append("copy")
+            elif name == "tl.dist_put_":
+                events.append("send")
             elif name == "tl.dist_wait_send":
                 events.append("flush")
 
@@ -544,3 +577,43 @@ def test_explicit_unroll_keeps_known_trip_count(tmp_path, bounded):
     for n in (0, 15, 250, 251, 255):
         _, events = trace_suvm_control_flow(result, source, rank_id=0, n=n)
         assert [e[1] for e in events if e[0] == "wait"] == ([0, 2, 6] if bounded or n <= 250 else [])
+
+
+@pytest.mark.parametrize("dma", [False, True], ids=["after_inner_wait", "dma"])
+@pytest.mark.parametrize("submitted", [False, True], ids=["queued", "inflight"])
+@pytest.mark.parametrize("overlap", [False, True], ids=["adjacent", "overlapping"])
+def test_same_iteration_source_against_physical_write(tmp_path, dma, submitted, overlap):
+    factory = copy_tile_kernel if dma else next_tile_kernel
+    options = {} if dma else {"wait_inner": True}
+    if overlap and not submitted:
+        with pytest.raises(tvm.error.InternalError, match="source is modified before its queued batch is submitted"):
+            generate(factory, tmp_path, submitted=submitted, overlap=overlap, **options)
+        return
+    result, source = generate(factory, tmp_path, submitted=submitted, overlap=overlap, **options)
+    events = source_events(result)
+    write = events.index("copy" if dma else "write")
+    assert (events.index("submit") < write) == submitted
+    start = events.index("submit" if submitted else "send")
+    # A queued batch may coexist with an older in-flight iteration. Only
+    # after submit is the current batch the sole in-flight source.
+    if submitted:
+        assert ("flush" in events[start + 1 : write]) == overlap
+    emitted = source.split("suvm.dist.batch_submit" if submitted else "suvm.dist.batch_put", 1)[1]
+    before_write = emitted.split("suvm.copy_async" if dma else "suvm.tile.store", 1)
+    assert len(before_write) == 2
+    if submitted:
+        assert ("suvm.dist.flush" in before_write[0]) == overlap
+    else:
+        assert "suvm.dist.batch_submit" not in before_write[0]
+
+
+@pytest.mark.parametrize("submitted", [False, True])
+def test_copy_overwriting_previous_iterations_source(tmp_path, submitted):
+    if not submitted:
+        with pytest.raises(tvm.error.InternalError, match="source is modified"):
+            generate(copy_tile_kernel, tmp_path, previous=True)
+        return
+    result, source = generate(copy_tile_kernel, tmp_path, previous=True, submitted=True)
+    events = source_events(result)
+    assert events[events.index("copy") - 1] == "flush"
+    assert source.index("suvm.dist.flush") < source.index("suvm.copy_async") < source.index("suvm.dist.batch_submit")
