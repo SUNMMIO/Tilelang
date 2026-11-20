@@ -310,6 +310,10 @@ def possible_remote_peers(func, rank, core=0):
     ],
 )
 def test_real_collective_expansions_validate(tmp_path, operation, row):
+    if row and operation == "alltoallv":
+        with pytest.raises(tvm.error.InternalError, match="local cross-row barrier"):
+            generate(collective_kernel, tmp_path, operation=operation, row=row)
+        return
     result, source = generate(collective_kernel, tmp_path, operation=operation, row=row)
     leaves = collect_calls(result.device_mod, "tl.dist_put_")
     updates = collect_calls(result.device_mod, "tl.dist_signal_put_")
@@ -336,6 +340,10 @@ def test_gather_all_payload_spaces_and_aggregate_wait(tmp_path, src_dram, dst_dr
 
 @pytest.mark.parametrize("row", [False, True])
 def test_alltoallv_transfers_complete_capacity(tmp_path, row):
+    if row:
+        with pytest.raises(tvm.error.InternalError, match="local cross-row barrier"):
+            generate(collective_kernel, tmp_path, operation="alltoallv", row=True, capacity=2)
+        return
     _, source = generate(collective_kernel, tmp_path, operation="alltoallv", row=row, capacity=2)
     assert "!suvm.tile_view<2x32x32xbf16>" in source
 
@@ -361,6 +369,10 @@ def test_local_rank_cross_row_path_has_no_remote_notifications(tmp_path, dst_dra
 def test_collectives_never_notify_local_rank(operation, row):
     # The matching cases above validate actual codegen. Project topology here
     # directly from production TIR to check all Rank/core paths independently.
+    if row and operation == "alltoallv":
+        with pytest.raises(tvm.error.InternalError, match="local cross-row barrier"):
+            lower_to_device_tir(collective_kernel.get_tir(world_size=4, operation=operation, row=row))
+        return
     result = lower_to_device_tir(collective_kernel.get_tir(world_size=4, operation=operation, row=row))
     func = single_prim_func(result.device_mod)
     for rank in range(4):

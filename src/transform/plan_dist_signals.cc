@@ -571,8 +571,8 @@ private:
 
 class DistLoopDependencyDetector : public StmtExprVisitor {
 public:
-  explicit DistLoopDependencyDetector(const VarNode *loop_var)
-      : loop_var_(loop_var) {}
+  DistLoopDependencyDetector(const VarNode *loop_var, bool static_bounds)
+      : loop_var_(loop_var), static_bounds_(static_bounds) {}
 
   bool Detect(const Stmt &stmt) {
     VisitStmt(stmt);
@@ -580,6 +580,21 @@ public:
   }
 
 private:
+  void VisitStmt_(const IfThenElseNode *op) final {
+    if (static_bounds_ && ExprVarUseDetector(loop_var_).Detect(
+                              Substitute(op->condition, let_bindings_))) {
+      PostOrderVisit(ffi::GetRef<Stmt>(op), [&](const ObjectRef &n) {
+        auto *c = n.as<CallNode>();
+        found_ |= c && (c->op.same_as(dist_signal_put()) ||
+                        c->op.same_as(DistPutOp::Get()) ||
+                        c->op.same_as(dist_routed_put()) ||
+                        c->op.same_as(dist_rank_routed_put()));
+      });
+    }
+    if (!found_)
+      StmtExprVisitor::VisitStmt_(op);
+  }
+
   void VisitStmt_(const LetStmtNode *op) final {
     Map<Var, PrimExpr> old_bindings = let_bindings_;
     let_bindings_.Set(op->var, Substitute(op->value, let_bindings_));
@@ -588,6 +603,13 @@ private:
   }
 
   void VisitExpr_(const CallNode *call) final {
+    if (call->op.same_as(dist_signal_put()))
+      found_ |= ExprVarUseDetector(loop_var_).Detect(
+          Substitute(call->args[1], let_bindings_));
+    if (call->op.same_as(dist_routed_put()) ||
+        call->op.same_as(dist_rank_routed_put()))
+      found_ |= ExprVarUseDetector(loop_var_).Detect(
+          Substitute(call->args[2], let_bindings_));
     if (call->op.same_as(DistPutOp::Get())) {
       ICHECK_EQ(call->args.size(), 6U);
       found_ |= ExprVarUseDetector(loop_var_).Detect(
@@ -615,6 +637,7 @@ private:
   }
 
   const VarNode *loop_var_;
+  bool static_bounds_;
   bool found_{false};
   Map<Var, PrimExpr> let_bindings_;
 };
@@ -778,9 +801,19 @@ private:
   void RecordSend(const PrimExpr &signal, const PrimExpr &dst_rank_expr,
                   const PrimExpr &dst_row_expr, const Var &current_core,
                   int64_t src_rank, int64_t src_row,
-                  const PrimExpr &extra_predicate = const_true()) {
+                  const PrimExpr &extra_predicate = const_true(),
+                  bool signal_only = false) {
     Map<Var, PrimExpr> substitution =
         MakeSourceSubstitution(current_core, src_row, src_rank);
+    PrimExpr source_predicate = Substitute(predicate_, let_bindings_);
+    auto participation = ParticipatingSource(
+        And(source_predicate, Substitute(extra_predicate, let_bindings_)),
+        substitution);
+    if (!participation)
+      return;
+    source_predicate = ResolveExpr(predicate_, substitution);
+    PrimExpr route_predicate = participation.value();
+
     PrimExpr dst_rank = ResolveExpr(dst_rank_expr, substitution);
     PrimExpr dst_row = ResolveExpr(dst_row_expr, substitution);
     ICHECK(!RouteExprBufferLoadDetector().Detect(dst_rank) &&
@@ -790,16 +823,27 @@ private:
     int64_t dst_rank_value = RequireIntImm(dst_rank, "signal dst_rank");
     int64_t dst_row_value = RequireIntImm(dst_row, "signal dst_row");
     if (dst_rank_value == src_rank) {
+      ICHECK(!signal_only)
+          << "T.dist.put_signal only supports a remote peer Rank; source Rank "
+          << src_rank << " targets itself";
+      if (dst_row_value != src_row) {
+        PrimExpr control = predicate_;
+        if (const auto *ref = signal.as<CallNode>()) {
+          if (ref->op.same_as(dist_signal_route()))
+            control = And(control, ref->args[1]);
+          if (ref->op.same_as(dist_signal_group_route()))
+            control = And(control, ref->args[3]);
+        }
+        auto at_rank = Substitute(Substitute(control, let_bindings_),
+                                  {{rank_id_, I32(src_rank)}});
+        ICHECK(!unproven_loop_depth_ &&
+               IsRowInvariantPredicate(at_rank, current_core))
+            << "local cross-row barrier requires loop bounds and active "
+               "condition uniform across rows; use a row-uniform condition or "
+               "separate slots";
+      }
       return;
     }
-
-    PrimExpr source_predicate = ResolveExpr(predicate_, substitution);
-    PrimExpr route_predicate = analyzer_->Simplify(
-        And(source_predicate, ResolveExpr(extra_predicate, substitution)));
-    if (analyzer_->CanProve(Not(route_predicate))) {
-      return;
-    }
-
     ResolvedSignal resolved = ResolveSignal(signal, substitution);
     if (!resolved.allows_sender_dynamic) {
       ICHECK(!RouteExprBufferLoadDetector().Detect(source_predicate))
@@ -827,8 +871,18 @@ private:
     int64_t sender = src_rank * mesh_nrows_ + src_row;
     int64_t receiver = dst_rank_value * mesh_nrows_ + dst_row_value;
     SignalTopologyInfo &info = topology_[resolved.key];
-    info.receiver_senders[receiver].insert(sender);
-    info.sender_destinations[sender].insert(receiver);
+    // Two columns have different physical receiver resources, even when
+    // they use the same logical kind and member. Test participation at the
+    // actual column before recording either endpoint.
+    for (int col = 0; col < mesh_ncols_; ++col) {
+      if (!is_one(predicate) &&
+          !ParticipatingSource(
+              predicate, {{current_core, I32(src_row * mesh_ncols_ + col)}}))
+        continue;
+      auto from = sender * mesh_ncols_ + col, to = receiver * mesh_ncols_ + col;
+      info.receiver_senders[to].insert(from);
+      info.sender_destinations[from].insert(to);
+    }
   }
 
   void AnalyzePut(const CallNode *call) {
@@ -848,7 +902,7 @@ private:
     for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
       for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
         RecordSend(call->args[0], call->args[1], I32(src_row), current_core,
-                   src_rank, src_row);
+                   src_rank, src_row, const_true(), true);
       }
     }
   }
@@ -860,6 +914,18 @@ private:
     Var current_core = Downcast<Var>(call->args[core_arg]);
     std::vector<NormalRouteEntry> routes = ParseNormalRouteTable(call->args[2]);
     for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
+      Map<Var, PrimExpr> rank_binding{{rank_id_, I32(src_rank)}};
+      if (has_src_rank &&
+          analyzer_->CanProve(ResolveExpr(call->args[3], rank_binding) !=
+                              I32(src_rank)))
+        continue;
+      auto rank_guard =
+          Substitute(Substitute(predicate_, let_bindings_), rank_binding);
+      if (analyzer_->CanProve(Not(rank_guard)))
+        continue;
+      ICHECK(IsRowInvariantPredicate(rank_guard, current_core))
+          << "T.dist.routed_put must be guarded by a condition that is uniform "
+             "across rows. Move source-row selection into the route table";
       for (const NormalRouteEntry &route : routes) {
         PrimExpr active = const_true();
         if (has_src_rank) {
@@ -894,9 +960,14 @@ private:
     if (uniform) {
       uniform_loop_vars_.insert(op->loop_var.get());
     }
-    if (!DistLoopDependencyDetector(op->loop_var.get()).Detect(op->body)) {
+    if (!DistLoopDependencyDetector(op->loop_var.get(),
+                                    min_expr.as<IntImmNode>() &&
+                                        extent_expr.as<IntImmNode>())
+             .Detect(op->body)) {
       VisitStmt(op->body);
     } else {
+      ICHECK(!op->step || is_one(op->step.value()))
+          << "static dist endpoint enumeration requires unit For.step";
       int64_t min = RequireIntImm(min_expr, "dynamic signal-index loop min");
       int64_t extent =
           RequireIntImm(extent_expr, "dynamic signal-index loop extent");

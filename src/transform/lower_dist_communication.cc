@@ -102,10 +102,7 @@ private:
     PrimExpr signal;
     std::string sort_key;
     PrimExpr current_core;
-    const DistSignalKindInfo *kind;
     std::vector<std::vector<PrimExpr>> deltas;
-    std::vector<std::vector<std::optional<std::pair<int64_t, int64_t>>>>
-        senders;
   };
 
   struct SignalExpectationKey {
@@ -132,6 +129,7 @@ private:
     Var var;
     int64_t min;
     int64_t extent;
+    bool unit_step;
   };
 
   class LoopVarUseDetector : public ExprVisitor {
@@ -160,6 +158,8 @@ private:
       return;
     }
     const StaticLoopBinding &loop = loops[depth];
+    ICHECK(loop.unit_step)
+        << "static dist endpoint enumeration requires unit For.step";
     for (int64_t offset = 0; offset < loop.extent; ++offset) {
       int64_t value = loop.min + offset;
       Map<Var, PrimExpr> next = substitution;
@@ -267,13 +267,11 @@ private:
                                     const PrimExpr &current_core) {
     const VarNode *owner = signal.as<VarNode>();
     int64_t member_index = -1;
-    const DistSignalKindInfo *kind = nullptr;
     std::string sort_key;
     if (owner) {
       auto kind_it = signal_kinds_.find(owner);
       ICHECK(kind_it != signal_kinds_.end())
           << "Cannot find resolved T.dist.signal kind for " << signal;
-      kind = kind_it->second.kind;
       sort_key = owner->name_hint;
     } else {
       const auto *ref = signal.as<CallNode>();
@@ -287,7 +285,6 @@ private:
       auto kind_it = signal_group_kinds_.find(owner);
       ICHECK(kind_it != signal_group_kinds_.end())
           << "Cannot find resolved T.dist.signals kind for " << signal;
-      kind = kind_it->second.kind;
       sort_key = owner->name_hint + ":" + std::to_string(member_index);
     }
     SignalExpectationKey key{owner, member_index};
@@ -295,37 +292,22 @@ private:
     if (it == expectations->end()) {
       std::vector<std::vector<PrimExpr>> deltas(
           world_size_, std::vector<PrimExpr>(mesh_nrows_, I32(0)));
-      std::vector<std::vector<std::optional<std::pair<int64_t, int64_t>>>>
-          senders(world_size_,
-                  std::vector<std::optional<std::pair<int64_t, int64_t>>>(
-                      mesh_nrows_));
       it = expectations
                ->emplace(key, SignalExpectation{signal, sort_key, current_core,
-                                                kind, deltas, senders})
+                                                deltas})
                .first;
     }
     return it->second;
   }
 
   void AddDelta(SignalExpectation *expectation, int64_t dst_rank,
-                int64_t dst_row, int64_t src_rank, int64_t src_row,
-                const PrimExpr &predicate) {
+                int64_t dst_row, const PrimExpr &predicate) {
     ICHECK_GE(dst_rank, 0);
     ICHECK_LT(dst_rank, world_size_);
     ICHECK_GE(dst_row, 0);
     ICHECK_LT(dst_row, mesh_nrows_);
-    if (!expectation->kind->allow_multi_sender &&
-        !analyzer_->CanProve(Not(predicate))) {
-      auto &sender = expectation->senders[dst_rank][dst_row];
-      std::pair<int64_t, int64_t> endpoint{src_rank, src_row};
-      ICHECK(!sender || sender.value() == endpoint)
-          << "T.dist signal " << expectation->signal
-          << " has multiple physical senders for receiver endpoint (rank="
-          << dst_rank << ", row=" << dst_row << ") with kind "
-          << expectation->kind->name
-          << ". Use one independent signal per sender";
-      sender = endpoint;
-    }
+    // PlanDistSignals has validated uniqueness per physical receiver and
+    // column.
     PrimExpr contribution = Select(predicate, I32(1), I32(0));
     expectation->deltas[dst_rank][dst_row] = analyzer_->Simplify(
         expectation->deltas[dst_rank][dst_row] + contribution);
@@ -348,17 +330,19 @@ private:
         for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
           Map<Var, PrimExpr> substitution =
               MakeSourceSubstitution(current_core, src_row, src_rank);
-          int64_t dst_rank =
-              RequireResolvedInt(Substitute(call->args[1], substitution),
-                                 "signal destination rank");
-          PrimExpr predicate =
-              analyzer_->Simplify(Substitute(source_predicate, substitution));
-          ICHECK(dst_rank != src_rank || analyzer_->CanProve(Not(predicate)))
-              << "T.dist.put_signal only supports a remote peer Rank; source "
-                 "Rank "
-              << src_rank << " targets itself";
-          AddDelta(&expectation, dst_rank, src_row, src_rank, src_row,
-                   predicate);
+          auto visit = [&](const Map<Var, PrimExpr> &instance,
+                           const PrimExpr &loop_condition) {
+            auto active = ParticipatingSource(source_predicate, instance);
+            if (!active)
+              return;
+            int64_t dst_rank = RequireResolvedInt(
+                Substitute(call->args[1], instance), "signal destination rank");
+            AddDelta(&expectation, dst_rank, src_row,
+                     And(active.value(), loop_condition));
+          };
+          ForEachStaticLoopInstance(
+              RelevantStaticLoops({call->args[1], source_predicate}), 0,
+              substitution, const_true(), visit);
         }
       }
       return;
@@ -374,15 +358,17 @@ private:
               MakeSourceSubstitution(current_core, src_row, src_rank);
           auto visit_instance = [&](const Map<Var, PrimExpr> &instance,
                                     const PrimExpr &loop_predicate) {
+            auto active = ParticipatingSource(source_predicate, instance);
+            if (!active)
+              return;
             int64_t dst_rank = RequireResolvedInt(
                 Substitute(call->args[2], instance), "peer destination rank");
-            PrimExpr predicate = analyzer_->Simplify(
-                And(loop_predicate, Substitute(source_predicate, instance)));
-            AddDelta(&expectation, dst_rank, src_row, src_rank, src_row,
-                     predicate);
+            PrimExpr predicate =
+                analyzer_->Simplify(And(loop_predicate, active.value()));
+            AddDelta(&expectation, dst_rank, src_row, predicate);
           };
           std::vector<StaticLoopBinding> loops =
-              RelevantStaticLoops({call->args[2]});
+              RelevantStaticLoops({call->args[2], source_predicate});
           ForEachStaticLoopInstance(loops, 0, substitution, const_true(),
                                     visit_instance);
         }
@@ -401,13 +387,13 @@ private:
           int64_t peer_row = RequireResolvedInt(route.peer_row, "peer row");
           Map<Var, PrimExpr> substitution =
               MakeSourceSubstitution(current_core, peer_row, src_rank);
+          auto active = ParticipatingSource(source_predicate, substitution);
+          if (!active)
+            continue;
           int64_t dst_rank =
               RequireResolvedInt(Substitute(route.dst_rank, substitution),
                                  "routed peer destination rank");
-          PrimExpr predicate =
-              analyzer_->Simplify(Substitute(source_predicate, substitution));
-          AddDelta(&expectation, dst_rank, peer_row, src_rank, peer_row,
-                   predicate);
+          AddDelta(&expectation, dst_rank, peer_row, active.value());
         }
       }
     }
@@ -748,7 +734,8 @@ private:
     bool static_loop = min_imm && extent_imm && extent_imm->value >= 0;
     if (static_loop) {
       static_loops_.push_back(
-          StaticLoopBinding{op->loop_var, min_imm->value, extent_imm->value});
+          StaticLoopBinding{op->loop_var, min_imm->value, extent_imm->value,
+                            !op->step || is_one(op->step.value())});
     }
     loop_vars_.insert(op->loop_var.get());
     Stmt stmt = arith::IRMutatorWithAnalyzer::VisitStmt_(op);

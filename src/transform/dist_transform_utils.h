@@ -394,6 +394,15 @@ protected:
         expr, MakeSourceSubstitution(current_core, src_row, src_rank)));
   }
 
+  // Only statically inactive sources are excluded. A runtime condition
+  // can still issue a descriptor, so its physical endpoint must be legal.
+  Optional<PrimExpr> ParticipatingSource(const PrimExpr &predicate,
+                                         const Map<Var, PrimExpr> &source) {
+    auto active = analyzer_->Simplify(Substitute(predicate, source));
+    return analyzer_->CanProve(Not(active)) ? Optional<PrimExpr>()
+                                            : Optional<PrimExpr>(active);
+  }
+
   void ValidateRouteExpression(const PrimExpr &expr, const char *name) {
     ICHECK(!RouteExprBufferLoadDetector().Detect(expr))
         << "T.dist.put " << name

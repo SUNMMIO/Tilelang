@@ -1,11 +1,17 @@
 """Cross-pass semantic regressions, compiled from the public SunMMIO DSL."""
 
+import re
+
 import pytest
 
 import tilelang
 import tilelang.language as T
 from tilelang import tvm
-from testing.python.sunmmio.common.codegen_validation import codegen_sunmmio_suvm_mlir, validate_suvm_mlir_with_npuir_opt
+from testing.python.sunmmio.common.codegen_validation import (
+    codegen_sunmmio_suvm_mlir,
+    simplify_suvm_mlir,
+    validate_suvm_mlir_with_npuir_opt,
+)
 from testing.python.sunmmio.common.suvm_trace import trace_suvm_control_flow
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 
@@ -70,8 +76,55 @@ def nested_init_kernel(mode="literal", world_size: int = 1):
     return main
 
 
-def generate(kernel, tmp_path, **kwargs):
-    result = lower_to_device_tir(kernel.get_tir(world_size=2, **kwargs))
+@tilelang.jit(target="sunmmio")
+def topology_kernel(mode, manual=False, kind=T.dist.SignalKind.SRAM_MEMORY, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel() as core:
+            src = T.alloc_shared((256,), T.int32)
+            dst = T.alloc_shared((256,), T.int32)
+            signal = T.dist.signal(kind=kind, expect="manual" if manual else "auto")
+            T.fill(src, 1)
+            if mode == "self":
+                T.dist.put_signal(signal, rank_id)
+            elif mode == "partial":
+                T.dist.put_signal(signal, 0)
+            elif mode == "column":
+                if rank_id < 2 and core % T.mesh_ncols() == rank_id:
+                    T.dist.put_signal(signal, 2)
+            elif mode == "iv_source":
+                for i in T.serial(1, 3):
+                    if rank_id == i:
+                        T.dist.put_signal(signal, 0)
+            elif mode == "two_senders":
+                if rank_id != 2:
+                    T.dist.put_signal(signal, 2)
+            elif mode == "ring":
+                for i in T.serial(1, world_size):
+                    T.dist.put_signal(signal, (rank_id + i) % world_size)
+            elif mode == "local_guard":
+                if core // T.mesh_ncols() == 0:
+                    T.dist.routed_put(src, dst, routes=[[0, rank_id, 1]], signal=signal)
+            elif mode == "local":
+                T.dist.routed_put(src, dst, routes=[[0, rank_id, 1]], signal=signal)
+            elif mode == "rank_guard":
+                if rank_id == 1:
+                    T.dist.routed_put(src, dst, routes=[[0, rank_id - 1, 0]], signal=signal)
+            elif mode == "inactive":
+                T.dist.routed_put(src, dst, src_rank=1, routes=[[0, rank_id - 1, 0]], signal=signal)
+            else:
+                T.dist.routed_put(src, dst, routes=[[0, 1 - rank_id, rank_id]], signal=signal)
+            T.dist.submit()
+            if manual:
+                T.dist.wait_signal(signal, expected_delta=0)
+            else:
+                T.dist.wait_signal(signal)
+
+    return main
+
+
+def generate(kernel, tmp_path, world_size=2, **kwargs):
+    result = lower_to_device_tir(kernel.get_tir(world_size=world_size, **kwargs))
     source = codegen_sunmmio_suvm_mlir(result.device_mod)
     validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
     return result, source
@@ -98,3 +151,72 @@ def test_local_initializer_executes_each_declaration(tmp_path, mode):
         for m in (0, 1, 2):
             batches, _ = trace_suvm_control_flow(r, src, rank_id=0, rounds=rounds, m=m, z=0)
             assert [x[3] for batch in batches for x in batch if x[0] == "signal"] == list(range(1, rounds * m + 1))
+
+
+@pytest.mark.parametrize("mode", ["self", "partial"])
+@pytest.mark.parametrize("manual", [True, False])
+def test_self_notify_is_rejected_before_expected_planning(mode, manual):
+    with pytest.raises(tvm.error.InternalError, match="remote peer Rank"):
+        lower_to_device_tir(topology_kernel.get_tir(mode, manual=manual, world_size=2))
+
+
+def test_local_routed_barrier_requires_both_rows(tmp_path):
+    with pytest.raises(tvm.error.InternalError, match="uniform across rows"):
+        lower_to_device_tir(topology_kernel.get_tir("local_guard", manual=True, world_size=2))
+    _, source = generate(topology_kernel, tmp_path, mode="local", manual=True)
+    for col in range(4):
+        mask = (1 << col) | (1 << (4 + col))
+        for row in (0, 1):
+            core = 4 * row + col
+            fixed = simplify_suvm_mlir(
+                source.replace("suvm.get_core_id : i64", f"arith.constant {core} : i64"),
+                opt_args=("--canonicalize", "--cse", "--sccp", "--canonicalize"),
+            )
+            barrier = re.search(rf"(%[\w-]+) = suvm.barrier.init mask = {mask} :", fixed)[1]
+            arrivals = f"suvm.barrier.arrive_and_wait {barrier} :"
+            assert fixed.count(arrivals) == 2
+            if row == 0:
+                assert fixed.index(arrivals) < fixed.index("suvm.mcast_async") < fixed.rindex(arrivals)
+
+
+@pytest.mark.parametrize("mode", ["inactive", "rank_guard", "mixed"])
+def test_routed_endpoint_is_classified_per_participating_rank(tmp_path, mode):
+    generate(topology_kernel, tmp_path, mode=mode)
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_static_signal_peer_loop(tmp_path, manual):
+    r, source = generate(topology_kernel, tmp_path, mode="ring", world_size=3, manual=manual, kind=T.dist.SignalKind.SRAM_FLAGREG_INC)
+    for rank in range(3):
+        batches, events = trace_suvm_control_flow(r, source, rank_id=rank)
+        assert [x[1] for batch in batches for x in batch if x[0] == "signal"] == [(rank + 1) % 3, (rank + 2) % 3]
+        assert [x[1] for x in events if x[0] == "wait"] == [0 if manual else 2]
+
+
+@pytest.mark.parametrize("kind", [T.dist.SignalKind.SRAM_MEMORY, T.dist.SignalKind.SRAM_FLAGREG_VALUE, T.dist.SignalKind.SRAM_FLAGREG_INC])
+def test_two_remote_senders_are_checked_per_member(tmp_path, kind):
+    opts = dict(mode="two_senders", manual=True, kind=kind, world_size=3)
+    if kind == T.dist.SignalKind.SRAM_FLAGREG_INC:
+        generate(topology_kernel, tmp_path, **opts)
+    else:
+        with pytest.raises(tvm.error.InternalError, match="sender"):
+            lower_to_device_tir(topology_kernel.get_tir(**opts))
+
+
+@pytest.mark.parametrize("manual", [False, True])
+@pytest.mark.parametrize("mode", ["column", "iv_source"])
+def test_static_source_filters_drive_expected_and_uniqueness(tmp_path, manual, mode):
+    kind = T.dist.SignalKind.SRAM_MEMORY if mode == "column" else T.dist.SignalKind.SRAM_FLAGREG_INC
+    result, source = generate(topology_kernel, tmp_path, world_size=3, mode=mode, manual=manual, kind=kind)
+    for col in range(4):
+        specialized = source.replace("suvm.get_core_id : i64", f"arith.constant {col} : i64")
+        for rank in range(3):
+            batches, events = trace_suvm_control_flow(result, specialized, rank_id=rank)
+            peers = [x[1] for batch in batches for x in batch if x[0] == "signal"]
+            if mode == "column":
+                assert peers == ([2] if rank < 2 and col == rank else [])
+                target = int(rank == 2 and col < 2)
+            else:
+                assert peers == ([0] if rank in (1, 2) else [])
+                target = 2 if rank == 0 else 0
+            assert [x[1] for x in events if x[0] == "wait"] == [0 if manual else target]

@@ -600,33 +600,12 @@ def test_alltoallv_single_signal_uses_inc_and_reaches_regular_wait_leaf():
     assert "pending_count" not in injected_script
 
 
-def test_alltoallv_single_signal_row_routes_active_and_reuses_wait_leaf():
+def test_alltoallv_single_signal_row_checks_local_barrier_participation():
     func = alltoallv_single_signal_row_kernel_factory.get_tir(world_size=2)
-    result = lower_to_device_tir(
-        func,
-        capture_passes=(
-            "tl.PlanDistSignals",
-            "tl.LowerDistRouting",
-            "tl.LowerDistCommunication",
-            "tl.LowerDistSync",
-        ),
-    )
-
-    planned = result.pass_snapshot("tl.PlanDistSignals").mod["main"]
-    assert int(planned.attrs["tl.dist.signal_counts"]["sram_flagreg_inc"]) == 1
-
-    routed = result.pass_snapshot("tl.LowerDistRouting").mod
-    routed_names = collect_op_names(routed)
-    assert routed_names.count("tl.tileop.dist_routed_peer_put") == 16
-    assert "dist_route_active" in routed.script()
-
-    lower_names = collect_op_names(result.pass_snapshot("tl.LowerDistCommunication").mod)
-    assert lower_names.count("tl.dist_put_") == 16
-    assert lower_names.count("tl.dist_wait_signal_") == 1
-    assert "tl.dist_wait_any_" not in lower_names
-    injected_script = result.pass_snapshot("tl.LowerDistSync").mod.script()
-    assert "recv_counts[1, 3]" in injected_script
-    assert "pending_count" not in injected_script
+    # Each origin owns its count. A local cross-row transfer cannot
+    # put the two-party barrier under each row's independent count load.
+    with pytest.raises(tvm.error.InternalError, match="local cross-row barrier"):
+        lower_to_device_tir(func)
 
 
 def test_alltoallv_single_signal_infers_dram_increment_kind():
@@ -765,63 +744,23 @@ def test_alltoallv_supports_all_p2p_scope_combinations():
     assert device_script.count('"dram_flagreg_inc"') >= 2
 
 
-def test_alltoallv_row_routes_active_state_and_reaches_completion_leaves():
+def test_alltoallv_row_wait_any_checks_local_barrier_participation():
     func = alltoallv_row_kernel_factory.get_tir(wait_mode="any", world_size=2)
-    result = lower_to_device_tir(
-        func,
-        capture_passes=(
-            "tl.LowerDistCollectives",
-            "tl.PlanDistSignals",
-            "tl.LowerDistRouting",
-            "tl.LowerDistCommunication",
-            "tl.LowerDistSync",
-        ),
-    )
-
-    planned = result.pass_snapshot("tl.PlanDistSignals").mod["main"]
-    assert int(planned.attrs["tl.dist.signal_counts"]["sram_flagreg_inc"]) == 8
-
-    routed = result.pass_snapshot("tl.LowerDistRouting").mod
-    routed_names = collect_op_names(routed)
-    routed_script = routed.script()
-    assert routed_names.count("tl.tileop.dist_routed_peer_put") == 16
-    assert routed_names.count("tl.tileop.comm_put") == 36
-    assert "dist_route_active" in routed_script
-
-    lower_comm = result.pass_snapshot("tl.LowerDistCommunication").mod
-    lower_names = collect_op_names(lower_comm)
-    assert lower_names.count("tl.dist_put_") == 16
-    assert lower_names.count("tl.dist_wait_any_") == 1
-
-    injected_script = result.pass_snapshot("tl.LowerDistSync").mod.script()
-    assert "rank_id * 4" in injected_script
-    assert "recv_counts[1, 3]" in injected_script
-    assert "pending_count" in injected_script
-    assert "_generation" not in injected_script
-    assert "T.uint8(0)" in injected_script
+    # Each origin owns its count. A local cross-row transfer cannot
+    # put the two-party barrier under each row's independent count load.
+    with pytest.raises(tvm.error.InternalError, match="local cross-row barrier"):
+        lower_to_device_tir(func)
 
 
-def test_alltoallv_row_value_group_flattens_member_and_destination_generation():
+def test_alltoallv_row_value_group_checks_local_barrier_participation():
     func = alltoallv_row_kernel_factory.get_tir(
         signal_kind=T.dist.SignalKind.SRAM_FLAGREG_VALUE,
         world_size=2,
     )
-    result = lower_to_device_tir(
-        func,
-        capture_passes=("tl.PlanDistSignals", "tl.LowerDistCommunication"),
-    )
-    planned = result.pass_snapshot("tl.PlanDistSignals").mod["main"]
-    assert int(planned.attrs["tl.dist.signal_counts"]["sram_flagreg_value"]) == 8
-
-    allocations = []
-
-    def visit(node):
-        if isinstance(node, tvm.tir.Allocate) and "generation" in node.buffer_var.name:
-            allocations.append(tuple(int(extent) for extent in node.extents))
-
-    lowered = result.pass_snapshot("tl.LowerDistCommunication").mod["main"]
-    tvm.tir.stmt_functor.post_order_visit(lowered.body, visit)
-    assert allocations == [(64,)]
+    # Each origin owns its count. A local cross-row transfer cannot
+    # put the two-party barrier under each row's independent count load.
+    with pytest.raises(tvm.error.InternalError, match="local cross-row barrier"):
+        lower_to_device_tir(func)
 
 
 def test_alltoallv_rejects_count_shape_mismatch():

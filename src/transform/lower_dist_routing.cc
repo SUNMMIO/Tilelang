@@ -13,6 +13,7 @@
 #include "../op/comm.h"
 #include "../op/copy.h"
 #include "../op/utils.h"
+#include "../support/finite_width_integer.h"
 #include "dist_transform_utils.h"
 
 namespace tvm {
@@ -169,10 +170,56 @@ public:
 
 private:
   DistRankRoutedPutNormalizer(int64_t world_size, Var rank_id)
-      : world_size_(world_size), rank_id_(std::move(rank_id)) {}
+      : world_size_(world_size), rank_id_(std::move(rank_id)) {
+    for (int64_t r = 0; r < world_size_; ++r)
+      ranks_.push_back(IntImm(rank_id_.dtype(), r));
+  }
 
+  // Restrict proofs to rank predicates at route sites. Binding every Let
+  // in the function here would run a second arithmetic analysis on payloads
+  // and expected values that routing neither owns nor needs.
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    auto cond = op->condition;
+    if (!UsesVar(cond, [&](const VarNode *v) { return v == rank_id_.get(); }))
+      return StmtExprMutator::VisitStmt_(op);
+    auto incoming = ranks_;
+    Array<PrimExpr> yes_ranks, no_ranks;
+    arith::Analyzer analyzer;
+    for (auto rank : incoming) {
+      FiniteWidthInteger facts(&analyzer);
+      auto value = facts.Analyze(Substitute(cond, {{rank_id_, rank}}));
+      if (!value.valid || value.range.hi != 0)
+        yes_ranks.push_back(rank);
+      if (!value.valid || value.range.lo == 0)
+        no_ranks.push_back(rank);
+    }
+    ranks_ = yes_ranks;
+    Stmt yes = VisitStmt(op->then_case);
+    Optional<Stmt> no;
+    if (op->else_case) {
+      ranks_ = no_ranks;
+      no = VisitStmt(op->else_case.value());
+    }
+    ranks_ = incoming;
+    return IfThenElse(cond, yes, no, op->span);
+  }
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *call_node = op->value.as<CallNode>();
+    if (call_node && (call_node->op.same_as(dist_routed_put()) ||
+                      call_node->op.same_as(DistPutOp::Get()))) {
+      if (ranks_.empty())
+        return Evaluate(0);
+      if (ranks_.size() == 1)
+        return Substitute(ffi::GetRef<Stmt>(op), {{rank_id_, ranks_[0]}});
+      if (ranks_.size() < static_cast<size_t>(world_size_)) {
+        Array<Stmt> routes;
+        for (auto rank : ranks_)
+          routes.push_back(
+              IfThenElse(rank_id_ == rank, Substitute(ffi::GetRef<Stmt>(op),
+                                                      {{rank_id_, rank}})));
+        return SeqStmt::Flatten(routes);
+      }
+    }
     if (!call_node || !call_node->op.same_as(dist_rank_routed_put())) {
       return StmtExprMutator::VisitStmt_(op);
     }
@@ -184,7 +231,7 @@ private:
     Stmt routed = Evaluate(Call(DataType::Handle(), dist_routed_put(), args,
                                 call_node->annotations, call_node->span));
     if (src_rank.same_as(rank_id_)) {
-      return routed;
+      return VisitStmt(routed);
     }
     int64_t src_rank_value =
         RequireIntImm(src_rank, "T.dist.routed_put src_rank");
@@ -192,9 +239,11 @@ private:
     ICHECK_LT(src_rank_value, world_size_)
         << "T.dist.routed_put src_rank is outside [0, " << world_size_
         << "): " << src_rank_value;
-    return IfThenElse(rank_id_ == src_rank, routed);
+    return IfThenElse(rank_id_ == src_rank,
+                      Substitute(routed, {{rank_id_, src_rank}}));
   }
 
+  Array<PrimExpr> ranks_;
   int64_t world_size_;
   Var rank_id_;
 };
@@ -255,14 +304,17 @@ private:
     return arith::IRMutatorWithAnalyzer::VisitStmt_(op);
   }
 
-  Locality ValidateAndClassify(const PrimExpr &dst_rank,
-                               const PrimExpr &dst_row, const Var &current_core,
-                               std::optional<int64_t> fixed_src_row,
-                               const char *op_name) {
+  Locality
+  ValidateAndClassify(const PrimExpr &dst_rank, const PrimExpr &dst_row,
+                      const Var &current_core,
+                      std::optional<int64_t> fixed_src_row, const char *op_name,
+                      std::optional<int64_t> fixed_rank = std::nullopt) {
     Locality result;
     int64_t row_begin = fixed_src_row.value_or(0);
     int64_t row_end = fixed_src_row ? row_begin + 1 : mesh_nrows_;
     for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
+      if (fixed_rank && *fixed_rank != src_rank)
+        continue;
       for (int64_t src_row = row_begin; src_row < row_end; ++src_row) {
         PrimExpr resolved_rank =
             RewriteForSource(dst_rank, current_core, src_row, src_rank);
@@ -450,7 +502,8 @@ private:
     return true;
   }
 
-  Stmt LowerRoutedPut(const Call &call) {
+  Stmt LowerRoutedPut(const Call &call,
+                      std::optional<int64_t> fixed_rank = std::nullopt) {
     ICHECK_EQ(call->args.size(), 5U);
     const auto *current_core_node = call->args[4].as<VarNode>();
     ICHECK(current_core_node);
@@ -466,11 +519,14 @@ private:
           << "T.dist.routed_put source row is outside [0, " << mesh_nrows_
           << "): " << route.origin_src_row;
       bool peer_for_all_ranks = true;
+      bool any_peer = false;
       for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
         PrimExpr resolved_row = RewriteForSource(
             route.dst_row, current_core, route.origin_src_row, src_rank);
-        peer_for_all_ranks &=
+        bool peer =
             analyzer_->CanProve(resolved_row == I32(route.origin_src_row));
+        any_peer |= peer;
+        peer_for_all_ranks &= peer;
       }
       if (!peer_for_all_ranks) {
         ValidateCrossRowRegionOffsets(call->args[0], call->args[1],
@@ -482,9 +538,29 @@ private:
             << index;
       }
 
-      Locality locality =
-          ValidateAndClassify(route.dst_rank, route.dst_row, current_core,
-                              route.origin_src_row, "T.dist.routed_put");
+      if (any_peer && !peer_for_all_ranks) {
+        // Only a route whose forwarding class differs by rank needs a
+        // rank branch. Specialize the endpoint table, not the payload.
+        for (int64_t rank = 0; rank < world_size_; ++rank) {
+          auto entry = Call(DataType::Handle(), dist_route(),
+                            {I32(route.origin_src_row),
+                             RewriteForSource(route.dst_rank, current_core,
+                                              route.origin_src_row, rank),
+                             RewriteForSource(route.dst_row, current_core,
+                                              route.origin_src_row, rank)});
+          auto args = call->args;
+          args.Set(2, Call(DataType::Handle(), dist_route_table(), {entry}));
+          statements.push_back(
+              IfThenElse(rank_id_ == I32(rank),
+                         LowerRoutedPut(Call(call->dtype, call->op, args,
+                                             call->annotations, call->span),
+                                        rank)));
+        }
+        continue;
+      }
+      Locality locality = ValidateAndClassify(
+          route.dst_rank, route.dst_row, current_core, route.origin_src_row,
+          "T.dist.routed_put", fixed_rank);
       PrimExpr entry =
           Call(DataType::Handle(), dist_route(),
                {I32(route.origin_src_row), route.dst_rank, route.dst_row});
