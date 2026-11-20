@@ -219,7 +219,7 @@ class BaseBuilder:
     def aug_assign_slice(self, op: Operator, target: Any, sl: slice, aug_value: Any):
         eval_aug_assign(op, target, sl, aug_value)
 
-    def lazy_operand(self, operand, callee=None):
+    def lazy_operand(self, operand, callee, unpack=None):
         return operand()
 
     def boolop(self, op: BoolOp, left: Any, right: Callable[[], Any] | None = None) -> Any:
@@ -546,40 +546,43 @@ class DSLMutator(ast.NodeTransformer):
                 return
 
     def visit_Call(self, node: ast.Call):
-        # A macro can emit statements while its Python arguments are being
-        # built. Mark lazy operands before evaluating calls inside them.
-        from types import ModuleType
-
-        from tilelang.language.tir.ir import if_then_else
-
-        attrs = []
-        root = node.func
-        while isinstance(root, ast.Attribute):
-            attrs.append(root.attr)
-            root = root.value
-        callee = self.nonlocals.get(root.id, self.globals.get(root.id)) if isinstance(root, ast.Name) else None
-        for attr in reversed(attrs):
-            if not isinstance(callee, ModuleType):
-                break
-            callee = vars(callee).get(attr)
-        # Simple names may be function arguments or locally bound aliases.
-        dynamic_alias = (
-            isinstance(node.func, ast.Name) and callee is None and (len(node.args) >= 3 or any(k.arg in ("t", "f") for k in node.keywords))
-        )
-        lazy = callee is if_then_else
         node = self.generic_visit(node)
-        if lazy or dynamic_alias:
+        if (
+            len(node.args) < 3
+            and not any(isinstance(a, ast.Starred) for a in node.args)
+            and not any(k.arg in (None, "t", "f", "true_value", "false_value") for k in node.keywords)
+        ):
+            return node
 
-            def wrap(arg):
-                if dynamic_alias:
-                    return quote_expr("__tb.lazy_operand(lambda: operand, callee)", operand=arg, callee=node.func, span=node)
-                return quote_expr("__tb.lazy_operand(lambda: operand)", operand=arg, span=node)
+        # Bind the callable once, before any macro can emit a statement. This
+        # works for computed callees as well as globals and local aliases.
+        name = self.get_tmp()
+        callee = node.func
+        node.func = ast.Name(id=name, ctx=ast.Load())
 
-            node.args[1:3] = [wrap(arg) for arg in node.args[1:3]]
-            for kw in node.keywords:
-                if kw.arg in ("t", "f", "true_value", "false_value"):
-                    kw.value = wrap(kw.value)
-        return node
+        def wrap(arg, unpack=None):
+            return quote_expr(f"__tb.lazy_operand(lambda: operand, {name}, {unpack!r})", operand=arg, span=node)
+
+        args = []
+        uncertain_position = False
+        for arg in node.args:
+            if isinstance(arg, ast.Starred) and isinstance(arg.value, (ast.Tuple, ast.List)):
+                elements = arg.value.elts
+            else:
+                elements = [arg]
+            for item in elements:
+                if isinstance(item, ast.Starred):
+                    args.append(ast.Starred(value=wrap(item.value, "*"), ctx=ast.Load()))
+                    uncertain_position = True
+                else:
+                    args.append(wrap(item) if uncertain_position or 1 <= len(args) <= 2 else item)
+        node.args = args
+        for kw in node.keywords:
+            if kw.arg is None:
+                kw.value = wrap(kw.value, "**")
+            elif kw.arg in ("t", "f", "true_value", "false_value"):
+                kw.value = wrap(kw.value)
+        return quote_expr(f"(lambda {name}: invoke)(callee)", invoke=node, callee=callee, span=node)
 
     def visit_BoolOp(self, node: ast.BoolOp):
         node = self.generic_visit(node)

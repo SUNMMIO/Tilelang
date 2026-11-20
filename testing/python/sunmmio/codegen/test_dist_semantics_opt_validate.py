@@ -18,6 +18,9 @@ from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 tilelang.env.disable_cache()
 
 
+selectors = (T.if_then_else,)
+
+
 @T.macro
 def wait_member_alias(c):
     member = T.dist.wait_any(c)
@@ -42,6 +45,12 @@ def consuming_wait_kernel(mode, world_size: int = 1):
             elif mode == "alias_macro":
                 choose = T.if_then_else
                 result = choose(T.dist.has_pending(done), wait_member_alias(done), -1)
+            elif mode == "computed":
+                result = selectors[0](T.dist.has_pending(done), wait_member_alias(done), -1)
+            elif mode == "star":
+                result = T.if_then_else(*(T.dist.has_pending(done), wait_member_alias(done), -1))
+            elif mode == "mapping":
+                result = T.if_then_else(**dict(cond=T.dist.has_pending(done), t=wait_member_alias(done), f=-1))
             elif mode == "ternary":
                 result = T.dist.wait_any(done) if T.dist.has_pending(done) else -1
             elif mode == "short":
@@ -55,6 +64,26 @@ def consuming_wait_kernel(mode, world_size: int = 1):
                         result = j
             assert T.Cast("uint32", result + 1) == n % T.uint32(2), "wrong member"
             T.dist.wait_all(done)
+
+    return main
+
+
+@T.macro
+def read_member(buf, i):
+    value = buf[i]
+    return value
+
+
+@tilelang.jit(target="sunmmio")
+def lazy_read_kernel(world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, i: T.int32):
+        with T.Kernel():
+            s = T.dist.signal(kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
+            buf = T.alloc_shared((16,), T.uint32)
+            T.fill(buf, T.uint32(7))
+            value = selectors[0](i >= 0, read_member(buf, i), T.uint32(0))
+            T.dist.wait_signal(s, expected_delta=value)
 
     return main
 
@@ -153,7 +182,7 @@ def generate(kernel, tmp_path, world_size=2, **kwargs):
     return result, source
 
 
-@pytest.mark.parametrize("mode", ["intrinsic", "alias_macro", "ternary", "short"])
+@pytest.mark.parametrize("mode", ["intrinsic", "alias_macro", "computed", "star", "mapping", "ternary", "short"])
 def test_wait_any_rejects_runtime_lazy_operand(mode):
     with pytest.raises((ValueError, tvm.error.InternalError), match="statement branch"):
         lower_to_device_tir(consuming_wait_kernel.get_tir(mode, world_size=2))
@@ -258,3 +287,10 @@ def test_macro_local_reset_and_outer_lifetime(tmp_path):
                 target += total
                 expected.append(target)
             assert [e[1] for e in events if e[0] == "wait"] == expected
+
+
+def test_read_macro_remains_in_lazy_operand(tmp_path):
+    result, source = generate(lazy_read_kernel, tmp_path)
+    for index, expected in ((-1, 0), (0, 7)):
+        _, events = trace_suvm_control_flow(result, source, rank_id=0, i=index)
+        assert [event[1] for event in events if event[0] == "wait"] == [expected]

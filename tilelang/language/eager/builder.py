@@ -689,14 +689,38 @@ class Builder(BaseBuilder):
         else:
             return super().boolop(op, left, right)
 
-    def lazy_operand(self, operand, callee=None):
-        if callee is not None:
-            from tilelang.language.tir.ir import if_then_else
+    def lazy_operand(self, operand, callee, unpack=None):
+        from tilelang.language.tir.ir import if_then_else
 
-            if callee is not if_then_else:
-                return operand()
-        with self.with_frame(LazyOperandFrame()):
+        if callee is not if_then_else and callee is not if_then_else.__wrapped__ and callee is not tvm.tir.if_then_else:
             return operand()
+
+        # Collect statements locally. Only immutable read/pure bindings can be
+        # embedded in an expression. Their evaluation belongs to this branch.
+        capture = tvm.ir.make_node("script.ir_builder.tir.TIRFrame", stmts=[])
+        with self.with_frame(LazyOperandFrame()):
+            self.enter_frame(capture)
+            result = operand()
+            if unpack == "*":
+                result = tuple(result)
+            elif unpack == "**":
+                result = {**result}
+            tir.evaluate(0)
+        bindings = []
+        body = capture.stmts
+        if len(body) == 1:
+            stmt = body[0]
+            while isinstance(stmt, tvm.tir.LetStmt) and side_effect(stmt.value) <= CallEffectKind.ReadState.value:
+                bindings.append((stmt.var, stmt.value))
+                stmt = stmt.body
+            if isinstance(stmt, tvm.tir.Evaluate) and isinstance(stmt.value, IntImm) and stmt.value.value == 0:
+                if not bindings:
+                    return result
+                if unpack is None:
+                    for var, value in reversed(bindings):
+                        result = tvm.tir.Let(var, value, result)
+                    return result
+        raise ValueError("A lazy operand that emits statements must use a statement branch; use explicit if/else")
 
     def ifexp(self, cond, then, otherwise):
         cond = unwrap_cond(cond)
