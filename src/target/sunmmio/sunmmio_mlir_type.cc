@@ -116,18 +116,22 @@ std::vector<uint8_t> BuildFlatDimLevels(size_t rank) {
 
 mlir::suvm::MemorySpaceAttr MapMemorySpaceAttr(mlir::MLIRContext *ctx,
                                                const std::string &space) {
-  using mlir::suvm::MemorySpace;
+  using mlir::suvm::symbolizeMemorySpace;
   if (space.empty() || space == "global") {
-    return mlir::suvm::MemorySpaceAttr::get(ctx, MemorySpace::global);
+    return mlir::suvm::MemorySpaceAttr::get(
+        ctx, symbolizeMemorySpace("global").value());
   }
   if (space == "shared.asram" || space == "asram") {
-    return mlir::suvm::MemorySpaceAttr::get(ctx, MemorySpace::asram);
+    return mlir::suvm::MemorySpaceAttr::get(
+        ctx, symbolizeMemorySpace("asram").value());
   }
   if (space == "shared.wsram" || space == "wsram") {
-    return mlir::suvm::MemorySpaceAttr::get(ctx, MemorySpace::wsram);
+    return mlir::suvm::MemorySpaceAttr::get(
+        ctx, symbolizeMemorySpace("wsram").value());
   }
   if (space == "shared.rsram" || space == "rsram") {
-    return mlir::suvm::MemorySpaceAttr::get(ctx, MemorySpace::rsram);
+    return mlir::suvm::MemorySpaceAttr::get(
+        ctx, symbolizeMemorySpace("rsram").value());
   }
   LOG(FATAL) << "Unsupported SUVM memory space: " << space;
   TVM_FFI_UNREACHABLE();

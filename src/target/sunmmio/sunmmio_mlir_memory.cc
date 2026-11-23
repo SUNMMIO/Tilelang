@@ -36,8 +36,8 @@ SunMMIOValue SunmmioMlirMemory::Alloc(
       ctx_.builder, ctx_.builder.getUnknownLoc(), tensor_type);
   mlir::suvm::MemorySpace memory_space =
       tensor_type.getMemorySpace().getValue();
-  if (memory_space == mlir::suvm::MemorySpace::asram ||
-      memory_space == mlir::suvm::MemorySpace::wsram) {
+  if (memory_space == mlir::suvm::symbolizeMemorySpace("asram").value() ||
+      memory_space == mlir::suvm::symbolizeMemorySpace("wsram").value()) {
     mlir::suvm::PingPong ping_pong_value = mlir::suvm::PingPong::ping;
     if (ping_pong.has_value()) {
       if (*ping_pong == "pong") {
