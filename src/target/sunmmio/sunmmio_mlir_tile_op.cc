@@ -1,6 +1,6 @@
 #include "sunmmio_mlir_tile_op.h"
-#include "npuir/Dialect/SUVM/IR/DeviceArchProperties.h"
 #include "npuir/Dialect/SUVM/IR/Dialect.h"
+#include "npuir/SDK/DeviceQuery.h"
 #include "sunmmio_mlir_expr.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -776,7 +776,8 @@ SunMMIOValue SunmmioMlirTileOp::TileSelect(const std::string &result_name,
     auto arch = mlir::suvm::SUVMDialect::getModuleDeviceArch(*ctx_.module);
     // Keep unsigned narrowing within a native half-register so splitting never
     // needs to synthesize an unsigned scalar padding constant.
-    int64_t chunk_elements = mlir::suvm::getVectorRegBits(arch) / (2 * 32);
+    int64_t chunk_elements =
+        npuir::sdk::DeviceQuery(arch).getVectorRegBits() / (2 * 32);
     for (int64_t start = 0; start < count; start += chunk_elements) {
       auto chunk_type = integer_type;
       chunk_type.shape = {

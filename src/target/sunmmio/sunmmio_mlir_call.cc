@@ -30,14 +30,17 @@ namespace codegen {
 namespace {
 
 std::string MapMemoryScopeName(mlir::suvm::MemorySpace space) {
-  switch (space) {
-  case mlir::suvm::MemorySpace::global:
+  using mlir::suvm::symbolizeMemorySpace;
+  if (space == symbolizeMemorySpace("global").value()) {
     return "global";
-  case mlir::suvm::MemorySpace::asram:
+  }
+  if (space == symbolizeMemorySpace("asram").value()) {
     return "shared.asram";
-  case mlir::suvm::MemorySpace::wsram:
+  }
+  if (space == symbolizeMemorySpace("wsram").value()) {
     return "shared.wsram";
-  case mlir::suvm::MemorySpace::rsram:
+  }
+  if (space == symbolizeMemorySpace("rsram").value()) {
     return "shared.rsram";
   }
   LOG(FATAL) << "Unsupported SUVM memory space";
@@ -52,7 +55,8 @@ template <typename OpType> void VerifyAsyncOp(OpType op, const char *callee) {
 template <typename OpType>
 void VerifyA4EMulticastOp(OpType op, const char *callee) {
   VerifyAsyncOp(op, callee);
-  ICHECK(llvm::succeeded(op.verifyWithDeviceArch(mlir::suvm::DeviceArch::a4e)))
+  ICHECK(llvm::succeeded(
+      op.verifyWithDeviceArch(mlir::suvm::symbolizeDeviceArch("a4e").value())))
       << callee << " violates A4E multicast data-path constraints";
 }
 

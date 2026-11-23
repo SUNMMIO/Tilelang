@@ -28,8 +28,9 @@ void SunmmioMlirFunction::BeginModule() {
 
   ctx_.module = mlir::ModuleOp::create(ctx_.builder.getUnknownLoc());
   ctx_.module->getOperation()->setAttr(
-      "suvm.device_arch", mlir::suvm::DeviceArchAttr::get(
-                              &ctx_.mlir_ctx, mlir::suvm::DeviceArch::a4e));
+      "suvm.device_arch",
+      mlir::suvm::DeviceArchAttr::get(
+          &ctx_.mlir_ctx, mlir::suvm::symbolizeDeviceArch("a4e").value()));
   ctx_.builder.setInsertionPointToEnd(ctx_.module->getBody());
   current_func_ = mlir::func::FuncOp();
   ctx_.ClearFunctionState();

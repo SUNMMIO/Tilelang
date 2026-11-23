@@ -28,22 +28,22 @@ using namespace tir;
 namespace {
 
 using npuir::sdk::DeviceQuery;
-using NpuMemorySpace = mlir::suvm::MemorySpace;
-using NpuUnit = mlir::suvm::Unit;
+using NpuMemorySpace = npuir::sdk::MemorySpace;
+using NpuUnit = npuir::sdk::Unit;
 
 NpuMemorySpace ToNpuMemorySpace(const Buffer &buffer) {
   const ffi::String &scope = buffer.scope();
   if (scope.empty() || scope == "global") {
-    return NpuMemorySpace::global;
+    return DeviceQuery::symbolizeMemorySpace("global").value();
   }
   if (scope == kSunmmioScopeRSRAM || scope == "local") {
-    return NpuMemorySpace::rsram;
+    return DeviceQuery::symbolizeMemorySpace("rsram").value();
   }
   if (scope == kSunmmioScopeASRAM) {
-    return NpuMemorySpace::asram;
+    return DeviceQuery::symbolizeMemorySpace("asram").value();
   }
   if (scope == kSunmmioScopeWSRAM) {
-    return NpuMemorySpace::wsram;
+    return DeviceQuery::symbolizeMemorySpace("wsram").value();
   }
   LOG(FATAL) << "ResolveSunmmioUnit does not recognize memory scope " << scope;
   TVM_FFI_UNREACHABLE();
@@ -68,7 +68,7 @@ void AddUniqueUnit(std::vector<NpuUnit> *units, NpuUnit unit) {
 
 class SunmmioUnitResolver : public StmtExprMutator {
 public:
-  SunmmioUnitResolver() : query_(mlir::suvm::DeviceArch::a4e) {}
+  SunmmioUnitResolver() : query_(DeviceQuery::forName("a4e").value()) {}
 
 private:
   PrimExpr VisitExpr_(const CallNode *op) final {
@@ -140,8 +140,8 @@ private:
       return ToTileLangUnit(candidates.front());
     }
 
-    ICHECK(src_space == NpuMemorySpace::rsram &&
-           dst_space == NpuMemorySpace::rsram)
+    const auto rsram = DeviceQuery::symbolizeMemorySpace("rsram").value();
+    ICHECK(src_space == rsram && dst_space == rsram)
         << "Ambiguous A4E ODMA route outside RSRAM-to-RSRAM copy";
     // ODMA1 handles both contiguous and strided RSRAM-to-RSRAM transfers.
     return SunmmioOdmaUnit::kOdma1;
@@ -169,10 +169,10 @@ private:
                        std::optional<NpuUnit> required_write_unit) const {
     std::vector<NpuUnit> units = LocalRouteUnits(src, dst, required_write_unit);
     if (required_sender) {
-      units.erase(std::remove_if(
-                      units.begin(), units.end(),
-                      [&](NpuUnit unit) { return unit != *required_sender; }),
-                  units.end());
+      ICHECK(std::find(units.begin(), units.end(), *required_sender) !=
+             units.end())
+          << "Expected one A4E ODMA route for the selected transfer";
+      return *required_sender;
     }
     ICHECK_EQ(units.size(), 1U)
         << "Expected one A4E ODMA route for the selected transfer";
