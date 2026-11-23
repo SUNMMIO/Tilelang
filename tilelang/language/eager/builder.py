@@ -1,8 +1,10 @@
 from __future__ import annotations
 from contextlib import contextmanager, AbstractContextManager
 from dataclasses import dataclass
+import functools
 import inspect
 import sys
+from types import CodeType, MethodWrapperType
 
 from tilelang.language.kernel import KernelLaunchFrame
 from tvm_ffi.container import Map
@@ -35,6 +37,9 @@ import threading
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Python 3.14 added positional holes in functools.partial.
+_partial_placeholder = getattr(functools, "Placeholder", object())
 
 
 def unwrap_expr(expr) -> PrimExpr | int | float:
@@ -198,6 +203,8 @@ class Builder(BaseBuilder):
         self._dist_world_size = _current_world_size(allow_none=True)
         self._dist_rank_id_var: Var | None = None
         self._dist_signal_decl_count = 0
+        self._kernel_body_code: CodeType | None = None
+        self._dsl_body_codes: set[CodeType] = set()
 
     def attach_metadata(self, prim_func):
         """Attach collected Metadata to a PrimFunc as 'tensor_meta' attribute.
@@ -675,6 +682,51 @@ class Builder(BaseBuilder):
         else:
             return super().aug_assign_slice(op, target, sl, aug_value)
 
+    def instantiate_body(self, generator):
+        body = generator.gen(self)
+        code = body.__code__
+        if self._kernel_body_code is None:
+            self._kernel_body_code = code
+        if code not in self._dsl_body_codes:
+            # Include generated operand thunks and comprehensions. Keep code
+            # objects only for this build, never live Python frames.
+            pending = [code]
+            while pending:
+                nested = pending.pop()
+                self._dsl_body_codes.add(nested)
+                pending.extend(value for value in nested.co_consts if isinstance(value, CodeType))
+        return body
+
+    def check_wait_any_placement(self):
+        if self.find_frame_idx((BoolOpFrame, LazyOperandFrame)) is not None:
+            raise ValueError("T.dist.wait_any must be consumed in a statement branch; use if/else")
+        # A macro can emit a Let or Evaluate before Python calls the function
+        # receiving its result. Only transformed callers have operand guards.
+        # Check the whole expansion chain, including callbacks into DSL code.
+        caller = sys._getframe(2)  # caller of T.dist.wait_any
+        # These builder routines invoke transformed thunks; runtime lazy
+        # operands have already been rejected by the frame check above.
+        bridges = (
+            Macro.__call__.__code__,
+            Builder.lazy_operand.__code__,
+            Builder.ctx_while.__code__,
+            Builder.ifexp.__code__,
+            BaseBuilder.ifexp.__code__,
+            Builder.boolop.__code__,
+            BaseBuilder.boolop.__code__,
+        )
+        while caller is not None:
+            code = caller.f_code
+            if code is self._kernel_body_code:
+                return
+            if code not in self._dsl_body_codes and code not in bridges:
+                break
+            caller = caller.f_back
+        raise ValueError(
+            "T.dist.wait_any called through an ordinary Python helper requires a verified statement branch; "
+            "use @T.macro on the helper and consume the member in an explicit if/else"
+        )
+
     def boolop(self, op, left, right=None):
         left = unwrap_cond(left)
         if isinstance(left, PrimExpr):
@@ -689,10 +741,29 @@ class Builder(BaseBuilder):
         else:
             return super().boolop(op, left, right)
 
-    def lazy_operand(self, operand, callee, unpack=None):
+    def lazy_operand(self, operand, callee, position=None, unpack=None):
+        # Map this call's positional argument back to the intrinsic. Bound
+        # keywords do not shift positional slots; callers can override them.
+        while isinstance(callee, (functools.partial, MethodWrapperType)):
+            if isinstance(callee, MethodWrapperType):
+                if callee.__name__ != "__call__":
+                    return operand()
+                callee = callee.__self__
+                continue
+            if position is not None:
+                holes = [i for i, arg in enumerate(callee.args) if arg is _partial_placeholder]
+                position = holes[position] if position < len(holes) else len(callee.args) + position - len(holes)
+            callee = callee.func
+        if position is not None and position not in (1, 2):
+            return operand()
         from tilelang.language.tir.ir import if_then_else
 
-        if callee is not if_then_else and callee is not if_then_else.__wrapped__ and callee is not tvm.tir.if_then_else:
+        if (
+            callee is not if_then_else
+            and callee is not if_then_else.__wrapped__
+            and callee is not tvm.tir.if_then_else
+            and callee is not tir.if_then_else
+        ):
             return operand()
 
         # Collect statements locally. Only immutable read/pure bindings can be
@@ -913,7 +984,7 @@ class Macro(Generic[_P, _T]):
             raise JITNoBuilderError("T.macro can only be used inside @tilelang.jit")
 
         with builder.macro(self.name, self.annotations):
-            res = self.ir_gen.gen(builder)(*args, **kwargs)
+            res = builder.instantiate_body(self.ir_gen)(*args, **kwargs)
         return res
 
     def __hash__(self):
@@ -1181,7 +1252,7 @@ class TirTemplate(Generic[_P, _T]):
         builder.eager_jit = "phase2"
         builder.eager_jit_subs = subs
         with _dist_world_context_from_arguments(kwargs), builder.prim_func(self.name):
-            self.ir_gen.gen(builder)(**tensor_args, **kwargs)
+            builder.instantiate_body(self.ir_gen)(**tensor_args, **kwargs)
         pf = builder.get()
         pf = builder.attach_metadata(pf)
         if builder.out_idx:
@@ -1281,7 +1352,7 @@ class JITFunc(Generic[_P, _T]):
                 builder = Builder()
                 builder.eager_jit = "phase1"
                 with builder.prim_func(self.orig_func.__name__):
-                    self.ir_gen.gen(builder)(**self.tensor_args, **kwargs)
+                    builder.instantiate_body(self.ir_gen)(**self.tensor_args, **kwargs)
                 pf = builder.get()
                 pf = builder.attach_metadata(pf)
                 pf.orig_func = self.orig_func
@@ -1385,7 +1456,7 @@ def prim_func(func: Callable[_P, _T] = None, *, eager_jit: bool = False) -> Prim
         else:
             try:
                 with builder.prim_func(func.__name__):
-                    ir_gen.gen(builder)(**annot)
+                    builder.instantiate_body(ir_gen)(**annot)
                 prim_func = builder.get()
                 prim_func = builder.attach_metadata(prim_func)
                 prim_func.orig_func = func

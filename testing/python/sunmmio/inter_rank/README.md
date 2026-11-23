@@ -41,6 +41,7 @@ kernel factory 留在所属功能文件中，测试文件之间不相互导入�
 [整数转换 codegen 测试](../codegen/test_dist_integer_cast_policy_opt_validate.py)
 
 普通 `put` 的本地 copy、跨 row 搬运和远端发送共用拓扑规划确认的源。嵌套 signed 64 位循环的次数证明使用可验证的外层逻辑 IV 范围。
+消费式 `T.dist.wait_any` 的调用链须位于 kernel 或 `@T.macro` 中。需要按条件等待时，在显式 `if T.dist.has_pending(c)` 分支中取得成员，再将索引传给普通 Python helper。
 [路由与惰性宏测试](../codegen/test_dist_semantics_opt_validate.py) · [循环边界测试](../codegen/test_dist_audit_kernel_opt_validate.py)
 
 ## 日常验证

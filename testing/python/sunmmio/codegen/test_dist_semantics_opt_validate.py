@@ -1,5 +1,6 @@
 """Cross-pass semantic regressions, compiled from the public SunMMIO DSL."""
 
+import functools
 import re
 
 import pytest
@@ -19,12 +20,68 @@ tilelang.env.disable_cache()
 
 
 selectors = (T.if_then_else,)
+partial_choice = functools.partial(T.if_then_else)
+partial_script_choice = functools.partial(tvm.script.ir_builder.tir.if_then_else)
 
 
 @T.macro
 def wait_member_alias(c):
     member = T.dist.wait_any(c)
     return member
+
+
+def plain_next_or_none(c):
+    return T.if_then_else(T.dist.has_pending(c), wait_member_alias(c), -1)
+
+
+@T.macro
+def nested_member(c):
+    return wait_member_alias(c)
+
+
+def plain_nested_wait(c):
+    return T.if_then_else(T.dist.has_pending(c), nested_member(c), -1)
+
+
+@T.macro
+def checked_next_or_none(c):
+    member = T.alloc_var(T.int32, init=-1)
+    if T.dist.has_pending(c):
+        member = nested_member(c)
+    return T.Cast("int32", member)
+
+
+def plain_saved_member(used, member):
+    return T.if_then_else(used, member, -1)
+
+
+@tilelang.jit(target="sunmmio")
+def helper_wait_kernel(mode, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId, n: T.uint32):
+        with T.Kernel():
+            group = T.dist.signals(1, kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
+            delta = T.alloc_shared((16,), T.uint32)
+            T.fill(delta, n % T.uint32(2))
+            if n % T.uint32(2) != 0:
+                T.dist.put_signal(group[0], (rank_id + 1) % world_size, submit=True)
+            done = T.dist.completion(group, expected_deltas=delta[0:1])
+            result = T.alloc_var(T.int32, init=-1)
+            if mode == "plain":
+                result = plain_next_or_none(done)
+            elif mode == "nested":
+                result = plain_nested_wait(done)
+            elif mode == "checked":
+                result = checked_next_or_none(done)
+            else:
+                active = T.dist.has_pending(done)
+                if active:
+                    saved = nested_member(done)
+                    result = plain_saved_member(active, saved)
+            assert T.Cast("uint32", result + 1) == n % T.uint32(2), "wrong member"
+            T.dist.wait_all(done)
+
+    return main
 
 
 @tilelang.jit(target="sunmmio")
@@ -68,6 +125,43 @@ def consuming_wait_kernel(mode, world_size: int = 1):
     return main
 
 
+@tilelang.jit(target="sunmmio")
+def partial_wait_kernel(binding, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            group = T.dist.signals(1, kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
+            T.dist.put_signal(group[0], (rank_id + 1) % world_size, submit=True)
+            delta = T.alloc_shared((16,), T.uint32)
+            T.fill(delta, T.uint32(1))
+            done = T.dist.completion(group, expected_deltas=delta[0:1])
+            if binding == "unbound":
+                value = partial_choice(T.dist.has_pending(done), wait_member_alias(done), -1)
+            elif binding == "call":
+                value = partial_choice.__call__(T.dist.has_pending(done), wait_member_alias(done), -1)
+            elif binding == "script":
+                value = partial_script_choice(T.dist.has_pending(done), wait_member_alias(done), -1)
+            elif binding == "cond":
+                choose = functools.partial(partial_choice, T.dist.has_pending(done))
+                value = choose(wait_member_alias(done), -1)
+            elif binding == "cond_true":
+                choose = functools.partial(T.if_then_else, T.dist.has_pending(done), -1)
+                value = choose(wait_member_alias(done))
+            elif binding == "hole":
+                choose = functools.partial(T.if_then_else, T.dist.has_pending(done), functools.Placeholder, -1)
+                value = choose(wait_member_alias(done))
+            elif binding == "keyword":
+                choose = functools.partial(T.if_then_else, cond=T.dist.has_pending(done), f=-1)
+                value = choose(t=wait_member_alias(done))
+            else:
+                choose = functools.partial(T.if_then_else, t=1, f=0)
+                value = choose(wait_member_alias(done) == 0)
+            assert value == 1, "expected ready member"
+            T.dist.wait_all(done)
+
+    return main
+
+
 @T.macro
 def read_member(buf, i):
     value = buf[i]
@@ -75,14 +169,18 @@ def read_member(buf, i):
 
 
 @tilelang.jit(target="sunmmio")
-def lazy_read_kernel(world_size: int = 1):
+def lazy_read_kernel(bound=False, world_size: int = 1):
     @T.prim_func
     def main(rank_id: T.dist.RankId, i: T.int32):
         with T.Kernel():
             s = T.dist.signal(kind=T.dist.SignalKind.SRAM_MEMORY, expect="manual")
             buf = T.alloc_shared((16,), T.uint32)
             T.fill(buf, T.uint32(7))
-            value = selectors[0](i >= 0, read_member(buf, i), T.uint32(0))
+            if bound:
+                choose = functools.partial(partial_choice, i >= 0, f=T.uint32(0))
+                value = choose(read_member(buf, i))
+            else:
+                value = selectors[0](i >= 0, read_member(buf, i), T.uint32(0))
             T.dist.wait_signal(s, expected_delta=value)
 
     return main
@@ -215,6 +313,44 @@ def test_wait_any_rejects_runtime_lazy_operand(mode):
         lower_to_device_tir(consuming_wait_kernel.get_tir(mode, world_size=2))
 
 
+@pytest.mark.parametrize(
+    "binding",
+    [
+        "unbound",
+        "call",
+        "script",
+        "cond",
+        "cond_true",
+        "keyword",
+        pytest.param("hole", marks=pytest.mark.skipif(not hasattr(functools, "Placeholder"), reason="requires Python 3.14")),
+    ],
+)
+def test_partial_wait_any_in_lazy_operand_is_rejected_at_construction(binding):
+    with pytest.raises(ValueError, match="wait_any must be consumed in a statement branch"):
+        partial_wait_kernel.get_tir(binding, world_size=2)
+
+
+def test_partial_wait_any_in_eager_condition_is_consumed_once(tmp_path):
+    result, source = generate(partial_wait_kernel, tmp_path, binding="eager_condition")
+    _, events = trace_suvm_control_flow(result, source, rank_id=0, signal_values={0: 1}, max_loop_iterations=4)
+    assert sum(event[0] == "fetch" for event in events) == 1
+
+
+@pytest.mark.parametrize("mode", ["plain", "nested"])
+def test_plain_helper_cannot_hoist_macro_wait(mode):
+    with pytest.raises(ValueError, match=r"wait_any.*ordinary Python helper.*@T.macro"):
+        helper_wait_kernel.get_tir(mode, world_size=2)
+
+
+@pytest.mark.parametrize("mode", ["saved", "checked"])
+def test_explicit_helper_wait_has_statement_semantics(tmp_path, mode):
+    result, source = generate(helper_wait_kernel, tmp_path, mode=mode)
+    for rank in (0, 1):
+        for n in (0, 1):
+            _, events = trace_suvm_control_flow(result, source, rank_id=rank, n=n, signal_values={0: 1}, max_loop_iterations=4)
+            assert sum(event[0] == "fetch" for event in events) == n
+
+
 @pytest.mark.parametrize("mode", ["statement", "assignment"])
 def test_wait_any_consumes_once_in_taken_branch(tmp_path, mode):
     r, src = generate(consuming_wait_kernel, tmp_path, mode=mode)
@@ -316,8 +452,9 @@ def test_macro_local_reset_and_outer_lifetime(tmp_path):
             assert [e[1] for e in events if e[0] == "wait"] == expected
 
 
-def test_read_macro_remains_in_lazy_operand(tmp_path):
-    result, source = generate(lazy_read_kernel, tmp_path)
+@pytest.mark.parametrize("bound", [False, True])
+def test_read_macro_remains_in_lazy_operand(tmp_path, bound):
+    result, source = generate(lazy_read_kernel, tmp_path, bound=bound)
     for index, expected in ((-1, 0), (0, 7)):
         _, events = trace_suvm_control_flow(result, source, rank_id=0, i=index)
         assert [event[1] for event in events if event[0] == "wait"] == [expected]

@@ -466,14 +466,15 @@ def has_pending(completion: DistCompletion):
 
 
 def wait_any(completion: DistCompletion):
-    """Wait for and consume one pending source, returning its logical index."""
+    """Wait for and consume one pending source, returning its logical index.
+
+    Consume inside the kernel or a chain of @T.macro helpers so the frontend
+    can verify statement placement. Pass the saved index to ordinary Python
+    helpers when they only need its value.
+    """
 
     _check_completion(completion)
-    from tilelang.language.eager.builder import BoolOpFrame, LazyOperandFrame
-
-    builder = _current_dist_builder()
-    if builder.find_frame_idx((BoolOpFrame, LazyOperandFrame)) is not None:
-        raise ValueError("T.dist.wait_any must be consumed in a statement branch; use if/else")
+    _current_dist_builder().check_wait_any_placement()
     return tir.call_intrin("int32", tir.op.Op.get("tl.dist_wait_any"), completion.handle)
 
 
