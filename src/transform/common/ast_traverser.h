@@ -236,7 +236,7 @@ public:
 
   void VisitStmt_(const EvaluateNode *op) {
     const CallNode *call = op->value.as<CallNode>();
-    if (call->op.same_as(dma_copy()) ||
+    if (call->op.same_as(dma_copy()) || call->op.same_as(sunmmio_cumsum()) ||
         call->op.same_as(sunmmio_layout_transform()) ||
         call->op.same_as(sunmmio_transpose()) ||
         call->op.same_as(Op::Get("tl.broadcast_"))) {
