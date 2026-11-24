@@ -73,18 +73,77 @@ bool IsGlobalScope(const tir::Buffer &buffer) {
   return buffer.scope().empty() || buffer.scope() == "global";
 }
 
+// A declared buffer and its backing buffer share a data variable. Adapt the
+// inherited layout only for a full, contiguous alias at the same origin.
+bool CanAdaptDataAliasLayout(const tir::Buffer &source,
+                             const tl::Layout &layout,
+                             const tir::Buffer &view) {
+  if (source->dtype != view->dtype || view->shape.empty())
+    return false;
+
+  arith::Analyzer analyzer;
+  const auto source_shape = layout->InputShape();
+  if (source_shape.empty() ||
+      !tl::IsSameLayout(layout, tl::sunmmio::MakeRowMajor(source_shape),
+                        &analyzer) ||
+      !analyzer.CanProveEqual(source->elem_offset, 0) ||
+      !analyzer.CanProveEqual(view->elem_offset, 0))
+    return false;
+
+  const DataType i64 = DataType::Int(64);
+  // A metadata-free DRAM buffer can inherit a row-major layout even when
+  // its explicit TIR strides include padding. Singleton axes never advance.
+  if (!source->strides.empty()) {
+    PrimExpr expected_stride = tir::make_const(i64, 1);
+    for (size_t i = source->shape.size(); i > 0; --i) {
+      const PrimExpr &extent = source->shape[i - 1];
+      if (!analyzer.CanProveEqual(tir::Cast(i64, source->strides[i - 1]),
+                                  expected_stride) &&
+          !analyzer.CanProveEqual(extent, 1))
+        return false;
+      expected_stride = expected_stride * tir::Cast(i64, extent);
+    }
+  }
+
+  PrimExpr view_size = tir::make_const(i64, 1);
+  for (size_t i = view->shape.size(); i > 0; --i) {
+    if (!view->strides.empty() &&
+        !analyzer.CanProveEqual(tir::Cast(i64, view->strides[i - 1]),
+                                view_size))
+      return false;
+    view_size = view_size * tir::Cast(i64, view->shape[i - 1]);
+  }
+  PrimExpr source_size = tir::make_const(i64, 1);
+  for (const PrimExpr &extent : source_shape)
+    source_size = source_size * tir::Cast(i64, extent);
+  return analyzer.CanProveEqual(source_size, view_size);
+}
+
 ffi::Optional<tl::Layout>
 LookupLayoutInMap(const SunmmioMlirContext::TirLayoutMap &layout_map,
                   const tir::Buffer &buffer) {
   if (layout_map.count(buffer)) {
     return layout_map[buffer];
   }
-  for (const auto &kv : layout_map) {
-    const tir::Buffer &candidate = kv.first;
-    if (candidate->data.same_as(buffer->data)) {
-      return kv.second;
+  ffi::Optional<tl::Layout> data_match;
+  for (const auto &[candidate, layout] : layout_map) {
+    if (!candidate->data.same_as(buffer->data))
+      continue;
+    if (!IsGlobalScope(buffer))
+      return layout;
+    if (layout->InputDim() == buffer->shape.size()) {
+      if (!data_match.defined())
+        data_match = layout;
+      continue;
     }
+    // The map can list a same-rank alias before its backing buffer. Every
+    // rank-changing match must be compatible with the declared view.
+    if (!CanAdaptDataAliasLayout(candidate, layout, buffer))
+      return layout;
+    data_match = tl::sunmmio::MakeRowMajor(buffer->shape);
   }
+  if (data_match.defined())
+    return data_match;
   ffi::Optional<tl::Layout> name_match;
   int name_match_count = 0;
   for (const auto &kv : layout_map) {
