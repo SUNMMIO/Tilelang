@@ -35,6 +35,28 @@ mlir::Value GetTileCastOp(SunmmioMlirContext &ctx, mlir::Value src_value,
   mlir::Type dst_mlir_type = MapMlirType(ctx, dst_type);
   auto tile_type = mlir::dyn_cast<mlir::suvm::TileType>(dst_mlir_type);
   ICHECK(tile_type) << "Expected SUVM tile type for tile.cast result";
+  auto src_tile_type = mlir::cast<mlir::suvm::TileType>(src_value.getType());
+  if (src_tile_type.getElementType().isF32() &&
+      tile_type.getElementType().isInteger(32)) {
+    // TIR floating-to-integer casts truncate toward zero.
+    auto truncated = mlir::suvm::TileTruncOp::create(
+        ctx.builder, loc, src_tile_type, src_value, mlir::Value(),
+        mlir::Value());
+    ctx.CompleteConsumedTileLoads(truncated.getOperation());
+    src_value = truncated.getResult();
+    if (dst_type.dtype.is_uint()) {
+      // Select unsigned conversion while keeping signless storage types.
+      auto unsigned_type = mlir::suvm::TileType::get(
+          tile_type.getShape(),
+          mlir::IntegerType::get(&ctx.mlir_ctx, 32,
+                                 mlir::IntegerType::Unsigned));
+      auto converted = mlir::suvm::TileCastOp::create(ctx.builder, loc,
+                                                      unsigned_type, src_value);
+      return mlir::suvm::TileBitCastOp::create(ctx.builder, loc, tile_type,
+                                               converted.getResult())
+          .getResult();
+    }
+  }
   return mlir::suvm::TileCastOp::create(ctx.builder, loc, tile_type, src_value)
       .getResult();
 }
