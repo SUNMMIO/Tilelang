@@ -1,8 +1,8 @@
 # Inter-rank 测试
 
-本目录顶层功能测试验证 DSL 到最终 device TIR，不执行 codegen、设备运行或数值正确性测试。
-本地 `kernel/` 中的应用示例另含六类 codegen/SUVM/A4E 验证，按需独立运行；
-运行及 TIR/MLIR 日志方法见本地 `kernel/README.md`。
+本目录的功能测试验证从 DSL 到最终 device TIR 的编译流程。
+SUVM MLIR 生成和 A4E 编译约束由[点对点 codegen 测试](../codegen/test_dist_basic_opt_validate.py)
+和[集合通信 codegen 测试](../codegen/test_dist_integration_opt_validate.py)验证。
 正式测试按功能归档；新增回归用例放回对应功能文件，不再按开发阶段或审查批次新建文件。
 
 ## 功能分工
@@ -57,9 +57,7 @@ conda run -n my-tilelang python -m pytest -q testing/python/sunmmio/inter_rank/t
 同一语义的参数变体优先参数化。不同层次的有效覆盖保留，公共规则的重复用例集中到负责该规则的文件。
 优先检查 op 参数、Buffer 关联与控制流结构，避免依赖自动变量后缀或整段 TIR 文本。
 
-日常只运行相关用例；完整回归另行指定。不要直接递归运行本目录：`kernel/` 的迁移和检查单独进行。
-本地的 `kernel/` 应用示例及 `kernel/history/` 草稿独立维护，不属于这里的正式回归集合。
-测试不读取本说明或 `doc/` 中的文档。
+日常按涉及的功能选择上表中的测试文件或用例。
 
 ## 显式打印 TIR
 
@@ -76,4 +74,4 @@ conda run -n my-tilelang python -m testing.python.sunmmio.inter_rank.show_dist_t
 conda run -n my-tilelang python -m testing.python.sunmmio.inter_rank.show_dist_tir --case cross_row_routing --output log
 ```
 
-日志仍写入本目录的 `log/<kernel 名>.log`，不纳入提交。
+生成的 TIR 日志保存在本地。
