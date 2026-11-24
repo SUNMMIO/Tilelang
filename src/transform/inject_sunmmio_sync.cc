@@ -24,6 +24,7 @@
  */
 
 #include <tvm/arith/analyzer.h>
+#include <tvm/arith/pattern.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/target/target.h>
 #include <tvm/tir/builtin.h>
@@ -36,8 +37,10 @@
 #include <algorithm>
 #include <cstdint>
 #include <initializer_list>
+#include <map>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -45,6 +48,7 @@
 #include "../op/comm.h"
 #include "../op/utils.h"
 #include "../target/sunmmio_utils.h"
+#include "common/attr.h"
 #include "common/mx_view.h"
 
 namespace tvm {
@@ -505,6 +509,305 @@ bool NeedsUnitSync(const UnitAccess &producer, const UnitAccess &consumer) {
          consumer.write;
 }
 
+// Pipeline and unknown loop annotations may imply scheduling/lifetime rules
+// outside these proofs. Only the already lowered tile metadata is accepted.
+bool HasOnlyTileLoopAnnotations(const ForNode *loop) {
+  for (const auto &item : loop->annotations) {
+    const std::string key = item.first;
+    if (key != attr::kTileDomain && key != "tile.loop_parallel" &&
+        key != "tile.loop_stage" && key != "tile.execution_axis" &&
+        key != "tile.execution_domain_axes" && key != "tile.scope_entry" &&
+        key != "tile.tile_size" && key != "tile.interior" &&
+        key != "tile.interior_axis") {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Prove a narrow vector-only map loop before moving its backedge drains to
+// the exit. Distinct local allocations rule out aliasing; output spans must
+// be disjoint across iterations. Unknown calls/control flow and in-place maps
+// retain the conservative path below.
+class IndependentTileLoopProof {
+public:
+  IndependentTileLoopProof(const std::unordered_set<const VarNode *> &allocated,
+                           const Var &outer)
+      : allocated_(allocated), outer_(outer) {}
+
+  bool Check(const ForNode *loop) {
+    const auto *min = loop->min.as<IntImmNode>();
+    const auto *extent = loop->extent.as<IntImmNode>();
+    if (loop->kind != ForKind::kSerial || !HasOnlyTileLoopAnnotations(loop) ||
+        loop->annotations.count(attr::kTileDomain) || !min || !extent ||
+        min->value < 0 || extent->value <= 0) {
+      return false;
+    }
+    analyzer_.Bind(loop->loop_var,
+                   Range::FromMinExtent(loop->min, loop->extent));
+    if (!CheckStmt(loop->body, false))
+      return false;
+    if (!saw_tiles_ || writes_.empty() || !PureIndex(loop->min) ||
+        !PureIndex(loop->extent) ||
+        (loop->step.defined() && !is_one(loop->step.value()))) {
+      return false;
+    }
+    for (const auto &[data, span] : writes_) {
+      if (reads_.count(data) || span.max - span.min >= span.stride) {
+        return false;
+      }
+      const auto *size = span.buffer->shape[0].as<IntImmNode>();
+      __int128 last = (static_cast<__int128>(min->value) + extent->value - 1) *
+                          span.stride +
+                      span.max;
+      __int128 index_max =
+          (static_cast<__int128>(1) << (span.index_bits - 1)) - 1;
+      if (!size || last >= size->value || last > index_max)
+        return false;
+    }
+    return true;
+  }
+
+private:
+  struct WriteSpan {
+    const BufferNode *buffer;
+    int64_t stride;
+    int64_t min;
+    int64_t max;
+    int index_bits;
+  };
+
+  static bool PureIndex(const PrimExpr &expr) {
+    bool pure = true;
+    PostOrderVisit(expr, [&](const ObjectRef &node) {
+      if (node.as<BufferLoadNode>() || node.as<CallNode>())
+        pure = false;
+    });
+    return pure;
+  }
+
+  bool LocalBuffer(const Buffer &buffer) const {
+    return buffer.scope() == kSunmmioScopeRSRAM &&
+           allocated_.count(buffer->data.get());
+  }
+
+  bool CheckExpr(const PrimExpr &expr) {
+    bool valid = true;
+    PostOrderVisit(expr, [&](const ObjectRef &node) {
+      if (node.as<CallNode>())
+        valid = false;
+      if (const auto *load = node.as<BufferLoadNode>()) {
+        if (!LocalBuffer(load->buffer))
+          valid = false;
+        for (const PrimExpr &index : load->indices) {
+          if (!PureIndex(index))
+            valid = false;
+        }
+        reads_.insert(load->buffer->data.get());
+      }
+    });
+    return valid;
+  }
+
+  bool CheckStmt(const Stmt &stmt, bool in_tiles) {
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const Stmt &child : seq->seq) {
+        if (!CheckStmt(child, in_tiles))
+          return false;
+      }
+      return true;
+    }
+    if (const auto *loop = stmt.as<ForNode>()) {
+      const auto *min = loop->min.as<IntImmNode>();
+      const auto *extent = loop->extent.as<IntImmNode>();
+      if (!min || !extent || extent->value <= 0 ||
+          loop->thread_binding.defined() || !HasOnlyTileLoopAnnotations(loop) ||
+          (loop->kind != ForKind::kSerial && loop->kind != ForKind::kParallel &&
+           loop->kind != ForKind::kVectorized) ||
+          (loop->step.defined() && !is_one(loop->step.value())))
+        return false;
+      analyzer_.Bind(loop->loop_var,
+                     Range::FromMinExtent(loop->min, loop->extent));
+      bool tile_root = loop->annotations.count(attr::kTileDomain);
+      saw_tiles_ |= tile_root;
+      return CheckStmt(loop->body, in_tiles || tile_root);
+    }
+    const auto *store = stmt.as<BufferStoreNode>();
+    if (!store || !in_tiles || !LocalBuffer(store->buffer) ||
+        store->indices.size() != 1 || store->buffer->shape.size() != 1 ||
+        (store->indices[0].dtype().bits() != 32 &&
+         store->indices[0].dtype().bits() != 64) ||
+        !store->buffer->strides.empty() ||
+        !is_zero(store->buffer->elem_offset) || !PureIndex(store->indices[0]) ||
+        !CheckExpr(store->value) ||
+        (store->predicate.defined() && !PureIndex(store->predicate.value()))) {
+      return false;
+    }
+    Array<PrimExpr> linear =
+        arith::DetectLinearEquation(store->indices[0], {outer_});
+    if (linear.size() != 2)
+      return false;
+    const auto *stride = linear[0].as<IntImmNode>();
+    if (!stride || stride->value <= 0)
+      return false;
+    arith::ConstIntBound bound = analyzer_.const_int_bound(linear[1]);
+    if (bound->min_value < 0 ||
+        bound->max_value == arith::ConstIntBound::kPosInf) {
+      return false;
+    }
+    const VarNode *data = store->buffer->data.get();
+    auto it = writes_.find(data);
+    if (it == writes_.end()) {
+      writes_.emplace(data, WriteSpan{store->buffer.get(), stride->value,
+                                      bound->min_value, bound->max_value,
+                                      store->indices[0].dtype().bits()});
+    } else {
+      if (it->second.buffer != store->buffer.get() ||
+          it->second.stride != stride->value)
+        return false;
+      it->second.min = std::min(it->second.min, bound->min_value);
+      it->second.max = std::max(it->second.max, bound->max_value);
+      it->second.index_bits =
+          std::min(it->second.index_bits, store->indices[0].dtype().bits());
+    }
+    return true;
+  }
+
+  const std::unordered_set<const VarNode *> &allocated_;
+  Var outer_;
+  arith::Analyzer analyzer_;
+  bool saw_tiles_{false};
+  std::unordered_set<const VarNode *> reads_;
+  std::map<const VarNode *, WriteSpan> writes_;
+};
+
+// Only defer global-to-WSRAM DMA across a tile loop
+// whose explicit effects are confined to already allocated RSRAM buffers.
+// This is NOT loop-carried independence and does not remove backedge waits.
+class RsramOnlyTileLoopProof {
+public:
+  explicit RsramOnlyTileLoopProof(
+      const std::unordered_set<const VarNode *> &allocated)
+      : allocated_(allocated) {}
+
+  bool Check(const ForNode *op) {
+    return op->annotations.count(attr::kTileDomain) &&
+           CheckStmt(ffi::GetRef<Stmt>(op));
+  }
+
+private:
+  bool LocalBuffer(const Buffer &buffer) const {
+    return buffer.scope() == kSunmmioScopeRSRAM &&
+           allocated_.count(buffer->data.get());
+  }
+
+  bool CheckExpr(const PrimExpr &expr, bool allow_loads,
+                 bool allow_region = false) const {
+    bool valid = true;
+    PostOrderVisit(expr, [&](const ObjectRef &node) {
+      if (const auto *call = node.as<CallNode>()) {
+        // Do not trust generic "pure" call annotations for hardware effects.
+        // The first C1 mask loop only needs this explicitly supported select.
+        if (!call->op.same_as(builtin::if_then_else()) &&
+            !(allow_region && call->op.same_as(Op::Get("tl.tileop.region"))))
+          valid = false;
+      }
+      if (const auto *load = node.as<BufferLoadNode>()) {
+        if (!allow_loads || !LocalBuffer(load->buffer))
+          valid = false;
+      }
+      if (const auto *var = node.as<VarNode>()) {
+        if (var->dtype.is_handle())
+          valid = false;
+      }
+    });
+    return valid;
+  }
+
+  bool CheckStmt(const Stmt &stmt) {
+    if (const auto *loop = stmt.as<ForNode>()) {
+      if (loop->kind != ForKind::kSerial && loop->kind != ForKind::kParallel &&
+          loop->kind != ForKind::kVectorized)
+        return false;
+      if (loop->thread_binding.defined())
+        return false;
+      if (!HasOnlyTileLoopAnnotations(loop))
+        return false;
+      return CheckExpr(loop->min, false) && CheckExpr(loop->extent, false) &&
+             (!loop->step.defined() || CheckExpr(loop->step.value(), false)) &&
+             CheckStmt(loop->body);
+    }
+    if (const auto *seq = stmt.as<SeqStmtNode>()) {
+      for (const Stmt &child : seq->seq) {
+        if (!CheckStmt(child))
+          return false;
+      }
+      return true;
+    }
+    if (const auto *store = stmt.as<BufferStoreNode>()) {
+      if (!LocalBuffer(store->buffer) || !CheckExpr(store->value, true))
+        return false;
+      for (const PrimExpr &index : store->indices) {
+        if (!CheckExpr(index, false))
+          return false;
+      }
+      return !store->predicate.defined() ||
+             CheckExpr(store->predicate.value(), false);
+    }
+    if (const auto *branch = stmt.as<IfThenElseNode>()) {
+      return CheckExpr(branch->condition, true) &&
+             CheckStmt(branch->then_case) &&
+             (!branch->else_case.defined() ||
+              CheckStmt(branch->else_case.value()));
+    }
+    if (const auto *alloc = stmt.as<AllocateNode>()) {
+      const auto *ptr =
+          alloc->buffer_var->type_annotation.as<PointerTypeNode>();
+      if (!ptr || ptr->storage_scope != kSunmmioScopeRSRAM ||
+          !CheckExpr(alloc->condition, false))
+        return false;
+      for (const PrimExpr &extent : alloc->extents) {
+        if (!CheckExpr(extent, false))
+          return false;
+      }
+      for (const auto &item : alloc->annotations) {
+        if (item.first != "tile.sunmmio_reduce_register_temp")
+          return false;
+      }
+      bool inserted = allocated_.insert(alloc->buffer_var.get()).second;
+      bool valid = CheckStmt(alloc->body);
+      if (inserted)
+        allocated_.erase(alloc->buffer_var.get());
+      return valid;
+    }
+    if (const auto *decl = stmt.as<DeclBufferNode>()) {
+      return LocalBuffer(decl->buffer) && CheckStmt(decl->body);
+    }
+    if (const auto *eval = stmt.as<EvaluateNode>()) {
+      const auto *call = eval->value.as<CallNode>();
+      if (!call || !call->op.same_as(vector_core_in_tile_reduce()) ||
+          call->args.size() != 4)
+        return false;
+      const auto *kind = call->args[0].as<StringImmNode>();
+      if (!kind || (kind->value != "max" && kind->value != "min" &&
+                    kind->value != "sum"))
+        return false;
+      for (int index : {1, 2}) {
+        const auto *region = call->args[index].as<CallNode>();
+        if (!region || !region->op.same_as(Op::Get("tl.tileop.region")) ||
+            !CheckExpr(call->args[index], true, true))
+          return false;
+      }
+      return CheckExpr(call->args[3], false);
+    }
+    // Reject DMA, explicit sync/barriers, unknown calls, attributes and
+    // escapes.
+    return false;
+  }
+
+  std::unordered_set<const VarNode *> allocated_;
+};
+
 class InjectUnitSyncRewriter : public StmtMutator {
 public:
   Stmt operator()(Stmt body) {
@@ -863,7 +1166,11 @@ private:
     }
     CollectTileLoads(op->condition, &accesses);
     SunmmioSyncUnits required = ProcessAccesses(accesses);
-    return PrependSync(StmtMutator::VisitStmt_(op), required);
+    bool inserted = allocated_.insert(op->buffer_var.get()).second;
+    Stmt rewritten = StmtMutator::VisitStmt_(op);
+    if (inserted)
+      allocated_.erase(op->buffer_var.get());
+    return PrependSync(std::move(rewritten), required);
   }
 
   Stmt VisitStmt_(const BufferRealizeNode *op) final {
@@ -917,6 +1224,57 @@ private:
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
+    std::vector<UnitAccess> deferred;
+    RsramOnlyTileLoopProof proof(allocated_);
+    if (proof.Check(op)) {
+      // Completion is per unit, so defer ALL pending accesses on ODMA0 or
+      // none of them. Unresolved/multi-unit work and other transfers reject.
+      bool eligible = true, saw_read = false, saw_write = false;
+      for (const UnitAccess &access : pending_) {
+        if (!(access.units & kSunmmioSyncOdma0))
+          continue;
+        const std::string scope = access.buffer.scope();
+        bool read =
+            !access.write && (scope == "global" || scope == "global.dram");
+        bool write = access.write && scope == kSunmmioScopeWSRAM &&
+                     allocated_.count(access.buffer->data.get());
+        if (access.units != kSunmmioSyncOdma0 ||
+            access.producer_kind != AccessProducerKind::kAsync ||
+            (!read && !write))
+          eligible = false;
+        saw_read |= read;
+        saw_write |= write;
+      }
+      if (eligible && saw_read && saw_write) {
+        std::vector<UnitAccess> remaining;
+        for (const UnitAccess &access : pending_) {
+          (access.units == kSunmmioSyncOdma0 ? deferred : remaining)
+              .push_back(access);
+        }
+        pending_ = std::move(remaining);
+      }
+    }
+    // Existing traversal still drains TC, Vector/RSRAM and every backedge.
+    // The proof excludes any instruction inside the loop using deferred DMA.
+    Stmt result = RewriteLoop(op);
+    // Complete the deferred unit at this loop's exit, including zero-trip
+    // loops and terminal loops with no subsequent consumer. No pending state
+    // is allowed to escape its original allocation/function lifetime.
+    return AppendSync(std::move(result),
+                      deferred.empty() ? kSunmmioSyncNone : kSunmmioSyncOdma0);
+  }
+
+  Stmt RewriteLoop(const ForNode *op) {
+
+    IndependentTileLoopProof proof(allocated_, op->loop_var);
+    if (proof.Check(op)) {
+      SunmmioSyncUnits prefix = DrainPending();
+      // The body has only independent tile loads/stores. Keep its operations
+      // ordered, but do not drain vector/RSRAM at every loop backedge. Complete
+      // all accesses once before any later scalar or async consumer.
+      return PrependSync(AppendSync(ffi::GetRef<Stmt>(op), kTileMemoryUnits),
+                         prefix);
+    }
     // Conservatively drain at entry and at each backedge. Straight-line code
     // remains dependency-driven; loop overlap can be recovered later with a
     // dedicated unit-aware loop-carried analysis.
@@ -955,6 +1313,7 @@ private:
   }
 
   std::vector<UnitAccess> pending_;
+  std::unordered_set<const VarNode *> allocated_;
 };
 
 class InjectBroadcastBarriersRewriter : public StmtMutator {
