@@ -106,6 +106,7 @@ jobs:
       NPUIR_CACHE_ROOT: /ci-cache/npuir
       LLVM_SDK_COMPILE_JOBS: "8"
       LLVM_SDK_LINK_JOBS: "2"
+      CLANG_TIDY_JOBS: "8"
       CLANG_TIDY_VENV: /tmp/tilelang-clang-tidy-venv
       TEST_VENV: /tmp/tilelang-test-venv
       CLANG_TIDY_BUILD_DIR: /tmp/tilelang-clang-tidy-build
@@ -415,12 +416,13 @@ jobs:
           CLANG_APPLY_REPLACEMENTS_BIN="${CLANG_TIDY_VENV}/bin/clang-apply-replacements"
           echo "\$ ${CLANG_TIDY_BIN} --version" && "${CLANG_TIDY_BIN}" --version
           echo "Using Sunmmio CMake args: ${TILELANG_SUNMMIO_CMAKE_ARGS}"
+          echo "Using clang-tidy parallel jobs: ${CLANG_TIDY_JOBS}"
 
           # Run clang-tidy before provisioning the Python test environment.
           RCT_URL=https://raw.githubusercontent.com/llvm/llvm-project/refs/heads/release/21.x/clang-tools-extra/clang-tidy/tool/run-clang-tidy.py
           echo "Downloading run-clang-tidy script from ${RCT_URL}"
           curl -LsSf "${RCT_URL}" -o "${RUN_CLANG_TIDY_SCRIPT}"
-          CLANG_TIDY=("${CLANG_TIDY_PYTHON}" "${RUN_CLANG_TIDY_SCRIPT}" -j "$(nproc)")
+          CLANG_TIDY=("${CLANG_TIDY_PYTHON}" "${RUN_CLANG_TIDY_SCRIPT}" -j "${CLANG_TIDY_JOBS}")
           if [[ -x "${CLANG_APPLY_REPLACEMENTS_BIN}" ]]; then
             echo "Using clang-apply-replacements from ${CLANG_APPLY_REPLACEMENTS_BIN}"
             CLANG_TIDY+=(-fix -clang-apply-replacements-binary="${CLANG_APPLY_REPLACEMENTS_BIN}")
@@ -443,7 +445,7 @@ jobs:
             "${TILELANG_SUNMMIO_CMAKE_ARGS_ARRAY[@]}"
           if [[ "${TILELANG_SUNMMIO_CMAKE_ARGS}" == *"-DUSE_SUNMMIO=ON"* ]]; then
             cmake --build "${CLANG_TIDY_BUILD_DIR}" \
-              --target tilelang_highs SUVMIncGen -j "$(nproc)"
+              --target tilelang_highs SUVMIncGen -j "${CLANG_TIDY_JOBS}"
           fi
           flock -u 9
 
