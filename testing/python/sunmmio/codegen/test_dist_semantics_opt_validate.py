@@ -239,34 +239,31 @@ def topology_kernel(mode, manual=False, kind=T.dist.SignalKind.SRAM_MEMORY, worl
             dst = T.alloc_shared((256,), T.int32)
             signal = T.dist.signal(kind=kind, expect="manual" if manual else "auto")
             T.fill(src, 1)
+            # Independent compile-time mode checks keep the generated DSL blocks shallow.
             if mode == "self":
                 T.dist.put_signal(signal, rank_id)
-            elif mode == "partial":
+            if mode == "partial":
                 T.dist.put_signal(signal, 0)
-            elif mode == "column":
-                if rank_id < 2 and core % T.mesh_ncols() == rank_id:
-                    T.dist.put_signal(signal, 2)
-            elif mode == "iv_source":
+            if mode == "column" and rank_id < 2 and core % T.mesh_ncols() == rank_id:
+                T.dist.put_signal(signal, 2)
+            if mode == "iv_source":
                 for i in T.serial(1, 3):
                     if rank_id == i:
                         T.dist.put_signal(signal, 0)
-            elif mode == "two_senders":
-                if rank_id != 2:
-                    T.dist.put_signal(signal, 2)
-            elif mode == "ring":
+            if mode == "two_senders" and rank_id != 2:
+                T.dist.put_signal(signal, 2)
+            if mode == "ring":
                 for i in T.serial(1, world_size):
                     T.dist.put_signal(signal, (rank_id + i) % world_size)
-            elif mode == "local_guard":
-                if core // T.mesh_ncols() == 0:
-                    T.dist.routed_put(src, dst, routes=[[0, rank_id, 1]], signal=signal)
-            elif mode == "local":
+            if mode == "local_guard" and core // T.mesh_ncols() == 0:
                 T.dist.routed_put(src, dst, routes=[[0, rank_id, 1]], signal=signal)
-            elif mode == "rank_guard":
-                if rank_id == 1:
-                    T.dist.routed_put(src, dst, routes=[[0, rank_id - 1, 0]], signal=signal)
-            elif mode == "inactive":
+            if mode == "local":
+                T.dist.routed_put(src, dst, routes=[[0, rank_id, 1]], signal=signal)
+            if mode == "rank_guard" and rank_id == 1:
+                T.dist.routed_put(src, dst, routes=[[0, rank_id - 1, 0]], signal=signal)
+            if mode == "inactive":
                 T.dist.routed_put(src, dst, src_rank=1, routes=[[0, rank_id - 1, 0]], signal=signal)
-            else:
+            if mode == "mixed":
                 T.dist.routed_put(src, dst, routes=[[0, 1 - rank_id, rank_id]], signal=signal)
             T.dist.submit()
             if manual:
