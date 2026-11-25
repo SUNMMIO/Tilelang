@@ -7,6 +7,7 @@ import tilelang.language as T
 from tilelang import tvm
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import (
+    base_mod,
     collect_calls,
 )
 
@@ -175,7 +176,8 @@ def sender_local_condition_kernel_factory(
                         T.copy(src, dst)
             T.dist.submit()
             if manual:
-                T.dist.wait_signal(signals[0], expected_delta=recv_count)
+                if recv_count >= 0 and recv_count <= 255:
+                    T.dist.wait_signal(signals[0], expected_delta=recv_count)
             else:
                 T.dist.wait_signal(signal)
 
@@ -300,7 +302,8 @@ def loop_expect_kernel_factory(
                         T.dist.put(src, dst, (rank_id + 1) % world_size, signal=signals[0] if group_member else signal, submit=True)
 
             if expect_mode == "manual":
-                T.dist.wait_signal(signals[0] if group_member else signal, expected_delta=recv_count)
+                if recv_count >= 0 and recv_count <= 255:
+                    T.dist.wait_signal(signals[0] if group_member else signal, expected_delta=recv_count)
             else:
                 T.dist.wait_signal(signals[0] if group_member else signal)
 
@@ -339,7 +342,7 @@ def static_destination_loop_kernel_factory(group_member=False, world_size: int =
 
 
 @tilelang.jit(target="sunmmio")
-def collective_loop_kernel_factory(variable_counts=False, world_size: int = 1):
+def collective_loop_kernel_factory(variable_counts=False, bounded=False, world_size: int = 1):
     @T.prim_func
     def main(rank_id: T.dist.RankId, rounds: T.int32):
         with T.Kernel():
@@ -349,7 +352,7 @@ def collective_loop_kernel_factory(variable_counts=False, world_size: int = 1):
             send_counts = T.alloc_shared((world_size,), T.int32)
             recv_counts = T.alloc_shared((world_size,), T.int32)
             signals = T.dist.signals(world_size)
-            for _ in T.serial(rounds):
+            for _ in T.serial(T.min(T.max(rounds, 0), 2) if bounded else rounds):
                 if variable_counts:
                     completion = T.dist.all_to_allv(
                         src,
@@ -440,7 +443,8 @@ def test_independent_signal_wait_then_send_keeps_each_expectation(group_members)
     ],
 )
 def test_unproven_if_else_expectation_is_rejected(pattern, send_in_else):
-    with pytest.raises(tvm.error.InternalError, match="(Cannot.*T.dist|sent after a wait)"):
+    message = "explicit return/break/continue" if pattern == "early_return" else "(Cannot.*T.dist|sent after a wait)"
+    with pytest.raises(tvm.error.InternalError, match=message):
         lower_to_device_tir(
             unsafe_phase_kernel_factory.get_tir(
                 pattern=pattern,
@@ -523,7 +527,8 @@ def test_conditional_while_rejects_hoisting_auto_expectation(iterations):
     ],
 )
 def test_auto_rejects_unproven_loop_iterations(bound, form):
-    with pytest.raises(tvm.error.InternalError, match="cannot prove matching.*loop"):
+    message = "explicit return/break/continue" if form == "exit" else "cannot prove matching.*loop"
+    with pytest.raises(tvm.error.InternalError, match=message):
         lower_to_device_tir(
             loop_expect_kernel_factory.get_tir(
                 bound=bound,
@@ -531,6 +536,27 @@ def test_auto_rejects_unproven_loop_iterations(bound, form):
                 world_size=4,
             )
         )
+
+
+def test_auto_loop_analysis_rejects_early_exit_in_single_pass():
+    mod = base_mod(loop_expect_kernel_factory.get_tir(bound="static", form="exit", world_size=4))
+    mod = tilelang.transform.InferSramScope()(mod)
+    with pytest.raises(tvm.error.InternalError, match="cannot prove matching.*loop"):
+        tilelang.transform.PlanDistSignals()(mod)
+
+
+def test_auto_phase_analysis_rejects_early_return_in_single_pass():
+    mod = base_mod(unsafe_phase_kernel_factory.get_tir(pattern="early_return", send_in_else=True, world_size=2))
+    for transform in (
+        tilelang.transform.InferSramScope(),
+        tilelang.transform.PlanDistSignals(),
+        tilelang.transform.LowerDistRouting(),
+        tilelang.transform.LegalizeSunmmioDataPath(),
+        tilelang.transform.SunmmioLayoutInference(),
+    ):
+        mod = transform(mod)
+    with pytest.raises(tvm.error.InternalError, match="Cannot.*T.dist"):
+        tilelang.transform.LowerDistCommunication()(mod)
 
 
 @pytest.mark.parametrize(
@@ -625,10 +651,13 @@ def test_allgather_auto_completion_does_not_bypass_loop_check():
         lower_to_device_tir(collective_loop_kernel_factory.get_tir(world_size=4))
 
 
-def test_alltoallv_protocol_manual_allows_dynamic_loop():
+def test_alltoallv_protocol_manual_requires_bounded_expected_accumulation():
+    with pytest.raises(tvm.error.InternalError, match="cannot prove cumulative expected"):
+        lower_to_device_tir(collective_loop_kernel_factory.get_tir(variable_counts=True, world_size=4))
     result = lower_to_device_tir(
         collective_loop_kernel_factory.get_tir(
             variable_counts=True,
+            bounded=True,
             world_size=4,
         ),
         capture_passes="tl.PlanDistSignals",

@@ -1,5 +1,6 @@
 #include "codegen_sunmmio.h"
 
+#include "../../op/builtin.h"
 #include "../../op/utils.h"
 #include "../../transform/common/attr.h"
 #include "../sunmmio_utils.h"
@@ -26,6 +27,15 @@ namespace codegen {
 namespace {
 
 using namespace tir;
+
+Optional<PrimExpr> TileCastOperand(const PrimExpr &expr) {
+  if (const auto *cast = expr.as<CastNode>())
+    return cast->value;
+  if (const auto *call = expr.as<CallNode>();
+      call && call->op.same_as(tl::sunmmio_tile_integer_cast()))
+    return call->args[0];
+  return std::nullopt;
+}
 
 bool IsSunmmioLocalVarBuffer(const tir::Buffer &buffer) {
   if (!buffer.defined()) {
@@ -740,8 +750,9 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
 
     access->aligned_load_bytes = align_bytes;
     access->aligned_load_elems = align_elems;
-    access->requires_aligned_1d_load =
-        access->tile_shape[0] < access->aligned_load_elems;
+    auto carrier = tl::GetSunmmioStoreCarrier(
+        access->tile_shape, dtype, tile_processor_config, {}, {}, {});
+    access->requires_aligned_1d_load = carrier.value() != access->tile_shape;
     access->may_cross_aligned_1d_carrier =
         access->requires_aligned_1d_load &&
         access->aligned_load_elems % access->tile_shape[0] != 0;
@@ -797,61 +808,15 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
         ExtractStaticPrimExprs(memtensor_type.layout_hshape, "layout shape");
     std::vector<int64_t> strides =
         ExtractStaticPrimExprs(memtensor_type.layout_hstride, "layout stride");
-    int64_t capacity_elems = tile_processor_config.register_bits / dtype.bits();
-    int64_t logical_elems = access->tile_shape[0] * access->tile_shape[1];
-    bool is_flat_row_major = memtensor_type.layout_dim_levels[0] == 1 &&
-                             memtensor_type.layout_dim_levels[1] == 1 &&
-                             layout_shape.size() == 2 && strides.size() == 2 &&
-                             strides[1] == 1 && strides[0] == layout_shape[1];
-    if (is_flat_row_major && logical_elems < capacity_elems) {
-      int64_t carrier_width = layout_shape[1];
-      bool legal_carrier =
-          carrier_width > 0 && capacity_elems % carrier_width == 0;
-      int64_t carrier_height =
-          legal_carrier ? capacity_elems / carrier_width : 0;
-      legal_carrier = legal_carrier && carrier_height > 0 &&
-                      carrier_height <= layout_shape[0] &&
-                      access->tile_shape[0] <= carrier_height &&
-                      access->tile_shape[1] <= carrier_width &&
-                      carrier_height % access->tile_shape[0] == 0 &&
-                      carrier_width % access->tile_shape[1] == 0;
-      ICHECK(legal_carrier)
-          << "Row-major small 2D tile " << access->tile_shape[0] << "x"
-          << access->tile_shape[1]
-          << " must fit entirely in one 4096-bit carrier whose width is the "
-             "covered row extent "
-          << carrier_width << ", but no such carrier exists for buffer "
-          << access->buffer->name << ".";
+    auto carrier = tl::GetSunmmioStoreCarrier(
+        access->tile_shape, dtype, tile_processor_config,
+        memtensor_type.layout_dim_levels, layout_shape, strides);
+    ICHECK(carrier)
+        << "Row-major small 2D tile must fit entirely in one 4096-bit carrier";
+    if (*carrier != access->tile_shape) {
       access->requires_aligned_2d_carrier = true;
-      access->aligned_2d_carrier_shape = {carrier_height, carrier_width};
-      return;
+      access->aligned_2d_carrier_shape = *carrier;
     }
-
-    if (memtensor_type.layout_dim_levels[0] < 2 ||
-        memtensor_type.layout_dim_levels[1] < 2) {
-      return;
-    }
-    size_t width_mode = memtensor_type.layout_dim_levels[0];
-    if (width_mode >= layout_shape.size() || width_mode >= strides.size() ||
-        strides[width_mode] != 1 || strides[0] != layout_shape[width_mode]) {
-      return;
-    }
-    int64_t carrier_width = layout_shape[width_mode];
-    if (carrier_width <= 0 || capacity_elems < carrier_width) {
-      return;
-    }
-    int64_t carrier_height =
-        std::min(layout_shape[0], capacity_elems / carrier_width);
-    if (carrier_height <= 0 || access->tile_shape[0] > carrier_height ||
-        access->tile_shape[1] > carrier_width ||
-        carrier_height % access->tile_shape[0] != 0 ||
-        carrier_width % access->tile_shape[1] != 0 ||
-        (access->tile_shape[0] == carrier_height &&
-         access->tile_shape[1] == carrier_width)) {
-      return;
-    }
-    access->requires_aligned_2d_carrier = true;
-    access->aligned_2d_carrier_shape = {carrier_height, carrier_width};
   };
 
   auto analyze_access = [&](const Buffer &buffer,
@@ -3316,8 +3281,8 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       }
       return std::nullopt;
     }
-    if (const auto *cast = expr.as<CastNode>()) {
-      return infer_tile_expr_shape(cast->value, state);
+    if (auto operand = TileCastOperand(expr)) {
+      return infer_tile_expr_shape(*operand, state);
     }
     if (const auto *add = expr.as<AddNode>()) {
       return infer_binary_shape(add->a, add->b);
@@ -4197,25 +4162,34 @@ bool CodeGenTileLangSunMMIO::TryLowerTilesScope(const tir::ForNode *op) {
       return emit_select(select->condition, select->true_value,
                          select->false_value, select->dtype);
     }
-    if (const auto *cast = expr.as<CastNode>()) {
+    if (auto operand = TileCastOperand(expr)) {
       // An explicit cast applies after its operand has been evaluated.
-      SunMMIOValue value = lower_expr(cast->value, state, std::nullopt);
+      SunMMIOValue value = lower_expr(*operand, state, std::nullopt);
       if (IsTileLike(value)) {
-        DataType dst_dtype = CanonicalizeSuvmDType(cast->dtype).with_lanes(1);
+        DataType dst_dtype = CanonicalizeSuvmDType(expr.dtype()).with_lanes(1);
+        if (expr.as<CallNode>()) {
+          int src_bits = value.dtype.bits();
+          ICHECK((src_bits == 16 || src_bits == 32) &&
+                 (dst_dtype.bits() == src_bits ||
+                  (src_bits == 32 && dst_dtype.bits() == 16)))
+              << "SunMMIO cannot preserve tile integer Cast from "
+              << value.dtype << " to " << dst_dtype;
+        }
         if (value.dtype == dst_dtype) {
           return value;
         }
-        SunMMIOType dst_type = MakeTileType(CanonicalizeSuvmDType(cast->dtype),
+        SunMMIOType dst_type = MakeTileType(CanonicalizeSuvmDType(expr.dtype()),
                                             ExtractStaticShape(value.type));
-        return builder_->Cast(NewValueName(), value, dst_type,
-                              CanonicalizeSuvmDType(cast->dtype).with_lanes(1));
+        return builder_->Cast(
+            NewValueName(), value, dst_type,
+            CanonicalizeSuvmDType(expr.dtype()).with_lanes(1));
       }
       SunMMIOType scalar_type{SunMMIOType::Kind::kScalar,
-                              CanonicalizeSuvmDType(cast->dtype),
+                              CanonicalizeSuvmDType(expr.dtype()),
                               1,
                               {}};
       return builder_->Cast(NewValueName(), value, scalar_type,
-                            CanonicalizeSuvmDType(cast->dtype).with_lanes(1));
+                            CanonicalizeSuvmDType(expr.dtype()).with_lanes(1));
     }
     if (const auto *call = expr.as<CallNode>()) {
       const auto *op_node = call->op.as<OpNode>();

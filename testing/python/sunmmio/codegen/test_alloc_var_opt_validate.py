@@ -292,7 +292,7 @@ def test_alloc_var_conditional_loop_extent_copy_codegen_validates_with_npuir_opt
         tmp_path,
         mlir_filename="alloc_var_conditional_loop_extent_copy_suvm.mlir",
         expected_tokens=(
-            "arith.select",
+            "scf.if",
             "scf.for",
             "suvm.copy_async",
             "suvm.sync",

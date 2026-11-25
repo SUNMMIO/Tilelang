@@ -181,7 +181,7 @@ def _clip_region_to_shape(spec: _CopyRegionSpec, mins: list[tir.PrimExpr], exten
         )
         for dim, (min_value, extent) in enumerate(zip(resolved_mins, resolved_extents))
     ]
-    return _NormalizedCopyRegion(spec, resolved_mins, validated_extents)
+    return _NormalizedCopyRegion(spec, mins, validated_extents)
 
 
 def _normalize_copy_regions(src: _CopyRegionSpec, dst: _CopyRegionSpec) -> tuple[_NormalizedCopyRegion, _NormalizedCopyRegion]:

@@ -692,27 +692,28 @@ def test_same_iteration_producer_wait_stays_before_consumer():
 
 
 @pytest.mark.parametrize("jump", ["break", "continue"])
-def test_loop_jump_preserves_producer_completion(jump):
+@pytest.mark.parametrize("unit,mask", [("odma0", 1), ("odma1", 2)])
+def test_loop_jump_preserves_producer_completion(jump, unit, mask):
     def body(src, dst):
         loop = tvm.tir.For(
             tvm.tir.Var("i", "int32"),
             0,
             3,
             tvm.tir.ForKind.SERIAL,
-            tvm.tir.SeqStmt([_dma(src, dst), _jump(jump)]),
+            tvm.tir.SeqStmt([_dma(src, dst, unit=unit), _jump(jump)]),
         )
         return [loop, _dist_put(dst, src)]
 
     mod = _apply(_make_module(body))
     loop = _nodes(mod, tvm.tir.For)[0]
-    assert _sync_masks(mod) == [1]
+    assert _sync_masks(mod) == [mask]
     if jump == "continue":
-        assert _sync_masks(loop.body) == [1]
-        assert loop.script().index("T.sunmmio_sync(1)") < loop.script().index("T.continue_loop")
+        assert _sync_masks(loop.body) == [mask]
+        assert loop.script().index(f"T.sunmmio_sync({mask})") < loop.script().index("T.continue_loop")
     else:
         assert _sync_masks(loop.body) == []
         script = mod.script()
-        assert script.index("T.break_loop") < script.index("T.sunmmio_sync(1)") < script.index("T.dist_put_")
+        assert script.index("T.break_loop") < script.index(f"T.sunmmio_sync({mask})") < script.index("T.dist_put_")
 
 
 def test_conditional_break_propagates_pending_to_external_consumer():

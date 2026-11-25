@@ -2,6 +2,7 @@
 
 #include "../../layout/cute_layout.h"
 
+#include "npuir/Dialect/SUVM/IR/Interfaces.h"
 #include "npuir/Dialect/SUVM/IR/Ops.h"
 #include <tvm/tir/expr.h>
 #include <tvm/tir/op.h>
@@ -53,11 +54,11 @@ void SunmmioMlirContext::CompletePendingSyncUnits(SyncUnitMask units) {
 }
 
 void SunmmioMlirContext::CompleteConsumedTileLoads(mlir::Operation *consumer) {
-  if (!consumer || !consumer->hasTrait<mlir::suvm::TileCompute>()) {
+  if (!consumer || !mlir::isa<mlir::suvm::TileCompute>(consumer)) {
     return;
   }
   // A direct TileCompute data dependency completes the corresponding tile load.
-  // Shape-only tile operations do not carry this trait and remain pending.
+  // Shape-only operations do not implement this interface and remain pending.
   for (mlir::Value operand : consumer->getOperands()) {
     auto load = operand.getDefiningOp<mlir::suvm::TileLoadOp>();
     if (load && operand == load.getResult()) {

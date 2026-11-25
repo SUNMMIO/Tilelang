@@ -86,6 +86,11 @@ def LegalizeSunmmioDataPath():
     return _ffi_api.LegalizeSunmmioDataPath()  # type: ignore
 
 
+def LegalizeSunmmioIntegerCasts():
+    """Preserve integer conversions in multi-rank SunMMIO kernels."""
+    return _ffi_api.LegalizeSunmmioIntegerCasts()
+
+
 def ResolveSunmmioMeshSymbols():
     """Resolve symbolic Sunmmio mesh dimensions from the bound target.
 

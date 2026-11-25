@@ -9,6 +9,7 @@ from tilelang.language.utils import region
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import (
     collect_calls,
+    collect_nodes,
     collect_op_names,
 )
 
@@ -19,6 +20,7 @@ def manual_completion_kernel_factory(signal_kind, world_size: int = 1):
     def main(rank_id: T.dist.RankId):
         with T.Kernel():
             expected_deltas = T.alloc_shared((2,), T.uint32)
+            T.fill(expected_deltas, 1)
             signals = T.dist.signals(
                 2,
                 kind=signal_kind,
@@ -85,6 +87,7 @@ def repeated_manual_completion_kernel_factory(drain_first=False, observe_first=F
     def main(rank_id: T.dist.RankId):
         with T.Kernel():
             expected_deltas = T.alloc_shared((2,), T.uint32)
+            T.fill(expected_deltas, 1)
             signals = T.dist.signals(2, kind=T.dist.SignalKind.SRAM_FLAGREG_VALUE, expect="manual")
             first = T.dist.completion(signals, expected_deltas=expected_deltas)
             if observe_first:  # noqa: SIM102 - Keep static selection separate from the device condition.
@@ -104,6 +107,7 @@ def loop_manual_completion_kernel_factory(drain_each=False, observe_each=False, 
     def main(rank_id: T.dist.RankId):
         with T.Kernel():
             expected_deltas = T.alloc_shared((2,), T.uint32)
+            T.fill(expected_deltas, 1)
             signals = T.dist.signals(2, kind=T.dist.SignalKind.SRAM_FLAGREG_VALUE, expect="manual")
             for _ in T.serial(2):
                 completion = T.dist.completion(signals, expected_deltas=expected_deltas)
@@ -137,12 +141,11 @@ def test_manual_completion_wait_any_supports_every_signal_kind(signal_kind):
     initializers = collect_calls(lowered, "tl.dist_completion_init_")
     assert len(initializers) == 1
     initializer = initializers[0]
-    state_dtype = "uint64" if signal_kind.value.endswith("memory") else "uint8"
-    # The group target and this completion's snapshot follow the physical
-    # counter width; pending bookkeeping is independent of that width.
+    state_dtype = "uint32" if signal_kind.value.endswith("memory") else "int32"
+    # Ordinary software arrays use i32 independently of the signal width.
     for state_region in initializer.args[:2]:
         assert state_region.args[0].buffer.dtype == state_dtype
-    assert initializer.args[2].args[0].buffer.dtype == "uint8"
+    assert initializer.args[2].args[0].buffer.dtype == "int32"
     assert initializer.args[3].buffer.dtype == "int32"
     assert collect_op_names(lowered).count("tl.dist_wait_any_") == 1
     injected = result.pass_snapshot("tl.LowerDistSync").mod
@@ -154,9 +157,9 @@ def test_manual_completion_wait_any_supports_every_signal_kind(signal_kind):
 @pytest.mark.parametrize(
     "state_dtype, initial, deltas, expected",
     [
-        pytest.param("uint8", [250, 17], [256, 0], [250, 17], id="byte-full-wrap-stays-pending"),
-        pytest.param("uint8", [255, 17], [1, 0], [0, 17], id="byte-boundary-wrap"),
-        pytest.param("uint64", [2**32 - 1, 2**32 + 17], [2, 0], [2**32 + 1, 2**32 + 17], id="memory-crosses-u32"),
+        pytest.param("uint8", [250, 17], [5, 0], [255, 17], id="byte-safe-cumulative-boundary"),
+        pytest.param("uint8", [254, 17], [1, 0], [255, 17], id="byte-safe-increment"),
+        pytest.param("uint32", [2**31 - 1, 2**31 + 17], [2, 0], [2**31 + 1, 2**31 + 17], id="memory-unsigned-high-bit"),
     ],
 )
 def test_completion_initialization_preserves_counter_width_and_pending(state_dtype, initial, deltas, expected, constant_deltas):
@@ -185,8 +188,8 @@ def test_completion_initialization_preserves_counter_width_and_pending(state_dty
     ).with_attr("tl.dist.world_size", 4)
     lowered = tilelang.transform.LowerDistSync()(tvm.IRModule({"main": func}))
     assert "tl.dist_completion_init_" not in collect_op_names(lowered)
-    # Exercise the production simplifier before substituting runtime inputs:
-    # a literal delta of 256 must not leave an invalid uint8(256) cast.
+    # This isolated expansion consumes inputs already admitted by the
+    # communication pass; overflow rejection is tested through that pass.
     if constant_deltas:
         lowered = tilelang.transform.Simplify()(lowered)
     statements = lowered["main"].body.seq
@@ -205,18 +208,10 @@ def test_completion_initialization_preserves_counter_width_and_pending(state_dty
         if isinstance(node, tvm.tir.BufferLoad):
             index = int(analyzer.simplify(node.indices[0]))
             return tvm.tir.const(memory[node.buffer.data][index], node.dtype)
-        if isinstance(node, tvm.tir.Call) and node.op.name == "tir.bitwise_and":
-            # Analyzer does not fold unsigned bitwise operations. Evaluate the
-            # mask emitted by the pass; casts themselves must simplify normally.
-            lhs, rhs = [analyzer.simplify(arg) for arg in node.args]
-            if isinstance(lhs, tvm.tir.IntImm) and isinstance(rhs, tvm.tir.IntImm):
-                return tvm.tir.const(int(lhs) & int(rhs), node.dtype)
         return None
 
     for store in statements:
-        value = tvm.tir.stmt_functor.ir_transform(
-            tvm.tir.Evaluate(store.value), None, evaluate_constants, ["tir.BufferLoad", "tir.Call"]
-        ).value
+        value = tvm.tir.stmt_functor.ir_transform(tvm.tir.Evaluate(store.value), None, evaluate_constants, ["tir.BufferLoad"]).value
         value = analyzer.simplify(value)
         assert isinstance(value, tvm.tir.IntImm)
         memory[store.buffer.data][int(store.indices[0])] = int(value)
@@ -235,16 +230,24 @@ def test_auto_completion_captures_only_current_put_members():
     )
 
     lowered = result.pass_snapshot("tl.LowerDistCommunication").mod
-    lowered_script = lowered.script()
     assert collect_op_names(lowered).count("tl.dist_completion_init_") == 1
-    assert "T.bool(False), v_completion_deltas_1[0], v_completion_deltas_1[1]" in lowered_script
-    assert 'v_completion_deltas_1[0] = v_completion_deltas_1[0] + T.Cast("int32", 1)' in lowered_script
+    initializer = collect_calls(lowered, "tl.dist_completion_init_")[0]
+    assert not bool(initializer.args[4])
+    deltas = initializer.args[5:]
+    assert [int(delta.indices[0]) for delta in deltas] == [0, 1]
+    assert deltas[0].buffer.data.same_as(deltas[1].buffer.data)
+    updates = collect_nodes(
+        lowered,
+        tvm.tir.BufferStore,
+        lambda store: store.buffer.data.same_as(deltas[0].buffer.data) and isinstance(store.value, tvm.tir.Add),
+    )
+    assert len(updates) == 1
+    assert int(updates[0].indices[0]) == 0
 
     injected = result.pass_snapshot("tl.LowerDistSync").mod
-    injected_script = injected.script()
     assert "tl.dist_completion_init_" not in collect_op_names(injected)
-    assert 'v_pending_1[0] = T.Cast("uint8", v_completion_deltas_1[0] > 0)' in injected_script
-    assert 'v_pending_1[1] = T.Cast("uint8", v_completion_deltas_1[1] > 0)' in injected_script
+    pending = collect_calls(injected, "tl.dist_wait_any_")[0].args[4].args[0].buffer
+    assert pending.dtype == "int32"
 
 
 def test_auto_completion_after_loop_uses_runtime_delta_without_free_loop_var():
@@ -258,17 +261,26 @@ def test_auto_completion_after_loop_uses_runtime_delta_without_free_loop_var():
     assert "T.dist_completion_init_" in lowered
     injected_mod = result.pass_snapshot("tl.LowerDistSync").mod
     injected = next(
-        func for func in injected_mod.functions.values() if isinstance(func, tvm.tir.PrimFunc) and "completion_deltas" in func.script()
+        func for func in injected_mod.functions.values() if isinstance(func, tvm.tir.PrimFunc) and collect_calls(func, "tl.dist_wait_any_")
     )
+
     # SplitHostDevice retains a symbolic mesh extent in the thread binding.
     # Normalize that unrelated metadata to the 4x4 test mesh before checking scope.
-    core = injected.body.seq[0]
-    core_iter = tvm.tir.IterVar(tvm.ir.Range(0, 16), core.node.var, core.node.iter_type, core.node.thread_tag)
-    body = tvm.tir.SeqStmt([tvm.tir.AttrStmt(core_iter, core.attr_key, core.value, core.body), *injected.body.seq[1:]])
-    normalized = tvm.tir.PrimFunc(injected.params, body, injected.ret_type, injected.buffer_map)
+    def normalize_core(node):
+        if isinstance(node, tvm.tir.AttrStmt) and node.attr_key == "thread_extent":
+            axis = node.node
+            bound = tvm.tir.IterVar(tvm.ir.Range(0, node.value), axis.var, axis.iter_type, axis.thread_tag)
+            return tvm.tir.AttrStmt(bound, node.attr_key, node.value, node.body)
+
+    body = tvm.tir.stmt_functor.ir_transform(injected.body, None, normalize_core, ["tir.AttrStmt"])
+    normalized = injected.with_body(body)
     assert tvm.tir.analysis.verify_well_formed(normalized)
-    pending_checks = [line for line in injected.script().splitlines() if "pending" in line and "> 0" in line]
-    assert pending_checks and all("iteration" not in line for line in pending_checks)
+    wait_any = collect_calls(injected, "tl.dist_wait_any_")[0]
+    pending_count = wait_any.args[5]
+    waits = collect_nodes(injected, tvm.tir.While)
+    assert waits
+    analyzer = tvm.arith.Analyzer()
+    assert any(analyzer.can_prove_equal(loop.condition, pending_count > 0) for loop in waits)
 
 
 def test_manual_completion_only_requires_drain_when_used_for_progress():
@@ -286,3 +298,37 @@ def test_loop_manual_completion_only_requires_drain_for_progress():
     lower_to_device_tir(loop_manual_completion_kernel_factory.get_tir(world_size=4))
     result = lower_to_device_tir(loop_manual_completion_kernel_factory.get_tir(drain_each=True, world_size=4))
     assert collect_op_names(result.device_mod).count("tl.dist_wait_any_") == 1
+
+
+@tilelang.jit(target="sunmmio")
+def completion_range_kernel_factory(auto=True, rounds=255, world_size: int = 1):
+    @T.prim_func
+    def main(rank_id: T.dist.RankId):
+        with T.Kernel():
+            src = T.alloc_shared((32,), T.bfloat16)
+            dst = T.alloc_shared((32,), T.bfloat16)
+            deltas = T.alloc_shared((1,), T.uint32)
+            signals = T.dist.signals(1, expect="auto" if auto else "manual")
+            T.fill(deltas, 1)
+            for _ in T.serial(rounds):
+                if auto:
+                    T.dist.put(src, dst, (rank_id + 1) % world_size, signal=signals[0], submit=True)
+                else:
+                    done = T.dist.completion(signals, expected_deltas=deltas)
+                    T.dist.wait_all(done)
+            if auto:
+                done = T.dist.completion(signals)
+                T.dist.wait_all(done)
+
+    return main
+
+
+@pytest.mark.parametrize("auto", [False, True])
+@pytest.mark.parametrize("rounds", [255, 256])
+def test_completion_expected_accumulates_once_and_drain_does_not_reset(auto, rounds):
+    func = completion_range_kernel_factory.get_tir(auto, rounds, world_size=2)
+    if rounds == 255:
+        lower_to_device_tir(func)
+    else:
+        with pytest.raises(tvm.error.InternalError, match="cumulative expected"):
+            lower_to_device_tir(func)

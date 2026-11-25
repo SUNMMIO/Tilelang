@@ -27,12 +27,21 @@ namespace dist_transform {
 
 using namespace tir;
 
+// PlanDistSignals owns endpoint admission. Ordinary puts carry its locality
+// and, only when forwarding between rows, the participating source routes.
+inline constexpr const char *kDistPutLocality = "tl.dist.put_locality";
+inline constexpr const char *kDistPutRowCases = "tl.dist.put_row_cases";
+inline constexpr const char *kDistRemoteRows = "tl.dist.remote_rows";
+enum PutLocality { kPutLocal = 1, kPutRemote = 2 };
+
 inline constexpr const char *kDistWorldSizeAttr = "tl.dist.world_size";
 inline constexpr const char *kDistSignalCountsAttr = "tl.dist.signal_counts";
 inline constexpr const char *kDistCompilerRegionAttr =
     "tl.dist.compiler_generated_region";
 inline constexpr const char *kDistSignalIndexInBoundsAttr =
     "tl.dist.signal_index_in_bounds";
+inline constexpr const char *kDistExpectedSignalKindAttr =
+    "tl.dist.expected_signal_kind";
 inline constexpr const char *kAutoSignalKind = "auto";
 inline constexpr int kIncrementFlagregCount = 8;
 inline constexpr int kValueFlagregCount = 32;
@@ -55,9 +64,18 @@ struct DistSignalKindInfo {
   DistSignalScope scope;
   DistSignalUpdateMode update_mode;
   int capacity;
+  // Signal interface type; software storage can use a narrower type.
   DataType state_dtype;
   bool allow_multi_sender;
 };
+
+// Convert a validated logical delta to its finite-width software storage type.
+PrimExpr CastDistStorage(DataType dtype, const PrimExpr &value);
+
+inline DataType DistSoftwareStateDType(const DistSignalKindInfo &kind) {
+  return kind.update_mode == DistSignalUpdateMode::kMemory ? DataType::UInt(32)
+                                                           : kind.state_dtype;
+}
 
 inline const std::array<DistSignalKindInfo,
                         static_cast<size_t>(DistSignalKind::kCount)> &
@@ -66,8 +84,6 @@ DistSignalKindInfos() {
                           static_cast<size_t>(DistSignalKind::kCount)>
       infos{{
           // SUVM signal values: increment/assign are 8-bit, memory is 64-bit.
-          // Expected values and generation snapshots use the same unsigned
-          // type.
           {DistSignalKind::kSramFlagregInc, "sram_flagreg_inc",
            DistSignalScope::kSram, DistSignalUpdateMode::kIncrement,
            kIncrementFlagregCount, DataType::UInt(8), true},
@@ -225,9 +241,11 @@ inline bool BufferRegionsMayOverlap(const Buffer &lhs_buffer,
 // write changes memory used by an index, its old BufferLoad expression cannot
 // be interpreted using the new value. Forget only the affected dimensions;
 // immutable indices and disjoint index-storage writes retain their precision.
-inline Region
-WidenRegionForIndexWrites(const Buffer &buffer, const Region &region,
-                          const std::vector<BufferRegion> &writes) {
+template <typename Overlaps>
+inline Region WidenRegionForIndexWrites(const Buffer &buffer,
+                                        const Region &region,
+                                        const std::vector<BufferRegion> &writes,
+                                        Overlaps overlaps) {
   if (writes.empty()) {
     return region;
   }
@@ -245,8 +263,7 @@ WidenRegionForIndexWrites(const Buffer &buffer, const Region &region,
         read.push_back(Range::FromMinExtent(index, 1));
       }
       for (const BufferRegion &write : writes) {
-        if (BufferRegionsMayOverlap(load->buffer, read, write->buffer,
-                                    write->region)) {
+        if (overlaps(load->buffer, read, write->buffer, write->region)) {
           changed = true;
           break;
         }
@@ -386,6 +403,15 @@ protected:
                             std::optional<int64_t> src_rank = std::nullopt) {
     return analyzer_->Simplify(Substitute(
         expr, MakeSourceSubstitution(current_core, src_row, src_rank)));
+  }
+
+  // Only statically inactive sources are excluded. A runtime condition
+  // can still issue a descriptor, so its physical endpoint must be legal.
+  Optional<PrimExpr> ParticipatingSource(const PrimExpr &predicate,
+                                         const Map<Var, PrimExpr> &source) {
+    auto active = analyzer_->Simplify(Substitute(predicate, source));
+    return analyzer_->CanProve(Not(active)) ? Optional<PrimExpr>()
+                                            : Optional<PrimExpr>(active);
   }
 
   void ValidateRouteExpression(const PrimExpr &expr, const char *name) {

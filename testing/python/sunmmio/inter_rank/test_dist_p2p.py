@@ -7,8 +7,6 @@ import tilelang.language as T
 from tilelang import tvm
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
 from testing.python.sunmmio.inter_rank.tir_test_utils import (
-    collect_calls,
-    collect_nodes,
     collect_op_arg_counts,
     collect_op_names,
     single_prim_func,
@@ -38,23 +36,11 @@ def producer_loop_jump_kernel_factory(jump="break", world_size: int = 1):
 
 
 @pytest.mark.parametrize("jump", ["break", "continue"])
-def test_local_producer_wait_survives_loop_jump_before_dist_send(jump):
-    result = lower_to_device_tir(producer_loop_jump_kernel_factory.get_tir(jump=jump, world_size=2))
-    func = single_prim_func(result.device_mod)
-    loop = collect_nodes(func, tvm.tir.For)[0]
-    loop_script = loop.script()
-    if jump == "continue":
-        sync = loop_script.rindex("T.sunmmio_sync(")
-        assert sync < loop_script.index("T.continue_loop()")
-        # The layout transform writes src through ODMA1.
-        sync_calls = collect_calls(tvm.tir.PrimFunc([], loop.body), "tl.sunmmio_sync")
-        assert int(sync_calls[-1].args[0]) & 2
-    else:
-        script = func.script()
-        jump_index = script.index("T.break_loop()")
-        put_index = script.index("T.dist_put_(")
-        assert "T.sunmmio_sync(2)" in script[jump_index:put_index]
-        assert "T.sunmmio_sync" not in loop_script[loop_script.index("T.break_loop()") :]
+def test_producer_loop_jump_is_rejected_before_dist_send(jump):
+    # Producer completion through loop jumps remains covered directly by
+    # InjectSunmmioSync's loop-jump tests.
+    with pytest.raises(tvm.error.InternalError, match="explicit return/break/continue"):
+        lower_to_device_tir(producer_loop_jump_kernel_factory.get_tir(jump=jump, world_size=2))
 
 
 @tilelang.jit(target="sunmmio")

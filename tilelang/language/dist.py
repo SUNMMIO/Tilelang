@@ -8,7 +8,7 @@ from enum import Enum, IntEnum
 import threading
 from collections.abc import Iterator
 
-from tvm import arith, tir
+from tvm import tir
 from tvm.script.ir_builder import tir as tir_builder
 
 
@@ -300,7 +300,9 @@ def _resolve_signal_count(count) -> int:
                 _mesh_ncols_symbol(): tir.IntImm("int32", mesh["ncol"]),
             },
         )
-        resolved = arith.Analyzer().simplify(resolved)
+        from tilelang.language.frame import resolve_let_bound_expr
+
+        resolved = resolve_let_bound_expr(resolved)
         if isinstance(resolved, tir.IntImm):
             return int(resolved.value)
     raise ValueError(f"count must be a positive compile-time int, got {count!r}")

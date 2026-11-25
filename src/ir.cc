@@ -10,10 +10,12 @@
 #include <tvm/ffi/object.h>
 
 #include "support/ffi_aliases.h"
+#include "support/finite_width_integer.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/script/ir_builder/tir/ir.h>
 #include <tvm/tir/analysis.h>
+#include <tvm/tir/stmt_functor.h>
 
 #include <utility>
 
@@ -57,6 +59,357 @@ static ForFrame MakeIterVarFrame(const std::string &name, const PrimExpr &dom) {
                /*step=*/step);
   };
   return ForFrame(n);
+}
+
+// Walk outward through lexical Let frames once. Only literal bindings
+// are used; function inputs must retain their runtime identity.
+static PrimExpr ResolveLoopAlias(PrimExpr expr) {
+  using tvm::script::ir_builder::IRBuilder;
+  if (!expr.as<tir::VarNode>() || !IRBuilder::IsInScope())
+    return expr;
+  const auto &frames = IRBuilder::Current()->frames;
+  const auto *func =
+      frames.empty() ? nullptr : frames[0].as<PrimFuncFrameNode>();
+  for (auto it = frames.rbegin(); it != frames.rend(); ++it) {
+    const auto *binding = (*it).as<LetFrameNode>();
+    if (!binding || !binding->var.same_as(expr))
+      continue;
+    if (func && std::any_of(func->args.begin(), func->args.end(),
+                            [&](const Var &v) { return v.same_as(expr); }))
+      return expr;
+    expr = binding->value;
+    if (!expr.as<tir::VarNode>())
+      break;
+  }
+  return expr;
+}
+
+static std::optional<FiniteWidthInteger::Wide>
+LoopLiteral(const PrimExpr &expr) {
+  return FiniteWidthInteger::Literal(ResolveLoopAlias(expr));
+}
+
+// Native TVM For frames describe the logical IV with one domain and step
+// per variable. Normalized counter frames leave steps empty because their
+// parsing domain may describe range_index rather than the user's IV.
+static void BindEnclosingUnitRanges(arith::Analyzer *analyzer,
+                                    const PrimExpr &lower,
+                                    const PrimExpr &upper) {
+  using namespace tir;
+  using tvm::script::ir_builder::IRBuilder;
+  if (!IRBuilder::IsInScope())
+    return;
+  for (const auto &frame : IRBuilder::Current()->frames) {
+    const auto *loop = frame.as<ForFrameNode>();
+    if (!loop || loop->steps.size() != loop->vars.size())
+      continue;
+    for (size_t i = 0; i < loop->vars.size(); ++i) {
+      const Var &iv = loop->vars[i];
+      if (!iv.dtype().is_scalar() || !iv.dtype().is_int() ||
+          iv.dtype().bits() > 64 ||
+          (loop->steps[i] && !is_one(*loop->steps[i])))
+        continue;
+      auto matches = [&](const VarNode *v) { return v == iv.get(); };
+      if (!UsesVar(lower, matches) && !UsesVar(upper, matches))
+        continue;
+      Range dom = loop->doms[i];
+      auto start = LoopLiteral(dom->min), count = LoopLiteral(dom->extent);
+      if (!start || !count || *count <= 0)
+        continue;
+      using Wide = FiniteWidthInteger::Wide;
+      Wide high = *start + *count - 1;
+      Wide sign = Wide(1) << (iv.dtype().bits() - 1);
+      if (*start >= -sign && high < sign)
+        analyzer->const_int_bound.Update(
+            iv, arith::ConstIntBound(static_cast<int64_t>(*start),
+                                     static_cast<int64_t>(high)));
+    }
+  }
+}
+
+// The block axis introduced by axis.remap initially matches the DSL IV.
+// Give that axis the full logical range if a narrow IV cannot represent
+// its extent. Uses in the block retain their original integer semantics.
+class WidenRemappedAxis : public tir::StmtMutator {
+public:
+  WidenRemappedAxis(Range parsed, PrimExpr start, PrimExpr count,
+                    PrimExpr value)
+      : parsed_(parsed),
+        domain_(Range::FromMinExtent(cast(count.dtype(), start), count)),
+        value_(value) {}
+
+private:
+  Stmt VisitStmt_(const tir::BlockRealizeNode *op) final {
+    auto result = Downcast<tir::BlockRealize>(StmtMutator::VisitStmt_(op));
+    auto block = result->block;
+    auto bindings = result->iter_values;
+    Map<Var, PrimExpr> replacements;
+    for (size_t i = 0; i < block->iter_vars.size(); ++i) {
+      auto axis = block->iter_vars[i];
+      if (!axis->dom.same_as(parsed_))
+        continue;
+      Var wide(axis->var->name_hint, domain_->extent.dtype());
+      replacements.Set(axis->var, cast(axis->var.dtype(), wide));
+      block.CopyOnWrite()->iter_vars.Set(
+          i, IterVar(domain_, wide, axis->iter_type, axis->thread_tag));
+      bindings.Set(i, value_);
+    }
+    if (replacements.empty())
+      return result;
+    return tir::BlockRealize(
+        bindings, result->predicate,
+        Downcast<tir::Block>(Substitute(block, replacements)), result->span);
+  }
+  Range parsed_, domain_;
+  PrimExpr value_;
+};
+
+// Keep the original range operands until the entry snapshots and ordering test
+// are built. A narrow stop-start may already have lost the empty-range case.
+ForFrame NormalizedFor(PrimExpr start, PrimExpr stop, PrimExpr step,
+                       bool unroll, bool stepped,
+                       const Map<String, tvm::ffi::Any> &annotations) {
+  using namespace tvm::tir;
+  using Wide = FiniteWidthInteger::Wide;
+  for (const auto &operand : {start, stop, step})
+    ICHECK((operand.dtype().is_int() || operand.dtype().is_uint()) &&
+           operand.dtype().is_scalar() && operand.dtype().bits() <= 64)
+        << "serial/unroll bounds and step must be scalar integers up to 64 "
+           "bits";
+  auto promote = [](DataType a, DataType b) {
+    return (make_zero(a) + make_zero(b)).dtype();
+  };
+  DataType bounds_type = promote(start.dtype(), stop.dtype());
+  start = cast(bounds_type, start);
+  stop = cast(bounds_type, stop);
+  auto step_value = LoopLiteral(step);
+  ICHECK(!step_value || *step_value != 0)
+      << "Invalid stepped serial: step must be non-zero";
+  bool reverse = step_value && *step_value < 0;
+  Wide magnitude = step_value ? (reverse ? -*step_value : *step_value) : 0;
+  // Match the legacy promotion through a Python integer constant in ceildiv.
+  DataType count_type = step.dtype();
+  if (step_value)
+    count_type = magnitude <= INT32_MAX   ? DataType::Int(32)
+                 : magnitude <= INT64_MAX ? DataType::Int(64)
+                                          : DataType::UInt(64);
+  count_type = promote(bounds_type, count_type);
+  DataType iv_type =
+      stepped ? promote(bounds_type, promote(count_type, step.dtype()))
+              : bounds_type;
+  const bool signed_unit = bounds_type.is_int() && step_value &&
+                           *step_value == 1 && iv_type == bounds_type;
+  // A zero origin cannot overflow stop - start, and the native For
+  // evaluates its sole nonconstant bound once on entry.
+  if (signed_unit && is_zero(start))
+    return unroll
+               ? tvm::script::ir_builder::tir::Unroll(start, stop, annotations)
+               : tvm::script::ir_builder::tir::Serial(start, stop, annotations);
+  DataType work_type = bounds_type.bits() <= 32 &&
+                               (!step_value || magnitude <= INT64_MAX) &&
+                               step.dtype().bits() <= 32
+                           ? DataType::Int(64)
+                           : DataType::UInt(64);
+  auto a_value = LoopLiteral(start), b_value = LoopLiteral(stop);
+  std::vector<std::pair<Var, PrimExpr>> snapshots;
+  auto snapshot = [&](const PrimExpr &expr, const char *name,
+                      std::optional<Wide> literal) -> PrimExpr {
+    if (expr.as<VarNode>() || literal)
+      return expr;
+    Var saved(name, expr.dtype());
+    snapshots.emplace_back(saved, expr);
+    return saved;
+  };
+  PrimExpr a = snapshot(start, "range_start", a_value);
+  PrimExpr b = snapshot(stop, "range_stop", b_value);
+  PrimExpr s = snapshot(step, "range_step", step_value);
+  PrimExpr zero = make_zero(work_type);
+  PrimExpr positive_step =
+      step_value ? make_const(work_type, static_cast<uint64_t>(magnitude))
+                 : cast(work_type, s);
+  PrimExpr count;
+  Optional<PrimExpr> unroll_guard;
+  std::optional<Wide> maximum_count;
+  bool use_signed_counter = false;
+  if (a_value && b_value && step_value) {
+    Wide distance = reverse ? *a_value - *b_value : *b_value - *a_value;
+    Wide trips =
+        distance <= 0 ? 0 : distance / magnitude + (distance % magnitude != 0);
+    count = make_const(work_type, static_cast<uint64_t>(trips));
+    maximum_count = trips;
+  } else {
+    PrimExpr compare_a = a, compare_b = b;
+    if (bounds_type.is_uint()) {
+      // A sign-bit permutation preserves unsigned order and keeps symbolic
+      // endpoint wrap out of mathematical inequality rewrites.
+      auto signed_type = DataType::Int(bounds_type.bits());
+      auto mask = make_const(
+          signed_type,
+          static_cast<int64_t>(-(Wide(1) << (bounds_type.bits() - 1))));
+      auto ordered_bits = [&](PrimExpr operand, std::optional<Wide> literal) {
+        if (literal)
+          return make_const(
+              signed_type,
+              static_cast<int64_t>(*literal -
+                                   (Wide(1) << (bounds_type.bits() - 1))));
+        return bitwise_xor(cast(signed_type, operand), mask);
+      };
+      compare_a = ordered_bits(a, a_value);
+      compare_b = ordered_bits(b, b_value);
+    }
+    PrimExpr ordered = reverse ? compare_a > compare_b : compare_a < compare_b;
+    auto stable = [](const PrimExpr &expr) {
+      if (SideEffect(expr) <= CallEffectKind::kPure)
+        return true;
+      const auto *load = expr.as<BufferLoadNode>();
+      return load && load->buffer.scope() == "local.var";
+    };
+    auto delta = [&](const PrimExpr &end,
+                     const PrimExpr &begin) -> std::optional<Wide> {
+      if (!stable(begin))
+        return std::nullopt;
+      if (StructuralEqual()(end, begin))
+        return Wide(0);
+      if (const auto *add = end.as<AddNode>()) {
+        if (StructuralEqual()(add->a, begin))
+          return LoopLiteral(add->b);
+        if (StructuralEqual()(add->b, begin))
+          return LoopLiteral(add->a);
+      }
+      return std::nullopt;
+    };
+    auto span = reverse ? delta(start, stop) : delta(stop, start);
+    if (span && *span >= 0 && step_value) {
+      Wide trips = *span / magnitude + (*span % magnitude != 0);
+      maximum_count = trips;
+      auto fixed_count = make_const(work_type, static_cast<uint64_t>(trips));
+      count = fixed_count;
+      if (trips > 0) {
+        // For end = begin + span the positive distance is fixed precisely
+        // when the endpoint fits. Testing begin against the last valid
+        // start avoids a simplifier folding begin < begin + span to true.
+        auto begin = reverse ? stop : start;
+        arith::Analyzer analyzer;
+        auto bound =
+            FiniteWidthInteger(&analyzer).Analyze(ResolveLoopAlias(begin));
+        Wide max_begin =
+            (Wide(1) << (bounds_type.bits() - bounds_type.is_int())) - 1 -
+            *span;
+        if (!bound.valid || bound.range.hi > max_begin) {
+          if (bounds_type.is_int())
+            ordered = (reverse ? b : a) <=
+                      make_const(bounds_type, static_cast<int64_t>(max_begin));
+          if (unroll)
+            unroll_guard = ordered; // UnrollLoop requires a literal extent.
+          else
+            count = Select(ordered, fixed_count, zero);
+        }
+      }
+    } else {
+      // Prove the trip bound on the original typed endpoints. The runtime
+      // difference may require unsigned 64-bit arithmetic even when the
+      // number of iterations is known to fit a signed index.
+      arith::Analyzer analyzer;
+      FiniteWidthInteger facts(&analyzer);
+      auto lo = ResolveLoopAlias(reverse ? stop : start);
+      auto hi = ResolveLoopAlias(reverse ? start : stop);
+      if (bounds_type.bits() == 64)
+        BindEnclosingUnitRanges(&analyzer, lo, hi);
+      auto lower = facts.Analyze(lo);
+      auto upper = facts.Analyze(hi);
+      if (lower.valid && upper.valid) {
+        Wide max_distance = std::max(Wide(0), upper.range.hi - lower.range.lo);
+        // Dynamic steps execute under the positive-entry assertion below.
+        Wide min_step = magnitude;
+        if (!step_value) {
+          auto stride = facts.Analyze(ResolveLoopAlias(step));
+          min_step =
+              stride.valid ? std::max(Wide(1), stride.range.lo) : Wide(1);
+        }
+        maximum_count =
+            max_distance / min_step + (max_distance % min_step != 0);
+        // A generic uint64 distance loses the relation between its two
+        // endpoints in the backend analyzer. Carry this proof through the
+        // counter dtype rather than asking the backend to rediscover it.
+        use_signed_counter =
+            bounds_type == DataType::UInt(64) && *maximum_count <= INT64_MAX;
+      }
+      // Clamp the endpoint before subtraction. Select only consumes immutable
+      // entry snapshots, so evaluating its operands eagerly is safe.
+      PrimExpr high = reverse ? cast(work_type, a) : cast(work_type, b);
+      PrimExpr low = reverse ? cast(work_type, b) : cast(work_type, a);
+      PrimExpr distance = Select(ordered, high, low) - low;
+      if (step_value && magnitude == 1) {
+        count = distance;
+      } else {
+        PrimExpr q = truncdiv(distance, positive_step);
+        PrimExpr r = distance - q * positive_step;
+        count = q + cast(work_type, r != zero);
+      }
+    }
+  }
+  // Use the source IV directly only when the already ordered count fits.
+  bool native_unit =
+      (!stepped && bounds_type.is_uint() && !use_signed_counter) ||
+      (signed_unit && maximum_count &&
+       *maximum_count < (Wide(1) << (iv_type.bits() - 1)));
+  PrimExpr native_min = a;
+  PrimExpr native_extent = cast(iv_type, count);
+  if (native_unit && a_value && *a_value == 0) {
+    snapshots.clear();
+    native_min = start;
+    native_extent = stop;
+  }
+  DataType counter_type = maximum_count && *maximum_count <= INT64_MAX
+                              ? DataType::Int(64)
+                              : work_type;
+  PrimExpr counter_count = cast(counter_type, count);
+  PrimExpr counter_zero = make_zero(counter_type);
+  Var logical_iv("v", iv_type), counter("range_index", counter_type);
+  ObjectPtr<ForFrameNode> frame = tvm::ffi::make_object<ForFrameNode>();
+  frame->vars.push_back(logical_iv);
+  // axis.remap queries the logical domain while parsing the body. A
+  // narrow signed axis may need a wider extent in the completed block.
+  auto logical_domain = Range::FromMinExtent(native_min, native_extent);
+  frame->doms.push_back(
+      native_unit || signed_unit
+          ? logical_domain
+          : Range::FromMinExtent(counter_zero, counter_count));
+  if (native_unit)
+    frame->steps.push_back(
+        std::nullopt); // doms[0] describes the actual For IV.
+  frame->f_make_for_loop = [=](const Array<Var> &vars, const Array<Range> &doms,
+                               const Array<Optional<PrimExpr>> &, Stmt body) {
+    PrimExpr offset = cast(work_type, counter) * positive_step;
+    PrimExpr value =
+        reverse ? cast(work_type, a) - offset : cast(work_type, a) + offset;
+    if (is_zero(count))
+      body = tvm::tir::Evaluate(0);
+    else if (native_unit)
+      body = tvm::tir::For(vars[0], native_min, native_extent,
+                           unroll ? ForKind::kUnrolled : ForKind::kSerial, body,
+                           std::nullopt, annotations);
+    else {
+      if (signed_unit && iv_type.bits() < work_type.bits()) {
+        body = WidenRemappedAxis(logical_domain, a, count, value)(body);
+      }
+      body = Substitute(body, {{vars[0], cast(iv_type, value)}});
+      body = tvm::tir::For(counter, counter_zero, counter_count,
+                           unroll ? ForKind::kUnrolled : ForKind::kSerial, body,
+                           std::nullopt, annotations);
+    }
+    if (unroll_guard)
+      body = tvm::tir::IfThenElse(unroll_guard.value(), body);
+    if (!step_value)
+      body =
+          AssertStmt(s.dtype().is_uint() ? s != make_zero(s.dtype())
+                                         : s > make_zero(s.dtype()),
+                     StringImm("dynamic serial step must be positive"), body);
+    for (auto it = snapshots.rbegin(); it != snapshots.rend(); ++it)
+      body = tvm::tir::LetStmt(it->first, it->second, body);
+    return body;
+  };
+  return ForFrame(frame);
 }
 
 ForFrame ParallelFor(const Array<PrimExpr> &extents,
@@ -369,6 +722,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef()
       .def("tl.Parallel", ParallelFor)
+      .def("tl.NormalizedFor", NormalizedFor)
       .def("tl.Tiles", TilesFor)
       .def("tl.Pipelined", PipelinedFor)
       .def("tl.Persistent", PersistentFor)

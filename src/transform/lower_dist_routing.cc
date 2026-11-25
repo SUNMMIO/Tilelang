@@ -13,6 +13,7 @@
 #include "../op/comm.h"
 #include "../op/copy.h"
 #include "../op/utils.h"
+#include "../support/finite_width_integer.h"
 #include "dist_transform_utils.h"
 
 namespace tvm {
@@ -169,10 +170,56 @@ public:
 
 private:
   DistRankRoutedPutNormalizer(int64_t world_size, Var rank_id)
-      : world_size_(world_size), rank_id_(std::move(rank_id)) {}
+      : world_size_(world_size), rank_id_(std::move(rank_id)) {
+    for (int64_t r = 0; r < world_size_; ++r)
+      ranks_.push_back(IntImm(rank_id_.dtype(), r));
+  }
 
+  // Restrict proofs to rank predicates at route sites. Binding every Let
+  // in the function here would run a second arithmetic analysis on payloads
+  // and expected values that routing neither owns nor needs.
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    auto cond = op->condition;
+    if (!UsesVar(cond, [&](const VarNode *v) { return v == rank_id_.get(); }))
+      return StmtExprMutator::VisitStmt_(op);
+    auto incoming = ranks_;
+    Array<PrimExpr> yes_ranks, no_ranks;
+    arith::Analyzer analyzer;
+    for (auto rank : incoming) {
+      FiniteWidthInteger facts(&analyzer);
+      auto value = facts.Analyze(Substitute(cond, {{rank_id_, rank}}));
+      if (!value.valid || value.range.hi != 0)
+        yes_ranks.push_back(rank);
+      if (!value.valid || value.range.lo == 0)
+        no_ranks.push_back(rank);
+    }
+    ranks_ = yes_ranks;
+    Stmt yes = VisitStmt(op->then_case);
+    Optional<Stmt> no;
+    if (op->else_case) {
+      ranks_ = no_ranks;
+      no = VisitStmt(op->else_case.value());
+    }
+    ranks_ = incoming;
+    return IfThenElse(cond, yes, no, op->span);
+  }
   Stmt VisitStmt_(const EvaluateNode *op) final {
     const auto *call_node = op->value.as<CallNode>();
+    if (call_node && (call_node->op.same_as(dist_routed_put()) ||
+                      call_node->op.same_as(DistPutOp::Get()))) {
+      if (ranks_.empty())
+        return Evaluate(0);
+      if (ranks_.size() == 1)
+        return Substitute(ffi::GetRef<Stmt>(op), {{rank_id_, ranks_[0]}});
+      if (ranks_.size() < static_cast<size_t>(world_size_)) {
+        Array<Stmt> routes;
+        for (auto rank : ranks_)
+          routes.push_back(
+              IfThenElse(rank_id_ == rank, Substitute(ffi::GetRef<Stmt>(op),
+                                                      {{rank_id_, rank}})));
+        return SeqStmt::Flatten(routes);
+      }
+    }
     if (!call_node || !call_node->op.same_as(dist_rank_routed_put())) {
       return StmtExprMutator::VisitStmt_(op);
     }
@@ -184,7 +231,7 @@ private:
     Stmt routed = Evaluate(Call(DataType::Handle(), dist_routed_put(), args,
                                 call_node->annotations, call_node->span));
     if (src_rank.same_as(rank_id_)) {
-      return routed;
+      return VisitStmt(routed);
     }
     int64_t src_rank_value =
         RequireIntImm(src_rank, "T.dist.routed_put src_rank");
@@ -192,9 +239,11 @@ private:
     ICHECK_LT(src_rank_value, world_size_)
         << "T.dist.routed_put src_rank is outside [0, " << world_size_
         << "): " << src_rank_value;
-    return IfThenElse(rank_id_ == src_rank, routed);
+    return IfThenElse(rank_id_ == src_rank,
+                      Substitute(routed, {{rank_id_, src_rank}}));
   }
 
+  Array<PrimExpr> ranks_;
   int64_t world_size_;
   Var rank_id_;
 };
@@ -255,14 +304,17 @@ private:
     return arith::IRMutatorWithAnalyzer::VisitStmt_(op);
   }
 
-  Locality ValidateAndClassify(const PrimExpr &dst_rank,
-                               const PrimExpr &dst_row, const Var &current_core,
-                               std::optional<int64_t> fixed_src_row,
-                               const char *op_name) {
+  Locality
+  ValidateAndClassify(const PrimExpr &dst_rank, const PrimExpr &dst_row,
+                      const Var &current_core,
+                      std::optional<int64_t> fixed_src_row, const char *op_name,
+                      std::optional<int64_t> fixed_rank = std::nullopt) {
     Locality result;
     int64_t row_begin = fixed_src_row.value_or(0);
     int64_t row_end = fixed_src_row ? row_begin + 1 : mesh_nrows_;
     for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
+      if (fixed_rank && *fixed_rank != src_rank)
+        continue;
       for (int64_t src_row = row_begin; src_row < row_end; ++src_row) {
         PrimExpr resolved_rank =
             RewriteForSource(dst_rank, current_core, src_row, src_rank);
@@ -380,52 +432,61 @@ private:
     Var current_core = tvm::ffi::GetRef<Var>(current_core_node);
     ValidateRouteExpression(call->args[2], "dst_rank");
     ValidateRouteExpression(call->args[3], "dst_row");
-    Locality locality = ValidateAndClassify(
-        call->args[2], call->args[3], current_core, std::nullopt, "T.dist.put");
-    if (!locality.has_local) {
-      return Evaluate(call);
-    }
-    bool all_local_routes_are_peer = true;
-    for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
-      for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
-        PrimExpr resolved_rank =
-            RewriteForSource(call->args[2], current_core, src_row, src_rank);
-        if (!analyzer_->CanProve(resolved_rank == I32(src_rank))) {
-          continue;
-        }
-        PrimExpr resolved_row =
-            RewriteForSource(call->args[3], current_core, src_row, src_rank);
-        all_local_routes_are_peer &=
-            analyzer_->CanProve(resolved_row == I32(src_row));
-      }
+    int locality =
+        Downcast<Integer>(call->annotations.at(kDistPutLocality))->value;
+    if (!locality)
+      return Evaluate(0);
+    auto cases = call->annotations.Get(kDistPutRowCases);
+    if (!cases) {
+      if (!(locality & kPutLocal))
+        return Evaluate(call);
+      Stmt copy = MakeLocalTransfer(call->args[0], call->args[1], current_core,
+                                    current_core, current_core);
+      Stmt transfer =
+          SelectLocalOrRemote({true, bool(locality & kPutRemote)},
+                              call->args[2] == rank_id_, copy, Evaluate(call));
+      return GuardDynamicSignal(call->args[4], transfer);
     }
 
-    Stmt local;
-    if (all_local_routes_are_peer) {
-      local = MakeLocalTransfer(call->args[0], call->args[1], current_core,
-                                current_core, current_core);
-    } else {
-      if (!HasCompilerGeneratedRegion(call)) {
-        ValidateCrossRowRegionOffsets(call->args[0], call->args[1],
-                                      "T.dist.put");
-      }
+    Array<Stmt> branches;
+    for (const auto &entry : Downcast<Array<Array<ObjectRef>>>(*cases)) {
+      PrimExpr guard = analyzer_->Simplify(Downcast<PrimExpr>(entry[0]));
+      if (is_zero(guard))
+        continue;
       Array<Stmt> transfers;
-      PrimExpr current_col = CurrentCol(current_core);
-      for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
-        PrimExpr src = RewriteForSource(call->args[0], current_core, src_row);
-        PrimExpr dst = RewriteForSource(call->args[1], current_core, src_row);
-        PrimExpr dst_row =
-            RewriteForSource(call->args[3], current_core, src_row);
-        PrimExpr src_core = I32(src_row * mesh_ncols_) + current_col;
-        PrimExpr dst_core = dst_row * I32(mesh_ncols_) + current_col;
-        transfers.push_back(
-            MakeLocalTransfer(src, dst, current_core, src_core, dst_core));
+      Array<Array<Integer>> remote;
+      for (const auto &row : Downcast<Array<Array<Integer>>>(entry[1])) {
+        int64_t src_row = row[0]->value, dst_row = row[1]->value;
+        if (!row[2]->value) {
+          remote.push_back(row);
+          continue;
+        }
+        if (src_row != dst_row && !HasCompilerGeneratedRegion(call))
+          ValidateCrossRowRegionOffsets(call->args[0], call->args[1],
+                                        "T.dist.put");
+        PrimExpr col = CurrentCol(current_core);
+        Stmt local = MakeLocalTransfer(
+            RewriteForSource(call->args[0], current_core, src_row),
+            RewriteForSource(call->args[1], current_core, src_row),
+            current_core, I32(src_row * mesh_ncols_) + col,
+            I32(dst_row * mesh_ncols_) + col);
+        transfers.push_back(local);
       }
-      local = SeqStmt::Flatten(transfers);
+      if (!transfers.empty()) {
+        Stmt local =
+            GuardDynamicSignal(call->args[4], SeqStmt::Flatten(transfers));
+        transfers = {local};
+      }
+      if (!remote.empty()) {
+        auto attrs = call->annotations;
+        attrs.Set(kDistRemoteRows, remote);
+        transfers.push_back(Evaluate(
+            Call(call->dtype, call->op, call->args, attrs, call->span)));
+      }
+      Stmt body = SeqStmt::Flatten(transfers);
+      branches.push_back(is_one(guard) ? body : IfThenElse(guard, body));
     }
-    Stmt lowered = SelectLocalOrRemote(locality, call->args[2] == rank_id_,
-                                       local, Evaluate(call));
-    return GuardDynamicSignal(call->args[4], std::move(lowered));
+    return SeqStmt::Flatten(branches);
   }
 
   bool SameRoute(const NormalRouteEntry &lhs, const NormalRouteEntry &rhs,
@@ -450,7 +511,8 @@ private:
     return true;
   }
 
-  Stmt LowerRoutedPut(const Call &call) {
+  Stmt LowerRoutedPut(const Call &call,
+                      std::optional<int64_t> fixed_rank = std::nullopt) {
     ICHECK_EQ(call->args.size(), 5U);
     const auto *current_core_node = call->args[4].as<VarNode>();
     ICHECK(current_core_node);
@@ -466,11 +528,14 @@ private:
           << "T.dist.routed_put source row is outside [0, " << mesh_nrows_
           << "): " << route.origin_src_row;
       bool peer_for_all_ranks = true;
+      bool any_peer = false;
       for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
         PrimExpr resolved_row = RewriteForSource(
             route.dst_row, current_core, route.origin_src_row, src_rank);
-        peer_for_all_ranks &=
+        bool peer =
             analyzer_->CanProve(resolved_row == I32(route.origin_src_row));
+        any_peer |= peer;
+        peer_for_all_ranks &= peer;
       }
       if (!peer_for_all_ranks) {
         ValidateCrossRowRegionOffsets(call->args[0], call->args[1],
@@ -482,9 +547,29 @@ private:
             << index;
       }
 
-      Locality locality =
-          ValidateAndClassify(route.dst_rank, route.dst_row, current_core,
-                              route.origin_src_row, "T.dist.routed_put");
+      if (any_peer && !peer_for_all_ranks) {
+        // Only a route whose forwarding class differs by rank needs a
+        // rank branch. Specialize the endpoint table, not the payload.
+        for (int64_t rank = 0; rank < world_size_; ++rank) {
+          auto entry = Call(DataType::Handle(), dist_route(),
+                            {I32(route.origin_src_row),
+                             RewriteForSource(route.dst_rank, current_core,
+                                              route.origin_src_row, rank),
+                             RewriteForSource(route.dst_row, current_core,
+                                              route.origin_src_row, rank)});
+          auto args = call->args;
+          args.Set(2, Call(DataType::Handle(), dist_route_table(), {entry}));
+          statements.push_back(
+              IfThenElse(rank_id_ == I32(rank),
+                         LowerRoutedPut(Call(call->dtype, call->op, args,
+                                             call->annotations, call->span),
+                                        rank)));
+        }
+        continue;
+      }
+      Locality locality = ValidateAndClassify(
+          route.dst_rank, route.dst_row, current_core, route.origin_src_row,
+          "T.dist.routed_put", fixed_rank);
       PrimExpr entry =
           Call(DataType::Handle(), dist_route(),
                {I32(route.origin_src_row), route.dst_rank, route.dst_row});
@@ -583,20 +668,14 @@ private:
     std::vector<NormalRouteEntry> routes;
     routes.reserve(static_cast<size_t>(mesh_nrows_));
     *all_peer = true;
-    for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
-      for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
-        PrimExpr dst_rank =
-            RewriteForSource(call->args[2], current_core, src_row, src_rank);
-        PrimExpr dst_row =
-            RewriteForSource(call->args[3], current_core, src_row, src_rank);
-        ValidateResolvedEndpoint(dst_rank, dst_row);
-        *all_peer &= analyzer_->CanProve(dst_row == I32(src_row));
+    if (auto table = call->annotations.Get(kDistRemoteRows)) {
+      for (const auto &row : Downcast<Array<Array<Integer>>>(*table)) {
+        int64_t src = row[0]->value, dst = row[1]->value;
+        *all_peer &= src == dst;
+        routes.push_back({src,
+                          RewriteForSource(call->args[2], current_core, src),
+                          I32(dst)});
       }
-    }
-    for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
-      routes.push_back(NormalRouteEntry{
-          src_row, RewriteForSource(call->args[2], current_core, src_row),
-          RewriteForSource(call->args[3], current_core, src_row)});
     }
     return routes;
   }
@@ -634,8 +713,16 @@ private:
         << "Cross-row T.dist.put inside loops is not supported until routed "
            "staging lifetime waits are implemented";
     if (all_peer) {
-      return MakePeerPut(call->args[0], call->args[1], call->args[2],
-                         call->args[4], current_core);
+      Stmt peer = MakePeerPut(call->args[0], call->args[1], call->args[2],
+                              call->args[4], current_core);
+      if (!routes.empty() && routes.size() < static_cast<size_t>(mesh_nrows_)) {
+        PrimExpr active = const_false();
+        for (const auto &route : routes)
+          active =
+              Or(active, CurrentRow(current_core) == I32(route.origin_src_row));
+        return IfThenElse(analyzer_->Simplify(active), peer);
+      }
+      return peer;
     }
 
     if (!HasCompilerGeneratedRegion(call)) {
@@ -763,10 +850,16 @@ private:
     ICHECK(!alloc_buffer_stack_.empty());
     std::string name = "dist_route_active_" + std::to_string(route_counter_) +
                        "_" + std::to_string(src_row);
+    // The predicate uses scalar tile access, and its local multicast must
+    // cover a complete RSRAM transfer unit. Only element zero is semantic.
+    const DataType dtype = DataType::Int(32);
+    int elements = GetSunmmioRsramAlignmentElems(
+        GetSunmmioTileProcessorConfig(target_).rsram_mcast_transfer_bytes,
+        dtype);
     Buffer stage =
-        decl_buffer({I32(1)}, DataType::UInt(8), name, kSunmmioScopeRSRAM);
+        decl_buffer({I32(elements)}, dtype, name, kSunmmioScopeRSRAM);
     alloc_buffer_stack_.back().push_back(stage);
-    return BufferRegion(stage, {Range::FromMinExtent(I32(0), I32(1))});
+    return BufferRegion(stage, {Range::FromMinExtent(I32(0), I32(elements))});
   }
 
   Stmt LowerDynamicRoutedPut(const Call &call, const Var &current_core,
@@ -811,12 +904,12 @@ private:
         statements.push_back(IfThenElse(
             current_row == I32(src_row),
             BufferStore(active_stage->buffer,
-                        Cast(DataType::UInt(8), peer_active), {I32(0)})));
+                        Cast(DataType::Int(32), peer_active), {I32(0)})));
         statements.push_back(Evaluate(
             Call(DataType::Handle(), PutOp::Get(),
                  {active_read, active_write, I32(-1), src_core, egress_core})));
         peer_active = BufferLoad(active_stage->buffer, {I32(0)}) !=
-                      IntImm(DataType::UInt(8), 0);
+                      IntImm(DataType::Int(32), 0);
       }
 
       PrimExpr signal;

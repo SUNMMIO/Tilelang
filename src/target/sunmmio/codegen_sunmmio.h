@@ -18,10 +18,14 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
 namespace tvm {
+namespace arith {
+class Analyzer;
+}
 namespace codegen {
 
 using SunMMIOCallAttrValue =
@@ -70,6 +74,27 @@ public:
                              const std::vector<BuilderArg> &args) = 0;
   virtual void EndFunction() = 0;
   virtual void EmitReturn() = 0;
+
+  virtual SunMMIOValue DistSignal(const std::string &name,
+                                  const SunMMIOType &type) = 0;
+  virtual SunMMIOValue DistBatchBegin(const std::string &name) = 0;
+  virtual void DistBatchPut(const SunMMIOValue &batch, const SunMMIOValue &peer,
+                            const SunMMIOValue &src,
+                            const SunMMIOValue &dst) = 0;
+  virtual void DistBatchSignal(const SunMMIOValue &batch,
+                               const SunMMIOValue &peer,
+                               const SunMMIOValue &signal,
+                               const SunMMIOValue &index,
+                               const std::optional<SunMMIOValue> &value) = 0;
+  virtual void DistBatchSubmit(const SunMMIOValue &batch) = 0;
+  virtual void DistSignalWait(const SunMMIOValue &signal,
+                              const SunMMIOValue &index,
+                              const SunMMIOValue &expected) = 0;
+  virtual SunMMIOValue DistSignalFetch(const std::string &name,
+                                       const SunMMIOValue &signal,
+                                       const SunMMIOValue &index,
+                                       DataType dtype) = 0;
+  virtual void DistFlush() = 0;
 
   virtual SunMMIOValue ConstantInt(const std::string &result_name, int64_t v,
                                    const SunMMIOType &type, DataType dtype) = 0;
@@ -260,6 +285,7 @@ public:
                         const std::vector<SunMMIOValue> &live_out_values) = 0;
   virtual void EndFor() = 0;
 
+  // An unbound result slot must be assigned in both branches before EndIf.
   virtual void BeginIf(const SunMMIOValue &cond,
                        const std::vector<SunMMIOValue> &live_out_values) = 0;
   virtual void BeginElse() = 0;
@@ -414,6 +440,64 @@ private:
                        const tvm::PrimExpr &rhs);
   SunMMIOValue EmitCast(const SunMMIOValue &v, tvm::DataType target_dtype);
   SunMMIOValue EmitCall(const tir::CallNode *op);
+  void ClearDistFunctionState();
+  void AnalyzeDistFunction(const tir::PrimFunc &func);
+  void BindDistResources(const tir::PrimFunc &func);
+  void PlanDistReconstruction(const tir::PrimFunc &func,
+                              const tir::CallNode *evidence);
+  void BindDistCaptures();
+  void AppendDistCaptureLiveOut(const tir::StmtNode *stmt,
+                                std::vector<SunMMIOValue> *live_out);
+  void PrepareDistRebuilds(const tir::StmtNode *stmt);
+  void EmitDistCapture(const tir::CallNode *op);
+  void EmitDistBatchBegins(const tir::StmtNode *stmt);
+  void PrepareDistFor(const tir::ForNode *op,
+                      std::vector<SunMMIOValue> *live_out);
+  void YieldDistFor(const tir::ForNode *op);
+  void FinishDistFor(const tir::ForNode *op);
+  SunMMIOValue EmitDistCall(const tir::CallNode *op);
+  SunMMIOValue EmitDistWaitAny(const tir::CallNode *op);
+  SunMMIOValue EmitRegionPartitionIndex(const PrimExpr &min, int64_t extent,
+                                        const std::string &context = "");
+  SunMMIOValue EmitDistRegion(const PrimExpr &region);
+
+  struct DistForPlan {
+    size_t initial;
+    size_t argument;
+    size_t yielded;
+    size_t result;
+    bool empty_yield;
+  };
+  struct DistCapture {
+    SunMMIOValue valid;
+    SunMMIOValue peer;
+    SunMMIOValue index;
+    std::optional<SunMMIOValue> generation;
+    std::optional<tir::BufferRegion> src;
+    std::optional<tir::BufferRegion> dst;
+    std::vector<SunMMIOValue> src_indices;
+    std::vector<SunMMIOValue> dst_indices;
+  };
+  void BindIntegerContext(arith::Analyzer *analyzer) const;
+  std::vector<PrimExpr> integer_constraints_;
+  std::vector<const tir::CallNode *> dist_capture_order_;
+  std::unordered_map<const tir::VarNode *, PrimExpr> dist_let_bindings_;
+  std::optional<std::pair<tir::Var, int64_t>> dist_rank_domain_;
+  std::unordered_map<const tir::CallNode *, DistCapture> dist_captures_;
+  std::unordered_map<const tir::CallNode *, std::vector<const tir::CallNode *>>
+      dist_rebuild_submits_;
+  std::unordered_map<const tir::StmtNode *, std::vector<const tir::CallNode *>>
+      dist_rebuild_before_;
+  std::unordered_map<const tir::StmtNode *,
+                     std::unordered_map<const tir::CallNode *, bool>>
+      dist_capture_live_out_;
+  std::unordered_map<const tir::CallNode *, SunMMIOValue> dist_rebuilt_batches_;
+  std::unordered_set<const tir::VarNode *> dist_destinations_;
+  std::unordered_map<const tir::CallNode *, size_t> dist_batch_for_call_;
+  std::unordered_map<const tir::StmtNode *, std::vector<size_t>> dist_begins_;
+  std::unordered_map<const tir::ForNode *, DistForPlan> dist_for_plans_;
+  std::unordered_map<size_t, SunMMIOValue> dist_batches_;
+  std::unordered_map<std::string, SunMMIOValue> dist_signals_;
   SunMMIOValue EmitMXPackOrUnpack(const tir::CallNode *op, bool is_pack);
   SunMMIOValue EmitRegionCall(const tvm::PrimExpr &region_expr,
                               int64_t byte_offset = 0,
@@ -435,6 +519,10 @@ private:
                          const SunMMIOValue &value);
   SunMMIOValue EmitScalarTilePick(const tir::BufferLoadNode *op);
   void EmitScalarTileSet(const tir::BufferStoreNode *op);
+  std::pair<std::vector<SunMMIOValue>, std::vector<SunMMIOValue>>
+  EmitScalarTileIndices(const ffi::Array<PrimExpr> &indices,
+                        const std::vector<int64_t> &dims,
+                        const std::vector<int64_t> &shape);
   std::vector<SunMMIOValue>
   CollectLocalVarLiveOutValues(const tir::Stmt &stmt) const;
   bool TryLowerTilesScope(const tir::ForNode *op);

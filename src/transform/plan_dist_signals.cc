@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "../op/utils.h"
+#include "../support/finite_width_integer.h"
 #include "dist_transform_utils.h"
 
 namespace tvm {
@@ -81,10 +82,13 @@ void ValidateStaticRegion(const BufferRegion &region, const char *op_name,
                           const char *operand_name, bool allow_dram) {
   bool valid_scope = region->buffer.scope() == kSunmmioScopeRSRAM ||
                      (allow_dram && IsDramScope(region->buffer.scope()));
-  ICHECK(valid_scope) << op_name << " " << operand_name
-                      << " must use shared.rsram"
-                      << (allow_dram ? " or global/DRAM" : "") << ", got "
-                      << region->buffer.scope();
+  ICHECK(valid_scope)
+      << op_name << " " << operand_name << " must use shared.rsram"
+      << (allow_dram ? " or global/DRAM" : "") << ", got "
+      << region->buffer.scope()
+      << (allow_dram
+              ? ""
+              : "; use T.copy to move the array to RSRAM before passing it");
   for (const Range &range : region->region) {
     ICHECK(range->extent.as<IntImmNode>())
         << op_name << " " << operand_name
@@ -567,8 +571,8 @@ private:
 
 class DistLoopDependencyDetector : public StmtExprVisitor {
 public:
-  explicit DistLoopDependencyDetector(const VarNode *loop_var)
-      : loop_var_(loop_var) {}
+  DistLoopDependencyDetector(const VarNode *loop_var, bool static_bounds)
+      : loop_var_(loop_var), static_bounds_(static_bounds) {}
 
   bool Detect(const Stmt &stmt) {
     VisitStmt(stmt);
@@ -576,6 +580,21 @@ public:
   }
 
 private:
+  void VisitStmt_(const IfThenElseNode *op) final {
+    if (static_bounds_ && ExprVarUseDetector(loop_var_).Detect(
+                              Substitute(op->condition, let_bindings_))) {
+      PostOrderVisit(ffi::GetRef<Stmt>(op), [&](const ObjectRef &n) {
+        auto *c = n.as<CallNode>();
+        found_ |= c && (c->op.same_as(dist_signal_put()) ||
+                        c->op.same_as(DistPutOp::Get()) ||
+                        c->op.same_as(dist_routed_put()) ||
+                        c->op.same_as(dist_rank_routed_put()));
+      });
+    }
+    if (!found_)
+      StmtExprVisitor::VisitStmt_(op);
+  }
+
   void VisitStmt_(const LetStmtNode *op) final {
     Map<Var, PrimExpr> old_bindings = let_bindings_;
     let_bindings_.Set(op->var, Substitute(op->value, let_bindings_));
@@ -584,6 +603,13 @@ private:
   }
 
   void VisitExpr_(const CallNode *call) final {
+    if (call->op.same_as(dist_signal_put()))
+      found_ |= ExprVarUseDetector(loop_var_).Detect(
+          Substitute(call->args[1], let_bindings_));
+    if (call->op.same_as(dist_routed_put()) ||
+        call->op.same_as(dist_rank_routed_put()))
+      found_ |= ExprVarUseDetector(loop_var_).Detect(
+          Substitute(call->args[2], let_bindings_));
     if (call->op.same_as(DistPutOp::Get())) {
       ICHECK_EQ(call->args.size(), 6U);
       found_ |= ExprVarUseDetector(loop_var_).Detect(
@@ -611,12 +637,51 @@ private:
   }
 
   const VarNode *loop_var_;
+  bool static_bounds_;
   bool found_{false};
   Map<Var, PrimExpr> let_bindings_;
 };
 
+// Same-row puts need just two locality bits. For a potential cross-row
+// transfer, group identical row tables under rank/IV guards. Payloads and
+// sender-local dynamic predicates stay at their original evaluation sites.
+struct OrdinaryPutPlan {
+  using Row = std::tuple<int64_t, int64_t, bool>; // origin, destination, local
+  using Table = std::vector<Row>;
+  int locality{0};
+  bool crosses_rows{false};
+  std::map<Table, std::vector<PrimExpr>> cases;
+
+  Call Annotate(const Call &call) const {
+    auto attrs = call->annotations;
+    attrs.Set(kDistPutLocality, Integer(locality));
+    if (crosses_rows) {
+      Array<Array<ObjectRef>> encoded;
+      for (const auto &[rows, guards] : cases) {
+        if (rows.empty())
+          continue;
+        PrimExpr guard = const_true();
+        if (cases.size() > 1) {
+          guard = const_false();
+          for (const auto &instance : guards)
+            guard = Or(guard, instance);
+        }
+        Array<Array<Integer>> entries;
+        for (const auto &[src, dst, local] : rows) {
+          entries.push_back({Integer(src), Integer(dst), Integer(local)});
+        }
+        encoded.push_back({guard, entries});
+      }
+      attrs.Set(kDistPutRowCases, encoded);
+    }
+    return Call(call->dtype, call->op, call->args, attrs, call->span);
+  }
+};
+
 class DistSignalTopologyAnalyzer : public DistRouteMutatorBase {
 public:
+  std::unordered_map<const CallNode *, OrdinaryPutPlan> put_plans;
+
   DistSignalTopologyAnalyzer(arith::Analyzer *analyzer, Target target,
                              int64_t world_size, Var rank_id,
                              const std::vector<DistSignalRecord> &records,
@@ -774,9 +839,20 @@ private:
   void RecordSend(const PrimExpr &signal, const PrimExpr &dst_rank_expr,
                   const PrimExpr &dst_row_expr, const Var &current_core,
                   int64_t src_rank, int64_t src_row,
-                  const PrimExpr &extra_predicate = const_true()) {
+                  const PrimExpr &extra_predicate = const_true(),
+                  bool signal_only = false, OrdinaryPutPlan *plan = nullptr,
+                  OrdinaryPutPlan::Table *rows = nullptr) {
     Map<Var, PrimExpr> substitution =
         MakeSourceSubstitution(current_core, src_row, src_rank);
+    PrimExpr source_predicate = Substitute(predicate_, let_bindings_);
+    auto participation = ParticipatingSource(
+        And(source_predicate, Substitute(extra_predicate, let_bindings_)),
+        substitution);
+    if (!participation)
+      return;
+    source_predicate = ResolveExpr(predicate_, substitution);
+    PrimExpr route_predicate = participation.value();
+
     PrimExpr dst_rank = ResolveExpr(dst_rank_expr, substitution);
     PrimExpr dst_row = ResolveExpr(dst_row_expr, substitution);
     ICHECK(!RouteExprBufferLoadDetector().Detect(dst_rank) &&
@@ -785,17 +861,35 @@ private:
     ValidateResolvedEndpoint(dst_rank, dst_row, "T.dist signal topology");
     int64_t dst_rank_value = RequireIntImm(dst_rank, "signal dst_rank");
     int64_t dst_row_value = RequireIntImm(dst_row, "signal dst_row");
+    if (plan) {
+      bool local = dst_rank_value == src_rank;
+      plan->locality |= local ? kPutLocal : kPutRemote;
+      plan->crosses_rows |= dst_row_value != src_row;
+      if (rows)
+        rows->emplace_back(src_row, dst_row_value, local);
+    }
     if (dst_rank_value == src_rank) {
+      ICHECK(!signal_only)
+          << "T.dist.put_signal only supports a remote peer Rank; source Rank "
+          << src_rank << " targets itself";
+      if (dst_row_value != src_row) {
+        PrimExpr control = predicate_;
+        if (const auto *ref = signal.as<CallNode>()) {
+          if (ref->op.same_as(dist_signal_route()))
+            control = And(control, ref->args[1]);
+          if (ref->op.same_as(dist_signal_group_route()))
+            control = And(control, ref->args[3]);
+        }
+        auto at_rank = Substitute(Substitute(control, let_bindings_),
+                                  {{rank_id_, I32(src_rank)}});
+        ICHECK(!unproven_loop_depth_ &&
+               IsRowInvariantPredicate(at_rank, current_core))
+            << "local cross-row barrier requires loop bounds and active "
+               "condition uniform across rows; use a row-uniform condition or "
+               "separate slots";
+      }
       return;
     }
-
-    PrimExpr source_predicate = ResolveExpr(predicate_, substitution);
-    PrimExpr route_predicate = analyzer_->Simplify(
-        And(source_predicate, ResolveExpr(extra_predicate, substitution)));
-    if (analyzer_->CanProve(Not(route_predicate))) {
-      return;
-    }
-
     ResolvedSignal resolved = ResolveSignal(signal, substitution);
     if (!resolved.allows_sender_dynamic) {
       ICHECK(!RouteExprBufferLoadDetector().Detect(source_predicate))
@@ -823,18 +917,36 @@ private:
     int64_t sender = src_rank * mesh_nrows_ + src_row;
     int64_t receiver = dst_rank_value * mesh_nrows_ + dst_row_value;
     SignalTopologyInfo &info = topology_[resolved.key];
-    info.receiver_senders[receiver].insert(sender);
-    info.sender_destinations[sender].insert(receiver);
+    // Two columns have different physical receiver resources, even when
+    // they use the same logical kind and member. Test participation at the
+    // actual column before recording either endpoint.
+    for (int col = 0; col < mesh_ncols_; ++col) {
+      if (!is_one(predicate) &&
+          !ParticipatingSource(
+              predicate, {{current_core, I32(src_row * mesh_ncols_ + col)}}))
+        continue;
+      auto from = sender * mesh_ncols_ + col, to = receiver * mesh_ncols_ + col;
+      info.receiver_senders[to].insert(from);
+      info.sender_destinations[from].insert(to);
+    }
   }
 
   void AnalyzePut(const CallNode *call) {
     ICHECK_EQ(call->args.size(), 6U);
     Var current_core = Downcast<Var>(call->args[5]);
+    auto &plan = put_plans[call];
+    bool needs_table =
+        !StructuralEqual()(call->args[3], CurrentRow(current_core));
     for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
+      OrdinaryPutPlan::Table rows;
       for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
         RecordSend(call->args[4], call->args[2], call->args[3], current_core,
-                   src_rank, src_row);
+                   src_rank, src_row, const_true(), false, &plan,
+                   needs_table ? &rows : nullptr);
       }
+      if (needs_table)
+        plan.cases[rows].push_back(
+            And(rank_id_ == I32(src_rank), instance_guard_));
     }
   }
 
@@ -844,7 +956,7 @@ private:
     for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
       for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
         RecordSend(call->args[0], call->args[1], I32(src_row), current_core,
-                   src_rank, src_row);
+                   src_rank, src_row, const_true(), true);
       }
     }
   }
@@ -856,6 +968,18 @@ private:
     Var current_core = Downcast<Var>(call->args[core_arg]);
     std::vector<NormalRouteEntry> routes = ParseNormalRouteTable(call->args[2]);
     for (int64_t src_rank = 0; src_rank < world_size_; ++src_rank) {
+      Map<Var, PrimExpr> rank_binding{{rank_id_, I32(src_rank)}};
+      if (has_src_rank &&
+          analyzer_->CanProve(ResolveExpr(call->args[3], rank_binding) !=
+                              I32(src_rank)))
+        continue;
+      auto rank_guard =
+          Substitute(Substitute(predicate_, let_bindings_), rank_binding);
+      if (analyzer_->CanProve(Not(rank_guard)))
+        continue;
+      ICHECK(IsRowInvariantPredicate(rank_guard, current_core))
+          << "T.dist.routed_put must be guarded by a condition that is uniform "
+             "across rows. Move source-row selection into the route table";
       for (const NormalRouteEntry &route : routes) {
         PrimExpr active = const_true();
         if (has_src_rank) {
@@ -890,20 +1014,29 @@ private:
     if (uniform) {
       uniform_loop_vars_.insert(op->loop_var.get());
     }
-    if (!DistLoopDependencyDetector(op->loop_var.get()).Detect(op->body)) {
+    if (!DistLoopDependencyDetector(op->loop_var.get(),
+                                    min_expr.as<IntImmNode>() &&
+                                        extent_expr.as<IntImmNode>())
+             .Detect(op->body)) {
       VisitStmt(op->body);
     } else {
+      ICHECK(!op->step || is_one(op->step.value()))
+          << "static dist endpoint enumeration requires unit For.step";
       int64_t min = RequireIntImm(min_expr, "dynamic signal-index loop min");
       int64_t extent =
           RequireIntImm(extent_expr, "dynamic signal-index loop extent");
       ICHECK_GE(extent, 0);
       Map<Var, PrimExpr> old_bindings = let_bindings_;
+      PrimExpr outer_guard = instance_guard_;
       for (int64_t offset = 0; offset < extent; ++offset) {
         let_bindings_.Set(op->loop_var,
                           IntImm(op->loop_var.dtype(), min + offset));
+        instance_guard_ =
+            And(outer_guard, op->loop_var == let_bindings_.at(op->loop_var));
         VisitStmt(op->body);
         let_bindings_ = old_bindings;
       }
+      instance_guard_ = outer_guard;
     }
     uniform_loop_vars_.erase(op->loop_var.get());
     unproven_loop_depth_ -= !uniform;
@@ -952,6 +1085,7 @@ private:
   std::unordered_map<SignalTopologyKey, SignalTopologyInfo,
                      SignalTopologyKeyHash>
       topology_;
+  PrimExpr instance_guard_{const_true()};
   PrimExpr predicate_{const_true()};
   Map<Var, PrimExpr> let_bindings_;
 
@@ -967,10 +1101,22 @@ public:
   explicit DistSignalPlanRewriter(
       const std::unordered_map<const VarNode *, DistSignalRecord> &plans,
       const std::unordered_map<const VarNode *, DistSignalGroupRecord>
-          &group_plans)
-      : plans_(plans), group_plans_(group_plans) {}
+          &group_plans,
+      const std::unordered_map<const CallNode *, OrdinaryPutPlan> &put_plans)
+      : plans_(plans), group_plans_(group_plans), put_plans_(put_plans) {}
 
 private:
+  const std::unordered_map<const CallNode *, OrdinaryPutPlan> &put_plans_;
+  PrimExpr VisitExpr_(const CallNode *op) final {
+    if (!op->op.same_as(DistPutOp::Get()))
+      return StmtExprMutator::VisitExpr_(op);
+    auto plan = put_plans_.find(op);
+    // A statically empty loop may contain a site never visited by topology.
+    const OrdinaryPutPlan empty;
+    return (plan == put_plans_.end() ? empty : plan->second)
+        .Annotate(ffi::GetRef<Call>(op));
+  }
+
   Stmt VisitStmt_(const LetStmtNode *let_node) final {
     const auto *call = let_node->value.as<CallNode>();
     if (call && call->op.same_as(dist_signal_group_decl())) {
@@ -1341,7 +1487,8 @@ PrimFunc PlanSignalResources(PrimFunc func) {
   for (const DistSignalGroupRecord &group : groups) {
     group_plans.emplace(group.var.get(), group);
   }
-  Stmt body = DistSignalPlanRewriter(plans, group_plans)(func->body);
+  Stmt body = DistSignalPlanRewriter(plans, group_plans,
+                                     topology.put_plans)(func->body);
   if (!body.same_as(func->body)) {
     func.CopyOnWrite()->body = std::move(body);
   }
@@ -1385,29 +1532,43 @@ private:
     Range range;
   };
 
-  PrimExpr Resolve(const PrimExpr &expr) {
-    return analyzer_->Simplify(Substitute(expr, bindings_));
+  PrimExpr Resolve(const PrimExpr &expr,
+                   const Map<Var, PrimExpr> &values = {}) {
+    FiniteWidthInteger::Definitions definitions;
+    for (const auto &[var, value] : bindings_)
+      definitions.emplace(var.get(), value);
+    for (const auto &[var, value] : values)
+      definitions[var.get()] = value;
+    FiniteWidthInteger integers(analyzer_, 1, &definitions);
+    auto value = integers.Analyze(expr);
+    // Failure to model a condition is not a proof that the program is invalid.
+    // Keep both paths possible without changing the original TIR expression.
+    return value.valid ? analyzer_->Simplify(value.expr)
+                       : Var("dist_unknown", expr.dtype());
   }
 
   // Find a concrete invalid Rank/loop instance. An interval merely crossing
   // the bound is not a counterexample; unknown runtime values need an assert.
   bool HasInvalidInstance(const PrimExpr &index, const PrimExpr &valid) {
     std::unordered_set<const VarNode *> needed;
-    auto collect = [&](const PrimExpr &expr) {
+    auto collect = [&](auto &&self, const PrimExpr &expr) -> void {
       PostOrderVisit(expr, [&](const ObjectRef &node) {
         if (const auto *var = node.as<VarNode>()) {
-          needed.insert(var);
+          if (needed.insert(var).second) {
+            if (auto value = bindings_.Get(ffi::GetRef<Var>(var)))
+              self(self, value.value());
+          }
         }
       });
     };
-    collect(index);
-    collect(path_);
+    collect(collect, index);
+    collect(collect, path_);
     std::vector<Domain> relevant;
     for (auto it = domains_.rbegin(); it != domains_.rend(); ++it) {
       if (needed.count(it->var.get())) {
         relevant.push_back(*it);
-        collect(it->range->min);
-        collect(it->range->extent);
+        collect(collect, it->range->min);
+        collect(collect, it->range->extent);
       }
     }
     std::reverse(relevant.begin(), relevant.end());
@@ -1418,11 +1579,11 @@ private:
       if (--budget < 0) {
         return false;
       }
-      PrimExpr active = analyzer_->Simplify(Substitute(path_, values));
+      PrimExpr active = Resolve(path_, values);
       if (is_zero(active)) {
         return false;
       }
-      PrimExpr check = analyzer_->Simplify(Substitute(valid, values));
+      PrimExpr check = Resolve(valid, values);
       if (is_one(active) && is_zero(check)) {
         return true;
       }
@@ -1430,9 +1591,8 @@ private:
         return false;
       }
       const Domain &domain = relevant[depth];
-      PrimExpr min = analyzer_->Simplify(Substitute(domain.range->min, values));
-      PrimExpr extent =
-          analyzer_->Simplify(Substitute(domain.range->extent, values));
+      PrimExpr min = Resolve(domain.range->min, values);
+      PrimExpr extent = Resolve(domain.range->extent, values);
       const auto *start = min.as<IntImmNode>();
       const auto *count = extent.as<IntImmNode>();
       if (!start || !count) {
@@ -1461,13 +1621,35 @@ private:
       groups_.erase(op->var.get());
       return LetStmt(op->var, op->value, body, op->span);
     }
+    PrimExpr value = VisitExpr(op->value);
     Map<Var, PrimExpr> previous = bindings_;
-    if (SideEffect(op->value) <= CallEffectKind::kPure) {
-      bindings_.Set(op->var, Resolve(op->value));
+    if ((op->var.dtype().is_int() || op->var.dtype().is_uint() ||
+         op->var.dtype().is_bool()) &&
+        SideEffect(value) <= CallEffectKind::kPure) {
+      // Preserve the real expression for concrete Rank/loop enumeration.
+      // Bind only its finite-width model to the mathematical analyzer.
+      PrimExpr model = Resolve(value);
+      bindings_.Set(op->var, value);
+      analyzer_->Bind(op->var, model);
     }
-    Stmt result = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
+    Stmt body = VisitStmt(op->body);
     bindings_ = std::move(previous);
-    return result;
+    return LetStmt(op->var, value, body, op->span);
+  }
+
+  PrimExpr VisitExpr_(const LetNode *op) final {
+    PrimExpr value = VisitExpr(op->value);
+    Map<Var, PrimExpr> previous = bindings_;
+    if ((op->var.dtype().is_int() || op->var.dtype().is_uint() ||
+         op->var.dtype().is_bool()) &&
+        SideEffect(value) <= CallEffectKind::kPure) {
+      PrimExpr model = Resolve(value);
+      bindings_.Set(op->var, value);
+      analyzer_->Bind(op->var, model);
+    }
+    PrimExpr body = VisitExpr(op->body);
+    bindings_ = std::move(previous);
+    return Let(op->var, value, body, op->span);
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
@@ -1476,14 +1658,23 @@ private:
     if (analyzer_->CanProve(extent <= 0)) {
       return tvm::ffi::GetRef<Stmt>(op);
     }
-    domains_.push_back({op->loop_var, Range::FromMinExtent(min, extent)});
-    Stmt body = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
+    Range domain = Range::FromMinExtent(min, extent);
+    domains_.push_back(
+        {op->loop_var, Range::FromMinExtent(op->min, op->extent)});
+    analyzer_->Bind(op->loop_var, domain);
+    With<arith::ConstraintContext> context(analyzer_, extent > 0);
+    Stmt body = StmtExprMutator::VisitStmt_(op);
     domains_.pop_back();
     return body;
   }
 
   Stmt VisitStmt_(const AttrStmtNode *op) final {
     const auto *thread = op->node.as<IterVarNode>();
+    if (op->attr_key == tir::attr::tilelang_assume) {
+      With<arith::ConstraintContext> context(
+          analyzer_, Resolve(Downcast<PrimExpr>(op->node)), true);
+      return StmtExprMutator::VisitStmt_(op);
+    }
     bool extent = thread && op->attr_key == tir::attr::thread_extent;
     if (extent) {
       domains_.push_back(
@@ -1497,18 +1688,28 @@ private:
     return result;
   }
 
+  Stmt VisitStmt_(const AssertStmtNode *op) final {
+    With<arith::ConstraintContext> context(analyzer_, Resolve(op->condition));
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  PrimExpr VisitExpr_(const SelectNode *op) final {
+    // Select evaluates both values; neither can use the other branch's facts.
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
   Stmt VisitStmt_(const IfThenElseNode *op) final {
     PrimExpr previous = path_;
     PrimExpr condition = Resolve(op->condition);
     Stmt then_case;
     Optional<Stmt> else_case;
     {
-      path_ = And(previous, condition);
+      path_ = And(previous, op->condition);
       With<arith::ConstraintContext> ctx(analyzer_, condition);
       then_case = VisitStmt(op->then_case);
     }
     if (op->else_case) {
-      path_ = And(previous, Not(condition));
+      path_ = And(previous, Not(op->condition));
       With<arith::ConstraintContext> ctx(analyzer_, Not(condition));
       else_case = VisitStmt(op->else_case.value());
     }
@@ -1517,6 +1718,24 @@ private:
   }
 
   PrimExpr VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(builtin::if_then_else())) {
+      PrimExpr condition = VisitExpr(op->args[0]);
+      PrimExpr model = Resolve(condition);
+      PrimExpr previous = path_, yes, no;
+      {
+        path_ = And(previous, condition);
+        With<arith::ConstraintContext> context(analyzer_, model);
+        yes = VisitExpr(op->args[1]);
+      }
+      {
+        path_ = And(previous, Not(condition));
+        With<arith::ConstraintContext> context(analyzer_, Not(model));
+        no = VisitExpr(op->args[2]);
+      }
+      path_ = previous;
+      return Call(op->dtype, op->op, {condition, yes, no}, op->annotations,
+                  op->span);
+    }
     PrimExpr rewritten = arith::IRMutatorWithAnalyzer::VisitExpr_(op);
     const auto *call = rewritten.as<CallNode>();
     if (!call->op.same_as(dist_signal_ref())) {
@@ -1524,23 +1743,26 @@ private:
     }
     auto group = groups_.find(call->args[0].as<VarNode>());
     ICHECK(group != groups_.end());
-    PrimExpr index = Substitute(call->args[1], bindings_);
+    PrimExpr index = call->args[1];
     ICHECK(index.dtype().is_int() && index.dtype().lanes() == 1)
         << "T.dist SignalList index must be a scalar integer";
     // Widen before comparing: count may not fit a narrow signed index dtype.
     PrimExpr wide = Cast(DataType::Int(64), index);
-    PrimExpr valid = And(wide >= make_zero(DataType::Int(64)),
-                         wide < IntImm(DataType::Int(64), group->second));
+    PrimExpr raw_valid = And(wide >= make_zero(DataType::Int(64)),
+                             wide < IntImm(DataType::Int(64), group->second));
+    PrimExpr valid = Resolve(raw_valid);
     bool proven = false;
     if (SideEffect(index) > CallEffectKind::kPure) {
       // A buffer tested by an outer branch may have been written since then.
       // Use only context-free arithmetic facts (e.g. load % count) for it.
       arith::Analyzer stable;
-      proven = stable.CanProve(valid);
-    } else if (!analyzer_->CanProve(Not(path_))) {
+      FiniteWidthInteger integers(&stable);
+      auto value = integers.Analyze(raw_valid);
+      proven = value.valid && stable.CanProve(value.expr);
+    } else if (!analyzer_->CanProve(Not(Resolve(path_)))) {
       proven = analyzer_->CanProve(valid);
       ICHECK(proven || (!analyzer_->CanProve(Not(valid)) &&
-                        !HasInvalidInstance(index, valid)))
+                        !HasInvalidInstance(index, raw_valid)))
           << "T.dist SignalList index " << call->args[1]
           << " is out of range [0, " << group->second
           << ") for a reachable Rank/loop instance";
@@ -1646,7 +1868,7 @@ private:
       ICHECK(call->args[0].dtype().is_handle());
       ValidateStaticRegion(NormalizeToBufferRegion(call->args[1]),
                            "T.dist.wait_signals", "expected_deltas",
-                           /*allow_dram=*/true);
+                           /*allow_dram=*/false);
     } else if (call->op.same_as(dist_wait_send())) {
       ICHECK_EQ(call->args.size(), 0);
     } else if (call->op.same_as(dist_completion())) {
@@ -1662,7 +1884,7 @@ private:
         ValidateStaticRegion(
             NormalizeToBufferRegion(call->args[1]), "T.dist.completion",
             mode == "manual" ? "expected_deltas" : "recv_counts",
-            /*allow_dram=*/true);
+            /*allow_dram=*/false);
       }
     } else if (call->op.same_as(dist_completion_has_pending()) ||
                call->op.same_as(dist_wait_any()) ||
@@ -1798,8 +2020,12 @@ private:
 
     void VisitStmt_(const EvaluateNode *op) final {
       if (const auto *call = op->value.as<CallNode>()) {
-        has_control_flow_ |= call->op.same_as(dist_wait_any()) ||
-                             call->op.same_as(dist_wait_completion_all()) ||
+        if (call->op.same_as(dist_wait_any())) {
+          ++wait_count_;
+          has_control_flow_ |= call->args.size() != 1 ||
+                               call->args[0].as<VarNode>() != completion_;
+        }
+        has_control_flow_ |= call->op.same_as(dist_wait_completion_all()) ||
                              call->op.same_as(tir::builtin::break_loop()) ||
                              call->op.same_as(tir::builtin::continue_loop()) ||
                              call->op.same_as(tir::builtin::ret());

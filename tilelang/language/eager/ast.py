@@ -219,6 +219,9 @@ class BaseBuilder:
     def aug_assign_slice(self, op: Operator, target: Any, sl: slice, aug_value: Any):
         eval_aug_assign(op, target, sl, aug_value)
 
+    def lazy_operand(self, operand, callee, position=None, unpack=None):
+        return operand()
+
     def boolop(self, op: BoolOp, left: Any, right: Callable[[], Any] | None = None) -> Any:
         if op == "And":
             return left and right()
@@ -541,6 +544,54 @@ class DSLMutator(ast.NodeTransformer):
             if isinstance(eval_res, (TensorProxy, StridedTensorProxy)) or eval_res is ptr:
                 self.extra_type_hints[name] = ptr
                 return
+
+    def visit_Call(self, node: ast.Call):
+        # Unknown keywords cannot bind any supported if_then_else spelling,
+        # including via partial. Keep those calls in their original frame.
+        if any(k.arg not in (None, "cond", "condition", "t", "f", "true_value", "false_value", "span", "dtype") for k in node.keywords):
+            return self.generic_visit(node)
+
+        # A partial may leave only one or two positional arguments, either of
+        # which can be a lazy branch. Already-bound names and literals cannot
+        # invoke an operand macro while evaluating such a short call.
+        if (
+            len(node.args) < 3
+            and all(isinstance(arg, (ast.Name, ast.Constant)) for arg in node.args)
+            and not any(k.arg in (None, "t", "f", "true_value", "false_value") for k in node.keywords)
+        ):
+            return self.generic_visit(node)
+
+        node = self.generic_visit(node)
+        # Bind the callable once, before any macro can emit a statement. This
+        # works for computed callees as well as globals and local aliases.
+        name = self.get_tmp()
+        callee = node.func
+        node.func = ast.Name(id=name, ctx=ast.Load())
+
+        def wrap(arg, position=None, unpack=None):
+            return quote_expr(f"__tb.lazy_operand(lambda: operand, {name}, {position!r}, {unpack!r})", operand=arg, span=node)
+
+        args = []
+        uncertain_position = False
+        for arg in node.args:
+            if isinstance(arg, ast.Starred) and isinstance(arg.value, (ast.Tuple, ast.List)):
+                elements = arg.value.elts
+            else:
+                elements = [arg]
+            for item in elements:
+                if isinstance(item, ast.Starred):
+                    args.append(ast.Starred(value=wrap(item.value, unpack="*"), ctx=ast.Load()))
+                    uncertain_position = True
+                else:
+                    position = None if uncertain_position else len(args)
+                    args.append(wrap(item, position) if position is None or position <= 2 else item)
+        node.args = args
+        for kw in node.keywords:
+            if kw.arg is None:
+                kw.value = wrap(kw.value, unpack="**")
+            elif kw.arg in ("t", "f", "true_value", "false_value"):
+                kw.value = wrap(kw.value)
+        return quote_expr(f"(lambda {name}: invoke)(callee)", invoke=node, callee=callee, span=node)
 
     def visit_BoolOp(self, node: ast.BoolOp):
         node = self.generic_visit(node)

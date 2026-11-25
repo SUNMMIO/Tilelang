@@ -71,7 +71,9 @@ struct SunMMIOType {
     kMemTensor,
     kTileView,
     kTile,
-    kUnknown
+    kUnknown,
+    kDistSignal,
+    kDistBatch
 
   };
 
@@ -84,6 +86,9 @@ struct SunMMIOType {
   std::vector<uint8_t> layout_dim_levels;
   std::string memory_scope;
   int64_t byte_offset{0};
+  bool peer_writable{false};
+  std::string signal_kind;
+  int64_t signal_count{0};
 };
 
 struct SunMMIOValue {

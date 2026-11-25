@@ -14,6 +14,7 @@ class SunmmioMlirExpr;
 class SunmmioMlirMemory;
 class SunmmioMlirTileOp;
 class SunmmioMlirCall;
+class SunmmioMlirDist;
 
 class SuvmSunmmioBuilder final : public SunMMIOBuilder {
 public:
@@ -31,6 +32,22 @@ public:
                      const std::vector<BuilderArg> &args) final;
   void EndFunction() final;
   void EmitReturn() final;
+
+  SunMMIOValue DistSignal(const std::string &name,
+                          const SunMMIOType &type) final;
+  SunMMIOValue DistBatchBegin(const std::string &name) final;
+  void DistBatchPut(const SunMMIOValue &batch, const SunMMIOValue &peer,
+                    const SunMMIOValue &src, const SunMMIOValue &dst) final;
+  void DistBatchSignal(const SunMMIOValue &batch, const SunMMIOValue &peer,
+                       const SunMMIOValue &signal, const SunMMIOValue &index,
+                       const std::optional<SunMMIOValue> &value) final;
+  void DistBatchSubmit(const SunMMIOValue &batch) final;
+  void DistSignalWait(const SunMMIOValue &signal, const SunMMIOValue &index,
+                      const SunMMIOValue &expected) final;
+  SunMMIOValue DistSignalFetch(const std::string &name,
+                               const SunMMIOValue &signal,
+                               const SunMMIOValue &index, DataType dtype) final;
+  void DistFlush() final;
 
   SunMMIOValue ConstantInt(const std::string &result_name, int64_t v,
                            const SunMMIOType &type, DataType dtype) final;
@@ -235,6 +252,7 @@ private:
   std::unique_ptr<SunmmioMlirMemory> memory_;
   std::unique_ptr<SunmmioMlirTileOp> tile_;
   std::unique_ptr<SunmmioMlirCall> call_;
+  std::unique_ptr<SunmmioMlirDist> dist_;
 };
 
 } // namespace codegen

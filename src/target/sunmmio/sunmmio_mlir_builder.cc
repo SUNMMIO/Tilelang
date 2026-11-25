@@ -1,6 +1,7 @@
 #include "sunmmio_mlir_builder.h"
 
 #include "sunmmio_mlir_call.h"
+#include "sunmmio_mlir_dist.h"
 #include "sunmmio_mlir_expr.h"
 #include "sunmmio_mlir_function.h"
 #include "sunmmio_mlir_memory.h"
@@ -17,7 +18,8 @@ SuvmSunmmioBuilder::SuvmSunmmioBuilder()
       expr_(std::make_unique<SunmmioMlirExpr>(ctx_)),
       memory_(std::make_unique<SunmmioMlirMemory>(ctx_)),
       tile_(std::make_unique<SunmmioMlirTileOp>(ctx_)),
-      call_(std::make_unique<SunmmioMlirCall>(ctx_)) {}
+      call_(std::make_unique<SunmmioMlirCall>(ctx_)),
+      dist_(std::make_unique<SunmmioMlirDist>(ctx_)) {}
 
 SuvmSunmmioBuilder::~SuvmSunmmioBuilder() = default;
 
@@ -44,6 +46,42 @@ void SuvmSunmmioBuilder::BeginFunction(const std::string &name,
 
 void SuvmSunmmioBuilder::EndFunction() { function_->EndFunction(); }
 void SuvmSunmmioBuilder::EmitReturn() { function_->EmitReturn(); }
+
+SunMMIOValue SuvmSunmmioBuilder::DistSignal(const std::string &name,
+                                            const SunMMIOType &type) {
+  return dist_->Signal(name, type);
+}
+SunMMIOValue SuvmSunmmioBuilder::DistBatchBegin(const std::string &name) {
+  return dist_->BatchBegin(name);
+}
+void SuvmSunmmioBuilder::DistBatchPut(const SunMMIOValue &batch,
+                                      const SunMMIOValue &peer,
+                                      const SunMMIOValue &src,
+                                      const SunMMIOValue &dst) {
+  dist_->BatchPut(batch, peer, src, dst);
+}
+void SuvmSunmmioBuilder::DistBatchSignal(
+    const SunMMIOValue &batch, const SunMMIOValue &peer,
+    const SunMMIOValue &signal, const SunMMIOValue &index,
+    const std::optional<SunMMIOValue> &value) {
+  dist_->BatchSignal(batch, peer, signal, index, value);
+}
+void SuvmSunmmioBuilder::DistBatchSubmit(const SunMMIOValue &batch) {
+  dist_->BatchSubmit(batch);
+}
+void SuvmSunmmioBuilder::DistSignalWait(const SunMMIOValue &signal,
+                                        const SunMMIOValue &index,
+                                        const SunMMIOValue &expected) {
+  dist_->SignalWait(signal, index, expected);
+}
+void SuvmSunmmioBuilder::DistFlush() { dist_->Flush(); }
+
+SunMMIOValue SuvmSunmmioBuilder::DistSignalFetch(const std::string &name,
+                                                 const SunMMIOValue &signal,
+                                                 const SunMMIOValue &index,
+                                                 DataType dtype) {
+  return dist_->SignalFetch(name, signal, index, dtype);
+}
 
 SunMMIOValue SuvmSunmmioBuilder::ConstantInt(const std::string &result_name,
                                              int64_t v, const SunMMIOType &type,

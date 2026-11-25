@@ -56,7 +56,8 @@ def memory_route_kernel_factory(
                 T.dist.put(src, output if dram else dst, peer, dst_row=target_row, signal=signals[1] if route == "member" else signal)
             T.dist.submit()
             if route == "active":
-                T.dist.wait_signal(signals[1], expected_delta=recv_count)
+                if recv_count >= 0 and recv_count <= 255:
+                    T.dist.wait_signal(signals[1], expected_delta=recv_count)
             else:
                 T.dist.wait_signal(signals[1] if route == "member" else signal)
 
@@ -89,9 +90,10 @@ def test_memory_cross_row_preserves_generation_and_receiver_kind(dram, kind, rou
     for put in puts:
         assert put.args[3].value == kind.value
         assert int(put.args[4]) == (1 if route in ("member", "active") else 0)
-        generation = put.args[5]
+        assert put.args[5].dtype == "uint64"
+        generation = put.args[5].value
         assert isinstance(generation, tvm.tir.BufferLoad)
-        assert str(generation.dtype) == "uint64"
+        assert str(generation.dtype) == "uint32"
         advances = collect_nodes(
             injected,
             tvm.tir.BufferStore,
@@ -117,7 +119,7 @@ def test_memory_cross_row_preserves_generation_and_receiver_kind(dram, kind, rou
         seqs = collect_nodes(injected, tvm.tir.SeqStmt)
         assert any(
             isinstance(a, tvm.tir.BufferStore)
-            and a.buffer.data.same_as(puts[0].args[5].buffer.data)
+            and a.buffer.data.same_as(generation.buffer.data)
             and isinstance(b, tvm.tir.Evaluate)
             and isinstance(b.value, tvm.tir.Call)
             and b.value.same_as(puts[0])

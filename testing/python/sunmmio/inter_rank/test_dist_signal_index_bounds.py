@@ -7,7 +7,7 @@ import tilelang
 import tilelang.language as T
 from tilelang import tvm
 from testing.python.sunmmio.inter_rank.lowering import lower_to_device_tir
-from testing.python.sunmmio.inter_rank.tir_test_utils import base_mod, collect_calls, collect_nodes, single_prim_func
+from testing.python.sunmmio.inter_rank.tir_test_utils import base_mod, collect_calls, collect_nodes, single_prim_func, strip_casts
 
 tir = tvm.tir
 
@@ -201,8 +201,10 @@ def test_mutable_index_is_sampled_once_per_wait_and_rechecked():
         assert not collect_nodes(body, tir.BufferLoad, lambda node: node.buffer.name == "indices")
         wait = collect_calls(body, "tl.dist_wait_signal_")[0]
         assert wait.args[1].same_as(snapshot.var)
-        assert wait.args[2].indices[0].same_as(snapshot.var)
-        updates = collect_nodes(body, tir.BufferStore, lambda node, data=wait.args[2].buffer.data: node.buffer.data.same_as(data))
+        expected = strip_casts(wait.args[2])
+        assert wait.args[2].dtype == "uint8"
+        assert expected.indices[0].same_as(snapshot.var)
+        updates = collect_nodes(body, tir.BufferStore, lambda node, data=expected.buffer.data: node.buffer.data.same_as(data))
         assert len(updates) == 1
         assert updates[0].indices[0].same_as(snapshot.var)
 

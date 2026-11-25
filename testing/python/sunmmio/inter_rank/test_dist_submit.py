@@ -202,7 +202,7 @@ def source_lifetime_kernel_factory(mode="submitted_overlap", redundant_submit=Fa
     @T.prim_func
     def main(rank_id: T.dist.RankId):
         with T.Kernel():
-            src = T.alloc_shared((64,), T.bfloat16)
+            src = T.alloc_shared((512,), T.bfloat16)
             dst = T.alloc_shared((32,), T.bfloat16)
             signal = T.dist.signal()
             T.dist.put(src[0:32], dst, (rank_id + 1) % world_size, signal=signal)
@@ -214,7 +214,7 @@ def source_lifetime_kernel_factory(mode="submitted_overlap", redundant_submit=Fa
             if mode == "submitted_overlap":
                 src[0] = 0
             elif mode == "submitted_disjoint":
-                src[32] = 0
+                src[256] = 0
             elif mode == "submitted_dma_overlap":
                 T.copy(dst, src[0:32])
 
@@ -226,12 +226,12 @@ def mutable_source_index_kernel_factory(submitted=True, mutate=True, world_size:
     @T.prim_func
     def main(initial: T.int32, rank_id: T.dist.RankId):
         with T.Kernel():
-            src = T.alloc_shared((128,), T.bfloat16)
+            src = T.alloc_shared((1024,), T.bfloat16)
             dst = T.alloc_shared((32,), T.bfloat16)
             position = T.alloc_var(T.int32, init=initial)
             signal = T.dist.signal(expect="manual")
             T.dist.put(
-                src[position * 32 : (position + 1) * 32],
+                src[position * 256 : position * 256 + 32],
                 dst,
                 (rank_id + 1) % world_size,
                 signal=signal,
@@ -240,9 +240,9 @@ def mutable_source_index_kernel_factory(submitted=True, mutate=True, world_size:
                 T.dist.submit()
             if mutate:
                 position += 1
-                src[(position - 1) * 32] = 0
+                src[(position - 1) * 256] = 0
             else:
-                src[(position + 1) * 32] = 0
+                src[(position + 1) * 256] = 0
             if not submitted:
                 T.dist.submit()
 
@@ -477,13 +477,9 @@ def _has_wait_before_return(func_or_mod, return_value):
 
 
 @pytest.mark.parametrize("control_flow", ["if", "for", "while"])
-def test_early_return_waits_on_every_in_flight_exit(control_flow):
-    result = lower_to_device_tir(
-        early_return_kernel_factory.get_tir(control_flow, world_size=4),
-        capture_passes="tl.LowerDistSync",
-    )
-    assert _has_wait_before_return(result.pass_snapshot("tl.LowerDistSync").mod, 1)
-    assert _has_wait_before_return(result.device_mod, 1)
+def test_early_return_is_rejected_at_production_entry(control_flow):
+    with pytest.raises(tvm.error.InternalError, match="explicit return/break/continue"):
+        lower_to_device_tir(early_return_kernel_factory.get_tir(control_flow, world_size=4))
 
 
 def test_manual_sender_wait_is_rejected():
@@ -519,7 +515,7 @@ def test_disjoint_source_write_keeps_wait_at_scope_exit(redundant_submit):
     )
     script = result.pass_snapshot("tl.LowerDistSync").mod.script()
     submit = script.index("T.dist_submit_()")
-    store = script.index("src[32] =", submit)
+    store = script.index("src[256] =", submit)
     wait = script.index("T.dist_wait_send()", submit)
     assert submit < store < wait
 
@@ -539,6 +535,10 @@ def test_async_source_write_after_submit_gets_automatic_wait():
 
 @pytest.mark.parametrize("loop_kind", ["serial", "step", "nested", "continue", "while"])
 def test_loop_carried_source_overwrite_waits_for_previous_iteration(loop_kind):
+    if loop_kind == "continue":
+        with pytest.raises(tvm.error.InternalError, match="explicit return/break/continue"):
+            lower_to_device_tir(loop_source_lifetime_kernel_factory.get_tir(loop_kind=loop_kind, world_size=4))
+        return
     result = lower_to_device_tir(
         loop_source_lifetime_kernel_factory.get_tir(loop_kind=loop_kind, world_size=4),
         capture_passes="tl.LowerDistSync",
@@ -560,7 +560,8 @@ def test_loop_carried_source_overwrite_waits_for_previous_iteration(loop_kind):
 
 @pytest.mark.parametrize("loop_kind", ["serial", "step", "nested", "continue", "while"])
 def test_loop_carried_source_overwrite_before_submit_is_rejected(loop_kind):
-    with pytest.raises(tvm.error.InternalError, match="modified before its queued batch is submitted"):
+    message = "explicit return/break/continue" if loop_kind == "continue" else "modified before its queued batch is submitted"
+    with pytest.raises(tvm.error.InternalError, match=message):
         lower_to_device_tir(loop_source_lifetime_kernel_factory.get_tir(loop_kind=loop_kind, submit_each=False, world_size=4))
 
 
@@ -613,6 +614,41 @@ def _inject_queue_body(body, params=()):
     func = tvm.tir.PrimFunc(params, body).with_attr("tl.dist.world_size", 4)
     mod = tilelang.transform.LowerDistSync()(tvm.IRModule({"main": func}))
     return mod["main"]
+
+
+@pytest.mark.parametrize("control_flow", ["if", "for", "while"])
+def test_sender_wait_before_explicit_return_in_single_pass(control_flow):
+    stop = tvm.tir.Var("stop", "int32")
+    exit_body = tvm.tir.IfThenElse(stop != 0, tvm.tir.Evaluate(tvm.tir.ret(1)), None)
+    if control_flow != "if":
+        exit_body = _queue_loop(control_flow, exit_body)
+    func = _inject_queue_body(
+        tvm.tir.SeqStmt([_queued_signal_put(), _dist_leaf("dist_submit_"), exit_body]),
+        [stop],
+    )
+    assert _has_wait_before_return(func, 1)
+
+
+@pytest.mark.parametrize("submitted", [False, True])
+def test_continue_source_overwrite_lifetime_in_single_pass(submitted):
+    src = tvm.tir.decl_buffer((32,), "bfloat16", name="src", scope="shared.rsram")
+    dst = tvm.tir.decl_buffer((32,), "bfloat16", name="dst", scope="shared.rsram")
+    send = _dist_leaf("dist_put_", _encoded_region(src, 1), _encoded_region(dst, 2), 1, "sram_flagreg_inc", 0, tvm.tir.const(0, "uint8"))
+    statements = [tvm.tir.BufferStore(src, tvm.tir.const(0, "bfloat16"), [0]), send]
+    if submitted:
+        statements.append(_dist_leaf("dist_submit_"))
+    statements.append(_loop_jump("continue"))
+    loop = tvm.tir.For(tvm.tir.Var("i", "int32"), 0, 2, tvm.tir.ForKind.SERIAL, tvm.tir.SeqStmt(statements))
+    body = tvm.tir.Allocate(src.data, src.dtype, src.shape, True, tvm.tir.Allocate(dst.data, dst.dtype, dst.shape, True, loop))
+    if not submitted:
+        with pytest.raises(tvm.error.InternalError, match="modified before its queued batch is submitted"):
+            _inject_queue_body(body)
+        return
+    func = _inject_queue_body(body)
+    loop = collect_nodes(func, tvm.tir.For)[0]
+    seq = loop.body.seq
+    store_index = next(i for i, stmt in enumerate(seq) if isinstance(stmt, tvm.tir.BufferStore))
+    assert store_index > 0 and seq[store_index - 1].value.op.same_as(tvm.ir.Op.get("tl.dist_wait_send"))
 
 
 @pytest.mark.parametrize("submitted", [False, True])
@@ -668,8 +704,8 @@ def test_index_storage_writes_preserve_queued_and_inflight_sources(submitted, in
 
 
 def test_loop_carried_source_preserves_invariant_disjoint_dimensions():
-    src = tvm.tir.decl_buffer((2, 128), "bfloat16", name="src", scope="shared.rsram")
-    dst = tvm.tir.decl_buffer((2, 128), "bfloat16", name="dst", scope="shared.rsram")
+    src = tvm.tir.decl_buffer((16, 128), "bfloat16", name="src", scope="shared.rsram")
+    dst = tvm.tir.decl_buffer((16, 128), "bfloat16", name="dst", scope="shared.rsram")
     i = tvm.tir.Var("i", "int32")
 
     def region(buffer, access):
@@ -682,15 +718,15 @@ def test_loop_carried_source_preserves_invariant_disjoint_dimensions():
         tvm.tir.ForKind.SERIAL,
         tvm.tir.SeqStmt(
             [
-                tvm.tir.BufferStore(src, tvm.tir.const(0, "bfloat16"), [1, (i - 1) * 32]),
+                tvm.tir.BufferStore(src, tvm.tir.const(0, "bfloat16"), [8, (i - 1) * 32]),
                 _dist_leaf("dist_put_", region(src, 1), region(dst, 2), 1, "sram_flagreg_inc", 0, tvm.tir.const(0, "uint8")),
                 _dist_leaf("dist_submit_"),
             ]
         ),
     )
     func = _inject_queue_body(loop, [src.data, dst.data])
-    # Only the existing pre-submit wait and final drain are needed: row 1 is
-    # disjoint from every previous send, even as the column changes each round.
+    # Only the existing pre-submit wait and final drain are needed: row 8 is
+    # in a different physical tile from every previous send, even as the column changes each round.
     assert collect_op_names(func).count("tl.dist_wait_send") == 2
 
 
@@ -827,19 +863,10 @@ def _queue_loop(loop_kind, body):
 
 @pytest.mark.parametrize("jump", ["break", "continue"])
 @pytest.mark.parametrize("submit_after_loop", [False, True])
-def test_loop_jump_submission_through_device_tir(jump, submit_after_loop):
+def test_loop_jump_submission_is_rejected_at_production_entry(jump, submit_after_loop):
     func = loop_jump_kernel_factory.get_tir(jump, submit_after_loop, world_size=4)
-    if not submit_after_loop:
-        with pytest.raises(tvm.error.InternalError, match="send queue is not submitted"):
-            lower_to_device_tir(func)
-        return
-    result = lower_to_device_tir(func, capture_passes="tl.LowerDistSync")
-    for mod in (result.pass_snapshot("tl.LowerDistSync").mod, result.device_mod):
-        names = collect_op_names(mod)
-        assert "tir." + jump + "_loop" in names
-        assert names.count("tl.dist_submit_") == 2
-        # Two pre-submit waits and one final drain; none at the jump itself.
-        assert names.count("tl.dist_wait_send") == 3
+    with pytest.raises(tvm.error.InternalError, match="explicit return/break/continue"):
+        lower_to_device_tir(func)
 
 
 @pytest.mark.parametrize("jump", ["break", "continue"])

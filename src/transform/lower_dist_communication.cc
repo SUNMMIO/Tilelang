@@ -15,7 +15,9 @@
 #include <utility>
 #include <vector>
 
+#include "../layout/cute_layout.h"
 #include "../op/builtin.h"
+#include "../op/region.h"
 #include "../op/utils.h"
 #include "dist_transform_utils.h"
 
@@ -100,10 +102,7 @@ private:
     PrimExpr signal;
     std::string sort_key;
     PrimExpr current_core;
-    const DistSignalKindInfo *kind;
     std::vector<std::vector<PrimExpr>> deltas;
-    std::vector<std::vector<std::optional<std::pair<int64_t, int64_t>>>>
-        senders;
   };
 
   struct SignalExpectationKey {
@@ -130,6 +129,7 @@ private:
     Var var;
     int64_t min;
     int64_t extent;
+    bool unit_step;
   };
 
   class LoopVarUseDetector : public ExprVisitor {
@@ -158,6 +158,8 @@ private:
       return;
     }
     const StaticLoopBinding &loop = loops[depth];
+    ICHECK(loop.unit_step)
+        << "static dist endpoint enumeration requires unit For.step";
     for (int64_t offset = 0; offset < loop.extent; ++offset) {
       int64_t value = loop.min + offset;
       Map<Var, PrimExpr> next = substitution;
@@ -265,13 +267,11 @@ private:
                                     const PrimExpr &current_core) {
     const VarNode *owner = signal.as<VarNode>();
     int64_t member_index = -1;
-    const DistSignalKindInfo *kind = nullptr;
     std::string sort_key;
     if (owner) {
       auto kind_it = signal_kinds_.find(owner);
       ICHECK(kind_it != signal_kinds_.end())
           << "Cannot find resolved T.dist.signal kind for " << signal;
-      kind = kind_it->second.kind;
       sort_key = owner->name_hint;
     } else {
       const auto *ref = signal.as<CallNode>();
@@ -285,7 +285,6 @@ private:
       auto kind_it = signal_group_kinds_.find(owner);
       ICHECK(kind_it != signal_group_kinds_.end())
           << "Cannot find resolved T.dist.signals kind for " << signal;
-      kind = kind_it->second.kind;
       sort_key = owner->name_hint + ":" + std::to_string(member_index);
     }
     SignalExpectationKey key{owner, member_index};
@@ -293,37 +292,22 @@ private:
     if (it == expectations->end()) {
       std::vector<std::vector<PrimExpr>> deltas(
           world_size_, std::vector<PrimExpr>(mesh_nrows_, I32(0)));
-      std::vector<std::vector<std::optional<std::pair<int64_t, int64_t>>>>
-          senders(world_size_,
-                  std::vector<std::optional<std::pair<int64_t, int64_t>>>(
-                      mesh_nrows_));
       it = expectations
                ->emplace(key, SignalExpectation{signal, sort_key, current_core,
-                                                kind, deltas, senders})
+                                                deltas})
                .first;
     }
     return it->second;
   }
 
   void AddDelta(SignalExpectation *expectation, int64_t dst_rank,
-                int64_t dst_row, int64_t src_rank, int64_t src_row,
-                const PrimExpr &predicate) {
+                int64_t dst_row, const PrimExpr &predicate) {
     ICHECK_GE(dst_rank, 0);
     ICHECK_LT(dst_rank, world_size_);
     ICHECK_GE(dst_row, 0);
     ICHECK_LT(dst_row, mesh_nrows_);
-    if (!expectation->kind->allow_multi_sender &&
-        !analyzer_->CanProve(Not(predicate))) {
-      auto &sender = expectation->senders[dst_rank][dst_row];
-      std::pair<int64_t, int64_t> endpoint{src_rank, src_row};
-      ICHECK(!sender || sender.value() == endpoint)
-          << "T.dist signal " << expectation->signal
-          << " has multiple physical senders for receiver endpoint (rank="
-          << dst_rank << ", row=" << dst_row << ") with kind "
-          << expectation->kind->name
-          << ". Use one independent signal per sender";
-      sender = endpoint;
-    }
+    // PlanDistSignals has validated uniqueness per physical receiver and
+    // column.
     PrimExpr contribution = Select(predicate, I32(1), I32(0));
     expectation->deltas[dst_rank][dst_row] = analyzer_->Simplify(
         expectation->deltas[dst_rank][dst_row] + contribution);
@@ -346,17 +330,19 @@ private:
         for (int64_t src_row = 0; src_row < mesh_nrows_; ++src_row) {
           Map<Var, PrimExpr> substitution =
               MakeSourceSubstitution(current_core, src_row, src_rank);
-          int64_t dst_rank =
-              RequireResolvedInt(Substitute(call->args[1], substitution),
-                                 "signal destination rank");
-          PrimExpr predicate =
-              analyzer_->Simplify(Substitute(source_predicate, substitution));
-          ICHECK(dst_rank != src_rank || analyzer_->CanProve(Not(predicate)))
-              << "T.dist.put_signal only supports a remote peer Rank; source "
-                 "Rank "
-              << src_rank << " targets itself";
-          AddDelta(&expectation, dst_rank, src_row, src_rank, src_row,
-                   predicate);
+          auto visit = [&](const Map<Var, PrimExpr> &instance,
+                           const PrimExpr &loop_condition) {
+            auto active = ParticipatingSource(source_predicate, instance);
+            if (!active)
+              return;
+            int64_t dst_rank = RequireResolvedInt(
+                Substitute(call->args[1], instance), "signal destination rank");
+            AddDelta(&expectation, dst_rank, src_row,
+                     And(active.value(), loop_condition));
+          };
+          ForEachStaticLoopInstance(
+              RelevantStaticLoops({call->args[1], source_predicate}), 0,
+              substitution, const_true(), visit);
         }
       }
       return;
@@ -372,15 +358,17 @@ private:
               MakeSourceSubstitution(current_core, src_row, src_rank);
           auto visit_instance = [&](const Map<Var, PrimExpr> &instance,
                                     const PrimExpr &loop_predicate) {
+            auto active = ParticipatingSource(source_predicate, instance);
+            if (!active)
+              return;
             int64_t dst_rank = RequireResolvedInt(
                 Substitute(call->args[2], instance), "peer destination rank");
-            PrimExpr predicate = analyzer_->Simplify(
-                And(loop_predicate, Substitute(source_predicate, instance)));
-            AddDelta(&expectation, dst_rank, src_row, src_rank, src_row,
-                     predicate);
+            PrimExpr predicate =
+                analyzer_->Simplify(And(loop_predicate, active.value()));
+            AddDelta(&expectation, dst_rank, src_row, predicate);
           };
           std::vector<StaticLoopBinding> loops =
-              RelevantStaticLoops({call->args[2]});
+              RelevantStaticLoops({call->args[2], source_predicate});
           ForEachStaticLoopInstance(loops, 0, substitution, const_true(),
                                     visit_instance);
         }
@@ -399,13 +387,13 @@ private:
           int64_t peer_row = RequireResolvedInt(route.peer_row, "peer row");
           Map<Var, PrimExpr> substitution =
               MakeSourceSubstitution(current_core, peer_row, src_rank);
+          auto active = ParticipatingSource(source_predicate, substitution);
+          if (!active)
+            continue;
           int64_t dst_rank =
               RequireResolvedInt(Substitute(route.dst_rank, substitution),
                                  "routed peer destination rank");
-          PrimExpr predicate =
-              analyzer_->Simplify(Substitute(source_predicate, substitution));
-          AddDelta(&expectation, dst_rank, peer_row, src_rank, peer_row,
-                   predicate);
+          AddDelta(&expectation, dst_rank, peer_row, active.value());
         }
       }
     }
@@ -746,7 +734,8 @@ private:
     bool static_loop = min_imm && extent_imm && extent_imm->value >= 0;
     if (static_loop) {
       static_loops_.push_back(
-          StaticLoopBinding{op->loop_var, min_imm->value, extent_imm->value});
+          StaticLoopBinding{op->loop_var, min_imm->value, extent_imm->value,
+                            !op->step || is_one(op->step.value())});
     }
     loop_vars_.insert(op->loop_var.get());
     Stmt stmt = arith::IRMutatorWithAnalyzer::VisitStmt_(op);
@@ -928,11 +917,33 @@ private:
 class LowerDistPrimitiveMutator : public StmtExprMutator {
 public:
   LowerDistPrimitiveMutator(int64_t world_size, int mesh_nrows, int mesh_ncols,
-                            Var rank_id)
+                            Var rank_id, Target target)
       : world_size_(world_size), mesh_nrows_(mesh_nrows),
-        mesh_ncols_(mesh_ncols), rank_id_(std::move(rank_id)) {}
+        mesh_ncols_(mesh_ncols), rank_id_(std::move(rank_id)),
+        target_(std::move(target)) {}
+
+  const LayoutMap &StateLayouts() const { return state_layouts_; }
 
 private:
+  Map<String, ObjectRef>
+  ExpectedAnnotations(const PrimExpr &kind,
+                      Map<String, ObjectRef> annotations = {}) {
+    annotations.Set(kDistExpectedSignalKindAttr, kind);
+    return annotations;
+  }
+
+  Buffer MakeStateArray(PrimExpr count, DataType dtype,
+                        const std::string &name) {
+    Buffer buffer = decl_buffer(
+        {count}, dtype == DataType::UInt(8) ? DataType::Int(32) : dtype, name,
+        kSunmmioScopeRSRAM);
+    auto config = GetSunmmioTileProcessorConfig(target_);
+    state_layouts_.Set(
+        buffer, sunmmio::MakeAlignedRowMajor(buffer->shape, buffer->dtype,
+                                             config.rsram_align_bytes));
+    return buffer;
+  }
+
   struct SignalInfo {
     PrimExpr kind;
     PrimExpr index;
@@ -1065,8 +1076,9 @@ private:
                                        : generation_layout.row_domain;
       PrimExpr count_imm = IntImm(DataType::Int(32), count);
       std::string base_name = let_node->var->name_hint;
-      Buffer expected = decl_buffer({count_imm}, kind_info->state_dtype,
-                                    base_name + "_expect", "local");
+      DataType software_dtype = DistSoftwareStateDType(*kind_info);
+      Buffer expected =
+          MakeStateArray(count_imm, software_dtype, base_name + "_expect");
       int64_t generation_factor = 1;
       if (generation_layout.dense) {
         generation_factor =
@@ -1076,16 +1088,15 @@ private:
           IntImm(DataType::Int(32), count * generation_factor);
       Buffer generation;
       if (needs_generation) {
-        generation = decl_buffer({generation_count}, kind_info->state_dtype,
-                                 base_name + "_generation", "local");
+        generation = MakeStateArray(generation_count, software_dtype,
+                                    base_name + "_generation");
       }
       std::string expect_mode =
           RequireStringImm(signal_call_node->args[3], "signal-group expect");
       Buffer auto_completion_deltas;
       if (completion_domain.uses_auto_completion) {
-        auto_completion_deltas =
-            decl_buffer({count_imm}, DataType::Int(32),
-                        base_name + "_completion_deltas", "local");
+        auto_completion_deltas = MakeStateArray(
+            count_imm, expected->dtype, base_name + "_completion_deltas");
       }
       signal_group_info_.emplace(
           let_node->var.get(),
@@ -1107,7 +1118,7 @@ private:
       Stmt initialize_expect =
           For(expect_init_index, IntImm(DataType::Int(32), 0), count_imm,
               ForKind::kSerial,
-              BufferStore(expected, make_zero(kind_info->state_dtype),
+              BufferStore(expected, make_zero(expected->dtype),
                           {expect_init_index}));
       Array<Stmt> statements{initialize_expect};
       if (auto_completion_deltas.defined()) {
@@ -1117,13 +1128,14 @@ private:
             For(delta_index, IntImm(DataType::Int(32), 0), count_imm,
                 ForKind::kSerial,
                 BufferStore(auto_completion_deltas,
-                            IntImm(DataType::Int(32), 0), {delta_index})));
+                            make_zero(auto_completion_deltas->dtype),
+                            {delta_index})));
       }
       if (generation.defined()) {
         statements.push_back(
             For(generation_init_index, IntImm(DataType::Int(32), 0),
                 generation_count, ForKind::kSerial,
-                BufferStore(generation, make_zero(kind_info->state_dtype),
+                BufferStore(generation, make_zero(generation->dtype),
                             {generation_init_index})));
       }
       statements.push_back(body);
@@ -1162,10 +1174,11 @@ private:
       bool advance_expected = mode != "auto";
       PrimExpr count_imm = IntImm(DataType::Int(32), group.count);
       std::string base_name = let_node->var->name_hint;
-      Buffer expect = decl_buffer({count_imm}, group.kind_info->state_dtype,
-                                  base_name + "_expect", "local");
-      Buffer pending = decl_buffer({count_imm}, DataType::UInt(8),
-                                   base_name + "_pending", "local");
+      Buffer expect =
+          MakeStateArray(count_imm, DistSoftwareStateDType(*group.kind_info),
+                         base_name + "_expect");
+      Buffer pending =
+          MakeStateArray(count_imm, DataType::Int(32), base_name + "_pending");
       Buffer pending_count =
           decl_buffer({IntImm(DataType::Int(32), 1)}, DataType::Int(32),
                       base_name + "_pending_count", "local.var");
@@ -1184,14 +1197,16 @@ private:
       for (const PrimExpr &delta : deltas) {
         init_args.push_back(delta);
       }
-      Stmt initialize = Evaluate(
-          Call(DataType::Handle(), dist_completion_init_(), init_args));
+      Stmt initialize =
+          Evaluate(Call(DataType::Handle(), dist_completion_init_(), init_args,
+                        ExpectedAnnotations(group.kind)));
       Array<Stmt> statements{initialize};
       if (mode == "auto") {
         for (int64_t index = 0; index < group.count; ++index) {
-          statements.push_back(BufferStore(group.auto_completion_deltas,
-                                           IntImm(DataType::Int(32), 0),
-                                           {IntImm(DataType::Int(32), index)}));
+          statements.push_back(
+              BufferStore(group.auto_completion_deltas,
+                          make_zero(group.auto_completion_deltas->dtype),
+                          {IntImm(DataType::Int(32), index)}));
         }
       }
       statements.push_back(body);
@@ -1225,18 +1240,22 @@ private:
         kind_info.update_mode != DistSignalUpdateMode::kIncrement;
     std::string expect_name = let_node->var->name_hint + "_expect";
     std::string generation_name = let_node->var->name_hint + "_generation";
-    Buffer expected =
-        decl_buffer({IntImm(DataType::Int(32), 1)}, kind_info.state_dtype,
-                    expect_name, "local.var");
+    Buffer expected = decl_buffer({IntImm(DataType::Int(32), 1)},
+                                  DistSoftwareStateDType(kind_info),
+                                  expect_name, "local.var");
     int64_t generation_extent =
         generation_layout.dense
             ? world_size_ * (generation_layout.row_domain ? mesh_nrows_ : 1)
             : 1;
     Buffer generation;
     if (needs_generation) {
-      generation = decl_buffer({IntImm(DataType::Int(32), generation_extent)},
-                               kind_info.state_dtype, generation_name,
-                               generation_layout.dense ? "local" : "local.var");
+      generation = generation_layout.dense
+                       ? MakeStateArray(
+                             IntImm(DataType::Int(32), generation_extent),
+                             DistSoftwareStateDType(kind_info), generation_name)
+                       : decl_buffer({IntImm(DataType::Int(32), 1)},
+                                     DistSoftwareStateDType(kind_info),
+                                     generation_name, "local.var");
     }
     SignalInfo info{signal_call_node->args[0],
                     signal_call_node->args[1],
@@ -1255,7 +1274,7 @@ private:
 
     Stmt scoped = DeclBuffer(expected, std::move(body));
     Map<String, ffi::Any> annotations;
-    annotations.Set(tl::attr::kLocalVarInit, make_zero(kind_info.state_dtype));
+    annotations.Set(tl::attr::kLocalVarInit, make_zero(expected->dtype));
     scoped = Allocate(expected->data, expected->dtype, expected->shape,
                       const_true(), std::move(scoped), annotations);
     if (!generation.defined()) {
@@ -1270,7 +1289,7 @@ private:
     Stmt initialize_generation =
         For(generation_init_index, IntImm(DataType::Int(32), 0),
             IntImm(DataType::Int(32), generation_extent), ForKind::kSerial,
-            BufferStore(generation, make_zero(kind_info.state_dtype),
+            BufferStore(generation, make_zero(generation->dtype),
                         {generation_init_index}));
     scoped = SeqStmt::Flatten(Array<Stmt>{initialize_generation, scoped});
     scoped = DeclBuffer(generation, std::move(scoped));
@@ -1312,7 +1331,8 @@ private:
       ICHECK_EQ(call->args.size(), 2U);
       SignalWaitSelection signal = ResolveSignalWait(call->args[0]);
       Array<PrimExpr> args{signal.expected, call->args[1]};
-      return Call(call->dtype, dist_expect_(), args, call->annotations,
+      return Call(call->dtype, dist_expect_(), args,
+                  ExpectedAnnotations(signal.kind, call->annotations),
                   call->span);
     }
     if (call->op.same_as(dist_completion_has_pending())) {
@@ -1350,7 +1370,8 @@ private:
       PrimExpr accumulated = BufferLoad(group.auto_completion_deltas, {offset});
       Stmt update = BufferStore(
           group.auto_completion_deltas,
-          accumulated + Cast(DataType::Int(32), call->args[1]), {offset});
+          accumulated + CastDistStorage(accumulated.dtype(), call->args[1]),
+          {offset});
       return SeqStmt::Flatten(Array<Stmt>{Evaluate(lowered), update});
     }
     if (call && call->op.same_as(dist_batch_begin())) {
@@ -1377,9 +1398,9 @@ private:
     if (call && call->op.same_as(dist_wait_signal_delta())) {
       ICHECK_EQ(call->args.size(), 2U);
       SignalWaitSelection signal = ResolveSignalWait(call->args[0]);
-      Stmt update = Evaluate(Call(DataType::Handle(), dist_expect_(),
-                                  {signal.expected, call->args[1]},
-                                  call->annotations, call->span));
+      Stmt update = Evaluate(Call(
+          DataType::Handle(), dist_expect_(), {signal.expected, call->args[1]},
+          ExpectedAnnotations(signal.kind, call->annotations), call->span));
       Stmt wait = Evaluate(Call(DataType::Handle(), dist_wait_signal_(),
                                 {signal.kind, signal.index, signal.expected},
                                 call->annotations, call->span));
@@ -1426,9 +1447,9 @@ private:
         PrimExpr delta_index = deltas->region[0]->min + offset;
         PrimExpr expected = BufferLoad(group.expected, {offset});
         PrimExpr delta = BufferLoad(deltas->buffer, {delta_index});
-        updates.push_back(
-            Evaluate(Call(DataType::Handle(), dist_expect_(), {expected, delta},
-                          call->annotations, call->span)));
+        updates.push_back(Evaluate(Call(
+            DataType::Handle(), dist_expect_(), {expected, delta},
+            ExpectedAnnotations(group.kind, call->annotations), call->span)));
         Array<PrimExpr> args{group.kind, group.base_index + offset, expected};
         waits.push_back(Evaluate(Call(DataType::Handle(), dist_wait_signal_(),
                                       args, call->annotations, call->span)));
@@ -1712,6 +1733,89 @@ private:
   int mesh_nrows_{1};
   int mesh_ncols_{1};
   Var rank_id_;
+  LayoutMap state_layouts_;
+  Target target_;
+};
+
+// Match the region builder's non-unit tiled axes (all-unit views use axis 0).
+// Physical storage-unit and MX byte accounting remain in the SUVM verifier.
+class DistFullTileValidator : public StmtExprVisitor {
+public:
+  static void Check(const PrimFunc &func) {
+    DistFullTileValidator validator;
+    for (const char *key : {tl::attr::kLayoutMap, tl::attr::kGlobalLayoutMap}) {
+      if (auto map = func->GetAttr<LayoutMap>(key)) {
+        for (const auto &[buffer, layout] : map.value()) {
+          validator.layouts_.Set(buffer, layout);
+        }
+      }
+    }
+    validator(func->body);
+  }
+
+private:
+  void VisitStmt_(const BlockNode *op) final {
+    LayoutMap saved = layouts_;
+    for (const char *key : {tl::attr::kLayoutMap, tl::attr::kGlobalLayoutMap}) {
+      if (auto map = op->annotations.Get(key)) {
+        for (const auto &[buffer, layout] : Downcast<LayoutMap>(map.value())) {
+          layouts_.Set(buffer, layout);
+        }
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+    layouts_ = std::move(saved);
+  }
+
+  void Validate(const PrimExpr &expr, const char *operand) {
+    BufferRegion region = NormalizeToBufferRegion(expr);
+    Optional<Layout> layout;
+    for (const auto &[buffer, candidate] : layouts_) {
+      if (buffer.same_as(region->buffer) ||
+          buffer->data.same_as(region->buffer->data)) {
+        layout = candidate;
+        if (buffer.same_as(region->buffer))
+          break;
+      }
+    }
+    ICHECK(layout) << "T.dist.put " << operand << " buffer "
+                   << region->buffer->name << " requires layout metadata";
+    const auto *cute = layout.value().as<CuteLayoutNode>();
+    ICHECK(cute) << "T.dist.put " << operand << " buffer "
+                 << region->buffer->name << " requires a Sunmmio CuteLayout";
+    auto covered = cute->GetCoveredShape();
+    bool has_nonunit = false;
+    for (const Range &range : region->region) {
+      has_nonunit |= !analyzer_.CanProveEqual(range->extent, 1);
+    }
+    for (size_t dim = 0; dim < region->region.size(); ++dim) {
+      const PrimExpr &tile = region->region[dim]->extent;
+      if (analyzer_.CanProveEqual(tile, 1) && (has_nonunit || dim != 0))
+        continue;
+      PrimExpr extent = analyzer_.Simplify(covered[dim]);
+      PrimExpr size = analyzer_.Simplify(tile);
+      const auto *l = extent.as<IntImmNode>();
+      const auto *t = size.as<IntImmNode>();
+      if (!l || !t)
+        continue;
+      ICHECK(t->value > 0 && l->value % t->value == 0)
+          << "T.dist.put " << operand << " tile extent " << size
+          << " at dimension " << dim << " of buffer " << region->buffer->name
+          << " must divide layout covered extent " << extent
+          << "; dist does not support a partial last tile";
+    }
+  }
+
+  void VisitExpr_(const CallNode *op) final {
+    if (op->op.same_as(dist_put_())) {
+      Validate(op->args[0], "src");
+      Validate(op->args[1], "dst");
+    }
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  LayoutMap layouts_;
+  arith::Analyzer analyzer_;
 };
 
 PrimFunc Run(PrimFunc func) {
@@ -1728,12 +1832,33 @@ PrimFunc Run(PrimFunc func) {
   auto target = func->GetAttr<Target>(tvm::attr::kTarget);
   ICHECK(target && TargetIsSunmmio(target.value()));
   auto mesh = GetSunmmioMeshConfig(target.value());
-  Stmt body =
-      LowerDistPrimitiveMutator(context.value().world_size, mesh.nrow,
-                                mesh.ncol, context.value().rank_id)(func->body);
+  LowerDistPrimitiveMutator lowerer(context.value().world_size, mesh.nrow,
+                                    mesh.ncol, context.value().rank_id,
+                                    target.value());
+  Stmt body = lowerer(func->body);
+  // These compiler-created buffers are introduced after layout inference.
+  // Add them to every block so nested layout scopes see the same identities.
+  auto attach_layouts = [&](const Stmt &stmt) -> Stmt {
+    const auto *block = stmt.as<BlockNode>();
+    if (!block || lowerer.StateLayouts().empty())
+      return stmt;
+    Block result = ffi::GetRef<Block>(block);
+    LayoutMap layouts;
+    if (auto existing = block->annotations.Get(tl::attr::kLayoutMap)) {
+      layouts = Downcast<LayoutMap>(existing.value());
+    }
+    for (const auto &[buffer, layout] : lowerer.StateLayouts()) {
+      layouts.Set(buffer, layout);
+    }
+    result.CopyOnWrite()->annotations.Set(tl::attr::kLayoutMap, layouts);
+    return result;
+  };
+  body = IRTransform(body, nullptr, ffi::Function::FromTyped(attach_layouts),
+                     Array<String>{"tir.Block"});
   if (!body.same_as(func->body)) {
     func.CopyOnWrite()->body = std::move(body);
   }
+  DistFullTileValidator::Check(func);
   return func;
 }
 

@@ -22,6 +22,7 @@
 #include "../op/builtin.h"
 #include "../op/comm.h"
 #include "../op/copy.h"
+#include "../op/dist_comm.h"
 #include "../op/operator.h"
 #include "../op/transpose.h"
 #include "../op/utils.h"
@@ -93,6 +94,13 @@ private:
       ValidateAllgatherOp(op);
     } else if (IsCommAllreduceOp(op)) {
       ValidateAllreduceOp(op);
+    } else if (op->op.same_as(DistPeerPutOp::Get()) ||
+               op->op.same_as(DistPutOp::Get())) {
+      ValidateTwoRegionOp(op, "T.dist.put", 0, /*dist=*/true);
+    } else if (op->op.same_as(DistRoutedPeerPutOp::Get())) {
+      for (size_t i = 3; i + 1 < op->args.size(); i += 2) {
+        ValidateTwoRegionOp(op, "T.dist.routed_peer_put", i, /*dist=*/true);
+      }
     }
     StmtExprVisitor::VisitExpr_(op);
   }
@@ -195,15 +203,15 @@ private:
   }
 
   void ValidateTwoRegionOp(const CallNode *call, const char *op_name,
-                           size_t arg_base) {
+                           size_t arg_base, bool dist = false) {
     ICHECK_GE(call->args.size(), arg_base + 2)
         << op_name << " expects at least src and dst region arguments";
 
     BufferRegion src = NormalizeToBufferRegion(call->args[arg_base]);
     BufferRegion dst = NormalizeToBufferRegion(call->args[arg_base + 1]);
 
-    ValidateRegionCanFormTileView(src, op_name, "src");
-    ValidateRegionCanFormTileView(dst, op_name, "dst");
+    ValidateRegionCanFormTileView(src, op_name, "src", dist);
+    ValidateRegionCanFormTileView(dst, op_name, "dst", dist);
   }
 
   void ValidateAllgatherOp(const CallNode *call) {
@@ -398,7 +406,8 @@ private:
 
   void ValidateRegionCanFormTileView(const BufferRegion &region,
                                      const char *op_name,
-                                     const char *operand_name) {
+                                     const char *operand_name,
+                                     bool dist = false) {
     ICHECK(region.defined())
         << op_name << " " << operand_name << " region is undefined";
     ICHECK(region->buffer.defined())
@@ -435,9 +444,9 @@ private:
     const size_t tile_dim_begin = non_unit_dims.size() - tile_dim_count;
     for (size_t idx = 0; idx < non_unit_dims.size(); ++idx) {
       size_t dim = static_cast<size_t>(non_unit_dims[idx]);
-      if (idx >= tile_dim_begin) {
+      if (dist || idx >= tile_dim_begin) {
         ValidateTileViewDim(region, layout, dim, static_extents[dim], op_name,
-                            operand_name);
+                            operand_name, dist);
       }
     }
   }
@@ -530,7 +539,8 @@ private:
   void ValidateTileViewDim(const BufferRegion &region, const Layout &layout,
                            size_t dim,
                            const std::optional<int64_t> &static_extent,
-                           const char *op_name, const char *operand_name) {
+                           const char *op_name, const char *operand_name,
+                           bool dist = false) {
     if (!static_extent.has_value()) {
       return;
     }
@@ -575,8 +585,14 @@ private:
       return;
     }
 
+    // Dist checks layout-covered divisibility at communication lowering.
+    // Logical shape may exclude padding and is only a region bounds limit.
+    if (dist && !info.is_blockwise)
+      return;
+
     DivisibilityProof shape_divisibility =
-        ProveDivisibility(buffer_shape, region_extent);
+        dist ? DivisibilityProof::kDivisible
+             : ProveDivisibility(buffer_shape, region_extent);
     ICHECK(shape_divisibility != DivisibilityProof::kNotDivisible)
         << op_name << " " << operand_name << " region extent at dim " << dim
         << " for buffer " << region->buffer->name

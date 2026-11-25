@@ -292,7 +292,7 @@ endforeach()
 list(INSERT TILE_LANG_INCLUDES 0 ${TVM_INCLUDES})
 
 # Collect source files
-file(GLOB TILE_LANG_SRCS
+file(GLOB TILE_LANG_SRCS CONFIGURE_DEPENDS
   src/*.cc
   src/analysis/*.cc
   src/layout/*.cc
@@ -367,6 +367,7 @@ if(USE_SUNMMIO)
 
   file(GLOB TILE_LANG_SUNMMIO_SRCS
     src/target/sunmmio/codegen_sunmmio.cc
+    src/target/sunmmio/codegen_sunmmio_dist.cc
     src/target/sunmmio/sunmmio_codegen_tiles_loop.cc
     src/target/sunmmio/sunmmio_mlir_builder.cc
     src/target/sunmmio/sunmmio_mlir_context.cc
@@ -376,6 +377,7 @@ if(USE_SUNMMIO)
     src/target/sunmmio/sunmmio_mlir_memory.cc
     src/target/sunmmio/sunmmio_mlir_tile_op.cc
     src/target/sunmmio/sunmmio_mlir_call.cc
+    src/target/sunmmio/sunmmio_mlir_dist.cc
     src/target/sunmmio/rt_mod_sunmmio.cc
     src/target/sunmmio/resolve_sunmmio_unit.cc
   )

@@ -7,6 +7,7 @@
 #include "../../op/comm.h"
 #include "../../op/region.h"
 #include "../../op/utils.h"
+#include "../../support/finite_width_integer.h"
 #include "../../tileview/tileview_planner_common.h"
 #include "../../transform/common/attr.h"
 #include "../sunmmio_utils.h"
@@ -150,35 +151,6 @@ std::string PrimExprArrayToString(const ffi::Array<PrimExpr> &exprs) {
   return os.str();
 }
 
-std::string IntVectorToString(const std::vector<int64_t> &values) {
-  std::ostringstream os;
-  os << "[";
-  for (size_t i = 0; i < values.size(); ++i) {
-    if (i != 0) {
-      os << ", ";
-    }
-    os << values[i];
-  }
-  os << "]";
-  return os.str();
-}
-
-int64_t StaticIntOrNegative(const PrimExpr &expr, arith::Analyzer *analyzer) {
-  PrimExpr simplified = analyzer->Simplify(expr);
-  const auto *imm = simplified.as<IntImmNode>();
-  if (!imm || imm->value <= 0) {
-    return -1;
-  }
-  return imm->value;
-}
-
-struct ScalarTileAccessPlan {
-  std::vector<int64_t> tile_shape;
-  std::vector<int64_t> tiled_dims;
-  std::vector<PrimExpr> partition_indices;
-  std::vector<PrimExpr> local_indices;
-};
-
 std::string DescribeScalarTileAccess(const tir::Buffer &buffer,
                                      const ffi::Array<PrimExpr> &indices,
                                      DataType dtype,
@@ -194,279 +166,6 @@ std::string DescribeScalarTileAccess(const tir::Buffer &buffer,
     os << ", layout=<plain row-major fallback>";
   }
   return os.str();
-}
-
-std::vector<int64_t> GetScalarAccessLayoutExtents(
-    const tir::Buffer &buffer, const ffi::Optional<tl::Layout> &layout,
-    arith::Analyzer *analyzer, std::string *failure_reason) {
-  ffi::Array<PrimExpr> extents;
-  if (layout.defined()) {
-    const auto *cute = layout.value().as<tl::CuteLayoutNode>();
-    if (!cute) {
-      if (failure_reason != nullptr) {
-        *failure_reason = "Sunmmio scalar tile access planning expects a "
-                          "CuteLayout when a layout annotation is present.";
-      }
-      return {};
-    }
-    extents = cute->GetCoveredShape();
-  } else {
-    extents = buffer->shape;
-  }
-
-  std::vector<int64_t> static_extents;
-  static_extents.reserve(extents.size());
-  for (const PrimExpr &extent : extents) {
-    static_extents.push_back(StaticIntOrNegative(extent, analyzer));
-  }
-  return static_extents;
-}
-
-int64_t TileElementCount(const std::vector<int64_t> &shape) {
-  int64_t elems = 1;
-  for (int64_t extent : shape) {
-    elems *= extent;
-  }
-  return elems;
-}
-
-bool TileTransferSizeIsLegal(const tir::Buffer &buffer, DataType dtype,
-                             const std::vector<int64_t> &tile_shape,
-                             const tl::SunmmioTileProcessorConfig &config) {
-  if (!IsSunmmioRsramScope(buffer.scope())) {
-    return true;
-  }
-  if (config.rsram_align_bytes <= 0) {
-    return true;
-  }
-  int64_t tile_bits =
-      TileElementCount(tile_shape) * static_cast<int64_t>(dtype.bits());
-  if (tile_bits % 8 != 0) {
-    return false;
-  }
-  int64_t tile_bytes = tile_bits / 8;
-  return tile_bytes >= config.rsram_align_bytes &&
-         tile_bytes % config.rsram_align_bytes == 0;
-}
-
-bool CandidateExtentsAreLegal(const tl::TrailingTilePattern &pattern,
-                              const std::vector<int64_t> &layout_extents,
-                              std::string *failure_reason) {
-  for (size_t i = 0; i < pattern.mapped_dims.size(); ++i) {
-    int dim = pattern.mapped_dims[i];
-    int64_t extent = layout_extents[dim];
-    int64_t tile_extent = pattern.tile_shape[i];
-    if (extent < 0) {
-      continue;
-    }
-    if (tile_extent > extent) {
-      if (failure_reason != nullptr) {
-        std::ostringstream os;
-        os << "tile extent " << tile_extent << " exceeds layout extent "
-           << extent << " at buffer dim " << dim << ".";
-        *failure_reason = os.str();
-      }
-      return false;
-    }
-    if (extent % tile_extent != 0) {
-      if (failure_reason != nullptr) {
-        std::ostringstream os;
-        os << "layout extent " << extent << " is not divisible by tile extent "
-           << tile_extent << " at buffer dim " << dim << ".";
-        *failure_reason = os.str();
-      }
-      return false;
-    }
-  }
-  return true;
-}
-
-bool HasTrailingRowMajorContiguousOrder(
-    const tir::Buffer &buffer,
-    const ffi::Map<tir::Buffer, tl::Layout> &layout_map,
-    std::string *failure_reason) {
-  std::vector<tl::ContiguousStep> steps =
-      tl::GetBufferContiguousSteps(buffer, layout_map);
-  if (steps.empty()) {
-    if (failure_reason != nullptr) {
-      *failure_reason = "cannot recover a contiguous trailing layout step.";
-    }
-    return false;
-  }
-  int width_dim = static_cast<int>(buffer->shape.size()) - 1;
-  if (steps.front().dim != width_dim) {
-    if (failure_reason != nullptr) {
-      std::ostringstream os;
-      os << "the innermost contiguous layout step is dim " << steps.front().dim
-         << ", not the trailing width dim " << width_dim
-         << "; suvm.tile.load/store require row-major tile views.";
-      *failure_reason = os.str();
-    }
-    return false;
-  }
-  return true;
-}
-
-std::optional<tl::TrailingTilePattern>
-SelectScalarTilePattern(const tir::Buffer &buffer, int tile_rank,
-                        DataType dtype,
-                        const ffi::Map<tir::Buffer, tl::Layout> &layout_map,
-                        const std::vector<int64_t> &layout_extents,
-                        const tl::SunmmioTileProcessorConfig &config,
-                        arith::Analyzer *analyzer, std::string *last_reason) {
-  std::vector<tl::TrailingTilePattern> legal_patterns;
-  for (const tl::TrailingTilePattern &pattern :
-       tl::EnumerateInferredTrailingTilePatterns(
-           buffer, tile_rank, layout_map, config, analyzer,
-           {tl::TileExtentPolicy::kRegisterBounded,
-            tl::AlignmentMode::kStrict})) {
-    if (static_cast<int>(pattern.tile_shape.size()) != tile_rank) {
-      continue;
-    }
-    std::vector<int64_t> tile_shape(pattern.tile_shape.begin(),
-                                    pattern.tile_shape.end());
-    if (!TileTransferSizeIsLegal(buffer, dtype, tile_shape, config)) {
-      if (last_reason != nullptr) {
-        std::ostringstream os;
-        os << "tile shape " << IntVectorToString(tile_shape)
-           << " does not satisfy the " << config.rsram_align_bytes
-           << "-byte RSRAM vector-transfer size/alignment constraint.";
-        *last_reason = os.str();
-      }
-      continue;
-    }
-    if (!CandidateExtentsAreLegal(pattern, layout_extents, last_reason)) {
-      continue;
-    }
-    legal_patterns.push_back(pattern);
-  }
-
-  if (legal_patterns.empty()) {
-    return std::nullopt;
-  }
-
-  std::sort(legal_patterns.begin(), legal_patterns.end(),
-            [](const tl::TrailingTilePattern &lhs,
-               const tl::TrailingTilePattern &rhs) {
-              int64_t lhs_elems = tl::TileElements(lhs.tile_shape);
-              int64_t rhs_elems = tl::TileElements(rhs.tile_shape);
-              if (lhs_elems != rhs_elems) {
-                return lhs_elems > rhs_elems;
-              }
-              return lhs.tile_shape > rhs.tile_shape;
-            });
-  return legal_patterns.front();
-}
-
-std::optional<ScalarTileAccessPlan> PlanScalarTileAccess(
-    const tir::Buffer &buffer, const ffi::Array<PrimExpr> &indices,
-    DataType dtype, const ffi::Optional<tl::Layout> &layout,
-    const tl::SunmmioTileProcessorConfig &config, std::string *failure_reason) {
-  int buffer_rank = static_cast<int>(buffer->shape.size());
-  if (buffer_rank < 1) {
-    if (failure_reason != nullptr) {
-      *failure_reason = "scalar tile access requires a rank >= 1 buffer.";
-    }
-    return std::nullopt;
-  }
-  if (static_cast<int>(indices.size()) != buffer_rank) {
-    if (failure_reason != nullptr) {
-      std::ostringstream os;
-      os << "indices rank " << indices.size()
-         << " does not match source buffer rank " << buffer_rank << ".";
-      *failure_reason = os.str();
-    }
-    return std::nullopt;
-  }
-
-  arith::Analyzer analyzer;
-  ffi::Map<tir::Buffer, tl::Layout> layout_map;
-  if (layout.defined()) {
-    layout_map.Set(buffer, layout.value());
-  }
-
-  std::string local_reason;
-  std::vector<int64_t> layout_extents =
-      GetScalarAccessLayoutExtents(buffer, layout, &analyzer, &local_reason);
-  if (layout_extents.empty()) {
-    if (failure_reason != nullptr) {
-      *failure_reason = local_reason;
-    }
-    return std::nullopt;
-  }
-  if (static_cast<int>(layout_extents.size()) != buffer_rank) {
-    if (failure_reason != nullptr) {
-      std::ostringstream os;
-      os << "layout covered rank " << layout_extents.size()
-         << " does not match buffer rank " << buffer_rank << ".";
-      *failure_reason = os.str();
-    }
-    return std::nullopt;
-  }
-
-  if (!HasTrailingRowMajorContiguousOrder(buffer, layout_map, &local_reason)) {
-    if (failure_reason != nullptr) {
-      *failure_reason = local_reason;
-    }
-    return std::nullopt;
-  }
-
-  std::vector<int> ranks_to_try;
-  if (buffer_rank >= 2) {
-    ranks_to_try.push_back(2);
-  }
-  ranks_to_try.push_back(1);
-
-  std::optional<tl::TrailingTilePattern> selected;
-  for (int tile_rank : ranks_to_try) {
-    selected = SelectScalarTilePattern(buffer, tile_rank, dtype, layout_map,
-                                       layout_extents, config, &analyzer,
-                                       &local_reason);
-    if (selected.has_value()) {
-      break;
-    }
-  }
-
-  if (!selected.has_value()) {
-    if (failure_reason != nullptr) {
-      std::ostringstream os;
-      os << "cannot infer a legal trailing rank-1/rank-2 tile_view";
-      if (!local_reason.empty()) {
-        os << ": " << local_reason;
-      }
-      os << ". Use an aligned-row-major staging layout when logical extents "
-            "are "
-            "not compatible with 64B RSRAM vector transfers.";
-      *failure_reason = os.str();
-    }
-    return std::nullopt;
-  }
-
-  ScalarTileAccessPlan plan;
-  plan.tile_shape.assign(selected->tile_shape.begin(),
-                         selected->tile_shape.end());
-  plan.tiled_dims.assign(selected->mapped_dims.begin(),
-                         selected->mapped_dims.end());
-  plan.partition_indices.reserve(buffer_rank);
-  std::unordered_map<int, int64_t> tiled_dim_to_extent;
-  for (size_t i = 0; i < selected->mapped_dims.size(); ++i) {
-    tiled_dim_to_extent[selected->mapped_dims[i]] = selected->tile_shape[i];
-  }
-
-  for (int dim = 0; dim < buffer_rank; ++dim) {
-    auto it = tiled_dim_to_extent.find(dim);
-    if (it == tiled_dim_to_extent.end()) {
-      plan.partition_indices.push_back(indices[dim]);
-      continue;
-    }
-    PrimExpr tile_extent = IntImm(indices[dim].dtype(), it->second);
-    plan.partition_indices.push_back(
-        analyzer.Simplify(floordiv(indices[dim], tile_extent)));
-    plan.local_indices.push_back(
-        analyzer.Simplify(floormod(indices[dim], tile_extent)));
-  }
-
-  return plan;
 }
 
 bool SameTypeShape(const SunMMIOType &lhs, const SunMMIOType &rhs) {
@@ -609,6 +308,8 @@ SunMMIOValue CodeGenTileLangSunMMIO::EvalExpr(const tvm::PrimExpr &expr) {
 }
 
 void CodeGenTileLangSunMMIO::VisitStmtTracked(const tir::Stmt &stmt) {
+  EmitDistBatchBegins(stmt.get());
+  PrepareDistRebuilds(stmt.get());
   // ForNode selects its coverage domain in VisitStmt_(ForNode*) before it is
   // marked.  All other statements inherit the domain of their lowering path.
   if (stmt.defined() && !stmt.as<tir::ForNode>()) {
@@ -888,6 +589,7 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
   ICHECK(builder_) << "CodeGenTileLangSunMMIO builder is not initialized";
   CollectExpectedCoverage(f);
   CollectDeclBuffers(f->body);
+  AnalyzeDistFunction(f);
 
   SunMMIOBuilder::TirLayoutMap layout_map;
   SunMMIOBuilder::TirLayoutMap global_layout_map;
@@ -923,6 +625,8 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
   }
 
   builder_->BeginFunction(gvar->name_hint, args);
+  BindDistResources(f);
+  BindDistCaptures();
   for (const PendingExternalBuffer &pending : pending_external_buffers) {
     BindExternalBufferLayout(pending);
   }
@@ -931,6 +635,7 @@ void CodeGenTileLangSunMMIO::AddFunction(const GlobalVar &gvar,
   builder_->EndFunction();
   ExitScope();
   builder_->PopLayoutScope();
+  ClearDistFunctionState();
 }
 
 std::string CodeGenTileLangSunMMIO::Finish() {
@@ -988,6 +693,7 @@ CodeGenTileLangSunMMIO::MapBufferType(const tir::Buffer &buffer) const {
   type.shape = std::move(shape);
   type.memory_scope = buffer.scope();
   type.byte_offset = 0;
+  type.peer_writable = dist_destinations_.count(buffer->data.get()) != 0;
   if (builder_) {
     builder_->ApplyLayoutToType(buffer, &type);
   }
@@ -1011,8 +717,14 @@ SunMMIOValue CodeGenTileLangSunMMIO::EnsureIndex(const SunMMIOValue &v) {
   if (v.type.kind == SunMMIOType::Kind::kIndex) {
     return v;
   }
+  // index_cast sign-extends narrow integers. Preserve unsigned values before
+  // converting to the target's 64-bit index type.
+  SunMMIOValue source = v;
+  if ((v.dtype.is_uint() || v.dtype.is_bool()) && v.dtype.bits() < 64) {
+    source = EmitCast(v, DataType::UInt(64));
+  }
   return builder_->Cast(
-      NewValueName(), v,
+      NewValueName(), source,
       SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
       DataType::Int(32));
 }
@@ -1280,7 +992,10 @@ CodeGenTileLangSunMMIO::EmitLocalVarLoad(const tir::Buffer &buffer,
   ICHECK(index_imm && index_imm->value == 0)
       << "local.var buffer loads only support index 0";
   MarkVisitedExprTree(indices[0]);
-  return LookupLocalVar(buffer->data.get());
+  // A load is a value at this program point, not the mutable alias itself.
+  // Otherwise an immutable TIR Let can silently read a later loop iter_arg.
+  return builder_->BindValueAlias(NewValueName(),
+                                  LookupLocalVar(buffer->data.get()));
 }
 
 void CodeGenTileLangSunMMIO::EmitLocalVarStore(
@@ -1353,27 +1068,103 @@ void CodeGenTileLangSunMMIO::EmitFor(const tir::ForNode *op) {
   std::vector<SunMMIOValue> local_live_out_values =
       CollectLocalVarLiveOutValues(op->body);
 
-  SunMMIOValue min = EnsureIndex(EvalExpr(op->min));
-  SunMMIOValue extent = EnsureIndex(EvalExpr(op->extent));
-  SunMMIOValue step = op->step.has_value()
-                          ? EnsureIndex(EvalExpr(op->step.value()))
-                          : EmitConstIndex(1);
-  SunMMIOValue upper = builder_->Binary(
-      NewValueName(), BinaryOp::kAdd, ArithmeticFlavor::kIndex, min, extent,
-      SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
-      DataType::Int(32));
+  DataType dtype = op->loop_var.dtype();
+  SunMMIOValue min, upper, step, entry_min, entry_step;
+  bool count_from_zero = dtype.bits() == 64;
+  bool unit_counter =
+      is_zero(op->min) && (!op->step || is_one(op->step.value()));
+  bool restore_iv = count_from_zero && !unit_counter;
+  if (count_from_zero) {
+    PrimExpr raw_step = op->step.value_or(make_const(dtype, 1));
+    arith::Analyzer analyzer;
+    BindIntegerContext(&analyzer);
+    tl::FiniteWidthInteger facts(&analyzer, 1, &dist_let_bindings_);
+    auto extent_bound = facts.Analyze(op->extent);
+    auto step_bound = facts.Analyze(raw_step);
+    ICHECK(step_bound.valid && step_bound.range.lo > 0)
+        << "SunMMIO 64-bit For requires a provably positive step";
+    using Wide = tl::FiniteWidthInteger::Wide;
+    Wide maximum_extent = std::max(Wide(0), extent_bound.range.hi);
+    Wide maximum_count = maximum_extent / step_bound.range.lo +
+                         (maximum_extent % step_bound.range.lo != 0);
+    ICHECK(extent_bound.valid && maximum_count <= (Wide(1) << 63) - 1)
+        << "SunMMIO 64-bit For trip count must fit a signed 64-bit index";
+
+    if (unit_counter) {
+      // The frontend (or an earlier pass) already supplied a trip count.
+      // Validate representability above, then evaluate it exactly once.
+      min = EmitConstIndex(0);
+      upper = EnsureIndex(EvalExpr(op->extent));
+      step = EmitConstIndex(1);
+    } else {
+      // Capture entry values before BeginFor rebinds mutable locals to
+      // iter_args.
+      entry_min = builder_->BindValueAlias(
+          NewValueName(), EnsureType(EvalExpr(op->min), MapType(dtype), dtype));
+      SunMMIOValue extent =
+          EnsureType(EvalExpr(op->extent), MapType(dtype), dtype);
+      entry_step = builder_->BindValueAlias(
+          NewValueName(),
+          EnsureType(EvalExpr(raw_step), MapType(dtype), dtype));
+      auto zero =
+          builder_->ConstantInt(NewValueName(), 0, MapType(dtype), dtype);
+      auto flavor = GetArithmeticFlavor(dtype);
+      if (dtype.is_int()) {
+        extent = builder_->Binary(NewValueName(), BinaryOp::kMax, flavor,
+                                  extent, zero, MapType(dtype), dtype);
+      }
+      // ceil(extent / step), without overflowing extent + step - 1.
+      auto quotient =
+          builder_->Binary(NewValueName(), BinaryOp::kDiv, flavor, extent,
+                           entry_step, MapType(dtype), dtype);
+      auto remainder =
+          builder_->Binary(NewValueName(), BinaryOp::kMod, flavor, extent,
+                           entry_step, MapType(dtype), dtype);
+      auto extra = builder_->Compare(NewValueName(), CompareOp::kNE,
+                                     GetCompareDomain(dtype), remainder, zero,
+                                     MapType(dtype));
+      auto count =
+          builder_->Binary(NewValueName(), BinaryOp::kAdd, flavor, quotient,
+                           EmitCast(extra, dtype), MapType(dtype), dtype);
+      min = EmitConstIndex(0);
+      upper = EnsureIndex(count);
+      step = EmitConstIndex(1);
+    }
+  } else {
+    min = EnsureIndex(EvalExpr(op->min));
+    SunMMIOValue extent = EnsureIndex(EvalExpr(op->extent));
+    step = op->step.has_value() ? EnsureIndex(EvalExpr(op->step.value()))
+                                : EmitConstIndex(1);
+    upper = builder_->Binary(
+        NewValueName(), BinaryOp::kAdd, ArithmeticFlavor::kIndex, min, extent,
+        SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}},
+        DataType::Int(32));
+  }
   std::string iv = "%" + op->loop_var->name_hint;
+  AppendDistCaptureLiveOut(op, &local_live_out_values);
+  PrepareDistFor(op, &local_live_out_values);
   builder_->BeginFor(iv, min, upper, step, op->annotations,
                      local_live_out_values);
   EnterScope();
-  BindVar(
-      op->loop_var,
-      SunMMIOValue{
-          op->loop_var.dtype(), iv,
-          SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(32), 1, {}}});
+  // The scf.for IV is an index; expressions in the body use the TIR dtype.
+  SunMMIOValue index_iv{
+      DataType::Int(64), iv,
+      SunMMIOType{SunMMIOType::Kind::kIndex, DataType::Int(64), 1, {}}};
+  SunMMIOValue logical_iv = EnsureType(index_iv, MapType(dtype), dtype);
+  if (restore_iv) {
+    auto offset = builder_->Binary(NewValueName(), BinaryOp::kMul,
+                                   GetArithmeticFlavor(dtype), logical_iv,
+                                   entry_step, MapType(dtype), dtype);
+    logical_iv = builder_->Binary(NewValueName(), BinaryOp::kAdd,
+                                  GetArithmeticFlavor(dtype), entry_min, offset,
+                                  MapType(dtype), dtype);
+  }
+  BindVar(op->loop_var, logical_iv);
   VisitStmtTracked(op->body);
   ExitScope();
+  YieldDistFor(op);
   builder_->EndFor();
+  FinishDistFor(op);
 }
 
 void CodeGenTileLangSunMMIO::EmitIf(const tir::IfThenElseNode *op) {
@@ -1389,11 +1180,17 @@ void CodeGenTileLangSunMMIO::EmitIf(const tir::IfThenElseNode *op) {
     AppendUniqueLocalVarLiveOutValues(&local_live_out_values,
                                       else_live_out_values);
   }
+  AppendDistCaptureLiveOut(op, &local_live_out_values);
   builder_->BeginIf(cond, local_live_out_values);
+  size_t mark = integer_constraints_.size();
+  integer_constraints_.push_back(op->condition);
   VisitStmtTracked(op->then_case);
+  integer_constraints_.resize(mark);
   if (op->else_case.defined()) {
     builder_->BeginElse();
+    integer_constraints_.push_back(Not(op->condition));
     VisitStmtTracked(op->else_case.value());
+    integer_constraints_.resize(mark);
   }
   builder_->EndIf();
 }
@@ -1415,6 +1212,7 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::ForNode *op) {
 void CodeGenTileLangSunMMIO::EmitWhile(const tir::WhileNode *op) {
   std::vector<SunMMIOValue> local_live_out_values =
       CollectLocalVarLiveOutValues(op->body);
+  AppendDistCaptureLiveOut(op, &local_live_out_values);
   builder_->BeginWhile(local_live_out_values);
   SunMMIOValue cond = EnsureType(
       EvalExpr(op->condition),
@@ -1537,7 +1335,9 @@ void CodeGenTileLangSunMMIO::VisitStmt_(const tir::AssertStmtNode *op) {
   SunMMIOValue msg = EvalExpr(op->message);
   std::string text = msg.value.empty() ? "\"assertion failed\"" : msg.value;
   builder_->EmitAssert(cond, text);
+  integer_constraints_.push_back(op->condition);
   VisitStmtTracked(op->body);
+  integer_constraints_.pop_back();
 }
 
 void CodeGenTileLangSunMMIO::VisitStmt_(const tir::EvaluateNode *op) {
@@ -1800,6 +1600,61 @@ CodeGenTileLangSunMMIO::EmitLoad(const tir::Buffer &buffer,
                         binding.buffer_type, dtype, MapType(dtype));
 }
 
+std::pair<std::vector<SunMMIOValue>, std::vector<SunMMIOValue>>
+CodeGenTileLangSunMMIO::EmitScalarTileIndices(
+    const ffi::Array<PrimExpr> &indices, const std::vector<int64_t> &dims,
+    const std::vector<int64_t> &shape) {
+  std::vector<SunMMIOValue> partitions, lanes(dims.size());
+  for (size_t dim = 0; dim < indices.size(); ++dim) {
+    // Evaluate the original index before widening; a narrowing cast is part of
+    // its runtime value. Partition and lane consume this same SSA value.
+    auto value = EvalExpr(indices[dim]);
+    auto found = std::find(dims.begin(), dims.end(), dim);
+    if (found == dims.end()) {
+      partitions.push_back(EnsureIndex(value));
+      continue;
+    }
+    size_t axis = found - dims.begin();
+    if (auto literal = tl::FiniteWidthInteger::Literal(indices[dim]);
+        literal && *literal >= 0 && *literal <= INT64_MAX) {
+      partitions.push_back(
+          EmitConstIndex(static_cast<int64_t>(*literal / shape[axis])));
+      lanes[axis] =
+          EmitConstIndex(static_cast<int64_t>(*literal % shape[axis]));
+      continue;
+    }
+    auto dtype = value.dtype.is_uint() ? DataType::UInt(64) : DataType::Int(64);
+    value = EmitCast(value, dtype);
+    auto width = builder_->ConstantInt(NewValueName(), shape[axis],
+                                       MapType(dtype), dtype);
+    auto flavor = GetArithmeticFlavor(dtype);
+    auto q = builder_->Binary(NewValueName(), BinaryOp::kDiv, flavor, value,
+                              width, MapType(dtype), dtype);
+    auto r = builder_->Binary(NewValueName(), BinaryOp::kMod, flavor, value,
+                              width, MapType(dtype), dtype);
+    if (dtype.is_int()) {
+      auto zero =
+          builder_->ConstantInt(NewValueName(), 0, MapType(dtype), dtype);
+      auto negative =
+          builder_->Compare(NewValueName(), CompareOp::kLT,
+                            CompareDomain::kSignedInt, r, zero, MapType(dtype));
+      auto one =
+          builder_->ConstantInt(NewValueName(), 1, MapType(dtype), dtype);
+      auto adjust = builder_->Select(NewValueName(), negative, one, zero,
+                                     MapType(dtype), dtype);
+      q = builder_->Binary(NewValueName(), BinaryOp::kSub, flavor, q, adjust,
+                           MapType(dtype), dtype);
+      auto correction = builder_->Select(NewValueName(), negative, width, zero,
+                                         MapType(dtype), dtype);
+      r = builder_->Binary(NewValueName(), BinaryOp::kAdd, flavor, r,
+                           correction, MapType(dtype), dtype);
+    }
+    partitions.push_back(EnsureIndex(q));
+    lanes[axis] = EnsureIndex(r);
+  }
+  return {partitions, lanes};
+}
+
 SunMMIOValue
 CodeGenTileLangSunMMIO::EmitScalarTilePick(const tir::BufferLoadNode *op) {
   const tir::Buffer &buffer = op->buffer;
@@ -1846,8 +1701,9 @@ CodeGenTileLangSunMMIO::EmitScalarTilePick(const tir::BufferLoadNode *op) {
   const tl::SunmmioTileProcessorConfig tile_processor_config =
       tl::GetSunmmioTileProcessorConfig(target_);
   std::string plan_failure;
-  std::optional<ScalarTileAccessPlan> plan = PlanScalarTileAccess(
-      buffer, indices, dtype, layout, tile_processor_config, &plan_failure);
+  std::optional<tl::SunmmioScalarTileAccessPlan> plan =
+      tl::PlanSunmmioScalarTileAccess(buffer, indices, dtype, layout,
+                                      tile_processor_config, &plan_failure);
   if (!plan.has_value()) {
     UnsupportedExpr(op, "Sunmmio scalar BufferLoad cannot infer a legal "
                         "tile.pick view: " +
@@ -1857,16 +1713,8 @@ CodeGenTileLangSunMMIO::EmitScalarTilePick(const tir::BufferLoadNode *op) {
     MarkVisitedExprTree(indices[dim]);
   }
 
-  std::vector<SunMMIOValue> partition_indices;
-  partition_indices.reserve(plan->partition_indices.size());
-  for (const PrimExpr &idx : plan->partition_indices) {
-    partition_indices.push_back(EnsureIndex(EvalExpr(idx)));
-  }
-  std::vector<SunMMIOValue> local_indices;
-  local_indices.reserve(plan->local_indices.size());
-  for (const PrimExpr &idx : plan->local_indices) {
-    local_indices.push_back(EnsureIndex(EvalExpr(idx)));
-  }
+  auto [partition_indices, local_indices] =
+      EmitScalarTileIndices(indices, plan->tiled_dims, plan->tile_shape);
 
   SunMMIOValue memtensor{dtype, binding.handle, binding.buffer_type};
   SunMMIOType tile_view_type = MakeTileTypeForShape(
@@ -1920,8 +1768,9 @@ void CodeGenTileLangSunMMIO::EmitScalarTileSet(const tir::BufferStoreNode *op) {
   const tl::SunmmioTileProcessorConfig tile_processor_config =
       tl::GetSunmmioTileProcessorConfig(target_);
   std::string plan_failure;
-  std::optional<ScalarTileAccessPlan> plan = PlanScalarTileAccess(
-      buffer, indices, dtype, layout, tile_processor_config, &plan_failure);
+  std::optional<tl::SunmmioScalarTileAccessPlan> plan =
+      tl::PlanSunmmioScalarTileAccess(buffer, indices, dtype, layout,
+                                      tile_processor_config, &plan_failure);
   if (!plan.has_value()) {
     UnsupportedStmt(op, "Sunmmio scalar BufferStore cannot infer a legal "
                         "tile.set view: " +
@@ -1931,16 +1780,8 @@ void CodeGenTileLangSunMMIO::EmitScalarTileSet(const tir::BufferStoreNode *op) {
     MarkVisitedExprTree(indices[dim]);
   }
 
-  std::vector<SunMMIOValue> partition_indices;
-  partition_indices.reserve(plan->partition_indices.size());
-  for (const PrimExpr &idx : plan->partition_indices) {
-    partition_indices.push_back(EnsureIndex(EvalExpr(idx)));
-  }
-  std::vector<SunMMIOValue> local_indices;
-  local_indices.reserve(plan->local_indices.size());
-  for (const PrimExpr &idx : plan->local_indices) {
-    local_indices.push_back(EnsureIndex(EvalExpr(idx)));
-  }
+  auto [partition_indices, local_indices] =
+      EmitScalarTileIndices(indices, plan->tiled_dims, plan->tile_shape);
 
   SunMMIOValue memtensor{dtype, binding.handle, binding.buffer_type};
   SunMMIOType tile_view_type = MakeTileTypeForShape(
@@ -2080,6 +1921,47 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitBinary(const char *op_name,
   b = EnsureType(b, result_type, dtype);
   std::string out = NewValueName();
   const std::string op(op_name);
+  ICHECK((op != "floordiv" && op != "floormod") || dtype.is_int() ||
+         dtype.is_uint())
+      << "SunMMIO floor arithmetic requires integer operands";
+  if ((op == "floordiv" || op == "floormod") && dtype.is_int()) {
+    ICHECK(result_type.kind == SunMMIOType::Kind::kScalar)
+        << "SunMMIO signed floor arithmetic requires scalar integers";
+    auto zero = builder_->ConstantInt(NewValueName(), 0, result_type, dtype);
+    auto remainder = builder_->Binary(NewValueName(), BinaryOp::kMod,
+                                      ArithmeticFlavor::kSignedInt, a, b,
+                                      result_type, dtype);
+    auto nonzero = builder_->Compare(NewValueName(), CompareOp::kNE,
+                                     CompareDomain::kSignedInt, remainder, zero,
+                                     result_type);
+    auto negative_remainder = builder_->Compare(NewValueName(), CompareOp::kLT,
+                                                CompareDomain::kSignedInt,
+                                                remainder, zero, result_type);
+    auto negative_divisor =
+        builder_->Compare(NewValueName(), CompareOp::kLT,
+                          CompareDomain::kSignedInt, b, zero, result_type);
+    auto boolean = MapType(DataType::Bool());
+    auto different_sign = builder_->Binary(
+        NewValueName(), BinaryOp::kXor, ArithmeticFlavor::kBool,
+        negative_remainder, negative_divisor, boolean, DataType::Bool());
+    auto adjust = builder_->Binary(NewValueName(), BinaryOp::kAnd,
+                                   ArithmeticFlavor::kBool, nonzero,
+                                   different_sign, boolean, DataType::Bool());
+    if (op == "floormod") {
+      auto correction =
+          builder_->Select(NewValueName(), adjust, b, zero, result_type, dtype);
+      return builder_->Binary(out, BinaryOp::kAdd, ArithmeticFlavor::kSignedInt,
+                              remainder, correction, result_type, dtype);
+    }
+    auto quotient = builder_->Binary(NewValueName(), BinaryOp::kDiv,
+                                     ArithmeticFlavor::kSignedInt, a, b,
+                                     result_type, dtype);
+    auto one = builder_->ConstantInt(NewValueName(), 1, result_type, dtype);
+    auto correction =
+        builder_->Select(NewValueName(), adjust, one, zero, result_type, dtype);
+    return builder_->Binary(out, BinaryOp::kSub, ArithmeticFlavor::kSignedInt,
+                            quotient, correction, result_type, dtype);
+  }
   BinaryOp bin_op;
   if (op == "add")
     bin_op = BinaryOp::kAdd;
@@ -2531,33 +2413,27 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitRegionCall(
   std::vector<int64_t> extents;
   mins.reserve(region->region.size());
   extents.reserve(region->region.size());
-  arith::Analyzer analyzer;
   for (size_t dim = 0; dim < region->region.size(); ++dim) {
     const Range &range = region->region[dim];
     const auto *extent_imm = range->extent.as<IntImmNode>();
     ICHECK(extent_imm) << "tl.tileop.region extent must be IntImm";
-    if (copy_operand) {
-      ICHECK_GT(extent_imm->value, 0)
-          << "Sunmmio copy " << copy_operand << " buffer "
-          << region->buffer->name << " has non-positive region extent at dim "
-          << extents.size();
-      // Partition indices count whole regions. Flooring an unaligned start
-      // silently changes the address, even when optional region checks are off.
-      ICHECK(analyzer.CanProveEqual(floormod(range->min, range->extent), 0))
-          << "Sunmmio copy " << copy_operand << " buffer "
-          << region->buffer->name << " region min at dim " << extents.size()
-          << " must be provably aligned to region extent " << range->extent
-          << ", but got min=" << range->min;
-    }
-    MarkVisitedExprRoot(range->extent);
     int64_t extent = use_layout_covered_shape
                          ? effective_extents[dim]
                          : static_cast<int64_t>(extent_imm->value);
+    if (copy_operand) {
+      ICHECK_GT(extent, 0) << "Sunmmio copy " << copy_operand << " buffer "
+                           << region->buffer->name
+                           << " has non-positive region extent at dim "
+                           << extents.size();
+    }
+    MarkVisitedExprRoot(range->extent);
     extents.push_back(extent);
-    PrimExpr min = floordiv(range->min, Integer(extent));
-    min = analyzer.Simplify(min);
-    MarkVisitedExprTree(range->min);
-    mins.push_back(EvalExpr(min));
+    std::string context;
+    if (copy_operand)
+      context = "Sunmmio copy " + std::string(copy_operand) + " buffer " +
+                std::string(region->buffer->name) + " region min at dim " +
+                std::to_string(extents.size() - 1);
+    mins.push_back(EmitRegionPartitionIndex(range->min, extent, context));
   }
   SunMMIOType ret_ty = MapType(region_expr.dtype());
   std::string result_name = region_expr.dtype().is_void() ? "" : NewValueName();
@@ -2579,16 +2455,36 @@ SunMMIOValue CodeGenTileLangSunMMIO::EmitCall(const tir::CallNode *op) {
   }
   std::vector<SunMMIOValue> operands;
   SunMMIOCallAttrs attrs;
-  if (callee == "tir.if_then_else") {
+  if (op->op.same_as(tl::sunmmio_tile_integer_cast()) ||
+      tl::FiniteWidthInteger::IsIntegerSignReinterpret(op)) {
+    return EmitCast(EvalExpr(op->args[0]), op->dtype);
+  }
+  if (callee == "tir.large_uint_imm") {
+    auto value =
+        tl::FiniteWidthInteger::Literal(tvm::ffi::GetRef<PrimExpr>(op));
+    ICHECK(value && op->dtype == DataType::UInt(64))
+        << "Invalid large_uint_imm literal";
+    return builder_->ConstantInt(
+        NewValueName(), static_cast<int64_t>(static_cast<uint64_t>(*value)),
+        MapType(op->dtype), op->dtype);
+  } else if (callee.rfind("tl.dist_", 0) == 0) {
+    return EmitDistCall(op);
+  } else if (callee == "tir.if_then_else") {
     ICHECK_EQ(op->args.size(), 3U) << "tir.if_then_else expects 3 arguments";
     SunMMIOType bool_ty{SunMMIOType::Kind::kScalar, DataType::Bool(), 1, {}};
     SunMMIOValue cond =
         EnsureType(EvalExpr(op->args[0]), bool_ty, DataType::Bool());
-    SunMMIOValue tv = EvalExpr(op->args[1]);
-    SunMMIOValue fv = EvalExpr(op->args[2]);
-    fv = EnsureType(fv, tv.type, tv.dtype);
     DataType dtype = CanonicalizeSuvmDType(op->dtype);
-    return builder_->Select(NewValueName(), cond, tv, fv, tv.type, dtype);
+    SunMMIOValue result{dtype, NewValueName(), MapType(dtype)};
+    // Unlike Select, if_then_else must not evaluate the unselected operand.
+    builder_->BeginIf(cond, {result});
+    builder_->BindValueAlias(
+        result.value, EnsureType(EvalExpr(op->args[1]), result.type, dtype));
+    builder_->BeginElse();
+    builder_->BindValueAlias(
+        result.value, EnsureType(EvalExpr(op->args[2]), result.type, dtype));
+    builder_->EndIf();
+    return result;
   } else if (callee == "tl.tileop.region") {
     return EmitRegionCall(tvm::ffi::GetRef<PrimExpr>(op));
   } else if (callee == "tl.mx_pack") {

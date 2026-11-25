@@ -107,6 +107,45 @@ def _runtime_scalar_sources(abi):
     return [(scalar.name, scalar.source_param_index, scalar.source_kind, scalar.source_dim) for scalar in abi.runtime_scalars]
 
 
+def test_sunmmio_jit_projects_eliminated_public_scalar(tmp_path, monkeypatch):
+    from testing.python.sunmmio.codegen.test_dist_audit_kernel_opt_validate import unroll_window_kernel
+    from testing.python.sunmmio.common.codegen_validation import validate_suvm_mlir_with_npuir_opt
+
+    # Exercise the real JIT, including ABI construction; stop at the
+    # independently validated SUVM interface before toolchain/ELF creation.
+    monkeypatch.setattr(SunmmioSuDeckLibraryGenerator, "compile_lib", lambda self: None)
+    monkeypatch.setattr(SunmmioSuDeckLibraryGenerator, "load_lib", lambda self, lib_path=None: None)
+    compiled = unroll_window_kernel.compile(world_size=2, bounded=True)
+    abi = compiled.adapter.abi
+    assert abi.public_param_names == ("rank_id", "n") and abi.device_param_names == ("rank_id",)
+    assert abi.materialize_runtime_args([1, 7], lambda *_: None) == [1]
+    loaded = SunmmioKernelABI.from_json_dict(abi.to_json_dict())
+    assert loaded == abi
+    source = compiled.get_kernel_source()
+    artifact = tilelang.lower(unroll_window_kernel.get_tir(world_size=2, bounded=True), target="sunmmio")
+    assert source.strip() == artifact.kernel_source.strip()
+    validate_suvm_mlir_with_npuir_opt(source, tmp_path, opt_args=("--verify-each", "--suvm-device-validate"))
+
+
+def test_projected_public_args_keep_hidden_tensor_index_and_rank():
+    abi = SunmmioKernelABI(
+        kernel_name="k",
+        public_arg_count=3,
+        public_param_names=("unused", "X", "rank"),
+        public_param_dtypes=("uint8", "handle", "int32"),
+        rank_id_index=2,
+        device_param_names=("rank", "m", "X"),
+        device_param_dtypes=("int32", "int32", "handle"),
+        runtime_scalars=(SunmmioRuntimeScalar("m", source_param_index=1, source_kind="shape", source_dim=0),),
+    )
+    assert abi.materialize_runtime_args([5, "tensor", 1], lambda value, *_: 8 if value == "tensor" else 0) == [1, 8, "tensor"]
+    for names in (["rank", "m"], ["X", "m"], ["rank", "rank", "X"], ["rank", "X", "unknown"]):
+        data = abi.to_json_dict()
+        data["device_param_names"] = names
+        with pytest.raises(ValueError):
+            SunmmioKernelABI.from_json_dict(data)
+
+
 def test_sunmmio_abi_reorders_public_args_to_device_order():
     abi = SunmmioKernelABI(
         kernel_name="main_kernel",
