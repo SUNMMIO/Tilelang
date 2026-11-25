@@ -126,8 +126,9 @@ public:
     return it == leaves_.end() ? empty : it->second;
   }
   const BufferRegions &Loop(const Stmt &body) {
-    auto [it, fresh] = loops_.try_emplace(body.get());
-    if (fresh) {
+    const auto insertion = loops_.try_emplace(body.get());
+    const auto it = insertion.first;
+    if (insertion.second) {
       // Preserve dimensions invariant throughout this loop; a leaf that
       // indexes by this loop (or a nested loop) uses its numeric envelope.
       std::unordered_set<BufferRegion, StructuralHash, StructuralEqual> seen;

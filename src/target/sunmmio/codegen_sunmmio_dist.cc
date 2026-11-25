@@ -830,7 +830,7 @@ void BindIntegerConstraint(arith::Analyzer *analyzer, PrimExpr condition,
     return;
   }
   if (const auto *eq = condition.as<EQNode>()) {
-    for (auto pair :
+    for (const auto &pair :
          {std::make_pair(eq->a, eq->b), std::make_pair(eq->b, eq->a)}) {
       if (!is_zero(pair.second) || !pair.first.dtype().is_uint())
         continue;
