@@ -592,6 +592,23 @@ private:
 
   PrimExpr VisitExpr_(const CallNode *op) final {
     if (InInfoCollectionPhase()) {
+      if (op->op.same_as(Op::Get("tl.tileop.comm_allgather"))) {
+        // The destination is an address descriptor, not an on-chip load.
+        // Keep real source reads and descriptor-index reads checked normally.
+        VisitExpr(op->args[0]);
+        BufferRegion dst = NormalizeToBufferRegion(op->args[1]);
+        if (dst->buffer.scope() == "shared" ||
+            dst->buffer.scope() == "shared.dyn") {
+          buffers_to_infer.insert(dst->buffer);
+        }
+        for (const Range &range : dst->region) {
+          VisitExpr(range->min);
+          VisitExpr(range->extent);
+        }
+        for (size_t i = 2; i < op->args.size(); ++i)
+          VisitExpr(op->args[i]);
+        return tvm::ffi::GetRef<Call>(op);
+      }
       auto tile_op = ParseOperator(tvm::ffi::GetRef<Call>(op));
       if (auto *copy = tile_op.as<CopyNode>()) {
         if (copy->dst.defined() && copy->src.defined() &&
