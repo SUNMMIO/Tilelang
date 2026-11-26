@@ -52,7 +52,9 @@ enum class BinaryOp {
   kOr,
   kXor,
   kShl,
-  kShr
+  kShr,
+  kFloorDiv,
+  kFloorMod
 };
 
 enum class ArithmeticFlavor { kFloat, kSignedInt, kUnsignedInt, kBool, kIndex };
